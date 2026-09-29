@@ -80,12 +80,14 @@ import {
   stepPhasesAt,
   type GraphStep,
   type MetricsMap,
-  type MissionGraph,
   type StepHeaderField,
 } from "./graph";
 import { initMinimap, isNarrowViewport, persistMinimap, timelineActive } from "./timeline";
 import { byTime, ingest, type NormRecord } from "../../lib/ingest";
 import { isHostSampleRecord } from "../../lib/machineDrawerScope";
+import type { FlowRecord } from "../../types/generated/FlowRecord";
+import type { FlowRecordsResponse } from "../../types/generated/FlowRecordsResponse";
+import type { MissionGraph } from "../../types/generated/MissionGraph";
 
 /** Dedup key — this port's counterpart to mission-graph.html's own
  * `backfillEvents` dedup (`ts + action + handle`): two sources
@@ -117,7 +119,7 @@ function recKey(r: NormRecord): string {
  * disk holds the mission, this daemon's flow stream still carries its
  * records with `machine_id` stamped). */
 async function lookupOwningMachine(missionId: string): Promise<string | null> {
-  const res = await fetchJson<unknown>(`/flow/${todayUTC()}`);
+  const res = await fetchJson<FlowRecord[]>(`/flow/${todayUTC()}`);
   if (!res.ok) return null;
   const rows = ingest(res.data);
   for (let i = rows.length - 1; i >= 0; i--) {
@@ -409,12 +411,12 @@ export function MissionGraphLens({
 
   const flowMissionQuery = useQuery({
     queryKey: queryKeys.flowMission(missionId),
-    queryFn: () => fetchJson<unknown>(`/flow-mission/${encodeURIComponent(missionId)}`),
+    queryFn: () => fetchJson<FlowRecordsResponse>(`/flow-mission/${encodeURIComponent(missionId)}`),
     enabled: daemonBacked,
   });
   const flowTodayQuery = useQuery({
     queryKey: queryKeys.flowDate(today),
-    queryFn: () => fetchJson<unknown>(`/flow/${today}`),
+    queryFn: () => fetchJson<FlowRecord[]>(`/flow/${today}`),
     enabled: daemonBacked,
   });
 

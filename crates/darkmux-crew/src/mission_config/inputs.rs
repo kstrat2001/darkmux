@@ -48,6 +48,7 @@
 
 use super::MissionConfig;
 use anyhow::{bail, Context, Result};
+use darkmux_types::param_scalar::whole_placeholder;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -160,15 +161,6 @@ fn scalar_to_string(v: &Value) -> String {
         Value::String(s) => s.clone(),
         other => other.to_string(),
     }
-}
-
-/// `"{{name}}"` (and nothing else) -> `Some("name")`.
-fn whole_placeholder(s: &str) -> Option<&str> {
-    let inner = s.strip_prefix("{{")?.strip_suffix("}}")?;
-    if inner.contains("{{") || inner.contains("}}") {
-        return None;
-    }
-    Some(inner.trim())
 }
 
 fn check_declared(name: &str, declared: &BTreeSet<String>, what: &str) -> Result<()> {
@@ -435,6 +427,24 @@ pub fn check_embedded_inputs_collected(
         bad.len(),
         lines.join("\n")
     );
+}
+
+/// Refuse the static graph's step configs a launch could not run: each
+/// step's `config`, with this launch's inputs substituted as a mint does, is
+/// checked against its kind (`step_config::gate::check_resolved`). A task
+/// that grows is skipped: its templates hold references only its items
+/// resolve, and each grown copy is checked when it is minted.
+pub fn check_resolved_step_configs(config: &MissionConfig, collected: &BTreeMap<String, Value>) -> Result<()> {
+    let declared: BTreeSet<String> = config.inputs.iter().map(|i| i.name.clone()).collect();
+    let mut resolved = Vec::new();
+    for task in config.phases.iter().flat_map(|p| &p.tasks).filter(|t| t.grow.is_none()) {
+        for step in &task.steps {
+            let value = substitute_step_config(&step.config, &declared, collected, &format!("step `{}`", step.id))?;
+            resolved.push((step.id.as_str(), step.kind.as_str(), value));
+        }
+    }
+    crate::step_config::gate::check_resolved(resolved.iter().map(|(id, kind, value)| (*id, *kind, value)))
+        .with_context(|| format!("mission config \"{}\"", config.id))
 }
 
 /// (#2384) Every placeholder name the document's static graph REFERENCES —
@@ -711,7 +721,6 @@ mod tests {
             }],
             phases,
             outcome_from: None,
-            panel: None,
             cmd: None,
             source_input: None,
             ticket: None,

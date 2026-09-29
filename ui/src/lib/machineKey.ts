@@ -1,4 +1,4 @@
-import type { PresenceBeat } from "../types/handwritten";
+import type { PresenceBeat } from "../types/generated/PresenceBeat";
 import { displayNameOf, machineUids, ownMachineName, type RosterName, type SelfIdentity } from "./flow";
 import type { NormRecord } from "./ingest";
 

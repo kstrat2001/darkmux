@@ -419,8 +419,14 @@ mod ts {
     /// The actions that are records OF a role execution, exported so the
     /// viewer's copy of `FlowAction::grain` is keyed by this union and a
     /// drift is a type error.
+    ///
+    /// Only the export test below uses it, so it is built for tests only: another
+    /// crate's dev-dependency turning `ts-export` on must not compile it into the
+    /// library.
+    #[cfg(test)]
     pub struct ExecutionGrainAction;
 
+    #[cfg(test)]
     impl ExecutionGrainAction {
         fn wires() -> Vec<&'static str> {
             FlowAction::KNOWN_WIRE
@@ -431,6 +437,7 @@ mod ts {
         }
     }
 
+    #[cfg(test)]
     impl ts_rs::TS for ExecutionGrainAction {
         type WithoutGenerics = Self;
         const DOCS: Option<&'static str> = Some(

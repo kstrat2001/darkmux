@@ -20,7 +20,7 @@ const proc = (
 ): NormRecord => norm({
   ts,
   category: "telemetry",
-  source: "process",
+  source: "host",
   // flow-action-guard:allow — a retired action, as an archive still holds it
   action: "telemetry.process",
   payload: { cpu, gpu, mem },
@@ -349,6 +349,7 @@ describe("MachineDrawer (#2107)", () => {
           darkmux_version: "3.3.0 (abc1234)",
           flow_schema_version: "1.28.0",
           machine_id: "MacBook-Pro",
+          machine_uid: null,
           os: "macOS",
           ram_total_bytes: 137438953472,
           ram_free_for_ai_bytes: null,
@@ -509,7 +510,7 @@ describe("MachineDrawer — idle state (no samples)", () => {
     const oldSample: NormRecord = norm({
       ts: new Date(NOW - 60 * 60_000).toISOString(), // 1h before NOW
       category: "telemetry",
-      source: "process",
+      source: "host",
       // flow-action-guard:allow — a retired action, as an archive still holds it
       action: "telemetry.process",
       payload: { cpu: 40, gpu: 55, mem: 30 },
@@ -1421,8 +1422,8 @@ describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", ()
           condition_word: "Normal",
           permanent_failure_status: 0,
           temperature_c: 31.0,
-          time_at_soc_hours: [10, 20, 40, 5],
-          total_operating_time_hours: 5368,
+          time_at_soc_ms: [36000000, 72000000, 144000000, 18000000],
+          total_operating_ms: 19324800000,
         },
       },
     });
@@ -1729,6 +1730,7 @@ describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", ()
           darkmux_version: "3.3.0 (ea3caf27)",
           flow_schema_version: "1.28.0",
           machine_id: "MacBook-Pro",
+          machine_uid: null,
           os: "macOS",
           ram_total_bytes: 137438953472,
           ram_free_for_ai_bytes: null,
@@ -1785,6 +1787,7 @@ describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", ()
           darkmux_version: "3.3.0 (ea3caf27)",
           flow_schema_version: "1.28.0",
           machine_id: "MacBook-Pro",
+          machine_uid: null,
           os: "macOS",
           ram_total_bytes: 137438953472,
           ram_free_for_ai_bytes: null,
@@ -1978,6 +1981,7 @@ describe("MachineDrawer — host stats only, never lms-derived model data", () =
    * `RESOURCES_WITH_MODELS`, so `FORBIDDEN` catches a leak from either
    * source without having to know which one it came from. */
   const SPECS_WITH_MODEL_DATA = {
+    machine_uid: null,
     darkmux_version: "3.6.0 (0904feab)",
     flow_schema_version: "1.33.0",
     machine_id: "MacBook-Pro",
@@ -1992,7 +1996,7 @@ describe("MachineDrawer — host stats only, never lms-derived model data", () =
       { identifier: "user:phi-4", model: "phi-4", status: "loaded", size: "9 GB", context: 16384 },
     ],
     lms_unreachable: false,
-    utility_model: { id: "qwen3-4b-instruct-2507", loaded: true },
+    utility_model: { id: "qwen3-4b-instruct-2507", loaded: true, n_ctx: null },
     redis_url_redacted: null,
     generated_at_ms: NOW,
   };

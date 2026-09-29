@@ -14,10 +14,10 @@ use cli::*;
 
 // SPIKE (#1388) — `darkmux acp`. See src/acp.rs module docs.
 mod acp;
-// (#1684) Registry-advertised panel commands + ephemeral procedural
-// launches — the merged mission-config registry enumeration, command
-// routing decision, and in-process ephemeral graph runner `acp.rs`'s
-// session/new and session/prompt handlers call into. Split out of acp.rs
+// The editor panel's generic `/mission list|launch|show` verbs (launch
+// planning over the merged mission-config registry) and the in-process
+// ephemeral graph runner `acp.rs`'s session/new and session/prompt
+// handlers call into. Split out of acp.rs
 // itself so the ACP wire-protocol plumbing and the registry/scheduler
 // wiring stay independently readable.
 mod acp_panel;
@@ -62,6 +62,7 @@ pub use darkmux_lab::lab;
 mod lab_cli;
 mod config_cmd;
 mod conventions;
+mod mission_show;
 mod mission_status;
 mod retired_verbs;
 mod run_list;
@@ -170,7 +171,7 @@ fn run(cmd: Cmd) -> Result<i32> {
             finding,
             mod_key,
             profile,
-            session_id,
+            name,
             timeout,
             workdir,
             workspace_read_only,
@@ -187,7 +188,7 @@ fn run(cmd: Cmd) -> Result<i32> {
             finding,
             mod_key,
             profile,
-            session_id,
+            name,
             timeout,
             workdir,
             workspace_read_only,
@@ -495,7 +496,7 @@ fn cmd_correction(sub: CorrectionCmd) -> Result<i32> {
     match sub {
         CorrectionCmd::List {
             mission,
-            session,
+            execution,
             days,
             json: cli::JsonFlagPlain { json },
         } => {
@@ -504,9 +505,9 @@ fn cmd_correction(sub: CorrectionCmd) -> Result<i32> {
             // never a prefix, which would bleed a sibling mission whose id
             // is a hyphen-extension, #849).
             let phases = mission.as_deref().map(correction_phase_sessions).transpose()?;
-            let scope = match (&phases, &session) {
+            let scope = match (&phases, &execution) {
                 (Some(p), _) => crew::corrections::Scope::Phases(p),
-                (None, Some(sid)) => crew::corrections::Scope::Session(sid),
+                (None, Some(id)) => crew::corrections::Scope::Execution(id),
                 (None, None) => crew::corrections::Scope::All,
             };
 
@@ -517,16 +518,16 @@ fn cmd_correction(sub: CorrectionCmd) -> Result<i32> {
                 return Ok(0);
             }
             if found.is_empty() {
-                let scoped = match (&mission, &session) {
+                let scoped = match (&mission, &execution) {
                     (Some(m), _) => format!(" for mission `{m}`"),
-                    (None, Some(s)) => format!(" for session `{s}`"),
+                    (None, Some(s)) => format!(" for role execution `{s}`"),
                     (None, None) => String::new(),
                 };
                 println!(
                     "{}",
                     darkmux_types::style::dim(&format!(
                         "no adjudication corrections recorded{scoped} in the last {days} day(s) \
-                         — your reviewer records them with darkmux flow note --session-id <sid> \
+                         — your reviewer records them with darkmux flow note --execution <id> \
                          --text \"<verdict · what you overrode · why>\" --source adjudication"
                     ))
                 );
@@ -542,13 +543,22 @@ fn cmd_correction(sub: CorrectionCmd) -> Result<i32> {
                 println!(
                     "  {} {}",
                     darkmux_types::style::accent(&c.ts),
-                    darkmux_types::style::dim(&format!("[{}]", c.session_id))
+                    darkmux_types::style::dim(&format!("[{}]", correction_origin(c)))
                 );
                 println!("    {}", c.text);
             }
             Ok(0)
         }
     }
+}
+
+/// What `memory correction list` names a correction as being about: its role
+/// execution, or, for an old record that names none, that plainly.
+fn correction_origin(correction: &crew::corrections::Correction) -> String {
+    correction
+        .execution_id
+        .as_ref()
+        .map_or_else(|| "no execution recorded".to_string(), |id| id.to_string())
 }
 
 fn print_lessons_tier(label: &str, entries: &[darkmux_crew::lessons::Lesson]) {
@@ -872,7 +882,8 @@ fn cmd_finding(sub: cli::FindingCmd) -> Result<i32> {
 
 fn cmd_mission(sub: MissionCmd) -> Result<i32> {
     match sub {
-        MissionCmd::Status { json, limit, all, missions } => mission_status::run(json, limit, all, missions),
+        MissionCmd::Status { json, limit, all, named } => mission_status::run(json, limit, all, named),
+        MissionCmd::Show { id, json } => mission_show::run(&id, json),
         MissionCmd::Debrief { id, json } => coder_phase::debrief(&id, json),
         MissionCmd::Finalize { id, reasoning } => {
             coder_phase::finalize(&id, reasoning.as_deref())
@@ -911,7 +922,7 @@ struct DispatchInvocation {
     finding: Vec<String>,
     mod_key: Vec<String>,
     profile: Option<String>,
-    session_id: Option<String>,
+    name: Option<String>,
     timeout: Option<u32>,
     workdir: Option<std::path::PathBuf>,
     workspace_read_only: bool,
@@ -923,45 +934,14 @@ struct DispatchInvocation {
     resume_from: Option<std::path::PathBuf>,
 }
 
-/// (#1426) `darkmux dispatch <role> [MESSAGE]` — the task-grain execution
-/// entry, promoted from the retired `dispatch`. The plumbing is unchanged
-/// (`fleet::dispatch_routed`); only the message source is reshaped: the message
-/// is a positional argument, falls back to stdin when omitted, and can still be
-/// read from a file via `--message-from-file`.
-fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
-    // (#2947) Bad enum config refuses first: before the message is read
-    // from stdin, before brief refs resolve, and before the crew-of-one
-    // mission is minted. `--skip-preflight` does not waive it: that flag
-    // skips the Docker/daemon probe, and a bad config value is not a probe
-    // result that could be stale or wrong.
-    darkmux_crew::user_files::preflight(darkmux_types::config_enum::Scope::Dispatch)?;
-    let DispatchInvocation {
-        role,
-        message,
-        message_from_file,
-        finding,
-        mod_key,
-        profile,
-        session_id,
-        timeout,
-        workdir,
-        workspace_read_only,
-        skip_preflight,
-        json,
-        no_wait,
-        image,
-        max_completion_tokens,
-        resume_from,
-    } = inv;
-    // (#2916 stage 2) The machine comes from the profile address: parsed
-    // here, before the message is read, so a malformed address is refused
-    // first. `dispatch_routed_via` splits it for the dispatch itself.
-    let machine = profile
-        .as_deref()
-        .map(darkmux_types::profile_address::ProfileAddress::parse)
-        .transpose()
-        .map_err(|e| anyhow::anyhow!("darkmux dispatch: {e}"))?
-        .and_then(|a| a.machine);
+/// The dispatch message in precedence order. `message` and `message_from_file`
+/// arrive as clap parsed them (mutually exclusive), so `role` is only for the
+/// usage guidance.
+fn resolve_dispatch_message(
+    role: &str,
+    message: Option<String>,
+    message_from_file: Option<std::path::PathBuf>,
+) -> Result<String> {
     // (#1426) Resolve the message in precedence order: positional MESSAGE >
     // `--message-from-file` > stdin. clap makes the positional and the file
     // flag mutually exclusive, so at most one of the first two is present.
@@ -973,7 +953,7 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
     // (empty `git diff`, a stray `echo |`, a blank brief file) likewise bails
     // loudly rather than burning a container run on a blank brief — the trim
     // is only the emptiness CHECK; real content is passed through unmodified.
-    let message = match (message, message_from_file) {
+    Ok(match (message, message_from_file) {
         (Some(m), _) => m,
         (None, Some(path)) => {
             let m = std::fs::read_to_string(&path)
@@ -1012,7 +992,49 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
             }
             buf
         }
-    };
+    })
+}
+
+/// (#1426) `darkmux dispatch <role> [MESSAGE]` — the task-grain execution
+/// entry, promoted from the retired `dispatch`. The plumbing is unchanged
+/// (`fleet::dispatch_routed`); only the message source is reshaped: the message
+/// is a positional argument, falls back to stdin when omitted, and can still be
+/// read from a file via `--message-from-file`.
+fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
+    // (#2947) Bad enum config refuses first: before the message is read
+    // from stdin, before brief refs resolve, and before the crew-of-one
+    // mission is minted. `--skip-preflight` does not waive it: that flag
+    // skips the Docker/daemon probe, and a bad config value is not a probe
+    // result that could be stale or wrong.
+    darkmux_crew::user_files::preflight(darkmux_types::config_enum::Scope::Dispatch)?;
+    let DispatchInvocation {
+        role,
+        message,
+        message_from_file,
+        finding,
+        mod_key,
+        profile,
+        name,
+        timeout,
+        workdir,
+        workspace_read_only,
+        skip_preflight,
+        json,
+        no_wait,
+        image,
+        max_completion_tokens,
+        resume_from,
+    } = inv;
+    // (#2916 stage 2) The machine comes from the profile address: parsed
+    // here, before the message is read, so a malformed address is refused
+    // first. `dispatch_routed_via` splits it for the dispatch itself.
+    let machine = profile
+        .as_deref()
+        .map(darkmux_types::profile_address::ProfileAddress::parse)
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("darkmux dispatch: {e}"))?
+        .and_then(|a| a.machine);
+    let message = resolve_dispatch_message(&role, message, message_from_file)?;
     // (#2295) `--finding <key>` and `--mod <key>` (both repeatable): each
     // named record's stored content is appended to the brief VERBATIM, after
     // the operator's own message. A key that addresses no stored record is
@@ -1077,8 +1099,8 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
         record_context: None,
         // The crew-of-one run this dispatch is, minted here so the route
         // record, a fleet submission and the local run all carry it;
-        // `--session-id` names the dispatch within it.
-        session: crew::dispatch_as_crew_of_one::dispatch_session(&role, session_id),
+        // `--name` names the dispatch within it.
+        session: crew::dispatch_as_crew_of_one::dispatch_session(&role, name),
         role_id: role,
         message,
         brief_refs,
@@ -1212,16 +1234,25 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
     // consumer it was written for and serves well.
     let quiet = json && result.exit_code == 0;
     if !quiet {
-        // Announce the resolved session id on stderr so operators can
+        // Announce the resolved execution id on stderr so operators can
         // correlate this dispatch with the flow stream — without polluting the
         // --json envelope on stdout that orchestrators parse.
-        eprintln!("darkmux dispatch: session id `{}`", result.session_id);
+        if let Some(line) = execution_id_line(&result) {
+            eprintln!("{line}");
+        }
     }
     print!("{}", result.stdout);
     if !quiet && !result.stderr.is_empty() {
         eprint!("{}", result.stderr);
     }
     Ok(result.exit_code)
+}
+
+/// The line `dispatch` prints naming the role execution it ran: its
+/// `exec-...` id, the one `--execution` takes. A result no local execution
+/// produced (a job routed to another machine) names none.
+fn execution_id_line(result: &crew::dispatch::DispatchResult) -> Option<String> {
+    result.execution.as_ref().map(|execution| format!("darkmux dispatch: execution id `{execution}`"))
 }
 
 /// (#1426) The `machine` family — this host's AI state. Bare `machine` (and
@@ -1912,6 +1943,38 @@ fn model_ctx_label(m: &types::ProfileModel, registry: &darkmux_types::ProfileReg
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_correction_shows_its_execution_or_says_it_has_none() {
+        let id = darkmux_types::execution_id::ExecutionId::mint();
+        let correction = |execution_id| crew::corrections::Correction { ts: "t".into(), execution_id, text: "x".into() };
+        assert_eq!(correction_origin(&correction(Some(id.clone()))), id.as_str());
+        assert_eq!(correction_origin(&correction(None)), "no execution recorded");
+    }
+
+    /// The id `dispatch` prints is the execution's, not its session's, and
+    /// is one every `--execution` flag takes.
+    #[test]
+    fn dispatch_prints_the_execution_id_that_every_execution_flag_takes() {
+        let execution = darkmux_types::execution_id::ExecutionId::mint();
+        let mut result = crew::dispatch::DispatchResult {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            session_id: test_session("s"),
+            execution: Some(execution.clone()),
+            out_dir: None,
+            trajectory: None,
+        };
+        let line = execution_id_line(&result).expect("a local dispatch names its execution");
+        assert!(line.contains(execution.as_str()), "{line}");
+        assert!(!line.contains(&result.session_id.wire()), "the session id is not the execution id: {line}");
+        let printed = line.split('`').nth(1).unwrap();
+        assert_eq!(flow_cli::parse_execution_arg(printed).unwrap(), execution);
+
+        result.execution = None;
+        assert_eq!(execution_id_line(&result), None, "a routed job has no local execution to name");
+    }
 
     /// (#2902 re-review C2) `profile list` tells a quarantined endpoint
     /// entry from an undefined id and from a defined-but-unusable one.

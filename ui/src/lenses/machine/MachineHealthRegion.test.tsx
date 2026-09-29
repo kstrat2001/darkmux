@@ -2,7 +2,8 @@ import { describe, it, expect } from "vitest";
 import { render } from "@testing-library/react";
 import { MachineHealthRegion } from "./MachineHealthRegion";
 import { advanceResidency } from "./machineGauge";
-import type { MachineResources, MachineResourcesModel } from "../../types/handwritten";
+import type { MachineResourcesResponse } from "../../types/generated/MachineResourcesResponse";
+import type { ModelRow } from "../../types/generated/ModelRow";
 import { maxOf, minOf } from "../../lib/numbers";
 
 // #1806 Stage 2/3's structural DOM claims, at the component level — the
@@ -33,7 +34,7 @@ function odoCellExtents(container: HTMLElement): { left: number; right: number }
   });
 }
 
-const BASE: MachineResources = {
+const BASE: MachineResourcesResponse = {
   schema_version: "1.0",
   generated_at_ms: 1000,
   gather_ms: 42,
@@ -67,17 +68,18 @@ const BASE: MachineResources = {
       state: "unknown",
     },
   ],
-  machine: { potential_bytes: 19272177280, unpriced_models: 1, estimated_models: 0, current_bytes: 20841952256, state: "unknown" },
+  machine: { potential_bytes: 19272177280, unpriced_models: 1, estimated_models: 0, over_price_models: 0, other_used_bytes: null, projected_total_bytes: null, current_bytes: 20841952256, state: "unknown" },
   attribution: "per_process",
+  attribution_note: "",
   messages: [],
   cache_ttl_ms: 2000,
 };
 
-function residencyRowsFor(resources: MachineResources) {
+function residencyRowsFor(resources: MachineResourcesResponse) {
   return advanceResidency(null, resources.models, resources.generated_at_ms).rows;
 }
 
-function renderRegion(resources: MachineResources | null, extra: Partial<Parameters<typeof MachineHealthRegion>[0]> = {}) {
+function renderRegion(resources: MachineResourcesResponse | null, extra: Partial<Parameters<typeof MachineHealthRegion>[0]> = {}) {
   return render(
     <MachineHealthRegion
       isLocalMach
@@ -118,7 +120,7 @@ describe("MachineHealthRegion — absence vs zero (docs/design/machine-lens/prov
    * legend entry for one, rather than a zero-width band.
    */
   it("draws NO growth band and no committed legend entry when there is nothing beyond current", () => {
-    const nothingPending: MachineResources = {
+    const nothingPending: MachineResourcesResponse = {
       ...BASE,
       models: [],
       machine: { ...BASE.machine, potential_bytes: 0, unpriced_models: 0 },
@@ -133,7 +135,7 @@ describe("MachineHealthRegion — absence vs zero (docs/design/machine-lens/prov
   it("the inverted case: a commitment beyond current DOES draw the band and name it", () => {
     // BASE is a fully-materialised fixture (committed 17.95 < current 19.41),
     // so it correctly has NO growth. Give it something still to claim.
-    const pending: MachineResources = {
+    const pending: MachineResourcesResponse = {
       ...BASE,
       machine: { ...BASE.machine, potential_bytes: 60_000_000_000 },
     };
@@ -159,9 +161,9 @@ describe("MachineHealthRegion — absence vs zero (docs/design/machine-lens/prov
 
 describe("MachineHealthRegion — hostile state strings degrade to 'unknown', never land raw", () => {
   it("maps an XSS-shaped state string to the unknown class, not a class attribute breakout", () => {
-    const hostile: MachineResources = {
+    const hostile: MachineResourcesResponse = {
       ...BASE,
-      models: [{ ...BASE.models[0], identifier: "hostile-model", state: 'red" onmouseover=window.__xss=1 x="' }],
+      models: [{ ...BASE.models[0], identifier: "hostile-model", state: 'red" onmouseover=window.__xss=1 x="' as never }],
       machine: { ...BASE.machine, unpriced_models: 0 },
     };
     const { container } = renderRegion(hostile, { residencyRows: residencyRowsFor(hostile) });
@@ -172,7 +174,7 @@ describe("MachineHealthRegion — hostile state strings degrade to 'unknown', ne
   });
 
   it("a recognized state string keeps its real class — the mapping is a real allowlist, not a blanket degrade", () => {
-    const known: MachineResources = {
+    const known: MachineResourcesResponse = {
       ...BASE,
       models: [{ ...BASE.models[0], identifier: "amber-model", state: "amber" }],
       machine: { ...BASE.machine, unpriced_models: 0 },
@@ -216,7 +218,7 @@ describe("MachineHealthRegion — the arc's color is a fixed ramp, never a verdi
     // The strongest form of "the fill is not a verdict": vary only
     // `machine.state` and the drawn arc must not differ by one character.
     const at = (state: string): string => {
-      const r: MachineResources = { ...BASE, machine: { ...BASE.machine, state } };
+      const r: MachineResourcesResponse = { ...BASE, machine: { ...BASE.machine, state: state as never } };
       const { container } = renderRegion(r, { residencyRows: residencyRowsFor(r) });
       return container.querySelector(".mm-gauge-val")!.outerHTML;
     };
@@ -229,7 +231,7 @@ describe("MachineHealthRegion — the arc's color is a fixed ramp, never a verdi
     // ending at the machine's `128 LIMIT` must not be driven by a quantity
     // that is only ever a fraction of it. darkmux barely present; the
     // MACHINE nearly full.
-    const busyElsewhere: MachineResources = {
+    const busyElsewhere: MachineResourcesResponse = {
       ...BASE,
       machine: { ...BASE.machine, current_bytes: 2_000_000_000 },
       pool: { ...BASE.pool!, used_bytes: 120_000_000_000 },
@@ -255,7 +257,7 @@ describe("MachineHealthRegion — the arc's color is a fixed ramp, never a verdi
     // reader can already see. The lamp row still carries server-declared
     // CONDITIONS (pressure, over-limit, unpriced) — those are facts, not an
     // assessment of whether the machine is doing well.
-    const full: MachineResources = { ...BASE, machine: { ...BASE.machine, state: "unknown", current_bytes: 130000000000 } };
+    const full: MachineResourcesResponse = { ...BASE, machine: { ...BASE.machine, state: "unknown", current_bytes: 130000000000 } };
     const { container } = renderRegion(full, { residencyRows: residencyRowsFor(full) });
     expect(container.querySelector(".mm-gcap")).toBeNull();
     expect(container.querySelector(".mm-chip")).toBeNull();
@@ -271,7 +273,7 @@ describe("MachineHealthRegion — the pressure tiles' seven-segment readout", ()
     // `.mm-odo-dot` span rather than a segment glyph. This is the FOOTER
     // odometer's own branch (the hero readout has a separate copy) — it had
     // never fired in a test before this one.
-    const swapped: MachineResources = {
+    const swapped: MachineResourcesResponse = {
       ...BASE,
       pressure: { ...BASE.pressure, swap_used_bytes: 7_752_000_000 },
     };
@@ -331,7 +333,7 @@ describe("MachineHealthRegion — the center readout is centered on the hub", ()
   });
 
   it("never cites the dashed tick — it was deleted", () => {
-    const pending: MachineResources = { ...BASE, machine: { ...BASE.machine, potential_bytes: 60_000_000_000 } };
+    const pending: MachineResourcesResponse = { ...BASE, machine: { ...BASE.machine, potential_bytes: 60_000_000_000 } };
     const { container } = renderRegion(pending, { residencyRows: residencyRowsFor(pending) });
     const aria = container.querySelector(".mm-gauge svg")!.getAttribute("aria-label")!;
     expect(aria).not.toMatch(/dashed tick/);
@@ -344,7 +346,7 @@ describe("MachineHealthRegion — the center readout is centered on the hub", ()
     // the machine is 0% full for the very payload the odometer renders as a
     // single "—". Absence is never zero — including in the channel a sighted
     // reader cannot check against the dial.
-    const none: MachineResources = {
+    const none: MachineResourcesResponse = {
       ...BASE,
       machine: { ...BASE.machine, current_bytes: null as unknown as number },
       pool: { ...BASE.pool!, used_bytes: null as unknown as number },
@@ -364,7 +366,7 @@ describe("MachineHealthRegion — the center readout is centered on the hub", ()
   it("stays centered when the figure's width changes — including the no-data case", () => {
     // The readout's source is the MACHINE's used memory: 130e9 = 121.1 GiB,
     // five cells.
-    const wide: MachineResources = { ...BASE, pool: { ...BASE.pool!, used_bytes: 130000000000 } };
+    const wide: MachineResourcesResponse = { ...BASE, pool: { ...BASE.pool!, used_bytes: 130000000000 } };
     const { container } = renderRegion(wide, { residencyRows: residencyRowsFor(wide) });
     const cells = odoCellExtents(container);
     expect(cells.length).toBe(5);
@@ -372,7 +374,7 @@ describe("MachineHealthRegion — the center readout is centered on the hub", ()
 
     // Both sources unreadable — the readout falls back through pool.used to
     // machine.current, and with neither present renders "—", never a 0.
-    const none: MachineResources = {
+    const none: MachineResourcesResponse = {
       ...BASE,
       machine: { ...BASE.machine, current_bytes: null as unknown as number },
       pool: { ...BASE.pool!, used_bytes: null as unknown as number },
@@ -390,27 +392,27 @@ describe("MachineHealthRegion — the center readout is centered on the hub", ()
 
 describe("MachineHealthRegion — the redline keys on exactly machine.state === 'red'", () => {
   it("lights the redline and the center value when state is red", () => {
-    const red: MachineResources = { ...BASE, machine: { ...BASE.machine, state: "red", current_bytes: 140000000000 }, pressure: { ...BASE.pressure, red: true } };
+    const red: MachineResourcesResponse = { ...BASE, machine: { ...BASE.machine, state: "red", current_bytes: 140000000000 }, pressure: { ...BASE.pressure, red: true } };
     const { container } = renderRegion(red, { residencyRows: residencyRowsFor(red) });
     expect(container.querySelector(".mm-gauge-redline.lit")).not.toBeNull();
     expect(container.querySelector(".mm-gauge-center-val.lit")).not.toBeNull();
   });
 
   it("renders the red REASON in the caption slot — the one job that slot has", () => {
-    const red: MachineResources = { ...BASE, machine: { ...BASE.machine, state: "red", current_bytes: 140000000000 }, pressure: { ...BASE.pressure, red: true } };
+    const red: MachineResourcesResponse = { ...BASE, machine: { ...BASE.machine, state: "red", current_bytes: 140000000000 }, pressure: { ...BASE.pressure, red: true } };
     const { container } = renderRegion(red, { residencyRows: residencyRowsFor(red) });
     expect(container.querySelector(".mm-gauge-center-caption")!.textContent).toBe("RED · PRESSURE");
   });
 
   it("the inverted case: amber does NOT light the redline, even at high current", () => {
-    const amber: MachineResources = { ...BASE, machine: { ...BASE.machine, state: "amber", current_bytes: 140000000000 } };
+    const amber: MachineResourcesResponse = { ...BASE, machine: { ...BASE.machine, state: "amber", current_bytes: 140000000000 } };
     const { container } = renderRegion(amber, { residencyRows: residencyRowsFor(amber) });
     expect(container.querySelector(".mm-gauge-redline.lit")).toBeNull();
     expect(container.querySelector(".mm-gauge-center-val.lit")).toBeNull();
   });
 
   it("a stale (errored, cached) snapshot never shows a lit redline — the cached read isn't grounds to alarm live", () => {
-    const red: MachineResources = { ...BASE, machine: { ...BASE.machine, state: "red" }, pressure: { ...BASE.pressure, red: true } };
+    const red: MachineResourcesResponse = { ...BASE, machine: { ...BASE.machine, state: "red" }, pressure: { ...BASE.pressure, red: true } };
     const { container } = renderRegion(red, { resourcesErrored: true, residencyRows: residencyRowsFor(red) });
     expect(container.querySelector(".mm-gauge-redline.lit")).toBeNull();
   });
@@ -447,7 +449,7 @@ describe("MachineHealthRegion — #1812: stale keeps the last-good reading, visi
 
 describe("MachineHealthRegion — the machine's own shrink hint", () => {
   it("renders the machine-level shrink_hint, distinct from a per-model one", () => {
-    const withHint: MachineResources = { ...BASE, machine: { ...BASE.machine, ...({ shrink_hint: "shrink several contexts" } as object) } };
+    const withHint: MachineResourcesResponse = { ...BASE, machine: { ...BASE.machine, ...({ shrink_hint: "shrink several contexts" } as object) } };
     const { getByText } = renderRegion(withHint);
     expect(getByText(/shrink several contexts/)).toBeInTheDocument();
   });
@@ -467,10 +469,10 @@ describe("MachineHealthRegion — the machine's own shrink hint", () => {
   // component level rather than trusting the dedupe logic by inspection.
   it("renders a reload suggestion that targets a resident row AT MOST ONCE, in the card", () => {
     const RELOAD_TEXT = "reload priced-model at ctx 32768 (now 65536) — cuts 8.00 GB of KV commitment; Σ potential then fits the limit at load time";
-    const targeted: MachineResources = {
+    const targeted: MachineResourcesResponse = {
       ...BASE,
-      models: [{ ...BASE.models[0], shrink_hint: RELOAD_TEXT } as MachineResourcesModel, BASE.models[1]],
-      machine: { ...BASE.machine, state: "amber", shrink_hint: RELOAD_TEXT } as MachineResources["machine"],
+      models: [{ ...BASE.models[0], shrink_hint: RELOAD_TEXT } as ModelRow, BASE.models[1]],
+      machine: { ...BASE.machine, state: "amber", shrink_hint: RELOAD_TEXT } as MachineResourcesResponse["machine"],
     };
     const { container } = renderRegion(targeted, { residencyRows: residencyRowsFor(targeted) });
     const occurrences = [...container.querySelectorAll(".mm-hint")].filter((h) => h.textContent?.includes(RELOAD_TEXT));
@@ -483,9 +485,9 @@ describe("MachineHealthRegion — the machine's own shrink hint", () => {
   // resident" no-shrinkable-context arm) has no card to fold into, so it
   // still renders on its own — the dedupe must not swallow it.
   it("still renders the machine-level hint on its own when it targets nothing resident", () => {
-    const untargeted: MachineResources = {
+    const untargeted: MachineResourcesResponse = {
       ...BASE,
-      machine: { ...BASE.machine, state: "amber", shrink_hint: "over the limit by 4.00 GiB with no shrinkable context — unload a resident or load a smaller quant to reach green at load time" } as MachineResources["machine"],
+      machine: { ...BASE.machine, state: "amber", shrink_hint: "over the limit by 4.00 GiB with no shrinkable context — unload a resident or load a smaller quant to reach green at load time" } as MachineResourcesResponse["machine"],
     };
     const { getByText } = renderRegion(untargeted);
     expect(getByText(/unload a resident or load a smaller quant/)).toBeInTheDocument();
@@ -498,7 +500,7 @@ describe("MachineHealthRegion — #2440 cut 3: only ACTIVE lamps render", () => 
     // (whose unpriced resident would light the UNPRICED lamp): zero
     // unpriced/estimated models, no pressure/over-limit condition, no
     // messages, no residency change, no stale poll.
-    const quiet: MachineResources = {
+    const quiet: MachineResourcesResponse = {
       ...BASE,
       models: [BASE.models[0]],
       machine: { ...BASE.machine, unpriced_models: 0, estimated_models: 0, state: "green" },
@@ -510,7 +512,7 @@ describe("MachineHealthRegion — #2440 cut 3: only ACTIVE lamps render", () => 
   });
 
   it("renders EXACTLY the active lamps, none of the inactive ones", () => {
-    const pressured: MachineResources = {
+    const pressured: MachineResourcesResponse = {
       ...BASE,
       pressure: { ...BASE.pressure, red: true },
       messages: [],
@@ -635,7 +637,7 @@ describe("MachineHealthRegion — the k/v row and footer the retired golden used
   });
 
   it("omits the parenthetical when there is no overlap to explain", () => {
-    const flush: MachineResources = {
+    const flush: MachineResourcesResponse = {
       ...BASE,
       pool: { ...BASE.pool!, available_bytes: BASE.pool!.free_bytes },
     };
@@ -779,7 +781,7 @@ describe("MachineHealthRegion — the per-row state chip only speaks when it dis
   it("DOES render it on a row that diverges — a materialized model under machine-amber", () => {
     // The exact `compute_ledger` branch: machine amber, but this model's
     // current has fully materialized its potential, so the row is green.
-    const amber: MachineResources = {
+    const amber: MachineResourcesResponse = {
       ...BASE,
       machine: { ...BASE.machine, state: "amber" },
       models: BASE.models.map((m) => (m.owner === "darkmux" ? { ...m, state: "green" } : m)),
@@ -792,7 +794,7 @@ describe("MachineHealthRegion — the per-row state chip only speaks when it dis
   });
 
   it("keeps the whole ledger quiet when every row agrees — the everyday case", () => {
-    const uniform: MachineResources = {
+    const uniform: MachineResourcesResponse = {
       ...BASE,
       machine: { ...BASE.machine, state: "green" },
       models: BASE.models.map((m) => ({ ...m, state: "green" })),
@@ -822,7 +824,7 @@ describe("MachineHealthRegion — no utility row chip (#2915)", () => {
  * coverage above, so a future edit can't quietly satisfy one case while
  * breaking the other.
  */
-const ESTIMATED_MODEL: MachineResourcesModel = {
+const ESTIMATED_MODEL: ModelRow = {
   identifier: "microsoft/phi-4-Q4_K_M",
   model_key: "phi-4-gguf",
   owner: "user",
@@ -837,7 +839,7 @@ const ESTIMATED_MODEL: MachineResourcesModel = {
 };
 
 describe("MachineHealthRegion — #1819 the ESTIMATED resident carries its provenance everywhere the verdict appears", () => {
-  function withEstimated(machineOverrides: Partial<MachineResources["machine"]> = {}): MachineResources {
+  function withEstimated(machineOverrides: Partial<MachineResourcesResponse["machine"]> = {}): MachineResourcesResponse {
     return {
       ...BASE,
       models: [BASE.models[0], ESTIMATED_MODEL],
@@ -880,7 +882,7 @@ describe("MachineHealthRegion — #1819 the ESTIMATED resident carries its prove
   // carries the dense-attention assumption verbatim.
   it("carries the dense-attention assumption in the ONE disclosure, not a per-row hint", () => {
     const resources = withEstimated({
-      ...({} as Partial<MachineResources["machine"]>),
+      ...({} as Partial<MachineResourcesResponse["machine"]>),
     });
     resources.messages = [
       { severity: "info", text: "1 resident model(s) priced by ESTIMATE, not measurement — assumes dense attention, overstating hybrid-attention models" },
@@ -928,7 +930,7 @@ describe("MachineHealthRegion — #1819 the ESTIMATED resident carries its prove
   });
 
   it("a genuinely unpriceable resident still forces the machine to UNKNOWN even alongside an estimated one — an estimate never substitutes for a real price", () => {
-    const resources: MachineResources = {
+    const resources: MachineResourcesResponse = {
       ...BASE,
       // BASE.models[1] is the genuinely unpriced fixture. The estimated
       // row's own `state` is "unknown" here too — matching what the real
@@ -963,7 +965,7 @@ describe("MachineHealthRegion — messages[] severity (#1821: an info disclosure
     // (#2440 cut 3) An unlit lamp no longer renders AT ALL — asserting its
     // absence is the honest form of "not lit" now, not a class check on an
     // element that no longer exists.
-    const infoOnly: MachineResources = {
+    const infoOnly: MachineResourcesResponse = {
       ...BASE,
       messages: [{ severity: "info", text: "N models priced by ESTIMATE" }],
     };
@@ -972,7 +974,7 @@ describe("MachineHealthRegion — messages[] severity (#1821: an info disclosure
   });
 
   it("the inverted case: a warn-severity message DOES light the WARN lamp", () => {
-    const withWarn: MachineResources = {
+    const withWarn: MachineResourcesResponse = {
       ...BASE,
       messages: [{ severity: "warn", text: "resident model(s) unpriceable — undercounts" }],
     };
@@ -981,7 +983,7 @@ describe("MachineHealthRegion — messages[] severity (#1821: an info disclosure
   });
 
   it("an error-severity message also lights the WARN lamp", () => {
-    const withError: MachineResources = {
+    const withError: MachineResourcesResponse = {
       ...BASE,
       messages: [{ severity: "error", text: "`lms ps` probe failed" }],
     };
@@ -990,7 +992,7 @@ describe("MachineHealthRegion — messages[] severity (#1821: an info disclosure
   });
 
   it("the message card renders the alarm (warn/error) entries; the info entry moves into the disclosure instead (#2440 cut 4)", () => {
-    const mixed: MachineResources = {
+    const mixed: MachineResourcesResponse = {
       ...BASE,
       messages: [
         { severity: "info", text: "estimate disclosure" },
@@ -1014,7 +1016,7 @@ describe("MachineHealthRegion — messages[] severity (#1821: an info disclosure
 // clamps the projection to what is actually held and flags the row; these
 // tests pin the two places the page SAYS so, because a silently-repaired
 // estimate is one nobody ever fixes.
-const OVER_PRICE: MachineResources = {
+const OVER_PRICE: MachineResourcesResponse = {
   ...BASE,
   models: [
     { ...BASE.models[0], potential_bytes: 24565385183, current_bytes: 30493331456, over_price_bytes: 5927946273, state: "green" },

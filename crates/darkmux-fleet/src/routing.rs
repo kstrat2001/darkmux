@@ -247,7 +247,8 @@ fn dispatch_via_submission(opts: DispatchOpts, target: &str) -> Result<DispatchR
         darkmux_flow::resolve_machine_id(),
     );
     eprintln!(
-        "darkmux dispatch: submitting to {target} (session={session_id}{})…",
+        "darkmux dispatch: submitting to {target} (run={}{})…",
+        session_id.wire(),
         if opts.wait { ", waiting for the result" } else { "" }
     );
     let reply = crate::submission::submit_work(job, opts.wait)?;
@@ -263,15 +264,16 @@ pub(crate) fn reply_to_dispatch_result(
 ) -> DispatchResult {
     use crate::ReplyStatus;
     let session_id = reply.session_id.clone().unwrap_or_else(|| session_id.clone());
-    let follow = format!("Follow it with `darkmux flow tail --session {session_id}` or in the viewer.");
+    let run = session_id.wire();
+    let follow = format!("Follow it in the viewer, or on {target} with `darkmux run list --kind dispatch`.");
     let stdout = match reply.status {
         // (#2916 stage 2) Queued without `--wait`: the receiver's own words,
         // verbatim (control characters removed), and how to follow it.
         ReplyStatus::Queued => format!(
-            "queued on {target}; not waiting (session_id={session_id}): {}. {follow}\n",
+            "queued on {target}; not waiting (run={run}): {}. {follow}\n",
             crate::sanitize_remote_text(reply.reason.as_deref().unwrap_or("its seat is busy"))
         ),
-        ReplyStatus::Accepted => format!("submitted to {target}; not waiting (session_id={session_id}). {follow}\n"),
+        ReplyStatus::Accepted => format!("submitted to {target}; not waiting (run={run}). {follow}\n"),
         // (#2916 review C1) Remote output never reaches the terminal raw.
         ReplyStatus::Completed | ReplyStatus::Error | ReplyStatus::Refused => {
             return DispatchResult {
@@ -342,7 +344,13 @@ mod tests {
         let accepted = crate::SubmissionReply::of(crate::ReplyStatus::Accepted);
         let r = reply_to_dispatch_result(accepted, &local, "studio");
         assert_eq!(r.exit_code, 0);
-        assert!(r.stdout.contains(&format!("submitted to studio; not waiting (session_id={local})")), "{}", r.stdout);
+        assert!(r.stdout.contains(&format!("submitted to studio; not waiting (run={})", local.wire())), "{}", r.stdout);
+        assert!(r.stdout.contains("darkmux run list --kind dispatch"), "it names the command that lists the run: {}", r.stdout);
+        assert!(!r.stdout.contains("session"), "a routed job shows the run, never the session: {}", r.stdout);
+        let queued = crate::SubmissionReply::of(crate::ReplyStatus::Queued);
+        let r = reply_to_dispatch_result(queued, &local, "studio");
+        assert!(r.stdout.contains(&format!("queued on studio; not waiting (run={})", local.wire())), "{}", r.stdout);
+        assert!(!r.stdout.contains("session"), "{}", r.stdout);
     }
 
     // (#1509) `dispatch_routed_via`'s local-dispatch injection seam. No

@@ -51,7 +51,7 @@ describe("activityOf", () => {
       "host telemetry",
     );
     // flow-action-guard:allow — a retired action, as an archive still holds it
-    expect(activityOf(rec({ action: "telemetry.process", category: "telemetry", source: "process" }))).toBe(
+    expect(activityOf(rec({ action: "telemetry.process", category: "telemetry", source: "host" }))).toBe(
       "host telemetry",
     );
   });
@@ -68,11 +68,11 @@ describe("activityOf", () => {
 
 describe("computeFacets / defaultFilterState", () => {
   it("derives facets from records, and defaultFilterState includes every one of them (a non-act facet)", () => {
-    const records = [rec({ tier: "local", source: "lms" }), rec({ tier: "frontier", category: "telemetry", source: "lms" })];
+    const records = [rec({ tier: "darkmux", source: "lms" }), rec({ tier: "frontier", category: "telemetry", source: "lms" })];
     const facets = computeFacets(records);
-    expect(facets.tier.sort()).toEqual(["frontier", "local"]);
+    expect(facets.tier.sort()).toEqual(["darkmux", "frontier"]);
     const filters = defaultFilterState(facets);
-    expect(filters.tier.has("local")).toBe(true);
+    expect(filters.tier.has("darkmux")).toBe(true);
     expect(filters.tier.has("frontier")).toBe(true);
     expect(filters.q).toBe("");
   });
@@ -118,10 +118,10 @@ describe("computeFacets / defaultFilterState", () => {
 
 describe("matchesFilters", () => {
   it("excludes a record whose facet value is present but unchecked", () => {
-    const facets = computeFacets([rec({ tier: "local" }), rec({ tier: "frontier" })]);
+    const facets = computeFacets([rec({ tier: "darkmux" }), rec({ tier: "frontier" })]);
     const filters = defaultFilterState(facets);
     filters.tier.delete("frontier");
-    expect(matchesFilters(rec({ tier: "local" }), filters)).toBe(true);
+    expect(matchesFilters(rec({ tier: "darkmux" }), filters)).toBe(true);
     expect(matchesFilters(rec({ tier: "frontier" }), filters)).toBe(false);
   });
 
@@ -147,9 +147,9 @@ describe("absorbNewFacetValues — viewer.html's absorbNewFilterValues()/SEEN (#
   it("auto-includes a brand-new NON-act facet value the first time it's ever seen", () => {
     const seen = createFacetSeen();
     let filters = defaultFilterState({ act: [], cat: [], tier: [], src: [] }); // the empty-at-mount snapshot
-    const facets = computeFacets([rec({ tier: "local" })]);
+    const facets = computeFacets([rec({ tier: "darkmux" })]);
     filters = absorbNewFacetValues(filters, facets, seen, createStoredPicks());
-    expect(filters.tier.has("local")).toBe(true);
+    expect(filters.tier.has("darkmux")).toBe(true);
   });
 
   // RED-PROVED: this is the exact regression `tests/parity/next-parity-live.spec.ts`
@@ -196,7 +196,7 @@ describe("absorbNewFacetValues — viewer.html's absorbNewFilterValues()/SEEN (#
 
   it("returns the SAME filters reference when nothing new appeared (no spurious re-render)", () => {
     const seen = createFacetSeen();
-    const facets = computeFacets([rec({ tier: "local" })]);
+    const facets = computeFacets([rec({ tier: "darkmux" })]);
     let filters = defaultFilterState(facets);
     filters = absorbNewFacetValues(filters, facets, seen, createStoredPicks());
     const again = absorbNewFacetValues(filters, facets, seen, createStoredPicks());
@@ -256,7 +256,7 @@ describe("'model only' over the PRODUCTION filter path", () => {
   const hostTelemetry: NormRecord = norm({
     ts: "2026-08-08T12:00:01.000Z",
     category: "telemetry",
-    source: "process",
+    source: "host",
   });
 
   // (#2416) This is the deliberate behavior change the fix accepts: a
@@ -543,7 +543,7 @@ describe("#2416 — act defaults to DEFAULT_ACTIVITIES, new values absorb off, p
       rec({ action: "dispatch.reasoning" }),
       rec({ action: "dispatch.turn.heartbeat" }),
       rec({ action: "operator.note" }),
-      rec({ category: "telemetry", source: "process" }),
+      rec({ category: "telemetry", source: "host" }),
     ]);
     const filters = defaultFilterState(facets);
     expect(activeFilterCount(filters, facets)).toBeGreaterThan(0);
@@ -762,7 +762,7 @@ describe("hiddenCauseLabel — names the control responsible for a nonzero hidde
   it("names the activity filter when act alone is narrowed and the query is empty", () => {
     // "host telemetry" is not in DEFAULT_ACTIVITIES, so `defaultFilterState`
     // narrows act to the other three; cat/tier stay fully selected.
-    const facets: Facets = { act: ["reasoning", "tool call", "turn", "host telemetry"], cat: ["work"], tier: ["local"], src: [] };
+    const facets: Facets = { act: ["reasoning", "tool call", "turn", "host telemetry"], cat: ["work"], tier: ["darkmux"], src: [] };
     const filters = defaultFilterState(facets);
     expect(filters.act.size).toBe(3);
     expect(hiddenCauseLabel(filters, facets)).toBe("activity filter");

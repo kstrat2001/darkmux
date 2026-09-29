@@ -59,6 +59,7 @@
 //! is the explicit "this mission is now being worked on" transition.
 
 use crate::loader::load_phases;
+use crate::retired_state::{parse_state, StateKind};
 use crate::types::{Mission, MissionStatus, NodeStatus, Phase, PhaseStatus};
 use darkmux_flow as flow;
 use darkmux_flow::{Category, FlowRecord, Level, Stage, Tier};
@@ -203,26 +204,12 @@ pub fn save_phase(phase: &Phase) -> Result<()> {
     save_json(&phase_path(&phase.mission_id, &phase.id), phase)
 }
 
-/// Directory holding the mission's phase JSONs.
-///
-/// **Sprint→Phase rename read-fallback:** pre-rename mission data nests its
-/// phase JSONs under `sprints/` (the old directory name), not `phases/`. If
-/// the canonical `phases/` subdir doesn't exist yet for this mission but the
-/// legacy `sprints/` one does, reads (and any subsequent writes, via
-/// `save_json`'s create-on-write) route there instead ("writes follow
-/// reads"), so the rename never orphans an operator's real existing mission
-/// data. A mission with neither subdir yet (brand new) gets the canonical
-/// path so a fresh write creates the new-name layout.
+/// Directory holding the mission's phase JSONs. Only `phases/` is read: a
+/// mission directory still holding the pre-rename `sprints/` is reported by
+/// `darkmux doctor` ([`crate::retired_state::retired_phases_dir`]), and its
+/// phases are not read.
 pub fn phases_dir(mission_id: &str) -> PathBuf {
-    let canonical = mission_dir(mission_id).join("phases");
-    if canonical.is_dir() {
-        return canonical;
-    }
-    let legacy = mission_dir(mission_id).join("sprints");
-    if legacy.is_dir() {
-        return legacy;
-    }
-    canonical
+    mission_dir(mission_id).join("phases")
 }
 
 /// Path to a single phase JSON within a mission.
@@ -287,7 +274,7 @@ pub fn load_task(mission_id: &str, phase_id: &str, task_id: &str) -> Result<crat
     let path = task_path(mission_id, phase_id, task_id);
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("reading {}", path.display()))?;
-    serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+    parse_state(StateKind::Task, &path, &text)
 }
 
 /// Load every Task under a phase. Missing `tasks/<phase-id>/` dir
@@ -295,7 +282,7 @@ pub fn load_task(mission_id: &str, phase_id: &str, task_id: &str) -> Result<crat
 /// an empty `Vec`, matching the additive/backward-compatible nature of
 /// the Task/Step schema (a pre-#1230 phase has none).
 pub fn load_tasks_for_phase(mission_id: &str, phase_id: &str) -> Result<Vec<crate::types::Task>> {
-    load_json_dir(&tasks_dir(mission_id, phase_id))
+    load_json_dir(StateKind::Task, &tasks_dir(mission_id, phase_id))
 }
 
 /// Persist a Step via the same atomic-rename `save_json` every other
@@ -321,7 +308,7 @@ pub fn load_step(mission_id: &str, phase_id: &str, step_id: &str) -> Result<crat
 /// `steps_dir` is scoped by phase, not by task). Missing dir → empty
 /// `Vec`, same convention as `load_tasks_for_phase`.
 pub fn load_steps_for_phase(mission_id: &str, phase_id: &str) -> Result<Vec<crate::types::Step>> {
-    load_json_dir(&steps_dir(mission_id, phase_id))
+    load_json_dir(StateKind::Step, &steps_dir(mission_id, phase_id))
 }
 
 /// Shared "read every `*.json` file directly in `dir`, deserialize as
@@ -329,7 +316,7 @@ pub fn load_steps_for_phase(mission_id: &str, phase_id: &str) -> Result<Vec<crat
 /// A missing directory is NOT an error (empty `Vec`) — the normal state
 /// for any phase that predates the Task/Step schema or simply has no
 /// graph yet.
-fn load_json_dir<T: serde::de::DeserializeOwned>(dir: &std::path::Path) -> Result<Vec<T>> {
+fn load_json_dir<T: serde::de::DeserializeOwned>(kind: StateKind, dir: &std::path::Path) -> Result<Vec<T>> {
     if !dir.is_dir() {
         return Ok(Vec::new());
     }
@@ -346,9 +333,7 @@ fn load_json_dir<T: serde::de::DeserializeOwned>(dir: &std::path::Path) -> Resul
     for path in entries {
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
-        let value: T = serde_json::from_str(&text)
-            .with_context(|| format!("parsing {}", path.display()))?;
-        out.push(value);
+        out.push(parse_state(kind, &path, &text)?);
     }
     Ok(out)
 }
@@ -460,9 +445,7 @@ pub(crate) fn load_phase(mission_id: &str, phase_id: &str) -> Result<Phase> {
     }
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("reading {}", path.display()))?;
-    let phase: Phase = serde_json::from_str(&text)
-        .with_context(|| format!("parsing {}", path.display()))?;
-    Ok(phase)
+    parse_state(StateKind::Phase, &path, &text)
 }
 
 /// Load a phase by phase-id alone — scans every mission's phases dir
@@ -502,7 +485,7 @@ pub(crate) fn load_phase_by_id(phase_id: &str) -> Result<Phase> {
                 phase_id: Some(phase_id.to_string()),
                 session_id: None,
                 execution_id: None,
-                source: Some("phase_lifecycle".to_string()),
+                source: Some(darkmux_flow::FlowSource::PhaseLifecycle),
                 model: None,
                 reasoning: None,
                 mission_id: Some(chosen.mission_id.clone()),
@@ -511,8 +494,6 @@ pub(crate) fn load_phase_by_id(phase_id: &str) -> Result<Phase> {
                 prev_hash: None,
                 hash: None,
                 payload: None,
-                work_id: None,
-                attempt: None,
             });
             Ok(chosen.clone())
         }
@@ -535,9 +516,7 @@ fn load_mission(id: &str) -> Result<Mission> {
     }
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("reading {}", path.display()))?;
-    let mission: Mission = serde_json::from_str(&text)
-        .with_context(|| format!("parsing {}", path.display()))?;
-    Ok(mission)
+    parse_state(StateKind::Mission, &path, &text)
 }
 
 // ─── Flow record emission ──────────────────────────────────────────────
@@ -560,7 +539,7 @@ fn emit_phase_transition_record(phase_id: &str, mission_id: &str, action: darkmu
     let _ = flow::record(FlowRecord {
         tier: Tier::Operator,
         phase_id: Some(phase_id.to_string()),
-        source: Some("phase_lifecycle".to_string()),
+        source: Some(darkmux_flow::FlowSource::PhaseLifecycle),
         ..FlowRecord::for_session(&session, Level::Info, Category::Work, Stage::Scope, action, phase_id.to_string())
     });
 }
@@ -582,7 +561,7 @@ fn emit_mission_transition_record_with_reasoning_and_payload(
     let Some(session) = mission_session(mission_id) else { return };
     let _ = flow::record(FlowRecord {
         tier: Tier::Operator,
-        source: Some("mission_lifecycle".to_string()),
+        source: Some(darkmux_flow::FlowSource::MissionLifecycle),
         reasoning: reasoning.map(String::from),
         payload,
         ..FlowRecord::for_session(&session, Level::Info, Category::Work, Stage::Scope, action, mission_id.to_string())
@@ -1702,18 +1681,16 @@ mod tests {
         assert!(!tmp_path.exists(), "atomic save should rename, leaving no .tmp");
     }
 
-    // ─── Sprint→Phase rename: existing real-data compat ────────────────
+    // ─── Retired spellings in operator state ───────────────────────────
 
-    /// End-to-end: a phase written under the legacy `sprints/` dir name
-    /// (simulating an operator's real pre-rename mission on disk) is fully
-    /// operable through the lifecycle verbs — `load_phase_by_id` finds it
-    /// and `phase_start` writes the transition back to the SAME legacy
-    /// dir (writes follow reads; no silent state split, no orphaned data).
+    /// A phase under the retired `sprints/` directory is not read: the
+    /// lifecycle verbs do not find it, and nothing is written next to it.
     #[serial_test::serial]
     #[test]
-    fn phase_lifecycle_operates_on_legacy_sprints_dir_data() {
+    fn phases_under_the_retired_sprints_dir_are_not_read() {
         let _g = CrewGuard::new();
-        let legacy_dir = crate::loader::missions_dir().join("legacy-mission").join("sprints");
+        let mission_dir = crate::loader::missions_dir().join("legacy-mission");
+        let legacy_dir = mission_dir.join("sprints");
         fs::create_dir_all(&legacy_dir).unwrap();
         let s = Phase {
             id: "legacy-phase".to_string(),
@@ -1729,34 +1706,52 @@ mod tests {
         };
         save_json(&legacy_dir.join("legacy-phase.json"), &s).unwrap();
 
-        let loaded = load_phase_by_id("legacy-phase").expect("legacy phase should be discoverable");
-        assert_eq!(loaded.mission_id, "legacy-mission");
-
-        let updated = phase_start("legacy-phase").expect("phase_start should operate on legacy data");
-        assert_eq!(updated.status, PhaseStatus::Running);
-        // The transition must have been written back into the SAME legacy
-        // dir, not a freshly-created `phases/` dir — no silent state split.
-        assert!(legacy_dir.join("legacy-phase.json").exists());
-        assert!(!crate::loader::missions_dir().join("legacy-mission").join("phases").exists());
+        assert!(load_phase_by_id("legacy-phase").is_err(), "a phase in sprints/ is not found");
+        assert_eq!(phases_dir("legacy-mission"), mission_dir.join("phases"));
+        // Recovery: the rename doctor asks for makes the phase readable.
+        fs::rename(&legacy_dir, mission_dir.join("phases")).unwrap();
+        assert_eq!(load_phase_by_id("legacy-phase").unwrap().mission_id, "legacy-mission");
     }
 
-    /// A mission.json written with the pre-rename `sprint_ids` wire key
-    /// (instead of the canonical `phase_ids`) deserializes correctly via
-    /// `#[serde(alias = "sprint_ids")]` — an operator's real existing
-    /// mission JSON isn't silently emptied of its phase list.
+    /// A `mission.json` using the retired `sprint_ids` key is refused by
+    /// name, never loaded as a mission with an empty phase list; the renamed
+    /// key loads.
     #[serial_test::serial]
     #[test]
-    fn mission_json_with_legacy_sprint_ids_key_deserializes() {
+    fn mission_json_with_the_retired_sprint_ids_key_is_refused() {
         let _g = CrewGuard::new();
-        let legacy_json = r#"{
-            "id": "legacy-mission-2",
-            "description": "pre-rename mission",
-            "status": "active",
-            "sprint_ids": ["s1", "s2"],
-            "created_ts": 1700000000
-        }"#;
-        let m: Mission = serde_json::from_str(legacy_json).expect("legacy sprint_ids key must parse");
-        assert_eq!(m.phase_ids, vec!["s1".to_string(), "s2".to_string()]);
+        let path = mission_path("legacy-mission-2");
+        let write = |key: &str| {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(
+                &path,
+                format!(
+                    r#"{{"id": "legacy-mission-2", "description": "d", "status": "active",
+                    "{key}": ["s1", "s2"], "created_ts": 1700000000}}"#
+                ),
+            )
+            .unwrap();
+        };
+        write("sprint_ids");
+        let err = format!("{:#}", load_mission("legacy-mission-2").unwrap_err());
+        assert!(err.contains("`sprint_ids` was renamed to `phase_ids`"), "{err}");
+        write("phase_ids");
+        assert_eq!(load_mission("legacy-mission-2").unwrap().phase_ids, ["s1", "s2"]);
+    }
+
+    /// A task file using the retired `sprint_id` key is refused when its
+    /// phase's tasks are loaded, not dropped from the list.
+    #[serial_test::serial]
+    #[test]
+    fn task_json_with_the_retired_sprint_id_key_is_refused() {
+        let _g = CrewGuard::new();
+        let dir = tasks_dir("m", "p");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("t.json"), r#"{"id": "t", "sprint_id": "p", "description": "d"}"#).unwrap();
+        let err = format!("{:#}", load_tasks_for_phase("m", "p").unwrap_err());
+        assert!(err.contains("`sprint_id` was renamed to `phase_id`"), "{err}");
+        let err = format!("{:#}", load_task("m", "p", "t").unwrap_err());
+        assert!(err.contains("`sprint_id` was renamed to `phase_id`"), "{err}");
     }
 
     // ─── (#1959) payload-carrying mission start/close ──────────────────
@@ -1872,37 +1867,8 @@ mod path_helper_tests {
         });
     }
 
-    /// Sprint→Phase rename read-fallback (real-data compat): a mission dir
-    /// with ONLY a legacy `sprints/` subdir (pre-rename on-disk layout) must
-    /// still resolve `phases_dir` to it, so an operator's existing mission
-    /// data survives the rename without a manual migration step.
-    #[test]
-    #[serial]
-    fn phases_dir_falls_back_to_legacy_sprints_subdir_name() {
-        with_test_root(|root| {
-            let legacy_dir = root.join("missions/m/sprints");
-            std::fs::create_dir_all(&legacy_dir).unwrap();
-            assert_eq!(phases_dir("m"), legacy_dir);
-            assert_eq!(phase_path("m", "s"), legacy_dir.join("s.json"));
-        });
-    }
-
-    /// Once the canonical `phases/` subdir exists (even alongside a
-    /// still-present `sprints/` one — e.g. mid-migration), canonical wins.
-    #[test]
-    #[serial]
-    fn phases_dir_prefers_canonical_when_both_exist() {
-        with_test_root(|root| {
-            let legacy_dir = root.join("missions/m/sprints");
-            let canonical_dir = root.join("missions/m/phases");
-            std::fs::create_dir_all(&legacy_dir).unwrap();
-            std::fs::create_dir_all(&canonical_dir).unwrap();
-            assert_eq!(phases_dir("m"), canonical_dir);
-        });
-    }
-
-    /// Brand-new mission (neither subdir exists yet) resolves to the
-    /// canonical name so a fresh write creates the new-name layout.
+    /// A mission with no phases dir yet resolves to `phases/`, so a fresh
+    /// write creates it.
     #[test]
     #[serial]
     fn phases_dir_defaults_to_canonical_when_neither_exists() {

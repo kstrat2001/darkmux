@@ -13,7 +13,7 @@ import {
 } from "./flow";
 import { ingest, ingestJsonl, recordsAsOf, __asOfFilterRuns, type NormRecord } from "./ingest";
 import { norm, normAll, type RawRecord } from "../testing/records";
-import type { PresenceBeat } from "../types/handwritten";
+import type { PresenceBeat } from "../types/generated/PresenceBeat";
 import { tokensOffMeter } from "../lenses/fleet/savings";
 import { DEFAULT_POLICY, lifecycleAt } from "./lifecycle";
 import { runIndex, sessionRun, __runIndexBuilds } from "./runRef";
@@ -337,7 +337,7 @@ describe("nameOf recency", () => {
 });
 
 /**
- * (#2123) Presence (`/fleet/sessions/live`, Redis-backed) only ever gets a
+ * (#2123) Presence (`/fleet/dispatches/live`, Redis-backed) only ever gets a
  * beat from `dispatch.internal`'s own container-heartbeat thread
  * (`crates/darkmux-crew/src/dispatch_internal.rs` — the ONE writer,
  * grep-confirmed). A mission/review dispatch fanning out through

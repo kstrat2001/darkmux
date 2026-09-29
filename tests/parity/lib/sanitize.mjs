@@ -295,7 +295,7 @@ const UUID_FIELDS = new Set(["machine_uid"]);
 const SAFE_FIELDS = new Set([
   "_type", "action", "ansi_text", "args", "argv", "attribution", "build",
   "captured_date", "captured_prev_date", "case_ids", "category", "command",
-  "condition", "condition_word", "health_condition", "config_id", "cpu_brand", "crew", "daemon_url",
+  "condition", "condition_word", "health_condition", "config_id", "dispatch_id", "cpu_brand", "crew", "daemon_url",
   "darkmux_version", "date", "decision", "dir", "display_name", "endpoint",
   "event", "exec_mode", "extra", "file", "finish_reason", "first_date",
   "first_ts", "flow_schema_version", "handle", "http_status", "id",
@@ -429,7 +429,7 @@ const BATTERY_HEALTH_SYNTHETIC_NUMERIC = {
   nominal_capacity_pct: 92,
   permanent_failure_status: 0,
   temperature_c: 30,
-  total_operating_time_hours: 4000,
+  total_operating_ms: 4000 * 3_600_000,
 };
 
 /** A smooth synthetic ramp, not the shape of any real battery's lifetime
@@ -465,7 +465,7 @@ const BATTERY_HEALTH_UNKNOWN_NUMERIC_PLACEHOLDER = 0;
  * character as `state`/`limit_source`. EVERY numeric value — named or not,
  * scalar or inside an array — is replaced: a named field gets its own
  * synthetic value from `BATTERY_HEALTH_SYNTHETIC_NUMERIC`,
- * `time_at_soc_hours` gets `syntheticSocHistogram`, and anything else
+ * `time_at_soc_ms` gets `syntheticSocHistogram`, and anything else
  * numeric this policy has no name for gets
  * `BATTERY_HEALTH_UNKNOWN_NUMERIC_PLACEHOLDER` — recorded into
  * `matched.unknownFields` (as `battery_health.<key>`) so a human sees it in
@@ -477,7 +477,7 @@ function sanitizeBatteryHealth(value, matched) {
   const out = {};
   for (const [k, v] of Object.entries(value)) {
     const known = Object.prototype.hasOwnProperty.call(BATTERY_HEALTH_SYNTHETIC_NUMERIC, k);
-    if (k === "time_at_soc_hours") {
+    if (k === "time_at_soc_ms") {
       out[k] = v === null ? null : syntheticSocHistogram(v.length);
       matched.batteryNumeric++;
     } else if (typeof v === "number") {
@@ -486,7 +486,7 @@ function sanitizeBatteryHealth(value, matched) {
       if (!known) matched.unknownFields.add(`battery_health.${k}`);
     } else if (Array.isArray(v) && v.every((x) => typeof x === "number")) {
       // A numeric array this policy has no NAME for (distinct from
-      // time_at_soc_hours, handled above) — same default-deny policy,
+      // time_at_soc_ms, handled above) — same default-deny policy,
       // applied per element, length preserved for structural fidelity.
       out[k] = v.map(() => BATTERY_HEALTH_UNKNOWN_NUMERIC_PLACEHOLDER);
       matched.batteryNumeric++;

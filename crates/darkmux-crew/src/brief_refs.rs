@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Which record store a [`BriefRef`]'s key addresses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum BriefRefKind {
     /// A `findings` record — something an earlier dispatch observed.
@@ -56,7 +56,7 @@ impl BriefRefKind {
 }
 
 /// One record the brief carries: a kind plus the key its store answers to.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct BriefRef {
     pub kind: BriefRefKind,
     pub key: String,
@@ -190,22 +190,6 @@ pub fn to_json(refs: &[BriefRef]) -> serde_json::Value {
             .map(|r| serde_json::json!({ "kind": r.kind.as_str(), "key": r.key }))
             .collect(),
     )
-}
-
-/// Read the refs back off a step config's `brief_refs` value. Lenient: an
-/// entry whose `kind` is unknown or whose `key` is missing is dropped rather
-/// than failing the step, the same contract every other config read has.
-pub fn from_json(v: Option<&serde_json::Value>) -> Vec<BriefRef> {
-    let Some(arr) = v.and_then(|v| v.as_array()) else {
-        return Vec::new();
-    };
-    arr.iter()
-        .filter_map(|e| {
-            let kind = BriefRefKind::parse(e.get("kind")?.as_str()?)?;
-            let key = e.get("key")?.as_str()?.to_string();
-            Some(BriefRef { kind, key })
-        })
-        .collect()
 }
 
 /// The host attachment directories the named mods want bind-mounted into the
@@ -425,11 +409,10 @@ mod tests {
                 {"kind": "mod", "key": "mod-1-aaa"},
             ])
         );
-        assert_eq!(from_json(Some(&v)), refs);
-        assert!(from_json(None).is_empty());
-        // Lenient on read: an unknown kind is dropped, not fatal.
+        assert_eq!(serde_json::from_value::<Vec<BriefRef>>(v).unwrap(), refs);
+        // Strict on read: an unknown kind is refused, never silently dropped.
         let mixed = serde_json::json!([{"kind": "sandwich", "key": "k"}, {"kind": "mod", "key": "m1"}]);
-        assert_eq!(from_json(Some(&mixed)), vec![BriefRef::mod_("m1")]);
+        assert!(serde_json::from_value::<Vec<BriefRef>>(mixed).is_err());
     }
 
     #[test]

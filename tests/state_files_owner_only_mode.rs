@@ -371,7 +371,7 @@ fn sample_record(action: darkmux_flow::FlowAction) -> darkmux_flow::FlowRecord {
         ts: darkmux_flow::ts_utc_now(),
         level: darkmux_flow::Level::Info,
         category: darkmux_flow::Category::Work,
-        tier: darkmux_flow::Tier::Local,
+        tier: darkmux_flow::Tier::Darkmux,
         stage: darkmux_flow::Stage::Dispatch,
         action,
         handle: "h".to_string(),
@@ -387,8 +387,6 @@ fn sample_record(action: darkmux_flow::FlowAction) -> darkmux_flow::FlowRecord {
         prev_hash: None,
         hash: None,
         payload: None,
-        work_id: None,
-        attempt: None,
     }
 }
 
@@ -624,7 +622,7 @@ fn flow_jsonl_is_owner_only_mode() {
         ts: darkmux_flow::ts_utc_now(),
         level: darkmux_flow::Level::Info,
         category: darkmux_flow::Category::Work,
-        tier: darkmux_flow::Tier::Local,
+        tier: darkmux_flow::Tier::Darkmux,
         stage: darkmux_flow::Stage::Dispatch,
         action: darkmux_flow::FlowAction::DispatchStart,
         handle: "coder".to_string(),
@@ -640,8 +638,6 @@ fn flow_jsonl_is_owner_only_mode() {
         prev_hash: None,
         hash: None,
         payload: None,
-        work_id: None,
-        attempt: None,
     };
     let sink = darkmux_flow::LocalFileSink::new();
     let result = darkmux_flow::record_via(&sink, &record);

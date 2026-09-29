@@ -20,7 +20,7 @@
 //! Emitted by the **dispatch process** (which is alive exactly as long as
 //! the session runs), NOT by the daemon — the daemon doesn't know about
 //! interactively-launched dispatches. Read by the daemon's
-//! `/fleet/sessions/live` endpoint, which the live viewer polls.
+//! `/fleet/dispatches/live` endpoint, which the live viewer polls.
 //!
 //! Like machine presence, session presence is **ephemeral** and separate
 //! from the durable flow stream: heartbeats are NOT flow records.
@@ -51,6 +51,8 @@ pub const DEFAULT_TTL_SECS: u64 = 15;
 /// the rest is best-effort enrichment for grouping/labelling the live
 /// indicator, omitted from the wire when empty.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct SessionBeat {
     /// The dispatch's session id — the key suffix and the join key against
     /// this session's flow records. Globally unique per dispatch.
@@ -59,22 +61,27 @@ pub struct SessionBeat {
     /// (`darkmux_hardware::machine_uid`), best-effort. Lets a reader group
     /// the live session under the right machine card. `None` off-Mac.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
     pub machine_uid: Option<String>,
     /// Mutable machine label (`resolve_machine_id`). Display-only.
     pub display_name: String,
     /// The dispatched role id (e.g. `coder`), best-effort enrichment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
     pub role: Option<String>,
     /// The model the dispatch is running, best-effort enrichment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
     pub model: Option<String>,
     /// The mission this execution belongs to, when it runs under one. A
     /// mission's own run-grain session never beats, so its run page counts
     /// as live while any beat names its mission.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
     pub mission_id: Option<String>,
     /// Unix-ms at beat-write time. Diagnostic / "last beat" only — liveness
     /// is governed by Redis key existence (TTL), not by clock comparison.
+    #[cfg_attr(feature = "ts-export", ts(type = "number"))]
     pub beat_ts_ms: u64,
 }
 
@@ -118,7 +125,7 @@ pub fn read_live_sessions(client: &redis::Client) -> Result<Vec<SessionBeat>> {
     // per-socket-read one, not a budget for the whole loop) — which is the
     // right shape here: `SCAN COUNT 200` is explicitly non-blocking, so no
     // single reply legitimately takes a second. This read serves the daemon's
-    // `/fleet/sessions/live` endpoint, so an unbounded stall here holds an
+    // `/fleet/dispatches/live` endpoint, so an unbounded stall here holds an
     // HTTP worker as well as the caller.
     bound_redis_response(&conn);
     let pattern = format!("{SESSION_KEY_PREFIX}*");
@@ -1002,7 +1009,7 @@ mod tests {
     }
 
     /// (#2227) Per-site bound: `read_live_sessions`'s `SCAN`. Backs the
-    /// daemon's `/fleet/sessions/live` endpoint.
+    /// daemon's `/fleet/dispatches/live` endpoint.
     #[test]
     fn read_live_sessions_against_silent_peer_errs_within_bounded_time() {
         let port = crate::spawn_silent_redis_peer(2);

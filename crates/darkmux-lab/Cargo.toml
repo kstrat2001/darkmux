@@ -23,6 +23,8 @@ darkmux-profiles = { path = "../darkmux-profiles" }
 # decide_residency/resolve_auto — see lab/review.rs's LmsCycler.
 darkmux-gestalt = { path = "../darkmux-gestalt" }
 anyhow = "1.0"
+# `BenchMode` is the `lab eval --mode` value: one enum, parsed by clap at the CLI boundary.
+clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json.workspace = true
 # The unknown-key gate derives each user file's valid keys from its type
@@ -60,6 +62,9 @@ darkmux-types = { path = "../darkmux-types", features = ["test-support"] }
 # into normal-dependency builds, so release builds stay off (verified via
 # `cargo tree -e features` in the #1355 review round).
 darkmux-flow = { path = "../darkmux-flow", features = ["test-support"] }
+# The step-config sweep (`darkmux_crew::step_config::sweep`) the crawl kinds'
+# reader tests share with the crew crate. Dev-dep only.
+darkmux-crew = { path = "../darkmux-crew", features = ["test-support"] }
 
 [features]
 # (#2301) TypeScript export for the crawl's typed step-output structs. Turned

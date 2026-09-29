@@ -229,7 +229,7 @@
           "payload": {
             "scope": "endpoint",
             "endpoint_id": "azure",
-            "wait_seconds": 86000
+            "wait_ms": 86000000
           }
         }
       ],
@@ -247,7 +247,7 @@
           "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
           "payload": {
             "endpoint_id": "azure",
-            "wait_seconds": 600
+            "wait_ms": 600000
           }
         }
       ],
@@ -265,7 +265,7 @@
           "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
           "payload": {
             "endpoint_id": "azure",
-            "wait_seconds": 600
+            "wait_ms": 600000
           }
         }
       ],
@@ -283,7 +283,7 @@
           "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
           "payload": {
             "endpoint_id": "azure",
-            "wait_seconds": 600
+            "wait_ms": 600000
           }
         }
       ],
@@ -302,7 +302,7 @@
           "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
           "payload": {
             "endpoint_id": "azure",
-            "wait_seconds": 600
+            "wait_ms": 600000
           }
         },
         {
@@ -337,7 +337,7 @@
           "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
           "payload": {
             "endpoint_id": "azure",
-            "wait_seconds": 86000
+            "wait_ms": 86000000
           }
         },
         {
@@ -366,7 +366,7 @@
           "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
           "payload": {
             "endpoint_id": "azure",
-            "wait_seconds": 86000
+            "wait_ms": 86000000
           }
         },
         {
@@ -401,7 +401,7 @@
           "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
           "payload": {
             "endpoint_id": "azure",
-            "wait_seconds": 86000
+            "wait_ms": 86000000
           }
         },
         {
@@ -430,7 +430,7 @@
           "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
           "payload": {
             "endpoint_id": "azure",
-            "wait_seconds": 86000
+            "wait_ms": 86000000
           }
         },
         {
@@ -634,7 +634,7 @@
           "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
           "payload": {
             "endpoint_id": "azure",
-            "wait_seconds": 600
+            "wait_ms": 600000
           }
         }
       ],
@@ -652,7 +652,7 @@
           "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
           "payload": {
             "endpoint_id": "azure",
-            "wait_seconds": 60
+            "wait_ms": 60000
           }
         },
         {
@@ -662,7 +662,7 @@
           "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
           "payload": {
             "endpoint_id": "azure",
-            "wait_seconds": 600
+            "wait_ms": 600000
           }
         }
       ],
@@ -680,7 +680,7 @@
           "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
           "payload": {
             "endpoint_id": "azure",
-            "wait_seconds": 600
+            "wait_ms": 600000
           }
         },
         {
@@ -1152,7 +1152,7 @@
           "session_id": "s1",
           "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
           "payload": {
-            "wait_seconds": 1800
+            "wait_ms": 1800000
           }
         },
         {
@@ -1182,7 +1182,7 @@
           "session_id": "s1",
           "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
           "payload": {
-            "wait_seconds": 1800
+            "wait_ms": 1800000
           }
         },
         {

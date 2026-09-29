@@ -29,7 +29,7 @@
 //! `ship` verb retired in #1463), then `darkmux mission finalize <id>` closes
 //! out the darkmux-side state.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -419,6 +419,7 @@ fn add_worktree(repo_root: &Path, wt_path: &Path, branch: &str, base: &str) -> R
 // `run_step_graph` returns — `Step.output` still carries a plain-text
 // summary for consistency with every other step kind's convention.
 
+use crew::step_config::{load, ConfigKind, MissionCoderConfig};
 use crew::step_kinds::{resolve_local_seat, CwdPolicy, Port, SeatClaim, StepKind, StepOutcome, StepRunCtx};
 use std::any::Any;
 use std::sync::{Arc, Mutex};
@@ -569,7 +570,7 @@ impl StepKind for MissionWorktreeStepKind {
     }
 
     fn id(&self) -> &'static str {
-        "mission.worktree"
+        ConfigKind::MissionWorktree.id()
     }
 
     /// (#1511) `None` — creating a git worktree dispatches no model,
@@ -739,7 +740,7 @@ pub(crate) struct MissionCoderStepKind;
 
 impl StepKind for MissionCoderStepKind {
     fn id(&self) -> &'static str {
-        "mission.coder"
+        ConfigKind::MissionCoder.id()
     }
 
     fn display_name(&self) -> &'static str {
@@ -828,13 +829,11 @@ impl StepKind for MissionCoderStepKind {
         // needs (the mission/phase records, the corrections/cautions/lessons
         // walk) is data this composition itself has to produce, so it stays
         // run-time work rather than something a build-time stamp could carry.
-        let injected_budget_chars = step
-            .config
-            .get("injected_budget_chars")
-            .and_then(|v| v.as_u64())
-            .expect(
-                "register_coder_phase_kinds always stamps \"injected_budget_chars\" onto the coder step's config",
-            ) as usize;
+        let cfg: MissionCoderConfig = load(step, ConfigKind::MissionCoder)?;
+        let stamped = |key: &str| {
+            anyhow!("register_coder_phase_kinds always stamps `{key}` onto the coder step's config; step `{}` has none", step.id)
+        };
+        let injected_budget_chars = cfg.injected_budget_chars.ok_or_else(|| stamped("injected_budget_chars"))?.0 as usize;
         // (#1546) Composition failure must stay AUDIBLE. Before this move it
         // was a registration `Err` returned out of `launch`, which
         // `fn main() -> Result<()>` printed as a full anyhow chain. Inside
@@ -862,13 +861,8 @@ impl StepKind for MissionCoderStepKind {
         // `register_coder_phase_kinds` computed once at build time; everything
         // else is either a constant every coder-phase dispatch has always
         // used, or comes straight off the context.
-        let timeout_seconds = step
-            .config
-            .get("timeout_seconds")
-            .and_then(|v| v.as_u64())
-            .expect("register_coder_phase_kinds always stamps \"timeout_seconds\" onto the coder step's config")
-            as u32;
-        let image = step.config.get("image").and_then(|v| v.as_str()).map(String::from);
+        let timeout_seconds = cfg.timeout_seconds.ok_or_else(|| stamped("timeout_seconds"))?.saturating_u32();
+        let image = cfg.image;
 
         let opts = crew::dispatch::DispatchOpts {
             // (#2914) Work never runs on the utility model.
@@ -909,10 +903,12 @@ impl StepKind for MissionCoderStepKind {
             system_prompt_override: None,
         };
         let result = crew::dispatch::dispatch(opts)?;
-        eprintln!(
-            "{}",
-            style::dim(&format!("darkmux coder-phase: session id `{session}`"))
-        );
+        if let Some(execution) = &result.execution {
+            eprintln!(
+                "{}",
+                style::dim(&format!("darkmux coder-phase: role execution `{execution}`"))
+            );
+        }
 
         let tokens = coder_tokens(&result);
 
@@ -1049,7 +1045,7 @@ pub(crate) struct MissionVerifyStepKind;
 
 impl StepKind for MissionVerifyStepKind {
     fn id(&self) -> &'static str {
-        "mission.verify"
+        ConfigKind::MissionVerify.id()
     }
 
     fn display_name(&self) -> &'static str {
@@ -2307,7 +2303,7 @@ fn mission_cautions(
             if r.get("category").and_then(|v| v.as_str()) != Some("telemetry") {
                 continue;
             }
-            if r.get("source").and_then(|v| v.as_str()) != Some("detector") {
+            if darkmux_flow::reader::source_of(&r) != Some(darkmux_flow::FlowSource::Detector) {
                 continue;
             }
             let in_mission = r
@@ -2816,7 +2812,7 @@ pub fn nudge_mission_debrief(mission_id: &str) {
     if let Ok(run) = RunId::mission(mission_id) {
         let _ = flow::record(flow::FlowRecord {
             tier: flow::Tier::Operator,
-            source: Some("mission_debrief".to_string()),
+            source: Some(darkmux_flow::FlowSource::MissionDebrief),
             ..flow::FlowRecord::for_session(
                 &SessionId::run(run),
                 flow::Level::Info,

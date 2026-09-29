@@ -36,7 +36,7 @@ const GRAPH = {
   generated_at_ms: 0,
 };
 
-const rec = (over) => ({ ts: `${TODAY}T10:00:00Z`, level: 'info', category: 'work', tier: 'local', stage: 'dispatch', handle: 'h', ...over });
+const rec = (over) => ({ ts: `${TODAY}T10:00:00Z`, level: 'info', category: 'work', tier: 'darkmux', stage: 'dispatch', handle: 'h', ...over });
 
 const RECORDS = [
   rec({ action: 'dispatch.start', session_id: 'step-judge-1', payload: { step_id: 'judge-1' } }),

@@ -19,6 +19,7 @@ pub mod execution_id;
 pub mod flock;
 #[cfg(unix)]
 pub mod interrupt;
+pub mod param_scalar;
 pub mod paths;
 pub mod profile_address;
 pub mod residency_lease;
@@ -938,11 +939,14 @@ impl InlineEndpointRewrite {
 // `Deserialize` (#1426) so `darkmux machine status <id>` can read a roster
 // peer's residents back out of that same endpoint's JSON.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct LoadedModel {
     pub identifier: String,
     pub model: String,
     pub status: String,
     pub size: String,
+    #[cfg_attr(feature = "ts-export", ts(type = "number"))]
     pub context: u64,
     /// (#2917) How many requests LM Studio reports WAITING on this
     /// instance (`lms ps --json`'s `queued`, from its CLI's
@@ -952,6 +956,7 @@ pub struct LoadedModel {
     /// wire both ways, so `/machine/status` stays readable by an older peer
     /// and an older peer's payload stays readable here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(type = "number", optional))]
     pub queued: Option<u64>,
 }
 

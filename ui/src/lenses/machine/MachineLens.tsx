@@ -29,7 +29,8 @@ import {
 import { aggregateHostSamples } from "../../lib/hostStats";
 import { rollingWindowSamples, findLastKnownSample } from "../../lib/machineDrawerScope";
 import { useMachineStatsContent } from "../../components/machineStatsContent";
-import type { MachineSpecs, MachineResources } from "../../types/handwritten";
+import type { MachineSpecsResponse } from "../../types/generated/MachineSpecsResponse";
+import type { MachineResourcesResponse } from "../../types/generated/MachineResourcesResponse";
 
 /** The health region's state vocabulary, verbatim from `/machine/resources`
  * (`machine.state` and each model's `state`), uppercased for display by
@@ -125,11 +126,10 @@ export function lineClass(line: string): string | undefined {
  * different things depending on which card was clicked. Every card now goes
  * to the runs lens pinned to that machine — see `FleetLens.tsx`'s
  * `machineDrillHash`. The
- * component itself still resolves an explicit REMOTE uid gracefully
+ * component itself still resolves an explicit REMOTE machine gracefully
  * (`isLocalMach` below stays real, `resourcesQuery` stays gated off) — a
- * `#lens=machine&uid=<remote>` bookmark minted before this packet, or typed
- * by hand, still degrades honestly rather than crashing; `FleetLens` simply
- * no longer MINTS that link itself. `isLocalMach` restores legacy's
+ * `#lens=machine&machine=<remote>` link typed by hand degrades honestly rather
+ * than crashing; `FleetLens` simply no longer MINTS that link itself. `isLocalMach` restores legacy's
  * `state.machineIsLocal || isLocalMachine(state.machine)` OR-gate now that
  * `lib/route.ts`'s widened `{kind:"machine",uid}` gives a drill somewhere
  * to carry its uid (this OR was narrowed to an unconditional `true` before
@@ -144,7 +144,7 @@ export function lineClass(line: string): string | undefined {
  * `label`/`spec` AND a remote machine's own `specs` string — `specOf()`,
  * viewer.html:1124-1129, since a remote
  * machine's hardware line comes from its presence beat, not this daemon's
- * local `/machine/specs` probe). `/fleet/sessions/live` — fetched by the
+ * local `/machine/specs` probe). `/fleet/dispatches/live` — fetched by the
  * OLD runs list for its live-vs-ended status labels — is gone along with
  * that list; nothing on this page needs session liveness anymore.
  */
@@ -187,7 +187,7 @@ export function MachineLens({
   const machineSrc = source.machine;
   const staticMachineQuery = useQuery({
     queryKey: queryKeys.staticMachine(machineSrc ?? ""),
-    queryFn: () => fetchJson<{ specs: MachineSpecs; resources: MachineResources }>(machineSrc as string),
+    queryFn: () => fetchJson<{ specs: MachineSpecsResponse; resources: MachineResourcesResponse }>(machineSrc as string),
     enabled: machineSrc !== null,
     staleTime: Infinity,
   });
@@ -208,7 +208,7 @@ export function MachineLens({
 
   const specsQuery = useQuery({
     queryKey: queryKeys.machineSpecs(),
-    queryFn: () => fetchJson<MachineSpecs>("/machine/specs"),
+    queryFn: () => fetchJson<MachineSpecsResponse>("/machine/specs"),
     enabled: daemonBacked,
   });
 
@@ -333,7 +333,7 @@ export function MachineLens({
   // never issues the request at all.
   const resourcesQuery = useQuery({
     queryKey: queryKeys.machineResources(),
-    queryFn: () => fetchJson<MachineResources>("/machine/resources"),
+    queryFn: () => fetchJson<MachineResourcesResponse>("/machine/resources"),
     refetchInterval: MACHINE_MEM_POLL_MS,
     enabled: isLocalMach && daemonBacked,
   });
@@ -351,7 +351,7 @@ export function MachineLens({
   // two-variable shape (`MACHINE_MEM` + `MACHINE_MEM_ERR`, `viewer.html`) in
   // React terms — `resourcesErrored` above still reflects the LATEST poll
   // (drives the banner + lamp), independent of what `resources` shows.
-  const [lastGoodResources, setLastGoodResources] = useState<MachineResources | null>(null);
+  const [lastGoodResources, setLastGoodResources] = useState<MachineResourcesResponse | null>(null);
   const resources = lastGoodResources;
 
 

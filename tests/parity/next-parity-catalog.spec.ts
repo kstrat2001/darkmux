@@ -303,13 +303,13 @@ test.describe("next-parity: catalog panel + replay-by-query (Packet 4)", () => {
     await page.screenshot({ path: shot("playback-date.png"), fullPage: true });
   });
 
-  test("#session=task-list matches session-task-list.txt's #stage byte-for-byte (drill-in packet: real render, not a placeholder)", async ({
+  test("#dispatch=task-list matches session-task-list.txt's #stage byte-for-byte (drill-in packet: real render, not a placeholder)", async ({
     page,
   }) => {
     // The one replay-by-query golden that already existed before this
     // packet (`goldens/session-task-list.txt`, Packet 0a) — now a REAL
     // byte-parity target: `SessionReplay.tsx` runs the corpus's 48 records
-    // (`flow-session-task-list.json`) through `flowToRenderModel` +
+    // (`flow-dispatch-task-list.json`) through `flowToRenderModel` +
     // `runRegions()` (`lenses/session/sessionRun.ts`) the same way legacy's
     // `renderSubsystem()` does, and this asserts the REAL BROWSER's
     // `#stage.innerText` matches the golden exactly — the same standard
@@ -320,7 +320,7 @@ test.describe("next-parity: catalog panel + replay-by-query (Packet 4)", () => {
     const pageErrors: string[] = [];
     page.on("pageerror", (e) => pageErrors.push(String(e)));
 
-    await page.goto("/index.html#session=task-list");
+    await page.goto("/index.html#dispatch=task-list");
     await waitSettled(page, expect, '.session-run[data-state="data"]');
 
     const got = await extractStageOnlyText(page);
@@ -411,14 +411,14 @@ test.describe("next-parity: catalog panel red-prove (harness self-test, Packet 4
   });
 
   // (drill-in packet) The session drill-in's own red-prove, matching the
-  // mission-replay one above — `installBlankRoutes` 404s `/flow-session/`
+  // mission-replay one above — `installBlankRoutes` 404s `/flow-dispatch/`
   // too, so this is a genuinely unreachable daemon, not the honest-empty
   // branch (which `installCorpusRoutes`' real fixture would exercise).
   test("blank routes: session replay renders a visible unreachable-daemon error, never a blank page", async ({ page }) => {
     await installFrozenClock(page, Date.UTC(2026, 0, 1));
     installBlankRoutes(page);
 
-    await page.goto("/index.html#session=task-list");
-    await expect(page.getByText(/couldn't reach \/flow-session\//i)).toBeVisible({ timeout: 15000 });
+    await page.goto("/index.html#dispatch=task-list");
+    await expect(page.getByText(/couldn't reach \/flow-dispatch\//i)).toBeVisible({ timeout: 15000 });
   });
 });

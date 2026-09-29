@@ -7,7 +7,7 @@ import { describe, expect, it } from "vitest";
 import { ACTION, CATEGORY, LEVEL, STAGE, TIER, tagText, type NormRecord } from "./ingest";
 import { norm } from "../testing/records";
 
-const r: NormRecord = norm({ ts: "2026-09-27T10:00:00Z", action: "dispatch.start", level: "info", category: "work", stage: "dispatch", tier: "local" });
+const r: NormRecord = norm({ ts: "2026-09-27T10:00:00Z", action: "dispatch.start", level: "info", category: "work", stage: "dispatch", tier: "darkmux" });
 
 describe("the tagged fields are opaque to string logic", () => {
   it("rejects a literal on every field and in every comparing shape", () => {
@@ -58,7 +58,7 @@ describe("the tagged fields are opaque to string logic", () => {
 
   it("accepts the constants, and the text only through tagText", () => {
     expect(r.action === ACTION.DispatchStart).toBe(true);
-    expect(r.level === LEVEL.Info && r.category === CATEGORY.Work && r.stage === STAGE.Dispatch && r.tier === TIER.Local).toBe(true);
+    expect(r.level === LEVEL.Info && r.category === CATEGORY.Work && r.stage === STAGE.Dispatch && r.tier === TIER.Darkmux).toBe(true);
     expect(tagText(r.action)).toBe("dispatch.start");
     // @ts-expect-error fields of different kinds never compare
     expect(r.level === CATEGORY.Work).toBe(false);

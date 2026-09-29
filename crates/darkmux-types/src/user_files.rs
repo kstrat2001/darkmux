@@ -183,6 +183,9 @@ pub enum Issue {
     /// A key the schema requires is absent, which fails the typed load the
     /// same way.
     Missing { expected: String },
+    /// A value the schema accepts but its consumer refuses: the rule it
+    /// breaks, named with the step and key.
+    Rule(String),
 }
 
 impl fmt::Display for KeyIssue {
@@ -196,7 +199,7 @@ impl fmt::Display for KeyIssue {
                 write!(f, " (valid keys here: {})", valid.join(", "))
             }
             Issue::Retired(line) => write!(f, "unknown key `{}`: {line}", self.path),
-            Issue::Removed(line) => write!(f, "`{}`: {line}", self.path),
+            Issue::Removed(line) | Issue::Rule(line) => write!(f, "`{}`: {line}", self.path),
             Issue::WrongType { expected, got } => write!(f, "`{}` must be {expected}, got {got}", self.path),
             Issue::Missing { expected } if expected.is_empty() => write!(f, "missing required key `{}`", self.path),
             Issue::Missing { expected } => write!(f, "missing required key `{}` ({expected})", self.path),
@@ -218,11 +221,30 @@ pub fn no_retired(_: &str) -> Option<String> {
 /// it does not know (a retired one names its replacement instead of the
 /// closest key), or a value of the wrong type.
 pub fn key_issues<T: JsonSchema + 'static>(doc: &Value, retired: RetiredLookup<'_>) -> Vec<KeyIssue> {
+    key_issues_at::<T>(doc, retired, "")
+}
+
+/// [`key_issues`] for a document that sits at `prefix` inside a larger one
+/// (a mission step's `config`): every issue's path is written from the
+/// larger document's root. `retired` looks paths up from `doc`'s own root.
+pub fn key_issues_at<T: JsonSchema + 'static>(doc: &Value, retired: RetiredLookup<'_>, prefix: &str) -> Vec<KeyIssue> {
     let schema = schema_of::<T>();
     let root = schema.as_ref();
     let mut walker = Walker { root, retired, out: Vec::new() };
-    walker.walk(&[root], doc, "", "");
+    walker.walk(&[root], doc, prefix, "");
     walker.out
+}
+
+/// The keys `T`'s object schema names at its top level, sorted.
+pub fn top_level_keys<T: JsonSchema + 'static>() -> Vec<String> {
+    let schema = schema_of::<T>();
+    let mut keys: Vec<String> = own_shape(&schema).map(|s| s.named.keys().map(|k| k.to_string()).collect()).unwrap_or_default();
+    for branch in branches(&schema) {
+        keys.extend(own_shape(branch).into_iter().flat_map(|s| s.named.into_keys().map(str::to_string)));
+    }
+    keys.sort();
+    keys.dedup();
+    keys
 }
 
 /// Every token an enum's schema allows: its `enum` list, or the `const` of
@@ -528,7 +550,7 @@ fn own_accepts(node: &Value, value: &Value) -> bool {
 /// integer's `minimum`/`maximum`.
 fn type_accepts(t: &str, node: &Value, value: &Value) -> bool {
     match t {
-        "string" => value.is_string(),
+        "string" => value.as_str().is_some_and(|text| string_accepts(node, text)),
         "boolean" => value.is_boolean(),
         "array" => value.is_array(),
         "object" => value.is_object(),
@@ -537,6 +559,13 @@ fn type_accepts(t: &str, node: &Value, value: &Value) -> bool {
         "integer" => (value.is_i64() || value.is_u64()) && in_range(node, value),
         _ => true,
     }
+}
+
+/// Whether a string fits a `string` node: any string, unless the node names
+/// one of the step-config text forms ([`crate::param_scalar`]).
+fn string_accepts(node: &Value, text: &str) -> bool {
+    let format = node.get("format").and_then(Value::as_str);
+    format.and_then(|f| crate::param_scalar::text_form_ok(f, text)).unwrap_or(true)
 }
 
 fn in_range(node: &Value, value: &Value) -> bool {
@@ -579,14 +608,28 @@ fn type_words(t: &str, node: &Value) -> String {
         ("integer", Some(0), None) => "a non-negative integer".to_string(),
         ("integer", _, _) => "an integer".to_string(),
         ("number", _, _) => "a number".to_string(),
-        ("string", _, _) => "a string".to_string(),
+        ("string", _, _) => string_words(node),
         ("boolean", _, _) => "true or false".to_string(),
-        ("array", _, _) => match (node.get("minItems").and_then(Value::as_u64), node.get("maxItems").and_then(Value::as_u64)) {
-            (Some(lo), Some(hi)) if lo == hi => format!("a list of {lo}"),
-            _ => "a list".to_string(),
-        },
+        ("array", _, _) => array_words(node),
         ("object", _, _) => "an object".to_string(),
         (other, _, _) => other.to_string(),
+    }
+}
+
+fn string_words(node: &Value) -> String {
+    match node.get("format").and_then(Value::as_str) {
+        Some(crate::param_scalar::COUNT_FORMAT) => "the text of a non-negative integer".to_string(),
+        Some(crate::param_scalar::BLANKABLE_COUNT_FORMAT) => "the text of a non-negative integer, or blank".to_string(),
+        Some(crate::param_scalar::FLAG_FORMAT) => "the text `true` or `false`".to_string(),
+        Some(crate::param_scalar::SESSION_ID_FORMAT) => "a session id in its wire form".to_string(),
+        _ => "a string".to_string(),
+    }
+}
+
+fn array_words(node: &Value) -> String {
+    match (node.get("minItems").and_then(Value::as_u64), node.get("maxItems").and_then(Value::as_u64)) {
+        (Some(lo), Some(hi)) if lo == hi => format!("a list of {lo}"),
+        _ => "a list".to_string(),
     }
 }
 
@@ -612,9 +655,12 @@ fn own_shape(node: &Value) -> Option<ObjectShape<'_>> {
         return None;
     }
     let others = match additional {
+        // A struct that denies unknown fields names its keys as the only
+        // valid ones, even when it names none.
+        Some(Value::Bool(false)) => Others::Refused,
         // A struct's schema omits `additionalProperties`: its named keys are
         // the only valid ones.
-        None | Some(Value::Bool(false)) => {
+        None => {
             if props.is_none() && !has_combinators(node) { Others::Free } else { Others::Refused }
         }
         Some(Value::Bool(true)) => Others::Free,
@@ -771,6 +817,7 @@ pub fn check_tiered<T: JsonSchema + 'static>(
     kind: UserFileKind,
     docs: &[(String, PathBuf)],
     retired: RetiredLookup<'_>,
+    extra: ExtraIssues<'_>,
     reach: Reach,
 ) -> Vec<FileProblem> {
     let mut first: BTreeMap<&str, &Path> = BTreeMap::new();
@@ -786,7 +833,7 @@ pub fn check_tiered<T: JsonSchema + 'static>(
         if shadowed_by.is_some() && reach == Reach::Effective {
             continue;
         }
-        if let Some(mut found) = check_path::<T>(kind, path, retired) {
+        if let Some(mut found) = check_path_and::<T>(kind, path, retired, extra) {
             found.note = shadowed_by.map(|w| {
                 format!("shadowed by {}: never loaded, so nothing refuses to start over it", escape_text(&w.display().to_string()))
             });

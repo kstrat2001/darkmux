@@ -788,12 +788,12 @@ pub(crate) static LISTENER_BUSY: std::sync::Mutex<Option<(BusyPolicy, u32)>> = s
 
 /// [`LISTENER_BUSY`] for `/health`, for this machine only (`local` is
 /// `is_local_request`'s answer); `None` when the listener has not started.
-pub(crate) fn listener_busy(local: bool) -> Option<serde_json::Value> {
+pub(crate) fn listener_busy(local: bool) -> Option<crate::wire::FleetBusy> {
     if !local {
         return None;
     }
-    let (policy, cap) = (*LISTENER_BUSY.lock().ok()?)?;
-    Some(serde_json::json!({ "policy": policy.as_str(), "hosted_cap": cap }))
+    let (policy, hosted_cap) = (*LISTENER_BUSY.lock().ok()?)?;
+    Some(crate::wire::FleetBusy { policy, hosted_cap })
 }
 
 /// `coarse` is one of `starting` / `waiting` / `listening` / `not started`;
@@ -1524,7 +1524,7 @@ mod tests {
     fn the_busy_settings_are_reported_to_this_machine_only() {
         *LISTENER_BUSY.lock().unwrap() = Some((BusyPolicy::Queue, 2));
         let local = listener_busy(true).unwrap();
-        assert_eq!((local["policy"].as_str(), local["hosted_cap"].as_u64()), (Some("queue"), Some(2)));
+        assert_eq!(serde_json::to_value(local).unwrap(), serde_json::json!({ "policy": "queue", "hosted_cap": 2 }));
         assert!(listener_busy(false).is_none(), "a peer sees nothing");
         // Process-global: leave it as the process started.
         *LISTENER_BUSY.lock().unwrap() = None;

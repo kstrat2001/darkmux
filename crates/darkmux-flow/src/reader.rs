@@ -10,9 +10,11 @@
 //!   spelling arrives as its current variant.
 //! * [`parse_value`] / [`upgrade`] for a consumer that keeps the record as
 //!   JSON (the daemon, which serves records on to the viewer with every
-//!   field intact). [`upgrade`] rewrites the `action` field in place, so the
-//!   JSON a route serves carries the current spelling too. [`action_of`] is
-//!   the typed read of that field.
+//!   field intact). [`upgrade`] rewrites the `action` field in place, and the
+//!   retired `source` / `tier` spellings and payload keys with it
+//!   ([`crate::legacy`]), so the JSON a route serves carries the current
+//!   spelling too. [`action_of`] and [`source_of`] are the typed reads of
+//!   those fields.
 //!
 //! Lenient on read (contract 5): an action this binary does not know is kept
 //! verbatim, as [`FlowAction::Other`]; one darkmux retired reads as
@@ -42,6 +44,8 @@ pub enum ActionRead {
 }
 
 /// Rewrite a record's retired action spelling to its current one, in place,
+/// its retired `source` / `tier` spellings and payload keys
+/// ([`crate::legacy::upgrade_fields`], [`crate::legacy::upgrade_payload`]),
 /// and give a pre-4.0 record of an execution its synthesized execution id
 /// ([`crate::legacy::stamp_execution`]).
 pub fn upgrade(record: &mut Value) -> ActionRead {
@@ -49,12 +53,14 @@ pub fn upgrade(record: &mut Value) -> ActionRead {
 }
 
 /// [`upgrade`], and whether it changed the record in any way (a respelled
-/// action, or a synthesized execution id).
+/// action, source, tier or payload key, or a synthesized execution id).
 fn upgrade_noting_rewrite(record: &mut Value) -> (ActionRead, bool) {
     let Some(read) = action_of(record) else {
         return (ActionRead::Absent, false);
     };
-    let stamped = crate::legacy::stamp_execution(record, &read);
+    let stamped = crate::legacy::stamp_execution(record, &read)
+        | crate::legacy::upgrade_fields(record)
+        | crate::legacy::upgrade_payload(record, &read);
     match read {
         FlowAction::Other(_) => return (ActionRead::Unknown, stamped),
         FlowAction::Retired(_) => return (ActionRead::Retired, stamped),
@@ -103,7 +109,7 @@ pub fn parse_value(line: &str) -> Option<Value> {
 
 /// One raw JSONL line as a consumer that forwards lines should send it: the
 /// line itself, byte for byte, unless [`upgrade`] changed the record (a
-/// retired spelling, a synthesized execution id), in which case the upgraded
+/// retired spelling or key, a synthesized execution id), in which case the upgraded
 /// record re-serialized. `None` for a line that is not a JSON object.
 pub fn upgrade_line(line: &str) -> Option<std::borrow::Cow<'_, str>> {
     let mut v: Value = serde_json::from_str(line).ok()?;
@@ -129,6 +135,12 @@ pub fn parse_record(line: &str) -> Option<FlowRecord> {
     let mut record: FlowRecord = serde_json::from_value(v).ok()?;
     record.action = action;
     Some(record)
+}
+
+/// The typed `source` of a JSON record, an old spelling upgraded; `None` when
+/// the record names none.
+pub fn source_of(record: &Value) -> Option<crate::FlowSource> {
+    record.get("source")?.as_str().map(crate::legacy::read_source)
 }
 
 /// The typed action of a JSON record, upgraded (a pre-4.0 whole-run bookend
@@ -202,6 +214,29 @@ pub fn day_file_records(path: &Path) -> Vec<Value> {
     text.lines().filter_map(parse_value).collect()
 }
 
+/// The session a role execution ran under: the `session_id` its
+/// `dispatch.start` record carries.
+///
+/// The id encodes the moment it was minted, and its `dispatch.start` follows
+/// within moments, so the record is in the day file of that UTC day, or in
+/// the neighboring days when the mint sat near midnight or clocks differ.
+/// Only those three files are read, however old the id is; a line that does
+/// not contain the id is skipped without being parsed. `None` when the id
+/// carries no mint time (a synthesized legacy id) or no such record is there.
+pub fn session_of_execution(dir: &Path, execution: &darkmux_types::execution_id::ExecutionId) -> Option<String> {
+    let minted = execution.minted_at_secs()?;
+    [0, 1, -1].into_iter().find_map(|day_offset| {
+        let path = dir.join(format!("{}.jsonl", crate::day_utc_at(minted + day_offset * 86_400)));
+        let text = std::fs::read_to_string(path).ok()?;
+        text.lines().filter(|line| line.contains(execution.as_str())).filter_map(parse_value).find_map(|r| {
+            let of_it = r.get("execution_id").and_then(Value::as_str) == Some(execution.as_str());
+            (of_it && action_of(&r) == Some(FlowAction::DispatchStart))
+                .then(|| r.get("session_id").and_then(Value::as_str).map(str::to_string))
+                .flatten()
+        })
+    })
+}
+
 /// Tally the unknown actions in the `days` newest day files under `dir`.
 /// Reads only each line's `action` field ([`action_field`]), not the whole
 /// record, so a week of busy day files costs a scan, not a parse.
@@ -243,6 +278,75 @@ fn quick_action_field(line: &str) -> Option<&str> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// An id minted at `secs`, in the grammar [`ExecutionId::mint`] writes.
+    fn exec_at(secs: i64, tag: u32) -> darkmux_types::execution_id::ExecutionId {
+        darkmux_types::execution_id::ExecutionId::parse_minted(&format!("exec-{:x}-1-{tag:x}", secs * 1_000_000)).unwrap()
+    }
+
+    fn start_line(exec: &darkmux_types::execution_id::ExecutionId, action: &str, session: &str) -> String {
+        json!({"action": action, "execution_id": exec.as_str(), "session_id": session}).to_string()
+    }
+
+    #[test]
+    fn an_execution_resolves_to_the_session_its_dispatch_start_carries() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = 1_790_564_400; // 2026-09-28T03:00:00Z
+        let (mine, other) = (exec_at(now, 1), exec_at(now, 2));
+        // The note names the execution too, under a session of its own: only
+        // the `dispatch.start` record says which session the execution ran in.
+        let body = [
+            start_line(&other, "dispatch.start", "run-a.adhoc.coder.other"),
+            start_line(&mine, "operator.note", "not-the-session"),
+            start_line(&mine, "dispatch.start", "run-b.adhoc.coder.mine"),
+        ]
+        .join("\n");
+        std::fs::write(dir.path().join(format!("{}.jsonl", crate::day_utc_at(now))), body).unwrap();
+
+        assert_eq!(session_of_execution(dir.path(), &mine).as_deref(), Some("run-b.adhoc.coder.mine"));
+        assert_eq!(session_of_execution(dir.path(), &exec_at(now, 3)), None, "an unknown execution");
+    }
+
+    #[test]
+    fn an_old_execution_resolves_however_old_it_is() {
+        // No look-back window: the id names its own day.
+        let dir = tempfile::tempdir().unwrap();
+        let then = 1_790_564_400 - 400 * 86_400;
+        let mine = exec_at(then, 1);
+        std::fs::write(dir.path().join(format!("{}.jsonl", crate::day_utc_at(then))), start_line(&mine, "dispatch.start", "run-o.adhoc.coder.old")).unwrap();
+        for newer in 1..=40 {
+            std::fs::write(dir.path().join(format!("{}.jsonl", crate::day_utc_at(then + newer * 86_400 + 43_200))), "{}").unwrap();
+        }
+        assert_eq!(session_of_execution(dir.path(), &mine).as_deref(), Some("run-o.adhoc.coder.old"));
+    }
+
+    #[test]
+    fn only_the_days_around_the_mint_are_read() {
+        // A record in a far-away day file is not reached: the mint time bounds
+        // the search, which is what keeps an unknown id off the whole archive.
+        let dir = tempfile::tempdir().unwrap();
+        let now = 1_790_564_400;
+        let mine = exec_at(now, 1);
+        std::fs::write(dir.path().join(format!("{}.jsonl", crate::day_utc_at(now - 10 * 86_400))), start_line(&mine, "dispatch.start", "run-x.adhoc.coder.far")).unwrap();
+        assert_eq!(session_of_execution(dir.path(), &mine), None);
+    }
+
+    #[test]
+    fn an_execution_started_across_midnight_of_its_mint_is_found_in_the_next_day() {
+        let dir = tempfile::tempdir().unwrap();
+        let just_before_midnight = 1_790_553_599; // 2026-09-27T23:59:59Z
+        let mine = exec_at(just_before_midnight, 1);
+        let next = crate::day_utc_at(just_before_midnight + 1);
+        std::fs::write(dir.path().join(format!("{next}.jsonl")), start_line(&mine, "dispatch.start", "run-n.adhoc.coder.next")).unwrap();
+        assert_eq!(session_of_execution(dir.path(), &mine).as_deref(), Some("run-n.adhoc.coder.next"));
+    }
+
+    #[test]
+    fn an_id_with_no_mint_time_resolves_to_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = darkmux_types::execution_id::ExecutionId::legacy(Some("s"), None, "t", "h", "u");
+        assert_eq!(session_of_execution(dir.path(), &legacy), None);
+    }
 
     #[test]
     fn a_spaced_bookend_is_upgraded_in_place() {
@@ -346,6 +450,93 @@ mod tests {
         let line = r#"{"ts":"t","level":"info","category":"work","tier":"local","stage":"dispatch","action":"dispatch.turn","handle":"h","session_id":"task-t","mission_id":"m1"}"#;
         let rec = parse_record(line).unwrap();
         assert_eq!(rec.execution_id.unwrap().as_str(), "legacy:task-t:m1");
+    }
+
+    /// A record written before the queue fields were dropped still reads: the
+    /// typed record has no `work_id` / `attempt`, and parsing ignores them.
+    #[test]
+    fn an_archived_record_carrying_dropped_fields_still_parses() {
+        let line = r#"{"ts":"2026-01-01T00:00:00Z","level":"info","category":"work","tier":"local","stage":"estimate","action":"operator.note","handle":"h","work_id":"1-0","attempt":2}"#;
+        let record = parse_record(line).expect("archive line parses");
+        assert!(matches!(record.stage, crate::Stage::Unknown), "{:?}", record.stage);
+        let back = serde_json::to_value(&record).unwrap();
+        assert!(back.get("work_id").is_none() && back.get("attempt").is_none());
+    }
+
+    /// A pre-4.0 `source` or `tier` spelling reads as its current one, on the
+    /// JSON path and the typed path alike; a current spelling is untouched.
+    #[test]
+    fn old_source_and_tier_spellings_are_upgraded_on_read() {
+        for (old, current) in [
+            ("host-sampler", "host_sampler"),
+            ("presence-reconciler", "presence_reconciler"),
+            ("cmd-gate-audit", "cmd_gate_audit"),
+            ("sprint_lifecycle", "phase_lifecycle"),
+            ("sprint_review", "phase_review"),
+            ("frontier-orchestrator", "frontier"),
+            ("process", "host"),
+        ] {
+            let mut v = json!({"action": "operator.note", "source": old, "tier": "local"});
+            assert_eq!(upgrade(&mut v), ActionRead::Current, "the action is current: {old}");
+            assert_eq!(v["source"], current);
+            assert_eq!(v["tier"], "darkmux");
+            let line = format!(
+                r#"{{"ts":"t","level":"info","category":"work","tier":"local","stage":"dispatch","action":"operator.note","handle":"h","source":"{old}"}}"#
+            );
+            let record = parse_record(&line).expect("archive line parses");
+            assert_eq!(serde_json::to_value(record.source).unwrap(), current);
+            assert!(matches!(record.tier, crate::Tier::Darkmux));
+        }
+        let current = r#"{"action":"operator.note","source":"host_sampler","tier":"darkmux"}"#;
+        assert!(matches!(upgrade_line(current), Some(std::borrow::Cow::Borrowed(_))), "a current line is forwarded byte for byte");
+        let old = r#"{"action":"operator.note","source":"host-sampler","tier":"darkmux"}"#;
+        assert!(matches!(upgrade_line(old), Some(std::borrow::Cow::Owned(_))), "an old spelling is rewritten");
+    }
+
+    /// A source no spelling maps (a retired launcher's, or one from a newer
+    /// build) is kept verbatim on the JSON path and reads as `Unknown`.
+    #[test]
+    fn an_unmapped_source_is_kept_verbatim_and_reads_unknown() {
+        let mut v = json!({"action": "operator.note", "source": "funnel"});
+        assert_eq!(upgrade(&mut v), ActionRead::Current);
+        assert_eq!(v["source"], "funnel");
+        let line = r#"{"ts":"t","level":"info","category":"work","tier":"darkmux","stage":"dispatch","action":"operator.note","handle":"h","source":"funnel"}"#;
+        assert_eq!(parse_record(line).unwrap().source, Some(crate::FlowSource::Unknown));
+    }
+
+    /// A payload key renamed in 4.0 reads under its new name, its value
+    /// converted to milliseconds; a record already on the new key, and one
+    /// of another action, are left alone.
+    #[test]
+    fn old_payload_keys_are_renamed_and_converted_on_read() {
+        let read = |line: serde_json::Value| {
+            let mut v = line;
+            upgrade(&mut v);
+            v["payload"].clone()
+        };
+        let wait = read(json!({"action": "budget.wait", "payload": {
+            "wait_seconds": 90, "resume_at": "2026-01-01T00:01:30Z", "pid": 7}}));
+        assert_eq!(wait, json!({"wait_ms": 90_000, "resume_at_ms": 1_767_225_690_000_i64, "pid": 7}));
+        let start = read(json!({"action": "utility.start", "payload": {"stall_after_seconds": 30}}));
+        assert_eq!(start, json!({"stall_after_ms": 30_000}));
+        let rollup = read(json!({"action": "machine.rollup", "payload": {"period_seconds": 60}}));
+        assert_eq!(rollup, json!({"period_ms": 60_000}));
+        let complete = read(json!({"action": "dispatch.complete", "payload": {"live": {"sampler_us": 1500, "forward_us": 250}}}));
+        assert_eq!(complete, json!({"live": {"sampler_ms": 1.5, "forward_ms": 0.25}}));
+        // The producer wrote `us as f64 / 1000.0`: a reader that multiplied by
+        // 0.001 would give 0.009000000000000001 for 9 us.
+        let exact = read(json!({"action": "dispatch.complete", "payload": {"live": {"sampler_us": 9, "forward_us": 3}}}));
+        assert_eq!(exact, json!({"live": {"sampler_ms": 0.009, "forward_ms": 0.003}}));
+        let battery = read(json!({"action": "machine.battery_health", "payload": {
+            "total_operating_time_hours": 2, "time_at_soc_hours": [0, 1, null]}}));
+        assert_eq!(battery, json!({"total_operating_ms": 7_200_000, "time_at_soc_ms": [0, 3_600_000, null]}));
+
+        let current = json!({"wait_ms": 5, "wait_seconds": 1});
+        assert_eq!(read(json!({"action": "budget.wait", "payload": current.clone()}))["wait_ms"], 5, "the new key wins");
+        let other = json!({"wait_seconds": 1});
+        assert_eq!(read(json!({"action": "dispatch.start", "payload": other.clone()})), other, "another action's payload is untouched");
+        let unreadable = json!({"wait_seconds": "soon"});
+        assert_eq!(read(json!({"action": "budget.wait", "payload": unreadable.clone()})), unreadable, "no reading: kept as written");
     }
 
     #[test]

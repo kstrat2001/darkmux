@@ -127,11 +127,12 @@ fn degraded_phase_ids(mission_id: &str) -> std::collections::BTreeSet<String> {
         .unwrap_or_default()
 }
 
-/// (#1569 packet A) The daemon URL a mission id links to.
+/// (#1569 packet A) The viewer deep link a mission id links to: the graph
+/// lens's own hash route, `#mission=<id>`.
 ///
 /// The id IS percent-encoded: mission ids are not guaranteed path-safe, and
-/// an unencoded one would emit extra path segments that resolve to the wrong
-/// route or to nothing.
+/// an unencoded `&`, `#` or `=` would end or split the hash grammar the viewer
+/// parses, landing on the wrong lens or on nothing.
 ///
 /// **What encoding does and does not buy** (#1593 gate — the first version of
 /// this comment implied more): it makes the URL *well-formed*, not
@@ -151,7 +152,7 @@ fn degraded_phase_ids(mission_id: &str) -> std::collections::BTreeSet<String> {
 /// Encoding is inline rather than a new dependency, per this repo's
 /// small-dep convention: the rule needed here is one line of RFC 3986
 /// unreserved-set logic, not a crate.
-fn mission_url(base: &str, id: &str) -> String {
+pub(crate) fn mission_url(base: &str, id: &str) -> String {
     let encoded: String = id
         .bytes()
         .map(|b| match b {
@@ -162,12 +163,12 @@ fn mission_url(base: &str, id: &str) -> String {
         })
         .collect();
     // `base` always carries its trailing slash (see `viewer_link_base`).
-    format!("{base}mission/{encoded}/graph")
+    format!("{base}#mission={encoded}")
 }
 
-/// A deep link to another panel, but ONLY when this process is rendering
-/// into the console (`DARKMUX_PANEL`, set by the serve daemon's panel
-/// spawner) and is not already the target.
+/// The console deep link to the unlimited mission board, but ONLY when this
+/// process is rendering into the console (`DARKMUX_PANEL`, set by the serve
+/// daemon's panel spawner) and is not already showing every mission.
 ///
 /// The point is that the ADVICE has to match the surface. "`--all` for every
 /// mission" is actionable in a terminal and a dead end in a panel, where
@@ -175,13 +176,13 @@ fn mission_url(base: &str, id: &str) -> String {
 /// fixes it here rather than the viewer pattern-matching this text, because
 /// that matching is the twin drift `/panel/:id` exists to kill: the flag and
 /// its link are one edit, in one file.
-fn panel_deep_link(link_base: &str, target: &str) -> Option<String> {
-    let current = std::env::var("DARKMUX_PANEL").ok()?;
-    if current == target {
+fn panel_all_link(link_base: &str, unlimited: bool) -> Option<String> {
+    std::env::var_os("DARKMUX_PANEL")?;
+    if unlimited {
         return None;
     }
     // `link_base` always carries its trailing slash (see `viewer_link_base`).
-    Some(format!("{link_base}#lens=console&panel={target}"))
+    Some(format!("{link_base}#lens=console&panel=mission-status&opt.all=all"))
 }
 
 /// (#2765) The base URL the board's viewer deep links are built on — the
@@ -196,7 +197,7 @@ fn panel_deep_link(link_base: &str, target: &str) -> Option<String> {
 /// means the fix was not pinned. `viewer_link_base` handles the host half
 /// and short-circuits without spawning `tailscale` when no link will be
 /// emitted.
-fn board_link_base() -> String {
+pub(crate) fn board_link_base() -> String {
     darkmux_doctor::viewer_link_base(darkmux_types::config_access::serve_port())
 }
 
@@ -336,7 +337,7 @@ const DESCRIPTION_NOTE_CAP_CHARS: usize = 120;
 /// that as ordinary punctuation inside a token rather than a sentence
 /// boundary, and finds the terminator several dozen characters later
 /// instead.
-fn first_sentence(d: &str) -> &str {
+pub(crate) fn first_sentence(d: &str) -> &str {
     for (i, ch) in d.char_indices() {
         if ch == '.' {
             let after = &d[i + 1..];
@@ -356,7 +357,7 @@ fn first_sentence(d: &str) -> &str {
 /// feature's own second wall of text. Backs off to the last whitespace
 /// inside the cut rather than hard-truncating at `max`, so the ellipsis
 /// never lands mid-identifier (e.g. mid backtick-quoted code, mid word).
-fn cap_note(s: &str, max: usize) -> String {
+pub(crate) fn cap_note(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
     }
@@ -1391,13 +1392,13 @@ fn planned_phase_nothing_advances_drift(
 /// the whole board, and trimming it would make the structured output lie about
 /// what exists (#1569).
 ///
-/// `missions_only` (#1709) is MEMBERSHIP, not pagination: it filters
+/// `named_only` (#1709) is MEMBERSHIP, not pagination: it filters
 /// machine-minted run instances out, leaving the missions the operator
 /// named. The default is `false` — the board answers "what's recent" across
 /// everything, and the named-only list is the other tab. `all` and
-/// `missions_only` are orthogonal: `--missions --all` means every named
+/// `named_only` are orthogonal: `--named --all` means every named
 /// mission, unpaginated. Like `limit`, it does not touch `--json`.
-pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> Result<i32> {
+pub fn run(json: bool, limit: Option<usize>, all: bool, named_only: bool) -> Result<i32> {
     let unlimited = all || limit == Some(0);
     let missions = crew::loader::load_missions()?;
     let phases = crew::loader::load_phases()?;
@@ -1431,7 +1432,7 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
     let peer = peer_mission_runs(&flows_dir, &fleet.records, &known_mission_ids);
 
     // (#1562, restated for #1709) `--json` is deliberately NEVER filtered —
-    // not by `--missions`, not by anything — because this branch returns
+    // not by `--named`, not by anything — because this branch returns
     // before `board_partition` even runs. A machine reader always gets the
     // whole board (`record exhaustively, display selectively`: the filter is
     // display-only). `--limit`/pagination already followed this same rule.
@@ -1479,7 +1480,7 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
         // CLICOLOR_FORCE, so it DOES resolve — bounded by the daemon's own
         // panel cache.
         let link_base = board_link_base();
-        let all_link = panel_deep_link(&link_base, "mission-status-all");
+        let all_link = panel_all_link(&link_base, unlimited);
         render_board(&Board {
             views: &views,
             peer: &peer,
@@ -1488,7 +1489,7 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
             width,
             limit,
             unlimited,
-            missions_only,
+            named_only,
             link_base: &link_base,
             all_link: all_link.as_deref(),
         })
@@ -1569,10 +1570,10 @@ struct Board<'a> {
     width: Option<usize>,
     limit: Option<usize>,
     unlimited: bool,
-    missions_only: bool,
+    named_only: bool,
     link_base: &'a str,
     /// The "show every mission" deep link, present only inside a console
-    /// panel (see [`panel_deep_link`]).
+    /// panel (see [`panel_all_link`]).
     all_link: Option<&'a str>,
 }
 
@@ -1602,11 +1603,11 @@ fn render_board(b: &Board) -> Vec<String> {
     // (#1709) RECENT-FIRST default, filter on request. "What's recent" is the
     // question an operator brings to a status board, so the default includes
     // run instances; "which missions did I name" is a FILTER they ask for
-    // (`--missions`). The named-first default this replaced (#1562) left a
+    // (`--named`). The named-first default this replaced (#1562) left a
     // day of reviews as one grey "+61 run instances" footer under a FINALIZED
     // section frozen on a mission closed 8 days earlier — accurate and
     // useless at once.
-    let (visible, hidden) = board_partition(b.views, b.missions_only);
+    let (visible, hidden) = board_partition(b.views, b.named_only);
     let mut out = vec![style::header(&format!(
         "mission status — {} mission{}",
         visible.len(),
@@ -1813,11 +1814,11 @@ fn overflow_lines(section: &Section, b: &Board, link_still_unshown: bool) -> Ove
     Overflow { lines, hidden_drift: hidden_drift > 0, showed_link: link.is_some() }
 }
 
-/// Everything after the local sections: the `--missions` footer and hint,
+/// Everything after the local sections: the `--named` footer and hint,
 /// the fleet half, and the closing rollup.
 fn footer_lines(b: &Board, visible: &[&MissionView], hidden: &[&MissionView], any_drift_hidden: bool) -> Vec<String> {
     let mut out = Vec::new();
-    // (#1562) Name what the `--missions` filter collapsed (count + how many
+    // (#1562) Name what the `--named` filter collapsed (count + how many
     // need attention) so a hidden actionable run never reads as silently gone
     // (#44). `--all` leaves `hidden` empty, so this never prints on a full
     // board.
@@ -1828,9 +1829,9 @@ fn footer_lines(b: &Board, visible: &[&MissionView], hidden: &[&MissionView], an
     }
     // (#1709) The other half of the tab: a filter nobody can find doesn't
     // exist. Printed only when there is something to filter, and never in a
-    // panel, which has no prompt to type a flag at (see `panel_deep_link`).
-    if !b.missions_only && b.all_link.is_none() && visible.iter().any(|v| is_minted_run(v.m)) {
-        out.extend(wrap_indented("→ `--missions` for named missions only", 0, b.width).iter().map(|l| style::dim(l)));
+    // panel, which has no prompt to type a flag at (see `panel_all_link`).
+    if !b.named_only && b.all_link.is_none() && visible.iter().any(|v| is_minted_run(v.m)) {
+        out.extend(wrap_indented("→ `--named` for named missions only", 0, b.width).iter().map(|l| style::dim(l)));
     }
     // (#1711) The fleet half — after every local section so this machine stays
     // visually primary, and before the rollup so the clean-board claim can be
@@ -1867,16 +1868,16 @@ fn footer_lines(b: &Board, visible: &[&MissionView], hidden: &[&MissionView], an
 /// comparator.
 fn board_partition<'a>(
     views: &'a [MissionView<'a>],
-    missions_only: bool,
+    named_only: bool,
 ) -> (Vec<&'a MissionView<'a>>, Vec<&'a MissionView<'a>>) {
-    // `--missions` FILTERS minted runs out; the default includes them.
-    partition_visibility(views, !missions_only)
+    // `--named` FILTERS minted runs out; the default includes them.
+    partition_visibility(views, !named_only)
 }
 
 /// Split `views` into (visible, hidden). `include_minted == true` returns
 /// every mission visible and nothing hidden; `false` hides machine-minted
 /// run instances (`is_minted_run`). (#1709) The DEFAULT board passes `true`
-/// and `--missions` passes `false`, via [`board_partition`]; `--all` only
+/// and `--named` passes `false`, via [`board_partition`]; `--all` only
 /// controls pagination. Pure and borrowing.
 fn partition_visibility<'a>(
     views: &'a [MissionView<'a>],
@@ -1899,19 +1900,19 @@ fn hidden_run_summary(hidden_len: usize, hidden_attention: usize) -> Option<Stri
         return None;
     }
     let plural = if hidden_len == 1 { "" } else { "s" };
-    // (#1709) This line now only ever prints under `--missions` — the
+    // (#1709) This line now only ever prints under `--named` — the
     // operator ASKED to filter these out, so the advice names the way back
     // rather than `--all` (which would also un-paginate).
     if hidden_attention == 0 {
         return Some(format!(
-            "+{hidden_len} run instance{plural} filtered out — drop `--missions` to include them, \
+            "+{hidden_len} run instance{plural} filtered out — drop `--named` to include them, \
              or see the runs lens"
         ));
     }
     let verb = if hidden_attention == 1 { "needs" } else { "need" };
     Some(format!(
         "+{hidden_len} run instance{plural} filtered out, {hidden_attention} {verb} attention — \
-         drop `--missions` to include them, or see the runs lens"
+         drop `--named` to include them, or see the runs lens"
     ))
 }
 
@@ -1920,7 +1921,7 @@ fn hidden_run_summary(hidden_len: usize, hidden_attention: usize) -> Option<Stri
 enum HiddenBy {
     /// A section limit cut them off; `--all` shows them.
     Paginated,
-    /// `--missions` filtered them out; only dropping it shows them.
+    /// `--named` filtered them out; only dropping it shows them.
     Filtered,
     Both,
 }
@@ -1976,14 +1977,14 @@ fn attention_rollup(
 }
 
 /// Nothing printed above needs action, but a filtered-out run does. (#1709)
-/// Reachable ONLY under `--missions` — the only way anything lands in
+/// Reachable ONLY under `--named` — the only way anything lands in
 /// `hidden` — so the remedy is to DROP the filter, matching
 /// `hidden_run_summary`'s advice one line above; `--all` would offer a
 /// different cure for the same set, and show nothing new.
 fn filtered_out_attention(hidden: usize, fleet_tail: &str) -> String {
     let one = hidden == 1;
     format!(
-        "{hidden} filtered-out run instance{s} {verb} attention — drop `--missions` to see {it} and {its} \
+        "{hidden} filtered-out run instance{s} {verb} attention — drop `--named` to see {it} and {its} \
          reconcile command{s}{fleet_tail}",
         s = if one { "" } else { "s" },
         verb = if one { "needs" } else { "need" },
@@ -1995,15 +1996,15 @@ fn filtered_out_attention(hidden: usize, fleet_tail: &str) -> String {
 /// Some printed mission needs action. "above" is only true for the ones
 /// printed as full rows, so when a limit or the filter hid others, the line
 /// names the cure for that cause: `--all` un-paginates, but only dropping
-/// `--missions` brings back a filtered-out run (#1709).
+/// `--named` brings back a filtered-out run (#1709).
 fn visible_attention_line(visible: usize, hidden_by: Option<HiddenBy>, all_link_present: bool, fleet_tail: &str) -> String {
     let tail = match (hidden_by, all_link_present) {
         (None, _) => "",
         (Some(HiddenBy::Paginated), true) => " (some are hidden — open the full board above)",
         (Some(HiddenBy::Paginated), false) => " (some are hidden — `--all` to see them)",
-        (Some(HiddenBy::Filtered), _) => " (some are hidden — drop `--missions` to see them)",
-        (Some(HiddenBy::Both), true) => " (some are hidden — drop `--missions` and open the full board above)",
-        (Some(HiddenBy::Both), false) => " (some are hidden — drop `--missions` and add `--all`)",
+        (Some(HiddenBy::Filtered), _) => " (some are hidden — drop `--named` to see them)",
+        (Some(HiddenBy::Both), true) => " (some are hidden — drop `--named` and open the full board above)",
+        (Some(HiddenBy::Both), false) => " (some are hidden — drop `--named` and add `--all`)",
     };
     format!(
         "{visible} mission{s} {verb} attention — run the suggested commands above to reconcile{tail}{fleet_tail}",
@@ -2991,8 +2992,15 @@ mod tests {
         // and no longer a hand-rolled save/restore.
         let _home = DarkmuxHomeGuard::new();
 
-        let real_description =
-            crew::mission_config::load::load("review").unwrap().config.description.unwrap();
+        // The shape that once shipped in `review.json` and cut mid-identifier:
+        // a first sentence over the cap whose body holds the dotted step-kind
+        // name `review.*`. A literal, so the pin does not move when the
+        // shipped description is reworded.
+        let real_description = "The code review, built on the shared mission building blocks rather than \
+             a pipeline of its own \u{2014} and, since P4d, the ONLY `review`: the bespoke funnel launcher \
+             and its ten Tier-3 `review.*` step kinds were deleted, and the config now runs on generic blocks. \
+             A second sentence."
+            .to_string();
 
         let mut m = mission("review-1788656497-cf872b", MissionStatus::Active);
         m.description = real_description.clone();
@@ -3138,30 +3146,28 @@ mod tests {
         assert_eq!(l.handle_width, 0);
     }
 
-    /// (#1569 packet A) Mission ids are NOT guaranteed path-safe — `pr-review`
-    /// ids embed a full TMPDIR path (#1563) — so an unencoded id would emit a
-    /// URL with extra path segments pointing at the wrong route, or none.
+    /// The all-missions link is offered only where a flag cannot be typed.
     #[test]
     #[serial_test::serial] // mutates DARKMUX_PANEL, a process-global
-    fn panel_deep_link_only_fires_inside_a_panel_and_never_at_itself() {
+    fn panel_all_link_only_fires_inside_a_panel_and_never_when_already_unlimited() {
         let base = "http://127.0.0.1:8765/";
         // A terminal has a prompt to type `--all` at, so the hint stays a
         // hint and no link is emitted.
         std::env::remove_var("DARKMUX_PANEL");
-        assert_eq!(panel_deep_link(base, "mission-status-all"), None);
+        assert_eq!(panel_all_link(base, false), None);
 
-        // Rendering into the base panel: the flag becomes reachable.
+        // Rendering into a panel: the flag becomes reachable, as the panel's
+        // own `all` option (never a retired panel id).
         std::env::set_var("DARKMUX_PANEL", "mission-status");
         assert_eq!(
-            panel_deep_link(base, "mission-status-all").as_deref(),
-            Some("http://127.0.0.1:8765/#lens=console&panel=mission-status-all")
+            panel_all_link(base, false).as_deref(),
+            Some("http://127.0.0.1:8765/#lens=console&panel=mission-status&opt.all=all")
         );
 
-        // Already the unlimited panel — a link to where you are is noise, and
+        // Already the unlimited board — a link to where you are is noise, and
         // it is the one case the caller's `shown < len` guard would not catch
         // if the section limit ever applied under `--all`.
-        std::env::set_var("DARKMUX_PANEL", "mission-status-all");
-        assert_eq!(panel_deep_link(base, "mission-status-all"), None);
+        assert_eq!(panel_all_link(base, true), None);
         std::env::remove_var("DARKMUX_PANEL");
     }
 
@@ -3192,21 +3198,21 @@ mod tests {
     #[test]
     fn mission_url_percent_encodes_ids_that_are_not_path_safe() {
         let base = "http://127.0.0.1:8765/";
-        assert_eq!(mission_url(base, "doom-loop-m4"), "http://127.0.0.1:8765/mission/doom-loop-m4/graph");
-        // The #1563 shape: a slash would otherwise open a new path segment.
+        assert_eq!(mission_url(base, "doom-loop-m4"), "http://127.0.0.1:8765/#mission=doom-loop-m4");
+        // The #1563 shape: a slash is not part of the id's own charset.
         assert_eq!(
             mission_url(base, "review-/tmp/x"),
-            "http://127.0.0.1:8765/mission/review-%2Ftmp%2Fx/graph"
+            "http://127.0.0.1:8765/#mission=review-%2Ftmp%2Fx"
         );
-        // `?`/`#` would truncate the path into a query/fragment.
+        // `?`/`#` would truncate the fragment.
         assert_eq!(
             mission_url(base, "a?b#c"),
-            "http://127.0.0.1:8765/mission/a%3Fb%23c/graph"
+            "http://127.0.0.1:8765/#mission=a%3Fb%23c"
         );
         // RFC 3986 unreserved characters survive unescaped.
         assert_eq!(
             mission_url(base, "a-b_c.d~e"),
-            "http://127.0.0.1:8765/mission/a-b_c.d~e/graph"
+            "http://127.0.0.1:8765/#mission=a-b_c.d~e"
         );
     }
 
@@ -3311,8 +3317,8 @@ mod tests {
         // The visible text is the elided form…
         assert!(strip_ansi(&cell).contains('…'), "{cell:?}");
         // …while the target carries the whole id, unelided.
-        assert!(cell.contains(&format!("mission/{full}/graph")), "{cell:?}");
-        assert!(!cell.contains(&format!("mission/{shown}/graph")), "elided id must never be the target: {cell:?}");
+        assert!(cell.contains(&format!("#mission={full}")), "{cell:?}");
+        assert!(!cell.contains(&format!("#mission={shown}")), "elided id must never be the target: {cell:?}");
     }
 
     /// Minimal ANSI/OSC stripper for the alignment assertion above — enough
@@ -4672,7 +4678,7 @@ mod tests {
         assert!(hidden.is_empty(), "`--all` must hide nothing");
     }
 
-    /// (#1709) The DEFAULT board passes `true` here (`!missions_only`), so a
+    /// (#1709) The DEFAULT board passes `true` here (`!named_only`), so a
     /// minted run instance is on the board unless the operator filters it
     /// out. This pins the inversion itself: before #1709 the default passed
     /// `all` (false), which is what buried a day of real work under an
@@ -4692,12 +4698,12 @@ mod tests {
             visible.iter().any(|v| v.m.id == "review-1786150410-209398"),
             "today's run instance must be ON the default board, not in a footer"
         );
-        assert!(hidden.is_empty(), "nothing is filtered out unless --missions asks for it");
+        assert!(hidden.is_empty(), "nothing is filtered out unless --named asks for it");
 
         // …and the filter still works when asked for.
         let (visible, hidden) = board_partition(&views, true);
         assert_eq!(visible.iter().map(|v| v.m.id.as_str()).collect::<Vec<_>>(), vec!["doom-loop-m4"]);
-        assert_eq!(hidden.len(), 1, "--missions filters the minted run out");
+        assert_eq!(hidden.len(), 1, "--named filters the minted run out");
     }
 
     #[test]
@@ -4709,11 +4715,11 @@ mod tests {
     fn hidden_run_summary_names_the_count_and_pluralizes() {
         assert_eq!(
             hidden_run_summary(1, 0).unwrap(),
-            "+1 run instance filtered out — drop `--missions` to include them, or see the runs lens"
+            "+1 run instance filtered out — drop `--named` to include them, or see the runs lens"
         );
         assert_eq!(
             hidden_run_summary(32, 0).unwrap(),
-            "+32 run instances filtered out — drop `--missions` to include them, or see the runs lens"
+            "+32 run instances filtered out — drop `--named` to include them, or see the runs lens"
         );
     }
 
@@ -4724,12 +4730,12 @@ mod tests {
         // collapsed out of the section it would have rendered in.
         assert_eq!(
             hidden_run_summary(32, 2).unwrap(),
-            "+32 run instances filtered out, 2 need attention — drop `--missions` to include them, \
+            "+32 run instances filtered out, 2 need attention — drop `--named` to include them, \
              or see the runs lens"
         );
         assert_eq!(
             hidden_run_summary(3, 1).unwrap(),
-            "+3 run instances filtered out, 1 needs attention — drop `--missions` to include them, \
+            "+3 run instances filtered out, 1 needs attention — drop `--named` to include them, \
              or see the runs lens"
         );
     }
@@ -4745,17 +4751,17 @@ mod tests {
     fn attention_rollup_names_a_hidden_only_attention_item() {
         // Nothing printed above needs action, but a filtered-out run does —
         // the board must not read as clean, and (#1709) must point at
-        // DROPPING `--missions`, the only thing that could have hidden it,
+        // DROPPING `--named`, the only thing that could have hidden it,
         // matching the footer's advice rather than competing with it.
         let (clean, msg) = attention_rollup(0, 1, Some(HiddenBy::Filtered), false, true);
         assert!(!clean, "a hidden actionable run must never look like a clean board");
         assert!(msg.contains("1 filtered-out run instance needs attention"), "{msg}");
-        assert!(msg.contains("--missions"), "{msg}");
+        assert!(msg.contains("--named"), "{msg}");
 
         let (clean, msg) = attention_rollup(0, 2, Some(HiddenBy::Filtered), false, true);
         assert!(!clean);
         assert!(msg.contains("2 filtered-out run instances need attention"), "{msg}");
-        assert!(msg.contains("--missions"), "{msg}");
+        assert!(msg.contains("--named"), "{msg}");
     }
 
     #[test]
@@ -4781,17 +4787,17 @@ mod tests {
     }
 
     /// The tail names the cure for WHY rows are hidden: `--all` un-paginates,
-    /// but only dropping `--missions` brings back a filtered-out run.
+    /// but only dropping `--named` brings back a filtered-out run.
     #[test]
     fn attention_rollup_tail_names_the_cure_for_filtered_rows() {
         for panel in [false, true] {
             let (_, msg) = attention_rollup(3, 2, Some(HiddenBy::Filtered), panel, true);
-            assert!(msg.ends_with("(some are hidden — drop `--missions` to see them)"), "{msg}");
+            assert!(msg.ends_with("(some are hidden — drop `--named` to see them)"), "{msg}");
         }
         let (_, msg) = attention_rollup(3, 2, Some(HiddenBy::Both), false, true);
-        assert!(msg.ends_with("(some are hidden — drop `--missions` and add `--all`)"), "{msg}");
+        assert!(msg.ends_with("(some are hidden — drop `--named` and add `--all`)"), "{msg}");
         let (_, msg) = attention_rollup(3, 2, Some(HiddenBy::Both), true, true);
-        assert!(msg.ends_with("(some are hidden — drop `--missions` and open the full board above)"), "{msg}");
+        assert!(msg.ends_with("(some are hidden — drop `--named` and open the full board above)"), "{msg}");
     }
 
     #[test]
@@ -5178,7 +5184,7 @@ mod tests {
             completed_ts: None,
             updated_ts: Some(100),
             tracked: false,
-            session_id: None,
+            dispatch_id: None,
             abandoned_reason: None,
             tokens: None,
             workload: None,
@@ -5220,7 +5226,7 @@ mod tests {
             width: Some(100),
             limit: None,
             unlimited: false,
-            missions_only: false,
+            named_only: false,
             link_base: "http://127.0.0.1:8765/",
             all_link: None,
         }
@@ -5247,7 +5253,7 @@ mod tests {
             completed_ts: None,
             updated_ts: ts,
             tracked: false,
-            session_id: None,
+            dispatch_id: None,
             abandoned_reason: None,
             tokens: None,
             workload: None,
@@ -5358,7 +5364,7 @@ mod tests {
         vs.reverse();
         let mut b = board(&vs);
         b.limit = Some(1);
-        b.all_link = Some("http://127.0.0.1:8765/#lens=console&panel=mission-status-all");
+        b.all_link = Some("http://127.0.0.1:8765/#lens=console&panel=mission-status&opt.all=all");
         let out = text(render_board(&b));
         assert!(out.contains("  … 2 more (1 of 3 shown)\n  ⚠ 1 hidden mission needs attention\n"), "{out}");
         assert!(out.contains("  … 1 more (1 of 2 shown)\n"), "{out}");
@@ -5405,22 +5411,22 @@ mod tests {
 
         let out = text(render_board(&board(&vs)));
         assert!(out.contains("mission status — 2 missions"), "{out}");
-        assert!(out.contains("→ `--missions` for named missions only"), "{out}");
+        assert!(out.contains("→ `--named` for named missions only"), "{out}");
 
         let mut b = board(&vs);
-        b.all_link = Some("http://x/#lens=console&panel=mission-status-all");
-        assert!(!text(render_board(&b)).contains("--missions"), "no flag advice inside a panel");
+        b.all_link = Some("http://x/#lens=console&panel=mission-status&opt.all=all");
+        assert!(!text(render_board(&b)).contains("--named"), "no flag advice inside a panel");
 
         let mut b = board(&vs);
-        b.missions_only = true;
+        b.named_only = true;
         let out = text(render_board(&b));
         assert!(out.contains("mission status — 1 mission\n"), "{out}");
         assert!(
-            out.contains("+1 run instance filtered out, 1 needs attention — drop `--missions` to include them"),
+            out.contains("+1 run instance filtered out, 1 needs attention — drop `--named` to include them"),
             "{out}"
         );
         assert!(
-            out.ends_with("\n\n1 filtered-out run instance needs attention — drop `--missions` to see it and its reconcile command"),
+            out.ends_with("\n\n1 filtered-out run instance needs attention — drop `--named` to see it and its reconcile command"),
             "{out}"
         );
     }
@@ -5437,11 +5443,11 @@ mod tests {
         vs[0].drifts.push(drift("named drift", &[]));
         vs[1].drifts.push(drift("minted drift", &[]));
         let mut b = board(&vs);
-        b.missions_only = true;
+        b.named_only = true;
         let out = text(render_board(&b));
         let rollup = out.rsplit("\n\n").next().unwrap().replace('\n', " ");
         assert!(rollup.starts_with("1 mission needs attention"), "{rollup}");
-        assert!(rollup.ends_with("(some are hidden — drop `--missions` to see them)"), "{rollup}");
+        assert!(rollup.ends_with("(some are hidden — drop `--named` to see them)"), "{rollup}");
     }
 
     #[test]

@@ -9,7 +9,7 @@
 //! - Procedural-only targets run in-process via `crate::acp_panel::
 //!   run_ephemeral` (already `pub`, no hoist needed — surface neutrality
 //!   held without moving a single line of `acp_panel.rs`).
-//! - Model-seated targets (`RoutePlan::Launch` — #2310 P4d retired the
+//! - Model-seated targets (`LaunchRoute::Launch` — #2310 P4d retired the
 //!   separate Review arm along with the bespoke launcher behind it, so
 //!   every routed command resolves to the SAME `mission launch <id>`
 //!   invocation) spawn `darkmux mission launch <id>` as a
@@ -52,11 +52,19 @@ pub fn run(text: &str, dry_run: bool) -> Result<i32> {
     // caught.
     crate::launch_guard::arm();
     let _reap_watchdog = crate::launch_guard::spawn_reap_watchdog();
-    let catalog = radio::compile_catalog();
+    let catalog = match radio::compile_catalog() {
+        Ok(catalog) => catalog,
+        // One stale user-tier file blocks every launch, so nothing is
+        // launchable: say why, and exit 1 (nothing was routed or run).
+        Err(refusal) => {
+            eprintln!("radio: no mission config can be launched right now.\n{refusal:#}");
+            return Ok(1);
+        }
+    };
     if catalog.is_empty() {
         println!(
-            "radio: no commands are currently advertised — no mission config in the merged \
-             registry (built-ins + ~/.darkmux/mission-configs/) declares a `panel` block."
+            "radio: no mission config is launchable — the merged registry (built-ins + \
+             ~/.darkmux/mission-configs/) is empty."
         );
         return Ok(0);
     }
@@ -135,7 +143,7 @@ pub fn run(text: &str, dry_run: bool) -> Result<i32> {
             Ok(1)
         }
         RouteDecision::Route { command, args } => {
-            println!("radio: routing to /{command} — from your text");
+            println!("radio: routing to `mission launch {command}` — from your text");
             if dry_run {
                 if args.trim().is_empty() {
                     println!("radio: --dry-run — would invoke `{command}` with no arguments");
@@ -149,41 +157,202 @@ pub fn run(text: &str, dry_run: bool) -> Result<i32> {
     }
 }
 
-/// A human-readable fallback list, mirroring
-/// `crate::acp_panel::not_a_command_message`'s render shape (a comma-joined
-/// backtick-slash list) — not a direct call into that function, since it
-/// takes `&[PanelCommand]`, not `&[CatalogEntry]` (two different catalog
-/// shapes for two different consumers — see `radio.rs`'s doc on why
-/// `CatalogEntry::description` diverges from `PanelCommand::description`).
+/// A human-readable fallback list of what can be launched.
 fn advertised_list_message(catalog: &[CatalogEntry]) -> String {
-    let list = catalog.iter().map(|c| format!("`/{}`", c.id)).collect::<Vec<_>>().join(", ");
+    let list =
+        catalog.iter().map(|c| format!("`darkmux mission launch {}`", c.id)).collect::<Vec<_>>().join(", ");
     format!("Available commands: {list}.")
 }
 
-/// Turn a resolved (catalog-validated) command id into an actual execution.
-/// Re-derives the execution PLAN via `crate::acp_panel::route_command` —
-/// the SAME structural Review/Ephemeral/Launch decision the panel surface
-/// uses — rather than re-implementing that classification here.
-///
-/// `Launch` covers every routed command now (#2310 P4d retired the bespoke
-/// review arm along with its launcher). It is NOT true that a launched
-/// config has "no required inputs beyond the optional `args` hook": a
-/// diff-scoped config declares `diff_file` required, and `spawn_mission_
-/// launch` synthesizes it from the cwd — see
-/// `acp_panel::synthesize_diff_launch_inputs`, the same seam the editor
-/// panel uses, so the two surfaces cannot drift.
-fn execute(command: &str, args: &str) -> Result<i32> {
-    let advertised = crate::acp_panel::list_panel_commands();
-    let plan = crate::acp_panel::route_command(&advertised, command).ok_or_else(|| {
-        anyhow::anyhow!(
-            "radio: routed command `{command}` is no longer advertised (the registry changed \
-             between routing and execution)"
-        )
-    })?;
+/// The user's answer to "run this command?". The model's pick is never the
+/// consent: it is the command that is confirmed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Consent {
+    Approved,
+    /// The user answered anything but yes.
+    Declined,
+    /// No answer could be asked for or read: no interactive terminal, or EOF
+    /// before an answer. Nothing runs, and the exit is 1 (a script can tell
+    /// "not run" from a run).
+    Unanswered,
+}
 
-    match plan {
-        crate::acp_panel::RoutePlan::Ephemeral(config) => run_ephemeral_and_report(&config, args),
-        crate::acp_panel::RoutePlan::Launch(id) => spawn_mission_launch(&id, args),
+/// `darkmux mission launch <id> --param k=v ...` as the user would type it,
+/// each param single-quoted when it needs it.
+pub(crate) fn launch_command_line(config_id: &str, params: &[String]) -> String {
+    let mut line = format!("darkmux mission launch {config_id}");
+    for param in params {
+        line.push_str(" --param ");
+        line.push_str(&shell_word(param));
+    }
+    line
+}
+
+/// `word` as one POSIX shell word: bare when it is plain, else single-quoted.
+fn shell_word(word: &str) -> String {
+    let plain = !word.is_empty()
+        && word.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':' | '=' | ',' | '@' | '+'));
+    if plain { word.to_string() } else { format!("'{}'", word.replace('\'', "'\\''")) }
+}
+
+/// What to tell a user who will run a printed command themselves, when some
+/// of its inputs were made from the cwd (see
+/// [`crate::acp_panel::PreparedLaunch::synthesized_keys`]): the inputs among
+/// them that name files ([`crate::acp_panel::SYNTHESIZED_FILE_KEYS`]) name
+/// temporary files that are gone once this process ends, so the command is
+/// not runnable as printed. `None` when none of the synthesized inputs is a
+/// file.
+pub(crate) fn synthesized_inputs_advice(keys: &[&str]) -> Option<String> {
+    let files: Vec<&str> = keys.iter().copied().filter(|k| crate::acp_panel::SYNTHESIZED_FILE_KEYS.contains(k)).collect();
+    if files.is_empty() {
+        return None;
+    }
+    let example = files.iter().map(|k| format!("`--param {k}=<path>`")).collect::<Vec<_>>().join(" and ");
+    Some(format!(
+        "The values for {} above name temporary files, removed when this exits, so the command does not run as printed later. \
+         To launch it yourself, save the diff and a workspace spec for your checkout to files of your own and pass them as \
+         {example}; `darkmux mission config show <config>` lists what each input takes.",
+        files.join(", ")
+    ))
+}
+
+/// Print `command_line`, then ask y/N on `reader`/`writer`. Without an
+/// interactive terminal nothing is asked: the command is printed, with the
+/// line saying it was not run (and, when `synthesized` names inputs made from
+/// the cwd, how to run it yourself), so the user can run it themselves.
+/// `y`/`yes` (case-insensitive) is the only approval, and an interrupt seen
+/// while waiting for it is never one: the SIGINT handler radio installs
+/// leaves the read waiting, so a later `y` would otherwise launch a run that
+/// is already being torn down.
+fn confirm_launch<R: std::io::BufRead, W: std::io::Write>(
+    mut reader: R,
+    mut writer: W,
+    interactive: bool,
+    command_line: &str,
+    synthesized: &[&str],
+) -> Consent {
+    let _ = writeln!(writer, "radio: chose this command from your text:\n\n    {command_line}\n");
+    if !interactive {
+        let _ = writeln!(
+            writer,
+            "radio: not run: there is no interactive terminal to confirm on. Run the command above yourself to launch it."
+        );
+        if let Some(advice) = synthesized_inputs_advice(synthesized) {
+            let _ = writeln!(writer, "radio: {advice}");
+        }
+        return Consent::Unanswered;
+    }
+    // A Ctrl-C that landed while the launch was being prepared is honored
+    // here, before a prompt nobody is going to answer.
+    if darkmux_types::interrupt::is_set() {
+        let _ = writeln!(writer, "radio: not run: interrupted.");
+        return Consent::Unanswered;
+    }
+    let _ = write!(writer, "Run it? [y/N] ");
+    let _ = writer.flush();
+    let mut line = String::new();
+    let read = reader.read_line(&mut line);
+    if darkmux_types::interrupt::is_set() {
+        let _ = writeln!(writer, "\nradio: not run: interrupted.");
+        return Consent::Unanswered;
+    }
+    match read {
+        Ok(0) | Err(_) => {
+            let _ = writeln!(writer, "\nradio: not run: no answer was read.");
+            Consent::Unanswered
+        }
+        Ok(_) if matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes") => Consent::Approved,
+        Ok(_) => {
+            let _ = writeln!(writer, "radio: not run.");
+            Consent::Declined
+        }
+    }
+}
+
+/// How long [`InterruptibleStdin`] waits for input before checking for an
+/// interrupt again.
+const INTERRUPT_POLL_MS: libc::c_int = 100;
+
+/// Stdin that gives up waiting once an interrupt is seen. The SIGINT handler
+/// is installed with `SA_RESTART`, and a plain `read` on a terminal resumes
+/// after it, so a Ctrl-C would leave the prompt waiting (and a third one,
+/// with the default disposition restored, would kill the process before the
+/// launch's temporary inputs are removed). This waits in `poll` in short
+/// slices instead and checks the flag between them. The error it returns is
+/// not `ErrorKind::Interrupted`, which `read_line` would retry.
+struct InterruptibleStdin;
+
+impl std::io::Read for InterruptibleStdin {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if darkmux_types::interrupt::is_set() {
+                return Err(std::io::Error::other("interrupted"));
+            }
+            let mut fds = libc::pollfd { fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0 };
+            // SAFETY: `fds` is one valid pollfd and the count says so.
+            let ready = unsafe { libc::poll(&mut fds, 1, INTERRUPT_POLL_MS) };
+            match ready {
+                0 => continue,
+                n if n > 0 => break,
+                _ => {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() != std::io::ErrorKind::Interrupted {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+        // Readable (a complete line, end of input, or a hangup), so this
+        // does not block.
+        std::io::stdin().lock().read(buf)
+    }
+}
+
+/// [`confirm_launch`] against this process's stdin and stdout.
+fn confirm_on_terminal(command_line: &str, synthesized: &[&str]) -> Consent {
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    confirm_launch(std::io::BufReader::new(InterruptibleStdin), std::io::stdout(), interactive, command_line, synthesized)
+}
+
+/// The exit code for a consent that did not approve.
+fn exit_for_unapproved(consent: Consent) -> Option<i32> {
+    match consent {
+        Consent::Approved => None,
+        Consent::Declined => Some(0),
+        Consent::Unanswered => Some(1),
+    }
+}
+
+/// Turn a routed command (a catalog config id) into an actual execution,
+/// through the SAME planning the editor panel's `/mission launch` uses
+/// ([`crate::acp_panel::plan_launch`] then [`crate::acp_panel::prepare_launch`]),
+/// so the two surfaces cannot drift: the same input mapping, the same
+/// refusals, the same diff synthesis from the cwd for a config that declares
+/// a required `diff_file`. The inputs are prepared BEFORE asking, so the user
+/// confirms the command with every param that will run, the synthesized ones
+/// included ([`confirm_on_terminal`]); the router could choose any config from
+/// free text, so its pick is never the consent. A repo with nothing to review
+/// is reported without asking.
+fn execute(command: &str, args: &str) -> Result<i32> {
+    let plan = crate::acp_panel::plan_launch(command, args).with_context(|| format!("radio: routed command `{command}`"))?;
+    let cwd = std::env::current_dir().context("resolving current directory")?;
+    let prepared = match crate::acp_panel::prepare_launch(&plan.config, plan.params.clone(), &cwd)? {
+        crate::acp_panel::Prepared::Ready(prepared) => prepared,
+        crate::acp_panel::Prepared::Nothing(msg) => {
+            println!("radio: {msg}");
+            return Ok(0);
+        }
+    };
+    if let Some(note) = &prepared.note {
+        println!("radio: {note}");
+    }
+    let command_line = launch_command_line(&plan.config_id, &prepared.params);
+    if let Some(code) = exit_for_unapproved(confirm_on_terminal(&command_line, &prepared.synthesized_keys())) {
+        return Ok(code);
+    }
+    match plan.route {
+        crate::acp_panel::LaunchRoute::Ephemeral => run_ephemeral_and_report(&plan.config, &prepared.params),
+        crate::acp_panel::LaunchRoute::Launch => spawn_mission_launch(&plan.config_id, &prepared.params),
     }
 }
 
@@ -197,10 +366,10 @@ fn execute(command: &str, args: &str) -> Result<i32> {
 /// `render_ephemeral_result`'s own doc) — the string-sniffing contract
 /// could never distinguish that case from a genuine clean success, so this
 /// CLI used to silently exit 0 for a partially-failed run.
-fn run_ephemeral_and_report(config: &crate::crew::mission_config::MissionConfig, args: &str) -> Result<i32> {
+fn run_ephemeral_and_report(config: &crate::crew::mission_config::MissionConfig, params: &[String]) -> Result<i32> {
     let cwd = std::env::current_dir().context("resolving current directory")?;
     let mut gate = cli_gate_handler();
-    match crate::acp_panel::run_ephemeral(config, args, &cwd, Some(&mut *gate)) {
+    match crate::acp_panel::run_ephemeral(config, params, &cwd, Some(&mut *gate)) {
         Ok(outcome) => {
             println!("{}", outcome.text);
             if outcome.success { Ok(0) } else { Ok(1) }
@@ -213,47 +382,22 @@ fn run_ephemeral_and_report(config: &crate::crew::mission_config::MissionConfig,
 }
 
 /// Spawn `darkmux mission launch <config_id>` as a child process INHERITING
-/// this process's stdio (`std::process::Command`'s default — unlike
+/// this process's stdio (`std::process::Command`'s default, unlike
 /// `src/acp.rs::run_launch_command`'s headless `Stdio::null()`/`piped()`
 /// spawn), so the child's own interactive tty sign-off gate
 /// (`mission_launch.rs`'s private `cli_gate_handler`) sees the SAME real
-/// terminal this `radio` invocation is running in. Forwards the raw text
-/// as `--param args=<raw>` when non-empty — the identical, already-
-/// documented forward-compatible hook `src/acp.rs::run_launch_command` uses
-/// (see that function's own "args honesty note": today no shipped config
-/// declares `args` as a `MissionInput`, so this is a hook, not yet a wired
-/// delivery — the same honest limitation applies here, unchanged).
-fn spawn_mission_launch(config_id: &str, args: &str) -> Result<i32> {
+/// terminal this `radio` invocation is running in. `params` are the
+/// `--param` values [`crate::acp_panel::plan_launch`] and
+/// [`crate::acp_panel::prepare_launch`] produced; the caller holds the
+/// [`crate::acp_panel::PreparedLaunch`] (and its synthesized-input tempdir)
+/// until this returns.
+fn spawn_mission_launch(config_id: &str, params: &[String]) -> Result<i32> {
     let exe = std::env::current_exe().context("resolving darkmux's own executable path")?;
     let mut cmd = std::process::Command::new(&exe);
     cmd.args(["mission", "launch", config_id]);
-    if !args.trim().is_empty() {
-        cmd.args(["--param", &format!("args={args}")]);
+    for param in params {
+        cmd.args(["--param", param]);
     }
-    // (#2310 P4d) Same synthesis the editor panel does, from the same
-    // function: a diff-scoped config gets its `diff_file`/`workspace`/
-    // `head_sha` from this cwd. `_synth`'s Drop removes the tempdir on
-    // every exit path below.
-    let cwd = std::env::current_dir().context("resolving current directory")?;
-    let config = crate::crew::mission_config::load(config_id)
-        .with_context(|| format!("loading mission config \"{config_id}\""))?
-        .config;
-    let _synth = match crate::acp_panel::synthesize_diff_launch_inputs(&config, &cwd)? {
-        crate::acp_panel::DiffLaunchInputs::NotNeeded => None,
-        crate::acp_panel::DiffLaunchInputs::Nothing(msg) => {
-            println!("radio: {msg}");
-            return Ok(0);
-        }
-        crate::acp_panel::DiffLaunchInputs::Ready(synth) => {
-            for p in synth.params() {
-                cmd.args(["--param", p]);
-            }
-            if let Some(note) = &synth.excluded_note {
-                println!("radio: {note}");
-            }
-            Some(synth)
-        }
-    };
     println!("radio: launching `{config_id}` …");
     // (#2463 review) POLL, do not `status()`. This child is deliberately NOT
     // in `child_registry` — the reap watchdog would SIGKILL it ~100ms after a
@@ -285,7 +429,7 @@ fn spawn_mission_launch(config_id: &str, args: &str) -> Result<i32> {
     // ~100ms cadence from the moment the interrupt flag is set — so every
     // registered pid gets reaped whether or not this line runs. And the
     // hard `exit` skipped every destructor on the way out, including
-    // `_synth`'s tempdir cleanup above; returning runs them. (This child is
+    // the prepared launch's tempdir cleanup above; returning runs them. (This child is
     // not in that registry at all — see the comment above — so neither call
     // ever reached it.)
     //
@@ -498,6 +642,133 @@ mod tests {
         );
     }
 
+    // ── consent before a routed launch ──────────────────────────────────
+
+    struct NoRead;
+    impl std::io::Read for NoRead {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            panic!("a non-interactive confirm must not read");
+        }
+    }
+
+    fn ask(input: &str, interactive: bool) -> (Consent, String) {
+        let mut out = Vec::new();
+        let consent = confirm_launch(input.as_bytes(), &mut out, interactive, "darkmux mission launch review", &[]);
+        (consent, String::from_utf8(out).unwrap())
+    }
+
+    #[test]
+    fn a_yes_answer_approves_and_the_command_was_shown_first() {
+        for yes in ["y\n", "Y\n", "yes\n", "  YES \n"] {
+            let (consent, out) = ask(yes, true);
+            assert_eq!(consent, Consent::Approved, "{yes:?}");
+            assert!(out.contains("darkmux mission launch review") && out.contains("[y/N]"), "{out}");
+        }
+    }
+
+    #[test]
+    fn anything_but_yes_declines() {
+        for no in ["n\n", "\n", "no\n", "maybe\n", "yep\n"] {
+            assert_eq!(ask(no, true).0, Consent::Declined, "{no:?}");
+        }
+    }
+
+    #[test]
+    fn eof_is_never_consent() {
+        let (consent, out) = ask("", true);
+        assert_eq!(consent, Consent::Unanswered);
+        assert!(out.contains("not run"), "{out}");
+    }
+
+    #[test]
+    fn without_a_terminal_the_command_is_printed_and_nothing_is_read() {
+        let mut out = Vec::new();
+        let consent = confirm_launch(std::io::BufReader::new(NoRead), &mut out, false, "darkmux mission launch review", &[]);
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(consent, Consent::Unanswered);
+        assert!(out.contains("darkmux mission launch review") && out.contains("not run") && out.contains("no interactive terminal"), "{out}");
+    }
+
+    /// A reader that delivers the interrupt while the prompt is waiting, then
+    /// the `y` typed afterward: the SIGINT handler radio installs sets the
+    /// flag and the blocked read resumes.
+    struct InterruptedThenYes;
+    impl std::io::Read for InterruptedThenYes {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            darkmux_types::interrupt::simulate_sigint_for_test();
+            buf[..2].copy_from_slice(b"y\n");
+            Ok(2)
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn an_interrupt_during_the_prompt_is_never_consent_even_if_a_yes_follows() {
+        darkmux_types::interrupt::reset_for_test();
+        let mut out = Vec::new();
+        let consent =
+            confirm_launch(std::io::BufReader::new(InterruptedThenYes), &mut out, true, "darkmux mission launch review", &[]);
+        darkmux_types::interrupt::reset_for_test();
+        assert_eq!(consent, Consent::Unanswered);
+        assert!(String::from_utf8(out).unwrap().contains("interrupted"));
+    }
+
+    #[test]
+    fn a_non_interactive_confirm_of_synthesized_inputs_says_how_to_run_it_yourself() {
+        let mut out = Vec::new();
+        let line = "darkmux mission launch review --param diff_file=/tmp/x/review.diff";
+        let consent = confirm_launch(std::io::BufReader::new(NoRead), &mut out, false, line, &["diff_file", "workspace"]);
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(consent, Consent::Unanswered);
+        assert!(out.contains("--param diff_file=/tmp/x/review.diff"), "the real param is shown: {out}");
+        assert!(out.contains("diff_file, workspace") && out.contains("temporary files"), "{out}");
+        assert!(out.contains("--param diff_file=<path>"), "{out}");
+        // The inverse: nothing synthesized, nothing qualified.
+        let mut plain = Vec::new();
+        confirm_launch(std::io::BufReader::new(NoRead), &mut plain, false, line, &[]);
+        assert!(!String::from_utf8(plain).unwrap().contains("temporary"));
+    }
+
+    #[test]
+    fn the_advice_names_only_the_file_inputs_and_points_at_the_config_listing() {
+        let advice = synthesized_inputs_advice(&["diff_file", "workspace", "head_sha"]).expect("advice");
+        assert!(advice.contains("diff_file, workspace") && !advice.contains("head_sha"), "{advice}");
+        assert!(advice.contains("darkmux mission config show <config>"), "{advice}");
+        assert!(!advice.contains("mission show"), "{advice}");
+        // The inverse: a commit hash alone names no temporary file.
+        assert_eq!(synthesized_inputs_advice(&["head_sha"]), None);
+        assert_eq!(synthesized_inputs_advice(&[]), None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn an_interrupt_already_seen_before_the_prompt_ends_it_without_asking_or_reading() {
+        darkmux_types::interrupt::reset_for_test();
+        darkmux_types::interrupt::simulate_sigint_for_test();
+        let mut out = Vec::new();
+        let consent = confirm_launch(std::io::BufReader::new(NoRead), &mut out, true, "darkmux mission launch review", &[]);
+        darkmux_types::interrupt::reset_for_test();
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(consent, Consent::Unanswered);
+        assert!(out.contains("interrupted") && !out.contains("[y/N]"), "{out}");
+    }
+
+    #[test]
+    fn only_an_approval_lets_the_launch_proceed_and_the_exits_differ() {
+        assert_eq!(exit_for_unapproved(Consent::Approved), None);
+        assert_eq!(exit_for_unapproved(Consent::Declined), Some(0));
+        assert_eq!(exit_for_unapproved(Consent::Unanswered), Some(1));
+    }
+
+    #[test]
+    fn the_printed_command_quotes_params_the_way_a_shell_needs() {
+        let params = vec!["rules=a,b".to_string(), "args=fix the bug".to_string(), "t=it's".to_string()];
+        assert_eq!(
+            launch_command_line("review", &params),
+            "darkmux mission launch review --param rules=a,b --param 'args=fix the bug' --param 't=it'\\''s'"
+        );
+    }
+
     #[test]
     fn advertised_list_message_lists_every_catalog_entry() {
         // `advertised_list_message` is only ever called from `run()`'s
@@ -512,7 +783,7 @@ mod tests {
             radio::CatalogEntry { id: "pr-list".to_string(), description: "d2".to_string(), hint: None, accepts_args: true },
         ];
         let msg = advertised_list_message(&catalog);
-        assert!(msg.contains("`/review`"), "{msg}");
-        assert!(msg.contains("`/pr-list`"), "{msg}");
+        assert!(msg.contains("`darkmux mission launch review`"), "{msg}");
+        assert!(msg.contains("`darkmux mission launch pr-list`"), "{msg}");
     }
 }

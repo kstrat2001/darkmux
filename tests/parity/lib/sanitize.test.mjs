@@ -57,15 +57,15 @@ test("an UNKNOWN numeric key inside battery_health is never passed through verba
   assert.ok(matched.unknownFields.includes("battery_health.manufacture_date_ms"));
 });
 
-test("time_at_soc_hours is replaced by a synthetic ramp of the same length, never the real buckets", () => {
+test("time_at_soc_ms is replaced by a synthetic ramp of the same length, never the real buckets", () => {
   const real = [0, 14, 1940, 683, 0, 13];
-  const { text } = sanitizeText(payloadWith({ time_at_soc_hours: real }));
-  const out = JSON.parse(text).load.battery_health.time_at_soc_hours;
+  const { text } = sanitizeText(payloadWith({ time_at_soc_ms: real }));
+  const out = JSON.parse(text).load.battery_health.time_at_soc_ms;
   assert.equal(out.length, real.length, "structural length preserved");
   assert.notDeepEqual(out, real, "real per-bucket values must not survive");
 });
 
-test("an unknown NUMERIC ARRAY inside battery_health (not time_at_soc_hours) is also scrubbed per element", () => {
+test("an unknown NUMERIC ARRAY inside battery_health (not time_at_soc_ms) is also scrubbed per element", () => {
   const { text, matched } = sanitizeText(
     payloadWith({ some_future_counter_array: [1, 2, 3, 999999] }),
   );

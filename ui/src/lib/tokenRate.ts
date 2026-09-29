@@ -669,10 +669,10 @@ export function deriveLiveState(records: NormRecord[], nowMs: number): LiveState
       // (#2915) This execution's compactor is running. A routing job (or any
       // other job that serves no execution) never lands here: it carries no
       // session, so it is not in an execution's records at all.
-      const bound = num(fields(r).stall_after_seconds);
-      // (#2915 review, C4) The start's own ms time counts the seconds.
+      const bound = num(fields(r).stall_after_ms);
+      // (#2915 review, C4) The start's own ms time counts the millisecond.
       const startedAt = num(fields(r).started_at_ms);
-      m = { atMs: startedAt !== null && startedAt > 0 ? startedAt : atMs, kind: "compacting", stallAfterMs: bound !== null && bound > 0 ? bound * 1000 : UTILITY_JOB_DEFAULT_STALL_MS };
+      m = { atMs: startedAt !== null && startedAt > 0 ? startedAt : atMs, kind: "compacting", stallAfterMs: bound !== null && bound > 0 ? bound : UTILITY_JOB_DEFAULT_STALL_MS };
     } else if (
       marker?.kind === "compacting" &&
       ((isUtilityEnd(r) && utilityJobOf(r) === UTILITY_JOB.compaction) || r.action === ACTION.DispatchCompaction)
@@ -691,9 +691,9 @@ export function deriveLiveState(records: NormRecord[], nowMs: number): LiveState
       // runtime to rest). It reads as the same REST an agentic run's budget
       // pause does: "budget · <endpoint>", counting down to the resume time.
       const f = fields(r);
-      const secs = num(f.wait_seconds);
-      if (secs !== null && secs > 0) {
-        m = { atMs, kind: "rest", restMs: secs * 1000 };
+      const waitMs = num(f.wait_ms);
+      if (waitMs !== null && waitMs > 0) {
+        m = { atMs, kind: "rest", restMs: waitMs };
         const why = restReasonLabel("budget", typeof f.endpoint_id === "string" ? f.endpoint_id : undefined);
         if (why !== null) {
           m.restReason = why;

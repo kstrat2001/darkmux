@@ -566,8 +566,9 @@ fn wait_holds_until_the_window_has_room_then_resumes() {
     assert_eq!(env.paused_ms.get(), env.slept_ms.get(), "every waited ms is recorded as pause");
     assert_eq!(env.actions(), vec![darkmux_flow::FlowAction::BudgetWait, darkmux_flow::FlowAction::BudgetResume]);
     let wait = env.payload(darkmux_flow::FlowAction::BudgetWait);
-    assert_eq!(wait["wait_seconds"].as_i64(), Some(90));
-    assert_eq!(wait["resume_at"].as_str(), Some(darkmux_flow::ts_utc_at(T0 + 90).as_str()));
+    assert_eq!(wait["wait_ms"].as_i64(), Some(90_000));
+    assert_eq!(wait["resume_at_ms"].as_i64(), Some((T0 + 90) * 1_000));
+    assert!(wait.get("wait_seconds").is_none() && wait.get("resume_at").is_none(), "no second spelling: {wait}");
     assert!(env.said.borrow()[0].contains("resuming in about 1m 30s"), "{:?}", env.said.borrow());
     assert!(env.payload(darkmux_flow::FlowAction::BudgetResume)["waited_ms"].as_u64().unwrap() >= 90_000);
 }
@@ -729,7 +730,7 @@ fn a_zero_budget_built_directly_waits_until_raised() {
     let env = FakeEnv::new(vec![]);
     *env.reload_to.borrow_mut() = Some(Some(budget(BudgetPolicy::Wait, Some(5), None, None)));
     admit_with(budget(BudgetPolicy::Wait, Some(0), None, None), &solo_caller(), &env).unwrap();
-    assert!(env.payload(darkmux_flow::FlowAction::BudgetWait)["resume_at"].is_null());
+    assert!(env.payload(darkmux_flow::FlowAction::BudgetWait)["resume_at_ms"].is_null());
     let said = env.said.borrow()[0].clone();
     assert!(said.contains("until its window has room") && !said.contains("budget is 0"), "{said}");
 }
@@ -1043,7 +1044,7 @@ fn active_waits_lists_open_waits_from_live_processes_only() {
         serde_json::json!({
             "ts": darkmux_flow::ts_utc_at(T0 - 30), "action": action, "session_id": sid, "mission_id": "m-1",
             "payload": {"scope": "endpoint", "endpoint_id": "azure", "pid": pid,
-                "resume_at": resume.map(darkmux_flow::ts_utc_at), "message": "m"}
+                "resume_at_ms": resume.map(|r| r * 1_000), "message": "m"}
         })
         .to_string()
             + "\n"
@@ -1083,7 +1084,7 @@ fn active_waits_skip_a_stopped_runs_wait() {
         serde_json::json!({
             "ts": darkmux_flow::ts_utc_at(T0 - 30), "action": darkmux_flow::FlowAction::BudgetWait, "session_id": sid, "mission_id": mission,
             "payload": {"scope": "endpoint", "endpoint_id": "azure", "pid": 1,
-                "resume_at": darkmux_flow::ts_utc_at(T0 + 600), "message": "m"}
+                "resume_at_ms": (T0 + 600) * 1_000, "message": "m"}
         })
         .to_string()
             + "\n"
@@ -1109,7 +1110,7 @@ fn active_waits_reach_back_to_the_widest_window() {
     let wait = serde_json::json!({
         "ts": darkmux_flow::ts_utc_at(T0 - 3 * DAY), "action": darkmux_flow::FlowAction::BudgetWait, "session_id": "s",
         "payload": {"scope": "endpoint", "endpoint_id": "azure", "pid": 1,
-            "resume_at": darkmux_flow::ts_utc_at(T0 + 3_600), "message": "m"}
+            "resume_at_ms": (T0 + 3_600) * 1_000, "message": "m"}
     })
     .to_string()
         + "\n";

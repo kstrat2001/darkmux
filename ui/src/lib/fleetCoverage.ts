@@ -7,7 +7,7 @@
  * the only thing that asked the question. Two readers now do — the notice
  * (and the masthead marker that shares its hook) over
  * `/fleet/machines/live`, and `hooks/useLiveSessionIds` over
- * `/fleet/sessions/live` — and those endpoints sit on the SAME Redis
+ * `/fleet/dispatches/live` — and those endpoints sit on the SAME Redis
  * substrate and fail in the same state (`fleet_sessions_live_handler` and
  * `fleet_machines_live_handler` both emit `source_state::coverage_meta`).
  * A hook importing a component to borrow its predicate would have been the
@@ -18,7 +18,8 @@
  * Pure and React-free on purpose: the hooks own the queries, this module owns
  * the reading of what they return.
  */
-import type { CoverageMeta, SourceState } from "../types/handwritten";
+import type { CoverageMeta } from "../types/generated/CoverageMeta";
+import type { SourceState } from "../types/generated/SourceState";
 
 /** The fleet source state when it is worth warning about, `null` otherwise
  * (`ok`/`off`/nothing tracked/no answer yet). One predicate, so the masthead's

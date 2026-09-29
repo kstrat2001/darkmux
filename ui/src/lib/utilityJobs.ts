@@ -6,7 +6,7 @@
  * lean: no session of its own, no dispatch bookends, no run, no presence
  * (#2914, the amended contract 2). It writes one `utility.start` flow record
  * when it starts (flow schema 1.61.0+: `job`, `model`, `serves` when it
- * serves an execution, `stall_after_seconds`), and its usage record
+ * serves an execution, `stall_after_ms`), and its usage record
  * (`telemetry.tokens`, `purpose: "utility"`, `job`) marks the end. A routing
  * job whose model call failed ends with `utility.error` instead.
  *
@@ -32,7 +32,7 @@ export const UTILITY_JOB = { compaction: "compaction", radio_routing: "radio_rou
 
 /** The bound a `utility.start` that carries none is held to: the runtime's
  *  default inactivity window (`runtime.inactivity_timeout_seconds`, 600 s).
- *  Every 1.61.0 start carries its own `stall_after_seconds`. */
+ *  Every 1.61.0 start carries its own `stall_after_ms`. */
 export const UTILITY_JOB_DEFAULT_STALL_MS = 600_000;
 
 const KNOWN: ReadonlySet<string> = new Set(Object.values(UTILITY_JOB));
@@ -119,7 +119,7 @@ export interface LiveUtilityJob {
   job: string;
   known: boolean;
   sinceMs: number;
-  /** The job's own bound (`stall_after_seconds`), else the default. */
+  /** The job's own bound (`stall_after_ms`), else the default. */
   stallAfterMs: number;
   /** No end within the bound: reads STALL. */
   stalled: boolean;
@@ -200,7 +200,7 @@ export function openUtilityJobs(records: readonly NormRecord[], nowMs: number): 
     if (isUtilityStart(r)) {
       const job = typeof p.job === "string" && p.job ? p.job : "";
       const jobId = typeof p.job_id === "string" && p.job_id ? p.job_id : null;
-      const bound = typeof p.stall_after_seconds === "number" && p.stall_after_seconds > 0 ? p.stall_after_seconds * 1000 : UTILITY_JOB_DEFAULT_STALL_MS;
+      const bound = typeof p.stall_after_ms === "number" && p.stall_after_ms > 0 ? p.stall_after_ms : UTILITY_JOB_DEFAULT_STALL_MS;
       const model = typeof p.model === "string" && p.model ? p.model : r.model || null;
       open.push({ job, jobId, atMs, session, stallAfterMs: bound, model });
     } else if (isUtilityEnd(r)) {

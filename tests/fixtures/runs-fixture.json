@@ -60,7 +60,7 @@
       "started_ts": 1893430000,
       "updated_ts": 1893430000,
       "tracked": false,
-      "session_id": "ghost-session-abc"
+      "dispatch_id": "ghost-session-abc"
     }
   ]
 }

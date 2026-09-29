@@ -22,7 +22,7 @@
       "archived": 7,
       "degenerate": false,
       "finished": true,
-      "has_funnels": true,
+      "has_reviews": true,
       "has_events": true
     },
     {
@@ -46,7 +46,7 @@
       "archived": 6,
       "degenerate": false,
       "finished": true,
-      "has_funnels": true,
+      "has_reviews": true,
       "has_events": true
     },
     {
@@ -65,7 +65,7 @@
       "archived": 0,
       "degenerate": false,
       "finished": false,
-      "has_funnels": false,
+      "has_reviews": false,
       "has_events": true
     }
   ]

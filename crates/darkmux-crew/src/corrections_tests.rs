@@ -69,19 +69,19 @@ fn scan_exact_set_scopes_to_the_mission_family_and_excludes_siblings() {
     );
     // Oldest→newest within the window.
     assert_eq!(got[0].ts, "2026-06-21T10:00:00Z", "{got:?}");
-    assert_eq!(got[0].session_id, "mission-run-auth-s1");
+    assert_eq!(got[0].text, "Do not rename the field.");
     assert_eq!(got[2].ts, "2026-06-21T11:30:00Z", "{got:?}");
 }
 
 /// `None` = unscoped: every adjudication note in the window, across missions.
-/// This is what `memory correction list` reads with no `--mission`/`--session`.
+/// This is what `memory correction list` reads with no `--mission`/`--execution`.
 #[test]
 #[serial_test::serial]
 fn scan_unscoped_reads_every_session() {
     let got = with_flows(|| scan(ADJUDICATION_LOOKBACK_DAYS, Scope::All));
     assert_eq!(got.len(), 6, "four auth + two auth-v2, undeduped: {got:?}");
     assert!(
-        got.iter().any(|c| c.session_id == "mission-run-auth-v2-s1"),
+        got.iter().any(|c| c.text.contains("auth-v2")),
         "unscoped includes the sibling mission: {got:?}"
     );
 }
@@ -142,4 +142,77 @@ fn scan_day_window_bounds_the_read() {
     assert_eq!(one[0].text, "newer day");
     assert_eq!(two.len(), 2, "a 2-day window reads both, oldest→newest: {two:?}");
     assert_eq!(two[0].text, "older day", "oldest first: {two:?}");
+}
+
+/// `Scope::Execution` reads the record's `execution_id`, never its session: a
+/// session holds several executions, and a session-shaped value names none.
+#[test]
+#[serial_test::serial]
+fn scan_execution_scope_matches_the_execution_and_not_its_session() {
+    let (mine, sibling) = (ExecutionId::mint(), ExecutionId::mint());
+    let note = |exec: &ExecutionId, text: &str| {
+        serde_json::json!({
+            "ts": "2026-06-21T10:00:00Z", "action": "operator.note", "source": "adjudication",
+            "session_id": "run-a.phase.p1", "execution_id": exec.as_str(), "handle": text,
+        })
+        .to_string()
+    };
+    let tmp = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        tmp.path().join("2026-06-21.jsonl"),
+        [note(&mine, "mine"), note(&sibling, "same session, other execution")].join("\n"),
+    )
+    .unwrap();
+    let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+    // SAFETY: serialized via #[serial]; restored below.
+    unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path()) };
+    let got = scan(ADJUDICATION_LOOKBACK_DAYS, Scope::Execution(&mine));
+    unsafe {
+        match prev {
+            Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+            None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+        }
+    }
+    assert_eq!(got.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(), ["mine"], "{got:?}");
+}
+
+/// A correction names the role execution it is about, never the session it
+/// ran under. A record with no execution of its own (a pre-4.0 note reads
+/// with a synthesized `legacy:` id) names none, so the session cannot leak
+/// back out through the synthesized spelling.
+#[test]
+#[serial_test::serial]
+fn a_correction_names_its_execution_and_an_old_one_names_none() {
+    let mine = ExecutionId::mint();
+    let with_exec = serde_json::json!({
+        "ts": "2026-06-21T10:00:00Z", "action": "operator.note", "source": "adjudication",
+        "session_id": "run-a.phase.p1", "execution_id": mine.as_str(), "handle": "new",
+    });
+    let old = serde_json::json!({
+        "ts": "2026-06-21T11:00:00Z", "action": "note", "source": "adjudication",
+        "session_id": "mission-run-auth-s1", "handle": "old",
+    });
+    let synthesized = serde_json::json!({
+        "ts": "2026-06-21T12:00:00Z", "action": "operator.note", "source": "adjudication",
+        "session_id": "mission-run-auth-s1", "execution_id": "legacy:mission-run-auth-s1:auth", "handle": "synth",
+    });
+    let tmp = tempfile::TempDir::new().unwrap();
+    std::fs::write(tmp.path().join("2026-06-21.jsonl"), format!("{with_exec}\n{old}\n{synthesized}\n")).unwrap();
+    let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+    // SAFETY: serialized via #[serial]; restored below.
+    unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path()) };
+    let got = scan(ADJUDICATION_LOOKBACK_DAYS, Scope::All);
+    unsafe {
+        match prev {
+            Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+            None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+        }
+    }
+    assert_eq!(got.len(), 3, "{got:?}");
+    assert_eq!(got[0].execution_id.as_ref(), Some(&mine));
+    assert_eq!(got[1].execution_id, None, "an old record has no execution to name");
+    assert_eq!(got[2].execution_id, None, "a synthesized id is not shown");
+    let json = serde_json::to_string(&got).unwrap();
+    assert!(!json.contains("session"), "no session in the serialized shape: {json}");
+    assert!(json.contains(mine.as_str()), "{json}");
 }

@@ -178,9 +178,9 @@
       }
     },
     {
-      "name": "fleet-sessions-live",
-      "path": "/fleet/sessions/live",
-      "file": "fleet-sessions-live.json",
+      "name": "fleet-dispatches-live",
+      "path": "/fleet/dispatches/live",
+      "file": "fleet-dispatches-live.json",
       "http_status": 200,
       "ok": true,
       "extra": null,
@@ -283,9 +283,9 @@
       }
     },
     {
-      "name": "flow-session-task-list",
-      "path": "/flow-session/task-list",
-      "file": "flow-session-task-list.json",
+      "name": "flow-dispatch-task-list",
+      "path": "/flow-dispatch/task-list",
+      "file": "flow-dispatch-task-list.json",
       "http_status": 200,
       "ok": true,
       "extra": {

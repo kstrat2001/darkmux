@@ -9,13 +9,11 @@ use axum::{
     routing::get,
     Router,
 };
-use darkmux_types::workdir::worktrees_base_dir;
 use futures::stream::{self, Stream};
 use std::collections::VecDeque;
-use std::io::{BufRead, IsTerminal};
+use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::path::{Path as StdPath, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -53,6 +51,7 @@ mod panel;
 /// (#1466) Best-effort peer-mission-graph fetch — see the module's own doc
 /// for the full attribution → roster → presence → fetch decision chain.
 mod peer_graph;
+mod routes;
 mod runs;
 mod run_lifecycle;
 pub use runs::{
@@ -60,6 +59,9 @@ pub use runs::{
     AbandonReason, DispatchSessionEvidence, Run, RunKind, RunStatus, RunsWithUsage,
 };
 pub mod source_state;
+/// The daemon's response bodies: one Rust type per JSON route, and the source
+/// of the TypeScript the viewer imports (see the module doc).
+pub mod wire;
 /// (#2928) The live channel's receive + SSE fan-out — see the module doc.
 mod live_hub;
 /// (#2902 step 2b) The one token sum, shared by `run list` and `/runs` —
@@ -89,7 +91,6 @@ const MAX_FLOW_LINE_BYTES: usize = 1 << 20; // 1 MiB
 #[derive(Clone)]
 pub(crate) struct AppState {
     flows_dir: PathBuf,
-    worktrees_base: PathBuf,
     /// (#925) Count of currently-open SSE streams; `flow_stream_handler`
     /// gates new streams on `MAX_CONCURRENT_SSE` and an `SseSlot` guard
     /// decrements this on disconnect.
@@ -152,8 +153,7 @@ fn is_valid_date(date: &str) -> Option<&str> {
 /// from `ui/` by `bun run build` and committed here so the release binary
 /// stays self-contained and node-free.
 /// **Serves `GET /` and `GET /play/:date`** as of the flip (#1800) — this IS
-/// the viewer. `/next` remains as a permanent redirect to `/` so the
-/// bookmarks minted during the port keep working (see `next_html`). The gate
+/// the viewer. (The `/next` route it grew up on is gone: it answers 404.) The gate
 /// for the flip was a number, not a judgement: 21 of 22 recorded legacy
 /// goldens asserting real byte parity, with the 22nd (`mission-replay`)
 /// blocked on a missing corpus fixture rather than on the port. The legacy
@@ -246,28 +246,6 @@ async fn root_html(headers: axum::http::HeaderMap) -> impl IntoResponse {
     html_response(&headers, inject_mode_meta(NEXT_HTML, "live", None))
 }
 
-/// `GET /next` — a permanent REDIRECT to `/` since the flip (#1800).
-///
-/// It served the in-progress React port from Packet 1 (#1717) until that port
-/// became `/` itself. Kept rather than removed, and kept deliberately: the
-/// operator's phone dashboard reaches the daemon through
-/// `tailscale serve --bg --http=80 8765`, and every bookmark, home-screen
-/// shortcut and shared link minted during the port's development points here.
-/// Deleting the route would 404 all of them for a page that not only still
-/// exists but is now the default.
-///
-/// **308, not 302** — permanent, so a browser can cache it, and
-/// method-preserving (302 is defined to allow a method rewrite; this route is
-/// GET-only today, but a redirect that quietly changes semantics is the kind
-/// of thing nobody re-reads later). The FRAGMENT survives on its own: a
-/// redirect target carrying no fragment inherits the original request's, per
-/// RFC 7231 §7.1.2, so `/next#lens=runs&kind=lab` lands on `/#lens=runs&kind=lab`
-/// without this route needing to see a hash it is never sent in the first
-/// place.
-async fn next_html() -> impl IntoResponse {
-    axum::response::Redirect::permanent("/")
-}
-
 /// Strong validator for an HTML document, so a browser can revalidate
 /// cheaply instead of choosing between the two bad options it has when a
 /// response carries NO cache metadata at all: re-download the whole ~256 KB
@@ -352,21 +330,10 @@ async fn play_html(Path(date): Path<String>, headers: axum::http::HeaderMap) -> 
 /// (`lab_dir: None`); tests that need `/lab/*` go through `build_router_full`.
 #[cfg(test)]
 pub(crate) fn build_router(flows_dir: PathBuf) -> Router {
-    build_router_with_worktrees_base(flows_dir, worktrees_base_dir())
+    build_router_full(flows_dir, None, None)
 }
 
-/// Like `build_router` but accepts a custom worktrees base directory.
-/// Delegates to `build_router_full` with `lab_dir: None`. Test-only, same
-/// reason as `build_router` above.
-#[cfg(test)]
-pub(crate) fn build_router_with_worktrees_base(
-    flows_dir: PathBuf,
-    worktrees_base: PathBuf,
-) -> Router {
-    build_router_full(flows_dir, worktrees_base, None, None)
-}
-
-/// Full router builder — flows dir + worktrees base + the lab observer's
+/// Full router builder — flows dir + the lab observer's
 /// scan root + the live-channel ingest this daemon bound. This is the SINGLE
 /// place routes are registered (#881 collapsed the prior duplicate builder;
 /// #1247 Part 3 added the `/lab/*` group here rather than a parallel
@@ -382,26 +349,19 @@ pub(crate) fn build_router_with_worktrees_base(
 /// always exempt (doctor's reachability probe). Layered INNER of CORS so preflight is
 /// handled by the CORS layer first.
 ///
-/// Prior to #1387 there was a SECOND, always-on gate wrapping only
-/// `/diff/:session_id` (the live-diff endpoint, which shipped worktree source
-/// text over HTTP and required the token even on loopback). That route and
-/// its dedicated gate are retired — `/worktree-summary/:session_id` is its
-/// numbers-only replacement and rides this same general remote-only gate like
-/// every other read route; there is no route-specific gate left in this
-/// router.
+/// There is no route-specific gate: every read route rides this one
+/// remote-only gate.
 ///
 /// **`/lab/*` auth (#1247 Part 3):** the lab routes ride the same remote-only
 /// gate — read-only local-run artifacts are no more sensitive than flow
 /// records, and the lab lens is machine-local by design (never federated).
 pub(crate) fn build_router_full(
     flows_dir: PathBuf,
-    worktrees_base: PathBuf,
     lab_dir: Option<PathBuf>,
     live_ingest: Option<Arc<live_hub::IngestState>>,
 ) -> Router {
     let state = AppState {
         flows_dir,
-        worktrees_base,
         sse_open: Arc::new(AtomicUsize::new(0)),
         lab_dir,
         panels: panel::PanelState::default(),
@@ -409,51 +369,9 @@ pub(crate) fn build_router_full(
     };
     let read_auth = darkmux_types::config_access::serve_read_auth();
 
-    // (#925) Keep the long-lived SSE stream route SEPARATE so the per-route
-    // request timeout below never applies to it (it's meant to stay open).
-    let streaming = Router::new().route("/flow/:date/stream", get(flow_stream_handler));
-
-    // Every other (non-streaming) route gets a request timeout, bounding a
-    // slow/hung request.
-    let timed = Router::new()
-        .route("/", get(root_html))
-        .route("/next", get(next_html))
-        .route("/play/:date", get(play_html))
-        .route("/health", get(health))
-        .route("/flow/:date", get(flow_handler))
-        .route("/flow-days", get(flow_days_handler))
-        .route("/flow-missions", get(flow_missions_handler))
-        .route("/flow-mission/:id", get(flow_mission_handler))
-        .route("/flow-session/:id", get(flow_session_handler))
-        .route("/flow-status", get(flow_status_handler))
-        .route("/machine/status", get(machine_status_handler))
-        .route("/machine/specs", get(machine_specs_handler))
-        .route("/machine/resources", get(machine_resources_handler))
-        .route("/missions", get(missions_handler))
-        .route("/runs", get(runs_handler))
-        .route("/panel/:id", get(panel::panel_handler))
-        .route("/phases", get(phases_handler))
-        .route("/mission/:id/graph", get(mission_graph_html))
-        .route("/mission/:id/graph.json", get(mission_graph_json_handler))
-        .route("/manifest.webmanifest", get(web_manifest_handler))
-        .route("/apple-touch-icon.png", get(apple_touch_icon_handler))
-        .route("/icon-192.png", get(icon_192_handler))
-        .route("/favicon-32.png", get(favicon_32_handler))
-        .route("/favicon-16.png", get(favicon_16_handler))
-        .route("/icon-512.png", get(icon_512_handler))
-        .route("/icon-512-maskable.png", get(icon_512_maskable_handler))
-        .route("/fleet/sessions/live", get(fleet_sessions_live_handler))
-        .route("/fleet/machines/live", get(fleet_machines_live_handler))
-        .route("/fleet/roster", get(fleet_roster_handler))
-        .route("/lab/runs", get(lab_runs_handler))
-        .route("/lab/run/detail", get(lab_run_detail_handler))
-        .route("/lab/run/events", get(lab_run_events_handler))
-        .route("/worktree-summary/:session_id", get(worktree_summary_handler))
-        .layer(tower_http::timeout::TimeoutLayer::new(Duration::from_secs(
-            REQUEST_TIMEOUT_SECS,
-        )));
-
-    let mut router = timed.merge(streaming);
+    // The router is built from the route table (`routes::table`), so what the
+    // daemon serves and what the golden pins cannot differ.
+    let mut router = routes::router();
 
     // Remote-only gate, added BEFORE the CORS layer so CORS ends up outermost
     // (handles preflight + sets headers first); the gate runs just inside it.
@@ -521,23 +439,13 @@ pub(crate) fn build_router_local(flows_dir: PathBuf) -> Router {
     build_router(flows_dir).layer(from_fn(assume_loopback_peer))
 }
 
-/// (#1663) [`build_router_with_worktrees_base`] plus the stated-loopback layer.
-#[cfg(test)]
-pub(crate) fn build_router_with_worktrees_base_local(
-    flows_dir: PathBuf,
-    worktrees_base: PathBuf,
-) -> Router {
-    build_router_with_worktrees_base(flows_dir, worktrees_base).layer(from_fn(assume_loopback_peer))
-}
-
 /// (#1663) [`build_router_full`] plus the stated-loopback layer.
 #[cfg(test)]
 pub(crate) fn build_router_full_local(
     flows_dir: PathBuf,
-    worktrees_base: PathBuf,
     lab_dir: Option<PathBuf>,
 ) -> Router {
-    build_router_full(flows_dir, worktrees_base, lab_dir, None).layer(from_fn(assume_loopback_peer))
+    build_router_full(flows_dir, lab_dir, None).layer(from_fn(assume_loopback_peer))
 }
 
 /// (#881) Build a `401 Unauthorized` with a `WWW-Authenticate: Bearer` hint.
@@ -619,7 +527,7 @@ async fn auth_mw(req: Request, next: Next) -> Response {
     // `run()`, guarded only by a comment asking the next person not to change
     // it. Downgrade that to `into_make_service()` in any refactor and every
     // peer looks loopback — a tailnet-exposed daemon then serves flow
-    // records, machine specs, mission state, and worktree summaries
+    // records, machine specs and mission state
     // unauthenticated, with every test still green and nothing visible to the
     // operator (the viewer keeps working; this machine is exempt either way).
     //
@@ -845,8 +753,8 @@ const TOKEN_REMEDY: &str = "store it: `security add-generic-password -U -a \"$US
 ///   to pass.
 /// - A non-loopback bind (a LAN/tailnet IP, `0.0.0.0`, or anything that
 ///   does not parse as an IP, so a typo can't sneak past) without read
-///   auth on and a token: it would expose flow records, machine specs,
-///   mission state and worktree summaries to any reachable peer
+///   auth on and a token: it would expose flow records, machine specs
+///   and mission state to any reachable peer
 ///   unauthenticated. A fleet token alone does not close reads, so it is
 ///   not enough.
 fn serve_auth_preflight(bind: &str, auth: ServeAuth) -> Result<(), String> {
@@ -863,7 +771,7 @@ every read not from this machine would be refused with no way to pass.\n  Fix: {
     }
     Err(format!(
         "refusing to bind the serve daemon to a non-loopback address ({bind}) with reads open — the daemon \
-would expose flow records, machine specs, mission state, and worktree what-changed summaries of in-flight \
+would expose flow records, machine specs and mission state of in-flight \
 dispatches to any reachable peer, unauthenticated.\n  Fix: `darkmux config set serve.read_auth true` with a \
 serve token ({TOKEN_REMEDY}), or bind to 127.0.0.1 (the default) and reach it through `tailscale serve`."
     ))
@@ -885,7 +793,7 @@ serve token ({TOKEN_REMEDY}), or bind to 127.0.0.1 (the default) and reach it th
 /// (a hub whose Redis just died — every machine still alive and working).
 /// The response is now an object whose `meta.sources.fleet` says which,
 /// per [`source_state`]; `machines` holds the beats as before.
-async fn fleet_machines_live_handler() -> impl IntoResponse {
+async fn fleet_machines_live_handler() -> axum::Json<wire::FleetMachinesLiveResponse> {
     // env(DARKMUX_REDIS_URL) > config-assembled (#661 Slice 5).
     let redis_url = darkmux_flow::redis_url();
     let (beats, state) = match redis_url {
@@ -897,10 +805,7 @@ async fn fleet_machines_live_handler() -> impl IntoResponse {
             }),
         None => (Vec::new(), source_state::SourceState::Off),
     };
-    axum::Json(serde_json::json!({
-        "machines": beats,
-        "meta": source_state::coverage_meta(&state),
-    }))
+    axum::Json(wire::FleetMachinesLiveResponse { machines: beats, meta: source_state::coverage_meta(&state) })
 }
 
 /// The literal every presence failure reports on the wire. Never the
@@ -1017,7 +922,7 @@ fn backfill_roster_machine_uids(
     }
 }
 
-async fn fleet_roster_handler() -> impl IntoResponse {
+async fn fleet_roster_handler() -> axum::Json<wire::FleetRosterResponse> {
     let result = tokio::task::spawn_blocking(darkmux_fleet::load_roster).await;
     let (machines, error) = match result {
         Ok(Ok(roster)) => {
@@ -1039,10 +944,10 @@ async fn fleet_roster_handler() -> impl IntoResponse {
             (Vec::new(), Some("internal error reading the fleet roster".to_string()))
         }
     };
-    axum::Json(serde_json::json!({
-        "machines": machines,
-        "error": error,
-    }))
+    axum::Json(wire::FleetRosterResponse {
+        machines: machines.iter().map(wire::RosterMachineEntry::from).collect(),
+        error,
+    })
 }
 
 /// Read one presence key-space, classifying the outcome instead of
@@ -1078,7 +983,7 @@ where
     }
 }
 
-/// GET /fleet/sessions/live — the sessions with a live heartbeat right now
+/// GET /fleet/dispatches/live — the dispatches with a live heartbeat right now
 /// (#638). Each running dispatch refreshes a short-TTL
 /// `darkmux:session-presence:<sid>` Redis key; this returns every unexpired
 /// one (fleet-wide, across machines on the shared Redis). The live viewer
@@ -1094,7 +999,7 @@ where
 /// response is now an object carrying `sessions` plus a
 /// `meta.sources.fleet` state, so "no live sessions" and "could not look"
 /// are distinguishable by the client.
-async fn fleet_sessions_live_handler() -> impl IntoResponse {
+async fn fleet_dispatches_live_handler() -> axum::Json<wire::FleetDispatchesLiveResponse> {
     // env(DARKMUX_REDIS_URL) > config-assembled (#661 Slice 5).
     let redis_url = darkmux_flow::redis_url();
     let (beats, state) = match redis_url {
@@ -1103,15 +1008,12 @@ async fn fleet_sessions_live_handler() -> impl IntoResponse {
         })
         .await
         .unwrap_or_else(|e| {
-            eprintln!("darkmux serve: GET /fleet/sessions/live task failed ({e})");
+            eprintln!("darkmux serve: GET /fleet/dispatches/live task failed ({e})");
             (Vec::new(), source_state::SourceState::Unavailable { detail: PRESENCE_READ_FAILED })
         }),
         None => (Vec::new(), source_state::SourceState::Off),
     };
-    axum::Json(serde_json::json!({
-        "sessions": beats,
-        "meta": source_state::coverage_meta(&state),
-    }))
+    axum::Json(wire::FleetDispatchesLiveResponse { dispatches: beats, meta: source_state::coverage_meta(&state) })
 }
 
 /// CORS layer for the daemon's browser-facing endpoints. **Default**:
@@ -1564,7 +1466,6 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
         // Built only now, so `/health` carries the ingest this daemon bound.
         let app = build_router_full(
             flows_dir.clone(),
-            worktrees_base_dir(),
             lab_dir.clone(),
             live_ingest.clone(),
         );
@@ -1729,45 +1630,45 @@ async fn health(
     State(state): State<AppState>,
     peer: Option<ConnectInfo<SocketAddr>>,
     headers: axum::http::HeaderMap,
-) -> axum::Json<serde_json::Value> {
+) -> axum::Json<wire::HealthResponse> {
     // (#2916 re-review C9) A peer sees only the listener's coarse state.
     // (#2916 stage 2 review C5) "This machine" is `is_local_request`: a
     // loopback request that did not come through a reverse proxy and names
     // this daemon in its Host.
     let loopback_caller = is_local_request(peer.map(|c| c.0), &headers);
-    axum::Json(serde_json::json!({
-        "darkmux_version": env!("CARGO_PKG_VERSION"),
-        "build": darkmux_types::build_version(),
-        "binary_mtime": STARTUP_EXE_MTIME.get().copied().flatten(),
-        "flow_schema_version": darkmux_flow::FLOW_SCHEMA_VERSION,
+    axum::Json(wire::HealthResponse {
+        darkmux_version: env!("CARGO_PKG_VERSION").to_string(),
+        build: darkmux_types::build_version(),
+        binary_mtime: STARTUP_EXE_MTIME.get().copied().flatten(),
+        flow_schema_version: darkmux_flow::FLOW_SCHEMA_VERSION.to_string(),
         // (#2916 review C8) What the fleet listener is doing (`null` when it
         // is off), so `darkmux doctor` reads the DAEMON's view rather than
         // re-deriving it from a shell whose PATH may differ.
-        "fleet_listener": fleet_listener::listener_state(loopback_caller),
+        fleet_listener: fleet_listener::listener_state(loopback_caller),
         // (#2916 stage 2 review C5) The busy policy and hosted-job bound the
         // running listener uses, for this machine only.
-        "fleet_busy": fleet_listener::listener_busy(loopback_caller),
+        fleet_busy: fleet_listener::listener_busy(loopback_caller),
         // (#2916 re-review C3) The open-file soft limit this daemon runs
         // with (raised at start), for this machine only.
-        "open_file_limit": if loopback_caller { current_open_file_limit() } else { None },
+        open_file_limit: if loopback_caller { current_open_file_limit() } else { None },
         // The lifecycle policy every run is judged by (`/runs`' own rows,
         // and the viewer's surfaces): cheap to read, so a page learns two
         // numbers without building the run union.
-        "lifecycle_policy": runs::runs_policy(),
+        lifecycle_policy: runs::runs_policy(),
         // (#2928) The live channel as this daemon runs it: the cadence knob
         // and the ingest's own counters, so its cost and its traffic are
         // readable without a debugger. Never a sample itself.
-        "live": {
-            "sample_ms": darkmux_types::config_access::live_sample_ms(),
+        live: wire::HealthLive {
+            sample_ms: darkmux_types::config_access::live_sample_ms(),
             // (#2928 review, C3) Which socket this daemon bound, by
             // fingerprint and port; `null` when none.
-            "ingest": state.live_ingest.as_ref().map(|s| s.health_json()),
-            "received": live_hub::stats().received.load(Ordering::Relaxed),
-            "rejected": live_hub::stats().rejected.load(Ordering::Relaxed),
-            "handle_us": live_hub::stats().handle_ns.load(Ordering::Relaxed) / 1_000,
-            "viewers": live_hub::hub().receiver_count(),
+            ingest: state.live_ingest.as_ref().map(|s| s.health()),
+            received: live_hub::stats().received.load(Ordering::Relaxed),
+            rejected: live_hub::stats().rejected.load(Ordering::Relaxed),
+            handle_us: live_hub::stats().handle_ns.load(Ordering::Relaxed) / 1_000,
+            viewers: live_hub::hub().receiver_count(),
         },
-    }))
+    })
 }
 
 /// The current soft open-file limit.
@@ -1806,335 +1707,28 @@ pub fn raise_open_file_limit(target: u64) -> Option<(u64, u64)> {
     }
 }
 
-/// Validate a base ref string: must match `^[A-Za-z0-9][A-Za-z0-9_/.-]*$`.
-/// No leading dash (prevents git argument injection). Plain char iteration,
-/// no regex crate.
-pub fn validate_base_ref(base: &str) -> bool {
-    if base.is_empty() {
+/// Validate that `path` is contained within `base_dir`.
+/// Both paths are canonicalized first (so a symlink out of the base is caught);
+/// missing paths return false.
+pub fn path_is_within(path: &StdPath, base_dir: &StdPath) -> bool {
+    let (Ok(canon_base), Ok(canon_path)) = (std::fs::canonicalize(base_dir), std::fs::canonicalize(path)) else {
         return false;
-    }
-    let mut chars = base.chars();
-    // First char: must be alphanumeric (no leading dash).
-    if !chars.clone().next().unwrap_or_default().is_ascii_alphanumeric() {
-        return false;
-    }
-    // Rest: alphanumeric, underscore, slash, dot, hyphen.
-    chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '/' | '.' | '-'))
-}
-
-/// Validate that `worktree_path` is contained within `base_dir`.
-/// Both paths are canonicalized first; missing paths return false.
-pub fn worktree_contained(
-    worktree_path: &StdPath,
-    base_dir: &StdPath,
-) -> bool {
-    let canon_base = match std::fs::canonicalize(base_dir) {
-        Ok(p) => p,
-        Err(_) => return false, // base doesn't exist
     };
-    let canon_wt = match std::fs::canonicalize(worktree_path) {
-        Ok(p) => p,
-        Err(_) => return false, // worktree doesn't exist
-    };
-    canon_wt.starts_with(&canon_base)
+    canon_path.starts_with(&canon_base)
 }
 
-/// Resolve a session_id from flow records: find the LAST `"step result"`
-/// record with `payload.kind == "mission.worktree"` matching that session
-/// across the two lexicographically last `.jsonl` day files, and extract
-/// payload.worktree/base/branch. (#1230 Packet 4: migrated off the retired
-/// `mission.run.start` action — the worktree step now emits this generic
-/// `"step result"` companion record instead; see `coder_phase.rs`'s
-/// `emit_step_result` doc.)
-pub fn resolve_session(
-    session_id: &str,
-    flows_dir: &StdPath,
-) -> Option<(String, String, String)> {
-    // Read all .jsonl day files from flows_dir.
-    let entries: Vec<PathBuf> = std::fs::read_dir(flows_dir)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| {
-            p.extension()
-                .and_then(|e| e.to_str())
-                .map(|ext| ext == "jsonl")
-                .unwrap_or(false)
-        })
-        .collect();
-
-    // Take the two lexicographically last day files (covers midnight rollover).
-    let mut last_two: Vec<PathBuf> = entries
-        .iter()
-        .filter_map(|p| {
-            p.file_stem()
-                .and_then(|s| s.to_str())
-                .filter(|name| is_valid_date(name).is_some())
-                .map(|_| p.clone())
-        })
-        .collect();
-    last_two.sort_by(|a, b| {
-        let a_name = a.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        let b_name = b.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        a_name.cmp(b_name)
-    });
-
-    let candidates: Vec<&StdPath> = last_two.iter().rev().take(2).map(|p| p.as_path()).collect();
-
-    // Scan all lines from those files, find the LAST matching record.
-    let mut best: Option<(String, String, String)> = None;
-
-    for day_file in &candidates {
-        let Ok(file) = std::fs::File::open(day_file) else {
-            continue;
-        };
-        let reader = std::io::BufReader::new(file);
-        for line in reader.lines() {
-            let Ok(line) = line else { continue };
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let Some(record) = darkmux_flow::reader::parse_value(line) else {
-                continue;
-            };
-            if darkmux_flow::reader::action_of(&record) != Some(darkmux_flow::FlowAction::StepResult) {
-                continue;
-            }
-            let payload = record.get("payload");
-            let kind = payload.and_then(|p| p.get("kind")).and_then(|k| k.as_str());
-            if kind != Some("mission.worktree") {
-                continue;
-            }
-            let sid = record
-                .get("session_id")
-                .and_then(|s| s.as_str())
-                .unwrap_or("");
-            if sid != session_id {
-                continue;
-            }
-            if let Some(p) = payload {
-                let wt = p.get("worktree").and_then(|w| w.as_str()).unwrap_or("");
-                let base = p.get("base").and_then(|b| b.as_str()).unwrap_or("");
-                let branch = p.get("branch").and_then(|b| b.as_str()).unwrap_or("");
-                if !wt.is_empty() && !base.is_empty() {
-                    best = Some((wt.to_string(), base.to_string(), branch.to_string()));
-                }
-            }
-        }
-    }
-
-    best
-}
-
-/// Compute a what-changed SUMMARY for a worktree against its base ref: file
-/// count + total additions/deletions, from `git diff --numstat` alone. This
-/// is the numbers-only replacement (#1387) for the retired `compute_git_diff`
-/// (#756) — it never reads or returns diff TEXT, so worktree source content
-/// never leaves the process, let alone the server.
-pub fn compute_diff_summary(worktree: &StdPath, base: &str) -> Result<(u64, u64, u64), String> {
-    let numstat_out = Command::new("git")
-        .current_dir(worktree)
-        .args(["diff", "--numstat", base])
-        .output()
-        .map_err(|_| "git error".to_string())?;
-    let numstat_text = String::from_utf8_lossy(&numstat_out.stdout);
-
-    let mut files = 0u64;
-    let mut adds = 0u64;
-    let mut dels = 0u64;
-    for line in numstat_text.lines() {
-        let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() < 3 {
-            continue;
-        }
-        files += 1;
-        if let Some(n) = parse_numstat_count(parts[0]) {
-            adds += n;
-        }
-        if let Some(n) = parse_numstat_count(parts[1]) {
-            dels += n;
-        }
-    }
-    Ok((files, adds, dels))
-}
-
-/// Parse a numstat count field: "-" means binary (null), otherwise parse as u64.
-fn parse_numstat_count(s: &str) -> Option<u64> {
-    if s == "-" {
-        None
-    } else {
-        s.parse::<u64>().ok()
-    }
-}
-
-/// Worktree what-changed summary response (#1387). Numbers + the worktree
-/// path only — never diff content. `path` is what the viewer renders as the
-/// copy/`zed://file/` handoff to the operator's own editor.
-#[derive(serde::Serialize)]
-pub struct WorktreeSummaryResponse {
-    pub available: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub base: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub branch: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub files: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub adds: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub dels: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-}
-
-/// GET /worktree-summary/:session_id — file count + aggregate adds/dels for
-/// a mission-run worktree, plus the worktree path (#1387). Replaces the
-/// retired `/diff/:session_id` (#756): that route shipped the worktree's
-/// unified diff TEXT over HTTP behind its own always-on auth gate; this one
-/// returns numbers + the path only, and rides the general remote-read gate
-/// like every other route (see `build_router_full`'s auth-wiring doc).
-pub(crate) async fn worktree_summary_handler(
-    State(state): State<AppState>,
-    Path(session_id): Path<String>,
-) -> impl IntoResponse {
-    // 1. Resolve session from flow records.
-    let flows_dir = state.flows_dir.clone();
-    let worktrees_base = state.worktrees_base.clone();
-    // Offload the blocking session resolution (fs read_dir + line scans) to
-    // the blocking pool so it never occupies an async worker thread.
-    let resolved = tokio::task::spawn_blocking({
-        let session_id = session_id.clone();
-        let flows_dir = flows_dir.clone();
-        move || resolve_session(&session_id, &flows_dir)
-    })
-    .await
-    .ok()
-    .flatten();
-    let (worktree, base, branch) = match resolved {
-        Some((wt, b, br)) => (wt, b, br),
-        None => {
-            return axum::Json(WorktreeSummaryResponse {
-                available: false,
-                session_id: None,
-                base: None,
-                branch: None,
-                files: None,
-                adds: None,
-                dels: None,
-                path: None,
-                reason: Some("no mission-run record for session".to_string()),
-            })
-            .into_response();
-        }
-    };
-
-    // 2. Security: containment check.
-    if !worktree_contained(StdPath::new(&worktree), &worktrees_base) {
-        return axum::Json(WorktreeSummaryResponse {
-            available: false,
-            session_id: None,
-            base: None,
-            branch: None,
-            files: None,
-            adds: None,
-            dels: None,
-            path: None,
-            reason: Some("worktree outside managed base".to_string()),
-        })
-        .into_response();
-    }
-
-    // 3. Security: base ref validation.
-    if !validate_base_ref(&base) {
-        return axum::Json(WorktreeSummaryResponse {
-            available: false,
-            session_id: None,
-            base: None,
-            branch: None,
-            files: None,
-            adds: None,
-            dels: None,
-            path: None,
-            reason: Some("invalid base ref".to_string()),
-        })
-        .into_response();
-    }
-
-    // 4. Compute the summary — one git subprocess, offloaded to the blocking
-    // pool so a slow/hung git can't starve the async runtime.
-    let summary_result = tokio::task::spawn_blocking({
-        let worktree = worktree.clone();
-        let base = base.clone();
-        move || compute_diff_summary(StdPath::new(&worktree), &base)
-    })
-    .await
-    .unwrap_or_else(|_| Err("worktree summary task panicked".to_string()));
-    let (files, adds, dels) = match summary_result {
-        Ok(r) => r,
-        Err(reason) => {
-            return axum::Json(WorktreeSummaryResponse {
-                available: false,
-                session_id: None,
-                base: None,
-                branch: None,
-                files: None,
-                adds: None,
-                dels: None,
-                path: None,
-                reason: Some(reason),
-            })
-            .into_response();
-        }
-    };
-
-    axum::Json(WorktreeSummaryResponse {
-        available: true,
-        session_id: Some(session_id),
-        base: Some(base),
-        branch: Some(branch),
-        files: Some(files),
-        adds: Some(adds),
-        dels: Some(dels),
-        path: Some(worktree),
-        reason: None,
-    })
-    .into_response()
-}
-
-/// GET /machine/status — returns currently-loaded models (per `lms ps
-/// --json`) as JSON. (#1426 — renamed from `/model/status` alongside the
-/// `machine` CLI family; one route family, one name. Its consumer is the
-/// `darkmux machine status <id>` peer read — the viewer does not fetch this
-/// route; an earlier doc comment claiming a viewer toolbar-pill consumer,
-/// from #87, was stale.)
-///
-/// Always returns 200 with a structured body. `lms_unreachable: true`
-/// signals the binary couldn't be invoked (operator hasn't installed
-/// LMStudio's CLI, or it's not on PATH) — UI surfaces this as a
-/// degraded-state pill rather than treating it as a hard error.
-///
-/// `lms::list_loaded()` is sync (subprocess invocation), so it runs on
-/// the blocking pool to keep the axum executor free.
 /// GET /missions — list of all missions from the JSON source-of-truth
 /// (`~/.darkmux/crew/missions/`). Includes status + transition timestamps
 /// (started_ts/finalized_ts) so the viewer can render wall-clock
 /// durations and the phase-progress widget. Empty array on no missions
 /// or unreachable crew root; never errors.
-async fn missions_handler() -> axum::Json<serde_json::Value> {
+async fn missions_handler() -> axum::Json<wire::MissionsResponse> {
     let result = tokio::task::spawn_blocking(darkmux_crew::loader::load_missions).await;
     let missions = match result {
         Ok(Ok(m)) => m,
         _ => Vec::new(),
     };
-    axum::Json(serde_json::json!({
-        "missions": missions,
-        "generated_at_ms": current_millis(),
-    }))
+    axum::Json(wire::MissionsResponse { missions, generated_at_ms: current_millis() })
 }
 
 /// GET /runs — the flat, kind-tagged, normalized run view-model (#1508 step
@@ -2151,7 +1745,7 @@ async fn missions_handler() -> axum::Json<serde_json::Value> {
 /// degrades each source independently to zero contribution on failure
 /// (mirrors `missions_handler`'s `_ => Vec::new()`); the `unwrap_or_default`
 /// below covers only the outer `spawn_blocking` join itself panicking.
-async fn runs_handler(State(state): State<AppState>) -> axum::Json<serde_json::Value> {
+async fn runs_handler(State(state): State<AppState>) -> axum::Json<wire::RunsResponse> {
     let flows_dir = state.flows_dir.clone();
     let lab_dir = state.lab_dir.clone();
     // (#1705) One blocking task: read the fleet stream, then build every
@@ -2169,12 +1763,12 @@ async fn runs_handler(State(state): State<AppState>) -> axum::Json<serde_json::V
         eprintln!("darkmux serve: GET /runs aggregation task failed ({e}); serving no rows");
         (Vec::new(), source_state::SourceState::Unavailable { detail: "the run aggregation failed" })
     });
-    axum::Json(serde_json::json!({
-        "runs": runs,
-        "generated_at_ms": current_millis(),
-        "meta": source_state::coverage_meta(&fleet_state),
-        "policy": runs::runs_policy(),
-    }))
+    axum::Json(wire::RunsResponse {
+        runs,
+        generated_at_ms: current_millis(),
+        meta: source_state::coverage_meta(&fleet_state),
+        policy: runs::runs_policy(),
+    })
 }
 
 /// GET /phases — list of all phases from the JSON source-of-truth
@@ -2182,69 +1776,16 @@ async fn runs_handler(State(state): State<AppState>) -> axum::Json<serde_json::V
 /// (started_ts/completed_ts/abandoned_ts) so the viewer's wall-clock
 /// graphic can render Running phases' live elapsed time + Complete
 /// phases' frozen durations. Empty array on no phases; never errors.
-async fn phases_handler() -> axum::Json<serde_json::Value> {
+async fn phases_handler() -> axum::Json<wire::PhasesResponse> {
     let result = tokio::task::spawn_blocking(darkmux_crew::loader::load_phases).await;
     let phases = match result {
         Ok(Ok(s)) => s,
         _ => Vec::new(),
     };
-    axum::Json(serde_json::json!({
-        "phases": phases,
-        "generated_at_ms": current_millis(),
-    }))
+    axum::Json(wire::PhasesResponse { phases, generated_at_ms: current_millis() })
 }
 
 // ─── Mission graph lens (#1284 Packet 5; folded into the React port #1868) ──
-
-/// `GET /mission/:id/graph` — the standalone mission-graph HTML page this
-/// route used to serve is retired (#1868 third packet); the graph lens now
-/// lives IN the React port as `MissionGraphLens` (`ui/src/lenses/mission/`),
-/// reached at the hash route `#mission=<id>`. A **308 permanent redirect**
-/// (method-preserving, cacheable — same reasoning as `next_html`'s redirect
-/// to `/`) keeps every bookmark and shared link minted against this path
-/// working: the browser lands on `/` with the mission already selected,
-/// not just on the bare app shell.
-///
-/// Validates `id` with [`is_valid_catalog_id`] before building the redirect
-/// target — the same allowlist `graph.json` gates on. Two separate classes
-/// of character are excluded, and the second is the one worth naming
-/// explicitly (#1868 review finding): `#`, `/` and whitespace would
-/// reinterpret or truncate the fragment at the URL level, while **`&` and
-/// `=` are the port's OWN hash-param separators**. `&` is a perfectly legal
-/// fragment character per RFC 3986, so a future widening of this allowlist
-/// that reasons only about URL syntax would admit it — and
-/// `/mission/a&lens=console/graph` would then redirect to
-/// `/#mission=a&lens=console`, which `parseRoute` resolves to the CONSOLE
-/// lens (`lens=` outranks a co-present `mission=`; see `route.test.ts`).
-/// The bookmark would land somewhere else entirely, silently. Widen this
-/// charset only against the port's hash grammar, not just against RFC 3986
-/// (no percent-encoding dependency needed today: the allowed charset is
-/// already both fragment-safe and separator-free). A structurally
-/// invalid id was always a `400` from `graph.json`'s own gate; this route
-/// now surfaces that same `400` immediately rather than redirecting into a
-/// port render that would only rediscover it on fetch. A VALID id that
-/// doesn't name a real mission still redirects — the port's own lens
-/// reports that "not found" inline (graceful-degradation posture
-/// unchanged, item 6), exactly as the retired standalone page did.
-///
-/// (#1868 QA finding) The `is_valid_catalog_id` gate is load-bearing for
-/// more than fragment safety: `axum::response::Redirect::permanent`
-/// PANICS if its argument isn't a valid HTTP header value. Today's
-/// allowlist (visible ASCII only) can never trip that, but if a future
-/// change widens the catalog-id charset (e.g. to accommodate a new id
-/// scheme), this handler's failure mode flips silently from a clean `400`
-/// to a request-handler panic unless the widened charset is re-checked
-/// against `HeaderValue`'s own constraints first.
-async fn mission_graph_html(Path(id): Path<String>) -> axum::response::Response {
-    if !is_valid_catalog_id(&id) {
-        return (
-            StatusCode::BAD_REQUEST,
-            "invalid mission id (alphanumeric + -_.: , <=128 chars)",
-        )
-            .into_response();
-    }
-    axum::response::Redirect::permanent(&format!("/#mission={id}")).into_response()
-}
 
 /// The outcome of the blocking task `mission_graph_json_handler` spawns:
 /// a graph built from THIS machine's own disk, one fetched live from the
@@ -2454,12 +1995,12 @@ const MAX_LAB_EVENTS_READ_BYTES: usize = 2 << 20; // 2 MiB
 ///
 /// The string-shape checks (absolute path, `..` component) are defense in
 /// depth and give a cheap, explicit rejection; the REAL boundary is
-/// `worktree_contained`'s canonicalize + prefix check below, which is what
+/// `path_is_within`'s canonicalize + prefix check below, which is what
 /// catches a symlink inside `lab_dir` pointing outside it (a pure string
 /// check can't — canonicalize resolves the link to its real target before
 /// the prefix comparison). `lab_dir.join("")` is `lab_dir` unchanged, so an
 /// empty `dir` still passes through the SAME containment check as any other
-/// value (`worktree_contained` trivially holds for a path against itself) —
+/// value (`path_is_within` trivially holds for a path against itself) —
 /// no separate code path, no separate risk surface.
 fn resolve_lab_run_dir(lab_dir: &StdPath, dir: &str) -> Option<PathBuf> {
     if StdPath::new(dir).is_absolute() {
@@ -2472,7 +2013,7 @@ fn resolve_lab_run_dir(lab_dir: &StdPath, dir: &str) -> Option<PathBuf> {
         return None;
     }
     let candidate = lab_dir.join(dir);
-    worktree_contained(&candidate, lab_dir).then_some(candidate)
+    path_is_within(&candidate, lab_dir).then_some(candidate)
 }
 
 /// A lab dir whose pre-4.0 runs have not been moved: where they are, where
@@ -2512,30 +2053,43 @@ pub(crate) fn pending_move_for(lab_dir: &StdPath) -> Option<PendingMove> {
 /// to the wire shape or to `/lab/runs`'s own behavior; this is purely a
 /// crate-internal visibility widening so a sibling module can reuse the
 /// SAME scan `/lab/runs` already does, rather than re-deriving it.
-#[derive(Debug, serde::Serialize)]
-pub(crate) struct LabRunSummary {
+#[derive(Debug, Clone, serde::Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
+pub struct LabRunSummary {
     /// POSIX-style path relative to `lab_dir` — the identifier every other
     /// `/lab/*` endpoint's `dir` query param takes.
     pub(crate) dir: String,
     /// Newest mtime among the run's marker artifacts, epoch milliseconds.
+    #[cfg_attr(test, ts(type = "number"))]
     pub(crate) mtime_ms: u64,
     pub(crate) case_ids: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub(crate) crew: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub(crate) exec_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub(crate) profile: Option<String>,
     /// The resolved per-seat staffing (model/k/max_tokens/n_ctx) this run
     /// actually used — `None` only for a brand-new live run whose first case
     /// hasn't completed yet (no `funnels.json` snapshot exists).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", serialize_with = "serialize_staffing_view")]
+    #[cfg_attr(test, ts(as = "Option<wire::LabStaffing>", optional))]
     pub(crate) staffing: Option<darkmux_lab::lab::review::StaffingSnapshot>,
+    #[cfg_attr(test, ts(type = "number"))]
     pub(crate) bundles: usize,
+    #[cfg_attr(test, ts(type = "number"))]
     pub(crate) raw_flags: usize,
+    #[cfg_attr(test, ts(type = "number"))]
     pub(crate) deduped_flags: usize,
+    #[cfg_attr(test, ts(type = "number"))]
     pub(crate) confirmed: usize,
+    #[cfg_attr(test, ts(type = "number"))]
     pub(crate) needs_check: usize,
+    #[cfg_attr(test, ts(type = "number"))]
     pub(crate) archived: usize,
     pub(crate) degenerate: bool,
     /// `scores.json` exists — the run reached its terminal artifact write.
@@ -2545,20 +2099,24 @@ pub(crate) struct LabRunSummary {
     /// for runs recorded before this record existed — those keep the old
     /// artifact-and-staleness inference, so this is additive, not a migration.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub(crate) lifecycle_status: Option<darkmux_lab::lab::lifecycle::LifecycleStatus>,
     /// (#2860) `manifest.json`'s `ok`: how the run's DISPATCH ended. The
     /// lifecycle's `complete` only says the harness ran to the end (see
     /// `lab::run`'s own comment at `finish_complete`), so the two together
     /// are the outcome. `None` when there is no manifest yet, or no `ok`.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub(crate) run_ok: Option<bool>,
     /// `manifest.json`'s `workload`: what the run dispatched.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub(crate) workload: Option<String>,
     /// `manifest.json`'s `verify.passed`: what the workload's own tests said,
     /// which `run_ok` (the dispatch result) does not carry (#2494). `None`
     /// when nothing was checked or there is no manifest yet.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub(crate) verify_passed: Option<bool>,
     /// (#2812) The lifecycle record's own `started_at_ms` — the run's real
     /// START, written before the provider is ever called. `LabRunSummary`
@@ -2569,6 +2127,7 @@ pub(crate) struct LabRunSummary {
     /// mtime was missing. `None` for a run recorded before the lifecycle
     /// record existed, same additive posture as `lifecycle_status`.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(type = "number", optional))]
     pub(crate) lifecycle_started_at_ms: Option<u64>,
     /// (#2462 review) The lifecycle record's own `error` string, carried
     /// alongside the status because the status ALONE cannot say which of
@@ -2581,8 +2140,9 @@ pub(crate) struct LabRunSummary {
     /// deliberate human teardown for every `Drop`-written record ever
     /// archived.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub(crate) lifecycle_error: Option<String>,
-    pub(crate) has_funnels: bool,
+    pub(crate) has_reviews: bool,
     pub(crate) has_events: bool,
     /// (#1982, extended #2511) The session_id the run's OWN inner dispatch
     /// used — read from `manifest.json` when it exists (a completed run),
@@ -2614,7 +2174,18 @@ pub(crate) struct LabRunSummary {
     ///   no manifest and never minted a session yet, or a manifest caught
     ///   mid-write.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub(crate) session_id: Option<String>,
+}
+
+/// The wire form of a run's staffing: the seats it used (see
+/// [`wire::LabStaffing`]), not the full snapshot the `/runs` fold reads.
+fn serialize_staffing_view<S: serde::Serializer>(
+    staffing: &Option<darkmux_lab::lab::review::StaffingSnapshot>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::Serialize;
+    staffing.as_ref().map(wire::LabStaffing::from).serialize(serializer)
 }
 
 /// GET /lab/runs — every run cluster under the lab observer's scan root,
@@ -2637,13 +2208,16 @@ pub(crate) struct LabRunSummary {
 /// half-stale "restart with `--lab-dir`" copy, which production can no longer
 /// trigger) is #1584. These fields land first so that work has something
 /// truthful to render.
-async fn lab_runs_handler(State(state): State<AppState>) -> impl IntoResponse {
+async fn lab_runs_handler(State(state): State<AppState>) -> axum::Json<wire::LabRunsResponse> {
     let Some(lab_dir) = state.lab_dir.clone() else {
         // Still reachable: `build_router` (test-only) threads `lab_dir: None`.
-        return axum::Json(serde_json::json!({
-            "configured": false, "dir": null, "exists": false, "runs": []
-        }))
-        .into_response();
+        return axum::Json(wire::LabRunsResponse {
+            configured: false,
+            dir: None,
+            exists: false,
+            runs: Vec::new(),
+            pending_move: None,
+        });
     };
     let shown = lab_dir.display().to_string();
     let exists = lab_dir.is_dir();
@@ -2652,18 +2226,9 @@ async fn lab_runs_handler(State(state): State<AppState>) -> impl IntoResponse {
     })
     .await
     .unwrap_or_default();
-    let mut body = serde_json::json!({
-        "configured": true,
-        "dir": shown,
-        "exists": exists,
-        "runs": runs,
-    });
-    // Additive: present only while pre-4.0 runs wait to be moved, so the lab
-    // lens can say why it is empty. Serving never refuses over it.
-    if let Some(m) = pending_move {
-        body["pending_move"] = serde_json::json!(m);
-    }
-    axum::Json(body).into_response()
+    // `pending_move` is present only while pre-4.0 runs wait to be moved, so the
+    // lab lens can say why it is empty. Serving never refuses over it.
+    axum::Json(wire::LabRunsResponse { configured: true, dir: Some(shown), exists, runs, pending_move })
 }
 
 /// `pub(crate)` (was private until #1508 step 3) — the `/runs` aggregator
@@ -2690,7 +2255,7 @@ fn scan_lab_dir_rec(dir: &StdPath, lab_dir: &StdPath, depth: usize, out: &mut Ve
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-    let has_funnels = dir.join("funnels.json").is_file();
+    let has_reviews = dir.join("funnels.json").is_file();
     let has_events = dir.join("funnel-events.jsonl").is_file();
     let has_scores = dir.join("scores.json").is_file();
     // (#1937) The lifecycle record is written at run START, so it is the only
@@ -2699,8 +2264,8 @@ fn scan_lab_dir_rec(dir: &StdPath, lab_dir: &StdPath, depth: usize, out: &mut Ve
     // it falls through to flow synthesis, displaying as an `untracked`
     // DISPATCH for its entire duration.
     let has_lifecycle = dir.join(darkmux_lab::lab::lifecycle::LIFECYCLE_FILE).is_file();
-    if has_funnels || has_events || has_scores || has_lifecycle {
-        if let Some(summary) = build_lab_run_summary(dir, lab_dir, has_funnels, has_events, has_scores) {
+    if has_reviews || has_events || has_scores || has_lifecycle {
+        if let Some(summary) = build_lab_run_summary(dir, lab_dir, has_reviews, has_events, has_scores) {
             out.push(summary);
         }
         // Deliberately DOES NOT `return` here — a match does not stop the
@@ -2739,6 +2304,17 @@ fn scan_lab_dir_rec(dir: &StdPath, lab_dir: &StdPath, depth: usize, out: &mut Ve
 
 /// `verify.passed` from a run's manifest. `None` is "not checked": the
 /// manifest has `verify: null` (the workload declares none) or no such block.
+/// The review envelopes archived in a run's `funnels.json`. No writer produces
+/// that file any more (the review path became a mission, #2310); only a lab run
+/// recorded before then carries one. It is read leniently, as an archive:
+/// missing or unparseable is `[]`, never an error.
+fn read_archived_reviews(run_dir: &StdPath) -> Vec<darkmux_lab::lab::review::ReviewEnvelope> {
+    std::fs::read_to_string(run_dir.join("funnels.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
 fn manifest_verify_passed(manifest: &serde_json::Value) -> Option<bool> {
     manifest.get("verify")?.get("passed")?.as_bool()
 }
@@ -2746,7 +2322,7 @@ fn manifest_verify_passed(manifest: &serde_json::Value) -> Option<bool> {
 fn build_lab_run_summary(
     dir: &StdPath,
     lab_dir: &StdPath,
-    has_funnels: bool,
+    has_reviews: bool,
     has_events: bool,
     has_scores: bool,
 ) -> Option<LabRunSummary> {
@@ -2812,31 +2388,27 @@ fn build_lab_run_summary(
     let mut archived = 0usize;
     let mut degenerate = false;
 
-    if has_funnels {
-        if let Ok(text) = std::fs::read_to_string(dir.join("funnels.json")) {
-            if let Ok(envs) = serde_json::from_str::<Vec<darkmux_lab::lab::review::ReviewEnvelope>>(&text) {
-                for e in &envs {
-                    if !case_ids.contains(&e.case_id) {
-                        case_ids.push(e.case_id.clone());
-                    }
-                    if crew.is_none() {
-                        crew = Some(e.crew.clone());
-                    }
-                    if exec_mode.is_none() {
-                        exec_mode = Some(e.mode.clone());
-                    }
-                    if staffing.is_none() {
-                        staffing = e.staffing.clone();
-                    }
-                    bundles += e.bundles;
-                    raw_flags += e.raw_flags;
-                    deduped_flags += e.deduped_flags;
-                    confirmed += e.confirmed;
-                    needs_check += e.needs_check;
-                    archived += e.archived;
-                    degenerate = degenerate || e.degenerate.is_some();
-                }
+    if has_reviews {
+        for e in &read_archived_reviews(dir) {
+            if !case_ids.contains(&e.case_id) {
+                case_ids.push(e.case_id.clone());
             }
+            if crew.is_none() {
+                crew = Some(e.crew.clone());
+            }
+            if exec_mode.is_none() {
+                exec_mode = Some(e.mode.clone());
+            }
+            if staffing.is_none() {
+                staffing = e.staffing.clone();
+            }
+            bundles += e.bundles;
+            raw_flags += e.raw_flags;
+            deduped_flags += e.deduped_flags;
+            confirmed += e.confirmed;
+            needs_check += e.needs_check;
+            archived += e.archived;
+            degenerate = degenerate || e.degenerate.is_some();
         }
     }
 
@@ -2847,7 +2419,7 @@ fn build_lab_run_summary(
             // A NON-funnel bench (scores.json but no funnels.json — Strict/
             // FreeForm/Agentic/Dialectic mode) has its case ids + crew/mode
             // only in the score rows' `detail`/`extras`, never an envelope.
-            if !has_funnels {
+            if !has_reviews {
                 for r in &doc.rows {
                     if r.axis == "case" {
                         if let Some(cid) = r.detail.get("case").and_then(|v| v.as_str()) {
@@ -2953,7 +2525,7 @@ fn build_lab_run_summary(
         lifecycle_status: lifecycle_record.as_ref().map(|r| r.status),
         lifecycle_started_at_ms: lifecycle_record.as_ref().map(|r| r.started_at_ms),
         lifecycle_error: lifecycle_record.and_then(|r| r.error),
-        has_funnels,
+        has_reviews,
         has_events,
         session_id,
         run_ok,
@@ -2979,17 +2551,11 @@ struct LabDirQuery {
     dir: String,
 }
 
-#[derive(serde::Serialize, Default)]
-struct LabRunDetailResponse {
-    dir: String,
-    funnels: Vec<darkmux_lab::lab::review::ReviewEnvelope>,
-    scores: Option<darkmux_lab::lab::scores::ScoresDoc>,
-}
-
-/// GET /lab/run/detail?dir=<rel> — the envelope(s) + scores content for one
-/// run. `funnels` is `[]` (never an error) when `funnels.json` is absent or
-/// unparseable — a live run before its first case completes, or a non-funnel
-/// bench mode. `scores` is `null` the same way.
+/// GET /lab/run/detail?dir=<rel> — the review headline(s) + scores identity for
+/// one run. `reviews` is `[]` (never an error) when the run's archived
+/// `funnels.json` is absent or unparseable — no run writes that file any more,
+/// so only a run recorded before the review path became a mission has any.
+/// `scores` is `null` the same way.
 ///
 /// DELIBERATELY no byte cap on the two file reads (unlike the events
 /// route's `MAX_LAB_EVENTS_READ_BYTES`): `funnels.json` / `scores.json` are
@@ -3011,18 +2577,19 @@ async fn lab_run_detail_handler(
         return lab_bad_dir();
     };
     let dir_label = q.dir.clone();
-    let (funnels, scores) = tokio::task::spawn_blocking(move || {
-        let funnels: Vec<darkmux_lab::lab::review::ReviewEnvelope> =
-            std::fs::read_to_string(run_dir.join("funnels.json"))
-                .ok()
-                .and_then(|t| serde_json::from_str(&t).ok())
-                .unwrap_or_default();
-        let scores = darkmux_lab::lab::scores::read_scores(&run_dir.join("scores.json")).ok();
-        (funnels, scores)
+    let (reviews, scores) = tokio::task::spawn_blocking(move || {
+        let reviews: Vec<wire::LabReviewSummary> = read_archived_reviews(&run_dir)
+            .iter()
+            .map(wire::LabReviewSummary::from)
+            .collect();
+        let scores = darkmux_lab::lab::scores::read_scores(&run_dir.join("scores.json"))
+            .ok()
+            .map(|doc| wire::LabScoresSummary::from(&doc));
+        (reviews, scores)
     })
     .await
     .unwrap_or_default();
-    axum::Json(LabRunDetailResponse { dir: dir_label, funnels, scores }).into_response()
+    axum::Json(wire::LabRunDetailResponse { dir: dir_label, reviews, scores }).into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -3030,16 +2597,6 @@ struct LabEventsQuery {
     dir: String,
     #[serde(default)]
     offset: u64,
-}
-
-#[derive(Debug, PartialEq, serde::Serialize)]
-struct LabRunEventsResponse {
-    lines: Vec<serde_json::Value>,
-    next_offset: u64,
-    /// `scores.json` exists — the run reached its terminal artifact write,
-    /// so this file has stopped growing. The client stops polling once it
-    /// sees this true (after draining any remaining backlog).
-    finished: bool,
 }
 
 /// GET /lab/run/events?dir=<rel>&offset=<byte> — POLL-based tail of
@@ -3092,10 +2649,10 @@ fn lab_bad_dir() -> Response {
 /// writer mid-flush) or hitting the read cap mid-line is left for the next
 /// poll rather than dropped or mis-parsed, so `next_offset` always lands on
 /// a line boundary.
-fn tail_lab_events(dir: &StdPath, offset: u64) -> LabRunEventsResponse {
+fn tail_lab_events(dir: &StdPath, offset: u64) -> wire::LabRunEventsResponse {
     let path = dir.join("funnel-events.jsonl");
     let finished = dir.join("scores.json").is_file();
-    let empty = |next_offset: u64| LabRunEventsResponse { lines: Vec::new(), next_offset, finished };
+    let empty = |next_offset: u64| wire::LabRunEventsResponse { lines: Vec::new(), next_offset, finished };
 
     let Ok(mut file) = std::fs::File::open(&path) else {
         return empty(offset);
@@ -3138,45 +2695,34 @@ fn tail_lab_events(dir: &StdPath, offset: u64) -> LabRunEventsResponse {
             lines.push(v);
         }
     }
-    LabRunEventsResponse { lines, next_offset: offset + last_nl as u64 + 1, finished }
+    wire::LabRunEventsResponse { lines, next_offset: offset + last_nl as u64 + 1, finished }
 }
 
-/// GET /flow-status — diagnostic snapshot of the flow substrate. Same
-/// data shape as `darkmux flow status --json`; the shared shell's
-/// store-status pill polls this every 30s. (#170)
+/// GET /machine/status — returns currently-loaded models (per `lms ps
+/// --json`) as JSON. (#1426 — renamed from `/model/status` alongside the
+/// `machine` CLI family; one route family, one name. Its consumer is the
+/// `darkmux machine status <id>` peer read — the viewer does not fetch this
+/// route; an earlier doc comment claiming a viewer toolbar-pill consumer,
+/// from #87, was stale.)
 ///
-/// `flow::collect_status()` opens a Redis connection when Redis is
-/// configured, so runs on the blocking pool to keep the axum executor
-/// free.
-async fn flow_status_handler() -> axum::Json<serde_json::Value> {
-    let result = tokio::task::spawn_blocking(darkmux_flow::collect_status).await;
-    match result {
-        Ok(status) => axum::Json(
-            serde_json::to_value(status)
-                .unwrap_or_else(|_| serde_json::json!({"error": "serialization failed"})),
-        ),
-        Err(_) => axum::Json(serde_json::json!({
-            "error": "flow status collector panicked",
-            "generated_at_ms": current_millis(),
-        })),
-    }
-}
-
-async fn machine_status_handler() -> axum::Json<serde_json::Value> {
+/// Always returns 200 with a structured body. `lms_unreachable: true`
+/// signals the binary couldn't be invoked (operator hasn't installed
+/// LMStudio's CLI, or it's not on PATH) — UI surfaces this as a
+/// degraded-state pill rather than treating it as a hard error.
+///
+/// `lms::list_loaded()` is sync (subprocess invocation), so it runs on
+/// the blocking pool to keep the axum executor free.
+async fn machine_status_handler() -> axum::Json<wire::MachineStatusResponse> {
     let result = tokio::task::spawn_blocking(darkmux_profiles::lms::list_loaded).await;
     let (models, unreachable) = match result {
         Ok(Ok(m)) => (m, false),
         _ => (Vec::new(), true),
     };
-    let generated_at_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    axum::Json(serde_json::json!({
-        "models": models,
-        "lms_unreachable": unreachable,
-        "generated_at_ms": generated_at_ms,
-    }))
+    axum::Json(wire::MachineStatusResponse {
+        models,
+        lms_unreachable: unreachable,
+        generated_at_ms: current_millis(),
+    })
 }
 
 /// (#1286) GET /machine/resources cache TTL. Computed on request with a short
@@ -3193,7 +2739,7 @@ const MACHINE_RESOURCES_CACHE_TTL: Duration = Duration::from_secs(2);
 /// staleness marker (this payload has no `age_ms` field at all — see
 /// [`machine_resources_handler`]'s `cache_ttl_ms` insert — so the failure
 /// here is silent, not even mislabeled).
-static MACHINE_RESOURCES_CACHE: std::sync::Mutex<Option<(std::time::SystemTime, serde_json::Value)>> =
+static MACHINE_RESOURCES_CACHE: std::sync::Mutex<Option<(std::time::SystemTime, darkmux_profiles::model_ledger::ModelLedger)>> =
     std::sync::Mutex::new(None);
 
 /// Single-flight gate for the machine-resources gather (#1286): concurrent
@@ -3208,7 +2754,7 @@ fn machine_resources_gather_lock() -> &'static tokio::sync::Mutex<()> {
 
 /// Fresh cached machine-resources payload, or `None` when absent/stale. The std
 /// mutex is held only for the clone — never across an `.await`.
-fn machine_resources_cached_fresh() -> Option<serde_json::Value> {
+fn machine_resources_cached_fresh() -> Option<darkmux_profiles::model_ledger::ModelLedger> {
     let guard = MACHINE_RESOURCES_CACHE.lock().ok()?;
     let (at, v) = guard.as_ref()?;
     wall_clock_cache_is_fresh(*at, std::time::SystemTime::now(), MACHINE_RESOURCES_CACHE_TTL).then(|| v.clone())
@@ -3228,60 +2774,51 @@ fn machine_resources_cached_fresh() -> Option<serde_json::Value> {
 /// other route (this machine open, remote requires the token) — nothing extra
 /// here.
 ///
-/// (#2107, #1833, #2108) Attach the daemon-side host sampler's `load` block —
-/// `now`/`window` in host-sample-shape v2, see `host_sampler`'s own doc — to
-/// a `/machine/resources` payload. Applied AFTER the ledger cache
-/// lookup/write, never cached itself: the ledger gather is the expensive
-/// shelled-out part worth a 2s cache; the ring read underneath `load` is a
-/// mutex lock plus arithmetic, cheap enough to be freshest-possible on
-/// every request rather than inheriting the ledger's cache staleness.
+/// (#2107, #1833, #2108) The host sampler's `load` block — `now`/`window` in
+/// host-sample-shape v2, see `host_sampler`'s own doc — is read AFTER the
+/// ledger cache lookup and never cached itself: the ledger gather is the
+/// expensive shelled-out part worth a 2s cache; the ring read underneath
+/// `load` is a mutex lock plus arithmetic, cheap enough to be freshest-possible
+/// on every request rather than inheriting the ledger's cache staleness.
 /// Absent (no `load` key at all) when the sampler hasn't produced a sample
 /// yet — disabled (`runtime.host_sampler_interval_ms: 0`) or just started —
 /// which is the same "absent means not measured" contract the envelope's
 /// `host` block uses.
-fn attach_load(mut value: serde_json::Value) -> serde_json::Value {
-    if let (Some(load), Some(obj)) = (host_sampler::ring().snapshot(), value.as_object_mut()) {
-        obj.insert("load".to_string(), load);
+/// The route's body for one ledger: the recorded cache cadence, and the host
+/// sampler's `load` block.
+fn machine_resources_body(ledger: darkmux_profiles::model_ledger::ModelLedger) -> wire::MachineResourcesResponse {
+    wire::MachineResourcesResponse {
+        ledger,
+        // Recorded cadence knob (#1286 observer constraint 4).
+        cache_ttl_ms: MACHINE_RESOURCES_CACHE_TTL.as_millis() as u64,
+        load: host_sampler::ring().snapshot(),
     }
-    value
 }
 
-/// The gather shells out (bounded) — runs on the blocking pool. Best-effort
-/// contract like /machine/specs: probe failures degrade to `warnings` in
-/// the payload, never a 500.
-async fn machine_resources_handler() -> axum::Json<serde_json::Value> {
+/// The gather shells out (bounded) — runs on the blocking pool. Probe failures
+/// degrade to `messages` in the ledger, never a 500; only a gather that PANICS
+/// answers 500, with a plain-text body (there is no ledger to serve).
+async fn machine_resources_handler(
+) -> Result<axum::Json<wire::MachineResourcesResponse>, (StatusCode, &'static str)> {
     // Fast path: a fresh cache serves without touching the gather lock.
-    if let Some(v) = machine_resources_cached_fresh() {
-        return axum::Json(attach_load(v));
+    if let Some(ledger) = machine_resources_cached_fresh() {
+        return Ok(axum::Json(machine_resources_body(ledger)));
     }
     // Single-flight (#1286): serialize cold-cache refreshers on the gather
     // lock, then RE-CHECK the cache under it — a request that waited behind an
     // in-flight gather returns that gather's fresh result instead of launching
     // a second one, so a poll burst costs one gather.
     let _permit = machine_resources_gather_lock().lock().await;
-    if let Some(v) = machine_resources_cached_fresh() {
-        return axum::Json(attach_load(v));
+    if let Some(ledger) = machine_resources_cached_fresh() {
+        return Ok(axum::Json(machine_resources_body(ledger)));
     }
-    let result = tokio::task::spawn_blocking(darkmux_profiles::model_ledger::gather).await;
-    let mut value = match result {
-        Ok(ledger) => serde_json::to_value(&ledger)
-            .unwrap_or_else(|_| serde_json::json!({"error": "ledger serialization failed"})),
-        Err(_) => serde_json::json!({
-            "error": "memory-ledger gather panicked",
-            "generated_at_ms": current_millis(),
-        }),
-    };
-    if let Some(obj) = value.as_object_mut() {
-        // Recorded cadence knob (#1286 observer constraint 4).
-        obj.insert(
-            "cache_ttl_ms".to_string(),
-            serde_json::json!(MACHINE_RESOURCES_CACHE_TTL.as_millis() as u64),
-        );
-    }
+    let ledger = tokio::task::spawn_blocking(darkmux_profiles::model_ledger::gather)
+        .await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "darkmux serve: memory-ledger gather panicked\n"))?;
     if let Ok(mut guard) = MACHINE_RESOURCES_CACHE.lock() {
-        *guard = Some((std::time::SystemTime::now(), value.clone()));
+        *guard = Some((std::time::SystemTime::now(), ledger.clone()));
     }
-    axum::Json(attach_load(value))
+    Ok(axum::Json(machine_resources_body(ledger)))
 }
 
 /// GET /machine/specs — local-machine spec sheet for `darkmux machine list
@@ -3296,7 +2833,7 @@ async fn machine_resources_handler() -> axum::Json<serde_json::Value> {
 /// fields) rather than 500-ing. This is the contract `machine list
 /// --deep` relies on — degraded state is a visible cell, not a failed
 /// command. (#275 PR-A)
-async fn machine_specs_handler() -> axum::Json<serde_json::Value> {
+async fn machine_specs_handler() -> axum::Json<wire::MachineSpecsResponse> {
     // Shell-out probes run in spawn_blocking so the async runtime stays
     // responsive. Each result is independent — one failure doesn't
     // cascade.
@@ -3361,37 +2898,28 @@ async fn machine_specs_handler() -> axum::Json<serde_json::Value> {
     .await
     .ok()
     .flatten()
-    .map(|(id, n_ctx)| utility_model_json(&id, n_ctx, &loaded_models));
+    .map(|(id, n_ctx)| utility_model(&id, n_ctx, &loaded_models));
 
-    let generated_at_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-
-    axum::Json(serde_json::json!({
-        "darkmux_version": env!("CARGO_PKG_VERSION"),
-        "flow_schema_version": darkmux_flow::FLOW_SCHEMA_VERSION,
-        "machine_id": machine_id,
-        "machine_uid": machine_uid,
-        "os": format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
-        "ram_total_bytes": ram_total,
-        "ram_free_for_ai_bytes": ram_free,
-        "cpu_brand": cpu_brand,
-        "loaded_models": loaded_models,
-        "lms_unreachable": lms_unreachable,
-        "utility_model": utility_model,
-        "redis_url_redacted": redis_url_redacted,
-        "generated_at_ms": generated_at_ms,
-    }))
+    axum::Json(wire::MachineSpecsResponse {
+        darkmux_version: env!("CARGO_PKG_VERSION").to_string(),
+        flow_schema_version: darkmux_flow::FLOW_SCHEMA_VERSION.to_string(),
+        machine_id,
+        machine_uid: machine_uid.map(str::to_string),
+        os: format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
+        ram_total_bytes: ram_total,
+        ram_free_for_ai_bytes: ram_free,
+        cpu_brand,
+        loaded_models,
+        lms_unreachable,
+        utility_model,
+        redis_url_redacted,
+        generated_at_ms: current_millis(),
+    })
 }
 
-/// (#1008, #2915) `/machine/specs`' `utility_model`: the machine's
-/// `internal.utility` binding, whether a loaded model matches it (by its
-/// namespaced identifier OR its bare model key, since the id may be stored
-/// either way), and its declared window (`null` when undeclared).
-fn utility_model_json(id: &str, n_ctx: Option<u32>, loaded_models: &[darkmux_types::LoadedModel]) -> serde_json::Value {
+fn utility_model(id: &str, n_ctx: Option<u32>, loaded_models: &[darkmux_types::LoadedModel]) -> wire::UtilityModel {
     let loaded = loaded_models.iter().any(|m| m.identifier == id || m.model == id);
-    serde_json::json!({ "id": id, "loaded": loaded, "n_ctx": n_ctx })
+    wire::UtilityModel { id: id.to_string(), loaded, n_ctx }
 }
 
 /// Read total system RAM in bytes. macOS uses `sysctl hw.memsize` which
@@ -3642,24 +3170,21 @@ struct FlowQuery {
 /// this is the navigation layer over it. A `mission_id`/`session_id` cross-day
 /// index is the scale path (not built here) — scanning day files is fine at the
 /// per-operator scale this serves.
-async fn flow_days_handler(State(state): State<AppState>) -> impl IntoResponse {
+async fn flow_days_handler(State(state): State<AppState>) -> axum::Json<wire::FlowDaysResponse> {
     let dir = state.flows_dir.clone();
     let days = tokio::task::spawn_blocking(move || scan_flow_days(&dir))
         .await
         .unwrap_or_default();
-    axum::Json(serde_json::json!({
-        "days": days,
-        "generated_at_ms": current_millis(),
-    }))
+    axum::Json(wire::FlowDaysResponse { days, generated_at_ms: current_millis() })
 }
 
 /// Scan `flows_dir` for `YYYY-MM-DD.jsonl` files and summarize each. Newest day
 /// first. Unreadable / malformed files are skipped (best-effort catalog, never
 /// an error that hides the days that DO parse). Schema-header lines (`_type ==
 /// "schema"`) don't count as records.
-fn scan_flow_days(flows_dir: &std::path::Path) -> Vec<serde_json::Value> {
+fn scan_flow_days(flows_dir: &std::path::Path) -> Vec<wire::FlowDay> {
     use std::io::BufRead;
-    let mut days: Vec<serde_json::Value> = Vec::new();
+    let mut days: Vec<wire::FlowDay> = Vec::new();
     let Ok(entries) = std::fs::read_dir(flows_dir) else {
         return days;
     };
@@ -3702,19 +3227,14 @@ fn scan_flow_days(flows_dir: &std::path::Path) -> Vec<serde_json::Value> {
                 dispatches.insert(darkmux_flow::legacy::execution_of(&v).to_string());
             }
         }
-        days.push(serde_json::json!({
-            "date": date,
-            "records": records,
-            "missions": missions.into_iter().collect::<Vec<_>>(),
-            "dispatches": dispatches.len(),
-        }));
+        days.push(wire::FlowDay {
+            date: date.to_string(),
+            records,
+            missions: missions.into_iter().collect(),
+            dispatches: dispatches.len(),
+        });
     }
-    days.sort_by(|a, b| {
-        b["date"]
-            .as_str()
-            .unwrap_or("")
-            .cmp(a["date"].as_str().unwrap_or(""))
-    });
+    days.sort_by(|a, b| b.date.cmp(&a.date));
     days
 }
 
@@ -3875,7 +3395,7 @@ pub(crate) fn for_each_flow_record_in_day_range(
 /// across all day files, with a rollup (records, dispatch count, date span, ts
 /// span, machines), newest-activity first. The viewer lists these so you can
 /// "replay the mission" instead of hunting through days (#691). Disk-backed.
-async fn flow_missions_handler(State(state): State<AppState>) -> impl IntoResponse {
+async fn flow_missions_handler(State(state): State<AppState>) -> axum::Json<wire::FlowMissionsResponse> {
     let dir = state.flows_dir.clone();
     // (#1705) The fleet read happens INSIDE the same blocking task as the
     // day-file walk — one `spawn_blocking`, not two round trips.
@@ -3895,11 +3415,11 @@ async fn flow_missions_handler(State(state): State<AppState>) -> impl IntoRespon
             source_state::SourceState::Unavailable { detail: "the mission aggregation failed" },
         )
     });
-    axum::Json(serde_json::json!({
-        "missions": missions,
-        "generated_at_ms": current_millis(),
-        "meta": source_state::coverage_meta(&fleet_state),
-    }))
+    axum::Json(wire::FlowMissionsResponse {
+        missions,
+        generated_at_ms: current_millis(),
+        meta: source_state::coverage_meta(&fleet_state),
+    })
 }
 
 /// Roll every flow record up per `mission_id`, across the local day-files
@@ -3919,7 +3439,7 @@ async fn flow_missions_handler(State(state): State<AppState>) -> impl IntoRespon
 fn scan_flow_missions(
     flows_dir: &std::path::Path,
     fleet: &[serde_json::Value],
-) -> Vec<serde_json::Value> {
+) -> Vec<wire::FlowMissionSummary> {
     use std::collections::{BTreeSet, HashMap};
     struct Agg {
         records: u64,
@@ -3999,27 +3519,20 @@ fn scan_flow_missions(
         std::ops::ControlFlow::Continue(())
     });
 
-    let mut out: Vec<serde_json::Value> = by_mission
+    let mut out: Vec<wire::FlowMissionSummary> = by_mission
         .into_iter()
-        .map(|(mid, a)| {
-            serde_json::json!({
-                "mission_id": mid,
-                "records": a.records,
-                "dispatches": a.dispatches.len(),
-                "machines": a.machines.into_iter().collect::<Vec<_>>(),
-                "first_ts": a.first_ts,
-                "last_ts": a.last_ts,
-                "first_date": a.first_date,
-                "last_date": a.last_date,
-            })
+        .map(|(mid, a)| wire::FlowMissionSummary {
+            mission_id: mid,
+            records: a.records,
+            dispatches: a.dispatches.len(),
+            machines: a.machines.into_iter().collect(),
+            first_ts: a.first_ts,
+            last_ts: a.last_ts,
+            first_date: a.first_date,
+            last_date: a.last_date,
         })
         .collect();
-    out.sort_by(|a, b| {
-        b["last_ts"]
-            .as_str()
-            .unwrap_or("")
-            .cmp(a["last_ts"].as_str().unwrap_or(""))
-    });
+    out.sort_by(|a, b| b.last_ts.cmp(&a.last_ts));
     out
 }
 
@@ -4029,21 +3542,39 @@ async fn flow_mission_handler(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    catalog_records_response(state, "mission_id", id).await
+    catalog_records_response(state, RecordKey::Mission, id).await
 }
 
-/// `GET /flow-session/:id` → the flow records for one dispatch session, across
+/// `GET /flow-dispatch/:id` → the flow records for one dispatch, across
 /// days (the "replay this dispatch" payload).
-async fn flow_session_handler(
+async fn flow_dispatch_handler(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    catalog_records_response(state, "session_id", id).await
+    catalog_records_response(state, RecordKey::Dispatch, id).await
+}
+
+/// What a catalog response collects records by: the mission they belong to, or
+/// the dispatch (the flow `session_id` join key) they belong to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecordKey {
+    Mission,
+    Dispatch,
+}
+
+impl RecordKey {
+    /// The flow-record field that holds the id.
+    fn field(self) -> &'static str {
+        match self {
+            RecordKey::Mission => "mission_id",
+            RecordKey::Dispatch => "session_id",
+        }
+    }
 }
 
 async fn catalog_records_response(
     state: AppState,
-    field: &'static str,
+    key: RecordKey,
     id: String,
 ) -> axum::response::Response {
     if !is_valid_catalog_id(&id) {
@@ -4069,7 +3600,7 @@ async fn catalog_records_response(
             // making the mission visible in the first place.
             let fleet = fleet_flow_records();
             let (mut records, truncated, mut records_scanned) =
-                collect_records_by_field(&dir, &fleet.records, field, &id);
+                collect_records_by_field(&dir, &fleet.records, key.field(), &id);
             // (#2413 M4) A session's own record set carries no host cpu/ram/gpu
             // samples any more — M3 retired the per-dispatch `telemetry.process`
             // producer that used to write them WITH this session's `session_id`.
@@ -4077,11 +3608,11 @@ async fn catalog_records_response(
             // response goes out, so the run-detail SYSTEM pane (which reads
             // this same session-scoped record set) doesn't have to learn a
             // second fetch.
-            if field == "mission_id" {
+            if key == RecordKey::Mission {
                 mission_graph::stamp_session_steps(&mut records, &id);
             }
             let mut days_scanned = 0usize;
-            if field == "session_id" {
+            if key == RecordKey::Dispatch {
                 let join_stats =
                     join_host_samples_into_session_records(&dir, &fleet.records, &mut records, current_millis());
                 days_scanned = join_stats.days_scanned;
@@ -4104,33 +3635,21 @@ async fn catalog_records_response(
                 0,
             )
         });
-    let mut meta = source_state::coverage_meta(&fleet_state);
-    if let Some(obj) = meta.as_object_mut() {
-        obj.insert("scan_ms".into(), serde_json::json!(scan_ms));
-        obj.insert("days_scanned".into(), serde_json::json!(days_scanned));
-        obj.insert("records_scanned".into(), serde_json::json!(records_scanned));
-    }
-    axum::Json(serde_json::json!({
-        "records": records,
-        "count": records.len(),
-        "truncated": truncated,
-        "generated_at_ms": current_millis(),
-        "meta": meta,
-    }))
+    axum::Json(wire::FlowRecordsResponse {
+        count: records.len(),
+        records,
+        truncated,
+        generated_at_ms: current_millis(),
+        meta: wire::RecordsMeta {
+            coverage: source_state::coverage_meta(&fleet_state),
+            scan_ms,
+            days_scanned,
+            records_scanned,
+        },
+    })
     .into_response()
 }
 
-/// Collect every record whose top-level string `field` equals `id`, from the
-/// local day files AND the fleet stream (#1705), in chronological order,
-/// bounded at MAX_CATALOG_RECORDS. Returns the records + whether the cap
-/// truncated the result + the number of records VISITED during the local
-/// walk (matched or not — the scan-cost figure `catalog_records_response`
-/// stamps into `meta.records_scanned`). Stops scanning the local side once
-/// the cap is hit (ControlFlow::Break) rather than reading the rest of
-/// history.
-///
-/// Same fleet-first de-dup as every other merged read: this machine's own
-/// records land in both sinks.
 fn collect_records_by_field(
     flows_dir: &std::path::Path,
     fleet: &[serde_json::Value],
@@ -4330,8 +3849,7 @@ fn join_host_samples_into_session_records(
 /// 3. `DARKMUX_REDIS_URL` unset → read the local file directly.
 ///
 /// Missing-file is not an error here: empty array is the correct response
-/// for a date the local machine has no record of. The viewer can ask
-/// `flow-status` to know whether Redis is participating.
+/// for a date the local machine has no record of.
 async fn aggregate_flow_records_for_date(
     date: &str,
     flows_dir: &std::path::Path,
@@ -5493,7 +5011,7 @@ fn synthetic_stream_error_record(stream_name: &str, attempts: u32, reason: &str)
         ts: darkmux_flow::ts_utc_now(),
         level: darkmux_flow::Level::Warn,
         category: darkmux_flow::Category::Audit,
-        tier: darkmux_flow::Tier::Local,
+        tier: darkmux_flow::Tier::Darkmux,
         stage: darkmux_flow::Stage::Scope,
         action: darkmux_flow::FlowAction::StreamError,
         handle: "redis_tail_lines".to_string(),
@@ -5511,8 +5029,6 @@ fn synthetic_stream_error_record(stream_name: &str, attempts: u32, reason: &str)
         prev_hash: None,
         hash: None,
         payload: None,
-        work_id: None,
-        attempt: None,
     };
     serde_json::to_string(&record).unwrap_or_default()
 }

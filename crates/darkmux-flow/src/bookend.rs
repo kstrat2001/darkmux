@@ -262,7 +262,7 @@ mod tests {
             ts: crate::ts_utc_now(),
             level,
             category: crate::Category::Work,
-            tier: crate::Tier::Local,
+            tier: crate::Tier::Darkmux,
             stage: crate::Stage::Dispatch,
             action: crate::FlowAction::DispatchStart,
             handle: marker.to_string(),
@@ -278,8 +278,6 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
-            work_id: None,
-            attempt: None,
         }
     }
 
@@ -406,7 +404,7 @@ mod tests {
 
     #[test]
     fn stamp_remote_classification_sets_both_fields_when_present() {
-        let mut payload = serde_json::json!({ "runtime": "review", "result_class": "ok" });
+        let mut payload = serde_json::json!({ "result_class": "ok" });
         stamp_remote_classification(&mut payload, Some("azure:host/model"), Some(42));
         assert_eq!(payload["endpoint"], "azure:host/model");
         assert_eq!(payload["remote_tokens"], 42);
@@ -414,7 +412,7 @@ mod tests {
 
     #[test]
     fn stamp_remote_classification_no_op_when_both_none() {
-        let mut payload = serde_json::json!({ "runtime": "review", "result_class": "ok" });
+        let mut payload = serde_json::json!({ "result_class": "ok" });
         let before = payload.clone();
         stamp_remote_classification(&mut payload, None, None);
         assert_eq!(payload, before);

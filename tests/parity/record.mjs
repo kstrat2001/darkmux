@@ -10,7 +10,7 @@
 //
 // Endpoints recorded: the plan's named set (/runs /missions /phases
 // /flow-days /flow-missions /flow/<today> /fleet/machines/live
-// /fleet/sessions/live /machine/resources /machine/specs
+// /fleet/dispatches/live /machine/resources /machine/specs
 // /panel/mission-status) PLUS three endpoints the plan's list didn't name
 // but the viewer's own code demands to render a complete lens:
 // /flow/<yesterday> (loadLiveWindow(), the live-mode boot path this harness
@@ -19,7 +19,7 @@
 // /lab/runs (the runs lens fetches it ALONGSIDE /runs on every entry —
 // window.goRuns does `Promise.all([loadRuns(), loadLabRuns()])`, so a runs
 // golden without it is an incomplete render, not a faithful one); and
-// /flow-session/<id> for one concrete, non-sensitive session id (`task-list`)
+// /flow-dispatch/<id> for one concrete, non-sensitive session id (`task-list`)
 // so the #session=<id> drill-in lens has something real to replay. All three
 // additions are logged in the transcript below exactly like the named set.
 //
@@ -360,7 +360,7 @@ async function main() {
   await rec({ name: "flow-today", urlPath: `/flow/${capturedDate}`, file: "flow-today.json", extra: { date: capturedDate } });
   await rec({ name: "flow-yesterday", urlPath: `/flow/${capturedPrevDate}`, file: "flow-yesterday.json", extra: { date: capturedPrevDate } });
   await rec({ name: "fleet-machines-live", urlPath: "/fleet/machines/live", file: "fleet-machines-live.json" });
-  await rec({ name: "fleet-sessions-live", urlPath: "/fleet/sessions/live", file: "fleet-sessions-live.json" });
+  await rec({ name: "fleet-dispatches-live", urlPath: "/fleet/dispatches/live", file: "fleet-dispatches-live.json" });
   await rec({ name: "machine-resources", urlPath: "/machine/resources", file: "machine-resources.json" });
   await rec({ name: "machine-specs", urlPath: "/machine/specs", file: "machine-specs.json" });
   await rec({
@@ -393,11 +393,9 @@ async function main() {
       headers: { "x-darkmux-panel": "1" },
     });
   }
-  // (#1911) `mission-status-all` is a one-release compat ALIAS server-side
-  // now, not a base panel id — the ported client never requests it
-  // directly (see `route.ts::PANEL_ALIASES`), so this records the wire
-  // shape the client ACTUALLY sends: `opt.all=all` against the base
-  // `mission-status` id. `panel-mission-status-all.json` is kept as the
+  // (#1911) `mission-status-all` is retired (a request for it is a 404), so
+  // this records the wire shape the client sends: `opt.all=all` against the
+  // base `mission-status` id. `panel-mission-status-all.json` is kept as the
   // fixture's filename (unchanged) since that's what `mock-routes.js`'s
   // corpus lookup and every existing golden already key on.
   await rec({
@@ -409,9 +407,9 @@ async function main() {
   // Extensions beyond the plan's literal list — see module doc.
   await rec({ name: "lab-runs", urlPath: "/lab/runs", file: "lab-runs.json", extra: { reason: "runs lens fetches this alongside /runs on every entry" } });
   await rec({
-    name: "flow-session-task-list",
-    urlPath: "/flow-session/task-list",
-    file: "flow-session-task-list.json",
+    name: "flow-dispatch-task-list",
+    urlPath: "/flow-dispatch/task-list",
+    file: "flow-dispatch-task-list.json",
     extra: { reason: "#session=<id> deep-link golden target; task-list chosen because it carries no client identifiers, sidestepping URL-encoding of a sanitized compound id" },
   });
   // (#1868 packet 1) The mission-graph parity fixture's own two endpoints;

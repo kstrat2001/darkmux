@@ -31,7 +31,7 @@
 
 import type { CallKind } from "../types/generated/CallKind";
 import type { UsagePurpose } from "../types/generated/UsagePurpose";
-import { ACTION, CATEGORY, executionOf, type NormRecord } from "./ingest";
+import { ACTION, CATEGORY, SOURCE, executionOf, type NormRecord } from "./ingest";
 
 /** Every `UsagePurpose` variant, by name. A key missing or extra relative to
  *  the generated union is a type error. */
@@ -89,7 +89,7 @@ function isFiniteNumber(v: unknown): v is number {
 /** True for a usage record (`telemetry.tokens`), in either shape the viewer
  *  receives it (category+source, or the action). */
 export function isUsageRecord(r: NormRecord): boolean {
-  return (r.category === CATEGORY.Telemetry && r.source === "tokens") || r.action === ACTION.TelemetryTokens;
+  return (r.category === CATEGORY.Telemetry && r.source === SOURCE.Tokens) || r.action === ACTION.TelemetryTokens;
 }
 
 /** A record's `purpose`. Records from before flow schema 1.59.0 carry none;

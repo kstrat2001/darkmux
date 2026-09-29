@@ -88,26 +88,26 @@ test('activity lane: drilling a session.end-only session does not throw', async 
   page.on('pageerror', (e) => pageErrors.push(String(e)));
 
   // The session-drill's own destination fetch (`SessionReplay` →
-  // `/flow-session/<id>`) — this static-playback harness has no daemon
+  // `/flow-dispatch/<id>`) — this static-playback harness has no daemon
   // behind it, so it needs the same real-shaped mock every other
   // `#session=` spec in this suite uses (`viewer-session-url.spec.js`'s
   // `mockSession`), scoped to exactly the fixture's two records for this
   // session id (dispatch.start, then ONLY session.end — no
   // dispatch.complete/error at all).
-  await page.route('**/flow-session/sess-ended-via-sessionend', (r) =>
+  await page.route('**/flow-dispatch/sess-ended-via-sessionend', (r) =>
     r.fulfill({
       contentType: 'application/json',
       body: JSON.stringify({
         records: [
           {
-            ts: '2026-01-01T00:01:00Z', level: 'info', category: 'work', tier: 'local', stage: 'dispatch',
+            ts: '2026-01-01T00:01:00Z', level: 'info', category: 'work', tier: 'darkmux', stage: 'dispatch',
             action: 'dispatch.start', handle: 'darkmux/coder', model: 'qwen',
             session_id: 'sess-ended-via-sessionend', machine_id: 'lifecycle-mac', machine_uid: 'lifecycle-mac-uid',
             payload: { prompt_chars: 42 },
           },
           {
-            ts: '2026-01-01T00:02:00Z', level: 'info', category: 'machinery', tier: 'local', stage: 'dispatch',
-            action: 'session.end', source: 'presence-reconciler',
+            ts: '2026-01-01T00:02:00Z', level: 'info', category: 'machinery', tier: 'darkmux', stage: 'dispatch',
+            action: 'session.end', source: 'presence_reconciler',
             session_id: 'sess-ended-via-sessionend', machine_id: 'lifecycle-mac', machine_uid: 'lifecycle-mac-uid',
           },
         ],

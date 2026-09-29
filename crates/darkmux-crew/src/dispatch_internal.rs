@@ -2429,7 +2429,6 @@ impl<'a> DispatchBookendGuard<'a> {
             // flow-sink write problem must not mask the original error
             // propagating out.
             let mut payload = serde_json::json!({
-                "runtime": "internal",
                 "result_class": "error",
                 "error": "dispatch terminated before completion (early return or panic)",
             });
@@ -3292,7 +3291,7 @@ fn emit_single_shot_usage(
     let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
         darkmux_flow::Level::Info,
         darkmux_flow::FlowAction::TelemetryTokens,
-        crate::usage::USAGE_SOURCE,
+        darkmux_flow::FlowSource::Tokens,
         role_id,
         session,
         execution,
@@ -3335,7 +3334,7 @@ fn build_remote_record(
     )
 }
 
-/// (#1444 review) The five token keys EVERY `runtime: "direct"` dispatch
+/// (#1444 review) The five token keys EVERY hosted single-shot dispatch
 /// completion record carries, written into the payload from ONE place so
 /// the two producers — [`dispatch_remote`] and `dispatch_local_single_shot`
 /// — cannot drift apart on the key SET again.
@@ -3370,7 +3369,7 @@ pub(crate) fn insert_direct_token_keys(
 }
 
 /// The keys [`insert_direct_token_keys`] writes, in order — the parity
-/// contract both `runtime: "direct"` producers are held to. Load-bearing,
+/// contract both hosted single-shot producers are held to. Load-bearing,
 /// not documentation: the writer above iterates this array, so the contract
 /// and the emission cannot disagree.
 pub(crate) const DIRECT_TOKEN_KEYS: [&str; 5] = [
@@ -3465,7 +3464,6 @@ fn dispatch_remote(
             Some(&model_for_abort),
             phase_for_abort.as_deref(),
             Some(serde_json::json!({
-                "runtime": "direct",
                 "endpoint": label_for_abort,
                 "result_class": "error",
                 "error": "dispatch terminated before completion (early return or panic)",
@@ -3487,7 +3485,6 @@ fn dispatch_remote(
             phase,
             darkmux_flow::FlowAction::DispatchStart,
             serde_json::json!({
-                "runtime": "direct",
                 "endpoint": label,
                 "prompt": crate::dispatch::capped_prompt(&opts.message),
                 "prompt_chars": opts.message.chars().count(),
@@ -3532,7 +3529,7 @@ fn dispatch_remote(
                     &pm.id,
                     phase,
                     darkmux_flow::FlowAction::DispatchError,
-                    serde_json::json!({ "runtime": "direct", "endpoint": label, "wall_ms": wall_ms, "error": e.to_string() }),
+                    serde_json::json!({ "endpoint": label, "wall_ms": wall_ms, "error": e.to_string() }),
                 ),
             );
             return Err(e);
@@ -3579,7 +3576,6 @@ fn dispatch_remote(
     let mut complete_payload = serde_json::json!({
         "result_class": "ok",
         "exit_code": 0,
-        "runtime": "direct",
         "endpoint": label,
         "total_turns": 1,
         "total_tools": 0,
@@ -3611,7 +3607,7 @@ fn dispatch_remote(
 
     let stdout = if opts.json {
         let mut metrics = serde_json::json!({
-            "model": pm.id, "endpoint": label, "runtime": "direct",
+            "model": pm.id, "endpoint": label,
             "wall_ms": wall_ms, "turns": 1,
         });
         insert_direct_token_keys(metrics.as_object_mut().expect("json! built an object"), &counts);
@@ -3833,7 +3829,6 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
             Some(&model_for_abort),
             phase_for_abort.as_deref(),
             Some(serde_json::json!({
-                "runtime": "direct",
                 "result_class": "error",
                 "error": "dispatch terminated before completion (early return or panic)",
             })),
@@ -3852,7 +3847,6 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
             phase,
             darkmux_flow::FlowAction::DispatchStart,
             serde_json::json!({
-                "runtime": "direct",
                 "prompt": crate::dispatch::capped_prompt(&opts.message),
                 "prompt_chars": opts.message.chars().count(),
                 // (#2295) Same field, same reason — see the hosted path above.
@@ -3915,7 +3909,7 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
                     &model_id,
                     phase,
                     darkmux_flow::FlowAction::DispatchError,
-                    serde_json::json!({ "runtime": "direct", "wall_ms": wall_ms, "error": e.to_string() }),
+                    serde_json::json!({ "wall_ms": wall_ms, "error": e.to_string() }),
                 ),
             );
             return Err(e);
@@ -3944,7 +3938,6 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
     let mut complete_payload = serde_json::json!({
         "result_class": "ok",
         "exit_code": 0,
-        "runtime": "direct",
         "total_turns": 1,
         "total_tools": 0,
         "total_compactions": 0,
@@ -6400,15 +6393,6 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         .join()
         .unwrap_or_else(|_| TrajectorySummary::default());
 
-    // (#2263) A resumed execution's whole-task counts come from the
-    // checkpoint it resumed from and what this run recorded
-    // (`CheckpointCounts::cumulative_turns`). The trajectory itself only
-    // ever holds this run's events (`host_out` is a fresh tempdir).
-    let resume_seed = resume_checkpoint_contents
-        .as_deref()
-        .map(darkmux_trajectory::CheckpointCounts::of)
-        .unwrap_or_default();
-
     // (#1955) The envelope is the orchestrator's only surface, so the
     // reduction lands here — after the tailer has finished and its
     // observations are final.
@@ -6416,7 +6400,6 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         stdout,
         &model,
         &trajectory_summary,
-        resume_seed,
         &host_stats,
         &host_extras,
         &host_out,
@@ -6443,7 +6426,6 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         &stderr,
         exit_code,
         &trajectory_summary,
-        resume_seed,
         remote_endpoint_raw_label.as_deref(),
         &host_stats,
         &host_extras,
@@ -6484,7 +6466,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
         darkmux_flow::Level::Info,
         darkmux_flow::FlowAction::TelemetryRuntime,
-        "runtime",
+        darkmux_flow::FlowSource::Runtime,
         &opts.role_id,
         &session,
         &execution,
@@ -6578,7 +6560,6 @@ fn dispatch_start_payload_json(
     brief_refs: &[crate::brief_refs::BriefRef],
 ) -> Result<serde_json::Value, darkmux_types::config_enum::BadEnumValue> {
     Ok(serde_json::json!({
-        "runtime": "internal",
         // (#1126) The resolved runtime image (operator `--image` or the default
         // darkmux image) — the environment the coder ran in. The viewer's run
         // brief + recent-runs rail read `payload.image`; it was a dead
@@ -6847,7 +6828,6 @@ fn enrich_envelope_with_summary(
     stdout: String,
     model: &str,
     summary: &TrajectorySummary,
-    resume_seed: darkmux_trajectory::CheckpointCounts,
     stats: &HostStats,
     extras: &HostExtras,
     out_dir: &std::path::Path,
@@ -6869,7 +6849,7 @@ fn enrich_envelope_with_summary(
     let Some(obj) = v.as_object_mut() else {
         return stdout;
     };
-    obj.insert("metrics".into(), envelope_metrics(&summary.fold, model, resume_seed));
+    obj.insert("metrics".into(), envelope_metrics(&summary.fold, model));
     // Always present, even when empty. An absent field is ambiguous between
     // "nothing fired" and "this build does not report it"; `[]` is not.
     obj.insert(
@@ -6883,10 +6863,9 @@ fn enrich_envelope_with_summary(
     //
     // (#2107) `cpu`/`mem`/`gpu` each carry the full peak/mean/p95/duty
     // reduction — a peak alone answers "did this ever spike"; it can't say
-    // how hard the host was driven ON AVERAGE. `peak_cpu_pct`/`peak_mem_pct`
-    // stay at the TOP LEVEL as aliases for one release in case a reader
-    // still looks there (the pre-#2107 shape); they read straight off the
-    // same nested `cpu.peak_pct`/`mem.peak_pct`, so the two can't drift.
+    // how hard the host was driven ON AVERAGE. The peaks live only in the
+    // nested blocks (`cpu.peak_pct`, `mem.peak_pct`); there is no
+    // top-level mirror.
     //
     // (#2108) `power`/`thermal`/`energy_mwh` join them when the host probe
     // could read those sources. They answer a question the percentages
@@ -6915,9 +6894,6 @@ fn enrich_envelope_with_summary(
             "gpu": metric_json(&stats.gpu),
             "samples": stats.samples,
             "sample_interval_ms": stats.sample_interval_ms,
-            // Deprecated top-level aliases — see the comment above.
-            "peak_cpu_pct": stats.cpu.peak_pct,
-            "peak_mem_pct": stats.mem.peak_pct,
         });
         // (#2108) Power, thermal and energy — each present only when the
         // probe actually read that source on this host, for the same reason
@@ -7047,7 +7023,6 @@ pub(crate) fn read_out_dir_text_with(out_dir: &Path, rel: &str, sink: &dyn Fn(&s
 fn envelope_metrics(
     fold: &darkmux_trajectory::TrajectoryFold,
     model: &str,
-    resume_seed: darkmux_trajectory::CheckpointCounts,
 ) -> serde_json::Value {
     serde_json::json!({
         "model": model,
@@ -7062,8 +7037,6 @@ fn envelope_metrics(
         "rest_ms": fold.rest_ms(),
         "rests": fold.rest_count(),
         "turn_delay_effective_ms": fold.complete.as_ref().and_then(|c| c.turn_delay_effective_ms),
-        "cumulative_turns": resume_seed.cumulative_turns(fold),
-        "cumulative_compactions": resume_seed.cumulative_compactions(fold),
     })
 }
 
@@ -7591,7 +7564,6 @@ fn build_dispatch_complete_payload(
     stderr: &str,
     exit_code: i32,
     summary: &TrajectorySummary,
-    resume_seed: darkmux_trajectory::CheckpointCounts,
     remote_endpoint_raw_label: Option<&str>,
     host_stats: &HostStats,
     host_extras: &HostExtras,
@@ -7606,7 +7578,6 @@ fn build_dispatch_complete_payload(
     // records carry, one per call.
     let fold = &summary.fold;
     let mut payload = serde_json::json!({
-        "runtime": "internal",
         "wall_ms": wall_ms,
         // (#2094) Surfaced NEXT TO wall_ms: a rested run's wall clock must
         // never be misread as a slow model.
@@ -7653,14 +7624,6 @@ fn build_dispatch_complete_payload(
         // provider-scoped; consumers must not derive one from the other.
         "reasoning_tokens": fold.tokens.reasoning,
         "cached_tokens": fold.tokens.cached,
-        // (#2263) The WHOLE task's counts across every resume, by the one
-        // rule (`CheckpointCounts`): the turns are the later of the
-        // checkpoint's count and the last `seq` this run recorded (a
-        // max-of-seq, not a sum), the compactions the checkpoint's plus this
-        // run's. Equal to `total_turns`/`total_compactions` for a run that
-        // was never resumed.
-        "cumulative_turns": resume_seed.cumulative_turns(fold),
-        "cumulative_compactions": resume_seed.cumulative_compactions(fold),
     });
     // (#1187 follow-up) Same field, same reason as `dispatch_start_payload` —
     // parity with `dispatch_remote`'s completion record, and needed by any
@@ -8277,7 +8240,7 @@ fn run_telemetry_sampler(
             Some(payload),
         ));
     };
-    let emit = |source: &str, action: darkmux_flow::FlowAction, payload: serde_json::Value| {
+    let emit = |source: darkmux_flow::FlowSource, action: darkmux_flow::FlowAction, payload: serde_json::Value| {
         let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
             darkmux_flow::Level::Info,
             action,
@@ -8382,7 +8345,7 @@ fn run_telemetry_sampler(
         // `LmsTelemetryTracker::tick` so they are unit-testable without a
         // live `lms` or a live flow sink. Nothing but the wiring is here.
         lms_tracker.tick(&darkmux_profiles::lms::list_loaded, &|payload| {
-            emit("lms", darkmux_flow::FlowAction::TelemetryLms, payload)
+            emit(darkmux_flow::FlowSource::Lms, darkmux_flow::FlowAction::TelemetryLms, payload)
         });
 
         // Host system load — CPU / RAM / GPU utilization%, plus (#2108) the
@@ -8476,7 +8439,7 @@ fn run_telemetry_sampler(
                         let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
                             darkmux_flow::Level::Warn,
                             darkmux_flow::FlowAction::ThermalStopUnresolved,
-                            "thermal",
+                            darkmux_flow::FlowSource::Thermal,
                             &role_id,
                             &session,
                             &execution,
@@ -8510,7 +8473,7 @@ fn run_telemetry_sampler(
                     if state == "critical" {
                         let trip_wall = SystemTime::now();
                         tier5_eject_on_critical(&host_out, trip_wall, &|action, payload| {
-                            emit("thermal", action, payload)
+                            emit(darkmux_flow::FlowSource::Thermal, action, payload)
                         });
                     }
                 }
@@ -8595,7 +8558,7 @@ fn run_telemetry_sampler(
                         let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
                             darkmux_flow::Level::Warn,
                             darkmux_flow::FlowAction::ThermalStopUnresolved,
-                            "thermal",
+                            darkmux_flow::FlowSource::Thermal,
                             &role_id,
                             &session,
                             &execution,
@@ -8662,7 +8625,7 @@ fn run_telemetry_sampler(
                     let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
                         darkmux_flow::Level::Warn,
                         darkmux_flow::FlowAction::BatteryPauseUnsupported,
-                        "battery",
+                        darkmux_flow::FlowSource::Battery,
                         &role_id,
                         &session,
                         &execution,
@@ -9058,9 +9021,11 @@ struct LiveChannel {
 
 /// (#2928) The live channel's own cost for one execution, stamped on its
 /// `dispatch complete` record as `payload.live` so the observer's cost is a
-/// number in the artifact rather than an assumption. `sampler_us` is ALL the
+/// number in the artifact rather than an assumption. `sampler_ms` is ALL the
 /// time the channel spent on this execution (building each chunk's sample,
-/// the sampler's decision, and the sends); `forward_us` is the sends' share.
+/// the sampler's decision, and the sends); `forward_ms` is the sends' share.
+/// Both are counted in microseconds and written as fractional milliseconds,
+/// like every other duration on the wire.
 /// Drops are split by cause: `dropped_no_receiver` (no daemon, or a stale
 /// socket nobody reads) and `dropped_full` (a daemon too slow to drain).
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -9086,8 +9051,8 @@ impl LiveSummary {
             "samples_sent": self.samples_sent,
             "dropped_no_receiver": self.dropped_no_receiver,
             "dropped_full": self.dropped_full,
-            "sampler_us": self.sampler_us,
-            "forward_us": self.forward_us,
+            "sampler_ms": self.sampler_us as f64 / 1_000.0,
+            "forward_ms": self.forward_us as f64 / 1_000.0,
             "bytes": self.bytes,
         })
     }
@@ -9565,7 +9530,7 @@ impl TailerState {
                 // (#557 slice 3) Per-turn context-window occupancy: the exact
                 // prompt-token count and the configured n_ctx, as the
                 // sawtooth the viewer draws.
-                self.emit_telemetry("context", darkmux_flow::FlowAction::TelemetryContext, serde_json::json!({
+                self.emit_telemetry(darkmux_flow::FlowSource::Context, darkmux_flow::FlowAction::TelemetryContext, serde_json::json!({
                     "used": c.used,
                     "max": c.max,
                     "threshold": self.compaction_threshold,
@@ -9635,7 +9600,7 @@ impl TailerState {
             self.endpoint.as_deref().unwrap_or_default(),
             self.endpoint_id.as_deref(),
         );
-        self.emit_telemetry("tokens", darkmux_flow::FlowAction::TelemetryTokens, tokens_payload);
+        self.emit_telemetry(darkmux_flow::FlowSource::Tokens, darkmux_flow::FlowAction::TelemetryTokens, tokens_payload);
     }
 
     /// A tool call ran: its record, the finding or mod it emitted, and
@@ -9705,7 +9670,7 @@ impl TailerState {
             &job_id,
             &model,
             Some(&self.session.wire()),
-            self.inactivity_secs,
+            self.inactivity_secs.saturating_mul(1_000),
             c.ts,
         );
         payload["generation"] = serde_json::json!(c.generation);
@@ -9720,7 +9685,7 @@ impl TailerState {
             &execution,
             COMPACTOR_ROLE,
             Some(&model).filter(|m| !m.is_empty()).map(String::as_str),
-            crate::usage::UTILITY_SOURCE,
+            darkmux_flow::FlowSource::Utility,
             darkmux_flow::FlowAction::UtilityStart,
             payload,
         );
@@ -9763,7 +9728,7 @@ impl TailerState {
             &execution,
             COMPACTOR_ROLE,
             model.as_deref(),
-            crate::usage::USAGE_SOURCE,
+            darkmux_flow::FlowSource::Tokens,
             darkmux_flow::FlowAction::TelemetryTokens,
             payload,
         );
@@ -9789,7 +9754,7 @@ impl TailerState {
         // (#557 slice 3) The drop in the context-occupancy sawtooth: the exact
         // prompt-token count that triggered it, and a chars/4 estimate of the
         // compacted buffer.
-        self.emit_telemetry("compaction", darkmux_flow::FlowAction::TelemetryCompaction, serde_json::json!({
+        self.emit_telemetry(darkmux_flow::FlowSource::Compaction, darkmux_flow::FlowAction::TelemetryCompaction, serde_json::json!({
             "from": c.tokens_before,
             "to": c.tokens_after,
             "compactor_model": self.compactor_model,
@@ -9894,7 +9859,7 @@ impl TailerState {
     fn on_detector(&mut self, event: &darkmux_trajectory::TrajectoryEvent) {
         if let Some(payload) = detector_telemetry_payload(event) {
             self.summary.detections.push(payload.clone());
-            self.emit_telemetry("detector", darkmux_flow::FlowAction::TelemetryDetector, payload);
+            self.emit_telemetry(darkmux_flow::FlowSource::Detector, darkmux_flow::FlowAction::TelemetryDetector, payload);
         }
     }
 
@@ -10179,7 +10144,7 @@ impl TailerState {
     /// `emit` but routes through `build_telemetry_record` so the record
     /// lands under `category=telemetry` with a caller-supplied `source`
     /// (`"detector"`, `"runtime"`, …) the observability viewer keys on.
-    fn emit_telemetry(&self, source: &str, action: darkmux_flow::FlowAction, payload: serde_json::Value) {
+    fn emit_telemetry(&self, source: darkmux_flow::FlowSource, action: darkmux_flow::FlowAction, payload: serde_json::Value) {
         self.emit_telemetry_as(&self.execution, &self.role_id, Some(&self.model), source, action, payload);
     }
 
@@ -10193,7 +10158,7 @@ impl TailerState {
         execution: &ExecutionId,
         role_id: &str,
         model: Option<&str>,
-        source: &str,
+        source: darkmux_flow::FlowSource,
         action: darkmux_flow::FlowAction,
         mut payload: serde_json::Value,
     ) {
@@ -10293,7 +10258,6 @@ impl<'a> Chunk<'a> {
 /// "writing", so absence is the other reading.
 fn heartbeat_payload(c: &Chunk<'_>) -> serde_json::Value {
     let mut payload = serde_json::json!({
-        "runtime": "internal",
         "turn_seq": c.seq,
         "partial_index": c.partial_index,
         "cumulative_chars": c.cumulative_chars,
@@ -10316,7 +10280,6 @@ fn heartbeat_payload(c: &Chunk<'_>) -> serde_json::Value {
 /// sum.
 fn opening_heartbeat_payload(s: &darkmux_trajectory::StreamingStart) -> serde_json::Value {
     serde_json::json!({
-        "runtime": "internal",
         "turn_seq": s.seq,
         "cumulative_chars": 0,
         "sampled_at_ms": s.ts,

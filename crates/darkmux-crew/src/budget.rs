@@ -74,11 +74,10 @@ use darkmux_types::execution_id::ExecutionId;
 use darkmux_types::session_id::SessionId;
 use darkmux_types::{BudgetPolicy, ModelEndpoint, WindowBudget};
 
-/// The flow-record telemetry `source` every budget record carries. The
-/// actions are `FlowAction::Budget*`: `budget.warn` (level Warn),
-/// `budget.wait` (Warn, carries when it will resume), `budget.resume` (Info,
-/// carries how long it waited) and `budget.stop` (Warn).
-pub const BUDGET_SOURCE: &str = "budget";
+// Every budget record carries `FlowSource::Budget`. The actions are
+// `FlowAction::Budget*`: `budget.warn` (level Warn), `budget.wait` (Warn,
+// carries when it will resume), `budget.resume` (Info, carries how long it
+// waited) and `budget.stop` (Warn).
 
 /// The longest single sleep while waiting: the wait re-reads the window
 /// (and the endpoint's limits, so a raised or switched-off budget releases
@@ -527,7 +526,7 @@ fn parse_entry(line: &[u8]) -> Option<(String, i64, Spend)> {
     let v = darkmux_flow::reader::parse_value(std::str::from_utf8(line).ok()?)?;
     let amount = crate::usage::usage_contribution(&v)?;
     let id = crate::usage::payload_of(&v).get("endpoint_id")?.as_str()?.to_string();
-    let ts = crate::records_emitted::parse_ts_secs(v.get("ts")?.as_str()?)?;
+    let ts = darkmux_flow::parse_ts_utc(v.get("ts")?.as_str()?)?;
     // `total` is the record's full total when known, else the halves it
     // reported; `spend` says which.
     Some((id, ts, Spend { known: amount.total, metered: amount.spend.is_some() }))
@@ -624,7 +623,7 @@ fn status_at(path: &Path) -> Option<String> {
 pub fn run_stop_reason(mission_id: Option<&str>, phase_id: Option<&str>) -> Option<String> {
     let mid = mission_id?;
     if let Some(status) = status_at(&crate::lifecycle::mission_path(mid)) {
-        if matches!(status.as_str(), "aborted" | "finalized" | "closed") {
+        if matches!(status.as_str(), "aborted" | "finalized") {
             return Some(format!("mission `{mid}` is {status}"));
         }
     }
@@ -885,7 +884,7 @@ fn record(
     crate::dispatch::build_telemetry_record(
         level,
         action,
-        BUDGET_SOURCE,
+        darkmux_flow::FlowSource::Budget,
         caller.role_id.unwrap_or("budget"),
         caller.session,
         caller.execution,
@@ -989,8 +988,8 @@ fn announce_wait(
             "limit": br.limit,
             "unmetered_calls": br.unmetered,
             "period": b.period,
-            "resume_at": resume_at.map(darkmux_flow::ts_utc_at),
-            "wait_seconds": resume_at.map(|r| (r - now).max(0)),
+            "resume_at_ms": resume_at.map(|r| r.saturating_mul(1_000)),
+            "wait_ms": resume_at.map(|r| (r - now).max(0).saturating_mul(1_000)),
             "pid": std::process::id(),
             "message": message,
         }),
@@ -1390,8 +1389,8 @@ pub fn active_waits(dir: &Path, now: i64, lookback_secs: u64, alive: &dyn Fn(u32
                 return None;
             }
             let p = crate::usage::payload_of(&v);
-            let resume_at = p.get("resume_at").and_then(|x| x.as_str()).map(str::to_string);
-            let resume_secs = resume_at.as_deref().and_then(crate::records_emitted::parse_ts_secs);
+            let resume_secs = p.get("resume_at_ms").and_then(|x| x.as_i64()).map(|ms| ms.div_euclid(1_000));
+            let resume_at = resume_secs.map(darkmux_flow::ts_utc_at);
             if resume_secs.is_some_and(|r| r + 1 < now) {
                 return None;
             }

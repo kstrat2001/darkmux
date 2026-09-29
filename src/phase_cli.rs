@@ -37,7 +37,7 @@ pub(crate) fn build_review_record(
     crate::flow::FlowRecord {
         tier,
         phase_id: phase_id.map(String::from),
-        source: Some("phase_review".to_string()),
+        source: Some(darkmux_flow::FlowSource::PhaseReview),
         ..crate::flow::FlowRecord::for_session(session, level, category, stage, action, handle)
     }
 }
@@ -505,7 +505,7 @@ pub(crate) fn phase_review_output_at(
     bookend.emit_now(build_review_record(
         crate::flow::Level::Info,
         crate::flow::Category::Machinery,
-        crate::flow::Tier::Local,
+        crate::flow::Tier::Darkmux,
         crate::flow::Stage::Review,
         darkmux_flow::FlowAction::PhaseReviewDispatch,
         session_id.wire(),
@@ -523,7 +523,7 @@ pub(crate) fn phase_review_output_at(
                 build_review_record(
                     crate::flow::Level::Error,
                     crate::flow::Category::Machinery,
-                    crate::flow::Tier::Local,
+                    crate::flow::Tier::Darkmux,
                     crate::flow::Stage::Review,
                     darkmux_flow::FlowAction::PhaseReviewFailed,
                     truncate(&format!("{e}"), 200),
@@ -826,7 +826,7 @@ mod tests {
         let record = crate::phase_cli::build_review_record(
             crate::flow::Level::Error,
             crate::flow::Category::Machinery,
-            crate::flow::Tier::Local,
+            crate::flow::Tier::Darkmux,
             crate::flow::Stage::Review,
             darkmux_flow::FlowAction::PhaseReviewFailed,
             "openclaw exit 1".to_string(),
@@ -837,7 +837,7 @@ mod tests {
         let json = serde_json::to_value(&record).unwrap();
         assert_eq!(json["level"], "error");
         assert_eq!(json["category"], "machinery");
-        assert_eq!(json["tier"], "local");
+        assert_eq!(json["tier"], "darkmux");
         assert_eq!(json["stage"], "review");
         assert_eq!(json["action"], "phase.review.failed");
         assert_eq!(json["source"], "phase_review");

@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { daySummary, missionSummary, missionsHeader, CATALOG_MISSION_CAP } from "./format";
-import type { FlowDay, FlowMissionSummary } from "../../types/handwritten";
+import type { FlowDay } from "../../types/generated/FlowDay";
+import type { FlowMissionSummary } from "../../types/generated/FlowMissionSummary";
 
 function day(overrides: Partial<FlowDay> = {}): FlowDay {
   return { date: "2026-08-08", records: 10, dispatches: 2, missions: [], ...overrides };

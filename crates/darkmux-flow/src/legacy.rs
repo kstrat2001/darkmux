@@ -1,4 +1,4 @@
-//! Pre-4.0 action spellings, and the one read-side upgrade that maps them.
+//! Pre-4.0 spellings, and the one read-side upgrade that maps them.
 //!
 //! Flow archives are append-only and never rewritten, so a 3.x day file
 //! still holds the spellings 4.0 retired: the spaced bookends
@@ -15,7 +15,8 @@
 //! execution written before 4.0 names none, and [`stamp_execution`] gives
 //! it the one synthesized identity.
 
-use crate::{Bookend, FlowAction, Grain};
+use crate::{Bookend, FlowAction, FlowSource, Grain, Tier};
+use serde_json::Value;
 
 /// Read one wire string as it appears in a record of ANY age: a current
 /// spelling, an old spelling of a current action (upgraded), a retired
@@ -150,6 +151,30 @@ pub const OLD_SPELLINGS: &[(&str, FlowAction)] = &[
     ("catch", FlowAction::OperatorCatch),
 ];
 
+/// Every old scope spelling and the scope it is now: the Sprint→Phase
+/// rename, as a glob's first segment (`sprint *` is `phase.*`).
+pub const OLD_SCOPES: &[(&str, &str)] = &[("sprint", "phase")];
+
+/// Every old spelling of a current `source`, and the source it now is. The
+/// `kebab-case` and `sprint_*` spellings are the ones the closed
+/// [`FlowSource`] retired; `process` was the per-dispatch host sampler's,
+/// whose records are host telemetry. A source with no entry here (a retired
+/// launcher's, or a newer build's) is left as written and reads as
+/// [`FlowSource::Unknown`].
+pub const OLD_SOURCES: &[(&str, FlowSource)] = &[
+    ("host-sampler", FlowSource::HostSampler),
+    ("presence-reconciler", FlowSource::PresenceReconciler),
+    ("cmd-gate-audit", FlowSource::CmdGateAudit),
+    ("sprint_lifecycle", FlowSource::PhaseLifecycle),
+    ("sprint_review", FlowSource::PhaseReview),
+    ("frontier-orchestrator", FlowSource::Frontier),
+    ("process", FlowSource::Host),
+];
+
+/// Every old spelling of a current `tier`: it named where the model ran, and
+/// every record darkmux itself wrote said `local`, hosted endpoints included.
+pub const OLD_TIERS: &[(&str, Tier)] = &[("local", Tier::Darkmux)];
+
 /// The current action for an old spelling, or `None` when `old` is not one.
 /// Never consulted on write: producers build [`FlowAction`] directly.
 pub fn upgrade_action(old: &str) -> Option<FlowAction> {
@@ -157,6 +182,195 @@ pub fn upgrade_action(old: &str) -> Option<FlowAction> {
         return Some(FlowAction::PhaseReviewVerdict);
     }
     OLD_SPELLINGS.iter().find(|(spelling, _)| *spelling == old).map(|(_, action)| action.clone())
+}
+
+/// How an old payload value becomes the current one.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ValueChange {
+    /// A number (or an array of numbers) times this factor: a duration in a
+    /// coarser or finer unit, now milliseconds.
+    Scale(f64),
+    /// A number (or an array of numbers) divided by this divisor. Where the
+    /// current producer divides (`us as f64 / 1000.0`), dividing here gives
+    /// the same float, which multiplying by the reciprocal does not.
+    Divide(f64),
+    /// An ISO `ts`-shaped string, now epoch milliseconds.
+    IsoToEpochMs,
+}
+
+/// One payload key an action's records spelled another way before 4.0. Time
+/// is `*_ms` for a duration and `*_at_ms` for an instant, in epoch
+/// milliseconds; these were the keys that used seconds, hours, microseconds
+/// or an ISO string.
+#[derive(Debug, Clone, Copy)]
+pub struct PayloadRename {
+    /// The actions whose payload carries the old key.
+    pub actions: &'static [FlowAction],
+    /// The object inside `payload` holding the key, when it is nested.
+    pub within: Option<&'static str>,
+    pub old: &'static str,
+    pub new: &'static str,
+    pub change: ValueChange,
+}
+
+const HOURS_TO_MS: f64 = 3_600_000.0;
+
+/// Every renamed payload key. An old key is renamed on read, its value
+/// converted; a record already carrying the new key is left as it is.
+pub const OLD_PAYLOAD_KEYS: &[PayloadRename] = &[
+    PayloadRename {
+        actions: &[FlowAction::BudgetWait],
+        within: None,
+        old: "wait_seconds",
+        new: "wait_ms",
+        change: ValueChange::Scale(1_000.0),
+    },
+    PayloadRename {
+        actions: &[FlowAction::BudgetWait],
+        within: None,
+        old: "resume_at",
+        new: "resume_at_ms",
+        change: ValueChange::IsoToEpochMs,
+    },
+    PayloadRename {
+        actions: &[FlowAction::UtilityStart],
+        within: None,
+        old: "stall_after_seconds",
+        new: "stall_after_ms",
+        change: ValueChange::Scale(1_000.0),
+    },
+    PayloadRename {
+        actions: &[FlowAction::MachineRollup],
+        within: None,
+        old: "period_seconds",
+        new: "period_ms",
+        change: ValueChange::Scale(1_000.0),
+    },
+    PayloadRename {
+        actions: &[FlowAction::DispatchComplete],
+        within: Some("live"),
+        old: "sampler_us",
+        new: "sampler_ms",
+        change: ValueChange::Divide(1_000.0),
+    },
+    PayloadRename {
+        actions: &[FlowAction::DispatchComplete],
+        within: Some("live"),
+        old: "forward_us",
+        new: "forward_ms",
+        change: ValueChange::Divide(1_000.0),
+    },
+    PayloadRename {
+        actions: &[FlowAction::MachineBatteryHealth],
+        within: None,
+        old: "total_operating_time_hours",
+        new: "total_operating_ms",
+        change: ValueChange::Scale(HOURS_TO_MS),
+    },
+    PayloadRename {
+        actions: &[FlowAction::MachineBatteryHealth],
+        within: None,
+        old: "time_at_soc_hours",
+        new: "time_at_soc_ms",
+        change: ValueChange::Scale(HOURS_TO_MS),
+    },
+];
+
+/// Rename the old payload keys of a record of `action`, in place. Returns
+/// whether it changed anything.
+pub(crate) fn upgrade_payload(record: &mut Value, action: &FlowAction) -> bool {
+    let Some(payload) = record.get_mut("payload") else { return false };
+    let mut changed = false;
+    for rename in OLD_PAYLOAD_KEYS.iter().filter(|r| r.actions.contains(action)) {
+        let holder = match rename.within {
+            Some(key) => payload.get_mut(key),
+            None => Some(&mut *payload),
+        };
+        if let Some(Value::Object(map)) = holder {
+            changed |= rename_key(map, rename);
+        }
+    }
+    changed
+}
+
+/// Move `rename.old` to `rename.new` in `map` with its value converted.
+/// Nothing moves when the new key is already there, or the value has no
+/// reading (it stays under its old key: an archive is not ours to discard).
+fn rename_key(map: &mut serde_json::Map<String, Value>, rename: &PayloadRename) -> bool {
+    if map.contains_key(rename.new) {
+        return false;
+    }
+    let Some(converted) = map.get(rename.old).and_then(|v| convert(v, rename.change)) else {
+        return false;
+    };
+    map.remove(rename.old);
+    map.insert(rename.new.to_string(), converted);
+    true
+}
+
+fn convert(value: &Value, change: ValueChange) -> Option<Value> {
+    match (change, value) {
+        (ValueChange::IsoToEpochMs, Value::String(iso)) => {
+            crate::parse_ts_utc(iso).map(|secs| Value::from(secs.saturating_mul(1_000)))
+        }
+        (ValueChange::IsoToEpochMs, _) => None,
+        (ValueChange::Scale(factor), v) => convert_numbers(v, &|n| n * factor),
+        (ValueChange::Divide(divisor), v) => convert_numbers(v, &|n| n / divisor),
+    }
+}
+
+/// `f` applied to a number, or to every element of an array of numbers.
+fn convert_numbers(value: &Value, f: &dyn Fn(f64) -> f64) -> Option<Value> {
+    match value {
+        Value::Array(items) => items.iter().map(|v| converted(v, f)).collect::<Option<Vec<_>>>().map(Value::Array),
+        v => converted(v, f),
+    }
+}
+
+/// `f` applied to one number: an integer when the result is whole, else a
+/// float. `null` (an absent reading) stays `null`.
+fn converted(value: &Value, f: &dyn Fn(f64) -> f64) -> Option<Value> {
+    if value.is_null() {
+        return Some(Value::Null);
+    }
+    let product = f(value.as_f64()?);
+    if product.fract() == 0.0 && product.abs() < 9.0e15 {
+        Some(Value::from(product as i64))
+    } else {
+        serde_json::Number::from_f64(product).map(Value::Number)
+    }
+}
+
+/// The [`FlowSource`] a wire string is, current or old: a spelling that maps
+/// nowhere is [`FlowSource::Unknown`].
+pub fn read_source(wire: &str) -> FlowSource {
+    let current = serde_json::from_value(Value::String(wire.to_string())).unwrap_or(FlowSource::Unknown);
+    match (current, OLD_SOURCES.iter().find(|(spelling, _)| *spelling == wire)) {
+        (FlowSource::Unknown, Some((_, now))) => *now,
+        (current, _) => current,
+    }
+}
+
+/// Rewrite the retired `source` and `tier` spellings of a record, in place.
+/// Returns whether it changed anything. The action is upgraded separately
+/// ([`upgrade_action`]); this is every other field's old spelling.
+pub(crate) fn upgrade_fields(record: &mut Value) -> bool {
+    let mut changed = rewrite_field(record, "source", |old| {
+        OLD_SOURCES.iter().find(|(spelling, _)| *spelling == old).and_then(|(_, now)| serde_json::to_value(now).ok())
+    });
+    changed |= rewrite_field(record, "tier", |old| {
+        OLD_TIERS.iter().find(|(spelling, _)| *spelling == old).and_then(|(_, now)| serde_json::to_value(now).ok())
+    });
+    changed
+}
+
+/// Replace `record[key]` with `upgrade(old)` when it is a string that has one.
+fn rewrite_field(record: &mut Value, key: &str, upgrade: impl Fn(&str) -> Option<Value>) -> bool {
+    let Some(now) = record.get(key).and_then(Value::as_str).and_then(upgrade) else {
+        return false;
+    };
+    record[key] = now;
+    true
 }
 
 /// The run-grain action a pre-4.0 whole-run bookend now is; `None` for any

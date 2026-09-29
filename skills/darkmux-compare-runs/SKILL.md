@@ -51,4 +51,4 @@ Tell the user the headline: "B was X% faster/slower than A," then add structural
 
 ## Notes
 
-- For multi-run characterization (n=3+) of a single config, use `darkmux-lab-run` with `--runs N` and then summarize all run-ids' inspect outputs. `compare` is for two specific runs, not a distribution.
+- For multi-run characterization (n=3+) of a single config, use `darkmux-lab-run` with `--repeat N` and then summarize all run-ids' inspect outputs. `compare` is for two specific runs, not a distribution.

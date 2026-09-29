@@ -239,9 +239,9 @@ pub struct Run {
     /// the module doc's "untracked" synthesis). `true` for every mission
     /// and lab run — both have a durable artifact on disk.
     pub tracked: bool,
-    /// (#1915) The flow session this row can be drilled into via
-    /// `#dispatch=<id>` (#1974 renamed it from `#session=<id>`; that
-    /// spelling survives as a one-release parser alias) — the SAME
+    /// (#1915) The id this row's dispatch is opened by: the key
+    /// `GET /flow-dispatch/:id` and the viewer's `#dispatch=<id>` route take
+    /// (the retired `#session=<id>` spelling is refused), the SAME
     /// representative-session pick
     /// [`mission_to_run`]/[`flow_mission_to_run`] already make for
     /// role/model/route, now also carried out to the client instead of
@@ -277,7 +277,7 @@ pub struct Run {
     /// record at all). An untracked mission can open its representative
     /// SESSION, never its graph; that limit is structural, not a gap this
     /// field closes. Carrying it uniformly means the client's own rule
-    /// ("untracked and has a `session_id`" — see `runDestination`'s doc)
+    /// ("untracked and has a `dispatch_id`", see `runDestination`'s doc)
     /// never needs a kind-specific carve-out, for missions OR any future
     /// kind that gains the same shape.
     ///
@@ -298,7 +298,7 @@ pub struct Run {
     /// corruption, it does not repair it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
-    pub session_id: Option<String>,
+    pub dispatch_id: Option<String>,
     /// (#1907) Set only when `status == RunStatus::Abandoned` — see
     /// [`AbandonReason`]'s own doc. `RunStatus::Abandoned` alone collapses
     /// "someone ran `mission abort`" and "no terminal record was ever
@@ -848,7 +848,7 @@ fn flow_mission_to_run(
             .or(agg.last_ts.as_deref())
             .and_then(parse_flow_ts),
         tracked: false,
-        session_id,
+        dispatch_id: session_id,
         abandoned_reason,
         tokens: None,
         workload: None,
@@ -1186,7 +1186,7 @@ fn mission_to_run(
         // makes the field's "always populated" contract total for this path.
         updated_ts: completed_ts.or(started_ts).or(Some(mission.created_ts)),
         tracked: true,
-        session_id,
+        dispatch_id: session_id,
         abandoned_reason,
         tokens: None,
         workload: None,
@@ -1690,7 +1690,7 @@ fn lab_summary_to_run(
         // tool-bench's manifest names one that no dispatch ever used. Its own
         // record is what represents it, so it publishes none and keeps its
         // scores page; every other lab run opens the shared session view.
-        session_id: if summary.finished { None } else { summary.session_id.clone() },
+        dispatch_id: if summary.finished { None } else { summary.session_id.clone() },
         abandoned_reason,
         tokens: None,
         workload: summary.workload.clone(),
@@ -2094,7 +2094,7 @@ struct SessionAgg {
     /// budget before its first bookend is a run.
     has_wait: bool,
     /// When the session's open budget wait lapses (epoch ms: its `ts`, plus
-    /// its `wait_seconds`, plus [`BUDGET_WAIT_GRACE_MS`]); `None` while no
+    /// its `wait_ms`, plus [`BUDGET_WAIT_GRACE_MS`]); `None` while no
     /// wait is open.
     wait_until_ms: Option<u64>,
     /// The session's terminal was a `budget.stop` that names why.
@@ -2414,7 +2414,7 @@ fn ghost_runs(
             // is itself a finding (a session-id COLLISION between an
             // orphaned dispatch and a real mission), not a nuisance to
             // silence.
-            session_id: if agg.is_ambiguous() { None } else { Some(session_id.clone()) },
+            dispatch_id: if agg.is_ambiguous() { None } else { Some(session_id.clone()) },
             abandoned_reason,
             tokens: None,
             workload: None,
@@ -2431,7 +2431,7 @@ fn ghost_runs(
 /// [`RUNS_FLOW_SCAN_WINDOW_DAYS`] before now unless `--since` pushed it
 /// earlier (#2902 step 2b). A SEPARATE,
 /// smaller day-file walk rather than extending the shared primitive —
-/// that primitive's OTHER callers (`/flow-mission/:id`, `/flow-session/:id`,
+/// that primitive's OTHER callers (`/flow-mission/:id`, `/flow-dispatch/:id`,
 /// the full-history catalog endpoints) must keep seeing a run's COMPLETE
 /// history; bounding is specific to THIS module's route-resolution/
 /// ghost-synthesis use, not a general flow-reading behavior change that
@@ -2501,57 +2501,14 @@ fn cutoff_date_string(window_days: i64) -> String {
 
 // ─── Timestamp parsing ──────────────────────────────────────────────────────
 
-/// Parse a flow record's `ts` field (`YYYY-MM-DDTHH:MM:SSZ`, second
-/// precision — see `darkmux_flow::schema::ts_utc_now`) into Unix epoch
-/// seconds. Hand-rolled rather than pulling in `chrono`/`time` (CLAUDE.md's
-/// "don't add dependencies casually" — a 10-line inline module beats a
-/// crate for a one-off need) using the Howard Hinnant civil-calendar
-/// algorithm — the inverse of the SAME algorithm `darkmux-flow`'s own
-/// `epoch_to_yyyymmdd` uses in the forward direction (that function is
-/// `pub(crate)` to its own crate, not reachable from here, hence this
-/// independently-tested re-derivation rather than a shared dependency).
-/// Returns `None` on anything that doesn't match the exact fixed-width
-/// shape — a malformed/absent `ts` degrades to "no flow-derived timestamp",
-/// never a panic.
+/// A flow record's `ts` (`YYYY-MM-DDTHH:MM:SSZ`) as Unix epoch seconds, or
+/// `None` for anything else ([`darkmux_flow::parse_ts_utc`], the one
+/// parser). A `ts` before the epoch is `None` too: this side counts unsigned.
 pub(crate) fn parse_flow_ts(ts: &str) -> Option<u64> {
-    let b = ts.as_bytes();
-    if b.len() != 20
-        || b[4] != b'-'
-        || b[7] != b'-'
-        || b[10] != b'T'
-        || b[13] != b':'
-        || b[16] != b':'
-        || b[19] != b'Z'
-    {
-        return None;
-    }
-    let y: i64 = ts.get(0..4)?.parse().ok()?;
-    let mo: i64 = ts.get(5..7)?.parse().ok()?;
-    let d: i64 = ts.get(8..10)?.parse().ok()?;
-    let h: i64 = ts.get(11..13)?.parse().ok()?;
-    let mi: i64 = ts.get(14..16)?.parse().ok()?;
-    let s: i64 = ts.get(17..19)?.parse().ok()?;
-    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || s > 60 {
-        return None;
-    }
-    let days = days_from_civil(y, mo, d);
-    let secs = days * 86_400 + h * 3600 + mi * 60 + s;
-    u64::try_from(secs).ok()
+    darkmux_flow::parse_ts_utc(ts).and_then(|secs| u64::try_from(secs).ok())
 }
 
-/// Days since the Unix epoch for a UTC civil date — Howard Hinnant's
-/// algorithm (public domain); see [`parse_flow_ts`]'s doc for why this is a
-/// local re-derivation rather than a shared crate dependency.
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y / 400 } else { (y - 399) / 400 };
-    let yoe = y - era * 400; // [0, 399]
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1; // [0, 365]
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
-    era * 146_097 + doe - 719_468
-}
-
-/// The inverse of [`days_from_civil`] — a UTC civil date from days since
+/// The inverse of `darkmux_flow::days_from_civil` — a UTC civil date from days since
 /// the Unix epoch (same Howard Hinnant algorithm, public domain). Used by
 /// [`cutoff_date_string`] to format the scan-window boundary as a
 /// `YYYY-MM-DD` day-file-name prefix, and by [`day_string_from_epoch_ms`]
@@ -2684,7 +2641,7 @@ mod tests {
     }
 
     #[test]
-    fn civil_from_days_is_the_exact_inverse_of_days_from_civil() {
+    fn civil_from_days_is_the_exact_inverse_of_flows_days_from_civil() {
         // Round-trip across a range spanning leap years, month-length
         // boundaries, and both eras (#1523 gate scale-cap knob's own
         // machinery) — every date must map to itself through both
@@ -2700,7 +2657,7 @@ mod tests {
             (2027, 1, 1),
         ];
         for &(y, m, d) in cases {
-            let days = days_from_civil(y, m, d);
+            let days = darkmux_flow::days_from_civil(y, m, d);
             let (ry, rm, rd) = civil_from_days(days);
             assert_eq!((ry, rm as i64, rd as i64), (y, m, d), "round-trip failed for {y:04}-{m:02}-{d:02}");
         }
@@ -3733,7 +3690,7 @@ mod tests {
         write_day_file(flows.path(), &today(), &[record("s-today")]);
         write_day_file(flows.path(), &cutoff_date_string(5), &[record("s-five-days-ago")]);
         let ids = |runs: Vec<Run>| -> Vec<String> {
-            runs.into_iter().filter_map(|r| r.session_id.or(Some(r.id))).collect()
+            runs.into_iter().filter_map(|r| r.dispatch_id.or(Some(r.id))).collect()
         };
         let board = ids(build_runs(flows.path(), None, &[]));
         assert!(board.iter().any(|i| i.contains("s-today")), "{board:?}");
@@ -3864,7 +3821,7 @@ mod tests {
             archived: 0,
             degenerate,
             finished,
-            has_funnels: true,
+            has_reviews: true,
             has_events: true,
             session_id: None,
             run_ok: None,
@@ -4030,7 +3987,7 @@ mod tests {
         let mut summary = minimal_lab_summary("live/case-2", false, false);
         summary.session_id = Some("sess-live-2".to_string());
         let run = lab_summary_to_run(&summary, None, FIXTURE_NOW_MS, None);
-        assert_eq!(run.session_id.as_deref(), Some("sess-live-2"));
+        assert_eq!(run.dispatch_id.as_deref(), Some("sess-live-2"));
     }
 
     /// (#2860 review F1) A finished BENCH run (it wrote `scores.json`) has no
@@ -4044,13 +4001,13 @@ mod tests {
         let mut bench = minimal_lab_summary("tool-bench-deep-1", true, false);
         bench.session_id = Some("darkmux-toolbench-1783249302971".to_string());
         let run = lab_summary_to_run(&bench, None, FIXTURE_NOW_MS, None);
-        assert_eq!(run.session_id, None);
+        assert_eq!(run.dispatch_id, None);
 
         // CONTROL: the same run without a bench record keeps its session.
         let mut coding = minimal_lab_summary("refresh-rotation-1", false, false);
         coding.session_id = Some("darkmux-coding-refresh-rotation-1".to_string());
         let run = lab_summary_to_run(&coding, None, FIXTURE_NOW_MS, None);
-        assert_eq!(run.session_id.as_deref(), Some("darkmux-coding-refresh-rotation-1"));
+        assert_eq!(run.dispatch_id.as_deref(), Some("darkmux-coding-refresh-rotation-1"));
     }
 
     /// The inverted case — without it, the test above would pass even if
@@ -4061,7 +4018,7 @@ mod tests {
         let summary = minimal_lab_summary("live/case-3", false, false);
         assert_eq!(summary.session_id, None, "this test's own premise");
         let run = lab_summary_to_run(&summary, None, FIXTURE_NOW_MS, None);
-        assert_eq!(run.session_id, None);
+        assert_eq!(run.dispatch_id, None);
     }
 
     /// (#1907) The staleness-gate `Abandoned` arm (no lifecycle record at
@@ -4767,7 +4724,7 @@ mod tests {
         // (#1915) A ghost row's own id already IS its session id — carried
         // explicitly anyway so the client's drill rule never needs a
         // dispatch-specific "use `id` itself" carve-out.
-        assert_eq!(g.session_id.as_deref(), Some("orphan-sess"));
+        assert_eq!(g.dispatch_id.as_deref(), Some("orphan-sess"));
     }
 
     /// (#1918) By construction a ghost SHOULD never be ambiguous — one row
@@ -4801,7 +4758,7 @@ mod tests {
         let g = &ghosts[0];
         assert_eq!(g.id, "colliding-sess");
         assert_eq!(
-            g.session_id, None,
+            g.dispatch_id, None,
             "an ambiguous session must never be handed out as a drill target, ghost or not: {g:?}"
         );
     }
@@ -4825,7 +4782,7 @@ mod tests {
     fn ghost_runs_a_budget_held_call_is_a_run_before_its_start() {
         let base_ts = "2000-01-01T00:00:00Z";
         let base_ms = parse_flow_ts(base_ts).unwrap() * 1_000;
-        let wait = serde_json::json!({ "ts": base_ts, "action": "budget.wait", "session_id": "held", "payload": { "wait_seconds": 86_000 } });
+        let wait = serde_json::json!({ "ts": base_ts, "action": "budget.wait", "session_id": "held", "payload": { "wait_ms": 86_000_000 } });
         let mut idx = HashMap::new();
         fold_session_record(&mut idx, &wait);
         settle_session_index(&mut idx);
@@ -5327,7 +5284,7 @@ mod tests {
         );
         assert!(runs[0].tracked);
         assert_eq!(
-            runs[0].session_id.as_deref(),
+            runs[0].dispatch_id.as_deref(),
             Some("darkmux-coding-crawl-error-discard-live-1787676109556"),
             "the live session must also ride out on `Run.session_id` itself — the client-side \
              half (`runDestination`, `ui/src/lenses/runs/format.ts`) depends on it to drill a \
@@ -5921,7 +5878,7 @@ mod tests {
         // same string here by construction, the pre-4.0 bookend's own shape —
         // pinned as "the representative session's id" rather than "the
         // mission id" so the two don't get silently conflated).
-        assert_eq!(runs[0].session_id.as_deref(), Some("bookend-mission-1"), "session_id must be the representative (earliest) session's own id: {runs:?}");
+        assert_eq!(runs[0].dispatch_id.as_deref(), Some("bookend-mission-1"), "session_id must be the representative (earliest) session's own id: {runs:?}");
 
         // Ordering is untouched by this fix: start_ts still comes from the
         // EARLIEST session (the bookend), same as before.
@@ -5965,7 +5922,7 @@ mod tests {
         );
         let runs = build_runs(flows.path(), None, &[]);
         let row = runs.iter().find(|r| r.id == "rep-mission").expect("the mission's row");
-        assert_eq!(row.session_id.as_deref(), Some("rep-mission.run"), "{row:?}");
+        assert_eq!(row.dispatch_id.as_deref(), Some("rep-mission.run"), "{row:?}");
         assert_eq!(row.machine.as_deref(), Some("studio"), "{row:?}");
         assert_eq!(row.started_ts, parse_flow_ts("2026-01-01T08:00:00Z"), "{row:?}");
         assert_eq!(row.role.as_deref(), Some("reviewer"), "the role is an execution's, never the run's config id: {row:?}");
@@ -6054,7 +6011,7 @@ mod tests {
         let row = runs.iter().find(|r| r.id == "collision-mission-1").expect("row for collision-mission-1");
         assert!(row.tracked, "this test's own premise: a LOCAL durable mission, tracked: true");
         assert_eq!(
-            row.session_id, None,
+            row.dispatch_id, None,
             "a tracked mission's representative session must ALSO go None when it is ambiguous — the guard is uniform across every population site, not a fleet-only special case: {row:?}"
         );
         // (#2487) Before the fix, `machine` and `started_ts` still read the
@@ -6262,7 +6219,7 @@ mod tests {
 
         // (#1915) The drill target follows the same recovered session.
         assert_eq!(
-            row.session_id.as_deref(),
+            row.dispatch_id.as_deref(),
             Some("crew-dispatch-coder-ambig"),
             "session_id must also recover from the unambiguous coder session: {row:?}"
         );
@@ -6871,7 +6828,7 @@ mod tests {
         );
         let runs = build_runs(flows.path(), Some(lab.path()), &[]);
         let lab_row = runs.iter().find(|r| r.kind == RunKind::Lab).unwrap_or_else(|| panic!("{runs:?}"));
-        assert_eq!(lab_row.session_id.as_deref(), Some("lab-sess-1"));
+        assert_eq!(lab_row.dispatch_id.as_deref(), Some("lab-sess-1"));
         assert_eq!(lab_row.tokens, Some(4200), "the lab row's own session, not its complete");
         assert!(runs.iter().all(|r| r.kind != RunKind::Dispatch), "the session is claimed, no ghost: {runs:?}");
     }
@@ -7065,7 +7022,7 @@ mod tests {
         let row = runs.iter().find(|r| r.id == "review-on-the-hub").unwrap();
         assert!(!row.tracked, "this test's own premise: the row must be untracked");
         assert_eq!(
-            row.session_id.as_deref(),
+            row.dispatch_id.as_deref(),
             Some("peer-session-1"),
             "an untracked mission row must carry its representative session as a drill target, not None: {row:?}"
         );
@@ -7098,7 +7055,7 @@ mod tests {
         let row = runs.iter().find(|r| r.id == "review-on-the-hub").expect("row for review-on-the-hub");
         assert!(!row.tracked, "this test's own premise: the row must be untracked");
         assert_eq!(
-            row.session_id, None,
+            row.dispatch_id, None,
             "a representative session shared by another mission must never be handed out as a drill target, \
              even though the mechanical representative-session pick still succeeds: {row:?}"
         );

@@ -46,7 +46,7 @@
 //! Step's `config.session_id`, rather than letting
 //! `DispatchInternalStepKind`'s own default (the step's session) apply —
 //! that default is right for a mission-graph step, wrong for a top-level
-//! dispatch, whose session the operator can name (`--session-id`).
+//! dispatch, whose session the operator can name (`--name`).
 
 use crate::dispatch::{DispatchOpts, DispatchResult};
 use darkmux_types::session_id::{RunId, SessionId};
@@ -475,7 +475,7 @@ fn spec_fingerprint(opts: &DispatchOpts) -> String {
 
 /// The session a top-level `darkmux dispatch <role>` runs under: an ad-hoc
 /// dispatch of `role_id` in a freshly minted crew-of-one run. `nonce` names
-/// it (the CLI's `--session-id`); `None` mints a fresh one
+/// it (the CLI's `--name`); `None` mints a fresh one
 /// ([`crate::dispatch::fresh_nonce`]).
 pub fn dispatch_session(role_id: &str, nonce: Option<String>) -> SessionId {
     let run = RunId::mission(mint_dispatch_run_id(role_id)).expect("a minted run id is never empty");
@@ -963,10 +963,9 @@ mod tests {
         );
         // The step kind must read back exactly what was written — the two
         // halves of the hand-off asserted against each other, not separately.
-        assert_eq!(
-            crate::brief_refs::from_json(step.config.get("brief_refs")),
-            opts.brief_refs
-        );
+        let read: crate::step_config::DispatchInternalConfig =
+            crate::step_config::load(&step, crate::step_config::ConfigKind::DispatchInternal).unwrap();
+        assert_eq!(read.brief_refs.unwrap_or_default(), opts.brief_refs);
     }
 
     #[serial_test::serial]

@@ -29,12 +29,12 @@ import { REPLAY_GRANULARITY_NOTE, useLiveOverlay } from "../../lib/liveChannel";
 import { scopeStateOf, type ScopeState } from "../../lib/scopeMorph";
 import { CLEAN_DETECTORS, runRegions } from "../session/sessionRun";
 import type { BriefEntry, SessionRunView } from "../session/sessionRun";
-import type { FlowRecordsResponse } from "../../types/handwritten";
+import type { FlowRecordsResponse } from "../../types/generated/FlowRecordsResponse";
 
 /**
- * `#session=<id>` — `viewer.html`'s `catalogQuery()` session branch, and
+ * `#dispatch=<id>` — `viewer.html`'s `catalogQuery()` session branch, and
  * `drillSession()`'s destination (the "open →" link on a machine page's run
- * row). Fetches `/flow-session/<id>` the same way `boot()` does, runs it
+ * row). Fetches `/flow-dispatch/<id>` the same way `boot()` does, runs it
  * through `flowToRenderModel` (`lib/flow.ts`) the same way `boot()`'s own
  * `cq` branch does, then renders `runRegions()`'s (`lenses/session/
  * sessionRun.ts`) derivation — the real port of legacy's
@@ -50,7 +50,7 @@ import type { FlowRecordsResponse } from "../../types/handwritten";
  * `innerText` line-break behavior.
  *
  * An EMPTY response is a genuine no-data state (this corpus's own
- * `flow-session-task-list.json` fixture is non-empty, so the parity spec
+ * `flow-dispatch-task-list.json` fixture is non-empty, so the parity spec
  * exercises the populated branch — the empty branch is honest but
  * unexercised by this corpus).
  */
@@ -440,7 +440,6 @@ function SessionPendingHeader({ sessionId }: { sessionId: string }) {
       </h2>
       <div className="track brief-grid">
         <PendingBriefPair label="route" />
-        <PendingBriefPair label="runtime" />
         <PendingBriefPair label="model" />
         <PendingBriefPair label="workspace" />
         <PendingBriefPair label="timing" />
@@ -539,12 +538,12 @@ export function SessionReplay({
   const livePresence = useMemo<Presence>(() => (isLive ? new Set([sessionId]) : NO_PRESENCE), [isLive, sessionId]);
   const policy = useLifecyclePolicy();
 
-  // (#2065) A static build has no `/flow-session/<id>` to reach — the demo's
+  // (#2065) A static build has no `/flow-dispatch/<id>` to reach — the demo's
   // dispatch-row tap 404'd here. Read the committed file instead (the same
   // `queryKeys.staticFlowSrc` slot the playback lens and `useRouteRecords`
   // fill, so this is cache reuse) and slice this session out of it, shaped
   // like the daemon's response so nothing below has to know. The day as
-  // INGESTED, not shaped: `/flow-session` hands back no synthesized rows,
+  // INGESTED, not shaped: `/flow-dispatch` hands back no synthesized rows,
   // and `flowToRenderModel` synthesizes the per-session runtime telemetry
   // row itself — slicing the shaped day would add a second copy the daemon
   // path never has.
@@ -552,7 +551,7 @@ export function SessionReplay({
   const flowSrc = source.flow;
   const query = useQuery({
     queryKey: queryKeys.flowSession(sessionId),
-    queryFn: () => fetchJson<FlowRecordsResponse>(`/flow-session/${encodeURIComponent(sessionId)}`),
+    queryFn: () => fetchJson<FlowRecordsResponse>(`/flow-dispatch/${encodeURIComponent(sessionId)}`),
     enabled: flowSrc === null,
     refetchInterval: shouldPoll ? PRESENCE_POLL_MS : false,
   });
@@ -678,7 +677,7 @@ export function SessionReplay({
   // should not climb toward the staleness window before it admits that. It
   // is deliberately NOT `!isLive` — a session presence never listed at all
   // (a replay, a January run, or a machine with Redis switched off, where
-  // `/fleet/sessions/live` returns an empty set for everything) is not
+  // `/fleet/dispatches/live` returns an empty set for everything) is not
   // evidence of anything. Only the observed transition counts. It decides
   // the clock and the pulse (the activity axis), never the run's status.
   // (Playback parity, Change A) `clockNow` — `playhead ?? wallNow` — is the
@@ -740,7 +739,7 @@ export function SessionReplay({
       <div data-state="error" role="alert">
         <div className="stagehdr">session replay</div>
         <div className="none">
-          couldn't reach /flow-session/{sessionId}
+          couldn't reach /flow-dispatch/{sessionId}
           {session.status !== null ? ` (HTTP ${session.status})` : ""}: {session.message}
         </div>
       </div>

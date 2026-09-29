@@ -444,10 +444,10 @@ describe("budget records (#2902 step 5)", () => {
     ({ ts: "2026-09-27T10:00:00Z", action, category: "telemetry", source: "budget", payload }) as unknown as NormRecord;
 
   it("a wait says what it waits on and for how long, in words, never clock-shaped", () => {
-    expect(recordDetail(rec("budget.wait", { scope: "endpoint", endpoint_id: "azure", wait_seconds: 843 }))).toBe(
+    expect(recordDetail(rec("budget.wait", { scope: "endpoint", endpoint_id: "azure", wait_ms: 843000 }))).toBe(
       "azure: waiting 15m",
     );
-    expect(recordDetail(rec("budget.wait", { scope: "endpoint", endpoint_id: "azure", wait_seconds: 3840 }))).toBe(
+    expect(recordDetail(rec("budget.wait", { scope: "endpoint", endpoint_id: "azure", wait_ms: 3840000 }))).toBe(
       "azure: waiting 1h 4m",
     );
   });
@@ -460,7 +460,7 @@ describe("budget records (#2902 step 5)", () => {
     expect(recordDetail(rec("budget.stop", { endpoint_id: "azure", reason: "mission `m` is aborted" }))).toBe(
       "azure: wait stopped (mission `m` is aborted)",
     );
-    expect(recordObject(rec("budget.wait", { endpoint_id: "azure", wait_seconds: 60 })).text).toBe(
+    expect(recordObject(rec("budget.wait", { endpoint_id: "azure", wait_ms: 60000 })).text).toBe(
       "azure: waiting 1m",
     );
   });

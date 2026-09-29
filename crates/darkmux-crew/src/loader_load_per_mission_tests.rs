@@ -652,3 +652,28 @@
             "the user manifest must win the override"
         );
     }
+
+    #[test]
+    #[serial]
+    fn a_leftover_sprints_dir_and_a_refused_mission_are_said_once_per_process() {
+        // The serve daemon loads both on every poll; the same refused file
+        // must not repeat on each one.
+        let guard = TestCrewRoot::new();
+        seed_mission(guard.path(), "m1");
+        std::fs::create_dir_all(guard.path().join("missions/m1/sprints")).unwrap();
+        let broken = guard.path().join("missions/m2");
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::write(broken.join("mission.json"), r#"{"id": "m2", "closed_ts": 3}"#).unwrap();
+
+        let (mut first, mut second) = (Vec::new(), Vec::new());
+        read_phases(&mut first).unwrap();
+        read_missions(&mut first).unwrap();
+        read_phases(&mut second).unwrap();
+        read_missions(&mut second).unwrap();
+        assert_eq!(first.len(), 2, "one line for the sprints dir, one for the refused mission: {first:?}");
+        assert_eq!(first, second, "each load collects them again");
+
+        assert_eq!(say_once(&first), 2, "the first load says both");
+        assert_eq!(say_once(&second), 0, "the second load says neither");
+        assert_eq!(say_once(&["warning: a different file".to_string()]), 1, "a new problem is still said");
+    }

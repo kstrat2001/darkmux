@@ -51,7 +51,8 @@ pub mod load;
 
 pub use grow::{grow_task, items_from_artifact, GrownFrom};
 pub use inputs::{
-    check_embedded_inputs_collected, check_placeholders_declared, check_supplied_inert_inputs,
+    check_embedded_inputs_collected, check_placeholders_declared, check_resolved_step_configs,
+    check_supplied_inert_inputs,
     find_unsubstituted_braces, substitute_step_config, undeclared_placeholders,
     unreferenced_inputs,
 };
@@ -80,13 +81,12 @@ use std::collections::{BTreeMap, BTreeSet};
 /// (#1619) — additive: [`TaskConfig`] gained the optional `reads` field (the
 /// run-scoped output ledger made nameable).
 ///
-/// Bumped to **"2.1"** (#1684) — additive: [`MissionConfig`] gained the
-/// optional `panel` field ([`PanelConfig`]). Presence of the block is what
-/// makes `darkmux acp` advertise this config as a slash command in the
-/// editor's agent panel — absence means the config stays launch-only
-/// (`darkmux mission launch <id>`), never
-/// panel-visible. `PanelConfig` itself carries `#[serde(flatten)] extras`
-/// overflow (contract 7), so a future sub-field is a minor bump.
+/// Bumped to **"2.1"** (#1684) — additive: [`MissionConfig`] gained an
+/// optional `panel` block that made `darkmux acp` advertise one config as
+/// its own slash command. The block is RETIRED in the 4.0 release
+/// (`PANEL_RETIRED`): the panel runs every launchable config through the
+/// generic `/mission launch <id>`, and a document still carrying `panel` is
+/// refused by the user-file gate and by [`MissionConfig::validate`].
 ///
 /// Bumped to **"2.0"** (#1550 cluster item 2) — a MAJOR bump, not minor:
 /// `TaskConfig::expand`/`ExpansionSpec`/`interpret::LaunchParams::expansions`
@@ -225,10 +225,17 @@ use std::collections::{BTreeMap, BTreeSet};
 /// disabled, an older binary's behavior on one is unchanged, the additive
 /// contract.
 ///
+/// Bumped to **"4.0"** (the 4.0 release), a MAJOR bump, because two changes
+/// break documents that parsed before: the `panel` key (and per-config slash
+/// commands) is refused rather than ignored, and a step's `config` is checked
+/// against its kind's schema at validate time instead of passing through. A
+/// 3.x document naming either now fails its gate, and `darkmux doctor` notes
+/// a user-tier config whose schema major is older than this build's.
+///
 /// Bump discipline (see `CLAUDE.md`'s "Versioning" — same rule, different
 /// data shape): additive field/section → minor; rename/retype/removed
 /// field/new-required-field → major.
-pub const MISSION_CONFIG_SCHEMA: &str = "3.5";
+pub const MISSION_CONFIG_SCHEMA: &str = "4.0";
 
 /// One mission config document — the whole graph SHAPE, as data.
 /// Why a mission config's `gh_verb` key is refused. One text for
@@ -243,11 +250,18 @@ const EXPAND_RETIRED: &str = "REMOVED in schema 2.0 (see MISSION_CONFIG_SCHEMA's
      dropping the fan-out this document expected. Declare the expanded tasks explicitly instead, one TaskConfig \
      per item (the built-in \"review\" config's probe stage is the reference shape, #1512)";
 
+/// Why a mission config's `panel` block is refused. One text for
+/// `MissionConfig::validate` and the unknown-key gate ([`retired_key`]).
+const PANEL_RETIRED: &str = "REMOVED: the editor panel no longer advertises one slash command per config. Every \
+     launchable config runs from the panel as `/mission launch <id>` (and `/mission list` lists them), so a config \
+     carrying the block is refused. Delete the `panel` key; to run this config from the panel, type `/mission launch <id>`";
+
 /// A mission config's retired keys, by path (array indices dropped), for
 /// the unknown-key gate (`darkmux_types::user_files`).
 pub(crate) fn retired_key(path: &str) -> Option<String> {
     match path {
         "gh_verb" => Some(GH_VERB_RETIRED.to_string()),
+        "panel" => Some(PANEL_RETIRED.to_string()),
         "phases.tasks.expand" => Some(EXPAND_RETIRED.to_string()),
         _ => None,
     }
@@ -279,13 +293,6 @@ pub struct MissionConfig {
     /// one" is purely positional).
     #[serde(default)]
     pub phases: Vec<PhaseConfig>,
-    /// (#1684, schema 2.1) Presence of this block is what makes `darkmux
-    /// acp` advertise this config as a slash command in the editor's agent
-    /// panel — `None` (the default; every pre-2.1 document) keeps the
-    /// config launch-only. See [`PanelConfig`]'s own doc for the field(s)
-    /// it carries.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub panel: Option<PanelConfig>,
     /// (#1685, schema 2.3) The `gh`-verb allowlist entry this config
     /// requires — `None` (the default; every config that isn't an
     /// operator-authored GitHub-CLI verb) means no allowlist check applies
@@ -371,50 +378,6 @@ pub fn check_cmd(config: &MissionConfig) -> Option<String> {
     }
 }
 
-/// (#1684, schema 2.1) The panel-advertising block on a [`MissionConfig`].
-/// Presence — not any particular field value — is the signal `darkmux acp`
-/// reads at `session/new` to decide whether to advertise this config's `id`
-/// as a slash command (see `src/acp_panel.rs` in the `darkmux` binary
-/// crate, which enumerates the merged mission-config registry and filters
-/// on `panel.is_some()`).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct PanelConfig {
-    /// A short, UI-facing label for the command palette. `MissionConfig.
-    /// description` is deliberately long-form dev prose (provenance,
-    /// design rationale — see that field's own callers), unsuitable to
-    /// render verbatim in an editor's slash-command list. `None` falls
-    /// back to `MissionConfig.name`, NEVER to `MissionConfig.description`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    /// Optional input hint shown in the editor before the user has typed
-    /// anything after the command name — the ACP `UnstructuredCommandInput`
-    /// hint text. `None` advertises the command with no input hint.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hint: Option<String>,
-    /// (#2050) Whether this command takes any text after its name. `None`
-    /// and `Some(true)` are identical — the command accepts arguments,
-    /// which is every advertised config's behavior before this field
-    /// existed and stays the default for every operator config that never
-    /// sets it. `Some(false)` declares a command that takes none, and the
-    /// radio routing seat's output is held to that: trailing words the
-    /// model carried over are DROPPED rather than forwarded to a command
-    /// that has nowhere to put them (`src/radio.rs`'s
-    /// `validate_router_output`).
-    ///
-    /// **A structured field, deliberately not a reading of `hint`.** The
-    /// built-in `review` config's hint reads `"(no arguments)"`, and
-    /// matching on that string would make one config's prose a load-bearing
-    /// contract every other config would have to spell identically — a
-    /// magic string where a declaration belongs.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub accepts_args: Option<bool>,
-    /// Lenient-on-read overflow (contract 7) — a future sub-field on this
-    /// block is safe to add without another schema bump.
-    #[serde(flatten)]
-    #[schemars(skip)]
-    pub extras: BTreeMap<String, serde_json::Value>,
-}
-
 /// (#1684) The reserved task id a panel-invoked config's task can name in
 /// its own `reads`/`depends_on` to receive the raw text typed after the
 /// command name — never a real document-declared task, always resolved at
@@ -436,6 +399,18 @@ pub struct PanelConfig {
 /// dangling to a check that only knows about the STATIC document, never
 /// this runtime-injected convention.
 pub const PANEL_ARGS_TASK_ID: &str = "__panel_args__";
+
+/// `true` iff `config` receives free text: a task names
+/// [`PANEL_ARGS_TASK_ID`] in its `reads`/`depends_on` and the document
+/// declares no task of that name itself (an explicit declaration wins, see
+/// [`inject_panel_args_task_if_referenced`]). The one derivation of "does
+/// this config take text after its id", read by the injection below, by
+/// `/mission launch`'s argument mapping, and by radio's catalog.
+pub fn takes_panel_args(config: &MissionConfig) -> bool {
+    let tasks = || config.phases.iter().flat_map(|p| p.tasks.iter());
+    let referenced = tasks().any(|t| t.reads.iter().chain(t.depends_on.iter()).any(|r| r == PANEL_ARGS_TASK_ID));
+    referenced && !tasks().any(|t| t.id == PANEL_ARGS_TASK_ID)
+}
 
 /// If any task in `config` names [`PANEL_ARGS_TASK_ID`] (`"__panel_args__"`)
 /// in its own `reads` or `depends_on`, prepend a new phase carrying exactly
@@ -472,17 +447,7 @@ pub const PANEL_ARGS_TASK_ID: &str = "__panel_args__";
 /// explicit declaration under a reserved name wins over the synthetic
 /// default for that name, silently and correctly, with nothing to inject.
 pub fn inject_panel_args_task_if_referenced(config: &mut MissionConfig, args: &str) {
-    let referenced = config
-        .phases
-        .iter()
-        .flat_map(|p| p.tasks.iter())
-        .any(|t| t.reads.iter().chain(t.depends_on.iter()).any(|r| r == PANEL_ARGS_TASK_ID));
-    if !referenced {
-        return;
-    }
-    let already_declared =
-        config.phases.iter().flat_map(|p| p.tasks.iter()).any(|t| t.id == PANEL_ARGS_TASK_ID);
-    if already_declared {
+    if !takes_panel_args(config) {
         return;
     }
     let args_task = TaskConfig {
@@ -582,6 +547,23 @@ pub struct MissionInput {
     #[serde(flatten)]
     #[schemars(skip)]
     pub extras: BTreeMap<String, serde_json::Value>,
+}
+
+impl MissionInput {
+    /// Whether a launch refuses to start until the operator supplies this
+    /// input. `mission_id` is filled by the launcher, so it is never asked
+    /// of the operator; an input whose `required` is absent counts as
+    /// required. The one predicate the launcher's missing-input refusal and
+    /// `mission show`'s listing both read.
+    pub fn is_required_of_operator(&self) -> bool {
+        !self.is_launcher_supplied() && self.required != Some(false)
+    }
+
+    /// The launcher fills this input itself (`mission_id`), so no surface asks
+    /// the operator for it.
+    pub fn is_launcher_supplied(&self) -> bool {
+        self.name == "mission_id"
+    }
 }
 
 /// One phase, as data. `id` is a SUFFIX — the launcher composes the real
@@ -822,8 +804,10 @@ pub struct GrowSpec {
 /// One step, as data. `kind` names a REGISTERED `step_kinds::StepKind` id —
 /// Tier 1 generic (e.g. `"dispatch.internal"`), Tier 2 pattern, or a Tier 3
 /// mission-bespoke id (e.g. `"review.bundle"`, `"mission.worktree"`, #1352).
-/// `config` is kind-specific and opaque to this schema — mirrors
-/// `crew::types::Step.config`'s own flat `serde_json::Value` bag.
+/// `config` is kind-specific: this document type holds it as an open
+/// `serde_json::Value` (mirroring `crew::types::Step.config`), and the
+/// unknown-key gate checks it against the struct `kind` selects
+/// (`crate::step_config`, `ConfigKind`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct StepConfig {
     pub id: String,
@@ -916,6 +900,20 @@ impl std::fmt::Display for ValidationFinding {
 }
 
 impl MissionConfig {
+    /// One error per retired top-level key the document still carries (it
+    /// parses into `extras` and would otherwise be silently inert).
+    fn retired_key_findings(&self) -> Vec<ValidationFinding> {
+        [("gh_verb", GH_VERB_RETIRED), ("panel", PANEL_RETIRED)]
+            .into_iter()
+            .filter(|(key, _)| self.extras.contains_key(*key))
+            .map(|(key, why)| ValidationFinding {
+                severity: FindingSeverity::Error,
+                path: key.to_string(),
+                message: format!("config \"{}\" declares `{key}`, which was {why}", self.id),
+            })
+            .collect()
+    }
+
     /// Semantic validation — SEPARATE from parsing (contract 7): a
     /// lenient-on-read document always PARSES regardless of content; this
     /// is what a caller (`darkmux doctor`, Packet 3's launcher) runs to
@@ -952,13 +950,7 @@ impl MissionConfig {
         // name would silently lose its gate and run UNGATED, with the shell-out
         // it was protecting proceeding as if the operator had allowlisted it.
         // Loud at validate/doctor time, never a runtime surprise.
-        if self.extras.contains_key("gh_verb") {
-            findings.push(ValidationFinding {
-                severity: FindingSeverity::Error,
-                path: "gh_verb".to_string(),
-                message: format!("config \"{}\" declares `gh_verb`, which was {GH_VERB_RETIRED}", self.id),
-            });
-        }
+        findings.extend(self.retired_key_findings());
         if self.name.trim().is_empty() {
             findings.push(ValidationFinding {
                 severity: FindingSeverity::Error,
@@ -1953,7 +1945,6 @@ mod tests {
             schema_version: Some(MISSION_CONFIG_SCHEMA.to_string()),
             inputs: Vec::new(),
             phases,
-            panel: None,
             cmd: None,
             outcome_from: None,
             source_input: None,
@@ -2645,7 +2636,7 @@ mod tests {
         assert_eq!(phase.tasks[2].steps[0].kind, "mission.verify");
 
         assert_eq!(phase.tasks[1].role_id.as_deref(), Some("coder"));
-        assert_eq!(phase.tasks[2].role_id.as_deref(), Some("code-reviewer"));
+        assert_eq!(phase.tasks[2].role_id, None, "mission.verify always dispatches code-reviewer; a role_id there is refused");
 
         // The coder task's description matches the Rust builder's dynamic
         // form with the default role substituted (`dispatch `{role}` into
@@ -2772,24 +2763,20 @@ mod tests {
     }
 
     /// (#2918) The built-in `machine-status` command: what makes "which
-    /// models are loaded?" routable. It is advertised through the SAME
-    /// mechanism every operator command uses (a `panel` block on a mission
-    /// config), so the catalog `radio`/ACP hand the router never grows a
-    /// hand-injected special case. Pinned here: read-only (one
+    /// models are loaded?" routable. Pinned here: read-only (one
     /// `procedural.shell` step that runs `darkmux machine status` through
-    /// `DARKMUX_BIN`, never `machine eject`), takes no arguments, and
-    /// validates with zero error findings so `run_ephemeral` accepts it.
+    /// `DARKMUX_BIN`, never `machine eject`), carries no retired `panel`
+    /// key, and validates with zero error findings so `run_ephemeral`
+    /// accepts it.
     #[test]
-    fn machine_status_builtin_is_a_read_only_procedural_command_the_panel_advertises() {
+    fn machine_status_builtin_is_a_read_only_procedural_config() {
         let cfg = embedded_config("machine-status");
         assert_eq!(cfg.id, "machine-status");
-        let panel = cfg
-            .panel
-            .as_ref()
-            .expect("machine-status must carry a `panel` block, or radio cannot route to it (#2918)");
-        let description = panel.description.as_deref().unwrap_or("").to_ascii_lowercase();
-        assert!(description.contains("loaded"), "the router matches on the panel description: {description}");
-        assert_eq!(panel.accepts_args, Some(false), "`machine status` takes no text after its name");
+        assert!(!cfg.extras.contains_key("panel"), "the retired `panel` block must be gone");
+        assert!(
+            cfg.description.as_deref().unwrap_or("").to_ascii_lowercase().contains("loaded"),
+            "the router matches on the config description"
+        );
 
         let steps: Vec<&StepConfig> =
             cfg.phases.iter().flat_map(|p| p.tasks.iter()).flat_map(|t| t.steps.iter()).collect();
@@ -3087,7 +3074,10 @@ mod tests {
         // whatever `enabled` says — and every shipped document keeps one
         // of each excluded pair disabled, so nothing already shipped
         // changes meaning under this bump either.
-        assert_eq!(MISSION_CONFIG_SCHEMA, "3.5");
+        //
+        // Bumped to "4.0" (MAJOR): the `panel` key is refused and step
+        // `config` is checked, so 3.x documents can now fail their gates.
+        assert_eq!(MISSION_CONFIG_SCHEMA, "4.0");
     }
 
     // ── (#2300) `grow` — the run-time fan-out ────────────────────────────
@@ -3498,116 +3488,38 @@ mod tests {
         assert!(grow_errors(&cfg).is_empty(), "{:?}", grow_errors(&cfg));
     }
 
-    // ── (#1684) `panel` schema field ─────────────────────────────────────
+    // ── the retired `panel` block ─────────────────────────────────────────
 
     #[test]
-    fn a_document_without_panel_still_parses_and_validates_clean() {
-        // Every pre-2.1 document omits `panel` — must parse identically
-        // (contract 5, additive minor) and never trip a validate() error.
-        let cfg = doc(vec![]);
-        assert!(cfg.panel.is_none());
-        assert!(cfg.validate(&[]).is_empty());
-    }
-
-    #[test]
-    fn a_document_with_panel_round_trips_through_json() {
-        let mut cfg = doc(vec![]);
-        cfg.panel = Some(PanelConfig {
-            description: Some("PR view".to_string()),
-            hint: Some("<pr number>".to_string()),
-            accepts_args: Some(false),
-            extras: BTreeMap::new(),
-        });
-        let json = serde_json::to_string(&cfg).unwrap();
-        let back: MissionConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(cfg, back);
-        let panel = back.panel.unwrap();
-        assert_eq!(panel.hint.as_deref(), Some("<pr number>"));
-        // (#2050) The declaration has to survive the wire in both
-        // directions, or `list_panel_commands` resolves a written `false`
-        // back to the permissive default and the enforcement is silently
-        // off for every config that asked for it.
-        assert_eq!(panel.accepts_args, Some(false));
-    }
-
-    #[test]
-    fn panel_with_no_accepts_args_parses_as_unset_rather_than_false() {
-        // (#2050) Unset must stay DISTINGUISHABLE from an explicit
-        // `false`: `src/acp_panel.rs` resolves unset to "accepts
-        // arguments", which is every pre-#2050 config's behavior. A
-        // `bool` here instead of `Option<bool>` would silently flip all of
-        // them to taking no arguments.
+    fn a_document_carrying_a_panel_block_is_refused_naming_the_replacement() {
         let json = r#"{"id":"x","name":"X","panel":{"description":"d"}}"#;
         let cfg: MissionConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(cfg.panel.as_ref().unwrap().accepts_args, None);
-        // And an unset field must not be written back out.
-        let out = serde_json::to_string(&cfg).unwrap();
-        assert!(!out.contains("accepts_args"), "an unset field must stay absent on write: {out}");
+        let findings = cfg.validate(&[]);
+        let hit = findings
+            .iter()
+            .find(|f| f.path == "panel")
+            .expect("a document still declaring `panel` must be flagged");
+        assert_eq!(hit.severity, FindingSeverity::Error);
+        assert!(hit.message.contains("/mission launch <id>"), "{}", hit.message);
     }
 
     #[test]
-    fn panel_with_no_hint_parses_and_round_trips() {
-        // `hint` is itself optional — a config can advertise as a panel
-        // command with no input hint at all.
-        let json = r#"{"id":"x","name":"X","panel":{}}"#;
-        let cfg: MissionConfig = serde_json::from_str(json).unwrap();
-        assert!(cfg.panel.is_some());
-        assert_eq!(cfg.panel.as_ref().unwrap().hint, None);
-        let back = serde_json::to_string(&cfg).unwrap();
-        let cfg2: MissionConfig = serde_json::from_str(&back).unwrap();
-        assert_eq!(cfg, cfg2);
+    fn the_unknown_key_gate_names_the_replacement_for_panel() {
+        let reason = retired_key("panel").expect("`panel` is a retired key");
+        assert!(reason.contains("/mission launch <id>"), "{reason}");
     }
 
     #[test]
-    fn unknown_fields_inside_panel_are_tolerated_lenient_on_read() {
-        // (contract 7) Unrecognized keys inside `panel` overflow into its
-        // own `extras`, never fail parsing — a future sub-field a fresh
-        // binary doesn't know yet is safe.
-        let json = r#"{"id":"x","name":"X","panel":{"hint":"h","futureField":{"a":1}}}"#;
-        let cfg: MissionConfig = serde_json::from_str(json).unwrap();
-        let panel = cfg.panel.expect("panel block present");
-        assert_eq!(panel.hint.as_deref(), Some("h"));
-        assert_eq!(panel.extras.get("futureField"), Some(&serde_json::json!({"a": 1})));
+    fn a_document_without_panel_validates_clean() {
+        assert!(doc(vec![]).validate(&[]).is_empty());
     }
 
     #[test]
-    fn review_builtin_declares_a_panel_block() {
-        // (#1684) `review` picks up panel advertising the same way any
-        // other config would — no more hardcoded single command in
-        // `src/acp.rs`.
-        let cfg = embedded_config("review");
-        let panel = cfg.panel.expect("the built-in review config must declare a panel block");
-        assert!(panel.hint.is_some(), "review's panel block should carry an input hint");
-        // (QA finding) `panel.description` must be a SHORT UI label, never
-        // the ~2KB provenance essay `MissionConfig.description` carries —
-        // that essay is developer-facing prose, not a command-palette
-        // label.
-        let panel_description = panel.description.expect("review's panel block should carry a short description");
-        assert!(
-            panel_description.len() < 120,
-            "panel.description must stay a short UI label, got {} chars: {panel_description}",
-            panel_description.len()
-        );
-        assert_ne!(
-            Some(panel_description),
-            cfg.description,
-            "panel.description must never equal the long-form MissionConfig.description"
-        );
-    }
-
-    #[test]
-    fn panel_description_round_trips_and_is_distinct_from_top_level_description() {
-        let mut cfg = doc(vec![]);
-        cfg.description = Some("a long developer-facing provenance essay".to_string());
-        cfg.panel = Some(PanelConfig {
-            description: Some("Short UI label".to_string()),
-            hint: None,
-            accepts_args: None,
-            extras: BTreeMap::new(),
-        });
-        let json = serde_json::to_string(&cfg).unwrap();
-        let back: MissionConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.panel.as_ref().unwrap().description.as_deref(), Some("Short UI label"));
+    fn every_builtin_config_is_free_of_the_retired_panel_block() {
+        for (id, _) in load::EMBEDDED_MISSION_CONFIGS {
+            let cfg = embedded_config(id);
+            assert!(!cfg.extras.contains_key("panel"), "built-in `{id}` still carries `panel`");
+        }
     }
 
     // ── (#1684 QA finding) reserved `__panel_args__` never dangles ─────

@@ -255,14 +255,14 @@ mod tests {
                 ts: darkmux_flow::ts_utc_now(),
                 level: darkmux_flow::Level::Info,
                 category: darkmux_flow::Category::Work,
-                tier: darkmux_flow::Tier::Local,
+                tier: darkmux_flow::Tier::Darkmux,
                 stage: darkmux_flow::Stage::Dispatch,
                 action: darkmux_flow::FlowAction::DispatchTool,
                 handle: "conformance".to_string(),
                 phase_id: None,
                 session_id: Some("sess-conformance".to_string()),
                 execution_id: Some(darkmux_types::execution_id::ExecutionId::mint()),
-                source: Some("crew_dispatch".to_string()),
+                source: Some(darkmux_flow::FlowSource::CrewDispatch),
                 model: None,
                 reasoning: None,
                 mission_id: None,
@@ -271,8 +271,6 @@ mod tests {
                 prev_hash: None,
                 hash: None,
                 payload: None,
-                work_id: None,
-                attempt: None,
             })
             .expect("the flow write must succeed, or this probe proves nothing");
 

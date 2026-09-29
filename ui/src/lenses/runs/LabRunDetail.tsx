@@ -13,7 +13,8 @@ import {
   labFeedStatusSuffix,
   labBadgeText,
 } from "./labRun";
-import type { LabRunDetailResponse, LabRunEventsResponse } from "../../types/handwritten";
+import type { LabRunDetailResponse } from "../../types/generated/LabRunDetailResponse";
+import type { LabRunEventsResponse } from "../../types/generated/LabRunEventsResponse";
 import { ingest, type NormRecord } from "../../lib/ingest";
 
 /**
@@ -221,7 +222,7 @@ export function LabRunDetail({
   }
 
   const detail = detailQuery.data.data;
-  const env = detail.funnels[0] ?? null;
+  const env = detail.reviews[0] ?? null;
   const scores = detail.scores;
   const pipe = computeLabPipeline(events);
   // (#1434) No task-finished record exists anymore; a run is "finished"

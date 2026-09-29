@@ -19,9 +19,11 @@ describe("parseRoute", () => {
     expect(parseRoute()).toEqual({ kind: "runs", runsKind: "lab", run: null, machine: null });
   });
 
-  it("parses the legacy #lens=lab alias, defaulting kind to lab", () => {
+  // No alias survives: every retired spelling is an UNKNOWN route, never a
+  // silent rewrite to its old meaning.
+  it("#lens=lab is retired: an unknown route naming the raw hash", () => {
     setHash("#lens=lab");
-    expect(parseRoute()).toEqual({ kind: "runs", runsKind: "lab", run: null, machine: null });
+    expect(parseRoute()).toEqual({ kind: "unknown", hash: "lens=lab" });
   });
 
   it("falls back to kind=all for an unrecognized kind value", () => {
@@ -50,9 +52,11 @@ describe("parseRoute", () => {
     expect(parseRoute()).toEqual({ kind: "machine", machine: "studio" });
   });
 
-  it("(#2929) still parses an old #lens=machine&uid=<uid> link, into the same field (lenient read)", () => {
+  it("uid= is retired: an old uid link is an unknown route that withholds the uid, never the local machine", () => {
     setHash("#lens=machine&uid=some-remote-uid");
-    expect(parseRoute()).toEqual({ kind: "machine", machine: "some-remote-uid" });
+    const route = parseRoute();
+    expect(route.kind).toBe("unknown");
+    expect(JSON.stringify(route)).not.toContain("some-remote-uid");
   });
 
   it("parses #lens=console&panel=<id>", () => {
@@ -103,15 +107,15 @@ describe("parseRoute", () => {
     expect(parseRoute()).toEqual({ kind: "console", panelId: "doctor", opts: {} });
   });
 
-  // ── #1911: the mission-status-all alias ───────────────────────────
+  // ── #1911: the mission-status-all alias is retired ────────────────
 
-  it("panel=mission-status-all resolves to mission-status with all forced", () => {
+  it("panel=mission-status-all is no panel: the console shows its activity view, never mission-status", () => {
     setHash("#lens=console&panel=mission-status-all");
-    expect(parseRoute()).toEqual({ kind: "console", panelId: "mission-status", opts: { all: "all" } });
+    expect(parseRoute()).toEqual({ kind: "console", panelId: "", opts: {} });
   });
 
-  it("the alias's forced opt wins over a stray opt.* param claiming otherwise", () => {
-    setHash("#lens=console&panel=mission-status-all&opt.all=recent");
+  it("the unlimited board is mission-status with opt.all=all", () => {
+    setHash("#lens=console&panel=mission-status&opt.all=all");
     expect(parseRoute()).toEqual({ kind: "console", panelId: "mission-status", opts: { all: "all" } });
   });
 
@@ -125,9 +129,11 @@ describe("parseRoute", () => {
     expect(parseRoute()).toEqual({ kind: "dispatch", dispatchId: "abc-123", missionId: null });
   });
 
-  it("(#1974) still parses the legacy #session=<id> alias, so old bookmarks and printed deep links resolve", () => {
+  it("#session=<id> is retired: an unknown route that withholds the id, never the default fleet view", () => {
     setHash("#session=abc-123");
-    expect(parseRoute()).toEqual({ kind: "dispatch", dispatchId: "abc-123", missionId: null });
+    const route = parseRoute();
+    expect(route.kind).toBe("unknown");
+    expect(JSON.stringify(route)).not.toContain("abc-123");
   });
 
   it("carries the run's mission when the link names one (a session id several missions share)", () => {
@@ -135,9 +141,11 @@ describe("parseRoute", () => {
     expect(parseRoute()).toEqual({ kind: "dispatch", dispatchId: "abc-123", missionId: "m-1" });
   });
 
-  it("(#1974) prefers the canonical dispatch= when a malformed hash carries both, so canonicalHash's rewrite is idempotent rather than oscillating", () => {
+  it("a hash carrying both dispatch= and a retired session= is refused, not half-read", () => {
     setHash("#dispatch=canonical&session=legacy");
-    expect(parseRoute()).toEqual({ kind: "dispatch", dispatchId: "canonical", missionId: null });
+    const route = parseRoute();
+    expect(route.kind).toBe("unknown");
+    expect(JSON.stringify(route)).not.toContain("legacy");
   });
 
   it("parses #mission=<id> as the mission-graph lens route (#1868)", () => {
@@ -216,9 +224,6 @@ describe("parseRoute", () => {
   it("lowercases lens= the same way kind= already is, for every real lens", () => {
     setHash("#lens=RUNS");
     expect(parseRoute()).toEqual({ kind: "runs", runsKind: "all", run: null, machine: null });
-
-    setHash("#lens=Lab");
-    expect(parseRoute()).toEqual({ kind: "runs", runsKind: "lab", run: null, machine: null });
 
     setHash("#lens=MACHINE");
     expect(parseRoute()).toEqual({ kind: "machine", machine: null });

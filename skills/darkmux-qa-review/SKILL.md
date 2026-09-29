@@ -53,7 +53,7 @@ RUN_ID="darkmux-qa-review-$(date +%s)-$$"
 
 OUTPUT=$(darkmux dispatch code-reviewer \
   --json \
-  --session-id "$RUN_ID" \
+  --name "$RUN_ID" \
   "QA review request.
 
 Repo: $REPO

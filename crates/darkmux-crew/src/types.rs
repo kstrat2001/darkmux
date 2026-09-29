@@ -237,6 +237,8 @@ pub struct Crew {
 
 /// Status of a mission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "lowercase")]
 pub enum MissionStatus {
     /// A mission that is running or ready to run. `paused` is read as
@@ -247,14 +249,9 @@ pub enum MissionStatus {
     #[default]
     #[serde(alias = "paused")]
     Active,
-    /// Terminal (SUCCESS path). Renamed from `Closed` for 2.0 terminology
-    /// consistency with the `mission finalize` verb (#1463 renamed the
-    /// lifecycle VERB; this rename catches the STATUS up to it). Pre-2.0
-    /// mission.json on disk carries `"status":"closed"` — `alias` accepts
-    /// it on read; every subsequent write emits the canonical
-    /// `"finalized"`, so a mission self-migrates the next time it's
-    /// touched (same pattern as `phase_ids`'s `sprint_ids` alias above).
-    #[serde(alias = "closed")]
+    /// Terminal (SUCCESS path). Named for the `mission finalize` verb. A
+    /// `mission.json` still saying `"status":"closed"` is refused by
+    /// [`crate::retired_state`], never read as this.
     Finalized,
     /// Terminal (FAILURE path). A mission the operator tore down with
     /// `mission abort`, or one reconciled after its process died.
@@ -274,34 +271,31 @@ pub enum MissionStatus {
 
 /// A mission — a named objective tying phases together.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct Mission {
     pub id: String,
     pub description: String,
     #[serde(default)]
     pub status: MissionStatus,
-    /// Sprint→Phase rename read-compat: pre-rename mission JSON on disk
-    /// carries this list under the old key `sprint_ids`. `alias` lets
-    /// serde accept either wire name on read; every subsequent
-    /// `save_json` write emits the canonical `phase_ids` key, so a
-    /// mission self-migrates its field name the next time it's touched.
-    #[serde(default, alias = "sprint_ids")]
+    /// The mission's phases. A `mission.json` still using the pre-rename key
+    /// `sprint_ids` is refused by [`crate::retired_state`], never read as an
+    /// empty list.
+    #[serde(default)]
     pub phase_ids: Vec<String>,
+    #[cfg_attr(feature = "ts-export", ts(type = "number"))]
     pub created_ts: u64,
     /// When the mission first transitioned to `Active`. None until
     /// `mission launch` starts it. Used by the wall-clock UI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(type = "number", optional))]
     pub started_ts: Option<u64>,
     /// When the mission transitioned to `Finalized`. Finalized is
     /// terminal — once set, lifecycle verbs can't move the mission
-    /// elsewhere. Field renamed from `closed_ts` (#1463 terminology
-    /// consistency); `alias` accepts the pre-rename wire name on read,
-    /// every subsequent write emits `finalized_ts`.
-    #[serde(
-        default,
-        rename = "finalized_ts",
-        alias = "closed_ts",
-        skip_serializing_if = "Option::is_none"
-    )]
+    /// elsewhere. A `mission.json` still using the old key `closed_ts` is
+    /// refused by [`crate::retired_state`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(type = "number", optional))]
     pub finalized_ts: Option<u64>,
     /// (#815) The operator's VERBATIM intent (a config's `source_input` key) — the
     /// unabridged prose that was summarized into the
@@ -311,6 +305,7 @@ pub struct Mission {
     /// translation seam from the 2026-06-12 dogfood). None on
     /// hand-authored or pre-#815 missions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
     pub source_input: Option<String>,
     /// (#816) Work-item / ticket id this mission realizes (e.g.
     /// `SAMPLE-4101`), set via the config's `ticket` key. Referenced as
@@ -319,6 +314,7 @@ pub struct Mission {
     /// on ticketless missions — templates referencing `{ticket}` then
     /// fall back to darkmux defaults with a soft warning.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
     pub ticket: Option<String>,
     /// (#1503) The spec this run was launched from — a GROUPING key
     /// (which config + which resolved inputs), never identity. A mission's
@@ -331,6 +327,7 @@ pub struct Mission {
     /// existed, or on a run with no meaningful input spec — they simply read
     /// as ungrouped; no migration needed (lenient-on-read, contract 7).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
     pub spec: Option<MissionSpec>,
     /// (#1810) The machine this mission was minted on, stamped once at
     /// creation from `darkmux_flow::resolve_machine_id()` — the SAME
@@ -367,6 +364,7 @@ pub struct Mission {
     /// therefore many distinct roles, has no single durable value and
     /// stays flow-derived (and therefore windowed) for role.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
     pub machine: Option<String>,
 }
 
@@ -446,6 +444,8 @@ fn has_epoch_segment(id: &str) -> bool {
 /// consolidation-ready: a future dispatch or lab-run record could carry the
 /// same shape as its own grouping key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct MissionSpec {
     /// The mission config id this run was launched from (e.g. `coder-phase`,
     /// `review`).
@@ -462,6 +462,7 @@ pub struct MissionSpec {
     /// every such spec-bearing mission was a launched run, so readers treat
     /// absent as `Builtin`-equivalent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
     pub origin: Option<MissionSpecOrigin>,
     /// A compact fingerprint over the resolved inputs — the blake3 digest
     /// that, pre-#1503, WAS the mission id. Two runs of the same config with
@@ -474,6 +475,8 @@ pub struct MissionSpec {
 /// read (an unrecognized future value deserializes as if absent via the
 /// field's `Option` + default — contract 5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "lowercase")]
 pub enum MissionSpecOrigin {
     /// Launched from the operator's own config (user tier).
@@ -484,6 +487,8 @@ pub enum MissionSpecOrigin {
 
 /// Status of a phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "lowercase")]
 pub enum PhaseStatus {
     #[default]
@@ -507,6 +512,8 @@ pub enum PhaseStatus {
 /// "next runnable phase" scan) is simply `Mission::phase_ids[i - 1]` for
 /// a phase at index `i`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct Phase {
     pub id: String,
     pub mission_id: String,
@@ -521,25 +528,30 @@ pub struct Phase {
     /// `id` (never `description` — a truncated brief reads worse than a
     /// clean id).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
     pub display_name: Option<String>,
     #[serde(default)]
     pub status: PhaseStatus,
+    #[cfg_attr(feature = "ts-export", ts(type = "number"))]
     pub created_ts: u64,
     /// When the phase first transitioned to `Running` (or last transitioned
     /// to `Running` after being `Abandoned` and restarted). None until
     /// `darkmux phase start` runs. Wall-clock UI shows live elapsed when
     /// `status == Running` (now - started_ts).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(type = "number", optional))]
     pub started_ts: Option<u64>,
     /// When the phase transitioned to `Complete`. Complete is terminal —
     /// once set, lifecycle verbs can't move the phase elsewhere. Wall-clock
     /// duration = completed_ts - started_ts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(type = "number", optional))]
     pub completed_ts: Option<u64>,
     /// When the phase transitioned to `Abandoned`. Cleared when the
     /// operator changes their mind and runs `phase start` again — the
     /// state machine treats `Abandoned → Running` as a legal restart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(type = "number", optional))]
     pub abandoned_ts: Option<u64>,
     /// (#1230 Packet 2) IDs of the DAG-native `Task`s that make up this
     /// phase's actual execution graph. Additive-only field — everything
@@ -561,6 +573,8 @@ pub struct Phase {
 /// `PhaseStatus` analog — a Phase either completes or is abandoned by
 /// the operator; a Step can fail its own execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "lowercase")]
 pub enum NodeStatus {
     #[default]
@@ -751,12 +765,8 @@ pub fn default_run_on() -> Vec<String> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
     pub id: String,
-    /// Sprint→Phase rename read-compat: accepts the pre-rename wire key
-    /// `sprint_id` as well as the canonical `phase_id` (see `Mission::phase_ids`'s
-    /// alias for the same rationale). Task/Step storage postdates the rename
-    /// by only a few days (#1230 Packet 2), so this is defensive more than
-    /// load-bearing, but costs nothing to keep consistent.
-    #[serde(alias = "sprint_id")]
+    /// The phase this task belongs to. A task file still using the pre-rename
+    /// key `sprint_id` is refused by [`crate::retired_state`].
     pub phase_id: String,
     pub description: String,
     /// (#1398) Operator-facing short label — same overload split as
@@ -1137,26 +1147,6 @@ mod tests {
                 Capability::AgenticToolUse,
             ],
         );
-    }
-
-    /// Closed→Finalized terminology rename (#1463 lineage): a mission.json
-    /// written by a pre-rename binary carries `"status":"closed"` and
-    /// `"closed_ts"`. Lenient-read must accept both — a mission finalized
-    /// yesterday can't stop deserializing the day this ships. Mirrors the
-    /// `sprint_ids` alias precedent for `phase_ids` above.
-    #[test]
-    fn mission_status_old_shape_closed_deserializes_to_finalized() {
-        let legacy_json = r#"{
-            "id": "m-old",
-            "description": "pre-rename mission",
-            "status": "closed",
-            "phase_ids": [],
-            "created_ts": 1700000000,
-            "closed_ts": 1700000900
-        }"#;
-        let m: Mission = serde_json::from_str(legacy_json).unwrap();
-        assert_eq!(m.status, MissionStatus::Finalized);
-        assert_eq!(m.finalized_ts, Some(1700000900));
     }
 
     /// (#1503) A pre-#1503 mission.json — id derived from an input hash,

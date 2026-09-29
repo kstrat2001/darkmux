@@ -47,7 +47,7 @@ Every mission runs as a live task graph you can watch from any device on your ta
 - 🧪 **The lab.** `darkmux lab run <workload>` captures wall clock, trajectory, and verify outcome on *your* hardware: baseline, change one knob, measure again. The [published findings](https://darklyenergized.substack.com) are re-runnable claims, not anecdotes.
 - 📊 **A fleet you can see.** One live view across every machine: what's loaded, what's running, and how many tokens each endpoint and model used. Phone-ready over your tailnet.
 - 🔒 **Provenance by default.** Every dispatch emits a structured record (machine, model, role, mission). Opt-in BLAKE3 hash-chained audit log with edit detection, cron-friendly (`flow integrity-check` exits 2 on a chain break).
-- 🖥️ **Editor-embedded** *(ships in 2.6)*: darkmux as a Zed agent over ACP — slash-command reviews, sign-off dialogs in the editor, and RADIO, the free-text voice on the console.
+- 🖥️ **Editor-embedded** *(ships in 2.6)*: darkmux as a Zed agent over ACP: `/mission launch review` from the panel, sign-off dialogs in the editor, and RADIO, the free-text voice on the console.
 
 ## What darkmux is for
 

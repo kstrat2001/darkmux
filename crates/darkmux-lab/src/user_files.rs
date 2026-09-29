@@ -44,7 +44,7 @@ fn fixture_retired(path: &str) -> Option<String> {
 pub fn problems(kind: UserFileKind, reach: Reach) -> Vec<FileProblem> {
     match (kind, reach) {
         (UserFileKind::Workload, _) => {
-            check_tiered::<WorkloadManifest>(kind, &workload_docs(), &workload_retired, reach)
+            check_tiered::<WorkloadManifest>(kind, &workload_docs(), &workload_retired, &|_| Vec::new(), reach)
         }
         (UserFileKind::LabFixture, Reach::Effective) => Vec::new(),
         (UserFileKind::LabFixture, Reach::Every) => registered_fixtures()

@@ -71,7 +71,7 @@ describe("labPipelineLines", () => {
     const pipe = computeLabPipeline(normAll([
       { ts: "t", action: "step.result", payload: { step_id: "bundle", items_out: 5 } },
     ]));
-    const lines = labPipelineLines(pipe, { crew: "c", mode: "m", confirmed: 3, needs_check: 1, archived: 0 });
+    const lines = labPipelineLines(pipe, { case_id: "case", crew: "c", mode: "m", confirmed: 3, needs_check: 1, archived: 0 });
     // Only `items_out` was seeded above (no `items_in`) — the em dash marks
     // the absent side, matching `labStageMeta`'s own `itemsIn ?? "—"`.
     expect(lines).toEqual(["bundle", "— → 5", "synthesis", "confirmed 3 · needs_check 1 · archived 0"]);
@@ -107,7 +107,7 @@ describe("labShortId / labFeedTs", () => {
 
 describe("labFeedRowLines", () => {
   it("renders a host-telemetry row as ts/host/cpu-mem-gpu", () => {
-    const r: RawRecord = { ts: "t", category: "telemetry", source: "process", payload: { cpu: 12, mem: 40, gpu: 0 } };
+    const r: RawRecord = { ts: "t", category: "telemetry", source: "host", payload: { cpu: 12, mem: 40, gpu: 0 } };
     expect(labFeedRowLines(norm(r))).toEqual(["t", "host", "cpu 12% · mem 40% · gpu 0%"]);
   });
 
@@ -200,20 +200,20 @@ describe("labCliHint", () => {
   // flags `lab eval` no longer has (clap rejects them). It is rebuilt from
   // what `scores.json` actually records: `role`, `mode`, and the profile.
   it("a strict run names its role, cases dir, and profile", () => {
-    expect(labCliHint({ role: "coder", mode: "strict", provenance: { profile: "fast" } })).toBe(
+    expect(labCliHint({ role: "coder", mode: "strict", profile: "fast" })).toBe(
       "darkmux lab eval coder --cases-dir <cases-dir> --profile fast",
     );
   });
 
   it("an experimental mode keeps the default role and adds its own flags", () => {
     expect(labCliHint({ role: "pr-reviewer", mode: "agentic" })).toBe(
-      "darkmux lab eval --cases-dir <cases-dir> --agentic --workdirs <workdirs-root>",
+      "darkmux lab eval --cases-dir <cases-dir> --mode agentic --workdirs <workdirs-root>",
     );
     expect(labCliHint({ role: "pr-reviewer", mode: "dialectic" })).toBe(
-      "darkmux lab eval --cases-dir <cases-dir> --dialectic --workdirs <workdirs-root>",
+      "darkmux lab eval --cases-dir <cases-dir> --mode dialectic --workdirs <workdirs-root>",
     );
     expect(labCliHint({ role: "pr-reviewer", mode: "freeform" })).toBe(
-      "darkmux lab eval --cases-dir <cases-dir> --freeform",
+      "darkmux lab eval --cases-dir <cases-dir> --mode freeform",
     );
   });
 

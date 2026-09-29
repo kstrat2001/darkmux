@@ -44,6 +44,7 @@ use crate::crawl::plan::{Plan, ReadFileEntry, Site, Unit};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use darkmux_crew::dispatch::{CompactionDispatchArgs, DispatchOpts, DispatchResult};
 use darkmux_crew::rules::{self, Rule};
+use darkmux_crew::step_config::{crawl_identity, load_checked, non_blank, ConfigKind, CrawlUnitConfig};
 use darkmux_crew::step_kinds::{CwdPolicy, Port, SeatClaim, StepKind, StepKindRegistry, StepOutcome, StepRunCtx};
 use darkmux_crew::thermal_governor;
 use darkmux_crew::types::{Step, Task};
@@ -53,8 +54,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-pub const CRAWL_UNIT_KIND: &str = "crawl.unit";
-pub const CRAWL_SUMMARY_KIND: &str = "crawl.summary";
+pub const CRAWL_UNIT_KIND: &str = ConfigKind::CrawlUnit.id();
+pub const CRAWL_SUMMARY_KIND: &str = ConfigKind::CrawlSummary.id();
 
 /// (#2301) CONTENT ids — what a step PRODUCES, checked by whoever reads it.
 /// Separate from the step-kind ids above on purpose: a kind is a thing that
@@ -124,23 +125,6 @@ const MAX_UNIT_MAX_TURNS: u32 = 40;
 /// Default no-progress bound (#2193's "N=8"), overridable per step via
 /// `config.no_progress_turns`; `0` disables the check.
 const DEFAULT_NO_PROGRESS_TURNS: usize = 8;
-
-/// (#2310 fix-loop E2, S5-7) The largest `draws` a unit config may name.
-///
-/// A draw is a WHOLE extra dispatch of the same unit — its own container,
-/// its own turn budget, its own tokens — so `draws` multiplies a run's cost
-/// linearly with nothing else in the pipeline bounding it. A mistyped
-/// `--param draws=80` is not a slightly more expensive run; it is an 80x
-/// one whose first visible symptom is an operator watching the same unit go
-/// round for an hour. Refused at config-parse time
-/// ([`UnitStepConfig::from_step`]) rather than clamped: a silently-lowered
-/// value would make the run's own `draws` a lie, and operator sovereignty
-/// says surface the conflict rather than substitute a judgment.
-///
-/// 8 is the ceiling because the technique this ports (the retired funnel's
-/// k-draw recall) never measured past a handful of draws, and a value above
-/// [`UNIT_DRAWS_WARN_ABOVE`] is already warned about as unusual.
-pub const MAX_UNIT_DRAWS: usize = 8;
 
 /// (#2310 fix-loop E2, S5-7) Above this, `run` warns — the value is legal
 /// and honored, but it is far enough outside the measured range that a
@@ -840,136 +824,31 @@ pub struct UnitStepConfig {
 
 impl UnitStepConfig {
     pub fn from_step(step: &Step) -> Result<Self> {
-        let str_field = |key: &str| -> Result<String> {
-            step.config
-                .get(key)
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.trim().is_empty())
-                .map(String::from)
-                .ok_or_else(|| anyhow!("step `{}`: `{CRAWL_UNIT_KIND}` requires config.{key}", step.id))
-        };
-        let plan = str_field("plan")?;
-        let unit = str_field("unit")?;
-        let rule = step.config.get("rule").and_then(|v| v.as_str()).map(String::from);
-        let no_progress_turns = match step.config.get("no_progress_turns") {
-            Some(v) => usize::try_from(v.as_u64().ok_or_else(|| {
-                anyhow!(
-                    "step `{}`: `{CRAWL_UNIT_KIND}` config.no_progress_turns must be a \
-                     non-negative integer, got {v}",
-                    step.id
-                )
-            })?)
-            .context("no_progress_turns does not fit usize")?,
+        let cfg: CrawlUnitConfig = load_checked(step, ConfigKind::CrawlUnit)?;
+        let plan = cfg.plan;
+        let unit = cfg.unit;
+        let no_progress_turns = match cfg.no_progress_turns {
+            Some(n) => n.as_usize().context("no_progress_turns does not fit usize")?,
             None => DEFAULT_NO_PROGRESS_TURNS,
         };
-        // (#2542 follow-up review) String-or-number, leniently — the same
-        // parse `draws` below uses, for the same reason: a `--param
-        // timeout_seconds=45` reaches step config as a JSON string, never a
-        // number, and `.as_u64()` alone silently read that as absent —
-        // `timeout_override_seconds` stayed `None` and the unit ran
-        // unbounded, the exact failure this field exists to prevent, just
-        // one hop further down the same config-key path #2542 fixed for the
-        // literal-integer form.
-        let timeout_seconds = match step.config.get("timeout_seconds") {
-            None => None,
-            Some(serde_json::Value::Null) => None,
-            // (#2595 review round 2, CONSIDER 6) An unresolved
-            // `{{template}}` (e.g. `"timeout_seconds": "{{unit_timeout}}"`
-            // in a hand-authored `grow.config`, launched without that
-            // param) renders as `""`, not as a missing key — and must read
-            // as ABSENT, matching `str_field`'s and `intent_file`'s own
-            // trim-and-filter convention three lines above/below this one
-            // for the identical shape. Before this, the sibling fields
-            // treated `""` as absent while this one fell through to the
-            // general parse below and errored by name (`must be a positive
-            // integer, got ""`) — a needless refusal for a param the
-            // config author simply didn't supply.
-            Some(serde_json::Value::String(s)) if s.trim().is_empty() => None,
-            Some(v) => {
-                let n = v
-                    .as_u64()
-                    .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "step `{}`: `{CRAWL_UNIT_KIND}` config.timeout_seconds must be a positive \
-                             integer, got {v}",
-                            step.id
-                        )
-                    })?;
-                // (#2542 follow-up review) `0` is refused, not accepted as
-                // "unbounded" or silently accepted as "instant kill": it
-                // resolves straight into `timeout_override_seconds`, which
-                // `effective_inactivity_timeout_seconds` treats as an
-                // already-elapsed inactivity deadline — the host watchdog
-                // kills the unit at its first poll. Mirrors `darkmux
-                // dispatch --timeout`'s own `range(1..)` clap validator
-                // (src/cli.rs, #2480 review blocker 6), which refused `0`
-                // for exactly this reason on the CLI path; a config-file
-                // route to the same field gets the same floor.
-                // (Second-round frontier review of #2610) No upper bound
-                // here, matching the CLI flag's own `1..` — deliberately.
-                // A crawl unit is a whole coding task an operator names in
-                // a mission config; how long that reasonably takes is the
-                // operator's own open-ended call, same as `--timeout`. The
-                // tool-bench workload provider's `taskTimeoutSeconds`
-                // manifest key sets this SAME `timeout_override_seconds`
-                // field but narrows to 30-3600 seconds — see that call
-                // site's own comment for why (one quick per-axis probe
-                // task inside a fixed bench sweep, not an open-ended unit).
-                anyhow::ensure!(
-                    n >= 1,
-                    "step `{}`: `{CRAWL_UNIT_KIND}` config.timeout_seconds must be >= 1 — `0` \
-                     resolves to an already-expired inactivity deadline (an instant kill), not \
-                     'unbounded'. Omit `timeout_seconds` for the standing env/config/600 default, \
-                     or set a real positive bound.",
-                    step.id
-                );
-                Some(u32::try_from(n).unwrap_or(u32::MAX))
-            }
-        };
-        // Empty-string filtered (matches `str_field`'s convention above):
-        // an unresolved `{{intent_file}}` template on a launch with no
+        // A `--param timeout_seconds=45` reaches step config as text, which
+        // `BlankableCount` reads; a blank one (a `{{unit_timeout}}` no param
+        // supplied) reads as ABSENT, matching `plan` and `intent_file`. `0`
+        // was refused when the config loaded (`CrawlUnitConfig`'s rules).
+        let timeout_seconds = cfg.timeout_seconds.and_then(|t| t.0).map(|n| n.saturating_u32());
+        // Empty-string filtered (matches `plan`'s convention above): an
+        // unresolved `{{intent_file}}` template on a launch with no
         // `intent_file` param renders as `""`, which must read as ABSENT,
         // not as a path to read-and-fail-and-warn about on every run.
-        let intent_file = step
-            .config
-            .get("intent_file")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.trim().is_empty())
-            .map(PathBuf::from);
-        // (#2310 P4c-2b) String-or-number, leniently — the same parse
-        // `crawl::plan::parse_sizing_and_no_fetch` uses, for the same
-        // reason: a `--param draws=3` reaches step config as a JSON
-        // string, never a number.
-        let draws = match step.config.get("draws") {
+        let intent_file = non_blank(cfg.intent_file).map(PathBuf::from);
+        // `--param draws=3` reaches step config as text, which `Count`
+        // reads; the floor and the `MAX_UNIT_DRAWS` ceiling were checked on
+        // the PARSED value when the config loaded.
+        let draws = match cfg.draws {
             None => 1,
-            Some(serde_json::Value::Null) => 1,
-            Some(v) => {
-                let n = v
-                    .as_u64()
-                    .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "step `{}`: `{CRAWL_UNIT_KIND}` config.draws must be a positive integer, got {v}",
-                            step.id
-                        )
-                    })?;
-                anyhow::ensure!(n >= 1, "step `{}`: `{CRAWL_UNIT_KIND}` config.draws must be >= 1, got {n}", step.id);
-                // (#2310 fix-loop E2, S5-7) The ceiling, checked on the
-                // PARSED value so the string form (`--param draws=99`,
-                // which is the shape an operator actually types) is capped
-                // identically to the numeric one.
-                anyhow::ensure!(
-                    n <= MAX_UNIT_DRAWS as u64,
-                    "step `{}`: `{CRAWL_UNIT_KIND}` config.draws is {n}, above the cap of {MAX_UNIT_DRAWS} \
-                     — every draw is a whole extra dispatch of this same unit, so this run would cost \
-                     {n}x its own wall clock and tokens. Lower `draws`, or split the work across units.",
-                    step.id
-                );
-                usize::try_from(n).context("draws does not fit usize")?
-            }
+            Some(n) => n.as_usize().context("draws does not fit usize")?,
         };
-        Ok(Self { plan, unit, rule, no_progress_turns, timeout_seconds, intent_file, draws })
+        Ok(Self { plan, unit, rule: cfg.rule, no_progress_turns, timeout_seconds, intent_file, draws })
     }
 }
 
@@ -1092,11 +971,8 @@ fn unit_rule_dir(declared: Option<&str>, rule_ids: &[String]) -> Result<String> 
         !dir.is_empty(),
         "`{CRAWL_UNIT_KIND}`: could not resolve a rule for this unit's on-disk path - `config.rule` is unset and the plan unit names no rule id; refusing rather than reverting to the pre-#2360 colliding `units/<unit_id>` layout"
     );
-    for part in dir.split('+') {
-        ensure!(
-            rules::is_safe_rule_id(part),
-            "`{CRAWL_UNIT_KIND}`: rule id `{part}` (from `{dir}`) is not a safe path component — it must be non-empty, <= 128 chars, never start with `.`, and hold only ascii alphanumerics, `-`, `_`, or `.`"
-        );
+    if let Some(part) = rules::first_unsafe_rule_part(&dir) {
+        bail!("`{CRAWL_UNIT_KIND}`: rule id `{part}` (from `{dir}`) is not a safe path component: {}", rules::SAFE_RULE_ID_SHAPE);
     }
     Ok(dir)
 }
@@ -1934,12 +1810,7 @@ pub fn summarize_mission(mission_id: &str) -> Result<CrawlSummary> {
                 || s.kind == crate::crawl::plan_sites_step::PLAN_SITES_KIND
         }) {
             if step.status != darkmux_crew::types::NodeStatus::Complete {
-                let rule = step
-                    .config
-                    .get("rule")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string)
-                    .unwrap_or_else(|| step.id.clone());
+                let rule = crawl_identity(&step.kind, &step.config).rule.unwrap_or_else(|| step.id.clone());
                 plans_errored.push(rule);
             }
         }
@@ -2168,14 +2039,9 @@ pub fn summarize_mission(mission_id: &str) -> Result<CrawlSummary> {
 /// `units_skipped` earned its own counter in #2454, if `"empty"` turns
 /// out to need one.
 fn errored_row(step: &Step) -> UnitOutcome {
-    let unit = step
-        .config
-        .get("unit")
-        .and_then(Value::as_str)
-        .filter(|u| !u.trim().is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| step.id.clone());
-    let rule = step.config.get("rule").and_then(Value::as_str).map(str::to_string);
+    let identity = crawl_identity(&step.kind, &step.config);
+    let unit = non_blank(identity.unit).unwrap_or_else(|| step.id.clone());
+    let rule = identity.rule;
     UnitOutcome {
         schema_version: UNIT_OUTCOME_SCHEMA_VERSION.to_string(),
         unit,

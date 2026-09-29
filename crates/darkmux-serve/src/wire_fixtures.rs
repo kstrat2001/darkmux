@@ -30,7 +30,11 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::mission_graph::{GraphEdge, GraphNode, MissionGraph, StepRow};
+    use crate::mission_graph::{
+        EdgeKind, GraphEdge, GraphNode, GraphNodeStatus, MissionGraph, NodeKind, PhaseDisplayStatus, StepRow,
+        TaskDisplayStatus,
+    };
+    use darkmux_crew::types::{MissionStatus, NodeStatus};
     use crate::runs::{Run, RunKind, RunStatus};
     use std::path::PathBuf;
 
@@ -163,7 +167,7 @@ mod tests {
             // fixture, and a spec author copying it should see the full
             // wire vocabulary, not infer that `session_id` only ever
             // shows up on an untracked row.
-            session_id: Some("crew-dispatch-pr-reviewer-1785400940-136e76-0".to_string()),
+            dispatch_id: Some("crew-dispatch-pr-reviewer-1785400940-136e76-0".to_string()),
             // (#1907) This exemplar's `status` is `Running`, so `None` here
             // is the honest value — `abandoned_reason` is only ever `Some`
             // alongside `RunStatus::Abandoned` (see that field's own doc).
@@ -197,19 +201,19 @@ mod tests {
     fn mission_graph_wire_shape() {
         let graph = MissionGraph {
             mission_id: "review-1785400940-136e76".to_string(),
-            mission_status: "active",
+            mission_status: MissionStatus::Active,
             nodes: vec![
                 GraphNode {
                     id: "phase-investigate".to_string(),
                     label: "Investigate".to_string(),
-                    kind: "phase",
-                    status: "complete",
+                    kind: NodeKind::Phase,
+                    status: GraphNodeStatus::Phase(PhaseDisplayStatus::Complete),
                     parent_id: None,
                     started_ts: Some(1_785_400_940),
                     completed_ts: Some(1_785_404_428),
                     depth: 0,
                     description: Some("Bundle, probe, dedup".to_string()),
-                    steps: vec![],
+                    steps: None,
                     status_note: None,
                 },
                 GraphNode {
@@ -223,21 +227,21 @@ mod tests {
                     // itself.
                     id: "phase-adjudicate".to_string(),
                     label: "Adjudicate".to_string(),
-                    kind: "phase",
-                    status: "running",
+                    kind: NodeKind::Phase,
+                    status: GraphNodeStatus::Phase(PhaseDisplayStatus::Running),
                     parent_id: None,
                     started_ts: Some(1_785_404_428),
                     completed_ts: None,
                     depth: 1,
                     description: None,
-                    steps: vec![],
+                    steps: None,
                     status_note: None,
                 },
                 GraphNode {
                     id: "task-judge".to_string(),
                     label: "Judge".to_string(),
-                    kind: "task",
-                    status: "running",
+                    kind: NodeKind::Task,
+                    status: GraphNodeStatus::Task(TaskDisplayStatus::Running),
                     // The field a hand-written fixture omitted twice, which is
                     // why the page rendered nothing: steps hang off a TASK.
                     parent_id: Some("phase-adjudicate".to_string()),
@@ -245,12 +249,12 @@ mod tests {
                     completed_ts: None,
                     depth: 0,
                     description: None,
-                    steps: vec![
+                    steps: Some(vec![
                         StepRow {
                             id: "judge-cloud".to_string(),
                             label: "Judge".to_string(),
                             kind: "dispatch.map".to_string(),
-                            status: "complete",
+                            status: NodeStatus::Complete,
                             started_ts: Some(1_785_404_428),
                             completed_ts: Some(1_785_404_600),
                             tokens_final: Some(5_000),
@@ -261,7 +265,7 @@ mod tests {
                             id: "judge-local".to_string(),
                             label: "Judge".to_string(),
                             kind: "dispatch.map".to_string(),
-                            status: "complete",
+                            status: NodeStatus::Complete,
                             started_ts: Some(1_785_404_428),
                             completed_ts: Some(1_785_404_610),
                             tokens_final: Some(3_000),
@@ -275,7 +279,7 @@ mod tests {
                             id: "judge-unknown".to_string(),
                             label: "Judge".to_string(),
                             kind: "dispatch.map".to_string(),
-                            status: "error",
+                            status: NodeStatus::Error,
                             started_ts: Some(1_785_404_428),
                             completed_ts: None,
                             tokens_final: Some(7_000),
@@ -287,22 +291,22 @@ mod tests {
                             id: "verify-planned".to_string(),
                             label: "Verify".to_string(),
                             kind: "dispatch.map".to_string(),
-                            status: "planned",
+                            status: NodeStatus::Planned,
                             started_ts: None,
                             completed_ts: None,
                             tokens_final: None,
                             turns_final: None,
                             model: None,
                         },
-                    ],
+                    ]),
                     status_note: None,
                 },
             ],
             edges: vec![GraphEdge {
-                id: "phase-investigate->phase-adjudicate".to_string(),
-                source: "phase-investigate".to_string(),
-                target: "phase-adjudicate".to_string(),
-                kind: "phase_order",
+                id: "phase-adjudicate->task-judge".to_string(),
+                source: "phase-adjudicate".to_string(),
+                target: "task-judge".to_string(),
+                kind: EdgeKind::Contains,
             }],
             legacy: false,
             note: None,

@@ -23,7 +23,7 @@ function start(s: number, job: string, extra: RawRecord = {}, payload: Record<st
     source: "utility",
     machine_uid: M,
     model: "u4b",
-    payload: { job, model: "u4b", stall_after_seconds: 30, ...payload },
+    payload: { job, model: "u4b", stall_after_ms: 30000, ...payload },
     ...extra,
   });
 }
@@ -93,7 +93,7 @@ describe("machineUtilityJob: the machine's live utility job", () => {
 
   test("a start without a bound takes the default inactivity window", () => {
     const r = start(0, UTILITY_JOB.radio_routing);
-    delete (r.payload as Record<string, unknown>).stall_after_seconds;
+    delete (r.payload as Record<string, unknown>).stall_after_ms;
     expect(machineUtilityJob([r], ms(0) + UTILITY_JOB_DEFAULT_STALL_MS - 1)?.stalled).toBe(false);
     expect(machineUtilityJob([r], ms(0) + UTILITY_JOB_DEFAULT_STALL_MS + 1)?.stalled).toBe(true);
   });

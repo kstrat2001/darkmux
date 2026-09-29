@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
 import { attributionLine, limitDescription, notLocalMessage, overPriceHint, perModelScale, stampLine, utilityModelId } from "./memoryLedgerLines";
-import type { MachineResources, MachineResourcesModel, MachineSpecs } from "../../types/handwritten";
+import type { MachineResourcesResponse } from "../../types/generated/MachineResourcesResponse";
+import type { ModelRow } from "../../types/generated/ModelRow";
+import type { MachineSpecsResponse } from "../../types/generated/MachineSpecsResponse";
 
 // #1806 Stage 1 refactored the health region's text builders from one flat
 // `healthLines()` array into granular exports; #1806 Stage 2/3 (the
@@ -12,7 +14,7 @@ import type { MachineResources, MachineResourcesModel, MachineSpecs } from "../.
 // still reads verbatim: the utility-tier lines, the limit-source wording,
 // the attribution/stamp footer, and the shared per-model scale.
 
-function machineResources(overrides: Partial<MachineResources> = {}): MachineResources {
+function machineResources(overrides: Partial<MachineResourcesResponse> = {}): MachineResourcesResponse {
   return {
     schema_version: "1.0",
     generated_at_ms: 1,
@@ -22,15 +24,16 @@ function machineResources(overrides: Partial<MachineResources> = {}): MachineRes
     pool: { capacity_bytes: 137438953472, used_bytes: 69300000000, available_bytes: 72000000000, free_bytes: 3738599424 },
     pressure: { swap_used_bytes: 5453843005, compressor_bytes: 890290176, margin_percent: 88, red: false },
     models: [],
-    machine: { potential_bytes: 24565385183, unpriced_models: 0, estimated_models: 0, current_bytes: 19506757632, state: "green" },
+    machine: { potential_bytes: 24565385183, unpriced_models: 0, estimated_models: 0, over_price_models: 0, other_used_bytes: null, projected_total_bytes: null, current_bytes: 19506757632, state: "green" },
     attribution: "per_process",
+    attribution_note: "",
     messages: [],
     cache_ttl_ms: 2000,
     ...overrides,
   };
 }
 
-function model(overrides: Partial<MachineResourcesModel> = {}): MachineResourcesModel {
+function model(overrides: Partial<ModelRow> = {}): ModelRow {
   return {
     identifier: "darkmux:qwen3.6-35b-a3b-turboquant-mlx",
     model_key: "qwen3.6-35b-a3b-turboquant-mlx",
@@ -64,7 +67,7 @@ function model(overrides: Partial<MachineResourcesModel> = {}): MachineResources
  * a missing binding yields `null` rather than a fabricated id.
  */
 describe("utilityModelId", () => {
-  const specs = (utility_model: unknown) => ({ utility_model }) as unknown as MachineSpecs;
+  const specs = (utility_model: unknown) => ({ utility_model }) as unknown as MachineSpecsResponse;
 
   it("returns the configured id for a specs-confirmed local machine", () => {
     expect(utilityModelId(specs({ id: "darkmux:qwen3-4b", loaded: true }), true)).toBe("darkmux:qwen3-4b");
@@ -128,7 +131,7 @@ describe("stampLine / attributionLine", () => {
   });
   it("falls back to the bare code, then —, when the note is absent", () => {
     expect(attributionLine(machineResources({ attribution: "per_process" }))).toBe("attribution: per_process");
-    expect(attributionLine(machineResources({ attribution: "" }))).toBe("attribution: —");
+    expect(attributionLine(machineResources({ attribution: "" as never }))).toBe("attribution: —");
   });
 });
 

@@ -5,7 +5,7 @@ import type { ReactNode } from "react";
 import { useLiveSessionIds } from "./useLiveSessionIds";
 
 /**
- * (#2725) The hook read `/fleet/sessions/live`'s `sessions` array and threw
+ * (#2725) The hook read `/fleet/dispatches/live`'s `sessions` array and threw
  * the rest of the response away — including `meta.sources.fleet`, the
  * daemon's own report of whether it could read the fleet substrate at all
  * (`fleet_sessions_live_handler` emits it from the same
@@ -31,7 +31,7 @@ function wrapper() {
   );
 }
 
-/** One `/fleet/sessions/live` answer. `null` body = a transport failure (a
+/** One `/fleet/dispatches/live` answer. `null` body = a transport failure (a
  *  non-2xx), which `fetchJson` turns into a settled `ok:false` rather than a
  *  throw — the #1812 shape this app is built on. */
 function stub(body: Record<string, unknown> | null) {
@@ -52,7 +52,7 @@ afterEach(() => {
 describe("useLiveSessionIds — the coverage half it used to discard (#2725)", () => {
   it("reports the daemon's own `unavailable` report, in the shared vocabulary", async () => {
     stub({
-      sessions: [],
+      dispatches: [],
       meta: { sources: { fleet: { state: "unavailable", detail: "PRESENCE_READ_FAILED" } }, complete: false },
     });
     const { result } = renderHook(() => useLiveSessionIds(true), { wrapper: wrapper() });
@@ -74,7 +74,7 @@ describe("useLiveSessionIds — the coverage half it used to discard (#2725)", (
 
   it("carries a `stale` report through unchanged rather than flattening it", async () => {
     stub({
-      sessions: [],
+      dispatches: [],
       meta: { sources: { fleet: { state: "stale", age_ms: 42_000 } }, complete: true },
     });
     const { result } = renderHook(() => useLiveSessionIds(true), { wrapper: wrapper() });
@@ -84,7 +84,7 @@ describe("useLiveSessionIds — the coverage half it used to discard (#2725)", (
   it("reports NO coverage problem on a healthy fleet, and still returns the sessions", async () => {
     // Inverted case 1. A healthy read must say nothing at all.
     stub({
-      sessions: [{ session_id: "s-1" }, { session_id: "s-2" }],
+      dispatches: [{ session_id: "s-1" }, { session_id: "s-2" }],
       meta: { sources: { fleet: { state: "ok" } }, complete: true },
     });
     const { result } = renderHook(() => useLiveSessionIds(true), { wrapper: wrapper() });
@@ -95,7 +95,7 @@ describe("useLiveSessionIds — the coverage half it used to discard (#2725)", (
 
   it("collects the missions live executions run under, skipping beats that name none", async () => {
     stub({
-      sessions: [{ session_id: "e-1", mission_id: "m-1" }, { session_id: "e-2" }],
+      dispatches: [{ session_id: "e-1", mission_id: "m-1" }, { session_id: "e-2" }],
       meta: { sources: { fleet: { state: "ok" } }, complete: true },
     });
     const { result } = renderHook(() => useLiveSessionIds(true), { wrapper: wrapper() });
@@ -107,7 +107,7 @@ describe("useLiveSessionIds — the coverage half it used to discard (#2725)", (
     // Inverted case 2, and the one most likely to be got wrong: a standalone
     // machine has no fleet substrate BY DESIGN — that is the default, not a
     // degradation, and warning about it would be the bug.
-    stub({ sessions: [], meta: { sources: { fleet: { state: "off" } }, complete: true } });
+    stub({ dispatches: [], meta: { sources: { fleet: { state: "off" } }, complete: true } });
     const { result } = renderHook(() => useLiveSessionIds(true), { wrapper: wrapper() });
     await waitFor(() => expect(result.current.sessions.size).toBe(0));
     expect(result.current.coverage).toBeNull();

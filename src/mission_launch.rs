@@ -223,7 +223,7 @@ fn spec_origin_for(source: crew::mission_config::MissionConfigSource) -> crew::t
 /// pr-merge` typed by a human at a shell gets [`crew::gate::
 /// tty_prompt_handler`] (a y/N prompt); anything else — CI, a
 /// piped/redirected stdin OR stdout, an ACP-spawned `mission launch <id>`
-/// subprocess (the `RoutePlan::Launch` route in `src/acp_panel.rs` —
+/// subprocess (the `LaunchRoute::Launch` route in `src/acp_panel.rs` —
 /// headless by construction) — gets [`crew::gate::refusal_handler`], which
 /// fails CLOSED rather than hanging on input that will never arrive.
 ///
@@ -347,6 +347,69 @@ impl Drop for WatchdogStopGuard {
     }
 }
 
+/// The refusal every launch runs first: a stale or invalid user file the
+/// launch scope consumes (every effective user-tier mission config
+/// included) blocks ALL launches. [`resolve_config`] and the surfaces that
+/// list what can be launched (`/mission list`, radio's catalog) share this
+/// one call, so a list never offers what a launch would refuse.
+pub(crate) fn preflight_launch() -> Result<()> {
+    darkmux_crew::user_files::preflight(darkmux_types::config_enum::Scope::MissionLaunch)?;
+    Ok(())
+}
+
+/// Resolve a launchable config by id: the identifier check, the
+/// bad-enum-config refusal, and the registry load, with the refusal text a
+/// launch prints. `darkmux mission launch` and the editor panel's
+/// `/mission launch` both call this, so an unknown or unreadable config is
+/// refused with the same words on either surface.
+///
+/// (#2947) Bad enum config refuses before anything is loaded or minted, and
+/// before the `--dry-run` short-circuit: a dry run surfaces the same loud
+/// failures a real launch would, and a launch whose dispatches would each
+/// refuse is not worth planning. Not waived by `--force`, which overrides a
+/// thermal/battery READING, not a config value.
+pub(crate) fn resolve_config(config_id: &str) -> Result<mission_config::LoadedMissionConfig> {
+    fleet::validate_identifier("config_id", config_id)?;
+    preflight_launch()?;
+    mission_config::load(config_id).with_context(|| {
+        format!(
+            "loading mission config \"{config_id}\" — note: a user-tier copy \
+             (~/.darkmux/mission-configs/{config_id}.json) or an on-disk template overrides \
+             an embedded built-in; the failing file is named above if one was found"
+        )
+    })
+}
+
+/// The inputs a launch collected, after document defaults, and the names the
+/// operator themself supplied (captured before a single default lands: the
+/// inert-input checks in [`launch`] must tell "the operator passed this knob"
+/// apart from "the document defaulted it").
+pub(crate) struct ResolvedInputs {
+    pub collected: BTreeMap<String, serde_json::Value>,
+    pub operator_supplied: std::collections::BTreeSet<String>,
+}
+
+/// Parse `--input`/`--param`, apply the document's declared defaults, and
+/// refuse a launch that is missing a required input. The one input
+/// resolution both `darkmux mission launch` and the panel's in-process
+/// route run, so a missing required input reads the same on both.
+///
+/// (#2310 P4e) Document-declared defaults land BEFORE every consumer, so a
+/// defaulted input is indistinguishable from one the operator typed: an
+/// EMBEDDED placeholder naming an uncollected input is refused at mint, so
+/// without this a config could not ship a default at all.
+pub(crate) fn resolve_inputs(
+    config: &MissionConfig,
+    input_file: Option<&Path>,
+    params: &[String],
+) -> Result<ResolvedInputs> {
+    let mut collected = collect_inputs(input_file, params)?;
+    let operator_supplied: std::collections::BTreeSet<String> = collected.keys().cloned().collect();
+    apply_input_defaults(config, &mut collected);
+    refuse_bad_inputs(config, &collected)?;
+    Ok(ResolvedInputs { collected, operator_supplied })
+}
+
 pub fn launch(
     config_id: &str,
     input_file: Option<&Path>,
@@ -366,31 +429,7 @@ pub fn launch(
     // negative or wildly wrong duration that subtracting the mission's two
     // wall-clock timestamps could.
     let run_started = std::time::Instant::now();
-    fleet::validate_identifier("config_id", config_id)?;
-
-    // (#2947) Bad enum config refuses before anything is loaded or minted,
-    // and before the `--dry-run` short-circuit below: a dry run surfaces the
-    // same loud failures a real launch would, and a launch whose dispatches
-    // would each refuse is not worth planning. Not waived by `--force`,
-    // which overrides a thermal/battery READING, not a config value.
-    darkmux_crew::user_files::preflight(darkmux_types::config_enum::Scope::MissionLaunch)?;
-
-    // (#2301) `crawl` used to be routed by literal id to a bespoke
-    // launcher, BEFORE the config load below, because its Task/Step graph
-    // was computed at run time and there was no document to execute. There
-    // is one now: `crawl.json` declares a `crawl.plan` task per rule, grows
-    // a `crawl.unit` task per planned unit from each plan's output (#2300),
-    // and closes with a `crawl.summary`. Nothing about a crawl needs a
-    // launcher of its own any more, so it takes this path like every other
-    // config and `src/crawl_launch.rs` is gone.
-
-    let loaded = mission_config::load(config_id).with_context(|| {
-        format!(
-            "loading mission config \"{config_id}\" — note: a user-tier copy \
-             (~/.darkmux/mission-configs/{config_id}.json) or an on-disk template overrides \
-             an embedded built-in; the failing file is named above if one was found"
-        )
-    })?;
+    let loaded = resolve_config(config_id)?;
     let config = &loaded.config;
 
     // (#1685) The command allowlist gate — checked before ANY other work on
@@ -439,27 +478,7 @@ pub fn launch(
         ))
     );
 
-    let mut collected = collect_inputs(input_file, params)?;
-    // (#2386 MF3) The operator's OWN action, captured before a single
-    // default lands — the inert-input checks below need to tell "the
-    // operator passed this knob" apart from "the document defaulted it".
-    // Everything else in this function wants the POST-default view (see
-    // the next comment); this set does not, and reading it off `collected`
-    // after defaults apply would make every defaulted-but-inert input look
-    // operator-supplied and refuse a launch the operator never touched.
-    let operator_supplied: std::collections::BTreeSet<String> = collected.keys().cloned().collect();
-    // (#2310 P4e) Document-declared defaults land BEFORE every consumer
-    // below — the required check, the typo warning, the dry-run print, the
-    // inputs fingerprint and both placeholder passes — so a defaulted
-    // input is indistinguishable from one the operator typed. That is the
-    // point: `review`'s wait command interpolates `mod_wait_seconds`
-    // from inside a string, and an EMBEDDED placeholder naming an
-    // uncollected input is refused at mint (`check_embedded_inputs_
-    // collected`), so without this the config could not ship a default at
-    // all.
-    apply_input_defaults(config, &mut collected);
-    let collected = collected;
-    refuse_bad_inputs(config, &collected)?;
+    let ResolvedInputs { collected, operator_supplied } = resolve_inputs(config, input_file, params)?;
 
     // (#2310 P4f review, CONSIDER 3) `mod_seat_profile` names the profile
     // `review`'s optional endpoint create-mod seat dispatches to. A name
@@ -575,7 +594,7 @@ pub fn launch(
     let config_as_declared: &MissionConfig = &config_owned;
     let (config_pruned, prune_report) = match &selection {
         Some(wanted) => mission_config::prune::prune_with_selection(config_as_declared, &|task| {
-            task_declares_rule(task).is_none_or(|rule| wanted.contains(rule))
+            task_declares_rule(task).is_none_or(|rule| wanted.contains(&rule))
         }),
         None => mission_config::prune::prune_disabled(config_as_declared),
     };
@@ -638,6 +657,28 @@ pub fn launch(
     // become a silent way to skip this specific refusal for a real launch.
     mission_config::check_placeholders_declared(config)?;
 
+    // Run id: minted fresh for THIS launch, never derived from inputs
+    // (#1503). AI work is non-deterministic, so two launches of the same
+    // config with the same inputs are two DIFFERENT runs, not one to
+    // dedupe/reopen onto. `spec_fingerprint`, computed from the
+    // OPERATOR-SUPPLIED inputs (never `mission_id` itself, so it is taken
+    // BEFORE the id is inserted below), is what still lets same-config-same-
+    // inputs runs be GROUPED for corpus analysis, via `Mission.spec`: a
+    // metadata field, never identity.
+    //
+    // Minted HERE, ahead of the placeholder checks, because the launcher
+    // supplies `mission_id` to `{{mission_id}}` references: a check that
+    // substituted params without it would refuse a config the mint runs.
+    // `mint_run_id` is pure in-memory derivation (no disk I/O, no signal
+    // hazard), so minting before `launch_guard::arm()` is harmless, and a
+    // `--dry-run` that returns below simply never uses the id.
+    let mission_id = mint_run_id(config_id)?;
+    let inputs_fingerprint = spec_fingerprint(&collected)?;
+    let mut collected = collected;
+    if config.inputs.iter().any(mission_config::MissionInput::is_launcher_supplied) {
+        collected.insert("mission_id".to_string(), serde_json::Value::String(mission_id.clone()));
+    }
+
     // (#2310 P4c-2 review round 2, item a) A DECLARED input referenced
     // EMBEDDED (part of a larger string, e.g. `"label": "run-{{tag}}"`)
     // that this specific launch never collected — `check_placeholders_
@@ -649,6 +690,13 @@ pub fn launch(
     // failed and abandoned it; `--dry-run` exited 0, silent. Same
     // placement as the check above: before `--dry-run`, before any mint.
     mission_config::check_embedded_inputs_collected(config, &collected)?;
+
+    // Every static step's config, with this launch's params substituted as a
+    // mint does, must be one its kind accepts: a `--param draws=0` the
+    // document's own `{{draws}}` reference let past the schema gate is
+    // refused here, before `--dry-run`'s short-circuit and before any mint.
+    // Grown copies are checked as they are minted (`grow_phase`).
+    mission_config::check_resolved_step_configs(config, &collected)?;
 
     // (#2384) The OTHER direction: a DECLARED input that no step config
     // (including a `grow.config` template) references and that this
@@ -734,18 +782,12 @@ pub fn launch(
     // (generic graphs + coder-phase) previously installed no signal
     // handling at all, the gap #2124 fixed for the now-deleted dedicated
     // review launcher and #1959 fixed (SIGINT only) for the retired crawl
-    // launcher. Installed HERE — ahead of `mint_run_id` below, matching the
-    // review launcher's own `run_dispatch`, which armed before ITS mint too
-    // — not merely ahead of the config-snapshot write / interpret /
-    // freeform-mint / executable-check work that follows the mint.
-    // `mint_run_id` itself is pure in-memory ID derivation (no disk I/O, so
-    // a signal caught inside it is harmless today regardless), but arming
-    // any later would make "is it safe to be here" a fact the reader has
-    // to re-derive from `mint_run_id`'s own implementation rather than
-    // something structurally true by placement — the SAME reasoning the
-    // review launcher applied. The flag is live well before the
-    // real-execution section (below) constructs this launcher's own
-    // `LaunchFinalizeGuard`.
+    // launcher. Installed HERE, ahead of the config-snapshot write /
+    // interpret / freeform-mint / executable-check work that follows: the
+    // first disk write of the launch is the first place a signal could
+    // strand state. (`mint_run_id` runs earlier, but it is pure in-memory
+    // derivation.) The flag is live well before the real-execution section
+    // (below) constructs this launcher's own `LaunchFinalizeGuard`.
     crate::launch_guard::arm();
 
     // (#2678) The run-level wall-clock bound — orthogonal to `arm()`
@@ -765,28 +807,14 @@ pub fn launch(
     let wall_clock_bound_seconds = darkmux_types::config_access::mission_wall_clock_timeout_seconds();
     let _wall_clock_guard = crate::launch_guard::spawn_wall_clock_watchdog(run_started, wall_clock_bound_seconds);
 
-    // Run id: minted fresh for THIS launch, never derived from inputs
-    // (#1503). AI work is non-deterministic, so two launches of the same
-    // config with the same inputs are two DIFFERENT runs, not one to
-    // dedupe/reopen onto — collapsing them onto one id was the category
-    // error #1503 fixes. `spec_fingerprint`, computed from the
-    // OPERATOR-SUPPLIED inputs below (never `mission_id` itself — hashing it
-    // would be circular), is what still lets same-config-same-inputs runs be
-    // GROUPED for corpus analysis, via `Mission.spec` — a metadata field,
-    // never identity. No `--mission-id` flag needed.
-    let mission_id = mint_run_id(config_id)?;
     let run = RunId::mission(mission_id.clone())?;
     let spec = MissionSpec {
         config_id: config_id.to_string(),
-        inputs_fingerprint: spec_fingerprint(&collected)?,
+        inputs_fingerprint,
         // (#1562) Recorded at mint so the board never has to guess — a
         // user-tier config's launches are the operator's named work.
         origin: Some(spec_origin_for(loaded.source)),
     };
-    let mut collected = collected;
-    if config.inputs.iter().any(|i| i.name == "mission_id") {
-        collected.insert("mission_id".to_string(), serde_json::Value::String(mission_id.clone()));
-    }
 
     // (#1504) `ensure_mission_and_phases_with_provenance` itself is a strand
     // window `reconcile_and_finalize_on_error` (below) can't cover — that
@@ -2124,6 +2152,11 @@ fn grow_phase(
         // (#2595) See `stamp_unit_timeout`'s own doc.
         stamp_unit_timeout(&mut grown_steps, timeout_seconds);
 
+        // A grown copy's config, its grow keys and items substituted, must be
+        // one its kind accepts: refused here, before the copy runs.
+        crew::step_config::gate::check_resolved(grown_steps.values().map(|s| (s.id.as_str(), s.kind.as_str(), &s.config)))
+            .with_context(|| format!("mission launch: growing task `{}`", task_cfg.id))?;
+
         // Same gate the statically-declared graph passes before it runs —
         // a grown step naming a kind this binary can't construct must fail
         // loudly here, not deep inside the scheduler.
@@ -2300,7 +2333,9 @@ fn print_dry_run_graph(config: &MissionConfig, collected: &BTreeMap<String, serd
                 serde_json::Value::String(s) => s.clone(),
                 other => other.to_string(),
             };
-            println!("  {k} = {rendered}");
+            let launcher_supplied = config.inputs.iter().any(|i| i.is_launcher_supplied() && i.name == *k);
+            let note = if launcher_supplied { " (example id: a real launch mints a fresh one)" } else { "" };
+            println!("  {k} = {rendered}{note}");
         }
     }
     println!("graph:");
@@ -2376,7 +2411,7 @@ fn refuse_bad_inputs(config: &MissionConfig, collected: &BTreeMap<String, serde_
 fn workspace_spec_inputs(config: &MissionConfig) -> std::collections::BTreeSet<String> {
     let steps = config.phases.iter().flat_map(|p| &p.tasks).flat_map(|t| &t.steps);
     steps
-        .filter_map(|s| s.config.get("workspace").and_then(serde_json::Value::as_str))
+        .filter_map(|s| crew::step_config::workspace_of(&s.kind, &s.config))
         .filter_map(|v| v.strip_prefix("{{")?.strip_suffix("}}").map(|n| n.trim().to_string()))
         .collect()
 }
@@ -2442,8 +2477,7 @@ fn missing_required_inputs<'a>(
     config
         .inputs
         .iter()
-        .filter(|i| i.name != "mission_id")
-        .filter(|i| i.required != Some(false))
+        .filter(|i| i.is_required_of_operator())
         .filter(|i| !collected.contains_key(&i.name))
         .collect()
 }
@@ -2460,7 +2494,7 @@ fn missing_inputs_message(config: &MissionConfig, missing: &[&mission_config::Mi
     msg.push_str("\nExample --input file:\n");
     let mut obj = serde_json::Map::new();
     for i in &config.inputs {
-        if i.name == "mission_id" {
+        if i.is_launcher_supplied() {
             continue; // launcher-supplied — never asked of the operator
         }
         obj.insert(i.name.clone(), serde_json::Value::String(format!("<{}>", i.name)));
@@ -2471,7 +2505,7 @@ fn missing_inputs_message(config: &MissionConfig, missing: &[&mission_config::Mi
         &config
             .inputs
             .iter()
-            .filter(|i| i.name != "mission_id")
+            .filter(|i| !i.is_launcher_supplied())
             .map(|i| format!("--param {}=<{}>", i.name, i.name))
             .collect::<Vec<_>>()
             .join(" "),
@@ -2549,7 +2583,7 @@ fn undeclared_param_warning(config_id: &str, key: &str, config: &MissionConfig) 
 /// (`crates/darkmux-lab/src/lab/run.rs`: `<workload>-<profile>-<unix-secs>-
 /// <index>`) for mission↔lab consistency: `<config-id>-<unix-secs>-<6-hex
 /// token>`. The lab convention's own disambiguator is a batch-loop index
-/// (`--runs N`); `mission launch` has no such loop, so the token here is a
+/// (`--repeat N`); `mission launch` has no such loop, so the token here is a
 /// blake3 digest over (nanosecond time, pid, an in-process atomic counter)
 /// instead — robustly unique even for two launches within the same
 /// wall-clock second (the lab scheme is itself only second-granular).
@@ -2954,8 +2988,8 @@ pub(crate) fn promoted_step_body(value: serde_json::Value) -> Option<serde_json:
 /// (#2301) The rule id a task is FOR — the `rule` key on any of its step
 /// configs. A task with no such key (the crawl's own `summary`, and every
 /// task in every other config) belongs to no rule and is never deselected.
-fn task_declares_rule(task: &mission_config::TaskConfig) -> Option<&str> {
-    task.steps.iter().find_map(|s| s.config.get("rule").and_then(|v| v.as_str()))
+fn task_declares_rule(task: &mission_config::TaskConfig) -> Option<String> {
+    task.steps.iter().find_map(|s| crew::step_config::crawl_identity(&s.kind, &s.config).rule)
 }
 
 /// (#2301) The set `--param rules=<csv>` names, or `None` when the operator
@@ -3659,11 +3693,13 @@ fn coder_phase_gate_outcome(
     );
     println!(
         "{}",
-        style::dim(&format!(
+        style::dim(
             "  record your adjudication (audit trail):  darkmux flow note \
-             --session-id {session_id} \
-             --text \"<verdict · what you overrode · why>\" --source adjudication",
-        ))
+             --execution <execution-id> \
+             --text \"<verdict · what you overrode · why>\" --source adjudication \
+             (the id of the role execution you adjudicated: an `execution_id` in \
+             `darkmux flow tail --json`)"
+        )
     );
     coder_phase::emit_step_result(
         flow::Level::Info,
@@ -4577,10 +4613,8 @@ fn refuse_utility_staffed_tasks(
         // profile_name` (`task_or_config_str`); the gate reads the same two
         // sources so a config-authored staffing is checked too.
         let step_staffing = task.step_ids.iter().filter_map(|id| steps.get(id)).find_map(|step| {
-            (step.kind == "dispatch.internal")
-                .then(|| step.config.get("role_id").and_then(|v| v.as_str()).map(str::to_string))
-                .flatten()
-                .map(|role| (role, step.config.get("profile_name").and_then(|v| v.as_str()).map(str::to_string)))
+            let (role, profile) = crew::step_config::dispatch_staffing(&step.kind, &step.config);
+            role.map(|role| (role, profile))
         });
         let (role, profile_name) = match (task.role_id.as_deref(), step_staffing) {
             (Some(role), _) => (Some(role.to_string()), task.profile_name.clone()),
@@ -4612,18 +4646,16 @@ fn refuse_utility_staffed_tasks(
             // deployment name, never the local utility instance.
             // (#2902) Through the one resolver: an unmanaged endpoint (or one
             // that cannot be resolved, which `run` refuses) skips the check.
+            let Some(call) = crew::step_config::model_call(&step.kind, &step.config) else { continue };
             if !matches!(
-                crew::target::step_unmanaged_endpoint(
-                    &step.config,
-                    step.config.get("config_path").and_then(|v| v.as_str())
-                ),
+                crew::target::step_unmanaged_endpoint(call.endpoint.as_ref(), call.config_path.as_deref()),
                 Ok(None)
             ) {
                 continue;
             }
-            let named = ["model_key", "model"]
-                .iter()
-                .filter_map(|k| step.config.get(k).and_then(|v| v.as_str()))
+            let named = [call.model_key.as_deref(), Some(call.model.as_str())]
+                .into_iter()
+                .flatten()
                 .find(|m| crew::select::names_utility_model(m, utility));
             if let Some(model) = named {
                 bail!(
@@ -5973,8 +6005,8 @@ mod tests {
             .iter()
             .filter(|r| {
                 let action = r.get("action").and_then(|v| v.as_str()).unwrap_or("");
-                let source = r.get("source").and_then(|v| v.as_str()).unwrap_or("");
-                source == "scheduler" && (action == "step.start" || action == "step.complete")
+                let source = darkmux_flow::reader::source_of(r);
+                source == Some(darkmux_flow::FlowSource::Scheduler) && (action == "step.start" || action == "step.complete")
             })
             .collect();
         assert!(
@@ -6303,6 +6335,46 @@ mod tests {
         let _ = guard;
     }
 
+    const DRAWS_PARAM_CONFIG: &str = r#"{
+        "id": "draws-param-test-mission",
+        "name": "Draws Param Test Mission",
+        "schema_version": "2.3",
+        "inputs": [
+            {"name": "draws", "description": "draws per unit", "default": "2"}
+        ],
+        "phases": [
+            {"id": "p1", "tasks": [{"id": "t1", "steps": [
+                {"id": "unit", "kind": "crawl.unit", "config": {"plan": "p", "unit": "u", "draws": "{{draws}}"}}
+            ]}]}
+        ]
+    }"#;
+
+    /// A step config the schema gate passes (`"{{draws}}"` is a reference) but
+    /// its kind refuses once the launch's `--param` is substituted is refused
+    /// before anything mints, `--dry-run` included, naming the step, the key
+    /// and the rule.
+    #[test]
+    #[serial_test::serial]
+    fn launch_refuses_a_param_that_breaks_its_steps_own_rule_before_minting() {
+        let guard = LaunchTestGuard::new();
+        guard.write_config("draws-param-test-mission", DRAWS_PARAM_CONFIG);
+        for (param, rule) in [("draws=0", "config.draws must be >= 1, got 0"), ("draws=99", "above the cap of 8")] {
+            for dry in [true, false] {
+                let mut params = vec![param.to_string()];
+                if dry {
+                    params.push("dry_run=true".to_string());
+                }
+                let err = launch("draws-param-test-mission", None, &params, None).expect_err("the rule must refuse the launch");
+                let msg = format!("{err:#}");
+                assert!(msg.contains("step `unit` (`crawl.unit`)") && msg.contains(rule), "{param} dry={dry}: {msg}");
+                assert!(all_mission_ids().is_empty(), "a refused launch must mint nothing");
+            }
+        }
+        let ok = launch("draws-param-test-mission", None, &["draws=3".to_string(), "dry_run=true".to_string()], None);
+        assert_eq!(ok.expect("a legal draws passes the check"), 0);
+        let _ = guard;
+    }
+
     /// (#2386 MF3) The mirror case: `knob` is declared with a `default`
     /// and the operator never named it on `--param`/stdin. Before the
     /// MF3 fix, `apply_input_defaults` ran BEFORE the supplied-set was
@@ -6322,6 +6394,33 @@ mod tests {
             None,
         )
         .expect("a defaulted-only inert input must not be refused, even though it lands in `collected`");
+        assert_eq!(exit, 0);
+        assert!(all_mission_ids().is_empty(), "a dry run must mint no mission");
+        let _ = guard;
+    }
+
+    const MISSION_ID_IN_GATE_CONFIG: &str = r#"{
+        "id": "mission-id-gate-test",
+        "name": "Mission Id Gate Test",
+        "schema_version": "4.0",
+        "inputs": [{"name": "mission_id", "required": false}],
+        "phases": [
+            {"id": "p1", "tasks": [{"id": "t1", "steps": [
+                {"id": "gate", "kind": "mods.gate", "config": {"for_key": "{{mission_id}}"}}
+            ]}]}
+        ]
+    }"#;
+
+    /// The launch-time step-config check must see the same `mission_id` the
+    /// mint injects: a `mods.gate` whose `for_key` is `{{mission_id}}` is a
+    /// config the real mint runs, so `--dry-run` must not refuse it.
+    #[test]
+    #[serial_test::serial]
+    fn dry_run_accepts_a_step_config_that_names_the_launcher_supplied_mission_id() {
+        let guard = LaunchTestGuard::new();
+        guard.write_config("mission-id-gate-test", MISSION_ID_IN_GATE_CONFIG);
+        let exit = launch("mission-id-gate-test", None, &["dry_run=true".to_string()], None)
+            .expect("a config using the launcher-supplied `mission_id` must pass the launch-time check");
         assert_eq!(exit, 0);
         assert!(all_mission_ids().is_empty(), "a dry run must mint no mission");
         let _ = guard;
@@ -6383,7 +6482,6 @@ mod tests {
             schema_version: None,
             inputs: vec![input("rules"), input("workdir")],
             phases: Vec::new(),
-            panel: None,
             cmd: None,
             outcome_from: None,
             source_input: None,
@@ -6440,7 +6538,6 @@ mod tests {
             schema_version: None,
             inputs: Vec::new(),
             phases: Vec::new(),
-            panel: None,
             cmd: None,
             outcome_from: None,
             source_input: None,
@@ -7069,7 +7166,7 @@ mod tests {
             "id": "ws-default", "name": "WS default",
             "inputs": [{"name": "workspace", "default": spec.to_str().unwrap()}],
             "phases": [{"id": "p1", "tasks": [{"id": "t1", "steps": [
-                {"id": "s1", "kind": "procedural.noop", "config": {"workspace": "{{workspace}}"}}
+                {"id": "s1", "kind": "crawl.plan", "config": {"rule": "swallowed-error", "workspace": "{{workspace}}"}}
             ]}]}],
         });
         guard.write_config("ws-default", &doc.to_string());
@@ -7273,7 +7370,6 @@ mod tests {
             ],
             phases: vec![],
             outcome_from: None,
-            panel: None,
             cmd: None,
             source_input: None,
             ticket: None,
@@ -7327,7 +7423,6 @@ mod tests {
                 input("image", Some(false)),
             ],
             phases: Vec::new(),
-            panel: None,
             cmd: None,
             outcome_from: None,
             source_input: None,
@@ -7404,73 +7499,40 @@ mod tests {
         }
     }
 
-    /// (silent-miss audit, 2026-09-06) `darkmux-crew`'s `records_gather`
-    /// scan (`scan_unit_and_plan_steps`) cannot depend on `darkmux-lab`,
-    /// so it keeps its own literal-string copies of the three step kind
-    /// ids it recognizes — `SCANNED_CRAWL_UNIT_KIND`/
-    /// `SCANNED_PLAN_SITES_KIND`/`SCANNED_CRAWL_PLAN_KIND`. This test
-    /// lives here because `src/` is the one place that depends on BOTH
-    /// crates and can hold both real constants side by side, plus the
-    /// fully-assembled `StepKindRegistry` (`all_step_kinds`) that proves
-    /// each literal actually resolves to a registered, constructible
-    /// kind — not just a string that happens to match today.
-    ///
-    /// Two ways this drifts silently without the test: (1) a lab-side
-    /// rename of one of the three constants leaves `records_gather`'s
-    /// copy stale — the scan then matches nothing for that kind, forever,
-    /// with no error; (2) a crew-side typo in one of the `SCANNED_*`
-    /// literals does the same from the other direction. Either failure
-    /// mode reproduces exactly the "closed list drifts silently" defect
-    /// this module's own doc names for a NEW kind — this guards the
-    /// EXISTING three from drifting the same way.
+    /// The step-config gate's promise covers every kind darkmux ships: a
+    /// registered kind with no config struct would take any config
+    /// unchecked, and a struct with no registered kind is checking nothing.
+    /// `all_step_kinds` is the production registry, so this pins the two
+    /// lists to each other.
     #[test]
-    fn records_gather_scanned_kinds_match_the_real_crawl_constants_and_are_registered() {
-        assert_eq!(
-            crew::step_kinds::SCANNED_CRAWL_UNIT_KIND,
-            darkmux_lab::crawl::unit_step::CRAWL_UNIT_KIND,
-            "records.gather's local literal has drifted from darkmux-lab's real \
-             `CRAWL_UNIT_KIND` — the scan will silently stop matching `crawl.unit` steps"
-        );
-        assert_eq!(
-            crew::step_kinds::SCANNED_PLAN_SITES_KIND,
-            darkmux_lab::crawl::plan_sites_step::PLAN_SITES_KIND,
-            "records.gather's local literal has drifted from darkmux-lab's real \
-             `PLAN_SITES_KIND` — the scan will silently stop matching `plan.sites` steps"
-        );
-        assert_eq!(
-            crew::step_kinds::SCANNED_CRAWL_PLAN_KIND,
-            darkmux_lab::crawl::plan_step::CRAWL_PLAN_KIND,
-            "records.gather's local literal has drifted from darkmux-lab's real \
-             `CRAWL_PLAN_KIND` — the scan will silently stop matching `crawl.plan` steps"
-        );
+    fn every_registered_step_kind_has_a_config_struct_and_every_struct_a_kind() {
+        let registry = all_step_kinds().expect("all_step_kinds must build cleanly in a test process");
+        let mut registered = registry.ids();
+        registered.sort();
+        let mut typed: Vec<String> = crew::step_config::ConfigKind::ALL.iter().map(|k| k.id().to_string()).collect();
+        typed.sort();
+        assert_eq!(registered, typed);
+    }
 
-        // (#2454) The same crate-boundary duplication, one level down: the
-        // scan reads a `crawl.unit` outcome's `result` to tell a unit that
-        // REVIEWED its windows from one the thermal breaker skipped before
-        // it ever dispatched. Drift here is silent AND produces a false
-        // claim rather than a mere blind spot — a skipped unit would go
-        // back to counting as covered, so the posted review would assert
-        // coverage of hunks a thermally shortened run never looked at.
+    /// `darkmux-crew`'s `records_gather` scan reads a `crawl.unit` outcome's
+    /// `result` to tell a unit that REVIEWED its windows from one the thermal
+    /// breaker skipped before it ever dispatched (#2454). It cannot depend on
+    /// `darkmux-lab`, so it keeps its own copy of the skip marker
+    /// (`UNIT_RESULT_THERMAL_STOP`); this test lives here because `src/` is
+    /// the one place that sees both crates' real constants. Drift is silent
+    /// AND produces a false claim rather than a mere blind spot: a skipped
+    /// unit would go back to counting as covered, so a posted review would
+    /// assert coverage of hunks a thermally shortened run never looked at.
+    /// (The kind ids the scan matches are `ConfigKind` ids, and the registry
+    /// conformance test proves each is registered.)
+    #[test]
+    fn records_gather_thermal_stop_marker_matches_the_lab_constant() {
         assert_eq!(
             crew::step_kinds::UNIT_RESULT_THERMAL_STOP,
             darkmux_lab::crawl::unit_step::THERMAL_STOP,
-            "records.gather's local literal has drifted from darkmux-lab's real `THERMAL_STOP` — \
+            "records.gather's local literal has drifted from darkmux-lab's real `THERMAL_STOP`: \
              thermally-skipped units would silently count as reviewed coverage again"
         );
-
-        let registry = all_step_kinds().expect("all_step_kinds must build cleanly in a test process");
-        let known = registry.ids();
-        for kind in [
-            crew::step_kinds::SCANNED_CRAWL_UNIT_KIND,
-            crew::step_kinds::SCANNED_PLAN_SITES_KIND,
-            crew::step_kinds::SCANNED_CRAWL_PLAN_KIND,
-        ] {
-            assert!(
-                known.iter().any(|k| k == kind),
-                "records.gather's scan recognizes `{kind}`, but `all_step_kinds`'s registry \
-                 has no such id — the scan would be matching a kind nothing can ever produce"
-            );
-        }
     }
 
     /// (#1530 — one global step-kind registry; #2310 P4d) The payoff this
@@ -9571,6 +9633,30 @@ mod tests {
         real_task_ids.insert("plan-task".to_string(), vec!["plan-task".to_string()]);
 
         (phase, real_task_ids, tasks_by_id, steps)
+    }
+
+    /// A grown copy whose grow keys break its kind's rule is refused when it
+    /// is minted, naming the step, the key and the rule; the same graph with a
+    /// legal value grows.
+    #[test]
+    fn grow_phase_refuses_a_grown_copy_whose_config_breaks_its_kinds_rule() {
+        let all_known = &[darkmux_lab::crawl::unit_step::CRAWL_UNIT_KIND];
+        let declared_inputs = std::collections::BTreeSet::new();
+        let collected = BTreeMap::new();
+        for (draws, refused) in [(0, true), (2, false)] {
+            let (mut phase, real_task_ids, tasks_by_id, steps) = two_template_crawl_phase_fixture();
+            let grow = phase.tasks[0].grow.as_mut().unwrap();
+            grow.config.as_object_mut().unwrap().insert("draws".to_string(), serde_json::json!(draws));
+            let grown = grow_phase(&phase, "crawl-phase", &real_task_ids, &tasks_by_id, &steps, all_known, &declared_inputs, &collected, None);
+            match (refused, grown) {
+                (true, Err(e)) => {
+                    let msg = format!("{e:#}");
+                    assert!(msg.contains("unit-rule-a") && msg.contains("config.draws must be >= 1, got 0"), "{msg}");
+                }
+                (false, Ok(batches)) => assert_eq!(batches.len(), 2),
+                (refused, other) => panic!("draws={draws}: refused expected {refused}, got {:?}", other.map(|b| b.len())),
+            }
+        }
     }
 
     #[test]

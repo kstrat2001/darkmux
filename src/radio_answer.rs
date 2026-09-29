@@ -708,10 +708,12 @@ fn render_surface_block(surface: RadioSurface) -> String {
              command as `darkmux mission launch <id>`, which runs that exact command directly; \
              name any other darkmux verb as the full line from the command index below."
             .to_string(),
-        RadioSurface::Panel => "Surface: editor panel. A catalog command runs by its exact \
-             slash id (e.g. `/pr-list`). Any other darkmux verb is a command the user types in \
-             a separate darkmux CLI shell, not in this panel — name it as the full line from \
-             the command index below."
+        RadioSurface::Panel => "Surface: editor panel. A catalog command runs as `/mission \
+             launch <id>` (e.g. `/mission launch pr-list`); `/mission list` lists the launchable \
+             ids and `/mission show <mission id>` shows one mission. `/<id>` on its own is not a \
+             command here, and never name a catalog command by its id alone. Any other darkmux \
+             verb is a command the user types in a separate darkmux CLI shell, not in this panel \
+             — name it as the full line from the command index below."
             .to_string(),
     }
 }
@@ -729,10 +731,10 @@ fn surface_instructions(surface: RadioSurface) -> String {
              here that runs `/anything` and no such subcommand either; any other darkmux verb \
              is the full line from the command index (e.g. `darkmux machine status`)."
             .to_string(),
-        RadioSurface::Panel => "in this panel, a catalog command runs by its exact slash id \
-             (e.g. `/pr-list`); any other darkmux verb is a command the user types in a \
-             separate darkmux CLI shell, cited as the full line from the command index (e.g. \
-             `darkmux machine status`)."
+        RadioSurface::Panel => "in this panel, a catalog command runs as `/mission launch <id>` \
+             (e.g. `/mission launch pr-list`), never as `/<id>` or the id on its own; any other \
+             darkmux verb is a command the user types in a separate darkmux CLI shell, cited as \
+             the full line from the command index (e.g. `darkmux machine status`)."
             .to_string(),
     }
 }
@@ -765,12 +767,11 @@ pub struct AnswerOutcome {
     pub rendered: String,
 }
 
-/// `true` iff `text` names one of `catalog`'s ids with the exact
-/// `/<id>` slash syntax the persona's own prompt instructs it to use —
-/// a cheap, deterministic heuristic (no NLP, no second model call).
-fn answer_references_a_command(text: &str, catalog: &[CatalogEntry]) -> bool {
-    let lower = text.to_ascii_lowercase();
-    catalog.iter().any(|c| lower.contains(&format!("/{}", c.id.to_ascii_lowercase())))
+/// `true` iff `text` names the panel's `/mission` command, the slash syntax
+/// the persona's own prompt instructs it to use for a catalog command: a
+/// cheap, deterministic heuristic (no NLP, no second model call).
+fn answer_references_a_command(text: &str) -> bool {
+    text.to_ascii_lowercase().contains(&format!("/{}", crate::acp_panel::MISSION_COMMAND))
 }
 
 /// The mechanical backstop for #1861 defects 1 and 2, as #2050 rebuilt it
@@ -1193,11 +1194,13 @@ fn slash_candidate_id(token: &str) -> Option<String> {
 /// `true` iff any `/`-shaped candidate names something the user cannot run
 /// here.
 ///
-/// The two branches are ORDERED, and the order is the point. An ADVERTISED
-/// id is a command reference however it was written, and gets the surface
-/// check — telling a CLI user to type `/tmp` is the #1861 defect whether or
-/// not `tmp` also names a directory. Anything else has to be
-/// [`token_is_framed`] before it counts as a reference at all.
+/// The panel's only command is `/mission`, so the branches are ORDERED. A
+/// `/mission ...` reference is runnable on the panel when its verb is (see
+/// [`mission_verb_is_runnable`]) and never on the CLI. An ADVERTISED config
+/// id written as `/<id>` is a command reference however it was written, and
+/// it is unrunnable everywhere: a config runs as `/mission launch <id>`.
+/// Anything else has to be [`token_is_framed`] before it counts as a
+/// reference at all.
 fn slash_reference_is_unrunnable(
     chars: &[char],
     tokens: &[Token],
@@ -1206,18 +1209,38 @@ fn slash_reference_is_unrunnable(
 ) -> bool {
     tokens.iter().enumerate().any(|(k, token)| {
         let Some(id) = slash_candidate_id(&token.text) else { return false };
-        if is_an_advertised_id(&id, catalog) {
-            // Valid on the panel only: the CLI has no shell that runs
-            // `/anything` — a routed id is executed by radio itself.
-            surface != RadioSurface::Panel
-        } else {
-            token_is_framed(chars, tokens, k)
+        if id.eq_ignore_ascii_case(crate::acp_panel::MISSION_COMMAND) {
+            return surface != RadioSurface::Panel || !mission_verb_is_runnable(&tokens[k + 1..], catalog);
         }
+        if is_an_advertised_id(&id, catalog) {
+            return true;
+        }
+        token_is_framed(chars, tokens, k)
     })
 }
 
+/// A word with the sentence punctuation a reply glues to it removed.
+fn bare_word(token: Option<&Token>) -> Option<&str> {
+    token.map(|t| t.text.trim_matches(|c: char| ".,;:!?".contains(c))).filter(|w| !w.is_empty())
+}
+
+/// `true` iff the words after `/mission` name a real panel verb:
+/// `list`, `show <id>`, or `launch <id>` naming a catalog id (or the generic
+/// `<id>` placeholder). A reply that invents a config id, or a verb, is
+/// naming something the user cannot run.
+fn mission_verb_is_runnable(rest: &[Token], catalog: &[CatalogEntry]) -> bool {
+    match bare_word(rest.first()) {
+        Some(verb) if verb.eq_ignore_ascii_case("list") => true,
+        Some(verb) if verb.eq_ignore_ascii_case("show") => bare_word(rest.get(1)).is_some(),
+        Some(verb) if verb.eq_ignore_ascii_case("launch") => {
+            bare_word(rest.get(1)).is_some_and(|id| id.starts_with('<') || is_an_advertised_id(id, catalog))
+        }
+        _ => false,
+    }
+}
+
 /// `true` iff `id` names one of `catalog`'s advertised commands.
-/// Case-insensitive, matching `acp_panel::route_command`'s own rule — a
+/// Case-insensitive, as a config id resolves — a
 /// mixed-case spelling of a real id is a real command, not an invention.
 fn is_an_advertised_id(id: &str, catalog: &[CatalogEntry]) -> bool {
     catalog.iter().any(|c| c.id.eq_ignore_ascii_case(id))
@@ -1322,7 +1345,8 @@ fn prose_darkmux_reference_is_unrunnable(
 ///
 /// A bare id is runnable on NEITHER surface, so this needs no `surface`
 /// argument. The panel's own parser requires the slash
-/// (`acp_panel::parse_command` returns `None` without it) and the CLI has
+/// (`acp_panel::parse_command` returns `None` without it), and `/mission launch`
+/// before the id and the CLI has
 /// no such clap subcommand — `darkmux review` exits with `unrecognized
 /// subcommand 'review'` and helpfully suggests `serve`. The seat produced
 /// exactly this, measured live:
@@ -1333,7 +1357,7 @@ fn prose_darkmux_reference_is_unrunnable(
 /// which the detector passed, because a bare id is neither of the two
 /// shapes the persona instructs the seat to write, so nothing looked at
 /// it. The runnable forms are `darkmux mission launch review` and
-/// `/review`, and both are still accepted by the arms above.
+/// `/mission launch review`, and both are still accepted by the arms above.
 ///
 /// **The one reading under which it is not wrong**, checked and rejected:
 /// `darkmux radio "review"` DOES route, so "say `review` to radio" would
@@ -1461,13 +1485,12 @@ pub fn answer(
     }
     // (#1698 Packet B2 gate) The bare LISTING, not `not_a_command_message`
     // — appending "darkmux acp doesn't recognize that as a command" under
-    // an answer that just helpfully named `/pr-list` tells the operator
+    // an answer that just helpfully named `/mission launch pr-list` tells the operator
     // their message failed, immediately after RADIO answered it.
     // (#1861 defect 1) Panel-only: the listing is a slash-id list, which
     // is meaningless — and exactly the shape of the defect — on the CLI.
-    let listing = crate::acp_panel::command_listing(&crate::acp_panel::list_panel_commands());
-    let rendered = if surface == RadioSurface::Panel && answer_references_a_command(&reply, catalog) && !listing.is_empty()
-    {
+    let listing = crate::acp_panel::command_listing();
+    let rendered = if surface == RadioSurface::Panel && answer_references_a_command(&reply) {
         format!("{reply}\n\n{listing}")
     } else {
         reply.clone()
@@ -2297,7 +2320,7 @@ mod tests {
 
     #[test]
     fn answer_referencing_a_slash_command_gets_the_listing_appended() {
-        let mut call = |_msg: &str| -> Result<String> { Ok("Try running /pr-list to see them.".to_string()) };
+        let mut call = |_msg: &str| -> Result<String> { Ok("Try running /mission launch pr-list to see them.".to_string()) };
         let shelf = ArtifactShelf::default();
         let outcome =
             answer("anything mergeable?", &fixture_catalog(), &shelf, Path::new("/tmp"), GroundingScope::Full, RadioSurface::Panel, &mut call)
@@ -2378,7 +2401,7 @@ mod tests {
         // actually valid on must pass — a detector that fired on
         // everything would satisfy the two tests above just as happily,
         // and would replace every panel answer with the refusal.
-        assert!(!detects("Run `/pr-list` to see them.", RadioSurface::Panel));
+        assert!(!detects("Run `/mission launch pr-list` to see them.", RadioSurface::Panel));
     }
 
     #[test]
@@ -2549,7 +2572,7 @@ mod tests {
 
     #[test]
     fn leaves_a_bare_real_slash_command_alone_on_the_panel_surface() {
-        assert!(!detects("Try running /pr-list to see them.", RadioSurface::Panel));
+        assert!(!detects("Try running /mission launch pr-list to see them.", RadioSurface::Panel));
     }
 
     #[test]
@@ -2592,7 +2615,7 @@ mod tests {
             "the CLI's own canonical form must pass"
         );
         assert!(
-            !detects("Run `/review` to start it.", RadioSurface::Panel),
+            !detects("Run `/mission launch review` to start it.", RadioSurface::Panel),
             "the panel's own canonical form must pass"
         );
     }
@@ -2785,28 +2808,57 @@ mod tests {
         // whole reply.
         let catalog = vec![entry("pr_list", "List open pull requests.")];
         assert!(
-            !names_an_unrunnable_command("Try /pr_list for that.", &catalog, &fixture_verb_index(), RadioSurface::Panel),
+            !names_an_unrunnable_command("Try /mission launch pr_list for that.", &catalog, &fixture_verb_index(), RadioSurface::Panel),
             "an underscored id must survive decoration stripping intact"
         );
     }
 
     #[test]
     fn an_advertised_id_is_judged_as_a_command_however_it_is_written() {
-        // Ordering pin for finding 4's relaxation: an ADVERTISED id is a
-        // command reference however the seat wrote it, and gets the surface
-        // check with no framing required. Only an unadvertised token has to
-        // be framed. So an operator whose catalog really does advertise
-        // `/tmp` keeps the surface check on it.
+        // Ordering pin for finding 4's relaxation: an ADVERTISED id written
+        // `/<id>` is a command reference however the seat wrote it, with no
+        // framing required, and it is unrunnable everywhere: a config runs
+        // as `/mission launch <id>`, never as its own slash command. So an
+        // operator whose catalog really does advertise `/tmp` still has the
+        // reply refused.
         let catalog = vec![entry("tmp", "Temp things.")];
         let index = fixture_verb_index();
+        for surface in [RadioSurface::Cli, RadioSurface::Panel] {
+            assert!(
+                names_an_unrunnable_command("Run /tmp to do it.", &catalog, &index, surface),
+                "`/<config id>` is no command on {surface:?}"
+            );
+        }
         assert!(
-            names_an_unrunnable_command("Run /tmp to do it.", &catalog, &index, RadioSurface::Cli),
-            "a real catalog id is still surface-checked: the CLI runs no /commands"
+            !names_an_unrunnable_command("Run /mission launch tmp to do it.", &catalog, &index, RadioSurface::Panel),
+            "the panel's real form for that id is valid"
         );
-        assert!(
-            !names_an_unrunnable_command("Run /tmp to do it.", &catalog, &index, RadioSurface::Panel),
-            "and on the panel it is simply valid"
-        );
+    }
+
+    #[test]
+    fn the_mission_command_is_judged_by_its_verb_and_surface() {
+        let catalog = vec![entry("review", "Code review.")];
+        let index = fixture_verb_index();
+        let judged = |reply: &str, surface| names_an_unrunnable_command(reply, &catalog, &index, surface);
+        for ok in [
+            "Try `/mission list` first.",
+            "Run `/mission launch review`.",
+            "Then `/mission show m-42`.",
+            "The generic form is `/mission launch <id>`.",
+            "Use /mission launch review, then wait.",
+        ] {
+            assert!(!judged(ok, RadioSurface::Panel), "a real panel form must pass: {ok}");
+        }
+        for invented in [
+            "Run `/mission launch nosuchconfig`.",
+            "Run `/mission finalize m-42`.",
+            "Run `/mission launch`.",
+            "Run `/mission show`.",
+            "Run `/mission`.",
+        ] {
+            assert!(judged(invented, RadioSurface::Panel), "an invented form must be caught: {invented}");
+        }
+        assert!(judged("Run `/mission list`.", RadioSurface::Cli), "the CLI has no shell that runs /mission");
     }
 
     #[test]
@@ -3207,7 +3259,7 @@ mod tests {
             // canonical form: the instruction already named the canonical
             // form and the seat still wrote a bare id, so what this pins
             // is the sentence that closes that gap.
-            [(RadioSurface::Cli, "never the id on its own"), (RadioSurface::Panel, "exact slash id")]
+            [(RadioSurface::Cli, "never the id on its own"), (RadioSurface::Panel, "/mission launch <id>")]
         {
             let prompt = substitute_persona(SHIPPED_TEMPLATE, 40, surface);
             assert!(!prompt.contains("{{"), "no placeholder may reach the model ({surface:?}): {prompt}");
@@ -3291,7 +3343,7 @@ mod tests {
         let panel =
             assemble_grounding("how do I run it?", &[], &shelf, Path::new("/tmp"), GroundingScope::RemoteSafe, RadioSurface::Panel);
         assert!(panel.contains("Surface: editor panel"), "{panel}");
-        assert!(panel.contains("exact slash id"), "{panel}");
+        assert!(panel.contains("/mission launch <id>"), "{panel}");
         assert!(!panel.contains("Surface: command line"), "{panel}");
     }
 

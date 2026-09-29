@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>radio: the conversational channel | darkmux user guide</title>
-<meta name="description" content="darkmux radio routes plain text onto the advertised command registry instead of making you memorize verbs. Two seats (routing + answering), configuration, and the grounding boundary at remote endpoints.">
+<meta name="description" content="darkmux radio routes plain text onto the launchable mission-config registry instead of making you memorize verbs. Two seats (routing + answering), configuration, and the grounding boundary at remote endpoints.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -32,7 +32,7 @@
   <div class="wrap">
     <div class="label">02 <span class="dot">·</span> first inference</div>
     <h1><code>radio</code>: darkmux in plain text</h1>
-    <p class="lede">Interactive help and a plain-text way to run things. Ask radio anything about darkmux and a local model answers from the command tree and your machine’s state; say what you want done and it routes to one advertised command, or refuses rather than guess. Two model calls at most, no tools, nothing invented.</p>
+    <p class="lede">Interactive help and a plain-text way to run things. Ask radio anything about darkmux and a local model answers from the command tree and your machine’s state; say what you want done and it routes to one launchable mission config, or refuses rather than guess. Two model calls at most, no tools, nothing invented.</p>
   </div>
 </header>
 
@@ -49,7 +49,7 @@
       <div class="cmd-out">radio: To inspect a specific past run, use <code>darkmux run inspect</code>. You'll need the run ID; if you don't have it handy, run <code>darkmux run list --kind lab</code> to pull one from the recent history. If you just want a quick overview of what happened, append <code>--summary</code>.</div>
     </div>
     <p class="session-caption">Verbatim, captured 2026-08-28 on an M5 Max: qwen3.6-35b-a3b answering, qwen3-4b routing, humor at the shipped default of 50 unless shown otherwise.</p>
-    <p>Since 4.0 there is a command for that first question. <code>/machine-status</code> is a built-in advertised command that runs <code>darkmux machine status</code>, so a question like "which models are loaded?" has a command the router can send it to, and when it does, radio prints the loaded models instead of telling you which verb to run. Whether a given wording routes there is up to the routing model. It is read-only; nothing that unloads a model is advertised.</p>
+    <p>Since 4.0 there is a command for that first question. <code>machine-status</code> is a built-in mission config that runs <code>darkmux machine status</code> (in the editor panel, <code>/mission launch machine-status</code>), so a question like "which models are loaded?" has a command the router can send it to, and when it does, radio shows you the command it chose, asks before running it, and on a yes prints the loaded models instead of telling you which verb to run. Whether a given wording routes there is up to the routing model. It is read-only; nothing that unloads a model is launchable.</p>
   </div>
 </section>
 
@@ -119,7 +119,7 @@ Run <code>darkmux init</code> to bootstrap one, or create it manually (see profi
 <section>
   <div class="wrap">
     <h2>In your editor</h2>
-    <p>The same two seats sit behind <code>darkmux acp</code>, an agent server for editors that speak the Agent Client Protocol. In Zed, register it once and the advertised catalog becomes slash commands in the agent panel: <code>/review</code>, plus whatever you advertise yourself. Type without a slash and the message goes to the routing seat first, a small model that maps it onto exactly one advertised command or refuses; a refusal falls through to the answering seat with the session’s recent outputs in its grounding. A gated step asks for permission in Zed’s own dialog before it runs. The host profile and humor are session pickers there, so you can try a different answering seat without touching <code>config.json</code>.</p>
+    <p>The same two seats sit behind <code>darkmux acp</code>, an agent server for editors that speak the Agent Client Protocol. In Zed, register it once and the agent panel gets one slash command, <code>/mission</code>, with three verbs: <code>/mission list</code> lists every launchable config, <code>/mission launch &lt;config&gt; [name=value ...]</code> launches one (<code>/mission launch review</code> reviews this branch's committed changes), and <code>/mission show &lt;id&gt;</code> prints one mission's phases, runs and tokens, the same text as <code>darkmux mission show &lt;id&gt;</code>. Every config <code>darkmux mission launch</code> accepts is launchable from the panel, with the same inputs and the same refusals. A value with spaces goes in quotes: <code>/mission launch pr-merge test_command="cargo test -p darkmux"</code>. Type without a slash and the message goes to the routing seat first, a small model that maps it onto exactly one launchable config or refuses; a refusal falls through to the answering seat with the session’s recent outputs in its grounding. The routing seat’s pick is never the consent to run it: the panel prepares the launch first and shows the command that will run (the same <code>darkmux mission launch &lt;config&gt; ...</code> line the terminal prints, with every param, including the ones made from the editor’s working directory) in a code block in Zed’s permission dialog, and only Allow runs it. Reject, cancel or no answer runs nothing, and the panel says it was not run. A repo with nothing to review is reported without asking. A <code>/mission launch</code> you type yourself is your own command and is not asked again. A gated step asks for permission in Zed’s own dialog before it runs. The host profile and humor are session pickers there, so you can try a different answering seat without touching <code>config.json</code>.</p>
     <pre><code>// Zed settings.json
 "agent_servers": {
   "darkmux": {
@@ -135,19 +135,20 @@ Run <code>darkmux init</code> to bootstrap one, or create it manually (see profi
 <a id="advertise"></a>
 <section>
   <div class="wrap">
-    <h2>Advertise your own commands</h2>
-    <p>radio only routes to what is advertised. Two commands ship built in, <code>/review</code> and the read-only <code>/machine-status</code>; a mission config in <code>~/.darkmux/mission-configs/</code> joins the catalog by carrying a <code>panel</code> block, and its <code>description</code> is what the router reads. A step that changes state carries <code>"gate": "operator"</code> and waits for your confirmation, at the terminal or in the editor.</p>
+    <h2>Add your own commands</h2>
+    <p>radio never runs what the router chose without asking. It prepares the launch first, prints the command that will run in <code>darkmux mission launch &lt;id&gt; --param ...</code> form, with every param (for <code>review</code>, the <code>diff_file</code>, <code>workspace</code> and <code>head_sha</code> radio makes from the current directory; the first two are temporary files, and <code>head_sha</code> is a commit hash), and asks <code>Run it? [y/N]</code>; only <code>y</code> or <code>yes</code> runs it. Anything else, the end of input, or a Ctrl-C at the prompt runs nothing. With no interactive terminal (a script, a pipe) radio prints the command, says it was not run, and exits 1. For <code>review</code> the printed command is not runnable later as it stands, because the two temporary files are removed when radio exits: save a diff and a workspace spec of your own and pass them as <code>--param diff_file=&lt;path&gt;</code> and <code>--param workspace=&lt;path&gt;</code>; <code>darkmux mission config show &lt;config&gt;</code> lists what each input takes. A router argument holding a control character or an invisible formatting character (a bidi override, a zero-width space) is refused. A Ctrl-C at the prompt ends it within a moment and removes the temporary files. A step that asks for sign-off still asks again when the launch reaches it. The router picks from every launchable config, so the pick is a suggestion; your answer is the consent.</p>
+    <p>radio only routes to what is launchable. Two configs ship built in that a chat message can reach, <code>review</code> and the read-only <code>machine-status</code>; any mission config in <code>~/.darkmux/mission-configs/</code> joins the catalog and <code>/mission list</code> the moment the file exists, unless a user file is stale: <code>darkmux mission launch</code> refuses every launch while any of your mission configs carries a retired key, so the list and the catalog then show that refusal instead of configs, and <code>darkmux doctor</code> names the file, and the first sentence of its <code>description</code> (else its <code>name</code>) is what the router reads, so lead with one plain sentence about what it does. A config takes text after its id only if a task reads <code>__panel_args__</code>; otherwise pass declared inputs as <code>name=value</code>. The old per-config <code>panel</code> block is gone: a config still carrying one is refused, with a message naming <code>/mission launch &lt;id&gt;</code>. A step that changes state carries <code>"gate": "operator"</code> and waits for your confirmation, at the terminal or in the editor.</p>
     <pre><code>{
   "id": "pr-merge",
   "name": "PR Merge",
-  "panel": { "description": "Merge a pull request once every check is green.", "hint": "[PR number]" },
+  "description": "Merge a pull request once every check is green.",
   "phases": [{ "id": "run", "tasks": [{
     "id": "merge-task", "description": "merge the named PR", "reads": ["__panel_args__"],
     "steps": [{ "id": "merge-step", "kind": "procedural.shell", "gate": "operator",
                 "config": { "command": "gh pr merge $DARKMUX_STEP_INPUT___PANEL_ARGS__ --squash --delete-branch" } }]
   }]}]
 }</code></pre>
-    <p><code>__panel_args__</code> hands the step the text you typed after the command’s intent ("merge PR 2049" carries <code>"PR 2049"</code>), as an environment variable. darkmux ships no forge verbs of its own: GitHub, GitLab, and Perforce want different vocabularies, so <code>gh</code> lives in your config, never in darkmux. A graph with no model step runs in-process; one with a model step launches as <code>darkmux mission launch &lt;id&gt;</code>. The full config shape is in <a href="missions.html#task-step-graphs">Task/Step graphs</a>.</p>
+    <p><code>__panel_args__</code> hands the step the text you typed after the config id (<code>/mission launch pr-merge 2049</code> carries <code>2049</code>; a routed "merge PR 2049" carries <code>"PR 2049"</code>), as an environment variable. darkmux ships no forge verbs of its own: GitHub, GitLab, and Perforce want different vocabularies, so <code>gh</code> lives in your config, never in darkmux. A graph with no model step runs in-process; one with a model step launches as <code>darkmux mission launch &lt;id&gt;</code> in a subprocess, so it is the same launcher the terminal uses. The full config shape is in <a href="missions.html#task-step-graphs">Task/Step graphs</a>.</p>
   </div>
 </section>
 

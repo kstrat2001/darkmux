@@ -2,7 +2,7 @@
   "id": "coder-phase",
   "name": "Coder Phase",
   "description": "The 3-Task/3-Step graph `darkmux mission launch coder-phase` runs for one phase: prepare a git worktree, dispatch a specialist role into it, run mechanical verify (code-reviewer). A strict linear chain (worktree -> coder -> verify, each depends_on the last). This document is the EXECUTABLE source of truth for that graph; the launch path resolves role/workdir/image as task_overrides and calls mission_config::interpret, and the Tier-3 step kinds it references (mission.worktree/mission.coder/mission.verify) live in src/coder_phase.rs, the launch-owned module (#1426 ship-4 retired the `mission run` verb and its hand-built default_phase_graph launcher). ID SCHEME (placeholder-prefix rule): every task/step id below carries the literal `build-` prefix standing in for the launcher's real composed phase id -- mission_config::interpret substitutes it at launch (`{phase_id}-worktree`, `{phase_id}-coder`, `{phase_id}-verify`; steps append `-step`), so persisted ids stay stable across launches, byte for byte.",
-  "schema_version": "3.5",
+  "schema_version": "4.0",
   "inputs": [
     {
       "name": "workdir",
@@ -74,7 +74,6 @@
           "depends_on": [
             "build-coder"
           ],
-          "role_id": "code-reviewer",
           "steps": [
             {
               "id": "build-verify-step",
@@ -83,8 +82,8 @@
             }
           ],
           "_comment": [
-            "role_id here is DECORATIVE, unlike build-coder's sibling role_id above (which the `role` launch input genuinely overrides). MissionVerifyStepKind (src/coder_phase.rs) hardcodes `code-reviewer` in two places -- resolve_local_placement's residency() call and phase_review_output_at's DispatchOpts -- and its run()/run_streaming() signatures never read `_task.role_id` at all. Editing this field changes NOTHING about which role actually dispatches (#1550 cluster item 5).",
-            "Why hardcoded rather than wired: phase_review_output_at's USER-FACING PROMPT TEXT self-identifies as \"the darkmux `code-reviewer` role\" (src/phase_cli.rs) -- threading role_id through would also require making that prompt text role-agnostic, a bigger change than this field alone. Filed as a real feature gap, not fixed here; if you need a different QA reviewer role, dispatch it directly (`darkmux dispatch design-reviewer ...`) rather than editing this field."
+            "This task names no role_id, and a config that adds one is refused. MissionVerifyStepKind (src/coder_phase.rs) hardcodes `code-reviewer` in two places -- resolve_local_placement's residency() call and phase_review_output_at's DispatchOpts -- so a role_id here changed NOTHING about which role dispatches (#2953).",
+            "Why hardcoded rather than wired: phase_review_output_at's USER-FACING PROMPT TEXT self-identifies as \"the darkmux `code-reviewer` role\" (src/phase_cli.rs) -- honoring a role_id would also require making that prompt text role-agnostic, a bigger change than this key alone. If you need a different QA reviewer role, dispatch it directly (`darkmux dispatch design-reviewer ...`)."
           ]
         }
       ]

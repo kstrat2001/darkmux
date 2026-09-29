@@ -487,7 +487,7 @@ describe("deriveLiveState", () => {
   // counting to the announced resume, and ends at `budget.resume`/`stop`.
   it("reads a hosted budget wait as REST budget · <endpoint> until it resumes", () => {
     const at = (ms: number) => new Date(ms).toISOString();
-    const wait = norm({ ts: at(1_000), action: "budget.wait", session_id: SID, payload: { endpoint_id: "azure", wait_seconds: 60 } });
+    const wait = norm({ ts: at(1_000), action: "budget.wait", session_id: SID, payload: { endpoint_id: "azure", wait_ms: 60000 } });
     expect(deriveLiveState([wait], 11_000)).toEqual({
       state: "rest", restSecondsLeft: 50, restEndMs: 61_000, restReason: "budget · azure", restReasonWord: "budget",
     });
@@ -530,7 +530,7 @@ describe("deriveLiveState", () => {
   // live until the policy's window runs out, then not.
   it("a budget wait silent past its resume time plus the grace goes stale one window later", () => {
     const at = (ms: number) => new Date(ms).toISOString();
-    const wait = norm({ ts: at(1_000), action: "budget.wait", session_id: SID, payload: { endpoint_id: "azure", wait_seconds: 60 } });
+    const wait = norm({ ts: at(1_000), action: "budget.wait", session_id: SID, payload: { endpoint_id: "azure", wait_ms: 60000 } });
     const lapse = 61_000 + DEFAULT_POLICY.budgetWaitGraceMs;
     expect(liveExecutions([[wait]], lapse + DEFAULT_POLICY.staleAfterMs)).toHaveLength(1);
     expect(liveExecutions([[wait]], lapse + DEFAULT_POLICY.staleAfterMs + 1)).toEqual([]);
@@ -542,7 +542,7 @@ describe("deriveLiveState", () => {
   it("a long wait reads 23h 53m, then minutes, then seconds; a long endpoint id is trimmed", () => {
     const at = (ms: number) => new Date(ms).toISOString();
     const secs = 23 * 3600 + 53 * 60;
-    const wait = norm({ ts: at(0), action: "budget.wait", session_id: SID, payload: { endpoint_id: "azure-openai-eastus2-prod", wait_seconds: secs } });
+    const wait = norm({ ts: at(0), action: "budget.wait", session_id: SID, payload: { endpoint_id: "azure-openai-eastus2-prod", wait_ms: secs * 1000 } });
     const r = deriveLiveState([wait], 0);
     // (6th review) The full id where there is room (the lamp status, the
     // hover title): two endpoints sharing a prefix stay distinct. Trimmed
@@ -1576,7 +1576,7 @@ describe("(#2915) compacting", () => {
       source: "utility",
       session_id: SID,
       handle: "compactor",
-      payload: { job: "compaction", model: "u4b", serves: SID, ...(stallAfterSeconds != null ? { stall_after_seconds: stallAfterSeconds } : {}) },
+      payload: { job: "compaction", model: "u4b", serves: SID, ...(stallAfterSeconds != null ? { stall_after_ms: stallAfterSeconds * 1000 } : {}) },
     });
   const compactUsage = (atMs: number, job: string | null = "compaction"): NormRecord =>
     norm({
@@ -1589,7 +1589,7 @@ describe("(#2915) compacting", () => {
       payload: { call_kind: "compaction", purpose: "utility", ...(job ? { job } : {}), total_tokens: 100 },
     });
   const routingStart = (atMs: number): NormRecord =>
-    norm({ ...compactStart(atMs), session_id: undefined, payload: { job: "radio_routing", model: "u4b", stall_after_seconds: 30 } });
+    norm({ ...compactStart(atMs), session_id: undefined, payload: { job: "radio_routing", model: "u4b", stall_after_ms: 30000 } });
 
   const toolAt = 1_000 + STALL_AFTER_MS + 200;
   const before = [beat(0, 10), beat(1_000, 200), turnEnd(toolAt, 1), tool(toolAt)];

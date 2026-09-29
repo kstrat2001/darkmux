@@ -217,7 +217,7 @@ fn footer(sel: &Selection, width: Option<usize>) -> Option<String> {
     }
 }
 
-fn kind_label(kind: RunKind) -> &'static str {
+pub(crate) fn kind_label(kind: RunKind) -> &'static str {
     match kind {
         RunKind::Mission => "mission",
         RunKind::Dispatch => "dispatch",
@@ -234,7 +234,7 @@ fn kind_arg_label(kind: RunKindArg) -> &'static str {
     }
 }
 
-fn status_label(status: RunStatus) -> &'static str {
+pub(crate) fn status_label(status: RunStatus) -> &'static str {
     match status {
         RunStatus::Planned => "planned",
         RunStatus::Running => "running",
@@ -292,7 +292,7 @@ fn tokens_cell(tokens: Option<u64>) -> String {
 
 /// Thousands-grouped integer (the viewer's `fmtN`), for the breakdown's
 /// exact counts.
-fn grouped(n: u64) -> String {
+pub(crate) fn grouped(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (i, chunk) in digits.as_bytes().rchunks(3).rev().enumerate() {
@@ -922,7 +922,7 @@ mod tests {
             // (#1915) This CLI-verb test helper only exercises filtering/
             // sorting, never drill-in — `None` is the honest value for a
             // synthetic row that was never joined to a real flow session.
-            session_id: None,
+            dispatch_id: None,
             // (#1907) None of this module's tests exercise `abandoned_reason`
             // directly — that behavior is covered in `darkmux-serve`'s own
             // `runs.rs` tests, where every construction site lives. This

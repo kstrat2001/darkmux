@@ -6,7 +6,7 @@ import { norm } from "../testing/records";
 const proc = (ts: string, cpu: number, machine_uid?: string): NormRecord => norm({
   ts,
   category: "telemetry",
-  source: "process",
+  source: "host",
   // flow-action-guard:allow — a retired action, as an archive still holds it
   action: "telemetry.process",
   machine_uid,

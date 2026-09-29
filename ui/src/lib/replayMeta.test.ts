@@ -11,7 +11,7 @@ import {
   replayPlaybackKvValue,
 } from "./replayMeta";
 import { shapeRecords } from "./flow";
-import { ingest, type NormRecord } from "./ingest";
+import { ingest, SOURCE, type NormRecord } from "./ingest";
 import { clk, clkrange, lday } from "./format";
 import { norm, normAll, type RawRecord } from "../testing/records";
 
@@ -115,14 +115,14 @@ describe("shapeRecords — the per-session runtime aggregate", () => {
   it("appends exactly one record per session with turns", () => {
     const out = shapeRecords(turns);
     expect(out).toHaveLength(turns.length + 2);
-    const synthetic = out.filter((r) => r.source === "runtime");
+    const synthetic = out.filter((r) => r.source === SOURCE.Runtime);
     expect(synthetic).toHaveLength(2);
   });
 
   it("carries each session's MAX turn_seq", () => {
     const bySession = new Map(
       shapeRecords(turns)
-        .filter((r) => r.source === "runtime")
+        .filter((r) => r.source === SOURCE.Runtime)
         .map((r) => [r.session_id, (r.fields as { turns: number }).turns]),
     );
     expect(bySession.get("s1")).toBe(7);
@@ -133,7 +133,7 @@ describe("shapeRecords — the per-session runtime aggregate", () => {
     // Without this, an implementation that emitted one record per SESSION
     // (rather than per session-with-turns) would pass every test above.
     const noTurns = [rec({ session_id: "s9", action: "dispatch.start" })];
-    expect(shapeRecords(noTurns).filter((r) => r.source === "runtime")).toHaveLength(0);
+    expect(shapeRecords(noTurns).filter((r) => r.source === SOURCE.Runtime)).toHaveLength(0);
     expect(shapeRecords(noTurns)).toHaveLength(1);
   });
 

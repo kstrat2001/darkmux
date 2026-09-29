@@ -19,7 +19,8 @@
  */
 
 import { GIB, KIB, MIB, memBytes, memPct, memStateCls } from "../../lib/format";
-import type { MachineResources, MachineResourcesModel } from "../../types/handwritten";
+import type { MachineResourcesResponse } from "../../types/generated/MachineResourcesResponse";
+import type { ModelRow } from "../../types/generated/ModelRow";
 
 // ── The gauge (the semicircle hero) ─────────────────────────────────────
 
@@ -38,7 +39,7 @@ export interface GaugeGeometry {
    * `MachineHealthRegion`'s guard). Distinct from a model's OWN
    * `potential_bytes` being `null` (the unpriced-model case, `MemBar`'s
    * absence-not-zero rule) — the MACHINE total's potential field is never
-   * itself nullable (`MachineResources.machine.potential_bytes: number`). */
+   * itself nullable (`MachineResourcesResponse.machine.potential_bytes: number`). */
   commitPct: number | null;
   commitAngleDeg: number | null;
   /** The raw (unclamped) commit percentage exceeded 100 — Σ potential >
@@ -198,7 +199,7 @@ export function resolveGaugeScale(limit: number | null, poolCap: number | null, 
   return Math.max(pot || 0, cur || 0, 1);
 }
 
-/** Builds the whole gauge's geometry off one `MachineResources` payload —
+/** Builds the whole gauge's geometry off one `MachineResourcesResponse` payload —
  * the single source every element on the face (needle, ticks, commit
  * marker, redline) reads from, so none of them can disagree about what the
  * scale means. */
@@ -249,7 +250,7 @@ export interface BandGeometry {
  * between darkmux's end and the needle — which is more honest than absence,
  * not less.
  */
-export function computeBandGeometry(resources: MachineResources): BandGeometry {
+export function computeBandGeometry(resources: MachineResourcesResponse): BandGeometry {
   const geo = computeGaugeGeometry(resources);
   const scale = geo.scale;
   const pctOf = (b: number | null | undefined): number => (b == null || !scale ? 0 : Math.max(0, Math.min(100, (Number(b) / scale) * 100)));
@@ -301,7 +302,7 @@ export function hatchedSegmentDash(startPct: number, lengthPct: number, dash = 2
   return parts.map((n) => Number(n.toFixed(3))).join(" ");
 }
 
-export function computeGaugeGeometry(resources: MachineResources): GaugeGeometry {
+export function computeGaugeGeometry(resources: MachineResourcesResponse): GaugeGeometry {
   const limit = resources.limit_bytes != null ? Number(resources.limit_bytes) : null;
   const poolCap = resources.pool?.capacity_bytes != null ? Number(resources.pool.capacity_bytes) : null;
   const pot = resources.machine.potential_bytes != null ? Number(resources.machine.potential_bytes) : null;
@@ -527,7 +528,7 @@ export function digitCells(s: string): string[] {
  * (the detail-layer's two-decimal convention) rather than the gauge's own
  * one-decimal `gaugeValueParts` — these are k/v figures, not the glance
  * layer. */
-export function odometerTiles(pressure: MachineResources["pressure"]): OdometerView[] {
+export function odometerTiles(pressure: MachineResourcesResponse["pressure"]): OdometerView[] {
   const marginText =
     pressure.margin_percent != null && Number.isFinite(Number(pressure.margin_percent))
       ? String(Math.round(Number(pressure.margin_percent)))
@@ -587,7 +588,7 @@ type RowStatus = "live" | "new" | "ghost";
 export interface ResidencyRowView {
   identifier: string;
   owner: string;
-  model: MachineResourcesModel;
+  model: ModelRow;
   status: RowStatus;
   /** For a ghost row: when it was last actually resident. For a live/new
    * row: the current poll's timestamp (unused by live rows, carried for
@@ -599,7 +600,7 @@ export interface ResidencyRowView {
 }
 
 interface KnownEntry {
-  model: MachineResourcesModel;
+  model: ModelRow;
   lastSeenMs: number;
   firstSeenMs: number;
 }
@@ -611,7 +612,7 @@ export interface ResidencyState {
   shownGhosts: Set<string>;
 }
 
-function rowIdentifier(m: MachineResourcesModel): string {
+function rowIdentifier(m: ModelRow): string {
   return m.identifier || m.model_key;
 }
 
@@ -636,7 +637,7 @@ function rowIdentifier(m: MachineResourcesModel): string {
  */
 export function advanceResidency(
   prev: ResidencyState | null,
-  currentModels: MachineResourcesModel[],
+  currentModels: ModelRow[],
   nowMs: number,
 ): { state: ResidencyState; rows: ResidencyRowView[] } {
   const known = new Map<string, KnownEntry>();
@@ -745,7 +746,7 @@ export { memStateCls };
  * named once here rather than an inline string compare repeated at every
  * call site (matching this module's convention of naming every condition a
  * marker renders on: `rowStateDiffers`, `isOverLimit`, `redlineLit`). */
-export function isEstimatedRow(m: Pick<MachineResourcesModel, "potential_source">): boolean {
+export function isEstimatedRow(m: Pick<ModelRow, "potential_source">): boolean {
   return m.potential_source === "estimated";
 }
 
@@ -755,7 +756,7 @@ export function isEstimatedRow(m: Pick<MachineResourcesModel, "potential_source"
  * string (docs/design/machine-lens/provenance.md row ⑮'s traced identities all read off this exact
  * text). Detail-layer precision (`memBytes()`, two decimals) — this is a
  * k/v row, not the glance layer. */
-export function modelKvLine(m: MachineResourcesModel): string {
+export function modelKvLine(m: ModelRow): string {
   const kv = m.kv_bytes_at_ctx != null ? `kv@ctx ${memBytes(m.kv_bytes_at_ctx)}` : "kv unknown (no arch facts)";
   // #1819: an ESTIMATED row's potential is a labeled guess, not a
   // measurement — the `~` and `(estimated)` suffix travel with the FIGURE

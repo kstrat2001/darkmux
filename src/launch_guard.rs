@@ -179,7 +179,7 @@ impl Drop for WatchdogStopGuard {
 ///   synchronous `kill_all` here is the thing that guarantees the child is
 ///   dead before this process is.
 /// * **Radio returns an exit code through `main`** and had a real
-///   destructor in flight (`_synth`'s tempdir). At the #2462 sites the
+///   destructor in flight (a prepared launch's tempdir). At the #2462 sites the
 ///   dispatch call has already returned, so the ONLY live destructor the
 ///   exit skips is [`WatchdogStopGuard`]'s stop-flag store — whose entire
 ///   job ends with the process — and the alternative exit code is std's

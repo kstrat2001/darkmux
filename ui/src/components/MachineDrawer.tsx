@@ -66,7 +66,8 @@ import { useIsMobile } from "../hooks/useIsMobile";
 import type { Route } from "../lib/route";
 import type { ReactNode } from "react";
 import type { LiveTailStatus } from "../hooks/useLiveTail";
-import type { MachineSpecs, PresenceBeat } from "../types/handwritten";
+import type { MachineSpecsResponse } from "../types/generated/MachineSpecsResponse";
+import type { PresenceBeat } from "../types/generated/PresenceBeat";
 import type { NormRecord } from "../lib/ingest";
 
 export interface MachineDrawerProps {
@@ -80,7 +81,7 @@ export interface MachineDrawerProps {
    * app, so this reads identically to the fleet card and the machine
    * lens rather than re-deriving its own copy. */
   liveMachines: Map<string, PresenceBeat>;
-  specs: MachineSpecs | null;
+  specs: MachineSpecsResponse | null;
   /** For the "about" section's connection/mode rows — the retired
    * `AboutDialog`'s own inputs, unchanged. */
   liveStatus: LiveTailStatus;

@@ -229,7 +229,7 @@ function utilityStreams(): [NormRecord[], NormRecord[]] {
   const compaction = (sid: string, total: number, extra: Record<string, unknown> = {}, mission?: string) =>
     ({ ...usage(sid, "compactor", { call_kind: CALL_KIND.compaction, purpose: PURPOSE.utility, requested_model: "darkmux:c4b", endpoint: LMS, token_source: "provider", prompt_tokens: total - 80, completion_tokens: 80, total_tokens: total, ...extra }, mission), model: "darkmux:c4b" }) as NormRecord;
 
-  both(r({ action: "dispatch.start", session_id: "h1", handle: "coder", model: "gpt-5.1", payload: { runtime: "internal", endpoint: HOSTED } }));
+  both(r({ action: "dispatch.start", session_id: "h1", handle: "coder", model: "gpt-5.1", payload: { endpoint: HOSTED } }));
   both(r({ action: "dispatch.turn.heartbeat", session_id: "h1", payload: { turn_seq: 1, generated_chars: 20000, sampled_at_ms: 1000 } }));
   both(r({ action: "dispatch.turn", session_id: "h1", payload: { turn_seq: 1, generation_ms: 2000 } }));
   both(usage("h1", "coder", { call_kind: CALL_KIND.turn, purpose: PURPOSE.work, requested_model: "gpt-5.1", endpoint: HOSTED, token_source: "provider", turn_seq: 1, prompt_tokens: 900, completion_tokens: 100, total_tokens: 1000 }));
@@ -237,7 +237,7 @@ function utilityStreams(): [NormRecord[], NormRecord[]] {
   only(compaction("h1", 120, { purpose: undefined }));
   both(r({ action: "dispatch.turn", session_id: "h1", payload: { turn_seq: 2, generation_ms: 500 } }));
   both(usage("h1", "coder", { call_kind: CALL_KIND.turn, purpose: PURPOSE.work, requested_model: "gpt-5.1", endpoint: HOSTED, token_source: "provider", turn_seq: 2, prompt_tokens: 1100, completion_tokens: 100, total_tokens: 1200 }));
-  both(r({ action: "dispatch.complete", session_id: "h1", handle: "coder", payload: { runtime: "internal", endpoint: HOSTED, result_class: "ok", total_turns: 2, prompt_tokens: 2000, completion_tokens: 200, total_tokens: 2200 } }));
+  both(r({ action: "dispatch.complete", session_id: "h1", handle: "coder", payload: { endpoint: HOSTED, result_class: "ok", total_turns: 2, prompt_tokens: 2000, completion_tokens: 200, total_tokens: 2200 } }));
 
   both(r({ action: "dispatch.start", session_id: "task-t3", handle: "cs", mission_id: M, payload: { step_id: "cs", kind: "dispatch.internal" } }));
   both(usage("task-t3", "cs", { call_kind: CALL_KIND.turn, purpose: PURPOSE.work, requested_model: "darkmux:q", endpoint: LMS, token_source: "provider", turn_seq: 1, prompt_tokens: 400, completion_tokens: 50, total_tokens: 450, step_id: "cs" }, M));
@@ -310,9 +310,9 @@ describe("the run page and the mission graph exclude utility (contract 8)", () =
   it("a session whose only calls are utility jobs (radio routing) IS that job: its page shows them", () => {
     clock = 0;
     const recs = [
-      r({ action: "dispatch.start", session_id: "rr", handle: "radio-router", payload: { runtime: "direct" } }),
+      r({ action: "dispatch.start", session_id: "rr", handle: "radio-router", payload: {} }),
       usage("rr", "radio-router", { call_kind: CALL_KIND.single_shot, purpose: PURPOSE.utility, prompt_tokens: 50, completion_tokens: 7, total_tokens: 57 }),
-      r({ action: "dispatch.complete", session_id: "rr", handle: "radio-router", payload: { runtime: "direct", total_tokens: 57, prompt_tokens: 50, completion_tokens: 7 } }),
+      r({ action: "dispatch.complete", session_id: "rr", handle: "radio-router", payload: { total_tokens: 57, prompt_tokens: 50, completion_tokens: 7 } }),
     ];
     expect(tile(recs, "rr", "TOKENS IN")).toBe("50");
     expect(tile(recs, "rr", "TOKENS OUT")).toBe("7");
@@ -321,9 +321,9 @@ describe("the run page and the mission graph exclude utility (contract 8)", () =
   it("a single-shot run's tiles read its usage record, not its complete", () => {
     clock = 0;
     const recs = [
-      r({ action: "dispatch.start", session_id: "ss", handle: "analyst", payload: { runtime: "direct" } }),
+      r({ action: "dispatch.start", session_id: "ss", handle: "analyst", payload: {} }),
       usage("ss", "analyst", { call_kind: CALL_KIND.single_shot, purpose: PURPOSE.work, prompt_tokens: 60, completion_tokens: 9, total_tokens: 69 }),
-      r({ action: "dispatch.complete", session_id: "ss", handle: "analyst", payload: { runtime: "direct", total_tokens: 1, prompt_tokens: 1, completion_tokens: 0 } }),
+      r({ action: "dispatch.complete", session_id: "ss", handle: "analyst", payload: { total_tokens: 1, prompt_tokens: 1, completion_tokens: 0 } }),
     ];
     expect(tile(recs, "ss", "TOKENS IN")).toBe("60");
     expect(tile(recs, "ss", "TOKENS OUT")).toBe("9");
@@ -332,8 +332,8 @@ describe("the run page and the mission graph exclude utility (contract 8)", () =
   it("a legacy session (complete only) reads its complete", () => {
     clock = 0;
     const recs = [
-      r({ action: "dispatch.start", session_id: "lg", handle: "analyst", payload: { runtime: "direct" } }),
-      r({ action: "dispatch.complete", session_id: "lg", handle: "analyst", payload: { runtime: "direct", total_tokens: 70, prompt_tokens: 61, completion_tokens: 9 } }),
+      r({ action: "dispatch.start", session_id: "lg", handle: "analyst", payload: {} }),
+      r({ action: "dispatch.complete", session_id: "lg", handle: "analyst", payload: { total_tokens: 70, prompt_tokens: 61, completion_tokens: 9 } }),
     ];
     expect(tile(recs, "lg", "TOKENS IN")).toBe("61");
   });

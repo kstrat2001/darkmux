@@ -4,6 +4,7 @@
 
 #![allow(dead_code)]
 
+use crate::retired_state::{self, parse_state, StateKind};
 use crate::types::*;
 use darkmux_types::paths::{resolve, ResolveScope};
 use anyhow::{Context, Result};
@@ -606,6 +607,15 @@ pub(crate) fn load_crews() -> Result<Vec<Crew>> {
 ///
 /// Built-in missions (currently empty) are merged last, same as other loaders.
 pub fn load_missions() -> Result<Vec<Mission>> {
+    let mut warnings = Vec::new();
+    let missions = read_missions(&mut warnings);
+    say_once(&warnings);
+    missions
+}
+
+/// [`load_missions`] without the saying: every mission it refused is a line in
+/// `warnings`.
+fn read_missions(warnings: &mut Vec<String>) -> Result<Vec<Mission>> {
     use crate::lifecycle;
     let missions_root = missions_dir();
     if !missions_root.is_dir() {
@@ -632,9 +642,9 @@ pub fn load_missions() -> Result<Vec<Mission>> {
         }
         let text = fs::read_to_string(&mission_file)
             .with_context(|| format!("reading {}", mission_file.display()))?;
-        match serde_json::from_str::<Mission>(&text) {
+        match parse_state::<Mission>(StateKind::Mission, &mission_file, &text) {
             Ok(m) => { map.insert(m.id.clone(), m); }
-            Err(e) => eprintln!("warning: failed to parse mission at {}: {e}", mission_file.display()),
+            Err(e) => warnings.push(format!("warning: failed to read mission: {e:#}")),
         }
     }
 
@@ -651,6 +661,17 @@ pub fn load_missions() -> Result<Vec<Mission>> {
     Ok(out)
 }
 
+/// Say each of `warnings` on stderr unless this process already said it: the
+/// serve daemon loads missions and phases on every poll, and the same refused
+/// file would otherwise repeat on each one. Returns how many it said.
+fn say_once(warnings: &[String]) -> usize {
+    warnings
+        .iter()
+        .filter(|line| crate::budget::first_refusal(line))
+        .inspect(|line| eprintln!("{line}"))
+        .count()
+}
+
 /// Load all phases from the new per-mission nested layout.
 ///
 /// Walks every `<root>/missions/<mission-id>/phases/*.json`.  The
@@ -658,7 +679,44 @@ pub fn load_missions() -> Result<Vec<Mission>> {
 /// name is needed.  Legacy flat phase files under `<root>/phases/`
 /// are silently ignored — the migration verb is the bridge.
 pub fn load_phases() -> Result<Vec<Phase>> {
-    use crate::lifecycle;
+    let mut warnings = Vec::new();
+    let phases = read_phases(&mut warnings);
+    say_once(&warnings);
+    phases
+}
+
+/// Read every `*.json` phase file under one mission's phases directory into
+/// `map`, keyed by `(mission_id, phase_id)`; a file that will not parse is a
+/// line in `warnings`.
+fn read_mission_phases(
+    mission_id: &str,
+    map: &mut BTreeMap<(String, String), Phase>,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    let phases_dir = crate::lifecycle::phases_dir(mission_id);
+    if !phases_dir.is_dir() {
+        return Ok(());
+    }
+    for phase_entry in fs::read_dir(&phases_dir)
+        .with_context(|| format!("reading {}", phases_dir.display()))?
+    {
+        let phase_path = phase_entry?.path();
+        if !phase_path.is_file() || phase_path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let text = fs::read_to_string(&phase_path)
+            .with_context(|| format!("reading {}", phase_path.display()))?;
+        match parse_state::<Phase>(StateKind::Phase, &phase_path, &text) {
+            Ok(s) => { map.insert((s.mission_id.clone(), s.id.clone()), s); }
+            Err(e) => warnings.push(format!("warning: failed to read phase: {e:#}")),
+        }
+    }
+    Ok(())
+}
+
+/// [`load_phases`] without the saying: a leftover `sprints/` directory and
+/// every phase it refused is a line in `warnings`.
+fn read_phases(warnings: &mut Vec<String>) -> Result<Vec<Phase>> {
     let missions_root = missions_dir();
     if !missions_root.is_dir() {
         return Ok(Vec::new());
@@ -678,28 +736,10 @@ pub fn load_phases() -> Result<Vec<Phase>> {
             Some(s) => s.to_string(),
             None => continue,
         };
-        let phases_dir = lifecycle::phases_dir(&mission_id);
-        if !phases_dir.is_dir() {
-            continue;
+        if let Some(retired) = retired_state::retired_phases_dir(&path) {
+            warnings.push(format!("warning: {}: {}", retired.path.display(), retired.fix));
         }
-        for phase_entry in fs::read_dir(&phases_dir)
-            .with_context(|| format!("reading {}", phases_dir.display()))?
-        {
-            let phase_entry = phase_entry?;
-            let phase_path = phase_entry.path();
-            if !phase_path.is_file() {
-                continue;
-            }
-            if phase_path.extension().and_then(|s| s.to_str()) != Some("json") {
-                continue;
-            }
-            let text = fs::read_to_string(&phase_path)
-                .with_context(|| format!("reading {}", phase_path.display()))?;
-            match serde_json::from_str::<Phase>(&text) {
-                Ok(s) => { map.insert((s.mission_id.clone(), s.id.clone()), s); }
-                Err(e) => eprintln!("warning: failed to parse phase at {}: {e}", phase_path.display()),
-            }
-        }
+        read_mission_phases(&mission_id, &mut map, warnings)?;
     }
 
     // Built-in phases (currently empty — future-proofing).

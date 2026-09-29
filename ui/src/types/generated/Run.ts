@@ -56,9 +56,9 @@ updated_ts?: number,
  */
 tracked: boolean, 
 /**
- * (#1915) The flow session this row can be drilled into via
- * `#dispatch=<id>` (#1974 renamed it from `#session=<id>`; that
- * spelling survives as a one-release parser alias) — the SAME
+ * (#1915) The id this row's dispatch is opened by: the key
+ * `GET /flow-dispatch/:id` and the viewer's `#dispatch=<id>` route take
+ * (the retired `#session=<id>` spelling is refused), the SAME
  * representative-session pick
  * [`mission_to_run`]/[`flow_mission_to_run`] already make for
  * role/model/route, now also carried out to the client instead of
@@ -94,7 +94,7 @@ tracked: boolean,
  * record at all). An untracked mission can open its representative
  * SESSION, never its graph; that limit is structural, not a gap this
  * field closes. Carrying it uniformly means the client's own rule
- * ("untracked and has a `session_id`" — see `runDestination`'s doc)
+ * ("untracked and has a `dispatch_id`", see `runDestination`'s doc)
  * never needs a kind-specific carve-out, for missions OR any future
  * kind that gains the same shape.
  *
@@ -114,7 +114,7 @@ tracked: boolean,
  * deliberately-versioned fix — this field only refuses to act on the
  * corruption, it does not repair it.
  */
-session_id?: string, 
+dispatch_id?: string, 
 /**
  * (#1907) Set only when `status == RunStatus::Abandoned` — see
  * [`AbandonReason`]'s own doc. `RunStatus::Abandoned` alone collapses

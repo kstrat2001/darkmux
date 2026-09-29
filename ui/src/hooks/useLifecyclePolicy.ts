@@ -2,6 +2,7 @@ import { useEffect, useSyncExternalStore } from "react";
 import { fetchJson } from "../lib/fetcher";
 import { DEFAULT_POLICY, policyOf, type LifecyclePolicy } from "../lib/lifecycle";
 import { getSource } from "../lib/source";
+import type { HealthResponse } from "../types/generated/HealthResponse";
 import type { RunsPolicy } from "../types/generated/RunsPolicy";
 
 /** The lifecycle policy the daemon judges runs by, read once per page from
@@ -20,8 +21,10 @@ function isPolicy(p: unknown): p is RunsPolicy {
 }
 
 async function load(): Promise<void> {
-  const res = await fetchJson<{ lifecycle_policy?: unknown }>("/health");
-  const p = res.ok ? res.data.lifecycle_policy : undefined;
+  const res = await fetchJson<HealthResponse>("/health");
+  // A static build or a failed read has no body; the guard keeps a daemon
+  // that answered without the policy from being trusted on its type alone.
+  const p: unknown = res.ok ? res.data.lifecycle_policy : undefined;
   if (!isPolicy(p)) {
     console.warn("darkmux viewer: the daemon published no lifecycle policy on /health; runs are judged by the default (a run silent for 20 minutes has stopped).");
     return;

@@ -144,6 +144,7 @@ pub mod power_policy;
 // `dispatch.map` fan-out and `darkmux-lab`'s review pipeline construct.
 pub mod budget;
 pub mod remote_budget;
+pub mod retired_state;
 // (#2421) Mission-envelope records-emitted aggregation — see the module doc
 // for why this lives here rather than in `darkmux-serve`.
 pub mod records_emitted;
@@ -190,6 +191,7 @@ pub mod utility;
 /// One consumer reads another's value THROUGH a struct; the deserialize is
 /// the validation.
 pub mod step_output;
+pub mod step_config;
 pub mod step_kinds;
 pub mod telemetry_sampler;
 // (#2774 round-4) Validated severity bands for the thermal ladder's soft

@@ -12,18 +12,16 @@
 //!
 //! - (#1684, Packet 1 — RESOLVED) Commands used to be limited to a single
 //!   HARDCODED `/review` with a fixed "not supported" reply for anything
-//!   else. `session/new` now advertises every mission config in the merged
-//!   registry (built-ins + `~/.darkmux/mission-configs/`) that declares a
-//!   `panel` block — see `src/acp_panel.rs`, which owns the registry
-//!   enumeration, the ephemeral-vs-mission-launch routing decision, and the
-//!   in-process ephemeral graph runner. `review` itself now reaches this
-//!   file's generic [`run_launch_command`] through that SAME routing path
-//!   (rather than a hand-rolled string match or a bespoke `run_review`
-//!   function — #2310 P4d deleted the dedicated review launcher, and
-//!   `run_launch_command` synthesizes the diff/workspace inputs review
-//!   needs via `acp_panel::synthesize_diff_launch_inputs` before spawning
-//!   the same `mission launch <config_id>` subprocess every other panel
-//!   command uses).
+//!   else. Then each mission config advertised itself through a `panel`
+//!   block. Both are gone: the panel advertises ONE command, `/mission`,
+//!   with `list`, `launch <config> [name=value ...]` and `show <id>` verbs,
+//!   so every launchable config runs from the panel with no config naming
+//!   itself into it. `src/acp_panel.rs` owns the grammar, the launch
+//!   planning and the in-process ephemeral runner; `review` reaches this
+//!   file's generic [`run_launch_command`] as `/mission launch review`
+//!   (`acp_panel::prepare_launch` synthesizes the diff/workspace inputs it
+//!   needs from the session's cwd, then the same `mission launch
+//!   <config_id>` subprocess every other config uses runs).
 //! - (#2310 P4d — RESOLVED) Review-stage progress used to be recognized by
 //!   pattern-matching known substrings out of the review subprocess's own
 //!   stderr (`REVIEW_STAGES`/`recognize_stage`, since deleted along with
@@ -376,9 +374,8 @@ fn build_session_config_options(overrides: &crate::radio_answer::AnswererOverrid
     vec![radio_host, humor]
 }
 
-/// Send the `AvailableCommandsUpdate` notification advertising every
-/// registry mission config that declares a `panel` block (#1684) — the
-/// SAME resolution `darkmux mission launch` / `mission status` use.
+/// Send the `AvailableCommandsUpdate` notification advertising the panel's
+/// one command, `/mission` (`list`, `launch <config>`, `show <id>`).
 ///
 /// Shared by `session/new` and `session/load` (#1698 Packet B2 gate): a
 /// resumed session needs the menu as much as a fresh one, and one copy of
@@ -392,26 +389,14 @@ fn advertise_panel_commands(
     session_id: SessionId,
     origin: &str,
 ) -> Result<(), agent_client_protocol::Error> {
-    let panel_commands = crate::acp_panel::list_panel_commands();
-    eprintln!(
-        "[darkmux-acp] {origin}: advertising {} panel command(s): {}",
-        panel_commands.len(),
-        panel_commands.iter().map(|c| c.id.as_str()).collect::<Vec<_>>().join(", ")
-    );
-    let commands = AvailableCommandsUpdate::new(
-        panel_commands
-            .iter()
-            .map(|c| {
-                let cmd = AvailableCommand::new(c.id.clone(), c.description.clone());
-                match &c.hint {
-                    Some(hint) => cmd.input(AvailableCommandInput::Unstructured(
-                        UnstructuredCommandInput::new(hint.clone()),
-                    )),
-                    None => cmd,
-                }
-            })
-            .collect::<Vec<_>>(),
-    );
+    eprintln!("[darkmux-acp] {origin}: advertising `/{}`", crate::acp_panel::MISSION_COMMAND);
+    let commands = AvailableCommandsUpdate::new(vec![AvailableCommand::new(
+        crate::acp_panel::MISSION_COMMAND,
+        crate::acp_panel::MISSION_DESCRIPTION,
+    )
+    .input(AvailableCommandInput::Unstructured(UnstructuredCommandInput::new(
+        crate::acp_panel::MISSION_HINT,
+    )))]);
     cx.send_notification(SessionNotification::new(
         session_id,
         SessionUpdate::AvailableCommandsUpdate(commands),
@@ -871,6 +856,27 @@ fn reap_on_host_shutdown() {
     std::process::exit(130);
 }
 
+/// Log the client's requested protocol version and identity to stderr
+/// unconditionally (never stdout; see module docs), so what Zed sends is
+/// observable.
+fn log_initialize(initialize: &InitializeRequest) {
+    eprintln!("[darkmux-acp] initialize: client requested protocol version {}", initialize.protocol_version);
+    if let Some(info) = &initialize.client_info {
+        eprintln!("[darkmux-acp] initialize: client_info = {} {}", info.name, info.version);
+    }
+}
+
+/// The mission verb a slash prompt names, or the reply to send back: what is
+/// available for a malformed `/mission ...`, the not-a-command listing for a
+/// bare `/`.
+fn slash_verb(text: &str) -> std::result::Result<crate::acp_panel::MissionVerb, String> {
+    match crate::acp_panel::parse_invocation(text) {
+        Some(crate::acp_panel::PanelInvocation::Mission(verb)) => Ok(verb),
+        Some(crate::acp_panel::PanelInvocation::Refused(reply)) => Err(reply),
+        None => Err(crate::acp_panel::not_a_command_message()),
+    }
+}
+
 /// `transport` is generic (#1698 Packet B test infrastructure) — production
 /// (`run()` above) passes real `AcpStdio::new()`; pipe-level tests pass
 /// `agent_client_protocol::ByteStreams::new(writer, reader)` over an
@@ -935,19 +941,7 @@ async fn serve(
         .builder()
         .on_receive_request(
             async move |initialize: InitializeRequest, responder, _cx| {
-                // The operator specifically wants to know, empirically,
-                // what protocol version Zed sends — log it unconditionally
-                // to stderr (never stdout; see module docs).
-                eprintln!(
-                    "[darkmux-acp] initialize: client requested protocol version {}",
-                    initialize.protocol_version
-                );
-                if let Some(info) = &initialize.client_info {
-                    eprintln!(
-                        "[darkmux-acp] initialize: client_info = {} {}",
-                        info.name, info.version
-                    );
-                }
+                log_initialize(&initialize);
                 responder.respond(
                     InitializeResponse::new(initialize.protocol_version)
                         .agent_capabilities(
@@ -1008,16 +1002,8 @@ async fn serve(
                         .config_options(Some(build_session_config_options(&overrides))),
                 )?;
 
-                // (#1684) Registry-driven advertising — every mission
-                // config in the merged registry (built-ins +
-                // `~/.darkmux/mission-configs/`) that declares a `panel`
-                // block, via `acp_panel::list_panel_commands` (the SAME
-                // resolution `darkmux mission launch`/`mission status`
-                // already use). This REPLACES the pre-#1684 hardcoded
-                // single `/review` command — `review` is no longer special
-                // here at all; it's advertised because the built-in
-                // `review.json` now carries a `panel` block like any other
-                // config would.
+                // The panel advertises one generic command, `/mission`;
+                // no config names itself into the palette.
                 advertise_panel_commands(&cx, session_id, "session/new")
             },
             agent_client_protocol::on_receive_request!(),
@@ -1042,57 +1028,22 @@ async fn serve(
                 // (`run_no_slash_route` below) — never a pattern match, a
                 // small local routing seat's classification instead.
                 if trimmed.is_empty() {
-                    let advertised = crate::acp_panel::list_panel_commands();
-                    let _ = cx.send_notification(agent_chunk(
-                        &session_id,
-                        crate::acp_panel::not_a_command_message(&advertised),
-                    ));
+                    let _ = cx.send_notification(agent_chunk(&session_id, crate::acp_panel::not_a_command_message()));
                     return responder.respond(PromptResponse::new(StopReason::EndTurn));
                 }
 
                 if trimmed.starts_with('/') {
-                    // (#1684) Registry-driven command dispatch — replaces the
-                    // pre-#1684 hardcoded `is_review_command` string match.
-                    // `advertised` is recomputed HERE, per prompt, rather than
-                    // reused from `session/new` — the registry can change
-                    // between the two (an operator edits/adds a mission-config
-                    // file mid-session).
-                    let advertised = crate::acp_panel::list_panel_commands();
-                    let route = crate::acp_panel::parse_command(&text)
-                        .and_then(|(cmd, args)| {
-                            // (#2050 sweep) `panel.accepts_args: false` was
-                            // enforced only on the ROUTED channel
-                            // (`radio::decide_route`); this direct
-                            // `/command args` path forwarded whatever the
-                            // operator typed. Decided here, where the
-                            // registry entry is in hand, and the notice is
-                            // sent below rather than dropping the text
-                            // silently. See `acp_panel::enforce_accepts_args`.
-                            let (args, notice) =
-                                crate::acp_panel::enforce_accepts_args(&advertised, &cmd, &args);
-                            crate::acp_panel::route_command(&advertised, &cmd)
-                                .map(|plan| (plan, args, notice))
-                        });
-
-                    let Some((plan, args, args_notice)) = route else {
-                        // Never hang, never bounce an error across the
-                        // protocol boundary for an input we just don't support
-                        // yet — reply plainly and end the turn. Lists the
-                        // CURRENTLY advertised commands instead of hardcoding
-                        // `/review`.
-                        let _ = cx.send_notification(agent_chunk(
-                            &session_id,
-                            crate::acp_panel::not_a_command_message(&advertised),
-                        ));
-                        return responder.respond(PromptResponse::new(StopReason::EndTurn));
+                    // The slash grammar is parsed once, here, into a typed
+                    // invocation (`acp_panel::parse_invocation`): `/mission
+                    // list|launch|show`, or a refusal naming what exists. A
+                    // bare `/` is not an invocation at all.
+                    let verb = match slash_verb(&text) {
+                        Ok(verb) => verb,
+                        Err(reply) => {
+                            let _ = cx.send_notification(agent_chunk(&session_id, reply));
+                            return responder.respond(PromptResponse::new(StopReason::EndTurn));
+                        }
                     };
-
-                    // Told BEFORE the command runs, so the operator reads
-                    // "your text was not passed on" next to the invocation
-                    // rather than after its output.
-                    if let Some(notice) = args_notice {
-                        let _ = cx.send_notification(agent_chunk(&session_id, notice));
-                    }
 
                     let Some(cwd) = session_cwd(&sessions_for_prompt, &session_id) else {
                         let _ = cx.send_notification(agent_chunk(&session_id, NO_CWD_MESSAGE));
@@ -1164,21 +1115,12 @@ async fn serve(
                         let work_cx = cx_task.clone();
                         let work_sessions = sessions_for_task.clone();
                         let work_cwd = cwd.clone();
-                        let work_args = args.clone();
                         let stop_reason = run_cancellable(
                             &in_flight_tasks_for_task,
                             session_id.clone(),
                             cx_task.clone(),
                             async move {
-                                execute_route_plan(
-                                    &work_session_id,
-                                    plan,
-                                    &work_args,
-                                    &work_cwd,
-                                    &work_cx,
-                                    &work_sessions,
-                                )
-                                .await
+                                execute_mission_verb(&work_session_id, verb, &work_cwd, &work_cx, &work_sessions).await
                             },
                         )
                         .await;
@@ -1298,9 +1240,7 @@ async fn serve(
                 // resumed thread with no pickers and possibly an empty slash
                 // menu — which defeats this scope's whole purpose, since the
                 // reason `session/load` exists here is to make binary swaps
-                // and reconnects INVISIBLE. (Typed `/pr-list` still works
-                // either way: `route_command` resolves against the registry,
-                // never against the advertised list.)
+                // and reconnects INVISIBLE.
                 //
                 // Same respond-FIRST ordering as `session/new`: a
                 // notification naming a session id the client hasn't been
@@ -1610,28 +1550,104 @@ fn session_shelf_push(sessions: &Sessions, session_id: &SessionId, entry: crate:
     }
 }
 
-/// Turn a resolved [`crate::acp_panel::RoutePlan`] into an actual execution
-/// — the SAME two-way match `serve()`'s `PromptRequest` handler ran
-/// inline before #1698 Packet B, extracted so BOTH the slash-command path
-/// AND the new no-slash channel (`run_no_slash_route` below) drive
-/// identical behavior once a plan is resolved: same
-/// `run_ephemeral_command`/`run_launch_command` execution primitives, same
-/// gates, no divergence between "the operator typed `/review`" and "the
-/// operator typed `review this` and the router picked `/review`".
-async fn execute_route_plan(
+/// Run one `/mission` verb. `list` and `show` are read-only renders of the
+/// derivations `darkmux mission config list` and `darkmux mission show`
+/// print; `launch` goes through [`execute_launch_plan`]. Every failure is a
+/// chunk of text, never an error across the protocol boundary.
+async fn execute_mission_verb(
     session_id: &SessionId,
-    plan: crate::acp_panel::RoutePlan,
-    args: &str,
+    verb: crate::acp_panel::MissionVerb,
     cwd: &Path,
     cx: &ConnectionTo<Client>,
     sessions: &Sessions,
 ) -> Result<()> {
-    match plan {
-        crate::acp_panel::RoutePlan::Ephemeral(config) => {
-            run_ephemeral_command(session_id, *config, args.to_string(), cwd.to_path_buf(), cx, sessions).await
+    use crate::acp_panel::MissionVerb;
+    match verb {
+        MissionVerb::List => {
+            let text = tokio::task::spawn_blocking(crate::acp_panel::mission_list_text)
+                .await
+            .context("joining the mission list task")?;
+            Ok(cx.send_notification(agent_chunk(session_id, text))?)
         }
-        crate::acp_panel::RoutePlan::Launch(config_id) => {
-            run_launch_command(session_id, &config_id, args, cwd, cx, sessions).await
+        MissionVerb::Show { id } => {
+            let shown = tokio::task::spawn_blocking(move || crate::mission_show::build(&id))
+                .await
+                .context("joining the mission show task")?;
+            let text = match shown {
+                Ok(show) => crate::mission_show::render_text(&show),
+                Err(e) => format!("darkmux: {e:#}"),
+            };
+            Ok(cx.send_notification(agent_chunk(session_id, text))?)
+        }
+        MissionVerb::Launch { config_id, rest } => match crate::acp_panel::plan_launch(&config_id, &rest) {
+            Ok(plan) => execute_launch_plan(session_id, plan, cwd, cx, sessions).await,
+            Err(e) => Ok(cx.send_notification(agent_chunk(session_id, format!("darkmux: {e:#}")))?),
+        },
+    }
+}
+
+/// Turn a resolved [`crate::acp_panel::LaunchPlan`] into an actual execution.
+/// BOTH the slash path (`/mission launch`) and the no-slash channel
+/// (`run_no_slash_route`) come through here, so "the operator typed `/mission
+/// launch review`" and "the operator typed `review this` and the router
+/// picked `review`" (and the user confirmed) run identical code: same input preparation, same
+/// execution primitives, same gates.
+async fn execute_launch_plan(
+    session_id: &SessionId,
+    plan: crate::acp_panel::LaunchPlan,
+    cwd: &Path,
+    cx: &ConnectionTo<Client>,
+    sessions: &Sessions,
+) -> Result<()> {
+    let Some(prepared) = prepare_or_report(session_id, &plan, cwd, cx)? else { return Ok(()) };
+    run_prepared_launch(session_id, plan, prepared, cwd, cx, sessions).await
+}
+
+/// Prepare `plan`'s inputs from the cwd ([`crate::acp_panel::prepare_launch`]).
+/// `None` after telling the panel why nothing will run (nothing to review, or
+/// a launch that cannot run here); otherwise the prepared launch, with any
+/// note about work its synthesized diff does not cover already sent.
+fn prepare_or_report(
+    session_id: &SessionId,
+    plan: &crate::acp_panel::LaunchPlan,
+    cwd: &Path,
+    cx: &ConnectionTo<Client>,
+) -> Result<Option<crate::acp_panel::PreparedLaunch>> {
+    let prepared = match crate::acp_panel::prepare_launch(&plan.config, plan.params.clone(), cwd) {
+        Ok(crate::acp_panel::Prepared::Ready(prepared)) => prepared,
+        Ok(crate::acp_panel::Prepared::Nothing(msg)) => {
+            cx.send_notification(agent_chunk(session_id, msg))?;
+            return Ok(None);
+        }
+        Err(e) => {
+            let reply = format!("darkmux: `{}` cannot run here — {e:#}", plan.config_id);
+            cx.send_notification(agent_chunk(session_id, reply))?;
+            return Ok(None);
+        }
+    };
+    if let Some(note) = &prepared.note {
+        let _ = cx.send_notification(agent_chunk(session_id, format!("darkmux: {note}")));
+    }
+    Ok(Some(prepared))
+}
+
+/// Run a prepared launch. The caller holds `prepared` (and its synthesized
+/// inputs' tempdir) until this returns.
+async fn run_prepared_launch(
+    session_id: &SessionId,
+    plan: crate::acp_panel::LaunchPlan,
+    prepared: crate::acp_panel::PreparedLaunch,
+    cwd: &Path,
+    cx: &ConnectionTo<Client>,
+    sessions: &Sessions,
+) -> Result<()> {
+    match plan.route {
+        crate::acp_panel::LaunchRoute::Ephemeral => {
+            let params = prepared.params.clone();
+            run_ephemeral_command(session_id, plan.config, params, plan.raw_args, cwd.to_path_buf(), cx, sessions).await
+        }
+        crate::acp_panel::LaunchRoute::Launch => {
+            run_launch_command(session_id, &plan.config_id, &prepared.params, &plan.raw_args, cwd, cx, sessions).await
         }
     }
 }
@@ -1646,14 +1662,16 @@ async fn execute_route_plan(
 /// one edit.
 ///
 /// **Ordering (issue #1698: "a successful route sends the provenance chunk
-/// FIRST"):** on [`crate::radio::RouteDecision::Route`], the "routed to
-/// /x — from your text" chunk is sent BEFORE [`execute_route_plan`] runs —
+/// FIRST"):** on [`crate::radio::RouteDecision::Route`], the "routing to
+/// /mission launch <id> — from your text" chunk is sent BEFORE [`execute_launch_plan`] runs —
 /// the operator sees WHERE their sentence went before seeing what it did,
-/// same provenance contract the CLI's own `radio: routing to /x — from
+/// same provenance contract the CLI's own `radio: routing to `mission launch <id>` — from
 /// your text` line gives (wall 4: "provenance boxes invisibility").
-/// Execution then runs through the EXACT SAME `RoutePlan` machinery a
-/// slash invocation uses — identical behavior, identical gates; a routed
-/// `/pr-merge` still hits the native sign-off dialog.
+/// The pick is then confirmed through the panel's permission dialog
+/// ([`confirm_then_execute`]), showing the command with every param that will
+/// run, the synthesized ones included; only an allow runs it, through the EXACT SAME `LaunchPlan` machinery a
+/// slash invocation uses, so a routed `pr-merge` still hits its own
+/// sign-off dialog too.
 ///
 /// **On [`crate::radio::RouteDecision::Refuse`]:** the refusal reason is
 /// rendered VERBATIM (persona-bearing operator content — the operator's
@@ -1699,12 +1717,51 @@ async fn run_no_slash_route(
         cx.send_notification(agent_chunk(session_id, format!("darkmux radio: {bad}\n")))?;
         return Ok(());
     }
+    let decision = routed_decision(session_id, text, cx, router_call).await?;
+
+    match decision {
+        // (#1698 Packet B2, scope A) A router refusal no longer prints the
+        // bare reason + listing directly — it goes to the ANSWERING seat
+        // for a grounded, in-persona reply, with the session's real
+        // artifact shelf + config-option overrides. The bare reason +
+        // listing is now the LAST RESORT, rendered only when the
+        // answering dispatch itself fails — see `answer_no_slash_refusal`'s
+        // own doc.
+        crate::radio::RouteDecision::Refuse { reason } => {
+            answer_no_slash_refusal(session_id, text, &reason, cwd, cx, seat, sessions).await
+        }
+        // Not a refusal: the routing seat could not run at all. The answering
+        // seat would fail the same way, so say it once and stop.
+        crate::radio::RouteDecision::Unavailable { error } => {
+            cx.send_notification(agent_chunk(session_id, format!("darkmux: could not reach a model.\n{error}")))?;
+            Ok(())
+        }
+        crate::radio::RouteDecision::Route { command, args } => {
+            announce_and_confirm_route(session_id, &command, &args, cwd, cx, sessions).await
+        }
+    }
+}
+
+/// Route `text` on a blocking task (it dispatches the router seat), telling
+/// the panel when the router waits past the slow-notice threshold.
+async fn routed_decision(
+    session_id: &SessionId,
+    text: &str,
+    cx: &ConnectionTo<Client>,
+    router_call: RouterCall,
+) -> Result<crate::radio::RouteDecision> {
     let text_owned = text.to_string();
     let mut routing = tokio::task::spawn_blocking(move || {
-        let catalog = crate::radio::compile_catalog();
-        crate::radio::route_and_record(&text_owned, &catalog, crate::radio::RadioSurface::Panel, &mut |message: &str| {
-            (router_call)(message)
-        })
+        match crate::radio::compile_catalog() {
+            Ok(catalog) => {
+                crate::radio::route_and_record(&text_owned, &catalog, crate::radio::RadioSurface::Panel, &mut |message: &str| {
+                    (router_call)(message)
+                })
+            }
+            // Every launch is refused, so there is nothing to route to: the
+            // refusal is the reason, handed to the answering seat like any other.
+            Err(refusal) => crate::radio::RouteDecision::Refuse { reason: format!("{refusal:#}") },
+        }
     });
     // (#2917) The router waits behind whatever occupies the one utility
     // instance (a compaction, by decision), but past
@@ -1729,37 +1786,67 @@ async fn run_no_slash_route(
             routing.await.context("joining the radio routing task")?
         }
     };
+    Ok(decision)
+}
 
-    match decision {
-        // (#1698 Packet B2, scope A) A router refusal no longer prints the
-        // bare reason + listing directly — it goes to the ANSWERING seat
-        // for a grounded, in-persona reply, with the session's real
-        // artifact shelf + config-option overrides. The bare reason +
-        // listing is now the LAST RESORT, rendered only when the
-        // answering dispatch itself fails — see `answer_no_slash_refusal`'s
-        // own doc.
-        crate::radio::RouteDecision::Refuse { reason } => {
-            answer_no_slash_refusal(session_id, text, &reason, cwd, cx, seat, sessions).await
-        }
-        // Not a refusal: the routing seat could not run at all. The answering
-        // seat would fail the same way, so say it once and stop.
-        crate::radio::RouteDecision::Unavailable { error } => {
-            cx.send_notification(agent_chunk(session_id, format!("darkmux: could not reach a model.\n{error}")))?;
-            Ok(())
-        }
-        crate::radio::RouteDecision::Route { command, args } => {
-            cx.send_notification(agent_chunk(
-                session_id,
-                format!("darkmux: routing to /{command} — from your text"),
-            ))?;
-            let advertised = crate::acp_panel::list_panel_commands();
-            let plan = crate::acp_panel::route_command(&advertised, &command).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "darkmux acp: routed command `{command}` is no longer advertised (the \
-                     registry changed between routing and execution)"
-                )
-            })?;
-            execute_route_plan(session_id, plan, &args, cwd, cx, sessions).await
+/// A router pick: say where it is going, then ask before running it.
+async fn announce_and_confirm_route(
+    session_id: &SessionId,
+    command: &str,
+    args: &str,
+    cwd: &Path,
+    cx: &ConnectionTo<Client>,
+    sessions: &Sessions,
+) -> Result<()> {
+    cx.send_notification(agent_chunk(
+        session_id,
+        format!("darkmux: routing to /mission launch {command} — from your text"),
+    ))?;
+    match crate::acp_panel::plan_launch(command, args) {
+        Ok(plan) => confirm_then_execute(session_id, plan, cwd, cx, sessions).await,
+        Err(e) => Ok(cx.send_notification(agent_chunk(session_id, format!("darkmux: {e:#}")))?),
+    }
+}
+
+/// `text` in a fenced code block, so backticks, `*` and newlines in it render
+/// literally. The fence is longer than any backtick run inside.
+fn fenced(text: &str) -> String {
+    let mut longest = 0;
+    let mut run = 0;
+    for c in text.chars() {
+        run = if c == '`' { run + 1 } else { 0 };
+        longest = longest.max(run);
+    }
+    let fence = "`".repeat((longest + 1).max(3));
+    format!("{fence}\n{text}\n{fence}")
+}
+
+/// The router's pick is never the consent to run it. The inputs are prepared
+/// first, so the permission dialog shows the command with every param that
+/// will run (the synthesized ones included), and only an explicit allow runs
+/// it. A reject, a cancel or no answer runs nothing and the panel says so,
+/// naming how to run it yourself when its inputs were made from the cwd. (An
+/// explicit `/mission launch` is the user's own command and does not come
+/// through here.)
+async fn confirm_then_execute(
+    session_id: &SessionId,
+    plan: crate::acp_panel::LaunchPlan,
+    cwd: &Path,
+    cx: &ConnectionTo<Client>,
+    sessions: &Sessions,
+) -> Result<()> {
+    let Some(prepared) = prepare_or_report(session_id, &plan, cwd, cx)? else { return Ok(()) };
+    let command_line = crate::radio_cli::launch_command_line(&plan.config_id, &prepared.params);
+    let title = format!("darkmux — run this command chosen from your text? `{}`", plan.config_id);
+    let answer = request_permission(cx, session_id, &plan.config_id, title, &fenced(&command_line)).await;
+    match answer.refusal_reason("radio launch", "confirmation") {
+        None => run_prepared_launch(session_id, plan, prepared, cwd, cx, sessions).await,
+        Some(reason) => {
+            let mut text = format!("darkmux: not run. {reason}. The command was:\n\n{}", fenced(&command_line));
+            if let Some(advice) = crate::radio_cli::synthesized_inputs_advice(&prepared.synthesized_keys()) {
+                text.push_str(&format!("\n\n{advice}"));
+            }
+            Ok(cx.send_notification(agent_chunk(session_id, text))?)
         }
     }
 }
@@ -1810,7 +1897,9 @@ async fn answer_no_slash_refusal(
     let text_owned = text.to_string();
     let cwd_owned = cwd.to_path_buf();
     let outcome = tokio::task::spawn_blocking(move || {
-        let catalog = crate::radio::compile_catalog();
+        // A launch refusal that empties the catalog is already the reason
+        // this turn is answering, so the answer is grounded on no commands.
+        let catalog = crate::radio::compile_catalog().unwrap_or_default();
         crate::radio_answer::answer(
             &text_owned,
             &catalog,
@@ -1835,10 +1924,9 @@ async fn answer_no_slash_refusal(
         }
         Err(e) => {
             eprintln!("[darkmux-acp] radio answering seat failed: {e:#}; falling back to the plain refusal");
-            let advertised = crate::acp_panel::list_panel_commands();
             Ok(cx.send_notification(agent_chunk(
                 session_id,
-                format!("{refusal_reason}\n\n{}", crate::acp_panel::not_a_command_message(&advertised)),
+                format!("{refusal_reason}\n\n{}", crate::acp_panel::not_a_command_message()),
             ))?)
         }
     }
@@ -1864,6 +1952,7 @@ async fn answer_no_slash_refusal(
 async fn run_ephemeral_command(
     session_id: &SessionId,
     config: crate::crew::mission_config::MissionConfig,
+    params: Vec<String>,
     args: String,
     cwd: PathBuf,
     cx: &ConnectionTo<Client>,
@@ -1877,9 +1966,9 @@ async fn run_ephemeral_command(
     // graph that declares `"gate": "operator"`.
     let mut gate = acp_gate_handler(cx.clone(), session_id.clone());
     let config_id = config.id.clone();
-    let args_for_shelf = args.clone();
+    let args_for_shelf = args;
     let handle = tokio::task::spawn_blocking(move || {
-        crate::acp_panel::run_ephemeral(&config, &args, &cwd, Some(&mut gate))
+        crate::acp_panel::run_ephemeral(&config, &params, &cwd, Some(&mut gate))
     });
     // (#1777 merge gate — MUST FIX 1 tier 2) Wrapped in a guard, NOT
     // awaited bare — see `EphemeralJoinGuard`'s own doc and the module
@@ -2004,48 +2093,65 @@ impl Drop for EphemeralJoinGuard {
     }
 }
 
-/// Raise `session/request_permission` to the connected client and await its
-/// decision — the async half of [`acp_gate_handler`]. Runs on a freshly
-/// spawned, concurrent task (never inline inside a request handler — see
-/// `acp_gate_handler`'s own doc on the deadlock this avoids).
-async fn request_operator_sign_off(
+/// What the client answered to a `session/request_permission` dialog. Only
+/// `Allowed` is consent; every other outcome, including no answer at all, is
+/// a refusal, so callers fail closed by matching on `Allowed` alone.
+enum PermissionAnswer {
+    Allowed,
+    /// The client selected an option other than allow.
+    Rejected { option: String },
+    Cancelled,
+    /// An outcome this binary's pinned schema version does not know.
+    Unrecognized,
+    /// The request could not be delivered or the client never replied.
+    Failed { error: String },
+}
+
+impl PermissionAnswer {
+    /// Why nothing ran, for `subject` (e.g. "step `x`"); `None` when allowed.
+    fn refusal_reason(&self, subject: &str, dialog: &str) -> Option<String> {
+        match self {
+            Self::Allowed => None,
+            Self::Rejected { option } => Some(format!("{subject} — operator selected `{option}` at the {dialog} dialog")),
+            Self::Cancelled => Some(format!("{subject} — the {dialog} request was cancelled")),
+            Self::Unrecognized => Some(format!("{subject} — the client returned an unrecognized {dialog} outcome")),
+            Self::Failed { error } => Some(format!("{subject} — the {dialog} request to the client failed: {error}")),
+        }
+    }
+}
+
+/// Raise `session/request_permission` (Allow / Reject) to the connected
+/// client and await its answer. The ONE permission mechanism the panel has:
+/// the operator sign-off gate ([`request_operator_sign_off`]) and the
+/// no-slash launch confirmation both go through it. Runs on an async task,
+/// never inline inside a request handler (see `acp_gate_handler`'s own doc
+/// on the deadlock that avoids).
+async fn request_permission(
     cx: &ConnectionTo<Client>,
     session_id: &SessionId,
-    step_id: &str,
-    facts_text: &str,
-) -> crate::crew::gate::GateDecision {
+    id_tag: &str,
+    title: String,
+    body: &str,
+) -> PermissionAnswer {
     const ALLOW: &str = "allow";
     const REJECT: &str = "reject";
 
-    // (#1684 QA CONSIDER) This `ToolCallId` is never announced via a prior
-    // `SessionUpdate::ToolCall` before this request — unlike the retired
-    // review launcher's own stage tool calls (`stage_tool_call_id`,
-    // deleted with that launcher in #2310 P4d), which always sent a
-    // `ToolCall` notification before referencing that id again. Per the
-    // schema, `RequestPermissionRequest.tool_call` is a `ToolCallUpdate`
-    // (an upsert, not an update-only reference), so this SHOULD be fine on
-    // a spec-compliant client — but this is the same class of "Zed drops
-    // a message naming something it doesn't know about yet" surprise the
-    // Packet-1 wire-ordering finding hit for `AvailableCommandsUpdate` (see
-    // `session/new`'s handler comment above). Live dogfood verified the
-    // dialog renders — for the FIRST gated invocation only, which is why
-    // the id below carries a nonce:
-    //
-    // (#1684, confirmed live) A DETERMINISTIC id here collides on the
-    // second gated invocation in one session: the first dialog's tool call
-    // is already terminal under the same id, Zed renders no new dialog,
-    // and the agent blocks forever on a reply that cannot come (the
-    // operator's canonical approve-then-merge pair hit this on its first
-    // real use). A process-global counter makes every request's id unique.
+    // The tool-call id carries a nonce. A DETERMINISTIC id collides on the
+    // second request in one session: the first dialog's tool call is already
+    // terminal under the same id, Zed renders no new dialog, and the agent
+    // blocks forever on a reply that cannot come (confirmed live on the
+    // approve-then-merge pair, #1684). A process-global counter makes every
+    // request's id unique. `RequestPermissionRequest.tool_call` is a
+    // `ToolCallUpdate` (an upsert), so the id needs no prior `ToolCall`.
     static GATE_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let nonce = GATE_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tool_call = ToolCallUpdate::new(
-        ToolCallId::new(format!("darkmux-gate-{step_id}-{nonce}")),
+        ToolCallId::new(format!("darkmux-gate-{id_tag}-{nonce}")),
         ToolCallUpdateFields::new()
-            .title(format!("darkmux — operator sign-off required: `{step_id}`"))
+            .title(title)
             .kind(ToolKind::Execute)
             .status(ToolCallStatus::Pending)
-            .content(vec![ToolCallContent::from(facts_text.to_string())]),
+            .content(vec![ToolCallContent::from(body.to_string())]),
     );
     let options = vec![
         PermissionOption::new(ALLOW, "Allow", PermissionOptionKind::AllowOnce),
@@ -2055,33 +2161,31 @@ async fn request_operator_sign_off(
 
     match cx.send_request(request).block_task().await {
         Ok(response) => match response.outcome {
-            RequestPermissionOutcome::Selected(sel) if &*sel.option_id.0 == ALLOW => {
-                crate::crew::gate::GateDecision::Approved
-            }
-            RequestPermissionOutcome::Selected(sel) => crate::crew::gate::GateDecision::Declined {
-                reason: format!(
-                    "step `{step_id}` — operator selected `{}` at the sign-off dialog",
-                    sel.option_id
-                ),
-            },
-            RequestPermissionOutcome::Cancelled => crate::crew::gate::GateDecision::Declined {
-                reason: format!("step `{step_id}` — the sign-off request was cancelled"),
-            },
-            // `RequestPermissionOutcome` is `#[non_exhaustive]` (the schema
-            // crate may add a variant in a future minor release this
-            // binary's pinned version predates) — an outcome this match
-            // doesn't recognize is exactly a "no sign-off received" case,
-            // so it fails closed like `Cancelled` rather than panicking on
-            // an unmatched arm.
-            _ => crate::crew::gate::GateDecision::Declined {
-                reason: format!(
-                    "step `{step_id}` — the client returned an unrecognized sign-off outcome"
-                ),
-            },
+            RequestPermissionOutcome::Selected(sel) if &*sel.option_id.0 == ALLOW => PermissionAnswer::Allowed,
+            RequestPermissionOutcome::Selected(sel) => PermissionAnswer::Rejected { option: sel.option_id.to_string() },
+            RequestPermissionOutcome::Cancelled => PermissionAnswer::Cancelled,
+            // `RequestPermissionOutcome` is `#[non_exhaustive]`: an outcome
+            // this pinned schema predates is "no consent received", so it
+            // fails closed like `Cancelled`.
+            _ => PermissionAnswer::Unrecognized,
         },
-        Err(e) => crate::crew::gate::GateDecision::Declined {
-            reason: format!("step `{step_id}` — the sign-off request to the client failed: {e}"),
-        },
+        Err(e) => PermissionAnswer::Failed { error: e.to_string() },
+    }
+}
+
+/// The async half of [`acp_gate_handler`]: ask the client to sign off on a
+/// gated step and translate the answer to a `GateDecision`.
+async fn request_operator_sign_off(
+    cx: &ConnectionTo<Client>,
+    session_id: &SessionId,
+    step_id: &str,
+    facts_text: &str,
+) -> crate::crew::gate::GateDecision {
+    let title = format!("darkmux — operator sign-off required: `{step_id}`");
+    let answer = request_permission(cx, session_id, step_id, title, facts_text).await;
+    match answer.refusal_reason(&format!("step `{step_id}`"), "sign-off") {
+        None => crate::crew::gate::GateDecision::Approved,
+        Some(reason) => crate::crew::gate::GateDecision::Declined { reason },
     }
 }
 
@@ -2184,16 +2288,6 @@ fn render_gate_facts(facts: &BTreeMap<String, String>) -> String {
         return "(no upstream facts)".to_string();
     }
     facts.iter().map(|(k, v)| format!("{k}: {v}")).collect::<Vec<_>>().join("\n")
-}
-
-/// Load a mission config by the id `route_command` resolved, for the
-/// launch-time input synthesis above. Separate from `route_command`'s own
-/// load because the two run at different moments (routing, then spawning)
-/// and the registry is the source of truth at each.
-fn loaded_config(config_id: &str) -> Result<crate::crew::mission_config::MissionConfig> {
-    crate::crew::mission_config::load(config_id)
-        .map(|l| l.config)
-        .with_context(|| format!("loading mission config \"{config_id}\""))
 }
 
 /// (#2476 review round 2, MUST FIX 2) The pids of every currently-live
@@ -2423,6 +2517,7 @@ async fn host_shutdown_reap_loop_ready(
 async fn run_launch_command(
     session_id: &SessionId,
     config_id: &str,
+    params: &[String],
     args: &str,
     cwd: &Path,
     cx: &ConnectionTo<Client>,
@@ -2431,36 +2526,9 @@ async fn run_launch_command(
     let exe = std::env::current_exe().context("resolving darkmux's own executable path")?;
     let mut cmd = Command::new(&exe);
     cmd.args(["mission", "launch", config_id]);
-    if !args.trim().is_empty() {
-        cmd.args(["--param", &format!("args={args}")]);
+    for param in params {
+        cmd.args(["--param", param]);
     }
-
-    // (#2310 P4d) A diff-scoped config (`review`) declares `diff_file`
-    // REQUIRED, and a panel invocation types no params — synthesize the
-    // diff + workspace from this session's cwd, exactly as the retired
-    // review launcher used to before it spawned. `_synth` is held for the
-    // whole spawn: its Drop removes the tempdir, so every exit path below
-    // (success, failure, a cancelled subprocess) cleans up.
-    let _synth = match crate::acp_panel::synthesize_diff_launch_inputs(&loaded_config(config_id)?, cwd) {
-        Ok(crate::acp_panel::DiffLaunchInputs::NotNeeded) => None,
-        Ok(crate::acp_panel::DiffLaunchInputs::Nothing(msg)) => {
-            cx.send_notification(agent_chunk(session_id, msg))?;
-            return Ok(());
-        }
-        Ok(crate::acp_panel::DiffLaunchInputs::Ready(synth)) => {
-            for p in synth.params() {
-                cmd.args(["--param", p]);
-            }
-            if let Some(note) = &synth.excluded_note {
-                let _ = cx.send_notification(agent_chunk(session_id, format!("darkmux: {note}")));
-            }
-            Some(synth)
-        }
-        Err(e) => {
-            cx.send_notification(agent_chunk(session_id, format!("darkmux: `{config_id}` cannot run here — {e:#}")))?;
-            return Ok(());
-        }
-    };
 
     eprintln!(
         "[darkmux-acp] session/prompt: spawning `mission launch {config_id}` cwd={}",
@@ -2742,8 +2810,8 @@ mod tests {
         }
     }
 
-    /// Write one panel-advertised, procedural-only fixture command —
-    /// `id`'s `panel` block advertises it; its single `procedural.noop`
+    /// Write one procedural-only fixture config, launchable as `/mission
+    /// launch <id>`; its single `procedural.noop`
     /// step's `output` is the fixed string every scenario asserts on, so a
     /// test can distinguish "the command actually ran" from "something
     /// else happened" without any real dispatch.
@@ -2755,7 +2823,6 @@ mod tests {
             serde_json::to_string(&serde_json::json!({
                 "id": id,
                 "name": id,
-                "panel": {"description": "Pipe-level test fixture — echoes a fixed string."},
                 "phases": [{
                     "id": "p1",
                     "tasks": [{"id": "t1", "steps": [{"id": "s1", "kind": "procedural.noop", "config": {"output": output}}]}]
@@ -2766,7 +2833,7 @@ mod tests {
         .unwrap();
     }
 
-    /// Write one panel-advertised, procedural-only fixture command whose
+    /// Write one procedural-only fixture config whose
     /// SINGLE step is a real `procedural.shell` — an actual OS subprocess,
     /// unlike `write_echo_fixture`'s in-process `procedural.noop` — so a
     /// test can prove things about REAL child-process lifecycle (started,
@@ -2786,7 +2853,6 @@ mod tests {
             serde_json::to_string(&serde_json::json!({
                 "id": id,
                 "name": id,
-                "panel": {"description": "Pipe-level test fixture — a real, observable OS subprocess."},
                 "phases": [{
                     "id": "p1",
                     "tasks": [{"id": "t1", "steps": [{"id": "s1", "kind": "procedural.shell", "config": {"command": command}}]}]
@@ -2895,6 +2961,15 @@ mod tests {
     /// Returns the minted `sessionId`, after draining the
     /// `AvailableCommandsUpdate` notification `session/new` always sends.
     async fn handshake(writer: &mut DuplexStream, reader: &mut BufReader<DuplexStream>, cwd: &Path) -> String {
+        handshake_with_commands(writer, reader, cwd).await.0
+    }
+
+    /// [`handshake`], keeping the `AvailableCommandsUpdate` it drains.
+    async fn handshake_with_commands(
+        writer: &mut DuplexStream,
+        reader: &mut BufReader<DuplexStream>,
+        cwd: &Path,
+    ) -> (String, serde_json::Value) {
         send_json(
             writer,
             serde_json::json!({
@@ -2918,8 +2993,8 @@ mod tests {
             .as_str()
             .expect("session/new must return a sessionId")
             .to_string();
-        let _available_commands_update = recv_json(reader).await;
-        session_id
+        let available_commands_update = recv_json(reader).await;
+        (session_id, available_commands_update)
     }
 
     async fn send_prompt(writer: &mut DuplexStream, session_id: &str, text: &str) {
@@ -2946,10 +3021,111 @@ mod tests {
         );
     }
 
-    /// Like [`write_echo_fixture`], but the advertised command declares
-    /// `panel.accepts_args: false` — the shape the shipped `review` config
-    /// uses, and the one the direct `/command args` path never consulted.
-    fn write_nullary_echo_fixture(crew_dir: &Path, id: &str, output: &str) {
+    /// The panel advertises exactly one command, `/mission`, whatever configs
+    /// exist: no config names itself into the palette.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn session_new_advertises_only_the_generic_mission_command() {
+        let crew_tmp = tempfile::TempDir::new().unwrap();
+        let _crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
+        write_echo_fixture(crew_tmp.path(), "echo-fixture", "fixture output");
+        let (mut writer, mut reader) = spawn_test_agent(|_: &str| panic!("no routing"), never_answer);
+        let (_session, update) = handshake_with_commands(&mut writer, &mut reader, &std::env::temp_dir()).await;
+        let commands = update["params"]["update"]["availableCommands"].as_array().expect("a command list").clone();
+        let names: Vec<&str> = commands.iter().map(|c| c["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["mission"], "one generic command, however many configs exist: {update}");
+    }
+
+    /// `/mission list` names every launchable config, including a fixture.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mission_list_lists_the_launchable_configs() {
+        let crew_tmp = tempfile::TempDir::new().unwrap();
+        let _crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
+        write_echo_fixture(crew_tmp.path(), "echo-fixture", "fixture output");
+        let (mut writer, mut reader) = spawn_test_agent(|_: &str| panic!("no routing"), never_answer);
+        let session_id = handshake(&mut writer, &mut reader, &std::env::temp_dir()).await;
+
+        send_prompt(&mut writer, &session_id, "/mission list").await;
+        let listing = recv_json(&mut reader).await;
+        let text = chunk_text(&listing);
+        for id in ["echo-fixture", "review", "machine-status"] {
+            assert!(text.contains(&format!("`{id}`")), "`{id}` must be listed: {text}");
+        }
+        assert_end_turn(&recv_json(&mut reader).await);
+    }
+
+    /// The retired per-config command is refused with what replaces it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_retired_per_config_slash_command_is_refused_naming_mission_launch() {
+        let crew_tmp = tempfile::TempDir::new().unwrap();
+        let _crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
+        write_echo_fixture(crew_tmp.path(), "echo-fixture", "fixture output");
+        let (mut writer, mut reader) = spawn_test_agent(|_: &str| panic!("no routing"), never_answer);
+        let session_id = handshake(&mut writer, &mut reader, &std::env::temp_dir()).await;
+
+        send_prompt(&mut writer, &session_id, "/echo-fixture").await;
+        let reply = recv_json(&mut reader).await;
+        let text = chunk_text(&reply);
+        assert!(text.contains("/mission launch <config>") && !text.contains("fixture output"), "{text}");
+        assert_end_turn(&recv_json(&mut reader).await);
+    }
+
+    /// An unknown config through the panel is refused with the words
+    /// `darkmux mission launch` uses for it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_unknown_config_is_refused_with_the_cli_refusal_text() {
+        let crew_tmp = tempfile::TempDir::new().unwrap();
+        let _crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
+        let (mut writer, mut reader) = spawn_test_agent(|_: &str| panic!("no routing"), never_answer);
+        let session_id = handshake(&mut writer, &mut reader, &std::env::temp_dir()).await;
+
+        send_prompt(&mut writer, &session_id, "/mission launch no-such-config").await;
+        let reply = recv_json(&mut reader).await;
+        let cli = format!("darkmux: {:#}", crate::mission_launch::resolve_config("no-such-config").map(|_| ()).unwrap_err());
+        assert_eq!(chunk_text(&reply), cli);
+        assert_end_turn(&recv_json(&mut reader).await);
+    }
+
+    /// `/mission show <id>` prints exactly what `darkmux mission show <id>`
+    /// does: both are `mission_show::build` then `render_text`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mission_show_prints_the_text_the_cli_prints() {
+        let crew_tmp = tempfile::TempDir::new().unwrap();
+        let _crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
+        let flows_tmp = tempfile::TempDir::new().unwrap();
+        let _flows_guard = EnvGuard::set("DARKMUX_FLOWS_DIR", flows_tmp.path());
+        crate::crew::lifecycle::save_mission(&crate::crew::types::Mission {
+            id: "panel-show-m1".to_string(),
+            description: "Shown in the panel.".to_string(),
+            status: crate::crew::types::MissionStatus::Active,
+            phase_ids: Vec::new(),
+            created_ts: 1,
+            started_ts: Some(1),
+            finalized_ts: None,
+            source_input: None,
+            ticket: None,
+            spec: None,
+            machine: None,
+        })
+        .unwrap();
+        let (mut writer, mut reader) = spawn_test_agent(|_: &str| panic!("no routing"), never_answer);
+        let session_id = handshake(&mut writer, &mut reader, &std::env::temp_dir()).await;
+
+        send_prompt(&mut writer, &session_id, "/mission show panel-show-m1").await;
+        let reply = recv_json(&mut reader).await;
+        let expected = crate::mission_show::render_text(&crate::mission_show::build("panel-show-m1").unwrap());
+        assert_eq!(chunk_text(&reply), expected);
+        assert!(expected.contains("Mission panel-show-m1"), "{expected}");
+        assert_end_turn(&recv_json(&mut reader).await);
+    }
+
+    /// Like [`write_echo_fixture`], but its task reads `__panel_args__`, so
+    /// the config takes free text after its id; the step echoes `output`.
+    fn write_args_echo_fixture(crew_dir: &Path, id: &str, output: &str) {
         let dir = crew_dir.join("mission-configs");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
@@ -2957,10 +3133,13 @@ mod tests {
             serde_json::to_string(&serde_json::json!({
                 "id": id,
                 "name": id,
-                "panel": {"description": "Pipe-level test fixture — takes no arguments.", "accepts_args": false},
                 "phases": [{
                     "id": "p1",
-                    "tasks": [{"id": "t1", "steps": [{"id": "s1", "kind": "procedural.noop", "config": {"output": output}}]}]
+                    "tasks": [{
+                        "id": "t1",
+                        "reads": ["__panel_args__"],
+                        "steps": [{"id": "s1", "kind": "procedural.noop", "config": {"output": output}}]
+                    }]
                 }]
             }))
             .unwrap(),
@@ -2968,26 +3147,18 @@ mod tests {
         .unwrap();
     }
 
-    /// (#2050 sweep) `panel.accepts_args: false` is enforced on the DIRECT
-    /// `/command args` path, and the operator is told their text was
-    /// dropped — proven behaviourally over the real pipe, not by asserting
-    /// on source text.
-    ///
-    /// Before this, `route_command` matched on the command NAME alone and
-    /// `execute_route_plan` forwarded whatever followed it, so typing
-    /// `/review please look closely at X` built an unused `--param
-    /// args=...`, discarded the operator's text, and reported nothing —
-    /// while the command's own hint advertises "(no arguments)".
-    ///
-    /// The ORDER is asserted, not merely the presence: the notice has to
-    /// arrive before the command's output, or the operator reads "your text
-    /// was not passed on" after a result they have already acted on.
+    /// Free text after the id of a config that reads no `__panel_args__` is
+    /// REFUSED over the real pipe, with one reply, and the config does not
+    /// run. Before, the direct `/command args` path dropped the text with a
+    /// notice and ran the command anyway; `/mission launch` maps arguments onto
+    /// declared inputs, and text with nowhere to go is refused rather than
+    /// discarded.
     #[tokio::test]
     #[serial_test::serial]
-    async fn a_nullary_slash_command_drops_typed_args_and_says_so_before_running() {
+    async fn free_text_for_a_config_that_reads_none_is_refused_and_nothing_runs() {
         let crew_tmp = tempfile::TempDir::new().unwrap();
         let _crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
-        write_nullary_echo_fixture(crew_tmp.path(), "nullary-fixture", "fixture output");
+        write_echo_fixture(crew_tmp.path(), "nullary-fixture", "fixture output");
 
         let router = |_msg: &str| -> Result<String> {
             panic!("a slash command must never reach the router");
@@ -2996,36 +3167,30 @@ mod tests {
         let cwd = std::env::temp_dir();
         let session_id = handshake(&mut writer, &mut reader, &cwd).await;
 
-        send_prompt(&mut writer, &session_id, "/nullary-fixture please look closely at X").await;
+        send_prompt(&mut writer, &session_id, "/mission launch nullary-fixture please look closely at X").await;
 
-        let notice = recv_json(&mut reader).await;
-        let notice = chunk_text(&notice);
+        let refusal = recv_json(&mut reader).await;
+        let refusal = chunk_text(&refusal);
         assert!(
-            notice.contains("/nullary-fixture") && notice.contains("takes no arguments"),
-            "the dropped text must be announced BEFORE the command's output, got: {notice}"
+            refusal.contains("nullary-fixture") && refusal.contains("takes no arguments"),
+            "the refused text must be announced: {refusal}"
         );
-
-        let output = recv_json(&mut reader).await;
-        assert!(
-            chunk_text(&output).contains("fixture output"),
-            "and the command must still run: {}",
-            chunk_text(&output)
-        );
+        assert!(!refusal.contains("fixture output"), "and the config must NOT run: {refusal}");
 
         let final_response = recv_json(&mut reader).await;
         assert_end_turn(&final_response);
     }
 
-    /// The inverted case over the same pipe: a command that DOES take
-    /// arguments must not be announced and must not lose its text. Without
-    /// it, clearing unconditionally would satisfy the test above just as
-    /// happily while breaking every advertised command that reads its args.
+    /// The inverted case over the same pipe: a config that DOES read
+    /// `__panel_args__` runs with its text. Without it, refusing all free
+    /// text would satisfy the test above just as happily while breaking
+    /// every command that reads its argument.
     #[tokio::test]
     #[serial_test::serial]
-    async fn a_slash_command_that_takes_args_is_not_announced() {
+    async fn a_config_that_reads_args_runs_with_its_free_text() {
         let crew_tmp = tempfile::TempDir::new().unwrap();
         let _crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
-        write_echo_fixture(crew_tmp.path(), "echo-fixture", "fixture output");
+        write_args_echo_fixture(crew_tmp.path(), "args-fixture", "fixture output");
 
         let router = |_msg: &str| -> Result<String> {
             panic!("a slash command must never reach the router");
@@ -3034,12 +3199,12 @@ mod tests {
         let cwd = std::env::temp_dir();
         let session_id = handshake(&mut writer, &mut reader, &cwd).await;
 
-        send_prompt(&mut writer, &session_id, "/echo-fixture please look closely at X").await;
+        send_prompt(&mut writer, &session_id, "/mission launch args-fixture please look closely at X").await;
 
         let first = recv_json(&mut reader).await;
         assert!(
             chunk_text(&first).contains("fixture output"),
-            "the FIRST chunk must be the output — no args notice belongs here: {}",
+            "the FIRST chunk must be the output: {}",
             chunk_text(&first)
         );
 
@@ -3070,44 +3235,83 @@ mod tests {
         assert_end_turn(&final_response);
     }
 
-    /// (#1698 Packet B) The no-slash channel's core contract: a successful
-    /// route sends the PROVENANCE chunk FIRST, then the executed command's
-    /// OUTPUT — never the reverse, and never interleaved. Also asserts
-    /// wall 4's flow record landed (source text + chosen command +
-    /// surface=panel).
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn no_slash_route_sends_provenance_before_output_and_records_wall_4() {
-        let crew_tmp = tempfile::TempDir::new().unwrap();
-        let _crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
-        let flows_tmp = tempfile::TempDir::new().unwrap();
-        let _flows_guard = EnvGuard::set("DARKMUX_FLOWS_DIR", flows_tmp.path());
-        write_echo_fixture(crew_tmp.path(), "echo-fixture", "fixture output");
+    /// Read the agent's next line, assert it is a `session/request_permission`
+    /// request, reply with `outcome`, and return the dialog body (the command
+    /// text the user is asked about).
+    async fn answer_permission(
+        writer: &mut DuplexStream,
+        reader: &mut BufReader<DuplexStream>,
+        outcome: serde_json::Value,
+    ) -> String {
+        let request = recv_json(reader).await;
+        assert_eq!(request["method"], "session/request_permission", "expected a permission request: {request}");
+        let body = request["params"]["toolCall"]["content"][0]["content"]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("permission request carries no command text: {request}"))
+            .to_string();
+        send_json(writer, serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "result": {"outcome": outcome}})).await;
+        body
+    }
 
+    fn selected(option: &str) -> serde_json::Value {
+        serde_json::json!({"outcome": "selected", "optionId": option})
+    }
+
+    /// A routed echo fixture with the flow sink and crew dir in temp dirs.
+    /// Returns the guards (keep alive), the flow dir, and the ACP endpoints.
+    struct RoutedFixture {
+        _guards: (tempfile::TempDir, tempfile::TempDir, EnvGuard, EnvGuard),
+        flows: std::path::PathBuf,
+        writer: DuplexStream,
+        reader: BufReader<DuplexStream>,
+        session_id: String,
+    }
+
+    async fn routed_fixture() -> RoutedFixture {
+        let crew_tmp = tempfile::TempDir::new().unwrap();
+        let crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
+        let flows_tmp = tempfile::TempDir::new().unwrap();
+        let flows_guard = EnvGuard::set("DARKMUX_FLOWS_DIR", flows_tmp.path());
+        write_echo_fixture(crew_tmp.path(), "echo-fixture", "fixture output");
         let router = |_msg: &str| -> Result<String> {
             Ok("```json\n{\"command\": \"echo-fixture\", \"args\": \"\"}\n```".to_string())
         };
         let (mut writer, mut reader) = spawn_test_agent(router, never_answer);
         let cwd = std::env::temp_dir();
         let session_id = handshake(&mut writer, &mut reader, &cwd).await;
+        let flows = flows_tmp.path().to_path_buf();
+        RoutedFixture { _guards: (crew_tmp, flows_tmp, crew_guard, flows_guard), flows, writer, reader, session_id }
+    }
 
-        send_prompt(&mut writer, &session_id, "please give me the fixture").await;
+    /// (#1698 Packet B) The no-slash channel's core contract: a successful
+    /// route sends the PROVENANCE chunk FIRST, then asks the user to confirm
+    /// the exact command (the router's pick is never the consent), and only
+    /// on allow sends the executed command's OUTPUT. Also asserts wall 4's
+    /// flow record landed (source text + chosen command + surface=panel).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn no_slash_route_sends_provenance_then_confirms_then_runs_and_records_wall_4() {
+        let mut f = routed_fixture().await;
+        send_prompt(&mut f.writer, &f.session_id, "please give me the fixture").await;
 
-        let provenance = recv_json(&mut reader).await;
+        let provenance = recv_json(&mut f.reader).await;
         assert!(
-            chunk_text(&provenance).contains("routing to /echo-fixture"),
+            chunk_text(&provenance).contains("routing to /mission launch echo-fixture"),
             "provenance chunk must arrive FIRST, naming the routed command: {}",
             chunk_text(&provenance)
         );
 
-        let output = recv_json(&mut reader).await;
-        assert_eq!(chunk_text(&output), "fixture output", "the SECOND chunk is the executed command's own output");
+        let body = answer_permission(&mut f.writer, &mut f.reader, selected("allow")).await;
+        assert_eq!(body, "```\ndarkmux mission launch echo-fixture\n```", "the dialog shows the CLI's own command text in a code block");
 
-        let final_response = recv_json(&mut reader).await;
+        let output = recv_json(&mut f.reader).await;
+        assert_eq!(chunk_text(&output), "fixture output", "after allow the next chunk is the command's own output");
+
+        let final_response = recv_json(&mut f.reader).await;
         assert_end_turn(&final_response);
 
         let day = darkmux_flow::day_utc_now();
-        let flow_path = flows_tmp.path().join(format!("{day}.jsonl"));
+        let flow_path = f.flows.join(format!("{day}.jsonl"));
         let flow_contents = std::fs::read_to_string(&flow_path).expect("wall 4's flow record file must exist");
         assert!(flow_contents.contains("\"action\":\"radio.route\""), "{flow_contents}");
         assert!(flow_contents.contains("\"surface\":\"panel\""), "{flow_contents}");
@@ -3116,6 +3320,97 @@ mod tests {
             flow_contents.contains("please give me the fixture"),
             "the flow record must carry the source text: {flow_contents}"
         );
+    }
+
+    /// Reject and cancel are the same outcome as no answer: nothing runs,
+    /// the panel says "not run" and names the command, and the turn ends.
+    async fn assert_routed_pick_not_run(outcome: serde_json::Value, why: &str) {
+        let mut f = routed_fixture().await;
+        send_prompt(&mut f.writer, &f.session_id, "please give me the fixture").await;
+        let _provenance = recv_json(&mut f.reader).await;
+        answer_permission(&mut f.writer, &mut f.reader, outcome).await;
+        let refusal = recv_json(&mut f.reader).await;
+        let text = chunk_text(&refusal);
+        assert!(text.contains("not run") && text.contains(why), "{text}");
+        assert!(text.contains("darkmux mission launch echo-fixture"), "the panel names what did not run: {text}");
+        let final_response = recv_json(&mut f.reader).await;
+        assert_end_turn(&final_response);
+    }
+
+    /// A routed `review` pick in a git repo with `commits` commits: the
+    /// permission dialog must show what will run, and the diff inputs are
+    /// made BEFORE asking.
+    async fn routed_review_fixture(commits: usize) -> (RoutedFixture, tempfile::TempDir) {
+        let crew_tmp = tempfile::TempDir::new().unwrap();
+        let crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
+        let flows_tmp = tempfile::TempDir::new().unwrap();
+        let flows_guard = EnvGuard::set("DARKMUX_FLOWS_DIR", flows_tmp.path());
+        let router = |_msg: &str| -> Result<String> {
+            Ok("```json\n{\"command\": \"review\", \"args\": \"\"}\n```".to_string())
+        };
+        let (mut writer, mut reader) = spawn_test_agent(router, never_answer);
+        let repo = crate::acp_panel::tests::temp_repo(commits);
+        let session_id = handshake(&mut writer, &mut reader, repo.path()).await;
+        let flows = flows_tmp.path().to_path_buf();
+        let fixture = RoutedFixture { _guards: (crew_tmp, flows_tmp, crew_guard, flows_guard), flows, writer, reader, session_id };
+        (fixture, repo)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_routed_review_dialog_shows_the_synthesized_inputs_and_the_refusal_says_how_to_run_it() {
+        let (mut f, _repo) = routed_review_fixture(2).await;
+        send_prompt(&mut f.writer, &f.session_id, "review this").await;
+        let _provenance = recv_json(&mut f.reader).await;
+        let note = recv_json(&mut f.reader).await;
+        assert!(chunk_text(&note).contains("reviewing only the last commit"), "{note}");
+        let body = answer_permission(&mut f.writer, &mut f.reader, selected("reject")).await;
+        assert!(body.starts_with("```\ndarkmux mission launch review "), "fenced command: {body}");
+        for key in ["--param diff_file=", "--param workspace=", "--param head_sha="] {
+            assert!(body.contains(key), "the dialog must show `{key}`: {body}");
+        }
+        let refusal = recv_json(&mut f.reader).await;
+        let text = chunk_text(&refusal);
+        assert!(text.contains("not run") && text.contains("values for diff_file, workspace above"), "{text}");
+        assert!(text.contains("temporary files"), "{text}");
+        assert_end_turn(&recv_json(&mut f.reader).await);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_routed_review_with_nothing_to_review_is_reported_without_asking() {
+        let (mut f, _repo) = routed_review_fixture(1).await;
+        send_prompt(&mut f.writer, &f.session_id, "review this").await;
+        let _provenance = recv_json(&mut f.reader).await;
+        // The next message is the report, not a permission request.
+        let next = recv_json(&mut f.reader).await;
+        assert_ne!(next["method"], "session/request_permission", "must not ask: {next}");
+        assert!(!chunk_text(&next).is_empty());
+        assert_end_turn(&recv_json(&mut f.reader).await);
+    }
+
+    #[test]
+    fn fenced_uses_a_fence_longer_than_any_backtick_run_inside() {
+        assert_eq!(fenced("a b"), "```\na b\n```");
+        assert_eq!(fenced("x ``` y"), "````\nx ``` y\n````");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn no_slash_route_rejected_runs_nothing() {
+        assert_routed_pick_not_run(selected("reject"), "selected `reject`").await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn no_slash_route_cancelled_runs_nothing() {
+        assert_routed_pick_not_run(serde_json::json!({"outcome": "cancelled"}), "cancelled").await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn no_slash_route_an_unknown_option_is_a_reject_and_runs_nothing() {
+        assert_routed_pick_not_run(selected("something-else"), "selected `something-else`").await;
     }
 
     #[tokio::test]
@@ -3234,7 +3529,7 @@ mod tests {
         let fallback = recv_json(&mut reader).await;
         let text = chunk_text(&fallback);
         assert!(text.contains("that's outside the scope of mission comms"), "{text}");
-        assert!(text.contains("echo-fixture"), "the live command listing follows the reason: {text}");
+        assert!(text.contains("/mission launch <config>"), "the live command listing follows the reason: {text}");
 
         let final_response = recv_json(&mut reader).await;
         assert_end_turn(&final_response);
@@ -3373,7 +3668,7 @@ mod tests {
 
         // First: a SLASH invocation, executed directly (never touches the
         // router or the answerer) — pushes its output onto the shelf.
-        send_prompt(&mut writer, &session_id, "/echo-fixture").await;
+        send_prompt(&mut writer, &session_id, "/mission launch echo-fixture").await;
         let slash_output = recv_json(&mut reader).await;
         assert_eq!(chunk_text(&slash_output), "the-shelf-marker-output");
         let slash_final = recv_json(&mut reader).await;
@@ -3464,7 +3759,7 @@ mod tests {
         let cwd = std::env::temp_dir();
         let session_id = handshake(&mut writer, &mut reader, &cwd).await;
 
-        send_prompt(&mut writer, &session_id, "/echo-fixture").await;
+        send_prompt(&mut writer, &session_id, "/mission launch echo-fixture").await;
 
         // No provenance chunk for the slash path (unchanged from pre-#1698
         // Packet B) — the FIRST notification is the command's own output.
@@ -3671,7 +3966,7 @@ mod tests {
 
         // The connection must still be healthy: an ordinary slash command
         // on the REAL session id executes normally afterward.
-        send_prompt(&mut writer, &session_id, "/echo-fixture").await;
+        send_prompt(&mut writer, &session_id, "/mission launch echo-fixture").await;
         let output = recv_json(&mut reader).await;
         assert_eq!(chunk_text(&output), "fixture output");
         let final_response = recv_json(&mut reader).await;
@@ -3699,7 +3994,7 @@ mod tests {
         let session_id = handshake(&mut writer, &mut reader, &cwd).await;
 
         // Sanity: the session works before closing.
-        send_prompt(&mut writer, &session_id, "/echo-fixture").await;
+        send_prompt(&mut writer, &session_id, "/mission launch echo-fixture").await;
         let output = recv_json(&mut reader).await;
         assert_eq!(chunk_text(&output), "fixture output");
         let before_close_response = recv_json(&mut reader).await;
@@ -3718,7 +4013,7 @@ mod tests {
 
         // The session's entry is gone — the SAME session id now behaves
         // exactly like one that was never minted.
-        send_prompt(&mut writer, &session_id, "/echo-fixture").await;
+        send_prompt(&mut writer, &session_id, "/mission launch echo-fixture").await;
         let no_cwd = recv_json(&mut reader).await;
         assert!(
             chunk_text(&no_cwd).contains("no working directory recorded"),
@@ -4145,7 +4440,7 @@ mod tests {
         let cwd = std::env::temp_dir();
         let session_id = handshake(&mut writer, &mut reader, &cwd).await;
 
-        send_prompt(&mut writer, &session_id, "/slow-echo").await;
+        send_prompt(&mut writer, &session_id, "/mission launch slow-echo").await;
 
         // Wait for the REAL shell subprocess to actually start (the
         // marker file appears) before cancelling.

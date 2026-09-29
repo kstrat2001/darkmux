@@ -40,7 +40,7 @@
 // on the bar's `onClick` for the full reasoning.
 const { test, expect } = require('@playwright/test');
 
-// A minimal, real-shaped `/flow-session/<id>` response — a clean
+// A minimal, real-shaped `/flow-dispatch/<id>` response — a clean
 // dispatch.start -> dispatch.complete pair, same record shape
 // `tests/fixtures/savings-flow.jsonl` uses elsewhere in this suite.
 // `SessionReplay` needs enough here that `runRegions()` doesn't hit its
@@ -50,12 +50,12 @@ function sessionRecords(id) {
   return {
     records: [
       {
-        ts: '2026-08-03T12:00:00Z', level: 'info', category: 'work', tier: 'local', stage: 'dispatch',
+        ts: '2026-08-03T12:00:00Z', level: 'info', category: 'work', tier: 'darkmux', stage: 'dispatch',
         source: 'crew_dispatch', machine_id: 'fixture-box', machine_uid: 'FIXTURE-UID',
         action: 'dispatch.start', handle: 'coder', session_id: id, payload: { runtime: 'internal' },
       },
       {
-        ts: '2026-08-03T12:00:02Z', level: 'info', category: 'work', tier: 'local', stage: 'dispatch',
+        ts: '2026-08-03T12:00:02Z', level: 'info', category: 'work', tier: 'darkmux', stage: 'dispatch',
         source: 'crew_dispatch', machine_id: 'fixture-box', machine_uid: 'FIXTURE-UID',
         action: 'dispatch.complete', handle: 'coder', session_id: id,
         payload: { runtime: 'internal', result_class: 'ok', total_turns: 1, total_tools: 0, total_tokens: 100 },
@@ -68,7 +68,7 @@ function sessionRecords(id) {
 }
 
 async function mockSession(page, id) {
-  await page.route(`**/flow-session/${encodeURIComponent(id)}`, (r) =>
+  await page.route(`**/flow-dispatch/${encodeURIComponent(id)}`, (r) =>
     r.fulfill({ contentType: 'application/json', body: JSON.stringify(sessionRecords(id)) })
   );
 }
@@ -102,7 +102,7 @@ const hash = (page) => page.evaluate(() => location.hash);
 // `.sbar` bar to render, matching this port's own machine-uid/session-id
 // field shapes (`machine_uid`/`session_id`, the `dispatch start`
 // space-spelling `normalizeAction` dots). `mockSession` (above) covers the
-// `/flow-session/<id>` fetch the click's destination needs.
+// `/flow-dispatch/<id>` fetch the click's destination needs.
 async function bootLiveWithSession(page, sid) {
   const errors = [];
   page.on('pageerror', (e) => errors.push(String(e)));
@@ -125,19 +125,19 @@ async function bootLiveWithSession(page, sid) {
   const laterTs = new Date(Date.now() - 60_000).toISOString();
   const records = [
     {
-      ts: startTs, level: 'info', category: 'work', tier: 'local', stage: 'dispatch',
+      ts: startTs, level: 'info', category: 'work', tier: 'darkmux', stage: 'dispatch',
       source: 'crew_dispatch', machine_id: 'fixture-box', machine_uid: 'FIXTURE-UID',
       action: 'dispatch.start', handle: 'coder', session_id: sid, payload: { runtime: 'internal' },
     },
     {
-      ts: completeTs, level: 'info', category: 'work', tier: 'local', stage: 'dispatch',
+      ts: completeTs, level: 'info', category: 'work', tier: 'darkmux', stage: 'dispatch',
       source: 'crew_dispatch', machine_id: 'fixture-box', machine_uid: 'FIXTURE-UID',
       action: 'dispatch.complete', handle: 'coder', session_id: sid,
       payload: { runtime: 'internal', result_class: 'ok', total_turns: 1, total_tools: 0, total_tokens: 100 },
     },
     {
-      ts: laterTs, level: 'info', category: 'machinery', tier: 'local', stage: 'dispatch',
-      source: 'presence-reconciler', machine_id: 'fixture-box', machine_uid: 'FIXTURE-UID', action: 'machine.online',
+      ts: laterTs, level: 'info', category: 'machinery', tier: 'darkmux', stage: 'dispatch',
+      source: 'presence_reconciler', machine_id: 'fixture-box', machine_uid: 'FIXTURE-UID', action: 'machine.online',
     },
   ];
   await page.route(/\/flow\/\d{4}-\d{2}-\d{2}(\?.*)?$/, (r) =>
@@ -165,23 +165,15 @@ test('drilling into a session writes it to the address bar', async ({ page }) =>
   expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
 });
 
-test('booting on the LEGACY #session= alias restores the dispatch view AND rewrites the URL to #dispatch= (#1974)', async ({ page }) => {
-  // Deliberately boots on the OLD spelling. This is the browser-level proof
-  // that the one-release alias in `route.ts` actually resolves for a real
-  // bookmark, and that `useSyncHash`'s write-back then rewrites the address
-  // bar to the canonical form — the two halves that together make the alias
-  // temporary rather than permanent. The unit tests cover each half in
-  // isolation (`route.test.ts`, `hashSync.test.ts`); only this one proves
-  // they compose across a real boot.
+test('booting on the retired #session= spelling opens the Unknown route page, not a dispatch or the fleet view (#1974)', async ({ page }) => {
+  // The 4.0 break: `#session=<id>` has no alias, and a retired link must never
+  // silently show something else, so it lands on the "Unknown route" page.
+  // `#dispatch=<id>` (the test above and below) is the one spelling.
   await mockSession(page, 'sess-in-flight');
   const errors = await bootLive(page, '#session=sess-in-flight');
-  await expect(page.locator('.session-run')).toBeVisible();
-  // The fleet hero's own marker must NOT be on the page — booting on a
-  // dispatch must not ALSO render fleet underneath/instead of it.
-  await expect(page.locator('.fleet-lens')).toHaveCount(0);
-  await expect
-    .poll(() => hash(page), { message: 'a legacy #session= bookmark must be honored AND rewritten to #dispatch=' })
-    .toContain('dispatch=sess-in-flight');
+  await expect(page.locator('.lens-placeholder__title')).toHaveText('Unknown route');
+  await expect(page.locator('.lens-placeholder__hash')).not.toContainText('sess-in-flight');
+  await expect(page.locator('.session-run')).toHaveCount(0);
   expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
 });
 

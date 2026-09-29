@@ -100,10 +100,31 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
 //           Their only source was the runtime's `metrics.json`, which 4.0
 //           no longer writes; the task's token total is the sum of its
 //           `telemetry.tokens` usage records. `cumulative_turns` /
-//           `cumulative_compactions` stay, computed from the resume
-//           checkpoint and this invocation's trajectory by
-//           `darkmux_trajectory::CheckpointCounts` (a hand-back resume
-//           continues the checkpoint's turn rather than adding one).
+//           `cumulative_compactions` are removed too: every count on the
+//           record is this invocation's own.
+//
+//           Also (4.0, the wire's last leftovers). Removed: `payload.runtime`
+//           (a dispatch-topology label) on every record; the top-level
+//           `host.peak_cpu_pct` / `host.peak_mem_pct` (the nested
+//           `host.cpu.peak_pct` / `host.mem.peak_pct` carry them);
+//           `FlowRecord.work_id` / `attempt` (the retired work queue's);
+//           `Stage::Estimate` (nothing wrote it). Closed: `source` is a
+//           `FlowSource` (one `snake_case` spelling each), and `tier` names
+//           who acted (`operator`, `frontier`, `darkmux`), not where a model
+//           ran, so a hosted-endpoint execution's records no longer read
+//           `local`. Renamed, one unit for time (a duration is `*_ms`, an
+//           instant `*_at_ms` in epoch milliseconds): `budget.wait`'s
+//           `wait_seconds` / ISO `resume_at` are `wait_ms` / `resume_at_ms`,
+//           `utility.start`'s `stall_after_seconds` is `stall_after_ms`,
+//           `machine.rollup`'s `period_seconds` is `period_ms`,
+//           `dispatch.complete`'s `live.sampler_us` / `forward_us` are
+//           `sampler_ms` / `forward_ms`, `machine.battery_health`'s
+//           `total_operating_time_hours` / `time_at_soc_hours` are
+//           `total_operating_ms` / `time_at_soc_ms`. A reader of an archive
+//           maps every old spelling and key
+//           (`darkmux_flow::legacy::{OLD_SOURCES, OLD_TIERS,
+//           OLD_PAYLOAD_KEYS}`); no file is rewritten. A hook rule naming a
+//           retired action spelling is refused, not read as the current one.
 //
 //           Also (4.0): a usage record whose provider sent no prompt count
 //           (and no total) carries no `total_tokens`: its full spend is
@@ -1334,7 +1355,7 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
 //           rule. Payload carries `rule_index` / `target_host` /
 //           `delivered_action` / `attempt`, plus `delivered_hash` and
 //           `error` when present. No struct/enum change — both actions use
-//           the existing `Category::Machinery` / `Tier::Local` /
+//           the existing `Category::Machinery` / `Tier::Darkmux` /
 //           `Stage::Ship`. Minor + additive: older readers ignore the two
 //           new action values; new records only, prior AuditFileSink
 //           chains survive without rotation.
@@ -2114,18 +2135,94 @@ pub enum Category {
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
+/// Who acted: the party that wrote the record. Not where the model ran (a
+/// hosted endpoint's execution is still darkmux's record), so it names no
+/// topology.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, ValueEnum)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "lowercase")]
 pub enum Tier {
+    /// The operator, at the CLI.
     Operator,
+    /// The frontier orchestrator, through the CLI.
     Frontier,
-    Local,
+    /// darkmux's own code: every record a dispatch, the scheduler, a sampler
+    /// or the hook sink writes.
+    Darkmux,
     /// See [`Level::Unknown`] — same lenient-on-read contract.
     #[serde(other)]
     #[value(skip)]
     Unknown,
+}
+
+/// The component that wrote a record: one spelling each, `snake_case`. The
+/// set is closed; a spelling this build does not know reads as
+/// [`FlowSource::Unknown`] (see [`Level::Unknown`]) and is never written.
+/// Pre-4.0 spellings map on read (`crate::legacy::OLD_SOURCES`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
+#[serde(rename_all = "snake_case")]
+pub enum FlowSource {
+    /// A dispatch's own work records (`dispatch.*`, and the run bookends).
+    CrewDispatch,
+    /// The mission scheduler's step records.
+    Scheduler,
+    PhaseLifecycle,
+    MissionLifecycle,
+    PhaseReview,
+    MissionDebrief,
+    /// The daemon's machine sampler (`machine.*`).
+    HostSampler,
+    PresenceReconciler,
+    /// The ACP panel's command gate.
+    CmdGateAudit,
+    /// The hook sink's own delivery records.
+    Hook,
+    /// The machine-scoped host probe.
+    Host,
+    Detector,
+    Runtime,
+    Tokens,
+    Context,
+    Compaction,
+    Lms,
+    Thermal,
+    Battery,
+    Budget,
+    /// A utility job's usage record.
+    Utility,
+    /// Written by the operator at the CLI (`flow note|catch|record --source`).
+    Orchestrator,
+    Adjudication,
+    Manual,
+    Frontier,
+    /// See [`Level::Unknown`] — same lenient-on-read contract.
+    #[serde(other)]
+    Unknown,
+}
+
+/// The [`FlowSource`]s an operator may name at the CLI (`flow note|catch|
+/// tier-decision|record --source`). Every other source is written by darkmux
+/// itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum OperatorSource {
+    Orchestrator,
+    Adjudication,
+    Manual,
+    Frontier,
+}
+
+impl From<OperatorSource> for FlowSource {
+    fn from(s: OperatorSource) -> Self {
+        match s {
+            OperatorSource::Orchestrator => FlowSource::Orchestrator,
+            OperatorSource::Adjudication => FlowSource::Adjudication,
+            OperatorSource::Manual => FlowSource::Manual,
+            OperatorSource::Frontier => FlowSource::Frontier,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
@@ -2134,9 +2231,11 @@ pub enum Tier {
 #[serde(rename_all = "kebab-case")]
 pub enum Stage {
     Scope,
-    Estimate,
     Dispatch,
     Review,
+    /// Delivery of records outward: the hook sink's own `hook.*` records
+    /// (delivery, dry run, dropped, busy). No work-lifecycle record carries
+    /// it.
     Ship,
     /// Post-mission review stage (#999, NASA vocabulary — Mission · Crew ·
     /// Debrief · Lessons). The mission debrief ceremony (#1000) distills the
@@ -2157,6 +2256,8 @@ pub enum Stage {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct FlowRecord {
     pub ts: String,
     pub level: Level,
@@ -2171,8 +2272,10 @@ pub struct FlowRecord {
     /// key so historical records don't silently lose the field; every
     /// newly-written record emits the canonical `phase_id` key.
     #[serde(skip_serializing_if = "Option::is_none", alias = "sprint_id")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
     pub phase_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
     pub session_id: Option<String>,
     /// The role execution this record is about: set on every record whose
     /// action is execution-grain (`FlowAction::grain`), never on any other.
@@ -2180,9 +2283,11 @@ pub struct FlowRecord {
     /// task session holds one per `dispatch.map` item). Schema 2.0 addition.
     /// A pre-4.0 record carries none; `crate::reader` synthesizes one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(type = "string", optional))]
     pub execution_id: Option<darkmux_types::execution_id::ExecutionId>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub source: Option<FlowSource>,
     /// LMStudio model id that handled this work, when known. Set on
     /// dispatch records (`tier=local, stage=dispatch`) so the viewer
     /// can render which model ran the work without cross-referencing
@@ -2192,6 +2297,7 @@ pub struct FlowRecord {
     /// verdicts) and for dispatches where the model can't be resolved.
     /// Schema 1.2 addition (#106).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
     pub model: Option<String>,
     /// Operator-facing reasoning for this record. Used primarily by
     /// tier-decision records (#136) where the frontier orchestrator
@@ -2202,11 +2308,13 @@ pub struct FlowRecord {
     /// on any record, it's free-form prose intended for human review
     /// (debrief, compliance audit, post-mortem).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
     pub reasoning: Option<String>,
     /// Parent mission id. Optional because some flow records aren't
     /// scoped to a mission (operator-initiated dispatches without an
     /// active mission, machinery events). Schema 1.3 addition (#136).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
     pub mission_id: Option<String>,
     /// Machine that emitted this record. Auto-populated at write time
     /// from `DARKMUX_MACHINE_ID` env (operator-named — e.g. `"studio"`,
@@ -2214,6 +2322,7 @@ pub struct FlowRecord {
     /// the field; viewer treats absence as `unknown`. Schema 1.4 addition
     /// (#167; substrate for fleet UI).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
     pub machine_id: Option<String>,
     /// Stable hardware identity of the machine that emitted this record
     /// (`IOPlatformUUID`, #640) — the canonical machine identity, distinct
@@ -2223,6 +2332,7 @@ pub struct FlowRecord {
     /// and groups such records under one "unknown" machine — never falling
     /// back to the (unprovable) name. Schema 1.11 addition.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
     pub machine_uid: Option<String>,
     /// BLAKE3 hash of the previous record in this audit file's chain.
     /// `None` on records written through LocalFileSink (the casual sink);
@@ -2234,6 +2344,7 @@ pub struct FlowRecord {
     /// body under the byte-hash format (#1769) — it's covered by the
     /// content hash the same way every other field is.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
     pub prev_hash: Option<String>,
     /// Legacy field (pre-2.6.0): under the OLD struct-hash audit format
     /// this carried THIS record's own content hash, embedded inside the
@@ -2245,6 +2356,7 @@ pub struct FlowRecord {
     /// (which DID embed `hash` here) still deserializes. Schema 1.5
     /// addition (#163).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
     pub hash: Option<String>,
     /// Event-specific structured fields that aren't promoted to first-class
     /// `FlowRecord` members. Schema 1.6 addition (#204) — gives new event
@@ -2264,23 +2376,12 @@ pub struct FlowRecord {
     /// older viewers — they see the action string and the standard
     /// FlowRecord fields, just not the event-specific extras.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(type = "Record<string, unknown>", optional))]
     pub payload: Option<serde_json::Value>,
-    /// Work-queue claim id, from when a job could flow through the global
-    /// `darkmux:work` stream. That queue is retired (#2916), so no current
-    /// producer sets it; kept so archived records still parse. Schema 1.8
-    /// addition (#246).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub work_id: Option<String>,
-    /// Retry counter for queued work — 1 on first attempt, 2+ on retries
-    /// after lease expiry. Surfaces in `darkmux doctor` as a "recent
-    /// retries" rollup. Absent on direct local dispatches (no retry
-    /// semantics outside the queue). Schema 1.8 addition (#246).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub attempt: Option<u32>,
 }
 
 impl FlowRecord {
-    /// A record under `session`, at the current time and `Tier::Local`, with
+    /// A record under `session`, at the current time and `Tier::Darkmux`, with
     /// every optional field empty. `session_id` and `mission_id` are both
     /// stamped from the one `session` here, so they can never disagree: the
     /// wire string names the run, and `mission_id` is that run when it is a
@@ -2297,7 +2398,7 @@ impl FlowRecord {
             ts: crate::ts_utc_now(),
             level,
             category,
-            tier: Tier::Local,
+            tier: Tier::Darkmux,
             stage,
             action,
             handle: handle.into(),
@@ -2313,8 +2414,6 @@ impl FlowRecord {
             prev_hash: None,
             hash: None,
             payload: None,
-            work_id: None,
-            attempt: None,
         }
     }
 }
@@ -2378,6 +2477,38 @@ pub fn ts_utc_at(secs: i64) -> String {
     let (y, mo, d) = epoch_to_yyyymmdd(secs);
     let (h, mi, s) = epoch_to_hhmmss(secs);
     format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, h, mi, s)
+}
+
+/// Days since the Unix epoch for a UTC civil date (Howard Hinnant's
+/// algorithm, public domain): the inverse of the calendar half of
+/// `epoch_to_yyyymmdd`.
+pub fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y / 400 } else { (y - 399) / 400 };
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// The epoch second of a record-`ts`-shaped string (`YYYY-MM-DDTHH:MM:SSZ`,
+/// fixed width): the inverse of [`ts_utc_at`]. `None` for anything that is
+/// not exactly that shape, so a malformed `ts` degrades to "no timestamp"
+/// and never panics.
+pub fn parse_ts_utc(ts: &str) -> Option<i64> {
+    if !has_ts_punctuation(ts.as_bytes()) {
+        return None;
+    }
+    let field = |range: std::ops::Range<usize>| -> Option<i64> { ts.get(range)?.parse().ok() };
+    let (y, mo, d) = (field(0..4)?, field(5..7)?, field(8..10)?);
+    let (h, mi, s) = (field(11..13)?, field(14..16)?, field(17..19)?);
+    let in_range = (1..=12).contains(&mo) && (1..=31).contains(&d) && h <= 23 && mi <= 59 && s <= 60;
+    in_range.then(|| days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + s)
+}
+
+/// The fixed width and separators of a record `ts`: `YYYY-MM-DDTHH:MM:SSZ`.
+fn has_ts_punctuation(b: &[u8]) -> bool {
+    b.len() == 20 && [(4, b'-'), (7, b'-'), (10, b'T'), (13, b':'), (16, b':'), (19, b'Z')].iter().all(|&(i, c)| b[i] == c)
 }
 
 pub(crate) fn current_epoch_secs() -> i64 {
@@ -2490,6 +2621,23 @@ mod for_session_tests {
 }
 
 #[cfg(test)]
+mod ts_parse_tests {
+    use super::*;
+
+    #[test]
+    fn parse_ts_utc_inverts_ts_utc_at_and_rejects_other_shapes() {
+        assert_eq!(parse_ts_utc("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(parse_ts_utc("2000-01-01T00:00:00Z"), Some(946_684_800));
+        for secs in [0_i64, 951_782_400, 1_700_000_000, 4_102_444_799] {
+            assert_eq!(parse_ts_utc(&ts_utc_at(secs)), Some(secs));
+        }
+        for bad in ["", "not-a-timestamp", "2026-07-24T12:34:56", "2026-13-01T00:00:00Z", "2026-07-24 12:34:56Z"] {
+            assert_eq!(parse_ts_utc(bad), None, "{bad:?}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod forward_compat_tests {
     use super::*;
 
@@ -2538,7 +2686,7 @@ mod forward_compat_tests {
             "ts": "2026-08-03T12:00:00Z",
             "level": "info",
             "category": "telemetry",
-            "tier": "local",
+            "tier": "darkmux",
             "stage": "dispatch",
             "action": "telemetry.tokens",
             "handle": "seat-1"
@@ -2546,7 +2694,7 @@ mod forward_compat_tests {
         let rec: FlowRecord = serde_json::from_str(wire).unwrap();
         assert!(matches!(rec.level, Level::Info));
         assert!(matches!(rec.category, Category::Telemetry));
-        assert!(matches!(rec.tier, Tier::Local));
+        assert!(matches!(rec.tier, Tier::Darkmux));
         assert!(matches!(rec.stage, Stage::Dispatch));
         // And a re-serialize keeps the wire spelling — true for variants this
         // binary KNOWS. It is emphatically not true for unknown ones; that

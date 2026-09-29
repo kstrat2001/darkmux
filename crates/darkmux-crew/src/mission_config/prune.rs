@@ -288,7 +288,6 @@ mod tests {
             schema_version: None,
             inputs: Vec::new(),
             phases,
-            panel: None,
             cmd: None,
             outcome_from: None,
             source_input: None,

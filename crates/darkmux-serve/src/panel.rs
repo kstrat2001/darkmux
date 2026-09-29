@@ -53,15 +53,8 @@
 //! 400 naming the legal set — never a pass-through, never silently ignored
 //! (see [`resolve_opts`]).
 //!
-//! `mission-status-all` is kept as a one-release ACCEPTED ALIAS
-//! (see [`resolve_alias`]) so the pre-#1911 client (a separate PR migrates
-//! it to `opt.*`) keeps working unmodified: the id resolves to the
-//! `mission-status` spec with its `all` opt forced to `"all"`, reproducing
-//! the old entry's exact argv and landing in the exact same cache entry a
-//! direct `opt.all=all` request would. It is deliberately kept OUT of
-//! [`PANEL_IDS`] (it is no longer a base verb — its old argv would fail the
-//! layer-2 flag guard below if it were one) and dropped entirely under the
-//! pre-1.0 no-compat-baggage posture once the client migrates.
+//! There is no `mission-status-all`: the unlimited board is `mission-status`
+//! with `opt.all=all`, and a request for the old id is an unknown panel (404).
 //!
 //! ## Response shape
 //!
@@ -117,6 +110,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::wire::PanelResponse;
 use crate::{current_millis, AppState};
 
 /// TTL for cached panel output. Short: panels are "state right now" views,
@@ -338,8 +332,7 @@ pub(crate) const PANEL_IDS: &[&str] = &[
 
 /// The allowlist. Deliberately short — see the module doc. Ids are kebab-case
 /// and OPAQUE to the client; the mapping to argv (and opts) lives here and
-/// only here. `mission-status-all` is NOT a base verb here — see
-/// [`resolve_alias`].
+/// only here.
 pub(crate) fn panel_spec(id: &str) -> Option<PanelSpec> {
     use PanelAudience::{LocalOrToken, Read};
     let (id, argv, auto_refresh, ttl, opts, audience): (
@@ -395,28 +388,6 @@ pub(crate) fn panel_spec(id: &str) -> Option<PanelSpec> {
     // this deliberately too — see `only_these_ids_need_a_fleet_snapshot`.
     let needs_fleet_snapshot = matches!(id, "run-list" | "mission-status");
     Some(PanelSpec { id, argv, auto_refresh, cache_ttl: ttl, opts, needs_fleet_snapshot, audience })
-}
-
-/// The `(name, value)` opt selections an alias forces.
-type ForcedOpts = &'static [(&'static str, &'static str)];
-
-/// One-release compatibility alias (#1911): the pre-opts client still
-/// requests `mission-status-all` by id (it has not yet migrated to
-/// `opt.all=all` — that migration is a separate, client-side PR). Resolves
-/// to the BASE id `panel_spec` should be looked up under, plus the forced
-/// `(name, value)` selections that reproduce the old entry's argv exactly.
-/// Anything else passes straight through with no forced opts.
-///
-/// Kept deliberately separate from `panel_spec`'s own match: the alias is
-/// NOT a base verb (it is absent from [`PANEL_IDS`], and its old argv
-/// `["mission","status","--all"]` would fail the layer-2 flag guard if
-/// entered directly), so it must never be reachable by looking `panel_spec`
-/// up under its own name.
-fn resolve_alias(id: &str) -> (&str, ForcedOpts) {
-    match id {
-        "mission-status-all" => ("mission-status", &[("all", "all")]),
-        other => (other, &[]),
-    }
 }
 
 /// One resolved `(name, value)` opt selection, in [`PanelSpec::opts`]'
@@ -509,10 +480,8 @@ fn variant_key(spec_id: &str, resolved: &[ResolvedOpt]) -> String {
 /// value, INCLUDING defaults, so the artifact stays self-describing even
 /// when nothing was picked explicitly. Empty object for a panel with no
 /// declared opts.
-fn opts_json(resolved: &[ResolvedOpt]) -> serde_json::Value {
-    let map: serde_json::Map<String, serde_json::Value> =
-        resolved.iter().map(|r| (r.name.to_string(), serde_json::Value::String(r.value.to_string()))).collect();
-    serde_json::Value::Object(map)
+fn opts_map(resolved: &[ResolvedOpt]) -> std::collections::BTreeMap<String, String> {
+    resolved.iter().map(|r| (r.name.to_string(), r.value.to_string())).collect()
 }
 
 /// Pull `opt.<name>=<value>` pairs out of the full raw query map, stripping
@@ -545,7 +514,7 @@ fn extract_opt_params(raw: &HashMap<String, String>) -> HashMap<String, String> 
 /// after wake, restamping a falsely small `age_ms` that claims the body
 /// is fresh when it may be hours old.
 struct CacheEntry {
-    body: serde_json::Value,
+    body: PanelResponse,
     captured: SystemTime,
 }
 
@@ -784,12 +753,12 @@ fn manual_floor_wait(
 /// The gates in front of every panel request, in order: the preflight-forcing
 /// header (checked BEFORE the allowlist lookup so a drive-by never even learns
 /// which ids exist), the allowlist lookup, then the panel's audience. Returns
-/// the panel's spec and the alias's forced `(name, value)` selections.
+/// the panel's spec.
 fn admit_panel_request(
     id: &str,
     peer: Option<std::net::SocketAddr>,
     headers: &axum::http::HeaderMap,
-) -> Result<(PanelSpec, ForcedOpts), (StatusCode, String)> {
+) -> Result<PanelSpec, (StatusCode, String)> {
     // The preflight forcer — see PANEL_HEADER.
     if !headers.contains_key(PANEL_HEADER) {
         return Err((
@@ -802,19 +771,14 @@ fn admit_panel_request(
         ));
     }
 
-    // Alias resolution BEFORE the allowlist lookup (#1911): a
-    // `mission-status-all` request resolves to the `mission-status` spec
-    // with its `all` opt forced — see `resolve_alias`'s own doc. Any other
-    // id passes through unchanged.
-    let (base_id, forced_opts) = resolve_alias(id);
-    let Some(spec) = panel_spec(base_id) else {
+    let Some(spec) = panel_spec(id) else {
         return Err((
             StatusCode::NOT_FOUND,
             format!("unknown panel \"{id}\" — panels are a fixed allowlist, not arbitrary commands\n"),
         ));
     };
     admit_audience(&spec, peer, headers)?;
-    Ok((spec, forced_opts))
+    Ok(spec)
 }
 
 pub(crate) async fn panel_handler(
@@ -823,29 +787,15 @@ pub(crate) async fn panel_handler(
     peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
     headers: axum::http::HeaderMap,
     State(state): State<AppState>,
-) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
-    let (spec, forced_opts) = admit_panel_request(&id, peer.map(|c| c.0), &headers)?;
+) -> Result<axum::Json<PanelResponse>, (StatusCode, String)> {
+    let spec = admit_panel_request(&id, peer.map(|c| c.0), &headers)?;
     // Canonical &'static id straight off the spec — one table, no second
     // lookup that could drift out from under it.
     let id: &'static str = spec.id;
 
-    // `opt.<name>` query params, with the alias's forced overrides applied
-    // LAST so they always win — the alias's whole point is a fixed,
-    // non-negotiable selection regardless of what a stray query param says.
-    let mut requested = extract_opt_params(&params);
-    // Validate what the CLIENT actually sent BEFORE the alias's forced
-    // overrides mask it (#1911). The module doc's rule is absolute: an
-    // unknown name or value is a 400, never silently ignored. Merging
-    // first made `mission-status-all?opt.all=bogus` a cheerful 200,
-    // because the forced value overwrote the illegal one before anything
-    // looked at it — the one request shape where the doc and the code
-    // disagreed. A non-alias request validates the same map twice, which
-    // is a table walk over at most a handful of entries.
-    resolve_opts(&spec, &requested).map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
-    for (name, value) in forced_opts {
-        requested.insert((*name).to_string(), (*value).to_string());
-    }
-
+    // `opt.<name>` query params. An unknown name or value is a 400, never
+    // silently ignored.
+    let requested = extract_opt_params(&params);
     let resolved = resolve_opts(&spec, &requested).map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
     let final_argv = compose_argv(&spec, &resolved);
     let key = variant_key(id, &resolved);
@@ -983,22 +933,22 @@ pub(crate) async fn panel_handler(
         .collect::<Vec<_>>()
         .join("\n");
 
-    let body = serde_json::json!({
-        "panel": id,
-        "argv": final_argv,
-        "opts": opts_json(&resolved),
-        "captured_ts_ms": current_millis(),
-        "gather_ms": gather_ms,
-        "exit_code": output.status.code(),
-        "ansi_text": ansi_text,
+    let body = PanelResponse {
+        panel: id.to_string(),
+        argv: final_argv.iter().map(|a| a.to_string()).collect(),
+        opts: opts_map(&resolved),
+        captured_ts_ms: current_millis(),
+        gather_ms,
+        exit_code: output.status.code(),
+        ansi_text,
         // Non-empty only when something went to stderr — surfaced so a
         // failing verb is diagnosable from the panel itself, not just logs.
-        "stderr_tail": stderr_tail,
-        "cols": cols,
-        "cache_ttl_ms": spec.cache_ttl.as_millis() as u64,
-        "age_ms": 0,
-        "auto_refresh": spec.auto_refresh,
-    });
+        stderr_tail,
+        cols,
+        cache_ttl_ms: spec.cache_ttl.as_millis() as u64,
+        age_ms: 0,
+        auto_refresh: spec.auto_refresh,
+    };
 
     if spec.cache_ttl.is_zero() {
         // Manual panel: nothing cached (an explicit run is a real run), but
@@ -1017,7 +967,7 @@ pub(crate) async fn panel_handler(
 /// Serve the cached body if it is within `ttl`, with `age_ms` restamped so
 /// the client can SEE it got a cached copy (#1286 constraint 4 — cadence and
 /// staleness are recorded knobs, never silent).
-async fn cached_if_fresh(panels: &PanelState, key: &str, ttl: Duration) -> Option<serde_json::Value> {
+async fn cached_if_fresh(panels: &PanelState, key: &str, ttl: Duration) -> Option<PanelResponse> {
     if ttl.is_zero() {
         return None;
     }
@@ -1028,7 +978,7 @@ async fn cached_if_fresh(panels: &PanelState, key: &str, ttl: Duration) -> Optio
         return None;
     }
     let mut body = entry.body.clone();
-    body["age_ms"] = serde_json::json!(cache_entry_age_ms_at(entry.captured, now));
+    body.age_ms = cache_entry_age_ms_at(entry.captured, now);
     Some(body)
 }
 
@@ -1106,9 +1056,7 @@ mod tests {
     /// verbs, mechanically. A flag baked into a spec's BASE argv means the
     /// old per-variant-id shape crept back in — `mission-status-all`'s own
     /// argv (`["mission","status","--all"]`) would trip this if it were
-    /// ever re-added as a direct entry, which is exactly why it is now
-    /// resolved only through `resolve_alias`, never through `panel_spec`'s
-    /// own match.
+    /// ever re-added as a direct entry.
     #[test]
     fn no_panel_bakes_a_flag_into_its_base_argv() {
         for id in PANEL_IDS {
@@ -1425,62 +1373,43 @@ mod tests {
         assert_ne!(variant_key(spec.id, &ra), variant_key(spec.id, &rb));
     }
 
-    // ── opts_json: the response echo (#1911) ──────────────────────────
+    // ── opts_map: the response echo (#1911) ──────────────────────────
 
     #[test]
-    fn opts_json_echoes_every_declared_opt_including_defaults() {
+    fn opts_map_echoes_every_declared_opt_including_defaults() {
         let spec = panel_spec("run-list").unwrap();
         let resolved = resolve_opts(&spec, &HashMap::new()).unwrap();
-        let json = opts_json(&resolved);
-        assert_eq!(json, serde_json::json!({"kind": "all", "all": "recent", "usage": "off"}));
+        let map = opts_map(&resolved);
+        let expected: std::collections::BTreeMap<String, String> =
+            [("kind", "all"), ("all", "recent"), ("usage", "off")].map(|(k, v)| (k.to_string(), v.to_string())).into();
+        assert_eq!(map, expected);
     }
 
     #[test]
-    fn opts_json_is_empty_object_for_a_no_opts_panel() {
+    fn opts_map_is_empty_object_for_a_no_opts_panel() {
         let spec = panel_spec("doctor").unwrap();
         let resolved = resolve_opts(&spec, &HashMap::new()).unwrap();
-        assert_eq!(opts_json(&resolved), serde_json::json!({}));
+        assert!(opts_map(&resolved).is_empty());
     }
 
-    // ── mission-status-all alias fold (#1911) ─────────────────────────
+    // ── the `all` opt is the only way to the unlimited board (#1911) ─────
 
     #[test]
-    fn mission_status_all_is_no_longer_a_base_spec() {
+    fn mission_status_all_is_not_a_panel() {
         assert!(
             panel_spec("mission-status-all").is_none(),
-            "mission-status-all folded into mission-status's `all` opt (#1911) — it must \
-             not resolve as a base verb any more"
+            "mission-status-all folded into mission-status's `all` opt (#1911) and its alias \
+             is retired: it must not resolve at all"
         );
     }
 
     #[test]
-    fn mission_status_all_alias_resolves_to_mission_status_with_all_forced() {
-        let (base_id, forced) = resolve_alias("mission-status-all");
-        assert_eq!(base_id, "mission-status");
-        assert_eq!(forced, &[("all", "all")]);
-
-        let spec = panel_spec(base_id).unwrap();
-        let mut requested: HashMap<String, String> = HashMap::new();
-        for (name, value) in forced {
-            requested.insert((*name).to_string(), (*value).to_string());
-        }
+    fn the_all_opt_composes_the_unlimited_argv_and_its_own_cache_key() {
+        let spec = panel_spec("mission-status").unwrap();
+        let requested: HashMap<String, String> = [("all".to_string(), "all".to_string())].into();
         let resolved = resolve_opts(&spec, &requested).unwrap();
-        let argv = compose_argv(&spec, &resolved);
-        assert_eq!(
-            argv,
-            vec!["mission", "status", "--all"],
-            "the alias must reproduce the OLD entry's exact argv"
-        );
-        // …and it lands in the exact same cache entry a direct
-        // `opt.all=all` request against `mission-status` would.
+        assert_eq!(compose_argv(&spec, &resolved), vec!["mission", "status", "--all"]);
         assert_eq!(variant_key(spec.id, &resolved), "mission-status?all=all");
-    }
-
-    #[test]
-    fn a_normal_id_is_unaffected_by_alias_resolution() {
-        let (base_id, forced) = resolve_alias("run-list");
-        assert_eq!(base_id, "run-list");
-        assert!(forced.is_empty());
     }
 
     // ── declaration-table invariants the handler leans on (#1911) ────
@@ -1639,15 +1568,20 @@ mod tests {
         assert_ne!(status, StatusCode::BAD_REQUEST, "a non-`opt.` param must not be read as an option: {body}");
     }
 
-    /// The alias's forced overrides must not mask an ILLEGAL client value.
-    /// Before this was fixed, merging happened first and this returned a
-    /// cheerful 200 — the one shape where the module doc's "never silently
-    /// ignored" was untrue.
+    /// An illegal opt value is a 400, never silently ignored.
     #[tokio::test]
-    async fn handler_rejects_an_illegal_value_even_when_the_alias_would_override_it() {
-        let (status, body) = panel_get("/panel/mission-status-all?opt.all=bogus", true).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "the alias must not launder an illegal value: {body}");
+    async fn handler_rejects_an_illegal_opt_value() {
+        let (status, body) = panel_get("/panel/mission-status?opt.all=bogus", true).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert!(body.contains("unknown value"), "{body}");
+    }
+
+    /// The retired `mission-status-all` id is an unknown panel, not a redirect
+    /// or an alias.
+    #[tokio::test]
+    async fn handler_answers_the_retired_mission_status_all_id_with_404() {
+        let (status, _) = panel_get("/panel/mission-status-all", true).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

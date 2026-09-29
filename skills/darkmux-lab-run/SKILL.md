@@ -7,7 +7,7 @@ allowed-tools: "Bash(darkmux:*)"
 
 # Lab run
 
-ARGUMENTS expected: `<workload-id> [--profile <p>] [--runs N]`
+ARGUMENTS expected: `<workload-id> [--profile <p>] [--repeat N]`
 
 ## Step 1 — List available workloads (if user didn't specify)
 
@@ -27,7 +27,7 @@ If the user wants to know what stack will be exercised, run `darkmux machine sta
 darkmux lab run "$ARGUMENTS"
 ```
 
-`$ARGUMENTS` is the literal command tail — `<workload-id>`, optionally followed by `--profile <p>` and/or `--runs N`. Example: `quick-q --profile deep --runs 3`.
+`$ARGUMENTS` is the literal command tail: `<workload-id>`, optionally followed by `--profile <p>` and/or `--repeat N`. Example: `quick-q --profile deep --repeat 3`.
 
 The dispatch runs synchronously and prints per-run lines like:
 
@@ -46,7 +46,7 @@ For each run, report:
 - ok / error
 - Verify outcome (pass/fail + details)
 
-If `--runs N` was used (N > 1), produce a quick aggregate at the end: min / max / mean wall, and any clusters observed.
+If `--repeat N` was used (N > 1), produce a quick aggregate at the end: min / max / mean wall, and any clusters observed.
 
 ## Fixtures (coding-task workloads)
 

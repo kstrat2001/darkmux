@@ -2,7 +2,7 @@
 //! kind, and the reader both consumers share.
 //!
 //! A correction is what the user's reviewer recorded when they adjudicated a
-//! dispatch's QA findings: `darkmux flow note --session-id <sid> --text
+//! dispatch's QA findings: `darkmux flow note --execution <id> --text
 //! "<verdict · what you overrode · why>" --source adjudication`. Unlike the
 //! authored [`crate::lessons`] store, corrections are never hand-authored as a
 //! memory entry — they are RECORDED BY THE REVIEW PATH as flow records, and the
@@ -24,11 +24,13 @@
 //! brief actually injects.
 //!
 //! Storage shape: the flow trail is per-day JSONL. A correction is a record
-//! with `action=note`, `source=adjudication`, and a `session_id`. Reads are
+//! with `action=note`, `source=adjudication`, and a `session_id` (the note's
+//! `--execution` stamps its `execution_id` and that execution's session). Reads are
 //! best-effort by design — any IO/parse problem reads as "no corrections"
 //! rather than an error, because the injection path must never fail a dispatch
 //! over an unreadable day-file.
 
+use darkmux_types::execution_id::ExecutionId;
 use darkmux_types::session_id::{SessionId, SessionKind};
 use serde::Serialize;
 use std::collections::HashSet;
@@ -43,8 +45,9 @@ pub const ADJUDICATION_LOOKBACK_DAYS: usize = 7;
 pub struct Correction {
     /// The flow record's timestamp (RFC3339, as written).
     pub ts: String,
-    /// The dispatch session the reviewer adjudicated.
-    pub session_id: String,
+    /// The role execution the correction is about. `None` for a record that
+    /// names none of its own (written before executions carried an id).
+    pub execution_id: Option<ExecutionId>,
     /// The correction text — the `--text` the reviewer recorded.
     pub text: String,
 }
@@ -85,20 +88,28 @@ impl PhaseSessions {
 pub enum Scope<'a> {
     /// Every correction in the window.
     All,
-    /// The corrections recorded against exactly this session id.
-    Session(&'a str),
+    /// The corrections recorded against exactly this role execution.
+    Execution(&'a ExecutionId),
     /// The corrections recorded against these phases' coder runs.
     Phases(&'a PhaseSessions),
 }
 
 impl Scope<'_> {
-    fn admits(&self, session_id: &str) -> bool {
+    fn admits(&self, session_id: &str, execution_id: Option<&str>) -> bool {
         match self {
             Scope::All => true,
-            Scope::Session(sid) => *sid == session_id,
+            Scope::Execution(id) => execution_id == Some(id.as_str()),
             Scope::Phases(p) => p.admits(session_id),
         }
     }
+}
+
+/// The execution a note record names: only a minted id counts. A note
+/// writes its execution through the same grammar, so anything else (a
+/// synthesized `legacy:` spelling, which is built from a session and not for
+/// showing) names none.
+fn execution_of(record: &serde_json::Value) -> Option<ExecutionId> {
+    ExecutionId::parse_minted(record.get("execution_id")?.as_str()?).ok()
 }
 
 /// Scan the most-recent `days` day-files of the flow trail for adjudication
@@ -122,14 +133,14 @@ pub fn scan(days: usize, scope: Scope<'_>) -> Vec<Correction> {
     for day in &recent {
         for r in darkmux_flow::reader::day_file_records(day) {
             if darkmux_flow::reader::action_of(&r) != Some(darkmux_flow::FlowAction::OperatorNote)
-                || r.get("source").and_then(|v| v.as_str()) != Some("adjudication")
+                || darkmux_flow::reader::source_of(&r) != Some(darkmux_flow::FlowSource::Adjudication)
             {
                 continue;
             }
             let Some(sid) = r.get("session_id").and_then(|v| v.as_str()) else {
                 continue;
             };
-            if !scope.admits(sid) {
+            if !scope.admits(sid, r.get("execution_id").and_then(|v| v.as_str())) {
                 continue;
             }
             let text = r
@@ -146,7 +157,7 @@ pub fn scan(days: usize, scope: Scope<'_>) -> Vec<Correction> {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string(),
-                session_id: sid.to_string(),
+                execution_id: execution_of(&r),
                 text: text.to_string(),
             });
         }
