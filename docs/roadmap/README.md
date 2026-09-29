@@ -27,7 +27,7 @@ Themes are **concurrent lanes, not a sequence** — work happens across several 
 
 ### Completed — the shipped record
 
-Narrated together in [`COMPLETED.md`](./COMPLETED.md) (right-sized, not full charters — the decision-level *why* lives in [`DESIGN.md` → How it got here](../../DESIGN.md#how-it-got-here-the-evolution)).
+Narrated together in [`COMPLETED.md`](./COMPLETED.md) (right-sized, not full charters: the decision-level *why* lives in [`DESIGN.md` → How it got here](../../DESIGN.md#how-it-got-here-the-evolution)).
 
 | Theme | What shipped | Milestone |
 |---|---|---|
