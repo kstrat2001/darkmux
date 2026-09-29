@@ -971,7 +971,7 @@ pub fn phase_abandon(id: &str) -> Result<Phase> {
 // ─── Mission transitions ───────────────────────────────────────────────
 
 /// Begin a mission: stamps `started_ts = now()`. NOT idempotent: an already
-/// started, Paused, or terminal mission errors, so `started_ts` stays the one
+/// started or terminal mission errors, so `started_ts` stays the one
 /// ground-truth instant. Callers: `mission launch` and the crew-of-one
 /// dispatch path.
 pub fn mission_start_with_reasoning(id: &str, reasoning: Option<&str>) -> Result<Mission> {
@@ -1001,12 +1001,6 @@ pub fn mission_start_with_reasoning_and_payload(
     save_json(&mission_path(id), &mission)?;
     emit_mission_transition_record_with_reasoning_and_payload(id, darkmux_flow::FlowAction::MissionStart, reasoning, payload);
     Ok(mission)
-}
-
-/// `mission close <id>` — Active/Paused → Finalized (terminal).
-#[allow(dead_code)]
-pub(crate) fn mission_close(id: &str) -> Result<Mission> {
-    mission_close_with_reasoning(id, None)
 }
 
 /// (#1504) Reconciles every non-terminal Phase belonging to this mission to

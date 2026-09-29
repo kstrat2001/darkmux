@@ -1200,8 +1200,7 @@ fn mission_to_run(
 ///
 /// **CONSIDER 4 — the dead `Planned` variant.** An `Active` mission
 /// (`MissionStatus`'s own default) with `started_ts: None` was minted but
-/// never actually started (`darkmux mission start` — or the launcher's own
-/// equivalent — hasn't run yet). Mapping that to `Planned` makes the
+/// never actually started (the launcher's `mission_start` hasn't run yet). Mapping that to `Planned` makes the
 /// variant reachable and distinguishes "queued" from "genuinely running".
 ///
 /// **CONSIDER 3 — a crashed mission can't stay `Running` forever.** A hard
