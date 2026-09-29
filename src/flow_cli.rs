@@ -1,7 +1,7 @@
 //! CLI dispatcher for `darkmux flow` shortcut verbs.
 
 use crate::flow;
-use crate::flow::{Category, FlowAction, FlowRecord, Level, Stage, Tier};
+use crate::flow::{Category, FlowAction, FlowRecord, FlowSource, Level, OperatorSource, Stage, Tier};
 use anyhow::{bail, Context, Result};
 use clap::Subcommand;
 
@@ -22,8 +22,8 @@ pub enum FlowCmd {
         #[arg(long = "session-id")]
         session_id: Option<String>,
         /// Optional source label.
-        #[arg(long)]
-        source: Option<String>,
+        #[arg(long, value_enum)]
+        source: Option<OperatorSource>,
     },
     /// Record an operator-flagged catch / mid-stream observation.
     Catch {
@@ -36,8 +36,8 @@ pub enum FlowCmd {
         #[arg(long = "session-id")]
         session_id: Option<String>,
         /// Optional source label.
-        #[arg(long)]
-        source: Option<String>,
+        #[arg(long, value_enum)]
+        source: Option<OperatorSource>,
     },
     /// Record a raw flow event — all six fields explicit from flags.
     Record {
@@ -62,8 +62,8 @@ pub enum FlowCmd {
         #[arg(long = "session-id")]
         session_id: Option<String>,
         /// Optional source label.
-        #[arg(long)]
-        source: Option<String>,
+        #[arg(long, value_enum)]
+        source: Option<OperatorSource>,
         /// Optional operator-supplied reasoning. The audit substrate's
         /// WHY layer for events emitted via this raw verb.
         #[arg(long)]
@@ -109,9 +109,9 @@ pub enum FlowCmd {
         /// already-dispatched session — e.g., recorded after the fact).
         #[arg(long = "session-id")]
         session_id: Option<String>,
-        /// Optional source label (e.g., `frontier`, `operator-manual`).
-        #[arg(long)]
-        source: Option<String>,
+        /// Optional source label.
+        #[arg(long, value_enum)]
+        source: Option<OperatorSource>,
     },
     /// Print a diagnostic snapshot of the flow substrate (sinks, Redis
     /// health, disk health, schema state). The store-status pill in
@@ -696,7 +696,7 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             phase_id,
             session_id,
             execution_id: None,
-            source,
+            source: source.map(FlowSource::from),
             model: None,
             reasoning: None,
             mission_id: None,
@@ -717,7 +717,7 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             phase_id,
             session_id,
             execution_id: None,
-            source,
+            source: source.map(FlowSource::from),
             model: None,
             reasoning: None,
             mission_id: None,
@@ -750,7 +750,7 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             phase_id,
             session_id,
             execution_id: None,
-            source,
+            source: source.map(FlowSource::from),
             model: None,
             reasoning,
             mission_id,
@@ -786,7 +786,7 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             phase_id,
             session_id,
             execution_id: None,
-            source,
+            source: source.map(FlowSource::from),
             model: None,
             reasoning: Some(format!("[{decision}] {reasoning}")),
             mission_id,
@@ -1062,7 +1062,7 @@ mod tests {
         run(FlowCmd::Record {
             level: Level::Error,
             category: Category::Machinery,
-            tier: Tier::Local,
+            tier: Tier::Darkmux,
             stage: Stage::Dispatch,
             action: FlowAction::OperatorNote,
             handle: "y".to_string(),
@@ -1096,7 +1096,7 @@ mod tests {
             handle: "opt-handle".to_string(),
             phase_id: Some("66".to_string()),
             session_id: Some("abc".to_string()),
-            source: Some("manual".to_string()),
+            source: Some(OperatorSource::Manual),
             reasoning: None,
             mission_id: None,
         })
@@ -1145,7 +1145,7 @@ mod tests {
             phase_id: Some("113-s1".into()),
             mission_id: Some("113-mission-propose-pipeline".into()),
             session_id: None,
-            source: Some("frontier".into()),
+            source: Some(OperatorSource::Frontier),
         })
         .unwrap();
 

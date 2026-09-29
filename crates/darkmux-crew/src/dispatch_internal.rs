@@ -3291,7 +3291,7 @@ fn emit_single_shot_usage(
     let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
         darkmux_flow::Level::Info,
         darkmux_flow::FlowAction::TelemetryTokens,
-        crate::usage::USAGE_SOURCE,
+        darkmux_flow::FlowSource::Tokens,
         role_id,
         session,
         execution,
@@ -6477,7 +6477,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
         darkmux_flow::Level::Info,
         darkmux_flow::FlowAction::TelemetryRuntime,
-        "runtime",
+        darkmux_flow::FlowSource::Runtime,
         &opts.role_id,
         &session,
         &execution,
@@ -8264,7 +8264,7 @@ fn run_telemetry_sampler(
             Some(payload),
         ));
     };
-    let emit = |source: &str, action: darkmux_flow::FlowAction, payload: serde_json::Value| {
+    let emit = |source: darkmux_flow::FlowSource, action: darkmux_flow::FlowAction, payload: serde_json::Value| {
         let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
             darkmux_flow::Level::Info,
             action,
@@ -8369,7 +8369,7 @@ fn run_telemetry_sampler(
         // `LmsTelemetryTracker::tick` so they are unit-testable without a
         // live `lms` or a live flow sink. Nothing but the wiring is here.
         lms_tracker.tick(&darkmux_profiles::lms::list_loaded, &|payload| {
-            emit("lms", darkmux_flow::FlowAction::TelemetryLms, payload)
+            emit(darkmux_flow::FlowSource::Lms, darkmux_flow::FlowAction::TelemetryLms, payload)
         });
 
         // Host system load — CPU / RAM / GPU utilization%, plus (#2108) the
@@ -8463,7 +8463,7 @@ fn run_telemetry_sampler(
                         let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
                             darkmux_flow::Level::Warn,
                             darkmux_flow::FlowAction::ThermalStopUnresolved,
-                            "thermal",
+                            darkmux_flow::FlowSource::Thermal,
                             &role_id,
                             &session,
                             &execution,
@@ -8497,7 +8497,7 @@ fn run_telemetry_sampler(
                     if state == "critical" {
                         let trip_wall = SystemTime::now();
                         tier5_eject_on_critical(&host_out, trip_wall, &|action, payload| {
-                            emit("thermal", action, payload)
+                            emit(darkmux_flow::FlowSource::Thermal, action, payload)
                         });
                     }
                 }
@@ -8582,7 +8582,7 @@ fn run_telemetry_sampler(
                         let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
                             darkmux_flow::Level::Warn,
                             darkmux_flow::FlowAction::ThermalStopUnresolved,
-                            "thermal",
+                            darkmux_flow::FlowSource::Thermal,
                             &role_id,
                             &session,
                             &execution,
@@ -8649,7 +8649,7 @@ fn run_telemetry_sampler(
                     let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
                         darkmux_flow::Level::Warn,
                         darkmux_flow::FlowAction::BatteryPauseUnsupported,
-                        "battery",
+                        darkmux_flow::FlowSource::Battery,
                         &role_id,
                         &session,
                         &execution,
@@ -9552,7 +9552,7 @@ impl TailerState {
                 // (#557 slice 3) Per-turn context-window occupancy: the exact
                 // prompt-token count and the configured n_ctx, as the
                 // sawtooth the viewer draws.
-                self.emit_telemetry("context", darkmux_flow::FlowAction::TelemetryContext, serde_json::json!({
+                self.emit_telemetry(darkmux_flow::FlowSource::Context, darkmux_flow::FlowAction::TelemetryContext, serde_json::json!({
                     "used": c.used,
                     "max": c.max,
                     "threshold": self.compaction_threshold,
@@ -9622,7 +9622,7 @@ impl TailerState {
             self.endpoint.as_deref().unwrap_or_default(),
             self.endpoint_id.as_deref(),
         );
-        self.emit_telemetry("tokens", darkmux_flow::FlowAction::TelemetryTokens, tokens_payload);
+        self.emit_telemetry(darkmux_flow::FlowSource::Tokens, darkmux_flow::FlowAction::TelemetryTokens, tokens_payload);
     }
 
     /// A tool call ran: its record, the finding or mod it emitted, and
@@ -9707,7 +9707,7 @@ impl TailerState {
             &execution,
             COMPACTOR_ROLE,
             Some(&model).filter(|m| !m.is_empty()).map(String::as_str),
-            crate::usage::UTILITY_SOURCE,
+            darkmux_flow::FlowSource::Utility,
             darkmux_flow::FlowAction::UtilityStart,
             payload,
         );
@@ -9750,7 +9750,7 @@ impl TailerState {
             &execution,
             COMPACTOR_ROLE,
             model.as_deref(),
-            crate::usage::USAGE_SOURCE,
+            darkmux_flow::FlowSource::Tokens,
             darkmux_flow::FlowAction::TelemetryTokens,
             payload,
         );
@@ -9776,7 +9776,7 @@ impl TailerState {
         // (#557 slice 3) The drop in the context-occupancy sawtooth: the exact
         // prompt-token count that triggered it, and a chars/4 estimate of the
         // compacted buffer.
-        self.emit_telemetry("compaction", darkmux_flow::FlowAction::TelemetryCompaction, serde_json::json!({
+        self.emit_telemetry(darkmux_flow::FlowSource::Compaction, darkmux_flow::FlowAction::TelemetryCompaction, serde_json::json!({
             "from": c.tokens_before,
             "to": c.tokens_after,
             "compactor_model": self.compactor_model,
@@ -9881,7 +9881,7 @@ impl TailerState {
     fn on_detector(&mut self, event: &darkmux_trajectory::TrajectoryEvent) {
         if let Some(payload) = detector_telemetry_payload(event) {
             self.summary.detections.push(payload.clone());
-            self.emit_telemetry("detector", darkmux_flow::FlowAction::TelemetryDetector, payload);
+            self.emit_telemetry(darkmux_flow::FlowSource::Detector, darkmux_flow::FlowAction::TelemetryDetector, payload);
         }
     }
 
@@ -10166,7 +10166,7 @@ impl TailerState {
     /// `emit` but routes through `build_telemetry_record` so the record
     /// lands under `category=telemetry` with a caller-supplied `source`
     /// (`"detector"`, `"runtime"`, …) the observability viewer keys on.
-    fn emit_telemetry(&self, source: &str, action: darkmux_flow::FlowAction, payload: serde_json::Value) {
+    fn emit_telemetry(&self, source: darkmux_flow::FlowSource, action: darkmux_flow::FlowAction, payload: serde_json::Value) {
         self.emit_telemetry_as(&self.execution, &self.role_id, Some(&self.model), source, action, payload);
     }
 
@@ -10180,7 +10180,7 @@ impl TailerState {
         execution: &ExecutionId,
         role_id: &str,
         model: Option<&str>,
-        source: &str,
+        source: darkmux_flow::FlowSource,
         action: darkmux_flow::FlowAction,
         mut payload: serde_json::Value,
     ) {

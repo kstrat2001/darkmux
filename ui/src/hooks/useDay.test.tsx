@@ -4,7 +4,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import { useDay } from "./useDay";
 import { shapeRecords } from "../lib/flow";
-import { ACTION } from "../lib/ingest";
+import { ACTION, SOURCE, type NormSource } from "../lib/ingest";
 
 // (#2377) Spy on the real implementation so other tests in this file keep
 // their actual behavior; only the call count is observed.
@@ -96,7 +96,7 @@ describe("useDay", () => {
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(['{"ts":"2026-08-09T05:00:00Z","action":"dispatch.start","session_id":"s1"}', '{"ts":"2026-08-09T05:00:01Z","action":"dispatch.turn","session_id":"s1","payload":{"turn_seq":1}}'].join("\n") + "\n", { status: 200 }))));
     const { result } = renderHook(() => useDay(null), { wrapper: wrapper() });
     await waitFor(() => expect(result.current.loading).toBe(false));
-    const runtime = (rs: { source?: string }[] | null) => (rs ?? []).filter((r) => r.source === "runtime").length;
+    const runtime = (rs: { source?: NormSource }[] | null) => (rs ?? []).filter((r) => r.source === SOURCE.Runtime).length;
     expect(runtime(result.current.ingested)).toBe(0);
     expect(runtime(result.current.records)).toBe(1);
   });

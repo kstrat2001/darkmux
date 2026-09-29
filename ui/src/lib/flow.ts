@@ -28,7 +28,7 @@ import type { AbandonReason } from "../types/generated/AbandonReason";
 import { isPlainObject } from "./guards";
 import { missionClosed } from "./lifecycle";
 import { runIndex } from "./runRef";
-import { ACTION, CATEGORY, byTime, earliestByTime, ingestJsonl, ingestRecord, latestByTime, recKey, recordsAsOf, recordsSince, type NormRecord } from "./ingest";
+import { ACTION, CATEGORY, SOURCE, byTime, earliestByTime, ingestJsonl, ingestRecord, latestByTime, recKey, recordsAsOf, recordsSince, type NormRecord } from "./ingest";
 
 /** `LIVE_WINDOW_MS` — viewer.html:3374. The rolling live window `RAW` is
  * bounded to; also the "N records · last Nh" meta-line's hour figure. */
@@ -631,7 +631,7 @@ export function flowToRenderModel(records: readonly NormRecord[]): NormRecord[] 
     if (o.action === ACTION.DispatchCompaction && !compTelemetryKeys.has(compKey(o.session_id, o.ts))) {
       const p = (o.payload || {}) as { before_messages?: number; after_messages?: number };
       o.category = CATEGORY.Telemetry;
-      o.source = "compaction";
+      o.source = SOURCE.Compaction;
       o.fields = { from: p.before_messages || 0, to: p.after_messages || 0 };
     }
     if (!o.category) o.category = o.source ? CATEGORY.Telemetry : CATEGORY.Work;

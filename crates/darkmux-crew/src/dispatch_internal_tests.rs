@@ -15691,7 +15691,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         let rec = build_machine_scoped_telemetry_record(&sample, 12_345, 5000);
         assert_eq!(rec.action, darkmux_flow::FlowAction::MachineTelemetry);
         assert!(matches!(rec.category, darkmux_flow::Category::Machinery));
-        assert_eq!(rec.source.as_deref(), Some("host"));
+        assert_eq!(rec.source, Some(darkmux_flow::FlowSource::Host));
         // (#2413) The whole point: no dispatch-scoped fields on a
         // machine-scoped record.
         assert!(rec.mission_id.is_none(), "machine-scoped: no mission context");
@@ -17366,7 +17366,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         assert_eq!(st["handle"], "compactor", "{st}");
         assert_eq!(st["model"], "darkmux:compactor-4b", "{st}");
         assert_eq!(st["session_id"], crate::test_session("sess-utility-start").wire(), "a compaction serves its execution: {st}");
-        assert_eq!(st["source"], crate::usage::UTILITY_SOURCE, "{st}");
+        assert_eq!(st["source"], "utility", "{st}");
         let p = &st["payload"];
         assert_eq!(p["job"], "compaction", "{p}");
         assert_eq!(p["model"], "darkmux:compactor-4b", "{p}");

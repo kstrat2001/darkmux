@@ -20,7 +20,7 @@ const proc = (
 ): NormRecord => norm({
   ts,
   category: "telemetry",
-  source: "process",
+  source: "host",
   // flow-action-guard:allow — a retired action, as an archive still holds it
   action: "telemetry.process",
   payload: { cpu, gpu, mem },
@@ -509,7 +509,7 @@ describe("MachineDrawer — idle state (no samples)", () => {
     const oldSample: NormRecord = norm({
       ts: new Date(NOW - 60 * 60_000).toISOString(), // 1h before NOW
       category: "telemetry",
-      source: "process",
+      source: "host",
       // flow-action-guard:allow — a retired action, as an archive still holds it
       action: "telemetry.process",
       payload: { cpu: 40, gpu: 55, mem: 30 },

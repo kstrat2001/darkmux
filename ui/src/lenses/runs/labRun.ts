@@ -20,7 +20,7 @@
 import { RUNNING_WORD } from "../../components/WorkStatus";
 import { shortModel } from "../lab/labSeries";
 import type { LabFunnelEnvelope, LabScoresDoc } from "../../types/handwritten";
-import { ACTION, CATEGORY, type NormRecord } from "../../lib/ingest";
+import { ACTION, CATEGORY, SOURCE, type NormRecord } from "../../lib/ingest";
 
 /** `computeLabPipeline()` — viewer.html:4756-4774. Folds the event feed
  * into per-`step_id` completion payloads (in first-seen order) plus a
@@ -119,7 +119,7 @@ export function labFeedRowLines(r: NormRecord): string[] {
   const tt = labFeedTs(r.ts);
   const f = r.payload || {};
 
-  if (r.category === CATEGORY.Telemetry && r.source === "process") {
+  if (r.category === CATEGORY.Telemetry && r.source === SOURCE.Host) {
     const cpu = f.cpu ?? "–";
     const mem = f.mem ?? "–";
     const gpu = f.gpu ?? "–";

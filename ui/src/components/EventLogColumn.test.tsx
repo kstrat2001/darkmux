@@ -380,7 +380,7 @@ describe("EventLogColumn", () => {
 
   it("the modal's checkbox grid filters by category/tier/source, not just activity", () => {
     const records = [
-      rec({ ts: "2026-08-08T12:00:00.000Z", action: "dispatch.reasoning", session_id: "s-local", tier: "local" }),
+      rec({ ts: "2026-08-08T12:00:00.000Z", action: "dispatch.reasoning", session_id: "s-local", tier: "darkmux" }),
       rec({ ts: "2026-08-08T12:05:00.000Z", action: "dispatch.reasoning", session_id: "s-cloud", tier: "frontier" }),
     ];
     render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
@@ -445,7 +445,7 @@ describe("EventLogColumn", () => {
       rec({
         ts: `2026-08-08T${String(10 + Math.floor(i / 60)).padStart(2, "0")}:${String(i % 60).padStart(2, "0")}:00.000Z`,
         category: "telemetry",
-        source: "process",
+        source: "host",
         action: undefined,
       }),
     );
@@ -475,7 +475,7 @@ describe("EventLogColumn", () => {
   // path (`setQuery`).
   it("(#2027 dual-mount) an idle sibling pane's own reconcile never writes, so it cannot clobber a gesture made in the other", () => {
     const records = [
-      rec({ ts: "2026-08-08T12:00:00.000Z", action: "dispatch.reasoning", session_id: "s-local", tier: "local" }),
+      rec({ ts: "2026-08-08T12:00:00.000Z", action: "dispatch.reasoning", session_id: "s-local", tier: "darkmux" }),
       rec({ ts: "2026-08-08T12:05:00.000Z", action: "dispatch.reasoning", session_id: "s-cloud", tier: "frontier" }),
     ];
     const { container: paneA } = render(<EventLogColumn scopeLabel="fleet" paneId="a" records={records} visible />);

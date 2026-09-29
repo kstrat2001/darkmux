@@ -8,6 +8,7 @@ import {
   ACTION,
   CATEGORY,
   LEVEL,
+  SOURCE,
   STAGE,
   TIER,
   byTime,
@@ -70,8 +71,8 @@ describe("ingest: the typed fields", () => {
   });
 
   it("types level, category, stage and tier; an unknown value keeps its text and equals no constant", () => {
-    const [r] = ingest([raw("dispatch.start", 0, { level: "warn", category: "telemetry", stage: "tier-decision", tier: "local" })]);
-    expect(r.level === LEVEL.Warn && r.category === CATEGORY.Telemetry && r.stage === STAGE.TierDecision && r.tier === TIER.Local).toBe(true);
+    const [r] = ingest([raw("dispatch.start", 0, { level: "warn", category: "telemetry", stage: "tier-decision", tier: "darkmux" })]);
+    expect(r.level === LEVEL.Warn && r.category === CATEGORY.Telemetry && r.stage === STAGE.TierDecision && r.tier === TIER.Darkmux).toBe(true);
     const [odd] = ingest([raw("dispatch.start", 0, { level: "loud", category: "novel", stage: "verify", tier: "cloud" })]);
     expect([odd.level, odd.category, odd.stage, odd.tier].map(tagText)).toEqual(["loud", "novel", "verify", "cloud"]);
     const allConstants: unknown[] = [...Object.values(LEVEL), ...Object.values(CATEGORY), ...Object.values(STAGE), ...Object.values(TIER)];
@@ -164,7 +165,7 @@ describe("ingest: one test per entry point", () => {
 
   it("a record the viewer synthesizes (the per-session runtime row) is ingested too", () => {
     const shaped = shapeRecords(ingest([raw("dispatch.turn", 1, { payload: { turn_seq: 2 } })]));
-    const runtime = shaped.find((r) => r.source === "runtime");
+    const runtime = shaped.find((r) => r.source === SOURCE.Runtime);
     expect(runtime?.category).toBe(CATEGORY.Telemetry);
     expect(runtime?.tMs).toBe(T0 + 1000);
   });
@@ -186,7 +187,7 @@ describe("vocabulary skew is loud", () => {
     try {
       const recs = ingest([
         // flow-action-guard:allow-start — a retired action, as an archive still holds it
-        raw("telemetry.process", 0, { category: "telemetry", source: "process", payload: { cpu: 12 } }),
+        raw("telemetry.process", 0, { category: "telemetry", source: "host", payload: { cpu: 12 } }),
         raw("mission.compile.error", 1),
         raw("mission reopen", 2),
         // flow-action-guard:allow-end

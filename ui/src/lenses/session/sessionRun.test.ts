@@ -1018,7 +1018,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
       ts,
       session_id: "s1",
       category: "telemetry" as const,
-      source: "process",
+      source: "host",
       fields: { cpu, mem, gpu },
     });
     const data: RawRecord[] = [

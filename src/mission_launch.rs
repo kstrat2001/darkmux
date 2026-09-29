@@ -5973,8 +5973,8 @@ mod tests {
             .iter()
             .filter(|r| {
                 let action = r.get("action").and_then(|v| v.as_str()).unwrap_or("");
-                let source = r.get("source").and_then(|v| v.as_str()).unwrap_or("");
-                source == "scheduler" && (action == "step.start" || action == "step.complete")
+                let source = darkmux_flow::reader::source_of(r);
+                source == Some(darkmux_flow::FlowSource::Scheduler) && (action == "step.start" || action == "step.complete")
             })
             .collect();
         assert!(

@@ -433,7 +433,7 @@ describe("MissionGraphLens", () => {
 
     seedLiveTail(queryClient, [
       // flow-action-guard:allow — a retired action, as an archive still holds it
-      { ts: new Date().toISOString(), action: "telemetry.process", category: "telemetry", source: "process", payload: { cpu: 41, gpu: 72, mem: 0.5 } },
+      { ts: new Date().toISOString(), action: "telemetry.process", category: "telemetry", source: "host", payload: { cpu: 41, gpu: 72, mem: 0.5 } },
     ]);
 
     await waitFor(() => expect(document.querySelector(".mproc")).not.toBeNull());
@@ -470,7 +470,7 @@ describe("MissionGraphLens", () => {
     await waitFor(() => expect(document.querySelector(".mnode")).not.toBeNull());
     seedLiveTail(queryClient, [
       // flow-action-guard:allow — a retired action, as an archive still holds it
-      { ts: new Date().toISOString(), action: "telemetry.process", category: "telemetry", source: "process", payload: { cpu: 41, gpu: 72 } },
+      { ts: new Date().toISOString(), action: "telemetry.process", category: "telemetry", source: "host", payload: { cpu: 41, gpu: 72 } },
     ]);
     await new Promise((r) => setTimeout(r, 50));
     expect(document.querySelector(".mproc")).toBeNull();
@@ -487,7 +487,7 @@ describe("MissionGraphLens", () => {
 
     seedLiveTail(queryClient, [
       // flow-action-guard:allow — a retired action, as an archive still holds it
-      { ts: new Date().toISOString(), action: "telemetry.process", category: "telemetry", source: "process", payload: { cpu: 10, gpu: 5 } },
+      { ts: new Date().toISOString(), action: "telemetry.process", category: "telemetry", source: "host", payload: { cpu: 10, gpu: 5 } },
     ]);
 
     await waitFor(() => expect(document.querySelector(".mproc")).not.toBeNull());
@@ -510,7 +510,7 @@ describe("MissionGraphLens", () => {
     try {
       seedLiveTail(queryClient, [
         // flow-action-guard:allow — a retired action, as an archive still holds it
-        { ts: new Date(t0).toISOString(), action: "telemetry.process", category: "telemetry", source: "process", payload: { cpu: 10, gpu: 5 } },
+        { ts: new Date(t0).toISOString(), action: "telemetry.process", category: "telemetry", source: "host", payload: { cpu: 10, gpu: 5 } },
       ]);
       await waitFor(() => expect(document.querySelector(".mproc")).not.toBeNull());
 

@@ -5493,7 +5493,7 @@ fn synthetic_stream_error_record(stream_name: &str, attempts: u32, reason: &str)
         ts: darkmux_flow::ts_utc_now(),
         level: darkmux_flow::Level::Warn,
         category: darkmux_flow::Category::Audit,
-        tier: darkmux_flow::Tier::Local,
+        tier: darkmux_flow::Tier::Darkmux,
         stage: darkmux_flow::Stage::Scope,
         action: darkmux_flow::FlowAction::StreamError,
         handle: "redis_tail_lines".to_string(),

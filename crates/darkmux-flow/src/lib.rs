@@ -2331,14 +2331,14 @@ mod tests {
             ts: "2025-06-01T08:00:00Z".to_string(),
             level: Level::Warn,
             category: Category::Audit,
-            tier: Tier::Local,
+            tier: Tier::Darkmux,
             stage: Stage::Review,
             action: crate::FlowAction::OperatorNote,
             handle: "handle-42".to_string(),
             phase_id: Some("sp-100".to_string()),
             session_id: Some("sess-abc".to_string()),
             execution_id: None,
-            source: Some("estimator".to_string()),
+            source: Some(FlowSource::Detector),
             model: None,
             reasoning: None,
             mission_id: None,
@@ -2362,7 +2362,7 @@ mod tests {
         assert_eq!(parsed["ts"], "2025-06-01T08:00:00Z");
         assert_eq!(parsed["level"], "warn");
         assert_eq!(parsed["category"], "audit");
-        assert_eq!(parsed["tier"], "local");
+        assert_eq!(parsed["tier"], "darkmux");
         assert_eq!(parsed["stage"], "review");
         assert_eq!(parsed["action"], "operator.note");
         assert_eq!(parsed["handle"], "handle-42");
@@ -2375,7 +2375,7 @@ mod tests {
         assert_eq!(session_id, "sess-abc");
 
         let source = parsed.get("source").expect("expected source");
-        assert_eq!(source, "estimator");
+        assert_eq!(source, "detector");
 
         // Round-trip: parse back into FlowRecord.
         let roundtrip: FlowRecord = serde_json::from_str(rec_line).unwrap();
@@ -2404,7 +2404,7 @@ mod tests {
                 phase_id: None,
                 session_id: None,
                 execution_id: None,
-                source: Some("reviewer".to_string()),
+                source: Some(FlowSource::Manual),
                 model: None,
                 reasoning: None,
                 mission_id: None,
@@ -4520,7 +4520,7 @@ mod tests {
             ts: ts_utc_now(),
             level: Level::Info,
             category: Category::Work,
-            tier: Tier::Local,
+            tier: Tier::Darkmux,
             stage: Stage::Dispatch,
             action: crate::FlowAction::OperatorNote,
             handle: "test".to_string(),
@@ -4730,7 +4730,7 @@ mod tests {
             ts: ts_utc_now(),
             level: Level::Info,
             category: Category::Work,
-            tier: Tier::Local,
+            tier: Tier::Darkmux,
             stage: Stage::Dispatch,
             action: crate::FlowAction::OperatorNote,
             handle: "test".to_string(),

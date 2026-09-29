@@ -1334,7 +1334,7 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
 //           rule. Payload carries `rule_index` / `target_host` /
 //           `delivered_action` / `attempt`, plus `delivered_hash` and
 //           `error` when present. No struct/enum change — both actions use
-//           the existing `Category::Machinery` / `Tier::Local` /
+//           the existing `Category::Machinery` / `Tier::Darkmux` /
 //           `Stage::Ship`. Minor + additive: older readers ignore the two
 //           new action values; new records only, prior AuditFileSink
 //           chains survive without rotation.
@@ -2114,18 +2114,94 @@ pub enum Category {
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
+/// Who acted: the party that wrote the record. Not where the model ran (a
+/// hosted endpoint's execution is still darkmux's record), so it names no
+/// topology.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, ValueEnum)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "lowercase")]
 pub enum Tier {
+    /// The operator, at the CLI.
     Operator,
+    /// The frontier orchestrator, through the CLI.
     Frontier,
-    Local,
+    /// darkmux's own code: every record a dispatch, the scheduler, a sampler
+    /// or the hook sink writes.
+    Darkmux,
     /// See [`Level::Unknown`] — same lenient-on-read contract.
     #[serde(other)]
     #[value(skip)]
     Unknown,
+}
+
+/// The component that wrote a record: one spelling each, `snake_case`. The
+/// set is closed; a spelling this build does not know reads as
+/// [`FlowSource::Unknown`] (see [`Level::Unknown`]) and is never written.
+/// Pre-4.0 spellings map on read (`crate::legacy::upgrade_source`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
+#[serde(rename_all = "snake_case")]
+pub enum FlowSource {
+    /// A dispatch's own work records (`dispatch.*`, and the run bookends).
+    CrewDispatch,
+    /// The mission scheduler's step records.
+    Scheduler,
+    PhaseLifecycle,
+    MissionLifecycle,
+    PhaseReview,
+    MissionDebrief,
+    /// The daemon's machine sampler (`machine.*`).
+    HostSampler,
+    PresenceReconciler,
+    /// The ACP panel's command gate.
+    CmdGateAudit,
+    /// The hook sink's own delivery records.
+    Hook,
+    /// The machine-scoped host probe.
+    Host,
+    Detector,
+    Runtime,
+    Tokens,
+    Context,
+    Compaction,
+    Lms,
+    Thermal,
+    Battery,
+    Budget,
+    /// A utility job's usage record.
+    Utility,
+    /// Written by the operator at the CLI (`flow note|catch|record --source`).
+    Orchestrator,
+    Adjudication,
+    Manual,
+    Frontier,
+    /// See [`Level::Unknown`] — same lenient-on-read contract.
+    #[serde(other)]
+    Unknown,
+}
+
+/// The [`FlowSource`]s an operator may name at the CLI (`flow note|catch|
+/// tier-decision|record --source`). Every other source is written by darkmux
+/// itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum OperatorSource {
+    Orchestrator,
+    Adjudication,
+    Manual,
+    Frontier,
+}
+
+impl From<OperatorSource> for FlowSource {
+    fn from(s: OperatorSource) -> Self {
+        match s {
+            OperatorSource::Orchestrator => FlowSource::Orchestrator,
+            OperatorSource::Adjudication => FlowSource::Adjudication,
+            OperatorSource::Manual => FlowSource::Manual,
+            OperatorSource::Frontier => FlowSource::Frontier,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
@@ -2184,7 +2260,7 @@ pub struct FlowRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_id: Option<darkmux_types::execution_id::ExecutionId>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
+    pub source: Option<FlowSource>,
     /// LMStudio model id that handled this work, when known. Set on
     /// dispatch records (`tier=local, stage=dispatch`) so the viewer
     /// can render which model ran the work without cross-referencing
@@ -2270,7 +2346,7 @@ pub struct FlowRecord {
 }
 
 impl FlowRecord {
-    /// A record under `session`, at the current time and `Tier::Local`, with
+    /// A record under `session`, at the current time and `Tier::Darkmux`, with
     /// every optional field empty. `session_id` and `mission_id` are both
     /// stamped from the one `session` here, so they can never disagree: the
     /// wire string names the run, and `mission_id` is that run when it is a
@@ -2287,7 +2363,7 @@ impl FlowRecord {
             ts: crate::ts_utc_now(),
             level,
             category,
-            tier: Tier::Local,
+            tier: Tier::Darkmux,
             stage,
             action,
             handle: handle.into(),
@@ -2526,7 +2602,7 @@ mod forward_compat_tests {
             "ts": "2026-08-03T12:00:00Z",
             "level": "info",
             "category": "telemetry",
-            "tier": "local",
+            "tier": "darkmux",
             "stage": "dispatch",
             "action": "telemetry.tokens",
             "handle": "seat-1"
@@ -2534,7 +2610,7 @@ mod forward_compat_tests {
         let rec: FlowRecord = serde_json::from_str(wire).unwrap();
         assert!(matches!(rec.level, Level::Info));
         assert!(matches!(rec.category, Category::Telemetry));
-        assert!(matches!(rec.tier, Tier::Local));
+        assert!(matches!(rec.tier, Tier::Darkmux));
         assert!(matches!(rec.stage, Stage::Dispatch));
         // And a re-serialize keeps the wire spelling — true for variants this
         // binary KNOWS. It is emphatically not true for unknown ones; that

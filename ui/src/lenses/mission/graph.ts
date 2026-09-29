@@ -25,7 +25,7 @@
  */
 import { compactThousands, fmtElapsed, type CompactStyle } from "../../lib/format";
 import { PURPOSE, isUsageRecord, stepTokensWithLegacyFallback, usageContribution } from "../../lib/usageRecords";
-import { ACTION, CATEGORY, byTime, byTimeNewestFirst, isAfter, isAsOf, isDispatchFamily, isDispatchTerminal, latestByTime, type NormAction, type NormRecord } from "../../lib/ingest";
+import { ACTION, CATEGORY, SOURCE, byTime, byTimeNewestFirst, isAfter, isAsOf, isDispatchFamily, isDispatchTerminal, latestByTime, type NormAction, type NormRecord } from "../../lib/ingest";
 import { lifecycleAt, type LifecyclePhase, type LifecyclePolicy } from "../../lib/lifecycle";
 import { currentRun, groupOfRecords } from "../../lib/runRef";
 
@@ -1029,7 +1029,7 @@ export function buildStepHeaderFields(step: GraphStep, metrics: MetricsMap, now:
 
   const detectorKinds = new Set<string>();
   for (const rec of stepRecords) {
-    const isDetector = rec.action === ACTION.TelemetryDetector || (rec.category === CATEGORY.Telemetry && rec.source === "detector");
+    const isDetector = rec.action === ACTION.TelemetryDetector || (rec.category === CATEGORY.Telemetry && rec.source === SOURCE.Detector);
     if (!isDetector) continue;
     const p = rec.payload;
     const kind = p ? (typeof p.kind === "string" ? p.kind : typeof p.detector === "string" ? p.detector : undefined) : undefined;

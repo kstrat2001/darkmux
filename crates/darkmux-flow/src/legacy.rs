@@ -15,7 +15,8 @@
 //! execution written before 4.0 names none, and [`stamp_execution`] gives
 //! it the one synthesized identity.
 
-use crate::{Bookend, FlowAction, Grain};
+use crate::{Bookend, FlowAction, FlowSource, Grain, Tier};
+use serde_json::Value;
 
 /// Read one wire string as it appears in a record of ANY age: a current
 /// spelling, an old spelling of a current action (upgraded), a retired
@@ -150,6 +151,26 @@ pub const OLD_SPELLINGS: &[(&str, FlowAction)] = &[
     ("catch", FlowAction::OperatorCatch),
 ];
 
+/// Every old spelling of a current `source`, and the source it now is. The
+/// `kebab-case` and `sprint_*` spellings are the ones the closed
+/// [`FlowSource`] retired; `process` was the per-dispatch host sampler's,
+/// whose records are host telemetry. A source with no entry here (a retired
+/// launcher's, or a newer build's) is left as written and reads as
+/// [`FlowSource::Unknown`].
+pub const OLD_SOURCES: &[(&str, FlowSource)] = &[
+    ("host-sampler", FlowSource::HostSampler),
+    ("presence-reconciler", FlowSource::PresenceReconciler),
+    ("cmd-gate-audit", FlowSource::CmdGateAudit),
+    ("sprint_lifecycle", FlowSource::PhaseLifecycle),
+    ("sprint_review", FlowSource::PhaseReview),
+    ("frontier-orchestrator", FlowSource::Frontier),
+    ("process", FlowSource::Host),
+];
+
+/// Every old spelling of a current `tier`: it named where the model ran, and
+/// every record darkmux itself wrote said `local`, hosted endpoints included.
+pub const OLD_TIERS: &[(&str, Tier)] = &[("local", Tier::Darkmux)];
+
 /// The current action for an old spelling, or `None` when `old` is not one.
 /// Never consulted on write: producers build [`FlowAction`] directly.
 pub fn upgrade_action(old: &str) -> Option<FlowAction> {
@@ -157,6 +178,38 @@ pub fn upgrade_action(old: &str) -> Option<FlowAction> {
         return Some(FlowAction::PhaseReviewVerdict);
     }
     OLD_SPELLINGS.iter().find(|(spelling, _)| *spelling == old).map(|(_, action)| action.clone())
+}
+
+/// The [`FlowSource`] a wire string is, current or old: a spelling that maps
+/// nowhere is [`FlowSource::Unknown`].
+pub fn read_source(wire: &str) -> FlowSource {
+    let current = serde_json::from_value(Value::String(wire.to_string())).unwrap_or(FlowSource::Unknown);
+    match (current, OLD_SOURCES.iter().find(|(spelling, _)| *spelling == wire)) {
+        (FlowSource::Unknown, Some((_, now))) => *now,
+        (current, _) => current,
+    }
+}
+
+/// Rewrite the retired `source` and `tier` spellings of a record, in place.
+/// Returns whether it changed anything. The action is upgraded separately
+/// ([`upgrade_action`]); this is every other field's old spelling.
+pub(crate) fn upgrade_fields(record: &mut Value) -> bool {
+    let mut changed = rewrite_field(record, "source", |old| {
+        OLD_SOURCES.iter().find(|(spelling, _)| *spelling == old).and_then(|(_, now)| serde_json::to_value(now).ok())
+    });
+    changed |= rewrite_field(record, "tier", |old| {
+        OLD_TIERS.iter().find(|(spelling, _)| *spelling == old).and_then(|(_, now)| serde_json::to_value(now).ok())
+    });
+    changed
+}
+
+/// Replace `record[key]` with `upgrade(old)` when it is a string that has one.
+fn rewrite_field(record: &mut Value, key: &str, upgrade: impl Fn(&str) -> Option<Value>) -> bool {
+    let Some(now) = record.get(key).and_then(Value::as_str).and_then(upgrade) else {
+        return false;
+    };
+    record[key] = now;
+    true
 }
 
 /// The run-grain action a pre-4.0 whole-run bookend now is; `None` for any

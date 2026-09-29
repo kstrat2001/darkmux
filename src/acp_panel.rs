@@ -791,7 +791,7 @@ pub(crate) fn emit_cmd_audit(verb: &str, args: &str, cwd: &Path, gate_confirmed:
     };
     let record = crate::flow::FlowRecord {
         tier: crate::flow::Tier::Operator,
-        source: Some("cmd-gate-audit".to_string()),
+        source: Some(darkmux_flow::FlowSource::CmdGateAudit),
         payload: Some(serde_json::json!({
             "verb": verb,
             "pr": pr,
@@ -1645,8 +1645,8 @@ mod tests {
             .iter()
             .filter(|r| {
                 let action = r.get("action").and_then(|v| v.as_str()).unwrap_or("");
-                let source = r.get("source").and_then(|v| v.as_str()).unwrap_or("");
-                source == "scheduler" && (action == "step.start" || action == "step.complete")
+                let source = darkmux_flow::reader::source_of(r);
+                source == Some(darkmux_flow::FlowSource::Scheduler) && (action == "step.start" || action == "step.complete")
             })
             .collect();
         assert!(

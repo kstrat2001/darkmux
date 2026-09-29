@@ -65,7 +65,7 @@ import { PURPOSE, sumUsage } from "../../lib/usageRecords";
 import type { DispatchStartPayload, DispatchCompletePayload } from "../../types/handwritten";
 import { toolOutcome } from "../../lib/recordDetail";
 import type { RunStatus } from "../../types/generated/RunStatus";
-import { ACTION, CATEGORY, byTime, isBookendTerminal, latestByTime, recordsAsOf, type NormRecord } from "../../lib/ingest";
+import { ACTION, CATEGORY, SOURCE, byTime, isBookendTerminal, latestByTime, recordsAsOf, type NormRecord, type NormSource } from "../../lib/ingest";
 import { maxOf } from "../../lib/numbers";
 
 /** The run-time figure's long hover text, shared by SYSTEM's WALL CLOCK and
@@ -453,7 +453,7 @@ interface MissionModelRollup {
  * NOW, which is the LATEST sample's (`latestByTime`: an untimed sample only
  * when no timed one exists, the bad-timestamp policy). */
 function contextFigures(tel: readonly NormRecord[]): { samples: number; nctx: number; ctxPeak: number; ctxNow: number } {
-  const cx = tel.filter((r) => r.source === "context").sort(byTime);
+  const cx = tel.filter((r) => r.source === SOURCE.Context).sort(byTime);
   const used = (r: NormRecord | undefined) => Number((r?.fields as Record<string, unknown> | undefined)?.used) || 0;
   const max0 = cx.length ? Number((cx[0].fields as Record<string, unknown>)?.max) : NaN;
   return {
@@ -504,10 +504,10 @@ function rollUpMissionModelWork(siblings: readonly RunGroup[]): MissionModelRoll
  *  work. (#2902 step 2a) Its own tokens, utility excluded. */
 function executionFigures(own: readonly NormRecord[]): (ModelFigures & { loads: NormRecord[] }) | null {
   const tel = own.filter((r) => r.category === CATEGORY.Telemetry);
-  const rt = bySource(tel, "runtime").slice(-1)[0] ?? null;
+  const rt = bySource(tel, SOURCE.Runtime).slice(-1)[0] ?? null;
   const tok = executionTokens(own);
   const cx = contextFigures(tel);
-  const loads = bySource(tel, "lms").filter(isLoad);
+  const loads = bySource(tel, SOURCE.Lms).filter(isLoad);
   const turns = rt ? Number((rt.fields as Record<string, unknown>).turns) : null;
   const fig = { turns, tokIn: tok ? tok.prompt : null, tokOut: tok ? tok.completion : null, ctxPeak: cx.ctxPeak, ctxNow: cx.ctxNow, nctx: cx.nctx, loads };
   return loads.length > 0 || turns != null || tok != null || cx.samples > 0 ? fig : null;
@@ -643,23 +643,23 @@ interface AttemptTelemetry {
   comps: NormRecord[];
 }
 
-const bySource = (recs: readonly NormRecord[], source: string): NormRecord[] => recs.filter((r) => r.source === source);
+const bySource = (recs: readonly NormRecord[], source: NormSource): NormRecord[] => recs.filter((r) => r.source === source);
 
 const isLoad = (r: NormRecord): boolean => (r.fields as Record<string, unknown> | undefined)?.event === "load";
 
 function attemptTelemetry(visible: readonly NormRecord[], ctx: RunContext): AttemptTelemetry {
   const tel = visible.filter((r) => ctx.inAttempt(r) && r.category === CATEGORY.Telemetry);
-  const lms = bySource(tel, "lms");
+  const lms = bySource(tel, SOURCE.Lms);
   const loads = lms.filter(isLoad);
   return {
     tel,
     lms,
-    procs: [...bySource(tel, "process"), ...hostSamplesOf(visible, ctx)],
-    rt: bySource(tel, "runtime").slice(-1)[0] ?? null,
-    dets: bySource(tel, "detector"),
+    procs: [...bySource(tel, SOURCE.Host), ...hostSamplesOf(visible, ctx)],
+    rt: bySource(tel, SOURCE.Runtime).slice(-1)[0] ?? null,
+    dets: bySource(tel, SOURCE.Detector),
     loads,
     distinct: [...new Set(loads.map((r) => (r.fields as Record<string, unknown>).model as string))],
-    comps: bySource(tel, "compaction"),
+    comps: bySource(tel, SOURCE.Compaction),
   };
 }
 

@@ -502,7 +502,7 @@ pub(crate) fn load_phase_by_id(phase_id: &str) -> Result<Phase> {
                 phase_id: Some(phase_id.to_string()),
                 session_id: None,
                 execution_id: None,
-                source: Some("phase_lifecycle".to_string()),
+                source: Some(darkmux_flow::FlowSource::PhaseLifecycle),
                 model: None,
                 reasoning: None,
                 mission_id: Some(chosen.mission_id.clone()),
@@ -558,7 +558,7 @@ fn emit_phase_transition_record(phase_id: &str, mission_id: &str, action: darkmu
     let _ = flow::record(FlowRecord {
         tier: Tier::Operator,
         phase_id: Some(phase_id.to_string()),
-        source: Some("phase_lifecycle".to_string()),
+        source: Some(darkmux_flow::FlowSource::PhaseLifecycle),
         ..FlowRecord::for_session(&session, Level::Info, Category::Work, Stage::Scope, action, phase_id.to_string())
     });
 }
@@ -580,7 +580,7 @@ fn emit_mission_transition_record_with_reasoning_and_payload(
     let Some(session) = mission_session(mission_id) else { return };
     let _ = flow::record(FlowRecord {
         tier: Tier::Operator,
-        source: Some("mission_lifecycle".to_string()),
+        source: Some(darkmux_flow::FlowSource::MissionLifecycle),
         reasoning: reasoning.map(String::from),
         payload,
         ..FlowRecord::for_session(&session, Level::Info, Category::Work, Stage::Scope, action, mission_id.to_string())

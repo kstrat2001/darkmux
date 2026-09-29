@@ -262,7 +262,7 @@ mod tests {
             ts: crate::ts_utc_now(),
             level,
             category: crate::Category::Work,
-            tier: crate::Tier::Local,
+            tier: crate::Tier::Darkmux,
             stage: crate::Stage::Dispatch,
             action: crate::FlowAction::DispatchStart,
             handle: marker.to_string(),

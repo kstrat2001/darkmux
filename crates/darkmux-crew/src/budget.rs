@@ -74,11 +74,10 @@ use darkmux_types::execution_id::ExecutionId;
 use darkmux_types::session_id::SessionId;
 use darkmux_types::{BudgetPolicy, ModelEndpoint, WindowBudget};
 
-/// The flow-record telemetry `source` every budget record carries. The
-/// actions are `FlowAction::Budget*`: `budget.warn` (level Warn),
-/// `budget.wait` (Warn, carries when it will resume), `budget.resume` (Info,
-/// carries how long it waited) and `budget.stop` (Warn).
-pub const BUDGET_SOURCE: &str = "budget";
+// Every budget record carries `FlowSource::Budget`. The actions are
+// `FlowAction::Budget*`: `budget.warn` (level Warn), `budget.wait` (Warn,
+// carries when it will resume), `budget.resume` (Info, carries how long it
+// waited) and `budget.stop` (Warn).
 
 /// The longest single sleep while waiting: the wait re-reads the window
 /// (and the endpoint's limits, so a raised or switched-off budget releases
@@ -885,7 +884,7 @@ fn record(
     crate::dispatch::build_telemetry_record(
         level,
         action,
-        BUDGET_SOURCE,
+        darkmux_flow::FlowSource::Budget,
         caller.role_id.unwrap_or("budget"),
         caller.session,
         caller.execution,

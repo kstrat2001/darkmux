@@ -639,7 +639,7 @@ describe("FleetLens", () => {
     try {
       const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
       const records = normAll([
-        { ts: "2026-08-26T10:00:00.000Z", machine_uid: "u1", machine_id: "m5-ultra-256gb", action: "machine.online", source: "presence-reconciler" },
+        { ts: "2026-08-26T10:00:00.000Z", machine_uid: "u1", machine_id: "m5-ultra-256gb", action: "machine.online", source: "presence_reconciler" },
       ]);
       render(
         <QueryClientProvider client={queryClient}>
@@ -1491,7 +1491,7 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
 
   it("(#2890) the machine name and hardware line carry their full text as a tooltip", async () => {
     const records = normAll([
-      { ts: "2026-08-26T10:00:00.000Z", machine_uid: "u1", machine_id: "m1-max-32gb-studio", action: "machine.online", source: "presence-reconciler" },
+      { ts: "2026-08-26T10:00:00.000Z", machine_uid: "u1", machine_id: "m1-max-32gb-studio", action: "machine.online", source: "presence_reconciler" },
     ]);
     renderFleetLens({ records, tMin: Date.parse("2026-08-26T09:00:00.000Z"), tMax: Date.parse("2026-08-26T10:00:00.000Z"), historical: true });
     await waitFor(() => expect(document.querySelector(".mach-name")).not.toBeNull());
@@ -1500,7 +1500,7 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
 
   it("(#2890) an online machine with nothing running shows its tube idle", async () => {
     const records = normAll([
-      { ts: "2026-08-26T10:00:00.000Z", machine_uid: "u1", machine_id: "m5", action: "machine.online", source: "presence-reconciler" },
+      { ts: "2026-08-26T10:00:00.000Z", machine_uid: "u1", machine_id: "m5", action: "machine.online", source: "presence_reconciler" },
     ]);
     renderFleetLens({ records, tMin: Date.parse("2026-08-26T09:00:00.000Z"), tMax: Date.parse("2026-08-26T10:00:00.000Z"), historical: true });
     await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
@@ -2092,7 +2092,7 @@ describe("FleetLens — a card says no signal until its first data arrives (#295
         { ts: t("10:01:50"), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
         { ts: t("10:01:56"), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { turn_seq: 1, sampled_at_ms: ms("10:01:56"), generated_chars: 0 } },
         { ts: t("10:01:58"), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { turn_seq: 1, sampled_at_ms: ms("10:01:58"), generated_chars: 800 } },
-        { ts: t("10:01:59"), machine_uid: "u1", machine_id: "MacBook-Pro", action: "machine.offline", source: "presence-reconciler" },
+        { ts: t("10:01:59"), machine_uid: "u1", machine_id: "MacBook-Pro", action: "machine.offline", source: "presence_reconciler" },
       ],
       runs: [],
     });
@@ -2184,7 +2184,7 @@ describe("FleetLens — a card says no signal until its first data arrives (#295
 
   it("a replay has its records in hand and never shows 'no signal'", async () => {
     const records = normAll([
-      { ts: "2026-08-26T10:00:00.000Z", machine_uid: "u1", machine_id: "m5", action: "machine.online", source: "presence-reconciler" },
+      { ts: "2026-08-26T10:00:00.000Z", machine_uid: "u1", machine_id: "m5", action: "machine.online", source: "presence_reconciler" },
     ]);
     renderFleetLens({ records, tMin: Date.parse("2026-08-26T09:00:00.000Z"), tMax: Date.parse("2026-08-26T10:00:00.000Z"), historical: true });
     await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());

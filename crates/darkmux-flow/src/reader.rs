@@ -54,7 +54,7 @@ fn upgrade_noting_rewrite(record: &mut Value) -> (ActionRead, bool) {
     let Some(read) = action_of(record) else {
         return (ActionRead::Absent, false);
     };
-    let stamped = crate::legacy::stamp_execution(record, &read);
+    let stamped = crate::legacy::stamp_execution(record, &read) | crate::legacy::upgrade_fields(record);
     match read {
         FlowAction::Other(_) => return (ActionRead::Unknown, stamped),
         FlowAction::Retired(_) => return (ActionRead::Retired, stamped),
@@ -129,6 +129,12 @@ pub fn parse_record(line: &str) -> Option<FlowRecord> {
     let mut record: FlowRecord = serde_json::from_value(v).ok()?;
     record.action = action;
     Some(record)
+}
+
+/// The typed `source` of a JSON record, an old spelling upgraded; `None` when
+/// the record names none.
+pub fn source_of(record: &Value) -> Option<crate::FlowSource> {
+    record.get("source")?.as_str().map(crate::legacy::read_source)
 }
 
 /// The typed action of a JSON record, upgraded (a pre-4.0 whole-run bookend
@@ -357,6 +363,47 @@ mod tests {
         assert!(matches!(record.stage, crate::Stage::Unknown), "{:?}", record.stage);
         let back = serde_json::to_value(&record).unwrap();
         assert!(back.get("work_id").is_none() && back.get("attempt").is_none());
+    }
+
+    /// A pre-4.0 `source` or `tier` spelling reads as its current one, on the
+    /// JSON path and the typed path alike; a current spelling is untouched.
+    #[test]
+    fn old_source_and_tier_spellings_are_upgraded_on_read() {
+        for (old, current) in [
+            ("host-sampler", "host_sampler"),
+            ("presence-reconciler", "presence_reconciler"),
+            ("cmd-gate-audit", "cmd_gate_audit"),
+            ("sprint_lifecycle", "phase_lifecycle"),
+            ("sprint_review", "phase_review"),
+            ("frontier-orchestrator", "frontier"),
+            ("process", "host"),
+        ] {
+            let mut v = json!({"action": "operator.note", "source": old, "tier": "local"});
+            assert_eq!(upgrade(&mut v), ActionRead::Current, "the action is current: {old}");
+            assert_eq!(v["source"], current);
+            assert_eq!(v["tier"], "darkmux");
+            let line = format!(
+                r#"{{"ts":"t","level":"info","category":"work","tier":"local","stage":"dispatch","action":"operator.note","handle":"h","source":"{old}"}}"#
+            );
+            let record = parse_record(&line).expect("archive line parses");
+            assert_eq!(serde_json::to_value(record.source).unwrap(), current);
+            assert!(matches!(record.tier, crate::Tier::Darkmux));
+        }
+        let current = r#"{"action":"operator.note","source":"host_sampler","tier":"darkmux"}"#;
+        assert!(matches!(upgrade_line(current), Some(std::borrow::Cow::Borrowed(_))), "a current line is forwarded byte for byte");
+        let old = r#"{"action":"operator.note","source":"host-sampler","tier":"darkmux"}"#;
+        assert!(matches!(upgrade_line(old), Some(std::borrow::Cow::Owned(_))), "an old spelling is rewritten");
+    }
+
+    /// A source no spelling maps (a retired launcher's, or one from a newer
+    /// build) is kept verbatim on the JSON path and reads as `Unknown`.
+    #[test]
+    fn an_unmapped_source_is_kept_verbatim_and_reads_unknown() {
+        let mut v = json!({"action": "operator.note", "source": "funnel"});
+        assert_eq!(upgrade(&mut v), ActionRead::Current);
+        assert_eq!(v["source"], "funnel");
+        let line = r#"{"ts":"t","level":"info","category":"work","tier":"darkmux","stage":"dispatch","action":"operator.note","handle":"h","source":"funnel"}"#;
+        assert_eq!(parse_record(line).unwrap().source, Some(crate::FlowSource::Unknown));
     }
 
     #[test]

@@ -822,7 +822,7 @@ fn read_meta(conn: &Connection, key: &str) -> Result<Option<String>> {
 /// `category` semantics must update BOTH.
 fn is_detector_caution(rec: &darkmux_flow::FlowRecord) -> bool {
     matches!(rec.category, darkmux_flow::Category::Telemetry)
-        && rec.source.as_deref() == Some("detector")
+        && rec.source == Some(darkmux_flow::FlowSource::Detector)
 }
 
 /// (#994) Pull the caution columns out of a detector record's `payload`
@@ -1259,7 +1259,7 @@ mod tests {
     /// Build one flow-stream line via the SAME constructor the runtime capture
     /// path uses (`build_telemetry_record`), so the test fixture format can't
     /// drift from what `derive_cautions` parses.
-    fn detector_line(source: &str, payload: serde_json::Value) -> String {
+    fn detector_line(source: darkmux_flow::FlowSource, payload: serde_json::Value) -> String {
         let rec = crate::dispatch::build_telemetry_record(
             darkmux_flow::Level::Info,
             darkmux_flow::FlowAction::TelemetryDetector,
@@ -1287,7 +1287,7 @@ mod tests {
                 r#"{"_type":"schema","version":"1.13.0","darkmux_version":"1.7.0"}"#.to_string(),
                 // A file-keyed cycle firing → caution with file=src/x.rs.
                 detector_line(
-                    "detector",
+                    darkmux_flow::FlowSource::Detector,
                     serde_json::json!({
                         "kind": "cycle", "severity": "warn", "detail": "`edit` called 3×",
                         "area": { "files": ["src/x.rs"] }
@@ -1295,14 +1295,14 @@ mod tests {
                 ),
                 // An engagement-level firing (no area) → caution with NULL file.
                 detector_line(
-                    "detector",
+                    darkmux_flow::FlowSource::Detector,
                     serde_json::json!({
                         "kind": "reasoning-loop", "severity": "warn", "detail": "same reasoning 3×"
                     }),
                 ),
                 // A non-detector telemetry record (source=runtime) → ignored.
                 detector_line(
-                    "runtime",
+                    darkmux_flow::FlowSource::Runtime,
                     serde_json::json!({ "kind": "context", "detail": "context fill 40%" }),
                 ),
             ],
@@ -1358,14 +1358,14 @@ mod tests {
             "2026-06-22.jsonl",
             &[
                 detector_line(
-                    "detector",
+                    darkmux_flow::FlowSource::Detector,
                     serde_json::json!({
                         "kind": "cycle", "severity": "warn", "detail": "`edit` called 3×",
                         "area": { "files": ["src/x.rs"] }
                     }),
                 ),
                 detector_line(
-                    "detector",
+                    darkmux_flow::FlowSource::Detector,
                     serde_json::json!({
                         "kind": "repetition", "severity": "warn",
                         "detail": "observation 17: tail_ratio=0.242 over 68000 characters — \
@@ -1400,7 +1400,7 @@ mod tests {
         let with_area = crate::dispatch::build_telemetry_record(
             darkmux_flow::Level::Info,
             darkmux_flow::FlowAction::TelemetryDetector,
-            "detector",
+            darkmux_flow::FlowSource::Detector,
             "coder",
             &crate::test_session("s"), &darkmux_types::execution_id::ExecutionId::mint(),
             None,
@@ -1418,7 +1418,7 @@ mod tests {
         let no_area = crate::dispatch::build_telemetry_record(
             darkmux_flow::Level::Info,
             darkmux_flow::FlowAction::TelemetryDetector,
-            "detector",
+            darkmux_flow::FlowSource::Detector,
             "coder",
             &crate::test_session("s"), &darkmux_types::execution_id::ExecutionId::mint(),
             None,
@@ -1433,7 +1433,7 @@ mod tests {
         let malformed = crate::dispatch::build_telemetry_record(
             darkmux_flow::Level::Info,
             darkmux_flow::FlowAction::TelemetryDetector,
-            "detector",
+            darkmux_flow::FlowSource::Detector,
             "coder",
             &crate::test_session("s"), &darkmux_types::execution_id::ExecutionId::mint(),
             None,
@@ -1449,7 +1449,7 @@ mod tests {
         let detector = crate::dispatch::build_telemetry_record(
             darkmux_flow::Level::Info,
             darkmux_flow::FlowAction::TelemetryDetector,
-            "detector",
+            darkmux_flow::FlowSource::Detector,
             "coder",
             &crate::test_session("s"), &darkmux_types::execution_id::ExecutionId::mint(),
             None,
@@ -1461,7 +1461,7 @@ mod tests {
         let runtime = crate::dispatch::build_telemetry_record(
             darkmux_flow::Level::Info,
             darkmux_flow::FlowAction::TelemetryRuntime,
-            "runtime",
+            darkmux_flow::FlowSource::Runtime,
             "coder",
             &crate::test_session("s"), &darkmux_types::execution_id::ExecutionId::mint(),
             None,

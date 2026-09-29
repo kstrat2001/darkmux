@@ -67,7 +67,7 @@ mod tests {
             ts: darkmux_flow::ts_utc_now(),
             level: darkmux_flow::Level::Info,
             category: darkmux_flow::Category::Work,
-            tier: darkmux_flow::Tier::Local,
+            tier: darkmux_flow::Tier::Darkmux,
             stage: darkmux_flow::Stage::Dispatch,
             action: darkmux_flow::FlowAction::StepResult,
             handle: "s1".to_string(),

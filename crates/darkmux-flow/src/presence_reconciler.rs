@@ -51,10 +51,6 @@ const EDGE_CLAIM_TTL_SECS: u64 = 60;
 /// so a disappearance is detected within ~one TTL window of the last beat.
 pub const RECONCILE_INTERVAL_SECS: u64 = 7;
 
-/// Source tag on edge records — lets the viewer/operator tell reconciler-
-/// emitted lifecycle edges from work records at a glance.
-const EDGE_SOURCE: &str = "presence-reconciler";
-
 /// Try to claim the right to record one transition. Atomic `SET <key> 1 NX EX
 /// <ttl>` — returns `true` iff THIS caller set the key (won the claim), `false`
 /// if it already existed (a peer claimed it first). Best-effort: a Redis error
@@ -153,14 +149,14 @@ fn build_machine_edge_record(action: crate::FlowAction, machine_uid: &str, displ
         ts: crate::ts_utc_now(),
         level: crate::Level::Info,
         category: crate::Category::Machinery,
-        tier: crate::Tier::Local,
+        tier: crate::Tier::Darkmux,
         stage: crate::Stage::Dispatch,
         action,
         handle: display_name.to_string(),
         phase_id: None,
         session_id: None,
         execution_id: None,
-        source: Some(EDGE_SOURCE.to_string()),
+        source: Some(crate::FlowSource::PresenceReconciler),
         model: None,
         reasoning: None,
         mission_id: None,
@@ -230,7 +226,7 @@ fn build_session_end_record(beat: &SessionBeat) -> FlowRecord {
             ts: crate::ts_utc_now(),
             level: crate::Level::Info,
             category: crate::Category::Machinery,
-            tier: crate::Tier::Local,
+            tier: crate::Tier::Darkmux,
             stage: crate::Stage::Dispatch,
             action: crate::FlowAction::SessionEnd,
             handle,
@@ -249,7 +245,7 @@ fn build_session_end_record(beat: &SessionBeat) -> FlowRecord {
         },
     };
     FlowRecord {
-        source: Some(EDGE_SOURCE.to_string()),
+        source: Some(crate::FlowSource::PresenceReconciler),
         model: beat.model.clone(),
         machine_id: Some(beat.display_name.clone()),
         machine_uid: beat.machine_uid.clone(),
@@ -641,7 +637,7 @@ mod tests {
         assert_eq!(rec.machine_uid.as_deref(), Some("UID-1"));
         assert_eq!(rec.machine_id.as_deref(), Some("laptop"));
         assert_eq!(rec.handle, "coder");
-        assert_eq!(rec.source.as_deref(), Some(EDGE_SOURCE));
+        assert_eq!(rec.source, Some(crate::FlowSource::PresenceReconciler));
     }
 
     /// A 4.0 session's close-edge is stamped from the one session value, so
@@ -658,7 +654,7 @@ mod tests {
         assert_eq!(rec.machine_uid.as_deref(), Some("UID-1"));
         assert_eq!(rec.machine_id.as_deref(), Some("laptop"));
         assert_eq!(rec.handle, "coder");
-        assert_eq!(rec.source.as_deref(), Some(EDGE_SOURCE));
+        assert_eq!(rec.source, Some(crate::FlowSource::PresenceReconciler));
 
         let legacy = build_session_end_record(&sbeat("crew-dispatch-coder-1-internal", "coder"));
         assert_eq!(legacy.session_id.as_deref(), Some("crew-dispatch-coder-1-internal"));
@@ -674,7 +670,7 @@ mod tests {
         assert_eq!(rec.machine_uid.as_deref(), Some("PEER-UID"));
         assert_eq!(rec.machine_id.as_deref(), Some("studio"));
         assert_eq!(rec.action, crate::FlowAction::MachineOffline);
-        assert_eq!(rec.source.as_deref(), Some(EDGE_SOURCE));
+        assert_eq!(rec.source, Some(crate::FlowSource::PresenceReconciler));
         assert!(matches!(rec.category, crate::Category::Machinery));
     }
 

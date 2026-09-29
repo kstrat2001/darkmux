@@ -56,7 +56,7 @@
 import type { Route } from "./route";
 import { uidOf } from "./flow";
 import type { ProcSamplePoint } from "./hostStats";
-import { ACTION, CATEGORY, byTime, recordsAsOf, recordsSince, type NormRecord } from "./ingest";
+import { ACTION, CATEGORY, SOURCE, byTime, recordsAsOf, recordsSince, type NormRecord } from "./ingest";
 
 const DRAWER_ROLLING_WINDOW_MS = 10 * 60 * 1000;
 export const DRAWER_ROLLING_SCOPE_LABEL = "last 10 min";
@@ -77,11 +77,11 @@ const LAST_KNOWN_LOOKBACK_MS = 24 * 60 * 60 * 1000;
  * by design, so old records keep showing SOMETHING rather than going
  * blank. The retired action is outside the flow vocabulary, so its arm
  * matches the shape it always carried (`category: "telemetry"`,
- * `source: "process"`). */
+ * `source: "host"`). */
 export function isHostSampleRecord(r: NormRecord): boolean {
   return (
     r.action === ACTION.MachineTelemetry ||
-    (r.category === CATEGORY.Telemetry && r.source === "process")
+    (r.category === CATEGORY.Telemetry && r.source === SOURCE.Host)
   );
 }
 

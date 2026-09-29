@@ -2307,7 +2307,7 @@ fn mission_cautions(
             if r.get("category").and_then(|v| v.as_str()) != Some("telemetry") {
                 continue;
             }
-            if r.get("source").and_then(|v| v.as_str()) != Some("detector") {
+            if darkmux_flow::reader::source_of(&r) != Some(darkmux_flow::FlowSource::Detector) {
                 continue;
             }
             let in_mission = r
@@ -2816,7 +2816,7 @@ pub fn nudge_mission_debrief(mission_id: &str) {
     if let Ok(run) = RunId::mission(mission_id) {
         let _ = flow::record(flow::FlowRecord {
             tier: flow::Tier::Operator,
-            source: Some("mission_debrief".to_string()),
+            source: Some(darkmux_flow::FlowSource::MissionDebrief),
             ..flow::FlowRecord::for_session(
                 &SessionId::run(run),
                 flow::Level::Info,

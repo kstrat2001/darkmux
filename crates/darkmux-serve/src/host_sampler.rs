@@ -350,14 +350,14 @@ fn build_thermal_transition_record_with(
         ts: darkmux_flow::ts_utc_now(),
         level,
         category: darkmux_flow::Category::Machinery,
-        tier: darkmux_flow::Tier::Local,
+        tier: darkmux_flow::Tier::Darkmux,
         stage: darkmux_flow::Stage::Dispatch,
         action: darkmux_flow::FlowAction::MachineThermal,
         handle: display_name,
         phase_id: None,
         session_id: None,
         execution_id: None,
-        source: Some("host-sampler".to_string()),
+        source: Some(darkmux_flow::FlowSource::HostSampler),
         model: None,
         reasoning: None,
         mission_id: None,
@@ -475,14 +475,14 @@ fn build_battery_health_record(
         ts: darkmux_flow::ts_utc_now(),
         level: darkmux_flow::Level::Info,
         category: darkmux_flow::Category::Machinery,
-        tier: darkmux_flow::Tier::Local,
+        tier: darkmux_flow::Tier::Darkmux,
         stage: darkmux_flow::Stage::Dispatch,
         action: darkmux_flow::FlowAction::MachineBatteryHealth,
         handle: display_name,
         phase_id: None,
         session_id: None,
         execution_id: None,
-        source: Some("host-sampler".to_string()),
+        source: Some(darkmux_flow::FlowSource::HostSampler),
         model: None,
         reasoning: None,
         mission_id: None,
@@ -649,14 +649,14 @@ fn build_battery_transition_record_with(
         ts: darkmux_flow::ts_utc_now(),
         level,
         category: darkmux_flow::Category::Machinery,
-        tier: darkmux_flow::Tier::Local,
+        tier: darkmux_flow::Tier::Darkmux,
         stage: darkmux_flow::Stage::Dispatch,
         action: darkmux_flow::FlowAction::MachineBattery,
         handle: display_name,
         phase_id: None,
         session_id: None,
         execution_id: None,
-        source: Some("host-sampler".to_string()),
+        source: Some(darkmux_flow::FlowSource::HostSampler),
         model: None,
         reasoning: None,
         mission_id: None,
@@ -862,14 +862,14 @@ fn build_machine_rollup_record_with(
         ts: darkmux_flow::ts_utc_now(),
         level: darkmux_flow::Level::Info,
         category: darkmux_flow::Category::Machinery,
-        tier: darkmux_flow::Tier::Local,
+        tier: darkmux_flow::Tier::Darkmux,
         stage: darkmux_flow::Stage::Dispatch,
         action: darkmux_flow::FlowAction::MachineRollup,
         handle: display_name,
         phase_id: None,
         session_id: None,
         execution_id: None,
-        source: Some("host-sampler".to_string()),
+        source: Some(darkmux_flow::FlowSource::HostSampler),
         model: None,
         reasoning: None,
         mission_id: None,
@@ -2278,7 +2278,7 @@ mod tests {
 
         for r in &records {
             assert!(matches!(r.category, darkmux_flow::Category::Machinery));
-            assert!(matches!(r.tier, darkmux_flow::Tier::Local));
+            assert!(matches!(r.tier, darkmux_flow::Tier::Darkmux));
             assert_eq!(r.action, darkmux_flow::FlowAction::MachineThermal);
             assert!(r.mission_id.is_none(), "no mission context — the daemon runs independently of any dispatch");
             assert!(r.session_id.is_none());
@@ -2538,7 +2538,7 @@ mod tests {
             5_000,
         );
         assert_eq!(rec.action, darkmux_flow::FlowAction::MachineRollup);
-        assert_eq!(rec.source.as_deref(), Some("host-sampler"));
+        assert_eq!(rec.source, Some(darkmux_flow::FlowSource::HostSampler));
         let p = rec.payload.expect("payload");
         // The lens's own keys, not re-spelled and not wrapped.
         assert!(p.get("now").is_some(), "the lens's `now` block rides at the top level");
@@ -2894,7 +2894,7 @@ mod tests {
             );
             assert!(payload["window"].is_object(), "the lens window block: {payload}");
             assert_eq!(
-                recs[0]["source"], "host-sampler",
+                recs[0]["source"], "host_sampler",
                 "machine-scoped, attributed to the sampler that emitted it"
             );
         });

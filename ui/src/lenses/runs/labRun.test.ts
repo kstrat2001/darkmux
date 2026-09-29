@@ -107,7 +107,7 @@ describe("labShortId / labFeedTs", () => {
 
 describe("labFeedRowLines", () => {
   it("renders a host-telemetry row as ts/host/cpu-mem-gpu", () => {
-    const r: RawRecord = { ts: "t", category: "telemetry", source: "process", payload: { cpu: 12, mem: 40, gpu: 0 } };
+    const r: RawRecord = { ts: "t", category: "telemetry", source: "host", payload: { cpu: 12, mem: 40, gpu: 0 } };
     expect(labFeedRowLines(norm(r))).toEqual(["t", "host", "cpu 12% · mem 40% · gpu 0%"]);
   });
 
