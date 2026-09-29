@@ -38,7 +38,7 @@ use std::collections::BTreeSet;
 
 /// One pruned item and why. `kind` is `phase` | `task` | `step`; `reason` is
 /// one of the rule names in the module doc.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Pruned {
     pub id: String,
     pub kind: String,
@@ -47,7 +47,7 @@ pub struct Pruned {
 
 /// What the mint saw and what it kept. Written to the run as
 /// `graph-report.json` and stamped on the `mission start` record's payload.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PruneReport {
     pub phases_in_config: usize,
     pub phases_minted: usize,

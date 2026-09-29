@@ -57,7 +57,7 @@ pub struct GrownFrom {
 /// growth produced, so `minted.len()` is the count and the ids themselves
 /// join a grown task back to the template it came from without reading
 /// every task record.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, schemars::JsonSchema)]
 pub struct Grown {
     /// Real phase id the growth minted into.
     pub phase: String,

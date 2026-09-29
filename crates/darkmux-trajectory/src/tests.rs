@@ -310,3 +310,60 @@ fn a_mistyped_text_field_reads_as_absent_and_keeps_the_event() {
         "`ok` feeds the failure count: a bad one rejects, text rescue or not"
     );
 }
+
+// ---- the runtime's `--json` envelope ----------------------------------------
+
+fn success_envelope() -> RuntimeEnvelope {
+    RuntimeEnvelope {
+        result: "stop".into(),
+        final_assistant: Some("done".into()),
+        trajectory_path: "/darkmux-out/.darkmux-runtime/trajectory.jsonl".into(),
+        failed_tool_invocations: Some(vec![FailedExec { command: "cargo test".into(), reason: "not found".into() }]),
+        resumed_from: Some(ResumedFrom { path: "/darkmux-out/checkpoint.json".into(), turn_index: 4 }),
+    }
+}
+
+/// The keys are printed in the order a reader has always seen them: the host
+/// appends its own blocks after these, so the order is part of the contract.
+#[test]
+fn the_success_envelope_names_its_keys_in_order() {
+    let line = serde_json::to_string(&success_envelope()).unwrap();
+    let at = |key: &str| line.find(&format!("\"{key}\":")).unwrap_or_else(|| panic!("no {key} in {line}"));
+    let order = ["result", "final_assistant", "trajectory_path", "failed_tool_invocations", "resumed_from"];
+    assert!(order.windows(2).all(|w| at(w[0]) < at(w[1])), "keys out of order: {line}");
+    let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(v["failed_tool_invocations"][0]["command"], "cargo test");
+    assert_eq!(v["resumed_from"]["turn_index"], 4);
+}
+
+/// The inverse: an execution that resumed nothing and failed nothing to run
+/// prints no `resumed_from`, and the error envelope prints no
+/// `failed_tool_invocations` at all (absent, never an empty list that would
+/// read as "an honest run").
+#[test]
+fn the_error_envelope_is_the_same_shape_without_the_optional_keys() {
+    let v = serde_json::to_value(RuntimeEnvelope::error("/t".into())).unwrap();
+    assert_eq!(v["result"], "error");
+    assert!(v["final_assistant"].is_null());
+    assert!(v.get("failed_tool_invocations").is_none(), "{v}");
+    assert!(v.get("resumed_from").is_none(), "{v}");
+    let mut honest = success_envelope();
+    honest.resumed_from = None;
+    honest.failed_tool_invocations = Some(vec![]);
+    let v = serde_json::to_value(honest).unwrap();
+    assert_eq!(v["failed_tool_invocations"], serde_json::json!([]));
+    assert!(v.get("resumed_from").is_none(), "{v}");
+}
+
+/// A reader tolerates a partial envelope (an older or foreign runtime): the
+/// missing keys read as empty, and a written envelope reads back equal.
+#[test]
+fn an_envelope_reads_back_and_a_partial_one_reads_as_empty() {
+    let e = success_envelope();
+    let back: RuntimeEnvelope = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
+    assert_eq!(back, e);
+    let partial: RuntimeEnvelope = serde_json::from_str(r#"{"result":"stop"}"#).unwrap();
+    assert_eq!(partial.result, "stop");
+    assert_eq!(partial.final_assistant, None);
+    assert_eq!(partial.failed_tool_invocations, None);
+}

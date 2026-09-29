@@ -9,11 +9,13 @@
 //! per-call usage; the host turns each call's usage into its usage record
 //! (`telemetry.tokens`), and every token sum is a sum of those.
 
+pub mod envelope;
 pub mod event;
 pub mod fold;
 pub mod legacy;
 pub mod usage;
 
+pub use envelope::{FailedExec, ResumedFrom, RuntimeEnvelope};
 pub use event::*;
 pub use fold::*;
 pub use usage::{estimate_tokens, TokenSum, Usage, UsageCounts, CHARS_PER_TOKEN};

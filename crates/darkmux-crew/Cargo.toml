@@ -12,7 +12,7 @@ rust-version = "1.86"
 [dependencies]
 darkmux-types = { path = "../darkmux-types" }
 # (4.0) The trajectory event types and their one fold, shared with the runtime.
-darkmux-trajectory = { path = "../darkmux-trajectory" }
+darkmux-trajectory = { path = "../darkmux-trajectory", features = ["schemars"] }
 darkmux-flow = { path = "../darkmux-flow" }
 darkmux-profiles = { path = "../darkmux-profiles" }
 # (#1230 Packet 1) The bounded concurrent-dispatch executor

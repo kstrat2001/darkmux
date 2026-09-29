@@ -1058,9 +1058,9 @@ fn active_waits_lists_open_waits_from_live_processes_only() {
     text += &rec(darkmux_flow::FlowAction::BudgetWait, "indefinite", 1, None);
     append(dir.path(), T0, &text);
     let waits = active_waits(dir.path(), T0, 86_400, &|pid| pid == 1);
-    let sessions: Vec<&str> = waits.iter().filter_map(|w| w.session_id.as_deref()).collect();
+    let sessions: Vec<&str> = waits.iter().filter_map(|w| w.execution_id.as_deref()).collect();
     assert_eq!(sessions, vec!["indefinite", "open"]);
-    let open = waits.iter().find(|w| w.session_id.as_deref() == Some("open")).unwrap();
+    let open = waits.iter().find(|w| w.execution_id.as_deref() == Some("open")).unwrap();
     assert_eq!(open.resumes_in_secs, Some(600));
     assert_eq!(open.mission_id.as_deref(), Some("m-1"));
 }
@@ -1097,7 +1097,7 @@ fn active_waits_skip_a_stopped_runs_wait() {
             None => std::env::remove_var("DARKMUX_HOME"),
         }
     }
-    let sessions: Vec<&str> = waits.iter().filter_map(|w| w.session_id.as_deref()).collect();
+    let sessions: Vec<&str> = waits.iter().filter_map(|w| w.execution_id.as_deref()).collect();
     assert_eq!(sessions, vec!["s-live"]);
 }
 

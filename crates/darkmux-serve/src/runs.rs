@@ -70,7 +70,7 @@ use std::path::{Path as StdPath, PathBuf};
 /// phase, whose one task has exactly one step — the same shape
 /// `build_graph` always produces — read as `Dispatch`; anything else reads
 /// as `Mission`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "lowercase")]
@@ -83,7 +83,7 @@ pub enum RunKind {
 /// The run's flat lifecycle status. See each source's own mapping:
 /// [`mission_run_status`] (missions/dispatches), [`lab_run_status`] (lab
 /// runs), [`ghost_runs`] (untracked flow-only sessions).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "lowercase")]
@@ -113,7 +113,7 @@ pub enum RunStatus {
 /// (`mission_to_run`/`flow_mission_to_run`/`lab_summary_to_run`/
 /// `ghost_runs`) for how each is decided. Only meaningful when `status ==
 /// RunStatus::Abandoned`; every other status leaves this `None`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "lowercase")]
@@ -170,7 +170,7 @@ pub enum DispatchSessionEvidence {
 /// field but `id`/`kind`/`status`/`tracked` is optional) — this is NEVER
 /// persisted, so there's no schema-version discipline to carry; a future
 /// consumer (the step-4 Runs lens) just reads whatever's present.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct Run {

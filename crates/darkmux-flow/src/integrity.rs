@@ -556,7 +556,7 @@ pub fn integrity_check_all() -> Result<Vec<IntegrityReport>> {
     Ok(reports)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct IntegrityReport {
     pub path: String,
     /// (#906) Number of RECORDS verified — the schema header on line 1 is

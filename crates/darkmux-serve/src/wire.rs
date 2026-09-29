@@ -106,7 +106,7 @@ pub struct MachineStatusResponse {
 }
 
 /// The configured machine utility model and whether it is resident.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize, schemars::JsonSchema)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct UtilityModel {
@@ -118,7 +118,7 @@ pub struct UtilityModel {
 }
 
 /// `GET /machine/specs`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize, schemars::JsonSchema)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct MachineSpecsResponse {

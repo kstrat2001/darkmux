@@ -26,6 +26,9 @@ ts-export = ["dep:ts-rs", "darkmux-types/ts-export"]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
+# The CLI `--json` golden derives field schemas from the types `flow status` and
+# `flow integrity-check` print.
+schemars = "1.2"
 serde_json.workspace = true
 dirs = "5.0"
 # #163 — AuditFileSink: BLAKE3 hash-chained audit sink (edits detected by `flow integrity-check`).

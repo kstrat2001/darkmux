@@ -1,0 +1,954 @@
+# verbs: what each prints under --json
+dispatch <role> (a container execution)  DispatchEnvelope
+dispatch <role> (a hosted-endpoint execution)  DirectDispatchEnvelope
+finding list  FindingList
+finding show  FindingRecord
+finding sync  SyncReport
+flow drain  DrainOutput
+flow drain --file  StrayDrainOutput
+flow integrity-check  IntegrityCheckOutput
+flow status  FlowStatus
+lab loop  LoopReport
+lab loop --ab  LoopAbReport
+machine list  MachineListOutput
+machine resources  ModelLedger
+machine status  MachineStatusOutput
+memory correction list  CorrectionList
+memory lesson export  LessonsExport
+memory lesson list  LessonTiers
+memory lesson recall  LessonTiers
+mission config list  ConfigList
+mission config show  ConfigShow
+mission debrief  DebriefReport
+mission show  MissionShow
+mission status  MissionBoard
+mod create  ModCreated
+mod list  ModList
+mod show  ModRecord
+profile draft  ProfileDraft
+profile list  ProfileList
+role list  RoleList
+role show  RoleShow
+run list  RunListOutput
+run stats <one run>  RunStats
+run stats <several runs, or --baseline>  RunSetStats
+
+# streams: one record per line
+flow tail  one flow record per line, verbatim; the record is pinned by FLOW_SCHEMA_VERSION, not by this file
+
+# types
+AbandonReason = "aborted" | "noterminal"
+ActiveWait
+  execution_id: string | null
+  message: string
+  mission_id: string | null
+  resume_at: string | null
+  resumes_in_secs: integer | null
+  scope: string
+  subject: string
+Attribution = "per_process" | "estimated" | "unavailable"
+BoardDrift
+  detail: string
+  kind: DriftKind
+  suggest: string[]
+BoardMission
+  drift: BoardDrift[]
+  graph: PruneReport | null
+  id: string
+  phases: BoardPhases
+  status: MissionStatus
+  ticket: string | null
+BoardPhases
+  abandoned: integer
+  complete: integer
+  degraded: integer
+  planned: integer
+  running: integer
+  total: integer
+BoardSummary
+  fleet_complete: boolean
+  needs_attention: integer
+  total: integer
+BudgetPolicy = "off" | "warn" | "wait"
+CapabilityProfile = { [key: string]: number }
+CheckpointGate
+  concluded_turns: integer[]
+  degenerate_turns: integer[]
+  degenerate_turns_by_ratio: integer[]
+  min_tail_ratio: number | null
+  observations: integer
+  policy: string | null
+CheckpointSummary
+  concluded: integer
+  mean_tail_ratio: number | null
+  min_tail_ratio: number | null
+  total: integer
+CompactionStrategy = "narrative" | "structured-slot"
+ConfigList
+  configs: ConfigListRow[]
+ConfigListRow
+  cmd: string | null
+  error: string | null
+  id: string
+  manifest_path: string | null
+  name: string | null
+  phases: integer | null
+  source: MissionConfigSource | null
+  tasks: integer | null
+ConfigShow
+  cmd: GhVerbJson | null
+  description: string | null
+  id: string
+  inputs: InputJson[]
+  manifest_path: string
+  name: string
+  phases: PhaseJson[]
+  registry: RegistryJson
+  requested_id: string
+  residency: ResidencyBlockJson
+  schema_version: string | null
+  source: MissionConfigSource
+  warnings: string[]
+Correction
+  execution_id: string | null
+  text: string
+  ts: string
+CorrectionList
+  corrections: Correction[]
+CostPerSuccess
+  active_ms: number | null
+  gpu_busy_ms: number | null
+  pkg_joules: number | null
+  withheld: string[]
+DebriefMission
+  description: string
+  id: string
+  status: MissionStatus
+DebriefPhase
+  description: string
+  id: string
+  reason: string | null
+  status: DebriefPhaseStatus
+DebriefPhaseStatus = "planned" | "running" | "complete" | "degraded" | "abandoned"
+DebriefReport
+  cautions: string[]
+  corrections: string[]
+  mission: DebriefMission
+  phases: DebriefPhase[]
+  records_emitted: RecordsEmitted | null
+DestinationProblem = "both_http_and_file" | "no_destination"
+DetectorCounts
+  cycle: integer
+  empty_tool_calls: integer
+  feedback_injected: integer
+  intra_turn_stall: integer
+  per_turn_cap: integer
+  promoted_calls: integer
+  reasoning_loop: integer
+  repeated_failure: integer
+Dialect = "chat-completions" | "chat-completions-max-tokens"
+DirectDispatchEnvelope
+  final_assistant: string
+  metrics: DirectMetrics
+  result: string
+DirectMetrics
+  cached_tokens: integer | null
+  completion_tokens: integer | null
+  endpoint: string
+  model: string
+  prompt_tokens: integer | null
+  reasoning_tokens: integer | null
+  total_tokens: integer | null
+  turns: integer
+  wall_ms: integer
+DiskStatus
+  day_files: integer
+  exists: boolean
+  flows_dir: string
+  observed_disk_schemas?: string[]
+  total_bytes: integer
+DispatchEnvelope
+  bounds: any
+  checkpoints?: CheckpointSummary | null
+  degeneracy_warnings?: integer | null
+  detections: any[]
+  failed_tool_invocations?: FailedExec[] | null
+  final_assistant: string | null
+  findings?: FindingsSummary | null
+  host?: EnvelopeHost | null
+  host_window?: any
+  metrics: EnvelopeMetrics
+  result: string
+  resumed_from?: ResumedFrom | null
+  trajectory_path: string
+DraftCompaction
+  custom_instructions: string
+DraftModel
+  id: string
+  n_ctx: integer
+DraftProfile
+  _comment: string[]
+  description: string
+  models: DraftModel[]
+  runtime: DraftRuntime
+DraftRuntime
+  compaction?: DraftCompaction | null
+  context_tokens: integer
+DrainOutput
+  delivered: integer
+  failed: integer
+  lock_held_rules: integer[]
+  remaining_undelivered: integer
+  rule: integer | null
+  timed_out: boolean
+DriftKind = "done-not-finalized" | "all-phases-terminal-none-complete" | "mission-terminal-live-step" | "mission-terminal-open-phase" | "phase-terminal-live-step" | "stale-active" | "running-phase-execution-dead" | "planned-phase-nothing-advances"
+EdgeKind = "contains" | "depends_on"
+EndpointAuth
+  key_env?: string | null
+  keychain?: string | null
+  type?: EndpointAuthType | null
+EndpointAuthType = "api-key" | "bearer"
+EndpointField = string
+EnvelopeHost
+  cpu: MetricStats
+  energy_mwh?: number | null
+  gpu: MetricStats
+  mem: MetricStats
+  power?: EnvelopePower | null
+  sample_interval_ms: integer | null
+  samples: integer
+  thermal?: EnvelopeThermal | null
+EnvelopeMetrics
+  cached_tokens: integer | null
+  compactions: integer
+  completion_tokens: integer
+  model: string
+  prompt_tokens: integer
+  reasoning_tokens: integer | null
+  rest_ms: integer
+  rests: integer
+  total_tokens: integer
+  turn_delay_effective_ms: integer | null
+  turns: integer
+  wall_ms: integer | null
+EnvelopePower
+  cpu: PowerRail
+  gpu: PowerRail
+  total: PowerRail
+EnvelopeThermal
+  above_nominal_ms: integer
+  min_cpu_speed_limit_pct: integer
+  worst_state: string
+EscalationKind = "bail-with-explanation" | "retry-with-hint" | "hand-off-to"
+FailedExec
+  command: string
+  reason: string
+FindingList
+  findings: FindingRecord[]
+FindingRecord
+  context: any
+  emitted: any
+  execution: string
+  key: string
+  mission_id: string | null
+  phase_id: string | null
+  proposer: Proposer
+  schema_version: string
+  seq: integer
+  source?: string | null
+  step_id: string | null
+  tool_name: string
+  ts: string
+FindingsSummary
+  count: integer
+  path: string
+FlowScan
+  files_read: integer
+  files_read_errors: integer
+  files_skipped: integer
+  files_stopped_early: integer
+  files_total: integer
+  files_unreadable: integer
+  gather_ms: integer
+  lines_scanned: integer
+FlowStatus
+  disk: DiskStatus
+  fail_reasons?: string[]
+  hooks: HooksStatus
+  overall_state: HealthState
+  redis?: RedisStatus | null
+  schema: SchemaSkew
+  schema_version: string
+  sinks: SinkSummary
+  warn_reasons?: string[]
+ForFinding
+  context?: any
+  emitted?: any
+  key: string
+  missing?: boolean
+  mission_id?: string | null
+GateOutcome
+  applied?: boolean | null
+  command: string
+  exit_code?: integer | null
+  passed: boolean
+  reason?: string | null
+Gates
+  checkpoint: CheckpointGate
+  stream: StreamGate
+GhVerbJson
+  allowed: boolean
+  verb: string
+GraphEdge
+  id: string
+  kind: EdgeKind
+  source: string
+  target: string
+GraphNode
+  completedTs?: integer | null
+  depth: integer
+  description?: string | null
+  id: string
+  kind: NodeKind
+  label: string
+  parentId?: string | null
+  startedTs?: integer | null
+  status: GraphNodeStatus
+  statusNote?: string | null
+  steps?: StepRow[] | null
+GraphNodeStatus = TaskDisplayStatus | PhaseDisplayStatus
+Grown
+  from: string
+  items: integer
+  minted: string[]
+  phase: string
+  source: string
+  task_template: string
+HealthState = "ok" | "warn" | "fail"
+HookRuleStatus
+  cursor_write_failures: integer
+  destination_problem?: DestinationProblem | null
+  dropped_appends: integer
+  index: integer
+  is_empty_match: boolean
+  is_loopback: boolean
+  is_refused: boolean
+  is_tailnet: boolean
+  last_delivery_ts?: string | null
+  last_drainer_heartbeat?: string | null
+  last_error?: string | null
+  last_receiver_rejected_reasons: string[]
+  match_desc: string
+  quarantined_lines: integer
+  receiver_rejected_total: integer
+  signed: boolean
+  stalled: boolean
+  undelivered: integer
+  url: string
+HooksStatus
+  enabled: boolean
+  outbox_dir: string
+  rules: HookRuleStatus[]
+InputJson
+  default: any
+  description: string | null
+  ignored: boolean
+  ignored_reason: string | null
+  name: string
+  required: boolean
+IntegrityCheckOutput
+  reports: IntegrityReport[]
+IntegrityReport
+  break_at_line?: integer | null
+  break_reason?: string | null
+  chain_valid: boolean
+  legacy_format?: boolean
+  note?: string | null
+  path: string
+  records_checked: integer
+  writer_schema_version?: string | null
+LedgerMessage
+  severity: Severity
+  text: string
+LedgerState = "green" | "amber" | "red" | "unknown"
+Lenient = ManagedBackend | any
+Lenient2 = Dialect | any
+Lenient3 = UsageLimits | any
+Lenient4 = BudgetPolicy | any
+Lesson
+  body: string
+  created_ts: integer
+  file?: string | null
+  id?: integer | null
+  source?: string | null
+  title: string
+  updated_ts: integer
+LessonTiers
+  global: Lesson[]
+  repo: Lesson[]
+LessonsExport
+  lessons: Lesson[]
+  schema_version: integer
+LimitSource = "budget" | "physical_pool" | "unknown"
+LoadedModel
+  context: integer
+  identifier: string
+  model: string
+  queued?: integer | null
+  size: string
+  status: string
+LoopAbReport
+  ab: boolean
+  injected_context_chars: integer
+  verdict_shift: VerdictShift
+  with: LoopReport
+  without: LoopReport
+LoopReport
+  compactions: integer
+  detectors: DetectorCounts
+  dispatch_ok: boolean
+  duration_ms: integer
+  loop_config: string[]
+  notes: string[]
+  run_id: string
+  sandbox_changed: boolean | null
+  tool_calls: integer
+  turns: integer
+  verdict: Verdict
+  verify_passed: boolean | null
+MachineListOutput
+  local_machine_id: string | null
+  machines: MachineListRow[]
+  roster_path: string
+  roster_version: string
+MachineListRow
+  added_unix_ms: integer
+  address: string
+  description: string | null
+  dialed_address: string
+  id: string
+  is_this_machine: boolean
+  machine_uid: string | null
+  probe_error: string | null
+  probe_ms: integer
+  reachable: boolean
+  resolved_address: string
+  specs: MachineSpecsResponse | null
+  specs_auth_required: boolean
+  specs_route_missing: boolean
+  specs_unverified: boolean
+MachineSpecsResponse
+  cpu_brand: string | null
+  darkmux_version: string
+  flow_schema_version: string
+  generated_at_ms: integer
+  lms_unreachable: boolean
+  loaded_models: LoadedModel[]
+  machine_id: string | null
+  machine_uid: string | null
+  os: string
+  ram_free_for_ai_bytes: integer | null
+  ram_total_bytes: integer | null
+  redis_url_redacted: string | null
+  utility_model: UtilityModel | null
+MachineStatusOutput
+  lms_unreachable: boolean
+  machine_id: string | null
+  managed: LoadedModel[]
+  matching_profiles?: string[] | null
+  registry?: string | null
+  user_state: LoadedModel[]
+MachineTotals
+  current_bytes: integer | null
+  estimated_models: integer
+  other_used_bytes: integer | null
+  over_price_models: integer
+  potential_bytes: integer
+  projected_total_bytes: integer | null
+  shrink_hint?: string | null
+  state: LedgerState
+  unpriced_models: integer
+ManagedBackend = "lmstudio"
+MetricStats
+  above_80_ms: integer
+  mean_pct: number | null
+  p95_pct: integer | null
+  peak_pct: integer | null
+MissionBoard
+  budget_waits: ActiveWait[]
+  fleet: SourceState
+  missions: BoardMission[]
+  peer_missions: Run[]
+  summary: BoardSummary
+MissionConfigSource = "user" | "on-disk" | "embedded"
+MissionGraph
+  edges: GraphEdge[]
+  generated_at_ms: integer
+  legacy: boolean
+  mission_id: string
+  mission_status: MissionStatus
+  nodes: GraphNode[]
+  note?: string | null
+MissionShow
+  config?: ShownConfig | null
+  description?: string | null
+  graph?: MissionGraph | null
+  id: string
+  link: string
+  runs: Run[]
+  status?: MissionStatus | null
+  tokens?: integer | null
+MissionStatus = "active" | "finalized" | "aborted"
+ModContext
+  findings: ForFinding[]
+ModCreated
+  path: string
+  record: ModRecord
+ModList
+  mods: ModRecord[]
+ModRecord
+  attachments: string[]
+  by: string
+  context: ModContext
+  for: string[]
+  gate?: GateOutcome | null
+  gate_skipped_reason?: string | null
+  key: string
+  kit: string | null
+  kit_kind?: string | null
+  kit_looks_json: boolean
+  mission_id: string | null
+  phase_id: string | null
+  schema_version: string
+  source?: string | null
+  step_id: string | null
+  ts: string
+  warnings?: string[]
+ModelEndpoint
+  api_version?: string | null
+  auth?: EndpointAuth | null
+  dialect?: Lenient2 | null
+  limits?: Lenient3 | null
+  managed?: Lenient | null
+  reasoning_effort?: string | null
+  url?: string | null
+ModelJson
+  id: string
+  n_ctx: integer | null
+  remote: boolean
+ModelLedger
+  attribution: Attribution
+  attribution_note: string
+  gather_ms: integer
+  generated_at_ms: integer
+  limit_bytes: integer | null
+  limit_source: LimitSource
+  machine: MachineTotals
+  messages: LedgerMessage[]
+  models: ModelRow[]
+  pool: PoolSnapshot | null
+  pressure: PressureSnapshot
+  schema_version: string
+ModelRow
+  current_bytes: integer | null
+  identifier: string
+  kv_bytes_at_ctx: integer | null
+  kv_per_token_bytes: integer | null
+  loaded_ctx: integer
+  model_key: string
+  over_price_bytes?: integer | null
+  owner: Owner
+  potential_bytes: integer | null
+  potential_source?: PotentialSource | null
+  shrink_hint?: string | null
+  state: LedgerState
+  weights_bytes: integer | null
+NodeKind = "phase" | "task"
+NodeStatus = "planned" | "running" | "complete" | "abandoned" | "error"
+Owner = "darkmux" | "user"
+PhaseDisplayStatus = "planned" | "running" | "complete" | "error" | "abandoned" | "waiting" | "degraded"
+PhaseJson
+  description: string | null
+  display_name: string | null
+  id: string
+  tasks: TaskJson[]
+PoolSnapshot
+  available_bytes: integer | null
+  capacity_bytes: integer
+  free_bytes: integer | null
+  used_bytes: integer | null
+PotentialSource = "arch" | "estimated"
+PowerRail
+  mean_mw: number | null
+  peak_mw: integer | null
+PressureSnapshot
+  compressor_bytes: integer | null
+  margin_percent: integer | null
+  red: boolean
+  swap_used_bytes: integer | null
+Profile
+  default_model?: string | null
+  description?: string | null
+  models: ProfileModel[]
+  runtime?: ProfileRuntime | null
+  use_when?: any
+ProfileDraft = { [key: string]: DraftProfile }
+ProfileList
+  registry: ProfileRegistry
+  registry_path: string
+ProfileModel
+  capabilities: CapabilityProfile
+  endpoint?: EndpointField | null
+  id: string
+  identifier?: string | null
+  n_ctx?: integer | null
+ProfileRegistry
+  default_profile?: string | null
+  endpoints?: { [key: string]: ModelEndpoint }
+  internal?: RegistryInternal | null
+  profiles: { [key: string]: Profile }
+  schema_version?: string | null
+ProfileRuntime
+  compaction?: RuntimeCompactionConfig | null
+  context_tokens?: integer | null
+Proposer
+  handle: string
+  machine_id?: string | null
+  model: string
+PruneReport
+  grown?: Grown[]
+  phases_in_config: integer
+  phases_minted: integer
+  pruned: Pruned[]
+  steps_in_config: integer
+  steps_minted: integer
+  tasks_in_config: integer
+  tasks_minted: integer
+Pruned
+  id: string
+  kind: string
+  reason: string
+Range
+  max: number
+  median: number
+  min: number
+  n: integer
+RecordsEmitted
+  by_action: { [key: string]: integer }
+  dispatch_pairs: integer
+  dispatch_seconds: number
+  host_samples_in_window: integer
+  machine_uid: string | null
+  open_dispatches: integer
+  total_bytes: integer
+  total_records: integer
+  wall_seconds: number
+RedisStatus
+  last_probe_ms?: integer | null
+  max_len?: integer | null
+  near_max_len: boolean
+  newest_ts?: string | null
+  oldest_ts?: string | null
+  reachability_error?: string | null
+  reachable: boolean
+  stream: string
+  url: string
+  xlen?: integer | null
+RegistryInternal
+  utility?: UtilityBinding | null
+RegistryJson
+  error: string | null
+  profiles_source: string | null
+ReserveConfig
+  bail_after_compactions?: integer | null
+  bail_after_token_count?: integer | null
+Residency = "loaded" | "loaded_stale_ctx" | "loaded_by_user" | "not_loaded" | "remote" | "unavailable" | "unknown"
+ResidencyBlockJson
+  available: boolean
+  error: string | null
+ResumedFrom
+  path: string
+  turn_index: integer
+RoleList
+  roles: RoleListRow[]
+RoleListRow
+  description: string
+  escalation: EscalationKind
+  id: string
+  skill_count: integer
+RoleProfileSource = "overridden" | "mapped" | "default_fallback"
+RoleResolution
+  error: string | null
+  model: ModelJson | null
+  profile: string | null
+  provenance: RoleProfileSource | null
+  residency: Residency
+  residency_detail: string | null
+  role_id: string
+RoleShow
+  description: string
+  escalation: EscalationKind
+  escalation_target: string | null
+  id: string
+  prompt_path: string | null
+  skills: string[]
+  tool_palette: ToolPalette
+Run
+  abandoned_reason?: AbandonReason | null
+  completed_ts?: integer | null
+  dispatch_id?: string | null
+  id: string
+  kind: RunKind
+  machine?: string | null
+  model?: string | null
+  role?: string | null
+  route?: string | null
+  started_ts?: integer | null
+  status: RunStatus
+  tokens?: integer | null
+  tracked: boolean
+  updated_ts?: integer | null
+  verify_passed?: boolean | null
+  workload?: string | null
+RunChecks
+  all_streams_billed: boolean
+  frames_match_streams: boolean
+  have_flow_records: boolean
+  have_telemetry_samples: boolean
+  policy_consistent: boolean | null
+  rest_within_wall: boolean
+  streams_terminated: boolean
+  telemetry_covers_run: boolean
+  verdict_matches_ratio: boolean
+RunKind = "mission" | "dispatch" | "lab"
+RunKindArg = "all" | "mission" | "dispatch" | "lab"
+RunListOutput
+  fleet: SourceState
+  kind: RunKindArg
+  runs: Run[]
+  since?: string | null
+  total: integer
+  usage?: UsageReport | null
+RunSetStats
+  baseline?: SetView | null
+  cross_arm_overlap?: string[] | null
+  duplicates: string[]
+  errors: SetError[]
+  runs: RunStats[]
+  summary: SetSummary
+RunStats
+  active_ms: integer
+  billed_gen_fraction: number | null
+  bounds: { [key: string]: any }
+  busy_ms: integer | null
+  checks: RunChecks
+  compactions: integer
+  completion_tokens: integer
+  content_chars: integer
+  cpu_speed_limit_min: integer | null
+  cpu_w_busy: number | null
+  flow_records_in_window: integer
+  flow_scan: FlowScan
+  gates: Gates
+  gen_ms_all: integer
+  gen_ms_billed: integer
+  gpu_duty_pct: number | null
+  gpu_w_busy: number | null
+  mem_pct_busy_max: integer | null
+  model: string | null
+  ok: boolean | null
+  pkg_j_busy: number | null
+  pkg_j_per_1k_reasoning_chars: number | null
+  pkg_j_per_1k_tokens: number | null
+  pkg_w_busy: number | null
+  reasoning_chars: integer
+  reasoning_chars_per_s: number | null
+  reasoning_tokens: integer
+  rest_delays_ms: integer[]
+  rest_events: integer
+  rest_ms: integer
+  rest_ms_per_turn: number | null
+  rest_reasons: string[]
+  rest_states: string[]
+  result: string | null
+  run: string
+  samples_busy: integer
+  samples_idle: integer
+  schema_version: string
+  started_at_unix_ms: integer | null
+  streams: integer
+  streams_unbilled: integer
+  streams_unterminated: integer
+  suspect_turns: SuspectTurn[]
+  telemetry_max_gap_ms: integer | null
+  thermal_ratchet_fired: boolean
+  thermal_states_busy: { [key: string]: integer }
+  throttled_samples: integer
+  tok_per_s: number | null
+  tool_calls: { [key: string]: integer }
+  tool_calls_failed: integer
+  tool_calls_total: integer
+  turns: integer
+  turns_with_stream_abort: integer[]
+  unbilled_gen_ms: integer
+  verify: string | null
+  verify_ungated: boolean
+  wall_ms: integer
+RunStatus = "planned" | "running" | "complete" | "error" | "abandoned" | "unparseable"
+RuntimeCompactionConfig
+  custom_instructions?: string | null
+  reserve?: ReserveConfig | null
+  strategy?: CompactionStrategy | null
+  threshold_ratio?: number | null
+  threshold_tokens?: integer | null
+  tier1?: Tier1Config | null
+  tier2?: Tier2Config | null
+SchemaSkew
+  observed_versions?: string[]
+  skew_detected: boolean
+  skew_reason?: string | null
+  writer_version: string
+SetError
+  error: string
+  run: string
+SetSummary
+  active_ms: Range | null
+  billed_gen_fraction: Range | null
+  completion_tokens: Range | null
+  cost_per_success: CostPerSuccess
+  failed: integer
+  flagged: any[][]
+  gpu_w_busy: Range | null
+  models: string[]
+  n: integer
+  passed: integer
+  passed_with_runtime_error: integer
+  pkg_j_per_1k_tokens: Range | null
+  pkg_w_busy: Range | null
+  rest_ms: Range | null
+  runs_with_degeneracy: integer
+  tok_per_s: Range | null
+  turns: Range | null
+  turns_cut: integer
+  unverified: integer
+  wall_ms: Range | null
+SetView
+  duplicates: string[]
+  errors: SetError[]
+  runs: RunStats[]
+  summary: SetSummary
+Severity = "info" | "warn" | "error"
+ShownConfig
+  id: string
+  inputs: ShownInput[]
+  name: string
+  source: string
+  summary: string
+ShownInput
+  name: string
+  required: boolean
+SinkInfo
+  children?: SinkInfo[]
+  config?: { [key: string]: string }
+  kind: string
+SinkSummary
+  active_kinds: string[]
+  composition: string
+  info: SinkInfo
+SourceState = { state: "ok" } | { age_ms: integer; detail: string; state: "stale" } | { detail: string; state: "unavailable" } | { state: "off" }
+StepJson
+  constructible: boolean
+  id: string
+  kind: string
+StepRow
+  completedTs?: integer | null
+  id: string
+  kind: string
+  label: string
+  model?: string | null
+  startedTs?: integer | null
+  status: NodeStatus
+  tokensFinal?: integer | null
+  turnsFinal?: integer | null
+StrayDrainOutput
+  delivered: integer
+  failed: integer
+  file: string
+  remaining_undelivered: integer
+  to: string
+StreamGate
+  aborts: integer
+  degenerate_turns: integer[]
+  min_tail_ratio: number | null
+  observations: integer
+SuspectTurn
+  reasoning_chars_per_token: number
+  seq: integer
+SyncReport
+  created: integer
+  present: integer
+  scanned: integer
+  skipped_no_emission: integer
+TaskDisplayStatus = "planned" | "running" | "complete" | "error" | "abandoned" | "waiting"
+TaskJson
+  depends_on: string[]
+  description: string | null
+  display_name: string | null
+  enabled: boolean | null
+  id: string
+  reads: string[]
+  role: RoleResolution | null
+  steps: StepJson[]
+Tier1Config
+  eviction_after_unreferenced_turns?: integer | null
+Tier2Config
+  schema_version?: string | null
+  slot_caps?: { [key: string]: integer }
+ToolPalette
+  allow: string[]
+  deny: string[]
+UsageGroup
+  endpoint?: string | null
+  reported_model?: string | null
+  requested_model?: string | null
+  utility: UsageSplit
+  work: UsageSplit
+UsageLimits
+  concurrent_calls?: integer | null
+  policy?: Lenient4 | null
+  tokens_per_dispatch?: integer | null
+  warn_at?: number | null
+  window?: UsageWindow | null
+UsageReport
+  default_window: boolean
+  groups: UsageGroup[]
+  overall: UsageSum
+  since: string
+UsageSplit
+  cached?: integer | null
+  calls: integer
+  generated: integer
+  input: integer
+  total: integer
+UsageSum
+  cached?: integer | null
+  completion: integer
+  legacy_completes: integer
+  prompt: integer
+  reported: integer
+  total: integer
+  usage_records: integer
+  utility: integer
+UsageWindow
+  calls?: integer | null
+  period?: string | null
+  tokens?: integer | null
+UtilityBinding
+  id: string
+  n_ctx?: integer | null
+UtilityModel
+  id: string
+  loaded: boolean
+  n_ctx: integer | null
+Verdict = "productive" | "struggled" | "inert-false-pass" | "failed"
+VerdictShift = "improved" | "regressed" | "no-change"

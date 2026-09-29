@@ -13695,6 +13695,61 @@ fn bounds_argument_survives_into_the_envelope() {
     );
 }
 
+/// The envelope names its keys in one order: the runtime's, then the host's.
+/// A reader diffing two envelopes, and the golden that pins the type, both
+/// lean on it.
+#[test]
+fn the_enriched_envelope_names_the_runtimes_keys_then_the_hosts() {
+    let out = super::enrich_envelope_with_summary(
+        r#"{"result":"stop","final_assistant":"hi","trajectory_path":"/t","failed_tool_invocations":[]}"#.to_string(),
+        "m",
+        &summary_with(vec![]),
+        &super::HostStats::default(),
+        &no_extras(),
+        no_findings_dir(),
+        serde_json::json!({}),
+        None,
+    );
+    let at = |key: &str| out.find(&format!("\"{key}\":")).unwrap_or_else(|| panic!("no {key} in {out}"));
+    let order = ["result", "final_assistant", "trajectory_path", "failed_tool_invocations", "metrics", "detections", "bounds"];
+    assert!(order.windows(2).all(|w| at(w[0]) < at(w[1])), "keys out of order: {out}");
+}
+
+/// A stdout that is not a JSON object is handed back untouched: the enrichment
+/// never invents an envelope around text, and never fails a dispatch over one.
+#[test]
+fn a_stdout_that_is_not_an_envelope_is_returned_untouched() {
+    for text in ["plain text", "[1,2]", "{ not json", ""] {
+        let out = super::enrich_envelope_with_summary(
+            text.to_string(),
+            "m",
+            &summary_with(vec![]),
+            &super::HostStats::default(),
+            &no_extras(),
+            no_findings_dir(),
+            serde_json::json!({}),
+            None,
+        );
+        assert_eq!(out, text);
+    }
+}
+
+/// The hosted-endpoint envelope's token keys are the parity contract both hosted
+/// single-shot producers are held to: `DirectTokens` serializes exactly
+/// `DIRECT_TOKEN_KEYS`, in order, and an unreported count is `null`.
+#[test]
+fn direct_tokens_carry_exactly_the_direct_token_keys() {
+    let none = serde_json::to_value(crate::dispatch_envelope::DirectTokens::of(&darkmux_trajectory::UsageCounts::default())).unwrap();
+    let keys: Vec<&str> = none.as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(keys, super::DIRECT_TOKEN_KEYS);
+    assert!(none.as_object().unwrap().values().all(|v| v.is_null()), "{none}");
+    let counts = darkmux_trajectory::UsageCounts { prompt: Some(3), completion: Some(4), total: None, reasoning: Some(1), cached: None };
+    let some = serde_json::to_value(crate::dispatch_envelope::DirectTokens::of(&counts)).unwrap();
+    assert_eq!(some["prompt_tokens"], 3);
+    assert_eq!(some["total_tokens"], 7, "the one total rule: prompt + completion when the provider sent none");
+    assert!(some["cached_tokens"].is_null(), "{some}");
+}
+
 fn summary_over_ratios(ratios: &[f64], concluded: u32) -> super::TrajectorySummary {
     let mut s = super::TrajectorySummary::default();
     for (i, r) in ratios.iter().enumerate() {

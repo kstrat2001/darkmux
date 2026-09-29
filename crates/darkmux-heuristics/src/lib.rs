@@ -455,33 +455,69 @@ fn format_description(
     )
 }
 
-/// JSON-serializable form of a profile suggestion: one `profiles` entry,
-/// written in the registry's current schema so it passes the unknown-key
-/// gate when pasted in (`darkmux_types::user_files`). Used by `darkmux
-/// profile draft`.
+/// A profile suggestion in the registry's current schema: one `profiles` entry
+/// keyed by the profile's name, so it passes the unknown-key gate when pasted
+/// in (`darkmux_types::user_files`). What `darkmux profile draft` prints.
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+pub struct ProfileDraft(pub std::collections::BTreeMap<String, DraftProfile>);
+
+/// One drafted profile.
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+pub struct DraftProfile {
+    /// The suggestion's notes, and where the paired compactor goes.
+    #[serde(rename = "_comment")]
+    pub comment: Vec<String>,
+    pub description: String,
+    pub models: Vec<DraftModel>,
+    pub runtime: DraftRuntime,
+}
+
+/// The drafted profile's one model.
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+pub struct DraftModel {
+    pub id: String,
+    pub n_ctx: u32,
+}
+
+/// The drafted profile's runtime block.
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+pub struct DraftRuntime {
+    pub context_tokens: u64,
+    /// Present only when the suggestion paired a compactor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<DraftCompaction>,
+}
+
+/// The compaction block a paired compactor puts in the drafted runtime.
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+pub struct DraftCompaction {
+    pub custom_instructions: String,
+}
+
+/// Draft a profile named `name` around `model_id`. Used by `darkmux profile
+/// draft`.
 ///
 /// A paired compactor is not a profile model: the compactor is the
 /// registry's `internal.utility` binding (#590, #2914), so the entry names
 /// it in its `_comment` instead, next to the suggestion's notes.
-pub fn suggestion_to_profile_json(name: &str, model_id: &str, suggestion: &ProfileSuggestion) -> serde_json::Value {
+pub fn draft_profile(name: &str, model_id: &str, suggestion: &ProfileSuggestion) -> ProfileDraft {
     let mut comment = suggestion.notes.clone();
-    let mut runtime = serde_json::json!({ "context_tokens": suggestion.context_tokens });
+    let mut compaction = None;
     if let Some(c) = suggestion.compactor.as_ref() {
         comment.push(format!(
             "compaction runs on the machine's utility model: set \"internal\": {{\"utility\": \
              {{\"id\": \"{}\", \"n_ctx\": {}}}}} at the top level of profiles.json",
             c.model_id, c.n_ctx
         ));
-        runtime["compaction"] = serde_json::json!({ "custom_instructions": DEFAULT_COMPACTION_INSTRUCTIONS });
+        compaction = Some(DraftCompaction { custom_instructions: DEFAULT_COMPACTION_INSTRUCTIONS.to_string() });
     }
-    serde_json::json!({
-        name: {
-            "_comment": comment,
-            "description": suggestion.description,
-            "models": [{ "id": model_id, "n_ctx": suggestion.primary_n_ctx }],
-            "runtime": runtime,
-        }
-    })
+    let profile = DraftProfile {
+        comment,
+        description: suggestion.description.clone(),
+        models: vec![DraftModel { id: model_id.to_string(), n_ctx: suggestion.primary_n_ctx }],
+        runtime: DraftRuntime { context_tokens: suggestion.context_tokens, compaction },
+    };
+    ProfileDraft(std::iter::once((name.to_string(), profile)).collect())
 }
 
 #[cfg(test)]
@@ -759,13 +795,13 @@ mod tests {
     }
 
     #[test]
-    fn suggestion_to_profile_json_emits_compaction_block_when_paired() {
+    fn draft_profile_emits_compaction_block_when_paired() {
         // 128 GB-tier Long task pairs a compactor → JSON should carry a
         // `runtime.compaction` block. Pin the fixture so the test doesn't
         // depend on whether the local rig's tier pairs a compactor.
         let m = meta("qwen3.6-35b-a3b", Some("35B"), Some("qwen3_5_moe"), 262_144, 0);
         let s = suggest_profile_for(&m, TaskClass::Long, &apple_silicon_128gb());
-        let json = suggestion_to_profile_json("test", "qwen3.6-35b-a3b", &s);
+        let json = serde_json::to_value(draft_profile("test", "qwen3.6-35b-a3b", &s)).unwrap();
         let obj = json.as_object().unwrap().get("test").unwrap();
         let compaction = obj.get("runtime").unwrap().get("compaction").unwrap();
         assert!(compaction.get("custom_instructions").is_some());
@@ -785,7 +821,7 @@ mod tests {
             (meta("phi", Some("4B"), Some("phi"), 32_000, 0), TaskClass::Fast),
         ] {
             let s = suggest_profile_for(&m, task, &apple_silicon_128gb());
-            let doc = serde_json::json!({ "profiles": suggestion_to_profile_json("p", &m.model_key, &s) });
+            let doc = serde_json::json!({ "profiles": draft_profile("p", &m.model_key, &s) });
             let keys = darkmux_types::user_files::key_issues::<darkmux_types::ProfileRegistry>(
                 &doc,
                 &darkmux_types::user_files::no_retired,
@@ -802,16 +838,16 @@ mod tests {
         let s = suggest_profile_for(&m, TaskClass::Long, &apple_silicon_128gb());
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("profiles.json");
-        let doc = serde_json::json!({ "profiles": suggestion_to_profile_json("p", &m.model_key, &s) });
+        let doc = serde_json::json!({ "profiles": draft_profile("p", &m.model_key, &s) });
         std::fs::write(&path, doc.to_string()).unwrap();
         assert_eq!(darkmux_profiles::profiles::user_file_problem(&path), None);
     }
 
     #[test]
-    fn suggestion_to_profile_json_omits_compaction_when_no_compactor() {
+    fn draft_profile_omits_compaction_when_no_compactor() {
         let m = meta("phi", Some("4B"), Some("phi"), 32_000, 0);
         let s = suggest_profile(&m, TaskClass::Fast);
-        let json = suggestion_to_profile_json("phi-fast", "phi", &s);
+        let json = serde_json::to_value(draft_profile("phi-fast", "phi", &s)).unwrap();
         let obj = json.as_object().unwrap().get("phi-fast").unwrap();
         let runtime = obj.get("runtime").unwrap();
         assert!(runtime.get("compaction").is_none());

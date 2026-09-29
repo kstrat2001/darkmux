@@ -1,7 +1,45 @@
 use crate::crew::index::{default_index_path, ensure_fresh_index, open_index};
+use crate::cli_json;
 use anyhow::{Context, Result, bail};
+use darkmux_crew::types::{EscalationKind, ToolPalette};
 use rusqlite::{params, OptionalExtension};
+use serde::Serialize;
 use std::path::Path;
+
+/// One role in `role list --json`, with its full, untruncated description.
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct RoleListRow {
+    pub id: String,
+    pub description: String,
+    pub skill_count: u32,
+    pub escalation: EscalationKind,
+}
+
+/// `role list --json`.
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct RoleList {
+    pub roles: Vec<RoleListRow>,
+}
+
+/// `role show --json`. `escalation_target` is `null` for a role that does not
+/// hand off and for a hand-off with no recorded target (index drift).
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct RoleShow {
+    pub id: String,
+    pub description: String,
+    pub prompt_path: Option<String>,
+    pub skills: Vec<String>,
+    pub tool_palette: ToolPalette,
+    pub escalation: EscalationKind,
+    pub escalation_target: Option<String>,
+}
+
+/// The kind an index row's tag names. The index constrains the column to the
+/// three tags, so an unknown one means the index is not darkmux's.
+fn escalation_of(tag: &str) -> Result<EscalationKind> {
+    EscalationKind::from_tag(tag)
+        .with_context(|| format!("the role index holds an unknown escalation contract `{tag}`"))
+}
 
 /// Print a table listing every role in the index.
 pub fn role_list(json: bool) -> Result<i32> {
@@ -35,36 +73,23 @@ pub(crate) fn role_list_at(path: &Path, json: bool) -> Result<i32> {
          ORDER BY r.id"
     )?;
 
-    let mut rows: Vec<(String, String, i32, String)> = Vec::new();
+    let mut rows: Vec<RoleListRow> = Vec::new();
     let stmt_rows = stmt.query_map([], |r| {
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, String>(1)?,
-            r.get::<_, i32>(2)?,
+            r.get::<_, u32>(2)?,
             r.get::<_, String>(3)?,
         ))
     })?;
     for row in stmt_rows {
-        rows.push(row?);
+        let (id, description, skill_count, tag) = row?;
+        rows.push(RoleListRow { id, description, skill_count, escalation: escalation_of(&tag)? });
     }
 
     if json {
         // (#907) Full, untruncated description for machine consumers.
-        let arr: Vec<serde_json::Value> = rows
-            .iter()
-            .map(|(id, desc, skills, esc)| {
-                serde_json::json!({
-                    "id": id,
-                    "description": desc,
-                    "skills": skills,
-                    "escalation": esc,
-                })
-            })
-            .collect();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({ "roles": arr }))?
-        );
+        cli_json::emit(&RoleList { roles: rows })?;
         return Ok(0);
     }
 
@@ -83,9 +108,9 @@ pub(crate) fn role_list_at(path: &Path, json: bool) -> Result<i32> {
         }
     };
 
-    let display: Vec<(String, String, i32, String)> = rows
+    let display: Vec<(String, String, u32, &str)> = rows
         .iter()
-        .map(|(id, desc, skills, esc)| (id.clone(), truncate(desc), *skills, esc.clone()))
+        .map(|r| (r.id.clone(), truncate(&r.description), r.skill_count, r.escalation.tag()))
         .collect();
 
     let mut id_w: usize = 2;
@@ -160,23 +185,14 @@ pub(crate) fn role_show_at(path: &Path, role_id: &str, json: bool) -> Result<i32
         |r| r.get(0),
     )?;
 
-    let palette: serde_json::Value = serde_json::from_str(&tool_palette_json)
+    let palette: ToolPalette = serde_json::from_str(&tool_palette_json)
         .context("parsing tool_palette_json")?;
-
-    let allow_vals: Vec<&str> = palette.get("allow")
-        .and_then(|a| a.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
-        .unwrap_or_default();
-
-    let deny_vals: Vec<&str> = palette.get("deny")
-        .and_then(|a| a.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
-        .unwrap_or_default();
+    let escalation = escalation_of(&escalation_tag)?;
 
     // #894: a `hand-off-to` role should have a target row, but the index could
     // be inconsistent. `.optional()` so a missing row surfaces as a clear
     // note/null rather than a raw `QueryReturnedNoRows` error.
-    let escalation_target: Option<String> = if escalation_tag == "hand-off-to" {
+    let escalation_target: Option<String> = if escalation == EscalationKind::HandOffTo {
         conn.query_row(
             "SELECT target_role_id FROM role_escalation_targets WHERE role_id = ?1",
             params![role_id],
@@ -188,18 +204,16 @@ pub(crate) fn role_show_at(path: &Path, role_id: &str, json: bool) -> Result<i32
     };
 
     if json {
-        // (#907) machine-readable parity. `escalation_target` is null for
-        // non-hand-off roles and for an unresolved hand-off (index drift).
-        let out = serde_json::json!({
-            "id": id,
-            "description": description,
-            "prompt_path": prompt_path,
-            "skills": skills,
-            "tool_palette": { "allow": allow_vals, "deny": deny_vals },
-            "escalation": escalation_tag,
-            "escalation_target": escalation_target,
-        });
-        println!("{}", serde_json::to_string_pretty(&out)?);
+        // (#907) machine-readable parity.
+        cli_json::emit(&RoleShow {
+            id,
+            description,
+            prompt_path,
+            skills,
+            tool_palette: palette,
+            escalation,
+            escalation_target,
+        })?;
         return Ok(0);
     }
 
@@ -220,21 +234,21 @@ pub(crate) fn role_show_at(path: &Path, role_id: &str, json: bool) -> Result<i32
     }
 
     println!("tool_palette:");
-    if allow_vals.is_empty() && deny_vals.is_empty() {
+    if palette.allow.is_empty() && palette.deny.is_empty() {
         println!("  (none)");
     } else {
-        if !allow_vals.is_empty() {
-            let allow_str: Vec<String> = allow_vals.iter().map(|s| format!("\"{}\"", s)).collect();
+        if !palette.allow.is_empty() {
+            let allow_str: Vec<String> = palette.allow.iter().map(|s| format!("\"{}\"", s)).collect();
             println!("  allow: [{}]", allow_str.join(", "));
         }
-        if !deny_vals.is_empty() {
-            let deny_str: Vec<String> = deny_vals.iter().map(|s| format!("\"{}\"", s)).collect();
+        if !palette.deny.is_empty() {
+            let deny_str: Vec<String> = palette.deny.iter().map(|s| format!("\"{}\"", s)).collect();
             println!("  deny: [{}]", deny_str.join(", "));
         }
     }
 
-    println!("escalation: {}", escalation_tag);
-    if escalation_tag == "hand-off-to" {
+    println!("escalation: {}", escalation.tag());
+    if escalation == EscalationKind::HandOffTo {
         match &escalation_target {
             Some(t) => println!("  target: {}", t),
             None => println!("  target: (unresolved: no target recorded for this role)"),

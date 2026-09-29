@@ -59,7 +59,7 @@ pub fn is_finding_tool(tool_name: &str) -> bool {
 
 /// Who proposed a finding. Named at write time from the dispatch's own
 /// identity — the role handle, the model that ran it, and the machine.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct Proposer {
     /// The role handle (the flow record's `handle`).
     pub handle: String,
@@ -79,7 +79,7 @@ pub struct Scope {
 }
 
 /// One finding, as stored at `<findings dir>/<execution>/<seq>/finding.json`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct FindingRecord {
     /// `<execution>/<seq>` — the address every other surface uses.
     pub key: String,
@@ -464,7 +464,7 @@ fn store_address_of(rec: &serde_json::Value) -> Option<String> {
 }
 
 /// What one `finding sync` pass did.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct SyncReport {
     /// Flow records inspected that named a finding tool and succeeded.
     pub scanned: usize,

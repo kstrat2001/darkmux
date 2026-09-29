@@ -16,6 +16,15 @@
 use anyhow::Result;
 use darkmux_crew::findings::{self, FindingRecord};
 use darkmux_types::config_access;
+use serde::Serialize;
+
+use crate::cli_json;
+
+/// `finding list --json`: the records that matched, ts-ascending.
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct FindingList<'a> {
+    pub findings: Vec<&'a FindingRecord>,
+}
 
 /// How many characters of the raw emission `list` previews. Enough to
 /// recognize a finding, short enough to keep one finding on one line.
@@ -42,10 +51,7 @@ pub fn list(
         .collect();
 
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({ "findings": rows }))?
-        );
+        cli_json::emit(&FindingList { findings: rows })?;
         return Ok(0);
     }
 
@@ -115,7 +121,7 @@ pub fn show(key: &str, json: bool) -> Result<i32> {
     };
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&rec)?);
+        cli_json::emit(&rec)?;
         return Ok(0);
     }
 
@@ -188,7 +194,7 @@ pub fn sync(since: Option<&str>, json: bool) -> Result<i32> {
     let report = findings::sync_at(&flows, &root, since)?;
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        cli_json::emit(&report)?;
         return Ok(0);
     }
 

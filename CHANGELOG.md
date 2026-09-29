@@ -16,6 +16,45 @@ darkmux release.
 
 ### Changed (breaking, 4.0)
 
+- **CLI `--json` output is a contract** (C4). Every verb's `--json` output is now
+  one serialized, named type (`src/cli_json.rs`), pinned by
+  `tests/cli-json.golden`, which lists each verb and the fields and types of
+  everything it prints. The golden is derived from the types, so changing a
+  shape fails a test until the golden is regenerated on purpose. An output
+  carries no `schema_version` of its own (its version is darkmux's), except a
+  document that is also written to disk, which already named its schema. From
+  this release a shape change is a semver-visible change like a daemon route.
+  No field spells `session`. These fields changed, one line per verb; every
+  other output keeps its bytes:
+  - `role list`: each role's `skills` (a count) is now `skill_count`, so `skills`
+    is a list of skill ids in `role show` and absent from `role list`.
+  - `mission status`: the drift `kind` `running-phase-session-dead` is
+    `running-phase-execution-dead`; `budget_waits[].session_id` is
+    `execution_id`.
+  - `mission config show`: a role's `provenance` is now `overridden`, `mapped` or
+    `default_fallback` (it was the phrase `launch override (--param)`,
+    `role_profiles map` or `default_profile fallback`); the text view prints the
+    same phrases as before.
+  - `run stats` (several runs, or `--baseline`): each `errors` entry is
+    `{"run": ..., "error": ...}` (it was a `[run, error]` pair).
+  - `memory correction list`: prints `{"corrections": [...]}` (it was a bare list).
+  - `flow integrity-check`: prints `{"reports": [...]}` (it was a bare list).
+  - `machine status`: every answer carries `machine_id` and `lms_unreachable`
+    (`false` when LMStudio answered). It was two shapes: the unreachable one had
+    both, the normal one neither.
+  - `machine status`, `machine resources` (for a roster peer): a peer that answers
+    in a shape this darkmux does not read is refused with an error naming the
+    version mismatch. It was printed as raw JSON.
+  - `machine list --deep`: a peer's `specs` is the peer's `/machine/specs`
+    document in full, or `null`; a body that is not one reads as unavailable.
+  - `dispatch` (`--json`): the runtime's keys print in the order `result`,
+    `final_assistant`, `trajectory_path`, `failed_tool_invocations`,
+    `resumed_from` (they were alphabetical), and a key the runtime does not
+    define is dropped. `detections`, `bounds` and `host_window` stay untyped in
+    the golden until the flow payloads they share are typed.
+  **Migration:** rename the fields above in any script that reads them, and
+  regenerate a golden you keep of these outputs.
+
 - **A mission config's step `config` is checked against its kind** (B1). It
   was open JSON, so a typo inside a step's config passed the unknown-key
   gate and silently did nothing. Each of the fifteen kinds darkmux ships

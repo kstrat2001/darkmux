@@ -7,8 +7,11 @@
 
 use anyhow::Result;
 
+use crate::cli_json;
 use crate::fleet;
 use crate::flow;
+use darkmux_serve::wire::MachineSpecsResponse;
+use serde::Serialize;
 
 /// `darkmux machine add` — register (or update) a roster entry.
 ///
@@ -396,135 +399,151 @@ fn route_missing_message(id: &str, path: &str, address: &str) -> String {
     }
 }
 
-pub(crate) fn cmd_machine_list(emit_json: bool, deep: bool) -> Result<i32> {
-    let roster = fleet::load_roster()?;
+/// `machine list --json`.
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct MachineListOutput {
+    pub roster_path: String,
+    pub roster_version: String,
+    pub local_machine_id: Option<String>,
+    pub machines: Vec<MachineListRow>,
+}
 
-    // Probe each machine's reachability (TCP connect to its daemon port).
-    // Done sequentially — the roster is small and the budget per probe
-    // is 300ms; total wall is bounded. This machine's own entry is dialed at
-    // the local daemon (#2924, `dial_address`).
-    let local_id = flow::resolve_machine_id();
-    let probes = list_probes(&roster, local_id.as_deref());
+/// One roster entry and what probing it found.
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct MachineListRow {
+    pub id: String,
+    pub address: String,
+    /// Where the probe went: the roster address, or the local daemon for this
+    /// machine's own entry (#2924).
+    pub dialed_address: String,
+    pub is_this_machine: bool,
+    pub description: Option<String>,
+    pub added_unix_ms: u64,
+    /// `null` for a remote peer or a pre-#2768 entry: "unknown identity",
+    /// never "same machine as another null entry".
+    pub machine_uid: Option<String>,
+    pub reachable: bool,
+    pub resolved_address: String,
+    pub probe_ms: u64,
+    pub probe_error: Option<String>,
+    /// The peer's `/machine/specs` body. `null` without `--deep`, and when the
+    /// fetch failed; the three flags below say why.
+    pub specs: Option<MachineSpecsResponse>,
+    /// The peer answered 401/403: this machine is not sending the shared fleet
+    /// token (#881).
+    pub specs_auth_required: bool,
+    /// The peer answered 404: reachable, but no `/machine/specs` route
+    /// (#1849).
+    pub specs_route_missing: bool,
+    /// The address did not verify as the pinned tailnet node, so nothing (and
+    /// no token) was sent (#2916).
+    pub specs_unverified: bool,
+}
 
-    // When --deep, fetch /machine/specs from each reachable peer. One
-    // HTTP GET per peer; ~1s budget each. Failures are surfaced per-row
-    // (Some(None) in the resolved vector) — they MUST NOT fail the
-    // whole command. (#275 PR-B)
-    // (#881) Resolve THIS machine's serve token once and send it to peers — a
-    // single shared fleet token. Track peers that answered 401/403 so a missing
-    // token surfaces a real "auth?" signal instead of looking like a timeout.
-    let mut auth_required: Vec<String> = Vec::new();
-    // (#2916 re-review MUST 3) Peers whose address did not verify as their
-    // pinned tailnet node: the token was NOT sent to them.
-    let mut unverified: Vec<String> = Vec::new();
-    // (#1849) Peers that answered with a 404 on `/machine/specs` — reachable,
-    // but no route, distinct from a generic probe failure.
-    let mut route_missing: Vec<String> = Vec::new();
-    let specs_by_id: std::collections::BTreeMap<String, Option<serde_json::Value>> = if deep {
-        probes
-            .iter()
-            .map(|(m, dialed, p)| {
-                let _ = dialed;
-                let value = if p.reachable {
-                    let probe = match peer_target_for(m, local_id.as_deref()) {
-                        Ok(t) => fetch_machine_specs(&t),
-                        Err(_) => SpecsProbe::Unverified,
-                    };
-                    match probe {
-                        SpecsProbe::Unverified => {
-                            unverified.push(m.id.clone());
-                            None
-                        }
-                        SpecsProbe::Ok(v) => Some(v),
-                        SpecsProbe::AuthRequired => {
-                            auth_required.push(m.id.clone());
-                            None
-                        }
-                        SpecsProbe::RouteMissing => {
-                            route_missing.push(m.id.clone());
-                            None
-                        }
-                        SpecsProbe::Unavailable => None,
-                    }
-                } else {
-                    None
-                };
-                (m.id.clone(), value)
-            })
-            .collect()
-    } else {
-        std::collections::BTreeMap::new()
-    };
+/// The `--deep` table's specs cells for a peer that answered: AI headroom, OS,
+/// darkmux version and the resident models.
+fn deep_cells(s: &MachineSpecsResponse) -> (String, String, String, String) {
+    let ram = s.ram_free_for_ai_bytes.map(human_gb).unwrap_or_else(|| "—".into());
+    let models = s.loaded_models.iter().map(|m| m.identifier.as_str()).collect::<Vec<_>>().join(", ");
+    (ram, s.os.clone(), s.darkmux_version.clone(), if models.is_empty() { "—".into() } else { models })
+}
 
-    if emit_json {
-        // (#776) Machine-readable output stays byte-clean: force color off so
-        // any accidental downstream style call can't leak ANSI into the JSON.
-        darkmux_types::style::set_colorize_override(Some(false));
-        let local_id = flow::resolve_machine_id();
-        let payload = serde_json::json!({
-            "roster_path": fleet::roster_path().display().to_string(),
-            "roster_version": roster.version,
-            "local_machine_id": local_id,
-            "machines": probes
-                .iter()
-                .map(|(m, dialed, p)| serde_json::json!({
-                    "id": m.id,
-                    "address": m.address,
-                    // (#2924) Where the probe went: the roster address, or the
-                    // local daemon for this machine's own entry.
-                    "dialed_address": dialed,
-                    "is_this_machine": local_id.as_deref() == Some(m.id.as_str()),
-                    "description": m.description,
-                    "added_unix_ms": m.added_unix_ms,
-                    // (#2768) `null` for a remote peer or a pre-#2768 entry —
-                    // "unknown identity", never "same machine as another
-                    // null entry". See `MachineEntry::machine_uid`'s own doc.
-                    "machine_uid": m.machine_uid,
-                    "reachable": p.reachable,
-                    "resolved_address": p.resolved_address,
-                    "probe_ms": p.elapsed_ms,
-                    "probe_error": p.error,
-                    // Only present when --deep was passed; null when
-                    // --deep was passed but the fetch failed.
-                    "specs": specs_by_id.get(&m.id).cloned().flatten().unwrap_or(serde_json::Value::Null),
-                    // (#881) Distinguish a null `specs` caused by a 401/403
-                    // (this machine isn't sending the shared fleet token) from a
-                    // timeout/other failure, so a consumer (viewer/script) gets
-                    // the same signal the text table's `auth?` column carries.
-                    "specs_auth_required": auth_required.contains(&m.id),
-                    // (#1849) Distinguish a null `specs` caused by a 404 (the
-                    // peer answered but has no `/machine/specs` route) from a
-                    // generic probe failure — the same signal the text
-                    // table's `no-route?` column carries.
-                    "specs_route_missing": route_missing.contains(&m.id),
-                    // (#2916) The address did not verify as the pinned
-                    // tailnet node, so nothing (and no token) was sent.
-                    "specs_unverified": unverified.contains(&m.id),
-                }))
-                .collect::<Vec<_>>(),
-        });
-        println!("{}", serde_json::to_string_pretty(&payload)?);
-        return Ok(0);
+/// What `--deep` learned from each peer: its specs when it answered, and which
+/// peers it could not read specs from, by why.
+#[derive(Default)]
+struct DeepSpecs {
+    by_id: std::collections::BTreeMap<String, Option<MachineSpecsResponse>>,
+    /// (#881) Peers that answered 401/403: this machine is not sending the
+    /// shared fleet token, which reads as `auth?` rather than a timeout.
+    auth_required: Vec<String>,
+    /// (#1849) Peers that answered 404: reachable, but no route, distinct from a
+    /// generic probe failure.
+    route_missing: Vec<String>,
+    /// (#2916 re-review MUST 3) Peers whose address did not verify as their
+    /// pinned tailnet node: the token was NOT sent to them.
+    unverified: Vec<String>,
+}
+
+impl DeepSpecs {
+    /// File one peer's probe under the reason it did or did not yield specs.
+    fn record(&mut self, id: &str, probe: SpecsProbe) -> Option<MachineSpecsResponse> {
+        let why = match probe {
+            SpecsProbe::Ok(specs) => return Some(*specs),
+            SpecsProbe::Unavailable => return None,
+            SpecsProbe::Unverified => &mut self.unverified,
+            SpecsProbe::AuthRequired => &mut self.auth_required,
+            SpecsProbe::RouteMissing => &mut self.route_missing,
+        };
+        why.push(id.to_string());
+        None
     }
+}
 
-    // Human-readable table.
+/// Fetch `/machine/specs` from each reachable peer: one HTTP GET per peer, ~1s
+/// budget each (#275 PR-B). A failure is a `None` in its row and never fails the
+/// whole command. This machine's serve token is resolved once and sent to peers
+/// that verify (#881).
+fn fetch_deep_specs(
+    probes: &[(fleet::MachineEntry, String, fleet::ReachabilityResult)],
+    local_id: Option<&str>,
+) -> DeepSpecs {
+    let mut deep = DeepSpecs::default();
+    for (m, _dialed, p) in probes {
+        let specs = if p.reachable {
+            let probe = match peer_target_for(m, local_id) {
+                Ok(t) => fetch_machine_specs(&t),
+                Err(_) => SpecsProbe::Unverified,
+            };
+            deep.record(&m.id, probe)
+        } else {
+            None
+        };
+        deep.by_id.insert(m.id.clone(), specs);
+    }
+    deep
+}
+
+fn machine_list_output(
+    roster: &fleet::FleetRoster,
+    local_id: Option<&str>,
+    probes: &[(fleet::MachineEntry, String, fleet::ReachabilityResult)],
+    mut deep: DeepSpecs,
+) -> MachineListOutput {
+    let machines = probes
+        .iter()
+        .map(|(m, dialed, p)| MachineListRow {
+            id: m.id.clone(),
+            address: m.address.clone(),
+            dialed_address: dialed.clone(),
+            is_this_machine: local_id == Some(m.id.as_str()),
+            description: m.description.clone(),
+            added_unix_ms: m.added_unix_ms,
+            machine_uid: m.machine_uid.clone(),
+            reachable: p.reachable,
+            resolved_address: p.resolved_address.clone(),
+            probe_ms: p.elapsed_ms,
+            probe_error: p.error.clone(),
+            specs: deep.by_id.remove(&m.id).flatten(),
+            specs_auth_required: deep.auth_required.contains(&m.id),
+            specs_route_missing: deep.route_missing.contains(&m.id),
+            specs_unverified: deep.unverified.contains(&m.id),
+        })
+        .collect();
+    MachineListOutput {
+        roster_path: fleet::roster_path().display().to_string(),
+        roster_version: roster.version.clone(),
+        local_machine_id: local_id.map(str::to_string),
+        machines,
+    }
+}
+
+/// The text view's column heads, and a note on which row is this machine.
+fn print_machine_columns_head(
+    probes: &[(fleet::MachineEntry, String, fleet::ReachabilityResult)],
+    local_id: Option<&str>,
+    deep: bool,
+) {
     use darkmux_types::style;
-    println!("{}", style::header("darkmux machine list"));
-    println!(
-        "  roster:           {}",
-        style::dim(&fleet::roster_path().display().to_string())
-    );
-    println!(
-        "  local machine_id: {}",
-        style::dim(&flow::resolve_machine_id().unwrap_or_else(|| "<unknown>".into()))
-    );
-    println!();
-    if probes.is_empty() {
-        println!("(no peers in roster — single-machine fleet)");
-        println!();
-        println!("Add a peer: darkmux machine add <id> --address <dns-name>");
-        return Ok(0);
-    }
     // Column-header row dimmed as secondary structure. Styling wraps the
     // WHOLE line (color codes at the line edges), so column alignment — which
     // counts visible chars inside the format — is preserved.
@@ -545,7 +564,7 @@ pub(crate) fn cmd_machine_list(emit_json: bool, deep: bool) -> Result<i32> {
             ))
         );
     }
-    if let Some((m, dialed, _)) = probes.iter().find(|(m, _, _)| local_id.as_deref() == Some(m.id.as_str())) {
+    if let Some((m, dialed, _)) = probes.iter().find(|(m, _, _)| local_id == Some(m.id.as_str())) {
         println!(
             "{}",
             style::dim(&format!(
@@ -554,71 +573,42 @@ pub(crate) fn cmd_machine_list(emit_json: bool, deep: bool) -> Result<i32> {
             ))
         );
     }
-    for (m, _dialed, p) in &probes {
+}
+
+/// The `--deep` cells for a peer that gave no specs are the reason it gave none.
+fn deep_cells_for(id: &str, deep: &DeepSpecs) -> (String, String, String, String) {
+    let dashes = |first: &str| (first.to_string(), "—".to_string(), "—".to_string(), "—".to_string());
+    match deep.by_id.get(id).and_then(Option::as_ref) {
+        Some(s) => deep_cells(s),
+        // (#881) Distinguish a 401/403 (peer requires a token we didn't send)
+        // from a generic specs failure, so it doesn't read as a timeout.
+        None if deep.auth_required.iter().any(|i| i == id) => dashes("auth?"),
+        // (#1849) Distinguish a 404 (peer reachable, no `/machine/specs` route)
+        // from a generic specs failure: this is the exact shape a bare-IP peer
+        // behind `tailscale serve` produces, and it must not render identically
+        // to an unreachable or timed-out peer.
+        None if deep.route_missing.iter().any(|i| i == id) => dashes("no-route?"),
+        None if deep.unverified.iter().any(|i| i == id) => dashes("unverified"),
+        None => dashes("specs?"),
+    }
+}
+
+/// One line per roster entry. With `--deep`, the peer's specs cells; without,
+/// its description.
+fn print_machine_rows(
+    probes: &[(fleet::MachineEntry, String, fleet::ReachabilityResult)],
+    deep: bool,
+    deep_specs: &DeepSpecs,
+) {
+    use darkmux_types::style;
+    for (m, _dialed, p) in probes {
         let status = if p.reachable {
             format!("✓ {}ms", p.elapsed_ms)
         } else {
             format!("✗ {}ms", p.elapsed_ms)
         };
         if deep {
-            let specs = specs_by_id.get(&m.id).cloned().unwrap_or(None);
-            let (ram_free, os_str, version, models_summary) = match &specs {
-                Some(s) => {
-                    let ram = s
-                        .get("ram_free_for_ai_bytes")
-                        .and_then(|v| v.as_u64())
-                        .map(human_gb)
-                        .unwrap_or_else(|| "—".into());
-                    let os = s
-                        .get("os")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("—")
-                        .to_string();
-                    let v = s
-                        .get("darkmux_version")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("—")
-                        .to_string();
-                    let models = s
-                        .get("loaded_models")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|m| m.get("identifier").and_then(|i| i.as_str()))
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        })
-                        .unwrap_or_else(|| "—".into());
-                    (
-                        ram,
-                        os,
-                        v,
-                        if models.is_empty() {
-                            "—".into()
-                        } else {
-                            models
-                        },
-                    )
-                }
-                // (#881) Distinguish a 401/403 (peer requires a token we didn't
-                // send) from a generic specs failure, so it doesn't read as a
-                // timeout.
-                None if auth_required.contains(&m.id) => {
-                    ("auth?".into(), "—".into(), "—".into(), "—".into())
-                }
-                // (#1849) Distinguish a 404 (peer reachable, no
-                // `/machine/specs` route) from a generic specs failure —
-                // this is the exact shape a bare-IP peer behind `tailscale
-                // serve` produces, and it must not render identically to
-                // an unreachable/timed-out peer.
-                None if route_missing.contains(&m.id) => {
-                    ("no-route?".into(), "—".into(), "—".into(), "—".into())
-                }
-                None if unverified.contains(&m.id) => {
-                    ("unverified".into(), "—".into(), "—".into(), "—".into())
-                }
-                None => ("specs?".into(), "—".into(), "—".into(), "—".into()),
-            };
+            let (ram_free, os_str, version, models_summary) = deep_cells_for(&m.id, deep_specs);
             // (#2916 round 3 MUST) Peer-provided cells are cut to their
             // column width, so padding cannot push text into other columns.
             let row = format!(
@@ -645,12 +635,24 @@ pub(crate) fn cmd_machine_list(emit_json: bool, deep: bool) -> Result<i32> {
             println!("{}", style::error(&format!("               error: {err}")));
         }
     }
+}
+
+/// The fixes for the peers `--deep` could not read specs from, one warning per
+/// reason.
+fn print_deep_warnings(
+    probes: &[(fleet::MachineEntry, String, fleet::ReachabilityResult)],
+    local_id: Option<&str>,
+    deep: &DeepSpecs,
+) {
+    use darkmux_types::style;
+    let (auth_required, route_missing) = (&deep.auth_required, &deep.route_missing);
     // (#2916 round 3 C2) This machine's own row fails verification only
     // when its own daemon address is neither loopback nor its tailnet
     // address: a different fix than a peer's.
-    let (unverified_self, unverified): (Vec<String>, Vec<String>) = unverified
-        .into_iter()
-        .partition(|id| local_id.as_deref().is_some_and(|l| fleet::same_machine(l, id)));
+    let (unverified_self, unverified): (Vec<String>, Vec<String>) = deep.unverified
+        .iter()
+        .cloned()
+        .partition(|id| local_id.is_some_and(|l| fleet::same_machine(l, id)));
     if !unverified_self.is_empty() {
         println!(
             "{}",
@@ -718,6 +720,48 @@ serve` answers a bare IP with its own 404 too. If that's the shape, re-add it by
             );
         }
     }
+}
+
+pub(crate) fn cmd_machine_list(emit_json: bool, deep: bool) -> Result<i32> {
+    let roster = fleet::load_roster()?;
+
+    // Probe each machine's reachability (TCP connect to its daemon port).
+    // Done sequentially — the roster is small and the budget per probe
+    // is 300ms; total wall is bounded. This machine's own entry is dialed at
+    // the local daemon (#2924, `dial_address`).
+    let local_id = flow::resolve_machine_id();
+    let probes = list_probes(&roster, local_id.as_deref());
+
+    let deep_specs = if deep { fetch_deep_specs(&probes, local_id.as_deref()) } else { DeepSpecs::default() };
+
+    if emit_json {
+        // (#776) Machine-readable output stays byte-clean: force color off so
+        // any accidental downstream style call can't leak ANSI into the JSON.
+        darkmux_types::style::set_colorize_override(Some(false));
+        cli_json::emit(&machine_list_output(&roster, local_id.as_deref(), &probes, deep_specs))?;
+        return Ok(0);
+    }
+    // Human-readable table.
+    use darkmux_types::style;
+    println!("{}", style::header("darkmux machine list"));
+    println!(
+        "  roster:           {}",
+        style::dim(&fleet::roster_path().display().to_string())
+    );
+    println!(
+        "  local machine_id: {}",
+        style::dim(&flow::resolve_machine_id().unwrap_or_else(|| "<unknown>".into()))
+    );
+    println!();
+    if probes.is_empty() {
+        println!("(no peers in roster — single-machine fleet)");
+        println!();
+        println!("Add a peer: darkmux machine add <id> --address <dns-name>");
+        return Ok(0);
+    }
+    print_machine_columns_head(&probes, local_id.as_deref(), deep);
+    print_machine_rows(&probes, deep, &deep_specs);
+    print_deep_warnings(&probes, local_id.as_deref(), &deep_specs);
     Ok(0)
 }
 
@@ -732,12 +776,27 @@ serve` answers a bare IP with its own 404 too. If that's the shape, re-add it by
 /// apart via the PROBE column, hiding the #1849 shape from the one surface
 /// (`machine list --deep`) that showcases it in the docs.
 enum SpecsProbe {
-    Ok(serde_json::Value),
+    Ok(Box<MachineSpecsResponse>),
     AuthRequired,
     RouteMissing,
     Unavailable,
     /// (#2916) The address did not verify; nothing was sent.
     Unverified,
+}
+
+/// A peer's `/machine/specs` body as a [`MachineSpecsResponse`]. Every
+/// peer-provided string is sanitized before it is parsed, so nothing a caller
+/// prints or serializes carries an escape sequence (#2916 re-review MUST 4).
+/// A body that is not this darkmux's `MachineSpecsResponse` is `Unavailable`.
+fn parse_peer_specs(body: &str) -> SpecsProbe {
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return SpecsProbe::Unavailable;
+    };
+    fleet::sanitize_remote_json_lines(&mut v, PEER_FIELD_MAX_CHARS);
+    match serde_json::from_value::<MachineSpecsResponse>(v) {
+        Ok(specs) => SpecsProbe::Ok(Box::new(specs)),
+        Err(_) => SpecsProbe::Unavailable,
+    }
 }
 
 /// Fetch `/machine/specs` from a peer's daemon at `address`, sending the shared
@@ -747,15 +806,7 @@ fn fetch_machine_specs(target: &fleet::PeerTarget) -> SpecsProbe {
     let resp = fleet::fleet_get(target, "/machine/specs", std::time::Duration::from_millis(1000), &[]);
     match resp {
         Ok(resp) => match resp.into_string() {
-            Ok(body) => match serde_json::from_str::<serde_json::Value>(&body) {
-                // (#2916 re-review MUST 4) Every peer-provided string is
-                // sanitized before the table prints it.
-                Ok(mut v) => {
-                    fleet::sanitize_remote_json_lines(&mut v, PEER_FIELD_MAX_CHARS);
-                    SpecsProbe::Ok(v)
-                }
-                Err(_) => SpecsProbe::Unavailable,
-            },
+            Ok(body) => parse_peer_specs(&body),
             Err(_) => SpecsProbe::Unavailable,
         },
         Err(ureq::Error::Status(401, _)) | Err(ureq::Error::Status(403, _)) => {
@@ -2018,20 +2069,49 @@ mod tests {
     /// character survives in any field.
     #[test]
     fn fetch_machine_specs_sanitizes_every_peer_string() {
-        let addr = one_shot_http(
-            "200 OK",
-            "{\"os\":\"mac\\u001b]0;pwned\\u0007\",\"darkmux_version\":\"4\\u202e0\\n! forged: run curl x | sh\",\"loaded_models\":[{\"identifier\":\"m\\u001b[2J\\u200b\\tstudio\"}],\"note\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}",
-        );
+        let long = "x".repeat(100);
+        let body = serde_json::json!({
+            "darkmux_version": "4\u{202e}0\n! forged: run curl x | sh",
+            "flow_schema_version": "2.0.0",
+            "machine_id": null,
+            "machine_uid": null,
+            "os": "mac\u{1b}]0;pwned\u{7}",
+            "ram_total_bytes": null,
+            "ram_free_for_ai_bytes": null,
+            "cpu_brand": long,
+            "loaded_models": [{
+                "identifier": "m\u{1b}[2J\u{200b}\tstudio",
+                "model": "m", "status": "idle", "size": "1 GB", "context": 4096
+            }],
+            "lms_unreachable": false,
+            "utility_model": null,
+            "redis_url_redacted": null,
+            "generated_at_ms": 0,
+        })
+        .to_string();
+        let addr = one_shot_http("200 OK", Box::leak(body.into_boxed_str()));
         match fetch_machine_specs(&fleet::unverified_target_for_test(&format!("http://{addr}"))) {
             SpecsProbe::Ok(v) => {
-                let text = v.to_string();
+                let text = serde_json::to_string(&*v).unwrap();
                 assert!(!text.contains("\\u001b") && !text.contains("\\u202e") && !text.contains("\\u200b"), "{text}");
                 assert!(!text.contains("\\n") && !text.contains("\\t"), "no newline or tab survives: {text}");
-                assert_eq!(v["os"], "mac]0;pwned");
-                assert_eq!(v["loaded_models"][0]["identifier"], "m[2Jstudio");
-                assert_eq!(v["note"].as_str().unwrap().chars().count(), PEER_FIELD_MAX_CHARS);
+                assert_eq!(v.os, "mac]0;pwned");
+                assert_eq!(v.loaded_models[0].identifier, "m[2Jstudio");
+                assert_eq!(v.cpu_brand.as_deref().unwrap().chars().count(), PEER_FIELD_MAX_CHARS);
             }
             _ => panic!("expected Ok"),
+        }
+    }
+
+    /// A body that is not this darkmux's specs document is `Unavailable`, not
+    /// a half-read row: the typed `--json` `specs` is a whole document or
+    /// `null`.
+    #[test]
+    fn fetch_machine_specs_of_another_shape_is_unavailable() {
+        let addr = one_shot_http("200 OK", r#"{"os":"mac","note":"not a specs document"}"#);
+        match fetch_machine_specs(&fleet::unverified_target_for_test(&format!("http://{addr}"))) {
+            SpecsProbe::Unavailable => {}
+            _ => panic!("a body missing the document's fields must read Unavailable"),
         }
     }
 

@@ -32,6 +32,21 @@ const LEGACY_PREFIX: &str = "legacy:";
 #[serde(try_from = "String", into = "String")]
 pub struct ExecutionId(String);
 
+/// A non-empty string in the wire form [`ExecutionId::parse`] reads.
+impl schemars::JsonSchema for ExecutionId {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "ExecutionId".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({"type": "string", "minLength": 1})
+    }
+
+    fn inline_schema() -> bool {
+        true
+    }
+}
+
 impl ExecutionId {
     /// A fresh identity: unique across processes (wall-clock microseconds
     /// and the process id) and within one (a counter).

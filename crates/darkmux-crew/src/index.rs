@@ -381,11 +381,7 @@ fn file_mtime(path: &Path) -> Result<i64> {
 }
 
 fn escalation_tag(contract: &EscalationContract) -> &'static str {
-    match contract {
-        EscalationContract::BailWithExplanation => "bail-with-explanation",
-        EscalationContract::RetryWithHint => "retry-with-hint",
-        EscalationContract::HandOffTo(_) => "hand-off-to",
-    }
+    contract.kind().tag()
 }
 
 fn position_str(p: Position) -> &'static str {

@@ -15,7 +15,9 @@
 //!     `--context-window`) overlays onto the profile-derived
 //!     `CompactionDispatchArgs` via the provider (`loop_override`).
 
+use crate::cli_json;
 use anyhow::Result;
+use serde::Serialize;
 use darkmux_lab::lab::loop_report::{self, LoopCompactionOverride, LoopReport, Verdict};
 
 /// Flattened args for `darkmux lab loop`, one field per CLI flag.
@@ -146,7 +148,7 @@ fn loop_verb(args: &LabLoopArgs) -> Result<i32> {
     }
     let report = run_arm(args, &plan, None)?;
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        cli_json::emit(&report)?;
     } else {
         loop_report::print_report(&report);
     }
@@ -254,8 +256,9 @@ fn ab_context(args: &LabLoopArgs) -> Result<String> {
 }
 
 /// How the verdict moved from the baseline arm to the treatment arm.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VerdictShift {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum VerdictShift {
     Improved,
     Regressed,
     NoChange,
@@ -289,20 +292,33 @@ fn verdict_rank(v: Verdict) -> u8 {
     }
 }
 
+/// `lab loop --ab --json`: the two arms of the engagement-context A/B and how
+/// the verdict moved between them. (Without `--ab`, `lab loop --json` prints one
+/// [`LoopReport`].)
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct LoopAbReport<'a> {
+    /// Always `true`: what tells this shape from a single [`LoopReport`].
+    pub ab: bool,
+    pub injected_context_chars: usize,
+    pub verdict_shift: VerdictShift,
+    pub without: &'a LoopReport,
+    pub with: &'a LoopReport,
+}
+
 /// The A/B result as printed: one JSON object in `--json` mode, else the
 /// human block.
 fn render_ab(json: bool, ctx_chars: usize, without: &LoopReport, with: &LoopReport) -> Result<String> {
-    let shift = VerdictShift::between(without.verdict, with.verdict).as_str();
+    let shift = VerdictShift::between(without.verdict, with.verdict);
     if json {
-        let v = serde_json::json!({
-            "ab": true,
-            "injected_context_chars": ctx_chars,
-            "verdict_shift": shift,
-            "without": without,
-            "with": with,
+        return cli_json::render(&LoopAbReport {
+            ab: true,
+            injected_context_chars: ctx_chars,
+            verdict_shift: shift,
+            without,
+            with,
         });
-        return Ok(format!("{}\n", serde_json::to_string_pretty(&v)?));
     }
+    let shift = shift.as_str();
     Ok(format!(
         "\n── engagement-context A/B (#1004) ──\n\
          \x20 without context: {}\n\

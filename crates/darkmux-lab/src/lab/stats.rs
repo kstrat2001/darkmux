@@ -110,7 +110,7 @@ fn mean(xs: impl Iterator<Item = f64>) -> Option<f64> {
 /// degenerate finding therefore appears here
 /// with `aborts: 0`, which is exactly the shape that proves the policy was
 /// in effect.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, schemars::JsonSchema)]
 pub struct StreamGate {
     /// How many times output was sampled. A zero degenerate count against a
     /// large observation count is a far stronger statement than an absence
@@ -124,7 +124,7 @@ pub struct StreamGate {
 
 /// The per-call-cap gate (`dispatch.checkpoint`) — it judges the accumulated
 /// slice when a call hits `max_tokens_per_call`.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, schemars::JsonSchema)]
 pub struct CheckpointGate {
     pub observations: usize,
     /// Turns the runtime JUDGED degenerate (`would_conclude`), whatever the
@@ -146,13 +146,13 @@ pub struct CheckpointGate {
     pub policy: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, schemars::JsonSchema)]
 pub struct Gates {
     pub stream: StreamGate,
     pub checkpoint: CheckpointGate,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct SuspectTurn {
     pub seq: u64,
     pub reasoning_chars_per_token: f64,
@@ -164,7 +164,7 @@ pub struct SuspectTurn {
 /// these would have caught a specific wrong claim made before this module
 /// existed; [`RunStats::unreconciled`] turns the failures into the caveats a
 /// renderer prints next to the figures.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, schemars::JsonSchema)]
 pub struct RunChecks {
     pub telemetry_covers_run: bool,
     /// The policy the checkpoint records say RAN agrees with the one
@@ -203,7 +203,7 @@ pub struct RunChecks {
 /// Durations are milliseconds because that is the unit the artifacts use;
 /// converting to seconds is the renderer's job, and doing it here would
 /// round away differences the comparison depends on.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, schemars::JsonSchema)]
 pub struct RunStats {
     pub schema_version: &'static str,
     pub run: String,
@@ -441,7 +441,7 @@ pub const WINDOW_SLACK_MS: u64 = 5 * 60 * 1000;
 /// observer was negligible" is a claim the data can check rather than an
 /// assumption. The point of the bound: `files_read` and `lines_scanned` track
 /// the size of the RUN, not the size of the archive.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, schemars::JsonSchema)]
 pub struct FlowScan {
     pub files_total: usize,
     /// Last written before the run began, so they cannot hold any of it.

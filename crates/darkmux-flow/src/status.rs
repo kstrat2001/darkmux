@@ -17,7 +17,7 @@ use crate::{
     REDIS_CONNECT_TIMEOUT,
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct FlowStatus {
     pub schema_version: String,
     pub sinks: SinkSummary,
@@ -37,7 +37,7 @@ pub struct FlowStatus {
     pub hooks: HooksStatus,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SinkSummary {
     pub info: SinkInfo,
     /// Flat list of active leaf sink kinds — e.g., `["LocalFile", "Redis"]`.
@@ -83,7 +83,7 @@ const _: () = assert!(
      DEFAULT_REDIS_MAXLEN alongside the cap, or re-derive compute_near_max_len's precondition."
 );
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RedisStatus {
     pub url: String,
     pub stream: String,
@@ -110,7 +110,7 @@ pub struct RedisStatus {
     pub near_max_len: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct DiskStatus {
     pub flows_dir: String,
     pub exists: bool,
@@ -123,7 +123,7 @@ pub struct DiskStatus {
     pub observed_disk_schemas: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SchemaSkew {
     pub writer_version: String,
     /// Distinct schema strings observed in the active Redis stream
@@ -136,7 +136,7 @@ pub struct SchemaSkew {
     pub skew_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum HealthState {
     Ok,
@@ -858,7 +858,7 @@ pub fn format_status_human(status: &FlowStatus) -> String {
 /// trimmed of the two `PathBuf` fields (`outbox_path`/`cursor_path`) that
 /// don't belong in the operator-facing status surface (they're internal
 /// storage detail, not something `flow status`/`--json` consumers act on).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct HookRuleStatus {
     pub index: usize,
     pub match_desc: String,
@@ -921,7 +921,7 @@ pub struct HookRuleStatus {
 /// install still sees the section, just reporting itself off, the same
 /// unconditional shape the retired `hooks status` sub-verb always
 /// printed.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct HooksStatus {
     pub enabled: bool,
     pub outbox_dir: String,

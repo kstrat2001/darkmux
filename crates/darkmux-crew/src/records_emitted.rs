@@ -41,7 +41,7 @@ use std::collections::BTreeMap;
 /// [`records_emitted_for_mission`]'s doc) rather than an absent block, per
 /// the operator's 2026-09-06 rule that a wrong-or-missing key must leave a
 /// warning to follow, not a silent gap.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RecordsEmitted {
     /// Count of this mission's own flow records, keyed by their `action`
     /// string. A `BTreeMap` (not a `HashMap`) so both JSON output and the

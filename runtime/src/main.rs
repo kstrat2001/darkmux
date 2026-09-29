@@ -1129,24 +1129,13 @@ fn run_dispatch(args: &[String]) -> ExitCode {
             // (#799) Stamp the verifier-fabrication backstop: the bash commands
             // that FAILED TO RUN this dispatch. The gate cross-checks a SIGNOFF's
             // verification claims against this; empty on an honest run.
-            if let Some(obj) = envelope.as_object_mut() {
-                obj.insert(
-                    "failed_tool_invocations".into(),
-                    serde_json::to_value(&o.failed_to_run)
-                        .unwrap_or_else(|_| serde_json::json!([])),
-                );
-                // (#2114) `resumed_from`: path + the checkpoint's OWN turn
-                // index (where the dispatch resumed FROM, not where it ended
-                // up) — present only when this dispatch actually reloaded a
-                // checkpoint.
-                if let (Some(path), Some(turn_index)) =
-                    (&resume_checkpoint_path, resumed_from_turn_index)
-                {
-                    obj.insert(
-                        "resumed_from".into(),
-                        serde_json::json!({ "path": path, "turn_index": turn_index }),
-                    );
-                }
+            envelope.failed_tool_invocations = Some(o.failed_to_run.clone());
+            // (#2114) `resumed_from`: path + the checkpoint's OWN turn
+            // index (where the dispatch resumed FROM, not where it ended
+            // up), present only when this dispatch actually reloaded a
+            // checkpoint.
+            if let (Some(path), Some(turn_index)) = (&resume_checkpoint_path, resumed_from_turn_index) {
+                envelope.resumed_from = Some(darkmux_trajectory::ResumedFrom { path: path.clone(), turn_index: u64::from(turn_index) });
             }
             println!("{}", serde_json::to_string(&envelope).unwrap_or_else(|_| "{}".into()));
         } else {
@@ -1191,20 +1180,19 @@ fn run_dispatch(args: &[String]) -> ExitCode {
 /// envelope points at, written as they happened; the host folds that one
 /// log (`darkmux_trajectory::TrajectoryFold`) and adds the `metrics` block
 /// its callers read, so no second tally exists to disagree with it.
-fn build_json_envelope(result: &str, final_assistant: Option<&str>) -> serde_json::Value {
-    serde_json::json!({
-        "result": result,
-        "final_assistant": match final_assistant {
-            Some(s) => serde_json::Value::String(s.to_string()),
-            None => serde_json::Value::Null,
-        },
+fn build_json_envelope(result: &str, final_assistant: Option<&str>) -> darkmux_trajectory::RuntimeEnvelope {
+    darkmux_trajectory::RuntimeEnvelope {
+        result: result.to_string(),
+        final_assistant: final_assistant.map(str::to_string),
         // Container-internal path where the runtime's own bookkeeping
         // landed — the out-dir (SEPARATE from /workspace). Built from the
         // shared trajectory constants so it can't drift from the write site.
-        "trajectory_path": darkmux_trajectory::trajectory_path(Path::new(trajectory::RUNTIME_OUT_BASE))
+        trajectory_path: darkmux_trajectory::trajectory_path(Path::new(trajectory::RUNTIME_OUT_BASE))
             .display()
             .to_string(),
-    })
+        failed_tool_invocations: None,
+        resumed_from: None,
+    }
 }
 
 /// Human mode's closing summary: this execution's counts, read back from
@@ -1470,7 +1458,7 @@ mod tests {
 
     #[test]
     fn json_envelope_success_carries_final_assistant_and_no_counts() {
-        let env = build_json_envelope("stop", Some("hello world"));
+        let env = serde_json::to_value(build_json_envelope("stop", Some("hello world"))).unwrap();
         // Top-level contract — qa-review + lab adapter parse these.
         assert_eq!(env["result"], "stop");
         assert_eq!(env["final_assistant"], "hello world");
@@ -1485,7 +1473,7 @@ mod tests {
     fn json_envelope_error_carries_null_final_assistant() {
         // Failure path emits same envelope shape so consumers can parse
         // uniformly without branching on success/error.
-        let env = build_json_envelope("error", None);
+        let env = serde_json::to_value(build_json_envelope("error", None)).unwrap();
         assert_eq!(env["result"], "error");
         assert!(env["final_assistant"].is_null(), "error envelope must have null final_assistant");
         assert!(env.get("metrics").is_none(), "{env}");
@@ -1495,7 +1483,7 @@ mod tests {
     fn json_envelope_serializes_as_single_line() {
         // qa-review parses with `jq -c` — verify the serialized form is
         // single-line + valid JSON. (No surprise whitespace, etc.)
-        let env = build_json_envelope("stop", Some("x"));
+        let env = serde_json::to_value(build_json_envelope("stop", Some("x"))).unwrap();
         let s = serde_json::to_string(&env).unwrap();
         assert!(!s.contains('\n'), "envelope must serialize on one line; got: {s}");
         // Round-trip must produce identical structure.
@@ -1510,7 +1498,7 @@ mod tests {
         // stays parseable. Regression guard for "naive println escaping"
         // mistakes that would tempt a future refactor.
         let tricky = "line1\nline2\twith \"quotes\" and \\backslash";
-        let env = build_json_envelope("stop", Some(tricky));
+        let env = serde_json::to_value(build_json_envelope("stop", Some(tricky))).unwrap();
         let s = serde_json::to_string(&env).unwrap();
         let back: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(back["final_assistant"], tricky);

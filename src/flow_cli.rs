@@ -1,9 +1,11 @@
 //! CLI dispatcher for `darkmux flow` shortcut verbs.
 
+use crate::cli_json;
 use crate::flow;
 use crate::flow::{Category, FlowAction, FlowRecord, FlowSource, Level, OperatorSource, Stage, Tier};
 use anyhow::{bail, Context, Result};
 use clap::Subcommand;
+use serde::Serialize;
 use darkmux_types::execution_id::ExecutionId;
 
 
@@ -274,14 +276,13 @@ fn run_drain_file(file: &std::path::Path, to: &str, json: bool) -> Result<()> {
     let result = flow::hooks::drain_stray_file(file, to)?;
     if json {
         darkmux_types::style::set_colorize_override(Some(false));
-        let v = serde_json::json!({
-            "file": file.display().to_string(),
-            "to": to,
-            "delivered": result.delivered,
-            "failed": result.failed,
-            "remaining_undelivered": result.remaining_undelivered,
-        });
-        println!("{}", serde_json::to_string_pretty(&v).context("serializing stray-file drain result to JSON")?);
+        cli_json::emit(&StrayDrainOutput {
+            file: file.display().to_string(),
+            to: to.to_string(),
+            delivered: result.delivered,
+            failed: result.failed,
+            remaining_undelivered: result.remaining_undelivered,
+        })?;
     } else {
         println!(
             "darkmux flow drain --file {} — delivered: {}, failed: {}, remaining undelivered: {}",
@@ -450,15 +451,47 @@ fn render_drain_result_human(r: &DrainResult, max_seconds: u64) -> String {
     out
 }
 
-fn drain_result_json(r: &DrainResult) -> serde_json::Value {
-    serde_json::json!({
-        "rule": r.rule_filter,
-        "delivered": r.delivered,
-        "failed": r.failed,
-        "remaining_undelivered": r.remaining_undelivered,
-        "timed_out": r.remaining_undelivered > 0,
-        "lock_held_rules": r.lock_held_rules,
-    })
+/// `flow drain --json`.
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct DrainOutput {
+    /// The rule index the drain was limited to, when it was.
+    pub rule: Option<usize>,
+    pub delivered: u64,
+    pub failed: u64,
+    pub remaining_undelivered: usize,
+    /// True when records remain after the wait.
+    pub timed_out: bool,
+    /// Rules whose drain lock another process held when the wait ended.
+    pub lock_held_rules: Vec<usize>,
+}
+
+impl From<&DrainResult> for DrainOutput {
+    fn from(r: &DrainResult) -> Self {
+        DrainOutput {
+            rule: r.rule_filter,
+            delivered: r.delivered,
+            failed: r.failed,
+            remaining_undelivered: r.remaining_undelivered,
+            timed_out: r.remaining_undelivered > 0,
+            lock_held_rules: r.lock_held_rules.clone(),
+        }
+    }
+}
+
+/// `flow drain --file <path> --to <url> --json`.
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct StrayDrainOutput {
+    pub file: String,
+    pub to: String,
+    pub delivered: usize,
+    pub failed: usize,
+    pub remaining_undelivered: usize,
+}
+
+/// `flow integrity-check --json`: one report per audit file checked.
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct IntegrityCheckOutput<'a> {
+    pub reports: &'a [flow::IntegrityReport],
 }
 
 fn run_drain(rule_filter: Option<usize>, max_seconds: u64, json: bool) -> Result<()> {
@@ -467,8 +500,7 @@ fn run_drain(rule_filter: Option<usize>, max_seconds: u64, json: bool) -> Result
     let result = drain_hooks(&rules, &outbox_dir, rule_filter, max_seconds)?;
     if json {
         darkmux_types::style::set_colorize_override(Some(false));
-        let v = drain_result_json(&result);
-        println!("{}", serde_json::to_string_pretty(&v).context("serializing drain result to JSON")?);
+        cli_json::emit(&DrainOutput::from(&result))?;
     } else {
         print!("{}", render_drain_result_human(&result, max_seconds));
     }
@@ -482,9 +514,7 @@ fn print_status(json: bool) -> Result<()> {
     if json {
         // (#776) machine-readable: force color off (defense-in-depth).
         darkmux_types::style::set_colorize_override(Some(false));
-        let s = serde_json::to_string_pretty(&status)
-            .context("serializing FlowStatus to JSON")?;
-        println!("{s}");
+        cli_json::emit(&status)?;
     } else {
         print!("{}", flow::format_status_human(&status));
     }
@@ -527,9 +557,7 @@ fn print_integrity_check(
     if json {
         // (#776) machine-readable: force color off (defense-in-depth).
         style::set_colorize_override(Some(false));
-        let s = serde_json::to_string_pretty(&reports)
-            .context("serializing integrity reports to JSON")?;
-        println!("{s}");
+        cli_json::emit(&IntegrityCheckOutput { reports: &reports })?;
     } else if reports.is_empty() {
         println!(
             "{}",
@@ -911,7 +939,7 @@ mod tests {
         assert!(human.contains("delivered: 3"), "{human}");
         assert!(!human.contains("still undelivered"), "{human}");
 
-        let json = drain_result_json(&result);
+        let json = serde_json::to_value(DrainOutput::from(&result)).unwrap();
         assert_eq!(json["delivered"], serde_json::json!(3));
         assert_eq!(json["timed_out"], serde_json::json!(false));
     }

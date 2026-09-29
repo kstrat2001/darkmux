@@ -16,3 +16,7 @@ rust-version = "1.86"
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# Off by default, so the runtime's own build (which takes only what it needs)
+# does not compile it. The host enables it: the CLI's `--json` golden derives its
+# field schemas from the trajectory types a `--json` output carries.
+schemars = { version = "1.2", optional = true }

@@ -829,18 +829,18 @@ edit loop detected on src/widget.rs in an earlier dispatch
         }
 
         let report = report.expect("mission found");
-        assert_eq!(report.mission_id, mid);
+        assert_eq!(report.mission.id, mid);
         // The legacy `"closed"` on disk (above) reads as `Finalized` via the
-        // alias, and `mission_status_label` renders the canonical new word.
-        assert_eq!(report.mission_status, "finalized");
+        // alias, and `MissionStatus` serializes the canonical new word.
+        assert_eq!(report.mission.status, crew::types::MissionStatus::Finalized);
         assert_eq!(report.phases.len(), 2, "both phases surfaced: {:?}", report.phases);
         assert!(
-            report.phases.iter().any(|p| p.id == "s1" && p.status == "complete"),
+            report.phases.iter().any(|p| p.id == "s1" && p.status == DebriefPhaseStatus::Complete),
             "{:?}",
             report.phases
         );
         assert!(
-            report.phases.iter().any(|p| p.id == "s2" && p.status == "abandoned"),
+            report.phases.iter().any(|p| p.id == "s2" && p.status == DebriefPhaseStatus::Abandoned),
             "{:?}",
             report.phases
         );
@@ -915,10 +915,10 @@ edit loop detected on src/widget.rs in an earlier dispatch
         let report = report.expect("mission found");
         let p1 = report.phases.iter().find(|p| p.id == "p1").expect("p1 present");
         let p2 = report.phases.iter().find(|p| p.id == "p2").expect("p2 present");
-        assert_eq!(p1.status, "complete", "a clean phase still reads complete: {p1:?}");
+        assert_eq!(p1.status, DebriefPhaseStatus::Complete, "a clean phase still reads complete: {p1:?}");
         assert_eq!(p1.reason, None, "a clean phase has no mix to name");
         assert_eq!(
-            p2.status, "degraded",
+            p2.status, DebriefPhaseStatus::Degraded,
             "the SAME on-disk `complete` must read `degraded` when the envelope says so: {p2:?}"
         );
         assert_eq!(
@@ -938,24 +938,24 @@ edit loop detected on src/widget.rs in an earlier dispatch
         use crew::types::PhaseStatus;
         assert_eq!(
             phase_label_with_outcome(PhaseStatus::Complete, Some(PhaseOutcomeKind::Degraded)),
-            "degraded"
+            DebriefPhaseStatus::Degraded
         );
         assert_eq!(
             phase_label_with_outcome(PhaseStatus::Abandoned, Some(PhaseOutcomeKind::Degraded)),
-            "abandoned",
+            DebriefPhaseStatus::Abandoned,
             "an operator's abort is the authoritative terminal — the envelope never overwrites it"
         );
         assert_eq!(
             phase_label_with_outcome(PhaseStatus::Running, Some(PhaseOutcomeKind::Degraded)),
-            "running",
+            DebriefPhaseStatus::Running,
             "a live phase is not relabeled by a stale envelope"
         );
         // No envelope row at all (never finalized, or an envelope written
         // before `Degraded` existed) → disk, unchanged.
-        assert_eq!(phase_label_with_outcome(PhaseStatus::Complete, None), "complete");
+        assert_eq!(phase_label_with_outcome(PhaseStatus::Complete, None), DebriefPhaseStatus::Complete);
         assert_eq!(
             phase_label_with_outcome(PhaseStatus::Complete, Some(PhaseOutcomeKind::Complete)),
-            "complete"
+            DebriefPhaseStatus::Complete
         );
     }
 

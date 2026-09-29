@@ -10,6 +10,7 @@ use clap::Parser;
 // fleet_cli/lab_cli. Glob-imported so every `FooCmd` variant type main.rs's
 // handlers already reference by bare name keeps resolving unchanged.
 mod cli;
+mod cli_json;
 use cli::*;
 
 // SPIKE (#1388) — `darkmux acp`. See src/acp.rs module docs.
@@ -301,8 +302,7 @@ fn cmd_lessons(sub: LessonCmd) -> Result<i32> {
             };
 
             if json {
-                let out = serde_json::json!({ "repo": repo, "global": global });
-                println!("{}", serde_json::to_string_pretty(&out)?);
+                cli_json::emit(&cli_json::LessonTiers { repo, global })?;
                 return Ok(0);
             }
             if repo.is_empty() && global.is_empty() {
@@ -397,7 +397,7 @@ fn cmd_lessons(sub: LessonCmd) -> Result<i32> {
                 schema_version: lessons::LESSONS_SCHEMA_VERSION,
                 lessons: lessons::load_entries_best_effort(&path),
             };
-            println!("{}", serde_json::to_string_pretty(&env)?);
+            cli_json::emit(&env)?;
             Ok(0)
         }
         LessonCmd::Import { file, global } => {
@@ -447,8 +447,7 @@ fn cmd_lessons(sub: LessonCmd) -> Result<i32> {
                 recall_tier(&global_path)
             };
             if json {
-                let out = serde_json::json!({ "repo": repo, "global": global });
-                println!("{}", serde_json::to_string_pretty(&out)?);
+                cli_json::emit(&cli_json::LessonTiers { repo, global })?;
                 return Ok(0);
             }
             if repo.is_empty() && global.is_empty() {
@@ -514,7 +513,7 @@ fn cmd_correction(sub: CorrectionCmd) -> Result<i32> {
             let found = crew::corrections::scan(days, scope);
 
             if json {
-                println!("{}", serde_json::to_string_pretty(&found)?);
+                cli_json::emit(&cli_json::CorrectionList { corrections: found })?;
                 return Ok(0);
             }
             if found.is_empty() {
@@ -1293,22 +1292,25 @@ fn cmd_machine_resources(id: Option<&str>, json: bool) -> Result<i32> {
     if let Some(id) = id {
         // Remote read — fetch the peer's live /machine/resources payload.
         let value = fleet_cli::fetch_peer_json(id, "/machine/resources")?;
-        if json {
-            println!("{}", serde_json::to_string_pretty(&value)?);
-            return Ok(0);
-        }
         // Deserialize into the same ledger shape and render it, so a remote
-        // read reads like a local one. Fall back to raw JSON if the peer's
-        // shape doesn't parse (older/newer daemon).
-        match serde_json::from_value::<darkmux_profiles::model_ledger::ModelLedger>(value.clone()) {
-            Ok(ledger) => print!("{}", darkmux_profiles::model_ledger::render_human(&ledger)),
-            Err(_) => println!("{}", serde_json::to_string_pretty(&value)?),
+        // read reads like a local one. A peer whose shape doesn't parse (an
+        // older or newer daemon) is refused, never printed raw.
+        let ledger = serde_json::from_value::<darkmux_profiles::model_ledger::ModelLedger>(value).map_err(|e| {
+            anyhow::anyhow!(
+                "machine `{id}` answered with a resource ledger this darkmux does not read \
+                 (its darkmux version differs from this one): {e}"
+            )
+        })?;
+        if json {
+            cli_json::emit(&ledger)?;
+        } else {
+            print!("{}", darkmux_profiles::model_ledger::render_human(&ledger));
         }
         return Ok(0);
     }
     let ledger = darkmux_profiles::model_ledger::gather();
     if json {
-        println!("{}", serde_json::to_string_pretty(&ledger)?);
+        cli_json::emit(&ledger)?;
     } else {
         print!("{}", darkmux_profiles::model_ledger::render_human(&ledger));
     }
@@ -1336,27 +1338,21 @@ fn cmd_machine_status(id: Option<&str>, config: Option<&str>, json: bool) -> Res
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         // Shape mismatch (an older/newer daemon whose payload doesn't parse):
-        // fall back to a raw JSON print — the same fallback
-        // `cmd_machine_resources` uses — never a fabricated-empty render.
+        // refuse, naming the cause (the same refusal `cmd_machine_resources`
+        // makes), never a fabricated-empty render.
         let models: Vec<types::LoadedModel> = match value
             .get("models")
             .map(|m| serde_json::from_value(m.clone()))
         {
             Some(Ok(models)) => models,
-            _ => {
-                println!("{}", serde_json::to_string_pretty(&value)?);
-                return Ok(0);
-            }
+            _ => anyhow::bail!(
+                "machine `{id}` answered with a resident list this darkmux does not read: \
+                 its darkmux version differs from this one"
+            ),
         };
         if lms_unreachable {
             if json {
-                let out = serde_json::json!({
-                    "machine_id": id,
-                    "lms_unreachable": true,
-                    "managed": [],
-                    "user_state": [],
-                });
-                println!("{}", serde_json::to_string_pretty(&out)?);
+                cli_json::emit(&cli_json::MachineStatusOutput::lms_unreachable(Some(id.to_string())))?;
             } else {
                 eprintln!(
                     "machine `{id}`: the peer's daemon could not reach LMStudio (`lms ps` \
@@ -1382,13 +1378,9 @@ fn cmd_machine_status(id: Option<&str>, config: Option<&str>, json: bool) -> Res
         Ok(loaded) => loaded,
         Err(e) => {
             if json {
-                let out = serde_json::json!({
-                    "machine_id": darkmux_types::config_access::machine_id(),
-                    "lms_unreachable": true,
-                    "managed": [],
-                    "user_state": [],
-                });
-                println!("{}", serde_json::to_string_pretty(&out)?);
+                cli_json::emit(&cli_json::MachineStatusOutput::lms_unreachable(
+                    darkmux_types::config_access::machine_id(),
+                ))?;
             } else {
                 eprintln!(
                     "this machine: could not query LMStudio (`lms ps` failed here) — residents \
@@ -1442,20 +1434,14 @@ fn render_residents(
         .partition(|m| ownership::is_darkmux_owned(&m.identifier));
     if json {
         // (#907) machine-readable parity, grouped by ownership.
-        let mut out = serde_json::json!({
-            "managed": managed,
-            "user_state": user,
-        });
-        if let Some(m) = matches {
-            out["matching_profiles"] = serde_json::json!(m);
-        }
-        if let Some(p) = registry_path {
-            out["registry"] = serde_json::json!(p);
-        }
-        if let Some(id) = remote_id {
-            out["machine_id"] = serde_json::json!(id);
-        }
-        println!("{}", serde_json::to_string_pretty(&out)?);
+        cli_json::emit(&cli_json::MachineStatusOutput {
+            machine_id: remote_id.map(str::to_string).or_else(darkmux_types::config_access::machine_id),
+            lms_unreachable: false,
+            managed,
+            user_state: user,
+            matching_profiles: matches,
+            registry: registry_path,
+        })?;
         return Ok(0);
     }
     if let Some(id) = remote_id {
@@ -1626,9 +1612,7 @@ fn cmd_profile(sub: ProfileCmd) -> Result<i32> {
             };
 
             let suggestion = heuristics::suggest_profile(&meta, task);
-            let json = heuristics::suggestion_to_profile_json(&name, &model, &suggestion);
-            // Pretty-print
-            println!("{}", serde_json::to_string_pretty(&json)?);
+            cli_json::emit(&heuristics::draft_profile(&name, &model, &suggestion))?;
             eprintln!();
             eprintln!("// Copy the above into the `profiles` block of ~/.darkmux/profiles.json,");
             eprintln!("// then run `darkmux doctor` to verify the result.");
@@ -1858,11 +1842,10 @@ fn cmd_profiles(config: Option<&str>, json: bool) -> Result<i32> {
     if json {
         // (#907) Serialize the registry directly — `default_profile` + the
         // full profile map, the lowest-surprise machine-readable shape.
-        let out = serde_json::json!({
-            "registry_path": loaded.path.display().to_string(),
-            "registry": loaded.registry,
-        });
-        println!("{}", serde_json::to_string_pretty(&out)?);
+        cli_json::emit(&cli_json::ProfileList {
+            registry_path: loaded.path.display().to_string(),
+            registry: &loaded.registry,
+        })?;
         return Ok(0);
     }
     println!("{}", darkmux_types::style::header(&format!("registry: {}", loaded.path.display())));

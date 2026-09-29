@@ -2201,22 +2201,28 @@ fn machine_status_local_unreachable_lms_matches_the_remote_shape() {
     );
 }
 
-/// (#1426) A peer payload whose `models` doesn't parse (older/newer daemon
-/// shape) falls back to a raw JSON print — never a fabricated-empty render.
+/// A peer payload whose shape this darkmux does not read (an older or newer
+/// daemon) is refused with a message naming the cause: never printed raw, never
+/// rendered as an empty machine. `--json` prints only its output type, so a
+/// refusal leaves stdout empty.
 #[test]
-fn machine_status_remote_shape_mismatch_prints_raw_json() {
-    let addr = canned_http_peer("200 OK", r#"{"future_shape":{"models_v2":[]}}"#, 1);
-    let tmp = TempDir::new().unwrap();
-    let fleet_file = roster_with_peer(&tmp, "peer1", &addr);
-    let out = darkmux_cmd()
-        .env("DARKMUX_FLEET_FILE", &fleet_file)
-        .args(["machine", "status", "peer1"])
-        .output()
-        .unwrap();
-    assert!(out.status.success());
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("future_shape"), "raw payload passthrough: {stdout}");
-    assert!(!stdout.contains("darkmux-managed"), "no fabricated render: {stdout}");
+fn a_peer_answering_in_another_shape_is_refused_not_printed_raw() {
+    for (args, why) in [
+        (vec!["machine", "status", "peer1"], "text status"),
+        (vec!["machine", "status", "peer1", "--json"], "json status"),
+        (vec!["machine", "resources", "peer1"], "text resources"),
+        (vec!["machine", "resources", "peer1", "--json"], "json resources"),
+    ] {
+        let addr = canned_http_peer("200 OK", r#"{"future_shape":{"models_v2":[]}}"#, 1);
+        let tmp = TempDir::new().unwrap();
+        let fleet_file = roster_with_peer(&tmp, "peer1", &addr);
+        let out = darkmux_cmd().env("DARKMUX_FLEET_FILE", &fleet_file).args(&args).output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{why}: a shape mismatch must fail: {stdout}{stderr}");
+        assert!(stdout.is_empty(), "{why}: nothing is printed to stdout: {stdout}");
+        assert!(stderr.contains("does not read") && stderr.contains("version differs"), "{why}: {stderr}");
+    }
 }
 
 #[test]
@@ -9169,7 +9175,7 @@ fn mission_launch_prunes_disabled_steps_at_mint_and_reports_them() {
     assert!(human_out.contains("1 of 4 steps minted (3 left out by config)"), "got:\n{human_out}");
 }
 
-// ── (#2682 fix-pass MUST FIX 3) `running-phase-session-dead` end-to-end ────
+// ── (#2682 fix-pass MUST FIX 3) `running-phase-execution-dead` end-to-end ────
 //
 // The unit tests inside `src/mission_status.rs` (`detect_drift`,
 // `running_phase_session_drift`) all hand-type the `local_status`/
@@ -9294,7 +9300,7 @@ fn mission_status_running_phase_with_no_dispatch_ever_stays_silent() {
     let m = mission_drift(&board, "never-dispatched-e2e");
     let drifts = m["drift"].as_array().unwrap();
     assert!(
-        !drifts.iter().any(|d| d["kind"] == "running-phase-session-dead"),
+        !drifts.iter().any(|d| d["kind"] == "running-phase-execution-dead"),
         "a mission with no attributable dispatch session must not be flagged as one whose \
          dispatch session died — this is the sign-off-gate false alarm round 2 removed: {m}"
     );
@@ -9341,8 +9347,8 @@ fn mission_status_recorded_session_end_describes_an_observation_not_an_absence()
     let drifts = m["drift"].as_array().unwrap();
     let hit = drifts
         .iter()
-        .find(|d| d["kind"] == "running-phase-session-dead")
-        .unwrap_or_else(|| panic!("no running-phase-session-dead drift for a recorded session.end: {m}"));
+        .find(|d| d["kind"] == "running-phase-execution-dead")
+        .unwrap_or_else(|| panic!("no running-phase-execution-dead drift for a recorded session.end: {m}"));
     let detail = hit["detail"].as_str().unwrap().to_lowercase();
     assert!(
         detail.contains("recorded") && detail.contains("ending"),
@@ -9422,8 +9428,8 @@ fn mission_status_stale_session_with_no_terminal_drifts_and_renders_for_a_human(
     let drifts = m["drift"].as_array().unwrap();
     let hit = drifts
         .iter()
-        .find(|d| d["kind"] == "running-phase-session-dead")
-        .unwrap_or_else(|| panic!("no running-phase-session-dead drift for a started, never-terminated session: {m}"));
+        .find(|d| d["kind"] == "running-phase-execution-dead")
+        .unwrap_or_else(|| panic!("no running-phase-execution-dead drift for a started, never-terminated session: {m}"));
     let detail = hit["detail"].as_str().unwrap().to_lowercase();
     assert!(
         detail.contains("no evidence of life") || detail.contains("no terminal record"),
@@ -9593,7 +9599,7 @@ fn a_legacy_paused_mission_reads_as_active_on_run_list_and_the_board() {
     assert!(
         board_drift_kinds(home.path(), flows.path(), "legacy-paused-e2e")
             .iter()
-            .any(|k| k == "running-phase-session-dead"),
+            .any(|k| k == "running-phase-execution-dead"),
         "and the board names the dead session as it does for an active mission"
     );
 }

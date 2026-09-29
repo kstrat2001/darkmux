@@ -1318,14 +1318,14 @@ pub fn settle_step(
 // ── Reading waits back (mission status) ─────────────────────────────────
 
 /// A wait still in progress, read back from the flow log.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct ActiveWait {
     /// `endpoint` (the one budget that waits).
     pub scope: String,
     /// The endpoint id.
     pub subject: String,
     pub mission_id: Option<String>,
-    pub session_id: Option<String>,
+    pub execution_id: Option<String>,
     /// When it resumes, when known (`YYYY-MM-DDTHH:MM:SSZ`).
     pub resume_at: Option<String>,
     /// Seconds from `now` to `resume_at`.
@@ -1398,7 +1398,7 @@ pub fn active_waits(dir: &Path, now: i64, lookback_secs: u64, alive: &dyn Fn(u32
                 scope,
                 subject,
                 mission_id: s("mission_id").map(str::to_string),
-                session_id: (!session.is_empty()).then_some(session),
+                execution_id: (!session.is_empty()).then_some(session),
                 resume_at,
                 resumes_in_secs: resume_secs.map(|r| (r - now).max(0) as u64),
                 message: p.get("message").and_then(|x| x.as_str()).unwrap_or("").to_string(),

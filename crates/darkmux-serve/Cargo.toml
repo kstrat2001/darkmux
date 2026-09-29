@@ -38,6 +38,9 @@ futures = "0.3"
 blake3 = "1.5"
 tower-http = { version = "0.5", features = ["cors", "timeout"] }
 serde = { version = "1.0", features = ["derive"] }
+# The CLI `--json` golden derives its field schemas from these types too, so the
+# ones a verb shares with the daemon (`Run`, `MissionGraph`) carry the derive.
+schemars = "1.2"
 serde_json.workspace = true
 redis = { version = "0.27", default-features = false, features = ["streams"] }
 # (#1914) Promoted from dev-only: the fleet-snapshot handoff file a spawned
