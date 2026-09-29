@@ -380,6 +380,14 @@ darkmux release.
   `session_id` alone can join by `execution_id`; the runtime image's
   `--session-id` flag is `--execution-id` (the image and binary are version
   locked, so nothing to do but upgrade both).
+- **`finding list --json` rows carry `execution`, not `dispatch`** (breaking:
+  `--json` shapes are semver-bound). Each row's `dispatch` field is now
+  `execution`, holding the `<execution_id>` half of the finding's key; the
+  `--dispatch` flag is refused with a message naming `--execution`.
+  **Migration:** read `.execution` where a script read `.dispatch`, and
+  pass `--execution <id>` where it passed `--dispatch <id>`. The catalog's
+  per-day and per-mission DISPATCHES counts are executions too, so a map
+  step's items each count.
 - **Every machine in a fleet upgrades together** (FLOW 2.0.0). A 4.0 reader
   upgrades a 3.x peer's records, but a 3.x reader does not know the dotted
   spellings: a 3.x hub misreads a 4.0 peer's records (its missions never

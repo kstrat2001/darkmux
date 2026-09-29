@@ -103,7 +103,7 @@ pub fn list(
 pub fn show(key: &str, json: bool) -> Result<i32> {
     let root = config_access::findings_dir();
     let Some((execution, seq)) = findings::parse_key(key) else {
-        eprintln!("not a finding key: {key} (expected <execution>/<seq>, e.g. sess-abc/1)");
+        eprintln!("not a finding key: {key} (expected <execution>/<seq>, e.g. exec-18f3a2c-1b2-0/1)");
         return Ok(1);
     };
     let Some(rec) = findings::load_at(&root, &execution, seq)? else {

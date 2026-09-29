@@ -570,6 +570,10 @@ pub(crate) enum FindingCmd {
         /// Only findings from this role execution (the key's first half).
         #[arg(long)]
         execution: Option<String>,
+        /// Refused: the pre-4.0 spelling of `--execution`. Declared only so
+        /// the refusal can name the replacement.
+        #[arg(long = "dispatch", hide = true, value_name = "KEY")]
+        retired_dispatch: Option<String>,
         /// Only findings whose recorded context names this rule.
         #[arg(long)]
         rule: Option<String>,
@@ -578,7 +582,7 @@ pub(crate) enum FindingCmd {
     },
     /// Show one finding, whole, by its `<execution>/<seq>` key.
     Show {
-        /// The finding key, e.g. `sess-abc/1`.
+        /// The finding key, e.g. `exec-18f3a2c-1b2-0/1`.
         key: String,
         #[command(flatten)]
         json: JsonFlag,

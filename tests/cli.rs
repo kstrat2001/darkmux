@@ -1055,6 +1055,18 @@ fn lab_eval_dead_funnel_flags_are_removed() {
     }
 }
 
+/// (4.0) `finding list --dispatch` became `--execution`. The old spelling is
+/// refused by name, so an operator's script learns the replacement instead of
+/// reading clap's "unexpected argument".
+#[test]
+fn finding_list_dispatch_flag_is_refused_naming_execution() {
+    darkmux_cmd()
+        .args(["finding", "list", "--dispatch", "sess-abc"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("`--dispatch` was renamed to `--execution`"));
+}
+
 /// (#1426 phase 2) The `skills` top-level verb retired — `init` is the one
 /// setup/refresh verb (it refreshes the bundled darkmux-* skills on re-run,
 /// and `darkmux doctor` flags stale ones). The spelling has NO compat alias,

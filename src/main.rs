@@ -845,7 +845,11 @@ fn cmd_mod(sub: cli::ModCmd) -> Result<i32> {
 /// missing, and never overwrites one that exists.
 fn cmd_finding(sub: cli::FindingCmd) -> Result<i32> {
     match sub {
-        cli::FindingCmd::List { mission, execution, rule, json: cli::JsonFlag { json } } => {
+        cli::FindingCmd::List { retired_dispatch: Some(_), .. } => {
+            eprintln!("darkmux finding list: `--dispatch` was renamed to `--execution` in 4.0");
+            Ok(2)
+        }
+        cli::FindingCmd::List { mission, execution, retired_dispatch: None, rule, json: cli::JsonFlag { json } } => {
             finding_cli::list(mission.as_deref(), execution.as_deref(), rule.as_deref(), json)
         }
         cli::FindingCmd::Show { key, json: cli::JsonFlag { json } } => {

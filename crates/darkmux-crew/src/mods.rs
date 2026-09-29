@@ -585,7 +585,7 @@ pub fn canonical_for_keys(for_keys: &[String]) -> Result<Vec<String>> {
         .iter()
         .map(|k| {
             canonical_finding_key(k).with_context(|| {
-                format!("not a finding key: {k:?} (expected <execution>/<seq>, e.g. sess-abc/1)")
+                format!("not a finding key: {k:?} (expected <execution>/<seq>, e.g. exec-18f3a2c-1b2-0/1)")
             })
         })
         .collect()
