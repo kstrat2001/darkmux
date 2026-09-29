@@ -36,7 +36,7 @@
   "crates/darkmux-crew/src/records_emitted.rs::parse_ts_secs": 25,
   "crates/darkmux-crew/src/rules.rs::load_all": 16,
   "crates/darkmux-crew/src/scheduler.rs::run_step_graph": 49,
-  "crates/darkmux-crew/src/step_kinds/builtins.rs::DispatchMapStepKind::run_map": 24,
+  "crates/darkmux-crew/src/step_kinds/builtins.rs::DispatchMapStepKind::run_map": 20,
   "crates/darkmux-crew/src/step_kinds/builtins.rs::resolve_map_collection": 19,
   "crates/darkmux-crew/src/step_kinds/deliver_github_review.rs::render_github_review": 23,
   "crates/darkmux-crew/src/step_kinds/liveness_conformance.rs::block_from": 37,

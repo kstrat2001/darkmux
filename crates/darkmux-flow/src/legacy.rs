@@ -11,7 +11,9 @@
 //! event whichever path read it. One upgrade needs the whole record, not
 //! just its action: a pre-4.0 whole-run bookend, spelled as an execution's
 //! and told apart by its `source`, reads as `run.*` ([`run_grain_of`],
-//! applied by [`crate::reader`]).
+//! applied by [`crate::reader`]). Another does too: a record of an
+//! execution written before 4.0 names none, and [`stamp_execution`] gives
+//! it the one synthesized identity.
 
 use crate::{Bookend, FlowAction, Grain};
 
@@ -169,6 +171,40 @@ pub(crate) fn run_grain_of(action: &FlowAction, record: &serde_json::Value) -> O
         return None;
     };
     Some(Bookend { grain: Grain::Run, edge }.action())
+}
+
+/// The execution a record of any age is of: the one it names, else the one
+/// [`darkmux_types::execution_id::ExecutionId::legacy`] synthesizes from its
+/// session, mission, `ts`, `handle` and machine. The one place that mapping is
+/// applied, by [`stamp_execution`] on read and by a consumer holding a
+/// record that never went through the reader.
+pub fn execution_of(record: &serde_json::Value) -> darkmux_types::execution_id::ExecutionId {
+    let text = |key: &str| record.get(key).and_then(serde_json::Value::as_str);
+    text("execution_id")
+        .and_then(|named| darkmux_types::execution_id::ExecutionId::parse(named).ok())
+        .unwrap_or_else(|| {
+            darkmux_types::execution_id::ExecutionId::legacy(
+                text("session_id"),
+                text("mission_id"),
+                text("ts").unwrap_or_default(),
+                text("handle").unwrap_or_default(),
+                text("machine_uid").unwrap_or_default(),
+            )
+        })
+}
+
+/// Give a record OF an execution that names none its synthesized identity
+/// ([`execution_of`]), in place. Whether a record is of an execution is its
+/// action's declared grain ([`FlowAction::grain`]); `action` is the record's
+/// action as [`crate::reader::action_of`] read it, so a pre-4.0 whole-run
+/// bookend (now `run.*`) gets none. Returns whether it wrote one; a record
+/// that already names its execution is left as it is.
+pub(crate) fn stamp_execution(record: &mut serde_json::Value, action: &FlowAction) -> bool {
+    if action.grain() != Some(Grain::Execution) || record.get("execution_id").is_some_and(|v| !v.is_null()) {
+        return false;
+    }
+    record["execution_id"] = serde_json::Value::String(execution_of(record).to_string());
+    true
 }
 
 /// The `source` a pre-4.0 mission launch or ACP panel run stamped on its

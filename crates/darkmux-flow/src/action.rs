@@ -141,13 +141,25 @@ macro_rules! flow_bookend {
     () => {
         None
     };
+    ($grain:ident) => {
+        None
+    };
     ($grain:ident $edge:ident) => {
         Some(Bookend { grain: Grain::$grain, edge: Edge::$edge })
     };
 }
 
+macro_rules! flow_grain {
+    () => {
+        None
+    };
+    ($grain:ident) => {
+        Some(Grain::$grain)
+    };
+}
+
 macro_rules! flow_actions {
-    ( $( $(#[$meta:meta])* $variant:ident => $scope:ident, $wire:literal $(, $grain:ident $edge:ident)?; )* ) => {
+    ( $( $(#[$meta:meta])* $variant:ident => $scope:ident, $wire:literal $(, $grain:ident $($edge:ident)?)?; )* ) => {
         /// A flow record's action. See the module doc for the grammar.
         #[derive(Debug, Clone, PartialEq, Eq, Hash)]
         pub enum FlowAction {
@@ -184,7 +196,19 @@ macro_rules! flow_actions {
             /// execution is said in exactly one place.
             pub fn bookend(&self) -> Option<Bookend> {
                 match self {
-                    $( FlowAction::$variant => flow_bookend!($($grain $edge)?), )*
+                    $( FlowAction::$variant => flow_bookend!($($grain $($edge)?)?), )*
+                    FlowAction::Retired(_) | FlowAction::Other(_) => None,
+                }
+            }
+
+            /// The unit this action is a record OF, when it names one: a
+            /// bookend's own grain, or the grain of a record written inside
+            /// that unit (a turn, a tool call, a usage record). Declared on
+            /// the row, so "which records carry an execution id" has one
+            /// answer.
+            pub fn grain(&self) -> Option<Grain> {
+                match self {
+                    $( FlowAction::$variant => flow_grain!($($grain)?), )*
                     FlowAction::Retired(_) | FlowAction::Other(_) => None,
                 }
             }
@@ -227,26 +251,26 @@ flow_actions! {
     BatteryPauseUnsupported => Battery, "battery.pause_unsupported";
     /// A budget was reached (or its `warn_at` fraction was) under `warn`, or
     /// a per-step cap was crossed; the call went ahead.
-    BudgetWarn => Budget, "budget.warn";
+    BudgetWarn => Budget, "budget.warn", Execution;
     /// A call is waiting on a budget (`wait`).
-    BudgetWait => Budget, "budget.wait";
+    BudgetWait => Budget, "budget.wait", Execution;
     /// A waiting call went ahead.
-    BudgetResume => Budget, "budget.resume";
+    BudgetResume => Budget, "budget.resume", Execution;
     /// A budget wait ended because its run was stopped; nothing was sent.
-    BudgetStop => Budget, "budget.stop";
+    BudgetStop => Budget, "budget.stop", Execution;
     DispatchStart => Dispatch, "dispatch.start", Execution Start;
     DispatchComplete => Dispatch, "dispatch.complete", Execution Complete;
     DispatchError => Dispatch, "dispatch.error", Execution Error;
-    DispatchTurn => Dispatch, "dispatch.turn";
-    DispatchTurnHeartbeat => Dispatch, "dispatch.turn.heartbeat";
-    DispatchTool => Dispatch, "dispatch.tool";
-    DispatchCompaction => Dispatch, "dispatch.compaction";
-    DispatchCheckpoint => Dispatch, "dispatch.checkpoint";
-    DispatchReasoning => Dispatch, "dispatch.reasoning";
-    DispatchFeedbackInjected => Dispatch, "dispatch.feedback.injected";
-    DispatchRest => Dispatch, "dispatch.rest";
-    DispatchDegeneracyWarning => Dispatch, "dispatch.degeneracy.warning";
-    DispatchWorkdirGitUnavailable => Dispatch, "dispatch.workdir_git_unavailable";
+    DispatchTurn => Dispatch, "dispatch.turn", Execution;
+    DispatchTurnHeartbeat => Dispatch, "dispatch.turn.heartbeat", Execution;
+    DispatchTool => Dispatch, "dispatch.tool", Execution;
+    DispatchCompaction => Dispatch, "dispatch.compaction", Execution;
+    DispatchCheckpoint => Dispatch, "dispatch.checkpoint", Execution;
+    DispatchReasoning => Dispatch, "dispatch.reasoning", Execution;
+    DispatchFeedbackInjected => Dispatch, "dispatch.feedback.injected", Execution;
+    DispatchRest => Dispatch, "dispatch.rest", Execution;
+    DispatchDegeneracyWarning => Dispatch, "dispatch.degeneracy.warning", Execution;
+    DispatchWorkdirGitUnavailable => Dispatch, "dispatch.workdir_git_unavailable", Execution;
     DispatchRoute => Dispatch, "dispatch.route";
     GhVerbExecuted => Gh, "gh.verb.executed";
     HookFired => Hook, "hook.fired";
@@ -298,12 +322,12 @@ flow_actions! {
     StepTiming => Step, "step.timing";
     StepSeatUnresolved => Step, "step.seat_unresolved";
     StreamError => Stream, "stream.error";
-    TelemetryTokens => Telemetry, "telemetry.tokens";
-    TelemetryDetector => Telemetry, "telemetry.detector";
-    TelemetryContext => Telemetry, "telemetry.context";
-    TelemetryCompaction => Telemetry, "telemetry.compaction";
-    TelemetryRuntime => Telemetry, "telemetry.runtime";
-    TelemetryLms => Telemetry, "telemetry.lms";
+    TelemetryTokens => Telemetry, "telemetry.tokens", Execution;
+    TelemetryDetector => Telemetry, "telemetry.detector", Execution;
+    TelemetryContext => Telemetry, "telemetry.context", Execution;
+    TelemetryCompaction => Telemetry, "telemetry.compaction", Execution;
+    TelemetryRuntime => Telemetry, "telemetry.runtime", Execution;
+    TelemetryLms => Telemetry, "telemetry.lms", Execution;
     TierDecision => Tier, "tier.decision";
     ThermalStopUnresolved => Thermal, "thermal.stop_unresolved";
     ThermalTier5Eject => Thermal, "thermal.tier5_eject";
@@ -394,6 +418,51 @@ mod ts {
         "RetiredAction.ts",
         "/**\n * An action darkmux wrote before 4.0 and retired with no current\n * equivalent. An archive may still hold it; nothing writes it.\n */\n"
     );
+
+    /// The actions that are records OF a role execution, exported so the
+    /// viewer's copy of `FlowAction::grain` is keyed by this union and a
+    /// drift is a type error.
+    pub struct ExecutionGrainAction;
+
+    impl ExecutionGrainAction {
+        fn wires() -> Vec<&'static str> {
+            FlowAction::KNOWN_WIRE
+                .iter()
+                .copied()
+                .filter(|w| FlowAction::from_wire(w).grain() == Some(crate::Grain::Execution))
+                .collect()
+        }
+    }
+
+    impl ts_rs::TS for ExecutionGrainAction {
+        type WithoutGenerics = Self;
+        const DOCS: Option<&'static str> = Some(
+            "/**\n * The flow actions that are records of one role execution: every one carries an\n * `execution_id`.\n */\n",
+        );
+        fn name() -> String {
+            "ExecutionGrainAction".to_string()
+        }
+        fn decl() -> String {
+            format!("type {} = {};", Self::name(), Self::inline())
+        }
+        fn decl_concrete() -> String {
+            Self::decl()
+        }
+        fn inline() -> String {
+            union(&Self::wires())
+        }
+        fn inline_flattened() -> String {
+            panic!("{} cannot be flattened", Self::name())
+        }
+        fn output_path() -> Option<&'static Path> {
+            Some(Path::new("../../../ui/src/types/generated/ExecutionGrainAction.ts"))
+        }
+    }
+
+    #[test]
+    fn export_bindings_executiongrainaction() {
+        <ExecutionGrainAction as ts_rs::TS>::export_all().expect("could not export ExecutionGrainAction");
+    }
 
     #[test]
     fn export_bindings_retiredaction() {
@@ -506,6 +575,25 @@ mod tests {
         assert_eq!(FlowAction::RunStart.bookend(), Some(Bookend { grain: Grain::Run, edge: Edge::Start }));
         assert_eq!(FlowAction::DispatchError.bookend(), Some(Bookend { grain: Grain::Execution, edge: Edge::Error }));
         assert_eq!(FlowAction::StepStart.bookend(), None, "a step is covered by its scheduler records, not a bookend");
+    }
+
+    /// A bookend is a record OF the unit it brackets: its declared grain is
+    /// its bookend's, and the run grain has no record inside it.
+    #[test]
+    fn a_bookends_grain_is_the_grain_it_brackets_and_the_run_grain_has_no_inner_record() {
+        for wire in FlowAction::KNOWN_WIRE {
+            let action = FlowAction::from_wire(wire);
+            if let Some(b) = action.bookend() {
+                assert_eq!(action.grain(), Some(b.grain), "{wire}");
+            }
+            if action.grain() == Some(Grain::Run) {
+                assert!(action.bookend().is_some(), "{wire}: only a run's own bookend is of the run grain");
+            }
+        }
+        assert_eq!(FlowAction::DispatchTool.grain(), Some(Grain::Execution));
+        assert_eq!(FlowAction::TelemetryTokens.grain(), Some(Grain::Execution));
+        assert_eq!(FlowAction::StepStart.grain(), None);
+        assert_eq!(FlowAction::DispatchRoute.grain(), None, "a route is decided before any execution exists");
     }
 
     #[test]

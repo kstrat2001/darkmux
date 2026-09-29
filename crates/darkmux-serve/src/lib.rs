@@ -5280,6 +5280,7 @@ fn synthetic_stream_error_record(stream_name: &str, attempts: u32, reason: &str)
         handle: "redis_tail_lines".to_string(),
         phase_id: None,
         session_id: None,
+        execution_id: None,
         source: None,
         model: None,
         reasoning: Some(format!(

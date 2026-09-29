@@ -2,6 +2,7 @@
   {
     "action": "dispatch.start",
     "category": "work",
+    "execution_id": "legacy:step-judge-1:review-1785400940-legacy",
     "handle": "judge",
     "level": "info",
     "mission_id": "review-1785400940-legacy",
@@ -17,6 +18,7 @@
   {
     "action": "dispatch.turn",
     "category": "work",
+    "execution_id": "legacy:step-judge-1:review-1785400940-legacy",
     "handle": "judge",
     "level": "info",
     "mission_id": "review-1785400940-legacy",
@@ -34,6 +36,7 @@
   {
     "action": "telemetry.tokens",
     "category": "telemetry",
+    "execution_id": "legacy:step-judge-1:review-1785400940-legacy",
     "handle": "judge",
     "level": "info",
     "mission_id": "review-1785400940-legacy",
@@ -50,6 +53,7 @@
   {
     "action": "dispatch.complete",
     "category": "work",
+    "execution_id": "legacy:step-judge-1:review-1785400940-legacy",
     "handle": "judge",
     "level": "info",
     "mission_id": "review-1785400940-legacy",
@@ -65,6 +69,7 @@
   {
     "action": "dispatch.start",
     "category": "work",
+    "execution_id": "legacy:step-verify-1-review-1785400940-legacy:review-1785400940-legacy",
     "handle": "verifier",
     "level": "info",
     "mission_id": "review-1785400940-legacy",
@@ -80,6 +85,7 @@
   {
     "action": "dispatch.turn",
     "category": "work",
+    "execution_id": "legacy:step-verify-1-review-1785400940-legacy:review-1785400940-legacy",
     "handle": "verifier",
     "level": "info",
     "mission_id": "review-1785400940-legacy",
@@ -97,6 +103,7 @@
   {
     "action": "telemetry.tokens",
     "category": "telemetry",
+    "execution_id": "legacy:step-verify-1-review-1785400940-legacy:review-1785400940-legacy",
     "handle": "verifier",
     "level": "info",
     "mission_id": "review-1785400940-legacy",
@@ -113,6 +120,7 @@
   {
     "action": "dispatch.complete",
     "category": "work",
+    "execution_id": "legacy:step-verify-1-review-1785400940-legacy:review-1785400940-legacy",
     "handle": "verifier",
     "level": "info",
     "mission_id": "review-1785400940-legacy",

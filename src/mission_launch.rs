@@ -1219,7 +1219,7 @@ pub fn launch(
             &run_for_abort,
             serde_json::json!({
                 "result_class": "error",
-                "error": "mission run terminated before completion (early return or panic)",
+                "error": "run terminated before completion (early return or panic)",
             }),
         )
     });
@@ -8800,7 +8800,7 @@ mod tests {
     /// `gate: "coder-phase"` and NEVER an `error` key — the opposite shape
     /// from the `BookendGuard` Drop backstop's generic abort record (see
     /// `launch`'s `bookend` construction: `on_abort` builds a payload with
-    /// `"error": "mission run terminated before completion..."` and no
+    /// `"error": "run terminated before completion..."` and no
     /// `gate` key). Distinguishing the two shapes is what lets
     /// `launch_coder_phase_worktree_failure_still_closes_the_run_as_run_error`
     /// (below) prove the explicit close actually ran, not just that SOME

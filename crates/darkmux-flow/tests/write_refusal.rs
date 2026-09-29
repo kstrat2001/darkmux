@@ -32,3 +32,29 @@ fn no_sink_writes_an_action_the_reader_could_not_name() {
     assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0, "nothing reached the day file");
     unsafe { std::env::remove_var("DARKMUX_FLOWS_DIR") };
 }
+
+/// (4.0) A record OF an execution names it: no sink writes an
+/// execution-grain record without an execution id, however the record was
+/// built. A record of another grain is unaffected.
+#[test]
+#[serial_test::serial]
+fn no_sink_writes_an_execution_record_without_its_execution_id() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    // SAFETY: serial test; nothing else reads the env concurrently.
+    unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path()) };
+    let line = |action: &str, extra: &str| {
+        format!(
+            r#"{{"ts":"t","level":"info","category":"work","tier":"local","stage":"dispatch","action":"{action}","handle":"h"{extra}}}"#
+        )
+    };
+    let read = |l: String| reader::parse_record(&l).expect("read");
+    let mut anonymous = read(line("dispatch.turn", ""));
+    anonymous.execution_id = None;
+    assert!(LocalFileSink::new().write(&anonymous).is_err(), "an execution record with no id must be refused");
+    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0, "nothing reached the day file");
+    let named = read(line("dispatch.turn", r#","execution_id":"exec-1""#));
+    assert!(LocalFileSink::new().write(&named).is_ok());
+    let step = read(line("step.start", ""));
+    assert!(LocalFileSink::new().write(&step).is_ok(), "a record of another grain needs none");
+    unsafe { std::env::remove_var("DARKMUX_FLOWS_DIR") };
+}

@@ -437,6 +437,27 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
      `dispatch.single_shot` kind (`crates/darkmux-crew/src/step_kinds/builtins.rs:794`,
      hosted twin at `:738`) — not review-specific, and not used by `review.json`.
 
+   **Every record of an execution names it: `execution_id` (4.0).** The id
+   (`darkmux_types::execution_id::ExecutionId`) is minted ONCE per role execution at the
+   host entries that run one: `crew::dispatch::dispatch` (which covers the hosted
+   single-shot path), `dispatch_local_single_shot`, the `dispatch.single_shot` step kind, and
+   each ITEM of a `dispatch.map` (a map step writes no `dispatch.*` pair of its own; the
+   scheduler's `step.start`/`step.complete` cover the step). It is stamped through ONE
+   builder path (`FlowRecord::for_execution`, called by `darkmux_crew::dispatch`'s
+   builders), on every record whose action declares `Execution` grain (`FlowAction::grain`,
+   on the action's row): the `dispatch.*` bookends, turns, tool calls, `telemetry.*` and
+   `budget.*` records. `CheckedRecord::check` refuses to write one without it. The
+   compactor's sub-execution records carry the PARENT's id (its usage record is `purpose:
+   utility`, so a sum can split it out); a host-side utility job (radio routing) mints its own
+   for its usage record and its markers carry none; a resumed dispatch continues its execution (the id
+   rides in the out-dir's `resume_origin.json`, beside the checkpoint the runtime writes);
+   a specialist change mints a new one. Consumers key on it: the token sum's legacy
+   fallback, the DISPATCHES chip, `records_emitted`'s pairing, both lifecycle executors'
+   attempts, and the finding store (`<execution_id>/<seq>`). A record from before 4.0
+   names none, and `darkmux_flow::legacy::execution_of` (the reader) and `ingest.ts` (the
+   viewer) give it `legacy:<session>:<mission>`: the ONLY place the old
+   `(session, mission)` grouping survives; no file is rewritten.
+
    **The run grain has its own bookends (4.0).** A `mission launch` and an ACP panel run
    open `run.start` on the run's own session and close it with `run.complete` or
    `run.error` on every exit path (a `BookendGuard`: a panic or an early return still

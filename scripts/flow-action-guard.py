@@ -141,9 +141,10 @@ def read(root, rel):
 
 def vocabulary(root):
     act, leg = read(root, ACTION_RS), read(root, LEGACY_RS)
-    # A row is `Variant => Scope, "wire";`, or with a bookend's grain and
-    # edge after the wire (`, Execution Start;`).
-    current = set(re.findall(r'^\s+\w+ => \w+, "([^"]+)"(?:, \w+ \w+)?;', act, re.M))
+    # A row is `Variant => Scope, "wire";`, or with the grain of the unit it
+    # is a record of after the wire (`, Execution;`), and a bookend's edge
+    # after that (`, Execution Start;`).
+    current = set(re.findall(r'^\s+\w+ => \w+, "([^"]+)"(?:, \w+(?: \w+)?)?;', act, re.M))
     scopes = set(re.findall(r'^\s+\w+ => "([a-z]+)";', act, re.M))
     old = set(re.findall(r'^\s+\("([^"]+)", FlowAction::\w+\),', leg, re.M))
     retired = set(re.findall(r'^\s+\w+ => "([^"]+)";', leg, re.M))

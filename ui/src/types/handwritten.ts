@@ -727,6 +727,12 @@ export interface FlowRecord {
   action?: string;
   handle?: string;
   session_id?: string;
+  /** The role execution a record is about (`darkmux_flow::FlowRecord::
+   * execution_id`): present on every record of an execution-grain action.
+   * The daemon serves one for a pre-4.0 record too, synthesized from its
+   * session and mission; `lib/ingest.ts` does the same for a record served
+   * without one (a committed archive). */
+  execution_id?: string;
   source?: string;
   model?: string;
   mission_id?: string;

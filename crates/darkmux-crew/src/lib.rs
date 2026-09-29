@@ -109,7 +109,7 @@ pub mod host_sampler_lock;
 // darkmux-lab, so the mapping lives at the caller (`src/pr_review.rs`).
 pub mod envelope;
 /// (#2265) The finding record — what was observed, stored write-once under
-/// `<findings dir>/<dispatch>/<seq>/finding.json`.
+/// `<findings dir>/<execution>/<seq>/finding.json`.
 pub mod findings;
 pub mod index;
 pub mod lessons;

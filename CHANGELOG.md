@@ -362,6 +362,24 @@ darkmux release.
   `dispatch.complete` with `source: "mission"` to learn that a run ended
   must match `run.complete` / `run.error` instead; one that counted
   `dispatch.start` records as runs now counts role executions.
+- **Every record of a role execution names it: `execution_id`** (FLOW 2.0.0,
+  CLAUDE.md contract 8). One id is minted per execution (a container or hosted
+  dispatch, a `dispatch.single_shot` step, each item of a `dispatch.map`) and
+  stamped on its `dispatch.*` bookends, turns, tool calls, `telemetry.*` and
+  `budget.*` records; a resumed dispatch keeps its id. A `dispatch.map` step
+  no longer writes one `dispatch.start` / `complete` pair around the whole
+  step: each item writes its own. Token totals, the DISPATCHES chip, the
+  records-emitted pairing and the run lifecycle key on the execution, so a
+  session holding several (a map's items) no longer blends them. Stored
+  findings are filed under `<execution_id>/<seq>`, and `darkmux finding list
+  --dispatch <id>` is now `--execution <id>`; a finding filed before 4.0 keeps
+  its address. darkmux's readers give a pre-4.0 record of an execution the id
+  `legacy:<session>:<mission>` and never rewrite the file. **Migration:** a
+  hook rule or external reader that counted a map step's `dispatch.start` as
+  one per step now sees one per item; one that joined a step's records by
+  `session_id` alone can join by `execution_id`; the runtime image's
+  `--session-id` flag is `--execution-id` (the image and binary are version
+  locked, so nothing to do but upgrade both).
 - **Every machine in a fleet upgrades together** (FLOW 2.0.0). A 4.0 reader
   upgrades a 3.x peer's records, but a 3.x reader does not know the dotted
   spellings: a 3.x hub misreads a 4.0 peer's records (its missions never

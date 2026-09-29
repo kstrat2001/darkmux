@@ -11,12 +11,17 @@
 //!    together. An attempt opens on its first opening record (a bookend
 //!    start, `run.start` or `dispatch.start`; a `budget.wait`,
 //!    `mission.start` or `step.start`; or, when nothing of its mission
-//!    opened yet, a turn, heartbeat, tool call or rest). A record naming a
-//!    mission joins that mission's latest attempt (or adopts the current one
-//!    when it names none yet). A record naming none joins the latest attempt
-//!    still open at its time, or the latest opened when none is. A bookend
-//!    start in an attempt that already has one, or a reopening record after
-//!    the attempt closed, starts the next attempt.
+//!    opened yet, a turn, heartbeat, tool call or rest). A record of an
+//!    execution (every execution-grain record carries its `execution_id`; a
+//!    pre-4.0 one reads as its session and mission) joins the latest attempt
+//!    of that execution, so a session holding several (a map's items) keeps
+//!    each one's records and its own close apart. Any other record, and one
+//!    of an execution with no attempt yet, joins by mission: a record naming
+//!    a mission joins that mission's latest attempt (or adopts the current
+//!    one when it names none yet). A record naming none joins the latest
+//!    attempt still open at its time, or the latest opened when none is. A
+//!    bookend start in an attempt that already has one, or a reopening
+//!    record after the attempt closed, starts the next attempt.
 //! 2. Close. An attempt closes on its first closing record. A closing record
 //!    seen before anything opened closes the first attempt left with none.
 //! 3. Outcome. A bookend terminal (`run.complete` / `run.error`,
@@ -36,7 +41,8 @@
 //! lacks (the viewer holds a session's current run open on it).
 
 use crate::runs::{AbandonReason, RunStatus};
-use darkmux_flow::{Edge, FlowAction};
+use darkmux_flow::{Edge, FlowAction, Grain};
+use darkmux_types::execution_id::ExecutionId;
 use std::sync::Arc;
 
 /// How a closed attempt ended: its status, and why when abandoned.
@@ -52,6 +58,8 @@ pub(crate) struct Ending {
 struct Folded {
     action: Option<FlowAction>,
     mission: Option<String>,
+    /// The execution the record is of; `None` for a record of another grain.
+    execution: Option<ExecutionId>,
     ts: String,
     /// Its `ts` as epoch seconds; `None` when unparsable.
     at: Option<u64>,
@@ -69,6 +77,7 @@ impl Folded {
         Folded {
             action: action.cloned(),
             mission: mission.map(str::to_string),
+            execution: action.filter(|a| a.grain() == Some(Grain::Execution)).map(|_| darkmux_flow::legacy::execution_of(v)),
             ts: ts.to_string(),
             at: crate::runs::parse_flow_ts(ts),
             names_a_reason: payload.get("reason").and_then(|r| r.as_str()).is_some_and(|r| !r.is_empty()),
@@ -123,6 +132,9 @@ fn is_first_opener(a: &FlowAction) -> bool {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Attempt {
     pub mission: Option<String>,
+    /// The execution of its first record that is of one; `None` for an
+    /// attempt no execution has touched (a run's, a step's).
+    execution: Option<ExecutionId>,
     pub has_start: bool,
     pub start_ts: Option<String>,
     pub waited: bool,
@@ -145,6 +157,9 @@ impl Attempt {
     fn add(&mut self, r: &Folded) {
         if self.mission.is_none() {
             self.mission.clone_from(&r.mission);
+        }
+        if self.execution.is_none() {
+            self.execution.clone_from(&r.execution);
         }
         // Segmented in time order, so the newest timed record is the last.
         if r.at.is_some() {
@@ -186,7 +201,10 @@ impl Attempt {
 }
 
 /// The attempt a record joins (rule 1), by index.
-fn target_for(attempts: &[Attempt], mission: Option<&str>) -> Option<usize> {
+fn target_for(attempts: &[Attempt], mission: Option<&str>, execution: Option<&ExecutionId>) -> Option<usize> {
+    if let Some(own) = execution.and_then(|x| attempts.iter().rposition(|a| a.execution.as_ref() == Some(x))) {
+        return Some(own);
+    }
     let cur = attempts.len().checked_sub(1);
     let Some(m) = mission else {
         return attempts.iter().rposition(|a| a.close.is_none()).or(cur);
@@ -231,7 +249,7 @@ fn segment(records: &[Folded]) -> Vec<Attempt> {
     let mut attempts: Vec<Attempt> = Vec::new();
     let mut orphans: Vec<&Folded> = Vec::new();
     for r in order {
-        let mut target = target_for(&attempts, r.mission.as_deref());
+        let mut target = target_for(&attempts, r.mission.as_deref(), r.execution.as_ref());
         if r.action.as_ref().is_some_and(|a| opens(&attempts, target, a)) {
             attempts.push(Attempt { mission: r.mission.clone(), ..Attempt::default() });
             target = Some(attempts.len() - 1);

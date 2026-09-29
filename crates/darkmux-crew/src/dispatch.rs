@@ -17,6 +17,7 @@ use std::fs;
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use darkmux_types::execution_id::ExecutionId;
 use darkmux_types::session_id::SessionId;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -846,6 +847,11 @@ pub struct DispatchResult {
     pub stderr: String,
     /// The session this dispatch ran under (`opts.session`).
     pub session_id: SessionId,
+    /// The role execution this dispatch was: the id every one of its
+    /// records names, and the address of the findings it recorded. `None`
+    /// only for a result no local execution produced (a dispatch routed to
+    /// a peer machine, whose records carry the peer's own ids).
+    pub execution: Option<ExecutionId>,
     /// Host path where the internal runtime's `.darkmux-runtime/`
     /// bookkeeping landed (the dir mounted into the container at
     /// `/darkmux-out`). `None` when the dispatch path doesn't produce
@@ -1056,12 +1062,11 @@ pub enum RoutingDecision {
 /// auto-route arm was retired, so `decision: "auto"` no longer occurs.
 pub fn emit_route_record(opts: &DispatchOpts, target_machine: Option<&str>) {
     let payload = build_route_payload(target_machine, opts.profile_name.as_deref());
-    let _ = darkmux_flow::record(build_dispatch_record_with_payload(
+    let _ = darkmux_flow::record(build_session_record_with_payload(
         darkmux_flow::Level::Info,
         darkmux_flow::FlowAction::DispatchRoute,
         &opts.role_id,
         &opts.session,
-        None,
         opts.phase_id.as_deref(),
         Some(payload),
     ));
@@ -1152,39 +1157,83 @@ fn with_session_step(session: &SessionId, mut payload: serde_json::Value) -> ser
     payload
 }
 
-/// Build a dispatch-stage flow record with an explicit `payload` for
-/// event-specific fields (#204).
-#[allow(clippy::too_many_arguments)]
-pub fn build_dispatch_record_with_payload(
-    level: darkmux_flow::Level,
-    action: darkmux_flow::FlowAction,
-    role_id: &str,
+/// The fields every crew-built record shares, laid over a record already
+/// built for its session (or execution): the phase, the model, and the
+/// payload with its step attributed.
+fn crew_fields(
+    base: darkmux_flow::FlowRecord,
     session: &SessionId,
+    source: &str,
     model: Option<&str>,
     phase_id: Option<&str>,
     payload: Option<serde_json::Value>,
 ) -> darkmux_flow::FlowRecord {
     darkmux_flow::FlowRecord {
         phase_id: phase_id.map(String::from),
-        // FROZEN data-contract value: consumed by the viewer's source join and
-        // test-asserted. Predates the #1426 verb rename (`crew dispatch` ->
-        // `dispatch`); do NOT rename in a spelling-cleanup sweep.
-        source: Some("crew_dispatch".to_string()),
+        source: Some(source.to_string()),
         model: model.map(String::from),
         payload: payload.map(|p| with_session_step(session, p)),
-        ..darkmux_flow::FlowRecord::for_session(
-            session,
-            level,
-            darkmux_flow::Category::Work,
-            darkmux_flow::Stage::Dispatch,
-            action,
-            role_id,
-        )
+        ..base
     }
 }
 
-/// Build a telemetry flow record (#557 slice 2). Same shape as
-/// `build_dispatch_record_with_payload` but `category = Telemetry` and
+/// The `source` of a crew-built dispatch-stage record: a FROZEN
+/// data-contract value, consumed by the viewer's source join and
+/// test-asserted. It predates the #1426 verb rename (`crew dispatch` ->
+/// `dispatch`); do NOT rename it in a spelling-cleanup sweep.
+const CREW_DISPATCH_SOURCE: &str = "crew_dispatch";
+
+/// Build a dispatch-stage flow record OF `execution`, with an explicit
+/// `payload` for event-specific fields (#204). The one builder of an
+/// execution's own records: it stamps the execution the way
+/// [`darkmux_flow::FlowRecord::for_execution`] does.
+#[allow(clippy::too_many_arguments)]
+pub fn build_dispatch_record_with_payload(
+    level: darkmux_flow::Level,
+    action: darkmux_flow::FlowAction,
+    role_id: &str,
+    session: &SessionId,
+    execution: &ExecutionId,
+    model: Option<&str>,
+    phase_id: Option<&str>,
+    payload: Option<serde_json::Value>,
+) -> darkmux_flow::FlowRecord {
+    let base = darkmux_flow::FlowRecord::for_execution(
+        session,
+        execution,
+        level,
+        darkmux_flow::Category::Work,
+        darkmux_flow::Stage::Dispatch,
+        action,
+        role_id,
+    );
+    crew_fields(base, session, CREW_DISPATCH_SOURCE, model, phase_id, payload)
+}
+
+/// Build a dispatch-stage flow record that is NOT of an execution: a route
+/// decision, a radio route, a coder-phase lifecycle or step result. Its
+/// action is not execution-grain, so it carries no execution id.
+pub fn build_session_record_with_payload(
+    level: darkmux_flow::Level,
+    action: darkmux_flow::FlowAction,
+    handle: &str,
+    session: &SessionId,
+    phase_id: Option<&str>,
+    payload: Option<serde_json::Value>,
+) -> darkmux_flow::FlowRecord {
+    let base = darkmux_flow::FlowRecord::for_session(
+        session,
+        level,
+        darkmux_flow::Category::Work,
+        darkmux_flow::Stage::Dispatch,
+        action,
+        handle,
+    );
+    crew_fields(base, session, CREW_DISPATCH_SOURCE, None, phase_id, payload)
+}
+
+/// Build a telemetry flow record OF `execution` (#557 slice 2). Same shape
+/// as `build_dispatch_record_with_payload` but `category = Telemetry` and
 /// the `source` is caller-supplied (`"detector"`, `"runtime"`, …) so the
 /// observability viewer can discriminate telemetry sub-streams. The
 /// `payload` carries the instrument-specific fields (the viewer aliases
@@ -1196,24 +1245,21 @@ pub fn build_telemetry_record(
     source: &str,
     role_id: &str,
     session: &SessionId,
+    execution: &ExecutionId,
     model: Option<&str>,
     phase_id: Option<&str>,
     payload: serde_json::Value,
 ) -> darkmux_flow::FlowRecord {
-    darkmux_flow::FlowRecord {
-        phase_id: phase_id.map(String::from),
-        source: Some(source.to_string()),
-        model: model.map(String::from),
-        payload: Some(with_session_step(session, payload)),
-        ..darkmux_flow::FlowRecord::for_session(
-            session,
-            level,
-            darkmux_flow::Category::Telemetry,
-            darkmux_flow::Stage::Dispatch,
-            action,
-            role_id,
-        )
-    }
+    let base = darkmux_flow::FlowRecord::for_execution(
+        session,
+        execution,
+        level,
+        darkmux_flow::Category::Telemetry,
+        darkmux_flow::Stage::Dispatch,
+        action,
+        role_id,
+    );
+    crew_fields(base, session, source, model, phase_id, Some(payload))
 }
 
 #[cfg(test)]
@@ -1366,7 +1412,7 @@ mod tests {
             darkmux_flow::FlowAction::TelemetryDetector,
             "detector",
             "coder",
-            &crate::test_session("sess-1"),
+            &crate::test_session("sess-1"), &darkmux_types::execution_id::ExecutionId::mint(),
             Some("darkmux:qwen3.6"),
             None,
             payload.clone(),
@@ -1394,7 +1440,7 @@ mod tests {
             darkmux_flow::FlowAction::TelemetryDetector,
             "detector",
             "coder",
-            &crate::test_session("sess-1"),
+            &crate::test_session("sess-1"), &darkmux_types::execution_id::ExecutionId::mint(),
             None,
             None,
             serde_json::json!({ "kind": "cycle", "severity": "warn", "detail": "x" }),
@@ -1796,7 +1842,7 @@ mod tests {
             darkmux_flow::Level::Info,
             darkmux_flow::FlowAction::DispatchStart,
             "coder",
-            &step,
+            &step, &darkmux_types::execution_id::ExecutionId::mint(),
             None,
             None,
             Some(serde_json::json!({ "runtime": "internal" })),
@@ -1807,7 +1853,7 @@ mod tests {
             darkmux_flow::FlowAction::TelemetryTokens,
             "tokens",
             "coder",
-            &step,
+            &step, &darkmux_types::execution_id::ExecutionId::mint(),
             None,
             None,
             serde_json::json!({ "step_id": "named" }),
@@ -1817,7 +1863,7 @@ mod tests {
             darkmux_flow::Level::Info,
             darkmux_flow::FlowAction::DispatchStart,
             "coder",
-            &SessionId::task(crate::test_run(), "t1"),
+            &SessionId::task(crate::test_run(), "t1"), &darkmux_types::execution_id::ExecutionId::mint(),
             None,
             None,
             Some(serde_json::json!({})),
@@ -1854,7 +1900,7 @@ mod tests {
             darkmux_flow::Level::Info,
             darkmux_flow::FlowAction::DispatchStart,
             "coder",
-            &crate::test_session("crew-dispatch-coder-12345-1"),
+            &crate::test_session("crew-dispatch-coder-12345-1"), &darkmux_types::execution_id::ExecutionId::mint(),
             Some("darkmux:qwen3.6-35b-a3b"),
             None,
             None,
@@ -1878,6 +1924,46 @@ mod tests {
         assert!(rec.ts.ends_with('Z'), "ts should be UTC: {}", rec.ts);
     }
 
+    /// The one builder of an execution's records stamps the execution; the
+    /// builder of a record that is not of one stamps none.
+    #[test]
+    fn the_execution_builders_stamp_the_execution_and_the_session_builder_stamps_none() {
+        let session = crate::test_session("s-exec");
+        let execution = ExecutionId::mint();
+        let dispatch = build_dispatch_record_with_payload(
+            darkmux_flow::Level::Info,
+            darkmux_flow::FlowAction::DispatchTurn,
+            "coder",
+            &session,
+            &execution,
+            None,
+            None,
+            None,
+        );
+        let telemetry = build_telemetry_record(
+            darkmux_flow::Level::Info,
+            darkmux_flow::FlowAction::TelemetryTokens,
+            "tokens",
+            "coder",
+            &session,
+            &execution,
+            None,
+            None,
+            serde_json::json!({}),
+        );
+        assert_eq!(dispatch.execution_id.as_ref(), Some(&execution));
+        assert_eq!(telemetry.execution_id.as_ref(), Some(&execution));
+        let route = build_session_record_with_payload(
+            darkmux_flow::Level::Info,
+            darkmux_flow::FlowAction::DispatchRoute,
+            "coder",
+            &session,
+            None,
+            None,
+        );
+        assert!(route.execution_id.is_none(), "a route decision is not a record of an execution");
+    }
+
     #[test]
     fn dispatch_record_omits_model_when_none() {
         // None model => field is absent from serialized JSON entirely
@@ -1888,7 +1974,7 @@ mod tests {
             darkmux_flow::Level::Info,
             darkmux_flow::FlowAction::DispatchStart,
             "coder",
-            &crate::test_session("session-no-model"),
+            &crate::test_session("session-no-model"), &darkmux_types::execution_id::ExecutionId::mint(),
             None,
             None,
             None,
@@ -1911,7 +1997,7 @@ mod tests {
             darkmux_flow::Level::Info,
             darkmux_flow::FlowAction::DispatchStart,
             "coder",
-            &crate::mission_test_session("pre-1.0-compat-sweep", "crew-dispatch-coder-99-internal"),
+            &crate::mission_test_session("pre-1.0-compat-sweep", "crew-dispatch-coder-99-internal"), &darkmux_types::execution_id::ExecutionId::mint(),
             Some("darkmux:qwen3.6"),
             Some("s694-profiles-schema"),
             None,
@@ -1929,7 +2015,7 @@ mod tests {
             darkmux_flow::Level::Info,
             darkmux_flow::FlowAction::DispatchStart,
             "coder",
-            &crate::test_session("crew-dispatch-coder-99-internal"),
+            &crate::test_session("crew-dispatch-coder-99-internal"), &darkmux_types::execution_id::ExecutionId::mint(),
             Some("darkmux:qwen3.6"),
             None,
             None,
@@ -1952,7 +2038,7 @@ mod tests {
             darkmux_flow::FlowAction::TelemetryRuntime,
             "runtime",
             "coder",
-            &crate::mission_test_session("pre-1.0-compat-sweep", "sess-1"),
+            &crate::mission_test_session("pre-1.0-compat-sweep", "sess-1"), &darkmux_types::execution_id::ExecutionId::mint(),
             Some("darkmux:qwen3.6"),
             Some("s694-profiles-schema"),
             serde_json::json!({ "turns": 9 }),
@@ -1970,7 +2056,7 @@ mod tests {
             darkmux_flow::Level::Info,
             darkmux_flow::FlowAction::DispatchComplete,
             "coder",
-            &crate::test_session("session-abc"),
+            &crate::test_session("session-abc"), &darkmux_types::execution_id::ExecutionId::mint(),
             Some("darkmux:foo"),
             None,
             None,
@@ -1979,7 +2065,7 @@ mod tests {
             darkmux_flow::Level::Error,
             darkmux_flow::FlowAction::DispatchError,
             "coder",
-            &crate::test_session("session-abc"),
+            &crate::test_session("session-abc"), &darkmux_types::execution_id::ExecutionId::mint(),
             Some("darkmux:foo"),
             None,
             None,
@@ -2007,7 +2093,7 @@ mod action_vocabulary_conformance {
             (darkmux_flow::FlowAction::DispatchError, "dispatch.error"),
         ] {
             let rec = build_dispatch_record_with_payload(
-                darkmux_flow::Level::Info, action.clone(), "coder", &crate::test_session("sess-1"), Some("m"), None, None,
+                darkmux_flow::Level::Info, action.clone(), "coder", &crate::test_session("sess-1"), &darkmux_types::execution_id::ExecutionId::mint(), Some("m"), None, None,
             );
             let line = serde_json::to_string(&rec).unwrap();
             let v: serde_json::Value = serde_json::from_str(&line).unwrap();

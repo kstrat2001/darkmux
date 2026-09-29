@@ -355,7 +355,7 @@ pub(crate) enum Cmd {
         #[command(subcommand)]
         sub: RoleCmd,
     },
-    /// Findings (#2265) — what a dispatch OBSERVED, keyed `<dispatch>/<seq>`.
+    /// Findings (#2265) — what a role execution OBSERVED, keyed `<execution>/<seq>`.
     /// A finding is an event: written once when an accepted `create_finding`
     /// call streams past, never rewritten. The flow stream stays the audit
     /// trail; this store is the queryable copy the verbs read. darkmux never
@@ -567,16 +567,16 @@ pub(crate) enum FindingCmd {
         /// Only findings whose recorded context names this mission.
         #[arg(long)]
         mission: Option<String>,
-        /// Only findings from this dispatch (the key's first half).
+        /// Only findings from this role execution (the key's first half).
         #[arg(long)]
-        dispatch: Option<String>,
+        execution: Option<String>,
         /// Only findings whose recorded context names this rule.
         #[arg(long)]
         rule: Option<String>,
         #[command(flatten)]
         json: JsonFlag,
     },
-    /// Show one finding, whole, by its `<dispatch>/<seq>` key.
+    /// Show one finding, whole, by its `<execution>/<seq>` key.
     Show {
         /// The finding key, e.g. `sess-abc/1`.
         key: String,

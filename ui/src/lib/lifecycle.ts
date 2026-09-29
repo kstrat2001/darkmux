@@ -20,9 +20,14 @@
  *    first opening record (a bookend start, `run.start` or
  *    `dispatch.start`; a `budget.wait`, a `mission.start`, a `step.start`;
  *    or, when nothing opened yet, any turn, heartbeat, tool call or rest).
- *    A record naming a mission joins that mission's latest attempt; one
- *    naming none joins the latest attempt still open at its time, or the
- *    latest opened when none is. A bookend start in an attempt that
+ *    A record of an execution (every execution-grain record carries its
+ *    `execution_id`; a pre-4.0 one reads as its session and mission) joins
+ *    the latest attempt of that execution, so a session holding several (a
+ *    map's items) keeps each one's records and its own close apart. Any
+ *    other record, and one of an execution with no attempt yet, joins by
+ *    mission: a record naming a mission joins that mission's latest
+ *    attempt; one naming none joins the latest attempt still open at its
+ *    time, or the latest opened when none is. A bookend start in an attempt that
  *    already has one, or any reopening record after the attempt closed,
  *    starts the next attempt (a relaunch under the same id). The attempt
  *    current as of t is the latest one opened by t.
@@ -53,7 +58,7 @@
  *    any of them is.
  */
 
-import { ACTION, byTime, isAsOf, isAtOrAfter, isBookendStart, isBookendTerminal, latestByTime, recordsAsOf, type NormAction, type NormRecord } from "./ingest";
+import { ACTION, byTime, isAsOf, isAtOrAfter, isBookendStart, isBookendTerminal, isExecutionAction, latestByTime, recordsAsOf, type NormAction, type NormRecord } from "./ingest";
 import type { RunState } from "./flow";
 import type { RunGroup, RunRecords } from "./runRef";
 import type { RunsPolicy } from "../types/generated/RunsPolicy";
@@ -152,6 +157,9 @@ export interface Attempt {
   /** The mission its records name (the first that names one); `null` when
    *  none does. */
   readonly missionId: string | null;
+  /** The execution of its first record that is of one; `null` for an
+   *  attempt no execution has touched (a run's, a step's). */
+  readonly executionId: string | null;
   /** Its place among its SESSION's attempts, every mission's together. */
   readonly index: number;
 }
@@ -217,7 +225,8 @@ function closeEdgeOf(r: NormRecord): CloseEdge | null {
   }
 }
 
-const isClosing = (r: NormRecord): boolean => closeEdgeOf(r) !== null;
+/** Whether a record closes the attempt it belongs to (rule 2). */
+export const isClosing = (r: NormRecord): boolean => closeEdgeOf(r) !== null;
 
 interface Building {
   opening: NormRecord;
@@ -226,7 +235,14 @@ interface Building {
   close: NormRecord | null;
   skewed: boolean;
   missionId: string | null;
+  executionId: string | null;
   index: number;
+}
+
+/** The last attempt of execution `x`. */
+function latestOfExecution(attempts: readonly Building[], x: string): Building | null {
+  for (let i = attempts.length - 1; i >= 0; i--) if (attempts[i].executionId === x) return attempts[i];
+  return null;
 }
 
 /** The last attempt of mission `m`. */
@@ -241,12 +257,15 @@ function latestOpen(attempts: readonly Building[]): Building | null {
   return null;
 }
 
-/** The attempt a record joins (rule 1): a record naming a mission joins
+/** The attempt a record joins (rule 1): a record of an execution joins that
+ *  execution's latest attempt; otherwise a record naming a mission joins
  *  that mission's latest attempt, or adopts the current attempt when that
  *  one names no mission yet; a record naming none joins the latest attempt
  *  still open at its time, or the latest opened when none is. `null`: it
  *  belongs to no attempt yet. */
-function targetFor(attempts: readonly Building[], m: string | null): Building | null {
+function targetFor(attempts: readonly Building[], m: string | null, x: string | null): Building | null {
+  const own = x === null ? null : latestOfExecution(attempts, x);
+  if (own) return own;
   const cur = attempts.at(-1) ?? null;
   if (!m) return latestOpen(attempts) ?? cur;
   return latestOf(attempts, m) ?? (cur && cur.missionId === null ? cur : null);
@@ -261,9 +280,10 @@ function opensAttempt(mine: Building | null, r: NormRecord): boolean {
   return isBookendStart(r.action) && mine.start !== null;
 }
 
-function add(cur: Building, r: NormRecord, m: string | null): void {
+function add(cur: Building, r: NormRecord, m: string | null, x: string | null): void {
   cur.records.push(r);
   if (cur.missionId === null && m) cur.missionId = m;
+  if (cur.executionId === null) cur.executionId = x;
   if (isBookendStart(r.action) && cur.start === null) cur.start = r;
   if (cur.close === null && isClosing(r)) cur.close = r;
 }
@@ -302,12 +322,13 @@ export function segmentSession(records: readonly NormRecord[]): SessionSegments 
   const strays = new Map<string | null, NormRecord[]>();
   for (const r of [...records].sort(byTime)) {
     const m = r.mission_id || null;
-    let target = targetFor(attempts, m);
+    const x = isExecutionAction(r.action) ? (r.execution_id ?? null) : null;
+    let target = targetFor(attempts, m, x);
     if (opensAttempt(target, r)) {
-      target = { opening: r, start: null, records: [], close: null, skewed: false, missionId: m, index: attempts.length };
+      target = { opening: r, start: null, records: [], close: null, skewed: false, missionId: m, executionId: null, index: attempts.length };
       attempts.push(target);
     }
-    if (target) add(target, r, m);
+    if (target) add(target, r, m, x);
     else pushStray(strays, m, r);
   }
   return { attempts, strays: placeStrays(attempts, strays) };

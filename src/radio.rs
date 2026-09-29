@@ -354,12 +354,11 @@ fn emit_route_record(text: &str, surface: RadioSurface, decision: &RouteDecision
             payload["error"] = serde_json::json!(error);
         }
     }
-    let record = crate::crew::dispatch::build_dispatch_record_with_payload(
+    let record = crate::crew::dispatch::build_session_record_with_payload(
         crate::flow::Level::Info,
         darkmux_flow::FlowAction::RadioRoute,
         crate::crew::loader::RADIO_ROUTER_ROLE_ID,
         &radio_session(crate::crew::loader::RADIO_ROUTER_ROLE_ID),
-        None,
         None,
         Some(payload),
     );

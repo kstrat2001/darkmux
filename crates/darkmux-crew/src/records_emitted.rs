@@ -33,6 +33,7 @@
 //! disk-scanning wrapper ([`records_emitted_for_mission`]) around it.
 
 use darkmux_flow::{FlowAction, FlowRecord};
+use darkmux_types::execution_id::ExecutionId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -69,19 +70,19 @@ pub struct RecordsEmitted {
     #[serde(default)]
     pub total_bytes: u64,
     /// Sum of (terminal ts − start ts) over the mission's own execution
-    /// bookend pairs (`dispatch.*`), paired by `session_id`. The run's own
+    /// bookend pairs (`dispatch.*`), paired by `execution_id`. The run's own
     /// bookend (`run.*`, opened around the whole `launch()` call and closed
     /// only after finalize returns) is a different grain and never pairs
     /// here: counting it would add the mission's whole wall time, still
     /// open when finalize runs. An unpaired ("open") seat dispatch — including
     /// one superseded by a second `dispatch start` on the same
-    /// `session_id` before ever seeing a terminal — counts to the
+    /// `execution_id` before ever seeing a terminal — counts to the
     /// finalize-time clock passed to [`aggregate_records_emitted`]; see
     /// `open_dispatches`.
     #[serde(default)]
     pub dispatch_seconds: f64,
     /// Count of dispatch bookend pairs actually matched (a `dispatch
-    /// start` paired with a later terminal on the same `session_id`) —
+    /// start` paired with a later terminal of the same `execution_id`) —
     /// contributes to `dispatch_seconds`. Distinguishes "zero dispatch
     /// seconds because there were no dispatches" (`dispatch_pairs == 0 &&
     /// open_dispatches == 0`) from "zero because every one is still open"
@@ -92,7 +93,7 @@ pub struct RecordsEmitted {
     /// credited to `dispatch_seconds` via the finalize-time clock rather
     /// than dropped. Includes both a start still open when the scan ends
     /// AND an earlier start superseded by a second `dispatch start` on the
-    /// same `session_id` (flushed to finalize time at the moment of the
+    /// same `execution_id` (flushed to finalize time at the moment of the
     /// second start, since no later terminal can retroactively close it).
     /// The run's own bookend is not an execution and never counts here (see
     /// `dispatch_seconds`'s doc), though it is still open at aggregation.
@@ -198,7 +199,7 @@ const DAY_MARGIN_DAYS: i64 = 1;
 /// finalize-time clock, used to close an OPEN dispatch bookend (a `dispatch
 /// start` with no matching terminal) at "now" rather than dropping it.
 ///
-/// Execution bookends (`dispatch.*`) pair by `session_id`, matched on
+/// Execution bookends (`dispatch.*`) pair by `execution_id`, matched on
 /// [`darkmux_flow::FlowAction`]; a pre-4.0 spaced spelling reads as the same
 /// action (#2425).
 ///
@@ -211,7 +212,7 @@ const DAY_MARGIN_DAYS: i64 = 1;
 /// reads as `run.start` through [`darkmux_flow::reader`], so it never pairs
 /// either.
 ///
-/// **A repeated `dispatch start` on the same `session_id` with no terminal
+/// **A repeated `dispatch start` on the same `execution_id` with no terminal
 /// in between** does not silently overwrite the earlier one: the earlier
 /// segment is flushed to `finalize_secs` (same treatment as a genuinely
 /// open dispatch — see `RecordsEmitted::open_dispatches`'s doc) before the
@@ -232,7 +233,7 @@ pub fn aggregate_records_emitted(lines: &[(FlowRecord, u64)], mission_id: &str, 
     let mut first_ts: Option<i64> = None;
     let mut last_ts: Option<i64> = None;
     let mut machine_uid: Option<String> = None;
-    let mut open_starts: BTreeMap<String, i64> = BTreeMap::new();
+    let mut open_starts: BTreeMap<ExecutionId, i64> = BTreeMap::new();
     let mut dispatch_seconds: f64 = 0.0;
     let mut dispatch_pairs: u64 = 0;
     let mut open_dispatches: u64 = 0;
@@ -255,18 +256,19 @@ pub fn aggregate_records_emitted(lines: &[(FlowRecord, u64)], mission_id: &str, 
         }
 
         if rec.action == FlowAction::DispatchStart {
-            if let (Some(sid), Some(ts)) = (rec.session_id.clone(), ts) {
-                if let Some(prev_start) = open_starts.insert(sid, ts) {
-                    // A repeat start for this session with no terminal in
-                    // between — flush the EARLIER segment to finalize time
-                    // rather than losing it to the overwrite.
+            if let (Some(execution), Some(ts)) = (rec.execution_id.clone(), ts) {
+                if let Some(prev_start) = open_starts.insert(execution, ts) {
+                    // A repeat start for this execution with no terminal in
+                    // between (a resumed dispatch) — flush the EARLIER
+                    // segment to finalize time rather than losing it to the
+                    // overwrite.
                     dispatch_seconds += (finalize_secs - prev_start).max(0) as f64;
                     open_dispatches += 1;
                 }
             }
         } else if matches!(rec.action, FlowAction::DispatchComplete | FlowAction::DispatchError) {
-            if let Some(sid) = &rec.session_id {
-                if let Some(start_ts) = open_starts.remove(sid) {
+            if let Some(execution) = &rec.execution_id {
+                if let Some(start_ts) = open_starts.remove(execution) {
                     dispatch_pairs += 1;
                     if let Some(ts) = ts {
                         dispatch_seconds += (ts - start_ts).max(0) as f64;
@@ -419,6 +421,8 @@ mod tests {
         session_id: Option<&str>,
         machine_uid: Option<&str>,
     ) -> FlowRecord {
+        let execution_id = (action.grain() == Some(darkmux_flow::Grain::Execution))
+            .then(|| darkmux_types::execution_id::ExecutionId::legacy(session_id, mission_id, ts, "role", ""));
         FlowRecord {
             ts: ts.to_string(),
             level: darkmux_flow::Level::Info,
@@ -429,6 +433,8 @@ mod tests {
             handle: "role".to_string(),
             phase_id: None,
             session_id: session_id.map(String::from),
+            // What the reader gives a record of an execution that names none.
+            execution_id,
             source: None,
             model: None,
             reasoning: None,
@@ -450,6 +456,28 @@ mod tests {
 
     // ── aggregate_records_emitted — pure core ───────────────────────────
 
+    /// Two executions in one session (a map's items) pair each with its own
+    /// terminal, whatever order they interleave in: they are two executions,
+    /// not one session flushed by its own second start.
+    #[test]
+    fn executions_sharing_a_session_pair_by_execution_not_by_session() {
+        let named = |ts: &str, action, exec: &str| {
+            let mut r = rec(ts, action, Some("m1"), Some("m1.task.t"), None);
+            r.execution_id = Some(darkmux_types::execution_id::ExecutionId::parse(exec).unwrap());
+            line(r)
+        };
+        use darkmux_flow::FlowAction as A;
+        let lines = vec![
+            named("2023-11-14T10:00:00Z", A::DispatchStart, "exec-a"),
+            named("2023-11-14T10:00:02Z", A::DispatchStart, "exec-b"),
+            named("2023-11-14T10:00:05Z", A::DispatchComplete, "exec-b"),
+            named("2023-11-14T10:00:10Z", A::DispatchComplete, "exec-a"),
+        ];
+        let got = aggregate_records_emitted(&lines, "m1", 0);
+        assert_eq!((got.dispatch_pairs, got.open_dispatches), (2, 0), "{got:?}");
+        assert_eq!(got.dispatch_seconds, 13.0, "a: 10s, b: 3s");
+    }
+
     #[test]
     fn counts_only_the_target_missions_records_from_an_interleaved_file() {
         let lines = vec![
@@ -469,7 +497,7 @@ mod tests {
     }
 
     #[test]
-    fn bookends_pair_by_session_id() {
+    fn bookends_pair_by_execution_id() {
         let lines = vec![
             line(rec("2023-11-14T10:00:00Z", darkmux_flow::FlowAction::DispatchStart, Some("m1"), Some("s1"), None)),
             line(rec("2023-11-14T10:00:10Z", darkmux_flow::FlowAction::DispatchComplete, Some("m1"), Some("s1"), None)),
@@ -873,6 +901,7 @@ mod cost_check {
                     handle: "coder".to_string(),
                     phase_id: None,
                     session_id: session,
+                    execution_id: None,
                     source: None,
                     model: None,
                     reasoning: None,

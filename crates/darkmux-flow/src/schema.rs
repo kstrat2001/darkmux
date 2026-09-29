@@ -75,6 +75,26 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
 //           (the retired review launcher's), as `run.*`
 //           (`darkmux_flow::legacy::run_grain_of`); no file is rewritten.
 //
+//           Also (4.0, CLAUDE.md contract 8): every record of a role
+//           execution names it. `execution_id` (`darkmux_types::
+//           execution_id::ExecutionId`, minted once per execution by the
+//           host entry that runs it: a container or hosted dispatch, a
+//           `dispatch.single_shot` step, each `dispatch.map` ITEM) is on the
+//           `dispatch.*` bookends, turns, tool calls, `telemetry.*` records
+//           and `budget.*` records of that execution, and on nothing else;
+//           `FlowAction::grain` declares which actions those are, and no
+//           sink writes one without it. A resumed dispatch keeps its
+//           execution's id (recorded in its out-dir's `resume_origin.json`);
+//           a specialist change is a new execution. A `dispatch.map` step no
+//           longer writes a `dispatch.*` pair around the whole step: each
+//           item writes its own, with `payload.item_index`. A reader of a
+//           pre-4.0 archive gives a record of an execution that names none
+//           `legacy:<session>:<mission>` (or, with no session, `legacy::
+//           <mission>:<ts>:<handle>:<machine_uid>`), `darkmux_flow::legacy::execution_of`;
+//           no file is rewritten. Findings are filed under it too:
+//           `<execution_id>/<emit_seq>` (a pre-4.0 record's address is
+//           unchanged).
+//
 //           Also removed (4.0, one token truth): `dispatch.complete`'s
 //           `cumulative_prompt_tokens` / `cumulative_completion_tokens`.
 //           Their only source was the runtime's `metrics.json`, which 4.0
@@ -2154,6 +2174,13 @@ pub struct FlowRecord {
     pub phase_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// The role execution this record is about: set on every record whose
+    /// action is execution-grain (`FlowAction::grain`), never on any other.
+    /// A session names the run; this names which execution inside it (a
+    /// task session holds one per `dispatch.map` item). Schema 2.0 addition.
+    /// A pre-4.0 record carries none; `crate::reader` synthesizes one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<darkmux_types::execution_id::ExecutionId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     /// LMStudio model id that handled this work, when known. Set on
@@ -2276,6 +2303,7 @@ impl FlowRecord {
             handle: handle.into(),
             phase_id: None,
             session_id: Some(session.wire()),
+            execution_id: None,
             source: None,
             model: None,
             reasoning: None,
@@ -2287,6 +2315,25 @@ impl FlowRecord {
             payload: None,
             work_id: None,
             attempt: None,
+        }
+    }
+}
+
+impl FlowRecord {
+    /// [`FlowRecord::for_session`] for a record OF one role execution: the
+    /// only place an execution id is put on a record.
+    pub fn for_execution(
+        session: &darkmux_types::session_id::SessionId,
+        execution: &darkmux_types::execution_id::ExecutionId,
+        level: Level,
+        category: Category,
+        stage: Stage,
+        action: crate::FlowAction,
+        handle: impl Into<String>,
+    ) -> Self {
+        FlowRecord {
+            execution_id: Some(execution.clone()),
+            ..FlowRecord::for_session(session, level, category, stage, action, handle)
         }
     }
 }

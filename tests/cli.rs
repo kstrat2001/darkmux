@@ -2874,7 +2874,7 @@ fn dispatch_finding_refuses_a_key_with_no_stored_record() {
         .args(["dispatch", "health-research", "--finding", "not-a-key", "smoke"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("<dispatch>/<seq>"));
+        .stderr(predicate::str::contains("<execution>/<seq>"));
 }
 
 /// (#2295) The same refusal rule for the second record kind: `dispatch --mod
@@ -8123,7 +8123,7 @@ fn a_template_grows_one_dispatch_per_finding_carrying_its_key_in_brief_refs() {
 
 // ─── `finding` family (#2265) ────────────────────────────────────────────
 //
-// The finding record is what was observed: an event, keyed `<dispatch>/<seq>`,
+// The finding record is what was observed: an event, keyed `<execution>/<seq>`,
 // written once and never rewritten. `finding sync` is the SECOND producer —
 // it replays the flow stream for anything the live tailer missed (an older
 // binary, a killed process) and must be idempotent, because the tailer and it
@@ -8269,17 +8269,17 @@ fn finding_sync_materializes_then_is_idempotent_and_list_show_read_the_store() {
     // `--dispatch` narrows to one dispatch. Unpinned, the filter could be
     // `.filter(|_| true)` and nothing would notice.
     assert_eq!(
-        mission_ids(&["finding", "list", "--dispatch", "sess-b", "--json"]),
+        mission_ids(&["finding", "list", "--execution", "sess-b", "--json"]),
         vec!["sess-b/2".to_string()],
         "--dispatch must return exactly that dispatch's findings"
     );
     assert!(
-        mission_ids(&["finding", "list", "--dispatch", "sess-nope", "--json"]).is_empty(),
+        mission_ids(&["finding", "list", "--execution", "sess-nope", "--json"]).is_empty(),
         "an unknown dispatch returns none"
     );
     // …and the three filters compose rather than replacing each other.
     assert!(
-        mission_ids(&["finding", "list", "--mission", "crawl-1", "--dispatch", "sess-b", "--json"])
+        mission_ids(&["finding", "list", "--mission", "crawl-1", "--execution", "sess-b", "--json"])
             .is_empty(),
         "filters compose: sess-b is not in crawl-1"
     );
@@ -11274,7 +11274,7 @@ fn the_wait_command_fails_fast_when_mod_list_itself_errors() {
     let stub = stub_dir.path().join("fake-darkmux");
     fs::write(
         &stub,
-        "#!/bin/sh\nprintf 'not a finding key: \"not-a-valid-key\" (expected <dispatch>/<seq>, e.g. sess-abc/1)\\n' >&2\nexit 42\n",
+        "#!/bin/sh\nprintf 'not a finding key: \"not-a-valid-key\" (expected <execution>/<seq>, e.g. sess-abc/1)\\n' >&2\nexit 42\n",
     )
     .unwrap();
     {
@@ -11283,7 +11283,7 @@ fn the_wait_command_fails_fast_when_mod_list_itself_errors() {
     }
 
     let started = std::time::Instant::now();
-    // Not `<dispatch>/<seq>` — real `mods::canonical_finding_key` would
+    // Not `<execution>/<seq>` — real `mods::canonical_finding_key` would
     // refuse this before the store is even read; the stub mirrors that
     // shape with a distinctive exit code instead of the real one (see doc
     // comment above for why).

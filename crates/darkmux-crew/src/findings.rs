@@ -1,7 +1,7 @@
 //! (#2265) The FINDING record: what was observed, stored once, never rewritten.
 //!
 //! A finding is an EVENT. It happened at a moment, from a dispatch, and it is
-//! never edited afterwards. Its key is `<dispatch>/<seq>` — the dispatch's
+//! never edited afterwards. Its key is `<execution>/<seq>` — the dispatch's
 //! session id plus the ordinal of the acceptance within that dispatch — which
 //! every finding has, crawl or not. A crawl adds `context` (mission, unit,
 //! rule, source, sha) when it launches the dispatch; nothing about a finding
@@ -44,12 +44,12 @@ pub const FINDING_TOOL_NAMES: [&str; 2] = ["create_finding", "report_finding"];
 /// leading dot, an empty string. A refusal is loud (an error, a counted skip);
 /// nothing is silently rewritten, because a rewritten id would no longer
 /// address the finding it names.
-pub fn is_safe_dispatch_segment(dispatch: &str) -> bool {
-    !dispatch.is_empty()
-        && !dispatch.starts_with('.')
-        && !dispatch.contains('/')
-        && !dispatch.contains('\\')
-        && !dispatch.contains('\0')
+pub fn is_safe_execution_segment(execution: &str) -> bool {
+    !execution.is_empty()
+        && !execution.starts_with('.')
+        && !execution.contains('/')
+        && !execution.contains('\\')
+        && !execution.contains('\0')
 }
 
 /// Whether a tool name produces a finding record.
@@ -78,14 +78,18 @@ pub struct Scope {
     pub step_id: Option<String>,
 }
 
-/// One finding, as stored at `<findings dir>/<dispatch>/<seq>/finding.json`.
+/// One finding, as stored at `<findings dir>/<execution>/<seq>/finding.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FindingRecord {
-    /// `<dispatch>/<seq>` — the address every other surface uses.
+    /// `<execution>/<seq>` — the address every other surface uses.
     pub key: String,
-    /// The dispatch's session id.
-    pub dispatch: String,
-    /// The accepted call's `emit_seq` within that dispatch.
+    /// The role execution that recorded it: the key's first half. A record
+    /// written before 4.0 names the dispatch's session id here instead (its
+    /// old field was `dispatch`, read through the alias, and its key is
+    /// unchanged): the store's addresses are never rewritten.
+    #[serde(alias = "dispatch")]
+    pub execution: String,
+    /// The accepted call's `emit_seq` within that execution.
     pub seq: u64,
     /// When the RECORD was written (not when the dispatch started).
     pub ts: String,
@@ -150,13 +154,13 @@ pub fn findings_dir() -> PathBuf {
 }
 
 /// The directory one finding lives in.
-pub fn record_dir_at(root: &Path, dispatch: &str, seq: u64) -> PathBuf {
-    root.join(dispatch).join(seq.to_string())
+pub fn record_dir_at(root: &Path, execution: &str, seq: u64) -> PathBuf {
+    root.join(execution).join(seq.to_string())
 }
 
 /// The file one finding lives at.
-pub fn record_path_at(root: &Path, dispatch: &str, seq: u64) -> PathBuf {
-    record_dir_at(root, dispatch, seq).join("finding.json")
+pub fn record_path_at(root: &Path, execution: &str, seq: u64) -> PathBuf {
+    record_dir_at(root, execution, seq).join("finding.json")
 }
 
 /// Strip the container-path prefix off a path a model reported (#2361).
@@ -223,7 +227,7 @@ fn map_emitted_paths(source_id: &str, mut emitted: serde_json::Value) -> serde_j
 /// recorded on the record so the container path stays reconstructible.
 #[allow(clippy::too_many_arguments)]
 pub fn build_record(
-    dispatch: &str,
+    execution: &str,
     seq: u64,
     ts: String,
     tool_name: &str,
@@ -238,8 +242,8 @@ pub fn build_record(
         None => emitted,
     };
     FindingRecord {
-        key: format!("{dispatch}/{seq}"),
-        dispatch: dispatch.to_string(),
+        key: format!("{execution}/{seq}"),
+        execution: execution.to_string(),
         seq,
         ts,
         tool_name: tool_name.to_string(),
@@ -264,11 +268,11 @@ pub fn materialize(root: &Path, record: &FindingRecord) -> Result<Materialized> 
     // the stream, so a producer that never parsed a key still cannot write
     // outside the store.
     anyhow::ensure!(
-        is_safe_dispatch_segment(&record.dispatch),
-        "refusing to write a finding under an unsafe dispatch id {:?}",
-        record.dispatch
+        is_safe_execution_segment(&record.execution),
+        "refusing to write a finding under an unsafe execution id {:?}",
+        record.execution
     );
-    let path = record_path_at(root, &record.dispatch, record.seq);
+    let path = record_path_at(root, &record.execution, record.seq);
     if path.exists() {
         return Ok(Materialized::AlreadyPresent);
     }
@@ -310,9 +314,9 @@ pub fn materialize(root: &Path, record: &FindingRecord) -> Result<Materialized> 
     }
 }
 
-/// Read one finding by `<dispatch>/<seq>`.
-pub fn load_at(root: &Path, dispatch: &str, seq: u64) -> Result<Option<FindingRecord>> {
-    let path = record_path_at(root, dispatch, seq);
+/// Read one finding by `<execution>/<seq>`.
+pub fn load_at(root: &Path, execution: &str, seq: u64) -> Result<Option<FindingRecord>> {
+    let path = record_path_at(root, execution, seq);
     if !path.exists() {
         return Ok(None);
     }
@@ -378,13 +382,13 @@ pub fn append_to_brief(
     let mut brief = message.to_string();
     let mut appended = Vec::new();
     for key in keys {
-        let (dispatch, seq) = parse_key(key).with_context(|| {
+        let (execution, seq) = parse_key(key).with_context(|| {
             format!(
-                "--finding {key:?} is not a finding key. A key is `<dispatch>/<seq>`, \
+                "--finding {key:?} is not a finding key. A key is `<execution>/<seq>`, \
                  e.g. `sess-abc/1` — `darkmux finding list` shows what is stored."
             )
         })?;
-        let record = load_at(root, &dispatch, seq)?.with_context(|| {
+        let record = load_at(root, &execution, seq)?.with_context(|| {
             format!(
                 "no finding {key} under {}\n  `darkmux finding sync` replays the flow \
                  stream into the store.",
@@ -398,16 +402,16 @@ pub fn append_to_brief(
     Ok((brief, appended))
 }
 
-/// Split a `<dispatch>/<seq>` key. The dispatch half may itself contain no
+/// Split a `<execution>/<seq>` key. The dispatch half may itself contain no
 /// slash (session ids never do), so the split is on the LAST separator.
 pub fn parse_key(key: &str) -> Option<(String, u64)> {
-    let (dispatch, seq) = key.rsplit_once('/')?;
+    let (execution, seq) = key.rsplit_once('/')?;
     // The dispatch half becomes a path segment, so it is validated HERE rather
     // than at the join: `finding show '../x/1'` must not read outside the store.
-    if !is_safe_dispatch_segment(dispatch) {
+    if !is_safe_execution_segment(execution) {
         return None;
     }
-    Some((dispatch.to_string(), seq.parse().ok()?))
+    Some((execution.to_string(), seq.parse().ok()?))
 }
 
 /// Every finding in the store, ts-ascending. Unreadable or unparseable files
@@ -418,12 +422,12 @@ pub fn load_all_at(root: &Path) -> Result<Vec<FindingRecord>> {
     if !root.exists() {
         return Ok(out);
     }
-    let dispatch_dirs = match std::fs::read_dir(root) {
+    let execution_dirs = match std::fs::read_dir(root) {
         Ok(d) => d,
         Err(_) => return Ok(out),
     };
-    for dispatch_entry in dispatch_dirs.flatten() {
-        let seq_dirs = match std::fs::read_dir(dispatch_entry.path()) {
+    for execution_entry in execution_dirs.flatten() {
+        let seq_dirs = match std::fs::read_dir(execution_entry.path()) {
             Ok(d) => d,
             Err(_) => continue,
         };
@@ -444,6 +448,19 @@ pub fn load_all_at(root: &Path) -> Result<Vec<FindingRecord>> {
 /// A top-level string field off a flow record, when it is present and a string.
 fn str_field(v: &serde_json::Value, field: &str) -> Option<String> {
     v.get(field).and_then(|x| x.as_str()).map(String::from)
+}
+
+/// The first half of the store key a flow record's finding is filed under:
+/// its execution's id. A record written before 4.0 names none (the reader
+/// gives it a synthesized one), and its finding was filed under the
+/// dispatch's session id, so that is where a replay files it again: an
+/// old finding is found at the address it always had, never twice.
+fn store_address_of(rec: &serde_json::Value) -> Option<String> {
+    let execution = str_field(rec, "execution_id")?;
+    match darkmux_types::execution_id::ExecutionId::parse(&execution).ok()?.is_legacy() {
+        true => str_field(rec, "session_id"),
+        false => Some(execution),
+    }
 }
 
 /// What one `finding sync` pass did.
@@ -526,26 +543,25 @@ pub fn sync_at(flows_dir: &Path, store_root: &Path, since: Option<&str>) -> Resu
                 report.skipped_no_emission += 1;
                 continue;
             }
-            let (Some(dispatch), Some(seq)) = (
-                rec.get("session_id")
-                    .and_then(|v| v.as_str())
+            let (Some(execution), Some(seq)) = (
+                store_address_of(&rec)
                     // An id that could escape the store is never joined onto a
                     // path — it is dropped here, before `materialize` has to
                     // refuse it, and counted like any other unaddressable call.
-                    .filter(|d| is_safe_dispatch_segment(d)),
+                    .filter(|d| is_safe_execution_segment(d)),
                 payload.get("emit_seq").and_then(|v| v.as_u64()),
             ) else {
-                // No `session_id` (or an unsafe one), or an `emitted` with no
+                // No execution to name (or an unsafe one), or an `emitted` with no
                 // `emit_seq` beside it (the tailer writes the pair together, so
                 // this is malformed). Either way there is no usable
-                // `<dispatch>/<seq>` to address the finding by, so it cannot
+                // `<execution>/<seq>` to address the finding by, so it cannot
                 // become a record — the same bucket, for the same reason, as a
                 // pre-1.33.0 call: counted and named, never silently dropped.
                 report.skipped_no_emission += 1;
                 continue;
             };
             let record = build_record(
-                dispatch,
+                &execution,
                 seq,
                 rec.get("ts").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
                 tool_name,
@@ -637,7 +653,7 @@ mod tests {
         let err = append_to_brief("fix this", &["sess-a/9".to_string()], root).unwrap_err();
         assert!(format!("{err:#}").contains("finding sync"), "{err:#}");
         let shape = append_to_brief("fix this", &["nope".to_string()], root).unwrap_err();
-        assert!(format!("{shape:#}").contains("<dispatch>/<seq>"), "{shape:#}");
+        assert!(format!("{shape:#}").contains("<execution>/<seq>"), "{shape:#}");
     }
 
     /// (#2361, PROVEN live on the 2026-09-05 live review run) The
@@ -746,9 +762,9 @@ mod tests {
         }
     }
 
-    fn rec_at(dispatch: &str, seq: u64, ts: &str) -> FindingRecord {
+    fn rec_at(execution: &str, seq: u64, ts: &str) -> FindingRecord {
         build_record(
-            dispatch,
+            execution,
             seq,
             ts.to_string(),
             "create_finding",
@@ -776,12 +792,12 @@ mod tests {
         assert_eq!(parse_key("sess-a/0"), Some(("sess-a".into(), 0)));
         assert_eq!(parse_key("no-slash"), None);
         assert_eq!(parse_key("sess-a/notanumber"), None);
-        assert_eq!(parse_key("/1"), None, "an empty dispatch is not a key");
+        assert_eq!(parse_key("/1"), None, "an empty execution is not a key");
         // The dispatch segment comes off the STREAM, so it is untrusted input
         // that ends up in a path. Anything that could escape the store is
         // refused rather than joined.
         assert_eq!(parse_key("../x/1"), None, "traversal must not resolve");
-        assert_eq!(parse_key("a/b/1"), None, "a nested dispatch is not a key");
+        assert_eq!(parse_key("a/b/1"), None, "a nested execution is not a key");
         assert_eq!(parse_key("../1"), None);
         assert_eq!(parse_key("./1"), None);
         assert_eq!(parse_key(".hidden/1"), None, "a leading dot is refused");
@@ -813,7 +829,7 @@ mod tests {
             let rec = rec_at(bad, 1, "2026-09-03T01:00:00Z");
             assert!(
                 materialize(tmp.path(), &rec).is_err(),
-                "an unsafe dispatch id must be refused, not joined: {bad:?}"
+                "an unsafe execution id must be refused, not joined: {bad:?}"
             );
         }
         // Nothing was created anywhere: a refusal happens BEFORE any path is
@@ -934,6 +950,57 @@ mod tests {
         // Idempotent: the store is write-once, so a replay creates nothing.
         let again = sync_at(&flows, &store, None).unwrap();
         assert_eq!((again.created, again.present), (0, 2), "{again:?}");
+    }
+
+    /// A flow line of one execution: the same shape as `flow_line`, naming its
+    /// execution.
+    fn exec_line(sess: &str, exec: &str, seq: u64) -> String {
+        let mut v: serde_json::Value = serde_json::from_str(&flow_line(sess, "create_finding", true, Some(serde_json::json!({"file": "a.ts"})), Some(seq))).unwrap();
+        v["execution_id"] = serde_json::json!(exec);
+        v.to_string()
+    }
+
+    /// Two executions in ONE session (a `dispatch.map`'s items, a resumed step)
+    /// each number their findings from 1: filed by session they would collide
+    /// and the second would be lost as "already present". Filed by execution
+    /// they are two records.
+    #[test]
+    fn two_executions_in_one_session_file_two_findings() {
+        let tmp = TempDir::new().unwrap();
+        let (flows, store) = (tmp.path().join("flows"), tmp.path().join("findings"));
+        write_day(&flows, "2026-09-03.jsonl", &[exec_line("m.task.t", "exec-a", 1), exec_line("m.task.t", "exec-b", 1)]);
+        let r = sync_at(&flows, &store, None).unwrap();
+        assert_eq!((r.created, r.present), (2, 0), "{r:?}");
+        assert!(store.join("exec-a").join("1").exists() && store.join("exec-b").join("1").exists());
+        assert!(!store.join("m.task.t").exists(), "the session is not the address");
+        assert_eq!(load_at(&store, "exec-b", 1).unwrap().unwrap().key, "exec-b/1");
+    }
+
+    /// A pre-4.0 flow record names no execution, and its finding was filed
+    /// under the session: a replay files it at that same address, so an old
+    /// finding is found where it always was and never stored twice.
+    #[test]
+    fn a_legacy_record_is_replayed_at_its_sessions_address() {
+        let tmp = TempDir::new().unwrap();
+        let (flows, store) = (tmp.path().join("flows"), tmp.path().join("findings"));
+        write_day(&flows, "2026-09-03.jsonl", &[flow_line("sess-old", "create_finding", true, Some(serde_json::json!({"file": "a.ts"})), Some(3))]);
+        // The store already holds the finding, filed by the pre-4.0 tailer.
+        materialize(&store, &rec_at("sess-old", 3, "2026-09-03T01:00:00Z")).unwrap();
+        let r = sync_at(&flows, &store, None).unwrap();
+        assert_eq!((r.created, r.present), (0, 1), "the replay finds the old address: {r:?}");
+    }
+
+    /// A record written before 4.0 has a `dispatch` field where a current one
+    /// has `execution`; both read, and the key is what it always was.
+    #[test]
+    fn a_pre_4_0_finding_record_still_reads() {
+        let old = r#"{"key":"sess-x/2","dispatch":"sess-x","seq":2,"ts":"t","tool_name":"create_finding",
+            "proposer":{"handle":"h","model":"m"},"context":null,"emitted":{},"schema_version":"1"}"#;
+        let rec: FindingRecord = serde_json::from_str(old).unwrap();
+        assert_eq!((rec.execution.as_str(), rec.key.as_str()), ("sess-x", "sess-x/2"));
+        let round = serde_json::to_value(&rec).unwrap();
+        assert_eq!(round["execution"], "sess-x");
+        assert!(round.get("dispatch").is_none(), "written under its current name");
     }
 
     #[test]

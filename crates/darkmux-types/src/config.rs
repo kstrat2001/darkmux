@@ -596,7 +596,7 @@ pub struct DirsConfig {
     /// once the same source feeds a consolidated view.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub lab: Option<String>,
     /// (#2265) Where finding records live — `<root>/findings` by default, one
-    /// `<dispatch>/<seq>/finding.json` per accepted `create_finding` call.
+    /// `<execution>/<seq>/finding.json` per accepted `create_finding` call.
     /// The flow stream stays the audit trail; this directory is the queryable
     /// copy `finding list` / `finding show` read, the same way roles are JSON
     /// on disk rather than a derived-only view.

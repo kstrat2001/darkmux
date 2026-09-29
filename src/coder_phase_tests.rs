@@ -52,6 +52,7 @@
             stdout: String::new(),
             stderr: String::new(),
             session_id: crate::test_session("s"),
+            execution: None,
             out_dir: Some(tmp.path().to_path_buf()),
             trajectory: Some(darkmux_trajectory::TrajectoryFold::from_lines(&completed(120, 10))),
         };

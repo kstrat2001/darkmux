@@ -2503,7 +2503,7 @@
     /// retired.
     #[test]
     fn forwarded_line_upgrades_a_retired_spelling_and_leaves_a_current_one_verbatim() {
-        let current = r#"{"z":1,"action":"dispatch.start"}"#.to_string();
+        let current = r#"{"z":1,"action":"dispatch.start","execution_id":"exec-1"}"#.to_string();
         assert_eq!(forwarded_line(current.clone()), current);
         // flow-action-guard:allow — an old spelling is this test's input
         let v: serde_json::Value = serde_json::from_str(&forwarded_line(r#"{"action":"mission close"}"#.to_string())).unwrap();

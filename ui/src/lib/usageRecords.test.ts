@@ -169,7 +169,20 @@ describe("the legacy fallback (a run with no usage records counts its complete)"
     expect(sumUsage(absentOnly)).toMatchObject({ total: 0, legacyCompletes: 0 });
   });
 
-  it("keys on the RUN (session_id, mission_id), not the bare session id", () => {
+  it("keys on the EXECUTION: a sibling's usage record does not hide another execution's complete", () => {
+    // Two executions in one task session (a map's items). Execution A has a
+    // usage record; execution B has only a legacy-shaped complete. Both count.
+    const named = (rec: NormRecord, execution: string): NormRecord => ({ ...rec, execution_id: execution });
+    const recs = [
+      named(usage("m.task.t", "s", { call_kind: CALL_KIND.map_item, total_tokens: 10 }, "m"), "exec-a"),
+      named(complete("m.task.t", { total_tokens: 10 }, "m"), "exec-a"),
+      named(complete("m.task.t", { total_tokens: 7 }, "m"), "exec-b"),
+    ];
+    expect(sumUsage(recs)).toMatchObject({ total: 17, usageRecords: 1, legacyCompletes: 1 });
+    expect(legacyCompleteCounts(recs).map((x) => x.execution_id)).toEqual(["exec-b"]);
+  });
+
+  it("keys a pre-4.0 record on its session and mission, the identity the reader gives it", () => {
     // Mission A has usage records; mission B under the same deterministic
     // session id has only a legacy complete. Both count.
     const recs = [

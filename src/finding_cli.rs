@@ -1,8 +1,8 @@
 //! `darkmux finding` (#2265) — read the finding store, and replay the flow
 //! stream into it.
 //!
-//! A finding is what was OBSERVED: an event from a dispatch, keyed
-//! `<dispatch>/<seq>`, written once and never rewritten. The flow stream stays
+//! A finding is what was OBSERVED: an event from a role execution, keyed
+//! `<execution>/<seq>`, written once and never rewritten. The flow stream stays
 //! the audit trail; this directory is the queryable copy, so JSON on disk is
 //! the truth the same way it is for roles.
 //!
@@ -24,7 +24,7 @@ const PREVIEW_CHARS: usize = 100;
 /// `finding list` — every record in the store, ts-ascending.
 pub fn list(
     mission: Option<&str>,
-    dispatch: Option<&str>,
+    execution: Option<&str>,
     rule: Option<&str>,
     json: bool,
 ) -> Result<i32> {
@@ -32,7 +32,7 @@ pub fn list(
     let all = findings::load_all_at(&root)?;
     let rows: Vec<&FindingRecord> = all
         .iter()
-        .filter(|r| dispatch.is_none_or(|d| r.dispatch == d))
+        .filter(|r| execution.is_none_or(|e| r.execution == e))
         // The mission is the RECORD's own field, not something inside the
         // launcher's `context` blob (which carries workspace / source / sha /
         // rule / unit and no mission at all). Reading it from `context` was
@@ -53,7 +53,7 @@ pub fn list(
         // An empty RESULT and an empty STORE need different remedies, so they
         // must not print the same line: one means "widen your filter", the
         // other means "nothing has been recorded here yet".
-        let filtered = mission.is_some() || dispatch.is_some() || rule.is_some();
+        let filtered = mission.is_some() || execution.is_some() || rule.is_some();
         if filtered && !all.is_empty() {
             println!("(no findings match — {} in the store)", all.len());
             return Ok(0);
@@ -99,14 +99,14 @@ pub fn list(
     Ok(0)
 }
 
-/// `finding show <dispatch>/<seq>` — one record, whole.
+/// `finding show <execution>/<seq>` — one record, whole.
 pub fn show(key: &str, json: bool) -> Result<i32> {
     let root = config_access::findings_dir();
-    let Some((dispatch, seq)) = findings::parse_key(key) else {
-        eprintln!("not a finding key: {key} (expected <dispatch>/<seq>, e.g. sess-abc/1)");
+    let Some((execution, seq)) = findings::parse_key(key) else {
+        eprintln!("not a finding key: {key} (expected <execution>/<seq>, e.g. sess-abc/1)");
         return Ok(1);
     };
-    let Some(rec) = findings::load_at(&root, &dispatch, seq)? else {
+    let Some(rec) = findings::load_at(&root, &execution, seq)? else {
         eprintln!(
             "no finding {key} under {}\n  `darkmux finding sync` replays the flow stream into the store.",
             root.display()
@@ -120,7 +120,7 @@ pub fn show(key: &str, json: bool) -> Result<i32> {
     }
 
     println!("finding   {}", rec.key);
-    println!("dispatch  {}", rec.dispatch);
+    println!("execution {}", rec.execution);
     println!("seq       {}", rec.seq);
     println!("recorded  {}", rec.ts);
     println!("tool      {}", rec.tool_name);

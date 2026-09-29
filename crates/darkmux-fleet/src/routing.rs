@@ -282,13 +282,14 @@ pub(crate) fn reply_to_dispatch_result(
                 stdout: crate::sanitize_remote_text(&reply.stdout.unwrap_or_default()),
                 stderr: crate::sanitize_remote_text(&reply.stderr.unwrap_or_default()),
                 session_id,
+                execution: None,
                 out_dir: None,
                 trajectory: None,
             }
         }
     };
     // The run's bookkeeping lands on the receiving machine.
-    DispatchResult { exit_code: 0, stdout, stderr: String::new(), session_id, out_dir: None, trajectory: None }
+    DispatchResult { exit_code: 0, stdout, stderr: String::new(), session_id, execution: None, out_dir: None, trajectory: None }
 }
 
 #[cfg(test)]
@@ -401,6 +402,7 @@ mod tests {
                 stdout: "injected stdout".to_string(),
                 stderr: String::new(),
                 session_id: crate::test_session("sess-injected"),
+                execution: None,
                 out_dir: None,
                 trajectory: None,
             })
@@ -677,7 +679,7 @@ mod tests {
         let mut seen = None;
         dispatch_routed_via(opts, |o| {
             seen = Some((o.profile_name.clone(), o.machine.clone()));
-            Ok(DispatchResult { exit_code: 0, stdout: String::new(), stderr: String::new(), session_id: crate::test_session("s"), out_dir: None, trajectory: None })
+            Ok(DispatchResult { exit_code: 0, stdout: String::new(), stderr: String::new(), session_id: crate::test_session("s"), execution: None, out_dir: None, trajectory: None })
         })
         .unwrap();
         assert_eq!(seen, Some((Some("host".to_string()), None)));

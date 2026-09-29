@@ -1846,3 +1846,28 @@ describe("tokensOffMeter — runKey injectivity", () => {
     // Without the separator both keys are "task-judgem1": cloud=1500 local=0.
   });
 });
+
+// (4.0) The DISPATCHES chip counts executions: a map step's items are one
+// execution each, so N items are N dispatches, whatever session they share.
+describe("tokensOffMeter: DISPATCHES counts executions", () => {
+  const item = (execution: string | undefined, endpoint: string, total: number): NormRecord[] => {
+    const common = { session_id: "m.task.probe", mission_id: "m", ...(execution ? { execution_id: execution } : {}) };
+    return [
+      rec({ ...common, action: "dispatch.start", payload: { endpoint } }),
+      rec({ ...common, category: "telemetry", source: "tokens", payload: { call_kind: "map_item", token_source: "provider", total_tokens: total } }),
+      rec({ ...common, action: "dispatch.complete", payload: { endpoint, result_class: "ok" } }),
+    ];
+  };
+
+  it("a 3-item map is three dispatches, each with its own tokens", () => {
+    const data = [...item("exec-1", "azure:a/gpt", 10), ...item("exec-2", "azure:b/gpt", 20), ...item("exec-3", "azure:c/gpt", 30)];
+    const t = tokensOffMeter(data);
+    expect(t.runs).toBe(3);
+    expect(t.total).toBe(60);
+  });
+
+  it("the same records with no execution id read as their session and mission: one dispatch, as before 4.0", () => {
+    const data = [...item(undefined, "azure:a/gpt", 10), ...item(undefined, "azure:a/gpt", 20), ...item(undefined, "azure:a/gpt", 30)];
+    expect(tokensOffMeter(data).runs).toBe(1);
+  });
+});

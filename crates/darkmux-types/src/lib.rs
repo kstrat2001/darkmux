@@ -14,6 +14,7 @@ pub mod dispatch_liveness;
 pub mod endpoint;
 #[cfg(any(test, feature = "test-support"))]
 pub mod env_audit;
+pub mod execution_id;
 #[cfg(unix)]
 pub mod flock;
 #[cfg(unix)]

@@ -55,6 +55,8 @@
 //!
 //! `usage_conformance` (tests) drives each one and holds the roster.
 
+use darkmux_types::execution_id::ExecutionId;
+
 /// The flow-record telemetry `source` every usage record carries.
 pub const USAGE_SOURCE: &str = "tokens";
 
@@ -217,7 +219,10 @@ pub fn utility_start_payload(
 /// `action` is [`darkmux_flow::FlowAction::UtilityStart`] or [`darkmux_flow::FlowAction::UtilityError`], `handle`
 /// the job's role id, the same attribution its usage record carries.
 pub fn utility_marker_record(action: darkmux_flow::FlowAction, job_role_id: &str, model: &str, payload: serde_json::Value) -> darkmux_flow::FlowRecord {
-    let mut rec = utility_usage_record(job_role_id, model, payload);
+    let mut rec = utility_usage_record(job_role_id, model, &ExecutionId::mint(), payload);
+    // A marker is not a record of the execution (its `job_id` pairs it with
+    // its job), so it carries no execution id.
+    rec.execution_id = None;
     if action == darkmux_flow::FlowAction::UtilityError {
         rec.level = darkmux_flow::Level::Warn;
     }
@@ -289,9 +294,11 @@ pub fn usage_payload(facts: &CallFacts<'_>, counts: &darkmux_trajectory::UsageCo
 /// utility job mints no session and writes no bookends (the amended
 /// contract 2), so `session_id` is `None` and `handle` is the JOB's role
 /// id (`radio-router`), the way a compactor call's record is attributed to
-/// `compactor`. Built here, beside the payload writer, so the record and
-/// its payload cannot drift apart.
-pub fn utility_usage_record(job_role_id: &str, model: &str, payload: serde_json::Value) -> darkmux_flow::FlowRecord {
+/// `compactor`. The job is one role execution of a utility role, so its
+/// record names the `execution` the caller minted for it. Built here,
+/// beside the payload writer, so the record and its payload cannot drift
+/// apart.
+pub fn utility_usage_record(job_role_id: &str, model: &str, execution: &ExecutionId, payload: serde_json::Value) -> darkmux_flow::FlowRecord {
     darkmux_flow::FlowRecord {
         ts: darkmux_flow::ts_utc_now(),
         level: darkmux_flow::Level::Info,
@@ -302,6 +309,7 @@ pub fn utility_usage_record(job_role_id: &str, model: &str, payload: serde_json:
         handle: job_role_id.to_string(),
         phase_id: None,
         session_id: None,
+        execution_id: Some(execution.clone()),
         source: Some(USAGE_SOURCE.to_string()),
         model: Some(model.to_string()),
         reasoning: None,

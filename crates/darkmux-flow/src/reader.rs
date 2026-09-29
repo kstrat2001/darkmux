@@ -41,26 +41,35 @@ pub enum ActionRead {
     Absent,
 }
 
-/// Rewrite a record's retired action spelling to its current one, in place.
+/// Rewrite a record's retired action spelling to its current one, in place,
+/// and give a pre-4.0 record of an execution its synthesized execution id
+/// ([`crate::legacy::stamp_execution`]).
 pub fn upgrade(record: &mut Value) -> ActionRead {
+    upgrade_noting_rewrite(record).0
+}
+
+/// [`upgrade`], and whether it changed the record in any way (a respelled
+/// action, or a synthesized execution id).
+fn upgrade_noting_rewrite(record: &mut Value) -> (ActionRead, bool) {
     let Some(read) = action_of(record) else {
-        return ActionRead::Absent;
+        return (ActionRead::Absent, false);
     };
+    let stamped = crate::legacy::stamp_execution(record, &read);
     match read {
-        FlowAction::Other(_) => return ActionRead::Unknown,
-        FlowAction::Retired(_) => return ActionRead::Retired,
+        FlowAction::Other(_) => return (ActionRead::Unknown, stamped),
+        FlowAction::Retired(_) => return (ActionRead::Retired, stamped),
         _ => {}
     }
     let wire = record["action"].as_str().unwrap_or_default();
     if read.as_str() == wire {
-        return ActionRead::Current;
+        return (ActionRead::Current, stamped);
     }
     let old = wire.to_string();
     record["action"] = Value::String(read.as_str().to_string());
     if let Some((key, detail)) = crate::legacy::detail_in_action(&old) {
         move_into_payload(record, key, detail);
     }
-    ActionRead::Upgraded
+    (ActionRead::Upgraded, true)
 }
 
 /// Put a value a retired action string carried into `payload.<key>`, unless
@@ -93,19 +102,17 @@ pub fn parse_value(line: &str) -> Option<Value> {
 }
 
 /// One raw JSONL line as a consumer that forwards lines should send it: the
-/// line itself, byte for byte, unless its action is a retired spelling, in
-/// which case the upgraded record re-serialized. `None` for a line that is
-/// not a JSON object.
+/// line itself, byte for byte, unless [`upgrade`] changed the record (a
+/// retired spelling, a synthesized execution id), in which case the upgraded
+/// record re-serialized. `None` for a line that is not a JSON object.
 pub fn upgrade_line(line: &str) -> Option<std::borrow::Cow<'_, str>> {
     let mut v: Value = serde_json::from_str(line).ok()?;
     if !v.is_object() {
         return None;
     }
-    Some(match upgrade(&mut v) {
-        ActionRead::Upgraded => std::borrow::Cow::Owned(v.to_string()),
-        ActionRead::Current | ActionRead::Retired | ActionRead::Unknown | ActionRead::Absent => {
-            std::borrow::Cow::Borrowed(line)
-        }
+    Some(match upgrade_noting_rewrite(&mut v) {
+        (_, true) => std::borrow::Cow::Owned(v.to_string()),
+        (_, false) => std::borrow::Cow::Borrowed(line),
     })
 }
 
@@ -293,6 +300,54 @@ mod tests {
         assert_eq!(upgrade(&mut sourceless), ActionRead::Current);
     }
 
+    /// Every arm of the pre-4.0 execution identity: a record OF an execution
+    /// that names none gets `legacy:{session}:{mission}` (or, sessionless,
+    /// its own `ts` and `handle`); one that names its own keeps it; a record
+    /// that is not of an execution, or of a run, gets none.
+    #[test]
+    fn a_pre_4_0_execution_record_reads_with_a_legacy_execution_id_per_arm() {
+        let stamped = |v: Value| -> Option<String> {
+            let mut v = v;
+            upgrade(&mut v);
+            v.get("execution_id").and_then(Value::as_str).map(str::to_string)
+        };
+        let of = |action: &str| json!({"action": action, "session_id": "task-t", "mission_id": "m1", "ts": "T", "handle": "h"});
+        for action in ["dispatch.start", "dispatch.complete", "dispatch.error", "dispatch.turn", "dispatch.tool", "telemetry.tokens", "budget.wait"] {
+            assert_eq!(stamped(of(action)).as_deref(), Some("legacy:task-t:m1"), "{action}");
+        }
+        // flow-action-guard:allow — an old spelling is this test's input
+        assert_eq!(stamped(of("dispatch start")).as_deref(), Some("legacy:task-t:m1"), "a spaced bookend");
+        let mut no_mission = of("dispatch.turn");
+        no_mission.as_object_mut().unwrap().remove("mission_id");
+        assert_eq!(stamped(no_mission).as_deref(), Some("legacy:task-t:"));
+        let sessionless = json!({"action": "telemetry.tokens", "ts": "2026-08-20T01:00:00Z", "handle": "radio-router", "machine_uid": "u1"});
+        assert_eq!(stamped(sessionless).as_deref(), Some("legacy:::2026-08-20T01:00:00Z:radio-router:u1"));
+        let named = json!({"action": "dispatch.turn", "session_id": "s", "execution_id": "exec-1"});
+        assert_eq!(stamped(named).as_deref(), Some("exec-1"), "a record's own id is never replaced");
+        for action in ["step.start", "step.result", "phase.start", "mission.start", "session.end", "run.start", "dispatch.route"] {
+            assert_eq!(stamped(of(action)), None, "{action} is not a record of an execution");
+        }
+        let mut whole_run = of("dispatch.start");
+        whole_run["source"] = json!("mission");
+        assert_eq!(stamped(whole_run), None, "a pre-4.0 whole-run bookend is a run, not an execution");
+    }
+
+    #[test]
+    fn a_stamped_line_is_forwarded_rewritten_and_a_named_one_byte_for_byte() {
+        let old = r#"{"action":"dispatch.turn","session_id":"s","mission_id":"m"}"#;
+        let up: Value = serde_json::from_str(&upgrade_line(old).unwrap()).unwrap();
+        assert_eq!(up["execution_id"], "legacy:s:m");
+        let named = r#"{"action":"dispatch.turn","session_id":"s","execution_id":"exec-1"}"#;
+        assert!(matches!(upgrade_line(named), Some(std::borrow::Cow::Borrowed(l)) if l == named));
+    }
+
+    #[test]
+    fn the_typed_read_carries_the_synthesized_execution_id() {
+        let line = r#"{"ts":"t","level":"info","category":"work","tier":"local","stage":"dispatch","action":"dispatch.turn","handle":"h","session_id":"task-t","mission_id":"m1"}"#;
+        let rec = parse_record(line).unwrap();
+        assert_eq!(rec.execution_id.unwrap().as_str(), "legacy:task-t:m1");
+    }
+
     #[test]
     fn a_current_spelling_is_left_alone() {
         let mut v = json!({"action": "dispatch.start"});
@@ -326,8 +381,8 @@ mod tests {
     }
 
     #[test]
-    fn a_forwarded_line_is_untouched_unless_its_spelling_is_retired() {
-        let current = r#"{"b":1,"action":"dispatch.start","a":2}"#;
+    fn a_forwarded_line_is_untouched_unless_the_upgrade_changes_it() {
+        let current = r#"{"b":1,"action":"step.start","a":2}"#;
         assert!(matches!(upgrade_line(current), Some(std::borrow::Cow::Borrowed(l)) if l == current));
         let unknown = r#"{"action":"future.thing"}"#;
         assert_eq!(upgrade_line(unknown).unwrap(), unknown);

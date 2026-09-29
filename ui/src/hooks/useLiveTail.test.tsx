@@ -115,11 +115,11 @@ describe("useLiveTail", () => {
     expect(MockEventSource.instances[0].url).toBe("/flow/2026-08-09/stream");
 
     act(() => {
-      MockEventSource.instances[0].emit(JSON.stringify({ action: "dispatch.start", ts: "2026-08-09T12:00:01Z" }));
+      MockEventSource.instances[0].emit(JSON.stringify({ action: "dispatch.start", ts: "2026-08-09T12:00:01Z", execution_id: "exec-1" }));
     });
 
     expect(queryClient.getQueryData(queryKeys.flowTail("2026-08-09"))).toEqual([
-      { action: "dispatch.start", ts: "2026-08-09T12:00:01Z", tMs: Date.parse("2026-08-09T12:00:01Z") },
+      { action: "dispatch.start", ts: "2026-08-09T12:00:01Z", execution_id: "exec-1", tMs: Date.parse("2026-08-09T12:00:01Z") },
     ]);
 
     unmount();
@@ -178,7 +178,7 @@ describe("useLiveTail", () => {
 
     act(() => {
       vi.advanceTimersByTime(2_000);
-      MockEventSource.instances[0].emit(JSON.stringify({ action: "dispatch.start", ts: "2026-08-09T12:00:01Z" }));
+      MockEventSource.instances[0].emit(JSON.stringify({ action: "dispatch.start", ts: "2026-08-09T12:00:01Z", execution_id: "exec-1" }));
     });
     expect(onContact).toHaveBeenLastCalledWith(Date.now());
 
@@ -240,7 +240,7 @@ describe("useLiveTail", () => {
 
   it("merges reconciled records into the flowTail cache, deduped against what's already there", async () => {
     const queryClient = new QueryClient();
-    const rec = { action: "dispatch.complete", ts: "2026-08-09T11:59:00Z" };
+    const rec = { action: "dispatch.complete", ts: "2026-08-09T11:59:00Z", execution_id: "exec-1" };
     // The cache holds the record as ingested: its wire fields plus its parsed time.
     const ingested = { ...rec, tMs: Date.parse(rec.ts) };
     const { impl } = makeFetchImpl((path) => (path.startsWith("/flow/2026-08-09?") ? { ok: true, data: [rec] } : { ok: true, data: [] }));

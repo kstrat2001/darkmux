@@ -5871,6 +5871,64 @@ mod tests {
         );
     }
 
+    /// A 3-item map step is ONE run row and THREE executions: each item
+    /// names its own execution, endpoint and tokens, and the run's tokens are
+    /// their sum. (A flow-only mission: the daemon has no durable record of
+    /// it, as for a run on a peer machine.)
+    #[test]
+    #[serial_test::serial]
+    fn build_runs_a_three_item_map_is_one_row_and_three_executions() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let session = darkmux_types::session_id::SessionId::task(darkmux_types::session_id::RunId::mission("m3").unwrap(), "probe").wire();
+        let now = darkmux_flow::ts_utc_now();
+        let mut records = vec![serde_json::json!({
+            "ts": now, "action": "run.start", "handle": "review", "mission_id": "m3",
+            "session_id": darkmux_types::session_id::SessionId::run(darkmux_types::session_id::RunId::mission("m3").unwrap()).wire(),
+        })];
+        for i in 1..=3u64 {
+            let (exec, endpoint) = (format!("exec-{i}"), format!("azure:seat-{i}.example.com/gpt-4o"));
+            let common = |action: &str| serde_json::json!({
+                "ts": now, "action": action, "handle": "probe-1", "mission_id": "m3",
+                "session_id": session, "execution_id": exec,
+            });
+            let mut start = common("dispatch.start");
+            start["payload"] = serde_json::json!({ "endpoint": endpoint, "item_index": i - 1 });
+            let mut usage = common("telemetry.tokens");
+            usage["category"] = serde_json::json!("telemetry");
+            usage["source"] = serde_json::json!("tokens");
+            usage["payload"] = serde_json::json!({
+                "call_kind": "map_item", "purpose": "work", "endpoint": endpoint,
+                "requested_model": "gpt-4o", "token_source": "provider", "total_tokens": 10 * i,
+            });
+            let mut done = common("dispatch.complete");
+            done["payload"] = serde_json::json!({ "endpoint": endpoint, "result_class": "ok" });
+            records.extend([start, usage, done]);
+        }
+        write_day_file(flows.path(), &today(), &records);
+
+        let out = build_runs_with_usage(flows.path(), None, &[], None);
+        assert_eq!(out.runs.len(), 1, "one row for the whole map, not one per execution: {:?}", out.runs);
+        assert_eq!(out.runs[0].id, "m3");
+        assert_eq!(out.runs[0].tokens, Some(60), "the run is the sum of its three executions");
+        let mut seats: Vec<(String, u64)> = out
+            .usage
+            .groups
+            .iter()
+            .map(|g| (g.endpoint.clone().expect("each execution's endpoint"), g.total()))
+            .collect();
+        seats.sort();
+        assert_eq!(
+            seats,
+            [
+                ("azure:seat-1.example.com/gpt-4o".to_string(), 10),
+                ("azure:seat-2.example.com/gpt-4o".to_string(), 20),
+                ("azure:seat-3.example.com/gpt-4o".to_string(), 30),
+            ],
+            "three executions, each with its own endpoint and tokens"
+        );
+    }
+
     /// (#1877 regression, fixed here) The run bookend `launch()` emits
     /// opens BEFORE any step dispatches, and its session is the row's
     /// representative. Its record carries `handle = <launched config id>`

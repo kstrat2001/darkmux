@@ -1501,6 +1501,131 @@
       ],
       "phase": "open",
       "status": "running"
+    },
+    {
+      "name": "a close names its own execution: the sibling that started later is still open",
+      "as_of": "2026-09-28T10:03:00Z",
+      "records": [
+        {
+          "ts": "2026-09-28T10:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "m-task.task.t",
+          "mission_id": "m-task",
+          "execution_id": "exec-a",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "coder"
+        },
+        {
+          "ts": "2026-09-28T10:01:00Z",
+          "action": "dispatch.start",
+          "session_id": "m-task.task.t",
+          "mission_id": "m-task",
+          "execution_id": "exec-b",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "coder"
+        },
+        {
+          "ts": "2026-09-28T10:02:00Z",
+          "action": "dispatch.complete",
+          "session_id": "m-task.task.t",
+          "mission_id": "m-task",
+          "execution_id": "exec-a",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "coder"
+        }
+      ],
+      "phase": "open",
+      "status": "running"
+    },
+    {
+      "name": "the latest execution's own complete closes it, whatever order the executions ended in",
+      "as_of": "2026-09-28T10:05:00Z",
+      "records": [
+        {
+          "ts": "2026-09-28T10:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "m-task.task.t",
+          "mission_id": "m-task",
+          "execution_id": "exec-a",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "coder"
+        },
+        {
+          "ts": "2026-09-28T10:01:00Z",
+          "action": "dispatch.start",
+          "session_id": "m-task.task.t",
+          "mission_id": "m-task",
+          "execution_id": "exec-b",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "coder"
+        },
+        {
+          "ts": "2026-09-28T10:02:00Z",
+          "action": "dispatch.complete",
+          "session_id": "m-task.task.t",
+          "mission_id": "m-task",
+          "execution_id": "exec-b",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "coder"
+        },
+        {
+          "ts": "2026-09-28T10:03:00Z",
+          "action": "dispatch.complete",
+          "session_id": "m-task.task.t",
+          "mission_id": "m-task",
+          "execution_id": "exec-a",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "coder"
+        }
+      ],
+      "phase": "closed",
+      "status": "complete"
+    },
+    {
+      "name": "a resumed execution's second start opens the next attempt of the same execution",
+      "as_of": "2026-09-28T10:11:00Z",
+      "records": [
+        {
+          "ts": "2026-09-28T10:00:00Z",
+          "action": "dispatch.start",
+          "session_id": "m-task.task.t",
+          "mission_id": "m-task",
+          "execution_id": "exec-a",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "coder"
+        },
+        {
+          "ts": "2026-09-28T10:05:00Z",
+          "action": "dispatch.error",
+          "session_id": "m-task.task.t",
+          "mission_id": "m-task",
+          "execution_id": "exec-a",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "coder",
+          "payload": {
+            "exit_code": 137
+          }
+        },
+        {
+          "ts": "2026-09-28T10:10:00Z",
+          "action": "dispatch.start",
+          "session_id": "m-task.task.t",
+          "mission_id": "m-task",
+          "execution_id": "exec-a",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "handle": "coder"
+        },
+        {
+          "ts": "2026-09-28T10:10:30Z",
+          "action": "dispatch.turn",
+          "session_id": "m-task.task.t",
+          "mission_id": "m-task",
+          "execution_id": "exec-a",
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+        }
+      ],
+      "phase": "open",
+      "status": "running"
     }
   ]
 }

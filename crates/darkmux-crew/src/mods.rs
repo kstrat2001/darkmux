@@ -24,7 +24,7 @@
 //! its mods is DERIVED by scanning mods — nothing is written back onto the
 //! finding, which is an event and is never rewritten.
 //!
-//! `for` keys are CANONICALIZED on create (`<dispatch>/<seq>`, the seq
+//! `for` keys are CANONICALIZED on create (`<execution>/<seq>`, the seq
 //! renumbered), so `sess-a/01` and `sess-a/1` are one address. One finding has
 //! to have one address, or a mod is attached to a finding by one reader and
 //! invisible to another. A key that can address no finding at all is refused
@@ -570,7 +570,7 @@ pub fn looks_like_unified_diff(kit: &str) -> bool {
 
 /// One finding, one address. `sess-a/01` and `sess-a/1` name the same finding,
 /// so the seq is renumbered and the pair rejoined — the form every reader
-/// compares against. A key that resolves to no `<dispatch>/<seq>` at all can
+/// compares against. A key that resolves to no `<execution>/<seq>` at all can
 /// address no finding and is refused by the caller.
 pub fn canonical_finding_key(key: &str) -> Option<String> {
     let (dispatch, seq) = crate::findings::parse_key(key)?;
@@ -585,7 +585,7 @@ pub fn canonical_for_keys(for_keys: &[String]) -> Result<Vec<String>> {
         .iter()
         .map(|k| {
             canonical_finding_key(k).with_context(|| {
-                format!("not a finding key: {k:?} (expected <dispatch>/<seq>, e.g. sess-abc/1)")
+                format!("not a finding key: {k:?} (expected <execution>/<seq>, e.g. sess-abc/1)")
             })
         })
         .collect()

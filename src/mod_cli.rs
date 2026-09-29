@@ -123,7 +123,7 @@ pub fn list(for_key: Option<&str>, mission: Option<&str>, json: bool) -> Result<
     let for_key = for_key
         .map(|k| {
             mods::canonical_finding_key(k).with_context(|| {
-                format!("not a finding key: {k:?} (expected <dispatch>/<seq>, e.g. sess-abc/1)")
+                format!("not a finding key: {k:?} (expected <execution>/<seq>, e.g. sess-abc/1)")
             })
         })
         .transpose()?;

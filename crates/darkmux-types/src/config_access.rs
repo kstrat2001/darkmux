@@ -2042,7 +2042,7 @@ fn flows_dir_default() -> std::path::PathBuf {
 /// config.dirs.findings > <darkmux root>/findings`, the same three-tier shape
 /// every sibling dir resolves through.
 ///
-/// One `<dispatch>/<seq>/finding.json` per accepted `create_finding` call. The
+/// One `<execution>/<seq>/finding.json` per accepted `create_finding` call. The
 /// flow stream remains the audit trail; this directory is the queryable copy
 /// (`finding list` / `finding show`), so JSON on disk is the truth the same way
 /// it is for roles.

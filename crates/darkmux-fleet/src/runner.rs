@@ -241,7 +241,7 @@ mod tests {
         let mut seen = None;
         let r = execute_job_with(job(), "resolved-host".into(), "laptop".into(), |o| {
             seen = Some((o.profile_name.clone(), o.remote_origin.clone(), o.machine.clone()));
-            Ok(DispatchResult { exit_code: 0, stdout: String::new(), stderr: String::new(), session_id: crate::test_session("s"), out_dir: None, trajectory: None })
+            Ok(DispatchResult { exit_code: 0, stdout: String::new(), stderr: String::new(), session_id: crate::test_session("s"), execution: None, out_dir: None, trajectory: None })
         });
         assert!(r.is_ok());
         assert_eq!(seen, Some((Some("resolved-host".into()), Some("laptop".into()), None)));
@@ -257,13 +257,13 @@ mod tests {
             execute_job_with(job(), "host".into(), "laptop".into(), |_| {
                 started_tx.send(()).unwrap();
                 release_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-                Ok(DispatchResult { exit_code: 0, stdout: String::new(), stderr: String::new(), session_id: crate::test_session("s"), out_dir: None, trajectory: None })
+                Ok(DispatchResult { exit_code: 0, stdout: String::new(), stderr: String::new(), session_id: crate::test_session("s"), execution: None, out_dir: None, trajectory: None })
             })
         });
         started_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
         // A second job starts and finishes while the first still runs.
         let short = execute_job_with(job(), "host".into(), "laptop".into(), |_| {
-            Ok(DispatchResult { exit_code: 0, stdout: String::new(), stderr: String::new(), session_id: crate::test_session("s"), out_dir: None, trajectory: None })
+            Ok(DispatchResult { exit_code: 0, stdout: String::new(), stderr: String::new(), session_id: crate::test_session("s"), execution: None, out_dir: None, trajectory: None })
         });
         assert!(short.is_ok());
         assert!(dispatch_in_flight(), "the first job is still running");
