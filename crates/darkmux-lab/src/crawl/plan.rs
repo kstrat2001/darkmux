@@ -863,9 +863,8 @@ const DEFAULT_DIFF_SPAN_CAP: usize = 2 * darkmux_crew::rules::DEFAULT_WINDOW + 1
 /// caller therefore still needs a materialized workspace at the diff's
 /// `head_sha`, not just the diff text.
 ///
-/// `sha`/`ref` are deliberately NOT this struct's concern: DESIGN.md says
-/// those "come from the launch inputs `head_sha`/`github` or the diff
-/// file's own header" — that resolution belongs to whatever builds the
+/// `sha`/`ref` are deliberately NOT this struct's concern: those come from the
+/// launch inputs `head_sha`/`github` or the diff file's own header, that resolution belongs to whatever builds the
 /// `MaterializedSource`/`PlanSource` a review plan step passes in, same as
 /// `TreeSource` never resolves its own `sha` either (`resolved()` in this
 /// module's own tests, or `workspace_spec::materialize` for a real run).
@@ -2260,9 +2259,8 @@ line two
 
     #[test]
     fn diff_source_with_no_prefilter_makes_every_hunk_a_site_and_a_hunk_longer_than_the_cap_splits() {
-        // (#2310 P4b, DESIGN.md "Rules may declare prefilter: none so every
-        // hunk is a site... a hunk with more lines than the window becomes
-        // several sites") — a synthetic diff with one 12-line hunk in one
+        // (#2310 P4b: a `prefilter: none` diff rule makes every hunk a site,
+        // and a hunk with more lines than the window becomes several sites), a synthetic diff with one 12-line hunk in one
         // file, capped at 4 lines, must split into 3 sites (4, 4, 4) and
         // must NOT lose or duplicate a single line across the split.
         let dir = TempDir::new().unwrap();

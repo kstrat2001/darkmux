@@ -4611,7 +4611,7 @@ mod tests {
     // markdown render, retry logic) but nothing pinned the wire input
     // until now, leaving the surfaces about to be mutated by S2+ open
     // to invisible regressions. See DESIGN.md "Schema isolation:
-    // each runtime owns its own config".
+    // darkmux owns its own config".
     //
     // When an intentional change to the wire shape lands (e.g. S2
     // appending operator-tunable customInstructions to the system

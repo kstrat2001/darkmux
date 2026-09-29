@@ -74,8 +74,7 @@
 //! genuinely new control flow (a strategy selector over two sources), not
 //! config over an existing kind. Co-located with the crawl module for now
 //! (a Tier 2 `step_kinds::patterns` promotion is the natural next step
-//! once `plan_step.rs`/`plan_sites_step.rs` actually merge — P4d's call,
-//! per DESIGN.md's "P4d ... let the planner be the shared pattern").
+//! once `plan_step.rs`/`plan_sites_step.rs` actually merge, P4d's call).
 
 use crate::crawl::plan::{self, Plan, PlanParams};
 use crate::crawl::plan_step::{self, CRAWL_PLAN_OUTPUT_KIND};

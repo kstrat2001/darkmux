@@ -41,8 +41,7 @@
 //! `findings_rejected`, summed off this mission's Step records
 //! (`scan_unit_and_plan_steps`, read as loose JSON — never `darkmux-lab`'s
 //! typed `UnitOutcome`, same crate-boundary reason) — NEVER a gate-failed
-//! mod (that renders as a double-check thread, DESIGN.md's own
-//! vocabulary; counting it as "refused" too would double-book one fact
+//! mod (that renders as a double-check thread; counting it as "refused" too would double-book one fact
 //! under two names). `not_attempted`/`errored` (#2310 P4c-2b PR #2357
 //! review MUST FIX C/D) come from the SAME scan: a rule whose plan step
 //! never reached `Complete`, or a unit that errored/was abandoned.
@@ -225,8 +224,8 @@ impl StepKind for RecordsGatherStepKind {
         // is the RUNTIME-BOUNDARY rejection count (`crawl.unit`'s own
         // `findings_rejected` — a `create_finding` call the runtime itself
         // rejected, before a finding ever became a stored record), never
-        // a gate-failed mod (that is a DOUBLE-CHECK thread, DESIGN.md's
-        // own vocabulary — `render_github_review`'s `DeliveryForm::Mod`
+        // a gate-failed mod (that is a DOUBLE-CHECK thread ,
+        // `render_github_review`'s `DeliveryForm::Mod`
         // arm already renders it as one; counting it as "refused" too
         // would double-book the same fact under two names).
         // `not_attempted`/`errored` come from this mission's own

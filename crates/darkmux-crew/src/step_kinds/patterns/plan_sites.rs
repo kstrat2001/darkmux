@@ -24,8 +24,8 @@
 //! this module takes an `is_hit: &dyn Fn(&str) -> bool` closure rather than
 //! a regex list, so it never needs the `regex` crate as a dependency —
 //! deciding "empty prefilter" behavior (zero units for a tree walk, "match
-//! everything" for a diff rule declaring `prefilter: none`, per DESIGN.md
-//! "A rule is a procedure") is therefore the caller's call too, made before
+//! everything" for a diff rule declaring `prefilter: none`; see DESIGN.md's
+//! "Hunks are natural windows") is therefore the caller's call too, made before
 //! it ever calls [`plan_site_units`].
 //!
 //! What this module owns: merging overlapping/adjacent hit windows into
@@ -39,8 +39,8 @@
 //! cap). A diff's "every hunk line is a candidate" mode (`prefilter: none`)
 //! makes one hunk ONE contiguous run of hits by construction — with no cap
 //! that run would always merge into a single, unbounded site, which
-//! contradicts DESIGN.md's "a hunk with more lines than the window becomes
-//! several sites" — so `Some(n)` is what makes that sentence true for a
+//! contradicts a hunk longer than the window becoming
+//! several sites, so `Some(n)` is what makes that sentence true for a
 //! diff-backed caller. `n` is the caller's choice (`crawl::plan::DiffSource`
 //! documents its own).
 

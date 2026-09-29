@@ -1041,8 +1041,8 @@ jobs:
         working-directory: ui
         run: bun run knip
 
-      # The TypeScript half of the complexity ratchet (the Rust half is the
-      # `complexity` job): ESLint's `complexity` rule at 15 over ui/src, each
+      # The TypeScript half of the complexity ratchet (the Rust half runs in the
+      # `docs-drift` job): ESLint's `complexity` rule at 15 over ui/src, each
       # reported function held to its recorded baseline.
       - name: UI complexity ratchet
         if: steps.filter.outputs.ui == 'true'

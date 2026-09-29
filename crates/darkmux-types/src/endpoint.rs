@@ -21,8 +21,9 @@ use serde::{Deserialize, Serialize, Serializer};
 /// What darkmux does at an endpoint: its own action, never the endpoint's
 /// location, owner or cost.
 ///
-/// An enum so a later kind is additive: #2916 adds a fleet machine here, and
-/// every `match` on this type then names what it does for one.
+/// An enum so a later kind is additive: every `match` on this type then names
+/// what darkmux does for the new one. (A fleet machine is not a kind: running
+/// on another machine is a property of the profile address.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EndpointKind {
     /// darkmux manages what is loaded: it runs the backend's own tool to load

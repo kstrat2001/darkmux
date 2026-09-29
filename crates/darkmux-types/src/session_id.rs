@@ -48,7 +48,7 @@ impl std::error::Error for IdError {}
 /// What kind of run a session belongs to. It decides whether the run is a
 /// mission (its id is stamped as a record's `mission_id`) or not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum RunKind {
+pub enum RunIdKind {
     /// A mission instance: `mission launch`, a crew-of-one `dispatch`, an
     /// ACP panel run (its correlation id).
     Mission,
@@ -59,12 +59,12 @@ pub enum RunKind {
     Standalone,
 }
 
-impl RunKind {
+impl RunIdKind {
     fn tag(self) -> Option<&'static str> {
         match self {
-            RunKind::Mission => None,
-            RunKind::Lab => Some("lab"),
-            RunKind::Standalone => Some("solo"),
+            RunIdKind::Mission => None,
+            RunIdKind::Lab => Some("lab"),
+            RunIdKind::Standalone => Some("solo"),
         }
     }
 }
@@ -72,12 +72,12 @@ impl RunKind {
 /// The run a session belongs to.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RunId {
-    kind: RunKind,
+    kind: RunIdKind,
     id: String,
 }
 
 impl RunId {
-    fn new(kind: RunKind, id: impl Into<String>) -> Result<Self, IdError> {
+    fn new(kind: RunIdKind, id: impl Into<String>) -> Result<Self, IdError> {
         let id = id.into();
         if id.is_empty() {
             return Err(IdError("a run id must be non-empty".to_string()));
@@ -87,20 +87,20 @@ impl RunId {
 
     /// A mission run: its id is the mission id.
     pub fn mission(id: impl Into<String>) -> Result<Self, IdError> {
-        Self::new(RunKind::Mission, id)
+        Self::new(RunIdKind::Mission, id)
     }
 
     /// A lab run: its id is the lab run id.
     pub fn lab(id: impl Into<String>) -> Result<Self, IdError> {
-        Self::new(RunKind::Lab, id)
+        Self::new(RunIdKind::Lab, id)
     }
 
-    /// A standalone run (see [`RunKind::Standalone`]).
+    /// A standalone run (see [`RunIdKind::Standalone`]).
     pub fn standalone(id: impl Into<String>) -> Result<Self, IdError> {
-        Self::new(RunKind::Standalone, id)
+        Self::new(RunIdKind::Standalone, id)
     }
 
-    pub fn kind(&self) -> RunKind {
+    pub fn kind(&self) -> RunIdKind {
         self.kind
     }
 
@@ -111,8 +111,8 @@ impl RunId {
     /// The mission this run is, when it is one.
     pub fn mission_id(&self) -> Option<&str> {
         match self.kind {
-            RunKind::Mission => Some(&self.id),
-            RunKind::Lab | RunKind::Standalone => None,
+            RunIdKind::Mission => Some(&self.id),
+            RunIdKind::Lab | RunIdKind::Standalone => None,
         }
     }
 }
@@ -184,7 +184,7 @@ impl SessionId {
     /// run is the standalone twin of the sender's (see
     /// [`SessionKind::Relay`]).
     pub fn relay(sender: SessionId, peer: impl Into<String>) -> Self {
-        let run = RunId { kind: RunKind::Standalone, id: sender.run.id.clone() };
+        let run = RunId { kind: RunIdKind::Standalone, id: sender.run.id.clone() };
         SessionId { kind: SessionKind::Relay { sender: Box::new(sender), peer: peer.into() }, run }
     }
 
@@ -252,9 +252,9 @@ impl SessionId {
     ) -> Result<(RunId, &'a [&'a str]), IdError> {
         let run_id = unescape(comps[0]).ok_or_else(|| bad("its run is not escaped as written"))?;
         let (run_kind, rest) = match comps.get(1).copied() {
-            Some("lab") => (RunKind::Lab, &comps[2..]),
-            Some("solo") => (RunKind::Standalone, &comps[2..]),
-            _ => (RunKind::Mission, &comps[1..]),
+            Some("lab") => (RunIdKind::Lab, &comps[2..]),
+            Some("solo") => (RunIdKind::Standalone, &comps[2..]),
+            _ => (RunIdKind::Mission, &comps[1..]),
         };
         let run = RunId::new(run_kind, run_id).map_err(|e| bad(&e.0))?;
         Ok((run, rest))

@@ -6787,7 +6787,7 @@
 
     /// (#383) `from_profile` IGNORES the openclaw-shape
     /// `extras["customInstructions"]` passthrough — schema-isolation
-    /// doctrine (DESIGN.md "Schema isolation: each runtime owns its
+    /// doctrine (DESIGN.md "Schema isolation: darkmux owns its
     /// own config"). Operators on legacy profiles need to migrate to
     /// the typed `custom_instructions` field; a follow-up under [#380](https://github.com/kstrat2001/darkmux/issues/380) surfaces them via
     /// doctor warning.

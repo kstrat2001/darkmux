@@ -10,8 +10,8 @@
 //! The one list lives in the `flow_actions!` invocation below. A liveness
 //! bookend declares its [`Grain`] and [`Edge`] on its row, and
 //! [`FlowAction::bookend`] reads them back, so "which actions open and close
-//! a run or an execution" has one answer. A later typed payload per action
-//! attaches there the same way.
+//! a run or an execution" has one answer. The typed payload per action is
+//! declared in the `flow_payloads!` list in `payload/mod.rs`, not here.
 //!
 //! [`FlowAction::Retired`] is an action darkmux once wrote and retired with
 //! no current equivalent (`telemetry.process`, the pre-graph `funnel.*` and

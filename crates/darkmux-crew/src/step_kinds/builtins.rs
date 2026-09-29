@@ -1235,7 +1235,7 @@ fn map_item_text(v: &serde_json::Value) -> String {
 /// plain item as before: no override, and the whole value substitutes via
 /// [`map_item_text`] under the step's own `config.system`. Exactness is what
 /// keeps a legitimate collection item that merely CONTAINS those keys from
-/// being hijacked; the shape is reserved and named in DESIGN.md's glossary.
+/// being hijacked.
 ///
 /// Returns `(system_override, payload)` — `payload` is the `"item"` field
 /// when the shape matched, else the item unchanged (so the two never disagree

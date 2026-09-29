@@ -361,7 +361,7 @@ pub struct RuntimeCompactionConfig {
     /// steer what the compactor preserves (e.g. "Preserve verbatim X /
     /// list active files with what was learned").
     ///
-    /// See DESIGN.md "Schema isolation: each runtime owns its own config".
+    /// See DESIGN.md "Schema isolation: darkmux owns its own config".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_instructions: Option<String>,
     /// Unrecognized keys, kept so a hand-edited `profiles.json` round-trips
