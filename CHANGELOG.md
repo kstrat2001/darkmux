@@ -1134,6 +1134,17 @@ darkmux release.
   `dispatch.start` `bounds` block from before the newer knobs existed reads with
   the knobs it has.
 
+### Fixed (4.0)
+
+- **`darkmux doctor` names why a `profiles.json` that exists does not load**,
+  and all of it at once. The `profile registry` row prints the whole cause
+  chain instead of "parsing JSON", and suggests `darkmux init` only when there
+  is no file. The `user file keys: profiles.json` row now runs on the file
+  itself, so a registry the typed load refuses still has every refused shape
+  named in one run: a bare-string `internal.utility`, inline endpoint objects,
+  and the retired `role` key on a model. The rows that depend on the registry
+  say it did not load, with the cause, instead of "no profile registry".
+
 ### Added (4.0)
 
 - **`darkmux mission show <id>`** and the panel's `/mission show <id>`: one

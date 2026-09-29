@@ -40,6 +40,7 @@ pub fn user_file_problem(path: &Path) -> Option<darkmux_types::user_files::FileP
         ProfileRegistry::inline_endpoint_rewrites(doc)
             .into_iter()
             .map(|r| KeyIssue { issue: Issue::Removed(r.line()), path: r.path })
+            .chain(darkmux_types::bare_utility_in(doc).map(|(path, line)| KeyIssue { issue: Issue::Removed(line), path: path.to_string() }))
             .collect()
     };
     let mut found = check_path_and::<ProfileRegistry>(UserFileKind::Profiles, path, &registry_retired, &inline_endpoints)?;
@@ -93,29 +94,10 @@ pub fn load_registry_quiet(explicit: Option<&str>) -> Result<LoadedRegistry> {
 }
 
 fn load_registry_with(explicit: Option<&str>, announce: bool) -> Result<LoadedRegistry> {
-    // Precedence: explicit --profiles flag > DARKMUX_PROFILES env var > default
-    // search locations. The two override paths fail-fast on missing files
-    // so that a typo'd path doesn't silently pick up an unrelated registry.
-    if let Some(p) = explicit {
-        return load_from(PathBuf::from(p), "--profiles flag", announce);
+    if let Some((path, source)) = registry_source(explicit) {
+        return load_from(path, source, announce);
     }
-    // (#2632 CONSIDER 3) The one instrumented chokepoint for
-    // `DARKMUX_PROFILES` — previously had no audited path at all, so crew's
-    // 15 test-side mutations of this key were invisible to the sweep.
-    #[cfg(any(test, feature = "test-support"))]
-    darkmux_types::env_audit::audit_env_read("DARKMUX_PROFILES");
-    if let Ok(p) = env::var("DARKMUX_PROFILES") {
-        if !p.is_empty() {
-            return load_from(PathBuf::from(p), "DARKMUX_PROFILES env var", announce);
-        }
-    }
-    let candidates = default_locations();
-    for path in &candidates {
-        if path.exists() {
-            return load_from(path.clone(), "default search", announce);
-        }
-    }
-    let listed = candidates
+    let listed = default_locations()
         .iter()
         .map(|p| format!("  {}", p.display()))
         .collect::<Vec<_>>()
@@ -127,6 +109,34 @@ fn load_registry_with(explicit: Option<&str>, announce: bool) -> Result<LoadedRe
          (see profiles.example.json in the darkmux repo).",
         listed
     );
+}
+
+/// The file [`load_registry`] reads, and how it was chosen. Precedence:
+/// explicit `--profiles-file` > `DARKMUX_PROFILES` > the first existing
+/// default location. The two overrides are returned even when the file is
+/// absent, so that a typo'd path fails fast instead of silently picking up an
+/// unrelated registry. `None` only when nothing names a file.
+fn registry_source(explicit: Option<&str>) -> Option<(PathBuf, &'static str)> {
+    if let Some(p) = explicit {
+        return Some((PathBuf::from(p), "--profiles flag"));
+    }
+    // (#2632 CONSIDER 3) The one instrumented chokepoint for
+    // `DARKMUX_PROFILES` — previously had no audited path at all, so crew's
+    // 15 test-side mutations of this key were invisible to the sweep.
+    #[cfg(any(test, feature = "test-support"))]
+    darkmux_types::env_audit::audit_env_read("DARKMUX_PROFILES");
+    if let Ok(p) = env::var("DARKMUX_PROFILES") {
+        if !p.is_empty() {
+            return Some((PathBuf::from(p), "DARKMUX_PROFILES env var"));
+        }
+    }
+    default_locations().into_iter().find(|p| p.exists()).map(|p| (p, "default search"))
+}
+
+/// The registry file a load would read (see [`registry_source`]), whether or
+/// not it parses: what a check needs to inspect a file the loader refuses.
+pub fn registry_path(explicit: Option<&str>) -> Option<PathBuf> {
+    registry_source(explicit).map(|(path, _)| path)
 }
 
 fn load_from(path: PathBuf, source: &str, announce: bool) -> Result<LoadedRegistry> {

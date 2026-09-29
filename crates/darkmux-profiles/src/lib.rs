@@ -240,3 +240,50 @@ mod historical_key_tests {
         assert!(p.to_string().contains("`profiles.p.runtime.contextTokens`: renamed to `context_tokens`"), "{p}");
     }
 }
+
+#[cfg(test)]
+mod unloadable_registry_tests {
+    use darkmux_types::user_files::Problem;
+
+    /// A registry whose typed load fails on a bare-string `internal.utility`
+    /// still has that shape named by the file check, with the object to
+    /// write, beside every other refused shape in the same file.
+    #[test]
+    fn the_file_check_names_every_refusal_in_a_file_that_does_not_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "profiles": {"p": {"models": [
+                    {"id": "m", "n_ctx": 1, "role": "primary"},
+                    {"id": "g", "endpoint": {"url": "https://api.example/v1"}}
+                ]}},
+                "internal": {"utility": "util-4b"}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(crate::profiles::load_registry_quiet(path.to_str()).is_err(), "the fixture must not load");
+        let p = crate::profiles::user_file_problem(&path).unwrap();
+        let Problem::Keys(keys) = &p.problem else { panic!("{p:?}") };
+        let msgs: Vec<String> = keys.iter().map(ToString::to_string).collect();
+        for (at, says) in [
+            ("internal.utility", r#""utility": { "id": "util-4b", "n_ctx": "#),
+            ("profiles.p.models[0].role", "removed in #590"),
+            ("profiles.p.models[1].endpoint", "inline endpoint object was removed"),
+        ] {
+            assert!(msgs.iter().any(|m| m.contains(at) && m.contains(says)), "{at}: {msgs:#?}");
+        }
+    }
+
+    /// `registry_path` is the file `load_registry` would read: an explicit
+    /// path even when absent, `None` only when nothing names a file.
+    #[test]
+    fn registry_path_is_the_file_the_loader_would_read() {
+        assert_eq!(
+            crate::profiles::registry_path(Some("/nonexistent/x/profiles.json")),
+            Some(std::path::PathBuf::from("/nonexistent/x/profiles.json"))
+        );
+    }
+}
