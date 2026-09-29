@@ -70,6 +70,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use darkmux_flow::payload::{BudgetPayload, BudgetPolicyKind, BudgetScope};
 use darkmux_types::execution_id::ExecutionId;
 use darkmux_types::session_id::SessionId;
 use darkmux_types::{BudgetPolicy, ModelEndpoint, WindowBudget};
@@ -186,24 +187,12 @@ impl EndpointBudget {
 }
 
 /// What a breach was measured in.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Metric {
-    Tokens,
-    Calls,
-}
+pub use darkmux_flow::payload::BudgetMetric as Metric;
 
 /// How far into a budget the KNOWN spend is. Ordered: a higher level is
 /// news. Whether the spend is fully known is a separate fact
 /// ([`Breach::unmetered`]), never a level, so neither masks the other.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BreachLevel {
-    /// At or past `warn_at` of the budget, still under it.
-    Early,
-    /// At or past the budget.
-    AtLimit,
-}
+pub use darkmux_flow::payload::BreachLevel;
 
 /// One measured breach.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -828,15 +817,13 @@ fn stopped_wait(
 fn stop_record(endpoint_id: &str, reason: &str, waited_ms: u64, message: &str, caller: &BudgetCaller<'_>, env: &dyn BudgetEnv) {
     env.emit(record(
         darkmux_flow::Level::Warn,
-        darkmux_flow::FlowAction::BudgetStop,
         caller,
-        serde_json::json!({
-            "scope": "endpoint",
-            "endpoint_id": endpoint_id,
-            "reason": reason,
-            "waited_ms": waited_ms,
-            "pid": std::process::id(),
-            "message": message,
+        darkmux_flow::Payload::BudgetStop(BudgetPayload {
+            endpoint_id: Some(endpoint_id.to_string()),
+            reason: Some(reason.to_string()),
+            waited_ms: Some(waited_ms),
+            pid: Some(std::process::id()),
+            ..budget_payload(BudgetScope::Endpoint, message)
         }),
     ));
 }
@@ -865,6 +852,15 @@ fn metric_word(m: Metric) -> &'static str {
     }
 }
 
+/// A budget policy as the payload names it.
+fn policy_kind(policy: BudgetPolicy) -> BudgetPolicyKind {
+    match policy {
+        BudgetPolicy::Off => BudgetPolicyKind::Off,
+        BudgetPolicy::Warn => BudgetPolicyKind::Warn,
+        BudgetPolicy::Wait => BudgetPolicyKind::Wait,
+    }
+}
+
 /// `1h 4m`, `3m 20s`, `45s`.
 pub fn human_duration(secs: u64) -> String {
     let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
@@ -875,15 +871,9 @@ pub fn human_duration(secs: u64) -> String {
     }
 }
 
-fn record(
-    level: darkmux_flow::Level,
-    action: darkmux_flow::FlowAction,
-    caller: &BudgetCaller<'_>,
-    payload: serde_json::Value,
-) -> darkmux_flow::FlowRecord {
+fn record(level: darkmux_flow::Level, caller: &BudgetCaller<'_>, payload: darkmux_flow::Payload) -> darkmux_flow::FlowRecord {
     crate::dispatch::build_telemetry_record(
         level,
-        action,
         darkmux_flow::FlowSource::Budget,
         caller.role_id.unwrap_or("budget"),
         caller.session,
@@ -892,6 +882,32 @@ fn record(
         caller.phase_id,
         payload,
     )
+}
+
+/// A budget payload of `scope` carrying `message`, with everything else for
+/// the caller to fill in.
+fn budget_payload(scope: BudgetScope, message: &str) -> BudgetPayload {
+    BudgetPayload {
+        scope,
+        message: message.to_string(),
+        endpoint_id: None,
+        step: None,
+        policy: None,
+        level: None,
+        metric: None,
+        spent: None,
+        limit: None,
+        unmetered_calls: None,
+        period: None,
+        warn_at: None,
+        resume_at_ms: None,
+        wait_ms: None,
+        waited_ms: None,
+        reason: None,
+        pid: None,
+        step_id: None,
+        context: None,
+    }
 }
 
 fn warn(b: &EndpointBudget, br: &Breach, caller: &BudgetCaller<'_>, env: &dyn BudgetEnv) {
@@ -926,20 +942,18 @@ fn warn(b: &EndpointBudget, br: &Breach, caller: &BudgetCaller<'_>, env: &dyn Bu
     env.say(&message);
     env.emit(record(
         darkmux_flow::Level::Warn,
-        darkmux_flow::FlowAction::BudgetWarn,
         caller,
-        serde_json::json!({
-            "scope": "endpoint",
-            "endpoint_id": b.endpoint_id,
-            "policy": darkmux_types::config_enum::ConfigEnum::token(b.policy),
-            "level": br.level,
-            "metric": br.metric,
-            "spent": br.spent,
-            "limit": br.limit,
-            "unmetered_calls": br.unmetered,
-            "period": b.period,
-            "warn_at": b.warn_at,
-            "message": message,
+        darkmux_flow::Payload::BudgetWarn(BudgetPayload {
+            endpoint_id: Some(b.endpoint_id.clone()),
+            policy: Some(policy_kind(b.policy)),
+            level: br.level,
+            metric: Some(br.metric),
+            spent: Some(br.spent),
+            limit: Some(br.limit),
+            unmetered_calls: Some(br.unmetered),
+            period: Some(b.period.clone()),
+            warn_at: b.warn_at,
+            ..budget_payload(BudgetScope::Endpoint, &message)
         }),
     ));
 }
@@ -977,21 +991,19 @@ fn announce_wait(
     env.say(&message);
     env.emit(record(
         darkmux_flow::Level::Warn,
-        darkmux_flow::FlowAction::BudgetWait,
         caller,
-        serde_json::json!({
-            "scope": "endpoint",
-            "endpoint_id": b.endpoint_id,
-            "policy": "wait",
-            "metric": br.metric,
-            "spent": br.spent,
-            "limit": br.limit,
-            "unmetered_calls": br.unmetered,
-            "period": b.period,
-            "resume_at_ms": resume_at.map(|r| r.saturating_mul(1_000)),
-            "wait_ms": resume_at.map(|r| (r - now).max(0).saturating_mul(1_000)),
-            "pid": std::process::id(),
-            "message": message,
+        darkmux_flow::Payload::BudgetWait(BudgetPayload {
+            endpoint_id: Some(b.endpoint_id.clone()),
+            policy: Some(BudgetPolicyKind::Wait),
+            metric: Some(br.metric),
+            spent: Some(br.spent),
+            limit: Some(br.limit),
+            unmetered_calls: Some(br.unmetered),
+            period: Some(b.period.clone()),
+            resume_at_ms: resume_at.map(|r| r.saturating_mul(1_000) as u64),
+            wait_ms: resume_at.map(|r| (r - now).max(0).saturating_mul(1_000) as u64),
+            pid: Some(std::process::id()),
+            ..budget_payload(BudgetScope::Endpoint, &message)
         }),
     ));
 }
@@ -1008,14 +1020,12 @@ fn resume_if_waited(b: &EndpointBudget, caller: &BudgetCaller<'_>, env: &dyn Bud
     env.say(&message);
     env.emit(record(
         darkmux_flow::Level::Info,
-        darkmux_flow::FlowAction::BudgetResume,
         caller,
-        serde_json::json!({
-            "scope": "endpoint",
-            "endpoint_id": b.endpoint_id,
-            "waited_ms": waited_ms,
-            "pid": std::process::id(),
-            "message": message,
+        darkmux_flow::Payload::BudgetResume(BudgetPayload {
+            endpoint_id: Some(b.endpoint_id.clone()),
+            waited_ms: Some(waited_ms),
+            pid: Some(std::process::id()),
+            ..budget_payload(BudgetScope::Endpoint, &message)
         }),
     ));
 }
@@ -1305,12 +1315,15 @@ pub fn settle_step(
     env.say(&message);
     env.emit(record(
         darkmux_flow::Level::Warn,
-        darkmux_flow::FlowAction::BudgetWarn,
         caller,
-        serde_json::json!({
-            "scope": "step", "step": step, "policy": "warn",
-            "level": BreachLevel::AtLimit, "metric": Metric::Tokens,
-            "spent": br.used, "limit": br.budget, "message": message,
+        darkmux_flow::Payload::BudgetWarn(BudgetPayload {
+            step: Some(step.to_string()),
+            policy: Some(BudgetPolicyKind::Warn),
+            level: Some(BreachLevel::AtLimit),
+            metric: Some(Metric::Tokens),
+            spent: Some(br.used),
+            limit: Some(br.budget),
+            ..budget_payload(BudgetScope::Step, &message)
         }),
     ));
 }
@@ -1356,7 +1369,7 @@ pub fn widest_window_secs(reg: &darkmux_types::ProfileRegistry) -> Option<u64> {
 /// whose run was not stopped, and whose resume time has not passed. For
 /// `darkmux mission status`.
 pub fn active_waits(dir: &Path, now: i64, lookback_secs: u64, alive: &dyn Fn(u32) -> bool) -> Vec<ActiveWait> {
-    let mut latest: BTreeMap<(String, String, String, u64), (bool, serde_json::Value)> = BTreeMap::new();
+    let mut latest: BTreeMap<(String, String, String, u64), (bool, serde_json::Value, BudgetPayload)> = BTreeMap::new();
     let mut day = (now - lookback_secs as i64).div_euclid(86_400) * 86_400;
     let last = darkmux_flow::day_utc_at(now);
     while darkmux_flow::day_utc_at(day) <= last {
@@ -1365,22 +1378,21 @@ pub fn active_waits(dir: &Path, now: i64, lookback_secs: u64, alive: &dyn Fn(u32
         let Ok(text) = std::fs::read_to_string(dir.join(format!("{stem}.jsonl"))) else { continue };
         // Cheap pre-filter: only a budget record can be one of the three.
         for v in text.lines().filter(|l| l.contains("\"budget.")).filter_map(darkmux_flow::reader::parse_value) {
-            let waiting = match darkmux_flow::reader::action_of(&v) {
-                Some(darkmux_flow::FlowAction::BudgetWait) => true,
-                Some(darkmux_flow::FlowAction::BudgetResume | darkmux_flow::FlowAction::BudgetStop) => false,
+            let (waiting, p) = match darkmux_flow::reader::payload_of(&v) {
+                Some(darkmux_flow::Payload::BudgetWait(p)) => (true, p),
+                Some(darkmux_flow::Payload::BudgetResume(p) | darkmux_flow::Payload::BudgetStop(p)) => (false, p),
                 _ => continue,
             };
-            let p = crate::usage::payload_of(&v);
-            let scope = p.get("scope").and_then(|x| x.as_str()).unwrap_or("").to_string();
-            let subject = p.get("endpoint_id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let scope = serde_json::to_value(p.scope).ok().and_then(|x| x.as_str().map(str::to_string)).unwrap_or_default();
+            let subject = p.endpoint_id.clone().unwrap_or_default();
             let session = v.get("session_id").and_then(|x| x.as_str()).unwrap_or("").to_string();
-            let pid = p.get("pid").and_then(|x| x.as_u64()).unwrap_or(0);
-            latest.insert((scope, subject, session, pid), (waiting, v));
+            let pid = u64::from(p.pid.unwrap_or(0));
+            latest.insert((scope, subject, session, pid), (waiting, v, p));
         }
     }
     latest
         .into_iter()
-        .filter_map(|((scope, subject, session, pid), (waiting, v))| {
+        .filter_map(|((scope, subject, session, pid), (waiting, v, p))| {
             if !waiting || !alive(pid as u32) {
                 return None;
             }
@@ -1388,8 +1400,7 @@ pub fn active_waits(dir: &Path, now: i64, lookback_secs: u64, alive: &dyn Fn(u32
             if run_stop_reason(s("mission_id"), s("phase_id")).is_some() {
                 return None;
             }
-            let p = crate::usage::payload_of(&v);
-            let resume_secs = p.get("resume_at_ms").and_then(|x| x.as_i64()).map(|ms| ms.div_euclid(1_000));
+            let resume_secs = p.resume_at_ms.map(|ms| (ms / 1_000) as i64);
             let resume_at = resume_secs.map(darkmux_flow::ts_utc_at);
             if resume_secs.is_some_and(|r| r + 1 < now) {
                 return None;
@@ -1401,7 +1412,7 @@ pub fn active_waits(dir: &Path, now: i64, lookback_secs: u64, alive: &dyn Fn(u32
                 session_id: (!session.is_empty()).then_some(session),
                 resume_at,
                 resumes_in_secs: resume_secs.map(|r| (r - now).max(0) as u64),
-                message: p.get("message").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                message: p.message,
             })
         })
         .collect()

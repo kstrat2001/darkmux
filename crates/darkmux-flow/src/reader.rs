@@ -151,6 +151,17 @@ pub fn action_of(record: &Value) -> Option<FlowAction> {
     Some(crate::legacy::run_grain_of(&read, record).unwrap_or(read))
 }
 
+/// The typed payload of a JSON record: read as its (upgraded) action's type,
+/// [`Payload::Unread`] when it is not that type, `None` when the record has no
+/// payload or no action. For a reader that holds records as JSON; one that
+/// parses lines into [`FlowRecord`]s gets the same through
+/// [`FlowRecord::payload`].
+pub fn payload_of(record: &Value) -> Option<crate::Payload> {
+    let action = action_of(record)?;
+    let raw = record.get("payload").filter(|p| !p.is_null())?;
+    Some(crate::Payload::settle(&action, raw.clone()))
+}
+
 /// A tally of the unknown actions a read met, by name. Filled by
 /// [`UnknownActions::observe`]; `darkmux doctor` reports it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

@@ -2803,7 +2803,7 @@ fn residency_resolves_the_tasks_own_role_not_a_hardcoded_crawler() {
         panic!(
             "a Task naming a role the registry has no manifest for must not silently resolve as \
              if it were \"crawler\" — expected LocalModelUnresolved, got {}",
-            claim.label()
+            format!("{:?}", claim.class())
         );
     };
     assert!(

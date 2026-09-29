@@ -506,16 +506,17 @@ pub enum SeatClaim {
 }
 
 impl SeatClaim {
-    /// The stable wire label stamped onto the `step start` flow record's
-    /// `payload.seat_class` (FLOW 1.41.0). Kept next to the variants so a
-    /// new one cannot ship without a label — the `match` here is exhaustive
-    /// with no `_` arm, same discipline as every other consumer.
-    pub fn label(&self) -> &'static str {
+    /// The seat class stamped onto the `step.start` flow record's payload
+    /// (FLOW 1.41.0). Kept next to the variants so a new one cannot ship
+    /// without a class: the `match` here is exhaustive with no `_` arm, same
+    /// discipline as every other consumer.
+    pub fn class(&self) -> darkmux_flow::payload::SeatClass {
+        use darkmux_flow::payload::SeatClass;
         match self {
-            SeatClaim::LocalModel(_) => "local_model",
-            SeatClaim::RemoteEndpoint => "remote_endpoint",
-            SeatClaim::NoModel => "no_model",
-            SeatClaim::LocalModelUnresolved { .. } => "local_model_unresolved",
+            SeatClaim::LocalModel(_) => SeatClass::LocalModel,
+            SeatClaim::RemoteEndpoint => SeatClass::RemoteEndpoint,
+            SeatClaim::NoModel => SeatClass::NoModel,
+            SeatClaim::LocalModelUnresolved { .. } => SeatClass::LocalModelUnresolved,
         }
     }
 }

@@ -461,7 +461,7 @@ pub fn advance_and_read(source: &dyn HostSource, elapsed_ms: u64) -> HostReading
 /// the cheapest possible "no"; an artifact is read by eye long after the
 /// run, where an explicit `null` is a stronger statement than a key that
 /// might merely have been forgotten.
-pub fn stamp(payload: &mut serde_json::Value) {
+pub fn stamp(payload: &mut darkmux_flow::Payload) {
     stamp_with(provenance(), payload);
 }
 
@@ -473,12 +473,9 @@ pub fn stamp(payload: &mut serde_json::Value) {
 /// env var, so a test driving `stamp` directly could only ever exercise
 /// whichever variant the test process happened to resolve — which is
 /// `Real`, always, and the branch that matters would be pinned by nothing.
-pub fn stamp_with(provenance: &Provenance, payload: &mut serde_json::Value) {
-    let Some(path) = provenance.simulated_path() else {
-        return;
-    };
-    if let Some(obj) = payload.as_object_mut() {
-        obj.insert("simulated_host_source".to_string(), serde_json::json!(path));
+pub fn stamp_with(provenance: &Provenance, payload: &mut darkmux_flow::Payload) {
+    if let Some(path) = provenance.simulated_path() {
+        payload.attribute_host_source(path);
     }
 }
 
@@ -768,20 +765,22 @@ pub(crate) fn watched_action_literals_anywhere(src: &str) -> Vec<String> {
     found
 }
 
-/// The wire string of every `FlowAction::<Name>` a line names: the typed
-/// form every producer writes now, read back to the string the registry
-/// classifies.
+/// The wire string of every `FlowAction::<Name>` or `Payload::<Name>` a line
+/// names: the typed forms every producer writes now (a record is built from a
+/// `Payload` variant, whose name is its action's), read back to the string the
+/// registry classifies.
 #[cfg(test)]
 fn flow_action_variants_named(line: &str) -> Vec<&'static str> {
-    const PATH: &str = "FlowAction::";
     let mut out = Vec::new();
-    let mut rest = line;
-    while let Some(i) = rest.find(PATH) {
-        rest = &rest[i + PATH.len()..];
-        let name_len = rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).unwrap_or(rest.len());
-        let name = &rest[..name_len];
-        if let Some(k) = FlowAction::VARIANT_NAMES.iter().position(|n| *n == name) {
-            out.push(FlowAction::KNOWN_WIRE[k]);
+    for path in ["FlowAction::", "Payload::"] {
+        let mut rest = line;
+        while let Some(i) = rest.find(path) {
+            rest = &rest[i + path.len()..];
+            let name_len = rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).unwrap_or(rest.len());
+            let name = &rest[..name_len];
+            if let Some(k) = FlowAction::VARIANT_NAMES.iter().position(|n| *n == name) {
+                out.push(FlowAction::KNOWN_WIRE[k]);
+            }
         }
     }
     out
@@ -1187,23 +1186,34 @@ mod tests {
         assert!(w.contains("REAL hardware"), "{w}");
     }
 
+    /// A `dispatch.rest` payload to stamp: any host-derived record would do.
+    fn rest_payload() -> darkmux_flow::Payload {
+        darkmux_flow::Payload::DispatchRest(darkmux_flow::payload::DispatchRestPayload {
+            reason: "thermal".to_string(),
+            state: Some("fair".to_string()),
+            ..Default::default()
+        })
+    }
+
     #[test]
     fn stamp_is_absent_not_false_when_the_source_is_real() {
-        let mut payload = serde_json::json!({ "reason": "thermal" });
+        let mut payload = rest_payload();
         stamp_with(&Provenance::Real, &mut payload);
+        let json = serde_json::to_value(&payload).unwrap();
         assert!(
-            payload.get("simulated_host_source").is_none(),
+            json.get("simulated_host_source").is_none(),
             "a real run must carry no key at all, not `false` and not `null` — its mere \
              PRESENCE is what answers `were these readings real`"
         );
 
-        let mut payload = serde_json::json!({ "reason": "thermal" });
+        let mut payload = rest_payload();
         stamp_with(
             &Provenance::ScriptedUnavailable { path: "/nope".into(), error: "boom".into() },
             &mut payload,
         );
+        let json = serde_json::to_value(&payload).unwrap();
         assert!(
-            payload.get("simulated_host_source").is_none(),
+            json.get("simulated_host_source").is_none(),
             "a scenario that failed to LOAD is reading real hardware, so nothing may be \
              stamped — stamping the path here would mark real readings as simulated"
         );
@@ -1211,19 +1221,20 @@ mod tests {
 
     #[test]
     fn stamp_names_the_scenario_on_every_simulated_payload() {
-        let mut payload = serde_json::json!({ "reason": "thermal", "state": "fair" });
+        let mut payload = rest_payload();
         stamp_with(
             &Provenance::Scripted { path: "/s.jsonl".into(), frames: 1, span_ms: 1 },
             &mut payload,
         );
+        let json = serde_json::to_value(&payload).unwrap();
         assert_eq!(
-            payload["simulated_host_source"],
+            json["simulated_host_source"],
             serde_json::json!("/s.jsonl"),
             "a pacing record made on scripted readings must say so — a flow stream that \
              cannot distinguish a simulated pause from a real one is a flow stream that \
              lies about the machine"
         );
-        assert_eq!(payload["reason"], serde_json::json!("thermal"), "and must not disturb the rest");
+        assert_eq!(json["reason"], serde_json::json!("thermal"), "and must not disturb the rest");
     }
 
     #[test]

@@ -4,7 +4,8 @@ import type { HostSampleNow } from "./HostSampleNow";
 import type { LoadWindow } from "./LoadWindow";
 
 /**
- * The daemon-side continuous host sampler's reading.
+ * The machine lens's own picture: the latest reading, its window, and the slow-moving battery
+ * health fact.
  */
 export type MachineLoad = { 
 /**

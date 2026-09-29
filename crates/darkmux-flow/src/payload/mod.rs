@@ -29,10 +29,42 @@
 //! one grep.
 
 mod audit;
+mod dispatch;
 mod hook;
+mod lifecycle;
+mod machine;
+mod telemetry;
+mod thermal;
+mod usage;
 
 pub use audit::AuditWriteFailedPayload;
 pub use hook::{HookDeliveryPayload, HookDryRunPayload, HookFailedPayload, HookNoticePayload};
+pub use dispatch::{
+    BoundRef, BriefRef, BriefRefKind, CheckpointVerdict, DispatchCheckpointPayload, DispatchCompactionPayload,
+    DispatchDegeneracyWarningPayload, DispatchEndPayload, DispatchFeedbackPayload, DispatchHeartbeatPayload,
+    DispatchReasoningPayload, DispatchRestPayload, DispatchRoutePayload, DispatchStartPayload, DispatchToolPayload,
+    DispatchTurnPayload, DispatchWorkdirGitUnavailablePayload, GitCheckout, GitdirKind, HostWindow, Knob, KnobSource,
+    LiveSummary, ResultClass, RouteDecision, RuntimeBounds, StreamPhase, ToolOutcome, TurnUsage,
+};
+pub use lifecycle::{
+    BreachLevel, BudgetMetric, BudgetPayload, BudgetPolicyKind, BudgetScope, FailedVerifier, GhVerbExecutedPayload, GrowReason,
+    MissionGrowPayload, MissionRunTerminalPayload, PhaseReviewVerdictPayload, RadioDecision, RadioRoutePayload, RadioSurface,
+    ReviewVerdict, RunPayload, SeatClass, StepResultPayload, StepSeatUnresolvedPayload, StepStartPayload, StepTimingPayload,
+};
+pub use machine::{
+    BatteryCharge, BatteryHealthNow, BatteryTransition, CpuClusterNow, HostSampleNow, LoadWindow, MachineBatteryHealthPayload,
+    MachineBatteryPayload, MachineLoad, MachineRollupPayload, MachineTelemetryPayload, MachineThermalPayload, MetricWindow,
+    PowerNow, PowerWindowWire, ThermalNow, ThermalWindowWire,
+};
+pub use telemetry::{
+    DetectorArea, DetectorKind, DetectorSeverity, LmsEvent, LmsRole, TelemetryCompactionPayload, TelemetryContextPayload,
+    TelemetryDetectorPayload, TelemetryLmsPayload, TelemetryRuntimePayload,
+};
+pub use thermal::{
+    BatteryPauseUnsupportedPayload, EjectFailure, EjectedModel, ThermalStopUnresolvedPayload, ThermalTier5EjectFailedPayload,
+    ThermalTier5EjectPayload,
+};
+pub use usage::{CallKind, TokenSource, UsagePayload, UsagePurpose, UtilityErrorPayload, UtilityJobKind, UtilityStartPayload};
 
 use crate::FlowAction;
 use serde::{Deserialize, Serialize, Serializer};
@@ -91,6 +123,29 @@ impl Serialize for UnreadPayload {
     }
 }
 
+/// The attribution a crew-built record lays over its payload, beyond the
+/// fields the payload's own type names: the graph step a step session names
+/// (`step_id`), the caller's provenance (`context`, a JSON object), and, on a
+/// record whose existence or content is a host reading, the scripted source
+/// behind it (`simulated_host_source`). A type carries the field or leaves the
+/// slot `None`, so a payload without it is never attributed.
+pub trait Attribution {
+    /// The payload's `step_id`, when its type has one.
+    fn step_slot(&mut self) -> Option<&mut Option<String>> {
+        None
+    }
+    /// The payload's `context`, when its type has one.
+    fn context_slot(&mut self) -> Option<&mut Option<serde_json::Map<String, Value>>> {
+        None
+    }
+    /// The payload's `simulated_host_source`, when its type has one.
+    fn host_source_slot(&mut self) -> Option<&mut Option<String>> {
+        None
+    }
+}
+
+impl Attribution for OpenPayload {}
+
 macro_rules! flow_payloads {
     ( $( $variant:ident => $ty:ty; )* ) => {
         /// A flow record's payload: one variant per payload-bearing action.
@@ -111,6 +166,45 @@ macro_rules! flow_payloads {
                 match self {
                     $( Payload::$variant(_) => FlowAction::$variant, )*
                     Payload::Unread(u) => u.action.clone(),
+                }
+            }
+
+            /// Name the graph step this payload belongs to, unless it already
+            /// names one. A payload whose type has no `step_id` is unchanged.
+            pub fn attribute_step(&mut self, step: &str) {
+                match self {
+                    $( Payload::$variant(p) => {
+                        if let Some(slot) = Attribution::step_slot(p) {
+                            slot.get_or_insert_with(|| step.to_string());
+                        }
+                    } )*
+                    Payload::Unread(_) => {}
+                }
+            }
+
+            /// Set the caller's provenance object, when the payload's type
+            /// carries one.
+            pub fn attribute_context(&mut self, context: &serde_json::Map<String, Value>) {
+                match self {
+                    $( Payload::$variant(p) => {
+                        if let Some(slot) = Attribution::context_slot(p) {
+                            *slot = Some(context.clone());
+                        }
+                    } )*
+                    Payload::Unread(_) => {}
+                }
+            }
+
+            /// Name the scripted host source behind this payload, when its
+            /// type carries the field.
+            pub fn attribute_host_source(&mut self, path: &str) {
+                match self {
+                    $( Payload::$variant(p) => {
+                        if let Some(slot) = Attribution::host_source_slot(p) {
+                            *slot = Some(path.to_string());
+                        }
+                    } )*
+                    Payload::Unread(_) => {}
                 }
             }
 
@@ -149,71 +243,60 @@ macro_rules! flow_payloads {
 
 flow_payloads! {
     AuditWriteFailed => AuditWriteFailedPayload;
-    BatteryPauseUnsupported => OpenPayload;
-    BudgetWarn => OpenPayload;
-    BudgetWait => OpenPayload;
-    BudgetResume => OpenPayload;
-    BudgetStop => OpenPayload;
-    DispatchStart => OpenPayload;
-    DispatchComplete => OpenPayload;
-    DispatchError => OpenPayload;
-    DispatchTurn => OpenPayload;
-    DispatchTurnHeartbeat => OpenPayload;
-    DispatchTool => OpenPayload;
-    DispatchCompaction => OpenPayload;
-    DispatchCheckpoint => OpenPayload;
-    DispatchReasoning => OpenPayload;
-    DispatchFeedbackInjected => OpenPayload;
-    DispatchRest => OpenPayload;
-    DispatchDegeneracyWarning => OpenPayload;
-    DispatchWorkdirGitUnavailable => OpenPayload;
-    DispatchRoute => OpenPayload;
-    GhVerbExecuted => OpenPayload;
+    BatteryPauseUnsupported => BatteryPauseUnsupportedPayload;
+    BudgetWarn => BudgetPayload;
+    BudgetWait => BudgetPayload;
+    BudgetResume => BudgetPayload;
+    BudgetStop => BudgetPayload;
+    DispatchStart => DispatchStartPayload;
+    DispatchComplete => DispatchEndPayload;
+    DispatchError => DispatchEndPayload;
+    DispatchTurn => DispatchTurnPayload;
+    DispatchTurnHeartbeat => DispatchHeartbeatPayload;
+    DispatchTool => DispatchToolPayload;
+    DispatchCompaction => DispatchCompactionPayload;
+    DispatchCheckpoint => DispatchCheckpointPayload;
+    DispatchReasoning => DispatchReasoningPayload;
+    DispatchFeedbackInjected => DispatchFeedbackPayload;
+    DispatchRest => DispatchRestPayload;
+    DispatchDegeneracyWarning => DispatchDegeneracyWarningPayload;
+    DispatchWorkdirGitUnavailable => DispatchWorkdirGitUnavailablePayload;
+    DispatchRoute => DispatchRoutePayload;
+    GhVerbExecuted => GhVerbExecutedPayload;
     HookFired => HookDeliveryPayload;
     HookFailed => HookFailedPayload;
     HookDryRun => HookDryRunPayload;
-    MachineTelemetry => OpenPayload;
-    MachineThermal => OpenPayload;
-    MachineBattery => OpenPayload;
-    MachineBatteryHealth => OpenPayload;
-    MachineRollup => OpenPayload;
+    MachineTelemetry => MachineTelemetryPayload;
+    MachineThermal => MachineThermalPayload;
+    MachineBattery => MachineBatteryPayload;
+    MachineBatteryHealth => MachineBatteryHealthPayload;
+    MachineRollup => MachineRollupPayload;
     MissionStart => OpenPayload;
     MissionClose => OpenPayload;
     MissionAbort => OpenPayload;
-    MissionGrow => OpenPayload;
-    MissionDebriefPrompt => OpenPayload;
-    MissionRunFinalize => OpenPayload;
-    MissionRunAbort => OpenPayload;
-    OperatorNote => OpenPayload;
-    OperatorCatch => OpenPayload;
-    PhaseReviewBegin => OpenPayload;
-    PhaseReviewAborted => OpenPayload;
-    PhaseReviewDispatch => OpenPayload;
-    PhaseReviewFailed => OpenPayload;
-    PhaseReviewVerdict => OpenPayload;
-    RadioRoute => OpenPayload;
-    RunStart => OpenPayload;
-    RunComplete => OpenPayload;
-    RunError => OpenPayload;
-    StepStart => OpenPayload;
-    StepComplete => OpenPayload;
-    StepError => OpenPayload;
-    StepResult => OpenPayload;
-    StepTiming => OpenPayload;
-    StepSeatUnresolved => OpenPayload;
-    StreamError => OpenPayload;
-    TelemetryTokens => OpenPayload;
-    TelemetryDetector => OpenPayload;
-    TelemetryContext => OpenPayload;
-    TelemetryCompaction => OpenPayload;
-    TelemetryRuntime => OpenPayload;
-    TelemetryLms => OpenPayload;
-    TierDecision => OpenPayload;
-    ThermalStopUnresolved => OpenPayload;
-    ThermalTier5Eject => OpenPayload;
-    ThermalTier5EjectFailed => OpenPayload;
-    UtilityStart => OpenPayload;
-    UtilityError => OpenPayload;
+    MissionGrow => MissionGrowPayload;
+    MissionRunFinalize => MissionRunTerminalPayload;
+    MissionRunAbort => MissionRunTerminalPayload;
+    PhaseReviewVerdict => PhaseReviewVerdictPayload;
+    RadioRoute => RadioRoutePayload;
+    RunStart => RunPayload;
+    RunComplete => RunPayload;
+    RunError => RunPayload;
+    StepStart => StepStartPayload;
+    StepResult => StepResultPayload;
+    StepTiming => StepTimingPayload;
+    StepSeatUnresolved => StepSeatUnresolvedPayload;
+    TelemetryTokens => UsagePayload;
+    TelemetryDetector => TelemetryDetectorPayload;
+    TelemetryContext => TelemetryContextPayload;
+    TelemetryCompaction => TelemetryCompactionPayload;
+    TelemetryRuntime => TelemetryRuntimePayload;
+    TelemetryLms => TelemetryLmsPayload;
+    ThermalStopUnresolved => ThermalStopUnresolvedPayload;
+    ThermalTier5Eject => ThermalTier5EjectPayload;
+    ThermalTier5EjectFailed => ThermalTier5EjectFailedPayload;
+    UtilityStart => UtilityStartPayload;
+    UtilityError => UtilityErrorPayload;
 }
 
 /// The generated TypeScript `FlowPayloads`: each payload-bearing action's wire

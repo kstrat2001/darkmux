@@ -1608,7 +1608,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
         let taken = slot.lock().unwrap().take();
         match taken {
             Some(Ok(review)) => {
-                assert_eq!(review.verdict, "clean");
+                assert_eq!(review.verdict, darkmux_flow::payload::ReviewVerdict::Clean);
                 assert_eq!(review.total_findings, 0);
             }
             Some(Err(e)) => panic!("expected Ok(clean review), got Err({e})"),
@@ -1873,7 +1873,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
         // dispatch indistinguishable from a healthy hosted one.
         let claim = resolve_local_seat("no-such-role-xyz", None, Some(path_str), "seat");
         let SeatClaim::LocalModelUnresolved { reason } = claim else {
-            panic!("an unresolvable role must claim LocalModelUnresolved, got {}", claim.label());
+            panic!("an unresolvable role must claim LocalModelUnresolved, got {}", format!("{:?}", claim.class()));
         };
         assert!(reason.contains("no-such-role-xyz"), "the reason names the role: {reason}");
     }

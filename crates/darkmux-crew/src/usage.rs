@@ -57,60 +57,7 @@
 
 use darkmux_types::execution_id::ExecutionId;
 
-/// Which kind of model call a usage record accounts for. Serialized into
-/// the payload's `call_kind` through serde (the variant names ARE the wire
-/// spelling), and exported to the viewer as a generated TS type.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
-pub enum CallKind {
-    /// One agent-loop turn of the container runtime.
-    Turn,
-    /// One container-free single-shot chat completion.
-    SingleShot,
-    /// One `dispatch.map` item.
-    MapItem,
-    /// (#2902 step 1b) One runtime compactor call: a sub-execution of the
-    /// utility role, attributed to it, never to the specialist.
-    Compaction,
-}
-
-/// (#2902, #2914) WHOSE job a model call was: the operator's WORK, or one of
-/// darkmux's own UTILITY jobs. Stamped on every usage record as `purpose`
-/// by [`usage_payload`], decided by [`call_purpose`] (the single definition
-/// of the utility jobs). The viewer's hero shows utility as its own chip, and
-/// an execution's own numbers (run page tiles, mission-graph step meter)
-/// exclude it (CLAUDE.md contract 8: sub-executions are never blended into
-/// the primary).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
-pub enum UsagePurpose {
-    /// The operator's work: every call that is not a utility job.
-    Work,
-    /// darkmux's own job, run on the machine's utility model.
-    Utility,
-}
-
-/// (#2915) WHICH of darkmux's utility jobs a call (or a `utility.start`)
-/// belongs to. Stamped as `job` on a utility usage record and on every
-/// `utility.start` / `utility.error`, and exported to the viewer as a
-/// generated TS union: the viewer keys each job's own visual by it, and
-/// gives a job it has no visual for a generic utility indicator, so a new
-/// variant here is never silent there.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
-pub enum UtilityJobKind {
-    /// A runtime compactor call (inside the container, serving the
-    /// execution it compacts).
-    Compaction,
-    /// A radio routing call (host-side, serving no execution).
-    RadioRouting,
-}
+pub use darkmux_flow::payload::{CallKind, TokenSource, UsagePayload, UsagePurpose, UtilityErrorPayload, UtilityJobKind, UtilityStartPayload};
 
 /// (#2902, #2914, #2915) THE definition of darkmux's utility jobs: every
 /// runtime COMPACTOR call, and every call made by the radio ROUTING role
@@ -167,15 +114,31 @@ pub fn unix_ms_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// (#2915 review, C4) Stamp a utility job's END (its usage record or its
-/// `utility.error`): the `job_id` its start minted, `ended_at_ms`, and
-/// `duration_ms` from the start's `started_at_ms`. A sub-second job's start
-/// and end share a whole-second `ts`; these keep them apart.
-pub fn stamp_utility_end(payload: &mut serde_json::Value, job_id: &str, started_at_ms: u64, ended_at_ms: u64) {
-    if let Some(obj) = payload.as_object_mut() {
-        obj.insert("job_id".into(), serde_json::json!(job_id));
-        obj.insert("ended_at_ms".into(), serde_json::json!(ended_at_ms));
-        obj.insert("duration_ms".into(), serde_json::json!(ended_at_ms.saturating_sub(started_at_ms)));
+/// (#2915 review, C4) Stamp a utility job's END on its usage record: the
+/// `job_id` its start minted, `ended_at_ms`, and `duration_ms` from the
+/// start's `started_at_ms`. A sub-second job's start and end share a
+/// whole-second `ts`; these keep them apart.
+pub fn stamp_utility_end(payload: &mut UsagePayload, job_id: &str, started_at_ms: u64, ended_at_ms: u64) {
+    payload.job_id = Some(job_id.to_string());
+    payload.ended_at_ms = Some(ended_at_ms);
+    payload.duration_ms = Some(ended_at_ms.saturating_sub(started_at_ms));
+}
+
+/// (#2915) The end of a started job that has no usage record: its
+/// `utility.error` payload, with the same end stamps a usage record carries.
+pub fn utility_error_payload(
+    job: UtilityJobKind,
+    model: &str,
+    job_id: &str,
+    started_at_ms: u64,
+    ended_at_ms: u64,
+) -> UtilityErrorPayload {
+    UtilityErrorPayload {
+        job,
+        model: model.to_string(),
+        job_id: job_id.to_string(),
+        ended_at_ms,
+        duration_ms: ended_at_ms.saturating_sub(started_at_ms),
     }
 }
 
@@ -196,33 +159,31 @@ pub fn utility_start_payload(
     serves: Option<&str>,
     stall_after_ms: u64,
     started_at_ms: u64,
-) -> serde_json::Value {
-    let mut payload = serde_json::json!({
-        "job": job,
-        "job_id": job_id,
-        "model": model,
-        "stall_after_ms": stall_after_ms,
-        "started_at_ms": started_at_ms,
-    });
-    if let Some(sid) = serves {
-        payload["serves"] = serde_json::json!(sid);
+) -> UtilityStartPayload {
+    UtilityStartPayload {
+        job,
+        job_id: job_id.to_string(),
+        model: model.to_string(),
+        stall_after_ms,
+        started_at_ms,
+        serves: serves.map(str::to_string),
+        generation: None,
+        step_id: None,
+        context: None,
     }
-    payload
 }
 
-/// (#2915) A host-side (sessionless) utility job's lifecycle marker:
-/// `action` is [`darkmux_flow::FlowAction::UtilityStart`] or [`darkmux_flow::FlowAction::UtilityError`], `handle`
+/// (#2915) A host-side (sessionless) utility job's lifecycle marker: a
+/// `utility.start` or `utility.error` (the payload's own action), `handle`
 /// the job's role id, the same attribution its usage record carries.
-pub fn utility_marker_record(action: darkmux_flow::FlowAction, job_role_id: &str, model: &str, payload: serde_json::Value) -> darkmux_flow::FlowRecord {
-    let mut rec = utility_usage_record(job_role_id, model, &ExecutionId::mint(), payload.clone());
-    rec.payload = Some(darkmux_flow::Payload::settle(&action, payload));
+pub fn utility_marker_record(job_role_id: &str, model: &str, payload: darkmux_flow::Payload) -> darkmux_flow::FlowRecord {
+    let mut rec = utility_record(job_role_id, model, payload);
     // A marker is not a record of the execution (its `job_id` pairs it with
     // its job), so it carries no execution id.
     rec.execution_id = None;
-    if action == darkmux_flow::FlowAction::UtilityError {
+    if rec.action == darkmux_flow::FlowAction::UtilityError {
         rec.level = darkmux_flow::Level::Warn;
     }
-    rec.action = action;
     rec.source = Some(darkmux_flow::FlowSource::Utility);
     rec
 }
@@ -247,42 +208,37 @@ pub struct CallFacts<'a> {
 }
 
 /// THE writer: one call's canonical `telemetry.tokens` payload.
-pub fn usage_payload(facts: &CallFacts<'_>, counts: &darkmux_trajectory::UsageCounts) -> serde_json::Value {
-    let mut payload = serde_json::json!({
-        "call_kind": facts.call_kind,
-        "purpose": call_purpose(facts.call_kind, facts.role_id),
-        "requested_model": facts.requested_model,
-        "endpoint": facts.endpoint,
-    });
-    let obj = payload.as_object_mut().expect("json! built an object");
-    // (#2915) A utility call names its job, so the viewer pairs it with the
-    // job's `utility.start` and tallies each job's own usage.
-    if let Some(job) = utility_job(facts.call_kind, facts.role_id) {
-        obj.insert("job".into(), serde_json::json!(job));
+pub fn usage_payload(facts: &CallFacts<'_>, counts: &darkmux_trajectory::UsageCounts) -> UsagePayload {
+    let reported = counts.reported();
+    let count = |value: Option<u64>| if reported { value } else { None };
+    UsagePayload {
+        call_kind: Some(facts.call_kind),
+        purpose: Some(call_purpose(facts.call_kind, facts.role_id)),
+        requested_model: Some(facts.requested_model.to_string()),
+        endpoint: Some(facts.endpoint.to_string()),
+        // (#2915) A utility call names its job, so the viewer pairs it with
+        // the job's `utility.start` and tallies each job's own usage.
+        job: utility_job(facts.call_kind, facts.role_id),
+        reported_model: facts.reported_model.map(str::to_string),
+        endpoint_id: facts.endpoint_id.map(str::to_string),
+        token_source: Some(if reported { TokenSource::Provider } else { TokenSource::Absent }),
+        prompt_tokens: count(counts.prompt),
+        completion_tokens: count(counts.completion),
+        total_tokens: count(counts.total_tokens()),
+        reasoning_tokens: count(counts.reasoning),
+        cached_tokens: count(counts.cached),
+        turn_seq: None,
+        remote: None,
+        index: None,
+        generation: None,
+        parent_role_id: None,
+        parent_model: None,
+        job_id: None,
+        ended_at_ms: None,
+        duration_ms: None,
+        step_id: None,
+        context: None,
     }
-    if let Some(m) = facts.reported_model {
-        obj.insert("reported_model".into(), serde_json::json!(m));
-    }
-    if let Some(id) = facts.endpoint_id {
-        obj.insert("endpoint_id".into(), serde_json::json!(id));
-    }
-    if !counts.reported() {
-        obj.insert("token_source".into(), serde_json::json!("absent"));
-        return payload;
-    }
-    obj.insert("token_source".into(), serde_json::json!("provider"));
-    for (key, value) in [
-        ("prompt_tokens", counts.prompt),
-        ("completion_tokens", counts.completion),
-        ("total_tokens", counts.total_tokens()),
-        ("reasoning_tokens", counts.reasoning),
-        ("cached_tokens", counts.cached),
-    ] {
-        if let Some(v) = value {
-            obj.insert(key.into(), serde_json::json!(v));
-        }
-    }
-    payload
 }
 
 /// (#2914) The flow record for a host-side UTILITY job's usage: the same
@@ -294,19 +250,29 @@ pub fn usage_payload(facts: &CallFacts<'_>, counts: &darkmux_trajectory::UsageCo
 /// record names the `execution` the caller minted for it. Built here,
 /// beside the payload writer, so the record and its payload cannot drift
 /// apart.
-pub fn utility_usage_record(job_role_id: &str, model: &str, execution: &ExecutionId, payload: serde_json::Value) -> darkmux_flow::FlowRecord {
+pub fn utility_usage_record(job_role_id: &str, model: &str, execution: &ExecutionId, payload: UsagePayload) -> darkmux_flow::FlowRecord {
+    darkmux_flow::FlowRecord {
+        execution_id: Some(execution.clone()),
+        source: Some(darkmux_flow::FlowSource::Tokens),
+        ..utility_record(job_role_id, model, darkmux_flow::Payload::TelemetryTokens(payload))
+    }
+}
+
+/// The record shape a host-side utility job's records share: telemetry,
+/// darkmux's, no session, on the job's role and model.
+fn utility_record(job_role_id: &str, model: &str, payload: darkmux_flow::Payload) -> darkmux_flow::FlowRecord {
     darkmux_flow::FlowRecord {
         ts: darkmux_flow::ts_utc_now(),
         level: darkmux_flow::Level::Info,
         category: darkmux_flow::Category::Telemetry,
         tier: darkmux_flow::Tier::Darkmux,
         stage: darkmux_flow::Stage::Dispatch,
-        action: darkmux_flow::FlowAction::TelemetryTokens,
+        action: payload.action(),
         handle: job_role_id.to_string(),
         phase_id: None,
         session_id: None,
-        execution_id: Some(execution.clone()),
-        source: Some(darkmux_flow::FlowSource::Tokens),
+        execution_id: None,
+        source: None,
         model: Some(model.to_string()),
         reasoning: None,
         mission_id: None,
@@ -314,7 +280,7 @@ pub fn utility_usage_record(job_role_id: &str, model: &str, execution: &Executio
         machine_uid: None,
         prev_hash: None,
         hash: None,
-        payload: Some(darkmux_flow::Payload::settle(&darkmux_flow::FlowAction::TelemetryTokens, payload)),
+        payload: Some(payload),
     }
 }
 
@@ -524,9 +490,9 @@ mod tests {
             endpoint_id,
         };
         let counts = darkmux_trajectory::UsageCounts { total: Some(5), ..Default::default() };
-        assert_eq!(usage_payload(&facts(Some("azure")), &counts)["endpoint_id"], "azure");
-        assert!(usage_payload(&facts(None), &counts).get("endpoint_id").is_none());
-        assert_eq!(usage_payload(&facts(Some("azure")), &darkmux_trajectory::UsageCounts::default())["endpoint_id"], "azure", "an absent-usage record still names its endpoint");
+        assert_eq!(usage_payload(&facts(Some("azure")), &counts).endpoint_id.as_deref(), Some("azure"));
+        assert!(usage_payload(&facts(None), &counts).endpoint_id.is_none());
+        assert_eq!(usage_payload(&facts(Some("azure")), &darkmux_trajectory::UsageCounts::default()).endpoint_id.as_deref(), Some("azure"), "an absent-usage record still names its endpoint");
     }
     use super::*;
 
@@ -543,7 +509,7 @@ mod tests {
 
     #[test]
     fn provider_total_wins_over_the_sum() {
-        let p = usage_payload(
+        let p = serde_json::to_value(usage_payload(
             &facts(Some("served")),
             &darkmux_trajectory::UsageCounts {
                 prompt: Some(10),
@@ -551,7 +517,7 @@ mod tests {
                 total: Some(40),
                 ..Default::default()
             },
-        );
+        )).unwrap();
         assert_eq!(p["total_tokens"], 40);
         assert_eq!(p["token_source"], "provider");
         assert_eq!(p["reported_model"], "served");
@@ -571,10 +537,10 @@ mod tests {
                 reported_model: None,
                 endpoint: "http://h:1234/v1",
             };
-            usage_payload(&f, &darkmux_trajectory::UsageCounts::default())["purpose"].clone()
+            usage_payload(&f, &darkmux_trajectory::UsageCounts::default()).purpose
         };
-        let utility = serde_json::json!(UsagePurpose::Utility);
-        let work = serde_json::json!(UsagePurpose::Work);
+        let utility = Some(UsagePurpose::Utility);
+        let work = Some(UsagePurpose::Work);
         assert_eq!(purpose(CallKind::Compaction, Some("compactor")), utility, "compactor call");
         assert_eq!(purpose(CallKind::Compaction, None), utility, "compactor call, no role");
         assert_eq!(
@@ -608,12 +574,12 @@ mod tests {
             };
             usage_payload(&f, &darkmux_trajectory::UsageCounts::default())
         };
-        assert_eq!(payload(CallKind::Compaction, Some("compactor"))["job"], "compaction");
+        assert_eq!(payload(CallKind::Compaction, Some("compactor")).job, Some(UtilityJobKind::Compaction));
         assert_eq!(
-            payload(CallKind::SingleShot, Some(crate::loader::RADIO_ROUTER_ROLE_ID))["job"],
-            "radio_routing"
+            payload(CallKind::SingleShot, Some(crate::loader::RADIO_ROUTER_ROLE_ID)).job,
+            Some(UtilityJobKind::RadioRouting)
         );
-        let work = payload(CallKind::Turn, Some("coder"));
+        let work = serde_json::to_value(payload(CallKind::Turn, Some("coder"))).unwrap();
         assert!(work.get("job").is_none(), "work names no job: {work}");
     }
 
@@ -633,7 +599,7 @@ mod tests {
     /// and `serves` only when the job serves an execution.
     #[test]
     fn utility_start_payload_names_job_model_bound_and_what_it_serves() {
-        let p = utility_start_payload(UtilityJobKind::Compaction, "j-1", "darkmux:u4b", Some("sid-1"), 600_000, 5);
+        let p = serde_json::to_value(utility_start_payload(UtilityJobKind::Compaction, "j-1", "darkmux:u4b", Some("sid-1"), 600_000, 5)).unwrap();
         assert_eq!(p["job_id"], "j-1");
         assert_eq!(p["started_at_ms"], 5);
         assert_eq!(p["job"], "compaction");
@@ -641,8 +607,8 @@ mod tests {
         assert_eq!(p["serves"], "sid-1");
         assert_eq!(p["stall_after_ms"], 600_000);
         let r = utility_start_payload(UtilityJobKind::RadioRouting, "j-2", "u4b", None, 30_000, 5);
-        assert!(r.get("serves").is_none(), "absent, never null: {r}");
-        let rec = utility_marker_record(darkmux_flow::FlowAction::UtilityStart, "radio-router", "u4b", r);
+        assert!(serde_json::to_value(&r).unwrap().get("serves").is_none(), "absent, never null: {r:?}");
+        let rec = utility_marker_record("radio-router", "u4b", darkmux_flow::Payload::UtilityStart(r));
         assert_eq!(rec.action, darkmux_flow::FlowAction::UtilityStart);
         assert_eq!(rec.source, Some(darkmux_flow::FlowSource::Utility));
         assert!(rec.session_id.is_none(), "a host-side utility job has no session");
@@ -674,14 +640,14 @@ mod tests {
 
     #[test]
     fn a_split_without_a_total_sums() {
-        let p = usage_payload(
+        let p = serde_json::to_value(usage_payload(
             &facts(None),
             &darkmux_trajectory::UsageCounts {
                 prompt: Some(10),
                 completion: Some(5),
                 ..Default::default()
             },
-        );
+        )).unwrap();
         assert_eq!(p["total_tokens"], 15);
         assert!(p.get("reported_model").is_none(), "absent, not null: {p}");
         assert!(
@@ -692,7 +658,7 @@ mod tests {
 
     #[test]
     fn no_usage_block_is_absent_with_no_counts() {
-        let p = usage_payload(&facts(None), &darkmux_trajectory::UsageCounts::default());
+        let p = serde_json::to_value(usage_payload(&facts(None), &darkmux_trajectory::UsageCounts::default())).unwrap();
         assert_eq!(p["token_source"], "absent");
         for k in [
             "prompt_tokens",

@@ -1,5 +1,6 @@
 //! The payload of `audit.write_failed`.
 
+use super::Attribution;
 use serde::{Deserialize, Serialize};
 
 /// The breadcrumb the tee sink writes to its casual sink when the audit sink refused a record:
@@ -15,3 +16,5 @@ pub struct AuditWriteFailedPayload {
     /// The audit sink's error.
     pub error: String,
 }
+
+impl Attribution for AuditWriteFailedPayload {}

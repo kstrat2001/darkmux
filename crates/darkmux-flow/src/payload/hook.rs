@@ -1,6 +1,7 @@
 //! Payloads of the hook engine's own records (`hook.fired`, `hook.failed`,
 //! `hook.dry_run`).
 
+use super::Attribution;
 use serde::{Deserialize, Serialize};
 
 /// One delivery attempt of a matched record to a hook rule's receiver: the payload of `hook.fired`
@@ -40,6 +41,8 @@ pub struct HookDeliveryPayload {
     pub receiver_rejected_reasons: Option<Vec<String>>,
 }
 
+impl Attribution for HookDeliveryPayload {}
+
 /// A rate-limited `hook.failed` notice about a rule as a whole rather than one delivery: the outbox
 /// over its cap (`dropped_count`) or its transform backlogged (`orphaned_transforms`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -63,6 +66,8 @@ pub struct HookNoticePayload {
     pub orphaned_transforms: Option<u32>,
 }
 
+impl Attribution for HookNoticePayload {}
+
 /// A `hook.failed` payload: a failed delivery, or a notice about the rule.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -72,6 +77,8 @@ pub enum HookFailedPayload {
     Delivery(HookDeliveryPayload),
     Notice(HookNoticePayload),
 }
+
+impl Attribution for HookFailedPayload {}
 
 /// One `file`-transport write: what a `hook.fired` would have delivered, dumped to disk instead.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -88,3 +95,5 @@ pub struct HookDryRunPayload {
     /// Where the dump was written.
     pub dump_path: String,
 }
+
+impl Attribution for HookDryRunPayload {}

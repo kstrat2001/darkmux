@@ -1246,12 +1246,7 @@ pub fn run_step_graph(
             // (#2394) The step's own start bookend, stamped with what it
             // consumes. Paired with `persist` exactly as it was when both
             // lived in the status-flip loop above.
-            emit(step_lifecycle_record_with_payload(
-                run,
-                &step_snapshot,
-                darkmux_flow::FlowAction::StepStart,
-                Some(serde_json::json!({ "seat_class": seat.label() })),
-            ));
+            emit(step_start_record(run, &step_snapshot, seat.class()));
             persist(&step_snapshot);
             // (#1483 Bug 3) The job wrapper's OWN handle on the wave channel,
             // used to stream this step's terminal transition the instant its
@@ -1971,7 +1966,11 @@ pub const STEP_LIFECYCLE_ACTIONS: [darkmux_flow::FlowAction; 3] = [
 /// config never share a session id, and the record names its mission
 /// without a launcher backfill.
 fn step_lifecycle_record(run: &RunId, step: &Step, action: darkmux_flow::FlowAction) -> FlowRecord {
-    step_lifecycle_record_with_payload(run, step, action, None)
+    let level = if action == darkmux_flow::FlowAction::StepError { Level::Warn } else { Level::Info };
+    FlowRecord {
+        source: Some(darkmux_flow::FlowSource::Scheduler),
+        ..FlowRecord::for_session(&SessionId::task(run.clone(), &step.task_id), level, Category::Work, Stage::Dispatch, action, step.id.clone())
+    }
 }
 
 
@@ -1989,45 +1988,39 @@ fn step_lifecycle_record(run: &RunId, step: &Step, action: darkmux_flow::FlowAct
 fn seat_unresolved_record(run: &RunId, step: &Step, reason: &str) -> FlowRecord {
     FlowRecord {
         source: Some(darkmux_flow::FlowSource::Scheduler),
-        ..FlowRecord::for_session(&SessionId::task(run.clone(), &step.task_id), Level::Warn, Category::Work, Stage::Dispatch, darkmux_flow::FlowAction::StepSeatUnresolved, step.id.clone())
-            .with_json_payload(serde_json::json!({
-                "step_id": step.id,
-                "kind": step.kind,
-                "seat_class": "local_model_unresolved",
-                "reason": reason,
-                "lost": "wave load + #1487 residency lease",
-            }))
+        ..FlowRecord::for_session_with(
+            &SessionId::task(run.clone(), &step.task_id),
+            Level::Warn,
+            Category::Work,
+            Stage::Dispatch,
+            darkmux_flow::Payload::StepSeatUnresolved(darkmux_flow::payload::StepSeatUnresolvedPayload {
+                step_id: step.id.clone(),
+                kind: step.kind.clone(),
+                seat_class: darkmux_flow::payload::SeatClass::LocalModelUnresolved,
+                reason: reason.to_string(),
+                lost: "wave load + #1487 residency lease".to_string(),
+            }),
+            step.id.clone(),
+        )
     }
 }
 
-/// (#1959) Payload-carrying variant, exported so a Tier-3 bespoke driver
-/// that mints its own `Step`s outside `run_step_graph` (the crawl
-/// launcher — see `CLAUDE.md`'s StepKind tiering doc for why it's Tier 3)
-/// can still emit the SAME canonical `"step start"`/`"step complete"`/
-/// `"step error"` vocabulary (`STEP_LIFECYCLE_ACTIONS`) with its own
-/// numbers in the payload, rather than inventing a competing action
-/// family. Every in-crate call site routes through the 2-arg wrapper
-/// above with `payload: None` — behavior unchanged.
-///
-/// `mission_id` is `None` here for the SAME reason the module doc on the
-/// 2-arg wrapper names: this function has no `Mission` concept of its
-/// own. A caller outside `run_step_graph`'s own backfill wrap (like the
-/// crawl launcher) sets `.mission_id` on the returned record directly
-/// before emitting it.
-fn step_lifecycle_record_with_payload(
-    run: &RunId,
-    step: &Step,
-    action: darkmux_flow::FlowAction,
-    payload: Option<serde_json::Value>,
-) -> FlowRecord {
-    let level = if action == darkmux_flow::FlowAction::StepError { Level::Warn } else { Level::Info };
+/// The `step.start` record, stamped with what the step consumes: the same
+/// task session and source as [`step_lifecycle_record`], carrying the
+/// step's seat class.
+fn step_start_record(run: &RunId, step: &Step, seat: darkmux_flow::payload::SeatClass) -> FlowRecord {
     FlowRecord {
         source: Some(darkmux_flow::FlowSource::Scheduler),
-        payload: payload.map(|p| darkmux_flow::Payload::settle(&action, p)),
-        ..FlowRecord::for_session(&SessionId::task(run.clone(), &step.task_id), level, Category::Work, Stage::Dispatch, action, step.id.clone())
+        ..FlowRecord::for_session_with(
+            &SessionId::task(run.clone(), &step.task_id),
+            Level::Info,
+            Category::Work,
+            Stage::Dispatch,
+            darkmux_flow::Payload::StepStart(darkmux_flow::payload::StepStartPayload { seat_class: seat }),
+            step.id.clone(),
+        )
     }
 }
-
 
 /// One `FlowRecord` per scheduler-produced [`StepRecord`]: the durable,
 /// live-streamed counterpart of the in-memory summary
@@ -2057,8 +2050,14 @@ fn step_lifecycle_record_with_payload(
 fn step_timing_record(run: &RunId, step: &Step, rec: &StepRecord) -> FlowRecord {
     FlowRecord {
         source: Some(darkmux_flow::FlowSource::Scheduler),
-        ..FlowRecord::for_session(&SessionId::task(run.clone(), &step.task_id), Level::Info, Category::Work, Stage::Dispatch, darkmux_flow::FlowAction::StepTiming, step.id.clone())
-            .with_json_payload(serde_json::to_value(rec).expect("StepRecord always serializes"))
+        ..FlowRecord::for_session_with(
+            &SessionId::task(run.clone(), &step.task_id),
+            Level::Info,
+            Category::Work,
+            Stage::Dispatch,
+            darkmux_flow::Payload::StepTiming(rec.clone()),
+            step.id.clone(),
+        )
     }
 }
 
@@ -2092,25 +2091,19 @@ mod tests {
         }
     }
 
-    /// A Tier-3 bespoke driver (the crawl launcher) that mints its own
-    /// `Step`s outside `run_step_graph` can still emit the SAME canonical
-    /// `"step start"`/`"step complete"`/`"step error"` vocabulary with its
-    /// own payload — this is the export `step_lifecycle_record` (the
-    /// 2-arg, in-crate wrapper) can't offer since it always passes `None`.
+    /// The `step.start` record carries the step's seat class under the
+    /// canonical action, on the step's task session in its run.
     #[test]
-    fn step_lifecycle_record_with_payload_carries_the_payload_and_the_canonical_action() {
+    fn step_start_record_carries_the_seat_class_and_the_canonical_action() {
         let step = bare_step("s-0001");
-        let rec = step_lifecycle_record_with_payload(
+        let rec = step_start_record(
             &darkmux_types::session_id::RunId::mission("m-test").unwrap(),
             &step,
-            darkmux_flow::FlowAction::StepStart,
-            Some(json!({"workspace": "acme", "unit": "u-0001", "source": "app", "sha": "abc123"})),
+            darkmux_flow::payload::SeatClass::RemoteEndpoint,
         );
         assert_eq!(rec.action, darkmux_flow::FlowAction::StepStart);
         assert!(STEP_LIFECYCLE_ACTIONS.contains(&rec.action));
-        let payload = rec.payload_json();
-        assert_eq!(payload["workspace"], "acme");
-        assert_eq!(payload["unit"], "u-0001");
+        assert_eq!(rec.payload_json()["seat_class"], "remote_endpoint");
         // Under the step's task session in its run: the mission comes from
         // that one session.
         assert_eq!(rec.session_id.as_deref(), Some("m-test.task.t-1"));

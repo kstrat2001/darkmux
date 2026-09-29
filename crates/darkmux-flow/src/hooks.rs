@@ -8743,6 +8743,28 @@ mod tests {
         (tmp, outbox_dir)
     }
 
+    /// A written-and-deliverable `dispatch.tool` payload: the typed one, since
+    /// the write check refuses anything that did not parse as its action's type.
+    fn create_finding_payload() -> crate::Payload {
+        crate::Payload::DispatchTool(crate::payload::DispatchToolPayload {
+            tool_seq: 1,
+            tool_calls_so_far: 1,
+            tool_name: "create_finding".to_string(),
+            args: String::new(),
+            args_chars: 0,
+            emitted: None,
+            emit_seq: None,
+            result_chars: 0,
+            result: String::new(),
+            ok: true,
+            outcome: None,
+            exit_code: None,
+            failure_reason: None,
+            step_id: None,
+            context: None,
+        })
+    }
+
     fn clear_darkmux_home() {
         unsafe { std::env::remove_var("DARKMUX_HOME") };
     }
@@ -8759,7 +8781,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let sink = HookSink::new(&rules, tmp.path().to_path_buf(), Arc::new(NoopSink)).unwrap();
         let mut rec = record(crate::FlowAction::DispatchTool);
-        rec.payload = Some(crate::Payload::settle(&rec.action, serde_json::json!({"tool_name": "create_finding"})));
+        rec.payload = Some(create_finding_payload());
         sink.write(&rec).unwrap();
         assert!(wait_until(|| receiver.request_count() >= 1, Duration::from_secs(3)));
         drop(sink);
@@ -8784,7 +8806,7 @@ mod tests {
         }];
         let sink = HookSink::new(&rules, outbox_dir, Arc::new(NoopSink)).unwrap();
         let mut rec = record(crate::FlowAction::DispatchTool);
-        rec.payload = Some(crate::Payload::settle(&rec.action, serde_json::json!({"tool_name": "create_finding"})));
+        rec.payload = Some(create_finding_payload());
         sink.write(&rec).unwrap();
         assert!(wait_until(|| receiver.request_count() >= 1, Duration::from_secs(3)));
         drop(sink);
@@ -8873,7 +8895,7 @@ mod tests {
         }];
         let sink = HookSink::new(&rules, outbox_dir, Arc::new(NoopSink)).unwrap();
         let mut rec = record(crate::FlowAction::DispatchTool);
-        rec.payload = Some(crate::Payload::settle(&rec.action, serde_json::json!({"tool_name": "create_finding"})));
+        rec.payload = Some(create_finding_payload());
         sink.write(&rec).unwrap();
         assert!(wait_until(|| receiver.request_count() >= 1, Duration::from_secs(3)));
         drop(sink);
@@ -8972,7 +8994,7 @@ mod tests {
         let report: Arc<dyn FlowSink> = capture.clone();
         let sink = HookSink::new(&rules, outbox_dir, report).unwrap();
         let mut rec = record(crate::FlowAction::DispatchTool);
-        rec.payload = Some(crate::Payload::settle(&rec.action, serde_json::json!({"tool_name": "create_finding"})));
+        rec.payload = Some(create_finding_payload());
         sink.write(&rec).unwrap();
         assert!(wait_until(
             || capture.0.lock().unwrap().iter().any(|r| r.action == crate::FlowAction::HookDryRun),

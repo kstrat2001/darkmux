@@ -146,38 +146,13 @@ pub struct MemberRecord {
 /// One pipeline step's in/out counts + wall time — the issue #1230 bridge:
 /// a future flow-record consumer can render a run as a step timeline
 /// without re-deriving it from a nested-array envelope. Realized by the
-/// `step result` flow record (#1247 Part 1) — the live-run counterpart of
-/// this end-of-run summary. See this module's doc for who produces these
-/// today: `crate::scheduler::run_step_graph` (every step, every mission,
-/// `items_in`/`items_out` always `None`) and review's own two drivers
-/// (`items_in`/`items_out` always `Some`, since they know the counts).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct StepRecord {
-    /// Mission-defined step identity (review's steps are `bundle` |
-    /// `probe` | `dedup` | `judge-pass1` | `judge-pass2`). A
-    /// scheduler-produced record uses the step's own `Step::id`.
-    pub step_id: String,
-    /// Review's hand-built records use the coarse `procedural` (no
-    /// dispatch) | `dispatch` (LMStudio calls) convention. A
-    /// scheduler-produced record uses the step's own `Step::kind` — the
-    /// full step-kind-registry id (e.g. `"dispatch.internal"`,
-    /// `"procedural.shell"`) — since that is the genuine, precise value
-    /// the scheduler has in hand; it does not know which registry kinds
-    /// count as "dispatch" in review's coarser sense.
-    pub kind: String,
-    /// How many items this step consumed, when the producer knows —
-    /// per-kind business semantics the scheduler cannot observe from
-    /// outside a `StepKind::run_streaming` call. `None` means "not known
-    /// to this producer," never a lying `Some(0)`. Skipped from JSON
-    /// entirely when `None`, so an old reader parsing a scheduler-produced
-    /// record never mistakes absence for a real zero-item step.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub items_in: Option<usize>,
-    /// See [`Self::items_in`] — same honesty contract, output side.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub items_out: Option<usize>,
-    pub wall_ms: u64,
-}
+/// `step.timing` flow record (#1247 Part 1) — the live-run counterpart of
+/// this end-of-run summary, whose payload IS this type. See this module's doc
+/// for who produces these today: `crate::scheduler::run_step_graph` (every
+/// step, every mission, `items_in`/`items_out` always `None`) and review's own
+/// two drivers (`items_in`/`items_out` always `Some`, since they know the
+/// counts).
+pub use darkmux_flow::payload::StepTimingPayload as StepRecord;
 
 // ─── resolved staffing snapshot ──────────────────────────────────────────
 

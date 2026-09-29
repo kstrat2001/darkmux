@@ -8,8 +8,8 @@ import type { ThermalWindowWire } from "./ThermalWindowWire";
  */
 export type LoadWindow = { samples: number, span_ms: number, 
 /**
- * The MEASURED mean gap between samples, not the configured cadence;
- * `null` with fewer than two samples.
+ * The MEASURED mean gap between samples, not the configured cadence; `null` with fewer than
+ * two samples.
  */
 interval_ms: number | null, cpu_pct: MetricWindow, gpu_pct: MetricWindow, mem_pct: MetricWindow, power_mw: PowerWindowWire | null, thermal: ThermalWindowWire | null, 
 /**

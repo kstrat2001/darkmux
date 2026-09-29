@@ -69,6 +69,7 @@ use crate::coder_phase;
 use anyhow::{anyhow, bail, Context, Result};
 use crew::mission_config::{self, FindingSeverity, LaunchParams, MissionConfig, TaskOverride};
 use crew::types::{Mission, MissionSpec, MissionStatus, NodeStatus, Phase, PhaseStatus, Step};
+use darkmux_flow::payload::{GrowReason, MissionGrowPayload, ReviewVerdict, RunPayload, StepResultPayload};
 use darkmux_types::session_id::{RunId, SessionId};
 use darkmux_types::style;
 use std::any::Any;
@@ -292,20 +293,18 @@ fn emit_launch_cmd_audit(
 /// `acp_panel::run_ephemeral` brackets its panel runs with the same records.
 pub(crate) fn run_record(
     level: flow::Level,
-    action: darkmux_flow::FlowAction,
     config_id: &str,
     run: &RunId,
-    payload: serde_json::Value,
+    payload: darkmux_flow::Payload,
 ) -> flow::FlowRecord {
-    flow::FlowRecord::for_session(
+    flow::FlowRecord::for_session_with(
         &SessionId::run(run.clone()),
         level,
         flow::Category::Work,
         flow::Stage::Dispatch,
-        action,
+        payload,
         config_id,
     )
-    .with_json_payload(payload)
 }
 
 /// (#1877, contract 8) The run's liveness bookend at `edge`: `run.start` as
@@ -318,13 +317,18 @@ pub(crate) fn run_bookend_record(
     edge: flow::Edge,
     config_id: &str,
     run: &RunId,
-    payload: serde_json::Value,
+    payload: darkmux_flow::payload::RunPayload,
 ) -> flow::FlowRecord {
     let level = match edge {
         flow::Edge::Start | flow::Edge::Complete => flow::Level::Info,
         flow::Edge::Error => flow::Level::Error,
     };
-    run_record(level, flow::Bookend { grain: flow::Grain::Run, edge }.action(), config_id, run, payload)
+    let payload = match edge {
+        flow::Edge::Start => darkmux_flow::Payload::RunStart(payload),
+        flow::Edge::Complete => darkmux_flow::Payload::RunComplete(payload),
+        flow::Edge::Error => darkmux_flow::Payload::RunError(payload),
+    };
+    run_record(level, config_id, run, payload)
 }
 
 /// (#2131 review round 2, item 5) RAII stop-signal for `launch`'s own
@@ -1215,13 +1219,10 @@ pub fn launch(
             flow::Edge::Error,
             &config_id_for_abort,
             &run_for_abort,
-            serde_json::json!({
-                "result_class": "error",
-                "error": "run terminated before completion (early return or panic)",
-            }),
+            RunPayload::failed("run terminated before completion (early return or panic)"),
         )
     });
-    bookend.open("run", "run", run_bookend_record(flow::Edge::Start, config_id, &run, serde_json::json!({})));
+    bookend.open("run", "run", run_bookend_record(flow::Edge::Start, config_id, &run, RunPayload::default()));
     // (#2877, pre-PR review) The mission's own run session beats presence for
     // as long as the launch runs. Its executions beat only while a model call
     // is live, so during the steps between them (a summary, a mod wait, a test
@@ -1406,14 +1407,17 @@ pub fn launch(
                     // growth minted something — a key present with a null
                     // value reads as "there was a reason and it was
                     // unknown", which is not what happened.
-                    let mut payload = serde_json::json!({
-                        "phase": event.phase,
-                        "task_template": event.task_template,
-                        "from": event.from,
-                        "source": event.source,
-                        "items": event.items,
-                        "minted": event.minted,
-                    });
+                    let mut payload = MissionGrowPayload {
+                        phase: event.phase.clone(),
+                        task_template: event.task_template.clone(),
+                        from: event.from.clone(),
+                        source: event.source.clone(),
+                        items: event.items as u64,
+                        minted: event.minted.clone(),
+                        reason: None,
+                        producer_step: None,
+                        producer_status: None,
+                    };
                     // (#2310 P4c-2b PR #2357 round-2 review item 3) A
                     // producer that ERRORED gets its OWN reason, distinct
                     // from a producer that legitimately found zero items —
@@ -1421,8 +1425,8 @@ pub fn launch(
                     // "nothing failed" on a run where something genuinely
                     // did.
                     if let Some(pe) = &producer_error {
-                        payload["reason"] = serde_json::json!("producer_errored");
-                        payload["producer_step"] = serde_json::json!(pe.step_id);
+                        payload.reason = Some(GrowReason::ProducerErrored);
+                        payload.producer_step = Some(pe.step_id.clone());
                         // (#2310 swarm F / S2-2) The STABLE mapping, never
                         // `format!("{:?}", …)`: a `Debug` rendering on the
                         // wire couples the stream to a derive no schema
@@ -1430,16 +1434,15 @@ pub fn launch(
                         // persisted on the step record (`"Error"` vs
                         // `"error"`). FLOW_SCHEMA 1.40.0 documents the
                         // vocabulary; `NodeStatus::as_str` owns it.
-                        payload["producer_status"] = serde_json::json!(pe.status.as_str());
+                        payload.producer_status = Some(pe.status.as_str().to_string());
                     } else if event.minted.is_empty() {
-                        payload["reason"] = serde_json::json!("grew_nothing");
+                        payload.reason = Some(GrowReason::GrewNothing);
                     }
                     bookend.emit_now(run_record(
                         flow::Level::Info,
-                        darkmux_flow::FlowAction::MissionGrow,
                         config_id,
                         &run,
-                        payload,
+                        darkmux_flow::Payload::MissionGrow(payload),
                     ));
                     for task in &grown_tasks {
                         if let Err(e) = crew::lifecycle::save_task(&mission_id, task) {
@@ -1663,10 +1666,7 @@ pub fn launch(
                 flow::Edge::Error,
                 config_id,
                 &run,
-                serde_json::json!({
-                    "result_class": "error",
-                    "error": e.to_string(),
-                }),
+                RunPayload::failed(e.to_string()),
             ),
         );
         // (#1685 QA MUST-FIX 2) A scheduler-level failure is still "the
@@ -1857,10 +1857,7 @@ pub fn launch(
             if exit_code == 0 { flow::Edge::Complete } else { flow::Edge::Error },
             config_id,
             &run,
-            serde_json::json!({
-                "result_class": if exit_code == 0 { "ok" } else { "error" },
-                "status": format!("{status:?}"),
-            }),
+            RunPayload { status: Some(format!("{status:?}")), ..RunPayload::ended(exit_code == 0) },
         ),
     );
     // (#2131) A no-op unless a signal was actually observed.
@@ -3375,10 +3372,7 @@ fn coder_branch_terminal_bookend(
         if reached_gate { flow::Edge::Complete } else { flow::Edge::Error },
         config_id,
         run,
-        serde_json::json!({
-            "result_class": if reached_gate { "ok" } else { "error" },
-            "gate": "coder-phase",
-        }),
+        RunPayload { gate: Some("coder-phase".to_string()), ..RunPayload::ended(reached_gate) },
     );
     (reached_gate, record)
 }
@@ -3526,11 +3520,13 @@ fn coder_phase_gate_outcome(
         };
         coder_phase::emit_step_result(
             flow::Level::Warn,
-            "mission.verify",
-            &verify_step_id,
             session_id,
             phase_id,
-            serde_json::json!({ "error": err_text, "total_tokens": tokens_total }),
+            StepResultPayload {
+                error: Some(err_text.clone()),
+                total_tokens: Some(tokens_total),
+                ..StepResultPayload::new(&verify_step_id, "mission.verify")
+            },
         );
         println!("\n{}", style::header("▶ gate — QA unavailable, manual review required"));
         coder_phase::print_unverified_banner(&failed_verifiers);
@@ -3588,16 +3584,15 @@ fn coder_phase_gate_outcome(
         );
         coder_phase::emit_step_result(
             flow::Level::Warn,
-            "mission.verify",
-            &verify_step_id,
             session_id,
             phase_id,
-            serde_json::json!({
-                "verdict": review.verdict,
-                "blockers": review.by_severity.block,
-                "flags": review.by_severity.flag,
-                "total_tokens": tokens_total,
-            }),
+            StepResultPayload {
+                verdict: Some(review.verdict.to_string()),
+                blockers: Some(review.by_severity.block as u64),
+                flags: Some(review.by_severity.flag as u64),
+                total_tokens: Some(tokens_total),
+                ..StepResultPayload::new(&verify_step_id, "mission.verify")
+            },
         );
         return Ok(2);
     }
@@ -3613,7 +3608,7 @@ fn coder_phase_gate_outcome(
     // response must never read as a green check (#1113's contract, applied
     // to the coder gate) — so it takes the SAME exit-3 posture as a failed
     // QA dispatch: gate holds, manual review required.
-    if review.verdict == "indeterminate" {
+    if review.verdict == ReviewVerdict::Indeterminate {
         println!(
             "\n{}",
             style::warn(
@@ -3634,16 +3629,15 @@ fn coder_phase_gate_outcome(
         );
         coder_phase::emit_step_result(
             flow::Level::Warn,
-            "mission.verify",
-            &verify_step_id,
             session_id,
             phase_id,
-            serde_json::json!({
-                "verdict": review.verdict,
-                "blockers": 0,
-                "flags": review.by_severity.flag,
-                "total_tokens": tokens_total,
-            }),
+            StepResultPayload {
+                verdict: Some(review.verdict.to_string()),
+                blockers: Some(0),
+                flags: Some(review.by_severity.flag as u64),
+                total_tokens: Some(tokens_total),
+                ..StepResultPayload::new(&verify_step_id, "mission.verify")
+            },
         );
         return Ok(3);
     }
@@ -3665,17 +3659,16 @@ fn coder_phase_gate_outcome(
     );
     coder_phase::emit_step_result(
         flow::Level::Info,
-        "mission.verify",
-        &verify_step_id,
         session_id,
         phase_id,
-        serde_json::json!({
-            "verdict": review.verdict,
-            "blockers": 0,
-            "flags": review.by_severity.flag,
-            "nits": review.by_severity.nit,
-            "total_tokens": tokens_total,
-        }),
+        StepResultPayload {
+            verdict: Some(review.verdict.to_string()),
+            blockers: Some(0),
+            flags: Some(review.by_severity.flag as u64),
+            nits: Some(review.by_severity.nit as u64),
+            total_tokens: Some(tokens_total),
+            ..StepResultPayload::new(&verify_step_id, "mission.verify")
+        },
     );
     Ok(0)
 }
@@ -6831,7 +6824,7 @@ mod tests {
         (handles, steps)
     }
 
-    fn review_output(block: usize, flag: usize, verdict: &str) -> crate::phase_cli::PhaseReviewOutput {
+    fn review_output(block: usize, flag: usize, verdict: ReviewVerdict) -> crate::phase_cli::PhaseReviewOutput {
         crate::phase_cli::PhaseReviewOutput {
             branch: "gate-test-branch".to_string(),
             base: "main".to_string(),
@@ -6840,7 +6833,7 @@ mod tests {
             total_findings: block + flag,
             by_severity: crate::phase_cli::SeverityCounts { block, flag, nit: 0 },
             findings: Vec::new(),
-            verdict: verdict.to_string(),
+            verdict,
         }
     }
 
@@ -6884,7 +6877,7 @@ mod tests {
         seed_running_instance("gate-test-mission", phase_id);
         let (handles, steps) =
             scripted_gate_fixture(phase_id, NodeStatus::Complete, NodeStatus::Complete, NodeStatus::Complete);
-        *handles.verify_slot.lock().unwrap() = Some(Ok(review_output(2, 1, "blockers")));
+        *handles.verify_slot.lock().unwrap() = Some(Ok(review_output(2, 1, ReviewVerdict::Blockers)));
 
         // (#1530 Packet 2) A fixture-scripted registry — `scripted_step`'s
         // placeholder `"mission.test"` kind resolves to nothing real, so
@@ -6956,7 +6949,7 @@ mod tests {
         seed_running_instance("gate-test-mission", phase_id);
         let (handles, steps) =
             scripted_gate_fixture(phase_id, NodeStatus::Complete, NodeStatus::Complete, NodeStatus::Complete);
-        *handles.verify_slot.lock().unwrap() = Some(Ok(review_output(0, 0, "indeterminate")));
+        *handles.verify_slot.lock().unwrap() = Some(Ok(review_output(0, 0, ReviewVerdict::Indeterminate)));
 
         let registry = crew::step_kinds::StepKindRegistry::new();
         let exit = coder_phase_gate_outcome("gate-test-mission", &handles, &steps, &registry).unwrap();
@@ -6980,7 +6973,7 @@ mod tests {
         seed_running_instance("gate-test-mission", phase_id);
         let (handles, steps) =
             scripted_gate_fixture(phase_id, NodeStatus::Complete, NodeStatus::Complete, NodeStatus::Complete);
-        *handles.verify_slot.lock().unwrap() = Some(Ok(review_output(0, 1, "flags-only")));
+        *handles.verify_slot.lock().unwrap() = Some(Ok(review_output(0, 1, ReviewVerdict::FlagsOnly)));
 
         let registry = crew::step_kinds::StepKindRegistry::new();
         let exit = coder_phase_gate_outcome("gate-test-mission", &handles, &steps, &registry).unwrap();
@@ -8719,7 +8712,7 @@ mod tests {
             (flow::Edge::Complete, darkmux_flow::FlowAction::RunComplete, "info"),
             (flow::Edge::Error, darkmux_flow::FlowAction::RunError, "error"),
         ] {
-            let rec = run_bookend_record(edge, "coder-phase", &run, serde_json::json!({}));
+            let rec = run_bookend_record(edge, "coder-phase", &run, RunPayload::default());
             assert_eq!(rec.action, action);
             assert_eq!(serde_json::to_value(rec.level).unwrap(), level, "{action}");
             assert_eq!(rec.handle, "coder-phase");
@@ -8826,9 +8819,9 @@ mod tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let abort_run = run.clone();
             let mut guard = flow::BookendGuard::new(&mut sink, move |_id, _kind| {
-                run_bookend_record(flow::Edge::Error, "panic-test-config", &abort_run, serde_json::json!({}))
+                run_bookend_record(flow::Edge::Error, "panic-test-config", &abort_run, RunPayload::default())
             });
-            guard.open("run", "run", run_bookend_record(flow::Edge::Start, "panic-test-config", &run, serde_json::json!({})));
+            guard.open("run", "run", run_bookend_record(flow::Edge::Start, "panic-test-config", &run, RunPayload::default()));
             panic!("simulated mid-run panic while the guard is armed");
         }));
         std::panic::set_hook(prev_hook);
