@@ -1597,19 +1597,48 @@ async fn execute_launch_plan(
     cx: &ConnectionTo<Client>,
     sessions: &Sessions,
 ) -> Result<()> {
+    let Some(prepared) = prepare_or_report(session_id, &plan, cwd, cx)? else { return Ok(()) };
+    run_prepared_launch(session_id, plan, prepared, cwd, cx, sessions).await
+}
+
+/// Prepare `plan`'s inputs from the cwd ([`crate::acp_panel::prepare_launch`]).
+/// `None` after telling the panel why nothing will run (nothing to review, or
+/// a launch that cannot run here); otherwise the prepared launch, with any
+/// note about work its synthesized diff does not cover already sent.
+fn prepare_or_report(
+    session_id: &SessionId,
+    plan: &crate::acp_panel::LaunchPlan,
+    cwd: &Path,
+    cx: &ConnectionTo<Client>,
+) -> Result<Option<crate::acp_panel::PreparedLaunch>> {
     let prepared = match crate::acp_panel::prepare_launch(&plan.config, plan.params.clone(), cwd) {
         Ok(crate::acp_panel::Prepared::Ready(prepared)) => prepared,
         Ok(crate::acp_panel::Prepared::Nothing(msg)) => {
-            return Ok(cx.send_notification(agent_chunk(session_id, msg))?);
+            cx.send_notification(agent_chunk(session_id, msg))?;
+            return Ok(None);
         }
         Err(e) => {
             let reply = format!("darkmux: `{}` cannot run here — {e:#}", plan.config_id);
-            return Ok(cx.send_notification(agent_chunk(session_id, reply))?);
+            cx.send_notification(agent_chunk(session_id, reply))?;
+            return Ok(None);
         }
     };
     if let Some(note) = &prepared.note {
         let _ = cx.send_notification(agent_chunk(session_id, format!("darkmux: {note}")));
     }
+    Ok(Some(prepared))
+}
+
+/// Run a prepared launch. The caller holds `prepared` (and its synthesized
+/// inputs' tempdir) until this returns.
+async fn run_prepared_launch(
+    session_id: &SessionId,
+    plan: crate::acp_panel::LaunchPlan,
+    prepared: crate::acp_panel::PreparedLaunch,
+    cwd: &Path,
+    cx: &ConnectionTo<Client>,
+    sessions: &Sessions,
+) -> Result<()> {
     match plan.route {
         crate::acp_panel::LaunchRoute::Ephemeral => {
             let params = prepared.params.clone();
@@ -1637,8 +1666,8 @@ async fn execute_launch_plan(
 /// same provenance contract the CLI's own `radio: routing to `mission launch <id>` — from
 /// your text` line gives (wall 4: "provenance boxes invisibility").
 /// The pick is then confirmed through the panel's permission dialog
-/// ([`confirm_then_execute`]), showing the command the CLI would print;
-/// only an allow runs it, through the EXACT SAME `LaunchPlan` machinery a
+/// ([`confirm_then_execute`]), showing the command with every param that will
+/// run, the synthesized ones included; only an allow runs it, through the EXACT SAME `LaunchPlan` machinery a
 /// slash invocation uses, so a routed `pr-merge` still hits its own
 /// sign-off dialog too.
 ///
@@ -1753,11 +1782,26 @@ async fn run_no_slash_route(
     }
 }
 
-/// The router's pick is never the consent to run it. Ask through the panel's
-/// permission dialog, showing the exact command the CLI would print, and run
-/// only on an explicit allow. A reject, a cancel or no answer runs nothing
-/// and the panel says so. (An explicit `/mission launch` is the user's own
-/// command and does not come through here.)
+/// `text` in a fenced code block, so backticks, `*` and newlines in it render
+/// literally. The fence is longer than any backtick run inside.
+fn fenced(text: &str) -> String {
+    let mut longest = 0;
+    let mut run = 0;
+    for c in text.chars() {
+        run = if c == '`' { run + 1 } else { 0 };
+        longest = longest.max(run);
+    }
+    let fence = "`".repeat((longest + 1).max(3));
+    format!("{fence}\n{text}\n{fence}")
+}
+
+/// The router's pick is never the consent to run it. The inputs are prepared
+/// first, so the permission dialog shows the command with every param that
+/// will run (the synthesized ones included), and only an explicit allow runs
+/// it. A reject, a cancel or no answer runs nothing and the panel says so,
+/// naming how to run it yourself when its inputs were made from the cwd. (An
+/// explicit `/mission launch` is the user's own command and does not come
+/// through here.)
 async fn confirm_then_execute(
     session_id: &SessionId,
     plan: crate::acp_panel::LaunchPlan,
@@ -1765,13 +1809,17 @@ async fn confirm_then_execute(
     cx: &ConnectionTo<Client>,
     sessions: &Sessions,
 ) -> Result<()> {
-    let command_line = crate::radio_cli::launch_command_line(&plan.config_id, &plan.params);
+    let Some(prepared) = prepare_or_report(session_id, &plan, cwd, cx)? else { return Ok(()) };
+    let command_line = crate::radio_cli::launch_command_line(&plan.config_id, &prepared.params);
     let title = format!("darkmux — run this command chosen from your text? `{}`", plan.config_id);
-    let answer = request_permission(cx, session_id, &plan.config_id, title, &command_line).await;
+    let answer = request_permission(cx, session_id, &plan.config_id, title, &fenced(&command_line)).await;
     match answer.refusal_reason("radio launch", "confirmation") {
-        None => execute_launch_plan(session_id, plan, cwd, cx, sessions).await,
+        None => run_prepared_launch(session_id, plan, prepared, cwd, cx, sessions).await,
         Some(reason) => {
-            let text = format!("darkmux: not run. {reason}. The command was:\n\n    {command_line}");
+            let mut text = format!("darkmux: not run. {reason}. The command was:\n\n{}", fenced(&command_line));
+            if let Some(advice) = crate::radio_cli::synthesized_inputs_advice(&prepared.synthesized_keys()) {
+                text.push_str(&format!("\n\n{advice}"));
+            }
             Ok(cx.send_notification(agent_chunk(session_id, text))?)
         }
     }
@@ -3228,7 +3276,7 @@ mod tests {
         );
 
         let body = answer_permission(&mut f.writer, &mut f.reader, selected("allow")).await;
-        assert_eq!(body, "darkmux mission launch echo-fixture", "the dialog shows the CLI's own command text");
+        assert_eq!(body, "```\ndarkmux mission launch echo-fixture\n```", "the dialog shows the CLI's own command text in a code block");
 
         let output = recv_json(&mut f.reader).await;
         assert_eq!(chunk_text(&output), "fixture output", "after allow the next chunk is the command's own output");
@@ -3263,6 +3311,64 @@ mod tests {
         assert_end_turn(&final_response);
     }
 
+    /// A routed `review` pick in a git repo with `commits` commits: the
+    /// permission dialog must show what will run, and the diff inputs are
+    /// made BEFORE asking.
+    async fn routed_review_fixture(commits: usize) -> (RoutedFixture, tempfile::TempDir) {
+        let crew_tmp = tempfile::TempDir::new().unwrap();
+        let crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
+        let flows_tmp = tempfile::TempDir::new().unwrap();
+        let flows_guard = EnvGuard::set("DARKMUX_FLOWS_DIR", flows_tmp.path());
+        let router = |_msg: &str| -> Result<String> {
+            Ok("```json\n{\"command\": \"review\", \"args\": \"\"}\n```".to_string())
+        };
+        let (mut writer, mut reader) = spawn_test_agent(router, never_answer);
+        let repo = crate::acp_panel::tests::temp_repo(commits);
+        let session_id = handshake(&mut writer, &mut reader, repo.path()).await;
+        let flows = flows_tmp.path().to_path_buf();
+        let fixture = RoutedFixture { _guards: (crew_tmp, flows_tmp, crew_guard, flows_guard), flows, writer, reader, session_id };
+        (fixture, repo)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_routed_review_dialog_shows_the_synthesized_inputs_and_the_refusal_says_how_to_run_it() {
+        let (mut f, _repo) = routed_review_fixture(2).await;
+        send_prompt(&mut f.writer, &f.session_id, "review this").await;
+        let _provenance = recv_json(&mut f.reader).await;
+        let note = recv_json(&mut f.reader).await;
+        assert!(chunk_text(&note).contains("reviewing only the last commit"), "{note}");
+        let body = answer_permission(&mut f.writer, &mut f.reader, selected("reject")).await;
+        assert!(body.starts_with("```\ndarkmux mission launch review "), "fenced command: {body}");
+        for key in ["--param diff_file=", "--param workspace=", "--param head_sha="] {
+            assert!(body.contains(key), "the dialog must show `{key}`: {body}");
+        }
+        let refusal = recv_json(&mut f.reader).await;
+        let text = chunk_text(&refusal);
+        assert!(text.contains("not run") && text.contains("diff_file, workspace, head_sha"), "{text}");
+        assert!(text.contains("temporary files"), "{text}");
+        assert_end_turn(&recv_json(&mut f.reader).await);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_routed_review_with_nothing_to_review_is_reported_without_asking() {
+        let (mut f, _repo) = routed_review_fixture(1).await;
+        send_prompt(&mut f.writer, &f.session_id, "review this").await;
+        let _provenance = recv_json(&mut f.reader).await;
+        // The next message is the report, not a permission request.
+        let next = recv_json(&mut f.reader).await;
+        assert_ne!(next["method"], "session/request_permission", "must not ask: {next}");
+        assert!(!chunk_text(&next).is_empty());
+        assert_end_turn(&recv_json(&mut f.reader).await);
+    }
+
+    #[test]
+    fn fenced_uses_a_fence_longer_than_any_backtick_run_inside() {
+        assert_eq!(fenced("a b"), "```\na b\n```");
+        assert_eq!(fenced("x ``` y"), "````\nx ``` y\n````");
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn no_slash_route_rejected_runs_nothing() {
@@ -3277,7 +3383,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn no_slash_route_unrecognized_answer_runs_nothing() {
+    async fn no_slash_route_an_unknown_option_is_a_reject_and_runs_nothing() {
         assert_routed_pick_not_run(selected("something-else"), "selected `something-else`").await;
     }
 

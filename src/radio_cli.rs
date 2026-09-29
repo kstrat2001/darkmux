@@ -195,15 +195,37 @@ fn shell_word(word: &str) -> String {
     if plain { word.to_string() } else { format!("'{}'", word.replace('\'', "'\\''")) }
 }
 
+/// What to tell a user who will run a printed command themselves, when some
+/// of its inputs were made from the cwd (see
+/// [`crate::acp_panel::PreparedLaunch::synthesized_keys`]): those values name
+/// temporary files that are gone once this process ends, so the command is
+/// not runnable as printed. `None` when nothing was synthesized.
+pub(crate) fn synthesized_inputs_advice(keys: &[&str]) -> Option<String> {
+    if keys.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "The values for {} above name temporary files, removed when this exits, so the command does not run as printed later. \
+         To launch it yourself, save the diff and a workspace spec for your checkout to files of your own and pass them as \
+         `--param diff_file=<path>` and `--param workspace=<path>`; `darkmux mission show <id>` lists what each input takes.",
+        keys.join(", ")
+    ))
+}
+
 /// Print `command_line`, then ask y/N on `reader`/`writer`. Without an
 /// interactive terminal nothing is asked: the command is printed, with the
-/// line saying it was not run, so the user can run it themselves. `y`/`yes`
-/// (case-insensitive) is the only approval.
+/// line saying it was not run (and, when `synthesized` names inputs made from
+/// the cwd, how to run it yourself), so the user can run it themselves.
+/// `y`/`yes` (case-insensitive) is the only approval, and an interrupt seen
+/// while waiting for it is never one: the SIGINT handler radio installs
+/// leaves the read waiting, so a later `y` would otherwise launch a run that
+/// is already being torn down.
 fn confirm_launch<R: std::io::BufRead, W: std::io::Write>(
     mut reader: R,
     mut writer: W,
     interactive: bool,
     command_line: &str,
+    synthesized: &[&str],
 ) -> Consent {
     let _ = writeln!(writer, "radio: chose this command from your text:\n\n    {command_line}\n");
     if !interactive {
@@ -211,12 +233,20 @@ fn confirm_launch<R: std::io::BufRead, W: std::io::Write>(
             writer,
             "radio: not run: there is no interactive terminal to confirm on. Run the command above yourself to launch it."
         );
+        if let Some(advice) = synthesized_inputs_advice(synthesized) {
+            let _ = writeln!(writer, "radio: {advice}");
+        }
         return Consent::Unanswered;
     }
     let _ = write!(writer, "Run it? [y/N] ");
     let _ = writer.flush();
     let mut line = String::new();
-    match reader.read_line(&mut line) {
+    let read = reader.read_line(&mut line);
+    if darkmux_types::interrupt::is_set() {
+        let _ = writeln!(writer, "\nradio: not run: interrupted.");
+        return Consent::Unanswered;
+    }
+    match read {
         Ok(0) | Err(_) => {
             let _ = writeln!(writer, "\nradio: not run: no answer was read.");
             Consent::Unanswered
@@ -230,9 +260,9 @@ fn confirm_launch<R: std::io::BufRead, W: std::io::Write>(
 }
 
 /// [`confirm_launch`] against this process's stdin and stdout.
-fn confirm_on_terminal(command_line: &str) -> Consent {
+fn confirm_on_terminal(command_line: &str, synthesized: &[&str]) -> Consent {
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-    confirm_launch(std::io::BufReader::new(std::io::stdin()), std::io::stdout(), interactive, command_line)
+    confirm_launch(std::io::BufReader::new(std::io::stdin()), std::io::stdout(), interactive, command_line, synthesized)
 }
 
 /// The exit code for a consent that did not approve.
@@ -249,14 +279,13 @@ fn exit_for_unapproved(consent: Consent) -> Option<i32> {
 /// ([`crate::acp_panel::plan_launch`] then [`crate::acp_panel::prepare_launch`]),
 /// so the two surfaces cannot drift: the same input mapping, the same
 /// refusals, the same diff synthesis from the cwd for a config that declares
-/// a required `diff_file`. The user confirms the command first
-/// ([`confirm_on_terminal`]): the router could choose any config from free
-/// text, so its pick is never the consent.
+/// a required `diff_file`. The inputs are prepared BEFORE asking, so the user
+/// confirms the command with every param that will run, the synthesized ones
+/// included ([`confirm_on_terminal`]); the router could choose any config from
+/// free text, so its pick is never the consent. A repo with nothing to review
+/// is reported without asking.
 fn execute(command: &str, args: &str) -> Result<i32> {
     let plan = crate::acp_panel::plan_launch(command, args).with_context(|| format!("radio: routed command `{command}`"))?;
-    if let Some(code) = exit_for_unapproved(confirm_on_terminal(&launch_command_line(&plan.config_id, &plan.params))) {
-        return Ok(code);
-    }
     let cwd = std::env::current_dir().context("resolving current directory")?;
     let prepared = match crate::acp_panel::prepare_launch(&plan.config, plan.params.clone(), &cwd)? {
         crate::acp_panel::Prepared::Ready(prepared) => prepared,
@@ -267,6 +296,10 @@ fn execute(command: &str, args: &str) -> Result<i32> {
     };
     if let Some(note) = &prepared.note {
         println!("radio: {note}");
+    }
+    let command_line = launch_command_line(&plan.config_id, &prepared.params);
+    if let Some(code) = exit_for_unapproved(confirm_on_terminal(&command_line, &prepared.synthesized_keys())) {
+        return Ok(code);
     }
     match plan.route {
         crate::acp_panel::LaunchRoute::Ephemeral => run_ephemeral_and_report(&plan.config, &prepared.params),
@@ -347,7 +380,7 @@ fn spawn_mission_launch(config_id: &str, params: &[String]) -> Result<i32> {
     // ~100ms cadence from the moment the interrupt flag is set — so every
     // registered pid gets reaped whether or not this line runs. And the
     // hard `exit` skipped every destructor on the way out, including
-    // `_synth`'s tempdir cleanup above; returning runs them. (This child is
+    // the prepared launch's tempdir cleanup above; returning runs them. (This child is
     // not in that registry at all — see the comment above — so neither call
     // ever reached it.)
     //
@@ -571,7 +604,7 @@ mod tests {
 
     fn ask(input: &str, interactive: bool) -> (Consent, String) {
         let mut out = Vec::new();
-        let consent = confirm_launch(input.as_bytes(), &mut out, interactive, "darkmux mission launch review");
+        let consent = confirm_launch(input.as_bytes(), &mut out, interactive, "darkmux mission launch review", &[]);
         (consent, String::from_utf8(out).unwrap())
     }
 
@@ -601,10 +634,50 @@ mod tests {
     #[test]
     fn without_a_terminal_the_command_is_printed_and_nothing_is_read() {
         let mut out = Vec::new();
-        let consent = confirm_launch(std::io::BufReader::new(NoRead), &mut out, false, "darkmux mission launch review");
+        let consent = confirm_launch(std::io::BufReader::new(NoRead), &mut out, false, "darkmux mission launch review", &[]);
         let out = String::from_utf8(out).unwrap();
         assert_eq!(consent, Consent::Unanswered);
         assert!(out.contains("darkmux mission launch review") && out.contains("not run") && out.contains("no interactive terminal"), "{out}");
+    }
+
+    /// A reader that delivers the interrupt while the prompt is waiting, then
+    /// the `y` typed afterward: the SIGINT handler radio installs sets the
+    /// flag and the blocked read resumes.
+    struct InterruptedThenYes;
+    impl std::io::Read for InterruptedThenYes {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            darkmux_types::interrupt::simulate_sigint_for_test();
+            buf[..2].copy_from_slice(b"y\n");
+            Ok(2)
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn an_interrupt_during_the_prompt_is_never_consent_even_if_a_yes_follows() {
+        darkmux_types::interrupt::reset_for_test();
+        let mut out = Vec::new();
+        let consent =
+            confirm_launch(std::io::BufReader::new(InterruptedThenYes), &mut out, true, "darkmux mission launch review", &[]);
+        darkmux_types::interrupt::reset_for_test();
+        assert_eq!(consent, Consent::Unanswered);
+        assert!(String::from_utf8(out).unwrap().contains("interrupted"));
+    }
+
+    #[test]
+    fn a_non_interactive_confirm_of_synthesized_inputs_says_how_to_run_it_yourself() {
+        let mut out = Vec::new();
+        let line = "darkmux mission launch review --param diff_file=/tmp/x/review.diff";
+        let consent = confirm_launch(std::io::BufReader::new(NoRead), &mut out, false, line, &["diff_file", "workspace"]);
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(consent, Consent::Unanswered);
+        assert!(out.contains("--param diff_file=/tmp/x/review.diff"), "the real param is shown: {out}");
+        assert!(out.contains("diff_file, workspace") && out.contains("temporary files"), "{out}");
+        assert!(out.contains("--param diff_file=<path>"), "{out}");
+        // The inverse: nothing synthesized, nothing qualified.
+        let mut plain = Vec::new();
+        confirm_launch(std::io::BufReader::new(NoRead), &mut plain, false, line, &[]);
+        assert!(!String::from_utf8(plain).unwrap().contains("temporary"));
     }
 
     #[test]

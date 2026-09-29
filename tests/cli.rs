@@ -5846,6 +5846,104 @@ fn radio_routes_a_loaded_models_question_to_machine_status_and_confirms_before_r
     assert!(!argv.contains("unload"), "{argv}");
 }
 
+/// Count the `lms ps` calls a recording fake `lms` logged.
+fn count_lms_ps_calls(argv_log: &std::path::Path) -> usize {
+    fs::read_to_string(argv_log).unwrap_or_default().lines().filter(|l| l.trim().starts_with("ps")).count()
+}
+
+/// A routed `machine-status` pick, with the isolated env every radio test
+/// here uses, run either on a terminal that answers `y` or with no terminal.
+/// Returns the child's exit code and how many times `lms ps` ran.
+fn run_radio_machine_status(answer_yes_on_a_pty: bool) -> (Option<i32>, usize) {
+    let route_port = start_route_decision_stub("machine-status");
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let os_home = TempDir::new().unwrap();
+    let profiles_path = home.path().join("profiles.json");
+    fs::write(&profiles_path, utility_binding_profiles_json()).unwrap();
+    let argv_log = home.path().join("lms-argv.log");
+    let fake_lms = write_recording_fake_lms(home.path(), &argv_log, "idle");
+    let mut cmd = darkmux_std_cmd();
+    cmd.env("HOME", os_home.path())
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_PROFILES", &profiles_path)
+        .env("DARKMUX_LMSTUDIO_URL", format!("http://127.0.0.1:{route_port}"))
+        .env("DARKMUX_LMS_BIN", &fake_lms)
+        .args(["radio", "which models are loaded on this machine right now?"]);
+    let code = if answer_yes_on_a_pty {
+        let (mut child, _pty) = spawn_answering_yes_on_a_pty(&mut cmd);
+        child.wait().expect("waiting for darkmux radio").code()
+    } else {
+        cmd.output().expect("running darkmux radio").status.code()
+    };
+    (code, count_lms_ps_calls(&argv_log))
+}
+
+/// The other half of the consent gate: an APPROVED routed ephemeral launch
+/// really runs. `machine status` shells to `lms ps` itself, so the approved
+/// run makes strictly more `lms ps` calls than the unapproved one (the router's
+/// own residency preflight makes the same call in both).
+#[cfg(unix)]
+#[test]
+fn radio_runs_an_approved_ephemeral_pick() {
+    let (unanswered_code, unanswered_ps) = run_radio_machine_status(false);
+    let (approved_code, approved_ps) = run_radio_machine_status(true);
+    assert_eq!(unanswered_code, Some(1), "no terminal: not run, exit 1");
+    assert_eq!(approved_code, Some(0), "an approved run of machine-status exits 0");
+    assert!(
+        approved_ps > unanswered_ps,
+        "the approved run must have run `machine status` (lms ps calls: approved {approved_ps}, unanswered {unanswered_ps})"
+    );
+}
+
+/// `review` is the main free-text target and a shell launch never synthesizes
+/// its `diff_file`, so the confirmation has to show the inputs that WILL run
+/// and, with no terminal, say the printed command is not runnable as it stands.
+#[test]
+fn radio_review_pick_shows_the_synthesized_inputs_and_qualifies_the_advice() {
+    let route_port = start_route_decision_stub("review");
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let os_home = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git").args(args).current_dir(repo.path()).output().expect("git runs");
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.email", "t@example.com"]);
+    git(&["config", "user.name", "t"]);
+    for i in 0..2 {
+        fs::write(repo.path().join("a.rs"), format!("fn f{i}() {{}}\n")).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", &format!("c{i}")]);
+    }
+    let profiles_path = home.path().join("profiles.json");
+    fs::write(&profiles_path, utility_binding_profiles_json()).unwrap();
+
+    let output = darkmux_std_cmd()
+        .current_dir(repo.path())
+        .env("HOME", os_home.path())
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_PROFILES", &profiles_path)
+        .env("DARKMUX_LMSTUDIO_URL", format!("http://127.0.0.1:{route_port}"))
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args(["radio", "review this branch"])
+        .output()
+        .expect("running darkmux radio");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(1), "stdout:\n{stdout}");
+    for key in ["--param diff_file=", "--param workspace=", "--param head_sha="] {
+        assert!(stdout.contains(key), "the confirmation must show `{key}`:\n{stdout}");
+    }
+    assert!(
+        stdout.contains("diff_file, workspace, head_sha") && stdout.contains("temporary files"),
+        "the advice must say the synthesized values do not outlive the process:\n{stdout}"
+    );
+}
+
 /// (#2917) One LM Studio instance serves one request at a time, so a radio
 /// request from another process used to queue inside LM Studio, silently,
 /// until the 300s ceiling. Radio now checks the instance its ANSWERING seat

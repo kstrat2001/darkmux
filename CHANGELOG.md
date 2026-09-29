@@ -40,16 +40,24 @@ darkmux release.
   until the file is fixed, and `darkmux doctor` names it. A value with spaces
   in the panel is written `name="two words"`.
 - **Radio asks before it runs anything it chose.** The router can now pick any
-  launchable config from free text, so `darkmux radio` prints the exact
-  `darkmux mission launch <id> --param ...` command and asks `Run it? [y/N]`
-  before running it. With no interactive terminal it prints the command and
-  exits 1 without running it. The editor agent panel does the same for free
-  text (no slash): the pick is shown in the panel's permission dialog, and
-  only Allow runs it; Reject, cancel or no answer runs nothing and the panel
-  says "not run". An explicit `/mission launch <id>` is your own command and
-  is not asked again. **Migration:** a script that relied on radio running its
-  pick unattended must run the printed command itself; a panel user answers
-  the dialog once per routed message.
+  launchable config from free text, so `darkmux radio` prepares the launch's
+  inputs first, prints the `darkmux mission launch <id> --param ...` command
+  with every param that will run (for `review`, the `diff_file`, `workspace`
+  and `head_sha` it makes from the current directory, which name temporary
+  files), and asks `Run it? [y/N]` before running it. A repo with nothing to
+  review is reported without asking. With no interactive terminal it prints
+  the command, says it was not run and, when inputs were made from the
+  current directory, that they are temporary and must be replaced with your
+  own, then exits 1. An interrupt at the prompt runs nothing, even if a `y`
+  follows. A routed input holding a control character is refused. The editor
+  agent panel does the same for free text (no slash): the pick is shown in a
+  code block in the panel's permission dialog, and only Allow runs it; Reject,
+  cancel or no answer runs nothing and the panel says "not run". An explicit
+  `/mission launch <id>` is your own command and is not asked again.
+  **Migration:** a script that relied on radio running its pick unattended
+  must run the printed command itself (for `review`, with its own
+  `diff_file` and `workspace`); a panel user answers the dialog once per
+  routed message.
 - **`darkmux mission dispatch` and the hand-built mission verbs** (#2954).
   Missions now come only from mission configs. Removed with no alias:
   `mission dispatch`, `mission add-phase`, `mission start`,
@@ -248,7 +256,9 @@ darkmux release.
   semver-bound shape (`MissionShow`: `id`, `status`, `description`, `config`,
   `graph` (the daemon's `/mission/:id/graph.json` value), `runs` (the `run
   list` rows for this mission), `tokens`, `link`). `mission status` stays the
-  board.
+  board. An input the launcher fills itself, `mission_id`, reports
+  `required: false` in `config.inputs` (and is not marked required in the text
+  listing), since no caller has to pass it.
 - **`/mission list`, `/mission launch <config> [name=value ...]` and
   `/mission show <id>` in the editor panel**, replacing the per-config
   commands. Arguments after the config id map onto its declared inputs the way
@@ -257,6 +267,10 @@ darkmux release.
   no inputs still synthesizes the diff, workspace and `head_sha` from the
   session's cwd, now triggered by a declared required `diff_file` input and
   skipped when you pass one.
+- **Panel values have no escapes.** In `/mission launch <config> name="two words"`
+  a backslash right before the closing quote is refused, naming the input,
+  instead of being guessed at; use the other kind of quote around a value that
+  holds one.
 
 ### Changed (breaking, 4.0)
 

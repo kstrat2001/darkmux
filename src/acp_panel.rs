@@ -292,8 +292,10 @@ enum Word {
 /// Split `rest` on whitespace into [`Word`]s. A declared input's value may be
 /// quoted, `name="two words"` or `name='two words'`, so it can hold spaces;
 /// the quotes are removed and the closing quote ends the quoted part. Quotes
-/// anywhere else (an apostrophe in free text) are ordinary characters. `Err`
-/// names a declared input whose quote never closes.
+/// anywhere else (an apostrophe in free text) are ordinary characters. There
+/// are no escapes, so a backslash right before the closing quote is refused
+/// rather than guessed at. `Err` names a declared input whose quote never
+/// closes or that ends in such a backslash.
 fn split_words(config: &MissionConfig, rest: &str) -> Result<Vec<Word>> {
     let mut words = Vec::new();
     let mut tail = rest.trim_start();
@@ -318,6 +320,9 @@ fn split_words(config: &MissionConfig, rest: &str) -> Result<Vec<Word>> {
             bail!("`{name}=` opens a {quote} quote that never closes, so `{}` was not launched. Close the quote after the value.", config.id);
         };
         let quoted_value = &tail[value_start..value_start + close];
+        if quoted_value.ends_with('\\') {
+            bail!("`{name}=` has a backslash before a {quote} quote, but there are no escapes: the quote closes the value there, so `{}` was not launched. Use the other kind of quote around a value that holds this one.", config.id);
+        }
         let after = value_start + close + 1;
         let suffix_end = tail[after..].find(char::is_whitespace).map_or(tail.len(), |i| after + i);
         words.push(Word::Param(format!("{name}={quoted_value}{}", &tail[after..suffix_end])));
@@ -355,8 +360,22 @@ pub fn map_launch_args(config: &MissionConfig, rest: &str) -> Result<Vec<String>
 pub fn plan_launch(config_id: &str, rest: &str) -> Result<LaunchPlan> {
     let loaded = crate::mission_launch::resolve_config(config_id)?;
     let params = map_launch_args(&loaded.config, rest)?;
+    refuse_control_chars(config_id, &params)?;
     let route = if is_procedural_only(&loaded.config) { LaunchRoute::Ephemeral } else { LaunchRoute::Launch };
     Ok(LaunchPlan { config_id: config_id.to_string(), config: loaded.config, route, params, raw_args: rest.to_string() })
+}
+
+/// Refuse a param whose value holds a control character (an escape sequence
+/// from a router's output would otherwise reach the terminal or the dialog
+/// as one). `Err` names the input.
+fn refuse_control_chars(config_id: &str, params: &[String]) -> Result<()> {
+    for param in params {
+        let (name, value) = param.split_once('=').unwrap_or((param.as_str(), ""));
+        if value.chars().any(char::is_control) {
+            bail!("the value for `{name}` holds a control character, so `{config_id}` was not launched. Retype the input without it.");
+        }
+    }
+    Ok(())
 }
 
 /// A launch's params after the panel filled in what it could, holding the
@@ -366,7 +385,16 @@ pub struct PreparedLaunch {
     /// Non-empty when the working tree carries changes a synthesized diff
     /// does not cover.
     pub note: Option<String>,
-    _synth: Option<SynthesizedInputs>,
+    synth: Option<SynthesizedInputs>,
+}
+
+impl PreparedLaunch {
+    /// The names of the inputs [`prepare_launch`] synthesized from the cwd,
+    /// empty when the operator supplied their own or none were needed.
+    pub fn synthesized_keys(&self) -> Vec<&str> {
+        let Some(synth) = &self.synth else { return Vec::new() };
+        synth.params().iter().filter_map(|p| p.split_once('=').map(|(k, _)| k)).collect()
+    }
 }
 
 /// What [`prepare_launch`] decided.
@@ -390,15 +418,15 @@ fn supplies(params: &[String], key: &str) -> bool {
 /// `Err` only for genuine IO failures and a cwd that is not a git repo.
 pub fn prepare_launch(config: &MissionConfig, mut params: Vec<String>, cwd: &Path) -> Result<Prepared> {
     if SYNTHESIZED_INPUTS.iter().any(|key| supplies(&params, key)) {
-        return Ok(Prepared::Ready(PreparedLaunch { params, note: None, _synth: None }));
+        return Ok(Prepared::Ready(PreparedLaunch { params, note: None, synth: None }));
     }
     match synthesize_diff_launch_inputs(config, cwd)? {
-        DiffLaunchInputs::NotNeeded => Ok(Prepared::Ready(PreparedLaunch { params, note: None, _synth: None })),
+        DiffLaunchInputs::NotNeeded => Ok(Prepared::Ready(PreparedLaunch { params, note: None, synth: None })),
         DiffLaunchInputs::Nothing(msg) => Ok(Prepared::Nothing(msg)),
         DiffLaunchInputs::Ready(synth) => {
             params.extend(synth.params().iter().cloned());
             let note = synth.excluded_note.clone();
-            Ok(Prepared::Ready(PreparedLaunch { params, note, _synth: Some(synth) }))
+            Ok(Prepared::Ready(PreparedLaunch { params, note, synth: Some(synth) }))
         }
     }
 }
@@ -1141,7 +1169,7 @@ fn render_ephemeral_result(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::crew::mission_config::{MissionInput, PhaseConfig, StepConfig, TaskConfig, PANEL_ARGS_TASK_ID};
     use std::collections::BTreeMap as Map;
@@ -1421,6 +1449,24 @@ mod tests {
         assert!(err.contains("`test_command=`") && err.contains("never closes"), "{err}");
     }
 
+    #[test]
+    fn a_backslash_before_a_quote_in_a_quoted_value_is_refused_naming_the_input() {
+        let cfg = config_with(&["name"], true);
+        let err = map_launch_args(&cfg, r#"name="say \"hi\" now""#).unwrap_err().to_string();
+        assert!(err.contains("`name=`") && err.contains("no escapes"), "{err}");
+        // The inverse: a backslash elsewhere in the value is ordinary text.
+        assert_eq!(map_launch_args(&cfg, r#"name="a\b c""#).unwrap(), vec![r"name=a\b c".to_string()]);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_control_character_in_a_planned_input_is_refused_naming_it() {
+        let err = plan_launch("review", "rules=a\u{1b}[31mb").err().expect("refused").to_string();
+        assert!(err.contains("`rules`") && err.contains("control character"), "{err}");
+        // The inverse: a plain value plans.
+        assert!(plan_launch("review", "rules=a,b").is_ok());
+    }
+
     /// The inverse: quotes outside a declared value are ordinary characters,
     /// so an apostrophe in free text neither errors nor vanishes.
     #[test]
@@ -1657,6 +1703,16 @@ mod tests {
         for key in ["diff_file", "workspace", "head_sha"] {
             assert!(supplies(&prepared.params, key), "`{key}` must be synthesized: {:?}", prepared.params);
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_prepared_review_names_the_inputs_it_synthesized_and_a_supplied_one_names_none() {
+        let repo = temp_repo(2);
+        let prepared = ready(prepare_launch(&embedded_review(), Vec::new(), repo.path()).unwrap());
+        assert_eq!(prepared.synthesized_keys(), ["diff_file", "workspace", "head_sha"]);
+        let own = ready(prepare_launch(&embedded_review(), vec!["diff_file=x.diff".to_string()], repo.path()).unwrap());
+        assert!(own.synthesized_keys().is_empty());
     }
 
     /// An operator-supplied `diff_file` is never overridden by the cwd's.
@@ -2586,7 +2642,7 @@ mod tests {
     // ── (#2310 P4d) diff synthesis for the panel/radio surfaces ────────
 
     /// A git repo with `n` commits, each adding one line to `src/a.rs`.
-    fn temp_repo(commits: usize) -> tempfile::TempDir {
+    pub(crate) fn temp_repo(commits: usize) -> tempfile::TempDir {
         let dir = tempfile::TempDir::new().unwrap();
         let run = |args: &[&str]| {
             let out = std::process::Command::new("git")
