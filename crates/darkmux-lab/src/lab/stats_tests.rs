@@ -9,6 +9,21 @@
 
 use super::*;
 
+/// A `dispatch.start` bounds block as a producer writes it: every required
+/// knob present, `overrides` laid over the built-in defaults.
+fn bounds_json(overrides: serde_json::Value) -> serde_json::Value {
+    let mut bounds = serde_json::json!({
+        "max_tokens_per_call": {"value": null, "source": "built-in"},
+        "inactivity_timeout_seconds": {"value": 600, "source": "built-in"},
+        "max_turns": {"value": null, "source": "built-in"},
+        "max_tokens": {"value": null, "source": "built-in"},
+    });
+    for (k, v) in overrides.as_object().expect("an object of knobs") {
+        bounds[k] = v.clone();
+    }
+    bounds
+}
+
 fn line(v: serde_json::Value) -> String {
     format!("{v}\n")
 }
@@ -379,9 +394,9 @@ fn telem(ts: u64, gpu_pct: u64, w: f64) -> String {
     line(serde_json::json!({
         "action": "machine.telemetry",
         "payload": {
-            "sampled_at_ms": ts, "gpu_pct": gpu_pct, "mem_pct": 62,
+            "sampled_at_ms": ts, "sampler_cost_ms": 1, "gpu_pct": gpu_pct, "mem_pct": 62,
             "thermal": {"state": "nominal", "cpu_speed_limit_pct": 100},
-            "power_mw": {"gpu": (w * 1000.0) as u64, "cpu": 5_000, "total": (w * 1000.0) as u64 + 5_000}
+            "power_mw": {"gpu": (w * 1000.0) as u64, "cpu": 5_000, "ane": 0, "total": (w * 1000.0) as u64 + 5_000}
         }
     }))
 }
@@ -400,9 +415,9 @@ fn power_is_averaged_over_busy_samples_only_with_a_duty_cycle() {
         line(serde_json::json!({
             "action": "machine.telemetry",
             "payload": {
-                "sampled_at_ms": from + off, "interval_ms": 25_000, "gpu_pct": gpu, "mem_pct": 62,
+                "sampled_at_ms": from + off, "sampler_cost_ms": 1, "interval_ms": 25_000, "gpu_pct": gpu, "mem_pct": 62,
                 "thermal": {"state": "nominal", "cpu_speed_limit_pct": 100},
-                "power_mw": {"gpu": (w * 1000.0) as u64, "cpu": 5_000, "total": (w * 1000.0) as u64 + 5_000}
+                "power_mw": {"gpu": (w * 1000.0) as u64, "cpu": 5_000, "ane": 0, "total": (w * 1000.0) as u64 + 5_000}
             }
         }))
     };
@@ -494,7 +509,7 @@ fn a_run_that_crossed_midnight_reads_both_days_files() {
         flows.path().join("2026-09-21.jsonl"),
         line(serde_json::json!({
             "action": "dispatch.start", "session_id": "sid-1",
-            "payload": {"bounds": {"max_tokens_per_call": {"value": 32_000, "source": "built-in"}}}
+            "payload": {"bounds": bounds_json(serde_json::json!({"max_tokens_per_call": {"value": 32_000, "source": "built-in"}}))}
         })),
     )
     .unwrap();
@@ -659,7 +674,7 @@ fn the_window_slack_keeps_session_records_but_not_outside_telemetry() {
         telem(start - 2 * MIN, 96, 40.0), // before the run: not a run sample
         line(serde_json::json!({
             "action": "dispatch.start", "session_id": "sid-9",
-            "payload": {"bounds": {"max_turns": {"value": null, "source": "built-in"}}}
+            "payload": {"bounds": bounds_json(serde_json::json!({"max_turns": {"value": null, "source": "built-in"}}))}
         })),
         telem(start + MIN, 96, 40.0),
     );
@@ -736,8 +751,8 @@ fn telem_at(ts: u64, gpu_pct: u64, interval_ms: u64) -> String {
     line(serde_json::json!({
         "action": "machine.telemetry",
         "payload": {
-            "sampled_at_ms": ts, "gpu_pct": gpu_pct, "interval_ms": interval_ms,
-            "power_mw": {"gpu": 30_000, "cpu": 5_000, "total": 35_000}
+            "sampled_at_ms": ts, "sampler_cost_ms": 1, "gpu_pct": gpu_pct, "interval_ms": interval_ms,
+            "power_mw": {"gpu": 30_000, "cpu": 5_000, "ane": 0, "total": 35_000}
         }
     }))
 }
@@ -844,7 +859,7 @@ fn a_file_last_written_just_before_the_run_is_still_opened() {
     let flows = tempfile::TempDir::new().unwrap();
     let body = line(serde_json::json!({
         "action": "dispatch.start", "session_id": "sid-4",
-        "payload": {"bounds": {"max_turns": {"value": null, "source": "built-in"}}}
+        "payload": {"bounds": bounds_json(serde_json::json!({"max_turns": {"value": null, "source": "built-in"}}))}
     }));
     flow_file(flows.path(), "d.jsonl", &body, start - 2 * MIN);
     let s = compute_from_dir(run.path(), flows.path()).unwrap();
@@ -988,8 +1003,8 @@ fn old_telem(off: u64, gpu: u64) -> String {
     // Telemetry as recorded before 2026-09-05: no `interval_ms`.
     line(serde_json::json!({
         "action": "machine.telemetry",
-        "payload": {"sampled_at_ms": 1_000_000 + off, "gpu_pct": gpu,
-                    "power_mw": {"gpu": 30_000, "cpu": 5_000, "total": 35_000}}
+        "payload": {"sampled_at_ms": 1_000_000 + off, "sampler_cost_ms": 1, "gpu_pct": gpu,
+                    "power_mw": {"gpu": 30_000, "cpu": 5_000, "ane": 0, "total": 35_000}}
     }))
 }
 

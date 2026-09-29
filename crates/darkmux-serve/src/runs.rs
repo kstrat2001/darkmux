@@ -2274,14 +2274,14 @@ fn fold_session_record(idx: &mut HashMap<String, SessionAgg>, v: &serde_json::Va
     // Check EVERY execution bookend's payload for `endpoint`, not just the
     // start (#1518, applied server-side; see `SessionAgg::endpoint`'s doc).
     if agg.endpoint.is_none() && grain == Some(Grain::Execution) {
-        if let Some(ep) = v
-            .get("payload")
-            .and_then(|p| p.get("endpoint"))
-            .and_then(|e| e.as_str())
-        {
-            if !ep.is_empty() {
-                agg.endpoint = Some(ep.to_string());
-            }
+        use darkmux_flow::Payload;
+        let endpoint = match darkmux_flow::reader::payload_of(v) {
+            Some(Payload::DispatchStart(p)) => p.endpoint,
+            Some(Payload::DispatchComplete(p) | Payload::DispatchError(p)) => p.endpoint,
+            _ => None,
+        };
+        if let Some(ep) = endpoint.filter(|e| !e.is_empty()) {
+            agg.endpoint = Some(ep);
         }
     }
 
@@ -4782,7 +4782,7 @@ mod tests {
     fn ghost_runs_a_budget_held_call_is_a_run_before_its_start() {
         let base_ts = "2000-01-01T00:00:00Z";
         let base_ms = parse_flow_ts(base_ts).unwrap() * 1_000;
-        let wait = serde_json::json!({ "ts": base_ts, "action": "budget.wait", "session_id": "held", "payload": { "wait_ms": 86_000_000 } });
+        let wait = serde_json::json!({ "ts": base_ts, "action": "budget.wait", "session_id": "held", "payload": { "scope": "endpoint", "message": "waiting", "wait_ms": 86_000_000 } });
         let mut idx = HashMap::new();
         fold_session_record(&mut idx, &wait);
         settle_session_index(&mut idx);
@@ -4790,7 +4790,7 @@ mod tests {
         assert_eq!(held.len(), 1, "a waiting session with no start yet is a run");
         assert_eq!(held[0].status, RunStatus::Running, "running while it waits, hours past the staleness window");
 
-        let stop = serde_json::json!({ "ts": "2000-01-01T04:00:00Z", "action": "budget.stop", "session_id": "held", "payload": { "reason": "mission `m` is aborted" } });
+        let stop = serde_json::json!({ "ts": "2000-01-01T04:00:00Z", "action": "budget.stop", "session_id": "held", "payload": { "scope": "endpoint", "message": "stopped", "reason": "mission `m` is aborted" } });
         fold_session_record(&mut idx, &stop);
         settle_session_index(&mut idx);
         let stopped = ghost_runs(&idx, &HashSet::new(), &HashSet::new(), &HashSet::new(), base_ms + 5 * 3_600_000);

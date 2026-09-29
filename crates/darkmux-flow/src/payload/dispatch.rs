@@ -147,17 +147,32 @@ pub struct Knob {
 #[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct RuntimeBounds {
     pub max_tokens_per_call: Knob,
-    pub reasoning_checkpoint_interval_tokens: Knob,
     pub inactivity_timeout_seconds: Knob,
     pub max_turns: Knob,
     pub max_tokens: Knob,
-    pub turn_delay_ms: Knob,
-    pub feedback_injection: Knob,
+    // The knobs below were added over time, so an older archive's block lacks them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub reasoning_checkpoint_interval_tokens: Option<Knob>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub turn_delay_ms: Option<Knob>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub feedback_injection: Option<Knob>,
     /// The detection regime the run executed under.
-    pub detection_degeneracy_policy: Knob,
-    pub thermal_pacing_enabled: Knob,
-    pub battery_pause_enabled: Knob,
-    pub battery_pause_floor_pct: Knob,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub detection_degeneracy_policy: Option<Knob>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub thermal_pacing_enabled: Option<Knob>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub battery_pause_enabled: Option<Knob>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub battery_pause_floor_pct: Option<Knob>,
 }
 
 /// A role execution began: the payload of `dispatch.start`. One type for every producer of the
@@ -243,6 +258,9 @@ pub struct DispatchStartPayload {
 impl Attribution for DispatchStartPayload {
     fn step_slot(&mut self) -> Option<&mut Option<String>> {
         Some(&mut self.step_id)
+    }
+    fn step(&self) -> Option<&str> {
+        self.step_id.as_deref()
     }
     fn context_slot(&mut self) -> Option<&mut Option<serde_json::Map<String, serde_json::Value>>> {
         Some(&mut self.context)
@@ -430,6 +448,9 @@ impl Attribution for DispatchEndPayload {
     fn step_slot(&mut self) -> Option<&mut Option<String>> {
         Some(&mut self.step_id)
     }
+    fn step(&self) -> Option<&str> {
+        self.step_id.as_deref()
+    }
     fn context_slot(&mut self) -> Option<&mut Option<serde_json::Map<String, serde_json::Value>>> {
         Some(&mut self.context)
     }
@@ -499,6 +520,9 @@ impl Attribution for DispatchTurnPayload {
     fn step_slot(&mut self) -> Option<&mut Option<String>> {
         Some(&mut self.step_id)
     }
+    fn step(&self) -> Option<&str> {
+        self.step_id.as_deref()
+    }
     fn context_slot(&mut self) -> Option<&mut Option<serde_json::Map<String, serde_json::Value>>> {
         Some(&mut self.context)
     }
@@ -551,6 +575,9 @@ pub struct DispatchHeartbeatPayload {
 impl Attribution for DispatchHeartbeatPayload {
     fn step_slot(&mut self) -> Option<&mut Option<String>> {
         Some(&mut self.step_id)
+    }
+    fn step(&self) -> Option<&str> {
+        self.step_id.as_deref()
     }
     fn context_slot(&mut self) -> Option<&mut Option<serde_json::Map<String, serde_json::Value>>> {
         Some(&mut self.context)
@@ -605,6 +632,9 @@ impl Attribution for DispatchToolPayload {
     fn step_slot(&mut self) -> Option<&mut Option<String>> {
         Some(&mut self.step_id)
     }
+    fn step(&self) -> Option<&str> {
+        self.step_id.as_deref()
+    }
     fn context_slot(&mut self) -> Option<&mut Option<serde_json::Map<String, serde_json::Value>>> {
         Some(&mut self.context)
     }
@@ -640,6 +670,9 @@ pub struct DispatchCompactionPayload {
 impl Attribution for DispatchCompactionPayload {
     fn step_slot(&mut self) -> Option<&mut Option<String>> {
         Some(&mut self.step_id)
+    }
+    fn step(&self) -> Option<&str> {
+        self.step_id.as_deref()
     }
     fn context_slot(&mut self) -> Option<&mut Option<serde_json::Map<String, serde_json::Value>>> {
         Some(&mut self.context)
@@ -696,6 +729,9 @@ impl Attribution for DispatchCheckpointPayload {
     fn step_slot(&mut self) -> Option<&mut Option<String>> {
         Some(&mut self.step_id)
     }
+    fn step(&self) -> Option<&str> {
+        self.step_id.as_deref()
+    }
     fn context_slot(&mut self) -> Option<&mut Option<serde_json::Map<String, serde_json::Value>>> {
         Some(&mut self.context)
     }
@@ -727,6 +763,9 @@ impl Attribution for DispatchReasoningPayload {
     fn step_slot(&mut self) -> Option<&mut Option<String>> {
         Some(&mut self.step_id)
     }
+    fn step(&self) -> Option<&str> {
+        self.step_id.as_deref()
+    }
     fn context_slot(&mut self) -> Option<&mut Option<serde_json::Map<String, serde_json::Value>>> {
         Some(&mut self.context)
     }
@@ -755,6 +794,9 @@ pub struct DispatchFeedbackPayload {
 impl Attribution for DispatchFeedbackPayload {
     fn step_slot(&mut self) -> Option<&mut Option<String>> {
         Some(&mut self.step_id)
+    }
+    fn step(&self) -> Option<&str> {
+        self.step_id.as_deref()
     }
     fn context_slot(&mut self) -> Option<&mut Option<serde_json::Map<String, serde_json::Value>>> {
         Some(&mut self.context)
@@ -832,6 +874,9 @@ impl Attribution for DispatchRestPayload {
     fn step_slot(&mut self) -> Option<&mut Option<String>> {
         Some(&mut self.step_id)
     }
+    fn step(&self) -> Option<&str> {
+        self.step_id.as_deref()
+    }
     fn context_slot(&mut self) -> Option<&mut Option<serde_json::Map<String, serde_json::Value>>> {
         Some(&mut self.context)
     }
@@ -866,6 +911,9 @@ pub struct DispatchDegeneracyWarningPayload {
 impl Attribution for DispatchDegeneracyWarningPayload {
     fn step_slot(&mut self) -> Option<&mut Option<String>> {
         Some(&mut self.step_id)
+    }
+    fn step(&self) -> Option<&str> {
+        self.step_id.as_deref()
     }
     fn context_slot(&mut self) -> Option<&mut Option<serde_json::Map<String, serde_json::Value>>> {
         Some(&mut self.context)
@@ -910,6 +958,9 @@ impl Attribution for DispatchWorkdirGitUnavailablePayload {
     fn step_slot(&mut self) -> Option<&mut Option<String>> {
         Some(&mut self.step_id)
     }
+    fn step(&self) -> Option<&str> {
+        self.step_id.as_deref()
+    }
     fn context_slot(&mut self) -> Option<&mut Option<serde_json::Map<String, serde_json::Value>>> {
         Some(&mut self.context)
     }
@@ -938,6 +989,9 @@ pub struct DispatchRoutePayload {
 impl Attribution for DispatchRoutePayload {
     fn step_slot(&mut self) -> Option<&mut Option<String>> {
         Some(&mut self.step_id)
+    }
+    fn step(&self) -> Option<&str> {
+        self.step_id.as_deref()
     }
 }
 

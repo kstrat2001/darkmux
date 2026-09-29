@@ -237,8 +237,9 @@ pub struct MachineTelemetryPayload {
     #[cfg_attr(feature = "ts-export", ts(flatten))]
     pub now: HostSampleNow,
     /// The MEASURED gap since the previous emission of this record, not the configured cadence.
-    #[cfg_attr(feature = "ts-export", ts(type = "number"))]
-    pub interval_ms: u64,
+    /// Absent on a record written before it was stamped (2026-09-05).
+    #[cfg_attr(feature = "ts-export", ts(type = "number | null"))]
+    pub interval_ms: Option<u64>,
     /// The liveness probe this emission's cadence decision depended on: part of this record's own
     /// write cost, stamped so "the observer was negligible" stays a verifiable claim.
     #[serde(default, skip_serializing_if = "Option::is_none")]

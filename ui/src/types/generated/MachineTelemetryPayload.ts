@@ -11,8 +11,9 @@ import type { ThermalNow } from "./ThermalNow";
 export type MachineTelemetryPayload = { 
 /**
  * The MEASURED gap since the previous emission of this record, not the configured cadence.
+ * Absent on a record written before it was stamped (2026-09-05).
  */
-interval_ms: number, 
+interval_ms: number | null, 
 /**
  * The liveness probe this emission's cadence decision depended on: part of this record's own
  * write cost, stamped so "the observer was negligible" stays a verifiable claim.

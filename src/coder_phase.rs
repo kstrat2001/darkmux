@@ -2301,13 +2301,14 @@ fn mission_cautions(
             if !in_mission {
                 continue;
             }
-            let payload = r.get("payload");
-            let pstr = |k: &str| payload.and_then(|p| p.get(k)).and_then(|v| v.as_str());
-            let detail = pstr("detail").unwrap_or("");
+            let Some(darkmux_flow::Payload::TelemetryDetector(finding)) = darkmux_flow::reader::payload_of(&r) else {
+                continue;
+            };
+            let detail = finding.detail.as_str();
             if detail.is_empty() {
                 continue;
             }
-            let kind = pstr("kind").unwrap_or("caution");
+            let kind = finding.kind.as_str();
             // (#2887 F5) `repetition` (the degeneracy gate + reasoning
             // checkpoint) is darkmux-internal vocabulary an operator reads
             // on the run page, not a finding about the CODE the next
@@ -2321,14 +2322,9 @@ fn mission_cautions(
             if kind == "repetition" {
                 continue;
             }
-            let severity = pstr("severity").unwrap_or("warn");
-            let area = payload.and_then(|p| p.get("area"));
-            let file = area
-                .and_then(|a| a.get("files"))
-                .and_then(|f| f.as_array())
-                .and_then(|arr| arr.first())
-                .and_then(|v| v.as_str());
-            let code_hash = area.and_then(|a| a.get("code_hash")).and_then(|v| v.as_str());
+            let severity = finding.severity.as_str();
+            let file = finding.area.as_ref().and_then(|a| a.files.first()).map(String::as_str);
+            let code_hash = finding.area.as_ref().and_then(|a| a.code_hash.as_deref());
             let ts = r.get("ts").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let bullet = match file {
                 Some(f) => format!("- [{kind}] {detail} (in `{f}`)"),

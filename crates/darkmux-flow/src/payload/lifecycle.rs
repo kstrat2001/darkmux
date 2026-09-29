@@ -50,7 +50,11 @@ pub struct StepSeatUnresolvedPayload {
     pub lost: String,
 }
 
-impl Attribution for StepSeatUnresolvedPayload {}
+impl Attribution for StepSeatUnresolvedPayload {
+    fn step(&self) -> Option<&str> {
+        Some(&self.step_id)
+    }
+}
 
 /// One step's in/out counts and wall time: the payload of `step.timing`, and the very shape of the
 /// scheduler's in-memory step summary, so there is exactly one such shape in the tree.
@@ -77,7 +81,11 @@ pub struct StepTimingPayload {
     pub wall_ms: u64,
 }
 
-impl Attribution for StepTimingPayload {}
+impl Attribution for StepTimingPayload {
+    fn step(&self) -> Option<&str> {
+        Some(&self.step_id)
+    }
+}
 
 /// A bash verifier command the runtime classified as FAILED TO RUN: the binary was missing, not
 /// executable, or its toolchain failed to load, so it never verified anything.
@@ -224,7 +232,11 @@ pub struct StepResultPayload {
     pub nits: Option<u64>,
 }
 
-impl Attribution for StepResultPayload {}
+impl Attribution for StepResultPayload {
+    fn step(&self) -> Option<&str> {
+        Some(&self.step_id)
+    }
+}
 
 
 impl StepResultPayload {
@@ -476,6 +488,9 @@ impl Attribution for RadioRoutePayload {
     fn step_slot(&mut self) -> Option<&mut Option<String>> {
         Some(&mut self.step_id)
     }
+    fn step(&self) -> Option<&str> {
+        self.step_id.as_deref()
+    }
 }
 
 /// A gated command ran: the payload of `gh.verb.executed`, ONE record per executed gated command
@@ -625,6 +640,9 @@ pub struct BudgetPayload {
 impl Attribution for BudgetPayload {
     fn step_slot(&mut self) -> Option<&mut Option<String>> {
         Some(&mut self.step_id)
+    }
+    fn step(&self) -> Option<&str> {
+        self.step_id.as_deref()
     }
     fn context_slot(&mut self) -> Option<&mut Option<serde_json::Map<String, serde_json::Value>>> {
         Some(&mut self.context)

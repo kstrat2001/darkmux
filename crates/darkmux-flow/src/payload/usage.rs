@@ -169,6 +169,9 @@ impl Attribution for UsagePayload {
     fn step_slot(&mut self) -> Option<&mut Option<String>> {
         Some(&mut self.step_id)
     }
+    fn step(&self) -> Option<&str> {
+        self.step_id.as_deref()
+    }
     fn context_slot(&mut self) -> Option<&mut Option<serde_json::Map<String, serde_json::Value>>> {
         Some(&mut self.context)
     }
@@ -216,6 +219,9 @@ pub struct UtilityStartPayload {
 impl Attribution for UtilityStartPayload {
     fn step_slot(&mut self) -> Option<&mut Option<String>> {
         Some(&mut self.step_id)
+    }
+    fn step(&self) -> Option<&str> {
+        self.step_id.as_deref()
     }
     fn context_slot(&mut self) -> Option<&mut Option<serde_json::Map<String, serde_json::Value>>> {
         Some(&mut self.context)

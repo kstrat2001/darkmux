@@ -6736,20 +6736,20 @@ fn resolved_runtime_bounds(
     };
     Ok(RuntimeBounds {
         max_tokens_per_call: vs(max_tokens_per_call.map(Into::into), s_mtpc),
-        reasoning_checkpoint_interval_tokens: vs(reasoning_checkpoint_interval_tokens.map(Into::into), s_rci),
+        reasoning_checkpoint_interval_tokens: Some(vs(reasoning_checkpoint_interval_tokens.map(Into::into), s_rci)),
         inactivity_timeout_seconds: inactivity_timeout_block,
         max_turns: max_turns_block,
         max_tokens: vs(max_tokens.map(Into::into), s_tokens),
-        turn_delay_ms: turn_delay_block,
-        feedback_injection: vs(Some(feedback_injection.into()), s_fi),
+        turn_delay_ms: Some(turn_delay_block),
+        feedback_injection: Some(vs(Some(feedback_injection.into()), s_fi)),
         // (#2846) The detection regime the run executed under. Stamped here
         // because a run that cannot say whether its gate was armed is not
         // comparable against one that can — which is exactly what made an
         // earlier engine comparison unreadable.
-        detection_degeneracy_policy: Knob::new(Some(dg_policy.as_str().into()), dg_source.into()),
-        thermal_pacing_enabled: vs(Some(thermal_pacing_enabled.into()), s_thermal),
-        battery_pause_enabled: vs(Some(battery_pause_enabled.into()), s_batt_en),
-        battery_pause_floor_pct: vs(Some(battery_pause_floor_pct.into()), s_batt_floor),
+        detection_degeneracy_policy: Some(Knob::new(Some(dg_policy.as_str().into()), dg_source.into())),
+        thermal_pacing_enabled: Some(vs(Some(thermal_pacing_enabled.into()), s_thermal)),
+        battery_pause_enabled: Some(vs(Some(battery_pause_enabled.into()), s_batt_en)),
+        battery_pause_floor_pct: Some(vs(Some(battery_pause_floor_pct.into()), s_batt_floor)),
     })
 }
 

@@ -424,17 +424,17 @@ edit loop detected on src/widget.rs in an earlier dispatch
             tmp.path().join("2026-06-22.jsonl"),
             concat!(
                 // mission `auth`, s1 — a file-keyed cycle (warn)
-                r#"{"ts":"2026-06-22T10:00:00Z","category":"telemetry","source":"detector","session_id":"mission-run-auth-s1","handle":"coder","payload":{"kind":"cycle","severity":"warn","detail":"`edit` called 3×","area":{"files":["src/x.rs"]}}}"#, "\n",
+                r#"{"ts":"2026-06-22T10:00:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"mission-run-auth-s1","handle":"coder","payload":{"kind":"cycle","severity":"warn","detail":"`edit` called 3×","area":{"files":["src/x.rs"]}}}"#, "\n",
                 // `auth`, s2 — an info-severity firing (must rank below warn)
-                r#"{"ts":"2026-06-22T11:00:00Z","category":"telemetry","source":"detector","session_id":"mission-run-auth-s2","handle":"coder","payload":{"kind":"intra-turn-stall","severity":"info","detail":"runaway turn recovered"}}"#, "\n",
+                r#"{"ts":"2026-06-22T11:00:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"mission-run-auth-s2","handle":"coder","payload":{"kind":"intra-turn-stall","severity":"info","detail":"runaway turn recovered"}}"#, "\n",
                 // exact duplicate of the cycle — must not repeat
-                r#"{"ts":"2026-06-22T11:30:00Z","category":"telemetry","source":"detector","session_id":"mission-run-auth-s1","handle":"coder","payload":{"kind":"cycle","severity":"warn","detail":"`edit` called 3×","area":{"files":["src/x.rs"]}}}"#, "\n",
+                r#"{"ts":"2026-06-22T11:30:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"mission-run-auth-s1","handle":"coder","payload":{"kind":"cycle","severity":"warn","detail":"`edit` called 3×","area":{"files":["src/x.rs"]}}}"#, "\n",
                 // SIBLING mission `auth-v2` — exact-set scope must NOT bleed it
-                r#"{"ts":"2026-06-22T11:45:00Z","category":"telemetry","source":"detector","session_id":"mission-run-auth-v2-s1","handle":"coder","payload":{"kind":"cycle","severity":"warn","detail":"belongs to auth-v2"}}"#, "\n",
+                r#"{"ts":"2026-06-22T11:45:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"mission-run-auth-v2-s1","handle":"coder","payload":{"kind":"cycle","severity":"warn","detail":"belongs to auth-v2"}}"#, "\n",
                 // non-detector telemetry (source=runtime) — skip
                 r#"{"ts":"2026-06-22T12:00:00Z","category":"telemetry","source":"runtime","session_id":"mission-run-auth-s1","handle":"coder","payload":{"kind":"context","detail":"context fill 40%"}}"#, "\n",
                 // non-telemetry category, even with source=detector — skip
-                r#"{"ts":"2026-06-22T12:05:00Z","category":"work","source":"detector","session_id":"mission-run-auth-s1","handle":"coder","payload":{"kind":"cycle","severity":"warn","detail":"wrong category"}}"#, "\n",
+                r#"{"ts":"2026-06-22T12:05:00Z","category":"work","source":"detector","action":"telemetry.detector","session_id":"mission-run-auth-s1","handle":"coder","payload":{"kind":"cycle","severity":"warn","detail":"wrong category"}}"#, "\n",
             ),
         )
         .unwrap();
@@ -492,8 +492,8 @@ edit loop detected on src/widget.rs in an earlier dispatch
         std::fs::write(
             tmp.path().join("2026-06-22.jsonl"),
             concat!(
-                r#"{"ts":"2026-06-22T10:00:00Z","category":"telemetry","source":"detector","session_id":"mission-run-rep-s1","handle":"coder","payload":{"kind":"cycle","severity":"warn","detail":"`edit` called 3×","area":{"files":["src/x.rs"]}}}"#, "\n",
-                r#"{"ts":"2026-06-22T10:01:00Z","category":"telemetry","source":"detector","session_id":"mission-run-rep-s1","handle":"coder","payload":{"kind":"repetition","severity":"warn","detail":"observation 17: tail_ratio=0.242 over 68000 characters — the degeneracy gate judged this repeating (#2836)"}}"#, "\n",
+                r#"{"ts":"2026-06-22T10:00:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"mission-run-rep-s1","handle":"coder","payload":{"kind":"cycle","severity":"warn","detail":"`edit` called 3×","area":{"files":["src/x.rs"]}}}"#, "\n",
+                r#"{"ts":"2026-06-22T10:01:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"mission-run-rep-s1","handle":"coder","payload":{"kind":"repetition","severity":"warn","detail":"observation 17: tail_ratio=0.242 over 68000 characters — the degeneracy gate judged this repeating (#2836)"}}"#, "\n",
             ),
         )
         .unwrap();
@@ -553,9 +553,9 @@ edit loop detected on src/widget.rs in an earlier dispatch
             tmp.path().join("2026-06-22.jsonl"),
             concat!(
                 // older caution on the file in play (normalized match for `./src/target.rs`)
-                r#"{"ts":"2026-06-22T10:00:00Z","category":"telemetry","source":"detector","session_id":"mission-run-m-s1","payload":{"kind":"cycle","severity":"warn","detail":"on the target","area":{"files":["src/target.rs"]}}}"#, "\n",
+                r#"{"ts":"2026-06-22T10:00:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"mission-run-m-s1","payload":{"kind":"cycle","severity":"warn","detail":"on the target","area":{"files":["src/target.rs"]}}}"#, "\n",
                 // NEWER, same-severity caution on an unrelated file
-                r#"{"ts":"2026-06-22T12:00:00Z","category":"telemetry","source":"detector","session_id":"mission-run-m-s1","payload":{"kind":"cycle","severity":"warn","detail":"on something else","area":{"files":["src/other.rs"]}}}"#, "\n",
+                r#"{"ts":"2026-06-22T12:00:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"mission-run-m-s1","payload":{"kind":"cycle","severity":"warn","detail":"on something else","area":{"files":["src/other.rs"]}}}"#, "\n",
             ),
         )
         .unwrap();
@@ -602,9 +602,9 @@ edit loop detected on src/widget.rs in an earlier dispatch
             format!(
                 concat!(
                     // stale caution (recorded hash != current content), NEWER
-                    r#"{{"ts":"2026-06-22T12:00:00Z","category":"telemetry","source":"detector","session_id":"mission-run-m-s1","payload":{{"kind":"cycle","severity":"warn","detail":"stale one","area":{{"files":["stale.rs"],"code_hash":"{stale}"}}}}}}"#, "\n",
+                    r#"{{"ts":"2026-06-22T12:00:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"mission-run-m-s1","payload":{{"kind":"cycle","severity":"warn","detail":"stale one","area":{{"files":["stale.rs"],"code_hash":"{stale}"}}}}}}"#, "\n",
                     // fresh caution (recorded hash == current content), older
-                    r#"{{"ts":"2026-06-22T10:00:00Z","category":"telemetry","source":"detector","session_id":"mission-run-m-s1","payload":{{"kind":"cycle","severity":"warn","detail":"fresh one","area":{{"files":["fresh.rs"],"code_hash":"{fresh}"}}}}}}"#, "\n",
+                    r#"{{"ts":"2026-06-22T10:00:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"mission-run-m-s1","payload":{{"kind":"cycle","severity":"warn","detail":"fresh one","area":{{"files":["fresh.rs"],"code_hash":"{fresh}"}}}}}}"#, "\n",
                 ),
                 stale = stale_recorded_hash,
                 fresh = fresh_hash,
@@ -802,10 +802,10 @@ edit loop detected on src/widget.rs in an earlier dispatch
         std::fs::write(
             flows.path().join("2026-06-22.jsonl"),
             concat!(
-                r#"{"ts":"2026-06-22T10:00:00Z","category":"telemetry","source":"detector","session_id":"mission-run-m-debrief-s1","handle":"coder","payload":{"kind":"cycle","severity":"warn","detail":"edit called 3x","area":{"files":["src/index.rs"]}}}"#, "\n",
+                r#"{"ts":"2026-06-22T10:00:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"mission-run-m-debrief-s1","handle":"coder","payload":{"kind":"cycle","severity":"warn","detail":"edit called 3x","area":{"files":["src/index.rs"]}}}"#, "\n",
                 r#"{"ts":"2026-06-22T10:30:00Z","action":"note","source":"adjudication","session_id":"mission-run-m-debrief-s1","handle":"overrode SIGNOFF — verify never ran"}"#, "\n",
                 // SIBLING mission session must NOT bleed in.
-                r#"{"ts":"2026-06-22T10:45:00Z","category":"telemetry","source":"detector","session_id":"mission-run-m-debrief-v2-s1","handle":"coder","payload":{"kind":"cycle","severity":"warn","detail":"belongs to a sibling"}}"#, "\n",
+                r#"{"ts":"2026-06-22T10:45:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"mission-run-m-debrief-v2-s1","handle":"coder","payload":{"kind":"cycle","severity":"warn","detail":"belongs to a sibling"}}"#, "\n",
             ),
         )
         .unwrap();
@@ -1678,7 +1678,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
             format!(
                 concat!(
                     r#"{{"ts":"2026-07-26T10:00:00Z","action":"note","source":"adjudication","session_id":"{sid}","handle":"Do not rename the widget config field."}}"#, "\n",
-                    r#"{{"ts":"2026-07-26T10:05:00Z","category":"telemetry","source":"detector","session_id":"{sid}","payload":{{"kind":"cycle","severity":"warn","detail":"`edit` called 3×","area":{{"files":["widget.rs"],"code_hash":"{hash}"}}}}}}"#, "\n",
+                    r#"{{"ts":"2026-07-26T10:05:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"{sid}","payload":{{"kind":"cycle","severity":"warn","detail":"`edit` called 3×","area":{{"files":["widget.rs"],"code_hash":"{hash}"}}}}}}"#, "\n",
                 ),
                 sid = session_id,
                 hash = fresh_hash,

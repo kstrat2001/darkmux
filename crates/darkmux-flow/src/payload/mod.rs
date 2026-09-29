@@ -134,6 +134,10 @@ pub trait Attribution {
     fn step_slot(&mut self) -> Option<&mut Option<String>> {
         None
     }
+    /// The payload's `step_id`, read, when its type has one and it is set.
+    fn step(&self) -> Option<&str> {
+        None
+    }
     /// The payload's `context`, when its type has one.
     fn context_slot(&mut self) -> Option<&mut Option<serde_json::Map<String, Value>>> {
         None
@@ -196,6 +200,14 @@ macro_rules! flow_payloads {
                         }
                     } )*
                     Payload::Unread(_) => {}
+                }
+            }
+
+            /// The step this payload belongs to, when its type names one.
+            pub fn step_id(&self) -> Option<&str> {
+                match self {
+                    $( Payload::$variant(p) => Attribution::step(p), )*
+                    Payload::Unread(_) => None,
                 }
             }
 

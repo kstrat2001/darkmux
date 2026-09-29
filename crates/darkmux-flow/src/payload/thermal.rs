@@ -53,6 +53,9 @@ impl Attribution for ThermalStopUnresolvedPayload {
     fn step_slot(&mut self) -> Option<&mut Option<String>> {
         Some(&mut self.step_id)
     }
+    fn step(&self) -> Option<&str> {
+        self.step_id.as_deref()
+    }
     fn context_slot(&mut self) -> Option<&mut Option<serde_json::Map<String, serde_json::Value>>> {
         Some(&mut self.context)
     }
@@ -91,6 +94,9 @@ pub struct ThermalTier5EjectPayload {
 impl Attribution for ThermalTier5EjectPayload {
     fn step_slot(&mut self) -> Option<&mut Option<String>> {
         Some(&mut self.step_id)
+    }
+    fn step(&self) -> Option<&str> {
+        self.step_id.as_deref()
     }
     fn context_slot(&mut self) -> Option<&mut Option<serde_json::Map<String, serde_json::Value>>> {
         Some(&mut self.context)
@@ -137,6 +143,9 @@ impl Attribution for ThermalTier5EjectFailedPayload {
     fn step_slot(&mut self) -> Option<&mut Option<String>> {
         Some(&mut self.step_id)
     }
+    fn step(&self) -> Option<&str> {
+        self.step_id.as_deref()
+    }
     fn context_slot(&mut self) -> Option<&mut Option<serde_json::Map<String, serde_json::Value>>> {
         Some(&mut self.context)
     }
@@ -175,6 +184,9 @@ pub struct BatteryPauseUnsupportedPayload {
 impl Attribution for BatteryPauseUnsupportedPayload {
     fn step_slot(&mut self) -> Option<&mut Option<String>> {
         Some(&mut self.step_id)
+    }
+    fn step(&self) -> Option<&str> {
+        self.step_id.as_deref()
     }
     fn context_slot(&mut self) -> Option<&mut Option<serde_json::Map<String, serde_json::Value>>> {
         Some(&mut self.context)

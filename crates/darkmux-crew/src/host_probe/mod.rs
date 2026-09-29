@@ -228,7 +228,7 @@ pub fn build_machine_scoped_telemetry_record_with(
 ) -> darkmux_flow::FlowRecord {
     let mut payload = darkmux_flow::Payload::MachineTelemetry(darkmux_flow::payload::MachineTelemetryPayload {
         now: wire::host_sample_now(sample, sampled_at_ms),
-        interval_ms,
+        interval_ms: Some(interval_ms),
         liveness_probe_ms: None,
         prev_record_write_ms: None,
         simulated_host_source: None,

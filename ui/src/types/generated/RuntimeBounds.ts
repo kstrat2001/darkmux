@@ -6,8 +6,8 @@ import type { Knob } from "./Knob";
  * mission envelope, from one producer, so a reader watching the flow stream and one reading the
  * finished envelope cannot disagree about what governed the run.
  */
-export type RuntimeBounds = { max_tokens_per_call: Knob, reasoning_checkpoint_interval_tokens: Knob, inactivity_timeout_seconds: Knob, max_turns: Knob, max_tokens: Knob, turn_delay_ms: Knob, feedback_injection: Knob, 
+export type RuntimeBounds = { max_tokens_per_call: Knob, inactivity_timeout_seconds: Knob, max_turns: Knob, max_tokens: Knob, reasoning_checkpoint_interval_tokens?: Knob, turn_delay_ms?: Knob, feedback_injection?: Knob, 
 /**
  * The detection regime the run executed under.
  */
-detection_degeneracy_policy: Knob, thermal_pacing_enabled: Knob, battery_pause_enabled: Knob, battery_pause_floor_pct: Knob, };
+detection_degeneracy_policy?: Knob, thermal_pacing_enabled?: Knob, battery_pause_enabled?: Knob, battery_pause_floor_pct?: Knob, };
