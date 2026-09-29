@@ -828,7 +828,6 @@ export interface DispatchCompletePayload {
  * prompt_chars)") — both are typed since the source code branches on
  * `sp.prompt` truthy first. */
 export interface DispatchStartPayload {
-  runtime?: string;
   image?: string;
   workspace?: string;
   endpoint?: string;

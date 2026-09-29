@@ -999,7 +999,6 @@ describe("tokensOffMeter", () => {
         payload: {
           step_id: "map-step-1",
           kind: "dispatch.map",
-          runtime: "scheduler",
           result_class: "ok",
           items_in: 3,
           ok_count: 3,
@@ -1493,7 +1492,7 @@ describe("tokensOffMeter — run-count terms (#2709)", () => {
     const t = tokensOffMeter([
       rec({ ts: "2026-08-08T00:00:01Z", session_id: sid, action: "dispatch.start" }),
       rec({ ts: "2026-08-08T00:00:02Z", session_id: sid, action: "dispatch.complete", payload: { total_tokens: 500 } }),
-      rec({ ts: "2026-08-08T00:00:03Z", session_id: sid, action: "dispatch.complete", payload: { step_id: "map-1", kind: "dispatch.map", runtime: "scheduler", result_class: "ok", items_in: 3, ok_count: 3, failed_count: 0 } }),
+      rec({ ts: "2026-08-08T00:00:03Z", session_id: sid, action: "dispatch.complete", payload: { step_id: "map-1", kind: "dispatch.map", result_class: "ok", items_in: 3, ok_count: 3, failed_count: 0 } }),
     ]);
     expect(t.runs).toBe(1);
   });
@@ -1554,7 +1553,7 @@ describe("tokensOffMeter — run-count terms (#2709)", () => {
       rec({ ts: "2026-08-08T00:00:01Z", session_id: sid, action: "dispatch.complete", handle: "judge-hosted", payload: { endpoint: AZURE, total_tokens: 5000 } }),
       // A local `dispatch.map` step's own summary bookend under the same key —
       // the real producer shape, carrying no endpoint and no token field.
-      rec({ ts: "2026-08-08T00:00:02Z", session_id: sid, action: "dispatch.complete", handle: "map-local", payload: { step_id: "map-1", kind: "dispatch.map", runtime: "scheduler", result_class: "ok", items_in: 3, ok_count: 3, failed_count: 0 } }),
+      rec({ ts: "2026-08-08T00:00:02Z", session_id: sid, action: "dispatch.complete", handle: "map-local", payload: { step_id: "map-1", kind: "dispatch.map", result_class: "ok", items_in: 3, ok_count: 3, failed_count: 0 } }),
     ];
     const t = tokensOffMeter(data);
     expect(t.runs).toBe(2);

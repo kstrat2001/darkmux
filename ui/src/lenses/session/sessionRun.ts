@@ -708,12 +708,6 @@ function wallClock(ctx: RunContext, nowMs: number): { runWallMs: number; wallEla
   };
 }
 
-const RUNTIME_LABEL: Record<string, string> = {
-  internal: "internal container",
-  direct: "direct client (hosted · no container)",
-  openclaw: "openclaw shell-out",
-};
-
 /** (#2834) The route line: the dialect and address the dispatch record
  *  names, read as facts. `openai:` names the request FORMAT, not a vendor,
  *  so a local server speaking it is labelled by its address, never as
@@ -730,7 +724,6 @@ function routeLabel(ep: string | undefined): string {
 function briefRowsOf(sp: DispatchStartPayload, model: string | null, d: NormRecord | null, route: string, timing: string): BriefEntry[] {
   const rows: BriefEntry[] = [];
   pushKv(rows, "route", route);
-  pushKv(rows, "runtime", sp.runtime ? (RUNTIME_LABEL[sp.runtime] ?? sp.runtime) : "");
   pushKv(rows, "image", sp.image);
   pushKv(rows, "model", model);
   pushKv(rows, "workspace", sp.workspace);

@@ -2429,7 +2429,6 @@ impl<'a> DispatchBookendGuard<'a> {
             // flow-sink write problem must not mask the original error
             // propagating out.
             let mut payload = serde_json::json!({
-                "runtime": "internal",
                 "result_class": "error",
                 "error": "dispatch terminated before completion (early return or panic)",
             });
@@ -3335,7 +3334,7 @@ fn build_remote_record(
     )
 }
 
-/// (#1444 review) The five token keys EVERY `runtime: "direct"` dispatch
+/// (#1444 review) The five token keys EVERY hosted single-shot dispatch
 /// completion record carries, written into the payload from ONE place so
 /// the two producers — [`dispatch_remote`] and `dispatch_local_single_shot`
 /// — cannot drift apart on the key SET again.
@@ -3370,7 +3369,7 @@ pub(crate) fn insert_direct_token_keys(
 }
 
 /// The keys [`insert_direct_token_keys`] writes, in order — the parity
-/// contract both `runtime: "direct"` producers are held to. Load-bearing,
+/// contract both hosted single-shot producers are held to. Load-bearing,
 /// not documentation: the writer above iterates this array, so the contract
 /// and the emission cannot disagree.
 pub(crate) const DIRECT_TOKEN_KEYS: [&str; 5] = [
@@ -3465,7 +3464,6 @@ fn dispatch_remote(
             Some(&model_for_abort),
             phase_for_abort.as_deref(),
             Some(serde_json::json!({
-                "runtime": "direct",
                 "endpoint": label_for_abort,
                 "result_class": "error",
                 "error": "dispatch terminated before completion (early return or panic)",
@@ -3487,7 +3485,6 @@ fn dispatch_remote(
             phase,
             darkmux_flow::FlowAction::DispatchStart,
             serde_json::json!({
-                "runtime": "direct",
                 "endpoint": label,
                 "prompt": crate::dispatch::capped_prompt(&opts.message),
                 "prompt_chars": opts.message.chars().count(),
@@ -3532,7 +3529,7 @@ fn dispatch_remote(
                     &pm.id,
                     phase,
                     darkmux_flow::FlowAction::DispatchError,
-                    serde_json::json!({ "runtime": "direct", "endpoint": label, "wall_ms": wall_ms, "error": e.to_string() }),
+                    serde_json::json!({ "endpoint": label, "wall_ms": wall_ms, "error": e.to_string() }),
                 ),
             );
             return Err(e);
@@ -3579,7 +3576,6 @@ fn dispatch_remote(
     let mut complete_payload = serde_json::json!({
         "result_class": "ok",
         "exit_code": 0,
-        "runtime": "direct",
         "endpoint": label,
         "total_turns": 1,
         "total_tools": 0,
@@ -3611,7 +3607,7 @@ fn dispatch_remote(
 
     let stdout = if opts.json {
         let mut metrics = serde_json::json!({
-            "model": pm.id, "endpoint": label, "runtime": "direct",
+            "model": pm.id, "endpoint": label,
             "wall_ms": wall_ms, "turns": 1,
         });
         insert_direct_token_keys(metrics.as_object_mut().expect("json! built an object"), &counts);
@@ -3833,7 +3829,6 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
             Some(&model_for_abort),
             phase_for_abort.as_deref(),
             Some(serde_json::json!({
-                "runtime": "direct",
                 "result_class": "error",
                 "error": "dispatch terminated before completion (early return or panic)",
             })),
@@ -3852,7 +3847,6 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
             phase,
             darkmux_flow::FlowAction::DispatchStart,
             serde_json::json!({
-                "runtime": "direct",
                 "prompt": crate::dispatch::capped_prompt(&opts.message),
                 "prompt_chars": opts.message.chars().count(),
                 // (#2295) Same field, same reason — see the hosted path above.
@@ -3915,7 +3909,7 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
                     &model_id,
                     phase,
                     darkmux_flow::FlowAction::DispatchError,
-                    serde_json::json!({ "runtime": "direct", "wall_ms": wall_ms, "error": e.to_string() }),
+                    serde_json::json!({ "wall_ms": wall_ms, "error": e.to_string() }),
                 ),
             );
             return Err(e);
@@ -3944,7 +3938,6 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
     let mut complete_payload = serde_json::json!({
         "result_class": "ok",
         "exit_code": 0,
-        "runtime": "direct",
         "total_turns": 1,
         "total_tools": 0,
         "total_compactions": 0,
@@ -6578,7 +6571,6 @@ fn dispatch_start_payload_json(
     brief_refs: &[crate::brief_refs::BriefRef],
 ) -> Result<serde_json::Value, darkmux_types::config_enum::BadEnumValue> {
     Ok(serde_json::json!({
-        "runtime": "internal",
         // (#1126) The resolved runtime image (operator `--image` or the default
         // darkmux image) — the environment the coder ran in. The viewer's run
         // brief + recent-runs rail read `payload.image`; it was a dead
@@ -7602,7 +7594,6 @@ fn build_dispatch_complete_payload(
     // records carry, one per call.
     let fold = &summary.fold;
     let mut payload = serde_json::json!({
-        "runtime": "internal",
         "wall_ms": wall_ms,
         // (#2094) Surfaced NEXT TO wall_ms: a rested run's wall clock must
         // never be misread as a slow model.
@@ -10289,7 +10280,6 @@ impl<'a> Chunk<'a> {
 /// "writing", so absence is the other reading.
 fn heartbeat_payload(c: &Chunk<'_>) -> serde_json::Value {
     let mut payload = serde_json::json!({
-        "runtime": "internal",
         "turn_seq": c.seq,
         "partial_index": c.partial_index,
         "cumulative_chars": c.cumulative_chars,
@@ -10312,7 +10302,6 @@ fn heartbeat_payload(c: &Chunk<'_>) -> serde_json::Value {
 /// sum.
 fn opening_heartbeat_payload(s: &darkmux_trajectory::StreamingStart) -> serde_json::Value {
     serde_json::json!({
-        "runtime": "internal",
         "turn_seq": s.seq,
         "cumulative_chars": 0,
         "sampled_at_ms": s.ts,

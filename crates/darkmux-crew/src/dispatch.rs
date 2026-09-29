@@ -1841,7 +1841,7 @@ mod tests {
             &step, &darkmux_types::execution_id::ExecutionId::mint(),
             None,
             None,
-            Some(serde_json::json!({ "runtime": "internal" })),
+            Some(serde_json::json!({ "role": "coder" })),
         );
         assert_eq!(rec.payload.unwrap()["step_id"], "s1");
         let usage = build_telemetry_record(

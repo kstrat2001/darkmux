@@ -760,7 +760,6 @@ fn hosted_single_shot_step_payload(
     serde_json::json!({
         "step_id": step_id,
         "kind": "dispatch.single_shot",
-        "runtime": "direct",
         // (#2902 step 5, CLAUDE.md contract 8: the wire keeps its historical
         // spelling) The per-step cap, under the key v3.13.0 shipped.
         "remote_max_tokens_per_execution": budget,
@@ -800,7 +799,6 @@ impl ExecutionBookends<'_> {
         let mut payload = serde_json::json!({
             "step_id": self.step.id,
             "kind": self.kind,
-            "runtime": "scheduler",
         });
         if let (Some(obj), Some(ex)) = (payload.as_object_mut(), extra.as_object()) {
             for (k, v) in ex {
@@ -5130,7 +5128,7 @@ mod tests {
         assert_eq!(payload["total_tokens"], 1261);
         assert_eq!(payload["step_id"], "s1");
         assert_eq!(payload["kind"], "dispatch.single_shot");
-        assert_eq!(payload["runtime"], "direct");
+        assert!(payload.get("runtime").is_none(), "no topology key: {payload}");
         assert_eq!(payload["max_tokens_sent"], 4096);
     }
 

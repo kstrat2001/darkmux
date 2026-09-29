@@ -140,7 +140,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
         action: "dispatch.start",
         handle: "darkmux/coder",
         model: "darkmux:qwen3-coder",
-        payload: { runtime: "internal", image: "darkmux-runtime:latest", workspace: "/tmp/wt", prompt_chars: 500 },
+        payload: { image: "darkmux-runtime:latest", workspace: "/tmp/wt", prompt_chars: 500 },
       },
       {
         ts: "2026-01-01T00:05:00Z",
@@ -168,8 +168,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     expect(view.header.role).toBe("CODER");
     expect(view.briefLines.map((e) => e.text)).toContain("route");
     expect(view.briefLines.map((e) => e.text)).toContain("LMStudio · local · this machine");
-    expect(view.briefLines.map((e) => e.text)).toContain("runtime");
-    expect(view.briefLines.map((e) => e.text)).toContain("internal container");
+    expect(view.briefLines.map((e) => e.text)).not.toContain("runtime");
     expect(view.briefLines.map((e) => e.text)).toContain("image");
     expect(view.briefLines.map((e) => e.text)).toContain("darkmux-runtime:latest");
     expect(view.briefLines.map((e) => e.text)).toContain("model");
@@ -1556,7 +1555,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
         action: "dispatch.start",
         handle: "darkmux/coder",
         model: "darkmux:qwen3-coder",
-        payload: { runtime: "internal", image: "darkmux-runtime:latest", workspace: "/tmp/wt", prompt_chars: 500 },
+        payload: { image: "darkmux-runtime:latest", workspace: "/tmp/wt", prompt_chars: 500 },
       },
       { ts: "2026-01-01T00:01:00Z", session_id: "s1", category: "telemetry", source: "context", fields: { max: 262144, used: 19000 } },
       { ts: "2026-01-01T00:05:00Z", session_id: "s1", action: "dispatch.turn", payload: { turn_seq: 3 } },

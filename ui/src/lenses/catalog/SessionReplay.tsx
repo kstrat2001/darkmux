@@ -440,7 +440,6 @@ function SessionPendingHeader({ sessionId }: { sessionId: string }) {
       </h2>
       <div className="track brief-grid">
         <PendingBriefPair label="route" />
-        <PendingBriefPair label="runtime" />
         <PendingBriefPair label="model" />
         <PendingBriefPair label="workspace" />
         <PendingBriefPair label="timing" />

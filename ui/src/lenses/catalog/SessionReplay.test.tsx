@@ -178,7 +178,6 @@ describe("SessionReplay", () => {
         model: "qwen3.6-35b-a3b-turboquant-mlx",
         payload: {
           role: "crawler",
-          runtime: "internal",
           image: "darkmux-runtime:latest",
           workspace: "/home/demo/.darkmux/runs/crawl-discarded-locks/sandbox",
         },
@@ -196,7 +195,6 @@ describe("SessionReplay", () => {
     // assertion below vacuously.
     expect(labels.map((l) => l.textContent)).toEqual([
       "route",
-      "runtime",
       "image",
       "model",
       "workspace",
@@ -269,7 +267,7 @@ describe("SessionReplay", () => {
         action: "dispatch.start",
         session_id: "s-disc",
         machine_id: "MacBook-Pro",
-        payload: { role: "coder", runtime: "internal" },
+        payload: { role: "coder" },
       },
       {
         ts: "2026-08-26T07:37:00Z",
@@ -1149,7 +1147,7 @@ describe("SessionReplay — dispatch-focus playhead never precedes the run's own
 // (#2862) The session page drew a bare "loading…" line while `/flow-session`
 // was in flight, even though the session id is already known from the URL.
 // The fix draws the real header (with the known id), the info card's labels
-// (route, runtime, model, workspace, timing), and the MODEL/SYSTEM tile
+// (route, model, workspace, timing), and the MODEL/SYSTEM tile
 // grids with their labels — only the not-yet-known VALUES shimmer.
 describe("SessionReplay — the pending state draws the page, not a bare line (#2862)", () => {
   it("shows the known session id, the info-card labels, and the MODEL/SYSTEM tile labels while the fetch is in flight", async () => {
@@ -1171,7 +1169,7 @@ describe("SessionReplay — the pending state draws the page, not a bare line (#
     expect(pending.textContent).not.toMatch(/loading…/);
 
     // The info card's labels are real text, not placeholders.
-    for (const label of ["route", "runtime", "model", "workspace", "timing"]) {
+    for (const label of ["route", "model", "workspace", "timing"]) {
       expect(pending.querySelector(`.brief-label`)?.parentElement, "brief grid should exist").toBeTruthy();
       const labels = Array.from(pending.querySelectorAll(".brief-label")).map((el) => el.textContent);
       expect(labels, `expected the "${label}" label to be drawn immediately`).toContain(label);

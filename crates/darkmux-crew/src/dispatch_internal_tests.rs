@@ -939,7 +939,7 @@
         );
         // The rest of the payload survives the extraction unchanged —
         // pinning the refactor didn't silently drop or rename a field.
-        assert_eq!(payload["runtime"], serde_json::json!("internal"));
+        assert!(payload.get("runtime").is_none(), "no topology key: {payload}");
         assert_eq!(payload["image"], serde_json::json!("darkmux-runtime:latest"));
         assert_eq!(payload["prompt_chars"], serde_json::json!("read x.txt".chars().count()));
         assert_eq!(payload["workspace"], serde_json::json!("/tmp/ws"));
@@ -10182,7 +10182,7 @@
 
     // ─── "direct"-runtime token key parity (#1444 review) ─────────────
 
-    /// (#1444 review) Both `runtime: "direct"` producers — `dispatch_remote`
+    /// (#1444 review) Both hosted single-shot producers — `dispatch_remote`
     /// and `dispatch_local_single_shot` — write their token block through
     /// `insert_direct_token_keys`, so their key SET cannot drift apart the
     /// way it did when #1444's first pass added `reasoning_tokens`/
@@ -10194,7 +10194,7 @@
     /// rewrote the constant.
     #[test]
     fn insert_direct_token_keys_always_writes_all_five_keys() {
-        let mut payload = serde_json::json!({ "runtime": "direct" });
+        let mut payload = serde_json::json!({});
         let obj = payload.as_object_mut().unwrap();
         insert_direct_token_keys(obj, &darkmux_trajectory::UsageCounts::default());
         for key in [
@@ -10207,7 +10207,7 @@
             assert!(obj.contains_key(key), "{key} must be PRESENT-and-null when unreported, never absent");
             assert!(obj[key].is_null(), "{key} must be null, never a fabricated 0");
         }
-        assert_eq!(obj.len(), 6, "the five token keys plus the pre-existing `runtime`");
+        assert_eq!(obj.len(), 5, "exactly the five token keys");
     }
 
     /// A direct completion record quotes the call's counts exactly as its
