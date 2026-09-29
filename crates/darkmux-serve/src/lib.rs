@@ -630,7 +630,7 @@ async fn auth_mw(req: Request, next: Next) -> Response {
     // string that doesn't parse is treated as non-loopback, so a typo can't
     // sneak past the gate. Absence is not evidence of safety.
     let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|ci| ci.0);
-    if is_local_request(peer, req.headers()) || request_token_ok(req.headers()) {
+    if caller_is_local_or_holds_token(peer, req.headers()) {
         next.run(req).await
     } else {
         unauthorized()
@@ -663,6 +663,12 @@ const PROXY_HEADERS: &[&str] = &[
     "tailscale-funnel-request",
     "tailscale-app-capabilities",
 ];
+
+/// Whether the caller is this machine ([`is_local_request`]) or presents the
+/// serve token: the audience of what only the operator's side may read.
+pub(crate) fn caller_is_local_or_holds_token(peer: Option<SocketAddr>, headers: &axum::http::HeaderMap) -> bool {
+    is_local_request(peer, headers) || request_token_ok(headers)
+}
 
 /// The address this daemon bound, recorded by `run` so the one predicate
 /// [`is_local_request`] can tell a Host naming this daemon from a stranger's.
