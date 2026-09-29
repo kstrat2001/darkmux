@@ -1328,7 +1328,7 @@ mod tests {
     fn mission_close_from_active_sets_finalized_and_finalized_ts() {
         let _g = CrewGuard::new();
         seed_mission("m4", MissionStatus::Active);
-        let updated = mission_close("m4").unwrap();
+        let updated = mission_close_with_reasoning("m4", None).unwrap();
         assert_eq!(updated.status, MissionStatus::Finalized);
         assert!(updated.finalized_ts.is_some());
     }
@@ -1338,7 +1338,7 @@ mod tests {
     fn mission_close_terminal_state_errors() {
         let _g = CrewGuard::new();
         seed_mission("m5", MissionStatus::Finalized);
-        let err = mission_close("m5").unwrap_err();
+        let err = mission_close_with_reasoning("m5", None).unwrap_err();
         assert!(err.to_string().contains("already Finalized"));
     }
 
