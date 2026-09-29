@@ -15,7 +15,7 @@ darkmux-flow = { path = "../darkmux-flow" }
 darkmux-crew = { path = "../darkmux-crew" }
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json.workspace = true
 # (#2916) The profile registry, for resolving a submitted job's profile
 # against this machine's own registry before the scope check.
 darkmux-profiles = { path = "../darkmux-profiles" }
