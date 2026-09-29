@@ -5203,6 +5203,26 @@
         assert!(!execution_for(Some(no_origin.path())).is_legacy());
     }
 
+    /// The recorded id is read from a file the model can write, so only the
+    /// minted grammar is believed: a planted `legacy:` id, one with control
+    /// characters and one with a slash each get a fresh execution.
+    #[test]
+    fn a_planted_execution_id_in_the_resume_origin_is_not_believed() {
+        for planted in ["legacy:sess-1:m1", "exec-1-2-3\u{1b}[31m", "exec-1/../../x", "exec-zz-1-2", "someone-elses"] {
+            let dir = TempDir::new().unwrap();
+            let origin = serde_json::json!({"workspace": "/w", "workspace_read_only": false, "execution_id": planted});
+            std::fs::write(dir.path().join(RESUME_ORIGIN_FILENAME), origin.to_string()).unwrap();
+            let got = execution_for(Some(dir.path()));
+            assert_ne!(got.as_str(), planted, "planted id {planted:?} must not be kept");
+            assert!(ExecutionId::parse_minted(got.as_str()).is_ok(), "a fresh minted id replaces {planted:?}");
+        }
+        let dir = TempDir::new().unwrap();
+        let ws = TempDir::new().unwrap();
+        let minted = ExecutionId::mint();
+        write_resume_origin_meta(dir.path(), ws.path(), false, None, &minted);
+        assert_eq!(execution_for(Some(dir.path())), minted, "a valid minted id is kept");
+    }
+
     /// The F2 regression, end to end: generate tier 4's hint from a real
     /// `resume_origin.json`, parse the flags back out, and feed them
     /// through the ACTUAL `validate_resume_checkpoint`. Before the fix the

@@ -1014,9 +1014,18 @@ pub(crate) fn execution_for(resume_from: Option<&Path>) -> ExecutionId {
 }
 
 /// The execution `out_dir`'s resume-origin file names, when it names one.
+/// The file's content is model-controlled, so only a minted-grammar id is
+/// believed; anything else is refused with a note and the caller mints anew.
 fn recorded_execution(out_dir: &Path) -> Option<ExecutionId> {
     let origin: serde_json::Value = serde_json::from_str(&read_out_dir_text(out_dir, RESUME_ORIGIN_FILENAME)?).ok()?;
-    ExecutionId::parse(origin.get("execution_id")?.as_str()?).ok()
+    let named = origin.get("execution_id")?.as_str()?;
+    match ExecutionId::parse_minted(named) {
+        Ok(id) => Some(id),
+        Err(_) => {
+            eprintln!("darkmux dispatch: ⚠ the resume origin names an execution id that is not a minted one; starting a new execution");
+            None
+        }
+    }
 }
 
 /// (#2774 review F2) Shell-quote one argument for a hint an operator is

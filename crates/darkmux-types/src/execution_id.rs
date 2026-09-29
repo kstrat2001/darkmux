@@ -63,6 +63,23 @@ impl ExecutionId {
         Ok(ExecutionId(wire.to_string()))
     }
 
+    /// Read back an identity [`ExecutionId::mint`] could have produced:
+    /// `exec-<hex>-<hex>-<hex>` and nothing else. For a wire string an
+    /// untrusted writer may have planted (a model-writable file), where
+    /// [`ExecutionId::parse`]'s "any non-empty string" would let it claim a
+    /// `legacy:` identity, carry control characters or name another execution.
+    pub fn parse_minted(wire: &str) -> Result<Self, IdError> {
+        let is_hex = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        let minted = wire
+            .strip_prefix("exec-")
+            .map(|rest| rest.split('-').collect::<Vec<_>>())
+            .is_some_and(|parts| parts.len() == 3 && parts.iter().all(|p| is_hex(p)));
+        if !minted {
+            return Err(IdError("not a minted execution id (exec-<hex>-<hex>-<hex>)".to_string()));
+        }
+        Ok(ExecutionId(wire.to_string()))
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -120,6 +137,15 @@ mod tests {
         assert!(s1 != s2 && s1 != s3, "a sessionless record names itself: its time, handle and machine");
         assert_eq!(s1.as_str(), "legacy:::2026-08-20T01:00:00Z:coder:u1");
         assert!(a.is_legacy() && s1.is_legacy());
+    }
+
+    #[test]
+    fn parse_minted_accepts_only_the_minted_grammar() {
+        let id = ExecutionId::mint();
+        assert_eq!(ExecutionId::parse_minted(id.as_str()).unwrap(), id);
+        for bad in ["", "legacy:s:m", "exec-", "exec-1-2", "exec-1-2-3-4", "exec-1-2-", "exec-G-2-3", "exec-1-2-3\n", "exec-1/2-3-4", "EXEC-1-2-3", "exec-1-2-\u{1b}"] {
+            assert!(ExecutionId::parse_minted(bad).is_err(), "{bad:?} is not a minted id");
+        }
     }
 
     #[test]
