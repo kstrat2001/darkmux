@@ -1246,7 +1246,7 @@ mod tests {
     use super::*;
     use darkmux_flow::payload::{
         DetectorKind, DetectorSeverity, DispatchEndPayload, DispatchStartPayload, TelemetryDetectorPayload,
-        TelemetryRuntimePayload, TelemetryContextPayload,
+        TelemetryRuntimePayload,
     };
 
     /// A cycle finding carrying `detail`, with nothing else set.

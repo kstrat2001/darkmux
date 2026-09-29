@@ -102,3 +102,43 @@ fn hook_failed_reads_a_notice_and_a_delivery_as_their_own_forms() {
     let delivery = read(r#"{"rule_index":0,"target_host":"h","delivered_action":null,"attempt":2,"delivery_id":"d","error":"boom"}"#);
     assert!(matches!(delivery, Some(Payload::HookFailed(HookFailedPayload::Delivery(_)))), "{delivery:?}");
 }
+
+/// A producer never builds a payload from JSON: `Payload::settle` is the
+/// reader's step (an archived line into its action's type), and a production
+/// call anywhere else would be the untyped write path this type exists to end.
+#[test]
+fn only_the_reader_settles_a_payload_from_json() {
+    fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for e in entries.flatten() {
+            let p = e.path();
+            let name = e.file_name().to_string_lossy().to_string();
+            if p.is_dir() {
+                if !matches!(name.as_str(), "target" | "node_modules" | ".git" | "tests") {
+                    rust_files(&p, out);
+                }
+            } else if name.ends_with(".rs") && !name.ends_with("_tests.rs") {
+                out.push(p);
+            }
+        }
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+    let mut files = Vec::new();
+    rust_files(&root.join("crates"), &mut files);
+    rust_files(&root.join("src"), &mut files);
+    assert!(files.len() > 100, "the walk found the workspace sources");
+    let allowed = ["crates/darkmux-flow/src/reader.rs", "crates/darkmux-flow/src/schema.rs", "crates/darkmux-flow/src/payload/mod.rs"];
+    let mut offenders = Vec::new();
+    for f in files {
+        let rel = f.strip_prefix(root).unwrap().to_string_lossy().to_string();
+        if allowed.contains(&rel.as_str()) {
+            continue;
+        }
+        let text = std::fs::read_to_string(&f).unwrap();
+        let production = text.split("\n#[cfg(test)]").next().unwrap();
+        if production.contains("Payload::settle(") {
+            offenders.push(rel);
+        }
+    }
+    assert!(offenders.is_empty(), "production code settling a payload from JSON: {offenders:?}");
+}

@@ -2431,15 +2431,6 @@ impl FlowRecord {
         self.payload.as_ref().map(|p| serde_json::to_value(p).unwrap_or_default()).unwrap_or_default()
     }
 
-    /// TRANSITIONAL: this record with `value` read as its action's payload
-    /// type. Every action typed since removes its callers; a payload that is
-    /// not the action's type becomes [`Payload::Unread`], which no sink
-    /// writes.
-    pub fn with_json_payload(mut self, value: serde_json::Value) -> Self {
-        self.payload = Some(crate::payload::Payload::settle(&self.action, value));
-        self
-    }
-
     /// This record with its payload read as its action's type. The one step
     /// between a deserialized record and a typed one; a record built by
     /// [`FlowRecord::for_session_with`] is already typed and comes back

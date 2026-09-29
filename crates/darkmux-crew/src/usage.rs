@@ -494,6 +494,41 @@ mod tests {
         assert!(usage_payload(&facts(None), &counts).endpoint_id.is_none());
         assert_eq!(usage_payload(&facts(Some("azure")), &darkmux_trajectory::UsageCounts::default()).endpoint_id.as_deref(), Some("azure"), "an absent-usage record still names its endpoint");
     }
+    /// The sums read a usage record as raw JSON, in the one value domain the
+    /// viewer shares (`num`: floor, clamp, hostile values read 0), because a
+    /// typed `u64` cannot express that domain. This pins the two halves
+    /// together: what the typed writer serializes is what the reader sums.
+    #[test]
+    fn the_value_domain_reader_reads_what_the_typed_writer_writes() {
+        let facts = CallFacts {
+            call_kind: CallKind::SingleShot,
+            role_id: None,
+            requested_model: "m",
+            reported_model: None,
+            endpoint: "h/m",
+            endpoint_id: Some("azure"),
+        };
+        let counts = darkmux_trajectory::UsageCounts { total: Some(42), prompt: Some(30), completion: Some(12), cached: Some(7), ..Default::default() };
+        let record = serde_json::json!({
+            "category": "telemetry",
+            "action": "telemetry.tokens",
+            "payload": serde_json::to_value(usage_payload(&facts, &counts)).unwrap(),
+        });
+        let amount = usage_contribution(&record).expect("a telemetry.tokens record is a usage record");
+        assert_eq!((amount.total, amount.prompt, amount.completion, amount.cached), (42, 30, 12, Some(7)));
+        assert!(amount.reported);
+        assert_eq!(amount.purpose, call_purpose(CallKind::SingleShot, None));
+
+        let unreported = serde_json::json!({
+            "category": "telemetry",
+            "action": "telemetry.tokens",
+            "payload": serde_json::to_value(usage_payload(&facts, &darkmux_trajectory::UsageCounts::default())).unwrap(),
+        });
+        let amount = usage_contribution(&unreported).expect("still a usage record");
+        assert!(!amount.reported, "a call that reported nothing sums as unreported, not as zero spend");
+        assert_eq!((amount.total, amount.cached), (0, None));
+    }
+
     use super::*;
 
     fn facts(reported: Option<&'static str>) -> CallFacts<'static> {

@@ -1362,6 +1362,9 @@ pub fn widest_window_secs(reg: &darkmux_types::ProfileRegistry) -> Option<u64> {
         .max()
 }
 
+/// (scope, subject, session, pid): one process's wait on one subject.
+type WaitKey = (String, String, String, u64);
+
 /// Every budget wait still open at `now`, from the day files covering the
 /// last `lookback_secs` (review C2: a long window's wait was announced up to
 /// a whole window ago): the newest `budget.wait` per (scope, subject,
@@ -1369,7 +1372,7 @@ pub fn widest_window_secs(reg: &darkmux_types::ProfileRegistry) -> Option<u64> {
 /// whose run was not stopped, and whose resume time has not passed. For
 /// `darkmux mission status`.
 pub fn active_waits(dir: &Path, now: i64, lookback_secs: u64, alive: &dyn Fn(u32) -> bool) -> Vec<ActiveWait> {
-    let mut latest: BTreeMap<(String, String, String, u64), (bool, serde_json::Value, BudgetPayload)> = BTreeMap::new();
+    let mut latest: BTreeMap<WaitKey, (bool, serde_json::Value, BudgetPayload)> = BTreeMap::new();
     let mut day = (now - lookback_secs as i64).div_euclid(86_400) * 86_400;
     let last = darkmux_flow::day_utc_at(now);
     while darkmux_flow::day_utc_at(day) <= last {

@@ -1873,7 +1873,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
         // dispatch indistinguishable from a healthy hosted one.
         let claim = resolve_local_seat("no-such-role-xyz", None, Some(path_str), "seat");
         let SeatClaim::LocalModelUnresolved { reason } = claim else {
-            panic!("an unresolvable role must claim LocalModelUnresolved, got {}", format!("{:?}", claim.class()));
+            panic!("an unresolvable role must claim LocalModelUnresolved, got {:?}", claim.class());
         };
         assert!(reason.contains("no-such-role-xyz"), "the reason names the role: {reason}");
     }

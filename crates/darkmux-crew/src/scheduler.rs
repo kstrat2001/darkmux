@@ -5873,7 +5873,11 @@ mod tests {
         ) -> Result<StepOutcome> {
             for i in 0..self.n {
                 let mut rec = step_lifecycle_record(&darkmux_types::session_id::RunId::mission("m-test").unwrap(), step, darkmux_flow::FlowAction::StepResult);
-                rec = rec.with_json_payload(json!({ "i": i }));
+                // `max_tokens_sent` is the emission index: any numeric field will do.
+                rec.payload = Some(darkmux_flow::Payload::StepResult(darkmux_flow::payload::StepResultPayload {
+                    max_tokens_sent: Some(i as u64),
+                    ..darkmux_flow::payload::StepResultPayload::new(&step.id, "test.streaming")
+                }));
                 ctx.emit(rec);
             }
             Ok(StepOutcome { output: "done".to_string(), flow_records: vec![] })
@@ -5908,7 +5912,7 @@ mod tests {
         let item_indices: Vec<u64> = emitted
             .iter()
             .filter(|r| r.action == darkmux_flow::FlowAction::StepResult)
-            .map(|r| r.payload_json()["i"].as_u64().unwrap())
+            .map(|r| r.payload_json()["max_tokens_sent"].as_u64().unwrap())
             .collect();
         assert_eq!(item_indices, vec![0, 1, 2, 3, 4], "records visible in emission order");
     }

@@ -152,6 +152,10 @@ macro_rules! flow_payloads {
         /// See the module doc.
         #[derive(Debug, Clone, PartialEq, Serialize)]
         #[serde(untagged)]
+        // A record is built, written and dropped; boxing the big variants would
+        // add an allocation per record and a `Box::new` at every producer to
+        // shrink a value that is never stored in bulk.
+        #[allow(clippy::large_enum_variant)]
         #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
         #[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
         pub enum Payload {

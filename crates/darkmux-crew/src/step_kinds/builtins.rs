@@ -774,8 +774,7 @@ fn hosted_single_shot_step_payload(
 /// The savings hero reads `payload.endpoint` off these bookends and off
 /// nothing else, so hosted spend is attributed to the endpoint the call went
 /// to. `endpoint_label` is `None` for a local call, which leaves the payload
-/// byte-identical to a purely-local dispatch's, the same no-op-when-None
-/// discipline `stamp_remote_classification` keeps.
+/// byte-identical to a purely-local dispatch's: the key is simply absent.
 struct ExecutionBookends<'a> {
     /// The step kind's id, stamped as the payload's `kind`.
     kind: &'static str,
