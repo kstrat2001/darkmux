@@ -83,7 +83,7 @@
                 maybe_build_machine_telemetry_record(last_emit_at_ms, at_ms, at_ms + 1_000_000, 5000, &sample)
             {
                 last_emit_at_ms = Some(new_last);
-                emitted.push((at_ms, rec.payload.expect("machine.telemetry always carries a payload")));
+                emitted.push((at_ms, rec.payload_json()));
             }
         }
         // Due at at_ms=0 (first, always), then next due once
@@ -15667,7 +15667,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         assert!(rec.phase_id.is_none(), "machine-scoped: no phase context");
         assert!(rec.session_id.is_none(), "machine-scoped: no session_id");
         assert!(rec.model.is_none(), "machine-scoped: no model");
-        let payload = rec.payload.expect("payload present");
+        let payload = rec.payload_json();
         assert_eq!(payload["cpu_pct"], 42);
         assert_eq!(payload["mem_pct"], 55);
         assert_eq!(payload["gpu_pct"], 12);
@@ -15726,7 +15726,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             span_ms: 90_000,
         };
         let rec = build_machine_scoped_telemetry_record_with(&sample, 12_345, 5000, &scripted);
-        let payload = rec.payload.expect("payload present");
+        let payload = rec.payload_json();
         assert_eq!(
             payload["thermal"]["state"], "critical",
             "the fiction rides the record — which is precisely why it must be marked"
@@ -15740,7 +15740,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         // never `null`. The flow-record surface's whole contract is that
         // presence alone answers "were these readings real".
         let real = build_machine_scoped_telemetry_record_with(&sample, 12_345, 5000, &Provenance::Real);
-        let real_payload = real.payload.expect("payload present");
+        let real_payload = real.payload_json();
         assert!(
             real_payload.get("simulated_host_source").is_none(),
             "real readings must be stamped with nothing at all, not with a null: {real_payload}"
@@ -15759,7 +15759,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             },
         );
         assert!(
-            unavailable.payload.expect("payload present").get("simulated_host_source").is_none(),
+            unavailable.payload_json().get("simulated_host_source").is_none(),
             "nothing is simulated when the scenario failed to load, so nothing may be stamped"
         );
     }

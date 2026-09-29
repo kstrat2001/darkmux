@@ -297,17 +297,15 @@ pub(crate) fn run_record(
     run: &RunId,
     payload: serde_json::Value,
 ) -> flow::FlowRecord {
-    flow::FlowRecord {
-        payload: Some(payload),
-        ..flow::FlowRecord::for_session(
-            &SessionId::run(run.clone()),
-            level,
-            flow::Category::Work,
-            flow::Stage::Dispatch,
-            action,
-            config_id,
-        )
-    }
+    flow::FlowRecord::for_session(
+        &SessionId::run(run.clone()),
+        level,
+        flow::Category::Work,
+        flow::Stage::Dispatch,
+        action,
+        config_id,
+    )
+    .with_json_payload(payload)
 }
 
 /// (#1877, contract 8) The run's liveness bookend at `edge`: `run.start` as
@@ -8751,8 +8749,8 @@ mod tests {
         assert!(reached_gate);
         assert_eq!(rec.action, darkmux_flow::FlowAction::RunComplete);
         assert!(matches!(rec.level, flow::Level::Info), "{:?}", rec.level);
-        assert_eq!(rec.payload.as_ref().unwrap()["result_class"], serde_json::json!("ok"));
-        assert_eq!(rec.payload.as_ref().unwrap()["gate"], serde_json::json!("coder-phase"));
+        assert_eq!(rec.payload_json()["result_class"], serde_json::json!("ok"));
+        assert_eq!(rec.payload_json()["gate"], serde_json::json!("coder-phase"));
     }
 
     #[test]
@@ -8781,7 +8779,7 @@ mod tests {
         assert!(!reached_gate);
         assert_eq!(rec.action, darkmux_flow::FlowAction::RunError);
         assert!(matches!(rec.level, flow::Level::Error), "{:?}", rec.level);
-        assert_eq!(rec.payload.as_ref().unwrap()["result_class"], serde_json::json!("error"));
+        assert_eq!(rec.payload_json()["result_class"], serde_json::json!("error"));
     }
 
     #[test]
@@ -8805,7 +8803,7 @@ mod tests {
     #[test]
     fn coder_branch_terminal_bookend_payload_never_carries_an_error_key() {
         let (_, rec) = coder_branch_terminal_bookend(&Err(anyhow!("boom")), "coder-phase", &RunId::mission("m-6").unwrap());
-        let payload = rec.payload.as_ref().unwrap();
+        let payload = rec.payload_json();
         assert!(
             payload.get("error").is_none(),
             "the explicit close's payload must not carry the Drop backstop's `error` key: {payload:?}"

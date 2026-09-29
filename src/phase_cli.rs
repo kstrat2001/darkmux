@@ -287,7 +287,7 @@ fn verdict_record(
         session,
         phase_id,
     );
-    rec.payload = Some(serde_json::json!({ "verdict": verdict }));
+    rec = rec.with_json_payload(serde_json::json!({ "verdict": verdict }));
     rec
 }
 

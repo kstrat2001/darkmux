@@ -331,8 +331,9 @@ pub fn hook_match(m: &HookMatch, record: &FlowRecord) -> bool {
     // etc. on the wire. Every predicate must resolve AND match exactly; a
     // record with no payload at all, or missing the named key, fails
     // every predicate (never treated as "no opinion, so it passes").
+    let payload_json = record.payload.as_ref().and_then(|p| serde_json::to_value(p).ok());
     for (path, expected) in m.payload_predicates() {
-        let actual = record.payload.as_ref().and_then(|p| payload_value_at(p, path));
+        let actual = payload_json.as_ref().and_then(|p| payload_value_at(p, path));
         if actual != Some(expected) {
             return false;
         }
@@ -3458,41 +3459,37 @@ fn emit_hook_record_with(
     let hash = parsed.and_then(|v| v.get("hash")).and_then(|v| v.as_str()).map(str::to_string);
     let host = extract_host_port(&rule.url).unwrap_or("").to_string();
 
-    let mut payload = serde_json::json!({
-        "rule_index": rule.index,
-        "target_host": host,
+    let rejected_count = receiver_rejected.filter(|n| *n > 0);
+    let delivery = crate::payload::HookDeliveryPayload {
+        rule_index: rule.index,
+        target_host: host.clone(),
         // `null` (never `""`) when the delivered line had no `action` —
         // an empty string would read as "delivered a record whose action
         // was blank", which is a different (and untrue) claim.
-        "delivered_action": action_val.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null),
-        "attempt": attempt,
+        delivered_action: action_val,
+        attempt,
         // (#2135 option 2) The SAME delivery id this attempt carried on
         // the wire as `X-Darkmux-Delivery` — lets a receiver (or an
         // operator reading flow) correlate the record here with the HTTP
         // request the receiver actually saw.
-        "delivery_id": delivery_id,
-    });
-    if let Some(h) = hash {
-        payload["delivered_hash"] = serde_json::Value::String(h);
-    }
-    if let Some(e) = error {
-        payload["error"] = serde_json::Value::String(e.to_string());
-    }
-    let rejected_count = receiver_rejected.filter(|n| *n > 0);
-    if let Some(n) = rejected_count {
-        payload["receiver_rejected"] = serde_json::Value::from(n);
-    }
-    // (#2196) The receiver's own `results[].error` text — WHY, not just
-    // how many. Rides alongside `receiver_rejected` only (never on a
-    // clean delivery, and never invented when the receiver's body
-    // carried no such detail); an empty array is never emitted so an
-    // older reader that doesn't know this key sees no difference from
-    // before.
-    if !receiver_rejected_reasons.is_empty() {
-        payload["receiver_rejected_reasons"] = serde_json::Value::from(receiver_rejected_reasons.to_vec());
-    }
+        delivery_id: delivery_id.to_string(),
+        delivered_hash: hash,
+        error: error.map(str::to_string),
+        receiver_rejected: rejected_count,
+        // (#2196) The receiver's own `results[].error` text — WHY, not just
+        // how many. Rides alongside `receiver_rejected` only (never on a
+        // clean delivery, and never invented when the receiver's body
+        // carried no such detail); an empty list is never emitted so an
+        // older reader that does not know this key sees no difference.
+        receiver_rejected_reasons: (!receiver_rejected_reasons.is_empty()).then(|| receiver_rejected_reasons.to_vec()),
+    };
 
-    let action = if success { crate::FlowAction::HookFired } else { crate::FlowAction::HookFailed };
+    let payload = if success {
+        crate::Payload::HookFired(delivery)
+    } else {
+        crate::Payload::HookFailed(crate::payload::HookFailedPayload::Delivery(delivery))
+    };
+    let action = payload.action();
     // (#2273) Three outcomes, not two: transport FAILURE (`Error`),
     // transport success with a clean receiver accept (`Info`), and
     // transport success where the receiver's own response body reported
@@ -3549,11 +3546,11 @@ fn emit_hook_record_with(
 fn emit_dry_run_record(report_sink: &dyn FlowSink, rt: &RuleRuntime, delivered_line: &str, delivery_id: &str, dump_path: &Path) {
     let parsed: Option<serde_json::Value> = serde_json::from_str(delivered_line).ok();
     let action_val = parsed.as_ref().and_then(|v| v.get("action")).and_then(|v| v.as_str()).map(str::to_string);
-    let payload = serde_json::json!({
-        "rule_index": rt.rule.index,
-        "delivered_action": action_val.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null),
-        "delivery_id": delivery_id,
-        "dump_path": dump_path.display().to_string(),
+    let payload = crate::Payload::HookDryRun(crate::payload::HookDryRunPayload {
+        rule_index: rt.rule.index,
+        delivered_action: action_val,
+        delivery_id: delivery_id.to_string(),
+        dump_path: dump_path.display().to_string(),
     });
     let rec = FlowRecord {
         ts: schema::ts_utc_now(),
@@ -3619,12 +3616,13 @@ fn maybe_warn_dropped(rt: &RuleRuntime, report_sink: &dyn FlowSink, max_outbox_m
         machine_uid: None,
         prev_hash: None,
         hash: None,
-        payload: Some(serde_json::json!({
-            "rule_index": rt.rule.index,
-            "target_host": extract_host_port(&rt.rule.url).unwrap_or(""),
-            "error": reason,
-            "dropped_count": dropped_count,
-        })),
+        payload: Some(crate::Payload::HookFailed(crate::payload::HookFailedPayload::Notice(crate::payload::HookNoticePayload {
+            rule_index: rt.rule.index,
+            target_host: extract_host_port(&rt.rule.url).unwrap_or("").to_string(),
+            error: reason,
+            dropped_count: Some(dropped_count),
+            orphaned_transforms: None,
+        }))),
     };
     if let Err(e) = crate::record_to(report_sink, rec) {
         eprintln!("flow::HookSink: failed to emit hook.failed (dropped-append warning): {e:#}");
@@ -3675,12 +3673,13 @@ fn maybe_warn_busy(rt: &RuleRuntime, report_sink: &dyn FlowSink, orphan_count: u
         machine_uid: None,
         prev_hash: None,
         hash: None,
-        payload: Some(serde_json::json!({
-            "rule_index": rt.rule.index,
-            "target_host": extract_host_port(&rt.rule.url).unwrap_or(""),
-            "error": reason,
-            "orphaned_transforms": orphan_count,
-        })),
+        payload: Some(crate::Payload::HookFailed(crate::payload::HookFailedPayload::Notice(crate::payload::HookNoticePayload {
+            rule_index: rt.rule.index,
+            target_host: extract_host_port(&rt.rule.url).unwrap_or("").to_string(),
+            error: reason,
+            dropped_count: None,
+            orphaned_transforms: Some(orphan_count),
+        }))),
     };
     if let Err(e) = crate::record_to(report_sink, rec) {
         eprintln!("flow::HookSink: failed to emit hook.failed (busy warning): {e:#}");
@@ -4797,7 +4796,7 @@ mod tests {
     #[test]
     fn payload_predicate_matches_on_tool_name() {
         let mut r = record(crate::FlowAction::DispatchTool);
-        r.payload = Some(serde_json::json!({"tool_name": "create_finding", "ok": true}));
+        r.payload = Some(crate::Payload::settle(&r.action, serde_json::json!({"tool_name": "create_finding", "ok": true})));
         let m = payload_match(&[("tool_name", serde_json::json!("create_finding"))]);
         assert!(hook_match(&m, &r));
 
@@ -4808,11 +4807,11 @@ mod tests {
     #[test]
     fn payload_predicate_distinguishes_ok_true_from_ok_false() {
         let mut r = record(crate::FlowAction::DispatchTool);
-        r.payload = Some(serde_json::json!({"tool_name": "create_finding", "ok": true}));
+        r.payload = Some(crate::Payload::settle(&r.action, serde_json::json!({"tool_name": "create_finding", "ok": true})));
         assert!(hook_match(&payload_match(&[("ok", serde_json::json!(true))]), &r));
         assert!(!hook_match(&payload_match(&[("ok", serde_json::json!(false))]), &r));
 
-        r.payload = Some(serde_json::json!({"tool_name": "create_finding", "ok": false}));
+        r.payload = Some(crate::Payload::settle(&r.action, serde_json::json!({"tool_name": "create_finding", "ok": false})));
         assert!(hook_match(&payload_match(&[("ok", serde_json::json!(false))]), &r));
         assert!(!hook_match(&payload_match(&[("ok", serde_json::json!(true))]), &r));
     }
@@ -4820,7 +4819,7 @@ mod tests {
     #[test]
     fn payload_predicate_on_a_missing_key_never_matches() {
         let mut r = record(crate::FlowAction::DispatchTool);
-        r.payload = Some(serde_json::json!({"tool_name": "create_finding"}));
+        r.payload = Some(crate::Payload::settle(&r.action, serde_json::json!({"tool_name": "create_finding"})));
         // `outcome` isn't in this payload at all.
         assert!(!hook_match(&payload_match(&[("outcome", serde_json::json!("ok"))]), &r));
 
@@ -4832,7 +4831,7 @@ mod tests {
     #[test]
     fn payload_predicate_resolves_a_nested_dotted_path() {
         let mut r = record(crate::FlowAction::DispatchTool);
-        r.payload = Some(serde_json::json!({"tool_name": "read", "detections": {"count": 3}}));
+        r.payload = Some(crate::Payload::settle(&r.action, serde_json::json!({"tool_name": "read", "detections": {"count": 3}})));
         assert!(hook_match(&payload_match(&[("detections.count", serde_json::json!(3))]), &r));
         assert!(!hook_match(&payload_match(&[("detections.count", serde_json::json!(4))]), &r));
         // A path that tries to walk THROUGH a non-object segment fails cleanly.
@@ -4862,7 +4861,7 @@ mod tests {
     #[test]
     fn payload_predicate_combines_with_action_and_every_other_field_anded() {
         let mut r = record(crate::FlowAction::DispatchTool);
-        r.payload = Some(serde_json::json!({"tool_name": "create_finding", "ok": true}));
+        r.payload = Some(crate::Payload::settle(&r.action, serde_json::json!({"tool_name": "create_finding", "ok": true})));
         let m = HookMatch {
             action: Some("dispatch.tool".to_string()),
             extras: {
@@ -5278,7 +5277,7 @@ mod tests {
         {
             let guard = capture.0.lock().unwrap();
             let fired = guard.iter().find(|r| r.action == crate::FlowAction::HookFired).unwrap();
-            assert_eq!(fired.payload.as_ref().unwrap()["delivered_action"], "mission.grow");
+            assert_eq!(fired.payload_json()["delivered_action"], "mission.grow");
         }
 
         // The cursor must have ADVANCED past the delivered line: without
@@ -5649,7 +5648,7 @@ mod tests {
         assert!(wait_until(|| capture.0.lock().unwrap().iter().any(|r| r.action == crate::FlowAction::HookFired), Duration::from_secs(3)));
         let guard = capture.0.lock().unwrap();
         let fired = guard.iter().find(|r| r.action == crate::FlowAction::HookFired).unwrap();
-        assert_eq!(fired.payload.as_ref().unwrap()["delivery_id"], serde_json::Value::String(first_id));
+        assert_eq!(fired.payload_json()["delivery_id"], serde_json::Value::String(first_id));
     }
 
     #[test]
@@ -5729,7 +5728,7 @@ mod tests {
         );
         let failed = capture.0.lock().unwrap();
         let failed = failed.iter().find(|r| r.action == crate::FlowAction::HookFailed).unwrap();
-        assert_eq!(failed.payload.as_ref().unwrap()["attempt"], 3);
+        assert_eq!(failed.payload_json()["attempt"], 3);
 
         // Cursor advanced past the skipped line — it's gone from the pending queue.
         assert!(wait_until(
@@ -5777,7 +5776,7 @@ mod tests {
         );
         let fired = capture.0.lock().unwrap();
         let fired = fired.iter().find(|r| r.action == crate::FlowAction::HookFired).unwrap();
-        assert_eq!(fired.payload.as_ref().unwrap()["attempt"], 3, "500, 500, 200 = 3 attempts total");
+        assert_eq!(fired.payload_json()["attempt"], 3, "500, 500, 200 = 3 attempts total");
     }
 
     // ─── (#2093 merge-gate finding 2) No redirects; explicit status ──────
@@ -5839,7 +5838,7 @@ mod tests {
         {
             let guard = capture.0.lock().unwrap();
             let failed = guard.iter().find(|r| r.action == crate::FlowAction::HookFailed).unwrap();
-            let err = failed.payload.as_ref().unwrap()["error"].as_str().unwrap_or_default();
+            let err = failed.payload_json()["error"].as_str().unwrap_or_default().to_string();
             assert!(err.contains("redirect refused"), "reason should name the redirect refusal: {err}");
             assert!(err.contains("302"), "reason should name the status: {err}");
         }
@@ -5932,7 +5931,7 @@ mod tests {
         // is not the only consumer.
         let guard = capture.0.lock().unwrap();
         let failed = guard.iter().find(|r| r.action == crate::FlowAction::HookFailed).unwrap();
-        assert_eq!(failed.payload.as_ref().unwrap()["error"].as_str().unwrap_or_default(), err);
+        assert_eq!(failed.payload_json()["error"].as_str().unwrap_or_default(), err);
     }
 
     #[test]
@@ -6866,10 +6865,10 @@ mod tests {
         let guard = capture.0.lock().unwrap();
         let fired: Vec<_> = guard.iter().filter(|r| r.action == crate::FlowAction::HookFired).collect();
         assert_eq!(fired.len(), 1, "exactly one hook.fired — never for the torn line");
-        assert_eq!(fired[0].payload.as_ref().unwrap()["delivered_action"], "operator.note");
+        assert_eq!(fired[0].payload_json()["delivered_action"], "operator.note");
         let failed: Vec<_> = guard.iter().filter(|r| r.action == crate::FlowAction::HookFailed).collect();
         assert_eq!(failed.len(), 1, "exactly one hook.failed — the quarantined torn line");
-        let reason = failed[0].payload.as_ref().unwrap()["error"].as_str().unwrap_or_default();
+        let reason = failed[0].payload_json()["error"].as_str().unwrap_or_default().to_string();
         assert_eq!(reason, "invalid outbox line");
         drop(guard);
 
@@ -6921,7 +6920,7 @@ mod tests {
         let guard = capture.0.lock().unwrap();
         let fired = guard.iter().find(|r| r.action == crate::FlowAction::HookFired).unwrap();
         assert_eq!(
-            fired.payload.as_ref().unwrap()["delivered_action"],
+            fired.payload_json()["delivered_action"],
             serde_json::Value::Null,
             "delivered_action must be JSON null, not an empty string, when the line has no `action` field"
         );
@@ -7424,7 +7423,7 @@ mod tests {
             Duration::from_secs(3)
         ));
         let fired = capture.0.lock().unwrap().iter().find(|r| r.action == crate::FlowAction::HookFired).cloned().unwrap();
-        let rejected = fired.payload.as_ref().and_then(|p| p.get("receiver_rejected")).and_then(|v| v.as_u64());
+        let rejected = fired.payload_json().get("receiver_rejected").and_then(|v| v.as_u64());
         assert_eq!(rejected, Some(1), "{fired:?}");
         // (#2273) A receiver rejection is a THIRD outcome, distinct from
         // both a routine delivery (Info) and a transport failure
@@ -7490,7 +7489,7 @@ mod tests {
         ));
         let fired = capture.0.lock().unwrap().iter().find(|r| r.action == crate::FlowAction::HookFired).cloned().unwrap();
         assert!(
-            fired.payload.as_ref().and_then(|p| p.get("receiver_rejected")).is_none(),
+            fired.payload_json().get("receiver_rejected").is_none(),
             "a clean accept must never carry a receiver_rejected field: {fired:?}"
         );
         assert_eq!(level_wire(fired.level), "info", "{fired:?}");
@@ -7615,13 +7614,10 @@ mod tests {
             Duration::from_secs(3)
         ));
         let fired = capture.0.lock().unwrap().iter().find(|r| r.action == crate::FlowAction::HookFired).cloned().unwrap();
-        let reasons: Vec<String> = fired
-            .payload
-            .as_ref()
-            .and_then(|p| p.get("receiver_rejected_reasons"))
-            .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_string)).collect())
-            .unwrap_or_default();
+        let reasons: Vec<String> = match &fired.payload {
+            Some(crate::Payload::HookFired(p)) => p.receiver_rejected_reasons.clone().unwrap_or_default(),
+            other => panic!("a hook.fired record carries its delivery payload: {other:?}"),
+        };
         // (#2196 fix-round 2, MUST FIX C) The receiver's raw text is 47
         // display columns — well under the fix-round-2 budget
         // (`REJECTION_REASON_RAW_BUDGET`, 118) — so it now survives
@@ -7738,11 +7734,11 @@ mod tests {
         let fired = capture.0.lock().unwrap().iter().find(|r| r.action == crate::FlowAction::HookFired).cloned().unwrap();
         assert_eq!(level_wire(fired.level), "info", "{fired:?}");
         assert!(
-            fired.payload.as_ref().and_then(|p| p.get("receiver_rejected")).is_none(),
+            fired.payload_json().get("receiver_rejected").is_none(),
             "an unparseable body must never be read as a rejection: {fired:?}"
         );
         assert!(
-            fired.payload.as_ref().and_then(|p| p.get("receiver_rejected_reasons")).is_none(),
+            fired.payload_json().get("receiver_rejected_reasons").is_none(),
             "no reasons can exist without a parseable body: {fired:?}"
         );
         let m = HookMatch { action: Some("mission.*".to_string()), ..Default::default() };
@@ -7860,11 +7856,11 @@ mod tests {
         );
         let fired = capture.0.lock().unwrap().iter().find(|r| r.action == crate::FlowAction::HookFired).cloned().unwrap();
         assert!(
-            fired.payload.as_ref().and_then(|p| p.get("receiver_rejected")).is_none(),
+            fired.payload_json().get("receiver_rejected").is_none(),
             "no top-level `rejected` key in the body means no count to disclose: {fired:?}"
         );
         assert!(
-            fired.payload.as_ref().and_then(|p| p.get("receiver_rejected_reasons")).is_none(),
+            fired.payload_json().get("receiver_rejected_reasons").is_none(),
             "a reason must never ride without the count that names it: {fired:?}"
         );
         assert_eq!(level_wire(fired.level), "info", "{fired:?}");
@@ -8538,11 +8534,11 @@ mod tests {
         );
         let fired = capture.0.lock().unwrap().iter().find(|r| r.action == crate::FlowAction::HookFired).cloned().unwrap();
         assert!(
-            fired.payload.as_ref().and_then(|p| p.get("receiver_rejected")).is_none(),
+            fired.payload_json().get("receiver_rejected").is_none(),
             "rejected: 0 is not a count to disclose: {fired:?}"
         );
         assert!(
-            fired.payload.as_ref().and_then(|p| p.get("receiver_rejected_reasons")).is_none(),
+            fired.payload_json().get("receiver_rejected_reasons").is_none(),
             "a reason must never ride when the receiver's own count was zero: {fired:?}"
         );
         assert_eq!(level_wire(fired.level), "info", "{fired:?}");
@@ -8677,13 +8673,10 @@ mod tests {
             Duration::from_secs(3)
         ));
         let fired = capture.0.lock().unwrap().iter().find(|r| r.action == crate::FlowAction::HookFired).cloned().unwrap();
-        let reasons: Vec<String> = fired
-            .payload
-            .as_ref()
-            .and_then(|p| p.get("receiver_rejected_reasons"))
-            .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_string)).collect())
-            .unwrap_or_default();
+        let reasons: Vec<String> = match &fired.payload {
+            Some(crate::Payload::HookFired(p)) => p.receiver_rejected_reasons.clone().unwrap_or_default(),
+            other => panic!("a hook.fired record carries its delivery payload: {other:?}"),
+        };
         assert_eq!(reasons.len(), 1, "{fired:?}");
         assert!(!reasons[0].contains('\n'), "{reasons:?}");
         assert!(!reasons[0].contains('\r'), "{reasons:?}");
@@ -8766,7 +8759,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let sink = HookSink::new(&rules, tmp.path().to_path_buf(), Arc::new(NoopSink)).unwrap();
         let mut rec = record(crate::FlowAction::DispatchTool);
-        rec.payload = Some(serde_json::json!({"tool_name": "create_finding"}));
+        rec.payload = Some(crate::Payload::settle(&rec.action, serde_json::json!({"tool_name": "create_finding"})));
         sink.write(&rec).unwrap();
         assert!(wait_until(|| receiver.request_count() >= 1, Duration::from_secs(3)));
         drop(sink);
@@ -8791,7 +8784,7 @@ mod tests {
         }];
         let sink = HookSink::new(&rules, outbox_dir, Arc::new(NoopSink)).unwrap();
         let mut rec = record(crate::FlowAction::DispatchTool);
-        rec.payload = Some(serde_json::json!({"tool_name": "create_finding"}));
+        rec.payload = Some(crate::Payload::settle(&rec.action, serde_json::json!({"tool_name": "create_finding"})));
         sink.write(&rec).unwrap();
         assert!(wait_until(|| receiver.request_count() >= 1, Duration::from_secs(3)));
         drop(sink);
@@ -8841,7 +8834,7 @@ mod tests {
         assert_eq!(receiver.request_count(), 0, "a jq error must never reach the network");
         let failed: Vec<_> = capture.0.lock().unwrap().iter().filter(|r| r.action == crate::FlowAction::HookFailed).cloned().collect();
         assert_eq!(failed.len(), 1, "quarantined once, never retried: {failed:?}");
-        let err = failed[0].payload.as_ref().and_then(|p| p.get("error")).and_then(|v| v.as_str()).unwrap_or("");
+        let err = failed[0].payload_json().get("error").and_then(|v| v.as_str()).unwrap_or("").to_string();
         assert!(err.contains("adapter boom"), "{err}");
     }
 
@@ -8880,7 +8873,7 @@ mod tests {
         }];
         let sink = HookSink::new(&rules, outbox_dir, Arc::new(NoopSink)).unwrap();
         let mut rec = record(crate::FlowAction::DispatchTool);
-        rec.payload = Some(serde_json::json!({"tool_name": "create_finding"}));
+        rec.payload = Some(crate::Payload::settle(&rec.action, serde_json::json!({"tool_name": "create_finding"})));
         sink.write(&rec).unwrap();
         assert!(wait_until(|| receiver.request_count() >= 1, Duration::from_secs(3)));
         drop(sink);
@@ -8979,7 +8972,7 @@ mod tests {
         let report: Arc<dyn FlowSink> = capture.clone();
         let sink = HookSink::new(&rules, outbox_dir, report).unwrap();
         let mut rec = record(crate::FlowAction::DispatchTool);
-        rec.payload = Some(serde_json::json!({"tool_name": "create_finding"}));
+        rec.payload = Some(crate::Payload::settle(&rec.action, serde_json::json!({"tool_name": "create_finding"})));
         sink.write(&rec).unwrap();
         assert!(wait_until(
             || capture.0.lock().unwrap().iter().any(|r| r.action == crate::FlowAction::HookDryRun),
@@ -9149,7 +9142,7 @@ mod tests {
                     .unwrap()
                     .iter()
                     .any(|r| r.action == crate::FlowAction::HookFailed
-                        && r.payload.as_ref().and_then(|p| p.get("error")).and_then(|v| v.as_str())
+                        && r.payload_json().get("error").and_then(|v| v.as_str())
                             .is_some_and(|e| e.contains("transform backlogged"))),
                 Duration::from_secs(5)
             ),

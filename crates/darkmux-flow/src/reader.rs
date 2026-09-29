@@ -134,7 +134,7 @@ pub fn parse_record(line: &str) -> Option<FlowRecord> {
     v["action"] = Value::String(FlowAction::OperatorNote.as_str().to_string());
     let mut record: FlowRecord = serde_json::from_value(v).ok()?;
     record.action = action;
-    Some(record)
+    Some(record.settled())
 }
 
 /// The typed `source` of a JSON record, an old spelling upgraded; `None` when
@@ -502,7 +502,7 @@ mod tests {
         let line = r#"{"ts":"t","level":"info","category":"review","tier":"frontier","stage":"review","action":"verdict: clean","handle":"h"}"#;
         let rec = parse_record(line).unwrap();
         assert_eq!(rec.action, FlowAction::PhaseReviewVerdict);
-        assert_eq!(rec.payload.unwrap()["verdict"], "clean");
+        assert_eq!(serde_json::to_value(rec.payload.unwrap()).unwrap()["verdict"], "clean");
     }
 
     #[test]

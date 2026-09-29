@@ -298,7 +298,7 @@ pub fn build_machine_scoped_telemetry_record_with(
         machine_uid: None,
         prev_hash: None,
         hash: None,
-        payload: Some(payload),
+        payload: Some(darkmux_flow::Payload::settle(&darkmux_flow::FlowAction::MachineTelemetry, payload)),
     }
 }
 

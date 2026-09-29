@@ -600,12 +600,6 @@ impl StepKind for DispatchInternalStepKind {
             if !failed.is_empty() {
                 flow_records.push(darkmux_flow::FlowRecord {
                     source: Some(darkmux_flow::FlowSource::Scheduler),
-                    payload: Some(serde_json::json!({
-                        "step_id": step.id,
-                        "kind": "dispatch.internal",
-                        "failed_verifiers": failed,
-                        "count": failed.len(),
-                    })),
                     ..darkmux_flow::FlowRecord::for_session(
                         &SessionId::task(ctx.run_id().clone(), &step.task_id),
                         darkmux_flow::Level::Warn,
@@ -614,6 +608,12 @@ impl StepKind for DispatchInternalStepKind {
                         darkmux_flow::FlowAction::StepResult,
                         step.id.clone(),
                     )
+                    .with_json_payload(serde_json::json!({
+                        "step_id": step.id,
+                        "kind": "dispatch.internal",
+                        "failed_verifiers": failed,
+                        "count": failed.len(),
+                    }))
                 });
             }
         }
@@ -809,7 +809,6 @@ impl ExecutionBookends<'_> {
         darkmux_flow::FlowRecord {
             source: Some(darkmux_flow::FlowSource::Scheduler),
             model: Some(self.model.to_string()),
-            payload: Some(payload),
             ..darkmux_flow::FlowRecord::for_execution(
                 self.session,
                 self.execution,
@@ -819,6 +818,7 @@ impl ExecutionBookends<'_> {
                 action,
                 self.step.id.clone(),
             )
+            .with_json_payload(payload)
         }
     }
 
@@ -1061,14 +1061,14 @@ impl DispatchSingleShotStepKind {
             flow_records.push(darkmux_flow::FlowRecord {
                 source: Some(darkmux_flow::FlowSource::Scheduler),
                 model: Some(wire_model.to_string()),
-                payload: Some(hosted_single_shot_step_payload(
-                    &step.id,
-                    budget,
-                    max_tokens,
-                    max_tokens,
-                    &reply,
-                )),
                 ..darkmux_flow::FlowRecord::for_session(session, darkmux_flow::Level::Info, darkmux_flow::Category::Work, darkmux_flow::Stage::Dispatch, darkmux_flow::FlowAction::StepResult, step.id.clone())
+                    .with_json_payload(hosted_single_shot_step_payload(
+                        &step.id,
+                        budget,
+                        max_tokens,
+                        max_tokens,
+                        &reply,
+                    ))
             });
 
             reply
@@ -1523,7 +1523,8 @@ impl DispatchMapStepKind {
         darkmux_flow::FlowRecord {
             source: Some(darkmux_flow::FlowSource::Scheduler),
             model: Some(model.to_string()),
-            payload: Some(serde_json::json!({
+            ..darkmux_flow::FlowRecord::for_execution(session, execution, if res.ok { darkmux_flow::Level::Info } else { darkmux_flow::Level::Warn }, darkmux_flow::Category::Work, darkmux_flow::Stage::Dispatch, darkmux_flow::FlowAction::StepResult, step.id.clone())
+            .with_json_payload(serde_json::json!({
                 "step_id": step.id,
                 "kind": "dispatch.map",
                 "index": res.index,
@@ -1537,8 +1538,7 @@ impl DispatchMapStepKind {
                 "served_model": res.served_model,
                 "wall_ms": res.wall_ms,
                 "error": res.error,
-            })),
-            ..darkmux_flow::FlowRecord::for_execution(session, execution, if res.ok { darkmux_flow::Level::Info } else { darkmux_flow::Level::Warn }, darkmux_flow::Category::Work, darkmux_flow::Stage::Dispatch, darkmux_flow::FlowAction::StepResult, step.id.clone())
+            }))
         }
     }
 
@@ -1558,8 +1558,10 @@ impl DispatchMapStepKind {
             serde_json::json!({ "item_index": res.index, "result_class": class, "error": res.error, "wall_ms": res.wall_ms }),
         );
         if records.endpoint_label.is_some() {
-            if let Some(payload) = done.payload.as_mut() {
-                darkmux_flow::stamp_remote_classification(payload, None, Some(res.total_tokens.unwrap_or(0)));
+            if let Some(payload) = done.payload.take() {
+                let mut json = serde_json::to_value(&payload).unwrap_or_default();
+                darkmux_flow::stamp_remote_classification(&mut json, None, Some(res.total_tokens.unwrap_or(0)));
+                done.payload = Some(darkmux_flow::Payload::settle(&done.action, json));
             }
         }
         done
@@ -1588,7 +1590,8 @@ impl DispatchMapStepKind {
         darkmux_flow::FlowRecord {
             source: Some(darkmux_flow::FlowSource::Scheduler),
             model: Some(model.to_string()),
-            payload: Some(serde_json::json!({
+            ..darkmux_flow::FlowRecord::for_session(session, if failed_count == 0 { darkmux_flow::Level::Info } else { darkmux_flow::Level::Warn }, darkmux_flow::Category::Work, darkmux_flow::Stage::Dispatch, darkmux_flow::FlowAction::StepResult, step.id.clone())
+            .with_json_payload(serde_json::json!({
                 "step_id": step.id,
                 "kind": "dispatch.map",
                 "items_in": results.len(),
@@ -1597,8 +1600,7 @@ impl DispatchMapStepKind {
                 "remote": remote,
                 "total_tokens": total_tokens,
                 "total_wall_ms": total_wall_ms,
-            })),
-            ..darkmux_flow::FlowRecord::for_session(session, if failed_count == 0 { darkmux_flow::Level::Info } else { darkmux_flow::Level::Warn }, darkmux_flow::Category::Work, darkmux_flow::Stage::Dispatch, darkmux_flow::FlowAction::StepResult, step.id.clone())
+            }))
         }
     }
 
@@ -1608,14 +1610,14 @@ impl DispatchMapStepKind {
         darkmux_flow::FlowRecord {
             source: Some(darkmux_flow::FlowSource::Scheduler),
             model: config_str(step, "model").map(str::to_string),
-            payload: Some(serde_json::json!({
+            ..darkmux_flow::FlowRecord::for_session(session, darkmux_flow::Level::Info, darkmux_flow::Category::Work, darkmux_flow::Stage::Dispatch, darkmux_flow::FlowAction::StepResult, step.id.clone())
+            .with_json_payload(serde_json::json!({
                 "step_id": step.id,
                 "kind": "dispatch.map",
                 "items_in": 0,
                 "items_out": 0,
                 "short_circuit": "empty collection — dispatch.map skipped before any model load",
-            })),
-            ..darkmux_flow::FlowRecord::for_session(session, darkmux_flow::Level::Info, darkmux_flow::Category::Work, darkmux_flow::Stage::Dispatch, darkmux_flow::FlowAction::StepResult, step.id.clone())
+            }))
         }
     }
 
@@ -3391,7 +3393,7 @@ mod tests {
         let item_records: Vec<&darkmux_flow::FlowRecord> = out
             .flow_records
             .iter()
-            .filter(|r| r.action == darkmux_flow::FlowAction::StepResult && r.payload.as_ref().and_then(|p| p.get("index")).is_some())
+            .filter(|r| r.action == darkmux_flow::FlowAction::StepResult && r.payload_json().get("index").is_some())
             .collect();
         assert_eq!(item_records.len(), 2, "one `step result` record per item: {:?}", out.flow_records);
         for rec in &item_records {
@@ -3406,7 +3408,7 @@ mod tests {
         let aggregate = out
             .flow_records
             .iter()
-            .find(|r| r.action == darkmux_flow::FlowAction::StepResult && r.payload.as_ref().and_then(|p| p.get("items_in")).is_some())
+            .find(|r| r.action == darkmux_flow::FlowAction::StepResult && r.payload_json().get("items_in").is_some())
             .expect("aggregate_record must be present");
         assert_eq!(
             aggregate.model.as_deref(),
@@ -4519,7 +4521,7 @@ mod tests {
         let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         assert_eq!(out.output, "[]");
         assert_eq!(out.flow_records.len(), 1, "one short-circuit record");
-        let payload = out.flow_records[0].payload.as_ref().unwrap();
+        let payload = out.flow_records[0].payload_json();
         assert!(payload["short_circuit"].as_str().unwrap().contains("empty collection"));
     }
 
@@ -5291,7 +5293,7 @@ mod tests {
         for remote in [false, true] {
             let tok = map_item_token_payload(&res, remote, "m", "ep").expect("emits");
             let item = DispatchMapStepKind::item_record(&task_session(), &ExecutionId::mint(), &step, "m", remote, &res);
-            let item_payload = item.payload.as_ref().expect("payload");
+            let item_payload = item.payload_json();
             assert_eq!(tok["remote"], item_payload["remote"], "one seat, one verdict");
             assert_eq!(tok["index"], item_payload["index"], "and one item position");
         }
@@ -5493,7 +5495,7 @@ mod tests {
         ];
         let s = map_step(json!({}));
         let rec = DispatchMapStepKind::aggregate_record(&task_session(), &s, "m", true, &results);
-        let p = rec.payload.as_ref().unwrap();
+        let p = rec.payload_json();
         assert_eq!(p["kind"], "dispatch.map");
         assert_eq!(p["items_in"], 3);
         assert_eq!(p["ok_count"], 2);
@@ -5508,7 +5510,7 @@ mod tests {
         let clean = vec![MapItemResult { index: 0, ok: true, content: "a".to_string(), error: None, total_tokens: Some(5), prompt_tokens: None, completion_tokens: None, reasoning_tokens: None, cached_tokens: None, served_model: None, wall_ms: 0, retried: 0 }];
         let rec = DispatchMapStepKind::aggregate_record(&task_session(), &s, "m", false, &clean);
         assert!(matches!(rec.level, darkmux_flow::Level::Info));
-        assert_eq!(rec.payload.as_ref().unwrap()["remote"], false);
+        assert_eq!(rec.payload_json()["remote"], false);
     }
 
     #[test]
@@ -5541,7 +5543,7 @@ mod tests {
         // A per-item flow record for every item, PLUS the one step-level
         // aggregate after the loop (#1442 gate C1) — 3 + 1.
         assert_eq!(out.flow_records.len(), 4);
-        let agg = out.flow_records.last().unwrap().payload.as_ref().unwrap();
+        let agg = out.flow_records.last().unwrap().payload_json();
         assert_eq!(agg["items_in"], 3);
         assert_eq!(agg["ok_count"], 0);
         assert_eq!(agg["failed_count"], 3);
@@ -6084,7 +6086,7 @@ mod tests {
             out.flow_records.iter().filter(|r| r.action == darkmux_flow::FlowAction::TelemetryTokens).collect();
         assert_eq!(telemetry.len(), 2, "one per item that reported usage: {:?}", out.flow_records);
         for (i, rec) in telemetry.iter().enumerate() {
-            let payload = rec.payload.as_ref().expect("telemetry payload");
+            let payload = rec.payload_json();
             assert_eq!(
                 payload["remote"],
                 serde_json::Value::Bool(true),
@@ -6140,7 +6142,7 @@ mod tests {
             out.flow_records.iter().filter(|r| r.action == darkmux_flow::FlowAction::TelemetryTokens).collect();
         assert_eq!(telemetry.len(), 2, "one per item that reported usage: {:?}", out.flow_records);
         for (i, rec) in telemetry.iter().enumerate() {
-            let payload = rec.payload.as_ref().expect("telemetry payload");
+            let payload = rec.payload_json();
             assert_eq!(
                 payload["remote"],
                 serde_json::Value::Bool(false),
@@ -6225,7 +6227,7 @@ mod tests {
         assert_eq!(id_of(bookends[2]), id_of(bookends[3]));
         assert_ne!(id_of(bookends[0]), id_of(bookends[2]), "two items are two executions");
         for terminal in [bookends[1], bookends[3]] {
-            let payload = terminal.payload.as_ref().expect("terminal carries a payload");
+            let payload = terminal.payload_json();
             assert_eq!(
                 payload["endpoint"], "azure:example.cognitiveservices.azure.com/gpt-4o",
                 "the terminal names WHERE the seat ran, in the one format the viewer parses"
@@ -6907,7 +6909,8 @@ mod tests {
         }));
         let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         for r in &out.flow_records {
-            if let Some(p) = r.payload.as_ref() {
+            if r.payload.is_some() {
+                let p = r.payload_json();
                 assert!(
                     p.get("endpoint").is_none(),
                     "a local map must never stamp an endpoint: {p}"
@@ -6952,10 +6955,10 @@ mod tests {
         );
         // Per-item flow record (index 0) carries the same telemetry; the
         // aggregate (last) carries the SUMMED wall.
-        let item_payload = out.flow_records[0].payload.as_ref().unwrap();
+        let item_payload = out.flow_records[0].payload_json();
         assert_eq!(item_payload["served_model"], "served-model-x");
         assert!(item_payload["wall_ms"].as_u64().unwrap() >= 1);
-        let agg = out.flow_records.last().unwrap().payload.as_ref().unwrap();
+        let agg = out.flow_records.last().unwrap().payload_json();
         assert_eq!(
             agg["total_wall_ms"].as_u64().unwrap(),
             results[0].wall_ms,

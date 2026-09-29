@@ -582,7 +582,7 @@ fn emit_mission_transition_record_with_reasoning_and_payload(
         tier: Tier::Operator,
         source: Some(darkmux_flow::FlowSource::MissionLifecycle),
         reasoning: reasoning.map(String::from),
-        payload,
+        payload: payload.map(|p| darkmux_flow::Payload::settle(&action, p)),
         ..FlowRecord::for_session(&session, Level::Info, Category::Work, Stage::Scope, action, mission_id.to_string())
     });
 }

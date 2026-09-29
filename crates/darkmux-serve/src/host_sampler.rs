@@ -332,7 +332,7 @@ fn build_thermal_transition_record_with(
         machine_uid: None,
         prev_hash: None,
         hash: None,
-        payload: Some(payload),
+        payload: Some(darkmux_flow::Payload::settle(&darkmux_flow::FlowAction::MachineThermal, payload)),
     }
 }
 
@@ -457,7 +457,7 @@ fn build_battery_health_record(
         machine_uid: None,
         prev_hash: None,
         hash: None,
-        payload: Some(payload),
+        payload: Some(darkmux_flow::Payload::settle(&darkmux_flow::FlowAction::MachineBatteryHealth, payload)),
     }
 }
 
@@ -631,7 +631,7 @@ fn build_battery_transition_record_with(
         machine_uid: None,
         prev_hash: None,
         hash: None,
-        payload: Some(payload),
+        payload: Some(darkmux_flow::Payload::settle(&darkmux_flow::FlowAction::MachineBattery, payload)),
     }
 }
 
@@ -844,7 +844,7 @@ fn build_machine_rollup_record_with(
         machine_uid: None,
         prev_hash: None,
         hash: None,
-        payload: Some(payload),
+        payload: Some(darkmux_flow::Payload::settle(&darkmux_flow::FlowAction::MachineRollup, payload)),
     }
 }
 
@@ -1200,8 +1200,12 @@ pub(crate) fn spawn(
                         // depended on is part of this record's own write
                         // cost — stamped so "the observer was negligible"
                         // stays a verifiable claim in the data.
-                        if let Some(obj) = rec.payload.as_mut().and_then(|p| p.as_object_mut()) {
-                            obj.insert("liveness_probe_ms".into(), serde_json::json!(liveness_probe_ms));
+                        if let Some(payload) = rec.payload.take() {
+                            let mut json = serde_json::to_value(&payload).unwrap_or_default();
+                            if let Some(obj) = json.as_object_mut() {
+                                obj.insert("liveness_probe_ms".into(), serde_json::json!(liveness_probe_ms));
+                            }
+                            rec.payload = Some(darkmux_flow::Payload::settle(&rec.action, json));
                         }
                         let _ = darkmux_flow::record(rec);
                     }
@@ -1297,7 +1301,7 @@ mod tests {
             matches!(rec.level, darkmux_flow::Level::Info),
             "normal laptop life is not a warning"
         );
-        let p = rec.payload.expect("payload");
+        let p = rec.payload_json();
         assert_eq!(p["transitions"], serde_json::json!(["to-battery"]));
         assert_eq!(p["from"]["on_ac"], true);
         assert_eq!(p["to"]["on_ac"], false);
@@ -1307,7 +1311,7 @@ mod tests {
         assert!(rec.is_none(), "an unchanged state is not a transition");
 
         let (_, rec) = battery_edge(known.as_ref(), &sample_with_battery(Some(on_ac)), 50, 5_000);
-        let p = rec.expect("replugging is a transition").payload.expect("payload");
+        let p = rec.expect("replugging is a transition").payload_json();
         assert_eq!(p["transitions"], serde_json::json!(["to-ac"]));
     }
 
@@ -1321,7 +1325,7 @@ mod tests {
             matches!(rec.level, darkmux_flow::Level::Warn),
             "below-floor is the one transition that changes what the machine will DO"
         );
-        let p = rec.payload.expect("payload");
+        let p = rec.payload_json();
         assert_eq!(p["transitions"], serde_json::json!(["below-floor"]));
         assert_eq!(p["floor_pct"], 50);
         assert_eq!(p["floor_field"], darkmux_crew::power_policy::FLOOR_FIELD);
@@ -1345,7 +1349,7 @@ mod tests {
         let (_, rec) = battery_edge(Some(&below), &sample_with_battery(Some(recovered)), 50, 1_000);
         let rec = rec.expect("recovery is a transition");
         assert!(matches!(rec.level, darkmux_flow::Level::Info));
-        let p = rec.payload.expect("payload");
+        let p = rec.payload_json();
         // Plugging in and crossing back up happen together and are both named.
         assert_eq!(p["transitions"], serde_json::json!(["to-ac", "at-or-above-floor"]));
     }
@@ -1508,7 +1512,7 @@ mod tests {
     fn a_changed_health_value_emits_with_the_cadence_that_produced_it() {
         let (known, _) = battery_health_edge(None, Some(&health_with(26)), 3_600_000, 0);
         let (_, rec) = battery_health_edge(known.as_ref(), Some(&health_with(27)), 3_600_000, 3_600_000);
-        let p = rec.expect("a real movement").payload.expect("payload");
+        let p = rec.expect("a real movement").payload_json();
         assert_eq!(p["cycle_count"], 27);
         assert_eq!(
             p["poll_interval_ms"], 3_600_000,
@@ -2229,17 +2233,17 @@ mod tests {
         }
         assert_eq!(records.len(), 3, "expected exactly 3 transitions, got {records:?}");
 
-        let p0 = records[0].payload.as_ref().unwrap();
+        let p0 = records[0].payload_json();
         assert_eq!(p0["from"], "nominal");
         assert_eq!(p0["to"], "fair");
         assert!(matches!(records[0].level, darkmux_flow::Level::Info), "rising to fair is Info");
 
-        let p1 = records[1].payload.as_ref().unwrap();
+        let p1 = records[1].payload_json();
         assert_eq!(p1["from"], "fair");
         assert_eq!(p1["to"], "serious");
         assert!(matches!(records[1].level, darkmux_flow::Level::Warn), "rising INTO serious is Warn");
 
-        let p2 = records[2].payload.as_ref().unwrap();
+        let p2 = records[2].payload_json();
         assert_eq!(p2["from"], "serious");
         assert_eq!(p2["to"], "nominal");
         assert!(matches!(records[2].level, darkmux_flow::Level::Info), "falling back to nominal is Info");
@@ -2298,7 +2302,7 @@ mod tests {
         };
         let (_next, rec) = thermal_edge(prev.as_deref(), &sample, 5000);
         let rec = rec.expect("nominal -> serious is a real transition");
-        let payload = rec.payload.unwrap();
+        let payload = rec.payload_json();
         assert_eq!(payload["cpu_speed_limit_pct"], 62);
         assert_eq!(payload["power_mw_total"], 1230);
         assert_eq!(payload["sampled_at_ms"], 5000);
@@ -2339,7 +2343,7 @@ mod tests {
             "a rise into critical is still an operator-actionable Warn — the stamp answers \
              WHOSE machine it happened on, it does not downgrade the event"
         );
-        let payload = rec.payload.expect("payload present");
+        let payload = rec.payload_json();
         assert_eq!(payload["to"], "critical");
         assert_eq!(
             payload["simulated_host_source"], "/tmp/critical-breaker.jsonl",
@@ -2360,7 +2364,7 @@ mod tests {
             },
         );
         assert!(
-            unavailable.payload.expect("payload present").get("simulated_host_source").is_none(),
+            unavailable.payload_json().get("simulated_host_source").is_none(),
             "nothing is simulated when the scenario failed to load, so nothing may be stamped"
         );
     }
@@ -2380,7 +2384,7 @@ mod tests {
         let below = battery_at(5, false);
 
         let (_, real) = battery_edge(Some(&above), &sample_with_battery(Some(below)), 50, 1_000);
-        let real = real.expect("60% -> 5% crosses a 50% floor").payload.expect("payload");
+        let real = real.expect("60% -> 5% crosses a 50% floor").payload_json();
         assert_eq!(real["transitions"], serde_json::json!(["below-floor"]));
         assert!(
             real.get("simulated_host_source").is_none(),
@@ -2398,7 +2402,7 @@ mod tests {
             "a floor crossing stays operator-actionable — the stamp answers WHOSE reading it was, \
              it does not downgrade the event"
         );
-        let payload = rec.payload.expect("payload present");
+        let payload = rec.payload_json();
         assert_eq!(
             payload["simulated_host_source"], "/tmp/battery-floor.jsonl",
             "a scripted pause trigger must name the scenario file behind it: {payload}"
@@ -2418,7 +2422,7 @@ mod tests {
             },
         );
         assert!(
-            unavailable.payload.expect("payload present").get("simulated_host_source").is_none(),
+            unavailable.payload_json().get("simulated_host_source").is_none(),
             "nothing is simulated when the scenario failed to load, so nothing may be stamped"
         );
     }
@@ -2442,8 +2446,7 @@ mod tests {
             "simulated_host_source": "/tmp/DECOY-from-the-load-object.jsonl",
         });
         let payload = build_machine_rollup_record_with(load, None, None, 60, 60_000, 1, 0, &scripted)
-            .payload
-            .expect("payload");
+            .payload_json();
         assert_eq!(
             payload["simulated_host_source"], "/tmp/real-scenario.jsonl",
             "the provenance the record was BUILT with must win over anything the spliced lens              object carries under the same key: {payload}"
@@ -2467,7 +2470,7 @@ mod tests {
     #[test]
     fn battery_health_is_never_stamped_because_the_facade_cannot_reach_it() {
         let payload =
-            build_battery_health_record(&health_with(120), 3_600_000, 1_000).payload.expect("payload");
+            build_battery_health_record(&health_with(120), 3_600_000, 1_000).payload_json();
         assert!(
             payload.get("simulated_host_source").is_none(),
             "health is a real IOKit read on every source, so it carries no simulation marker: {payload}"
@@ -2507,7 +2510,7 @@ mod tests {
         );
         assert_eq!(rec.action, darkmux_flow::FlowAction::MachineRollup);
         assert_eq!(rec.source, Some(darkmux_flow::FlowSource::HostSampler));
-        let p = rec.payload.expect("payload");
+        let p = rec.payload_json();
         // The lens's own keys, not re-spelled and not wrapped.
         assert!(p.get("now").is_some(), "the lens's `now` block rides at the top level");
         assert_eq!(p["window"]["samples"], 2);
@@ -2532,7 +2535,7 @@ mod tests {
             42,
             9_000,
         );
-        let p = rec.payload.expect("payload");
+        let p = rec.payload_json();
         assert_eq!(p["gather_ms"], 42, "the observer's own cost must be in the artifact");
         assert_eq!(p["period_ms"], 60_000, "the configured knob");
         assert_eq!(
@@ -2550,7 +2553,7 @@ mod tests {
     #[test]
     fn previous_thermal_state_is_null_until_a_transition_has_been_seen() {
         let rec = build_machine_rollup_record(serde_json::json!({}), None, None, 60_000, 60_000, 1, 0);
-        assert_eq!(rec.payload.unwrap()["previous_thermal_state"], serde_json::Value::Null);
+        assert_eq!(rec.payload_json()["previous_thermal_state"], serde_json::Value::Null);
 
         let rec = build_machine_rollup_record(
             serde_json::json!({}),
@@ -2561,7 +2564,7 @@ mod tests {
             1,
             0,
         );
-        assert_eq!(rec.payload.unwrap()["previous_thermal_state"], "nominal");
+        assert_eq!(rec.payload_json()["previous_thermal_state"], "nominal");
     }
 
     /// A heartbeat is a READING, not a verdict. The edge-triggered
@@ -2611,8 +2614,7 @@ mod tests {
         // mean something, and an explicit `null` would NOT do — the flow
         // records answer "were these real" by the key's absence.
         let real = build_machine_rollup_record(load.clone(), None, None, 60_000, 60_000, 1, 0)
-            .payload
-            .expect("payload");
+            .payload_json();
         assert_eq!(real["now"]["thermal"]["state"], "critical", "the reading really is in there");
         assert!(
             real.get("simulated_host_source").is_none(),
@@ -2626,8 +2628,7 @@ mod tests {
         };
         let payload =
             build_machine_rollup_record_with(load.clone(), None, None, 60, 60_000, 1, 0, &scripted)
-                .payload
-                .expect("payload");
+                .payload_json();
         assert_eq!(
             payload["simulated_host_source"], "/tmp/critical-breaker.jsonl",
             "a scripted machine picture must name the scenario file behind it: {payload}"
@@ -2651,7 +2652,7 @@ mod tests {
             },
         );
         assert!(
-            unavailable.payload.expect("payload present").get("simulated_host_source").is_none(),
+            unavailable.payload_json().get("simulated_host_source").is_none(),
             "nothing is simulated when the scenario failed to load, so nothing may be stamped"
         );
     }
@@ -2697,7 +2698,7 @@ mod tests {
 
         let rec = build_machine_rollup_record(load, None, None, 60_000, 60_000, 1, 0);
         assert_eq!(
-            rec.payload.unwrap()["window"]["thermal"],
+            rec.payload_json()["window"]["thermal"],
             from_lens,
             "the rollup must carry the lens's own block, not a second rendering of it"
         );

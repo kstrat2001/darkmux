@@ -103,7 +103,7 @@ impl FakeEnv {
         self.emitted.borrow().iter().map(|r| r.action.clone()).collect()
     }
     pub(crate) fn payload(&self, action: darkmux_flow::FlowAction) -> serde_json::Value {
-        self.emitted.borrow().iter().find(|r| r.action == action).and_then(|r| r.payload.clone()).unwrap()
+        self.emitted.borrow().iter().find(|r| r.action == action).map(|r| r.payload_json()).unwrap()
     }
     /// The first record emitted with `action`.
     pub(crate) fn record(&self, action: darkmux_flow::FlowAction) -> Option<darkmux_flow::FlowRecord> {
@@ -373,7 +373,7 @@ fn an_early_warning_after_an_unmetered_one_is_still_said() {
     env.records.borrow_mut().push((T0 - 30, Spend::full(600)));
     admit_with(b.clone(), &caller, &env).unwrap();
     assert_eq!(env.actions().len(), 2, "crossing warn_at is news even after an unmetered warning");
-    let early = env.emitted.borrow()[1].payload.clone().unwrap();
+    let early = env.emitted.borrow()[1].payload_json();
     assert_eq!((early["level"].as_str(), early["unmetered_calls"].as_u64()), (Some("early"), Some(1)));
     // The other direction: a metered early warning, then an unmetered call.
     let env = FakeEnv::new(vec![(T0 - 60, 600)]);
@@ -985,7 +985,7 @@ fn budget_messages_have_no_double_spaces() {
     let keys = darkmux_types::user_files::key_issues::<darkmux_types::ProfileRegistry>(&typo, &darkmux_types::user_files::no_retired);
     env.said.borrow_mut().extend(keys.iter().map(ToString::to_string));
     let mut messages: Vec<String> = env.said.borrow().clone();
-    messages.extend(env.emitted.borrow().iter().filter_map(|r| r.payload.as_ref()?.get("message")?.as_str().map(str::to_string)));
+    messages.extend(env.emitted.borrow().iter().filter_map(|r| r.payload_json().get("message")?.as_str().map(str::to_string)));
     let err = EndpointBudget::of(&named(serde_json::json!({"window": {"period": "1d", "tokens": "2M"}}))).unwrap_err();
     messages.push(err);
     assert!(messages.len() >= 5, "{messages:?}");

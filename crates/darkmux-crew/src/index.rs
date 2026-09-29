@@ -835,7 +835,8 @@ fn is_detector_caution(rec: &darkmux_flow::FlowRecord) -> bool {
 fn caution_fields(
     rec: &darkmux_flow::FlowRecord,
 ) -> (String, String, String, Option<String>, Option<String>) {
-    let payload = rec.payload.as_ref();
+    let payload_json = rec.payload.as_ref().and_then(|p| serde_json::to_value(p).ok());
+    let payload = payload_json.as_ref();
     let str_at = |k: &str| {
         payload
             .and_then(|v| v.get(k))

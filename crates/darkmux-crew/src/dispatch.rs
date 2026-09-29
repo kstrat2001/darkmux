@@ -1168,7 +1168,7 @@ fn crew_fields(
         phase_id: phase_id.map(String::from),
         source: Some(source),
         model: model.map(String::from),
-        payload: payload.map(|p| with_session_step(session, p)),
+        payload: payload.map(|p| darkmux_flow::Payload::settle(&base.action, with_session_step(session, p))),
         ..base
     }
 }
@@ -1415,7 +1415,7 @@ mod tests {
         assert_eq!(rec.handle, "coder");
         assert_eq!(rec.session_id, Some(crate::test_session("sess-1").wire()));
         assert_eq!(rec.model.as_deref(), Some("darkmux:qwen3.6"));
-        assert_eq!(rec.payload, Some(payload));
+        assert_eq!(rec.payload_json(), payload);
     }
 
     /// The observability viewer discriminates telemetry sub-streams on
@@ -1837,7 +1837,7 @@ mod tests {
             None,
             Some(serde_json::json!({ "role": "coder" })),
         );
-        assert_eq!(rec.payload.unwrap()["step_id"], "s1");
+        assert_eq!(rec.payload_json()["step_id"], "s1");
         let usage = build_telemetry_record(
             darkmux_flow::Level::Info,
             darkmux_flow::FlowAction::TelemetryTokens,
@@ -1848,7 +1848,7 @@ mod tests {
             None,
             serde_json::json!({ "step_id": "named" }),
         );
-        assert_eq!(usage.payload.unwrap()["step_id"], "named", "an explicit step is kept");
+        assert_eq!(usage.payload_json()["step_id"], "named", "an explicit step is kept");
         let task = build_dispatch_record_with_payload(
             darkmux_flow::Level::Info,
             darkmux_flow::FlowAction::DispatchStart,
@@ -1858,7 +1858,7 @@ mod tests {
             None,
             Some(serde_json::json!({})),
         );
-        assert!(task.payload.unwrap().get("step_id").is_none(), "a task session names no step");
+        assert!(task.payload_json().get("step_id").is_none(), "a task session names no step");
     }
 
     // ─── #88: a fresh nonce per ad-hoc dispatch ────────────────────────────

@@ -792,13 +792,6 @@ pub(crate) fn emit_cmd_audit(verb: &str, args: &str, cwd: &Path, gate_confirmed:
     let record = crate::flow::FlowRecord {
         tier: crate::flow::Tier::Operator,
         source: Some(darkmux_flow::FlowSource::CmdGateAudit),
-        payload: Some(serde_json::json!({
-            "verb": verb,
-            "pr": pr,
-            "worktree": cwd.to_string_lossy(),
-            "confirmed": gate_confirmed,
-            "success": success,
-        })),
         ..crate::flow::FlowRecord::for_session(
             &SessionId::run(run.clone()),
             if success { crate::flow::Level::Info } else { crate::flow::Level::Warn },
@@ -807,6 +800,13 @@ pub(crate) fn emit_cmd_audit(verb: &str, args: &str, cwd: &Path, gate_confirmed:
             darkmux_flow::FlowAction::GhVerbExecuted,
             handle,
         )
+        .with_json_payload(serde_json::json!({
+            "verb": verb,
+            "pr": pr,
+            "worktree": cwd.to_string_lossy(),
+            "confirmed": gate_confirmed,
+            "success": success,
+        }))
     };
     let _ = crate::flow::record(record);
 }

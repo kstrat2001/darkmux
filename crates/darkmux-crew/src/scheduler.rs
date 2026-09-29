@@ -1989,14 +1989,14 @@ fn step_lifecycle_record(run: &RunId, step: &Step, action: darkmux_flow::FlowAct
 fn seat_unresolved_record(run: &RunId, step: &Step, reason: &str) -> FlowRecord {
     FlowRecord {
         source: Some(darkmux_flow::FlowSource::Scheduler),
-        payload: Some(serde_json::json!({
-            "step_id": step.id,
-            "kind": step.kind,
-            "seat_class": "local_model_unresolved",
-            "reason": reason,
-            "lost": "wave load + #1487 residency lease",
-        })),
         ..FlowRecord::for_session(&SessionId::task(run.clone(), &step.task_id), Level::Warn, Category::Work, Stage::Dispatch, darkmux_flow::FlowAction::StepSeatUnresolved, step.id.clone())
+            .with_json_payload(serde_json::json!({
+                "step_id": step.id,
+                "kind": step.kind,
+                "seat_class": "local_model_unresolved",
+                "reason": reason,
+                "lost": "wave load + #1487 residency lease",
+            }))
     }
 }
 
@@ -2023,7 +2023,7 @@ fn step_lifecycle_record_with_payload(
     let level = if action == darkmux_flow::FlowAction::StepError { Level::Warn } else { Level::Info };
     FlowRecord {
         source: Some(darkmux_flow::FlowSource::Scheduler),
-        payload,
+        payload: payload.map(|p| darkmux_flow::Payload::settle(&action, p)),
         ..FlowRecord::for_session(&SessionId::task(run.clone(), &step.task_id), level, Category::Work, Stage::Dispatch, action, step.id.clone())
     }
 }
@@ -2057,8 +2057,8 @@ fn step_lifecycle_record_with_payload(
 fn step_timing_record(run: &RunId, step: &Step, rec: &StepRecord) -> FlowRecord {
     FlowRecord {
         source: Some(darkmux_flow::FlowSource::Scheduler),
-        payload: Some(serde_json::to_value(rec).expect("StepRecord always serializes")),
         ..FlowRecord::for_session(&SessionId::task(run.clone(), &step.task_id), Level::Info, Category::Work, Stage::Dispatch, darkmux_flow::FlowAction::StepTiming, step.id.clone())
+            .with_json_payload(serde_json::to_value(rec).expect("StepRecord always serializes"))
     }
 }
 
@@ -2108,7 +2108,7 @@ mod tests {
         );
         assert_eq!(rec.action, darkmux_flow::FlowAction::StepStart);
         assert!(STEP_LIFECYCLE_ACTIONS.contains(&rec.action));
-        let payload = rec.payload.expect("payload set");
+        let payload = rec.payload_json();
         assert_eq!(payload["workspace"], "acme");
         assert_eq!(payload["unit"], "u-0001");
         // Under the step's task session in its run: the mission comes from
@@ -4259,8 +4259,8 @@ mod tests {
         assert_eq!(rec.source, Some(darkmux_flow::FlowSource::Scheduler));
         assert_eq!(rec.handle, "a-step");
         assert_eq!(
-            rec.payload.as_ref(),
-            Some(&serde_json::to_value(&report.step_records[0]).unwrap()),
+            Some(rec.payload_json()),
+            Some(serde_json::to_value(&report.step_records[0]).unwrap()),
             "the flow record's payload must be the exact same StepRecord shape the summary carries"
         );
         // Never the business-result vocabulary. See `step_timing_record`'s
@@ -4611,11 +4611,9 @@ mod tests {
         records
             .iter()
             .find(|r| r.action == darkmux_flow::FlowAction::StepStart)
-            .and_then(|r| r.payload.as_ref())
-            .and_then(|p| p.get("seat_class"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("<missing>")
-            .to_string()
+            .map(|r| r.payload_json())
+            .and_then(|p| p.get("seat_class").and_then(|v| v.as_str()).map(str::to_string))
+            .unwrap_or_else(|| "<missing>".to_string())
     }
 
     /// (#2394) Every seat class reaches the durable stream on the step's own
@@ -4683,7 +4681,7 @@ mod tests {
             "a lost residency lease is a warning, not info"
         );
         assert_eq!(warn.handle, "seat-step", "the record names the step it is about");
-        let payload = warn.payload.as_ref().expect("the warning carries a payload");
+        let payload = warn.payload_json();
         assert_eq!(payload["reason"], "role `ghost` not found", "the resolver's own reason, verbatim");
         assert_eq!(payload["seat_class"], "local_model_unresolved");
         assert!(
@@ -4866,7 +4864,7 @@ mod tests {
         );
         assert_eq!(timing[0].handle, "boom-step");
         assert_eq!(
-            timing[0].payload.as_ref().and_then(|p| p.get("wall_ms")).and_then(|v| v.as_u64()),
+            timing[0].payload_json().get("wall_ms").and_then(|v| v.as_u64()),
             Some(rec.wall_ms),
             "the flow record's wall_ms must match the in-memory StepRecord's exactly"
         );
@@ -5882,7 +5880,7 @@ mod tests {
         ) -> Result<StepOutcome> {
             for i in 0..self.n {
                 let mut rec = step_lifecycle_record(&darkmux_types::session_id::RunId::mission("m-test").unwrap(), step, darkmux_flow::FlowAction::StepResult);
-                rec.payload = Some(json!({ "i": i }));
+                rec = rec.with_json_payload(json!({ "i": i }));
                 ctx.emit(rec);
             }
             Ok(StepOutcome { output: "done".to_string(), flow_records: vec![] })
@@ -5917,7 +5915,7 @@ mod tests {
         let item_indices: Vec<u64> = emitted
             .iter()
             .filter(|r| r.action == darkmux_flow::FlowAction::StepResult)
-            .map(|r| r.payload.as_ref().unwrap()["i"].as_u64().unwrap())
+            .map(|r| r.payload_json()["i"].as_u64().unwrap())
             .collect();
         assert_eq!(item_indices, vec![0, 1, 2, 3, 4], "records visible in emission order");
     }

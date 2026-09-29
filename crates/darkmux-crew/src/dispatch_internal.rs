@@ -8758,10 +8758,12 @@ fn run_telemetry_sampler(
                     // PREVIOUS emission's measured write duration instead.
                     // `None` on the first emission (no previous write to
                     // report).
-                    if let (Some(ms), Some(obj)) =
-                        (prev_record_write_ms, rec.payload.as_mut().and_then(|p| p.as_object_mut()))
-                    {
-                        obj.insert("prev_record_write_ms".into(), serde_json::json!(ms));
+                    if let (Some(ms), Some(payload)) = (prev_record_write_ms, rec.payload.take()) {
+                        let mut json = serde_json::to_value(&payload).unwrap_or_default();
+                        if let Some(obj) = json.as_object_mut() {
+                            obj.insert("prev_record_write_ms".into(), serde_json::json!(ms));
+                        }
+                        rec.payload = Some(darkmux_flow::Payload::settle(&rec.action, json));
                     }
                     let write_start = Instant::now();
                     let _ = darkmux_flow::record(rec);

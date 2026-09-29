@@ -13,6 +13,7 @@ pub mod hook_transform;
 pub mod hooks;
 pub mod legacy;
 pub mod live;
+pub mod payload;
 pub mod presence;
 pub mod presence_reconciler;
 pub mod reader;
@@ -24,6 +25,7 @@ mod schema;
 mod status;
 
 pub use action::{Bookend, Edge, FlowAction, FlowScope, Grain, UnknownAction};
+pub use payload::{OpenPayload, Payload, UnreadPayload};
 pub use bookend::*;
 pub use integrity::*;
 pub use schema::*;
@@ -121,7 +123,25 @@ impl<'a> CheckedRecord<'a> {
             known if known.grain() == Some(Grain::Execution) && record.execution_id.is_none() => {
                 anyhow::bail!("refusing to write a `{}` record with no execution id: it is a record of a role execution", known.as_str())
             }
-            _ => Ok(Self(record)),
+            _ => Self::check_payload(record).map(|()| Self(record)),
+        }
+    }
+
+    /// A payload is written only as its own action's type: not an unread
+    /// one (a payload that did not parse), and not another action's.
+    fn check_payload(record: &FlowRecord) -> Result<()> {
+        match &record.payload {
+            None => Ok(()),
+            Some(Payload::Unread(_)) => anyhow::bail!(
+                "refusing to write a `{}` record with an unread payload: build it from the action's payload type",
+                record.action.as_str()
+            ),
+            Some(payload) if payload.action() != record.action => anyhow::bail!(
+                "refusing to write a `{}` record carrying a `{}` payload",
+                record.action.as_str(),
+                payload.action().as_str()
+            ),
+            Some(_) => Ok(()),
         }
     }
 
@@ -1538,10 +1558,10 @@ impl TeeSink {
         // Never carry chain fields on the casual-sink breadcrumb.
         bc.prev_hash = None;
         bc.hash = None;
-        bc.payload = Some(serde_json::json!({
-            "dropped_action": dropped.action,
-            "dropped_session_id": dropped.session_id,
-            "error": err_msg,
+        bc.payload = Some(Payload::AuditWriteFailed(payload::AuditWriteFailedPayload {
+            dropped_action: dropped.action.as_str().to_string(),
+            dropped_session_id: dropped.session_id.clone(),
+            error: err_msg.to_string(),
         }));
         if let Err(e) = local.write(&bc) {
             eprintln!(
@@ -2763,9 +2783,11 @@ mod tests {
         assert!(matches!(captured[1].level, Level::Error));
         assert!(matches!(captured[1].category, Category::Audit));
         assert!(captured[1].prev_hash.is_none() && captured[1].hash.is_none());
-        let payload = captured[1].payload.as_ref().expect("breadcrumb carries payload");
-        assert_eq!(payload["dropped_action"], "dispatch.complete");
-        assert_eq!(payload["dropped_session_id"], "sess-1");
+        let Some(Payload::AuditWriteFailed(payload)) = captured[1].payload.as_ref() else {
+            panic!("the breadcrumb carries its payload");
+        };
+        assert_eq!(payload.dropped_action, "dispatch.complete");
+        assert_eq!(payload.dropped_session_id.as_deref(), Some("sess-1"));
     }
 
     #[serial_test::serial]
@@ -5157,7 +5179,7 @@ mod tests {
              free-form and every added field is optional",
         );
         assert_eq!(rec.action, crate::FlowAction::MissionGrow);
-        let payload = rec.payload.expect("the record carries its payload");
+        let payload = serde_json::to_value(rec.payload.expect("the record carries its payload")).unwrap();
         assert_eq!(payload["producer_status"], serde_json::json!("error"));
         assert_eq!(payload["reason"], serde_json::json!("producer_errored"));
     }

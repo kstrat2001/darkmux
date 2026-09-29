@@ -214,7 +214,8 @@ pub fn utility_start_payload(
 /// `action` is [`darkmux_flow::FlowAction::UtilityStart`] or [`darkmux_flow::FlowAction::UtilityError`], `handle`
 /// the job's role id, the same attribution its usage record carries.
 pub fn utility_marker_record(action: darkmux_flow::FlowAction, job_role_id: &str, model: &str, payload: serde_json::Value) -> darkmux_flow::FlowRecord {
-    let mut rec = utility_usage_record(job_role_id, model, &ExecutionId::mint(), payload);
+    let mut rec = utility_usage_record(job_role_id, model, &ExecutionId::mint(), payload.clone());
+    rec.payload = Some(darkmux_flow::Payload::settle(&action, payload));
     // A marker is not a record of the execution (its `job_id` pairs it with
     // its job), so it carries no execution id.
     rec.execution_id = None;
@@ -313,7 +314,7 @@ pub fn utility_usage_record(job_role_id: &str, model: &str, execution: &Executio
         machine_uid: None,
         prev_hash: None,
         hash: None,
-        payload: Some(payload),
+        payload: Some(darkmux_flow::Payload::settle(&darkmux_flow::FlowAction::TelemetryTokens, payload)),
     }
 }
 

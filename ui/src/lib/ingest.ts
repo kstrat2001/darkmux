@@ -36,6 +36,7 @@ import type { FlowRecord } from "../types/generated/FlowRecord";
 import type { Category } from "../types/generated/Category";
 import type { ExecutionGrainAction } from "../types/generated/ExecutionGrainAction";
 import type { FlowAction } from "../types/generated/FlowAction";
+import type { FlowPayloads } from "../types/generated/FlowPayloads";
 import type { FlowSource } from "../types/generated/FlowSource";
 import type { Level } from "../types/generated/Level";
 import type { RetiredAction } from "../types/generated/RetiredAction";
@@ -81,7 +82,9 @@ declare const normBrand: unique symbol;
 
 /** A flow record that has passed through `ingest`. Lenses and libs accept
  *  this type only; a raw `FlowRecord` does not satisfy it. */
-export interface NormRecord extends Omit<FlowRecord, "action" | "level" | "category" | "stage" | "tier" | "source" | "_type"> {
+export interface NormRecord extends Omit<FlowRecord, "action" | "level" | "category" | "stage" | "tier" | "source" | "payload" | "_type"> {
+  /** The wire `payload`, read through `payloadOf` as its action's type. */
+  payload?: Record<string, unknown>;
   /** `ts` parsed once; `null` when it is missing or does not parse. */
   readonly tMs: number | null;
   /** `payload`, aliased by the render model for records that only carry the
@@ -106,6 +109,18 @@ export interface NormRecord extends Omit<FlowRecord, "action" | "level" | "categ
  *  never for deciding anything (compare against the constants instead). */
 export function tagText(v: Tag<string, string> | undefined): string {
   return v === undefined ? "" : (v as unknown as string);
+}
+
+/** A record's payload read as the type of its own action: `undefined` when
+ *  the record is of another action or carries none. The wire type is the
+ *  writer's: an archived record written before a field existed lacks it, and
+ *  one whose payload is not its action's type (`UnreadPayload` in Rust) reads
+ *  as whatever JSON it holds. */
+export function payloadOf<W extends keyof FlowPayloads>(
+  rec: { readonly action?: NormAction; readonly payload?: Record<string, unknown> },
+  action: Tag<"action", W>,
+): FlowPayloads[W] | undefined {
+  return rec.action === (action as unknown as NormAction) ? (rec.payload as FlowPayloads[W] | undefined) : undefined;
 }
 
 /** A constant table's wire strings, typed as tags of kind `K`. The one place
