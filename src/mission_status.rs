@@ -681,6 +681,10 @@ fn detect_drift(
         out.push(d);
     }
 
+    if let Some(d) = planned_phase_nothing_advances_drift(m, phases, local_status, local_evidence) {
+        out.push(d);
+    }
+
     // (#2406) `unreachable_phase_drifts` retired — see its doc comment
     // above for why the phase-order heuristic it used was simply wrong.
     let step_drifts = live_step_drifts(m, phases, live_steps);
@@ -1113,7 +1117,7 @@ fn stale_active_drift(m: &Mission, complete: usize, now: u64, stale_days: u64) -
 /// says `Abandoned` and THIS RULE is silent" is **28 rows**; it is a
 /// coverage measure for one rule and does not move when a DIFFERENT board
 /// rule starts drawing a row. "`run list` says `Abandoned` and the board
-/// draws NOTHING AT ALL" is **12 rows**, down from 29, and that is the one
+/// draws NOTHING AT ALL" is **10 rows**, down from 29, and that is the one
 /// #2682 is about. Round 4 closed 17 of those 29 — and closed 5 of them by
 /// fixing `run list` rather than the board.
 ///
@@ -1133,7 +1137,7 @@ fn stale_active_drift(m: &Mission, complete: usize, now: u64, stale_days: u64) -
 ///     `done-not-finalized` deliberately excludes. See
 ///     [`nothing_complete_not_closed_drift`].
 ///
-/// **The 12 rows still silent, each on purpose.** Closing all of them was
+/// **The 10 rows still silent, each on purpose.** Closing all of them was
 /// never the goal; making the two surfaces agree OR differ honestly was.
 ///   - **Active + a Running phase, evidence `NoAttributableSession` (1
 ///     row).** Unchanged from round 2 — no dispatch-liveness observation
@@ -1146,8 +1150,15 @@ fn stale_active_drift(m: &Mission, complete: usize, now: u64, stale_days: u64) -
 ///     `lifecycle::reconcile_mint_failure` already owns closing it; a
 ///     board rule here would be a second, weaker answer to a question
 ///     something else already answers properly.
-///   - **Active + a Planned phase, × the same 3 flow shapes (3 rows).** The
-///     one where firing would be actively wrong. A Planned phase is the
+///   - **Active + a Planned phase (1 row: `NoAttributableSession`).** The
+///     other two flow shapes (`StaleNoTerminal`, `RecordedEnd`) are drawn by
+///     [`planned_phase_nothing_advances_drift`] (#2954), which owns them
+///     because nothing advances a Planned phase once its launch is gone. The
+///     caveat below still holds for the row left silent, and is the price
+///     of the two it drew: a mission whose dispatch was killed and then
+///     re-run reads `Abandoned` from its history, so that rule can flag it;
+///     it describes and offers `debrief` first for that reason. Where firing
+///     would be actively wrong is the no-observation row. A Planned phase is the
 ///     board saying work is QUEUED, not in flight — the ordinary shape of a
 ///     mission parked at a sign-off gate between phases. And
 ///     `mission_run_status_and_evidence` reaches `Abandoned` through `any`
@@ -1205,8 +1216,8 @@ fn stale_active_drift(m: &Mission, complete: usize, now: u64, stale_days: u64) -
 ///      `run_list::subtitle_for` renders as the literal word "aborted" —
 ///      the same thing the board itself shows for a mission the operator
 ///      tore down. Splitting on the REASON is what turns 53 into 28. (The
-///      board-silent sweep splits the same way: raw **27**, real **12**.)
-///   2. The 28 counts rows where THIS RULE is silent; the 12 counts rows
+///      board-silent sweep splits the same way: raw **25**, real **10**.)
+///   2. The 28 counts rows where THIS RULE is silent; the 10 counts rows
 ///      where NO rule speaks. The gap between them is every row some OTHER
 ///      board rule already draws — `done-not-finalized` for the
 ///      complete-bearing all-terminal shapes, and (round 4)
@@ -1214,7 +1225,7 @@ fn stale_active_drift(m: &Mission, complete: usize, now: u64, stale_days: u64) -
 ///      `mission-terminal-open-phase`. The matrix test asserts both numbers
 ///      and both per-status breakdowns.
 ///
-/// Leaving 12 rows silent WITH the reasoning above, rather than widening
+/// Leaving 10 rows silent WITH the reasoning above, rather than widening
 /// this rule until the count reaches zero, is the deliberate choice — a
 /// drift that fires on a healthy mission is noise however it is worded, and
 /// three of the twelve would do exactly that.
@@ -1276,6 +1287,63 @@ fn running_phase_session_drift(
         kind: "running-phase-session-dead",
         detail: format!("phase(s) {} read Running, but {fact}", running.join(", ")),
         suggest,
+    })
+}
+
+/// (#2954) An ACTIVE mission holding a `Planned` phase and no `Running`
+/// one, whose dispatch session is observably dead. Nothing advances that
+/// phase: a config-launched mission advances its own phases from inside its
+/// launch, and once the launch is gone no verb starts one (`add-phase` and
+/// `pause` are retired). The shape is what a mission left behind by an older
+/// `add-phase`, or one parked between phases, looks like now.
+///
+/// The other rules cannot see it: `done-not-finalized` needs every phase
+/// terminal, `stale-active` needs zero Complete phases, and
+/// `running-phase-session-dead` needs a Running phase.
+///
+/// **The liveness signal is `running_phase_session_drift`'s**, passed in
+/// rather than re-derived: `local_status == Abandoned` AND the evidence is a
+/// dispatch OBSERVATION (`RecordedEnd`/`StaleNoTerminal`). A live launch
+/// reads `Running`, so this stays silent; a mission with no attributable
+/// session is one parked at a sign-off gate inside a live launch, so it stays
+/// silent too. Describes, never adjudicates: `finalize` and `abort` are
+/// offered as alternatives.
+fn planned_phase_nothing_advances_drift(
+    m: &Mission,
+    phases: &[&Phase],
+    local_status: Option<RunStatus>,
+    local_evidence: Option<DispatchSessionEvidence>,
+) -> Option<Drift> {
+    if m.status != MissionStatus::Active || local_status != Some(RunStatus::Abandoned) {
+        return None;
+    }
+    match local_evidence? {
+        DispatchSessionEvidence::RecordedEnd | DispatchSessionEvidence::StaleNoTerminal => {}
+        DispatchSessionEvidence::NoAttributableSession => return None,
+    }
+    if phases.iter().any(|p| p.status == PhaseStatus::Running) {
+        return None;
+    }
+    let planned: Vec<&str> =
+        phases.iter().filter(|p| p.status == PhaseStatus::Planned).map(|p| p.id.as_str()).collect();
+    if planned.is_empty() {
+        return None;
+    }
+    Some(Drift {
+        kind: "planned-phase-nothing-advances",
+        detail: format!(
+            "phase(s) {} still read Planned, but this mission's dispatch session has ended — \
+             nothing is left to advance them",
+            planned.join(", ")
+        ),
+        suggest: vec![
+            format!(
+                "darkmux mission debrief {id} --json   # inspect what each phase recorded first",
+                id = m.id
+            ),
+            format!("darkmux mission finalize {id}   # …then this, if the work is concluded", id = m.id),
+            format!("darkmux mission abort {id}   # …or this, to close it as a teardown", id = m.id),
+        ],
     })
 }
 
@@ -3865,6 +3933,62 @@ mod tests {
         }
     }
 
+    // ─── planned-phase-nothing-advances (#2954) ────────────────────────
+
+    /// An Active mission holding Complete phases and a leftover `Planned`
+    /// one, whose dispatch session went stale: nothing advances that phase
+    /// (a config-launched mission advances its own phases, and its launch
+    /// is gone), no other rule speaks, and `run list` reads it Abandoned.
+    #[test]
+    fn a_leftover_planned_phase_with_a_dead_session_draws_a_drift() {
+        let m = mission("m1", MissionStatus::Active);
+        let done = phase("p1", "m1", PhaseStatus::Complete);
+        let left = phase("p2", "m1", PhaseStatus::Planned);
+        for ev in [DispatchSessionEvidence::StaleNoTerminal, DispatchSessionEvidence::RecordedEnd] {
+            let d = detect_drift(&m, &[&done, &left], &BTreeMap::new(), Some(RunStatus::Abandoned), Some(ev), 0, 14);
+            let hit = d
+                .iter()
+                .find(|x| x.kind == "planned-phase-nothing-advances")
+                .unwrap_or_else(|| panic!("no drift for {ev:?}: {d:?}"));
+            assert!(hit.detail.contains("p2") && !hit.detail.contains("p1"), "{}", hit.detail);
+            // flow-action-guard:allow — the CLI verbs, not actions
+            assert!(hit.suggest.iter().any(|s| s.contains("mission finalize m1")), "{:?}", hit.suggest);
+            // flow-action-guard:allow — the CLI verbs, not actions
+            assert!(hit.suggest.iter().any(|s| s.contains("mission abort m1")), "{:?}", hit.suggest);
+        }
+    }
+
+    /// The inverse cases: a live launch advances its own phases; a mission
+    /// with no dispatch observation is a parked-at-a-gate mission, not a
+    /// dead one; a Running phase belongs to `running-phase-session-dead`;
+    /// no Planned phase means nothing is left to advance; a closed mission
+    /// is not Active.
+    #[test]
+    fn a_leftover_planned_phase_draws_nothing_unless_the_session_is_dead() {
+        let kind = "planned-phase-nothing-advances";
+        let stale = Some(DispatchSessionEvidence::StaleNoTerminal);
+        let dead = Some(RunStatus::Abandoned);
+        let active = mission("m1", MissionStatus::Active);
+        let done = phase("p1", "m1", PhaseStatus::Complete);
+        let left = phase("p2", "m1", PhaseStatus::Planned);
+        let running = phase("p3", "m1", PhaseStatus::Running);
+        let fires = |m: &Mission, ps: &[&Phase], st: Option<RunStatus>, ev: Option<DispatchSessionEvidence>| {
+            detect_drift(m, ps, &BTreeMap::new(), st, ev, 0, 14).iter().any(|d| d.kind == kind)
+        };
+        assert!(fires(&active, &[&done, &left], dead, stale), "the positive shape");
+        assert!(!fires(&active, &[&done, &left], Some(RunStatus::Running), stale), "live launch");
+        assert!(!fires(&active, &[&done, &left], None, None), "unclassified");
+        assert!(
+            !fires(&active, &[&done, &left], dead, Some(DispatchSessionEvidence::NoAttributableSession)),
+            "no dispatch observation"
+        );
+        assert!(!fires(&active, &[&done, &left], dead, None), "no evidence");
+        assert!(!fires(&active, &[&done, &left, &running], dead, stale), "a Running phase is the sibling rule's");
+        assert!(!fires(&active, &[&done], dead, stale), "nothing Planned");
+        let closed = mission("m2", MissionStatus::Finalized);
+        assert!(!fires(&closed, &[&done, &left], dead, stale), "closed mission");
+    }
+
     // ─── the board-vs-`run list` disagreement matrix (#2682 round 2) ───
 
     /// The five flow-record shapes the matrix below sweeps, one per row of
@@ -4122,16 +4246,16 @@ mod tests {
         );
 
         // ── Predicate 2: THE HEADLINE — the board says nothing at all ────
-        assert_eq!(raw_board_silent, 27, "whole-board-silent raw count moved");
+        assert_eq!(raw_board_silent, 25, "whole-board-silent raw count moved");
         assert_eq!(
-            real_board_silent, 12,
-            "(#2682 round 4) 29 before this round, 12 after. Every remaining row is named, with \
+            real_board_silent, 10,
+            "(#2682 round 4) 29 before this round, 12 after; (#2954) 10 once a Planned phase with a dead session is drawn. Every remaining row is named, with \
              its reasoning, in `running_phase_session_drift`'s scope doc — if this number moves, \
              update that doc rather than this assertion: {board_detail:?}"
         );
         assert_eq!(
             board_per_status.get("Active").copied(),
-            Some(7),
+            Some(5),
             "Active board-silent breakdown moved: {board_detail:?}"
         );
         assert_eq!(
