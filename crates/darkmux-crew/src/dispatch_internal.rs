@@ -3352,66 +3352,17 @@ fn build_remote_record(
     )
 }
 
-/// (#1444 review) The five token keys EVERY hosted single-shot dispatch
-/// completion record carries, written into the payload from ONE place so
-/// the two producers — [`dispatch_remote`] and `dispatch_local_single_shot`
-/// — cannot drift apart on the key SET again.
-///
-/// They already had: #1444's first pass added `reasoning_tokens`/
-/// `cached_tokens` to the remote producer and missed the local one, so a
-/// consumer reading `runtime: "direct"` got an explicit `null` from one and
-/// a MISSING KEY from the other. Both mean "unreported", but a consumer that
-/// distinguishes them — which is the entire point of the tri-state this
-/// change exists to protect — sees two different answers to the same
-/// question depending on which arm answered. The absent-vs-zero problem,
-/// reintroduced one level up.
-///
-/// The values are the call's own counts, the ones its usage record
-/// carries: an unreported count is `null`, never a fabricated 0, and
-/// `total_tokens` is [`darkmux_trajectory::UsageCounts::total_tokens`], the
-/// one total rule.
-pub(crate) fn insert_direct_token_keys(
-    obj: &mut serde_json::Map<String, serde_json::Value>,
-    counts: &darkmux_trajectory::UsageCounts,
-) {
-    for (key, value) in DIRECT_TOKEN_KEYS.iter().zip(direct_token_values(counts)) {
-        obj.insert((*key).to_string(), serde_json::json!(value));
-    }
-}
-
-/// The counts of a direct (single-shot) call, in [`DIRECT_TOKEN_KEYS`] order.
-/// A reply with no usage block reports nothing, details included: the same
-/// `reported()` gate its usage record applies.
-fn direct_token_values(counts: &darkmux_trajectory::UsageCounts) -> [Option<u64>; 5] {
-    if counts.reported() {
-        [counts.prompt, counts.completion, counts.total_tokens(), counts.reasoning, counts.cached]
-    } else {
-        [None; 5]
-    }
-}
-
-/// [`insert_direct_token_keys`] for a `dispatch.complete` payload: the same
-/// five counts, absent when unreported.
+/// The five token counts of a direct (single-shot) call on its `dispatch.complete` payload, from
+/// the same [`DirectTokens`](crate::dispatch_envelope::DirectTokens) the hosted envelope prints, so
+/// the two producers cannot drift on the key set or the total rule. Absent when unreported.
 fn set_direct_token_counts(payload: &mut DispatchEndPayload, counts: &darkmux_trajectory::UsageCounts) {
-    let [prompt, completion, total, reasoning, cached] = direct_token_values(counts);
-    payload.prompt_tokens = prompt;
-    payload.completion_tokens = completion;
-    payload.total_tokens = total;
-    payload.reasoning_tokens = reasoning;
-    payload.cached_tokens = cached;
+    let t = crate::dispatch_envelope::DirectTokens::of(counts);
+    payload.prompt_tokens = t.prompt_tokens;
+    payload.completion_tokens = t.completion_tokens;
+    payload.total_tokens = t.total_tokens;
+    payload.reasoning_tokens = t.reasoning_tokens;
+    payload.cached_tokens = t.cached_tokens;
 }
-
-/// The keys [`insert_direct_token_keys`] writes, in order — the parity
-/// contract both hosted single-shot producers are held to. Load-bearing,
-/// not documentation: the writer above iterates this array, so the contract
-/// and the emission cannot disagree.
-pub(crate) const DIRECT_TOKEN_KEYS: [&str; 5] = [
-    "prompt_tokens",
-    "completion_tokens",
-    "total_tokens",
-    "reasoning_tokens",
-    "cached_tokens",
-];
 
 /// The hosted single-shot dispatch (#1177). Precondition: `target` is an
 /// unmanaged endpoint (`try_resolve_remote_target`).

@@ -51,18 +51,9 @@ pub fn role_show(role_id: &str, json: bool) -> Result<i32> {
     role_show_at(&default_index_path(), role_id, json)
 }
 
-/// Internal entry for `role list` taking an explicit index path. Tests use
-/// this to avoid querying the live `~/.darkmux/index.db`.
-pub(crate) fn role_list_at(path: &Path, json: bool) -> Result<i32> {
-    // Derived index: build it on demand if missing or stale (#914) so the
-    // verb just works — no manual `darkmux crew index rebuild`.
-    ensure_fresh_index(path)?;
-
-    let conn = open_index(path)?;
-
-    // (#907) Select the FULL description — the display truncation now happens
-    // in Rust so the `--json` path can emit the untruncated value while the
-    // text table stays compact.
+/// Every role's list row, ordered by id. The description is the full text: the text table
+/// truncates it, `--json` does not (#907).
+fn load_role_rows(conn: &rusqlite::Connection) -> Result<Vec<RoleListRow>> {
     let mut stmt = conn.prepare(
         "SELECT r.id, r.description, \
          COALESCE(rc.skill_count, 0), \
@@ -86,20 +77,12 @@ pub(crate) fn role_list_at(path: &Path, json: bool) -> Result<i32> {
         let (id, description, skill_count, tag) = row?;
         rows.push(RoleListRow { id, description, skill_count, escalation: escalation_of(&tag)? });
     }
+    Ok(rows)
+}
 
-    if json {
-        // (#907) Full, untruncated description for machine consumers.
-        cli_json::emit(&RoleList { roles: rows })?;
-        return Ok(0);
-    }
-
-    if rows.is_empty() {
-        println!("(no roles in index)");
-        return Ok(0);
-    }
-
-    // Truncate the description for the text table only (mirrors the old SQL
-    // `CASE WHEN LENGTH > 60 THEN SUBSTR(.,1,57) || '…'`).
+/// The text table of `role list`. The description is truncated here only (mirrors the old SQL
+/// `CASE WHEN LENGTH > 60 THEN SUBSTR(.,1,57) || '…'`).
+fn print_role_table(rows: &[RoleListRow]) {
     let truncate = |d: &str| -> String {
         if d.chars().count() > 60 {
             format!("{}…", d.chars().take(57).collect::<String>())
@@ -134,7 +117,31 @@ pub(crate) fn role_list_at(path: &Path, json: bool) -> Result<i32> {
             id, desc, skills, esc
         );
     }
+}
 
+/// Internal entry for `role list` taking an explicit index path. Tests use
+/// this to avoid querying the live `~/.darkmux/index.db`.
+pub(crate) fn role_list_at(path: &Path, json: bool) -> Result<i32> {
+    // Derived index: build it on demand if missing or stale (#914) so the
+    // verb just works — no manual `darkmux crew index rebuild`.
+    ensure_fresh_index(path)?;
+
+    let conn = open_index(path)?;
+
+    let rows = load_role_rows(&conn)?;
+
+    if json {
+        // (#907) Full, untruncated description for machine consumers.
+        cli_json::emit(&RoleList { roles: rows })?;
+        return Ok(0);
+    }
+
+    if rows.is_empty() {
+        println!("(no roles in index)");
+        return Ok(0);
+    }
+
+    print_role_table(&rows);
     Ok(0)
 }
 
@@ -203,59 +210,55 @@ pub(crate) fn role_show_at(path: &Path, role_id: &str, json: bool) -> Result<i32
         None
     };
 
+    let show = RoleShow { id, description, prompt_path, skills, tool_palette: palette, escalation, escalation_target };
     if json {
         // (#907) machine-readable parity.
-        cli_json::emit(&RoleShow {
-            id,
-            description,
-            prompt_path,
-            skills,
-            tool_palette: palette,
-            escalation,
-            escalation_target,
-        })?;
+        cli_json::emit(&show)?;
         return Ok(0);
     }
+    print_role_show(&show);
+    Ok(0)
+}
 
-    println!("id: {}", id);
-    println!("description: {}", description);
+/// The text rendering of `role show`.
+fn print_role_show(show: &RoleShow) {
+    println!("id: {}", show.id);
+    println!("description: {}", show.description);
 
-    if let Some(p) = &prompt_path {
+    if let Some(p) = &show.prompt_path {
         println!("prompt_path: {}", p);
     }
 
     println!("skills:");
-    if skills.is_empty() {
+    if show.skills.is_empty() {
         println!("  (none)");
     } else {
-        for skill in &skills {
+        for skill in &show.skills {
             println!("  - {}", skill);
         }
     }
 
     println!("tool_palette:");
-    if palette.allow.is_empty() && palette.deny.is_empty() {
+    if show.tool_palette.allow.is_empty() && show.tool_palette.deny.is_empty() {
         println!("  (none)");
     } else {
-        if !palette.allow.is_empty() {
-            let allow_str: Vec<String> = palette.allow.iter().map(|s| format!("\"{}\"", s)).collect();
+        if !show.tool_palette.allow.is_empty() {
+            let allow_str: Vec<String> = show.tool_palette.allow.iter().map(|s| format!("\"{}\"", s)).collect();
             println!("  allow: [{}]", allow_str.join(", "));
         }
-        if !palette.deny.is_empty() {
-            let deny_str: Vec<String> = palette.deny.iter().map(|s| format!("\"{}\"", s)).collect();
+        if !show.tool_palette.deny.is_empty() {
+            let deny_str: Vec<String> = show.tool_palette.deny.iter().map(|s| format!("\"{}\"", s)).collect();
             println!("  deny: [{}]", deny_str.join(", "));
         }
     }
 
-    println!("escalation: {}", escalation.tag());
-    if escalation == EscalationKind::HandOffTo {
-        match &escalation_target {
+    println!("escalation: {}", show.escalation.tag());
+    if show.escalation == EscalationKind::HandOffTo {
+        match &show.escalation_target {
             Some(t) => println!("  target: {}", t),
             None => println!("  target: (unresolved: no target recorded for this role)"),
         }
     }
-
-    Ok(0)
 }
 
 #[cfg(test)]

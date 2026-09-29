@@ -249,8 +249,8 @@ pub struct DirectMetrics {
 
 /// The call's own token counts, the ones its usage record carries. An
 /// unreported count is `null`, never a fabricated 0, and a reply with no usage
-/// block reports nothing, details included. The key set is the parity contract
-/// both hosted single-shot producers are held to (`DIRECT_TOKEN_KEYS`).
+/// block reports nothing, details included. The `dispatch.complete` payload of both hosted
+/// single-shot producers reads its counts from here, so the two cannot drift.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct DirectTokens {
     pub prompt_tokens: Option<u64>,

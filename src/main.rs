@@ -265,200 +265,213 @@ fn run(cmd: Cmd) -> Result<i32> {
 }
 
 fn cmd_lessons(sub: LessonCmd) -> Result<i32> {
-    use darkmux_crew::lessons;
     match sub {
-        LessonCmd::Add {
-            title,
-            body,
-            file,
-            global,
-        } => {
-            let (path, tier) = if global {
-                (lessons::global_db_path(), "global")
-            } else {
-                (lessons::repo_db_path(), "repo")
-            };
-            let conn = lessons::open_at(&path)?;
-            lessons::add(&conn, &title, &body, file.as_deref(), None)?;
+        LessonCmd::Add { title, body, file, global } => lessons_add(&title, &body, file.as_deref(), global),
+        LessonCmd::List { json: cli::JsonFlagPlain { json } } => lessons_list(json),
+        LessonCmd::Edit { id, title, body, file, clear_file, global } => {
+            lessons_edit(id, title.as_deref(), body.as_deref(), file.as_deref(), clear_file, global)
+        }
+        LessonCmd::Remove { id, global } => lessons_remove(id, global),
+        LessonCmd::Export { global } => lessons_export(global),
+        LessonCmd::Import { file, global } => lessons_import(file, global),
+        LessonCmd::Recall { term, file, json: cli::JsonFlagPlain { json } } => {
+            lessons_recall(term.as_deref(), file.as_deref(), json)
+        }
+    }
+}
+
+fn lessons_add(title: &str, body: &str, file: Option<&str>, global: bool) -> Result<i32> {
+    use darkmux_crew::lessons;
+        let (path, tier) = if global {
+            (lessons::global_db_path(), "global")
+        } else {
+            (lessons::repo_db_path(), "repo")
+        };
+        let conn = lessons::open_at(&path)?;
+        lessons::add(&conn, title, body, file, None)?;
+        println!(
+            "{}",
+            darkmux_types::style::success(&format!("recorded lesson ({tier}): {title}"))
+        );
+        println!("{}", darkmux_types::style::dim(&format!("  {}", path.display())));
+        Ok(0)
+}
+
+fn lessons_list(json: bool) -> Result<i32> {
+    use darkmux_crew::lessons;
+        let repo_path = lessons::repo_db_path();
+        let global_path = lessons::global_db_path();
+        let repo = lessons::load_entries_best_effort(&repo_path);
+        // When `$DARKMUX_HOME` collapses both tiers to one root the paths are
+        // identical — read once, don't double-display the same entries.
+        let global = if global_path == repo_path {
+            Vec::new()
+        } else {
+            lessons::load_entries_best_effort(&global_path)
+        };
+
+        if json {
+            cli_json::emit(&cli_json::LessonTiers { repo, global })?;
+            return Ok(0);
+        }
+        if repo.is_empty() && global.is_empty() {
             println!(
                 "{}",
-                darkmux_types::style::success(&format!("recorded lesson ({tier}): {title}"))
+                darkmux_types::style::dim(
+                    "no lessons recorded yet — darkmux memory lesson add --title <t> --body <b>"
+                )
             );
-            println!("{}", darkmux_types::style::dim(&format!("  {}", path.display())));
-            Ok(0)
+            return Ok(0);
         }
-        LessonCmd::List {
-            json: cli::JsonFlagPlain { json },
-        } => {
-            let repo_path = lessons::repo_db_path();
-            let global_path = lessons::global_db_path();
-            let repo = lessons::load_entries_best_effort(&repo_path);
-            // When `$DARKMUX_HOME` collapses both tiers to one root the paths are
-            // identical — read once, don't double-display the same entries.
-            let global = if global_path == repo_path {
-                Vec::new()
-            } else {
-                lessons::load_entries_best_effort(&global_path)
-            };
+        print_lessons_tier("repo (this engagement)", &repo);
+        print_lessons_tier("global (all engagements)", &global);
+        Ok(0)
+}
 
-            if json {
-                cli_json::emit(&cli_json::LessonTiers { repo, global })?;
-                return Ok(0);
-            }
-            if repo.is_empty() && global.is_empty() {
-                println!(
-                    "{}",
-                    darkmux_types::style::dim(
-                        "no lessons recorded yet — darkmux memory lesson add --title <t> --body <b>"
-                    )
-                );
-                return Ok(0);
-            }
-            print_lessons_tier("repo (this engagement)", &repo);
-            print_lessons_tier("global (all engagements)", &global);
-            Ok(0)
+fn lessons_edit(
+    id: i64,
+    title: Option<&str>,
+    body: Option<&str>,
+    file: Option<&str>,
+    clear_file: bool,
+    global: bool,
+) -> Result<i32> {
+    use darkmux_crew::lessons;
+        let (path, tier) = lessons_tier(global);
+        // tri-state: --clear-file wins (Some(None)); else --file (Some(Some));
+        // else leave unchanged (None).
+        let file_update: Option<Option<&str>> = if clear_file {
+            Some(None)
+        } else {
+            file.map(Some)
+        };
+        if title.is_none() && body.is_none() && file_update.is_none() {
+            eprintln!(
+                "{}",
+                darkmux_types::style::error(
+                    "nothing to edit — pass at least one of --title / --body / --file / --clear-file"
+                )
+            );
+            return Ok(2);
         }
-        LessonCmd::Edit {
+        let conn = lessons::open_at(&path)?;
+        let changed = lessons::edit(
+            &conn,
             id,
             title,
             body,
-            file,
-            clear_file,
-            global,
-        } => {
-            let (path, tier) = lessons_tier(global);
-            // tri-state: --clear-file wins (Some(None)); else --file (Some(Some));
-            // else leave unchanged (None).
-            let file_update: Option<Option<&str>> = if clear_file {
-                Some(None)
-            } else {
-                file.as_deref().map(Some)
-            };
-            if title.is_none() && body.is_none() && file_update.is_none() {
-                eprintln!(
-                    "{}",
-                    darkmux_types::style::error(
-                        "nothing to edit — pass at least one of --title / --body / --file / --clear-file"
-                    )
-                );
-                return Ok(2);
-            }
-            let conn = lessons::open_at(&path)?;
-            let changed = lessons::edit(
-                &conn,
-                id,
-                title.as_deref(),
-                body.as_deref(),
-                file_update,
-                None,
-            )?;
-            if changed {
-                println!(
-                    "{}",
-                    darkmux_types::style::success(&format!("edited lesson #{id} ({tier})"))
-                );
-                Ok(0)
-            } else {
-                eprintln!(
-                    "{}",
-                    darkmux_types::style::error(&format!(
-                        "no lesson #{id} in the {tier} store (ids are per-tier — try --global?)"
-                    ))
-                );
-                Ok(1)
-            }
-        }
-        LessonCmd::Remove { id, global } => {
-            let (path, tier) = lessons_tier(global);
-            let conn = lessons::open_at(&path)?;
-            if lessons::remove(&conn, id)? {
-                println!(
-                    "{}",
-                    darkmux_types::style::success(&format!("removed lesson #{id} ({tier})"))
-                );
-                Ok(0)
-            } else {
-                eprintln!(
-                    "{}",
-                    darkmux_types::style::error(&format!(
-                        "no lesson #{id} in the {tier} store (ids are per-tier — try --global?)"
-                    ))
-                );
-                Ok(1)
-            }
-        }
-        LessonCmd::Export { global } => {
-            let (path, _) = lessons_tier(global);
-            // export reads the store; if absent, emit an empty envelope rather
-            // than creating the db (a read must not write). Build the envelope
-            // through `LessonsExport` so the wire shape is single-sourced with
-            // `import_json` — the two can't drift.
-            let env = lessons::LessonsExport {
-                schema_version: lessons::LESSONS_SCHEMA_VERSION,
-                lessons: lessons::load_entries_best_effort(&path),
-            };
-            cli_json::emit(&env)?;
-            Ok(0)
-        }
-        LessonCmd::Import { file, global } => {
-            let (path, tier) = lessons_tier(global);
-            let data = match file {
-                Some(p) => std::fs::read_to_string(&p)
-                    .with_context(|| format!("reading {}", p.display()))?,
-                None => {
-                    use std::io::Read;
-                    let mut buf = String::new();
-                    std::io::stdin()
-                        .read_to_string(&mut buf)
-                        .context("reading lessons import from stdin")?;
-                    buf
-                }
-            };
-            let mut conn = lessons::open_at(&path)?;
-            let stats = lessons::import_json(&mut conn, &data)?;
+            file_update,
+            None,
+        )?;
+        if changed {
             println!(
                 "{}",
-                darkmux_types::style::success(&format!(
-                    "imported into {tier}: {} inserted, {} updated",
-                    stats.inserted, stats.updated
-                ))
+                darkmux_types::style::success(&format!("edited lesson #{id} ({tier})"))
             );
             Ok(0)
+        } else {
+            eprintln!(
+                "{}",
+                darkmux_types::style::error(&format!(
+                    "no lesson #{id} in the {tier} store (ids are per-tier — try --global?)"
+                ))
+            );
+            Ok(1)
         }
-        LessonCmd::Recall {
-            term,
-            file,
-            json: cli::JsonFlagPlain { json },
-        } => {
-            let repo_path = lessons::repo_db_path();
-            let global_path = lessons::global_db_path();
-            let recall_tier = |path: &std::path::Path| -> Vec<lessons::Lesson> {
-                if !path.exists() {
-                    return Vec::new();
-                }
-                lessons::open_at(path)
-                    .and_then(|conn| lessons::recall(&conn, term.as_deref(), file.as_deref()))
-                    .unwrap_or_default()
-            };
-            let repo = recall_tier(&repo_path);
-            let global = if global_path == repo_path {
-                Vec::new()
-            } else {
-                recall_tier(&global_path)
-            };
-            if json {
-                cli_json::emit(&cli_json::LessonTiers { repo, global })?;
-                return Ok(0);
-            }
-            if repo.is_empty() && global.is_empty() {
-                println!("{}", darkmux_types::style::dim("no lessons match"));
-                return Ok(0);
-            }
-            print_lessons_tier("repo (this engagement)", &repo);
-            print_lessons_tier("global (all engagements)", &global);
+}
+
+fn lessons_remove(id: i64, global: bool) -> Result<i32> {
+    use darkmux_crew::lessons;
+        let (path, tier) = lessons_tier(global);
+        let conn = lessons::open_at(&path)?;
+        if lessons::remove(&conn, id)? {
+            println!(
+                "{}",
+                darkmux_types::style::success(&format!("removed lesson #{id} ({tier})"))
+            );
             Ok(0)
+        } else {
+            eprintln!(
+                "{}",
+                darkmux_types::style::error(&format!(
+                    "no lesson #{id} in the {tier} store (ids are per-tier — try --global?)"
+                ))
+            );
+            Ok(1)
         }
-    }
+}
+
+fn lessons_export(global: bool) -> Result<i32> {
+    use darkmux_crew::lessons;
+        let (path, _) = lessons_tier(global);
+        // export reads the store; if absent, emit an empty envelope rather
+        // than creating the db (a read must not write). Build the envelope
+        // through `LessonsExport` so the wire shape is single-sourced with
+        // `import_json` — the two can't drift.
+        let env = lessons::LessonsExport {
+            schema_version: lessons::LESSONS_SCHEMA_VERSION,
+            lessons: lessons::load_entries_best_effort(&path),
+        };
+        cli_json::emit(&env)?;
+        Ok(0)
+}
+
+fn lessons_import(file: Option<std::path::PathBuf>, global: bool) -> Result<i32> {
+    use darkmux_crew::lessons;
+        let (path, tier) = lessons_tier(global);
+        let data = match file {
+            Some(p) => std::fs::read_to_string(&p)
+                .with_context(|| format!("reading {}", p.display()))?,
+            None => {
+                use std::io::Read;
+                let mut buf = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut buf)
+                    .context("reading lessons import from stdin")?;
+                buf
+            }
+        };
+        let mut conn = lessons::open_at(&path)?;
+        let stats = lessons::import_json(&mut conn, &data)?;
+        println!(
+            "{}",
+            darkmux_types::style::success(&format!(
+                "imported into {tier}: {} inserted, {} updated",
+                stats.inserted, stats.updated
+            ))
+        );
+        Ok(0)
+}
+
+fn lessons_recall(term: Option<&str>, file: Option<&str>, json: bool) -> Result<i32> {
+    use darkmux_crew::lessons;
+        let repo_path = lessons::repo_db_path();
+        let global_path = lessons::global_db_path();
+        let recall_tier = |path: &std::path::Path| -> Vec<lessons::Lesson> {
+            if !path.exists() {
+                return Vec::new();
+            }
+            lessons::open_at(path)
+                .and_then(|conn| lessons::recall(&conn, term, file))
+                .unwrap_or_default()
+        };
+        let repo = recall_tier(&repo_path);
+        let global = if global_path == repo_path {
+            Vec::new()
+        } else {
+            recall_tier(&global_path)
+        };
+        if json {
+            cli_json::emit(&cli_json::LessonTiers { repo, global })?;
+            return Ok(0);
+        }
+        if repo.is_empty() && global.is_empty() {
+            println!("{}", darkmux_types::style::dim("no lessons match"));
+            return Ok(0);
+        }
+        print_lessons_tier("repo (this engagement)", &repo);
+        print_lessons_tier("global (all engagements)", &global);
+        Ok(0)
 }
 
 /// Resolve the `(db path, label)` for a lessons tier — repo (this engagement)
@@ -1310,46 +1323,51 @@ fn cmd_machine_resources(id: Option<&str>, json: bool) -> Result<i32> {
 /// fetches THAT peer's residents over its serve daemon; the profile-match
 /// column is local-only (it reads this host's registry), so it is omitted for
 /// a remote read.
+/// A peer's resident list, rendered like a local one.
+fn machine_status_remote(id: &str, json: bool) -> Result<i32> {
+    // Remote read: the peer's /machine/status returns a flat resident list;
+    // partition by ownership here so a remote read renders like a local
+    // one. No profile-match — that reads this host's registry.
+    let value = fleet_cli::fetch_peer_json(id, "/machine/status")?;
+    // (#1426 gate fix) A degraded peer must NOT render as healthy-empty:
+    // `lms_unreachable: true` means the peer's daemon could not query
+    // LMStudio — its residents are UNKNOWN, not zero. Surface it loudly
+    // and exit 2 instead of printing an all-clear empty view.
+    let lms_unreachable = value
+        .get("lms_unreachable")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    // Shape mismatch (an older/newer daemon whose payload doesn't parse):
+    // refuse, naming the cause (the same refusal `cmd_machine_resources`
+    // makes), never a fabricated-empty render.
+    let models: Vec<types::LoadedModel> = match value
+        .get("models")
+        .map(|m| serde_json::from_value(m.clone()))
+    {
+        Some(Ok(models)) => models,
+        _ => anyhow::bail!(
+            "machine `{id}` answered with a resident list this darkmux does not read ({})",
+            fleet_cli::peer_reports(&value)
+        ),
+    };
+    if lms_unreachable {
+        if json {
+            cli_json::emit(&cli_json::MachineStatusOutput::lms_unreachable(Some(id.to_string())))?;
+        } else {
+            eprintln!(
+                "machine `{id}`: the peer's daemon could not reach LMStudio (`lms ps` \
+                 failed there) — residents UNKNOWN, not empty. Check LMStudio + the \
+                 `lms` CLI on `{id}`."
+            );
+        }
+        return Ok(2);
+    }
+    render_residents(&models, None, None, json, Some(id))
+}
+
 fn cmd_machine_status(id: Option<&str>, config: Option<&str>, json: bool) -> Result<i32> {
     if let Some(id) = id {
-        // Remote read: the peer's /machine/status returns a flat resident list;
-        // partition by ownership here so a remote read renders like a local
-        // one. No profile-match — that reads this host's registry.
-        let value = fleet_cli::fetch_peer_json(id, "/machine/status")?;
-        // (#1426 gate fix) A degraded peer must NOT render as healthy-empty:
-        // `lms_unreachable: true` means the peer's daemon could not query
-        // LMStudio — its residents are UNKNOWN, not zero. Surface it loudly
-        // and exit 2 instead of printing an all-clear empty view.
-        let lms_unreachable = value
-            .get("lms_unreachable")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        // Shape mismatch (an older/newer daemon whose payload doesn't parse):
-        // refuse, naming the cause (the same refusal `cmd_machine_resources`
-        // makes), never a fabricated-empty render.
-        let models: Vec<types::LoadedModel> = match value
-            .get("models")
-            .map(|m| serde_json::from_value(m.clone()))
-        {
-            Some(Ok(models)) => models,
-            _ => anyhow::bail!(
-                "machine `{id}` answered with a resident list this darkmux does not read ({})",
-                fleet_cli::peer_reports(&value)
-            ),
-        };
-        if lms_unreachable {
-            if json {
-                cli_json::emit(&cli_json::MachineStatusOutput::lms_unreachable(Some(id.to_string())))?;
-            } else {
-                eprintln!(
-                    "machine `{id}`: the peer's daemon could not reach LMStudio (`lms ps` \
-                     failed there) — residents UNKNOWN, not empty. Check LMStudio + the \
-                     `lms` CLI on `{id}`."
-                );
-            }
-            return Ok(2);
-        }
-        return render_residents(&models, None, None, json, Some(id));
+        return machine_status_remote(id, json);
     }
     // (#2774 round-9 review C1) The LOCAL twin of the remote branch's
     // `lms_unreachable` handling just above.

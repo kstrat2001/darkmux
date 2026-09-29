@@ -4524,6 +4524,7 @@ mod tests {
     /// The retired phase-order rule's signature: a drift that tells the
     /// operator to `mission abort <id> --phase <name>`.
     fn suggests_aborting_a_phase(drift: &Drift) -> bool {
+        // flow-action-guard:allow — a CLI command a suggestion must not contain, not a flow action
         drift.suggest.iter().any(|c| c.contains("mission abort") && c.contains("--phase"))
     }
 

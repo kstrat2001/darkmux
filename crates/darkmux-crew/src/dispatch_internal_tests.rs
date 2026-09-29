@@ -10202,36 +10202,6 @@
         assert!(bare.mission_id.is_none(), "a None mission_id must never be fabricated into Some");
     }
 
-    // ─── "direct"-runtime token key parity (#1444 review) ─────────────
-
-    /// (#1444 review) Both hosted single-shot producers — `dispatch_remote`
-    /// and `dispatch_local_single_shot` — write their token block through
-    /// `insert_direct_token_keys`, so their key SET cannot drift apart the
-    /// way it did when #1444's first pass added `reasoning_tokens`/
-    /// `cached_tokens` to one and not the other.
-    ///
-    /// The keys must be present even when every value is unreported. The
-    /// key names are spelled out as LITERALS on purpose: an earlier draft
-    /// iterated `DIRECT_TOKEN_KEYS` itself and stayed green when mutation
-    /// rewrote the constant.
-    #[test]
-    fn insert_direct_token_keys_always_writes_all_five_keys() {
-        let mut payload = serde_json::json!({});
-        let obj = payload.as_object_mut().unwrap();
-        insert_direct_token_keys(obj, &darkmux_trajectory::UsageCounts::default());
-        for key in [
-            "prompt_tokens",
-            "completion_tokens",
-            "total_tokens",
-            "reasoning_tokens",
-            "cached_tokens",
-        ] {
-            assert!(obj.contains_key(key), "{key} must be PRESENT-and-null when unreported, never absent");
-            assert!(obj[key].is_null(), "{key} must be null, never a fabricated 0");
-        }
-        assert_eq!(obj.len(), 5, "exactly the five token keys");
-    }
-
     /// A direct completion record quotes the call's counts exactly as its
     /// usage record does: the provider's own total when it sent one, the
     /// split's sum when it sent only that. There is no second reading of
@@ -10251,12 +10221,13 @@
             darkmux_trajectory::UsageCounts { prompt: Some(300), completion: Some(45), ..Default::default() },
             darkmux_trajectory::UsageCounts { reasoning: Some(0), cached: Some(64), ..Default::default() },
         ] {
-            let mut complete = serde_json::json!({});
-            insert_direct_token_keys(complete.as_object_mut().unwrap(), &counts);
+            let mut end = DispatchEndPayload::default();
+            set_direct_token_counts(&mut end, &counts);
+            let complete = serde_json::to_value(&end).unwrap();
             let record = crate::usage::usage_payload(&facts, &counts);
             for key in ["prompt_tokens", "completion_tokens", "total_tokens", "reasoning_tokens", "cached_tokens"] {
                 let recorded = serde_json::to_value(&record).unwrap().get(key).cloned().unwrap_or(serde_json::Value::Null);
-                assert_eq!(complete[key], recorded, "{key} for {counts:?}");
+                assert_eq!(complete.get(key).cloned().unwrap_or(serde_json::Value::Null), recorded, "{key} for {counts:?}");
             }
         }
     }
@@ -13783,13 +13754,13 @@ fn a_stdout_that_is_not_an_envelope_is_returned_untouched() {
 }
 
 /// The hosted-endpoint envelope's token keys are the parity contract both hosted
-/// single-shot producers are held to: `DirectTokens` serializes exactly
-/// `DIRECT_TOKEN_KEYS`, in order, and an unreported count is `null`.
+/// single-shot producers are held to: `DirectTokens` serializes exactly these five keys, in
+/// order, and an unreported count is `null`.
 #[test]
 fn direct_tokens_carry_exactly_the_direct_token_keys() {
     let none = serde_json::to_value(crate::dispatch_envelope::DirectTokens::of(&darkmux_trajectory::UsageCounts::default())).unwrap();
     let keys: Vec<&str> = none.as_object().unwrap().keys().map(String::as_str).collect();
-    assert_eq!(keys, super::DIRECT_TOKEN_KEYS);
+    assert_eq!(keys, ["prompt_tokens", "completion_tokens", "total_tokens", "reasoning_tokens", "cached_tokens"]);
     assert!(none.as_object().unwrap().values().all(|v| v.is_null()), "{none}");
     let counts = darkmux_trajectory::UsageCounts { prompt: Some(3), completion: Some(4), total: None, reasoning: Some(1), cached: None };
     let some = serde_json::to_value(crate::dispatch_envelope::DirectTokens::of(&counts)).unwrap();
