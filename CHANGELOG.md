@@ -170,6 +170,18 @@ darkmux release.
   `darkmux config set serve.read_auth true`. A non-loopback `--bind` now
   also requires `serve.read_auth true`: a token alone no longer licenses
   it, and `serve` refuses to start with read auth on and no token.
+  "This machine" is one predicate: a loopback peer (`::ffff:127.0.0.1`
+  included), no proxy header, and a single `Host` naming the daemon
+  (`localhost`, `127.0.0.1`, `[::1]` or the bound address, with no port or
+  the bound port). A page rebound by DNS to loopback, and a header-less
+  `tailscale serve --tcp` proxy, are no longer local. The `doctor` and
+  `config-list` panels describe the fleet listener and its allow-list, so
+  they are served only to this machine or a token holder even with read
+  auth off; the other panels follow `serve.read_auth`. `darkmux serve` runs
+  the config gate before it binds, so a wrong-typed value (`serve.read_auth:
+  "true"`) or a retired key refuses the start. **Migration:** a tailnet
+  viewer with read auth off loses the `doctor` and `config-list` panels
+  (401); run them on the hub, or present the token.
 - **An unknown key in a user file is refused (CONFIG 2.0).** `config.json`,
   `profiles.json`, role, skill and crew manifests, mission configs, rule
   files, workload documents, lab fixture manifests and a crawl's workspace

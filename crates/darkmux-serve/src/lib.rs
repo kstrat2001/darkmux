@@ -596,10 +596,12 @@ fn request_token_ok(headers: &axum::http::HeaderMap) -> bool {
 /// external liveness checks) keep working.
 ///
 /// "This machine" is [`is_local_request`], the one predicate every local
-/// decision in this daemon uses: a loopback peer address AND no reverse-proxy
-/// header. (#2988) Behind `tailscale serve`, the documented way a hub reaches
-/// the tailnet, every peer arrives on loopback with `X-Forwarded-For` set, so
-/// the address alone exempted the whole tailnet from the token.
+/// decision in this daemon uses: a loopback peer address, no reverse-proxy
+/// header, and a `Host` naming this daemon. (#2988) Behind `tailscale serve`,
+/// the documented way a hub reaches the tailnet, every peer arrives on
+/// loopback with `X-Forwarded-For` set, so the address alone exempted the
+/// whole tailnet from the token; and a DNS-rebound page arrives on loopback
+/// with its own Host.
 ///
 /// (#1663) A missing `ConnectInfo` is not local, so it needs the token — see
 /// the fail-closed reasoning in the body. Tests that want the exemption state
@@ -1712,8 +1714,9 @@ async fn health(
     headers: axum::http::HeaderMap,
 ) -> axum::Json<serde_json::Value> {
     // (#2916 re-review C9) A peer sees only the listener's coarse state.
-    // (#2916 stage 2 review C5) "This machine" is a loopback request that
-    // did not come through a reverse proxy (`is_local_request`).
+    // (#2916 stage 2 review C5) "This machine" is `is_local_request`: a
+    // loopback request that did not come through a reverse proxy and names
+    // this daemon in its Host.
     let loopback_caller = is_local_request(peer.map(|c| c.0), &headers);
     axum::Json(serde_json::json!({
         "darkmux_version": env!("CARGO_PKG_VERSION"),
