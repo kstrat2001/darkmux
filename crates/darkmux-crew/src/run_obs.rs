@@ -73,6 +73,7 @@ mod tests {
             handle: "s1".to_string(),
             phase_id: None,
             session_id: None,
+            execution_id: None,
             source: None,
             model: None,
             reasoning: None,

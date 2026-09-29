@@ -380,6 +380,10 @@ export interface StepMetrics {
    * stand-in for legacy's out-of-React `STEP_LAST_RX` wall-clock ref; see
    * this module's own doc for why. */
   lastTs: number;
+  /** Whether the step's own `step.start` bookend has been seen. Such a step
+   *  ends only on its `step.complete`/`step.error`: a dispatch terminal is
+   *  one execution's end (a map step holds one per item), not the step's. */
+  stepBookended?: boolean;
 }
 
 const EMPTY_METRICS: StepMetrics = {
@@ -490,6 +494,23 @@ export function stepDispatchSessions(records: NormRecord[], missionId: string): 
   return out;
 }
 
+/** Whether folding a record left the step's accumulator unchanged. */
+function sameMetrics(a: StepMetrics, b: StepMetrics): boolean {
+  return (
+    a.tokRun === b.tokRun &&
+    a.tokFinal === b.tokFinal &&
+    a.turnRun === b.turnRun &&
+    a.turnFinal === b.turnFinal &&
+    a.toolRun === b.toolRun &&
+    a.toolFinal === b.toolFinal &&
+    a.usageSeen === b.usageSeen &&
+    a.startTs === b.startTs &&
+    a.endTs === b.endTs &&
+    a.stepBookended === b.stepBookended &&
+    a.lastTs === b.lastTs
+  );
+}
+
 /** `applyRecordToMetrics` — mission-graph.html. Folds one record into the
  * per-step metric accumulator, returning a NEW map only when something
  * changed (so a no-op record doesn't churn state). */
@@ -513,7 +534,9 @@ export function applyRecordToMetrics(metrics: MetricsMap, rec: NormRecord, idx: 
   const isComplete = action === ACTION.DispatchComplete;
   const isStepResult = action === ACTION.StepResult;
   const isStart = action === ACTION.DispatchStart || action === ACTION.StepStart;
-  const isTerminal = action === ACTION.StepComplete || action === ACTION.StepError || isDispatchTerminal(action);
+  const stepBookended = cur.stepBookended || action === ACTION.StepStart;
+  if (stepBookended) next.stepBookended = true;
+  const isTerminal = action === ACTION.StepComplete || action === ACTION.StepError || (!stepBookended && isDispatchTerminal(action));
 
   if (isStart && recMs) next.startTs = next.startTs ? Math.min(next.startTs, recMs) : recMs;
   // A terminal with no usable time still ends the step, at the latest time
@@ -536,20 +559,7 @@ export function applyRecordToMetrics(metrics: MetricsMap, rec: NormRecord, idx: 
     if (finalTok) next.tokFinal = Math.max(next.tokFinal, finalTok);
   }
 
-  if (
-    next.tokRun === cur.tokRun &&
-    next.tokFinal === cur.tokFinal &&
-    next.turnRun === cur.turnRun &&
-    next.turnFinal === cur.turnFinal &&
-    next.toolRun === cur.toolRun &&
-    next.toolFinal === cur.toolFinal &&
-    next.usageSeen === cur.usageSeen &&
-    next.startTs === cur.startTs &&
-    next.endTs === cur.endTs &&
-    next.lastTs === cur.lastTs
-  ) {
-    return metrics;
-  }
+  if (sameMetrics(next, cur)) return metrics;
   return { ...metrics, [sid]: next };
 }
 

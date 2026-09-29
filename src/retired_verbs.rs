@@ -84,6 +84,12 @@ const RETIRED: &[RetiredVerb] = &[
                  `darkmux mission finalize <id>` or `darkmux mission abort <id>`.",
     },
     RetiredVerb {
+        words: &["finding", "list"],
+        flag: Some("--dispatch"),
+        remedy: "Findings are keyed by the role execution that filed them: use \
+                 `darkmux finding list --execution <execution-id>`.",
+    },
+    RetiredVerb {
         words: &["dispatch"],
         flag: Some("--phase-id"),
         remedy: "A dispatch no longer attaches to another mission's phase. Run the work as a \
@@ -159,6 +165,15 @@ mod tests {
         }
         // After `--` the text is the message, never a flag.
         assert!(refusal(&args(&["dispatch", "coder", "--", "--phase-id", "p"])).is_none());
+    }
+
+    #[test]
+    fn the_finding_list_dispatch_flag_names_execution() {
+        let msg = refusal(&args(&["finding", "list", "--dispatch", "k"])).unwrap();
+        // drift-guard:allow finding list --dispatch — asserts the refusal names the retired flag
+        assert!(msg.contains("`darkmux finding list --dispatch` was removed"), "{msg}");
+        assert!(msg.contains("--execution"), "{msg}");
+        assert!(refusal(&args(&["finding", "list", "--execution", "k"])).is_none());
     }
 
     #[test]

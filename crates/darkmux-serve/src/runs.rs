@@ -50,7 +50,7 @@
 use crate::LabRunSummary;
 use darkmux_crew::envelope::MissionOutcomeStatus;
 use darkmux_crew::types::{Mission, MissionStatus, Phase, PhaseStatus, Step, Task};
-use darkmux_flow::FlowAction;
+use darkmux_flow::{Edge, FlowAction, Grain};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path as StdPath, PathBuf};
@@ -1001,7 +1001,14 @@ fn mission_to_run(
     // from one source. Add a new field here and it reads this pool too.
     let unambiguous_sessions: Vec<(&str, &SessionAgg)> =
         sessions.iter().copied().filter(|(_, s)| !s.is_ambiguous()).collect();
-    let representative = earliest_by_start(&unambiguous_sessions);
+    // (contract 8) The run's own session, the one its `run.start` opened,
+    // represents the row: its machine, start and drill target are the
+    // run's, whatever an execution's clock says. A mission with none (its
+    // start outside the window, or no run bookend written) falls back to
+    // the earliest session.
+    let run_sessions: Vec<(&str, &SessionAgg)> =
+        unambiguous_sessions.iter().copied().filter(|(_, s)| s.run_grain).collect();
+    let representative = earliest_by_start(&run_sessions).or_else(|| earliest_by_start(&unambiguous_sessions));
     // TODO(step-4): a mission whose dispatches span MULTIPLE distinct
     // endpoints (mixed local/remote seats across phases) collapses to one
     // representative endpoint here — the Runs lens can't yet show per-seat
@@ -1026,13 +1033,11 @@ fn mission_to_run(
             .collect::<Vec<_>>(),
     );
 
-    // (#1877 regression) `representative` (earliest_by_start) is right for
-    // anything that genuinely is about ORDERING — `start_ts` below really
-    // should come from the mission's earliest dispatch. Role and model are
-    // ATTRIBUTE lookups, not ordering, and the #1877 whole-run bookend is
-    // deliberately the mission's earliest record (it opens before any step
-    // dispatches) — so reading role/model only off `representative` shows
-    // a stale-by-construction value whenever the bookend wins the pick.
+    // (#1877 regression) `representative` (the run session) is right for
+    // the row's machine and start. Role and model are ATTRIBUTE lookups:
+    // the run bookend carries a config id as its handle and no model, so
+    // reading them only off `representative` shows a stale-by-construction
+    // value.
     // `sessions` is built from a HashSet (`candidate_ids`), so sorting a
     // copy by `start_ts` (rather than trusting HashSet iteration order)
     // keeps "first" deterministic; ISO-8601 sorts correctly as a plain
@@ -1061,26 +1066,21 @@ fn mission_to_run(
         unambiguous_sessions.iter().map(|(_, s)| *s).filter(|s| s.start_ts.is_some()).collect();
     sessions_by_start.sort_by(|a, b| a.start_ts.cmp(&b.start_ts));
 
-    // Model is simple: the bookend's own record NEVER carries one
-    // (`mission_bookend_record` passes `model: None` unconditionally, one
-    // dispatch bookend spans however many per-step model calls a mission
-    // makes), so a plain "first session that resolved one" — same idiom
-    // as `flow_mission_to_run`'s route/model fallback above — is enough.
+    // Model is simple: the run bookend NEVER carries one (a run spans
+    // however many executions it makes), so a plain "first session that
+    // resolved one" — same idiom as `flow_mission_to_run`'s route/model
+    // fallback above — is enough.
     let model = sessions_by_start.iter().find_map(|s| s.model.clone());
 
-    // Role needs one more step: the bookend's `handle` is the LAUNCHED
-    // CONFIG ID (`mission_bookend_record`'s `role_id` param), which is a
-    // real, non-empty string — so a plain find_map "resolves" it
-    // immediately and never reaches the coder/reviewer/etc. step's actual
-    // role. Prefer the first NON-bookend session (source != "mission")
-    // that resolved a role; only reach for the bookend's own placeholder
-    // if nothing else did — which is the honest outcome for a Tier-1-only
-    // procedural mission that never dispatches a model at all (#1877's own
-    // named gap 2), where the bookend's config-id label is the best
-    // available information, not a display bug.
-    let is_bookend = |s: &&SessionAgg| s.source.as_deref() == Some("mission");
+    // Role needs one more step: the run bookend's `handle` is the LAUNCHED
+    // CONFIG ID (`run_bookend_record`), a real, non-empty string, so a plain
+    // find_map would "resolve" it and never reach an execution's actual
+    // role. Prefer the first session that is not the run's own that
+    // resolved a role; fall back to the run's config-id label only when
+    // nothing else did, the honest outcome for a Tier-1-only procedural
+    // mission that runs no role at all (#1877's named gap 2).
     let role = dispatch_role
-        .or_else(|| sessions_by_start.iter().filter(|s| !is_bookend(s)).find_map(|s| s.role.clone()))
+        .or_else(|| sessions_by_start.iter().filter(|s| !s.run_grain).find_map(|s| s.role.clone()))
         .or_else(|| sessions_by_start.iter().find_map(|s| s.role.clone()));
 
     // `machine` deliberately stays representative-only, unlike role/model
@@ -1828,9 +1828,9 @@ pub fn runs_policy() -> RunsPolicy {
     RunsPolicy { stale_after_ms: stale_after_ms(), budget_wait_grace_ms: BUDGET_WAIT_GRACE_MS }
 }
 
-/// (#2413) Best-effort, LOCAL-ONLY: is at least one dispatch bookend-open
-/// (a `dispatch start` with no matching `dispatch complete`/`error` yet,
-/// within [`stale_after_ms`] of `now_ms`) on THIS machine? Feeds the
+/// (#2413) Best-effort, LOCAL-ONLY: is at least one run or execution
+/// bookend-open (a `run.start` / `dispatch.start` with no matching terminal
+/// yet, within [`stale_after_ms`] of `now_ms`) on THIS machine? Feeds the
 /// daemon host sampler's live-vs-idle emission cadence
 /// (`host_sampler::spawn`) — reusing the SAME dispatch bookends and the SAME
 /// staleness budget [`session_is_live`] already judges run liveness by,
@@ -1860,26 +1860,22 @@ fn any_dispatch_live_in(dir: &std::path::Path, day: &str, now_ms: u64, max_age_m
     let path = dir.join(format!("{day}.jsonl"));
     let Ok(text) = std::fs::read_to_string(&path) else { return false };
     let mut last_activity_ms: HashMap<String, u64> = HashMap::new();
-    // (self-QA catch, #2413) A session is "open" ONLY from its OWN
-    // `dispatch start` bookend through its OWN `dispatch complete`/`error`
-    // — never inferred from mere PRESENCE in the file. The first cut of
-    // this function tracked `last_activity_ms` for every record carrying a
-    // `session_id`, live-checking "not yet seen a terminal" — which
-    // wrongly read a `mission close` record's `mission-<id>` session (a
-    // mission session is never `dispatch`-terminated at all) as an
-    // eternally-open dispatch, always live. Red-proved against a fixture
-    // with only `mission start`/`mission close` records: the buggy
-    // version returned `true`; this one correctly returns `false`.
+    // (self-QA catch, #2413) A session is "open" ONLY from its OWN bookend
+    // start through its OWN terminal, never inferred from mere PRESENCE in
+    // the file: a session holding only `mission.start`/`mission.close` is
+    // never open. Red-proved against a fixture with only those records: a
+    // presence-based version returned `true`; this one returns `false`.
     let mut open: HashSet<String> = HashSet::new();
     for line in text.lines() {
         let Some(rec) = darkmux_flow::reader::parse_record(line) else { continue };
         let Some(sid) = rec.session_id.clone() else { continue };
         let Some(ts_secs) = parse_flow_ts(&rec.ts) else { continue };
         let ts_ms = ts_secs.saturating_mul(1000);
-        if rec.action == FlowAction::DispatchStart {
+        let edge = rec.action.bookend().map(|b| b.edge);
+        if edge == Some(Edge::Start) {
             open.insert(sid.clone());
             last_activity_ms.insert(sid, ts_ms);
-        } else if matches!(rec.action, FlowAction::DispatchComplete | FlowAction::DispatchError) {
+        } else if edge.is_some_and(Edge::is_terminal) {
             open.remove(&sid);
         } else if open.contains(&sid) {
             // Any OTHER record for an ALREADY-open dispatch session is
@@ -2063,14 +2059,10 @@ struct SessionAgg {
     role: Option<String>,
     model: Option<String>,
     machine: Option<String>,
-    /// The record's `source` field (e.g. `"crew_dispatch"`, `"review"`, or
-    /// the #1877 whole-run bookend's `"mission"`) — tracked so
-    /// [`mission_to_run`]'s role/model fallback can tell a real per-step
-    /// dispatch session apart from the mission-level bookend, whose
-    /// `handle` is the launched config id (a real string, never blank),
-    /// not an actual per-step role. Simple presence/absence (`role.is_
-    /// none()`) can't make that distinction — only the source can.
-    source: Option<String>,
+    /// The session holds a run bookend (`run.*`): it is a run's own session,
+    /// whose `handle` is the launched config id, not a role.
+    /// [`mission_to_run`]'s role fallback skips it for a real execution's.
+    run_grain: bool,
     /// From the FIRST non-empty `payload.endpoint` seen on any dispatch
     /// lifecycle record (start, complete, OR error) for this session — the
     /// #1518 lesson applied server-side: the review pipeline stamps
@@ -2274,24 +2266,14 @@ fn fold_session_record(idx: &mut HashMap<String, SessionAgg>, v: &serde_json::Va
             }
         }
     }
-    if agg.source.is_none() {
-        if let Some(src) = v.get("source").and_then(|s| s.as_str()) {
-            if !src.is_empty() {
-                agg.source = Some(src.to_string());
-            }
-        }
-    }
-
     let action = darkmux_flow::reader::action_of(v);
     let ts = v.get("ts").and_then(|t| t.as_str()).unwrap_or("");
+    let grain = action.as_ref().and_then(FlowAction::bookend).map(|b| b.grain);
+    agg.run_grain |= grain == Some(Grain::Run);
 
-    // Check EVERY dispatch lifecycle record's payload for `endpoint` —
-    // not just start (#1518, applied server-side; see `SessionAgg::endpoint`'s doc).
-    let is_bookend = matches!(
-        action,
-        Some(FlowAction::DispatchStart | FlowAction::DispatchComplete | FlowAction::DispatchError)
-    );
-    if agg.endpoint.is_none() && is_bookend {
+    // Check EVERY execution bookend's payload for `endpoint`, not just the
+    // start (#1518, applied server-side; see `SessionAgg::endpoint`'s doc).
+    if agg.endpoint.is_none() && grain == Some(Grain::Execution) {
         if let Some(ep) = v
             .get("payload")
             .and_then(|p| p.get("endpoint"))
@@ -5766,14 +5748,72 @@ mod tests {
         );
     }
 
-    /// (#1877 regression, fixed here) The whole-run `dispatch start`
-    /// bookend `launch()` now emits unconditionally opens BEFORE any step
-    /// dispatches — so it is always the mission's earliest session, and
-    /// wins `earliest_by_start`'s pick as `representative`. Its record
-    /// carries `handle = <launched config id>` (a real, non-empty string
-    /// — never the actual per-step role) and NO `model` at all
-    /// (`mission_bookend_record` always passes `model: None`; one bookend
-    /// spans however many per-step model calls the mission makes).
+    /// A 3-item map step is ONE run row and THREE executions: each item
+    /// names its own execution, endpoint and tokens, and the run's tokens are
+    /// their sum. (A flow-only mission: the daemon has no durable record of
+    /// it, as for a run on a peer machine.)
+    #[test]
+    #[serial_test::serial]
+    fn build_runs_a_three_item_map_is_one_row_and_three_executions() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let session = darkmux_types::session_id::SessionId::task(darkmux_types::session_id::RunId::mission("m3").unwrap(), "probe").wire();
+        let now = darkmux_flow::ts_utc_now();
+        let mut records = vec![serde_json::json!({
+            "ts": now, "action": "run.start", "handle": "review", "mission_id": "m3",
+            "session_id": darkmux_types::session_id::SessionId::run(darkmux_types::session_id::RunId::mission("m3").unwrap()).wire(),
+        })];
+        for i in 1..=3u64 {
+            let (exec, endpoint) = (format!("exec-{i}"), format!("azure:seat-{i}.example.com/gpt-4o"));
+            let common = |action: &str| serde_json::json!({
+                "ts": now, "action": action, "handle": "probe-1", "mission_id": "m3",
+                "session_id": session, "execution_id": exec,
+            });
+            let mut start = common("dispatch.start");
+            start["payload"] = serde_json::json!({ "endpoint": endpoint, "item_index": i - 1 });
+            let mut usage = common("telemetry.tokens");
+            usage["category"] = serde_json::json!("telemetry");
+            usage["source"] = serde_json::json!("tokens");
+            usage["payload"] = serde_json::json!({
+                "call_kind": "map_item", "purpose": "work", "endpoint": endpoint,
+                "requested_model": "gpt-4o", "token_source": "provider", "total_tokens": 10 * i,
+            });
+            let mut done = common("dispatch.complete");
+            done["payload"] = serde_json::json!({ "endpoint": endpoint, "result_class": "ok" });
+            records.extend([start, usage, done]);
+        }
+        write_day_file(flows.path(), &today(), &records);
+
+        let out = build_runs_with_usage(flows.path(), None, &[], None);
+        assert_eq!(out.runs.len(), 1, "one row for the whole map, not one per execution: {:?}", out.runs);
+        assert_eq!(out.runs[0].id, "m3");
+        assert_eq!(out.runs[0].tokens, Some(60), "the run is the sum of its three executions");
+        let mut seats: Vec<(String, u64)> = out
+            .usage
+            .groups
+            .iter()
+            .map(|g| (g.endpoint.clone().expect("each execution's endpoint"), g.total()))
+            .collect();
+        seats.sort();
+        assert_eq!(
+            seats,
+            [
+                ("azure:seat-1.example.com/gpt-4o".to_string(), 10),
+                ("azure:seat-2.example.com/gpt-4o".to_string(), 20),
+                ("azure:seat-3.example.com/gpt-4o".to_string(), 30),
+            ],
+            "three executions, each with its own endpoint and tokens"
+        );
+    }
+
+    /// (#1877 regression, fixed here) The run bookend `launch()` emits
+    /// opens BEFORE any step dispatches, and its session is the row's
+    /// representative. Its record carries `handle = <launched config id>`
+    /// (a real, non-empty string, never an execution's role) and NO `model`
+    /// at all (one run spans however many executions it makes). This
+    /// fixture is a pre-4.0 archive: the whole-run bookend written as
+    /// `dispatch.start` with `source: "mission"`, which the reader serves as
+    /// `run.start`, so the row reads the same from an old day file.
     /// Reading role/model straight off `representative` therefore shows
     /// the config id as "role" and blanks "model" on the dashboard for
     /// every mission the new bookend touches — a real, operator-visible
@@ -5821,13 +5861,11 @@ mod tests {
             flows.path(),
             &today(),
             &[
-                // The #1877 whole-run bookend — matches `mission_bookend_record`'s
-                // real shape: `handle` = the launched config id, `session_id` =
-                // `mission_id`, `source: "mission"`, no `model`. Earliest ts, so
-                // it wins the `earliest_by_start` pick. `machine_id` present, as
-                // it would be in production (`darkmux_flow::record` auto-stamps
-                // it on every record whose caller left it unset — not something
-                // `mission_bookend_record` itself sets).
+                // The pre-4.0 whole-run bookend: `handle` = the launched config
+                // id, `session_id` = `mission_id`, `source: "mission"`, no
+                // `model`. `machine_id` present, as it would be in production
+                // (`darkmux_flow::record` auto-stamps it on every record whose
+                // caller left it unset).
                 serde_json::json!({
                     "ts": "2026-01-01T08:00:00Z",
                     "action": "dispatch.start",
@@ -5880,9 +5918,9 @@ mod tests {
         // (#1915) `session_id` follows the SAME representative-only rule as
         // `machine` above — the bookend's own id, not the later coder
         // session's, and not the mission's own id (which happens to be the
-        // same string here by construction, `mission_bookend_record`'s own
-        // shape — pinned as "the representative session's id" rather than
-        // "the mission id" so the two don't get silently conflated).
+        // same string here by construction, the pre-4.0 bookend's own shape —
+        // pinned as "the representative session's id" rather than "the
+        // mission id" so the two don't get silently conflated).
         assert_eq!(runs[0].session_id.as_deref(), Some("bookend-mission-1"), "session_id must be the representative (earliest) session's own id: {runs:?}");
 
         // Ordering is untouched by this fix: start_ts still comes from the
@@ -5892,6 +5930,46 @@ mod tests {
             parse_flow_ts("2026-01-01T08:00:00Z"),
             "start_ts must still come from the earliest session — only role/model attribution changed: {runs:?}"
         );
+    }
+
+    /// (contract 8) The runs board's representative is the run's own
+    /// session, the one `run.start` opened, even when an execution's clock
+    /// put its start earlier (a fleet peer with skew): the row's machine,
+    /// start and drill target are the run's.
+    #[test]
+    #[serial_test::serial]
+    fn build_runs_the_representative_is_the_run_session_not_the_earliest() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let mut mission = minimal_mission(
+            "rep-mission",
+            vec!["p-rep".to_string()],
+            Some(MissionSpec { config_id: "review".to_string(), inputs_fingerprint: "fpr".to_string(), origin: None }),
+        );
+        mission.started_ts = None;
+        mission.machine = None;
+        darkmux_crew::lifecycle::save_mission(&mission).unwrap();
+        write_day_file(
+            flows.path(),
+            &today(),
+            &[
+                serde_json::json!({
+                    "ts": "2026-01-01T07:00:00Z", "action": "dispatch.start", "session_id": "rep-mission.task.probe",
+                    "mission_id": "rep-mission", "handle": "reviewer", "machine_id": "skewed-peer",
+                }),
+                serde_json::json!({
+                    "ts": "2026-01-01T08:00:00Z", "action": "run.start", "session_id": "rep-mission.run",
+                    "mission_id": "rep-mission", "handle": "review", "machine_id": "studio",
+                }),
+            ],
+        );
+        let runs = build_runs(flows.path(), None, &[]);
+        let row = runs.iter().find(|r| r.id == "rep-mission").expect("the mission's row");
+        assert_eq!(row.session_id.as_deref(), Some("rep-mission.run"), "{row:?}");
+        assert_eq!(row.machine.as_deref(), Some("studio"), "{row:?}");
+        assert_eq!(row.started_ts, parse_flow_ts("2026-01-01T08:00:00Z"), "{row:?}");
+        assert_eq!(row.role.as_deref(), Some("reviewer"), "the role is an execution's, never the run's config id: {row:?}");
+        assert_eq!(runs.len(), 1, "one run row, the execution session is the mission's, not a ghost: {runs:?}");
     }
 
     /// (#1918) The SAME uniform guard applied to the LOCAL tracked-mission
@@ -5966,7 +6044,6 @@ mod tests {
                     "session_id": "collision-mission-1",
                     "handle": "coder-phase",
                     "mission_id": "collision-mission-1",
-                    "source": "mission",
                     "machine_id": "studio",
                     "payload": { "endpoint": "tainted-endpoint" },
                 }),
@@ -6080,7 +6157,6 @@ mod tests {
                     "session_id": "ambig-bookend-mission",
                     "handle": "coder-phase",
                     "mission_id": "ambig-bookend-mission",
-                    "source": "mission",
                     "machine_id": "stale-bookend-machine",
                     // (#2558) An endpoint on the tainted session, EARLIER
                     // than the coder's — `remote` is an `earliest_by_start`
@@ -6235,8 +6311,8 @@ mod tests {
             flows.path(),
             &today(),
             &[
-                // The #1877 whole-run bookend — earliest ts, wins
-                // `earliest_by_start`'s `representative` pick.
+                // A pre-4.0 whole-run bookend (read as `run.start`), the
+                // row's `representative`.
                 serde_json::json!({
                     "ts": "2026-01-01T08:00:00Z",
                     "action": "dispatch.start",

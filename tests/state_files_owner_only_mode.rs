@@ -365,6 +365,8 @@ impl darkmux_flow::FlowSink for NullSink {
 }
 
 fn sample_record(action: darkmux_flow::FlowAction) -> darkmux_flow::FlowRecord {
+    let execution_id = (action.grain() == Some(darkmux_flow::Grain::Execution))
+        .then(darkmux_types::execution_id::ExecutionId::mint);
     darkmux_flow::FlowRecord {
         ts: darkmux_flow::ts_utc_now(),
         level: darkmux_flow::Level::Info,
@@ -375,6 +377,7 @@ fn sample_record(action: darkmux_flow::FlowAction) -> darkmux_flow::FlowRecord {
         handle: "h".to_string(),
         phase_id: None,
         session_id: None,
+        execution_id,
         source: None,
         model: None,
         reasoning: None,
@@ -508,8 +511,8 @@ fn finding_store_is_owner_only_mode() {
     assert_umask_leaves_a_bare_create_readable(tmp.path());
     let root = tmp.path().join("findings");
     let record = darkmux_crew::findings::FindingRecord {
-        key: "sess-1/1".to_string(),
-        dispatch: "sess-1".to_string(),
+        key: "exec-1/1".to_string(),
+        execution: "exec-1".to_string(),
         seq: 1,
         ts: darkmux_flow::ts_utc_now(),
         tool_name: "report_finding".to_string(),
@@ -535,7 +538,7 @@ fn finding_store_is_owner_only_mode() {
         "setup guard: the finding must actually have been written for the mode assertion below to mean anything"
     );
 
-    let path = darkmux_crew::findings::record_path_at(&root, "sess-1", 1);
+    let path = darkmux_crew::findings::record_path_at(&root, "exec-1", 1);
     assert!(path.exists(), "finding.json not at {}", path.display());
     assert_eq!(
         mode_bits(&path),
@@ -627,6 +630,7 @@ fn flow_jsonl_is_owner_only_mode() {
         handle: "coder".to_string(),
         phase_id: None,
         session_id: None,
+        execution_id: Some(darkmux_types::execution_id::ExecutionId::mint()),
         source: None,
         model: None,
         reasoning: None,

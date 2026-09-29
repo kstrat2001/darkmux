@@ -179,6 +179,10 @@ fn envelope(result: &str, prompt: u64, completion: u64, wall_ms: u64) -> String 
     .to_string()
 }
 
+/// The execution every `ok_result` stands for: the id a finding's key leads
+/// with.
+const UNIT_EXECUTION: &str = "exec-unit-test";
+
 fn ok_result(stdout: String, out: PathBuf) -> Result<DispatchResult> {
     ok_result_with(stdout, out, TrajectoryFold::default())
 }
@@ -189,6 +193,7 @@ fn ok_result_with(stdout: String, out: PathBuf, trajectory: TrajectoryFold) -> R
         stdout,
         stderr: String::new(),
         session_id: darkmux_types::session_id::SessionId::run(darkmux_types::session_id::RunId::mission(MISSION).unwrap()),
+        execution: Some(darkmux_types::execution_id::ExecutionId::parse(UNIT_EXECUTION).unwrap()),
         out_dir: Some(out),
         trajectory: Some(trajectory),
     })
@@ -203,6 +208,7 @@ fn interpret_dispatch_result_reads_the_envelope_metrics() {
         stdout: envelope("stop", 100, 20, 5_000),
         stderr: String::new(),
         session_id: darkmux_types::session_id::SessionId::run(darkmux_types::session_id::RunId::mission(MISSION).unwrap()),
+        execution: None,
         out_dir: None,
         trajectory: None,
     };
@@ -799,6 +805,7 @@ fn two_rules_growing_unit_u_0001_do_not_collide_on_disk() {
             stdout: envelope("stop", 10, 5, 100),
             stderr: String::new(),
             session_id: opts.session,
+            execution: None,
             out_dir: Some(dir),
             trajectory: Some(TrajectoryFold::default()),
         })
@@ -2488,15 +2495,15 @@ fn a_units_outcome_names_every_finding_it_recorded_by_store_key() {
 
     assert_eq!(body.findings, 2, "the count and the roster come from ONE read");
     assert_eq!(body.finding_refs.len(), 2, "one ref per accepted finding");
-    let session = unit_session("unnamed-predicate", "u-0001");
+    let session = UNIT_EXECUTION;
     assert_eq!(
         body.finding_refs.iter().map(|r| r.key.as_str()).collect::<Vec<_>>(),
         vec![format!("{session}/1"), format!("{session}/2")],
-        "`<dispatch>/<emit_seq>`, 1-based over non-empty lines — the runtime's own ordinal"
+        "`<execution>/<emit_seq>`, 1-based over non-empty lines — the runtime's own ordinal"
     );
     assert_eq!(
         body.finding_refs[0].id,
-        format!("{}-1", unit_session("unnamed-predicate", "u-0001")),
+        format!("{UNIT_EXECUTION}-1"),
         "`/` swapped for `-`: the id becomes a task id suffix"
     );
     assert_eq!(body.finding_refs[0].file.as_deref(), Some("src/a.ts"), "the container prefix is stripped");
@@ -2513,14 +2520,14 @@ fn a_units_outcome_names_every_finding_it_recorded_by_store_key() {
     // the store the dispatch tailer writes.
     let store = TempDir::new().unwrap();
     for r in &body.finding_refs {
-        let (dispatch, seq) =
+        let (execution, seq) =
             darkmux_crew::findings::parse_key(&r.key).unwrap_or_else(|| panic!("`{}` must be a finding key", r.key));
-        assert_eq!(dispatch, session);
+        assert_eq!(execution, session);
         darkmux_crew::findings::materialize(
             store.path(),
             &darkmux_crew::findings::FindingRecord {
                 key: r.key.clone(),
-                dispatch: dispatch.clone(),
+                execution: execution.clone(),
                 seq,
                 ts: "2026-09-04T00:00:00Z".into(),
                 tool_name: "create_finding".into(),
@@ -2540,7 +2547,7 @@ fn a_units_outcome_names_every_finding_it_recorded_by_store_key() {
             },
         )
         .expect("the tailer's own write");
-        let back = darkmux_crew::findings::load_at(store.path(), &dispatch, seq)
+        let back = darkmux_crew::findings::load_at(store.path(), &execution, seq)
             .unwrap()
             .unwrap_or_else(|| panic!("`{}` must resolve — `brief_refs` refuses a key that does not", r.key));
         assert_eq!(back.key, r.key);
@@ -2632,7 +2639,7 @@ fn a_key_keeps_the_runtimes_ordinal_even_when_a_line_does_not_parse() {
         .body;
 
     assert_eq!(body.findings, 2, "only the readable lines are counted");
-    let session = unit_session("unnamed-predicate", "u-0001");
+    let session = UNIT_EXECUTION;
     assert_eq!(
         body.finding_refs.iter().map(|r| r.key.as_str()).collect::<Vec<_>>(),
         vec![format!("{session}/1"), format!("{session}/3")],
@@ -2659,8 +2666,8 @@ fn a_unit_id_holding_a_separator_still_names_its_findings() {
         .unwrap()
         .body;
 
-    let session = unit_session("unnamed-predicate", "u/0001");
-    assert!(darkmux_crew::findings::is_safe_dispatch_segment(&session), "the wire escapes the separator: {session}");
+    let session = UNIT_EXECUTION;
+    assert!(darkmux_crew::findings::is_safe_execution_segment(session), "a minted id is one path segment: {session}");
     assert_eq!(body.findings, 2);
     assert_eq!(
         body.finding_refs.iter().map(|r| r.key.as_str()).collect::<Vec<_>>(),

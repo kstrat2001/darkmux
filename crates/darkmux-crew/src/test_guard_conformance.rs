@@ -261,6 +261,7 @@ mod tests {
                 handle: "conformance".to_string(),
                 phase_id: None,
                 session_id: Some("sess-conformance".to_string()),
+                execution_id: Some(darkmux_types::execution_id::ExecutionId::mint()),
                 source: Some("crew_dispatch".to_string()),
                 model: None,
                 reasoning: None,

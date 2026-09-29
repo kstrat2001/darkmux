@@ -235,6 +235,18 @@ fn container_free_single_shot_dispatch_round_trips_through_a_real_http_mock_serv
     assert!(saw_start, "no dispatch.start flow record found for session {session_id}");
     assert!(saw_complete, "no terminal dispatch.complete/dispatch.error flow record found for session {session_id}");
 
+    // One call is one role execution: its bookends and its usage record all
+    // name the id the result carries, and no other.
+    let execution = result.execution.as_ref().expect("a local single-shot dispatch is one execution");
+    assert!(!records.is_empty());
+    for record in &records {
+        assert_eq!(
+            record["execution_id"],
+            execution.as_str(),
+            "every record of the execution names it: {record:?}"
+        );
+    }
+
     // (#2902 step 1a, usage conformance: `dispatch_local_single_shot`) The
     // one model call emits exactly one `telemetry.tokens` usage record with
     // the canonical fields. The same check the in-crate conformance tests

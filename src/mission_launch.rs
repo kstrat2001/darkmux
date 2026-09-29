@@ -286,48 +286,47 @@ fn emit_launch_cmd_audit(
     crate::acp_panel::emit_cmd_audit(verb, args, &cwd, gate_confirmed, success, run);
 }
 
-/// (#1877 — "no blind runs" is now PRESCRIBED for the generic launch path,
-/// not opt-in per config) Build a whole-run `dispatch *` bookend record —
-/// the same coarse liveness edge the now-deleted dedicated review
-/// launcher's own `review_bookend_record`/`with_dispatch_bookends` used to
-/// give `review` privately, before it branched out and minted no
-/// `mission_id` of its own. Generalized here so every config `launch` runs
-/// gets it unconditionally — `review` reaches this function the same as
-/// any other config now (#2310 P4d — the funnel deletion).
-///
-/// `source = "mission"` — distinct from the per-model-dispatch FROZEN
-/// `"crew_dispatch"` value (`build_dispatch_record_with_payload`'s own
-/// doc — an individual coder/verify/worktree step's OWN dispatch already
-/// carries that) and from review's own `"review"`, so the viewer can tell
-/// a whole-run bookend apart from either: this is not one model call, and
-/// not a review run — it is "did this mission's dispatch work start and
-/// finish."
-///
-/// `pub(crate)` (#1877 QA must-fix 1): `src/acp_panel.rs::run_ephemeral`
-/// reuses this SAME builder for its own whole-run bookend pair — the
-/// `session_id`/`mission_id` param happens to be a minted per-invocation
-/// `correlation_id` there rather than a real mission id, but the shape
-/// (config-id handle, no model, `source: "mission"`) is identical, and a
-/// second hand-rolled copy is exactly the drift #1685 QA MUST-FIX 2
-/// already closed for `emit_cmd_audit`.
-pub(crate) fn mission_bookend_record(
+/// A record on the run's own session ([`SessionId::run`]) under the
+/// launched config's id: the run bookends ([`run_bookend_record`]) and the
+/// run's own lifecycle records (`mission.grow`). `pub(crate)` because
+/// `acp_panel::run_ephemeral` brackets its panel runs with the same records.
+pub(crate) fn run_record(
     level: flow::Level,
     action: darkmux_flow::FlowAction,
     config_id: &str,
     run: &RunId,
     payload: serde_json::Value,
 ) -> flow::FlowRecord {
-    let mut record = crew::dispatch::build_dispatch_record_with_payload(
-        level,
-        action,
-        config_id,
-        &SessionId::run(run.clone()),
-        None,
-        None,
-        Some(payload),
-    );
-    record.source = Some("mission".to_string());
-    record
+    flow::FlowRecord {
+        payload: Some(payload),
+        ..flow::FlowRecord::for_session(
+            &SessionId::run(run.clone()),
+            level,
+            flow::Category::Work,
+            flow::Stage::Dispatch,
+            action,
+            config_id,
+        )
+    }
+}
+
+/// (#1877, contract 8) The run's liveness bookend at `edge`: `run.start` as
+/// the launch begins, `run.complete` or `run.error` on every exit (the
+/// callers hold it in a [`flow::BookendGuard`], so a panic or an early
+/// return still writes `run.error`). Every launch gets the pair, whether
+/// its graph dispatches a model or only runs shell steps; the role
+/// executions inside it bookend as `dispatch.*` on their own sessions.
+pub(crate) fn run_bookend_record(
+    edge: flow::Edge,
+    config_id: &str,
+    run: &RunId,
+    payload: serde_json::Value,
+) -> flow::FlowRecord {
+    let level = match edge {
+        flow::Edge::Start | flow::Edge::Complete => flow::Level::Info,
+        flow::Edge::Error => flow::Level::Error,
+    };
+    run_record(level, flow::Bookend { grain: flow::Grain::Run, edge }.action(), config_id, run, payload)
 }
 
 /// (#2131 review round 2, item 5) RAII stop-signal for `launch`'s own
@@ -1198,81 +1197,33 @@ pub fn launch(
         None
     };
 
-    // (#1877 "no blind runs" — the whole-run dispatch bookend is
-    // PRESCRIBED here, not opt-in) Opened unconditionally below, for EVERY
-    // config that reaches this point — regardless of whether its graph
-    // declares a model-dispatching step kind or is Tier-1-only
-    // procedural/shell work. `review` reaches this line too, the same as
-    // any other config (#2310 P4d — the funnel deletion): before that,
-    // `config_uses_review_kinds` branched it out far above, before this
-    // function's own `--input`/`--param` collection even ran, because
-    // review opened its own bookend privately (the now-deleted dedicated
-    // review launcher / `darkmux_lab::lab::review::run_review_graph`,
-    // itself since removed). With that private construction gone,
-    // `review`'s bookend rides this same shared construction — no
-    // double-bookend risk to guard against, since there is only one
-    // construction left.
-    //
-    // (#2413 round 2 M3) This function used to ALSO construct a per-run
-    // `HostTelemetrySampler` right here, draining it into `telemetry.process`
-    // records at every emission point below. That construction
-    // is deleted: host cpu/ram/gpu samples now come from the ONE
-    // machine-scoped sampler (`darkmux_crew::host_sampler_lock`,
-    // `dispatch_internal.rs`'s always-on sampler thread, or `darkmux
-    // serve`'s daemon ring), and a consumer joins them to this run by
-    // `machine_uid` + a time window (`darkmux-serve`'s `join_host_samples_
-    // into_session_records`) rather than this function draining a sampler
-    // of its own. There is nothing left for this function to construct,
-    // drain, or forward for telemetry — only the bookend below is still
-    // this function's job.
-    let mut dispatch_sink = |record: flow::FlowRecord| {
+    // (#1877 "no blind runs", contract 8) The run bookend, opened for EVERY
+    // config that reaches this point, whether its graph dispatches a model
+    // or only runs procedural/shell steps. Host samples are not this
+    // function's job: the one machine-scoped sampler writes them and a
+    // reader joins them to this run by `machine_uid` and time.
+    let mut run_sink = |record: flow::FlowRecord| {
         let _ = flow::record(record);
     };
     let run_for_abort = run.clone();
     let config_id_for_abort = config_id.to_string();
-    // `BookendGuard`'s Drop fires this `on_abort` closure — building the
-    // "dispatch error" abort record — for any exit between `open()` below
-    // and a matching `close()`: an early `?`-return this function doesn't
-    // already reconcile explicitly, or a genuine panic (contract 2 — RAII-
-    // guarded on all exit paths). Every KNOWN exit point below (the
-    // scheduler error, the coder-phase gate, and the gate-less finish)
-    // calls `bookend.close(...)` explicitly with the real outcome; this is
-    // strictly the backstop for the unexpected case.
-    //
-    // (#2413 M3) The paragraph that used to sit here named a gap in a
-    // per-run telemetry drain this function no longer has: `on_abort`
-    // builds exactly one record and had no way
-    // to also flush a `HostTelemetrySampler`'s buffered samples on the
-    // panic/early-return backstop path. That sampler construction is
-    // deleted (#2413 M3) — host samples come from the machine-scoped
-    // sampler now, joined to this run by time after the fact, not drained
-    // by this function at all — so there is nothing left for `on_abort`
-    // to lose. The bookend's own liveness record (the actual contract-2
-    // obligation) is unaffected either way.
-    let mut bookend = flow::BookendGuard::new(&mut dispatch_sink, move |_id, _kind| {
-        mission_bookend_record(
-            flow::Level::Error,
-            darkmux_flow::FlowAction::DispatchError,
+    // The guard's Drop writes `run.error` for any exit between `open` and a
+    // matching `close` (contract 2: RAII on every exit path): an early
+    // `?`-return, or a panic. Every KNOWN exit below (the scheduler error,
+    // the coder-phase gate and the gate-less finish) closes it explicitly
+    // with the real outcome; Drop is the backstop for the unexpected case.
+    let mut bookend = flow::BookendGuard::new(&mut run_sink, move |_id, _kind| {
+        run_bookend_record(
+            flow::Edge::Error,
             &config_id_for_abort,
             &run_for_abort,
             serde_json::json!({
-                "runtime": "mission",
                 "result_class": "error",
-                "error": "mission dispatch terminated before completion (early return or panic)",
+                "error": "run terminated before completion (early return or panic)",
             }),
         )
     });
-    bookend.open(
-        "dispatch",
-        "dispatch",
-        mission_bookend_record(
-            flow::Level::Info,
-            darkmux_flow::FlowAction::DispatchStart,
-            config_id,
-            &run,
-            serde_json::json!({ "runtime": "mission" }),
-        ),
-    );
+    bookend.open("run", "run", run_bookend_record(flow::Edge::Start, config_id, &run, serde_json::json!({})));
     // (#2877, pre-PR review) The mission's own run session beats presence for
     // as long as the launch runs. Its executions beat only while a model call
     // is live, so during the steps between them (a summary, a mod wait, a test
@@ -1485,7 +1436,7 @@ pub fn launch(
                     } else if event.minted.is_empty() {
                         payload["reason"] = serde_json::json!("grew_nothing");
                     }
-                    bookend.emit_now(mission_bookend_record(
+                    bookend.emit_now(run_record(
                         flow::Level::Info,
                         darkmux_flow::FlowAction::MissionGrow,
                         config_id,
@@ -1709,14 +1660,12 @@ pub fn launch(
             reconcile_and_finalize_on_error(&mission_id, config, &real_phase_ids, &tasks, &mut steps, &e)
         });
         bookend.close(
-            "dispatch",
-            mission_bookend_record(
-                flow::Level::Error,
-                darkmux_flow::FlowAction::DispatchError,
+            "run",
+            run_bookend_record(
+                flow::Edge::Error,
                 config_id,
                 &run,
                 serde_json::json!({
-                    "runtime": "mission",
                     "result_class": "error",
                     "error": e.to_string(),
                 }),
@@ -1790,7 +1739,7 @@ pub fn launch(
         // gate-reached; see `coder_branch_terminal_bookend`'s own doc for
         // why the bookend record itself keys on `reached_gate` instead.
         let (_reached_gate, record) = coder_branch_terminal_bookend(&outcome, config_id, &run);
-        bookend.close("dispatch", record);
+        bookend.close("run", record);
         emit_launch_cmd_audit(config, &collected, &run, gate_confirmed.get(), success);
         // (#2131) A no-op unless a signal was actually observed — see the
         // scheduler-error branch above for what this does when one was.
@@ -1905,14 +1854,12 @@ pub fn launch(
     // (#1877) Explicit close on the gate-less generic finish — the third
     // and last KNOWN exit this guard covers.
     bookend.close(
-        "dispatch",
-        mission_bookend_record(
-            if exit_code == 0 { flow::Level::Info } else { flow::Level::Error },
-            if exit_code == 0 { darkmux_flow::FlowAction::DispatchComplete } else { darkmux_flow::FlowAction::DispatchError },
+        "run",
+        run_bookend_record(
+            if exit_code == 0 { flow::Edge::Complete } else { flow::Edge::Error },
             config_id,
             &run,
             serde_json::json!({
-                "runtime": "mission",
                 "result_class": if exit_code == 0 { "ok" } else { "error" },
                 "status": format!("{status:?}"),
             }),
@@ -3408,7 +3355,7 @@ fn gate_outcome_reached_no_gate(outcome: &Result<i32>) -> bool {
 /// here is gone, #2413 M3: host samples now come from the machine-scoped
 /// sampler joined to this run by time, not a drain this function performs),
 /// this function owns only the DECISION: same split responsibility
-/// `mission_bookend_record` itself already has relative to its callers.
+/// `run_bookend_record` itself already has relative to its callers.
 ///
 /// The complete-vs-error split is `reached_gate`
 /// (`!gate_outcome_reached_no_gate(outcome)`), NOT `outcome == Ok(0)` —
@@ -3416,7 +3363,7 @@ fn gate_outcome_reached_no_gate(outcome: &Result<i32>) -> bool {
 /// blockers) and `Ok(3)` (QA unavailable) both leave the mission Active at
 /// the sign-off gate, which is real dispatch work that started and
 /// FINISHED, same as a clean `Ok(0)`. Reading `outcome == Ok(0)` here
-/// instead would mismark `Ok(2)`/`Ok(3)` as `dispatch error`, flipping
+/// instead would mismark `Ok(2)`/`Ok(3)` as `run.error`, flipping
 /// those missions to Error on the Runs lens even though they are the
 /// expected "QA has findings, come look" outcome — the exact regression
 /// this function's own tests pin against.
@@ -3426,13 +3373,11 @@ fn coder_branch_terminal_bookend(
     run: &RunId,
 ) -> (bool, flow::FlowRecord) {
     let reached_gate = !gate_outcome_reached_no_gate(outcome);
-    let record = mission_bookend_record(
-        if reached_gate { flow::Level::Info } else { flow::Level::Error },
-        if reached_gate { darkmux_flow::FlowAction::DispatchComplete } else { darkmux_flow::FlowAction::DispatchError },
+    let record = run_bookend_record(
+        if reached_gate { flow::Edge::Complete } else { flow::Edge::Error },
         config_id,
         run,
         serde_json::json!({
-            "runtime": "mission",
             "result_class": if reached_gate { "ok" } else { "error" },
             "gate": "coder-phase",
         }),
@@ -5858,6 +5803,11 @@ mod tests {
     /// read raw off disk rather than through any in-process buffer, so this
     /// exercises the SAME on-disk shape a real `mission-graph` page's
     /// backfill fetch would see.
+    /// Whether a written record is a run bookend (`run.*`).
+    fn is_run_bookend(r: &serde_json::Value) -> bool {
+        darkmux_flow::reader::action_of(r).and_then(|a| a.bookend()).is_some_and(|b| b.grain == darkmux_flow::Grain::Run)
+    }
+
     fn read_all_flow_records() -> Vec<serde_json::Value> {
         let dir = std::env::var("DARKMUX_FLOWS_DIR")
             .expect("DARKMUX_FLOWS_DIR must be set by an active LaunchTestGuard");
@@ -8761,28 +8711,25 @@ mod tests {
         );
     }
 
-    // ── #1877 — telemetry + the whole-run dispatch bookend, prescribed ──
+    // ── #1877, contract 8 — the run bookend, prescribed ──────────────────
 
     #[test]
-    fn mission_bookend_record_stamps_mission_source_session_and_mission_id() {
-        let rec = mission_bookend_record(
-            flow::Level::Info,
-            darkmux_flow::FlowAction::DispatchStart,
-            "coder-phase",
-            &RunId::mission("coder-phase-123-abcdef").unwrap(),
-            serde_json::json!({ "runtime": "mission" }),
-        );
-        assert_eq!(rec.action, darkmux_flow::FlowAction::DispatchStart);
-        assert_eq!(rec.handle, "coder-phase");
-        assert_eq!(rec.session_id.as_deref(), Some("coder-phase-123-abcdef.run"));
-        assert_eq!(rec.mission_id.as_deref(), Some("coder-phase-123-abcdef"));
-        // (#1877 requirement 2) `source` must be distinct from BOTH the
-        // per-model-dispatch FROZEN `"crew_dispatch"` value and review's
-        // own `"review"` — otherwise the viewer can't tell a whole-run
-        // bookend apart from an individual model call or a review run.
-        assert_eq!(rec.source.as_deref(), Some("mission"));
-        assert_ne!(rec.source.as_deref(), Some("crew_dispatch"));
-        assert_ne!(rec.source.as_deref(), Some("review"));
+    fn run_bookend_record_is_the_run_grain_on_the_run_session() {
+        let run = RunId::mission("coder-phase-123-abcdef").unwrap();
+        for (edge, action, level) in [
+            (flow::Edge::Start, darkmux_flow::FlowAction::RunStart, "info"),
+            (flow::Edge::Complete, darkmux_flow::FlowAction::RunComplete, "info"),
+            (flow::Edge::Error, darkmux_flow::FlowAction::RunError, "error"),
+        ] {
+            let rec = run_bookend_record(edge, "coder-phase", &run, serde_json::json!({}));
+            assert_eq!(rec.action, action);
+            assert_eq!(serde_json::to_value(rec.level).unwrap(), level, "{action}");
+            assert_eq!(rec.handle, "coder-phase");
+            assert_eq!(rec.session_id.as_deref(), Some("coder-phase-123-abcdef.run"));
+            assert_eq!(rec.mission_id.as_deref(), Some("coder-phase-123-abcdef"));
+            // The action names the grain; nothing else has to.
+            assert_eq!(rec.source, None);
+        }
     }
 
     // ── #1877 QA must-fix 3 — the coder branch's terminal bookend must ──
@@ -8796,14 +8743,13 @@ mod tests {
     // `reached_gate = success` mutation named in the finding) failed
     // `coder_branch_terminal_bookend_ok_2_qa_blockers_still_reaches_the_gate`
     // and `..._ok_3_qa_unavailable_still_reaches_the_gate` below: both
-    // asserted `action == "dispatch.complete"` and instead got
-    // `"dispatch error"`.
+    // asserted the complete terminal and instead got the error one.
 
     #[test]
     fn coder_branch_terminal_bookend_ok_0_clean_reaches_the_gate() {
         let (reached_gate, rec) = coder_branch_terminal_bookend(&Ok(0), "coder-phase", &RunId::mission("m-1").unwrap());
         assert!(reached_gate);
-        assert_eq!(rec.action, darkmux_flow::FlowAction::DispatchComplete);
+        assert_eq!(rec.action, darkmux_flow::FlowAction::RunComplete);
         assert!(matches!(rec.level, flow::Level::Info), "{:?}", rec.level);
         assert_eq!(rec.payload.as_ref().unwrap()["result_class"], serde_json::json!("ok"));
         assert_eq!(rec.payload.as_ref().unwrap()["gate"], serde_json::json!("coder-phase"));
@@ -8812,12 +8758,12 @@ mod tests {
     #[test]
     fn coder_branch_terminal_bookend_ok_2_qa_blockers_still_reaches_the_gate() {
         // `coder_phase_gate_outcome`'s own table: QA found blocker(s)
-        // leaves the phase Running at the sign-off gate — real dispatch
-        // work that started and FINISHED, same as clean. Must close
-        // `dispatch complete`, never `dispatch error`.
+        // leaves the phase Running at the sign-off gate — real work that
+        // started and FINISHED, same as clean. Must close `run.complete`,
+        // never `run.error`.
         let (reached_gate, rec) = coder_branch_terminal_bookend(&Ok(2), "coder-phase", &RunId::mission("m-2").unwrap());
         assert!(reached_gate, "Ok(2) (QA blockers) must still reach the gate");
-        assert_eq!(rec.action, darkmux_flow::FlowAction::DispatchComplete);
+        assert_eq!(rec.action, darkmux_flow::FlowAction::RunComplete);
         assert!(matches!(rec.level, flow::Level::Info), "{:?}", rec.level);
     }
 
@@ -8825,7 +8771,7 @@ mod tests {
     fn coder_branch_terminal_bookend_ok_3_qa_unavailable_still_reaches_the_gate() {
         let (reached_gate, rec) = coder_branch_terminal_bookend(&Ok(3), "coder-phase", &RunId::mission("m-3").unwrap());
         assert!(reached_gate, "Ok(3) (QA unavailable) must still reach the gate");
-        assert_eq!(rec.action, darkmux_flow::FlowAction::DispatchComplete);
+        assert_eq!(rec.action, darkmux_flow::FlowAction::RunComplete);
         assert!(matches!(rec.level, flow::Level::Info), "{:?}", rec.level);
     }
 
@@ -8833,7 +8779,7 @@ mod tests {
     fn coder_branch_terminal_bookend_ok_1_coder_dispatch_failure_never_reaches_the_gate() {
         let (reached_gate, rec) = coder_branch_terminal_bookend(&Ok(1), "coder-phase", &RunId::mission("m-4").unwrap());
         assert!(!reached_gate);
-        assert_eq!(rec.action, darkmux_flow::FlowAction::DispatchError);
+        assert_eq!(rec.action, darkmux_flow::FlowAction::RunError);
         assert!(matches!(rec.level, flow::Level::Error), "{:?}", rec.level);
         assert_eq!(rec.payload.as_ref().unwrap()["result_class"], serde_json::json!("error"));
     }
@@ -8843,7 +8789,7 @@ mod tests {
         let (reached_gate, rec) =
             coder_branch_terminal_bookend(&Err(anyhow!("worktree already exists")), "coder-phase", &RunId::mission("m-5").unwrap());
         assert!(!reached_gate);
-        assert_eq!(rec.action, darkmux_flow::FlowAction::DispatchError);
+        assert_eq!(rec.action, darkmux_flow::FlowAction::RunError);
         assert!(matches!(rec.level, flow::Level::Error), "{:?}", rec.level);
     }
 
@@ -8851,11 +8797,11 @@ mod tests {
     /// `gate: "coder-phase"` and NEVER an `error` key — the opposite shape
     /// from the `BookendGuard` Drop backstop's generic abort record (see
     /// `launch`'s `bookend` construction: `on_abort` builds a payload with
-    /// `"error": "mission dispatch terminated before completion..."` and no
+    /// `"error": "run terminated before completion..."` and no
     /// `gate` key). Distinguishing the two shapes is what lets
-    /// `launch_coder_phase_worktree_failure_still_closes_the_mission_
-    /// bookend_as_dispatch_error` (below) prove the explicit close actually
-    /// ran, not just that SOME "dispatch error" record landed.
+    /// `launch_coder_phase_worktree_failure_still_closes_the_run_as_run_error`
+    /// (below) prove the explicit close actually ran, not just that SOME
+    /// `run.error` record landed.
     #[test]
     fn coder_branch_terminal_bookend_payload_never_carries_an_error_key() {
         let (_, rec) = coder_branch_terminal_bookend(&Err(anyhow!("boom")), "coder-phase", &RunId::mission("m-6").unwrap());
@@ -8869,50 +8815,28 @@ mod tests {
 
     /// (#1877 "Bookends fire on a panic") Mirrors `darkmux_flow::bookend`'s
     /// own `panic_while_armed_still_fires_the_abort_record` test, but
-    /// exercises the EXACT construction `launch` uses (`mission_bookend_
-    /// record` + `BookendGuard::new`'s `on_abort` closure) rather than a
-    /// synthetic fixture — proving THIS integration keeps the RAII
-    /// guarantee, not just the generic mechanism `darkmux-flow`'s own suite
-    /// already covers.
+    /// exercises the construction `launch` uses (`run_bookend_record` +
+    /// `BookendGuard::new`'s `on_abort` closure) rather than a synthetic
+    /// fixture: THIS integration keeps the RAII guarantee.
     #[test]
-    fn mission_bookend_guard_fires_a_dispatch_error_abort_record_on_panic() {
+    fn the_run_bookend_guard_writes_run_error_on_panic() {
         let mut records: Vec<flow::FlowRecord> = Vec::new();
         let mut sink = |r: flow::FlowRecord| records.push(r);
+        let run = RunId::mission("panic-test-mission").unwrap();
         let prev_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let abort_run = run.clone();
             let mut guard = flow::BookendGuard::new(&mut sink, move |_id, _kind| {
-                mission_bookend_record(
-                    flow::Level::Error,
-                    darkmux_flow::FlowAction::DispatchError,
-                    "panic-test-config",
-                    &RunId::mission("panic-test-mission").unwrap(),
-                    serde_json::json!({
-                        "runtime": "mission",
-                        "result_class": "error",
-                        "error": "mission dispatch terminated before completion (early return or panic)",
-                    }),
-                )
+                run_bookend_record(flow::Edge::Error, "panic-test-config", &abort_run, serde_json::json!({}))
             });
-            guard.open(
-                "dispatch",
-                "dispatch",
-                mission_bookend_record(
-                    flow::Level::Info,
-                    darkmux_flow::FlowAction::DispatchStart,
-                    "panic-test-config",
-                    &RunId::mission("panic-test-mission").unwrap(),
-                    serde_json::json!({ "runtime": "mission" }),
-                ),
-            );
+            guard.open("run", "run", run_bookend_record(flow::Edge::Start, "panic-test-config", &run, serde_json::json!({})));
             panic!("simulated mid-run panic while the guard is armed");
         }));
         std::panic::set_hook(prev_hook);
         assert!(result.is_err(), "the panic must propagate out of catch_unwind");
-        assert_eq!(records.len(), 2, "expected [start, abort]: {records:#?}");
-        assert_eq!(records[0].action, darkmux_flow::FlowAction::DispatchStart);
-        assert_eq!(records[1].action, darkmux_flow::FlowAction::DispatchError);
-        assert_eq!(records[1].source.as_deref(), Some("mission"));
+        let actions: Vec<_> = records.iter().map(|r| r.action.clone()).collect();
+        assert_eq!(actions, [darkmux_flow::FlowAction::RunStart, darkmux_flow::FlowAction::RunError]);
     }
 
     /// (#2413 M3) The retired per-dispatch process sampler had a standalone
@@ -8941,25 +8865,18 @@ mod tests {
         );
     }
 
-    /// (#1877 requirement 1 — "no opt-in": a Tier-1-only, no-model-dispatch
-    /// generic config now gets a mission-level `dispatch *` bookend where it
-    /// previously got NONE at all.) Reuses `MIXED_OUTCOME_CONFIG` — one
-    /// completed step, one errored step, `MissionOutcomeStatus::Degraded`,
-    /// exit 0 — because it's the shape every operator-authored `cmd`
-    /// panel config actually produces on a partial run, and because a
-    /// Degraded-but-exit-0 run closing as `dispatch complete` (never
-    /// `dispatch error`) is itself worth pinning: the bookend carries
-    /// "did dispatch work happen and finish," not the mission's own
-    /// pass/fail verdict.
+    /// (#1877 requirement 1, "no opt-in") A Tier-1-only generic config, one
+    /// with no role execution at all, still gets the run bookend pair.
+    /// `MIXED_OUTCOME_CONFIG` (one completed step, one errored, `Degraded`,
+    /// exit 0) is the shape an operator-authored `cmd` panel config produces
+    /// on a partial run, and a Degraded-but-exit-0 run closes as
+    /// `run.complete`: the bookend says whether the run finished, not the
+    /// mission's verdict.
     ///
-    /// RED PROVED: before this arc's `mission_launch.rs` changes, NO
-    /// record with `source == "mission"` was ever emitted on this path —
-    /// `read_all_flow_records()` filtered to `source: "mission"` was
-    /// empty for every generic (non-review) launch, confirmed by running
-    /// this exact assertion against the pre-change tree.
+    /// RED PROVED: before #1877 this path wrote no whole-run bookend at all.
     #[test]
     #[serial_test::serial]
-    fn launch_of_a_tier1_generic_config_emits_exactly_one_mission_dispatch_bookend_pair() {
+    fn launch_of_a_tier1_generic_config_emits_exactly_one_run_bookend_pair() {
         let guard = LaunchTestGuard::new();
         guard.write_config("mixed-outcome-test-mission", MIXED_OUTCOME_CONFIG);
 
@@ -8969,34 +8886,17 @@ mod tests {
 
         let mission_id = single_mission_id();
         let records = read_all_flow_records();
-        let mission_records: Vec<&serde_json::Value> =
-            records.iter().filter(|r| r["source"] == "mission").collect();
-        let starts: Vec<&&serde_json::Value> =
-            mission_records.iter().filter(|r| r["action"] == "dispatch.start").collect();
-        let completes: Vec<&&serde_json::Value> =
-            mission_records.iter().filter(|r| r["action"] == "dispatch.complete").collect();
-        let errors: Vec<&&serde_json::Value> =
-            mission_records.iter().filter(|r| r["action"] == "dispatch.error").collect();
-        assert_eq!(
-            starts.len(),
-            1,
-            "expected exactly one mission-level `dispatch start`, got {mission_records:#?}"
-        );
-        assert_eq!(
-            completes.len() + errors.len(),
-            1,
-            "expected exactly one mission-level terminal bookend, got {mission_records:#?}"
-        );
-        assert_eq!(
-            completes.len(),
-            1,
-            "a Degraded-but-exit-0 run must close as `dispatch complete`, not `dispatch error`: \
-             {mission_records:#?}"
-        );
-        for r in &starts {
+        let run_records: Vec<&serde_json::Value> = records.iter().filter(|r| is_run_bookend(r)).collect();
+        let actions: Vec<&str> = run_records.iter().filter_map(|r| r["action"].as_str()).collect();
+        assert_eq!(actions, ["run.start", "run.complete"], "{run_records:#?}");
+        for r in &run_records {
             assert_eq!(r["mission_id"], serde_json::json!(mission_id));
             assert_eq!(r["session_id"], serde_json::json!(format!("{mission_id}.run")));
         }
+        assert!(
+            !records.iter().any(|r| r["action"] == "dispatch.start"),
+            "a procedural run has no role execution, so no `dispatch.start`: {records:#?}"
+        );
         drop(guard);
     }
 
@@ -9019,13 +8919,11 @@ mod tests {
     /// every OTHER test running concurrently in this binary — a strictly
     /// worse risk than the one it would avoid.
     ///
-    /// RED PROVED: before this arc's change, this exact scenario produced
-    /// zero `source: "mission"` records — confirmed by running this
-    /// assertion against the pre-change tree, where the coder branch's
-    /// early return had no bookend to close at all.
+    /// RED PROVED: before #1877 this exact scenario wrote no whole-run
+    /// bookend, the coder branch's early return had nothing to close.
     #[test]
     #[serial_test::serial]
-    fn launch_coder_phase_worktree_failure_still_closes_the_mission_bookend_as_dispatch_error() {
+    fn launch_coder_phase_worktree_failure_still_closes_the_run_as_run_error() {
         let guard = LaunchTestGuard::new();
         let tmp = TempDir::new().unwrap();
         let workdir = tmp.path().join("wt");
@@ -9050,35 +8948,27 @@ mod tests {
 
         let mission_id = single_mission_id();
         let records = read_all_flow_records();
-        let mission_records: Vec<&serde_json::Value> =
-            records.iter().filter(|r| r["source"] == "mission").collect();
-        let starts: Vec<&&serde_json::Value> =
-            mission_records.iter().filter(|r| r["action"] == "dispatch.start").collect();
-        let errors: Vec<&&serde_json::Value> =
-            mission_records.iter().filter(|r| r["action"] == "dispatch.error").collect();
-        assert_eq!(
-            starts.len(),
-            1,
-            "the coder branch's early return must still have opened a mission-level bookend: \
-             {mission_records:#?}"
-        );
+        let mission_records: Vec<&serde_json::Value> = records.iter().filter(|r| is_run_bookend(r)).collect();
+        let starts: Vec<&&serde_json::Value> = mission_records.iter().filter(|r| r["action"] == "run.start").collect();
+        let errors: Vec<&&serde_json::Value> = mission_records.iter().filter(|r| r["action"] == "run.error").collect();
+        assert_eq!(starts.len(), 1, "the coder branch's early return must still have opened the run: {mission_records:#?}");
         assert_eq!(
             errors.len(),
             1,
-            "the coder branch's early return must close as `dispatch error`, explicitly — not \
-             rely on the Drop backstop for a KNOWN outcome: {mission_records:#?}"
+            "the coder branch's early return must close as `run.error`, explicitly, not rely on \
+             the Drop backstop for a KNOWN outcome: {mission_records:#?}"
         );
         assert_eq!(errors[0]["mission_id"], serde_json::json!(mission_id));
         // (#1877 QA must-fix 3) `errors.len() == 1` alone can't tell the
         // explicit `bookend.close(...)` apart from the `BookendGuard` Drop
-        // backstop — both emit exactly one "dispatch error" record. Only
+        // backstop — both emit exactly one `run.error` record. Only
         // the PAYLOAD shape distinguishes them: the explicit close stamps
         // `gate: "coder-phase"` (see `coder_branch_terminal_bookend`) and
         // carries no `error` key; the Drop backstop's `on_abort` closure
         // does the opposite (an `error` key naming "terminated before
         // completion", no `gate` key). Asserting `gate` here is what
         // proves this test exercises the explicit close this arc added —
-        // not just "some dispatch-error record landed" — which is exactly
+        // not just "some `run.error` record landed" — which is exactly
         // what this test's own docstring claims but, before this
         // assertion, never actually checked.
         //

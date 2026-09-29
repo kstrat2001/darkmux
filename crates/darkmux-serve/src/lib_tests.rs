@@ -1391,6 +1391,33 @@
         );
     }
 
+    /// A map step's items share the task's session; each is its own execution.
+    /// The catalog counts executions, so a 3-item map reads 3 in both the day
+    /// picker and the missions lens (a session count reads 1).
+    #[test]
+    fn catalog_counts_executions_not_sessions_for_a_three_item_map() {
+        let tmp = TempDir::new().unwrap();
+        let lines: Vec<String> = (1..=3)
+            .map(|i| {
+                serde_json::to_string(&serde_json::json!({
+                    "action": "dispatch.start",
+                    "session_id": "S-map",
+                    "execution_id": format!("exec-0000000{i}-0000-0001"),
+                    "mission_id": "m-map",
+                    "machine_id": "MacBook-Pro",
+                    "ts": format!("2026-05-14T09:0{i}:00Z"),
+                }))
+                .unwrap()
+            })
+            .collect();
+        fs::write(tmp.path().join("2026-05-14.jsonl"), lines.join("\n") + "\n").unwrap();
+        let days = super::scan_flow_days(tmp.path());
+        assert_eq!(days[0]["dispatches"], 3, "day picker counts executions");
+        let missions = super::scan_flow_missions(tmp.path(), &[]);
+        let m = missions.iter().find(|m| m["mission_id"] == "m-map").expect("mission present");
+        assert_eq!(m["dispatches"], 3, "missions lens counts executions");
+    }
+
     #[tokio::test]
     async fn flow_mission_returns_records_across_days_chronologically() {
         let tmp = TempDir::new().unwrap();
@@ -2980,7 +3007,7 @@
     /// retired.
     #[test]
     fn forwarded_line_upgrades_a_retired_spelling_and_leaves_a_current_one_verbatim() {
-        let current = r#"{"z":1,"action":"dispatch.start"}"#.to_string();
+        let current = r#"{"z":1,"action":"dispatch.start","execution_id":"exec-1"}"#.to_string();
         assert_eq!(forwarded_line(current.clone()), current);
         // flow-action-guard:allow — an old spelling is this test's input
         let v: serde_json::Value = serde_json::from_str(&forwarded_line(r#"{"action":"mission close"}"#.to_string())).unwrap();

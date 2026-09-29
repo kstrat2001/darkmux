@@ -164,8 +164,8 @@ mission.close            <span class="comment"># units_completed/errored/skipped
 <section>
   <div class="wrap">
     <h2>4. Findings and mods</h2>
-    <p>The runtime tool is <code>create_finding</code> (renamed from <code>report_finding</code> on 2026-09-03). Each accepted call writes one record at <code>~/.darkmux/findings/&lt;dispatch&gt;/&lt;seq&gt;/finding.json</code>: the context the crawl supplied (mission, unit, rule, source, sha) plus the model's emission verbatim. darkmux never interprets the emission and never rewrites the record.</p>
-    <p><code>finding list [--mission &lt;id&gt;|--dispatch &lt;id&gt;|--rule &lt;id&gt;] [--json]</code> reads the store, one row per record with a truncated preview of the emission:</p>
+    <p>The runtime tool is <code>create_finding</code> (renamed from <code>report_finding</code> on 2026-09-03). Each accepted call writes one record at <code>~/.darkmux/findings/&lt;execution&gt;/&lt;seq&gt;/finding.json</code>: the context the crawl supplied (mission, unit, rule, source, sha) plus the model's emission verbatim. darkmux never interprets the emission and never rewrites the record.</p>
+    <p><code>finding list [--mission &lt;id&gt;|--execution &lt;id&gt;|--rule &lt;id&gt;] [--json]</code> reads the store, one row per record with a truncated preview of the emission:</p>
     <pre><code>$ darkmux finding list
 crawl-crawl-1788400556-b1119b-u-0001/1  2026-09-03T01:59:29Z  crawler (qwen3.6-35b-a3b-turboquant-mlx)  [mission=crawl-1788400556-b1119b unit=u-0001 rule=unnamed-predicate]
     {"evidence":"  const playhead = transport.active &amp;&amp; transport.scrubbed &amp;&amp; transport.t &lt; transport.tM…

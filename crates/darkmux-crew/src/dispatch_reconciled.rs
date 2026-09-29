@@ -480,6 +480,7 @@ mod tests {
                     stdout: format!("dispatched {}", opts.role_id),
                     stderr: String::new(),
                     session_id: crate::test_session("n"),
+                    execution: None,
                     out_dir: None,
                     trajectory: None,
                 })
@@ -562,6 +563,7 @@ mod tests {
                     stdout: format!("dispatched {}", opts.role_id),
                     stderr: String::new(),
                     session_id: crate::test_session("n"),
+                    execution: None,
                     out_dir: None,
                     trajectory: None,
                 })
@@ -614,6 +616,7 @@ mod tests {
                     stdout: "remote ok".to_string(),
                     stderr: String::new(),
                     session_id: crate::test_session("n"),
+                    execution: None,
                     out_dir: None,
                     trajectory: None,
                 })
@@ -643,6 +646,7 @@ mod tests {
                     stdout: "ran anyway".to_string(),
                     stderr: String::new(),
                     session_id: crate::test_session("n"),
+                    execution: None,
                     out_dir: None,
                     trajectory: None,
                 })
@@ -748,6 +752,7 @@ mod tests {
                     stdout: format!("dispatched {}", opts.role_id),
                     stderr: String::new(),
                     session_id: crate::test_session("n"),
+                    execution: None,
                     out_dir: None,
                     trajectory: None,
                 })
@@ -822,6 +827,7 @@ mod tests {
                     stdout: format!("dispatched {}", opts.role_id),
                     stderr: String::new(),
                     session_id: crate::test_session("n"),
+                    execution: None,
                     out_dir: None,
                     trajectory: None,
                 })

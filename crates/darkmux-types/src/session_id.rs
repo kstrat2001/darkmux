@@ -35,7 +35,7 @@ use std::fmt;
 /// A malformed identity: an empty run id, or a wire string outside the
 /// grammar in this module's doc.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IdError(String);
+pub struct IdError(pub(crate) String);
 
 impl fmt::Display for IdError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

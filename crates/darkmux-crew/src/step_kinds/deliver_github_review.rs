@@ -1797,7 +1797,7 @@ mod tests {
         }
         FindingRecord {
             key: key.to_string(),
-            dispatch: key.split('/').next().unwrap().to_string(),
+            execution: key.split('/').next().unwrap().to_string(),
             seq: key.split('/').nth(1).unwrap().parse().unwrap(),
             ts: "2026-09-04T00:00:00Z".to_string(),
             tool_name: "create_finding".to_string(),
@@ -2340,7 +2340,7 @@ mod tests {
     fn unanchored_finding(key: &str, rule: &str, why: &str) -> FindingRecord {
         FindingRecord {
             key: key.to_string(),
-            dispatch: key.split('/').next().unwrap().to_string(),
+            execution: key.split('/').next().unwrap().to_string(),
             seq: key.split('/').nth(1).unwrap().parse().unwrap(),
             ts: "2026-09-06T00:00:00Z".to_string(),
             tool_name: "create_finding".to_string(),

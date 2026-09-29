@@ -3497,6 +3497,7 @@ fn emit_hook_record_with(
         handle: host,
         phase_id: None,
         session_id: None,
+        execution_id: None,
         source: Some("hook".to_string()),
         model: None,
         reasoning: None,
@@ -3542,6 +3543,7 @@ fn emit_dry_run_record(report_sink: &dyn FlowSink, rt: &RuleRuntime, delivered_l
         handle: rt.rule.url.clone(),
         phase_id: None,
         session_id: None,
+        execution_id: None,
         source: Some("hook".to_string()),
         model: None,
         reasoning: None,
@@ -3588,6 +3590,7 @@ fn maybe_warn_dropped(rt: &RuleRuntime, report_sink: &dyn FlowSink, max_outbox_m
         handle: host,
         phase_id: None,
         session_id: None,
+        execution_id: None,
         source: Some("hook".to_string()),
         model: None,
         reasoning: None,
@@ -3645,6 +3648,7 @@ fn maybe_warn_busy(rt: &RuleRuntime, report_sink: &dyn FlowSink, orphan_count: u
         handle: host,
         phase_id: None,
         session_id: None,
+        execution_id: None,
         source: Some("hook".to_string()),
         model: None,
         reasoning: None,
@@ -4591,6 +4595,7 @@ mod tests {
     }
 
     fn record(action: crate::FlowAction) -> FlowRecord {
+        let execution_id = (action.grain() == Some(crate::Grain::Execution)).then(darkmux_types::execution_id::ExecutionId::mint);
         FlowRecord {
             ts: schema::ts_utc_now(),
             level: Level::Info,
@@ -4601,6 +4606,7 @@ mod tests {
             handle: "h".to_string(),
             phase_id: None,
             session_id: None,
+            execution_id,
             source: None,
             model: None,
             reasoning: None,
@@ -4692,7 +4698,7 @@ mod tests {
         let path = tmp.path().join("r.outbox.jsonl");
         // flow-action-guard:allow — an old spelling is this test's input
         let old = r#"{"action":"dispatch complete","handle":"h"}"#;
-        let current = r#"{"action":"dispatch.turn","handle":"h"}"#;
+        let current = r#"{"action":"dispatch.turn","handle":"h","execution_id":"exec-1"}"#;
         std::fs::write(&path, format!("{old}\n{current}\n")).unwrap();
         let (first, cursor) = next_pending_line(&path, 0).unwrap();
         let v: serde_json::Value = serde_json::from_str(&first).unwrap();

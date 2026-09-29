@@ -387,7 +387,7 @@
         );
         let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::full_window().stopped_after(1, "mission `m` is aborted"));
         let result = crate::budget::with_test_env(env.clone(), || {
-            dispatch_remote(&opts, &quarantine_test_role(), "system prompt", &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap())
+            dispatch_remote(&opts, &darkmux_types::execution_id::ExecutionId::mint(), &quarantine_test_role(), "system prompt", &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap())
         });
         unsafe {
             match prev_home {
@@ -491,7 +491,7 @@
             run_telemetry_sampler(
                 stop,
                 "coder".into(),
-                crate::test_session("s-pacer"),
+                crate::test_session("s-pacer"), darkmux_types::execution_id::ExecutionId::mint(),
                 "gpt-remote".into(),
                 None,
                 None,
@@ -2765,7 +2765,7 @@
         let role = quarantine_test_role(); // `dispatch_remote` ignores `_role` entirely
         let pm = darkmux_types::ProfileModel::hosted_for_test("gpt-remote", Some(100000), serde_json::json!({"url": base_url}));
 
-        let result = dispatch_remote(&opts, &role, "system prompt", &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap());
+        let result = dispatch_remote(&opts, &darkmux_types::execution_id::ExecutionId::mint(), &role, "system prompt", &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap());
 
         unsafe {
             match prev_home {
@@ -2857,7 +2857,7 @@
             opts.json = false;
             let pm = darkmux_types::ProfileModel::hosted_for_test("gpt-remote", Some(100000), serde_json::json!({"url": base_url}));
             let result =
-                dispatch_remote(&opts, &role, "system prompt", &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap()).expect("dispatch_remote must succeed");
+                dispatch_remote(&opts, &darkmux_types::execution_id::ExecutionId::mint(), &role, "system prompt", &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap()).expect("dispatch_remote must succeed");
             assert_eq!(result.session_id, step_session, "dispatch_remote runs under its caller's session");
             seen_session_ids.insert(result.session_id);
         }
@@ -4190,7 +4190,7 @@
             )),
             image: "rust:slim".to_string(),
             role_id: "test-role".to_string(),
-            session_id: crate::test_session("sess-test"),
+            execution: darkmux_types::execution_id::ExecutionId::parse("exec-test").unwrap(),
             model: "llama3-8b".to_string(),
             system_prompt: "You are a coding assistant.".to_string(),
             message: "Fix the bug in main.rs".to_string(),
@@ -4376,9 +4376,9 @@
         assert_eq!(argv[41], "--role-id");
         assert_eq!(argv[42], "test-role");
         // (#2386) Unconditional too — the runtime needs its finding-key
-        // namespace on every dispatch. See `DockerRunConfig::session_id`.
-        assert_eq!(argv[43], "--session-id");
-        assert_eq!(argv[44], &*crate::test_session("sess-test").wire());
+        // namespace on every dispatch. See `DockerRunConfig::execution`.
+        assert_eq!(argv[43], "--execution-id");
+        assert_eq!(argv[44], "exec-test");
         assert_eq!(argv[45], "--system");
         assert_eq!(argv[46], "You are a coding assistant.");
         // (#386) The message goes via the out-dir mount, not argv — argv carries
@@ -4453,7 +4453,7 @@
             runtime_binary: None,
             image: "darkmux-runtime:latest".to_string(),
             role_id: "test-role".to_string(),
-            session_id: crate::test_session("sess-test"),
+            execution: darkmux_types::execution_id::ExecutionId::parse("exec-test").unwrap(),
             model: "default-model".to_string(),
             system_prompt: "Basic role.".to_string(),
             message: "Hello world".to_string(),
@@ -4668,7 +4668,7 @@
             runtime_binary: None,
             image: "darkmux-runtime:latest".to_string(),
             role_id: "test-role".to_string(),
-            session_id: crate::test_session("sess-test"),
+            execution: darkmux_types::execution_id::ExecutionId::parse("exec-test").unwrap(),
             model: "default-model".to_string(),
             system_prompt: "Basic role.".to_string(),
             message: "Hello world".to_string(),
@@ -4809,7 +4809,7 @@
             runtime_binary: None,
             image: "darkmux-runtime:latest".to_string(),
             role_id: "test-role".to_string(),
-            session_id: crate::test_session("sess-test"),
+            execution: darkmux_types::execution_id::ExecutionId::parse("exec-test").unwrap(),
             model: "default-model".to_string(),
             system_prompt: "Tool-less reviewer.".to_string(),
             message: "Review this.".to_string(),
@@ -4868,7 +4868,7 @@
             runtime_binary: None,
             image: "darkmux-runtime:latest".to_string(),
             role_id: "test-role".to_string(),
-            session_id: crate::test_session("sess-test"),
+            execution: darkmux_types::execution_id::ExecutionId::parse("exec-test").unwrap(),
             model: "m".to_string(),
             system_prompt: "role".to_string(),
             message: "msg".to_string(),
@@ -5040,7 +5040,7 @@
     /// writes in production, so tests exercising the happy path (or the
     /// workspace gate specifically) don't have to hand-roll the JSON.
     fn write_origin(dir: &std::path::Path, workspace: &str, read_only: bool) {
-        write_resume_origin_meta(dir, std::path::Path::new(workspace), read_only, None);
+        write_resume_origin_meta(dir, std::path::Path::new(workspace), read_only, None, &darkmux_types::execution_id::ExecutionId::mint());
     }
 
     /// (#2162) Test-only composition mirroring the OLD (pre-#2162)
@@ -5155,6 +5155,54 @@
         args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).map(String::as_str)
     }
 
+    /// A resumed dispatch continues the execution its checkpoint dir
+    /// recorded, and writes it into its own dir so a resume of a resume
+    /// continues too. Every other dispatch is a new execution, and so is a
+    /// resume from a dir that recorded none (written before 4.0): a fresh id,
+    /// never a synthesized legacy one.
+    #[test]
+    fn a_resumed_dispatch_continues_its_checkpoints_execution() {
+        let ws = TempDir::new().unwrap();
+        let first = TempDir::new().unwrap();
+        let recorded = ExecutionId::mint();
+        write_resume_origin_meta(first.path(), ws.path(), false, None, &recorded);
+        assert_eq!(execution_for(Some(first.path())), recorded, "the resume continues the recorded execution");
+
+        let second = TempDir::new().unwrap();
+        write_resume_origin_meta(second.path(), ws.path(), false, None, &execution_for(Some(first.path())));
+        assert_eq!(execution_for(Some(second.path())), recorded, "a resume of a resume continues it too");
+
+        assert_ne!(execution_for(None), recorded, "a fresh dispatch is a new execution");
+        assert_ne!(execution_for(None), execution_for(None), "each is its own");
+
+        let pre_4_0 = TempDir::new().unwrap();
+        std::fs::write(pre_4_0.path().join(RESUME_ORIGIN_FILENAME), r#"{"workspace":"/w","workspace_read_only":false}"#).unwrap();
+        let fresh = execution_for(Some(pre_4_0.path()));
+        assert!(!fresh.is_legacy() && fresh != recorded, "no recorded id: a new execution");
+        let no_origin = TempDir::new().unwrap();
+        assert!(!execution_for(Some(no_origin.path())).is_legacy());
+    }
+
+    /// The recorded id is read from a file the model can write, so only the
+    /// minted grammar is believed: a planted `legacy:` id, one with control
+    /// characters and one with a slash each get a fresh execution.
+    #[test]
+    fn a_planted_execution_id_in_the_resume_origin_is_not_believed() {
+        for planted in ["legacy:sess-1:m1", "exec-1-2-3\u{1b}[31m", "exec-1/../../x", "exec-zz-1-2", "someone-elses"] {
+            let dir = TempDir::new().unwrap();
+            let origin = serde_json::json!({"workspace": "/w", "workspace_read_only": false, "execution_id": planted});
+            std::fs::write(dir.path().join(RESUME_ORIGIN_FILENAME), origin.to_string()).unwrap();
+            let got = execution_for(Some(dir.path()));
+            assert_ne!(got.as_str(), planted, "planted id {planted:?} must not be kept");
+            assert!(ExecutionId::parse_minted(got.as_str()).is_ok(), "a fresh minted id replaces {planted:?}");
+        }
+        let dir = TempDir::new().unwrap();
+        let ws = TempDir::new().unwrap();
+        let minted = ExecutionId::mint();
+        write_resume_origin_meta(dir.path(), ws.path(), false, None, &minted);
+        assert_eq!(execution_for(Some(dir.path())), minted, "a valid minted id is kept");
+    }
+
     /// The F2 regression, end to end: generate tier 4's hint from a real
     /// `resume_origin.json`, parse the flags back out, and feed them
     /// through the ACTUAL `validate_resume_checkpoint`. Before the fix the
@@ -5166,7 +5214,7 @@
         let workspace = TempDir::new().unwrap();
         let prior = TempDir::new().unwrap();
         std::fs::write(prior.path().join(CHECKPOINT_FILENAME), sample_checkpoint_json()).unwrap();
-        write_resume_origin_meta(prior.path(), workspace.path(), false, Some("rust:latest"));
+        write_resume_origin_meta(prior.path(), workspace.path(), false, Some("rust:latest"), &darkmux_types::execution_id::ExecutionId::mint());
 
         let hint = resume_hint_from_origin(prior.path(), "coder");
         let args = parse_hint_args(&hint);
@@ -5227,7 +5275,7 @@
 
         let prior = TempDir::new().unwrap();
         std::fs::write(prior.path().join(CHECKPOINT_FILENAME), sample_checkpoint_json()).unwrap();
-        write_resume_origin_meta(prior.path(), &ws, false, None);
+        write_resume_origin_meta(prior.path(), &ws, false, None, &darkmux_types::execution_id::ExecutionId::mint());
 
         let hint = resume_hint_from_origin(prior.path(), "coder");
         let args = parse_hint_args(&hint);
@@ -5261,7 +5309,7 @@
         ));
         std::fs::create_dir_all(&ws).unwrap();
         let prior = TempDir::new().unwrap();
-        write_resume_origin_meta(prior.path(), &ws, false, None);
+        write_resume_origin_meta(prior.path(), &ws, false, None, &darkmux_types::execution_id::ExecutionId::mint());
         let body: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(prior.path().join(RESUME_ORIGIN_FILENAME)).unwrap(),
         )
@@ -5284,7 +5332,7 @@
         let workspace = TempDir::new().unwrap();
         let prior = TempDir::new().unwrap();
         std::fs::write(prior.path().join(CHECKPOINT_FILENAME), sample_checkpoint_json()).unwrap();
-        write_resume_origin_meta(prior.path(), workspace.path(), true, None);
+        write_resume_origin_meta(prior.path(), workspace.path(), true, None, &darkmux_types::execution_id::ExecutionId::mint());
 
         let hint = resume_hint_from_origin(prior.path(), "coder");
         let args = parse_hint_args(&hint);
@@ -5313,7 +5361,7 @@
         let workspace = TempDir::new().unwrap();
         let prior = TempDir::new().unwrap();
         std::fs::write(prior.path().join(CHECKPOINT_FILENAME), sample_checkpoint_json()).unwrap();
-        write_resume_origin_meta(prior.path(), workspace.path(), true, None);
+        write_resume_origin_meta(prior.path(), workspace.path(), true, None, &darkmux_types::execution_id::ExecutionId::mint());
 
         // (#2774 round-3 MF2) `expected_workspace` is CANONICALIZED here
         // because that is what production passes — `dispatch()`'s
@@ -5341,7 +5389,7 @@
         std::fs::create_dir_all(&workspace).unwrap();
         let prior = TempDir::new().unwrap();
         std::fs::write(prior.path().join(CHECKPOINT_FILENAME), sample_checkpoint_json()).unwrap();
-        write_resume_origin_meta(prior.path(), &workspace, false, None);
+        write_resume_origin_meta(prior.path(), &workspace, false, None, &darkmux_types::execution_id::ExecutionId::mint());
 
         let hint = resume_hint_from_origin(prior.path(), "coder");
         assert!(hint.contains("'"), "a path with a space must be quoted: {hint}");
@@ -6091,7 +6139,7 @@
             runtime_binary: None,
             image: "darkmux-runtime:latest".to_string(),
             role_id: "test-role".to_string(),
-            session_id: crate::test_session("sess-test"),
+            execution: darkmux_types::execution_id::ExecutionId::parse("exec-test").unwrap(),
             model: "default-model".to_string(),
             system_prompt: "Basic role.".to_string(),
             message: "Hello world".to_string(),
@@ -6923,7 +6971,7 @@
 
         let mut state = TailerState::new(
             traj_path.clone(),
-            crate::test_session("test-session"),
+            crate::test_session("test-session"), darkmux_types::execution_id::ExecutionId::mint(),
             "test-role".into(),
             "test-model".into(),
             Arc::clone(&shared),
@@ -6986,7 +7034,7 @@
         let shared = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(3600)));
         let mut state = TailerState::new(
             traj_path.clone(),
-            crate::test_session("test-session"),
+            crate::test_session("test-session"), darkmux_types::execution_id::ExecutionId::mint(),
             "test-role".into(),
             "test-model".into(),
             Arc::clone(&shared),
@@ -7030,7 +7078,7 @@
 
         let mut state = TailerState::new(
             traj_path.clone(),
-            crate::test_session("test-session"),
+            crate::test_session("test-session"), darkmux_types::execution_id::ExecutionId::mint(),
             "test-role".into(),
             "test-model".into(),
             Arc::clone(&shared),
@@ -7105,7 +7153,7 @@
 
         let mut state = TailerState::new(
             traj_path.clone(),
-            crate::test_session("test-session"),
+            crate::test_session("test-session"), darkmux_types::execution_id::ExecutionId::mint(),
             "test-role".into(),
             "test-model".into(),
             Arc::clone(&shared),
@@ -7170,7 +7218,7 @@
 
         let mut state = TailerState::new(
             traj_path.clone(),
-            crate::test_session("test-session"),
+            crate::test_session("test-session"), darkmux_types::execution_id::ExecutionId::mint(),
             "test-role".into(),
             "test-model".into(),
             Arc::clone(&shared),
@@ -7263,7 +7311,7 @@
         let handle = crate::concurrent_dispatch::spawn_detached_named(move || {
             run_tailer(
                 out_dir,
-                crate::test_session("sess-real-watchdog"),
+                crate::test_session("sess-real-watchdog"), darkmux_types::execution_id::ExecutionId::mint(),
                 "coder".into(),
                 "darkmux:qwen3.6".into(),
                 None,
@@ -7377,7 +7425,7 @@
 
         let mut state = TailerState::new(
             traj_path.clone(),
-            crate::test_session("test-session"),
+            crate::test_session("test-session"), darkmux_types::execution_id::ExecutionId::mint(),
             "test-role".into(),
             "test-model".into(),
             Arc::clone(&shared),
@@ -7427,7 +7475,7 @@
 
         let mut state = TailerState::new(
             traj_path.clone(),
-            crate::test_session("test-session"),
+            crate::test_session("test-session"), darkmux_types::execution_id::ExecutionId::mint(),
             "test-role".into(),
             "test-model".into(),
             Arc::clone(&shared),
@@ -7487,7 +7535,7 @@
 
         let mut state = TailerState::new(
             traj_path.clone(),
-            crate::test_session("test-session"),
+            crate::test_session("test-session"), darkmux_types::execution_id::ExecutionId::mint(),
             "test-role".into(),
             "test-model".into(),
             Arc::clone(&shared),
@@ -7544,7 +7592,7 @@
 
         let mut state = TailerState::new(
             traj_path.clone(),
-            crate::test_session("test-session"),
+            crate::test_session("test-session"), darkmux_types::execution_id::ExecutionId::mint(),
             "test-role".into(),
             "test-model".into(),
             Arc::clone(&shared),
@@ -8017,7 +8065,7 @@
 
     /// (#2265) The tailer is the LIVE producer of the finding record. An
     /// accepted finding call streaming past materializes
-    /// `<findings dir>/<dispatch>/<seq>/finding.json` with the emission
+    /// `<findings dir>/<execution>/<seq>/finding.json` with the emission
     /// verbatim, and only an accepted finding call does.
     ///
     /// Write-once is the load-bearing half: a finding is an EVENT, so a second
@@ -8045,7 +8093,7 @@
             "crawler".into(),
             "darkmux:qwen3.6".into(),
         );
-        let dispatch = crate::mission_test_session("crawl-1788402801", "sess-finding").wire();
+        let execution = state.execution.to_string();
         // A crawl's `context` is the LAUNCHER's blob: workspace / source / sha /
         // rule / unit. The mission is NOT in it — on the flow record
         // `mission_id`, `phase_id` and `step_id` are TOP-LEVEL fields, which is
@@ -8069,11 +8117,11 @@
         });
         state.handle_event(&accepted.to_string());
 
-        let path = store.join(&dispatch).join("4").join("finding.json");
+        let path = store.join(&execution).join("4").join("finding.json");
         let rec: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).expect("record written")).unwrap();
-        assert_eq!(rec["key"], format!("{dispatch}/4"));
-        assert_eq!(rec["dispatch"], dispatch.as_str());
+        assert_eq!(rec["key"], format!("{execution}/4"));
+        assert_eq!(rec["execution"], execution.as_str());
         assert_eq!(rec["seq"], 4);
         assert_eq!(rec["tool_name"], "create_finding");
         assert_eq!(rec["schema_version"], "1");
@@ -8133,7 +8181,7 @@
             .to_string(),
         );
         assert!(
-            store.join(&dispatch).join("5").join("finding.json").exists(),
+            store.join(&execution).join("5").join("finding.json").exists(),
             "report_finding (the old name) must materialize the same record"
         );
 
@@ -8145,7 +8193,7 @@
             r#"{"type":"tool.completed","seq":1,"tool_seq":8,"tool_name":"create_finding","args":"{}","result":"REJECTED: line 9999 does not exist","ok":false,"emitted":{"file":"r.ts"},"emit_seq":8}"#,
         );
         assert!(
-            !store.join(&dispatch).join("8").exists(),
+            !store.join(&execution).join("8").exists(),
             "a rejected (ok:false) finding call must NOT become a record"
         );
 
@@ -8156,8 +8204,8 @@
         state.handle_event(
             r#"{"type":"tool.completed","seq":1,"tool_seq":3,"tool_name":"read","args":"{}","result":"r","ok":true,"emitted":{"file":"z"},"emit_seq":7}"#,
         );
-        assert!(!store.join(&dispatch).join("6").exists(), "emitted:null → no record");
-        assert!(!store.join(&dispatch).join("7").exists(), "a read is not a finding");
+        assert!(!store.join(&execution).join("6").exists(), "emitted:null → no record");
+        assert!(!store.join(&execution).join("7").exists(), "a read is not a finding");
 
         // A plain `darkmux dispatch` runs under no mission at all. The fields
         // must be explicitly null rather than absent, so "no mission" and "an
@@ -8172,7 +8220,7 @@
             r#"{"type":"tool.completed","seq":1,"tool_seq":0,"tool_name":"create_finding","args":"{}","result":"r","ok":true,"emitted":{"file":"s.ts"},"emit_seq":1}"#,
         );
         let solo_rec: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(store.join(&*crate::test_session("sess-solo").wire()).join("1").join("finding.json")).unwrap(),
+            &std::fs::read_to_string(store.join(solo.execution.as_str()).join("1").join("finding.json")).unwrap(),
         )
         .unwrap();
         assert!(solo_rec["mission_id"].is_null(), "no mission → explicit null: {solo_rec}");
@@ -8547,27 +8595,19 @@
         );
     }
 
-    /// (#2386 review, item 6) The argv's `--session-id` value and the id the
+    /// (#2386 review, item 6) The argv's `--execution-id` value and the id the
     /// finding tailer stamps into a stored key must be ONE string. Pinning
-    /// only the literal `&*crate::test_session("sess-test").wire()` would stay green if the two drifted to
-    /// different fields, and the model would then be handed a key the store
-    /// files elsewhere — worse than handing it no key at all.
+    /// only a literal would stay green if the two drifted to different
+    /// fields, and the model would then be handed a key the store files
+    /// elsewhere — worse than handing it no key at all.
     #[test]
     #[serial]
-    fn the_argv_session_id_is_the_id_the_finding_tailer_stamps() {
+    fn the_argv_execution_id_is_the_id_the_finding_tailer_stamps() {
         let tmp = TempDir::new().unwrap();
         let findings_store = tmp.path().join("findings");
         let prev = mod_test_env(tmp.path(), &tmp.path().join("mods"), &findings_store);
 
         let session = crate::test_session("step-review-unit-0007");
-        let session_id = session.wire();
-
-        // 1. What the container is TOLD, off the real argv builder.
-        let mut config = base_argv_config();
-        config.session_id = session.clone();
-        let argv = build_docker_run_argv(&config);
-        let at = argv.iter().position(|a| a == "--session-id").expect("--session-id is passed");
-        let told = argv[at + 1].clone();
 
         // 2. What the tailer STAMPS, off a real create_finding event.
         let mut state = TailerState::new_for_test(
@@ -8576,6 +8616,13 @@
             "crawler".into(),
             "m".into(),
         );
+        // 1. What the container is TOLD, off the real argv builder, for the
+        // execution the tailer is tailing.
+        let mut config = base_argv_config();
+        config.execution = state.execution.clone();
+        let argv = build_docker_run_argv(&config);
+        let at = argv.iter().position(|a| a == "--execution-id").expect("--execution-id is passed");
+        let told = argv[at + 1].clone();
         state.handle_event(
             &serde_json::json!({
                 "type": "tool.completed", "seq": 1, "tool_seq": 0,
@@ -8589,7 +8636,7 @@
             .expect("readable")
             .expect("the tailer stamped its key under the SAME id the argv carries");
         assert_eq!(stored.key, format!("{told}/1"));
-        assert_eq!(told, session_id);
+        assert_eq!(told, state.execution.as_str());
         restore_env(prev);
     }
 
@@ -8820,6 +8867,7 @@
             "crawler".into(),
             "darkmux:qwen3.6".into(),
         );
+        let execution = state.execution.to_string();
         // A non-object context: the flow record's merge drops it entirely.
         state.record_context = Some(serde_json::json!("just a string"));
 
@@ -8863,7 +8911,7 @@
             .find(|v| v["action"] == "dispatch.tool")
             .expect("a dispatch.tool record");
         let rec: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(store.join(&*crate::test_session("sess-parity").wire()).join("1").join("finding.json"))
+            &std::fs::read_to_string(store.join(&execution).join("1").join("finding.json"))
                 .expect("record written"),
         )
         .unwrap();
@@ -10106,7 +10154,7 @@
     fn build_remote_record_threads_mission_id_through() {
         let rec = build_remote_record(
             "coder",
-            &crate::mission_test_session("m1", "sess-1"),
+            &crate::mission_test_session("m1", "sess-1"), &darkmux_types::execution_id::ExecutionId::mint(),
             "gpt-remote",
             Some("p1"),
             darkmux_flow::FlowAction::DispatchStart,
@@ -10123,7 +10171,7 @@
         // mission resolved ⇒ no fabricated mission_id.
         let bare = build_remote_record(
             "coder",
-            &crate::test_session("sess-2"),
+            &crate::test_session("sess-2"), &darkmux_types::execution_id::ExecutionId::mint(),
             "gpt-remote",
             None,
             darkmux_flow::FlowAction::DispatchStart,
@@ -10299,7 +10347,7 @@
         let shared = Arc::new(Mutex::new(original_deadline));
         let mut state = TailerState::new(
             traj_path.clone(),
-            crate::test_session("test-session"),
+            crate::test_session("test-session"), darkmux_types::execution_id::ExecutionId::mint(),
             "test-role".into(),
             "test-model".into(),
             Arc::clone(&shared),
@@ -10342,7 +10390,7 @@
         let shared = Arc::new(Mutex::new(original_deadline));
         let mut state = TailerState::new(
             traj_path.clone(),
-            crate::test_session("test-session"),
+            crate::test_session("test-session"), darkmux_types::execution_id::ExecutionId::mint(),
             "test-role".into(),
             "test-model".into(),
             Arc::clone(&shared),
@@ -10453,7 +10501,7 @@
         let tmp = TempDir::new().unwrap();
         let traj_path = tmp.path().join("trajectory.jsonl");
         let shared = Arc::new(Mutex::new(Instant::now()));
-        let mut state = TailerState::new(traj_path.clone(), crate::test_session("live-sess"), "coder".into(), "work-35b".into(), shared, 600)
+        let mut state = TailerState::new(traj_path.clone(), crate::test_session("live-sess"), darkmux_types::execution_id::ExecutionId::mint(), "coder".into(), "work-35b".into(), shared, 600)
             .with_compactor_model(Some("util-4b".into()))
             .with_live(live, 250);
         let mut f = std::fs::File::create(&traj_path).unwrap();
@@ -10536,7 +10584,7 @@
         let sock = sock_dir.path().join("live.sock");
         let rx = darkmux_flow::live::bind_ingest(&sock).unwrap();
         rx.set_nonblocking(true).unwrap();
-        let mut st = TailerState::new(traj.clone(), crate::test_session("w-sess"), "coder".into(), "m".into(), Arc::new(Mutex::new(Instant::now())), 600)
+        let mut st = TailerState::new(traj.clone(), crate::test_session("w-sess"), darkmux_types::execution_id::ExecutionId::mint(), "coder".into(), "m".into(), Arc::new(Mutex::new(Instant::now())), 600)
             .with_live(Some(darkmux_flow::live::LiveSender::to_path(sock)), 250);
         let t = 1_758_700_000_000u64;
         std::fs::write(
@@ -10611,7 +10659,7 @@
         let shared = Arc::new(Mutex::new(original_deadline));
         let mut state = TailerState::new(
             traj_path.clone(),
-            crate::test_session("test-session"),
+            crate::test_session("test-session"), darkmux_types::execution_id::ExecutionId::mint(),
             "test-role".into(),
             "test-model".into(),
             Arc::clone(&shared),
@@ -10775,7 +10823,7 @@
             let mut guard = DispatchBookendGuard::new(
                 &mut sink,
                 "coder".into(),
-                crate::mission_test_session("pre-1.0-compat-sweep", "sess-orphan"),
+                crate::mission_test_session("pre-1.0-compat-sweep", "sess-orphan"), darkmux_types::execution_id::ExecutionId::mint(),
                 "darkmux:qwen3.6".into(),
                 Some("s694".into()),
                 None,
@@ -10784,7 +10832,7 @@
                 darkmux_flow::Level::Info,
                 darkmux_flow::FlowAction::DispatchStart,
                 "coder",
-                &crate::mission_test_session("pre-1.0-compat-sweep", "sess-orphan"),
+                &crate::mission_test_session("pre-1.0-compat-sweep", "sess-orphan"), &darkmux_types::execution_id::ExecutionId::mint(),
                 Some("darkmux:qwen3.6"),
                 Some("s694"),
                 None,
@@ -10834,7 +10882,7 @@
             let mut guard = DispatchBookendGuard::new(
                 &mut sink,
                 "coder".into(),
-                crate::test_session("sess-clean"),
+                crate::test_session("sess-clean"), darkmux_types::execution_id::ExecutionId::mint(),
                 "darkmux:qwen3.6".into(),
                 None,
                 None,
@@ -10843,7 +10891,7 @@
                 darkmux_flow::Level::Info,
                 darkmux_flow::FlowAction::DispatchStart,
                 "coder",
-                &crate::test_session("sess-clean"),
+                &crate::test_session("sess-clean"), &darkmux_types::execution_id::ExecutionId::mint(),
                 Some("darkmux:qwen3.6"),
                 None,
                 None,
@@ -10892,7 +10940,7 @@
             let mut guard = DispatchBookendGuard::new(
                 &mut sink,
                 "coder".into(),
-                crate::mission_test_session("pre-1.0-compat-sweep", "sess-panic"),
+                crate::mission_test_session("pre-1.0-compat-sweep", "sess-panic"), darkmux_types::execution_id::ExecutionId::mint(),
                 "darkmux:qwen3.6".into(),
                 None,
                 None,
@@ -10901,7 +10949,7 @@
                 darkmux_flow::Level::Info,
                 darkmux_flow::FlowAction::DispatchStart,
                 "coder",
-                &crate::mission_test_session("pre-1.0-compat-sweep", "sess-panic"),
+                &crate::mission_test_session("pre-1.0-compat-sweep", "sess-panic"), &darkmux_types::execution_id::ExecutionId::mint(),
                 Some("darkmux:qwen3.6"),
                 None,
                 None,
@@ -11212,6 +11260,15 @@
         }
 
         let records = drain_flow_records(tmp.path());
+
+        // Every record of the tailed execution (its turns, tool calls and
+        // usage) names it, with no exception.
+        let execution = state.execution.as_str();
+        let of_the_execution: Vec<&serde_json::Value> = records.iter().filter(|r| r.get("action").is_some()).collect();
+        assert!(of_the_execution.len() >= 7, "two turns, three tools, two usage records: {records:?}");
+        for r in of_the_execution {
+            assert_eq!(r["execution_id"], execution, "a record of the execution names it: {r}");
+        }
 
         // dispatch.turn — running count 1,2; step_id stamped on each.
         let turn_recs: Vec<&serde_json::Value> = records
@@ -12554,7 +12611,7 @@
             runtime_binary: None,
             image: "darkmux-runtime:latest".to_string(),
             role_id: "test-role".to_string(),
-            session_id: crate::test_session("sess-test"),
+            execution: darkmux_types::execution_id::ExecutionId::parse("exec-test").unwrap(),
             model: "primary-model".to_string(),
             system_prompt: "Basic role.".to_string(),
             message: "Hello world".to_string(),
@@ -14285,7 +14342,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         let started = Instant::now();
         let _summary = run_tailer(
             out_dir.path().to_path_buf(),
-            crate::test_session("test-session"),
+            crate::test_session("test-session"), darkmux_types::execution_id::ExecutionId::mint(),
             "coder".to_string(),
             "test-model".to_string(),
             None,
@@ -14653,7 +14710,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             let (_guard, handle) = spawn_guarded_tailer(
                 &stop_flag_for_closure,
                 out_dir,
-                crate::test_session("test-session"),
+                crate::test_session("test-session"), darkmux_types::execution_id::ExecutionId::mint(),
                 "test-role".to_string(),
                 "test-model".to_string(),
                 None,
@@ -14746,7 +14803,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             let (_guard, handle) = spawn_guarded_sampler(
                 &sampler_stop_for_closure,
                 "test-role".to_string(),
-                crate::test_session("test-session"),
+                crate::test_session("test-session"), darkmux_types::execution_id::ExecutionId::mint(),
                 "test-model".to_string(),
                 None,
                 None,
@@ -16756,7 +16813,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         let shared = Arc::new(Mutex::new(Instant::now()));
         let mut state = TailerState::new(
             traj_path.clone(),
-            crate::test_session("test-session"),
+            crate::test_session("test-session"), darkmux_types::execution_id::ExecutionId::mint(),
             "coder".into(),
             "darkmux:qwen3.6-35b-a3b".into(),
             Arc::clone(&shared),
@@ -17122,7 +17179,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::new(vec![]));
         let result = crate::budget::with_test_env(env.clone(), || {
             dispatch_remote(
-                &opts,
+                &opts, &darkmux_types::execution_id::ExecutionId::mint(),
                 &quarantine_test_role(),
                 "system prompt",
                 &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap(),
@@ -17174,7 +17231,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::new(vec![]));
         let result = crate::budget::with_test_env(env.clone(), || {
             dispatch_remote(
-                &opts,
+                &opts, &darkmux_types::execution_id::ExecutionId::mint(),
                 &quarantine_test_role(),
                 "system prompt",
                 &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap(),
@@ -17339,6 +17396,57 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         assert_eq!(summary.fold.compactions(), 0, "a start is not an installed compaction");
     }
 
+    /// (#1974, contract 8) A compaction is a sub-execution: a utility role's
+    /// own role execution. Its `utility.start` and its call's usage record
+    /// name ONE execution of their own (never the specialist's), attributed
+    /// to the compactor's role and model; each attempt is its own; and the
+    /// compactor's tokens never enter the specialist's execution.
+    #[test]
+    #[serial]
+    fn a_compaction_is_its_own_execution_apart_from_the_specialists() {
+        let (records, summary) = tail_events_for_usage(
+            "sess-sub-exec",
+            &[
+                r#"{"type":"model.completed","seq":1,"finish_reason":"stop","usage":{"prompt_tokens":1000,"completion_tokens":50,"total_tokens":1050}}"#,
+                r#"{"type":"compaction.start","generation":1,"ts":1790000000100,"requested_model":"darkmux:compactor-4b"}"#,
+                r#"{"type":"compaction.call","generation":1,"ts":1790000004600,"requested_model":"darkmux:compactor-4b","usage":{"prompt_tokens":500,"completion_tokens":80,"total_tokens":580}}"#,
+                r#"{"type":"compaction.start","generation":2,"ts":1790000009100,"requested_model":"darkmux:compactor-4b"}"#,
+                r#"{"type":"compaction.call","generation":2,"ts":1790000010100,"requested_model":"darkmux:compactor-4b","usage":{"prompt_tokens":7,"completion_tokens":1,"total_tokens":8}}"#,
+            ],
+        );
+        let exec = |r: &serde_json::Value| r["execution_id"].as_str().unwrap_or_default().to_string();
+        let of_handle = |h: &str, action: &str| -> Vec<&serde_json::Value> {
+            records.iter().filter(|r| r["handle"] == h && r["action"] == action).collect()
+        };
+        let turn = of_handle("coder", "telemetry.tokens");
+        assert_eq!(turn.len(), 1, "{records:#?}");
+        let specialist = exec(turn[0]);
+        assert!(!specialist.is_empty());
+        let starts = of_handle("compactor", "utility.start");
+        let calls = of_handle("compactor", "telemetry.tokens");
+        assert_eq!((starts.len(), calls.len()), (2, 2), "{records:#?}");
+        for (i, (st, call)) in starts.iter().zip(&calls).enumerate() {
+            assert_eq!(exec(st), exec(call), "attempt {i}: the start and its call are one execution");
+            assert_ne!(exec(st), specialist, "attempt {i}: a compaction is not the specialist's execution");
+            assert_eq!(st["model"], "darkmux:compactor-4b");
+        }
+        assert_ne!(exec(starts[0]), exec(starts[1]), "each attempt is its own execution");
+        let mut distinct: std::collections::BTreeSet<String> = records
+            .iter()
+            .filter(|r| r["action"] == "telemetry.tokens" || r["action"] == "utility.start")
+            .map(exec)
+            .collect();
+        distinct.remove("");
+        assert_eq!(distinct.len(), 3, "the specialist plus two compaction executions: {distinct:?}");
+        let specialist_tokens: u64 = records
+            .iter()
+            .filter(|r| r["action"] == "telemetry.tokens" && exec(r) == specialist)
+            .map(|r| r["payload"]["total_tokens"].as_u64().unwrap_or(0))
+            .sum();
+        assert_eq!(specialist_tokens, 1050, "the compactor's 588 tokens are not summed into the specialist's execution");
+        assert_eq!(summary.fold.tokens.total, 1050);
+    }
+
     /// (#2915 review, MUST 1) Each compaction attempt in an execution gets
     /// its own job id, even when a refused attempt repeats a generation.
     #[test]
@@ -17469,7 +17577,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
             serde_json::json!({ "url": base_url, "dialect": "chat-completions-max-tokens" }),
         );
         let result = dispatch_remote(
-            &opts,
+            &opts, &darkmux_types::execution_id::ExecutionId::mint(),
             &quarantine_test_role(),
             "system prompt",
             &crate::target::target_for("p".into(), Default::default(), pm).unwrap(),
@@ -17511,7 +17619,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         opts.phase_id = None;
         opts.json = false;
         let pm = darkmux_types::ProfileModel::hosted_for_test("gpt-remote", Some(100000), serde_json::json!({"url": base_url}));
-        let result = dispatch_remote(&opts, &quarantine_test_role(), "system prompt", &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap());
+        let result = dispatch_remote(&opts, &darkmux_types::execution_id::ExecutionId::mint(), &quarantine_test_role(), "system prompt", &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap());
         unsafe {
             match prev_home {
                 Some(v) => std::env::set_var("DARKMUX_HOME", v),
@@ -17825,7 +17933,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         let stop = Arc::new(AtomicBool::new(true));
         let summary = run_tailer(
             tmp.path().to_path_buf(),
-            crate::test_session("sess-2869-drain"),
+            crate::test_session("sess-2869-drain"), darkmux_types::execution_id::ExecutionId::mint(),
             "coder".into(),
             "darkmux:m".into(),
             None,

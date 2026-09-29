@@ -8,19 +8,25 @@
 //! hand them over.
 //!
 //! 1. Attempts. A session's records segment into attempts, every mission's
-//!    together. An attempt opens on its first opening record (a
-//!    `dispatch.start`, `budget.wait`, `mission.start` or `step.start`, or,
-//!    when nothing of its mission opened yet, a turn, heartbeat, tool call
-//!    or rest). A record naming a mission joins that mission's latest
-//!    attempt (or adopts the current one when it names none yet). A record
-//!    naming none joins the latest attempt still open at its time, or the
-//!    latest opened when none is. A `dispatch.start` in an attempt that
-//!    already has one, or a reopening record after the attempt closed,
-//!    starts the next attempt.
+//!    together. An attempt opens on its first opening record (a bookend
+//!    start, `run.start` or `dispatch.start`; a `budget.wait`,
+//!    `mission.start` or `step.start`; or, when nothing of its mission
+//!    opened yet, a turn, heartbeat, tool call or rest). A record of an
+//!    execution (every execution-grain record carries its `execution_id`; a
+//!    pre-4.0 one reads as its session and mission) joins the latest attempt
+//!    of that execution, so a session holding several (a map's items) keeps
+//!    each one's records and its own close apart. Any other record, and one
+//!    of an execution with no attempt yet, joins by mission: a record naming
+//!    a mission joins that mission's latest attempt (or adopts the current
+//!    one when it names none yet). A record naming none joins the latest
+//!    attempt still open at its time, or the latest opened when none is. A
+//!    bookend start in an attempt that already has one, or a reopening
+//!    record after the attempt closed, starts the next attempt.
 //! 2. Close. An attempt closes on its first closing record. A closing record
 //!    seen before anything opened closes the first attempt left with none.
-//! 3. Outcome. A dispatch terminal is the outcome when the attempt has one,
-//!    even when a `session.end` closed it first.
+//! 3. Outcome. A bookend terminal (`run.complete` / `run.error`,
+//!    `dispatch.complete` / `dispatch.error`) is the outcome when the
+//!    attempt has one, even when a `session.end` closed it first.
 //! 4. Waiting. An open `budget.wait` holds the attempt live until its
 //!    announced resume time plus the grace; the staleness clock then runs
 //!    from there.
@@ -35,7 +41,8 @@
 //! lacks (the viewer holds a session's current run open on it).
 
 use crate::runs::{AbandonReason, RunStatus};
-use darkmux_flow::FlowAction;
+use darkmux_flow::{Edge, FlowAction, Grain};
+use darkmux_types::execution_id::ExecutionId;
 use std::sync::Arc;
 
 /// How a closed attempt ended: its status, and why when abandoned.
@@ -51,6 +58,8 @@ pub(crate) struct Ending {
 struct Folded {
     action: Option<FlowAction>,
     mission: Option<String>,
+    /// The execution the record is of; `None` for a record of another grain.
+    execution: Option<ExecutionId>,
     ts: String,
     /// Its `ts` as epoch seconds; `None` when unparsable.
     at: Option<u64>,
@@ -68,6 +77,7 @@ impl Folded {
         Folded {
             action: action.cloned(),
             mission: mission.map(str::to_string),
+            execution: action.filter(|a| a.grain() == Some(Grain::Execution)).map(|_| darkmux_flow::legacy::execution_of(v)),
             ts: ts.to_string(),
             at: crate::runs::parse_flow_ts(ts),
             names_a_reason: payload.get("reason").and_then(|r| r.as_str()).is_some_and(|r| !r.is_empty()),
@@ -79,10 +89,15 @@ impl Folded {
     fn ending(&self) -> Option<Ending> {
         let action = self.action.as_ref()?;
         let ended = |status, reason| Some(Ending { status, reason });
-        if matches!(action, FlowAction::DispatchComplete | FlowAction::StepComplete | FlowAction::MissionClose) {
+        match action.bookend().map(|b| b.edge) {
+            Some(Edge::Complete) => return ended(RunStatus::Complete, None),
+            Some(Edge::Error) => return ended(RunStatus::Error, None),
+            Some(Edge::Start) | None => {}
+        }
+        if matches!(action, FlowAction::StepComplete | FlowAction::MissionClose) {
             return ended(RunStatus::Complete, None);
         }
-        if matches!(action, FlowAction::DispatchError | FlowAction::StepError) {
+        if *action == FlowAction::StepError {
             return ended(RunStatus::Error, None);
         }
         if *action == FlowAction::SessionEnd {
@@ -94,13 +109,19 @@ impl Folded {
         (*action == FlowAction::BudgetStop).then_some(Ending { status: RunStatus::Abandoned, reason: Some(AbandonReason::NoTerminal) })
     }
 
-    fn is_dispatch_terminal(&self) -> bool {
-        matches!(self.action, Some(FlowAction::DispatchComplete | FlowAction::DispatchError))
+    /// A bookend terminal: the outcome over any other close (rule 3).
+    fn is_bookend_terminal(&self) -> bool {
+        self.action.as_ref().and_then(FlowAction::bookend).is_some_and(|b| b.edge.is_terminal())
     }
 }
 
+/// A bookend start, at either grain.
+fn is_bookend_start(a: &FlowAction) -> bool {
+    a.bookend().is_some_and(|b| b.edge == Edge::Start)
+}
+
 fn is_reopener(a: &FlowAction) -> bool {
-    matches!(a, FlowAction::DispatchStart | FlowAction::BudgetWait | FlowAction::MissionStart | FlowAction::StepStart)
+    is_bookend_start(a) || matches!(a, FlowAction::BudgetWait | FlowAction::MissionStart | FlowAction::StepStart)
 }
 
 fn is_first_opener(a: &FlowAction) -> bool {
@@ -111,6 +132,9 @@ fn is_first_opener(a: &FlowAction) -> bool {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Attempt {
     pub mission: Option<String>,
+    /// The execution of its first record that is of one; `None` for an
+    /// attempt no execution has touched (a run's, a step's).
+    execution: Option<ExecutionId>,
     pub has_start: bool,
     pub start_ts: Option<String>,
     pub waited: bool,
@@ -118,7 +142,7 @@ pub(crate) struct Attempt {
     pub last_activity_ts: Option<String>,
     /// Its first closing record: when, and what it implies.
     pub close: Option<(String, Ending)>,
-    /// Its first dispatch terminal: the outcome over any other close (rule 3).
+    /// Its first bookend terminal: the outcome over any other close (rule 3).
     terminal: Option<Ending>,
     /// While a `budget.wait` is open: when it lapses, epoch ms.
     pub wait_until_ms: Option<u64>,
@@ -134,26 +158,29 @@ impl Attempt {
         if self.mission.is_none() {
             self.mission.clone_from(&r.mission);
         }
+        if self.execution.is_none() {
+            self.execution.clone_from(&r.execution);
+        }
         // Segmented in time order, so the newest timed record is the last.
         if r.at.is_some() {
             self.last_activity_ts = Some(r.ts.clone());
         }
         let Some(action) = r.action.as_ref() else { return };
-        if *action == FlowAction::DispatchStart && !self.has_start {
+        if is_bookend_start(action) && !self.has_start {
             self.has_start = true;
             self.start_ts = (!r.ts.is_empty()).then(|| r.ts.clone());
         }
         if let Some(ending) = r.ending() {
-            self.close_with(&r.ts, ending, r.is_dispatch_terminal());
+            self.close_with(&r.ts, ending, r.is_bookend_terminal());
         }
         self.fold_wait(action, r);
     }
 
-    fn close_with(&mut self, ts: &str, ending: Ending, dispatch_terminal: bool) {
+    fn close_with(&mut self, ts: &str, ending: Ending, bookend_terminal: bool) {
         if self.close.is_none() {
             self.close = Some((ts.to_string(), ending));
         }
-        if dispatch_terminal && self.terminal.is_none() {
+        if bookend_terminal && self.terminal.is_none() {
             self.terminal = Some(ending);
         }
         self.wait_until_ms = None;
@@ -174,7 +201,10 @@ impl Attempt {
 }
 
 /// The attempt a record joins (rule 1), by index.
-fn target_for(attempts: &[Attempt], mission: Option<&str>) -> Option<usize> {
+fn target_for(attempts: &[Attempt], mission: Option<&str>, execution: Option<&ExecutionId>) -> Option<usize> {
+    if let Some(own) = execution.and_then(|x| attempts.iter().rposition(|a| a.execution.as_ref() == Some(x))) {
+        return Some(own);
+    }
     let cur = attempts.len().checked_sub(1);
     let Some(m) = mission else {
         return attempts.iter().rposition(|a| a.close.is_none()).or(cur);
@@ -187,7 +217,7 @@ fn target_for(attempts: &[Attempt], mission: Option<&str>) -> Option<usize> {
 fn opens(attempts: &[Attempt], mine: Option<usize>, action: &FlowAction) -> bool {
     let Some(i) = mine else { return is_reopener(action) || is_first_opener(action) };
     let a = &attempts[i];
-    is_reopener(action) && (a.close.is_some() || (*action == FlowAction::DispatchStart && a.has_start))
+    is_reopener(action) && (a.close.is_some() || (is_bookend_start(action) && a.has_start))
 }
 
 /// Rule 2's skew case: each closing record seen before anything of its
@@ -219,7 +249,7 @@ fn segment(records: &[Folded]) -> Vec<Attempt> {
     let mut attempts: Vec<Attempt> = Vec::new();
     let mut orphans: Vec<&Folded> = Vec::new();
     for r in order {
-        let mut target = target_for(&attempts, r.mission.as_deref());
+        let mut target = target_for(&attempts, r.mission.as_deref(), r.execution.as_ref());
         if r.action.as_ref().is_some_and(|a| opens(&attempts, target, a)) {
             attempts.push(Attempt { mission: r.mission.clone(), ..Attempt::default() });
             target = Some(attempts.len() - 1);
@@ -261,7 +291,7 @@ impl RunFold {
     /// end when nothing of it opened (rule 2): not a run, but a session that
     /// recorded how it ended (the crash shape: the presence reconciler's
     /// `session.end`, the opening records in an older day or never written).
-    /// An attempt holding only that close: its dispatch terminal when it has
+    /// An attempt holding only that close: its bookend terminal when it has
     /// one (rule 3), else its earliest closing record; `None` when nothing
     /// closed. Read only where no attempt opened (`latest`/`latest_of` are
     /// `None`): an opened session's closes are its attempts'.
@@ -269,7 +299,7 @@ impl RunFold {
         let mut closes: Vec<&Folded> =
             self.records.iter().filter(|r| r.ending().is_some() && (mission.is_none() || r.mission.as_deref() == mission)).collect();
         closes.sort_by_key(|r| (r.at.is_none(), r.at));
-        let record = closes.iter().find(|r| r.is_dispatch_terminal()).or(closes.first())?;
+        let record = closes.iter().find(|r| r.is_bookend_terminal()).or(closes.first())?;
         let mut end = Attempt { mission: record.mission.clone(), ..Attempt::default() };
         end.add(record);
         Some(end)

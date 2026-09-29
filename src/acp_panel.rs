@@ -612,61 +612,35 @@ pub fn run_ephemeral(
     // written).
     let correlation = RunId::mission(mint_ephemeral_correlation_id(&config.id))?;
 
-    // (#1877 QA must-fix 1) A whole-run dispatch bookend, PRESCRIBED here
-    // too — not just for `darkmux mission launch`. Before this, `run_
-    // ephemeral` was a second door into `run_step_graph` with none: the
-    // SAME cmd configs `launch()` now covers (`pr-merge`, `pr-approve`) run
-    // through here whenever the ACP panel in Zed invokes them, so a
-    // panel-launched `pr-merge` that hung had no liveness signal at all,
-    // and the Runs lens showed nothing for it. The bookend pair is what
-    // makes an ephemeral run's liveness visible, the same way `mission_
-    // bookend_record`'s own doc explains for `launch`. Reuses `mission_
-    // launch`'s own builder (`mission_bookend_record`) rather than a
-    // second hand-rolled copy of the record shape — same discipline #1685
-    // QA MUST-FIX 2 already applied to `emit_cmd_audit`. No mission
-    // instance is minted either way (rule D still holds): `mission_id`/
-    // `session_id` on every record here is the per-invocation
-    // `correlation_id`, never a real mission id.
-    //
-    // (#2413 M3) This path used to ALSO run its own per-invocation host
-    // sampler (`HostTelemetrySampler`, drained into `telemetry.process`
-    // records) — retired along with the generic launch path's identical
-    // construction. One machine-scoped sampler now covers every live
-    // dispatch on the machine, this ephemeral path included; there is
-    // nothing left for this function to start or drain.
-    let mut dispatch_sink = |record: crate::flow::FlowRecord| {
+    // (#1877 QA must-fix 1, contract 8) The run bookend, the same one
+    // `mission launch` opens and built by the same `run_bookend_record`: the
+    // cmd configs a panel runs here (`pr-merge`, `pr-approve`) are runs too,
+    // and one that hung would otherwise have no liveness signal. No mission
+    // instance is minted (rule D): every record's run is the per-invocation
+    // `correlation` id. Host samples are the machine-scoped sampler's job.
+    let mut run_sink = |record: crate::flow::FlowRecord| {
         let _ = crate::flow::record(record);
     };
     let config_id_for_abort = config.id.clone();
     let correlation_for_abort = correlation.clone();
-    // `BookendGuard`'s Drop fires this `on_abort` closure for any exit
-    // between `open()` below and a matching `close()` that this function
-    // doesn't already reach explicitly — mirrors `launch`'s own bookend;
-    // see its doc for why this is the accepted backstop for the
-    // unexpected case, not the primary mechanism.
-    let mut bookend = crate::flow::BookendGuard::new(&mut dispatch_sink, move |_id, _kind| {
-        crate::mission_launch::mission_bookend_record(
-            crate::flow::Level::Error,
-            darkmux_flow::FlowAction::DispatchError,
+    // The guard's Drop writes `run.error` for any exit between `open` and a
+    // matching `close` that this function does not reach explicitly (a
+    // panic): the backstop, as in `launch`.
+    let mut bookend = crate::flow::BookendGuard::new(&mut run_sink, move |_id, _kind| {
+        crate::mission_launch::run_bookend_record(
+            crate::flow::Edge::Error,
             &config_id_for_abort,
             &correlation_for_abort,
             serde_json::json!({
-                "runtime": "ephemeral",
                 "result_class": "error",
-                "error": "ephemeral panel dispatch terminated before completion (early return or panic)",
+                "error": "ephemeral panel run terminated before completion (early return or panic)",
             }),
         )
     });
     bookend.open(
-        "dispatch",
-        "dispatch",
-        crate::mission_launch::mission_bookend_record(
-            crate::flow::Level::Info,
-            darkmux_flow::FlowAction::DispatchStart,
-            &config.id,
-            &correlation,
-            serde_json::json!({ "runtime": "ephemeral" }),
-        ),
+        "run",
+        "run",
+        crate::mission_launch::run_bookend_record(crate::flow::Edge::Start, &config.id, &correlation, serde_json::json!({})),
     );
 
     // (#1685) Track whether an operator sign-off gate was actually
@@ -729,14 +703,12 @@ pub fn run_ephemeral(
         Ok(report) => report,
         Err(e) => {
             bookend.close(
-                "dispatch",
-                crate::mission_launch::mission_bookend_record(
-                    crate::flow::Level::Error,
-                    darkmux_flow::FlowAction::DispatchError,
+                "run",
+                crate::mission_launch::run_bookend_record(
+                    crate::flow::Edge::Error,
                     &config.id,
                     &correlation,
                     serde_json::json!({
-                        "runtime": "ephemeral",
                         "result_class": "error",
                         "error": e.to_string(),
                     }),
@@ -750,14 +722,12 @@ pub fn run_ephemeral(
         Ok(outcome) => outcome,
         Err(e) => {
             bookend.close(
-                "dispatch",
-                crate::mission_launch::mission_bookend_record(
-                    crate::flow::Level::Error,
-                    darkmux_flow::FlowAction::DispatchError,
+                "run",
+                crate::mission_launch::run_bookend_record(
+                    crate::flow::Edge::Error,
                     &config.id,
                     &correlation,
                     serde_json::json!({
-                        "runtime": "ephemeral",
                         "result_class": "error",
                         "error": e.to_string(),
                     }),
@@ -768,14 +738,12 @@ pub fn run_ephemeral(
     };
 
     bookend.close(
-        "dispatch",
-        crate::mission_launch::mission_bookend_record(
-            if outcome.success { crate::flow::Level::Info } else { crate::flow::Level::Error },
-            if outcome.success { darkmux_flow::FlowAction::DispatchComplete } else { darkmux_flow::FlowAction::DispatchError },
+        "run",
+        crate::mission_launch::run_bookend_record(
+            if outcome.success { crate::flow::Edge::Complete } else { crate::flow::Edge::Error },
             &config.id,
             &correlation,
             serde_json::json!({
-                "runtime": "ephemeral",
                 "result_class": if outcome.success { "ok" } else { "error" },
             }),
         ),
@@ -1582,20 +1550,17 @@ mod tests {
         }
     }
 
-    // ── #1877 QA must-fix 1 — `run_ephemeral` gets telemetry + the same ──
-    // whole-run `dispatch *` bookend pair `mission_launch::launch` gives
-    // every OTHER config. Before this, a panel-launched `pr-merge` had
-    // neither: identical steps, identical `cmd`, zero observability.
+    // ── #1877 QA must-fix 1 — `run_ephemeral` gets the same run bookend ──
+    // `mission_launch::launch` gives every other config.
     //
-    // RED PROVED: against the pre-fix `run_ephemeral` (no telemetry/bookend
-    // construction at all), `read_all_flow_records()` in both tests below
-    // returned only the step's own `step result` record — no `source:
-    // "mission"` record of any kind, so the `starts`/`terminals` filters
-    // found nothing and both `assert_eq!(..., 1, ...)` calls failed on `0`.
+    // RED PROVED: against the pre-fix `run_ephemeral` (no bookend at all),
+    // `read_all_flow_records()` in both tests below returned only the
+    // step's own `step result` record, and both `assert_eq!(..., 1, ...)`
+    // calls failed on `0`.
 
     #[test]
     #[serial_test::serial]
-    fn run_ephemeral_emits_a_mission_source_dispatch_bookend_pair_on_success() {
+    fn run_ephemeral_emits_a_run_bookend_pair_on_success() {
         let tmp_flows = tempfile::TempDir::new().unwrap();
         let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
         unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", tmp_flows.path()) };
@@ -1610,22 +1575,15 @@ mod tests {
         assert!(out.success);
 
         let records = read_all_flow_records();
-        let mission_records: Vec<&serde_json::Value> =
-            records.iter().filter(|r| r["source"] == "mission").collect();
-        let starts: Vec<&&serde_json::Value> =
-            mission_records.iter().filter(|r| r["action"] == "dispatch.start").collect();
+        let run_records: Vec<&serde_json::Value> = records.iter().filter(|r| is_run_bookend(r)).collect();
+        let starts: Vec<&&serde_json::Value> = run_records.iter().filter(|r| r["action"] == "run.start").collect();
         let completes: Vec<&&serde_json::Value> =
-            mission_records.iter().filter(|r| r["action"] == "dispatch.complete").collect();
-        assert_eq!(
-            starts.len(),
-            1,
-            "an ephemeral run must open exactly one mission-level bookend, matching launch()'s \
-             own pair: {mission_records:#?}"
-        );
-        assert_eq!(
-            completes.len(),
-            1,
-            "a successful ephemeral run must close as `dispatch complete`: {mission_records:#?}"
+            run_records.iter().filter(|r| r["action"] == "run.complete").collect();
+        assert_eq!(starts.len(), 1, "an ephemeral run opens exactly one run bookend, as launch() does: {run_records:#?}");
+        assert_eq!(completes.len(), 1, "a successful ephemeral run closes as `run.complete`: {run_records:#?}");
+        assert!(
+            !records.iter().any(|r| r["action"] == "dispatch.start"),
+            "a procedural run has no role execution, so no `dispatch.start`: {records:#?}"
         );
         assert_eq!(starts[0]["handle"], serde_json::json!("bookend-noop-test"));
         let mission_id = starts[0]["mission_id"].as_str().expect("mission_id present").to_string();
@@ -1747,7 +1705,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn run_ephemeral_closes_the_bookend_as_dispatch_error_when_the_gate_declines() {
+    fn run_ephemeral_closes_the_run_as_run_error_when_the_gate_declines() {
         let tmp_flows = tempfile::TempDir::new().unwrap();
         let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
         unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", tmp_flows.path()) };
@@ -1762,19 +1720,11 @@ mod tests {
         assert!(!out.success);
 
         let records = read_all_flow_records();
-        let mission_records: Vec<&serde_json::Value> =
-            records.iter().filter(|r| r["source"] == "mission").collect();
-        let starts: Vec<&&serde_json::Value> =
-            mission_records.iter().filter(|r| r["action"] == "dispatch.start").collect();
-        let errors: Vec<&&serde_json::Value> =
-            mission_records.iter().filter(|r| r["action"] == "dispatch.error").collect();
-        assert_eq!(starts.len(), 1, "{mission_records:#?}");
-        assert_eq!(
-            errors.len(),
-            1,
-            "a declined gate is a command FAILURE — the bookend must close as `dispatch error`: \
-             {mission_records:#?}"
-        );
+        let run_records: Vec<&serde_json::Value> = records.iter().filter(|r| is_run_bookend(r)).collect();
+        let starts: Vec<&&serde_json::Value> = run_records.iter().filter(|r| r["action"] == "run.start").collect();
+        let errors: Vec<&&serde_json::Value> = run_records.iter().filter(|r| r["action"] == "run.error").collect();
+        assert_eq!(starts.len(), 1, "{run_records:#?}");
+        assert_eq!(errors.len(), 1, "a declined gate is a command FAILURE: the run closes as `run.error`: {run_records:#?}");
 
         unsafe {
             match prev_flows {
@@ -2160,6 +2110,11 @@ mod tests {
     /// Every flow record written to the isolated `DARKMUX_FLOWS_DIR` so far
     /// — mirrors `mission_launch.rs`'s own `read_all_flow_records` test
     /// helper (same on-disk shape, read raw off disk).
+    /// Whether a written record is a run bookend (`run.*`).
+    fn is_run_bookend(r: &serde_json::Value) -> bool {
+        darkmux_flow::reader::action_of(r).and_then(|a| a.bookend()).is_some_and(|b| b.grain == darkmux_flow::Grain::Run)
+    }
+
     fn read_all_flow_records() -> Vec<serde_json::Value> {
         let dir = std::env::var("DARKMUX_FLOWS_DIR").expect("DARKMUX_FLOWS_DIR must be set by an active guard");
         let mut out = Vec::new();

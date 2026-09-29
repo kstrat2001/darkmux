@@ -4,11 +4,11 @@
  * (#2302) ONE finding a unit's dispatch recorded, named by the key its
  * store answers to — the address a FOLLOW-ON step hands to `brief_refs`.
  *
- * The key is `<dispatch session id>/<emit_seq>`, exactly the form
+ * The key is `<execution id>/<emit_seq>`, exactly the form
  * [`darkmux_crew::findings::parse_key`] splits and
- * [`darkmux_crew::findings::load_at`] resolves: the unit's dispatch owns
- * the session id, and `emit_seq` is the 1-based ordinal of the acceptance
- * within that dispatch, which is the finding file's own non-empty-line
+ * [`darkmux_crew::findings::load_at`] resolves: the unit's dispatch is one
+ * execution, and `emit_seq` is the 1-based ordinal of the acceptance
+ * within it, which is the finding file's own non-empty-line
  * ordinal (the runtime writes `emit_seq = count + 1` after appending).
  * Nothing is re-derived from the model's prose — `file`/`line`/`rule` are
  * copied off the record the crawl already stamps, so this carries no
@@ -16,7 +16,7 @@
  */
 export type FindingRef = { 
 /**
- * `<dispatch>/<seq>` — the finding store's key.
+ * `<execution>/<seq>` — the finding store's key.
  */
 key: string, 
 /**

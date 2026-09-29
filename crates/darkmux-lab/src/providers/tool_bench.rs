@@ -2440,6 +2440,7 @@ not json — tolerated
             .to_string(),
             stderr: String::new(),
             session_id: darkmux_types::session_id::SessionId::adhoc(darkmux_types::session_id::RunId::lab("r").unwrap(), "coder", "s"),
+            execution: None,
             // No out_dir: `run()`'s trajectory-copy block is a no-op on
             // `None` (see its own `if let Some(out) = out_dir.as_deref()`),
             // so a mocked dispatch needs no `.darkmux-runtime/` fixture.
@@ -2582,6 +2583,7 @@ not json — tolerated
                 stdout: String::new(),
                 stderr: "container exited".into(),
                 session_id: darkmux_types::session_id::SessionId::adhoc(darkmux_types::session_id::RunId::lab("r").unwrap(), "coder", "s"),
+                execution: None,
                 out_dir: None,
                 trajectory: None,
             })

@@ -501,6 +501,7 @@ pub(crate) fn load_phase_by_id(phase_id: &str) -> Result<Phase> {
                 ),
                 phase_id: Some(phase_id.to_string()),
                 session_id: None,
+                execution_id: None,
                 source: Some("phase_lifecycle".to_string()),
                 model: None,
                 reasoning: None,

@@ -1229,6 +1229,7 @@ mod tests {
                     stdout: format!("ran {} on {profile}", job.role_id),
                     stderr: String::new(),
                     session_id: job.session_id,
+                    execution: None,
                     out_dir: None,
                     trajectory: None,
                 })
@@ -2244,7 +2245,7 @@ mod tests {
                 test_resolution(None)
             }),
             execute: Arc::new(|j: WorkJob, _, _| {
-                Ok(DispatchResult { exit_code: 0, stdout: String::new(), stderr: String::new(), session_id: j.session_id, out_dir: None, trajectory: None })
+                Ok(DispatchResult { exit_code: 0, stdout: String::new(), stderr: String::new(), session_id: j.session_id, execution: None, out_dir: None, trajectory: None })
             }),
             seats: Arc::new(SeatBook::new(1)),
             busy_policy: BusyPolicy::Refuse,

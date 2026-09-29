@@ -19,7 +19,7 @@ pub(crate) fn mission_caller(mid: &str) -> BudgetCaller<'static> {
 
 /// A caller under `session` (leaked: a test's caller lives for the test).
 fn caller_in(session: SessionId) -> BudgetCaller<'static> {
-    BudgetCaller { session: Box::leak(Box::new(session)), role_id: None, model: None, phase_id: None, profiles_file: None }
+    BudgetCaller { session: Box::leak(Box::new(session)), execution: Box::leak(Box::new(ExecutionId::mint())), role_id: None, model: None, phase_id: None, profiles_file: None }
 }
 
 const T0: i64 = 1_790_000_000; // a fixed epoch second, the frozen "now"
@@ -539,6 +539,18 @@ fn budget_records_land_on_the_callers_run() {
         (Some("budget-test.solo.adhoc.coder.1"), None),
         "a standalone run: no mission"
     );
+}
+
+/// Every budget record is about the ONE execution whose call was gated:
+/// the wait and the stop its run's abort ends both name the caller's
+/// execution, and no other.
+#[test]
+fn budget_records_name_the_gated_calls_execution() {
+    let env = FakeEnv::full_window().stopped_after(1, "mission `m-a` is aborted");
+    let caller = mission_caller("m-a");
+    let _ = admit_with(budget(BudgetPolicy::Wait, Some(1_000), None, None), &caller, &env);
+    let got: Vec<Option<darkmux_types::execution_id::ExecutionId>> = env.emitted.borrow().iter().map(|r| r.execution_id.clone()).collect();
+    assert_eq!(got, vec![Some(caller.execution.clone()), Some(caller.execution.clone())], "wait and stop, both of the caller's execution");
 }
 
 /// `wait` holds the call until the rolling window has room, says how

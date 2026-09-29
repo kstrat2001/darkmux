@@ -3699,9 +3699,7 @@ fn scan_flow_days(flows_dir: &std::path::Path) -> Vec<serde_json::Value> {
             }
             // A dispatch = a dispatch.start edge.
             if darkmux_flow::reader::action_of(&v) == Some(darkmux_flow::FlowAction::DispatchStart) {
-                if let Some(s) = v.get("session_id").and_then(|s| s.as_str()) {
-                    dispatches.insert(s.to_string());
-                }
+                dispatches.insert(darkmux_flow::legacy::execution_of(&v).to_string());
             }
         }
         days.push(serde_json::json!({
@@ -3968,9 +3966,7 @@ fn scan_flow_missions(
             e.last_date = date.to_string();
         }
         if darkmux_flow::reader::action_of(v) == Some(darkmux_flow::FlowAction::DispatchStart) {
-            if let Some(s) = v.get("session_id").and_then(|s| s.as_str()) {
-                e.dispatches.insert(s.to_string());
-            }
+            e.dispatches.insert(darkmux_flow::legacy::execution_of(v).to_string());
         }
         if let Some(mach) = v.get("machine_id").and_then(|m| m.as_str()) {
             if !mach.is_empty() {
@@ -4201,7 +4197,8 @@ struct HostSampleJoinStats {
 /// doc for why a time+machine join replaced the old session_id match.
 /// A no-op when the session carries no `machine_uid` (pre-#2413 historical
 /// records, or a record shape this join can't key on) or no parsable
-/// `dispatch.start` — the run-detail pane's own "no host samples" tile
+/// bookend start (`run.start` / `dispatch.start`) — the run-detail pane's
+/// own "no host samples" tile
 /// covers that case, not a synthesized window here.
 ///
 /// (#2647) This join bounds the WINDOW to the session, never the SAMPLES:
@@ -4224,13 +4221,11 @@ fn join_host_samples_into_session_records(
     records: &mut Vec<serde_json::Value>,
     now_ms: u64,
 ) -> HostSampleJoinStats {
-    use darkmux_flow::FlowAction;
-    let is_start = |r: &serde_json::Value| darkmux_flow::reader::action_of(r) == Some(FlowAction::DispatchStart);
+    use darkmux_flow::{Edge, FlowAction};
+    let edge = |r: &serde_json::Value| darkmux_flow::reader::action_of(r).and_then(|a| a.bookend()).map(|b| b.edge);
+    let is_start = |r: &serde_json::Value| edge(r) == Some(Edge::Start);
     let is_terminal = |r: &serde_json::Value| {
-        matches!(
-            darkmux_flow::reader::action_of(r),
-            Some(FlowAction::DispatchComplete | FlowAction::DispatchError | FlowAction::SessionEnd)
-        )
+        edge(r).is_some_and(Edge::is_terminal) || darkmux_flow::reader::action_of(r) == Some(FlowAction::SessionEnd)
     };
     // (live finding, 2026-09-06) `machine_uid` must come from the
     // dispatch-START record specifically, matching what the CLIENT gates
@@ -4894,24 +4889,24 @@ fn records_from_xrevrange(raw: redis::Value, date: Option<&str>) -> Result<Vec<s
 }
 
 /// The most records `GET /flow/:date` returns from the local day-file —
-/// the newest `MAX_FLOW_FILE_RECORDS` for everything EXCEPT the dispatch
-/// liveness bookends, matching the Redis path's `XREVRANGE … COUNT 10000`
+/// the newest `MAX_FLOW_FILE_RECORDS` for everything EXCEPT the liveness
+/// bookends, matching the Redis path's `XREVRANGE … COUNT 10000`
 /// cap (#900). The file path previously read the WHOLE file into memory +
 /// parsed every line into a `Vec`, so a large day-file under concurrent
 /// requests could OOM the daemon (the Redis path was already bounded; the
 /// snapshot path wasn't).
 ///
-/// (#2409) The cap applies to the supplementary-vocabulary ring only.
-/// `dispatch.start`/`dispatch.complete`/`dispatch.error` (a pre-4.0 spaced
-/// spelling reads as the same action through `darkmux_flow::reader`) are
-/// ALWAYS kept regardless of this count: cross-system contract 2 (dispatch
-/// liveness) requires that liveness surfaces key on these bookends, and
+/// (#2409) The cap applies to the supplementary-vocabulary ring only. The
+/// bookends, `run.*` and `dispatch.*` (a pre-4.0 spelling reads as its
+/// current action through `darkmux_flow::reader`), are ALWAYS kept
+/// regardless of this count: cross-system contract 2 (liveness) requires
+/// that liveness surfaces key on these bookends, and
 /// that supplementary vocabularies (here, high-cadence `telemetry.process`
 /// / `dispatch.turn.heartbeat` / `machine.telemetry`) never evict them. A
 /// live day file measured ~118 bookends against 56,829 total records. The
 /// bookend keep-list is its OWN ring under this same cap (newest kept), so
 /// the read stays constant-bounded even when a crash-looping producer emits
-/// a `dispatch error` bookend every second — #900's bound, not a second
+/// an error bookend every second — #900's bound, not a second
 /// unbounded read.
 // (#1715) Single-sourced from darkmux-flow's `FLOW_READ_CAP_RECORDS` — the
 // doctor/`flow status` near-maxlen warning reasons about THIS value (is
@@ -4923,7 +4918,7 @@ fn records_from_xrevrange(raw: redis::Value, date: Option<&str>) -> Result<Vec<s
 const MAX_FLOW_FILE_RECORDS: usize = darkmux_flow::FLOW_READ_CAP_RECORDS;
 
 /// Parse `<flows_dir>/<date>.jsonl` into a Vec of JSON values, keeping every
-/// dispatch-liveness bookend PLUS the newest `MAX_FLOW_FILE_RECORDS` of
+/// liveness bookend PLUS the newest `MAX_FLOW_FILE_RECORDS` of
 /// everything else (chronological order preserved throughout). Missing file
 /// = empty Vec (not an error).
 ///
@@ -4936,8 +4931,8 @@ const MAX_FLOW_FILE_RECORDS: usize = darkmux_flow::FLOW_READ_CAP_RECORDS;
 /// live: a busy day's `telemetry.process` volume fills the whole 10k window,
 /// so every `dispatch.start` sitting further back than that gets dropped and
 /// every activity bar built from it goes blank — cross-system contract 2
-/// (dispatch liveness) says a route serving liveness surfaces must never do
-/// that. This function now tracks the dispatch bookends in a
+/// (liveness) says a route serving liveness surfaces must never do that.
+/// This function now tracks the bookends in a
 /// separate always-kept list alongside the capped ring, carries each kept
 /// record's file-order line index, and merges the two lists by index at the
 /// end — so the cap still bounds memory for the high-cadence vocabulary
@@ -5024,8 +5019,8 @@ async fn read_flow_records_from_file(
 /// Non-UTF-8, empty, or non-JSON lines are dropped silently — the same
 /// tolerance the old `.lines()` loop had.
 ///
-/// (#2409) A `dispatch.start`/`dispatch.complete`/`dispatch.error` record
-/// goes to `bookends` and never touches the ring's cap. Everything else keeps the
+/// (#2409) A bookend (`run.*`, `dispatch.*`) goes to `bookends` and never
+/// touches the ring's cap. Everything else keeps the
 /// prior newest-`MAX_FLOW_FILE_RECORDS` ring behavior. `next_index` is
 /// advanced only for lines that actually parse, so the index each kept
 /// record carries is a dense, monotonic file-order position the caller can
@@ -5056,14 +5051,7 @@ fn push_flow_line(
     let index = *next_index;
     *next_index += 1;
 
-    if matches!(
-        darkmux_flow::reader::action_of(&v),
-        Some(
-            darkmux_flow::FlowAction::DispatchStart
-                | darkmux_flow::FlowAction::DispatchComplete
-                | darkmux_flow::FlowAction::DispatchError
-        )
-    ) {
+    if darkmux_flow::reader::action_of(&v).and_then(|a| a.bookend()).is_some() {
         if bookends.len() >= MAX_FLOW_FILE_RECORDS {
             bookends.pop_front();
         }
@@ -5511,6 +5499,7 @@ fn synthetic_stream_error_record(stream_name: &str, attempts: u32, reason: &str)
         handle: "redis_tail_lines".to_string(),
         phase_id: None,
         session_id: None,
+        execution_id: None,
         source: None,
         model: None,
         reasoning: Some(format!(

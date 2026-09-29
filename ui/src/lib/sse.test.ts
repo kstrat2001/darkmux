@@ -74,13 +74,13 @@ describe("startFlowTail", () => {
     expect(MockEventSource.instances).toHaveLength(1);
     expect(MockEventSource.instances[0].url).toBe("/flow/2026-08-09/stream");
 
-    MockEventSource.instances[0].emit(JSON.stringify({ action: "dispatch.start", ts: "2026-08-09T00:00:00Z" }));
-    MockEventSource.instances[0].emit(JSON.stringify({ action: "dispatch.complete", ts: "2026-08-09T00:00:05Z" }));
+    MockEventSource.instances[0].emit(JSON.stringify({ action: "dispatch.start", ts: "2026-08-09T00:00:00Z", execution_id: "exec-1" }));
+    MockEventSource.instances[0].emit(JSON.stringify({ action: "dispatch.complete", ts: "2026-08-09T00:00:05Z", execution_id: "exec-1" }));
 
     // Appended through the ingest boundary: each record carries its parsed time.
     expect(queryClient.getQueryData(queryKey)).toEqual([
-      { action: "dispatch.start", ts: "2026-08-09T00:00:00Z", tMs: Date.parse("2026-08-09T00:00:00Z") },
-      { action: "dispatch.complete", ts: "2026-08-09T00:00:05Z", tMs: Date.parse("2026-08-09T00:00:05Z") },
+      { action: "dispatch.start", ts: "2026-08-09T00:00:00Z", execution_id: "exec-1", tMs: Date.parse("2026-08-09T00:00:00Z") },
+      { action: "dispatch.complete", ts: "2026-08-09T00:00:05Z", execution_id: "exec-1", tMs: Date.parse("2026-08-09T00:00:05Z") },
     ]);
 
     handle.close();

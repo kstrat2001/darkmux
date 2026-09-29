@@ -1,11 +1,10 @@
 import {
   CALL_KIND,
   hasAnyTokenCounts,
-  runKeyMemo,
   sumUsage,
   type UsagePayload,
 } from "../../lib/usageRecords";
-import { ACTION, CATEGORY, type NormRecord } from "../../lib/ingest";
+import { ACTION, CATEGORY, executionOf, type NormRecord } from "../../lib/ingest";
 
 /**
  * `tokensOffMeter()` — the fleet hero's numbers (#783, #1186, #1607, #2902).
@@ -58,8 +57,9 @@ export function tokensOffMeter(data: NormRecord[]): TokensOffMeter {
  * not-reported where the old count coerced it truthy — hardening, since no
  * producer writes one.
  *
- * Keyed on `runKey`, `(session_id, mission_id)`: a deterministic session id
- * recurs across unrelated runs (#2709). Per run key:
+ * Keyed on the execution (`executionOf`: the record's `execution_id`, which
+ * for a pre-4.0 record is its session and mission, since a deterministic
+ * session id recurs across unrelated runs, #2709). Per execution:
  *
  *   - every token-bearing `dispatch complete` is one run (#2659: a re-launch
  *     under the same deterministic id closes with its own completion);
@@ -67,7 +67,7 @@ export function tokensOffMeter(data: NormRecord[]): TokensOffMeter {
  *     completion of the same LINEAGE already counted it. The lineage is
  *     whether the bookend names an `endpoint` (two seats sharing a
  *     task-scoped id, one on a named endpoint and one not, are two runs; a
- *     local `dispatch.map` step's token-less summary beside its seat's
+ *     pre-4.0 local `dispatch.map` step's token-less summary beside its seat's
  *     token-bearing completion is one, the MUST FIX 2 shape). This is a
  *     dedup of bookends, not a classification of where anything ran;
  *   - a key with no completion but with per-turn usage is one run in flight.
@@ -76,23 +76,22 @@ export function tokensOffMeter(data: NormRecord[]): TokensOffMeter {
  *     completion, and a compactor call is not a dispatch.
  */
 function dispatchCount(data: NormRecord[]): number {
-  // Per run key, a bit set over its completions (one pass, one key string
+  // Per execution, a bit set over its completions (one pass, one key string
   // per relevant record): which lineages it closed on, and which of those
   // closed with a token-bearing completion.
   const WITH_EP = 1, WITHOUT_EP = 2, TOK_WITH_EP = 4, TOK_WITHOUT_EP = 8;
   const closed = new Map<string, number>();
   const inFlight = new Set<string>();
-  const runKey = runKeyMemo();
   let runs = 0;
   for (const r of data) {
     const p = r.payload as (UsagePayload & { endpoint?: unknown }) | undefined;
     if (r.category === CATEGORY.Telemetry && r.source === "tokens") {
       const u = p ?? {};
-      if (u.call_kind !== CALL_KIND.single_shot && u.call_kind !== CALL_KIND.compaction && u.token_source !== "absent") inFlight.add(runKey(r));
+      if (u.call_kind !== CALL_KIND.single_shot && u.call_kind !== CALL_KIND.compaction && u.token_source !== "absent") inFlight.add(executionOf(r));
       continue;
     }
     if (!p || !r.session_id || r.action !== ACTION.DispatchComplete) continue;
-    const k = runKey(r);
+    const k = executionOf(r);
     const ep = !!p.endpoint;
     let bits = (closed.get(k) ?? 0) | (ep ? WITH_EP : WITHOUT_EP);
     if (hasAnyTokenCounts(p)) {

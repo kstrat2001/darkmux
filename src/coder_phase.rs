@@ -53,12 +53,11 @@ fn emit_run_record(
     phase_id: &str,
     payload: serde_json::Value,
 ) {
-    let _ = flow::record(crew::dispatch::build_dispatch_record_with_payload(
+    let _ = flow::record(crew::dispatch::build_session_record_with_payload(
         level,
         action,
         "mission-run",
         session,
-        None,
         Some(phase_id),
         Some(payload),
     ));
@@ -98,12 +97,11 @@ pub(crate) fn emit_step_result(
     {
         base.extend(extra);
     }
-    let _ = flow::record(crew::dispatch::build_dispatch_record_with_payload(
+    let _ = flow::record(crew::dispatch::build_session_record_with_payload(
         level,
         darkmux_flow::FlowAction::StepResult,
         "mission-run",
         session,
-        None,
         Some(phase_id),
         Some(full),
     ));

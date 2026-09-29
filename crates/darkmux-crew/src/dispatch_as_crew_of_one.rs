@@ -234,6 +234,7 @@ pub(crate) fn dispatch_as_crew_of_one_with(
                 stdout: raw.stdout,
                 stderr: raw.stderr,
                 session_id: raw.session_id,
+                execution: raw.execution_id,
                 out_dir: raw.out_dir,
                 // The packed step output carries the envelope, not the fold.
                 trajectory: None,
@@ -752,6 +753,7 @@ mod tests {
                 stdout: self.stdout.clone(),
                 stderr: self.stderr.clone(),
                 session_id: SessionId::parse(&session_id.unwrap_or_default())?,
+                execution_id: None,
                 out_dir: None,
             };
             let output = serde_json::to_string(&payload).unwrap();
@@ -1621,7 +1623,7 @@ mod tests {
             valid_checkpoint_json("coder"),
         )
         .unwrap();
-        crate::dispatch_internal::write_resume_origin_meta(resume_from.path(), &workdir_path, false, None);
+        crate::dispatch_internal::write_resume_origin_meta(resume_from.path(), &workdir_path, false, None, &darkmux_types::execution_id::ExecutionId::mint());
 
         let mut opts = test_opts("coder", "resume please");
         opts.resume_from = Some(resume_from.path().to_path_buf());

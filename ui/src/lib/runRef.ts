@@ -23,7 +23,7 @@
  * per-run lookup after the first is a map read.
  */
 
-import { ACTION, isAsOf, type NormRecord } from "./ingest";
+import { ACTION, bookendOf, isAsOf, type NormRecord } from "./ingest";
 import { segmentSession, type Attempt, type SessionSegments } from "./lifecycle";
 
 /** One attempt of one run. `attempt` indexes `RunGroup.attempts`. */
@@ -68,8 +68,9 @@ export interface RunRecords {
 }
 
 /** What kind of unit a group is (contract 8's grains):
- *  - `run`: a mission's whole-run bookend (`dispatch.start` sourced
- *    `mission`, or the retired review launcher's `review`);
+ *  - `run`: a run's own session, opened by `run.start` (a pre-4.0 archive's
+ *    whole-run `dispatch.start` reaches the viewer as `run.start`: the
+ *    daemon's reader upgrades it);
  *  - `execution`: model work (a dispatch, a budget-held call, or a turn,
  *    heartbeat, tool call or rest);
  *  - `lifecycle`: bookkeeping only (a mission's own lifecycle session, a
@@ -86,14 +87,6 @@ export interface RunIndex {
   groupOf(r: NormRecord): RunGroup | null;
 }
 
-const RUN_GRAIN_SOURCES: ReadonlySet<string> = new Set([
-  "mission",
-  // (#2881) The retired review launcher's whole-run bookend source (deleted
-  // in #2310 P4d). Archives are append-only (contract 8): readers stay
-  // bilingual.
-  "review",
-]);
-
 const EXECUTION_EVIDENCE: ReadonlySet<unknown> = new Set([
   ACTION.BudgetWait,
   ACTION.DispatchTurnHeartbeat,
@@ -103,7 +96,8 @@ const EXECUTION_EVIDENCE: ReadonlySet<unknown> = new Set([
 ]);
 
 function grainOfRecord(r: NormRecord): Grain {
-  if (r.action === ACTION.DispatchStart) return RUN_GRAIN_SOURCES.has(r.source ?? "") ? "run" : "execution";
+  const bookend = bookendOf(r.action);
+  if (bookend?.edge === "start") return bookend.grain;
   return EXECUTION_EVIDENCE.has(r.action) ? "execution" : "lifecycle";
 }
 

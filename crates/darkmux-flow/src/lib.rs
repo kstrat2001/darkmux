@@ -23,7 +23,7 @@ mod integrity;
 mod schema;
 mod status;
 
-pub use action::{FlowAction, FlowScope, UnknownAction};
+pub use action::{Bookend, Edge, FlowAction, FlowScope, Grain, UnknownAction};
 pub use bookend::*;
 pub use integrity::*;
 pub use schema::*;
@@ -101,7 +101,8 @@ pub trait FlowSink: Send + Sync {
 }
 
 /// A record that passed the write check: its action is one darkmux writes
-/// today, never [`FlowAction::Other`] (unknown) or [`FlowAction::Retired`].
+/// today, never [`FlowAction::Other`] (unknown) or [`FlowAction::Retired`],
+/// and a record of a role execution names it.
 /// Its field is private, so the only way to hand one to a sink is
 /// [`FlowSinkWrite::write`], the one chokepoint every sink's write goes
 /// through.
@@ -116,6 +117,9 @@ impl<'a> CheckedRecord<'a> {
             }
             FlowAction::Retired(retired) => {
                 anyhow::bail!("refusing to write a flow record with the retired action `{}`", retired.as_str())
+            }
+            known if known.grain() == Some(Grain::Execution) && record.execution_id.is_none() => {
+                anyhow::bail!("refusing to write a `{}` record with no execution id: it is a record of a role execution", known.as_str())
             }
             _ => Ok(Self(record)),
         }
@@ -2086,6 +2090,7 @@ mod tests {
             handle: "t".to_string(),
             phase_id: None,
             session_id: None,
+            execution_id: None,
             source: None,
             model: None,
             reasoning: None,
@@ -2191,6 +2196,7 @@ mod tests {
             handle: "test-1".to_string(),
             phase_id: None,
             session_id: None,
+            execution_id: None,
             source: None,
             model: None,
             reasoning: None,
@@ -2233,6 +2239,7 @@ mod tests {
             handle: handle.to_string(),
             phase_id: None,
             session_id: None,
+            execution_id: None,
             source: None,
             model: None,
             reasoning: None,
@@ -2336,6 +2343,7 @@ mod tests {
             handle: "handle-42".to_string(),
             phase_id: Some("sp-100".to_string()),
             session_id: Some("sess-abc".to_string()),
+            execution_id: None,
             source: Some("estimator".to_string()),
             model: None,
             reasoning: None,
@@ -2403,6 +2411,7 @@ mod tests {
                 handle: "ex-path-1".to_string(),
                 phase_id: None,
                 session_id: None,
+                execution_id: None,
                 source: Some("reviewer".to_string()),
                 model: None,
                 reasoning: None,
@@ -2449,6 +2458,7 @@ mod tests {
             handle: "ship-1".to_string(),
             phase_id: None,
             session_id: None,
+            execution_id: None,
             source: None,
             model: None,
             reasoning: None,
@@ -2504,6 +2514,7 @@ mod tests {
             handle: "ev-1".to_string(),
             phase_id: None,
             session_id: None,
+            execution_id: None,
             source: None,
             model: None,
             reasoning: None,
@@ -2651,6 +2662,7 @@ mod tests {
             handle: "h".to_string(),
             phase_id: None,
             session_id: None,
+            execution_id: None,
             source: None,
             model: None,
             reasoning: None,
@@ -2750,6 +2762,7 @@ mod tests {
         let mut rec = minimal_record();
         rec.action = crate::FlowAction::DispatchComplete;
         rec.session_id = Some("sess-1".to_string());
+        rec.execution_id = Some(darkmux_types::execution_id::ExecutionId::mint());
 
         // TeeSink returns Err (the audit child failed), but the breadcrumb is
         // the point.
@@ -2829,6 +2842,7 @@ mod tests {
             handle: "h".to_string(),
             phase_id: None,
             session_id: None,
+            execution_id: None,
             source: None,
             model: None,
             reasoning: None,
@@ -2870,6 +2884,7 @@ mod tests {
             handle: "h".to_string(),
             phase_id: None,
             session_id: None,
+            execution_id: None,
             source: None,
             model: None,
             reasoning: None,
@@ -2925,6 +2940,7 @@ mod tests {
             handle: "h".to_string(),
             phase_id: None,
             session_id: None,
+            execution_id: None,
             source: None,
             model: None,
             reasoning: None,
@@ -2968,6 +2984,7 @@ mod tests {
             handle: "h".to_string(),
             phase_id: None,
             session_id: None,
+            execution_id: None,
             source: None,
             model: None,
             reasoning: None,
@@ -3425,6 +3442,7 @@ mod tests {
             handle: "h".to_string(),
             phase_id: None,
             session_id: None,
+            execution_id: None,
             source: None,
             model: None,
             reasoning: None,
@@ -3460,6 +3478,7 @@ mod tests {
                 handle: "schema-check".to_string(),
                 phase_id: None,
                 session_id: None,
+                execution_id: None,
                 source: None,
                 model: None,
                 reasoning: None,
@@ -3643,6 +3662,7 @@ mod tests {
             handle: "y".to_string(),
             phase_id: None,
             session_id: None,
+            execution_id: None,
             source: None,
             model: None,
             reasoning: None,
@@ -3671,6 +3691,7 @@ mod tests {
             handle: "y".to_string(),
             phase_id: None,
             session_id: None,
+            execution_id: None,
             source: None,
             model: None,
             reasoning: None,
@@ -3714,6 +3735,7 @@ mod tests {
             handle: "h".to_string(),
             phase_id: None,
             session_id: None,
+            execution_id: None,
             source: None,
             model: None,
             reasoning: None,
@@ -3765,6 +3787,7 @@ mod tests {
             handle: "y".to_string(),
             phase_id: None,
             session_id: None,
+            execution_id: None,
             source: None,
             model: None,
             reasoning: None,
@@ -3798,6 +3821,7 @@ mod tests {
             handle: "y".to_string(),
             phase_id: None,
             session_id: None,
+            execution_id: None,
             source: None,
             model: None,
             reasoning: None,
@@ -3871,6 +3895,7 @@ mod tests {
                 handle: format!("h-{i}"),
                 phase_id: None,
                 session_id: None,
+                execution_id: None,
                 source: None,
                 model: None,
                 reasoning: None,
@@ -3936,6 +3961,7 @@ mod tests {
                 handle: format!("rec-{i}"),
                 phase_id: None,
                 session_id: None,
+                execution_id: None,
                 source: None,
                 model: None,
                 reasoning: None,
@@ -3985,6 +4011,7 @@ mod tests {
                 handle: format!("rec-{i}"),
                 phase_id: None,
                 session_id: None,
+                execution_id: None,
                 source: None,
                 model: None,
                 reasoning: None,
@@ -4056,6 +4083,7 @@ mod tests {
                 handle: format!("rec-{i}"),
                 phase_id: None,
                 session_id: None,
+                execution_id: None,
                 source: None,
                 model: None,
                 reasoning: None,
@@ -4163,6 +4191,7 @@ mod tests {
             handle: "h".to_string(),
             phase_id: None,
             session_id: None,
+            execution_id: None,
             source: None,
             model: None,
             reasoning: None,
@@ -4228,6 +4257,7 @@ mod tests {
             handle: handle.to_string(),
             phase_id: None,
             session_id: None,
+            execution_id: None,
             source: None,
             model: None,
             reasoning: None,
@@ -4633,6 +4663,7 @@ mod tests {
             handle: "test".to_string(),
             phase_id: None,
             session_id: None,
+            execution_id: None,
             source: None,
             model: None,
             reasoning: None,
@@ -4844,6 +4875,7 @@ mod tests {
             handle: "test".to_string(),
             phase_id: None,
             session_id: None,
+            execution_id: None,
             source: None,
             model: None,
             reasoning: None,
