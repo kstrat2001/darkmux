@@ -24,9 +24,9 @@ use tempfile::TempDir;
 // subprocess, so nothing about being launched FROM a test makes the
 // child read a test-shaped configuration. `DARKMUX_HOME` is the FIRST
 // tier of `paths::resolve` (`crates/darkmux-types/src/paths.rs`);
-// without it the child resolves `./.darkmux` and then the developer's
+// without it the child resolves the developer's
 // actual `~/.darkmux`, and every accessor that has no test-build guard
-// of its own (`crew_dir_override`, `fleet_file`,
+// of its own (`fleet_file`,
 // `identity_path_override`, `ack_dir_override`) then reads and WRITES
 // the operator's real state. Measured 2026-09-07 against this file's own
 // binary: with `DARKMUX_HOME` unset, `darkmux machine add` created
@@ -151,27 +151,11 @@ fn pin_child_tmpdir(cmd: &mut std::process::Command, home: &std::path::Path) {
 /// written). They point at the same tree, so a child sees one coherent
 /// root either way it resolves.
 ///
-/// (#2682 fix-pass round 3, MUST FIX 1) And one `env_remove`, because
-/// `DARKMUX_CREW_DIR` OUTRANKS both of them. `crew::loader::
-/// user_state_root()` — the resolver behind every `missions/` and
-/// `phases/` read and write — asks `config_access::crew_dir_override()`
-/// first and only falls back to the `DARKMUX_HOME` tier when that
-/// override is absent, so a child spawned by this helper with
-/// `DARKMUX_CREW_DIR` merely INHERITED from the ambient environment reads
-/// and writes the operator's real board, whatever root the two vars above
-/// name. Measured at this head with a sentinel exported: `cargo test
-/// --test cli mission_status_` failed 4 of 8, because each test's fixture
-/// (written under its own `DARKMUX_HOME`) was invisible to the subprocess
-/// reading it back. Clearing it here restores the intended
-/// `DARKMUX_HOME`-tier resolution for every spawn at once; the handful of
-/// tests that genuinely exercise the override still set it explicitly
-/// afterward, and a later `.env` wins over this `.env_remove`.
-///
 /// (#2704 fix-pass, MUST FIX 4) And now EVERY other state variable, taken
 /// from `test_isolation`'s two lists rather than one at a time. Hand-
 /// maintaining this helper's own little set is the bug class #2697
-/// filed, reproduced here: `DARKMUX_CREW_DIR` was cleared because someone
-/// hit it, and the other twelve were inherited straight from the ambient
+/// filed, reproduced here: one variable was cleared because someone
+/// hit it, and the others were inherited straight from the ambient
 /// shell. `DARKMUX_AUDIT_DIR` is the one that mattered. Measured at this
 /// head with the dir set exported to a sentinel and a fake `$HOME`:
 /// `cargo test --test cli -- machine_ flow_ init_ config_` returned
@@ -416,11 +400,8 @@ fn darkmux_cmd() -> Command {
 /// `darkmux_std_cmd()` is untouched, so the `dirs::home_dir()` accessors
 /// (`fleet_file` and friends) still cannot reach the operator.
 ///
-/// Setting `DARKMUX_HOME` rather than relying on `paths::resolve`'s
-/// project tier finding `./.darkmux` on its own is deliberate: the two
-/// resolve to the identical set of paths (only `DarkmuxPaths::scope`
-/// differs, which no production code reads), and an explicit value can't
-/// be defeated by an inherited one.
+/// `DARKMUX_HOME` is the one relocation (a `./.darkmux` is never adopted on
+/// its own), and an explicit value can't be defeated by an inherited one.
 fn darkmux_cmd_in_project(dir: &std::path::Path) -> Command {
     let mut cmd = darkmux_cmd();
     cmd.current_dir(dir).env("DARKMUX_HOME", dir.join(".darkmux"));
@@ -439,9 +420,8 @@ fn darkmux_cmd_in_project(dir: &std::path::Path) -> Command {
 /// `DARKMUX_HOME`, so a helper that kept only the `DARKMUX_HOME` half
 /// fails here rather than passing.
 ///
-/// The child's cwd is a fresh tempdir so the `./.darkmux` tier of
-/// `paths::resolve` cannot quietly absorb the write and turn a real
-/// regression into a green run.
+/// The child's cwd is a fresh tempdir, so a write that fell through to the cwd
+/// shows up as a `./.darkmux` there.
 #[test]
 fn darkmux_cmd_keeps_a_child_out_of_the_process_home() {
     let mut cmd = darkmux_std_cmd();
@@ -514,8 +494,8 @@ fn darkmux_cmd_keeps_a_child_out_of_the_process_home() {
     );
     assert!(
         !empty_cwd.path().join(".darkmux").exists(),
-        "(#2184) the child fell through to the project-local `./.darkmux` tier of \
-         paths::resolve instead of the helper's root"
+        "(#2184) the child wrote a `./.darkmux` in its cwd instead of the \
+         helper's root"
     );
 }
 
@@ -931,40 +911,82 @@ fn lab_loop_rejects_an_out_of_range_compact_threshold_ratio() {
         .stderr(predicate::str::contains("--compact-threshold-ratio 5 is out of range"));
 }
 
-// `mission dispatch` names an unknown mission and points at `mission
-// launch`, and rejects an id outside the identifier charset, both before
-// any fan-out. Runs without Redis or a model (the redis e2e twin of the
-// charset check skips on CI runners with no redis-server, #2938).
+/// (#2954) 4.0 retired the hand-built mission verbs with no alias: missions
+/// come only from mission configs (`mission launch`). Each old spelling is
+/// refused by name, exit 2, with the line naming its replacement; a wrong
+/// argument count or an unknown id never gets past the refusal, because the
+/// verb itself is gone.
 #[test]
-fn mission_dispatch_names_an_unknown_mission_and_how_to_create_one() {
-    darkmux_cmd()
-        .args(["mission", "dispatch", "no-such-mission", "--role", "coder", "--machine", "studio"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("mission `no-such-mission` not found"))
-        .stderr(predicate::str::contains("darkmux mission launch <config-id>"));
+fn retired_mission_verbs_are_refused_naming_the_replacement() {
+    let cases: [(&[&str], &str, &[&str]); 6] = [
+        (
+            &["mission", "dispatch", "m1", "--role", "coder", "--machine", "studio"],
+            "darkmux mission dispatch",
+            &["--profile <profile>@<machine>", "darkmux mission launch <config>"],
+        ),
+        (
+            &["mission", "add-phase", "m1", "--phase-id", "p2", "--description", "x"],
+            "darkmux mission add-phase",
+            &["darkmux mission launch <config>"],
+        ),
+        (&["mission", "start", "m1"], "darkmux mission start", &["darkmux mission launch <config>"]),
+        (&["mission", "pause", "m1"], "darkmux mission pause", &["darkmux mission abort <id>"]),
+        (&["mission", "resume", "m1"], "darkmux mission resume", &["darkmux mission finalize <id>"]),
+        (
+            &["dispatch", "coder", "hello", "--phase-id", "p1"],
+            "darkmux dispatch --phase-id",
+            &["darkmux mission launch <config>"],
+        ),
+    ];
+    for (args, named, remedies) in cases {
+        let mut assert = darkmux_cmd()
+            .args(args)
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains(format!("`{named}` was removed in 4.0")));
+        for remedy in remedies {
+            assert = assert.stderr(predicate::str::contains(*remedy));
+        }
+    }
 }
 
-// (#2916) The shared fleet work queue is retired, so a phase goes to one
-// named machine: `mission dispatch` with no `--machine` refuses and says how
-// to run the phase here instead.
+/// (#2954) The `--phase-id=<id>` spelling is the same retired flag.
 #[test]
-fn mission_dispatch_without_a_machine_names_the_retired_queue_and_the_local_alternative() {
+fn retired_dispatch_phase_id_equals_spelling_is_refused() {
     darkmux_cmd()
-        .args(["mission", "dispatch", "some-mission", "--role", "coder"])
+        .args(["dispatch", "coder", "hello", "--phase-id=p1"])
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("mission dispatch needs --machine <id>"))
-        .stderr(predicate::str::contains("--phase-id <phase>"));
+        .code(2)
+        .stderr(predicate::str::contains("`darkmux dispatch --phase-id` was removed in 4.0"));
 }
 
+/// (#2954) A non-UTF-8 argument alongside a bad flag is clap's usage error
+/// (exit 2), never a panic (101) from decoding argv.
+#[cfg(unix)]
 #[test]
-fn mission_dispatch_rejects_a_mission_id_outside_the_charset() {
+fn a_non_utf8_argument_with_a_bad_flag_is_a_usage_error_not_a_panic() {
+    use std::os::unix::ffi::OsStrExt;
+    let bad = std::ffi::OsStr::from_bytes(b"m\xff");
     darkmux_cmd()
-        .args(["mission", "dispatch", "../evil", "--role", "coder"])
+        .arg("dispatch")
+        .arg("coder")
+        .arg(bad)
+        .arg("--bogus")
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("mission_id contains invalid char"));
+        .code(2)
+        .stderr(predicate::str::contains("panicked").not());
+}
+
+/// (#2954) The inverse: an unknown verb that was never darkmux's keeps clap's
+/// own error, so the refusal table never shadows a typo with a wrong remedy.
+#[test]
+fn an_unknown_mission_verb_that_was_never_retired_keeps_clap_s_error() {
+    darkmux_cmd()
+        .args(["mission", "frobnicate", "m1"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("unrecognized subcommand"))
+        .stderr(predicate::str::contains("was removed in 4.0").not());
 }
 
 #[test]
@@ -1031,7 +1053,7 @@ fn retired_top_level_notebook_verb_is_unknown() {
 fn retired_mission_migrate_verb_is_unknown() {
     let tmp = TempDir::new().unwrap();
     darkmux_cmd()
-        .env("DARKMUX_CREW_DIR", tmp.path())
+        .env("DARKMUX_HOME", tmp.path())
         .args(["mission", "migrate"])
         .assert()
         .failure()
@@ -1053,6 +1075,18 @@ fn lab_eval_dead_funnel_flags_are_removed() {
             .failure()
             .stderr(predicate::str::contains(format!("unexpected argument '{flag}'")));
     }
+}
+
+/// (4.0) `finding list --dispatch` became `--execution`. The old spelling is
+/// refused by name (`retired_verbs`), so an operator's script learns the
+/// replacement instead of reading clap's "unexpected argument".
+#[test]
+fn finding_list_dispatch_flag_is_refused_naming_execution() {
+    darkmux_cmd()
+        .args(["finding", "list", "--dispatch", "sess-abc"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("`darkmux finding list --dispatch` was removed").and(predicate::str::contains("--execution")));
 }
 
 /// (#1426 phase 2) The `skills` top-level verb retired — `init` is the one
@@ -1224,15 +1258,19 @@ fn lab_kind_families_carry_their_members() {
         assert!(lab.contains(family), "lab --help lists `{family}`: {lab}");
     }
 
-    // `lab run` carries the recorded-run sub-verbs AND still takes a workload.
-    let run = help(&["lab", "run"]);
-    for sub in ["list", "inspect", "compare"] {
-        assert!(run.contains(sub), "lab run --help keeps `{sub}`: {run}");
-    }
+    // `lab run` is the launcher only; the recorded-run verbs are `run`'s.
+    let lab_run = help(&["lab", "run"]);
     assert!(
-        run.to_lowercase().contains("workload"),
-        "lab run --help still names the workload positional: {run}"
+        lab_run.to_lowercase().contains("workload"),
+        "lab run --help names the workload positional: {lab_run}"
     );
+    for sub in ["inspect", "compare", "stats"] {
+        assert!(!lab_run.contains(&format!("  {sub} ")), "lab run --help has no `{sub}` sub-verb: {lab_run}");
+    }
+    let run = help(&["run"]);
+    for sub in ["list", "inspect", "stats", "compare"] {
+        assert!(run.contains(sub), "run --help carries `{sub}`: {run}");
+    }
 
     let workload = help(&["lab", "workload"]);
     assert!(workload.contains("list"), "lab workload --help has `list`: {workload}");
@@ -1269,8 +1307,7 @@ fn retired_mission_run_subverb_is_unknown() {
 /// (#1463) The `phase` top-level verb family retired ENTIRELY: `estimate` +
 /// `review` + the `start`/`complete`/`abandon` lifecycle trio. Every spelling —
 /// the bare family and each old sub-verb — is now an unknown TOP-LEVEL verb with
-/// no compat alias (pre-2.0 clean removal). (`mission add-phase` is a DIFFERENT,
-/// surviving verb — it is NOT `darkmux phase`; see the mission-surface test.)
+/// no compat alias (pre-2.0 clean removal).
 #[test]
 fn retired_phase_family_is_unknown_entirely() {
     for args in [
@@ -1311,13 +1348,14 @@ fn retired_mission_ship_and_close_subverbs_are_unknown() {
     }
 }
 
-/// (#1463) The replacement surface EXISTS: the `mission` family lists `finalize`
-/// and `abort` (the two whole-mission terminals) and keeps `add-phase`, while
-/// `ship`/`close` are gone. Proves the rename landed — a change that dropped
-/// `finalize` or re-added `ship`/`close` can't pass both this and the
-/// retirement test above.
+/// (#1463, #2954) The replacement surface EXISTS: the `mission` family lists
+/// `launch` and the two whole-mission terminals `finalize` and `abort`, while
+/// `ship`/`close` (#1463) and the hand-built verbs `add-phase`/`dispatch`/
+/// `start`/`pause`/`resume` (#2954) are gone. A change that dropped a
+/// terminal or re-added a retired verb can't pass both this and the
+/// retirement tests above.
 #[test]
-fn mission_family_has_finalize_abort_addphase_but_not_ship_close() {
+fn mission_family_has_launch_finalize_abort_but_no_retired_verb() {
     let out = darkmux_cmd()
         .args(["mission", "--help"])
         .output()
@@ -1346,16 +1384,16 @@ fn mission_family_has_finalize_abort_addphase_but_not_ship_close() {
             }
         }
     }
-    for present in ["finalize", "abort", "add-phase"] {
+    for present in ["launch", "finalize", "abort"] {
         assert!(
             verbs.iter().any(|v| v == present),
-            "mission help must list `{present}` (#1463); parsed verbs: {verbs:?}"
+            "mission help must list `{present}`; parsed verbs: {verbs:?}"
         );
     }
-    for gone in ["ship", "close"] {
+    for gone in ["ship", "close", "add-phase", "dispatch", "start", "pause", "resume"] {
         assert!(
             !verbs.iter().any(|v| v == gone),
-            "the `mission {gone}` verb must stay retired (#1463); parsed verbs: {verbs:?}"
+            "the `mission {gone}` verb must stay retired; parsed verbs: {verbs:?}"
         );
     }
 }
@@ -1409,7 +1447,7 @@ fn mission_run_verb_absent_from_help_but_launch_present() {
 }
 
 // (#1860) `mission config list`/`show` wiring — help-level presence plus one
-// real end-to-end invocation of each, isolated via `DARKMUX_CREW_DIR` so the
+// real end-to-end invocation of each, isolated via `DARKMUX_HOME` so the
 // user tier is empty and deterministic (the on-disk `templates/builtin/`
 // tier still resolves from cwd, and the two embedded built-ins always
 // resolve regardless of either).
@@ -2178,9 +2216,8 @@ fn lab_run_quick_q_from_clean_cwd_uses_embedded_workload() {
     )
     .unwrap();
 
-    // Force project-scope path resolution: paths::resolve(Auto) falls back to
-    // ~/.darkmux/ when `./.darkmux/` is absent. Pre-create the project dir so
-    // the test writes to the tempdir, not the user's home.
+    // Pre-create the project dir; `darkmux_cmd_in_project` points DARKMUX_HOME
+    // at it so the test writes to the tempdir, not the user's home.
     fs::create_dir_all(tmp.path().join(".darkmux")).unwrap();
 
     let mut cmd = darkmux_cmd_in_project(tmp.path());
@@ -2201,9 +2238,9 @@ fn lab_run_quick_q_from_clean_cwd_uses_embedded_workload() {
     .assert()
     .success();
 
-    // The run dir should exist under .darkmux/runs/<id>/ in the tempdir,
+    // The run dir should exist under .darkmux/lab/<id>/ in the tempdir,
     // and contain a v2 manifest with the right run_id.
-    let runs_dir = tmp.path().join(".darkmux").join("runs");
+    let runs_dir = tmp.path().join(".darkmux").join("lab");
     assert!(
         runs_dir.is_dir(),
         "expected {} to exist",
@@ -2874,7 +2911,7 @@ fn dispatch_finding_refuses_a_key_with_no_stored_record() {
         .args(["dispatch", "health-research", "--finding", "not-a-key", "smoke"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("<dispatch>/<seq>"));
+        .stderr(predicate::str::contains("<execution>/<seq>"));
 }
 
 /// (#2295) The same refusal rule for the second record kind: `dispatch --mod
@@ -3835,10 +3872,11 @@ fn responding_endpoint_profiles_json(port: u16) -> String {
             "profiles": {{
                 "stub": {{
                     "models": [
-                        {{"id": "stub-model", "n_ctx": 8000, "endpoint": {{"url": "http://127.0.0.1:{port}"}}}}
+                        {{"id": "stub-model", "n_ctx": 8000, "endpoint": "stub"}}
                     ]
                 }}
             }},
+            "endpoints": {{"stub": {{"url": "http://127.0.0.1:{port}"}}}},
             "default_profile": "stub"
         }}"#
     )
@@ -3864,10 +3902,11 @@ fn hanging_endpoint_profiles_json(port: u16) -> String {
             "profiles": {{
                 "hang": {{
                     "models": [
-                        {{"id": "stub-model", "n_ctx": 8000, "endpoint": {{"url": "http://127.0.0.1:{port}"}}}}
+                        {{"id": "stub-model", "n_ctx": 8000, "endpoint": "hang"}}
                     ]
                 }}
             }},
+            "endpoints": {{"hang": {{"url": "http://127.0.0.1:{port}"}}}},
             "default_profile": "hang"
         }}"#
     )
@@ -4168,7 +4207,6 @@ fn serve_sigterm_reaps_the_fleet_runners_curl_child() {
             "dialectic-judge",
             "cli-test-serve-sigterm-session",
         ),
-        None,
         None,
         None,
         None,
@@ -5103,7 +5141,7 @@ fn lab_run_sigterm_mid_dispatch_finalizes_lifecycle_and_reaps_curl() {
 
     assert_no_surviving_remote_curl(child.id(), "lab-run");
 
-    let runs_dir = home.path().join("runs");
+    let runs_dir = home.path().join("lab");
     let run_id = fs::read_dir(&runs_dir)
         .unwrap_or_else(|e| panic!("reading {}: {e}", runs_dir.display()))
         .filter_map(|e| e.ok())
@@ -5435,10 +5473,11 @@ fn radio_sigterm_forwards_to_the_launched_child_which_finalizes() {
                 "profiles": {{
                     "hang-stub": {{
                         "models": [
-                            {{"id": "stub-model", "n_ctx": 8000, "endpoint": {{"url": "http://127.0.0.1:{}"}}}}
+                            {{"id": "stub-model", "n_ctx": 8000, "endpoint": "hang"}}
                         ]
                     }}
                 }},
+                "endpoints": {{"hang": {{"url": "http://127.0.0.1:{}"}}}},
                 "default_profile": "hang-stub",
                 "internal": {{ "utility": {{ "id": "stub-util", "n_ctx": 8000 }} }}
             }}"#,
@@ -5630,9 +5669,10 @@ fn run_radio_launch_to_completion(config_id: &str, dispatch_port: u16) -> (std::
             r#"{{
                 "profiles": {{
                     "dispatch-stub": {{
-                        "models": [{{"id": "stub-model", "n_ctx": 8000, "endpoint": {{"url": "http://127.0.0.1:{dispatch_port}"}}}}]
+                        "models": [{{"id": "stub-model", "n_ctx": 8000, "endpoint": "dispatch"}}]
                     }}
                 }},
+                "endpoints": {{"dispatch": {{"url": "http://127.0.0.1:{dispatch_port}"}}}},
                 "default_profile": "dispatch-stub",
                 "internal": {{ "utility": {{ "id": "stub-util", "n_ctx": 8000 }} }}
             }}"#
@@ -6342,8 +6382,8 @@ fn mission_launch_run_on_unknown_value_refused_before_minting() {
 // for a reason worth recording: the built-in `review` mission config
 // (`templates/builtin/mission-configs/review.json`) declares a `panel`
 // block, so it is ALWAYS merged into `radio::compile_catalog`'s output
-// regardless of `DARKMUX_CREW_DIR` — built-ins are embedded at compile
-// time, independent of the user-tier crew dir an isolated TempDir can
+// regardless of `DARKMUX_HOME` — built-ins are embedded at compile
+// time, independent of the user-tier root an isolated TempDir can
 // override. There is therefore no environment override that produces a
 // genuinely EMPTY catalog (the fail-closed short-circuit
 // `radio::route_with_empty_catalog_refuses_without_invoking_call` covers),
@@ -6591,7 +6631,7 @@ fn run_list_binary_agrees_with_the_shared_union_it_calls() {
         .env("DARKMUX_HOME", home.path())
         .env("DARKMUX_FLOWS_DIR", flows.path())
         .env("DARKMUX_LAB_DIR", lab.path())
-        .env("DARKMUX_CREW_DIR", crew.path())
+        .env("DARKMUX_HOME", crew.path())
         .env_remove("DARKMUX_REDIS_URL")
         .output()
         .unwrap();
@@ -6611,9 +6651,9 @@ fn run_list_binary_agrees_with_the_shared_union_it_calls() {
     // restored rather than leaked. `build_runs` takes the flows and lab
     // paths as ARGUMENTS, so `DARKMUX_FLOWS_DIR`/`DARKMUX_LAB_DIR` would
     // be inert here; `darkmux-types` is compiled with `test-support` in
-    // this binary, so `config()` is empty and `DARKMUX_HOME` buys nothing;
+    // this binary, so `config()` is empty;
     // and the fleet slice is literally `&[]`, so Redis is never consulted.
-    // That leaves `DARKMUX_CREW_DIR`, which `crew_dir_override()` feeds to
+    // That leaves `DARKMUX_HOME`, which `user_state_root()` feeds to
     // `load_missions()` — without it the in-process half would read the
     // developer's REAL `~/.darkmux` missions and this comparison would be
     // an accident.
@@ -6632,7 +6672,7 @@ fn run_list_binary_agrees_with_the_shared_union_it_calls() {
     // `DARKMUX_HOME` at 55 of them, so the rest inherited whatever the
     // developer's shell had (usually nothing, which resolves their real
     // `~/.darkmux`).
-    let _crew_guard = EnvVarGuard::set("DARKMUX_CREW_DIR", crew.path());
+    let _crew_guard = EnvVarGuard::set("DARKMUX_HOME", crew.path());
     let direct = darkmux_serve::build_runs(flows.path(), Some(lab.path()), &[]);
     let mut direct_ids: Vec<String> = direct
         .iter()
@@ -6701,7 +6741,7 @@ fn run_list_usage_breakdown_end_to_end() {
             .env("DARKMUX_HOME", home.path())
             .env("DARKMUX_FLOWS_DIR", flows.path())
             .env("DARKMUX_LAB_DIR", lab.path())
-            .env("DARKMUX_CREW_DIR", crew.path())
+            .env("DARKMUX_HOME", crew.path())
             .env_remove("DARKMUX_REDIS_URL")
             .output()
             .unwrap()
@@ -8009,8 +8049,9 @@ fn a_template_grows_one_dispatch_per_finding_carrying_its_key_in_brief_refs() {
             "schema_version": "1.5",
             "default_profile": "stub",
             "profiles": {"stub": {"models": [
-                {"id": "stub-model", "n_ctx": 8000, "endpoint": {"url": "http://127.0.0.1:9"}}
-            ]}}
+                {"id": "stub-model", "n_ctx": 8000, "endpoint": "stub"}
+            ]}},
+            "endpoints": {"stub": {"url": "http://127.0.0.1:9"}}
         })
         .to_string(),
     )
@@ -8123,7 +8164,7 @@ fn a_template_grows_one_dispatch_per_finding_carrying_its_key_in_brief_refs() {
 
 // ─── `finding` family (#2265) ────────────────────────────────────────────
 //
-// The finding record is what was observed: an event, keyed `<dispatch>/<seq>`,
+// The finding record is what was observed: an event, keyed `<execution>/<seq>`,
 // written once and never rewritten. `finding sync` is the SECOND producer —
 // it replays the flow stream for anything the live tailer missed (an older
 // binary, a killed process) and must be idempotent, because the tailer and it
@@ -8269,17 +8310,17 @@ fn finding_sync_materializes_then_is_idempotent_and_list_show_read_the_store() {
     // `--dispatch` narrows to one dispatch. Unpinned, the filter could be
     // `.filter(|_| true)` and nothing would notice.
     assert_eq!(
-        mission_ids(&["finding", "list", "--dispatch", "sess-b", "--json"]),
+        mission_ids(&["finding", "list", "--execution", "sess-b", "--json"]),
         vec!["sess-b/2".to_string()],
         "--dispatch must return exactly that dispatch's findings"
     );
     assert!(
-        mission_ids(&["finding", "list", "--dispatch", "sess-nope", "--json"]).is_empty(),
+        mission_ids(&["finding", "list", "--execution", "sess-nope", "--json"]).is_empty(),
         "an unknown dispatch returns none"
     );
     // …and the three filters compose rather than replacing each other.
     assert!(
-        mission_ids(&["finding", "list", "--mission", "crawl-1", "--dispatch", "sess-b", "--json"])
+        mission_ids(&["finding", "list", "--mission", "crawl-1", "--execution", "sess-b", "--json"])
             .is_empty(),
         "filters compose: sess-b is not in crawl-1"
     );
@@ -9234,83 +9275,49 @@ fn board_drift_kinds(home: &std::path::Path, flows: &std::path::Path, id: &str) 
         .collect()
 }
 
-/// (#2682 round 4) The one family where the BOARD was right and `darkmux
-/// run list` was wrong: a Paused mission whose dispatch session carried a
-/// `session.end`. #1642 already ruled that a paused mission must never
-/// decay into `Abandoned`, but its early-return sat BELOW the all-terminal
-/// branch, so the exemption leaked. The surfaces now agree.
-///
-/// NOT vacuous, and the second half is what proves it: the byte-identical
-/// fixture with `status: "active"` must still read `abandoned`. So the
-/// first half measures the pause exemption, not a fixture that was never
-/// near the boundary.
+/// A `mission.json` an older binary left at `"status": "paused"` is an
+/// ordinary open mission now: `darkmux run list` and the board both read it
+/// as `Active`, so a recorded `session.end` on its dispatch reads
+/// `abandoned` and the board names it, exactly as for an `active` mission.
 #[test]
-fn run_list_does_not_call_a_paused_mission_abandoned_from_a_recorded_session_end() {
-    let write_end_record = |flows: &std::path::Path, mission_id: &str| {
-        let day = darkmux_flow::day_utc_now();
-        fs::write(
-            flows.join(format!("{day}.jsonl")),
-            serde_json::json!({
-                "ts": "2024-01-01T09:00:00Z",
-                "action": "session.end",
-                "session_id": format!("{mission_id}-sess"),
-                "mission_id": mission_id,
-                "handle": "coder",
-            })
-            .to_string()
-                + "\n",
-        )
-        .unwrap();
-    };
+fn a_legacy_paused_mission_reads_as_active_on_run_list_and_the_board() {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-
     let home = TempDir::new().unwrap();
     let flows = TempDir::new().unwrap();
     write_mission_with_phases(
         home.path(),
-        "paused-end-e2e",
+        "legacy-paused-e2e",
         "paused",
         &[("p1", "running")],
         now - 25 * 60,
     );
-    write_end_record(flows.path(), "paused-end-e2e");
+    let day = darkmux_flow::day_utc_now();
+    fs::write(
+        flows.path().join(format!("{day}.jsonl")),
+        serde_json::json!({
+            "ts": "2024-01-01T09:00:00Z",
+            "action": "session.end",
+            "session_id": "legacy-paused-e2e-sess",
+            "mission_id": "legacy-paused-e2e",
+            "handle": "coder",
+        })
+        .to_string()
+            + "\n",
+    )
+    .unwrap();
     assert_eq!(
-        run_list_status(home.path(), flows.path(), "paused-end-e2e"),
-        "running",
-        "a paused mission must not read abandoned — `mission pause` never touches a process, so \
-         its dispatch not being alive is the expected state"
-    );
-    assert!(
-        board_drift_kinds(home.path(), flows.path(), "paused-end-e2e").is_empty(),
-        "and the board, which was already right, must not have gained a drift for it"
-    );
-
-    // The boundary control: the SAME records under an ACTIVE mission still
-    // read abandoned, and the board still names it. Without this the
-    // assertion above would pass with the whole recorded-end branch deleted.
-    let home2 = TempDir::new().unwrap();
-    let flows2 = TempDir::new().unwrap();
-    write_mission_with_phases(
-        home2.path(),
-        "paused-end-e2e",
-        "active",
-        &[("p1", "running")],
-        now - 25 * 60,
-    );
-    write_end_record(flows2.path(), "paused-end-e2e");
-    assert_eq!(
-        run_list_status(home2.path(), flows2.path(), "paused-end-e2e"),
+        run_list_status(home.path(), flows.path(), "legacy-paused-e2e"),
         "abandoned",
-        "the pause exemption must not disable the recorded-end verdict for an Active mission"
+        "a legacy paused mission is Active, so its recorded session end reads abandoned"
     );
     assert!(
-        board_drift_kinds(home2.path(), flows2.path(), "paused-end-e2e")
+        board_drift_kinds(home.path(), flows.path(), "legacy-paused-e2e")
             .iter()
             .any(|k| k == "running-phase-session-dead"),
-        "…and #2689's rule must still fire there"
+        "and the board names the dead session as it does for an active mission"
     );
 }
 
@@ -10764,9 +10771,10 @@ fn endpoint_seat_fixture() -> EndpointSeatFixture {
             "profiles": {
                 "local-default": {"models": [{"id": "local-model", "n_ctx": 8000}]},
                 "grok-endpoint": {"models": [
-                    {"id": "grok-model", "n_ctx": 8000, "endpoint": {"url": "http://127.0.0.1:9"}}
+                    {"id": "grok-model", "n_ctx": 8000, "endpoint": "grok"}
                 ]}
-            }
+            },
+            "endpoints": {"grok": {"url": "http://127.0.0.1:9"}}
         })
         .to_string(),
     )
@@ -11274,7 +11282,7 @@ fn the_wait_command_fails_fast_when_mod_list_itself_errors() {
     let stub = stub_dir.path().join("fake-darkmux");
     fs::write(
         &stub,
-        "#!/bin/sh\nprintf 'not a finding key: \"not-a-valid-key\" (expected <dispatch>/<seq>, e.g. sess-abc/1)\\n' >&2\nexit 42\n",
+        "#!/bin/sh\nprintf 'not a finding key: \"not-a-valid-key\" (expected <execution>/<seq>, e.g. sess-abc/1)\\n' >&2\nexit 42\n",
     )
     .unwrap();
     {
@@ -11283,7 +11291,7 @@ fn the_wait_command_fails_fast_when_mod_list_itself_errors() {
     }
 
     let started = std::time::Instant::now();
-    // Not `<dispatch>/<seq>` — real `mods::canonical_finding_key` would
+    // Not `<execution>/<seq>` — real `mods::canonical_finding_key` would
     // refuse this before the store is even read; the stub mirrors that
     // shape with a distinctive exit code instead of the real one (see doc
     // comment above for why).
@@ -12003,7 +12011,7 @@ fn stats_cmd(flows: &std::path::Path) -> Command {
 fn lab_run_stats_one_run_prints_the_single_run_view() {
     let tmp = tempfile::TempDir::new().unwrap();
     let a = stats_run_dir(tmp.path(), "run-a");
-    let out = stats_cmd(tmp.path()).args(["lab", "run", "stats"]).arg(&a).assert().success();
+    let out = stats_cmd(tmp.path()).args(["run", "stats"]).arg(&a).assert().success();
     let text = String::from_utf8_lossy(&out.get_output().stdout).to_string();
     assert!(text.contains("stream gate") && text.contains("100 tok/s"), "{text}");
     assert!(!text.contains("cost per successful run"), "one run is not a set: {text}");
@@ -12013,7 +12021,7 @@ fn lab_run_stats_one_run_prints_the_single_run_view() {
 fn lab_run_stats_one_run_json_is_the_run_record() {
     let tmp = tempfile::TempDir::new().unwrap();
     let a = stats_run_dir(tmp.path(), "run-a");
-    let out = stats_cmd(tmp.path()).args(["lab", "run", "stats", "--json"]).arg(&a).assert().success();
+    let out = stats_cmd(tmp.path()).args(["run", "stats", "--json"]).arg(&a).assert().success();
     let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
     assert_eq!(v["run"], "run-a");
     assert_eq!(v["tok_per_s"], 100.0);
@@ -12024,7 +12032,7 @@ fn lab_run_stats_several_runs_print_the_set_view() {
     let tmp = tempfile::TempDir::new().unwrap();
     let a = stats_run_dir(tmp.path(), "run-a");
     let b = stats_run_dir(tmp.path(), "run-b");
-    let out = stats_cmd(tmp.path()).args(["lab", "run", "stats"]).arg(&a).arg(&b).assert().success();
+    let out = stats_cmd(tmp.path()).args(["run", "stats"]).arg(&a).arg(&b).assert().success();
     let text = String::from_utf8_lossy(&out.get_output().stdout).to_string();
     assert!(text.contains("cost per successful run") && text.contains("run-b"), "{text}");
 }
@@ -12035,7 +12043,7 @@ fn lab_run_stats_one_run_with_a_baseline_prints_the_comparison() {
     let a = stats_run_dir(tmp.path(), "run-a");
     let b = stats_run_dir(tmp.path(), "run-b");
     let out = stats_cmd(tmp.path())
-        .args(["lab", "run", "stats"])
+        .args(["run", "stats"])
         .arg(&a)
         .arg("--baseline")
         .arg(&b)
@@ -12045,6 +12053,144 @@ fn lab_run_stats_one_run_with_a_baseline_prints_the_comparison() {
     assert!(text.contains("candidate") && text.contains("moved"), "{text}");
 }
 
+/// (4.0) `--json` is a contract and the verb MOVED (`lab run stats` -> `run
+/// stats`): the whole document is pinned, not two fields of it. The goldens
+/// were captured from the moved code, which is the pre-move handler verbatim.
+#[test]
+fn run_stats_json_shapes_are_pinned_by_golden() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let a = stats_run_dir(tmp.path(), "run-a");
+    let b = stats_run_dir(tmp.path(), "run-b");
+    let json = |args: &[&std::path::Path], baseline: Option<&std::path::Path>| -> serde_json::Value {
+        let mut c = stats_cmd(tmp.path());
+        c.args(["run", "stats", "--json"]).args(args);
+        if let Some(bl) = baseline {
+            c.arg("--baseline").arg(bl);
+        }
+        serde_json::from_slice(&c.assert().success().get_output().stdout).unwrap()
+    };
+    let golden = |g: &str| -> serde_json::Value { serde_json::from_str(g).unwrap() };
+    assert_eq!(json(&[&a], None), golden(include_str!("fixtures/run-stats-single.golden.json")));
+    assert_eq!(json(&[&a, &b], Some(&b)), golden(include_str!("fixtures/run-stats-set.golden.json")));
+}
+
+/// (4.0) The retired `lab run list|inspect|stats|compare` spellings fail
+/// naming their replacement, and never run (no alias).
+#[test]
+fn retired_lab_run_verbs_fail_naming_the_replacement() {
+    for (args, want) in [
+        (&["lab", "run", "list"][..], "darkmux run list --kind lab"),
+        (&["lab", "run", "inspect", "some-run"][..], "darkmux run inspect <run>"),
+        (&["lab", "run", "stats", "some-run"][..], "darkmux run stats <run>..."),
+        (&["lab", "run", "compare", "a", "b"][..], "darkmux run compare <a> <b>"),
+    ] {
+        darkmux_cmd()
+            .args(args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("was removed in 4.0").and(predicate::str::contains(want)));
+    }
+}
+
+/// (4.0) Lab runs moved from `<root>/runs` to `<root>/lab`. darkmux never
+/// moves them itself: every verb that reads or writes lab runs refuses,
+/// naming the `mv`, until the operator has run it; then the runs read.
+#[test]
+fn pre_4_0_lab_runs_dir_refuses_every_lab_verb_naming_the_mv_until_moved() {
+    let home = tempfile::TempDir::new().unwrap();
+    let old = home.path().join("runs");
+    let new = home.path().join("lab");
+    stats_run_dir(&old, "run-a");
+    let want = format!("mv {} {}", old.display(), new.display());
+    let cmd = || {
+        let mut c = darkmux_cmd();
+        c.env("DARKMUX_HOME", home.path()).env("DARKMUX_FLOWS_DIR", home.path().join("flows"));
+        c
+    };
+    for args in [
+        &["lab", "run", "quick-q"][..],
+        &["run", "list", "--kind", "lab"][..],
+        &["run", "inspect", "run-a"][..],
+        &["run", "stats", "run-a"][..],
+        &["run", "compare", "run-a", "run-a"][..],
+    ] {
+        cmd().args(args).assert().failure().stderr(predicate::str::contains(&want));
+    }
+    // The all-kinds list does not refuse: it says so and carries on.
+    cmd().args(["run", "list"]).assert().success().stderr(predicate::str::contains(&want));
+    assert!(!new.exists(), "darkmux never moves the data itself");
+
+    fs::rename(&old, &new).unwrap();
+    cmd().args(["run", "stats", "run-a"]).assert().success();
+    cmd().args(["run", "list", "--kind", "lab"]).assert().success();
+}
+
+/// A lab run dir the scanner recognizes: a lifecycle record (the marker) and a
+/// manifest carrying the given `verify`.
+fn lab_run_with_manifest(dir: &std::path::Path, workload: &str, verify: serde_json::Value) {
+    fs::create_dir_all(dir).unwrap();
+    let id = dir.file_name().unwrap().to_string_lossy().to_string();
+    let lifecycle = serde_json::json!({
+        "schema_version": "1.1", "run_id": id, "kind": "lab", "workload": workload,
+        "profile": "default", "started_at_ms": 1_700_000_000_000u64, "status": "complete",
+    });
+    fs::write(dir.join("lifecycle.json"), lifecycle.to_string()).unwrap();
+    let manifest = serde_json::json!({
+        "schema_version": 5, "run_id": id, "workload": workload, "ok": true, "verify": verify,
+    });
+    fs::write(dir.join("manifest.json"), manifest.to_string()).unwrap();
+}
+
+/// (4.0) An EMPTY `lab/` beside a full `runs/` is a pending move, not a
+/// split: it used to skip the refusal and print "no recorded lab runs yet"
+/// with exit 0, hiding every old run. The command it prints removes the empty
+/// dir first, since a plain `mv` would nest the runs as `lab/runs`.
+#[test]
+fn an_empty_lab_dir_beside_a_full_runs_dir_still_refuses_and_the_printed_command_works() {
+    let home = tempfile::TempDir::new().unwrap();
+    let (old, new) = (home.path().join("runs"), home.path().join("lab"));
+    lab_run_with_manifest(&old.join("quick-q-1"), "quick-q", serde_json::Value::Null);
+    fs::create_dir_all(&new).unwrap();
+    let cmd = || {
+        let mut c = darkmux_cmd();
+        c.env("DARKMUX_HOME", home.path()).env("DARKMUX_FLOWS_DIR", home.path().join("flows"));
+        c
+    };
+    let want = format!("rmdir {} && mv {} {}", new.display(), old.display(), new.display());
+    cmd().args(["run", "list", "--kind", "lab"]).assert().failure().stderr(predicate::str::contains(&want));
+
+    let ran = std::process::Command::new("sh").arg("-c").arg(&want).status().unwrap();
+    assert!(ran.success());
+    assert!(new.join("quick-q-1").is_dir(), "the runs land at lab/<id>, not lab/runs/<id>");
+    cmd().args(["run", "list", "--kind", "lab"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("quick-q-1"));
+}
+
+/// (#2494) The verify outcome is visible in `run list` itself: a run that
+/// dispatched fine and failed its tests must not read as a clean one.
+#[test]
+fn run_list_shows_a_failed_verify_beside_a_good_dispatch() {
+    let home = tempfile::TempDir::new().unwrap();
+    let lab = home.path().join("lab");
+    let failed = serde_json::json!({"passed": false, "details": "2 tests failed"});
+    lab_run_with_manifest(&lab.join("quick-coding-1"), "quick-coding", failed);
+    lab_run_with_manifest(&lab.join("quick-q-1"), "quick-q", serde_json::Value::Null);
+    let out = darkmux_cmd()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", home.path().join("flows"))
+        .args(["run", "list", "--kind", "lab"])
+        .assert()
+        .success();
+    let text = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    let line = |id: &str| text.lines().find(|l| l.contains(id)).unwrap_or_else(|| panic!("{id} listed: {text}")).to_string();
+    assert!(line("quick-coding-1").contains("verify FAIL"), "{text}");
+    assert!(line("quick-coding-1").contains("complete"), "status stays the dispatch result: {text}");
+    assert!(line("quick-q-1").contains("verify \u{2014}"), "not checked is not a pass: {text}");
+    assert!(!line("quick-q-1").contains("FAIL"), "{text}");
+}
+
 /// A set with a run that cannot be read fails, so a script cannot mistake a
 /// partial set for a whole one.
 #[test]
@@ -12052,7 +12198,7 @@ fn lab_run_stats_a_set_with_an_unreadable_run_exits_1() {
     let tmp = tempfile::TempDir::new().unwrap();
     let a = stats_run_dir(tmp.path(), "run-a");
     stats_cmd(tmp.path())
-        .args(["lab", "run", "stats"])
+        .args(["run", "stats"])
         .arg(&a)
         .arg(tmp.path().join("no-such-run"))
         .assert()
@@ -12094,6 +12240,11 @@ fn every_enum_setting_is_refused_by_every_cli_entry_point_that_consumes_it() {
                 // No CLI verb starts fleet submission on its own; covered
                 // by darkmux-fleet's `configured_provider` test.
                 Scope::FleetSubmission => continue,
+                // `serve` is not a spawnable no-model verb: it binds a
+                // port. Its enum refusals (`fleet.busy_policy`,
+                // `fleet.identity.provider`) are covered in-process by
+                // darkmux-types' `the_serve_preflight_refuses_a_bad_fleet_listener_enum`.
+                Scope::Serve => continue,
             };
             for args in cases {
                 let mut cmd = darkmux_std_cmd();
@@ -12250,26 +12401,93 @@ fn config_set_refuses_the_renamed_per_execution_key() {
     );
 }
 
-/// (#2902 step 5) A leftover pre-4.0 per-execution cap in the env is read
-/// by nothing: a dispatch says so on stderr (once), naming the new key and
-/// the advice, and is NOT refused for it.
+/// A renamed or retired setting's env var, still set, is refused at CLI entry
+/// like any other bad config: the pre-4.0 per-execution cap (renamed) and
+/// `DARKMUX_CREW_DIR` (retired) each name their replacement.
 #[test]
-fn a_leftover_renamed_cap_is_named_at_preflight_and_not_refused() {
-    let empty_path = TempDir::new().unwrap();
-    let out = darkmux_std_cmd()
-        .env("PATH", empty_path.path())
-        .env("DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION", "500000")
-        .args(["dispatch", "code-reviewer", "hello"])
-        .output()
+fn a_leftover_retired_env_var_is_refused_at_preflight_naming_the_replacement() {
+    let cases = [
+        (
+            "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION",
+            "env var DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION (500000) is refused: renamed to `remote.max_tokens_per_step`",
+        ),
+        ("DARKMUX_CREW_DIR", "env var DARKMUX_CREW_DIR (/x) is refused: removed in 4.0"),
+    ];
+    for (var, says) in cases {
+        let empty_path = TempDir::new().unwrap();
+        let value = if var == "DARKMUX_CREW_DIR" { "/x" } else { "500000" };
+        let out = darkmux_std_cmd()
+            .env("PATH", empty_path.path())
+            .env(var, value)
+            .args(["dispatch", "code-reviewer", "hello"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{var} must refuse: {stderr}");
+        assert!(stderr.contains("refusing to start: bad config"), "{var}: {stderr}");
+        assert!(stderr.contains(says), "{var}: {stderr}");
+    }
+}
+
+/// A retired setting's env var is refused by EVERY command, through the one
+/// check at CLI entry: a read-only verb (`mission status`, `role list`, a
+/// lesson read) that uses the darkmux root refuses as loudly as a dispatch.
+#[test]
+fn a_retired_env_var_is_refused_by_read_only_commands_too() {
+    let cases: [&[&str]; 4] =
+        [&["mission", "status"], &["role", "list"], &["memory", "lesson", "list"], &["machine", "status"]];
+    for args in cases {
+        let out = darkmux_std_cmd().env("DARKMUX_CREW_DIR", "/x").args(args).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{args:?} must refuse: {stderr}");
+        assert!(stderr.contains("refusing to start"), "{args:?}: {stderr}");
+        assert!(stderr.contains("DARKMUX_CREW_DIR"), "{args:?}: {stderr}");
+    }
+}
+
+/// `serve` refuses too, before it binds anything. Spawned with a deadline: a
+/// daemon that does start would otherwise hang this test.
+#[test]
+fn serve_refuses_a_retired_env_var_before_binding() {
+    let mut cmd = darkmux_std_cmd();
+    let mut child = cmd
+        .env("DARKMUX_CREW_DIR", "/x")
+        .args(["serve", "--bind", "127.0.0.1", "--port", "38917"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .unwrap();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("env var DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION (500000) is ignored: renamed to `remote.max_tokens_per_step`"),
-        "{stderr}"
-    );
-    assert!(stderr.contains("500000 was darkmux's old default"), "{stderr}");
-    assert!(!stderr.contains("refusing to start: bad config"), "a leftover is never refused: {stderr}");
-    assert_eq!(stderr.matches("is ignored: renamed to").count(), 1, "once per process: {stderr}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break Some(s);
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let status = status.expect("`serve` started with a retired env var set instead of refusing");
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
+    assert!(!status.success(), "{stderr}");
+    assert!(stderr.contains("refusing to start") && stderr.contains("DARKMUX_CREW_DIR"), "{stderr}");
+}
+
+/// The exemptions: `doctor` and `config` still run with a retired env var
+/// set, because they are how the operator finds and fixes it. Doctor reports
+/// it; neither refuses to start.
+#[test]
+fn doctor_and_config_run_with_a_retired_env_var_set() {
+    for args in [&["config", "list"][..], &["doctor"][..]] {
+        let out = darkmux_std_cmd().env("DARKMUX_CREW_DIR", "/x").args(args).output().unwrap();
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(!text.contains("refusing to start"), "{args:?} must not refuse: {text}");
+    }
+    let doctor = darkmux_std_cmd().env("DARKMUX_CREW_DIR", "/x").arg("doctor").output().unwrap();
+    assert!(String::from_utf8_lossy(&doctor.stdout).contains("DARKMUX_CREW_DIR"), "doctor names the leftover");
 }
 
 fn collect_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
@@ -12399,7 +12617,7 @@ impl LabStub {
     }
 
     fn run_ids(&self) -> Vec<String> {
-        let mut ids: Vec<String> = fs::read_dir(self.home.path().join("runs"))
+        let mut ids: Vec<String> = fs::read_dir(self.home.path().join("lab"))
             .map(|rd| {
                 rd.filter_map(|e| e.ok())
                     .map(|e| e.file_name().to_string_lossy().to_string())
@@ -12668,13 +12886,14 @@ fn lab_run_dispatch_summary_and_exit_code() {
     assert_eq!(out.status.code(), Some(1), "a failed verify exits 1: {stderr}");
     assert!(!stdout.contains("run(s) complete"), "{stdout}");
 
-    lab.cmd().args(["lab", "run"]).assert().failure().stderr(predicate::str::contains(
-        "specify a workload to dispatch (`lab run <workload>`) or a run sub-verb \
-         (`lab run list` / `lab run inspect <id>` / `lab run compare <a> <b>`)",
-    ));
+    lab.cmd()
+        .args(["lab", "run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("required arguments were not provided").and(predicate::str::contains("<WORKLOAD>")));
 }
 
-/// `lab run inspect`/`list`/`compare` over runs this test recorded.
+/// `run inspect`/`list`/`compare` over runs this test recorded.
 #[test]
 fn lab_run_inspect_list_and_compare_render_recorded_runs() {
     let lab = LabStub::new(&RespondingStubServer::start());
@@ -12694,7 +12913,7 @@ fn lab_run_inspect_list_and_compare_render_recorded_runs() {
         ("labchar-fail", "verify:      FAILED — "),
     ] {
         let id = id_of(w);
-        let out = lab.cmd().args(["lab", "run", "inspect", &id]).output().unwrap();
+        let out = lab.cmd().args(["run", "inspect", &id]).output().unwrap();
         let (stdout, stderr) = out_text(&out);
         assert_eq!(out.status.code(), Some(0), "{stderr}");
         let head = format!("run:         {id}\nworkload:    {w}\nwall:        ");
@@ -12707,26 +12926,26 @@ fn lab_run_inspect_list_and_compare_render_recorded_runs() {
         assert!(stdout.contains("\nnotes:\n  - "), "{stdout}");
         assert!(!stdout.contains("compaction summaries"), "{stdout}");
     }
-    let out = lab.cmd().args(["lab", "run", "inspect", &id_of("labchar"), "--summary"]).output().unwrap();
+    let out = lab.cmd().args(["run", "inspect", &id_of("labchar"), "--summary"]).output().unwrap();
     let (stdout, _) = out_text(&out);
     assert!(
         stdout.ends_with("\n\ncompaction summaries: (none — no trajectory.jsonl recorded)\n"),
         "{stdout}"
     );
-    lab.cmd().args(["lab", "run", "inspect", "no-such-run"]).assert().failure();
+    lab.cmd().args(["run", "inspect", "no-such-run"]).assert().failure();
 
-    let out = lab.cmd().args(["lab", "run", "list", "--all"]).output().unwrap();
+    let out = lab.cmd().args(["run", "list", "--kind", "lab", "--all"]).output().unwrap();
     let (stdout, _) = out_text(&out);
     for id in &ids {
         assert!(stdout.contains(id.as_str()), "{stdout}");
     }
-    let out = lab.cmd().args(["lab", "run", "list", "-l", "1"]).output().unwrap();
+    let out = lab.cmd().args(["run", "list", "--kind", "lab", "--limit", "1"]).output().unwrap();
     let (stdout, _) = out_text(&out);
     assert_eq!(ids.iter().filter(|i| stdout.contains(i.as_str())).count(), 1, "{stdout}");
 
     let out = lab
         .cmd()
-        .args(["lab", "run", "compare", &id_of("labchar-pass"), &id_of("labchar-fail")])
+        .args(["run", "compare", &id_of("labchar-pass"), &id_of("labchar-fail")])
         .output()
         .unwrap();
     let (stdout, stderr) = out_text(&out);
@@ -12754,7 +12973,7 @@ fn lab_run_inspect_shows_an_errored_runs_error() {
     assert_eq!(out.status.code(), Some(1), "{stdout} / {stderr}");
     let id = lab.run_ids().pop().unwrap();
     assert!(stderr.contains(&format!("[lab] run {id} failed: unknown workload provider")), "{stderr}");
-    let out = lab.cmd().args(["lab", "run", "inspect", &id]).output().unwrap();
+    let out = lab.cmd().args(["run", "inspect", &id]).output().unwrap();
     let (stdout, stderr) = out_text(&out);
     assert_eq!(out.status.code(), Some(0), "{stderr}");
     assert!(stdout.contains("verify:      not checked\n"), "{stdout}");
@@ -12964,7 +13183,7 @@ fn assert_lab_verb_sigterm_finalizes_interrupted(verb_args: &[&str], label: &str
     );
     assert_no_surviving_remote_curl(pid, label);
 
-    let runs_dir = home.path().join("runs");
+    let runs_dir = home.path().join("lab");
     let run_id = fs::read_dir(&runs_dir)
         .unwrap_or_else(|e| panic!("{label}: reading {}: {e}", runs_dir.display()))
         .filter_map(|e| e.ok())

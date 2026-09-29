@@ -155,14 +155,14 @@ describe("useRouteRecords — the static-demo flow-src route (#1801)", () => {
 
   it("reads records from the flow-src file, never GET /flow/<date>", async () => {
     injectMeta("darkmux-flow-src", "./demo-flow.jsonl");
-    vi.stubGlobal("fetch", mockStaticSrc('{"ts":"2026-08-07T00:00:00Z","action":"dispatch.start"}\n'));
+    vi.stubGlobal("fetch", mockStaticSrc('{"ts":"2026-08-07T00:00:00Z","action":"dispatch.start","execution_id":"exec-1"}\n'));
     const route: Route = { kind: "playback", date: null };
 
     const { result } = renderHook(() => useRouteRecords(route, LIVE), { wrapper: wrapper() });
     await waitFor(() => expect(result.current.loading).toBe(false));
 
     expect(result.current.historical).toBe(true);
-    expect(result.current.records).toEqual([{ ts: "2026-08-07T00:00:00Z", action: "dispatch.start", tMs: Date.parse("2026-08-07T00:00:00Z") }]);
+    expect(result.current.records).toEqual([{ ts: "2026-08-07T00:00:00Z", action: "dispatch.start", execution_id: "exec-1", tMs: Date.parse("2026-08-07T00:00:00Z") }]);
     // The regression this test guards: falling through to `/flow/<date>`
     // (or `/flow/null`) instead of the static source.
     const calls = (globalThis.fetch as unknown as { mock: { calls: unknown[][] } }).mock.calls.map((c) => String(c[0]));

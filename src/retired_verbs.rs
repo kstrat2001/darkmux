@@ -1,0 +1,224 @@
+//! Verb spellings darkmux retired, each with the line that names its
+//! replacement. This is the ONE table of them: no aliases, the retired
+//! spelling never runs. [`refusal`] runs on the raw command line BEFORE clap,
+//! because a retired spelling can still parse (`lab run list` reads as the
+//! launcher for a workload named `list`), so clap's own rejection cannot be
+//! the trigger. An entry must therefore name a spelling that has no live
+//! meaning.
+
+/// One retired spelling: the leading words of the command line, and the flag
+/// that is the retired part when the verb itself survives.
+struct RetiredVerb {
+    words: &'static [&'static str],
+    flag: Option<&'static str>,
+    remedy: &'static str,
+}
+
+/// The remedy for a retired `lab run <verb>` read spelling: where the read
+/// went, and how a workload that shares the verb's name still launches.
+macro_rules! run_read_remedy {
+    ($verb:literal, $use:literal) => {
+        concat!(
+            "Recorded runs are read through `darkmux run`. Use `",
+            $use,
+            "`. `darkmux lab run <workload>` still launches a lab run; for a workload named `",
+            $verb,
+            "`, use `darkmux lab run -- ",
+            $verb,
+            "`."
+        )
+    };
+}
+
+const RETIRED: &[RetiredVerb] = &[
+    RetiredVerb {
+        words: &["lab", "run", "list"],
+        flag: None,
+        remedy: run_read_remedy!("list", "darkmux run list --kind lab"),
+    },
+    RetiredVerb {
+        words: &["lab", "run", "inspect"],
+        flag: None,
+        remedy: run_read_remedy!("inspect", "darkmux run inspect <run>"),
+    },
+    RetiredVerb {
+        words: &["lab", "run", "stats"],
+        flag: None,
+        remedy: run_read_remedy!("stats", "darkmux run stats <run>..."),
+    },
+    RetiredVerb {
+        words: &["lab", "run", "compare"],
+        flag: None,
+        remedy: run_read_remedy!("compare", "darkmux run compare <a> <b>"),
+    },
+    RetiredVerb {
+        words: &["mission", "dispatch"],
+        flag: None,
+        remedy: "To run a role on another machine, name a profile on that machine: \
+                 `darkmux dispatch <role> \"<message>\" --profile <profile>@<machine> [--timeout N] \
+                 [--no-wait]`. Missions come only from mission configs: \
+                 `darkmux mission launch <config>`.",
+    },
+    RetiredVerb {
+        words: &["mission", "add-phase"],
+        flag: None,
+        remedy: "A mission's phases come from its mission config: write or edit the config \
+                 (`darkmux mission config show <config>` prints one to start from), then \
+                 `darkmux mission launch <config>`.",
+    },
+    RetiredVerb {
+        words: &["mission", "start"],
+        flag: None,
+        remedy: "`darkmux mission launch <config>` starts the mission it creates.",
+    },
+    RetiredVerb {
+        words: &["mission", "pause"],
+        flag: None,
+        remedy: "A mission runs from `darkmux mission launch <config>` and ends with \
+                 `darkmux mission finalize <id>` or `darkmux mission abort <id>`.",
+    },
+    RetiredVerb {
+        words: &["mission", "resume"],
+        flag: None,
+        remedy: "A mission runs from `darkmux mission launch <config>` and ends with \
+                 `darkmux mission finalize <id>` or `darkmux mission abort <id>`.",
+    },
+    RetiredVerb {
+        words: &["finding", "list"],
+        flag: Some("--dispatch"),
+        remedy: "Findings are keyed by the role execution that filed them: use \
+                 `darkmux finding list --execution <execution-id>`.",
+    },
+    RetiredVerb {
+        words: &["dispatch"],
+        flag: Some("--phase-id"),
+        remedy: "A dispatch no longer attaches to another mission's phase. Run the work as a \
+                 step of a mission config (`darkmux mission launch <config>`), or dispatch \
+                 without `--phase-id`.",
+    },
+];
+
+impl RetiredVerb {
+    fn matches(&self, args: &[String]) -> bool {
+        let leads = self.words.len() <= args.len()
+            && self.words.iter().zip(args).all(|(w, a)| w == a);
+        if !leads {
+            return false;
+        }
+        let Some(flag) = self.flag else { return true };
+        let prefixed = format!("{flag}=");
+        args[self.words.len()..]
+            .iter()
+            .take_while(|a| a.as_str() != "--")
+            .any(|a| a == flag || a.starts_with(&prefixed))
+    }
+
+    fn spelling(&self) -> String {
+        let mut s = format!("darkmux {}", self.words.join(" "));
+        if let Some(flag) = self.flag {
+            s.push(' ');
+            s.push_str(flag);
+        }
+        s
+    }
+}
+
+/// The refusal for a command line (`args` without the program name) that
+/// names a retired spelling, or `None` when it names none.
+pub(crate) fn refusal(args: &[String]) -> Option<String> {
+    RETIRED
+        .iter()
+        .find(|r| r.matches(args))
+        .map(|r| format!("`{}` was removed in 4.0. {}", r.spelling(), r.remedy))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::refusal;
+
+    fn args(s: &[&str]) -> Vec<String> {
+        s.iter().map(|a| a.to_string()).collect()
+    }
+
+    #[test]
+    fn each_retired_spelling_is_named_with_its_remedy() {
+        let msg = refusal(&args(&["mission", "dispatch", "m", "--role", "coder"])).unwrap();
+        // drift-guard:allow mission dispatch — asserts the refusal names the retired verb
+        assert!(msg.contains("`darkmux mission dispatch` was removed"), "{msg}");
+        assert!(msg.contains("--profile <profile>@<machine>"), "{msg}");
+        for verb in ["add-phase", "start", "pause", "resume"] {
+            let msg = refusal(&args(&["mission", verb, "m"])).unwrap();
+            assert!(msg.contains(&format!("`darkmux mission {verb}` was removed")), "{msg}");
+            assert!(msg.contains("darkmux mission launch <config>"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn the_phase_id_flag_is_found_in_either_spelling_before_the_separator() {
+        for a in [
+            args(&["dispatch", "coder", "m", "--phase-id", "p"]),
+            args(&["dispatch", "coder", "--phase-id=p", "m"]),
+        ] {
+            let msg = refusal(&a).unwrap();
+            // drift-guard:allow dispatch --phase-id — asserts the refusal names the retired flag
+            assert!(msg.contains("`darkmux dispatch --phase-id` was removed"), "{msg}");
+        }
+        // After `--` the text is the message, never a flag.
+        assert!(refusal(&args(&["dispatch", "coder", "--", "--phase-id", "p"])).is_none());
+    }
+
+    #[test]
+    fn the_finding_list_dispatch_flag_names_execution() {
+        let msg = refusal(&args(&["finding", "list", "--dispatch", "k"])).unwrap();
+        // drift-guard:allow finding list --dispatch — asserts the refusal names the retired flag
+        assert!(msg.contains("`darkmux finding list --dispatch` was removed"), "{msg}");
+        assert!(msg.contains("--execution"), "{msg}");
+        assert!(refusal(&args(&["finding", "list", "--execution", "k"])).is_none());
+    }
+
+    #[test]
+    fn a_live_verb_or_an_unrelated_typo_is_not_refused() {
+        for a in [
+            args(&["dispatch", "coder", "m", "--bogus"]),
+            args(&["mission", "frobnicate"]),
+            args(&["lab", "run", "quick-q"]),
+            args(&["lab", "run"]),
+            args(&["run", "inspect", "x"]),
+            // The `--` escape still reaches the launcher, for a workload named `list`.
+            args(&["lab", "run", "--", "list"]),
+            args(&["mission"]),
+            args(&["missions", "dispatch"]),
+            args(&[]),
+        ] {
+            assert!(refusal(&a).is_none(), "{a:?}");
+        }
+    }
+
+    #[test]
+    fn a_retired_run_read_spelling_names_its_replacement_and_the_escape() {
+        for (verb, want) in [
+            ("list", "darkmux run list --kind lab"),
+            ("inspect", "darkmux run inspect <run>"),
+            ("stats", "darkmux run stats <run>..."),
+            ("compare", "darkmux run compare <a> <b>"),
+        ] {
+            let msg = refusal(&args(&["lab", "run", verb])).unwrap();
+            assert!(msg.contains(&format!("`darkmux lab run {verb}` was removed")), "{msg}");
+            assert!(msg.contains(want), "{msg}");
+            assert!(msg.contains(&format!("darkmux lab run -- {verb}")), "{msg}");
+        }
+    }
+
+    /// The escape the refusal names really reaches the launcher: clap reads
+    /// the word after `--` as the workload, not as a retired verb.
+    #[test]
+    fn the_escape_the_refusal_names_parses_as_the_launcher() {
+        use clap::Parser;
+        let argv = ["darkmux", "lab", "run", "--", "list"];
+        let cli = crate::cli::Cli::try_parse_from(argv).ok().unwrap();
+        match cli.command {
+            crate::cli::Cmd::Lab { sub: crate::cli::LabCmd::Run { workload, .. } } => assert_eq!(workload, "list"),
+            _ => panic!("`lab run -- list` did not parse as the launcher"),
+        }
+    }
+}

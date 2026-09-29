@@ -234,6 +234,7 @@ pub(crate) fn dispatch_as_crew_of_one_with(
                 stdout: raw.stdout,
                 stderr: raw.stderr,
                 session_id: raw.session_id,
+                execution: raw.execution_id,
                 out_dir: raw.out_dir,
                 // The packed step output carries the envelope, not the fold.
                 trajectory: None,
@@ -349,7 +350,6 @@ fn build_graph(opts: &DispatchOpts, mission_id: &str) -> (Mission, Phase, Task, 
         created_ts: now,
         started_ts: None,
         finalized_ts: None,
-        paused_ts: None,
         source_input: None,
         ticket: None,
         spec: Some(MissionSpec {
@@ -403,15 +403,6 @@ fn build_graph(opts: &DispatchOpts, mission_id: &str) -> (Mission, Phase, Task, 
         "json": opts.json,
         "preserve_dispatch_result": true,
     });
-    // `opts.phase_id` is a DIFFERENT concept from this graph's own `phase_id`
-    // above — it's the CLI's `--phase-id` flag, an operator-named EXTERNAL
-    // mission phase this dispatch's flow records should attribute to (see
-    // `DispatchOpts::phase_id`'s doc). Only set the key when present, so
-    // `DispatchInternalStepKind`'s `config_str(step, "phase_id")` reads
-    // `None` exactly like the pre-#1509 CLI's `opts.phase_id: None` default.
-    if let Some(external_phase_id) = &opts.phase_id {
-        config["phase_id"] = serde_json::Value::String(external_phase_id.clone());
-    }
     if let Some(max_tokens) = opts.max_completion_tokens {
         config["max_completion_tokens"] = serde_json::Value::from(max_tokens);
     }
@@ -581,38 +572,32 @@ mod tests {
         }
     }
 
-    /// Isolates `DARKMUX_CREW_DIR` (mission/phase/task/step JSON),
-    /// `DARKMUX_FLOWS_DIR` (flow records), and `DARKMUX_HOME` (the #1487
-    /// residency-lease registry `ensure_wave_loaded` writes into) to
-    /// tempdirs — mirrors `lifecycle::tests::CrewGuard`, extended with
-    /// `DARKMUX_HOME` since this module's tests are the first in this crate
-    /// to assert on a REAL residency lease written by a REAL
-    /// `run_step_graph` run (every other `ensure_wave_loaded` test lives in
-    /// `concurrent_dispatch.rs` directly, one level below `run_step_graph`).
+    /// Isolates `DARKMUX_HOME` (the root: mission/phase/task/step JSON and the
+    /// #1487 residency-lease registry `ensure_wave_loaded` writes into) and
+    /// `DARKMUX_FLOWS_DIR` (flow records) to tempdirs. This module's tests are
+    /// the first in this crate to assert on a REAL residency lease written by
+    /// a REAL `run_step_graph` run (every other `ensure_wave_loaded` test
+    /// lives in `concurrent_dispatch.rs` directly, one level below
+    /// `run_step_graph`).
     struct RunGuard {
-        _crew: TempDir,
         _flows: TempDir,
         _home: TempDir,
-        prev_crew: Option<String>,
         prev_flows: Option<String>,
         prev_home: Option<String>,
     }
 
     impl RunGuard {
         fn new() -> Self {
-            let crew = TempDir::new().unwrap();
             let flows = TempDir::new().unwrap();
             let home = TempDir::new().unwrap();
-            let prev_crew = env::var("DARKMUX_CREW_DIR").ok();
             let prev_flows = env::var("DARKMUX_FLOWS_DIR").ok();
             let prev_home = env::var("DARKMUX_HOME").ok();
             // SAFETY: every test using this guard is `#[serial_test::serial]`.
             unsafe {
-                env::set_var("DARKMUX_CREW_DIR", crew.path());
                 env::set_var("DARKMUX_FLOWS_DIR", flows.path());
                 env::set_var("DARKMUX_HOME", home.path());
             }
-            Self { _crew: crew, _flows: flows, _home: home, prev_crew, prev_flows, prev_home }
+            Self { _flows: flows, _home: home, prev_flows, prev_home }
         }
 
         fn home_path(&self) -> std::path::PathBuf {
@@ -623,10 +608,6 @@ mod tests {
     impl Drop for RunGuard {
         fn drop(&mut self) {
             unsafe {
-                match &self.prev_crew {
-                    Some(v) => env::set_var("DARKMUX_CREW_DIR", v),
-                    None => env::remove_var("DARKMUX_CREW_DIR"),
-                }
                 match &self.prev_flows {
                     Some(v) => env::set_var("DARKMUX_FLOWS_DIR", v),
                     None => env::remove_var("DARKMUX_FLOWS_DIR"),
@@ -772,6 +753,7 @@ mod tests {
                 stdout: self.stdout.clone(),
                 stderr: self.stderr.clone(),
                 session_id: SessionId::parse(&session_id.unwrap_or_default())?,
+                execution_id: None,
                 out_dir: None,
             };
             let output = serde_json::to_string(&payload).unwrap();
@@ -1075,24 +1057,9 @@ mod tests {
 
     #[serial_test::serial]
     #[test]
-    fn build_graph_external_phase_id_is_a_separate_concept_from_the_graphs_own_phase() {
-        // `opts.phase_id` (the CLI's `--phase-id`, external mission-phase
-        // attribution) must land in `Step.config["phase_id"]` — a DIFFERENT
-        // string from this graph's OWN minted phase id (`task.phase_id`).
-        let mut opts = test_opts("coder", "hi");
-        opts.phase_id = Some("some-other-mission-phase".to_string());
-        let (_, phase, task, step) = build_graph(&opts, "dispatch-coder-1-abc");
-
-        assert_eq!(step.config["phase_id"], "some-other-mission-phase");
-        assert_eq!(task.phase_id, phase.id);
-        assert_ne!(task.phase_id, "some-other-mission-phase");
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn build_graph_omits_phase_id_key_when_the_cli_flag_is_unset() {
-        // Matches the pre-#1509 `DispatchOpts.phase_id: None` default —
-        // `config_str(step, "phase_id")` must read `None`, not `Some("")`.
+    fn build_graph_carries_no_phase_id_key() {
+        // The graph's own phase is the only phase a crew-of-one dispatch
+        // has: `config_str(step, "phase_id")` must read `None`, not `Some("")`.
         let opts = test_opts("coder", "hi");
         let (_, _, _, step) = build_graph(&opts, "dispatch-coder-1-abc");
         assert!(step.config.get("phase_id").is_none());
@@ -1656,7 +1623,7 @@ mod tests {
             valid_checkpoint_json("coder"),
         )
         .unwrap();
-        crate::dispatch_internal::write_resume_origin_meta(resume_from.path(), &workdir_path, false, None);
+        crate::dispatch_internal::write_resume_origin_meta(resume_from.path(), &workdir_path, false, None, &darkmux_types::execution_id::ExecutionId::mint());
 
         let mut opts = test_opts("coder", "resume please");
         opts.resume_from = Some(resume_from.path().to_path_buf());

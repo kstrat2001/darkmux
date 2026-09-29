@@ -1283,7 +1283,7 @@ pub(crate) fn cmd_machine_untrust(name: &str) -> Result<i32> {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
 
     // ── machine add: loopback refusal + self by machine_id (#2924) ──────
@@ -1646,7 +1646,7 @@ pub(crate) mod tests {
     }
 
     /// A config whose `fleet.identity.provider` is an unregistered value.
-    pub(crate) fn bad_provider_config() -> darkmux_types::config::DarkmuxConfig {
+    fn bad_provider_config() -> darkmux_types::config::DarkmuxConfig {
         darkmux_types::config::DarkmuxConfig {
             fleet: Some(darkmux_types::config::FleetConfig {
                 identity: Some(darkmux_types::config::FleetIdentityConfig {
@@ -2071,7 +2071,7 @@ mod trust_tests {
             r#"{"profiles":{"host":{"models":[{"id":"big","n_ctx":32000}]},
                 "coder-studio":{"models":[{"id":"big","n_ctx":64000}]},
                 "utility":{"models":[{"id":"small","n_ctx":8000}]}},
-              "internal":{"utility":"small"}}"#,
+              "internal":{"utility":{"id":"small"}}}"#,
         )
         .unwrap()
     }

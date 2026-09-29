@@ -10,49 +10,17 @@ pub struct LoadedRegistry {
     pub path: PathBuf,
 }
 
-/// Default search locations when neither `--profiles` nor `DARKMUX_PROFILES` is
-/// set. `DARKMUX_PROFILES`, if set, short-circuits this list — see `load_registry`.
+/// Default search locations when neither `--profiles-file` nor
+/// `DARKMUX_PROFILES` is set: the darkmux root's `profiles.json`
+/// (`paths::resolve`: `DARKMUX_HOME`, else `~/.darkmux`), then the XDG-style
+/// `~/.config/darkmux/profiles.json`. Never the working directory: 4.0 dropped
+/// project-local discovery, and `darkmux doctor` names a leftover
+/// `./.darkmux/profiles.json` or `./.darkmux.json` as ignored.
+/// `DARKMUX_PROFILES`, if set, short-circuits this list (see `load_registry`).
 pub fn default_locations() -> Vec<PathBuf> {
-    let mut out: Vec<PathBuf> = Vec::new();
-    // (#2450) `DARKMUX_HOME` is the bootstrap pointer that RELOCATES the
-    // darkmux root entirely, so when it is set it outranks the cwd candidates
-    // below — the same precedence `paths::resolve` gives it ("it overrides the
-    // darkmux root directory entirely ... and wins over the project/user
-    // auto-resolve"). Before this fix the registry LOADER never consulted it,
-    // so a `DARKMUX_HOME`-scoped install read the operator's real
-    // `~/.darkmux/profiles.json`, and `darkmux init` (fixed in the same
-    // change) wrote there too — config.json in the scoped root, profiles.json
-    // in the real home. Gated on the var being SET so that an install without
-    // it keeps this list byte-identical to before.
-    // (#2632 CONSIDER 3) Logged BEFORE the `is_ok_and` guard below, not
-    // just on the set branch: the "DARKMUX_HOME is unset" observation is
-    // exactly the race-relevant one when a sibling test is between
-    // `set_var` and `remove_var` on this key, and the guard would
-    // otherwise decide + branch without ever recording that it read the
-    // var at all.
-    #[cfg(any(test, feature = "test-support"))]
-    darkmux_types::env_audit::audit_env_read("DARKMUX_HOME");
-    if env::var("DARKMUX_HOME").is_ok_and(|v| !v.trim().is_empty()) {
-        out.push(darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).profiles);
-    }
-    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    out.push(cwd.join(".darkmux.json"));
-    out.push(cwd.join(".darkmux").join("profiles.json"));
+    let mut out = vec![darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).profiles];
     if let Some(home) = dirs::home_dir() {
-        out.push(home.join(".darkmux").join("profiles.json"));
         out.push(home.join(".config").join("darkmux").join("profiles.json"));
-    }
-    // Running from $HOME (the first-run case) makes cwd/.darkmux and
-    // ~/.darkmux the same path; the "Looked in" list should not say it twice.
-    dedupe_paths(out)
-}
-
-fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
-    let mut out: Vec<PathBuf> = Vec::with_capacity(paths.len());
-    for p in paths {
-        if !out.contains(&p) {
-            out.push(p);
-        }
     }
     out
 }
@@ -67,8 +35,14 @@ fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
 /// ([`parse_registry_lenient`], #1282); a broken registry shell fails the
 /// load outright. Neither is silent.
 pub fn user_file_problem(path: &Path) -> Option<darkmux_types::user_files::FileProblem> {
-    use darkmux_types::user_files::{check_path, Issue, Problem, UserFileKind};
-    let mut found = check_path::<ProfileRegistry>(UserFileKind::Profiles, path, &registry_retired)?;
+    use darkmux_types::user_files::{check_path_and, Issue, KeyIssue, Problem, UserFileKind};
+    let inline_endpoints = |doc: &serde_json::Value| -> Vec<KeyIssue> {
+        ProfileRegistry::inline_endpoint_rewrites(doc)
+            .into_iter()
+            .map(|r| KeyIssue { issue: Issue::Removed(r.line()), path: r.path })
+            .collect()
+    };
+    let mut found = check_path_and::<ProfileRegistry>(UserFileKind::Profiles, path, &registry_retired, &inline_endpoints)?;
     if let Problem::Keys(keys) = &mut found.problem {
         keys.retain(|k| !matches!(k.issue, Issue::WrongType { .. } | Issue::Missing { .. }));
         if keys.is_empty() {
@@ -518,15 +492,46 @@ mod tests {
     use std::io::Write;
     use tempfile::TempDir;
 
-    /// (#2450) The registry LOADER must consult `DARKMUX_HOME`, because
-    /// `darkmux init` writes the registry there. Before the fix the two
-    /// disagreed: `init` wrote `config.json` into the scoped root but
-    /// `profiles.json` into the operator's REAL `~/.darkmux`, and the loader
-    /// only ever looked at the real home — one command, two roots. Proven live
-    /// on the built binary before and after.
+    /// A `./.darkmux/profiles.json` or `./.darkmux.json` in the working
+    /// directory is NOT a registry: 4.0 dropped project-local discovery, and
+    /// the registry comes from `DARKMUX_HOME` (or `~/.darkmux`) only.
     #[serial_test::serial]
     #[test]
-    fn default_locations_prefers_darkmux_home_when_set() {
+    fn a_cwd_darkmux_registry_is_never_a_candidate_or_the_loaded_registry() {
+        let cwd = TempDir::new().unwrap();
+        fs::create_dir_all(cwd.path().join(".darkmux")).unwrap();
+        write(&cwd.path().join(".darkmux").join("profiles.json"), minimal_json());
+        write(&cwd.path().join(".darkmux.json"), minimal_json());
+        let root = TempDir::new().unwrap();
+        write(&root.path().join("profiles.json"), minimal_json());
+        let prev_cwd = env::current_dir().unwrap();
+        env::set_current_dir(cwd.path()).unwrap();
+        let prev_home = env::var("DARKMUX_HOME").ok();
+        unsafe { env::set_var("DARKMUX_HOME", root.path()) };
+        let locs = default_locations();
+        let loaded = load_registry(None);
+        unsafe {
+            match prev_home {
+                Some(v) => env::set_var("DARKMUX_HOME", v),
+                None => env::remove_var("DARKMUX_HOME"),
+            }
+        }
+        env::set_current_dir(prev_cwd).unwrap();
+        let cwd_real = cwd.path().canonicalize().unwrap();
+        assert!(
+            !locs.iter().any(|p| p.starts_with(cwd.path()) || p.starts_with(&cwd_real)),
+            "a cwd candidate is back in the registry search: {locs:?}"
+        );
+        assert_eq!(loaded.unwrap().path, root.path().join("profiles.json"));
+    }
+
+    /// (#2450) The registry LOADER must consult `DARKMUX_HOME`, because
+    /// `darkmux init` writes the registry there: `DARKMUX_HOME` relocates the
+    /// root entirely, so it is the FIRST candidate. Unset, the first is
+    /// `~/.darkmux/profiles.json`.
+    #[serial_test::serial]
+    #[test]
+    fn default_locations_lead_with_the_darkmux_root() {
         let tmp = TempDir::new().unwrap();
         let prev = std::env::var("DARKMUX_HOME").ok();
         unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()); }
@@ -539,21 +544,11 @@ mod tests {
                 None => std::env::remove_var("DARKMUX_HOME"),
             }
         }
-        assert_eq!(
-            with_home.first(),
-            Some(&tmp.path().join("profiles.json")),
-            "DARKMUX_HOME must be the FIRST candidate — it relocates the root entirely"
-        );
-        // ...and an install without it is byte-identical to the old list, so
-        // no existing operator's registry lookup moves.
-        assert!(
-            !without_home.contains(&tmp.path().join("profiles.json")),
-            "unset DARKMUX_HOME must not inject a scoped candidate"
-        );
+        assert_eq!(with_home.first(), Some(&tmp.path().join("profiles.json")));
         assert_eq!(
             without_home.first(),
-            Some(&std::env::current_dir().unwrap().join(".darkmux.json")),
-            "unset DARKMUX_HOME must still lead with the cwd candidate"
+            dirs::home_dir().map(|h| h.join(".darkmux").join("profiles.json")).as_ref(),
+            "unset DARKMUX_HOME leads with ~/.darkmux, never a cwd candidate"
         );
     }
 
@@ -633,17 +628,23 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn darkmux_config_empty_falls_through() {
-        let tmp = TempDir::new().unwrap();
-        let p = tmp.path().join(".darkmux.json");
+        let root = TempDir::new().unwrap();
+        let p = root.path().join("profiles.json");
         write(&p, minimal_json());
-        let prev = env::current_dir().unwrap();
-        env::set_current_dir(tmp.path()).unwrap();
-        unsafe { env::set_var("DARKMUX_PROFILES", "") };
+        let prev_home = env::var("DARKMUX_HOME").ok();
+        unsafe {
+            env::set_var("DARKMUX_HOME", root.path());
+            env::set_var("DARKMUX_PROFILES", "");
+        }
         let result = load_registry(None);
-        unsafe { env::remove_var("DARKMUX_PROFILES") };
-        env::set_current_dir(prev).unwrap();
-        let loaded = result.unwrap();
-        assert!(loaded.path.ends_with(".darkmux.json"));
+        unsafe {
+            env::remove_var("DARKMUX_PROFILES");
+            match prev_home {
+                Some(v) => env::set_var("DARKMUX_HOME", v),
+                None => env::remove_var("DARKMUX_HOME"),
+            }
+        }
+        assert_eq!(result.unwrap().path, p);
     }
 
     #[test]
@@ -778,8 +779,9 @@ mod tests {
         write(
             &p,
             r#"{"profiles":{"azure-x":{"models":[
-                    {"id":"gpt-4o","endpoint":{"url":"https://example.azure.com/openai"}}
-                ]}}}"#,
+                    {"id":"gpt-4o","endpoint":"azure"}
+                ]}},
+                "endpoints":{"azure":{"url":"https://example.azure.com/openai"}}}"#,
         );
         let loaded = load_registry(Some(p.to_str().unwrap())).unwrap();
         assert!(loaded.registry.quarantined.is_empty());
@@ -794,6 +796,19 @@ mod tests {
         let prof2 = get_profile(&reloaded.registry, "azure-x").unwrap();
         assert_eq!(prof2.models[0].n_ctx, None);
         assert!(!fs::read_to_string(&round).unwrap().contains("n_ctx"));
+    }
+
+    /// A bare-string `internal.utility` was removed in 4.0: the registry does
+    /// not load, and the error names the object to write.
+    #[test]
+    fn a_bare_string_utility_fails_the_load_naming_the_object_form() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("profiles.json");
+        write(&p, r#"{"profiles":{"p":{"models":[{"id":"m","n_ctx":1}]}},"internal":{"utility":"util-4b"}}"#);
+        let err = format!("{:#}", load_registry(Some(p.to_str().unwrap())).unwrap_err());
+        assert!(err.contains("bare string") && err.contains(r#""utility": { "id": "util-4b", "n_ctx": "#), "{err}");
+        write(&p, r#"{"profiles":{"p":{"models":[{"id":"m","n_ctx":1}]}},"internal":{"utility":{"id":"util-4b","n_ctx":8000}}}"#);
+        assert!(load_registry(Some(p.to_str().unwrap())).is_ok());
     }
 
     /// (#2902 step 4) The loader materializes `"endpoint": "<id>"` from the
@@ -854,7 +869,7 @@ mod tests {
         assert!(on_bad.endpoint_kind().unwrap_err().to_string().contains("bad"));
         let on_good = &get_profile(&loaded.registry, "on-good").unwrap().models[0];
         assert!(on_good.endpoint_kind().is_ok());
-        let issues: Vec<String> = loaded.registry.validate().into_iter().map(|i| i.message).collect();
+        let issues: Vec<String> = loaded.registry.validate();
         assert!(
             issues.iter().any(|m| m.contains("\"bad\"") && m.contains("quarantined")),
             "the reference names the quarantine: {issues:?}"
@@ -887,7 +902,7 @@ mod tests {
         let p = tmp.path().join("profiles.json");
         write(&p, r#"{"profiles":{"h":{"models":[{"id":"gpt","endpoint":"x"}]}},"endpoints":[]}"#);
         let loaded = load_registry(Some(p.to_str().unwrap())).unwrap();
-        let issues: Vec<String> = loaded.registry.validate().into_iter().map(|i| i.message).collect();
+        let issues: Vec<String> = loaded.registry.validate();
         assert!(issues.iter().any(|m| m.contains("\"x\"") && m.contains("quarantined")), "{issues:?}");
     }
 
@@ -1069,17 +1084,6 @@ mod tests {
             "default_locations leaked DARKMUX_PROFILES into the fallback chain: {:?}",
             locs
         );
-    }
-
-
-    /// Running from $HOME (the first-run case) made cwd/.darkmux and
-    /// ~/.darkmux the same path, so the "Looked in" list printed it twice.
-    #[test]
-    fn candidate_listing_has_no_duplicate_paths() {
-        let a = std::path::PathBuf::from("/h/.darkmux.json");
-        let b = std::path::PathBuf::from("/h/.darkmux/profiles.json");
-        let out = dedupe_paths(vec![a.clone(), b.clone(), b.clone(), a.clone()]);
-        assert_eq!(out, vec![a, b]);
     }
 }
 

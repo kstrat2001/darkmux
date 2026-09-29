@@ -293,23 +293,19 @@ pub fn choose_utility_model(current: &str, available: &[darkmux_profiles::lms::M
 }
 
 /// Locate the model id of the registry's `internal.utility` binding in the
-/// raw text: the byte range of `<id>` in either `"utility": "<id>"` or
-/// (#2914) `"utility": { "id": "<id>", "n_ctx": N }`. A hand-rolled scan
-/// rather than a regex dependency (the dep set is small on purpose). `None`
-/// when the key is absent, or not followed by a string or an object with a
-/// string `id`.
+/// raw text: the byte range of `<id>` in `"utility": { "id": "<id>", "n_ctx": N }`.
+/// A hand-rolled scan rather than a regex dependency (the dep set is small on
+/// purpose). `None` when the key is absent, or not followed by an object with
+/// a string `id` (a bare string is not a valid binding).
 fn utility_value_span(registry_json: &str) -> Option<(usize, usize)> {
-    let value_at = string_value_after_key(registry_json, 0, "\"utility\"")?;
-    match value_at {
+    let ValueAt::Object(open) = string_value_after_key(registry_json, 0, "\"utility\"")? else {
+        return None;
+    };
+    // The first `"id"` string inside the object.
+    let close = open + registry_json[open..].find('}')?;
+    match string_value_after_key(&registry_json[..close], open, "\"id\"")? {
         ValueAt::Str(start, end) => Some((start, end)),
-        ValueAt::Object(open) => {
-            // The object form: the first `"id"` string inside the object.
-            let close = open + registry_json[open..].find('}')?;
-            match string_value_after_key(&registry_json[..close], open, "\"id\"")? {
-                ValueAt::Str(start, end) => Some((start, end)),
-                ValueAt::Object(_) => None,
-            }
-        }
+        ValueAt::Object(_) => None,
     }
 }
 
@@ -1181,13 +1177,11 @@ mod tests {
         assert_eq!(choose_utility_model("nobody/4b", &[meta("embed", 1, "embedding")]), None);
     }
 
+    /// The removed bare-string binding is not one init recognizes.
     #[test]
-    fn fill_utility_binding_rewrites_only_that_value() {
-        let reg = r#"{"internal":{"utility":"qwen/qwen3-4b-instruct-2507"},"profiles":{"fast":{"models":[{"id":"qwen/qwen3-4b-instruct-2507","n_ctx":32000}]}}}"#;
-        let out = fill_utility_binding(reg, "qwen/qwen3-4b-instruct-2507", "qwen3-4b-instruct-2507").expect("binding present");
-        assert!(out.contains(r#""utility":"qwen3-4b-instruct-2507""#), "{out}");
-        assert!(out.contains(r#""id":"qwen/qwen3-4b-instruct-2507""#), "a profile model with the same id is not the utility binding: {out}");
-        assert_eq!(fill_utility_binding(&out, "qwen/qwen3-4b-instruct-2507", "x"), None, "nothing to replace");
+    fn fill_utility_binding_ignores_a_bare_string() {
+        let reg = r#"{"internal":{"utility":"qwen/qwen3-4b-instruct-2507"},"profiles":{}}"#;
+        assert_eq!(fill_utility_binding(reg, "qwen/qwen3-4b-instruct-2507", "x"), None);
     }
 
     /// (#2914) The object form `"utility": { "id": .., "n_ctx": .. }` — the

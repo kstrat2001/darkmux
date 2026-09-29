@@ -48,6 +48,23 @@ RETIRED_COMMAND_PHRASES = [
     "mission propose",   # removed in 4.0; write the config by hand, then `mission launch` (#2912)
     "notebook draft",    # removed in 4.0; the darkmux-lab-notebook skill (#2913)
     "notebook list",     # removed in 4.0; the darkmux-lab-notebook skill (#2913)
+    "mission add-phase",      # removed in 4.0; phases come from the mission config (#2954)
+    "darkmux mission start",  # removed in 4.0; `mission launch` starts the mission it creates (#2954)
+    "mission pause",          # removed in 4.0; `mission finalize` / `mission abort` end a run (#2954)
+    "mission resume",         # removed in 4.0 with `mission pause` (#2954)
+    "dispatch --phase-id",    # removed in 4.0; a dispatch no longer names a phase (#2954)
+    "lab run list",      # -> `run list --kind lab` (4.0, one run noun)
+    "lab run inspect",   # -> `run inspect` (4.0, one run noun)
+    "lab run stats",     # -> `run stats` (4.0, one run noun)
+    "lab run compare",   # -> `run compare` (4.0, one run noun)
+]
+
+# Retired phrases with an unrelated same-spelled use, as raw regexes. The
+# `mission dispatch` verb is gone (#2954: `dispatch <role> --profile
+# <p>@<machine>`), but `mission dispatch terminated before completion` is the
+# launcher's own error text and stays legal.
+RETIRED_COMMAND_REGEXES = [
+    r"\bmission dispatch\b(?! terminated)",
 ]
 
 # Single-word retired verbs: matched ONLY in the `darkmux <verb>` form so common
@@ -68,7 +85,9 @@ ALLOW_MARKER = "drift-guard:allow"
 
 ROOTS = ["src", "runtime/src"]  # plus crates/*/src, discovered below
 
-_command_res = [re.compile(r"\b" + re.escape(p) + r"\b") for p in RETIRED_COMMAND_PHRASES]
+_command_res = [re.compile(r"\b" + re.escape(p) + r"\b") for p in RETIRED_COMMAND_PHRASES] + [
+    re.compile(r) for r in RETIRED_COMMAND_REGEXES
+]
 _single_re = re.compile(r"darkmux (" + "|".join(RETIRED_SINGLE_VERBS) + r")\b")
 _string_re = re.compile(r'"([^"\\]|\\.)*"')
 

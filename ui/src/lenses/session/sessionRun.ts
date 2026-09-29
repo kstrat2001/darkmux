@@ -65,7 +65,7 @@ import { PURPOSE, sumUsage } from "../../lib/usageRecords";
 import type { DispatchStartPayload, DispatchCompletePayload } from "../../types/handwritten";
 import { toolOutcome } from "../../lib/recordDetail";
 import type { RunStatus } from "../../types/generated/RunStatus";
-import { ACTION, CATEGORY, byTime, isDispatchTerminal, latestByTime, recordsAsOf, type NormRecord } from "../../lib/ingest";
+import { ACTION, CATEGORY, byTime, isBookendTerminal, latestByTime, recordsAsOf, type NormRecord } from "../../lib/ingest";
 import { maxOf } from "../../lib/numbers";
 
 /** The run-time figure's long hover text, shared by SYSTEM's WALL CLOCK and
@@ -621,10 +621,11 @@ function contextOf(run: RunRecords, l: Lifecycle, nowMs: number): RunContext {
 }
 
 /** What the page reads off a run's close: when, whether its clock was
- *  skewed, and the dispatch terminal its payload comes from. */
+ *  skewed, and the bookend terminal (a run's or an execution's) its payload
+ *  comes from. */
 function closeFacts(close: Close | null): Pick<RunContext, "closeTs" | "skewedClose" | "c"> {
   if (!close) return { closeTs: null, skewedClose: false, c: null };
-  return { closeTs: close.atMs, skewedClose: close.skewed, c: isDispatchTerminal(close.record.action) ? close.record : null };
+  return { closeTs: close.atMs, skewedClose: close.skewed, c: isBookendTerminal(close.record.action) ? close.record : null };
 }
 
 /** The attempt's telemetry, by source. */

@@ -27,6 +27,7 @@ Usage:
 """
 import argparse, json, pathlib, random, subprocess, sys, zlib
 from datetime import datetime, timedelta, timezone
+from lib_demo_env import without_retired_env
 
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
@@ -372,7 +373,7 @@ def replay(source, plan, machine, now_ms, session_id):
             if p.get("model") == source_primary:
                 p["model"] = plan["model"]
             if isinstance(p.get("workspace"), str):
-                p["workspace"] = f"/home/demo/.darkmux/runs/{plan['slug']}/sandbox"
+                p["workspace"] = f"/home/demo/.darkmux/lab/{plan['slug']}/sandbox"
         out.append(r)
     return out, start
 
@@ -453,15 +454,10 @@ def materialize_mission(slug, plan, machine, home, now_ms):
     span_s = max((v for obj in files.values() for v in _walk_ts_rel(obj)), default=0)
     start_s = now_ms // 1000 - plan["ends_ago_min"] * 60 - span_s
 
-    # `home / "crew"`, NOT `home / "missions"` directly: `panel_env`/`serve.py`
-    # both pin `DARKMUX_CREW_DIR` at `<home>/crew` (the env var names the
-    # directory CONTAINING `missions/`/`phases/`/`roles/`/…, no extra nesting
-    # — see `darkmux-crew::loader::user_subdir`), so that is where
-    # `load_missions()` actually walks. Missing this the first time round
-    # made the graph route 404 with "no mission with id ... found" even
-    # though the files existed, just one directory level off from where the
-    # daemon was told to look.
-    out_dir = home / "crew" / "missions" / slug  # mission id == slug by import_mission.py's construction
+    # Missions live directly under the darkmux root (`<home>/missions/<slug>/`,
+    # `darkmux-crew::loader::user_subdir`), which is where `load_missions()`
+    # walks. `DARKMUX_HOME` (set by `panel_env`/`serve.py`) is the only pointer.
+    out_dir = home / "missions" / slug  # mission id == slug by import_mission.py's construction
     for relpath, obj in files.items():
         obj = _reanchor_ts_rel(obj, start_s)
         p = out_dir / relpath
@@ -515,11 +511,10 @@ def canned_machine_status(machine, ledger):
 def panel_env(home):
     """Env that pins every CLI shell-out to the demo home."""
     import os
-    e = dict(os.environ)
+    e = without_retired_env(os.environ)
     e.update({
         "DARKMUX_HOME": str(home),
         "DARKMUX_FLOWS_DIR": str(home / "flows"),
-        "DARKMUX_CREW_DIR": str(home / "crew"),
         "DARKMUX_MACHINE_ID": "m5-ultra-256gb",
         # Never let a demo shell-out reach a real coordination substrate.
         "DARKMUX_REDIS_URL": "",
@@ -630,7 +625,7 @@ def main():
 
     out = pathlib.Path(a.out)
     home, fx = out / "demo-home", out / "fixtures"
-    for d in (home / "flows", home / "crew", fx / "machine", fx / "panel"):
+    for d in (home / "flows", home / "missions", fx / "machine", fx / "panel"):
         d.mkdir(parents=True, exist_ok=True)
 
     version = subprocess.run(["darkmux", "--version"], capture_output=True, text=True
@@ -811,7 +806,7 @@ def main():
           f"the rest render from the demo home")
     if mission_slugs:
         print(f"  missions   {', '.join(mission_slugs)} materialized under "
-              f"{home / 'crew' / 'missions'}")
+              f"{home / 'missions'}")
     else:
         print(f"  missions   none imported yet — run ./import_mission.py <mission-id> "
               f"first")

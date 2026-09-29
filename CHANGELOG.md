@@ -16,6 +16,56 @@ darkmux release.
 
 ### Removed (breaking, 4.0)
 
+- **`darkmux mission dispatch` and the hand-built mission verbs** (#2954).
+  Missions now come only from mission configs. Removed with no alias:
+  `mission dispatch`, `mission add-phase`, `mission start`,
+  `mission pause`, `mission resume`, and `dispatch --phase-id`. Each now
+  exits 2 with a line naming its replacement. `WorkJob.phase_id` is gone
+  from the work-submission wire (WORK_JOB 7 to 8), so a v7 sender gets the
+  version remedy. **Migration:** to run a role on another machine,
+  `darkmux dispatch <role> "<message>" --profile <profile>@<machine>
+  [--no-wait]`; to run a mission, write or edit its config and
+  `darkmux mission launch <config>` (it starts the mission it creates);
+  end it with `mission finalize <id>` or `mission abort <id>`. Growing a
+  running mission by hand, and pausing one, have no replacement. Routing a
+  mission's own steps to another machine comes back as a step-staffing
+  feature, not as a verb.
+- **The `paused` mission status and the `mission.pause`, `mission.resume` and
+  `phase.added` flow actions** (#2954). Nothing writes them any more. A
+  `mission.json` that says `"status": "paused"` still loads and reads as
+  `active` (a leftover `paused_ts` is ignored), and the three actions read
+  from an archive as retired. **Migration:** none; the mission board and
+  `run list` no longer show a `paused` group.
+- **One run noun: recorded lab runs are read through `darkmux run`, and live in
+  `lab/`** (B4, B5). Contract 8 makes "run" the umbrella over mission, dispatch
+  and lab runs, so a `runs/` directory holding only lab runs and a
+  `lab run list|inspect|stats|compare` family beside `darkmux run list` were
+  the umbrella's name on one kind. **Migration (CLI):** `darkmux lab run list`
+  is `darkmux run list --kind lab`; `lab run inspect|stats|compare` are
+  `darkmux run inspect|stats|compare`, with the same output and the same
+  `--json` documents. The old spellings fail naming the replacement.
+  `run inspect|stats|compare` read lab runs only and refuse a mission or
+  dispatch run id, naming where to look. `darkmux lab run <workload>` is the
+  launcher only; a workload named `list` still launches with the escape,
+  `darkmux lab run -- list`. The
+  workload/profile/verify table `lab run list` printed is gone with it: the
+  `run list` rows carry kind, status, start, duration, tokens and id; a lab
+  row's subtitle names the workload and its verify outcome (`verify pass`,
+  `verify FAIL`, `verify —` for not checked). A bare run id now resolves under
+  the lab dir only: a same-named directory in the cwd is no longer read (pass a
+  path to read one).
+  **Migration (disk):** the lab-run root default moved from
+  `~/.darkmux/runs/` to `~/.darkmux/lab/`. darkmux does not move your data.
+  While the old directory holds runs and the new one does not exist, `darkmux
+  doctor` fails and prints the exact command, and every lab verb (`lab run`,
+  `lab eval`, `lab loop`, `run list --kind lab`, `run inspect|stats|compare`)
+  refuses, naming it: `mv ~/.darkmux/runs ~/.darkmux/lab` (`rmdir` the new dir
+  first when it already exists and is empty, which the printed command does).
+  `lab doctor` does not touch the lab dir and is not gated. `darkmux serve`
+  still starts: it names the move in its startup banner and on `GET /lab/runs`
+  (`pending_move`). If both hold runs, doctor warns and prints a merge that
+  never overwrites. An explicit
+  `DARKMUX_LAB_DIR` / `dirs.lab` is untouched.
 - **The fleet page's orchestrator note** (#2983): the "Orchestrator note:"
   line under the token panel, its `history →` list, and the stock sentence
   it showed when no note existed. The panel is one line shorter; nothing
@@ -150,7 +200,106 @@ darkmux release.
   (CONFIG 2.0, below). **Migration:** delete any of those keys still
   present (`darkmux doctor`'s `user file keys` rows name them).
 
+- **A role's `escalation_posture`.** Nothing read it: the runtime treated
+  `auto` and `pause` the same. A role manifest that still sets it is refused
+  like any retired key. **Migration:** delete `escalation_posture` from your
+  role manifests (`darkmux doctor`'s `user file keys` row names each file).
+
 ### Changed (breaking, 4.0)
+
+- **Read auth and execution auth are separate switches** (#2988). A serve
+  token used to close the whole read surface to peers, so a hub that took
+  fleet work (which needs the token) could not also serve its viewer over
+  `tailscale serve`. Now fleet work submission always requires the token
+  plus a network-verified sender, unchanged, and READS are governed by the
+  new `serve.read_auth` (`DARKMUX_SERVE_READ_AUTH`), default `false`: the
+  viewer and every JSON route stay tailnet-open, token or no token. With it
+  on, a read not from this machine needs the token, proxied requests
+  included, so a browser viewer over the tailnet gets 401. `darkmux doctor`
+  shows both postures (`serve daemon token`, `serve reads`), and so does the
+  `serve` banner. `runtime.daemon_auth_enabled` is retired (CONFIG 2.0),
+  replaced by `serve.token_keychain`; `init` writes both new keys visibly
+  as `false`. **Migration:** move `runtime.daemon_auth_enabled` to
+  `darkmux config set serve.token_keychain <value>` (a leftover key is
+  refused, naming the replacement). If you relied on a token closing reads,
+  `darkmux config set serve.read_auth true`. A non-loopback `--bind` now
+  also requires `serve.read_auth true`: a token alone no longer licenses
+  it, and `serve` refuses to start with read auth on and no token.
+  "This machine" is one predicate: a loopback peer (`::ffff:127.0.0.1`
+  included), no proxy header, and a single `Host` naming the daemon
+  (`localhost`, `127.0.0.1`, `[::1]` or the bound address, with no port or
+  the bound port). A page rebound by DNS to loopback, and a browser reaching
+  the daemon through a header-less `tailscale serve --tcp` proxy, are no
+  longer local. Limit: `Host` is client-set, so a non-browser client behind a
+  TCP forward that adds no headers can send `Host: localhost` and cannot be
+  told apart from this machine; for that setup use the HTTPS `tailscale
+  serve` (it adds headers) or keep read auth on with a non-loopback bind. The `doctor` and
+  `config-list` panels describe the fleet listener and its allow-list, so
+  they are served only to this machine or a token holder even with read
+  auth off; the other panels follow `serve.read_auth`. `darkmux serve` runs
+  the config gate before it binds, so a wrong-typed value (`serve.read_auth:
+  "true"`) or a retired key refuses the start. **Migration:** a tailnet
+  viewer with read auth off loses the `doctor` and `config-list` panels
+  (401); run them on the hub, or present the token.
+
+- **`internal.utility` is the object `{ "id", "n_ctx" }` only (PROFILES 2.0).**
+  The bare-string spelling (`"utility": "<model-id>"`) is refused, and the
+  registry does not load with it: the error names the object to write.
+  **Migration:** change `"utility": "<id>"` to
+  `"utility": { "id": "<id>", "n_ctx": <the window it is loaded at> }`
+  (the shipped `profiles.example.json` already uses it); an object with no
+  `n_ctx` still declares no window and is nudged by `darkmux doctor`.
+
+- **A profile model's inline `endpoint` object is refused, and an endpoint
+  declares its kind (PROFILES 2.0).** A model names an `endpoints` entry by
+  id (`"endpoint": "azure-east"`); the object form is gone, and so is the
+  implicit-kind rule (no `url` meant managed, a `url` meant unmanaged): an
+  `endpoints` entry declares `"managed": "lmstudio"` or a `url`, and one
+  with neither is refused at use. Every dispatching preflight and `darkmux
+  doctor` name each inline object with the exact rewrite. **Migration:**
+  for each `"endpoint": { ... }` on a model, move the object to
+  `endpoints."<id>"` and write `"endpoint": "<id>"` on the model (the
+  refusal prints the id); a model on the LM Studio darkmux manages needs no
+  `endpoint` at all.
+
+- **`dirs.crew` and `DARKMUX_CREW_DIR` are removed; `DARKMUX_HOME` is the one
+  relocation.** "Crew" is a retired concept: roles, missions, phases, crews
+  and skills live directly under the darkmux root, and the knob meant two
+  things (the preamble-override directory `<root>/crew`, and the root of
+  that state). `dirs.crew` in `config.json` is an unknown key, refused by
+  the gate, and a set `DARKMUX_CREW_DIR` is refused by every command
+  (`doctor` and `config` excepted, so you can find and fix it) and failed by
+  `darkmux doctor`. The autonomous-dispatch preamble override is now
+  `<root>/AUTONOMOUS_DISPATCH_PREAMBLE.md` (it was `<root>/crew/...`).
+  **Migration:** delete `dirs.crew`, unset `DARKMUX_CREW_DIR`, and if you
+  relocated darkmux with it set `DARKMUX_HOME` instead. `darkmux doctor`'s
+  `beat-33 crew/ layout` row prints the move for a preamble override left
+  under `<root>/crew/`.
+
+- **A project-local `./.darkmux/` is no longer adopted.** The darkmux root is
+  `$DARKMUX_HOME` when set, else `~/.darkmux`, and nothing else: a `.darkmux/`
+  in the working directory used to become the root for flows, lab runs,
+  sandboxes and profiles while missions and roles stayed at home. It is now
+  ignored: only the per-repo `lessons.db` and `conventions.json` are still
+  read from it. The same goes for a `./.darkmux/profiles.json` or
+  `./.darkmux.json` registry, which used to be searched ahead of
+  `~/.darkmux/profiles.json`: the registry now comes from the root
+  (`DARKMUX_HOME` or `~/.darkmux`), or `--profiles-file` /
+  `DARKMUX_PROFILES`. **Migration:** to keep using such a directory, run
+  darkmux with `DARKMUX_HOME=<that directory>`; otherwise move what you need
+  into `~/.darkmux` (a registry is `~/.darkmux/profiles.json`). `darkmux
+  doctor`'s `project-local .darkmux` row warns when the working directory
+  holds anything besides those per-repo files, naming what is stranded.
+
+- **A retired setting's env var is refused by every command.**
+  `DARKMUX_CREW_DIR`, `DARKMUX_NOTEBOOK_DIR`, `DARKMUX_RADIO_ROUTER_PROFILE`
+  and the renamed `DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION` used to be
+  refused only by the dispatch, mission-launch, lab and fleet entry points
+  (or, for the notebook and radio-router ones, only warned about). One check
+  at CLI entry now refuses to start while any is set, for every command
+  except `doctor` and `config` (and `--help` / `--version`). **Migration:**
+  remove the export from your shell rc; `darkmux doctor` lists each one with
+  what replaced it.
 
 - **An unknown key in a user file is refused (CONFIG 2.0).** `config.json`,
   `profiles.json`, role, skill and crew manifests, mission configs, rule
@@ -308,9 +457,9 @@ darkmux release.
   `DARKMUX_REMOTE_MAX_TOKENS_PER_STEP`): a per-step cap on hosted tokens,
   where `dispatch.map` steps naming the same `bucket_group` share one
   allowance. Clean break, no alias: `darkmux config set` refuses the old key
-  naming the new one, the old key is read by nothing, and `darkmux doctor`
-  names a leftover old key in `config.json` or the env with the exact
-  rename. It has no built-in default any more (unset means no cap), and
+  naming the new one, and a leftover old key in `config.json` or old env var
+  is refused at every preflight and failed by `darkmux doctor`, naming the
+  exact rename. It has no built-in default any more (unset means no cap), and
   reaching a cap never stops the step: the new `remote.step_budget_policy`
   (env `DARKMUX_REMOTE_STEP_BUDGET_POLICY`) is `warn` (the default: a CLI
   line and a `budget.warn` flow record, and the step keeps going) or `off`.
@@ -322,8 +471,8 @@ darkmux release.
   means unbounded), where before it refused every hosted call. `init`
   writes both keys visibly as `null`. CONFIG 1.32. **Migration:** a
   `config.json` written by an earlier `init` carries
-  `"max_tokens_per_execution": 500000` in its `remote` block; nothing reads
-  it now, so it no longer caps anything. Delete it, or, to keep a cap, run
+  `"max_tokens_per_execution": 500000` in its `remote` block; darkmux now
+  refuses it. Delete it, or, to keep a cap, run
   `darkmux config set remote.max_tokens_per_step <n>` (and rename an
   exported `DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION`).
 - **Flow actions have one spelling per event** (FLOW 2.0.0). Every action
@@ -347,6 +496,47 @@ darkmux release.
   as `step.*`); one that would match more (`dispatch *`, `mission *`,
   `phase *`) matches nothing, and both `darkmux doctor` (`CANNOT MATCH`) and
   the hook sink at startup say so.
+- **A whole run has its own bookends: `run.start` / `run.complete` /
+  `run.error`** (FLOW 2.0.0, CLAUDE.md contract 8). `mission launch` and an
+  ACP panel run used to bracket the whole run in `dispatch.start` /
+  `complete` / `error` with `source: "mission"` and `payload.runtime`
+  (`mission` / `ephemeral`); they now write `run.*` on the run's own session
+  and neither field. `dispatch.*` means one role execution only. On the
+  viewer, the fleet card's DISPATCHES chip and the status line's "last
+  dispatch" no longer count a run as a dispatch, and the event log files the
+  run records as `run.start` / `run.complete` / `run.error` under MISSION.
+  darkmux's own readers read a pre-4.0 archive's whole-run pair (`source`
+  `mission`, or the retired review launcher's `review`) as `run.*`, and never
+  rewrite it. **Migration:** a hook rule or external reader that watched
+  `dispatch.complete` with `source: "mission"` to learn that a run ended
+  must match `run.complete` / `run.error` instead; one that counted
+  `dispatch.start` records as runs now counts role executions.
+- **Every record of a role execution names it: `execution_id`** (FLOW 2.0.0,
+  CLAUDE.md contract 8). One id is minted per execution (a container or hosted
+  dispatch, a `dispatch.single_shot` step, each item of a `dispatch.map`) and
+  stamped on its `dispatch.*` bookends, turns, tool calls, `telemetry.*` and
+  `budget.*` records; a resumed dispatch keeps its id. A `dispatch.map` step
+  no longer writes one `dispatch.start` / `complete` pair around the whole
+  step: each item writes its own. Token totals, the DISPATCHES chip, the
+  records-emitted pairing and the run lifecycle key on the execution, so a
+  session holding several (a map's items) no longer blends them. Stored
+  findings are filed under `<execution_id>/<seq>`, and `darkmux finding list
+  --dispatch <id>` is now `--execution <id>`; a finding filed before 4.0 keeps
+  its address. darkmux's readers give a pre-4.0 record of an execution the id
+  `legacy:<session>:<mission>` and never rewrite the file. **Migration:** a
+  hook rule or external reader that counted a map step's `dispatch.start` as
+  one per step now sees one per item; one that joined a step's records by
+  `session_id` alone can join by `execution_id`; the runtime image's
+  `--session-id` flag is `--execution-id` (the image and binary are version
+  locked, so nothing to do but upgrade both).
+- **`finding list --json` rows carry `execution`, not `dispatch`** (breaking:
+  `--json` shapes are semver-bound). Each row's `dispatch` field is now
+  `execution`, holding the `<execution_id>` half of the finding's key; the
+  `--dispatch` flag is refused with a message naming `--execution`.
+  **Migration:** read `.execution` where a script read `.dispatch`, and
+  pass `--execution <id>` where it passed `--dispatch <id>`. The catalog's
+  per-day and per-mission DISPATCHES counts are executions too, so a map
+  step's items each count.
 - **Every machine in a fleet upgrades together** (FLOW 2.0.0). A 4.0 reader
   upgrades a 3.x peer's records, but a 3.x reader does not know the dotted
   spellings: a 3.x hub misreads a 4.0 peer's records (its missions never
@@ -508,7 +698,7 @@ darkmux release.
   `published_by_orchestrator` removed. **Migration:** on every machine
   that should take work, store the fleet token if it has none (`security
   add-generic-password -U -a "$USER" -s darkmux-serve-token -w`, same value
-  everywhere, plus `darkmux config set runtime.daemon_auth_enabled true`),
+  everywhere, plus `darkmux config set serve.token_keychain true`),
   trust each sender (`darkmux machine trust <sender> --profiles
   <profile>,... --roles <role>,...`), `darkmux config set fleet.listener.enabled true`, and
   restart `darkmux serve`. On the hub, delete the dead streams: `redis-cli
@@ -780,6 +970,13 @@ darkmux release.
 
 ### Fixed
 
+- **A request proxied to loopback no longer counts as this machine**
+  (#2988). The daemon exempted any loopback connection from the bearer
+  check, and `tailscale serve` (the documented way a hub reaches the
+  tailnet) delivers every tailnet peer on loopback, so with a token set,
+  remote reads were served without it. With read auth on, the gate now uses
+  the same test `/health` already did: loopback AND no reverse-proxy header
+  (`X-Forwarded-For`, `Forwarded`, `Tailscale-User-*` and the like).
 - **Model output can no longer reach host files through symlinks** (#2869).
   Every host read or copy of a container-writable path (the out-dir,
   `.darkmux-runtime/`, the resume checkpoint, the live trajectory tailer,

@@ -108,7 +108,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// `MISSION_STATUS_VALUES` (see its doc comment) instead of hand-widened,
 /// and a stale on-disk index built under the old, too-narrow CHECK needs
 /// this version bump to force a rebuild onto the fixed schema.
-const SCHEMA_VERSION: i32 = 8;
+///
+/// Bumped 8 -> 9 (#2954): `MissionStatus::Paused` and `Mission.paused_ts` are
+/// gone, so the `missions` table lost its `paused_ts` column and the status
+/// CHECK lost `'paused'`. A stale index is detected by this bump and rebuilt
+/// from `mission.json`, which still reads a `paused` status as `active`.
+const SCHEMA_VERSION: i32 = 9;
 
 /// Canonical wire-form values for every `MissionStatus` variant. Single
 /// source of truth for the `missions.status` CHECK constraint baked into
@@ -119,7 +124,7 @@ const SCHEMA_VERSION: i32 = 8;
 /// This is the fix for #2142: the constraint used to be a hand-widened SQL
 /// literal that silently fell behind the enum for the better part of a
 /// milestone.
-const MISSION_STATUS_VALUES: &[&str] = &["active", "finalized", "aborted", "paused"];
+const MISSION_STATUS_VALUES: &[&str] = &["active", "finalized", "aborted"];
 
 /// Build the `IN (...)` list for the `missions.status` CHECK from
 /// [`MISSION_STATUS_VALUES`] — see that constant's doc comment.
@@ -228,8 +233,7 @@ CREATE TABLE IF NOT EXISTS missions (
     status       TEXT NOT NULL CHECK (status IN ({MISSION_STATUS_LIST})),
     created_ts   INTEGER NOT NULL,
     started_ts   INTEGER,  -- Active transition; #95
-    finalized_ts INTEGER,  -- Finalized transition (terminal); #95, renamed from closed_ts (#1463 lineage)
-    paused_ts    INTEGER   -- most-recent Paused transition; #95
+    finalized_ts INTEGER   -- Finalized transition (terminal); #95, renamed from closed_ts (#1463 lineage)
 );
 
 CREATE TABLE IF NOT EXISTS phases (
@@ -335,13 +339,9 @@ const REBUILD_TABLES: &[&str] = &[
 /// Stable across releases — changing this silently invalidates every operator's
 /// existing index. Tests use the `_at(&path)` variants (`rebuild_at`,
 /// `role_list_at`, `crew_list_at`, etc.) rather than overriding this path.
-/// (#1012) ForceUser, NOT Auto: the index is DERIVED from the user-scope crew /
-/// missions / phases (now resolved via `user_state_root` = ForceUser), so it
-/// must be user-scoped to match its content — a project-scoped index of
-/// user-scoped data is incoherent, and a bare `<cwd>/.darkmux/` must not relocate
-/// it. In the common no-project-`.darkmux` case `Auto` already resolved to user,
-/// so the path is unchanged; only a repo with a stray `.darkmux/` is corrected
-/// (one rebuild). DARKMUX_HOME still wins.
+/// The index is DERIVED from the user-scope crew / missions / phases, so it
+/// lives at the user root; a bare `<cwd>/.darkmux/` does not relocate it.
+/// DARKMUX_HOME still wins.
 pub fn default_index_path() -> PathBuf {
     resolve(ResolveScope::ForceUser).root.join("index.db")
 }
@@ -402,7 +402,6 @@ fn mission_status_str(s: MissionStatus) -> &'static str {
         MissionStatus::Active => "active",
         MissionStatus::Finalized => "finalized",
         MissionStatus::Aborted => "aborted",
-        MissionStatus::Paused => "paused",
     }
 }
 
@@ -710,8 +709,8 @@ fn populate(conn: &mut Connection) -> Result<()> {
     for mission in &missions {
         let status_str = mission_status_str(mission.status);
         let inserted = tx.execute(
-            "INSERT INTO missions (id, description, status, created_ts, started_ts, finalized_ts, paused_ts)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO missions (id, description, status, created_ts, started_ts, finalized_ts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 mission.id,
                 mission.description,
@@ -719,7 +718,6 @@ fn populate(conn: &mut Connection) -> Result<()> {
                 mission.created_ts as i64,
                 mission.started_ts.map(|t| t as i64),
                 mission.finalized_ts.map(|t| t as i64),
-                mission.paused_ts.map(|t| t as i64),
             ],
         );
         if let Err(e) = inserted {
@@ -1204,7 +1202,7 @@ mod tests {
     use std::env;
     use tempfile::TempDir;
 
-    /// RAII guard: point DARKMUX_CREW_DIR at a TempDir for the test's
+    /// RAII guard: point DARKMUX_HOME at a TempDir for the test's
     /// lifetime. Mirrors the loader's pattern; serialized via #[serial].
     ///
     /// (#994) Also isolates DARKMUX_FLOWS_DIR to an (initially absent) subdir of
@@ -1222,10 +1220,10 @@ mod tests {
     impl CrewDirGuard {
         fn new() -> Self {
             let tmp = TempDir::new().unwrap();
-            let prev_crew = env::var("DARKMUX_CREW_DIR").ok();
+            let prev_crew = env::var("DARKMUX_HOME").ok();
             let prev_flows = env::var("DARKMUX_FLOWS_DIR").ok();
             unsafe {
-                env::set_var("DARKMUX_CREW_DIR", tmp.path());
+                env::set_var("DARKMUX_HOME", tmp.path());
                 env::set_var("DARKMUX_FLOWS_DIR", tmp.path().join("flows"));
             }
             Self { prev_crew, prev_flows, tmp }
@@ -1247,8 +1245,8 @@ mod tests {
         fn drop(&mut self) {
             unsafe {
                 match &self.prev_crew {
-                    Some(v) => env::set_var("DARKMUX_CREW_DIR", v),
-                    None => env::remove_var("DARKMUX_CREW_DIR"),
+                    Some(v) => env::set_var("DARKMUX_HOME", v),
+                    None => env::remove_var("DARKMUX_HOME"),
                 }
                 match &self.prev_flows {
                     Some(v) => env::set_var("DARKMUX_FLOWS_DIR", v),
@@ -1267,7 +1265,7 @@ mod tests {
             darkmux_flow::FlowAction::TelemetryDetector,
             source,
             "coder",
-            &crate::mission_test_session("m1", "sess-1"),
+            &crate::mission_test_session("m1", "sess-1"), &darkmux_types::execution_id::ExecutionId::mint(),
             Some("test-model"),
             Some("s1"),
             payload,
@@ -1404,7 +1402,7 @@ mod tests {
             darkmux_flow::FlowAction::TelemetryDetector,
             "detector",
             "coder",
-            &crate::test_session("s"),
+            &crate::test_session("s"), &darkmux_types::execution_id::ExecutionId::mint(),
             None,
             None,
             serde_json::json!({
@@ -1422,7 +1420,7 @@ mod tests {
             darkmux_flow::FlowAction::TelemetryDetector,
             "detector",
             "coder",
-            &crate::test_session("s"),
+            &crate::test_session("s"), &darkmux_types::execution_id::ExecutionId::mint(),
             None,
             None,
             serde_json::json!({ "kind": "reasoning-loop", "severity": "warn", "detail": "d2" }),
@@ -1437,7 +1435,7 @@ mod tests {
             darkmux_flow::FlowAction::TelemetryDetector,
             "detector",
             "coder",
-            &crate::test_session("s"),
+            &crate::test_session("s"), &darkmux_types::execution_id::ExecutionId::mint(),
             None,
             None,
             serde_json::json!({ "unexpected": true }),
@@ -1453,7 +1451,7 @@ mod tests {
             darkmux_flow::FlowAction::TelemetryDetector,
             "detector",
             "coder",
-            &crate::test_session("s"),
+            &crate::test_session("s"), &darkmux_types::execution_id::ExecutionId::mint(),
             None,
             None,
             serde_json::json!({}),
@@ -1465,7 +1463,7 @@ mod tests {
             darkmux_flow::FlowAction::TelemetryRuntime,
             "runtime",
             "coder",
-            &crate::test_session("s"),
+            &crate::test_session("s"), &darkmux_types::execution_id::ExecutionId::mint(),
             None,
             None,
             serde_json::json!({}),
@@ -1621,7 +1619,6 @@ mod tests {
             MissionStatus::Active,
             MissionStatus::Finalized,
             MissionStatus::Aborted,
-            MissionStatus::Paused,
         ];
         let produced: Vec<&str> = variants.iter().map(|v| mission_status_str(*v)).collect();
         assert_eq!(
@@ -2099,7 +2096,7 @@ mod tests {
     }
 
     /// (#914) A pre-#95 index whose `missions` table predates the
-    /// `started_ts`/`finalized_ts`/`paused_ts` columns. Pre-fix, the
+    /// `started_ts`/`finalized_ts` columns. Pre-fix, the
     /// `CREATE TABLE IF NOT EXISTS` in SCHEMA_SQL skipped the existing table
     /// (so a `populate` INSERT with `started_ts` crashed, or rolled back to
     /// stale data). The self-healing drop+recreate in `init_schema` must
@@ -2371,7 +2368,6 @@ mod tests {
                     "description",
                     "finalized_ts",
                     "id",
-                    "paused_ts",
                     "started_ts",
                     "status",
                 ],

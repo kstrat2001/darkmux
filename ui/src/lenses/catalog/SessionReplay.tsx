@@ -12,7 +12,7 @@ import { flowToRenderModel } from "../../lib/flow";
 import { NO_PRESENCE, isRunning, judgementAt, lifecycleAt, type Presence } from "../../lib/lifecycle";
 import { useLifecyclePolicy } from "../../hooks/useLifecyclePolicy";
 import { sessionRouteRecords, sessionRun } from "../../lib/runRef";
-import { ACTION, CATEGORY, ingest, recordsAsOf, type NormRecord } from "../../lib/ingest";
+import { CATEGORY, ingest, isBookendStart, recordsAsOf, type NormRecord } from "../../lib/ingest";
 import { useNowMs } from "../../lib/clock";
 import { clkhm } from "../../lib/format";
 import { getSource } from "../../lib/source";
@@ -574,8 +574,8 @@ export function SessionReplay({
         ? undefined
         : { ok: true, data: { count: staticSlice.length } };
 
-  // (#2759) A run's OWN top-level session (the run-grain `dispatch start`/
-  // `dispatch complete`/`mission.grow` trio a mission mints for itself)
+  // (#2759) A run's OWN top-level session (the run-grain `run.start`/
+  // `run.complete`/`mission.grow` trio a mission mints for itself)
   // carries no model telemetry — every turn, token and context record lives
   // on the mission's INNER role-execution sessions instead. This session's
   // OWN fetch can never see those; only a mission-wide fetch can. So: look
@@ -592,7 +592,7 @@ export function SessionReplay({
   const ownMissionId = useMemo(() => {
     if (!ownRaw) return null;
     if (missionId !== null) return missionId;
-    const start = ownRaw.find((r) => r.session_id === sessionId && r.action === ACTION.DispatchStart);
+    const start = ownRaw.find((r) => r.session_id === sessionId && isBookendStart(r.action));
     return start?.mission_id ?? null;
   }, [ownRaw, sessionId, missionId]);
   useEffect(() => setLivenessMissionId(ownMissionId), [ownMissionId]);

@@ -1658,8 +1658,12 @@ describe("tokensOffMeter — corpus playhead scrub (#2709)", () => {
     );
     const asRecorded = tokensOffMeter(corpus);
     const asScoped = tokensOffMeter(scoped);
-    expect(asRecorded.runs).toBe(52);
-    expect(asScoped.runs).toBe(52);
+    // 51, not the 52 this corpus read before 4.0: the retired review
+    // launcher's whole-run bookend is a run (`run.complete`, contract 8),
+    // not a dispatch. Four of the five review runs still count once each,
+    // from the seat usage their run key holds; the fifth holds none.
+    expect(asRecorded.runs).toBe(51);
+    expect(asScoped.runs).toBe(51);
     // The BASE's own numbers (40 and 50) cannot be asserted from here
     // without importing the pre-#2709 implementation; what this pins is the
     // half that belongs to this branch — that scoping the ids changes
@@ -1727,16 +1731,19 @@ describe("tokensOffMeter — corpus playhead scrub (#2709)", () => {
   it("every run key that closed with a dispatch.complete is counted", () => {
     const key = (r: NormRecord) => `${r.session_id}\u0000${r.mission_id || ""}`;
     const closed = new Set(corpus.filter((r) => r.action === ACTION.DispatchComplete && r.session_id).map(key));
-    // 50 keys closed; `runs` reported 40 before #2709. The two extra runs
-    // are one key holding two token-bearing sibling bookends, plus one
-    // telemetry-only key with no terminal (an `unknownRuns` member).
-    expect(closed.size).toBe(50);
+    // 45 keys closed with an execution terminal (the five review runs close
+    // with `run.complete`, a run's terminal, not a dispatch's). The six
+    // extra runs are one key holding two token-bearing sibling bookends,
+    // one telemetry-only key with no terminal (an `unknownRuns` member), and
+    // the four review-run keys whose seats' usage has no execution terminal.
+    expect(closed.size).toBe(45);
     const t = tokensOffMeter(corpus);
-    expect(t.runs).toBe(52);
+    expect(t.runs).toBe(51);
     // (round-2 review note) Which keys the EXTRA LOCAL RUN term actually
     // adds, counted rather than described: a key whose only local evidence
-    // is a token-LESS completion. Twelve of the sixteen are `dispatch.map`
-    // step AGGREGATES that fanned out to 3, 8 or 21 real seat calls each.
+    // is a token-LESS completion. All twelve are `dispatch.map` step
+    // AGGREGATES that fanned out to 3, 8 or 21 real seat calls each (the
+    // four review-run keys that made sixteen close as runs now).
     // So "every key that closed is a run" counts dispatches at the STEP
     // grain, not model calls — for those keys one run stands for many
     // calls. Base counted the HOSTED ones on exactly those terms already;
@@ -1751,7 +1758,7 @@ describe("tokensOffMeter — corpus playhead scrub (#2709)", () => {
         })
         .map(key),
     );
-    expect(tokenLessLocalKeys.size).toBe(16);
+    expect(tokenLessLocalKeys.size).toBe(12);
     const mapAggregates = [...tokenLessLocalKeys].filter((k) =>
       corpus.some((r) => key(r) === k && ((r.payload ?? {}) as Record<string, unknown>).kind === "dispatch.map"),
     );
@@ -1837,5 +1844,30 @@ describe("tokensOffMeter — runKey injectivity", () => {
     const t = tokensOffMeter(data);
     expect(t.total).toBe(1500);
     // Without the separator both keys are "task-judgem1": cloud=1500 local=0.
+  });
+});
+
+// (4.0) The DISPATCHES chip counts executions: a map step's items are one
+// execution each, so N items are N dispatches, whatever session they share.
+describe("tokensOffMeter: DISPATCHES counts executions", () => {
+  const item = (execution: string | undefined, endpoint: string, total: number): NormRecord[] => {
+    const common = { session_id: "m.task.probe", mission_id: "m", ...(execution ? { execution_id: execution } : {}) };
+    return [
+      rec({ ...common, action: "dispatch.start", payload: { endpoint } }),
+      rec({ ...common, category: "telemetry", source: "tokens", payload: { call_kind: "map_item", token_source: "provider", total_tokens: total } }),
+      rec({ ...common, action: "dispatch.complete", payload: { endpoint, result_class: "ok" } }),
+    ];
+  };
+
+  it("a 3-item map is three dispatches, each with its own tokens", () => {
+    const data = [...item("exec-1", "azure:a/gpt", 10), ...item("exec-2", "azure:b/gpt", 20), ...item("exec-3", "azure:c/gpt", 30)];
+    const t = tokensOffMeter(data);
+    expect(t.runs).toBe(3);
+    expect(t.total).toBe(60);
+  });
+
+  it("the same records with no execution id read as their session and mission: one dispatch, as before 4.0", () => {
+    const data = [...item(undefined, "azure:a/gpt", 10), ...item(undefined, "azure:a/gpt", 20), ...item(undefined, "azure:a/gpt", 30)];
+    expect(tokensOffMeter(data).runs).toBe(1);
   });
 });

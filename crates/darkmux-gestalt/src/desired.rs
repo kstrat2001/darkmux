@@ -278,10 +278,9 @@ mod tests {
             extras: Default::default(),
         };
         assert!(DesiredEntry::from_profile_model(&pm, "judge").remote);
-        // An endpoint block WITHOUT a url is the LMStudio-local default —
-        // not remote.
+        // The managed LM Studio endpoint is local — not remote.
         let pm_local = darkmux_types::ProfileModel {
-            endpoint: Some(darkmux_types::ModelEndpoint::default()),
+            endpoint: Some(darkmux_types::ModelEndpoint::managed_lmstudio()),
             ..pm
         };
         assert!(!DesiredEntry::from_profile_model(&pm_local, "judge").remote);

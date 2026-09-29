@@ -1,4 +1,4 @@
-//! (#2855) What `lab run stats` prints. CI's mutation job found every line
+//! (#2855) What `run stats` prints. CI's mutation job found every line
 //! of the renderer could be deleted with the suite green; each test below
 //! pins a promise the text makes to the person reading it.
 

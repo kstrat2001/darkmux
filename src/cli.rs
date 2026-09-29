@@ -229,12 +229,6 @@ pub(crate) enum Cmd {
         /// stays read-write either way.
         #[arg(long = "workspace-read-only")]
         workspace_read_only: bool,
-        /// Phase id binding this dispatch to a phase in a mission (#714).
-        /// When set, every flow record this dispatch emits carries
-        /// `mission_id`/`phase_id` so the observability view groups it
-        /// under its mission.
-        #[arg(long = "phase-id", value_name = "ID")]
-        phase_id: Option<String>,
         /// Skip the pre-flight checks. Use only for debugging.
         #[arg(long, hide = true)]
         skip_preflight: bool,
@@ -355,7 +349,7 @@ pub(crate) enum Cmd {
         #[command(subcommand)]
         sub: RoleCmd,
     },
-    /// Findings (#2265) — what a dispatch OBSERVED, keyed `<dispatch>/<seq>`.
+    /// Findings (#2265) — what a role execution OBSERVED, keyed `<execution>/<seq>`.
     /// A finding is an event: written once when an accepted `create_finding`
     /// call streams past, never rewritten. The flow stream stays the audit
     /// trail; this store is the queryable copy the verbs read. darkmux never
@@ -376,24 +370,23 @@ pub(crate) enum Cmd {
         sub: ModCmd,
     },
     /// Mission lifecycle — transition missions through their state machine.
-    /// Mission status flows: Active ↔ Paused → Finalized (success) or
+    /// Mission status flows: Active → Finalized (success) or
     /// Aborted (teardown — #1627: a teardown is not a success, and the two
     /// are distinct terminals on disk). All transitions are
-    /// operator-explicit; nothing auto-decides a mission is paused or done.
+    /// operator-explicit; nothing auto-decides a mission is done.
     /// Wall-clock UI consumes mission timestamps via `darkmux serve`.
     Mission {
         #[command(subcommand)]
         sub: MissionCmd,
     },
-    /// Run views (#1905) — the flat cross-kind union `GET /runs` also
-    /// serves: mission, dispatch, and lab runs together, one row per run
-    /// regardless of source. `run list` is the CLI twin of the RUNS lens;
-    /// both call the SAME `darkmux_serve::build_runs` union, so they can
-    /// never disagree about what counts as a run (see that function's own
-    /// doc for the contract). Distinct from `lab run list`, which stays
-    /// lab-directory-scoped and answers a different question (workload /
-    /// profile / wall / ok) — folding the two families together is a real
-    /// option with precedent (#1426) but not this change.
+    /// Runs (#1905): the umbrella over mission, dispatch, and lab runs.
+    /// `run list` is the flat cross-kind union `GET /runs` also serves, one
+    /// row per run regardless of source; it is the CLI twin of the RUNS
+    /// lens, and both call the SAME `darkmux_serve::build_runs` union, so
+    /// they can never disagree about what counts as a run (see that
+    /// function's own doc for the contract). `run inspect|stats|compare`
+    /// read a lab run's recorded artifacts and refuse the other kinds;
+    /// `darkmux lab run <workload>` is the launcher for lab runs.
     Run {
         #[command(subcommand)]
         sub: RunFamilyCmd,
@@ -567,18 +560,18 @@ pub(crate) enum FindingCmd {
         /// Only findings whose recorded context names this mission.
         #[arg(long)]
         mission: Option<String>,
-        /// Only findings from this dispatch (the key's first half).
+        /// Only findings from this role execution (the key's first half).
         #[arg(long)]
-        dispatch: Option<String>,
+        execution: Option<String>,
         /// Only findings whose recorded context names this rule.
         #[arg(long)]
         rule: Option<String>,
         #[command(flatten)]
         json: JsonFlag,
     },
-    /// Show one finding, whole, by its `<dispatch>/<seq>` key.
+    /// Show one finding, whole, by its `<execution>/<seq>` key.
     Show {
-        /// The finding key, e.g. `sess-abc/1`.
+        /// The finding key, e.g. `exec-18f3a2c-1b2-0/1`.
         key: String,
         #[command(flatten)]
         json: JsonFlag,
@@ -672,20 +665,6 @@ pub(crate) enum MissionCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Transition a mission to `Active`. Stamps `started_ts=now()` if not
-    /// already set. Mission must be currently `Active` with no started_ts,
-    /// OR — note: missions get created in `Active` status by convention,
-    /// so this is the "I'm starting to work on it now" verb, not a status
-    /// flip.
-    Start {
-        /// Mission id (filename stem under ~/.darkmux/missions/).
-        id: String,
-        /// Optional operator-supplied reasoning for the transition.
-        /// Lands on the emitted flow record so the audit substrate
-        /// captures *why* the state change happened.
-        #[arg(long)]
-        reasoning: Option<String>,
-    },
     /// Finalize a mission — the SUCCESS terminal (#1463). Drives every
     /// non-terminal phase to `Complete`, tears down each phase's worktree +
     /// branch, and transitions the mission to `Finalized` (stamps
@@ -702,22 +681,6 @@ pub(crate) enum MissionCmd {
         #[arg(long)]
         reasoning: Option<String>,
     },
-    /// Transition an `Active` mission to `Paused`. Stamps `paused_ts=now()`.
-    Pause {
-        id: String,
-        /// Optional operator-supplied reasoning for pausing the mission.
-        #[arg(long)]
-        reasoning: Option<String>,
-    },
-    /// Transition a `Paused` mission back to `Active`. Does NOT clear
-    /// `paused_ts` — the operator may want to see when the most recent
-    /// pause occurred even after resuming.
-    Resume {
-        id: String,
-        /// Optional operator-supplied reasoning for resuming the mission.
-        #[arg(long)]
-        reasoning: Option<String>,
-    },
     /// Launch a named mission CONFIG into a brand-new mission RUN (#1284
     /// Packet 4a; run-identity fixed in #1503). Resolves `<config-id>`
     /// through the mission-config registry (user → on-disk → embedded — see
@@ -727,8 +690,9 @@ pub(crate) enum MissionCmd {
     /// input is missing), then mints `mission.json` + one phase per
     /// declared phase + a `config-snapshot.json` freezing the resolved
     /// config alongside the run. A graph with no tasks anywhere (a
-    /// freeform/manual config) mints the run and starts the mission but
-    /// leaves every phase transition operator-driven. A coder-phase graph
+    /// freeform/manual config) mints the run and starts the mission; its
+    /// phases stay Planned until `mission finalize` or `mission abort`
+    /// closes it (#2954: no verb moves a phase by hand). A coder-phase graph
     /// executes worktree → coder → QA and then STOPS at an operator
     /// sign-off gate — the phase stays Running. The frontier orchestrator
     /// ships the git work by hand (commit/push/PR/merge), then `mission
@@ -835,67 +799,6 @@ pub(crate) enum MissionCmd {
         #[arg(long)]
         force: bool,
     },
-    /// Add a new Phase to an existing Mission mid-flight (#107).
-    /// Operator-sovereign scope growth — alternative to either hand-
-    /// editing JSON or filing a separate Mission for work that
-    /// composes with the in-flight arc. Idempotent on exact-match
-    /// (same id + mission + description); errors on collision. Phases
-    /// are strictly linear (#1341) — `--after` places the new phase in
-    /// `Mission.phase_ids` order; there is no separate dependency
-    /// declaration.
-    AddPhase {
-        /// Mission id to extend (must exist).
-        mission_id: String,
-        /// Id for the new Phase (must not collide with any existing
-        /// phase under a different mission; idempotent if same).
-        #[arg(long = "phase-id")]
-        phase_id: String,
-        /// Description of the new Phase's scope.
-        #[arg(long)]
-        description: String,
-        /// Insert the new phase immediately after this existing
-        /// phase id (insert-in-middle). When omitted, the new
-        /// phase is appended to the end of the mission's phase
-        /// list (queue-on-end). The named id must already be in
-        /// the mission's phase_ids — errors otherwise to surface
-        /// typos and stale references.
-        #[arg(long)]
-        after: Option<String>,
-        /// Optional operator-supplied reasoning for the mid-flight
-        /// scope growth. Lands on the emitted flow record so the
-        /// audit substrate captures *why* the mission grew here.
-        #[arg(long)]
-        reasoning: Option<String>,
-    },
-    /// Dispatch a mission's next runnable phase on a fleet machine (#247,
-    /// PR-D.1). One role applies to every dispatched phase — operator-explicit
-    /// per the CLAUDE.md doctrine that mission planning is judgment-bearing
-    /// work the operator owns.
-    ///
-    /// (#2916) The next runnable phase is submitted to the machine named by
-    /// `--machine` (required: the queue any machine could claim from is
-    /// retired), which checks the fleet token and its allow-list before
-    /// running it. Default `--wait` blocks until the phase finishes;
-    /// `--no-wait` returns once the machine accepts it.
-    Dispatch {
-        /// Mission id to dispatch.
-        mission_id: String,
-        /// Role to dispatch each phase under (e.g. `coder`,
-        /// `code-reviewer`). One role applies to every dispatched phase.
-        #[arg(long)]
-        role: String,
-        /// The machine to run the phase on (its `machine_id`, in this
-        /// machine's roster). Required.
-        #[arg(long, value_name = "ID")]
-        machine: Option<String>,
-        /// Per-phase dispatch timeout (seconds). Default 600.
-        #[arg(long, default_value = "600")]
-        timeout: u32,
-        /// Return as soon as the machine accepts each phase instead of
-        /// waiting for its result. Default is `--wait`.
-        #[arg(long)]
-        no_wait: bool,
-    },
     /// Abort a mission — the KILL terminal (#1463). By default the WHOLE
     /// mission: removes every phase's worktree + branch, flips all non-terminal
     /// phases to `Abandoned`, and closes the mission. The clear opposite of
@@ -984,6 +887,40 @@ pub(crate) enum RunFamilyCmd {
         #[command(flatten)]
         json: JsonFlag,
     },
+    /// Inspect a recorded lab run. Lab runs only: a mission or dispatch run
+    /// leaves no manifest, so its id is refused with where to look instead.
+    Inspect {
+        run: String,
+        /// Also dump the full compaction summary text(s) the compactor model
+        /// wrote during this run (read from trajectory.jsonl). Useful for
+        /// methodology validation — confirming the compactor is producing
+        /// substantive summaries rather than degenerate / empty output.
+        #[arg(long)]
+        summary: bool,
+    },
+    /// (#2855) Derived metrics for a recorded lab run — active time,
+    /// throughput over the streams that were actually billed, both
+    /// degeneracy gates, busy-only power — each with the reconciliation check
+    /// that says whether it may be quoted. Reads the run's existing
+    /// artifacts; nothing is recomputed at dispatch time, so this applies to
+    /// runs already on disk.
+    ///
+    /// Given several runs, prints one row per run and the set as ranges
+    /// (median with min and max, never a bare mean), plus cost per
+    /// successful outcome. With `--baseline`, prints both sets side by side
+    /// with what moved.
+    Stats {
+        /// One or more run ids or paths.
+        #[arg(required = true, num_args = 1..)]
+        runs: Vec<String>,
+        /// Runs to compare against (repeatable, or several after one flag).
+        #[arg(long, num_args = 1..)]
+        baseline: Vec<String>,
+        #[command(flatten)]
+        json: JsonFlagPlain,
+    },
+    /// Compare two recorded lab runs.
+    Compare { run_a: String, run_b: String },
 }
 
 /// (#1860) `darkmux mission config list`/`show` — a READ-ONLY projection
@@ -1437,56 +1374,6 @@ pub(crate) enum LessonCmd {
     },
 }
 
-/// (#1465, #1426) The recorded-run sub-verbs, folded out of the flat
-/// `lab runs`/`lab inspect`/`lab compare` leaves into the `lab run`
-/// kind-family. `lab run <workload>` still dispatches (a positional workload);
-/// these route when no workload positional is given.
-#[derive(Subcommand)]
-pub(crate) enum RunCmd {
-    /// List recent runs (most recent first). (was: `lab runs`)
-    List {
-        /// Show at most N runs (default: 5).
-        #[arg(long, short = 'l', default_value = "5")]
-        limit: usize,
-        /// Show all runs (overrides --limit).
-        #[arg(long, short = 'a')]
-        all: bool,
-    },
-    /// Inspect a previously-recorded run. (was: `lab inspect`)
-    Inspect {
-        run: String,
-        /// Also dump the full compaction summary text(s) the compactor model
-        /// wrote during this run (read from trajectory.jsonl). Useful for
-        /// methodology validation — confirming the compactor is producing
-        /// substantive summaries rather than degenerate / empty output.
-        #[arg(long)]
-        summary: bool,
-    },
-    /// (#2855) Derived metrics for a recorded run — active time, throughput
-    /// over the streams that were actually billed, both degeneracy gates,
-    /// busy-only power — each with the reconciliation check that says
-    /// whether it may be quoted. Reads the run's existing artifacts; nothing
-    /// is recomputed at dispatch time, so this applies to runs already on
-    /// disk.
-    ///
-    /// Given several runs, prints one row per run and the set as ranges
-    /// (median with min and max, never a bare mean), plus cost per
-    /// successful outcome. With `--baseline`, prints both sets side by side
-    /// with what moved.
-    Stats {
-        /// One or more run ids or paths.
-        #[arg(required = true, num_args = 1..)]
-        runs: Vec<String>,
-        /// Runs to compare against (repeatable, or several after one flag).
-        #[arg(long, num_args = 1..)]
-        baseline: Vec<String>,
-        #[command(flatten)]
-        json: JsonFlagPlain,
-    },
-    /// Compare two runs. (was: `lab compare`)
-    Compare { run_a: String, run_b: String },
-}
-
 /// (#1465) The `lab workload` kind-family. `list` is the only member today —
 /// spelled `list` (round-9 universal convention) instead of the retired flat
 /// `lab workloads` plural-noun-as-verb leaf.
@@ -1537,22 +1424,11 @@ pub(crate) enum FixtureCmd {
 
 #[derive(Subcommand)]
 pub(crate) enum LabCmd {
-    /// Dispatch a workload, or manage recorded runs (#1465, #1426).
-    ///
-    /// `lab run <workload>` dispatches a workload (one or more times — the
-    /// unchanged run path). With NO workload positional, a sub-verb manages
-    /// recorded runs: `lab run list`, `lab run inspect <id>`,
-    /// `lab run compare <a> <b>` (the retired flat `lab runs`/`lab inspect`/
-    /// `lab compare` leaves, folded into the `run` kind-family). `run` takes
-    /// EITHER a workload positional OR a sub-verb — `args_conflicts_with_
-    /// subcommands` keeps the two forms from mixing, and a token that is not a
-    /// known sub-verb fills the workload positional. A user workload whose id
-    /// collides with a sub-verb (`list`/`inspect`/`compare`) is still reachable
-    /// as a workload via the `--` escape: `lab run -- <id>` (#1465).
-    #[command(args_conflicts_with_subcommands = true)]
+    /// Dispatch a workload (one or more times). The launcher only: recorded
+    /// runs are read with `darkmux run list|inspect|stats|compare`.
     Run {
-        /// Workload id to dispatch (omit when using a run sub-verb).
-        workload: Option<String>,
+        /// Workload id to dispatch.
+        workload: String,
         #[arg(long, short = 'p')]
         profile: Option<String>,
         #[arg(long, short = 'n', default_value = "1")]
@@ -1561,8 +1437,6 @@ pub(crate) enum LabCmd {
         profiles: ProfilesFileArg,
         #[arg(long, short = 'q')]
         quiet: bool,
-        #[command(subcommand)]
-        sub: Option<RunCmd>,
     },
     /// Workload registry (`lab workload list`). (#1465)
     Workload {

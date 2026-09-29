@@ -50,7 +50,7 @@
 use crate::LabRunSummary;
 use darkmux_crew::envelope::MissionOutcomeStatus;
 use darkmux_crew::types::{Mission, MissionStatus, Phase, PhaseStatus, Step, Task};
-use darkmux_flow::FlowAction;
+use darkmux_flow::{Edge, FlowAction, Grain};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path as StdPath, PathBuf};
@@ -142,11 +142,6 @@ pub enum AbandonReason {
 /// describe what was actually OBSERVED instead of asserting the same fixed
 /// sentence for three different facts — see that function's own doc for
 /// the review finding this closes (#2682 fix-pass MUST FIX 1/2/5).
-///
-/// (#2682 round 4) `Active` ONLY, not `Active`/`Paused` as this doc used to
-/// say: a Paused mission no longer reaches ANY of these three, because the
-/// only arm it could reach (`RecordedEnd`, via the all-terminal branch) is
-/// now gated on `mission.status != Paused` — see that gate's own comment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchSessionEvidence {
     /// darkmux POSITIVELY recorded this mission's dispatch session ending —
@@ -325,6 +320,20 @@ pub struct Run {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional, type = "number"))]
     pub tokens: Option<u64>,
+    /// The workload a lab run dispatched (`manifest.json`'s `workload`).
+    /// Lab rows only; absent for a run with no manifest yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub workload: Option<String>,
+    /// Whether a lab run's workload verify passed (`manifest.json`'s
+    /// `verify.passed`). Deliberately NOT folded into `status`: `status` is
+    /// how the dispatch ended and this is what its tests said, and a run
+    /// that dispatched fine but failed its tests is exactly the case the two
+    /// must stay separable for (#2494). `None` is "not checked": the
+    /// workload declares no verify, or the run has no manifest yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub verify_passed: Option<bool>,
 }
 
 /// Build the full run union — the SAME `Vec<Run>` both `runs_handler`
@@ -842,6 +851,8 @@ fn flow_mission_to_run(
         session_id,
         abandoned_reason,
         tokens: None,
+        workload: None,
+        verify_passed: None,
     }
 }
 
@@ -990,7 +1001,14 @@ fn mission_to_run(
     // from one source. Add a new field here and it reads this pool too.
     let unambiguous_sessions: Vec<(&str, &SessionAgg)> =
         sessions.iter().copied().filter(|(_, s)| !s.is_ambiguous()).collect();
-    let representative = earliest_by_start(&unambiguous_sessions);
+    // (contract 8) The run's own session, the one its `run.start` opened,
+    // represents the row: its machine, start and drill target are the
+    // run's, whatever an execution's clock says. A mission with none (its
+    // start outside the window, or no run bookend written) falls back to
+    // the earliest session.
+    let run_sessions: Vec<(&str, &SessionAgg)> =
+        unambiguous_sessions.iter().copied().filter(|(_, s)| s.run_grain).collect();
+    let representative = earliest_by_start(&run_sessions).or_else(|| earliest_by_start(&unambiguous_sessions));
     // TODO(step-4): a mission whose dispatches span MULTIPLE distinct
     // endpoints (mixed local/remote seats across phases) collapses to one
     // representative endpoint here — the Runs lens can't yet show per-seat
@@ -1015,13 +1033,11 @@ fn mission_to_run(
             .collect::<Vec<_>>(),
     );
 
-    // (#1877 regression) `representative` (earliest_by_start) is right for
-    // anything that genuinely is about ORDERING — `start_ts` below really
-    // should come from the mission's earliest dispatch. Role and model are
-    // ATTRIBUTE lookups, not ordering, and the #1877 whole-run bookend is
-    // deliberately the mission's earliest record (it opens before any step
-    // dispatches) — so reading role/model only off `representative` shows
-    // a stale-by-construction value whenever the bookend wins the pick.
+    // (#1877 regression) `representative` (the run session) is right for
+    // the row's machine and start. Role and model are ATTRIBUTE lookups:
+    // the run bookend carries a config id as its handle and no model, so
+    // reading them only off `representative` shows a stale-by-construction
+    // value.
     // `sessions` is built from a HashSet (`candidate_ids`), so sorting a
     // copy by `start_ts` (rather than trusting HashSet iteration order)
     // keeps "first" deterministic; ISO-8601 sorts correctly as a plain
@@ -1050,26 +1066,21 @@ fn mission_to_run(
         unambiguous_sessions.iter().map(|(_, s)| *s).filter(|s| s.start_ts.is_some()).collect();
     sessions_by_start.sort_by(|a, b| a.start_ts.cmp(&b.start_ts));
 
-    // Model is simple: the bookend's own record NEVER carries one
-    // (`mission_bookend_record` passes `model: None` unconditionally, one
-    // dispatch bookend spans however many per-step model calls a mission
-    // makes), so a plain "first session that resolved one" — same idiom
-    // as `flow_mission_to_run`'s route/model fallback above — is enough.
+    // Model is simple: the run bookend NEVER carries one (a run spans
+    // however many executions it makes), so a plain "first session that
+    // resolved one" — same idiom as `flow_mission_to_run`'s route/model
+    // fallback above — is enough.
     let model = sessions_by_start.iter().find_map(|s| s.model.clone());
 
-    // Role needs one more step: the bookend's `handle` is the LAUNCHED
-    // CONFIG ID (`mission_bookend_record`'s `role_id` param), which is a
-    // real, non-empty string — so a plain find_map "resolves" it
-    // immediately and never reaches the coder/reviewer/etc. step's actual
-    // role. Prefer the first NON-bookend session (source != "mission")
-    // that resolved a role; only reach for the bookend's own placeholder
-    // if nothing else did — which is the honest outcome for a Tier-1-only
-    // procedural mission that never dispatches a model at all (#1877's own
-    // named gap 2), where the bookend's config-id label is the best
-    // available information, not a display bug.
-    let is_bookend = |s: &&SessionAgg| s.source.as_deref() == Some("mission");
+    // Role needs one more step: the run bookend's `handle` is the LAUNCHED
+    // CONFIG ID (`run_bookend_record`), a real, non-empty string, so a plain
+    // find_map would "resolve" it and never reach an execution's actual
+    // role. Prefer the first session that is not the run's own that
+    // resolved a role; fall back to the run's config-id label only when
+    // nothing else did, the honest outcome for a Tier-1-only procedural
+    // mission that runs no role at all (#1877's named gap 2).
     let role = dispatch_role
-        .or_else(|| sessions_by_start.iter().filter(|s| !is_bookend(s)).find_map(|s| s.role.clone()))
+        .or_else(|| sessions_by_start.iter().filter(|s| !s.run_grain).find_map(|s| s.role.clone()))
         .or_else(|| sessions_by_start.iter().find_map(|s| s.role.clone()));
 
     // `machine` deliberately stays representative-only, unlike role/model
@@ -1178,6 +1189,8 @@ fn mission_to_run(
         session_id,
         abandoned_reason,
         tokens: None,
+        workload: None,
+        verify_passed: None,
     }
 }
 
@@ -1205,8 +1218,7 @@ fn mission_to_run(
 ///
 /// **CONSIDER 4 — the dead `Planned` variant.** An `Active` mission
 /// (`MissionStatus`'s own default) with `started_ts: None` was minted but
-/// never actually started (`darkmux mission start` — or the launcher's own
-/// equivalent — hasn't run yet). Mapping that to `Planned` makes the
+/// never actually started (the launcher's `mission_start` hasn't run yet). Mapping that to `Planned` makes the
 /// variant reachable and distinguishes "queued" from "genuinely running".
 ///
 /// **CONSIDER 3 — a crashed mission can't stay `Running` forever.** A hard
@@ -1250,7 +1262,7 @@ fn mission_status_sessions<'a>(mission_id: &str, sessions: &[(&str, &'a SessionA
         .collect()
 }
 
-/// (#2682 fix-pass) As [`mission_run_status`], but for the `Active`/`Paused`
+/// (#2682 fix-pass) As [`mission_run_status`], but for the `Active`
 /// arm ALSO names which of the three genuinely different situations
 /// produced an `Abandoned` verdict — see [`DispatchSessionEvidence`]'s own
 /// doc for what each means and why the distinction matters. `None` evidence
@@ -1267,38 +1279,11 @@ fn mission_run_status_and_evidence(
     now_ms: u64,
 ) -> (RunStatus, Option<DispatchSessionEvidence>) {
     match mission.status {
-        MissionStatus::Active | MissionStatus::Paused => {
+        MissionStatus::Active => {
             let Some(started_ts) = mission.started_ts else {
                 return (RunStatus::Planned, None);
             };
             if !sessions.is_empty() && sessions.iter().all(|s| s.terminal_status.is_some()) {
-                // (#2682 round 4) `mission.status != Paused` extends #1642's
-                // OWN rule — stated one branch below as "a paused mission
-                // must not decay into Abandoned" — to the branch that
-                // OUTRANKS it. This arm runs BEFORE that early-return, so
-                // before this guard a Paused mission whose session carried a
-                // `session.end` read `Abandoned` on `darkmux run list` and in
-                // the viewer while `mission status`'s board read `Paused` —
-                // 5 of the 33 board-vs-`run list` disagreement rows #2682
-                // enumerates, and the one family where the BOARD was right.
-                //
-                // #1642's argument transfers intact, and is not weakened by
-                // this being an OBSERVATION rather than an inference from
-                // silence: `mission pause` does not touch any process (it
-                // flips the record — `lifecycle::mission_pause_with_
-                // reasoning`), so a paused mission's dispatch not being alive
-                // is the expected state, not news. The mission-level fact the
-                // operator wants back is "I paused this", and `RunStatus` has
-                // no `Paused` variant to say it with — so the same
-                // lesser-error trade #1642 already took (report `Running`,
-                // never `Abandoned`) is taken here.
-                //
-                // Deliberately narrow: only the `Abandoned` arm is gated. A
-                // Paused mission whose session genuinely reached `dispatch
-                // error` still reads `Error` below — a recorded FAILURE, not
-                // an abandonment inference, and suppressing it would lose
-                // real signal the operator has no other way to see here.
-                //
                 // (#2748) `any()` used to decide this off the mission's
                 // WHOLE session history, so one abandoned dispatch anywhere
                 // outranked every LATER success, permanently. The fix is
@@ -1373,7 +1358,7 @@ fn mission_run_status_and_evidence(
                         })
                     })
                     .is_some_and(|s| s.terminal_status == Some(RunStatus::Abandoned));
-                if mission.status != MissionStatus::Paused && most_recent_terminal_is_abandoned {
+                if most_recent_terminal_is_abandoned {
                     // A `session.end` terminal really did land — darkmux
                     // OBSERVED this session stop (see
                     // `run_lifecycle.rs`'s `ending_of`), never a guess from
@@ -1383,26 +1368,6 @@ fn mission_run_status_and_evidence(
                 if sessions.iter().any(|s| s.terminal_status == Some(RunStatus::Error)) {
                     return (RunStatus::Error, None);
                 }
-                return (RunStatus::Running, None);
-            }
-            // (#1642) A PAUSED mission is deliberately idle, so the staleness
-            // gate must not touch it. The gate reads "went quiet without
-            // finishing" as abandonment, which is honest for an Active
-            // mission and a lie for a paused one — it would relabel the
-            // operator's own intent as a failure the moment a pause outlasts
-            // the inactivity budget (`mission launch` → `mission pause` →
-            // lunch → the board says Abandoned). Not decaying is the lesser
-            // error: `RunStatus` has no `Paused` variant, so some imprecision
-            // is unavoidable here, and over-reporting a mission the operator
-            // KNOWS they paused costs nothing, while calling it abandoned
-            // actively misinforms.
-            //
-            // (#2682 round 4) This is no longer the ONLY place the pause
-            // exemption is applied — the all-terminal branch above carries
-            // its own `mission.status != Paused` gate, because it returns
-            // BEFORE this line is ever reached. Both are load-bearing; see
-            // that one's comment for why #1642's argument covers it too.
-            if mission.status == MissionStatus::Paused {
                 return (RunStatus::Running, None);
             }
             if sessions.is_empty() {
@@ -1728,6 +1693,8 @@ fn lab_summary_to_run(
         session_id: if summary.finished { None } else { summary.session_id.clone() },
         abandoned_reason,
         tokens: None,
+        workload: summary.workload.clone(),
+        verify_passed: summary.verify_passed,
     }
 }
 
@@ -1861,9 +1828,9 @@ pub fn runs_policy() -> RunsPolicy {
     RunsPolicy { stale_after_ms: stale_after_ms(), budget_wait_grace_ms: BUDGET_WAIT_GRACE_MS }
 }
 
-/// (#2413) Best-effort, LOCAL-ONLY: is at least one dispatch bookend-open
-/// (a `dispatch start` with no matching `dispatch complete`/`error` yet,
-/// within [`stale_after_ms`] of `now_ms`) on THIS machine? Feeds the
+/// (#2413) Best-effort, LOCAL-ONLY: is at least one run or execution
+/// bookend-open (a `run.start` / `dispatch.start` with no matching terminal
+/// yet, within [`stale_after_ms`] of `now_ms`) on THIS machine? Feeds the
 /// daemon host sampler's live-vs-idle emission cadence
 /// (`host_sampler::spawn`) — reusing the SAME dispatch bookends and the SAME
 /// staleness budget [`session_is_live`] already judges run liveness by,
@@ -1893,26 +1860,22 @@ fn any_dispatch_live_in(dir: &std::path::Path, day: &str, now_ms: u64, max_age_m
     let path = dir.join(format!("{day}.jsonl"));
     let Ok(text) = std::fs::read_to_string(&path) else { return false };
     let mut last_activity_ms: HashMap<String, u64> = HashMap::new();
-    // (self-QA catch, #2413) A session is "open" ONLY from its OWN
-    // `dispatch start` bookend through its OWN `dispatch complete`/`error`
-    // — never inferred from mere PRESENCE in the file. The first cut of
-    // this function tracked `last_activity_ms` for every record carrying a
-    // `session_id`, live-checking "not yet seen a terminal" — which
-    // wrongly read a `mission close` record's `mission-<id>` session (a
-    // mission session is never `dispatch`-terminated at all) as an
-    // eternally-open dispatch, always live. Red-proved against a fixture
-    // with only `mission start`/`mission close` records: the buggy
-    // version returned `true`; this one correctly returns `false`.
+    // (self-QA catch, #2413) A session is "open" ONLY from its OWN bookend
+    // start through its OWN terminal, never inferred from mere PRESENCE in
+    // the file: a session holding only `mission.start`/`mission.close` is
+    // never open. Red-proved against a fixture with only those records: a
+    // presence-based version returned `true`; this one returns `false`.
     let mut open: HashSet<String> = HashSet::new();
     for line in text.lines() {
         let Some(rec) = darkmux_flow::reader::parse_record(line) else { continue };
         let Some(sid) = rec.session_id.clone() else { continue };
         let Some(ts_secs) = parse_flow_ts(&rec.ts) else { continue };
         let ts_ms = ts_secs.saturating_mul(1000);
-        if rec.action == FlowAction::DispatchStart {
+        let edge = rec.action.bookend().map(|b| b.edge);
+        if edge == Some(Edge::Start) {
             open.insert(sid.clone());
             last_activity_ms.insert(sid, ts_ms);
-        } else if matches!(rec.action, FlowAction::DispatchComplete | FlowAction::DispatchError) {
+        } else if edge.is_some_and(Edge::is_terminal) {
             open.remove(&sid);
         } else if open.contains(&sid) {
             // Any OTHER record for an ALREADY-open dispatch session is
@@ -2096,14 +2059,10 @@ struct SessionAgg {
     role: Option<String>,
     model: Option<String>,
     machine: Option<String>,
-    /// The record's `source` field (e.g. `"crew_dispatch"`, `"review"`, or
-    /// the #1877 whole-run bookend's `"mission"`) — tracked so
-    /// [`mission_to_run`]'s role/model fallback can tell a real per-step
-    /// dispatch session apart from the mission-level bookend, whose
-    /// `handle` is the launched config id (a real string, never blank),
-    /// not an actual per-step role. Simple presence/absence (`role.is_
-    /// none()`) can't make that distinction — only the source can.
-    source: Option<String>,
+    /// The session holds a run bookend (`run.*`): it is a run's own session,
+    /// whose `handle` is the launched config id, not a role.
+    /// [`mission_to_run`]'s role fallback skips it for a real execution's.
+    run_grain: bool,
     /// From the FIRST non-empty `payload.endpoint` seen on any dispatch
     /// lifecycle record (start, complete, OR error) for this session — the
     /// #1518 lesson applied server-side: the review pipeline stamps
@@ -2307,24 +2266,14 @@ fn fold_session_record(idx: &mut HashMap<String, SessionAgg>, v: &serde_json::Va
             }
         }
     }
-    if agg.source.is_none() {
-        if let Some(src) = v.get("source").and_then(|s| s.as_str()) {
-            if !src.is_empty() {
-                agg.source = Some(src.to_string());
-            }
-        }
-    }
-
     let action = darkmux_flow::reader::action_of(v);
     let ts = v.get("ts").and_then(|t| t.as_str()).unwrap_or("");
+    let grain = action.as_ref().and_then(FlowAction::bookend).map(|b| b.grain);
+    agg.run_grain |= grain == Some(Grain::Run);
 
-    // Check EVERY dispatch lifecycle record's payload for `endpoint` —
-    // not just start (#1518, applied server-side; see `SessionAgg::endpoint`'s doc).
-    let is_bookend = matches!(
-        action,
-        Some(FlowAction::DispatchStart | FlowAction::DispatchComplete | FlowAction::DispatchError)
-    );
-    if agg.endpoint.is_none() && is_bookend {
+    // Check EVERY execution bookend's payload for `endpoint`, not just the
+    // start (#1518, applied server-side; see `SessionAgg::endpoint`'s doc).
+    if agg.endpoint.is_none() && grain == Some(Grain::Execution) {
         if let Some(ep) = v
             .get("payload")
             .and_then(|p| p.get("endpoint"))
@@ -2468,6 +2417,8 @@ fn ghost_runs(
             session_id: if agg.is_ambiguous() { None } else { Some(session_id.clone()) },
             abandoned_reason,
             tokens: None,
+            workload: None,
+            verify_passed: None,
         });
     }
     out
@@ -2764,7 +2715,7 @@ mod tests {
     ///
     /// **Why it had to change.** The `finalize_mission` tests in this
     /// module hold this guard, and the old version pinned only
-    /// `DARKMUX_CREW_DIR`. That isolates mission state — and the flow sink
+    /// the root. That isolates mission state — and the flow sink
     /// those same tests drive resolves through `flows_dir()`
     /// (`env(DARKMUX_FLOWS_DIR) > config.dirs.flows > <root>/flows`),
     /// which this guard never pinned. So `cargo test -p darkmux-serve
@@ -2922,7 +2873,6 @@ mod tests {
             created_ts: now_unix(),
             started_ts: Some(now_unix()),
             finalized_ts: None,
-            paused_ts: None,
             source_input: None,
             ticket: None,
             spec,
@@ -3054,15 +3004,13 @@ mod tests {
     // ── mission_run_status ──────────────────────────────────────────────
 
     #[test]
-    fn mission_run_status_active_and_paused_are_running() {
+    fn mission_run_status_active_is_running() {
         // `minimal_mission` stamps `started_ts` with the real "now" — judge
         // it against that same instant (idle ~0) so this stays a pure
-        // "Active/Paused reads Running" test, independent of the staleness
+        // "Active reads Running" test, independent of the staleness
         // gate exercised separately below.
         let now_ms = now_unix() * 1_000;
-        let mut m = minimal_mission("m5", vec![], None);
-        assert_eq!(mission_run_status(&m, &[], now_ms), RunStatus::Running);
-        m.status = MissionStatus::Paused;
+        let m = minimal_mission("m5", vec![], None);
         assert_eq!(mission_run_status(&m, &[], now_ms), RunStatus::Running);
     }
 
@@ -3329,8 +3277,8 @@ mod tests {
         match status {
             MissionStatus::Aborted => true,
             MissionStatus::Finalized => false,
-            MissionStatus::Active | MissionStatus::Paused => {
-                panic!("not a terminal status; see mission_run_status_active_and_paused_are_running")
+            MissionStatus::Active => {
+                panic!("not a terminal status; see mission_run_status_active_is_running")
             }
         }
     }
@@ -3920,6 +3868,8 @@ mod tests {
             has_events: true,
             session_id: None,
             run_ok: None,
+            workload: None,
+            verify_passed: None,
         }
     }
 
@@ -3941,6 +3891,24 @@ mod tests {
         assert_eq!(lab_run_status(&with_ok(Some(true)), now, None), RunStatus::Complete);
         // No manifest (a provider that writes none) is not evidence of failure.
         assert_eq!(lab_run_status(&with_ok(None), now, None), RunStatus::Complete);
+    }
+
+    /// (#2494) The verify outcome rides the row and NEVER changes `status`:
+    /// a run that dispatched fine and failed its tests stays `complete`, with
+    /// `verify_passed: Some(false)` beside it for the list to show.
+    #[test]
+    fn a_lab_row_carries_workload_and_verify_without_moving_status() {
+        use darkmux_lab::lab::lifecycle::LifecycleStatus as Lc;
+        let summary = LabRunSummary {
+            run_ok: Some(true),
+            workload: Some("quick-coding".into()),
+            verify_passed: Some(false),
+            ..lab_summary_with_lifecycle("d", true, false, Some(Lc::Complete))
+        };
+        let row = lab_summary_to_run(&summary, None, 1_700_000_000_000, None);
+        assert_eq!(row.verify_passed, Some(false));
+        assert_eq!(row.workload.as_deref(), Some("quick-coding"));
+        assert_eq!(row.status, RunStatus::Complete, "verify is not folded into status");
     }
 
     /// (#2860 review F4) A run from before `lifecycle.json` existed still has
@@ -4732,115 +4700,6 @@ mod tests {
             Some("2026-07-24T10:30:00Z"),
             "an older record arriving late must not rewind the liveness clock — \
              rewinding it would age a live session into Abandoned"
-        );
-    }
-
-    #[test]
-    fn a_paused_mission_never_decays_into_abandoned() {
-        // (#1642) `mission pause` is an operator verb, and a paused mission is
-        // deliberately idle — so the staleness gate, which reads "went quiet
-        // without finishing" as abandonment, must not touch it. Without this,
-        // `mission launch` → `mission pause` → lunch makes the board report
-        // the operator's own intent as a failure.
-        //
-        // Asserted at an absurd `now` so it cannot pass by sitting inside the
-        // budget: if the gate applied to Paused at all, this fails.
-        let mut mission = minimal_mission("paused-1", vec![], None);
-        mission.status = MissionStatus::Paused;
-        mission.started_ts = Some(parse_flow_ts("2000-01-01T00:00:00Z").unwrap());
-
-        let ancient = SessionAgg {
-            has_start: true,
-            terminal_status: None,
-            last_activity_ts: Some("2000-01-01T00:00:00Z".to_string()),
-            ..Default::default()
-        };
-        let now_ms = u64::from(u32::MAX) * 1_000;
-
-        assert_eq!(
-            mission_run_status(&mission, &[], now_ms),
-            RunStatus::Running,
-            "a paused mission with no sessions must not read as abandoned"
-        );
-        assert_eq!(
-            mission_run_status(&mission, &[&ancient], now_ms),
-            RunStatus::Running,
-            "a paused mission with a long-quiet open session must not read as abandoned"
-        );
-
-        // And the control: the SAME shape while Active does decay. Without
-        // this line the test above would still pass if the gate were removed
-        // outright, which would silently undo #1642.
-        mission.status = MissionStatus::Active;
-        assert_eq!(
-            mission_run_status(&mission, &[&ancient], now_ms),
-            RunStatus::Abandoned,
-            "the pause exemption must not disable the gate for Active missions"
-        );
-    }
-
-    /// (#2682 round 4) The half of the test above that its NAME already
-    /// promised and its body did not reach. `a_paused_mission_never_decays_
-    /// into_abandoned` exercises two shapes — no sessions, and a long-quiet
-    /// OPEN session — and both of those resolve through the staleness gate.
-    /// The all-terminal branch sits ABOVE that gate, so a paused mission
-    /// whose session carried a `session.end` (`terminal_status ==
-    /// Abandoned`) walked straight past the exemption and read `Abandoned`
-    /// anyway. That is 5 of #2682's 33 board-vs-`run list` disagreement
-    /// rows: `mission status` said `Paused`, `run list` said `abandoned`,
-    /// about the same mission at the same moment.
-    ///
-    /// Both directions, and the `Error` neighbor that must NOT be silenced:
-    /// the guard is scoped to the `Abandoned` arm on purpose, because a
-    /// recorded `dispatch error` is a FAILURE darkmux observed, not an
-    /// abandonment it inferred.
-    #[test]
-    fn a_paused_mission_does_not_read_abandoned_from_a_recorded_session_end() {
-        let mut mission = minimal_mission("paused-recorded-end", vec![], None);
-        mission.started_ts = Some(parse_flow_ts("2026-01-01T00:00:00Z").unwrap());
-
-        let ended = SessionAgg {
-            has_start: true,
-            terminal_status: Some(RunStatus::Abandoned),
-            terminal_ts: Some("2026-01-01T01:00:00Z".to_string()),
-            last_activity_ts: Some("2026-01-01T01:00:00Z".to_string()),
-            ..Default::default()
-        };
-        let errored = SessionAgg {
-            has_start: true,
-            terminal_status: Some(RunStatus::Error),
-            terminal_ts: Some("2026-01-01T01:00:00Z".to_string()),
-            last_activity_ts: Some("2026-01-01T01:00:00Z".to_string()),
-            ..Default::default()
-        };
-        // Comfortably past any staleness budget, so nothing here passes by
-        // sitting inside the window.
-        let now_ms = u64::from(u32::MAX) * 1_000;
-
-        mission.status = MissionStatus::Paused;
-        assert_eq!(
-            mission_run_status_and_evidence(&mission, &[&ended], now_ms),
-            (RunStatus::Running, None),
-            "a paused mission whose dispatch session was positively recorded ENDING must not \
-             read abandoned — `mission pause` never touches a process, so a dead dispatch under \
-             a pause is the expected state, not news"
-        );
-        assert_eq!(
-            mission_run_status_and_evidence(&mission, &[&errored], now_ms),
-            (RunStatus::Error, None),
-            "the guard is scoped to the Abandoned arm: a recorded `dispatch error` under a pause \
-             is an observed FAILURE and must still surface"
-        );
-
-        // The control, and the reason this cannot pass with the whole arm
-        // deleted: the SAME session shape under an ACTIVE mission still
-        // resolves to Abandoned/RecordedEnd, which is what #2689's board
-        // drift consumes.
-        mission.status = MissionStatus::Active;
-        assert_eq!(
-            mission_run_status_and_evidence(&mission, &[&ended], now_ms),
-            (RunStatus::Abandoned, Some(DispatchSessionEvidence::RecordedEnd)),
-            "the pause exemption must not disable the recorded-end verdict for Active missions"
         );
     }
 
@@ -5889,14 +5748,72 @@ mod tests {
         );
     }
 
-    /// (#1877 regression, fixed here) The whole-run `dispatch start`
-    /// bookend `launch()` now emits unconditionally opens BEFORE any step
-    /// dispatches — so it is always the mission's earliest session, and
-    /// wins `earliest_by_start`'s pick as `representative`. Its record
-    /// carries `handle = <launched config id>` (a real, non-empty string
-    /// — never the actual per-step role) and NO `model` at all
-    /// (`mission_bookend_record` always passes `model: None`; one bookend
-    /// spans however many per-step model calls the mission makes).
+    /// A 3-item map step is ONE run row and THREE executions: each item
+    /// names its own execution, endpoint and tokens, and the run's tokens are
+    /// their sum. (A flow-only mission: the daemon has no durable record of
+    /// it, as for a run on a peer machine.)
+    #[test]
+    #[serial_test::serial]
+    fn build_runs_a_three_item_map_is_one_row_and_three_executions() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let session = darkmux_types::session_id::SessionId::task(darkmux_types::session_id::RunId::mission("m3").unwrap(), "probe").wire();
+        let now = darkmux_flow::ts_utc_now();
+        let mut records = vec![serde_json::json!({
+            "ts": now, "action": "run.start", "handle": "review", "mission_id": "m3",
+            "session_id": darkmux_types::session_id::SessionId::run(darkmux_types::session_id::RunId::mission("m3").unwrap()).wire(),
+        })];
+        for i in 1..=3u64 {
+            let (exec, endpoint) = (format!("exec-{i}"), format!("azure:seat-{i}.example.com/gpt-4o"));
+            let common = |action: &str| serde_json::json!({
+                "ts": now, "action": action, "handle": "probe-1", "mission_id": "m3",
+                "session_id": session, "execution_id": exec,
+            });
+            let mut start = common("dispatch.start");
+            start["payload"] = serde_json::json!({ "endpoint": endpoint, "item_index": i - 1 });
+            let mut usage = common("telemetry.tokens");
+            usage["category"] = serde_json::json!("telemetry");
+            usage["source"] = serde_json::json!("tokens");
+            usage["payload"] = serde_json::json!({
+                "call_kind": "map_item", "purpose": "work", "endpoint": endpoint,
+                "requested_model": "gpt-4o", "token_source": "provider", "total_tokens": 10 * i,
+            });
+            let mut done = common("dispatch.complete");
+            done["payload"] = serde_json::json!({ "endpoint": endpoint, "result_class": "ok" });
+            records.extend([start, usage, done]);
+        }
+        write_day_file(flows.path(), &today(), &records);
+
+        let out = build_runs_with_usage(flows.path(), None, &[], None);
+        assert_eq!(out.runs.len(), 1, "one row for the whole map, not one per execution: {:?}", out.runs);
+        assert_eq!(out.runs[0].id, "m3");
+        assert_eq!(out.runs[0].tokens, Some(60), "the run is the sum of its three executions");
+        let mut seats: Vec<(String, u64)> = out
+            .usage
+            .groups
+            .iter()
+            .map(|g| (g.endpoint.clone().expect("each execution's endpoint"), g.total()))
+            .collect();
+        seats.sort();
+        assert_eq!(
+            seats,
+            [
+                ("azure:seat-1.example.com/gpt-4o".to_string(), 10),
+                ("azure:seat-2.example.com/gpt-4o".to_string(), 20),
+                ("azure:seat-3.example.com/gpt-4o".to_string(), 30),
+            ],
+            "three executions, each with its own endpoint and tokens"
+        );
+    }
+
+    /// (#1877 regression, fixed here) The run bookend `launch()` emits
+    /// opens BEFORE any step dispatches, and its session is the row's
+    /// representative. Its record carries `handle = <launched config id>`
+    /// (a real, non-empty string, never an execution's role) and NO `model`
+    /// at all (one run spans however many executions it makes). This
+    /// fixture is a pre-4.0 archive: the whole-run bookend written as
+    /// `dispatch.start` with `source: "mission"`, which the reader serves as
+    /// `run.start`, so the row reads the same from an old day file.
     /// Reading role/model straight off `representative` therefore shows
     /// the config id as "role" and blanks "model" on the dashboard for
     /// every mission the new bookend touches — a real, operator-visible
@@ -5944,13 +5861,11 @@ mod tests {
             flows.path(),
             &today(),
             &[
-                // The #1877 whole-run bookend — matches `mission_bookend_record`'s
-                // real shape: `handle` = the launched config id, `session_id` =
-                // `mission_id`, `source: "mission"`, no `model`. Earliest ts, so
-                // it wins the `earliest_by_start` pick. `machine_id` present, as
-                // it would be in production (`darkmux_flow::record` auto-stamps
-                // it on every record whose caller left it unset — not something
-                // `mission_bookend_record` itself sets).
+                // The pre-4.0 whole-run bookend: `handle` = the launched config
+                // id, `session_id` = `mission_id`, `source: "mission"`, no
+                // `model`. `machine_id` present, as it would be in production
+                // (`darkmux_flow::record` auto-stamps it on every record whose
+                // caller left it unset).
                 serde_json::json!({
                     "ts": "2026-01-01T08:00:00Z",
                     "action": "dispatch.start",
@@ -6003,9 +5918,9 @@ mod tests {
         // (#1915) `session_id` follows the SAME representative-only rule as
         // `machine` above — the bookend's own id, not the later coder
         // session's, and not the mission's own id (which happens to be the
-        // same string here by construction, `mission_bookend_record`'s own
-        // shape — pinned as "the representative session's id" rather than
-        // "the mission id" so the two don't get silently conflated).
+        // same string here by construction, the pre-4.0 bookend's own shape —
+        // pinned as "the representative session's id" rather than "the
+        // mission id" so the two don't get silently conflated).
         assert_eq!(runs[0].session_id.as_deref(), Some("bookend-mission-1"), "session_id must be the representative (earliest) session's own id: {runs:?}");
 
         // Ordering is untouched by this fix: start_ts still comes from the
@@ -6015,6 +5930,46 @@ mod tests {
             parse_flow_ts("2026-01-01T08:00:00Z"),
             "start_ts must still come from the earliest session — only role/model attribution changed: {runs:?}"
         );
+    }
+
+    /// (contract 8) The runs board's representative is the run's own
+    /// session, the one `run.start` opened, even when an execution's clock
+    /// put its start earlier (a fleet peer with skew): the row's machine,
+    /// start and drill target are the run's.
+    #[test]
+    #[serial_test::serial]
+    fn build_runs_the_representative_is_the_run_session_not_the_earliest() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let mut mission = minimal_mission(
+            "rep-mission",
+            vec!["p-rep".to_string()],
+            Some(MissionSpec { config_id: "review".to_string(), inputs_fingerprint: "fpr".to_string(), origin: None }),
+        );
+        mission.started_ts = None;
+        mission.machine = None;
+        darkmux_crew::lifecycle::save_mission(&mission).unwrap();
+        write_day_file(
+            flows.path(),
+            &today(),
+            &[
+                serde_json::json!({
+                    "ts": "2026-01-01T07:00:00Z", "action": "dispatch.start", "session_id": "rep-mission.task.probe",
+                    "mission_id": "rep-mission", "handle": "reviewer", "machine_id": "skewed-peer",
+                }),
+                serde_json::json!({
+                    "ts": "2026-01-01T08:00:00Z", "action": "run.start", "session_id": "rep-mission.run",
+                    "mission_id": "rep-mission", "handle": "review", "machine_id": "studio",
+                }),
+            ],
+        );
+        let runs = build_runs(flows.path(), None, &[]);
+        let row = runs.iter().find(|r| r.id == "rep-mission").expect("the mission's row");
+        assert_eq!(row.session_id.as_deref(), Some("rep-mission.run"), "{row:?}");
+        assert_eq!(row.machine.as_deref(), Some("studio"), "{row:?}");
+        assert_eq!(row.started_ts, parse_flow_ts("2026-01-01T08:00:00Z"), "{row:?}");
+        assert_eq!(row.role.as_deref(), Some("reviewer"), "the role is an execution's, never the run's config id: {row:?}");
+        assert_eq!(runs.len(), 1, "one run row, the execution session is the mission's, not a ghost: {runs:?}");
     }
 
     /// (#1918) The SAME uniform guard applied to the LOCAL tracked-mission
@@ -6089,7 +6044,6 @@ mod tests {
                     "session_id": "collision-mission-1",
                     "handle": "coder-phase",
                     "mission_id": "collision-mission-1",
-                    "source": "mission",
                     "machine_id": "studio",
                     "payload": { "endpoint": "tainted-endpoint" },
                 }),
@@ -6203,7 +6157,6 @@ mod tests {
                     "session_id": "ambig-bookend-mission",
                     "handle": "coder-phase",
                     "mission_id": "ambig-bookend-mission",
-                    "source": "mission",
                     "machine_id": "stale-bookend-machine",
                     // (#2558) An endpoint on the tainted session, EARLIER
                     // than the coder's — `remote` is an `earliest_by_start`
@@ -6358,8 +6311,8 @@ mod tests {
             flows.path(),
             &today(),
             &[
-                // The #1877 whole-run bookend — earliest ts, wins
-                // `earliest_by_start`'s `representative` pick.
+                // A pre-4.0 whole-run bookend (read as `run.start`), the
+                // row's `representative`.
                 serde_json::json!({
                     "ts": "2026-01-01T08:00:00Z",
                     "action": "dispatch.start",
@@ -7067,7 +7020,7 @@ mod tests {
         // `peer_mission_runs` call `load_missions()` internally, so an
         // unguarded test here reads the OPERATOR'S real `~/.darkmux`
         // missions — and, unannotated, also raced whichever scratch
-        // `DARKMUX_CREW_DIR` a concurrent sibling happened to have set.
+        // `DARKMUX_HOME` a concurrent sibling happened to have set.
         let _g = CrewGuard::new();
         let flows = TempDir::new().unwrap(); // deliberately EMPTY: the peer's
         // records were never written to this machine's flows dir.

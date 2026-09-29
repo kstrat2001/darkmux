@@ -2709,7 +2709,7 @@ mod tests {
         );
     }
 
-    /// RAII env-var guard — isolates `DARKMUX_CREW_DIR`/`DARKMUX_FLOWS_DIR`
+    /// RAII env-var guard — isolates `DARKMUX_HOME`/`DARKMUX_FLOWS_DIR`
     /// to a fresh tempdir for one test, restoring the prior value on
     /// `Drop` (including on panic/early-return, unlike the manual
     /// save-then-restore-at-the-bottom pattern used elsewhere in this
@@ -2986,7 +2986,7 @@ mod tests {
     #[serial_test::serial]
     async fn a_nullary_slash_command_drops_typed_args_and_says_so_before_running() {
         let crew_tmp = tempfile::TempDir::new().unwrap();
-        let _crew_guard = EnvGuard::set("DARKMUX_CREW_DIR", crew_tmp.path());
+        let _crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
         write_nullary_echo_fixture(crew_tmp.path(), "nullary-fixture", "fixture output");
 
         let router = |_msg: &str| -> Result<String> {
@@ -3024,7 +3024,7 @@ mod tests {
     #[serial_test::serial]
     async fn a_slash_command_that_takes_args_is_not_announced() {
         let crew_tmp = tempfile::TempDir::new().unwrap();
-        let _crew_guard = EnvGuard::set("DARKMUX_CREW_DIR", crew_tmp.path());
+        let _crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
         write_echo_fixture(crew_tmp.path(), "echo-fixture", "fixture output");
 
         let router = |_msg: &str| -> Result<String> {
@@ -3054,7 +3054,7 @@ mod tests {
     #[serial_test::serial]
     async fn a_no_slash_prompt_with_bad_enum_config_refuses_before_routing() {
         let crew_tmp = tempfile::TempDir::new().unwrap();
-        let _crew_guard = EnvGuard::set("DARKMUX_CREW_DIR", crew_tmp.path());
+        let _crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
         let _bad = EnvGuard::set("DARKMUX_THERMAL_PAUSE_AT", Path::new("seroius"));
         let router = |_msg: &str| -> Result<String> {
             panic!("bad config must refuse before the router is called");
@@ -3079,7 +3079,7 @@ mod tests {
     #[serial_test::serial]
     async fn no_slash_route_sends_provenance_before_output_and_records_wall_4() {
         let crew_tmp = tempfile::TempDir::new().unwrap();
-        let _crew_guard = EnvGuard::set("DARKMUX_CREW_DIR", crew_tmp.path());
+        let _crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
         let flows_tmp = tempfile::TempDir::new().unwrap();
         let _flows_guard = EnvGuard::set("DARKMUX_FLOWS_DIR", flows_tmp.path());
         write_echo_fixture(crew_tmp.path(), "echo-fixture", "fixture output");
@@ -3127,7 +3127,7 @@ mod tests {
         // failed identically, and the user read the same error twice. The
         // answerer here PANICS if called: that is the assertion.
         let crew_tmp = tempfile::TempDir::new().unwrap();
-        let _crew_guard = EnvGuard::set("DARKMUX_CREW_DIR", crew_tmp.path());
+        let _crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
         let flows_tmp = tempfile::TempDir::new().unwrap();
         let _flows_guard = EnvGuard::set("DARKMUX_FLOWS_DIR", flows_tmp.path());
         write_echo_fixture(crew_tmp.path(), "echo-fixture", "fixture output");
@@ -3169,7 +3169,7 @@ mod tests {
     #[serial_test::serial]
     async fn no_slash_refusal_routes_to_the_answering_seat_and_records_wall_4() {
         let crew_tmp = tempfile::TempDir::new().unwrap();
-        let _crew_guard = EnvGuard::set("DARKMUX_CREW_DIR", crew_tmp.path());
+        let _crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
         let flows_tmp = tempfile::TempDir::new().unwrap();
         let _flows_guard = EnvGuard::set("DARKMUX_FLOWS_DIR", flows_tmp.path());
         write_echo_fixture(crew_tmp.path(), "echo-fixture", "fixture output");
@@ -3216,7 +3216,7 @@ mod tests {
     #[serial_test::serial]
     async fn no_slash_refusal_falls_back_to_the_plain_listing_when_the_answering_seat_errors() {
         let crew_tmp = tempfile::TempDir::new().unwrap();
-        let _crew_guard = EnvGuard::set("DARKMUX_CREW_DIR", crew_tmp.path());
+        let _crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
         write_echo_fixture(crew_tmp.path(), "echo-fixture", "fixture output");
 
         let router = |_msg: &str| -> Result<String> {
@@ -3250,7 +3250,7 @@ mod tests {
     #[serial_test::serial]
     async fn no_slash_refusal_answers_at_once_that_the_seat_instance_is_busy() {
         let crew_tmp = tempfile::TempDir::new().unwrap();
-        let _crew_guard = EnvGuard::set("DARKMUX_CREW_DIR", crew_tmp.path());
+        let _crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
         let flows_tmp = tempfile::TempDir::new().unwrap();
         let _flows_guard = EnvGuard::set("DARKMUX_FLOWS_DIR", flows_tmp.path());
         write_echo_fixture(crew_tmp.path(), "echo-fixture", "fixture output");
@@ -3300,7 +3300,7 @@ mod tests {
     #[serial_test::serial]
     async fn a_slow_router_gets_one_notice_chunk_then_the_answer_and_is_called_once() {
         let crew_tmp = tempfile::TempDir::new().unwrap();
-        let _crew_guard = EnvGuard::set("DARKMUX_CREW_DIR", crew_tmp.path());
+        let _crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
         let flows_tmp = tempfile::TempDir::new().unwrap();
         let _flows_guard = EnvGuard::set("DARKMUX_FLOWS_DIR", flows_tmp.path());
         write_echo_fixture(crew_tmp.path(), "echo-fixture", "fixture output");
@@ -3355,7 +3355,7 @@ mod tests {
     #[serial_test::serial]
     async fn a_prior_commands_output_reaches_the_answering_seats_grounding_via_the_shelf() {
         let crew_tmp = tempfile::TempDir::new().unwrap();
-        let _crew_guard = EnvGuard::set("DARKMUX_CREW_DIR", crew_tmp.path());
+        let _crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
         write_echo_fixture(crew_tmp.path(), "echo-fixture", "the-shelf-marker-output");
 
         let router = |_msg: &str| -> Result<String> {
@@ -3404,7 +3404,7 @@ mod tests {
     #[serial_test::serial]
     async fn set_config_option_override_reaches_the_answering_seats_dispatch() {
         let crew_tmp = tempfile::TempDir::new().unwrap();
-        let _crew_guard = EnvGuard::set("DARKMUX_CREW_DIR", crew_tmp.path());
+        let _crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
         write_echo_fixture(crew_tmp.path(), "echo-fixture", "fixture output");
 
         let router = |_msg: &str| -> Result<String> {
@@ -3454,7 +3454,7 @@ mod tests {
     #[serial_test::serial]
     async fn slash_invocation_never_calls_the_router() {
         let crew_tmp = tempfile::TempDir::new().unwrap();
-        let _crew_guard = EnvGuard::set("DARKMUX_CREW_DIR", crew_tmp.path());
+        let _crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
         write_echo_fixture(crew_tmp.path(), "echo-fixture", "fixture output");
 
         let router = |_msg: &str| -> Result<String> {
@@ -3486,7 +3486,7 @@ mod tests {
     #[serial_test::serial]
     async fn bare_word_matching_a_command_name_does_not_fire_it_directly() {
         let crew_tmp = tempfile::TempDir::new().unwrap();
-        let _crew_guard = EnvGuard::set("DARKMUX_CREW_DIR", crew_tmp.path());
+        let _crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
         write_echo_fixture(crew_tmp.path(), "echo-fixture", "fixture output");
 
         let call_count = Arc::new(AtomicUsize::new(0));
@@ -3541,7 +3541,7 @@ mod tests {
     #[serial_test::serial]
     async fn empty_text_never_invokes_the_router() {
         let crew_tmp = tempfile::TempDir::new().unwrap();
-        let _crew_guard = EnvGuard::set("DARKMUX_CREW_DIR", crew_tmp.path());
+        let _crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
         write_echo_fixture(crew_tmp.path(), "echo-fixture", "fixture output");
 
         let router = |_msg: &str| -> Result<String> {
@@ -3577,7 +3577,7 @@ mod tests {
     #[serial_test::serial]
     async fn session_cancel_aborts_an_in_flight_command_and_reports_cancelled() {
         let crew_tmp = tempfile::TempDir::new().unwrap();
-        let _crew_guard = EnvGuard::set("DARKMUX_CREW_DIR", crew_tmp.path());
+        let _crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
         write_echo_fixture(crew_tmp.path(), "echo-fixture", "fixture output");
 
         let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
@@ -3650,7 +3650,7 @@ mod tests {
     #[serial_test::serial]
     async fn session_cancel_for_unknown_session_is_a_quiet_no_op() {
         let crew_tmp = tempfile::TempDir::new().unwrap();
-        let _crew_guard = EnvGuard::set("DARKMUX_CREW_DIR", crew_tmp.path());
+        let _crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
         write_echo_fixture(crew_tmp.path(), "echo-fixture", "fixture output");
 
         let router = |_msg: &str| -> Result<String> {
@@ -3688,7 +3688,7 @@ mod tests {
     #[serial_test::serial]
     async fn session_close_prunes_the_session_and_a_later_prompt_finds_no_cwd() {
         let crew_tmp = tempfile::TempDir::new().unwrap();
-        let _crew_guard = EnvGuard::set("DARKMUX_CREW_DIR", crew_tmp.path());
+        let _crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
         write_echo_fixture(crew_tmp.path(), "echo-fixture", "fixture output");
 
         let router = |_msg: &str| -> Result<String> {
@@ -3741,7 +3741,7 @@ mod tests {
     #[serial_test::serial]
     async fn session_new_latches_ever_attached_and_close_never_clears_it() {
         let crew_tmp = tempfile::TempDir::new().unwrap();
-        let _crew_guard = EnvGuard::set("DARKMUX_CREW_DIR", crew_tmp.path());
+        let _crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
 
         let router = |_msg: &str| -> Result<String> {
             panic!("this scenario never prompts, so the router must never be reached");
@@ -3805,7 +3805,7 @@ mod tests {
     #[serial_test::serial]
     async fn the_real_loop_never_reclaims_an_attached_process() {
         let crew_tmp = tempfile::TempDir::new().unwrap();
-        let _crew_guard = EnvGuard::set("DARKMUX_CREW_DIR", crew_tmp.path());
+        let _crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
 
         let router = |_msg: &str| -> Result<String> {
             panic!("this scenario never prompts, so the router must never be reached");
@@ -3892,7 +3892,7 @@ mod tests {
         const SENTINEL: u64 = 9_999_999;
 
         let crew_tmp = tempfile::TempDir::new().unwrap();
-        let _crew_guard = EnvGuard::set("DARKMUX_CREW_DIR", crew_tmp.path());
+        let _crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
 
         let router = |_msg: &str| -> Result<String> {
             panic!("this scenario never routes, so the router must never be reached");
@@ -3993,7 +3993,7 @@ mod tests {
     #[serial_test::serial]
     async fn session_load_latches_ever_attached() {
         let crew_tmp = tempfile::TempDir::new().unwrap();
-        let _crew_guard = EnvGuard::set("DARKMUX_CREW_DIR", crew_tmp.path());
+        let _crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
 
         let router = |_msg: &str| -> Result<String> {
             panic!("this scenario never prompts, so the router must never be reached");
@@ -4050,7 +4050,7 @@ mod tests {
     #[serial_test::serial]
     async fn session_close_aborts_an_in_flight_command_before_pruning_the_session() {
         let crew_tmp = tempfile::TempDir::new().unwrap();
-        let _crew_guard = EnvGuard::set("DARKMUX_CREW_DIR", crew_tmp.path());
+        let _crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
         write_echo_fixture(crew_tmp.path(), "echo-fixture", "fixture output");
 
         let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
@@ -4131,7 +4131,7 @@ mod tests {
     #[serial_test::serial]
     async fn ephemeral_command_cancellation_still_reports_the_shells_eventual_result() {
         let crew_tmp = tempfile::TempDir::new().unwrap();
-        let _crew_guard = EnvGuard::set("DARKMUX_CREW_DIR", crew_tmp.path());
+        let _crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
         let flows_tmp = tempfile::TempDir::new().unwrap();
         let _flows_guard = EnvGuard::set("DARKMUX_FLOWS_DIR", flows_tmp.path());
 

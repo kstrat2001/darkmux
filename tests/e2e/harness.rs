@@ -312,15 +312,14 @@ pub struct FleetNode {
     /// `~/.darkmux/...` as a candidate. Measured 2026-09-07 against a
     /// plain `cargo build` binary: with `DARKMUX_HOME` set to a tempdir,
     /// `darkmux machine add` still wrote `$HOME/.darkmux/fleet.json`.
-    /// This node overrides two of those by name (`DARKMUX_FLEET_FILE`,
-    /// `DARKMUX_CREW_DIR`).
+    /// This node overrides one of those by name (`DARKMUX_FLEET_FILE`).
     ///
     /// (#2710) This doc used to end "…`HOME` closes the rest at once, and
     /// keeps closing the ones nobody has written yet." **That was false**,
     /// and it is the identical claim #2704 spent two review rounds
     /// disproving for the isolated-roots helper one file over. `HOME` is
     /// the LAST tier of every resolver that has a `DARKMUX_*` override:
-    /// `crew::loader::user_state_root` consults `DARKMUX_CREW_DIR` first,
+    /// `config_access::lab_dir` consults `DARKMUX_LAB_DIR` first,
     /// `config_access::audit_enabled` is true on the mere PRESENCE of
     /// `DARKMUX_AUDIT_DIR`, and so on down the list in
     /// `darkmux_types::test_isolation::PINNED_STATE_VARS`. An exported
@@ -386,8 +385,7 @@ impl FleetNode {
             .env("DARKMUX_MACHINE_ID", &self.machine_id)
             .env("DARKMUX_REDIS_URL", &self.redis_url)
             .env("DARKMUX_FLOWS_DIR", &self.flows_dir)
-            .env("DARKMUX_FLEET_FILE", &self.fleet_file)
-            .env("DARKMUX_CREW_DIR", &self.crew_root);
+            .env("DARKMUX_FLEET_FILE", &self.fleet_file);
         // (#2727) Must match whatever the daemon itself is running under
         // (`spawn_daemon` sets the identical var from the identical
         // field) — a one-shot CLI command's flow record and the daemon's
@@ -398,36 +396,6 @@ impl FleetNode {
             cmd.env("DARKMUX_REDIS_STREAM", stream);
         }
         cmd
-    }
-
-    /// Register a minimal role named `id` in this node's crew root, so a
-    /// mission dispatch gets past its role-exists check. The manifest is
-    /// serialized from the `Role` type rather than written by hand: the
-    /// dispatch preflight refuses any key the type does not declare, so a
-    /// hand-written fixture silently falls behind when a key is retired.
-    pub fn register_role(&self, id: &str) {
-        let role = darkmux_crew::types::Role {
-            id: id.to_string(),
-            description: "test role".to_string(),
-            skills: Vec::new(),
-            tool_palette: darkmux_crew::types::ToolPalette::default(),
-            escalation_contract: darkmux_crew::types::EscalationContract::BailWithExplanation,
-            output_schema: None,
-            prompt_path: None,
-            bail_after_compactions: None,
-            escalation_posture: None,
-            role_family: None,
-            feedback_templates: None,
-        };
-        let role_dir = self.crew_root.join("roles");
-        std::fs::create_dir_all(&role_dir).expect("creating the roles dir");
-        std::fs::write(
-            role_dir.join(format!("{id}.json")),
-            serde_json::to_string_pretty(&role).expect("a Role serializes"),
-        )
-        .expect("writing the role manifest");
-        std::fs::write(role_dir.join(format!("{id}.md")), "test system prompt")
-            .expect("writing the role prompt");
     }
 
     /// Returns false if the daemon process has exited. Used by tests
@@ -501,7 +469,7 @@ mod darkmux_home_isolation_tests {
             process_home: process_home.clone(),
             flows_dir: node_dir.join("flows"),
             fleet_file: node_dir.join("fleet.json"),
-            crew_root: node_dir.join("crew"),
+            crew_root: home_dir.clone(),
             redis_url: "redis://127.0.0.1:0".to_string(),
             redis_stream: None,
             lmstudio_base_url: "http://127.0.0.1:0".to_string(),
@@ -1040,7 +1008,7 @@ fn spawn_daemon(
     let flows_dir = node_dir.join("flows");
     std::fs::create_dir_all(&flows_dir)
         .map_err(|e| format!("flows dir: {e}"))?;
-    let crew_root = node_dir.join("crew");
+    let crew_root = node_dir.join("home");
     std::fs::create_dir_all(crew_root.join("missions"))
         .map_err(|e| format!("crew/missions dir: {e}"))?;
     std::fs::create_dir_all(crew_root.join("roles"))
@@ -1084,7 +1052,6 @@ fn spawn_daemon(
             .env("DARKMUX_REDIS_URL", redis_url)
             .env("DARKMUX_FLOWS_DIR", &flows_dir)
             .env("DARKMUX_FLEET_FILE", &fleet_file)
-            .env("DARKMUX_CREW_DIR", &crew_root)
             // Point the internal runtime at our mock LMStudio.
             .env("OPENAI_BASE_URL", lmstudio_base_url)
             .env("DARKMUX_LMSTUDIO_BASE_URL", lmstudio_base_url)

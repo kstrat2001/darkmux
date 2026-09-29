@@ -23,7 +23,7 @@ mod integrity;
 mod schema;
 mod status;
 
-pub use action::{FlowAction, FlowScope, UnknownAction};
+pub use action::{Bookend, Edge, FlowAction, FlowScope, Grain, UnknownAction};
 pub use bookend::*;
 pub use integrity::*;
 pub use schema::*;
@@ -101,7 +101,8 @@ pub trait FlowSink: Send + Sync {
 }
 
 /// A record that passed the write check: its action is one darkmux writes
-/// today, never [`FlowAction::Other`] (unknown) or [`FlowAction::Retired`].
+/// today, never [`FlowAction::Other`] (unknown) or [`FlowAction::Retired`],
+/// and a record of a role execution names it.
 /// Its field is private, so the only way to hand one to a sink is
 /// [`FlowSinkWrite::write`], the one chokepoint every sink's write goes
 /// through.
@@ -116,6 +117,9 @@ impl<'a> CheckedRecord<'a> {
             }
             FlowAction::Retired(retired) => {
                 anyhow::bail!("refusing to write a flow record with the retired action `{}`", retired.as_str())
+            }
+            known if known.grain() == Some(Grain::Execution) && record.execution_id.is_none() => {
+                anyhow::bail!("refusing to write a `{}` record with no execution id: it is a record of a role execution", known.as_str())
             }
             _ => Ok(Self(record)),
         }
@@ -292,11 +296,11 @@ pub fn audit_dir() -> PathBuf {
 /// override would still (were `audit.enabled` on) write the hash-chained
 /// audit trail into the operator's REAL `~/.darkmux/audit`. Derived from the
 /// SAME root resolution every sibling darkmux directory resolves through —
-/// `darkmux_types::paths::resolve(Auto)`, which honors `DARKMUX_HOME` and a
-/// project-local `./.darkmux` before `~/.darkmux`.
+/// `darkmux_types::paths::resolve`, which honors `DARKMUX_HOME` before
+/// `~/.darkmux`.
 #[cfg(not(any(test, feature = "test-support")))]
 fn audit_dir_default() -> PathBuf {
-    darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::Auto)
+    darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser)
         .root
         .join("audit")
 }
@@ -309,7 +313,7 @@ fn audit_dir_default() -> PathBuf {
 /// verbatim, because a test that isolated itself means it.
 #[cfg(any(test, feature = "test-support"))]
 fn audit_dir_default() -> PathBuf {
-    let resolved = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::Auto);
+    let resolved = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser);
     let real_user_root = dirs::home_dir().map(|h| h.join(".darkmux"));
     if real_user_root.as_ref() == Some(&resolved.root) {
         return darkmux_types::paths::test_isolated_dir("audit");
@@ -801,14 +805,13 @@ fn keychain_serve_token() -> Option<String> {
 /// Resolve the serve-daemon bearer token, mirroring `redis_url`'s tiering:
 ///   1. `env(DARKMUX_SERVE_TOKEN)` verbatim (trimmed, empty-filtered) — the
 ///      portable/non-macOS path, no config gate (its presence is the opt-in);
-///   2. else config gate on (`runtime.daemon_auth_enabled`) + Keychain item
+///   2. else config gate on (`serve.token_keychain`) + Keychain item
 ///      `darkmux-serve-token`;
-///   3. else `None` (auth off — today's default).
+///   3. else `None` (no token — the default).
 ///
 /// Always a `RawServeToken`, so the secret reaches a comparison only via
-/// `expose_for_compare`. **Auth is "active" iff this returns `Some`** — the
-/// config flag alone never activates auth (a gate-on-but-no-token state would
-/// otherwise 401 every request with no way to pass). (#881)
+/// `expose_for_compare`. The token is the fleet's execution credential; the
+/// read surface needs it only when `serve.read_auth` is on (#2988). (#881)
 pub fn serve_token() -> Option<RawServeToken> {
     // (#2643) Same chokepoint-wiring reasoning as `redis_url` above.
     #[cfg(any(test, feature = "test-support"))]
@@ -822,7 +825,7 @@ pub fn serve_token() -> Option<RawServeToken> {
         return Some(RawServeToken::new(tok));
     }
     // Tier 2 — config gate on + Keychain item present.
-    if darkmux_types::config_access::serve_auth_config_enabled() {
+    if darkmux_types::config_access::serve_token_keychain() {
         if let Some(tok) = keychain_serve_token() {
             return Some(RawServeToken::new(tok));
         }
@@ -832,8 +835,8 @@ pub fn serve_token() -> Option<RawServeToken> {
 }
 
 /// Whether a serve-daemon bearer token is configured (env or gated-Keychain).
-/// Boolean ONLY — never the token. Drives the refuse-to-bind gate, the auth
-/// middleware toggle, the startup banner, and `darkmux doctor`. (#881)
+/// Boolean ONLY — never the token. Drives the serve startup preflight, the
+/// fleet listener, the startup banner, and `darkmux doctor`. (#881)
 pub fn serve_token_present() -> bool {
     serve_token().is_some()
 }
@@ -2047,6 +2050,35 @@ mod tests {
         assert_eq!(sink.0.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
+    /// The verbs behind `mission.pause`, `mission.resume` and `phase.added`
+    /// are gone (#2954), so each spelling reads as retired and no write path
+    /// can name one: it is not a current action, and both entry points
+    /// refuse a record that carries it.
+    #[test]
+    fn the_retired_pause_resume_and_added_actions_read_but_cannot_be_written() {
+        struct Never;
+        impl FlowSink for Never {
+            fn persist(&self, _record: crate::CheckedRecord<'_>) -> Result<()> {
+                panic!("a retired action reached a sink");
+            }
+            fn info(&self) -> SinkInfo {
+                SinkInfo { kind: "Never".into(), config: Default::default(), children: vec![], raw_url: None }
+            }
+        }
+        // flow-action-guard:allow-start — the retired spellings are this test's input
+        // drift-guard:allow mission pause — the retired spelling is this test's input
+        // drift-guard:allow mission resume — same
+        for wire in ["mission.pause", "mission pause", "mission.resume", "mission resume", "phase.added", "phase added", "sprint added"] {
+            assert!(!FlowAction::KNOWN_WIRE.contains(&wire), "{wire} is still a current action");
+            let mut r = minimal_record();
+            r.action = crate::legacy::read_action(wire);
+            assert!(matches!(r.action, FlowAction::Retired(_)), "{wire} must read as retired");
+            assert!(record_via(&Never, &r).is_err(), "{wire}");
+            assert!(record_to(&Never, r).is_err(), "{wire}");
+        }
+        // flow-action-guard:allow-end
+    }
+
     fn minimal_record() -> FlowRecord {
         FlowRecord {
             ts: "2025-01-15T12:34:56Z".to_string(),
@@ -2058,6 +2090,7 @@ mod tests {
             handle: "t".to_string(),
             phase_id: None,
             session_id: None,
+            execution_id: None,
             source: None,
             model: None,
             reasoning: None,
@@ -2163,6 +2196,7 @@ mod tests {
             handle: "test-1".to_string(),
             phase_id: None,
             session_id: None,
+            execution_id: None,
             source: None,
             model: None,
             reasoning: None,
@@ -2205,6 +2239,7 @@ mod tests {
             handle: handle.to_string(),
             phase_id: None,
             session_id: None,
+            execution_id: None,
             source: None,
             model: None,
             reasoning: None,
@@ -2308,6 +2343,7 @@ mod tests {
             handle: "handle-42".to_string(),
             phase_id: Some("sp-100".to_string()),
             session_id: Some("sess-abc".to_string()),
+            execution_id: None,
             source: Some("estimator".to_string()),
             model: None,
             reasoning: None,
@@ -2375,6 +2411,7 @@ mod tests {
                 handle: "ex-path-1".to_string(),
                 phase_id: None,
                 session_id: None,
+                execution_id: None,
                 source: Some("reviewer".to_string()),
                 model: None,
                 reasoning: None,
@@ -2421,6 +2458,7 @@ mod tests {
             handle: "ship-1".to_string(),
             phase_id: None,
             session_id: None,
+            execution_id: None,
             source: None,
             model: None,
             reasoning: None,
@@ -2476,6 +2514,7 @@ mod tests {
             handle: "ev-1".to_string(),
             phase_id: None,
             session_id: None,
+            execution_id: None,
             source: None,
             model: None,
             reasoning: None,
@@ -2623,6 +2662,7 @@ mod tests {
             handle: "h".to_string(),
             phase_id: None,
             session_id: None,
+            execution_id: None,
             source: None,
             model: None,
             reasoning: None,
@@ -2722,6 +2762,7 @@ mod tests {
         let mut rec = minimal_record();
         rec.action = crate::FlowAction::DispatchComplete;
         rec.session_id = Some("sess-1".to_string());
+        rec.execution_id = Some(darkmux_types::execution_id::ExecutionId::mint());
 
         // TeeSink returns Err (the audit child failed), but the breadcrumb is
         // the point.
@@ -2801,6 +2842,7 @@ mod tests {
             handle: "h".to_string(),
             phase_id: None,
             session_id: None,
+            execution_id: None,
             source: None,
             model: None,
             reasoning: None,
@@ -2842,6 +2884,7 @@ mod tests {
             handle: "h".to_string(),
             phase_id: None,
             session_id: None,
+            execution_id: None,
             source: None,
             model: None,
             reasoning: None,
@@ -2897,6 +2940,7 @@ mod tests {
             handle: "h".to_string(),
             phase_id: None,
             session_id: None,
+            execution_id: None,
             source: None,
             model: None,
             reasoning: None,
@@ -2940,6 +2984,7 @@ mod tests {
             handle: "h".to_string(),
             phase_id: None,
             session_id: None,
+            execution_id: None,
             source: None,
             model: None,
             reasoning: None,
@@ -3397,6 +3442,7 @@ mod tests {
             handle: "h".to_string(),
             phase_id: None,
             session_id: None,
+            execution_id: None,
             source: None,
             model: None,
             reasoning: None,
@@ -3432,6 +3478,7 @@ mod tests {
                 handle: "schema-check".to_string(),
                 phase_id: None,
                 session_id: None,
+                execution_id: None,
                 source: None,
                 model: None,
                 reasoning: None,
@@ -3615,6 +3662,7 @@ mod tests {
             handle: "y".to_string(),
             phase_id: None,
             session_id: None,
+            execution_id: None,
             source: None,
             model: None,
             reasoning: None,
@@ -3643,6 +3691,7 @@ mod tests {
             handle: "y".to_string(),
             phase_id: None,
             session_id: None,
+            execution_id: None,
             source: None,
             model: None,
             reasoning: None,
@@ -3686,6 +3735,7 @@ mod tests {
             handle: "h".to_string(),
             phase_id: None,
             session_id: None,
+            execution_id: None,
             source: None,
             model: None,
             reasoning: None,
@@ -3737,6 +3787,7 @@ mod tests {
             handle: "y".to_string(),
             phase_id: None,
             session_id: None,
+            execution_id: None,
             source: None,
             model: None,
             reasoning: None,
@@ -3770,6 +3821,7 @@ mod tests {
             handle: "y".to_string(),
             phase_id: None,
             session_id: None,
+            execution_id: None,
             source: None,
             model: None,
             reasoning: None,
@@ -3843,6 +3895,7 @@ mod tests {
                 handle: format!("h-{i}"),
                 phase_id: None,
                 session_id: None,
+                execution_id: None,
                 source: None,
                 model: None,
                 reasoning: None,
@@ -3908,6 +3961,7 @@ mod tests {
                 handle: format!("rec-{i}"),
                 phase_id: None,
                 session_id: None,
+                execution_id: None,
                 source: None,
                 model: None,
                 reasoning: None,
@@ -3957,6 +4011,7 @@ mod tests {
                 handle: format!("rec-{i}"),
                 phase_id: None,
                 session_id: None,
+                execution_id: None,
                 source: None,
                 model: None,
                 reasoning: None,
@@ -4028,6 +4083,7 @@ mod tests {
                 handle: format!("rec-{i}"),
                 phase_id: None,
                 session_id: None,
+                execution_id: None,
                 source: None,
                 model: None,
                 reasoning: None,
@@ -4135,6 +4191,7 @@ mod tests {
             handle: "h".to_string(),
             phase_id: None,
             session_id: None,
+            execution_id: None,
             source: None,
             model: None,
             reasoning: None,
@@ -4200,6 +4257,7 @@ mod tests {
             handle: handle.to_string(),
             phase_id: None,
             session_id: None,
+            execution_id: None,
             source: None,
             model: None,
             reasoning: None,
@@ -4605,6 +4663,7 @@ mod tests {
             handle: "test".to_string(),
             phase_id: None,
             session_id: None,
+            execution_id: None,
             source: None,
             model: None,
             reasoning: None,
@@ -4816,6 +4875,7 @@ mod tests {
             handle: "test".to_string(),
             phase_id: None,
             session_id: None,
+            execution_id: None,
             source: None,
             model: None,
             reasoning: None,

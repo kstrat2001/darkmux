@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import { QueryClient } from "@tanstack/react-query";
 import type { FlowRecord } from "../types/handwritten";
@@ -12,6 +15,7 @@ import {
   ingest,
   ingestJsonl,
   isAsOf,
+  isExecutionAction,
   recordsAsOf,
   recordsSince,
   isKnownAction,
@@ -310,5 +314,53 @@ describe("the bad-timestamp policy", () => {
   it("the same untimed terminal, in the live window, is not dropped by the 24h cut", () => {
     const win = buildFlowWindow([], ingest([raw("dispatch.start", 0), raw("dispatch.complete", "bad")]), T0 + 1000);
     expect(win.map((r) => r.action)).toEqual([ACTION.DispatchStart, ACTION.DispatchComplete]);
+  });
+});
+
+describe("ingest: the execution a record is of", () => {
+  const exec = (r: NormRecord | undefined) => r?.execution_id;
+
+  it("gives a record of an execution that names none its legacy identity, per arm", () => {
+    const cases: [string, Record<string, unknown>, string | undefined][] = [
+      ["dispatch.start", { session_id: "task-t", mission_id: "m1" }, "legacy:task-t:m1"],
+      ["dispatch.complete", { session_id: "task-t", mission_id: "m1" }, "legacy:task-t:m1"],
+      ["telemetry.tokens", { session_id: "task-t", mission_id: "m1" }, "legacy:task-t:m1"],
+      ["budget.wait", { session_id: "task-t", mission_id: "m1" }, "legacy:task-t:m1"],
+      ["dispatch.turn", { session_id: "task-t", mission_id: undefined }, "legacy:task-t:"],
+      ["telemetry.tokens", { session_id: undefined, mission_id: undefined, ts: "2026-08-20T01:00:00Z", handle: "radio-router", machine_uid: "u1" }, "legacy:::2026-08-20T01:00:00Z:radio-router:u1"],
+      ["dispatch.turn", { session_id: "s", execution_id: "exec-1" }, "exec-1"],
+      ["step.start", { session_id: "task-t", mission_id: "m1" }, undefined],
+      ["run.start", { session_id: "task-t", mission_id: "m1" }, undefined],
+      ["dispatch.route", { session_id: "task-t", mission_id: "m1" }, undefined],
+    ];
+    for (const [action, extra, want] of cases) {
+      const [r] = ingest([{ ...raw(action, 0), ...extra }]);
+      expect(exec(r), `${action} ${JSON.stringify(extra)}`).toBe(want);
+    }
+  });
+
+  it("agrees, record for record, with the reader on the shared archive golden", () => {
+    const dir = path.join(path.dirname(fileURLToPath(import.meta.url)), "../../../tests/flow-archive-golden");
+    const twin = readFileSync(path.join(dir, "2026-08-20.upgraded.jsonl"), "utf8")
+      .split("\n")
+      .filter((l) => l.trim() !== "")
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+    let checked = 0;
+    for (const want of twin) {
+      const { execution_id: named, ...rest } = want;
+      const [got] = ingest([rest]);
+      if (!got) continue;
+      expect(got.execution_id, JSON.stringify(rest)).toBe(named);
+      checked += named === undefined ? 0 : 1;
+    }
+    expect(checked, "the golden holds execution records").toBeGreaterThan(5);
+  });
+
+  it("names exactly the actions Rust declares execution-grain", () => {
+    expect(isExecutionAction(ACTION.DispatchTool)).toBe(true);
+    expect(isExecutionAction(ACTION.TelemetryTokens)).toBe(true);
+    expect(isExecutionAction(ACTION.StepStart)).toBe(false);
+    expect(isExecutionAction(ACTION.DispatchRoute)).toBe(false);
+    expect(isExecutionAction(undefined)).toBe(false);
   });
 });

@@ -354,12 +354,11 @@ fn emit_route_record(text: &str, surface: RadioSurface, decision: &RouteDecision
             payload["error"] = serde_json::json!(error);
         }
     }
-    let record = crate::crew::dispatch::build_dispatch_record_with_payload(
+    let record = crate::crew::dispatch::build_session_record_with_payload(
         crate::flow::Level::Info,
         darkmux_flow::FlowAction::RadioRoute,
         crate::crew::loader::RADIO_ROUTER_ROLE_ID,
         &radio_session(crate::crew::loader::RADIO_ROUTER_ROLE_ID),
-        None,
         None,
         Some(payload),
     );
@@ -709,7 +708,7 @@ mod tests {
         // is compared against an `include_str!` of the SHIPPED template
         // directly, NEVER `crate::crew::loader::role_prompt("radio-router")`.
         // `role_prompt` resolves the SAME operator-tier-override-wins
-        // precedence every dispatch honors (`~/.darkmux/crew/roles/
+        // precedence every dispatch honors (`~/.darkmux/roles/
         // radio-router.md`, loader-preferred over the embedded default —
         // see the issue's own "RADIO's persona" comment, which documents
         // exactly this override as the delivery mechanism for the
@@ -766,7 +765,7 @@ mod tests {
              text (contract 6) — a deliberate edit updates both this golden and the file \
              together. (Compared against the SHIPPED template directly, not through \
              `crate::crew::loader::role_prompt`, which would resolve an operator's own \
-             persona override at `~/.darkmux/crew/roles/radio-router.md` instead — see this \
+             persona override at `~/.darkmux/roles/radio-router.md` instead — see this \
              test's own doc.)"
         );
     }
@@ -1135,9 +1134,9 @@ mod tests {
     #[serial_test::serial]
     fn compile_catalog_advertises_panel_blocked_configs_sorted_with_the_panel_description() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
+        let prev = std::env::var("DARKMUX_HOME").ok();
         // SAFETY: this test is #[serial_test::serial].
-        unsafe { std::env::set_var("DARKMUX_CREW_DIR", tmp.path()) };
+        unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()) };
 
         let dir = tmp.path().join("mission-configs");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1210,8 +1209,8 @@ mod tests {
         // SAFETY: this test is #[serial_test::serial].
         unsafe {
             match prev {
-                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-                None => std::env::remove_var("DARKMUX_CREW_DIR"),
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
             }
         }
     }
@@ -1227,9 +1226,9 @@ mod tests {
     #[serial_test::serial]
     fn compile_catalog_advertises_the_built_in_machine_status_command() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
+        let prev = std::env::var("DARKMUX_HOME").ok();
         // SAFETY: this test is #[serial_test::serial].
-        unsafe { std::env::set_var("DARKMUX_CREW_DIR", tmp.path()) };
+        unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()) };
 
         let catalog = compile_catalog();
         let entry = catalog
@@ -1246,8 +1245,8 @@ mod tests {
         // SAFETY: this test is #[serial_test::serial].
         unsafe {
             match prev {
-                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-                None => std::env::remove_var("DARKMUX_CREW_DIR"),
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
             }
         }
     }
@@ -1256,9 +1255,9 @@ mod tests {
     #[serial_test::serial]
     fn compile_catalog_falls_back_to_the_configs_name_when_panel_description_is_absent() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
+        let prev = std::env::var("DARKMUX_HOME").ok();
         // SAFETY: this test is #[serial_test::serial].
-        unsafe { std::env::set_var("DARKMUX_CREW_DIR", tmp.path()) };
+        unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()) };
 
         let dir = tmp.path().join("mission-configs");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1288,8 +1287,8 @@ mod tests {
         // SAFETY: this test is #[serial_test::serial].
         unsafe {
             match prev {
-                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-                None => std::env::remove_var("DARKMUX_CREW_DIR"),
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
             }
         }
     }

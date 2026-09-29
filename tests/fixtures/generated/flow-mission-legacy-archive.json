@@ -12,7 +12,8 @@
     "source": "crew_dispatch",
     "payload": {
       "step_id": "judge-1"
-    }
+    },
+    "execution_id": "legacy:step-judge-1:review-1785400940-legacy"
   },
   {
     "ts": "2026-08-20T09:00:05Z",
@@ -29,7 +30,8 @@
       "turn_seq": 4,
       "turns_so_far": 4,
       "step_id": "judge-1"
-    }
+    },
+    "execution_id": "legacy:step-judge-1:review-1785400940-legacy"
   },
   {
     "ts": "2026-08-20T09:00:06Z",
@@ -45,7 +47,8 @@
     "payload": {
       "total_tokens": 5000,
       "step_id": "judge-1"
-    }
+    },
+    "execution_id": "legacy:step-judge-1:review-1785400940-legacy"
   },
   {
     "ts": "2026-08-20T09:00:07Z",
@@ -58,6 +61,7 @@
     "session_id": "step-judge-1",
     "mission_id": "review-1785400940-legacy",
     "source": "crew_dispatch",
+    "execution_id": "legacy:step-judge-1:review-1785400940-legacy",
     "payload": {
       "step_id": "judge-1"
     }
@@ -75,7 +79,8 @@
     "source": "crew_dispatch",
     "payload": {
       "step_id": "verify-1"
-    }
+    },
+    "execution_id": "legacy:step-verify-1-review-1785400940-legacy:review-1785400940-legacy"
   },
   {
     "ts": "2026-08-20T09:01:04Z",
@@ -92,7 +97,8 @@
       "turn_seq": 2,
       "turns_so_far": 2,
       "step_id": "verify-1"
-    }
+    },
+    "execution_id": "legacy:step-verify-1-review-1785400940-legacy:review-1785400940-legacy"
   },
   {
     "ts": "2026-08-20T09:01:05Z",
@@ -108,7 +114,8 @@
     "payload": {
       "total_tokens": 18000,
       "step_id": "verify-1"
-    }
+    },
+    "execution_id": "legacy:step-verify-1-review-1785400940-legacy:review-1785400940-legacy"
   },
   {
     "ts": "2026-08-20T09:01:06Z",
@@ -121,6 +128,7 @@
     "session_id": "step-verify-1-review-1785400940-legacy",
     "mission_id": "review-1785400940-legacy",
     "source": "crew_dispatch",
+    "execution_id": "legacy:step-verify-1-review-1785400940-legacy:review-1785400940-legacy",
     "payload": {
       "step_id": "verify-1"
     }

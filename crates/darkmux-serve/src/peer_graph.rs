@@ -467,7 +467,7 @@ mod tests {
             .and_then(|s| s.local_addr())
             .ok()
             .map(|a| a.ip())
-            .filter(|ip| !ip.is_loopback() && !ip.is_unspecified())
+            .filter(|ip| !ip.to_canonical().is_loopback() && !ip.is_unspecified())
         else {
             return;
         };

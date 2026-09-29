@@ -348,6 +348,7 @@ pub fn build_machine_scoped_telemetry_record_with(
         handle: display_name,
         phase_id: None,
         session_id: None,
+        execution_id: None,
         source: Some("host".to_string()),
         model: None,
         reasoning: None,

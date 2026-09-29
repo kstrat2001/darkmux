@@ -232,7 +232,7 @@ pub fn select_in_profile(
 
 /// The [`Target`] for an already-selected model.
 pub fn target_for(profile_name: String, profile: Profile, model: ProfileModel) -> Result<Target> {
-    let endpoint = model.endpoint.clone().unwrap_or_default();
+    let endpoint = model.endpoint.clone().unwrap_or_else(ModelEndpoint::managed_lmstudio);
     let kind = endpoint.kind()?;
     let dialect = endpoint.resolved_dialect()?;
     let chat_url = endpoint.chat_url()?;
@@ -281,7 +281,8 @@ mod step_endpoint_tests {
         .unwrap();
         let path = pf.to_str();
         assert!(step_unmanaged_endpoint(&json!({}), path).unwrap().is_none());
-        assert!(step_unmanaged_endpoint(&json!({"endpoint": {}}), path).unwrap().is_none(), "no url: managed");
+        let err = step_unmanaged_endpoint(&json!({"endpoint": {}}), path).unwrap_err();
+        assert!(format!("{err:#}").contains("neither"), "an endpoint of no declared kind is refused: {err:#}");
         assert!(step_unmanaged_endpoint(&json!({"endpoint": {"managed": "lmstudio"}}), path).unwrap().is_none());
         let inline = step_unmanaged_endpoint(&json!({"endpoint": {"url": "https://i.example/v1"}}), path).unwrap();
         assert_eq!(inline.unwrap().url.as_deref(), Some("https://i.example/v1"));
@@ -386,16 +387,6 @@ mod equivalence_tests {
                 n_ctx: Some(65536),
             },
             Row {
-                name: "inline endpoint with no url (reasoning_effort only)",
-                model: r#"{"id":"local-ep","n_ctx":8000,"endpoint":{"reasoning_effort":"high"}}"#,
-                chat_url: "http://127.0.0.1:4321/v1/chat/completions",
-                wire_model: "darkmux:local-ep",
-                managed: true,
-                cap_field: "max_tokens",
-                auth: None,
-                n_ctx: Some(8000),
-            },
-            Row {
                 name: "hosted, api_version (profiles.example.json hosted-frontier)",
                 model: r#"{"id":"gpt-5.1","endpoint":{"url":"https://r.cognitiveservices.azure.com/openai/deployments/d","api_version":"2025-01-01-preview"}}"#,
                 chat_url: "https://r.cognitiveservices.azure.com/openai/deployments/d/chat/completions?api-version=2025-01-01-preview",
@@ -448,8 +439,8 @@ mod equivalence_tests {
         n_ctx: Option<u32>,
     }
 
-    /// Through the one resolver (#2902 step 3): the same rows, observed on
-    /// the consolidated code, must read exactly as they did before it.
+    /// Through the one resolver (#2902 step 3): each row, observed on the
+    /// consolidated code, resolves to the wire facts it lists.
     fn observe(pf: &std::path::Path) -> Observed {
         let role: crate::types::Role = serde_json::from_str(
             r#"{"id":"r","description":"d","tool_palette":{"allow":[],"deny":[]},"escalation_contract":"bail-with-explanation"}"#,
@@ -502,33 +493,19 @@ mod equivalence_tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut failures = Vec::new();
         for row in rows() {
-            let pf = tmp.path().join("profiles.json");
-            std::fs::write(
-                &pf,
-                format!(r#"{{"profiles":{{"p":{{"models":[{}]}}}},"default_profile":"p"}}"#, row.model),
-            )
-            .unwrap();
-            let got = observe(&pf);
-            let want_auth = row.auth.map(|(h, s)| (h.to_string(), s.to_string()));
-            // (#2902 step 4) The same endpoint named by id from an
-            // `endpoints` entry must resolve to the same facts as inline.
+            // The row's model, its endpoint (if any) declared once under
+            // `endpoints` and named by id.
             let mut model: serde_json::Value = serde_json::from_str(row.model).unwrap();
+            let mut registry = serde_json::json!({"default_profile": "p"});
             if let Some(ep) = model.as_object_mut().unwrap().remove("endpoint") {
                 model["endpoint"] = serde_json::json!("e");
-                let named = serde_json::json!({
-                    "profiles": { "p": { "models": [model] } },
-                    "default_profile": "p",
-                    "endpoints": { "e": ep },
-                });
-                let pf_named = tmp.path().join("profiles-named.json");
-                std::fs::write(&pf_named, named.to_string()).unwrap();
-                let by_id = observe(&pf_named);
-                if (by_id.chat_url.as_str(), by_id.wire_model.as_str(), by_id.managed, by_id.cap_field, &by_id.auth, by_id.n_ctx)
-                    != (got.chat_url.as_str(), got.wire_model.as_str(), got.managed, got.cap_field, &got.auth, got.n_ctx)
-                {
-                    failures.push(format!("{} (named by id) resolves differently from inline", row.name));
-                }
+                registry["endpoints"] = serde_json::json!({ "e": ep });
             }
+            registry["profiles"] = serde_json::json!({ "p": { "models": [model] } });
+            let pf = tmp.path().join("profiles.json");
+            std::fs::write(&pf, registry.to_string()).unwrap();
+            let got = observe(&pf);
+            let want_auth = row.auth.map(|(h, s)| (h.to_string(), s.to_string()));
             if got.chat_url != row.chat_url
                 || got.wire_model != row.wire_model
                 || got.managed != row.managed

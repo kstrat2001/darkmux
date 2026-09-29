@@ -507,6 +507,24 @@ describe("deriveLiveState", () => {
     expect(aggregateLiveState([[wait, stopped]], 21_000)).toBeNull();
   });
 
+  // A session that holds several executions (a map's items) reads one live
+  // execution at a time: the running one's records, not the closed sibling's
+  // beats blended into its rate.
+  it("reads the running execution of a session that holds several, without its closed sibling's records", () => {
+    const at = (ms: number) => new Date(ms).toISOString();
+    const rec = (ms: number, action: string, execution: string, payload: Record<string, unknown> = {}) =>
+      norm({ ts: at(ms), action, session_id: SID, execution_id: execution, payload });
+    const closed = [rec(0, "dispatch.start", "exec-a"), rec(1_000, "dispatch.turn.heartbeat", "exec-a", { sampled_at_ms: 1_000, generated_chars: 400, cumulative_chars: 400 }), rec(2_000, "dispatch.complete", "exec-a")];
+    const running = [rec(3_000, "dispatch.start", "exec-b"), rec(4_000, "dispatch.turn.heartbeat", "exec-b", { sampled_at_ms: 4_000, generated_chars: 40, cumulative_chars: 40 })];
+    const sessionStep = norm({ ts: at(2_500), action: "step.start", session_id: SID, payload: {} });
+    const live = liveExecutions([[...closed, sessionStep, ...running]], 5_000);
+    expect(live).toHaveLength(1);
+    expect(live[0].filter((r) => r.execution_id !== undefined).map((r) => r.execution_id)).toEqual(["exec-b", "exec-b"]);
+    // ...and a session's own close still ends the execution under it.
+    const ended = norm({ ts: at(4_500), action: "session.end", session_id: SID, payload: {} });
+    expect(liveExecutions([[...closed, ...running, ended]], 5_000)).toEqual([]);
+  });
+
   // A waiter that died mid-wait writes nothing more. Past its resume time
   // plus the grace the staleness clock runs from there (lifecycle rule 4):
   // live until the policy's window runs out, then not.
@@ -862,8 +880,8 @@ describe("lastHeartbeatMs", () => {
 // (pre-PR review, 2026-09-24) The findings below were each PROVEN on real
 // runs before these tests existed.
 describe("which executions count: live ones only", () => {
-  const rec = (sid: string, atMs: number, action: string, payload: Record<string, unknown> = {}, source?: string): NormRecord =>
-    norm({ ts: new Date(atMs).toISOString(), action, session_id: sid, ...(source ? { source } : {}), payload });
+  const rec = (sid: string, atMs: number, action: string, payload: Record<string, unknown> = {}): NormRecord =>
+    norm({ ts: new Date(atMs).toISOString(), action, session_id: sid, payload });
   const hb = (sid: string, atMs: number, chars: number, turn = 1) =>
     rec(sid, atMs, "dispatch.turn.heartbeat", { sampled_at_ms: atMs, generated_chars: chars, turn_seq: turn });
 
@@ -880,8 +898,8 @@ describe("which executions count: live ones only", () => {
     expect(aggregateTokenRate([resting, live], 5_500)?.tokensPerSec).toBeCloseTo(100, 5);
   });
 
-  it("the mission's own run-grain session (a mission-sourced start) never reads as PROMPT over a stalled execution", () => {
-    const runGrain = [rec("m", 0, "dispatch.start", {}, "mission")];
+  it("the mission's own run-grain session (its run.start) never reads as PROMPT over a stalled execution", () => {
+    const runGrain = [rec("m", 0, "run.start")];
     const stalled = [rec("b", 0, "dispatch.start"), hb("b", 1_000, 0), hb("b", 3_000, 800)];
     expect(aggregateLiveState([runGrain, stalled], 3_000 + 60_000)?.state).toBe("stalled");
   });
@@ -898,7 +916,7 @@ describe("which executions count: live ones only", () => {
   });
 
   it("is null, not PROMPT, when no live execution exists (a mission between model steps)", () => {
-    const runGrain = [rec("m", 0, "dispatch.start", {}, "mission")];
+    const runGrain = [rec("m", 0, "run.start")];
     const finished = [rec("a", 0, "dispatch.start"), hb("a", 1_000, 0), rec("a", 2_000, "dispatch.complete")];
     const lifecycle = [rec("mission-m", 0, "mission.start")];
     expect(aggregateLiveState([runGrain, finished, lifecycle], 10_000)).toBeNull();

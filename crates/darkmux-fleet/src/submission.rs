@@ -233,13 +233,14 @@ impl Refusal {
         match self {
             Refusal::NoTokenConfigured => format!(
                 "{receiver} has no fleet token configured, so it takes no work from other machines \
-                 (the fleet token is the serve token: Keychain item `darkmux-serve-token` or \
-                 DARKMUX_SERVE_TOKEN, the same value on every machine)"
+                 (the fleet token is the serve token: Keychain item `darkmux-serve-token`, read only \
+                 when `serve.token_keychain` is on, or DARKMUX_SERVE_TOKEN; the same value on every machine)"
             ),
             Refusal::Token => format!(
                 "{receiver} refused the request: the fleet token is missing or does not match \
-                 (the serve token: Keychain item `darkmux-serve-token` or DARKMUX_SERVE_TOKEN; \
-                 every machine in the fleet holds the same value)"
+                 (the serve token: Keychain item `darkmux-serve-token`, read only when \
+                 `serve.token_keychain` is on, or DARKMUX_SERVE_TOKEN; every machine in the fleet holds \
+                 the same value)"
             ),
             Refusal::IdentityUnavailable { provider, detail } => format!(
                 "{receiver} cannot tell which machine sent this request ({provider}: {detail}), \
@@ -922,7 +923,8 @@ pub fn submit_work(job: WorkJob, wait: bool) -> Result<SubmissionReply> {
     if !darkmux_flow::serve_token_present() {
         return Err(anyhow!(
             "no fleet token on this machine: submitting work to {target} needs the serve token \
-             (Keychain item `darkmux-serve-token` or DARKMUX_SERVE_TOKEN), the same value {target} holds"
+             (Keychain item `darkmux-serve-token`, read only when `serve.token_keychain` is on, or \
+             DARKMUX_SERVE_TOKEN), the same value {target} holds"
         ));
     }
     let provider = sender_provider()?;
@@ -990,6 +992,17 @@ mod tests {
     use super::*;
     use crate::identity::test_node;
 
+    /// (#2988 review) A machine whose Keychain item exists can still have no
+    /// token, because `serve.token_keychain` is the switch that reads it. The
+    /// no-token sentences name the switch, not only the item.
+    #[test]
+    fn the_no_token_sentence_names_the_switch_that_reads_the_keychain() {
+        let said = Refusal::NoTokenConfigured.reason("studio");
+        assert!(said.contains("serve.token_keychain"), "{said}");
+        let said = Refusal::Token.reason("studio");
+        assert!(said.contains("serve.token_keychain"), "{said}");
+    }
+
     fn entry(node_id: Option<&str>, profiles: &[&str], workspace: bool) -> AcceptWorkEntry {
         AcceptWorkEntry {
             node_id: node_id.map(str::to_string),
@@ -1017,7 +1030,6 @@ mod tests {
             session_id: crate::test_session("s-1"),
             profile: profile.map(str::to_string),
             workdir: None,
-            phase_id: None,
             image: None,
             timeout_seconds: 60,
             published_at_unix_ms: 1,
@@ -1343,7 +1355,9 @@ mod tests {
     }
 
     fn registry(json: &str) -> darkmux_types::ProfileRegistry {
-        serde_json::from_str(json).unwrap()
+        let mut r: darkmux_types::ProfileRegistry = serde_json::from_str(json).unwrap();
+        r.materialize_endpoints();
+        r
     }
 
     fn role() -> darkmux_crew::types::Role {
@@ -1364,7 +1378,7 @@ mod tests {
                 "host":{"models":[{"id":"big","n_ctx":32000}]},
                 "utility":{"models":[{"id":"small","n_ctx":8000}]}},
               "default_profile":"host",
-              "internal":{"utility":"small"}}"#,
+              "internal":{"utility":{"id":"small"}}}"#,
         );
         let r = role();
         assert_eq!(classify_profile(&reg, &r, Some("host"), None, "studio"), work("host"));
@@ -1383,7 +1397,8 @@ mod tests {
         let reg = registry(
             r#"{"profiles":{
                 "host":{"models":[{"id":"big","n_ctx":32000}]},
-                "cloud":{"models":[{"id":"gpt-x","n_ctx":32000,"endpoint":{"url":"https://api.example/v1"}}]}},
+                "cloud":{"models":[{"id":"gpt-x","n_ctx":32000,"endpoint":"api"}]}},
+              "endpoints":{"api":{"url":"https://api.example/v1"}},
               "default_profile":"host"}"#,
         );
         let r = role();

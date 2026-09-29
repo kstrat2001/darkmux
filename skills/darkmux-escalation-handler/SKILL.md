@@ -14,7 +14,7 @@ This skill picks up where a local-tier dispatch left off when it hit an operator
 You're looking at one of:
 
 - A `darkmux lab run` or `darkmux dispatch` that ended with `result: "escalation_compaction_limit_reached"`, `result: "escalation_cumulative_tokens_exceeded"`, `result: "escalation_intra_turn_stall_exhausted"`, `result: "escalation_generation_checkpoint_budget_exhausted"` (#2171 — a turn that kept hitting the generation check-in without converging), `result: "escalation_malformed_tool_calls"` (#2169 — 3 consecutive turns where every tool call named something that wasn't a real, granted tool, so nothing dispatched), or `result: "escalation_empty_tool_calls"` (#2190 — a turn kept returning `finish_reason=tool_calls` with NO tool calls; a protocol-shaped model/parser miss, not a reasoning loop). All escalation results share the `escalation_*` prefix; future variants will too.
-- A run manifest under `~/.darkmux/runs/<run-id>/manifest.json` whose `ok: false` carries an escalation-shaped error string.
+- A run manifest under `~/.darkmux/lab/<run-id>/manifest.json` whose `ok: false` carries an escalation-shaped error string.
 - A flow record on the topology viewer with `terminal_reason: EscalationTriggered`.
 
 If the dispatch ended with `result: "stop"` (clean finish) or `result: "max_turns"` (loop cap, not escalation), this is the WRONG skill — those don't trigger handoff.
@@ -32,7 +32,7 @@ The operator (or the topology viewer) will give you a run id. Find the artifacts
 
 ```bash
 RUN_ID=<from operator>
-RUN_DIR=~/.darkmux/runs/$RUN_ID
+RUN_DIR=~/.darkmux/lab/$RUN_ID
 ls -la $RUN_DIR
 cat $RUN_DIR/manifest.json | jq '.'
 ```
@@ -96,15 +96,6 @@ Some operator-facing principles:
 - **You're not slower than local tier; you're slower-and-smarter.** Operator escalated specifically so a more capable layer takes over. Don't try to act like a 4B utility agent; act like the frontier-tier orchestrator you are.
 - **Verify before declaring done.** Whatever the operator's `verify_criteria` was on the workload, run it (or have the operator run it) before reporting success.
 - **Preserve the escalation trail.** When the work is done, mention in your reply where the run-dir is and how the work post-escalation differed from what local-tier had done — this is the lab signal that future tuning depends on.
-
-## Pause-posture roles (escalation_posture: pause)
-
-A role manifest can declare `escalation_posture: "pause"` (instead of the default `"auto"`). Today the runtime treats both the same — it emits the EscalationTriggered terminal regardless. The host/skill layer is where the distinction kicks in:
-
-- **auto** (default): you should proceed with Step 4-5 above. The operator wanted automatic handoff; that's what they set the role up for.
-- **pause**: you should STOP at Step 4. Don't propose to continue. Just summarize what local tier did + what's left. The operator wants to make the next-step decision themselves. Wait for their signal.
-
-This is operator-sovereignty applied to the escalation hand-off: some work is too judgment-bearing to auto-continue (research roles, financial-decision roles, anything where the operator wants the explicit yes/no before more work happens).
 
 ## When the trail is cold
 

@@ -815,7 +815,7 @@ mod tests {
             FinalizeRefusal::Drift
         );
         assert_eq!(
-            classify_mission_close_refusal(Some(MissionStatus::Paused)),
+            classify_mission_close_refusal(Some(MissionStatus::Aborted)),
             FinalizeRefusal::Drift
         );
         // Unknown status (mission unreadable) is loud.
@@ -826,7 +826,7 @@ mod tests {
     /// ([`darkmux_types::test_isolation::IsolatedState`]), which pins
     /// EVERY darkmux write destination under a single throwaway root.
     ///
-    /// It used to pin two variables by hand — `DARKMUX_CREW_DIR` and
+    /// It used to pin two variables by hand — `DARKMUX_HOME` and
     /// `DARKMUX_FLOWS_DIR` — which is the per-variable pattern that
     /// produced this bug class: each guard knows about the destinations
     /// whose leak somebody already noticed and is silent about the rest,
@@ -857,7 +857,6 @@ mod tests {
             created_ts: 1_700_000_000,
             started_ts: Some(1_700_000_000),
             finalized_ts: None,
-            paused_ts: None,
             source_input: None,
             ticket: None,
             spec: None,

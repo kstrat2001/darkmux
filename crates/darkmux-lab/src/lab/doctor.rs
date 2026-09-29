@@ -33,11 +33,9 @@ impl DoctorReport {
 }
 
 pub fn lab_doctor() -> Result<DoctorReport> {
-    // (#2613) FORCED to the home (user) tier, matching every other registry
-    // consumer (`fixture_cli`'s register/unregister/list, and
-    // `resolve_source_sandbox`'s dispatch-time lookup) — never `Auto`, or
-    // doctor could report a different registry than the one a dispatch (or
-    // `lab fixture list`) actually consults from the same directory.
+    // The same root every other registry consumer resolves (`fixture_cli`'s
+    // register/unregister/list, and `resolve_source_sandbox`'s dispatch-time
+    // lookup), so doctor reports the registry a dispatch actually consults.
     let paths = paths::resolve(ResolveScope::ForceUser);
     let reg_path = default_registry_path(&paths);
     let mut report = DoctorReport::default();

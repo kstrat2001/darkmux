@@ -47,7 +47,7 @@
         // (#2632, #2268) Embedded-only load via `builtin_role` — this test
         // asserts a property of the BUILTIN manifest, never a user
         // override, so it must not pay for (or race) `load_roles()`'s
-        // DARKMUX_CREW_DIR/DARKMUX_HOME merge.
+        // DARKMUX_HOME.
         let role = builtin_role("pr-reviewer-agentic")
             .expect("pr-reviewer-agentic builtin role parses")
             .expect("pr-reviewer-agentic must be embedded");
@@ -99,8 +99,8 @@
         // (#2632, #2268) Embedded-only load via `builtin_role`, not
         // `load_roles()` — this test asserts properties of the BUILTIN
         // dialectic-seat manifests only, so it has no reason to touch
-        // `DARKMUX_CREW_DIR`/`DARKMUX_HOME` at all. Before this fix it
-        // raced any other test's transient override of either var:
+        // `DARKMUX_HOME` at all. Before this fix it
+        // raced any other test's transient override of that var:
         // `serial_test::serial` only serializes tests that carry it, and
         // this one carried nothing — it once observed a `TempDir` another,
         // unrelated test had already dropped and deleted.
@@ -399,7 +399,7 @@
         }
     }
 
-    /// RAII guard that points `DARKMUX_CREW_DIR` at a TempDir for the test's
+    /// RAII guard that points `DARKMUX_HOME` at a TempDir for the test's
     /// duration, then restores the previous value (or unsets it) on drop.
     /// Uses the existing env-var hook in `load_roles` rather than mutating
     /// the process cwd — cwd mutation crashes follow-up tests when the
@@ -411,9 +411,9 @@
 
     impl CrewDirGuard {
         fn new(tmp: TempDir) -> Self {
-            let prev = env::var("DARKMUX_CREW_DIR").ok();
+            let prev = env::var("DARKMUX_HOME").ok();
             // SAFETY: serialized via #[serial_test::serial] on every caller.
-            unsafe { env::set_var("DARKMUX_CREW_DIR", tmp.path()); }
+            unsafe { env::set_var("DARKMUX_HOME", tmp.path()); }
             Self { prev, _tmp: tmp }
         }
 
@@ -427,8 +427,8 @@
             // SAFETY: serialized via #[serial_test::serial] on every caller.
             unsafe {
                 match &self.prev {
-                    Some(v) => env::set_var("DARKMUX_CREW_DIR", v),
-                    None => env::remove_var("DARKMUX_CREW_DIR"),
+                    Some(v) => env::set_var("DARKMUX_HOME", v),
+                    None => env::remove_var("DARKMUX_HOME"),
                 }
             }
         }
@@ -445,7 +445,6 @@
             escalation_contract: EscalationContract::BailWithExplanation,
             prompt_path: None,
             bail_after_compactions: None,
-            escalation_posture: None,
             role_family: None,
             feedback_templates: None,
         };

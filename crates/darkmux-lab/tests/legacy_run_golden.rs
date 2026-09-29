@@ -50,7 +50,7 @@ fn a_run_with_a_stale_metrics_json_reports_its_trajectory_totals() {
     let flows = tempfile::TempDir::new().unwrap();
     let stats = compute_from_dir(&dir, flows.path()).unwrap();
     let want = expected(&dir);
-    assert_eq!(stats.turns, want["turns"].as_u64().unwrap(), "lab run stats reads the same fold");
+    assert_eq!(stats.turns, want["turns"].as_u64().unwrap(), "run stats reads the same fold");
     assert_eq!(stats.completion_tokens, want["completion_tokens"].as_u64().unwrap());
     assert_eq!(stats.rest_ms, want["rest_ms"].as_u64().unwrap());
 }

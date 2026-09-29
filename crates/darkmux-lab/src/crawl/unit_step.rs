@@ -157,11 +157,11 @@ pub const UNIT_OUTCOME_SCHEMA_VERSION: &str = "1.1";
 /// (#2302) ONE finding a unit's dispatch recorded, named by the key its
 /// store answers to — the address a FOLLOW-ON step hands to `brief_refs`.
 ///
-/// The key is `<dispatch session id>/<emit_seq>`, exactly the form
+/// The key is `<execution id>/<emit_seq>`, exactly the form
 /// [`darkmux_crew::findings::parse_key`] splits and
-/// [`darkmux_crew::findings::load_at`] resolves: the unit's dispatch owns
-/// the session id, and `emit_seq` is the 1-based ordinal of the acceptance
-/// within that dispatch, which is the finding file's own non-empty-line
+/// [`darkmux_crew::findings::load_at`] resolves: the unit's dispatch is one
+/// execution, and `emit_seq` is the 1-based ordinal of the acceptance
+/// within it, which is the finding file's own non-empty-line
 /// ordinal (the runtime writes `emit_seq = count + 1` after appending).
 /// Nothing is re-derived from the model's prose — `file`/`line`/`rule` are
 /// copied off the record the crawl already stamps, so this carries no
@@ -170,7 +170,7 @@ pub const UNIT_OUTCOME_SCHEMA_VERSION: &str = "1.1";
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct FindingRef {
-    /// `<dispatch>/<seq>` — the finding store's key.
+    /// `<execution>/<seq>` — the finding store's key.
     pub key: String,
     /// The same key with `/` replaced by `-`. A grown task's id suffix
     /// becomes part of a task id and a step id, and `/` in either would
@@ -705,14 +705,17 @@ fn readback_findings(
     into: &Path,
     model: Option<&str>,
     session: &SessionId,
+    execution: Option<&darkmux_types::execution_id::ExecutionId>,
 ) -> (usize, Vec<FindingRef>) {
     let Some(body) = darkmux_crew::dispatch_internal::read_out_dir_text(out_dir, ".darkmux-runtime/findings.jsonl") else {
         return (0, Vec::new());
     };
-    // (#2302) A key's dispatch half becomes a path segment under the
-    // finding store: a session's wire string always is one (its grammar
-    // keeps it inside `[A-Za-z0-9._-]` and never leading with `.`).
+    // (#2302) A key's execution half becomes a path segment under the
+    // finding store, and the tailer filed each finding under the id of the
+    // execution that recorded it. A dispatch no execution produced has no
+    // key to name: its findings are counted and never addressed.
     let session_id = session.wire();
+    let execution_key = execution.map(darkmux_types::execution_id::ExecutionId::to_string);
     let mut refs: Vec<FindingRef> = Vec::new();
     let mut found = 0usize;
     let mut buf = String::new();
@@ -747,15 +750,17 @@ fn readback_findings(
             if let Some(m) = model {
                 obj.insert("model".to_string(), json!(m));
             }
-            let key = format!("{session_id}/{seq}");
-            refs.push(FindingRef {
-                id: key.replace('/', "-"),
-                key,
-                file: obj.get(FINDING_FILE_KEY).and_then(Value::as_str).map(str::to_string),
-                line: obj.get("line").and_then(Value::as_u64),
-                rule: rule_id.clone(),
-                tree_root: ctx.tree_root.display().to_string(),
-            });
+            if let Some(execution_key) = &execution_key {
+                let key = format!("{execution_key}/{seq}");
+                refs.push(FindingRef {
+                    id: key.replace('/', "-"),
+                    key,
+                    file: obj.get(FINDING_FILE_KEY).and_then(Value::as_str).map(str::to_string),
+                    line: obj.get("line").and_then(Value::as_u64),
+                    rule: rule_id.clone(),
+                    tree_root: ctx.tree_root.display().to_string(),
+                });
+            }
         }
         buf.push_str(&serde_json::to_string(&rec).unwrap_or_default());
         buf.push('\n');
@@ -1555,6 +1560,7 @@ impl StepKind for CrawlUnitStepKind {
             // Both counts read the dispatch's own fold of its trajectory,
             // never the model-writable out-dir.
             let out_dir = outcome.as_ref().ok().and_then(|r| r.out_dir.clone());
+            let execution = outcome.as_ref().ok().and_then(|r| r.execution.clone());
             let fold = outcome.as_ref().ok().and_then(|r| r.trajectory.as_ref());
             if result == "stop" && fold.is_some_and(|f| unit_hit_no_progress_bound(f, cfg.no_progress_turns)) {
                 result = UNIT_BUDGET_EXHAUSTED.to_string();
@@ -1572,7 +1578,7 @@ impl StepKind for CrawlUnitStepKind {
                 run_dir.join(format!("{rule_dir}.{}.findings.jsonl.d{}", ctx.unit_id, draw + 1))
             };
             let (findings, finding_refs) = match &out_dir {
-                Some(d) => readback_findings(&ctx, d, &readback_into, model.as_deref(), &draw_session_id),
+                Some(d) => readback_findings(&ctx, d, &readback_into, model.as_deref(), &draw_session_id, execution.as_ref()),
                 None => (0, Vec::new()),
             };
 

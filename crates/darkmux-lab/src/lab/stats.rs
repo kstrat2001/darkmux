@@ -687,7 +687,7 @@ fn telemetry_coverage(samples: &[Sample], from: u64, to: u64) -> Coverage {
 /// configured flow directory for host telemetry.
 ///
 /// Resolution is [`crate::lab::inspect::resolve_run_dir`] — the same one
-/// `lab run inspect` uses, so `stats` and `inspect` can never disagree about
+/// `run inspect` uses, so `stats` and `inspect` can never disagree about
 /// which run they are describing.
 pub fn run_stats(run: &str) -> Result<RunStats> {
     let dir = crate::lab::inspect::resolve_run_dir(run);

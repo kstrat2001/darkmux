@@ -74,11 +74,25 @@ export function runStatusLabel(r: Run): string {
 /** viewer.html: `function runSubtitle(r, showMachine)`. */
 export function runSubtitle(r: Run, showMachine: boolean): string {
   const bits: string[] = [];
+  if (r.workload) bits.push(r.workload);
+  const verify = verifyLabel(r);
+  if (verify) bits.push(verify);
   if (r.role) bits.push(r.role);
   if (r.model) bits.push(shortModel(r.model));
   if (r.route) bits.push(`via ${r.route}`);
   if (showMachine && r.machine) bits.push(r.machine);
   return bits.join(" · ");
+}
+
+/** A lab row's verify outcome, in three states (#2494): what the workload's
+ * own tests said is a different fact from how the dispatch ended (`status`).
+ * The twin of `src/run_list.rs::verify_label`. A lab run with no manifest yet
+ * names no workload, and says nothing about verify. */
+function verifyLabel(r: Run): string | null {
+  if (r.kind !== "lab") return null;
+  if (r.verify_passed === true) return "verify pass";
+  if (r.verify_passed === false) return "verify FAIL";
+  return r.workload ? "verify \u2014" : null;
 }
 
 /** viewer.html: `function runsMultiMachine()`, generalized to take the runs

@@ -33,6 +33,7 @@
 //! disk-scanning wrapper ([`records_emitted_for_mission`]) around it.
 
 use darkmux_flow::{FlowAction, FlowRecord};
+use darkmux_types::execution_id::ExecutionId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -68,24 +69,20 @@ pub struct RecordsEmitted {
     /// with, not the record re-serialized by this reader.
     #[serde(default)]
     pub total_bytes: u64,
-    /// Sum of (terminal ts − start ts) over the mission's own dispatch
-    /// bookend pairs, paired by `session_id`. Excludes the LAUNCH's own
-    /// wrapper liveness bookend (`source == "mission"` —
-    /// `mission_bookend_record` in `src/mission_launch.rs`, opened around
-    /// the whole `launch()` call and closed only after finalize returns):
-    /// that bookend is liveness for the launch invocation, not seat work,
-    /// and counting it would inflate this field by the mission's entire
-    /// wall time every time (it always reads as OPEN at aggregation time,
-    /// since finalize runs strictly before the wrapper's own terminal
-    /// record is written). An unpaired ("open") seat dispatch — including
+    /// Sum of (terminal ts − start ts) over the mission's own execution
+    /// bookend pairs (`dispatch.*`), paired by `execution_id`. The run's own
+    /// bookend (`run.*`, opened around the whole `launch()` call and closed
+    /// only after finalize returns) is a different grain and never pairs
+    /// here: counting it would add the mission's whole wall time, still
+    /// open when finalize runs. An unpaired ("open") seat dispatch — including
     /// one superseded by a second `dispatch start` on the same
-    /// `session_id` before ever seeing a terminal — counts to the
+    /// `execution_id` before ever seeing a terminal — counts to the
     /// finalize-time clock passed to [`aggregate_records_emitted`]; see
     /// `open_dispatches`.
     #[serde(default)]
     pub dispatch_seconds: f64,
     /// Count of dispatch bookend pairs actually matched (a `dispatch
-    /// start` paired with a later terminal on the same `session_id`) —
+    /// start` paired with a later terminal of the same `execution_id`) —
     /// contributes to `dispatch_seconds`. Distinguishes "zero dispatch
     /// seconds because there were no dispatches" (`dispatch_pairs == 0 &&
     /// open_dispatches == 0`) from "zero because every one is still open"
@@ -96,11 +93,10 @@ pub struct RecordsEmitted {
     /// credited to `dispatch_seconds` via the finalize-time clock rather
     /// than dropped. Includes both a start still open when the scan ends
     /// AND an earlier start superseded by a second `dispatch start` on the
-    /// same `session_id` (flushed to finalize time at the moment of the
+    /// same `execution_id` (flushed to finalize time at the moment of the
     /// second start, since no later terminal can retroactively close it).
-    /// The launch's own wrapper bookend is EXCLUDED from this count too
-    /// (see `dispatch_seconds`'s doc) — it never reaches `open_dispatches`
-    /// even though it always reads as unterminated at aggregation time.
+    /// The run's own bookend is not an execution and never counts here (see
+    /// `dispatch_seconds`'s doc), though it is still open at aggregation.
     #[serde(default)]
     pub open_dispatches: u64,
     /// Last record ts − first record ts, over this mission's own records
@@ -203,22 +199,20 @@ const DAY_MARGIN_DAYS: i64 = 1;
 /// finalize-time clock, used to close an OPEN dispatch bookend (a `dispatch
 /// start` with no matching terminal) at "now" rather than dropping it.
 ///
-/// Bookends pair by `session_id`, matched on [`darkmux_flow::FlowAction`];
-/// a pre-4.0 spaced spelling reads as the same action (#2425).
+/// Execution bookends (`dispatch.*`) pair by `execution_id`, matched on
+/// [`darkmux_flow::FlowAction`]; a pre-4.0 spaced spelling reads as the same
+/// action (#2425).
 ///
-/// **The launch's own wrapper bookend is excluded from pairing (#2426 round
-/// 2 MF1).** `mission_bookend_record` (`src/mission_launch.rs`) opens a
-/// `source == "mission"` `dispatch start`/`dispatch complete` pair around
-/// the WHOLE `launch()` call, and `finalize_mission_with_payload` runs
-/// strictly INSIDE that pair — so at aggregation time the wrapper's own
-/// start is always still open, and treating it like a seat dispatch would
-/// credit the mission's entire wall time into `dispatch_seconds` on every
-/// finalize. A record with `source == Some("mission")` still counts toward
-/// `total_records`/`by_action`/the wall window/the machine_uid resolution —
-/// it's a real record this mission emitted — it just never opens or closes
-/// a bookend pair.
+/// **The run's own bookend never pairs (#2426 round 2 MF1, contract 8).**
+/// `launch` opens `run.start` around the WHOLE run and
+/// `finalize_mission_with_payload` runs strictly inside it, so it is still
+/// open here; it is a run, not a seat's execution. It still counts toward
+/// `total_records`/`by_action`/the wall window/the machine_uid resolution.
+/// A pre-4.0 archive's whole-run `dispatch start` (`source: "mission"`)
+/// reads as `run.start` through [`darkmux_flow::reader`], so it never pairs
+/// either.
 ///
-/// **A repeated `dispatch start` on the same `session_id` with no terminal
+/// **A repeated `dispatch start` on the same `execution_id` with no terminal
 /// in between** does not silently overwrite the earlier one: the earlier
 /// segment is flushed to `finalize_secs` (same treatment as a genuinely
 /// open dispatch — see `RecordsEmitted::open_dispatches`'s doc) before the
@@ -239,7 +233,7 @@ pub fn aggregate_records_emitted(lines: &[(FlowRecord, u64)], mission_id: &str, 
     let mut first_ts: Option<i64> = None;
     let mut last_ts: Option<i64> = None;
     let mut machine_uid: Option<String> = None;
-    let mut open_starts: BTreeMap<String, i64> = BTreeMap::new();
+    let mut open_starts: BTreeMap<ExecutionId, i64> = BTreeMap::new();
     let mut dispatch_seconds: f64 = 0.0;
     let mut dispatch_pairs: u64 = 0;
     let mut open_dispatches: u64 = 0;
@@ -261,26 +255,20 @@ pub fn aggregate_records_emitted(lines: &[(FlowRecord, u64)], mission_id: &str, 
             machine_uid = rec.machine_uid.clone();
         }
 
-        // The launch's own liveness wrapper never opens/closes a bookend
-        // pair — see this function's doc.
-        let is_wrapper_bookend = rec.source.as_deref() == Some("mission");
-        if is_wrapper_bookend {
-            continue;
-        }
-
         if rec.action == FlowAction::DispatchStart {
-            if let (Some(sid), Some(ts)) = (rec.session_id.clone(), ts) {
-                if let Some(prev_start) = open_starts.insert(sid, ts) {
-                    // A repeat start for this session with no terminal in
-                    // between — flush the EARLIER segment to finalize time
-                    // rather than losing it to the overwrite.
+            if let (Some(execution), Some(ts)) = (rec.execution_id.clone(), ts) {
+                if let Some(prev_start) = open_starts.insert(execution, ts) {
+                    // A repeat start for this execution with no terminal in
+                    // between (a resumed dispatch) — flush the EARLIER
+                    // segment to finalize time rather than losing it to the
+                    // overwrite.
                     dispatch_seconds += (finalize_secs - prev_start).max(0) as f64;
                     open_dispatches += 1;
                 }
             }
         } else if matches!(rec.action, FlowAction::DispatchComplete | FlowAction::DispatchError) {
-            if let Some(sid) = &rec.session_id {
-                if let Some(start_ts) = open_starts.remove(sid) {
+            if let Some(execution) = &rec.execution_id {
+                if let Some(start_ts) = open_starts.remove(execution) {
                     dispatch_pairs += 1;
                     if let Some(ts) = ts {
                         dispatch_seconds += (ts - start_ts).max(0) as f64;
@@ -425,9 +413,7 @@ mod tests {
 
     /// Minimal `FlowRecord` builder — every field the aggregation ignores
     /// gets a neutral default, keeping each test's literal focused on the
-    /// fields the assertion actually cares about. `source` defaults to
-    /// `None` (a seat dispatch); use [`rec_src`] for a test that needs to
-    /// name the launch wrapper's `source == "mission"`.
+    /// fields the assertion actually cares about.
     fn rec(
         ts: &str,
         action: darkmux_flow::FlowAction,
@@ -435,19 +421,8 @@ mod tests {
         session_id: Option<&str>,
         machine_uid: Option<&str>,
     ) -> FlowRecord {
-        rec_src(ts, action, mission_id, session_id, machine_uid, None)
-    }
-
-    /// [`rec`] with an explicit `source` — for the wrapper-bookend-exclusion
-    /// tests (#2426 round 2 MF1), which need `source == Some("mission")`.
-    fn rec_src(
-        ts: &str,
-        action: darkmux_flow::FlowAction,
-        mission_id: Option<&str>,
-        session_id: Option<&str>,
-        machine_uid: Option<&str>,
-        source: Option<&str>,
-    ) -> FlowRecord {
+        let execution_id = (action.grain() == Some(darkmux_flow::Grain::Execution))
+            .then(|| darkmux_types::execution_id::ExecutionId::legacy(session_id, mission_id, ts, "role", ""));
         FlowRecord {
             ts: ts.to_string(),
             level: darkmux_flow::Level::Info,
@@ -458,7 +433,9 @@ mod tests {
             handle: "role".to_string(),
             phase_id: None,
             session_id: session_id.map(String::from),
-            source: source.map(String::from),
+            // What the reader gives a record of an execution that names none.
+            execution_id,
+            source: None,
             model: None,
             reasoning: None,
             mission_id: mission_id.map(String::from),
@@ -479,6 +456,28 @@ mod tests {
 
     // ── aggregate_records_emitted — pure core ───────────────────────────
 
+    /// Two executions in one session (a map's items) pair each with its own
+    /// terminal, whatever order they interleave in: they are two executions,
+    /// not one session flushed by its own second start.
+    #[test]
+    fn executions_sharing_a_session_pair_by_execution_not_by_session() {
+        let named = |ts: &str, action, exec: &str| {
+            let mut r = rec(ts, action, Some("m1"), Some("m1.task.t"), None);
+            r.execution_id = Some(darkmux_types::execution_id::ExecutionId::parse(exec).unwrap());
+            line(r)
+        };
+        use darkmux_flow::FlowAction as A;
+        let lines = vec![
+            named("2023-11-14T10:00:00Z", A::DispatchStart, "exec-a"),
+            named("2023-11-14T10:00:02Z", A::DispatchStart, "exec-b"),
+            named("2023-11-14T10:00:05Z", A::DispatchComplete, "exec-b"),
+            named("2023-11-14T10:00:10Z", A::DispatchComplete, "exec-a"),
+        ];
+        let got = aggregate_records_emitted(&lines, "m1", 0);
+        assert_eq!((got.dispatch_pairs, got.open_dispatches), (2, 0), "{got:?}");
+        assert_eq!(got.dispatch_seconds, 13.0, "a: 10s, b: 3s");
+    }
+
     #[test]
     fn counts_only_the_target_missions_records_from_an_interleaved_file() {
         let lines = vec![
@@ -498,7 +497,7 @@ mod tests {
     }
 
     #[test]
-    fn bookends_pair_by_session_id() {
+    fn bookends_pair_by_execution_id() {
         let lines = vec![
             line(rec("2023-11-14T10:00:00Z", darkmux_flow::FlowAction::DispatchStart, Some("m1"), Some("s1"), None)),
             line(rec("2023-11-14T10:00:10Z", darkmux_flow::FlowAction::DispatchComplete, Some("m1"), Some("s1"), None)),
@@ -523,46 +522,61 @@ mod tests {
         parse_ts_secs(ts).unwrap()
     }
 
-    // ── wrapper-bookend exclusion + repeated starts (#2426 round 2 MF1/(3)) ──
+    // ── the run bookend never pairs + repeated starts (#2426 round 2 MF1/(3)) ──
 
     #[test]
-    fn an_open_wrapper_bookend_is_excluded_from_pairing_a_seat_dispatch_left_open_is_not() {
+    fn an_open_run_bookend_is_not_an_execution_a_seat_dispatch_left_open_is() {
         let finalize_secs = parse_ts_secs_pub("2023-11-14T11:00:00Z");
         let lines = vec![
-            // The launch's OWN liveness wrapper — session_id == mission_id
-            // in production (`mission_bookend_record`), open the whole
-            // time finalize runs. Must contribute NOTHING to
-            // dispatch_seconds/open_dispatches.
-            line(rec_src("2023-11-14T10:00:00Z", darkmux_flow::FlowAction::DispatchStart, Some("m1"), Some("m1"), None, Some("mission"))),
+            // The run's own bookend, open the whole time finalize runs.
+            // Must contribute NOTHING to dispatch_seconds/open_dispatches.
+            line(rec("2023-11-14T10:00:00Z", darkmux_flow::FlowAction::RunStart, Some("m1"), Some("m1.run"), None)),
             // A real seat dispatch, also left open (no terminal).
             line(rec("2023-11-14T10:30:00Z", darkmux_flow::FlowAction::DispatchStart, Some("m1"), Some("s-seat"), None)),
         ];
         let got = aggregate_records_emitted(&lines, "m1", finalize_secs);
-        // Only the seat dispatch's 30 minutes counts — NOT the wrapper's
-        // full 60 minutes on top of it.
-        assert_eq!(got.dispatch_seconds, 1800.0, "wrapper excluded, only the seat dispatch's open segment counts");
-        assert_eq!(got.open_dispatches, 1, "the wrapper must not appear here at all");
+        // Only the seat dispatch's 30 minutes counts, not the run's 60.
+        assert_eq!(got.dispatch_seconds, 1800.0, "only the seat dispatch's open segment counts");
+        assert_eq!(got.open_dispatches, 1, "the run must not appear here at all");
         assert_eq!(got.dispatch_pairs, 0);
-        // The wrapper record still counts as a real record of this mission.
+        // The run record still counts as a real record of this mission.
         assert_eq!(got.total_records, 2);
-        assert_eq!(got.by_action.get("dispatch.start"), Some(&2));
+        assert_eq!(got.by_action.get("run.start"), Some(&1));
+        assert_eq!(got.by_action.get("dispatch.start"), Some(&1));
     }
 
     #[test]
-    fn a_wrapper_bookend_pair_never_becomes_a_dispatch_pair_either() {
-        // Even when the wrapper's terminal DOES land in the same scan (a
-        // re-finalize reading a day file written after the launch fully
-        // returned), it must not be counted as a dispatch pair — it is
-        // liveness, not seat work.
+    fn a_run_bookend_pair_never_becomes_a_dispatch_pair_either() {
+        // Even when the run's terminal lands in the same scan (a
+        // re-finalize after the launch returned), it is not seat work.
         let lines = vec![
-            line(rec_src("2023-11-14T10:00:00Z", darkmux_flow::FlowAction::DispatchStart, Some("m1"), Some("m1"), None, Some("mission"))),
-            line(rec_src("2023-11-14T11:00:00Z", darkmux_flow::FlowAction::DispatchComplete, Some("m1"), Some("m1"), None, Some("mission"))),
+            line(rec("2023-11-14T10:00:00Z", darkmux_flow::FlowAction::RunStart, Some("m1"), Some("m1.run"), None)),
+            line(rec("2023-11-14T11:00:00Z", darkmux_flow::FlowAction::RunComplete, Some("m1"), Some("m1.run"), None)),
         ];
         let got = aggregate_records_emitted(&lines, "m1", 0);
         assert_eq!(got.dispatch_pairs, 0);
         assert_eq!(got.dispatch_seconds, 0.0);
         assert_eq!(got.open_dispatches, 0);
         assert_eq!(got.total_records, 2, "still real records of this mission");
+    }
+
+    /// A pre-4.0 archive's whole-run bookend (`dispatch start` sourced
+    /// `mission`) is read the way the disk path reads every line, through
+    /// `darkmux_flow::reader`, and never pairs.
+    #[test]
+    fn a_pre_4_0_whole_run_bookend_read_from_an_archive_never_pairs() {
+        let archived = |ts: &str, action: &str| {
+            let raw = format!(
+                r#"{{"ts":"{ts}","level":"info","category":"work","tier":"local","stage":"dispatch","action":"{action}","handle":"review","mission_id":"m1","session_id":"m1","source":"mission"}}"#
+            );
+            line(darkmux_flow::reader::parse_record(&raw).expect("an archived bookend parses"))
+        };
+        // flow-action-guard:allow-start — pre-4.0 spellings are this test's input
+        let lines = vec![archived("2023-11-14T10:00:00Z", "dispatch start"), archived("2023-11-14T11:00:00Z", "dispatch complete")];
+        // flow-action-guard:allow-end
+        let got = aggregate_records_emitted(&lines, "m1", 0);
+        assert_eq!((got.dispatch_pairs, got.open_dispatches), (0, 0));
+        assert_eq!(got.by_action.get("run.start"), Some(&1));
     }
 
     #[test]
@@ -887,6 +901,7 @@ mod cost_check {
                     handle: "coder".to_string(),
                     phase_id: None,
                     session_id: session,
+                    execution_id: None,
                     source: None,
                     model: None,
                     reasoning: None,

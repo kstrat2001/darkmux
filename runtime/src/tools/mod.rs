@@ -2240,7 +2240,7 @@ y = 2
         assert!(m.contains("`sess-x/3`"), "the key the host will file this under: {m}");
         assert!(m.contains("create_mod"), "and what it is FOR: {m}");
         assert!(m.contains("3 finding(s) so far, 17 remaining"), "budget back-pressure kept: {m}");
-        // A host that passed no --session-id gets the pre-#2386 wording
+        // A host that passed no --execution-id gets the pre-#2386 wording
         // rather than an invented key.
         let none = recorded_finding_message(None, 1, 19);
         assert!(none.starts_with("Recorded. "), "{none}");
@@ -2248,7 +2248,7 @@ y = 2
     }
 
     /// The key form MUST equal the host's own
-    /// `findings::build_record` -> `format!("{session_id}/{seq}")`. A key the
+    /// `findings::build_record` -> `format!("{execution_id}/{seq}")`. A key the
     /// model is told to use that the store files elsewhere is worse than none.
     #[test]
     fn the_key_form_is_session_slash_seq() {
@@ -2362,10 +2362,10 @@ y = 2
     /// silent fallback is what makes a host/image version mismatch present
     /// as "mods link to nothing" with no way back to the cause.
     #[test]
-    fn a_dispatch_with_no_session_id_says_so_and_one_with_an_id_stays_quiet() {
+    fn a_dispatch_with_no_execution_id_says_so_and_one_with_an_id_stays_quiet() {
         let notice = leniency_notice(None).expect("the degraded mode announces itself");
         assert!(notice.starts_with("[darkmux-runtime]"), "{notice}");
-        assert!(notice.contains("--session-id") && notice.contains("Upgrade"), "{notice}");
+        assert!(notice.contains("--execution-id") && notice.contains("Upgrade"), "{notice}");
         assert_eq!(leniency_notice(Some("step-x")), None, "a grounded dispatch says nothing");
     }
 
@@ -3200,7 +3200,7 @@ y = 2
 // ─── (#2386) this dispatch's finding-key identity ─────────────────────────
 //
 // The finding STORE is host-side: `dispatch_internal.rs::materialize_finding`
-// keys every accepted `create_finding` call as `<session-id>/<emit_seq>`.
+// keys every accepted `create_finding` call as `<execution-id>/<emit_seq>`.
 // Until #2386 the runtime knew neither half, so `create_finding` could only
 // answer "Recorded." — the model had no key to name in a later `create_mod`'s
 // `for`, and the only key text anywhere in its context was the tool
@@ -3208,18 +3208,18 @@ y = 2
 // it onto six mods in one live run; each was stored as a link to nothing, so
 // the coder phase redid work that had already been done.
 //
-// The host now passes `--session-id`, which is enough for both halves of the
+// The host now passes `--execution-id`, which is enough for both halves of the
 // repair: `create_finding` hands back the REAL key, and `create_mod` can tell
 // a key this run actually minted (or was handed in its brief) from one the
 // model invented.
-static DISPATCH_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static EXECUTION_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 static DISPATCH_BRIEF: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-/// Record what this dispatch is, once, before the loop runs. `session_id` is
-/// `None` when the host passed no `--session-id` (an older host, or a
+/// Record what this dispatch is, once, before the loop runs. `execution_id` is
+/// `None` when the host passed no `--execution-id` (an older host, or a
 /// non-dispatch invocation), which leaves both tools at their pre-#2386
 /// behavior rather than guessing an identity.
-/// (#2386 review, item 4) What a dispatch with no `--session-id` says on
+/// (#2386 review, item 4) What a dispatch with no `--execution-id` says on
 /// stderr — `None` when there is nothing to say.
 ///
 /// Without an id this runtime silently drops to pre-#2386 behavior:
@@ -3231,26 +3231,26 @@ static DISPATCH_BRIEF: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 ///
 /// A `[darkmux-runtime]` prefix, per the self-identifying-provenance
 /// convention for text the runtime speaks in its own voice.
-fn leniency_notice(session_id: Option<&str>) -> Option<&'static str> {
-    session_id.is_none().then_some(
-        "[darkmux-runtime] no --session-id was passed: finding keys cannot be grounded on this \
+fn leniency_notice(execution_id: Option<&str>) -> Option<&'static str> {
+    execution_id.is_none().then_some(
+        "[darkmux-runtime] no --execution-id was passed: finding keys cannot be grounded on this \
          dispatch, so create_finding cannot return one and create_mod cannot refuse an invented \
          `for` key. Upgrade the darkmux binary driving this container.",
     )
 }
 
-pub fn set_dispatch_context(session_id: Option<String>, brief: &str) {
-    if let Some(notice) = leniency_notice(session_id.as_deref()) {
+pub fn set_dispatch_context(execution_id: Option<String>, brief: &str) {
+    if let Some(notice) = leniency_notice(execution_id.as_deref()) {
         eprintln!("{notice}");
     }
-    if let Some(id) = session_id {
-        let _ = DISPATCH_ID.set(id);
+    if let Some(id) = execution_id {
+        let _ = EXECUTION_ID.set(id);
     }
     let _ = DISPATCH_BRIEF.set(brief.to_string());
 }
 
-fn dispatch_id() -> Option<&'static str> {
-    DISPATCH_ID.get().map(String::as_str)
+fn execution_id() -> Option<&'static str> {
+    EXECUTION_ID.get().map(String::as_str)
 }
 
 fn dispatch_brief() -> &'static str {
@@ -3262,15 +3262,15 @@ fn dispatch_brief() -> &'static str {
 /// `for`. `None` when this run has no identity to build one from.
 ///
 /// It MUST agree with `crate::findings::build_record`'s own
-/// `format!("{session_id}/{seq}")` on the host: a key the model is told to
+/// `format!("{execution_id}/{seq}")` on the host: a key the model is told to
 /// use and the store then files under a different address is worse than no
 /// key at all.
 ///
 /// (#2386 MF2) Takes the dispatch identity IN rather than reading the
-/// process-wide `dispatch_id()` itself — mirrors `execute_create_mod_with`'s
+/// process-wide `execution_id()` itself — mirrors `execute_create_mod_with`'s
 /// own reason for existing (a test that needs an identity should not have
 /// to set an `OnceLock` every later test in the binary would then inherit).
-/// The real call site (`execute_create_finding`) passes `dispatch_id()`.
+/// The real call site (`execute_create_finding`) passes `execution_id()`.
 fn finding_key_with(my_dispatch: Option<&str>, seq: usize) -> Option<String> {
     my_dispatch.map(|d| finding_key_for(d, seq))
 }
@@ -3373,7 +3373,7 @@ fn brief_finding_keys(brief: &str) -> std::collections::BTreeSet<String> {
 /// refusal and can call again with the right key — `failure_rate.rs`
 /// classifies a `REJECTED:` reply from this tool as a repairable failure.
 ///
-/// Lenient when this run has no identity (`dispatch_id()` is `None`): a
+/// Lenient when this run has no identity (`execution_id()` is `None`): a
 /// runtime the host did not tell who it is cannot distinguish (1) from an
 /// invention, and a false refusal costs the model its whole call.
 fn refuse_for_key(key: &str, my_dispatch: Option<&str>, recorded: usize, brief: &str) -> Option<String> {
@@ -3561,7 +3561,7 @@ fn execute_create_finding(
     out_dir: &Path,
     workspace_root: &Path,
 ) -> Result<ToolRun> {
-    execute_create_finding_with(raw_args, out_dir, workspace_root, dispatch_id())
+    execute_create_finding_with(raw_args, out_dir, workspace_root, execution_id())
 }
 
 /// (#2386 MF2) The same tool with its dispatch identity passed IN —
@@ -3879,7 +3879,7 @@ fn b64_encode(bytes: &[u8]) -> String {
 /// Production entry: this dispatch's own identity and brief, read from the
 /// process-wide context the host set before the loop started.
 fn execute_create_mod(raw_args: &str, out_dir: &Path, workspace_root: &Path) -> Result<ToolRun> {
-    execute_create_mod_with(raw_args, out_dir, workspace_root, dispatch_id(), dispatch_brief())
+    execute_create_mod_with(raw_args, out_dir, workspace_root, execution_id(), dispatch_brief())
 }
 
 /// (#2386) The same tool with its dispatch context passed IN — the form the

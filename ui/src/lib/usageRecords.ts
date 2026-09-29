@@ -7,15 +7,17 @@
  * provider's own counts. A token total anywhere in the viewer (the fleet
  * hero, the run page's tiles, the mission graph's step meter) is a PLAIN SUM
  * of those records, through `sumUsage` (or, for a fold that sees one record
- * at a time, its per-record half `usageContribution`). No run keying, no
+ * at a time, its per-record half `usageContribution`). No execution keying, no
  * complete-vs-telemetry precedence, no local/cloud classification, no
  * estimates: every figure is a sum of counts a provider reported.
  *
- * THE ONE EXCEPTION is legacy data, isolated in `isLegacyFallbackComplete`: a run
- * with ZERO usage records (written before flow schema 1.57.0, or by a fleet
- * peer on an older darkmux) counts each of its token-bearing
- * `dispatch complete` records once. A run with any usage record, even a
- * count-less `token_source: "absent"` one, never reads its complete.
+ * THE ONE EXCEPTION is legacy data, isolated in `isLegacyFallbackComplete`: an
+ * execution with ZERO usage records (written before flow schema 1.57.0, or by
+ * a fleet peer on an older darkmux) counts its token-bearing
+ * `dispatch complete` once. An execution with any usage record, even a
+ * count-less `token_source: "absent"` one, never reads its complete. The
+ * execution is the record's own `execution_id` (`ingest.ts`'s `executionOf`;
+ * a pre-4.0 record reads as its session and mission).
  *
  * `purpose` and `call_kind` values come from the Rust enums
  * (`darkmux_crew::usage::{UsagePurpose, CallKind}`) through their generated
@@ -29,7 +31,7 @@
 
 import type { CallKind } from "../types/generated/CallKind";
 import type { UsagePurpose } from "../types/generated/UsagePurpose";
-import { ACTION, CATEGORY, type NormRecord } from "./ingest";
+import { ACTION, CATEGORY, executionOf, type NormRecord } from "./ingest";
 
 /** Every `UsagePurpose` variant, by name. A key missing or extra relative to
  *  the generated union is a type error. */
@@ -151,73 +153,44 @@ export function usageContribution(r: NormRecord, opts: SumOptions = {}): UsageAm
   return amountOf(payloadOf(r), opts);
 }
 
-/** The identity of ONE RUN: `(session_id, mission_id)`. A bare session id
- *  is not one: pre-4.0 task and mission-run ids were deterministic, so the
- *  same id recurred across unrelated runs (#2690/#2709); archives keep them. The legacy fallback
- *  and the hero's run count both key on this. A sessionless record gets a
- *  composite of its own; `\u0000` cannot occur inside either id. */
-function runKey(r: NormRecord): string {
-  const sid = r.session_id || `ts:${r.ts}:${r.handle || ""}:${r.machine_uid || ""}`;
-  return `${sid}\u0000${r.mission_id || ""}`;
-}
-
-/** A `runKey` that reuses the previous key when consecutive records name the
- *  same `(session_id, mission_id)` (a run's turns arrive together), so a
- *  pass over a window builds one key string per run instead of one per
- *  record. Same result as `runKey`, always. */
-export function runKeyMemo(): (r: NormRecord) => string {
-  let lastSid: string | null | undefined;
-  let lastMid: string | null | undefined;
-  let lastKey = "";
-  return (r) => {
-    if (!r.session_id) return runKey(r);
-    if (r.session_id !== lastSid || r.mission_id !== lastMid) {
-      lastSid = r.session_id;
-      lastMid = r.mission_id;
-      lastKey = runKey(r);
-    }
-    return lastKey;
-  };
-}
-
 /** True when a `dispatch complete`'s payload carries any token count. */
 export function hasAnyTokenCounts(p: UsagePayload): boolean {
   return !!(num(p.total_tokens) || num(p.prompt_tokens) || num(p.completion_tokens) || num(p.remote_tokens));
 }
 
 /** THE LEGACY FALLBACK, and the only exception to the plain sum: a
- *  token-bearing `dispatch complete` counts (once) when its run key holds
+ *  token-bearing `dispatch complete` counts (once) when its execution holds
  *  ZERO usage records. Before flow schema 1.57.0 a single-shot or hosted
  *  call emitted no usage record, so its complete was the only place its
  *  tokens were written; a run with any usage record (even an `absent` one)
  *  is fully described by its records and its complete is never read.
- *  `runsWithUsage` is the set of run keys that hold a usage record.
+ *  `executionsWithUsage` is the set of executions that hold a usage record.
  *
  *  At the live window's lower edge this rule has a known exposure: a MODERN
- *  run whose usage records have scrolled out of the window but whose
+ *  execution whose usage records have scrolled out of the window but whose
  *  `dispatch complete` is still inside holds zero usage records here, so it
  *  reads its complete (the writer's whole-run total). The CLI's `--since`
  *  handles the same edge by registering runs from out-of-window usage
  *  records (#2902 step 2b); the viewer's window is a moving 24h, so a run
  *  sits in that state for seconds, and the sum is corrected on the next
  *  poll when the complete scrolls out too. */
-function isLegacyFallbackComplete(r: NormRecord, runsWithUsage: ReadonlySet<string>, key: (r: NormRecord) => string): boolean {
-  return r.action === ACTION.DispatchComplete && hasAnyTokenCounts(payloadOf(r)) && !runsWithUsage.has(key(r));
+function isLegacyFallbackComplete(r: NormRecord, executionsWithUsage: ReadonlySet<string>): boolean {
+  return r.action === ACTION.DispatchComplete && hasAnyTokenCounts(payloadOf(r)) && !executionsWithUsage.has(executionOf(r));
 }
 
 /** The records the legacy fallback counts, for a reader that needs them
  *  itself (a per-field breakdown). `sumUsage` applies the same rule. */
 export function legacyCompleteCounts<R extends NormRecord>(records: readonly R[]): R[] {
   const withUsage = new Set<string>();
-  for (const r of records) if (isUsageRecord(r)) withUsage.add(runKey(r));
-  return records.filter((r) => isLegacyFallbackComplete(r, withUsage, runKey));
+  for (const r of records) if (isUsageRecord(r)) withUsage.add(executionOf(r));
+  return records.filter((r) => isLegacyFallbackComplete(r, withUsage));
 }
 
 /** A mission-graph step's token figure: its usage records' sum once any
  *  usage record for it has been seen, else (legacy) the finalized total its
  *  `dispatch complete`/`step result` reported (or the server backfilled).
  *  The same legacy rule as `isLegacyFallbackComplete`, at the grain the
- *  graph folds: a step, not a run key. */
+ *  graph folds: a step, not an execution. */
 export function stepTokensWithLegacyFallback(usageSum: number, usageRecordsSeen: boolean, completeTotal: number): number {
   return usageRecordsSeen ? usageSum : completeTotal;
 }
@@ -264,16 +237,15 @@ export function sumUsage(records: readonly NormRecord[], opts: SumOptions = {}):
   };
   const withUsage = new Set<string>();
   const completes: NormRecord[] = [];
-  const key = runKeyMemo();
   for (const r of records) {
     if (isUsageRecord(r)) {
-      withUsage.add(key(r));
+      withUsage.add(executionOf(r));
       if (add(payloadOf(r))) out.usageRecords++;
     } else if (r.action === ACTION.DispatchComplete) {
       completes.push(r);
     }
   }
-  for (const r of completes) if (isLegacyFallbackComplete(r, withUsage, runKey) && add(payloadOf(r))) out.legacyCompletes++;
+  for (const r of completes) if (isLegacyFallbackComplete(r, withUsage) && add(payloadOf(r))) out.legacyCompletes++;
   return out;
 }
 

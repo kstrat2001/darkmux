@@ -550,7 +550,7 @@ pub fn resolve(ids: &[String], user_dir: Option<&Path>) -> Result<(Vec<Rule>, Ve
 
 /// The `<darkmux root>/rules` user tier.
 pub fn user_rules_dir() -> std::path::PathBuf {
-    darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::Auto).root.join("rules")
+    darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).root.join("rules")
 }
 
 /// `resolve` against the real [`user_rules_dir`].

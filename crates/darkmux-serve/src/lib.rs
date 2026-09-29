@@ -97,7 +97,7 @@ pub(crate) struct AppState {
     /// (#1569 packet B) Panel cache + single-flight locks — see `panel.rs`.
     panels: panel::PanelState,
     /// (#1585, was #1247 Part 3) The lab-run scan root — `--lab-dir` >
-    /// `DARKMUX_LAB_DIR` > `config.dirs.lab` > `~/.darkmux/runs`.
+    /// `DARKMUX_LAB_DIR` > `config.dirs.lab` > `~/.darkmux/lab`.
     ///
     /// **In production this is always `Some`.** It stays an `Option` only
     /// because the test-only `build_router` threads `None`; the `/lab/*`
@@ -372,13 +372,14 @@ pub(crate) fn build_router_with_worktrees_base(
 /// #1247 Part 3 added the `/lab/*` group here rather than a parallel
 /// builder), so the auth layers below land in exactly one place.
 ///
-/// **Auth wiring (#881, narrowed #1387):** when a bearer token is configured
-/// (`darkmux_flow::serve_token_present()`), a **remote-only** gate (`auth_mw`)
-/// wraps the whole router — otherwise the router is byte-for-byte today's
-/// behavior (zero friction for the loopback-only default install). Loopback
-/// peers pass (the operator's own machine + the bundled viewer keep working),
-/// non-loopback peers must present the token. `/health` is always exempt
-/// (doctor's reachability probe). Layered INNER of CORS so preflight is
+/// **Auth wiring (#881, narrowed #1387, split #2988):** when read auth is on
+/// (`serve.read_auth`), a **remote-only** gate (`auth_mw`) wraps the whole
+/// router — otherwise reads are open to whatever reaches the daemon, token
+/// or no token. Every route here is a GET read; nothing on this router
+/// starts work (the fleet listener is the execution surface). A request
+/// from this machine (`is_local_request`) passes; every other request,
+/// including one proxied to loopback, must present the token. `/health` is
+/// always exempt (doctor's reachability probe). Layered INNER of CORS so preflight is
 /// handled by the CORS layer first.
 ///
 /// Prior to #1387 there was a SECOND, always-on gate wrapping only
@@ -406,7 +407,7 @@ pub(crate) fn build_router_full(
         panels: panel::PanelState::default(),
         live_ingest,
     };
-    let auth_on = darkmux_flow::serve_token_present();
+    let read_auth = darkmux_types::config_access::serve_read_auth();
 
     // (#925) Keep the long-lived SSE stream route SEPARATE so the per-route
     // request timeout below never applies to it (it's meant to stay open).
@@ -456,7 +457,9 @@ pub(crate) fn build_router_full(
 
     // Remote-only gate, added BEFORE the CORS layer so CORS ends up outermost
     // (handles preflight + sets headers first); the gate runs just inside it.
-    if auth_on {
+    // (#2988) Keyed on `serve.read_auth`, never on the token existing: the
+    // token is the fleet's execution credential and does not close reads.
+    if read_auth {
         router = router.layer(from_fn(auth_mw));
     }
 
@@ -494,15 +497,19 @@ async fn assume_loopback_peer(mut req: Request, next: Next) -> Response {
         req.extensions_mut()
             .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 5555))));
     }
+    if !req.headers().contains_key(axum::http::header::HOST) {
+        req.headers_mut().insert(axum::http::header::HOST, axum::http::HeaderValue::from_static("localhost"));
+    }
     next.run(req).await
 }
 
 /// (#1663) [`build_router`] plus the stated-loopback layer — the default for
 /// tests that are not themselves about auth.
 ///
-/// Why this exists: a serve token resolves from the process-global
-/// `DARKMUX_SERVE_TOKEN`, and `#[serial]` only excludes OTHER serial tests. So
-/// while one of the eleven token-setting tests holds that variable, every
+/// Why this exists: read auth resolves from the process-global
+/// `DARKMUX_SERVE_READ_AUTH` (and the token from `DARKMUX_SERVE_TOKEN`), and
+/// `#[serial]` only excludes OTHER serial tests. So while one of the
+/// auth-setting tests holds those variables, every
 /// concurrent non-serial test runs against an auth-on router — and once the
 /// gate fails closed, a peerless `oneshot` from an unrelated test gets a 401
 /// instead of its assertion. That is a harness defect, not a production one:
@@ -582,19 +589,23 @@ fn request_token_ok(headers: &axum::http::HeaderMap) -> bool {
     tokens_match(presented.trim().as_bytes(), token.expose_for_compare().as_bytes())
 }
 
-/// (#881) Remote-only token gate for the whole read surface. Loopback peers
-/// pass (the operator's own machine + the bundled same-origin viewer keep
-/// working with zero friction); non-loopback peers must present the token.
-/// `/health` is always exempt so doctor's reachability probe (and external
-/// liveness checks) keep working. (#1663) A missing `ConnectInfo` is treated as
-/// REMOTE — see the fail-closed reasoning in the body. Tests that want the
-/// loopback exemption state it, via `build_router_local`.
+/// (#881) Remote-only token gate for the whole read surface. A request from
+/// THIS machine passes (the operator's own shell + the bundled same-origin
+/// viewer keep working with zero friction); anything else must present the
+/// token. `/health` is always exempt so doctor's reachability probe (and
+/// external liveness checks) keep working.
 ///
-/// **Trust assumption:** "loopback is trusted" holds for darkmux's deployment —
-/// bound directly (no reverse proxy) over a Tailscale tailnet that preserves the
-/// real peer IP. Behind a connection-terminating reverse proxy every peer would
-/// appear loopback and this gate would be bypassed. If darkmux ever grows a
-/// multi-tenant/shared-host or behind-proxy mode, revisit this exemption.
+/// "This machine" is [`is_local_request`], the one predicate every local
+/// decision in this daemon uses: a loopback peer address, no reverse-proxy
+/// header, and a `Host` naming this daemon. (#2988) Behind `tailscale serve`,
+/// the documented way a hub reaches the tailnet, every peer arrives on
+/// loopback with `X-Forwarded-For` set, so the address alone exempted the
+/// whole tailnet from the token; and a DNS-rebound page arrives on loopback
+/// with its own Host.
+///
+/// (#1663) A missing `ConnectInfo` is not local, so it needs the token — see
+/// the fail-closed reasoning in the body. Tests that want the exemption state
+/// the peer, via `build_router_local`.
 async fn auth_mw(req: Request, next: Next) -> Response {
     if req.uri().path() == "/health" {
         return next.run(req).await;
@@ -610,22 +621,18 @@ async fn auth_mw(req: Request, next: Next) -> Response {
     // peer looks loopback — a tailnet-exposed daemon then serves flow
     // records, machine specs, mission state, and worktree summaries
     // unauthenticated, with every test still green and nothing visible to the
-    // operator (the viewer keeps working; loopback is exempt either way).
+    // operator (the viewer keeps working; this machine is exempt either way).
     //
     // Now that same refactor produces 401s on the first remote request
     // instead of silence. Tests inject `ConnectInfo` explicitly — see
     // `loopback_peer` and `build_router_local` — so the exemption is
     // something a test STATES rather than something it inherits by omission.
     //
-    // Same instinct `bind_requires_token` already applies just below: a bind
+    // Same instinct `serve_auth_preflight` applies: a bind
     // string that doesn't parse is treated as non-loopback, so a typo can't
     // sneak past the gate. Absence is not evidence of safety.
-    let is_remote = req
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|ci| !ci.0.ip().is_loopback())
-        .unwrap_or(true);
-    if !is_remote || request_token_ok(req.headers()) {
+    let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|ci| ci.0);
+    if caller_is_local_or_holds_token(peer, req.headers()) {
         next.run(req).await
     } else {
         unauthorized()
@@ -659,41 +666,207 @@ const PROXY_HEADERS: &[&str] = &[
     "tailscale-app-capabilities",
 ];
 
-/// (#2916 stage 2 review C5) Whether a request comes from THIS machine: a
-/// loopback peer address, and no header a reverse proxy adds. Behind
-/// `tailscale serve` every tailnet peer arrives on loopback, so the address
-/// alone would hand a peer what only this machine may read. A local process
-/// that adds such a header only makes itself look remote, which fails
-/// toward showing less. No address (no `ConnectInfo`) is not local.
-///
-/// The limit: a proxy that forwards to loopback and adds NONE of these
-/// headers looks exactly like a local request, and cannot be told apart.
-pub(crate) fn is_local_request(peer: Option<SocketAddr>, headers: &axum::http::HeaderMap) -> bool {
-    peer.is_some_and(|p| p.ip().is_loopback()) && !PROXY_HEADERS.iter().any(|h| headers.contains_key(*h))
+/// Whether the caller is this machine ([`is_local_request`]) or presents the
+/// serve token: the audience of what only the operator's side may read.
+pub(crate) fn caller_is_local_or_holds_token(peer: Option<SocketAddr>, headers: &axum::http::HeaderMap) -> bool {
+    is_local_request(peer, headers) || request_token_ok(headers)
 }
 
-/// (#881) Refuse a non-loopback bind unless a token is configured. Pure +
-/// testable: parse `bind` to an `IpAddr`; a loopback address (127.0.0.0/8, ::1)
-/// is always allowed; any other parsed address (a LAN/Tailnet IP, or `0.0.0.0`)
-/// requires `token_present`. A bind string that doesn't parse as an IP is
-/// treated conservatively as non-loopback (so a typo can't sneak past the gate).
-fn bind_requires_token(bind: &str, token_present: bool) -> Result<(), String> {
-    let is_loopback = bind
-        .parse::<std::net::IpAddr>()
-        .map(|ip| ip.is_loopback())
-        .unwrap_or(false);
-    if is_loopback || token_present {
-        Ok(())
-    } else {
-        Err(format!(
-            "refusing to bind the serve daemon to a non-loopback address ({bind}) without a token \
-configured — the daemon would expose flow records, machine specs, mission state, and worktree \
-what-changed summaries of in-flight dispatches to any reachable peer, unauthenticated.\n\
-  Fix: set a token — `security add-generic-password -U -a \"$USER\" -s darkmux-serve-token -w` (macOS) \
-plus `daemon_auth_enabled: true` in ~/.darkmux/config.json, OR export DARKMUX_SERVE_TOKEN=… — then \
-re-run. Or bind to 127.0.0.1 (the default) for a loopback-only daemon."
-        ))
+/// The address this daemon bound, recorded by `run` so the one predicate
+/// [`is_local_request`] can tell a Host naming this daemon from a stranger's.
+/// `None` until `run` binds (and in tests that state no bind).
+static BOUND_ADDR: std::sync::Mutex<Option<SocketAddr>> = std::sync::Mutex::new(None);
+
+/// Record (or clear) the address this daemon bound.
+pub(crate) fn record_bound_addr(addr: Option<SocketAddr>) {
+    if let Ok(mut g) = BOUND_ADDR.lock() {
+        *g = addr;
     }
+}
+
+/// (#2916 stage 2 review C5, #2988 review) Whether a request comes from THIS
+/// machine, judged by the one predicate every local decision in this daemon
+/// uses. All three must hold:
+///
+/// - a loopback peer address (an IPv4-mapped `::ffff:127.0.0.1` included);
+/// - no header a reverse proxy adds ([`PROXY_HEADERS`]);
+/// - a `Host` header naming this daemon: `localhost`, `127.0.0.1`, `[::1]`
+///   or the bound address, each with or without the bound port. A page an
+///   attacker rebinds by DNS to 127.0.0.1 connects from loopback carrying
+///   the attacker's Host, and a browser reaching the daemon through a
+///   header-less proxy (`tailscale serve --tcp`) carries the tailnet name;
+///   neither is this machine. No Host is not local.
+///
+/// Known limit: `Host` is set by the client. A browser cannot forge it, but
+/// a non-browser client behind a TCP forward that adds no headers (for
+/// example `tailscale serve --tcp`) can send `Host: localhost:<port>` and is
+/// not told apart from this machine. For that setup use the HTTPS
+/// `tailscale serve` (it adds headers) or keep read auth on with a
+/// non-loopback bind.
+///
+/// A local process that fakes a header only makes itself look remote, which
+/// fails toward showing less. No address (no `ConnectInfo`) is not local.
+pub(crate) fn is_local_request(peer: Option<SocketAddr>, headers: &axum::http::HeaderMap) -> bool {
+    let bound = BOUND_ADDR.lock().ok().and_then(|g| *g);
+    is_local_at(peer, headers, bound)
+}
+
+/// [`is_local_request`] against an explicit bind address.
+pub(crate) fn is_local_at(
+    peer: Option<SocketAddr>,
+    headers: &axum::http::HeaderMap,
+    bound: Option<SocketAddr>,
+) -> bool {
+    peer.is_some_and(|p| p.ip().to_canonical().is_loopback())
+        && !PROXY_HEADERS.iter().any(|h| headers.contains_key(*h))
+        && host_names_this_daemon(headers, bound)
+}
+
+/// The host part of a `Host` header value.
+#[derive(Debug, PartialEq, Eq)]
+enum RequestHost {
+    Localhost,
+    Ip(std::net::IpAddr),
+    Other,
+}
+
+/// A parsed `Host` header value: the host and the optional port.
+#[derive(Debug, PartialEq, Eq)]
+struct HostHeader {
+    host: RequestHost,
+    port: Option<u16>,
+}
+
+/// Parse `host`, `host:port`, `[v6]` or `[v6]:port`; `None` for anything
+/// else (a bare IPv6 literal, a non-numeric port, junk after a bracket).
+fn parse_host_header(raw: &str) -> Option<HostHeader> {
+    let raw = raw.trim().to_ascii_lowercase();
+    let (name, port) = if let Some(rest) = raw.strip_prefix('[') {
+        let (inner, tail) = rest.split_once(']')?;
+        let port = match tail {
+            "" => None,
+            t => Some(t.strip_prefix(':')?),
+        };
+        let ip = inner.parse::<std::net::Ipv6Addr>().ok()?;
+        return Some(HostHeader { host: RequestHost::Ip(ip.into()), port: parse_port(port)? });
+    } else {
+        match raw.split_once(':') {
+            Some((n, p)) => (n.to_string(), Some(p)),
+            None => (raw, None),
+        }
+    };
+    let host = if name == "localhost" {
+        RequestHost::Localhost
+    } else if let Ok(ip) = name.parse::<std::net::Ipv4Addr>() {
+        RequestHost::Ip(ip.into())
+    } else {
+        RequestHost::Other
+    };
+    Some(HostHeader { host, port: parse_port(port)? })
+}
+
+/// `Some(None)` for an absent port, `Some(Some(p))` for a numeric one,
+/// `None` for a port that is not a number.
+fn parse_port(port: Option<&str>) -> Option<Option<u16>> {
+    match port {
+        None => Some(None),
+        Some(p) => p.parse::<u16>().ok().map(Some),
+    }
+}
+
+/// Whether the request's single `Host` header names this daemon: a loopback
+/// name or literal, or the bound address's own host, with no port or the
+/// bound port. A wildcard bind names no host of its own.
+fn host_names_this_daemon(headers: &axum::http::HeaderMap, bound: Option<SocketAddr>) -> bool {
+    let mut values = headers.get_all(axum::http::header::HOST).iter();
+    let (Some(value), None) = (values.next(), values.next()) else {
+        return false;
+    };
+    let Some(parsed) = value.to_str().ok().and_then(parse_host_header) else {
+        return false;
+    };
+    if let (Some(port), Some(bound)) = (parsed.port, bound) {
+        if port != bound.port() {
+            return false;
+        }
+    }
+    match parsed.host {
+        RequestHost::Localhost => true,
+        RequestHost::Ip(ip) => {
+            ip.to_canonical().is_loopback()
+                || bound.is_some_and(|b| !b.ip().is_unspecified() && b.ip().to_canonical() == ip.to_canonical())
+        }
+        RequestHost::Other => false,
+    }
+}
+
+/// (#881, #2988) The startup banner's two auth lines: the read posture and
+/// the execution posture. `serve_auth_preflight` has already refused a
+/// posture reads could not be answered in, so these only describe.
+fn auth_banner_lines(auth: ServeAuth) -> [String; 2] {
+    let reads = if auth.read_auth {
+        "  reads:          token required unless from this machine (serve.read_auth on; proxied requests included)"
+    } else {
+        "  reads:          open to whatever reaches this daemon (serve.read_auth off)"
+    };
+    let exec = if auth.token_present {
+        "  fleet work:     token set; the fleet listener requires it plus a verified sender".to_string()
+    } else {
+        format!("  fleet work:     {}", darkmux_types::style::dim("no serve token; this machine takes and sends no fleet work"))
+    };
+    [reads.to_string(), exec]
+}
+
+/// (#2988) The serve auth posture `darkmux serve` starts under: whether
+/// reads need the token (`serve.read_auth`), and whether one resolves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ServeAuth {
+    pub(crate) read_auth: bool,
+    pub(crate) token_present: bool,
+}
+
+impl ServeAuth {
+    /// The posture this process resolves now.
+    fn resolve() -> Self {
+        Self {
+            read_auth: darkmux_types::config_access::serve_read_auth(),
+            token_present: darkmux_flow::serve_token_present(),
+        }
+    }
+}
+
+const TOKEN_REMEDY: &str = "store it: `security add-generic-password -U -a \"$USER\" -s darkmux-serve-token -w` \
+(macOS) plus `darkmux config set serve.token_keychain true`, OR export DARKMUX_SERVE_TOKEN=…";
+
+/// (#881, #2988) Refuse to start `serve` in a posture whose reads could not
+/// be answered as configured. Pure + testable.
+///
+/// - Read auth on with no token: every remote read would 401 with no way
+///   to pass.
+/// - A non-loopback bind (a LAN/tailnet IP, `0.0.0.0`, or anything that
+///   does not parse as an IP, so a typo can't sneak past) without read
+///   auth on and a token: it would expose flow records, machine specs,
+///   mission state and worktree summaries to any reachable peer
+///   unauthenticated. A fleet token alone does not close reads, so it is
+///   not enough.
+fn serve_auth_preflight(bind: &str, auth: ServeAuth) -> Result<(), String> {
+    if auth.read_auth && !auth.token_present {
+        return Err(format!(
+            "refusing to start the serve daemon: `serve.read_auth` is on but no serve token resolves, so \
+every read not from this machine would be refused with no way to pass.\n  Fix: {TOKEN_REMEDY}, or \
+`darkmux config set serve.read_auth false`."
+        ));
+    }
+    let is_loopback = bind.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.to_canonical().is_loopback());
+    if is_loopback || auth.read_auth {
+        return Ok(());
+    }
+    Err(format!(
+        "refusing to bind the serve daemon to a non-loopback address ({bind}) with reads open — the daemon \
+would expose flow records, machine specs, mission state, and worktree what-changed summaries of in-flight \
+dispatches to any reachable peer, unauthenticated.\n  Fix: `darkmux config set serve.read_auth true` with a \
+serve token ({TOKEN_REMEDY}), or bind to 127.0.0.1 (the default) and reach it through `tailscale serve`."
+    ))
 }
 
 /// GET /fleet/machines/live — the machines present in the fleet RIGHT NOW
@@ -1110,6 +1283,7 @@ fn build_startup_banner(
     mission_count: usize,
     phase_count: usize,
     lab_dir: Option<&std::path::Path>,
+    pending_move: Option<&PendingMove>,
 ) -> Vec<String> {
     let mut lines = Vec::new();
     let version = env!("CARGO_PKG_VERSION");
@@ -1164,27 +1338,9 @@ fn build_startup_banner(
         ));
     }
 
-    // (#881) Auth-state line — so the operator can see at a glance whether the
-    // bearer gate is active and (when bound non-loopback) that a token is set.
-    let token_present = darkmux_flow::serve_token_present();
-    let non_loopback = !addr.ip().is_loopback();
-    if token_present {
-        lines.push(format!(
-            "  auth:           {} (remote reads require a bearer token; loopback open)",
-            darkmux_types::style::success("token set")
-        ));
-    } else if non_loopback {
-        // Should be unreachable — `bind_requires_token` refuses this combination
-        // before bind — but surface it loudly if the bind path ever changes.
-        lines.push(darkmux_types::style::warn(
-            "  ! auth:         NO token set but bound non-loopback — the read surface is UNAUTHENTICATED",
-        ));
-    } else {
-        lines.push(
-            "  auth:           none (loopback-only; set DARKMUX_SERVE_TOKEN or daemon_auth_enabled + Keychain to bind non-loopback)"
-                .to_string(),
-        );
-    }
+    // (#881, #2988) Both auth postures, so the operator sees at a glance
+    // what reads need and what execution needs.
+    lines.extend(auth_banner_lines(ServeAuth::resolve()));
 
     if !flows_dir_exists {
         lines.push(darkmux_types::style::warn(
@@ -1205,7 +1361,7 @@ fn build_startup_banner(
     }
 
     // (#1585) Lab-run scan root. Always resolved in production now (flag > env
-    // > config > `~/.darkmux/runs`); the `None` arm below survives only for
+    // > config > `~/.darkmux/lab`); the `None` arm below survives only for
     // the test-only router. Printed either way so the resolved path is never
     // something the operator has to guess at.
     match lab_dir {
@@ -1217,6 +1373,13 @@ fn build_startup_banner(
             "  lab dir:        none (pass --lab-dir <path> to enable the lab observer lens)"
                 .to_string(),
         ),
+    }
+
+    if let Some(m) = pending_move {
+        lines.push(darkmux_types::style::warn(&format!(
+            "  ! lab runs in {} are not read (4.0 reads {}); move them: {}",
+            m.from, m.to, m.command
+        )));
     }
 
     lines.push(darkmux_types::style::success("  ready — Ctrl-C to stop"));
@@ -1259,7 +1422,7 @@ pub fn resolve_listen_addr(port: Option<u16>, bind: Option<String>) -> (u16, Str
 /// four #2782 surfaces rendered IPv6 as supported (`serve address` printing
 /// `[::]:8765`, `viewer_link_base` emitting `http://[::1]:8765/`, the
 /// tailnet matcher, and the tests asserting all three) and
-/// `bind_requires_token("::1", false)` returned `Ok`, i.e. the codebase
+/// the bind gate returned `Ok` for `::1`, i.e. the codebase
 /// already INTENDED v6 loopback to be legal. One bracketing rule keeps the
 /// address the daemon binds and the address doctor prints from disagreeing.
 ///
@@ -1283,6 +1446,11 @@ pub fn listen_socket_addr(bind: &str, port: u16) -> Result<std::net::SocketAddr>
 }
 
 pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>) -> Result<()> {
+    // (#2988 review) The config gate every entry point runs: a wrong-typed
+    // value (`serve.read_auth: "true"`) or a retired key would otherwise be
+    // dropped by the lenient loader and this daemon would start on defaults,
+    // read auth off, with no word said.
+    darkmux_types::config_enum::preflight(darkmux_types::config_enum::Scope::Serve)?;
     // (#1461) Capture the mtime of the binary we were launched from BEFORE
     // serving anything. It has to be read at startup, not lazily on the first
     // `/health`: `cargo install` REPLACES the file on disk, so a later read
@@ -1298,11 +1466,9 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
 
     rt.block_on(async move {
         let addr = listen_socket_addr(&bind, port)?;
-        // (#881) Refuse a non-loopback bind without a configured token BEFORE we
-        // bind the socket — exposing the read surface unauthenticated is the
-        // vulnerability this gate closes.
-        bind_requires_token(&bind, darkmux_flow::serve_token_present())
-            .map_err(anyhow::Error::msg)?;
+        // (#881, #2988) Refuse a posture whose reads could not be answered as
+        // configured BEFORE we bind the socket.
+        serve_auth_preflight(&bind, ServeAuth::resolve()).map_err(anyhow::Error::msg)?;
         // (#2782) Name the address in the bind failure. The banner below holds
         // it, and only prints AFTER a successful bind — so a bare `io::Error`
         // here is the operator's entire stderr: `Error: Permission denied (os
@@ -1325,6 +1491,7 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
                      `darkmux config set serve.port <port>`"
                 )
             })?;
+        record_bound_addr(listener.local_addr().ok());
 
         // Banner: print after bind succeeds so we don't claim "listening"
         // before we actually are.
@@ -1365,6 +1532,7 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
             mission_count,
             phase_count,
             lab_dir.as_deref(),
+            lab_dir.as_deref().and_then(pending_move_for).as_ref(),
         ) {
             println!("{line}");
         }
@@ -1563,8 +1731,9 @@ async fn health(
     headers: axum::http::HeaderMap,
 ) -> axum::Json<serde_json::Value> {
     // (#2916 re-review C9) A peer sees only the listener's coarse state.
-    // (#2916 stage 2 review C5) "This machine" is a loopback request that
-    // did not come through a reverse proxy (`is_local_request`).
+    // (#2916 stage 2 review C5) "This machine" is `is_local_request`: a
+    // loopback request that did not come through a reverse proxy and names
+    // this daemon in its Host.
     let loopback_caller = is_local_request(peer.map(|c| c.0), &headers);
     axum::Json(serde_json::json!({
         "darkmux_version": env!("CARGO_PKG_VERSION"),
@@ -1953,7 +2122,7 @@ pub(crate) async fn worktree_summary_handler(
 /// the blocking pool to keep the axum executor free.
 /// GET /missions — list of all missions from the JSON source-of-truth
 /// (`~/.darkmux/crew/missions/`). Includes status + transition timestamps
-/// (started_ts/finalized_ts/paused_ts) so the viewer can render wall-clock
+/// (started_ts/finalized_ts) so the viewer can render wall-clock
 /// durations and the phase-progress widget. Empty array on no missions
 /// or unreachable crew root; never errors.
 async fn missions_handler() -> axum::Json<serde_json::Value> {
@@ -2236,7 +2405,7 @@ fn current_millis() -> u64 {
 //
 // "Two doors, one viewer, distinct questions" (operator direction, #1247):
 // these routes read ONLY `AppState::lab_dir` — the scan root resolved as
-// `--lab-dir` > `DARKMUX_LAB_DIR` > `config.dirs.lab` > `~/.darkmux/runs`
+// `--lab-dir` > `DARKMUX_LAB_DIR` > `config.dirs.lab` > `~/.darkmux/lab`
 // (#1585; it was operator-named-or-nothing until that default landed) — and
 // never touch the flow stream, Redis, or any other machine's data. Machine-local by construction;
 // no federation, ever. A "run" is any directory directly containing
@@ -2306,6 +2475,35 @@ fn resolve_lab_run_dir(lab_dir: &StdPath, dir: &str) -> Option<PathBuf> {
     worktree_contained(&candidate, lab_dir).then_some(candidate)
 }
 
+/// A lab dir whose pre-4.0 runs have not been moved: where they are, where
+/// 4.0 reads, and the command that settles it. `darkmux serve` never moves
+/// them and never refuses to start over it; it says so in the startup banner
+/// and on `GET /lab/runs`, where the lab lens would otherwise show no runs.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
+pub struct PendingMove {
+    pub from: String,
+    pub to: String,
+    pub command: String,
+}
+
+/// The [`PendingMove`] for a served lab dir, or `None` when nothing waits to
+/// be moved.
+pub(crate) fn pending_move_for(lab_dir: &StdPath) -> Option<PendingMove> {
+    use darkmux_types::config_access::LabDirState;
+    let state = darkmux_types::config_access::lab_dir_state_for(lab_dir);
+    let command = state.command()?;
+    match state {
+        LabDirState::MovePending { from, to, .. } | LabDirState::Split { from, to } => Some(PendingMove {
+            from: from.display().to_string(),
+            to: to.display().to_string(),
+            command,
+        }),
+        LabDirState::Current => None,
+    }
+}
+
 /// One run cluster's summary row for `GET /lab/runs`.
 ///
 /// `pub(crate)` (was private until #1508 step 3): the `/runs` aggregator's
@@ -2354,6 +2552,14 @@ pub(crate) struct LabRunSummary {
     /// are the outcome. `None` when there is no manifest yet, or no `ok`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) run_ok: Option<bool>,
+    /// `manifest.json`'s `workload`: what the run dispatched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) workload: Option<String>,
+    /// `manifest.json`'s `verify.passed`: what the workload's own tests said,
+    /// which `run_ok` (the dispatch result) does not carry (#2494). `None`
+    /// when nothing was checked or there is no manifest yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) verify_passed: Option<bool>,
     /// (#2812) The lifecycle record's own `started_at_ms` — the run's real
     /// START, written before the provider is ever called. `LabRunSummary`
     /// carried no start timestamp at all before this, which is why
@@ -2441,16 +2647,23 @@ async fn lab_runs_handler(State(state): State<AppState>) -> impl IntoResponse {
     };
     let shown = lab_dir.display().to_string();
     let exists = lab_dir.is_dir();
-    let runs = tokio::task::spawn_blocking(move || scan_lab_runs(&lab_dir))
-        .await
-        .unwrap_or_default();
-    axum::Json(serde_json::json!({
+    let (runs, pending_move) = tokio::task::spawn_blocking(move || {
+        (scan_lab_runs(&lab_dir), pending_move_for(&lab_dir))
+    })
+    .await
+    .unwrap_or_default();
+    let mut body = serde_json::json!({
         "configured": true,
         "dir": shown,
         "exists": exists,
         "runs": runs,
-    }))
-    .into_response()
+    });
+    // Additive: present only while pre-4.0 runs wait to be moved, so the lab
+    // lens can say why it is empty. Serving never refuses over it.
+    if let Some(m) = pending_move {
+        body["pending_move"] = serde_json::json!(m);
+    }
+    axum::Json(body).into_response()
 }
 
 /// `pub(crate)` (was private until #1508 step 3) — the `/runs` aggregator
@@ -2522,6 +2735,12 @@ fn scan_lab_dir_rec(dir: &StdPath, lab_dir: &StdPath, depth: usize, out: &mut Ve
     for sub in subdirs {
         scan_lab_dir_rec(&sub, lab_dir, depth + 1, out);
     }
+}
+
+/// `verify.passed` from a run's manifest. `None` is "not checked": the
+/// manifest has `verify: null` (the workload declares none) or no such block.
+fn manifest_verify_passed(manifest: &serde_json::Value) -> Option<bool> {
+    manifest.get("verify")?.get("passed")?.as_bool()
 }
 
 fn build_lab_run_summary(
@@ -2738,6 +2957,10 @@ fn build_lab_run_summary(
         has_events,
         session_id,
         run_ok,
+        workload: manifest
+            .as_ref()
+            .and_then(|v| v.get("workload").and_then(|w| w.as_str()).map(str::to_string)),
+        verify_passed: manifest.as_ref().and_then(manifest_verify_passed),
     })
 }
 
@@ -3002,7 +3225,7 @@ fn machine_resources_cached_fresh() -> Option<serde_json::Value> {
 /// run artifacts (lab lens) and the flow stream (fleet lenses). Read-only,
 /// zero model dispatches; the gather stamps its own cost (`gather_ms`)
 /// into the payload. Auth: rides the same remote-only bearer gate as every
-/// other route (loopback open, remote requires the token) — nothing extra
+/// other route (this machine open, remote requires the token) — nothing extra
 /// here.
 ///
 /// (#2107, #1833, #2108) Attach the daemon-side host sampler's `load` block —
@@ -3126,8 +3349,8 @@ async fn machine_specs_handler() -> axum::Json<serde_json::Value> {
     // matches a loaded model by its namespaced identifier OR its bare model key
     // (utility_model_id may be stored either way). Best-effort — a profiles read
     // failure just yields `None`.
-    // (#2915) With the binding's declared window (`n_ctx`, `null` when the
-    // bare form declared none), which the machine page's Utility section shows.
+    // (#2915) With the binding's declared window (`n_ctx`, `null` when
+    // none is declared), which the machine page's Utility section shows.
     let utility_model = tokio::task::spawn_blocking(|| {
         darkmux_profiles::profiles::load_registry(None).ok().and_then(|lr| {
             lr.registry
@@ -3476,9 +3699,7 @@ fn scan_flow_days(flows_dir: &std::path::Path) -> Vec<serde_json::Value> {
             }
             // A dispatch = a dispatch.start edge.
             if darkmux_flow::reader::action_of(&v) == Some(darkmux_flow::FlowAction::DispatchStart) {
-                if let Some(s) = v.get("session_id").and_then(|s| s.as_str()) {
-                    dispatches.insert(s.to_string());
-                }
+                dispatches.insert(darkmux_flow::legacy::execution_of(&v).to_string());
             }
         }
         days.push(serde_json::json!({
@@ -3745,9 +3966,7 @@ fn scan_flow_missions(
             e.last_date = date.to_string();
         }
         if darkmux_flow::reader::action_of(v) == Some(darkmux_flow::FlowAction::DispatchStart) {
-            if let Some(s) = v.get("session_id").and_then(|s| s.as_str()) {
-                e.dispatches.insert(s.to_string());
-            }
+            e.dispatches.insert(darkmux_flow::legacy::execution_of(v).to_string());
         }
         if let Some(mach) = v.get("machine_id").and_then(|m| m.as_str()) {
             if !mach.is_empty() {
@@ -3978,7 +4197,8 @@ struct HostSampleJoinStats {
 /// doc for why a time+machine join replaced the old session_id match.
 /// A no-op when the session carries no `machine_uid` (pre-#2413 historical
 /// records, or a record shape this join can't key on) or no parsable
-/// `dispatch.start` — the run-detail pane's own "no host samples" tile
+/// bookend start (`run.start` / `dispatch.start`) — the run-detail pane's
+/// own "no host samples" tile
 /// covers that case, not a synthesized window here.
 ///
 /// (#2647) This join bounds the WINDOW to the session, never the SAMPLES:
@@ -4001,13 +4221,11 @@ fn join_host_samples_into_session_records(
     records: &mut Vec<serde_json::Value>,
     now_ms: u64,
 ) -> HostSampleJoinStats {
-    use darkmux_flow::FlowAction;
-    let is_start = |r: &serde_json::Value| darkmux_flow::reader::action_of(r) == Some(FlowAction::DispatchStart);
+    use darkmux_flow::{Edge, FlowAction};
+    let edge = |r: &serde_json::Value| darkmux_flow::reader::action_of(r).and_then(|a| a.bookend()).map(|b| b.edge);
+    let is_start = |r: &serde_json::Value| edge(r) == Some(Edge::Start);
     let is_terminal = |r: &serde_json::Value| {
-        matches!(
-            darkmux_flow::reader::action_of(r),
-            Some(FlowAction::DispatchComplete | FlowAction::DispatchError | FlowAction::SessionEnd)
-        )
+        edge(r).is_some_and(Edge::is_terminal) || darkmux_flow::reader::action_of(r) == Some(FlowAction::SessionEnd)
     };
     // (live finding, 2026-09-06) `machine_uid` must come from the
     // dispatch-START record specifically, matching what the CLIENT gates
@@ -4671,24 +4889,24 @@ fn records_from_xrevrange(raw: redis::Value, date: Option<&str>) -> Result<Vec<s
 }
 
 /// The most records `GET /flow/:date` returns from the local day-file —
-/// the newest `MAX_FLOW_FILE_RECORDS` for everything EXCEPT the dispatch
-/// liveness bookends, matching the Redis path's `XREVRANGE … COUNT 10000`
+/// the newest `MAX_FLOW_FILE_RECORDS` for everything EXCEPT the liveness
+/// bookends, matching the Redis path's `XREVRANGE … COUNT 10000`
 /// cap (#900). The file path previously read the WHOLE file into memory +
 /// parsed every line into a `Vec`, so a large day-file under concurrent
 /// requests could OOM the daemon (the Redis path was already bounded; the
 /// snapshot path wasn't).
 ///
-/// (#2409) The cap applies to the supplementary-vocabulary ring only.
-/// `dispatch.start`/`dispatch.complete`/`dispatch.error` (a pre-4.0 spaced
-/// spelling reads as the same action through `darkmux_flow::reader`) are
-/// ALWAYS kept regardless of this count: cross-system contract 2 (dispatch
-/// liveness) requires that liveness surfaces key on these bookends, and
+/// (#2409) The cap applies to the supplementary-vocabulary ring only. The
+/// bookends, `run.*` and `dispatch.*` (a pre-4.0 spelling reads as its
+/// current action through `darkmux_flow::reader`), are ALWAYS kept
+/// regardless of this count: cross-system contract 2 (liveness) requires
+/// that liveness surfaces key on these bookends, and
 /// that supplementary vocabularies (here, high-cadence `telemetry.process`
 /// / `dispatch.turn.heartbeat` / `machine.telemetry`) never evict them. A
 /// live day file measured ~118 bookends against 56,829 total records. The
 /// bookend keep-list is its OWN ring under this same cap (newest kept), so
 /// the read stays constant-bounded even when a crash-looping producer emits
-/// a `dispatch error` bookend every second — #900's bound, not a second
+/// an error bookend every second — #900's bound, not a second
 /// unbounded read.
 // (#1715) Single-sourced from darkmux-flow's `FLOW_READ_CAP_RECORDS` — the
 // doctor/`flow status` near-maxlen warning reasons about THIS value (is
@@ -4700,7 +4918,7 @@ fn records_from_xrevrange(raw: redis::Value, date: Option<&str>) -> Result<Vec<s
 const MAX_FLOW_FILE_RECORDS: usize = darkmux_flow::FLOW_READ_CAP_RECORDS;
 
 /// Parse `<flows_dir>/<date>.jsonl` into a Vec of JSON values, keeping every
-/// dispatch-liveness bookend PLUS the newest `MAX_FLOW_FILE_RECORDS` of
+/// liveness bookend PLUS the newest `MAX_FLOW_FILE_RECORDS` of
 /// everything else (chronological order preserved throughout). Missing file
 /// = empty Vec (not an error).
 ///
@@ -4713,8 +4931,8 @@ const MAX_FLOW_FILE_RECORDS: usize = darkmux_flow::FLOW_READ_CAP_RECORDS;
 /// live: a busy day's `telemetry.process` volume fills the whole 10k window,
 /// so every `dispatch.start` sitting further back than that gets dropped and
 /// every activity bar built from it goes blank — cross-system contract 2
-/// (dispatch liveness) says a route serving liveness surfaces must never do
-/// that. This function now tracks the dispatch bookends in a
+/// (liveness) says a route serving liveness surfaces must never do that.
+/// This function now tracks the bookends in a
 /// separate always-kept list alongside the capped ring, carries each kept
 /// record's file-order line index, and merges the two lists by index at the
 /// end — so the cap still bounds memory for the high-cadence vocabulary
@@ -4801,8 +5019,8 @@ async fn read_flow_records_from_file(
 /// Non-UTF-8, empty, or non-JSON lines are dropped silently — the same
 /// tolerance the old `.lines()` loop had.
 ///
-/// (#2409) A `dispatch.start`/`dispatch.complete`/`dispatch.error` record
-/// goes to `bookends` and never touches the ring's cap. Everything else keeps the
+/// (#2409) A bookend (`run.*`, `dispatch.*`) goes to `bookends` and never
+/// touches the ring's cap. Everything else keeps the
 /// prior newest-`MAX_FLOW_FILE_RECORDS` ring behavior. `next_index` is
 /// advanced only for lines that actually parse, so the index each kept
 /// record carries is a dense, monotonic file-order position the caller can
@@ -4833,14 +5051,7 @@ fn push_flow_line(
     let index = *next_index;
     *next_index += 1;
 
-    if matches!(
-        darkmux_flow::reader::action_of(&v),
-        Some(
-            darkmux_flow::FlowAction::DispatchStart
-                | darkmux_flow::FlowAction::DispatchComplete
-                | darkmux_flow::FlowAction::DispatchError
-        )
-    ) {
+    if darkmux_flow::reader::action_of(&v).and_then(|a| a.bookend()).is_some() {
         if bookends.len() >= MAX_FLOW_FILE_RECORDS {
             bookends.pop_front();
         }
@@ -5288,6 +5499,7 @@ fn synthetic_stream_error_record(stream_name: &str, attempts: u32, reason: &str)
         handle: "redis_tail_lines".to_string(),
         phase_id: None,
         session_id: None,
+        execution_id: None,
         source: None,
         model: None,
         reasoning: Some(format!(

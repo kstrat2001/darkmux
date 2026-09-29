@@ -34,6 +34,7 @@
 
 import type { FlowRecord } from "../types/handwritten";
 import type { Category } from "../types/generated/Category";
+import type { ExecutionGrainAction } from "../types/generated/ExecutionGrainAction";
 import type { FlowAction } from "../types/generated/FlowAction";
 import type { Level } from "../types/generated/Level";
 import type { RetiredAction } from "../types/generated/RetiredAction";
@@ -137,8 +138,6 @@ const ACTION_WIRE = {
   MissionStart: "mission.start",
   MissionClose: "mission.close",
   MissionAbort: "mission.abort",
-  MissionPause: "mission.pause",
-  MissionResume: "mission.resume",
   MissionGrow: "mission.grow",
   MissionDebriefPrompt: "mission.debrief.prompt",
   MissionRunFinalize: "mission.run.finalize",
@@ -148,7 +147,6 @@ const ACTION_WIRE = {
   PhaseStart: "phase.start",
   PhaseComplete: "phase.complete",
   PhaseAbandon: "phase.abandon",
-  PhaseAdded: "phase.added",
   PhaseIdAmbiguous: "phase.id_ambiguous",
   PhaseReviewBegin: "phase.review.begin",
   PhaseReviewAborted: "phase.review.aborted",
@@ -156,6 +154,9 @@ const ACTION_WIRE = {
   PhaseReviewFailed: "phase.review.failed",
   PhaseReviewVerdict: "phase.review.verdict",
   RadioRoute: "radio.route",
+  RunStart: "run.start",
+  RunComplete: "run.complete",
+  RunError: "run.error",
   SessionEnd: "session.end",
   StepStart: "step.start",
   StepComplete: "step.complete",
@@ -264,6 +265,13 @@ const RETIRED_WIRE: { readonly [W in RetiredAction]: true } = {
   "mission.compile.complete": true,
   "mission.compile.error": true,
   "mission reopen": true,
+  "mission.pause": true,
+  "mission pause": true,
+  "mission.resume": true,
+  "mission resume": true,
+  "phase.added": true,
+  "phase added": true,
+  "sprint added": true,
   "crawl.finding": true,
   "crawl.mission.started": true,
   "crawl.mission.completed": true,
@@ -324,6 +332,7 @@ export function ingestRecord(raw: unknown): NormRecord | null {
   for (const key of TAGGED_FIELDS) assignTyped(out, key, parseTag(raw[key]));
   const action = out.action as NormAction | undefined;
   if (action !== undefined && !isKnownAction(action)) warnUnknownAction(tagText(action));
+  if (isExecutionAction(action) && typeof out.execution_id !== "string") out.execution_id = legacyExecutionId(raw);
   return out as unknown as NormRecord;
 }
 
@@ -378,9 +387,96 @@ export function ingestJsonl(text: string): NormRecord[] {
 
 // ─── action predicates that need the text itself ──────────────────────────
 
-/** Either dispatch terminal: the "did this dispatch stop" question. */
-export const isDispatchTerminal = (a: NormAction | undefined): boolean =>
-  a === ACTION.DispatchComplete || a === ACTION.DispatchError;
+/** Every action that is a record OF a role execution: the viewer's copy of
+ *  `darkmux_flow::FlowAction::grain`, keyed by the union the Rust list
+ *  generates so a drift is a type error. */
+const EXECUTION_GRAIN_WIRE: { readonly [W in ExecutionGrainAction]: true } = {
+  "budget.warn": true,
+  "budget.wait": true,
+  "budget.resume": true,
+  "budget.stop": true,
+  "dispatch.start": true,
+  "dispatch.complete": true,
+  "dispatch.error": true,
+  "dispatch.turn": true,
+  "dispatch.turn.heartbeat": true,
+  "dispatch.tool": true,
+  "dispatch.compaction": true,
+  "dispatch.checkpoint": true,
+  "dispatch.reasoning": true,
+  "dispatch.feedback.injected": true,
+  "dispatch.rest": true,
+  "dispatch.degeneracy.warning": true,
+  "dispatch.workdir_git_unavailable": true,
+  "telemetry.tokens": true,
+  "telemetry.detector": true,
+  "telemetry.context": true,
+  "telemetry.compaction": true,
+  "telemetry.runtime": true,
+  "telemetry.lms": true,
+};
+
+/** Whether an action is a record of a role execution. */
+export const isExecutionAction = (a: NormAction | undefined): boolean => a !== undefined && Object.hasOwn(EXECUTION_GRAIN_WIRE, tagText(a));
+
+/** THE legacy path: the execution a record that names none is of, as
+ *  `darkmux_flow::legacy::execution_of` reads it: its session and mission
+ *  (a bare session id is not an identity in a pre-4.0 archive: a task
+ *  session named only its task, so the same id recurs across unrelated runs,
+ *  #2690/#2709), or, with no session, the record itself (its time, handle and machine). */
+const LEGACY_EXECUTION_PREFIX = "legacy:";
+
+function legacyExecutionId(raw: { session_id?: unknown; mission_id?: unknown; ts?: unknown; handle?: unknown; machine_uid?: unknown }): string {
+  const text = (v: unknown): string => (typeof v === "string" ? v : "");
+  const mission = text(raw.mission_id);
+  const session = text(raw.session_id);
+  return session === ""
+    ? `${LEGACY_EXECUTION_PREFIX}:${mission}:${text(raw.ts)}:${text(raw.handle)}:${text(raw.machine_uid)}`
+    : `${LEGACY_EXECUTION_PREFIX}${session}:${mission}`;
+}
+
+/** Whether an execution id was synthesized for a pre-4.0 record
+ *  (`legacyExecutionId`) rather than minted for one execution. A legacy id
+ *  is a session and mission, so one session's records may carry several. */
+export const isLegacyExecution = (id: string): boolean => id.startsWith(LEGACY_EXECUTION_PREFIX);
+
+/** The execution a record is of: the one it names, else the legacy one
+ *  (`legacyExecutionId`). Meaningful for a record of an execution-grain
+ *  action (`isExecutionAction`); `ingestRecord` stamps it on those. */
+export const executionOf = (r: NormRecord): string => r.execution_id ?? legacyExecutionId(r);
+
+/** A liveness bookend: the unit it brackets (contract 8's grains: a whole
+ *  `run`, or one role `execution`) and its edge. The viewer's copy of
+ *  `darkmux_flow::FlowAction::bookend`, keyed by the actions it names. */
+export interface Bookend {
+  readonly grain: "run" | "execution";
+  readonly edge: "start" | "complete" | "error";
+}
+
+const BOOKENDS: ReadonlyMap<NormAction, Bookend> = new Map<NormAction, Bookend>([
+  [ACTION.RunStart, { grain: "run", edge: "start" }],
+  [ACTION.RunComplete, { grain: "run", edge: "complete" }],
+  [ACTION.RunError, { grain: "run", edge: "error" }],
+  [ACTION.DispatchStart, { grain: "execution", edge: "start" }],
+  [ACTION.DispatchComplete, { grain: "execution", edge: "complete" }],
+  [ACTION.DispatchError, { grain: "execution", edge: "error" }],
+]);
+
+/** The bookend an action is, or `null` when it is none. */
+export const bookendOf = (a: NormAction | undefined): Bookend | null => (a === undefined ? null : (BOOKENDS.get(a) ?? null));
+
+/** A bookend start, at either grain. */
+export const isBookendStart = (a: NormAction | undefined): boolean => bookendOf(a)?.edge === "start";
+
+/** A bookend terminal, at either grain: the "did this run or execution
+ *  stop" question. */
+export const isBookendTerminal = (a: NormAction | undefined): boolean => {
+  const edge = bookendOf(a)?.edge;
+  return edge === "complete" || edge === "error";
+};
+
+/** An execution's terminal: the "did this dispatch stop" question. */
+export const isDispatchTerminal = (a: NormAction | undefined): boolean => bookendOf(a)?.grain === "execution" && isBookendTerminal(a);
 
 /** Any `dispatch.*` action, known or not: evidence that model-dispatch work
  *  ran under a record's session. The one family test that must see an

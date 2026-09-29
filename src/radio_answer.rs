@@ -350,7 +350,6 @@ fn status_word(s: crate::crew::types::MissionStatus) -> &'static str {
     use crate::crew::types::MissionStatus as M;
     match s {
         M::Active => "active",
-        M::Paused => "paused",
         M::Finalized => "finalized",
         M::Aborted => "aborted",
     }
@@ -361,7 +360,7 @@ fn status_word(s: crate::crew::types::MissionStatus) -> &'static str {
 /// one"). Never the full board render `mission status` itself produces
 /// (that's an operator-facing table, not grounding text).
 ///
-/// Emits counts by status, the open (Active/Paused) mission ids when there
+/// Emits counts by status, the open (Active) mission ids when there
 /// are any, and — since #1713 — the most RECENT missions whatever their
 /// status. The last line is the one that matters most in practice: the
 /// questions an operator asks a console are disproportionately about what
@@ -403,10 +402,9 @@ fn render_board_block_from(missions: &[crate::crew::types::Mission]) -> Option<S
     use crate::crew::types::MissionStatus;
     let count = |s: MissionStatus| missions.iter().filter(|m| m.status == s).count();
     let mut out = format!(
-        "{} mission(s) total — {} active, {} paused, {} finalized, {} aborted.\n",
+        "{} mission(s) total — {} active, {} finalized, {} aborted.\n",
         missions.len(),
         count(MissionStatus::Active),
-        count(MissionStatus::Paused),
         count(MissionStatus::Finalized),
         count(MissionStatus::Aborted)
     );
@@ -437,7 +435,7 @@ fn render_board_block_from(missions: &[crate::crew::types::Mission]) -> Option<S
     // own comment for why (#1717 follow-up #2).
     let live_missions: Vec<&crate::crew::types::Mission> = missions
         .iter()
-        .filter(|m| matches!(m.status, MissionStatus::Active | MissionStatus::Paused))
+        .filter(|m| m.status == MissionStatus::Active)
         .take(5)
         .collect();
     let live: Vec<String> = live_missions
@@ -448,14 +446,14 @@ fn render_board_block_from(missions: &[crate::crew::types::Mission]) -> Option<S
         })
         .collect();
     if !live.is_empty() {
-        out.push_str("Active/paused: ");
+        out.push_str("Active: ");
         out.push_str(&live.join(", "));
         out.push('\n');
     }
 
     // (#1713) The MOST RECENT missions, whatever their status.
     //
-    // This block used to name only the active/paused ones, on the assumption
+    // This block used to name only the active ones, on the assumption
     // that open work is the interesting work. That is the same assumption
     // #1709 removed from the CLI board, and it failed the same way: an
     // operator with nothing open (every mission finalized — the ordinary
@@ -497,8 +495,8 @@ fn render_board_block_from(missions: &[crate::crew::types::Mission]) -> Option<S
     //
     // (#1717 follow-up #2) "not already shown above" means EVERY list
     // above, not just the recent top-5 — this line's own header says "not
-    // in the list above," and a named mission that is Active/Paused is
-    // already on the `Active/paused:` line. Before this fix the filter only
+    // in the list above," and a named mission that is Active is
+    // already on the `Active:` line. Before this fix the filter only
     // excluded `top`, so an open named mission crowded out of the top-5
     // could be emitted a SECOND time here: a genuine duplicate that also
     // makes the header's own claim false. Excluding `live_missions` too
@@ -1566,7 +1564,7 @@ pub fn answer_text(stdout: &str, cap: u32) -> Result<String> {
 /// cannot catch a substitution that stops firing and ships a raw
 /// `{{surface_instructions}}` to the model. Takes `persona` rather than
 /// loading it, so a test can pin the SHIPPED template without resolving an
-/// operator's own `~/.darkmux/crew/roles/radio-host.md` override.
+/// operator's own `~/.darkmux/roles/radio-host.md` override.
 fn substitute_persona(persona: &str, humor: u8, surface: RadioSurface) -> String {
     persona
         .replace("{{humor}}", &humor.to_string())
@@ -1805,7 +1803,6 @@ mod tests {
             created_ts: created,
             started_ts: None,
             finalized_ts: finalized,
-            paused_ts: None,
             source_input: None,
             ticket: None,
             spec: None,
@@ -1816,7 +1813,7 @@ mod tests {
     /// THE #1713 regression. Every mission finalized — the ordinary state on
     /// a machine whose recent work is all run instances — must still put
     /// mission NAMES in the bundle. Before the fix this block named only
-    /// active/paused missions, so the answering seat was handed counts and
+    /// active missions, so the answering seat was handed counts and
     /// nothing else, and correctly refused to say which was most recent.
     #[test]
     fn the_board_block_names_recent_missions_even_when_nothing_is_open() {
@@ -1850,7 +1847,7 @@ mod tests {
         ];
         let block = render_board_block_from(&missions).expect("block renders");
         // Scoped to the recent LINE on purpose: an open mission also appears
-        // on the `Active/paused:` line above it, so a whole-block `find`
+        // on the `Active:` line above it, so a whole-block `find`
         // measures which line comes first, not the ordering under test.
         let recent_line = block.lines().find(|l| l.starts_with("Most recent")).expect("line");
         let finalized_at = recent_line.find("created-early-finalized-late").unwrap();
@@ -1913,8 +1910,8 @@ mod tests {
     /// outnumber named missions) must still surface the operator's named
     /// work somewhere in the bundle — never silently crowded out entirely.
     ///
-    /// Both fixtures are non-open (`Finalized`) on purpose: an `Active` or
-    /// `Paused` floor fixture would also land on the `Active/paused:` line,
+    /// Both fixtures are non-open (`Finalized`) on purpose: an `Active`
+    /// floor fixture would also land on the `Active:` line,
     /// which would satisfy a whole-block `contains` check regardless of
     /// whether the floor logic under test ever ran. A prior version of this
     /// test used `M::Active` for `doom-loop-m4` and asserted only
@@ -1964,8 +1961,8 @@ mod tests {
 
     /// (#1717 follow-up, MUST FIX) A minted run that drops out of the "Most
     /// recent" top-5 — because five OTHER missions were touched more
-    /// recently — still appears on the `Active/paused:` line if it's
-    /// Active or Paused. Before this fix that line never marked minted
+    /// recently — still appears on the `Active:` line if it's
+    /// Active. Before this fix that line never marked minted
     /// runs, and the block's own inline definition ("`auto` marks a run
     /// the darkmux CLI launched by itself, not something the user typed")
     /// applies block-wide once stated — so an unmarked id on THIS line now
@@ -1978,7 +1975,7 @@ mod tests {
             vec![board_mission("dispatch-code-reviewer-1785589698-abc123", M::Active, 100, None)];
         // Five more-recently-touched named missions push the minted run out
         // of the top-5 "Most recent" list without changing its Active
-        // status — it can ONLY still surface via the Active/paused line.
+        // status — it can ONLY still surface via the Active line.
         missions.extend((0..RECENT_MISSIONS_IN_BOARD_BLOCK).map(|i| {
             board_mission(&format!("named-mission-{i}"), M::Finalized, 100, Some(9_000 + i as u64))
         }));
@@ -1990,23 +1987,23 @@ mod tests {
             "precondition: the minted run must be crowded out of the recent list, or this \
              test isn't exercising the bug: {recent_line}"
         );
-        let live_line = block.lines().find(|l| l.starts_with("Active/paused")).expect("line");
+        let live_line = block.lines().find(|l| l.starts_with("Active")).expect("line");
         assert!(
             live_line.contains("dispatch-code-reviewer-1785589698-abc123 (auto)"),
-            "a minted run that only surfaces via Active/paused must still carry the auto \
+            "a minted run that only surfaces via Active must still carry the auto \
              marker — an unmarked id here reads as a positive claim the user typed it: \
              {live_line}"
         );
     }
 
     /// (#1717 follow-up #2, coordinator finding) A named mission that is
-    /// itself Active/Paused — and therefore already visible on the
-    /// `Active/paused:` line — must not ALSO be re-emitted by the floor.
+    /// itself Active — and therefore already visible on the
+    /// `Active:` line — must not ALSO be re-emitted by the floor.
     /// The floor's own header claims "named work not in the list above";
     /// before this fix the floor only excluded ids already in the `Most
-    /// recent` top-5, not ids already on the `Active/paused` line, so an
+    /// recent` top-5, not ids already on the `Active` line, so an
     /// active named mission crowded out of the top-5 (but still open) got
-    /// a genuine duplicate: once on `Active/paused`, again on the floor.
+    /// a genuine duplicate: once on `Active`, again on the floor.
     /// Two lines both asserting something true about the same mission
     /// reads to a model as two DIFFERENT pieces of evidence about it, not
     /// one restated — the same failure class the MUST FIX above closed on
@@ -2016,7 +2013,7 @@ mod tests {
         use crate::crew::types::MissionStatus as M;
         // Active named mission, touched a while ago — old enough to be
         // crowded out of the RECENT_MISSIONS_IN_BOARD_BLOCK top-5 by the
-        // finalized runs below, but still Active (so it's on Active/paused).
+        // finalized runs below, but still Active (so it's on Active).
         let mut missions = vec![board_mission("1616-compactor-fix", M::Active, 100, None)];
         missions.extend((0..RECENT_MISSIONS_IN_BOARD_BLOCK).map(|i| {
             board_mission(
@@ -2034,17 +2031,17 @@ mod tests {
             "precondition: the active mission must be crowded out of the recent list: \
              {recent_line}"
         );
-        let live_line = block.lines().find(|l| l.starts_with("Active/paused")).expect("line");
+        let live_line = block.lines().find(|l| l.starts_with("Active")).expect("line");
         assert!(
             live_line.contains("1616-compactor-fix"),
-            "precondition: it must be on Active/paused: {live_line}"
+            "precondition: it must be on Active: {live_line}"
         );
 
         let occurrences = block.matches("1616-compactor-fix").count();
         assert_eq!(
             occurrences, 1,
             "an active named mission must appear exactly ONCE across the whole block, not \
-             once on Active/paused AND again on the floor's Also-tracking line: {block}"
+             once on Active AND again on the floor's Also-tracking line: {block}"
         );
     }
 
@@ -2083,7 +2080,7 @@ mod tests {
         assert!(
             !floor_line.contains("1616-compactor-fix"),
             "the active mission must not consume a floor slot it doesn't need — it's \
-             already visible on Active/paused: {floor_line}"
+             already visible on Active: {floor_line}"
         );
         assert!(floor_line.contains("older-named-a"), "{floor_line}");
         assert!(floor_line.contains("older-named-b"), "{floor_line}");
@@ -2117,7 +2114,7 @@ mod tests {
 
         let mut missions = Vec::new();
         // 5 live (Active) rows — lowest recency, but always shown on the
-        // Active/paused line regardless of where recency puts them.
+        // Active line regardless of where recency puts them.
         for i in 0..5 {
             missions.push(board_mission(&wide_id(&format!("live{i}")), M::Active, 1, None));
         }
@@ -2948,11 +2945,10 @@ mod tests {
 
     #[test]
     fn a_group_node_that_takes_a_positional_is_a_real_invocation() {
-        // MF3. The verb index held LEAVES only, so `lab run`'s children
-        // (`list`/`inspect`/`compare`) were emitted and the
-        // workload-dispatch form — THIS REPO'S OWN documented smoke
-        // command — was not. Nothing named it, so the backstop called it
-        // invented. Asserted against the LIVE index, because the fix is
+        // MF3. The verb index held LEAVES only, so a group's sub-verbs were
+        // emitted and the workload-dispatch form of `lab run` — THIS REPO'S
+        // OWN documented smoke command — was not. Nothing named it, so the
+        // backstop called it invented. Asserted against the LIVE index, because the fix is
         // that `radio_index` now asks clap for the node's positionals.
         let live = command_verb_index();
         assert!(
@@ -2960,8 +2956,9 @@ mod tests {
             "`lab run` takes a <workload> positional and must be in the index"
         );
         assert!(
-            live.iter().any(|v| v.path == "lab run list"),
-            "and its children must still be there — this adds an entry, it does not replace them"
+            // drift-guard:allow lab run inspect — asserting the retirement
+            live.iter().any(|v| v.path == "run inspect") && !live.iter().any(|v| v.path == "lab run inspect"),
+            "the recorded-run verbs are `run`'s, and `lab run` is the launcher only"
         );
         for reply in ["Run darkmux lab run quick-q to smoke it.", "Try `darkmux lab run quick-q`."] {
             assert!(
@@ -3240,7 +3237,7 @@ mod tests {
     fn radio_host_role_prompt_matches_frozen_golden() {
         // Compared against the SHIPPED template directly (`include_str!`),
         // never `crate::crew::loader::role_prompt`, which would resolve an
-        // operator's own override at `~/.darkmux/crew/roles/radio-host.md`
+        // operator's own override at `~/.darkmux/roles/radio-host.md`
         // instead — see `radio.rs`'s sibling golden test for why.
         const SHIPPED_TEMPLATE: &str = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),

@@ -123,7 +123,6 @@
 //! for the reused pid after the reader judged the old one stale is put
 //! back, never deleted.
 
-use crate::paths::expand_tilde;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -640,20 +639,11 @@ fn remove_lease(pid: u32) -> Result<()> {
     }
 }
 
-/// The registry directory: `<darkmux-home>/residency/`. Mirrors
-/// [`crate::dispatch_liveness`]'s `liveness_dir` home resolution exactly
-/// (honor `DARKMUX_HOME`, tilde-expanded, else `~/.darkmux`) so the two
-/// per-process registries always agree on where "home" is.
+/// The registry directory: `<darkmux-home>/residency/`, under the same root
+/// as [`crate::dispatch_liveness`]'s heartbeats (`paths::user_root_guarded`),
+/// so the two per-process registries always agree on where "home" is.
 fn residency_dir() -> PathBuf {
-    #[cfg(any(test, feature = "test-support"))]
-    crate::env_audit::audit_env_read("DARKMUX_HOME");
-    if let Ok(root) = std::env::var("DARKMUX_HOME") {
-        let root = root.trim();
-        if !root.is_empty() {
-            return expand_tilde(root).join("residency");
-        }
-    }
-    dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".darkmux").join("residency")
+    crate::paths::user_root_guarded().join("residency")
 }
 
 /// Is `pid` a live process? `kill(pid, 0)` sends no signal — it only probes

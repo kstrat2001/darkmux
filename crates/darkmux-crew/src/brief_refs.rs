@@ -146,8 +146,8 @@ fn resolve(r: &BriefRef, dirs: &StoreDirs) -> Result<(String, BriefRef)> {
             let key = &r.key;
             let (dispatch, seq) = crate::findings::parse_key(key).with_context(|| {
                 format!(
-                    "--finding {key:?} is not a finding key. A key is `<dispatch>/<seq>`, \
-                     e.g. `sess-abc/1` — `darkmux finding list` shows what is stored."
+                    "--finding {key:?} is not a finding key. A key is `<execution>/<seq>`, \
+                     e.g. `exec-18f3a2c-1b2-0/1` — `darkmux finding list` shows what is stored."
                 )
             })?;
             let record =

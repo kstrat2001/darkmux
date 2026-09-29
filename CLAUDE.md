@@ -7,7 +7,7 @@ This file is for any AI agent (Claude Code, Cursor, OpenClaw, etc.) that's helpi
 A Rust CLI (v2.x) that is two things for users running local LLMs:
 
 1. **Mission orchestrator**: config-defined missions launched with `darkmux mission launch <config>` that run as a live task graph. A crew of local-AI roles works the phases through the internal Docker-bounded runtime (any seat can instead be staffed by a hosted cloud endpoint), every dispatch gated on operator sign-off, each run finalizing into a typed envelope. `darkmux dispatch <role> <message>` is the task-grain entry point (one role, one turn). This is the 2.0 headline.
-2. **Lab harness**: `darkmux lab run <workload>` dispatches a workload against the same internal runtime and records timing + trajectory + verify outcome under `.darkmux/runs/<run-id>/`.
+2. **Lab harness**: `darkmux lab run <workload>` dispatches a workload against the same internal runtime and records timing + trajectory + verify outcome under `.darkmux/lab/<run-id>/`.
 
 **Backend, stated honestly (#316):** darkmux drives **LMStudio** today, and only LMStudio. The residency arbiter, the `darkmux:` namespace convention, the empirical profile defaults, and every `lms`-shell-out in `darkmux-gestalt` are LMStudio-shaped. An earlier version of this line claimed "LMStudio + Ollama + llama.cpp"; that was aspiration, not capability, and a fresh agent session reading it would confidently propose work against backends that don't exist. A `ModelBackend` abstraction is tracked as #316 and is deliberately NOT being built — revisit when a real second backend has a real user. Until then: don't deepen LMStudio coupling gratuitously in new code, but don't pretend the abstraction is there either.
 
@@ -406,12 +406,11 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    in test code, the viewer, docs, skills, templates and fixtures, on any string that looks
    like an action and is not a current one (an old spelling, or a made-up
    `<scope>.<event>`); recorded archives are exempt.
-   Hook rules written in an old exact spelling are read as the current action. The bookends
-   `dispatch.start`/`dispatch.complete` are still emitted at BOTH grains today (the whole
-   run, and an inner role execution); separating the run grain is the migration below. What
-   entry 8 fixes is the WORD used in code, docs and UI, where `dispatch` had come to mean
-   both ends of the ladder at once. Both contracts stand: contract 2 says liveness must be
-   visible, contract 8 says which noun means which grain.
+   Hook rules written in an old exact spelling are read as the current action. What entry 8
+   fixes is the WORD used in code, docs, UI and on the wire, where `dispatch` had come to
+   mean both ends of the ladder at once; the run grain now has its own bookends (below).
+   Both contracts stand: contract 2 says liveness must be visible, contract 8 says which
+   noun means which grain.
 
    Verified by enumerating every completion-endpoint (`chat/completions`) call site — five
    modules. Two host-side entry points bookend per execution and are correct:
@@ -438,29 +437,45 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
      `dispatch.single_shot` kind (`crates/darkmux-crew/src/step_kinds/builtins.rs:794`,
      hosted twin at `:738`) — not review-specific, and not used by `review.json`.
 
-   **Retiring the run-grain use is a CONSUMER MIGRATION, not a free deletion.** An earlier
-   draft of this entry claimed it "costs nothing in liveness" because the scheduler already
-   emits `step.start`/`step.complete`/`step.error` per step (`scheduler.rs`'s
-   `step_lifecycle_record`) under a `mission.start`. That is
-   true and irrelevant: the consumers key specifically on DISPATCH bookends at the session
-   grain, and step bookends do not feed any of them. The run lifecycle — ONE rule with two
-   executors judged by the same corpus (`tests/lifecycle/cases.json`): the viewer's
-   `ui/src/lib/lifecycle.ts` and the daemon's `crates/darkmux-serve/src/run_lifecycle.rs`
-   — opens an attempt on `dispatch.start` and takes its outcome from the dispatch terminal,
-   and every surface (fleet card, timeline, run page, runs board, radio's busy check) is a
-   projection of it. The runs board's representative-session pick prefers the whole-run
-   bookend (losing it already blanked role/model once), and the status line's last-dispatch
-   (`ui/src/lib/metaLine.ts`) reads `dispatch.start`. Delete the emission first and those
-   surfaces go dark.
+   **Every record of an execution names it: `execution_id` (4.0).** The id
+   (`darkmux_types::execution_id::ExecutionId`) is minted ONCE per role execution at the
+   host entries that run one: `crew::dispatch::dispatch` (which covers the hosted
+   single-shot path), `dispatch_local_single_shot`, the `dispatch.single_shot` step kind, and
+   each ITEM of a `dispatch.map` (a map step writes no `dispatch.*` pair of its own; the
+   scheduler's `step.start`/`step.complete` cover the step). It is stamped through ONE
+   builder path (`FlowRecord::for_execution`, called by `darkmux_crew::dispatch`'s
+   builders), on every record whose action declares `Execution` grain (`FlowAction::grain`,
+   on the action's row): the `dispatch.*` bookends, turns, tool calls, `telemetry.*` and
+   `budget.*` records. `CheckedRecord::check` refuses to write one without it. The
+   compactor's sub-execution records carry the PARENT's id (its usage record is `purpose:
+   utility`, so a sum can split it out); a host-side utility job (radio routing) mints its own
+   for its usage record and its markers carry none; a resumed dispatch continues its execution (the id
+   rides in the out-dir's `resume_origin.json`, beside the checkpoint the runtime writes);
+   a specialist change mints a new one. Consumers key on it: the token sum's legacy
+   fallback, the DISPATCHES chip, `records_emitted`'s pairing, both lifecycle executors'
+   attempts, and the finding store (`<execution_id>/<seq>`). A record from before 4.0
+   names none, and `darkmux_flow::legacy::execution_of` (the reader) and `ingest.ts` (the
+   viewer) give it `legacy:<session>:<mission>`: the ONLY place the old
+   `(session, mission)` grouping survives; no file is rewritten.
 
-   Note also that #1899 PRESCRIBED the whole-run pair for every generic launch three days
-   before this entry was written (`src/mission_launch.rs:~684`: "telemetry + the whole-run
-   dispatch bookend are PRESCRIBED here, not opt-in"). This entry supersedes that
-   deliberately, and the supersession is the point: contract 8 wins on the NOUN, #1899 wins
-   on the MECHANISM. The run grain keeps its bookend and gets its own action vocabulary
-   (`run.start`/`run.complete`/`run.error`), so `dispatch.*` can mean one specialist
-   execution. Archives are append-only and are never rewritten, so the run-grain split
-   reaches old records through `darkmux_flow::legacy`, like every other retired spelling.
+   **The run grain has its own bookends (4.0).** A `mission launch` and an ACP panel run
+   open `run.start` on the run's own session and close it with `run.complete` or
+   `run.error` on every exit path (a `BookendGuard`: a panic or an early return still
+   writes `run.error`). The role executions inside it bookend as `dispatch.*`, so
+   `dispatch.*` means one role execution and nothing else. #1899 prescribed the whole-run
+   pair for every generic launch; that mechanism stands, only its noun changed. Which
+   actions are bookends, at which grain and edge, is declared once, on the action's row in
+   `action.rs` (`FlowAction::bookend`; the viewer's `bookendOf` mirrors it). The run
+   lifecycle — ONE rule with two executors judged by the same corpus
+   (`tests/lifecycle/cases.json`): the viewer's `ui/src/lib/lifecycle.ts` and the daemon's
+   `crates/darkmux-serve/src/run_lifecycle.rs` — opens an attempt on a bookend start at
+   either grain and takes its outcome from a bookend terminal. The runs board's
+   representative is the run session its `run.start` opened, the fleet card collapses a
+   mission onto its run-grain group, and the status line's last-dispatch counts role
+   executions only. A pre-4.0 archive's whole-run pair (`dispatch.*` with `source`
+   `mission`, or the retired review launcher's `review`) reads as `run.*` through
+   `darkmux_flow::legacy::run_grain_of`; no file is rewritten and no consumer reads
+   `source` to tell the grains apart.
 
    **"step" is a known-imperfect name, deliberately not being changed (operator, 2026-08-26.)**
    It implies plurality, so it reads badly for a single-step dispatch — but a task genuinely
@@ -542,8 +557,8 @@ When proposing a config change to an operator, write the visible field; don't re
 
 **Carve-outs — the ONLY things NOT plaintext config:**
 - **Redis password → macOS Keychain** (item `darkmux-redis`, the same item the Homebrew wrapper populates). `config.redis` holds only non-secret bits (`enabled`/`host`/`port`/`db`/`stream`/`maxlen`); the password is read at runtime via `security find-generic-password` and never logged — every URL is wrapped in `RawRedisUrl` (redacted `Display` + `Debug`; raw bytes only via `expose_for_probe`). Non-macOS uses the full-URL env override. `redis_url()` resolves `env(DARKMUX_REDIS_URL) verbatim > config.redis.enabled + Keychain > off`.
-- **Serve-daemon bearer token → macOS Keychain** (item `darkmux-serve-token`) — #881, same carve-out shape as the Redis password. `config.runtime` holds only the non-secret `daemon_auth_enabled` gate; the token is read at runtime via `security find-generic-password`, wrapped in `RawServeToken` (redacted `Display` + `Debug`; raw bytes only via `expose_for_compare`), and lives in `darkmux-flow` beside the Redis-secret machinery. `serve_token()` resolves `env(DARKMUX_SERVE_TOKEN) verbatim > daemon_auth_enabled + Keychain > off`. Auth is *active* iff a token resolves; a non-loopback `--bind` is refused without one, and remote reads + `/diff` then require `Authorization: Bearer <token>` (loopback stays open).
-- **`DARKMUX_HOME`** — the bootstrap pointer that *locates* the config root (`<root>/config.json`); it can't live inside the config it finds, so it stays an env var.
+- **Serve-daemon bearer token → macOS Keychain** (item `darkmux-serve-token`) — #881, same carve-out shape as the Redis password. `config.serve` holds only the non-secret `token_keychain` gate; the token is read at runtime via `security find-generic-password`, wrapped in `RawServeToken` (redacted `Display` + `Debug`; raw bytes only via `expose_for_compare`), and lives in `darkmux-flow` beside the Redis-secret machinery. `serve_token()` resolves `env(DARKMUX_SERVE_TOKEN) verbatim > serve.token_keychain + Keychain > off`. **Read auth and execution auth are separate switches (#2988).** EXECUTION (fleet work submission, the only surface that starts work) always requires the token plus the network-verified sender, whatever else is set. READS (the viewer, every JSON route, `/worktree-summary`, the live SSE stream) are governed by `serve.read_auth` (`DARKMUX_SERVE_READ_AUTH`), default `false`: reads stay tailnet-open by design, token or no token. With `serve.read_auth` on, only a request from THIS machine stays open: a loopback peer carrying no reverse-proxy header (`is_local_request` in `darkmux-serve`, the one predicate for every local decision); a request proxied to loopback, e.g. by `tailscale serve` (it sets `X-Forwarded-For` / `Tailscale-User-*`), is NOT treated as loopback and needs `Authorization: Bearer <token>`; a request is also local only when its `Host` header names this daemon: `localhost`, `127.0.0.1`, `[::1]` or the bound address, with no port or the bound port. A DNS-rebound page (loopback peer, the attacker's Host) and a browser reaching the daemon through a header-less `tailscale serve --tcp` proxy (the tailnet name as Host) are therefore not local, and a request with no `Host` is not local. Known limit: `Host` is client-set, so a non-browser client behind a TCP forward that adds no headers can send `Host: localhost` and cannot be told apart from this machine; for that setup use the HTTPS `tailscale serve` (it adds headers) or keep read auth on with a non-loopback bind. An IPv4-mapped loopback peer (`::ffff:127.0.0.1`) is loopback. Two panels whose output describes the execution surface (`doctor`: the fleet listener's overlay address, port and busy policy and the allow-list's node names and roles; `config-list`: the whole `config.json`, allow-list included) are served only to a local request or a caller presenting the serve token, even with read auth off, as `/health` withholds the same facts; the other panels (`mission-status`, `role-list`, `machine-status`, `flow-status`, `lab-fixture-list`, `run-list`) follow the read posture. `darkmux serve` also runs the same config gate every other entry point runs, so a wrong-typed value (`serve.read_auth: "true"`) or a retired key refuses the start instead of dropping the file to defaults. `serve` refuses to start with read auth on and no token, and refuses a non-loopback `--bind` unless read auth is on.
+- **`DARKMUX_HOME`** — the bootstrap pointer that *locates* the config root (`<root>/config.json`); it can't live inside the config it finds, so it stays an env var. It is the ONE relocation of the darkmux root: a `./.darkmux/` in the working directory is never adopted, nor is a cwd `profiles.json` / `.darkmux.json` registry (only a repo's `lessons.db` and `conventions.json` are read from it; `darkmux doctor` warns about anything else in it), and `dirs.crew` / `DARKMUX_CREW_DIR` are retired (a set retired env var is refused by every command except `doctor` and `config`, through the one check at the top of `run` in `src/main.rs`, and failed by doctor).
 
 **Loading never bricks, consuming refuses** (CONFIG 2.0, contract 7): all-`Option` + `#[serde(flatten)] extras` overflow means a partial, hand-edited or malformed config never bricks the CLI and `darkmux doctor` always runs, but a key the schema does not know is refused at every entry point's preflight and failed by doctor, naming the closest valid key. So an older binary refuses a newer config's new key: add fields as a minor bump, and upgrade the binary before writing them. `CONFIG_SCHEMA_VERSION` lives in `darkmux-types/src/config.rs`.
 
@@ -621,7 +636,10 @@ src/                          CLI command layer (clap)
   crawl_launch.rs             The crawl launcher (#1959) — `mission launch crawl`'s Task/Step graph is computed at run time from a resolved crawl plan (darkmux-lab's `crawl::plan`), never declared in a mission-config document; routed by literal config id, BEFORE `mission_config::load` runs
   coder_phase.rs              coder-phase pipeline StepKinds (worktree/coder/verify): Tier-3 bespoke, launch-owned (`mission run` retired #1426 ship-4)
   mission_status.rs           `mission status`: the read-only mission board
-  lab_cli.rs                  `lab` family — kind-family shape (#1465): `run {<dispatch>·list·inspect·compare}` · `workload list` · `fixture {list·register·unregister}` · `eval <role>` · `loop`/`characterize`/`tune`/`doctor`
+  run_list.rs                 `run list`: the cross-kind union (mission, dispatch, lab), the CLI twin of `GET /runs`
+  run_records.rs              `run inspect|stats|compare`: read a lab run's recorded artifacts; refuses mission and dispatch runs, naming where to look
+  retired_verbs.rs            The ONE table of retired verb spellings and flags (`mission dispatch`, `lab run list|inspect|stats|compare`, `finding list --dispatch`, ...): checked before clap so the refusal names the replacement
+  lab_cli.rs                  `lab` family — kind-family shape (#1465): `run <workload>` (the launcher only; recorded runs are read through `darkmux run`) · `workload list` · `fixture {list·register·unregister}` · `eval <role>` · `loop`/`characterize`/`tune`/`doctor`
   phase_cli.rs                Code-review output rendering (`phase_review_output_at`) for the coder-phase QA gate; the `phase` verb family retired (#1463)
   mod_cli.rs                  `mod` family (create/list/show over the write-once mod store)
   role_cli.rs                 `role` family (list/show from the SQLite index)
@@ -749,7 +767,7 @@ If a user asks you to:
 | "add a lab fixture" | Create a dir with a `.fixture.json` manifest (`name` required; `satisfies`, `verify_command`, `required_files` optional), then `darkmux lab fixture register <path>`. A workload binds to it via `requires_fixture: "<name>@<version>"`. Built-ins live under `templates/builtin/lab-fixtures/` and register via `scripts/lab-init.sh`. |
 | "check fixtures are healthy" | `darkmux lab doctor` — offline check that registered paths exist, manifests load, required files are present, and content hashes haven't drifted. |
 | "run the smoke test" | `cargo install --path . && darkmux lab run quick-q`. Should complete in ~6-10s if a model is loaded. |
-| "draft a notebook entry" | Invoke the bundled `darkmux-lab-notebook` skill (installed by `darkmux init`): it reads `darkmux lab run stats <run-id> --json` (and the run's `manifest.json` when needed) and drafts the entry, observation first, with the verify outcome stated as recorded, then writes it wherever the operator's own instructions say. The `lab notebook draft`/`list` verbs and the `scribe` role were removed in 4.0 (#2913). |
+| "draft a notebook entry" | Invoke the bundled `darkmux-lab-notebook` skill (installed by `darkmux init`): it reads `darkmux run stats <run-id> --json` (and the run's `manifest.json` when needed) and drafts the entry, observation first, with the verify outcome stated as recorded, then writes it wherever the operator's own instructions say. The `lab notebook draft`/`list` verbs and the `scribe` role were removed in 4.0 (#2913). |
 | "make the build self-contained" | Already is — `include_str!` for embedded workloads, no external assets needed at runtime. |
 | "review the diff before commit" | Run the AREA you touched (`cargo t-review`, `cargo t-flow`, … — see "Testing — run the area, not the world"; `t-all` only for a cross-cutting change or a release), eyeball `git diff`, propose a commit message — but **do not commit unless explicitly asked**. |
 | "check the mission board / housekeeping" | `darkmux mission status` (#829) — the global mission-control read: every mission grouped by status with phase progress + the drift that needs attention (an open mission whose phases are all done; a stalled Active mission; a phase permanently blocked by an earlier abandoned one) + copy-pasteable reconcile commands. READ-ONLY — surfaces + suggests, never mutates; the operator/you run the suggested `mission finalize`/`mission abort` (#1463 — those two whole-mission terminals reconcile phases now, so a "Finalized mission with a non-terminal phase" is no longer a reachable drift). `--json` for programmatic consumption. **Run it as session-start housekeeping** (and before opening PRs / wrapping a work arc) so mission↔phase drift gets caught structurally rather than by memory — and so gh/jira stay reconciled off the same cue. The CLI twin of the viewer's missions lens (#827). |

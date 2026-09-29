@@ -14,7 +14,7 @@ ARGUMENTS expected: `<run-A> <run-B>`
 ## Step 0 — If user didn't provide run IDs, list recent runs first
 
 ```bash
-darkmux lab run list --limit 5
+darkmux run list --kind lab --limit 5
 ```
 
 This prints the 5 most-recent run IDs with their workload, profile, wall clock, and ok/error status. Surface the table and ask which two to compare.
@@ -22,7 +22,7 @@ This prints the 5 most-recent run IDs with their workload, profile, wall clock, 
 ## Step 1 — Diff
 
 ```bash
-darkmux lab run compare "$ARGUMENTS"
+darkmux run compare "$ARGUMENTS"
 ```
 
 (Pass both args separated by a space — clap parses them.)

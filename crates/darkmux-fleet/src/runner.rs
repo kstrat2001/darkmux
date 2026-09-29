@@ -147,7 +147,7 @@ impl WorkJob {
             // through WorkJob, this can read self.json.)
             json: false,
             workdir: self.workdir.map(PathBuf::from),
-            phase_id: self.phase_id,
+            phase_id: None,
             // A received job runs HERE: never forwarded to another machine
             // (that would bounce jobs between machines); always synchronous.
             machine: None,
@@ -193,7 +193,6 @@ mod tests {
             session_id: crate::test_session("s"),
             profile: Some("host".into()),
             workdir: None,
-            phase_id: Some("p".into()),
             image: Some("rust:slim".into()),
             timeout_seconds: 60,
             published_at_unix_ms: 1,
@@ -209,7 +208,7 @@ mod tests {
         assert_eq!(o.role_id, "coder");
         assert_eq!(o.profile_name.as_deref(), Some("host"));
         assert_eq!(o.session, crate::test_session("s"));
-        assert_eq!(o.phase_id.as_deref(), Some("p"));
+        assert!(o.phase_id.is_none(), "a received job carries no phase (#2954)");
         assert_eq!(o.image.as_deref(), Some("rust:slim"));
         assert!(o.machine.is_none(), "a received job runs here; it is never forwarded");
         assert!(!o.allow_utility_model);
@@ -241,7 +240,7 @@ mod tests {
         let mut seen = None;
         let r = execute_job_with(job(), "resolved-host".into(), "laptop".into(), |o| {
             seen = Some((o.profile_name.clone(), o.remote_origin.clone(), o.machine.clone()));
-            Ok(DispatchResult { exit_code: 0, stdout: String::new(), stderr: String::new(), session_id: crate::test_session("s"), out_dir: None, trajectory: None })
+            Ok(DispatchResult { exit_code: 0, stdout: String::new(), stderr: String::new(), session_id: crate::test_session("s"), execution: None, out_dir: None, trajectory: None })
         });
         assert!(r.is_ok());
         assert_eq!(seen, Some((Some("resolved-host".into()), Some("laptop".into()), None)));
@@ -257,13 +256,13 @@ mod tests {
             execute_job_with(job(), "host".into(), "laptop".into(), |_| {
                 started_tx.send(()).unwrap();
                 release_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-                Ok(DispatchResult { exit_code: 0, stdout: String::new(), stderr: String::new(), session_id: crate::test_session("s"), out_dir: None, trajectory: None })
+                Ok(DispatchResult { exit_code: 0, stdout: String::new(), stderr: String::new(), session_id: crate::test_session("s"), execution: None, out_dir: None, trajectory: None })
             })
         });
         started_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
         // A second job starts and finishes while the first still runs.
         let short = execute_job_with(job(), "host".into(), "laptop".into(), |_| {
-            Ok(DispatchResult { exit_code: 0, stdout: String::new(), stderr: String::new(), session_id: crate::test_session("s"), out_dir: None, trajectory: None })
+            Ok(DispatchResult { exit_code: 0, stdout: String::new(), stderr: String::new(), session_id: crate::test_session("s"), execution: None, out_dir: None, trajectory: None })
         });
         assert!(short.is_ok());
         assert!(dispatch_in_flight(), "the first job is still running");

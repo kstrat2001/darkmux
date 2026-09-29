@@ -418,14 +418,14 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   });
 
   it("never reads noSignal for a genuinely idle run (no live execution) even though state is also null", () => {
-    // A mission's own run-grain session never generates — its own
-    // `dispatch.start` is mission-sourced, so `liveExecutions` excludes it:
+    // A mission's own run-grain session never generates — it opens on
+    // `run.start`, so `liveExecutions` excludes it:
     // there is model work (this session DID start), but no live EXECUTION
     // to derive a state from. `state` reads null the same as the
     // disconnected case above, for a wholly unrelated reason — and even
     // while `connected` is explicitly `false` here, `noSignal` must stay
     // `false`, since nothing about THIS null came from a connection problem.
-    const data: RawRecord[] = [{ ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder", source: "mission" }];
+    const data: RawRecord[] = [{ ts: BASE_TS, session_id: "s1", action: "run.start", handle: "coder" }];
     const view = runRegions(flowToRenderModel(data), "s1", Date.parse(BASE_TS) + 1_000, false);
     expect(view.liveTokScope).not.toBeNull();
     expect(view.liveTokScope!.state).toBeNull();

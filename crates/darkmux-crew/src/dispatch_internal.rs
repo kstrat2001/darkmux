@@ -16,7 +16,9 @@
 
 use crate::dispatch::DispatchResult;
 use crate::dispatch::DispatchOpts;
+use darkmux_types::execution_id::ExecutionId;
 use darkmux_types::session_id::SessionId;
+use darkmux_types::shell::quote as shell_quote;
 use crate::loader::{load_autonomous_dispatch_preamble, load_roles};
 use anyhow::{anyhow, bail, Context, Result};
 use std::fs;
@@ -975,6 +977,7 @@ pub(crate) fn write_resume_origin_meta(
     workspace: &Path,
     workspace_read_only: bool,
     image: Option<&str>,
+    execution: &ExecutionId,
 ) {
     let recorded_workspace =
         workspace.canonicalize().unwrap_or_else(|_| workspace.to_path_buf());
@@ -982,6 +985,7 @@ pub(crate) fn write_resume_origin_meta(
         "workspace": recorded_workspace.display().to_string(),
         "workspace_read_only": workspace_read_only,
         "image": image,
+        "execution_id": execution,
     });
     let path = host_out.join(RESUME_ORIGIN_FILENAME);
     match serde_json::to_vec_pretty(&body) {
@@ -1000,15 +1004,28 @@ pub(crate) fn write_resume_origin_meta(
     }
 }
 
-/// (#2774 review F2) Shell-quote one argument for a hint an operator is
-/// expected to PASTE. A workspace path with a space in it (`~/My
-/// Projects/...`) otherwise produces a command that silently means
-/// something else.
-fn shell_quote(s: &str) -> String {
-    if !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-./:@+=,".contains(&b)) {
-        s.to_string()
-    } else {
-        format!("'{}'", s.replace('\'', r"'\''"))
+/// The execution a dispatch runs as. A resumed dispatch continues the one
+/// its checkpoint's out-dir recorded (in [`RESUME_ORIGIN_FILENAME`], beside
+/// the checkpoint: the runtime writes the checkpoint itself, inside the
+/// container, and knows no host identity); every other dispatch is a new
+/// execution, as is a resume from a dir written before 4.0, which recorded
+/// none.
+pub(crate) fn execution_for(resume_from: Option<&Path>) -> ExecutionId {
+    resume_from.and_then(recorded_execution).unwrap_or_else(ExecutionId::mint)
+}
+
+/// The execution `out_dir`'s resume-origin file names, when it names one.
+/// The file's content is model-controlled, so only a minted-grammar id is
+/// believed; anything else is refused with a note and the caller mints anew.
+fn recorded_execution(out_dir: &Path) -> Option<ExecutionId> {
+    let origin: serde_json::Value = serde_json::from_str(&read_out_dir_text(out_dir, RESUME_ORIGIN_FILENAME)?).ok()?;
+    let named = origin.get("execution_id")?.as_str()?;
+    match ExecutionId::parse_minted(named) {
+        Ok(id) => Some(id),
+        Err(_) => {
+            eprintln!("darkmux dispatch: ⚠ the resume origin names an execution id that is not a minted one; starting a new execution");
+            None
+        }
     }
 }
 
@@ -1036,7 +1053,6 @@ fn shell_quote(s: &str) -> String {
 pub(crate) fn resume_hint_from_origin(
     host_out: &Path,
     role_id: &str,
-    phase_id: Option<&str>,
 ) -> String {
     let origin = read_out_dir_text(host_out, RESUME_ORIGIN_FILENAME)
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
@@ -1073,10 +1089,6 @@ pub(crate) fn resume_hint_from_origin(
     if let Some(image) = image {
         cmd.push_str(" --image ");
         cmd.push_str(&shell_quote(image));
-    }
-    if let Some(phase_id) = phase_id {
-        cmd.push_str(" --phase-id ");
-        cmd.push_str(&shell_quote(phase_id));
     }
     format!("{cmd} (once conditions look better — this pause does not clear on its own)")
 }
@@ -1807,18 +1819,18 @@ pub struct DockerRunConfig {
     /// flow records), so plain argv/`ps` visibility is fine, same as
     /// `--model`.
     pub role_id: String,
-    /// (#2386) This dispatch's session id — passed to the container as
-    /// `--session-id`. It is the `<dispatch>` half of every finding key
+    /// (#2386) This dispatch's execution — passed to the container as
+    /// `--execution-id`. It is the `<execution>` half of every finding key
     /// `materialize_finding` files an accepted `create_finding` call under
-    /// (`<session_id>/<emit_seq>`), so handing it to the runtime is what
+    /// (`<execution_id>/<emit_seq>`), so handing it to the runtime is what
     /// lets `create_finding` return the REAL key the model must name in a
     /// later `create_mod`'s `for` — and what lets `create_mod` refuse a key
     /// this run never recorded and its brief never handed it. Before this,
     /// the only key-shaped text in a reviewer's context was the tool
     /// description's own example, which one seat copied onto six mods that
-    /// linked to nothing. Not secret (it is already in the container name
-    /// and on every flow record), so plain argv visibility is fine.
-    pub session_id: SessionId,
+    /// linked to nothing. Not secret (it is already on every flow record),
+    /// so plain argv visibility is fine.
+    pub execution: ExecutionId,
     /// Resolved model name for the runtime CLI.
     pub model: String,
     /// Full system prompt (preamble + role prompt, specialist roles only).
@@ -2133,8 +2145,8 @@ pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
     // (#2386) Unconditional, same as `--role-id`: the runtime needs its own
     // finding-key namespace on every dispatch, not only on a crawl — any
     // role with the `create_finding`/`create_mod` palette mints keys.
-    args.push("--session-id".to_string());
-    args.push(config.session_id.wire());
+    args.push("--execution-id".to_string());
+    args.push(config.execution.to_string());
     args.push("--system".to_string());
     args.push(config.system_prompt.clone());
     // (#1038) Role-declared output schema → runtime `--response-schema` →
@@ -2403,6 +2415,7 @@ impl<'a> DispatchBookendGuard<'a> {
         sink: &'a mut dyn darkmux_flow::BookendSink,
         role_id: String,
         session: SessionId,
+        execution: ExecutionId,
         model: String,
         phase_id: Option<String>,
         // (#1959) Same provenance merge as every other record this
@@ -2426,6 +2439,7 @@ impl<'a> DispatchBookendGuard<'a> {
                 darkmux_flow::FlowAction::DispatchError,
                 &role_id,
                 &session,
+                &execution,
                 Some(&model),
                 phase_id.as_deref(),
                 Some(payload),
@@ -3270,6 +3284,7 @@ pub(crate) fn parse_hosted_response(
 fn emit_single_shot_usage(
     role_id: &str,
     session: &SessionId,
+    execution: &ExecutionId,
     model: &str,
     phase_id: Option<&str>,
     payload: serde_json::Value,
@@ -3280,6 +3295,7 @@ fn emit_single_shot_usage(
         crate::usage::USAGE_SOURCE,
         role_id,
         session,
+        execution,
         Some(model),
         phase_id,
         payload,
@@ -3301,6 +3317,7 @@ fn emit_single_shot_usage(
 fn build_remote_record(
     role_id: &str,
     session: &SessionId,
+    execution: &ExecutionId,
     model: &str,
     phase_id: Option<&str>,
     action: darkmux_flow::FlowAction,
@@ -3311,6 +3328,7 @@ fn build_remote_record(
         action,
         role_id,
         session,
+        execution,
         Some(model),
         phase_id,
         Some(payload),
@@ -3367,6 +3385,7 @@ pub(crate) const DIRECT_TOKEN_KEYS: [&str; 5] = [
 /// unmanaged endpoint (`try_resolve_remote_target`).
 fn dispatch_remote(
     opts: &DispatchOpts,
+    execution: &ExecutionId,
     _role: &crate::types::Role,
     system_prompt: &str,
     target: &crate::target::Target,
@@ -3411,6 +3430,7 @@ fn dispatch_remote(
     let budget_caller = crate::budget::BudgetCaller {
         role_id: Some(&opts.role_id),
         session,
+        execution,
         model: Some(&pm.id),
         phase_id: phase,
         profiles_file: opts.config_path.as_deref(),
@@ -3431,6 +3451,7 @@ fn dispatch_remote(
     };
     let role_id_for_abort = opts.role_id.clone();
     let session_for_abort = session.clone();
+    let execution_for_abort = execution.clone();
     let model_for_abort = pm.id.clone();
     let phase_for_abort = phase.map(str::to_string);
     let label_for_abort = label.clone();
@@ -3440,6 +3461,7 @@ fn dispatch_remote(
             darkmux_flow::FlowAction::DispatchError,
             &role_id_for_abort,
             &session_for_abort,
+            &execution_for_abort,
             Some(&model_for_abort),
             phase_for_abort.as_deref(),
             Some(serde_json::json!({
@@ -3460,6 +3482,7 @@ fn dispatch_remote(
         build_remote_record(
             &opts.role_id,
             session,
+            execution,
             &pm.id,
             phase,
             darkmux_flow::FlowAction::DispatchStart,
@@ -3505,6 +3528,7 @@ fn dispatch_remote(
                 build_remote_record(
                     &opts.role_id,
                     session,
+                    execution,
                     &pm.id,
                     phase,
                     darkmux_flow::FlowAction::DispatchError,
@@ -3527,6 +3551,7 @@ fn dispatch_remote(
     emit_single_shot_usage(
         &opts.role_id,
         session,
+        execution,
         &pm.id,
         phase,
         reply.usage_payload(
@@ -3576,6 +3601,7 @@ fn dispatch_remote(
         build_remote_record(
             &opts.role_id,
             session,
+            execution,
             &pm.id,
             phase,
             darkmux_flow::FlowAction::DispatchComplete,
@@ -3604,6 +3630,7 @@ fn dispatch_remote(
         stdout,
         stderr: String::new(),
         session_id: session.clone(),
+        execution: Some(execution.clone()),
         out_dir: None,
         trajectory: None,
     })
@@ -3669,6 +3696,8 @@ fn dispatch_remote(
 /// follow-up when a real second caller needs it; left unbuilt here rather
 /// than adding speculative shape for a consumer that doesn't exist yet.
 pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> {
+    // One execution: the record of every call below names it.
+    let execution = &ExecutionId::mint();
     // (#2947) Bad enum config refuses before anything, same as `dispatch`.
     crate::user_files::preflight_with(darkmux_types::config_enum::Scope::Dispatch, opts.config_path.as_deref())?;
     darkmux_flow::daemon_probe::nudge_if_daemon_unreachable("dispatch");
@@ -3720,7 +3749,7 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
                 opts.role_id
             );
         }
-        return dispatch_remote(&opts, &remote_role, &system_prompt, &pm);
+        return dispatch_remote(&opts, execution, &remote_role, &system_prompt, &pm);
     }
 
     // (#1698 Packet B2) `system_prompt_override` skips BOTH the loader
@@ -3791,6 +3820,7 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
     };
     let role_id_for_abort = opts.role_id.clone();
     let session_for_abort = session.clone();
+    let execution_for_abort = execution.clone();
     let model_for_abort = model_id.clone();
     let phase_for_abort = phase.map(str::to_string);
     let on_abort = move |_id: &str, _kind: &str| {
@@ -3799,6 +3829,7 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
             darkmux_flow::FlowAction::DispatchError,
             &role_id_for_abort,
             &session_for_abort,
+            &execution_for_abort,
             Some(&model_for_abort),
             phase_for_abort.as_deref(),
             Some(serde_json::json!({
@@ -3816,6 +3847,7 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
         build_remote_record(
             &opts.role_id,
             session,
+            execution,
             &model_id,
             phase,
             darkmux_flow::FlowAction::DispatchStart,
@@ -3879,6 +3911,7 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
                 build_remote_record(
                     &opts.role_id,
                     session,
+                    execution,
                     &model_id,
                     phase,
                     darkmux_flow::FlowAction::DispatchError,
@@ -3895,6 +3928,7 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
     emit_single_shot_usage(
         &opts.role_id,
         session,
+        execution,
         &model_id,
         phase,
         reply.usage_payload(
@@ -3931,6 +3965,7 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
         build_remote_record(
             &opts.role_id,
             session,
+            execution,
             &model_id,
             phase,
             darkmux_flow::FlowAction::DispatchComplete,
@@ -3943,6 +3978,7 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
         stdout: reply.content,
         stderr: String::new(),
         session_id: session.clone(),
+        execution: Some(execution.clone()),
         out_dir: None,
         trajectory: None,
     })
@@ -4847,6 +4883,9 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_micros())
         .unwrap_or(0);
+    // One execution, whichever way this dispatch runs (hosted single-shot or
+    // container): every record of it below names this id.
+    let execution = execution_for(opts.resume_from.as_deref());
     let remote_target = try_resolve_remote_target(&opts)?;
     let mut agentic_pm: Option<crate::target::Target> = None;
     if let Some((role, system_prompt, pm)) = remote_target {
@@ -4881,7 +4920,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
                 // still covers this guard.
                 bail!(resume_from_bare_hosted_refusal(&opts.role_id));
             }
-            return dispatch_remote(&opts, &role, &system_prompt, &pm);
+            return dispatch_remote(&opts, &execution, &role, &system_prompt, &pm);
         }
     }
 
@@ -4911,6 +4950,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             &crate::budget::BudgetCaller {
                 role_id: Some(&opts.role_id),
                 session: &opts.session,
+                execution: &execution,
                 model: Some(&t.model.id),
                 phase_id: opts.phase_id.as_deref(),
                 profiles_file: opts.config_path.as_deref(),
@@ -5282,6 +5322,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
                 darkmux_flow::FlowAction::DispatchWorkdirGitUnavailable,
                 &opts.role_id,
                 &session,
+                &execution,
                 Some(&model),
                 phase_id.as_deref(),
                 Some(serde_json::json!({
@@ -5389,7 +5430,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // workspace path/mount-mode into its own host_out, unconditionally —
     // the host-held record a LATER --resume-from reads back rather than
     // guessing. See `write_resume_origin_meta`'s own doc.
-    write_resume_origin_meta(&host_out, &workspace, opts.workspace_read_only, opts.image.as_deref());
+    write_resume_origin_meta(&host_out, &workspace, opts.workspace_read_only, opts.image.as_deref(), &execution);
 
     // (#2114 follow-up / #2162) `--resume-from <dir>` trigger: the checkpoint
     // was already validated — see the `validate_resume_checkpoint` call
@@ -5481,6 +5522,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         &mut dispatch_flow_sink,
         opts.role_id.clone(),
         session.clone(),
+        execution.clone(),
         model.clone(),
         phase_id.clone(),
         opts.record_context.clone(),
@@ -5490,6 +5532,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         darkmux_flow::FlowAction::DispatchStart,
         &opts.role_id,
         &session,
+        &execution,
         Some(&model),
         phase_id.as_deref(),
         Some(dispatch_start_payload),
@@ -5740,7 +5783,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         image: run_image.clone(),
         role_id: opts.role_id.clone(),
         // (#2386) The SAME id `materialize_finding` keys stored findings by.
-        session_id: session.clone(),
+        execution: execution.clone(),
         model: model.clone(),
         system_prompt: system_prompt.clone(),
         output_schema: role.output_schema.clone(),
@@ -5956,6 +5999,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         // workspace. The tailer reads from there.
         host_out.clone(),
         session.clone(),
+        execution.clone(),
         opts.role_id.clone(),
         model.clone(),
         phase_id.clone(),
@@ -6079,6 +6123,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         &sampler_stop,
         opts.role_id.clone(),
         session.clone(),
+        execution.clone(),
         model.clone(),
         // (#1934) This dispatch's own declared compactor/utility model ids,
         // resolved earlier in this same function — threaded through so the
@@ -6421,6 +6466,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         action,
         &opts.role_id,
         &session,
+        &execution,
         Some(&model),
         phase_id.as_deref(),
         Some(dispatch_complete_payload),
@@ -6441,6 +6487,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         "runtime",
         &opts.role_id,
         &session,
+        &execution,
         Some(&model),
         phase_id.as_deref(),
         serde_json::json!({ "turns": trajectory_summary.fold.turns() }),
@@ -6459,6 +6506,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         stdout,
         stderr,
         session_id: session,
+        execution: Some(execution),
         // Host path where the runtime's `.darkmux-runtime/` bookkeeping
         // landed (mounted at `/darkmux-out` in the container). Callers
         // that keep the run's artifacts (coding_task) copy them out of it
@@ -7295,6 +7343,7 @@ fn spawn_guarded_tailer(
     stop_flag: &Arc<AtomicBool>,
     out_dir: PathBuf,
     session: SessionId,
+    execution: ExecutionId,
     role_id: String,
     model: String,
     phase_id: Option<String>,
@@ -7320,6 +7369,7 @@ fn spawn_guarded_tailer(
         run_tailer(
             out_dir,
             session,
+            execution,
             role_id,
             model,
             phase_id,
@@ -7367,6 +7417,7 @@ fn run_tailer(
     // bookkeeping, not the tree the agent is editing.
     out_dir: PathBuf,
     session: SessionId,
+    execution: ExecutionId,
     role_id: String,
     model: String,
     phase_id: Option<String>,
@@ -7388,6 +7439,7 @@ fn run_tailer(
     let mut state = TailerState::new(
         trajectory_path,
         session,
+        execution,
         role_id,
         model,
         inactivity_deadline,
@@ -8043,6 +8095,7 @@ fn spawn_guarded_sampler(
     sampler_stop: &Arc<AtomicBool>,
     role_id: String,
     session: SessionId,
+    execution: ExecutionId,
     model: String,
     compactor_model: Option<String>,
     utility_model: Option<String>,
@@ -8060,6 +8113,7 @@ fn spawn_guarded_sampler(
             stop,
             role_id,
             session,
+            execution,
             model,
             compactor_model,
             utility_model,
@@ -8078,6 +8132,7 @@ fn run_telemetry_sampler(
     stop_flag: Arc<AtomicBool>,
     role_id: String,
     session: SessionId,
+    execution: ExecutionId,
     model: String,
     // (#1934) This dispatch's own declared compactor/utility model ids —
     // `None` when this dispatch runs no compaction, or utility-model
@@ -8216,6 +8271,7 @@ fn run_telemetry_sampler(
             darkmux_flow::FlowAction::DispatchRest,
             &role_id,
             &session,
+            &execution,
             Some(&model),
             phase_id.as_deref(),
             Some(payload),
@@ -8228,6 +8284,7 @@ fn run_telemetry_sampler(
             source,
             &role_id,
             &session,
+            &execution,
             Some(&model),
             phase_id.as_deref(),
             payload,
@@ -8255,6 +8312,7 @@ fn run_telemetry_sampler(
                 darkmux_flow::FlowAction::DispatchRest,
                 &role_id,
                 &session,
+                &execution,
                 Some(&model),
                 phase_id.as_deref(),
                 Some(payload),
@@ -8421,6 +8479,7 @@ fn run_telemetry_sampler(
                             "thermal",
                             &role_id,
                             &session,
+                            &execution,
                             Some(&model),
                             phase_id.as_deref(),
                             payload,
@@ -8491,7 +8550,7 @@ fn run_telemetry_sampler(
                     // `validate_resume_checkpoint` for every dispatch; see
                     // `resume_hint_from_origin`'s own doc.
                     let resume_hint =
-                        resume_hint_from_origin(&host_out, &role_id, phase_id.as_deref());
+                        resume_hint_from_origin(&host_out, &role_id);
                     // (#2774 round-3 C9) "this mission", not "this run":
                     // F5 made the episode count MISSION-scoped (seeded
                     // across dispatches from the ladder-state file), so a
@@ -8539,6 +8598,7 @@ fn run_telemetry_sampler(
                             "thermal",
                             &role_id,
                             &session,
+                            &execution,
                             Some(&model),
                             phase_id.as_deref(),
                             payload,
@@ -8605,6 +8665,7 @@ fn run_telemetry_sampler(
                         "battery",
                         &role_id,
                         &session,
+                        &execution,
                         Some(&model),
                         phase_id.as_deref(),
                         payload,
@@ -8627,6 +8688,7 @@ fn run_telemetry_sampler(
             let caller = crate::budget::BudgetCaller {
                 role_id: Some(&role_id),
                 session: &session,
+                execution: &execution,
                 model: Some(&model),
                 phase_id: phase_id.as_deref(),
                 profiles_file: None,
@@ -8904,6 +8966,8 @@ struct TailerState {
     /// carried.
     generation_reported: std::collections::HashSet<u64>,
     session: SessionId,
+    /// The execution every record this tailer writes is about.
+    execution: ExecutionId,
     role_id: String,
     model: String,
     /// (#714) Mission/phase this dispatch belongs to (when phase-bound),
@@ -8949,9 +9013,11 @@ struct TailerState {
     /// the SPECIALIST this dispatch is for. `None` when no compactor is bound.
     compactor_model: Option<String>,
     /// (#2915 review) Compaction attempts seen in this execution (the job
-    /// id's counter), and the one in flight: its job id and start ms.
+    /// id's counter), and the one in flight: its job id, start ms and the
+    /// execution it is (each attempt is a utility role's own role execution,
+    /// contract 8, never the specialist's).
     compaction_attempts: u64,
-    open_compaction: Option<(String, u64)>,
+    open_compaction: Option<(String, u64, ExecutionId)>,
     compaction_threshold: Option<u32>,
     /// (#2902 step 1a) The endpoint this dispatch's model calls went to, as
     /// a fact: the hosted label for an endpoint-staffed brain, else the
@@ -9071,6 +9137,7 @@ impl TailerState {
     fn new(
         trajectory_path: PathBuf,
         session: SessionId,
+        execution: ExecutionId,
         role_id: String,
         model: String,
         inactivity_deadline: Arc<Mutex<Instant>>,
@@ -9090,6 +9157,7 @@ impl TailerState {
             pending: Vec::new(),
             generation_reported: std::collections::HashSet::new(),
             session,
+            execution,
             role_id,
             model,
             phase_id: None,
@@ -9317,6 +9385,7 @@ impl TailerState {
             pending: Vec::new(),
             generation_reported: std::collections::HashSet::new(),
             session,
+            execution: ExecutionId::mint(),
             role_id,
             model,
             phase_id: None,
@@ -9629,7 +9698,8 @@ impl TailerState {
         // is the start time.
         self.compaction_attempts += 1;
         let job_id = format!("{}:compaction:{}", self.session, self.compaction_attempts);
-        self.open_compaction = Some((job_id.clone(), c.ts));
+        let execution = ExecutionId::mint();
+        self.open_compaction = Some((job_id.clone(), c.ts, execution.clone()));
         let mut payload = crate::usage::utility_start_payload(
             crate::usage::UtilityJobKind::Compaction,
             &job_id,
@@ -9647,6 +9717,7 @@ impl TailerState {
         live["serves"] = serde_json::json!(self.session.wire());
         self.live_utility(live, Some(&model));
         self.emit_telemetry_as(
+            &execution,
             COMPACTOR_ROLE,
             Some(&model).filter(|m| !m.is_empty()).map(String::as_str),
             crate::usage::UTILITY_SOURCE,
@@ -9669,7 +9740,9 @@ impl TailerState {
         );
         // (#2915 review) The attempt this call served: its job id and ms
         // times.
-        if let Some((job_id, started_at_ms)) = self.open_compaction.clone() {
+        let mut execution = None;
+        if let Some((job_id, started_at_ms, attempt)) = self.open_compaction.clone() {
+            execution = Some(attempt);
             crate::usage::stamp_utility_end(&mut payload, &job_id, started_at_ms, c.ts);
             // (#2928) The job's end on the live channel, at once.
             let live = serde_json::json!({
@@ -9683,7 +9756,11 @@ impl TailerState {
             self.live_utility(live, m.as_deref());
         }
         let model = payload["requested_model"].as_str().map(str::to_string);
+        // A call with no `compaction.start` before it is still its own
+        // execution.
+        let execution = execution.unwrap_or_else(ExecutionId::mint);
         self.emit_telemetry_as(
+            &execution,
             COMPACTOR_ROLE,
             model.as_deref(),
             crate::usage::USAGE_SOURCE,
@@ -9871,6 +9948,7 @@ impl TailerState {
             action,
             &self.role_id,
             &self.session,
+            &self.execution,
             Some(&self.model),
             self.phase_id.as_deref(),
             Some(payload),
@@ -9918,7 +9996,7 @@ impl TailerState {
             return;
         };
         let record = crate::findings::build_record(
-            &self.session.wire(),
+            self.execution.as_str(),
             seq,
             darkmux_flow::ts_utc_now(),
             tool_name,
@@ -10009,7 +10087,7 @@ impl TailerState {
             match crate::mods::canonical_finding_key(key) {
                 Some(k) => for_keys.push(k),
                 None => warnings.push(format!(
-                    "dropped `for` key {key:?}: not `<dispatch>/<seq>`, so it can address \
+                    "dropped `for` key {key:?}: not `<execution>/<seq>`, so it can address \
                      no finding"
                 )),
             }
@@ -10102,16 +10180,17 @@ impl TailerState {
     /// lands under `category=telemetry` with a caller-supplied `source`
     /// (`"detector"`, `"runtime"`, …) the observability viewer keys on.
     fn emit_telemetry(&self, source: &str, action: darkmux_flow::FlowAction, payload: serde_json::Value) {
-        self.emit_telemetry_as(&self.role_id, Some(&self.model), source, action, payload);
+        self.emit_telemetry_as(&self.execution, &self.role_id, Some(&self.model), source, action, payload);
     }
 
     /// (#2902 step 1b) `emit_telemetry` for a record whose work was done by
-    /// a SUB-EXECUTION: the record's `handle` and `model` name that
-    /// sub-execution's own role and model (CLAUDE.md contract 8), while the
-    /// session, mission, phase and step stay the parent's, so the record
-    /// still joins the run it happened in.
+    /// a SUB-EXECUTION: the record's `execution`, `handle` and `model` name
+    /// that sub-execution's own identity, role and model (CLAUDE.md contract
+    /// 8), while the session, mission, phase and step stay the parent's, so
+    /// the record still joins the run it happened in.
     fn emit_telemetry_as(
         &self,
+        execution: &ExecutionId,
         role_id: &str,
         model: Option<&str>,
         source: &str,
@@ -10126,6 +10205,7 @@ impl TailerState {
             source,
             role_id,
             &self.session,
+            execution,
             model,
             self.phase_id.as_deref(),
             payload,
@@ -11254,8 +11334,8 @@ fn resolve_dispatch_model_with_hosts(
 /// is a genuinely different, disclosed degraded mode now, not a silent
 /// substitution.
 ///
-/// The window is the SECOND element: `internal.utility.n_ctx`, `None` for
-/// the bare-string binding. Since #2914 this is the only source of the
+/// The window is the SECOND element: `internal.utility.n_ctx`, `None` when
+/// none is declared. Since #2914 this is the only source of the
 /// compactor's own window — never a profile's `models[]` entry, which
 /// would make the utility model a work model.
 pub(crate) fn resolve_utility_model_internal(config_path: Option<&str>) -> Option<(String, Option<u32>)> {

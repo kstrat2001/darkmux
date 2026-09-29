@@ -306,8 +306,9 @@ fn boot(busy_policy: &str) -> Fleet {
         beta.home.join("profiles.json"),
         serde_json::json!({
             "profiles": {
-                "cloud": {"models": [{"id": "mock-model", "n_ctx": 32000, "endpoint": {"url": format!("http://127.0.0.1:{}/v1", mock.port)}}]}
+                "cloud": {"models": [{"id": "mock-model", "n_ctx": 32000, "endpoint": "mock"}]}
             },
+            "endpoints": {"mock": {"url": format!("http://127.0.0.1:{}/v1", mock.port)}},
             "default_profile": "cloud"
         })
         .to_string(),

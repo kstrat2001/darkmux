@@ -23,7 +23,7 @@ ordinary `darkmux mod create` verb. Nothing in darkmux knows a frontier exists.
 
 One of:
 
-- **A finding key** — `<dispatch>/<seq>`, e.g. `crawl-crawl-1788455407-fc5219-u-0001/1`.
+- **A finding key** — `<execution>/<seq>`, e.g. `exec-19a3f1c2b4d-4a1b-0/1`.
 - **A mission id** — `crawl-1788455407-fc5219`. Work every finding that has no mod
   yet, **one subagent per finding**. Do not batch several findings into one
   subagent: each is a separate small reading job, and a shared context is exactly
@@ -36,7 +36,7 @@ The store's root resolves the same way every darkmux path does
 Never read the files directly to find it — ask the verb:
 
 ```bash
-darkmux finding show <dispatch>/<seq> --json          # one finding, whole
+darkmux finding show <execution>/<seq> --json          # one finding, whole
 darkmux finding list --mission <mission-id> --json    # every finding in a run
 darkmux mod list --mission <mission-id> --json        # what already has a mod
 ```
@@ -70,7 +70,7 @@ directory holding one subdirectory per workspace source. The run recorded it: th
 `workdir` **is** `tree_root`.
 
 ```bash
-MISSION=<mission-id>; KEY=<dispatch>/<seq>
+MISSION=<mission-id>; KEY=<execution>/<seq>
 TREE_ROOT=$(jq -r --arg k "$KEY" 'select(.config.for_key == $k) | .config.workdir' \
   ~/.darkmux/missions/"$MISSION"/steps/*/*.json | head -1)
 SOURCE=$(darkmux finding show "$KEY" --json | jq -r .context.source)

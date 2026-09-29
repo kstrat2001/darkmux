@@ -1,10 +1,10 @@
 import { isTurnUsage } from "./usageRecords";
-import { DEFAULT_POLICY, NO_PRESENCE, isRunning, lifecycleAt, type LifecyclePolicy, type Presence } from "./lifecycle";
+import { DEFAULT_POLICY, NO_PRESENCE, isClosing, isRunning, lifecycleAt, type LifecyclePolicy, type Presence } from "./lifecycle";
 import { currentRun, groupOfRecords } from "./runRef";
 import { cleanToolPath, toolCallPath } from "./recordDetail";
 import { compactDuration } from "./format";
 import { UTILITY_JOB, UTILITY_JOB_DEFAULT_STALL_MS, isUtilityEnd, isUtilityStart, utilityJobOf } from "./utilityJobs";
-import { ACTION, byTime, recordsAsOf, type NormRecord } from "./ingest";
+import { ACTION, byTime, isExecutionAction, isLegacyExecution, recordsAsOf, type NormRecord } from "./ingest";
 
 /** (#2877) Live token-rate scope — pure derivation from flow records
  * already fetched for a session; zero model work, matches CLAUDE.md's "the
@@ -847,10 +847,31 @@ export function liveExecutions(
   policy: LifecyclePolicy = DEFAULT_POLICY,
   presence: Presence = NO_PRESENCE,
 ): NormRecord[][] {
-  return perExecutionRecords.filter((recs) => {
+  return perExecutionRecords.flatMap(byExecution).filter((recs) => {
     const g = groupOfRecords(recordsAsOf(recs, nowMs));
     return g.grain === "execution" && isRunning(lifecycleAt(currentRun(g, nowMs), nowMs, policy, presence));
   });
+}
+
+/** A record set as one set per execution it holds. Each keeps the records
+ *  that close a session rather than an execution (`session.end`, a step's
+ *  terminal): those end every execution under them. Records of a pre-4.0
+ *  session stay together: their identity is a session and mission, not an
+ *  execution. A session holds several executions when a map ran its items
+ *  under one task session; a rate, a state and a role are one execution's,
+ *  so its closed siblings' beats must not reach them. A set of one
+ *  execution (or none) is returned as it came. */
+function byExecution(recs: NormRecord[]): NormRecord[][] {
+  const minted = (r: NormRecord): string | undefined =>
+    isExecutionAction(r.action) && r.execution_id !== undefined && !isLegacyExecution(r.execution_id) ? r.execution_id : undefined;
+  const executions = new Set<string>();
+  for (const r of recs) {
+    const id = minted(r);
+    if (id !== undefined) executions.add(id);
+  }
+  if (executions.size < 2) return [recs];
+  const kept = (r: NormRecord, id: string): boolean => (isExecutionAction(r.action) ? minted(r) === undefined || minted(r) === id : isClosing(r));
+  return [...executions].map((id) => recs.filter((r) => kept(r, id)));
 }
 
 /** Priority order for `aggregateLiveState` — the most informative state

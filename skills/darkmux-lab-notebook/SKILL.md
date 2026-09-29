@@ -1,6 +1,6 @@
 ---
 name: darkmux-lab-notebook
-description: Draft a lab notebook entry for a recorded darkmux lab run, from `darkmux lab run stats <run-id> --json` (and the run's manifest.json when needed). Observation first, methodology over polish, the verify outcome stated exactly as recorded. Writes the entry wherever the operator's own instructions say a notebook lives; asks when they say nothing. Use this after a lab run whose result is worth keeping, or when the operator says "notebook this run" / "write up run X". Replaces the retired `lab notebook` verbs and the `scribe` role (4.0, #2913).
+description: Draft a lab notebook entry for a recorded darkmux lab run, from `darkmux run stats <run-id> --json` (and the run's manifest.json when needed). Observation first, methodology over polish, the verify outcome stated exactly as recorded. Writes the entry wherever the operator's own instructions say a notebook lives; asks when they say nothing. Use this after a lab run whose result is worth keeping, or when the operator says "notebook this run" / "write up run X". Replaces the retired `lab notebook` verbs and the `scribe` role (4.0, #2913).
 user_invocable: true
 allowed-tools: "Bash(darkmux:*), Bash(cat:*), Bash(jq:*), Bash(ls:*), Bash(date:*), Read, Write"
 ---
@@ -14,7 +14,7 @@ You are the recorder. darkmux measures; you write the entry, in the style of an 
 ## Step 1 — Find the run, if none was named
 
 ```bash
-darkmux lab run list --limit 5
+darkmux run list --kind lab --limit 5
 ```
 
 Show the table and ask which run to write up.
@@ -22,7 +22,7 @@ Show the table and ask which run to write up.
 ## Step 2 — Read the run's derived numbers
 
 ```bash
-darkmux lab run stats "<run-id>" --json
+darkmux run stats "<run-id>" --json
 ```
 
 One run prints one JSON object. The fields an entry is built from:
@@ -40,7 +40,7 @@ Several run ids print a set instead: `runs` (one object each, as above), `summar
 
 ## Step 3 — Read the manifest when the entry needs what stats does not carry
 
-`manifest.json` sits in the run directory. Runs live under `~/.darkmux/runs/<run-id>/` by default (under `$DARKMUX_HOME/runs/` when that is set, or `./.darkmux/runs/` when the run was launched from a directory with its own `.darkmux/`); `$DARKMUX_LAB_DIR` or `dirs.lab` in `config.json` moves that root. `darkmux lab run stats` also accepts the run directory's path in place of an id, and when a run id does not resolve its error names the root it searched. It carries `workload`, `provider`, `profile`, `session_id`, `duration_ms`, `ok`, the fixture that was used (`fixture`), and `verify` as `{passed, details}`. `details` is where a failed verify says why; quote it.
+`manifest.json` sits in the run directory. Runs live under `~/.darkmux/lab/<run-id>/` by default (under `$DARKMUX_HOME/lab/` when that is set); `$DARKMUX_LAB_DIR` or `dirs.lab` in `config.json` moves that root. `darkmux run stats` also accepts the run directory's path in place of an id, and when a run id does not resolve its error names the root it searched. It carries `workload`, `provider`, `profile`, `session_id`, `duration_ms`, `ok`, the fixture that was used (`fixture`), and `verify` as `{passed, details}`. `details` is where a failed verify says why; quote it.
 
 ## Step 4 — Draft the entry
 

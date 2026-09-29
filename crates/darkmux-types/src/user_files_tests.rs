@@ -49,7 +49,7 @@ fn paths(keys: &[KeyIssue]) -> Vec<&str> {
 fn closest_of(k: &KeyIssue) -> Option<&str> {
     match &k.issue {
         Issue::Unknown { closest, .. } => closest.as_deref(),
-        Issue::Retired(_) | Issue::WrongType { .. } | Issue::Missing { .. } => None,
+        Issue::Retired(_) | Issue::Removed(_) | Issue::WrongType { .. } | Issue::Missing { .. } => None,
     }
 }
 
@@ -450,19 +450,67 @@ fn every_historical_config_key_is_named_as_retired() {
         "orchestrator": "claude",
         "gh": {"enabled": true, "allowed": []},
         "review": {"judge_concurrency": 2, "judge_fail_on_any_skip": true},
-        "dirs": {"notebook": "/n", "openclaw_config": "/o", "runtime_agents": "/r"},
+        "dirs": {"notebook": "/n", "openclaw_config": "/o", "runtime_agents": "/r", "crew": "/c"},
         "radio": {"router_profile": "p"},
         "remote": {"max_tokens_per_execution": 1, "stage_budget_policy": "warn"},
-        "runtime": {"telemetry_record_every_samples": 5},
+        "runtime": {"telemetry_record_every_samples": 5, "daemon_auth_enabled": true},
     });
     let keys = config_keys(doc);
     let not_retired: Vec<String> =
         keys.iter().filter(|k| !matches!(k.issue, Issue::Retired(_))).map(ToString::to_string).collect();
     assert!(not_retired.is_empty(), "{not_retired:#?}");
-    assert_eq!(keys.len(), 10, "{keys:#?}");
+    assert_eq!(keys.len(), 12, "{keys:#?}");
     let msg: String = keys.iter().map(|k| format!("{k}\n")).collect();
-    for says in ["`gh`: renamed to `cmd`", "`orchestrator`: removed", "`remote.stage_budget_policy`: renamed to `remote.step_budget_policy`", "host_sampler_interval_ms"] {
+    for says in ["`gh`: renamed to `cmd`", "`orchestrator`: removed", "`remote.stage_budget_policy`: renamed to `remote.step_budget_policy`", "host_sampler_interval_ms", "`runtime.daemon_auth_enabled`: replaced in 4.0 (#2988) by `serve.token_keychain`", "`dirs.crew`: removed in 4.0", "DARKMUX_HOME"] {
         assert!(msg.contains(says), "{says}: {msg}");
+    }
+}
+
+/// (#2988 review) A wrong-typed value is a reported problem, not a silent
+/// drop to defaults: `serve.read_auth` written as a string used to make the
+/// lenient loader discard the whole file, turning read auth off.
+#[test]
+fn a_wrong_typed_config_value_is_a_reported_problem() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    std::fs::write(&path, r#"{"serve":{"read_auth":"true"}}"#).unwrap();
+    let found = config_json_problem_at(&path).expect("a string read_auth is a problem");
+    let shown = format!("{found:?}");
+    assert!(shown.contains("read_auth"), "{shown}");
+    std::fs::write(&path, r#"{"serve":{"read_auth":true}}"#).unwrap();
+    assert!(config_json_problem_at(&path).is_none(), "the same key with the right type is clean");
+}
+
+/// `darkmux serve` is an entry point of its own: its preflight refuses the
+/// retired auth switch by name, and points at both replacements.
+#[test]
+#[serial_test::serial]
+fn the_serve_preflight_refuses_the_retired_auth_switch_naming_both_replacements() {
+    let cfg: crate::config::DarkmuxConfig =
+        serde_json::from_str(r#"{"runtime": {"daemon_auth_enabled": true}}"#).unwrap();
+    let _guard = crate::config_access::set_config_for_test(cfg);
+    let refusal = crate::config_enum::preflight(Scope::Serve).expect_err("refused").to_string();
+    for says in ["runtime.daemon_auth_enabled", "serve.token_keychain", "serve.read_auth"] {
+        assert!(refusal.contains(says), "{says}: {refusal}");
+    }
+}
+
+/// The daemon's fleet listener reads `fleet.busy_policy` and
+/// `fleet.identity.provider`, so a bad value must refuse `serve` at start,
+/// not surface later on the listener path.
+#[test]
+#[serial_test::serial]
+fn the_serve_preflight_refuses_a_bad_fleet_listener_enum() {
+    for (json, key) in [
+        (r#"{"fleet": {"busy_policy": "zz-bad"}}"#, "fleet.busy_policy"),
+        (r#"{"fleet": {"identity": {"provider": "zz-bad"}}}"#, "fleet.identity.provider"),
+    ] {
+        let cfg: crate::config::DarkmuxConfig = serde_json::from_str(json).unwrap();
+        let _guard = crate::config_access::set_config_for_test(cfg);
+        let refusal = crate::config_enum::preflight(Scope::Serve)
+            .expect_err(&format!("{key}: serve must refuse a bad value"))
+            .to_string();
+        assert!(refusal.contains(key) && refusal.contains("zz-bad"), "{key}: {refusal}");
     }
 }
 

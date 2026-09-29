@@ -290,9 +290,7 @@ fn pick_parsed_with_source<T: FromStr + Copy>(
 
 /// The **override tier** for a directory setting: `env > config tier
 /// (tilde-expanded)`, or `None` when neither is set. The caller then supplies
-/// its own default — used where one env var overrides two *different* derived
-/// defaults (e.g. `DARKMUX_CREW_DIR` overrides both the crew root and the
-/// user-state root). `env` is the already-empty-filtered `env_str` output, used
+/// its own default. `env` is the already-empty-filtered `env_str` output, used
 /// raw (the shell expands `~`); the config tier is tilde-expanded (operators
 /// hand-write `~/...`) and an empty/whitespace value falls through. Pure +
 /// testable — the reusable spine of every dir accessor (#661 Slice 3).
@@ -600,8 +598,7 @@ pub fn hooks_enabled() -> bool {
 }
 /// (#2093 merge-gate finding 8) Derived from the SAME root resolution
 /// every other darkmux directory resolves through —
-/// `paths::resolve(Auto)`, which honors `DARKMUX_HOME` and a
-/// project-local `./.darkmux` before `~/.darkmux` — mirroring
+/// `paths::resolve(ForceUser)`, which honors `DARKMUX_HOME` before `~/.darkmux` — mirroring
 /// `lab_dir_default`'s own doc. Before this fix, `hooks_outbox_dir`'s
 /// fallback went straight to `dirs::home_dir()`, so a `DARKMUX_HOME`-
 /// scoped install still wrote hook outbox files to the operator's REAL
@@ -609,18 +606,17 @@ pub fn hooks_enabled() -> bool {
 /// `lab_dir`, one directory over.
 #[cfg(not(any(test, feature = "test-support")))]
 fn hooks_outbox_dir_default() -> std::path::PathBuf {
-    crate::paths::resolve(crate::paths::ResolveScope::Auto).root.join("hooks")
+    crate::paths::resolve(crate::paths::ResolveScope::ForceUser).root.join("hooks")
 }
 
 /// Test builds must never default onto the operator's real
 /// `~/.darkmux/hooks` — same isolation discipline as `lab_dir_default`'s
 /// own test-build variant (#994). A test that DID isolate itself (a
 /// `DARKMUX_HOME` tempdir) is honored verbatim, because a test that isolated
-/// itself means it. A project-local `./.darkmux` does NOT apply here — the
-/// production resolution is `ForceUser`, see its own doc for why.
+/// itself means it.
 #[cfg(any(test, feature = "test-support"))]
 fn hooks_outbox_dir_default() -> std::path::PathBuf {
-    let resolved = crate::paths::resolve(crate::paths::ResolveScope::Auto);
+    let resolved = crate::paths::resolve(crate::paths::ResolveScope::ForceUser);
     let real_user_root = dirs::home_dir().map(|h| h.join(".darkmux"));
     if real_user_root.as_ref() == Some(&resolved.root) {
         return crate::paths::test_isolated_dir("hooks");
@@ -717,7 +713,8 @@ pub fn hooks_jq_max_output_bytes() -> u64 {
 pub const SERVE_PORT_DEFAULT: u16 = 8765;
 
 /// The built-in daemon bind address: loopback only. A non-loopback bind is
-/// separately refused without a resolved serve token (`darkmux-serve`).
+/// separately refused unless `serve.read_auth` is on with a resolved serve
+/// token (`darkmux-serve`).
 pub const SERVE_BIND_DEFAULT: &str = "127.0.0.1";
 
 /// The resolved daemon port — `env(DARKMUX_SERVE_PORT) > config.serve.port >
@@ -1114,12 +1111,22 @@ pub fn remote_step_budget_policy() -> Result<crate::config::StepBudgetPolicy, cr
     resolve_enum("remote.step_budget_policy").map(|(v, _)| v)
 }
 
-/// (#2902 step 5) Every RENAMED setting (`config::RENAMED_SETTINGS`) whose
-/// old env var is still set: read by nothing, so named loudly (doctor Warn, a
-/// preflight warning line). A leftover old `config.json` key is refused as an
-/// unknown key instead (`user_files`).
-pub fn renamed_setting_leftovers() -> Vec<crate::config::RenamedLeftover> {
-    crate::config::renamed_leftovers(&env_str)
+/// Every renamed or retired setting (`config::RENAMED_SETTINGS`,
+/// `config::RETIRED_SETTINGS`) whose env var is still set. The ONE refusal of
+/// them is `refuse_retired_env`, called once at CLI entry; `doctor` reads this
+/// list to report them. A leftover `config.json` key is refused as an unknown
+/// key instead (`user_files`).
+pub fn retired_env_leftovers() -> Vec<crate::config::RetiredLeftover> {
+    crate::config::retired_env_leftovers(&env_str)
+}
+
+/// `Err` when any retired or renamed setting's env var is set. Called once at
+/// the top of the CLI's command dispatch for every command but `doctor` and
+/// `config`, so no entry point (a read-only verb, `serve`, the fleet
+/// listener it hosts) starts under a setting that nothing reads any more.
+pub fn refuse_retired_env() -> Result<(), crate::config::RetiredEnvRefusal> {
+    let left = retired_env_leftovers();
+    if left.is_empty() { Ok(()) } else { Err(crate::config::RetiredEnvRefusal(left)) }
 }
 
 /// (#1230 Packet 1) Max CONCURRENT remote dispatches
@@ -1337,14 +1344,42 @@ pub fn daemon_cors_origins() -> Option<String> {
     pick_string("DARKMUX_DAEMON_CORS_ORIGINS", cfg, None)
 }
 /// (#881) Whether the serve daemon may read the `darkmux-serve-token` macOS
-/// Keychain item for bearer auth. Config-only gate (`config.runtime.
-/// daemon_auth_enabled`, default `false`) — the env token path
+/// Keychain item. Config-only gate (`serve.token_keychain`, default
+/// `false`) — the env token path
 /// `DARKMUX_SERVE_TOKEN` needs no gate (its presence is the opt-in). Consumed by
-/// `darkmux_flow::serve_token`'s tier-2; auth being *active* is decided by
-/// whether a token actually resolves (`serve_token_present`), never by this flag
-/// alone (a gate-on-but-no-token state must NOT 401 every request).
-pub fn serve_auth_config_enabled() -> bool {
-    config().runtime.as_ref().and_then(|r| r.daemon_auth_enabled).unwrap_or(false)
+/// `darkmux_flow::serve_token`'s tier-2; a token being *present* is decided by
+/// whether one actually resolves (`serve_token_present`), never by this flag.
+pub fn serve_token_keychain() -> bool {
+    serve_token_keychain_from(config())
+}
+
+fn serve_token_keychain_from(cfg: &crate::config::DarkmuxConfig) -> bool {
+    cfg.serve.as_ref().and_then(|s| s.token_keychain).unwrap_or(false)
+}
+
+/// (#2988) Whether a read that is not from this machine needs the serve
+/// token: `env(DARKMUX_SERVE_READ_AUTH) > serve.read_auth > false`. The
+/// execution surface (fleet work) never reads this; it always needs the token.
+pub fn serve_read_auth() -> bool {
+    serve_read_auth_with_source().0
+}
+
+/// [`serve_read_auth`] plus WHICH tier resolved it, for `darkmux doctor`.
+pub fn serve_read_auth_with_source() -> (bool, Source) {
+    resolve_serve_read_auth(env_str("DARKMUX_SERVE_READ_AUTH"), config().serve.as_ref().and_then(|s| s.read_auth))
+}
+
+/// The precedence of [`serve_read_auth_with_source`], pure. An env value that
+/// is not a boolean word resolves ON: a typo in a security switch fails
+/// toward requiring the token.
+fn resolve_serve_read_auth(env: Option<String>, cfg: Option<bool>) -> (bool, Source) {
+    if let Some(s) = env {
+        return (parse_bool_token(&s).unwrap_or(true), Source::Env);
+    }
+    match cfg {
+        Some(v) => (v, Source::Config),
+        None => (false, Source::BuiltIn),
+    }
 }
 /// (#1011) Fraction (0–1) of the dispatch model's context window budgeted for
 /// the coder brief's injected-context blocks (cautions + lessons + corrections).
@@ -1586,23 +1621,10 @@ pub fn liveness_dir() -> std::path::PathBuf {
     liveness_dir_default()
 }
 
-/// (#2653 MUST FIX 3) Delegates straight to `dispatch_liveness::liveness_dir()`
-/// — the WRITER's own resolution — instead of `paths::resolve(Auto)`.
-///
-/// `paths::resolve(Auto)` auto-detects a project-local `./.darkmux` (a
-/// supported layout `lab run`/`lab fixture` create); `dispatch_liveness`
-/// deliberately never does that project-local auto-detect — its entire
-/// reason for existing is to avoid a cwd stat (or any config read) before
-/// config/Redis/audit/flow are even touched. With a project-local
-/// `.darkmux` present in cwd, this function used to resolve to a DIFFERENT
-/// directory than the one every heartbeat actually lands in: the doctor row
-/// whose whole purpose is making growth visible counted 0 files in the cwd
-/// directory while the real directory (`$HOME/.darkmux/liveness`, or
-/// `DARKMUX_HOME`) kept growing, unpruned and unseen, the entire time the
-/// check said "Pass". `host_sampler_lock_path` rides this same function, so
-/// the identical divergence would have put the host-sampler lock file
-/// somewhere `dispatch_liveness` never writes to either — this closes both
-/// at the resolution root rather than patching each consumer.
+/// Delegates straight to `dispatch_liveness::liveness_dir()` (the WRITER's own
+/// resolution, which reads no config) instead of `paths::resolve`, so the
+/// doctor row that counts heartbeat files and `host_sampler_lock_path` target
+/// the exact directory heartbeats land in.
 ///
 /// `dispatch_liveness::liveness_dir()` carries its OWN test isolation
 /// (#2653 MUST FIX 1: `DARKMUX_HOME` if set, else a per-process
@@ -1969,7 +1991,7 @@ pub fn mission_stale_active_days() -> u64 {
 
 /// The flows directory (the always-on LocalFileSink target):
 /// `env(DARKMUX_FLOWS_DIR) > config.dirs.flows > <darkmux root>/flows`. The
-/// root comes from `paths::resolve(Auto)` (below), so a HOME-less
+/// root comes from `paths::resolve(ForceUser)` (below), so a HOME-less
 /// environment falls back to `paths::resolve`'s own `/tmp` scoping rather
 /// than a separate literal here.
 pub fn flows_dir() -> std::path::PathBuf {
@@ -1984,8 +2006,8 @@ pub fn flows_dir() -> std::path::PathBuf {
 /// be isolated in test builds.
 ///
 /// (#2359) Derived from the SAME root resolution every other darkmux
-/// directory resolves through — `paths::resolve(Auto)`, which honors
-/// `DARKMUX_HOME` and a project-local `./.darkmux` before `~/.darkmux` —
+/// directory resolves through — `paths::resolve`, which honors
+/// `DARKMUX_HOME` before `~/.darkmux` —
 /// mirroring `findings_dir_default`/`mods_dir_default`/`lab_dir_default`/
 /// `hooks_outbox_dir_default`. Before this fix the default went straight to
 /// `dirs::home_dir()`, so a `DARKMUX_HOME`-scoped launch with no
@@ -1996,7 +2018,7 @@ pub fn flows_dir() -> std::path::PathBuf {
 /// real flow store exactly this way on 2026-09-05.
 #[cfg(not(any(test, feature = "test-support")))]
 fn flows_dir_default() -> std::path::PathBuf {
-    crate::paths::resolve(crate::paths::ResolveScope::Auto).root.join("flows")
+    crate::paths::resolve(crate::paths::ResolveScope::ForceUser).root.join("flows")
 }
 
 /// (#994) In test / `test-support` builds the default must NOT be the
@@ -2010,7 +2032,7 @@ fn flows_dir_default() -> std::path::PathBuf {
 /// construction in test builds" move the empty `config()` tier already makes.
 ///
 /// (#2359) But a test that DID isolate itself — by pointing `DARKMUX_HOME` at
-/// a tempdir, or via a project-local `./.darkmux` — is honored verbatim, same
+/// a tempdir — is honored verbatim, same
 /// isolation discipline as `lab_dir_default`'s own test-build variant: a test
 /// that isolated itself means it. Only a test that isolated NOTHING (so
 /// `paths::resolve` would otherwise land on the real user root) falls back to
@@ -2030,7 +2052,7 @@ fn flows_dir_default() -> std::path::PathBuf {
 /// the two facts are separated instead.)
 #[cfg(any(test, feature = "test-support"))]
 fn flows_dir_default() -> std::path::PathBuf {
-    let resolved = crate::paths::resolve(crate::paths::ResolveScope::Auto);
+    let resolved = crate::paths::resolve(crate::paths::ResolveScope::ForceUser);
     let real_user_root = dirs::home_dir().map(|h| h.join(".darkmux"));
     if real_user_root.as_ref() == Some(&resolved.root) {
         return crate::paths::test_isolated_dir("flows");
@@ -2042,7 +2064,7 @@ fn flows_dir_default() -> std::path::PathBuf {
 /// config.dirs.findings > <darkmux root>/findings`, the same three-tier shape
 /// every sibling dir resolves through.
 ///
-/// One `<dispatch>/<seq>/finding.json` per accepted `create_finding` call. The
+/// One `<execution>/<seq>/finding.json` per accepted `create_finding` call. The
 /// flow stream remains the audit trail; this directory is the queryable copy
 /// (`finding list` / `finding show`), so JSON on disk is the truth the same way
 /// it is for roles.
@@ -2055,24 +2077,24 @@ pub fn findings_dir() -> std::path::PathBuf {
 }
 
 /// Derived from the SAME root resolution every other darkmux directory
-/// resolves through — `paths::resolve(Auto)`, which honors `DARKMUX_HOME` and
-/// a project-local `./.darkmux` before `~/.darkmux` — mirroring
+/// resolves through — `paths::resolve`, which honors `DARKMUX_HOME` and
+/// the default `~/.darkmux` — mirroring
 /// `hooks_outbox_dir_default`. Reaching straight for `dirs::home_dir()` here
 /// would put a `DARKMUX_HOME`-scoped install's findings in the operator's real
 /// `~/.darkmux/findings`, the bug class #1585 fixed one directory over.
 #[cfg(not(any(test, feature = "test-support")))]
 fn findings_dir_default() -> std::path::PathBuf {
-    crate::paths::resolve(crate::paths::ResolveScope::Auto).root.join("findings")
+    crate::paths::resolve(crate::paths::ResolveScope::ForceUser).root.join("findings")
 }
 
 /// Test builds must never default onto the operator's real
 /// `~/.darkmux/findings` — same isolation discipline as `lab_dir_default`'s own
 /// test-build variant (#994). A test that DID isolate itself (a `DARKMUX_HOME`
-/// tempdir, or a project-local `./.darkmux`) is honored verbatim, because a
+/// tempdir) is honored verbatim, because a
 /// test that isolated itself means it.
 #[cfg(any(test, feature = "test-support"))]
 fn findings_dir_default() -> std::path::PathBuf {
-    let resolved = crate::paths::resolve(crate::paths::ResolveScope::Auto);
+    let resolved = crate::paths::resolve(crate::paths::ResolveScope::ForceUser);
     let real_user_root = dirs::home_dir().map(|h| h.join(".darkmux"));
     if real_user_root.as_ref() == Some(&resolved.root) {
         return crate::paths::test_isolated_dir("findings");
@@ -2096,22 +2118,22 @@ pub fn mods_dir() -> std::path::PathBuf {
 }
 
 /// Derived from the SAME root resolution every other darkmux directory
-/// resolves through — `paths::resolve(Auto)`, which honors `DARKMUX_HOME` and
-/// a project-local `./.darkmux` before `~/.darkmux`. Mirrors
+/// resolves through — `paths::resolve`, which honors `DARKMUX_HOME` and
+/// the default `~/.darkmux`. Mirrors
 /// `findings_dir_default`.
 #[cfg(not(any(test, feature = "test-support")))]
 fn mods_dir_default() -> std::path::PathBuf {
-    crate::paths::resolve(crate::paths::ResolveScope::Auto).root.join("mods")
+    crate::paths::resolve(crate::paths::ResolveScope::ForceUser).root.join("mods")
 }
 
 /// Test builds must never default onto the operator's real `~/.darkmux/mods`
 /// — same isolation discipline as `findings_dir_default`'s own test-build
 /// variant. A test that DID isolate itself (a `DARKMUX_HOME` tempdir, or a
-/// project-local `./.darkmux`) is honored verbatim, because a test that
+/// tempdir) is honored verbatim, because a test that
 /// isolated itself means it.
 #[cfg(any(test, feature = "test-support"))]
 fn mods_dir_default() -> std::path::PathBuf {
-    let resolved = crate::paths::resolve(crate::paths::ResolveScope::Auto);
+    let resolved = crate::paths::resolve(crate::paths::ResolveScope::ForceUser);
     let real_user_root = dirs::home_dir().map(|h| h.join(".darkmux"));
     if real_user_root.as_ref() == Some(&resolved.root) {
         return crate::paths::test_isolated_dir("mods");
@@ -2120,13 +2142,13 @@ fn mods_dir_default() -> std::path::PathBuf {
 }
 
 /// (#1585) The lab-run scan root — `env(DARKMUX_LAB_DIR) > config.dirs.lab >
-/// ~/.darkmux/runs`, the same three-tier shape as its nine sibling dirs.
+/// ~/.darkmux/lab`, the same three-tier shape as its nine sibling dirs.
 ///
 /// It has a real DEFAULT now, where before it had none and resolved to
 /// `None`. That absence was the bug: `/lab/runs` answered
 /// `{"configured": false}` and `/runs`' lab arm never ran, so 247 on-disk runs
 /// were invisible in every surface. Defaulting is safe here in a way a
-/// general "guess the operator's directory" would not be — `~/.darkmux/runs`
+/// general "guess the operator's directory" would not be — `~/.darkmux/lab`
 /// is darkmux-owned by construction (the namespace convention), so reading it
 /// assumes nothing about user state.
 ///
@@ -2141,44 +2163,142 @@ pub fn lab_dir() -> std::path::PathBuf {
     )
 }
 
+/// (4.0) Where the lab-run root stands relative to the pre-4.0 one.
+///
+/// Before 4.0 the default lab root was `<root>/runs`. Contract 8 makes "run"
+/// the umbrella over mission, dispatch and lab runs, so a directory named
+/// `runs` that held only lab runs named the umbrella for one kind; 4.0 moved
+/// the default to `<root>/lab`, beside `missions/`. darkmux never moves the
+/// operator's data itself: this reports the state, and the command that
+/// settles it, for `darkmux doctor` and the lab verbs to print.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LabDirState {
+    /// Nothing to move: the pre-4.0 dir is absent or empty, or the operator
+    /// set the lab dir explicitly (`DARKMUX_LAB_DIR` / `dirs.lab`).
+    Current,
+    /// The pre-4.0 dir holds runs and the 4.0 dir holds none: one command
+    /// moves them. Lab verbs refuse until it has run. `onto_empty_dir` is set
+    /// when the 4.0 dir already exists (empty): a plain `mv` into it would
+    /// nest the runs as `lab/runs`, so the command removes it first.
+    MovePending { from: std::path::PathBuf, to: std::path::PathBuf, onto_empty_dir: bool },
+    /// Both dirs hold something, so the pre-4.0 runs are not read. The
+    /// command merges them without overwriting either side.
+    Split { from: std::path::PathBuf, to: std::path::PathBuf },
+}
+
+impl LabDirState {
+    /// The command that settles this state, paths shell-quoted for pasting.
+    pub fn command(&self) -> Option<String> {
+        let q = |p: &std::path::Path| crate::shell::quote(&p.display().to_string());
+        match self {
+            LabDirState::Current => None,
+            LabDirState::MovePending { from, to, onto_empty_dir: false } => {
+                Some(format!("mv {} {}", q(from), q(to)))
+            }
+            LabDirState::MovePending { from, to, onto_empty_dir: true } => {
+                Some(format!("rmdir {} && mv {} {}", q(to), q(from), q(to)))
+            }
+            // Entry by entry, `-n` so a run id present on both sides is
+            // skipped rather than overwritten; `rmdir` then fails loudly on
+            // whatever was skipped instead of deleting it.
+            LabDirState::Split { from, to } => {
+                Some(format!("mv -n {}/* {}/ && rmdir {}", q(from), q(to), q(from)))
+            }
+        }
+    }
+}
+
+/// [`LabDirState`] for the lab dir this process resolves.
+pub fn lab_dir_state() -> LabDirState {
+    lab_dir_state_for(&lab_dir())
+}
+
+/// [`LabDirState`] for a lab dir the caller already resolved (`darkmux serve`
+/// resolves its own from `--lab-dir`, which a state read of the process-wide
+/// [`lab_dir`] would not see).
+pub fn lab_dir_state_for(lab: &std::path::Path) -> LabDirState {
+    lab_dir_state_in(lab, &lab_dir_default())
+}
+
+/// Pure half of [`lab_dir_state`]: `lab` is the resolved lab dir, `default`
+/// the one darkmux would pick with no override.
+fn lab_dir_state_in(lab: &std::path::Path, default: &std::path::Path) -> LabDirState {
+    let from = default.with_file_name("runs");
+    // A dotfile (`.DS_Store`) is not a run, so a dir holding only those is
+    // empty for the pre-4.0 side.
+    let holds_runs = std::fs::read_dir(&from).is_ok_and(|d| {
+        d.flatten().any(|e| !e.file_name().to_string_lossy().starts_with('.'))
+    });
+    if lab != default || !holds_runs {
+        return LabDirState::Current;
+    }
+    let to = lab.to_path_buf();
+    let to_holds_entries = std::fs::read_dir(&to).is_ok_and(|mut d| d.next().is_some());
+    if to_holds_entries {
+        LabDirState::Split { from, to }
+    } else {
+        let onto_empty_dir = to.is_dir();
+        LabDirState::MovePending { from, to, onto_empty_dir }
+    }
+}
+
+/// Refuse when [`lab_dir_state`] is [`LabDirState::MovePending`], naming the
+/// `mv` that settles it. Every lab verb calls this first: reading or writing
+/// the empty 4.0 dir while the runs sit in the pre-4.0 one would hide them.
+pub fn require_current_lab_dir() -> anyhow::Result<()> {
+    require_state_current(&lab_dir_state())
+}
+
+fn require_state_current(state: &LabDirState) -> anyhow::Result<()> {
+    match state {
+        LabDirState::MovePending { from, to, .. } => anyhow::bail!(
+            "lab runs are still in {} (the pre-4.0 location); 4.0 reads them from {}. \
+             darkmux does not move your data itself. Move them, then re-run:\n\n  {}\n",
+            from.display(),
+            to.display(),
+            state.command().unwrap_or_default()
+        ),
+        LabDirState::Current | LabDirState::Split { .. } => Ok(()),
+    }
+}
+
 /// Derived from the SAME root resolution lab runs are written through —
-/// `paths::resolve(Auto)`, which honors `DARKMUX_HOME` and a project-local
+/// `paths::resolve`, which honors `DARKMUX_HOME` before
 /// `./.darkmux` before `~/.darkmux`.
 ///
-/// Deliberately not a hardcoded `~/.darkmux/runs`: that would reintroduce this
+/// Deliberately not a hardcoded `~/.darkmux/lab`: that would reintroduce this
 /// issue's own bug class one layer down. Under `DARKMUX_HOME=/x`, a lab run
-/// WRITES to `/x/runs` while a hardcoded reader scans `~/.darkmux/runs` — the
+/// WRITES to `/x/lab` while a hardcoded reader scans `~/.darkmux/lab` — the
 /// run is invisible again, and now worse than before, because `/lab/runs`
 /// would report `configured: true, exists: true` and imply everything is
 /// wired. Sharing the resolver makes read and write incapable of disagreeing.
 #[cfg(not(any(test, feature = "test-support")))]
 fn lab_dir_default() -> std::path::PathBuf {
-    crate::paths::resolve(crate::paths::ResolveScope::Auto).runs
+    crate::paths::resolve(crate::paths::ResolveScope::ForceUser).lab
 }
 
-/// Test builds must never default onto the operator's real `~/.darkmux/runs`
+/// Test builds must never default onto the operator's real `~/.darkmux/lab`
 /// — same isolation discipline as `flows_dir_default` (#994).
 ///
 /// But a test that DID isolate itself, by pointing `DARKMUX_HOME` at a
 /// tempdir, means it: honor that exactly as production does. An earlier cut
 /// returned the throwaway path unconditionally, which silently overrode
-/// per-test isolation — `lab run list` then scanned the tmp path while the
+/// per-test isolation — `run list --kind lab` then scanned the tmp path while the
 /// test had written under its own `DARKMUX_HOME`, and the two could never
 /// agree. The throwaway is the fallback for tests that isolated NOTHING, not
 /// a replacement for tests that did.
 #[cfg(any(test, feature = "test-support"))]
 fn lab_dir_default() -> std::path::PathBuf {
-    let resolved = crate::paths::resolve(crate::paths::ResolveScope::Auto);
+    let resolved = crate::paths::resolve(crate::paths::ResolveScope::ForceUser);
     // Substitute the throwaway ONLY when resolution actually landed on the
-    // operator's real user root — that is the case this guard exists for. Both
-    // documented isolation forms (a `DARKMUX_HOME` tempdir, or a project-local
-    // `./.darkmux` reached via `set_current_dir`) resolve elsewhere and are
-    // honored verbatim, because a test that isolated itself means it.
+    // operator's real user root — that is the case this guard exists for. A
+    // `DARKMUX_HOME` tempdir resolves elsewhere and is honored verbatim,
+    // because a test that isolated itself means it.
     let real_user_root = dirs::home_dir().map(|h| h.join(".darkmux"));
     if real_user_root.as_ref() == Some(&resolved.root) {
-        return crate::paths::test_isolated_dir("runs");
+        return crate::paths::test_isolated_dir("lab");
     }
-    resolved.runs
+    resolved.lab
 }
 
 /// (#703) Host cache dir for the extracted static `darkmux-runtime` binary,
@@ -2188,8 +2308,8 @@ fn lab_dir_default() -> std::path::PathBuf {
 /// env/config override tier.
 ///
 /// (#2450) Derived from the SAME root resolution every other darkmux
-/// directory resolves through — `paths::resolve(Auto)`, which honors
-/// `DARKMUX_HOME` and a project-local `./.darkmux` before `~/.darkmux` —
+/// directory resolves through — `paths::resolve`, which honors
+/// `DARKMUX_HOME` before `~/.darkmux` —
 /// mirroring `fleet_file_default`/`flows_dir_default`. Before this fix, this
 /// went straight to `dirs::home_dir()`, so a `DARKMUX_HOME`-scoped install
 /// still cached the extracted runtime binary under the operator's REAL
@@ -2221,12 +2341,12 @@ fn lab_dir_default() -> std::path::PathBuf {
 /// cached binary.
 #[cfg(not(any(test, feature = "test-support")))]
 pub fn runtime_cache_dir() -> std::path::PathBuf {
-    crate::paths::resolve(crate::paths::ResolveScope::Auto).root.join("runtime")
+    crate::paths::resolve(crate::paths::ResolveScope::ForceUser).root.join("runtime")
 }
 
 #[cfg(any(test, feature = "test-support"))]
 pub fn runtime_cache_dir() -> std::path::PathBuf {
-    let resolved = crate::paths::resolve(crate::paths::ResolveScope::Auto);
+    let resolved = crate::paths::resolve(crate::paths::ResolveScope::ForceUser);
     let real_user_root = dirs::home_dir().map(|h| h.join(".darkmux"));
     if real_user_root.as_ref() == Some(&resolved.root) {
         return crate::paths::test_isolated_dir("runtime");
@@ -2248,30 +2368,17 @@ pub fn runtime_cache_dir() -> std::path::PathBuf {
 /// confirmed broken before this fix.
 #[cfg(not(any(test, feature = "test-support")))]
 pub fn cache_dir() -> std::path::PathBuf {
-    crate::paths::resolve(crate::paths::ResolveScope::Auto).root.join("cache")
+    crate::paths::resolve(crate::paths::ResolveScope::ForceUser).root.join("cache")
 }
 
 #[cfg(any(test, feature = "test-support"))]
 pub fn cache_dir() -> std::path::PathBuf {
-    let resolved = crate::paths::resolve(crate::paths::ResolveScope::Auto);
+    let resolved = crate::paths::resolve(crate::paths::ResolveScope::ForceUser);
     let real_user_root = dirs::home_dir().map(|h| h.join(".darkmux"));
     if real_user_root.as_ref() == Some(&resolved.root) {
         return crate::paths::test_isolated_dir("cache");
     }
     resolved.root.join("cache")
-}
-
-/// The crew-state directory **override** (`env(DARKMUX_CREW_DIR) >
-/// config.dirs.crew`), or `None` when neither is set. Returns the override only
-/// — the env var points at the directory *containing* the crew subdirs, and it
-/// overrides two distinct derived defaults (the crew root `<root>/crew` and the
-/// user-state root `<root>`), so each caller in `darkmux-crew` applies its own
-/// (`crew_root` / `user_state_root`).
-pub fn crew_dir_override() -> Option<std::path::PathBuf> {
-    pick_dir_override(
-        env_str("DARKMUX_CREW_DIR"),
-        config().dirs.as_ref().and_then(|d| d.crew.as_deref()),
-    )
 }
 
 /// The fleet roster file: `env(DARKMUX_FLEET_FILE) > config.dirs.fleet_file >
@@ -2285,8 +2392,8 @@ pub fn fleet_file() -> std::path::PathBuf {
 }
 
 /// (#2450) Derived from the SAME root resolution every other darkmux
-/// directory resolves through — `paths::resolve(Auto)`, which honors
-/// `DARKMUX_HOME` and a project-local `./.darkmux` before `~/.darkmux` —
+/// directory resolves through — `paths::resolve`, which honors
+/// `DARKMUX_HOME` before `~/.darkmux` —
 /// mirroring `flows_dir_default`/`hooks_outbox_dir_default`/`lab_dir_default`.
 /// Before this fix, `fleet_file`'s fallback went straight to
 /// `dirs::home_dir()`, so a `DARKMUX_HOME`-scoped install with no
@@ -2295,42 +2402,9 @@ pub fn fleet_file() -> std::path::PathBuf {
 /// for `lab_dir`, #2093 fixed for `hooks_outbox_dir`, and #2363 fixed for
 /// `flows_dir`, one directory over.
 ///
-/// **Behavior change for existing operators, stated out loud (#2450 review).**
-/// `Auto` does not only add the `DARKMUX_HOME` tier — it also prefers a
-/// project-local `./.darkmux` over `~/.darkmux` whenever the process happens
-/// to be standing in a directory that has one. So `darkmux machine add` /
-/// `machine list` run from such a directory now read and write
-/// `./.darkmux/fleet.json` instead of the user-global roster, and the
-/// operator's real fleet appears EMPTY there. This is reachable, not
-/// theoretical: `crew::lessons::repo_db_path` creates `<repo>/.darkmux/` in
-/// every repo a coder dispatch has recorded a lesson in, so any such repo is
-/// already a directory where this switch fires. Verified live with the built
-/// binary: from a cwd containing `./.darkmux`, `machine add` reported
-/// `roster: <cwd>/.darkmux/fleet.json`.
-///
-/// It is kept as `Auto` for consistency with every sibling default
-/// (`flows_dir`, `findings_dir`, `mods_dir`, `lab_dir`, `hooks_outbox_dir`),
-/// which all resolve project-local-first. If the roster should instead be a
-/// per-MACHINE constant — a defensible reading, since a fleet roster is not
-/// project-scoped state the way a run record or a finding is — the one-word
-/// change is `ResolveScope::ForceUser`, which still closes the `DARKMUX_HOME`
-/// escape this issue is about while dropping the cwd sensitivity.
-/// `workdir::worktrees_base_dir` and `dispatch::identity_path` took exactly
-/// that `ForceUser` route in this same change, for that same reason.
+/// A fleet roster is user-global state by nature, unlike a run record or a
+/// finding: the machines you own do not change because you cd'd.
 fn fleet_file_default() -> std::path::PathBuf {
-    // `ForceUser`, NOT `Auto` (#2450 review decision). Closing the
-    // `DARKMUX_HOME` escape must not smuggle in a NEW cwd sensitivity: before
-    // this fix the roster was `dirs::home_dir()/.darkmux/fleet.json`,
-    // unconditionally user-global, so `Auto` would have changed behavior for
-    // operators who never set `DARKMUX_HOME` at all. And it is reachable, not
-    // theoretical — `crew::lessons::repo_db_path` creates `<repo>/.darkmux/`
-    // in every repository a coder dispatch has recorded a lesson in, so
-    // `machine add` run from such a repo would silently read and write a
-    // project-local roster and report the fleet as empty.
-    //
-    // A fleet roster is user-global state by nature, unlike a run record or a
-    // finding: the machines you own do not change because you cd'd. Same call,
-    // for the same reason, as `worktrees_base_dir` and `identity_path`.
     crate::paths::resolve(crate::paths::ResolveScope::ForceUser).root.join("fleet.json")
 }
 
@@ -3419,12 +3493,151 @@ mod tests {
         unsafe {
             std::env::remove_var("DARKMUX_LAB_DIR");
         }
-        assert!(lab_dir().ends_with("runs"), "unset must resolve to a runs dir, not nothing");
+        assert!(lab_dir().ends_with("lab"), "unset must resolve to the lab dir, not nothing");
         if let Some(v) = prev {
             unsafe {
                 std::env::set_var("DARKMUX_LAB_DIR", v);
             }
         }
+    }
+
+    /// (4.0) A pre-4.0 `runs/` holding runs, and no `lab/` yet: one `mv`
+    /// settles it, and that `mv` is exactly what gets printed.
+    #[test]
+    fn lab_dir_state_is_move_pending_when_only_the_pre_4_0_dir_holds_runs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("my root");
+        std::fs::create_dir_all(root.join("runs").join("quick-q-1")).unwrap();
+        let lab = root.join("lab");
+        let state = lab_dir_state_in(&lab, &lab);
+        assert_eq!(state, LabDirState::MovePending { from: root.join("runs"), to: lab.clone(), onto_empty_dir: false });
+        let want = format!(
+            "mv {} {}",
+            crate::shell::quote(&root.join("runs").display().to_string()),
+            crate::shell::quote(&lab.display().to_string())
+        );
+        assert_eq!(state.command().as_deref(), Some(want.as_str()));
+        assert!(want.contains("'"), "a path with a space must be quoted: {want}");
+        let err = require_state_current(&state).unwrap_err().to_string();
+        assert!(err.contains(&want), "the refusal names the exact command: {err}");
+    }
+
+    /// The inverse cases: nothing to move, so nothing refuses.
+    #[test]
+    fn lab_dir_state_is_current_when_there_is_nothing_to_move() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let lab = root.join("lab");
+        // Neither dir.
+        assert_eq!(lab_dir_state_in(&lab, &lab), LabDirState::Current);
+        // An EMPTY pre-4.0 dir (every pre-4.0 install created one) moves nothing.
+        std::fs::create_dir_all(root.join("runs")).unwrap();
+        assert_eq!(lab_dir_state_in(&lab, &lab), LabDirState::Current);
+        // An explicit lab dir (env / config) is the operator's choice: the
+        // default's sibling is not consulted even when it holds runs.
+        std::fs::create_dir_all(root.join("runs").join("r1")).unwrap();
+        let custom = root.join("elsewhere");
+        assert_eq!(lab_dir_state_in(&custom, &lab), LabDirState::Current);
+        assert!(require_state_current(&LabDirState::Current).is_ok());
+    }
+
+    /// Recovery: after the printed `mv`, the state is current. And when the
+    /// operator ended up with BOTH dirs holding runs, it is a split, whose
+    /// command merges without overwriting, and which does not refuse.
+    #[test]
+    fn lab_dir_state_after_the_move_is_current_and_both_full_is_split() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let (from, lab) = (root.join("runs"), root.join("lab"));
+        std::fs::create_dir_all(from.join("r1")).unwrap();
+        std::fs::rename(&from, &lab).unwrap();
+        assert_eq!(lab_dir_state_in(&lab, &lab), LabDirState::Current);
+
+        std::fs::create_dir_all(from.join("r0")).unwrap();
+        let state = lab_dir_state_in(&lab, &lab);
+        assert_eq!(state, LabDirState::Split { from: from.clone(), to: lab.clone() });
+        let cmd = state.command().unwrap();
+        assert!(cmd.starts_with("mv -n "), "a merge never overwrites: {cmd}");
+        assert!(cmd.ends_with(&format!("rmdir {}", from.display())), "{cmd}");
+        assert!(require_state_current(&state).is_ok(), "a split warns in doctor, it does not refuse");
+    }
+
+    /// Every cell of (pre-4.0 dir) x (4.0 dir). The 4.0 dir existing but EMPTY
+    /// must not read as a split: that hid every old run behind an exit-0
+    /// "no recorded lab runs yet".
+    #[test]
+    fn lab_dir_state_table_covers_every_from_and_to_cell() {
+        #[derive(Clone, Copy, Debug)]
+        enum Dir {
+            Absent,
+            Empty,
+            OnlyDotfiles,
+            Runs,
+        }
+        let make = |p: &std::path::Path, d: Dir| match d {
+            Dir::Absent => {}
+            Dir::Empty => std::fs::create_dir_all(p).unwrap(),
+            Dir::OnlyDotfiles => {
+                std::fs::create_dir_all(p).unwrap();
+                std::fs::write(p.join(".DS_Store"), "").unwrap();
+            }
+            Dir::Runs => std::fs::create_dir_all(p.join("quick-q-1")).unwrap(),
+        };
+        use Dir::*;
+        // (from, to, expected: None = Current, Some(onto_empty_dir) = MovePending,
+        // and the sentinel Split handled below)
+        #[derive(Debug, PartialEq)]
+        enum Want {
+            Current,
+            Pending { onto_empty_dir: bool },
+            Split,
+        }
+        let cells = [
+            (Absent, Absent, Want::Current),
+            (Absent, Empty, Want::Current),
+            (Absent, Runs, Want::Current),
+            (Empty, Absent, Want::Current),
+            (Empty, Runs, Want::Current),
+            (OnlyDotfiles, Absent, Want::Current),
+            (OnlyDotfiles, Empty, Want::Current),
+            (OnlyDotfiles, Runs, Want::Current),
+            (Runs, Absent, Want::Pending { onto_empty_dir: false }),
+            (Runs, Empty, Want::Pending { onto_empty_dir: true }),
+            (Runs, Runs, Want::Split),
+        ];
+        for (from_d, to_d, want) in cells {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (from, lab) = (tmp.path().join("runs"), tmp.path().join("lab"));
+            make(&from, from_d);
+            make(&lab, to_d);
+            let got = match lab_dir_state_in(&lab, &lab) {
+                LabDirState::Current => Want::Current,
+                LabDirState::MovePending { onto_empty_dir, .. } => Want::Pending { onto_empty_dir },
+                LabDirState::Split { .. } => Want::Split,
+            };
+            assert_eq!(got, want, "from={from_d:?} to={to_d:?}");
+        }
+    }
+
+    /// The command for an existing-but-empty 4.0 dir removes it first: a plain
+    /// `mv runs lab` would nest the runs as `lab/runs`, still hidden.
+    #[test]
+    fn lab_dir_state_onto_an_empty_dir_prints_rmdir_then_mv_and_it_works() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (from, lab) = (tmp.path().join("runs"), tmp.path().join("lab"));
+        std::fs::create_dir_all(from.join("quick-q-1")).unwrap();
+        std::fs::write(from.join(".DS_Store"), "").unwrap();
+        std::fs::create_dir_all(&lab).unwrap();
+        let state = lab_dir_state_in(&lab, &lab);
+        let q = |p: &std::path::Path| crate::shell::quote(&p.display().to_string());
+        let want = format!("rmdir {} && mv {} {}", q(&lab), q(&from), q(&lab));
+        assert_eq!(state.command().as_deref(), Some(want.as_str()));
+        assert!(require_state_current(&state).is_err(), "the lab verbs refuse until it has run");
+        // Recovery: running the printed command settles it.
+        let ok = std::process::Command::new("sh").arg("-c").arg(&want).status().unwrap();
+        assert!(ok.success());
+        assert!(lab.join("quick-q-1").is_dir(), "runs land at lab/<id>, not lab/runs/<id>");
+        assert_eq!(lab_dir_state_in(&lab, &lab), LabDirState::Current);
     }
 
     #[serial_test::serial]
@@ -3442,19 +3655,6 @@ mod tests {
                 None => std::env::remove_var("DARKMUX_LAB_DIR"),
             }
         }
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn crew_dir_override_env_then_none() {
-        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
-        unsafe { std::env::set_var("DARKMUX_CREW_DIR", "/custom/crew"); }
-        assert_eq!(crew_dir_override(), Some(std::path::PathBuf::from("/custom/crew")));
-        // No env, and (in CI) no config → no override; the caller supplies its
-        // own default (crew root vs user-state root).
-        unsafe { std::env::remove_var("DARKMUX_CREW_DIR"); }
-        assert_eq!(crew_dir_override(), None);
-        if let Some(v) = prev { unsafe { std::env::set_var("DARKMUX_CREW_DIR", v); } }
     }
 
     #[serial_test::serial]
@@ -4002,7 +4202,7 @@ mod tests {
     }
 
     /// (#2093 merge-gate finding 8) `hooks_outbox_dir` resolves under
-    /// `paths::resolve(Auto)` — same root every other darkmux directory
+    /// `paths::resolve` — same root every other darkmux directory
     /// resolves under — so `DARKMUX_HOME` scopes it too. Before this fix
     /// it went straight to `dirs::home_dir()`, so a `DARKMUX_HOME`-scoped
     /// install (a relocated root, or test isolation) still wrote hook
@@ -4636,6 +4836,31 @@ mod tests {
                 None => std::env::remove_var(k),
             }
         }
+    }
+
+    /// (#2988 follow-up) `serve.read_auth`: env beats config beats the
+    /// built-in `false`. An env value that is not a boolean word turns read
+    /// auth ON: a typo in a security switch fails toward requiring the
+    /// token, never toward open reads.
+    #[test]
+    fn serve_read_auth_env_beats_config_beats_default_and_fails_closed() {
+        assert_eq!(resolve_serve_read_auth(None, None), (false, Source::BuiltIn));
+        assert_eq!(resolve_serve_read_auth(None, Some(true)), (true, Source::Config));
+        assert_eq!(resolve_serve_read_auth(Some("off".into()), Some(true)), (false, Source::Env));
+        assert_eq!(resolve_serve_read_auth(Some("on".into()), Some(false)), (true, Source::Env));
+        assert_eq!(resolve_serve_read_auth(Some("of".into()), None), (true, Source::Env), "a typo fails closed");
+    }
+
+    /// (#2988 follow-up) `serve.token_keychain` is config-only, default
+    /// `false`.
+    #[test]
+    fn serve_token_keychain_reads_the_serve_block() {
+        let on = crate::config::DarkmuxConfig {
+            serve: Some(crate::config::ServeConfig { token_keychain: Some(true), ..Default::default() }),
+            ..Default::default()
+        };
+        assert!(serve_token_keychain_from(&on));
+        assert!(!serve_token_keychain_from(&crate::config::DarkmuxConfig::default()));
     }
 
     /// The CLIENT address is not simply `bind:port`. A wildcard bind is a

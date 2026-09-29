@@ -268,6 +268,7 @@ mod tests {
             handle: marker.to_string(),
             phase_id: None,
             session_id: Some("sess".to_string()),
+            execution_id: None,
             source: None,
             model: None,
             reasoning: None,

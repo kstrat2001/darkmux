@@ -13,6 +13,7 @@
  */
 
 import type { Run } from "./generated/Run";
+import type { PendingMove } from "./generated/PendingMove";
 
 /** `GET /runs` — the wrapper `runs_handler` builds around `Vec<Run>`.
  * Source: `crates/darkmux-serve/src/lib.rs::runs_handler`. */
@@ -283,6 +284,9 @@ export interface LabRunsResponse {
   dir: string | null;
   exists: boolean | null;
   runs: LabRun[];
+  /** Present while runs recorded before 4.0 still sit in the old lab dir:
+   * where they are, where 4.0 reads, and the command that moves them. */
+  pending_move?: PendingMove;
 }
 
 /** `GET /panel/:id` — an allowlisted CLI command's own rendered output,
@@ -727,6 +731,12 @@ export interface FlowRecord {
   action?: string;
   handle?: string;
   session_id?: string;
+  /** The role execution a record is about (`darkmux_flow::FlowRecord::
+   * execution_id`): present on every record of an execution-grain action.
+   * The daemon serves one for a pre-4.0 record too, synthesized from its
+   * session and mission; `lib/ingest.ts` does the same for a record served
+   * without one (a committed archive). */
+  execution_id?: string;
   source?: string;
   model?: string;
   mission_id?: string;

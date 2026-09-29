@@ -21,6 +21,7 @@ use super::types::{
 };
 use crate::remote_budget::RemoteBudget;
 use crate::types::{Step, Task};
+use darkmux_types::execution_id::ExecutionId;
 use darkmux_types::session_id::{SessionId, SessionScope};
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::BTreeMap;
@@ -369,6 +370,8 @@ pub struct RawDispatchOutcome {
     pub stderr: String,
     pub session_id: SessionId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<ExecutionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub out_dir: Option<std::path::PathBuf>,
 }
 
@@ -574,6 +577,7 @@ impl StepKind for DispatchInternalStepKind {
                 stdout: result.stdout,
                 stderr: result.stderr,
                 session_id: result.session_id,
+                execution_id: result.execution,
                 out_dir: result.out_dir,
             };
             let output = serde_json::to_string(&payload)
@@ -771,23 +775,31 @@ fn hosted_single_shot_step_payload(
     })
 }
 
-impl DispatchSingleShotStepKind {
-    /// (#2344) This kind's contract-#2 bookend records — the same shape
-    /// `DispatchMapStepKind::bookend_record` builds for its own kind, and
-    /// keyed on the SAME task session this kind's `step result` record
-    /// already uses, so a consumer joins the pair to the tokens.
-    fn bookend_record(
-        session: &SessionId,
-        step: &Step,
-        model: &str,
-        action: darkmux_flow::FlowAction,
-        level: darkmux_flow::Level,
-        endpoint_label: Option<&str>,
-        extra: serde_json::Value,
-    ) -> darkmux_flow::FlowRecord {
+/// The contract-#2 bookend records of ONE role execution a Tier-1 step kind
+/// runs (`dispatch.single_shot`, and each item of `dispatch.map`): keyed on
+/// the task session the step's `step result` records already use, so a
+/// consumer joins the pair to the tokens, and stamped with the execution.
+///
+/// The savings hero reads `payload.endpoint` off these bookends and off
+/// nothing else, so hosted spend is attributed to the endpoint the call went
+/// to. `endpoint_label` is `None` for a local call, which leaves the payload
+/// byte-identical to a purely-local dispatch's, the same no-op-when-None
+/// discipline `stamp_remote_classification` keeps.
+struct ExecutionBookends<'a> {
+    /// The step kind's id, stamped as the payload's `kind`.
+    kind: &'static str,
+    session: &'a SessionId,
+    execution: &'a ExecutionId,
+    step: &'a Step,
+    model: &'a str,
+    endpoint_label: Option<&'a str>,
+}
+
+impl ExecutionBookends<'_> {
+    fn record(&self, action: darkmux_flow::FlowAction, level: darkmux_flow::Level, extra: serde_json::Value) -> darkmux_flow::FlowRecord {
         let mut payload = serde_json::json!({
-            "step_id": step.id,
-            "kind": "dispatch.single_shot",
+            "step_id": self.step.id,
+            "kind": self.kind,
             "runtime": "scheduler",
         });
         if let (Some(obj), Some(ex)) = (payload.as_object_mut(), extra.as_object()) {
@@ -795,13 +807,37 @@ impl DispatchSingleShotStepKind {
                 obj.insert(k.clone(), v.clone());
             }
         }
-        darkmux_flow::stamp_remote_classification(&mut payload, endpoint_label, None);
+        darkmux_flow::stamp_remote_classification(&mut payload, self.endpoint_label, None);
         darkmux_flow::FlowRecord {
             source: Some("scheduler".to_string()),
-            model: Some(model.to_string()),
+            model: Some(self.model.to_string()),
             payload: Some(payload),
-            ..darkmux_flow::FlowRecord::for_session(session, level, darkmux_flow::Category::Work, darkmux_flow::Stage::Dispatch, action, step.id.clone())
+            ..darkmux_flow::FlowRecord::for_execution(
+                self.session,
+                self.execution,
+                level,
+                darkmux_flow::Category::Work,
+                darkmux_flow::Stage::Dispatch,
+                action,
+                self.step.id.clone(),
+            )
         }
+    }
+
+    /// Open the execution's liveness edge and arm its terminal: `start_extra`
+    /// rides the `dispatch.start`, and dropping the guard without `close`
+    /// (a `?`, a panic) writes a `dispatch.error` saying `abort_message`.
+    fn open<'c>(&self, ctx: Option<&'c StepRunCtx>, start_extra: serde_json::Value, abort_message: &str) -> StepBookend<'c> {
+        let mut abort = start_extra.clone();
+        if let Some(obj) = abort.as_object_mut() {
+            obj.insert("result_class".to_string(), serde_json::json!("error"));
+            obj.insert("error".to_string(), serde_json::json!(abort_message));
+        }
+        StepBookend::new(
+            ctx,
+            self.record(darkmux_flow::FlowAction::DispatchStart, darkmux_flow::Level::Info, start_extra),
+            self.record(darkmux_flow::FlowAction::DispatchError, darkmux_flow::Level::Error, abort),
+        )
     }
 }
 
@@ -908,6 +944,9 @@ impl DispatchSingleShotStepKind {
         // one, else batch into the outcome (see `StepBookend`).
         let ctx = run_ctx.live();
         let session = &run_ctx.session(self, step)?;
+        // One model call, one execution: its bookends, its usage record and
+        // the budget records of its gate all name it.
+        let execution = &ExecutionId::mint();
 
         let model = require_config_str(step, self.id(), "model")?;
         // (#2570) The identifier this step actually ADDRESSES: the bare
@@ -947,30 +986,15 @@ impl DispatchSingleShotStepKind {
         // `StepBookend`'s Drop.
         let endpoint_label: Option<String> =
             endpoint.as_ref().map(|ep| crate::target::endpoint_route_label(ep, wire_model.as_ref()));
-        let mut bookend = StepBookend::new(
-            ctx,
-            Self::bookend_record(
-                session,
-                step,
-                wire_model.as_ref(),
-                darkmux_flow::FlowAction::DispatchStart,
-                darkmux_flow::Level::Info,
-                endpoint_label.as_deref(),
-                serde_json::json!({}),
-            ),
-            Self::bookend_record(
-                session,
-                step,
-                wire_model.as_ref(),
-                darkmux_flow::FlowAction::DispatchError,
-                darkmux_flow::Level::Error,
-                endpoint_label.as_deref(),
-                serde_json::json!({
-                    "result_class": "error",
-                    "error": "dispatch.single_shot terminated before completion (early return or panic)",
-                }),
-            ),
-        );
+        let records = ExecutionBookends {
+            kind: "dispatch.single_shot",
+            session,
+            execution,
+            step,
+            model: wire_model.as_ref(),
+            endpoint_label: endpoint_label.as_deref(),
+        };
+        let mut bookend = records.open(ctx, serde_json::json!({}), "dispatch.single_shot terminated before completion (early return or panic)");
 
         // (#2344) Session-liveness heartbeat — the same in-process twin of
         // the container path's emitter (#638) `dispatch.map` grew, opened at
@@ -1000,6 +1024,7 @@ impl DispatchSingleShotStepKind {
             // its heartbeat beating) until there is room. Nothing is clamped.
             let budget_caller = crate::budget::BudgetCaller {
                 session,
+                execution,
                 role_id: None,
                 model: Some(wire_model.as_ref()),
                 phase_id: Some(&task.phase_id),
@@ -1082,6 +1107,7 @@ impl DispatchSingleShotStepKind {
             crate::usage::USAGE_SOURCE,
             &step.id,
             session,
+            execution,
             Some(wire_model.as_ref()),
             None,
             // A step runs no role (#2914: `None` → the call's `purpose` is decided
@@ -1105,13 +1131,9 @@ impl DispatchSingleShotStepKind {
         if let Some(em) = session_emitter.take() {
             em.stop();
         }
-        bookend.close(Self::bookend_record(
-            session,
-            step,
-            wire_model.as_ref(),
+        bookend.close(records.record(
             darkmux_flow::FlowAction::DispatchComplete,
             darkmux_flow::Level::Info,
-            endpoint_label.as_deref(),
             serde_json::json!({
                 "result_class": "ok",
                 "stdout_chars": reply.content.len(),
@@ -1499,7 +1521,7 @@ impl DispatchMapStepKind {
     /// [`DispatchSingleShotStepKind`]'s hosted "step result" record so a
     /// graph/parity consumer reads a map's per-item records the same way it
     /// reads a single-shot's.
-    fn item_record(session: &SessionId, step: &Step, model: &str, remote: bool, res: &MapItemResult) -> darkmux_flow::FlowRecord {
+    fn item_record(session: &SessionId, execution: &ExecutionId, step: &Step, model: &str, remote: bool, res: &MapItemResult) -> darkmux_flow::FlowRecord {
         darkmux_flow::FlowRecord {
             source: Some("scheduler".to_string()),
             model: Some(model.to_string()),
@@ -1518,8 +1540,31 @@ impl DispatchMapStepKind {
                 "wall_ms": res.wall_ms,
                 "error": res.error,
             })),
-            ..darkmux_flow::FlowRecord::for_session(session, if res.ok { darkmux_flow::Level::Info } else { darkmux_flow::Level::Warn }, darkmux_flow::Category::Work, darkmux_flow::Stage::Dispatch, darkmux_flow::FlowAction::StepResult, step.id.clone())
+            ..darkmux_flow::FlowRecord::for_execution(session, execution, if res.ok { darkmux_flow::Level::Info } else { darkmux_flow::Level::Warn }, darkmux_flow::Category::Work, darkmux_flow::Stage::Dispatch, darkmux_flow::FlowAction::StepResult, step.id.clone())
         }
+    }
+
+    /// The terminal of one item's execution (see [`ExecutionBookends`]):
+    /// `dispatch.complete` for an item that produced a reply, `dispatch.error`
+    /// for one that did not. `remote_tokens` is stamped only for a hosted
+    /// item, and only what it spent, the figure its item record reports.
+    fn item_terminal(records: &ExecutionBookends<'_>, res: &MapItemResult) -> darkmux_flow::FlowRecord {
+        let (action, level, class) = if res.ok {
+            (darkmux_flow::FlowAction::DispatchComplete, darkmux_flow::Level::Info, "ok")
+        } else {
+            (darkmux_flow::FlowAction::DispatchError, darkmux_flow::Level::Error, "error")
+        };
+        let mut done = records.record(
+            action,
+            level,
+            serde_json::json!({ "item_index": res.index, "result_class": class, "error": res.error, "wall_ms": res.wall_ms }),
+        );
+        if records.endpoint_label.is_some() {
+            if let Some(payload) = done.payload.as_mut() {
+                darkmux_flow::stamp_remote_classification(payload, None, Some(res.total_tokens.unwrap_or(0)));
+            }
+        }
+        done
     }
 
     /// (#1442 gate C1) The ONE step-level aggregate record emitted after the
@@ -1527,49 +1572,6 @@ impl DispatchMapStepKind {
     /// total_tokens across every item. See the emission site in `run` for
     /// why the sum (not the per-item values) is what the mission graph's
     /// max-fold token meter must see.
-    /// (#1607) The dispatch-liveness bookends this kind owes contract #2:
-    /// "any production code path that performs model work emits
-    /// `dispatch.start` and a terminal `dispatch.complete`/`dispatch.error`
-    /// ... new vocabularies supplement, never replace."
-    ///
-    /// `dispatch.map` emitted only its own `step result` vocabulary, so the
-    /// per-seat sessions it mints (`task-<id>` — the review's probe and verify
-    /// seats) had token records but nothing anywhere naming WHERE they ran.
-    /// The savings hero reads `payload.endpoint` off these bookends and off
-    /// nothing else, so hosted seat spend was unattributable: 229,034 tokens
-    /// on one machine in one day.
-    ///
-    /// `endpoint_label` is `None` for a local seat, which leaves the payload
-    /// byte-identical to a purely-local dispatch's — the same no-op-when-None
-    /// discipline `stamp_remote_classification` keeps.
-    fn bookend_record(
-        session: &SessionId,
-        step: &Step,
-        model: &str,
-        action: darkmux_flow::FlowAction,
-        level: darkmux_flow::Level,
-        endpoint_label: Option<&str>,
-        extra: serde_json::Value,
-    ) -> darkmux_flow::FlowRecord {
-        let mut payload = serde_json::json!({
-            "step_id": step.id,
-            "kind": "dispatch.map",
-            "runtime": "scheduler",
-        });
-        if let (Some(obj), Some(ex)) = (payload.as_object_mut(), extra.as_object()) {
-            for (k, v) in ex {
-                obj.insert(k.clone(), v.clone());
-            }
-        }
-        darkmux_flow::stamp_remote_classification(&mut payload, endpoint_label, None);
-        darkmux_flow::FlowRecord {
-            source: Some("scheduler".to_string()),
-            model: Some(model.to_string()),
-            payload: Some(payload),
-            ..darkmux_flow::FlowRecord::for_session(session, level, darkmux_flow::Category::Work, darkmux_flow::Stage::Dispatch, action, step.id.clone())
-        }
-    }
-
     fn aggregate_record(
         session: &SessionId,
         step: &Step,
@@ -1719,12 +1721,10 @@ impl DispatchMapStepKind {
         // probe stage is the first to set it (darkmux#1605 cause 2).
         let retry_on_error = self.config_retry_budget(step, "retry_on_error")?;
 
-        // (#1607) Contract #2's liveness bookends. Opened BEFORE any model
-        // work and closed on every exit path, including the ones a `?` takes:
-        // `StepBookend`'s Drop emits `dispatch error` unless `close` already
-        // consumed the terminal. This is what gives a per-seat `task-<id>`
-        // session an endpoint to be attributed by — without it the seat's
-        // token records name a model and a cost but never a place.
+        // (#1607) Contract #2's liveness bookends are per ITEM (below): each
+        // item is one role execution. They carry the endpoint label, which is
+        // what gives a per-seat `task-<id>` session an endpoint to be
+        // attributed by.
         let endpoint_label: Option<String> = endpoint
             .as_ref()
             .map(|ep| crate::target::endpoint_route_label(ep, wire_model.as_ref()));
@@ -1733,31 +1733,6 @@ impl DispatchMapStepKind {
         // local items call (`base_url: None` below, so the configured one).
         let usage_endpoint =
             endpoint_label.clone().unwrap_or_else(|| crate::usage::lmstudio_endpoint(None));
-        let mut bookend = StepBookend::new(
-            ctx,
-            Self::bookend_record(
-                session,
-                step,
-                wire_model.as_ref(),
-                darkmux_flow::FlowAction::DispatchStart,
-                darkmux_flow::Level::Info,
-                endpoint_label.as_deref(),
-                serde_json::json!({ "items_in": items.len() }),
-            ),
-            Self::bookend_record(
-                session,
-                step,
-                wire_model.as_ref(),
-                darkmux_flow::FlowAction::DispatchError,
-                darkmux_flow::Level::Error,
-                endpoint_label.as_deref(),
-                serde_json::json!({
-                    "result_class": "error",
-                    "error": "dispatch.map terminated before completion (early return or panic)",
-                }),
-            ),
-        );
-
         // (#2344) Session-liveness heartbeat — the in-process twin of
         // `dispatch_internal`'s container-path emitter (#638). `dispatch.map`
         // performs REAL model work in the per-item loop below (`single_shot_chat`
@@ -1822,13 +1797,6 @@ impl DispatchMapStepKind {
                     .map_err(|e| anyhow::anyhow!(e.to_string()))?,
             )),
         };
-        let budget_caller = crate::budget::BudgetCaller {
-            session,
-            role_id: task.role_id.as_deref(),
-            model: Some(wire_model.as_ref()),
-            phase_id: Some(&task.phase_id),
-            profiles_file: config_str(step, "config_path"),
-        };
         // (#1442 ship-2b) The scheduler-supplied dispatch override, if any —
         // threaded into every item's arm; `None` on all production paths.
         let ovr = run_ctx.dispatch_override();
@@ -1837,6 +1805,30 @@ impl DispatchMapStepKind {
             step.config.get("temperature").and_then(|v| v.as_f64()).unwrap_or(0.7) as f32;
         let mut results: Vec<MapItemResult> = Vec::with_capacity(items.len());
         for (index, item) in items.iter().enumerate() {
+            // One item, one execution: its bookends, its usage records and
+            // the budget records of its gate all name it.
+            let execution = &ExecutionId::mint();
+            let records = ExecutionBookends {
+                kind: "dispatch.map",
+                session,
+                execution,
+                step,
+                model: wire_model.as_ref(),
+                endpoint_label: endpoint_label.as_deref(),
+            };
+            let mut bookend = records.open(
+                ctx,
+                serde_json::json!({ "item_index": index }),
+                "dispatch.map item terminated before completion (early return or panic)",
+            );
+            let budget_caller = crate::budget::BudgetCaller {
+                session,
+                execution,
+                role_id: task.role_id.as_deref(),
+                model: Some(wire_model.as_ref()),
+                phase_id: Some(&task.phase_id),
+                profiles_file: config_str(step, "config_path"),
+            };
             // (#2310 P1 review finding I1) A `{system, item}` override wins
             // for THIS item's dispatch; every other item shape keeps using
             // the step's own `config.system` unchanged — see
@@ -1857,7 +1849,7 @@ impl DispatchMapStepKind {
                 ),
             };
             // (#1442 gate C3) LIVE per-item emission when streaming.
-            push(Self::item_record(session, step, wire_model.as_ref(), endpoint.is_some(), &res), &mut batched);
+            push(Self::item_record(session, execution, step, wire_model.as_ref(), endpoint.is_some(), &res), &mut batched);
             // (#1442 ship-2b, #1361 continuity) `telemetry.tokens` records
             // for this item's calls (see #2902 below), so the fleet
             // dashboard's off-meter token sum (`category: telemetry,
@@ -1889,6 +1881,7 @@ impl DispatchMapStepKind {
                         crate::usage::USAGE_SOURCE,
                         &step.id,
                         session,
+                        execution,
                         Some(wire_model.as_ref()),
                         None,
                         map_call_token_payload(
@@ -1903,6 +1896,9 @@ impl DispatchMapStepKind {
                     &mut batched,
                 );
             }
+            // (#1607) The item's terminal, after its usage records: `ok` is
+            // a completed execution, anything else an errored one.
+            bookend.close(Self::item_terminal(&records, &res));
             results.push(res);
         }
 
@@ -1927,32 +1923,6 @@ impl DispatchMapStepKind {
         // aggregate's SUMMED total_tokens is >= every per-item value, so the
         // existing max-fold reads the true spend with zero viewer changes.
         push(Self::aggregate_record(session, step, wire_model.as_ref(), endpoint.is_some(), &results), &mut batched);
-
-        // (#1607) The clean terminal. `remote_tokens` is stamped only for a
-        // hosted seat, and only the SUM the seat actually spent — the same
-        // figure the aggregate reports, so the two never disagree.
-        let ok_count = results.iter().filter(|r| r.ok).count();
-        let spent: u64 = results.iter().filter_map(|r| r.total_tokens).sum();
-        let mut done = Self::bookend_record(
-            session,
-            step,
-            wire_model.as_ref(),
-            darkmux_flow::FlowAction::DispatchComplete,
-            if ok_count == results.len() { darkmux_flow::Level::Info } else { darkmux_flow::Level::Warn },
-            endpoint_label.as_deref(),
-            serde_json::json!({
-                "result_class": if ok_count == results.len() { "ok" } else { "partial" },
-                "items_in": results.len(),
-                "ok_count": ok_count,
-                "failed_count": results.len() - ok_count,
-            }),
-        );
-        if endpoint_label.is_some() {
-            if let Some(payload) = done.payload.as_mut() {
-                darkmux_flow::stamp_remote_classification(payload, None, Some(spent));
-            }
-        }
-        bookend.close(done);
 
         let output = serde_json::to_string(&results).context("serializing dispatch.map results")?;
         Ok(StepOutcome { output, flow_records: batched })
@@ -3164,9 +3134,9 @@ mod tests {
         std::fs::write(
             &pf,
             r#"{"profiles":{"cloud":{"models":[
-                    {"id":"gpt-remote","n_ctx":100000,
-                     "endpoint":{"url":"http://127.0.0.1:1"}}
+                    {"id":"gpt-remote","n_ctx":100000,"endpoint":"mock"}
                 ]}},
+                "endpoints":{"mock":{"url":"http://127.0.0.1:1"}},
                 "default_profile":"cloud"}"#,
         )
         .unwrap();
@@ -3474,8 +3444,8 @@ mod tests {
         // through the scheduler's live-emission channel. This is the same
         // streaming-plus-channel shape
         // `dispatch_map_hosted_emits_liveness_bookends_carrying_the_endpoint`
-        // already uses. Reverting either `Self::bookend_record(step,
-        // wire_model.as_ref(), ...)` call back to the bare `model` leaves
+        // already uses. Reverting the `ExecutionBookends`'
+        // `model: wire_model.as_ref()` back to the bare `model` leaves
         // the dispatch itself succeeding (the mock only inspects the wire
         // body) while the liveness bookends silently go back to naming the
         // wrong model.
@@ -3659,8 +3629,8 @@ mod tests {
         // real COMPLETE record. `StepBookend`'s on_abort record — the
         // "dispatch error" the Drop impl emits when `run_single_shot`
         // returns early via `?` WITHOUT ever reaching `close` — is a
-        // SEPARATE construction site (line ~994, `Self::bookend_record(step,
-        // wire_model.as_ref(), darkmux_flow::FlowAction::DispatchError, ...)`), and nothing
+        // SEPARATE record (the abort half `ExecutionBookends::open` builds beside
+        // the start, from the same `model`), and nothing
         // exercised it: mutating that call back to the bare `model` compiled
         // and left the whole suite green, because no test ever forced the
         // dispatch itself to fail on the STREAMING path.
@@ -3867,6 +3837,7 @@ mod tests {
             stdout: "some output".to_string(),
             stderr: "some warning".to_string(),
             session_id: crate::test_session("123-0"),
+            execution_id: None,
             out_dir: Some(std::path::PathBuf::from("/tmp/darkmux-out")),
         };
         let json = serde_json::to_string(&original).unwrap();
@@ -3885,6 +3856,7 @@ mod tests {
             stdout: String::new(),
             stderr: String::new(),
             session_id: crate::test_session("s"),
+            execution_id: None,
             out_dir: None,
         };
         let json = serde_json::to_string(&original).unwrap();
@@ -4783,8 +4755,8 @@ mod tests {
     #[serial_test::serial]
     fn a_map_item_waiting_on_an_aborted_missions_budget_never_sends() {
         let crew = tempfile::TempDir::new().unwrap();
-        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
-        unsafe { std::env::set_var("DARKMUX_CREW_DIR", crew.path()) };
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::set_var("DARKMUX_HOME", crew.path()) };
         let mpath = crate::lifecycle::mission_path("m-aborted");
         std::fs::create_dir_all(mpath.parent().unwrap()).unwrap();
         std::fs::write(&mpath, r#"{"id":"m-aborted","status":"aborted"}"#).unwrap();
@@ -4805,8 +4777,8 @@ mod tests {
         });
         unsafe {
             match prev {
-                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-                None => std::env::remove_var("DARKMUX_CREW_DIR"),
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
             }
         }
         assert!(!out.ok);
@@ -4909,8 +4881,8 @@ mod tests {
     #[serial_test::serial]
     fn an_abort_in_one_launch_never_ends_another_launchs_wait() {
         let crew = tempfile::TempDir::new().unwrap();
-        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
-        unsafe { std::env::set_var("DARKMUX_CREW_DIR", crew.path()) };
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::set_var("DARKMUX_HOME", crew.path()) };
         for (mid, status) in [("launch-a", "aborted"), ("launch-b", "active")] {
             let mpath = crate::lifecycle::mission_path(mid);
             std::fs::create_dir_all(mpath.parent().unwrap()).unwrap();
@@ -4945,8 +4917,8 @@ mod tests {
         launch("launch-b", env_b.clone());
         unsafe {
             match prev {
-                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-                None => std::env::remove_var("DARKMUX_CREW_DIR"),
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
             }
         }
         use darkmux_flow::FlowAction::{BudgetResume, BudgetStop, BudgetWait};
@@ -5270,6 +5242,31 @@ mod tests {
         assert_eq!(obj["index"], 0);
     }
 
+    /// Each map item's `step result` record names that item's own execution,
+    /// the one its bookends and usage records carry, not just the task session
+    /// the items share.
+    #[test]
+    fn a_map_items_step_result_names_its_execution() {
+        let step = map_step(json!({}));
+        let res = MapItemResult {
+            index: 0,
+            ok: true,
+            content: String::new(),
+            error: None,
+            total_tokens: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            reasoning_tokens: None,
+            cached_tokens: None,
+            served_model: None,
+            wall_ms: 0,
+            retried: 0,
+        };
+        let execution = ExecutionId::mint();
+        let rec = DispatchMapStepKind::item_record(&task_session(), &execution, &step, "m", false, &res);
+        assert_eq!(rec.execution_id.as_ref(), Some(&execution));
+    }
+
     /// (#2690) The seat tier a map step stamps on its `telemetry.tokens`
     /// record and the one it stamps on that same item's `step result` record
     /// are the SAME fact, and the emission site derives both from one
@@ -5295,7 +5292,7 @@ mod tests {
         };
         for remote in [false, true] {
             let tok = map_item_token_payload(&res, remote, "m", "ep").expect("emits");
-            let item = DispatchMapStepKind::item_record(&task_session(), &step, "m", remote, &res);
+            let item = DispatchMapStepKind::item_record(&task_session(), &ExecutionId::mint(), &step, "m", remote, &res);
             let item_payload = item.payload.as_ref().expect("payload");
             assert_eq!(tok["remote"], item_payload["remote"], "one seat, one verdict");
             assert_eq!(tok["index"], item_payload["index"], "and one item position");
@@ -6214,47 +6211,174 @@ mod tests {
                 _ => None,
             })
             .collect();
-        let actions: Vec<&str> = emitted.iter().map(|r| r.action.as_str()).collect();
-        assert!(
-            actions.contains(&"dispatch.start"),
-            "a hosted map must OPEN its liveness edge; got {actions:?}"
-        );
-        assert!(
-            actions.contains(&"dispatch.complete"),
-            "...and close it; got {actions:?}"
-        );
-        // Exactly one of each — the drop guard must not double-emit alongside
-        // the clean close.
+        let bookends: Vec<&darkmux_flow::FlowRecord> = emitted.iter().filter(|r| r.action.bookend().is_some()).collect();
+        let actions: Vec<&str> = bookends.iter().map(|r| r.action.as_str()).collect();
+        // Each item is one execution: start, then its own terminal, before
+        // the next item's start. The step itself has no bookend of its own
+        // (the scheduler's `step.start`/`step.complete` cover it), and the
+        // drop guard never double-emits alongside the clean close.
         assert_eq!(
-            actions.iter().filter(|a| **a == "dispatch.start").count(),
-            1,
-            "one start per run; got {actions:?}"
+            actions,
+            ["dispatch.start", "dispatch.complete", "dispatch.start", "dispatch.complete"],
+            "a 2-item map is 2 executions, each opened and closed in turn"
         );
-        assert_eq!(
-            actions.iter().filter(|a| matches!(**a, "dispatch.complete" | "dispatch.error")).count(),
-            1,
-            "exactly one terminal per open; got {actions:?}"
-        );
+        let id_of = |r: &darkmux_flow::FlowRecord| r.execution_id.clone().expect("a bookend names its execution");
+        assert_eq!(id_of(bookends[0]), id_of(bookends[1]), "an item's start and terminal name one execution");
+        assert_eq!(id_of(bookends[2]), id_of(bookends[3]));
+        assert_ne!(id_of(bookends[0]), id_of(bookends[2]), "two items are two executions");
+        for terminal in [bookends[1], bookends[3]] {
+            let payload = terminal.payload.as_ref().expect("terminal carries a payload");
+            assert_eq!(
+                payload["endpoint"], "azure:example.cognitiveservices.azure.com/gpt-4o",
+                "the terminal names WHERE the seat ran, in the one format the viewer parses"
+            );
+            assert_eq!(payload["remote_tokens"].as_u64(), Some(42), "remote spend is the item's own");
+            assert_eq!(
+                terminal.session_id.as_deref(),
+                Some(darkmux_types::session_id::SessionId::task(crate::test_run(), "t1").wire().as_str()),
+                "SAME session as the seat's token records — that join is the whole point"
+            );
+        }
+        // Each item's usage record names the same execution its bookends do.
+        let usage: Vec<_> = emitted.iter().filter(|r| r.action == darkmux_flow::FlowAction::TelemetryTokens).collect();
+        assert_eq!(usage.len(), 2);
+        assert_eq!(id_of(usage[0]), id_of(bookends[0]));
+        assert_eq!(id_of(usage[1]), id_of(bookends[2]));
+    }
 
-        let terminal = emitted
-            .iter()
-            .find(|r| r.action == darkmux_flow::FlowAction::DispatchComplete)
-            .expect("terminal present");
-        let payload = terminal.payload.as_ref().expect("terminal carries a payload");
-        assert_eq!(
-            payload["endpoint"], "azure:example.cognitiveservices.azure.com/gpt-4o",
-            "the terminal names WHERE the seat ran, in the one format the viewer parses"
+    // ── the run bracket around N executions (contract 8) ────────────────
+
+    /// The records of a 3-item hosted map inside the run bracket a mission
+    /// launch puts around it (`run.start` ... `run.complete`/`run.error`,
+    /// through the same `BookendGuard`), in the order the one channel saw
+    /// them. `item_reply` decides each item's reply by index: `Ok`, `Err`,
+    /// or a panic.
+    fn bracketed_map_records(
+        item_reply: impl Fn(usize) -> Result<crate::single_shot::SingleShotReply> + 'static,
+        close_as: darkmux_flow::FlowAction,
+    ) -> Vec<darkmux_flow::FlowRecord> {
+        let run_session = darkmux_types::session_id::SessionId::run(crate::test_run());
+        let run_record = |action| {
+            darkmux_flow::FlowRecord::for_session(
+                &run_session,
+                darkmux_flow::Level::Info,
+                darkmux_flow::Category::Work,
+                darkmux_flow::Stage::Dispatch,
+                action,
+                "bracket-test",
+            )
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let record_tx = tx.clone();
+        let mut sink = move |r: darkmux_flow::FlowRecord| {
+            let _ = record_tx.send(crate::step_kinds::WaveSignal::Record(r));
+        };
+        let calls = std::cell::Cell::new(0usize);
+        clear_hosted_override();
+        install_hosted_override(move |_req| {
+            let n = calls.get();
+            calls.set(n + 1);
+            item_reply(n)
+        });
+        let s = map_step(json!({
+            "model": "gpt-4o",
+            "user_template": "check {item}",
+            "collection": ["a", "b", "c"],
+            "endpoint": { "url": "https://example.cognitiveservices.azure.com" },
+        }));
+        let ctx = StepRunCtx::new(
+            crate::test_run(),
+            Some(tx),
+            None,
+            None,
+            std::sync::Arc::new(crate::step_kinds::ArtifactBus::new()),
         );
-        assert_eq!(
-            payload["remote_tokens"].as_u64(),
-            Some(84),
-            "remote spend is the seat's own sum (2 items x 42), matching the aggregate"
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut guard = darkmux_flow::BookendGuard::new(&mut sink, |_id, _kind| run_record(darkmux_flow::FlowAction::RunError));
+            guard.open("run", "run", run_record(darkmux_flow::FlowAction::RunStart));
+            DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &ctx).unwrap();
+            guard.close("run", run_record(close_as));
+        }));
+        std::panic::set_hook(prev_hook);
+        clear_hosted_override();
+        drop(unwound);
+        // Every sender must be gone for the channel to end.
+        drop(sink);
+        drop(ctx);
+        rx.into_iter()
+            .filter_map(|sig| match sig {
+                crate::step_kinds::WaveSignal::Record(r) => Some(r),
+                _ => None,
+            })
+            .filter(|r| r.action.bookend().is_some())
+            .collect()
+    }
+
+    /// The whole promise of the run bracket, over the records `bracketed_map_records`
+    /// saw: `run.start`, then N x (`dispatch.start`, its own terminal), then
+    /// one run terminal, and every execution named by a distinct id. Returns
+    /// the terminals, in order.
+    fn assert_run_bracket(records: &[darkmux_flow::FlowRecord], executions: usize, run_terminal: darkmux_flow::FlowAction) -> Vec<darkmux_flow::FlowAction> {
+        let actions: Vec<darkmux_flow::FlowAction> = records.iter().map(|r| r.action.clone()).collect();
+        assert_eq!(actions.first(), Some(&darkmux_flow::FlowAction::RunStart), "{actions:?}");
+        assert_eq!(actions.last(), Some(&run_terminal), "{actions:?}");
+        let inner = &records[1..records.len() - 1];
+        assert_eq!(inner.len(), executions * 2, "{actions:?}");
+        let mut seen = std::collections::HashSet::new();
+        let mut terminals = Vec::new();
+        for pair in inner.chunks(2) {
+            assert_eq!(pair[0].action, darkmux_flow::FlowAction::DispatchStart, "{actions:?}");
+            assert!(pair[1].action.bookend().is_some_and(|b| b.edge.is_terminal()), "{actions:?}");
+            let id = pair[0].execution_id.clone().expect("an execution bookend names its execution");
+            assert_eq!(pair[1].execution_id.as_ref(), Some(&id), "a pair names one execution: {actions:?}");
+            assert!(seen.insert(id), "two executions share an id: {actions:?}");
+            terminals.push(pair[1].action.clone());
+        }
+        assert!(
+            records[0].execution_id.is_none() && records[records.len() - 1].execution_id.is_none(),
+            "the run grain names no execution"
         );
-        assert_eq!(
-            terminal.session_id.as_deref(),
-            Some(darkmux_types::session_id::SessionId::task(crate::test_run(), "t1").wire().as_str()),
-            "SAME session as the seat's token records — that join is the whole point"
+        terminals
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_map_inside_a_run_is_run_start_then_n_executions_then_run_complete() {
+        use darkmux_flow::FlowAction as A;
+        let records = bracketed_map_records(|_| Ok(hosted_reply(Some(7))), A::RunComplete);
+        let terminals = assert_run_bracket(&records, 3, A::RunComplete);
+        assert_eq!(terminals, [A::DispatchComplete, A::DispatchComplete, A::DispatchComplete]);
+    }
+
+    /// An item that errors is an errored execution; its siblings and the run
+    /// still complete (per-item isolation).
+    #[test]
+    #[serial_test::serial]
+    fn an_erroring_item_is_one_errored_execution_inside_a_completed_run() {
+        use darkmux_flow::FlowAction as A;
+        let records = bracketed_map_records(
+            |n| if n == 1 { Err(anyhow!("upstream 500")) } else { Ok(hosted_reply(Some(7))) },
+            A::RunComplete,
         );
+        let terminals = assert_run_bracket(&records, 3, A::RunComplete);
+        assert_eq!(terminals, [A::DispatchComplete, A::DispatchError, A::DispatchComplete]);
+    }
+
+    /// A panic mid-item: the item's own guard closes ITS execution as
+    /// `dispatch.error` and the run's guard closes the run as `run.error`,
+    /// with nothing left open and no later item started.
+    #[test]
+    #[serial_test::serial]
+    fn a_panic_mid_item_closes_its_execution_and_then_the_run_by_raii() {
+        use darkmux_flow::FlowAction as A;
+        let records = bracketed_map_records(
+            |n| if n == 1 { panic!("simulated mid-item panic") } else { Ok(hosted_reply(Some(7))) },
+            A::RunComplete,
+        );
+        let terminals = assert_run_bracket(&records, 2, A::RunError);
+        assert_eq!(terminals, [A::DispatchComplete, A::DispatchError]);
     }
 
     #[test]
@@ -6264,8 +6388,8 @@ mod tests {
         // `dispatch.map`'s bookends, like `dispatch.single_shot`'s, are only
         // observable through the streaming channel (`StepBookend::new` only
         // emits through a `ctx`; the batched `run()` path is inert for
-        // them). Reverting either `Self::bookend_record(step, wire_model.
-        // as_ref(), ...)` call in `run_map` back to the bare `model` leaves
+        // them). Reverting `run_map`'s `ExecutionBookends` `model:
+        // wire_model.as_ref()` back to the bare `model` leaves
         // the per-item dispatches themselves succeeding (the mock only
         // inspects the chat body) while the bookends silently go back to
         // naming the wrong model.
@@ -7195,8 +7319,8 @@ mod tests {
     }
 
     /// (#2902 step 3) A seat whose selected model is on an UNMANAGED
-    /// endpoint is the silent `Remote` miss (no local residency to plan),
-    /// named by id or inline; an undefined id is a loud resolution failure.
+    /// endpoint is the silent `Remote` miss (no local residency to plan);
+    /// an undefined id is a loud resolution failure.
     #[serial_test::serial]
     #[test]
     fn placement_classifies_through_the_one_resolver() {
@@ -7210,7 +7334,6 @@ mod tests {
                 "profiles": {
                     "local": {"models": [{"id": "m-local", "n_ctx": 4096}]},
                     "named": {"models": [{"id": "gpt", "endpoint": "hosted"}]},
-                    "inline": {"models": [{"id": "gpt", "endpoint": {"url": "https://i.example/v1"}}]},
                     "dangling": {"models": [{"id": "gpt", "endpoint": "nope"}]}
                 }
             })
@@ -7228,7 +7351,6 @@ mod tests {
         };
         assert_eq!(pick("local"), Ok("m-local".into()));
         assert_eq!(pick("named"), Err("remote".into()));
-        assert_eq!(pick("inline"), Err("remote".into()));
         let err = pick("dangling").unwrap_err();
         assert!(err.contains("nope") && err != "remote", "{err}");
     }

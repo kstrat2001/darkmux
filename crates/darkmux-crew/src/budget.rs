@@ -70,6 +70,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use darkmux_types::execution_id::ExecutionId;
 use darkmux_types::session_id::SessionId;
 use darkmux_types::{BudgetPolicy, ModelEndpoint, WindowBudget};
 
@@ -89,11 +90,13 @@ const WAIT_SLICE: Duration = Duration::from_millis(500);
 /// Who a gated call is for, so a budget record lands on the right run, and
 /// so a wait can tell that its run was stopped. The session is required: it
 /// names the run, so two launches of one config never share a budget
-/// record, and a wait reads only its own run's stop. The rest is optional
-/// (a `dispatch.map` step runs no role).
+/// record, and a wait reads only its own run's stop. The execution is
+/// required too: every budget record is about the one execution whose call
+/// was gated. The rest is optional (a `dispatch.map` step runs no role).
 #[derive(Clone, Copy, Debug)]
 pub struct BudgetCaller<'a> {
     pub session: &'a SessionId,
+    pub execution: &'a ExecutionId,
     pub role_id: Option<&'a str>,
     pub model: Option<&'a str>,
     pub phase_id: Option<&'a str>,
@@ -885,6 +888,7 @@ fn record(
         BUDGET_SOURCE,
         caller.role_id.unwrap_or("budget"),
         caller.session,
+        caller.execution,
         caller.model,
         caller.phase_id,
         payload,

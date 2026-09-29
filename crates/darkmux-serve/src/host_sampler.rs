@@ -356,6 +356,7 @@ fn build_thermal_transition_record_with(
         handle: display_name,
         phase_id: None,
         session_id: None,
+        execution_id: None,
         source: Some("host-sampler".to_string()),
         model: None,
         reasoning: None,
@@ -482,6 +483,7 @@ fn build_battery_health_record(
         handle: display_name,
         phase_id: None,
         session_id: None,
+        execution_id: None,
         source: Some("host-sampler".to_string()),
         model: None,
         reasoning: None,
@@ -657,6 +659,7 @@ fn build_battery_transition_record_with(
         handle: display_name,
         phase_id: None,
         session_id: None,
+        execution_id: None,
         source: Some("host-sampler".to_string()),
         model: None,
         reasoning: None,
@@ -871,6 +874,7 @@ fn build_machine_rollup_record_with(
         handle: display_name,
         phase_id: None,
         session_id: None,
+        execution_id: None,
         source: Some("host-sampler".to_string()),
         model: None,
         reasoning: None,
@@ -1770,7 +1774,7 @@ mod tests {
     /// (#2762) `spawn` takes the singleton sampler lock, and `lock_path()`
     /// resolves through process-global `DARKMUX_HOME`. Left un-isolated,
     /// this test contended for the FIXED machine-global fallback path
-    /// (`dispatch_liveness::darkmux_home_dir_fallback` →
+    /// (`paths::user_root_guarded` →
     /// `<test-isolated root>/liveness/host-sampler.lock`) — shared
     /// with every other test binary in the workspace running with
     /// `DARKMUX_HOME` unset — and, being non-serial, could also run
@@ -2144,7 +2148,7 @@ mod tests {
             //      assertion was just pointed somewhere else.
             //   2. With `DARKMUX_HOME` unset, every test build in this
             //      workspace falls back to ONE fixed machine-global path
-            //      (`dispatch_liveness::darkmux_home_dir_fallback`), so
+            //      (`paths::user_root_guarded`), so
             //      "a sibling test" is not even bounded to this binary.
             //
             // Neither is a timing problem, which is why widening the timing

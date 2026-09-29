@@ -149,10 +149,15 @@ pub enum Scope {
     /// Fleet work submission: the daemon's work-submission listener and the
     /// sending side, both of which build the identity provider.
     FleetSubmission,
+    /// `darkmux serve`: the daemon reads `config.json` for its bind address,
+    /// its read posture and its fleet listener, so it refuses one that fails
+    /// the schema before it binds anything.
+    Serve,
 }
 
 impl Scope {
-    pub const ALL: [Scope; 4] = [Scope::Dispatch, Scope::MissionLaunch, Scope::LabRun, Scope::FleetSubmission];
+    pub const ALL: [Scope; 5] =
+        [Scope::Dispatch, Scope::MissionLaunch, Scope::LabRun, Scope::FleetSubmission, Scope::Serve];
 
     /// How the refusal names the entry point.
     pub fn label(self) -> &'static str {
@@ -161,6 +166,7 @@ impl Scope {
             Scope::MissionLaunch => "mission launch",
             Scope::LabRun => "lab run",
             Scope::FleetSubmission => "fleet work submission",
+            Scope::Serve => "serve",
         }
     }
 }
@@ -460,9 +466,7 @@ pub fn bad_hook_rule_values(rules: &[crate::config::HookRule]) -> Vec<BadEnumVal
 }
 
 /// (#2902 step 5) Every unregistered budget `policy` in a profile registry:
-/// each `endpoints.<id>.limits.policy`, and each inline endpoint's on a
-/// profile model (`profiles.<p>.models[<i>].endpoint.limits.policy`). The
-/// same rule as a config enum: never resolved to a fallback, refused at
+/// each `endpoints.<id>.limits.policy`. The same rule as a config enum: never resolved to a fallback, refused at
 /// preflight by every entry point that dispatches (`darkmux_profiles::
 /// preflight`), Fail in doctor. A per-endpoint enum lives in
 /// `profiles.json`, not `config.json`, so it is not an [`EnumSetting`]: this
@@ -489,16 +493,6 @@ pub fn bad_endpoint_budget_policies(reg: &crate::ProfileRegistry) -> Vec<BadEnum
             out.push(bad(raw, format!("endpoints.{id}.limits.policy")));
         }
     }
-    for (pname, profile) in &reg.profiles {
-        for (i, m) in profile.models.iter().enumerate() {
-            let Some(ep) = m.endpoint.as_ref().filter(|e| e.source == crate::endpoint::EndpointSource::Inline) else {
-                continue;
-            };
-            if let Some(raw) = raw_of(ep) {
-                out.push(bad(raw, format!("profiles.{pname}.models[{i}].endpoint.limits.policy")));
-            }
-        }
-    }
     out
 }
 
@@ -512,8 +506,8 @@ pub const LIMITS_SHAPE: &str = "`limits`: {\"window\": {\"period\": \"<n>m|<n>h|
 /// value unreadable, and an unreadable budget must never silently count
 /// nothing), or readable but invalid (a set window whose `period` does not
 /// parse, `warn_at` outside (0, 1)). An unregistered `policy` in readable
-/// limits is [`bad_endpoint_budget_policies`]'s, not this. Same coverage:
-/// `endpoints.<id>` and inline endpoints on profile models.
+/// limits is [`bad_endpoint_budget_policies`]'s, not this. Covers
+/// `endpoints.<id>`.
 pub fn invalid_endpoint_limits(reg: &crate::ProfileRegistry) -> Vec<InvalidSetting> {
     use crate::endpoint::Lenient;
     fn problem(ep: &crate::ModelEndpoint) -> Option<String> {
@@ -537,16 +531,6 @@ pub fn invalid_endpoint_limits(reg: &crate::ProfileRegistry) -> Vec<InvalidSetti
     for (id, ep) in &reg.endpoints {
         if let Some(p) = problem(ep) {
             push(format!("endpoints.{id}.limits"), p);
-        }
-    }
-    for (pname, profile) in &reg.profiles {
-        for (i, m) in profile.models.iter().enumerate() {
-            let Some(ep) = m.endpoint.as_ref().filter(|e| e.source == crate::endpoint::EndpointSource::Inline) else {
-                continue;
-            };
-            if let Some(p) = problem(ep) {
-                push(format!("profiles.{pname}.models[{i}].endpoint.limits"), p);
-            }
         }
     }
     out
@@ -761,16 +745,19 @@ pub static ENUM_SETTINGS: &[EnumSetting] = &[
         "fleet.identity.provider",
         None,
         "tailscale",
-        &[Scope::FleetSubmission],
+        &[Scope::FleetSubmission, Scope::Serve],
         read_fleet_identity_provider,
     ),
     // (#2916 stage 2) Read by the fleet listener, which runs the fleet
-    // submission preflight when it builds its identity provider.
+    // submission preflight when it builds its identity provider. The serve
+    // daemon starts that listener, so `serve` refuses a bad value too
+    // (`fleet.identity.provider` above shares the reason). `fleet.mode` stays
+    // unscoped: nothing in the daemon or its listener reads it.
     EnumSetting::of::<crate::config::BusyPolicy>(
         "fleet.busy_policy",
         Some("DARKMUX_FLEET_BUSY_POLICY"),
         "refuse",
-        &[Scope::FleetSubmission],
+        &[Scope::FleetSubmission, Scope::Serve],
         read_fleet_busy_policy,
     ),
     // (#2947 review C2) A typo here used to match nothing, silently.
@@ -1081,6 +1068,7 @@ mod tests {
             ("WireKind", "a session kind's tag in the session id wire grammar (`session_id`), never a setting"),
             ("EndpointKind", "derived from `managed` + `url`, never written"),
             ("Lenient", "the lenient-read wrapper itself"),
+            ("LabDirState", "where the lab-run root stands relative to the pre-4.0 one (doctor and lab verbs), never a setting"),
             ("EndpointSource", "runtime-only provenance, never serialized"),
             ("CredentialSource", "runtime-only resolution result, never serialized"),
             (
@@ -1096,9 +1084,7 @@ mod tests {
                 "CompactionStrategy",
                 "profiles.json `compaction.strategy`, strictly deserialized (an unknown one fails the load)",
             ),
-            ("UtilityBinding", "the `internal.utility` value's shape (id or object), not a token set"),
             ("QuarantinedEntryKind", "a registry-load diagnostic, never written"),
-            ("IssueSeverity", "a registry-load diagnostic, never written"),
             ("GitdirPointerKind", "a workspace probe result, never written"),
             ("Scope", "`paths::Scope` / `config_enum::Scope`: code-side enums, not setting values"),
             ("ResolveScope", "a path-resolution mode chosen by code, not a setting"),

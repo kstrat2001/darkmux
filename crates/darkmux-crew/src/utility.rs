@@ -38,6 +38,7 @@
 //! slots or a second instance here.
 
 use anyhow::{anyhow, bail, Context, Result};
+use darkmux_types::execution_id::ExecutionId;
 
 /// One utility job: a single model call on the machine's utility model.
 #[derive(Debug, Clone, Copy)]
@@ -68,7 +69,7 @@ pub struct UtilityReply {
     pub content: String,
 }
 
-/// (#2914) The window a bare-string binding (no `n_ctx` declared) is loaded
+/// (#2914) The window a binding that declares no `n_ctx` is loaded
 /// at for a host-side utility job. Named, and disclosed on stderr when it
 /// applies, never silently substituted (#44). 16K is the window the radio
 /// routing seat ran at before #2914 (the operator's `radio` profile); a
@@ -252,7 +253,7 @@ pub fn run_utility_single_shot(job: &UtilityJob<'_>) -> Result<UtilityReply> {
         send_live_end(&mut live, ended_at_ms);
         crate::usage::stamp_utility_end(&mut payload, &job_id, started_at_ms, ended_at_ms);
     }
-    let _ = darkmux_flow::record(crate::usage::utility_usage_record(job.role_id, &wire_model, payload));
+    let _ = darkmux_flow::record(crate::usage::utility_usage_record(job.role_id, &wire_model, &ExecutionId::mint(), payload));
 
     Ok(UtilityReply { content: reply.content })
 }

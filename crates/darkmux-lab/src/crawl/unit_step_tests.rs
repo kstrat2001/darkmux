@@ -4,13 +4,9 @@
 //! holds a `HomeGuard`, so nothing here reads or writes the operator's real
 //! root.
 //!
-//! (#2718) That claim used to be made of a guard that pinned `DARKMUX_HOME`
-//! and nothing else, and it held only for a reader with no
-//! `DARKMUX_CREW_DIR` exported — that variable outranks `DARKMUX_HOME` in
-//! `user_state_root()`, so for anyone who had one these tests wrote their
-//! missions and findings into it and shared one directory. The guard is
-//! now `IsolatedState`-backed; see its own comment for the four-cell
-//! measurement.
+//! The guard is `IsolatedState`-backed: it pins EVERY darkmux write
+//! destination under one throwaway root, so an ambient `DARKMUX_FINDINGS_DIR`
+//! or `DARKMUX_MODS_DIR` cannot make these tests share one directory.
 
 use super::*;
 use darkmux_crew::types::{NodeStatus, Phase, PhaseStatus};
@@ -27,37 +23,12 @@ struct HomeGuard {
 }
 impl HomeGuard {
     fn set(p: &Path) -> Self {
-        // (#2718) `IsolatedState` first — it pins EVERY darkmux write
-        // destination under one throwaway root and records what it
-        // displaced — then re-point the ones these fixtures stage at `p`.
-        //
-        // The `DARKMUX_HOME`-only version this replaces is the guard
-        // class #2693 retired in `darkmux-crew` for a measured reason, and
-        // it had the same consequence here: `DARKMUX_CREW_DIR` OUTRANKS
-        // `DARKMUX_HOME` in `user_state_root()` (and
-        // `DARKMUX_FINDINGS_DIR`/`DARKMUX_MODS_DIR` outrank it in their
-        // own accessors), so for anyone who has one exported these tests
-        // isolated nothing and shared one directory.
-        //
-        // Measured, `cargo test -p darkmux-lab --lib`, four cells:
-        //
-        //   guard        DARKMUX_CREW_DIR exported   result
-        //   home-only    yes                         15 failed / 681 passed
-        //   home-only    no                          696 passed
-        //   this one     yes                         696 passed
-        //   this one     no                          696 passed
-        //
-        // The failures are environmental — they are an ambient variable,
-        // not a defect in the code under test — which is exactly why they
-        // are worth removing: an operator who exports a scratch crew dir
-        // should not be handed fifteen red tests that have nothing to do
-        // with their change. Same finding as #2693, one package over.
-        //
-        // No `Drop` of its own: `IsolatedState` restores every variable it
-        // pinned, these three included.
+        // `IsolatedState` first: it pins EVERY darkmux write destination
+        // under one throwaway root and records what it displaced. Then
+        // re-point the ones these fixtures stage at `p`. No `Drop` of its
+        // own: `IsolatedState` restores every variable it pinned.
         let isolated = darkmux_types::test_isolation::IsolatedState::new();
         std::env::set_var("DARKMUX_HOME", p);
-        std::env::set_var("DARKMUX_CREW_DIR", p);
         std::env::set_var("DARKMUX_FINDINGS_DIR", p.join("findings"));
         std::env::set_var("DARKMUX_MODS_DIR", p.join("mods"));
         Self { _isolated: isolated }
@@ -208,6 +179,10 @@ fn envelope(result: &str, prompt: u64, completion: u64, wall_ms: u64) -> String 
     .to_string()
 }
 
+/// The execution every `ok_result` stands for: the id a finding's key leads
+/// with.
+const UNIT_EXECUTION: &str = "exec-unit-test";
+
 fn ok_result(stdout: String, out: PathBuf) -> Result<DispatchResult> {
     ok_result_with(stdout, out, TrajectoryFold::default())
 }
@@ -218,6 +193,7 @@ fn ok_result_with(stdout: String, out: PathBuf, trajectory: TrajectoryFold) -> R
         stdout,
         stderr: String::new(),
         session_id: darkmux_types::session_id::SessionId::run(darkmux_types::session_id::RunId::mission(MISSION).unwrap()),
+        execution: Some(darkmux_types::execution_id::ExecutionId::parse(UNIT_EXECUTION).unwrap()),
         out_dir: Some(out),
         trajectory: Some(trajectory),
     })
@@ -232,6 +208,7 @@ fn interpret_dispatch_result_reads_the_envelope_metrics() {
         stdout: envelope("stop", 100, 20, 5_000),
         stderr: String::new(),
         session_id: darkmux_types::session_id::SessionId::run(darkmux_types::session_id::RunId::mission(MISSION).unwrap()),
+        execution: None,
         out_dir: None,
         trajectory: None,
     };
@@ -828,6 +805,7 @@ fn two_rules_growing_unit_u_0001_do_not_collide_on_disk() {
             stdout: envelope("stop", 10, 5, 100),
             stderr: String::new(),
             session_id: opts.session,
+            execution: None,
             out_dir: Some(dir),
             trajectory: Some(TrajectoryFold::default()),
         })
@@ -2517,15 +2495,15 @@ fn a_units_outcome_names_every_finding_it_recorded_by_store_key() {
 
     assert_eq!(body.findings, 2, "the count and the roster come from ONE read");
     assert_eq!(body.finding_refs.len(), 2, "one ref per accepted finding");
-    let session = unit_session("unnamed-predicate", "u-0001");
+    let session = UNIT_EXECUTION;
     assert_eq!(
         body.finding_refs.iter().map(|r| r.key.as_str()).collect::<Vec<_>>(),
         vec![format!("{session}/1"), format!("{session}/2")],
-        "`<dispatch>/<emit_seq>`, 1-based over non-empty lines — the runtime's own ordinal"
+        "`<execution>/<emit_seq>`, 1-based over non-empty lines — the runtime's own ordinal"
     );
     assert_eq!(
         body.finding_refs[0].id,
-        format!("{}-1", unit_session("unnamed-predicate", "u-0001")),
+        format!("{UNIT_EXECUTION}-1"),
         "`/` swapped for `-`: the id becomes a task id suffix"
     );
     assert_eq!(body.finding_refs[0].file.as_deref(), Some("src/a.ts"), "the container prefix is stripped");
@@ -2542,14 +2520,14 @@ fn a_units_outcome_names_every_finding_it_recorded_by_store_key() {
     // the store the dispatch tailer writes.
     let store = TempDir::new().unwrap();
     for r in &body.finding_refs {
-        let (dispatch, seq) =
+        let (execution, seq) =
             darkmux_crew::findings::parse_key(&r.key).unwrap_or_else(|| panic!("`{}` must be a finding key", r.key));
-        assert_eq!(dispatch, session);
+        assert_eq!(execution, session);
         darkmux_crew::findings::materialize(
             store.path(),
             &darkmux_crew::findings::FindingRecord {
                 key: r.key.clone(),
-                dispatch: dispatch.clone(),
+                execution: execution.clone(),
                 seq,
                 ts: "2026-09-04T00:00:00Z".into(),
                 tool_name: "create_finding".into(),
@@ -2569,7 +2547,7 @@ fn a_units_outcome_names_every_finding_it_recorded_by_store_key() {
             },
         )
         .expect("the tailer's own write");
-        let back = darkmux_crew::findings::load_at(store.path(), &dispatch, seq)
+        let back = darkmux_crew::findings::load_at(store.path(), &execution, seq)
             .unwrap()
             .unwrap_or_else(|| panic!("`{}` must resolve — `brief_refs` refuses a key that does not", r.key));
         assert_eq!(back.key, r.key);
@@ -2661,7 +2639,7 @@ fn a_key_keeps_the_runtimes_ordinal_even_when_a_line_does_not_parse() {
         .body;
 
     assert_eq!(body.findings, 2, "only the readable lines are counted");
-    let session = unit_session("unnamed-predicate", "u-0001");
+    let session = UNIT_EXECUTION;
     assert_eq!(
         body.finding_refs.iter().map(|r| r.key.as_str()).collect::<Vec<_>>(),
         vec![format!("{session}/1"), format!("{session}/3")],
@@ -2688,8 +2666,8 @@ fn a_unit_id_holding_a_separator_still_names_its_findings() {
         .unwrap()
         .body;
 
-    let session = unit_session("unnamed-predicate", "u/0001");
-    assert!(darkmux_crew::findings::is_safe_dispatch_segment(&session), "the wire escapes the separator: {session}");
+    let session = UNIT_EXECUTION;
+    assert!(darkmux_crew::findings::is_safe_execution_segment(session), "a minted id is one path segment: {session}");
     assert_eq!(body.findings, 2);
     assert_eq!(
         body.finding_refs.iter().map(|r| r.key.as_str()).collect::<Vec<_>>(),

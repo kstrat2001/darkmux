@@ -475,7 +475,7 @@ struct TrajStats {
 }
 
 /// A trial's stats, from the fold of its trajectory: the one reading
-/// `lab run stats` and the live tailer use, so a bench's turn and token
+/// `run stats` and the live tailer use, so a bench's turn and token
 /// counts are the same numbers every other surface quotes.
 fn analyze_trajectory(text: &str) -> TrajStats {
     let f = darkmux_trajectory::TrajectoryFold::from_lines(text);
@@ -2440,6 +2440,7 @@ not json — tolerated
             .to_string(),
             stderr: String::new(),
             session_id: darkmux_types::session_id::SessionId::adhoc(darkmux_types::session_id::RunId::lab("r").unwrap(), "coder", "s"),
+            execution: None,
             // No out_dir: `run()`'s trajectory-copy block is a no-op on
             // `None` (see its own `if let Some(out) = out_dir.as_deref()`),
             // so a mocked dispatch needs no `.darkmux-runtime/` fixture.
@@ -2582,6 +2583,7 @@ not json — tolerated
                 stdout: String::new(),
                 stderr: "container exited".into(),
                 session_id: darkmux_types::session_id::SessionId::adhoc(darkmux_types::session_id::RunId::lab("r").unwrap(), "coder", "s"),
+                execution: None,
                 out_dir: None,
                 trajectory: None,
             })

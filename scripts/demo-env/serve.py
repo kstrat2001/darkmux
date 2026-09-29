@@ -22,6 +22,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
 sys.path.insert(0, str(HERE))
 from lib_identity_scrub import scrub as _identity_scrub, FORBIDDEN  # noqa: E402
+from lib_demo_env import without_retired_env  # noqa: E402
 
 MACHINE_ROUTES = {"/machine/specs": "specs", "/machine/resources": "resources",
                   "/machine/status": "status"}
@@ -302,11 +303,10 @@ def main():
     claim.close()
 
     inner_port = free_port()
-    env = dict(os.environ)
+    env = without_retired_env(os.environ)
     env.update({
         "DARKMUX_HOME": str(home),
         "DARKMUX_FLOWS_DIR": str(home / "flows"),
-        "DARKMUX_CREW_DIR": str(home / "crew"),
         "DARKMUX_MACHINE_ID": hero,
         # Isolation, stated twice on purpose: the demo daemon must not reach
         # the operator's real coordination substrate, and must not write into

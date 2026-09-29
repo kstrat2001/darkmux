@@ -14,6 +14,7 @@ pub mod dispatch_liveness;
 pub mod endpoint;
 #[cfg(any(test, feature = "test-support"))]
 pub mod env_audit;
+pub mod execution_id;
 #[cfg(unix)]
 pub mod flock;
 #[cfg(unix)]
@@ -23,6 +24,7 @@ pub mod profile_address;
 pub mod residency_lease;
 pub mod run_pause;
 pub mod session_id;
+pub mod shell;
 pub mod size;
 /// (#2695/#2697/#2698) The single test-isolation guard. Gated the same
 /// way `env_audit` is: available to a crate's TEST build via the
@@ -164,13 +166,12 @@ pub struct ProfileModel {
     #[schemars(with = "CapabilityProfileSchema")]
     pub capabilities: CapabilityProfile,
     /// The endpoint this model is served from. Absent ⇒ the managed LM
-    /// Studio default. (#2902 step 4) Written as an id naming an entry of the
-    /// registry's `endpoints` map (`"endpoint": "azure-east"`), or, the
-    /// pre-4.0 spelling, as an inline object (still read; `darkmux doctor`
-    /// names the move to an id). The loader materializes an id into the
-    /// definition's fields; see [`endpoint`]. On an unmanaged endpoint `n_ctx`
-    /// is a *declared* window (darkmux cannot load-set it) rather than a
-    /// load parameter.
+    /// Studio default. Written as an id naming an entry of the registry's
+    /// `endpoints` map (`"endpoint": "azure-east"`); an inline object is
+    /// refused (`ProfileRegistry::inline_endpoint_rewrites` names the move).
+    /// The loader materializes an id into the definition's fields; see
+    /// [`endpoint`]. On an unmanaged endpoint `n_ctx` is a *declared* window
+    /// (darkmux cannot load-set it) rather than a load parameter.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "endpoint::endpoint_field")]
     #[schemars(with = "Option<endpoint::EndpointFieldSchema>")]
     pub endpoint: Option<ModelEndpoint>,
@@ -182,6 +183,15 @@ pub struct ProfileModel {
 }
 
 impl ProfileModel {
+    /// A model on the named endpoint `endpoint_json` declares (as an
+    /// `endpoints` entry does), built without a registry.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn hosted_for_test(id: &str, n_ctx: Option<u32>, endpoint_json: serde_json::Value) -> Self {
+        let mut ep: ModelEndpoint = serde_json::from_value(endpoint_json).expect("a valid endpoint definition");
+        ep.source = EndpointSource::Named("azure".to_string());
+        ProfileModel { id: id.to_string(), n_ctx, endpoint: Some(ep), ..Default::default() }
+    }
+
     /// (#2902 step 3) What darkmux does at this model's endpoint. No endpoint
     /// ⇒ the managed LM Studio default. THE classification every consumer
     /// reads (dispatch routing, residency, doctor, `profile list`); an
@@ -410,8 +420,7 @@ pub struct RegistryInternal {
     /// task/step selection path excludes it, so a profile's `models[]` are
     /// work models only. One global utility model serves every utility job.
     ///
-    /// Either a bare model id or `{ "id": .., "n_ctx": .. }`
-    /// ([`UtilityBinding`]). The window is declared HERE, since #2914 the
+    /// `{ "id": .., "n_ctx": .. }` ([`UtilityBinding`]). The window is declared HERE, since #2914 the
     /// only place the compactor's own context comes from — not from a
     /// profile's `models[]` entry, which would make the utility model a work
     /// model. Absent ⇒ (#2571) NOT a fallback to a built-in default compactor
@@ -419,64 +428,42 @@ pub struct RegistryInternal {
     /// `CompactionDispatchArgs::apply_utility_model` leaves `compactor_model`
     /// unset, and an unset compactor means compaction is OFF outright for the
     /// dispatch (disclosed loudly at dispatch time, not silently defaulted).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_utility_binding")]
     pub utility: Option<UtilityBinding>,
 }
 
-/// (#2914) The `internal.utility` value: a bare model id (the original
-/// spelling, still read) or an object declaring the model's own context
-/// window. Untagged so both spellings parse from the same key; the object
-/// form serializes back as an object, the bare form as a string.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(untagged)]
-pub enum UtilityBinding {
-    /// `"utility": "<model-id>"` — no window declared. Consumers that need
-    /// one fall back to a NAMED default and say so (never silently).
-    Id(String),
-    /// `"utility": { "id": "<model-id>", "n_ctx": <u32> }`.
-    Declared(UtilityModel),
-}
-
-/// (#2914) The object form of [`UtilityBinding`].
+/// The `internal.utility` value: `{ "id": "<model-id>", "n_ctx": <u32> }`. The
+/// bare-string spelling was removed in 4.0 ([`deserialize_utility_binding`]
+/// refuses it, naming this shape).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct UtilityModel {
+pub struct UtilityBinding {
     pub id: String,
     /// The window the utility model is loaded at, and the size a compaction
-    /// payload is bounded by. `None` ⇒ undeclared (same as the bare form).
+    /// payload is bounded by. `None` ⇒ undeclared: consumers that need one
+    /// fall back to a NAMED default and say so (never silently).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub n_ctx: Option<u32>,
     /// Overflow for keys this binary does not know, re-serialized flat: a
     /// registry written by a NEWER binary that added a field to this object
-    /// still reads here without losing the field. (It does not help the
-    /// other direction: a binary from before 2.0 cannot read the object at
-    /// all, see `PROFILES_SCHEMA_VERSION`.)
+    /// still reads here without losing the field.
     #[serde(flatten)]
     #[schemars(skip)]
     pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
-impl UtilityBinding {
-    /// The bare-form constructor, for callers that only have an id.
-    pub fn id(id: impl Into<String>) -> Self {
-        UtilityBinding::Id(id.into())
-    }
-
-    /// The declared model id, untrimmed (see
-    /// [`ProfileRegistry::utility_model_id`] for the trimmed, blank-is-unset
-    /// view every consumer should use).
-    pub fn raw_id(&self) -> &str {
-        match self {
-            UtilityBinding::Id(id) => id,
-            UtilityBinding::Declared(m) => &m.id,
-        }
-    }
-
-    /// The declared window, if the object form declared one.
-    pub fn n_ctx(&self) -> Option<u32> {
-        match self {
-            UtilityBinding::Id(_) => None,
-            UtilityBinding::Declared(m) => m.n_ctx,
-        }
+/// `serde(deserialize_with)` for `internal.utility`: the object form only. A
+/// bare string is refused with the object to write in its place, since the
+/// typed parse of `internal` is not per-entry-quarantined and a vague error
+/// here stops every dispatch.
+fn deserialize_utility_binding<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<UtilityBinding>, D::Error> {
+    use serde::de::Error;
+    match Option::<serde_json::Value>::deserialize(d)? {
+        None => Ok(None),
+        Some(serde_json::Value::String(id)) => Err(D::Error::custom(format!(
+            "`internal.utility` is a bare string (\"{id}\"), which 4.0 removed: write \
+             `\"utility\": {{ \"id\": \"{id}\", \"n_ctx\": <the window it is loaded at> }}`"
+        ))),
+        Some(other) => serde_json::from_value(other).map(Some).map_err(D::Error::custom),
     }
 }
 
@@ -561,15 +548,14 @@ impl Profile {
 // holding an endpoint's API key — the headless-runner escape hatch, resolved
 // ahead of the Keychain). Minor bump: every 1.4 registry parses unchanged (the
 // field is `Option`, absent on read), per the lenient-read doctrine.
-// 2.0 (#2914, darkmux 4.0): `internal.utility` also accepts the object form
+// 2.0 (#2914, darkmux 4.0): `internal.utility` is the object
 // `{ "id": <model-id>, "n_ctx": <u32> }` (`UtilityBinding`), declaring the
 // utility model's own context window where the binding lives. The bare
-// string form still reads (no window declared), so every 1.5 registry
-// parses unchanged. MAJOR bump all the same: this RETYPES a value, and an
-// older binary (`utility: Option<String>`) given the object form fails the
-// whole registry's typed parse (`internal` is a typed field, not a
-// quarantined per-entry one), which is a hard stop on every dispatch
-// (#1269). Alongside it, the utility model stopped being a legal work
+// string form is refused, naming the object to write. MAJOR bump: this
+// RETYPES a value, and an older binary (`utility: Option<String>`) given the
+// object form fails the whole registry's typed parse (`internal` is a typed
+// field, not a quarantined per-entry one), which is a hard stop on every
+// dispatch (#1269). Alongside it, the utility model stopped being a legal work
 // model: no profile's `models[]` should list it (`darkmux doctor` flags
 // one that does), and every task/step selection path excludes it.
 // Also in 2.0 (#2902 step 4, same unreleased major): the top-level
@@ -578,8 +564,10 @@ impl Profile {
 // retypes a value: a binary from before it reads `"endpoint": "<id>"` as a
 // type error and quarantines that profile (#1282). Folded into 2.0 rather
 // than a 2.1 because no binary has shipped 2.0 yet, so there is no released
-// 2.x reader it could break. Inline endpoint objects still read unchanged,
-// and gained three optional fields (`managed`, `dialect`, `limits`).
+// 2.x reader it could break. A profile model's inline endpoint OBJECT is
+// removed in the same major (refused, naming the rewrite to `endpoints`), and
+// an endpoint declares `managed` or a `url`: there is no implicit kind. An
+// endpoint gained three optional fields (`managed`, `dialect`, `limits`).
 // Also in 2.0 (#2902 step 5, same unreleased major, so no bump of its own):
 // `limits` gained two optional fields, `policy` (`off` / `warn` / `wait`, a
 // registered `ConfigEnum`, read leniently and refused at preflight when
@@ -711,19 +699,19 @@ impl ProfileRegistry {
         self.internal
             .as_ref()
             .and_then(|i| i.utility.as_ref())
-            .map(|u| u.raw_id().trim())
+            .map(|u| u.id.trim())
             .filter(|s| !s.is_empty())
     }
 
     /// (#2914) The utility model's declared context window
-    /// (`internal.utility.n_ctx`), when the object form declared one. `None`
-    /// for the bare form, for an undeclared window, and whenever
+    /// (`internal.utility.n_ctx`), when one is declared. `None`
+    /// for an undeclared window, and whenever
     /// [`Self::utility_model_id`] is `None` (a window with no model is not a
     /// binding). Since #2914 this is the ONLY source of the compactor's own
     /// window; a profile's `models[]` is never consulted for it.
     pub fn utility_model_n_ctx(&self) -> Option<u32> {
         self.utility_model_id()?;
-        self.internal.as_ref().and_then(|i| i.utility.as_ref()).and_then(UtilityBinding::n_ctx)
+        self.internal.as_ref().and_then(|i| i.utility.as_ref()).and_then(|u| u.n_ctx)
     }
 
     /// (#1054) Resolve which profile a dispatch should use, given an optional
@@ -794,102 +782,88 @@ impl ProfileRegistry {
     /// windows, in one pass, with no I/O (credential PRESENCE is doctor's live
     /// check). `darkmux doctor` prints these; resolution refuses the same
     /// problems at use. Assumes [`Self::materialize_endpoints`] has run.
-    pub fn validate(&self) -> Vec<RegistryIssue> {
+    pub fn validate(&self) -> Vec<String> {
         let mut out = Vec::new();
-        let suggestions = self.inline_endpoint_ids();
         for (id, def) in &self.endpoints {
             if let Err(reason) = def.validate() {
-                out.push(RegistryIssue::error(format!("endpoint \"{id}\": {reason}")));
+                out.push(format!("endpoint \"{id}\": {reason}"));
             }
         }
         for (pname, profile) in &self.profiles {
             for m in &profile.models {
-                if let Some(ep) = &m.endpoint {
-                    match &ep.source {
-                        EndpointSource::Unresolved(id) => {
-                            // The entry itself, else (re-review MF1) the whole
-                            // `endpoints` value, when that was not an object.
-                            let why = match self
-                                .quarantined
-                                .iter()
-                                .filter(|q| q.kind == QuarantinedEntryKind::Endpoint)
-                                .find(|q| &q.name == id)
-                                .or_else(|| {
-                                    self.quarantined
-                                        .iter()
-                                        .find(|q| q.kind == QuarantinedEntryKind::Endpoint && q.name == "endpoints")
-                                })
-                            {
-                                Some(q) => format!("whose `endpoints` entry is quarantined ({})", q.error),
-                                None => "which `endpoints` does not define".to_string(),
-                            };
-                            out.push(RegistryIssue::error(format!(
-                                "profile \"{pname}\" model \"{}\" names endpoint \"{id}\", {why}",
-                                m.id
-                            )))
-                        }
-                        EndpointSource::Inline => {
-                            if let Err(reason) = ep.validate() {
-                                out.push(RegistryIssue::error(format!(
-                                    "profile \"{pname}\" model \"{}\": {reason}",
-                                    m.id
-                                )));
-                            }
-                            let suggested = suggestions.get(&endpoint_key(ep)).cloned().unwrap_or_default();
-                            out.push(RegistryIssue::advice(format!(
-                                "profile \"{pname}\" model \"{}\" declares its endpoint inline; move the \
-                                 object to `endpoints.\"{suggested}\"` and write `\"endpoint\": \"{suggested}\"` \
-                                 on the model (inline endpoints still read)",
-                                m.id
-                            )));
-                        }
-                        EndpointSource::Named(_) => {}
-                    }
+                if let Some(EndpointSource::Unresolved(id)) = m.endpoint.as_ref().map(|e| &e.source) {
+                    out.push(format!(
+                        "profile \"{pname}\" model \"{}\" names endpoint \"{id}\", {}",
+                        m.id,
+                        self.unresolved_reason(id)
+                    ));
                 }
                 if m.missing_managed_n_ctx() {
-                    out.push(RegistryIssue::error(format!(
+                    out.push(format!(
                         "profile \"{pname}\" model \"{}\" is local (no endpoint) but declares no n_ctx — \
                          swap/dispatch on it will fail at resolution",
                         m.id
-                    )));
+                    ));
                 }
             }
         }
         out
     }
 
-    /// (#2902 review C6) A suggested `endpoints` id for each DISTINCT inline
-    /// endpoint definition (keyed by [`endpoint_key`]): its host (or
-    /// `lmstudio` for a managed one); when several distinct definitions
-    /// share a host, the host plus the URL's last path segment (an Azure
-    /// deployment name); then a numeric suffix until the id is unique, never
-    /// reusing an id `endpoints` already defines. The same definition used by
-    /// several models gets one id.
-    fn inline_endpoint_ids(&self) -> BTreeMap<String, String> {
-        let mut defs: Vec<(String, String, String)> = Vec::new(); // (key, host base, last segment)
-        for profile in self.profiles.values() {
-            for m in &profile.models {
-                let Some(ep) = m.endpoint.as_ref().filter(|e| e.source == EndpointSource::Inline) else { continue };
-                let key = endpoint_key(ep);
-                if defs.iter().any(|(k, _, _)| *k == key) {
-                    continue;
-                }
-                let base = ep.host().unwrap_or_else(|| "lmstudio".to_string());
-                // The last segment of the URL's PATH (never the host).
-                let last = ep
-                    .url
-                    .as_deref()
-                    .and_then(|u| u.split_once("://"))
-                    .and_then(|(_, rest)| rest.trim_end_matches('/').split_once('/'))
-                    .and_then(|(_, path)| path.rsplit('/').next())
-                    .filter(|seg| !seg.is_empty() && !seg.eq_ignore_ascii_case("v1"))
-                    .unwrap_or_default()
-                    .to_string();
-                defs.push((key, base, last));
+    /// Why endpoint `id` did not resolve: its entry (else, when `endpoints`
+    /// was not an object, the whole value) is quarantined, or `endpoints`
+    /// does not define it.
+    fn unresolved_reason(&self, id: &str) -> String {
+        let entry = self.quarantined.iter().filter(|q| q.kind == QuarantinedEntryKind::Endpoint);
+        match entry.clone().find(|q| q.name == id).or_else(|| entry.clone().find(|q| q.name == "endpoints")) {
+            Some(q) => format!("whose `endpoints` entry is quarantined ({})", q.error),
+            None => "which `endpoints` does not define".to_string(),
+        }
+    }
+
+    /// Every profile model in the profiles.json document `doc` that declares
+    /// its endpoint as an inline object, which 4.0 refuses, with the id to
+    /// move it to: each DISTINCT definition gets its host (or `lmstudio` for
+    /// one with no `url`); when several distinct definitions share a host,
+    /// the host plus the URL's last path segment (an Azure deployment name);
+    /// then a numeric suffix until the id is unique, never reusing an id
+    /// `endpoints` already defines. The same definition used by several
+    /// models gets one id. Reads the document, not the typed registry: a
+    /// profile with an inline object does not parse into one.
+    pub fn inline_endpoint_rewrites(doc: &serde_json::Value) -> Vec<InlineEndpointRewrite> {
+        let mut found: Vec<(String, ModelEndpoint)> = Vec::new(); // (path, definition)
+        let profiles = doc.get("profiles").and_then(|p| p.as_object()).into_iter().flatten();
+        for (pname, profile) in profiles {
+            let models = profile.get("models").and_then(|m| m.as_array()).into_iter().flatten();
+            for (i, model) in models.enumerate() {
+                let Some(obj) = model.get("endpoint").filter(|e| e.is_object()) else { continue };
+                let ep = serde_json::from_value::<ModelEndpoint>(obj.clone()).unwrap_or_default();
+                found.push((format!("profiles.{pname}.models[{i}].endpoint"), ep));
             }
         }
-        let mut taken: std::collections::BTreeSet<String> = self.endpoints.keys().cloned().collect();
-        let mut out = BTreeMap::new();
+        let taken: std::collections::BTreeSet<String> =
+            doc.get("endpoints").and_then(|e| e.as_object()).into_iter().flat_map(|m| m.keys().cloned()).collect();
+        let mut defs: Vec<(String, String, String)> = Vec::new(); // (key, host base, last segment)
+        for (_, ep) in &found {
+            let key = endpoint_key(ep);
+            if defs.iter().any(|(k, _, _)| *k == key) {
+                continue;
+            }
+            let base = ep.host().unwrap_or_else(|| "lmstudio".to_string());
+            // The last segment of the URL's PATH (never the host).
+            let last = ep
+                .url
+                .as_deref()
+                .and_then(|u| u.split_once("://"))
+                .and_then(|(_, rest)| rest.trim_end_matches('/').split_once('/'))
+                .and_then(|(_, path)| path.rsplit('/').next())
+                .filter(|seg| !seg.is_empty() && !seg.eq_ignore_ascii_case("v1"))
+                .unwrap_or_default()
+                .to_string();
+            defs.push((key, base, last));
+        }
+        let mut taken = taken;
+        let mut ids: BTreeMap<String, String> = BTreeMap::new();
         for (key, base, last) in &defs {
             let shared = defs.iter().filter(|(_, b, _)| b == base).count() > 1;
             let mut id = if shared && !last.is_empty() { format!("{base}-{last}") } else { base.clone() };
@@ -900,9 +874,15 @@ impl ProfileRegistry {
                 n += 1;
             }
             taken.insert(id.clone());
-            out.insert(key.clone(), id);
+            ids.insert(key.clone(), id);
         }
-        out
+        found
+            .into_iter()
+            .map(|(path, ep)| {
+                let suggested_id = ids.get(&endpoint_key(&ep)).cloned().unwrap_or_default();
+                InlineEndpointRewrite { path, suggested_id }
+            })
+            .collect()
     }
 
     pub fn quarantine_error_for(&self, name: &str) -> Option<String> {
@@ -932,29 +912,23 @@ fn named_endpoint(endpoints: &BTreeMap<String, ModelEndpoint>, id: &str) -> Mode
     }
 }
 
-/// (#2902 step 4) One finding from [`ProfileRegistry::validate`].
+/// One profile model whose `endpoint` is an inline object (refused in 4.0):
+/// where it is, and the `endpoints` id to move it to.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RegistryIssue {
-    pub severity: IssueSeverity,
-    /// The whole operator-facing sentence, naming the entry and the fix.
-    pub message: String,
+pub struct InlineEndpointRewrite {
+    /// The dotted path of the model's `endpoint` (`profiles.p.models[0].endpoint`).
+    pub path: String,
+    pub suggested_id: String,
 }
 
-/// How much a [`RegistryIssue`] matters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IssueSeverity {
-    /// The entry fails when used.
-    Error,
-    /// The entry works; a better spelling is named.
-    Advice,
-}
-
-impl RegistryIssue {
-    fn error(message: String) -> Self {
-        RegistryIssue { severity: IssueSeverity::Error, message }
-    }
-    fn advice(message: String) -> Self {
-        RegistryIssue { severity: IssueSeverity::Advice, message }
+impl InlineEndpointRewrite {
+    /// The operator line: what was removed and the exact rewrite.
+    pub fn line(&self) -> String {
+        format!(
+            "an inline endpoint object was removed in 4.0: declare it once under `endpoints` and name it by id. \
+             Move this object to `endpoints.\"{id}\"` and write `\"endpoint\": \"{id}\"` on the model",
+            id = self.suggested_id
+        )
     }
 }
 
@@ -1156,7 +1130,7 @@ mod tests {
     fn profile_model_n_ctx_absent_parses_and_round_trips_absent() {
         let json = r#"{
             "id": "gpt-4o",
-            "endpoint": { "url": "https://example.azure.com/openai" }
+            "endpoint": "azure"
         }"#;
         let m: ProfileModel = serde_json::from_str(json).unwrap();
         assert_eq!(m.n_ctx, None);
@@ -1198,18 +1172,19 @@ mod tests {
 
     #[test]
     fn profile_model_endpoint_round_trips() {
-        // A remote model names its endpoint URL + auth. The Keychain item
-        // NAME is stored — never the secret.
+        // A remote model names an `endpoints` entry by id; the entry carries
+        // the URL + auth. The Keychain item NAME is stored, never the secret.
         let json = r#"{
-            "id": "gpt-5.1",
-            "n_ctx": 200000,
-            "endpoint": {
+            "profiles": {"p": {"models": [{"id": "gpt-5.1", "n_ctx": 200000, "endpoint": "azure"}]}},
+            "endpoints": {"azure": {
                 "url": "https://example-aoai.cognitiveservices.azure.com/openai/deployments/gpt-4o",
                 "api_version": "2025-01-01-preview",
                 "auth": { "type": "api-key", "keychain": "darkmux-azure-example" }
-            }
+            }}
         }"#;
-        let m: ProfileModel = serde_json::from_str(json).unwrap();
+        let mut r: ProfileRegistry = serde_json::from_str(json).unwrap();
+        r.materialize_endpoints();
+        let m = &r.profiles["p"].models[0];
         let ep = m.endpoint.as_ref().expect("endpoint parsed");
         assert_eq!(ep.kind().unwrap(), EndpointKind::Unmanaged);
         assert_eq!(
@@ -1220,10 +1195,12 @@ mod tests {
         let auth = ep.auth.as_ref().expect("auth parsed");
         assert_eq!(auth.auth_type, Some(EndpointAuthType::ApiKey));
         assert_eq!(auth.keychain.as_deref(), Some("darkmux-azure-example"));
-        // full round-trip preserves the endpoint
-        let back: ProfileModel =
-            serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
-        assert_eq!(back.endpoint, m.endpoint);
+        // full round-trip preserves the endpoint, written back as its id
+        let out = serde_json::to_value(&r).unwrap();
+        assert_eq!(out["profiles"]["p"]["models"][0]["endpoint"], "azure");
+        let mut back: ProfileRegistry = serde_json::from_value(out).unwrap();
+        back.materialize_endpoints();
+        assert_eq!(back.profiles["p"].models[0].endpoint, m.endpoint);
     }
 
     #[test]
@@ -1237,10 +1214,10 @@ mod tests {
 
     #[serial_test::serial]
     #[test]
-    fn endpoint_default_is_managed() {
-        // No url ⇒ managed LM Studio; its chat URL is the configured LM
-        // Studio address (a URL).
-        let ep = ModelEndpoint::default();
+    fn managed_lmstudio_endpoint_uses_the_configured_address() {
+        // The managed endpoint's chat URL is the configured LM Studio address
+        // (a URL).
+        let ep = ModelEndpoint::managed_lmstudio();
         assert_eq!(ep.kind().unwrap(), EndpointKind::Managed(ManagedBackend::Lmstudio));
         let url = ep.chat_url().unwrap();
         assert!(url.contains("://"), "chat_url should be a URL, got {url:?}");
@@ -1328,7 +1305,7 @@ mod tests {
             "profiles": {
                 "fast": { "models": [ {"id": "worker-a", "n_ctx": 32000} ] }
             },
-            "internal": { "utility": "darkmux:qwen3-4b-instruct-2507" }
+            "internal": { "utility": { "id": "darkmux:qwen3-4b-instruct-2507" } }
         }"#;
         let reg: ProfileRegistry = serde_json::from_str(json).unwrap();
         assert_eq!(reg.utility_model_id(), Some("darkmux:qwen3-4b-instruct-2507"));
@@ -1336,6 +1313,23 @@ mod tests {
         let back: ProfileRegistry =
             serde_json::from_str(&serde_json::to_string(&reg).unwrap()).unwrap();
         assert_eq!(back.utility_model_id(), Some("darkmux:qwen3-4b-instruct-2507"));
+    }
+
+    /// The bare-string `internal.utility` was removed in 4.0: the typed load
+    /// refuses it, naming the object form with the id the file wrote.
+    #[test]
+    fn a_bare_string_utility_is_refused_naming_the_object_form() {
+        let err = serde_json::from_str::<ProfileRegistry>(r#"{ "profiles": {}, "internal": { "utility": "util-4b" } }"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("bare string") && err.contains("removed"), "{err}");
+        assert!(err.contains(r#""utility": { "id": "util-4b", "n_ctx": "#), "names the object to write: {err}");
+        for ok in [r#"{ "id": "u" }"#, r#"{ "id": "u", "n_ctx": 8 }"#, "null"] {
+            let json = format!(r#"{{ "profiles": {{}}, "internal": {{ "utility": {ok} }} }}"#);
+            serde_json::from_str::<ProfileRegistry>(&json).unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
+        let wrong = serde_json::from_str::<ProfileRegistry>(r#"{ "profiles": {}, "internal": { "utility": 5 } }"#).unwrap_err();
+        assert!(wrong.to_string().contains("invalid type"), "{wrong}");
     }
 
     #[test]
@@ -1357,12 +1351,12 @@ mod tests {
         // as "no util model" — guards swap (#590) against trying to load the
         // bare `darkmux:` identifier. Surrounding whitespace is also trimmed.
         for blank in ["\"\"", "\"   \"", "\"\\t\\n\""] {
-            let json = format!(r#"{{ "profiles": {{}}, "internal": {{ "utility": {blank} }} }}"#);
+            let json = format!(r#"{{ "profiles": {{}}, "internal": {{ "utility": {{ "id": {blank} }} }} }}"#);
             let reg: ProfileRegistry = serde_json::from_str(&json).unwrap();
             assert_eq!(reg.utility_model_id(), None, "blank {blank} should be unset");
         }
         // A padded real id trims to the bare id (so it still matches loaded state).
-        let json = r#"{ "profiles": {}, "internal": { "utility": "  darkmux:util-4b  " } }"#;
+        let json = r#"{ "profiles": {}, "internal": { "utility": { "id": "  darkmux:util-4b  " } } }"#;
         let reg: ProfileRegistry = serde_json::from_str(json).unwrap();
         assert_eq!(reg.utility_model_id(), Some("darkmux:util-4b"));
     }
@@ -1370,7 +1364,7 @@ mod tests {
     /// (#2914) `internal.utility` also accepts `{id, n_ctx}`: the utility
     /// model declares its own context window HERE, never in a profile's
     /// `models[]` (the compactor's window used to be looked up there, which
-    /// made the utility model a work model). A bare string still reads.
+    /// made the utility model a work model). A bare string is refused.
     #[test]
     fn registry_internal_utility_accepts_id_and_n_ctx_object() {
         let json = r#"{
@@ -1386,11 +1380,11 @@ mod tests {
         assert_eq!(back.utility_model_id(), Some("darkmux:util-4b"));
         assert_eq!(back.utility_model_n_ctx(), Some(120_000));
 
-        // The bare form declares no window.
-        let bare: ProfileRegistry =
-            serde_json::from_str(r#"{ "profiles": {}, "internal": { "utility": "util-4b" } }"#).unwrap();
-        assert_eq!(bare.utility_model_id(), Some("util-4b"));
-        assert_eq!(bare.utility_model_n_ctx(), None);
+        // An object with no `n_ctx` declares no window.
+        let undeclared: ProfileRegistry =
+            serde_json::from_str(r#"{ "profiles": {}, "internal": { "utility": { "id": "util-4b" } } }"#).unwrap();
+        assert_eq!(undeclared.utility_model_id(), Some("util-4b"));
+        assert_eq!(undeclared.utility_model_n_ctx(), None);
 
         // A blank/padded id in the object form gets the same treatment as a
         // blank/padded bare string.
@@ -1750,7 +1744,7 @@ mod tests {
     /// Full round-trip preserves typed fields through serialize→parse cycle.
     #[test]
     fn registry_full_shape_round_trips() {
-        let json = r#"{"schema_version":"2.0","profiles":{"fast":{"description":"tiny profile","models":[{"id":"model-a","n_ctx":32000}],"default_model":"model-a"}},"hooks":{"pre_swap":[{"command":"echo swap-start","condition":"always"}],"post_swap":[{"command":"echo swap-end"}]},"default_profile":"fast","internal":{"utility":"darkmux:util-4b"},"future_field":true}"#;
+        let json = r#"{"schema_version":"2.0","profiles":{"fast":{"description":"tiny profile","models":[{"id":"model-a","n_ctx":32000}],"default_model":"model-a"}},"hooks":{"pre_swap":[{"command":"echo swap-start","condition":"always"}],"post_swap":[{"command":"echo swap-end"}]},"default_profile":"fast","internal":{"utility":{"id":"darkmux:util-4b"}},"future_field":true}"#;
         let reg: ProfileRegistry = serde_json::from_str(json).unwrap();
         assert_eq!(reg.schema_version.as_deref(), Some("2.0"));
         assert_eq!(reg.profiles.len(), 1);

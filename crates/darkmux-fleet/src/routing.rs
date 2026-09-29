@@ -29,7 +29,6 @@ pub fn build_work_job(
     session_id: SessionId,
     profile: Option<String>,
     workdir: Option<String>,
-    phase_id: Option<String>,
     image: Option<String>,
     timeout_seconds: u32,
     published_by_machine: Option<String>,
@@ -50,7 +49,6 @@ pub fn build_work_job(
         session_id,
         profile,
         workdir,
-        phase_id,
         image,
         timeout_seconds,
         published_at_unix_ms,
@@ -232,7 +230,7 @@ pub fn dispatch_routed_via(
 ///
 /// What crosses: role, message, session id, `--profile`, `--workdir` (a
 /// path on the RECEIVER, and only if its allow-list entry grants
-/// `workspace`), `--phase-id`, `--image`, `timeout_seconds`. What does not:
+/// `workspace`), `--image`, `timeout_seconds`. What does not:
 /// `--timeout`'s inactivity override, `--max-completion-tokens`, compaction
 /// flags, `--json` (the receiver's human output is returned as stdout).
 fn dispatch_via_submission(opts: DispatchOpts, target: &str) -> Result<DispatchResult> {
@@ -244,7 +242,6 @@ fn dispatch_via_submission(opts: DispatchOpts, target: &str) -> Result<DispatchR
         session_id.clone(),
         opts.profile_name.clone(),
         opts.workdir.as_ref().map(|p| p.display().to_string()),
-        opts.phase_id.clone(),
         opts.image.clone(),
         opts.timeout_seconds,
         darkmux_flow::resolve_machine_id(),
@@ -282,13 +279,14 @@ pub(crate) fn reply_to_dispatch_result(
                 stdout: crate::sanitize_remote_text(&reply.stdout.unwrap_or_default()),
                 stderr: crate::sanitize_remote_text(&reply.stderr.unwrap_or_default()),
                 session_id,
+                execution: None,
                 out_dir: None,
                 trajectory: None,
             }
         }
     };
     // The run's bookkeeping lands on the receiving machine.
-    DispatchResult { exit_code: 0, stdout, stderr: String::new(), session_id, out_dir: None, trajectory: None }
+    DispatchResult { exit_code: 0, stdout, stderr: String::new(), session_id, execution: None, out_dir: None, trajectory: None }
 }
 
 #[cfg(test)]
@@ -306,7 +304,6 @@ mod tests {
             crate::test_session("sess-42"),    // session_id
             Some("coder-studio".to_string()),  // profile
             Some("/work/repo".to_string()),    // workdir
-            Some("phase-7".to_string()),       // phase_id
             Some("rust:slim".to_string()),     // image
             900,                               // timeout_seconds
             Some("laptop".to_string()),        // published_by_machine
@@ -322,7 +319,6 @@ mod tests {
         assert_eq!(j.session_id, crate::test_session("sess-42"));
         assert_eq!(j.profile.as_deref(), Some("coder-studio"));
         assert_eq!(j.workdir.as_deref(), Some("/work/repo"));
-        assert_eq!(j.phase_id.as_deref(), Some("phase-7"));
         assert_eq!(j.image.as_deref(), Some("rust:slim"));
         assert_eq!(j.timeout_seconds, 900);
         assert_eq!(j.published_by_machine.as_deref(), Some("laptop"));
@@ -401,6 +397,7 @@ mod tests {
                 stdout: "injected stdout".to_string(),
                 stderr: String::new(),
                 session_id: crate::test_session("sess-injected"),
+                execution: None,
                 out_dir: None,
                 trajectory: None,
             })
@@ -677,7 +674,7 @@ mod tests {
         let mut seen = None;
         dispatch_routed_via(opts, |o| {
             seen = Some((o.profile_name.clone(), o.machine.clone()));
-            Ok(DispatchResult { exit_code: 0, stdout: String::new(), stderr: String::new(), session_id: crate::test_session("s"), out_dir: None, trajectory: None })
+            Ok(DispatchResult { exit_code: 0, stdout: String::new(), stderr: String::new(), session_id: crate::test_session("s"), execution: None, out_dir: None, trajectory: None })
         })
         .unwrap();
         assert_eq!(seen, Some((Some("host".to_string()), None)));
@@ -882,13 +879,10 @@ mod tests {
     //   either fails LOUD rather than silently, but if `dispatch_via_submission`
     //   genuinely needs wider visibility this scan's premise is gone.
     // - A reimplementation of "submit this dispatch to another machine"
-    //   that never calls `dispatch_via_submission` itself. Not hypothetical:
-    //   `darkmux mission dispatch` (`src/main.rs`) builds its own
-    //   `WorkJob`s via `fleet::build_work_job` and calls
-    //   `fleet::submit_work` directly. It is NOT a live bypass only because
-    //   `mission dispatch` has no `--resume-from` flag at all. If it ever
-    //   grows one, it needs this same guard BEFORE it submits, and this
-    //   check will not notice either way.
+    //   that never calls `dispatch_via_submission` itself. Anything that
+    //   builds its own `WorkJob`s via `fleet::build_work_job` and calls
+    //   `fleet::submit_work` directly would skip the `--resume-from` guard
+    //   below, and this check would not notice.
     // - A call reached only through a function-pointer alias.
     // - A call inside an `impl` block method or a macro body (the function
     //   extractor only indexes column-0 `fn`/`pub fn` items) — this FAILS

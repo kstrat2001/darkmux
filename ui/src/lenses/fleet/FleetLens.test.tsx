@@ -373,16 +373,15 @@ describe("FleetLens", () => {
     const today = todayUTC();
     mockFleetFetch({
       flowToday: [
-        // (#2886 pass 5) `source: "mission"` on the mission's own top-level
-        // session — a real mission bookend always carries it
-        // (`mission_launch.rs::mission_bookend_record`) and it's what
+        // (#2886 pass 5) The mission's own run session opens on `run.start`
+        // (`mission_launch.rs::run_bookend_record`), which is what
         // `liveExecutions` reads to exclude this session from the pager's
-        // `card.executions` (see that function's own doc). Without it here,
+        // `card.executions` (see that function's own doc). As an execution,
         // this fixture read as TWO genuine executions sharing one collapsed
         // run — a real mismatch, correctly triggering #2881's "N run(s) · M
         // executions" wording, not the bug this older test predates and was
         // never about.
-        { ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "mission-1", mission_id: "mission-1", action: "dispatch.start", source: "mission" },
+        { ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "mission-1", mission_id: "mission-1", action: "run.start" },
         { ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "seat-1", mission_id: "mission-1", action: "dispatch.start" },
       ],
     });
@@ -1136,7 +1135,7 @@ describe("FleetLens pager (#2881)", () => {
       handle: "darkmux/crawler",
     }));
     const missionRecords: NormRecord[] = normAll([
-      { ts: at(0), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: missionId, action: "dispatch.start", source: "mission", mission_id: missionId },
+      { ts: at(0), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: missionId, action: "run.start", mission_id: missionId },
       { ts: at(0), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "seat-1", action: "dispatch.start", mission_id: missionId, handle: "darkmux/crawler" },
       { ts: at(0), machine_uid: "u1", session_id: "seat-1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0, generated_chars: 0 } },
       { ts: at(2), machine_uid: "u1", session_id: "seat-1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0 + 2000, generated_chars: 800 } },
