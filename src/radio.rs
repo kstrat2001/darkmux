@@ -708,7 +708,7 @@ mod tests {
         // is compared against an `include_str!` of the SHIPPED template
         // directly, NEVER `crate::crew::loader::role_prompt("radio-router")`.
         // `role_prompt` resolves the SAME operator-tier-override-wins
-        // precedence every dispatch honors (`~/.darkmux/crew/roles/
+        // precedence every dispatch honors (`~/.darkmux/roles/
         // radio-router.md`, loader-preferred over the embedded default —
         // see the issue's own "RADIO's persona" comment, which documents
         // exactly this override as the delivery mechanism for the
@@ -765,7 +765,7 @@ mod tests {
              text (contract 6) — a deliberate edit updates both this golden and the file \
              together. (Compared against the SHIPPED template directly, not through \
              `crate::crew::loader::role_prompt`, which would resolve an operator's own \
-             persona override at `~/.darkmux/crew/roles/radio-router.md` instead — see this \
+             persona override at `~/.darkmux/roles/radio-router.md` instead — see this \
              test's own doc.)"
         );
     }

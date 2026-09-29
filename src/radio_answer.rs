@@ -1564,7 +1564,7 @@ pub fn answer_text(stdout: &str, cap: u32) -> Result<String> {
 /// cannot catch a substitution that stops firing and ships a raw
 /// `{{surface_instructions}}` to the model. Takes `persona` rather than
 /// loading it, so a test can pin the SHIPPED template without resolving an
-/// operator's own `~/.darkmux/crew/roles/radio-host.md` override.
+/// operator's own `~/.darkmux/roles/radio-host.md` override.
 fn substitute_persona(persona: &str, humor: u8, surface: RadioSurface) -> String {
     persona
         .replace("{{humor}}", &humor.to_string())
@@ -3237,7 +3237,7 @@ mod tests {
     fn radio_host_role_prompt_matches_frozen_golden() {
         // Compared against the SHIPPED template directly (`include_str!`),
         // never `crate::crew::loader::role_prompt`, which would resolve an
-        // operator's own override at `~/.darkmux/crew/roles/radio-host.md`
+        // operator's own override at `~/.darkmux/roles/radio-host.md`
         // instead — see `radio.rs`'s sibling golden test for why.
         const SHIPPED_TEMPLATE: &str = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
