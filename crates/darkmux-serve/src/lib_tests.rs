@@ -2097,6 +2097,7 @@
     /// proxy (`tailscale serve` puts every tailnet peer on loopback), and
     /// shown to a plain loopback request. Drives the real handler.
     #[tokio::test]
+    #[serial_test::serial]
     async fn health_withholds_this_machine_fields_from_a_proxied_loopback_request() {
         *crate::fleet_listener::LISTENER_BUSY.lock().unwrap() =
             Some((darkmux_types::config::BusyPolicy::Queue, 2));
@@ -2116,21 +2117,172 @@
         *crate::fleet_listener::LISTENER_BUSY.lock().unwrap() = None;
     }
 
+    fn headers_with(pairs: &[(&str, &str)]) -> axum::http::HeaderMap {
+        let mut hm = axum::http::HeaderMap::new();
+        for (k, v) in pairs {
+            hm.append(axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(), v.parse().unwrap());
+        }
+        hm
+    }
+
     #[test]
     fn is_local_request_needs_a_loopback_peer_and_no_proxy_header() {
-        let empty = axum::http::HeaderMap::new();
+        let named = headers_with(&[("Host", "localhost:8765")]);
         let lo: SocketAddr = "127.0.0.1:5000".parse().unwrap();
         let v6: SocketAddr = "[::1]:5000".parse().unwrap();
         let remote: SocketAddr = "100.64.0.7:5000".parse().unwrap();
-        assert!(is_local_request(Some(lo), &empty));
-        assert!(is_local_request(Some(v6), &empty));
-        assert!(!is_local_request(Some(remote), &empty));
-        assert!(!is_local_request(None, &empty), "no address is not local");
+        assert!(is_local_request(Some(lo), &named));
+        assert!(is_local_request(Some(v6), &named));
+        assert!(!is_local_request(Some(remote), &named));
+        assert!(!is_local_request(None, &named), "no address is not local");
         for h in PROXY_HEADERS {
-            let mut hm = axum::http::HeaderMap::new();
-            hm.insert(*h, "x".parse().unwrap());
+            let hm = headers_with(&[("Host", "localhost:8765"), (h, "x")]);
             assert!(!is_local_request(Some(lo), &hm), "{h}");
         }
+    }
+
+    // ─── (#2988 review) a local request names this machine ────────────
+    // A loopback peer is not enough: a browser tab on an attacker's page,
+    // rebound by DNS to 127.0.0.1, connects from loopback carrying the
+    // attacker's Host. A header-less proxy's Host is the tailnet name.
+
+    const REBOUND: &[(&str, &str)] =
+        &[("Host", "attacker.example:8765"), ("Origin", "http://attacker.example:8765")];
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn auth_on_loopback_with_a_rebinding_host_and_no_token_is_refused() {
+        assert_eq!(loopback_flow_status(AuthEnv::ReadAuth, REBOUND).await, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn auth_on_loopback_with_a_rebinding_host_and_the_token_is_allowed() {
+        let status = loopback_flow_status(
+            AuthEnv::ReadAuth,
+            &[("Host", "attacker.example:8765"), ("Authorization", BEARER)],
+        )
+        .await;
+        assert_ne!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn auth_on_loopback_with_a_local_host_name_is_allowed_without_the_token() {
+        for host in ["localhost", "localhost:8765", "LocalHost:8765", "127.0.0.1", "127.0.0.1:8765", "[::1]", "[::1]:8765"] {
+            let status = loopback_flow_status(AuthEnv::ReadAuth, &[("Host", host)]).await;
+            assert_ne!(status, StatusCode::UNAUTHORIZED, "Host: {host}");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn auth_on_loopback_with_a_tailnet_host_and_no_token_is_refused() {
+        // What a header-less `tailscale serve --tcp` proxy sends.
+        let status = loopback_flow_status(AuthEnv::ReadAuth, &[("Host", "hub.tailnet-test.example")]).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// The router as `run()` builds it: no layer that supplies a Host.
+    async fn bare_router_status(headers: &[(&str, &str)], peer: ConnectInfo<SocketAddr>) -> StatusCode {
+        apply_auth_env(AuthEnv::ReadAuth);
+        let app = build_router(PathBuf::new());
+        let mut b = Request::builder().uri("/flow-days");
+        for (k, v) in headers {
+            b = b.header(*k, *v);
+        }
+        let mut req = b.body(Body::empty()).unwrap();
+        req.extensions_mut().insert(peer);
+        let resp = app.oneshot(req).await.unwrap();
+        clear_auth_env();
+        resp.status()
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn auth_on_loopback_with_no_host_header_is_refused() {
+        assert_eq!(bare_router_status(&[], loopback_peer()).await, StatusCode::UNAUTHORIZED);
+        assert_ne!(
+            bare_router_status(&[("Host", "localhost:8765")], loopback_peer()).await,
+            StatusCode::UNAUTHORIZED,
+            "the same request with a local Host passes"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn auth_on_an_ipv4_mapped_loopback_peer_is_local() {
+        let mapped = ConnectInfo("[::ffff:127.0.0.1]:5555".parse::<SocketAddr>().unwrap());
+        let status = bare_router_status(&[("Host", "localhost")], mapped).await;
+        assert_ne!(status, StatusCode::UNAUTHORIZED, "a v4-mapped loopback peer is this machine");
+    }
+
+    #[test]
+    fn an_ipv4_mapped_loopback_peer_is_local_and_a_mapped_remote_is_not() {
+        let h = headers_with(&[("Host", "localhost")]);
+        assert!(is_local_request(Some("[::ffff:127.0.0.1]:5000".parse().unwrap()), &h));
+        assert!(!is_local_request(Some("[::ffff:100.64.0.7]:5000".parse().unwrap()), &h));
+    }
+
+    /// The Host rule against a known bind address: the bind's own host, with
+    /// or without the bound port; a different port or name is not this daemon.
+    #[test]
+    fn the_host_rule_accepts_the_bind_address_and_only_its_port() {
+        let lo: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let bound: Option<SocketAddr> = Some("100.64.0.5:8765".parse().unwrap());
+        let ok = |host: &str| is_local_at(Some(lo), &headers_with(&[("Host", host)]), bound);
+        for host in ["100.64.0.5", "100.64.0.5:8765", "localhost", "localhost:8765", "[::1]:8765", "127.0.0.1:8765"] {
+            assert!(ok(host), "{host}");
+        }
+        for host in ["100.64.0.5:9999", "localhost:9999", "attacker.example", "attacker.example:8765", "100.64.0.6", "", "localhost:notaport", "::1"] {
+            assert!(!ok(host), "{host:?}");
+        }
+        // A wildcard bind names no host: only the loopback names count.
+        let wild: Option<SocketAddr> = Some("0.0.0.0:8765".parse().unwrap());
+        assert!(!is_local_at(Some(lo), &headers_with(&[("Host", "0.0.0.0:8765")]), wild));
+        assert!(is_local_at(Some(lo), &headers_with(&[("Host", "localhost:8765")]), wild));
+    }
+
+    #[test]
+    fn two_host_headers_are_not_local() {
+        let lo: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let two = headers_with(&[("Host", "localhost"), ("Host", "attacker.example")]);
+        assert!(!is_local_at(Some(lo), &two, None));
+        assert!(!is_local_at(Some(lo), &axum::http::HeaderMap::new(), None), "no Host is not local");
+    }
+
+    /// The daemon records the address it bound; `is_local_request` reads it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_recorded_bind_address_bounds_the_host_port() {
+        record_bound_addr(Some("127.0.0.1:8765".parse().unwrap()));
+        let wrong_port = loopback_flow_status(AuthEnv::ReadAuth, &[("Host", "localhost:9999")]).await;
+        let right_port = loopback_flow_status(AuthEnv::ReadAuth, &[("Host", "localhost:8765")]).await;
+        record_bound_addr(None);
+        assert_eq!(wrong_port, StatusCode::UNAUTHORIZED);
+        assert_ne!(right_port, StatusCode::UNAUTHORIZED);
+    }
+
+    /// `/health`'s this-machine fields follow the same predicate.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn health_withholds_this_machine_fields_from_a_rebound_or_hostless_request() {
+        *crate::fleet_listener::LISTENER_BUSY.lock().unwrap() =
+            Some((darkmux_types::config::BusyPolicy::Queue, 2));
+        let rebound = loopback_health(REBOUND).await;
+        assert!(rebound["open_file_limit"].is_null(), "{rebound}");
+        assert!(rebound["fleet_busy"].is_null(), "{rebound}");
+        let app = build_router(PathBuf::new());
+        let mut req = Request::builder().uri("/health").body(Body::empty()).unwrap();
+        req.extensions_mut().insert(loopback_peer());
+        let resp = app.oneshot(req).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let hostless: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(hostless["open_file_limit"].is_null(), "{hostless}");
+        assert!(hostless["fleet_busy"].is_null(), "{hostless}");
+        let local = loopback_health(&[("Host", "localhost:8765")]).await;
+        assert!(local["open_file_limit"].is_number(), "{local}");
+        *crate::fleet_listener::LISTENER_BUSY.lock().unwrap() = None;
     }
 
     #[tokio::test]
@@ -2179,6 +2331,8 @@
         assert!(serve_auth_preflight("127.0.0.1", NO_AUTH).is_ok());
         assert!(serve_auth_preflight("::1", NO_AUTH).is_ok());
         assert!(serve_auth_preflight("127.0.0.5", NO_AUTH).is_ok());
+        assert!(serve_auth_preflight("::ffff:127.0.0.1", NO_AUTH).is_ok(), "a v4-mapped loopback bind is loopback");
+        assert!(serve_auth_preflight("::ffff:100.64.0.5", NO_AUTH).is_err(), "a mapped tailnet bind is not");
     }
 
     /// (#2782 C5) The gate above says v6 loopback is legal; before this the

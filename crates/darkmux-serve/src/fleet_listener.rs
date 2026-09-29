@@ -756,7 +756,7 @@ pub(crate) fn listen_addr(local: &darkmux_fleet::NodeIdentity, port: u16) -> Res
         .or_else(|| local.addresses.first())
         .copied()
         .ok_or_else(|| "the identity provider reports no overlay address for this machine".to_string())?;
-    if ip.is_unspecified() || (ip.is_loopback() && !LOOPBACK_FOR_E2E) || ip.is_multicast() {
+    if ip.is_unspecified() || (ip.to_canonical().is_loopback() && !LOOPBACK_FOR_E2E) || ip.is_multicast() {
         return Err(format!("refusing to bind the fleet listener to {ip}: not a specific overlay address"));
     }
     Ok(SocketAddr::new(ip, port))
@@ -2328,7 +2328,7 @@ mod tests {
     fn the_listener_binds_only_a_specific_overlay_address() {
         let local = test_node("n", "studio", "100.64.0.2");
         assert_eq!(listen_addr(&local, 8766).unwrap().to_string(), "100.64.0.2:8766");
-        for bad in ["0.0.0.0", "127.0.0.1", "::"] {
+        for bad in ["0.0.0.0", "127.0.0.1", "::", "::ffff:127.0.0.1"] {
             let n = test_node("n", "studio", bad);
             assert!(listen_addr(&n, 8766).is_err(), "{bad}");
         }

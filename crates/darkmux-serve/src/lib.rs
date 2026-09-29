@@ -497,6 +497,9 @@ async fn assume_loopback_peer(mut req: Request, next: Next) -> Response {
         req.extensions_mut()
             .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 5555))));
     }
+    if !req.headers().contains_key(axum::http::header::HOST) {
+        req.headers_mut().insert(axum::http::header::HOST, axum::http::HeaderValue::from_static("localhost"));
+    }
     next.run(req).await
 }
 
@@ -661,17 +664,124 @@ const PROXY_HEADERS: &[&str] = &[
     "tailscale-app-capabilities",
 ];
 
-/// (#2916 stage 2 review C5) Whether a request comes from THIS machine: a
-/// loopback peer address, and no header a reverse proxy adds. Behind
-/// `tailscale serve` every tailnet peer arrives on loopback, so the address
-/// alone would hand a peer what only this machine may read. A local process
-/// that adds such a header only makes itself look remote, which fails
-/// toward showing less. No address (no `ConnectInfo`) is not local.
+/// The address this daemon bound, recorded by `run` so the one predicate
+/// [`is_local_request`] can tell a Host naming this daemon from a stranger's.
+/// `None` until `run` binds (and in tests that state no bind).
+static BOUND_ADDR: std::sync::Mutex<Option<SocketAddr>> = std::sync::Mutex::new(None);
+
+/// Record (or clear) the address this daemon bound.
+pub(crate) fn record_bound_addr(addr: Option<SocketAddr>) {
+    if let Ok(mut g) = BOUND_ADDR.lock() {
+        *g = addr;
+    }
+}
+
+/// (#2916 stage 2 review C5, #2988 review) Whether a request comes from THIS
+/// machine, judged by the one predicate every local decision in this daemon
+/// uses. All three must hold:
 ///
-/// The limit: a proxy that forwards to loopback and adds NONE of these
-/// headers looks exactly like a local request, and cannot be told apart.
+/// - a loopback peer address (an IPv4-mapped `::ffff:127.0.0.1` included);
+/// - no header a reverse proxy adds ([`PROXY_HEADERS`]);
+/// - a `Host` header naming this daemon: `localhost`, `127.0.0.1`, `[::1]`
+///   or the bound address, each with or without the bound port. A page an
+///   attacker rebinds by DNS to 127.0.0.1 connects from loopback carrying
+///   the attacker's Host, and a header-less proxy (`tailscale serve --tcp`)
+///   carries the tailnet name; neither is this machine. No Host is not local.
+///
+/// A local process that fakes a header only makes itself look remote, which
+/// fails toward showing less. No address (no `ConnectInfo`) is not local.
 pub(crate) fn is_local_request(peer: Option<SocketAddr>, headers: &axum::http::HeaderMap) -> bool {
-    peer.is_some_and(|p| p.ip().is_loopback()) && !PROXY_HEADERS.iter().any(|h| headers.contains_key(*h))
+    let bound = BOUND_ADDR.lock().ok().and_then(|g| *g);
+    is_local_at(peer, headers, bound)
+}
+
+/// [`is_local_request`] against an explicit bind address.
+pub(crate) fn is_local_at(
+    peer: Option<SocketAddr>,
+    headers: &axum::http::HeaderMap,
+    bound: Option<SocketAddr>,
+) -> bool {
+    peer.is_some_and(|p| p.ip().to_canonical().is_loopback())
+        && !PROXY_HEADERS.iter().any(|h| headers.contains_key(*h))
+        && host_names_this_daemon(headers, bound)
+}
+
+/// The host part of a `Host` header value.
+#[derive(Debug, PartialEq, Eq)]
+enum RequestHost {
+    Localhost,
+    Ip(std::net::IpAddr),
+    Other,
+}
+
+/// A parsed `Host` header value: the host and the optional port.
+#[derive(Debug, PartialEq, Eq)]
+struct HostHeader {
+    host: RequestHost,
+    port: Option<u16>,
+}
+
+/// Parse `host`, `host:port`, `[v6]` or `[v6]:port`; `None` for anything
+/// else (a bare IPv6 literal, a non-numeric port, junk after a bracket).
+fn parse_host_header(raw: &str) -> Option<HostHeader> {
+    let raw = raw.trim().to_ascii_lowercase();
+    let (name, port) = if let Some(rest) = raw.strip_prefix('[') {
+        let (inner, tail) = rest.split_once(']')?;
+        let port = match tail {
+            "" => None,
+            t => Some(t.strip_prefix(':')?),
+        };
+        let ip = inner.parse::<std::net::Ipv6Addr>().ok()?;
+        return Some(HostHeader { host: RequestHost::Ip(ip.into()), port: parse_port(port)? });
+    } else {
+        match raw.split_once(':') {
+            Some((n, p)) => (n.to_string(), Some(p)),
+            None => (raw, None),
+        }
+    };
+    let host = if name == "localhost" {
+        RequestHost::Localhost
+    } else if let Ok(ip) = name.parse::<std::net::Ipv4Addr>() {
+        RequestHost::Ip(ip.into())
+    } else {
+        RequestHost::Other
+    };
+    Some(HostHeader { host, port: parse_port(port)? })
+}
+
+/// `Some(None)` for an absent port, `Some(Some(p))` for a numeric one,
+/// `None` for a port that is not a number.
+fn parse_port(port: Option<&str>) -> Option<Option<u16>> {
+    match port {
+        None => Some(None),
+        Some(p) => p.parse::<u16>().ok().map(Some),
+    }
+}
+
+/// Whether the request's single `Host` header names this daemon: a loopback
+/// name or literal, or the bound address's own host, with no port or the
+/// bound port. A wildcard bind names no host of its own.
+fn host_names_this_daemon(headers: &axum::http::HeaderMap, bound: Option<SocketAddr>) -> bool {
+    let mut values = headers.get_all(axum::http::header::HOST).iter();
+    let (Some(value), None) = (values.next(), values.next()) else {
+        return false;
+    };
+    let Some(parsed) = value.to_str().ok().and_then(parse_host_header) else {
+        return false;
+    };
+    if let (Some(port), Some(bound)) = (parsed.port, bound) {
+        if port != bound.port() {
+            return false;
+        }
+    }
+    match parsed.host {
+        RequestHost::Localhost => true,
+        RequestHost::Ip(ip) => {
+            ip.to_canonical().is_loopback()
+                || bound.is_some_and(|b| !b.ip().is_unspecified() && b.ip().to_canonical() == ip.to_canonical())
+        }
+        RequestHost::Other => false,
+    }
 }
 
 /// (#881, #2988) The startup banner's two auth lines: the read posture and
@@ -731,7 +841,7 @@ every read not from this machine would be refused with no way to pass.\n  Fix: {
 `darkmux config set serve.read_auth false`."
         ));
     }
-    let is_loopback = bind.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
+    let is_loopback = bind.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.to_canonical().is_loopback());
     if is_loopback || auth.read_auth {
         return Ok(());
     }
@@ -1352,6 +1462,7 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
                      `darkmux config set serve.port <port>`"
                 )
             })?;
+        record_bound_addr(listener.local_addr().ok());
 
         // Banner: print after bind succeeds so we don't claim "listening"
         // before we actually are.
