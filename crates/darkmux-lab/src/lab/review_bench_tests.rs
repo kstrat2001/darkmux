@@ -1014,14 +1014,14 @@
     // `adjudicate` phase id. Config-resolving tests are all serial as a set.
     /// A bench run must write where the lab READER scans, and in a test build
     /// that is the isolated tmp root — never the operator's real
-    /// `~/.darkmux/runs`.
+    /// `~/.darkmux/lab`.
     ///
     /// Both halves of this were live defects. `run_review_bench` resolved its
     /// default artifact path through `paths::resolve(Auto).runs` directly
     /// instead of `config_access::lab_dir()`, so:
     ///
     ///   1. every test that reached this path wrote real run directories into
-    ///      the operator's `~/.darkmux/runs` (observed 2026-08-23: two
+    ///      the operator's `~/.darkmux/lab` (observed 2026-08-23: two
     ///      `review-bench-<ts>` dirs created by `cargo test`, which then
     ///      rendered as live RUNNING rows in the viewer's runs lens), and
     ///   2. it silently ignored `DARKMUX_LAB_DIR` / `config.dirs.lab`, so an
@@ -1047,7 +1047,7 @@
         );
 
         if let Some(home) = dirs::home_dir() {
-            let real = home.join(".darkmux").join("runs");
+            let real = home.join(".darkmux").join("lab");
             assert!(
                 !path.starts_with(&real),
                 "a test build wrote into the operator's real run store: {}",

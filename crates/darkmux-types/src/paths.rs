@@ -31,7 +31,7 @@ pub struct DarkmuxPaths {
     /// and the test-build isolation (#994) that this raw field has neither of.
     /// Three call sites resolved this directly and each one wrote lab runs to a
     /// root the lab reader does not scan; one of them put real run directories
-    /// into the operator's ~/.darkmux/runs from `cargo test`. Making the bypass
+    /// into the operator's ~/.darkmux/lab from `cargo test`. Making the bypass
     /// unrepresentable is cheaper than remembering not to take it.
     pub(crate) lab: PathBuf,
     pub sandboxes: PathBuf,

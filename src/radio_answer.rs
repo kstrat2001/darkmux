@@ -2948,11 +2948,10 @@ mod tests {
 
     #[test]
     fn a_group_node_that_takes_a_positional_is_a_real_invocation() {
-        // MF3. The verb index held LEAVES only, so `lab run`'s children
-        // (`list`/`inspect`/`compare`) were emitted and the
-        // workload-dispatch form — THIS REPO'S OWN documented smoke
-        // command — was not. Nothing named it, so the backstop called it
-        // invented. Asserted against the LIVE index, because the fix is
+        // MF3. The verb index held LEAVES only, so a group's sub-verbs were
+        // emitted and the workload-dispatch form of `lab run` — THIS REPO'S
+        // OWN documented smoke command — was not. Nothing named it, so the
+        // backstop called it invented. Asserted against the LIVE index, because the fix is
         // that `radio_index` now asks clap for the node's positionals.
         let live = command_verb_index();
         assert!(
@@ -2960,8 +2959,9 @@ mod tests {
             "`lab run` takes a <workload> positional and must be in the index"
         );
         assert!(
-            live.iter().any(|v| v.path == "lab run list"),
-            "and its children must still be there — this adds an entry, it does not replace them"
+            // drift-guard:allow lab run inspect — asserting the retirement
+            live.iter().any(|v| v.path == "run inspect") && !live.iter().any(|v| v.path == "lab run inspect"),
+            "the recorded-run verbs are `run`'s, and `lab run` is the launcher only"
         );
         for reply in ["Run darkmux lab run quick-q to smoke it.", "Try `darkmux lab run quick-q`."] {
             assert!(

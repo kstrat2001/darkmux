@@ -2120,13 +2120,13 @@ fn mods_dir_default() -> std::path::PathBuf {
 }
 
 /// (#1585) The lab-run scan root — `env(DARKMUX_LAB_DIR) > config.dirs.lab >
-/// ~/.darkmux/runs`, the same three-tier shape as its nine sibling dirs.
+/// ~/.darkmux/lab`, the same three-tier shape as its nine sibling dirs.
 ///
 /// It has a real DEFAULT now, where before it had none and resolved to
 /// `None`. That absence was the bug: `/lab/runs` answered
 /// `{"configured": false}` and `/runs`' lab arm never ran, so 247 on-disk runs
 /// were invisible in every surface. Defaulting is safe here in a way a
-/// general "guess the operator's directory" would not be — `~/.darkmux/runs`
+/// general "guess the operator's directory" would not be — `~/.darkmux/lab`
 /// is darkmux-owned by construction (the namespace convention), so reading it
 /// assumes nothing about user state.
 ///
@@ -2224,9 +2224,9 @@ fn require_state_current(state: &LabDirState) -> anyhow::Result<()> {
 /// `paths::resolve(Auto)`, which honors `DARKMUX_HOME` and a project-local
 /// `./.darkmux` before `~/.darkmux`.
 ///
-/// Deliberately not a hardcoded `~/.darkmux/runs`: that would reintroduce this
+/// Deliberately not a hardcoded `~/.darkmux/lab`: that would reintroduce this
 /// issue's own bug class one layer down. Under `DARKMUX_HOME=/x`, a lab run
-/// WRITES to `/x/runs` while a hardcoded reader scans `~/.darkmux/runs` — the
+/// WRITES to `/x/lab` while a hardcoded reader scans `~/.darkmux/lab` — the
 /// run is invisible again, and now worse than before, because `/lab/runs`
 /// would report `configured: true, exists: true` and imply everything is
 /// wired. Sharing the resolver makes read and write incapable of disagreeing.
@@ -2235,13 +2235,13 @@ fn lab_dir_default() -> std::path::PathBuf {
     crate::paths::resolve(crate::paths::ResolveScope::Auto).lab
 }
 
-/// Test builds must never default onto the operator's real `~/.darkmux/runs`
+/// Test builds must never default onto the operator's real `~/.darkmux/lab`
 /// — same isolation discipline as `flows_dir_default` (#994).
 ///
 /// But a test that DID isolate itself, by pointing `DARKMUX_HOME` at a
 /// tempdir, means it: honor that exactly as production does. An earlier cut
 /// returned the throwaway path unconditionally, which silently overrode
-/// per-test isolation — `lab run list` then scanned the tmp path while the
+/// per-test isolation — `run list --kind lab` then scanned the tmp path while the
 /// test had written under its own `DARKMUX_HOME`, and the two could never
 /// agree. The throwaway is the fallback for tests that isolated NOTHING, not
 /// a replacement for tests that did.

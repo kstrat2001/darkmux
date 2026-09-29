@@ -63,7 +63,9 @@ mod lab_cli;
 mod config_cmd;
 mod conventions;
 mod mission_status;
+mod retired_verbs;
 mod run_list;
+mod run_records;
 mod mission_config_cli;
 mod coder_phase;
 // (#2112) Power-posture pre-flight — battery/Low-Power-Mode warnings + the
@@ -133,7 +135,12 @@ pub(crate) fn test_run() -> darkmux_types::session_id::RunId {
 
 fn main() -> Result<()> {
     providers::register_builtins()?;
-    let cli = Cli::parse();
+    let argv: Vec<String> = std::env::args().collect();
+    if let Some(refusal) = retired_verbs::refusal(&argv) {
+        eprintln!("error: {refusal}");
+        std::process::exit(2);
+    }
+    let cli = Cli::parse_from(argv);
     let code = run(cli.command)?;
     std::process::exit(code);
 }
@@ -195,11 +202,7 @@ fn run(cmd: Cmd) -> Result<i32> {
         Cmd::Finding { sub } => cmd_finding(sub),
         Cmd::Mod { sub } => cmd_mod(sub),
         Cmd::Mission { sub } => cmd_mission(sub),
-        Cmd::Run { sub } => match sub {
-            cli::RunFamilyCmd::List { kind, limit, all, usage, since, json } => {
-                run_list::run(kind, limit, all, json.json, usage, since.as_deref())
-            }
-        },
+        Cmd::Run { sub } => run_records::cmd_run(sub),
         Cmd::Flow { sub } => {
             flow_cli::run(sub)?;
             Ok(0)
@@ -226,7 +229,7 @@ fn run(cmd: Cmd) -> Result<i32> {
             let (port, bind) = serve::resolve_listen_addr(port, bind);
             let flows_dir = flows_dir.unwrap_or_else(crate::flow::flows_dir);
             // (#1585) `--lab-dir` > `DARKMUX_LAB_DIR` > `config.dirs.lab` >
-            // `~/.darkmux/runs`. The flag still wins; the tiers beneath it are
+            // `~/.darkmux/lab`. The flag still wins; the tiers beneath it are
             // new, and `Some(...)` is now unconditional.
             //
             // This REPLACES #1247's opt-in ("no config tier and no built-in

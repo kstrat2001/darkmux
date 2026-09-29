@@ -385,15 +385,14 @@ pub(crate) enum Cmd {
         #[command(subcommand)]
         sub: MissionCmd,
     },
-    /// Run views (#1905) — the flat cross-kind union `GET /runs` also
-    /// serves: mission, dispatch, and lab runs together, one row per run
-    /// regardless of source. `run list` is the CLI twin of the RUNS lens;
-    /// both call the SAME `darkmux_serve::build_runs` union, so they can
-    /// never disagree about what counts as a run (see that function's own
-    /// doc for the contract). Distinct from `lab run list`, which stays
-    /// lab-directory-scoped and answers a different question (workload /
-    /// profile / wall / ok) — folding the two families together is a real
-    /// option with precedent (#1426) but not this change.
+    /// Runs (#1905): the umbrella over mission, dispatch, and lab runs.
+    /// `run list` is the flat cross-kind union `GET /runs` also serves, one
+    /// row per run regardless of source; it is the CLI twin of the RUNS
+    /// lens, and both call the SAME `darkmux_serve::build_runs` union, so
+    /// they can never disagree about what counts as a run (see that
+    /// function's own doc for the contract). `run inspect|stats|compare`
+    /// read a lab run's recorded artifacts and refuse the other kinds;
+    /// `darkmux lab run <workload>` is the launcher for lab runs.
     Run {
         #[command(subcommand)]
         sub: RunFamilyCmd,
@@ -984,6 +983,40 @@ pub(crate) enum RunFamilyCmd {
         #[command(flatten)]
         json: JsonFlag,
     },
+    /// Inspect a recorded lab run. Lab runs only: a mission or dispatch run
+    /// leaves no manifest, so its id is refused with where to look instead.
+    Inspect {
+        run: String,
+        /// Also dump the full compaction summary text(s) the compactor model
+        /// wrote during this run (read from trajectory.jsonl). Useful for
+        /// methodology validation — confirming the compactor is producing
+        /// substantive summaries rather than degenerate / empty output.
+        #[arg(long)]
+        summary: bool,
+    },
+    /// (#2855) Derived metrics for a recorded lab run — active time,
+    /// throughput over the streams that were actually billed, both
+    /// degeneracy gates, busy-only power — each with the reconciliation check
+    /// that says whether it may be quoted. Reads the run's existing
+    /// artifacts; nothing is recomputed at dispatch time, so this applies to
+    /// runs already on disk.
+    ///
+    /// Given several runs, prints one row per run and the set as ranges
+    /// (median with min and max, never a bare mean), plus cost per
+    /// successful outcome. With `--baseline`, prints both sets side by side
+    /// with what moved.
+    Stats {
+        /// One or more run ids or paths.
+        #[arg(required = true, num_args = 1..)]
+        runs: Vec<String>,
+        /// Runs to compare against (repeatable, or several after one flag).
+        #[arg(long, num_args = 1..)]
+        baseline: Vec<String>,
+        #[command(flatten)]
+        json: JsonFlagPlain,
+    },
+    /// Compare two recorded lab runs.
+    Compare { run_a: String, run_b: String },
 }
 
 /// (#1860) `darkmux mission config list`/`show` — a READ-ONLY projection
@@ -1437,56 +1470,6 @@ pub(crate) enum LessonCmd {
     },
 }
 
-/// (#1465, #1426) The recorded-run sub-verbs, folded out of the flat
-/// `lab runs`/`lab inspect`/`lab compare` leaves into the `lab run`
-/// kind-family. `lab run <workload>` still dispatches (a positional workload);
-/// these route when no workload positional is given.
-#[derive(Subcommand)]
-pub(crate) enum RunCmd {
-    /// List recent runs (most recent first). (was: `lab runs`)
-    List {
-        /// Show at most N runs (default: 5).
-        #[arg(long, short = 'l', default_value = "5")]
-        limit: usize,
-        /// Show all runs (overrides --limit).
-        #[arg(long, short = 'a')]
-        all: bool,
-    },
-    /// Inspect a previously-recorded run. (was: `lab inspect`)
-    Inspect {
-        run: String,
-        /// Also dump the full compaction summary text(s) the compactor model
-        /// wrote during this run (read from trajectory.jsonl). Useful for
-        /// methodology validation — confirming the compactor is producing
-        /// substantive summaries rather than degenerate / empty output.
-        #[arg(long)]
-        summary: bool,
-    },
-    /// (#2855) Derived metrics for a recorded run — active time, throughput
-    /// over the streams that were actually billed, both degeneracy gates,
-    /// busy-only power — each with the reconciliation check that says
-    /// whether it may be quoted. Reads the run's existing artifacts; nothing
-    /// is recomputed at dispatch time, so this applies to runs already on
-    /// disk.
-    ///
-    /// Given several runs, prints one row per run and the set as ranges
-    /// (median with min and max, never a bare mean), plus cost per
-    /// successful outcome. With `--baseline`, prints both sets side by side
-    /// with what moved.
-    Stats {
-        /// One or more run ids or paths.
-        #[arg(required = true, num_args = 1..)]
-        runs: Vec<String>,
-        /// Runs to compare against (repeatable, or several after one flag).
-        #[arg(long, num_args = 1..)]
-        baseline: Vec<String>,
-        #[command(flatten)]
-        json: JsonFlagPlain,
-    },
-    /// Compare two runs. (was: `lab compare`)
-    Compare { run_a: String, run_b: String },
-}
-
 /// (#1465) The `lab workload` kind-family. `list` is the only member today —
 /// spelled `list` (round-9 universal convention) instead of the retired flat
 /// `lab workloads` plural-noun-as-verb leaf.
@@ -1537,22 +1520,11 @@ pub(crate) enum FixtureCmd {
 
 #[derive(Subcommand)]
 pub(crate) enum LabCmd {
-    /// Dispatch a workload, or manage recorded runs (#1465, #1426).
-    ///
-    /// `lab run <workload>` dispatches a workload (one or more times — the
-    /// unchanged run path). With NO workload positional, a sub-verb manages
-    /// recorded runs: `lab run list`, `lab run inspect <id>`,
-    /// `lab run compare <a> <b>` (the retired flat `lab runs`/`lab inspect`/
-    /// `lab compare` leaves, folded into the `run` kind-family). `run` takes
-    /// EITHER a workload positional OR a sub-verb — `args_conflicts_with_
-    /// subcommands` keeps the two forms from mixing, and a token that is not a
-    /// known sub-verb fills the workload positional. A user workload whose id
-    /// collides with a sub-verb (`list`/`inspect`/`compare`) is still reachable
-    /// as a workload via the `--` escape: `lab run -- <id>` (#1465).
-    #[command(args_conflicts_with_subcommands = true)]
+    /// Dispatch a workload (one or more times). The launcher only: recorded
+    /// runs are read with `darkmux run list|inspect|stats|compare`.
     Run {
-        /// Workload id to dispatch (omit when using a run sub-verb).
-        workload: Option<String>,
+        /// Workload id to dispatch.
+        workload: String,
         #[arg(long, short = 'p')]
         profile: Option<String>,
         #[arg(long, short = 'n', default_value = "1")]
@@ -1561,8 +1533,6 @@ pub(crate) enum LabCmd {
         profiles: ProfilesFileArg,
         #[arg(long, short = 'q')]
         quiet: bool,
-        #[command(subcommand)]
-        sub: Option<RunCmd>,
     },
     /// Workload registry (`lab workload list`). (#1465)
     Workload {

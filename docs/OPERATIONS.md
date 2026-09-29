@@ -161,9 +161,9 @@ darkmux profile list                  # list configured profiles
 darkmux machine status                # what's loaded; which profile (if any) matches
 darkmux lab characterize              # one-command "QA my Mac": dispatch a smoke workload, get a verdict
 darkmux lab run quick-q               # the smoke workload directly
-darkmux lab run list --limit 5         # see your recent runs
-darkmux lab run inspect <run-id>      # full per-run breakdown
-darkmux lab run stats <run-id> --json # derived metrics; the darkmux-lab-notebook skill drafts an entry from this
+darkmux run list --kind lab --limit 5         # see your recent runs
+darkmux run inspect <run-id>      # full per-run breakdown
+darkmux run stats <run-id> --json # derived metrics; the darkmux-lab-notebook skill drafts an entry from this
 darkmux mission config list            # the mission configs you can launch
 darkmux mission launch <id>            # mint + start a running mission instance from a config
 ```
@@ -300,7 +300,7 @@ Roles can override the nudge wording per signal via a `feedback_templates` block
 darkmux does not write notebook prose itself. The bundled `darkmux-lab-notebook` skill (installed by `darkmux init` into your agent's skills directory) tells the frontier orchestrator how to draft an entry from a run's derived numbers:
 
 ```bash
-darkmux lab run stats <run-id> --json   # what the skill reads; the manifest when it needs more
+darkmux run stats <run-id> --json   # what the skill reads; the manifest when it needs more
 ```
 
 The entry goes wherever your own instructions say your notebook lives; the skill asks when they say nothing. If you collate entries across machines, set a distinct `DARKMUX_MACHINE_ID` on each (`darkmux doctor --verbose` shows the resolved id) and the skill stamps it into the entry header, so cross-machine readouts stay unambiguous.
@@ -331,7 +331,7 @@ The case for darkmux: **once you accept that static configs leave performance on
 - ✅ Profile registry + `profile list`/`profile scan`/`profile draft` CLI, with `machine status` for the loaded-state read (the founding `swap` verb retired in 2.0; gestalt manages residency)
 - ✅ Lab subcommands (`run` + `run inspect`/`run compare`/`run list`, `characterize`/`tune`), `WorkloadProvider` trait, embedded smoke workloads, always-on cross-layer flow telemetry (#557)
 - ✅ Lab reproducibility (#487): per-run copy-on-write sandbox isolation (source never mutated), `baseline_hash` + `final_hash` content hashing in the run manifest, a fixture registry with `lab fixture register`/`unregister`/`list` + `lab doctor` verbs, workload `requires_fixture` resolution, and `scripts/lab-init.sh` + the built-in `demo-tiny-py` fixture
-- ✅ Lab run stats (`lab run stats`, derived metrics + reconciliation checks) feeding the `darkmux-lab-notebook` skill
+- ✅ Lab run stats (`run stats`, derived metrics + reconciliation checks) feeding the `darkmux-lab-notebook` skill
 - ✅ Agent-invocable skills bundle (12 skills including `/darkmux-bootstrap`)
 - ✅ Crew + Role + Mission + Phase schema with SQLite-backed index; mission configs + `mission launch` as the config-launched instance-creation path
 - ✅ Flow substrate: `LocalFileSink` (always) + `AuditFileSink` (BLAKE3 hash chain, verifiable via `flow integrity-check`; opt-in) + `RedisSink` (coordination; opt-in), composed via `TeeSink`

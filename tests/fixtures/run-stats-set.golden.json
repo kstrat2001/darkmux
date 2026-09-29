@@ -1,0 +1,451 @@
+{
+  "runs": [
+    {
+      "schema_version": "2.0.0",
+      "run": "run-a",
+      "model": "m",
+      "result": "stop",
+      "verify": null,
+      "verify_ungated": false,
+      "ok": null,
+      "started_at_unix_ms": 1000,
+      "wall_ms": 10000,
+      "rest_ms": 0,
+      "active_ms": 10000,
+      "rest_events": 0,
+      "rest_delays_ms": [],
+      "rest_reasons": [],
+      "rest_states": [],
+      "thermal_ratchet_fired": false,
+      "rest_ms_per_turn": 0.0,
+      "turns": 1,
+      "compactions": 0,
+      "reasoning_chars": 0,
+      "content_chars": 0,
+      "completion_tokens": 300,
+      "reasoning_tokens": 0,
+      "suspect_turns": [],
+      "tool_calls": {},
+      "tool_calls_total": 0,
+      "tool_calls_failed": 0,
+      "streams": 1,
+      "streams_unbilled": 0,
+      "streams_unterminated": 0,
+      "turns_with_stream_abort": [],
+      "gen_ms_billed": 3000,
+      "gen_ms_all": 3000,
+      "unbilled_gen_ms": 0,
+      "billed_gen_fraction": 1.0,
+      "tok_per_s": 100.0,
+      "reasoning_chars_per_s": null,
+      "gates": {
+        "stream": {
+          "observations": 0,
+          "degenerate_turns": [],
+          "aborts": 0,
+          "min_tail_ratio": null
+        },
+        "checkpoint": {
+          "observations": 0,
+          "degenerate_turns": [],
+          "concluded_turns": [],
+          "degenerate_turns_by_ratio": [],
+          "min_tail_ratio": null,
+          "policy": null
+        }
+      },
+      "bounds": {},
+      "gpu_w_busy": null,
+      "cpu_w_busy": null,
+      "pkg_w_busy": null,
+      "gpu_duty_pct": null,
+      "samples_busy": 0,
+      "samples_idle": 0,
+      "busy_ms": null,
+      "pkg_j_busy": null,
+      "pkg_j_per_1k_tokens": null,
+      "pkg_j_per_1k_reasoning_chars": null,
+      "thermal_states_busy": {},
+      "cpu_speed_limit_min": null,
+      "throttled_samples": 0,
+      "mem_pct_busy_max": null,
+      "telemetry_max_gap_ms": null,
+      "flow_records_in_window": 0,
+      "flow_scan": {
+        "files_total": 0,
+        "files_skipped": 0,
+        "files_read": 0,
+        "files_unreadable": 0,
+        "files_read_errors": 0,
+        "files_stopped_early": 0,
+        "lines_scanned": 0,
+        "gather_ms": 0
+      },
+      "checks": {
+        "telemetry_covers_run": false,
+        "policy_consistent": null,
+        "rest_within_wall": true,
+        "have_telemetry_samples": false,
+        "have_flow_records": false,
+        "verdict_matches_ratio": true,
+        "all_streams_billed": true,
+        "frames_match_streams": true,
+        "streams_terminated": true
+      }
+    },
+    {
+      "schema_version": "2.0.0",
+      "run": "run-b",
+      "model": "m",
+      "result": "stop",
+      "verify": null,
+      "verify_ungated": false,
+      "ok": null,
+      "started_at_unix_ms": 1000,
+      "wall_ms": 10000,
+      "rest_ms": 0,
+      "active_ms": 10000,
+      "rest_events": 0,
+      "rest_delays_ms": [],
+      "rest_reasons": [],
+      "rest_states": [],
+      "thermal_ratchet_fired": false,
+      "rest_ms_per_turn": 0.0,
+      "turns": 1,
+      "compactions": 0,
+      "reasoning_chars": 0,
+      "content_chars": 0,
+      "completion_tokens": 300,
+      "reasoning_tokens": 0,
+      "suspect_turns": [],
+      "tool_calls": {},
+      "tool_calls_total": 0,
+      "tool_calls_failed": 0,
+      "streams": 1,
+      "streams_unbilled": 0,
+      "streams_unterminated": 0,
+      "turns_with_stream_abort": [],
+      "gen_ms_billed": 3000,
+      "gen_ms_all": 3000,
+      "unbilled_gen_ms": 0,
+      "billed_gen_fraction": 1.0,
+      "tok_per_s": 100.0,
+      "reasoning_chars_per_s": null,
+      "gates": {
+        "stream": {
+          "observations": 0,
+          "degenerate_turns": [],
+          "aborts": 0,
+          "min_tail_ratio": null
+        },
+        "checkpoint": {
+          "observations": 0,
+          "degenerate_turns": [],
+          "concluded_turns": [],
+          "degenerate_turns_by_ratio": [],
+          "min_tail_ratio": null,
+          "policy": null
+        }
+      },
+      "bounds": {},
+      "gpu_w_busy": null,
+      "cpu_w_busy": null,
+      "pkg_w_busy": null,
+      "gpu_duty_pct": null,
+      "samples_busy": 0,
+      "samples_idle": 0,
+      "busy_ms": null,
+      "pkg_j_busy": null,
+      "pkg_j_per_1k_tokens": null,
+      "pkg_j_per_1k_reasoning_chars": null,
+      "thermal_states_busy": {},
+      "cpu_speed_limit_min": null,
+      "throttled_samples": 0,
+      "mem_pct_busy_max": null,
+      "telemetry_max_gap_ms": null,
+      "flow_records_in_window": 0,
+      "flow_scan": {
+        "files_total": 0,
+        "files_skipped": 0,
+        "files_read": 0,
+        "files_unreadable": 0,
+        "files_read_errors": 0,
+        "files_stopped_early": 0,
+        "lines_scanned": 0,
+        "gather_ms": 0
+      },
+      "checks": {
+        "telemetry_covers_run": false,
+        "policy_consistent": null,
+        "rest_within_wall": true,
+        "have_telemetry_samples": false,
+        "have_flow_records": false,
+        "verdict_matches_ratio": true,
+        "all_streams_billed": true,
+        "frames_match_streams": true,
+        "streams_terminated": true
+      }
+    }
+  ],
+  "summary": {
+    "n": 2,
+    "passed": 0,
+    "failed": 0,
+    "unverified": 2,
+    "passed_with_runtime_error": 0,
+    "models": [
+      "m"
+    ],
+    "active_ms": {
+      "n": 2,
+      "median": 10000.0,
+      "min": 10000.0,
+      "max": 10000.0
+    },
+    "wall_ms": {
+      "n": 2,
+      "median": 10000.0,
+      "min": 10000.0,
+      "max": 10000.0
+    },
+    "rest_ms": {
+      "n": 2,
+      "median": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "turns": {
+      "n": 2,
+      "median": 1.0,
+      "min": 1.0,
+      "max": 1.0
+    },
+    "completion_tokens": {
+      "n": 2,
+      "median": 300.0,
+      "min": 300.0,
+      "max": 300.0
+    },
+    "tok_per_s": {
+      "n": 2,
+      "median": 100.0,
+      "min": 100.0,
+      "max": 100.0
+    },
+    "billed_gen_fraction": {
+      "n": 2,
+      "median": 1.0,
+      "min": 1.0,
+      "max": 1.0
+    },
+    "gpu_w_busy": null,
+    "pkg_w_busy": null,
+    "pkg_j_per_1k_tokens": null,
+    "runs_with_degeneracy": 0,
+    "turns_cut": 0,
+    "cost_per_success": {
+      "active_ms": null,
+      "gpu_busy_ms": null,
+      "pkg_joules": null,
+      "withheld": [
+        "no run in the set passed verify, so there is no success to cost"
+      ]
+    },
+    "flagged": [
+      [
+        "run-a",
+        [
+          "NO-TELEM",
+          "NO-FLOW",
+          "OVERLAP"
+        ]
+      ],
+      [
+        "run-b",
+        [
+          "NO-TELEM",
+          "NO-FLOW",
+          "OVERLAP"
+        ]
+      ]
+    ]
+  },
+  "errors": [],
+  "duplicates": [],
+  "baseline": {
+    "runs": [
+      {
+        "schema_version": "2.0.0",
+        "run": "run-b",
+        "model": "m",
+        "result": "stop",
+        "verify": null,
+        "verify_ungated": false,
+        "ok": null,
+        "started_at_unix_ms": 1000,
+        "wall_ms": 10000,
+        "rest_ms": 0,
+        "active_ms": 10000,
+        "rest_events": 0,
+        "rest_delays_ms": [],
+        "rest_reasons": [],
+        "rest_states": [],
+        "thermal_ratchet_fired": false,
+        "rest_ms_per_turn": 0.0,
+        "turns": 1,
+        "compactions": 0,
+        "reasoning_chars": 0,
+        "content_chars": 0,
+        "completion_tokens": 300,
+        "reasoning_tokens": 0,
+        "suspect_turns": [],
+        "tool_calls": {},
+        "tool_calls_total": 0,
+        "tool_calls_failed": 0,
+        "streams": 1,
+        "streams_unbilled": 0,
+        "streams_unterminated": 0,
+        "turns_with_stream_abort": [],
+        "gen_ms_billed": 3000,
+        "gen_ms_all": 3000,
+        "unbilled_gen_ms": 0,
+        "billed_gen_fraction": 1.0,
+        "tok_per_s": 100.0,
+        "reasoning_chars_per_s": null,
+        "gates": {
+          "stream": {
+            "observations": 0,
+            "degenerate_turns": [],
+            "aborts": 0,
+            "min_tail_ratio": null
+          },
+          "checkpoint": {
+            "observations": 0,
+            "degenerate_turns": [],
+            "concluded_turns": [],
+            "degenerate_turns_by_ratio": [],
+            "min_tail_ratio": null,
+            "policy": null
+          }
+        },
+        "bounds": {},
+        "gpu_w_busy": null,
+        "cpu_w_busy": null,
+        "pkg_w_busy": null,
+        "gpu_duty_pct": null,
+        "samples_busy": 0,
+        "samples_idle": 0,
+        "busy_ms": null,
+        "pkg_j_busy": null,
+        "pkg_j_per_1k_tokens": null,
+        "pkg_j_per_1k_reasoning_chars": null,
+        "thermal_states_busy": {},
+        "cpu_speed_limit_min": null,
+        "throttled_samples": 0,
+        "mem_pct_busy_max": null,
+        "telemetry_max_gap_ms": null,
+        "flow_records_in_window": 0,
+        "flow_scan": {
+          "files_total": 0,
+          "files_skipped": 0,
+          "files_read": 0,
+          "files_unreadable": 0,
+          "files_read_errors": 0,
+          "files_stopped_early": 0,
+          "lines_scanned": 0,
+          "gather_ms": 0
+        },
+        "checks": {
+          "telemetry_covers_run": false,
+          "policy_consistent": null,
+          "rest_within_wall": true,
+          "have_telemetry_samples": false,
+          "have_flow_records": false,
+          "verdict_matches_ratio": true,
+          "all_streams_billed": true,
+          "frames_match_streams": true,
+          "streams_terminated": true
+        }
+      }
+    ],
+    "summary": {
+      "n": 1,
+      "passed": 0,
+      "failed": 0,
+      "unverified": 1,
+      "passed_with_runtime_error": 0,
+      "models": [
+        "m"
+      ],
+      "active_ms": {
+        "n": 1,
+        "median": 10000.0,
+        "min": 10000.0,
+        "max": 10000.0
+      },
+      "wall_ms": {
+        "n": 1,
+        "median": 10000.0,
+        "min": 10000.0,
+        "max": 10000.0
+      },
+      "rest_ms": {
+        "n": 1,
+        "median": 0.0,
+        "min": 0.0,
+        "max": 0.0
+      },
+      "turns": {
+        "n": 1,
+        "median": 1.0,
+        "min": 1.0,
+        "max": 1.0
+      },
+      "completion_tokens": {
+        "n": 1,
+        "median": 300.0,
+        "min": 300.0,
+        "max": 300.0
+      },
+      "tok_per_s": {
+        "n": 1,
+        "median": 100.0,
+        "min": 100.0,
+        "max": 100.0
+      },
+      "billed_gen_fraction": {
+        "n": 1,
+        "median": 1.0,
+        "min": 1.0,
+        "max": 1.0
+      },
+      "gpu_w_busy": null,
+      "pkg_w_busy": null,
+      "pkg_j_per_1k_tokens": null,
+      "runs_with_degeneracy": 0,
+      "turns_cut": 0,
+      "cost_per_success": {
+        "active_ms": null,
+        "gpu_busy_ms": null,
+        "pkg_joules": null,
+        "withheld": [
+          "no run in the set passed verify, so there is no success to cost"
+        ]
+      },
+      "flagged": [
+        [
+          "run-b",
+          [
+            "NO-TELEM",
+            "NO-FLOW"
+          ]
+        ]
+      ]
+    },
+    "errors": [],
+    "duplicates": []
+  },
+  "cross_arm_overlap": [
+    "run-b"
+  ]
+}

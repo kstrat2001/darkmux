@@ -264,7 +264,7 @@ The runtime records every event of a dispatch, including each call's token
 `usage`, in `trajectory.jsonl` (`runtime/src/trajectory.rs`). There is no
 separate summary file: every count is a fold of that log
 (`darkmux_trajectory::TrajectoryFold`, `crates/darkmux-trajectory/src/fold.rs`),
-the one reading the host tailer, `lab run stats` and `lab run inspect` share:
+the one reading the host tailer, `run stats` and `run inspect` share:
 
 - **turns** (distinct model-call `seq`s; a checkpoint continuation is the same turn)
 - **prompt, completion and total tokens**: **absolute token counts**, not a

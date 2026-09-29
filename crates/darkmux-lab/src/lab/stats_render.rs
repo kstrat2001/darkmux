@@ -1,4 +1,4 @@
-//! (#2855) The text `darkmux lab run stats` prints, as pure functions.
+//! (#2855) The text `darkmux run stats` prints, as pure functions.
 //!
 //! Rendering lives here, not in the CLI, so what an operator actually READS
 //! is tested: CI's mutation job showed the whole renderer could be deleted
@@ -159,7 +159,7 @@ pub fn load_set(ids: &[String]) -> StatsSet {
     for id in ids {
         match crate::lab::stats::run_stats(id) {
             // Deduplicated on the run it RESOLVED to, not the argument text:
-            // `run-a` and `~/.darkmux/runs/run-a` are the same run, and a run
+            // `run-a` and `~/.darkmux/lab/run-a` are the same run, and a run
             // counted twice skews every range and total in the set.
             Ok(s) => {
                 if seen.insert(s.run.clone()) {
@@ -361,7 +361,7 @@ pub fn sets_text(cand: &StatsSet, base: Option<&StatsSet>) -> String {
         for n in &notes {
             p!(out, "  - {n}");
         }
-        p!(out, "  (flag meanings: `darkmux lab run stats <run>` explains a single run's failed checks)");
+        p!(out, "  (flag meanings: `darkmux run stats <run>` explains a single run's failed checks)");
     }
     out
 }

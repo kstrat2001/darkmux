@@ -97,7 +97,7 @@ pub(crate) struct AppState {
     /// (#1569 packet B) Panel cache + single-flight locks — see `panel.rs`.
     panels: panel::PanelState,
     /// (#1585, was #1247 Part 3) The lab-run scan root — `--lab-dir` >
-    /// `DARKMUX_LAB_DIR` > `config.dirs.lab` > `~/.darkmux/runs`.
+    /// `DARKMUX_LAB_DIR` > `config.dirs.lab` > `~/.darkmux/lab`.
     ///
     /// **In production this is always `Some`.** It stays an `Option` only
     /// because the test-only `build_router` threads `None`; the `/lab/*`
@@ -1205,7 +1205,7 @@ fn build_startup_banner(
     }
 
     // (#1585) Lab-run scan root. Always resolved in production now (flag > env
-    // > config > `~/.darkmux/runs`); the `None` arm below survives only for
+    // > config > `~/.darkmux/lab`); the `None` arm below survives only for
     // the test-only router. Printed either way so the resolved path is never
     // something the operator has to guess at.
     match lab_dir {
@@ -2236,7 +2236,7 @@ fn current_millis() -> u64 {
 //
 // "Two doors, one viewer, distinct questions" (operator direction, #1247):
 // these routes read ONLY `AppState::lab_dir` — the scan root resolved as
-// `--lab-dir` > `DARKMUX_LAB_DIR` > `config.dirs.lab` > `~/.darkmux/runs`
+// `--lab-dir` > `DARKMUX_LAB_DIR` > `config.dirs.lab` > `~/.darkmux/lab`
 // (#1585; it was operator-named-or-nothing until that default landed) — and
 // never touch the flow stream, Redis, or any other machine's data. Machine-local by construction;
 // no federation, ever. A "run" is any directory directly containing

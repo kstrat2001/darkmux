@@ -201,10 +201,10 @@ pub(crate) fn render_report(r: &TuneReport) -> String {
     render_errored(&mut out, &r.outcomes);
     p!(out);
     p!(out, "Next steps:");
-    p!(out, "  • `darkmux lab run inspect <run-id>` for any individual run");
+    p!(out, "  • `darkmux run inspect <run-id>` for any individual run");
     let completed: Vec<_> = r.outcomes.iter().filter(|o| o.completed()).collect();
     if let [first, .., last] = completed.as_slice() {
-        p!(out, "  • `darkmux lab run compare {} {}` for a head-to-head diff", first.run_id, last.run_id);
+        p!(out, "  • `darkmux run compare {} {}` for a head-to-head diff", first.run_id, last.run_id);
     }
     if s.slow_cluster.count > 0 {
         p!(out, "  • Slow cluster present — re-tune compaction knobs and re-run");
@@ -293,8 +293,8 @@ mod tests {
             "darkmux tune — workload `w` profile `(default)` × 2 run(s), 2 completed\n\n\
              ┌─ wall clock\n│  range:  8s – 9s\n│  mean:   8s\n│  total:  17s across 2 run(s)\n\
              │  cluster: single (variance < 1.5×, no meaningful bimodal split)\n└─\n\n\n\
-             Next steps:\n  • `darkmux lab run inspect <run-id>` for any individual run\n\
-             \x20 • `darkmux lab run compare test-8 test-9` for a head-to-head diff\n"
+             Next steps:\n  • `darkmux run inspect <run-id>` for any individual run\n\
+             \x20 • `darkmux run compare test-8 test-9` for a head-to-head diff\n"
         );
     }
 
@@ -323,7 +323,7 @@ mod tests {
         let empty = render_report(&tune_report(vec![]));
         assert_eq!(empty, "darkmux tune — workload `w` profile `(default)` × 0 run(s), 0 completed\n\n(no runs completed)\n");
         let one = render_report(&tune_report(vec![outcome(5)]));
-        assert!(!one.contains("lab run compare"), "{one}");
+        assert!(!one.contains("run compare"), "{one}");
         assert!(!one.contains("⚠"), "{one}");
     }
 

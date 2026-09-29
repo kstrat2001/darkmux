@@ -737,7 +737,7 @@ jobs:
           # exit status, not cmd1's — a path error in cmd1 (exit 2) was
           # doubly invisible. Capture cmd1's status directly, then filter
           # its captured output as a second, exit-code-free step.
-          VERBPAT='darkmux (profiles|scan|notebook|pr-review|external|skills|crew|status|swap|model|fleet|recommendations|lessons|phase|mission run|mission ship|mission close|mission propose|lab runs|lab workloads|lab fixtures|lab inspect|lab compare|lab register|lab unregister|lab review-bench|lab notebook)\b'
+          VERBPAT='darkmux (profiles|scan|notebook|pr-review|external|skills|crew|status|swap|model|fleet|recommendations|lessons|phase|mission run|mission ship|mission close|mission propose|lab runs|lab workloads|lab fixtures|lab inspect|lab compare|lab register|lab unregister|lab review-bench|lab notebook|lab run list|lab run inspect|lab run stats|lab run compare)\b'
           set +e
           raw=$(grep -rniE $EXCL "$VERBPAT" $SCAN 2>"$VERB_ERRF")
           STATUS=$?

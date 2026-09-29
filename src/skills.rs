@@ -94,7 +94,7 @@ const EMBEDDED_SKILLS: &[(&str, &str)] = &[
     ),
     // (#2913, 4.0) Replaces the retired `lab notebook` verbs and the
     // `scribe` role: the orchestrator drafts the entry from
-    // `lab run stats --json` and writes it where the operator says.
+    // `run stats --json` and writes it where the operator says.
     (
         "darkmux-lab-notebook",
         include_str!("../skills/darkmux-lab-notebook/SKILL.md"),
@@ -1447,7 +1447,7 @@ mod tests {
     }
 
     /// (#2913 review C2) The lab-notebook skill tells an agent which
-    /// `lab run stats --json` fields to read. A field it names that the
+    /// `run stats --json` fields to read. A field it names that the
     /// output does not carry (it once listed `policy` under `gates.stream`,
     /// which has none) sends the agent after data that is not there. Pin
     /// every documented path against a serialized `RunStats`, whose fields
@@ -1474,7 +1474,7 @@ mod tests {
             .collect();
         assert!(
             missing.is_empty(),
-            "skills/darkmux-lab-notebook/SKILL.md documents field(s) `lab run stats --json` does not \
+            "skills/darkmux-lab-notebook/SKILL.md documents field(s) `run stats --json` does not \
              emit: {missing:?}"
         );
     }

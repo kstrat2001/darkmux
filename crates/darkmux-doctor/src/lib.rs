@@ -210,6 +210,7 @@ pub fn run() -> DoctorReport {
         check_role_tool_vocab_typos(),
         check_beat33_legacy_crew_dir(),
         check_flat_mission_files(),
+        check_lab_dir_location(),
         check_mission_envelope_readability(),
     ]);
     let checks = [checks, check_enum_settings(), check_user_file_keys(), check_hooks(), eureka_checks()].concat();
@@ -433,6 +434,48 @@ fn check_flat_mission_files() -> Check {
             "run `darkmux mission migrate --apply` on 3.x before upgrading, or delete them".into(),
         ),
     }
+}
+
+/// (4.0) Lab runs used to live in `<root>/runs`; contract 8 makes "run" the
+/// umbrella over mission, dispatch and lab runs, so the default moved to
+/// `<root>/lab`. darkmux never moves data itself: a pre-4.0 dir still holding
+/// runs is a Fail that prints the exact `mv` (the lab verbs refuse until it
+/// has run); runs on both sides is a Warn with the merge command.
+fn check_lab_dir_location() -> Check {
+    lab_dir_location_check(&darkmux_types::config_access::lab_dir_state())
+}
+
+fn lab_dir_location_check(state: &darkmux_types::config_access::LabDirState) -> Check {
+    use darkmux_types::config_access::LabDirState;
+    let name = "lab runs location".to_string();
+    let (status, message) = match state {
+        LabDirState::Current => {
+            return Check {
+                name,
+                status: Status::Pass,
+                message: "lab runs are where 4.0 reads them".into(),
+                hint: None,
+            }
+        }
+        LabDirState::MovePending { from, to } => (
+            Status::Fail,
+            format!(
+                "lab runs are still in {} (the pre-4.0 location); 4.0 reads {}, so the lab verbs refuse until they are moved",
+                from.display(),
+                to.display()
+            ),
+        ),
+        LabDirState::Split { from, to } => (
+            Status::Warn,
+            format!(
+                "{} (pre-4.0) and {} both hold runs; the ones in {} are not read",
+                from.display(),
+                to.display(),
+                from.display()
+            ),
+        ),
+    };
+    Check { name, status, message, hint: state.command() }
 }
 
 /// Detect operators still on the pre-Beat-33 `<root>/crew/{roles,
@@ -2264,7 +2307,7 @@ fn check_removed_notebook_settings() -> Check {
         hint: Some(
             "unset DARKMUX_NOTEBOOK_DIR (remove the export from your shell rc). The notebook verbs retired \
              in 4.0; the bundled `darkmux-lab-notebook` skill (installed by `darkmux init`) drafts an entry \
-             from `darkmux lab run stats <run-id> --json` and writes it wherever your own instructions say"
+             from `darkmux run stats <run-id> --json` and writes it wherever your own instructions say"
                 .into(),
         ),
     }
@@ -11824,8 +11867,10 @@ mod tests {
         //
         // (4.0 unknown-key gate) 66: `check_user_file_keys` contributes one
         // Pass row when every user file is clean, as it is here.
+        //
+        // (4.0 one run noun) 67: `check_lab_dir_location` joined.
         let expected =
-            66 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
+            67 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
@@ -13708,6 +13753,28 @@ mod tests {
         assert!(!check.message.contains("scribe.json"), "only files that exist: {}", check.message);
         let hint = check.hint.expect("a fix");
         assert!(hint.contains("delete"), "the fix: {hint}");
+    }
+
+    // ─── (4.0) check_lab_dir_location ────────────────────────────────
+
+    #[test]
+    fn lab_dir_location_fails_with_the_exact_mv_while_runs_sit_in_the_old_dir() {
+        use darkmux_types::config_access::LabDirState;
+        let state = LabDirState::MovePending { from: "/r/runs".into(), to: "/r/lab".into() };
+        let check = lab_dir_location_check(&state);
+        assert_eq!(check.status, Status::Fail, "{}", check.message);
+        assert!(check.message.contains("/r/runs") && check.message.contains("/r/lab"), "{}", check.message);
+        assert_eq!(check.hint.as_deref(), Some("mv /r/runs /r/lab"));
+    }
+
+    #[test]
+    fn lab_dir_location_passes_when_current_and_warns_when_split() {
+        use darkmux_types::config_access::LabDirState;
+        let ok = lab_dir_location_check(&LabDirState::Current);
+        assert_eq!((ok.status, ok.hint), (Status::Pass, None));
+        let split = lab_dir_location_check(&LabDirState::Split { from: "/r/runs".into(), to: "/r/lab".into() });
+        assert_eq!(split.status, Status::Warn, "{}", split.message);
+        assert!(split.hint.unwrap().starts_with("mv -n "), "a merge never overwrites");
     }
 
     // ─── (4.0) check_flat_mission_files ──────────────────────────────

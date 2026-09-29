@@ -48,6 +48,10 @@ RETIRED_COMMAND_PHRASES = [
     "mission propose",   # removed in 4.0; write the config by hand, then `mission launch` (#2912)
     "notebook draft",    # removed in 4.0; the darkmux-lab-notebook skill (#2913)
     "notebook list",     # removed in 4.0; the darkmux-lab-notebook skill (#2913)
+    "lab run list",      # -> `run list --kind lab` (4.0, one run noun)
+    "lab run inspect",   # -> `run inspect` (4.0, one run noun)
+    "lab run stats",     # -> `run stats` (4.0, one run noun)
+    "lab run compare",   # -> `run compare` (4.0, one run noun)
 ]
 
 # Single-word retired verbs: matched ONLY in the `darkmux <verb>` form so common

@@ -143,7 +143,7 @@
   "src/main.rs::cmd_mission": 20,
   "src/main.rs::cmd_mission_dispatch": 31,
   "src/main.rs::cmd_scan": 25,
-  "src/main.rs::run": 23,
+  "src/main.rs::run": 22,
   "src/mission_config_cli.rs::render_show_text": 30,
   "src/mission_config_cli.rs::resolve_role": 17,
   "src/mission_launch.rs::launch": 112,
