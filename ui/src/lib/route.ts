@@ -389,6 +389,10 @@ export function parseRoute(): Route {
   }
 
   if (lens === "machine") {
+    // A retired `uid=` link must not silently open the local machine. The
+    // unknown-route page shows this hash, and the old value is a hardware
+    // uid, so the hash it names is the redacted spelling, never the raw one.
+    if (get("uid")) return { kind: "unknown", hash: "lens=machine&uid=(retired, value withheld)" };
     const machine = get("machine");
     return { kind: "machine", machine: machine ? machine : null };
   }

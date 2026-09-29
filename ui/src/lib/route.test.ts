@@ -52,9 +52,11 @@ describe("parseRoute", () => {
     expect(parseRoute()).toEqual({ kind: "machine", machine: "studio" });
   });
 
-  it("uid= is retired: the machine route reads only machine=, so an old uid link opens the local machine", () => {
+  it("uid= is retired: an old uid link is an unknown route that withholds the uid, never the local machine", () => {
     setHash("#lens=machine&uid=some-remote-uid");
-    expect(parseRoute()).toEqual({ kind: "machine", machine: null });
+    const route = parseRoute();
+    expect(route.kind).toBe("unknown");
+    expect(JSON.stringify(route)).not.toContain("some-remote-uid");
   });
 
   it("parses #lens=console&panel=<id>", () => {

@@ -28,6 +28,11 @@ function fetchGenerics(text: string): string[] {
   return out;
 }
 
+/** `.json() as T` casts: a call that reads a response body without `fetchJson`. */
+function jsonCasts(text: string): string[] {
+  return [...text.matchAll(/\.json\(\)\)?\s+as\s+([^;\n]+)/g)].map((m) => m[1]);
+}
+
 /** The identifiers a generic mentions that are not TypeScript built-ins. */
 function namedTypes(generic: string): string[] {
   const builtins = new Set(["unknown", "Record", "string", "T"]);
@@ -39,16 +44,16 @@ describe("daemon data is typed by generated types only", () => {
     expect(() => statSync(path.join(SRC, "types", "handwritten.ts"))).toThrow();
   });
 
-  it("every type a fetchJson<...> names is imported from types/generated", () => {
+  it("every type a fetchJson<...> or .json() as T names is imported from types/generated", () => {
     const offenders: string[] = [];
     let seen = 0;
     for (const file of sourceFiles(SRC)) {
       const text = readFileSync(file, "utf8");
-      for (const generic of fetchGenerics(text)) {
+      for (const generic of [...fetchGenerics(text), ...jsonCasts(text)]) {
         seen += 1;
         for (const name of namedTypes(generic)) {
           if (!new RegExp(`import type \\{[^}]*\\b${name}\\b[^}]*\\} from "[./]*types/generated/`).test(text)) {
-            offenders.push(`${file.slice(SRC.length + 1)}: fetchJson<${generic}> names ${name}, which is not a generated type`);
+            offenders.push(`${file.slice(SRC.length + 1)}: ${generic} names ${name}, which is not a generated type`);
           }
         }
       }
