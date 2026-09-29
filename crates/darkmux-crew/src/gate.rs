@@ -1,7 +1,7 @@
 //! Operator sign-off gate for mission steps (#1684 Packet 2).
 //!
-//! Packet 1 (#1695) built the panel-advertised, registry-driven command
-//! surface (`darkmux acp`'s slash commands, `src/acp_panel.rs`) and its
+//! Packet 1 (#1695) built the panel's registry-driven command surface (now
+//! `darkmux acp`'s `/mission launch <config>`, `src/acp_panel.rs`) and its
 //! ephemeral in-process runner. This packet is the mechanism BEHIND a
 //! gated panel verb — `pr-merge`, `pr-approve`, or any future config that
 //! declares `"gate": "operator"` on a step (`mission_config::StepConfig::

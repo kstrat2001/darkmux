@@ -14339,14 +14339,9 @@ mod tests {
     /// (#1684) The same-major-lower-minor trail this file's own
     /// `check_mission_config_registry_warns_when_user_tier_copy_is_on_an_older_major`
     /// doc comment named as "worth re-testing directly again once a real
-    /// 2.1 exists" — #1684's additive `panel` field is exactly that: the
-    /// mission-config schema bumped `2.0` -> `2.1` in the SAME change that
-    /// introduces this test, making a user-tier "2.0" copy of `review` a
-    /// live, reachable same-major-minor-trail case for the first time
-    /// since the 2.0 major bump. A pre-2.1 user copy is missing the
-    /// `panel` block, so it silently stops being ACP-advertisable — the
-    /// concrete hazard this finding exists to name (a same-major
-    /// minor-trail finding is a loud `Status::Warn`, same tier as every
+    /// 2.1 exists" — #1684's additive field was the first reachable
+    /// same-major-minor-trail case since the 2.0 major bump (a same-major
+    /// minor-trail finding was a loud `Status::Warn`, same tier as every
     /// other entry `check_mission_config_registry`'s `blocking` vec
     /// collects — see that function's own `if blocking.is_empty()` branch).
     ///

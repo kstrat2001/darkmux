@@ -16,6 +16,23 @@ darkmux release.
 
 ### Removed (breaking, 4.0)
 
+- **The per-config `panel` block, and the panel's per-config slash commands**
+  (`/review`, `/machine-status`, `/pr-merge`, ...). The editor panel now has
+  one command, `/mission`, with three verbs, and every config `darkmux mission
+  launch` accepts is listable and launchable through it. A mission config
+  carrying a `panel` key is refused by the user-file gate and by `mission
+  config` validation, with a message naming `/mission launch <id>`.
+  `mission config list --json` rows and `mission config show --json` lose
+  their `panel` field, and the text list loses its `panel` column.
+  **Migration:** delete the `panel` block from your configs; run `/review` as
+  `/mission launch review`, `/pr-merge 2049` as `/mission launch pr-merge 2049`.
+  A config takes text after its id only if a task reads `__panel_args__`
+  (this replaces `panel.accepts_args`); text sent to a config that takes none
+  is refused, not dropped. Radio's router now reads the first sentence of a
+  config's `description` (else its `name`) where it read `panel.description`,
+  so a config you want routable should lead with one plain sentence. Panel
+  ids are the ones `mission launch` accepts (lowercase), so a config whose
+  file name has an uppercase letter is not listed.
 - **`darkmux mission dispatch` and the hand-built mission verbs** (#2954).
   Missions now come only from mission configs. Removed with no alias:
   `mission dispatch`, `mission add-phase`, `mission start`,
@@ -204,6 +221,25 @@ darkmux release.
   `auto` and `pause` the same. A role manifest that still sets it is refused
   like any retired key. **Migration:** delete `escalation_posture` from your
   role manifests (`darkmux doctor`'s `user file keys` row names each file).
+
+### Added (4.0)
+
+- **`darkmux mission show <id>`** and the panel's `/mission show <id>`: one
+  mission in full, from one derivation. The config it was launched from and
+  its declared inputs, every phase, task and step with status, tokens, turns
+  and model, its runs, total tokens, and a viewer link. `--json` is a
+  semver-bound shape (`MissionShow`: `id`, `status`, `description`, `config`,
+  `graph` (the daemon's `/mission/:id/graph.json` value), `runs` (the `run
+  list` rows for this mission), `tokens`, `link`). `mission status` stays the
+  board.
+- **`/mission list`, `/mission launch <config> [name=value ...]` and
+  `/mission show <id>` in the editor panel**, replacing the per-config
+  commands. Arguments after the config id map onto its declared inputs the way
+  `--param` does (a `name=value` token naming a declared input is a param, the
+  rest is the config's `__panel_args__` text). `/mission launch review` with
+  no inputs still synthesizes the diff, workspace and `head_sha` from the
+  session's cwd, now triggered by a declared required `diff_file` input and
+  skipped when you pass one.
 
 ### Changed (breaking, 4.0)
 

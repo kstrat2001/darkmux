@@ -374,9 +374,8 @@ fn build_session_config_options(overrides: &crate::radio_answer::AnswererOverrid
     vec![radio_host, humor]
 }
 
-/// Send the `AvailableCommandsUpdate` notification advertising every
-/// registry mission config that declares a `panel` block (#1684) — the
-/// SAME resolution `darkmux mission launch` / `mission status` use.
+/// Send the `AvailableCommandsUpdate` notification advertising the panel's
+/// one command, `/mission` (`list`, `launch <config>`, `show <id>`).
 ///
 /// Shared by `session/new` and `session/load` (#1698 Packet B2 gate): a
 /// resumed session needs the menu as much as a fresh one, and one copy of
@@ -1239,9 +1238,7 @@ async fn serve(
                 // resumed thread with no pickers and possibly an empty slash
                 // menu — which defeats this scope's whole purpose, since the
                 // reason `session/load` exists here is to make binary swaps
-                // and reconnects INVISIBLE. (Typed `/pr-list` still works
-                // either way: `route_command` resolves against the registry,
-                // never against the advertised list.)
+                // and reconnects INVISIBLE.
                 //
                 // Same respond-FIRST ordering as `session/new`: a
                 // notification naming a session id the client hasn't been
@@ -2843,6 +2840,15 @@ mod tests {
     /// Returns the minted `sessionId`, after draining the
     /// `AvailableCommandsUpdate` notification `session/new` always sends.
     async fn handshake(writer: &mut DuplexStream, reader: &mut BufReader<DuplexStream>, cwd: &Path) -> String {
+        handshake_with_commands(writer, reader, cwd).await.0
+    }
+
+    /// [`handshake`], keeping the `AvailableCommandsUpdate` it drains.
+    async fn handshake_with_commands(
+        writer: &mut DuplexStream,
+        reader: &mut BufReader<DuplexStream>,
+        cwd: &Path,
+    ) -> (String, serde_json::Value) {
         send_json(
             writer,
             serde_json::json!({
@@ -2866,8 +2872,8 @@ mod tests {
             .as_str()
             .expect("session/new must return a sessionId")
             .to_string();
-        let _available_commands_update = recv_json(reader).await;
-        session_id
+        let available_commands_update = recv_json(reader).await;
+        (session_id, available_commands_update)
     }
 
     async fn send_prompt(writer: &mut DuplexStream, session_id: &str, text: &str) {
@@ -2892,6 +2898,108 @@ mod tests {
             response["result"]["stopReason"], "end_turn",
             "expected the session/prompt response to end the turn: {response}"
         );
+    }
+
+    /// The panel advertises exactly one command, `/mission`, whatever configs
+    /// exist: no config names itself into the palette.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn session_new_advertises_only_the_generic_mission_command() {
+        let crew_tmp = tempfile::TempDir::new().unwrap();
+        let _crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
+        write_echo_fixture(crew_tmp.path(), "echo-fixture", "fixture output");
+        let (mut writer, mut reader) = spawn_test_agent(|_: &str| panic!("no routing"), never_answer);
+        let (_session, update) = handshake_with_commands(&mut writer, &mut reader, &std::env::temp_dir()).await;
+        let commands = update["params"]["update"]["availableCommands"].as_array().expect("a command list").clone();
+        let names: Vec<&str> = commands.iter().map(|c| c["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["mission"], "one generic command, however many configs exist: {update}");
+    }
+
+    /// `/mission list` names every launchable config, including a fixture.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mission_list_lists_the_launchable_configs() {
+        let crew_tmp = tempfile::TempDir::new().unwrap();
+        let _crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
+        write_echo_fixture(crew_tmp.path(), "echo-fixture", "fixture output");
+        let (mut writer, mut reader) = spawn_test_agent(|_: &str| panic!("no routing"), never_answer);
+        let session_id = handshake(&mut writer, &mut reader, &std::env::temp_dir()).await;
+
+        send_prompt(&mut writer, &session_id, "/mission list").await;
+        let listing = recv_json(&mut reader).await;
+        let text = chunk_text(&listing);
+        for id in ["echo-fixture", "review", "machine-status"] {
+            assert!(text.contains(&format!("`{id}`")), "`{id}` must be listed: {text}");
+        }
+        assert_end_turn(&recv_json(&mut reader).await);
+    }
+
+    /// The retired per-config command is refused with what replaces it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_retired_per_config_slash_command_is_refused_naming_mission_launch() {
+        let crew_tmp = tempfile::TempDir::new().unwrap();
+        let _crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
+        write_echo_fixture(crew_tmp.path(), "echo-fixture", "fixture output");
+        let (mut writer, mut reader) = spawn_test_agent(|_: &str| panic!("no routing"), never_answer);
+        let session_id = handshake(&mut writer, &mut reader, &std::env::temp_dir()).await;
+
+        send_prompt(&mut writer, &session_id, "/echo-fixture").await;
+        let reply = recv_json(&mut reader).await;
+        let text = chunk_text(&reply);
+        assert!(text.contains("/mission launch <config>") && !text.contains("fixture output"), "{text}");
+        assert_end_turn(&recv_json(&mut reader).await);
+    }
+
+    /// An unknown config through the panel is refused with the words
+    /// `darkmux mission launch` uses for it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_unknown_config_is_refused_with_the_cli_refusal_text() {
+        let crew_tmp = tempfile::TempDir::new().unwrap();
+        let _crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
+        let (mut writer, mut reader) = spawn_test_agent(|_: &str| panic!("no routing"), never_answer);
+        let session_id = handshake(&mut writer, &mut reader, &std::env::temp_dir()).await;
+
+        send_prompt(&mut writer, &session_id, "/mission launch no-such-config").await;
+        let reply = recv_json(&mut reader).await;
+        let cli = format!("darkmux: {:#}", crate::mission_launch::resolve_config("no-such-config").err().unwrap());
+        assert_eq!(chunk_text(&reply), cli);
+        assert_end_turn(&recv_json(&mut reader).await);
+    }
+
+    /// `/mission show <id>` prints exactly what `darkmux mission show <id>`
+    /// does: both are `mission_show::build` then `render_text`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mission_show_prints_the_text_the_cli_prints() {
+        let crew_tmp = tempfile::TempDir::new().unwrap();
+        let _crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
+        let flows_tmp = tempfile::TempDir::new().unwrap();
+        let _flows_guard = EnvGuard::set("DARKMUX_FLOWS_DIR", flows_tmp.path());
+        crate::crew::lifecycle::save_mission(&crate::crew::types::Mission {
+            id: "panel-show-m1".to_string(),
+            description: "Shown in the panel.".to_string(),
+            status: crate::crew::types::MissionStatus::Active,
+            phase_ids: Vec::new(),
+            created_ts: 1,
+            started_ts: Some(1),
+            finalized_ts: None,
+            source_input: None,
+            ticket: None,
+            spec: None,
+            machine: None,
+        })
+        .unwrap();
+        let (mut writer, mut reader) = spawn_test_agent(|_: &str| panic!("no routing"), never_answer);
+        let session_id = handshake(&mut writer, &mut reader, &std::env::temp_dir()).await;
+
+        send_prompt(&mut writer, &session_id, "/mission show panel-show-m1").await;
+        let reply = recv_json(&mut reader).await;
+        let expected = crate::mission_show::render_text(&crate::mission_show::build("panel-show-m1").unwrap());
+        assert_eq!(chunk_text(&reply), expected);
+        assert!(expected.contains("Mission panel-show-m1"), "{expected}");
+        assert_end_turn(&recv_json(&mut reader).await);
     }
 
     /// Like [`write_echo_fixture`], but its task reads `__panel_args__`, so

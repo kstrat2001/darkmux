@@ -5488,7 +5488,7 @@ fn radio_sigterm_forwards_to_the_launched_child_which_finalizes() {
 
     let config_dir = home.path().join("mission-configs");
     fs::create_dir_all(&config_dir).unwrap();
-    // Advertised via `panel` (so radio's catalog names it) and classified
+    // Launchable (so radio's catalog names it) and classified
     // `Launch` (so it spawns a `mission launch` subprocess, not an
     // in-process ephemeral run) by having a `dispatch.internal` step — the
     // SAME shape `mission_launch_generic_sigterm_mid_dispatch_finalizes_and_reaps_curl`
@@ -6380,8 +6380,8 @@ fn mission_launch_run_on_unknown_value_refused_before_minting() {
 //
 // No assert_cmd binary-level test exists for `radio`'s live routing path,
 // for a reason worth recording: the built-in `review` mission config
-// (`templates/builtin/mission-configs/review.json`) declares a `panel`
-// block, so it is ALWAYS merged into `radio::compile_catalog`'s output
+// (`templates/builtin/mission-configs/review.json`) is launchable, so it is
+// ALWAYS merged into `radio::compile_catalog`'s output
 // regardless of `DARKMUX_HOME` — built-ins are embedded at compile
 // time, independent of the user-tier root an isolated TempDir can
 // override. There is therefore no environment override that produces a

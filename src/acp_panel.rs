@@ -1833,6 +1833,47 @@ mod tests {
         assert_eq!(out.text.trim(), "arg: hello world");
     }
 
+    fn greeting_config(required: bool) -> MissionConfig {
+        let mut cfg = config(
+            "greet",
+            vec![phase(
+                "p1",
+                vec![task(
+                    "t1",
+                    &[],
+                    &[],
+                    vec![step("s1", "procedural.shell", serde_json::json!({"command": "echo greeting: {{greeting}}"}))],
+                )],
+            )],
+        );
+        cfg.inputs = vec![MissionInput { required: Some(required), ..input("greeting") }];
+        cfg
+    }
+
+    /// A declared input reaches the step's `{{name}}` placeholder on the
+    /// ephemeral route, as it does under `mission launch --param`.
+    #[serial_test::serial]
+    #[test]
+    fn ephemeral_run_substitutes_a_declared_input_into_its_step() {
+        let out = run_ephemeral(&greeting_config(true), &["greeting=hi".to_string()], &std::env::temp_dir(), None)
+            .expect("ephemeral run succeeds");
+        assert!(out.success, "{}", out.text);
+        assert_eq!(out.text.trim(), "greeting: hi");
+    }
+
+    /// The same run without the required input is refused, in the words
+    /// `mission launch` uses for a missing required input, and no step runs.
+    #[serial_test::serial]
+    #[test]
+    fn ephemeral_run_refuses_a_missing_required_input_with_the_launch_text() {
+        let cfg = greeting_config(true);
+        let out = run_ephemeral(&cfg, &[], &std::env::temp_dir(), None).expect("a refusal is an outcome, not an Err");
+        assert!(!out.success);
+        let launch_text = format!("{:#}", crate::mission_launch::resolve_inputs(&cfg, None, &[]).err().expect("launch refuses too"));
+        assert!(out.text.contains(&launch_text), "one refusal text on both surfaces:\n{}\nvs\n{launch_text}", out.text);
+        assert!(!out.text.contains("greeting: "), "no step may have run: {}", out.text);
+    }
+
     #[serial_test::serial]
 
     #[test]
