@@ -1079,7 +1079,6 @@ mod tests {
                 "CompactionStrategy",
                 "profiles.json `compaction.strategy`, strictly deserialized (an unknown one fails the load)",
             ),
-            ("UtilityBinding", "the `internal.utility` value's shape (id or object), not a token set"),
             ("QuarantinedEntryKind", "a registry-load diagnostic, never written"),
             ("GitdirPointerKind", "a workspace probe result, never written"),
             ("Scope", "`paths::Scope` / `config_enum::Scope`: code-side enums, not setting values"),

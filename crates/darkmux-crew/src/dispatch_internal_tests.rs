@@ -1853,14 +1853,14 @@
         assert_eq!(explicit.compactor_n_ctx, Some(120_000), "switching profiles never changes the compactor's window");
     }
 
-    /// (#2914) A bare-string binding declares no window: the compactor's
+    /// (#2914) A binding with no `n_ctx` declares no window: the compactor's
     /// n_ctx is `None` (the caller then falls back to the primary's window
     /// and SAYS so), even when a profile still lists the model with one.
     #[test]
     #[serial]
-    fn compactor_window_is_undeclared_for_a_bare_binding_even_when_a_profile_lists_the_model() {
+    fn compactor_window_is_undeclared_for_a_binding_without_n_ctx_even_when_a_profile_lists_the_model() {
         let state = darkmux_types::test_isolation::IsolatedState::new();
-        let pf = state.join("profiles-2914-bare.json");
+        let pf = state.join("profiles-2914-no-window.json");
         std::fs::write(
             &pf,
             r#"{"profiles":{
@@ -1869,7 +1869,7 @@
                         {"id":"util-4b","n_ctx":16000}
                     ]}
                 },
-                "internal":{"utility":"darkmux:util-4b"},
+                "internal":{"utility":{"id":"darkmux:util-4b"}},
                 "default_profile":"fast"}"#,
         )
         .unwrap();

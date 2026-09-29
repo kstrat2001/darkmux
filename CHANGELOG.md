@@ -157,6 +157,14 @@ darkmux release.
 
 ### Changed (breaking, 4.0)
 
+- **`internal.utility` is the object `{ "id", "n_ctx" }` only (PROFILES 2.0).**
+  The bare-string spelling (`"utility": "<model-id>"`) is refused, and the
+  registry does not load with it: the error names the object to write.
+  **Migration:** change `"utility": "<id>"` to
+  `"utility": { "id": "<id>", "n_ctx": <the window it is loaded at> }`
+  (the shipped `profiles.example.json` already uses it); an object with no
+  `n_ctx` still declares no window and is nudged by `darkmux doctor`.
+
 - **A profile model's inline `endpoint` object is refused, and an endpoint
   declares its kind (PROFILES 2.0).** A model names an `endpoints` entry by
   id (`"endpoint": "azure-east"`); the object form is gone, and so is the

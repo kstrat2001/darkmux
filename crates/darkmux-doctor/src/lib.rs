@@ -1251,8 +1251,8 @@ fn check_utility_model_binding() -> Check {
 /// Pure decision for `check_utility_model_binding`, split out so every arm is
 /// unit-testable without a live LMStudio. `loaded` is `None` when the binding
 /// is set but `lms ps` couldn't be queried. (#2914) `n_ctx` is the window the
-/// binding declares (`internal.utility.n_ctx`); `None` for the bare-string
-/// form, which still works but gets nudged to declare one, since that window
+/// binding declares (`internal.utility.n_ctx`); `None` when none is declared,
+/// which still works but gets nudged to declare one, since that window
 /// is now the ONLY source of the compactor's own context (a profile entry
 /// no longer counts).
 fn utility_binding_status(
@@ -1355,7 +1355,7 @@ fn utility_binding_status(
     }
 }
 
-/// (#2914) The nudge for a bare-string binding: since #2914 the window in
+/// (#2914) The nudge for a binding that declares no window: since #2914 the window in
 /// `internal.utility` is the only source of the compactor's own context (a
 /// profile entry no longer counts), so an undeclared window falls back to
 /// the primary's for compaction and to a fixed 16K for radio routing, both
@@ -12595,7 +12595,7 @@ mod tests {
     #[test]
     fn utility_in_profiles_warns_naming_each_profile_and_the_fix() {
         let registry: darkmux_types::ProfileRegistry = serde_json::from_value(serde_json::json!({
-            "internal": { "utility": "util-4b" },
+            "internal": { "utility": { "id": "util-4b" } },
             "profiles": {
                 "deep": { "models": [{ "id": "primary-big", "n_ctx": 262144 }, { "id": "darkmux:util-4b", "n_ctx": 120000 }] },
                 "radio": { "models": [{ "id": "util-4b", "n_ctx": 16000 }] },
@@ -12674,15 +12674,15 @@ mod tests {
     }
 
     /// (#2914) The binding check reports the declared window, and points a
-    /// bare-string binding at declaring one.
+    /// binding with no window at declaring one.
     #[test]
-    fn utility_binding_reports_its_window_and_nudges_a_bare_binding() {
+    fn utility_binding_reports_its_window_and_nudges_one_with_no_window() {
         let loaded = vec![lm("darkmux:util-4b", "util-4b")];
         let c = super::utility_binding_status(Some("util-4b"), Some(120_000), Some(&loaded));
         assert_eq!(c.status, Status::Pass);
         assert!(c.message.contains("120000"), "{}", c.message);
         let c = super::utility_binding_status(Some("util-4b"), None, Some(&loaded));
-        assert_eq!(c.status, Status::Pass, "a bare binding still works: {}", c.message);
+        assert_eq!(c.status, Status::Pass, "a binding with no window still works: {}", c.message);
         assert!(
             c.hint.clone().unwrap_or_default().contains("n_ctx"),
             "but the hint says to declare the window: {:?}",
@@ -12997,7 +12997,7 @@ mod tests {
     #[test]
     fn unreachable_residents_utility_binding_counts_as_addressable() {
         let mut registry = registry_with(&[("balanced", &[("qwen/qwen3.8-27b", None)])]);
-        registry.internal = Some(darkmux_types::RegistryInternal { utility: Some(darkmux_types::UtilityBinding::id("util-4b")) });
+        registry.internal = Some(darkmux_types::RegistryInternal { utility: Some(darkmux_types::UtilityBinding { id: "util-4b".into(), ..Default::default() }) });
         let loaded = vec![
             lm("darkmux:qwen/qwen3.8-27b", "qwen/qwen3.8-27b"),
             lm("darkmux:util-4b", "util-4b"),

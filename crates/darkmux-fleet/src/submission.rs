@@ -1366,7 +1366,7 @@ mod tests {
                 "host":{"models":[{"id":"big","n_ctx":32000}]},
                 "utility":{"models":[{"id":"small","n_ctx":8000}]}},
               "default_profile":"host",
-              "internal":{"utility":"small"}}"#,
+              "internal":{"utility":{"id":"small"}}}"#,
         );
         let r = role();
         assert_eq!(classify_profile(&reg, &r, Some("host"), None, "studio"), work("host"));

@@ -11254,8 +11254,8 @@ fn resolve_dispatch_model_with_hosts(
 /// is a genuinely different, disclosed degraded mode now, not a silent
 /// substitution.
 ///
-/// The window is the SECOND element: `internal.utility.n_ctx`, `None` for
-/// the bare-string binding. Since #2914 this is the only source of the
+/// The window is the SECOND element: `internal.utility.n_ctx`, `None` when
+/// none is declared. Since #2914 this is the only source of the
 /// compactor's own window — never a profile's `models[]` entry, which
 /// would make the utility model a work model.
 pub(crate) fn resolve_utility_model_internal(config_path: Option<&str>) -> Option<(String, Option<u32>)> {

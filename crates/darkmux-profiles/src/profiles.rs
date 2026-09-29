@@ -803,6 +803,19 @@ mod tests {
         assert!(!fs::read_to_string(&round).unwrap().contains("n_ctx"));
     }
 
+    /// A bare-string `internal.utility` was removed in 4.0: the registry does
+    /// not load, and the error names the object to write.
+    #[test]
+    fn a_bare_string_utility_fails_the_load_naming_the_object_form() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("profiles.json");
+        write(&p, r#"{"profiles":{"p":{"models":[{"id":"m","n_ctx":1}]}},"internal":{"utility":"util-4b"}}"#);
+        let err = format!("{:#}", load_registry(Some(p.to_str().unwrap())).unwrap_err());
+        assert!(err.contains("bare string") && err.contains(r#""utility": { "id": "util-4b", "n_ctx": "#), "{err}");
+        write(&p, r#"{"profiles":{"p":{"models":[{"id":"m","n_ctx":1}]}},"internal":{"utility":{"id":"util-4b","n_ctx":8000}}}"#);
+        assert!(load_registry(Some(p.to_str().unwrap())).is_ok());
+    }
+
     /// (#2902 step 4) The loader materializes `"endpoint": "<id>"` from the
     /// `endpoints` map, so every consumer downstream of `load_registry` sees
     /// the definition's fields; an id the map does not define stays

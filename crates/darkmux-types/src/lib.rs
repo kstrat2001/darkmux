@@ -418,8 +418,7 @@ pub struct RegistryInternal {
     /// task/step selection path excludes it, so a profile's `models[]` are
     /// work models only. One global utility model serves every utility job.
     ///
-    /// Either a bare model id or `{ "id": .., "n_ctx": .. }`
-    /// ([`UtilityBinding`]). The window is declared HERE, since #2914 the
+    /// `{ "id": .., "n_ctx": .. }` ([`UtilityBinding`]). The window is declared HERE, since #2914 the
     /// only place the compactor's own context comes from — not from a
     /// profile's `models[]` entry, which would make the utility model a work
     /// model. Absent ⇒ (#2571) NOT a fallback to a built-in default compactor
@@ -427,64 +426,42 @@ pub struct RegistryInternal {
     /// `CompactionDispatchArgs::apply_utility_model` leaves `compactor_model`
     /// unset, and an unset compactor means compaction is OFF outright for the
     /// dispatch (disclosed loudly at dispatch time, not silently defaulted).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_utility_binding")]
     pub utility: Option<UtilityBinding>,
 }
 
-/// (#2914) The `internal.utility` value: a bare model id (the original
-/// spelling, still read) or an object declaring the model's own context
-/// window. Untagged so both spellings parse from the same key; the object
-/// form serializes back as an object, the bare form as a string.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(untagged)]
-pub enum UtilityBinding {
-    /// `"utility": "<model-id>"` — no window declared. Consumers that need
-    /// one fall back to a NAMED default and say so (never silently).
-    Id(String),
-    /// `"utility": { "id": "<model-id>", "n_ctx": <u32> }`.
-    Declared(UtilityModel),
-}
-
-/// (#2914) The object form of [`UtilityBinding`].
+/// The `internal.utility` value: `{ "id": "<model-id>", "n_ctx": <u32> }`. The
+/// bare-string spelling was removed in 4.0 ([`deserialize_utility_binding`]
+/// refuses it, naming this shape).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct UtilityModel {
+pub struct UtilityBinding {
     pub id: String,
     /// The window the utility model is loaded at, and the size a compaction
-    /// payload is bounded by. `None` ⇒ undeclared (same as the bare form).
+    /// payload is bounded by. `None` ⇒ undeclared: consumers that need one
+    /// fall back to a NAMED default and say so (never silently).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub n_ctx: Option<u32>,
     /// Overflow for keys this binary does not know, re-serialized flat: a
     /// registry written by a NEWER binary that added a field to this object
-    /// still reads here without losing the field. (It does not help the
-    /// other direction: a binary from before 2.0 cannot read the object at
-    /// all, see `PROFILES_SCHEMA_VERSION`.)
+    /// still reads here without losing the field.
     #[serde(flatten)]
     #[schemars(skip)]
     pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
-impl UtilityBinding {
-    /// The bare-form constructor, for callers that only have an id.
-    pub fn id(id: impl Into<String>) -> Self {
-        UtilityBinding::Id(id.into())
-    }
-
-    /// The declared model id, untrimmed (see
-    /// [`ProfileRegistry::utility_model_id`] for the trimmed, blank-is-unset
-    /// view every consumer should use).
-    pub fn raw_id(&self) -> &str {
-        match self {
-            UtilityBinding::Id(id) => id,
-            UtilityBinding::Declared(m) => &m.id,
-        }
-    }
-
-    /// The declared window, if the object form declared one.
-    pub fn n_ctx(&self) -> Option<u32> {
-        match self {
-            UtilityBinding::Id(_) => None,
-            UtilityBinding::Declared(m) => m.n_ctx,
-        }
+/// `serde(deserialize_with)` for `internal.utility`: the object form only. A
+/// bare string is refused with the object to write in its place, since the
+/// typed parse of `internal` is not per-entry-quarantined and a vague error
+/// here stops every dispatch.
+fn deserialize_utility_binding<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<UtilityBinding>, D::Error> {
+    use serde::de::Error;
+    match Option::<serde_json::Value>::deserialize(d)? {
+        None => Ok(None),
+        Some(serde_json::Value::String(id)) => Err(D::Error::custom(format!(
+            "`internal.utility` is a bare string (\"{id}\"), which 4.0 removed: write \
+             `\"utility\": {{ \"id\": \"{id}\", \"n_ctx\": <the window it is loaded at> }}`"
+        ))),
+        Some(other) => serde_json::from_value(other).map(Some).map_err(D::Error::custom),
     }
 }
 
@@ -569,15 +546,14 @@ impl Profile {
 // holding an endpoint's API key — the headless-runner escape hatch, resolved
 // ahead of the Keychain). Minor bump: every 1.4 registry parses unchanged (the
 // field is `Option`, absent on read), per the lenient-read doctrine.
-// 2.0 (#2914, darkmux 4.0): `internal.utility` also accepts the object form
+// 2.0 (#2914, darkmux 4.0): `internal.utility` is the object
 // `{ "id": <model-id>, "n_ctx": <u32> }` (`UtilityBinding`), declaring the
 // utility model's own context window where the binding lives. The bare
-// string form still reads (no window declared), so every 1.5 registry
-// parses unchanged. MAJOR bump all the same: this RETYPES a value, and an
-// older binary (`utility: Option<String>`) given the object form fails the
-// whole registry's typed parse (`internal` is a typed field, not a
-// quarantined per-entry one), which is a hard stop on every dispatch
-// (#1269). Alongside it, the utility model stopped being a legal work
+// string form is refused, naming the object to write. MAJOR bump: this
+// RETYPES a value, and an older binary (`utility: Option<String>`) given the
+// object form fails the whole registry's typed parse (`internal` is a typed
+// field, not a quarantined per-entry one), which is a hard stop on every
+// dispatch (#1269). Alongside it, the utility model stopped being a legal work
 // model: no profile's `models[]` should list it (`darkmux doctor` flags
 // one that does), and every task/step selection path excludes it.
 // Also in 2.0 (#2902 step 4, same unreleased major): the top-level
@@ -721,19 +697,19 @@ impl ProfileRegistry {
         self.internal
             .as_ref()
             .and_then(|i| i.utility.as_ref())
-            .map(|u| u.raw_id().trim())
+            .map(|u| u.id.trim())
             .filter(|s| !s.is_empty())
     }
 
     /// (#2914) The utility model's declared context window
-    /// (`internal.utility.n_ctx`), when the object form declared one. `None`
-    /// for the bare form, for an undeclared window, and whenever
+    /// (`internal.utility.n_ctx`), when one is declared. `None`
+    /// for an undeclared window, and whenever
     /// [`Self::utility_model_id`] is `None` (a window with no model is not a
     /// binding). Since #2914 this is the ONLY source of the compactor's own
     /// window; a profile's `models[]` is never consulted for it.
     pub fn utility_model_n_ctx(&self) -> Option<u32> {
         self.utility_model_id()?;
-        self.internal.as_ref().and_then(|i| i.utility.as_ref()).and_then(UtilityBinding::n_ctx)
+        self.internal.as_ref().and_then(|i| i.utility.as_ref()).and_then(|u| u.n_ctx)
     }
 
     /// (#1054) Resolve which profile a dispatch should use, given an optional
@@ -1327,7 +1303,7 @@ mod tests {
             "profiles": {
                 "fast": { "models": [ {"id": "worker-a", "n_ctx": 32000} ] }
             },
-            "internal": { "utility": "darkmux:qwen3-4b-instruct-2507" }
+            "internal": { "utility": { "id": "darkmux:qwen3-4b-instruct-2507" } }
         }"#;
         let reg: ProfileRegistry = serde_json::from_str(json).unwrap();
         assert_eq!(reg.utility_model_id(), Some("darkmux:qwen3-4b-instruct-2507"));
@@ -1335,6 +1311,23 @@ mod tests {
         let back: ProfileRegistry =
             serde_json::from_str(&serde_json::to_string(&reg).unwrap()).unwrap();
         assert_eq!(back.utility_model_id(), Some("darkmux:qwen3-4b-instruct-2507"));
+    }
+
+    /// The bare-string `internal.utility` was removed in 4.0: the typed load
+    /// refuses it, naming the object form with the id the file wrote.
+    #[test]
+    fn a_bare_string_utility_is_refused_naming_the_object_form() {
+        let err = serde_json::from_str::<ProfileRegistry>(r#"{ "profiles": {}, "internal": { "utility": "util-4b" } }"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("bare string") && err.contains("removed"), "{err}");
+        assert!(err.contains(r#""utility": { "id": "util-4b", "n_ctx": "#), "names the object to write: {err}");
+        for ok in [r#"{ "id": "u" }"#, r#"{ "id": "u", "n_ctx": 8 }"#, "null"] {
+            let json = format!(r#"{{ "profiles": {{}}, "internal": {{ "utility": {ok} }} }}"#);
+            serde_json::from_str::<ProfileRegistry>(&json).unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
+        let wrong = serde_json::from_str::<ProfileRegistry>(r#"{ "profiles": {}, "internal": { "utility": 5 } }"#).unwrap_err();
+        assert!(wrong.to_string().contains("invalid type"), "{wrong}");
     }
 
     #[test]
@@ -1356,12 +1349,12 @@ mod tests {
         // as "no util model" — guards swap (#590) against trying to load the
         // bare `darkmux:` identifier. Surrounding whitespace is also trimmed.
         for blank in ["\"\"", "\"   \"", "\"\\t\\n\""] {
-            let json = format!(r#"{{ "profiles": {{}}, "internal": {{ "utility": {blank} }} }}"#);
+            let json = format!(r#"{{ "profiles": {{}}, "internal": {{ "utility": {{ "id": {blank} }} }} }}"#);
             let reg: ProfileRegistry = serde_json::from_str(&json).unwrap();
             assert_eq!(reg.utility_model_id(), None, "blank {blank} should be unset");
         }
         // A padded real id trims to the bare id (so it still matches loaded state).
-        let json = r#"{ "profiles": {}, "internal": { "utility": "  darkmux:util-4b  " } }"#;
+        let json = r#"{ "profiles": {}, "internal": { "utility": { "id": "  darkmux:util-4b  " } } }"#;
         let reg: ProfileRegistry = serde_json::from_str(json).unwrap();
         assert_eq!(reg.utility_model_id(), Some("darkmux:util-4b"));
     }
@@ -1369,7 +1362,7 @@ mod tests {
     /// (#2914) `internal.utility` also accepts `{id, n_ctx}`: the utility
     /// model declares its own context window HERE, never in a profile's
     /// `models[]` (the compactor's window used to be looked up there, which
-    /// made the utility model a work model). A bare string still reads.
+    /// made the utility model a work model). A bare string is refused.
     #[test]
     fn registry_internal_utility_accepts_id_and_n_ctx_object() {
         let json = r#"{
@@ -1385,11 +1378,11 @@ mod tests {
         assert_eq!(back.utility_model_id(), Some("darkmux:util-4b"));
         assert_eq!(back.utility_model_n_ctx(), Some(120_000));
 
-        // The bare form declares no window.
-        let bare: ProfileRegistry =
-            serde_json::from_str(r#"{ "profiles": {}, "internal": { "utility": "util-4b" } }"#).unwrap();
-        assert_eq!(bare.utility_model_id(), Some("util-4b"));
-        assert_eq!(bare.utility_model_n_ctx(), None);
+        // An object with no `n_ctx` declares no window.
+        let undeclared: ProfileRegistry =
+            serde_json::from_str(r#"{ "profiles": {}, "internal": { "utility": { "id": "util-4b" } } }"#).unwrap();
+        assert_eq!(undeclared.utility_model_id(), Some("util-4b"));
+        assert_eq!(undeclared.utility_model_n_ctx(), None);
 
         // A blank/padded id in the object form gets the same treatment as a
         // blank/padded bare string.
@@ -1749,7 +1742,7 @@ mod tests {
     /// Full round-trip preserves typed fields through serialize→parse cycle.
     #[test]
     fn registry_full_shape_round_trips() {
-        let json = r#"{"schema_version":"2.0","profiles":{"fast":{"description":"tiny profile","models":[{"id":"model-a","n_ctx":32000}],"default_model":"model-a"}},"hooks":{"pre_swap":[{"command":"echo swap-start","condition":"always"}],"post_swap":[{"command":"echo swap-end"}]},"default_profile":"fast","internal":{"utility":"darkmux:util-4b"},"future_field":true}"#;
+        let json = r#"{"schema_version":"2.0","profiles":{"fast":{"description":"tiny profile","models":[{"id":"model-a","n_ctx":32000}],"default_model":"model-a"}},"hooks":{"pre_swap":[{"command":"echo swap-start","condition":"always"}],"post_swap":[{"command":"echo swap-end"}]},"default_profile":"fast","internal":{"utility":{"id":"darkmux:util-4b"}},"future_field":true}"#;
         let reg: ProfileRegistry = serde_json::from_str(json).unwrap();
         assert_eq!(reg.schema_version.as_deref(), Some("2.0"));
         assert_eq!(reg.profiles.len(), 1);
