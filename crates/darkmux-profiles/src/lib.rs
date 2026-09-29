@@ -51,7 +51,6 @@ pub fn preflight_with(
     use darkmux_types::user_files::UserFileKind;
     let mut refusal = config_enum::preflight(scope).err().unwrap_or_else(|| PreflightRefusal::none(scope));
     if UserFileKind::Profiles.scopes().contains(&scope) {
-        warn_renamed_leftovers_once();
         if let Ok(loaded) = profiles::load_registry_quiet(profiles_file) {
             refusal.bad.extend(config_enum::bad_endpoint_budget_policies(&loaded.registry));
             refusal.invalid.extend(config_enum::invalid_endpoint_limits(&loaded.registry));
@@ -59,21 +58,6 @@ pub fn preflight_with(
         }
     }
     refusal.into_result()
-}
-
-/// (#2902 step 5) A leftover RENAMED setting (the pre-4.0
-/// `remote.max_tokens_per_execution`, in config.json or the env) is read by
-/// nothing. It is never refused, but it must not silently do nothing: every
-/// entry point that dispatches says so, once per process, on stderr.
-fn warn_renamed_leftovers_once() {
-    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    let leftovers = darkmux_types::config_access::renamed_setting_leftovers();
-    if leftovers.is_empty() || WARNED.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        return;
-    }
-    for l in leftovers {
-        eprintln!("darkmux: ⚠ {}", l.line);
-    }
 }
 
 #[cfg(test)]
@@ -127,6 +111,29 @@ mod user_file_tests {
             }
             assert_eq!(crate::preflight_with(Scope::FleetSubmission, Some(&path)), Ok(()), "fleet submission reads no registry");
         }
+    }
+
+    /// A profile model's inline `endpoint` object is refused by every
+    /// dispatching preflight, naming the exact rewrite (the `endpoints` id to
+    /// move it to). The same document with the endpoint named by id passes.
+    #[test]
+    fn an_inline_endpoint_object_is_refused_naming_the_rewrite() {
+        let inline = r#"{"profiles": {"p": {"models": [{"id": "gpt", "endpoint": {"url": "https://api.example/v1"}}]}}}"#;
+        let (_d, path) = write(inline);
+        for scope in [Scope::Dispatch, Scope::MissionLaunch, Scope::LabRun] {
+            let msg = crate::preflight_with(scope, Some(&path)).expect_err(inline).to_string();
+            assert!(msg.contains("profiles.p.models[0].endpoint"), "names the model's endpoint: {msg}");
+            assert!(
+                msg.contains("removed in 4.0")
+                    && msg.contains("endpoints.\"api.example\"")
+                    && msg.contains("\"endpoint\": \"api.example\""),
+                "names the rewrite: {msg}"
+            );
+        }
+        let named = r#"{"profiles": {"p": {"models": [{"id": "gpt", "endpoint": "api"}]}},
+                        "endpoints": {"api": {"url": "https://api.example/v1"}}}"#;
+        let (_d, path) = write(named);
+        assert_eq!(crate::preflight_with(Scope::Dispatch, Some(&path)), Ok(()));
     }
 
     #[test]

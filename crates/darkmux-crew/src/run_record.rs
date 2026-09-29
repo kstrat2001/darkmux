@@ -357,20 +357,15 @@ pub fn staffing_snapshot(
 mod tests {
     use super::*;
 
-    /// (#2902 review C3) Only an UNMANAGED endpoint is a hosted seat: an
-    /// inline endpoint with no `url` is the managed LM Studio default and
-    /// must not show a host or an endpoint.
+    /// (#2902 review C3) Only an UNMANAGED endpoint is a hosted seat: a
+    /// managed LM Studio endpoint must not show a host or an endpoint.
     #[test]
     fn seat_endpoint_shows_only_unmanaged_endpoints() {
-        let pm = |ep: serde_json::Value| -> ProfileModel {
-            serde_json::from_value(serde_json::json!({ "id": "m", "n_ctx": 1, "endpoint": ep })).unwrap()
-        };
-        for managed in [serde_json::json!({}), serde_json::json!({ "reasoning_effort": "high" }), serde_json::json!({ "managed": "lmstudio" })] {
-            let m = pm(managed.clone());
-            assert!(seat_endpoint(&m).is_none(), "{managed}");
-            assert!(seat_endpoint_host(&m).is_none(), "{managed}");
-            assert_eq!(seat_identifier(&m), "darkmux:m", "{managed}");
-        }
+        let pm = |ep: serde_json::Value| -> ProfileModel { ProfileModel::hosted_for_test("m", Some(1), ep) };
+        let m = pm(serde_json::json!({ "managed": "lmstudio" }));
+        assert!(seat_endpoint(&m).is_none());
+        assert!(seat_endpoint_host(&m).is_none());
+        assert_eq!(seat_identifier(&m), "darkmux:m");
         let hosted = pm(serde_json::json!({ "url": "https://tok@h.example/v1" }));
         assert!(seat_endpoint(&hosted).is_some());
         assert_eq!(seat_endpoint_host(&hosted).as_deref(), Some("h.example"));

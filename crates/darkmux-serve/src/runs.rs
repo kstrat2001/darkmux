@@ -2733,7 +2733,7 @@ mod tests {
     ///
     /// **Why it had to change.** The `finalize_mission` tests in this
     /// module hold this guard, and the old version pinned only
-    /// `DARKMUX_CREW_DIR`. That isolates mission state — and the flow sink
+    /// the root. That isolates mission state — and the flow sink
     /// those same tests drive resolves through `flows_dir()`
     /// (`env(DARKMUX_FLOWS_DIR) > config.dirs.flows > <root>/flows`),
     /// which this guard never pinned. So `cargo test -p darkmux-serve
@@ -6944,7 +6944,7 @@ mod tests {
         // `peer_mission_runs` call `load_missions()` internally, so an
         // unguarded test here reads the OPERATOR'S real `~/.darkmux`
         // missions — and, unannotated, also raced whichever scratch
-        // `DARKMUX_CREW_DIR` a concurrent sibling happened to have set.
+        // `DARKMUX_HOME` a concurrent sibling happened to have set.
         let _g = CrewGuard::new();
         let flows = TempDir::new().unwrap(); // deliberately EMPTY: the peer's
         // records were never written to this machine's flows dir.

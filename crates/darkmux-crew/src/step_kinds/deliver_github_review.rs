@@ -887,7 +887,7 @@ fn group_for<'g>(
 /// declares no `title` simply has no entry here, which
 /// [`render_github_review`] renders as the bare rule id.
 pub fn rule_titles() -> BTreeMap<String, String> {
-    let user_dir = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::Auto).root.join("rules");
+    let user_dir = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).root.join("rules");
     let (rules, _warnings) = crate::rules::load_all(Some(&user_dir));
     titles_of(rules)
 }

@@ -200,6 +200,11 @@ darkmux release.
   (CONFIG 2.0, below). **Migration:** delete any of those keys still
   present (`darkmux doctor`'s `user file keys` rows name them).
 
+- **A role's `escalation_posture`.** Nothing read it: the runtime treated
+  `auto` and `pause` the same. A role manifest that still sets it is refused
+  like any retired key. **Migration:** delete `escalation_posture` from your
+  role manifests (`darkmux doctor`'s `user file keys` row names each file).
+
 ### Changed (breaking, 4.0)
 
 - **Read auth and execution auth are separate switches** (#2988). A serve
@@ -236,6 +241,66 @@ darkmux release.
   "true"`) or a retired key refuses the start. **Migration:** a tailnet
   viewer with read auth off loses the `doctor` and `config-list` panels
   (401); run them on the hub, or present the token.
+
+- **`internal.utility` is the object `{ "id", "n_ctx" }` only (PROFILES 2.0).**
+  The bare-string spelling (`"utility": "<model-id>"`) is refused, and the
+  registry does not load with it: the error names the object to write.
+  **Migration:** change `"utility": "<id>"` to
+  `"utility": { "id": "<id>", "n_ctx": <the window it is loaded at> }`
+  (the shipped `profiles.example.json` already uses it); an object with no
+  `n_ctx` still declares no window and is nudged by `darkmux doctor`.
+
+- **A profile model's inline `endpoint` object is refused, and an endpoint
+  declares its kind (PROFILES 2.0).** A model names an `endpoints` entry by
+  id (`"endpoint": "azure-east"`); the object form is gone, and so is the
+  implicit-kind rule (no `url` meant managed, a `url` meant unmanaged): an
+  `endpoints` entry declares `"managed": "lmstudio"` or a `url`, and one
+  with neither is refused at use. Every dispatching preflight and `darkmux
+  doctor` name each inline object with the exact rewrite. **Migration:**
+  for each `"endpoint": { ... }` on a model, move the object to
+  `endpoints."<id>"` and write `"endpoint": "<id>"` on the model (the
+  refusal prints the id); a model on the LM Studio darkmux manages needs no
+  `endpoint` at all.
+
+- **`dirs.crew` and `DARKMUX_CREW_DIR` are removed; `DARKMUX_HOME` is the one
+  relocation.** "Crew" is a retired concept: roles, missions, phases, crews
+  and skills live directly under the darkmux root, and the knob meant two
+  things (the preamble-override directory `<root>/crew`, and the root of
+  that state). `dirs.crew` in `config.json` is an unknown key, refused by
+  the gate, and a set `DARKMUX_CREW_DIR` is refused by every command
+  (`doctor` and `config` excepted, so you can find and fix it) and failed by
+  `darkmux doctor`. The autonomous-dispatch preamble override is now
+  `<root>/AUTONOMOUS_DISPATCH_PREAMBLE.md` (it was `<root>/crew/...`).
+  **Migration:** delete `dirs.crew`, unset `DARKMUX_CREW_DIR`, and if you
+  relocated darkmux with it set `DARKMUX_HOME` instead. `darkmux doctor`'s
+  `beat-33 crew/ layout` row prints the move for a preamble override left
+  under `<root>/crew/`.
+
+- **A project-local `./.darkmux/` is no longer adopted.** The darkmux root is
+  `$DARKMUX_HOME` when set, else `~/.darkmux`, and nothing else: a `.darkmux/`
+  in the working directory used to become the root for flows, lab runs,
+  sandboxes and profiles while missions and roles stayed at home. It is now
+  ignored: only the per-repo `lessons.db` and `conventions.json` are still
+  read from it. The same goes for a `./.darkmux/profiles.json` or
+  `./.darkmux.json` registry, which used to be searched ahead of
+  `~/.darkmux/profiles.json`: the registry now comes from the root
+  (`DARKMUX_HOME` or `~/.darkmux`), or `--profiles-file` /
+  `DARKMUX_PROFILES`. **Migration:** to keep using such a directory, run
+  darkmux with `DARKMUX_HOME=<that directory>`; otherwise move what you need
+  into `~/.darkmux` (a registry is `~/.darkmux/profiles.json`). `darkmux
+  doctor`'s `project-local .darkmux` row warns when the working directory
+  holds anything besides those per-repo files, naming what is stranded.
+
+- **A retired setting's env var is refused by every command.**
+  `DARKMUX_CREW_DIR`, `DARKMUX_NOTEBOOK_DIR`, `DARKMUX_RADIO_ROUTER_PROFILE`
+  and the renamed `DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION` used to be
+  refused only by the dispatch, mission-launch, lab and fleet entry points
+  (or, for the notebook and radio-router ones, only warned about). One check
+  at CLI entry now refuses to start while any is set, for every command
+  except `doctor` and `config` (and `--help` / `--version`). **Migration:**
+  remove the export from your shell rc; `darkmux doctor` lists each one with
+  what replaced it.
+
 - **An unknown key in a user file is refused (CONFIG 2.0).** `config.json`,
   `profiles.json`, role, skill and crew manifests, mission configs, rule
   files, workload documents, lab fixture manifests and a crawl's workspace
@@ -392,9 +457,9 @@ darkmux release.
   `DARKMUX_REMOTE_MAX_TOKENS_PER_STEP`): a per-step cap on hosted tokens,
   where `dispatch.map` steps naming the same `bucket_group` share one
   allowance. Clean break, no alias: `darkmux config set` refuses the old key
-  naming the new one, the old key is read by nothing, and `darkmux doctor`
-  names a leftover old key in `config.json` or the env with the exact
-  rename. It has no built-in default any more (unset means no cap), and
+  naming the new one, and a leftover old key in `config.json` or old env var
+  is refused at every preflight and failed by `darkmux doctor`, naming the
+  exact rename. It has no built-in default any more (unset means no cap), and
   reaching a cap never stops the step: the new `remote.step_budget_policy`
   (env `DARKMUX_REMOTE_STEP_BUDGET_POLICY`) is `warn` (the default: a CLI
   line and a `budget.warn` flow record, and the step keeps going) or `off`.
@@ -406,8 +471,8 @@ darkmux release.
   means unbounded), where before it refused every hosted call. `init`
   writes both keys visibly as `null`. CONFIG 1.32. **Migration:** a
   `config.json` written by an earlier `init` carries
-  `"max_tokens_per_execution": 500000` in its `remote` block; nothing reads
-  it now, so it no longer caps anything. Delete it, or, to keep a cap, run
+  `"max_tokens_per_execution": 500000` in its `remote` block; darkmux now
+  refuses it. Delete it, or, to keep a cap, run
   `darkmux config set remote.max_tokens_per_step <n>` (and rename an
   exported `DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION`).
 - **Flow actions have one spelling per event** (FLOW 2.0.0). Every action

@@ -104,16 +104,6 @@ pub struct Role {
     /// continue to work unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bail_after_compactions: Option<u32>,
-    /// (#377) What to do when an escalation bound fires. `"auto"`
-    /// (default) emits the `EscalationTriggered` terminal and exits
-    /// the dispatch — frontier-tier picks up via the
-    /// `darkmux-escalation-handler` skill. `"pause"` is the operator
-    /// opt-in for roles where work should NOT auto-escalate (e.g. a
-    /// human-supervised long-arc role). The runtime treats both the
-    /// same today; the field is plumbed for the host/skill layer to
-    /// branch on.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub escalation_posture: Option<String>,
     /// (#425) Role family — a **scope** distinction (#590): `"specialist"`
     /// roles work the mission/phases (the deliverable); `"utility"` roles
     /// support the runtime outside mission scope (radio-router today; the
@@ -891,7 +881,6 @@ mod tests {
             escalation_contract: EscalationContract::BailWithExplanation,
             prompt_path: None,
             bail_after_compactions: None,
-            escalation_posture: None,
             role_family: None,
             feedback_templates: None,
         }

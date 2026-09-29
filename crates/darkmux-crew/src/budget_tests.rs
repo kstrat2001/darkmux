@@ -581,8 +581,8 @@ fn a_stopped_run_ends_a_wait_and_nothing_is_sent() {
 #[serial_test::serial]
 fn an_aborted_mission_on_disk_stops_its_waiter_without_sending() {
     let crew = tempfile::tempdir().unwrap();
-    let prev = std::env::var("DARKMUX_CREW_DIR").ok();
-    unsafe { std::env::set_var("DARKMUX_CREW_DIR", crew.path()) };
+    let prev = std::env::var("DARKMUX_HOME").ok();
+    unsafe { std::env::set_var("DARKMUX_HOME", crew.path()) };
     let write = |path: std::path::PathBuf, status: &str| {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, format!(r#"{{"status":"{status}"}}"#)).unwrap();
@@ -601,8 +601,8 @@ fn an_aborted_mission_on_disk_stops_its_waiter_without_sending() {
     let live = LiveEnv.stop_reason(&caller);
     unsafe {
         match prev {
-            Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-            None => std::env::remove_var("DARKMUX_CREW_DIR"),
+            Some(v) => std::env::set_var("DARKMUX_HOME", v),
+            None => std::env::remove_var("DARKMUX_HOME"),
         }
     }
     assert_eq!(active, None);
@@ -1059,8 +1059,8 @@ fn active_waits_lists_open_waits_from_live_processes_only() {
 #[serial_test::serial]
 fn active_waits_skip_a_stopped_runs_wait() {
     let crew = tempfile::tempdir().unwrap();
-    let prev = std::env::var("DARKMUX_CREW_DIR").ok();
-    unsafe { std::env::set_var("DARKMUX_CREW_DIR", crew.path()) };
+    let prev = std::env::var("DARKMUX_HOME").ok();
+    unsafe { std::env::set_var("DARKMUX_HOME", crew.path()) };
     for (m, status) in [("m-live", "active"), ("m-gone", "aborted")] {
         let path = crate::lifecycle::mission_path(m);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1080,8 +1080,8 @@ fn active_waits_skip_a_stopped_runs_wait() {
     let waits = active_waits(dir.path(), T0, 86_400, &|_| true);
     unsafe {
         match prev {
-            Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-            None => std::env::remove_var("DARKMUX_CREW_DIR"),
+            Some(v) => std::env::set_var("DARKMUX_HOME", v),
+            None => std::env::remove_var("DARKMUX_HOME"),
         }
     }
     let sessions: Vec<&str> = waits.iter().filter_map(|w| w.session_id.as_deref()).collect();

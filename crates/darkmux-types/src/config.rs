@@ -376,8 +376,9 @@ pub const CONFIG_SCHEMA_VERSION: &str = "2.0";
 /// refuses the old key naming the new one; a leftover old key in
 /// `config.json` is an unknown key, refused by every preflight and failed by
 /// `darkmux doctor` with this rename as its message (`user_files`); a
-/// leftover old env var, which nothing reads, is named by doctor (Warn) and
-/// by every dispatch / launch / lab-run preflight (a one-line warning).
+/// leftover old env var is failed by doctor and refused by every command
+/// (`config_access::refuse_retired_env`, once at CLI entry; see
+/// [`retired_env_leftovers`]).
 #[derive(Debug, Clone, Copy)]
 pub struct RenamedSetting {
     pub old_key: &'static str,
@@ -410,6 +411,9 @@ pub const RENAMED_SETTINGS: &[RenamedSetting] = &[
 pub struct RetiredSetting {
     /// The dotted key; a block (`review`) covers every key inside it.
     pub key: &'static str,
+    /// The env var that set it, when it had one: a set one is refused like the
+    /// key ([`retired_env_leftovers`]).
+    pub env: Option<&'static str>,
     /// What replaced it, or that nothing did, and what to do.
     pub line: &'static str,
 }
@@ -418,44 +422,53 @@ pub struct RetiredSetting {
 pub const RETIRED_SETTINGS: &[RetiredSetting] = &[
     RetiredSetting {
         key: "dirs.notebook",
+        env: Some("DARKMUX_NOTEBOOK_DIR"),
         line: "removed in 4.0 (#2913): the notebook verbs retired; the bundled `darkmux-lab-notebook` skill writes \
                an entry wherever your own instructions say. Delete it",
     },
     RetiredSetting {
         // flow-action-guard:allow — a retired config key, refused by name
         key: "radio.router_profile",
+        env: Some("DARKMUX_RADIO_ROUTER_PROFILE"),
         line: "removed in CONFIG 1.28: radio routing runs on the machine's utility model, `internal.utility` in \
                profiles.json. Delete it",
     },
     RetiredSetting {
         key: "dirs.openclaw_config",
+        env: None,
         line: "removed with the openclaw runtime (#1405): nothing reads it. Delete it",
     },
     RetiredSetting {
         key: "dirs.runtime_agents",
+        env: None,
         line: "removed with the openclaw runtime (#1405): nothing reads it. Delete it",
     },
     RetiredSetting {
         key: "gh",
+        env: None,
         line: "renamed to `cmd` (#2003): move `gh.enabled` / `gh.allowed` to `cmd.enabled` / `cmd.allowed`",
     },
     RetiredSetting {
         key: "orchestrator",
+        env: None,
         line: "removed in #1766 (`init` wrote it from #663): flow records no longer carry an orchestrator. \
                Delete it",
     },
     RetiredSetting {
         key: "remote.stage_budget_policy",
+        env: None,
         line: "renamed to `remote.step_budget_policy` in 4.0 (#2902), which takes `off` or `warn` (`wait` is an \
                endpoint budget's policy only)",
     },
     RetiredSetting {
         key: "review",
+        env: None,
         line: "removed with the review funnel (#2310): `review` runs as a mission config now, and its judge knobs \
                went with the funnel. Delete the block",
     },
     RetiredSetting {
         key: "runtime.daemon_auth_enabled",
+        env: None,
         line: "replaced in 4.0 (#2988) by `serve.token_keychain` (read the serve token from the Keychain; the \
                fleet's execution credential) and `serve.read_auth` (whether reads from off this machine need \
                it, default off). Move your value to `serve.token_keychain`, and set `serve.read_auth true` if \
@@ -463,40 +476,65 @@ pub const RETIRED_SETTINGS: &[RetiredSetting] = &[
     },
     RetiredSetting {
         key: "runtime.telemetry_record_every_samples",
+        env: None,
         line: "removed in #2413: one machine-scoped host sampler replaced the per-dispatch curve; its cadence is \
                `runtime.host_sampler_interval_ms`. Delete it",
     },
+    RetiredSetting {
+        key: "dirs.crew",
+        env: Some("DARKMUX_CREW_DIR"),
+        line: "removed in 4.0: \"crew\" is a retired concept. `DARKMUX_HOME` (or `~/.darkmux`) is the one root, and \
+               roles, missions, phases, crews and skills live directly under it. Unset it, and to relocate \
+               darkmux set `DARKMUX_HOME`; the autonomous-dispatch preamble override is \
+               `<root>/AUTONOMOUS_DISPATCH_PREAMBLE.md`",
+    },
 ];
 
-/// A leftover old env var of a renamed setting.
+/// A retired or renamed setting whose env var is still set.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RenamedLeftover {
+pub struct RetiredLeftover {
     pub setting_old_key: &'static str,
     /// `env var ...`.
     pub found_in: String,
-    /// The operator line: what is ignored, its new name, and the advice.
+    /// The operator line: what is refused, what replaced it, and what to do.
     pub line: String,
 }
 
-/// Every renamed setting whose old env var is still set. (A leftover old
+/// Every renamed or retired setting whose env var is still set. (A leftover
 /// `config.json` key is an unknown key, which `user_files` refuses.)
-pub fn renamed_leftovers(env: &dyn Fn(&str) -> Option<String>) -> Vec<RenamedLeftover> {
-    RENAMED_SETTINGS
-        .iter()
-        .filter_map(|r| {
-            let v = env(r.old_env).filter(|v| !v.trim().is_empty())?;
-            let found_in = format!("env var {} ({v})", r.old_env);
-            Some(RenamedLeftover {
-                setting_old_key: r.old_key,
-                line: format!(
-                    "{found_in} is ignored: renamed to `{}` (env {}) in 4.0 (#2902); {}",
-                    r.new_key, r.new_env, r.advice
-                ),
-                found_in,
-            })
+pub fn retired_env_leftovers(env: &dyn Fn(&str) -> Option<String>) -> Vec<RetiredLeftover> {
+    let renamed = RENAMED_SETTINGS.iter().map(|r| {
+        let what = format!("renamed to `{}` (env {}) in 4.0 (#2902); {}", r.new_key, r.new_env, r.advice);
+        (r.old_key, r.old_env, what)
+    });
+    let retired = RETIRED_SETTINGS.iter().filter_map(|r| Some((r.key, r.env?, r.line.to_string())));
+    renamed
+        .chain(retired)
+        .filter_map(|(key, var, what)| {
+            let v = env(var).filter(|v| !v.trim().is_empty())?;
+            let found_in = format!("env var {var} ({v})");
+            Some(RetiredLeftover { setting_old_key: key, line: format!("{found_in} is refused: {what}"), found_in })
         })
         .collect()
 }
+
+/// What the CLI-entry check refuses with: every retired or renamed setting
+/// whose env var is still set, one operator line each. Its `Display` is the
+/// whole message; `doctor` and `config` are the only commands that run past it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetiredEnvRefusal(pub Vec<RetiredLeftover>);
+
+impl std::fmt::Display for RetiredEnvRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "refusing to start: bad config")?;
+        for l in &self.0 {
+            write!(f, "\n  {}", l.line)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for RetiredEnvRefusal {}
 
 /// The `~/.darkmux/config.json` document. All fields optional + skipped when
 /// `None`, so a fresh/empty config serializes to `{}` and any field absent
@@ -588,7 +626,6 @@ pub struct DirsConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub flows: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub audit: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub skills: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub crew: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub templates: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub ack: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub identity: Option<String>,
@@ -2204,13 +2241,8 @@ impl DarkmuxConfig {
     /// load path; a bad config must never brick the CLI — accessors fall through
     /// to env/built-in defaults).
     ///
-    /// (#1323) `ForceUser`, NOT `Auto`: config.json carries user/machine-level
-    /// state (redis/audit/lms/machine_id) — there is no legitimate per-project
-    /// config. Under `Auto`, the mere existence of a `<cwd>/.darkmux/` created
-    /// for an unrelated purpose (project-tier missions/phases/lessons) silently
-    /// resolved the "home" to the project dir, defaulting redis+audit OFF — a
-    /// real audit-trail hole on a self-hosted-runner checkout. Same shadowing
-    /// class as #1012/#1016; this is the config/flow-sink resolution path.
+    /// config.json carries user/machine-level state (redis/audit/lms/machine_id):
+    /// there is no per-project config, and a `<cwd>/.darkmux/` never shadows it.
     pub fn load_resolved() -> Self {
         let path = crate::paths::resolve(crate::paths::ResolveScope::ForceUser).config;
         Self::load_from(&path)
@@ -2235,9 +2267,9 @@ mod tests {
     /// `.darkmux/config.json` (created for missions/phases/lessons) must NEVER
     /// shadow the user-scope config. `DARKMUX_HOME` is UNSET on purpose — with it
     /// set, `paths::resolve` short-circuits to the same root for every scope, so
-    /// Auto and ForceUser wouldn't diverge and this guard would be hollow. If
-    /// `load_resolved` regresses to `ResolveScope::Auto`, it reads the project
-    /// shadow → the marker → this fails.
+    /// the project and user scopes wouldn't diverge and this guard would be
+    /// hollow. If `load_resolved` regresses to `ResolveScope::ForceProject`, it
+    /// reads the project shadow → the marker → this fails.
     #[serial_test::serial]
     #[test]
     fn config_load_resolved_ignores_project_darkmux_shadow() {
@@ -2255,9 +2287,8 @@ mod tests {
         unsafe { env::remove_var("DARKMUX_HOME") };
         env::set_current_dir(proj.path()).unwrap();
 
-        // Sanity: in THIS setup Auto and ForceUser genuinely diverge (Auto sees
-        // the project shadow), so the guard below actually exercises the choice.
-        let auto = crate::paths::resolve(crate::paths::ResolveScope::Auto).config;
+        // Sanity: in THIS setup the project and user scopes genuinely diverge, so the guard below actually exercises the choice.
+        let auto = crate::paths::resolve(crate::paths::ResolveScope::ForceProject).config;
         let force_user = crate::paths::resolve(crate::paths::ResolveScope::ForceUser).config;
         let cfg = DarkmuxConfig::load_resolved();
 
@@ -2270,9 +2301,9 @@ mod tests {
 
         assert_ne!(
             auto, force_user,
-            "sanity: with a project .darkmux/ and no DARKMUX_HOME, Auto must diverge from ForceUser"
+            "sanity: with a project .darkmux/ and no DARKMUX_HOME, the project scope must diverge from ForceUser"
         );
-        // The real guard: under the pre-#1323 `Auto`, load_resolved reads the
+        // The real guard: under the project scope, load_resolved reads the
         // project shadow → the marker → FAIL. Under `ForceUser` it never does.
         assert_ne!(
             cfg.machine_id.as_deref(),
@@ -2360,15 +2391,25 @@ mod tests {
     /// leftover here: it is an unknown key, which `user_files` refuses with
     /// the same rename (`config_retired_keys_name_their_replacement`).
     #[test]
-    fn renamed_leftovers_are_found_in_the_env() {
+    fn retired_env_leftovers_are_found_in_the_env() {
         let env = |k: &str| (k == "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION").then(|| "9".to_string());
-        let found = renamed_leftovers(&env);
+        let found = retired_env_leftovers(&env);
         assert_eq!(found.len(), 1);
-        assert!(found[0].line.contains("env var DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION (9) is ignored"));
+        assert!(found[0].line.contains("env var DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION (9) is refused"));
         assert!(found[0].line.contains("renamed to `remote.max_tokens_per_step`") && found[0].line.contains("500000 was darkmux's old default"));
-        assert!(renamed_leftovers(&|_| None).is_empty());
+        assert!(retired_env_leftovers(&|_| None).is_empty());
         let blank = |_: &str| Some("  ".to_string());
-        assert!(renamed_leftovers(&blank).is_empty(), "an empty env value reads as unset");
+        assert!(retired_env_leftovers(&blank).is_empty(), "an empty env value reads as unset");
+        let crew = |k: &str| (k == "DARKMUX_CREW_DIR").then(|| "/x".to_string());
+        let found = retired_env_leftovers(&crew);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].line.contains("DARKMUX_CREW_DIR") && found[0].line.contains("DARKMUX_HOME"), "{found:?}");
+        for var in ["DARKMUX_NOTEBOOK_DIR", "DARKMUX_RADIO_ROUTER_PROFILE"] {
+            let one = |k: &str| (k == var).then(|| "/x".to_string());
+            let found = retired_env_leftovers(&one);
+            assert_eq!(found.len(), 1, "{var} is a retired env var, refused with the rest: {found:?}");
+            assert!(found[0].line.contains(var), "{found:?}");
+        }
     }
 
     /// (#2914) `radio.router_profile` is REMOVED (CONFIG 1.28): routing runs

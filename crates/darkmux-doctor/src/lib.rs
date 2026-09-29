@@ -168,7 +168,6 @@ pub fn run() -> DoctorReport {
         check_redis_config(),
         check_gh_allowlist(),
         check_removed_radio_router_staffing(),
-        check_removed_notebook_settings(),
         check_renamed_budget_settings(),
         check_retired_role_leftovers(),
         check_role_skill_references(),
@@ -212,6 +211,7 @@ pub fn run() -> DoctorReport {
         check_beat33_legacy_crew_dir(),
         check_flat_mission_files(),
         check_lab_dir_location(),
+        check_ignored_project_darkmux(),
         check_mission_envelope_readability(),
     ]);
     let checks = [checks, check_enum_settings(), check_user_file_keys(), check_hooks(), eureka_checks()].concat();
@@ -396,6 +396,40 @@ fn installed_skill_content(targets: &[PathBuf], name: &str) -> Option<String> {
     None
 }
 
+/// (4.0) State in the working directory that darkmux no longer reads. Earlier
+/// releases adopted a `./.darkmux/` as the darkmux root (splitting flows, lab
+/// runs and profiles from missions) and a `./.darkmux.json` as the profile
+/// registry; 4.0 ignores both. A repo's `.darkmux/` is normal: it holds the
+/// per-repo `lessons.db` and `conventions.json`, which darkmux still reads,
+/// so only what else is in it is stranded. Warn, naming each stranded entry.
+fn check_ignored_project_darkmux() -> Check {
+    ignored_project_status(darkmux_types::paths::ignored_project_state())
+}
+
+/// Pure decision for [`check_ignored_project_darkmux`]. The `DARKMUX_HOME`
+/// relocation is offered only when the directory holds a `config.json` or
+/// `profiles.json` to relocate; a leftover registry file is moved into the root.
+fn ignored_project_status(state: Option<darkmux_types::paths::IgnoredProjectState>) -> Check {
+    let name = "project-local .darkmux".to_string();
+    let Some(state) = state else {
+        return Check { name, status: Status::Pass, message: "nothing stranded in the working directory".into(), hint: None };
+    };
+    let listed = state.stranded.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ");
+    let hint = match &state.adoptable_dir {
+        Some(dir) => format!(
+            "to use that directory as the root, run darkmux with DARKMUX_HOME={}; otherwise move what you need to ~/.darkmux (a registry is ~/.darkmux/profiles.json)",
+            dir.display()
+        ),
+        None => "move what you need to ~/.darkmux (a registry is ~/.darkmux/profiles.json) and delete the rest".into(),
+    };
+    Check {
+        name,
+        status: Status::Warn,
+        message: format!("stranded, darkmux no longer reads a project-local root or registry: {listed}"),
+        hint: Some(hint),
+    }
+}
+
 /// (4.0) Pre-#148 flat mission files: `<root>/missions/<id>.json` and
 /// `<root>/phases/<id>.json`. 4.0 deleted `mission migrate` and does not read
 /// them, so a leftover one is state the operator would otherwise lose
@@ -510,11 +544,15 @@ fn check_beat33_legacy_crew_dir() -> Check {
     // only ever named for deletion, never moved.
     let promoted_subdirs = ["roles", "missions", "phases", "crews", "skills"];
     let pins_file = "role-model-pins.json";
+    let preamble_file = darkmux_crew::loader::PREAMBLE_OVERRIDE_FILE;
     let mut present_subdirs: Vec<&str> = promoted_subdirs
         .iter()
         .filter(|s| legacy_dir.join(s).is_dir())
         .copied()
         .collect();
+    if legacy_dir.join(preamble_file).is_file() {
+        present_subdirs.push(preamble_file);
+    }
     let pins_present = legacy_dir.join(pins_file).is_file();
     present_subdirs.sort();
     let pins_note = format!(
@@ -560,7 +598,7 @@ fn check_beat33_legacy_crew_dir() -> Check {
     // Three things the emitted lines have to get right, each of which was a
     // SILENT no-op-and-exit-0 before (#1715 review):
     //
-    // - Every path is DOUBLE-QUOTED. `DARKMUX_CREW_DIR` is an operator-set
+    // - Every path is DOUBLE-QUOTED. `DARKMUX_HOME` is an operator-set
     //   path and can hold a space (`~/Library/Application Support/...`, a
     //   folder named by hand); unquoted, the `for` header word-splits into
     //   two non-matching literals, the loop body never runs, and the block
@@ -579,7 +617,10 @@ fn check_beat33_legacy_crew_dir() -> Check {
         let dest = root.join(subdir);
         let legacy = legacy_dir.display();
         let root_disp = root.display();
-        if dest.is_dir() {
+        if legacy_dir.join(subdir).is_file() {
+            script_lines.push(format!("# {subdir}: the autonomous-dispatch preamble override now lives at the root"));
+            script_lines.push(format!("mv -n \"{legacy}/{subdir}\" \"{root_disp}/{subdir}\""));
+        } else if dest.is_dir() {
             script_lines.push(format!(
                 "# {subdir}: destination directory already exists — merging entries, not \
                  moving the directory (a plain `mv` would nest it)"
@@ -627,9 +668,8 @@ fn check_beat33_legacy_crew_dir() -> Check {
              exists at the flattened destination is left where it is and the script prints a \
              `LEFTOVERS in ...` line naming the directory it stayed in — compare those two \
              copies yourself and delete the stale one. A clean run prints nothing.\n\n\
-             Note: if you set DARKMUX_CREW_DIR explicitly, this check assumes the env var \
-             points at the post-flatten root (e.g. `~/.darkmux/`), and this script's paths \
-             are computed from the env var value as-given.{pins_hint}",
+             Note: the paths above are computed from the darkmux root (`DARKMUX_HOME` when \
+             set, else `~/.darkmux`).{pins_hint}",
             script = script_lines.join("\n")
         )),
     }
@@ -1305,8 +1345,8 @@ fn check_utility_model_binding() -> Check {
 /// Pure decision for `check_utility_model_binding`, split out so every arm is
 /// unit-testable without a live LMStudio. `loaded` is `None` when the binding
 /// is set but `lms ps` couldn't be queried. (#2914) `n_ctx` is the window the
-/// binding declares (`internal.utility.n_ctx`); `None` for the bare-string
-/// form, which still works but gets nudged to declare one, since that window
+/// binding declares (`internal.utility.n_ctx`); `None` when none is declared,
+/// which still works but gets nudged to declare one, since that window
 /// is now the ONLY source of the compactor's own context (a profile entry
 /// no longer counts).
 fn utility_binding_status(
@@ -1409,7 +1449,7 @@ fn utility_binding_status(
     }
 }
 
-/// (#2914) The nudge for a bare-string binding: since #2914 the window in
+/// (#2914) The nudge for a binding that declares no window: since #2914 the window in
 /// `internal.utility` is the only source of the compactor's own context (a
 /// profile entry no longer counts), so an undeclared window falls back to
 /// the primary's for compaction and to a fixed 16K for radio routing, both
@@ -1511,49 +1551,39 @@ fn utility_in_profiles_status(registry: &darkmux_types::ProfileRegistry) -> Chec
     }
 }
 
-/// (#2914, CONFIG 1.28) The removed radio ROUTING-seat staffing that is not
-/// a config key: `role_profiles.radio-router` (a binding in the dynamic map)
-/// and the `DARKMUX_RADIO_ROUTER_PROFILE` env var. Routing runs on the
-/// machine's utility model now, so each is inert; `Warn` naming whichever are
-/// still set, with the one fix. (A leftover `radio.router_profile` key is a
-/// retired key, refused by the user-file keys row.)
+/// (#2914, CONFIG 1.28) The removed radio ROUTING-seat staffing that is not a
+/// config key or an env var: `role_profiles.radio-router`, a binding in the
+/// dynamic map. Routing runs on the machine's utility model now, so it is
+/// inert; `Warn` naming it, with the one fix. (A leftover `radio.router_profile`
+/// key is a retired key, refused by the user-file keys row, and
+/// `DARKMUX_RADIO_ROUTER_PROFILE` a retired env var, refused at CLI entry and
+/// failed by the retired-env row: both are `config::RETIRED_SETTINGS`.)
 fn check_removed_radio_router_staffing() -> Check {
     let role_binding = darkmux_types::config_access::role_profile("radio-router");
-    let env_set = std::env::var("DARKMUX_RADIO_ROUTER_PROFILE").ok().is_some_and(|s| !s.trim().is_empty());
-    removed_radio_router_staffing_status(role_binding.as_deref(), env_set)
+    removed_radio_router_staffing_status(role_binding.as_deref())
 }
 
 /// Pure decision for [`check_removed_radio_router_staffing`].
-/// A leftover `radio.router_profile` key is not this check's: it is an
-/// unknown key, which the user-file keys row fails with its removal line
-/// (`config::RETIRED_SETTINGS`).
-fn removed_radio_router_staffing_status(role_binding: Option<&str>, env_set: bool) -> Check {
+fn removed_radio_router_staffing_status(role_binding: Option<&str>) -> Check {
     let name = "radio router staffing (removed)".to_string();
-    let mut leftovers: Vec<String> = Vec::new();
-    if let Some(profile) = role_binding {
+    let Some(profile) = role_binding else {
+        return Check { name, status: Status::Pass, message: "not present".into(), hint: None };
+    };
+    Check {
+        name,
+        status: Status::Warn,
         // (C6) No CLI removes a `role_profiles` binding (`config set`
         // refuses a blank value like any other, and there is no `config
         // unset`), so this is a hand edit, the way every other removed key's
         // check says: name the file and the block.
-        leftovers.push(format!(
+        message: format!(
             "config.json binds `role_profiles.radio-router` to `{profile}` — the router has no profile; \
              delete the `radio-router` entry from the `role_profiles` block in ~/.darkmux/config.json by hand"
-        ));
-    }
-    if env_set {
-        leftovers.push("`DARKMUX_RADIO_ROUTER_PROFILE` is set in this shell — removed in CONFIG 1.28; unset it".into());
-    }
-    if leftovers.is_empty() {
-        return Check { name, status: Status::Pass, message: "not present".into(), hint: None };
-    }
-    Check {
-        name,
-        status: Status::Warn,
-        message: leftovers.join("; "),
+        ),
         hint: Some(
             "Since 4.0 (#2914) radio routing runs on the machine's utility model, declared once as \
              `internal.utility` in ~/.darkmux/profiles.json (with its `n_ctx`), never on a profile. \
-             None of these settings has any effect; a profile that existed only for the router can \
+             This binding has no effect; a profile that existed only for the router can \
              be deleted. The answering seat is still staffed by `radio.answerer_profile` / \
              `role_profiles.radio-host`."
                 .into(),
@@ -2049,6 +2079,9 @@ fn user_file_hint(p: &darkmux_types::user_files::FileProblem) -> String {
         Problem::Keys(keys) if keys.iter().any(|k| matches!(k.issue, Issue::WrongType { .. } | Issue::Missing { .. })) => {
             format!("fix each value named and add each missing key; until then {unloaded}")
         }
+        Problem::Keys(keys) if keys.iter().any(|k| matches!(k.issue, Issue::Removed(_))) => {
+            format!("make each rewrite named (and rename or delete any other key listed); until then {unloaded}")
+        }
         Problem::Keys(_) => "rename each key to the valid one named, or delete it; until then it does nothing".to_string(),
     }
 }
@@ -2291,59 +2324,28 @@ fn resolved_config_path() -> std::path::PathBuf {
     darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).config
 }
 
-/// (#2902 step 5) Settings RENAMED in 4.0 with no alias
-/// (`darkmux_types::config::RENAMED_SETTINGS`: the per-step cap's
-/// `remote.max_tokens_per_execution` -> `remote.max_tokens_per_step`). A
-/// leftover old env var is read by nothing: named with the rename and what to
-/// do. Warn, not Fail: nothing refuses to run. A leftover old `config.json`
-/// key is an unknown key, which the user-file keys row fails.
+/// Settings RENAMED or RETIRED in 4.0 with no alias
+/// (`darkmux_types::config::RENAMED_SETTINGS` / `RETIRED_SETTINGS`: the
+/// per-step cap's `remote.max_tokens_per_execution`, `DARKMUX_CREW_DIR`). A
+/// leftover env var is read by nothing and every command but `doctor` and `config` refuses it, so this
+/// row fails, naming the replacement. A leftover old `config.json` key is an
+/// unknown key, which the user-file keys row fails.
 fn check_renamed_budget_settings() -> Check {
     renamed_settings_status(&|k| std::env::var(k).ok())
 }
 
 /// Pure decision for [`check_renamed_budget_settings`].
 fn renamed_settings_status(env: &dyn Fn(&str) -> Option<String>) -> Check {
-    let name = "renamed settings (4.0)";
-    let leftovers = darkmux_types::config::renamed_leftovers(env);
+    let name = "retired env vars (4.0)";
+    let leftovers = darkmux_types::config::retired_env_leftovers(env);
     if leftovers.is_empty() {
         return Check { name: name.into(), status: Status::Pass, message: "none present".into(), hint: None };
     }
     Check {
         name: name.into(),
-        status: Status::Warn,
+        status: Status::Fail,
         message: leftovers.iter().map(|l| l.line.clone()).collect::<Vec<_>>().join("; "),
-        hint: Some("Nothing reads the old names; remove the old env var from your shell rc.".into()),
-    }
-}
-
-/// (#2913, 4.0) `DARKMUX_NOTEBOOK_DIR` is removed: `lab notebook
-/// draft`/`list` retired outright in 4.0, replaced by the bundled
-/// `darkmux-lab-notebook` skill, which writes the entry wherever the
-/// operator's own instructions say. The env var is read by nothing, so this
-/// is the one place an operator learns it is dead. (A leftover
-/// `dirs.notebook` key in `config.json` is an unknown key, which the
-/// user-file keys row fails with its removal line.)
-///
-/// `Pass` when it is unset; `Warn` with the removal step when it is set. An
-/// empty value reads as unset, matching every other env-tier accessor.
-fn check_removed_notebook_settings() -> Check {
-    let name = "DARKMUX_NOTEBOOK_DIR (removed)";
-    let env_set = std::env::var("DARKMUX_NOTEBOOK_DIR")
-        .ok()
-        .is_some_and(|s| !s.trim().is_empty());
-    if !env_set {
-        return Check { name: name.into(), status: Status::Pass, message: "not present".into(), hint: None };
-    }
-    Check {
-        name: name.into(),
-        status: Status::Warn,
-        message: "`DARKMUX_NOTEBOOK_DIR` is exported — removed in 4.0 (#2913); nothing reads it".into(),
-        hint: Some(
-            "unset DARKMUX_NOTEBOOK_DIR (remove the export from your shell rc). The notebook verbs retired \
-             in 4.0; the bundled `darkmux-lab-notebook` skill (installed by `darkmux init`) drafts an entry \
-             from `darkmux run stats <run-id> --json` and writes it wherever your own instructions say"
-                .into(),
-        ),
+        hint: Some("Nothing reads the old names and darkmux refuses to start with them set; remove the export from your shell rc.".into()),
     }
 }
 
@@ -2417,9 +2419,8 @@ fn check_role_skill_references() -> Check {
 /// retired with `mission propose` and `lab notebook`. A user-tier copy of
 /// either (a `.json` override or a `.md` prompt left in `<root>/roles/`) is
 /// not inert: the `.json` still loads as a user role and shows in `darkmux
-/// role list`, though nothing in darkmux dispatches it. Same shape as
-/// `check_removed_notebook_settings`: `Pass` when none is present, `Warn`
-/// naming each file with the removal step.
+/// role list`, though nothing in darkmux dispatches it. `Pass` when none is present,
+/// `Warn` naming each file with the removal step.
 fn check_retired_role_leftovers() -> Check {
     let name = "retired roles (mission-compiler, scribe)";
     let dir = darkmux_crew::loader::user_roles_dir();
@@ -3699,7 +3700,7 @@ fn check_thermal_governor() -> Option<Check> {
 /// deliberately kept is not a defect, and deciding when evidence has
 /// served its purpose is the operator's call (#44), not doctor's.
 fn check_quarantined_mirrors() -> Check {
-    let workspaces = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::Auto)
+    let workspaces = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser)
         .root
         .join("workspaces");
     quarantined_mirrors_check_at(&workspaces)
@@ -3947,23 +3948,18 @@ fn check_remote_endpoint_credentials() -> Check {
     let mut problems: Vec<String> = Vec::new();
     let mut checked = 0usize;
 
-    // (#2902 step 4) A named endpoint is checked once, under its id; an
-    // inline one per model that declares it.
+    // A named endpoint is checked once, under its id.
     let mut seen_named: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for (profile_name, profile) in &registry.registry.profiles {
+    for profile in registry.registry.profiles.values() {
         for model in &profile.models {
             let Some(ep) = model.endpoint.as_ref() else {
                 continue;
             };
-            let subject = match ep.named_id() {
-                Some(id) => {
-                    if !seen_named.insert(id.to_string()) {
-                        continue;
-                    }
-                    format!("endpoint `{id}`")
-                }
-                None => format!("profile `{profile_name}` model `{}`", model.id),
-            };
+            let Some(id) = ep.named_id() else { continue };
+            if !seen_named.insert(id.to_string()) {
+                continue;
+            }
+            let subject = format!("endpoint `{id}`");
             let Some(auth) = ep.auth.as_ref() else {
                 continue;
             };
@@ -4046,8 +4042,8 @@ fn keychain_item_present(name: &str) -> bool {
 
 /// (#2902 steps 4 and 5) `endpoints`: what the registry's `endpoints` map
 /// declares, one line per endpoint (what darkmux does there, the request
-/// dialect, where the credential lives by NAME, its limits and its budget),
-/// and the move to name each inline endpoint by id. For a budget that
+/// dialect, where the credential lives by NAME, its limits and its budget).
+/// For a budget that
 /// counts, the line shows its policy and the spend so far in its rolling
 /// window (this machine's usage records, read through the same window
 /// reader the gate uses). An unregistered budget `policy` is Fail: every
@@ -4169,52 +4165,12 @@ fn endpoints_status(
         let budget = endpoint_budget_note(id, ep, spend);
         lines.push(format!("`{id}`: {kind}, {dialect}, {credential}{limits}{budget}"));
     }
-    let mut advice: Vec<String> = registry
-        .validate()
-        .into_iter()
-        .filter(|i| i.severity == darkmux_types::IssueSeverity::Advice)
-        .map(|i| i.message)
-        .collect();
-    // (#2902 step 5) A window budget on an INLINE endpoint is not enforced:
-    // its usage records carry no `endpoints` id to sum by.
-    for (pname, profile) in &registry.profiles {
-        for m in &profile.models {
-            let Some(ep) = m.endpoint.as_ref().filter(|e| e.source == darkmux_types::EndpointSource::Inline) else {
-                continue;
-            };
-            if ep.known_limits().and_then(|l| l.window.as_ref()).is_some_and(|w| w.is_set()) {
-                advice.push(format!(
-                    "profile \"{pname}\" model \"{}\" sets a window budget on an inline endpoint, which is \
-                     not enforced: a budget is summed by `endpoints` id, so declare the endpoint there",
-                    m.id
-                ));
-            }
-        }
-    }
     let listed = if lines.is_empty() {
         "no `endpoints` declared".to_string()
     } else {
         format!("{} endpoint(s): {}", lines.len(), lines.join("; "))
     };
-    // (#2902 review C6) Advice, not a warning: an inline endpoint works, so
-    // the check passes and names the move instead of flagging every
-    // working pre-4.0 config.
-    if advice.is_empty() {
-        Check { name, status: Status::Pass, message: listed, hint: None }
-    } else {
-        Check {
-            name,
-            status: Status::Pass,
-            message: format!("{listed}; advice: {}", advice.join("; ")),
-            hint: Some(
-                "Inline `endpoint` objects still work. Declaring each endpoint once under the \
-                 top-level `endpoints` map and naming it by id (`\"endpoint\": \"<id>\"`) keeps \
-                 its url, auth and limits in one place for every profile that uses it, and is \
-                 what lets its window budget be enforced. (#2902)"
-                    .into(),
-            ),
-        }
-    }
+    Check { name, status: Status::Pass, message: listed, hint: None }
 }
 
 /// (#1177) Live endpoint probes — NOT part of [`run`]'s offline check set.
@@ -4566,7 +4522,7 @@ fn check_crew_role_prompt_coverage() -> Check {
 /// nobody's manifest currently references would otherwise go unchecked
 /// forever).
 fn check_rules_registry() -> Check {
-    let user_dir = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::Auto)
+    let user_dir = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser)
         .root
         .join("rules");
     build_rules_check(Some(&user_dir))
@@ -5820,23 +5776,14 @@ fn check_profile_registry() -> Check {
             //   2. (#2902 step 4) every error `ProfileRegistry::validate`
             //      finds — the ONE place the registry's rules live: managed
             //      models missing `n_ctx`, endpoints that cannot work as
-            //      written, and ids no `endpoints` entry defines. (Its advice,
-            //      inline endpoints to move to an id, is the `endpoints`
-            //      check's.)
+            //      written, and ids no `endpoints` entry defines.
             let mut findings: Vec<String> = loaded
                 .registry
                 .quarantined
                 .iter()
                 .map(|q| format!("quarantined {} \"{}\": {}", q.kind, q.name, q.error))
                 .collect();
-            findings.extend(
-                loaded
-                    .registry
-                    .validate()
-                    .into_iter()
-                    .filter(|i| i.severity == darkmux_types::IssueSeverity::Error)
-                    .map(|i| i.message),
-            );
+            findings.extend(loaded.registry.validate());
 
             if findings.is_empty() {
                 Check {
@@ -9242,56 +9189,6 @@ mod tests {
         }
     }
 
-    // ─── (#2913, 4.0) check_removed_notebook_settings — the removed env var ─
-
-    /// Runs `check_removed_notebook_settings` with `DARKMUX_NOTEBOOK_DIR`
-    /// pinned to `env_value`, restored after the call.
-    fn notebook_settings_check(env_value: Option<&str>) -> Check {
-        let prev_nb = std::env::var("DARKMUX_NOTEBOOK_DIR").ok();
-        unsafe {
-            match env_value {
-                Some(v) => std::env::set_var("DARKMUX_NOTEBOOK_DIR", v),
-                None => std::env::remove_var("DARKMUX_NOTEBOOK_DIR"),
-            }
-        }
-        let check = check_removed_notebook_settings();
-        unsafe {
-            match prev_nb {
-                Some(v) => std::env::set_var("DARKMUX_NOTEBOOK_DIR", v),
-                None => std::env::remove_var("DARKMUX_NOTEBOOK_DIR"),
-            }
-        }
-        check
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn check_removed_notebook_settings_passes_when_unset() {
-        let check = notebook_settings_check(None);
-        assert_eq!(check.status, Status::Pass, "{}", check.message);
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn check_removed_notebook_settings_warns_on_leftover_env_var() {
-        let check = notebook_settings_check(Some("/tmp/nb"));
-        assert_eq!(check.status, Status::Warn, "{}", check.message);
-        assert!(check.message.contains("DARKMUX_NOTEBOOK_DIR"), "names the var: {}", check.message);
-        let hint = check.hint.expect("a removal step");
-        assert!(hint.contains("unset DARKMUX_NOTEBOOK_DIR"), "the exact change: {hint}");
-        assert!(hint.contains("darkmux-lab-notebook"), "names the replacement: {hint}");
-    }
-
-    /// An empty env value is "unset", the same reading every other env-tier
-    /// accessor gives it — a stale `export DARKMUX_NOTEBOOK_DIR=` must not
-    /// warn.
-    #[serial_test::serial]
-    #[test]
-    fn check_removed_notebook_settings_treats_empty_env_as_unset() {
-        let check = notebook_settings_check(Some("  "));
-        assert_eq!(check.status, Status::Pass, "{}", check.message);
-    }
-
     // ─── (#2653) check_liveness_retention ───
 
     #[serial_test::serial]
@@ -9405,86 +9302,6 @@ mod tests {
                 check.hint
             );
         });
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn check_liveness_retention_never_diverges_from_the_writer_dir_via_project_local_darkmux() {
-        // (#2653 MUST FIX 3) Before the fix, this check read
-        // `config_access::liveness_dir()`, which resolved through
-        // `paths::resolve(Auto)` — auto-detecting a project-local
-        // `./.darkmux` (a supported layout `lab run`/`lab fixture` create).
-        // `dispatch_liveness` (the actual WRITER) never does that
-        // auto-detect. So with a project-local `.darkmux/` in cwd, doctor
-        // read/counted the WRONG directory (a decoy file below) while the
-        // real liveness dir — where every heartbeat actually lands — grew
-        // unpruned and unseen underneath a "Pass".
-        let proj = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(proj.path().join(".darkmux").join("liveness")).unwrap();
-        std::fs::write(proj.path().join(".darkmux").join("liveness").join("999999.log"), "decoy")
-            .unwrap();
-
-        let prev_home = std::env::var("DARKMUX_HOME").ok();
-        let prev_cwd = std::env::current_dir().unwrap();
-        unsafe { std::env::remove_var("DARKMUX_HOME") };
-        std::env::set_current_dir(proj.path()).unwrap();
-
-        // Sanity: Auto really does diverge from the writer's own resolution
-        // in this setup, so the guard below exercises the actual choice.
-        let auto_dir =
-            darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::Auto).root.join("liveness");
-        // The writer's dir here is the FIXED test-isolation scratch path
-        // (#2653 MUST FIX 1) — shared with every other test in this binary
-        // that also runs with `DARKMUX_HOME` unset, so count by DELTA
-        // rather than an absolute number to stay deterministic under
-        // parallel/repeated runs. A pid-derived filename keeps this run's
-        // own marker distinguishable, and it is removed again below.
-        let writer_dir = darkmux_types::dispatch_liveness::liveness_dir();
-        std::fs::create_dir_all(&writer_dir).unwrap();
-        let baseline = count_pid_log_files(&writer_dir);
-        let marker = writer_dir.join(format!("{}.log", std::process::id()));
-        std::fs::write(&marker, "hi").unwrap();
-
-        let check = check_liveness_retention();
-        let after = count_pid_log_files(&writer_dir);
-        let _ = std::fs::remove_file(&marker);
-
-        // Restore env/cwd FIRST so a failed assert can't poison other
-        // serial tests.
-        std::env::set_current_dir(&prev_cwd).unwrap();
-        unsafe {
-            match prev_home {
-                Some(h) => std::env::set_var("DARKMUX_HOME", h),
-                None => std::env::remove_var("DARKMUX_HOME"),
-            }
-        }
-
-        assert_ne!(
-            auto_dir, writer_dir,
-            "sanity: a project-local .darkmux/ must actually diverge from the writer's dir here"
-        );
-        assert!(
-            check.message.contains(&writer_dir.display().to_string()),
-            "doctor must report the WRITER's directory, not the project-local one: {}",
-            check.message
-        );
-        assert_eq!(
-            after,
-            baseline + 1,
-            "doctor must count the writer's dir (one marker added), not the project-local decoy: {}",
-            check.message
-        );
-    }
-
-    /// Same `.log` + pid-named-stem filter `check_liveness_retention` itself
-    /// applies, for tests that need to compute a baseline/delta rather than
-    /// an absolute count against the shared test-isolation scratch dir.
-    fn count_pid_log_files(dir: &std::path::Path) -> usize {
-        std::fs::read_dir(dir)
-            .map(|entries| {
-                entries.filter_map(|e| e.ok()).filter(|e| darkmux_types::dispatch_liveness::is_pid_log_file(&e.path())).count()
-            })
-            .unwrap_or(0)
     }
 
     // ─── (#2413) check_host_sampler — singleton lock Pass/Warn/Warn ───
@@ -11674,15 +11491,15 @@ mod tests {
         r
     }
 
-    /// (#2902 step 5) A leftover old budget env var is named with its exact
+    /// A leftover renamed or retired env var fails, named with its exact
     /// rename; nothing set passes. (A leftover old `config.json` key is an
     /// unknown key, failed by the user-file keys row.)
     #[test]
     fn renamed_budget_settings_are_named_with_the_exact_rename() {
         let env = |k: &str| (k == "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION").then(|| "5".to_string());
         let c = renamed_settings_status(&env);
-        assert_eq!(c.status, Status::Warn, "{}", c.message);
-        assert!(c.message.contains("env var DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION (5) is ignored"), "{}", c.message);
+        assert_eq!(c.status, Status::Fail, "{}", c.message);
+        assert!(c.message.contains("env var DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION (5) is refused"), "{}", c.message);
         assert!(
             c.message.contains("delete it unless you chose that number (500000 was darkmux's old default)"),
             "{}",
@@ -11690,6 +11507,15 @@ mod tests {
         );
         assert!(c.message.contains("set remote.max_tokens_per_step only if you want one"), "{}", c.message);
         assert_eq!(renamed_settings_status(&|_| None).status, Status::Pass);
+    }
+
+    /// A set `DARKMUX_CREW_DIR` (retired) fails, naming `DARKMUX_HOME`.
+    #[test]
+    fn a_set_crew_dir_fails_naming_darkmux_home() {
+        let env = |k: &str| (k == "DARKMUX_CREW_DIR").then(|| "/somewhere".to_string());
+        let c = renamed_settings_status(&env);
+        assert_eq!(c.status, Status::Fail, "{}", c.message);
+        assert!(c.message.contains("DARKMUX_CREW_DIR") && c.message.contains("DARKMUX_HOME"), "{}", c.message);
     }
 
     fn no_spend(_: &darkmux_crew::budget::EndpointBudget) -> darkmux_crew::budget::WindowEntries {
@@ -11773,17 +11599,6 @@ mod tests {
         let c = endpoints_status(&zero, &mut |_| panic!("a refused budget must not read the window"));
         assert_eq!(c.status, Status::Fail, "{}", c.message);
         assert!(c.message.contains("limits.window.tokens is 0") && c.message.contains("set policy off"), "{}", c.message);
-    }
-
-    /// (#2902 step 4) An inline endpoint still works; doctor names the move.
-    #[test]
-    fn endpoints_check_names_the_move_from_inline_to_an_id() {
-        let r = materialized(r#"{"profiles":{"p":{"models":[{"id":"grok-4","endpoint":{"url":"https://api.x.ai/v1"}}]}}}"#);
-        let c = endpoints_status(&r, &mut no_spend);
-        assert_eq!(c.status, Status::Pass, "advice, not a warning, for a working inline endpoint");
-        assert!(c.message.contains("advice: "), "{}", c.message);
-        assert!(c.message.contains("move the object to `endpoints.\"api.x.ai\"`"), "{}", c.message);
-        assert!(c.hint.as_deref().is_some_and(|h| h.contains("still work")));
     }
 
     #[test]
@@ -11876,7 +11691,8 @@ mod tests {
         // Every check should appear regardless of environment — even if the
         // underlying probe couldn't read state.
         // 65 with #2902's endpoints check, plus three 4.0 retirement checks:
-        // (#2913) `check_removed_notebook_settings`, and (#2912/#2913 review)
+        // (#2913) the notebook env-var check (since folded into the retired-env
+        // row), and (#2912/#2913 review)
         // `check_retired_role_leftovers` and `check_role_skill_references`.
         // (#2928) 69: `check_live_channel` joined the static array.
         //
@@ -11906,6 +11722,10 @@ mod tests {
         // doctor shows the read posture and the execution posture.
         //
         // (4.0 one run noun) 68: `check_lab_dir_location` joined.
+        //
+        // (4.0 project-local) `check_ignored_project_darkmux` joined and
+        // `check_removed_notebook_settings` left (its env var is a
+        // `RETIRED_SETTINGS` entry the retired-env row reports): net zero.
         let expected =
             68 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
@@ -12440,21 +12260,11 @@ mod tests {
     /// probe destination that resolves outside the isolated root fails
     /// this test with that destination named.
     ///
-    /// **Why it used to be backwards.** The previous cut set only
-    /// `DARKMUX_HOME` and then asserted `missions_dir()` landed under it.
-    /// But `user_state_root()` resolves `crew_dir_override()` — that is,
-    /// `env(DARKMUX_CREW_DIR) > config.dirs.crew` — BEFORE `DARKMUX_HOME`
-    /// ever gets a look in. So the assertion was correct and the setup was
-    /// not: anyone who had exported a scratch `DARKMUX_CREW_DIR`, which is
-    /// the careful thing to do and what agent sessions are told to do, got
-    /// a red suite for doing it right, while anyone who exported nothing
-    /// got a green one INCLUDING in the case the guard exists to catch. A
-    /// suite run with `DARKMUX_CREW_DIR` exported wrote 102 mission
-    /// directories into a real board and reported 98 passed.
-    ///
-    /// The fix is to neutralize every override that outranks the root,
-    /// enumerated from the resolvers rather than from memory — which is
-    /// exactly what `IsolatedState` is, so this test simply holds one.
+    /// **Why it holds an `IsolatedState`.** Setting only `DARKMUX_HOME` and
+    /// asserting `missions_dir()` landed under it is correct for the root but
+    /// silent about every override that outranks it. Neutralizing those,
+    /// enumerated from the resolvers rather than from memory, is exactly
+    /// what `IsolatedState` is, so this test simply holds one.
     ///
     /// **The residual it also measures.** Six destinations have no env
     /// tier at all — `hooks_outbox_dir()` and `hooks_adapters_dir()` are
@@ -12515,7 +12325,7 @@ mod tests {
             ("liveness heartbeats", ca::liveness_dir()),
             ("host-sampler lock", ca::host_sampler_lock_path()),
             ("cache", ca::cache_dir()),
-            // ── crew/user state: `DARKMUX_CREW_DIR` OUTRANKS the root ──
+            // ── crew/user state: the root itself ──
             ("crew user-state root", darkmux_crew::loader::user_state_root()),
             ("mission/phase state", darkmux_crew::loader::missions_dir()),
             ("phase state", darkmux_crew::loader::phases_dir()),
@@ -12541,9 +12351,9 @@ mod tests {
                 ca::identity_path_override().unwrap_or_else(|| state.join("identity.md")),
             ),
             // ── the root's own files ──
-            ("config.json", darkmux_types::paths::resolve(Default::default()).config),
-            ("profiles.json", darkmux_types::paths::resolve(Default::default()).profiles),
-            ("sandboxes", darkmux_types::paths::resolve(Default::default()).sandboxes),
+            ("config.json", darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).config),
+            ("profiles.json", darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).profiles),
+            ("sandboxes", darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).sandboxes),
         ];
 
         // Hold the LIST before iterating it. A loop over `resolved` can
@@ -12738,7 +12548,7 @@ mod tests {
             let _ = darkmux_crew::loader::missions_dir();
             let _ = darkmux_crew::loader::phases_dir();
             let _ = darkmux_crew::lessons::global_db_path();
-            let _ = darkmux_types::paths::resolve(Default::default());
+            let _ = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser);
         }
 
         // SAFETY: #[serial].
@@ -12819,7 +12629,7 @@ mod tests {
     #[test]
     fn utility_in_profiles_warns_naming_each_profile_and_the_fix() {
         let registry: darkmux_types::ProfileRegistry = serde_json::from_value(serde_json::json!({
-            "internal": { "utility": "util-4b" },
+            "internal": { "utility": { "id": "util-4b" } },
             "profiles": {
                 "deep": { "models": [{ "id": "primary-big", "n_ctx": 262144 }, { "id": "darkmux:util-4b", "n_ctx": 120000 }] },
                 "radio": { "models": [{ "id": "util-4b", "n_ctx": 16000 }] },
@@ -12855,8 +12665,9 @@ mod tests {
         let registry: darkmux_types::ProfileRegistry = serde_json::from_value(serde_json::json!({
             "internal": { "utility": { "id": "util-4b", "n_ctx": 120000 } },
             "profiles": {
-                "hosted": { "models": [{ "id": "util-4b", "endpoint": { "url": "https://provider.example/v1" } }] }
-            }
+                "hosted": { "models": [{ "id": "util-4b", "endpoint": "provider" }] }
+            },
+            "endpoints": { "provider": { "url": "https://provider.example/v1" } }
         }))
         .unwrap();
         let c = super::utility_in_profiles_status(&registry);
@@ -12868,44 +12679,35 @@ mod tests {
     /// and names the path, the way every other removed key's check does.
     #[test]
     fn removed_radio_router_binding_says_to_edit_config_json_by_hand() {
-        let c = super::removed_radio_router_staffing_status(Some("radio"), false);
+        let c = super::removed_radio_router_staffing_status(Some("radio"));
         assert!(c.message.contains("~/.darkmux/config.json"), "names the file: {}", c.message);
         assert!(c.message.contains("by hand"), "{}", c.message);
     }
 
-    /// (#2914) The removed routing-seat staffing: `role_profiles.radio-router`
-    /// and the `DARKMUX_RADIO_ROUTER_PROFILE` env var each get named, with
-    /// the fix; nothing set is a Pass. (A leftover `radio.router_profile` key
-    /// is an unknown key, failed by the user-file keys row.)
+    /// (#2914) The removed routing-seat binding `role_profiles.radio-router` is
+    /// named with the fix; nothing set is a Pass.
     #[test]
-    fn removed_radio_router_staffing_names_each_leftover() {
-        let c = super::removed_radio_router_staffing_status(None, false);
+    fn removed_radio_router_staffing_names_the_leftover_binding() {
+        let c = super::removed_radio_router_staffing_status(None);
         assert_eq!(c.status, Status::Pass, "{}", c.message);
 
-        let c = super::removed_radio_router_staffing_status(Some("radio"), false);
+        let c = super::removed_radio_router_staffing_status(Some("radio"));
         assert_eq!(c.status, Status::Warn);
         assert!(c.message.contains("role_profiles.radio-router") && c.message.contains("radio"), "{}", c.message);
-
-        let c = super::removed_radio_router_staffing_status(None, true);
-        assert_eq!(c.status, Status::Warn);
-        assert!(c.message.contains("DARKMUX_RADIO_ROUTER_PROFILE"), "{}", c.message);
-
-        let c = super::removed_radio_router_staffing_status(Some("radio"), true);
         let hint = c.hint.clone().unwrap_or_default();
-        assert!(hint.contains("internal.utility"), "the fix, once: {hint}");
-        assert!(c.message.matches("radio").count() >= 2, "every leftover named: {}", c.message);
+        assert!(hint.contains("internal.utility"), "the fix: {hint}");
     }
 
     /// (#2914) The binding check reports the declared window, and points a
-    /// bare-string binding at declaring one.
+    /// binding with no window at declaring one.
     #[test]
-    fn utility_binding_reports_its_window_and_nudges_a_bare_binding() {
+    fn utility_binding_reports_its_window_and_nudges_one_with_no_window() {
         let loaded = vec![lm("darkmux:util-4b", "util-4b")];
         let c = super::utility_binding_status(Some("util-4b"), Some(120_000), Some(&loaded));
         assert_eq!(c.status, Status::Pass);
         assert!(c.message.contains("120000"), "{}", c.message);
         let c = super::utility_binding_status(Some("util-4b"), None, Some(&loaded));
-        assert_eq!(c.status, Status::Pass, "a bare binding still works: {}", c.message);
+        assert_eq!(c.status, Status::Pass, "a binding with no window still works: {}", c.message);
         assert!(
             c.hint.clone().unwrap_or_default().contains("n_ctx"),
             "but the hint says to declare the window: {:?}",
@@ -13220,7 +13022,7 @@ mod tests {
     #[test]
     fn unreachable_residents_utility_binding_counts_as_addressable() {
         let mut registry = registry_with(&[("balanced", &[("qwen/qwen3.8-27b", None)])]);
-        registry.internal = Some(darkmux_types::RegistryInternal { utility: Some(darkmux_types::UtilityBinding::id("util-4b")) });
+        registry.internal = Some(darkmux_types::RegistryInternal { utility: Some(darkmux_types::UtilityBinding { id: "util-4b".into(), ..Default::default() }) });
         let loaded = vec![
             lm("darkmux:qwen/qwen3.8-27b", "qwen/qwen3.8-27b"),
             lm("darkmux:util-4b", "util-4b"),
@@ -13682,14 +13484,96 @@ mod tests {
             .contains("darkmux serve"));
     }
 
+    /// Runs `check_ignored_project_darkmux` from a fresh cwd holding `files`
+    /// (paths relative to it; a trailing `/` makes a directory), with
+    /// `DARKMUX_HOME` set to `home_rel` under it when given.
+    fn ignored_project_check(files: &[&str], home_rel: Option<&str>) -> Check {
+        let tmp = tempfile::TempDir::new().unwrap();
+        for f in files {
+            let path = tmp.path().join(f);
+            if f.ends_with('/') {
+                std::fs::create_dir_all(&path).unwrap();
+            } else {
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, "{}").unwrap();
+            }
+        }
+        let prev_cwd = std::env::current_dir().unwrap();
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        unsafe {
+            match home_rel {
+                Some(h) => std::env::set_var("DARKMUX_HOME", tmp.path().join(h)),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+        std::env::set_current_dir(tmp.path()).unwrap();
+        let check = check_ignored_project_darkmux();
+        std::env::set_current_dir(prev_cwd).unwrap();
+        unsafe {
+            match prev_home {
+                Some(h) => std::env::set_var("DARKMUX_HOME", h),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+        check
+    }
+
+    /// A repo's `.darkmux/` holding only what darkmux still reads there
+    /// (`lessons.db`, `conventions.json`) is a normal state, not a warning.
+    #[serial_test::serial]
+    #[test]
+    fn a_repo_darkmux_dir_holding_only_per_repo_files_is_a_pass() {
+        let c = ignored_project_check(&[".darkmux/lessons.db", ".darkmux/conventions.json"], None);
+        assert_eq!(c.status, Status::Pass, "{}", c.message);
+    }
+
+    /// Anything else in a cwd `.darkmux/` is stranded: the warning names it,
+    /// and offers the `DARKMUX_HOME` relocation only when it holds a
+    /// `config.json` or `profiles.json` to relocate.
+    #[serial_test::serial]
+    #[test]
+    fn stranded_project_contents_are_named_and_relocation_is_offered_only_for_root_files() {
+        let c = ignored_project_check(&[".darkmux/lessons.db", ".darkmux/roles/x.json"], None);
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.message.contains("roles"), "names the stranded entry: {}", c.message);
+        assert!(!c.message.contains("lessons.db"), "the per-repo file is not stranded: {}", c.message);
+        assert!(c.hint.as_deref().is_some_and(|h| !h.contains("DARKMUX_HOME=")), "{:?}", c.hint);
+
+        let c = ignored_project_check(&[".darkmux/config.json"], None);
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.hint.as_deref().is_some_and(|h| h.contains("DARKMUX_HOME=")), "{:?}", c.hint);
+    }
+
+    /// A cwd `./.darkmux.json` (the old project-local registry) is ignored
+    /// too, and named.
+    #[serial_test::serial]
+    #[test]
+    fn a_cwd_dot_darkmux_json_registry_is_named_as_ignored() {
+        let c = ignored_project_check(&[".darkmux.json"], None);
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.message.contains(".darkmux.json"), "{}", c.message);
+        assert!(c.hint.as_deref().is_some_and(|h| h.contains("profiles.json")), "{:?}", c.hint);
+    }
+
+    /// `DARKMUX_HOME` pointing at the cwd's `.darkmux` makes it the root, so
+    /// nothing in it is stranded; no directory at all is a Pass too.
+    #[serial_test::serial]
+    #[test]
+    fn a_project_dir_adopted_via_darkmux_home_or_absent_is_a_pass() {
+        let adopted = ignored_project_check(&[".darkmux/config.json"], Some(".darkmux"));
+        assert_eq!(adopted.status, Status::Pass, "{}", adopted.message);
+        let absent = ignored_project_check(&[], None);
+        assert_eq!(absent.status, Status::Pass, "{}", absent.message);
+    }
+
     // ─── check_beat33_legacy_crew_dir ─────────────────────────────────
     //
     // The doctor check detects an operator on the pre-Beat-33
     // `<root>/crew/{subdirs}` layout and emits an mv-script. Tests run
-    // serially because they mutate DARKMUX_CREW_DIR — the env var is
+    // serially because they mutate DARKMUX_HOME — the env var is
     // process-global.
 
-    /// RAII: redirect DARKMUX_CREW_DIR to a TempDir for the test's duration.
+    /// RAII: redirect the darkmux root (DARKMUX_HOME) to a TempDir for the test's duration.
     struct CrewRootGuard {
         prev: Option<String>,
         _tmp: tempfile::TempDir,
@@ -13714,10 +13598,10 @@ mod tests {
             let tmp = tempfile::TempDir::new().expect("tempdir");
             let root = pick(tmp.path());
             std::fs::create_dir_all(&root).expect("crew root");
-            let prev = std::env::var("DARKMUX_CREW_DIR").ok();
+            let prev = std::env::var("DARKMUX_HOME").ok();
             // SAFETY: tests using this guard MUST be #[serial].
             unsafe {
-                std::env::set_var("DARKMUX_CREW_DIR", &root);
+                std::env::set_var("DARKMUX_HOME", &root);
             }
             Self { prev, _tmp: tmp, root }
         }
@@ -13732,8 +13616,8 @@ mod tests {
             // SAFETY: tests using this guard MUST be #[serial].
             unsafe {
                 match &self.prev {
-                    Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-                    None => std::env::remove_var("DARKMUX_CREW_DIR"),
+                    Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                    None => std::env::remove_var("DARKMUX_HOME"),
                 }
             }
         }
@@ -13945,6 +13829,20 @@ mod tests {
         // no longer read, not that it keeps working. Strip newlines before
         // substring-matching so rewrapping doesn't move the goalposts.
         assert!(hint.replace('\n', " ").contains("darkmux no longer reads"));
+    }
+
+    /// (4.0) A preamble override left under `<root>/crew/` is state darkmux
+    /// stopped reading (it lives at the root now): Fail, with a move line.
+    #[serial_test::serial]
+    #[test]
+    fn beat33_names_a_preamble_override_left_under_crew() {
+        let guard = CrewRootGuard::new();
+        std::fs::create_dir_all(guard.path().join("crew")).unwrap();
+        std::fs::write(guard.path().join("crew").join("AUTONOMOUS_DISPATCH_PREAMBLE.md"), "x").unwrap();
+        let check = check_beat33_legacy_crew_dir();
+        assert_eq!(check.status, Status::Fail, "{}", check.message);
+        let hint = check.hint.expect("a move line");
+        assert!(hint.contains("mv -n") && hint.contains("AUTONOMOUS_DISPATCH_PREAMBLE.md"), "{hint}");
     }
 
     /// (4.0) A `crew/` holding ONLY the retired `role-model-pins.json` is
@@ -14922,8 +14820,9 @@ mod tests {
         std::fs::write(
             &config_path,
             r#"{"profiles":{"cloud":{"models":[
-                    {"id":"gpt-4o","endpoint":{"url":"https://example.azure.com/openai"}}
-                ]}}}"#,
+                    {"id":"gpt-4o","endpoint":"azure"}
+                ]}},
+                "endpoints":{"azure":{"url":"https://example.azure.com/openai"}}}"#,
         )
         .unwrap();
 
@@ -14964,10 +14863,11 @@ mod tests {
                     "models": [{
                         "id": "proxy-model",
                         "n_ctx": 32768,
-                        "endpoint": { "url": "http://localhost:8080/v1" }
+                        "endpoint": "proxy"
                     }]
                 }
-            }
+            },
+            "endpoints": { "proxy": { "url": "http://localhost:8080/v1" } }
         }"#;
         std::fs::write(&config_path, registry_json).unwrap();
 
@@ -14986,20 +14886,20 @@ mod tests {
                     "models": [{
                         "id": "gpt-4o",
                         "n_ctx": 128000,
-                        "endpoint": {
-                            "url": "https://x.cognitiveservices.azure.com/openai/deployments/gpt-4o",
-                            "auth": { "type": "api-key" }
-                        }
+                        "endpoint": "azure"
                     }]
                 }
-            }
+            },
+            "endpoints": { "azure": {
+                "url": "https://x.cognitiveservices.azure.com/openai/deployments/gpt-4o",
+                "auth": { "type": "api-key" }
+            } }
         }"#;
         std::fs::write(&config_path, registry_json).unwrap();
 
         let check = check_remote_endpoint_credentials();
         assert_eq!(check.status, Status::Warn);
-        assert!(check.message.contains("azure-profile"));
-        assert!(check.message.contains("gpt-4o"));
+        assert!(check.message.contains("endpoint `azure`"), "{}", check.message);
         // (#1312) The message now names BOTH credential sources (keychain OR
         // key_env), since either satisfies the auth.
         assert!(check.message.contains("no credential source resolved"), "{}", check.message);
@@ -15017,16 +14917,17 @@ mod tests {
                     "models": [{
                         "id": "gpt-4o",
                         "n_ctx": 128000,
-                        "endpoint": {
-                            "url": "https://x.cognitiveservices.azure.com/openai/deployments/gpt-4o",
-                            "auth": {
-                                "type": "api-key",
-                                "keychain": "darkmux-doctor-test-definitely-nonexistent-item-xyz123"
-                            }
-                        }
+                        "endpoint": "azure"
                     }]
                 }
-            }
+            },
+            "endpoints": { "azure": {
+                "url": "https://x.cognitiveservices.azure.com/openai/deployments/gpt-4o",
+                "auth": {
+                    "type": "api-key",
+                    "keychain": "darkmux-doctor-test-definitely-nonexistent-item-xyz123"
+                }
+            } }
         }"#;
         std::fs::write(&config_path, registry_json).unwrap();
 
@@ -15054,17 +14955,18 @@ mod tests {
                     "models": [{{
                         "id": "gpt-4o",
                         "n_ctx": 128000,
-                        "endpoint": {{
-                            "url": "https://x.cognitiveservices.azure.com/openai/deployments/gpt-4o",
-                            "auth": {{
-                                "type": "api-key",
-                                "keychain": "darkmux-doctor-test-definitely-nonexistent-item-xyz123",
-                                "key_env": "{var}"
-                            }}
-                        }}
+                        "endpoint": "azure"
                     }}]
                 }}
-            }}
+            }},
+            "endpoints": {{ "azure": {{
+                "url": "https://x.cognitiveservices.azure.com/openai/deployments/gpt-4o",
+                "auth": {{
+                    "type": "api-key",
+                    "keychain": "darkmux-doctor-test-definitely-nonexistent-item-xyz123",
+                    "key_env": "{var}"
+                }}
+            }} }}
         }}"#
         );
         std::fs::write(&config_path, registry_json).unwrap();
@@ -15148,17 +15050,18 @@ mod tests {
                     "models": [{{
                         "id": "gpt-probe",
                         "n_ctx": 128000,
-                        "endpoint": {{ "url": "http://127.0.0.1:{port}/v1" }}
+                        "endpoint": "mock"
                     }}]
                 }},
                 "review-b": {{
                     "models": [{{
                         "id": "gpt-probe",
                         "n_ctx": 128000,
-                        "endpoint": {{ "url": "http://127.0.0.1:{port}/v1" }}
+                        "endpoint": "mock"
                     }}]
                 }}
-            }}
+            }},
+            "endpoints": {{ "mock": {{ "url": "http://127.0.0.1:{port}/v1" }} }}
         }}"#
         );
         std::fs::write(&config_path, registry_json).unwrap();
@@ -16345,6 +16248,26 @@ mod user_file_key_tests {
         for text in [&row.name, &row.message] {
             assert!(!text.contains('\n') && !text.contains('\u{202e}'), "{text:?}");
         }
+    }
+
+    /// A profile model's inline `endpoint` object is a Fail row naming the
+    /// exact rewrite and that every dispatching entry point refuses to start.
+    #[test]
+    fn an_inline_endpoint_object_is_a_fail_row_naming_the_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        std::fs::write(
+            &path,
+            r#"{"profiles":{"p":{"models":[{"id":"gpt","endpoint":{"url":"https://api.example/v1"}}]}}}"#,
+        )
+        .unwrap();
+        let problem = darkmux_profiles::profiles::user_file_problem(&path).unwrap();
+        let row = &user_file_key_rows(&[problem])[0];
+        assert_eq!(row.status, Status::Fail);
+        assert!(row.message.contains("profiles.p.models[0].endpoint"), "{}", row.message);
+        assert!(row.message.contains("endpoints.\"api.example\""), "{}", row.message);
+        assert!(row.message.contains("Refused at preflight by"), "{}", row.message);
+        assert!(row.hint.as_deref().is_some_and(|h| h.contains("rewrite")), "{:?}", row.hint);
     }
 
     /// Doctor runs to completion against a user file with a syntax error and

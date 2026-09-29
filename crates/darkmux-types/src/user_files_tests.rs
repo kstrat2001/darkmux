@@ -49,7 +49,7 @@ fn paths(keys: &[KeyIssue]) -> Vec<&str> {
 fn closest_of(k: &KeyIssue) -> Option<&str> {
     match &k.issue {
         Issue::Unknown { closest, .. } => closest.as_deref(),
-        Issue::Retired(_) | Issue::WrongType { .. } | Issue::Missing { .. } => None,
+        Issue::Retired(_) | Issue::Removed(_) | Issue::WrongType { .. } | Issue::Missing { .. } => None,
     }
 }
 
@@ -450,7 +450,7 @@ fn every_historical_config_key_is_named_as_retired() {
         "orchestrator": "claude",
         "gh": {"enabled": true, "allowed": []},
         "review": {"judge_concurrency": 2, "judge_fail_on_any_skip": true},
-        "dirs": {"notebook": "/n", "openclaw_config": "/o", "runtime_agents": "/r"},
+        "dirs": {"notebook": "/n", "openclaw_config": "/o", "runtime_agents": "/r", "crew": "/c"},
         "radio": {"router_profile": "p"},
         "remote": {"max_tokens_per_execution": 1, "stage_budget_policy": "warn"},
         "runtime": {"telemetry_record_every_samples": 5, "daemon_auth_enabled": true},
@@ -461,7 +461,7 @@ fn every_historical_config_key_is_named_as_retired() {
     assert!(not_retired.is_empty(), "{not_retired:#?}");
     assert_eq!(keys.len(), 11, "{keys:#?}");
     let msg: String = keys.iter().map(|k| format!("{k}\n")).collect();
-    for says in ["`gh`: renamed to `cmd`", "`orchestrator`: removed", "`remote.stage_budget_policy`: renamed to `remote.step_budget_policy`", "host_sampler_interval_ms", "`runtime.daemon_auth_enabled`: replaced in 4.0 (#2988) by `serve.token_keychain`"] {
+    for says in ["`gh`: renamed to `cmd`", "`orchestrator`: removed", "`remote.stage_budget_policy`: renamed to `remote.step_budget_policy`", "host_sampler_interval_ms", "`runtime.daemon_auth_enabled`: replaced in 4.0 (#2988) by `serve.token_keychain`", "`dirs.crew`: removed in 4.0", "DARKMUX_HOME"] {
         assert!(msg.contains(says), "{says}: {msg}");
     }
 }

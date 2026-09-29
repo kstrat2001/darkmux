@@ -39,8 +39,8 @@ const LICENSED_ADJACENT_ROLES: &[&str] = &["health-research", "legal-research", 
 ///
 /// (#2450) The fallback default is derived from the SAME root resolution
 /// every other darkmux directory resolves through —
-/// `darkmux_types::paths::resolve(Auto)`, which honors `DARKMUX_HOME` and a
-/// project-local `./.darkmux` before `~/.darkmux` — mirroring
+/// `darkmux_types::paths::resolve`, which honors `DARKMUX_HOME` before
+/// `~/.darkmux` — mirroring
 /// `config_access::fleet_file_default`/`flows_dir_default`. Before this fix,
 /// this went straight to `dirs::home_dir()`, so a `DARKMUX_HOME`-scoped
 /// install with no `DARKMUX_ACK_DIR` override still wrote licensed-adjacent
@@ -66,7 +66,7 @@ fn ack_dir() -> Result<PathBuf> {
 /// verbatim, because a test that isolated itself means it.
 #[cfg(any(test, feature = "test-support"))]
 fn ack_dir_default() -> PathBuf {
-    let resolved = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::Auto);
+    let resolved = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser);
     let real_user_root = dirs::home_dir().map(|h| h.join(".darkmux"));
     if real_user_root.as_ref() == Some(&resolved.root) {
         return darkmux_types::paths::test_isolated_dir("acks");
@@ -76,7 +76,7 @@ fn ack_dir_default() -> PathBuf {
 
 #[cfg(not(any(test, feature = "test-support")))]
 fn ack_dir_default() -> PathBuf {
-    darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::Auto).root.join("acks")
+    darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).root.join("acks")
 }
 
 fn ack_file_for(role_id: &str) -> Result<PathBuf> {
@@ -761,10 +761,6 @@ impl CompactionDispatchArgs {
     /// any dispatcher that knows which role is about to run; sites
     /// that don't have a role (phase_cli adhoc) can skip the call
     /// and the profile-level fallback applies.
-    ///
-    /// The role's `escalation_posture` field is parsed here too but
-    /// is currently informational only — the host/skill layer in
-    /// chunk 5 will branch on it when frontier handoff lands.
     pub fn apply_role_override(&mut self, role: &crate::types::Role) {
         if let Some(role_bail) = role.bail_after_compactions {
             self.bail_after_compactions = Some(role_bail);

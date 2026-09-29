@@ -5350,10 +5350,9 @@
     /// Redirects `darkmux-crew`'s mission/phase/task/step storage into a
     /// fresh temp dir for the lifetime of the guard, mirroring the
     /// `CrewDirGuard` pattern used throughout `darkmux-crew`'s own tests
-    /// (`cli.rs`, `index.rs`) — `DARKMUX_CREW_DIR` is the top tier of
-    /// `darkmux_types::config_access::crew_dir_override()`, read live per
-    /// call, so no process restart is needed for the override to take
-    /// effect. Callers of anything backed by this guard MUST be
+    /// (`cli.rs`, `index.rs`) — `DARKMUX_HOME` is the darkmux root, read
+    /// live per call, so no process restart is needed for the override to
+    /// take effect. Callers of anything backed by this guard MUST be
     /// `#[serial_test::serial]` (env var mutation isn't thread-safe).
     struct CrewDirGuard {
         prev: Option<String>,
@@ -5364,9 +5363,9 @@
     impl CrewDirGuard {
         fn new() -> Self {
             let tmp = TempDir::new().unwrap();
-            let prev = std::env::var("DARKMUX_CREW_DIR").ok();
+            let prev = std::env::var("DARKMUX_HOME").ok();
             unsafe {
-                std::env::set_var("DARKMUX_CREW_DIR", tmp.path());
+                std::env::set_var("DARKMUX_HOME", tmp.path());
             }
             Self { prev, _tmp: tmp }
         }
@@ -5375,8 +5374,8 @@
         fn drop(&mut self) {
             unsafe {
                 match &self.prev {
-                    Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-                    None => std::env::remove_var("DARKMUX_CREW_DIR"),
+                    Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                    None => std::env::remove_var("DARKMUX_HOME"),
                 }
             }
         }

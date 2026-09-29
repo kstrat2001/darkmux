@@ -1355,7 +1355,9 @@ mod tests {
     }
 
     fn registry(json: &str) -> darkmux_types::ProfileRegistry {
-        serde_json::from_str(json).unwrap()
+        let mut r: darkmux_types::ProfileRegistry = serde_json::from_str(json).unwrap();
+        r.materialize_endpoints();
+        r
     }
 
     fn role() -> darkmux_crew::types::Role {
@@ -1376,7 +1378,7 @@ mod tests {
                 "host":{"models":[{"id":"big","n_ctx":32000}]},
                 "utility":{"models":[{"id":"small","n_ctx":8000}]}},
               "default_profile":"host",
-              "internal":{"utility":"small"}}"#,
+              "internal":{"utility":{"id":"small"}}}"#,
         );
         let r = role();
         assert_eq!(classify_profile(&reg, &r, Some("host"), None, "studio"), work("host"));
@@ -1395,7 +1397,8 @@ mod tests {
         let reg = registry(
             r#"{"profiles":{
                 "host":{"models":[{"id":"big","n_ctx":32000}]},
-                "cloud":{"models":[{"id":"gpt-x","n_ctx":32000,"endpoint":{"url":"https://api.example/v1"}}]}},
+                "cloud":{"models":[{"id":"gpt-x","n_ctx":32000,"endpoint":"api"}]}},
+              "endpoints":{"api":{"url":"https://api.example/v1"}},
               "default_profile":"host"}"#,
         );
         let r = role();

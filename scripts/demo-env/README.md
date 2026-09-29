@@ -191,6 +191,6 @@ release cadence is the point where "what the demo shows" and "what a
 `darkmux doctor` reports on the machine it RUNS on, so the canned panel carries
 host-level findings (daemon freshness, installed skills) that describe your
 machine rather than the demo one. The demo home isolates what it can — flows,
-crew, profiles, audit dir — but a host probe is a host probe. Prefer
+missions, profiles, audit dir — but a host probe is a host probe. Prefer
 `console-runs` as the console screenshot, or hand-author a doctor fixture if
 the docs need a specific posture.

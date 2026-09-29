@@ -1260,9 +1260,9 @@ mod tests {
     #[serial_test::serial]
     fn route_command_matches_case_insensitively_and_launches_the_correctly_cased_id() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
+        let prev = std::env::var("DARKMUX_HOME").ok();
         // SAFETY: this test is #[serial_test::serial].
-        unsafe { std::env::set_var("DARKMUX_CREW_DIR", tmp.path()) };
+        unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()) };
 
         let dir = tmp.path().join("mission-configs");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1297,8 +1297,8 @@ mod tests {
         // SAFETY: this test is #[serial_test::serial].
         unsafe {
             match prev {
-                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-                None => std::env::remove_var("DARKMUX_CREW_DIR"),
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
             }
         }
     }
@@ -1309,9 +1309,9 @@ mod tests {
     #[serial_test::serial]
     fn list_panel_commands_resolves_accepts_args_with_true_as_the_unset_default() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
+        let prev = std::env::var("DARKMUX_HOME").ok();
         // SAFETY: this test is #[serial_test::serial].
-        unsafe { std::env::set_var("DARKMUX_CREW_DIR", tmp.path()) };
+        unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()) };
 
         let dir = tmp.path().join("mission-configs");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1362,8 +1362,8 @@ mod tests {
         // SAFETY: this test is #[serial_test::serial].
         unsafe {
             match prev {
-                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-                None => std::env::remove_var("DARKMUX_CREW_DIR"),
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
             }
         }
     }
@@ -1444,9 +1444,9 @@ mod tests {
     #[serial_test::serial]
     fn list_panel_commands_advertises_the_resolvable_filename_not_the_document_body_id() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
+        let prev = std::env::var("DARKMUX_HOME").ok();
         // SAFETY: this test is #[serial_test::serial].
-        unsafe { std::env::set_var("DARKMUX_CREW_DIR", tmp.path()) };
+        unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()) };
 
         let dir = tmp.path().join("mission-configs");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1482,8 +1482,8 @@ mod tests {
         // SAFETY: this test is #[serial_test::serial].
         unsafe {
             match prev {
-                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-                None => std::env::remove_var("DARKMUX_CREW_DIR"),
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
             }
         }
     }
@@ -1549,12 +1549,12 @@ mod tests {
     #[serial_test::serial]
     fn ephemeral_run_never_mints_a_mission_instance_directory() {
         // (Required test) Assert NO mission instance directory was
-        // created — isolate DARKMUX_CREW_DIR so this test can inspect the
+        // created — isolate DARKMUX_HOME so this test can inspect the
         // (empty) missions dir without racing any other test's real state.
         let tmp = tempfile::TempDir::new().unwrap();
-        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
+        let prev = std::env::var("DARKMUX_HOME").ok();
         // SAFETY: this test is #[serial_test::serial].
-        unsafe { std::env::set_var("DARKMUX_CREW_DIR", tmp.path()) };
+        unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()) };
 
         let cfg = config(
             "noop-test",
@@ -1576,8 +1576,8 @@ mod tests {
         // SAFETY: this test is #[serial_test::serial].
         unsafe {
             match prev {
-                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-                None => std::env::remove_var("DARKMUX_CREW_DIR"),
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
             }
         }
     }
@@ -2581,6 +2581,7 @@ mod tests {
             _ => panic!("expected Ready"),
         };
         let mut cmd = std::process::Command::cargo_bin("darkmux").unwrap();
+        darkmux_types::test_isolation::neutralize_state_vars(&mut cmd);
         cmd.args(["mission", "launch", "review"]);
         for p in synth.params() {
             cmd.args(["--param", p]);

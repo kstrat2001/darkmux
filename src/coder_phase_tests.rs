@@ -1636,7 +1636,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
     /// body called, unchanged by this packet); the RUN-TIME side is the
     /// actual `coder_brief_with_injected_context` call
     /// `MissionCoderStepKind::run_streaming` now makes. `#[serial]` —
-    /// mutates DARKMUX_HOME/DARKMUX_CREW_DIR/DARKMUX_FLOWS_DIR.
+    /// mutates DARKMUX_HOME/DARKMUX_FLOWS_DIR.
     #[test]
     #[serial_test::serial]
     fn coder_brief_with_injected_context_matches_the_retired_prelude_computation() {
@@ -1644,12 +1644,10 @@ edit loop detected on src/widget.rs in an earlier dispatch
         let flows_dir = tmp.path().join("flows");
         std::fs::create_dir_all(&flows_dir).unwrap();
         let prev_home = std::env::var("DARKMUX_HOME").ok();
-        let prev_crew = std::env::var("DARKMUX_CREW_DIR").ok();
         let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
         // SAFETY: serialized via #[serial]; restored below.
         unsafe {
-            std::env::set_var("DARKMUX_HOME", tmp.path());
-            std::env::set_var("DARKMUX_CREW_DIR", tmp.path().join("crew"));
+            std::env::set_var("DARKMUX_HOME", tmp.path().join("crew"));
             std::env::set_var("DARKMUX_FLOWS_DIR", &flows_dir);
         }
 
@@ -1726,10 +1724,6 @@ edit loop detected on src/widget.rs in an earlier dispatch
                 Some(v) => std::env::set_var("DARKMUX_HOME", v),
                 None => std::env::remove_var("DARKMUX_HOME"),
             }
-            match prev_crew {
-                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-                None => std::env::remove_var("DARKMUX_CREW_DIR"),
-            }
             match prev_flows {
                 Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
                 None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
@@ -1761,12 +1755,10 @@ edit loop detected on src/widget.rs in an earlier dispatch
     fn coder_brief_with_injected_context_with_no_sources_is_the_bare_brief() {
         let tmp = tempfile::TempDir::new().unwrap();
         let prev_home = std::env::var("DARKMUX_HOME").ok();
-        let prev_crew = std::env::var("DARKMUX_CREW_DIR").ok();
         let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
         // SAFETY: serialized via #[serial]; restored below.
         unsafe {
-            std::env::set_var("DARKMUX_HOME", tmp.path());
-            std::env::set_var("DARKMUX_CREW_DIR", tmp.path().join("crew"));
+            std::env::set_var("DARKMUX_HOME", tmp.path().join("crew"));
             std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path().join("flows"));
         }
 
@@ -1792,10 +1784,6 @@ edit loop detected on src/widget.rs in an earlier dispatch
             match prev_home {
                 Some(v) => std::env::set_var("DARKMUX_HOME", v),
                 None => std::env::remove_var("DARKMUX_HOME"),
-            }
-            match prev_crew {
-                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-                None => std::env::remove_var("DARKMUX_CREW_DIR"),
             }
             match prev_flows {
                 Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
@@ -1827,11 +1815,12 @@ edit loop detected on src/widget.rs in an earlier dispatch
                     "test": {
                         "models": [
                             {"id": "local-model", "n_ctx": 32000},
-                            {"id": "remote-model", "n_ctx": 32000, "endpoint": {"url": "https://example.com/v1"}}
+                            {"id": "remote-model", "n_ctx": 32000, "endpoint": "hosted"}
                         ],
                         "default_model": "local-model"
                     }
                 },
+                "endpoints": {"hosted": {"url": "https://example.com/v1"}},
                 "default_profile": "test"
             }"#,
         )
@@ -1859,11 +1848,12 @@ edit loop detected on src/widget.rs in an earlier dispatch
                 "profiles": {
                     "test": {
                         "models": [
-                            {"id": "remote-model", "n_ctx": 32000, "endpoint": {"url": "https://example.com/v1"}}
+                            {"id": "remote-model", "n_ctx": 32000, "endpoint": "hosted"}
                         ],
                         "default_model": "remote-model"
                     }
                 },
+                "endpoints": {"hosted": {"url": "https://example.com/v1"}},
                 "default_profile": "test"
             }"#,
         )
@@ -1889,7 +1879,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
 
     // ── (#1426 ship-4 / #1433) ship/abort honest-finalize + workdir align ──
 
-    /// Point `DARKMUX_CREW_DIR` + `DARKMUX_FLOWS_DIR` at fresh TempDirs and
+    /// Point `DARKMUX_HOME` + `DARKMUX_FLOWS_DIR` at fresh TempDirs and
     /// restore on drop. Every user MUST be `#[serial]` (global env mutation).
     struct CrewEnvGuard {
         _crew: tempfile::TempDir,
@@ -1901,11 +1891,11 @@ edit loop detected on src/widget.rs in an earlier dispatch
         fn new() -> Self {
             let crew = tempfile::TempDir::new().unwrap();
             let flows = tempfile::TempDir::new().unwrap();
-            let prev_crew = std::env::var("DARKMUX_CREW_DIR").ok();
+            let prev_crew = std::env::var("DARKMUX_HOME").ok();
             let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
             // SAFETY: serialized via #[serial_test::serial] on every caller.
             unsafe {
-                std::env::set_var("DARKMUX_CREW_DIR", crew.path());
+                std::env::set_var("DARKMUX_HOME", crew.path());
                 std::env::set_var("DARKMUX_FLOWS_DIR", flows.path());
             }
             Self { _crew: crew, _flows: flows, prev_crew, prev_flows }
@@ -1916,8 +1906,8 @@ edit loop detected on src/widget.rs in an earlier dispatch
             // SAFETY: serialized via #[serial_test::serial] on every caller.
             unsafe {
                 match &self.prev_crew {
-                    Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-                    None => std::env::remove_var("DARKMUX_CREW_DIR"),
+                    Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                    None => std::env::remove_var("DARKMUX_HOME"),
                 }
                 match &self.prev_flows {
                     Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),

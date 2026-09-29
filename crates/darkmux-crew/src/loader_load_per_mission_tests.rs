@@ -1,7 +1,7 @@
     use super::*;
     use serial_test::serial;
 
-    /// RAII guard: sets `DARKMUX_CREW_DIR` to a TempDir for the test's duration,
+    /// RAII guard: sets `DARKMUX_HOME` to a TempDir for the test's duration,
     /// then restores (or unsets) on drop.  Mirrors `CrewDirGuard` in the sibling
     /// `tests` module — kept local to this module to avoid cross-module coupling.
     struct TestCrewRoot {
@@ -12,9 +12,9 @@
     impl TestCrewRoot {
         fn new() -> Self {
             let tmp = tempfile::TempDir::new().unwrap();
-            let prev = std::env::var("DARKMUX_CREW_DIR").ok();
+            let prev = std::env::var("DARKMUX_HOME").ok();
             // SAFETY: serialized via #[serial] on every caller.
-            unsafe { std::env::set_var("DARKMUX_CREW_DIR", tmp.path()); }
+            unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()); }
             Self { prev, _tmp: tmp }
         }
 
@@ -28,8 +28,8 @@
             // SAFETY: serialized via #[serial] on every caller.
             unsafe {
                 match &self.prev {
-                    Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-                    None => std::env::remove_var("DARKMUX_CREW_DIR"),
+                    Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                    None => std::env::remove_var("DARKMUX_HOME"),
                 }
             }
         }
@@ -375,6 +375,20 @@
         assert!(!preamble.contains("autonomous dispatch mode"));
     }
 
+    /// The pre-4.0 override location, `<root>/crew/`, is not read: the file sits
+    /// at the root or it is ignored (`darkmux doctor` prints the move).
+    #[serial]
+    #[test]
+    fn load_preamble_ignores_the_pre_4_0_crew_subdirectory() {
+        let guard = TestCrewRoot::new();
+        let legacy = guard.path().join("crew");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join(PREAMBLE_OVERRIDE_FILE), "# LEGACY PREAMBLE").unwrap();
+        let preamble = load_autonomous_dispatch_preamble();
+        assert!(!preamble.contains("LEGACY PREAMBLE"));
+        assert!(preamble.contains("autonomous dispatch mode"));
+    }
+
     #[test]
     fn role_family_default_is_specialist() {
         // Field absent on Role manifests defaults to specialist
@@ -389,7 +403,6 @@
             escalation_contract: EscalationContract::BailWithExplanation,
             prompt_path: None,
             bail_after_compactions: None,
-            escalation_posture: None,
             role_family: None,
             feedback_templates: None,
         };
@@ -407,7 +420,6 @@
             escalation_contract: EscalationContract::BailWithExplanation,
             prompt_path: None,
             bail_after_compactions: None,
-            escalation_posture: None,
             role_family: Some("utility".into()),
             feedback_templates: None,
         };
@@ -431,7 +443,6 @@
             escalation_contract: EscalationContract::BailWithExplanation,
             prompt_path: None,
             bail_after_compactions: None,
-            escalation_posture: None,
             role_family: Some("admin".into()),
             feedback_templates: None,
         };
@@ -453,7 +464,6 @@
             escalation_contract: EscalationContract::BailWithExplanation,
             prompt_path: None,
             bail_after_compactions: None,
-            escalation_posture: None,
             role_family: Some("specialist".into()),
             feedback_templates: None,
         };
@@ -515,7 +525,6 @@
             escalation_contract: EscalationContract::BailWithExplanation,
             prompt_path: None,
             bail_after_compactions: None,
-            escalation_posture: None,
             role_family: Some("admin".into()),
             feedback_templates: None,
         };
@@ -544,7 +553,6 @@
             escalation_contract: EscalationContract::BailWithExplanation,
             prompt_path: None,
             bail_after_compactions: None,
-            escalation_posture: None,
             role_family: Some("admin".into()),
             feedback_templates: None,
         };
@@ -567,7 +575,6 @@
             escalation_contract: EscalationContract::BailWithExplanation,
             prompt_path: None,
             bail_after_compactions: None,
-            escalation_posture: None,
             role_family: None,
             feedback_templates: None,
         };
@@ -595,7 +602,6 @@
             escalation_contract: EscalationContract::BailWithExplanation,
             prompt_path: None,
             bail_after_compactions: None,
-            escalation_posture: None,
             role_family: Some("worker".into()),
             feedback_templates: None,
         };

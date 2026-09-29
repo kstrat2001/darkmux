@@ -40,7 +40,7 @@ Several run ids print a set instead: `runs` (one object each, as above), `summar
 
 ## Step 3 — Read the manifest when the entry needs what stats does not carry
 
-`manifest.json` sits in the run directory. Runs live under `~/.darkmux/lab/<run-id>/` by default (under `$DARKMUX_HOME/lab/` when that is set, or `./.darkmux/lab/` when the run was launched from a directory with its own `.darkmux/`); `$DARKMUX_LAB_DIR` or `dirs.lab` in `config.json` moves that root. `darkmux run stats` also accepts the run directory's path in place of an id, and when a run id does not resolve its error names the root it searched. It carries `workload`, `provider`, `profile`, `session_id`, `duration_ms`, `ok`, the fixture that was used (`fixture`), and `verify` as `{passed, details}`. `details` is where a failed verify says why; quote it.
+`manifest.json` sits in the run directory. Runs live under `~/.darkmux/lab/<run-id>/` by default (under `$DARKMUX_HOME/lab/` when that is set); `$DARKMUX_LAB_DIR` or `dirs.lab` in `config.json` moves that root. `darkmux run stats` also accepts the run directory's path in place of an id, and when a run id does not resolve its error names the root it searched. It carries `workload`, `provider`, `profile`, `session_id`, `duration_ms`, `ok`, the fixture that was used (`fixture`), and `verify` as `{passed, details}`. `details` is where a failed verify says why; quote it.
 
 ## Step 4 — Draft the entry
 

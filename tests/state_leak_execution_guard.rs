@@ -92,7 +92,7 @@
 //! the rest. That asymmetry is load-bearing and was got wrong first: a
 //! variable that outranks the root is the right thing to CLEAR and the
 //! wrong thing to PIN, because pinning it overrides every per-test guard
-//! inside the target with one shared value. With `DARKMUX_CREW_DIR` pinned
+//! inside the target with one shared value. With a directory variable pinned
 //! this way, 31 `darkmux-lab` crawl tests fail on the shared directory;
 //! with the pin removed, 2,416 of 2,416 pass. Those failures were the
 //! harness, not the code — and a harness that manufactures findings is

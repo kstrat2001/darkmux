@@ -152,7 +152,7 @@ impl Lab {
     /// The sandbox a scripted workload's run is cloned from (no
     /// `requires_fixture`, so the `sandboxes/<id>` fallback).
     fn source_sandbox(&self, workload: &str) -> std::path::PathBuf {
-        paths::resolve(ResolveScope::Auto).sandboxes.join(workload)
+        paths::resolve(ResolveScope::ForceUser).sandboxes.join(workload)
     }
 
     pub(crate) fn scripted(workloads: &[&str]) -> Self {
@@ -299,7 +299,8 @@ fn a_prompt_workload_reports_verify_none_without_a_spec_and_the_verdict_with_one
     let lab = Lab::new(
         &format!(
             r#"{{"default_profile":"stub","profiles":{{"stub":{{"models":[
-                {{"id":"stub-model","n_ctx":8000,"endpoint":{{"url":"http://127.0.0.1:{port}"}}}}]}}}}}}"#
+                {{"id":"stub-model","n_ctx":8000,"endpoint":"stub"}}]}}}},
+                "endpoints":{{"stub":{{"url":"http://127.0.0.1:{port}"}}}}}}"#
         ),
         &[
             prompt("p2982-none", serde_json::Value::Null),

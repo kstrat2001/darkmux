@@ -339,13 +339,9 @@ const REBUILD_TABLES: &[&str] = &[
 /// Stable across releases — changing this silently invalidates every operator's
 /// existing index. Tests use the `_at(&path)` variants (`rebuild_at`,
 /// `role_list_at`, `crew_list_at`, etc.) rather than overriding this path.
-/// (#1012) ForceUser, NOT Auto: the index is DERIVED from the user-scope crew /
-/// missions / phases (now resolved via `user_state_root` = ForceUser), so it
-/// must be user-scoped to match its content — a project-scoped index of
-/// user-scoped data is incoherent, and a bare `<cwd>/.darkmux/` must not relocate
-/// it. In the common no-project-`.darkmux` case `Auto` already resolved to user,
-/// so the path is unchanged; only a repo with a stray `.darkmux/` is corrected
-/// (one rebuild). DARKMUX_HOME still wins.
+/// The index is DERIVED from the user-scope crew / missions / phases, so it
+/// lives at the user root; a bare `<cwd>/.darkmux/` does not relocate it.
+/// DARKMUX_HOME still wins.
 pub fn default_index_path() -> PathBuf {
     resolve(ResolveScope::ForceUser).root.join("index.db")
 }
@@ -1206,7 +1202,7 @@ mod tests {
     use std::env;
     use tempfile::TempDir;
 
-    /// RAII guard: point DARKMUX_CREW_DIR at a TempDir for the test's
+    /// RAII guard: point DARKMUX_HOME at a TempDir for the test's
     /// lifetime. Mirrors the loader's pattern; serialized via #[serial].
     ///
     /// (#994) Also isolates DARKMUX_FLOWS_DIR to an (initially absent) subdir of
@@ -1224,10 +1220,10 @@ mod tests {
     impl CrewDirGuard {
         fn new() -> Self {
             let tmp = TempDir::new().unwrap();
-            let prev_crew = env::var("DARKMUX_CREW_DIR").ok();
+            let prev_crew = env::var("DARKMUX_HOME").ok();
             let prev_flows = env::var("DARKMUX_FLOWS_DIR").ok();
             unsafe {
-                env::set_var("DARKMUX_CREW_DIR", tmp.path());
+                env::set_var("DARKMUX_HOME", tmp.path());
                 env::set_var("DARKMUX_FLOWS_DIR", tmp.path().join("flows"));
             }
             Self { prev_crew, prev_flows, tmp }
@@ -1249,8 +1245,8 @@ mod tests {
         fn drop(&mut self) {
             unsafe {
                 match &self.prev_crew {
-                    Some(v) => env::set_var("DARKMUX_CREW_DIR", v),
-                    None => env::remove_var("DARKMUX_CREW_DIR"),
+                    Some(v) => env::set_var("DARKMUX_HOME", v),
+                    None => env::remove_var("DARKMUX_HOME"),
                 }
                 match &self.prev_flows {
                     Some(v) => env::set_var("DARKMUX_FLOWS_DIR", v),

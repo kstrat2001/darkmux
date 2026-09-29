@@ -3637,13 +3637,9 @@ line two
 
     /// Scopes `DARKMUX_HOME` for one test and restores the prior value —
     /// same pattern `crawl::unit_step_tests::HomeGuard` uses.
-    /// (#2718) `IsolatedState`-backed, then re-pointed at `p`.
+    /// `IsolatedState`-backed, then re-pointed at `p`.
     ///
-    /// With a `DARKMUX_CREW_DIR` exported — which outranks `DARKMUX_HOME`
-    /// in `user_state_root()` — the `DARKMUX_HOME`-only version put this
-    /// fixture's whole mission (`missions/review-2310-fixture/**`) and its
-    /// five `findings/sess-fix/*` records into that directory instead of
-    /// the tempdir it names. With an ambient `DARKMUX_MODS_DIR` it was
+    /// With an ambient `DARKMUX_MODS_DIR` a `DARKMUX_HOME`-only guard was
     /// worse than misplaced: the golden comparison read mods left behind
     /// by an EARLIER run and reported "2 proposed changes not verified"
     /// against a golden that says 1 — a red test whose cause is in a
@@ -3657,7 +3653,6 @@ line two
         fn set(p: &Path) -> Self {
             let isolated = darkmux_types::test_isolation::IsolatedState::new();
             std::env::set_var("DARKMUX_HOME", p);
-            std::env::set_var("DARKMUX_CREW_DIR", p);
             std::env::set_var("DARKMUX_FINDINGS_DIR", p.join("findings"));
             std::env::set_var("DARKMUX_MODS_DIR", p.join("mods"));
             Self { _isolated: isolated }

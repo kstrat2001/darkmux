@@ -325,7 +325,7 @@ mod tests {
         format!(r#"{{"id":"{id}","name":"Test {id}"}}"#)
     }
 
-    /// RAII guard pinning `DARKMUX_CREW_DIR` (which `mission_configs_dir()`
+    /// RAII guard pinning `DARKMUX_HOME` (which `mission_configs_dir()`
     /// resolves under) at a TempDir for the test's duration, restoring the
     /// previous value on drop. Mirrors `loader::tests::CrewDirGuard`
     /// exactly (that guard is private to `loader`'s own test module, so
@@ -337,9 +337,9 @@ mod tests {
 
     impl CrewDirGuard {
         fn new(tmp: TempDir) -> Self {
-            let prev = std::env::var("DARKMUX_CREW_DIR").ok();
+            let prev = std::env::var("DARKMUX_HOME").ok();
             // SAFETY: serialized via #[serial_test::serial] on every caller.
-            unsafe { std::env::set_var("DARKMUX_CREW_DIR", tmp.path()) };
+            unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()) };
             Self { prev, _tmp: tmp }
         }
 
@@ -353,8 +353,8 @@ mod tests {
             // SAFETY: serialized via #[serial_test::serial] on every caller.
             unsafe {
                 match &self.prev {
-                    Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-                    None => std::env::remove_var("DARKMUX_CREW_DIR"),
+                    Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                    None => std::env::remove_var("DARKMUX_HOME"),
                 }
             }
         }

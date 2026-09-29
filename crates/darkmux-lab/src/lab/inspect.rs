@@ -103,20 +103,8 @@ pub fn lab_inspect(run_path: &str) -> Result<InspectionReport> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("manifest missing 'provider' field"))?;
 
-    // (#2590) This is the THIRD workload-document lookup site, missed by the
-    // original fix, which covered only `lab::run::lab_run` and
-    // `lab::run::lab_workloads`. `resolve_run_dir` above deliberately stays
-    // `Auto`/project-sensitive (it reads `config_access::lab_dir()`, the same
-    // cwd-sensitive root `lab run` wrote the run's artifacts under — that
-    // part is correct and untouched). The workload DOCUMENT lookup below is
-    // a separate concern: before this fix it also used `Auto`'s root, so a
-    // `./.darkmux/workloads/<id>.json` sitting in the shell's cwd could
-    // shadow the embedded/home-tier document of the same id when inspecting
-    // a run, and a run naming a home-tier-only workload could fail "not
-    // found" here even though `lab run`/`lab workload list` resolve it fine
-    // — the same split-tier inconsistency `lab_run`/`lab_workloads` closed,
-    // one call site over. Force the workload user tier home, matching those
-    // two.
+    // The workload document resolves at the darkmux root, like `lab_run` and
+    // `lab_workloads`.
     let user_workloads_root = paths::resolve(ResolveScope::ForceUser).root;
     let loaded = load(workload_id, Some(&user_workloads_root))?;
 

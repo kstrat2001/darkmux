@@ -3164,9 +3164,9 @@ mod tests {
         std::fs::write(
             &pf,
             r#"{"profiles":{"cloud":{"models":[
-                    {"id":"gpt-remote","n_ctx":100000,
-                     "endpoint":{"url":"http://127.0.0.1:1"}}
+                    {"id":"gpt-remote","n_ctx":100000,"endpoint":"mock"}
                 ]}},
+                "endpoints":{"mock":{"url":"http://127.0.0.1:1"}},
                 "default_profile":"cloud"}"#,
         )
         .unwrap();
@@ -4783,8 +4783,8 @@ mod tests {
     #[serial_test::serial]
     fn a_map_item_waiting_on_an_aborted_missions_budget_never_sends() {
         let crew = tempfile::TempDir::new().unwrap();
-        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
-        unsafe { std::env::set_var("DARKMUX_CREW_DIR", crew.path()) };
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::set_var("DARKMUX_HOME", crew.path()) };
         let mpath = crate::lifecycle::mission_path("m-aborted");
         std::fs::create_dir_all(mpath.parent().unwrap()).unwrap();
         std::fs::write(&mpath, r#"{"id":"m-aborted","status":"aborted"}"#).unwrap();
@@ -4805,8 +4805,8 @@ mod tests {
         });
         unsafe {
             match prev {
-                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-                None => std::env::remove_var("DARKMUX_CREW_DIR"),
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
             }
         }
         assert!(!out.ok);
@@ -4909,8 +4909,8 @@ mod tests {
     #[serial_test::serial]
     fn an_abort_in_one_launch_never_ends_another_launchs_wait() {
         let crew = tempfile::TempDir::new().unwrap();
-        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
-        unsafe { std::env::set_var("DARKMUX_CREW_DIR", crew.path()) };
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::set_var("DARKMUX_HOME", crew.path()) };
         for (mid, status) in [("launch-a", "aborted"), ("launch-b", "active")] {
             let mpath = crate::lifecycle::mission_path(mid);
             std::fs::create_dir_all(mpath.parent().unwrap()).unwrap();
@@ -4945,8 +4945,8 @@ mod tests {
         launch("launch-b", env_b.clone());
         unsafe {
             match prev {
-                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-                None => std::env::remove_var("DARKMUX_CREW_DIR"),
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
             }
         }
         use darkmux_flow::FlowAction::{BudgetResume, BudgetStop, BudgetWait};
@@ -7195,8 +7195,8 @@ mod tests {
     }
 
     /// (#2902 step 3) A seat whose selected model is on an UNMANAGED
-    /// endpoint is the silent `Remote` miss (no local residency to plan),
-    /// named by id or inline; an undefined id is a loud resolution failure.
+    /// endpoint is the silent `Remote` miss (no local residency to plan);
+    /// an undefined id is a loud resolution failure.
     #[serial_test::serial]
     #[test]
     fn placement_classifies_through_the_one_resolver() {
@@ -7210,7 +7210,6 @@ mod tests {
                 "profiles": {
                     "local": {"models": [{"id": "m-local", "n_ctx": 4096}]},
                     "named": {"models": [{"id": "gpt", "endpoint": "hosted"}]},
-                    "inline": {"models": [{"id": "gpt", "endpoint": {"url": "https://i.example/v1"}}]},
                     "dangling": {"models": [{"id": "gpt", "endpoint": "nope"}]}
                 }
             })
@@ -7228,7 +7227,6 @@ mod tests {
         };
         assert_eq!(pick("local"), Ok("m-local".into()));
         assert_eq!(pick("named"), Err("remote".into()));
-        assert_eq!(pick("inline"), Err("remote".into()));
         let err = pick("dangling").unwrap_err();
         assert!(err.contains("nope") && err != "remote", "{err}");
     }

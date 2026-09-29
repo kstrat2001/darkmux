@@ -1135,9 +1135,9 @@ mod tests {
     #[serial_test::serial]
     fn compile_catalog_advertises_panel_blocked_configs_sorted_with_the_panel_description() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
+        let prev = std::env::var("DARKMUX_HOME").ok();
         // SAFETY: this test is #[serial_test::serial].
-        unsafe { std::env::set_var("DARKMUX_CREW_DIR", tmp.path()) };
+        unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()) };
 
         let dir = tmp.path().join("mission-configs");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1210,8 +1210,8 @@ mod tests {
         // SAFETY: this test is #[serial_test::serial].
         unsafe {
             match prev {
-                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-                None => std::env::remove_var("DARKMUX_CREW_DIR"),
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
             }
         }
     }
@@ -1227,9 +1227,9 @@ mod tests {
     #[serial_test::serial]
     fn compile_catalog_advertises_the_built_in_machine_status_command() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
+        let prev = std::env::var("DARKMUX_HOME").ok();
         // SAFETY: this test is #[serial_test::serial].
-        unsafe { std::env::set_var("DARKMUX_CREW_DIR", tmp.path()) };
+        unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()) };
 
         let catalog = compile_catalog();
         let entry = catalog
@@ -1246,8 +1246,8 @@ mod tests {
         // SAFETY: this test is #[serial_test::serial].
         unsafe {
             match prev {
-                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-                None => std::env::remove_var("DARKMUX_CREW_DIR"),
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
             }
         }
     }
@@ -1256,9 +1256,9 @@ mod tests {
     #[serial_test::serial]
     fn compile_catalog_falls_back_to_the_configs_name_when_panel_description_is_absent() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
+        let prev = std::env::var("DARKMUX_HOME").ok();
         // SAFETY: this test is #[serial_test::serial].
-        unsafe { std::env::set_var("DARKMUX_CREW_DIR", tmp.path()) };
+        unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()) };
 
         let dir = tmp.path().join("mission-configs");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1288,8 +1288,8 @@ mod tests {
         // SAFETY: this test is #[serial_test::serial].
         unsafe {
             match prev {
-                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-                None => std::env::remove_var("DARKMUX_CREW_DIR"),
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
             }
         }
     }

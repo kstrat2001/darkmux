@@ -59,12 +59,10 @@
 //! - `paths::resolve` — `DARKMUX_HOME` (the bootstrap pointer, which can't
 //!   live inside the config it locates), read directly in `resolve`
 //!   itself.
-//! - `dispatch_liveness::liveness_dir` — a direct `DARKMUX_HOME` read
-//!   outside both chokepoints above.
-//! - `residency_lease::residency_dir` — a second direct `DARKMUX_HOME`
-//!   read site, mirroring `liveness_dir`'s resolution exactly.
-//! - `darkmux-profiles::profiles::default_locations` (`DARKMUX_HOME`) and
-//!   `profiles::load_registry` (`DARKMUX_PROFILES`) — a fifth chokepoint,
+//!   `dispatch_liveness::liveness_dir` and `residency_lease::residency_dir`
+//!   reach it through `paths::user_root_guarded`, so they are covered too.
+//! - `profiles::load_registry` (`DARKMUX_PROFILES`; its `DARKMUX_HOME` read
+//!   is `paths::resolve`'s) — a further chokepoint,
 //!   in a DIFFERENT crate (#2632 CONSIDER 3). `darkmux-crew` calls
 //!   `load_registry` at five production sites and its tests mutate both
 //!   keys, so this one matters for crew's own sweep even though

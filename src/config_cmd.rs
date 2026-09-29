@@ -209,7 +209,6 @@ const KEYS: &[(&str, Ty)] = &[
     ("dirs.flows", Ty::Str),
     ("dirs.audit", Ty::Str),
     ("dirs.skills", Ty::Str),
-    ("dirs.crew", Ty::Str),
     ("dirs.templates", Ty::Str),
     ("dirs.ack", Ty::Str),
     ("dirs.identity", Ty::Str),
@@ -272,11 +271,9 @@ const SECRET_KEYS: &[(&str, &str)] = &[
 /// no value (it describes the key, and still fails a script that forgot the
 /// value, as the old missing-argument usage error did; #2947 review C7).
 pub fn run(cmd: ConfigCmd) -> Result<i32> {
-    // (#1323) ForceUser, not Auto — `darkmux config get/set/list` operates on
-    // the user-scope config.json, matching `DarkmuxConfig::load_resolved`. Under
-    // Auto a stray project-local `.darkmux/` (missions/phases/lessons) would
-    // silently redirect reads/writes to the wrong file. Config is user/machine-
-    // level; there is no legitimate per-project config.
+    // `darkmux config get/set/list` operates on the user-scope config.json,
+    // matching `DarkmuxConfig::load_resolved`. Config is user/machine-level;
+    // there is no per-project config.
     let path = resolve(ResolveScope::ForceUser).config;
     match cmd {
         ConfigCmd::Set { key, value: Some(value) } => {
@@ -1272,6 +1269,18 @@ mod tests {
         assert!(set_at(&path, "serve.token_keychain", "true").is_ok());
         assert!(set_at(&path, "serve.read_auth", "true").is_ok());
         assert!(set_at(&path, "serve.read_auth", "maybe").is_err());
+    }
+
+    /// `config set` refuses a retired key, naming what replaced it, and writes
+    /// nothing.
+    #[test]
+    fn config_set_refuses_a_retired_key_naming_the_replacement() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, "{}").unwrap();
+        let err = set_at(&path, "dirs.crew", "/x").unwrap_err().to_string();
+        assert!(err.contains("`dirs.crew`") && err.contains("DARKMUX_HOME"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}", "nothing was written");
     }
 
     /// (#2902 step 5) `config set` refuses a renamed budget key, naming the

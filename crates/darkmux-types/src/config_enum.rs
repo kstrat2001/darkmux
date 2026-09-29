@@ -466,9 +466,7 @@ pub fn bad_hook_rule_values(rules: &[crate::config::HookRule]) -> Vec<BadEnumVal
 }
 
 /// (#2902 step 5) Every unregistered budget `policy` in a profile registry:
-/// each `endpoints.<id>.limits.policy`, and each inline endpoint's on a
-/// profile model (`profiles.<p>.models[<i>].endpoint.limits.policy`). The
-/// same rule as a config enum: never resolved to a fallback, refused at
+/// each `endpoints.<id>.limits.policy`. The same rule as a config enum: never resolved to a fallback, refused at
 /// preflight by every entry point that dispatches (`darkmux_profiles::
 /// preflight`), Fail in doctor. A per-endpoint enum lives in
 /// `profiles.json`, not `config.json`, so it is not an [`EnumSetting`]: this
@@ -495,16 +493,6 @@ pub fn bad_endpoint_budget_policies(reg: &crate::ProfileRegistry) -> Vec<BadEnum
             out.push(bad(raw, format!("endpoints.{id}.limits.policy")));
         }
     }
-    for (pname, profile) in &reg.profiles {
-        for (i, m) in profile.models.iter().enumerate() {
-            let Some(ep) = m.endpoint.as_ref().filter(|e| e.source == crate::endpoint::EndpointSource::Inline) else {
-                continue;
-            };
-            if let Some(raw) = raw_of(ep) {
-                out.push(bad(raw, format!("profiles.{pname}.models[{i}].endpoint.limits.policy")));
-            }
-        }
-    }
     out
 }
 
@@ -518,8 +506,8 @@ pub const LIMITS_SHAPE: &str = "`limits`: {\"window\": {\"period\": \"<n>m|<n>h|
 /// value unreadable, and an unreadable budget must never silently count
 /// nothing), or readable but invalid (a set window whose `period` does not
 /// parse, `warn_at` outside (0, 1)). An unregistered `policy` in readable
-/// limits is [`bad_endpoint_budget_policies`]'s, not this. Same coverage:
-/// `endpoints.<id>` and inline endpoints on profile models.
+/// limits is [`bad_endpoint_budget_policies`]'s, not this. Covers
+/// `endpoints.<id>`.
 pub fn invalid_endpoint_limits(reg: &crate::ProfileRegistry) -> Vec<InvalidSetting> {
     use crate::endpoint::Lenient;
     fn problem(ep: &crate::ModelEndpoint) -> Option<String> {
@@ -543,16 +531,6 @@ pub fn invalid_endpoint_limits(reg: &crate::ProfileRegistry) -> Vec<InvalidSetti
     for (id, ep) in &reg.endpoints {
         if let Some(p) = problem(ep) {
             push(format!("endpoints.{id}.limits"), p);
-        }
-    }
-    for (pname, profile) in &reg.profiles {
-        for (i, m) in profile.models.iter().enumerate() {
-            let Some(ep) = m.endpoint.as_ref().filter(|e| e.source == crate::endpoint::EndpointSource::Inline) else {
-                continue;
-            };
-            if let Some(p) = problem(ep) {
-                push(format!("profiles.{pname}.models[{i}].endpoint.limits"), p);
-            }
         }
     }
     out
@@ -1106,9 +1084,7 @@ mod tests {
                 "CompactionStrategy",
                 "profiles.json `compaction.strategy`, strictly deserialized (an unknown one fails the load)",
             ),
-            ("UtilityBinding", "the `internal.utility` value's shape (id or object), not a token set"),
             ("QuarantinedEntryKind", "a registry-load diagnostic, never written"),
-            ("IssueSeverity", "a registry-load diagnostic, never written"),
             ("GitdirPointerKind", "a workspace probe result, never written"),
             ("Scope", "`paths::Scope` / `config_enum::Scope`: code-side enums, not setting values"),
             ("ResolveScope", "a path-resolution mode chosen by code, not a setting"),

@@ -2071,7 +2071,7 @@ mod trust_tests {
             r#"{"profiles":{"host":{"models":[{"id":"big","n_ctx":32000}]},
                 "coder-studio":{"models":[{"id":"big","n_ctx":64000}]},
                 "utility":{"models":[{"id":"small","n_ctx":8000}]}},
-              "internal":{"utility":"small"}}"#,
+              "internal":{"utility":{"id":"small"}}}"#,
         )
         .unwrap()
     }

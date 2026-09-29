@@ -119,7 +119,7 @@ When filing a bug, please include:
 - LMStudio version (`lms --version`) if relevant
 - Output of `darkmux machine status`
 - A minimal `profiles.json` that reproduces the issue (the `profiles.example.json` in the repo is a starting point)
-- The CWD where you ran the command (project-local `.darkmux/` vs. user-global `~/.darkmux/` resolution affects path-related issues)
+- Whether `DARKMUX_HOME` is set (it is the one relocation of `~/.darkmux`; a `./.darkmux/` in the working directory is ignored)
 
 ## Project structure
 

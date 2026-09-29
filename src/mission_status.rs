@@ -2456,25 +2456,10 @@ mod tests {
     /// every variable it displaced on `Drop` — including when the test body
     /// panics partway through.
     ///
-    /// **The history this replaces, because it is the argument for the
-    /// alias.** This guard started as a `DARKMUX_HOME`-only pin. That was
-    /// not enough: every mission/phase write in this module routes through
-    /// `crew::loader::user_state_root()`, which resolves
-    /// `config_access::crew_dir_override()` FIRST and only falls back to the
-    /// `DARKMUX_HOME` tier when that override is absent — so anyone with
-    /// `DARKMUX_CREW_DIR` exported outranked the scratch root and the
-    /// fixtures landed in the REAL board. Measured with a sentinel
-    /// exported: `cargo test --bin darkmux mission_status::` exited 0, 98
-    /// passed, and wrote 102 mission directories permanently into the
-    /// sentinel — a fully green suite mutating operator state. So a second
-    /// variable was added. Then #2697 found the same shape one destination
-    /// over, in `darkmux-serve`: a guard pinning the crew dir, and flow
-    /// records going to the operator's real stream anyway.
-    ///
-    /// Two incidents, same cause: the guard knows about the destinations
-    /// whose leak somebody already noticed. Pinning the whole set from one
-    /// place is the fix; adding a third variable here would only have moved
-    /// the next incident. Caller must still hold `#[serial_test::serial]`.
+    /// It pins every darkmux write destination (mission state, the flow
+    /// sink, findings and mods) under one throwaway root, so no destination
+    /// whose leak somebody has not yet noticed is left reachable. Caller must
+    /// still hold `#[serial_test::serial]`.
     type DarkmuxHomeGuard = darkmux_types::test_isolation::IsolatedState;
 
     /// (#2698) Now a thin alias over the shared
@@ -2486,10 +2471,9 @@ mod tests {
     type InactivityBudgetGuard = darkmux_types::test_isolation::InactivityBudget;
 
     /// The guard's own contract, asserted rather than documented. The leak
-    /// it closes is SILENT — with `DARKMUX_CREW_DIR` exported, the
-    /// mission-writing tests in this module wrote 102 mission directories
-    /// into the operator's real board and the suite still exited 0, 98
-    /// passed. Nothing in a green run could have told anyone.
+    /// it closes is SILENT: a mission-writing test that reached the
+    /// operator's real board would still exit 0. Nothing in a green run
+    /// could tell anyone.
     ///
     /// It asserts against `user_state_root()` — the resolver every
     /// `missions/` write in this module actually routes through — not
@@ -2511,11 +2495,11 @@ mod tests {
     /// gone.
     #[test]
     #[serial_test::serial]
-    fn the_home_guard_also_pins_the_crew_dir_that_outranks_it() {
+    fn the_home_guard_pins_the_root_user_state_resolves_under() {
         const SENTINEL: &str = "/darkmux-round3-sentinel-must-not-be-used";
-        let ambient = std::env::var_os("DARKMUX_CREW_DIR");
+        let ambient = std::env::var_os("DARKMUX_HOME");
         // SAFETY: #[serial].
-        unsafe { std::env::set_var("DARKMUX_CREW_DIR", SENTINEL) };
+        unsafe { std::env::set_var("DARKMUX_HOME", SENTINEL) };
 
         let guard = DarkmuxHomeGuard::new();
         let root = crew::loader::user_state_root();
@@ -2523,32 +2507,30 @@ mod tests {
         drop(guard);
 
         // The guard restored what IT displaced…
-        let after_guard = std::env::var("DARKMUX_CREW_DIR").ok();
+        let after_guard = std::env::var("DARKMUX_HOME").ok();
 
         // …and this test restores what IT displaced, before any assertion
         // can panic and strand the sentinel in the process environment.
         // SAFETY: #[serial].
         unsafe {
             match &ambient {
-                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-                None => std::env::remove_var("DARKMUX_CREW_DIR"),
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
             }
         }
 
         assert!(
             pinned_ok,
-            "every missions/ write in this module resolves through user_state_root(), whose \
-             FIRST tier is crew_dir_override() — a guard that pins only DARKMUX_HOME leaves \
-             the fixtures landing in whatever board the environment names"
+            "every missions/ write in this module resolves through user_state_root(), which \
+             is the pinned root"
         );
         assert_eq!(
             after_guard.as_deref(),
             Some(SENTINEL),
-            "the guard must restore the crew dir it displaced, the same way it restores \
-             DARKMUX_HOME"
+            "the guard must restore the DARKMUX_HOME it displaced"
         );
         assert_eq!(
-            std::env::var_os("DARKMUX_CREW_DIR"),
+            std::env::var_os("DARKMUX_HOME"),
             ambient,
             "and this test must leave the ambient environment exactly as it found it — the \
              restore that went unasserted in #2698"

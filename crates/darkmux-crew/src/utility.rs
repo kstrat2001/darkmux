@@ -68,7 +68,7 @@ pub struct UtilityReply {
     pub content: String,
 }
 
-/// (#2914) The window a bare-string binding (no `n_ctx` declared) is loaded
+/// (#2914) The window a binding that declares no `n_ctx` is loaded
 /// at for a host-side utility job. Named, and disclosed on stderr when it
 /// applies, never silently substituted (#44). 16K is the window the radio
 /// routing seat ran at before #2914 (the operator's `radio` profile); a

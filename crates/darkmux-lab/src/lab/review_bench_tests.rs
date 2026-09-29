@@ -1007,7 +1007,7 @@
     }
 
     // Every test below resolves `mission_config::load("review")`, which reads
-    // the process-global DARKMUX_CREW_DIR. `#[serial_test::serial]` only
+    // the process-global DARKMUX_HOME. `#[serial_test::serial]` only
     // serializes against OTHER serial tests, so the gate test above (which
     // points that var at a tempdir holding a deliberately phase-less review
     // override) would otherwise race these and fail them with a dangling
@@ -1017,7 +1017,7 @@
     /// `~/.darkmux/lab`.
     ///
     /// Both halves of this were live defects. `run_review_bench` resolved its
-    /// default artifact path through `paths::resolve(Auto).runs` directly
+    /// default artifact path through `paths::resolve(ForceUser).runs` directly
     /// instead of `config_access::lab_dir()`, so:
     ///
     ///   1. every test that reached this path wrote real run directories into

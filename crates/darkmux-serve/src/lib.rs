@@ -3349,8 +3349,8 @@ async fn machine_specs_handler() -> axum::Json<serde_json::Value> {
     // matches a loaded model by its namespaced identifier OR its bare model key
     // (utility_model_id may be stored either way). Best-effort — a profiles read
     // failure just yields `None`.
-    // (#2915) With the binding's declared window (`n_ctx`, `null` when the
-    // bare form declared none), which the machine page's Utility section shows.
+    // (#2915) With the binding's declared window (`n_ctx`, `null` when
+    // none is declared), which the machine page's Utility section shows.
     let utility_model = tokio::task::spawn_blocking(|| {
         darkmux_profiles::profiles::load_registry(None).ok().and_then(|lr| {
             lr.registry

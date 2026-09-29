@@ -228,11 +228,7 @@ fn dispatch_panic_mid_run_leaves_no_tailer_sampler_watchdog_thread() {
 
     let real_path = std::env::var("PATH").unwrap_or_default();
 
-    // (Hard constraint, this task's own brief) Pin DARKMUX_HOME, never
-    // DARKMUX_CREW_DIR — DARKMUX_HOME is what `user_state_root()` actually
-    // resolves against; DARKMUX_CREW_DIR outranks it and pinning that
-    // instead would defeat this test's own isolation from a real
-    // `~/.darkmux`.
+    // Pin DARKMUX_HOME: it is what `user_state_root()` resolves against.
     let _home_guard = EnvVarGuard::set("DARKMUX_HOME", &home_dir);
     let _flows_guard = EnvVarGuard::set("DARKMUX_FLOWS_DIR", &flows_dir);
     let _ack_guard = EnvVarGuard::set("DARKMUX_ACK_DIR", &ack_dir);
