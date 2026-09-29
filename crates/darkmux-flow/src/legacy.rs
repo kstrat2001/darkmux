@@ -232,6 +232,14 @@ pub const OLD_PAYLOAD_KEYS: &[PayloadRename] = &[
         new: "resume_at_ms",
         change: ValueChange::IsoToEpochMs,
     },
+    // The retired review vocabulary's spelling of a step's spend.
+    PayloadRename {
+        actions: &[FlowAction::DispatchComplete, FlowAction::StepResult],
+        within: None,
+        old: "tokens",
+        new: "total_tokens",
+        change: ValueChange::Scale(1.0),
+    },
     PayloadRename {
         actions: &[FlowAction::UtilityStart],
         within: None,

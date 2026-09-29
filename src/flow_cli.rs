@@ -312,12 +312,14 @@ impl flow::FlowSink for DrainCountingSink {
     fn persist(&self, record: crate::flow::CheckedRecord<'_>) -> Result<()> {
         let record = record.get();
         if let Some(idx) = self.rule_filter {
-            let matches_idx = record
-                .payload
-                .as_ref()
-                .and_then(|p| p.get("rule_index"))
-                .and_then(|v| v.as_u64())
-                .is_some_and(|v| v as usize == idx);
+            let rule_index = match record.payload.as_ref() {
+                Some(flow::Payload::HookFired(p)) | Some(flow::Payload::HookFailed(flow::payload::HookFailedPayload::Delivery(p))) => {
+                    Some(p.rule_index)
+                }
+                Some(flow::Payload::HookFailed(flow::payload::HookFailedPayload::Notice(p))) => Some(p.rule_index),
+                _ => None,
+            };
+            let matches_idx = rule_index == Some(idx);
             if !matches_idx {
                 return Ok(());
             }

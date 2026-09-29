@@ -504,7 +504,7 @@ fn scan_flow_records_for_session(flows_dir: &Path, session_id: &str) -> (bool, b
 // timeout_override_seconds)` at the `argv_config` call site in
 // `dispatch_internal::dispatch` — has no test that fails when that
 // argument is swapped for `None`: mutating it built clean and left all
-// 1585 tests green. #2596 made it worse: `resolved_runtime_bounds_json`
+// 1585 tests green. #2596 made it worse: `resolved_runtime_bounds`
 // (the `dispatch.start` record's `bounds` block) reads the SAME
 // `opts.timeout_override_seconds` on a SEPARATE call site and hand-rolls
 // its own copy of the same precedence logic — so the two can
@@ -866,7 +866,7 @@ fn dispatch_i2596_forwards_the_cli_timeout_override_into_the_container() {
 
 /// The more valuable half (#2596): pins that `dispatch.start`'s `bounds`
 /// record and the container's actual budget cannot independently drift.
-/// `resolved_runtime_bounds_json` (feeding the record) and
+/// `resolved_runtime_bounds` (feeding the record) and
 /// `effective_inactivity_timeout_seconds` (feeding the container) are TWO
 /// SEPARATE functions, each re-reading `opts.timeout_override_seconds` at
 /// its own call site in `dispatch_internal::dispatch` and hand-rolling
@@ -922,7 +922,7 @@ fn dispatch_i2596_start_record_and_container_budget_must_agree() {
         "dispatch.start's bounds.inactivity_timeout_seconds.value ({record_value}) must \
          equal what the container was ACTUALLY given \
          (DARKMUX_INACTIVITY_TIMEOUT_SECONDS={container_value}) — #2596: these are \
-         resolved on two SEPARATE call sites (`resolved_runtime_bounds_json` for the \
+         resolved on two SEPARATE call sites (`resolved_runtime_bounds` for the \
          record, `effective_inactivity_timeout_seconds` for the container) that can \
          independently drift; a mismatch here means the record is lying about what \
          governed this run"

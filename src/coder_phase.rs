@@ -37,6 +37,7 @@ use crate::crew;
 use crate::fleet;
 use crate::flow;
 use darkmux_types::session_id::{RunId, SessionId};
+use darkmux_flow::payload::{MissionRunTerminalPayload, StepResultPayload};
 use darkmux_types::style;
 
 /// Emit a mission-run lifecycle flow record for the mission-level events
@@ -48,19 +49,11 @@ use darkmux_types::style;
 /// Best-effort (observability, never loop-failing).
 fn emit_run_record(
     level: flow::Level,
-    action: darkmux_flow::FlowAction,
     session: &SessionId,
     phase_id: &str,
-    payload: serde_json::Value,
+    payload: darkmux_flow::Payload,
 ) {
-    let _ = flow::record(crew::dispatch::build_session_record_with_payload(
-        level,
-        action,
-        "mission-run",
-        session,
-        Some(phase_id),
-        Some(payload),
-    ));
+    let _ = flow::record(crew::dispatch::build_session_record(level, "mission-run", session, Some(phase_id), payload));
 }
 
 /// (#1230 Packet 4) Emit a `"step result"` flow record — the rich,
@@ -85,25 +78,16 @@ fn emit_run_record(
 // reinventing a second vocabulary for the same event.
 pub(crate) fn emit_step_result(
     level: flow::Level,
-    kind: &str,
-    step_id: &str,
     session: &SessionId,
     phase_id: &str,
-    payload: serde_json::Value,
+    payload: StepResultPayload,
 ) {
-    let mut full = serde_json::json!({ "step_id": step_id, "kind": kind });
-    if let (serde_json::Value::Object(extra), serde_json::Value::Object(base)) =
-        (payload, &mut full)
-    {
-        base.extend(extra);
-    }
-    let _ = flow::record(crew::dispatch::build_session_record_with_payload(
+    let _ = flow::record(crew::dispatch::build_session_record(
         level,
-        darkmux_flow::FlowAction::StepResult,
         "mission-run",
         session,
         Some(phase_id),
-        Some(full),
+        darkmux_flow::Payload::StepResult(payload),
     ));
 }
 
@@ -639,16 +623,15 @@ impl StepKind for MissionWorktreeStepKind {
         );
         emit_step_result(
             flow::Level::Info,
-            "mission.worktree",
-            &step.id,
             &session,
             &ctx.phase_id,
-            serde_json::json!({
-                "role": ctx.role,
-                "base": ctx.base,
-                "branch": ctx.branch,
-                "worktree": ctx.wt_path.display().to_string(),
-            }),
+            StepResultPayload {
+                role: Some(ctx.role.to_string()),
+                base: Some(ctx.base.to_string()),
+                branch: Some(ctx.branch.to_string()),
+                worktree: Some(ctx.wt_path.display().to_string()),
+                ..StepResultPayload::new(&step.id, "mission.worktree")
+            },
         );
 
         Ok(StepOutcome {
@@ -929,11 +912,13 @@ impl StepKind for MissionCoderStepKind {
             print_token_line(&tokens);
             emit_step_result(
                 flow::Level::Error,
-                "mission.coder",
-                &step.id,
                 &session,
                 &ctx.phase_id,
-                serde_json::json!({ "exit_code": exit_code, "total_tokens": tokens.total }),
+                StepResultPayload {
+                    exit_code: Some(i64::from(exit_code)),
+                    total_tokens: Some(tokens.total),
+                    ..StepResultPayload::new(&step.id, "mission.coder")
+                },
             );
             *result_slot.lock().expect("mission.coder result mutex poisoned") = Some(CoderStepResult {
                 failed_verifiers: Vec::new(),
@@ -952,15 +937,14 @@ impl StepKind for MissionCoderStepKind {
             } else {
                 flow::Level::Warn
             },
-            "mission.coder",
-            &step.id,
             &session,
             &ctx.phase_id,
-            serde_json::json!({
-                "failed_verifiers": failed_verifiers,
-                "count": failed_verifiers.len(),
-                "total_tokens": tokens.total,
-            }),
+            StepResultPayload {
+                count: Some(failed_verifiers.len() as u64),
+                failed_verifiers: Some(failed_verifiers.clone()),
+                total_tokens: Some(tokens.total),
+                ..StepResultPayload::new(&step.id, "mission.coder")
+            },
         );
 
         let stdout = result.stdout.clone();
@@ -1123,7 +1107,7 @@ impl StepKind for MissionVerifyStepKind {
         match crate::phase_cli::phase_review_output_at(&ctx.wt_path, Some(&ctx.base), Some(&ctx.phase_id)) {
             Ok(review) => {
                 print_review_summary(&review);
-                let verdict = review.verdict.clone();
+                let verdict = review.verdict.to_string();
                 *result_slot.lock().expect("mission.verify result mutex poisoned") = Some(Ok(review));
                 Ok(StepOutcome {
                     output: verdict,
@@ -1463,15 +1447,15 @@ fn teardown_and_terminate_phase(
     }
 
     let Ok(run) = RunId::mission(mission_id) else { return };
+    let terminal = MissionRunTerminalPayload { branch: branch.clone(), worktree: wt_display.clone() };
     emit_run_record(
         flow::Level::Info,
-        match kind {
-            MissionTerminal::Finalize => darkmux_flow::FlowAction::MissionRunFinalize,
-            MissionTerminal::Abort => darkmux_flow::FlowAction::MissionRunAbort,
-        },
         &SessionId::phase(run, &phase.id),
         &phase.id,
-        serde_json::json!({ "branch": branch, "worktree": wt_display }),
+        match kind {
+            MissionTerminal::Finalize => darkmux_flow::Payload::MissionRunFinalize(terminal),
+            MissionTerminal::Abort => darkmux_flow::Payload::MissionRunAbort(terminal),
+        },
     );
 }
 
@@ -2313,13 +2297,14 @@ fn mission_cautions(
             if !in_mission {
                 continue;
             }
-            let payload = r.get("payload");
-            let pstr = |k: &str| payload.and_then(|p| p.get(k)).and_then(|v| v.as_str());
-            let detail = pstr("detail").unwrap_or("");
+            let Some(darkmux_flow::Payload::TelemetryDetector(finding)) = darkmux_flow::reader::payload_of(&r) else {
+                continue;
+            };
+            let detail = finding.detail.as_str();
             if detail.is_empty() {
                 continue;
             }
-            let kind = pstr("kind").unwrap_or("caution");
+            let kind = finding.kind.as_str();
             // (#2887 F5) `repetition` (the degeneracy gate + reasoning
             // checkpoint) is darkmux-internal vocabulary an operator reads
             // on the run page, not a finding about the CODE the next
@@ -2333,14 +2318,9 @@ fn mission_cautions(
             if kind == "repetition" {
                 continue;
             }
-            let severity = pstr("severity").unwrap_or("warn");
-            let area = payload.and_then(|p| p.get("area"));
-            let file = area
-                .and_then(|a| a.get("files"))
-                .and_then(|f| f.as_array())
-                .and_then(|arr| arr.first())
-                .and_then(|v| v.as_str());
-            let code_hash = area.and_then(|a| a.get("code_hash")).and_then(|v| v.as_str());
+            let severity = finding.severity.as_str();
+            let file = finding.area.as_ref().and_then(|a| a.files.first()).map(String::as_str);
+            let code_hash = finding.area.as_ref().and_then(|a| a.code_hash.as_deref());
             let ts = r.get("ts").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let bullet = match file {
                 Some(f) => format!("- [{kind}] {detail} (in `{f}`)"),

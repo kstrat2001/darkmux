@@ -810,6 +810,7 @@ dependencies = [
  "jaq-json",
  "jaq-std",
  "redis",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "serial_test",

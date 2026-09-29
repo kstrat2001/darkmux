@@ -1,5 +1,6 @@
 import { compactDuration } from "./format";
-import { ACTION, type NormAction, type NormRecord } from "./ingest";
+import type { DispatchToolPayload } from "../types/generated/DispatchToolPayload";
+import { ACTION, payloadOf, type NormRecord } from "./ingest";
 
 /**
  * The event-log row's trailing preview (`renderLog()`'s `detail`,
@@ -65,20 +66,18 @@ export function recordDetail(r: NormRecord): string {
   return escapeBidiControls(recordDetailRaw(r));
 }
 
-/** The budget records (#2902 step 5), which name their own subject in a row. */
-const BUDGET_ACTIONS: ReadonlySet<NormAction> = new Set<NormAction>([ACTION.BudgetWarn, ACTION.BudgetWait, ACTION.BudgetResume, ACTION.BudgetStop]);
-
 function recordDetailRaw(r: NormRecord): string {
-  const f = (r.fields || r.payload) as Record<string, unknown> | undefined;
   const a = r.action;
 
-  if (a === ACTION.DispatchReasoning && typeof f?.reasoning_text === "string") {
-    return `"${firstLine(f.reasoning_text, 60)}..."`;
+  const reasoning = payloadOf(r, ACTION.DispatchReasoning);
+  if (typeof reasoning?.reasoning_text === "string") {
+    return `"${firstLine(reasoning.reasoning_text, 60)}..."`;
   }
-  if (a === ACTION.DispatchTool && f) {
+  const tool = payloadOf(r, ACTION.DispatchTool);
+  if (tool) {
     // `args` absent on pre-1.16 records — fall back to its size, so an old
     // record degrades to what it can say rather than rendering a bare arrow.
-    const args = f.args != null ? prettyArgs(f.args) : `${f.args_chars ?? 0}ch`;
+    const args = tool.args != null ? prettyArgs(tool.args) : `${tool.args_chars ?? 0}ch`;
     // (#2008) Three outcomes, not two. A command that RAN and reported a
     // non-zero exit — a red test, a lint finding — is the tool working, and
     // marking it ❌ told the operator the instrument was broken. It shows its
@@ -89,47 +88,54 @@ function recordDetailRaw(r: NormRecord): string {
     // what they meant when written — the honest reading of an old record, not
     // a retroactive reinterpretation of it.
     let suffix = "";
-    if (typeof f.outcome === "string") {
-      if (f.outcome === "reported") suffix = ` exit ${f.exit_code ?? "?"}`;
-      else if (f.outcome === "failed") suffix = " ❌";
-    } else if (f.ok === false) {
+    if (typeof tool.outcome === "string") {
+      if (tool.outcome === "reported") suffix = ` exit ${tool.exit_code ?? "?"}`;
+      else if (tool.outcome === "failed") suffix = " ❌";
+    } else if (tool.ok === false) {
       suffix = " ❌";
     }
-    return `${String(f.tool_name ?? "")} ${args} → ${f.result_chars ?? 0}ch${suffix}`;
+    return `${String(tool.tool_name ?? "")} ${args} → ${tool.result_chars ?? 0}ch${suffix}`;
   }
-  if (a === ACTION.DispatchTurn && f) {
-    return `turn ${f.turn_seq ?? 0} (${String(f.finish_reason ?? "")})`;
+  const turn = payloadOf(r, ACTION.DispatchTurn);
+  if (turn) {
+    return `turn ${turn.turn_seq ?? 0} (${String(turn.finish_reason ?? "")})`;
   }
   // `reasoning` is a tier-decision-only top-level field absent from
   // `NormRecord`'s typed surface, so it is read defensively rather than added
   // to the type for one branch.
-  const reasoning = (r as unknown as { reasoning?: unknown }).reasoning;
-  if (a === ACTION.TierDecision && typeof reasoning === "string") {
-    return `"${firstLine(reasoning, 60)}..."`;
+  const tierReasoning = (r as unknown as { reasoning?: unknown }).reasoning;
+  if (a === ACTION.TierDecision && typeof tierReasoning === "string") {
+    return `"${firstLine(tierReasoning, 60)}..."`;
   }
   if (a === ACTION.DispatchStart) {
-    return `start (prompt: ${f?.prompt_chars ?? 0}ch)`;
+    return `start (prompt: ${payloadOf(r, ACTION.DispatchStart)?.prompt_chars ?? 0}ch)`;
   }
   // (#2902 step 5) A budget record says in the row itself what it is about
   // and, for a wait, how long: the run page is one of the three places a
   // wait must say so (with the CLI and `mission status`).
-  if (a !== undefined && BUDGET_ACTIONS.has(a) && f) {
-    const subject = String(f.endpoint_id ?? f.step ?? "budget");
+  const budget = budgetPayloadOf(r);
+  if (a !== undefined && budget) {
+    const subject = String(budget.endpoint_id ?? budget.step ?? "budget");
     if (a === ACTION.BudgetWait) {
-      return typeof f.wait_ms === "number" ? `${subject}: waiting ${spanWords(f.wait_ms / 1000)}` : `${subject}: waiting`;
+      return typeof budget.wait_ms === "number" ? `${subject}: waiting ${spanWords(budget.wait_ms / 1000)}` : `${subject}: waiting`;
     }
     if (a === ACTION.BudgetStop) {
-      return typeof f.reason === "string" ? `${subject}: wait stopped (${f.reason})` : `${subject}: wait stopped`;
+      return typeof budget.reason === "string" ? `${subject}: wait stopped (${budget.reason})` : `${subject}: wait stopped`;
     }
-    if (a === ACTION.BudgetResume && typeof f.waited_ms === "number") {
-      return `${subject}: resumed after ${spanWords(f.waited_ms / 1000)}`;
+    if (a === ACTION.BudgetResume && typeof budget.waited_ms === "number") {
+      return `${subject}: resumed after ${spanWords(budget.waited_ms / 1000)}`;
     }
-    if (a === ACTION.BudgetWarn && typeof f.spent === "number" && typeof f.limit === "number") {
-      const per = typeof f.period === "string" ? ` per ${f.period}` : "";
-      return `${subject}: ${f.spent}/${f.limit} ${String(f.metric ?? "tokens")}${per}`;
+    if (a === ACTION.BudgetWarn && typeof budget.spent === "number" && typeof budget.limit === "number") {
+      const per = typeof budget.period === "string" ? ` per ${budget.period}` : "";
+      return `${subject}: ${budget.spent}/${budget.limit} ${String(budget.metric ?? "tokens")}${per}`;
     }
   }
   return "";
+}
+
+/** The budget records share one payload type across their four actions. */
+function budgetPayloadOf(r: NormRecord) {
+  return payloadOf(r, ACTION.BudgetWarn) ?? payloadOf(r, ACTION.BudgetWait) ?? payloadOf(r, ACTION.BudgetResume) ?? payloadOf(r, ACTION.BudgetStop);
 }
 
 /** `45s`, `14m`, `1h 4m`: a span in words, never clock-shaped (a wait of
@@ -367,7 +373,7 @@ function unquote(s: string): string {
  *  `failed`. `undefined` when the record says neither. (#2890) Exported so
  *  the run page's TOOL CALLS failed count reads the same rule as the event
  *  log's row, not a second copy of it. */
-export function toolOutcome(f: Record<string, unknown>): RecordObject["outcome"] {
+export function toolOutcome(f: Pick<DispatchToolPayload, "outcome" | "ok">): RecordObject["outcome"] {
   if (typeof f.outcome === "string") {
     return f.outcome === "reported" ? "reported" : f.outcome === "failed" ? "failed" : "ok";
   }
@@ -378,7 +384,7 @@ export function toolOutcome(f: Record<string, unknown>): RecordObject["outcome"]
 
 /** A `dispatch.tool` record's `args` as an object, or `null` when they are
  *  not a JSON object (absent, or cut short by the per-call cap). */
-function parseToolArgs(f: Record<string, unknown>): Record<string, unknown> | null {
+function parseToolArgs(f: Partial<Pick<DispatchToolPayload, "args">>): Record<string, unknown> | null {
   if (typeof f.args !== "string") return null;
   try {
     let parsed: unknown = JSON.parse(f.args);
@@ -399,7 +405,7 @@ function parseToolArgs(f: Record<string, unknown>): Record<string, unknown> | nu
  *  log row's reading (`recordObject`), plus the `./`, so the
  *  run page's readout and the log never name different files. `null` when
  *  the call named none. */
-export function toolCallPath(f: Record<string, unknown>): string | null {
+export function toolCallPath(f: Partial<Pick<DispatchToolPayload, "args" | "tool_name" | "result">>): string | null {
   const args = parseToolArgs(f);
   let path: string | null = null;
   if (args) {
@@ -427,10 +433,9 @@ export function cleanToolPath(raw: unknown): string | null {
 }
 
 export function recordObject(r: NormRecord): RecordObject {
-  const f = (r.fields || r.payload) as Record<string, unknown> | undefined;
-  const a = r.action;
+  const f = payloadOf(r, ACTION.DispatchTool);
 
-  if (a === ACTION.DispatchTool && f) {
+  if (f) {
     const args = parseToolArgs(f);
     let text = "";
     let mono = false;
@@ -469,8 +474,9 @@ export function recordObject(r: NormRecord): RecordObject {
     if (outcome) o.outcome = outcome;
     return o;
   }
-  if (a === ACTION.DispatchReasoning && typeof f?.reasoning_text === "string") {
-    const first = unquote(f.reasoning_text).split("\n").find((l) => l.trim()) ?? "";
+  const reasoning = payloadOf(r, ACTION.DispatchReasoning);
+  if (typeof reasoning?.reasoning_text === "string") {
+    const first = unquote(reasoning.reasoning_text).split("\n").find((l) => l.trim()) ?? "";
     return { chip: "reasoning", kind: "think", text: escapeBidiControls(first.trim()) || "(no reasoning text)", mono: false };
   }
   // (#2863 review round 2, finding 5) `recordDetail()` escapes its own

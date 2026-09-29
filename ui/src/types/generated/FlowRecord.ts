@@ -3,6 +3,7 @@ import type { Category } from "./Category";
 import type { FlowAction } from "./FlowAction";
 import type { FlowSource } from "./FlowSource";
 import type { Level } from "./Level";
+import type { Payload } from "./Payload";
 import type { Stage } from "./Stage";
 import type { Tier } from "./Tier";
 
@@ -94,22 +95,15 @@ prev_hash?: string,
  */
 hash?: string, 
 /**
- * Event-specific structured fields that aren't promoted to first-class
- * `FlowRecord` members. Schema 1.6 addition (#204) — gives new event
- * types (`dispatch.turn`, `dispatch.tool`, `dispatch.compaction`,
- * `dispatch.reasoning`, `mission.compile.start/complete`) a place to
- * carry their event-specific fields without growing the struct
- * indefinitely.
+ * The event-specific fields, typed per action (see [`crate::payload`]).
+ * A record carries the payload of its own action: build it with
+ * [`FlowRecord::for_session_with`] / [`FlowRecord::for_execution_with`],
+ * which take the action from the payload. A payload read from an archive
+ * is settled into its action's type by [`crate::reader`]; a
+ * `FlowRecord` deserialized directly holds [`Payload::Unread`] until
+ * [`FlowRecord::settled`] runs.
  *
- * Convention: keys are snake_case strings; values are typed by event
- * shape (e.g. `dispatch.tool` uses `tool_name: string`, `args_chars:
- * integer`, `result_chars: integer`, `success: boolean`). See the
- * emit sites in `dispatch.rs` / `dispatch_internal.rs` for the
- * per-event-type payload shapes.
- *
- * Older records (pre-1.6) lack the field; viewer treats absence as
- * the empty object `{}`. New event types degrade to "action only" on
- * older viewers — they see the action string and the standard
- * FlowRecord fields, just not the event-specific extras.
+ * Older records (pre-1.6) lack the field, and an action with no payload
+ * never carries one.
  */
-payload?: Record<string, unknown>, };
+payload?: Payload, };

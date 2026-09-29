@@ -83,8 +83,8 @@ import {
   type StepHeaderField,
 } from "./graph";
 import { initMinimap, isNarrowViewport, persistMinimap, timelineActive } from "./timeline";
-import { byTime, ingest, type NormRecord } from "../../lib/ingest";
-import { isHostSampleRecord } from "../../lib/machineDrawerScope";
+import { byTime, ingest, stepIdOf, type NormRecord } from "../../lib/ingest";
+import { isHostSampleRecord, toPoint } from "../../lib/machineDrawerScope";
 import type { FlowRecord } from "../../types/generated/FlowRecord";
 import type { FlowRecordsResponse } from "../../types/generated/FlowRecordsResponse";
 import type { MissionGraph } from "../../types/generated/MissionGraph";
@@ -197,16 +197,13 @@ function useProcReadout(tail: NormRecord[] | undefined): ProcSample | null {
   const [proc, setProc] = useState<ProcSample | null>(null);
   useEffect(() => {
     if (!latest || !latest.payload) return;
-    // (#2413) `machine.telemetry` carries `cpu_pct`/`mem_pct`/`gpu_pct`
-    // (the full `host_probe` shape); the retired `telemetry.process`
-    // carried bare `cpu`/`mem`/`gpu`. Prefer the new keys, fall back to
-    // the old ones.
-    const p = latest.payload as { cpu?: unknown; gpu?: unknown; mem?: unknown; cpu_pct?: unknown; gpu_pct?: unknown; mem_pct?: unknown };
-    const num = (v: unknown): number | undefined => (typeof v === "number" ? v : undefined);
+    // (#2413) `toPoint` reads `machine.telemetry`'s payload, or the retired
+    // `telemetry.process` shape an older archive holds.
+    const point = toPoint(latest);
     setProc({
-      cpu: num(p.cpu_pct) ?? num(p.cpu),
-      gpu: num(p.gpu_pct) ?? num(p.gpu),
-      mem: num(p.mem_pct) ?? num(p.mem),
+      cpu: point.cpu,
+      gpu: point.gpu,
+      mem: point.mem,
       rx: Date.now(),
     });
   }, [latest]);
@@ -607,7 +604,7 @@ export function MissionGraphLens({
   // filter of the one record set this lens already holds.
   const selectedStepRecords = useMemo(() => {
     if (!selectedStepId) return [];
-    return events.filter((r) => r.payload && r.payload.step_id === selectedStepId);
+    return events.filter((r) => stepIdOf(r) === selectedStepId);
   }, [events, selectedStepId]);
 
   const anyRunning = !!(

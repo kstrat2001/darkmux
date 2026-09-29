@@ -42,9 +42,12 @@ use darkmux_crew::host_probe::{
     battery, reduce_host_extras, BatteryHealth, BatterySample, HostExtraAt, HostProbe,
     HostSampleFull,
 };
-use darkmux_crew::host_probe::wire::{BatteryHealthNow, HostSampleNow, PowerWindowWire, ThermalWindowWire};
+use darkmux_crew::host_probe::wire::{host_sample_now, BatteryHealthNow, PowerWindowWire, ThermalWindowWire};
 use darkmux_crew::telemetry_sampler::{reduce_host_stats, HostSampleAt};
-use crate::wire::{LoadWindow, MachineLoad};
+use darkmux_flow::payload::{
+    BatteryCharge, BatteryTransition, LoadWindow, MachineBatteryHealthPayload, MachineBatteryPayload, MachineLoad,
+    MachineRollupPayload, MachineThermalPayload,
+};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -150,6 +153,12 @@ impl HostSamplerRing {
         });
     }
 
+    /// Test-only: the snapshot as the JSON it serializes to.
+    #[cfg(test)]
+    pub(crate) fn snapshot_json(&self) -> Option<serde_json::Value> {
+        self.snapshot().map(|load| serde_json::to_value(load).unwrap_or_default())
+    }
+
     /// Test-only: set the cadence [`spawn`] would otherwise record, without
     /// actually spawning a sampler thread. Needed to exercise
     /// `snapshot`'s sleep-gap cap (`reduce_host_extras`'s
@@ -212,7 +221,7 @@ impl HostSamplerRing {
         let span_ms = raw.last().unwrap().at_ms.saturating_sub(raw.first().unwrap().at_ms);
         drop(g);
 
-        // (#2111) The "now" shape is the shared `sample_full_json` mapping —
+        // (#2111) The "now" shape is the shared `host_sample_now` mapping —
         // the same one `dispatch_internal::run_telemetry_sampler` uses for
         // the periodic `machine.telemetry` flow record's payload — so the
         // two never independently drift on what a host reading's JSON shape
@@ -224,7 +233,7 @@ impl HostSamplerRing {
         let health = self.battery_health.lock().ok().and_then(|h| h.clone());
         Some(MachineLoad {
             battery_health: health.as_ref().map(BatteryHealthNow::from),
-            now: HostSampleNow::new(&latest.sample, latest.at_ms),
+            now: host_sample_now(&latest.sample, latest.at_ms),
             window: LoadWindow {
                 samples: stats.samples,
                 span_ms,
@@ -243,11 +252,6 @@ impl HostSamplerRing {
                 energy_mwh: ex.energy_mwh,
             },
         })
-    }
-
-    /// The snapshot as the JSON value the `machine.rollup` record embeds.
-    pub(crate) fn snapshot_json(&self) -> Option<serde_json::Value> {
-        self.snapshot().map(|load| serde_json::to_value(load).unwrap_or(serde_json::Value::Null))
     }
 }
 
@@ -304,12 +308,13 @@ fn build_thermal_transition_record_with(
     } else {
         darkmux_flow::Level::Info
     };
-    let mut payload = serde_json::json!({
-        "from": from,
-        "to": to,
-        "cpu_speed_limit_pct": sample.thermal.as_ref().map(|t| t.cpu_speed_limit_pct),
-        "power_mw_total": sample.power.as_ref().map(|p| p.total_mw().round() as i64),
-        "sampled_at_ms": sampled_at_ms,
+    let mut payload = darkmux_flow::Payload::MachineThermal(MachineThermalPayload {
+        from: from.to_string(),
+        to: to.to_string(),
+        cpu_speed_limit_pct: sample.thermal.as_ref().map(|t| t.cpu_speed_limit_pct),
+        power_mw_total: sample.power.as_ref().map(|p| p.total_mw().round() as i64),
+        sampled_at_ms,
+        simulated_host_source: None,
     });
     darkmux_crew::host_source::stamp_with(provenance, &mut payload);
     let display_name = darkmux_flow::resolve_machine_id().unwrap_or_else(|| "unknown".to_string());
@@ -432,11 +437,11 @@ fn build_battery_health_record(
     poll_interval_ms: u64,
     sampled_at_ms: u64,
 ) -> darkmux_flow::FlowRecord {
-    let mut payload = darkmux_crew::host_probe::battery_health_json(health);
-    if let Some(obj) = payload.as_object_mut() {
-        obj.insert("poll_interval_ms".into(), serde_json::json!(poll_interval_ms));
-        obj.insert("sampled_at_ms".into(), serde_json::json!(sampled_at_ms));
-    }
+    let payload = darkmux_flow::Payload::MachineBatteryHealth(MachineBatteryHealthPayload {
+        health: BatteryHealthNow::from(health),
+        poll_interval_ms,
+        sampled_at_ms,
+    });
     let display_name = darkmux_flow::resolve_machine_id().unwrap_or_else(|| "unknown".to_string());
     darkmux_flow::FlowRecord {
         ts: darkmux_flow::ts_utc_now(),
@@ -533,19 +538,19 @@ fn same_health(a: &BatteryHealth, b: &BatteryHealth) -> bool {
 /// `power.min_battery_pct` #2706's gate enforces, so "the stream said it
 /// crossed" and "the gate refused" can never disagree about where the line
 /// was.
-fn battery_transitions(prev: &BatterySample, now: &BatterySample, floor_pct: u8) -> Vec<&'static str> {
+fn battery_transitions(prev: &BatterySample, now: &BatterySample, floor_pct: u8) -> Vec<BatteryTransition> {
     let mut out = Vec::new();
     match (prev.on_ac, now.on_ac) {
-        (true, false) => out.push("to-battery"),
-        (false, true) => out.push("to-ac"),
+        (true, false) => out.push(BatteryTransition::ToBattery),
+        (false, true) => out.push(BatteryTransition::ToAc),
         _ => {}
     }
     let was_below = prev.charge_pct < floor_pct;
     let is_below = now.charge_pct < floor_pct;
     if !was_below && is_below {
-        out.push("below-floor");
+        out.push(BatteryTransition::BelowFloor);
     } else if was_below && !is_below {
-        out.push("at-or-above-floor");
+        out.push(BatteryTransition::AtOrAboveFloor);
     }
     out
 }
@@ -558,7 +563,7 @@ fn battery_transitions(prev: &BatterySample, now: &BatterySample, floor_pct: u8)
 /// normal laptop life, and warning on it would be the editorializing the
 /// issue rules out.
 fn build_battery_transition_record(
-    transitions: &[&'static str],
+    transitions: &[BatteryTransition],
     from: &BatterySample,
     to: &BatterySample,
     floor_pct: u8,
@@ -588,27 +593,28 @@ fn build_battery_transition_record(
 /// pause is justified by, and being machine-scoped it rides the fleet
 /// stream to another machine's machine lens.
 fn build_battery_transition_record_with(
-    transitions: &[&'static str],
+    transitions: &[BatteryTransition],
     from: &BatterySample,
     to: &BatterySample,
     floor_pct: u8,
     sampled_at_ms: u64,
     provenance: &darkmux_crew::host_source::Provenance,
 ) -> darkmux_flow::FlowRecord {
-    let level = if transitions.contains(&"below-floor") {
+    let level = if transitions.contains(&BatteryTransition::BelowFloor) {
         darkmux_flow::Level::Warn
     } else {
         darkmux_flow::Level::Info
     };
-    let mut payload = serde_json::json!({
-        "transitions": transitions,
-        "from": darkmux_crew::host_probe::battery_sample_json(from),
-        "to": darkmux_crew::host_probe::battery_sample_json(to),
+    let mut payload = darkmux_flow::Payload::MachineBattery(MachineBatteryPayload {
+        transitions: transitions.to_vec(),
+        from: BatteryCharge::from(from),
+        to: BatteryCharge::from(to),
         // The floor this crossing was judged against, recorded so a reader
         // is not left to guess which config was in force at the time.
-        "floor_pct": floor_pct,
-        "floor_field": darkmux_crew::power_policy::FLOOR_FIELD,
-        "sampled_at_ms": sampled_at_ms,
+        floor_pct,
+        floor_field: darkmux_crew::power_policy::FLOOR_FIELD.to_string(),
+        sampled_at_ms,
+        simulated_host_source: None,
     });
     darkmux_crew::host_source::stamp_with(provenance, &mut payload);
     let display_name = darkmux_flow::resolve_machine_id().unwrap_or_else(|| "unknown".to_string());
@@ -751,7 +757,7 @@ fn residency_json(ledger: &darkmux_profiles::model_ledger::ModelLedger) -> serde
 /// would light the same lamp every minute for a condition already reported.
 #[allow(clippy::too_many_arguments)]
 fn build_machine_rollup_record(
-    load: serde_json::Value,
+    load: MachineLoad,
     residency: Option<serde_json::Value>,
     previous_thermal_state: Option<&str>,
     period_ms: u64,
@@ -787,7 +793,7 @@ fn build_machine_rollup_record(
 /// cooking with nothing in the data saying otherwise.
 #[allow(clippy::too_many_arguments)]
 fn build_machine_rollup_record_with(
-    load: serde_json::Value,
+    load: MachineLoad,
     residency: Option<serde_json::Value>,
     previous_thermal_state: Option<&str>,
     period_ms: u64,
@@ -796,33 +802,27 @@ fn build_machine_rollup_record_with(
     sampled_at_ms: u64,
     provenance: &darkmux_crew::host_source::Provenance,
 ) -> darkmux_flow::FlowRecord {
-    let mut payload = serde_json::json!({
-        // Constraint 4: the CONFIGURED cadence...
-        "period_ms": period_ms,
-        // ...and the MEASURED gap since the previous emission. The same
-        // rule `machine.telemetry` follows: a tick that ran late reports
-        // what actually happened rather than restating the knob.
-        "emitted_interval_ms": emitted_interval_ms,
-        // Constraint 3: this rollup's own total cost, ledger gather
-        // included (`residency.gather_ms` breaks out the expensive half).
-        "gather_ms": gather_ms,
-        "sampled_at_ms": sampled_at_ms,
-        "previous_thermal_state": previous_thermal_state,
-        "residency": residency,
-    });
     // `load` is the machine lens's own `now`/`window`/`battery_health`
     // object, spliced in at the top level rather than nested under a
     // `load` key: the aggregate IS the machine picture, and a consumer
     // writing a hook predicate should say `payload.window.thermal.…`, not
     // `payload.load.window.thermal.…`.
-    if let (Some(obj), Some(load_obj)) = (payload.as_object_mut(), load.as_object()) {
-        for (k, v) in load_obj {
-            obj.insert(k.clone(), v.clone());
-        }
-    }
-    // AFTER the splice, not before: the splice is a blind key-by-key
-    // overwrite of whatever the lens object carries, so a stamp written
-    // first would be one `load` key away from being silently replaced.
+    let mut payload = darkmux_flow::Payload::MachineRollup(MachineRollupPayload {
+        // Constraint 4: the CONFIGURED cadence...
+        period_ms,
+        // ...and the MEASURED gap since the previous emission. The same
+        // rule `machine.telemetry` follows: a tick that ran late reports
+        // what actually happened rather than restating the knob.
+        emitted_interval_ms,
+        // Constraint 3: this rollup's own total cost, ledger gather
+        // included (`residency.gather_ms` breaks out the expensive half).
+        gather_ms,
+        sampled_at_ms,
+        previous_thermal_state: previous_thermal_state.map(str::to_string),
+        residency,
+        load,
+        simulated_host_source: None,
+    });
     darkmux_crew::host_source::stamp_with(provenance, &mut payload);
     let display_name = darkmux_flow::resolve_machine_id().unwrap_or_else(|| "unknown".to_string());
     darkmux_flow::FlowRecord {
@@ -1114,7 +1114,7 @@ pub(crate) fn spawn(
                     // one out. Found by writing the test that pins the
                     // seeding, which is why it had survived: every existing
                     // test asked only whether a record eventually lands.
-                    if let Some(load) = ring.snapshot_json() {
+                    if let Some(load) = ring.snapshot() {
                         ms_since_rollup = 0;
                         let ledger = darkmux_profiles::model_ledger::gather();
                         let residency = residency_json(&ledger);
@@ -1200,8 +1200,8 @@ pub(crate) fn spawn(
                         // depended on is part of this record's own write
                         // cost — stamped so "the observer was negligible"
                         // stays a verifiable claim in the data.
-                        if let Some(obj) = rec.payload.as_mut().and_then(|p| p.as_object_mut()) {
-                            obj.insert("liveness_probe_ms".into(), serde_json::json!(liveness_probe_ms));
+                        if let Some(darkmux_flow::Payload::MachineTelemetry(p)) = rec.payload.as_mut() {
+                            p.liveness_probe_ms = Some(liveness_probe_ms);
                         }
                         let _ = darkmux_flow::record(rec);
                     }
@@ -1240,6 +1240,13 @@ mod tests {
     use darkmux_crew::host_probe::{CpuCluster, PowerSample, ThermalSample};
     use std::time::Instant;
     use tempfile::TempDir;
+
+    /// A machine picture from a ring holding one sample.
+    fn a_load() -> MachineLoad {
+        let ring = HostSamplerRing::new();
+        ring.push_for_test(0, 10, 20, 30, 1);
+        ring.snapshot().expect("one sample")
+    }
 
     fn entry(at_ms: u64, cpu: u64, mem: u64, gpu: u64, cost_ms: u64) -> RingEntry {
         RingEntry {
@@ -1297,7 +1304,7 @@ mod tests {
             matches!(rec.level, darkmux_flow::Level::Info),
             "normal laptop life is not a warning"
         );
-        let p = rec.payload.expect("payload");
+        let p = rec.payload_json();
         assert_eq!(p["transitions"], serde_json::json!(["to-battery"]));
         assert_eq!(p["from"]["on_ac"], true);
         assert_eq!(p["to"]["on_ac"], false);
@@ -1307,7 +1314,7 @@ mod tests {
         assert!(rec.is_none(), "an unchanged state is not a transition");
 
         let (_, rec) = battery_edge(known.as_ref(), &sample_with_battery(Some(on_ac)), 50, 5_000);
-        let p = rec.expect("replugging is a transition").payload.expect("payload");
+        let p = rec.expect("replugging is a transition").payload_json();
         assert_eq!(p["transitions"], serde_json::json!(["to-ac"]));
     }
 
@@ -1321,7 +1328,7 @@ mod tests {
             matches!(rec.level, darkmux_flow::Level::Warn),
             "below-floor is the one transition that changes what the machine will DO"
         );
-        let p = rec.payload.expect("payload");
+        let p = rec.payload_json();
         assert_eq!(p["transitions"], serde_json::json!(["below-floor"]));
         assert_eq!(p["floor_pct"], 50);
         assert_eq!(p["floor_field"], darkmux_crew::power_policy::FLOOR_FIELD);
@@ -1345,7 +1352,7 @@ mod tests {
         let (_, rec) = battery_edge(Some(&below), &sample_with_battery(Some(recovered)), 50, 1_000);
         let rec = rec.expect("recovery is a transition");
         assert!(matches!(rec.level, darkmux_flow::Level::Info));
-        let p = rec.payload.expect("payload");
+        let p = rec.payload_json();
         // Plugging in and crossing back up happen together and are both named.
         assert_eq!(p["transitions"], serde_json::json!(["to-ac", "at-or-above-floor"]));
     }
@@ -1508,7 +1515,7 @@ mod tests {
     fn a_changed_health_value_emits_with_the_cadence_that_produced_it() {
         let (known, _) = battery_health_edge(None, Some(&health_with(26)), 3_600_000, 0);
         let (_, rec) = battery_health_edge(known.as_ref(), Some(&health_with(27)), 3_600_000, 3_600_000);
-        let p = rec.expect("a real movement").payload.expect("payload");
+        let p = rec.expect("a real movement").payload_json();
         assert_eq!(p["cycle_count"], 27);
         assert_eq!(
             p["poll_interval_ms"], 3_600_000,
@@ -2229,17 +2236,17 @@ mod tests {
         }
         assert_eq!(records.len(), 3, "expected exactly 3 transitions, got {records:?}");
 
-        let p0 = records[0].payload.as_ref().unwrap();
+        let p0 = records[0].payload_json();
         assert_eq!(p0["from"], "nominal");
         assert_eq!(p0["to"], "fair");
         assert!(matches!(records[0].level, darkmux_flow::Level::Info), "rising to fair is Info");
 
-        let p1 = records[1].payload.as_ref().unwrap();
+        let p1 = records[1].payload_json();
         assert_eq!(p1["from"], "fair");
         assert_eq!(p1["to"], "serious");
         assert!(matches!(records[1].level, darkmux_flow::Level::Warn), "rising INTO serious is Warn");
 
-        let p2 = records[2].payload.as_ref().unwrap();
+        let p2 = records[2].payload_json();
         assert_eq!(p2["from"], "serious");
         assert_eq!(p2["to"], "nominal");
         assert!(matches!(records[2].level, darkmux_flow::Level::Info), "falling back to nominal is Info");
@@ -2298,7 +2305,7 @@ mod tests {
         };
         let (_next, rec) = thermal_edge(prev.as_deref(), &sample, 5000);
         let rec = rec.expect("nominal -> serious is a real transition");
-        let payload = rec.payload.unwrap();
+        let payload = rec.payload_json();
         assert_eq!(payload["cpu_speed_limit_pct"], 62);
         assert_eq!(payload["power_mw_total"], 1230);
         assert_eq!(payload["sampled_at_ms"], 5000);
@@ -2339,7 +2346,7 @@ mod tests {
             "a rise into critical is still an operator-actionable Warn — the stamp answers \
              WHOSE machine it happened on, it does not downgrade the event"
         );
-        let payload = rec.payload.expect("payload present");
+        let payload = rec.payload_json();
         assert_eq!(payload["to"], "critical");
         assert_eq!(
             payload["simulated_host_source"], "/tmp/critical-breaker.jsonl",
@@ -2360,7 +2367,7 @@ mod tests {
             },
         );
         assert!(
-            unavailable.payload.expect("payload present").get("simulated_host_source").is_none(),
+            unavailable.payload_json().get("simulated_host_source").is_none(),
             "nothing is simulated when the scenario failed to load, so nothing may be stamped"
         );
     }
@@ -2380,7 +2387,7 @@ mod tests {
         let below = battery_at(5, false);
 
         let (_, real) = battery_edge(Some(&above), &sample_with_battery(Some(below)), 50, 1_000);
-        let real = real.expect("60% -> 5% crosses a 50% floor").payload.expect("payload");
+        let real = real.expect("60% -> 5% crosses a 50% floor").payload_json();
         assert_eq!(real["transitions"], serde_json::json!(["below-floor"]));
         assert!(
             real.get("simulated_host_source").is_none(),
@@ -2392,13 +2399,13 @@ mod tests {
             frames: 2,
             span_ms: 4_000,
         };
-        let rec = build_battery_transition_record_with(&["below-floor"], &above, &below, 50, 1_000, &scripted);
+        let rec = build_battery_transition_record_with(&[BatteryTransition::BelowFloor], &above, &below, 50, 1_000, &scripted);
         assert!(
             matches!(rec.level, darkmux_flow::Level::Warn),
             "a floor crossing stays operator-actionable — the stamp answers WHOSE reading it was, \
              it does not downgrade the event"
         );
-        let payload = rec.payload.expect("payload present");
+        let payload = rec.payload_json();
         assert_eq!(
             payload["simulated_host_source"], "/tmp/battery-floor.jsonl",
             "a scripted pause trigger must name the scenario file behind it: {payload}"
@@ -2407,7 +2414,7 @@ mod tests {
         // A NAMED scenario that failed to load reads REAL hardware, so it
         // must not be marked — same rule the thermal record follows.
         let unavailable = build_battery_transition_record_with(
-            &["below-floor"],
+            &[BatteryTransition::BelowFloor],
             &above,
             &below,
             50,
@@ -2418,35 +2425,8 @@ mod tests {
             },
         );
         assert!(
-            unavailable.payload.expect("payload present").get("simulated_host_source").is_none(),
+            unavailable.payload_json().get("simulated_host_source").is_none(),
             "nothing is simulated when the scenario failed to load, so nothing may be stamped"
-        );
-    }
-
-    /// (C4) The rollup stamps AFTER splicing the lens object in, and the
-    /// ordering is load-bearing: the splice is a blind key-by-key overwrite
-    /// of whatever `load` carries, so a stamp written first is one key away
-    /// from being silently replaced. `load` cannot carry that key today —
-    /// which is exactly why the ordering needs a test rather than only a
-    /// comment, since reversing it is green until the day it is not.
-    #[test]
-    fn the_rollup_stamp_survives_a_load_object_carrying_the_same_key() {
-        let scripted = darkmux_crew::host_source::Provenance::Scripted {
-            path: "/tmp/real-scenario.jsonl".to_string(),
-            frames: 1,
-            span_ms: 1_000,
-        };
-        let load = serde_json::json!({
-            "now": { "thermal": { "state": "critical" } },
-            // The decoy: a `load` key claiming the readings were real.
-            "simulated_host_source": "/tmp/DECOY-from-the-load-object.jsonl",
-        });
-        let payload = build_machine_rollup_record_with(load, None, None, 60, 60_000, 1, 0, &scripted)
-            .payload
-            .expect("payload");
-        assert_eq!(
-            payload["simulated_host_source"], "/tmp/real-scenario.jsonl",
-            "the provenance the record was BUILT with must win over anything the spliced lens              object carries under the same key: {payload}"
         );
     }
 
@@ -2467,7 +2447,7 @@ mod tests {
     #[test]
     fn battery_health_is_never_stamped_because_the_facade_cannot_reach_it() {
         let payload =
-            build_battery_health_record(&health_with(120), 3_600_000, 1_000).payload.expect("payload");
+            build_battery_health_record(&health_with(120), 3_600_000, 1_000).payload_json();
         assert!(
             payload.get("simulated_host_source").is_none(),
             "health is a real IOKit read on every source, so it carries no simulation marker: {payload}"
@@ -2494,7 +2474,7 @@ mod tests {
         ring.set_configured_interval_for_test(5_000);
         ring.push_for_test(0, 10, 20, 30, 7);
         ring.push_for_test(5_000, 50, 60, 70, 8);
-        let load = ring.snapshot_json().expect("two samples are in the ring");
+        let load = ring.snapshot().expect("two samples are in the ring");
 
         let rec = build_machine_rollup_record(
             load,
@@ -2507,7 +2487,7 @@ mod tests {
         );
         assert_eq!(rec.action, darkmux_flow::FlowAction::MachineRollup);
         assert_eq!(rec.source, Some(darkmux_flow::FlowSource::HostSampler));
-        let p = rec.payload.expect("payload");
+        let p = rec.payload_json();
         // The lens's own keys, not re-spelled and not wrapped.
         assert!(p.get("now").is_some(), "the lens's `now` block rides at the top level");
         assert_eq!(p["window"]["samples"], 2);
@@ -2524,7 +2504,7 @@ mod tests {
     #[test]
     fn the_rollup_stamps_its_own_cost_and_records_both_cadences() {
         let rec = build_machine_rollup_record(
-            serde_json::json!({}),
+            a_load(),
             None,
             None,
             60_000,
@@ -2532,7 +2512,7 @@ mod tests {
             42,
             9_000,
         );
-        let p = rec.payload.expect("payload");
+        let p = rec.payload_json();
         assert_eq!(p["gather_ms"], 42, "the observer's own cost must be in the artifact");
         assert_eq!(p["period_ms"], 60_000, "the configured knob");
         assert_eq!(
@@ -2549,11 +2529,11 @@ mod tests {
     /// than guessing `nominal`.
     #[test]
     fn previous_thermal_state_is_null_until_a_transition_has_been_seen() {
-        let rec = build_machine_rollup_record(serde_json::json!({}), None, None, 60_000, 60_000, 1, 0);
-        assert_eq!(rec.payload.unwrap()["previous_thermal_state"], serde_json::Value::Null);
+        let rec = build_machine_rollup_record(a_load(), None, None, 60_000, 60_000, 1, 0);
+        assert_eq!(rec.payload_json()["previous_thermal_state"], serde_json::Value::Null);
 
         let rec = build_machine_rollup_record(
-            serde_json::json!({}),
+            a_load(),
             None,
             Some("nominal"),
             60_000,
@@ -2561,7 +2541,7 @@ mod tests {
             1,
             0,
         );
-        assert_eq!(rec.payload.unwrap()["previous_thermal_state"], "nominal");
+        assert_eq!(rec.payload_json()["previous_thermal_state"], "nominal");
     }
 
     /// A heartbeat is a READING, not a verdict. The edge-triggered
@@ -2581,7 +2561,7 @@ mod tests {
                 ..Default::default()
             },
         });
-        let load = ring.snapshot_json().expect("one sample");
+        let load = ring.snapshot().expect("one sample");
         let rec = build_machine_rollup_record(load, None, Some("serious"), 60_000, 60_000, 1, 0);
         assert!(matches!(rec.level, darkmux_flow::Level::Info));
     }
@@ -2605,14 +2585,13 @@ mod tests {
                 ..Default::default()
             },
         });
-        let load = ring.snapshot_json().expect("one sample");
+        let load = ring.snapshot().expect("one sample");
 
         // Real hardware first: the absence is what makes the presence below
         // mean something, and an explicit `null` would NOT do — the flow
         // records answer "were these real" by the key's absence.
         let real = build_machine_rollup_record(load.clone(), None, None, 60_000, 60_000, 1, 0)
-            .payload
-            .expect("payload");
+            .payload_json();
         assert_eq!(real["now"]["thermal"]["state"], "critical", "the reading really is in there");
         assert!(
             real.get("simulated_host_source").is_none(),
@@ -2626,8 +2605,7 @@ mod tests {
         };
         let payload =
             build_machine_rollup_record_with(load.clone(), None, None, 60, 60_000, 1, 0, &scripted)
-                .payload
-                .expect("payload");
+                .payload_json();
         assert_eq!(
             payload["simulated_host_source"], "/tmp/critical-breaker.jsonl",
             "a scripted machine picture must name the scenario file behind it: {payload}"
@@ -2651,7 +2629,7 @@ mod tests {
             },
         );
         assert!(
-            unavailable.payload.expect("payload present").get("simulated_host_source").is_none(),
+            unavailable.payload_json().get("simulated_host_source").is_none(),
             "nothing is simulated when the scenario failed to load, so nothing may be stamped"
         );
     }
@@ -2690,14 +2668,14 @@ mod tests {
                 },
             });
         }
-        let load = ring.snapshot_json().expect("samples");
-        let from_lens = load["window"]["thermal"].clone();
+        let load = ring.snapshot().expect("samples");
+        let from_lens = serde_json::to_value(&load).unwrap()["window"]["thermal"].clone();
         assert_eq!(from_lens["level_entries"]["fair"], 1, "one arrival, not two samples");
         assert_eq!(from_lens["level_ms"]["fair"], 10_000);
 
         let rec = build_machine_rollup_record(load, None, None, 60_000, 60_000, 1, 0);
         assert_eq!(
-            rec.payload.unwrap()["window"]["thermal"],
+            rec.payload_json()["window"]["thermal"],
             from_lens,
             "the rollup must carry the lens's own block, not a second rendering of it"
         );

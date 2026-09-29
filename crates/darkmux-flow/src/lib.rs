@@ -13,6 +13,7 @@ pub mod hook_transform;
 pub mod hooks;
 pub mod legacy;
 pub mod live;
+pub mod payload;
 pub mod presence;
 pub mod presence_reconciler;
 pub mod reader;
@@ -24,6 +25,7 @@ mod schema;
 mod status;
 
 pub use action::{Bookend, Edge, FlowAction, FlowScope, Grain, UnknownAction};
+pub use payload::{OpenPayload, Payload, UnreadPayload};
 pub use bookend::*;
 pub use integrity::*;
 pub use schema::*;
@@ -121,7 +123,25 @@ impl<'a> CheckedRecord<'a> {
             known if known.grain() == Some(Grain::Execution) && record.execution_id.is_none() => {
                 anyhow::bail!("refusing to write a `{}` record with no execution id: it is a record of a role execution", known.as_str())
             }
-            _ => Ok(Self(record)),
+            _ => Self::check_payload(record).map(|()| Self(record)),
+        }
+    }
+
+    /// A payload is written only as its own action's type: not an unread
+    /// one (a payload that did not parse), and not another action's.
+    fn check_payload(record: &FlowRecord) -> Result<()> {
+        match &record.payload {
+            None => Ok(()),
+            Some(Payload::Unread(_)) => anyhow::bail!(
+                "refusing to write a `{}` record with an unread payload: build it from the action's payload type",
+                record.action.as_str()
+            ),
+            Some(payload) if payload.action() != record.action => anyhow::bail!(
+                "refusing to write a `{}` record carrying a `{}` payload",
+                record.action.as_str(),
+                payload.action().as_str()
+            ),
+            Some(_) => Ok(()),
         }
     }
 
@@ -141,8 +161,48 @@ pub trait FlowSinkWrite {
 
 impl<S: FlowSink + ?Sized> FlowSinkWrite for S {
     fn write(&self, record: &FlowRecord) -> Result<()> {
-        self.persist(CheckedRecord::check(record)?)
+        match CheckedRecord::check(record) {
+            Ok(checked) => self.persist(checked),
+            Err(refusal) => {
+                report_refusal(&record.action, &refusal);
+                Err(refusal)
+            }
+        }
     }
+}
+
+/// True the first time `key` is seen in this process: a line that would repeat every poll of a
+/// wait, or on every record of a kind, is said once.
+pub fn first_refusal(key: &str) -> bool {
+    static SEEN: OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(key.to_string())
+}
+
+/// Say a refused write on stderr, once per action per process. Callers mostly discard the write's
+/// result (`let _ = record(..)`), and a refused liveness bookend would otherwise vanish without a
+/// trace.
+fn report_refusal(action: &FlowAction, refusal: &anyhow::Error) {
+    if !first_refusal(&format!("flow-write-refused:{}", action.as_str())) {
+        return;
+    }
+    let line = format!("darkmux: flow record refused ({refusal}); further refusals of `{}` are not repeated", action.as_str());
+    eprintln!("{line}");
+    #[cfg(test)]
+    REFUSALS_SAID.with(|said| said.borrow_mut().push(line));
+}
+
+#[cfg(test)]
+thread_local! {
+    static REFUSALS_SAID: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The refusal lines this test thread said.
+#[cfg(test)]
+pub(crate) fn refusals_said() -> Vec<String> {
+    REFUSALS_SAID.with(|said| said.borrow().clone())
 }
 
 /// File-based flow sink: appends to per-day JSONL files under
@@ -1538,10 +1598,10 @@ impl TeeSink {
         // Never carry chain fields on the casual-sink breadcrumb.
         bc.prev_hash = None;
         bc.hash = None;
-        bc.payload = Some(serde_json::json!({
-            "dropped_action": dropped.action,
-            "dropped_session_id": dropped.session_id,
-            "error": err_msg,
+        bc.payload = Some(Payload::AuditWriteFailed(payload::AuditWriteFailedPayload {
+            dropped_action: dropped.action.as_str().to_string(),
+            dropped_session_id: dropped.session_id.clone(),
+            error: err_msg.to_string(),
         }));
         if let Err(e) = local.write(&bc) {
             eprintln!(
@@ -2048,6 +2108,38 @@ mod tests {
         assert_eq!(sink.0.load(std::sync::atomic::Ordering::Relaxed), 0, "no sink saw the unknown or retired action");
         assert!(record_via(&sink, &minimal_record()).is_ok());
         assert_eq!(sink.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    /// A refused record is said, not dropped: the write check names the action and the reason on
+    /// stderr, once per action per process, and still returns the error.
+    #[test]
+    fn a_refused_record_is_reported_once_per_action() {
+        struct Never;
+        impl FlowSink for Never {
+            fn persist(&self, _record: crate::CheckedRecord<'_>) -> Result<()> {
+                panic!("a refused record reached a sink")
+            }
+            fn info(&self) -> SinkInfo {
+                SinkInfo { kind: "Never".into(), config: Default::default(), children: vec![], raw_url: None }
+            }
+        }
+        let unread = |action: FlowAction| {
+            let mut r = minimal_record();
+            r.payload = Some(Payload::settle(&action, serde_json::json!({"items": "not a number"})));
+            r.action = action;
+            r
+        };
+        let grow = unread(FlowAction::MissionGrow);
+        assert!(record_via(&Never, &grow).is_err());
+        assert!(record_via(&Never, &grow).is_err());
+        let said = crate::refusals_said();
+        assert_eq!(said.len(), 1, "once per action: {said:?}");
+        assert!(said[0].contains("mission.grow") && said[0].contains("unread payload"), "{said:?}");
+
+        assert!(record_via(&Never, &unread(FlowAction::HookFired)).is_err());
+        let said = crate::refusals_said();
+        assert_eq!(said.len(), 2, "another action is said again: {said:?}");
+        assert!(said[1].contains("hook.fired"), "{said:?}");
     }
 
     /// The verbs behind `mission.pause`, `mission.resume` and `phase.added`
@@ -2763,9 +2855,11 @@ mod tests {
         assert!(matches!(captured[1].level, Level::Error));
         assert!(matches!(captured[1].category, Category::Audit));
         assert!(captured[1].prev_hash.is_none() && captured[1].hash.is_none());
-        let payload = captured[1].payload.as_ref().expect("breadcrumb carries payload");
-        assert_eq!(payload["dropped_action"], "dispatch.complete");
-        assert_eq!(payload["dropped_session_id"], "sess-1");
+        let Some(Payload::AuditWriteFailed(payload)) = captured[1].payload.as_ref() else {
+            panic!("the breadcrumb carries its payload");
+        };
+        assert_eq!(payload.dropped_action, "dispatch.complete");
+        assert_eq!(payload.dropped_session_id.as_deref(), Some("sess-1"));
     }
 
     #[serial_test::serial]
@@ -5157,7 +5251,7 @@ mod tests {
              free-form and every added field is optional",
         );
         assert_eq!(rec.action, crate::FlowAction::MissionGrow);
-        let payload = rec.payload.expect("the record carries its payload");
+        let payload = serde_json::to_value(rec.payload.expect("the record carries its payload")).unwrap();
         assert_eq!(payload["producer_status"], serde_json::json!("error"));
         assert_eq!(payload["reason"], serde_json::json!("producer_errored"));
     }

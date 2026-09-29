@@ -1,4 +1,5 @@
     use super::*;
+    use darkmux_flow::payload::LmsEvent;
     use serial_test::serial;
     use std::io::Write;
     use tempfile::TempDir;
@@ -27,16 +28,17 @@
     /// The heartbeat payload of a `model.partial` or `model.tool_call.writing`
     /// fixture.
     fn hb(v: serde_json::Value) -> serde_json::Value {
-        match ev(v) {
+        let payload = match ev(v) {
             darkmux_trajectory::TrajectoryEvent::Partial(p) => heartbeat_payload(&Chunk::of_partial(&p)),
             darkmux_trajectory::TrajectoryEvent::ToolCallWriting(w) => heartbeat_payload(&Chunk::of_writing(&w)),
             other => panic!("not a chunk or a tick: {other:?}"),
-        }
+        };
+        serde_json::to_value(payload).unwrap()
     }
 
     /// The `area` a detector fixture's telemetry payload carries.
     fn area_of(event_type: &str, v: serde_json::Value) -> Option<serde_json::Value> {
-        detector_telemetry_payload(&ev_as(event_type, v))?.get("area").cloned()
+        detector_telemetry_payload(&ev_as(event_type, v))?.area.map(|a| serde_json::to_value(a).unwrap())
     }
 
     /// The degeneracy warning a checkpoint or stream-gate fixture calls for.
@@ -83,7 +85,7 @@
                 maybe_build_machine_telemetry_record(last_emit_at_ms, at_ms, at_ms + 1_000_000, 5000, &sample)
             {
                 last_emit_at_ms = Some(new_last);
-                emitted.push((at_ms, rec.payload.expect("machine.telemetry always carries a payload")));
+                emitted.push((at_ms, rec.payload_json()));
             }
         }
         // Due at at_ms=0 (first, always), then next due once
@@ -901,7 +903,7 @@
 
     // ─── MUST FIX 3 (merge-gate review of #2165): pin the two `bounds`
     //     WIRING sites — deleting either insertion failed no test before
-    //     this. `dispatch_start_payload_json` below covers the first
+    //     this. `dispatch_start_payload` below covers the first
     //     (`dispatch()`'s real construction was un-unit-testable before the
     //     #2165 review extracted it into this pure fn); the
     //     `enrich_envelope_with_summary` tests further down cover the
@@ -909,11 +911,11 @@
 
     #[test]
     #[serial]
-    fn dispatch_start_payload_json_carries_the_bounds_key_with_the_expected_shape() {
+    fn dispatch_start_payload_carries_the_bounds_key_with_the_expected_shape() {
         let prev = std::env::var("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL").ok();
         unsafe { std::env::remove_var("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL") };
 
-        let payload = dispatch_start_payload_json(
+        let payload = serde_json::to_value(dispatch_start_payload(
             "darkmux-runtime:latest",
             "read x.txt",
             "system prompt",
@@ -923,19 +925,19 @@
             None,
             None,
             &[],
-        ).unwrap();
+        ).unwrap()).unwrap();
 
         // The wiring itself: this key would be ABSENT entirely if the
-        // `"bounds": resolved_runtime_bounds_json(is_agentic_remote)` line
-        // were ever deleted from `dispatch_start_payload_json` — proving
+        // `"bounds": resolved_runtime_bounds(is_agentic_remote)` line
+        // were ever deleted from `dispatch_start_payload` — proving
         // this assertion actually exercises the insertion, not just the
         // helper's own internal logic (already pinned by the
-        // `resolved_runtime_bounds_json_*` tests below).
+        // `resolved_runtime_bounds_*` tests below).
         assert!(payload.get("bounds").is_some(), "dispatch_start_payload must carry a bounds key: {payload}");
         assert_eq!(
             payload["bounds"]["max_tokens_per_call"],
             serde_json::json!({"value": null, "source": "built-in"}),
-            "bounds must be the SAME shape resolved_runtime_bounds_json produces: {payload}"
+            "bounds must be the SAME shape resolved_runtime_bounds produces: {payload}"
         );
         // The rest of the payload survives the extraction unchanged —
         // pinning the refactor didn't silently drop or rename a field.
@@ -966,11 +968,11 @@
     /// The agentic-remote half of the same wiring: `is_agentic_remote=true`
     /// must reach `bounds.turn_delay_ms`'s `forced-agentic-remote` shape
     /// (MUST FIX 2) through this real call path, not just through
-    /// `resolved_runtime_bounds_json` called directly.
+    /// `resolved_runtime_bounds` called directly.
     #[serial]
     #[test]
-    fn dispatch_start_payload_json_forces_turn_delay_ms_for_agentic_remote() {
-        let payload = dispatch_start_payload_json(
+    fn dispatch_start_payload_forces_turn_delay_ms_for_agentic_remote() {
+        let payload = serde_json::to_value(dispatch_start_payload(
             "darkmux-runtime:latest",
             "msg",
             "sys",
@@ -980,12 +982,12 @@
             None,
             None,
             &[],
-        ).unwrap();
+        ).unwrap()).unwrap();
         assert_eq!(payload["bounds"]["turn_delay_ms"]["source"], serde_json::json!("forced-agentic-remote"));
         assert_eq!(payload["turn_delay_ms"], serde_json::json!(0), "the top-level stamp is also forced");
     }
 
-    // ─── #2165: resolved_runtime_bounds_json — the SAME block shared by
+    // ─── #2165: resolved_runtime_bounds — the SAME block shared by
     //     dispatch_start_payload["bounds"] and the envelope's own `bounds` ───
     //
     // (#811 test-isolation) darkmux-crew's dev-dependency on
@@ -998,7 +1000,7 @@
     // `*_with_source` tests, which construct it directly.
     #[test]
     #[serial]
-    fn resolved_runtime_bounds_json_names_built_in_when_nothing_is_set() {
+    fn resolved_runtime_bounds_names_built_in_when_nothing_is_set() {
         for k in [
             "DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL",
             "DARKMUX_RUNTIME_REASONING_CHECKPOINT_INTERVAL",
@@ -1010,7 +1012,7 @@
         ] {
             unsafe { std::env::remove_var(k) };
         }
-        let bounds = resolved_runtime_bounds_json(false, None, None).unwrap();
+        let bounds = serde_json::to_value(resolved_runtime_bounds(false, None, None).unwrap()).unwrap();
         assert_eq!(
             bounds["max_tokens_per_call"],
             serde_json::json!({"value": null, "source": "built-in"}),
@@ -1038,7 +1040,7 @@
 
     #[test]
     #[serial]
-    fn resolved_runtime_bounds_json_names_built_in_for_thermal_and_battery_pacing() {
+    fn resolved_runtime_bounds_names_built_in_for_thermal_and_battery_pacing() {
         for k in [
             "DARKMUX_THERMAL_ENABLED",
             "DARKMUX_POWER_PAUSE_RUNNING_BELOW_MIN",
@@ -1046,7 +1048,7 @@
         ] {
             unsafe { std::env::remove_var(k) };
         }
-        let bounds = resolved_runtime_bounds_json(false, None, None).unwrap();
+        let bounds = serde_json::to_value(resolved_runtime_bounds(false, None, None).unwrap()).unwrap();
         assert_eq!(
             bounds["thermal_pacing_enabled"],
             serde_json::json!({"value": true, "source": "built-in"}),
@@ -1066,7 +1068,7 @@
 
     #[test]
     #[serial]
-    fn resolved_runtime_bounds_json_names_env_when_thermal_and_battery_pacing_are_overridden() {
+    fn resolved_runtime_bounds_names_env_when_thermal_and_battery_pacing_are_overridden() {
         for k in [
             "DARKMUX_THERMAL_ENABLED",
             "DARKMUX_POWER_PAUSE_RUNNING_BELOW_MIN",
@@ -1077,7 +1079,7 @@
         unsafe { std::env::set_var("DARKMUX_THERMAL_ENABLED", "false") };
         unsafe { std::env::set_var("DARKMUX_POWER_PAUSE_RUNNING_BELOW_MIN", "off") };
         unsafe { std::env::set_var("DARKMUX_POWER_MIN_BATTERY_PCT", "35") };
-        let bounds = resolved_runtime_bounds_json(false, None, None).unwrap();
+        let bounds = serde_json::to_value(resolved_runtime_bounds(false, None, None).unwrap()).unwrap();
         assert_eq!(bounds["thermal_pacing_enabled"], serde_json::json!({"value": false, "source": "env"}));
         assert_eq!(bounds["battery_pause_enabled"], serde_json::json!({"value": false, "source": "env"}));
         assert_eq!(bounds["battery_pause_floor_pct"], serde_json::json!({"value": 35, "source": "env"}));
@@ -1092,7 +1094,7 @@
 
     #[test]
     #[serial]
-    fn resolved_runtime_bounds_json_names_env_when_an_env_var_wins() {
+    fn resolved_runtime_bounds_names_env_when_an_env_var_wins() {
         for k in [
             "DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL",
             "DARKMUX_RUNTIME_REASONING_CHECKPOINT_INTERVAL",
@@ -1103,7 +1105,7 @@
         unsafe { std::env::set_var("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL", "4000") };
         unsafe { std::env::set_var("DARKMUX_RUNTIME_REASONING_CHECKPOINT_INTERVAL", "500") };
         unsafe { std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", "120") };
-        let bounds = resolved_runtime_bounds_json(false, None, None).unwrap();
+        let bounds = serde_json::to_value(resolved_runtime_bounds(false, None, None).unwrap()).unwrap();
         assert_eq!(bounds["max_tokens_per_call"], serde_json::json!({"value": 4000, "source": "env"}));
         assert_eq!(
             bounds["reasoning_checkpoint_interval_tokens"],
@@ -1122,7 +1124,7 @@
         }
     }
 
-    // ─── #2193: effective_max_turns / resolved_runtime_bounds_json's
+    // ─── #2193: effective_max_turns / resolved_runtime_bounds's
     //     max_turns block — operator-explicit vs caller-derived precedence ──
 
     #[test]
@@ -1147,17 +1149,17 @@
 
     #[test]
     #[serial]
-    fn resolved_runtime_bounds_json_max_turns_names_launcher_when_the_override_wins() {
+    fn resolved_runtime_bounds_max_turns_names_launcher_when_the_override_wins() {
         unsafe { std::env::remove_var("DARKMUX_RUNTIME_MAX_TURNS") };
-        let bounds = resolved_runtime_bounds_json(false, Some(15), None).unwrap();
+        let bounds = serde_json::to_value(resolved_runtime_bounds(false, Some(15), None).unwrap()).unwrap();
         assert_eq!(bounds["max_turns"], serde_json::json!({"value": 15, "source": "launcher"}));
     }
 
     #[test]
     #[serial]
-    fn resolved_runtime_bounds_json_max_turns_names_env_when_the_operator_set_one() {
+    fn resolved_runtime_bounds_max_turns_names_env_when_the_operator_set_one() {
         unsafe { std::env::set_var("DARKMUX_RUNTIME_MAX_TURNS", "5") };
-        let bounds = resolved_runtime_bounds_json(false, Some(15), None).unwrap();
+        let bounds = serde_json::to_value(resolved_runtime_bounds(false, Some(15), None).unwrap()).unwrap();
         assert_eq!(
             bounds["max_turns"],
             serde_json::json!({"value": 5, "source": "env"}),
@@ -1167,7 +1169,7 @@
     }
 
     // ─── #2480: effective_inactivity_timeout_seconds /
-    //     resolved_runtime_bounds_json's inactivity_timeout_seconds block —
+    //     resolved_runtime_bounds's inactivity_timeout_seconds block —
     //     `darkmux dispatch --timeout <n>` wins OUTRIGHT (opposite
     //     precedence from max_turns above — see the function's own doc for
     //     why: this override is direct operator input at the point of
@@ -1245,10 +1247,10 @@
 
     #[test]
     #[serial]
-    fn resolved_runtime_bounds_json_inactivity_timeout_names_cli_when_the_override_wins() {
+    fn resolved_runtime_bounds_inactivity_timeout_names_cli_when_the_override_wins() {
         let prev = std::env::var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS").ok();
         unsafe { std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", "1200") };
-        let bounds = resolved_runtime_bounds_json(false, None, Some(30)).unwrap();
+        let bounds = serde_json::to_value(resolved_runtime_bounds(false, None, Some(30)).unwrap()).unwrap();
         assert_eq!(
             bounds["inactivity_timeout_seconds"],
             serde_json::json!({"value": 30, "source": "cli"}),
@@ -1265,10 +1267,10 @@
 
     #[test]
     #[serial]
-    fn resolved_runtime_bounds_json_inactivity_timeout_passes_through_with_no_override() {
+    fn resolved_runtime_bounds_inactivity_timeout_passes_through_with_no_override() {
         let prev = std::env::var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS").ok();
         unsafe { std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS") };
-        let bounds = resolved_runtime_bounds_json(false, None, None).unwrap();
+        let bounds = serde_json::to_value(resolved_runtime_bounds(false, None, None).unwrap()).unwrap();
         assert_eq!(
             bounds["inactivity_timeout_seconds"],
             serde_json::json!({"value": 600, "source": "built-in"})
@@ -1280,10 +1282,10 @@
 
     #[test]
     #[serial]
-    fn resolved_runtime_bounds_json_turn_delay_ms_passes_through_for_a_local_dispatch() {
+    fn resolved_runtime_bounds_turn_delay_ms_passes_through_for_a_local_dispatch() {
         let prev = std::env::var("DARKMUX_TURN_DELAY_MS").ok();
         unsafe { std::env::set_var("DARKMUX_TURN_DELAY_MS", "3000") };
-        let bounds = resolved_runtime_bounds_json(false, None, None).unwrap();
+        let bounds = serde_json::to_value(resolved_runtime_bounds(false, None, None).unwrap()).unwrap();
         assert_eq!(
             bounds["turn_delay_ms"],
             serde_json::json!({"value": 3000, "source": "env"}),
@@ -1311,10 +1313,10 @@
     /// configured value.
     #[test]
     #[serial]
-    fn resolved_runtime_bounds_json_turn_delay_ms_is_self_explaining_when_forced_agentic_remote() {
+    fn resolved_runtime_bounds_turn_delay_ms_is_self_explaining_when_forced_agentic_remote() {
         let prev = std::env::var("DARKMUX_TURN_DELAY_MS").ok();
         unsafe { std::env::set_var("DARKMUX_TURN_DELAY_MS", "5000") };
-        let bounds = resolved_runtime_bounds_json(true, None, None).unwrap();
+        let bounds = serde_json::to_value(resolved_runtime_bounds(true, None, None).unwrap()).unwrap();
         assert_eq!(
             bounds["turn_delay_ms"],
             serde_json::json!({
@@ -1338,10 +1340,10 @@
     /// shape — the override applies regardless of what it overrode.
     #[test]
     #[serial]
-    fn resolved_runtime_bounds_json_turn_delay_ms_forced_shape_holds_even_at_the_default() {
+    fn resolved_runtime_bounds_turn_delay_ms_forced_shape_holds_even_at_the_default() {
         let prev = std::env::var("DARKMUX_TURN_DELAY_MS").ok();
         unsafe { std::env::remove_var("DARKMUX_TURN_DELAY_MS") };
-        let bounds = resolved_runtime_bounds_json(true, None, None).unwrap();
+        let bounds = serde_json::to_value(resolved_runtime_bounds(true, None, None).unwrap()).unwrap();
         assert_eq!(
             bounds["turn_delay_ms"],
             serde_json::json!({
@@ -8652,9 +8654,9 @@
             crate::brief_refs::BriefRef::finding("sess-a/1"),
             crate::brief_refs::BriefRef::mod_("mod-1-aaa"),
         ];
-        let with = dispatch_start_payload_json(
+        let with = serde_json::to_value(dispatch_start_payload(
             "img", "msg", "sys", std::path::Path::new("/ws"), false, None, None, None, &refs,
-        ).unwrap();
+        ).unwrap()).unwrap();
         assert_eq!(
             with["brief_refs"],
             serde_json::json!([
@@ -8664,9 +8666,9 @@
         );
         // Every other dispatch carries the field EMPTY rather than absent — an
         // absent key would be indistinguishable from an older writer's record.
-        let without = dispatch_start_payload_json(
+        let without = serde_json::to_value(dispatch_start_payload(
             "img", "msg", "sys", std::path::Path::new("/ws"), false, None, None, None, &[],
-        ).unwrap();
+        ).unwrap()).unwrap();
         assert_eq!(without["brief_refs"], serde_json::json!([]));
     }
 
@@ -8943,14 +8945,14 @@
     #[test]
     fn an_emission_over_the_bound_is_replaced_by_a_flagged_prefix() {
         let huge = "z".repeat(MAX_EMITTED_BYTES + 10);
-        let bounded = bound_emitted(Some(&serde_json::json!({"why": huge})));
+        let bounded = bound_emitted(Some(&serde_json::json!({"why": huge}))).expect("an emission is forwarded");
         assert_eq!(bounded["emitted_truncated"], serde_json::json!(true));
         assert!(bounded["truncated"].as_str().unwrap().len() <= MAX_EMITTED_BYTES);
         assert!(bounded["truncated"].as_str().unwrap().starts_with("{\"why\":\"zzz"));
 
         let small = serde_json::json!({"file": "a.ts", "line": 1, "why": "w"});
-        assert_eq!(bound_emitted(Some(&small)), small, "under the bound: untouched, no flag");
-        assert!(bound_emitted(None).is_null());
+        assert_eq!(bound_emitted(Some(&small)), Some(small.clone()), "under the bound: untouched, no flag");
+        assert!(bound_emitted(None).is_none());
     }
 
     /// The other half of the same contract: `record_context: None` (every
@@ -9029,8 +9031,7 @@
             "count": 3,
             "window_size": 10,
         });
-        let payload =
-            detector_telemetry_payload(&ev_as("dispatch.cycle.suspected", event.clone())).expect("maps cycle");
+        let payload =serde_json::to_value(detector_telemetry_payload(&ev_as("dispatch.cycle.suspected", event.clone())).expect("maps cycle")).unwrap();
         assert_eq!(payload["kind"], "cycle");
         assert_eq!(payload["severity"], "warn");
         let detail = payload["detail"].as_str().expect("detail is a string");
@@ -9077,8 +9078,8 @@
             "interval_tokens": 1000,
             "degenerate": true,
         });
-        let payload = detector_telemetry_payload(&ev_as("dispatch.gate.observation", event.clone()))
-            .expect("a degenerate observation must map to a record");
+        let payload = serde_json::to_value(detector_telemetry_payload(&ev_as("dispatch.gate.observation", event.clone()))
+            .expect("a degenerate observation must map to a record")).unwrap();
         assert_eq!(payload["kind"], "repetition");
         assert_eq!(payload["severity"], "warn");
         assert_eq!(payload["observation"], 17);
@@ -9102,8 +9103,8 @@
             "interval_tokens": 1000,
             "tool_call_in_flight": false,
         });
-        let payload = detector_telemetry_payload(&ev_as("dispatch.gate.abort", event.clone()))
-            .expect("an abort must always map to a record");
+        let payload = serde_json::to_value(detector_telemetry_payload(&ev_as("dispatch.gate.abort", event.clone()))
+            .expect("an abort must always map to a record")).unwrap();
         assert_eq!(payload["kind"], "repetition");
         assert_eq!(payload["severity"], "warn");
         assert_eq!(payload["observation"], 6);
@@ -9122,8 +9123,8 @@
             "recoveries_used": 1,
             "recoveries_budget": 3,
         });
-        let payload = detector_telemetry_payload(&ev_as("dispatch.intra_turn_stall.recovered", event.clone()))
-            .expect("maps intra-turn-stall");
+        let payload = serde_json::to_value(detector_telemetry_payload(&ev_as("dispatch.intra_turn_stall.recovered", event.clone()))
+            .expect("maps intra-turn-stall")).unwrap();
         assert_eq!(payload["kind"], "intra-turn-stall");
         assert_eq!(payload["severity"], "info");
         let detail = payload["detail"].as_str().unwrap();
@@ -9151,8 +9152,8 @@
             "salvaged_tool_calls": 2,
             "bound": {"kind": "reasoning_checkpoint_interval", "value": 1000, "source": "built-in"},
         });
-        let payload = detector_telemetry_payload(&ev_as("dispatch.per_turn_cap.salvaged", event.clone()))
-            .expect("maps per-turn-cap");
+        let payload = serde_json::to_value(detector_telemetry_payload(&ev_as("dispatch.per_turn_cap.salvaged", event.clone()))
+            .expect("maps per-turn-cap")).unwrap();
         assert_eq!(
             payload["bound"],
             serde_json::json!({"kind": "reasoning_checkpoint_interval", "value": 1000, "source": "built-in"}),
@@ -9262,8 +9263,8 @@
             "arguments_chars": 1,
             "cut": "server_length",
         });
-        let payload = detector_telemetry_payload(&ev_as("dispatch.tool_call.discarded", event.clone()))
-            .expect("maps discarded_tool_call");
+        let payload = serde_json::to_value(detector_telemetry_payload(&ev_as("dispatch.tool_call.discarded", event.clone()))
+            .expect("maps discarded_tool_call")).unwrap();
         assert_eq!(payload["kind"], "discarded_tool_call");
         assert_eq!(
             payload["severity"], "warn",
@@ -9306,8 +9307,8 @@
             "arguments_chars": 42,
             "cut": "runtime_abort:degenerate",
         });
-        let payload = detector_telemetry_payload(&ev_as("dispatch.tool_call.discarded", event.clone()))
-            .expect("maps discarded_tool_call");
+        let payload = serde_json::to_value(detector_telemetry_payload(&ev_as("dispatch.tool_call.discarded", event.clone()))
+            .expect("maps discarded_tool_call")).unwrap();
         let detail = payload["detail"].as_str().expect("detail is a string");
         assert!(detail.contains("42 characters of"), "got {detail:?}");
         assert!(!detail.contains("  "), "got {detail:?}");
@@ -9332,8 +9333,8 @@
             "model": "mistralai/devstral-small-2-2512",
             "sample_name_prefix": "} catch (error) { --- [TOOL_CALLS]",
         });
-        let payload = detector_telemetry_payload(&ev_as("dispatch.tool.malformed_names", event.clone()))
-            .expect("maps malformed_tool_names");
+        let payload = serde_json::to_value(detector_telemetry_payload(&ev_as("dispatch.tool.malformed_names", event.clone()))
+            .expect("maps malformed_tool_names")).unwrap();
         assert_eq!(payload["kind"], "malformed_tool_names");
         assert_eq!(payload["severity"], "warn");
         assert_eq!(payload["count"], 5);
@@ -9370,8 +9371,8 @@
             "sample_name_prefix": "bash",
             "reason": "real_tool_not_granted",
         });
-        let payload = detector_telemetry_payload(&ev_as("dispatch.tool.malformed_names", event.clone()))
-            .expect("maps malformed_tool_names");
+        let payload = serde_json::to_value(detector_telemetry_payload(&ev_as("dispatch.tool.malformed_names", event.clone()))
+            .expect("maps malformed_tool_names")).unwrap();
         assert_eq!(payload["kind"], "malformed_tool_names", "same detector kind, different reason");
         assert_eq!(payload["reason"], "real_tool_not_granted");
         let detail = payload["detail"].as_str().unwrap();
@@ -9497,8 +9498,8 @@
             "salvaged_tool_calls": 1,
             "bound": {"kind": "max_tokens_per_call", "value": 4000, "source": "config"},
         });
-        let payload = detector_telemetry_payload(&ev_as("dispatch.per_turn_cap.salvaged", event.clone()))
-            .expect("maps per-turn-cap");
+        let payload = serde_json::to_value(detector_telemetry_payload(&ev_as("dispatch.per_turn_cap.salvaged", event.clone()))
+            .expect("maps per-turn-cap")).unwrap();
         let detail = payload["detail"].as_str().unwrap();
         assert!(
             detail.contains("the per-call token cap") && detail.contains("config 4000"),
@@ -9517,8 +9518,8 @@
             "recoveries_budget": 2,
             "bound": {"kind": "max_tokens_per_call", "value": 10000, "source": "env"},
         });
-        let payload = detector_telemetry_payload(&ev_as("dispatch.intra_turn_stall.recovered", event.clone()))
-            .expect("maps intra-turn-stall");
+        let payload = serde_json::to_value(detector_telemetry_payload(&ev_as("dispatch.intra_turn_stall.recovered", event.clone()))
+            .expect("maps intra-turn-stall")).unwrap();
         assert_eq!(
             payload["bound"],
             serde_json::json!({"kind": "max_tokens_per_call", "value": 10000, "source": "env"}),
@@ -9543,8 +9544,8 @@
             "cap": 1000,
             "salvaged_tool_calls": 2,
         });
-        let payload = detector_telemetry_payload(&ev_as("dispatch.per_turn_cap.salvaged", event.clone()))
-            .expect("maps per-turn-cap even without a bound field");
+        let payload = serde_json::to_value(detector_telemetry_payload(&ev_as("dispatch.per_turn_cap.salvaged", event.clone()))
+            .expect("maps per-turn-cap even without a bound field")).unwrap();
         assert!(payload.get("bound").is_none(), "no bound field on the event -> none on the payload");
         let detail = payload["detail"].as_str().unwrap();
         // (#2190) Reworded from "salvaged at the per-call cap" to the
@@ -9601,8 +9602,8 @@
             "recoveries_budget": 2,
             "bound": {"kind": "generation_checkpoint_interval", "value": 4000, "source": "built-in"},
         });
-        let payload = detector_telemetry_payload(&ev_as("dispatch.intra_turn_stall.recovered", event.clone()))
-            .expect("maps intra-turn-stall");
+        let payload = serde_json::to_value(detector_telemetry_payload(&ev_as("dispatch.intra_turn_stall.recovered", event.clone()))
+            .expect("maps intra-turn-stall")).unwrap();
         let detail = payload["detail"].as_str().unwrap();
         assert!(
             detail.contains("the generation check-in interval (built-in 4000)"),
@@ -9636,8 +9637,8 @@
             "recoveries_budget": 2,
             "bound": {"kind": "generation_checkpoint_interval", "value": 4000, "source": "built-in"},
         });
-        let payload = detector_telemetry_payload(&ev_as("dispatch.empty_tool_calls.recovered", event.clone()))
-            .expect("maps empty_tool_calls");
+        let payload = serde_json::to_value(detector_telemetry_payload(&ev_as("dispatch.empty_tool_calls.recovered", event.clone()))
+            .expect("maps empty_tool_calls")).unwrap();
         assert_eq!(payload["kind"], serde_json::json!("empty_tool_calls"));
         let detail = payload["detail"].as_str().unwrap();
         assert!(
@@ -9666,8 +9667,8 @@
             "model": "devstral-small-2-2512",
             "prompt_tokens": 19133,
         });
-        let payload = detector_telemetry_payload(&ev_as("dispatch.escalation.triggered", event.clone()))
-            .expect("maps escalation");
+        let payload = serde_json::to_value(detector_telemetry_payload(&ev_as("dispatch.escalation.triggered", event.clone()))
+            .expect("maps escalation")).unwrap();
         assert_eq!(payload["kind"], serde_json::json!("escalation"));
         assert_eq!(payload["model"], serde_json::json!("devstral-small-2-2512"));
         assert_eq!(payload["prompt_tokens"], serde_json::json!(19133));
@@ -10051,7 +10052,7 @@
             "finish_reason": "tool_calls",
             "usage": { "prompt_tokens": 24000, "completion_tokens": 850 },
         });
-        let payload = turn_tokens_payload(&mc(event.clone()), "coder", "m", "ep", None);
+        let payload = serde_json::to_value(turn_tokens_payload(&mc(event.clone()), "coder", "m", "ep", None)).unwrap();
         assert_eq!(payload["turn_seq"], 12);
         assert_eq!(payload["prompt_tokens"], 24000);
         assert_eq!(payload["completion_tokens"], 850);
@@ -10080,7 +10081,7 @@
                 "reasoning_tokens": 1024, "cached_tokens": 64,
             },
         });
-        let payload = turn_tokens_payload(&mc(event.clone()), "coder", "m", "ep", None);
+        let payload = serde_json::to_value(turn_tokens_payload(&mc(event.clone()), "coder", "m", "ep", None)).unwrap();
         assert_eq!(payload["reasoning_tokens"], 1024);
         assert_eq!(payload["cached_tokens"], 64);
         assert!(payload["reasoning_tokens"].as_u64().unwrap() <= payload["completion_tokens"].as_u64().unwrap());
@@ -10105,7 +10106,7 @@
             "seq": 4,
             "usage": { "prompt_tokens": 9970, "completion_tokens": 128, "total_tokens": 11598 },
         });
-        let payload = turn_tokens_payload(&mc(event.clone()), "coder", "m", "ep", None);
+        let payload = serde_json::to_value(turn_tokens_payload(&mc(event.clone()), "coder", "m", "ep", None)).unwrap();
         assert_eq!(
             payload["total_tokens"], 11598,
             "the provider's own total must win; prompt + completion (10098) understates by 1500"
@@ -10125,7 +10126,7 @@
             "seq": 5,
             "usage": { "prompt_tokens": 300, "completion_tokens": 45 },
         });
-        let payload = turn_tokens_payload(&mc(event.clone()), "coder", "m", "ep", None);
+        let payload = serde_json::to_value(turn_tokens_payload(&mc(event.clone()), "coder", "m", "ep", None)).unwrap();
         assert_eq!(payload["total_tokens"], 345, "no reported total → derive from the split");
     }
 
@@ -10160,8 +10161,10 @@
             &crate::mission_test_session("m1", "sess-1"), &darkmux_types::execution_id::ExecutionId::mint(),
             "gpt-remote",
             None,
-            darkmux_flow::FlowAction::DispatchStart,
-            serde_json::json!({ "endpoint": "azure:host/gpt-remote" }),
+            darkmux_flow::Payload::DispatchStart(DispatchStartPayload {
+                endpoint: Some("azure:host/gpt-remote".to_string()),
+                ..Default::default()
+            }),
         );
         assert!(matches!(rec.tier, darkmux_flow::Tier::Darkmux), "{:?}", rec.tier);
         assert_eq!(serde_json::to_value(&rec).unwrap()["tier"], "darkmux");
@@ -10174,8 +10177,7 @@
             &crate::mission_test_session("m1", "sess-1"), &darkmux_types::execution_id::ExecutionId::mint(),
             "gpt-remote",
             Some("p1"),
-            darkmux_flow::FlowAction::DispatchStart,
-            serde_json::json!({}),
+            darkmux_flow::Payload::DispatchStart(DispatchStartPayload::default()),
         );
         assert_eq!(
             rec.mission_id.as_deref(),
@@ -10191,8 +10193,7 @@
             &crate::test_session("sess-2"), &darkmux_types::execution_id::ExecutionId::mint(),
             "gpt-remote",
             None,
-            darkmux_flow::FlowAction::DispatchStart,
-            serde_json::json!({}),
+            darkmux_flow::Payload::DispatchStart(DispatchStartPayload::default()),
         );
         assert!(bare.mission_id.is_none(), "a None mission_id must never be fabricated into Some");
     }
@@ -10250,7 +10251,7 @@
             insert_direct_token_keys(complete.as_object_mut().unwrap(), &counts);
             let record = crate::usage::usage_payload(&facts, &counts);
             for key in ["prompt_tokens", "completion_tokens", "total_tokens", "reasoning_tokens", "cached_tokens"] {
-                let recorded = record.get(key).cloned().unwrap_or(serde_json::Value::Null);
+                let recorded = serde_json::to_value(&record).unwrap().get(key).cloned().unwrap_or(serde_json::Value::Null);
                 assert_eq!(complete[key], recorded, "{key} for {counts:?}");
             }
         }
@@ -10263,11 +10264,11 @@
     #[test]
     fn turn_tokens_payload_marks_absent_or_null_usage_absent() {
         let absent = serde_json::json!({ "type": "model.completed", "seq": 3 });
-        assert_eq!(turn_tokens_payload(&mc(absent.clone()), "coder", "m", "ep", None)["token_source"], "absent", "absent usage → an absent record, no counts");
+        assert_eq!(serde_json::to_value(turn_tokens_payload(&mc(absent.clone()), "coder", "m", "ep", None)).unwrap()["token_source"], "absent", "absent usage → an absent record, no counts");
         let null = serde_json::json!({
             "type": "model.completed", "seq": 3, "usage": serde_json::Value::Null,
         });
-        assert_eq!(turn_tokens_payload(&mc(null.clone()), "coder", "m", "ep", None)["token_source"], "absent", "null usage → an absent record, no counts");
+        assert_eq!(serde_json::to_value(turn_tokens_payload(&mc(null.clone()), "coder", "m", "ep", None)).unwrap()["token_source"], "absent", "null usage → an absent record, no counts");
     }
 
     /// (#795) A `usage` object missing a count omits that count from the
@@ -10280,7 +10281,7 @@
             "seq": 1,
             "usage": { "completion_tokens": 500 },
         });
-        let payload = turn_tokens_payload(&mc(event.clone()), "coder", "m", "ep", None);
+        let payload = serde_json::to_value(turn_tokens_payload(&mc(event.clone()), "coder", "m", "ep", None)).unwrap();
         assert!(payload.get("prompt_tokens").is_none(), "{payload}");
         assert_eq!(payload["completion_tokens"], 500);
         assert!(payload.get("total_tokens").is_none(), "{payload}");
@@ -10585,7 +10586,7 @@
         // (#2928 review, C7) The stamped cost covers the sampler's work on
         // every chunk, not only the sends.
         assert!(live.sampler_us >= live.forward_us, "{live:?}");
-        let json = live.to_json();
+        let json = serde_json::to_value(live.to_payload()).unwrap();
         assert_eq!(json["sampler_ms"], live.sampler_us as f64 / 1_000.0, "{json}");
         assert!(json.get("sampler_us").is_none() && json.get("forward_us").is_none(), "milliseconds only: {json}");
     }
@@ -10658,7 +10659,7 @@
         // (#2928 re-review, C-5) A dispatch with no channel (the lab) says so,
         // rather than a cadence it never sampled at.
         assert_eq!((off_summary.live.enabled, off_summary.live.cadence_ms, off_summary.live.samples_sent), (false, 0, 0));
-        assert_eq!(off_summary.live.to_json()["enabled"], false);
+        assert_eq!(serde_json::to_value(off_summary.live.to_payload()).unwrap()["enabled"], false);
         assert_eq!(off, without);
         let (with, summary) = run_live_fixture(Some(darkmux_flow::live::LiveSender::to_path(dir.path().join("absent.sock"))));
         assert_eq!(with, without);
@@ -10848,14 +10849,13 @@
                 Some("s694".into()),
                 None,
             );
-            guard.open(crate::dispatch::build_dispatch_record_with_payload(
+            guard.open(crate::dispatch::build_dispatch_record(
                 darkmux_flow::Level::Info,
-                darkmux_flow::FlowAction::DispatchStart,
                 "coder",
                 &crate::mission_test_session("pre-1.0-compat-sweep", "sess-orphan"), &darkmux_types::execution_id::ExecutionId::mint(),
                 Some("darkmux:qwen3.6"),
                 Some("s694"),
-                None,
+                darkmux_flow::Payload::DispatchStart(DispatchStartPayload::default()),
             ));
             // drop here (end of scope) — no close/disarm
         }
@@ -10907,14 +10907,13 @@
                 None,
                 None,
             );
-            guard.open(crate::dispatch::build_dispatch_record_with_payload(
+            guard.open(crate::dispatch::build_dispatch_record(
                 darkmux_flow::Level::Info,
-                darkmux_flow::FlowAction::DispatchStart,
                 "coder",
                 &crate::test_session("sess-clean"), &darkmux_types::execution_id::ExecutionId::mint(),
                 Some("darkmux:qwen3.6"),
                 None,
-                None,
+                darkmux_flow::Payload::DispatchStart(DispatchStartPayload::default()),
             ));
             guard.disarm();
         }
@@ -10965,14 +10964,13 @@
                 None,
                 None,
             );
-            guard.open(crate::dispatch::build_dispatch_record_with_payload(
+            guard.open(crate::dispatch::build_dispatch_record(
                 darkmux_flow::Level::Info,
-                darkmux_flow::FlowAction::DispatchStart,
                 "coder",
                 &crate::mission_test_session("pre-1.0-compat-sweep", "sess-panic"), &darkmux_types::execution_id::ExecutionId::mint(),
                 Some("darkmux:qwen3.6"),
                 None,
-                None,
+                darkmux_flow::Payload::DispatchStart(DispatchStartPayload::default()),
             ));
             panic!("simulated mid-dispatch panic");
         });
@@ -11340,7 +11338,7 @@
             { "id": "e", "name": "read", "arguments_chars": 90, "path": "x".repeat(MAX_TRAJ_FIELD_BYTES + 1) },
         ]});
         assert_eq!(
-            turn_tool_paths(&mc(ev.clone())),
+            turn_tool_paths(&mc(ev.clone())).map(|v| serde_json::json!(v)),
             Some(serde_json::json!(["/workspace/src/a.rs", null, "src/b.rs", null]))
         );
         let none = serde_json::json!({ "calls_planned": true, "tool_calls": [{ "id": "b", "name": "bash", "arguments_chars": 12 }] });
@@ -11364,11 +11362,11 @@
         // (#2963 review, CONSIDER 2) A name that is not a known runtime tool
         // never rides the flow stream, so the over-long name is `null`; so
         // would a model-invented one be.
-        assert_eq!(turn_tool_names(&mc(ev.clone())), Some(serde_json::json!(["write", "read", null])));
+        assert_eq!(turn_tool_names(&mc(ev.clone())).map(|v| serde_json::json!(v)), Some(serde_json::json!(["write", "read", null])));
         let invented = serde_json::json!({ "calls_planned": true, "tool_calls": [{ "id": "a", "name": "rm_rf_everything", "arguments_chars": 2 }] });
-        assert_eq!(turn_tool_names(&mc(invented.clone())), Some(serde_json::json!([null])));
+        assert_eq!(turn_tool_names(&mc(invented.clone())).map(|v| serde_json::json!(v)), Some(serde_json::json!([null])));
         let bash = serde_json::json!({ "calls_planned": true, "tool_calls": [{ "id": "b", "name": "bash", "arguments_chars": 12 }] });
-        assert_eq!(turn_tool_names(&mc(bash.clone())), Some(serde_json::json!(["bash"])));
+        assert_eq!(turn_tool_names(&mc(bash.clone())).map(|v| serde_json::json!(v)), Some(serde_json::json!(["bash"])));
         assert_eq!(turn_tool_names(&mc(serde_json::json!({ "calls_planned": true, "tool_calls": [] }))), None);
         assert_eq!(turn_tool_names(&mc(serde_json::json!({ "calls_planned": true, "tool_calls": null }))), None);
         assert_eq!(turn_tool_names(&mc(serde_json::json!({}))), None);
@@ -11386,8 +11384,8 @@
         assert_eq!(turn_tool_paths(&mc(unplanned.clone())), None);
         let mut planned = unplanned.clone();
         planned["calls_planned"] = serde_json::json!(true);
-        assert_eq!(turn_tool_names(&mc(planned.clone())), Some(serde_json::json!(["read"])));
-        assert_eq!(turn_tool_paths(&mc(planned.clone())), Some(serde_json::json!(["src/y.rs"])));
+        assert_eq!(turn_tool_names(&mc(planned.clone())).map(|v| serde_json::json!(v)), Some(serde_json::json!(["read"])));
+        assert_eq!(turn_tool_paths(&mc(planned.clone())).map(|v| serde_json::json!(v)), Some(serde_json::json!(["src/y.rs"])));
     }
 
     /// (#2963 review, MUST FIX 1) Only the calls that RUN are in the lists.
@@ -11404,12 +11402,12 @@
             { "id": "c", "name": "frobnicate", "arguments_chars": 2, "runs": false },
             { "id": "d", "name": "edit", "arguments_chars": 30, "path": "src/z.rs", "runs": true },
         ]});
-        assert_eq!(turn_tool_names(&mc(ev.clone())), Some(serde_json::json!(["read", "edit"])));
-        assert_eq!(turn_tool_paths(&mc(ev.clone())), Some(serde_json::json!(["src/y.rs", "src/z.rs"])));
+        assert_eq!(turn_tool_names(&mc(ev.clone())).map(|v| serde_json::json!(v)), Some(serde_json::json!(["read", "edit"])));
+        assert_eq!(turn_tool_paths(&mc(ev.clone())).map(|v| serde_json::json!(v)), Some(serde_json::json!(["src/y.rs", "src/z.rs"])));
         let none_run = serde_json::json!({ "calls_planned": true, "tool_calls": [
             { "id": "a", "name": "write", "arguments_chars": 40, "path": "src/x.rs", "runs": false },
         ]});
-        assert_eq!(turn_tool_names(&mc(none_run.clone())), Some(serde_json::json!([])), "no call runs: an empty list, not a missing one");
+        assert_eq!(turn_tool_names(&mc(none_run.clone())).map(|v| serde_json::json!(v)), Some(serde_json::json!([])), "no call runs: an empty list, not a missing one");
         assert_eq!(turn_tool_paths(&mc(none_run.clone())), None);
     }
 
@@ -11952,8 +11950,8 @@
             "count": 3,
             "window_size": 10,
         });
-        let payload = detector_telemetry_payload(&ev_as("dispatch.cycle.suspected", event.clone()))
-            .expect("cycle event yields a payload");
+        let payload = serde_json::to_value(detector_telemetry_payload(&ev_as("dispatch.cycle.suspected", event.clone()))
+            .expect("cycle event yields a payload")).unwrap();
         let detail = payload["detail"].as_str().expect("detail string");
         assert!(detail.len() <= MAX_TRAJ_FIELD_BYTES + 100, "detail bounded near the cap");
         assert!(detail.contains("[truncated"), "carries the marker");
@@ -11976,8 +11974,7 @@
             "count": 3,
             "window_size": 10,
         });
-        let payload =
-            detector_telemetry_payload(&ev_as("dispatch.cycle.suspected", event.clone())).expect("maps cycle");
+        let payload =serde_json::to_value(detector_telemetry_payload(&ev_as("dispatch.cycle.suspected", event.clone())).expect("maps cycle")).unwrap();
         assert_eq!(
             payload["area"]["files"],
             serde_json::json!(["src/lib.rs"]),
@@ -11999,7 +11996,7 @@
         });
         let payload =
             detector_telemetry_payload(&ev_as("dispatch.cycle.suspected", event.clone())).expect("maps cycle");
-        assert!(payload.get("area").is_none(), "bash cycle has no file area");
+        assert!(payload.area.is_none(), "bash cycle has no file area");
     }
 
     /// A `search` cycle DOES carry a `path` in its canonical args — but it's
@@ -12018,7 +12015,7 @@
         let payload =
             detector_telemetry_payload(&ev_as("dispatch.cycle.suspected", event.clone())).expect("maps cycle");
         assert!(
-            payload.get("area").is_none(),
+            payload.area.is_none(),
             "search's path is a directory, not a file — must not be stamped as area.files"
         );
     }
@@ -12034,8 +12031,8 @@
             "count": 3,
             "window_size": 10,
         });
-        let payload = detector_telemetry_payload(&ev_as("dispatch.cycle.suspected", event.clone()))
-            .expect("maps cycle even with bad args");
+        let payload = serde_json::to_value(detector_telemetry_payload(&ev_as("dispatch.cycle.suspected", event.clone()))
+            .expect("maps cycle even with bad args")).unwrap();
         assert!(payload.get("area").is_none());
         assert_eq!(payload["kind"], "cycle");
     }
@@ -12053,7 +12050,7 @@
         });
         let payload =
             detector_telemetry_payload(&ev_as("dispatch.cycle.suspected", event.clone())).expect("maps cycle");
-        assert!(payload.get("area").is_none());
+        assert!(payload.area.is_none());
     }
 
     /// Turn-level detectors fire with no single target file, so they never
@@ -12067,7 +12064,7 @@
         });
         let payload = detector_telemetry_payload(&ev_as("dispatch.reasoning_loop.suspected", event.clone()))
             .expect("maps reasoning-loop");
-        assert!(payload.get("area").is_none());
+        assert!(payload.area.is_none());
     }
 
     /// A pathologically long container-written path is bounded the same way the
@@ -12082,8 +12079,7 @@
             "count": 3,
             "window_size": 10,
         });
-        let payload =
-            detector_telemetry_payload(&ev_as("dispatch.cycle.suspected", event.clone())).expect("maps cycle");
+        let payload =serde_json::to_value(detector_telemetry_payload(&ev_as("dispatch.cycle.suspected", event.clone())).expect("maps cycle")).unwrap();
         let file = payload["area"]["files"][0].as_str().expect("file string");
         assert!(file.len() <= MAX_TRAJ_FIELD_BYTES + 100, "path bounded near the cap");
         assert!(file.contains("[truncated"), "carries the marker");
@@ -12901,6 +12897,11 @@ fn with_both_copies_resident_only_the_darkmux_one_is_selected() {
 
 // ── (#1934) `tag_lms_role` — the `telemetry.lms` payload stamper ────────
 
+/// A `telemetry.lms` payload with no role or baseline yet.
+fn lms_payload(event: LmsEvent, model: &str, gb: Option<u64>) -> TelemetryLmsPayload {
+    TelemetryLmsPayload { event, model: model.to_string(), gb, role: None, baseline: None, step_id: None, context: None }
+}
+
 /// A load payload gets both `role` (delegated to `role_for_load`, already
 /// unit-tested on its own in `telemetry_sampler.rs`) and, when the caller
 /// says so, `baseline: true` — the field the viewer's jit-model-swap
@@ -12908,8 +12909,8 @@ fn with_both_copies_resident_only_the_darkmux_one_is_selected() {
 /// happened during this attempt".
 #[test]
 fn tag_lms_role_stamps_role_and_baseline_on_a_load() {
-    let payload = serde_json::json!({"event": "load", "model": "primary-35b", "gb": 20});
-    let tagged = super::tag_lms_role(payload, "primary-35b", &["compactor-4b".to_string()], true);
+    let payload = lms_payload(LmsEvent::Load, "primary-35b", Some(20));
+    let tagged = serde_json::to_value(super::tag_lms_role(payload, "primary-35b", &["compactor-4b".to_string()], true)).unwrap();
     assert_eq!(tagged["role"], "primary");
     assert_eq!(tagged["baseline"], true);
 }
@@ -12919,8 +12920,8 @@ fn tag_lms_role_stamps_role_and_baseline_on_a_load() {
 /// field as "was this the seed" without also handling an explicit `false`.
 #[test]
 fn tag_lms_role_omits_baseline_when_not_the_seed() {
-    let payload = serde_json::json!({"event": "load", "model": "compactor-4b", "gb": 2});
-    let tagged = super::tag_lms_role(payload, "primary-35b", &["compactor-4b".to_string()], false);
+    let payload = lms_payload(LmsEvent::Load, "compactor-4b", Some(2));
+    let tagged = serde_json::to_value(super::tag_lms_role(payload, "primary-35b", &["compactor-4b".to_string()], false)).unwrap();
     assert_eq!(tagged["role"], "utility");
     assert!(tagged.get("baseline").is_none(), "baseline must be ABSENT, not `false`: {tagged:?}");
 }
@@ -12930,8 +12931,8 @@ fn tag_lms_role_omits_baseline_when_not_the_seed() {
 /// it was loaded INTO.
 #[test]
 fn tag_lms_role_tags_an_unload_by_the_same_rule_as_a_load() {
-    let payload = serde_json::json!({"event": "unload", "model": "utility-4b"});
-    let tagged = super::tag_lms_role(payload, "primary-35b", &["utility-4b".to_string()], false);
+    let payload = lms_payload(LmsEvent::Unload, "utility-4b", None);
+    let tagged = serde_json::to_value(super::tag_lms_role(payload, "primary-35b", &["utility-4b".to_string()], false)).unwrap();
     assert_eq!(tagged["role"], "utility");
 }
 
@@ -12961,7 +12962,7 @@ fn drive_lms_tracker(
         let snapshot = RefCell::new(Some(snapshot));
         tracker.tick(
             &|| Ok(snapshot.borrow_mut().take().expect("list_loaded called twice in one tick")),
-            &|p| emitted.borrow_mut().push(p),
+            &|p| emitted.borrow_mut().push(serde_json::to_value(p).unwrap()),
         );
     }
     emitted.into_inner()
@@ -13088,10 +13089,10 @@ fn lms_tracker_skips_a_failed_probe_without_consuming_the_seed() {
     use std::cell::RefCell;
     let emitted: RefCell<Vec<serde_json::Value>> = RefCell::new(Vec::new());
     let mut tracker = super::LmsTelemetryTracker::new("primary-35b".to_string(), Vec::new());
-    tracker.tick(&|| anyhow::bail!("lms ps timed out"), &|p| emitted.borrow_mut().push(p));
+    tracker.tick(&|| anyhow::bail!("lms ps timed out"), &|p| emitted.borrow_mut().push(serde_json::to_value(p).unwrap()));
     assert!(emitted.borrow().is_empty(), "a failed probe emits nothing: {:?}", emitted.borrow());
     let snapshot = RefCell::new(Some(vec![loaded("primary-35b", "20.00")]));
-    tracker.tick(&|| Ok(snapshot.borrow_mut().take().unwrap()), &|p| emitted.borrow_mut().push(p));
+    tracker.tick(&|| Ok(snapshot.borrow_mut().take().unwrap()), &|p| emitted.borrow_mut().push(serde_json::to_value(p).unwrap()));
     let out = emitted.into_inner();
     assert_eq!(out.len(), 1, "{out:?}");
     assert_eq!(out[0]["baseline"], true, "the first SUCCESSFUL probe is still the seed tick: {out:?}");
@@ -13578,10 +13579,10 @@ fn only_a_warn_policy_finding_produces_a_degeneracy_warning() {
     };
     let w = dw("dispatch.checkpoint", cp("warn", true)).expect("a warn finding warns");
     assert!(w.line.contains("turn 4") && w.line.contains("not concluded") && w.line.contains("policy = warn"), "{}", w.line);
-    assert_eq!(w.payload["source"], "checkpoint");
-    assert_eq!(w.payload["acted"], false);
+    assert_eq!(serde_json::to_value(&w.payload).unwrap()["source"], "checkpoint");
+    assert_eq!(serde_json::to_value(&w.payload).unwrap()["acted"], false);
     let g = dw("dispatch.gate.observation", gate("warn", true)).expect("a warn gate finding warns");
-    assert_eq!(g.payload["source"], "stream_gate");
+    assert_eq!(serde_json::to_value(&g.payload).unwrap()["source"], "stream_gate");
     for policy in ["record", "conclude", "observe", "enforce", "off"] {
         assert!(dw("dispatch.checkpoint", cp(policy, true)).is_none(), "{policy}");
         assert!(dw("dispatch.gate.observation", gate(policy, true)).is_none(), "{policy}");
@@ -13669,7 +13670,7 @@ fn a_clean_run_reports_an_empty_array_not_an_absent_field() {
 /// was unpinned — every other `enrich_envelope_with_summary` test in this
 /// file passes `serde_json::json!({})` as the `bounds` arg, so deleting the
 /// insert line failed nothing. Passes a DISTINCTIVE, non-empty value (never
-/// the shape `resolved_runtime_bounds_json` would actually produce) so this
+/// the shape `resolved_runtime_bounds` would actually produce) so this
 /// assertion could only pass if the caller's `bounds` argument genuinely
 /// made it into the envelope, not some other field coincidentally matching.
 #[test]
@@ -14941,7 +14942,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
     // ─── (#2234 follow-up review) the clamp above was REVERTED — see
     // `effective_inactivity_timeout_seconds`'s own doc for why (invisible,
     // silently overrode `--timeout`'s deliberately-unbounded parser,
-    // desynced `resolved_runtime_bounds_json`, and its 315_360_000 figure
+    // desynced `resolved_runtime_bounds`, and its 315_360_000 figure
     // was ~29 billion× more aggressive than the panic it cited —
     // 9_223_372_036_847_700_827, measured by binary search). A future
     // clamp is tracked in the issue filed alongside this revert (see the
@@ -15667,7 +15668,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         assert!(rec.phase_id.is_none(), "machine-scoped: no phase context");
         assert!(rec.session_id.is_none(), "machine-scoped: no session_id");
         assert!(rec.model.is_none(), "machine-scoped: no model");
-        let payload = rec.payload.expect("payload present");
+        let payload = rec.payload_json();
         assert_eq!(payload["cpu_pct"], 42);
         assert_eq!(payload["mem_pct"], 55);
         assert_eq!(payload["gpu_pct"], 12);
@@ -15726,7 +15727,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             span_ms: 90_000,
         };
         let rec = build_machine_scoped_telemetry_record_with(&sample, 12_345, 5000, &scripted);
-        let payload = rec.payload.expect("payload present");
+        let payload = rec.payload_json();
         assert_eq!(
             payload["thermal"]["state"], "critical",
             "the fiction rides the record — which is precisely why it must be marked"
@@ -15740,7 +15741,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         // never `null`. The flow-record surface's whole contract is that
         // presence alone answers "were these readings real".
         let real = build_machine_scoped_telemetry_record_with(&sample, 12_345, 5000, &Provenance::Real);
-        let real_payload = real.payload.expect("payload present");
+        let real_payload = real.payload_json();
         assert!(
             real_payload.get("simulated_host_source").is_none(),
             "real readings must be stamped with nothing at all, not with a null: {real_payload}"
@@ -15759,7 +15760,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             },
         );
         assert!(
-            unavailable.payload.expect("payload present").get("simulated_host_source").is_none(),
+            unavailable.payload_json().get("simulated_host_source").is_none(),
             "nothing is simulated when the scenario failed to load, so nothing may be stamped"
         );
     }
@@ -15783,7 +15784,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             span_ms: 90_000,
         };
         let darkmux_trajectory::TrajectoryEvent::Rest(rest) = ev(event) else { panic!("a rest") };
-        let p = super::runtime_rest_payload(&rest, 45_000, 3, &scripted);
+        let p = serde_json::to_value(super::runtime_rest_payload(&rest, 45_000, 3, &scripted)).unwrap();
         // The forwarding this function already owed, asserted here so the
         // stamp cannot be added by quietly replacing the payload.
         assert_eq!(p["ms"], 30_000);
@@ -15801,7 +15802,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         // when the runtime's event carries none.
         let plain = serde_json::json!({ "type": "runtime.rest", "seq": 1, "ms": 500 });
         let darkmux_trajectory::TrajectoryEvent::Rest(plain) = ev(plain) else { panic!("a rest") };
-        let p = super::runtime_rest_payload(&plain, 500, 1, &Provenance::Real);
+        let p = serde_json::to_value(super::runtime_rest_payload(&plain, 500, 1, &Provenance::Real)).unwrap();
         assert_eq!(p["reason"], "turn_delay");
         assert!(p.get("state").is_none(), "no pace-file state on a plain turn delay: {p}");
         assert!(
@@ -15826,28 +15827,38 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             frames: 4,
             span_ms: 90_000,
         };
-        let p =
-            super::host_derived_payload(serde_json::json!({ "state": "critical", "charge_pct": 5 }), &scripted);
+        let critical = |state: &str| {
+            darkmux_flow::Payload::ThermalStopUnresolved(ThermalStopUnresolvedPayload {
+                stop_written: false,
+                cause: "no_stop_file".to_string(),
+                reason: "no STOP file".to_string(),
+                state: state.to_string(),
+                simulated_host_source: None,
+                step_id: None,
+                context: None,
+            })
+        };
+        let p = serde_json::to_value(super::host_derived_payload(critical("critical"), &scripted)).unwrap();
         assert_eq!(p["state"], "critical", "the reading still rides the record");
-        assert_eq!(p["charge_pct"], 5);
         assert_eq!(
             p["simulated_host_source"], "/tmp/critical-breaker.jsonl",
             "a record built on scripted readings must name the scenario behind it: {p}"
         );
 
-        let real = super::host_derived_payload(serde_json::json!({ "state": "critical" }), &Provenance::Real);
+        let real = serde_json::to_value(super::host_derived_payload(critical("critical"), &Provenance::Real)).unwrap();
         assert!(
             real.get("simulated_host_source").is_none(),
             "real readings must be stamped with nothing at all, not with a null: {real}"
         );
 
-        let unavailable = super::host_derived_payload(
-            serde_json::json!({ "state": "critical" }),
+        let unavailable = serde_json::to_value(super::host_derived_payload(
+            critical("critical"),
             &Provenance::ScriptedUnavailable {
                 path: "/nope.jsonl".to_string(),
                 error: "No such file".to_string(),
             },
-        );
+        ))
+        .unwrap();
         assert!(
             unavailable.get("simulated_host_source").is_none(),
             "nothing is simulated when the scenario failed to load, so nothing may be stamped"
@@ -15867,7 +15878,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             frames: 4,
             span_ms: 90_000,
         };
-        let p = super::thermal_stop_unresolved_payload("missing_context", "no crawl id", "critical", &scripted);
+        let p = serde_json::to_value(super::thermal_stop_unresolved_payload("missing_context", "no crawl id", "critical", &scripted)).unwrap();
         assert_eq!(p["stop_written"], false);
         assert_eq!(p["cause"], "missing_context");
         assert_eq!(p["reason"], "no crawl id");
@@ -15877,7 +15888,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             "a fabricated `critical` must not read as a real one: {p}"
         );
 
-        let real = super::thermal_stop_unresolved_payload("missing_context", "no crawl id", "critical", &Provenance::Real);
+        let real = serde_json::to_value(super::thermal_stop_unresolved_payload("missing_context", "no crawl id", "critical", &Provenance::Real)).unwrap();
         assert!(
             real.get("simulated_host_source").is_none(),
             "real readings must be stamped with nothing, not with a null: {real}"
@@ -15896,7 +15907,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             frames: 2,
             span_ms: 4_000,
         };
-        let p = super::battery_pause_unsupported_payload(5, 50, &scripted);
+        let p = serde_json::to_value(super::battery_pause_unsupported_payload(5, 50, &scripted)).unwrap();
         assert_eq!(p["charge_pct"], 5, "the host reading rides the record");
         assert_eq!(p["floor_pct"], 50);
         assert_eq!(p["paused"], false);
@@ -15911,7 +15922,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             "a fabricated low battery must not read as a real one: {p}"
         );
 
-        let real = super::battery_pause_unsupported_payload(5, 50, &Provenance::Real);
+        let real = serde_json::to_value(super::battery_pause_unsupported_payload(5, 50, &Provenance::Real)).unwrap();
         assert!(
             real.get("simulated_host_source").is_none(),
             "real readings must be stamped with nothing, not with a null: {real}"
@@ -15934,17 +15945,38 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         use crate::host_source::Provenance;
         use std::sync::Mutex;
         let collected: Mutex<Vec<(String, serde_json::Value)>> = Mutex::new(Vec::new());
-        let sink = |action: darkmux_flow::FlowAction, payload: serde_json::Value| {
-            collected.lock().expect("not poisoned").push((action.to_string(), payload));
+        let sink = |payload: darkmux_flow::Payload| {
+            collected
+                .lock()
+                .expect("not poisoned")
+                .push((payload.action().to_string(), serde_json::to_value(&payload).unwrap()));
         };
         let scripted = Provenance::Scripted {
             path: "/tmp/critical-breaker.jsonl".to_string(),
             frames: 1,
             span_ms: 2_000,
         };
+        let eject = || {
+            darkmux_flow::Payload::ThermalTier5Eject(ThermalTier5EjectPayload {
+                reached_checkpoint_boundary: true,
+                ejected: Vec::new(),
+                user_loaded_count: 0,
+                simulated_host_source: None,
+                step_id: None,
+                context: None,
+            })
+        };
         let emit = super::stamping_emitter(&sink, &scripted);
-        emit(darkmux_flow::FlowAction::ThermalTier5Eject, serde_json::json!({ "ejected": [], "user_loaded_count": 0 }));
-        emit(darkmux_flow::FlowAction::ThermalTier5EjectFailed, serde_json::json!({ "error": "lms unreachable" }));
+        emit(eject());
+        emit(darkmux_flow::Payload::ThermalTier5EjectFailed(ThermalTier5EjectFailedPayload {
+            reached_checkpoint_boundary: false,
+            failed: None,
+            ejected_count: None,
+            error: Some("lms unreachable".to_string()),
+            simulated_host_source: None,
+            step_id: None,
+            context: None,
+        }));
 
         let seen = collected.lock().expect("not poisoned");
         assert_eq!(seen.len(), 2, "the wrapper must forward every record, not swallow any");
@@ -15962,13 +15994,13 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
 
         // Real hardware: forwarded, unmarked.
         let collected_real: Mutex<Vec<(String, serde_json::Value)>> = Mutex::new(Vec::new());
-        let sink_real = |action: darkmux_flow::FlowAction, payload: serde_json::Value| {
-            collected_real.lock().expect("not poisoned").push((action.to_string(), payload));
+        let sink_real = |payload: darkmux_flow::Payload| {
+            collected_real
+                .lock()
+                .expect("not poisoned")
+                .push((payload.action().to_string(), serde_json::to_value(&payload).unwrap()));
         };
-        super::stamping_emitter(&sink_real, &Provenance::Real)(
-            darkmux_flow::FlowAction::ThermalTier5Eject,
-            serde_json::json!({ "ejected": [] }),
-        );
+        super::stamping_emitter(&sink_real, &Provenance::Real)(eject());
         let seen = collected_real.lock().expect("not poisoned");
         assert!(
             seen[0].1.get("simulated_host_source").is_none(),
@@ -16054,7 +16086,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         );
     }
 
-    // ─── (#2111) host_window_json — the dispatch-summary flow-record field ─
+    // ─── (#2111) host_window — the dispatch-summary flow-record field ─
 
     #[test]
     fn host_window_reaches_the_envelope_with_the_flattened_summary_shape() {
@@ -16106,7 +16138,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
     }
 
     /// (#2774 review F4) The two ladder fields were pinned by NOTHING:
-    /// deleting both lines from `host_window_json` left the crate green,
+    /// deleting both lines from `host_window` left the crate green,
     /// because every call-site test threaded `ThermalLadderSummary::
     /// default()` and asserted on the other keys. This threads DISTINCT,
     /// non-default values and asserts both reach the envelope — so a
@@ -16144,7 +16176,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
     #[test]
     fn the_thermal_ladder_numbers_reach_the_flow_record_distinctly() {
         let stats = super::reduce_host_stats(&worked_samples());
-        let payload = super::build_dispatch_complete_payload(
+        let payload = serde_json::to_value(super::build_dispatch_complete_payload(
             1000,
             "stdout-body",
             "",
@@ -16153,13 +16185,12 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             None,
             &stats,
             &no_extras(),
-            &None,
             None,
             Some(crate::thermal_governor::ThermalLadderSummary {
                 serious_episodes: 7,
                 current_duty_delay_ms: 240_000,
             }),
-        );
+        )).unwrap();
         assert_eq!(payload["host_window"]["thermal_serious_episodes"], 7, "{payload}");
         assert_eq!(payload["host_window"]["thermal_duty_delay_ms"], 240_000, "{payload}");
     }
@@ -16224,7 +16255,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             Some(2000),
         );
         let stats = super::reduce_host_stats(&worked_samples());
-        let payload = super::build_dispatch_complete_payload(
+        let payload = serde_json::to_value(super::build_dispatch_complete_payload(
             1000,
             "stdout-body",
             "",
@@ -16233,10 +16264,9 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             None,
             &stats,
             &extras,
-            &None,
             None,
             None,
-        );
+        )).unwrap();
         assert_eq!(
             payload["host_window"]["thermal_worst_state"], "serious",
             "the FLOW RECORD payload must carry host_window, not just the envelope: {payload}"
@@ -16269,7 +16299,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             "type": "model.completed", "seq": 8, "finish_reason": "stop",
             "usage": { "prompt_tokens": 100, "completion_tokens": 600, "reasoning_tokens": 500, "cached_tokens": 20 },
         })));
-        let payload = super::build_dispatch_complete_payload(
+        let payload = serde_json::to_value(super::build_dispatch_complete_payload(
             1000,
             "stdout-body",
             "",
@@ -16278,10 +16308,9 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             None,
             &stats,
             &no_extras(),
-            &None,
             None,
             None,
-        );
+        )).unwrap();
         assert_eq!(payload["prompt_tokens"], 100);
         assert_eq!(payload["completion_tokens"], 600);
         assert_eq!(payload["reasoning_tokens"], 500);
@@ -16313,7 +16342,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             state.handle_event(e);
         }
         let stats = super::reduce_host_stats(&[]);
-        super::build_dispatch_complete_payload(
+        serde_json::to_value(super::build_dispatch_complete_payload(
             1000,
             "",
             "",
@@ -16322,10 +16351,10 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             None,
             &stats,
             &no_extras(),
-            &None,
             None,
             None,
-        )
+        ))
+        .unwrap()
     }
 
     /// (#2903) The complete record's `total_tokens` takes the SAME
@@ -16349,7 +16378,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         let per_turn_sum: u64 = events
             .iter()
             .map(|e| {
-                super::turn_tokens_payload(&mc(serde_json::from_str(e).unwrap()), "coder", "m", "ep", None)["total_tokens"].as_u64().unwrap()
+                super::turn_tokens_payload(&mc(serde_json::from_str(e).unwrap()), "coder", "m", "ep", None).total_tokens.unwrap()
             })
             .sum();
         assert_eq!(per_turn_sum, 11598 + 150);
@@ -16395,7 +16424,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             Some(2000),
         );
         let stats = super::reduce_host_stats(&worked_samples());
-        let payload = super::build_dispatch_complete_payload(
+        let payload = serde_json::to_value(super::build_dispatch_complete_payload(
             500,
             "",
             "boom: container crashed",
@@ -16404,10 +16433,9 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             Some("azure/gpt-x"),
             &stats,
             &extras,
-            &None,
             None,
             None,
-        );
+        )).unwrap();
         assert_eq!(payload["result_class"], "error");
         assert_eq!(payload["endpoint"], "azure/gpt-x");
         assert_eq!(
@@ -16431,12 +16459,11 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             None,
             &super::HostStats::default(),
             &no_extras(),
-            &None,
             None,
             None,
         );
         assert!(
-            payload.get("host_window").is_none(),
+            payload.host_window.is_none(),
             "unsampled must omit host_window on the FLOW RECORD too, never zero it"
         );
     
@@ -16447,8 +16474,8 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
     // otherwise — so a request/advertised gap is visible in the artifact.
     #[serial]
     #[test]
-    fn dispatch_start_payload_json_carries_tools_requested_or_null() {
-        let none = dispatch_start_payload_json(
+    fn dispatch_start_payload_carries_tools_requested_or_null() {
+        let none = serde_json::to_value(dispatch_start_payload(
             "darkmux-runtime:latest",
             "msg",
             "sys",
@@ -16458,10 +16485,10 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             None,
             None,
             &[],
-        ).unwrap();
+        ).unwrap()).unwrap();
         assert!(none["tools_requested"].is_null(), "{}", none);
         let names = vec!["read".to_string(), "search".to_string(), "bash".to_string(), "create_finding".to_string()];
-        let some = dispatch_start_payload_json(
+        let some = serde_json::to_value(dispatch_start_payload(
             "darkmux-runtime:latest",
             "msg",
             "sys",
@@ -16471,7 +16498,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             None,
             Some(&names),
             &[],
-        ).unwrap();
+        ).unwrap()).unwrap();
         assert_eq!(some["tools_requested"], serde_json::json!(["read", "search", "bash", "create_finding"]));
     }
 

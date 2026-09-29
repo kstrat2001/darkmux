@@ -8460,7 +8460,8 @@ fn write_finding_day_file(flows: &std::path::Path) {
     // would test a shape the producer never emits.
     let rec = |ts: &str, sess: &str, tool: &str, seq: u64, mission: &str, emitted: Option<serde_json::Value>| {
         let mut payload = serde_json::json!({
-            "tool_name": tool, "ok": true, "args": "{}",
+            "tool_seq": 1, "tool_calls_so_far": 1, "tool_name": tool, "ok": true, "args": "{}",
+            "args_chars": 2, "result_chars": 0, "result": "",
             "context": {"unit": "u1", "rule": "unnamed-predicate", "source": "acme"},
         });
         if let Some(e) = emitted {

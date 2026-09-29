@@ -1023,6 +1023,46 @@ darkmux release.
   their names. darkmux's readers rename and convert an old record's keys on
   read.
 
+### Typed flow payloads (4.0, FLOW 2.0.0)
+
+- **Every flow record's payload is written from one Rust type per action, and
+  the viewer reads it through that type's generated twin.** A record is built
+  from a `Payload` variant, which fixes its action, and the write check refuses
+  a payload that is not its action's, one that did not parse as its action's
+  type, and a payload on an action that carries none (`session.end`,
+  `machine.online`, `machine.offline`, `phase.*`, `step.complete`,
+  `step.error`, `operator.note`, `operator.catch`, `stream.error`,
+  `tier.decision`, `mission.debrief.prompt`, `phase.review.begin|aborted|dispatch|failed`).
+  `mission.start`, `mission.close` and `mission.abort` keep an open JSON object
+  (a mission config authors that outcome document). `ui/src/lib/flowPayloads.ts`
+  is deleted; `FlowPayloads.ts` and one `<Action>Payload.ts` per type are
+  generated. **On the wire, key order in a payload now follows its type's
+  field order; no key is renamed and no value changes.**
+- **An optional key with no value is omitted, not written as `null`,** in
+  `dispatch.start`, `dispatch.complete`, `dispatch.error`, `dispatch.rest`,
+  `step.result`, `telemetry.detector` and `budget.*` payloads (for example
+  `reasoning_tokens`, `cached_tokens`, `stderr_excerpt`, `turn_delay_effective_ms`,
+  `policy`, `tail_ratio`, and the token counts of a call that reported none).
+  `telemetry.tokens` and the `--json` envelope keep `null` for "not reported".
+  **Migration:** a hook rule that matches `payload.<key>: null` keeps working:
+  an expected `null` matches both a `null` value (archived records) and an
+  absent key (current records). A receiver or `jq` filter that tests
+  `.payload.<key> == null` still holds, since a missing key reads as `null`
+  in `jq`; code that tests for the key's presence (`has("key")`, an
+  `"key" in payload` check) must accept absence.
+- **Archives still read.** A payload that does not parse as its action's type
+  is kept as it was and never re-written. The retired review spelling `tokens`
+  reads as `total_tokens` on `dispatch.complete` and `step.result`. A field
+  an older version never wrote (`sampled_at_ms`, `tool_calls_so_far`, `result`,
+  `turns_so_far`, `parent_model`, `reason`, `delivery_id`, `seat_class`, `source`),
+  or wrote as `null`, reads as absent, never as zero. The role `compactor` reads
+  as the utility seat, and a word in a closed set (a result class, a detector
+  kind, a seat class) that this build does not name reads as `unknown` instead
+  of dropping the record. A refused write of a flow record is now said once per
+  action on stderr. A
+  `dispatch.start` `bounds` block from before the newer knobs existed reads with
+  the knobs it has.
+
 ### Added (4.0)
 
 - **`darkmux mission show <id>`** and the panel's `/mission show <id>`: one

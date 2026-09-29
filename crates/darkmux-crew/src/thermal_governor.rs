@@ -1301,7 +1301,7 @@ impl ThermalGovernor {
 
     /// (#2774) Both artifact fields at once — what `dispatch_internal.rs`
     /// threads out of the sampler thread (via `run_telemetry_sampler`'s
-    /// return value) into `host_window_json`'s payload, alongside
+    /// return value) into `host_window`'s payload, alongside
     /// `above_nominal_ms`, so "was this run throttled, and how hard" is
     /// answerable from the run's own data.
     pub fn ladder_summary(&self) -> ThermalLadderSummary {

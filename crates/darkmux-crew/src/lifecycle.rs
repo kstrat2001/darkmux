@@ -62,7 +62,7 @@ use crate::loader::load_phases;
 use crate::retired_state::{parse_state, StateKind};
 use crate::types::{Mission, MissionStatus, NodeStatus, Phase, PhaseStatus};
 use darkmux_flow as flow;
-use darkmux_flow::{Category, FlowRecord, Level, Stage, Tier};
+use darkmux_flow::{Category, FlowRecord, Level, OpenPayload, Stage, Tier};
 use darkmux_types::session_id::{RunId, SessionId};
 use anyhow::{bail, Context, Result};
 use std::fs;
@@ -559,6 +559,18 @@ fn emit_mission_transition_record_with_reasoning_and_payload(
     payload: Option<serde_json::Value>,
 ) {
     let Some(session) = mission_session(mission_id) else { return };
+    // The launcher's own outcome document: an object whose keys the mission's
+    // config chose, so the record carries it as an open payload. A value that
+    // is not an object carries none.
+    let outcome = match payload {
+        Some(serde_json::Value::Object(map)) => Some(OpenPayload(map)),
+        _ => None,
+    };
+    let payload = outcome.map(|open| match action {
+        darkmux_flow::FlowAction::MissionStart => darkmux_flow::Payload::MissionStart(open),
+        darkmux_flow::FlowAction::MissionAbort => darkmux_flow::Payload::MissionAbort(open),
+        _ => darkmux_flow::Payload::MissionClose(open),
+    });
     let _ = flow::record(FlowRecord {
         tier: Tier::Operator,
         source: Some(darkmux_flow::FlowSource::MissionLifecycle),

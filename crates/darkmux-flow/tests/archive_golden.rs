@@ -75,6 +75,30 @@ fn the_typed_read_agrees_with_the_json_read_on_every_record() {
         let Some(typed) = reader::parse_record(line) else { continue };
         let json = reader::parse_value(line).unwrap();
         assert_eq!(json["action"], typed.action.as_str(), "{line}");
-        assert_eq!(json.get("payload"), typed.payload.as_ref(), "{line}");
+        let typed_json = typed.payload.as_ref().map(|p| serde_json::to_value(p).unwrap());
+        assert!(payload_agrees(json.get("payload"), typed_json.as_ref()), "{line}");
+    }
+}
+
+/// The typed payload agrees with the JSON one: every key it carries has the
+/// JSON's value. A typed payload drops a key its type does not name and
+/// writes `null` for an optional key the archive lacked, so it may hold less
+/// than the JSON, never a different value.
+fn payload_agrees(json: Option<&serde_json::Value>, typed: Option<&serde_json::Value>) -> bool {
+    match (json, typed) {
+        (None, None) => true,
+        (Some(j), Some(t)) => value_agrees(j, t),
+        _ => false,
+    }
+}
+
+fn value_agrees(json: &serde_json::Value, typed: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    match (json, typed) {
+        (Value::Object(j), Value::Object(t)) => t.iter().all(|(k, tv)| match j.get(k) {
+            Some(jv) => value_agrees(jv, tv),
+            None => tv.is_null(),
+        }),
+        (j, t) => j == t,
     }
 }

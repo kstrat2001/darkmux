@@ -30,7 +30,8 @@ import { recordDetail, recordObject } from "../lib/recordDetail";
 import { turnItems } from "../lib/turnGroups";
 import { restReasonLabel } from "../lib/tokenRate";
 import { openModalEl } from "../lib/dialogManager";
-import { recKey, unknownActionCount, type NormRecord } from "../lib/ingest";
+import type { DispatchRestPayload } from "../types/generated/DispatchRestPayload";
+import { ACTION, payloadOf, recKey, unknownActionCount, type NormRecord } from "../lib/ingest";
 
 /** Row cap — `renderLog()`'s `all.slice(-50).reverse()` (viewer.html:2443):
  * newest 50, newest-first. */
@@ -1365,7 +1366,7 @@ export function EventLogColumn({
               }
               // (#2863) A rest is a divider between turns, not a row among them.
               if (item.kind === "rest") {
-                const f = (r.fields || r.payload || {}) as Record<string, unknown>;
+                const f: Partial<DispatchRestPayload> = payloadOf(r, ACTION.DispatchRest) ?? {};
                 const ms = typeof f.ms === "number" ? f.ms : null;
                 if (ms !== null) {
                   return (

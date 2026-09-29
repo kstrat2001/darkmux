@@ -65,8 +65,8 @@ import { PURPOSE, sumUsage } from "../../lib/usageRecords";
 
 import { toolOutcome } from "../../lib/recordDetail";
 import type { RunStatus } from "../../types/generated/RunStatus";
-import type { DispatchCompletePayload, DispatchStartPayload } from "../../lib/flowPayloads";
-import { ACTION, CATEGORY, SOURCE, byTime, isBookendTerminal, latestByTime, recordsAsOf, type NormRecord, type NormSource } from "../../lib/ingest";
+import type { DispatchStartPayload } from "../../types/generated/DispatchStartPayload";
+import { ACTION, CATEGORY, SOURCE, byTime, endPayloadOf, payloadOf, isBookendTerminal, latestByTime, recordsAsOf, type NormRecord, type NormSource } from "../../lib/ingest";
 import { maxOf } from "../../lib/numbers";
 
 /** The run-time figure's long hover text, shared by SYSTEM's WALL CLOCK and
@@ -858,7 +858,8 @@ function toolCounts(records: readonly NormRecord[]): { calls: number; failed: nu
   for (const r of records) {
     if (r.action !== ACTION.DispatchTool) continue;
     calls += 1;
-    if (toolOutcome((r.fields || r.payload || {}) as Record<string, unknown>) === "failed") failed += 1;
+    const call = payloadOf(r, ACTION.DispatchTool);
+    if (call && toolOutcome(call) === "failed") failed += 1;
   }
   return { calls, failed };
 }
@@ -923,9 +924,8 @@ function restKindOf(reason: unknown): { key: string; label: string } {
 function restsByKind(records: readonly NormRecord[]): Map<string, RestKind> {
   const out = new Map<string, RestKind>();
   for (const r of records) {
-    if (r.action !== ACTION.DispatchRest) continue;
-    const f = (r.fields || r.payload || {}) as Record<string, unknown>;
-    if (typeof f.ms !== "number" || !Number.isFinite(f.ms) || f.ms <= 0) continue;
+    const f = payloadOf(r, ACTION.DispatchRest);
+    if (!f || typeof f.ms !== "number" || !Number.isFinite(f.ms) || f.ms <= 0) continue;
     const { key, label } = restKindOf(f.reason);
     const cur = out.get(key) ?? { label, count: 0, totalMs: 0 };
     cur.count += 1;
@@ -1511,8 +1511,8 @@ export function runRegions(
   const role = roleOf(d ?? firstSessRec);
   const svLabel = statusLabel(state);
 
-  const sp = (d?.payload ?? {}) as DispatchStartPayload;
-  const remoteEp = sp.endpoint || (c?.payload as DispatchCompletePayload | undefined)?.endpoint;
+  const sp: DispatchStartPayload = payloadOf(d, ACTION.DispatchStart) ?? {};
+  const remoteEp = sp.endpoint || endPayloadOf(c)?.endpoint;
   const model = modelOf(d, remoteEp, distinct);
 
   // (#2902 step 2a) The plain sum of this attempt's usage records, utility

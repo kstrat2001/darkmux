@@ -79,7 +79,7 @@ impl SingleShotReply {
         requested_model: &str,
         endpoint: &str,
         endpoint_id: Option<&str>,
-    ) -> serde_json::Value {
+    ) -> crate::usage::UsagePayload {
         crate::usage::usage_payload(
             &crate::usage::CallFacts {
                 call_kind,

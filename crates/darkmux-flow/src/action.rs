@@ -221,6 +221,12 @@ macro_rules! flow_actions {
                 }
             }
 
+            /// The action of a payload no record has settled yet: not a real
+            /// action, and never written.
+            pub(crate) fn unsettled() -> FlowAction {
+                FlowAction::Other(UnknownAction(String::new()))
+            }
+
             /// Parse a CURRENT wire string. An unknown string becomes
             /// [`FlowAction::Other`]; a retired spelling is
             /// [`crate::legacy::read_action`]'s job, not this one's.

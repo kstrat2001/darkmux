@@ -14,7 +14,7 @@
 //! value reaches a step as text. A field that holds an open value says so in its own doc.
 
 use super::{require_text, ConfigRules, RuleViolation};
-use crate::brief_refs::BriefRef;
+use crate::brief_refs::{BriefRef, BriefRefKind};
 use darkmux_types::param_scalar::{BlankableCount, Count, Decimal, Flag};
 use darkmux_types::{ModelEndpoint, session_id::SessionId};
 use schemars::JsonSchema;
@@ -36,7 +36,6 @@ macro_rules! no_rules {
 }
 
 no_rules!(
-    DispatchInternalConfig,
     SingleShotConfig,
     ShellConfig,
     NoopConfig,
@@ -72,6 +71,18 @@ pub struct DispatchInternalConfig {
     pub max_completion_tokens: Option<Count>,
     pub resume_from: Option<String>,
     pub timeout_override_seconds: Option<Count>,
+}
+
+impl ConfigRules for DispatchInternalConfig {
+    /// A ref of a kind this build does not name is a typo in the config, not
+    /// an archive to read tolerantly: refuse it before anything runs.
+    fn check(&self) -> Result<(), RuleViolation> {
+        let unknown = self.brief_refs.iter().flatten().any(|r| r.kind == BriefRefKind::Unknown);
+        if unknown {
+            return Err(RuleViolation::new("brief_refs", "a ref's kind is `finding` or `mod`"));
+        }
+        Ok(())
+    }
 }
 
 /// What a one-model-call kind (`dispatch.single_shot`, `dispatch.map`) reads

@@ -2358,26 +2358,19 @@ pub struct FlowRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub hash: Option<String>,
-    /// Event-specific structured fields that aren't promoted to first-class
-    /// `FlowRecord` members. Schema 1.6 addition (#204) — gives new event
-    /// types (`dispatch.turn`, `dispatch.tool`, `dispatch.compaction`,
-    /// `dispatch.reasoning`, `mission.compile.start/complete`) a place to
-    /// carry their event-specific fields without growing the struct
-    /// indefinitely.
+    /// The event-specific fields, typed per action (see [`crate::payload`]).
+    /// A record carries the payload of its own action: build it with
+    /// [`FlowRecord::for_session_with`] / [`FlowRecord::for_execution_with`],
+    /// which take the action from the payload. A payload read from an archive
+    /// is settled into its action's type by [`crate::reader`]; a
+    /// `FlowRecord` deserialized directly holds [`Payload::Unread`] until
+    /// [`FlowRecord::settled`] runs.
     ///
-    /// Convention: keys are snake_case strings; values are typed by event
-    /// shape (e.g. `dispatch.tool` uses `tool_name: string`, `args_chars:
-    /// integer`, `result_chars: integer`, `success: boolean`). See the
-    /// emit sites in `dispatch.rs` / `dispatch_internal.rs` for the
-    /// per-event-type payload shapes.
-    ///
-    /// Older records (pre-1.6) lack the field; viewer treats absence as
-    /// the empty object `{}`. New event types degrade to "action only" on
-    /// older viewers — they see the action string and the standard
-    /// FlowRecord fields, just not the event-specific extras.
+    /// Older records (pre-1.6) lack the field, and an action with no payload
+    /// never carries one.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "ts-export", ts(type = "Record<string, unknown>", optional))]
-    pub payload: Option<serde_json::Value>,
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub payload: Option<crate::payload::Payload>,
 }
 
 impl FlowRecord {
@@ -2416,6 +2409,38 @@ impl FlowRecord {
             payload: None,
         }
     }
+
+    /// [`FlowRecord::for_session`] for a record carrying `payload`: the
+    /// action is the payload's, so the two cannot disagree.
+    pub fn for_session_with(
+        session: &darkmux_types::session_id::SessionId,
+        level: Level,
+        category: Category,
+        stage: Stage,
+        payload: crate::payload::Payload,
+        handle: impl Into<String>,
+    ) -> Self {
+        let action = payload.action();
+        FlowRecord { payload: Some(payload), ..FlowRecord::for_session(session, level, category, stage, action, handle) }
+    }
+
+    /// The payload as the JSON it serializes to, `Null` when the record has
+    /// none. For a reader that treats a payload generically (a display, a
+    /// predicate over dotted paths) rather than as its action's type.
+    pub fn payload_json(&self) -> serde_json::Value {
+        self.payload.as_ref().map(|p| serde_json::to_value(p).unwrap_or_default()).unwrap_or_default()
+    }
+
+    /// This record with its payload read as its action's type. The one step
+    /// between a deserialized record and a typed one; a record built by
+    /// [`FlowRecord::for_session_with`] is already typed and comes back
+    /// unchanged.
+    pub fn settled(mut self) -> Self {
+        if let Some(crate::payload::Payload::Unread(u)) = self.payload.take() {
+            self.payload = Some(crate::payload::Payload::settle(&self.action, u.into_raw()));
+        }
+        self
+    }
 }
 
 impl FlowRecord {
@@ -2437,6 +2462,21 @@ impl FlowRecord {
             execution_id: Some(execution.clone()),
             ..FlowRecord::for_session(session, level, category, stage, action, handle)
         }
+    }
+
+    /// [`FlowRecord::for_execution`] for a record carrying `payload`: the
+    /// action is the payload's.
+    pub fn for_execution_with(
+        session: &darkmux_types::session_id::SessionId,
+        execution: &darkmux_types::execution_id::ExecutionId,
+        level: Level,
+        category: Category,
+        stage: Stage,
+        payload: crate::payload::Payload,
+        handle: impl Into<String>,
+    ) -> Self {
+        let action = payload.action();
+        FlowRecord { payload: Some(payload), ..FlowRecord::for_execution(session, execution, level, category, stage, action, handle) }
     }
 }
 
@@ -2491,6 +2531,11 @@ pub fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
+/// Whether `b` has the fixed width and separators of a record `ts`.
+fn has_ts_punctuation(b: &[u8]) -> bool {
+    b.len() == 20 && [(4, b'-'), (7, b'-'), (10, b'T'), (13, b':'), (16, b':'), (19, b'Z')].iter().all(|&(i, c)| b[i] == c)
+}
+
 /// The epoch second of a record-`ts`-shaped string (`YYYY-MM-DDTHH:MM:SSZ`,
 /// fixed width): the inverse of [`ts_utc_at`]. `None` for anything that is
 /// not exactly that shape, so a malformed `ts` degrades to "no timestamp"
@@ -2504,11 +2549,6 @@ pub fn parse_ts_utc(ts: &str) -> Option<i64> {
     let (h, mi, s) = (field(11..13)?, field(14..16)?, field(17..19)?);
     let in_range = (1..=12).contains(&mo) && (1..=31).contains(&d) && h <= 23 && mi <= 59 && s <= 60;
     in_range.then(|| days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + s)
-}
-
-/// The fixed width and separators of a record `ts`: `YYYY-MM-DDTHH:MM:SSZ`.
-fn has_ts_punctuation(b: &[u8]) -> bool {
-    b.len() == 20 && [(4, b'-'), (7, b'-'), (10, b'T'), (13, b':'), (16, b':'), (19, b'Z')].iter().all(|&(i, c)| b[i] == c)
 }
 
 pub(crate) fn current_epoch_secs() -> i64 {
