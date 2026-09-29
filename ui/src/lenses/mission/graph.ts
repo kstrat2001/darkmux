@@ -494,6 +494,23 @@ export function stepDispatchSessions(records: NormRecord[], missionId: string): 
   return out;
 }
 
+/** Whether folding a record left the step's accumulator unchanged. */
+function sameMetrics(a: StepMetrics, b: StepMetrics): boolean {
+  return (
+    a.tokRun === b.tokRun &&
+    a.tokFinal === b.tokFinal &&
+    a.turnRun === b.turnRun &&
+    a.turnFinal === b.turnFinal &&
+    a.toolRun === b.toolRun &&
+    a.toolFinal === b.toolFinal &&
+    a.usageSeen === b.usageSeen &&
+    a.startTs === b.startTs &&
+    a.endTs === b.endTs &&
+    a.stepBookended === b.stepBookended &&
+    a.lastTs === b.lastTs
+  );
+}
+
 /** `applyRecordToMetrics` — mission-graph.html. Folds one record into the
  * per-step metric accumulator, returning a NEW map only when something
  * changed (so a no-op record doesn't churn state). */
@@ -542,21 +559,7 @@ export function applyRecordToMetrics(metrics: MetricsMap, rec: NormRecord, idx: 
     if (finalTok) next.tokFinal = Math.max(next.tokFinal, finalTok);
   }
 
-  if (
-    next.tokRun === cur.tokRun &&
-    next.tokFinal === cur.tokFinal &&
-    next.turnRun === cur.turnRun &&
-    next.turnFinal === cur.turnFinal &&
-    next.toolRun === cur.toolRun &&
-    next.toolFinal === cur.toolFinal &&
-    next.usageSeen === cur.usageSeen &&
-    next.startTs === cur.startTs &&
-    next.endTs === cur.endTs &&
-    next.stepBookended === cur.stepBookended &&
-    next.lastTs === cur.lastTs
-  ) {
-    return metrics;
-  }
+  if (sameMetrics(next, cur)) return metrics;
   return { ...metrics, [sid]: next };
 }
 
