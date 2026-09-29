@@ -62,10 +62,6 @@ pub struct WorkJob {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workdir: Option<String>,
 
-    /// Optional phase-id binding — same semantics as DispatchOpts.phase_id.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub phase_id: Option<String>,
-
     /// (#703 Slice 4) Docker image the receiver dispatches into. `None` →
     /// the receiver's default runtime image.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -96,8 +92,10 @@ pub struct WorkJob {
 /// it. "7" (4.0): `session_id` (the job's and the reply's) is a session in
 /// the 4.0 grammar (`darkmux_types::session_id`), read back strictly, so a
 /// v6 sender's free-form session gets the version remedy, not a field
-/// error.
-pub const WORK_JOB_SCHEMA_VERSION: &str = "7";
+/// error. "8" (#2954): `phase_id` was removed with the hand-built mission
+/// phase verbs; a v7 job that still carries it is refused with the version
+/// remedy.
+pub const WORK_JOB_SCHEMA_VERSION: &str = "8";
 
 /// Max byte size of a `WorkJob.message`. 256 KiB matches the
 /// reasoning-text cap in `dispatch_internal.rs` (#231 / S6). (#246 PR-C.2)
@@ -132,9 +130,6 @@ impl WorkJob {
         validate_machine_name("WorkJob.target_machine", &self.target_machine)?;
         validate_work_identifier("role_id", &self.role_id)?;
         validate_session_id(&self.session_id)?;
-        if let Some(p) = &self.phase_id {
-            validate_work_identifier("phase_id", p)?;
-        }
         if let Some(p) = &self.profile {
             if p.is_empty() || p.len() > MAX_WORK_IDENTIFIER_LEN || !p.chars().all(|c| c.is_ascii_graphic()) {
                 return Err(anyhow!(
@@ -320,7 +315,6 @@ mod tests {
             session_id: SessionId::adhoc(darkmux_types::session_id::RunId::mission("m-1").unwrap(), "test-role", "sess-1"),
             profile: None,
             workdir: None,
-            phase_id: None,
             image: None,
             timeout_seconds: 60,
             published_at_unix_ms: 1_700_000_000_000,
@@ -371,14 +365,18 @@ mod tests {
         }
     }
 
-    /// (#2916 re-review C4) phase ids are identifiers.
+    /// (#2954) v8 dropped `phase_id`: a job still carrying one is a field
+    /// the receiver does not know, refused whole, and the wire version says
+    /// so. The same job without it parses.
     #[test]
-    fn phase_ids_are_checked() {
-        let mut job = make_valid_job();
-        job.phase_id = Some("../x".into());
-        assert!(job.validate().unwrap_err().to_string().contains("phase_id"));
-        job.phase_id = Some("phase-1".into());
-        assert!(job.validate().is_ok());
+    fn a_job_carrying_a_phase_id_is_refused_at_v8() {
+        assert_eq!(WORK_JOB_SCHEMA_VERSION, "8");
+        let mut v = serde_json::to_value(make_valid_job()).unwrap();
+        assert!(v.get("phase_id").is_none(), "v8 never writes phase_id");
+        assert!(serde_json::from_value::<WorkJob>(v.clone()).is_ok());
+        v["phase_id"] = serde_json::json!("phase-1");
+        let err = serde_json::from_value::<WorkJob>(v).unwrap_err().to_string();
+        assert!(err.contains("phase_id"), "{err}");
     }
 
     /// (#2916) A session id is a join key and part of file names on the

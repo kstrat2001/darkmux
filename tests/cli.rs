@@ -931,40 +931,65 @@ fn lab_loop_rejects_an_out_of_range_compact_threshold_ratio() {
         .stderr(predicate::str::contains("--compact-threshold-ratio 5 is out of range"));
 }
 
-// `mission dispatch` names an unknown mission and points at `mission
-// launch`, and rejects an id outside the identifier charset, both before
-// any fan-out. Runs without Redis or a model (the redis e2e twin of the
-// charset check skips on CI runners with no redis-server, #2938).
+/// (#2954) 4.0 retired the hand-built mission verbs with no alias: missions
+/// come only from mission configs (`mission launch`). Each old spelling is
+/// refused by name, exit 2, with the line naming its replacement; a wrong
+/// argument count or an unknown id never gets past the refusal, because the
+/// verb itself is gone.
 #[test]
-fn mission_dispatch_names_an_unknown_mission_and_how_to_create_one() {
-    darkmux_cmd()
-        .args(["mission", "dispatch", "no-such-mission", "--role", "coder", "--machine", "studio"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("mission `no-such-mission` not found"))
-        .stderr(predicate::str::contains("darkmux mission launch <config-id>"));
+fn retired_mission_verbs_are_refused_naming_the_replacement() {
+    let cases: [(&[&str], &str, &[&str]); 6] = [
+        (
+            &["mission", "dispatch", "m1", "--role", "coder", "--machine", "studio"],
+            "darkmux mission dispatch",
+            &["--profile <profile>@<machine>", "darkmux mission launch <config>"],
+        ),
+        (
+            &["mission", "add-phase", "m1", "--phase-id", "p2", "--description", "x"],
+            "darkmux mission add-phase",
+            &["darkmux mission launch <config>"],
+        ),
+        (&["mission", "start", "m1"], "darkmux mission start", &["darkmux mission launch <config>"]),
+        (&["mission", "pause", "m1"], "darkmux mission pause", &["darkmux mission abort <id>"]),
+        (&["mission", "resume", "m1"], "darkmux mission resume", &["darkmux mission finalize <id>"]),
+        (
+            &["dispatch", "coder", "hello", "--phase-id", "p1"],
+            "darkmux dispatch --phase-id",
+            &["darkmux mission launch <config>"],
+        ),
+    ];
+    for (args, named, remedies) in cases {
+        let mut assert = darkmux_cmd()
+            .args(args)
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains(format!("`{named}` was removed in 4.0")));
+        for remedy in remedies {
+            assert = assert.stderr(predicate::str::contains(*remedy));
+        }
+    }
 }
 
-// (#2916) The shared fleet work queue is retired, so a phase goes to one
-// named machine: `mission dispatch` with no `--machine` refuses and says how
-// to run the phase here instead.
+/// (#2954) The `--phase-id=<id>` spelling is the same retired flag.
 #[test]
-fn mission_dispatch_without_a_machine_names_the_retired_queue_and_the_local_alternative() {
+fn retired_dispatch_phase_id_equals_spelling_is_refused() {
     darkmux_cmd()
-        .args(["mission", "dispatch", "some-mission", "--role", "coder"])
+        .args(["dispatch", "coder", "hello", "--phase-id=p1"])
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("mission dispatch needs --machine <id>"))
-        .stderr(predicate::str::contains("--phase-id <phase>"));
+        .code(2)
+        .stderr(predicate::str::contains("`darkmux dispatch --phase-id` was removed in 4.0"));
 }
 
+/// (#2954) The inverse: an unknown verb that was never darkmux's keeps clap's
+/// own error, so the refusal table never shadows a typo with a wrong remedy.
 #[test]
-fn mission_dispatch_rejects_a_mission_id_outside_the_charset() {
+fn an_unknown_mission_verb_that_was_never_retired_keeps_clap_s_error() {
     darkmux_cmd()
-        .args(["mission", "dispatch", "../evil", "--role", "coder"])
+        .args(["mission", "frobnicate", "m1"])
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("mission_id contains invalid char"));
+        .code(2)
+        .stderr(predicate::str::contains("unrecognized subcommand"))
+        .stderr(predicate::str::contains("was removed in 4.0").not());
 }
 
 #[test]
@@ -1269,8 +1294,7 @@ fn retired_mission_run_subverb_is_unknown() {
 /// (#1463) The `phase` top-level verb family retired ENTIRELY: `estimate` +
 /// `review` + the `start`/`complete`/`abandon` lifecycle trio. Every spelling —
 /// the bare family and each old sub-verb — is now an unknown TOP-LEVEL verb with
-/// no compat alias (pre-2.0 clean removal). (`mission add-phase` is a DIFFERENT,
-/// surviving verb — it is NOT `darkmux phase`; see the mission-surface test.)
+/// no compat alias (pre-2.0 clean removal).
 #[test]
 fn retired_phase_family_is_unknown_entirely() {
     for args in [
@@ -1311,13 +1335,14 @@ fn retired_mission_ship_and_close_subverbs_are_unknown() {
     }
 }
 
-/// (#1463) The replacement surface EXISTS: the `mission` family lists `finalize`
-/// and `abort` (the two whole-mission terminals) and keeps `add-phase`, while
-/// `ship`/`close` are gone. Proves the rename landed — a change that dropped
-/// `finalize` or re-added `ship`/`close` can't pass both this and the
-/// retirement test above.
+/// (#1463, #2954) The replacement surface EXISTS: the `mission` family lists
+/// `launch` and the two whole-mission terminals `finalize` and `abort`, while
+/// `ship`/`close` (#1463) and the hand-built verbs `add-phase`/`dispatch`/
+/// `start`/`pause`/`resume` (#2954) are gone. A change that dropped a
+/// terminal or re-added a retired verb can't pass both this and the
+/// retirement tests above.
 #[test]
-fn mission_family_has_finalize_abort_addphase_but_not_ship_close() {
+fn mission_family_has_launch_finalize_abort_but_no_retired_verb() {
     let out = darkmux_cmd()
         .args(["mission", "--help"])
         .output()
@@ -1346,16 +1371,16 @@ fn mission_family_has_finalize_abort_addphase_but_not_ship_close() {
             }
         }
     }
-    for present in ["finalize", "abort", "add-phase"] {
+    for present in ["launch", "finalize", "abort"] {
         assert!(
             verbs.iter().any(|v| v == present),
-            "mission help must list `{present}` (#1463); parsed verbs: {verbs:?}"
+            "mission help must list `{present}`; parsed verbs: {verbs:?}"
         );
     }
-    for gone in ["ship", "close"] {
+    for gone in ["ship", "close", "add-phase", "dispatch", "start", "pause", "resume"] {
         assert!(
             !verbs.iter().any(|v| v == gone),
-            "the `mission {gone}` verb must stay retired (#1463); parsed verbs: {verbs:?}"
+            "the `mission {gone}` verb must stay retired; parsed verbs: {verbs:?}"
         );
     }
 }
