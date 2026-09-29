@@ -49,6 +49,7 @@
 
 use crate::findings::{self, FindingRecord};
 use crate::mods;
+use crate::step_config::{crawl_identity, load, non_blank, ConfigKind, RecordsGatherConfig};
 use crate::step_kinds::deliver_github_review::{DeliverScope, GatedMod};
 use crate::step_kinds::registry::StepKindRegistry;
 use crate::step_kinds::types::{CwdPolicy, Port, SeatClaim, StepKind, StepOutcome, StepRunCtx};
@@ -59,7 +60,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-pub const RECORDS_GATHER_KIND: &str = "records.gather";
+pub const RECORDS_GATHER_KIND: &str = ConfigKind::RecordsGather.id();
 
 /// Content id both the step's own `provides()` port and the envelope's
 /// `kind` use — same one-name-for-both-roles convention `crawl.summary`
@@ -68,19 +69,18 @@ pub const RECORDS_GATHER_OUTPUT_KIND: &str = "records.gather";
 
 pub const GATHER_OUTPUT_SCHEMA_VERSION: &str = "1.0";
 
-/// Local literal duplicate of `darkmux_lab::crawl::unit_step::
-/// CRAWL_UNIT_KIND`. `darkmux-crew` cannot depend on `darkmux-lab` (see
-/// `scan_unit_and_plan_steps`'s own doc), so this crate keeps its own
-/// copy of the string; a conformance test in `src/mission_launch.rs`
-/// (which depends on both crates) asserts the two literals stay equal and
-/// that both resolve against `all_step_kinds`'s real registry.
-pub const SCANNED_CRAWL_UNIT_KIND: &str = "crawl.unit";
-/// Local literal duplicate of `darkmux_lab::crawl::plan_sites_step::
-/// PLAN_SITES_KIND`. See [`SCANNED_CRAWL_UNIT_KIND`].
-pub const SCANNED_PLAN_SITES_KIND: &str = "plan.sites";
-/// Local literal duplicate of `darkmux_lab::crawl::plan_step::
-/// CRAWL_PLAN_KIND`. See [`SCANNED_CRAWL_UNIT_KIND`].
-pub const SCANNED_CRAWL_PLAN_KIND: &str = "crawl.plan";
+/// `darkmux_lab::crawl::unit_step::CRAWL_UNIT_KIND`, from the same
+/// [`ConfigKind`] id. `darkmux-crew` cannot depend on `darkmux-lab` (see
+/// `scan_unit_and_plan_steps`'s own doc); a conformance test in
+/// `src/mission_launch.rs` asserts each resolves against `all_step_kinds`'s
+/// real registry.
+pub const SCANNED_CRAWL_UNIT_KIND: &str = ConfigKind::CrawlUnit.id();
+/// `darkmux_lab::crawl::plan_sites_step::PLAN_SITES_KIND`, from the same
+/// [`ConfigKind`] id. See [`SCANNED_CRAWL_UNIT_KIND`].
+pub const SCANNED_PLAN_SITES_KIND: &str = ConfigKind::PlanSites.id();
+/// `darkmux_lab::crawl::plan_step::CRAWL_PLAN_KIND`, from the same
+/// [`ConfigKind`] id. See [`SCANNED_CRAWL_UNIT_KIND`].
+pub const SCANNED_CRAWL_PLAN_KIND: &str = ConfigKind::CrawlPlan.id();
 
 /// What [`RecordsGatherStepKind`] produces — everything
 /// `deliver_github_review::render_github_review` needs, gathered from this
@@ -195,17 +195,13 @@ impl StepKind for RecordsGatherStepKind {
     fn run(&self, step: &Step, task: &Task, _input: &BTreeMap<String, String>, _ctx: &StepRunCtx) -> Result<StepOutcome> {
         let mission_id = mission_id_for(task)?;
 
-        let diff = match step.config.get("diff_file").and_then(|v| v.as_str()) {
-            Some(p) if !p.trim().is_empty() => std::fs::read_to_string(p)
+        let cfg: RecordsGatherConfig = load(step, ConfigKind::RecordsGather)?;
+        let diff = match non_blank(cfg.diff_file) {
+            Some(p) => std::fs::read_to_string(&p)
                 .with_context(|| format!("step `{}`: `{RECORDS_GATHER_KIND}` reading config.diff_file {p}", step.id))?,
-            _ => String::new(),
+            None => String::new(),
         };
-        let mut not_attempted: Vec<String> = step
-            .config
-            .get("not_attempted")
-            .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
-            .unwrap_or_default();
+        let mut not_attempted: Vec<String> = cfg.not_attempted.unwrap_or_default();
 
         let findings: Vec<FindingRecord> = findings::load_all_at(&findings::findings_dir())
             .context("loading the finding store")?
@@ -336,8 +332,8 @@ fn declared_rules(mission_id: &str) -> std::collections::BTreeMap<String, String
     let Ok(Some(config)) = crate::lifecycle::load_config_snapshot(mission_id) else { return out };
     for phase in &config.phases {
         for task in &phase.tasks {
-            if let Some(rule) = task.steps.iter().find_map(|s| s.config.get("rule").and_then(|v| v.as_str())) {
-                out.insert(task.id.clone(), rule.to_string());
+            if let Some(rule) = task.steps.iter().find_map(|s| crawl_identity(&s.kind, &s.config).rule) {
+                out.insert(task.id.clone(), rule);
             }
         }
     }
@@ -499,7 +495,7 @@ pub const UNIT_RESULT_THERMAL_STOP: &str = "thermal_stop";
 /// what it CAN see, but now says so, rather than rendering the same as a
 /// mission with nothing wrong.
 ///
-/// **The scan keys on kind ids held as local constants**
+/// **The scan keys on kind ids held as constants**
 /// ([`SCANNED_CRAWL_UNIT_KIND`]/[`SCANNED_PLAN_SITES_KIND`]/
 /// [`SCANNED_CRAWL_PLAN_KIND`], #2310 swarm F). This is a closed list,
 /// matched by string, and there is no generic property ("this kind
@@ -530,12 +526,11 @@ pub const UNIT_RESULT_THERMAL_STOP: &str = "thermal_stop";
 /// time it is written** — a step of any other kind that merely fails is
 /// now caught by the fallthrough, but its rule/unit specifics are not.
 /// [`SCANNED_CRAWL_UNIT_KIND`]/[`SCANNED_PLAN_SITES_KIND`]/
-/// [`SCANNED_CRAWL_PLAN_KIND`] are local literal duplicates of
+/// [`SCANNED_CRAWL_PLAN_KIND`] come from the same [`ConfigKind`] ids as
 /// `darkmux_lab::crawl::{unit_step::CRAWL_UNIT_KIND, plan_sites_step::
-/// PLAN_SITES_KIND, plan_step::CRAWL_PLAN_KIND}` (this crate cannot
-/// depend on `darkmux-lab` — this module's own doc) kept honest by a
-/// conformance test in `src/mission_launch.rs`, which has access to both
-/// crates' real constants and the full `StepKindRegistry`.
+/// PLAN_SITES_KIND, plan_step::CRAWL_PLAN_KIND}` (this crate cannot depend
+/// on `darkmux-lab` — this module's own doc); a conformance test in
+/// `src/mission_launch.rs` checks them against the full `StepKindRegistry`.
 fn scan_unit_and_plan_steps(mission_id: &str, exclude_task_id: &str) -> StepScan {
     let mut scan = StepScan::default();
     let phases = match crate::loader::load_phases() {
@@ -634,11 +629,9 @@ fn scan_unit_and_plan_steps(mission_id: &str, exclude_task_id: &str) -> StepScan
                     // `DeliverScope` field, its render and its goldens —
                     // worth doing, deliberately not folded into this fix.
                     if !never_dispatched {
-                        if let (Some(rule), Some(unit)) = (
-                            step.config.get("rule").and_then(|v| v.as_str()),
-                            step.config.get("unit").and_then(|v| v.as_str()),
-                        ) {
-                            scan.completed_units.insert((rule.to_string(), unit.to_string()));
+                        let identity = crawl_identity(&step.kind, &step.config);
+                        if let (Some(rule), Some(unit)) = (identity.rule, identity.unit) {
+                            scan.completed_units.insert((rule, unit));
                         }
                     }
                     let rejected = doc
@@ -654,12 +647,7 @@ fn scan_unit_and_plan_steps(mission_id: &str, exclude_task_id: &str) -> StepScan
                     if step.status == crate::types::NodeStatus::Complete {
                         continue;
                     }
-                    let rule = step
-                        .config
-                        .get("rule")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string)
-                        .unwrap_or_else(|| step.id.clone());
+                    let rule = crawl_identity(&step.kind, &step.config).rule.unwrap_or_else(|| step.id.clone());
                     scan.not_attempted.push(rule);
                     scan.errored.push(format!("plan `{}` ({:?})", step.id, step.status));
                 }

@@ -51,7 +51,8 @@ pub mod load;
 
 pub use grow::{grow_task, items_from_artifact, GrownFrom};
 pub use inputs::{
-    check_embedded_inputs_collected, check_placeholders_declared, check_supplied_inert_inputs,
+    check_embedded_inputs_collected, check_placeholders_declared, check_resolved_step_configs,
+    check_supplied_inert_inputs,
     find_unsubstituted_braces, substitute_step_config, undeclared_placeholders,
     unreferenced_inputs,
 };
@@ -790,8 +791,10 @@ pub struct GrowSpec {
 /// One step, as data. `kind` names a REGISTERED `step_kinds::StepKind` id —
 /// Tier 1 generic (e.g. `"dispatch.internal"`), Tier 2 pattern, or a Tier 3
 /// mission-bespoke id (e.g. `"review.bundle"`, `"mission.worktree"`, #1352).
-/// `config` is kind-specific and opaque to this schema — mirrors
-/// `crew::types::Step.config`'s own flat `serde_json::Value` bag.
+/// `config` is kind-specific: this document type holds it as an open
+/// `serde_json::Value` (mirroring `crew::types::Step.config`), and the
+/// unknown-key gate checks it against the struct `kind` selects
+/// (`crate::step_config`, `ConfigKind`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct StepConfig {
     pub id: String,
@@ -2619,7 +2622,7 @@ mod tests {
         assert_eq!(phase.tasks[2].steps[0].kind, "mission.verify");
 
         assert_eq!(phase.tasks[1].role_id.as_deref(), Some("coder"));
-        assert_eq!(phase.tasks[2].role_id.as_deref(), Some("code-reviewer"));
+        assert_eq!(phase.tasks[2].role_id, None, "mission.verify always dispatches code-reviewer; a role_id there is refused");
 
         // The coder task's description matches the Rust builder's dynamic
         // form with the default role substituted (`dispatch `{role}` into

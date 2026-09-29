@@ -1,12 +1,11 @@
 //! Built-in step kinds (#1230 Packet 2): `dispatch.internal`,
 //! `dispatch.single_shot`, `procedural.shell`, `procedural.noop`.
 //!
-//! Each kind reads its parameters from `Step.config` (a flat
-//! `serde_json::Value` object — the same "kind-specific overflow bag"
-//! pattern `WorkloadSpec.extras` and `ProfileModel.extras` already use).
-//! Required keys are named in each kind's doc comment; a missing
-//! required key is a loud `Err`, never a silent default that would mask
-//! an operator/caller typo.
+//! Each kind reads its parameters from `Step.config` through ONE typed
+//! struct (`crate::step_config`), the same struct the mission-config gate
+//! checks the document against. A missing required key or a key of the
+//! wrong type is a loud `Err`, never a silent default that would mask an
+//! operator/caller typo.
 //!
 //! **This is Tier 1 (#1352).** Every kind below is generic AND
 //! config-driven — no per-mission control flow, only values read from
@@ -20,6 +19,10 @@ use super::types::{
     CwdPolicy, MapDispatchOverride, OverrideDispatchCall, SeatClaim, StepKind, StepOutcome, StepRunCtx,
 };
 use crate::remote_budget::RemoteBudget;
+use crate::step_config::{
+    load, load_checked, ConfigKind, DispatchInternalConfig, MapConfig, ModelCallConfig, NoopConfig,
+    MapSource, ShellConfig, SingleShotConfig,
+};
 use crate::types::{Step, Task};
 use darkmux_types::execution_id::ExecutionId;
 use darkmux_types::session_id::{SessionId, SessionScope};
@@ -45,16 +48,6 @@ fn compose_message(base: &str, input: &BTreeMap<String, String>) -> String {
     composed
 }
 
-fn config_str<'a>(step: &'a Step, key: &str) -> Option<&'a str> {
-    step.config.get(key).and_then(|v| v.as_str())
-}
-
-fn require_config_str<'a>(step: &'a Step, kind_id: &str, key: &str) -> Result<&'a str> {
-    config_str(step, key).ok_or_else(|| {
-        anyhow!("step `{}`: `{kind_id}` requires config.{key}", step.id)
-    })
-}
-
 /// (#2570) The identifier a LOCAL (non-`endpoint`) `dispatch.single_shot` /
 /// `dispatch.map` step addresses — the SAME derivation each kind's `seat()`
 /// already uses to decide what residency LOADS under (an explicit
@@ -78,20 +71,18 @@ fn require_config_str<'a>(step: &'a Step, kind_id: &str, key: &str) -> Result<&'
 /// deployment name is not something darkmux loads into local residency, so
 /// the bare `config.model` string is already the correct wire value there
 /// — see each `seat()`'s own `RemoteEndpoint` short-circuit.
-fn local_dispatch_wire_model_id(step: &Step, model: &str) -> String {
-    config_str(step, "identifier")
-        .map(str::to_string)
-        .unwrap_or_else(|| darkmux_gestalt::namespaced_identifier(model, None))
+fn local_dispatch_wire_model_id(call: &ModelCallConfig) -> String {
+    call.identifier.clone().unwrap_or_else(|| darkmux_gestalt::namespaced_identifier(&call.model, None))
 }
 
 /// The identifier a single-shot or map step addresses: the bare `model` for
 /// a hosted step (an endpoint's deployment name, never loaded locally),
 /// else the local identifier [`local_dispatch_wire_model_id`] derives.
-fn step_wire_model<'a>(step: &Step, model: &'a str, is_hosted: bool) -> std::borrow::Cow<'a, str> {
+fn step_wire_model(call: &ModelCallConfig, is_hosted: bool) -> String {
     if is_hosted {
-        std::borrow::Cow::Borrowed(model)
+        call.model.clone()
     } else {
-        std::borrow::Cow::Owned(local_dispatch_wire_model_id(step, model))
+        local_dispatch_wire_model_id(call)
     }
 }
 
@@ -247,8 +238,8 @@ fn resolve_local_placement_inner_with(
 /// (`target::step_unmanaged_endpoint`): `Some` only for an UNMANAGED
 /// endpoint, the hosted arm. An `endpoints` id resolves against the registry
 /// the step names (`config.config_path`), else the default one.
-fn step_endpoint(step: &Step) -> Result<Option<darkmux_types::ModelEndpoint>> {
-    crate::target::step_unmanaged_endpoint(&step.config, config_str(step, "config_path"))
+fn step_endpoint(call: &ModelCallConfig) -> Result<Option<darkmux_types::ModelEndpoint>> {
+    crate::target::step_unmanaged_endpoint(call.endpoint.as_ref(), call.config_path.as_deref())
 }
 
 /// (#1230 Packet 4 DRY pass) One `failed_tool_invocations` entry from the
@@ -344,7 +335,7 @@ pub fn parse_failed_verifiers(envelope_stdout: &str) -> Vec<FailedVerifier> {
 /// failure), and `StepOutcome.output` carries a JSON-serialized
 /// [`RawDispatchOutcome`] instead of the bare stdout string. Every other
 /// caller (mission launch, coder-phase, review) never sets this key, so
-/// `config_str` reads `None` and the original behavior is byte-identical.
+/// the key loads as unset and the original behavior is byte-identical.
 ///
 /// Also newly config-driven, same additive/default-preserving shape, so the
 /// crew-of-one path can thread the CLI's own `--skip-preflight`/
@@ -375,13 +366,6 @@ pub struct RawDispatchOutcome {
     pub out_dir: Option<std::path::PathBuf>,
 }
 
-/// `task.<field>.clone()`, falling back to `Step.config.<key>` (as a
-/// string) when the Task leaves it unset — the shared sourcing rule every
-/// dispatch-shaped built-in's assignment fields use (#1230/#1341).
-fn task_or_config_str(task_field: Option<&String>, step: &Step, key: &str) -> Option<String> {
-    task_field.cloned().or_else(|| config_str(step, key).map(str::to_string))
-}
-
 /// (#2480 review, blocker 2) The `Step` + `Task` + upstream-`input` ->
 /// [`DispatchOpts`] reconstruction, as a free function.
 ///
@@ -403,26 +387,19 @@ pub(crate) fn dispatch_opts_for(
 ) -> Result<crate::dispatch::DispatchOpts> {
     use crate::dispatch::{CompactionDispatchArgs, DispatchOpts};
 
-    let role_id = task_or_config_str(task.role_id.as_ref(), step, "role_id").ok_or_else(|| {
+    let cfg: DispatchInternalConfig = load(step, ConfigKind::DispatchInternal)?;
+    let role_id = task.role_id.clone().or(cfg.role_id).ok_or_else(|| {
         // The kind id is spelled out rather than read off `self.id()` — this
         // is a free function now, and the literal is the same constant that
         // method returns, so the message is byte-identical to before.
         anyhow!("step `{}`: `dispatch.internal` requires task.role_id or config.role_id", step.id)
     })?;
-    let base_message = config_str(step, "message").unwrap_or_default();
-    let message = compose_message(base_message, input);
-    let timeout_seconds = step
-        .config
-        .get("timeout_seconds")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(3600) as u32;
-    let profile_name = task_or_config_str(task.profile_name.as_ref(), step, "profile_name");
-    let image = task_or_config_str(task.image.as_ref(), step, "image");
-    let config_path = config_str(step, "config_path").map(str::to_string);
-    let workdir = task
-        .workdir
-        .clone()
-        .or_else(|| config_str(step, "workdir").map(std::path::PathBuf::from));
+    let message = compose_message(cfg.message.as_deref().unwrap_or_default(), input);
+    let timeout_seconds = cfg.timeout_seconds.map_or(3600, |c| c.saturating_u32());
+    let profile_name = task.profile_name.clone().or(cfg.profile_name);
+    let image = task.image.clone().or(cfg.image);
+    let config_path = cfg.config_path;
+    let workdir = task.workdir.clone().or_else(|| cfg.workdir.map(std::path::PathBuf::from));
     // The owning Task names the phase for every step minted from a mission
     // config; the step config's own `phase_id` (the crew-of-one's way of
     // passing the CLI's `--phase`) wins when present. Without the task
@@ -430,37 +407,26 @@ pub(crate) fn dispatch_opts_for(
     // mission on its records: no drill link from the mission view, no
     // events in the sheet, no token attribution (2026-09-04, the grown
     // follow-on steps of a crawl).
-    let phase_id = config_str(step, "phase_id")
-        .map(str::to_string)
-        .or_else(|| (!task.phase_id.is_empty()).then(|| task.phase_id.clone()));
+    let phase_id = cfg.phase_id.or_else(|| (!task.phase_id.is_empty()).then(|| task.phase_id.clone()));
     // A producer that names the session (the crew-of-one names its ad-hoc
     // dispatch) writes its wire string here; read back strictly. Otherwise
     // the step's own session in this run.
-    let session = match step.config.get("session_id") {
-        Some(v) => serde_json::from_value::<SessionId>(v.clone())
-            .with_context(|| format!("step `{}`: config.session_id", step.id))?,
+    let session = match cfg.session_id {
+        Some(session) => session,
         None => ctx.session(&DispatchInternalStepKind, step)?,
     };
     // (#1509) Additive, default-preserving config passthroughs — see
     // `DispatchInternalStepKind`'s doc. Every existing caller (mission
     // launch, coder-phase, review) never sets these keys, so each falls
     // back to the exact literal the code used to hardcode here.
-    let skip_preflight = step
-        .config
-        .get("skip_preflight")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let json = step.config.get("json").and_then(|v| v.as_bool()).unwrap_or(true);
-    let max_completion_tokens = step
-        .config
-        .get("max_completion_tokens")
-        .and_then(|v| v.as_u64())
-        .and_then(|v| u32::try_from(v).ok());
+    let skip_preflight = cfg.skip_preflight.is_some_and(|f| f.0);
+    let json = cfg.json.is_none_or(|f| f.0);
+    let max_completion_tokens = cfg.max_completion_tokens.and_then(|c| c.as_u32());
     // (#2114 follow-up) `--resume-from <dir>` threaded through the
     // crew-of-one graph's step config (`DispatchAsCrewOfOne::build_graph`)
     // — see that fn's own doc for why the CLI's `DispatchOpts` isn't
     // forwarded wholesale.
-    let resume_from = config_str(step, "resume_from").map(std::path::PathBuf::from);
+    let resume_from = cfg.resume_from.map(std::path::PathBuf::from);
     // (#2295) The finding / mod records the brief carries, read back off
     // the step config. The step config is this list's HOME: the
     // crew-of-one graph writes it from the CLI flags, and a mission graph
@@ -475,7 +441,7 @@ pub(crate) fn dispatch_opts_for(
     // record still fails the step before the ack gate and before any
     // container work. The CANONICAL refs (the key as the record spells it)
     // are what get stamped and mounted.
-    let brief_refs = crate::brief_refs::from_json(step.config.get("brief_refs"));
+    let brief_refs = cfg.brief_refs.unwrap_or_default();
     let (message, brief_refs) = crate::brief_refs::append_to_brief(
         &message,
         &brief_refs,
@@ -525,18 +491,14 @@ pub(crate) fn dispatch_opts_for(
         // top-level `darkmux dispatch` takes. A mission/coder-phase/
         // review step names no such key and still resolves `None`, so
         // their standing `env > config > 600` budget is unchanged.
-        timeout_override_seconds: step
-            .config
-            .get("timeout_override_seconds")
-            .and_then(|v| v.as_u64())
-            .and_then(|v| u32::try_from(v).ok()),
+        timeout_override_seconds: cfg.timeout_override_seconds.and_then(|c| c.as_u32()),
     };
     Ok(opts)
 }
 
 impl StepKind for DispatchInternalStepKind {
     fn id(&self) -> &'static str {
-        "dispatch.internal"
+        ConfigKind::DispatchInternal.id()
     }
 
     fn display_name(&self) -> &'static str {
@@ -546,16 +508,9 @@ impl StepKind for DispatchInternalStepKind {
     fn run(&self, step: &Step, task: &Task, input: &BTreeMap<String, String>, ctx: &StepRunCtx) -> Result<StepOutcome> {
         use crate::dispatch::dispatch;
 
-        let parse_verifiers = step
-            .config
-            .get("parse_verifiers")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let preserve_dispatch_result = step
-            .config
-            .get("preserve_dispatch_result")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let cfg: DispatchInternalConfig = load(step, ConfigKind::DispatchInternal)?;
+        let parse_verifiers = cfg.parse_verifiers.is_some_and(|f| f.0);
+        let preserve_dispatch_result = cfg.preserve_dispatch_result.is_some_and(|f| f.0);
         // (#2480 review, blocker 2) The whole `Step`/`Task` ->
         // `DispatchOpts` reconstruction lives in `dispatch_opts_for`, a
         // free function a unit test can call without Docker or a model —
@@ -637,13 +592,17 @@ impl StepKind for DispatchInternalStepKind {
         _input: &std::collections::BTreeMap<String, String>,
         _ctx: &StepRunCtx,
     ) -> SeatClaim {
-        let Some(role_id) = task_or_config_str(task.role_id.as_ref(), step, "role_id") else {
+        let cfg: DispatchInternalConfig = match load(step, ConfigKind::DispatchInternal) {
+            Ok(cfg) => cfg,
+            Err(e) => return SeatClaim::LocalModelUnresolved { reason: format!("{e:#}") },
+        };
+        let Some(role_id) = task.role_id.clone().or(cfg.role_id) else {
             return SeatClaim::LocalModelUnresolved {
                 reason: "no role_id on the task or in step config".to_string(),
             };
         };
-        let profile_name = task_or_config_str(task.profile_name.as_ref(), step, "profile_name");
-        let config_path = config_str(step, "config_path").map(str::to_string);
+        let profile_name = task.profile_name.clone().or(cfg.profile_name);
+        let config_path = cfg.config_path;
         // NOTE: `step:{id}` here is a gestalt SEAT LABEL (placement-plan
         // diagnostics), NOT a flow-record session id — exempt from the #1436
         // hyphen convention; future colon sweeps should skip it.
@@ -651,9 +610,8 @@ impl StepKind for DispatchInternalStepKind {
     }
 
     /// (#1511) The role this kind dispatches, read from the SAME
-    /// `task_or_config_str` source `run` and `seat` above both read — one
-    /// expression, three callers, so the consent gate cannot disagree with
-    /// the load. `None` only when neither the Task nor the config names a
+    /// task-then-config source `run` and `seat` above both read, so the
+    /// consent gate cannot disagree with the load. `None` only when neither the Task nor the config names a
     /// role, which is the same input `seat` reports as
     /// `LocalModelUnresolved` (no wave load) and `run` fails on.
     fn dispatch_role(
@@ -663,14 +621,14 @@ impl StepKind for DispatchInternalStepKind {
         _input: &std::collections::BTreeMap<String, String>,
         _ctx: &StepRunCtx,
     ) -> Option<String> {
-        task_or_config_str(task.role_id.as_ref(), step, "role_id")
+        task.role_id.clone().or_else(|| load::<DispatchInternalConfig>(step, ConfigKind::DispatchInternal).ok()?.role_id)
     }
 
     /// (#2614 review, MUST FIX + "Also fix" wrong-problem-surfaced finding)
     /// The scheduler-hoisted half of the `--resume-from` checkpoint gate —
     /// see `StepKind::resume_precheck`'s own doc for the full "why here,
     /// why not the workdir check too" reasoning. The early-out on a bare
-    /// `config_str` read (no `resume_from` key at all) stays cheap and
+    /// config load (no `resume_from` key at all) stays cheap and
     /// I/O-free for the overwhelming majority of dispatches that never set
     /// one; only a `--resume-from` dispatch pays for the full
     /// `dispatch_opts_for` hop below.
@@ -698,7 +656,8 @@ impl StepKind for DispatchInternalStepKind {
         input: &std::collections::BTreeMap<String, String>,
         ctx: &StepRunCtx,
     ) -> Result<()> {
-        if config_str(step, "resume_from").is_none() {
+        let cfg: DispatchInternalConfig = load(step, ConfigKind::DispatchInternal)?;
+        if cfg.resume_from.is_none() {
             return Ok(());
         }
         let opts = dispatch_opts_for(step, task, input, ctx)
@@ -841,7 +800,7 @@ impl ExecutionBookends<'_> {
 
 impl StepKind for DispatchSingleShotStepKind {
     fn id(&self) -> &'static str {
-        "dispatch.single_shot"
+        ConfigKind::DispatchSingleShot.id()
     }
 
     fn display_name(&self) -> &'static str {
@@ -882,23 +841,22 @@ impl StepKind for DispatchSingleShotStepKind {
         // a managed one (or none) is placed locally. One that cannot be
         // resolved keeps the hosted claim it always had: `run` refuses it
         // with the reason.
-        if !matches!(step_endpoint(step), Ok(None)) {
+        let cfg: SingleShotConfig = match load(step, ConfigKind::DispatchSingleShot) {
+            Ok(cfg) => cfg,
+            Err(e) => return SeatClaim::LocalModelUnresolved { reason: format!("{e:#}") },
+        };
+        let call = &cfg.call;
+        if !matches!(step_endpoint(call), Ok(None)) {
             return SeatClaim::RemoteEndpoint;
         }
-        let Some(model) = config_str(step, "model") else {
-            return SeatClaim::LocalModelUnresolved { reason: "no config.model".to_string() };
-        };
-        let Some(min_ctx) = step.config.get("n_ctx").and_then(|v| v.as_u64()).and_then(|n| u32::try_from(n).ok())
-        else {
+        let Some(min_ctx) = call.n_ctx.and_then(|n| n.as_u32()) else {
             return SeatClaim::LocalModelUnresolved {
-                reason: format!("local model `{model}` has no usable config.n_ctx"),
+                reason: format!("local model `{}` has no usable config.n_ctx", call.model),
             };
         };
-        let identifier = local_dispatch_wire_model_id(step, model);
-        let model_key = config_str(step, "model_key").unwrap_or(model);
         SeatClaim::LocalModel(darkmux_gestalt::Placement {
-            model_key: model_key.to_string(),
-            identifier,
+            model_key: call.model_key.clone().unwrap_or_else(|| call.model.clone()),
+            identifier: local_dispatch_wire_model_id(call),
             min_ctx,
             seat: format!("step:{}", step.id),
         })
@@ -946,7 +904,8 @@ impl DispatchSingleShotStepKind {
         // the budget records of its gate all name it.
         let execution = &ExecutionId::mint();
 
-        let model = require_config_str(step, self.id(), "model")?;
+        let cfg: SingleShotConfig = load(step, ConfigKind::DispatchSingleShot)?;
+        let call = &cfg.call;
         // (#2570) The identifier this step actually ADDRESSES: the bare
         // `config.model` string for a hosted step (an endpoint deployment
         // name — darkmux never loads it into local residency), or the SAME
@@ -957,22 +916,13 @@ impl DispatchSingleShotStepKind {
         // `<key>` — the #2240/#2536 split, here. Computed once so the
         // records and the actual call can never disagree about what was
         // dispatched.
-        let endpoint = step_endpoint(step).with_context(|| format!("step `{}`: config.endpoint", step.id))?;
+        let endpoint = step_endpoint(call).with_context(|| format!("step `{}`: config.endpoint", step.id))?;
         let is_hosted = endpoint.is_some();
-        let wire_model = step_wire_model(step, model, is_hosted);
-        let system = config_str(step, "system").unwrap_or("");
-        let base_user = config_str(step, "user").unwrap_or_default();
-        let user = compose_message(base_user, input);
-        let max_tokens = step
-            .config
-            .get("max_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(4096) as u32;
-        let timeout_seconds = step
-            .config
-            .get("timeout_seconds")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(120) as u32;
+        let wire_model = step_wire_model(call, is_hosted);
+        let system = call.system.as_deref().unwrap_or("");
+        let user = compose_message(cfg.user.as_deref().unwrap_or_default(), input);
+        let max_tokens = call.max_tokens.map_or(4096, |c| c.saturating_u32());
+        let timeout_seconds = call.timeout_seconds.map_or(120, |c| c.saturating_u32());
 
         // (#2344) Contract #2's liveness bookends, which this kind owed and
         // never emitted — it performs REAL model work (one chat completion,
@@ -1026,7 +976,7 @@ impl DispatchSingleShotStepKind {
                 role_id: None,
                 model: Some(wire_model.as_ref()),
                 phase_id: Some(&task.phase_id),
-                profiles_file: config_str(step, "config_path"),
+                profiles_file: call.config_path.as_deref(),
             };
             crate::budget::admit_endpoint(endpoint, &budget_caller)?;
             let step_bucket = std::sync::Mutex::new(
@@ -1073,11 +1023,7 @@ impl DispatchSingleShotStepKind {
 
             reply
         } else {
-            let temperature = step
-                .config
-                .get("temperature")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.7) as f32;
+            let temperature = call.temperature();
             let req = SingleShotRequest {
                 base_url: None,
                 model: wire_model.as_ref(),
@@ -1349,14 +1295,9 @@ fn resolve_map_collection(
     task: &Task,
     input: &BTreeMap<String, String>,
 ) -> Result<Vec<serde_json::Value>> {
-    if let Some(v) = step.config.get("collection") {
-        return match v.as_array() {
-            Some(arr) => Ok(arr.clone()),
-            None => bail!(
-                "step `{}`: `dispatch.map` config.collection must be a JSON array",
-                step.id
-            ),
-        };
+    let source: MapSource = load(step, ConfigKind::DispatchMap)?;
+    if let Some(items) = source.collection {
+        return Ok(items);
     }
     let present_keys = || {
         if input.is_empty() {
@@ -1376,7 +1317,7 @@ fn resolve_map_collection(
         .filter(|&i| i > 0)
         .and_then(|i| task.step_ids.get(i - 1))
         .and_then(|prev_id| input.get(prev_id));
-    let source: Option<&String> = match config_str(step, "collection_input") {
+    let source: Option<&String> = match source.collection_input.as_deref() {
         Some(key) => match input.get(key) {
             Some(s) => Some(s),
             None => bail!(
@@ -1515,6 +1456,17 @@ fn resolve_map_collection(
 pub struct DispatchMapStepKind;
 
 impl DispatchMapStepKind {
+    /// The seat of a step whose config does not load: no model is claimed
+    /// for an empty collection (which `run` completes without one), and
+    /// anything else is unresolved for the config's own reason.
+    fn seat_without_config(step: &Step, task: &Task, input: &BTreeMap<String, String>, cause: &anyhow::Error) -> SeatClaim {
+        match resolve_map_collection(step, task, input) {
+            Ok(items) if items.is_empty() => SeatClaim::NoModel,
+            Ok(_) => SeatClaim::LocalModelUnresolved { reason: format!("{cause:#}") },
+            Err(e) => SeatClaim::LocalModelUnresolved { reason: format!("collection: {e:#}") },
+        }
+    }
+
     /// One per-item flow record, field-aligned with
     /// [`DispatchSingleShotStepKind`]'s hosted "step result" record so a
     /// graph/parity consumer reads a map's per-item records the same way it
@@ -1607,7 +1559,7 @@ impl DispatchMapStepKind {
     fn short_circuit_record(session: &SessionId, step: &Step) -> darkmux_flow::FlowRecord {
         darkmux_flow::FlowRecord {
             source: Some(darkmux_flow::FlowSource::Scheduler),
-            model: config_str(step, "model").map(str::to_string),
+            model: load::<MapConfig>(step, ConfigKind::DispatchMap).ok().map(|cfg| cfg.call.model),
             payload: Some(serde_json::json!({
                 "step_id": step.id,
                 "kind": "dispatch.map",
@@ -1616,31 +1568,6 @@ impl DispatchMapStepKind {
                 "short_circuit": "empty collection — dispatch.map skipped before any model load",
             })),
             ..darkmux_flow::FlowRecord::for_session(session, darkmux_flow::Level::Info, darkmux_flow::Category::Work, darkmux_flow::Stage::Dispatch, darkmux_flow::FlowAction::StepResult, step.id.clone())
-        }
-    }
-
-    /// (#1605) Shared parse/validate for a `dispatch.map` retry-budget
-    /// config key (`retry_on_empty`, `retry_on_error`) — both are a
-    /// non-negative integer, default 0/off when absent, and a loud
-    /// step-run-time `Err` (never silent coercion) when present but
-    /// non-integer or out of `u32`'s range. Named after the key it reads so
-    /// the error messages stay specific to whichever knob was misconfigured.
-    fn config_retry_budget(&self, step: &Step, key: &'static str) -> Result<u32> {
-        match step.config.get(key) {
-            None => Ok(0),
-            Some(v) => {
-                let n = v.as_u64().ok_or_else(|| {
-                    anyhow!("step `{}`: `{}` config.{key} must be a non-negative integer", step.id, self.id())
-                })?;
-                u32::try_from(n).map_err(|_| {
-                    anyhow!(
-                        "step `{}`: `{}` config.{key} ({n}) exceeds the maximum of {}",
-                        step.id,
-                        self.id(),
-                        u32::MAX
-                    )
-                })
-            }
         }
     }
 
@@ -1682,7 +1609,8 @@ impl DispatchMapStepKind {
             return Ok(StepOutcome { output: "[]".to_string(), flow_records: batched });
         }
 
-        let model = require_config_str(step, self.id(), "model")?;
+        let cfg: MapConfig = load_checked(step, ConfigKind::DispatchMap)?;
+        let call = &cfg.call;
         // (#2570) The identifier this step actually ADDRESSES per item: the
         // bare `config.model` string for a hosted step (an endpoint
         // deployment name — darkmux never loads it into local residency),
@@ -1694,30 +1622,21 @@ impl DispatchMapStepKind {
         // #2240/#2536 split, here. Computed once so the records and the
         // actual per-item calls can never disagree about what was
         // dispatched.
-        let endpoint = step_endpoint(step).with_context(|| format!("step `{}`: config.endpoint", step.id))?;
+        let endpoint = step_endpoint(call).with_context(|| format!("step `{}`: config.endpoint", step.id))?;
         let is_hosted = endpoint.is_some();
-        let wire_model = step_wire_model(step, model, is_hosted);
-        let user_template = require_config_str(step, self.id(), "user_template")?;
-        let system = config_str(step, "system").unwrap_or("");
-        let max_tokens = step.config.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(4096) as u32;
-        let timeout_seconds =
-            step.config.get("timeout_seconds").and_then(|v| v.as_u64()).unwrap_or(120) as u32;
-        // (#1442) The generic retry-on-empty budget (default 0/off) — see the
-        // struct doc. Read once for the whole collection loop. ABSENT → 0
-        // (optional, off). A PRESENT-but-invalid value is a LOUD config error
-        // at step-run time (matching this block's `require_config_*`
-        // "missing/invalid key is loud" doctrine), never silently coerced —
-        // an out-of-u32-range `retry_on_empty` must NOT become ~4 billion
-        // re-dispatches (the prior `u32::try_from(...).unwrap_or(u32::MAX)`
-        // did exactly that; #1442 gate CONSIDER).
-        let retry_on_empty = self.config_retry_budget(step, "retry_on_empty")?;
-        // (#1605) `retry_on_error` — same shape, same validation, default
-        // 0/off. See [`DispatchMapStepKind`]'s doc for the policy this opts
-        // a step INTO: a dispatch `Err` is retried up to this many times
-        // (short backoff between attempts) instead of isolating immediately.
-        // Off by default for every existing caller; the review pipeline's
-        // probe stage is the first to set it (darkmux#1605 cause 2).
-        let retry_on_error = self.config_retry_budget(step, "retry_on_error")?;
+        let wire_model = step_wire_model(call, is_hosted);
+        let user_template = cfg.user_template.as_str();
+        let system = call.system.as_deref().unwrap_or("");
+        let max_tokens = call.max_tokens.map_or(4096, |c| c.saturating_u32());
+        let timeout_seconds = call.timeout_seconds.map_or(120, |c| c.saturating_u32());
+        // (#1442) The retry budgets (default 0/off), read once for the whole
+        // collection loop. A value beyond `u32`'s range was refused when the
+        // config loaded (`MapConfig`'s rules): it must never become ~4 billion
+        // re-dispatches. `retry_on_error` (#1605) retries a dispatch `Err`
+        // instead of isolating it immediately; see [`DispatchMapStepKind`]'s
+        // doc for the policy.
+        let retry_on_empty = cfg.retry_on_empty.map_or(0, |n| n.saturating_u32());
+        let retry_on_error = cfg.retry_on_error.map_or(0, |n| n.saturating_u32());
 
         // (#1607) Contract #2's liveness bookends are per ITEM (below): each
         // item is one role execution. They carry the endpoint label, which is
@@ -1791,7 +1710,7 @@ impl DispatchMapStepKind {
         let bucket: Arc<Mutex<RemoteBudget>> = match run_ctx.remote_bucket() {
             Some(shared) => shared.clone(),
             None => Arc::new(Mutex::new(
-                RemoteBudget::from_config(step.config.get("bucket_budget").and_then(|v| v.as_u64()))
+                RemoteBudget::from_config(cfg.bucket.bucket_budget.map(|c| c.0))
                     .map_err(|e| anyhow::anyhow!(e.to_string()))?,
             )),
         };
@@ -1799,8 +1718,7 @@ impl DispatchMapStepKind {
         // threaded into every item's arm; `None` on all production paths.
         let ovr = run_ctx.dispatch_override();
 
-        let temperature =
-            step.config.get("temperature").and_then(|v| v.as_f64()).unwrap_or(0.7) as f32;
+        let temperature = call.temperature();
         let mut results: Vec<MapItemResult> = Vec::with_capacity(items.len());
         for (index, item) in items.iter().enumerate() {
             // One item, one execution: its bookends, its usage records and
@@ -1825,7 +1743,7 @@ impl DispatchMapStepKind {
                 role_id: task.role_id.as_deref(),
                 model: Some(wire_model.as_ref()),
                 phase_id: Some(&task.phase_id),
-                profiles_file: config_str(step, "config_path"),
+                profiles_file: call.config_path.as_deref(),
             };
             // (#2310 P1 review finding I1) A `{system, item}` override wins
             // for THIS item's dispatch; every other item shape keeps using
@@ -2512,7 +2430,7 @@ fn map_hosted_item(
 
 impl StepKind for DispatchMapStepKind {
     fn id(&self) -> &'static str {
-        "dispatch.map"
+        ConfigKind::DispatchMap.id()
     }
 
     fn display_name(&self) -> &'static str {
@@ -2564,8 +2482,13 @@ impl StepKind for DispatchMapStepKind {
         input: &BTreeMap<String, String>,
         _ctx: &StepRunCtx,
     ) -> SeatClaim {
+        let cfg: MapConfig = match load(step, ConfigKind::DispatchMap) {
+            Ok(cfg) => cfg,
+            Err(e) => return Self::seat_without_config(step, task, input, &e),
+        };
+        let call = &cfg.call;
         // (#2902 step 3) Same rule as `dispatch.single_shot`'s seat.
-        if !matches!(step_endpoint(step), Ok(None)) {
+        if !matches!(step_endpoint(call), Ok(None)) {
             return SeatClaim::RemoteEndpoint;
         }
         match resolve_map_collection(step, task, input) {
@@ -2575,24 +2498,18 @@ impl StepKind for DispatchMapStepKind {
                 return SeatClaim::LocalModelUnresolved { reason: format!("collection: {e:#}") }
             }
         }
-        let Some(model) = config_str(step, "model") else {
-            return SeatClaim::LocalModelUnresolved { reason: "no config.model".to_string() };
-        };
-        let Some(min_ctx) = step.config.get("n_ctx").and_then(|v| v.as_u64()).and_then(|n| u32::try_from(n).ok())
-        else {
+        let Some(min_ctx) = call.n_ctx.and_then(|n| n.as_u32()) else {
             return SeatClaim::LocalModelUnresolved { reason: "no usable config.n_ctx".to_string() };
         };
-        let identifier = local_dispatch_wire_model_id(step, model);
         // (#1442 ship-2b) `model_key` — the LOADABLE model key when it
         // differs from the wire `model` id. A local seat dispatches against
         // its darkmux-NAMESPACED identifier (`darkmux:<id>` as the wire
         // `model`), but the wave loader's `lms load` needs the bare model
         // key; without this override the loader would try to load the
         // namespaced string as if it were a model key.
-        let model_key = config_str(step, "model_key").unwrap_or(model);
         SeatClaim::LocalModel(darkmux_gestalt::Placement {
-            model_key: model_key.to_string(),
-            identifier,
+            model_key: call.model_key.clone().unwrap_or_else(|| call.model.clone()),
+            identifier: local_dispatch_wire_model_id(call),
             min_ctx,
             // (#1442 gate C7) "step:<id>", consistent with the placement
             // provenance `dispatch.internal`'s seat claim uses.
@@ -2658,7 +2575,7 @@ pub struct ProceduralShellStepKind;
 /// (`procedural_shell_task_workdir_outranks_a_step_config_workdir`).
 /// `workdir` is shared vocabulary, so it has to mean one thing across
 /// kinds: `dispatch_opts_for` resolves it `task.workdir.clone()
-/// .or_else(|| config_str(step, "workdir"))` — Task first — and
+/// .or_else(|| cfg.workdir)` — Task first — and
 /// `step_kinds::types`'s `StepKind` doc states the same contract ("a
 /// dispatch-shaped step kind sources its assignment from THESE fields
 /// first, falling back to `Step.config` only when the Task leaves a field
@@ -2713,14 +2630,14 @@ pub struct ProceduralShellStepKind;
 /// `workdir` and the shell step runs FIRST, so this error means the gate
 /// never runs — the loud step error, naming the directory, is the signal;
 /// a silent skip there would be the worse outcome.)
-fn resolve_shell_cwd(step: &Step, task: &Task) -> Result<Option<std::path::PathBuf>> {
-    if let Some(explicit) = config_str(step, "cwd") {
+fn resolve_shell_cwd(step: &Step, task: &Task, cfg: &ShellConfig) -> Result<Option<std::path::PathBuf>> {
+    if let Some(explicit) = cfg.cwd.as_deref() {
         return Ok(Some(validated_shell_cwd(step, "step config `cwd`", std::path::Path::new(explicit))?));
     }
     if let Some(path) = task.workdir.as_deref() {
         return Ok(Some(validated_shell_cwd(step, "the owning task's `workdir`", path)?));
     }
-    if let Some(explicit) = config_str(step, "workdir") {
+    if let Some(explicit) = cfg.workdir.as_deref() {
         return Ok(Some(validated_shell_cwd(step, "step config `workdir`", std::path::Path::new(explicit))?));
     }
     match std::env::current_dir() {
@@ -2800,7 +2717,7 @@ impl StepKind for ProceduralShellStepKind {
     }
 
     fn id(&self) -> &'static str {
-        "procedural.shell"
+        ConfigKind::ProceduralShell.id()
     }
 
     fn display_name(&self) -> &'static str {
@@ -2826,11 +2743,11 @@ impl StepKind for ProceduralShellStepKind {
     }
 
     fn run(&self, step: &Step, task: &Task, input: &BTreeMap<String, String>, _ctx: &StepRunCtx) -> Result<StepOutcome> {
-        let command = require_config_str(step, self.id(), "command")?;
-        let cwd = resolve_shell_cwd(step, task)?;
+        let cfg: ShellConfig = load(step, ConfigKind::ProceduralShell)?;
+        let cwd = resolve_shell_cwd(step, task, &cfg)?;
 
         let mut cmd = std::process::Command::new("sh");
-        cmd.arg("-c").arg(command);
+        cmd.arg("-c").arg(&cfg.command);
         if let Some(cwd) = &cwd {
             cmd.current_dir(cwd);
         }
@@ -2970,7 +2887,7 @@ impl StepKind for ProceduralNoopStepKind {
     }
 
     fn id(&self) -> &'static str {
-        "procedural.noop"
+        ConfigKind::ProceduralNoop.id()
     }
 
     fn display_name(&self) -> &'static str {
@@ -2989,7 +2906,8 @@ impl StepKind for ProceduralNoopStepKind {
 
 
     fn run(&self, step: &Step, _task: &Task, _input: &BTreeMap<String, String>, _ctx: &StepRunCtx) -> Result<StepOutcome> {
-        let output = config_str(step, "output").unwrap_or(&step.id).to_string();
+        let cfg: NoopConfig = load(step, ConfigKind::ProceduralNoop)?;
+        let output = cfg.output.unwrap_or_else(|| step.id.clone());
         Ok(StepOutcome {
             output,
             flow_records: Vec::new(),
@@ -3052,6 +2970,24 @@ mod tests {
     /// implementations read the bus, so an empty one is sufficient here.
     fn bare_ctx() -> StepRunCtx {
         StepRunCtx::new(crate::test_run(), None, None, None, std::sync::Arc::new(crate::step_kinds::ArtifactBus::new()))
+    }
+
+    /// The consent gate names the role a `dispatch.internal` step dispatches;
+    /// a task's own role is that role even when the step's config fails to
+    /// load (`run` then refuses the config, but the gate must not be blind to
+    /// who the task staffs).
+    #[test]
+    fn dispatch_role_is_the_tasks_role_even_when_the_config_fails_to_load() {
+        let mut task = empty_task();
+        task.role_id = Some("coder".to_string());
+        let bad = step("s1", "dispatch.internal", json!({"timeout_seconds": "soon"}));
+        let role = DispatchInternalStepKind.dispatch_role(&bad, &task, &BTreeMap::new(), &bare_ctx());
+        assert_eq!(role.as_deref(), Some("coder"));
+
+        let configured = step("s1", "dispatch.internal", json!({"role_id": "reviewer"}));
+        let role = DispatchInternalStepKind.dispatch_role(&configured, &empty_task(), &BTreeMap::new(), &bare_ctx());
+        assert_eq!(role.as_deref(), Some("reviewer"));
+        assert_eq!(DispatchInternalStepKind.dispatch_role(&bad, &empty_task(), &BTreeMap::new(), &bare_ctx()), None);
     }
 
     // ── #2614 review: resume_precheck / message ordering ────────────────
@@ -3187,6 +3123,11 @@ mod tests {
     // pointing `DARKMUX_LMSTUDIO_URL` at a mock that only answers a request
     // whose JSON body names the namespaced identifier.
 
+    /// The model-call keys of a single-shot or map test step.
+    fn call_of(step: &Step) -> ModelCallConfig {
+        crate::step_config::model_call(&step.kind, &step.config).expect("a model-call step with a model")
+    }
+
     #[test]
     fn local_dispatch_wire_model_id_matches_what_seat_claims_without_an_override() {
         let single = step(
@@ -3200,7 +3141,7 @@ mod tests {
             panic!("expected LocalModel");
         };
         assert_eq!(
-            local_dispatch_wire_model_id(&single, "qwen3-4b"),
+            local_dispatch_wire_model_id(&call_of(&single)),
             placement.identifier,
             "the wire helper must derive the identical identifier seat() claimed residency \
              under, or load and wire disagree"
@@ -3218,7 +3159,7 @@ mod tests {
         else {
             panic!("expected LocalModel");
         };
-        assert_eq!(local_dispatch_wire_model_id(&map, "qwen3-4b"), placement.identifier);
+        assert_eq!(local_dispatch_wire_model_id(&call_of(&map)), placement.identifier);
         assert_eq!(placement.identifier, "darkmux:qwen3-4b");
     }
 
@@ -3229,7 +3170,7 @@ mod tests {
             "dispatch.single_shot",
             json!({ "model": "qwen3-4b", "identifier": "my-own-alias", "user": "hi", "n_ctx": 8192 }),
         );
-        assert_eq!(local_dispatch_wire_model_id(&s, "qwen3-4b"), "my-own-alias");
+        assert_eq!(local_dispatch_wire_model_id(&call_of(&s)), "my-own-alias");
         let SeatClaim::LocalModel(placement) =
             DispatchSingleShotStepKind.seat(&s, &empty_task(), &BTreeMap::new(), &bare_ctx())
         else {
@@ -3244,7 +3185,7 @@ mod tests {
     /// The sibling of the test above for `dispatch.map` — the no-override
     /// case above already covers both kinds together, but the OVERRIDE path
     /// was only pinned for `dispatch.single_shot`, leaving `dispatch.map`'s
-    /// own `config_str(step, "identifier")` read in `local_dispatch_wire_
+    /// own `identifier` read in `local_dispatch_wire_
     /// model_id` unpinned for the override branch specifically.
     #[test]
     fn map_local_dispatch_wire_model_id_honors_an_explicit_identifier_override() {
@@ -3255,7 +3196,7 @@ mod tests {
             "n_ctx": 8192,
             "collection": ["a"],
         }));
-        assert_eq!(local_dispatch_wire_model_id(&m, "qwen3-4b"), "my-own-alias");
+        assert_eq!(local_dispatch_wire_model_id(&call_of(&m)), "my-own-alias");
         let SeatClaim::LocalModel(placement) =
             DispatchMapStepKind.seat(&m, &empty_task(), &BTreeMap::new(), &bare_ctx())
         else {
@@ -3883,14 +3824,14 @@ mod tests {
     fn dispatch_single_shot_requires_model() {
         let s = step("s1", "dispatch.single_shot", json!({"user": "hi"}));
         let err = DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap_err();
-        assert!(err.to_string().contains("config.model"), "{err}");
+        assert!(err.to_string().contains("missing required key `config.model`"), "{err}");
     }
 
     #[test]
     fn procedural_shell_requires_command() {
         let s = step("s1", "procedural.shell", json!({}));
         let err = ProceduralShellStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap_err();
-        assert!(err.to_string().contains("config.command"), "{err}");
+        assert!(err.to_string().contains("missing required key `config.command`"), "{err}");
     }
 
     #[test]
@@ -4143,11 +4084,11 @@ mod tests {
     /// (#2532) **The tier order between the two spellings of the SHARED
     /// `workdir` key, pinned.** `workdir` means one thing across kinds:
     /// `dispatch_opts_for` resolves it `task.workdir.clone().or_else(||
-    /// config_str(step, "workdir"))` — Task first — and `StepKind`'s own
+    /// cfg.workdir)` — Task first — and `StepKind`'s own
     /// doc states the same contract. Before this test, hoisting either
     /// branch above the other built clean and left the whole crate green,
     /// so nothing pinned it in either direction. Red-proved by swapping the
-    /// `task.workdir` and `config_str(step, "workdir")` branches in
+    /// `task.workdir` and `cfg.workdir` branches in
     /// `resolve_shell_cwd`: this test then reports the step's directory.
     #[serial_test::serial]
     #[test]
@@ -4285,14 +4226,14 @@ mod tests {
         // short-circuits BEFORE it (tested separately), so give one item.
         let s = map_step(json!({ "user_template": "check {item}", "collection": ["a"] }));
         let err = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap_err();
-        assert!(err.to_string().contains("config.model"), "{err}");
+        assert!(err.to_string().contains("missing required key `config.model`"), "{err}");
     }
 
     #[test]
     fn dispatch_map_requires_user_template_once_the_collection_is_non_empty() {
         let s = map_step(json!({ "model": "m", "collection": ["a"] }));
         let err = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap_err();
-        assert!(err.to_string().contains("config.user_template"), "{err}");
+        assert!(err.to_string().contains("missing required key `config.user_template`"), "{err}");
     }
 
     #[test]
@@ -4494,10 +4435,7 @@ mod tests {
         let mut input = BTreeMap::new();
         input.insert("u".to_string(), r#"["would-be-used-on-fallthrough"]"#.to_string());
         let err = resolve_map_collection(&s, &empty_task(), &input).unwrap_err();
-        assert!(
-            err.to_string().contains("config.collection must be a JSON array"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("`config.collection` must be a list"), "{err}");
     }
 
     #[test]

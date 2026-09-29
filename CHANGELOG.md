@@ -14,6 +14,70 @@ darkmux release.
 
 ## [Unreleased]
 
+### Changed (breaking, 4.0)
+
+- **A mission config's step `config` is checked against its kind** (B1). It
+  was open JSON, so a typo inside a step's config passed the unknown-key
+  gate and silently did nothing. Each of the fifteen kinds darkmux ships
+  (`dispatch.internal`, `dispatch.single_shot`, `dispatch.map`,
+  `procedural.shell`, `procedural.noop`, `mods.gate`, `records.gather`,
+  `deliver.github_review`, `crawl.plan`, `crawl.unit`, `crawl.summary`,
+  `plan.sites`, `mission.worktree`, `mission.coder`, `mission.verify`) now
+  has one typed config. A misspelled, wrong-type or missing key in a step
+  config, a `grow.config` key no step of the task reads, or a step `kind`
+  that is none of the fifteen, is refused at preflight and failed by
+  `darkmux doctor`, naming the file, the key path and the closest valid key.
+  **Migration:** run `darkmux doctor` and fix what it names; a key that did
+  nothing has no replacement. Numbers and flags still accept their text form
+  (`"draws": "3"`), and the open fields (`dispatch.map`'s `collection`, the
+  `findings`, `mods` and `scope` a `deliver.github_review` step embeds) stay
+  free-form. A step config the kind cannot load now fails the step naming the
+  key, where a wrong-typed value used to fall back to a default.
+- **A step config is also checked by value, before anything runs** (B1). The
+  rules each kind's own reader enforces are now checked by the same code
+  before a launch starts, on the document where no `{{param}}` is involved
+  and again with the launch's `--param` values substituted (`--dry-run`
+  included, and each grown copy as it is minted). The refusal names the step,
+  the key and the rule: `crawl.unit` `draws` outside `1..=8` and
+  `timeout_seconds` of `0`; `plan.sites` `source: "diff"` with no `diff_file`,
+  or with neither `workspace` nor `github` plus `head_sha`, or with a `github`
+  that is not `owner/repo` or a GitHub URL; `plan.sites` on its default tree
+  source with no `workspace` (`github` plus `head_sha` derive one for a diff
+  only); `crawl.plan`, `plan.sites` and `crawl.unit` with a `rule` that is not
+  a safe path component (`crawl.unit` checks each part of a `+`-joined rule);
+  `crawl.plan` and `plan.sites` with a blank `rule` (and `crawl.plan` a blank
+  `workspace`) or a `sizing.*` of `0`; `mods.gate` with a blank `for_key`; `dispatch.map` retry
+  budgets past `u32`; `deliver.github_review` with `findings` but no `mods` or
+  `diff`, or records that are not the record types. The launch substitutes
+  params exactly as the mint does, `{{mission_id}}` included, and a refusal
+  after substitution names the step and its kind whatever the problem. Still
+  refused only when the step runs, because no config alone decides them: a
+  role named by neither the task nor `dispatch.internal`'s config, a
+  profile-registry endpoint id, a `rule` id that names no known rule (or a
+  diff-only rule on a tree plan), a directory or file that must exist (a
+  workspace spec, a diff, a plan or an intent file, a workdir), a
+  `dispatch.map` collection read from a dependency's output, and a
+  `deliver.github_review` with no embedded `findings` and no `records.gather`
+  output to read. A step `config` that is not an object (a string, a
+  number or a list) is refused; a list used to load as its first values in
+  field order. `temperature` now accepts its text form (`"0.5"`), and a
+  `{{param}}` reference counts as a number or flag only when it is the whole
+  string (`"n={{n}}"` is refused).
+- **Some step config values now fail the step, and some now read as unset**
+  (B1). Now refused, where they were silently dropped: a `records.gather`
+  `not_attempted` entry that is not a string; a `deliver.github_review`
+  `emit`, `attribution` or (with no `findings`) `diff` that is not a string; a
+  `crawl.unit` `rule` that is not a string. Now read as unset, where they were
+  errors: `null` for a `sizing.max_*` or `no_progress_turns`. And a
+  `deliver.github_review` `findings: null` now reads as absent, so the step
+  takes its records from a `records.gather` step. **Migration:** delete the
+  key or fix its type; `darkmux doctor` names each.
+- **A `mission.verify` task takes no `role_id`** (A19, #2953). The step always
+  dispatches `code-reviewer`, so the key never did anything; the shipped
+  `coder-phase` config no longer sets it and a config that does is refused.
+  **Migration:** delete the `role_id` from the task; to review with another
+  role, `darkmux dispatch <role> ...`.
+
 ### Removed (breaking, 4.0)
 
 - **The daemon HTTP API is a semver contract, and its aliases are gone** (C1,

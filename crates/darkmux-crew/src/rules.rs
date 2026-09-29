@@ -313,6 +313,17 @@ pub fn is_safe_rule_id(id: &str) -> bool {
         && id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
+/// What [`is_safe_rule_id`] requires, for a message naming a refused id.
+pub const SAFE_RULE_ID_SHAPE: &str =
+    "it must be non-empty, <= 128 chars, never start with `.`, and hold only ascii alphanumerics, `-`, `_`, or `.`";
+
+/// The first `+`-joined part of `dir` (a rule id, or several joined by `+`
+/// as a multi-rule unit's directory is) that is not a safe path component.
+/// The one place a rule id string is judged as a path.
+pub fn first_unsafe_rule_part(dir: &str) -> Option<&str> {
+    dir.split('+').find(|part| !is_safe_rule_id(part))
+}
+
 /// (#2298 / #2297) The `prefilter` field has ONE implemented shape today: a
 /// list of regex strings. A second shape is reserved — `{"command": "..."}`,
 /// a tool that emits SARIF/JSON sites (semgrep, ast-grep, a linter) — and is

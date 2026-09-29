@@ -71,6 +71,11 @@ fn cases() -> Vec<KindCase> {
                 (with_key(mission.clone(), "", "zzz_bogus"), "zzz_bogus", ""),
                 (with_key(mission.clone(), "/phases/0/tasks/0", "stpes"), "phases[0].tasks[0].stpes", "phases[0].tasks[0].steps"),
                 (with_key(mission.clone(), "", "phase"), "phase", "phases"),
+                (
+                    with_key(mission.clone(), "/phases/0/tasks/0/steps/0/config", "comand"),
+                    "phases[0].tasks[0].steps[0].config.comand",
+                    "phases[0].tasks[0].steps[0].config.command",
+                ),
             ],
             clean: mission,
         },

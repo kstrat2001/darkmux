@@ -40,6 +40,7 @@
 
 use crate::findings::FindingRecord;
 use crate::mods::ModRecord;
+use crate::step_config::{load, non_blank, ConfigKind, ConfigRules, DeliverGithubReviewConfig, RuleViolation};
 use crate::step_kinds::registry::StepKindRegistry;
 use crate::step_kinds::types::{CwdPolicy, Port, SeatClaim, StepKind, StepOutcome, StepRunCtx};
 use crate::types::{Step, Task};
@@ -50,7 +51,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-pub const DELIVER_GITHUB_REVIEW_KIND: &str = "deliver.github_review";
+pub const DELIVER_GITHUB_REVIEW_KIND: &str = ConfigKind::DeliverGithubReview.id();
 
 /// One mod plus whether it passed its gate — the fact a bare [`ModRecord`]
 /// does not carry. A mod record is the proposed change (#2265's own
@@ -1509,6 +1510,42 @@ struct DeliverConfig {
     absence_backstop: BTreeMap<String, crate::absence_backstop::AbsenceBackstopNote>,
 }
 
+/// The records a step's own `findings` / `mods` / `diff` / `scope` group
+/// carries, parsed.
+struct EmbeddedRecords {
+    findings: Vec<FindingRecord>,
+    mods: Vec<GatedMod>,
+    diff: String,
+    scope: DeliverScope,
+}
+
+impl DeliverGithubReviewConfig {
+    /// The embedded group, `None` when the step names no `findings` (its
+    /// records then come from a `records.gather` step). With `findings`, the
+    /// step also needs `mods` and `diff`, and every part must be its record
+    /// type.
+    fn embedded(&self) -> Result<Option<EmbeddedRecords>, RuleViolation> {
+        let Some(findings) = &self.findings else { return Ok(None) };
+        let findings = serde_json::from_value(findings.clone())
+            .map_err(|e| RuleViolation::new("findings", format!("is not a list of finding records: {e}")))?;
+        let mods = self.mods.clone().ok_or_else(|| RuleViolation::new("mods", "is required when `findings` is set"))?;
+        let mods = serde_json::from_value(mods)
+            .map_err(|e| RuleViolation::new("mods", format!("is not a list of gated mods: {e}")))?;
+        let diff = self.diff.clone().ok_or_else(|| RuleViolation::new("diff", "is required when `findings` is set"))?;
+        let scope = match self.scope.clone() {
+            Some(v) => serde_json::from_value(v).map_err(|e| RuleViolation::new("scope", format!("is not a delivery scope: {e}")))?,
+            None => DeliverScope::default(),
+        };
+        Ok(Some(EmbeddedRecords { findings, mods, diff, scope }))
+    }
+}
+
+impl ConfigRules for DeliverGithubReviewConfig {
+    fn check(&self) -> Result<(), RuleViolation> {
+        self.embedded().map(|_| ())
+    }
+}
+
 impl DeliverConfig {
     /// `input` is the step's own `gather_inputs` map (unused by every
     /// existing caller — every current test embeds `findings`/`mods`/
@@ -1523,33 +1560,26 @@ impl DeliverConfig {
     /// from it as a group. `attribution`/`emit` are launch-time strings,
     /// never data, and always come from `step.config` either way.
     fn from_step(step: &Step, input: &BTreeMap<String, String>) -> Result<Self> {
-        let attribution = step.config.get("attribution").and_then(|v| v.as_str()).map(str::to_string);
-        let emit = step.config.get("emit").and_then(|v| v.as_str()).map(PathBuf::from);
+        let cfg: DeliverGithubReviewConfig = load(step, ConfigKind::DeliverGithubReview)?;
+        let embedded = cfg.embedded().map_err(|v| anyhow!("step `{}`: `{DELIVER_GITHUB_REVIEW_KIND}` {v}", step.id))?;
+        let attribution = cfg.attribution;
+        let emit = cfg.emit.map(PathBuf::from);
         // (#2429 part 4) A blank `{{head_sha}}` (the param unset at launch)
         // reads the same as absent — never echo an empty string into the
         // payload as though it were a real sha.
-        let head_sha = step.config.get("head_sha").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty()).map(str::to_string);
+        let head_sha = non_blank(cfg.head_sha);
 
-        if step.config.get("findings").is_some() {
-            let field = |key: &str| -> Result<serde_json::Value> {
-                step.config.get(key).cloned().ok_or_else(|| {
-                    anyhow!("step `{}`: `{DELIVER_GITHUB_REVIEW_KIND}` requires config.{key}", step.id)
-                })
-            };
-            let findings: Vec<FindingRecord> = serde_json::from_value(field("findings")?)
-                .with_context(|| format!("step `{}`: config.findings", step.id))?;
-            let mods: Vec<GatedMod> = serde_json::from_value(field("mods")?)
-                .with_context(|| format!("step `{}`: config.mods", step.id))?;
-            let diff = field("diff")?
-                .as_str()
-                .map(str::to_string)
-                .ok_or_else(|| anyhow!("step `{}`: config.diff must be a string", step.id))?;
-            let scope: DeliverScope = match step.config.get("scope") {
-                Some(v) => serde_json::from_value(v.clone())
-                    .with_context(|| format!("step `{}`: config.scope", step.id))?,
-                None => DeliverScope::default(),
-            };
-            return Ok(Self { findings, mods, diff, scope, attribution, emit, head_sha, absence_backstop: BTreeMap::new() });
+        if let Some(embedded) = embedded {
+            return Ok(Self {
+                findings: embedded.findings,
+                mods: embedded.mods,
+                diff: embedded.diff,
+                scope: embedded.scope,
+                attribution,
+                emit,
+                head_sha,
+                absence_backstop: BTreeMap::new(),
+            });
         }
 
         let gathered = input.values().find_map(|raw| {
@@ -4216,5 +4246,34 @@ mod tests {
             checked += 1;
         }
         assert!(checked > 0, "no golden files found under {} — this test would pass vacuously", golden_path.display());
+    }
+    /// The gate's promise, held to this kind's real reader: every config the
+    /// gate accepts is one `DeliverConfig::from_step` reads, except that one
+    /// with no embedded records needs a `records.gather` step's output, which
+    /// only a run has.
+    #[test]
+    fn every_config_the_gate_accepts_is_one_from_step_reads() {
+        let mut embedded = 0;
+        for (what, config) in crate::step_config::sweep::gate_accepted(ConfigKind::DeliverGithubReview) {
+            let step = Step {
+                id: "deliver-step".into(),
+                task_id: "deliver-task".into(),
+                kind: DELIVER_GITHUB_REVIEW_KIND.into(),
+                gate: None,
+                status: crate::types::NodeStatus::Planned,
+                config: config.clone(),
+                started_ts: None,
+                completed_ts: None,
+                output: None,
+            };
+            match DeliverConfig::from_step(&step, &BTreeMap::new()) {
+                Ok(_) => embedded += 1,
+                Err(e) => {
+                    assert!(config.get("findings").is_none_or(|f| f.is_null()), "{what}: {e}");
+                    assert!(e.to_string().contains("requires config.findings"), "{what}: {e}");
+                }
+            }
+        }
+        assert!(embedded > 0, "no swept config carried embedded records");
     }
 }

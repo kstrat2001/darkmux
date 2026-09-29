@@ -242,18 +242,20 @@ pub fn target_for(profile_name: String, profile: Profile, model: ProfileModel) -
 /// A step's `config.endpoint`, resolved (#2902 step 3; the step kinds'
 /// "is this hosted?" test). `Ok(Some(ep))` when it names an UNMANAGED
 /// endpoint (the step's hosted arm); `Ok(None)` when absent or managed (the
-/// local arm). The value is an inline object, or an `endpoints` id looked up
-/// in the registry at `config_path` (one registry read, only for the id
-/// form). An unparseable object or an undefined id is an error.
+/// local arm). An inline definition is used as written; an `endpoints` id is
+/// looked up in the registry at `config_path` (one registry read, only for
+/// the id form). An undefined id or an endpoint of no declared kind is an
+/// error.
 pub fn step_unmanaged_endpoint(
-    config: &serde_json::Value,
+    endpoint: Option<&crate::step_config::EndpointRef>,
     config_path: Option<&str>,
 ) -> Result<Option<ModelEndpoint>> {
-    let Some(v) = config.get("endpoint") else { return Ok(None) };
-    let ep: ModelEndpoint = match v {
+    use crate::step_config::EndpointRef;
+    let Some(endpoint) = endpoint else { return Ok(None) };
+    let ep: ModelEndpoint = match endpoint {
         // The registry's own id lookup, the one `materialize_endpoints` uses.
-        serde_json::Value::String(id) => darkmux_profiles::profiles::load_registry(config_path)?.registry.endpoint_named(id),
-        other => serde_json::from_value(other.clone())?,
+        EndpointRef::Id(id) => darkmux_profiles::profiles::load_registry(config_path)?.registry.endpoint_named(id),
+        EndpointRef::Inline(inline) => (**inline).clone(),
     };
     Ok(match ep.kind()? {
         EndpointKind::Managed(_) => None,
@@ -263,8 +265,16 @@ pub fn step_unmanaged_endpoint(
 
 #[cfg(test)]
 mod step_endpoint_tests {
-    use super::step_unmanaged_endpoint;
+    use crate::step_config::EndpointRef;
     use serde_json::json;
+
+    fn step_unmanaged_endpoint(
+        config: &serde_json::Value,
+        path: Option<&str>,
+    ) -> anyhow::Result<Option<darkmux_types::ModelEndpoint>> {
+        let endpoint: Option<EndpointRef> = config.get("endpoint").map(|v| serde_json::from_value(v.clone()).unwrap());
+        super::step_unmanaged_endpoint(endpoint.as_ref(), path)
+    }
 
     /// A step's `config.endpoint`: only an UNMANAGED endpoint takes the
     /// hosted arm; absent and managed ones run locally; an undefined id is

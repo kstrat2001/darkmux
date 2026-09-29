@@ -81,6 +81,7 @@ use crate::crawl::plan::{self, Plan, PlanParams};
 use crate::crawl::plan_step::{self, CRAWL_PLAN_OUTPUT_KIND};
 use anyhow::{anyhow, Context, Result};
 use darkmux_crew::rules;
+use darkmux_crew::step_config::{github_repo, load_checked, non_blank, ConfigKind, PlanSitesConfig, SitesSource};
 use darkmux_crew::step_kinds::{Port, SeatClaim, StepKind, StepKindRegistry, StepOutcome, StepRunCtx};
 use darkmux_crew::types::{Step, Task};
 use darkmux_crew::workspace_spec::{materialize, MaterializeOptions, WorkspaceSpec};
@@ -88,7 +89,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-pub const PLAN_SITES_KIND: &str = "plan.sites";
+pub const PLAN_SITES_KIND: &str = ConfigKind::PlanSites.id();
 
 /// (#2310) The `plan.sites` step kind — see this module's own doc for the
 /// tree/diff strategy split. `Plan::source_kind` (in `plan.rs`) records
@@ -162,8 +163,8 @@ impl StepKind for PlanSitesStepKind {
             None => plan_step::default_plan_path(task, &cfg.rule)?,
         };
         let the_plan = match cfg.source {
-            Source::Tree => plan_step::plan_one_rule(&cfg.as_tree_config()?)?,
-            Source::Diff => plan_diff(&cfg)?,
+            SitesSource::Tree => plan_step::plan_one_rule(&cfg.as_tree_config())?,
+            SitesSource::Diff => plan_diff(&cfg)?,
         };
         let wrapped = darkmux_crew::step_output::Output::wrap(
             CRAWL_PLAN_OUTPUT_KIND,
@@ -173,12 +174,6 @@ impl StepKind for PlanSitesStepKind {
         plan_step::write_plan(&out_path, &wrapped)?;
         Ok(StepOutcome { output: darkmux_crew::step_output::ref_output_string(&out_path), flow_records: Vec::new() })
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Source {
-    Tree,
-    Diff,
 }
 
 #[derive(Debug, Clone)]
@@ -192,7 +187,7 @@ struct SitesStepConfig {
     params: PlanParams,
     fetch: bool,
     plan_out: Option<PathBuf>,
-    source: Source,
+    source: SitesSource,
     /// Required when `source == Diff`; canonicalized when the path exists
     /// on disk at parse time (a relative path must not silently depend on
     /// the process's cwd surviving to `run`'s later `std::fs::
@@ -213,63 +208,22 @@ struct SitesStepConfig {
 
 impl SitesStepConfig {
     fn from_step(step: &Step) -> Result<Self> {
-        let str_field = |key: &str| -> Result<String> {
-            step.config
-                .get(key)
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.trim().is_empty())
-                .map(String::from)
-                .ok_or_else(|| anyhow!("step `{}`: `{PLAN_SITES_KIND}` requires config.{key}", step.id))
-        };
-        let rule = str_field("rule")?;
-        let opt_str = |key: &str| -> Option<String> {
-            step.config
-                .get(key)
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.trim().is_empty())
-                .map(String::from)
-        };
-        let workspace = opt_str("workspace").map(PathBuf::from);
-        let head_sha = opt_str("head_sha");
-        let github = opt_str("github");
-        if workspace.is_none() && !(head_sha.is_some() && github.is_some()) {
-            anyhow::bail!(
-                "step `{}`: `{PLAN_SITES_KIND}` requires config.workspace, or both \
-                 config.github and config.head_sha to derive one",
-                step.id
-            );
-        }
+        let cfg: PlanSitesConfig = load_checked(step, ConfigKind::PlanSites)?;
+        let rule = cfg.common.rule.clone();
+        let workspace = non_blank(cfg.workspace.clone()).map(PathBuf::from);
+        let head_sha = non_blank(cfg.head_sha.clone());
+        let github = non_blank(cfg.github.clone());
         // (#2310 P4c-2 review MUST-do 1) Shared with `plan_step.rs` so the
         // two `plan.*` kinds cannot silently drift back apart on
-        // CLI-string leniency — this kind still parsed `sizing`/`no_fetch`
-        // STRICTLY (`as_u64`/`as_bool`) after item 0 shipped item 0's
-        // generic substitution, which always carries a `--param`-sourced
-        // value through as a JSON string; the strict parse silently
-        // dropped every such override for `review.json`'s own
-        // `plan.sites` steps.
-        let (params, fetch) = plan::parse_sizing_and_no_fetch(&step.config, &step.id, PLAN_SITES_KIND)?;
-        let plan_out = step.config.get("plan_out").and_then(|v| v.as_str()).map(PathBuf::from);
-        let source = match step.config.get("source").and_then(|v| v.as_str()) {
-            None | Some("tree") => Source::Tree,
-            Some("diff") => Source::Diff,
-            Some(other) => {
-                anyhow::bail!(
-                    "step `{}`: `{PLAN_SITES_KIND}` config.source must be \"tree\" or \"diff\", got {other:?}",
-                    step.id
-                )
-            }
-        };
-        let diff_file = step.config.get("diff_file").and_then(|v| v.as_str()).map(|s| {
+        // CLI-string leniency: both read `PlanCommon` through
+        // `plan::plan_params`.
+        let (params, fetch) = plan::plan_params(&cfg.common, &step.id, PLAN_SITES_KIND)?;
+        let source = cfg.source.unwrap_or(SitesSource::Tree);
+        let diff_file = cfg.diff_file.map(|s| {
             let p = PathBuf::from(s);
             std::fs::canonicalize(&p).unwrap_or(p)
         });
-        if source == Source::Diff && diff_file.is_none() {
-            anyhow::bail!(
-                "step `{}`: `{PLAN_SITES_KIND}` config.source=\"diff\" requires config.diff_file",
-                step.id
-            );
-        }
-        Ok(Self { rule, workspace, params, fetch, plan_out, source, diff_file, head_sha, github })
+        Ok(Self { rule, workspace, params, fetch, plan_out: cfg.common.plan_out.map(PathBuf::from), source, diff_file, head_sha, github })
     }
 
     /// The workspace spec this step plans against — loaded from
@@ -290,24 +244,20 @@ impl SitesStepConfig {
         }
     }
 
-    /// `Source::Tree`'s config, in `plan_step::plan_one_rule`'s own shape —
+    /// `SitesSource::Tree`'s config, in `plan_step::plan_one_rule`'s own shape —
     /// the byte-identical-to-`crawl.plan` guarantee this module's doc
     /// promises lives entirely in reusing that struct/function, not in
     /// re-deriving them here.
-    fn as_tree_config(&self) -> Result<plan_step::PlanStepConfig> {
-        let workspace = self.workspace.clone().ok_or_else(|| {
-            anyhow!(
-                "`{PLAN_SITES_KIND}` config.source=\"tree\" requires config.workspace \
-                 (the github/head_sha derivation is diff-scoped)"
-            )
-        })?;
-        Ok(plan_step::PlanStepConfig {
+    fn as_tree_config(&self) -> plan_step::PlanStepConfig {
+        // `from_step`'s value rules refuse a tree source with no workspace.
+        let workspace = self.workspace.clone().expect("from_step refuses source=tree with no workspace");
+        plan_step::PlanStepConfig {
             rule: self.rule.clone(),
             workspace,
             params: self.params,
             fetch: self.fetch,
             plan_out: None, // `run` above resolves + writes the path itself either way
-        })
+        }
     }
 }
 
@@ -342,21 +292,8 @@ impl SitesStepConfig {
 /// regardless of what the PR does afterward, and the fetch above is what
 /// makes that fixed point reachable.
 pub(crate) fn derive_workspace_spec(github: &str, head_sha: &str) -> Result<WorkspaceSpec> {
-    let trimmed = github.trim().trim_end_matches('/');
-    let slug = trimmed
-        .strip_prefix("https://github.com/")
-        .or_else(|| trimmed.strip_prefix("http://github.com/"))
-        .or_else(|| trimmed.strip_prefix("git@github.com:"))
-        .unwrap_or(trimmed)
-        .trim_end_matches(".git");
-    let mut parts = slug.split('/');
-    let (owner, repo) = match (parts.next(), parts.next(), parts.next()) {
-        (Some(o), Some(r), None) if !o.is_empty() && !r.is_empty() => (o, r),
-        _ => {
-            anyhow::bail!(
-                "`{PLAN_SITES_KIND}`: config.github must be `owner/repo` or a GitHub URL, got {github:?}"
-            )
-        }
+    let Some((owner, repo)) = github_repo(github) else {
+        anyhow::bail!("`{PLAN_SITES_KIND}`: config.github must be `owner/repo` or a GitHub URL, got {github:?}")
     };
     let head_sha = head_sha.trim();
     if head_sha.is_empty() {
@@ -459,7 +396,7 @@ mod tests {
             "rule": "swallowed-error", "workspace": "/tmp/ws.json"
         })))
         .unwrap();
-        assert_eq!(cfg.source, Source::Tree);
+        assert_eq!(cfg.source, SitesSource::Tree);
     }
 
     /// (#2310 P4c-2 review MUST-do 1 — proven) This kind used to parse
@@ -495,8 +432,7 @@ mod tests {
             "rule": "swallowed-error", "workspace": "/tmp/ws.json", "source": "branch"
         })))
         .unwrap_err();
-        assert!(err.to_string().contains("\"tree\""), "{err}");
-        assert!(err.to_string().contains("\"diff\""), "{err}");
+        assert!(err.to_string().contains("`config.source` must be one of `tree`, `diff`"), "{err}");
     }
 
     #[test]
@@ -505,7 +441,7 @@ mod tests {
             "rule": "swallowed-error", "workspace": "/tmp/ws.json", "source": "diff", "diff_file": "/tmp/d.diff"
         })))
         .unwrap();
-        assert_eq!(cfg.source, Source::Diff);
+        assert_eq!(cfg.source, SitesSource::Diff);
         assert_eq!(cfg.diff_file.as_deref(), Some(std::path::Path::new("/tmp/d.diff")));
     }
 
@@ -627,14 +563,22 @@ mod tests {
 
     #[test]
     fn a_tree_source_with_no_workspace_is_refused_naming_workspace() {
-        let cfg = SitesStepConfig::from_step(&step(serde_json::json!({
+        let err = SitesStepConfig::from_step(&step(serde_json::json!({
             "rule": "swallowed-error", "github": "kstrat2001/darkmux", "head_sha": "abc"
         })))
-        .unwrap();
-        let err = cfg.as_tree_config().unwrap_err();
-        assert!(err.to_string().contains("config.workspace"), "{err}");
+        .unwrap_err();
+        assert!(err.to_string().contains("config.workspace is required when `source` is the tree"), "{err}");
     }
 
+
+    /// The gate's promise, held to this kind's real reader: every config the
+    /// gate accepts is one `from_step` reads.
+    #[test]
+    fn every_config_the_gate_accepts_is_one_from_step_reads() {
+        for (what, config) in darkmux_crew::step_config::sweep::gate_accepted(ConfigKind::PlanSites) {
+            SitesStepConfig::from_step(&step(config)).unwrap_or_else(|e| panic!("{what}: {e}"));
+        }
+    }
 
     #[test]
     fn the_kind_registers_beside_the_builtins() {

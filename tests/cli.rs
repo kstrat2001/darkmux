@@ -1570,7 +1570,7 @@ fn mission_config_show_renders_an_ignored_input() {
             "id": "p1",
             "tasks": [{
                 "id": "t1",
-                "steps": [{"id": "s1", "kind": "procedural.noop", "config": {"text": "{{message}}"}}]
+                "steps": [{"id": "s1", "kind": "procedural.noop", "config": {"output": "{{message}}"}}]
             }]
         }]
     }"#;
@@ -7282,7 +7282,7 @@ fn an_ignored_input_flag_warns_on_any_config_never_by_id() {
             // test's own `live_flag` inert by construction.
             "phases": [{"id": "p", "tasks": [{
                 "id": "t",
-                "steps": [{"id": "t-step", "kind": "procedural.noop", "config": {"note": "{{live_flag}}"}}]
+                "steps": [{"id": "t-step", "kind": "procedural.noop", "config": {"output": "{{live_flag}}"}}]
             }]}]
         })
         .to_string(),
@@ -7354,7 +7354,7 @@ fn write_synthetic_static_typo_config(home: &TempDir) {
             "inputs": [{"name": "workspace", "required": true}],
             "phases": [{"id": "p", "tasks": [{
                 "id": "t",
-                "steps": [{"id": "t-step", "kind": "procedural.noop", "config": {"note": "{{workspac}}"}}]
+                "steps": [{"id": "t-step", "kind": "procedural.noop", "config": {"output": "{{workspac}}"}}]
             }]}]
         })
         .to_string(),
@@ -7381,7 +7381,7 @@ fn write_synthetic_grow_typo_config(home: &TempDir) {
                     "id": "consumer",
                     "depends_on": ["producer"],
                     "grow": {"from": "producer", "items": "units", "id": "{{item.id}}",
-                             "config": {"intent_file": "{{intent_fle}}"}},
+                             "config": {"output": "{{intent_fle}}"}},
                     "steps": [{"id": "consumer-step", "kind": "procedural.noop", "config": {}}]
                 }]}
             ]
@@ -7501,7 +7501,7 @@ fn write_synthetic_embedded_optional_config(home: &TempDir) {
             "phases": [{"id": "p", "tasks": [{
                 "id": "t",
                 "steps": [{"id": "t-step", "kind": "procedural.noop",
-                           "config": {"workspace": "{{workspace}}", "label": "run-{{tag}}"}}]
+                           "config": {"output": "{{workspace}} run-{{tag}}"}}]
             }]}]
         })
         .to_string(),
@@ -8117,7 +8117,7 @@ fn a_real_crawl_plan_step_grows_one_task_per_planned_unit() {
                     "id": "unit",
                     "depends_on": ["plan-swallowed-error"],
                     "grow": {"from": "plan-swallowed-error", "items": "units", "id": "{{item.id}}",
-                             "config": {"plan": "{{from.output}}", "unit": "{{item.id}}"}},
+                             "config": {"output": "{{from.output}} {{item.id}}"}},
                     "steps": [{"id": "unit-step", "kind": "procedural.noop", "config": {}}]
                 }]}
             ]
@@ -9723,7 +9723,7 @@ fn grow_fixture(units_json: &str, config_extra: &str) -> (TempDir, TempDir, std:
                 "from": "plan-task",
                 "items": "units",
                 "id": "{{{{item.id}}}}",
-                "config": {{ "unit": "{{{{item.id}}}}", "rule": "{{{{item.rule}}}}" }}
+                "config": {{ "output": "{{{{item.rule}}}}:{{{{item.id}}}}" }}
               }},
               "steps": [{{ "id": "unit-step", "kind": "procedural.noop", "config": {{}} }}]
             }}]
@@ -9804,8 +9804,7 @@ fn mission_launch_grows_one_task_per_plan_unit_with_provenance() {
         let step_path = dir.join("steps").join(&grown_phase).join(format!("unit-step-{unit}.json"));
         let step: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&step_path).unwrap()).unwrap();
-        assert_eq!(step["config"]["unit"], serde_json::json!(unit), "step: {step}");
-        assert_eq!(step["config"]["rule"], serde_json::json!("r"), "step: {step}");
+        assert_eq!(step["config"]["output"], serde_json::json!(format!("r:{unit}")), "step: {step}");
         assert_eq!(step["config"]["grown_from"]["task"], serde_json::json!("plan-task"));
         assert_eq!(step["config"]["grown_from"]["item"], serde_json::json!(unit));
         assert_eq!(step["status"], serde_json::json!("complete"), "the grown step must RUN: {step}");
