@@ -526,6 +526,42 @@ fn a_run_that_crossed_midnight_reads_both_days_files() {
     assert!(s.unreconciled().is_empty(), "a clean run quotes cleanly: {:?}", s.unreconciled());
 }
 
+/// A knob a newer writer adds to `dispatch.start.bounds` survives into the run's
+/// stats: the block is read as the map it is on the wire, not through the typed
+/// struct, which would drop a name this build does not declare.
+#[test]
+fn a_knob_this_build_does_not_declare_survives_into_the_stats() {
+    let run = tempfile::TempDir::new().unwrap();
+    let flows = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        run.path().join("trajectory.jsonl"),
+        format!(
+            "{}{}",
+            line(serde_json::json!({"type": "dispatch.start", "ts": 1_000, "model": "m"})),
+            line(serde_json::json!({"type": "dispatch.complete", "ts": 11_000, "result": "stop", "wall_ms": 10_000})),
+        ),
+    )
+    .unwrap();
+    std::fs::write(run.path().join("lifecycle.json"), serde_json::json!({"session_id": "sid-1"}).to_string()).unwrap();
+    std::fs::write(run.path().join("manifest.json"), serde_json::json!({"ok": true, "session_id": "sid-1"}).to_string()).unwrap();
+    std::fs::write(
+        flows.path().join("2026-09-21.jsonl"),
+        line(serde_json::json!({
+            "action": "dispatch.start", "session_id": "sid-1",
+            "payload": {"bounds": bounds_json(serde_json::json!({
+                "detection_degeneracy_policy": {"value": "enforce", "source": "env"},
+                "tomorrows_knob": {"value": 7, "source": "config"},
+            }))}
+        })),
+    )
+    .unwrap();
+    let s = compute_from_dir(run.path(), flows.path()).unwrap();
+    let future = s.bounds.get("tomorrows_knob").expect("the unknown knob is kept");
+    assert_eq!(future.value, Some(serde_json::json!(7)));
+    assert_eq!(future.source, darkmux_flow::payload::KnobSource::Config);
+    assert_eq!(s.gates.checkpoint.policy.as_deref(), Some("enforce"), "the policy still reads through the typed knob");
+}
+
 // ---------------------------------------------------------------------------
 // A run directory with no trajectory
 // ---------------------------------------------------------------------------
@@ -955,7 +991,11 @@ fn with_policy_bound(value: &str) -> FlowFacts {
     let mut f = FlowFacts::default();
     f.bounds.insert(
         "detection_degeneracy_policy".into(),
-        serde_json::json!({"value": value, "source": "env"}),
+        darkmux_flow::payload::Knob {
+            value: Some(serde_json::json!(value)),
+            source: darkmux_flow::payload::KnobSource::Env,
+            configured_value: None,
+        },
     );
     f
 }

@@ -294,7 +294,7 @@ pub struct RunStats {
     pub gates: Gates,
     /// `dispatch start.bounds` — the resolved caps with their provenance, so
     /// an arm's settings are read from the run rather than assumed.
-    pub bounds: BTreeMap<String, serde_json::Value>,
+    pub bounds: BTreeMap<String, darkmux_flow::payload::Knob>,
 
     // --- host -------------------------------------------------------------
     pub gpu_w_busy: Option<f64>,
@@ -458,7 +458,7 @@ pub struct FlowScan {
 pub(crate) struct FlowFacts {
     samples: Vec<Sample>,
     records_for_session: usize,
-    bounds: BTreeMap<String, serde_json::Value>,
+    bounds: BTreeMap<String, darkmux_flow::payload::Knob>,
     scan: FlowScan,
 }
 
@@ -504,8 +504,9 @@ pub(crate) fn scan_flow_lines(
         }
         let Some(r) = darkmux_flow::reader::parse_value(line) else { continue };
         let action = darkmux_flow::reader::action_of(&r);
-        // Only the two actions this read is about are read as their type; the
-        // rest of a day file is passed over without parsing a payload.
+        // Only a machine reading is read as its type; the rest of a day file is
+        // passed over without parsing a payload. A session's `dispatch.start`
+        // is read below as raw JSON, for its bounds map.
         let payload = payload_this_read_wants(action.as_ref(), &r);
         let sample = match &payload {
             Some(darkmux_flow::Payload::MachineTelemetry(p)) => Some(p),
@@ -519,8 +520,8 @@ pub(crate) fn scan_flow_lines(
         if let Some(sid) = session_id {
             if r.get("session_id").and_then(|v| v.as_str()) == Some(sid) {
                 facts.records_for_session += 1;
-                if let Some(darkmux_flow::Payload::DispatchStart(start)) = &payload {
-                    merge_bounds(&mut facts.bounds, start.bounds.as_ref());
+                if action == Some(darkmux_flow::FlowAction::DispatchStart) {
+                    merge_bounds(&mut facts.bounds, &r);
                 }
             }
         }
@@ -534,21 +535,24 @@ pub(crate) fn scan_flow_lines(
     (scanned, false, false)
 }
 
-/// A record's payload, read as its type, for the two actions this read is
-/// about.
+/// A record's payload, read as its type, for the one action this read parses.
 fn payload_this_read_wants(action: Option<&darkmux_flow::FlowAction>, r: &serde_json::Value) -> Option<darkmux_flow::Payload> {
     match action {
-        Some(darkmux_flow::FlowAction::MachineTelemetry | darkmux_flow::FlowAction::DispatchStart) => darkmux_flow::reader::payload_of(r),
+        Some(darkmux_flow::FlowAction::MachineTelemetry) => darkmux_flow::reader::payload_of(r),
         _ => None,
     }
 }
 
 /// The first value each knob resolved to, across a session's `dispatch.start`
-/// records.
-fn merge_bounds(into: &mut BTreeMap<String, serde_json::Value>, bounds: Option<&darkmux_flow::payload::RuntimeBounds>) {
-    let Some(serde_json::Value::Object(knobs)) = bounds.and_then(|b| serde_json::to_value(b).ok()) else { return };
-    for (k, v) in knobs {
-        into.entry(k).or_insert(v);
+/// records. Read from the record's own `bounds` map, not through
+/// `RuntimeBounds`, so a knob a newer writer adds is kept. An entry that is not
+/// a knob is skipped.
+fn merge_bounds(into: &mut BTreeMap<String, darkmux_flow::payload::Knob>, record: &serde_json::Value) {
+    let Some(serde_json::Value::Object(knobs)) = record.pointer("/payload/bounds") else { return };
+    for (name, raw) in knobs {
+        if let Ok(knob) = serde_json::from_value(raw.clone()) {
+            into.entry(name.clone()).or_insert(knob);
+        }
     }
 }
 
@@ -796,7 +800,7 @@ pub(crate) fn derive_stats(
     let bounds_policy = flows
         .bounds
         .get("detection_degeneracy_policy")
-        .and_then(|b| b.get("value"))
+        .and_then(|k| k.value.as_ref())
         .and_then(|v| v.as_str())
         .map(|v| v.to_string());
     let checkpoint = checkpoint_gate(fold, bounds_policy.clone());

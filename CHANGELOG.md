@@ -37,6 +37,12 @@ darkmux release.
     same phrases as before.
   - `run stats` (several runs, or `--baseline`): each `errors` entry is
     `{"run": ..., "error": ...}` (it was a `[run, error]` pair).
+  - `run stats`: `bounds` is typed as a map from a knob's name to
+    `{value, source, configured_value?}` and is read from the record's own
+    `bounds` map, so a knob a newer darkmux writes is kept (reading it through
+    `RuntimeBounds` would have dropped it). The JSON of a well-formed entry is
+    unchanged, so `RUN_STATS_SCHEMA_VERSION` stays; an entry that is not a knob
+    is now skipped instead of copied through.
   - `memory correction list`: prints `{"corrections": [...]}` (it was a bare list).
   - `flow integrity-check`: prints `{"reports": [...]}` (it was a bare list).
   - `machine status`: every answer carries `machine_id` and `lms_unreachable`
@@ -61,8 +67,21 @@ darkmux release.
     `resumed_from` (they were alphabetical), and a key the runtime does not
     define is dropped. `result` and `trajectory_path` are absent when the runtime
     did not send them (they printed as `""`). A runtime stdout that does not parse
-    as an envelope goes out as written, with one line on stderr saying why. `detections`, `bounds` and `host_window` stay untyped in
-    the golden until the flow payloads they share are typed.
+    as an envelope goes out as written, with one line on stderr saying why.
+    `detections`, `bounds` and `host_window` are the flow payload types
+    themselves (`TelemetryDetectorPayload`, `RuntimeBounds`, `HostWindow`), so
+    the golden pins them and two things changed inside them. A key that was
+    printed as an explicit `null` is now omitted: in `detections[]`,
+    `generated_chars` on a stream-gate observation and `tail_ratio` on a gate
+    abort (the same omission the flow records got). Key order follows the
+    struct's field order: in `bounds`, `reasoning_checkpoint_interval_tokens`
+    moves from second to fifth; `host_window.power_mw_total` prints `mean`,
+    `p95`, `max` (it was `mean`, `max`, `p95`); `detections[]` prints `kind`,
+    `severity`, `detail` and then the fields in the type's declared order
+    instead of the order each detector happened to add them. The golden lists
+    only values the verb can print: `DetectorKind`, `DetectorSeverity` and
+    `KnobSource` no longer offer `"unknown"`, which only a reader of another
+    build's archive can meet.
   **Migration:** rename the fields above in any script that reads them, and
   regenerate a golden you keep of these outputs.
 
@@ -1093,7 +1112,9 @@ darkmux release.
   `step.result`, `telemetry.detector` and `budget.*` payloads (for example
   `reasoning_tokens`, `cached_tokens`, `stderr_excerpt`, `turn_delay_effective_ms`,
   `policy`, `tail_ratio`, and the token counts of a call that reported none).
-  `telemetry.tokens` and the `--json` envelope keep `null` for "not reported".
+  `telemetry.tokens` keeps `null` for "not reported", and so do the `--json`
+  envelope's own keys; the exception is `dispatch --json`'s `detections[]`,
+  which now omits an absent key like the flow record it shares a type with.
   **Migration:** a hook rule that matches `payload.<key>: null` keeps working:
   an expected `null` matches both a `null` value (archived records) and an
   absent key (current records). A receiver or `jq` filter that tests

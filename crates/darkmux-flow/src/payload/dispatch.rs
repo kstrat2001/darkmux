@@ -106,6 +106,7 @@ pub enum KnobSource {
     ForcedAgenticRemote,
     /// A value this build does not name, read from an archive written by another version.
     /// Never written.
+    #[schemars(skip)]
     #[serde(other)]
     Unknown,
 }

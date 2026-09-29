@@ -378,6 +378,18 @@ mod tests {
         );
     }
 
+    /// A value a verb never prints is not offered to a script. The three payload enums the
+    /// `dispatch` envelope shares with the flow stream each carry an `Unknown` for archives
+    /// a newer build wrote; the verb builds them host-side, so the golden omits it.
+    #[test]
+    fn the_golden_does_not_offer_unknown_for_host_built_enums() {
+        let golden = render_golden();
+        for name in ["DetectorKind", "DetectorSeverity", "KnobSource"] {
+            let line = golden.lines().find(|l| l.starts_with(&format!("{name} = "))).unwrap_or_else(|| panic!("{name} missing from the golden"));
+            assert!(!line.contains("\"unknown\""), "{name} offers a value the verb never prints: {line}");
+        }
+    }
+
     /// What the golden can tell apart: an integer's width and sign, a tuple's
     /// elements, and the order a struct declares its fields in. Each is a shape a
     /// script would notice, so each must change the rendered text.

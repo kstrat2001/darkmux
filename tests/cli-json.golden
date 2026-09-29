@@ -178,8 +178,8 @@ DetectorCounts
   per_turn_cap: uint32
   feedback_injected: uint32
   promoted_calls: uint32
-DetectorKind = "cycle" | "reasoning-loop" | "tool-failure" | "intra-turn-stall" | "empty_tool_calls" | "per-turn-cap" | "discarded_tool_call" | "malformed_tool_names" | "escalation" | "repetition" | "unknown"
-DetectorSeverity = "warn" | "info" | "unknown"
+DetectorKind = "cycle" | "reasoning-loop" | "tool-failure" | "intra-turn-stall" | "empty_tool_calls" | "per-turn-cap" | "discarded_tool_call" | "malformed_tool_names" | "escalation" | "repetition"
+DetectorSeverity = "warn" | "info"
 Dialect = "chat-completions" | "chat-completions-max-tokens"
 DirectDispatchEnvelope
   result: string
@@ -428,7 +428,7 @@ Knob
   value: any
   source: KnobSource
   configured_value?: Knob | null
-KnobSource = "env" | "config" | "built-in" | "launcher" | "cli" | "forced-agentic-remote" | "unknown"
+KnobSource = "env" | "config" | "built-in" | "launcher" | "cli" | "forced-agentic-remote"
 LedgerMessage
   severity: Severity
   text: string
@@ -880,7 +880,7 @@ RunStats
   tok_per_s: double | null
   reasoning_chars_per_s: double | null
   gates: Gates
-  bounds: { [key: string]: any }
+  bounds: { [key: string]: Knob }
   gpu_w_busy: double | null
   cpu_w_busy: double | null
   pkg_w_busy: double | null
@@ -1114,5 +1114,4 @@ Lenient2
 Lenient3
 Lenient4
 Profile.use_when
-RunStats.bounds
 TelemetryDetectorPayload.context

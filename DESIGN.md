@@ -518,9 +518,8 @@ A script or an orchestrator binds to what a verb prints under `--json`, so from 
 
 **The known free-form fields.** Every `any` in the golden is listed under its `# untyped` heading, and `every_untyped_field_is_explained_in_design_md` fails until each is named here with its reason. A script reading one of them gets JSON whose shape the golden does not pin:
 
-- `Knob.value` (inside `DispatchEnvelope.bounds`): a resolved runtime knob's value, which is a number, a boolean or a string by knob, or `null` for an uncapped one.
+- `Knob.value` (inside `DispatchEnvelope.bounds` and `RunStats.bounds`): a resolved runtime knob's value, which is a number, a boolean or a string by knob, or `null` for an uncapped one.
 - `TelemetryDetectorPayload.context` (inside `DispatchEnvelope.detections`): the provenance a dispatch caller supplied, carried verbatim; darkmux never reads inside it.
-- `RunStats.bounds`: the resolved caps of `dispatch start.bounds`, a map from a cap's name to a value whose type depends on the cap.
 - `FindingRecord.context` and `ForFinding.context`: the dispatch's `record_context` verbatim, or `null`. darkmux never reads inside it; its author owns the shape.
 - `FindingRecord.emitted` and `ForFinding.emitted`: the model's tool-call arguments, verbatim and opaque by design.
 - `InputJson.default`: a mission input's declared default, which may be a string, a number or a bool.
