@@ -12094,8 +12094,10 @@ fn every_enum_setting_is_refused_by_every_cli_entry_point_that_consumes_it() {
                 // No CLI verb starts fleet submission on its own; covered
                 // by darkmux-fleet's `configured_provider` test.
                 Scope::FleetSubmission => continue,
-                // `serve` checks only the config.json schema; no enum
-                // setting lists it, so it never reaches this loop.
+                // `serve` is not a spawnable no-model verb: it binds a
+                // port. Its enum refusals (`fleet.busy_policy`,
+                // `fleet.identity.provider`) are covered in-process by
+                // darkmux-types' `the_serve_preflight_refuses_a_bad_fleet_listener_enum`.
                 Scope::Serve => continue,
             };
             for args in cases {

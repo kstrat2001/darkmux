@@ -1046,8 +1046,6 @@ mod tests {
         assert!(panel_spec("").is_none());
     }
 
-    /// The drift guard the three-parallel-tables shape could not have: the
-    /// ONE list and the ONE match must agree, in both directions.
     /// The classification table, stated independently of `panel_spec`: a
     /// new panel must be placed here on purpose, with the reason in the
     /// table's own comments.
@@ -1060,6 +1058,8 @@ mod tests {
         }
     }
 
+    /// The drift guard the three-parallel-tables shape could not have: the
+    /// ONE list and the ONE match must agree, in both directions.
     #[test]
     fn every_listed_id_has_a_spec_and_reports_itself() {
         for id in PANEL_IDS {

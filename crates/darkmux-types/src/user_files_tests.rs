@@ -494,6 +494,25 @@ fn the_serve_preflight_refuses_the_retired_auth_switch_naming_both_replacements(
     }
 }
 
+/// The daemon's fleet listener reads `fleet.busy_policy` and
+/// `fleet.identity.provider`, so a bad value must refuse `serve` at start,
+/// not surface later on the listener path.
+#[test]
+#[serial_test::serial]
+fn the_serve_preflight_refuses_a_bad_fleet_listener_enum() {
+    for (json, key) in [
+        (r#"{"fleet": {"busy_policy": "zz-bad"}}"#, "fleet.busy_policy"),
+        (r#"{"fleet": {"identity": {"provider": "zz-bad"}}}"#, "fleet.identity.provider"),
+    ] {
+        let cfg: crate::config::DarkmuxConfig = serde_json::from_str(json).unwrap();
+        let _guard = crate::config_access::set_config_for_test(cfg);
+        let refusal = crate::config_enum::preflight(Scope::Serve)
+            .expect_err(&format!("{key}: serve must refuse a bad value"))
+            .to_string();
+        assert!(refusal.contains(key) && refusal.contains("zz-bad"), "{key}: {refusal}");
+    }
+}
+
 /// (review minor) A file larger than the cap is not read into memory: it is
 /// reported, the same cap the crew loader holds manifests to.
 #[test]

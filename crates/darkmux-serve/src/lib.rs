@@ -693,8 +693,16 @@ pub(crate) fn record_bound_addr(addr: Option<SocketAddr>) {
 /// - a `Host` header naming this daemon: `localhost`, `127.0.0.1`, `[::1]`
 ///   or the bound address, each with or without the bound port. A page an
 ///   attacker rebinds by DNS to 127.0.0.1 connects from loopback carrying
-///   the attacker's Host, and a header-less proxy (`tailscale serve --tcp`)
-///   carries the tailnet name; neither is this machine. No Host is not local.
+///   the attacker's Host, and a browser reaching the daemon through a
+///   header-less proxy (`tailscale serve --tcp`) carries the tailnet name;
+///   neither is this machine. No Host is not local.
+///
+/// Known limit: `Host` is set by the client. A browser cannot forge it, but
+/// a non-browser client behind a TCP forward that adds no headers (for
+/// example `tailscale serve --tcp`) can send `Host: localhost:<port>` and is
+/// not told apart from this machine. For that setup use the HTTPS
+/// `tailscale serve` (it adds headers) or keep read auth on with a
+/// non-loopback bind.
 ///
 /// A local process that fakes a header only makes itself look remote, which
 /// fails toward showing less. No address (no `ConnectInfo`) is not local.

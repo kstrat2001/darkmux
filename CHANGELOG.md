@@ -173,8 +173,12 @@ darkmux release.
   "This machine" is one predicate: a loopback peer (`::ffff:127.0.0.1`
   included), no proxy header, and a single `Host` naming the daemon
   (`localhost`, `127.0.0.1`, `[::1]` or the bound address, with no port or
-  the bound port). A page rebound by DNS to loopback, and a header-less
-  `tailscale serve --tcp` proxy, are no longer local. The `doctor` and
+  the bound port). A page rebound by DNS to loopback, and a browser reaching
+  the daemon through a header-less `tailscale serve --tcp` proxy, are no
+  longer local. Limit: `Host` is client-set, so a non-browser client behind a
+  TCP forward that adds no headers can send `Host: localhost` and cannot be
+  told apart from this machine; for that setup use the HTTPS `tailscale
+  serve` (it adds headers) or keep read auth on with a non-loopback bind. The `doctor` and
   `config-list` panels describe the fleet listener and its allow-list, so
   they are served only to this machine or a token holder even with read
   auth off; the other panels follow `serve.read_auth`. `darkmux serve` runs

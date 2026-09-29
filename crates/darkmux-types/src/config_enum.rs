@@ -767,16 +767,19 @@ pub static ENUM_SETTINGS: &[EnumSetting] = &[
         "fleet.identity.provider",
         None,
         "tailscale",
-        &[Scope::FleetSubmission],
+        &[Scope::FleetSubmission, Scope::Serve],
         read_fleet_identity_provider,
     ),
     // (#2916 stage 2) Read by the fleet listener, which runs the fleet
-    // submission preflight when it builds its identity provider.
+    // submission preflight when it builds its identity provider. The serve
+    // daemon starts that listener, so `serve` refuses a bad value too
+    // (`fleet.identity.provider` above shares the reason). `fleet.mode` stays
+    // unscoped: nothing in the daemon or its listener reads it.
     EnumSetting::of::<crate::config::BusyPolicy>(
         "fleet.busy_policy",
         Some("DARKMUX_FLEET_BUSY_POLICY"),
         "refuse",
-        &[Scope::FleetSubmission],
+        &[Scope::FleetSubmission, Scope::Serve],
         read_fleet_busy_policy,
     ),
     // (#2947 review C2) A typo here used to match nothing, silently.
