@@ -24,11 +24,13 @@
 //! brief actually injects.
 //!
 //! Storage shape: the flow trail is per-day JSONL. A correction is a record
-//! with `action=note`, `source=adjudication`, and a `session_id`. Reads are
+//! with `action=note`, `source=adjudication`, and a `session_id` (the note's
+//! `--execution` stamps its `execution_id` and that execution's session). Reads are
 //! best-effort by design — any IO/parse problem reads as "no corrections"
 //! rather than an error, because the injection path must never fail a dispatch
 //! over an unreadable day-file.
 
+use darkmux_types::execution_id::ExecutionId;
 use darkmux_types::session_id::{SessionId, SessionKind};
 use serde::Serialize;
 use std::collections::HashSet;
@@ -43,7 +45,7 @@ pub const ADJUDICATION_LOOKBACK_DAYS: usize = 7;
 pub struct Correction {
     /// The flow record's timestamp (RFC3339, as written).
     pub ts: String,
-    /// The dispatch session the reviewer adjudicated.
+    /// The session the adjudicated role execution ran under.
     pub session_id: String,
     /// The correction text — the `--text` the reviewer recorded.
     pub text: String,
@@ -85,17 +87,17 @@ impl PhaseSessions {
 pub enum Scope<'a> {
     /// Every correction in the window.
     All,
-    /// The corrections recorded against exactly this session id.
-    Session(&'a str),
+    /// The corrections recorded against exactly this role execution.
+    Execution(&'a ExecutionId),
     /// The corrections recorded against these phases' coder runs.
     Phases(&'a PhaseSessions),
 }
 
 impl Scope<'_> {
-    fn admits(&self, session_id: &str) -> bool {
+    fn admits(&self, session_id: &str, execution_id: Option<&str>) -> bool {
         match self {
             Scope::All => true,
-            Scope::Session(sid) => *sid == session_id,
+            Scope::Execution(id) => execution_id == Some(id.as_str()),
             Scope::Phases(p) => p.admits(session_id),
         }
     }
@@ -129,7 +131,7 @@ pub fn scan(days: usize, scope: Scope<'_>) -> Vec<Correction> {
             let Some(sid) = r.get("session_id").and_then(|v| v.as_str()) else {
                 continue;
             };
-            if !scope.admits(sid) {
+            if !scope.admits(sid, r.get("execution_id").and_then(|v| v.as_str())) {
                 continue;
             }
             let text = r

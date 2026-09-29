@@ -475,7 +475,7 @@ fn spec_fingerprint(opts: &DispatchOpts) -> String {
 
 /// The session a top-level `darkmux dispatch <role>` runs under: an ad-hoc
 /// dispatch of `role_id` in a freshly minted crew-of-one run. `nonce` names
-/// it (the CLI's `--session-id`); `None` mints a fresh one
+/// it (the CLI's `--name`); `None` mints a fresh one
 /// ([`crate::dispatch::fresh_nonce`]).
 pub fn dispatch_session(role_id: &str, nonce: Option<String>) -> SessionId {
     let run = RunId::mission(mint_dispatch_run_id(role_id)).expect("a minted run id is never empty");

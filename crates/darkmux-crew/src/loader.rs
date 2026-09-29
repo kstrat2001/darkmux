@@ -607,6 +607,15 @@ pub(crate) fn load_crews() -> Result<Vec<Crew>> {
 ///
 /// Built-in missions (currently empty) are merged last, same as other loaders.
 pub fn load_missions() -> Result<Vec<Mission>> {
+    let mut warnings = Vec::new();
+    let missions = read_missions(&mut warnings);
+    say_once(&warnings);
+    missions
+}
+
+/// [`load_missions`] without the saying: every mission it refused is a line in
+/// `warnings`.
+fn read_missions(warnings: &mut Vec<String>) -> Result<Vec<Mission>> {
     use crate::lifecycle;
     let missions_root = missions_dir();
     if !missions_root.is_dir() {
@@ -635,7 +644,7 @@ pub fn load_missions() -> Result<Vec<Mission>> {
             .with_context(|| format!("reading {}", mission_file.display()))?;
         match parse_state::<Mission>(StateKind::Mission, &mission_file, &text) {
             Ok(m) => { map.insert(m.id.clone(), m); }
-            Err(e) => eprintln!("warning: failed to read mission: {e:#}"),
+            Err(e) => warnings.push(format!("warning: failed to read mission: {e:#}")),
         }
     }
 
@@ -652,6 +661,17 @@ pub fn load_missions() -> Result<Vec<Mission>> {
     Ok(out)
 }
 
+/// Say each of `warnings` on stderr unless this process already said it: the
+/// serve daemon loads missions and phases on every poll, and the same refused
+/// file would otherwise repeat on each one. Returns how many it said.
+fn say_once(warnings: &[String]) -> usize {
+    warnings
+        .iter()
+        .filter(|line| crate::budget::first_refusal(line))
+        .inspect(|line| eprintln!("{line}"))
+        .count()
+}
+
 /// Load all phases from the new per-mission nested layout.
 ///
 /// Walks every `<root>/missions/<mission-id>/phases/*.json`.  The
@@ -659,6 +679,15 @@ pub fn load_missions() -> Result<Vec<Mission>> {
 /// name is needed.  Legacy flat phase files under `<root>/phases/`
 /// are silently ignored — the migration verb is the bridge.
 pub fn load_phases() -> Result<Vec<Phase>> {
+    let mut warnings = Vec::new();
+    let phases = read_phases(&mut warnings);
+    say_once(&warnings);
+    phases
+}
+
+/// [`load_phases`] without the saying: a leftover `sprints/` directory and
+/// every phase it refused is a line in `warnings`.
+fn read_phases(warnings: &mut Vec<String>) -> Result<Vec<Phase>> {
     use crate::lifecycle;
     let missions_root = missions_dir();
     if !missions_root.is_dir() {
@@ -680,7 +709,7 @@ pub fn load_phases() -> Result<Vec<Phase>> {
             None => continue,
         };
         if let Some(retired) = retired_state::retired_phases_dir(&path) {
-            eprintln!("warning: {}: {}", retired.path.display(), retired.fix);
+            warnings.push(format!("warning: {}: {}", retired.path.display(), retired.fix));
         }
         let phases_dir = lifecycle::phases_dir(&mission_id);
         if !phases_dir.is_dir() {
@@ -701,7 +730,7 @@ pub fn load_phases() -> Result<Vec<Phase>> {
                 .with_context(|| format!("reading {}", phase_path.display()))?;
             match parse_state::<Phase>(StateKind::Phase, &phase_path, &text) {
                 Ok(s) => { map.insert((s.mission_id.clone(), s.id.clone()), s); }
-                Err(e) => eprintln!("warning: failed to read phase: {e:#}"),
+                Err(e) => warnings.push(format!("warning: failed to read phase: {e:#}")),
             }
         }
     }

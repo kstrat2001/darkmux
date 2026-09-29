@@ -911,6 +911,38 @@ fn lab_loop_rejects_an_out_of_range_compact_threshold_ratio() {
         .stderr(predicate::str::contains("--compact-threshold-ratio 5 is out of range"));
 }
 
+/// A seat profile outside `--mode dialectic` is a usage error: exit 2, the
+/// same as a clap-rejected argument, not the generic failure exit 1.
+#[test]
+fn a_seat_profile_outside_dialectic_mode_exits_2() {
+    darkmux_cmd()
+        .args(["lab", "eval", "--mode", "strict", "--judge-profile", "p"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("`--judge-profile` applies only to `--mode dialectic`"));
+}
+
+/// `--execution` takes the `exec-...` id `dispatch` prints. A session-shaped
+/// value is a usage error (exit 2) on every verb that has the flag, naming
+/// what the flag wants; it never reaches the flow trail.
+#[test]
+fn execution_flags_refuse_a_session_shaped_value() {
+    let session = "run-a.adhoc.coder.x";
+    let cases: [&[&str]; 4] = [
+        &["flow", "tail", "--execution", session],
+        &["flow", "note", "--text", "t", "--execution", session],
+        &["memory", "correction", "list", "--execution", session],
+        &["flow", "tier-decision", "--decision", "direct", "--reasoning", "r", "--execution", session],
+    ];
+    for args in cases {
+        darkmux_cmd()
+            .args(args)
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("is not a role execution id"));
+    }
+}
+
 /// (#2954) 4.0 retired the hand-built mission verbs with no alias: missions
 /// come only from mission configs (`mission launch`). Each old spelling is
 /// refused by name, exit 2, with the line naming its replacement; a wrong

@@ -189,32 +189,34 @@ fn cmd_lab_run_dispatch(
 
 /// The per-seat profile overrides belong to the dialectic pipeline. Given
 /// under any other `--mode` they would do nothing, so they are refused
-/// rather than silently ignored.
+/// rather than silently ignored: the usage error to print, when there is one.
 fn refuse_seat_profiles_outside_dialectic(
     mode: lab::review_bench::BenchMode,
     seats: [(&str, &Option<String>); 3],
-) -> Result<()> {
+) -> Option<String> {
     if mode == lab::review_bench::BenchMode::Dialectic {
-        return Ok(());
+        return None;
     }
-    match seats.iter().find(|(_, profile)| profile.is_some()) {
-        Some((flag, _)) => anyhow::bail!("`--{flag}` applies only to `--mode dialectic`"),
-        None => Ok(()),
-    }
+    let (flag, _) = seats.iter().find(|(_, profile)| profile.is_some())?;
+    Some(format!("`--{flag}` applies only to `--mode dialectic`"))
 }
 
 /// `lab eval`: one dispatch per labeled case. A run killed mid-corpus loses
 /// only the cases not yet scored; `scores.json` is written when the loop
 /// completes.
 fn cmd_lab_eval(opts: lab::review_bench::ReviewBenchOpts) -> Result<i32> {
-    refuse_seat_profiles_outside_dialectic(
+    if let Some(usage) = refuse_seat_profiles_outside_dialectic(
         opts.mode,
         [
             ("prosecutor-profile", &opts.prosecutor_profile),
             ("defender-profile", &opts.defender_profile),
             ("judge-profile", &opts.judge_profile),
         ],
-    )?;
+    ) {
+        // A usage error exits 2, as a clap-rejected argument does.
+        eprintln!("error: {usage}");
+        return Ok(2);
+    }
     signal_aware(|| lab::review_bench::run_review_bench(opts))?;
     Ok(0)
 }
@@ -339,11 +341,11 @@ mod tests {
         let judge = Some("p".to_string());
         let seats = [("prosecutor-profile", &none), ("defender-profile", &none), ("judge-profile", &judge)];
         for mode in [BenchMode::Strict, BenchMode::FreeForm, BenchMode::Agentic] {
-            let err = refuse_seat_profiles_outside_dialectic(mode, seats).unwrap_err().to_string();
-            assert_eq!(err, "`--judge-profile` applies only to `--mode dialectic`");
+            let usage = refuse_seat_profiles_outside_dialectic(mode, seats);
+            assert_eq!(usage.as_deref(), Some("`--judge-profile` applies only to `--mode dialectic`"));
         }
-        assert!(refuse_seat_profiles_outside_dialectic(BenchMode::Dialectic, seats).is_ok());
+        assert_eq!(refuse_seat_profiles_outside_dialectic(BenchMode::Dialectic, seats), None);
         let unset = [("prosecutor-profile", &none), ("defender-profile", &none), ("judge-profile", &none)];
-        assert!(refuse_seat_profiles_outside_dialectic(BenchMode::Strict, unset).is_ok());
+        assert_eq!(refuse_seat_profiles_outside_dialectic(BenchMode::Strict, unset), None);
     }
 }

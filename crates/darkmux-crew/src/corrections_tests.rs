@@ -143,3 +143,35 @@ fn scan_day_window_bounds_the_read() {
     assert_eq!(two.len(), 2, "a 2-day window reads both, oldest→newest: {two:?}");
     assert_eq!(two[0].text, "older day", "oldest first: {two:?}");
 }
+
+/// `Scope::Execution` reads the record's `execution_id`, never its session: a
+/// session holds several executions, and a session-shaped value names none.
+#[test]
+#[serial_test::serial]
+fn scan_execution_scope_matches_the_execution_and_not_its_session() {
+    let (mine, sibling) = (ExecutionId::mint(), ExecutionId::mint());
+    let note = |exec: &ExecutionId, text: &str| {
+        serde_json::json!({
+            "ts": "2026-06-21T10:00:00Z", "action": "operator.note", "source": "adjudication",
+            "session_id": "run-a.phase.p1", "execution_id": exec.as_str(), "handle": text,
+        })
+        .to_string()
+    };
+    let tmp = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        tmp.path().join("2026-06-21.jsonl"),
+        [note(&mine, "mine"), note(&sibling, "same session, other execution")].join("\n"),
+    )
+    .unwrap();
+    let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+    // SAFETY: serialized via #[serial]; restored below.
+    unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path()) };
+    let got = scan(ADJUDICATION_LOOKBACK_DAYS, Scope::Execution(&mine));
+    unsafe {
+        match prev {
+            Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+            None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+        }
+    }
+    assert_eq!(got.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(), ["mine"], "{got:?}");
+}

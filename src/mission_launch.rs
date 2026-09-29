@@ -3659,11 +3659,13 @@ fn coder_phase_gate_outcome(
     );
     println!(
         "{}",
-        style::dim(&format!(
+        style::dim(
             "  record your adjudication (audit trail):  darkmux flow note \
-             --execution {session_id} \
-             --text \"<verdict · what you overrode · why>\" --source adjudication",
-        ))
+             --execution <execution-id> \
+             --text \"<verdict · what you overrode · why>\" --source adjudication \
+             (the id of the role execution you adjudicated: an `execution_id` in \
+             `darkmux flow tail --json`)"
+        )
     );
     coder_phase::emit_step_result(
         flow::Level::Info,

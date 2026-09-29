@@ -30,11 +30,11 @@ macro_rules! run_read_remedy {
     };
 }
 
-/// The remedy for a retired `--session-id` flag on a `flow` verb: it takes the
-/// id of the role execution the record belongs to (what `darkmux dispatch`
-/// prints), which `--execution` names.
-const EXECUTION_ID_REMEDY: &str = "The id names one role execution (`darkmux dispatch` prints it): \
-                                   use `--execution <id>`.";
+/// The remedy for a retired `--session-id` flag on a `flow` verb: its
+/// replacement takes the `exec-...` id of the role execution the record is
+/// about (what `darkmux dispatch` prints), not the session id the old flag took.
+const EXECUTION_ID_REMEDY: &str = "Use `--execution <id>`, which takes the `exec-...` id of the role \
+                                   execution (`darkmux dispatch` prints it), not a session id.";
 
 const RETIRED: &[RetiredVerb] = &[
     RetiredVerb {
@@ -131,13 +131,14 @@ const RETIRED: &[RetiredVerb] = &[
     RetiredVerb {
         words: &["flow", "tail"],
         flag: Some("--session"),
-        remedy: "The id it filters on names one role execution: use `darkmux flow tail --execution <id>`.",
+        remedy: "Use `darkmux flow tail --execution <id>`, which takes the `exec-...` id of a role \
+                 execution (`darkmux dispatch` prints it), not a session id.",
     },
     RetiredVerb {
         words: &["memory", "correction", "list"],
         flag: Some("--session"),
-        remedy: "The id it filters on names one role execution: use \
-                 `darkmux memory correction list --execution <id>`.",
+        remedy: "Use `darkmux memory correction list --execution <id>`, which takes the `exec-...` id \
+                 of a role execution (`darkmux dispatch` prints it), not a session id.",
     },
     RetiredVerb {
         words: &["lab", "eval"],
@@ -285,10 +286,10 @@ mod tests {
         use clap::Parser;
         for argv in [
             &["dispatch", "coder", "hi", "--name", "x"][..],
-            &["flow", "note", "--text", "t", "--execution", "s"],
-            &["flow", "catch", "--text", "t", "--execution", "s"],
-            &["flow", "tail", "--execution", "s"],
-            &["memory", "correction", "list", "--execution", "s"],
+            &["flow", "note", "--text", "t", "--execution", "exec-1-2-3"],
+            &["flow", "catch", "--text", "t", "--execution", "exec-1-2-3"],
+            &["flow", "tail", "--execution", "exec-1-2-3"],
+            &["memory", "correction", "list", "--execution", "exec-1-2-3"],
             &["lab", "eval", "--mode", "freeform"],
             &["lab", "eval", "--mode", "dialectic"],
             &["lab", "run", "quick-q", "--repeat", "3"],

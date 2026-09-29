@@ -965,7 +965,7 @@ pub fn submit_work(job: WorkJob, wait: bool) -> Result<SubmissionReply> {
                 let theirs = SessionId::relay(session_id.clone(), me);
                 anyhow!(
                     "{lost}. The job may still be running on {target} (session {theirs}); follow it \
-                     there with `darkmux flow tail --execution {theirs}` or in its viewer"
+                     there in its viewer or with `darkmux flow tail`"
                 )
             }
             Err(other) => other,

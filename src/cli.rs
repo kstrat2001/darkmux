@@ -239,9 +239,9 @@ pub(crate) enum Cmd {
         json: bool,
         /// With `--profile <p>@<machine>`: return as soon as the other
         /// machine accepts (or queues) the job instead of waiting for its
-        /// result. The CLI prints the `session_id`; follow it with `darkmux
-        /// flow tail --execution <id>` or in the viewer. Ignored for local
-        /// dispatches (always synchronous).
+        /// result. The CLI prints the job's session; follow it in the
+        /// viewer, or on that machine with `darkmux flow tail`. Ignored for
+        /// local dispatches (always synchronous).
         #[arg(long)]
         no_wait: bool,
         /// (#703) Dispatch into a specific Docker image. Default: the
@@ -1265,10 +1265,10 @@ pub(crate) enum CorrectionCmd {
         /// next brief would carry. Conflicts with `--execution`.
         #[arg(long, conflicts_with = "execution")]
         mission: Option<String>,
-        /// Scope to a single role execution id (the one `darkmux dispatch`
-        /// prints).
-        #[arg(long)]
-        execution: Option<String>,
+        /// Scope to a single role execution (the `exec-...` id `darkmux
+        /// dispatch` prints).
+        #[arg(long, value_parser = crate::flow_cli::parse_execution_arg)]
+        execution: Option<darkmux_types::execution_id::ExecutionId>,
         /// How many of the most-recent day-files to read. Defaults to the same
         /// window the coder-brief injection reads.
         #[arg(long, default_value_t = darkmux_crew::corrections::ADJUDICATION_LOOKBACK_DAYS)]

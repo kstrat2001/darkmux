@@ -202,6 +202,18 @@ pub fn day_file_records(path: &Path) -> Vec<Value> {
     text.lines().filter_map(parse_value).collect()
 }
 
+/// The session a role execution ran under: the `session_id` its
+/// `dispatch.start` record carries, read from the `days` newest day files
+/// under `dir`. `None` when no such record is in the window.
+pub fn session_of_execution(dir: &Path, days: usize, execution: &darkmux_types::execution_id::ExecutionId) -> Option<String> {
+    recent_day_files(dir, days).iter().flat_map(|day| day_file_records(day)).find_map(|r| {
+        let of_it = r.get("execution_id").and_then(Value::as_str) == Some(execution.as_str());
+        (of_it && action_of(&r) == Some(FlowAction::DispatchStart))
+            .then(|| r.get("session_id").and_then(Value::as_str).map(str::to_string))
+            .flatten()
+    })
+}
+
 /// Tally the unknown actions in the `days` newest day files under `dir`.
 /// Reads only each line's `action` field ([`action_field`]), not the whole
 /// record, so a week of busy day files costs a scan, not a parse.
@@ -243,6 +255,28 @@ fn quick_action_field(line: &str) -> Option<&str> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn an_execution_resolves_to_the_session_its_dispatch_start_carries() {
+        use darkmux_types::execution_id::ExecutionId;
+        let dir = tempfile::tempdir().unwrap();
+        let (mine, other) = (ExecutionId::mint(), ExecutionId::mint());
+        let line = |exec: &ExecutionId, action: &str, session: &str| {
+            json!({"action": action, "execution_id": exec.as_str(), "session_id": session}).to_string()
+        };
+        // The note names the execution too, under a session of its own: only
+        // the `dispatch.start` record says which session the execution ran in.
+        let body = [
+            line(&other, "dispatch.start", "run-a.adhoc.coder.other"),
+            line(&mine, "operator.note", "not-the-session"),
+            line(&mine, "dispatch.start", "run-b.adhoc.coder.mine"),
+        ]
+        .join("\n");
+        std::fs::write(dir.path().join("2026-09-30.jsonl"), body).unwrap();
+
+        assert_eq!(session_of_execution(dir.path(), 7, &mine).as_deref(), Some("run-b.adhoc.coder.mine"));
+        assert_eq!(session_of_execution(dir.path(), 7, &ExecutionId::mint()), None, "an unknown execution");
+    }
 
     #[test]
     fn a_spaced_bookend_is_upgraded_in_place() {

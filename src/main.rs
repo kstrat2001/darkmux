@@ -506,7 +506,7 @@ fn cmd_correction(sub: CorrectionCmd) -> Result<i32> {
             let phases = mission.as_deref().map(correction_phase_sessions).transpose()?;
             let scope = match (&phases, &execution) {
                 (Some(p), _) => crew::corrections::Scope::Phases(p),
-                (None, Some(sid)) => crew::corrections::Scope::Session(sid),
+                (None, Some(id)) => crew::corrections::Scope::Execution(id),
                 (None, None) => crew::corrections::Scope::All,
             };
 
@@ -1215,13 +1215,22 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
         // Announce the resolved execution id on stderr so operators can
         // correlate this dispatch with the flow stream — without polluting the
         // --json envelope on stdout that orchestrators parse.
-        eprintln!("darkmux dispatch: execution id `{}`", result.session_id);
+        if let Some(line) = execution_id_line(&result) {
+            eprintln!("{line}");
+        }
     }
     print!("{}", result.stdout);
     if !quiet && !result.stderr.is_empty() {
         eprint!("{}", result.stderr);
     }
     Ok(result.exit_code)
+}
+
+/// The line `dispatch` prints naming the role execution it ran: its
+/// `exec-...` id, the one `--execution` takes. A result no local execution
+/// produced (a job routed to another machine) names none.
+fn execution_id_line(result: &crew::dispatch::DispatchResult) -> Option<String> {
+    result.execution.as_ref().map(|execution| format!("darkmux dispatch: execution id `{execution}`"))
 }
 
 /// (#1426) The `machine` family — this host's AI state. Bare `machine` (and
@@ -1912,6 +1921,30 @@ fn model_ctx_label(m: &types::ProfileModel, registry: &darkmux_types::ProfileReg
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The id `dispatch` prints is the execution's, not its session's, and
+    /// is one every `--execution` flag takes.
+    #[test]
+    fn dispatch_prints_the_execution_id_that_every_execution_flag_takes() {
+        let execution = darkmux_types::execution_id::ExecutionId::mint();
+        let mut result = crew::dispatch::DispatchResult {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            session_id: test_session("s"),
+            execution: Some(execution.clone()),
+            out_dir: None,
+            trajectory: None,
+        };
+        let line = execution_id_line(&result).expect("a local dispatch names its execution");
+        assert!(line.contains(execution.as_str()), "{line}");
+        assert!(!line.contains(&result.session_id.wire()), "the session id is not the execution id: {line}");
+        let printed = line.split('`').nth(1).unwrap();
+        assert_eq!(flow_cli::parse_execution_arg(printed).unwrap(), execution);
+
+        result.execution = None;
+        assert_eq!(execution_id_line(&result), None, "a routed job has no local execution to name");
+    }
 
     /// (#2902 re-review C2) `profile list` tells a quarantined endpoint
     /// entry from an undefined id and from a defined-but-unusable one.

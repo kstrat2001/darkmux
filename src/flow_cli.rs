@@ -4,6 +4,7 @@ use crate::flow;
 use crate::flow::{Category, FlowAction, FlowRecord, Level, Stage, Tier};
 use anyhow::{bail, Context, Result};
 use clap::Subcommand;
+use darkmux_types::execution_id::ExecutionId;
 
 
 /// Top-level `flow` subcommand enum.
@@ -18,9 +19,10 @@ pub enum FlowCmd {
         /// Optional phase identifier.
         #[arg(long = "phase-id")]
         phase_id: Option<String>,
-        /// Optional role execution id (the one `darkmux dispatch` prints).
-        #[arg(long = "execution")]
-        session_id: Option<String>,
+        /// Optional role execution id (the `exec-...` id `darkmux dispatch`
+        /// prints).
+        #[arg(long, value_parser = parse_execution_arg)]
+        execution: Option<ExecutionId>,
         /// Optional source label.
         #[arg(long)]
         source: Option<String>,
@@ -32,9 +34,10 @@ pub enum FlowCmd {
         /// Optional phase identifier.
         #[arg(long = "phase-id")]
         phase_id: Option<String>,
-        /// Optional role execution id (the one `darkmux dispatch` prints).
-        #[arg(long = "execution")]
-        session_id: Option<String>,
+        /// Optional role execution id (the `exec-...` id `darkmux dispatch`
+        /// prints).
+        #[arg(long, value_parser = parse_execution_arg)]
+        execution: Option<ExecutionId>,
         /// Optional source label.
         #[arg(long)]
         source: Option<String>,
@@ -58,9 +61,10 @@ pub enum FlowCmd {
         /// Optional phase identifier.
         #[arg(long = "phase-id")]
         phase_id: Option<String>,
-        /// Optional role execution id (the one `darkmux dispatch` prints).
-        #[arg(long = "execution")]
-        session_id: Option<String>,
+        /// Optional role execution id (the `exec-...` id `darkmux dispatch`
+        /// prints).
+        #[arg(long, value_parser = parse_execution_arg)]
+        execution: Option<ExecutionId>,
         /// Optional source label.
         #[arg(long)]
         source: Option<String>,
@@ -105,10 +109,11 @@ pub enum FlowCmd {
         /// Optional mission identifier this decision is scoped to.
         #[arg(long = "mission-id")]
         mission_id: Option<String>,
-        /// Optional role execution id (when the decision links to an
-        /// already-dispatched execution — e.g., recorded after the fact).
-        #[arg(long = "execution")]
-        session_id: Option<String>,
+        /// Optional role execution id (the `exec-...` id `darkmux dispatch`
+        /// prints), when the decision links to an already-dispatched
+        /// execution, e.g. recorded after the fact.
+        #[arg(long, value_parser = parse_execution_arg)]
+        execution: Option<ExecutionId>,
         /// Optional source label (e.g., `frontier`, `operator-manual`).
         #[arg(long)]
         source: Option<String>,
@@ -167,9 +172,10 @@ pub enum FlowCmd {
     /// appends live (like `tail -f`). Ctrl-C to stop.
     #[command(name = "tail")]
     Tail {
-        /// Only show records for this role execution id.
-        #[arg(long = "execution")]
-        execution: Option<String>,
+        /// Only show records for this role execution (the `exec-...` id
+        /// `darkmux dispatch` prints).
+        #[arg(long, value_parser = parse_execution_arg)]
+        execution: Option<ExecutionId>,
         /// Emit raw JSON lines instead of a formatted one-line summary.
         #[arg(long)]
         json: bool,
@@ -222,14 +228,49 @@ pub fn run(cmd: FlowCmd) -> Result<()> {
         FlowCmd::IntegrityCheck { path, json, strict } => {
             return print_integrity_check(path, json, strict)
         }
-        FlowCmd::Tail { execution, json } => return run_tail(execution.as_deref(), json),
+        FlowCmd::Tail { execution, json } => return run_tail(execution.as_ref(), json),
         FlowCmd::Drain { file: Some(file), to: Some(to), json, .. } => return run_drain_file(&file, &to, json),
         FlowCmd::Drain { file: Some(_), to: None, .. } => bail!("--file requires --to"),
         FlowCmd::Drain { rule, max_seconds, json, .. } => return run_drain(rule, max_seconds, json),
         _ => {}
     }
-    let record = build_record(cmd);
+    let mut record = build_record(cmd);
+    stamp_execution_session(&mut record, |id| {
+        flow::reader::session_of_execution(&flow::flows_dir(), EXECUTION_LOOKBACK_DAYS, id)
+    })?;
     flow::record(record).context("writing flow record")
+}
+
+/// How many of the most-recent day files a `--execution` id is looked up in.
+const EXECUTION_LOOKBACK_DAYS: usize = 30;
+
+/// The value of an `--execution` flag: the `exec-...` id `darkmux dispatch`
+/// prints. Anything else, a session id included, is refused at parse time,
+/// so no verb takes one for the other.
+pub(crate) fn parse_execution_arg(wire: &str) -> std::result::Result<ExecutionId, String> {
+    ExecutionId::parse_minted(wire).map_err(|e| {
+        format!("`{wire}` is not a role execution id: {e}; it is the id `darkmux dispatch` prints")
+    })
+}
+
+/// A note about a role execution carries that execution's session too, so
+/// the readers keyed on sessions and phases (the coder brief's corrections)
+/// still find it. The session is the one the execution's `dispatch.start`
+/// record names; an execution `resolve` cannot find is refused, never
+/// recorded as a note that nothing can key on.
+fn stamp_execution_session(
+    record: &mut FlowRecord,
+    resolve: impl FnOnce(&ExecutionId) -> Option<String>,
+) -> Result<()> {
+    let Some(execution) = record.execution_id.as_ref() else { return Ok(()) };
+    let session = resolve(execution).with_context(|| {
+        format!(
+            "no role execution `{execution}` in the last {EXECUTION_LOOKBACK_DAYS} days of the flow trail \
+             (`darkmux flow tail` lists recent records); refusing to record a note nothing can find"
+        )
+    })?;
+    record.session_id = Some(session);
+    Ok(())
 }
 
 /// (fix-round finding 6, #1959 renamed from `run_hooks_drain_file`)
@@ -589,16 +630,16 @@ fn print_integrity_check(
 /// Filter a single JSONL line for tail output.
 ///
 /// Returns `Some(string)` when the line should be printed, `None` otherwise.
-/// When `session` is `Some(s)`, only records whose `session_id` equals `s`
-/// are returned. When `json` is true, the line is returned as the flow
+/// When `execution` is `Some(id)`, only records whose `execution_id` equals
+/// `id` are returned. When `json` is true, the line is returned as the flow
 /// reader forwards it (verbatim, unless its action is a retired spelling);
 /// otherwise a concise one-line summary is built from available fields.
-fn tail_match(line: &str, session: Option<&str>, json: bool) -> Option<String> {
+fn tail_match(line: &str, execution: Option<&ExecutionId>, json: bool) -> Option<String> {
     let forwarded = flow::reader::upgrade_line(line)?;
     let parsed: serde_json::Value = serde_json::from_str(&forwarded).ok()?;
 
-    if let Some(s) = session {
-        if parsed.get("session_id").and_then(|v| v.as_str()) != Some(s) {
+    if let Some(id) = execution {
+        if parsed.get("execution_id").and_then(|v| v.as_str()) != Some(id.as_str()) {
             return None;
         }
     }
@@ -627,7 +668,7 @@ fn tail_match(line: &str, session: Option<&str>, json: bool) -> Option<String> {
 
 /// Run `darkmux flow tail`: read today's JSONL file, then follow new appends
 /// until interrupted (Ctrl-C / SIGINT — default signal handler).
-pub fn run_tail(session: Option<&str>, json: bool) -> anyhow::Result<()> {
+pub fn run_tail(execution: Option<&ExecutionId>, json: bool) -> anyhow::Result<()> {
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::thread;
     use std::time::Duration;
@@ -664,7 +705,7 @@ pub fn run_tail(session: Option<&str>, json: bool) -> anyhow::Result<()> {
                         offset = current_len;
                         let content = String::from_utf8_lossy(&buf);
                         for line in content.lines() {
-                            if let Some(s) = tail_match(line, session, json) {
+                            if let Some(s) = tail_match(line, execution, json) {
                                 println!("{s}");
                             }
                         }
@@ -685,7 +726,7 @@ pub fn run_tail(session: Option<&str>, json: bool) -> anyhow::Result<()> {
 pub fn build_record(cmd: FlowCmd) -> FlowRecord {
     let ts = flow::ts_utc_now();
     match cmd {
-        FlowCmd::Note { text, phase_id, session_id, source } => FlowRecord {
+        FlowCmd::Note { text, phase_id, execution, source } => FlowRecord {
             ts,
             level: Level::Info,
             category: Category::Work,
@@ -694,8 +735,8 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             action: FlowAction::OperatorNote,
             handle: text,
             phase_id,
-            session_id,
-            execution_id: None,
+            session_id: None,
+            execution_id: execution,
             source,
             model: None,
             reasoning: None,
@@ -708,7 +749,7 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             work_id: None,
             attempt: None,
         },
-        FlowCmd::Catch { text, phase_id, session_id, source } => FlowRecord {
+        FlowCmd::Catch { text, phase_id, execution, source } => FlowRecord {
             ts,
             level: Level::Warn,
             category: Category::Audit,
@@ -717,8 +758,8 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             action: FlowAction::OperatorCatch,
             handle: text,
             phase_id,
-            session_id,
-            execution_id: None,
+            session_id: None,
+            execution_id: execution,
             source,
             model: None,
             reasoning: None,
@@ -739,7 +780,7 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             action,
             handle,
             phase_id,
-            session_id,
+            execution,
             source,
             reasoning,
             mission_id,
@@ -752,8 +793,8 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             action,
             handle,
             phase_id,
-            session_id,
-            execution_id: None,
+            session_id: None,
+            execution_id: execution,
             source,
             model: None,
             reasoning,
@@ -772,7 +813,7 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             role_chosen,
             phase_id,
             mission_id,
-            session_id,
+            execution,
             source,
         } => FlowRecord {
             ts,
@@ -790,8 +831,8 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             action: FlowAction::TierDecision,
             handle: role_chosen.clone().unwrap_or_else(|| decision.clone()),
             phase_id,
-            session_id,
-            execution_id: None,
+            session_id: None,
+            execution_id: execution,
             source,
             model: None,
             reasoning: Some(format!("[{decision}] {reasoning}")),
@@ -1033,7 +1074,7 @@ mod tests {
         run(FlowCmd::Note {
             text: "hello".to_string(),
             phase_id: None,
-            session_id: None,
+            execution: None,
             source: None,
         })
         .unwrap();
@@ -1053,7 +1094,7 @@ mod tests {
         run(FlowCmd::Catch {
             text: "oops".to_string(),
             phase_id: None,
-            session_id: None,
+            execution: None,
             source: None,
         })
         .unwrap();
@@ -1075,7 +1116,7 @@ mod tests {
             action: FlowAction::OperatorNote,
             handle: "y".to_string(),
             phase_id: None,
-            session_id: None,
+            execution: None,
             source: None,
             reasoning: None,
             mission_id: None,
@@ -1091,11 +1132,10 @@ mod tests {
         assert_eq!(rec["handle"], "y");
     }
 
-    #[serial_test::serial]
     #[test]
     fn record_threads_optional_fields_when_provided() {
-        let guard = FlowsDirGuard::new();
-        run(FlowCmd::Record {
+        let execution = ExecutionId::mint();
+        let rec = build_record(FlowCmd::Record {
             level: Level::Info,
             category: Category::Work,
             tier: Tier::Operator,
@@ -1103,17 +1143,108 @@ mod tests {
             action: FlowAction::OperatorNote,
             handle: "opt-handle".to_string(),
             phase_id: Some("66".to_string()),
-            session_id: Some("abc".to_string()),
+            execution: Some(execution.clone()),
             source: Some("manual".to_string()),
             reasoning: None,
             mission_id: None,
+        });
+
+        assert_eq!(rec.phase_id.as_deref(), Some("66"));
+        assert_eq!(rec.execution_id, Some(execution));
+        assert_eq!(rec.source.as_deref(), Some("manual"));
+    }
+
+    fn note_about(execution: &ExecutionId) -> FlowRecord {
+        build_record(FlowCmd::Note {
+            text: "verdict".into(),
+            phase_id: None,
+            execution: Some(execution.clone()),
+            source: Some("adjudication".into()),
+        })
+    }
+
+    /// A note about an execution keys on the execution AND carries the
+    /// session that execution ran under, so the session-keyed corrections
+    /// reader (#849) still finds it.
+    #[test]
+    fn a_note_about_an_execution_is_stamped_with_it_and_its_session() {
+        let execution = ExecutionId::mint();
+        let mut rec = note_about(&execution);
+        assert_eq!(rec.execution_id.as_ref(), Some(&execution));
+        assert_eq!(rec.session_id, None, "the session is resolved, never taken from the flag");
+        stamp_execution_session(&mut rec, |id| {
+            assert_eq!(id, &execution);
+            Some("run-a.phase.p1".to_string())
         })
         .unwrap();
+        assert_eq!(rec.session_id.as_deref(), Some("run-a.phase.p1"));
+        assert_eq!(rec.execution_id, Some(execution));
+    }
 
-        let rec = single_record(&guard);
-        assert_eq!(rec["phase_id"], "66");
-        assert_eq!(rec["session_id"], "abc");
-        assert_eq!(rec["source"], "manual");
+    /// The inverse: an execution the flow trail never saw is refused, naming
+    /// the id, rather than recorded as a note nothing can key on.
+    #[test]
+    fn a_note_about_an_unknown_execution_is_refused_naming_it() {
+        let execution = ExecutionId::mint();
+        let mut rec = note_about(&execution);
+        let err = stamp_execution_session(&mut rec, |_| None).unwrap_err().to_string();
+        assert!(err.contains(execution.as_str()), "{err}");
+        assert_eq!(rec.session_id, None);
+    }
+
+    #[test]
+    fn a_note_about_nothing_needs_no_lookup() {
+        let mut rec = build_record(FlowCmd::Note { text: "t".into(), phase_id: None, execution: None, source: None });
+        stamp_execution_session(&mut rec, |_| panic!("no execution, no lookup")).unwrap();
+        assert_eq!(rec.session_id, None);
+    }
+
+    /// End to end: a `dispatch.start` in the flow trail is what a note's
+    /// `--execution` resolves against.
+    #[serial_test::serial]
+    #[test]
+    fn run_resolves_the_session_from_the_flow_trail_and_refuses_an_unseen_execution() {
+        let guard = FlowsDirGuard::new();
+        let execution = ExecutionId::mint();
+        let start = serde_json::json!({
+            "ts": "2026-09-30T00:00:00Z", "action": "dispatch.start",
+            "execution_id": execution.as_str(), "session_id": "run-a.adhoc.coder.x",
+        });
+        let day = format!("{}.jsonl", flow::ts_utc_now().chars().take(10).collect::<String>());
+        std::fs::write(guard.tmp.path().join(day), format!("{start}\n")).unwrap();
+
+        let unseen = ExecutionId::mint();
+        let err = run(FlowCmd::Note { text: "t".into(), phase_id: None, execution: Some(unseen.clone()), source: None })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(unseen.as_str()), "{err}");
+
+        run(FlowCmd::Note { text: "verdict".into(), phase_id: None, execution: Some(execution.clone()), source: None })
+            .unwrap();
+        let written = std::fs::read_dir(guard.tmp.path())
+            .unwrap()
+            .flatten()
+            .map(|e| std::fs::read_to_string(e.path()).unwrap())
+            .collect::<String>();
+        let note = written
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .find(|r| r["action"] == "operator.note")
+            .expect("the note was recorded");
+        assert_eq!(note["execution_id"], execution.as_str());
+        assert_eq!(note["session_id"], "run-a.adhoc.coder.x");
+    }
+
+    /// A session id is not an execution id, and is refused where the flag
+    /// is parsed, so `--execution` cannot be handed the wrong noun.
+    #[test]
+    fn a_session_shaped_value_is_refused_as_an_execution() {
+        for wrong in ["run-a.adhoc.coder.x", "mission-run-auth-s1", "", "legacy:s:m", "exec-zz-1-2"] {
+            let err = parse_execution_arg(wrong).unwrap_err();
+            assert!(err.contains("not a role execution id"), "{wrong:?}: {err}");
+        }
+        let minted = ExecutionId::mint();
+        assert_eq!(parse_execution_arg(minted.as_str()).unwrap(), minted);
     }
 
     #[serial_test::serial]
@@ -1121,9 +1252,9 @@ mod tests {
     fn multiple_calls_append_to_same_day_file() {
         let guard = FlowsDirGuard::new();
 
-        run(FlowCmd::Note { text: "a".into(), phase_id: None, session_id: None, source: None }).unwrap();
-        run(FlowCmd::Note { text: "b".into(), phase_id: None, session_id: None, source: None }).unwrap();
-        run(FlowCmd::Note { text: "c".into(), phase_id: None, session_id: None, source: None }).unwrap();
+        run(FlowCmd::Note { text: "a".into(), phase_id: None, execution: None, source: None }).unwrap();
+        run(FlowCmd::Note { text: "b".into(), phase_id: None, execution: None, source: None }).unwrap();
+        run(FlowCmd::Note { text: "c".into(), phase_id: None, execution: None, source: None }).unwrap();
 
         // Sum non-schema lines across however many day files the calls
         // produced (one in steady state; two if straddling UTC midnight).
@@ -1152,7 +1283,7 @@ mod tests {
             role_chosen: Some("coder".into()),
             phase_id: Some("113-s1".into()),
             mission_id: Some("113-mission-propose-pipeline".into()),
-            session_id: None,
+            execution: None,
             source: Some("frontier".into()),
         })
         .unwrap();
@@ -1184,7 +1315,7 @@ mod tests {
             role_chosen: None,
             phase_id: Some("japan-day-3".into()),
             mission_id: Some("japan-trip-2026-may".into()),
-            session_id: None,
+            execution: None,
             source: None,
         })
         .unwrap();
@@ -1199,19 +1330,27 @@ mod tests {
     }
 
     #[test]
-    fn tail_match_session_filter_matches() {
-        let line = r#"{"ts":"2025-01-01T00:00:00Z","action":"note","handle":"hello","session_id":"abc"}"#;
-        assert!(tail_match(line, Some("abc"), false).is_some());
+    fn tail_match_execution_filter_matches_the_record_execution() {
+        let id = ExecutionId::mint();
+        let line = format!(r#"{{"ts":"2025-01-01T00:00:00Z","action":"note","handle":"hello","execution_id":"{id}"}}"#);
+        assert!(tail_match(&line, Some(&id), false).is_some());
+    }
+
+    /// The inverse, and the noun's whole point: a record of the same session
+    /// but another execution is not this execution's.
+    #[test]
+    fn tail_match_execution_filter_excludes_other_executions_of_the_same_session() {
+        let (mine, other) = (ExecutionId::mint(), ExecutionId::mint());
+        let line = format!(
+            r#"{{"ts":"2025-01-01T00:00:00Z","action":"note","handle":"hello","session_id":"abc","execution_id":"{other}"}}"#
+        );
+        assert!(tail_match(&line, Some(&mine), false).is_none());
+        let no_execution = r#"{"ts":"2025-01-01T00:00:00Z","action":"note","handle":"hello","session_id":"abc"}"#;
+        assert!(tail_match(no_execution, Some(&mine), false).is_none());
     }
 
     #[test]
-    fn tail_match_session_filter_no_match() {
-        let line = r#"{"ts":"2025-01-01T00:00:00Z","action":"note","handle":"hello","session_id":"abc"}"#;
-        assert!(tail_match(line, Some("xyz"), false).is_none());
-    }
-
-    #[test]
-    fn tail_match_no_session_filter_always_some() {
+    fn tail_match_no_execution_filter_always_some() {
         let line = r#"{"ts":"2025-01-01T00:00:00Z","action":"note","handle":"hello"}"#;
         assert!(tail_match(line, None, false).is_some());
     }

@@ -18,17 +18,22 @@ darkmux release.
 
 - **Flag spellings that named the internal noun "session", or a misleading
   grain, are renamed** (A10 to A13). No aliases: each retired spelling exits 2
-  naming its replacement, and each flag does exactly what it did.
+  naming its replacement.
   **Migration:** `dispatch --session-id` is `--name`;
   `flow note|catch|record|tier-decision --session-id`, `flow tail --session`
-  and `memory correction list --session` are `--execution` (the role execution
-  id `darkmux dispatch` prints, now labeled "execution id");
+  and `memory correction list --session` are `--execution`, which takes the
+  `exec-...` id of a role execution, the one `darkmux dispatch` now prints on
+  its "execution id" line (it used to print the session id). A session id
+  given to `--execution` is refused with exit 2, and a note recorded with
+  `--execution` is stamped with that execution and its session; an execution
+  the last 30 days of the flow trail never saw is refused;
   `lab eval --freeform|--agentic|--dialectic` is `--mode
   freeform|agentic|dialectic` (one choice, `strict` by default; the dialectic
-  per-seat profile flags are refused under any other mode);
+  per-seat profile flags are refused with exit 2 under any other mode);
   `lab run --runs` and `lab tune --runs` are `--repeat` (`-n` is unchanged);
   `mission status --missions` is `--named`. The viewer's "try it yourself"
-  `lab eval` line prints the new spelling.
+  `lab eval` line prints the new spelling. The `--no-wait` follow-up lines no
+  longer print a `flow tail` command with an id.
 - **Mission state files are read in one spelling** (A18). A `mission.json`
   using `sprint_ids`, `closed_ts` or status `closed`, a task file using
   `sprint_id`, and a `sprints/` directory (the old name of `phases/`) are
