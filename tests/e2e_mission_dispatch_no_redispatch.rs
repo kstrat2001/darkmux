@@ -115,22 +115,7 @@ fn second_mission_dispatch_finds_nothing_to_fan_out() {
     let node = harness.node("node-a").unwrap();
 
     // Write a role manifest into node-a's crew root.
-    let role_json = serde_json::json!({
-        "id": "tdd-coder",
-        "description": "test role",
-        "skills": [],
-        "tool_palette": {"allow": [], "deny": []},
-        "escalation_contract": "bail-with-explanation",
-        "tier": "inference"
-    });
-    let role_dir = node.crew_root.join("roles");
-    std::fs::create_dir_all(&role_dir).unwrap();
-    std::fs::write(
-        role_dir.join("tdd-coder.json"),
-        serde_json::to_string_pretty(&role_json).unwrap(),
-    )
-    .unwrap();
-    std::fs::write(role_dir.join("tdd-coder.md"), "test system prompt").unwrap();
+    node.register_role("tdd-coder");
 
     // Write the mission + 2 phase fixtures.
     write_mission_fixture(&node.crew_root, "m-test", &["phase-alpha", "phase-beta"]);

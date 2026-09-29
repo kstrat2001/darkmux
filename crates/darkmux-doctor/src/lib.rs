@@ -1434,13 +1434,12 @@ fn utility_in_profiles_status(registry: &darkmux_types::ProfileRegistry) -> Chec
     }
 }
 
-/// (#2914, CONFIG 1.28) The removed radio ROUTING-seat staffing:
-/// `radio.router_profile` (a config key), `role_profiles.radio-router` (a
-/// binding in the dynamic map), and the `DARKMUX_RADIO_ROUTER_PROFILE` env
-/// var. Routing runs on the machine's utility model now, so each of these
-/// is inert; `Warn` naming whichever are still set, with the one fix.
-/// The key is read off `radio.extras`, where the typed struct no longer has
-/// a field for it.
+/// (#2914, CONFIG 1.28) The removed radio ROUTING-seat staffing that is not
+/// a config key: `role_profiles.radio-router` (a binding in the dynamic map)
+/// and the `DARKMUX_RADIO_ROUTER_PROFILE` env var. Routing runs on the
+/// machine's utility model now, so each is inert; `Warn` naming whichever are
+/// still set, with the one fix. (A leftover `radio.router_profile` key is a
+/// retired key, refused by the user-file keys row.)
 fn check_removed_radio_router_staffing() -> Check {
     let role_binding = darkmux_types::config_access::role_profile("radio-router");
     let env_set = std::env::var("DARKMUX_RADIO_ROUTER_PROFILE").ok().is_some_and(|s| !s.trim().is_empty());
