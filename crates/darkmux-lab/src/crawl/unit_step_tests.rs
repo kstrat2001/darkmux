@@ -3384,3 +3384,12 @@ fn the_no_progress_bound_judges_the_dispatch_fold_not_the_out_dir() {
     let unit = run_unit(&kind, &plan, serde_json::json!({ "no_progress_turns": 3 }));
     assert_eq!(unit.result, "stop", "a finding attempt every turn is progress");
 }
+
+/// The gate's promise, held to this kind's real reader: every config the gate
+/// accepts is one `from_step` reads.
+#[test]
+fn every_config_the_gate_accepts_is_one_from_step_reads() {
+    for (what, config) in darkmux_crew::step_config::sweep::gate_accepted(ConfigKind::CrawlUnit) {
+        UnitStepConfig::from_step(&unit_step(config)).unwrap_or_else(|e| panic!("{what}: {e}"));
+    }
+}

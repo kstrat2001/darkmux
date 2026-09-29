@@ -246,6 +246,35 @@ impl Sizing {
     }
 }
 
+/// A rule id that names a file: every `+`-joined part is one safe path
+/// component ([`crate::rules::first_unsafe_rule_part`]).
+fn require_safe_rule(key: &str, rule: &str) -> Result<(), RuleViolation> {
+    match crate::rules::first_unsafe_rule_part(rule) {
+        Some(part) => Err(RuleViolation::new(
+            key,
+            format!("`{part}` is not a safe path component: {}", crate::rules::SAFE_RULE_ID_SHAPE),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The `(owner, repo)` a `github` value names: `owner/repo`, or a GitHub URL
+/// with or without a trailing `.git`.
+pub fn github_repo(github: &str) -> Option<(&str, &str)> {
+    let trimmed = github.trim().trim_end_matches('/');
+    let slug = trimmed
+        .strip_prefix("https://github.com/")
+        .or_else(|| trimmed.strip_prefix("http://github.com/"))
+        .or_else(|| trimmed.strip_prefix("git@github.com:"))
+        .unwrap_or(trimmed)
+        .trim_end_matches(".git");
+    let mut parts = slug.split('/');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(owner), Some(repo), None) if !owner.is_empty() && !repo.is_empty() => Some((owner, repo)),
+        _ => None,
+    }
+}
+
 /// What every planning kind reads.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct PlanCommon {
@@ -260,6 +289,7 @@ pub struct PlanCommon {
 impl ConfigRules for PlanCommon {
     fn check(&self) -> Result<(), RuleViolation> {
         require_text("rule", &self.rule)?;
+        require_safe_rule("rule", &self.rule)?;
         self.sizing.as_ref().map_or(Ok(()), |s| s.limits().map(|_| ()))
     }
 }
@@ -304,25 +334,39 @@ pub struct PlanSitesConfig {
 }
 
 impl PlanSitesConfig {
-    /// Whether the config names a workspace itself, or the pair a workspace
-    /// is derived from.
-    fn names_a_workspace(&self) -> bool {
-        let named = |text: &Option<String>| text.as_deref().is_some_and(|t| !t.trim().is_empty());
-        named(&self.workspace) || (named(&self.head_sha) && named(&self.github))
+    fn named(text: &Option<String>) -> Option<&str> {
+        text.as_deref().filter(|t| !t.trim().is_empty())
     }
 }
 
 impl ConfigRules for PlanSitesConfig {
     fn check(&self) -> Result<(), RuleViolation> {
-        require_text("rule", &self.common.rule)?;
-        if !self.names_a_workspace() {
-            return Err(RuleViolation::new(
-                "workspace",
-                "is required, or set both config.github and config.head_sha to derive one",
-            ));
-        }
         self.common.check()?;
-        if self.source == Some(SitesSource::Diff) && self.diff_file.is_none() {
+        let source = self.source.unwrap_or(SitesSource::Tree);
+        let workspace = Self::named(&self.workspace);
+        let derivable = Self::named(&self.head_sha).zip(Self::named(&self.github));
+        match (source, workspace, derivable) {
+            (SitesSource::Tree, None, _) => {
+                return Err(RuleViolation::new(
+                    "workspace",
+                    "is required when `source` is the tree (the default): config.github and config.head_sha derive a workspace for a diff only",
+                ));
+            }
+            (SitesSource::Diff, None, None) => {
+                return Err(RuleViolation::new(
+                    "workspace",
+                    "is required, or set both config.github and config.head_sha to derive one",
+                ));
+            }
+            (SitesSource::Diff, None, Some((_, github))) if github_repo(github).is_none() => {
+                return Err(RuleViolation::new(
+                    "github",
+                    format!("must be `owner/repo` or a GitHub URL, got {github:?}"),
+                ));
+            }
+            _ => {}
+        }
+        if source == SitesSource::Diff && self.diff_file.is_none() {
             return Err(RuleViolation::new("diff_file", "is required when `source` is \"diff\""));
         }
         Ok(())
@@ -361,6 +405,9 @@ impl ConfigRules for CrawlUnitConfig {
     fn check(&self) -> Result<(), RuleViolation> {
         require_text("plan", &self.plan)?;
         require_text("unit", &self.unit)?;
+        if let Some(rule) = &self.rule {
+            require_safe_rule("rule", rule)?;
+        }
         if let Some(t) = self.timeout_seconds.and_then(|t| t.0).filter(|t| t.0 < 1) {
             return Err(RuleViolation::new(
                 "timeout_seconds",

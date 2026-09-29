@@ -4247,4 +4247,33 @@ mod tests {
         }
         assert!(checked > 0, "no golden files found under {} — this test would pass vacuously", golden_path.display());
     }
+    /// The gate's promise, held to this kind's real reader: every config the
+    /// gate accepts is one `DeliverConfig::from_step` reads, except that one
+    /// with no embedded records needs a `records.gather` step's output, which
+    /// only a run has.
+    #[test]
+    fn every_config_the_gate_accepts_is_one_from_step_reads() {
+        let mut embedded = 0;
+        for (what, config) in crate::step_config::sweep::gate_accepted(ConfigKind::DeliverGithubReview) {
+            let step = Step {
+                id: "deliver-step".into(),
+                task_id: "deliver-task".into(),
+                kind: DELIVER_GITHUB_REVIEW_KIND.into(),
+                gate: None,
+                status: crate::types::NodeStatus::Planned,
+                config: config.clone(),
+                started_ts: None,
+                completed_ts: None,
+                output: None,
+            };
+            match DeliverConfig::from_step(&step, &BTreeMap::new()) {
+                Ok(_) => embedded += 1,
+                Err(e) => {
+                    assert!(config.get("findings").is_none_or(|f| f.is_null()), "{what}: {e}");
+                    assert!(e.to_string().contains("requires config.findings"), "{what}: {e}");
+                }
+            }
+        }
+        assert!(embedded > 0, "no swept config carried embedded records");
+    }
 }

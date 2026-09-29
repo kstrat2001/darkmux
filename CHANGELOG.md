@@ -40,15 +40,25 @@ darkmux release.
   included, and each grown copy as it is minted). The refusal names the step,
   the key and the rule: `crawl.unit` `draws` outside `1..=8` and
   `timeout_seconds` of `0`; `plan.sites` `source: "diff"` with no `diff_file`,
-  or with neither `workspace` nor `github` plus `head_sha`; `crawl.plan` and
-  `plan.sites` with a blank `rule` (and `crawl.plan` a blank `workspace`) or a
-  `sizing.*` of `0`; `mods.gate` with a blank `for_key`; `dispatch.map` retry
+  or with neither `workspace` nor `github` plus `head_sha`, or with a `github`
+  that is not `owner/repo` or a GitHub URL; `plan.sites` on its default tree
+  source with no `workspace` (`github` plus `head_sha` derive one for a diff
+  only); `crawl.plan`, `plan.sites` and `crawl.unit` with a `rule` that is not
+  a safe path component (`crawl.unit` checks each part of a `+`-joined rule);
+  `crawl.plan` and `plan.sites` with a blank `rule` (and `crawl.plan` a blank
+  `workspace`) or a `sizing.*` of `0`; `mods.gate` with a blank `for_key`; `dispatch.map` retry
   budgets past `u32`; `deliver.github_review` with `findings` but no `mods` or
-  `diff`, or records that are not the record types. Still refused only when
-  the step runs, because no config alone decides them: a role named by neither
-  the task nor `dispatch.internal`'s config, a profile-registry endpoint id, a
-  directory or file that must exist, and a `dispatch.map` collection read from
-  a dependency's output. A step `config` that is not an object (a string, a
+  `diff`, or records that are not the record types. The launch substitutes
+  params exactly as the mint does, `{{mission_id}}` included, and a refusal
+  after substitution names the step and its kind whatever the problem. Still
+  refused only when the step runs, because no config alone decides them: a
+  role named by neither the task nor `dispatch.internal`'s config, a
+  profile-registry endpoint id, a `rule` id that names no known rule (or a
+  diff-only rule on a tree plan), a directory or file that must exist (a
+  workspace spec, a diff, a plan or an intent file, a workdir), a
+  `dispatch.map` collection read from a dependency's output, and a
+  `deliver.github_review` with no embedded `findings` and no `records.gather`
+  output to read. A step `config` that is not an object (a string, a
   number or a list) is refused; a list used to load as its first values in
   field order. `temperature` now accepts its text form (`"0.5"`), and a
   `{{param}}` reference counts as a number or flag only when it is the whole

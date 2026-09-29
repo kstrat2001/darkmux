@@ -38,8 +38,10 @@ pub fn check_resolved<'a>(steps: impl IntoIterator<Item = (&'a str, &'a str, &'a
     let problems: Vec<String> = steps
         .into_iter()
         .filter_map(|(id, kind, config)| Some((id, ConfigKind::from_id(kind)?, config)))
-        .flat_map(|(id, kind, config)| kind.problems(&without_stamp(config), "config", id))
-        .map(|issue| issue.to_string())
+        .flat_map(|(id, kind, config)| {
+            let label = kind.step_label(id);
+            kind.problems(&without_stamp(config), "config").into_iter().map(move |issue| format!("{label}: {issue}"))
+        })
         .collect();
     if !problems.is_empty() {
         bail!("{} step config(s) refused before anything runs:\n  {}", problems.len(), problems.join("\n  "));
@@ -121,10 +123,20 @@ fn step_issues(step_path: &str, step: &Value, kind: ConfigKind, grow: Option<&Ma
     };
     let step_id = step.get("id").and_then(Value::as_str).unwrap_or("?");
     let grow_path = format!("{task_path}.grow.config");
-    kind.problems(&overlay, &config_path, step_id)
+    kind.problems(&overlay, &config_path)
         .into_iter()
+        .map(|issue| named_step(issue, &kind.step_label(step_id)))
         .map(|issue| relocate(issue, &config_path, &grow_path, &from_grow))
         .collect()
+}
+
+/// A value-rule issue with the step it is about written into it: the document
+/// walk reports it beside issues whose path alone locates them.
+fn named_step(mut issue: KeyIssue, label: &str) -> KeyIssue {
+    if let Issue::Rule(line) = &issue.issue {
+        issue.issue = Issue::Rule(format!("{label}: {line}"));
+    }
+    issue
 }
 
 /// `config` with each of the task's grow keys `keys` written over it.

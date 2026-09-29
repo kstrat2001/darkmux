@@ -81,7 +81,7 @@ use crate::crawl::plan::{self, Plan, PlanParams};
 use crate::crawl::plan_step::{self, CRAWL_PLAN_OUTPUT_KIND};
 use anyhow::{anyhow, Context, Result};
 use darkmux_crew::rules;
-use darkmux_crew::step_config::{load_checked, non_blank, ConfigKind, PlanSitesConfig, SitesSource};
+use darkmux_crew::step_config::{github_repo, load_checked, non_blank, ConfigKind, PlanSitesConfig, SitesSource};
 use darkmux_crew::step_kinds::{Port, SeatClaim, StepKind, StepKindRegistry, StepOutcome, StepRunCtx};
 use darkmux_crew::types::{Step, Task};
 use darkmux_crew::workspace_spec::{materialize, MaterializeOptions, WorkspaceSpec};
@@ -163,7 +163,7 @@ impl StepKind for PlanSitesStepKind {
             None => plan_step::default_plan_path(task, &cfg.rule)?,
         };
         let the_plan = match cfg.source {
-            SitesSource::Tree => plan_step::plan_one_rule(&cfg.as_tree_config()?)?,
+            SitesSource::Tree => plan_step::plan_one_rule(&cfg.as_tree_config())?,
             SitesSource::Diff => plan_diff(&cfg)?,
         };
         let wrapped = darkmux_crew::step_output::Output::wrap(
@@ -248,20 +248,16 @@ impl SitesStepConfig {
     /// the byte-identical-to-`crawl.plan` guarantee this module's doc
     /// promises lives entirely in reusing that struct/function, not in
     /// re-deriving them here.
-    fn as_tree_config(&self) -> Result<plan_step::PlanStepConfig> {
-        let workspace = self.workspace.clone().ok_or_else(|| {
-            anyhow!(
-                "`{PLAN_SITES_KIND}` config.source=\"tree\" requires config.workspace \
-                 (the github/head_sha derivation is diff-scoped)"
-            )
-        })?;
-        Ok(plan_step::PlanStepConfig {
+    fn as_tree_config(&self) -> plan_step::PlanStepConfig {
+        // `from_step`'s value rules refuse a tree source with no workspace.
+        let workspace = self.workspace.clone().expect("from_step refuses source=tree with no workspace");
+        plan_step::PlanStepConfig {
             rule: self.rule.clone(),
             workspace,
             params: self.params,
             fetch: self.fetch,
             plan_out: None, // `run` above resolves + writes the path itself either way
-        })
+        }
     }
 }
 
@@ -296,21 +292,8 @@ impl SitesStepConfig {
 /// regardless of what the PR does afterward, and the fetch above is what
 /// makes that fixed point reachable.
 pub(crate) fn derive_workspace_spec(github: &str, head_sha: &str) -> Result<WorkspaceSpec> {
-    let trimmed = github.trim().trim_end_matches('/');
-    let slug = trimmed
-        .strip_prefix("https://github.com/")
-        .or_else(|| trimmed.strip_prefix("http://github.com/"))
-        .or_else(|| trimmed.strip_prefix("git@github.com:"))
-        .unwrap_or(trimmed)
-        .trim_end_matches(".git");
-    let mut parts = slug.split('/');
-    let (owner, repo) = match (parts.next(), parts.next(), parts.next()) {
-        (Some(o), Some(r), None) if !o.is_empty() && !r.is_empty() => (o, r),
-        _ => {
-            anyhow::bail!(
-                "`{PLAN_SITES_KIND}`: config.github must be `owner/repo` or a GitHub URL, got {github:?}"
-            )
-        }
+    let Some((owner, repo)) = github_repo(github) else {
+        anyhow::bail!("`{PLAN_SITES_KIND}`: config.github must be `owner/repo` or a GitHub URL, got {github:?}")
     };
     let head_sha = head_sha.trim();
     if head_sha.is_empty() {
@@ -580,14 +563,22 @@ mod tests {
 
     #[test]
     fn a_tree_source_with_no_workspace_is_refused_naming_workspace() {
-        let cfg = SitesStepConfig::from_step(&step(serde_json::json!({
+        let err = SitesStepConfig::from_step(&step(serde_json::json!({
             "rule": "swallowed-error", "github": "kstrat2001/darkmux", "head_sha": "abc"
         })))
-        .unwrap();
-        let err = cfg.as_tree_config().unwrap_err();
-        assert!(err.to_string().contains("config.workspace"), "{err}");
+        .unwrap_err();
+        assert!(err.to_string().contains("config.workspace is required when `source` is the tree"), "{err}");
     }
 
+
+    /// The gate's promise, held to this kind's real reader: every config the
+    /// gate accepts is one `from_step` reads.
+    #[test]
+    fn every_config_the_gate_accepts_is_one_from_step_reads() {
+        for (what, config) in darkmux_crew::step_config::sweep::gate_accepted(ConfigKind::PlanSites) {
+            SitesStepConfig::from_step(&step(config)).unwrap_or_else(|e| panic!("{what}: {e}"));
+        }
+    }
 
     #[test]
     fn the_kind_registers_beside_the_builtins() {

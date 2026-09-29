@@ -971,11 +971,8 @@ fn unit_rule_dir(declared: Option<&str>, rule_ids: &[String]) -> Result<String> 
         !dir.is_empty(),
         "`{CRAWL_UNIT_KIND}`: could not resolve a rule for this unit's on-disk path - `config.rule` is unset and the plan unit names no rule id; refusing rather than reverting to the pre-#2360 colliding `units/<unit_id>` layout"
     );
-    for part in dir.split('+') {
-        ensure!(
-            rules::is_safe_rule_id(part),
-            "`{CRAWL_UNIT_KIND}`: rule id `{part}` (from `{dir}`) is not a safe path component — it must be non-empty, <= 128 chars, never start with `.`, and hold only ascii alphanumerics, `-`, `_`, or `.`"
-        );
+    if let Some(part) = rules::first_unsafe_rule_part(&dir) {
+        bail!("`{CRAWL_UNIT_KIND}`: rule id `{part}` (from `{dir}`) is not a safe path component: {}", rules::SAFE_RULE_ID_SHAPE);
     }
     Ok(dir)
 }

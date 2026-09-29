@@ -358,6 +358,15 @@ mod tests {
         }
     }
 
+    /// The gate's promise, held to this kind's real reader: every config the
+    /// gate accepts is one `from_step` reads.
+    #[test]
+    fn every_config_the_gate_accepts_is_one_from_step_reads() {
+        for (what, config) in darkmux_crew::step_config::sweep::gate_accepted(ConfigKind::CrawlPlan) {
+            PlanStepConfig::from_step(&step_with(config)).unwrap_or_else(|e| panic!("{what}: {e}"));
+        }
+    }
+
     fn task() -> Task {
         Task {
             run_on: darkmux_crew::types::default_run_on(),

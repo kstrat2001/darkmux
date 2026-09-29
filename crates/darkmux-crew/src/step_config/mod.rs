@@ -14,7 +14,7 @@
 //! own reader calls the same rule function the gate does, so a launch refuses
 //! such a config before anything runs: on the document itself where no
 //! `{{param}}` is involved (`gate`), and again once a launch's params are
-//! substituted (`gate::check_resolved_steps`). What no config can decide
+//! substituted (`gate::check_resolved`). What no config can decide
 //! alone stays a run-time refusal: a role named by neither the task nor the
 //! config, a profile-registry endpoint id, a directory or file that must
 //! exist, and a collection read from a dependency's output.
@@ -26,6 +26,8 @@
 
 pub mod gate;
 pub mod kinds;
+#[cfg(any(test, feature = "test-support"))]
+pub mod sweep;
 
 pub use kinds::*;
 
@@ -181,32 +183,34 @@ impl ConfigKind {
     /// refuses although the types are right. `None` also for a config that
     /// does not load at all ([`Self::issues`] names that).
     ///
-    /// A `{{param}}` still in `config` is a value not known yet: it is read
-    /// as one that satisfies its key, and a rule broken AT such a key is not
-    /// reported. Every other key is checked as written, so a launch's
+    /// A `{{param}}` still in `config` is a value not known yet: a whole-string
+    /// one is read as one that satisfies its key, and a rule broken AT a key
+    /// whose text holds one (whole or embedded) is not reported. Every other key is checked as written, so a launch's
     /// `--param` values are checked again once substituted.
     pub fn violation(self, config: &Value) -> Option<RuleViolation> {
         let assumed = assume_params(config);
         let violation = with_config_type!(self, T => T::deserialize(&*object_config(&assumed).ok()?).ok()?.check().err())?;
         let top = violation.key.split('.').next().unwrap_or_default();
-        let unresolved = config.get(top).and_then(Value::as_str).is_some_and(is_placeholder);
+        let unresolved = config.get(top).and_then(Value::as_str).is_some_and(|text| text.contains("{{"));
         (!unresolved).then_some(violation)
     }
 
     /// Every problem of `config`: its schema issues, else the value rule it
-    /// breaks, written at `prefix` and naming `step_id`.
-    pub fn problems(self, config: &Value, prefix: &str, step_id: &str) -> Vec<KeyIssue> {
+    /// breaks, written at `prefix`.
+    pub fn problems(self, config: &Value, prefix: &str) -> Vec<KeyIssue> {
         let issues = self.issues(config, prefix);
         if !issues.is_empty() {
             return issues;
         }
         self.violation(config)
-            .map(|v| KeyIssue {
-                path: format!("{prefix}.{}", v.key),
-                issue: Issue::Rule(format!("step `{step_id}` (`{}`): {v}", self.id())),
-            })
+            .map(|v| KeyIssue { path: format!("{prefix}.{}", v.key), issue: Issue::Rule(v.to_string()) })
             .into_iter()
             .collect()
+    }
+
+    /// How a message names the step of this kind it is about.
+    pub fn step_label(self, step_id: &str) -> String {
+        format!("step `{step_id}` (`{}`)", self.id())
     }
 
     /// The top-level keys this kind's config names.

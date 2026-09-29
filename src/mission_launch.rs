@@ -638,6 +638,28 @@ pub fn launch(
     // become a silent way to skip this specific refusal for a real launch.
     mission_config::check_placeholders_declared(config)?;
 
+    // Run id: minted fresh for THIS launch, never derived from inputs
+    // (#1503). AI work is non-deterministic, so two launches of the same
+    // config with the same inputs are two DIFFERENT runs, not one to
+    // dedupe/reopen onto. `spec_fingerprint`, computed from the
+    // OPERATOR-SUPPLIED inputs (never `mission_id` itself, so it is taken
+    // BEFORE the id is inserted below), is what still lets same-config-same-
+    // inputs runs be GROUPED for corpus analysis, via `Mission.spec`: a
+    // metadata field, never identity.
+    //
+    // Minted HERE, ahead of the placeholder checks, because the launcher
+    // supplies `mission_id` to `{{mission_id}}` references: a check that
+    // substituted params without it would refuse a config the mint runs.
+    // `mint_run_id` is pure in-memory derivation (no disk I/O, no signal
+    // hazard), so minting before `launch_guard::arm()` is harmless, and a
+    // `--dry-run` that returns below simply never uses the id.
+    let mission_id = mint_run_id(config_id)?;
+    let inputs_fingerprint = spec_fingerprint(&collected)?;
+    let mut collected = collected;
+    if config.inputs.iter().any(|i| i.name == "mission_id") {
+        collected.insert("mission_id".to_string(), serde_json::Value::String(mission_id.clone()));
+    }
+
     // (#2310 P4c-2 review round 2, item a) A DECLARED input referenced
     // EMBEDDED (part of a larger string, e.g. `"label": "run-{{tag}}"`)
     // that this specific launch never collected — `check_placeholders_
@@ -741,18 +763,12 @@ pub fn launch(
     // (generic graphs + coder-phase) previously installed no signal
     // handling at all, the gap #2124 fixed for the now-deleted dedicated
     // review launcher and #1959 fixed (SIGINT only) for the retired crawl
-    // launcher. Installed HERE — ahead of `mint_run_id` below, matching the
-    // review launcher's own `run_dispatch`, which armed before ITS mint too
-    // — not merely ahead of the config-snapshot write / interpret /
-    // freeform-mint / executable-check work that follows the mint.
-    // `mint_run_id` itself is pure in-memory ID derivation (no disk I/O, so
-    // a signal caught inside it is harmless today regardless), but arming
-    // any later would make "is it safe to be here" a fact the reader has
-    // to re-derive from `mint_run_id`'s own implementation rather than
-    // something structurally true by placement — the SAME reasoning the
-    // review launcher applied. The flag is live well before the
-    // real-execution section (below) constructs this launcher's own
-    // `LaunchFinalizeGuard`.
+    // launcher. Installed HERE, ahead of the config-snapshot write /
+    // interpret / freeform-mint / executable-check work that follows: the
+    // first disk write of the launch is the first place a signal could
+    // strand state. (`mint_run_id` runs earlier, but it is pure in-memory
+    // derivation.) The flag is live well before the real-execution section
+    // (below) constructs this launcher's own `LaunchFinalizeGuard`.
     crate::launch_guard::arm();
 
     // (#2678) The run-level wall-clock bound — orthogonal to `arm()`
@@ -772,28 +788,14 @@ pub fn launch(
     let wall_clock_bound_seconds = darkmux_types::config_access::mission_wall_clock_timeout_seconds();
     let _wall_clock_guard = crate::launch_guard::spawn_wall_clock_watchdog(run_started, wall_clock_bound_seconds);
 
-    // Run id: minted fresh for THIS launch, never derived from inputs
-    // (#1503). AI work is non-deterministic, so two launches of the same
-    // config with the same inputs are two DIFFERENT runs, not one to
-    // dedupe/reopen onto — collapsing them onto one id was the category
-    // error #1503 fixes. `spec_fingerprint`, computed from the
-    // OPERATOR-SUPPLIED inputs below (never `mission_id` itself — hashing it
-    // would be circular), is what still lets same-config-same-inputs runs be
-    // GROUPED for corpus analysis, via `Mission.spec` — a metadata field,
-    // never identity. No `--mission-id` flag needed.
-    let mission_id = mint_run_id(config_id)?;
     let run = RunId::mission(mission_id.clone())?;
     let spec = MissionSpec {
         config_id: config_id.to_string(),
-        inputs_fingerprint: spec_fingerprint(&collected)?,
+        inputs_fingerprint,
         // (#1562) Recorded at mint so the board never has to guess — a
         // user-tier config's launches are the operator's named work.
         origin: Some(spec_origin_for(loaded.source)),
     };
-    let mut collected = collected;
-    if config.inputs.iter().any(|i| i.name == "mission_id") {
-        collected.insert("mission_id".to_string(), serde_json::Value::String(mission_id.clone()));
-    }
 
     // (#1504) `ensure_mission_and_phases_with_provenance` itself is a strand
     // window `reconcile_and_finalize_on_error` (below) can't cover — that
@@ -6370,6 +6372,33 @@ mod tests {
             None,
         )
         .expect("a defaulted-only inert input must not be refused, even though it lands in `collected`");
+        assert_eq!(exit, 0);
+        assert!(all_mission_ids().is_empty(), "a dry run must mint no mission");
+        let _ = guard;
+    }
+
+    const MISSION_ID_IN_GATE_CONFIG: &str = r#"{
+        "id": "mission-id-gate-test",
+        "name": "Mission Id Gate Test",
+        "schema_version": "3.5",
+        "inputs": [{"name": "mission_id", "required": false}],
+        "phases": [
+            {"id": "p1", "tasks": [{"id": "t1", "steps": [
+                {"id": "gate", "kind": "mods.gate", "config": {"for_key": "{{mission_id}}"}}
+            ]}]}
+        ]
+    }"#;
+
+    /// The launch-time step-config check must see the same `mission_id` the
+    /// mint injects: a `mods.gate` whose `for_key` is `{{mission_id}}` is a
+    /// config the real mint runs, so `--dry-run` must not refuse it.
+    #[test]
+    #[serial_test::serial]
+    fn dry_run_accepts_a_step_config_that_names_the_launcher_supplied_mission_id() {
+        let guard = LaunchTestGuard::new();
+        guard.write_config("mission-id-gate-test", MISSION_ID_IN_GATE_CONFIG);
+        let exit = launch("mission-id-gate-test", None, &["dry_run=true".to_string()], None)
+            .expect("a config using the launcher-supplied `mission_id` must pass the launch-time check");
         assert_eq!(exit, 0);
         assert!(all_mission_ids().is_empty(), "a dry run must mint no mission");
         let _ = guard;

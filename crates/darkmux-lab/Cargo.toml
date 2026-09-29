@@ -60,6 +60,9 @@ darkmux-types = { path = "../darkmux-types", features = ["test-support"] }
 # into normal-dependency builds, so release builds stay off (verified via
 # `cargo tree -e features` in the #1355 review round).
 darkmux-flow = { path = "../darkmux-flow", features = ["test-support"] }
+# The step-config sweep (`darkmux_crew::step_config::sweep`) the crawl kinds'
+# reader tests share with the crew crate. Dev-dep only.
+darkmux-crew = { path = "../darkmux-crew", features = ["test-support"] }
 
 [features]
 # (#2301) TypeScript export for the crawl's typed step-output structs. Turned
