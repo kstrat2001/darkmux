@@ -1286,26 +1286,13 @@ fn cmd_machine(sub: Option<MachineCmd>) -> Result<i32> {
 /// `darkmux machine resources` (#1286, renamed from `model ledger` in #1426)
 /// — the no-viewer twin of the machine lens: one bounded gather (lms metadata
 /// and kernel counters, zero model dispatches), rendered as a table or emitted
-/// as the same JSON shape the serve daemon's /machine/resources returns. With
-/// a roster `id`, reads that peer's resources over its serve daemon.
+/// as JSON. With a roster `id`, reads that peer's resources over its serve
+/// daemon and prints the daemon's own `/machine/resources` response.
 fn cmd_machine_resources(id: Option<&str>, json: bool) -> Result<i32> {
     if let Some(id) = id {
         // Remote read — fetch the peer's live /machine/resources payload.
         let value = fleet_cli::fetch_peer_json(id, "/machine/resources")?;
-        // Deserialize into the same ledger shape and render it, so a remote
-        // read reads like a local one. A peer whose shape doesn't parse (an
-        // older or newer daemon) is refused, never printed raw.
-        let ledger = serde_json::from_value::<darkmux_profiles::model_ledger::ModelLedger>(value).map_err(|e| {
-            anyhow::anyhow!(
-                "machine `{id}` answered with a resource ledger this darkmux does not read \
-                 (its darkmux version differs from this one): {e}"
-            )
-        })?;
-        if json {
-            cli_json::emit(&ledger)?;
-        } else {
-            print!("{}", darkmux_profiles::model_ledger::render_human(&ledger));
-        }
+        print!("{}", fleet_cli::peer_resources_view(id, value, json)?);
         return Ok(0);
     }
     let ledger = darkmux_profiles::model_ledger::gather();
@@ -1346,8 +1333,8 @@ fn cmd_machine_status(id: Option<&str>, config: Option<&str>, json: bool) -> Res
         {
             Some(Ok(models)) => models,
             _ => anyhow::bail!(
-                "machine `{id}` answered with a resident list this darkmux does not read: \
-                 its darkmux version differs from this one"
+                "machine `{id}` answered with a resident list this darkmux does not read ({})",
+                fleet_cli::peer_reports(&value)
             ),
         };
         if lms_unreachable {

@@ -38,16 +38,18 @@ pub struct ResumedFrom {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct RuntimeEnvelope {
-    /// How the loop ended (`stop`, `error`, an escalation reason, ...).
-    #[serde(default)]
-    pub result: String,
+    /// How the loop ended (`stop`, `error`, an escalation reason, ...). Absent
+    /// when the runtime that wrote the envelope did not say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
     /// The last assistant message; `null` on the error envelope.
     #[serde(default)]
     pub final_assistant: Option<String>,
     /// The trajectory file, under the runtime's out-dir (SEPARATE from
     /// `/workspace`); the host rewrites it to a path the caller can open.
-    #[serde(default)]
-    pub trajectory_path: String,
+    /// Absent when the runtime that wrote the envelope did not say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trajectory_path: Option<String>,
     /// Bash invocations that failed to run this execution. Empty on an honest
     /// run; absent on the error envelope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -61,9 +63,9 @@ impl RuntimeEnvelope {
     /// The envelope of a loop that produced no reply.
     pub fn error(trajectory_path: String) -> Self {
         RuntimeEnvelope {
-            result: "error".to_string(),
+            result: Some("error".to_string()),
             final_assistant: None,
-            trajectory_path,
+            trajectory_path: Some(trajectory_path),
             failed_tool_invocations: None,
             resumed_from: None,
         }

@@ -6806,6 +6806,21 @@ fn degeneracy_warning(
     })
 }
 
+/// The runtime's stdout as its [`darkmux_trajectory::RuntimeEnvelope`], or
+/// `None` after one line to `warn` saying it did not parse and why.
+fn parse_runtime_envelope(stdout: &str, warn: &dyn Fn(&str)) -> Option<darkmux_trajectory::RuntimeEnvelope> {
+    match serde_json::from_str(stdout.trim()) {
+        Ok(envelope) => Some(envelope),
+        Err(e) => {
+            warn(&format!(
+                "darkmux: the runtime's stdout is not an envelope this darkmux reads ({e}); printing it as the \
+                 runtime wrote it, without metrics, detections or bounds"
+            ));
+            None
+        }
+    }
+}
+
 /// (#1955) Add the observed summary to a JSON envelope.
 ///
 /// The orchestrator's ONLY surface is this envelope, and it carried none of
@@ -6843,8 +6858,10 @@ fn enrich_envelope_with_summary(
 ) -> String {
     // Anything that is not a runtime envelope (plain text, a list, a truncated
     // object) is handed back untouched: the enrichment never invents an
-    // envelope around text, and never fails a dispatch over one.
-    let Ok(runtime) = serde_json::from_str::<darkmux_trajectory::RuntimeEnvelope>(stdout.trim()) else {
+    // envelope around text, and never fails a dispatch over one. It says so on
+    // stderr, because the caller is then reading a document with no metrics,
+    // detections or bounds.
+    let Some(runtime) = parse_runtime_envelope(&stdout, &stderr_warning_sink) else {
         return stdout;
     };
     // The host block is only present when the sampler actually ran: an absent

@@ -12,7 +12,7 @@
 //! renders them differently. So the `Option` fields here are always present on
 //! the wire.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use super::battery::{BatteryHealth, BatterySample};
@@ -20,7 +20,7 @@ use super::{CpuCluster, HostSampleFull, MwStats, PowerSample, ThermalSample, The
 
 /// One `hw.perflevelN` cluster (Apple Silicon "Super" / "Performance" /
 /// "Efficiency"). `pct` and `mhz` are `null` when IOReport is unavailable.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct CpuClusterNow {
@@ -34,7 +34,7 @@ pub struct CpuClusterNow {
 /// `ProcessInfo.thermalState` and the CPU speed limit, verbatim. `state` is a
 /// string, not a closed union: the kernel owns the vocabulary, and a level a
 /// later macOS adds must render rather than fail to parse.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct ThermalNow {
@@ -44,7 +44,7 @@ pub struct ThermalNow {
 }
 
 /// Instantaneous package power by rail, in milliwatts.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct PowerNow {
@@ -61,7 +61,7 @@ pub struct PowerNow {
 /// One battery CHARGE reading. The whole object is `null` on a machine with no
 /// battery. `minutes_to_empty` is `null` on AC, while charging, and whenever
 /// the OS declines to estimate; never a synthesized zero.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct BatteryCharge {
@@ -72,7 +72,7 @@ pub struct BatteryCharge {
 }
 
 /// One host reading's full "now" shape, plus the wall-clock it was taken at.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct HostSampleNow {
@@ -151,7 +151,7 @@ impl From<&BatterySample> for BatteryCharge {
 /// signal; `condition_word` is the verdict derived from it (see
 /// `BatteryHealth::condition_word`). A UI shows `condition_word` and falls back
 /// to `condition`, labeled precisely, only when it is `null`.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct BatteryHealthNow {
@@ -199,7 +199,7 @@ impl From<&BatteryHealth> for BatteryHealthNow {
 
 /// One metric's window reduction: mean, nearest-rank p95 and maximum. The same
 /// shape carries a percentage metric and a power rail in milliwatts.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct MetricWindow {
@@ -223,7 +223,7 @@ impl From<&MwStats> for MetricWindow {
 }
 
 /// The power rails' window reductions, in milliwatts.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct PowerWindowWire {
@@ -243,7 +243,7 @@ impl From<&super::PowerWindow> for PowerWindowWire {
 /// not samples). Both are keyed by the level's own name, because the kernel owns
 /// that vocabulary; a missing key means "never observed in this window", which
 /// is not the same claim as `0`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct ThermalWindowWire {

@@ -1182,14 +1182,14 @@ fn run_dispatch(args: &[String]) -> ExitCode {
 /// its callers read, so no second tally exists to disagree with it.
 fn build_json_envelope(result: &str, final_assistant: Option<&str>) -> darkmux_trajectory::RuntimeEnvelope {
     darkmux_trajectory::RuntimeEnvelope {
-        result: result.to_string(),
+        result: Some(result.to_string()),
         final_assistant: final_assistant.map(str::to_string),
         // Container-internal path where the runtime's own bookkeeping
         // landed — the out-dir (SEPARATE from /workspace). Built from the
         // shared trajectory constants so it can't drift from the write site.
-        trajectory_path: darkmux_trajectory::trajectory_path(Path::new(trajectory::RUNTIME_OUT_BASE))
-            .display()
-            .to_string(),
+        trajectory_path: Some(
+            darkmux_trajectory::trajectory_path(Path::new(trajectory::RUNTIME_OUT_BASE)).display().to_string(),
+        ),
         failed_tool_invocations: None,
         resumed_from: None,
     }

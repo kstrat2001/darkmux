@@ -2202,18 +2202,19 @@ fn machine_status_local_unreachable_lms_matches_the_remote_shape() {
 }
 
 /// A peer payload whose shape this darkmux does not read (an older or newer
-/// daemon) is refused with a message naming the cause: never printed raw, never
-/// rendered as an empty machine. `--json` prints only its output type, so a
-/// refusal leaves stdout empty.
+/// daemon) is never printed raw and never rendered as an empty machine. The
+/// verbs that fail say what was observed (the peer's own versions, when it
+/// gives any) and claim no version mismatch that was not; `--json` prints only
+/// its output type, so a refusal leaves stdout empty. `machine resources` in
+/// text mode degrades to a note instead, exit 0.
 #[test]
 fn a_peer_answering_in_another_shape_is_refused_not_printed_raw() {
     for (args, why) in [
         (vec!["machine", "status", "peer1"], "text status"),
         (vec!["machine", "status", "peer1", "--json"], "json status"),
-        (vec!["machine", "resources", "peer1"], "text resources"),
         (vec!["machine", "resources", "peer1", "--json"], "json resources"),
     ] {
-        let addr = canned_http_peer("200 OK", r#"{"future_shape":{"models_v2":[]}}"#, 1);
+        let addr = canned_http_peer("200 OK", r#"{"future_shape":{"models_v2":[]},"darkmux_version":"9.9.9"}"#, 1);
         let tmp = TempDir::new().unwrap();
         let fleet_file = roster_with_peer(&tmp, "peer1", &addr);
         let out = darkmux_cmd().env("DARKMUX_FLEET_FILE", &fleet_file).args(&args).output().unwrap();
@@ -2221,8 +2222,26 @@ fn a_peer_answering_in_another_shape_is_refused_not_printed_raw() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(!out.status.success(), "{why}: a shape mismatch must fail: {stdout}{stderr}");
         assert!(stdout.is_empty(), "{why}: nothing is printed to stdout: {stdout}");
-        assert!(stderr.contains("does not read") && stderr.contains("version differs"), "{why}: {stderr}");
+        assert!(stderr.contains("does not read") && stderr.contains("darkmux_version 9.9.9"), "{why}: {stderr}");
+        assert!(!stderr.contains("differs"), "{why}: claims a mismatch nobody observed: {stderr}");
     }
+}
+
+/// `machine resources <peer>` in text mode, against a body it cannot read:
+/// a note naming the peer and what it reported, not a bare failure.
+#[test]
+fn an_unreadable_peer_ledger_reads_as_a_note_in_text_mode() {
+    let addr = canned_http_peer("200 OK", r#"{"future_shape":true,"schema_version":"9.0"}"#, 1);
+    let tmp = TempDir::new().unwrap();
+    let fleet_file = roster_with_peer(&tmp, "peer1", &addr);
+    let out = darkmux_cmd()
+        .env("DARKMUX_FLEET_FILE", &fleet_file)
+        .args(["machine", "resources", "peer1"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}{}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.contains("peer1") && stdout.contains("resources unreadable") && stdout.contains("schema_version 9.0"), "{stdout}");
 }
 
 #[test]

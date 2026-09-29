@@ -5,8 +5,10 @@
 //!
 //! - **The type.** A verb prints through [`emit`] (or [`render`]), which takes
 //!   only a [`CliOutput`]. A hand-built `serde_json::Value` is not one, so it
-//!   cannot reach stdout by that road; `no_verb_prints_a_hand_built_value`
-//!   scans the sources for the other road (`println!` of a `to_string` call).
+//!   cannot reach stdout by that road; `no_verb_serializes_json_outside_emit`
+//!   scans the sources for the others: production code may not call
+//!   `serde_json::to_string*` (or `to_writer*`, `to_vec*`, however imported)
+//!   outside a short, counted, reasoned allowlist of non-output uses.
 //! - **The table.** [`cli_outputs!`] is the one place a type becomes a
 //!   `CliOutput`, and it names the verbs that print it.
 //! - **The golden.** `tests/cli-json.golden` lists every verb and, for every
@@ -114,6 +116,14 @@ pub(crate) const STREAMS: &[(&str, &str)] = &[(
     "one flow record per line, verbatim; the record is pinned by FLOW_SCHEMA_VERSION, not by this file",
 )];
 
+/// The verbs that print JSON with no `--json` flag: the document is their only
+/// output. The clap walk cannot see them, so this list is the second half of
+/// the agreement: each is a row of [`cli_outputs!`] and a real verb without a
+/// `--json` flag, and every row of the table names a verb that has the flag, is
+/// listed here, or is a stream.
+#[cfg(test)]
+pub(crate) const ALWAYS_JSON: &[&str] = &["profile draft", "memory lesson export"];
+
 /// Declare the output types and the verbs that print each. One row per type;
 /// a verb that can print several types appears in each of their rows.
 macro_rules! cli_outputs {
@@ -144,6 +154,7 @@ cli_outputs! {
     ProfileList<'_> => ["profile list"],
     MachineStatusOutput<'_> => ["machine status"],
     darkmux_profiles::model_ledger::ModelLedger => ["machine resources"],
+    darkmux_serve::wire::MachineResourcesResponse => ["machine resources <peer>"],
     crate::fleet_cli::MachineListOutput => ["machine list"],
     crate::flow_cli::DrainOutput => ["flow drain"],
     crate::flow_cli::StrayDrainOutput => ["flow drain --file"],
@@ -214,12 +225,33 @@ mod tests {
     /// One `type` keyword, with the shape its siblings give it.
     fn typed(t: &str, v: &Value) -> String {
         match t {
-            "array" => match v.get("items") {
-                Some(items) => format!("{}[]", wrap(&type_expr(items))),
-                None => "any[]".to_string(),
-            },
+            "array" => array_expr(v),
             "object" => object_expr(v),
+            "integer" | "number" => numeric_expr(t, v),
             other => other.to_string(),
+        }
+    }
+
+    /// A number by its width and sign: schemars' `format` (`uint64`, `int32`,
+    /// `double`), and a `minimum` when the format does not already say the
+    /// value is unsigned. A `u64` turning into an `i64` changes the golden.
+    fn numeric_expr(t: &str, v: &Value) -> String {
+        let base = v.get("format").and_then(Value::as_str).unwrap_or(t);
+        match v.get("minimum") {
+            Some(min) if !base.starts_with("uint") => format!("{base}>={min}"),
+            _ => base.to_string(),
+        }
+    }
+
+    /// An array: a tuple as its element types in order, a list as `T[]`.
+    fn array_expr(v: &Value) -> String {
+        if let Some(elems) = v.get("prefixItems").and_then(Value::as_array) {
+            let types = elems.iter().map(type_expr).collect::<Vec<_>>();
+            return format!("[{}]", types.join(", "));
+        }
+        match v.get("items") {
+            Some(items) => format!("{}[]", wrap(&type_expr(items))),
+            None => "any[]".to_string(),
         }
     }
 
@@ -243,17 +275,17 @@ mod tests {
         }
     }
 
-    /// `name: type` (or `name?: type` when not required), sorted by name.
+    /// `name: type` (or `name?: type` when not required), in declaration order
+    /// (schemars keeps it), so reordering a struct's fields changes the golden:
+    /// a script that reads the output positionally would notice.
     fn fields(node: &Value, props: &serde_json::Map<String, Value>) -> Vec<String> {
         let required: Vec<&str> = node
             .get("required")
             .and_then(Value::as_array)
             .map(|r| r.iter().filter_map(Value::as_str).collect())
             .unwrap_or_default();
-        let mut names: Vec<&String> = props.keys().collect();
-        names.sort();
-        names
-            .into_iter()
+        props
+            .keys()
             .map(|n| {
                 let opt = if required.contains(&n.as_str()) { "" } else { "?" };
                 format!("{n}{opt}: {}", type_expr(&props[n]))
@@ -292,10 +324,39 @@ mod tests {
         let defs = Value::Object(generator.take_definitions(true));
         let mut names: Vec<&String> = defs.as_object().map(|m| m.keys().collect()).unwrap_or_default();
         names.sort();
-        for name in names {
-            out.push_str(&definition(name, &defs[name]));
+        for name in &names {
+            out.push_str(&definition(name, &defs[*name]));
+        }
+        out.push_str("\n# untyped: fields (or types) that hold free-form JSON, each explained in DESIGN.md\n");
+        for line in untyped(&names, &defs) {
+            out.push_str(&format!("{line}\n"));
         }
         out
+    }
+
+    /// Whether a type expression mentions `any`: a value with no declared shape.
+    fn mentions_any(expr: &str) -> bool {
+        expr.split(|c: char| !c.is_alphanumeric()).any(|word| word == "any")
+    }
+
+    /// `Type.field` for every field whose type mentions `any`, and `Type` for a
+    /// definition that is not an object but does. The golden lists them so a
+    /// new free-form field is a visible line, not a silent hole in the pin.
+    fn untyped(names: &[&String], defs: &Value) -> Vec<String> {
+        let mut found = Vec::new();
+        for name in names {
+            let node = &defs[name.as_str()];
+            match node.get("properties").and_then(Value::as_object) {
+                Some(props) if node.get("type").and_then(Value::as_str) == Some("object") => {
+                    found.extend(
+                        props.iter().filter(|(_, ty)| mentions_any(&type_expr(ty))).map(|(field, _)| format!("{name}.{field}")),
+                    );
+                }
+                _ if mentions_any(&type_expr(node)) => found.push(name.to_string()),
+                _ => {}
+            }
+        }
+        found
     }
 
     /// A changed output shape fails here until the golden is regenerated on
@@ -315,6 +376,45 @@ mod tests {
              intended, regenerate with `DARKMUX_REGENERATE_FIXTURES=1 cargo nextest run -p darkmux \
              cli_json` and add a CHANGELOG migration line."
         );
+    }
+
+    /// What the golden can tell apart: an integer's width and sign, a tuple's
+    /// elements, and the order a struct declares its fields in. Each is a shape a
+    /// script would notice, so each must change the rendered text.
+    #[test]
+    fn the_golden_tells_apart_widths_signs_tuples_and_order() {
+        let ty = |json: &str| type_expr(&serde_json::from_str::<Value>(json).unwrap());
+        assert_ne!(
+            ty(r#"{"type":"integer","format":"uint64","minimum":0}"#),
+            ty(r#"{"type":"integer","format":"int64"}"#),
+            "u64 and i64 render alike"
+        );
+        assert_ne!(ty(r#"{"type":"integer","format":"uint32","minimum":0}"#), ty(r#"{"type":"integer","format":"uint64","minimum":0}"#));
+        assert_ne!(ty(r#"{"type":"number","format":"float"}"#), ty(r#"{"type":"number","format":"double"}"#));
+        assert_eq!(ty(r#"{"type":"integer"}"#), "integer");
+        assert_eq!(ty(r#"{"type":"integer","minimum":1}"#), "integer>=1", "a sign with no format still shows");
+        let tuple = r#"{"type":"array","prefixItems":[{"type":"string"},{"type":"integer","format":"uint64","minimum":0}],"minItems":2,"maxItems":2}"#;
+        assert_eq!(ty(tuple), "[string, uint64]");
+        assert_ne!(ty(tuple), ty(r#"{"type":"array","prefixItems":[{"type":"integer","format":"uint64","minimum":0},{"type":"string"}]}"#));
+        let order = |json: &str| definition("T", &serde_json::from_str::<Value>(json).unwrap());
+        assert_ne!(
+            order(r#"{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"string"}},"required":["a","b"]}"#),
+            order(r#"{"type":"object","properties":{"b":{"type":"string"},"a":{"type":"string"}},"required":["a","b"]}"#),
+            "a reordered struct renders alike"
+        );
+    }
+
+    /// Every field the golden lists as untyped is explained in DESIGN.md's
+    /// "CLI `--json` is a contract" section, by its `Type.field` name in code
+    /// font, so a new free-form field cannot land without a stated reason.
+    #[test]
+    fn every_untyped_field_is_explained_in_design_md() {
+        let design = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("DESIGN.md")).unwrap();
+        let section = design.split("## CLI `--json` is a contract").nth(1).and_then(|rest| rest.split("\n## ").next()).unwrap();
+        let golden = render_golden();
+        let listed = golden.split("# untyped:").nth(1).unwrap().lines().skip(1).filter(|l| !l.is_empty());
+        let missing: Vec<&str> = listed.filter(|name| !section.contains(&format!("`{name}`"))).collect();
+        assert!(missing.is_empty(), "untyped fields with no reason in DESIGN.md: {missing:?}");
     }
 
     /// The names the golden holds (fields and type names) never spell the internal
@@ -342,53 +442,238 @@ mod tests {
         }
     }
 
-    /// The statements in `text` that print a `serde_json::to_string*` call as
-    /// the whole line: the road by which a hand-built value could reach stdout
-    /// without [`emit`].
-    fn json_prints(text: &str) -> Vec<String> {
-        let mut found = Vec::new();
-        for start in text.match_indices("print").map(|(i, _)| i) {
-            let rest = &text[start..];
-            if !(rest.starts_with("println!(") || rest.starts_with("print!(")) {
+    /// `text` with comments and string literals blanked (newlines kept), so a
+    /// scan sees only code: a message that quotes `serde_json::to_string` is
+    /// not a call.
+    fn code_only(text: &str) -> String {
+        let chars: Vec<char> = text.chars().collect();
+        let mut out = String::with_capacity(text.len());
+        let mut i = 0;
+        while i < chars.len() {
+            let end = literal_end(&chars, i);
+            if end == i {
+                out.push(chars[i]);
+                i += 1;
+            } else {
+                out.extend(chars[i..end].iter().map(|c| if *c == '\n' { '\n' } else { ' ' }));
+                i = end;
+            }
+        }
+        out
+    }
+
+    /// Where the comment or string literal starting at `i` ends; `i` itself
+    /// when none starts there.
+    fn literal_end(chars: &[char], i: usize) -> usize {
+        let at = |k: usize| chars.get(k).copied();
+        match (chars[i], at(i + 1)) {
+            ('/', Some('/')) => (i..chars.len()).find(|&k| chars[k] == '\n').unwrap_or(chars.len()),
+            ('/', Some('*')) => (i + 2..chars.len()).find(|&k| chars[k] == '*' && at(k + 1) == Some('/')).map_or(chars.len(), |k| k + 2),
+            ('"', _) => string_end(chars, i + 1, 0),
+            ('r', Some('"' | '#')) => {
+                let hashes = chars[i + 1..].iter().take_while(|c| **c == '#').count();
+                if at(i + 1 + hashes) == Some('"') { string_end(chars, i + 2 + hashes, hashes + 1) } else { i }
+            }
+            _ => i,
+        }
+    }
+
+    /// The end of a string body starting at `from`: a plain string closes at an
+    /// unescaped `"`, a raw string with `hashes` marks at `"` and that many `#`.
+    fn string_end(chars: &[char], from: usize, raw_marks: usize) -> usize {
+        let hashes = raw_marks.saturating_sub(1);
+        let mut k = from;
+        while k < chars.len() {
+            if raw_marks == 0 && chars[k] == '\\' {
+                k += 2;
                 continue;
             }
-            let stmt = rest.split(";\n").next().unwrap_or(rest);
-            // A bare `"{}"` format is a document; `"context   {}"` is a text
-            // line that quotes a value.
-            let args = stmt.split_once('(').map_or("", |(_, a)| a.trim_start());
-            if args.starts_with("\"{}\"") && stmt.contains("serde_json::to_string") {
-                found.push(stmt.lines().next().unwrap_or("").trim().to_string());
+            let closes = chars[k] == '"' && chars[k + 1..].iter().take(hashes).filter(|c| **c == '#').count() == hashes;
+            if closes {
+                return k + 1 + hashes;
+            }
+            k += 1;
+        }
+        chars.len()
+    }
+
+    /// The serializers that turn a value into JSON text or bytes.
+    fn is_json_writer(name: &str) -> bool {
+        ["to_string", "to_writer", "to_vec"].iter().any(|p| name.starts_with(p))
+    }
+
+    /// The identifier at the start of `code`.
+    fn leading_ident(code: &str) -> &str {
+        let len = code.find(|c: char| !(c.is_alphanumeric() || c == '_')).unwrap_or(code.len());
+        &code[..len]
+    }
+
+    /// The text of each `use` statement in `code` (up to its `;`).
+    fn use_statements(code: &str) -> Vec<&str> {
+        code.split(';')
+            .filter_map(|stmt| {
+                stmt.match_indices("use ")
+                    .find(|(at, _)| !stmt[..*at].ends_with(|c: char| c.is_alphanumeric() || c == '_'))
+                    .map(|(at, _)| &stmt[at + "use ".len()..])
+            })
+            .collect()
+    }
+
+    /// Every way `code` reaches a `serde_json` serializer: a path
+    /// `serde_json::to_string*` (whitespace and line breaks allowed), a `use`
+    /// that imports one by name, by glob, or under an alias (so an unqualified
+    /// or renamed call cannot slip past the path check).
+    fn json_writer_calls(code: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        for (at, _) in code.match_indices("serde_json") {
+            let after = code[at + "serde_json".len()..].trim_start();
+            let Some(rest) = after.strip_prefix("::") else { continue };
+            let rest = rest.trim_start();
+            let name = leading_ident(rest);
+            if is_json_writer(name) {
+                found.push(format!("serde_json::{name}"));
+            }
+        }
+        for import in use_statements(code).into_iter().filter(|i| i.contains("serde_json")) {
+            let words: Vec<&str> = import.split(|c: char| !(c.is_alphanumeric() || c == '_')).collect();
+            if let Some(name) = words.iter().find(|w| is_json_writer(w)) {
+                found.push(format!("use of {name}"));
+            } else if import.contains("serde_json::*") || import.contains("serde_json as ") || import.contains("self as ") {
+                found.push("a glob or aliased import of serde_json".to_string());
             }
         }
         found
     }
 
-    /// A verb prints a JSON document only through [`emit`]: no `println!` of a
-    /// `serde_json::to_string*` call exists in the binary's sources.
-    #[test]
-    fn no_verb_prints_a_hand_built_value() {
-        let mut files = Vec::new();
-        rust_files(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src"), &mut files);
-        let mut offenders = Vec::new();
-        for file in files.iter().filter(|f| !f.ends_with("cli_json.rs")) {
-            for line in json_prints(&std::fs::read_to_string(file).unwrap()) {
-                offenders.push(format!("{}: {line}", file.display()));
-            }
+    /// `code` (already blanked by [`code_only`]) without its `#[cfg(test)]`
+    /// items: each is blanked through its closing brace, or through its `;`
+    /// when that comes first (`mod x;`, a `use`). Code before or after a test
+    /// module stays, so a serializer added below one is still seen.
+    fn without_test_items(code: &str) -> String {
+        const MARK: &str = "#[cfg(test)]";
+        let mut out = String::new();
+        let mut rest = code;
+        while let Some(at) = rest.find(MARK) {
+            out.push_str(&rest[..at]);
+            let item = &rest[at + MARK.len()..];
+            let end = item_end(item);
+            out.extend(rest[at..at + MARK.len() + end].chars().map(|c| if c == '\n' { '\n' } else { ' ' }));
+            rest = &item[end..];
         }
-        assert!(offenders.is_empty(), "a verb prints JSON without cli_json::emit: {offenders:#?}");
+        out.push_str(rest);
+        out
     }
 
-    /// The scan itself can fail: it sees a print of a `to_string_pretty` call,
-    /// on one line or across several, and lets an `emit` through.
+    /// The byte length of the item at the start of `item`: through the matching
+    /// `}` of its first `{`, or through its `;` if that comes first.
+    fn item_end(item: &str) -> usize {
+        let Some(open) = item.find(['{', ';']) else { return item.len() };
+        if item.as_bytes()[open] == b';' {
+            return open + 1;
+        }
+        let mut depth = 0usize;
+        for (i, c) in item[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return open + i + 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        item.len()
+    }
+
+    /// Production code that may serialize JSON outside [`emit`], with the count
+    /// of call sites and why. None of these prints a document to stdout: each
+    /// writes a file, feeds a fingerprint or a prompt, or quotes a free-form
+    /// field inside a text line.
+    const JSON_WRITER_ALLOWLIST: &[(&str, usize, &str)] = &[
+        ("src/config_cmd.rs", 2, "writes config.json"),
+        ("src/init.rs", 2, "writes config.json"),
+        ("src/fleet_cli.rs", 2, "writes the roster's config file"),
+        ("src/acp_panel.rs", 1, "writes the launch spec file"),
+        ("src/mission_launch.rs", 2, "a spec fingerprint, and JSON quoted inside a prompt"),
+        ("src/finding_cli.rs", 2, "`finding show` text mode: two free-form fields as lines of a text view"),
+    ];
+
+    /// The production call sites in every source file, as (relative path, calls).
+    fn production_writer_calls() -> Vec<(String, Vec<String>)> {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        rust_files(&root.join("src"), &mut files);
+        files
+            .iter()
+            .filter(|f| !f.ends_with("cli_json.rs") && !f.file_name().is_some_and(|n| n.to_string_lossy().contains("tests")))
+            .map(|f| {
+                let text = std::fs::read_to_string(f).unwrap();
+                let calls = json_writer_calls(&without_test_items(&code_only(&text)));
+                (f.strip_prefix(&root).unwrap().display().to_string(), calls)
+            })
+            .filter(|(_, calls)| !calls.is_empty())
+            .collect()
+    }
+
+    /// A verb prints a JSON document only through [`emit`]: production code
+    /// under `src/` never calls `serde_json::to_string*` (or `to_writer*`,
+    /// `to_vec*`, however imported), except the allowlisted non-output uses,
+    /// counted per file so a new call in an allowed file fails too.
     #[test]
-    fn the_print_scan_sees_what_it_is_meant_to_see() {
-        let bad = "fn f() { println!(\"{}\", serde_json::to_string_pretty(&x)?); }\n";
-        assert_eq!(json_prints(bad).len(), 1);
-        let multiline = "fn f() {\n    println!(\n        \"{}\",\n        serde_json::to_string(&x)?\n    );\n}\n";
-        assert_eq!(json_prints(multiline).len(), 1);
-        assert!(json_prints("fn f() { cli_json::emit(&x)?; println!(\"{}\", y); }\n").is_empty());
-        let text_line = "fn f() { println!(\"context   {}\", serde_json::to_string(&x)?); }\n";
-        assert!(json_prints(text_line).is_empty(), "a text line that quotes a value is not a document");
+    fn no_verb_serializes_json_outside_emit() {
+        let mut offenders = Vec::new();
+        for (path, calls) in production_writer_calls() {
+            let allowed = JSON_WRITER_ALLOWLIST.iter().find(|(p, _, _)| *p == path).map_or(0, |(_, n, _)| *n);
+            if calls.len() != allowed {
+                offenders.push(format!("{path}: {} call(s), {allowed} allowed: {calls:?}", calls.len()));
+            }
+        }
+        for (path, _, _) in JSON_WRITER_ALLOWLIST {
+            assert!(
+                production_writer_calls().iter().any(|(p, _)| p == path),
+                "allowlist row for {path} names a file with no serializer call: delete the row"
+            );
+        }
+        assert!(offenders.is_empty(), "JSON serialized outside cli_json::emit: {offenders:#?}");
+    }
+
+    /// The scan can fail: each way a print could have bypassed the old textual
+    /// pattern is seen, and the ways that are not calls are not.
+    #[test]
+    fn the_writer_scan_sees_every_bypass() {
+        let bypasses = [
+            ("named argument", "fn f() { println!(\"{s}\", s = serde_json::to_string(&x)?); }"),
+            ("unqualified after use", "use serde_json::to_string_pretty;\nfn f() { println!(\"{}\", to_string_pretty(&x)?); }"),
+            ("writeln to stdout", "fn f() { writeln!(out, \"{}\", serde_json::to_string(&x)?)?; }"),
+            ("let then print", "use serde_json::to_string;\nfn f() { let s = to_string(&x)?; println!(\"{s}\"); }"),
+            ("grouped import", "use serde_json::{Value, to_string_pretty};"),
+            ("path over a line break", "fn f() { serde_json\n    ::to_string(&x); }"),
+            ("to_writer", "fn f() { serde_json::to_writer(stdout(), &x)?; }"),
+            ("to_vec_pretty", "fn f() { serde_json::to_vec_pretty(&x)?; }"),
+            ("glob import", "use serde_json::*;"),
+            ("aliased import", "use serde_json as sj;"),
+        ];
+        for (why, src) in bypasses {
+            assert!(!json_writer_calls(&code_only(src)).is_empty(), "the scan misses: {why}");
+        }
+        let innocent = [
+            ("a comment", "// serde_json::to_string(&x)\nfn f() {}"),
+            ("a string", "fn f() { let m = \"call serde_json::to_string\"; }"),
+            ("a raw string", "fn f() { let m = r#\"serde_json::to_string\"#; }"),
+            ("a value import", "use serde_json::{json, Value};"),
+            ("a Display to_string", "fn f() { let s = n.to_string(); }"),
+        ];
+        for (why, src) in innocent {
+            assert!(json_writer_calls(&code_only(src)).is_empty(), "the scan flags {why}");
+        }
+        let tests = "fn f() {}\n#[cfg(test)]\npub(crate) mod tests {\n    fn t() { if a { serde_json::to_string(&x); } }\n}\n";
+        let prod = |src: &str| json_writer_calls(&without_test_items(&code_only(src)));
+        assert!(prod(tests).is_empty(), "test code is not production");
+        let after = format!("{tests}fn g() {{ serde_json::to_string(&x); }}\n");
+        assert_eq!(prod(&after).len(), 1, "a serializer added below the test module is production");
+        assert!(prod("#[cfg(test)]\nmod tests_file;\nfn g() { serde_json::to_string(&x); }").len() == 1);
     }
 
     /// The table's verbs, without their qualifier: the leading words that name a
@@ -442,6 +727,37 @@ mod tests {
         let verbs = table(&mut generator).into_iter().map(|(verb, _)| verb).chain(STREAMS.iter().map(|(v, _)| *v));
         for (verb, path) in verbs.zip(&in_table) {
             assert!(!path.is_empty() && verb.starts_with(path.as_str()), "table row `{verb}` names no verb");
+        }
+    }
+
+    /// The clap tree and the table agree in both directions for the verbs with
+    /// no `--json` flag: each always-JSON verb is a real verb, has no flag (else
+    /// it is not "always"), and is in the table; and every verb the table names
+    /// either has the flag, is a stream, or is listed as always-JSON. A new
+    /// always-JSON verb is therefore a table row that fails here until it is
+    /// declared.
+    #[test]
+    fn always_json_verbs_and_the_clap_tree_agree() {
+        let root = <crate::cli::Cli as clap::CommandFactory>::command();
+        let mut flagged = Vec::new();
+        json_flag_paths(&root, "", &mut flagged);
+        let mut generator = SchemaSettings::draft2020_12().into_generator();
+        let rows: Vec<&str> = table(&mut generator).into_iter().map(|(verb, _)| verb).collect();
+        for verb in ALWAYS_JSON {
+            assert!(
+                rows.iter().any(|r| r == verb),
+                "always-JSON verb `{verb}` is not a row of cli_outputs!"
+            );
+            assert!(!flagged.iter().any(|p| p == verb), "`{verb}` takes --json: it is not always-JSON");
+            let mut cmd = &root;
+            for word in verb.split(' ') {
+                cmd = cmd.find_subcommand(word).unwrap_or_else(|| panic!("always-JSON verb `{verb}` is not a verb"));
+            }
+        }
+        let streams: Vec<&str> = STREAMS.iter().map(|(v, _)| *v).collect();
+        for (row, path) in rows.iter().zip(table_verb_paths()) {
+            let covered = flagged.contains(&path) || ALWAYS_JSON.contains(&path.as_str()) || streams.contains(&path.as_str());
+            assert!(covered, "table row `{row}` (verb `{path}`) has no --json flag and is not listed in ALWAYS_JSON");
         }
     }
 

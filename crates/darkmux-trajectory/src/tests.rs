@@ -315,9 +315,9 @@ fn a_mistyped_text_field_reads_as_absent_and_keeps_the_event() {
 
 fn success_envelope() -> RuntimeEnvelope {
     RuntimeEnvelope {
-        result: "stop".into(),
+        result: Some("stop".into()),
         final_assistant: Some("done".into()),
-        trajectory_path: "/darkmux-out/.darkmux-runtime/trajectory.jsonl".into(),
+        trajectory_path: Some("/darkmux-out/.darkmux-runtime/trajectory.jsonl".into()),
         failed_tool_invocations: Some(vec![FailedExec { command: "cargo test".into(), reason: "not found".into() }]),
         resumed_from: Some(ResumedFrom { path: "/darkmux-out/checkpoint.json".into(), turn_index: 4 }),
     }
@@ -363,7 +363,18 @@ fn an_envelope_reads_back_and_a_partial_one_reads_as_empty() {
     let back: RuntimeEnvelope = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
     assert_eq!(back, e);
     let partial: RuntimeEnvelope = serde_json::from_str(r#"{"result":"stop"}"#).unwrap();
-    assert_eq!(partial.result, "stop");
+    assert_eq!(partial.result.as_deref(), Some("stop"));
+    assert_eq!(partial.trajectory_path, None, "a missing path is unknown, not an empty string");
     assert_eq!(partial.final_assistant, None);
     assert_eq!(partial.failed_tool_invocations, None);
+}
+
+/// A key the envelope did not carry stays absent when it is printed again: no
+/// `"result": ""` or `"trajectory_path": ""` invented for a partial envelope.
+#[test]
+fn a_partial_envelope_prints_no_empty_string_for_what_it_lacked() {
+    let partial: RuntimeEnvelope = serde_json::from_str(r#"{"final_assistant":"hi"}"#).unwrap();
+    let v = serde_json::to_value(&partial).unwrap();
+    assert!(v.get("result").is_none() && v.get("trajectory_path").is_none(), "{v}");
+    assert_eq!(v["final_assistant"], "hi");
 }

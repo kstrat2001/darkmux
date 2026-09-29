@@ -257,6 +257,60 @@ pub(crate) fn cmd_machine_remove(id: &str) -> Result<i32> {
     }
 }
 
+/// What a peer's body says about its own versions: the `schema_version` and
+/// `darkmux_version` strings it carries, when it carries them. Read from the
+/// raw body, so it works when the body does not parse into a type this darkmux
+/// knows.
+fn peer_versions(body: &serde_json::Value) -> Option<String> {
+    let named: Vec<String> = ["schema_version", "darkmux_version"]
+        .into_iter()
+        .filter_map(|key| body.get(key).and_then(serde_json::Value::as_str).map(|v| format!("{key} {v}")))
+        .collect();
+    (!named.is_empty()).then(|| named.join(", "))
+}
+
+/// The peer's versions as a sentence fragment, for a message that names them.
+pub(crate) fn peer_reports(body: &serde_json::Value) -> String {
+    peer_versions(body)
+        .map_or_else(|| "the peer reports no schema_version or darkmux_version".to_string(), |v| format!("the peer reports {v}"))
+}
+
+/// Why a peer's `/machine/resources` body did not read: what the peer says it
+/// is, what this darkmux reads, and the parse error. It claims no version
+/// mismatch it did not observe: a body that names the schema this darkmux
+/// reads and still fails is reported as malformed, not as another version.
+fn unreadable_resources_reason(body: &serde_json::Value, err: &serde_json::Error) -> String {
+    let local = darkmux_profiles::model_ledger::LEDGER_SCHEMA_VERSION;
+    let peer = peer_reports(body);
+    let same_schema = body.get("schema_version").and_then(serde_json::Value::as_str) == Some(local);
+    let verdict = if same_schema {
+        format!("the schema matches, so the body is malformed: {err}")
+    } else {
+        format!("this darkmux reads ledger schema {local}: {err}")
+    };
+    format!("{peer}; {verdict}")
+}
+
+/// What `machine resources <peer>` prints for the peer's `/machine/resources`
+/// body. It is read as the daemon's own `MachineResourcesResponse`, so the
+/// recorded cadence (`cache_ttl_ms`) and the sampler's `load` reach the
+/// output. A body this darkmux cannot read is a refusal under `--json` (a
+/// script needs the failure) and a note in text mode (an operator needs to
+/// know which peer and which version, not a bare error).
+pub(crate) fn peer_resources_view(id: &str, body: serde_json::Value, json: bool) -> Result<String> {
+    match serde_json::from_value::<darkmux_serve::wire::MachineResourcesResponse>(body.clone()) {
+        Ok(resp) if json => cli_json::render(&resp),
+        Ok(resp) => Ok(darkmux_profiles::model_ledger::render_human(&resp.ledger)),
+        Err(e) => {
+            let reason = unreadable_resources_reason(&body, &e);
+            if json {
+                anyhow::bail!("machine `{id}` answered with a resource ledger this darkmux does not read ({reason})")
+            }
+            Ok(format!("machine `{id}`: resources unreadable. Nothing from the peer's ledger could be shown ({reason}).\n"))
+        }
+    }
+}
+
 /// Resolve a roster `id` and GET `path` from its daemon with the shared
 /// fleet token (#1426, #881). Used by `machine status [id]` / `machine
 /// resources [id]`. (#2916 re-review MUST 3) The request goes through
@@ -438,6 +492,9 @@ pub struct MachineListRow {
     /// The address did not verify as the pinned tailnet node, so nothing (and
     /// no token) was sent (#2916).
     pub specs_unverified: bool,
+    /// The peer answered, but its specs body is not a document this darkmux
+    /// reads: the darkmux version the body names. `null` otherwise.
+    pub specs_unreadable_peer_version: Option<String>,
 }
 
 /// The `--deep` table's specs cells for a peer that answered: AI headroom, OS,
@@ -462,6 +519,9 @@ struct DeepSpecs {
     /// (#2916 re-review MUST 3) Peers whose address did not verify as their
     /// pinned tailnet node: the token was NOT sent to them.
     unverified: Vec<String>,
+    /// Peers whose specs body this darkmux could not read, by the darkmux
+    /// version the body names.
+    unreadable: std::collections::BTreeMap<String, String>,
 }
 
 impl DeepSpecs {
@@ -470,6 +530,10 @@ impl DeepSpecs {
         let why = match probe {
             SpecsProbe::Ok(specs) => return Some(*specs),
             SpecsProbe::Unavailable => return None,
+            SpecsProbe::Unreadable { peer_version } => {
+                self.unreadable.insert(id.to_string(), peer_version);
+                return None;
+            }
             SpecsProbe::Unverified => &mut self.unverified,
             SpecsProbe::AuthRequired => &mut self.auth_required,
             SpecsProbe::RouteMissing => &mut self.route_missing,
@@ -527,6 +591,7 @@ fn machine_list_output(
             specs_auth_required: deep.auth_required.contains(&m.id),
             specs_route_missing: deep.route_missing.contains(&m.id),
             specs_unverified: deep.unverified.contains(&m.id),
+            specs_unreadable_peer_version: deep.unreadable.get(&m.id).cloned(),
         })
         .collect();
     MachineListOutput {
@@ -589,6 +654,7 @@ fn deep_cells_for(id: &str, deep: &DeepSpecs) -> (String, String, String, String
         // to an unreachable or timed-out peer.
         None if deep.route_missing.iter().any(|i| i == id) => dashes("no-route?"),
         None if deep.unverified.iter().any(|i| i == id) => dashes("unverified"),
+        None if deep.unreadable.contains_key(id) => dashes(&format!("unreadable (peer {})", deep.unreadable[id])),
         None => dashes("specs?"),
     }
 }
@@ -777,6 +843,9 @@ pub(crate) fn cmd_machine_list(emit_json: bool, deep: bool) -> Result<i32> {
 /// (`machine list --deep`) that showcases it in the docs.
 enum SpecsProbe {
     Ok(Box<MachineSpecsResponse>),
+    /// The body names a `darkmux_version` but is not a `MachineSpecsResponse`
+    /// this darkmux reads: a peer on another version.
+    Unreadable { peer_version: String },
     AuthRequired,
     RouteMissing,
     Unavailable,
@@ -787,15 +856,20 @@ enum SpecsProbe {
 /// A peer's `/machine/specs` body as a [`MachineSpecsResponse`]. Every
 /// peer-provided string is sanitized before it is parsed, so nothing a caller
 /// prints or serializes carries an escape sequence (#2916 re-review MUST 4).
-/// A body that is not this darkmux's `MachineSpecsResponse` is `Unavailable`.
+/// A body that is not this darkmux's `MachineSpecsResponse` is `Unreadable`
+/// when it names the peer's version and `Unavailable` when it does not.
 fn parse_peer_specs(body: &str) -> SpecsProbe {
     let Ok(mut v) = serde_json::from_str::<serde_json::Value>(body) else {
         return SpecsProbe::Unavailable;
     };
     fleet::sanitize_remote_json_lines(&mut v, PEER_FIELD_MAX_CHARS);
+    let raw_version = v.get("darkmux_version").and_then(serde_json::Value::as_str).map(str::to_string);
     match serde_json::from_value::<MachineSpecsResponse>(v) {
         Ok(specs) => SpecsProbe::Ok(Box::new(specs)),
-        Err(_) => SpecsProbe::Unavailable,
+        Err(_) => match raw_version {
+            Some(peer_version) => SpecsProbe::Unreadable { peer_version },
+            None => SpecsProbe::Unavailable,
+        },
     }
 }
 
@@ -2061,6 +2135,7 @@ mod tests {
             SpecsProbe::Ok(_) => panic!("expected RouteMissing, got Ok"),
             SpecsProbe::AuthRequired => panic!("expected RouteMissing, got AuthRequired"),
             SpecsProbe::Unverified => panic!("expected RouteMissing, got Unverified"),
+            SpecsProbe::Unreadable { .. } => panic!("expected RouteMissing, got Unreadable"),
         }
     }
 
@@ -2129,6 +2204,7 @@ mod tests {
             SpecsProbe::Ok(_) => panic!("expected Unavailable, got Ok"),
             SpecsProbe::AuthRequired => panic!("expected Unavailable, got AuthRequired"),
             SpecsProbe::Unverified => panic!("expected Unavailable, got Unverified"),
+            SpecsProbe::Unreadable { .. } => panic!("expected Unavailable, got Unreadable"),
         }
     }
 }
@@ -2371,6 +2447,93 @@ mod trust_tests {
         for c in &rows {
             assert!(!c.message.contains("nLAPTOP") && !c.message.contains("nGONE"), "{}", c.message);
         }
+    }
+
+    // ── machine resources <peer>: the daemon's whole response, or an honest note ──
+
+    /// A peer's `/machine/resources` body: a real ledger plus the two fields
+    /// the daemon adds to it.
+    fn peer_resources_body() -> serde_json::Value {
+        let ledger = darkmux_profiles::model_ledger::gather_with_bin("/nonexistent-lms");
+        let mut body = serde_json::to_value(ledger).unwrap();
+        body["cache_ttl_ms"] = serde_json::json!(2000);
+        body["load"] = serde_json::json!({
+            "battery_health": null,
+            "now": { "sampled_at_ms": 5, "sampler_cost_ms": 1 },
+            "window": {
+                "samples": 3, "span_ms": 4000, "interval_ms": 2000,
+                "cpu_pct": { "mean": 10.0, "p95": 20, "max": 30 },
+                "gpu_pct": { "mean": null, "p95": null, "max": null },
+                "mem_pct": { "mean": 50.0, "p95": 51, "max": 52 },
+                "power_mw": null, "thermal": null, "energy_mwh": null
+            }
+        });
+        body
+    }
+
+    #[test]
+    fn a_peers_cadence_and_load_reach_the_json_output() {
+        let out = peer_resources_view("studio", peer_resources_body(), true).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["cache_ttl_ms"], 2000, "the recorded cadence knob is dropped: {out}");
+        assert_eq!(v["load"]["window"]["samples"], 3, "the sampler's load is dropped: {out}");
+    }
+
+    #[test]
+    fn a_peer_without_a_sampler_prints_no_load_key() {
+        let mut body = peer_resources_body();
+        body.as_object_mut().unwrap().remove("load");
+        let v: serde_json::Value = serde_json::from_str(&peer_resources_view("studio", body, true).unwrap()).unwrap();
+        assert!(v.get("load").is_none());
+        assert_eq!(v["cache_ttl_ms"], 2000);
+    }
+
+    #[test]
+    fn a_newer_peers_unknown_variant_reads_as_a_note_in_text_naming_its_version() {
+        let mut body = peer_resources_body();
+        body["limit_source"] = serde_json::json!("quantum_pool");
+        body["darkmux_version"] = serde_json::json!("9.9.9");
+        let out = peer_resources_view("studio", body, false).unwrap();
+        assert!(out.contains("resources unreadable"), "{out}");
+        assert!(out.contains("schema_version 2.1") && out.contains("darkmux_version 9.9.9"), "{out}");
+        assert!(out.contains("quantum_pool"), "what could not be read is named: {out}");
+    }
+
+    #[test]
+    fn a_refusal_under_json_names_the_peer_version_and_claims_no_mismatch_it_did_not_see() {
+        let mut body = peer_resources_body();
+        body["limit_source"] = serde_json::json!("quantum_pool");
+        let err = peer_resources_view("studio", body.clone(), true).unwrap_err().to_string();
+        assert!(err.contains("schema_version 2.1") && err.contains("the schema matches"), "{err}");
+        assert!(!err.contains("differs"), "a version mismatch nobody observed is claimed: {err}");
+        body["schema_version"] = serde_json::json!("3.0");
+        let err = peer_resources_view("studio", body, true).unwrap_err().to_string();
+        assert!(err.contains("schema_version 3.0") && err.contains("reads ledger schema 2.1"), "{err}");
+    }
+
+    #[test]
+    fn a_peer_body_with_no_versions_says_so() {
+        let err = peer_resources_view("studio", serde_json::json!({"x": 1}), true).unwrap_err().to_string();
+        assert!(err.contains("reports no schema_version or darkmux_version"), "{err}");
+    }
+
+    /// A peer whose specs body names a darkmux version but does not parse
+    /// (a newer daemon that added or changed a field) is unreadable, and the
+    /// row says which version, instead of reading like a timeout.
+    #[test]
+    fn a_specs_body_this_darkmux_cannot_read_names_the_peer_version() {
+        match parse_peer_specs(r#"{"darkmux_version":"9.9.9","os":5}"#) {
+            SpecsProbe::Unreadable { peer_version } => assert_eq!(peer_version, "9.9.9"),
+            _ => panic!("a body with a version and a wrong shape must be Unreadable"),
+        }
+    }
+
+    #[test]
+    fn an_unreadable_specs_row_says_so_and_not_specs_question_mark() {
+        let mut deep = DeepSpecs::default();
+        deep.record("studio", SpecsProbe::Unreadable { peer_version: "9.9.9".into() });
+        assert_eq!(deep_cells_for("studio", &deep).0, "unreadable (peer 9.9.9)");
+        assert_eq!(deep_cells_for("other", &deep).0, "specs?", "a timeout still reads as one");
     }
 }
 

@@ -42,15 +42,26 @@ darkmux release.
   - `machine status`: every answer carries `machine_id` and `lms_unreachable`
     (`false` when LMStudio answered). It was two shapes: the unreachable one had
     both, the normal one neither.
-  - `machine status`, `machine resources` (for a roster peer): a peer that answers
-    in a shape this darkmux does not read is refused with an error naming the
-    version mismatch. It was printed as raw JSON.
-  - `machine list --deep`: a peer's `specs` is the peer's `/machine/specs`
-    document in full, or `null`; a body that is not one reads as unavailable.
+  - `machine status` (for a roster peer): a peer that answers in a shape this
+    darkmux does not read is refused with an error that names what the peer
+    reports (its `schema_version` or `darkmux_version`, when it gives one). It
+    was printed as raw JSON.
+  - `machine resources <peer>` prints the daemon's own response: the ledger plus
+    `cache_ttl_ms` and, when the peer's sampler has a reading, `load`. Head of
+    this release dropped both. A body this darkmux does not read (a newer peer's
+    unknown variant) is refused under `--json` with the peer's version named, and
+    in text mode prints a note naming it, exit 0. It was printed as raw JSON.
+  - `machine list --deep`: a peer's `specs` is the `/machine/specs` document as
+    this darkmux reads it (a field a newer peer adds is not carried), or `null`.
+    A body that names a `darkmux_version` but does not parse sets the new
+    `specs_unreadable_peer_version` to that version, and the table shows
+    `unreadable (peer <version>)`; any other body reads as unavailable.
   - `dispatch` (`--json`): the runtime's keys print in the order `result`,
     `final_assistant`, `trajectory_path`, `failed_tool_invocations`,
     `resumed_from` (they were alphabetical), and a key the runtime does not
-    define is dropped. `detections`, `bounds` and `host_window` stay untyped in
+    define is dropped. `result` and `trajectory_path` are absent when the runtime
+    did not send them (they printed as `""`). A runtime stdout that does not parse
+    as an envelope goes out as written, with one line on stderr saying why. `detections`, `bounds` and `host_window` stay untyped in
     the golden until the flow payloads they share are typed.
   **Migration:** rename the fields above in any script that reads them, and
   regenerate a golden you keep of these outputs.

@@ -18013,3 +18013,55 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         assert!(format!("{err:#}").contains("exceeds"), "{err:#}");
     }
 
+
+/// A runtime stdout with a wrongly typed field is not enriched, and the caller
+/// is told once on stderr why the document has no metrics, detections or
+/// bounds: the failure is not silent.
+#[test]
+fn an_envelope_that_does_not_parse_says_so_and_goes_out_as_written() {
+    let warnings = std::cell::RefCell::new(Vec::new());
+    let sink = |line: &str| warnings.borrow_mut().push(line.to_string());
+    let stdout = r#"{"result":5,"final_assistant":"hi"}"#;
+    assert!(super::parse_runtime_envelope(stdout, &sink).is_none());
+    let lines = warnings.borrow();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("not an envelope") && lines[0].contains("invalid type"), "{lines:?}");
+    drop(lines);
+    let out = super::enrich_envelope_with_summary(
+        stdout.to_string(),
+        "m",
+        &summary_with(vec![]),
+        &super::HostStats::default(),
+        &no_extras(),
+        no_findings_dir(),
+        serde_json::json!({}),
+        None,
+    );
+    assert_eq!(out, stdout, "an envelope this darkmux cannot read goes out unchanged");
+}
+
+/// The inverse: a well-formed envelope raises no warning.
+#[test]
+fn an_envelope_that_parses_raises_no_warning() {
+    let warnings = std::cell::RefCell::new(Vec::<String>::new());
+    let sink = |line: &str| warnings.borrow_mut().push(line.to_string());
+    assert!(super::parse_runtime_envelope(r#"{"result":"stop"}"#, &sink).is_some());
+    assert!(warnings.borrow().is_empty());
+}
+
+/// A partial envelope prints no empty string for what the runtime did not say.
+#[test]
+fn a_partial_runtime_envelope_prints_no_empty_result_or_path() {
+    let out = super::enrich_envelope_with_summary(
+        r#"{"final_assistant":"hi"}"#.to_string(),
+        "m",
+        &summary_with(vec![]),
+        &super::HostStats::default(),
+        &no_extras(),
+        no_findings_dir(),
+        serde_json::json!({}),
+        None,
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(v.get("result").is_none() && v.get("trajectory_path").is_none(), "{out}");
+}
