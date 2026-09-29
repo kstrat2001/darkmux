@@ -149,7 +149,10 @@ fn main() -> Result<()> {
 fn refuse_retired_or_exit(e: clap::Error) -> ! {
     use clap::error::ErrorKind;
     if matches!(e.kind(), ErrorKind::InvalidSubcommand | ErrorKind::UnknownArgument) {
-        let args: Vec<String> = std::env::args().skip(1).collect();
+        let args: Vec<String> = std::env::args_os()
+            .skip(1)
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
         if let Some(msg) = retired_verbs::refusal(&args) {
             eprintln!("{msg}");
             std::process::exit(2);

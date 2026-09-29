@@ -980,6 +980,23 @@ fn retired_dispatch_phase_id_equals_spelling_is_refused() {
         .stderr(predicate::str::contains("`darkmux dispatch --phase-id` was removed in 4.0"));
 }
 
+/// (#2954) A non-UTF-8 argument alongside a bad flag is clap's usage error
+/// (exit 2), never a panic (101) from decoding argv.
+#[cfg(unix)]
+#[test]
+fn a_non_utf8_argument_with_a_bad_flag_is_a_usage_error_not_a_panic() {
+    use std::os::unix::ffi::OsStrExt;
+    let bad = std::ffi::OsStr::from_bytes(b"m\xff");
+    darkmux_cmd()
+        .arg("dispatch")
+        .arg("coder")
+        .arg(bad)
+        .arg("--bogus")
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("panicked").not());
+}
+
 /// (#2954) The inverse: an unknown verb that was never darkmux's keeps clap's
 /// own error, so the refusal table never shadows a typo with a wrong remedy.
 #[test]
