@@ -1266,15 +1266,19 @@ fn lab_kind_families_carry_their_members() {
         assert!(lab.contains(family), "lab --help lists `{family}`: {lab}");
     }
 
-    // `lab run` carries the recorded-run sub-verbs AND still takes a workload.
-    let run = help(&["lab", "run"]);
-    for sub in ["list", "inspect", "compare"] {
-        assert!(run.contains(sub), "lab run --help keeps `{sub}`: {run}");
-    }
+    // `lab run` is the launcher only; the recorded-run verbs are `run`'s.
+    let lab_run = help(&["lab", "run"]);
     assert!(
-        run.to_lowercase().contains("workload"),
-        "lab run --help still names the workload positional: {run}"
+        lab_run.to_lowercase().contains("workload"),
+        "lab run --help names the workload positional: {lab_run}"
     );
+    for sub in ["inspect", "compare", "stats"] {
+        assert!(!lab_run.contains(&format!("  {sub} ")), "lab run --help has no `{sub}` sub-verb: {lab_run}");
+    }
+    let run = help(&["run"]);
+    for sub in ["list", "inspect", "stats", "compare"] {
+        assert!(run.contains(sub), "run --help carries `{sub}`: {run}");
+    }
 
     let workload = help(&["lab", "workload"]);
     assert!(workload.contains("list"), "lab workload --help has `list`: {workload}");
@@ -2243,9 +2247,9 @@ fn lab_run_quick_q_from_clean_cwd_uses_embedded_workload() {
     .assert()
     .success();
 
-    // The run dir should exist under .darkmux/runs/<id>/ in the tempdir,
+    // The run dir should exist under .darkmux/lab/<id>/ in the tempdir,
     // and contain a v2 manifest with the right run_id.
-    let runs_dir = tmp.path().join(".darkmux").join("runs");
+    let runs_dir = tmp.path().join(".darkmux").join("lab");
     assert!(
         runs_dir.is_dir(),
         "expected {} to exist",
@@ -5144,7 +5148,7 @@ fn lab_run_sigterm_mid_dispatch_finalizes_lifecycle_and_reaps_curl() {
 
     assert_no_surviving_remote_curl(child.id(), "lab-run");
 
-    let runs_dir = home.path().join("runs");
+    let runs_dir = home.path().join("lab");
     let run_id = fs::read_dir(&runs_dir)
         .unwrap_or_else(|e| panic!("reading {}: {e}", runs_dir.display()))
         .filter_map(|e| e.ok())
@@ -12010,7 +12014,7 @@ fn stats_cmd(flows: &std::path::Path) -> Command {
 fn lab_run_stats_one_run_prints_the_single_run_view() {
     let tmp = tempfile::TempDir::new().unwrap();
     let a = stats_run_dir(tmp.path(), "run-a");
-    let out = stats_cmd(tmp.path()).args(["lab", "run", "stats"]).arg(&a).assert().success();
+    let out = stats_cmd(tmp.path()).args(["run", "stats"]).arg(&a).assert().success();
     let text = String::from_utf8_lossy(&out.get_output().stdout).to_string();
     assert!(text.contains("stream gate") && text.contains("100 tok/s"), "{text}");
     assert!(!text.contains("cost per successful run"), "one run is not a set: {text}");
@@ -12020,7 +12024,7 @@ fn lab_run_stats_one_run_prints_the_single_run_view() {
 fn lab_run_stats_one_run_json_is_the_run_record() {
     let tmp = tempfile::TempDir::new().unwrap();
     let a = stats_run_dir(tmp.path(), "run-a");
-    let out = stats_cmd(tmp.path()).args(["lab", "run", "stats", "--json"]).arg(&a).assert().success();
+    let out = stats_cmd(tmp.path()).args(["run", "stats", "--json"]).arg(&a).assert().success();
     let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
     assert_eq!(v["run"], "run-a");
     assert_eq!(v["tok_per_s"], 100.0);
@@ -12031,7 +12035,7 @@ fn lab_run_stats_several_runs_print_the_set_view() {
     let tmp = tempfile::TempDir::new().unwrap();
     let a = stats_run_dir(tmp.path(), "run-a");
     let b = stats_run_dir(tmp.path(), "run-b");
-    let out = stats_cmd(tmp.path()).args(["lab", "run", "stats"]).arg(&a).arg(&b).assert().success();
+    let out = stats_cmd(tmp.path()).args(["run", "stats"]).arg(&a).arg(&b).assert().success();
     let text = String::from_utf8_lossy(&out.get_output().stdout).to_string();
     assert!(text.contains("cost per successful run") && text.contains("run-b"), "{text}");
 }
@@ -12042,7 +12046,7 @@ fn lab_run_stats_one_run_with_a_baseline_prints_the_comparison() {
     let a = stats_run_dir(tmp.path(), "run-a");
     let b = stats_run_dir(tmp.path(), "run-b");
     let out = stats_cmd(tmp.path())
-        .args(["lab", "run", "stats"])
+        .args(["run", "stats"])
         .arg(&a)
         .arg("--baseline")
         .arg(&b)
@@ -12052,6 +12056,144 @@ fn lab_run_stats_one_run_with_a_baseline_prints_the_comparison() {
     assert!(text.contains("candidate") && text.contains("moved"), "{text}");
 }
 
+/// (4.0) `--json` is a contract and the verb MOVED (`lab run stats` -> `run
+/// stats`): the whole document is pinned, not two fields of it. The goldens
+/// were captured from the moved code, which is the pre-move handler verbatim.
+#[test]
+fn run_stats_json_shapes_are_pinned_by_golden() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let a = stats_run_dir(tmp.path(), "run-a");
+    let b = stats_run_dir(tmp.path(), "run-b");
+    let json = |args: &[&std::path::Path], baseline: Option<&std::path::Path>| -> serde_json::Value {
+        let mut c = stats_cmd(tmp.path());
+        c.args(["run", "stats", "--json"]).args(args);
+        if let Some(bl) = baseline {
+            c.arg("--baseline").arg(bl);
+        }
+        serde_json::from_slice(&c.assert().success().get_output().stdout).unwrap()
+    };
+    let golden = |g: &str| -> serde_json::Value { serde_json::from_str(g).unwrap() };
+    assert_eq!(json(&[&a], None), golden(include_str!("fixtures/run-stats-single.golden.json")));
+    assert_eq!(json(&[&a, &b], Some(&b)), golden(include_str!("fixtures/run-stats-set.golden.json")));
+}
+
+/// (4.0) The retired `lab run list|inspect|stats|compare` spellings fail
+/// naming their replacement, and never run (no alias).
+#[test]
+fn retired_lab_run_verbs_fail_naming_the_replacement() {
+    for (args, want) in [
+        (&["lab", "run", "list"][..], "darkmux run list --kind lab"),
+        (&["lab", "run", "inspect", "some-run"][..], "darkmux run inspect <run>"),
+        (&["lab", "run", "stats", "some-run"][..], "darkmux run stats <run>..."),
+        (&["lab", "run", "compare", "a", "b"][..], "darkmux run compare <a> <b>"),
+    ] {
+        darkmux_cmd()
+            .args(args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("was removed in 4.0").and(predicate::str::contains(want)));
+    }
+}
+
+/// (4.0) Lab runs moved from `<root>/runs` to `<root>/lab`. darkmux never
+/// moves them itself: every verb that reads or writes lab runs refuses,
+/// naming the `mv`, until the operator has run it; then the runs read.
+#[test]
+fn pre_4_0_lab_runs_dir_refuses_every_lab_verb_naming_the_mv_until_moved() {
+    let home = tempfile::TempDir::new().unwrap();
+    let old = home.path().join("runs");
+    let new = home.path().join("lab");
+    stats_run_dir(&old, "run-a");
+    let want = format!("mv {} {}", old.display(), new.display());
+    let cmd = || {
+        let mut c = darkmux_cmd();
+        c.env("DARKMUX_HOME", home.path()).env("DARKMUX_FLOWS_DIR", home.path().join("flows"));
+        c
+    };
+    for args in [
+        &["lab", "run", "quick-q"][..],
+        &["run", "list", "--kind", "lab"][..],
+        &["run", "inspect", "run-a"][..],
+        &["run", "stats", "run-a"][..],
+        &["run", "compare", "run-a", "run-a"][..],
+    ] {
+        cmd().args(args).assert().failure().stderr(predicate::str::contains(&want));
+    }
+    // The all-kinds list does not refuse: it says so and carries on.
+    cmd().args(["run", "list"]).assert().success().stderr(predicate::str::contains(&want));
+    assert!(!new.exists(), "darkmux never moves the data itself");
+
+    fs::rename(&old, &new).unwrap();
+    cmd().args(["run", "stats", "run-a"]).assert().success();
+    cmd().args(["run", "list", "--kind", "lab"]).assert().success();
+}
+
+/// A lab run dir the scanner recognizes: a lifecycle record (the marker) and a
+/// manifest carrying the given `verify`.
+fn lab_run_with_manifest(dir: &std::path::Path, workload: &str, verify: serde_json::Value) {
+    fs::create_dir_all(dir).unwrap();
+    let id = dir.file_name().unwrap().to_string_lossy().to_string();
+    let lifecycle = serde_json::json!({
+        "schema_version": "1.1", "run_id": id, "kind": "lab", "workload": workload,
+        "profile": "default", "started_at_ms": 1_700_000_000_000u64, "status": "complete",
+    });
+    fs::write(dir.join("lifecycle.json"), lifecycle.to_string()).unwrap();
+    let manifest = serde_json::json!({
+        "schema_version": 5, "run_id": id, "workload": workload, "ok": true, "verify": verify,
+    });
+    fs::write(dir.join("manifest.json"), manifest.to_string()).unwrap();
+}
+
+/// (4.0) An EMPTY `lab/` beside a full `runs/` is a pending move, not a
+/// split: it used to skip the refusal and print "no recorded lab runs yet"
+/// with exit 0, hiding every old run. The command it prints removes the empty
+/// dir first, since a plain `mv` would nest the runs as `lab/runs`.
+#[test]
+fn an_empty_lab_dir_beside_a_full_runs_dir_still_refuses_and_the_printed_command_works() {
+    let home = tempfile::TempDir::new().unwrap();
+    let (old, new) = (home.path().join("runs"), home.path().join("lab"));
+    lab_run_with_manifest(&old.join("quick-q-1"), "quick-q", serde_json::Value::Null);
+    fs::create_dir_all(&new).unwrap();
+    let cmd = || {
+        let mut c = darkmux_cmd();
+        c.env("DARKMUX_HOME", home.path()).env("DARKMUX_FLOWS_DIR", home.path().join("flows"));
+        c
+    };
+    let want = format!("rmdir {} && mv {} {}", new.display(), old.display(), new.display());
+    cmd().args(["run", "list", "--kind", "lab"]).assert().failure().stderr(predicate::str::contains(&want));
+
+    let ran = std::process::Command::new("sh").arg("-c").arg(&want).status().unwrap();
+    assert!(ran.success());
+    assert!(new.join("quick-q-1").is_dir(), "the runs land at lab/<id>, not lab/runs/<id>");
+    cmd().args(["run", "list", "--kind", "lab"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("quick-q-1"));
+}
+
+/// (#2494) The verify outcome is visible in `run list` itself: a run that
+/// dispatched fine and failed its tests must not read as a clean one.
+#[test]
+fn run_list_shows_a_failed_verify_beside_a_good_dispatch() {
+    let home = tempfile::TempDir::new().unwrap();
+    let lab = home.path().join("lab");
+    let failed = serde_json::json!({"passed": false, "details": "2 tests failed"});
+    lab_run_with_manifest(&lab.join("quick-coding-1"), "quick-coding", failed);
+    lab_run_with_manifest(&lab.join("quick-q-1"), "quick-q", serde_json::Value::Null);
+    let out = darkmux_cmd()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", home.path().join("flows"))
+        .args(["run", "list", "--kind", "lab"])
+        .assert()
+        .success();
+    let text = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    let line = |id: &str| text.lines().find(|l| l.contains(id)).unwrap_or_else(|| panic!("{id} listed: {text}")).to_string();
+    assert!(line("quick-coding-1").contains("verify FAIL"), "{text}");
+    assert!(line("quick-coding-1").contains("complete"), "status stays the dispatch result: {text}");
+    assert!(line("quick-q-1").contains("verify \u{2014}"), "not checked is not a pass: {text}");
+    assert!(!line("quick-q-1").contains("FAIL"), "{text}");
+}
+
 /// A set with a run that cannot be read fails, so a script cannot mistake a
 /// partial set for a whole one.
 #[test]
@@ -12059,7 +12201,7 @@ fn lab_run_stats_a_set_with_an_unreadable_run_exits_1() {
     let tmp = tempfile::TempDir::new().unwrap();
     let a = stats_run_dir(tmp.path(), "run-a");
     stats_cmd(tmp.path())
-        .args(["lab", "run", "stats"])
+        .args(["run", "stats"])
         .arg(&a)
         .arg(tmp.path().join("no-such-run"))
         .assert()
@@ -12411,7 +12553,7 @@ impl LabStub {
     }
 
     fn run_ids(&self) -> Vec<String> {
-        let mut ids: Vec<String> = fs::read_dir(self.home.path().join("runs"))
+        let mut ids: Vec<String> = fs::read_dir(self.home.path().join("lab"))
             .map(|rd| {
                 rd.filter_map(|e| e.ok())
                     .map(|e| e.file_name().to_string_lossy().to_string())
@@ -12680,13 +12822,14 @@ fn lab_run_dispatch_summary_and_exit_code() {
     assert_eq!(out.status.code(), Some(1), "a failed verify exits 1: {stderr}");
     assert!(!stdout.contains("run(s) complete"), "{stdout}");
 
-    lab.cmd().args(["lab", "run"]).assert().failure().stderr(predicate::str::contains(
-        "specify a workload to dispatch (`lab run <workload>`) or a run sub-verb \
-         (`lab run list` / `lab run inspect <id>` / `lab run compare <a> <b>`)",
-    ));
+    lab.cmd()
+        .args(["lab", "run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("required arguments were not provided").and(predicate::str::contains("<WORKLOAD>")));
 }
 
-/// `lab run inspect`/`list`/`compare` over runs this test recorded.
+/// `run inspect`/`list`/`compare` over runs this test recorded.
 #[test]
 fn lab_run_inspect_list_and_compare_render_recorded_runs() {
     let lab = LabStub::new(&RespondingStubServer::start());
@@ -12706,7 +12849,7 @@ fn lab_run_inspect_list_and_compare_render_recorded_runs() {
         ("labchar-fail", "verify:      FAILED — "),
     ] {
         let id = id_of(w);
-        let out = lab.cmd().args(["lab", "run", "inspect", &id]).output().unwrap();
+        let out = lab.cmd().args(["run", "inspect", &id]).output().unwrap();
         let (stdout, stderr) = out_text(&out);
         assert_eq!(out.status.code(), Some(0), "{stderr}");
         let head = format!("run:         {id}\nworkload:    {w}\nwall:        ");
@@ -12719,26 +12862,26 @@ fn lab_run_inspect_list_and_compare_render_recorded_runs() {
         assert!(stdout.contains("\nnotes:\n  - "), "{stdout}");
         assert!(!stdout.contains("compaction summaries"), "{stdout}");
     }
-    let out = lab.cmd().args(["lab", "run", "inspect", &id_of("labchar"), "--summary"]).output().unwrap();
+    let out = lab.cmd().args(["run", "inspect", &id_of("labchar"), "--summary"]).output().unwrap();
     let (stdout, _) = out_text(&out);
     assert!(
         stdout.ends_with("\n\ncompaction summaries: (none — no trajectory.jsonl recorded)\n"),
         "{stdout}"
     );
-    lab.cmd().args(["lab", "run", "inspect", "no-such-run"]).assert().failure();
+    lab.cmd().args(["run", "inspect", "no-such-run"]).assert().failure();
 
-    let out = lab.cmd().args(["lab", "run", "list", "--all"]).output().unwrap();
+    let out = lab.cmd().args(["run", "list", "--kind", "lab", "--all"]).output().unwrap();
     let (stdout, _) = out_text(&out);
     for id in &ids {
         assert!(stdout.contains(id.as_str()), "{stdout}");
     }
-    let out = lab.cmd().args(["lab", "run", "list", "-l", "1"]).output().unwrap();
+    let out = lab.cmd().args(["run", "list", "--kind", "lab", "--limit", "1"]).output().unwrap();
     let (stdout, _) = out_text(&out);
     assert_eq!(ids.iter().filter(|i| stdout.contains(i.as_str())).count(), 1, "{stdout}");
 
     let out = lab
         .cmd()
-        .args(["lab", "run", "compare", &id_of("labchar-pass"), &id_of("labchar-fail")])
+        .args(["run", "compare", &id_of("labchar-pass"), &id_of("labchar-fail")])
         .output()
         .unwrap();
     let (stdout, stderr) = out_text(&out);
@@ -12766,7 +12909,7 @@ fn lab_run_inspect_shows_an_errored_runs_error() {
     assert_eq!(out.status.code(), Some(1), "{stdout} / {stderr}");
     let id = lab.run_ids().pop().unwrap();
     assert!(stderr.contains(&format!("[lab] run {id} failed: unknown workload provider")), "{stderr}");
-    let out = lab.cmd().args(["lab", "run", "inspect", &id]).output().unwrap();
+    let out = lab.cmd().args(["run", "inspect", &id]).output().unwrap();
     let (stdout, stderr) = out_text(&out);
     assert_eq!(out.status.code(), Some(0), "{stderr}");
     assert!(stdout.contains("verify:      not checked\n"), "{stdout}");
@@ -12976,7 +13119,7 @@ fn assert_lab_verb_sigterm_finalizes_interrupted(verb_args: &[&str], label: &str
     );
     assert_no_surviving_remote_curl(pid, label);
 
-    let runs_dir = home.path().join("runs");
+    let runs_dir = home.path().join("lab");
     let run_id = fs::read_dir(&runs_dir)
         .unwrap_or_else(|e| panic!("{label}: reading {}: {e}", runs_dir.display()))
         .filter_map(|e| e.ok())

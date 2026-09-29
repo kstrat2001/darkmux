@@ -1,13 +1,12 @@
-//! Verbs darkmux removed, each with the line that names its replacement.
-//!
-//! A removed verb is not an alias and does not parse: clap rejects it as an
-//! unknown subcommand or argument. When it does, [`refusal`] looks the
-//! command line up here, so the operator reads what replaced the verb
-//! instead of a bare "unrecognized subcommand". It is consulted ONLY after
-//! clap has rejected the command line, so an entry can never shadow a verb
-//! that still exists.
+//! Verb spellings darkmux retired, each with the line that names its
+//! replacement. This is the ONE table of them: no aliases, the retired
+//! spelling never runs. [`refusal`] runs on the raw command line BEFORE clap,
+//! because a retired spelling can still parse (`lab run list` reads as the
+//! launcher for a workload named `list`), so clap's own rejection cannot be
+//! the trigger. An entry must therefore name a spelling that has no live
+//! meaning.
 
-/// One removed spelling: the leading words of the command line, and the flag
+/// One retired spelling: the leading words of the command line, and the flag
 /// that is the retired part when the verb itself survives.
 struct RetiredVerb {
     words: &'static [&'static str],
@@ -15,7 +14,43 @@ struct RetiredVerb {
     remedy: &'static str,
 }
 
+/// The remedy for a retired `lab run <verb>` read spelling: where the read
+/// went, and how a workload that shares the verb's name still launches.
+macro_rules! run_read_remedy {
+    ($verb:literal, $use:literal) => {
+        concat!(
+            "Recorded runs are read through `darkmux run`. Use `",
+            $use,
+            "`. `darkmux lab run <workload>` still launches a lab run; for a workload named `",
+            $verb,
+            "`, use `darkmux lab run -- ",
+            $verb,
+            "`."
+        )
+    };
+}
+
 const RETIRED: &[RetiredVerb] = &[
+    RetiredVerb {
+        words: &["lab", "run", "list"],
+        flag: None,
+        remedy: run_read_remedy!("list", "darkmux run list --kind lab"),
+    },
+    RetiredVerb {
+        words: &["lab", "run", "inspect"],
+        flag: None,
+        remedy: run_read_remedy!("inspect", "darkmux run inspect <run>"),
+    },
+    RetiredVerb {
+        words: &["lab", "run", "stats"],
+        flag: None,
+        remedy: run_read_remedy!("stats", "darkmux run stats <run>..."),
+    },
+    RetiredVerb {
+        words: &["lab", "run", "compare"],
+        flag: None,
+        remedy: run_read_remedy!("compare", "darkmux run compare <a> <b>"),
+    },
     RetiredVerb {
         words: &["mission", "dispatch"],
         flag: None,
@@ -83,11 +118,12 @@ impl RetiredVerb {
 }
 
 /// The refusal for a command line (`args` without the program name) that
-/// names a removed verb, or `None` when it names none.
+/// names a retired spelling, or `None` when it names none.
 pub(crate) fn refusal(args: &[String]) -> Option<String> {
-    RETIRED.iter().find(|r| r.matches(args)).map(|r| {
-        format!("error: `{}` was removed in 4.0 (#2954). {}", r.spelling(), r.remedy)
-    })
+    RETIRED
+        .iter()
+        .find(|r| r.matches(args))
+        .map(|r| format!("`{}` was removed in 4.0. {}", r.spelling(), r.remedy))
 }
 
 #[cfg(test)]
@@ -130,11 +166,44 @@ mod tests {
         for a in [
             args(&["dispatch", "coder", "m", "--bogus"]),
             args(&["mission", "frobnicate"]),
+            args(&["lab", "run", "quick-q"]),
+            args(&["lab", "run"]),
+            args(&["run", "inspect", "x"]),
+            // The `--` escape still reaches the launcher, for a workload named `list`.
+            args(&["lab", "run", "--", "list"]),
             args(&["mission"]),
             args(&["missions", "dispatch"]),
             args(&[]),
         ] {
             assert!(refusal(&a).is_none(), "{a:?}");
+        }
+    }
+
+    #[test]
+    fn a_retired_run_read_spelling_names_its_replacement_and_the_escape() {
+        for (verb, want) in [
+            ("list", "darkmux run list --kind lab"),
+            ("inspect", "darkmux run inspect <run>"),
+            ("stats", "darkmux run stats <run>..."),
+            ("compare", "darkmux run compare <a> <b>"),
+        ] {
+            let msg = refusal(&args(&["lab", "run", verb])).unwrap();
+            assert!(msg.contains(&format!("`darkmux lab run {verb}` was removed")), "{msg}");
+            assert!(msg.contains(want), "{msg}");
+            assert!(msg.contains(&format!("darkmux lab run -- {verb}")), "{msg}");
+        }
+    }
+
+    /// The escape the refusal names really reaches the launcher: clap reads
+    /// the word after `--` as the workload, not as a retired verb.
+    #[test]
+    fn the_escape_the_refusal_names_parses_as_the_launcher() {
+        use clap::Parser;
+        let argv = ["darkmux", "lab", "run", "--", "list"];
+        let cli = crate::cli::Cli::try_parse_from(argv).ok().unwrap();
+        match cli.command {
+            crate::cli::Cmd::Lab { sub: crate::cli::LabCmd::Run { workload, .. } } => assert_eq!(workload, "list"),
+            _ => panic!("`lab run -- list` did not parse as the launcher"),
         }
     }
 }

@@ -7,21 +7,36 @@ mod lab_loop;
 
 use anyhow::Result;
 
-use crate::cli::{FixtureCmd, LabCmd, ProfilesFileArg, RunCmd, WorkloadCmd};
+use crate::cli::{FixtureCmd, LabCmd, ProfilesFileArg, WorkloadCmd};
 use crate::lab;
-use crate::workloads;
+
+/// Whether a lab verb reads or writes run records under the lab dir, and so
+/// must not run while the pre-4.0 runs are still un-moved. The workload
+/// catalog, the fixture registry and `lab doctor` (a fixture health check)
+/// never touch it.
+fn touches_lab_dir(sub: &LabCmd) -> bool {
+    match sub {
+        LabCmd::Workload { .. } | LabCmd::Fixture { .. } | LabCmd::Doctor => false,
+        LabCmd::Run { .. }
+        | LabCmd::Eval { .. }
+        | LabCmd::Loop { .. }
+        | LabCmd::Characterize { .. }
+        | LabCmd::Tune { .. } => true,
+    }
+}
 
 pub(crate) fn cmd_lab(sub: LabCmd) -> Result<i32> {
+    if touches_lab_dir(&sub) {
+        darkmux_types::config_access::require_current_lab_dir()?;
+    }
     match sub {
         LabCmd::Workload { sub } => cmd_lab_workload(sub),
-        LabCmd::Run { sub: Some(run_sub), .. } => cmd_lab_run_sub(run_sub),
         LabCmd::Run {
             workload,
             profile,
             runs,
             profiles: ProfilesFileArg { profiles },
             quiet,
-            sub: None,
         } => cmd_lab_run_dispatch(workload, profile, runs, profiles, quiet),
         LabCmd::Eval {
             role,
@@ -145,26 +160,18 @@ fn cmd_lab_workload(sub: WorkloadCmd) -> Result<i32> {
     }
 }
 
-/// (#1465) `lab run <workload>`: dispatch a workload `runs` times. `lab run`
-/// takes EITHER this positional OR a run sub-verb (`cmd_lab_run_sub`);
-/// `args_conflicts_with_subcommands` keeps the two forms from mixing.
+/// `lab run <workload>`: dispatch a workload `runs` times. The launcher only;
+/// reading recorded runs is `darkmux run`.
 fn cmd_lab_run_dispatch(
-    workload: Option<String>,
+    workload: String,
     profile: Option<String>,
     runs: u32,
     profiles: Option<String>,
     quiet: bool,
 ) -> Result<i32> {
-    let workload_id = workload.ok_or_else(|| {
-        anyhow::anyhow!(
-            "specify a workload to dispatch (`lab run <workload>`) or a run \
-             sub-verb (`lab run list` / `lab run inspect <id>` / \
-             `lab run compare <a> <b>`)"
-        )
-    })?;
     let outcomes = signal_aware(|| {
         lab::run::lab_run(lab::run::RunOpts {
-            workload_id,
+            workload_id: workload,
             profile_name: profile,
             runs,
             config_path: profiles,
@@ -257,133 +264,42 @@ fn cmd_lab_doctor() -> Result<i32> {
     Ok(if report.has_warnings() { 1 } else { 0 })
 }
 
-/// (#1465) The `lab run` sub-verbs: list, inspect, stats and compare
-/// recorded runs.
-fn cmd_lab_run_sub(sub: RunCmd) -> Result<i32> {
-    match sub {
-        RunCmd::List { limit, all } => {
-            let summaries = lab::list::list_runs((!all).then_some(limit))?;
-            print!(
-                "{}",
-                lab::list::format_table(&summaries, &darkmux_types::config_access::lab_dir())
-            );
-            Ok(0)
-        }
-        RunCmd::Inspect { run, summary } => cmd_lab_run_inspect(&run, summary),
-        RunCmd::Stats { runs, baseline, json } => cmd_lab_run_stats(&runs, &baseline, json.json),
-        RunCmd::Compare { run_a, run_b } => {
-            let result = lab::compare::lab_compare(&run_a, &run_b)?;
-            for n in &result.notes {
-                println!("{n}");
-            }
-            Ok(0)
-        }
-    }
-}
-
-/// `lab run inspect <run> [--summary]`.
-fn cmd_lab_run_inspect(run: &str, summary: bool) -> Result<i32> {
-    let report = lab::inspect::lab_inspect(run)?;
-    print_inspection(&report);
-    if summary {
-        let run_dir = lab::inspect::resolve_run_path(run);
-        print_compaction_summaries(&lab::inspect::read_compaction_summaries(&run_dir));
-    }
-    Ok(0)
-}
-
-fn print_inspection(report: &workloads::types::InspectionReport) {
-    println!("run:         {}", report.run_id);
-    println!("workload:    {}", report.workload_id);
-    println!("wall:        {}s", report.walltime_ms / 1000);
-    // (#2094 finding 7) Shown next to wall so a rested run's wall clock is
-    // never misread as a slow model. Milliseconds, because a seconds display
-    // can round a real rest down to "0s". `0` means the run predates the
-    // field or took no rests.
-    if report.rest_ms > 0 {
-        println!("rest:        {}ms", report.rest_ms);
-    }
-    println!("turns:       {}", report.turns);
-    println!("compactions: {}", report.compactions);
-    println!("verify:      {}", verify_line(report.verify.as_ref()));
-    if !report.tokens_before.is_empty() {
-        let listed: Vec<String> = report.tokens_before.iter().map(|n| n.to_string()).collect();
-        println!("tokensBefore: {}", listed.join(", "));
-    }
-    if let Some(m) = report.mode {
-        println!(
-            "mode:        {}",
-            match m {
-                workloads::types::RunMode::Fast => "fast",
-                workloads::types::RunMode::Slow => "slow",
-            }
-        );
-    }
-    println!("notes:");
-    for n in &report.notes {
-        println!("  - {n}");
-    }
-}
-
-/// (#2494) The workload's OWN result, distinct from the dispatch path's `ok`.
-/// "not checked" is said in words: an omitted line would read as a pass.
-fn verify_line(verify: Option<&workloads::types::VerifyReport>) -> String {
-    match verify {
-        Some(v) if v.passed => "ok".to_string(),
-        Some(v) if v.details.is_empty() => "FAILED".to_string(),
-        Some(v) => format!("FAILED — {}", v.details),
-        None => "not checked".to_string(),
-    }
-}
-
-fn print_compaction_summaries(summaries: &[darkmux_trajectory::legacy::LegacyCompaction]) {
-    println!();
-    if summaries.is_empty() {
-        println!("compaction summaries: (none — no trajectory.jsonl recorded)");
-        return;
-    }
-    println!("compaction summaries: {}", summaries.len());
-    for (i, s) in summaries.iter().enumerate() {
-        println!();
-        println!(
-            "─── summary {} of {} (turn {}, tokensBefore={}, {} chars) ───",
-            i + 1,
-            summaries.len(),
-            s.turn,
-            s.tokens_before,
-            s.summary_chars()
-        );
-        println!("{}", s.summary);
-    }
-}
-
-/// (#2855) `lab run stats`: one run alone prints the single-run view; a set,
-/// or one run with a baseline, prints the set view.
-fn cmd_lab_run_stats(runs: &[String], baseline: &[String], json: bool) -> Result<i32> {
-    use lab::stats_render as render;
-    if runs.len() == 1 && baseline.is_empty() {
-        let s = lab::stats::run_stats(&runs[0])?;
-        if json {
-            println!("{}", serde_json::to_string_pretty(&s)?);
-        } else {
-            print!("{}", render::run_text(&s));
-        }
-        return Ok(0);
-    }
-    let cand = render::load_set(runs);
-    let base = (!baseline.is_empty()).then(|| render::load_set(baseline));
-    if json {
-        println!("{}", serde_json::to_string_pretty(&render::sets_json(&cand, base.as_ref()))?);
-    } else {
-        print!("{}", render::sets_text(&cand, base.as_ref()));
-    }
-    Ok(render::exit_code(&cand, base.as_ref()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use lab::review_bench::BenchMode;
+
+    /// `lab doctor` is the fixture-registry health check and never touches
+    /// the lab dir, so a pending move must not make it refuse.
+    #[serial_test::serial]
+    #[test]
+    fn lab_doctor_runs_while_a_lab_dir_move_is_pending() {
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join("runs").join("quick-q-1")).unwrap();
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
+        let pending = darkmux_types::config_access::require_current_lab_dir();
+        let doctor = cmd_lab(LabCmd::Doctor);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+        assert!(pending.is_err(), "premise: the move is pending in the scratch home");
+        assert!(doctor.is_ok(), "lab doctor must not be gated: {:?}", doctor.err());
+    }
+
+    #[test]
+    fn only_verbs_that_read_or_write_run_records_are_gated_on_the_lab_dir() {
+        let characterize = LabCmd::Characterize {
+            workload: "quick-q".into(),
+            profile: None,
+            profiles: ProfilesFileArg { profiles: None },
+        };
+        assert!(touches_lab_dir(&characterize), "a dispatching verb writes run records");
+        assert!(!touches_lab_dir(&LabCmd::Doctor), "fixture health check never touches the lab dir");
+    }
 
     #[test]
     fn bench_mode_picks_the_most_specific_condition_flag() {
@@ -393,15 +309,5 @@ mod tests {
         assert_eq!(bench_mode(false, false, true), BenchMode::Dialectic);
         assert_eq!(bench_mode(true, true, false), BenchMode::Agentic);
         assert_eq!(bench_mode(true, true, true), BenchMode::Dialectic);
-    }
-
-    #[test]
-    fn verify_line_says_not_checked_rather_than_omitting_it() {
-        use workloads::types::VerifyReport;
-        let v = |passed, details: &str| VerifyReport { passed, details: details.to_string() };
-        assert_eq!(verify_line(None), "not checked");
-        assert_eq!(verify_line(Some(&v(true, "whatever"))), "ok");
-        assert_eq!(verify_line(Some(&v(false, ""))), "FAILED");
-        assert_eq!(verify_line(Some(&v(false, "missing ack"))), "FAILED — missing ack");
     }
 }

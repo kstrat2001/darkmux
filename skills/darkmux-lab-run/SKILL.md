@@ -1,6 +1,6 @@
 ---
 name: darkmux-lab-run
-description: Execute a darkmux lab workload (one or more dispatches) to characterize how the current stack performs on a defined task. Use this when you want empirical data about a config — wall clock, turns, compaction events, fast/slow mode classification — rather than guessing. Captures full run artifacts to .darkmux/runs/<id>/.
+description: Execute a darkmux lab workload (one or more dispatches) to characterize how the current stack performs on a defined task. Use this when you want empirical data about a config — wall clock, turns, compaction events, fast/slow mode classification — rather than guessing. Captures full run artifacts to .darkmux/lab/<id>/.
 user_invocable: true
 allowed-tools: "Bash(darkmux:*)"
 ---
@@ -41,7 +41,7 @@ Total wall depends on the workload — single-turn `prompt` workloads land in se
 ## Step 4 — Report
 
 For each run, report:
-- Run ID (use this for follow-up `darkmux lab run inspect` calls)
+- Run ID (use this for follow-up `darkmux run inspect` calls)
 - Wall clock
 - ok / error
 - Verify outcome (pass/fail + details)
@@ -63,6 +63,6 @@ Each run gets its own copy-on-write clone of the source fixture — the source d
 
 ## Notes
 
-- Run artifacts live under `.darkmux/runs/<run-id>/` (project-local) or `~/.darkmux/runs/<run-id>/` (user-global), depending on whether the cwd has a `.darkmux/` dir. This is OUTPUT placement only — it's independent of (#2590) which workload document resolves: a user-defined workload id always resolves from `~/.darkmux/workloads/` (home, never the cwd), regardless of where this run's artifacts land.
+- Run artifacts live under `.darkmux/lab/<run-id>/` (project-local) or `~/.darkmux/lab/<run-id>/` (user-global), depending on whether the cwd has a `.darkmux/` dir. This is OUTPUT placement only — it's independent of (#2590) which workload document resolves: a user-defined workload id always resolves from `~/.darkmux/workloads/` (home, never the cwd), regardless of where this run's artifacts land.
 - A failing verify or non-zero exit code from the runtime is reported as an error — surface it instead of silently passing through.
 - Don't kick off many runs without confirming with the user — long-task workloads can saturate the machine for 30+ minutes.

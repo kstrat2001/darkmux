@@ -11,8 +11,6 @@ use clap::Parser;
 // handlers already reference by bare name keeps resolving unchanged.
 mod cli;
 use cli::*;
-// (#2954) Removed verbs, refused with the line naming their replacement.
-mod retired_verbs;
 
 // SPIKE (#1388) — `darkmux acp`. See src/acp.rs module docs.
 mod acp;
@@ -65,7 +63,9 @@ mod lab_cli;
 mod config_cmd;
 mod conventions;
 mod mission_status;
+mod retired_verbs;
 mod run_list;
+mod run_records;
 mod mission_config_cli;
 mod coder_phase;
 // (#2112) Power-posture pre-flight — battery/Low-Power-Mode warnings + the
@@ -135,30 +135,14 @@ pub(crate) fn test_run() -> darkmux_types::session_id::RunId {
 
 fn main() -> Result<()> {
     providers::register_builtins()?;
-    let cli = match Cli::try_parse() {
-        Ok(cli) => cli,
-        Err(e) => refuse_retired_or_exit(e),
-    };
+    let argv: Vec<String> = std::env::args().collect();
+    if let Some(refusal) = retired_verbs::refusal(argv.get(1..).unwrap_or_default()) {
+        eprintln!("error: {refusal}");
+        std::process::exit(2);
+    }
+    let cli = Cli::parse_from(argv);
     let code = run(cli.command)?;
     std::process::exit(code);
-}
-
-/// clap rejected the command line. When it names a verb darkmux removed,
-/// say what replaced it (exit 2, clap's usage-error code); otherwise clap's
-/// own error, unchanged.
-fn refuse_retired_or_exit(e: clap::Error) -> ! {
-    use clap::error::ErrorKind;
-    if matches!(e.kind(), ErrorKind::InvalidSubcommand | ErrorKind::UnknownArgument) {
-        let args: Vec<String> = std::env::args_os()
-            .skip(1)
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        if let Some(msg) = retired_verbs::refusal(&args) {
-            eprintln!("{msg}");
-            std::process::exit(2);
-        }
-    }
-    e.exit()
 }
 
 fn run(cmd: Cmd) -> Result<i32> {
@@ -216,11 +200,7 @@ fn run(cmd: Cmd) -> Result<i32> {
         Cmd::Finding { sub } => cmd_finding(sub),
         Cmd::Mod { sub } => cmd_mod(sub),
         Cmd::Mission { sub } => cmd_mission(sub),
-        Cmd::Run { sub } => match sub {
-            cli::RunFamilyCmd::List { kind, limit, all, usage, since, json } => {
-                run_list::run(kind, limit, all, json.json, usage, since.as_deref())
-            }
-        },
+        Cmd::Run { sub } => run_records::cmd_run(sub),
         Cmd::Flow { sub } => {
             flow_cli::run(sub)?;
             Ok(0)
@@ -247,7 +227,7 @@ fn run(cmd: Cmd) -> Result<i32> {
             let (port, bind) = serve::resolve_listen_addr(port, bind);
             let flows_dir = flows_dir.unwrap_or_else(crate::flow::flows_dir);
             // (#1585) `--lab-dir` > `DARKMUX_LAB_DIR` > `config.dirs.lab` >
-            // `~/.darkmux/runs`. The flag still wins; the tiers beneath it are
+            // `~/.darkmux/lab`. The flag still wins; the tiers beneath it are
             // new, and `Some(...)` is now unconditional.
             //
             // This REPLACES #1247's opt-in ("no config tier and no built-in

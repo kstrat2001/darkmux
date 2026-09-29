@@ -415,7 +415,7 @@ impl WorkloadProvider for CodingTaskProvider {
             // question from whether the workload's own verify command
             // passed — a run can dispatch cleanly and still fail verify.
             // Recording only `ok` left the smoke's real result in
-            // scrollback, so `lab run inspect` could read green on a run
+            // scrollback, so `run inspect` could read green on a run
             // whose tests failed. `null` here is a THIRD state, distinct
             // from pass and fail: the workload declared no verify command,
             // so nothing was checked.
@@ -483,7 +483,7 @@ impl WorkloadProvider for CodingTaskProvider {
             serde_json::Value::Null
         };
         // Every count is the fold of the run's trajectory: the one reading
-        // `lab run stats` and the live tailer use too. An openclaw-era run's
+        // `run stats` and the live tailer use too. An openclaw-era run's
         // turns and compactions are its `prompt.submitted` events and the
         // distinct compaction summaries in them (`darkmux_trajectory::legacy`).
         let fold = crate::lab::inspect::run_trajectory(run_dir);

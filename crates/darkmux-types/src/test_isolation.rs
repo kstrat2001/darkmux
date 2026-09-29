@@ -124,7 +124,7 @@ pub const PINNED_STATE_VARS: &[(&str, &str)] = &[
     ("DARKMUX_FLOWS_DIR", "flows"),
     ("DARKMUX_FINDINGS_DIR", "findings"),
     ("DARKMUX_MODS_DIR", "mods"),
-    ("DARKMUX_LAB_DIR", "runs"),
+    ("DARKMUX_LAB_DIR", "lab"),
     ("DARKMUX_ACK_DIR", "acks"),
     ("DARKMUX_FLEET_FILE", "fleet.json"),
     // `.md`, not `.json`: `crew::dispatch::identity_path()`'s default is

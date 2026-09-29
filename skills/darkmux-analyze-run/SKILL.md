@@ -1,6 +1,6 @@
 ---
 name: darkmux-analyze-run
-description: Inspect a previously-recorded lab run. Reads the trajectory + manifest under .darkmux/runs/<id>/ and reports turns, compaction events, wall clock, fast/slow mode classification, and verify outcome. Use this to understand what a dispatch did, especially when investigating variance or compaction behavior. Also serves as the canonical reference for what data lives where + how to parse it (data-location map + per-event-type field reference + jq cookbook + diagnostic patterns).
+description: Inspect a previously-recorded lab run. Reads the trajectory + manifest under .darkmux/lab/<id>/ and reports turns, compaction events, wall clock, fast/slow mode classification, and verify outcome. Use this to understand what a dispatch did, especially when investigating variance or compaction behavior. Also serves as the canonical reference for what data lives where + how to parse it (data-location map + per-event-type field reference + jq cookbook + diagnostic patterns).
 user_invocable: true
 allowed-tools: "Bash(darkmux:*), Bash(ls:*), Bash(cat:*), Bash(jq:*), Bash(grep:*), Bash(wc:*), Read"
 ---
@@ -12,7 +12,7 @@ ARGUMENTS expected: `<run-id-or-path>`
 ## Step 1 — If no run-id given, list recent runs
 
 ```bash
-darkmux lab run list --limit 5
+darkmux run list --kind lab --limit 5
 ```
 
 This prints the 5 most-recent run IDs with workload + wall clock + ok/error status. Surface the table and ask the user which to analyze.
@@ -20,7 +20,7 @@ This prints the 5 most-recent run IDs with workload + wall clock + ok/error stat
 ## Step 2 — Inspect
 
 ```bash
-darkmux lab run inspect "$ARGUMENTS"
+darkmux run inspect "$ARGUMENTS"
 ```
 
 Output shape:
@@ -54,7 +54,7 @@ Frame the run in human terms:
 
 # Data reference — where each piece of data lives
 
-`darkmux lab run inspect` gives a fixed summary. When you need finer-grained signal (per-turn token timeline, compression ratio per compaction, partial-event cadence, etc.) you query the raw files directly. **This section names the canonical locations + field shapes** so jq queries work first try, not after three wrong guesses.
+`darkmux run inspect` gives a fixed summary. When you need finer-grained signal (per-turn token timeline, compression ratio per compaction, partial-event cadence, etc.) you query the raw files directly. **This section names the canonical locations + field shapes** so jq queries work first try, not after three wrong guesses.
 
 ## Run-artifact map
 
@@ -62,12 +62,12 @@ There are four distinct files with overlapping but **non-identical** schemas. Mi
 
 | File | Path template | Authoritative for | NOT authoritative for |
 |---|---|---|---|
-| **Run manifest** | `~/.darkmux/runs/<run-id>/manifest.json` | host's view of the run: `run_id`, `workload`, `profile`, `provider`, `sandbox`, `ok`, `duration_ms`, `session_id`, `schema_version`. **schema_version 3+** adds `final_hash` (post-dispatch sandbox content hash, `blake3:<hex>`); **schema_version 4+** adds a `fixture` block (`source_path`, `baseline_hash`) for fixture-backed coding-task runs; **schema_version 5+** adds a `verify` object (`passed`, `details`) — the WORKLOAD's own result, which is NOT `ok` (that is the dispatch path's result; a run can dispatch cleanly and still fail its tests). A manifest with no `verify` key means "not checked", never "passed" — and note that a v4 manifest may predate `verify` entirely, so the version alone does not tell you a missing `verify` was a deliberate no-op | per-turn metrics; final assistant text; tool calls |
-| **QA reply** | `~/.darkmux/runs/<run-id>/qa-reply.json` | the dispatch envelope: `final_assistant` (string), `result` ("stop"/"max_turns"/"escalation_*"/"error"), `trajectory_path`, and a `metrics` block the host folds from THIS invocation's trajectory: `{model, wall_ms, turns, compactions, prompt_tokens, completion_tokens, total_tokens, reasoning_tokens, cached_tokens, rest_ms, rests, cumulative_turns, cumulative_compactions}`. Every figure is this invocation's own; only the two `cumulative_*` counts add a resumed dispatch's checkpoint seed. | per-turn breakdown; tool calls; reasoning |
+| **Run manifest** | `~/.darkmux/lab/<run-id>/manifest.json` | host's view of the run: `run_id`, `workload`, `profile`, `provider`, `sandbox`, `ok`, `duration_ms`, `session_id`, `schema_version`. **schema_version 3+** adds `final_hash` (post-dispatch sandbox content hash, `blake3:<hex>`); **schema_version 4+** adds a `fixture` block (`source_path`, `baseline_hash`) for fixture-backed coding-task runs; **schema_version 5+** adds a `verify` object (`passed`, `details`) — the WORKLOAD's own result, which is NOT `ok` (that is the dispatch path's result; a run can dispatch cleanly and still fail its tests). A manifest with no `verify` key means "not checked", never "passed" — and note that a v4 manifest may predate `verify` entirely, so the version alone does not tell you a missing `verify` was a deliberate no-op | per-turn metrics; final assistant text; tool calls |
+| **QA reply** | `~/.darkmux/lab/<run-id>/qa-reply.json` | the dispatch envelope: `final_assistant` (string), `result` ("stop"/"max_turns"/"escalation_*"/"error"), `trajectory_path`, and a `metrics` block the host folds from THIS invocation's trajectory: `{model, wall_ms, turns, compactions, prompt_tokens, completion_tokens, total_tokens, reasoning_tokens, cached_tokens, rest_ms, rests, cumulative_turns, cumulative_compactions}`. Every figure is this invocation's own; only the two `cumulative_*` counts add a resumed dispatch's checkpoint seed. | per-turn breakdown; tool calls; reasoning |
 | **Pre-send bound** (#2792) | a `dispatch.pre_send_bound` line in the trajectory | the assembled prompt exceeded the profile's DECLARED context window before it was sent, and what darkmux did: `tokens_before` / `tokens_after` (both INCLUDING the tools schema, which `measure_request_context` alone omits), `declared_window`, `results_trimmed`, and `fits`. **`fits: false` means darkmux sent a request it had already computed was too big** — it is the record to look for when a dispatch dies on a provider 400. `results_trimmed: 0` with `fits: false` means no tool result was large enough to trim, NOT that the weight is elsewhere | whether the endpoint actually refused it |
 | **Trajectory** | `<sandbox>/.darkmux-runtime/trajectory.jsonl` | event-by-event ground truth. JSONL — one event per line. Source for all derived analyses. | aggregates (derive them yourself) |
 
-Quick locator: `cat ~/.darkmux/runs/<run-id>/manifest.json | jq -r '.sandbox'` returns the sandbox path the runtime wrote into. For `provider: "prompt"` workloads the sandbox is `null` (fresh tempdir, cleaned up after dispatch) — the qa-reply.json is your only data source for those.
+Quick locator: `cat ~/.darkmux/lab/<run-id>/manifest.json | jq -r '.sandbox'` returns the sandbox path the runtime wrote into. For `provider: "prompt"` workloads the sandbox is `null` (fresh tempdir, cleaned up after dispatch) — the qa-reply.json is your only data source for those.
 
 ## Trajectory event-type reference
 
@@ -341,7 +341,7 @@ For runs whose workload declared `requires_fixture`, the manifest carries conten
 ```bash
 for r in <run-a> <run-b>; do
   jq -c '{run: .run_id, baseline: .fixture.baseline_hash, final: .final_hash}' \
-    ~/.darkmux/runs/$r/manifest.json
+    ~/.darkmux/lab/$r/manifest.json
 done
 ```
 

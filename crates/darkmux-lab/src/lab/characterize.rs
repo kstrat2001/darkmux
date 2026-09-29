@@ -68,12 +68,12 @@ pub(crate) fn render_report(r: &CharacterizeReport) -> String {
     }
     p!(out);
     p!(out, "Next steps:");
-    p!(out, "  • `darkmux lab run inspect <run-id>` for the per-run breakdown");
+    p!(out, "  • `darkmux run inspect <run-id>` for the per-run breakdown");
     if r.outcomes.len() == 1 {
         p!(
             out,
             "  • Re-run for distribution: `darkmux lab run {} --runs 5` then \
-             `darkmux lab run compare <a> <b>` for variance",
+             `darkmux run compare <a> <b>` for variance",
             r.workload
         );
     }
@@ -89,7 +89,7 @@ fn verdict(outcomes: &[RunOutcome]) -> Option<String> {
     }
     if outcomes.iter().any(|o| !o.ok) {
         return Some(
-            "at least one dispatch failed — inspect `darkmux lab run inspect <run-id>` \
+            "at least one dispatch failed — inspect `darkmux run inspect <run-id>` \
              and check `darkmux doctor` for setup problems"
                 .to_string(),
         );
@@ -171,9 +171,9 @@ mod tests {
             text,
             "darkmux characterize — workload `w`\n\n  ✓ r1 — 8s\n      provider=stub\n\n\
              verdict: fast — single-turn dispatch in expected range for any modern Apple Silicon\n\n\
-             Next steps:\n  • `darkmux lab run inspect <run-id>` for the per-run breakdown\n\
+             Next steps:\n  • `darkmux run inspect <run-id>` for the per-run breakdown\n\
              \x20 • Re-run for distribution: `darkmux lab run w --runs 5` then \
-             `darkmux lab run compare <a> <b>` for variance\n"
+             `darkmux run compare <a> <b>` for variance\n"
         );
     }
 

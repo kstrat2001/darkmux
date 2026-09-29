@@ -17,6 +17,7 @@
 use crate::dispatch::DispatchResult;
 use crate::dispatch::DispatchOpts;
 use darkmux_types::session_id::SessionId;
+use darkmux_types::shell::quote as shell_quote;
 use crate::loader::{load_autonomous_dispatch_preamble, load_roles};
 use anyhow::{anyhow, bail, Context, Result};
 use std::fs;
@@ -997,18 +998,6 @@ pub(crate) fn write_resume_origin_meta(
         Err(e) => {
             eprintln!("darkmux dispatch: ⚠ failed to serialize resume-origin metadata: {e}");
         }
-    }
-}
-
-/// (#2774 review F2) Shell-quote one argument for a hint an operator is
-/// expected to PASTE. A workspace path with a space in it (`~/My
-/// Projects/...`) otherwise produces a command that silently means
-/// something else.
-fn shell_quote(s: &str) -> String {
-    if !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-./:@+=,".contains(&b)) {
-        s.to_string()
-    } else {
-        format!("'{}'", s.replace('\'', r"'\''"))
     }
 }
 

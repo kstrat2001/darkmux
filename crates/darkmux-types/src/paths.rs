@@ -31,9 +31,9 @@ pub struct DarkmuxPaths {
     /// and the test-build isolation (#994) that this raw field has neither of.
     /// Three call sites resolved this directly and each one wrote lab runs to a
     /// root the lab reader does not scan; one of them put real run directories
-    /// into the operator's ~/.darkmux/runs from `cargo test`. Making the bypass
+    /// into the operator's ~/.darkmux/lab from `cargo test`. Making the bypass
     /// unrepresentable is cheaper than remembering not to take it.
-    pub(crate) runs: PathBuf,
+    pub(crate) lab: PathBuf,
     pub sandboxes: PathBuf,
     pub crew: PathBuf,
     pub profiles: PathBuf,
@@ -68,7 +68,7 @@ impl DarkmuxPaths {
     pub fn under_root(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
         DarkmuxPaths {
-            runs: root.join("runs"),
+            lab: root.join("lab"),
             sandboxes: root.join("sandboxes"),
             crew: root.join("crew"),
             profiles: root.join("profiles.json"),
@@ -217,7 +217,7 @@ pub fn resolve(scope: ResolveScope) -> DarkmuxPaths {
 /// project/user resolution so both stay in sync.
 fn paths_from_root(chosen: PathBuf, chosen_scope: Scope) -> DarkmuxPaths {
     DarkmuxPaths {
-        runs: chosen.join("runs"),
+        lab: chosen.join("lab"),
         sandboxes: chosen.join("sandboxes"),
         crew: chosen.join("crew"),
         profiles: chosen.join("profiles.json"),
@@ -246,12 +246,10 @@ pub(crate) fn expand_tilde(s: &str) -> PathBuf {
 }
 
 pub fn ensure(paths: &DarkmuxPaths) -> Result<()> {
-    for p in [
-        &paths.root,
-        &paths.runs,
-        &paths.sandboxes,
-        &paths.crew,
-    ] {
+    // Not the lab dir: its one writer (`lab run`) creates it per run, after
+    // the pre-4.0 `runs/` check has passed. Creating it here would turn an
+    // un-moved `runs/` into a split one on the next unrelated command.
+    for p in [&paths.root, &paths.sandboxes, &paths.crew] {
         if !p.exists() {
             fs::create_dir_all(p)
                 .with_context(|| format!("creating {}", p.display()))?;
@@ -427,7 +425,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let paths = DarkmuxPaths {
             root: tmp.path().join(".darkmux"),
-            runs: tmp.path().join(".darkmux/runs"),
+            lab: tmp.path().join(".darkmux/lab"),
             sandboxes: tmp.path().join(".darkmux/sandboxes"),
             crew: tmp.path().join(".darkmux/crew"),
             profiles: tmp.path().join(".darkmux/profiles.json"),
@@ -436,7 +434,7 @@ mod tests {
         };
         ensure(&paths).unwrap();
         assert!(paths.root.exists());
-        assert!(paths.runs.exists());
+        assert!(!paths.lab.exists(), "the lab dir is created by its writer, not by ensure");
         assert!(paths.sandboxes.exists());
         assert!(paths.crew.exists());
     }
@@ -446,7 +444,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let paths = DarkmuxPaths {
             root: tmp.path().join(".darkmux"),
-            runs: tmp.path().join(".darkmux/runs"),
+            lab: tmp.path().join(".darkmux/lab"),
             sandboxes: tmp.path().join(".darkmux/sandboxes"),
             crew: tmp.path().join(".darkmux/crew"),
             profiles: tmp.path().join(".darkmux/profiles.json"),
@@ -455,7 +453,7 @@ mod tests {
         };
         ensure(&paths).unwrap();
         ensure(&paths).unwrap(); // second call is a no-op
-        assert!(paths.runs.exists());
+        assert!(paths.sandboxes.exists());
     }
     // ── (#2777) the test-build scratch root ──
 
@@ -543,7 +541,7 @@ mod tests {
     #[test]
     fn every_named_subtree_hangs_off_the_one_root() {
         let root = test_isolated_root();
-        for name in ["hooks", "flows", "findings", "mods", "runs", "runtime", "cache", "acks", "audit"] {
+        for name in ["hooks", "flows", "findings", "mods", "lab", "runtime", "cache", "acks", "audit"] {
             let d = test_isolated_dir(name);
             assert_eq!(d.parent(), Some(root.as_path()), "{name} must hang off the shared root");
             assert_eq!(d.file_name().and_then(|s| s.to_str()), Some(name));

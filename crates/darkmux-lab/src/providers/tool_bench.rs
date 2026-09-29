@@ -475,7 +475,7 @@ struct TrajStats {
 }
 
 /// A trial's stats, from the fold of its trajectory: the one reading
-/// `lab run stats` and the live tailer use, so a bench's turn and token
+/// `run stats` and the live tailer use, so a bench's turn and token
 /// counts are the same numbers every other surface quotes.
 fn analyze_trajectory(text: &str) -> TrajStats {
     let f = darkmux_trajectory::TrajectoryFold::from_lines(text);

@@ -53,6 +53,10 @@ RETIRED_COMMAND_PHRASES = [
     "mission pause",          # removed in 4.0; `mission finalize` / `mission abort` end a run (#2954)
     "mission resume",         # removed in 4.0 with `mission pause` (#2954)
     "dispatch --phase-id",    # removed in 4.0; a dispatch no longer names a phase (#2954)
+    "lab run list",      # -> `run list --kind lab` (4.0, one run noun)
+    "lab run inspect",   # -> `run inspect` (4.0, one run noun)
+    "lab run stats",     # -> `run stats` (4.0, one run noun)
+    "lab run compare",   # -> `run compare` (4.0, one run noun)
 ]
 
 # Retired phrases with an unrelated same-spelled use, as raw regexes. The

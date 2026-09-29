@@ -311,18 +311,23 @@ fn a_prompt_workload_reports_verify_none_without_a_spec_and_the_verdict_with_one
         let o = lab.run(id, 1).unwrap().remove(0);
         assert!(o.ok, "{id}: the stub dispatch must succeed: {:?}", o.notes);
         assert_eq!(o.verify_passed, want, "{id}: {:?}", o.notes);
-        // The manifest records the same tri-state, so `lab run list` reads
-        // a failed verify as FAIL rather than a plain tick.
-        let listed = crate::lab::list::list_runs(None).unwrap();
-        let row = listed.iter().find(|r| r.run_id == o.run_id).unwrap();
-        assert_eq!(row.verify_passed, want, "{id}: listed");
+        // The manifest records the tri-state, so a reader can tell a failed
+        // verify from a pass and from "not checked".
+        assert_eq!(manifest_verify_passed(&o.run_id), want, "{id}: manifest");
     }
     // A manifest from before the field existed reads as not checked.
     let old = darkmux_types::config_access::lab_dir().join("p2982-old-stub-1-1");
     fs::create_dir_all(&old).unwrap();
     fs::write(old.join("manifest.json"), r#"{"schema_version":2,"workload":"p2982-none","ok":true}"#).unwrap();
-    let listed = crate::lab::list::list_runs(None).unwrap();
-    assert_eq!(listed.iter().find(|r| r.run_id == "p2982-old-stub-1-1").unwrap().verify_passed, None);
+    assert_eq!(manifest_verify_passed("p2982-old-stub-1-1"), None);
+}
+
+/// `verify.passed` as recorded in a run's manifest; `None` when the manifest
+/// has no `verify` block.
+fn manifest_verify_passed(run_id: &str) -> Option<bool> {
+    let path = darkmux_types::config_access::lab_dir().join(run_id).join("manifest.json");
+    let manifest: serde_json::Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+    manifest.get("verify")?.get("passed")?.as_bool()
 }
 /// (#2982b, #2494) ONE exit gate for every lab verb that runs a workload:
 /// a failed dispatch or a failed verify exits 1; a verify nothing declared
@@ -628,7 +633,7 @@ fn a_failed_lms_ps_is_an_unverified_profile_warning() {
     assert!(w[0].ends_with("this run's `profile=fast` tag is unverified. (#365)"), "{w:?}");
 }
 
-/// (review of #2986) `lab run inspect` on a run whose provider errored, which
+/// (review of #2986) `run inspect` on a run whose provider errored, which
 /// has a lifecycle record but no manifest, shows the recorded error instead
 /// of failing: the characterize and tune reports point there.
 #[test]

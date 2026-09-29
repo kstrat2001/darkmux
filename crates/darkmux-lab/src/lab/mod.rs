@@ -26,7 +26,6 @@ pub mod fixture;
 pub mod fixture_cli;
 pub mod inspect;
 pub mod lifecycle;
-pub mod list;
 pub mod loop_report;
 pub mod profile_check;
 // #463 workspace split — paths lifted into the darkmux-types foundation crate
@@ -49,7 +48,7 @@ pub mod scores;
 pub mod stats;
 // (#2855) A set of runs summarized as ranges, with cost per successful outcome.
 pub mod stats_set;
-// (#2855) The text `lab run stats` prints, as tested pure functions.
+// (#2855) The text `run stats` prints, as tested pure functions.
 pub mod stats_render;
 pub mod tune;
 // (#2833) The write-the-tests work gate: a run can only pass when it did

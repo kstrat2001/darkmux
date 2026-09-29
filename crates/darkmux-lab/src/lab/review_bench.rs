@@ -294,7 +294,7 @@ pub struct ReviewBenchOpts {
 ///
 ///   1. `lab_dir()` is `cfg`-isolated in test builds (#994), so an un-isolated
 ///      test can no longer write real run directories into the operator's
-///      `~/.darkmux/runs`. Observed 2026-08-23: a `cargo test` created two
+///      `~/.darkmux/lab`. Observed 2026-08-23: a `cargo test` created two
 ///      `review-bench-<ts>` dirs there, which the viewer's runs lens then
 ///      rendered as live RUNNING rows.
 ///   2. `lab_dir()` honors `DARKMUX_LAB_DIR` and `config.dirs.lab`; the direct

@@ -3091,7 +3091,7 @@
         let missions = PathBuf::from("/tmp/darkmux-missions-banner-test");
         let phases = PathBuf::from("/tmp/darkmux-phases-banner-test");
         let lines = build_startup_banner(
-            &sample_addr(), &flows, true, &missions, true, &phases, true, 3, 9, None,
+            &sample_addr(), &flows, true, &missions, true, &phases, true, 3, 9, None, None,
         );
 
         // Title carries the binary version that operators bump via cargo install.
@@ -3117,7 +3117,7 @@
         let missions = PathBuf::from("/tmp/darkmux-banner-present-missions");
         let phases = PathBuf::from("/tmp/darkmux-banner-present-phases");
         let lines = build_startup_banner(
-            &sample_addr(), &flows, false, &missions, true, &phases, true, 0, 0, None,
+            &sample_addr(), &flows, false, &missions, true, &phases, true, 0, 0, None, None,
         );
         let joined = lines.join("\n");
         assert!(
@@ -3140,7 +3140,7 @@
         let missions = PathBuf::from("/tmp/darkmux-banner-missing-missions");
         let phases = PathBuf::from("/tmp/darkmux-banner-present-phases");
         let lines = build_startup_banner(
-            &sample_addr(), &flows, true, &missions, false, &phases, true, 0, 0, None,
+            &sample_addr(), &flows, true, &missions, false, &phases, true, 0, 0, None, None,
         );
         let joined = lines.join("\n");
         assert!(
@@ -3163,7 +3163,7 @@
         let missions = PathBuf::from("/tmp/darkmux-banner-present-missions");
         let phases = PathBuf::from("/tmp/darkmux-banner-missing-phases");
         let lines = build_startup_banner(
-            &sample_addr(), &flows, true, &missions, true, &phases, false, 0, 0, None,
+            &sample_addr(), &flows, true, &missions, true, &phases, false, 0, 0, None, None,
         );
         let joined = lines.join("\n");
         assert!(
@@ -3182,7 +3182,7 @@
         let missions = PathBuf::from("/some/missions");
         let phases = PathBuf::from("/some/phases");
         let lines = build_startup_banner(
-            &sample_addr(), &flows, true, &missions, true, &phases, true, 1, 4, None,
+            &sample_addr(), &flows, true, &missions, true, &phases, true, 1, 4, None, None,
         );
         let joined = lines.join("\n");
         assert!(!joined.contains("doesn't exist yet"), "no flows warning");
@@ -3199,7 +3199,7 @@
         let missions = PathBuf::from("/some/missions");
         let phases = PathBuf::from("/some/phases");
         let unconfigured = build_startup_banner(
-            &sample_addr(), &flows, true, &missions, true, &phases, true, 0, 0, None,
+            &sample_addr(), &flows, true, &missions, true, &phases, true, 0, 0, None, None,
         )
         .join("\n");
         assert!(
@@ -3209,13 +3209,76 @@
 
         let lab = PathBuf::from("/some/lab-runs");
         let configured = build_startup_banner(
-            &sample_addr(), &flows, true, &missions, true, &phases, true, 0, 0, Some(&lab),
+            &sample_addr(), &flows, true, &missions, true, &phases, true, 0, 0, Some(&lab), None,
         )
         .join("\n");
         assert!(
             configured.contains("/some/lab-runs"),
             "expected the configured lab dir path: {configured}"
         );
+    }
+
+    fn sample_pending_move() -> PendingMove {
+        PendingMove {
+            from: "/h/runs".into(),
+            to: "/h/lab".into(),
+            command: "mv /h/runs /h/lab".into(),
+        }
+    }
+
+    /// (4.0) A pending lab-dir move is named in the banner, under the lab dir
+    /// line, with the exact command. The daemon still starts: the banner only
+    /// reports it.
+    #[test]
+    fn startup_banner_names_a_pending_lab_move_and_its_command() {
+        let flows = PathBuf::from("/some/flows");
+        let missions = PathBuf::from("/some/missions");
+        let phases = PathBuf::from("/some/phases");
+        let lab = PathBuf::from("/h/lab");
+        let banner = |pending: Option<&PendingMove>| {
+            build_startup_banner(
+                &sample_addr(), &flows, true, &missions, true, &phases, true, 0, 0, Some(&lab), pending,
+            )
+        };
+        let pending = sample_pending_move();
+        let lines = banner(Some(&pending));
+        let at = lines.iter().position(|l| l.contains("lab dir:")).expect("lab dir line");
+        assert!(lines[at + 1].contains("mv /h/runs /h/lab"), "the command sits under lab dir: {lines:?}");
+        assert!(lines[at + 1].contains("/h/runs"), "{lines:?}");
+        // Inverse: nothing pending, no line.
+        assert!(!banner(None).join("\n").contains("mv /h/runs"), "no phantom move line");
+    }
+
+    /// `/lab/runs` carries `pending_move` while the runs sit in the pre-4.0
+    /// dir, so the lab lens can say why it is empty; it answers 200 rather
+    /// than refusing, and drops the field once the move is done.
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn lab_runs_handler_reports_a_pending_move_and_recovers_after_it() {
+        let home = darkmux_types::test_isolation::IsolatedState::new();
+        let (from, lab) = (home.join("runs"), home.join("lab"));
+        std::fs::create_dir_all(from.join("quick-q-1")).unwrap();
+        let get = || async {
+            let flows = TempDir::new().unwrap();
+            let app = build_router_full_local(flows.path().to_path_buf(), worktrees_base_dir(), Some(lab.clone()));
+            let response = app
+                .oneshot(Request::builder().uri("/lab/runs").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+        let json = get().await;
+        assert_eq!(json["runs"].as_array().unwrap().len(), 0);
+        let mv = json["pending_move"]["command"].as_str().expect("pending_move.command");
+        assert!(mv.starts_with("mv ") && mv.contains("runs") && mv.contains("lab"), "{mv}");
+        assert_eq!(json["pending_move"]["from"], from.display().to_string());
+        assert_eq!(json["pending_move"]["to"], lab.display().to_string());
+
+        std::fs::rename(&from, &lab).unwrap();
+        let json = get().await;
+        assert!(json.get("pending_move").is_none(), "recovered: {json}");
     }
 
     // ─── #270 Redis aggregation tests ─────────────────────────────────
@@ -4882,6 +4945,27 @@
             let runs = scan_lab_runs(tmp.path());
             assert_eq!(runs.len(), 1, "{runs:?}");
             assert_eq!(runs[0].run_ok, want, "manifest {manifest}");
+        }
+    }
+
+    /// (#2494) A run that dispatched fine but failed its tests is only
+    /// visible if the scan carries `verify.passed` and the workload beside
+    /// `ok`. Three states: passed, failed, not checked (`verify: null` or
+    /// absent).
+    #[test]
+    fn scan_lab_runs_reads_workload_and_verify_passed_from_the_manifest() {
+        for (manifest, want_verify) in [
+            (r#"{"workload":"quick-coding","ok":true,"verify":{"passed":false,"details":"x"}}"#, Some(false)),
+            (r#"{"workload":"quick-coding","ok":true,"verify":{"passed":true,"details":"x"}}"#, Some(true)),
+            (r#"{"workload":"quick-coding","ok":true,"verify":null}"#, None),
+            (r#"{"workload":"quick-coding","ok":true}"#, None),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            write_lab_run_with_lifecycle_session_id(&tmp.path().join("run1"), "run1", None, Some(manifest));
+            let runs = scan_lab_runs(tmp.path());
+            assert_eq!(runs.len(), 1, "{runs:?}");
+            assert_eq!(runs[0].verify_passed, want_verify, "manifest {manifest}");
+            assert_eq!(runs[0].workload.as_deref(), Some("quick-coding"), "manifest {manifest}");
         }
     }
 
