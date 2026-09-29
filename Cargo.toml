@@ -25,6 +25,19 @@ members = [".", "crates/darkmux-types", "crates/darkmux-flow", "crates/darkmux-p
 # see the workflow's own comment for the reasoning).
 exclude = ["runtime", "plugins/darkmux-bundler-rust", "tools/darkmux-mock-model"]
 
+[workspace.dependencies]
+# `preserve_order` makes a JSON object keep the order its keys were inserted
+# or parsed in, instead of sorting them. It is declared here, once, because
+# cargo turns a feature on for every crate in a build as soon as ANY crate in
+# that build asks for it, and `agent-client-protocol` (linked by the binary)
+# asks for it. Without this line a `cargo test -p <crate>` build sorted keys
+# while the binary and `cargo test --workspace` kept them in order, so the
+# daemon's served JSON and every golden compared against it depended on which
+# crates happened to be linked. Every member inherits this entry
+# (`serde_json.workspace = true`) except darkmux-trajectory, which takes
+# nothing from this workspace because the runtime builds it on its own.
+serde_json = { version = "1.0", features = ["preserve_order"] }
+
 [package]
 name = "darkmux"
 version = "4.0.0-rc.1"
@@ -89,7 +102,7 @@ clap = { version = "4.5", features = ["derive"] }
 # src/acp.rs module docs.
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "fs", "io-util", "process"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json.workspace = true
 dirs = "5.0"
 # Phase B (#45) — SQLite-backed derived index over crew manifests.
 # `bundled` per #45 dep spec so users don't need libsqlite3 on PATH.

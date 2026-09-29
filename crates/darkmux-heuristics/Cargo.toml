@@ -13,7 +13,7 @@ rust-version = "1.86"
 darkmux-hardware = { path = "../darkmux-hardware" }
 darkmux-profiles = { path = "../darkmux-profiles" }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json.workspace = true
 
 [dev-dependencies]
 # `a_drafted_profile_has_no_unknown_keys` runs the unknown-key gate.

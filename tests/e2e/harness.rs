@@ -400,6 +400,36 @@ impl FleetNode {
         cmd
     }
 
+    /// Register a minimal role named `id` in this node's crew root, so a
+    /// mission dispatch gets past its role-exists check. The manifest is
+    /// serialized from the `Role` type rather than written by hand: the
+    /// dispatch preflight refuses any key the type does not declare, so a
+    /// hand-written fixture silently falls behind when a key is retired.
+    pub fn register_role(&self, id: &str) {
+        let role = darkmux_crew::types::Role {
+            id: id.to_string(),
+            description: "test role".to_string(),
+            skills: Vec::new(),
+            tool_palette: darkmux_crew::types::ToolPalette::default(),
+            escalation_contract: darkmux_crew::types::EscalationContract::BailWithExplanation,
+            output_schema: None,
+            prompt_path: None,
+            bail_after_compactions: None,
+            escalation_posture: None,
+            role_family: None,
+            feedback_templates: None,
+        };
+        let role_dir = self.crew_root.join("roles");
+        std::fs::create_dir_all(&role_dir).expect("creating the roles dir");
+        std::fs::write(
+            role_dir.join(format!("{id}.json")),
+            serde_json::to_string_pretty(&role).expect("a Role serializes"),
+        )
+        .expect("writing the role manifest");
+        std::fs::write(role_dir.join(format!("{id}.md")), "test system prompt")
+            .expect("writing the role prompt");
+    }
+
     /// Returns false if the daemon process has exited. Used by tests
     /// that want to verify the daemon survived a scenario. (Wave-E.2+.)
     #[allow(dead_code)]

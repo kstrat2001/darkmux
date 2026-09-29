@@ -24,7 +24,7 @@ darkmux-profiles = { path = "../darkmux-profiles" }
 darkmux-gestalt = { path = "../darkmux-gestalt" }
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json.workspace = true
 # The unknown-key gate derives each user file's valid keys from its type
 # (`darkmux_types::user_files`).
 schemars = "1.2"

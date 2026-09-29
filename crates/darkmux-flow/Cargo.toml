@@ -26,7 +26,7 @@ ts-export = ["dep:ts-rs"]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json.workspace = true
 dirs = "5.0"
 # #163 — AuditFileSink: BLAKE3 hash-chained audit sink (edits detected by `flow integrity-check`).
 blake3 = "1.5"

@@ -1,128 +1,128 @@
 [
   {
-    "action": "dispatch.start",
-    "category": "work",
-    "handle": "judge",
+    "ts": "2026-08-20T09:00:00Z",
     "level": "info",
+    "category": "work",
+    "tier": "local",
+    "stage": "dispatch",
+    "action": "dispatch.start",
+    "handle": "judge",
+    "session_id": "step-judge-1",
     "mission_id": "review-1785400940-legacy",
+    "source": "crew_dispatch",
     "payload": {
       "step_id": "judge-1"
-    },
-    "session_id": "step-judge-1",
-    "source": "crew_dispatch",
-    "stage": "dispatch",
-    "tier": "local",
-    "ts": "2026-08-20T09:00:00Z"
+    }
   },
   {
-    "action": "dispatch.turn",
-    "category": "work",
-    "handle": "judge",
+    "ts": "2026-08-20T09:00:05Z",
     "level": "info",
+    "category": "work",
+    "tier": "local",
+    "stage": "dispatch",
+    "action": "dispatch.turn",
+    "handle": "judge",
+    "session_id": "step-judge-1",
     "mission_id": "review-1785400940-legacy",
+    "source": "crew_dispatch",
     "payload": {
-      "step_id": "judge-1",
       "turn_seq": 4,
-      "turns_so_far": 4
-    },
-    "session_id": "step-judge-1",
-    "source": "crew_dispatch",
-    "stage": "dispatch",
-    "tier": "local",
-    "ts": "2026-08-20T09:00:05Z"
+      "turns_so_far": 4,
+      "step_id": "judge-1"
+    }
   },
   {
-    "action": "telemetry.tokens",
+    "ts": "2026-08-20T09:00:06Z",
+    "level": "info",
     "category": "telemetry",
-    "handle": "judge",
-    "level": "info",
-    "mission_id": "review-1785400940-legacy",
-    "payload": {
-      "step_id": "judge-1",
-      "total_tokens": 5000
-    },
-    "session_id": "step-judge-1",
-    "source": "tokens",
-    "stage": "dispatch",
     "tier": "local",
-    "ts": "2026-08-20T09:00:06Z"
+    "stage": "dispatch",
+    "action": "telemetry.tokens",
+    "handle": "judge",
+    "session_id": "step-judge-1",
+    "mission_id": "review-1785400940-legacy",
+    "source": "tokens",
+    "payload": {
+      "total_tokens": 5000,
+      "step_id": "judge-1"
+    }
   },
   {
-    "action": "dispatch.complete",
-    "category": "work",
-    "handle": "judge",
+    "ts": "2026-08-20T09:00:07Z",
     "level": "info",
+    "category": "work",
+    "tier": "local",
+    "stage": "dispatch",
+    "action": "dispatch.complete",
+    "handle": "judge",
+    "session_id": "step-judge-1",
     "mission_id": "review-1785400940-legacy",
+    "source": "crew_dispatch",
     "payload": {
       "step_id": "judge-1"
-    },
-    "session_id": "step-judge-1",
-    "source": "crew_dispatch",
-    "stage": "dispatch",
-    "tier": "local",
-    "ts": "2026-08-20T09:00:07Z"
+    }
   },
   {
+    "ts": "2026-08-20T09:01:00Z",
+    "level": "info",
+    "category": "work",
+    "tier": "local",
+    "stage": "dispatch",
     "action": "dispatch.start",
-    "category": "work",
     "handle": "verifier",
-    "level": "info",
+    "session_id": "step-verify-1-review-1785400940-legacy",
     "mission_id": "review-1785400940-legacy",
+    "source": "crew_dispatch",
     "payload": {
       "step_id": "verify-1"
-    },
-    "session_id": "step-verify-1-review-1785400940-legacy",
-    "source": "crew_dispatch",
-    "stage": "dispatch",
-    "tier": "local",
-    "ts": "2026-08-20T09:01:00Z"
+    }
   },
   {
+    "ts": "2026-08-20T09:01:04Z",
+    "level": "info",
+    "category": "work",
+    "tier": "local",
+    "stage": "dispatch",
     "action": "dispatch.turn",
-    "category": "work",
     "handle": "verifier",
-    "level": "info",
-    "mission_id": "review-1785400940-legacy",
-    "payload": {
-      "step_id": "verify-1",
-      "turn_seq": 2,
-      "turns_so_far": 2
-    },
     "session_id": "step-verify-1-review-1785400940-legacy",
+    "mission_id": "review-1785400940-legacy",
     "source": "crew_dispatch",
-    "stage": "dispatch",
-    "tier": "local",
-    "ts": "2026-08-20T09:01:04Z"
-  },
-  {
-    "action": "telemetry.tokens",
-    "category": "telemetry",
-    "handle": "verifier",
-    "level": "info",
-    "mission_id": "review-1785400940-legacy",
     "payload": {
-      "step_id": "verify-1",
-      "total_tokens": 18000
-    },
-    "session_id": "step-verify-1-review-1785400940-legacy",
-    "source": "tokens",
-    "stage": "dispatch",
-    "tier": "local",
-    "ts": "2026-08-20T09:01:05Z"
+      "turn_seq": 2,
+      "turns_so_far": 2,
+      "step_id": "verify-1"
+    }
   },
   {
-    "action": "dispatch.complete",
-    "category": "work",
-    "handle": "verifier",
+    "ts": "2026-08-20T09:01:05Z",
     "level": "info",
+    "category": "telemetry",
+    "tier": "local",
+    "stage": "dispatch",
+    "action": "telemetry.tokens",
+    "handle": "verifier",
+    "session_id": "step-verify-1-review-1785400940-legacy",
     "mission_id": "review-1785400940-legacy",
+    "source": "tokens",
+    "payload": {
+      "total_tokens": 18000,
+      "step_id": "verify-1"
+    }
+  },
+  {
+    "ts": "2026-08-20T09:01:06Z",
+    "level": "info",
+    "category": "work",
+    "tier": "local",
+    "stage": "dispatch",
+    "action": "dispatch.complete",
+    "handle": "verifier",
+    "session_id": "step-verify-1-review-1785400940-legacy",
+    "mission_id": "review-1785400940-legacy",
+    "source": "crew_dispatch",
     "payload": {
       "step_id": "verify-1"
-    },
-    "session_id": "step-verify-1-review-1785400940-legacy",
-    "source": "crew_dispatch",
-    "stage": "dispatch",
-    "tier": "local",
-    "ts": "2026-08-20T09:01:06Z"
+    }
   }
 ]
