@@ -47,9 +47,12 @@ fn golden_bundle_set_matches_fixture() {
     }
 
     let expected = std::fs::read_to_string(&golden_path).expect("read golden.json — run with DARKMUX_BUNDLE_UPDATE_GOLDEN=1 to generate it");
+    // Compared as parsed JSON: key order is a serde_json feature detail, not
+    // part of the golden's meaning.
+    let parse = |t: &str| serde_json::from_str::<serde_json::Value>(t).expect("golden is JSON");
     assert_eq!(
-        actual.trim_end(),
-        expected.trim_end(),
+        parse(&actual),
+        parse(&expected),
         "BundleSet output drifted from the committed golden fixture at {}.\n\
          If this drift is an intended behavior change, regenerate with:\n\
          DARKMUX_BUNDLE_UPDATE_GOLDEN=1 cargo test -p darkmux-lab --test bundle_golden\n\

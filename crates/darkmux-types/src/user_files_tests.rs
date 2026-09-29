@@ -100,10 +100,11 @@ fn keys_inside_arrays_maps_and_enum_variants_are_checked() {
         "shape": {"kind": "square", "sid": 2.0},
     });
     let keys = key_issues::<Probe>(&doc, &no_retired);
-    // The `kind` tag picks the `square` variant, so its missing `side` is
-    // named too, before the typo that was meant for it.
-    assert_eq!(paths(&keys), ["by_name.a.hst", "list[1].prot", "shape.side", "shape.sid"]);
-    assert_eq!(closest_of(&keys[1]), Some("list[1].port"));
+    // Problems come in the order the document holds them. The `kind` tag
+    // picks the `square` variant, so its missing `side` is named too, before
+    // the typo that was meant for it.
+    assert_eq!(paths(&keys), ["list[1].prot", "by_name.a.hst", "shape.side", "shape.sid"]);
+    assert_eq!(closest_of(&keys[0]), Some("list[1].port"));
     assert!(matches!(keys[2].issue, Issue::Missing { .. }), "{keys:?}");
     assert_eq!(closest_of(&keys[3]), Some("shape.side"));
 }
@@ -340,9 +341,9 @@ fn wrong_types_are_found_at_every_level_and_in_every_json_type() {
     assert_eq!(
         found,
         [
-            ("hooks.rules[0].file", Some(("a string", "5"))),
-            ("redis.enabled", Some(("true or false", "\"yes\""))),
             ("redis.port", Some(("an integer from 0 to 65535", "70000"))),
+            ("redis.enabled", Some(("true or false", "\"yes\""))),
+            ("hooks.rules[0].file", Some(("a string", "5"))),
             ("role_profiles.coder", Some(("a string", "[\"not\",\"a\",\"string\"]"))),
         ]
     );
@@ -354,7 +355,7 @@ fn enum_variants_free_values_and_null_options_are_accepted_or_named() {
     assert_eq!(key_issues::<Probe>(&ok, &no_retired), vec![]);
     let bad = key_issues::<Probe>(&json!({"shape": {"kind": "hexagon"}, "list": {"port": 1}}), &no_retired);
     let found: Vec<(&str, Option<(&str, &str)>)> = bad.iter().map(|k| (k.path.as_str(), wrong_type(k))).collect();
-    assert_eq!(found, [("list", Some(("a list", "{\"port\":1}"))), ("shape.kind", Some(("`circle` or `square`", "\"hexagon\"")))]);
+    assert_eq!(found, [("shape.kind", Some(("`circle` or `square`", "\"hexagon\""))), ("list", Some(("a list", "{\"port\":1}")))]);
 }
 
 /// A long value is shortened in the message, never printed whole.

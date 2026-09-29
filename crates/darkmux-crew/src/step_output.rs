@@ -131,13 +131,14 @@ pub struct Output<T> {
 /// `serde_json::Map` is a `BTreeMap` by default (already sorted) but an
 /// `IndexMap` (insertion-ordered) when anything in the build enables
 /// serde_json's `preserve_order` feature — and cargo unifies features
-/// across a workspace, so whether that happens is a property of WHO ELSE
-/// is being compiled, not of this crate. In darkmux's own tree
-/// `agent-client-protocol` turns it on, which is why this digest was
-/// stable under `cargo test -p darkmux-crew` and unstable under
-/// `cargo test --workspace` (#2301 CI). A hash whose value depends on the
-/// feature graph is not a hash. This function therefore never relies on
-/// the map's own ordering.
+/// across a build, so whether that happens is a property of WHO ELSE is
+/// being compiled, not of this crate. Before the workspace declared the
+/// feature for every member, `agent-client-protocol` alone turned it on,
+/// which is why this digest was stable under `cargo test -p darkmux-crew`
+/// and unstable under `cargo test --workspace` (#2301 CI). A hash whose
+/// value depends on the feature graph is not a hash, and the runtime,
+/// built outside this workspace, never gets the feature. This function
+/// therefore never relies on the map's own ordering.
 pub fn body_hash(body: &serde_json::Value) -> String {
     let mut canonical = String::new();
     write_canonical(body, &mut canonical);
