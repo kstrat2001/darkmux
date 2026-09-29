@@ -17,8 +17,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // `ui/src/components/` -> repo root is three levels up.
 const REPO_ROOT = path.resolve(__dirname, "../../..");
 
-/** (#2863 review round 2, finding 1) A trimmed, REAL flow-session fixture —
- * fetched once from `/flow-session/crew-dispatch-code-reviewer-1789963273339920-0`
+/** (#2863 review round 2, finding 1) A trimmed, REAL flow-dispatch fixture —
+ * fetched once from `/flow-dispatch/crew-dispatch-code-reviewer-1789963273339920-0`
  * (a run that left `turn 4` unfinished: a `dispatch.checkpoint` and a
  * `dispatch error`, no `dispatch.turn`), saved with most heartbeats/host
  * telemetry dropped but every action/payload shape kept verbatim from the
@@ -31,7 +31,7 @@ const REPO_ROOT = path.resolve(__dirname, "../../..");
  * named the real host that fetched this fixture — replaced with the
  * corpus's existing synthetic `machine_uid`
  * (`00000000-0000-4000-8000-ABFCA7779F06`, already used across
- * `fleet-machines-live.json`/`flow-session-task-list.json`/`flow-today.json`
+ * `fleet-machines-live.json`/`flow-dispatch-task-list.json`/`flow-today.json`
  * and others, paired with the same `machine_id: "MacBook-Pro"` this fixture
  * uses) and a neutral `/tmp/...` path. Every other field (the prompt, the
  * diff it reviews, tool args/results, timings, turn structure) is the real
@@ -1452,7 +1452,7 @@ describe("EventLogColumn — turns (#2863)", () => {
 // session where turn 4 left a checkpoint and an error but no `dispatch.turn`.
 describe("EventLogColumn — synthesized header identity (#2863 review round 2)", () => {
   it("gives the synthesized header its own key, distinct from the row it borrowed a timestamp from", () => {
-    const records = readCorpus("flow-session-unfinished-turn.json");
+    const records = readCorpus("flow-dispatch-unfinished-turn.json");
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     render(<EventLogColumn scopeLabel="runs" records={records} visible />);
     errSpy.mock.calls.forEach((call) => {

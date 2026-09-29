@@ -43,7 +43,7 @@ describe("canonicalHash / parseRoute round-trip", () => {
     expect(roundTrip(route)).toEqual(route);
   });
 
-  it("runs (kind=lab) round-trips — the legacy #lens=lab upgrade target", () => {
+  it("runs (kind=lab) round-trips", () => {
     const route: Route = { kind: "runs", runsKind: "lab", run: null, machine: null };
     expect(canonicalHash(route)).toBe("lens=runs&kind=lab");
     expect(roundTrip(route)).toEqual(route);
@@ -139,17 +139,10 @@ describe("canonicalHash / parseRoute round-trip", () => {
     expect(roundTrip(route)).toEqual(route);
   });
 
-  // ── #1911: the mission-status-all alias upgrade ─────────────────────
-  // Same shape as the pre-existing `#lens=lab` → `#lens=runs&kind=lab`
-  // upgrade above: arriving on the alias already parses to the CANONICAL
-  // route, so writing it back just names it in the address bar.
-
-  it("a panel=mission-status-all deep link upgrades the address bar to panel=mission-status&opt.all=all", () => {
-    window.location.hash = "#lens=console&panel=mission-status-all";
-    const route = parseRoute();
-    expect(route).toEqual({ kind: "console", panelId: "mission-status", opts: { all: "all" } });
-    writeHash(canonicalHash(route));
-    expect(window.location.hash).toBe("#lens=console&panel=mission-status&opt.all=all");
+  it("the unlimited mission board is written as panel=mission-status&opt.all=all", () => {
+    const route: Route = { kind: "console", panelId: "mission-status", opts: { all: "all" } };
+    expect(canonicalHash(route)).toBe("lens=console&panel=mission-status&opt.all=all");
+    expect(roundTrip(route)).toEqual(route);
   });
 
   it("dispatch round-trips on the canonical spelling (#1974)", () => {
@@ -162,14 +155,6 @@ describe("canonicalHash / parseRoute round-trip", () => {
     const route: Route = { kind: "dispatch", dispatchId: "abc-123", missionId: "m-1" };
     expect(canonicalHash(route)).toBe("dispatch=abc-123&dispatch.mission=m-1");
     expect(roundTrip(route)).toEqual(route);
-  });
-
-  it("(#1974) a legacy #session= bookmark is REWRITTEN to the canonical #dispatch= form — which is what makes the alias one-release rather than permanent", () => {
-    window.location.hash = "#session=abc-123";
-    const route = parseRoute();
-    expect(route).toEqual({ kind: "dispatch", dispatchId: "abc-123", missionId: null });
-    writeHash(canonicalHash(route));
-    expect(window.location.hash).toBe("#dispatch=abc-123");
   });
 
   it("mission (no step) round-trips to a bare mission= hash — the pre-#2189 shape, unchanged", () => {
@@ -199,8 +184,8 @@ describe("writeHash", () => {
     expect(window.location.hash).toBe("#lens=machine");
   });
 
-  it("rewrites a stale hash to the canonical form — the #lens=lab upgrade mechanism", () => {
-    window.location.hash = "#lens=lab";
+  it("rewrites a non-canonical hash to the canonical form of the same route", () => {
+    window.location.hash = "#kind=lab&lens=runs";
     const route = parseRoute(); // {kind:"runs", runsKind:"lab", run:null}
     writeHash(canonicalHash(route));
     expect(window.location.hash).toBe("#lens=runs&kind=lab");

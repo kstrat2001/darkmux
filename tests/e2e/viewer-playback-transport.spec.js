@@ -103,8 +103,8 @@ test('the transport is absent on a live (daemon, no-hash) route', async ({ page 
   await page.route('**/fleet/machines/live', (r) =>
     r.fulfill({ contentType: 'application/json', body: JSON.stringify({ machines: [], meta: { sources: { fleet: { state: 'off' } }, complete: true } }) })
   );
-  await page.route('**/fleet/sessions/live', (r) =>
-    r.fulfill({ contentType: 'application/json', body: JSON.stringify({ sessions: [], meta: { sources: { fleet: { state: 'off' } }, complete: true } }) })
+  await page.route('**/fleet/dispatches/live', (r) =>
+    r.fulfill({ contentType: 'application/json', body: JSON.stringify({ dispatches: [], meta: { sources: { fleet: { state: 'off' } }, complete: true } }) })
   );
   await page.route('**/machine/specs', (r) => r.fulfill({ status: 404, contentType: 'application/json', body: '{}' }));
 

@@ -63,6 +63,8 @@ afterEach(() => {
 const GRAPH: MissionGraph = {
   mission_id: "m1",
   mission_status: "finalized",
+  legacy: false,
+  generated_at_ms: 0,
   nodes: [
     { id: "p1", label: "Investigate", kind: "phase", status: "complete", depth: 0 },
     {
@@ -608,7 +610,7 @@ describe("no lens-local liveness pill", () => {
 // "ran 0:00" for a mission with no terminal record; nothing here was red.
 describe("mission header sub-line and meter (#2332)", () => {
   const MINTED = "crawl-x-1788484173-b562e3";
-  const minted = (status: string): MissionGraph => ({ ...GRAPH, mission_id: MINTED, mission_status: status });
+  const minted = (status: MissionGraph["mission_status"]): MissionGraph => ({ ...GRAPH, mission_id: MINTED, mission_status: status });
   const sub = () => document.querySelector(".missionlens .msub")?.textContent ?? "";
 
   it("shows the id's name and keeps the full id on the element; the hash rides the sub-line", async () => {

@@ -367,20 +367,26 @@ optional fields are minor bumps that older viewers safely ignore (the
 
 ### The serve daemon
 
-`darkmux serve` exposes a **JSON-only** HTTP API: exactly **8 GET routes**
-(`crates/darkmux-serve/src/lib.rs:44-57`):
+`darkmux serve` serves the viewer at `GET /` and a JSON HTTP API beside it. The
+API is a **semver contract**: every route and response shape changes only on
+purpose.
 
-```
-/health   /flow/:date   /flow/:date/stream   /flow-status
-/machine/status /machine/specs   /missions   /phases
-```
+- **One definition per response.** Each JSON body is a Rust type in
+  `crates/darkmux-serve/src/wire.rs` (or a type that lives beside the thing it
+  describes). The TypeScript the viewer imports is generated from it
+  (`bun run types:regen` in `ui/`), and CI fails if the generated files are stale.
+- **The route table is pinned.** The router is built from
+  `crates/darkmux-serve/src/routes.rs`, and `crates/darkmux-serve/route-table.golden`
+  lists every route with its response type. Adding, removing or renaming a route
+  fails a test until the golden is regenerated (`DARKMUX_REGENERATE_FIXTURES=1`).
+- **No aliases.** A retired route (`/next`, `/mission/:id/graph`,
+  `/flow-session/:id`, `/fleet/sessions/live`, `/flow-status`,
+  `/worktree-summary/:session_id`) answers 404.
 
-- `/flow/:date` aggregates fleet-wide records from Redis (`XRANGE`) with a
-  local-file fallback when Redis is unreachable; `/flow/:date/stream` is an SSE
-  tail (Redis `XREAD`) (`crates/darkmux-serve/src/lib.rs:630-692, 707-732, 740-841`).
-- The daemon **does not serve HTML**: there is no `ServeDir`, `fallback`, or
-  `nest`, and unmapped paths `404`. The single-page observability viewer is
-  [planned](#8-planned-not-yet-shipped) (#554), not shipped.
+`/flow/:date` aggregates fleet-wide records from Redis (`XRANGE`) with a
+local-file fallback when Redis is unreachable; `/flow/:date/stream` is an SSE
+tail (Redis `XREAD`). See the [observability guide](../guide/observability.html)
+for the full route list.
 
 ### Lab telemetry transport (today)
 

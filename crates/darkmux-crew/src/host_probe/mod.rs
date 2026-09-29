@@ -46,6 +46,7 @@ pub mod mach_cpu;
 // pre-flight), not part of the periodic telemetry sampler above.
 pub mod power_posture;
 pub mod thermal;
+pub mod wire;
 
 pub use battery::{BatteryHealth, BatterySample};
 pub use thermal::ThermalSample;
@@ -185,99 +186,39 @@ pub fn epoch_ms_now() -> u64 {
 /// never a zero — "not measured" and "measured, and idle" are different
 /// claims, and downstream consumers render them differently.
 pub fn sample_full_json(s: &HostSampleFull, sampled_at_ms: u64) -> serde_json::Value {
-    let clusters = s.cpu_clusters.as_ref().map(|cs| {
-        cs.iter()
-            .map(|c| {
-                serde_json::json!({
-                    "name": c.name,
-                    "cores": c.cores,
-                    "pct": c.pct,
-                    "mhz": c.mhz,
-                })
-            })
-            .collect::<Vec<_>>()
-    });
-    serde_json::json!({
-        "sampled_at_ms": sampled_at_ms,
-        "sampler_cost_ms": s.cost_ms,
-        "cpu_pct": s.cpu_pct,
-        "cpu_clusters": clusters,
-        "mem_pct": s.mem_pct,
-        "gpu_pct": s.gpu_pct,
-        "gpu_mhz": s.gpu_mhz,
-        "gpu_mem_bytes": s.gpu_mem_bytes,
-        "thermal": s.thermal.as_ref().map(|t| serde_json::json!({
-            "state": t.state,
-            "cpu_speed_limit_pct": t.cpu_speed_limit_pct,
-        })),
-        // (#2705) The CHARGE half only. `null` on a machine with no
-        // battery — the same "not measured" vs "measured, and zero"
-        // distinction this function's own doc draws, and the one #2706's
-        // gate reads as "inert" rather than as 0%.
-        "battery": s.battery.as_ref().map(battery_sample_json),
-        "power_mw": s.power.as_ref().map(|p| serde_json::json!({
-            "cpu": p.cpu_mw.round() as i64,
-            "gpu": p.gpu_mw.round() as i64,
-            "ane": p.ane_mw.round() as i64,
-            "total": p.total_mw().round() as i64,
-        })),
-    })
+    to_wire_json(&wire::HostSampleNow::new(s, sampled_at_ms))
 }
 
 /// (#2705) One battery CHARGE reading's wire shape. Extracted so the two
-/// consumers that render it — `sample_full_json` above (the telemetry ring
+/// consumers that render it, `sample_full_json` above (the telemetry ring
 /// and `machine.telemetry`) and `darkmux-serve`'s `machine.battery`
-/// transition record — cannot drift into two spellings of one reading.
+/// transition record, cannot drift into two spellings of one reading.
 ///
 /// `minutes_to_empty` serializes as JSON `null` whenever the OS declines to
 /// estimate; see [`battery::minutes_to_empty_from`] for why that must never
 /// become a zero.
 pub fn battery_sample_json(b: &BatterySample) -> serde_json::Value {
-    serde_json::json!({
-        "charge_pct": b.charge_pct,
-        "on_ac": b.on_ac,
-        "charging": b.charging,
-        "minutes_to_empty": b.minutes_to_empty,
-    })
+    to_wire_json(&wire::BatteryCharge::from(b))
 }
 
-/// (#2705) One battery HEALTH reading's wire shape — the MACHINE-RECORD
-/// half, emitted only when a value actually changed (see
+/// (#2705) One battery HEALTH reading's wire shape: the MACHINE-RECORD half,
+/// emitted only when a value actually changed (see
 /// `battery::HEALTH_POLL_INTERVAL_MS`), never per telemetry sample.
 ///
-/// Both capacity ratios ride alongside the raw mAh counters they were
-/// derived from, each under a name that says WHICH reading it is. See the
-/// battery module's own doc for the measurement behind that: macOS's
-/// displayed figure reproduces from neither pair, so darkmux records what
-/// it read and does not synthesize the third.
+/// Both capacity ratios ride alongside the raw mAh counters they were derived
+/// from, each under a name that says WHICH reading it is. See the battery
+/// module's own doc for the measurement behind that: macOS's displayed figure
+/// reproduces from neither pair, so darkmux records what it read and does not
+/// synthesize the third. [`wire::BatteryHealthNow`] documents the three
+/// condition fields.
 pub fn battery_health_json(h: &BatteryHealth) -> serde_json::Value {
-    serde_json::json!({
-        "cycle_count": h.cycle_count,
-        "design_capacity_mah": h.design_capacity_mah,
-        "raw_max_capacity_mah": h.raw_max_capacity_mah,
-        "nominal_charge_capacity_mah": h.nominal_charge_capacity_mah,
-        "raw_capacity_pct": h.raw_capacity_pct(),
-        "nominal_capacity_pct": h.nominal_capacity_pct(),
-        // (#2821, corrected on review) `condition` is the raw,
-        // demonstrably-unreliable `BatteryHealth` IOKit word — kept for
-        // completeness/debugging, never the UI's primary. `health_condition`
-        // is the AUTHORITATIVE raw signal (`BatteryHealthCondition`);
-        // `condition_word` is the computed verdict derived from it (empty
-        // -> "Normal", non-empty -> passed through verbatim,
-        // `permanent_failure_status` non-zero -> "Service Battery"
-        // regardless) — see `BatteryHealth::condition_word`'s own doc for
-        // the full derivation and the measurement behind it. A viewer shows
-        // `condition_word` when present and falls back to labeling
-        // `condition` precisely (never as "the" condition) only when
-        // `condition_word` is null.
-        "condition": h.condition,
-        "health_condition": h.health_condition,
-        "condition_word": h.condition_word(),
-        "permanent_failure_status": h.permanent_failure_status,
-        "temperature_c": h.temperature_c,
-        "time_at_soc_ms": h.time_at_soc_ms,
-        "total_operating_ms": h.total_operating_ms,
-    })
+    to_wire_json(&wire::BatteryHealthNow::from(h))
+}
+
+/// A wire struct as a JSON value. Every wire type here is plain data with
+/// string keys, for which serialization cannot fail.
+fn to_wire_json<T: serde::Serialize>(v: &T) -> serde_json::Value {
+    serde_json::to_value(v).unwrap_or(serde_json::Value::Null)
 }
 
 /// (#2413) Build one machine-SCOPED `machine.telemetry` flow record — the

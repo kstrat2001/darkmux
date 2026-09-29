@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { rosterOnlyEntries } from "./cards";
-import type { PresenceBeat } from "../../types/handwritten";
-import type { RosterMachineEntry } from "../../types/handwritten";
+import type { PresenceBeat } from "../../types/generated/PresenceBeat";
+import type { RosterMachineEntry } from "../../types/generated/RosterMachineEntry";
 import type { NormRecord } from "../../lib/ingest";
 import { norm } from "../../testing/records";
 

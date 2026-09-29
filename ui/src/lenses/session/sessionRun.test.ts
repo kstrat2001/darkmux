@@ -117,8 +117,8 @@ function flattenView(view: ReturnType<typeof runRegions>): string[] {
 }
 
 describe("runRegions — byte parity against the real recorded legacy golden", () => {
-  it("matches goldens/session-task-list.txt's #stage section for the real flow-session-task-list.json corpus", () => {
-    const records = readCorpus("flow-session-task-list.json");
+  it("matches goldens/session-task-list.txt's #stage section for the real flow-dispatch-task-list.json corpus", () => {
+    const records = readCorpus("flow-dispatch-task-list.json");
     const data = flowToRenderModel(records);
     const view = runRegions(data, "task-list");
 

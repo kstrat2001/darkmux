@@ -40,7 +40,7 @@ function mockFetch(opts: {
     vi.fn((url: string) => {
       if (url.startsWith("/lab/run/detail")) {
         return Promise.resolve(
-          new Response(JSON.stringify(opts.detail ?? { dir: "d1", funnels: [], scores: null }), {
+          new Response(JSON.stringify(opts.detail ?? { dir: "d1", reviews: [], scores: null }), {
             status: opts.detailStatus ?? 200,
           }),
         );
@@ -105,7 +105,7 @@ describe("LabRunDetail", () => {
   });
 
   it("renders 'finished' when the envelope is present", async () => {
-    mockFetch({ detail: { dir: "d1", funnels: [{ crew: "reviewer", mode: "auto", confirmed: 2, needs_check: 1, archived: 0 }], scores: null } });
+    mockFetch({ detail: { dir: "d1", reviews: [{ crew: "reviewer", mode: "auto", confirmed: 2, needs_check: 1, archived: 0 }], scores: null } });
     renderDetail("d1");
     await waitFor(() => expect(screen.getByText("finished")).toBeInTheDocument());
     expect(screen.getByText(/confirmed 2 · needs_check 1 · archived 0/)).toBeInTheDocument();
@@ -145,7 +145,7 @@ describe("LabRunDetail", () => {
     // one legitimate match.
     await waitFor(() => expect(screen.getAllByText("bundle").length).toBeGreaterThan(0));
 
-    mockFetch({ detail: { dir: "d2", funnels: [], scores: null }, events: [] });
+    mockFetch({ detail: { dir: "d2", reviews: [], scores: null }, events: [] });
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     rerender(
       <QueryClientProvider client={queryClient}>
@@ -179,7 +179,7 @@ describe("LabRunDetail", () => {
       "fetch",
       vi.fn((url: string) => {
         if (url.startsWith("/lab/run/detail")) {
-          return Promise.resolve(new Response(JSON.stringify({ dir: "d1", funnels: [], scores: null }), { status: 200 }));
+          return Promise.resolve(new Response(JSON.stringify({ dir: "d1", reviews: [], scores: null }), { status: 200 }));
         }
         if (url.startsWith("/lab/run/events")) {
           eventsCalls += 1;

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { effectiveHostAggregate } from "./machineStatsContent";
 import type { HostAggregate } from "../lib/hostStats";
-import type { MachineLoad } from "../types/handwritten";
+import type { MachineLoad } from "../types/generated/MachineLoad";
 
 const EMPTY_METRIC = { now: null, avg: null, high: null, p95: null };
 
@@ -13,6 +13,7 @@ const DISPATCH_AGG: HostAggregate = {
 };
 
 const LOAD: MachineLoad = {
+  battery_health: null,
   now: {
     sampled_at_ms: 4000,
     sampler_cost_ms: 6.3,

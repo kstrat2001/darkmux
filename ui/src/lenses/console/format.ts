@@ -2,7 +2,7 @@
  * `viewer.html`'s `function panelAgeLabel(body, fetchedAt)`. Split out from
  * `ConsolePanel.tsx` for the same reason `lenses/runs/format.ts` is split
  * from `RunsBoard.tsx`: pure functions are unit-testable without a DOM. */
-import type { PanelResponse } from "../../types/handwritten";
+import type { PanelResponse } from "../../types/generated/PanelResponse";
 
 export interface PanelAgeLabel {
   hhmmss: string;

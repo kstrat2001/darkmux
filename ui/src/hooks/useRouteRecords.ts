@@ -9,6 +9,7 @@ import { useDay } from "./useDay";
 import type { FlowWindowResult } from "./useFlowWindow";
 import { ingest, type NormRecord } from "../lib/ingest";
 import { sessionRouteRecords } from "../lib/runRef";
+import type { FlowRecordsResponse } from "../types/generated/FlowRecordsResponse";
 
 /**
  * Which records does THIS route actually mean? (#1800 P1)
@@ -16,7 +17,7 @@ import { sessionRouteRecords } from "../lib/runRef";
  * Until this existed, `App.tsx` fed `EventLogColumn` the live rolling window
  * (`useFlowWindow`) on EVERY route that shows an event log. `showsEventLog()`
  * returns true for `playback` and `session` — it only excludes runs/console/
- * machine — so a `#session=<id>` route rendered the event log populated with
+ * machine — so a `#dispatch=<id>` route rendered the event log populated with
  * the LIVE window's records instead of that session's.
  *
  * That is not a missing view. It is the wrong data, displayed confidently,
@@ -61,7 +62,7 @@ export interface RouteRecords {
  * The two endpoints answer different shapes, which `ingest` accepts both of:
  *
  *   GET /flow/<date>        -> a BARE JSON ARRAY   (lib.rs `flow_handler`)
- *   GET /flow-session/<id>  -> { records, ... }    (`catalog_records_response`)
+ *   GET /flow-dispatch/<id>  -> { records, ... }    (`catalog_records_response`)
  *
  * (#1800) Then SHAPED through `shapeRecords`, as legacy's own playback boot
  * is `DATA=flowToRenderModel(RAW)` (viewer.html:3894/3922), so this hook and
@@ -88,7 +89,7 @@ export function useRouteRecords(route: Route, flowWindow: FlowWindowResult): Rou
   // resolver" this fix keeps to (`lib/source.ts`, the one place the build type is decided).
   // (#2065) A DISPATCH route on a static build reads the same committed file
   // and slices ONE session out of it (`session_id`), instead of asking a
-  // daemon that is not there for `/flow-session/<id>` (a 404 on every
+  // daemon that is not there for `/flow-dispatch/<id>` (a 404 on every
   // dispatch-row tap of the demo). The file already carries every session
   // its `demo-runs.json` lists; there is nothing to fetch.
   // (U4-1) …and EVERY OTHER route on a static build reads it too, not just
@@ -139,7 +140,7 @@ export function useRouteRecords(route: Route, flowWindow: FlowWindowResult): Rou
 
   const sessionQuery = useQuery({
     queryKey: queryKeys.flowSession(sessionId ?? ""),
-    queryFn: () => fetchJson<unknown>(`/flow-session/${encodeURIComponent(sessionId ?? "")}`),
+    queryFn: () => fetchJson<FlowRecordsResponse>(`/flow-dispatch/${encodeURIComponent(sessionId ?? "")}`),
     enabled: sessionId !== null && flowSrc === null,
     refetchInterval: shouldPoll ? PRESENCE_POLL_MS : false,
   });

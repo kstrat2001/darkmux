@@ -40,7 +40,7 @@
 // on the bar's `onClick` for the full reasoning.
 const { test, expect } = require('@playwright/test');
 
-// A minimal, real-shaped `/flow-session/<id>` response — a clean
+// A minimal, real-shaped `/flow-dispatch/<id>` response — a clean
 // dispatch.start -> dispatch.complete pair, same record shape
 // `tests/fixtures/savings-flow.jsonl` uses elsewhere in this suite.
 // `SessionReplay` needs enough here that `runRegions()` doesn't hit its
@@ -68,7 +68,7 @@ function sessionRecords(id) {
 }
 
 async function mockSession(page, id) {
-  await page.route(`**/flow-session/${encodeURIComponent(id)}`, (r) =>
+  await page.route(`**/flow-dispatch/${encodeURIComponent(id)}`, (r) =>
     r.fulfill({ contentType: 'application/json', body: JSON.stringify(sessionRecords(id)) })
   );
 }
@@ -102,7 +102,7 @@ const hash = (page) => page.evaluate(() => location.hash);
 // `.sbar` bar to render, matching this port's own machine-uid/session-id
 // field shapes (`machine_uid`/`session_id`, the `dispatch start`
 // space-spelling `normalizeAction` dots). `mockSession` (above) covers the
-// `/flow-session/<id>` fetch the click's destination needs.
+// `/flow-dispatch/<id>` fetch the click's destination needs.
 async function bootLiveWithSession(page, sid) {
   const errors = [];
   page.on('pageerror', (e) => errors.push(String(e)));

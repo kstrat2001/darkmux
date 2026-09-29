@@ -10,7 +10,7 @@ import { ACTION, earliestByTime, latestByTime, type NormRecord } from "./ingest"
 import { readyParts } from "./metaLine";
 import { maxOf, minOf } from "./numbers";
 import { perModelScale } from "../lenses/machine/memoryLedgerLines";
-import type { MachineResourcesModel } from "../types/handwritten";
+import type { ModelRow } from "../types/generated/ModelRow";
 
 const N = 300_000;
 const T0 = Date.parse("2026-09-01T00:00:00Z");
@@ -48,7 +48,7 @@ describe("extrema over 300k inputs do not throw", () => {
   });
 
   it("the per-model scale is the largest footprint", () => {
-    const models = Array.from({ length: N }, (_, i) => ({ potential_bytes: i, current_bytes: 0 }) as MachineResourcesModel);
+    const models = Array.from({ length: N }, (_, i) => ({ potential_bytes: i, current_bytes: 0 }) as ModelRow);
     expect(perModelScale(models)).toBe(N - 1);
   });
 

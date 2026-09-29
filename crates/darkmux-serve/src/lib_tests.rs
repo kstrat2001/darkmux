@@ -4,7 +4,7 @@
     /// declared window, `null` when undeclared, beside the residency match
     /// (by namespaced identifier or bare key).
     #[test]
-    fn utility_model_json_carries_the_declared_window() {
+    fn utility_model_carries_the_declared_window() {
         let lm = |identifier: &str, model: &str| darkmux_types::LoadedModel {
             identifier: identifier.into(),
             model: model.into(),
@@ -13,12 +13,12 @@
             context: 120_000,
             queued: None,
         };
-        let v = utility_model_json("darkmux:util-4b", Some(120_000), &[lm("darkmux:util-4b", "util-4b")]);
+        let v = serde_json::to_value(utility_model("darkmux:util-4b", Some(120_000), &[lm("darkmux:util-4b", "util-4b")])).unwrap();
         assert_eq!(v, serde_json::json!({ "id": "darkmux:util-4b", "loaded": true, "n_ctx": 120_000 }));
-        let bare = utility_model_json("util-4b", None, &[lm("darkmux:util-4b", "util-4b")]);
-        assert_eq!(bare["loaded"], true, "matched by bare key");
-        assert!(bare["n_ctx"].is_null(), "undeclared is null, never a guess: {bare}");
-        assert_eq!(utility_model_json("util-4b", None, &[])["loaded"], false);
+        let bare = utility_model("util-4b", None, &[lm("darkmux:util-4b", "util-4b")]);
+        assert!(bare.loaded, "matched by bare key");
+        assert!(bare.n_ctx.is_none(), "undeclared is null, never a guess: {bare:?}");
+        assert!(!utility_model("util-4b", None, &[]).loaded);
     }
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
@@ -398,40 +398,6 @@
         );
     }
 
-    /// (the flip, #1800) `GET /next` is a PERMANENT REDIRECT to `/` — it
-    /// served the in-progress React port (#1717) until that port became `/`
-    /// itself.
-    ///
-    /// The route is kept, not deleted, and this test is why it has to stay
-    /// correct rather than merely present: the operator's phone reaches the
-    /// daemon over the tailnet at this path, and every bookmark and
-    /// home-screen shortcut minted during the port points here. A 404 for the
-    /// page that is now the default would be the most visible possible way to
-    /// get the flip wrong.
-    #[tokio::test]
-    async fn next_route_permanently_redirects_to_root() {
-        let app = build_router_local(PathBuf::new());
-        let response = app
-            .oneshot(Request::builder().uri("/next").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-
-        assert_eq!(
-            response.status(),
-            StatusCode::PERMANENT_REDIRECT,
-            "308, not 302: permanent so it caches, method-preserving so the \
-             semantics cannot quietly change"
-        );
-        assert_eq!(
-            response.headers().get("location").and_then(|v| v.to_str().ok()),
-            Some("/"),
-            "a bare `/` target is what lets the FRAGMENT survive — RFC 7231 \
-             §7.1.2 reattaches the original request's fragment when the \
-             target carries none, so `/next#lens=runs` lands correctly \
-             without this handler ever seeing a hash (it is never sent one)"
-        );
-    }
-
     /// The flip itself: `GET /` serves the React port, not the legacy viewer.
     ///
     /// This test previously asserted the OPPOSITE — `next_route_does_not_
@@ -576,8 +542,8 @@
     }
 
     #[tokio::test]
-    async fn fleet_sessions_live_carries_sessions_plus_a_coverage_state() {
-        // GET /fleet/sessions/live (#638) must always answer 200 and never
+    async fn fleet_dispatches_live_carries_sessions_plus_a_coverage_state() {
+        // GET /fleet/dispatches/live (#638) must always answer 200 and never
         // 500 on a Redis blip — the live viewer keys "running" on this.
         // It now answers with an OBJECT so an empty `sessions` can be
         // distinguished from an unreadable substrate: the viewer used to
@@ -587,7 +553,7 @@
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/fleet/sessions/live")
+                    .uri("/fleet/dispatches/live")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -596,7 +562,7 @@
         assert_eq!(response.status(), 200);
         let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert!(body["sessions"].is_array(), "live sessions must be a JSON array under `sessions`");
+        assert!(body["dispatches"].is_array(), "live dispatches must be a JSON array under `dispatches`");
         assert!(body["meta"]["sources"]["fleet"]["state"].is_string(), "coverage state must be reported");
     }
 
@@ -622,7 +588,7 @@
             eprintln!("skipping: this machine has Redis configured, so `off` is not the expected state");
             return;
         }
-        for uri in ["/fleet/sessions/live", "/fleet/machines/live"] {
+        for uri in ["/fleet/dispatches/live", "/fleet/machines/live"] {
             let app = build_router_local(PathBuf::new());
             let response = app
                 .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
@@ -1348,11 +1314,11 @@
         let missions = super::scan_flow_missions(tmp.path(), &fleet);
         let m = missions
             .iter()
-            .find(|m| m["mission_id"] == "m-on-the-hub")
+            .find(|m| m.mission_id == "m-on-the-hub")
             .expect("a peer's mission must appear in the missions lens");
-        assert_eq!(m["records"], 1);
-        assert_eq!(m["machines"], serde_json::json!(["m1-max-32gb-studio"]));
-        assert_eq!(m["first_date"], "2026-05-14", "the date comes from the record's own ts");
+        assert_eq!(m.records, 1);
+        assert_eq!(m.machines, vec!["m1-max-32gb-studio".to_string()]);
+        assert_eq!(m.first_date, "2026-05-14", "the date comes from the record's own ts");
     }
 
     /// The de-dup, tested where it is actually OBSERVABLE. This machine's
@@ -1383,9 +1349,9 @@
         )
         .unwrap();
         let missions = super::scan_flow_missions(tmp.path(), std::slice::from_ref(&record));
-        let m = missions.iter().find(|m| m["mission_id"] == "m-mine").expect("mission present");
+        let m = missions.iter().find(|m| m.mission_id == "m-mine").expect("mission present");
         assert_eq!(
-            m["records"], 1,
+            m.records, 1,
             "a record present in both sinks must be counted once — without the shared \
              identity de-dup this reads 2, and every local dispatch is double-counted"
         );
@@ -1412,10 +1378,10 @@
             .collect();
         fs::write(tmp.path().join("2026-05-14.jsonl"), lines.join("\n") + "\n").unwrap();
         let days = super::scan_flow_days(tmp.path());
-        assert_eq!(days[0]["dispatches"], 3, "day picker counts executions");
+        assert_eq!(days[0].dispatches, 3, "day picker counts executions");
         let missions = super::scan_flow_missions(tmp.path(), &[]);
-        let m = missions.iter().find(|m| m["mission_id"] == "m-map").expect("mission present");
-        assert_eq!(m["dispatches"], 3, "missions lens counts executions");
+        let m = missions.iter().find(|m| m.mission_id == "m-map").expect("mission present");
+        assert_eq!(m.dispatches, 3, "missions lens counts executions");
     }
 
     #[tokio::test]
@@ -1461,7 +1427,7 @@
     }
 
     #[tokio::test]
-    async fn flow_session_returns_only_that_sessions_records() {
+    async fn flow_dispatch_returns_only_that_sessions_records() {
         let tmp = TempDir::new().unwrap();
         fs::write(
             tmp.path().join("2026-05-12.jsonl"),
@@ -1470,7 +1436,7 @@
         ).unwrap();
         let app = build_router_local(tmp.path().to_path_buf());
         let response = app
-            .oneshot(Request::builder().uri("/flow-session/S1").body(Body::empty()).unwrap())
+            .oneshot(Request::builder().uri("/flow-dispatch/S1").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -1489,7 +1455,7 @@
     /// files on the machine — three day files exist here, but the run's
     /// own window sits in exactly one.
     #[tokio::test]
-    async fn flow_session_meta_stamps_the_bounded_scan_cost() {
+    async fn flow_dispatch_meta_stamps_the_bounded_scan_cost() {
         let tmp = TempDir::new().unwrap();
         fs::write(
             tmp.path().join("2026-05-11.jsonl"),
@@ -1507,7 +1473,7 @@
         ).unwrap();
         let app = build_router_local(tmp.path().to_path_buf());
         let response = app
-            .oneshot(Request::builder().uri("/flow-session/S1").body(Body::empty()).unwrap())
+            .oneshot(Request::builder().uri("/flow-dispatch/S1").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -1807,46 +1773,6 @@
         ConnectInfo("127.0.0.1:5555".parse::<SocketAddr>().unwrap())
     }
 
-    /// (#1387) `/worktree-summary/:session_id` (the numbers-only replacement
-    /// for the retired `/diff/:session_id`) must ride the SAME remote-only
-    /// bearer gate as the rest of the read surface — there is no longer a
-    /// route-specific always-on gate anywhere in this router. Mirrors
-    /// `lab_runs_requires_token_from_remote_peer`.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn worktree_summary_requires_token_from_remote_peer() {
-        set_read_auth_env();
-        let app = build_router_local(PathBuf::new());
-        let mut req = Request::builder()
-            .uri("/worktree-summary/some-session")
-            .body(Body::empty())
-            .unwrap();
-        req.extensions_mut().insert(remote_peer());
-        let resp = app.oneshot(req).await.unwrap();
-        clear_auth_env();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    /// Companion to the above: unlike the retired `/diff` gate,
-    /// `/worktree-summary` is open to a request from this machine (a stated
-    /// loopback peer, no proxy header) even when a token is configured,
-    /// same as every other route on the general gate.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn worktree_summary_open_on_loopback_even_with_token() {
-        set_read_auth_env();
-        let app = build_router_local(PathBuf::new());
-        // (#1663) Loopback stated, not inherited from an absent ConnectInfo.
-        let mut req = Request::builder()
-            .uri("/worktree-summary/some-session")
-            .body(Body::empty())
-            .unwrap();
-        req.extensions_mut().insert(loopback_peer());
-        let resp = app.oneshot(req).await.unwrap();
-        clear_auth_env();
-        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
-    }
-
     #[tokio::test]
     #[serial_test::serial]
     async fn flow_open_on_loopback_even_with_token() {
@@ -2020,24 +1946,6 @@
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
-    /// `/worktree-summary` (the numbers-only successor of the retired
-    /// `/diff`) sits behind the same gate: proxied loopback needs the token.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn auth_on_proxied_loopback_worktree_summary_needs_the_token() {
-        set_read_auth_env();
-        let app = build_router_local(PathBuf::new());
-        let mut req = Request::builder()
-            .uri("/worktree-summary/some-session")
-            .header("X-Forwarded-For", "100.64.0.7")
-            .body(Body::empty())
-            .unwrap();
-        req.extensions_mut().insert(loopback_peer());
-        let resp = app.oneshot(req).await.unwrap();
-        clear_auth_env();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    }
-
     /// Auth OFF (no token resolves, read auth off — the default): reads
     /// stay open to everything, proxied or not.
     #[tokio::test]
@@ -2064,7 +1972,7 @@
     #[serial_test::serial]
     async fn a_fleet_token_with_read_auth_off_leaves_reads_open() {
         let proxied = [("X-Forwarded-For", "100.64.0.7"), ("Tailscale-User-Login", "someone@example.com")];
-        for uri in ["/", "/flow-days", "/runs", "/worktree-summary/some-session", "/mission/m/graph.json"] {
+        for uri in ["/", "/flow-days", "/runs", "/flow-dispatch/some-session", "/mission/m/graph.json"] {
             let s = read_status(AuthEnv::TokenOnly, loopback_peer(), uri, &proxied).await;
             assert_ne!(s, StatusCode::UNAUTHORIZED, "proxied {uri}");
             let s = read_status(AuthEnv::TokenOnly, remote_peer(), uri, &[]).await;
@@ -2094,7 +2002,7 @@
         for auth in [AuthEnv::Off, AuthEnv::TokenOnly] {
             apply_auth_env(auth);
             let app = build_router_local(PathBuf::new());
-            for uri in ["/", "/flow-days", "/runs", "/panel/doctor", "/worktree-summary/s"] {
+            for uri in ["/", "/flow-days", "/runs", "/panel/doctor", "/flow-dispatch/s"] {
                 let mut req = Request::builder().method("POST").uri(uri).body(Body::empty()).unwrap();
                 req.extensions_mut().insert(loopback_peer());
                 let resp = app.clone().oneshot(req).await.unwrap();
@@ -2947,8 +2855,8 @@
     }
 
     #[tokio::test]
-    async fn flow_session_route_serves_a_spaced_archive_dotted() {
-        let json = get_json(&spaced_archive(), "/flow-session/S1").await;
+    async fn flow_dispatch_route_serves_a_spaced_archive_dotted() {
+        let json = get_json(&spaced_archive(), "/flow-dispatch/S1").await;
         assert_eq!(actions_of(&json["records"]), vec!["dispatch.start", "dispatch.complete"]);
     }
 
@@ -3287,7 +3195,7 @@
         std::fs::create_dir_all(from.join("quick-q-1")).unwrap();
         let get = || async {
             let flows = TempDir::new().unwrap();
-            let app = build_router_full_local(flows.path().to_path_buf(), worktrees_base_dir(), Some(lab.clone()));
+            let app = build_router_full_local(flows.path().to_path_buf(), Some(lab.clone()));
             let response = app
                 .oneshot(Request::builder().uri("/lab/runs").body(Body::empty()).unwrap())
                 .await
@@ -4243,40 +4151,22 @@
     // current handler) ──────────────────────────────────────────────────
 
     #[test]
-    fn validate_base_ref_accepts_valid_refs() {
-        assert!(validate_base_ref("main"));
-        assert!(validate_base_ref("origin/main"));
-        assert!(validate_base_ref("abc123"));
-        assert!(validate_base_ref("v1.0.0"));
-        assert!(validate_base_ref("feature/my-branch"));
-        assert!(validate_base_ref("a_b.c-d"));
-    }
-
-    #[test]
-    fn validate_base_ref_rejects_invalid_refs() {
-        assert!(!validate_base_ref(""));
-        assert!(!validate_base_ref("-rev"));
-        assert!(!validate_base_ref("$(x)"));
-        assert!(!validate_base_ref("a b")); // space
-    }
-
-    #[test]
-    fn worktree_contained_accepts_path_under_base() {
+    fn path_is_within_accepts_path_under_base() {
         let tmp = TempDir::new().unwrap();
         // Create a real directory structure.
         std::fs::create_dir_all(tmp.path().join("sub")).unwrap();
-        assert!(worktree_contained(
+        assert!(path_is_within(
             &tmp.path().join("sub"),
             tmp.path(),
         ));
     }
 
     #[test]
-    fn worktree_contained_rejects_path_outside_base() {
+    fn path_is_within_rejects_path_outside_base() {
         let tmp = TempDir::new().unwrap();
         // A path outside the base dir.
         assert!(
-            !worktree_contained(
+            !path_is_within(
                 StdPath::new("/tmp"),
                 tmp.path(),
             )
@@ -4284,254 +4174,15 @@
     }
 
     #[test]
-    fn worktree_contained_rejects_missing_worktree() {
+    fn path_is_within_rejects_missing_worktree() {
         let tmp = TempDir::new().unwrap();
         // Non-existent worktree path.
         assert!(
-            !worktree_contained(
+            !path_is_within(
                 &tmp.path().join("does_not_exist"),
                 tmp.path(),
             )
         );
-    }
-
-    #[test]
-    fn resolve_session_finds_matching_record() {
-        let tmp = TempDir::new().unwrap();
-        let record = serde_json::json!({
-            "action": "step.result",
-            "session_id": "abc123",
-            "payload": {
-                "step_id": "s1-worktree-step",
-                "kind": "mission.worktree",
-                "worktree": "/tmp/wt",
-                "base": "main",
-                "branch": "darkmux/abc123"
-            }
-        });
-        fs::write(
-            tmp.path().join("2026-01-15.jsonl"),
-            format!("{}\n", record),
-        )
-        .unwrap();
-
-        let result = resolve_session("abc123", tmp.path());
-        assert!(result.is_some(), "expected session to resolve");
-        let (wt, base, branch) = result.unwrap();
-        assert_eq!(wt, "/tmp/wt");
-        assert_eq!(base, "main");
-        assert_eq!(branch, "darkmux/abc123");
-    }
-
-    #[test]
-    fn resolve_session_returns_none_for_unknown() {
-        let tmp = TempDir::new().unwrap();
-        fs::write(
-            tmp.path().join("2026-01-15.jsonl"),
-            r#"{"action":"step.result","session_id":"other","payload":{"step_id":"s1-worktree-step","kind":"mission.worktree","worktree":"/tmp/wt","base":"main","branch":"x"}}\n"#,
-        )
-        .unwrap();
-
-        let result = resolve_session("unknown", tmp.path());
-        assert!(result.is_none(), "expected no match for unknown session");
-    }
-
-    /// `compute_diff_summary` must count files and sum additions/deletions
-    /// correctly from `git diff --numstat` — including a BINARY file, whose
-    /// numstat line is `-\t-\t<path>`: it counts as a changed FILE but
-    /// contributes nothing to the add/del totals (the `parse_numstat_count`
-    /// "-" arm, pinned here by a direct test). And (the #1387 invariant this
-    /// replaces the old cap tests with) it must never read or return diff
-    /// TEXT: only the three `u64` totals come back, whatever the change size.
-    #[test]
-    fn compute_diff_summary_counts_files_and_totals() {
-        let wt = TempDir::new().unwrap();
-        let dir = wt.path();
-        let git = |args: &[&str]| {
-            Command::new("git")
-                .current_dir(dir)
-                .args(args)
-                .output()
-                .expect("git command");
-        };
-        git(&["init"]);
-        git(&["config", "user.email", "t@t.com"]);
-        git(&["config", "user.name", "T"]);
-        fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
-        fs::write(dir.join("b.txt"), "x\n").unwrap();
-        // A binary file (NUL byte forces git's binary detection).
-        fs::write(dir.join("blob.bin"), [0u8, 159, 146, 150]).unwrap();
-        git(&["add", "."]);
-        git(&["commit", "-m", "base"]);
-        let base = String::from_utf8(
-            Command::new("git")
-                .current_dir(dir)
-                .args(["rev-parse", "HEAD"])
-                .output()
-                .unwrap()
-                .stdout,
-        )
-        .unwrap()
-        .trim()
-        .to_string();
-
-        // a.txt: +1/-2 lines (replace both with one new line); b.txt: +1/-0
-        // (append a line); blob.bin: modified binary (numstat `-\t-\t...`).
-        // Three files changed, still 2 additions and 2 deletions total.
-        fs::write(dir.join("a.txt"), "three\n").unwrap();
-        fs::write(dir.join("b.txt"), "x\ny\n").unwrap();
-        fs::write(dir.join("blob.bin"), [0u8, 1, 2, 3, 4]).unwrap();
-        git(&["add", "."]);
-        git(&["commit", "-m", "change"]);
-
-        let (files, adds, dels) =
-            compute_diff_summary(dir, &base).expect("compute_diff_summary");
-        assert_eq!(files, 3, "expected three changed files (two text + one binary)");
-        assert_eq!(adds, 2, "expected 2 total additions (binary contributes none)");
-        assert_eq!(dels, 2, "expected 2 total deletions (binary contributes none)");
-    }
-
-    #[tokio::test]
-    // (#881) serial: DARKMUX_SERVE_TOKEN is set/scrubbed by the serial auth
-    // tests — without this, that token can leak into this test's
-    // build_router window and 401 the request (CI-only race).
-    #[serial_test::serial]
-    async fn worktree_summary_handler_returns_available_true_with_totals() {
-        // Create a temp dir acting as the worktrees base containing a real git repo.
-        let wt_base = TempDir::new().unwrap();
-
-        // Create a real git repo inside the base.
-        let wt_dir = wt_base.path().join("myrepo").join("phase1");
-        std::fs::create_dir_all(&wt_dir).unwrap();
-
-        // Initialize git repo.
-        Command::new("git")
-            .current_dir(&wt_dir)
-            .args(["init"])
-            .output()
-            .expect("git init");
-
-        // Configure git user for commits.
-        Command::new("git")
-            .current_dir(&wt_dir)
-            .args(["config", "user.email", "test@test.com"])
-            .output()
-            .expect("git config");
-        Command::new("git")
-            .current_dir(&wt_dir)
-            .args(["config", "user.name", "Test"])
-            .output()
-            .expect("git config");
-
-        // Create and commit a file as base.
-        let test_file = wt_dir.join("hello.txt");
-        fs::write(&test_file, "original content\n").unwrap();
-
-        Command::new("git")
-            .current_dir(&wt_dir)
-            .args(["add", "."])
-            .output()
-            .expect("git add");
-        let _commit_out = Command::new("git")
-            .current_dir(&wt_dir)
-            .args(["commit", "-m", "initial"])
-            .output()
-            .expect("git commit");
-        // Use git rev-parse to get just the hash.
-        let base_ref = Command::new("git")
-            .current_dir(&wt_dir)
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .expect("git rev-parse")
-            .stdout;
-        let base_ref = String::from_utf8(base_ref).unwrap().trim().to_string();
-
-        // Modify the file (no separate untracked file needed — the
-        // #1387 response never enumerates untracked paths).
-        fs::write(&test_file, "modified content\n").unwrap();
-        Command::new("git")
-            .current_dir(&wt_dir)
-            .args(["add", "."])
-            .output()
-            .expect("git add");
-
-        // Create a flows dir with a day file pointing at this worktree.
-        let flows_dir = TempDir::new().unwrap();
-        let record = serde_json::json!({
-            "action": "step.result",
-            "session_id": "test-session-1",
-            "payload": {
-                "step_id": "s1-worktree-step",
-                "kind": "mission.worktree",
-                "worktree": wt_dir.to_str().unwrap(),
-                "base": &base_ref,
-                "branch": "darkmux/test"
-            }
-        });
-        fs::write(
-            flows_dir.path().join("2026-01-15.jsonl"),
-            format!("{}\n", record),
-        )
-        .unwrap();
-
-        let app = build_router_with_worktrees_base_local(
-            flows_dir.path().to_path_buf(),
-            wt_base.path().to_path_buf(),
-        );
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/worktree-summary/test-session-1")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON body");
-
-        assert!(json["available"].as_bool().unwrap_or(false), "expected available:true");
-        assert_eq!(json["session_id"].as_str(), Some("test-session-1"));
-        assert!(!json["base"].as_str().unwrap_or("").is_empty());
-        assert!(!json["branch"].as_str().unwrap_or("").is_empty());
-        assert_eq!(json["path"].as_str(), Some(wt_dir.to_str().unwrap()));
-
-        // One file changed (hello.txt), one line added and one removed.
-        assert_eq!(json["files"].as_u64(), Some(1), "expected one changed file");
-        assert_eq!(json["adds"].as_u64(), Some(1), "expected one addition");
-        assert_eq!(json["dels"].as_u64(), Some(1), "expected one deletion");
-
-        // No diff TEXT and no per-file breakdown ever leave the server — the
-        // whole point of #1387.
-        assert!(json.get("diff").is_none(), "response must never carry diff text");
-        assert!(json.get("untracked").is_none(), "response must never carry an untracked list");
-    }
-
-    #[tokio::test]
-    // (#881) serial — see worktree_summary_handler_returns_available_true_with_totals:
-    // the general remote gate keys on DARKMUX_SERVE_TOKEN set by the serial auth tests.
-    #[serial_test::serial]
-    async fn worktree_summary_handler_returns_available_false_for_unknown_session() {
-        let flows_dir = TempDir::new().unwrap();
-        // No records at all.
-
-        let app = build_router_local(flows_dir.path().to_path_buf());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/worktree-summary/nonexistent")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON body");
-        assert!(!json["available"].as_bool().unwrap_or(false));
     }
 
     // ─── #1247 Part 3: lab observer lens ───────────────────────────────────
@@ -4572,7 +4223,7 @@
                 "probes": [
                     {"name": "demo-probe", "model": "darkmux:demo-probe-model", "k": 1, "n_ctx": 32768, "max_tokens": 3000}
                 ],
-                "judge": {"name": "demo-judge", "model": "darkmux:demo-judge-model", "k": 3, "n_ctx": 65536, "max_tokens": 20000}
+                "judge": {"name": "demo-judge", "model": "darkmux:demo-judge-model", "k": 3, "n_ctx": 65536, "max_tokens": 20000, "role_id": "judge", "remote": true, "endpoint": "provider.example", "passes": 2}
             }
         }]);
         fs::write(dir.join("funnels.json"), serde_json::to_vec_pretty(&funnels).unwrap()).unwrap();
@@ -4668,7 +4319,7 @@
 
     #[test]
     fn resolve_lab_run_dir_rejects_nonexistent_subdir() {
-        // worktree_contained canonicalizes both sides; a dir that was never
+        // path_is_within canonicalizes both sides; a dir that was never
         // created can't resolve — the endpoint would 400 rather than 500 on
         // a typo'd `dir` param.
         let tmp = TempDir::new().unwrap();
@@ -4680,7 +4331,7 @@
     fn resolve_lab_run_dir_rejects_symlink_escape() {
         // A symlink INSIDE lab_dir pointing OUTSIDE it must be rejected —
         // the string-shape checks (`..`, absolute) can't catch this; only
-        // the canonicalize + prefix check in `worktree_contained` can, since
+        // the canonicalize + prefix check in `path_is_within` can, since
         // canonicalize resolves the link to its real (outside) target before
         // the prefix comparison runs.
         let lab = TempDir::new().unwrap();
@@ -4709,7 +4360,7 @@
         assert_eq!(r.archived, 3);
         assert!(!r.degenerate);
         assert!(r.finished, "scores.json present => finished");
-        assert!(r.has_funnels);
+        assert!(r.has_reviews);
         assert!(r.has_events);
         let staffing = r.staffing.as_ref().expect("staffing snapshot present");
         assert_eq!(staffing.probes.len(), 1);
@@ -4738,7 +4389,7 @@
         assert!(r.crew.is_none(), "crew meta lands only once a case completes");
         assert!(r.exec_mode.is_none(), "exec_mode meta lands only once a case completes");
         assert!(!r.finished, "no scores.json yet => not finished");
-        assert!(!r.has_funnels, "no case has completed yet");
+        assert!(!r.has_reviews, "no case has completed yet");
         assert!(r.has_events);
         assert!(r.staffing.is_none(), "no envelope snapshot exists yet");
     }
@@ -5134,7 +4785,7 @@
     #[tokio::test]
     async fn lab_runs_handler_reports_unconfigured_when_no_lab_dir() {
         let flows = TempDir::new().unwrap();
-        let app = build_router_full_local(flows.path().to_path_buf(), worktrees_base_dir(), None);
+        let app = build_router_full_local(flows.path().to_path_buf(), None);
         let response = app
             .oneshot(Request::builder().uri("/lab/runs").body(Body::empty()).unwrap())
             .await
@@ -5153,7 +4804,6 @@
         write_synthetic_funnel_run(&lab.path().join("case-a/run1"), "demo-case-a", "demo-crew");
         let app = build_router_full_local(
             flows.path().to_path_buf(),
-            worktrees_base_dir(),
             Some(lab.path().to_path_buf()),
         );
         let response = app
@@ -5170,14 +4820,37 @@
         assert_eq!(runs[0]["crew"], "demo-crew");
     }
 
+    /// `/lab/runs` serves each run's staffing as the seats it used (name, model,
+    /// k, window, budget), not the whole snapshot the `/runs` fold reads: the
+    /// wire type is `LabStaffing`, and the retired `has_funnels` spelling is gone.
     #[tokio::test]
-    async fn lab_run_detail_handler_returns_funnels_and_scores() {
+    async fn lab_runs_serves_the_staffing_view_and_has_reviews() {
+        let flows = TempDir::new().unwrap();
+        let lab = TempDir::new().unwrap();
+        write_synthetic_funnel_run(&lab.path().join("case-a/run1"), "demo-case-a", "demo-crew");
+        let app = build_router_full_local(flows.path().to_path_buf(), Some(lab.path().to_path_buf()));
+        let response = app
+            .oneshot(Request::builder().uri("/lab/runs").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let run = &json["runs"][0];
+        let mut judge_keys: Vec<&str> =
+            run["staffing"]["judge"].as_object().unwrap().keys().map(String::as_str).collect();
+        judge_keys.sort_unstable();
+        assert_eq!(judge_keys, ["k", "max_tokens", "model", "n_ctx", "name"], "{run}");
+        assert_eq!(run["has_reviews"], true);
+        assert!(run.get("has_funnels").is_none(), "the retired field name must not be served: {run}");
+    }
+
+    #[tokio::test]
+    async fn lab_run_detail_handler_returns_reviews_and_scores() {
         let flows = TempDir::new().unwrap();
         let lab = TempDir::new().unwrap();
         write_synthetic_funnel_run(&lab.path().join("case-a/run1"), "demo-case-a", "demo-crew");
         let app = build_router_full_local(
             flows.path().to_path_buf(),
-            worktrees_base_dir(),
             Some(lab.path().to_path_buf()),
         );
         let response = app
@@ -5193,10 +4866,11 @@
         let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["dir"], "case-a/run1");
-        let funnels = json["funnels"].as_array().unwrap();
-        assert_eq!(funnels.len(), 1);
-        assert_eq!(funnels[0]["case_id"], "demo-case-a");
-        assert_eq!(json["scores"]["provenance"]["profile"], "demo-profile");
+        let reviews = json["reviews"].as_array().unwrap();
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0]["case_id"], "demo-case-a");
+        assert_eq!(json["scores"]["profile"], "demo-profile");
+        assert!(json.get("funnels").is_none(), "the retired field name must not be served: {json}");
     }
 
     #[tokio::test]
@@ -5211,7 +4885,6 @@
         write_synthetic_funnel_run(lab.path(), "demo-case-root", "demo-crew");
         let app = build_router_full_local(
             flows.path().to_path_buf(),
-            worktrees_base_dir(),
             Some(lab.path().to_path_buf()),
         );
         let response = app
@@ -5226,7 +4899,7 @@
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["funnels"].as_array().unwrap()[0]["case_id"], "demo-case-root");
+        assert_eq!(json["reviews"].as_array().unwrap()[0]["case_id"], "demo-case-root");
     }
 
     #[tokio::test]
@@ -5236,7 +4909,6 @@
         write_synthetic_funnel_run(&lab.path().join("case-a/run1"), "demo-case-a", "demo-crew");
         let app = build_router_full_local(
             flows.path().to_path_buf(),
-            worktrees_base_dir(),
             Some(lab.path().to_path_buf()),
         );
         let response = app
@@ -5254,7 +4926,7 @@
     #[tokio::test]
     async fn lab_run_detail_handler_404s_when_not_configured() {
         let flows = TempDir::new().unwrap();
-        let app = build_router_full_local(flows.path().to_path_buf(), worktrees_base_dir(), None);
+        let app = build_router_full_local(flows.path().to_path_buf(), None);
         let response = app
             .oneshot(
                 Request::builder()
@@ -5275,7 +4947,6 @@
         write_synthetic_live_run(&run_dir, "demo-case-b", "demo-gate-crew");
         let app = build_router_full_local(
             flows.path().to_path_buf(),
-            worktrees_base_dir(),
             Some(lab.path().to_path_buf()),
         );
 
@@ -5341,7 +5012,6 @@
         write_synthetic_live_run(&lab.path().join("live/gate-1"), "demo-case-b", "demo-gate-crew");
         let app = build_router_full_local(
             flows.path().to_path_buf(),
-            worktrees_base_dir(),
             Some(lab.path().to_path_buf()),
         );
         let response = app
@@ -5359,7 +5029,7 @@
     #[tokio::test]
     async fn lab_run_events_handler_404s_when_not_configured() {
         let flows = TempDir::new().unwrap();
-        let app = build_router_full_local(flows.path().to_path_buf(), worktrees_base_dir(), None);
+        let app = build_router_full_local(flows.path().to_path_buf(), None);
         let response = app
             .oneshot(
                 Request::builder()
@@ -5469,7 +5139,7 @@
         save_test_mission(&mission);
 
         let flows = TempDir::new().unwrap();
-        let app = build_router_full_local(flows.path().to_path_buf(), worktrees_base_dir(), None);
+        let app = build_router_full_local(flows.path().to_path_buf(), None);
         let response = app
             .oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap())
             .await
@@ -5500,7 +5170,7 @@
     #[tokio::test]
     async fn runs_handler_publishes_its_lifecycle_policy() {
         let flows = TempDir::new().unwrap();
-        let app = build_router_full_local(flows.path().to_path_buf(), worktrees_base_dir(), None);
+        let app = build_router_full_local(flows.path().to_path_buf(), None);
         let response = app.oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap()).await.unwrap();
         let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -5516,7 +5186,6 @@
         write_synthetic_funnel_run(&lab.path().join("case-a/run1"), "demo-case-a", "demo-crew");
         let app = build_router_full_local(
             flows.path().to_path_buf(),
-            worktrees_base_dir(),
             Some(lab.path().to_path_buf()),
         );
         let response = app
@@ -5540,7 +5209,7 @@
     async fn runs_handler_never_errors_with_no_sources_configured() {
         let _guard = CrewDirGuard::new();
         let flows = TempDir::new().unwrap();
-        let app = build_router_full_local(flows.path().to_path_buf(), worktrees_base_dir(), None);
+        let app = build_router_full_local(flows.path().to_path_buf(), None);
         let response = app
             .oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap())
             .await
@@ -5597,7 +5266,6 @@
         // Path B: the daemon's `GET /runs`.
         let app = build_router_full_local(
             flows.path().to_path_buf(),
-            worktrees_base_dir(),
             Some(lab.path().to_path_buf()),
         );
         let response = app
@@ -5640,63 +5308,6 @@
              transformed the rows on the way out, or one of the two call sites stopped passing \
              the same inputs"
         );
-    }
-
-    /// (#1868) The standalone mission-graph page and its `/vendor/*` bundle
-    /// routes are retired; `/mission/:id/graph` is now a 308 redirect into
-    /// the port's own `#mission=<id>` hash route, so an old bookmark or
-    /// shared link still lands the visitor on the mission graph — just
-    /// inside `next.html` instead of a separate document. Permanent +
-    /// method-preserving, matching `next_html`'s own redirect to `/`.
-    #[tokio::test]
-    async fn mission_graph_route_redirects_into_the_port() {
-        let app = build_router_local(PathBuf::new());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/mission/any-id/graph")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT);
-        assert_eq!(
-            response.headers().get("location").unwrap(),
-            "/#mission=any-id"
-        );
-    }
-
-    /// A structurally invalid mission id (fails [`is_valid_catalog_id`]) is
-    /// rejected here directly, matching `graph.json`'s own gate, rather than
-    /// built into a redirect target. Two classes are pinned, because they
-    /// fail for different reasons (#1868 review finding): `#` would
-    /// truncate the hand-built `#mission=<id>` fragment at the URL level,
-    /// while `&` is a legal RFC 3986 fragment character that happens to be
-    /// the PORT's hash-param separator — admitting it would let
-    /// `a&lens=console` redirect a bookmark into the console lens. A
-    /// widening of the allowlist that only considered URL syntax would keep
-    /// the `#` case green while breaking the `&` one, which is exactly why
-    /// both are here.
-    #[tokio::test]
-    async fn mission_graph_route_rejects_invalid_mission_id() {
-        for encoded in ["bad%23id", "a%26lens%3Dconsole"] {
-            let app = build_router_local(PathBuf::new());
-            let response = app
-                .oneshot(
-                    Request::builder()
-                        .uri(format!("/mission/{encoded}/graph"))
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(
-                response.status(),
-                StatusCode::BAD_REQUEST,
-                "id `{encoded}` must be refused, not redirected"
-            );
-        }
     }
 
     /// (#1403) The standalone-shell manifest serves at the well-known path with
@@ -5789,7 +5400,7 @@
             id: "s1".to_string(),
             label: "Dispatch".to_string(),
             kind: "dispatch.internal".to_string(),
-            status: "running",
+            status: darkmux_crew::types::NodeStatus::Running,
             started_ts: None,
             completed_ts: None,
             tokens_final: None,
@@ -5821,7 +5432,7 @@
             id: "review-probe-0-step".to_string(),
             label: "Probe".to_string(),
             kind: "dispatch.map".to_string(),
-            status: "running",
+            status: darkmux_crew::types::NodeStatus::Running,
             started_ts: None,
             completed_ts: None,
             tokens_final: None,
@@ -5844,27 +5455,6 @@
         let app = build_router_local(PathBuf::new());
         let mut req = Request::builder()
             .uri("/mission/some-mission/graph.json")
-            .body(Body::empty())
-            .unwrap();
-        req.extensions_mut().insert(remote_peer());
-        let resp = app.oneshot(req).await.unwrap();
-        clear_auth_env();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    /// Same parity check for the HTML route — it rides the same `timed`
-    /// router group as `/`/`/play/:date`, so the auth gate must run BEFORE
-    /// the redirect handler, not just before whatever the redirect target
-    /// eventually renders. (The sibling `/vendor/*` bundle routes this test
-    /// used to cover alongside it are retired, #1868 — see
-    /// `mission_graph_route_redirects_into_the_port`.)
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn mission_graph_html_requires_token_from_remote_peer() {
-        set_read_auth_env();
-        let app = build_router_local(PathBuf::new());
-        let mut req = Request::builder()
-            .uri("/mission/some-mission/graph")
             .body(Body::empty())
             .unwrap();
         req.extensions_mut().insert(remote_peer());

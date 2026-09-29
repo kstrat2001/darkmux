@@ -113,7 +113,18 @@ async function waitLoadedUnderFrozenClock(page, locatorStr, timeoutMs = 15000) {
 // same relationship `mission-status`/`console.txt` had pre-#1904, verified
 // directly by the "default boot matches console-run-list.txt too" test
 // below rather than merely asserted in this comment.
-const AUTO_PANELS = ["mission-status", "mission-status-all", "machine-status", "flow-status", "role-list", "config-list", "lab-fixture-list", "run-list"];
+// Each entry is `[golden name, hash after "#lens=console&"]`: `mission-status-all`
+// names the golden of the unlimited board, reached by the panel's own `all` opt.
+const AUTO_PANELS: readonly (readonly [string, string])[] = [
+  ["mission-status", "panel=mission-status"],
+  ["mission-status-all", "panel=mission-status&opt.all=all"],
+  ["machine-status", "panel=machine-status"],
+  ["flow-status", "panel=flow-status"],
+  ["role-list", "panel=role-list"],
+  ["config-list", "panel=config-list"],
+  ["lab-fixture-list", "panel=lab-fixture-list"],
+  ["run-list", "panel=run-list"],
+];
 
 test.describe("next-parity: console lens (Packet 6)", () => {
   test.beforeAll(() => {
@@ -152,13 +163,13 @@ test.describe("next-parity: console lens (Packet 6)", () => {
     expect(await extractStageOnlyText(page)).toBe(goldenStageText("console"));
   });
 
-  for (const panelId of AUTO_PANELS) {
-    test(`#lens=console&panel=${panelId} deep-link boot matches console-${panelId}.txt's #stage`, async ({ page }) => {
+  for (const [panelId, panelHash] of AUTO_PANELS) {
+    test(`#lens=console&${panelHash} deep-link boot matches console-${panelId}.txt's #stage`, async ({ page }) => {
       const meta = loadMeta();
       await installFrozenClock(page, meta.frozen_clock_ms);
       installCorpusRoutes(page, meta);
 
-      await page.goto(`/index.html#lens=console&panel=${panelId}`);
+      await page.goto(`/index.html#lens=console&${panelHash}`);
       await expect(page.locator(LOADED)).toBeAttached({ timeout: 15000 });
       expect(await extractStageOnlyText(page)).toBe(goldenStageText(`console-${panelId}`));
       await page.screenshot({ path: shot(`console-${panelId}.png`), fullPage: true });
@@ -222,9 +233,9 @@ test.describe("next-parity: console lens (Packet 6)", () => {
 
   test("the REAL in-corpus OSC-8 deep link ('→ show every mission') renders as a real anchor, since this harness's origin never matches the recorded one", async ({ page }) => {
     // `mission status`'s own recorded output bakes a REAL OSC-8 hyperlink to
-    // `#lens=console&panel=mission-status-all` at the OPERATOR'S OWN daemon
+    // `#lens=console&panel=mission-status&opt.all=all` at the OPERATOR'S OWN daemon
     // origin (`http://100.141.193.1:8765/...` post-sanitization —
-    // `panel_deep_link` in `src/mission_status.rs`). Tried, as a first pass,
+    // `panel_all_link` in `src/mission_status.rs`). Tried, as a first pass,
     // to click this real link and assert an in-page panel switch — that
     // FAILED, and reading `ansi.tsx`'s `panelHref`/`panelSwitchId` shows why
     // it MUST fail under this specific harness: the switch only fires for a
@@ -257,7 +268,7 @@ test.describe("next-parity: console lens (Packet 6)", () => {
     const deepLink = page.locator('a.a-link', { hasText: "show every mission" });
     await expect(deepLink).toBeAttached({ timeout: 15000 });
     expect(await deepLink.getAttribute("data-act")).toBeNull();
-    expect(await deepLink.getAttribute("href")).toContain("panel=mission-status-all");
+    expect(await deepLink.getAttribute("href")).toContain("panel=mission-status&opt.all=all");
   });
 
   test("render-sanity: zero pageerror, real #stage height, no 390px overflow", async ({ page }) => {
@@ -275,7 +286,7 @@ test.describe("next-parity: console lens (Packet 6)", () => {
     // identical comment) — the device preset alone does not guarantee an
     // actually-390px viewport.
     await page.setViewportSize({ width: 390, height: 844 });
-    await page.goto("/index.html#lens=console&panel=mission-status-all");
+    await page.goto("/index.html#lens=console&panel=mission-status&opt.all=all");
     await expect(page.locator(LOADED)).toBeAttached({ timeout: 15000 });
 
     const stageBox = await page.locator("#stage").boundingBox();
@@ -284,7 +295,7 @@ test.describe("next-parity: console lens (Packet 6)", () => {
 
     // `document.body.scrollWidth`, NOT `documentElement.scrollWidth` — see
     // `next-parity-runs.spec.ts`'s identical comment for the
-    // `overflow-x:hidden`-clamp gotcha this sidesteps. `mission-status-all`
+    // `overflow-x:hidden`-clamp gotcha this sidesteps. the unlimited board
     // is deliberately the widest real panel content in the corpus (93
     // missions' worth of table rows) — the panel most likely to actually
     // overflow if `.panelout`'s `overflow-x:auto` scoping were wrong.
@@ -334,8 +345,8 @@ test.describe("next-parity: console lens red-prove (harness self-test)", () => {
     // up the determinism a frozen clock provides elsewhere. See the
     // "clicking through tabs" test above, and its own comment, for where
     // this was first isolated.
-    for (const panelId of AUTO_PANELS) {
-      await page.goto(`/index.html#lens=console&panel=${panelId}`);
+    for (const [panelId, panelHash] of AUTO_PANELS) {
+      await page.goto(`/index.html#lens=console&${panelHash}`);
       await waitLoadedUnderFrozenClock(page, ERRORED);
       expect(await extractStageOnlyText(page)).not.toBe(goldenStageText(`console-${panelId}`));
     }

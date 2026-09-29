@@ -3,7 +3,9 @@ import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../lib/fetcher";
 import { queryKeys } from "../lib/queryKeys";
 import { MACHINE_NOT_FOUND_KEY, UID_SHAPED, decodeMachineKey, type DecodedMachineKey, type MachineKeyContext } from "../lib/machineKey";
-import type { FleetMachinesLiveResponse, FleetRosterResponse, MachineSpecs } from "../types/handwritten";
+import type { FleetMachinesLiveResponse } from "../types/generated/FleetMachinesLiveResponse";
+import type { FleetRosterResponse } from "../types/generated/FleetRosterResponse";
+import type { MachineSpecsResponse } from "../types/generated/MachineSpecsResponse";
 import { useFleetRoster, useLiveMachines } from "./useLiveMachines";
 import type { NormRecord } from "../lib/ingest";
 
@@ -28,7 +30,7 @@ export function useMachineKeyContext(
   const specsQuery = useQuery({
     enabled: live,
     queryKey: queryKeys.machineSpecs(),
-    queryFn: () => fetchJson<MachineSpecs>("/machine/specs"),
+    queryFn: () => fetchJson<MachineSpecsResponse>("/machine/specs"),
   });
   // Observers of the two shared slots above, for their settle state only
   // (`useLiveMachines`/`useFleetRoster` return data, not status). Disabled:

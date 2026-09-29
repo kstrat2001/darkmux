@@ -18,7 +18,7 @@
  */
 
 import { relAgoFrom } from "./format";
-import type { PresenceBeat } from "../types/handwritten";
+import type { PresenceBeat } from "../types/generated/PresenceBeat";
 import { ACTION, latestByTime, type NormRecord } from "./ingest";
 
 /** How long ago the newest dispatch STARTED, as of `nowMs` ("" when none

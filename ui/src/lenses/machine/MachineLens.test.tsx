@@ -138,8 +138,8 @@ function mockMachineFetch(opts: {
       );
     }
     if (path === "./demo-flow.jsonl") return Promise.resolve(new Response("", { status: 200 }));
-    if (path === "/fleet/sessions/live") {
-      return Promise.resolve(new Response(JSON.stringify({ sessions: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }));
+    if (path === "/fleet/dispatches/live") {
+      return Promise.resolve(new Response(JSON.stringify({ dispatches: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }));
     }
     if (path === "/fleet/roster" && opts.roster) {
       return Promise.resolve(new Response(JSON.stringify({ machines: opts.roster, error: null }), { status: 200 }));

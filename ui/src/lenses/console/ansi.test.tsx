@@ -109,7 +109,7 @@ describe("panelSwitchId", () => {
   });
 
   it("returns null for a same-origin link that isn't the console lens", () => {
-    expect(panelSwitchId("/mission/abc/graph")).toBeNull();
+    expect(panelSwitchId("/#mission=abc")).toBeNull();
   });
 
   it("returns null for a console link naming no panel id", () => {
@@ -143,7 +143,36 @@ describe("AnsiText", () => {
     const a = container.querySelector('a[data-act="setpanel"]');
     expect(a?.getAttribute("data-arg")).toBe("doctor");
     (a as HTMLAnchorElement).click();
-    expect(onSwitch).toHaveBeenCalledWith("doctor");
+    expect(onSwitch).toHaveBeenCalledWith("doctor", {});
+  });
+
+  // The CLI's "show every mission" link is `panel=mission-status&opt.all=all`
+  // (the retired `mission-status-all` id is gone). The in-page switch must carry
+  // the opt, or the click lands on the same limited board it started on.
+  it("a panel deep link carries its declared opts into the switch", () => {
+    const origin = window.location.origin;
+    const onSwitch = vi.fn();
+    const { container } = render(
+      <AnsiText
+        text={`\x1b]8;;${origin}/#lens=console&panel=mission-status&opt.all=all\x1b\\every\x1b]8;;\x1b\\`}
+        onPanelSwitch={onSwitch}
+      />,
+    );
+    (container.querySelector('a[data-act="setpanel"]') as HTMLAnchorElement).click();
+    expect(onSwitch).toHaveBeenCalledWith("mission-status", { all: "all" });
+  });
+
+  it("an opt the panel does not declare, or a value it does not allow, is dropped from the switch", () => {
+    const origin = window.location.origin;
+    const onSwitch = vi.fn();
+    const { container } = render(
+      <AnsiText
+        text={`\x1b]8;;${origin}/#lens=console&panel=mission-status&opt.all=bogus&opt.nope=1\x1b\\x\x1b]8;;\x1b\\`}
+        onPanelSwitch={onSwitch}
+      />,
+    );
+    (container.querySelector('a[data-act="setpanel"]') as HTMLAnchorElement).click();
+    expect(onSwitch).toHaveBeenCalledWith("mission-status", {});
   });
 
   it("innerText concatenates plain and styled segments with no stray markup artifacts", () => {

@@ -107,12 +107,8 @@ export interface PanelOptsEntry {
 
 /** The client twin of `panel.rs`'s `panel_spec` match — one entry per BASE
  * verb (#1911: this table counts base verbs, not variants; a verb's
- * declared `opts` is where its variant space lives). `mission-status-all`
- * is NOT an entry here — it resolves through `PANEL_ALIASES`
- * (`lib/route.ts`) to `mission-status` with `all` forced, mirroring the
- * server's own `resolve_alias` split (kept OUT of `panel_spec`'s match for
- * the identical reason: its old argv would fail a "flags are opts, ids are
- * verbs" guard if it were entered directly). */
+ * declared `opts` is where its variant space lives). The unlimited mission
+ * board is `mission-status` with its `all` opt, never an id of its own). */
 export const PANEL_OPTS: Record<PanelId, PanelOptsEntry> = {
   "mission-status": { argv: ["mission", "status"], opts: [ALL_OPT] },
   "role-list": { argv: ["role", "list"], opts: [] },

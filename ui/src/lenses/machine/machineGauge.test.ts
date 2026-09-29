@@ -29,10 +29,11 @@ import {
   resolveGaugeScale,
   sortResidencyRows,
 } from "./machineGauge";
-import type { MachineResources, MachineResourcesModel } from "../../types/handwritten";
+import type { MachineResourcesResponse } from "../../types/generated/MachineResourcesResponse";
+import type { ModelRow } from "../../types/generated/ModelRow";
 import { maxOf, minOf } from "../../lib/numbers";
 
-function resources(overrides: Partial<MachineResources> = {}): MachineResources {
+function resources(overrides: Partial<MachineResourcesResponse> = {}): MachineResourcesResponse {
   return {
     schema_version: "1.0",
     generated_at_ms: 1,
@@ -42,15 +43,16 @@ function resources(overrides: Partial<MachineResources> = {}): MachineResources 
     pool: { capacity_bytes: 137438953472, used_bytes: 69300000000, available_bytes: 72000000000, free_bytes: 3738599424 },
     pressure: { swap_used_bytes: 5453843005, compressor_bytes: 890290176, margin_percent: 88, red: false },
     models: [],
-    machine: { potential_bytes: 24565385183, unpriced_models: 0, estimated_models: 0, current_bytes: 19506757632, state: "green" },
+    machine: { potential_bytes: 24565385183, unpriced_models: 0, estimated_models: 0, over_price_models: 0, other_used_bytes: null, projected_total_bytes: null, current_bytes: 19506757632, state: "green" },
     attribution: "per_process",
+    attribution_note: "",
     messages: [],
     cache_ttl_ms: 2000,
     ...overrides,
   };
 }
 
-function model(overrides: Partial<MachineResourcesModel> = {}): MachineResourcesModel {
+function model(overrides: Partial<ModelRow> = {}): ModelRow {
   return {
     identifier: "darkmux:a",
     model_key: "a",
@@ -144,7 +146,7 @@ describe("resolveGaugeScale — the scale is the allowance, never auto-expanded 
 describe("computeGaugeGeometry", () => {
   it("scales to the limit and positions the needle at cur/scale, clamped 0-180deg", () => {
     const g = computeGaugeGeometry(
-      resources({ machine: { potential_bytes: 24565385183, unpriced_models: 0, estimated_models: 0, current_bytes: 32378306560, state: "unknown" } }),
+      resources({ machine: { potential_bytes: 24565385183, unpriced_models: 0, estimated_models: 0, over_price_models: 0, other_used_bytes: null, projected_total_bytes: null, current_bytes: 32378306560, state: "unknown" } }),
     );
     expect(g.scale).toBe(137438953472);
     expect(g.pct).toBeCloseTo(23.56, 1);
@@ -152,7 +154,7 @@ describe("computeGaugeGeometry", () => {
   });
 
   it("clamps the needle at 100% (180deg) when current meets or exceeds the scale — never past it", () => {
-    const g = computeGaugeGeometry(resources({ machine: { potential_bytes: 1, unpriced_models: 0, estimated_models: 0, current_bytes: 999999999999, state: "red" } }));
+    const g = computeGaugeGeometry(resources({ machine: { potential_bytes: 1, unpriced_models: 0, estimated_models: 0, over_price_models: 0, other_used_bytes: null, projected_total_bytes: null, current_bytes: 999999999999, state: "red" } }));
     expect(g.pct).toBe(100);
     expect(g.needleAngleDeg).toBe(180);
   });
@@ -165,7 +167,7 @@ describe("computeGaugeGeometry", () => {
   });
 
   it("the inverted case: commit tick is null when Σ potential is 0 — no models, nothing to draw", () => {
-    const g = computeGaugeGeometry(resources({ machine: { potential_bytes: 0, unpriced_models: 0, estimated_models: 0, current_bytes: 0, state: "unknown" } }));
+    const g = computeGaugeGeometry(resources({ machine: { potential_bytes: 0, unpriced_models: 0, estimated_models: 0, over_price_models: 0, other_used_bytes: null, projected_total_bytes: null, current_bytes: 0, state: "unknown" } }));
     expect(g.commitPct).toBeNull();
     expect(g.commitAngleDeg).toBeNull();
   });
@@ -175,7 +177,7 @@ describe("computeGaugeGeometry", () => {
       resources({
         limit_bytes: 10000000000,
         pool: { capacity_bytes: 10000000000, used_bytes: 8000000000, available_bytes: 1, free_bytes: 1 },
-        machine: { potential_bytes: 15000000000, unpriced_models: 0, estimated_models: 0, current_bytes: 8000000000, state: "amber" },
+        machine: { potential_bytes: 15000000000, unpriced_models: 0, estimated_models: 0, over_price_models: 0, other_used_bytes: null, projected_total_bytes: null, current_bytes: 8000000000, state: "amber" },
       }),
     );
     expect(g.overcommitted).toBe(true);
@@ -417,7 +419,7 @@ describe("advanceResidency — the scaling rule's residency state machine", () =
 });
 
 describe("sortResidencyRows / groupResidencyRows — stable, never keyed on a live figure", () => {
-  function row(identifier: string, owner: string, current: number): ReturnType<typeof advanceResidency>["rows"][number] {
+  function row(identifier: string, owner: "darkmux" | "user", current: number): ReturnType<typeof advanceResidency>["rows"][number] {
     return { identifier, owner, model: model({ identifier, owner, current_bytes: current }), status: "live", lastSeenMs: 0 };
   }
 
@@ -575,13 +577,13 @@ describe("rowStateDiffers — the per-row chip's whole condition", () => {
  */
 describe("computeBandGeometry — one band, stacked in scale order", () => {
   const G = 1073741824;
-  const res = (over: Record<string, unknown>): MachineResources =>
+  const res = (over: Record<string, unknown>): MachineResourcesResponse =>
     resources({
       limit_bytes: 128 * G,
       pool: { capacity_bytes: 128 * G, used_bytes: 64 * G, available_bytes: 40 * G, free_bytes: 20 * G },
       machine: { potential_bytes: 48 * G, unpriced_models: 0, current_bytes: 32 * G, state: "green" },
       ...over,
-    } as Partial<MachineResources>);
+    } as Partial<MachineResourcesResponse>);
 
   it("stacks darkmux, then everything else, then growth — in that order, without gaps", () => {
     const b = computeBandGeometry(res({}));

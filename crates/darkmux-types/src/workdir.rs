@@ -382,7 +382,7 @@ fn split_gitdir_at(dir: &Path) -> Option<SplitGitdir> {
 /// real `~/.darkmux/worktrees`) before this fix.
 ///
 /// **`ForceUser`: the base is never CWD-DEPENDENT.** This value feeds a
-/// SECURITY check: the daemon's `worktree_contained` /
+/// SECURITY check: the daemon's `path_is_within` /
 /// `validate_remote_workdir` containment test (#840) compares a
 /// tailnet-supplied workdir against this base, and `darkmux serve` (whose cwd
 /// is wherever the operator launched it) must agree with `coder_phase` (whose
@@ -397,7 +397,7 @@ fn split_gitdir_at(dir: &Path) -> Option<SplitGitdir> {
 /// UTF-8, or a platform where `dirs::home_dir()` consults an API beyond
 /// the env var), and the serve copy feeds the worktree containment check
 /// (security-adjacent — see `validate_remote_workdir` below and
-/// `worktree_contained` in darkmux-serve). Unified on `dirs::home_dir()`
+/// `path_is_within` in darkmux-serve). Unified on `dirs::home_dir()`
 /// semantics here; both other call sites now re-point at this function.
 pub fn worktrees_base_dir() -> PathBuf {
     crate::paths::resolve(crate::paths::ResolveScope::ForceUser).root.join("worktrees")

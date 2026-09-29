@@ -11,13 +11,14 @@ import {
   fmtOperatingHours,
 } from "./battery";
 import { gaugeFillColor } from "../components/Meter";
-import type { BatteryHealth, BatterySample } from "../types/handwritten";
+import type { BatteryHealthNow } from "../types/generated/BatteryHealthNow";
+import type { BatteryCharge } from "../types/generated/BatteryCharge";
 
-function sample(over: Partial<BatterySample> = {}): BatterySample {
+function sample(over: Partial<BatteryCharge> = {}): BatteryCharge {
   return { charge_pct: 78, on_ac: false, charging: false, minutes_to_empty: 130, ...over };
 }
 
-function health(over: Partial<BatteryHealth> = {}): BatteryHealth {
+function health(over: Partial<BatteryHealthNow> = {}): BatteryHealthNow {
   return {
     cycle_count: 28,
     design_capacity_mah: 6249,

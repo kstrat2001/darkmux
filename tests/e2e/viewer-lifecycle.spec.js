@@ -88,13 +88,13 @@ test('activity lane: drilling a session.end-only session does not throw', async 
   page.on('pageerror', (e) => pageErrors.push(String(e)));
 
   // The session-drill's own destination fetch (`SessionReplay` →
-  // `/flow-session/<id>`) — this static-playback harness has no daemon
+  // `/flow-dispatch/<id>`) — this static-playback harness has no daemon
   // behind it, so it needs the same real-shaped mock every other
   // `#session=` spec in this suite uses (`viewer-session-url.spec.js`'s
   // `mockSession`), scoped to exactly the fixture's two records for this
   // session id (dispatch.start, then ONLY session.end — no
   // dispatch.complete/error at all).
-  await page.route('**/flow-session/sess-ended-via-sessionend', (r) =>
+  await page.route('**/flow-dispatch/sess-ended-via-sessionend', (r) =>
     r.fulfill({
       contentType: 'application/json',
       body: JSON.stringify({

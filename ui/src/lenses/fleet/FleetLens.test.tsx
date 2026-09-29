@@ -169,7 +169,7 @@ function mockFleetFetch(opts: {
   /** (#2965) Further days that answer `200 []`: the mock names today and
    *  yesterday when it is built, so a day reached by a rollover needs this. */
   emptyDays?: string[];
-  /** Session ids `/fleet/sessions/live` reports beating. */
+  /** Session ids `/fleet/dispatches/live` reports beating. */
   sessions?: string[];
 } = {}) {
   const today = todayUTC();
@@ -205,10 +205,10 @@ function mockFleetFetch(opts: {
         ),
       );
     }
-    if (path === "/fleet/sessions/live") {
-      const sessions = (opts.sessions ?? []).map((session_id) => ({ session_id }));
+    if (path === "/fleet/dispatches/live") {
+      const dispatches = (opts.sessions ?? []).map((session_id) => ({ session_id }));
       return Promise.resolve(
-        new Response(JSON.stringify({ sessions, meta: { sources: { fleet: { state: "ok" } }, complete: true } }), { status: 200 }),
+        new Response(JSON.stringify({ dispatches, meta: { sources: { fleet: { state: "ok" } }, complete: true } }), { status: 200 }),
       );
     }
     if (path === "/machine/specs") {
@@ -556,7 +556,7 @@ describe("FleetLens", () => {
    * renders `<FleetLens />` with NO props, so `historical` sits at its
    * default `false` and the live-only endpoints fired on the STATIC
    * demo — measured on the served build, `#lens=fleet` produced 404s for
-   * `/fleet/machines/live`, `/fleet/sessions/live` and `/machine/specs`
+   * `/fleet/machines/live`, `/fleet/dispatches/live` and `/machine/specs`
    * plus their console errors. The prop describes the CALLER's intent (a
    * replay); only the BUILD can answer "is there a daemon at all" — the
    * #1801 rule `MachineLens`/`useFlowWindow`/`route.ts::isLiveRoute`
@@ -598,7 +598,7 @@ describe("FleetLens", () => {
       await new Promise((r) => setTimeout(r, 50));
       expect(
         seen.filter(
-          (p) => p === "/fleet/machines/live" || p === "/fleet/sessions/live" || p === "/machine/specs" || p === "/fleet/roster",
+          (p) => p === "/fleet/machines/live" || p === "/fleet/dispatches/live" || p === "/machine/specs" || p === "/fleet/roster",
         ),
       ).toEqual([]);
     } finally {
@@ -1919,7 +1919,7 @@ describe("FleetLens — a card says no signal until its first data arrives (#295
   for (const [what, held] of [
     ["the flow window", flowPaths],
     ["live machines", () => ["/fleet/machines/live"]],
-    ["live sessions", () => ["/fleet/sessions/live"]],
+    ["live sessions", () => ["/fleet/dispatches/live"]],
     ["/runs", () => ["/runs"]],
   ] as const) {
     it(`this machine's own card says 'no signal' while ${what} alone is unanswered, then 'idle'`, async () => {
@@ -1931,7 +1931,7 @@ describe("FleetLens — a card says no signal until its first data arrives (#295
       await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
       // Every other source has answered before the card is read: the held
       // one is the only thing standing between the card and its reading.
-      const others = { "/fleet/machines/live": queryKeys.fleetMachinesLive(), "/fleet/sessions/live": queryKeys.fleetSessionsLive(), "/runs": queryKeys.runs() };
+      const others = { "/fleet/machines/live": queryKeys.fleetMachinesLive(), "/fleet/dispatches/live": queryKeys.fleetSessionsLive(), "/runs": queryKeys.runs() };
       await waitFor(() => {
         for (const [path, key] of Object.entries(others)) {
           if (!paths.includes(path)) expect(queryClient.getQueryState(key)?.status, path).toBe("success");

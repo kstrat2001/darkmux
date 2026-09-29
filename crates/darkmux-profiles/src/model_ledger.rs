@@ -271,6 +271,8 @@ const SHRINK_CTX_FLOOR: u64 = 4096;
 // ── payload types (ONE shape for --json and /machine/resources) ────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "lowercase")]
 pub enum LedgerState {
     Green,
@@ -293,6 +295,8 @@ impl LedgerState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "lowercase")]
 pub enum Owner {
     /// `darkmux:*`-namespaced instance (darkmux-managed).
@@ -305,6 +309,8 @@ pub enum Owner {
 /// degraded attribution is visible in the output itself (#1286: never
 /// silently precise).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "snake_case")]
 pub enum Attribution {
     /// One inference worker per resident: workers rank-matched to models
@@ -328,6 +334,8 @@ pub enum Attribution {
 /// term two meanings inside the same product (the same collision class as
 /// compactor/compressor).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     /// A disclosure — nothing degraded, working as documented. The #1819
@@ -348,6 +356,8 @@ pub enum Severity {
 /// [`LEDGER_SCHEMA_VERSION`]'s 2.0 changelog entry for why this was a
 /// breaking rename rather than an additive field.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct LedgerMessage {
     pub severity: Severity,
     pub text: String,
@@ -366,6 +376,8 @@ impl LedgerMessage {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "snake_case")]
 pub enum LimitSource {
     /// The #1243 AI-RAM budget (not yet wired into `config.json` on main —
@@ -384,6 +396,8 @@ pub enum LimitSource {
 /// Absent (not serialized) on a [`ModelRow`] with no potential at all —
 /// see [`ModelRow::potential_source`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "snake_case")]
 pub enum PotentialSource {
     /// Priced from the model's own architecture facts ([`ArchEstimator`]) —
@@ -417,7 +431,10 @@ pub enum PotentialSource {
 /// (issue finding 7: `pool free` and the `% free` tile disagreed by 51
 /// points while sharing the word "free").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct PoolSnapshot {
+    #[cfg_attr(feature = "ts-export", ts(type = "number"))]
     pub capacity_bytes: u64,
     /// Activity-Monitor-style: `wired + compressor_occupied + (active +
     /// inactive - purgeable)`. Cross-checked live against `top` (issue
@@ -425,6 +442,7 @@ pub struct PoolSnapshot {
     /// loaded machine — materially closer than the implied
     /// `capacity - free`, which came in at 73.4 GiB the same instant and
     /// had swung between 1.8 and 61 GiB within one earlier session.
+    #[cfg_attr(feature = "ts-export", ts(type = "number | null"))]
     pub used_bytes: Option<u64>,
     /// The colloquial "how much is left": `free + inactive + speculative`.
     /// Neither `free_bytes` alone (too strict — charges ~26 GiB of
@@ -432,59 +450,75 @@ pub struct PoolSnapshot {
     /// (too generous — the `% free` pressure tile; see its own doc) answers
     /// this; this field is the figure that was missing from the page
     /// entirely (issue finding 7).
+    #[cfg_attr(feature = "ts-export", ts(type = "number | null"))]
     pub available_bytes: Option<u64>,
     /// Truly-free pages only (`vm_stat` "Pages free" × page size) — the
     /// SAME conservative figure this field answered to the name
     /// `available_bytes` before #1821's honest rename. Still the same tilt
     /// as the gestalt `MacProbe` (inactive/speculative/purgeable
     /// deliberately excluded).
+    #[cfg_attr(feature = "ts-export", ts(type = "number | null"))]
     pub free_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct PressureSnapshot {
     /// `sysctl vm.swapusage` used bytes.
+    #[cfg_attr(feature = "ts-export", ts(type = "number | null"))]
     pub swap_used_bytes: Option<u64>,
     /// `vm_stat` "Pages occupied by compressor" × page size. Surfaced as a
     /// row; NOT a red trigger in v1 (growth detection needs history a
     /// single snapshot doesn't have — #1247 telemetry series will).
+    #[cfg_attr(feature = "ts-export", ts(type = "number | null"))]
     pub compressor_bytes: Option<u64>,
     /// `sysctl kern.memorystatus_level` — `(capacity - wired - compressor) /
     /// capacity`, the kernel's own 0–100 pressure headroom. Named `margin`,
     /// not `free` (#1821): it is neither free nor available memory in the
     /// byte-count sense — see [`MARGIN_PERCENT_RED`]'s doc for the live
     /// 82%-vs-30.8% gap that motivated the rename.
+    #[cfg_attr(feature = "ts-export", ts(type = "number | null"))]
     pub margin_percent: Option<u64>,
     /// Whether any red-zone pressure signal is active (see the thresholds).
     pub red: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct ModelRow {
     pub identifier: String,
     pub model_key: String,
     pub owner: Owner,
+    #[cfg_attr(feature = "ts-export", ts(type = "number"))]
     pub loaded_ctx: u64,
     /// Catalog `size_bytes` (on-disk weights).
+    #[cfg_attr(feature = "ts-export", ts(type = "number | null"))]
     pub weights_bytes: Option<u64>,
     /// `kv_per_token(arch)` — `None` when arch facts are unreadable.
+    #[cfg_attr(feature = "ts-export", ts(type = "number | null"))]
     pub kv_per_token_bytes: Option<u64>,
     /// `kv_per_token × loaded_ctx`.
+    #[cfg_attr(feature = "ts-export", ts(type = "number | null"))]
     pub kv_bytes_at_ctx: Option<u64>,
     /// weights + KV@ctx + transient margin ([`ArchEstimator`]), OR weights +
     /// the #1819 size-based fallback estimate ([`V1Estimator`] via
     /// [`ArchWithSizeFallback`]); `None` = genuinely unpriceable (no
     /// readable arch facts AND no catalog size either — the documented
     /// unknowable path, never guessed).
+    #[cfg_attr(feature = "ts-export", ts(type = "number | null"))]
     pub potential_bytes: Option<u64>,
     /// Which estimator answered — `None` only when `potential_bytes` is
     /// also `None` (nothing priced it at all). Not serialized when absent
     /// (`skip_serializing_if`), matching this file's other optional-field
     /// convention (see `shrink_hint`).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
     pub potential_source: Option<PotentialSource>,
     /// Attributed current footprint — `None` under
     /// [`Attribution::Unavailable`].
+    #[cfg_attr(feature = "ts-export", ts(type = "number | null"))]
     pub current_bytes: Option<u64>,
     pub state: LedgerState,
     /// #1854: how much this resident holds ABOVE its priced
@@ -503,13 +537,17 @@ pub struct ModelRow {
     /// What was falsified is the estimate's ceiling, not the fit — the fit
     /// is measured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(type = "number", optional))]
     pub over_price_bytes: Option<u64>,
     /// Amber only: the config shrink that reaches green at load time.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
     pub shrink_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct MachineTotals {
     /// Σ potential over PRICEABLE residents (arch-priced AND estimated —
     /// see [`Self::estimated_models`]). When `unpriced_models > 0` this
@@ -523,6 +561,7 @@ pub struct MachineTotals {
     /// every verdict downstream of it) optimistic by exactly the overage.
     /// [`Self::over_price_models`] counts how many residents were counted
     /// at their measured size, so the qualification travels with the figure.
+    #[cfg_attr(feature = "ts-export", ts(type = "number"))]
     pub potential_bytes: u64,
     /// Residents whose potential is genuinely unknowable — no readable arch
     /// facts AND no catalog size either (counted as 0 above). Distinct from
@@ -567,6 +606,7 @@ pub struct MachineTotals {
     pub over_price_models: u32,
     /// Total inference-worker footprint; `None` under
     /// [`Attribution::Unavailable`].
+    #[cfg_attr(feature = "ts-export", ts(type = "number | null"))]
     pub current_bytes: Option<u64>,
     /// #1821: what everything else on the machine is holding right now —
     /// `pool.used_bytes - current_bytes`, floored at 0. `None` when
@@ -577,6 +617,7 @@ pub struct MachineTotals {
     /// commitment. Emitted so the cascade's arithmetic is checkable from
     /// the JSON, not just trusted (this page's covenant).
     #[serde(default)]
+    #[cfg_attr(feature = "ts-export", ts(type = "number | null"))]
     pub other_used_bytes: Option<u64>,
     /// #1821: `other_used_bytes + potential_bytes` — "if darkmux's own
     /// commitment fully materializes while everything else holds what it
@@ -586,19 +627,26 @@ pub struct MachineTotals {
     /// silently assumed darkmux was the machine's only tenant. `None`
     /// exactly when `other_used_bytes` is `None`.
     #[serde(default)]
+    #[cfg_attr(feature = "ts-export", ts(type = "number | null"))]
     pub projected_total_bytes: Option<u64>,
     pub state: LedgerState,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
     pub shrink_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct ModelLedger {
     pub schema_version: String,
+    #[cfg_attr(feature = "ts-export", ts(type = "number"))]
     pub generated_at_ms: u64,
     /// Observer-cost stamp (#1286 binding constraint 3): wall-clock ms the
     /// gather itself took. 0 for a purely-computed ledger (tests).
+    #[cfg_attr(feature = "ts-export", ts(type = "number"))]
     pub gather_ms: u64,
+    #[cfg_attr(feature = "ts-export", ts(type = "number | null"))]
     pub limit_bytes: Option<u64>,
     pub limit_source: LimitSource,
     pub pool: Option<PoolSnapshot>,

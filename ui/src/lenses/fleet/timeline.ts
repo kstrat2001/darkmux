@@ -59,7 +59,7 @@
 import { statusLabel, displayNameOf } from "../../lib/flow";
 import type { RosterName, SelfIdentity } from "../../lib/flow";
 import { clkhm } from "../../lib/format";
-import type { PresenceBeat } from "../../types/handwritten";
+import type { PresenceBeat } from "../../types/generated/PresenceBeat";
 import type { NormRecord } from "../../lib/ingest";
 import type { RunStatus } from "../../types/generated/RunStatus";
 import { DEFAULT_POLICY, endMs, lifecycleAt, spanOf, toRunState, type LifecyclePolicy, type Presence } from "../../lib/lifecycle";

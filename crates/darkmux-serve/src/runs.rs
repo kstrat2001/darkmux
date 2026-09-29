@@ -2431,7 +2431,7 @@ fn ghost_runs(
 /// [`RUNS_FLOW_SCAN_WINDOW_DAYS`] before now unless `--since` pushed it
 /// earlier (#2902 step 2b). A SEPARATE,
 /// smaller day-file walk rather than extending the shared primitive —
-/// that primitive's OTHER callers (`/flow-mission/:id`, `/flow-session/:id`,
+/// that primitive's OTHER callers (`/flow-mission/:id`, `/flow-dispatch/:id`,
 /// the full-history catalog endpoints) must keep seeing a run's COMPLETE
 /// history; bounding is specific to THIS module's route-resolution/
 /// ghost-synthesis use, not a general flow-reading behavior change that
@@ -3821,7 +3821,7 @@ mod tests {
             archived: 0,
             degenerate,
             finished,
-            has_funnels: true,
+            has_reviews: true,
             has_events: true,
             session_id: None,
             run_ok: None,

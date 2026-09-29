@@ -39,7 +39,7 @@ function wrapper() {
  *  gate rather than by this file:
  *
  *    GET /flow/<date>        -> a BARE JSON ARRAY   (lib.rs flow_handler)
- *    GET /flow-session/<id>  -> { records, count, ... }  (catalog_records_response)
+ *    GET /flow-dispatch/<id>  -> { records, count, ... }  (catalog_records_response)
  */
 function mockFetch(records: unknown[]) {
   return vi.fn(async (url: string) => {
@@ -169,7 +169,7 @@ describe("useRouteRecords — the static-demo flow-src route (#1801)", () => {
     expect(calls.some((u) => u.startsWith("/flow/"))).toBe(false);
   });
 
-  it("(#2065) slices ONE session out of the flow-src file on a dispatch route, never GET /flow-session/<id>", async () => {
+  it("(#2065) slices ONE session out of the flow-src file on a dispatch route, never GET /flow-dispatch/<id>", async () => {
     injectMeta("darkmux-flow-src", "./demo-flow.jsonl");
     vi.stubGlobal(
       "fetch",
@@ -195,7 +195,7 @@ describe("useRouteRecords — the static-demo flow-src route (#1801)", () => {
       ["s1", "dispatch.complete"],
     ]);
     const calls = (globalThis.fetch as unknown as { mock: { calls: unknown[][] } }).mock.calls.map((c) => String(c[0]));
-    expect(calls.some((u) => u.startsWith("/flow-session/"))).toBe(false);
+    expect(calls.some((u) => u.startsWith("/flow-dispatch/"))).toBe(false);
   });
 
   it("is EMPTY, not the live window, when the static source is unreachable", async () => {
@@ -243,11 +243,11 @@ describe("useRouteRecords — the static-demo flow-src route (#1801)", () => {
 function mockFetchLive(opts: { liveIds: string[]; records: () => unknown[] }) {
   return vi.fn(async (url: string) => {
     const u = String(url);
-    if (u.startsWith("/fleet/sessions/live")) {
+    if (u.startsWith("/fleet/dispatches/live")) {
       return {
         ok: true,
         status: 200,
-        json: async () => ({ sessions: opts.liveIds.map((id) => ({ session_id: id })) }),
+        json: async () => ({ dispatches: opts.liveIds.map((id) => ({ session_id: id })) }),
       };
     }
     const recs = opts.records();

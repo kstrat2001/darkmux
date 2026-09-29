@@ -237,6 +237,8 @@ pub struct Crew {
 
 /// Status of a mission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "lowercase")]
 pub enum MissionStatus {
     /// A mission that is running or ready to run. `paused` is read as
@@ -274,6 +276,8 @@ pub enum MissionStatus {
 
 /// A mission — a named objective tying phases together.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct Mission {
     pub id: String,
     pub description: String,
@@ -286,10 +290,12 @@ pub struct Mission {
     /// mission self-migrates its field name the next time it's touched.
     #[serde(default, alias = "sprint_ids")]
     pub phase_ids: Vec<String>,
+    #[cfg_attr(feature = "ts-export", ts(type = "number"))]
     pub created_ts: u64,
     /// When the mission first transitioned to `Active`. None until
     /// `mission launch` starts it. Used by the wall-clock UI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(type = "number", optional))]
     pub started_ts: Option<u64>,
     /// When the mission transitioned to `Finalized`. Finalized is
     /// terminal — once set, lifecycle verbs can't move the mission
@@ -302,6 +308,7 @@ pub struct Mission {
         alias = "closed_ts",
         skip_serializing_if = "Option::is_none"
     )]
+    #[cfg_attr(feature = "ts-export", ts(type = "number", optional))]
     pub finalized_ts: Option<u64>,
     /// (#815) The operator's VERBATIM intent (a config's `source_input` key) — the
     /// unabridged prose that was summarized into the
@@ -311,6 +318,7 @@ pub struct Mission {
     /// translation seam from the 2026-06-12 dogfood). None on
     /// hand-authored or pre-#815 missions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
     pub source_input: Option<String>,
     /// (#816) Work-item / ticket id this mission realizes (e.g.
     /// `SAMPLE-4101`), set via the config's `ticket` key. Referenced as
@@ -319,6 +327,7 @@ pub struct Mission {
     /// on ticketless missions — templates referencing `{ticket}` then
     /// fall back to darkmux defaults with a soft warning.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
     pub ticket: Option<String>,
     /// (#1503) The spec this run was launched from — a GROUPING key
     /// (which config + which resolved inputs), never identity. A mission's
@@ -331,6 +340,7 @@ pub struct Mission {
     /// existed, or on a run with no meaningful input spec — they simply read
     /// as ungrouped; no migration needed (lenient-on-read, contract 7).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
     pub spec: Option<MissionSpec>,
     /// (#1810) The machine this mission was minted on, stamped once at
     /// creation from `darkmux_flow::resolve_machine_id()` — the SAME
@@ -367,6 +377,7 @@ pub struct Mission {
     /// therefore many distinct roles, has no single durable value and
     /// stays flow-derived (and therefore windowed) for role.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
     pub machine: Option<String>,
 }
 
@@ -446,6 +457,8 @@ fn has_epoch_segment(id: &str) -> bool {
 /// consolidation-ready: a future dispatch or lab-run record could carry the
 /// same shape as its own grouping key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct MissionSpec {
     /// The mission config id this run was launched from (e.g. `coder-phase`,
     /// `review`).
@@ -462,6 +475,7 @@ pub struct MissionSpec {
     /// every such spec-bearing mission was a launched run, so readers treat
     /// absent as `Builtin`-equivalent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
     pub origin: Option<MissionSpecOrigin>,
     /// A compact fingerprint over the resolved inputs — the blake3 digest
     /// that, pre-#1503, WAS the mission id. Two runs of the same config with
@@ -474,6 +488,8 @@ pub struct MissionSpec {
 /// read (an unrecognized future value deserializes as if absent via the
 /// field's `Option` + default — contract 5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "lowercase")]
 pub enum MissionSpecOrigin {
     /// Launched from the operator's own config (user tier).
@@ -484,6 +500,8 @@ pub enum MissionSpecOrigin {
 
 /// Status of a phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "lowercase")]
 pub enum PhaseStatus {
     #[default]
@@ -507,6 +525,8 @@ pub enum PhaseStatus {
 /// "next runnable phase" scan) is simply `Mission::phase_ids[i - 1]` for
 /// a phase at index `i`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct Phase {
     pub id: String,
     pub mission_id: String,
@@ -521,25 +541,30 @@ pub struct Phase {
     /// `id` (never `description` — a truncated brief reads worse than a
     /// clean id).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
     pub display_name: Option<String>,
     #[serde(default)]
     pub status: PhaseStatus,
+    #[cfg_attr(feature = "ts-export", ts(type = "number"))]
     pub created_ts: u64,
     /// When the phase first transitioned to `Running` (or last transitioned
     /// to `Running` after being `Abandoned` and restarted). None until
     /// `darkmux phase start` runs. Wall-clock UI shows live elapsed when
     /// `status == Running` (now - started_ts).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(type = "number", optional))]
     pub started_ts: Option<u64>,
     /// When the phase transitioned to `Complete`. Complete is terminal —
     /// once set, lifecycle verbs can't move the phase elsewhere. Wall-clock
     /// duration = completed_ts - started_ts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(type = "number", optional))]
     pub completed_ts: Option<u64>,
     /// When the phase transitioned to `Abandoned`. Cleared when the
     /// operator changes their mind and runs `phase start` again — the
     /// state machine treats `Abandoned → Running` as a legal restart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(type = "number", optional))]
     pub abandoned_ts: Option<u64>,
     /// (#1230 Packet 2) IDs of the DAG-native `Task`s that make up this
     /// phase's actual execution graph. Additive-only field — everything
@@ -561,6 +586,8 @@ pub struct Phase {
 /// `PhaseStatus` analog — a Phase either completes or is abandoned by
 /// the operator; a Step can fail its own execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "lowercase")]
 pub enum NodeStatus {
     #[default]

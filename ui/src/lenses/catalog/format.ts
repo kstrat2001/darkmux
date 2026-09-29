@@ -1,4 +1,5 @@
-import type { FlowDay, FlowMissionSummary } from "../../types/handwritten";
+import type { FlowDay } from "../../types/generated/FlowDay";
+import type { FlowMissionSummary } from "../../types/generated/FlowMissionSummary";
 
 /**
  * Pure formatting functions ported from `viewer.html`'s `toggleCatalog()`

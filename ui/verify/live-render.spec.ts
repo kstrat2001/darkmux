@@ -40,7 +40,7 @@ test("the /next shell renders clean: zero pageerrors, no horizontal scroll at 39
   });
 
   await page.setViewportSize({ width: 390, height: 844 });
-  await page.goto("/next");
+  await page.goto("/");
   await page.waitForSelector("#stage");
   // Give the fleet query a moment to settle out of the pending skeleton.
   await page.waitForSelector('[data-state]:not([data-state="pending"])', { timeout: 10_000 });
@@ -104,7 +104,7 @@ test("data state: a non-empty fleet renders one card per machine", async ({ page
     }),
   );
   await page.setViewportSize({ width: 1280, height: 800 });
-  await page.goto("/next");
+  await page.goto("/");
   await expect(page.locator('[data-state="data"]')).toBeVisible();
   await expect(page.getByText("MacBook-Pro")).toBeVisible();
   await expect(page.getByText("m1-max-32gb-studio")).toBeVisible();
@@ -117,14 +117,14 @@ test("pending state: the skeleton renders before the fetch resolves", async ({ p
     await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ machines: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }) });
   });
   await page.setViewportSize({ width: 1280, height: 800 });
-  await page.goto("/next");
+  await page.goto("/");
   await expect(page.locator('[data-state="pending"]')).toBeVisible();
   await page.screenshot({ path: screenshotPath("1-fleet-pending.png") });
 });
 
 test("error state: killing the throwaway daemon mid-session renders a visible error, not a blank page", async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 800 });
-  await page.goto("/next");
+  await page.goto("/");
   // Confirm we start from a real, non-error state (daemon alive).
   await page.waitForSelector('[data-state]:not([data-state="pending"])', { timeout: 10_000 });
   await expect(page.locator('[data-state="error"]')).toHaveCount(0);

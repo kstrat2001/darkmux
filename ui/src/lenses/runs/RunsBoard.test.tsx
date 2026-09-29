@@ -187,7 +187,7 @@ describe("RunsBoard", () => {
     // such row is synthesized only for a flow session that saw a real
     // `dispatch start` record (`ghost_runs`'s `has_start` gate in
     // `crates/darkmux-serve/src/runs.rs`), so it always has something to
-    // show via `/flow-session/<id>` even with no mission graph behind it.
+    // show via `/flow-dispatch/<id>` even with no mission graph behind it.
     // The "untracked" chip still shows (it's an honest label — no durable
     // run record backs this row) but it must no longer mean unopenable.
     // `session_id: "ghost"` matches the real wire shape: `ghost_runs`
@@ -223,7 +223,7 @@ describe("RunsBoard", () => {
 
       fireEvent.click(row);
       expect(window.location.hash).toBe("#dispatch=ghost");
-      // No mission-graph gate applies here — `/flow-session/<id>` is a
+      // No mission-graph gate applies here — `/flow-dispatch/<id>` is a
       // plain daemon fetch, same precedent as `FleetLens.tsx`'s activity-
       // lane bars, which navigate to `#dispatch=<sid>` ungated.
       expect(screen.queryByText(/needs a running daemon/i)).not.toBeInTheDocument();
@@ -443,7 +443,7 @@ describe("RunsBoard", () => {
         if (url === "/runs") return Promise.resolve(new Response(JSON.stringify({ runs: RUNS, generated_at_ms: 1 }), { status: 200 }));
         if (url === "/lab/runs")
           return Promise.resolve(new Response(JSON.stringify({ configured: true, dir: "/lab", exists: true, runs: [] }), { status: 200 }));
-        if (url.startsWith("/lab/run/detail")) return Promise.resolve(new Response(JSON.stringify({ dir: "l1", funnels: [], scores: null }), { status: 200 }));
+        if (url.startsWith("/lab/run/detail")) return Promise.resolve(new Response(JSON.stringify({ dir: "l1", reviews: [], scores: null }), { status: 200 }));
         if (url.startsWith("/lab/run/events")) return Promise.resolve(new Response(JSON.stringify({ lines: [], next_offset: 0, finished: false }), { status: 200 }));
         return Promise.resolve(new Response("not found", { status: 404 }));
       }),
@@ -511,7 +511,7 @@ describe("RunsBoard", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn((url: string) => {
-        if (url.startsWith("/lab/run/detail")) return Promise.resolve(new Response(JSON.stringify({ dir: "live/gate-1", funnels: [], scores: null }), { status: 200 }));
+        if (url.startsWith("/lab/run/detail")) return Promise.resolve(new Response(JSON.stringify({ dir: "live/gate-1", reviews: [], scores: null }), { status: 200 }));
         if (url.startsWith("/lab/run/events")) return Promise.resolve(new Response(JSON.stringify({ lines: [], next_offset: 0, finished: false }), { status: 200 }));
         return Promise.resolve(new Response("not found", { status: 404 }));
       }),

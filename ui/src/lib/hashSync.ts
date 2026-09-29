@@ -30,13 +30,11 @@ import { canonicalOptPairs } from "../lenses/console/panels";
  *   one user today: a kind-chip click changes no `Route` (no `hashchange`
  *   fires), so the route-keyed effect below would never see it.
  * - `useSyncHash` (effect): runs `canonicalHash` on every route change and
- *   writes it back — this is what performs the legacy `#lens=lab` →
- *   `#lens=runs&kind=lab` upgrade, since arriving on the alias already
- *   parses to the canonical `Route` (`route.runsKind === "lab"`) and this
- *   effect just names it in the address bar.
+ *   writes it back, so the address bar always names the route the page is
+ *   showing (for instance, an opt left at its default is dropped).
  *
  * Scope: the params every ported lens drives (`lens`/`kind`/`panel`/
- * `session`/`machine`) are written. `mission` (#1868 — the
+ * `dispatch`/`machine`) are written. `mission` (#1868 — the
  * mission-graph lens) stays out of scope for this write-back path too, for
  * a DIFFERENT reason than before this packet: `#mission=<id>` used to be a
  * full navigation away (nothing to write back to); now it renders in-place,
@@ -103,8 +101,7 @@ export function canonicalHash(route: Route): string | null {
       // (drill-in packet) The drilled machine — see `route.ts`'s own doc on
       // the widened `machine` route: written only for an explicit drill
       // (non-null); the local nav-tab/deep-link entry stays exactly
-      // `#lens=machine`. (#2929) As `machine=<key>`, never `uid=<uid>`: an
-      // old `uid=` link parses into the same field and is rewritten here.
+      // `#lens=machine`. (#2929) As `machine=<key>`, never `uid=<uid>`.
       if (route.machine) p.set("machine", route.machine);
       return p.toString();
     }
@@ -126,13 +123,7 @@ export function canonicalHash(route: Route): string | null {
       // (#1911) Non-default `opt.<name>` selections, sorted by name — the
       // SAME `canonicalOptPairs` function `queryKeys.panel` keys its cache
       // on, so the two tiers cannot disagree about what "the current
-      // variant" means. This is also the alias-upgrade path: a
-      // `panel=mission-status-all` deep link already parsed to
-      // `{panelId:"mission-status", opts:{all:"all"}}` (see
-      // `route.ts::PANEL_ALIASES`), so writing it back here rewrites the
-      // address bar to `panel=mission-status&opt.all=all` — the same
-      // `#lens=lab` → `#lens=runs&kind=lab` upgrade this function already
-      // performs for the runs lens.
+      // variant" means.
       if (route.panelId) {
         for (const [name, value] of canonicalOptPairs(route.panelId, route.opts)) {
           p.set(`opt.${name}`, value);
@@ -141,9 +132,6 @@ export function canonicalHash(route: Route): string | null {
       return p.toString();
     }
     case "dispatch": {
-      // (#1974) Writes the CANONICAL `dispatch=` spelling, which is what
-      // makes the `session=` alias one-release rather than permanent: an
-      // old bookmark parses, then gets rewritten here to the new form.
       return dispatchHash(route.dispatchId, route.missionId);
     }
     case "mission": {

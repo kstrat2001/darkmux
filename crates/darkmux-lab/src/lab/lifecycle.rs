@@ -85,6 +85,8 @@ pub const LIFECYCLE_FILE: &str = "lifecycle.json";
 pub const LIFECYCLE_SCHEMA_VERSION: &str = "1.1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "snake_case")]
 pub enum LifecycleStatus {
     /// Start bookend written; no terminal record yet. Either genuinely live,

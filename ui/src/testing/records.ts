@@ -1,4 +1,4 @@
-import type { FlowRecord } from "../types/handwritten";
+import type { FlowRecord } from "../types/generated/FlowRecord";
 import { ingest, ingestRecord, type NormRecord } from "../lib/ingest";
 
 /** A test fixture's raw record: the wire shape, loosely typed so a fixture

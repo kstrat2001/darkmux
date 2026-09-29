@@ -2256,6 +2256,8 @@ pub enum Stage {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct FlowRecord {
     pub ts: String,
     pub level: Level,
@@ -2270,8 +2272,10 @@ pub struct FlowRecord {
     /// key so historical records don't silently lose the field; every
     /// newly-written record emits the canonical `phase_id` key.
     #[serde(skip_serializing_if = "Option::is_none", alias = "sprint_id")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
     pub phase_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
     pub session_id: Option<String>,
     /// The role execution this record is about: set on every record whose
     /// action is execution-grain (`FlowAction::grain`), never on any other.
@@ -2279,8 +2283,10 @@ pub struct FlowRecord {
     /// task session holds one per `dispatch.map` item). Schema 2.0 addition.
     /// A pre-4.0 record carries none; `crate::reader` synthesizes one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(type = "string", optional))]
     pub execution_id: Option<darkmux_types::execution_id::ExecutionId>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
     pub source: Option<FlowSource>,
     /// LMStudio model id that handled this work, when known. Set on
     /// dispatch records (`tier=local, stage=dispatch`) so the viewer
@@ -2291,6 +2297,7 @@ pub struct FlowRecord {
     /// verdicts) and for dispatches where the model can't be resolved.
     /// Schema 1.2 addition (#106).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
     pub model: Option<String>,
     /// Operator-facing reasoning for this record. Used primarily by
     /// tier-decision records (#136) where the frontier orchestrator
@@ -2301,11 +2308,13 @@ pub struct FlowRecord {
     /// on any record, it's free-form prose intended for human review
     /// (debrief, compliance audit, post-mortem).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
     pub reasoning: Option<String>,
     /// Parent mission id. Optional because some flow records aren't
     /// scoped to a mission (operator-initiated dispatches without an
     /// active mission, machinery events). Schema 1.3 addition (#136).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
     pub mission_id: Option<String>,
     /// Machine that emitted this record. Auto-populated at write time
     /// from `DARKMUX_MACHINE_ID` env (operator-named — e.g. `"studio"`,
@@ -2313,6 +2322,7 @@ pub struct FlowRecord {
     /// the field; viewer treats absence as `unknown`. Schema 1.4 addition
     /// (#167; substrate for fleet UI).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
     pub machine_id: Option<String>,
     /// Stable hardware identity of the machine that emitted this record
     /// (`IOPlatformUUID`, #640) — the canonical machine identity, distinct
@@ -2322,6 +2332,7 @@ pub struct FlowRecord {
     /// and groups such records under one "unknown" machine — never falling
     /// back to the (unprovable) name. Schema 1.11 addition.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
     pub machine_uid: Option<String>,
     /// BLAKE3 hash of the previous record in this audit file's chain.
     /// `None` on records written through LocalFileSink (the casual sink);
@@ -2333,6 +2344,7 @@ pub struct FlowRecord {
     /// body under the byte-hash format (#1769) — it's covered by the
     /// content hash the same way every other field is.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
     pub prev_hash: Option<String>,
     /// Legacy field (pre-2.6.0): under the OLD struct-hash audit format
     /// this carried THIS record's own content hash, embedded inside the
@@ -2344,6 +2356,7 @@ pub struct FlowRecord {
     /// (which DID embed `hash` here) still deserializes. Schema 1.5
     /// addition (#163).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
     pub hash: Option<String>,
     /// Event-specific structured fields that aren't promoted to first-class
     /// `FlowRecord` members. Schema 1.6 addition (#204) — gives new event
@@ -2363,6 +2376,7 @@ pub struct FlowRecord {
     /// older viewers — they see the action string and the standard
     /// FlowRecord fields, just not the event-specific extras.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(type = "Record<string, unknown>", optional))]
     pub payload: Option<serde_json::Value>,
 }
 

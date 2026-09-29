@@ -419,7 +419,7 @@ const byDate = new Map(ALL.map((s) => [s.date, s.records]));
 const PLAYBACK_NOW = Date.parse("2026-09-28T12:00:00Z");
 
 /**
- * Serve the fixture days to the page: `/flow/<date>`, `/flow-session/<id>`,
+ * Serve the fixture days to the page: `/flow/<date>`, `/flow-dispatch/<id>`,
  * `/flow-mission/<id>`, `/flow-days`, and a 404 for every other daemon route
  * (a fresh daemon with nothing else to say). The SSE stream passes through
  * to the suite's own server, which holds it open, so a live page reads as
@@ -459,7 +459,7 @@ async function installLayoutRoutes(page, { blockStream = false, machineSpecs = f
     if (holdPresence && p === "/fleet/machines/live") return new Promise(() => {});
     // (#2902 step 5) Redis session presence for a state that has it: the
     // sessions the daemon reports as beating right now.
-    if (presence && p === "/fleet/sessions/live") return json({ sessions: presence, meta: { sources: { fleet: { state: "ok" } }, complete: true } });
+    if (presence && p === "/fleet/dispatches/live") return json({ dispatches: presence, meta: { sources: { fleet: { state: "ok" } }, complete: true } });
     if (roster && p === "/fleet/roster") return json({ machines: [{ id: "layout-offline", address: "100.64.0.9:8765", added_unix_ms: 1 }], error: null });
     if (/^\/flow\/\d{4}-\d{2}-\d{2}\/stream$/.test(p)) {
       if (blockStream) return route.fulfill({ status: 503, contentType: "text/plain", body: "layout harness: stream refused\n" });
@@ -471,7 +471,7 @@ async function installLayoutRoutes(page, { blockStream = false, machineSpecs = f
     if (p === "/flow-days") return json([...byDate.keys()].sort().reverse().map((date) => ({ date, count: byDate.get(date).length })));
     // The daemon's catalog shape (`catalog_records_response`).
     const catalog = (records) => json({ records, count: records.length, truncated: false });
-    m = p.match(/^\/flow-session\/(.+)$/);
+    m = p.match(/^\/flow-dispatch\/(.+)$/);
     if (m) {
       const sid = decodeURIComponent(m[1]);
       return catalog(ALL.flatMap((s) => s.records).filter((r) => r.session_id === sid));
