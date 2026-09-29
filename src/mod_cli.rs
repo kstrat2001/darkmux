@@ -19,7 +19,25 @@
 use anyhow::{Context, Result};
 use darkmux_crew::mods::{self, ModRecord};
 use darkmux_types::config_access;
+use serde::Serialize;
 use std::path::PathBuf;
+
+use crate::cli_json;
+
+/// `mod create --json`. `path` sits BESIDE the record, never inside it:
+/// `record` has to stay byte-equal to what is on disk, or a consumer that
+/// diffs the two sees a field darkmux invented.
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct ModCreated<'a> {
+    pub record: &'a ModRecord,
+    pub path: String,
+}
+
+/// `mod list --json`: the mods that matched, ts-ascending.
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct ModList<'a> {
+    pub mods: Vec<&'a ModRecord>,
+}
 
 /// How many characters of the raw kit `list` previews. Enough to recognize a
 /// mod, short enough to keep one mod on one line.
@@ -83,13 +101,7 @@ pub fn create(
         // `path` sits BESIDE the record, never inside it: `record` has to stay
         // byte-equal to what is on disk, or a consumer that diffs the two sees
         // a field darkmux invented.
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "record": &rec,
-                "path": path.to_string_lossy(),
-            }))?
-        );
+        cli_json::emit(&ModCreated { record: &rec, path: path.to_string_lossy().into_owned() })?;
         return Ok(0);
     }
 
@@ -138,7 +150,7 @@ pub fn list(for_key: Option<&str>, mission: Option<&str>, json: bool) -> Result<
         .collect();
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "mods": rows }))?);
+        cli_json::emit(&ModList { mods: rows })?;
         return Ok(0);
     }
 
@@ -204,7 +216,7 @@ pub fn show(key: &str, json: bool) -> Result<i32> {
     };
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&rec)?);
+        cli_json::emit(&rec)?;
         return Ok(0);
     }
 

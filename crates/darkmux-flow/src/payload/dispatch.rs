@@ -85,7 +85,7 @@ pub enum RouteDecision {
 }
 
 /// Where a resolved runtime knob's value came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
@@ -156,7 +156,7 @@ pub struct BriefRef {
 }
 
 /// One resolved runtime knob, with where its value came from: the operator never has to wonder.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct Knob {
@@ -174,7 +174,7 @@ pub struct Knob {
 /// The runtime knobs a dispatch ran under, each with its provenance. The same block rides the
 /// mission envelope, from one producer, so a reader watching the flow stream and one reading the
 /// finished envelope cannot disagree about what governed the run.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct RuntimeBounds {
@@ -321,7 +321,7 @@ pub struct LiveSummary {
 
 /// How comfortable the host was over one execution: the compact host-pressure summary the
 /// envelope's `host` block carries too. A field the sampler could not read is `null`, never zero.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct HostWindow {
@@ -725,7 +725,7 @@ impl Attribution for DispatchCompactionPayload {
 }
 
 /// The request bound a record names, with its provenance.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct BoundRef {

@@ -43,8 +43,10 @@
 //! itself be bounded (out of scope here).
 
 use anyhow::Result;
+use serde::Serialize;
 use std::collections::BTreeMap;
 
+use crate::cli_json;
 use crate::crew;
 use crate::crew::types::{Mission, MissionStatus, Phase, PhaseStatus};
 use darkmux_serve::{
@@ -52,11 +54,26 @@ use darkmux_serve::{
 };
 use darkmux_types::{config_access, style};
 
+/// What kind of inconsistency a [`Drift`] flags. Closed: it is the `kind` a
+/// `mission status --json` reader switches on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum DriftKind {
+    DoneNotFinalized,
+    AllPhasesTerminalNoneComplete,
+    MissionTerminalLiveStep,
+    MissionTerminalOpenPhase,
+    PhaseTerminalLiveStep,
+    StaleActive,
+    RunningPhaseExecutionDead,
+    PlannedPhaseNothingAdvances,
+}
+
 /// A flagged inconsistency on one mission, with concrete reconcile commands.
 /// Kept data-only (no IO) so `detect_drift` is unit-testable.
 #[derive(Debug, Clone, PartialEq)]
 struct Drift {
-    kind: &'static str,
+    kind: DriftKind,
     detail: String,
     suggest: Vec<String>,
 }
@@ -663,7 +680,7 @@ fn detect_drift(
 
     if m.status == MissionStatus::Active && all_terminal && complete > 0 {
         out.push(Drift {
-            kind: "done-not-finalized",
+            kind: DriftKind::DoneNotFinalized,
             detail: "all phases are terminal — the mission looks done but is still open"
                 .to_string(),
             suggest: vec![format!("darkmux mission finalize {}", m.id)],
@@ -743,7 +760,7 @@ fn nothing_complete_not_closed_drift(
     }
     let abandoned = phases.iter().filter(|p| p.status == PhaseStatus::Abandoned).count();
     Some(Drift {
-        kind: "all-phases-terminal-none-complete",
+        kind: DriftKind::AllPhasesTerminalNoneComplete,
         detail: format!(
             "every phase is terminal and none completed ({abandoned} of {} abandoned) — the \
              mission is still open with nothing left to run",
@@ -812,7 +829,7 @@ fn terminal_mission_open_phase_drift(
     if !matches!(m.status, MissionStatus::Finalized | MissionStatus::Aborted) {
         return None;
     }
-    if step_drifts.iter().any(|d| d.kind == "mission-terminal-live-step") {
+    if step_drifts.iter().any(|d| d.kind == DriftKind::MissionTerminalLiveStep) {
         return None;
     }
     let open: Vec<&str> =
@@ -836,7 +853,7 @@ fn terminal_mission_open_phase_drift(
         )
     }));
     Some(Drift {
-        kind: "mission-terminal-open-phase",
+        kind: DriftKind::MissionTerminalOpenPhase,
         detail: format!(
             "mission is {:?} but {} phase(s) never reached a terminal status: {}",
             m.status,
@@ -898,7 +915,7 @@ fn live_step_drifts(
     // `detail`.
     if !in_terminal_phase.is_empty() {
         out.push(Drift {
-            kind: "phase-terminal-live-step",
+            kind: DriftKind::PhaseTerminalLiveStep,
             detail: format!(
                 "{} step(s) are still Planned/Running under a phase that already reached a \
                  terminal status: {}",
@@ -910,7 +927,7 @@ fn live_step_drifts(
     }
     if mission_terminal && !under_terminal_mission.is_empty() {
         out.push(Drift {
-            kind: "mission-terminal-live-step",
+            kind: DriftKind::MissionTerminalLiveStep,
             detail: format!(
                 "mission is {:?} but {} step(s) are still Planned/Running: {}",
                 m.status,
@@ -968,7 +985,7 @@ fn stale_active_drift(m: &Mission, complete: usize, now: u64, stale_days: u64) -
         return None;
     }
     Some(Drift {
-        kind: "stale-active",
+        kind: DriftKind::StaleActive,
         detail: format!(
             "mission has been Active for {age_days} day(s) with zero phases complete \
              (staleness threshold: {stale_days} day(s))"
@@ -1073,7 +1090,7 @@ fn stale_active_drift(m: &Mission, complete: usize, now: u64, stale_days: u64) -
 /// including the one Active row named below that no other rule draws.)
 /// `RecordedEnd` and `StaleNoTerminal` are genuine dispatch observations
 /// and stay, which is what keeps the `kind` string
-/// (`running-phase-session-dead`) accurate for every arm that survives.
+/// (`running-phase-execution-dead`) accurate for every arm that survives.
 ///
 /// Fires ONLY when:
 ///   - `m.status == MissionStatus::Active` — checked explicitly by THIS
@@ -1285,7 +1302,7 @@ fn running_phase_session_drift(
     };
 
     Some(Drift {
-        kind: "running-phase-session-dead",
+        kind: DriftKind::RunningPhaseExecutionDead,
         detail: format!("phase(s) {} read Running, but {fact}", running.join(", ")),
         suggest,
     })
@@ -1300,7 +1317,7 @@ fn running_phase_session_drift(
 ///
 /// The other rules cannot see it: `done-not-finalized` needs every phase
 /// terminal, `stale-active` needs zero Complete phases, and
-/// `running-phase-session-dead` needs a Running phase.
+/// `running-phase-execution-dead` needs a Running phase.
 ///
 /// **The liveness signal is `running_phase_session_drift`'s**, passed in
 /// rather than re-derived: `local_status == Abandoned` AND the evidence is a
@@ -1331,7 +1348,7 @@ fn planned_phase_nothing_advances_drift(
         return None;
     }
     Some(Drift {
-        kind: "planned-phase-nothing-advances",
+        kind: DriftKind::PlannedPhaseNothingAdvances,
         detail: format!(
             "phase(s) {} still read Planned, but this mission's dispatch session has ended — \
              nothing is left to advance them",
@@ -2019,56 +2036,110 @@ fn visible_attention_line(visible: usize, hidden_by: Option<HiddenBy>, all_link_
 /// `partition_visibility`, so a test can assert the mission count here
 /// matches the input slice regardless of what a human-board `--all` would
 /// show. No I/O, no printing.
-fn board_json(views: &[MissionView], peer: &[Run], fleet_state: &SourceState) -> serde_json::Value {
-    let arr: Vec<serde_json::Value> = views
-        .iter()
-        .map(|v| {
-            serde_json::json!({
-                "id": v.m.id,
-                "status": status_word(v.m.status),
-                "ticket": v.m.ticket,
-                "phases": {
-                    // (#2406) `degraded` is a SIBLING bucket, and `complete`
-                    // no longer includes it. Safe because nothing parses
-                    // `phases.complete`: the only `mission status --json`
-                    // consumers in the tree are two `tests/cli.rs` assertions
-                    // that read `missions[].drift` and nothing else (enumerated
-                    // before the change). The four terminal/live buckets still
-                    // sum to `total`, which is the invariant a reader can rely
-                    // on.
-                    "total": v.total, "complete": v.complete, "degraded": v.degraded,
-                    "running": v.running, "planned": v.planned, "abandoned": v.abandoned,
-                },
-                // (#2299) present only for a config-launched run: what the
-                // config declared, what was minted, and what was pruned + why.
-                "graph": v.graph,
-                "drift": v.drifts.iter().map(|d| serde_json::json!({
-                    "kind": d.kind, "detail": d.detail, "suggest": d.suggest,
-                })).collect::<Vec<_>>(),
-            })
-        })
-        .collect();
-    let attention = views.iter().filter(|v| !v.drifts.is_empty()).count();
-    let fleet_complete = fleet_complete(fleet_state);
-    serde_json::json!({
-        "missions": arr,
-        // (#1711) Peer missions — observed via the shared flow stream, not
+fn board_json<'a>(
+    views: &'a [MissionView],
+    peer: &'a [Run],
+    fleet_state: &'a SourceState,
+    budget_waits: &'a [crew::budget::ActiveWait],
+) -> MissionBoard<'a> {
+    MissionBoard {
+        missions: views.iter().map(BoardMission::of).collect(),
+        // (#1711) Peer missions: observed via the shared flow stream, not
         // owned by this machine (see `peer_mission_runs`'s doc). Always
         // present (possibly empty), same "record exhaustively" posture as
-        // `missions` above — a machine reader must be able to tell "no peer
+        // `missions` above: a machine reader must be able to tell "no peer
         // missions" from "the fleet read never ran".
-        "peer_missions": peer,
-        // The SAME wire shape `darkmux run list --json` emits for this
-        // field (`run_list.rs::run_json`) — one state vocabulary for
-        // "what's running on the fleet" across both CLI surfaces (#1711's
-        // own complaint was two surfaces disagreeing).
-        "fleet": fleet_state,
-        "summary": {
-            "total": views.len(),
-            "needs_attention": attention,
-            "fleet_complete": fleet_complete,
+        peer_missions: peer,
+        // The SAME wire shape `darkmux run list --json` emits for this field:
+        // one state vocabulary for "what's running on the fleet" across both
+        // CLI surfaces (#1711's own complaint was two surfaces disagreeing).
+        fleet: fleet_state,
+        summary: BoardSummary {
+            total: views.len(),
+            needs_attention: views.iter().filter(|v| !v.drifts.is_empty()).count(),
+            fleet_complete: fleet_complete(fleet_state),
         },
-    })
+        // (#2902 step 5) Every call waiting on a budget now.
+        budget_waits,
+    }
+}
+
+/// `mission status --json`: every mission on this machine, the peers' missions
+/// observed through the flow stream, the fleet read's state, and the calls
+/// waiting on a budget. Never paginated or filtered.
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct MissionBoard<'a> {
+    pub missions: Vec<BoardMission<'a>>,
+    pub peer_missions: &'a [Run],
+    pub fleet: &'a SourceState,
+    pub summary: BoardSummary,
+    pub budget_waits: &'a [crew::budget::ActiveWait],
+}
+
+/// One mission on the board.
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct BoardMission<'a> {
+    pub id: &'a str,
+    pub status: MissionStatus,
+    pub ticket: Option<&'a str>,
+    pub phases: BoardPhases,
+    /// Present only for a config-launched run: what the config declared, what
+    /// was minted, and what was pruned and why (#2299). `null` otherwise.
+    pub graph: Option<&'a crew::mission_config::prune::PruneReport>,
+    pub drift: Vec<BoardDrift<'a>>,
+}
+
+/// A mission's phases by state. The five state buckets sum to `total`: a
+/// `degraded` phase is its own bucket and is not counted in `complete`
+/// (#2406).
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct BoardPhases {
+    pub total: usize,
+    pub complete: usize,
+    pub degraded: usize,
+    pub running: usize,
+    pub planned: usize,
+    pub abandoned: usize,
+}
+
+/// One flagged inconsistency, with the commands that would reconcile it.
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct BoardDrift<'a> {
+    pub kind: DriftKind,
+    pub detail: &'a str,
+    pub suggest: &'a [String],
+}
+
+/// The board's rollup line.
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct BoardSummary {
+    pub total: usize,
+    pub needs_attention: usize,
+    pub fleet_complete: bool,
+}
+
+impl<'a> BoardMission<'a> {
+    fn of(v: &'a MissionView) -> Self {
+        BoardMission {
+            id: &v.m.id,
+            status: v.m.status,
+            ticket: v.m.ticket.as_deref(),
+            phases: BoardPhases {
+                total: v.total,
+                complete: v.complete,
+                degraded: v.degraded,
+                running: v.running,
+                planned: v.planned,
+                abandoned: v.abandoned,
+            },
+            graph: v.graph.as_ref(),
+            drift: v
+                .drifts
+                .iter()
+                .map(|d| BoardDrift { kind: d.kind, detail: &d.detail, suggest: &d.suggest })
+                .collect(),
+        }
+    }
 }
 
 /// (#1711) Whether the fleet-wide read covers everything it claims to: `Ok`
@@ -2085,10 +2156,7 @@ fn run_json(
     fleet_state: &SourceState,
     budget_waits: &[crew::budget::ActiveWait],
 ) -> Result<i32> {
-    let mut board = board_json(views, peer, fleet_state);
-    // (#2902 step 5) Additive: every call waiting on a budget now.
-    board["budget_waits"] = serde_json::to_value(budget_waits)?;
-    println!("{}", serde_json::to_string_pretty(&board)?);
+    cli_json::emit(&board_json(views, peer, fleet_state, budget_waits))?;
     Ok(0)
 }
 
@@ -2425,6 +2493,11 @@ fn now_unix() -> u64 {
 mod tests {
     use super::*;
 
+    /// The `--json` payload as a value, for assertions on its keys.
+    fn board_value(views: &[MissionView], peer: &[Run], fleet_state: &SourceState) -> serde_json::Value {
+        serde_json::to_value(board_json(views, peer, fleet_state, &[])).unwrap()
+    }
+
     /// (#2902 step 5) `mission status` says what a waiting call waits on,
     /// whose mission, and how long, or that it waits on the operator.
     #[test]
@@ -2433,7 +2506,7 @@ mod tests {
             scope: scope.into(),
             subject: subject.into(),
             mission_id: Some("review-1790000000-a1b2c3".into()),
-            session_id: Some("s".into()),
+            execution_id: Some("s".into()),
             resume_at: secs.map(|_| "2026-09-27T12:14:09Z".into()),
             resumes_in_secs: secs,
             message: String::new(),
@@ -2673,7 +2746,7 @@ mod tests {
     /// A `MissionView` with drift attached, for ordering tests.
     fn drifted<'a>(m: &'a Mission) -> MissionView<'a> {
         let mut v = view(m, 1, 0);
-        v.drifts.push(Drift { kind: "test", detail: "d".into(), suggest: vec![] });
+        v.drifts.push(Drift { kind: DriftKind::StaleActive, detail: "d".into(), suggest: vec![] });
         v
     }
 
@@ -3287,7 +3360,7 @@ mod tests {
         // …and the rule this feeds fires on exactly that map.
         let drifts = live_step_drifts(&m, &[&closed], &live);
         assert!(
-            drifts.iter().any(|d| d.kind == "phase-terminal-live-step"),
+            drifts.iter().any(|d| d.kind == DriftKind::PhaseTerminalLiveStep),
             "{drifts:?}"
         );
     }
@@ -3402,7 +3475,7 @@ mod tests {
         let d = detect_drift(&m, &[&running, &planned], &BTreeMap::new(), None, None, 0, 14);
         assert_eq!(
             d.iter().map(|dr| dr.kind).collect::<Vec<_>>(),
-            vec!["mission-terminal-open-phase"],
+            vec![DriftKind::MissionTerminalOpenPhase],
             "got: {d:?}"
         );
         assert!(d[0].detail.contains("s1") && d[0].detail.contains("s2"), "{}", d[0].detail);
@@ -3437,24 +3510,24 @@ mod tests {
         let mut live = BTreeMap::new();
         live.insert("s1".to_string(), vec!["step-1".to_string()]);
 
-        let kinds: Vec<&str> = detect_drift(&m, &[&running], &live, None, None, 0, 14)
+        let kinds: Vec<DriftKind> = detect_drift(&m, &[&running], &live, None, None, 0, 14)
             .iter()
             .map(|d| d.kind)
             .collect();
         assert_eq!(
             kinds,
-            vec!["mission-terminal-live-step"],
+            vec![DriftKind::MissionTerminalLiveStep],
             "the step-level drift already speaks for this mission: {kinds:?}"
         );
 
         // …and the contrast that makes the suppression measurable rather
         // than accidental: the SAME phase with no live steps under it is the
         // stranded-on-its-own case nothing named before.
-        let kinds: Vec<&str> = detect_drift(&m, &[&running], &BTreeMap::new(), None, None, 0, 14)
+        let kinds: Vec<DriftKind> = detect_drift(&m, &[&running], &BTreeMap::new(), None, None, 0, 14)
             .iter()
             .map(|d| d.kind)
             .collect();
-        assert_eq!(kinds, vec!["mission-terminal-open-phase"], "got: {kinds:?}");
+        assert_eq!(kinds, vec![DriftKind::MissionTerminalOpenPhase], "got: {kinds:?}");
     }
 
     #[test]
@@ -3470,7 +3543,7 @@ mod tests {
         let s = phase("s1", "m1", PhaseStatus::Complete);
         let d = detect_drift(&m, &[&s], &BTreeMap::new(), None, None, 0, 14);
         assert_eq!(d.len(), 1);
-        assert_eq!(d[0].kind, "done-not-finalized");
+        assert_eq!(d[0].kind, DriftKind::DoneNotFinalized);
         assert!(d[0].suggest[0].contains("mission finalize m1"));
     }
 
@@ -3499,7 +3572,7 @@ mod tests {
         let d = detect_drift(&m, &[&s], &BTreeMap::new(), None, None, 0, 14);
         assert_eq!(
             d.iter().map(|dr| dr.kind).collect::<Vec<_>>(),
-            vec!["all-phases-terminal-none-complete"],
+            vec![DriftKind::AllPhasesTerminalNoneComplete],
             "got: {d:?}"
         );
         assert!(
@@ -3518,13 +3591,13 @@ mod tests {
             "work still in flight is not this shape"
         );
         let complete = phase("s3", "m1", PhaseStatus::Complete);
-        let kinds: Vec<&str> = detect_drift(&m, &[&s, &complete], &BTreeMap::new(), None, None, 0, 14)
+        let kinds: Vec<DriftKind> = detect_drift(&m, &[&s, &complete], &BTreeMap::new(), None, None, 0, 14)
             .iter()
             .map(|dr| dr.kind)
             .collect();
         assert_eq!(
             kinds,
-            vec!["done-not-finalized"],
+            vec![DriftKind::DoneNotFinalized],
             "a mission that produced SOMETHING stays with the rule whose sentence fits it — the \
              two kinds must never both fire: {kinds:?}"
         );
@@ -3551,7 +3624,7 @@ mod tests {
         let now = 15 * 86_400; // 15 days later
         let d = detect_drift(&m, &[], &BTreeMap::new(), None, None, now, 14);
         assert_eq!(d.len(), 1);
-        assert_eq!(d[0].kind, "stale-active");
+        assert_eq!(d[0].kind, DriftKind::StaleActive);
         assert!(d[0].detail.contains("15 day"));
     }
 
@@ -3566,7 +3639,7 @@ mod tests {
         let mut m = mission("m1", MissionStatus::Active);
         m.started_ts = Some(0);
         let d = detect_drift(&m, &[], &BTreeMap::new(), None, None, 15 * 86_400, 14);
-        let stale = d.iter().find(|dr| dr.kind == "stale-active").expect("stale-active drift");
+        let stale = d.iter().find(|dr| dr.kind == DriftKind::StaleActive).expect("stale-active drift");
 
         for want in ["darkmux mission abort m1", "darkmux mission finalize m1"] {
             let is_own_command = stale
@@ -3600,7 +3673,7 @@ mod tests {
         let mut m = mission("m9", MissionStatus::Active);
         m.started_ts = Some(0);
         let d = detect_drift(&m, &[], &BTreeMap::new(), None, None, 15 * 86_400, 14);
-        let stale = d.iter().find(|dr| dr.kind == "stale-active").expect("stale-active drift");
+        let stale = d.iter().find(|dr| dr.kind == DriftKind::StaleActive).expect("stale-active drift");
         let first_cmd = split_suggestion(&stale.suggest[0]).0;
         assert_eq!(
             first_cmd, "darkmux mission debrief m9 --json",
@@ -3636,21 +3709,21 @@ mod tests {
         let d = detect_drift(&m, &[&s], &BTreeMap::new(), None, None, 30 * 86_400, 14);
         // `done-not-finalized` fires (all terminal + complete>0), but NOT
         // `stale-active`.
-        assert!(!d.iter().any(|dr| dr.kind == "stale-active"));
+        assert!(!d.iter().any(|dr| dr.kind == DriftKind::StaleActive));
     }
 
-    // ─── running-phase-session-dead (#2682) ────────────────────────────
+    // ─── running-phase-execution-dead (#2682) ────────────────────────────
 
     #[test]
     fn running_phase_session_drift_fires_when_local_status_is_abandoned() {
         let m = mission("m1", MissionStatus::Active);
         let s = phase("p1", "m1", PhaseStatus::Running);
         let d = detect_drift(&m, &[&s], &BTreeMap::new(), Some(RunStatus::Abandoned), Some(DispatchSessionEvidence::StaleNoTerminal), 0, 14);
-        let kinds: Vec<&str> = d.iter().map(|x| x.kind).collect();
+        let kinds: Vec<DriftKind> = d.iter().map(|x| x.kind).collect();
         let hit = d
             .iter()
-            .find(|dr| dr.kind == "running-phase-session-dead")
-            .unwrap_or_else(|| panic!("no running-phase-session-dead drift: {kinds:?}"));
+            .find(|dr| dr.kind == DriftKind::RunningPhaseExecutionDead)
+            .unwrap_or_else(|| panic!("no running-phase-execution-dead drift: {kinds:?}"));
         assert!(hit.detail.contains("p1"), "{}", hit.detail);
         // Describes, never adjudicates (#2682's own doctrine, matching
         // `peer_status_word`'s posture) — must say what was OBSERVED, never
@@ -3696,7 +3769,7 @@ mod tests {
             14,
         );
         assert!(
-            !d.iter().any(|dr| dr.kind == "running-phase-session-dead"),
+            !d.iter().any(|dr| dr.kind == DriftKind::RunningPhaseExecutionDead),
             "a mission with no attributable dispatch session must not be flagged as one whose \
              dispatch session died: {d:?}"
         );
@@ -3711,7 +3784,7 @@ mod tests {
         let m = mission("m1", MissionStatus::Active);
         let s = phase("p1", "m1", PhaseStatus::Running);
         let d = detect_drift(&m, &[&s], &BTreeMap::new(), Some(RunStatus::Abandoned), None, 0, 14);
-        assert!(!d.iter().any(|dr| dr.kind == "running-phase-session-dead"), "{d:?}");
+        assert!(!d.iter().any(|dr| dr.kind == DriftKind::RunningPhaseExecutionDead), "{d:?}");
     }
 
     /// (#2682 fix-pass MUST FIX 5) darkmux POSITIVELY recorded the session
@@ -3732,8 +3805,8 @@ mod tests {
         );
         let hit = d
             .iter()
-            .find(|dr| dr.kind == "running-phase-session-dead")
-            .unwrap_or_else(|| panic!("no running-phase-session-dead drift: {d:?}"));
+            .find(|dr| dr.kind == DriftKind::RunningPhaseExecutionDead)
+            .unwrap_or_else(|| panic!("no running-phase-execution-dead drift: {d:?}"));
         assert!(
             hit.detail.to_lowercase().contains("recorded") && hit.detail.to_lowercase().contains("ending"),
             "must describe the POSITIVE observation, not an absence: {}",
@@ -3771,8 +3844,8 @@ mod tests {
         );
         let hit = d
             .iter()
-            .find(|dr| dr.kind == "running-phase-session-dead")
-            .unwrap_or_else(|| panic!("no running-phase-session-dead drift: {d:?}"));
+            .find(|dr| dr.kind == DriftKind::RunningPhaseExecutionDead)
+            .unwrap_or_else(|| panic!("no running-phase-execution-dead drift: {d:?}"));
         assert!(hit.detail.contains("p1"), "{}", hit.detail);
         assert!(hit.detail.contains("p2"), "{}", hit.detail);
     }
@@ -3785,7 +3858,7 @@ mod tests {
         let s = phase("p1", "m1", PhaseStatus::Running);
         let d = detect_drift(&m, &[&s], &BTreeMap::new(), Some(RunStatus::Running), None, 0, 14);
         assert!(
-            !d.iter().any(|dr| dr.kind == "running-phase-session-dead"),
+            !d.iter().any(|dr| dr.kind == DriftKind::RunningPhaseExecutionDead),
             "a live session must never fire this drift: {d:?}"
         );
     }
@@ -3798,7 +3871,7 @@ mod tests {
         let m = mission("m1", MissionStatus::Active);
         let s = phase("p1", "m1", PhaseStatus::Running);
         let d = detect_drift(&m, &[&s], &BTreeMap::new(), None, None, 0, 14);
-        assert!(!d.iter().any(|dr| dr.kind == "running-phase-session-dead"), "{d:?}");
+        assert!(!d.iter().any(|dr| dr.kind == DriftKind::RunningPhaseExecutionDead), "{d:?}");
     }
 
     #[test]
@@ -3806,7 +3879,7 @@ mod tests {
         let m = mission("m1", MissionStatus::Active);
         let s = phase("p1", "m1", PhaseStatus::Planned);
         let d = detect_drift(&m, &[&s], &BTreeMap::new(), Some(RunStatus::Abandoned), Some(DispatchSessionEvidence::StaleNoTerminal), 0, 14);
-        assert!(!d.iter().any(|dr| dr.kind == "running-phase-session-dead"), "{d:?}");
+        assert!(!d.iter().any(|dr| dr.kind == DriftKind::RunningPhaseExecutionDead), "{d:?}");
     }
 
     /// (#2682 fix-pass round 3, CONSIDER 1) The one Active shape the board
@@ -3823,7 +3896,7 @@ mod tests {
     ///   - `done-not-finalized` needs ALL phases terminal; the Running one
     ///     is not,
     ///   - `stale-active` is disqualified by `complete > 0`,
-    ///   - `running-phase-session-dead` is silent on
+    ///   - `running-phase-execution-dead` is silent on
     ///     `NoAttributableSession` (round 2's MUST FIX 1),
     /// — and no rule is left. `darkmux run list` meanwhile reads the same
     /// mission `abandoned`, which this test asserts FIRST so the silence
@@ -3890,7 +3963,7 @@ mod tests {
             );
 
             let phase_refs: Vec<&Phase> = phases.iter().collect();
-            let kinds: Vec<&str> = detect_drift(
+            let kinds: Vec<DriftKind> = detect_drift(
                 &m,
                 &phase_refs,
                 &BTreeMap::new(),
@@ -3906,7 +3979,7 @@ mod tests {
             if complete_phases == 0 {
                 assert_eq!(
                     kinds,
-                    vec!["stale-active"],
+                    vec![DriftKind::StaleActive],
                     "the day-scale rule covers the zero-complete sibling — if this arm ever \
                      goes empty too, the narrowing below stopped being narrow"
                 );
@@ -3936,7 +4009,7 @@ mod tests {
             let d = detect_drift(&m, &[&done, &left], &BTreeMap::new(), Some(RunStatus::Abandoned), Some(ev), 0, 14);
             let hit = d
                 .iter()
-                .find(|x| x.kind == "planned-phase-nothing-advances")
+                .find(|x| x.kind == DriftKind::PlannedPhaseNothingAdvances)
                 .unwrap_or_else(|| panic!("no drift for {ev:?}: {d:?}"));
             assert!(hit.detail.contains("p2") && !hit.detail.contains("p1"), "{}", hit.detail);
             // flow-action-guard:allow — the CLI verbs, not actions
@@ -3948,12 +4021,12 @@ mod tests {
 
     /// The inverse cases: a live launch advances its own phases; a mission
     /// with no dispatch observation is a parked-at-a-gate mission, not a
-    /// dead one; a Running phase belongs to `running-phase-session-dead`;
+    /// dead one; a Running phase belongs to `running-phase-execution-dead`;
     /// no Planned phase means nothing is left to advance; a closed mission
     /// is not Active.
     #[test]
     fn a_leftover_planned_phase_draws_nothing_unless_the_session_is_dead() {
-        let kind = "planned-phase-nothing-advances";
+        let kind = DriftKind::PlannedPhaseNothingAdvances;
         let stale = Some(DispatchSessionEvidence::StaleNoTerminal);
         let dead = Some(RunStatus::Abandoned);
         let active = mission("m1", MissionStatus::Active);
@@ -4020,7 +4093,7 @@ mod tests {
     /// "`run list` reads it `Abandoned` and the board draws NO drift of any
     /// kind" — is the one that answers this issue's actual question, "do
     /// the two surfaces disagree". Predicate 1 measures one RULE's coverage
-    /// (`running-phase-session-dead`), which is narrower by construction and
+    /// (`running-phase-execution-dead`), which is narrower by construction and
     /// is not moved at all by a row that a DIFFERENT board rule starts
     /// drawing. Round 4 closed 17 of predicate 2's 29 rows with rules that
     /// are not that one, so predicate 1 barely moved (33 → 28) while
@@ -4074,7 +4147,7 @@ mod tests {
 
         let mut rows = 0usize;
         // Predicate 1 — "THIS RULE stayed silent": `Abandoned` per `run
-        // list`, no `running-phase-session-dead` drift. This is the one the
+        // list`, no `running-phase-execution-dead` drift. This is the one the
         // scope claim in `running_phase_session_drift`'s doc is about
         // ("this rule only fires for Running").
         let mut raw_rule_silent = 0usize;
@@ -4176,7 +4249,7 @@ mod tests {
                     // this test's doc: a torn-down mission reads "aborted"
                     // on BOTH surfaces, so it is not a disagreement.
                     let counts_as_disagreement = *ms != MissionStatus::Aborted;
-                    if !d.iter().any(|dr| dr.kind == "running-phase-session-dead") {
+                    if !d.iter().any(|dr| dr.kind == DriftKind::RunningPhaseExecutionDead) {
                         raw_rule_silent += 1;
                         if counts_as_disagreement {
                             real_rule_silent += 1;
@@ -4378,7 +4451,7 @@ mod tests {
         );
 
         assert!(
-            d.iter().any(|dr| dr.kind == "running-phase-session-dead"),
+            d.iter().any(|dr| dr.kind == DriftKind::RunningPhaseExecutionDead),
             "`darkmux run list` reads this mission Abandoned but the board stayed clean: {d:?}"
         );
         // `guard` restores DARKMUX_HOME on drop — including if an assert
@@ -4405,7 +4478,7 @@ mod tests {
         let d = detect_drift(&m, &[&done], &live, None, None, 0, 14);
         let hit = d
             .iter()
-            .find(|dr| dr.kind == "phase-terminal-live-step")
+            .find(|dr| dr.kind == DriftKind::PhaseTerminalLiveStep)
             .unwrap_or_else(|| panic!("no step-level drift: {:?}", d.iter().map(|x| x.kind).collect::<Vec<_>>()));
         assert!(hit.detail.contains("s-dep") && hit.detail.contains("s-chain"), "{}", hit.detail);
         assert!(hit.suggest.iter().any(|c| c.contains("mission finalize m1")), "{:?}", hit.suggest);
@@ -4423,12 +4496,12 @@ mod tests {
 
         let d = detect_drift(&m, &[&open], &live, None, None, 0, 14);
         assert!(
-            d.iter().any(|dr| dr.kind == "mission-terminal-live-step" && dr.detail.contains("s-1")),
+            d.iter().any(|dr| dr.kind == DriftKind::MissionTerminalLiveStep && dr.detail.contains("s-1")),
             "{:?}",
             d.iter().map(|x| x.kind).collect::<Vec<_>>()
         );
         // Not double-counted as the phase-level kind — the phase is Running.
-        assert!(!d.iter().any(|dr| dr.kind == "phase-terminal-live-step"));
+        assert!(!d.iter().any(|dr| dr.kind == DriftKind::PhaseTerminalLiveStep));
     }
 
     /// An Active mission's Running phase with live steps is exactly where
@@ -4442,10 +4515,16 @@ mod tests {
 
         let d = detect_drift(&m, &[&open], &live, None, None, 0, 14);
         assert!(
-            !d.iter().any(|dr| dr.kind.ends_with("live-step")),
+            !d.iter().any(|dr| matches!(dr.kind, DriftKind::PhaseTerminalLiveStep | DriftKind::MissionTerminalLiveStep)),
             "{:?}",
             d.iter().map(|x| x.kind).collect::<Vec<_>>()
         );
+    }
+
+    /// The retired phase-order rule's signature: a drift that tells the
+    /// operator to `mission abort <id> --phase <name>`.
+    fn suggests_aborting_a_phase(drift: &Drift) -> bool {
+        drift.suggest.iter().any(|c| c.contains("mission abort") && c.contains("--phase"))
     }
 
     // ─── unreachable-phase, RETIRED (#2406) ────────────────────────────
@@ -4470,7 +4549,7 @@ mod tests {
 
         let d = detect_drift(&m, &[&dead, &blocked], &BTreeMap::new(), None, None, 0, 14);
         assert!(
-            !d.iter().any(|dr| dr.kind == "unreachable-phase"),
+            !d.iter().any(suggests_aborting_a_phase),
             "the phase-order rule is retired (#2406): {d:?}"
         );
     }
@@ -4486,7 +4565,7 @@ mod tests {
         m.phase_ids = ["dead", "blocked-a", "blocked-b"].map(String::from).to_vec();
 
         let d = detect_drift(&m, &[&dead, &a, &b], &BTreeMap::new(), None, None, 0, 14);
-        assert!(!d.iter().any(|dr| dr.kind == "unreachable-phase"), "{d:?}");
+        assert!(!d.iter().any(suggests_aborting_a_phase), "{d:?}");
     }
 
     #[test]
@@ -4500,7 +4579,7 @@ mod tests {
         m.phase_ids = ["healthy", "dead", "blocked"].map(String::from).to_vec();
 
         let d = detect_drift(&m, &[&healthy, &dead, &blocked], &BTreeMap::new(), None, None, 0, 14);
-        assert!(!d.iter().any(|dr| dr.kind == "unreachable-phase"), "{d:?}");
+        assert!(!d.iter().any(suggests_aborting_a_phase), "{d:?}");
     }
 
     #[test]
@@ -4514,7 +4593,7 @@ mod tests {
         m.phase_ids = ["dead", "in-flight", "blocked"].map(String::from).to_vec();
 
         let d = detect_drift(&m, &[&dead, &running, &blocked], &BTreeMap::new(), None, None, 0, 14);
-        assert!(!d.iter().any(|dr| dr.kind == "unreachable-phase"), "{d:?}");
+        assert!(!d.iter().any(suggests_aborting_a_phase), "{d:?}");
     }
 
     #[test]
@@ -4525,7 +4604,7 @@ mod tests {
         m.phase_ids = vec!["done".to_string(), "next".to_string()];
 
         let d = detect_drift(&m, &[&done, &next], &BTreeMap::new(), None, None, 0, 14);
-        assert!(!d.iter().any(|dr| dr.kind == "unreachable-phase"));
+        assert!(!d.iter().any(suggests_aborting_a_phase));
     }
 
     #[test]
@@ -4538,7 +4617,7 @@ mod tests {
         m.phase_ids = vec!["dead".to_string(), "done".to_string()];
 
         let d = detect_drift(&m, &[&dead, &done], &BTreeMap::new(), None, None, 0, 14);
-        assert!(!d.iter().any(|dr| dr.kind == "unreachable-phase"));
+        assert!(!d.iter().any(suggests_aborting_a_phase));
     }
 
     /// (renamed from `doom_loop_m4_mission_status_fixture_flags_both_drift_variants`,
@@ -4586,11 +4665,11 @@ mod tests {
         let d = detect_drift(&m, &phases, &BTreeMap::new(), None, None, now, 14);
 
         assert!(
-            d.iter().any(|dr| dr.kind == "stale-active"),
+            d.iter().any(|dr| dr.kind == DriftKind::StaleActive),
             "doom-loop-m4 has sat at 0/4 phases for weeks — must still flag stale-active: {d:?}"
         );
         assert!(
-            !d.iter().any(|dr| dr.kind == "unreachable-phase"),
+            !d.iter().any(suggests_aborting_a_phase),
             "the phase-order rule is retired (#2406) — no phase in this fixture should be \
              flagged unreachable any more: {d:?}"
         );
@@ -4605,7 +4684,7 @@ mod tests {
     /// run" and suggested `mission abort review-1788656497-cf872b --phase
     /// deliver`, which would have destroyed the delivery mid-flight had the
     /// operator trusted it. This pins that the board now says nothing of the
-    /// kind for this exact shape: no `"unreachable-phase"` drift, and no
+    /// kind for this exact shape: no phase-abort drift, and no
     /// `mission abort ... --phase deliver` suggestion anywhere on the board.
     #[test]
     fn a_planned_phase_after_an_abandoned_one_that_actually_goes_on_to_run_is_never_told_to_abort() {
@@ -4619,7 +4698,7 @@ mod tests {
         let d = detect_drift(&m, &[&review, &deliver], &BTreeMap::new(), None, None, 1_788_657_100, 14);
 
         assert!(
-            !d.iter().any(|dr| dr.kind == "unreachable-phase"),
+            !d.iter().any(suggests_aborting_a_phase),
             "must never flag `deliver` unreachable while it is legitimately about to run: {d:?}"
         );
         assert!(
@@ -4858,7 +4937,7 @@ mod tests {
         minted.spec = Some(minted_spec());
         let views = vec![view(&named, 1, 0), drifted(&minted)];
 
-        let payload = board_json(&views, &[], &SourceState::Off);
+        let payload = board_value(&views, &[], &SourceState::Off);
         let ids: Vec<&str> =
             payload["missions"].as_array().unwrap().iter().map(|m| m["id"].as_str().unwrap()).collect();
         assert_eq!(ids.len(), 2, "both named and minted missions must be present");
@@ -4913,7 +4992,7 @@ mod tests {
         // can rely on.
         let m = mission("m1", MissionStatus::Finalized);
         let v = view_with_degraded(&m, 2, 1, 0);
-        let payload = board_json(std::slice::from_ref(&v), &[], &SourceState::Off);
+        let payload = board_value(std::slice::from_ref(&v), &[], &SourceState::Off);
         let phases = &payload["missions"][0]["phases"];
         assert_eq!(phases["complete"], 2, "the degraded phase must NOT be folded in here");
         assert_eq!(phases["degraded"], 1);
@@ -5190,7 +5269,7 @@ mod tests {
             workload: None,
             verify_passed: None,
         };
-        let payload = board_json(&[], std::slice::from_ref(&peer_run), &SourceState::Ok);
+        let payload = board_value(&[], std::slice::from_ref(&peer_run), &SourceState::Ok);
         assert_eq!(payload["peer_missions"][0]["id"], "review-peer-3");
         assert_eq!(payload["peer_missions"][0]["tracked"], false);
         assert_eq!(payload["fleet"]["state"], "ok");
@@ -5203,13 +5282,13 @@ mod tests {
 
     #[test]
     fn board_json_fleet_complete_is_false_only_for_stale_and_unavailable() {
-        let ok = board_json(&[], &[], &SourceState::Ok);
+        let ok = board_value(&[], &[], &SourceState::Ok);
         assert_eq!(ok["summary"]["fleet_complete"], true);
-        let off = board_json(&[], &[], &SourceState::Off);
+        let off = board_value(&[], &[], &SourceState::Off);
         assert_eq!(off["summary"]["fleet_complete"], true, "`Off` is a correct standalone machine");
-        let unavailable = board_json(&[], &[], &SourceState::Unavailable { detail: "x" });
+        let unavailable = board_value(&[], &[], &SourceState::Unavailable { detail: "x" });
         assert_eq!(unavailable["summary"]["fleet_complete"], false);
-        let stale = board_json(&[], &[], &SourceState::Stale { age_ms: 1, detail: "x" });
+        let stale = board_value(&[], &[], &SourceState::Stale { age_ms: 1, detail: "x" });
         assert_eq!(stale["summary"]["fleet_complete"], false);
     }
 
@@ -5237,7 +5316,7 @@ mod tests {
     }
 
     fn drift(detail: &str, suggest: &[&str]) -> Drift {
-        Drift { kind: "k", detail: detail.into(), suggest: suggest.iter().map(|s| s.to_string()).collect() }
+        Drift { kind: DriftKind::StaleActive, detail: detail.into(), suggest: suggest.iter().map(|s| s.to_string()).collect() }
     }
 
     fn peer(id: &str, status: RunStatus, ts: Option<u64>) -> Run {

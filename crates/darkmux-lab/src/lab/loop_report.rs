@@ -110,7 +110,7 @@ pub fn fired_summary(d: &DetectorCounts) -> Vec<String> {
     .collect()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum Verdict {
     Productive,
@@ -192,7 +192,7 @@ pub fn classify(
 }
 
 /// The full loop-lab report for a single run.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct LoopReport {
     pub run_id: String,
     pub verdict: Verdict,

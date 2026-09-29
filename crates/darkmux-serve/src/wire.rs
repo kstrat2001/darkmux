@@ -18,7 +18,7 @@ use darkmux_flow::session_presence::SessionBeat;
 use darkmux_profiles::model_ledger::ModelLedger;
 use darkmux_types::config::BusyPolicy;
 use darkmux_types::LoadedModel;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::runs::{Run, RunsPolicy};
 use crate::source_state::SourceState;
@@ -106,7 +106,7 @@ pub struct MachineStatusResponse {
 }
 
 /// The configured machine utility model and whether it is resident.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize, schemars::JsonSchema)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct UtilityModel {
@@ -118,7 +118,7 @@ pub struct UtilityModel {
 }
 
 /// `GET /machine/specs`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize, schemars::JsonSchema)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct MachineSpecsResponse {
@@ -148,7 +148,7 @@ pub struct MachineSpecsResponse {
 
 /// `GET /machine/resources`: the memory ledger, the recorded cache cadence, and
 /// the host sampler's reading when one has landed.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct MachineResourcesResponse {

@@ -20,14 +20,16 @@ test-support = ["darkmux-types/test-support"]
 # Generates `ui/src/types/generated/{FlowAction,FlowScope,Level,Category,Stage,Tier}.ts`
 # from the flow schema's enums, like darkmux-crew's own `ts-export`. Test-only:
 # the release binary never pulls `ts-rs` in.
-ts-export = ["dep:ts-rs", "darkmux-types/ts-export"]
+ts-export = ["dep:ts-rs", "darkmux-types/ts-export", "darkmux-trajectory/ts-export"]
 
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json.workspace = true
+# The CLI `--json` golden derives field schemas from the types `flow status` and
+# `flow integrity-check` print.
 schemars = "1.2"
+serde_json.workspace = true
 dirs = "5.0"
 # #163 — AuditFileSink: BLAKE3 hash-chained audit sink (edits detected by `flow integrity-check`).
 blake3 = "1.5"
@@ -38,6 +40,8 @@ darkmux-hardware = { path = "../darkmux-hardware" }
 # #661 — config accessors (env > config.json > default). The one new edge in
 # the dep graph; darkmux-types is the leaf (no darkmux-* deps), so no cycle.
 darkmux-types = { path = "../darkmux-types" }
+# A leaf crate; owns `FailedExec`, which `step.result` carries as `failed_verifiers`.
+darkmux-trajectory = { path = "../darkmux-trajectory" }
 # #2093 — HookSink's drainer POSTs a matching flow record to a loopback
 # receiver. Already a workspace dependency (the root crate's `fleet_cli.rs`
 # GET path); this is the same client, now also linked into this crate for

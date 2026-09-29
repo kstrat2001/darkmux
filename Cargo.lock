@@ -713,6 +713,7 @@ dependencies = [
  "predicates",
  "redis",
  "rusqlite",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "serial_test",
@@ -804,6 +805,7 @@ dependencies = [
  "blake3",
  "clap",
  "darkmux-hardware",
+ "darkmux-trajectory",
  "darkmux-types",
  "dirs",
  "jaq-core",
@@ -845,6 +847,7 @@ dependencies = [
  "darkmux-hardware",
  "darkmux-profiles",
  "darkmux-types",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "tempfile",
@@ -882,6 +885,7 @@ dependencies = [
  "darkmux-gestalt",
  "darkmux-types",
  "dirs",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "serial_test",
@@ -909,6 +913,7 @@ dependencies = [
  "hyper-util",
  "libc",
  "redis",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "serial_test",
@@ -925,8 +930,10 @@ dependencies = [
 name = "darkmux-trajectory"
 version = "4.0.0-rc.1"
 dependencies = [
+ "schemars 1.2.2",
  "serde",
  "serde_json",
+ "ts-rs",
 ]
 
 [[package]]

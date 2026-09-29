@@ -47,7 +47,7 @@ pub use dispatch::{
     LiveSummary, ResultClass, RouteDecision, RuntimeBounds, StreamPhase, ToolOutcome, TurnUsage,
 };
 pub use lifecycle::{
-    BreachLevel, BudgetMetric, BudgetPayload, BudgetPolicyKind, BudgetScope, FailedVerifier, GhVerbExecutedPayload, GrowReason,
+    BreachLevel, BudgetMetric, BudgetPayload, BudgetPolicyKind, BudgetScope, GhVerbExecutedPayload, GrowReason,
     MissionGrowPayload, MissionRunTerminalPayload, PhaseReviewVerdictPayload, RadioDecision, RadioRoutePayload, RadioSurface,
     ReviewVerdict, RunPayload, SeatClass, StepResultPayload, StepSeatUnresolvedPayload, StepStartPayload, StepTimingPayload,
 };

@@ -39,7 +39,7 @@ use crate::plain_text_tool_calls::promote_plain_text_tool_calls;
 use crate::reasoning_loop::{ReasoningLoopDetector, ReasoningLoopSignal};
 use crate::stream_gate::{AbortReason, CutSource, StreamGate, StreamOutcome};
 use crate::tools::{dispatch, Tool};
-use darkmux_trajectory::MalformedReason;
+use darkmux_trajectory::{FailedExec, MalformedReason};
 use crate::trajectory::Trajectory;
 
 // (#457) Cap on tool-call turns inside a single dispatch — REMOVED
@@ -481,18 +481,6 @@ pub fn escalation_reason_str(reason: EscalationReason) -> &'static str {
         }
         EscalationReason::MalformedToolCallsExhausted => "escalation_malformed_tool_calls",
     }
-}
-
-/// (#799) A bash tool invocation that **failed to run** — never executed —
-/// rather than running and returning a non-zero exit. Stamped onto the
-/// dispatch envelope so a SIGNOFF claiming a verifier passed can be
-/// mechanically contradicted (the gate cross-checks the claim against this).
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct FailedExec {
-    /// The command the model asked to run (from the bash tool args).
-    pub command: String,
-    /// Why it's classified as failed-to-run (e.g. "command not found (exit 127)").
-    pub reason: String,
 }
 
 /// Outcome of a completed loop run.

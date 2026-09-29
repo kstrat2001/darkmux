@@ -3638,16 +3638,17 @@ fn dispatch_remote(
     );
 
     let stdout = if opts.json {
-        let mut metrics = serde_json::json!({
-            "model": pm.id, "endpoint": label,
-            "wall_ms": wall_ms, "turns": 1,
-        });
-        insert_direct_token_keys(metrics.as_object_mut().expect("json! built an object"), &counts);
-        serde_json::to_string(&serde_json::json!({
-            "result": "stop",
-            "final_assistant": reply.content,
-            "metrics": metrics,
-        }))
+        serde_json::to_string(&crate::dispatch_envelope::DirectDispatchEnvelope {
+            result: "stop".to_string(),
+            final_assistant: reply.content.clone(),
+            metrics: crate::dispatch_envelope::DirectMetrics {
+                model: pm.id.clone(),
+                endpoint: label.clone(),
+                wall_ms,
+                turns: 1,
+                tokens: crate::dispatch_envelope::DirectTokens::of(&counts),
+            },
+        })
         .unwrap_or_else(|_| reply.content.clone())
     } else {
         reply.content
@@ -6420,12 +6421,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         &host_stats,
         &host_extras,
         &host_out,
-        serde_json::to_value(resolved_runtime_bounds(
-            agentic_pm.is_some(),
-            opts.max_turns_override,
-            opts.timeout_override_seconds,
-        )?)
-        .unwrap_or_default(),
+        resolved_runtime_bounds(agentic_pm.is_some(), opts.max_turns_override, opts.timeout_override_seconds)?,
         thermal_ladder_summary,
     );
 
@@ -6818,6 +6814,21 @@ fn degeneracy_warning(
     })
 }
 
+/// The runtime's stdout as its [`darkmux_trajectory::RuntimeEnvelope`], or
+/// `None` after one line to `warn` saying it did not parse and why.
+fn parse_runtime_envelope(stdout: &str, warn: &dyn Fn(&str)) -> Option<darkmux_trajectory::RuntimeEnvelope> {
+    match serde_json::from_str(stdout.trim()) {
+        Ok(envelope) => Some(envelope),
+        Err(e) => {
+            warn(&format!(
+                "darkmux: the runtime's stdout is not an envelope this darkmux reads ({e}); printing it as the \
+                 runtime wrote it, without metrics, detections or bounds"
+            ));
+            None
+        }
+    }
+}
+
 /// (#1955) Add the observed summary to a JSON envelope.
 ///
 /// The orchestrator's ONLY surface is this envelope, and it carried none of
@@ -6833,7 +6844,8 @@ fn degeneracy_warning(
 /// belongs in the trajectory, which `trajectory_path` still points at.
 ///
 /// The `metrics` block is written here too, from the same fold of the
-/// trajectory the `dispatch complete` record reads ([`envelope_metrics`]):
+/// trajectory the `dispatch complete` record reads
+/// ([`crate::dispatch_envelope::EnvelopeMetrics::of`]):
 /// the runtime prints no counts of its own, so there is no second tally to
 /// disagree with.
 #[allow(clippy::too_many_arguments)]
@@ -6848,135 +6860,34 @@ fn enrich_envelope_with_summary(
     // built once at the call site (`resolved_runtime_bounds`) so the
     // start record and the finished envelope can't independently drift on
     // what "the resolved knobs" means.
-    bounds: serde_json::Value,
+    bounds: RuntimeBounds,
     // (#2774) See `host_window`'s own doc.
     thermal_ladder: Option<crate::thermal_governor::ThermalLadderSummary>,
 ) -> String {
-    let trimmed = stdout.trim();
-    if !trimmed.starts_with('{') {
-        return stdout;
-    }
-    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(trimmed) else {
-        return stdout;
-    };
-    let Some(obj) = v.as_object_mut() else {
+    // Anything that is not a runtime envelope (plain text, a list, a truncated
+    // object) is handed back untouched: the enrichment never invents an
+    // envelope around text, and never fails a dispatch over one. It says so on
+    // stderr, because the caller is then reading a document with no metrics,
+    // detections or bounds.
+    let Some(runtime) = parse_runtime_envelope(&stdout, &stderr_warning_sink) else {
         return stdout;
     };
-    obj.insert("metrics".into(), envelope_metrics(&summary.fold, model));
-    // Always present, even when empty. An absent field is ambiguous between
-    // "nothing fired" and "this build does not report it"; `[]` is not.
-    obj.insert(
-        "detections".into(),
-        serde_json::Value::Array(summary.detections.clone()),
-    );
-    obj.insert("bounds".into(), bounds);
-    // Host pressure, reduced. Included only when the sampler actually ran —
-    // an absent block says "not measured", which is honest, where a zeroed
-    // one would read as "measured, and idle".
-    //
-    // (#2107) `cpu`/`mem`/`gpu` each carry the full peak/mean/p95/duty
-    // reduction — a peak alone answers "did this ever spike"; it can't say
-    // how hard the host was driven ON AVERAGE. The peaks live only in the
-    // nested blocks (`cpu.peak_pct`, `mem.peak_pct`); there is no
-    // top-level mirror.
-    //
-    // (#2108) `power`/`thermal`/`energy_mwh` join them when the host probe
-    // could read those sources. They answer a question the percentages
-    // can't: a dispatch that ran at 40% CPU the whole way while the kernel
-    // held the speed cap at 62% was not a comfortable run, and the wall
-    // clock alone never says so.
-    fn metric_json(m: &MetricStats) -> serde_json::Value {
-        serde_json::json!({
-            "peak_pct": m.peak_pct,
-            "mean_pct": m.mean_pct,
-            "p95_pct": m.p95_pct,
-            "above_80_ms": m.above_80_ms,
-        })
-    }
-    // (#2108) A power rail's window reduction. `mean_mw`/`peak_mw` mirror
-    // the `mean_pct`/`peak_pct` naming above rather than the ROUTE's
-    // `mean`/`max` — this is the ENVELOPE's vocabulary, and inside it a
-    // number's unit is part of its name.
-    fn power_json(m: &MwStats) -> serde_json::Value {
-        serde_json::json!({ "mean_mw": m.mean_mw, "peak_mw": m.max_mw })
-    }
-    if stats.samples > 0 {
-        let mut host = serde_json::json!({
-            "cpu": metric_json(&stats.cpu),
-            "mem": metric_json(&stats.mem),
-            "gpu": metric_json(&stats.gpu),
-            "samples": stats.samples,
-            "sample_interval_ms": stats.sample_interval_ms,
-        });
-        // (#2108) Power, thermal and energy — each present only when the
-        // probe actually read that source on this host, for the same reason
-        // the whole `host` block is present only when the sampler ran: an
-        // absent block says "not measured", a zeroed one would say
-        // "measured, and idle". Purely ADDITIVE to the #2107 shape above.
-        if let Some(obj) = host.as_object_mut() {
-            if let Some(p) = &extras.power {
-                obj.insert(
-                    "power".into(),
-                    serde_json::json!({
-                        "cpu": power_json(&p.cpu),
-                        "gpu": power_json(&p.gpu),
-                        "total": power_json(&p.total),
-                    }),
-                );
-            }
-            if let Some(t) = &extras.thermal {
-                obj.insert(
-                    "thermal".into(),
-                    serde_json::json!({
-                        "worst_state": t.worst_state,
-                        "above_nominal_ms": t.above_nominal_ms,
-                        "min_cpu_speed_limit_pct": t.min_cpu_speed_limit_pct,
-                    }),
-                );
-            }
-            if let Some(e) = extras.energy_mwh {
-                obj.insert("energy_mwh".into(), serde_json::json!(e));
-            }
-        }
-        obj.insert("host".into(), host);
-        // (#2111) The flatter dispatch-summary shape — see
-        // `host_window`'s own doc for why it exists alongside `host`
-        // above rather than replacing it.
-        if let Some(hw) = host_window(stats, extras, thermal_ladder) {
-            obj.insert("host_window".into(), serde_json::to_value(hw).unwrap_or_default());
-        }
-    }
-    // (#1959) What a crawl actually FOUND. The envelope carried a converged
-    // dispatch and no way to tell a run that reported twelve findings from one
-    // that reported none — the difference the caller's next action turns on.
-    //
-    // The block is emitted only when the file exists, and its ABSENCE is
-    // meaningful rather than merely uninformative: the runtime creates this
-    // file on the first successful `create_finding` call, so no file means the
-    // channel was never used. For a role holding that tool, that is precisely
-    // the #1959 failure — the model mis-called the tool, decided it "is not
-    // available in this runtime", and narrated its findings into prose where
-    // nothing could collect them. A count of 0 cannot say that; a missing
-    // block can.
-    if let Some(f) = read_findings_summary(out_dir) {
-        obj.insert("findings".into(), f);
-    }
-    if summary.degeneracy_warnings > 0 {
-        obj.insert("degeneracy_warnings".into(), serde_json::json!(summary.degeneracy_warnings));
-    }
-    if !summary.fold.checkpoints.is_empty() {
-        let (min_tail_ratio, mean_tail_ratio) = summary.fold.checkpoint_tail_ratios();
-        obj.insert(
-            "checkpoints".into(),
-            serde_json::json!({
-                "total": summary.fold.checkpoints.len(),
-                "concluded": summary.fold.checkpoints_concluded(),
-                "min_tail_ratio": min_tail_ratio,
-                "mean_tail_ratio": mean_tail_ratio,
-            }),
-        );
-    }
-    serde_json::to_string(&v).unwrap_or(stdout)
+    // The host block is only present when the sampler actually ran: an absent
+    // block says "not measured", where a zeroed one would read as "measured,
+    // and idle". `host_window` is the flatter summary the `dispatch.complete`
+    // flow record carries; see `host_window`'s own doc for why both exist.
+    let envelope = crate::dispatch_envelope::DispatchEnvelope {
+        runtime,
+        metrics: crate::dispatch_envelope::EnvelopeMetrics::of(&summary.fold, model),
+        detections: summary.detections.clone(),
+        bounds,
+        host: crate::dispatch_envelope::EnvelopeHost::of(stats, extras),
+        host_window: host_window(stats, extras, thermal_ladder),
+        findings: read_findings_summary(out_dir),
+        degeneracy_warnings: (summary.degeneracy_warnings > 0).then_some(summary.degeneracy_warnings),
+        checkpoints: crate::dispatch_envelope::CheckpointSummary::of(&summary.fold),
+    };
+    serde_json::to_string(&envelope).unwrap_or(stdout)
 }
 
 /// (#2869) Read `<out_dir>/<rel>` as text with the no-follow,
@@ -7028,31 +6939,6 @@ pub(crate) fn read_out_dir_text_with(out_dir: &Path, rel: &str, sink: &dyn Fn(&s
     }
 }
 
-/// The envelope's `metrics` block: this execution's counts, from the fold
-/// of its trajectory, under the names envelope readers (`--json` callers,
-/// the lab benches, the crawl) read. `wall_ms` is the runtime's own clock
-/// (the span its events cover, for a killed run). `cumulative_*` add the
-/// checkpoint a resumed run started from.
-fn envelope_metrics(
-    fold: &darkmux_trajectory::TrajectoryFold,
-    model: &str,
-) -> serde_json::Value {
-    serde_json::json!({
-        "model": model,
-        "wall_ms": fold.wall_ms(),
-        "turns": fold.turns(),
-        "compactions": fold.compactions(),
-        "prompt_tokens": fold.tokens.prompt,
-        "completion_tokens": fold.tokens.completion,
-        "total_tokens": fold.tokens.total,
-        "reasoning_tokens": fold.tokens.reasoning,
-        "cached_tokens": fold.tokens.cached,
-        "rest_ms": fold.rest_ms(),
-        "rests": fold.rest_count(),
-        "turn_delay_effective_ms": fold.complete.as_ref().and_then(|c| c.turn_delay_effective_ms),
-    })
-}
-
 /// (#1959) Count what the crawler recorded, and say where it is.
 ///
 /// Deliberately a COUNT plus a PATH rather than the findings themselves: the
@@ -7060,16 +6946,13 @@ fn envelope_metrics(
 /// push the thing the caller reads past the point of being read. The path is
 /// host-shaped for the same reason `trajectory_path` is (#1955) — a container
 /// path in an envelope is a path the caller cannot open.
-fn read_findings_summary(out_dir: &std::path::Path) -> Option<serde_json::Value> {
+fn read_findings_summary(out_dir: &std::path::Path) -> Option<crate::dispatch_envelope::FindingsSummary> {
     let path = out_dir.join(".darkmux-runtime").join("findings.jsonl");
     let body = read_out_dir_text(out_dir, ".darkmux-runtime/findings.jsonl")?;
     // Count RECORDS, not lines: a trailing newline is not a finding, and a
     // count that says 4 when the file holds 3 is worse than no count.
     let count = body.lines().filter(|l| !l.trim().is_empty()).count();
-    Some(serde_json::json!({
-        "count": count,
-        "path": path.display().to_string(),
-    }))
+    Some(crate::dispatch_envelope::FindingsSummary { count, path: path.display().to_string() })
 }
 
 // (#2107) `HostSampleAt`/`MetricStats`/`HostStats`/`reduce_metric`/
@@ -7080,8 +6963,8 @@ fn read_findings_summary(out_dir: &std::path::Path) -> Option<serde_json::Value>
 // dispatch-scoped sampler uses — one peak/mean/p95/duty algorithm, not two
 // that could silently drift apart. See that module for the full docs; the
 // names/behavior are unchanged, only the home moved.
-use crate::host_probe::{reduce_host_extras, HostExtraAt, HostExtras, MwStats};
-use crate::telemetry_sampler::{reduce_host_stats, HostSampleAt, HostStats, MetricStats};
+use crate::host_probe::{reduce_host_extras, HostExtraAt, HostExtras};
+use crate::telemetry_sampler::{reduce_host_stats, HostSampleAt, HostStats};
 // `reduce_metric` itself isn't called directly in this file (only via
 // `reduce_host_stats` above) — the direct-call tests in
 // `dispatch_internal_tests.rs` (`super::reduce_metric(...)`) are the only
@@ -7106,7 +6989,7 @@ struct TrajectorySummary {
     /// so the orchestrator's envelope and the viewer cannot drift. Firings
     /// were already forwarded to the flow stream and never reached the
     /// caller, whose only surface is the envelope.
-    detections: Vec<serde_json::Value>,
+    detections: Vec<TelemetryDetectorPayload>,
     /// (#2928) The live channel's own cost; see [`LiveSummary`].
     live: LiveSummary,
 }
@@ -9879,7 +9762,7 @@ impl TailerState {
     /// observation produces none.
     fn on_detector(&mut self, event: &darkmux_trajectory::TrajectoryEvent) {
         if let Some(payload) = detector_telemetry_payload(event) {
-            self.summary.detections.push(serde_json::to_value(&payload).unwrap_or_default());
+            self.summary.detections.push(payload.clone());
             self.emit_telemetry(darkmux_flow::FlowSource::Detector, darkmux_flow::Payload::TelemetryDetector(payload));
         }
     }

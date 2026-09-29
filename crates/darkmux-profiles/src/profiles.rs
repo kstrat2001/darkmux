@@ -324,7 +324,8 @@ pub fn get_profile<'a>(reg: &'a ProfileRegistry, name: &str) -> Result<&'a Profi
 /// `default_profile` (the fresh-user single-model floor). Lets a caller (and
 /// `darkmux doctor`) tell an override from a deliberate map binding from the
 /// default fallback.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
 pub enum RoleProfileSource {
     /// (#1475 packet 3) The role was bound by a per-run launch override
     /// (`mission launch review --param <role>=<profile>`) — highest precedence,
@@ -334,6 +335,17 @@ pub enum RoleProfileSource {
     Mapped,
     /// The role was unmapped; it fell back to the registry's `default_profile`.
     DefaultFallback,
+}
+
+impl RoleProfileSource {
+    /// The words `mission config show` prints for the tier.
+    pub fn label(self) -> &'static str {
+        match self {
+            RoleProfileSource::Overridden => "launch override (--param)",
+            RoleProfileSource::Mapped => "role_profiles map",
+            RoleProfileSource::DefaultFallback => "default_profile fallback",
+        }
+    }
 }
 
 /// (#1475 packet 3) The origin of a role→profile binding, supplied to

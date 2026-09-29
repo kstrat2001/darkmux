@@ -25,6 +25,7 @@ use crate::step_config::{
 };
 use crate::types::{Step, Task};
 use darkmux_flow::payload::{DispatchEndPayload, DispatchStartPayload, ResultClass, StepResultPayload};
+use darkmux_trajectory::FailedExec;
 use darkmux_types::execution_id::ExecutionId;
 use darkmux_types::session_id::{SessionId, SessionScope};
 use anyhow::{anyhow, bail, Context, Result};
@@ -243,15 +244,6 @@ fn step_endpoint(call: &ModelCallConfig) -> Result<Option<darkmux_types::ModelEn
     crate::target::step_unmanaged_endpoint(call.endpoint.as_ref(), call.config_path.as_deref())
 }
 
-/// (#1230 Packet 4 DRY pass) One `failed_tool_invocations` entry from the
-/// internal runtime's `--json` envelope — a verifier command the dispatched
-/// role's tool loop attempted to run but never actually executed (missing
-/// binary, toolchain not present, etc). Moved here from `src/coder_phase.rs`
-/// (was mission-run-private) so ANY `dispatch.internal`-shaped step can
-/// surface it, not just `mission.coder` — see `parse_failed_verifiers` and
-/// `DispatchInternalStepKind`'s `parse_verifiers` config opt-in below.
-pub use darkmux_flow::payload::FailedVerifier;
-
 /// Best-effort parse of `failed_tool_invocations` from the internal
 /// runtime's `--json` envelope (a dispatch's stdout). In `--json` mode the
 /// runtime prints a single-line JSON envelope to stdout (status goes to
@@ -259,7 +251,7 @@ pub use darkmux_flow::payload::FailedVerifier;
 /// fallback is pure defense against an unexpected leading line. Returns
 /// EMPTY on any parse miss or absent field — a soft signal must never fire
 /// a FALSE alarm, so "couldn't tell" reads as "nothing failed."
-pub fn parse_failed_verifiers(envelope_stdout: &str) -> Vec<FailedVerifier> {
+pub fn parse_failed_verifiers(envelope_stdout: &str) -> Vec<FailedExec> {
     let as_json = |s: &str| serde_json::from_str::<serde_json::Value>(s.trim()).ok();
     let Some(v) = as_json(envelope_stdout).or_else(|| {
         envelope_stdout
@@ -274,7 +266,7 @@ pub fn parse_failed_verifiers(envelope_stdout: &str) -> Vec<FailedVerifier> {
         .and_then(|a| a.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|e| serde_json::from_value::<FailedVerifier>(e.clone()).ok())
+                .filter_map(|e| serde_json::from_value::<FailedExec>(e.clone()).ok())
                 .collect()
         })
         .unwrap_or_default()
@@ -348,7 +340,7 @@ pub struct DispatchInternalStepKind;
 /// is set — see `DispatchInternalStepKind`'s doc. `dispatch_as_crew_of_one`
 /// is the sole consumer today; kept `pub` (not `pub(crate)`) since a
 /// `Step.output` on disk is operator-inspectable data, same visibility as
-/// `FailedVerifier` above.
+/// `FailedExec`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RawDispatchOutcome {
     pub exit_code: i32,

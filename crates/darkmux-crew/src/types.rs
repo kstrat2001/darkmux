@@ -67,6 +67,45 @@ pub enum EscalationContract {
     HandOffTo(String), // role id to hand off to
 }
 
+impl EscalationContract {
+    /// Which contract this is, without the hand-off target.
+    pub fn kind(&self) -> EscalationKind {
+        match self {
+            EscalationContract::BailWithExplanation => EscalationKind::BailWithExplanation,
+            EscalationContract::RetryWithHint => EscalationKind::RetryWithHint,
+            EscalationContract::HandOffTo(_) => EscalationKind::HandOffTo,
+        }
+    }
+}
+
+/// The three escalation contracts by name: what the role index stores and
+/// `darkmux role` prints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum EscalationKind {
+    BailWithExplanation,
+    RetryWithHint,
+    HandOffTo,
+}
+
+impl EscalationKind {
+    /// The kebab-case tag, as stored in the index and printed.
+    pub fn tag(self) -> &'static str {
+        match self {
+            EscalationKind::BailWithExplanation => "bail-with-explanation",
+            EscalationKind::RetryWithHint => "retry-with-hint",
+            EscalationKind::HandOffTo => "hand-off-to",
+        }
+    }
+
+    /// The kind an index tag names; `None` for a tag no contract has.
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        [Self::BailWithExplanation, Self::RetryWithHint, Self::HandOffTo]
+            .into_iter()
+            .find(|k| k.tag() == tag)
+    }
+}
+
 /// A single role definition: skills, tool palette, escalation behavior.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Role {
@@ -236,7 +275,7 @@ pub struct Crew {
 }
 
 /// Status of a mission.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, schemars::JsonSchema)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "lowercase")]
@@ -572,7 +611,7 @@ pub struct Phase {
 /// automatically as `run_step_graph` walks the graph). `Error` has no
 /// `PhaseStatus` analog — a Phase either completes or is abandoned by
 /// the operator; a Step can fail its own execution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, schemars::JsonSchema)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "lowercase")]

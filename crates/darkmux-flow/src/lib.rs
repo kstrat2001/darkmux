@@ -61,7 +61,7 @@ use std::sync::{Arc, OnceLock};
 /// per sink) so a new sink kind can be added without touching every
 /// downstream consumer — the human formatter prints whatever's in
 /// `config`; the JSON serializer is a pass-through.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SinkInfo {
     pub kind: String,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]

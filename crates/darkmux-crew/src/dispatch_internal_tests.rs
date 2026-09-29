@@ -9427,7 +9427,7 @@
         // Also lands in the envelope's `detections` array via the shared
         // producer (#1955) — same payload the flow record carries.
         assert!(
-            state.summary.detections.iter().any(|d| d["kind"] == "malformed_tool_names"),
+            state.summary.detections.iter().any(|d| d.kind == DetectorKind::MalformedToolNames),
             "must also reach the envelope's detections array"
         );
     }
@@ -9468,18 +9468,18 @@
             state.summary.fold.tool_calls_ungranted, 2,
             "the real_tool_not_granted event's 2, kept in its OWN bucket"
         );
-        let kinds_and_reasons: Vec<(&str, &str)> = state
+        let kinds_and_reasons: Vec<(DetectorKind, &str)> = state
             .summary
             .detections
             .iter()
-            .map(|d| (d["kind"].as_str().unwrap(), d["reason"].as_str().unwrap()))
+            .map(|d| (d.kind, d.reason.as_deref().unwrap()))
             .collect();
         assert_eq!(
             kinds_and_reasons,
             vec![
-                ("malformed_tool_names", "not_a_tool"),
-                ("malformed_tool_names", "real_tool_not_granted"),
-                ("malformed_tool_names", "not_a_tool"),
+                (DetectorKind::MalformedToolNames, "not_a_tool"),
+                (DetectorKind::MalformedToolNames, "real_tool_not_granted"),
+                (DetectorKind::MalformedToolNames, "not_a_tool"),
             ],
             "detections array must carry each firing's own reason"
         );
@@ -9720,8 +9720,12 @@
 
         assert_eq!(state.summary.detections.len(), 1, "one detection recorded");
         assert_eq!(
-            state.summary.detections[0]["bound"],
-            serde_json::json!({"kind": "reasoning_checkpoint_interval", "value": 1000, "source": "built-in"}),
+            state.summary.detections[0].bound,
+            Some(BoundRef {
+                kind: "reasoning_checkpoint_interval".into(),
+                value: Some(1000),
+                source: Some("built-in".into()),
+            }),
             "bound must survive into the envelope-bound detections summary, not just the live flow record"
         );
     }
@@ -13559,7 +13563,34 @@ fn an_envelope_without_a_trajectory_path_is_unchanged() {
 // byte-indistinguishable from a clean one.
 // ---------------------------------------------------------------
 
-fn summary_with(detections: Vec<serde_json::Value>) -> super::TrajectorySummary {
+/// A `RuntimeBounds` whose four required knobs carry distinguishable values.
+fn test_bounds() -> darkmux_flow::payload::RuntimeBounds {
+    use darkmux_flow::payload::{Knob, KnobSource};
+    let knob = |v: u64| Knob { value: Some(serde_json::json!(v)), source: KnobSource::Config, configured_value: None };
+    darkmux_flow::payload::RuntimeBounds {
+        max_tokens_per_call: knob(4000),
+        inactivity_timeout_seconds: knob(600),
+        max_turns: knob(30),
+        max_tokens: knob(8000),
+        reasoning_checkpoint_interval_tokens: None,
+        turn_delay_ms: None,
+        feedback_injection: None,
+        detection_degeneracy_policy: None,
+        thermal_pacing_enabled: None,
+        battery_pause_enabled: None,
+        battery_pause_floor_pct: None,
+    }
+}
+
+fn a_cycle_detection() -> TelemetryDetectorPayload {
+    TelemetryDetectorPayload::new(
+        DetectorKind::Cycle,
+        DetectorSeverity::Warn,
+        "`read` called 3× in the last 5 tool calls".to_string(),
+    )
+}
+
+fn summary_with(detections: Vec<TelemetryDetectorPayload>) -> super::TrajectorySummary {
     super::TrajectorySummary {
         detections,
         ..Default::default()
@@ -13605,7 +13636,7 @@ fn degeneracy_warnings_reach_the_envelope() {
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
-        serde_json::json!({}),
+        test_bounds(),
         None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -13617,7 +13648,7 @@ fn degeneracy_warnings_reach_the_envelope() {
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
-        serde_json::json!({}),
+        test_bounds(),
         None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -13626,11 +13657,7 @@ fn degeneracy_warnings_reach_the_envelope() {
 
 #[test]
 fn a_detection_reaches_the_envelope() {
-    let det = serde_json::json!({
-        "kind": "cycle",
-        "severity": "warn",
-        "detail": "`read` called 3× in the last 5 tool calls",
-    });
+    let det = a_cycle_detection();
     let out = super::enrich_envelope_with_summary(
         r#"{"result":"stop"}"#.to_string(),
         "m",
@@ -13638,11 +13665,11 @@ fn a_detection_reaches_the_envelope() {
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
-        serde_json::json!({}),
+        test_bounds(),
         None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(v["detections"][0], det, "the firing must reach the caller: {out}");
+    assert_eq!(v["detections"][0], serde_json::to_value(&det).unwrap(), "the firing must reach the caller: {out}");
     assert_eq!(v["result"], "stop", "existing fields survive");
 }
 
@@ -13658,7 +13685,7 @@ fn a_clean_run_reports_an_empty_array_not_an_absent_field() {
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
-        serde_json::json!({}),
+        test_bounds(),
         None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -13666,19 +13693,13 @@ fn a_clean_run_reports_an_empty_array_not_an_absent_field() {
     assert_eq!(v["detections"].as_array().unwrap().len(), 0);
 }
 
-/// MUST FIX 3 (merge-gate review of #2165): `obj.insert("bounds", bounds)`
-/// was unpinned — every other `enrich_envelope_with_summary` test in this
-/// file passes `serde_json::json!({})` as the `bounds` arg, so deleting the
-/// insert line failed nothing. Passes a DISTINCTIVE, non-empty value (never
-/// the shape `resolved_runtime_bounds` would actually produce) so this
-/// assertion could only pass if the caller's `bounds` argument genuinely
-/// made it into the envelope, not some other field coincidentally matching.
+/// The caller's `bounds` argument must reach the envelope under `"bounds"`, verbatim. Uses a
+/// distinctive value (never what `resolved_runtime_bounds` would produce) so the assertion can
+/// only pass if the argument itself made it in.
 #[test]
 fn bounds_argument_survives_into_the_envelope() {
-    let distinctive_bounds = serde_json::json!({
-        "max_tokens_per_call": {"value": 4000, "source": "config"},
-        "__test_marker": "bounds-survival-proof",
-    });
+    let mut distinctive_bounds = test_bounds();
+    distinctive_bounds.max_tokens_per_call.value = Some(serde_json::json!(4321));
     let out = super::enrich_envelope_with_summary(
         r#"{"result":"stop"}"#.to_string(),
         "m",
@@ -13691,9 +13712,90 @@ fn bounds_argument_survives_into_the_envelope() {
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(
-        v["bounds"], distinctive_bounds,
+        v["bounds"],
+        serde_json::to_value(&distinctive_bounds).unwrap(),
         "the bounds argument must reach the envelope verbatim under the \"bounds\" key: {out}"
     );
+    assert_eq!(v["bounds"]["max_tokens_per_call"]["value"], 4321, "{out}");
+}
+
+/// The three typed fields (`detections`, `bounds`, `host_window`) print the bytes the
+/// flow payloads print: same keys, same order, same nulls. Pinned as one literal so a
+/// reordered field or a dropped `skip_serializing_if` is a failure here.
+#[test]
+fn the_typed_envelope_fields_print_their_pinned_bytes() {
+    let mut detection = a_cycle_detection();
+    detection.turn_seq = Some(4);
+    let out = super::enrich_envelope_with_summary(
+        r#"{"result":"stop"}"#.to_string(),
+        "m",
+        &summary_with(vec![detection]),
+        &super::reduce_host_stats(&worked_samples()),
+        &no_extras(),
+        no_findings_dir(),
+        test_bounds(),
+        None,
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let field = |k: &str| serde_json::to_string(&v[k]).unwrap();
+    assert_eq!(field("detections"), r#"[{"kind":"cycle","severity":"warn","detail":"`read` called 3× in the last 5 tool calls","turn_seq":4}]"#);
+    assert_eq!(field("bounds"), r#"{"max_tokens_per_call":{"value":4000,"source":"config"},"inactivity_timeout_seconds":{"value":600,"source":"config"},"max_turns":{"value":30,"source":"config"},"max_tokens":{"value":8000,"source":"config"}}"#);
+    assert_eq!(field("host_window"), r#"{"thermal_worst_state":null,"above_nominal_ms":null,"min_cpu_speed_limit_pct":null,"thermal_serious_episodes":null,"thermal_duty_delay_ms":null,"simulated_host_source":null,"power_mw_total":null,"energy_mwh":null,"samples":5,"span_ms":8000}"#);
+}
+
+/// The envelope names its keys in one order: the runtime's, then the host's.
+/// A reader diffing two envelopes, and the golden that pins the type, both
+/// lean on it.
+#[test]
+fn the_enriched_envelope_names_the_runtimes_keys_then_the_hosts() {
+    let out = super::enrich_envelope_with_summary(
+        r#"{"result":"stop","final_assistant":"hi","trajectory_path":"/t","failed_tool_invocations":[]}"#.to_string(),
+        "m",
+        &summary_with(vec![]),
+        &super::HostStats::default(),
+        &no_extras(),
+        no_findings_dir(),
+        test_bounds(),
+        None,
+    );
+    let at = |key: &str| out.find(&format!("\"{key}\":")).unwrap_or_else(|| panic!("no {key} in {out}"));
+    let order = ["result", "final_assistant", "trajectory_path", "failed_tool_invocations", "metrics", "detections", "bounds"];
+    assert!(order.windows(2).all(|w| at(w[0]) < at(w[1])), "keys out of order: {out}");
+}
+
+/// A stdout that is not a JSON object is handed back untouched: the enrichment
+/// never invents an envelope around text, and never fails a dispatch over one.
+#[test]
+fn a_stdout_that_is_not_an_envelope_is_returned_untouched() {
+    for text in ["plain text", "[1,2]", "{ not json", ""] {
+        let out = super::enrich_envelope_with_summary(
+            text.to_string(),
+            "m",
+            &summary_with(vec![]),
+            &super::HostStats::default(),
+            &no_extras(),
+            no_findings_dir(),
+            test_bounds(),
+            None,
+        );
+        assert_eq!(out, text);
+    }
+}
+
+/// The hosted-endpoint envelope's token keys are the parity contract both hosted
+/// single-shot producers are held to: `DirectTokens` serializes exactly
+/// `DIRECT_TOKEN_KEYS`, in order, and an unreported count is `null`.
+#[test]
+fn direct_tokens_carry_exactly_the_direct_token_keys() {
+    let none = serde_json::to_value(crate::dispatch_envelope::DirectTokens::of(&darkmux_trajectory::UsageCounts::default())).unwrap();
+    let keys: Vec<&str> = none.as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(keys, super::DIRECT_TOKEN_KEYS);
+    assert!(none.as_object().unwrap().values().all(|v| v.is_null()), "{none}");
+    let counts = darkmux_trajectory::UsageCounts { prompt: Some(3), completion: Some(4), total: None, reasoning: Some(1), cached: None };
+    let some = serde_json::to_value(crate::dispatch_envelope::DirectTokens::of(&counts)).unwrap();
+    assert_eq!(some["prompt_tokens"], 3);
+    assert_eq!(some["total_tokens"], 7, "the one total rule: prompt + completion when the provider sent none");
+    assert!(some["cached_tokens"].is_null(), "{some}");
 }
 
 fn summary_over_ratios(ratios: &[f64], concluded: u32) -> super::TrajectorySummary {
@@ -13718,7 +13820,7 @@ fn checkpoint_block(s: &super::TrajectorySummary) -> serde_json::Value {
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
-        serde_json::json!({}),
+        test_bounds(),
         None,
     );
     serde_json::from_str::<serde_json::Value>(&out).unwrap()["checkpoints"].clone()
@@ -13802,7 +13904,7 @@ fn a_dispatch_that_never_checkpointed_omits_the_block() {
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
-        serde_json::json!({}),
+        test_bounds(),
         None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -13835,7 +13937,7 @@ fn the_envelope_metrics_are_the_fold_of_the_trajectory() {
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
-        serde_json::json!({}),
+        test_bounds(),
         None,
     );
     let m = serde_json::from_str::<serde_json::Value>(&out).unwrap()["metrics"].clone();
@@ -13851,7 +13953,7 @@ fn the_envelope_metrics_are_the_fold_of_the_trajectory() {
 
 #[test]
 fn non_envelope_stdout_is_untouched_by_enrichment() {
-    let s = summary_with(vec![serde_json::json!({"kind":"cycle"})]);
+    let s = summary_with(vec![a_cycle_detection()]);
     for raw in ["plain model output", "", "{ not json"] {
         assert_eq!(
             super::enrich_envelope_with_summary(
@@ -13861,7 +13963,7 @@ fn non_envelope_stdout_is_untouched_by_enrichment() {
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
-        serde_json::json!({}),
+        test_bounds(),
         None,
     ),
             raw,
@@ -13976,7 +14078,7 @@ fn host_stats_reach_the_envelope_nested_by_metric_only() {
         &stats,
         &no_extras(),
         no_findings_dir(),
-        serde_json::json!({}),
+        test_bounds(),
         None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -14023,7 +14125,7 @@ fn power_thermal_and_energy_reach_the_envelope_without_disturbing_the_2107_shape
         &stats,
         &extras,
         no_findings_dir(),
-        serde_json::json!({}),
+        test_bounds(),
         None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -14047,7 +14149,7 @@ fn power_thermal_and_energy_reach_the_envelope_without_disturbing_the_2107_shape
         &stats,
         &no_extras(),
         no_findings_dir(),
-        serde_json::json!({}),
+        test_bounds(),
         None,
     );
     let w: serde_json::Value = serde_json::from_str(&without).unwrap();
@@ -14068,7 +14170,7 @@ fn a_host_without_power_or_thermal_sources_omits_those_blocks() {
         &super::reduce_host_stats(&worked_samples()),
         &no_extras(),
         no_findings_dir(),
-        serde_json::json!({}),
+        test_bounds(),
         None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -14092,7 +14194,7 @@ fn an_unsampled_run_omits_the_host_block_rather_than_reporting_zero() {
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
-        serde_json::json!({}),
+        test_bounds(),
         None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -14147,7 +14249,7 @@ fn the_envelope_reports_how_many_findings_the_crawl_recorded() {
         &super::HostStats::default(),
         &no_extras(),
         td.path(),
-        serde_json::json!({}),
+        test_bounds(),
         None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -14170,7 +14272,7 @@ fn a_trailing_newline_is_not_a_finding() {
         &super::HostStats::default(),
         &no_extras(),
         td.path(),
-        serde_json::json!({}),
+        test_bounds(),
         None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -14191,7 +14293,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
-        serde_json::json!({}),
+        test_bounds(),
         None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -16114,7 +16216,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         &stats,
         &extras,
         no_findings_dir(),
-        serde_json::json!({}),
+        test_bounds(),
         None,
     );
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -16153,7 +16255,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         &stats,
         &no_extras(),
         no_findings_dir(),
-        serde_json::json!({}),
+        test_bounds(),
         Some(crate::thermal_governor::ThermalLadderSummary {
                 serious_episodes: 3,
                 current_duty_delay_ms: 120_000,
@@ -16209,7 +16311,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         &stats,
         &no_extras(),
         no_findings_dir(),
-        serde_json::json!({}),
+        test_bounds(),
         None,
     );
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -16226,7 +16328,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
-        serde_json::json!({}),
+        test_bounds(),
         None,
     );
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -17985,3 +18087,55 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         assert!(format!("{err:#}").contains("exceeds"), "{err:#}");
     }
 
+
+/// A runtime stdout with a wrongly typed field is not enriched, and the caller
+/// is told once on stderr why the document has no metrics, detections or
+/// bounds: the failure is not silent.
+#[test]
+fn an_envelope_that_does_not_parse_says_so_and_goes_out_as_written() {
+    let warnings = std::cell::RefCell::new(Vec::new());
+    let sink = |line: &str| warnings.borrow_mut().push(line.to_string());
+    let stdout = r#"{"result":5,"final_assistant":"hi"}"#;
+    assert!(super::parse_runtime_envelope(stdout, &sink).is_none());
+    let lines = warnings.borrow();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("not an envelope") && lines[0].contains("invalid type"), "{lines:?}");
+    drop(lines);
+    let out = super::enrich_envelope_with_summary(
+        stdout.to_string(),
+        "m",
+        &summary_with(vec![]),
+        &super::HostStats::default(),
+        &no_extras(),
+        no_findings_dir(),
+        test_bounds(),
+        None,
+    );
+    assert_eq!(out, stdout, "an envelope this darkmux cannot read goes out unchanged");
+}
+
+/// The inverse: a well-formed envelope raises no warning.
+#[test]
+fn an_envelope_that_parses_raises_no_warning() {
+    let warnings = std::cell::RefCell::new(Vec::<String>::new());
+    let sink = |line: &str| warnings.borrow_mut().push(line.to_string());
+    assert!(super::parse_runtime_envelope(r#"{"result":"stop"}"#, &sink).is_some());
+    assert!(warnings.borrow().is_empty());
+}
+
+/// A partial envelope prints no empty string for what the runtime did not say.
+#[test]
+fn a_partial_runtime_envelope_prints_no_empty_result_or_path() {
+    let out = super::enrich_envelope_with_summary(
+        r#"{"final_assistant":"hi"}"#.to_string(),
+        "m",
+        &summary_with(vec![]),
+        &super::HostStats::default(),
+        &no_extras(),
+        no_findings_dir(),
+        test_bounds(),
+        None,
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(v.get("result").is_none() && v.get("trajectory_path").is_none(), "{out}");
+}

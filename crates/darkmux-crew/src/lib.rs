@@ -64,6 +64,7 @@ pub mod dispatch;
 // the same `run_step_graph` engine every mission/coder-phase/review run
 // uses, so its residency participates in the #1487 lease/reconcile regime.
 pub mod dispatch_as_crew_of_one;
+pub mod dispatch_envelope;
 pub mod dispatch_internal;
 // (#2628) Gives a STANDALONE raw dispatch (never itself a `StepKind`, never
 // one placement among concurrent wave siblings) the same Exclusive-

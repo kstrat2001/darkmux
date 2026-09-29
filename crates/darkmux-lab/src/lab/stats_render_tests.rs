@@ -198,7 +198,7 @@ fn a_comparison_prints_what_moved() {
 #[test]
 fn unread_duplicate_and_unverified_runs_are_named() {
     let mut s = set(vec![run("a")]);
-    s.errors.push(("gone".into(), "no run directory".into()));
+    s.errors.push(SetError { run: "gone".into(), error: "no run directory".into() });
     s.duplicates.push("a".into());
     let mut unv = run("u");
     unv.verify = None;
@@ -224,11 +224,13 @@ fn a_pass_from_an_errored_run_is_called_out() {
 #[test]
 fn the_set_json_carries_runs_summary_and_what_was_not_counted() {
     let mut s = set(vec![run("a")]);
-    s.errors.push(("gone".into(), "x".into()));
-    let j = sets_json(&s, Some(&set(vec![run("b")])));
+    s.errors.push(SetError { run: "gone".into(), error: "x".into() });
+    let base = set(vec![run("b")]);
+    let j = serde_json::to_value(sets_json(&s, Some(&base))).unwrap();
     assert_eq!(j["runs"][0]["run"], "a");
     assert_eq!(j["summary"]["n"], 1);
-    assert_eq!(j["errors"][0][0], "gone");
+    assert_eq!(j["errors"][0]["run"], "gone");
+    assert_eq!(j["errors"][0]["error"], "x");
     assert_eq!(j["baseline"]["runs"][0]["run"], "b");
 }
 
@@ -241,7 +243,7 @@ fn only_an_unread_run_makes_the_exit_code_non_zero() {
     dup.duplicates.push("a".into());
     assert_eq!(exit_code(&dup, None), 0);
     let mut bad = set(vec![run("a")]);
-    bad.errors.push(("gone".into(), "x".into()));
+    bad.errors.push(SetError { run: "gone".into(), error: "x".into() });
     assert_eq!(exit_code(&bad, None), 1);
     assert_eq!(exit_code(&ok, Some(&bad)), 1, "an unread baseline run counts too");
 }
@@ -250,9 +252,9 @@ fn only_an_unread_run_makes_the_exit_code_non_zero() {
 #[test]
 fn unread_runs_are_counted_across_both_sets() {
     let mut cand = set(vec![run("a")]);
-    cand.errors.push(("gone-a".into(), "x".into()));
+    cand.errors.push(SetError { run: "gone-a".into(), error: "x".into() });
     let mut base = set(vec![run("b")]);
-    base.errors.push(("gone-b".into(), "x".into()));
+    base.errors.push(SetError { run: "gone-b".into(), error: "x".into() });
     let t = sets_text(&cand, Some(&base));
     assert!(t.contains("2 listed run(s) are not in the figures above"), "{t}");
 }
@@ -273,7 +275,7 @@ fn a_run_named_in_both_arms_gets_a_notice() {
     );
     assert!(!t.contains("y is in both"), "y is only in the candidate");
     assert_eq!(exit_code(&cand, Some(&base)), 0, "a notice, not an error");
-    let j = sets_json(&cand, Some(&base));
+    let j = serde_json::to_value(sets_json(&cand, Some(&base))).unwrap();
     assert_eq!(j["cross_arm_overlap"], serde_json::json!(["x"]));
 }
 

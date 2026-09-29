@@ -91,7 +91,7 @@ darkmux-serve = { path = "crates/darkmux-serve" }
 # other crate here pulls it in transitively via darkmux-profiles), just not
 # previously wired as a DIRECT dependency of the binary itself.
 darkmux-gestalt = { path = "crates/darkmux-gestalt" }
-darkmux-trajectory = { path = "crates/darkmux-trajectory" }
+darkmux-trajectory = { path = "crates/darkmux-trajectory", features = ["schemars"] }
 anyhow = "1.0"
 axum = "0.7"
 clap = { version = "4.5", features = ["derive"] }
@@ -103,6 +103,9 @@ clap = { version = "4.5", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "fs", "io-util", "process"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json.workspace = true
+# The `--json` contract golden (`tests/cli-json.golden`) is derived from the
+# output types' schemas. Already a dependency of the types, crew and lab crates.
+schemars = "1.2"
 dirs = "5.0"
 # Phase B (#45) — SQLite-backed derived index over crew manifests.
 # `bundled` per #45 dep spec so users don't need libsqlite3 on PATH.

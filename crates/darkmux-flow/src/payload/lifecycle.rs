@@ -93,16 +93,6 @@ impl Attribution for StepTimingPayload {
     }
 }
 
-/// A bash verifier command the runtime classified as FAILED TO RUN: the binary was missing, not
-/// executable, or its toolchain failed to load, so it never verified anything.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
-pub struct FailedVerifier {
-    pub command: String,
-    pub reason: String,
-}
-
 /// The rich, kind-specific result of a step: the payload of `step.result`, the companion to the
 /// scheduler's generic step bookends. One type for every producer: a hosted single-shot (spend and
 /// caps), a `dispatch.map` (per item, per aggregate, or the empty-collection short circuit), a
@@ -195,7 +185,7 @@ pub struct StepResultPayload {
     /// Verifier commands that failed to run: a soft signal for the adjudicator.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
-    pub failed_verifiers: Option<Vec<FailedVerifier>>,
+    pub failed_verifiers: Option<Vec<darkmux_trajectory::FailedExec>>,
     /// How many `failed_verifiers`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(type = "number", optional))]

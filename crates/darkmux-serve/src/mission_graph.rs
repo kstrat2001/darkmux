@@ -46,7 +46,7 @@ use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// What a graph node is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "lowercase")]
@@ -57,7 +57,7 @@ pub enum NodeKind {
 
 /// What an edge means: `Contains` (phase to task) or `DependsOn` (a real
 /// `Task::depends_on`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "snake_case")]
@@ -69,7 +69,7 @@ pub enum EdgeKind {
 /// A node's display status: a task's own display status, or a phase's. The two
 /// sets differ (`Degraded` is a phase-only verdict), so the wire type is their
 /// union and each variant serializes as its bare status word.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(untagged)]
@@ -90,7 +90,7 @@ pub enum GraphNodeStatus {
 /// the `mission_graph_json_fan_in_shape` route test now pins the exact
 /// key the JS reads so a rename on either side fails a test instead of
 /// silently flattening the layout.
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq, schemars::JsonSchema)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "camelCase")]
@@ -151,7 +151,7 @@ pub struct GraphNode {
 
 /// One row inside a Task node's card (#1401). Same `camelCase` wire
 /// contract as [`GraphNode`].
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq, schemars::JsonSchema)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "camelCase")]
@@ -237,7 +237,7 @@ pub struct StepRow {
 /// [`GraphNode`] (a no-op for the current single-word field names, but the
 /// attribute keeps a future two-word field from re-introducing the
 /// casing trap).
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq, schemars::JsonSchema)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "camelCase")]
@@ -259,7 +259,7 @@ pub struct GraphEdge {
 /// the page's JS reads it that way (`g.mission_id`, `g.mission_status`).
 /// Only the node/edge OBJECTS are camelCase — see [`GraphNode`]'s casing
 /// contract. The `mission_graph_json_fan_in_shape` test pins both casings.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct MissionGraph {
@@ -333,7 +333,7 @@ fn step_model_from_config(config: &serde_json::Value) -> Option<String> {
 /// in DISPLAY), while a Task's own status is read-only, derived fresh from
 /// its steps on every graph build (`Task` carries no `status` field of its
 /// own — #1230/#1341).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "lowercase")]
@@ -434,7 +434,7 @@ fn derive_task_status(steps: &[(NodeStatus, Option<u64>)]) -> TaskDisplayStatus 
 /// `Waiting` a task could never legitimately reach (task level keeps "any
 /// Error wins" unchanged, see `derive_task_status`) would widen the
 /// scheduler's own vocabulary for a concept that only exists one level up.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "lowercase")]

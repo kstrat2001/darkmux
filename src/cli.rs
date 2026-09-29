@@ -849,7 +849,8 @@ pub(crate) enum MissionCmd {
 /// `run_list::run_kind_arg_vocabulary_matches_the_ui_runs_kinds_twin`
 /// (`src/run_list.rs`), which reads BOTH sides live rather than trusting
 /// this comment to stay true.
-#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
 pub(crate) enum RunKindArg {
     All,
     Mission,

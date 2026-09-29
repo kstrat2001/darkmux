@@ -74,7 +74,8 @@
 //! failing to resolve — nothing to show at all.
 
 use crate::cli;
-use crate::crew::mission_config::{self, FindingSeverity, LoadedMissionConfig, MissionConfig};
+use crate::cli_json;
+use crate::crew::mission_config::{self, FindingSeverity, LoadedMissionConfig, MissionConfig, MissionConfigSource};
 use crate::crew::step_kinds::StepKindRegistry;
 use anyhow::{anyhow, Context, Result};
 use darkmux_gestalt::{decide_residency, namespaced_identifier, Placement, ResidencyDecision, ResidentFact};
@@ -102,11 +103,11 @@ pub fn run(sub: cli::MissionConfigCmd) -> Result<i32> {
 /// field is present in the JSON shape regardless (null on the failure
 /// branch) so a machine reader never has to guess which fields a given row
 /// carries.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub(crate) struct ConfigListRow {
     pub id: String,
     pub name: Option<String>,
-    pub source: Option<String>,
+    pub source: Option<MissionConfigSource>,
     pub manifest_path: Option<String>,
     pub phases: Option<usize>,
     pub tasks: Option<usize>,
@@ -129,7 +130,7 @@ pub(crate) fn build_list() -> Vec<ConfigListRow> {
                 ConfigListRow {
                     id,
                     name: Some(loaded.config.name.clone()),
-                    source: Some(loaded.source.label().to_string()),
+                    source: Some(loaded.source),
                     manifest_path: Some(loaded.manifest_path.display().to_string()),
                     phases: Some(loaded.config.phases.len()),
                     tasks: Some(total_tasks),
@@ -164,7 +165,7 @@ fn render_list_text(rows: &[ConfigListRow]) -> String {
     let name_w = rows.iter().map(|r| name_of(r).chars().count()).max().unwrap_or(4).max(4);
     let src_w = rows
         .iter()
-        .map(|r| r.source.as_deref().map(|s| s.chars().count()).unwrap_or(0))
+        .map(|r| r.source.map(|s| s.label().chars().count()).unwrap_or(0))
         .max()
         .unwrap_or(6)
         .max(6);
@@ -182,7 +183,7 @@ fn render_list_text(rows: &[ConfigListRow]) -> String {
             "{:<id_w$}  {:<name_w$}  {:<src_w$}  {:>6}  {:>5}  {}\n",
             row.id,
             name_of(row),
-            row.source.as_deref().unwrap_or(""),
+            row.source.map(|s| s.label()).unwrap_or(""),
             row.phases.unwrap_or(0),
             row.tasks.unwrap_or(0),
             row.cmd.as_deref().unwrap_or("-"),
@@ -191,13 +192,16 @@ fn render_list_text(rows: &[ConfigListRow]) -> String {
     out
 }
 
+/// `mission config list --json`.
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct ConfigList {
+    pub configs: Vec<ConfigListRow>,
+}
+
 fn list(json: bool) -> Result<i32> {
     let rows = build_list();
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({ "configs": rows }))?
-        );
+        cli_json::emit(&ConfigList { configs: rows })?;
     } else {
         print!("{}", render_list_text(&rows));
     }
@@ -206,7 +210,7 @@ fn list(json: bool) -> Result<i32> {
 
 // ── show ────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub(crate) struct InputJson {
     pub name: String,
     pub description: Option<String>,
@@ -226,51 +230,77 @@ pub(crate) struct InputJson {
     pub default: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub(crate) struct GhVerbJson {
     pub verb: String,
     pub allowed: bool,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq, schemars::JsonSchema)]
 pub(crate) struct ModelJson {
     pub id: String,
     pub remote: bool,
     pub n_ctx: Option<u32>,
 }
 
+/// Whether a role's model is resident right now.
+///
+/// `LoadedStaleCtx` is `darkmux_gestalt::ResidencyDecision::Reconcile`: a
+/// darkmux-owned resident shares the model but at an insufficient ctx, so
+/// `mission launch` would unload and reload it (the #1135 shape) rather than
+/// reuse it as-is. `Unknown` covers every case where a model was never
+/// reached (profile registry unavailable, dangling mapping, profile declares
+/// no models, a local model missing `n_ctx`), which is when `error` is set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Residency {
+    Loaded,
+    LoadedStaleCtx,
+    LoadedByUser,
+    NotLoaded,
+    Remote,
+    Unavailable,
+    Unknown,
+}
+
+impl Residency {
+    /// The words the text view prints when it has no detail line.
+    fn words(self) -> &'static str {
+        match self {
+            Residency::Loaded => "loaded",
+            Residency::LoadedStaleCtx => "loaded stale ctx",
+            Residency::LoadedByUser => "loaded by user",
+            Residency::NotLoaded => "not loaded",
+            Residency::Remote => "remote",
+            Residency::Unavailable => "unavailable",
+            Residency::Unknown => "unknown",
+        }
+    }
+}
+
 /// A task's `role_id` resolved to a profile + model, exactly as `mission
-/// launch`/`dispatch` would resolve it right now. `residency` is always one
-/// of `"loaded"` / `"loaded_stale_ctx"` / `"loaded_by_user"` /
-/// `"not_loaded"` / `"remote"` / `"unavailable"` / `"unknown"`:
-/// `"loaded_stale_ctx"` is `darkmux_gestalt::ResidencyDecision::Reconcile` —
-/// a darkmux-owned resident shares the model but at an insufficient ctx, so
-/// `mission launch` would unload + reload it (the #1135 shape) rather than
-/// reuse it as-is. `"unknown"` covers every case where a model was never
-/// reached (profile registry unavailable, dangling mapping, profile
-/// declares no models, a local model missing `n_ctx`), which is when
-/// `error` is set. `residency_detail` carries the human-readable
-/// elaboration the text renderer prints; the JSON reader can ignore it and
-/// key off `residency` alone.
-#[derive(Debug, Clone, Serialize)]
+/// launch`/`dispatch` would resolve it right now. `residency_detail` carries
+/// the human-readable elaboration the text renderer prints; the JSON reader
+/// can ignore it and key off `residency` alone.
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub(crate) struct RoleResolution {
     pub role_id: String,
     pub profile: Option<String>,
-    pub provenance: Option<String>,
+    pub provenance: Option<RoleProfileSource>,
     pub model: Option<ModelJson>,
-    pub residency: String,
+    pub residency: Residency,
     pub residency_detail: Option<String>,
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub(crate) struct StepJson {
     pub id: String,
     pub kind: String,
     pub constructible: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub(crate) struct TaskJson {
     pub id: String,
     /// (#2302) The `enabled` FIELD verbatim — `Some(false)` is a task the
@@ -288,7 +318,7 @@ pub(crate) struct TaskJson {
     pub steps: Vec<StepJson>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub(crate) struct PhaseJson {
     pub id: String,
     pub display_name: Option<String>,
@@ -296,19 +326,19 @@ pub(crate) struct PhaseJson {
     pub tasks: Vec<TaskJson>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub(crate) struct RegistryJson {
     pub profiles_source: Option<String>,
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub(crate) struct ResidencyBlockJson {
     pub available: bool,
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub(crate) struct ConfigShow {
     /// The id the caller ASKED for (`mission config show <id>`) — a
     /// user-tier file's own basename can differ from the `id` field its
@@ -319,7 +349,7 @@ pub(crate) struct ConfigShow {
     pub id: String,
     pub name: String,
     pub description: Option<String>,
-    pub source: String,
+    pub source: MissionConfigSource,
     pub manifest_path: String,
     pub schema_version: Option<String>,
     pub inputs: Vec<InputJson>,
@@ -362,7 +392,7 @@ fn resolve_role(
         profile: None,
         provenance: None,
         model: None,
-        residency: "unknown".to_string(),
+        residency: Residency::Unknown,
         residency_detail: None,
         error: Some(error),
     };
@@ -377,12 +407,7 @@ fn resolve_role(
         Ok(r) => r,
         Err(e) => return unresolved(format!("{e:#}")),
     };
-    let provenance = match resolved.source {
-        RoleProfileSource::Overridden => "launch override (--param)",
-        RoleProfileSource::Mapped => "role_profiles map",
-        RoleProfileSource::DefaultFallback => "default_profile fallback",
-    }
-    .to_string();
+    let provenance = resolved.source;
 
     // Every early-return past this point has resolved a PROFILE (so
     // `profile`/`provenance` are known) but not yet a usable model — same
@@ -391,9 +416,9 @@ fn resolve_role(
     let bound_but_unusable = |error: String| RoleResolution {
         role_id: role_id.to_string(),
         profile: Some(resolved.profile_name.clone()),
-        provenance: Some(provenance.clone()),
+        provenance: Some(provenance),
         model: None,
-        residency: "unknown".to_string(),
+        residency: Residency::Unknown,
         residency_detail: None,
         error: Some(error),
     };
@@ -486,15 +511,15 @@ fn resolve_role(
 fn model_residency(
     pm: &darkmux_types::ProfileModel,
     loaded_models: Result<&[LoadedModel], &str>,
-) -> (String, Option<String>) {
+) -> (Residency, Option<String>) {
     if !pm.is_managed() {
-        return ("remote".to_string(), None);
+        return (Residency::Remote, None);
     }
     match loaded_models {
         // (merge-gate CONSIDER 6) The cause already carries in the show-level
         // `residency.error` field / header line, printed ONCE — repeating
         // the whole message on every role line is noise, not information.
-        Err(_) => ("unavailable".to_string(), None),
+        Err(_) => (Residency::Unavailable, None),
         Ok(models) => {
             let residents: Vec<ResidentFact> = models
                 .iter()
@@ -517,11 +542,11 @@ fn model_residency(
             };
             match decide_residency(&residents, &placement) {
                 ResidencyDecision::Reuse { identifier, resident_ctx } => (
-                    "loaded".to_string(),
+                    Residency::Loaded,
                     Some(format!("loaded ({identifier}, ctx {resident_ctx})")),
                 ),
                 ResidencyDecision::Reconcile { stale_identifier, stale_ctx } => (
-                    "loaded_stale_ctx".to_string(),
+                    Residency::LoadedStaleCtx,
                     Some(format!(
                         "loaded at ctx {stale_ctx} ({stale_identifier}) — below the profile's \
                          {}; launch would reload",
@@ -529,13 +554,13 @@ fn model_residency(
                     )),
                 ),
                 ResidencyDecision::ForeignDuplicate { foreign_identifier } => (
-                    "loaded_by_user".to_string(),
+                    Residency::LoadedByUser,
                     Some(format!(
                         "loaded by user ({foreign_identifier}, not darkmux-managed) — darkmux \
                          will not dispatch to it, see CLAUDE.md namespace contract"
                     )),
                 ),
-                ResidencyDecision::LoadFresh => ("not_loaded".to_string(), None),
+                ResidencyDecision::LoadFresh => (Residency::NotLoaded, None),
             }
         }
     }
@@ -617,7 +642,7 @@ pub(crate) fn build_show(
         id: config.id.clone(),
         name: config.name.clone(),
         description: config.description.clone(),
-        source: loaded.source.label().to_string(),
+        source: loaded.source,
         manifest_path: loaded.manifest_path.display().to_string(),
         schema_version: config.schema_version.clone(),
         inputs: config
@@ -684,7 +709,7 @@ fn render_role_line(role: &RoleResolution) -> String {
         return format!("    ↳ role {} → ERROR: {err}\n", role.role_id);
     }
     let profile = role.profile.as_deref().unwrap_or("?");
-    let provenance = role.provenance.as_deref().unwrap_or("?");
+    let provenance = role.provenance.map_or("?", RoleProfileSource::label);
     let model = match &role.model {
         Some(m) => {
             let ctx = match m.n_ctx {
@@ -700,7 +725,7 @@ fn render_role_line(role: &RoleResolution) -> String {
     let residency = role
         .residency_detail
         .clone()
-        .unwrap_or_else(|| role.residency.replace('_', " "));
+        .unwrap_or_else(|| role.residency.words().to_string());
     format!(
         "    ↳ role {} → profile {profile} ({provenance}) → model {model} · {residency}\n",
         role.role_id
@@ -731,7 +756,7 @@ fn render_show_text(show: &ConfigShow) -> String {
             show.requested_id, show.id, show.name
         ));
     }
-    out.push_str(&format!("  source: {} ({})\n", show.source, show.manifest_path));
+    out.push_str(&format!("  source: {} ({})\n", show.source.label(), show.manifest_path));
     if let Some(v) = &show.schema_version {
         out.push_str(&format!("  schema_version: {v}\n"));
     }
@@ -972,7 +997,7 @@ fn show(id: &str, params: &[String], profiles_file: Option<&str>, json: bool) ->
     let show = build_show(id, &loaded, &registry, profiles_ctx, &bindings, loaded_models, &warnings);
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&show)?);
+        cli_json::emit(&show)?;
     } else {
         print!("{}", render_show_text(&show));
     }
@@ -1142,9 +1167,9 @@ mod tests {
         let show = build_show("m", &loaded, &registry, Ok(&pctx), &bindings, Ok(&[]), &[]);
         let roles: Vec<&RoleResolution> =
             show.phases[0].tasks.iter().map(|t| t.role.as_ref().unwrap()).collect();
-        assert_eq!(roles[0].provenance.as_deref(), Some("launch override (--param)"));
-        assert_eq!(roles[1].provenance.as_deref(), Some("role_profiles map"));
-        assert_eq!(roles[2].provenance.as_deref(), Some("default_profile fallback"));
+        assert_eq!(roles[0].provenance, Some(RoleProfileSource::Overridden));
+        assert_eq!(roles[1].provenance, Some(RoleProfileSource::Mapped));
+        assert_eq!(roles[2].provenance, Some(RoleProfileSource::DefaultFallback));
         for r in &roles {
             assert!(r.error.is_none(), "unexpected error: {:?}", r.error);
             assert_eq!(r.profile.as_deref(), Some("fast"));
@@ -1173,7 +1198,7 @@ mod tests {
         let show = build_show("m", &loaded, &registry, Ok(&pctx), &bindings, Ok(&[]), &[]);
         let broken = show.phases[0].tasks[0].role.as_ref().unwrap();
         assert!(broken.error.is_some(), "dangling mapping must be captured as an error");
-        assert_eq!(broken.residency, "unknown");
+        assert_eq!(broken.residency, Residency::Unknown);
         let fine = show.phases[0].tasks[1].role.as_ref().unwrap();
         assert!(fine.error.is_none(), "the rest of the graph must still resolve: {:?}", fine.error);
         assert_eq!(fine.profile.as_deref(), Some("fast"));
@@ -1279,7 +1304,7 @@ mod tests {
         let show = build_show("m", &loaded, &registry, Ok(&pctx), &|_| RoleBinding::Unmapped, Ok(&[]), &[]);
         let role = show.phases[0].tasks[0].role.as_ref().unwrap();
         assert!(role.error.is_none(), "a remote model must never be gated on n_ctx: {:?}", role.error);
-        assert_eq!(role.residency, "remote");
+        assert_eq!(role.residency, Residency::Remote);
     }
 
     #[test]
@@ -1309,7 +1334,7 @@ mod tests {
         let m = local_model("m-a", 8000);
         let loaded = vec![loaded_model("m-a", true, 32000)];
         let (residency, detail) = model_residency(&m, Ok(&loaded));
-        assert_eq!(residency, "loaded");
+        assert_eq!(residency, Residency::Loaded);
         assert!(detail.unwrap().contains("darkmux:m-a"));
     }
 
@@ -1318,7 +1343,7 @@ mod tests {
         let m = local_model("m-a", 8000);
         let loaded = vec![loaded_model("m-a", false, 32000)];
         let (residency, detail) = model_residency(&m, Ok(&loaded));
-        assert_eq!(residency, "loaded_by_user");
+        assert_eq!(residency, Residency::LoadedByUser);
         assert!(detail.unwrap().contains("not darkmux-managed"));
     }
 
@@ -1327,7 +1352,7 @@ mod tests {
         let m = local_model("m-a", 8000);
         let loaded: Vec<LoadedModel> = vec![loaded_model("some-other-model", true, 32000)];
         let (residency, detail) = model_residency(&m, Ok(&loaded));
-        assert_eq!(residency, "not_loaded");
+        assert_eq!(residency, Residency::NotLoaded);
         assert!(detail.is_none());
     }
 
@@ -1337,7 +1362,7 @@ mod tests {
         // `Err` loaded_models — a remote model's residency must not depend
         // on `lms` being reachable at all.
         let (residency, detail) = model_residency(&m, Err("lms not found"));
-        assert_eq!(residency, "remote");
+        assert_eq!(residency, Residency::Remote);
         assert!(detail.is_none());
     }
 
@@ -1350,7 +1375,7 @@ mod tests {
         // itself ("unavailable").
         let m = local_model("m-a", 8000);
         let (residency, detail) = model_residency(&m, Err("lms: command not found"));
-        assert_eq!(residency, "unavailable");
+        assert_eq!(residency, Residency::Unavailable);
         assert!(detail.is_none(), "per-role detail must not repeat the error: {detail:?}");
     }
 
@@ -1368,7 +1393,7 @@ mod tests {
         let m = local_model("m-a", 262144);
         let loaded = vec![loaded_model("m-a", true, 4096)];
         let (residency, detail) = model_residency(&m, Ok(&loaded));
-        assert_eq!(residency, "loaded_stale_ctx", "an insufficient loaded ctx must NOT read as plain `loaded`");
+        assert_eq!(residency, Residency::LoadedStaleCtx, "an insufficient loaded ctx must NOT read as plain `loaded`");
         let d = detail.expect("Reconcile must carry a human explanation");
         assert!(d.contains("4096"), "{d}");
         assert!(d.contains("262144"), "{d}");
@@ -1393,7 +1418,7 @@ mod tests {
         }];
         let (residency, detail) = model_residency(&m, Ok(&loaded));
         assert_eq!(
-            residency, "loaded",
+            residency, Residency::Loaded,
             "an explicit-alias resident must count as darkmux's own, not user state: {detail:?}"
         );
     }
@@ -1529,7 +1554,7 @@ mod tests {
         let loaded = loaded_doc(cfg);
         let pctx = ctx(profiles);
         let show = build_show("m", &loaded, &registry, Ok(&pctx), &|_| RoleBinding::Unmapped, Ok(&[]), &[]);
-        assert_eq!(show.phases[0].tasks[0].role.as_ref().unwrap().residency, "not_loaded");
+        assert_eq!(show.phases[0].tasks[0].role.as_ref().unwrap().residency, Residency::NotLoaded);
         let text = render_show_text(&show);
         assert!(text.contains("· not loaded"), "got:\n{text}");
         assert!(!text.contains("not_loaded"), "got:\n{text}");

@@ -6,7 +6,7 @@
 //! print beneath the figures" unchecked. The CLI prints what these return
 //! and nothing else.
 
-use serde_json::json;
+use serde::Serialize;
 
 /// Strip terminal control characters (`char::is_control`: C0 incl. ESC, and
 /// C1) from a string before it is printed to a terminal. `model`, `result`,
@@ -142,12 +142,20 @@ pub fn run_text(s: &crate::lab::stats::RunStats) -> String {
     out
 }
 
+/// A run a set view was asked for and could not read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+pub struct SetError {
+    pub run: String,
+    pub error: String,
+}
+
 /// Runs loaded for a set view, and the ones that could not be.
+#[derive(Serialize, schemars::JsonSchema)]
 pub struct StatsSet {
     pub runs: Vec<crate::lab::stats::RunStats>,
-    /// `(run, error)`. Never silently dropped: a set missing a run it was
-    /// asked for reads as a different arm.
-    pub errors: Vec<(String, String)>,
+    /// Never silently dropped: a set missing a run it was asked for reads as a
+    /// different arm.
+    pub errors: Vec<SetError>,
     /// Runs named more than once (by id or by path): counted once. A notice,
     /// not an error, so it does not change the exit code.
     pub duplicates: Vec<String>,
@@ -168,7 +176,7 @@ pub fn load_set(ids: &[String]) -> StatsSet {
                     set.duplicates.push(s.run);
                 }
             }
-            Err(e) => set.errors.push((id.clone(), format!("{e:#}"))),
+            Err(e) => set.errors.push(SetError { run: id.clone(), error: format!("{e:#}") }),
         }
     }
     set
@@ -188,7 +196,7 @@ fn fmt_opt(v: Option<f64>, dp: usize) -> String {
 fn table_text(out: &mut String, set: &StatsSet) {
     use crate::lab::stats_set::{flags, overlapping};
     let overlap = overlapping(&set.runs);
-    let w = set.runs.iter().map(|s| s.run.len()).chain(set.errors.iter().map(|(r, _)| r.len())).max().unwrap_or(3).max(3);
+    let w = set.runs.iter().map(|s| s.run.len()).chain(set.errors.iter().map(|e| e.run.len())).max().unwrap_or(3).max(3);
     p!(out,
         "{:<w$}  {:>6} {:>7} {:>6} {:>5} {:>7} {:>6} {:>7} {:>4} {:>6} {:>5} {:>7}  flags",
         "run", "verify", "active", "rest", "turns", "tok/s", "billed", "tokens", "cuts", "pkgW", "duty", "J/1ktok"
@@ -215,7 +223,7 @@ fn table_text(out: &mut String, set: &StatsSet) {
             if f.is_empty() { "ok".to_string() } else { f.join(",") },
         );
     }
-    for (r, e) in &set.errors {
+    for SetError { run: r, error: e } in &set.errors {
         p!(out, "{r:<w$}  not counted: {e}");
     }
 }
@@ -366,23 +374,44 @@ pub fn sets_text(cand: &StatsSet, base: Option<&StatsSet>) -> String {
     out
 }
 
-/// The JSON `--json` prints for a set view: each set's runs, its summary, and
-/// what could not be counted.
-pub fn sets_json(cand: &StatsSet, base: Option<&StatsSet>) -> serde_json::Value {
-    let one = |set: &StatsSet| {
-        json!({
-            "runs": set.runs,
-            "summary": crate::lab::stats_set::summarize(&set.runs),
-            "errors": set.errors,
-            "duplicates": set.duplicates,
-        })
-    };
-    let mut out = one(cand);
-    if let Some(b) = base {
-        out["baseline"] = one(b);
-        out["cross_arm_overlap"] = json!(cross_arm_overlap(cand, b));
+/// One arm of a set view, as `--json` prints it: each run, the arm's summary,
+/// and what could not be counted.
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct SetView<'a> {
+    pub runs: &'a [crate::lab::stats::RunStats],
+    pub summary: crate::lab::stats_set::SetSummary,
+    pub errors: &'a [SetError],
+    pub duplicates: &'a [String],
+}
+
+/// `run stats --json` for a set of runs, or a run against a baseline.
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct RunSetStats<'a> {
+    #[serde(flatten)]
+    pub candidate: SetView<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<SetView<'a>>,
+    /// Runs named on both sides, present only with a baseline.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cross_arm_overlap: Option<Vec<String>>,
+}
+
+fn set_view(set: &StatsSet) -> SetView<'_> {
+    SetView {
+        runs: &set.runs,
+        summary: crate::lab::stats_set::summarize(&set.runs),
+        errors: &set.errors,
+        duplicates: &set.duplicates,
     }
-    out
+}
+
+/// The document `--json` prints for a set view.
+pub fn sets_json<'a>(cand: &'a StatsSet, base: Option<&'a StatsSet>) -> RunSetStats<'a> {
+    RunSetStats {
+        candidate: set_view(cand),
+        baseline: base.map(set_view),
+        cross_arm_overlap: base.map(|b| cross_arm_overlap(cand, b)),
+    }
 }
 
 /// A run that could not be read makes the exit code non-zero, so a script

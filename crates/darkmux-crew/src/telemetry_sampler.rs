@@ -311,7 +311,7 @@ pub struct HostSampleAt {
 /// using each sample's OWN measured gap to the next (see [`HostSampleAt`]),
 /// not a synthetic `samples_above_80 × <nominal interval>` count that would
 /// silently assume a constant cadence.
-#[derive(Default, Debug, Clone, Copy)]
+#[derive(Default, Debug, Clone, Copy, serde::Serialize, schemars::JsonSchema)]
 pub struct MetricStats {
     pub peak_pct: Option<u64>,
     pub mean_pct: Option<f64>,

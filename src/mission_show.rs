@@ -39,7 +39,7 @@ fn wire_word<T: Serialize>(value: &T) -> String {
 
 /// The config a mission was launched from, as it resolves in the registry
 /// today.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct ShownConfig {
     pub id: String,
     pub name: String,
@@ -52,7 +52,7 @@ pub struct ShownConfig {
 }
 
 /// One declared input of a [`ShownConfig`].
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct ShownInput {
     pub name: String,
     pub required: bool,
@@ -60,7 +60,7 @@ pub struct ShownInput {
 
 /// One mission, everything `mission show` reports. The `--json` shape of
 /// `darkmux mission show <id>`: a semver-bound contract.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct MissionShow {
     pub id: String,
     /// `active`, `finalized` or `aborted`; absent when this machine holds no
@@ -142,7 +142,7 @@ pub fn build(id: &str) -> Result<MissionShow> {
 pub fn run(id: &str, json: bool) -> Result<i32> {
     let show = build(id)?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&show)?);
+        crate::cli_json::emit(&show)?;
     } else {
         println!("{}", render_text(&show));
     }

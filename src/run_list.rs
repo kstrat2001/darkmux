@@ -15,6 +15,7 @@
 //! renders counts and never sums anything itself. `--since` bounds both.
 
 use anyhow::Result;
+use serde::Serialize;
 use darkmux_serve::usage_sum::{UsageBreakdown, UsageSplit};
 use darkmux_serve::{AbandonReason, Run, RunKind, RunStatus};
 use darkmux_types::style;
@@ -54,7 +55,7 @@ pub(crate) fn run(
     let since_label = since.map(|_| built.since.as_str());
     if json {
         let payload = json_payload(&filtered, kind, &fleet.state, since_label, report.as_ref());
-        println!("{}", serde_json::to_string_pretty(&payload)?);
+        crate::cli_json::emit(&payload)?;
         return Ok(0);
     }
 
@@ -712,51 +713,51 @@ fn render_text(
 }
 
 /// (#2902) What `--usage` reports: the breakdown and the bound it covers.
-struct UsageReport {
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct UsageReport {
     /// The inclusive bound, in the flow schema's own `ts` spelling: the
     /// operator's `--since`, else the default window's first day.
     since: String,
     /// True when no `--since` was given and the bound is the default
     /// 14-day scan window.
     default_window: bool,
+    #[serde(flatten)]
     breakdown: UsageBreakdown,
 }
 
 /// The `--json` document. The top-level `since` appears whenever `--since`
 /// was given, `usage` only with `--usage`; every row carries its own
 /// `tokens` regardless.
-fn json_payload(
-    rows: &[Run],
+///
+/// Never paginated (#1905, matching `mission status --json`): a machine reader
+/// gets every row the kind filter selected; `--limit`/`--all` only shape the
+/// human table.
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct RunListOutput<'a> {
+    /// The kind filter the rows were selected by.
+    pub kind: RunKindArg,
+    /// Most recently active first.
+    pub runs: Vec<&'a Run>,
+    pub total: usize,
+    /// The same honesty `runs_handler` ships as `meta`: a script must be able
+    /// to tell an incomplete answer from a quiet fleet.
+    pub fleet: &'a darkmux_serve::source_state::SourceState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<&'a UsageReport>,
+}
+
+fn json_payload<'a>(
+    rows: &'a [Run],
     kind: RunKindArg,
-    fleet: &darkmux_serve::source_state::SourceState,
-    since: Option<&str>,
-    usage: Option<&UsageReport>,
-) -> serde_json::Value {
-    // (#1905, matching `mission status --json`'s posture) NEVER paginated —
-    // a machine reader gets every row the kind filter selected;
-    // `--limit`/`--all` only shape the human table above.
+    fleet: &'a darkmux_serve::source_state::SourceState,
+    since: Option<&'a str>,
+    usage: Option<&'a UsageReport>,
+) -> RunListOutput<'a> {
     let mut sorted: Vec<&Run> = rows.iter().collect();
     sorted.sort_by_key(|r| std::cmp::Reverse(run_activity(r)));
-    let mut payload = serde_json::json!({
-        "kind": kind_arg_label(kind),
-        "runs": sorted,
-        "total": sorted.len(),
-        // The same honesty `runs_handler` ships as `meta`: a script must be
-        // able to tell an incomplete answer from a quiet fleet.
-        "fleet": fleet,
-    });
-    if let Some(bound) = since {
-        payload["since"] = serde_json::json!(bound);
-    }
-    if let Some(report) = usage {
-        payload["usage"] = serde_json::json!({
-            "since": report.since,
-            "default_window": report.default_window,
-            "overall": report.breakdown.overall,
-            "groups": report.breakdown.groups,
-        });
-    }
-    payload
+    RunListOutput { kind, total: sorted.len(), runs: sorted, fleet, since, usage }
 }
 
 // ── (#2902) the --usage breakdown ────────────────────────────────────
@@ -1636,7 +1637,7 @@ mod tests {
     fn since_without_usage_still_reports_its_bound() {
         let rows = vec![mk_run("m1", RunKind::Mission, RunStatus::Complete, 100)];
         let fleet = darkmux_serve::source_state::SourceState::Off;
-        let payload = json_payload(&rows, RunKindArg::All, &fleet, Some("2026-09-12T00:00:00Z"), None);
+        let payload = serde_json::to_value(json_payload(&rows, RunKindArg::All, &fleet, Some("2026-09-12T00:00:00Z"), None)).unwrap();
         assert_eq!(payload["since"], "2026-09-12T00:00:00Z");
         assert!(payload.get("usage").is_none());
         assert_eq!(empty_state_line(RunKindArg::All, None), "no recorded run activity yet");
@@ -1651,7 +1652,7 @@ mod tests {
         let rows = vec![mk_run("m1", RunKind::Mission, RunStatus::Complete, 100)];
         let fleet = darkmux_serve::source_state::SourceState::Off;
         let report = sample_report();
-        let payload = json_payload(&rows, RunKindArg::All, &fleet, Some(&report.since), Some(&report));
+        let payload = serde_json::to_value(json_payload(&rows, RunKindArg::All, &fleet, Some(&report.since), Some(&report))).unwrap();
         assert_eq!(payload["usage"]["since"], "2026-09-12T00:00:00Z");
         assert_eq!(payload["usage"]["default_window"], true);
         assert_eq!(payload["usage"]["overall"]["total"], 2045);
@@ -1665,7 +1666,7 @@ mod tests {
         assert_eq!(payload["since"], "2026-09-12T00:00:00Z");
         // Without --usage there is no usage key at all, and rows still
         // carry their own `tokens`.
-        let plain = json_payload(&rows, RunKindArg::All, &fleet, None, None);
+        let plain = serde_json::to_value(json_payload(&rows, RunKindArg::All, &fleet, None, None)).unwrap();
         assert!(plain.get("usage").is_none() && plain.get("since").is_none());
         assert_eq!(plain["runs"][0]["id"], "m1");
     }
