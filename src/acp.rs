@@ -856,6 +856,27 @@ fn reap_on_host_shutdown() {
     std::process::exit(130);
 }
 
+/// Log the client's requested protocol version and identity to stderr
+/// unconditionally (never stdout; see module docs), so what Zed sends is
+/// observable.
+fn log_initialize(initialize: &InitializeRequest) {
+    eprintln!("[darkmux-acp] initialize: client requested protocol version {}", initialize.protocol_version);
+    if let Some(info) = &initialize.client_info {
+        eprintln!("[darkmux-acp] initialize: client_info = {} {}", info.name, info.version);
+    }
+}
+
+/// The mission verb a slash prompt names, or the reply to send back: what is
+/// available for a malformed `/mission ...`, the not-a-command listing for a
+/// bare `/`.
+fn slash_verb(text: &str) -> std::result::Result<crate::acp_panel::MissionVerb, String> {
+    match crate::acp_panel::parse_invocation(text) {
+        Some(crate::acp_panel::PanelInvocation::Mission(verb)) => Ok(verb),
+        Some(crate::acp_panel::PanelInvocation::Refused(reply)) => Err(reply),
+        None => Err(crate::acp_panel::not_a_command_message()),
+    }
+}
+
 /// `transport` is generic (#1698 Packet B test infrastructure) — production
 /// (`run()` above) passes real `AcpStdio::new()`; pipe-level tests pass
 /// `agent_client_protocol::ByteStreams::new(writer, reader)` over an
@@ -920,19 +941,7 @@ async fn serve(
         .builder()
         .on_receive_request(
             async move |initialize: InitializeRequest, responder, _cx| {
-                // The operator specifically wants to know, empirically,
-                // what protocol version Zed sends — log it unconditionally
-                // to stderr (never stdout; see module docs).
-                eprintln!(
-                    "[darkmux-acp] initialize: client requested protocol version {}",
-                    initialize.protocol_version
-                );
-                if let Some(info) = &initialize.client_info {
-                    eprintln!(
-                        "[darkmux-acp] initialize: client_info = {} {}",
-                        info.name, info.version
-                    );
-                }
+                log_initialize(&initialize);
                 responder.respond(
                     InitializeResponse::new(initialize.protocol_version)
                         .agent_capabilities(
@@ -1028,17 +1037,10 @@ async fn serve(
                     // invocation (`acp_panel::parse_invocation`): `/mission
                     // list|launch|show`, or a refusal naming what exists. A
                     // bare `/` is not an invocation at all.
-                    let verb = match crate::acp_panel::parse_invocation(&text) {
-                        Some(crate::acp_panel::PanelInvocation::Mission(verb)) => verb,
-                        Some(crate::acp_panel::PanelInvocation::Refused(reply)) => {
+                    let verb = match slash_verb(&text) {
+                        Ok(verb) => verb,
+                        Err(reply) => {
                             let _ = cx.send_notification(agent_chunk(&session_id, reply));
-                            return responder.respond(PromptResponse::new(StopReason::EndTurn));
-                        }
-                        None => {
-                            let _ = cx.send_notification(agent_chunk(
-                                &session_id,
-                                crate::acp_panel::not_a_command_message(),
-                            ));
                             return responder.respond(PromptResponse::new(StopReason::EndTurn));
                         }
                     };
@@ -1715,6 +1717,39 @@ async fn run_no_slash_route(
         cx.send_notification(agent_chunk(session_id, format!("darkmux radio: {bad}\n")))?;
         return Ok(());
     }
+    let decision = routed_decision(session_id, text, cx, router_call).await?;
+
+    match decision {
+        // (#1698 Packet B2, scope A) A router refusal no longer prints the
+        // bare reason + listing directly — it goes to the ANSWERING seat
+        // for a grounded, in-persona reply, with the session's real
+        // artifact shelf + config-option overrides. The bare reason +
+        // listing is now the LAST RESORT, rendered only when the
+        // answering dispatch itself fails — see `answer_no_slash_refusal`'s
+        // own doc.
+        crate::radio::RouteDecision::Refuse { reason } => {
+            answer_no_slash_refusal(session_id, text, &reason, cwd, cx, seat, sessions).await
+        }
+        // Not a refusal: the routing seat could not run at all. The answering
+        // seat would fail the same way, so say it once and stop.
+        crate::radio::RouteDecision::Unavailable { error } => {
+            cx.send_notification(agent_chunk(session_id, format!("darkmux: could not reach a model.\n{error}")))?;
+            Ok(())
+        }
+        crate::radio::RouteDecision::Route { command, args } => {
+            announce_and_confirm_route(session_id, &command, &args, cwd, cx, sessions).await
+        }
+    }
+}
+
+/// Route `text` on a blocking task (it dispatches the router seat), telling
+/// the panel when the router waits past the slow-notice threshold.
+async fn routed_decision(
+    session_id: &SessionId,
+    text: &str,
+    cx: &ConnectionTo<Client>,
+    router_call: RouterCall,
+) -> Result<crate::radio::RouteDecision> {
     let text_owned = text.to_string();
     let mut routing = tokio::task::spawn_blocking(move || {
         match crate::radio::compile_catalog() {
@@ -1751,34 +1786,25 @@ async fn run_no_slash_route(
             routing.await.context("joining the radio routing task")?
         }
     };
+    Ok(decision)
+}
 
-    match decision {
-        // (#1698 Packet B2, scope A) A router refusal no longer prints the
-        // bare reason + listing directly — it goes to the ANSWERING seat
-        // for a grounded, in-persona reply, with the session's real
-        // artifact shelf + config-option overrides. The bare reason +
-        // listing is now the LAST RESORT, rendered only when the
-        // answering dispatch itself fails — see `answer_no_slash_refusal`'s
-        // own doc.
-        crate::radio::RouteDecision::Refuse { reason } => {
-            answer_no_slash_refusal(session_id, text, &reason, cwd, cx, seat, sessions).await
-        }
-        // Not a refusal: the routing seat could not run at all. The answering
-        // seat would fail the same way, so say it once and stop.
-        crate::radio::RouteDecision::Unavailable { error } => {
-            cx.send_notification(agent_chunk(session_id, format!("darkmux: could not reach a model.\n{error}")))?;
-            Ok(())
-        }
-        crate::radio::RouteDecision::Route { command, args } => {
-            cx.send_notification(agent_chunk(
-                session_id,
-                format!("darkmux: routing to /mission launch {command} — from your text"),
-            ))?;
-            match crate::acp_panel::plan_launch(&command, &args) {
-                Ok(plan) => confirm_then_execute(session_id, plan, cwd, cx, sessions).await,
-                Err(e) => Ok(cx.send_notification(agent_chunk(session_id, format!("darkmux: {e:#}")))?),
-            }
-        }
+/// A router pick: say where it is going, then ask before running it.
+async fn announce_and_confirm_route(
+    session_id: &SessionId,
+    command: &str,
+    args: &str,
+    cwd: &Path,
+    cx: &ConnectionTo<Client>,
+    sessions: &Sessions,
+) -> Result<()> {
+    cx.send_notification(agent_chunk(
+        session_id,
+        format!("darkmux: routing to /mission launch {command} — from your text"),
+    ))?;
+    match crate::acp_panel::plan_launch(command, args) {
+        Ok(plan) => confirm_then_execute(session_id, plan, cwd, cx, sessions).await,
+        Err(e) => Ok(cx.send_notification(agent_chunk(session_id, format!("darkmux: {e:#}")))?),
     }
 }
 
@@ -3345,7 +3371,7 @@ mod tests {
         }
         let refusal = recv_json(&mut f.reader).await;
         let text = chunk_text(&refusal);
-        assert!(text.contains("not run") && text.contains("diff_file, workspace, head_sha"), "{text}");
+        assert!(text.contains("not run") && text.contains("values for diff_file, workspace above"), "{text}");
         assert!(text.contains("temporary files"), "{text}");
         assert_end_turn(&recv_json(&mut f.reader).await);
     }

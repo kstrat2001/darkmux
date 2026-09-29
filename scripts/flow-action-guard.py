@@ -35,7 +35,9 @@
 # that names an action; every other old spelling counts wherever it is.
 #
 # Not flow actions, though they share the grammar, and each READ from its own
-# source: the step-kind ids (`fn id(&self)` in crates/ and src/), the
+# source: the step-kind ids (`ConfigKind::id` in
+# crates/darkmux-crew/src/step_config/mod.rs, plus any `fn id(&self)` literal
+# in crates/ and src/), the
 # trajectory event types (`crates/darkmux-trajectory/src/event.rs`), and the
 # config keys (`src/config_cmd.rs`), the record stages (the generated
 # `Stage.ts`: `tier-decision` is a stage as well as an old action), and, in a
@@ -71,6 +73,7 @@ TRAJECTORY_EVENTS_RS = "crates/darkmux-trajectory/src/event.rs"
 CONFIG_KEYS_RS = "src/config_cmd.rs"
 STAGE_TS = "ui/src/types/generated/Stage.ts"
 CLI_RS = "src/cli.rs"
+STEP_CONFIG_RS = "crates/darkmux-crew/src/step_config/mod.rs"
 ACTIVITY_TS = "ui/src/lib/eventFilters.ts"
 VOCAB_SOURCES = (ACTION_RS, LEGACY_RS, TRAJECTORY_EVENTS_RS)
 GENERATED_TS = "ui/src/types/generated/"
@@ -185,6 +188,8 @@ def other_vocabularies(root):
         for path in glob.glob(os.path.join(root, d, "**", "*.rs"), recursive=True):
             text = open(path, encoding="utf-8").read()
             kinds |= set(re.findall(r"fn id\(&self\) -> &'static str \{\s*\"([^\"]+)\"", text))
+    config_kinds = read(root, STEP_CONFIG_RS).split("pub const fn id(self)", 1)[1].split("\n    }\n", 1)[0]
+    kinds |= set(re.findall(r'Self::\w+ => "([a-z][a-z0-9_]*\.[a-z][a-z0-9_]*)"', config_kinds))
     events = set(re.findall(r'#\[serde\(rename = "([^"]+)"\)\]', read(root, TRAJECTORY_EVENTS_RS)))
     keys = set(re.findall(r'^\s+\("([a-z_.]+)", Ty::', read(root, CONFIG_KEYS_RS), re.M))
     stages = set(re.findall(r'"([^"]+)"', read(root, STAGE_TS).split("export type Stage", 1)[1]))

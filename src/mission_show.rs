@@ -18,12 +18,24 @@
 //! READ-ONLY, like `mission status`.
 
 use anyhow::{bail, Result};
-use darkmux_serve::mission_graph::{GraphNode, MissionGraph};
+use darkmux_serve::mission_graph::{GraphNode, MissionGraph, NodeKind, StepRow};
 use darkmux_serve::{Run, RunKind};
 use darkmux_types::config_access;
 use serde::Serialize;
 
 use crate::crew;
+use crate::crew::types::MissionStatus;
+
+/// The one wire spelling of a serde-lowercase enum (`active`, `running`,
+/// `phase`), for the text view. Derived from serde so the text and `--json`
+/// cannot drift onto two hand-kept lists.
+fn wire_word<T: Serialize>(value: &T) -> String {
+    match serde_json::to_value(value) {
+        Ok(serde_json::Value::String(word)) => word,
+        Ok(other) => other.to_string(),
+        Err(_) => String::new(),
+    }
+}
 
 /// The config a mission was launched from, as it resolves in the registry
 /// today.
@@ -54,7 +66,7 @@ pub struct MissionShow {
     /// `active`, `finalized` or `aborted`; absent when this machine holds no
     /// record of the mission (a run observed from a peer).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub status: Option<String>,
+    pub status: Option<MissionStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// `None` for a mission with no resolvable config (a `dispatch <role>`
@@ -116,7 +128,7 @@ pub fn build(id: &str) -> Result<MissionShow> {
     let link = crate::mission_status::mission_url(&crate::mission_status::board_link_base(), id);
     Ok(MissionShow {
         id: id.to_string(),
-        status: graph.as_ref().map(|g| g.mission_status.to_string()),
+        status: graph.as_ref().map(|g| g.mission_status),
         description: mission.as_ref().map(|m| m.description.trim().to_string()).filter(|d| !d.is_empty()),
         config: mission.as_ref().and_then(shown_config),
         graph,
@@ -151,8 +163,8 @@ fn config_lines(config: &ShownConfig) -> Vec<String> {
     lines
 }
 
-fn step_line(step: &darkmux_serve::mission_graph::StepRow) -> String {
-    let mut line = format!("      {} [{}] {}", step.id, step.kind, step.status);
+fn step_line(step: &StepRow) -> String {
+    let mut line = format!("      {} [{}] {}", step.id, step.kind, wire_word(&step.status));
     if let Some(tokens) = step.tokens_final {
         line.push_str(&format!(" · {} tokens", crate::run_list::grouped(tokens)));
     }
@@ -166,16 +178,16 @@ fn step_line(step: &darkmux_serve::mission_graph::StepRow) -> String {
 }
 
 fn task_lines(task: &GraphNode) -> Vec<String> {
-    let mut lines = vec![format!("    {} {}", task.label, task.status)];
-    lines.extend(task.steps.iter().map(step_line));
+    let mut lines = vec![format!("    {} {}", task.label, wire_word(&task.status))];
+    lines.extend(task.steps.iter().flatten().map(step_line));
     lines
 }
 
 fn graph_lines(graph: &MissionGraph) -> Vec<String> {
     let mut lines = vec!["Phases:".to_string()];
-    for phase in graph.nodes.iter().filter(|n| n.kind == "phase") {
+    for phase in graph.nodes.iter().filter(|n| n.kind == NodeKind::Phase) {
         let note = phase.status_note.as_deref().map(|n| format!(" ({n})")).unwrap_or_default();
-        lines.push(format!("  {} {}{note}", phase.label, phase.status));
+        lines.push(format!("  {} {}{note}", phase.label, wire_word(&phase.status)));
         for task in graph.nodes.iter().filter(|n| n.parent_id.as_deref() == Some(phase.id.as_str())) {
             lines.extend(task_lines(task));
         }
@@ -194,7 +206,7 @@ fn run_line(run: &Run) -> String {
 /// Render `show` as plain text, no color: the terminal and the editor panel
 /// print the same lines.
 pub fn render_text(show: &MissionShow) -> String {
-    let status = show.status.as_deref().map(|s| format!(" ({s})")).unwrap_or_default();
+    let status = show.status.map(|s| format!(" ({})", wire_word(&s))).unwrap_or_default();
     let mut lines = vec![format!("Mission {}{status}", show.id)];
     if let Some(description) = &show.description {
         lines.push(crate::mission_status::cap_note(crate::mission_status::first_sentence(description), 160));
@@ -299,14 +311,16 @@ mod tests {
 
         let show = build("show-m1").unwrap();
         assert_eq!(show.id, "show-m1");
-        assert_eq!(show.status.as_deref(), Some("active"));
+        assert_eq!(show.status, Some(MissionStatus::Active));
+        let json = serde_json::to_value(&show).unwrap();
+        assert_eq!(json["status"], "active", "--json keeps the lowercase wire word");
         let config = show.config.as_ref().expect("the spec names a loadable config");
         assert_eq!((config.id.as_str(), config.name.as_str()), ("machine-status", "Machine status"));
         assert!(config.summary.to_ascii_lowercase().contains("loaded"), "{}", config.summary);
         let graph = show.graph.as_ref().expect("a local mission has a graph");
-        assert!(graph.nodes.iter().any(|n| n.kind == "phase" && n.label == "The phase"), "{:?}", graph.nodes);
+        assert!(graph.nodes.iter().any(|n| n.kind == NodeKind::Phase && n.label == "The phase"), "{:?}", graph.nodes);
         assert!(show.runs.iter().any(|r| r.id == "show-m1"), "the run row for this mission: {:?}", show.runs);
-        assert!(show.link.ends_with("/mission/show-m1/graph"), "{}", show.link);
+        assert!(show.link.ends_with("/#mission=show-m1"), "{}", show.link);
 
         let text = render_text(&show);
         for needle in ["Mission show-m1 (active)", "Config: machine-status (Machine status", "The phase running", "Runs:", "Viewer: "] {

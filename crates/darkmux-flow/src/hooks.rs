@@ -195,6 +195,7 @@ impl RetiredRuleAction {
         if !self.current.ends_with('*') {
             return None;
         }
+        // flow-action-guard:allow — a glob-scope prefix test on a hook rule's pattern, not an action
         let extra = if self.current.starts_with("dispatch.") {
             " (`dispatch.*` also matches every `dispatch.turn` and `dispatch.tool` record)"
         } else {

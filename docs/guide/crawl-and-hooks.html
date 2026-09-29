@@ -260,7 +260,7 @@ darkmux mod show &lt;key&gt;</code></pre>
 
     <h3>The match vocabulary</h3>
     <p>A rule's <code>match</code> ANDs every key it names. Top-level fields: <code>action</code>, <code>session_id</code>, <code>mission_id</code>, <code>machine_id</code>, <code>category</code>, <code>level</code>; a trailing <code>*</code> matches any action with that prefix. A <code>"payload.&lt;dotted.path&gt;"</code> key is an exact scalar match inside the record's payload, which is how you subscribe to one tool call's outcome. A key the payload doesn't carry never matches.</p>
-    <!-- flow-action-guard:allow — the retired spellings this paragraph names -->
+    <!-- flow-action-guard:allow: the retired spellings this paragraph names -->
     <p>An <code>action</code> is spelled <code>&lt;scope&gt;.&lt;event&gt;</code>. A rule written in a spelling darkmux retired (<code>dispatch complete</code>, <code>step *</code>) is refused rather than guessed at: the hooks sink does not load, a dispatch or mission launch refuses at preflight, and <code>darkmux doctor</code> fails the rule, each naming the spelling to write.</p>
 
     <h3><code>hook.fired</code> / <code>hook.failed</code></h3>

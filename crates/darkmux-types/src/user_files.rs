@@ -608,20 +608,28 @@ fn type_words(t: &str, node: &Value) -> String {
         ("integer", Some(0), None) => "a non-negative integer".to_string(),
         ("integer", _, _) => "an integer".to_string(),
         ("number", _, _) => "a number".to_string(),
-        ("string", _, _) => match node.get("format").and_then(Value::as_str) {
-            Some(crate::param_scalar::COUNT_FORMAT) => "the text of a non-negative integer".to_string(),
-            Some(crate::param_scalar::BLANKABLE_COUNT_FORMAT) => "the text of a non-negative integer, or blank".to_string(),
-            Some(crate::param_scalar::FLAG_FORMAT) => "the text `true` or `false`".to_string(),
-            Some(crate::param_scalar::SESSION_ID_FORMAT) => "a session id in its wire form".to_string(),
-            _ => "a string".to_string(),
-        },
+        ("string", _, _) => string_words(node),
         ("boolean", _, _) => "true or false".to_string(),
-        ("array", _, _) => match (node.get("minItems").and_then(Value::as_u64), node.get("maxItems").and_then(Value::as_u64)) {
-            (Some(lo), Some(hi)) if lo == hi => format!("a list of {lo}"),
-            _ => "a list".to_string(),
-        },
+        ("array", _, _) => array_words(node),
         ("object", _, _) => "an object".to_string(),
         (other, _, _) => other.to_string(),
+    }
+}
+
+fn string_words(node: &Value) -> String {
+    match node.get("format").and_then(Value::as_str) {
+        Some(crate::param_scalar::COUNT_FORMAT) => "the text of a non-negative integer".to_string(),
+        Some(crate::param_scalar::BLANKABLE_COUNT_FORMAT) => "the text of a non-negative integer, or blank".to_string(),
+        Some(crate::param_scalar::FLAG_FORMAT) => "the text `true` or `false`".to_string(),
+        Some(crate::param_scalar::SESSION_ID_FORMAT) => "a session id in its wire form".to_string(),
+        _ => "a string".to_string(),
+    }
+}
+
+fn array_words(node: &Value) -> String {
+    match (node.get("minItems").and_then(Value::as_u64), node.get("maxItems").and_then(Value::as_u64)) {
+        (Some(lo), Some(hi)) if lo == hi => format!("a list of {lo}"),
+        _ => "a list".to_string(),
     }
 }
 

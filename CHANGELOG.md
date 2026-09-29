@@ -63,6 +63,9 @@ darkmux release.
   field order. `temperature` now accepts its text form (`"0.5"`), and a
   `{{param}}` reference counts as a number or flag only when it is the whole
   string (`"n={{n}}"` is refused).
+- **`mission launch --dry-run` labels the `mission_id` it prints** (B1). The id
+  is minted before the launch check so `{{mission_id}}` can be checked, and a
+  real launch mints a fresh one; the dry run now says `example id` beside it.
 - **Some step config values now fail the step, and some now read as unset**
   (B1). Now refused, where they were silently dropped: a `records.gather`
   `not_attempted` entry that is not a string; a `deliver.github_review`
@@ -417,7 +420,8 @@ darkmux release.
   list` rows for this mission), `tokens`, `link`). `mission status` stays the
   board. An input the launcher fills itself, `mission_id`, reports
   `required: false` in `config.inputs` (and is not marked required in the text
-  listing), since no caller has to pass it.
+  listing), since no caller has to pass it. The link is the graph lens's
+  `#mission=<id>` route.
 - **`/mission list`, `/mission launch <config> [name=value ...]` and
   `/mission show <id>` in the editor panel**, replacing the per-config
   commands. Arguments after the config id map onto its declared inputs the way

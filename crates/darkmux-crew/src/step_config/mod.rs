@@ -27,6 +27,7 @@
 pub mod gate;
 pub mod kinds;
 #[cfg(any(test, feature = "test-support"))]
+#[path = "sweep_tests.rs"]
 pub mod sweep;
 
 pub use kinds::*;
@@ -141,24 +142,29 @@ impl ConfigKind {
 
     /// The kind's registry id, the string a mission config's `kind` holds.
     pub const fn id(self) -> &'static str {
-        match self {
-            Self::DispatchInternal => "dispatch.internal",
-            Self::DispatchSingleShot => "dispatch.single_shot",
-            Self::DispatchMap => "dispatch.map",
-            Self::ProceduralShell => "procedural.shell",
-            Self::ProceduralNoop => "procedural.noop",
-            Self::ModsGate => "mods.gate",
-            Self::RecordsGather => "records.gather",
-            Self::DeliverGithubReview => "deliver.github_review",
-            Self::CrawlPlan => "crawl.plan",
-            Self::PlanSites => "plan.sites",
-            Self::CrawlUnit => "crawl.unit",
-            Self::CrawlSummary => "crawl.summary",
-            Self::MissionWorktree => "mission.worktree",
-            Self::MissionCoder => "mission.coder",
-            Self::MissionVerify => "mission.verify",
-        }
+        Self::IDS[self as usize]
     }
+
+    /// Registry ids in declaration order, so `id` is one index instead of a
+    /// fifteen-arm match. `ids_are_in_declaration_order` pins the order
+    /// against [`Self::ALL`].
+    const IDS: [&'static str; 15] = [
+        "dispatch.internal",
+        "dispatch.single_shot",
+        "dispatch.map",
+        "procedural.shell",
+        "procedural.noop",
+        "mods.gate",
+        "records.gather",
+        "deliver.github_review",
+        "crawl.plan",
+        "plan.sites",
+        "crawl.unit",
+        "crawl.summary",
+        "mission.worktree",
+        "mission.coder",
+        "mission.verify",
+    ];
 
     /// The kind a registry id names, parsed once here.
     pub fn from_id(id: &str) -> Option<Self> {

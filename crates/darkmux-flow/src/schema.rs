@@ -2496,18 +2496,19 @@ pub fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 /// not exactly that shape, so a malformed `ts` degrades to "no timestamp"
 /// and never panics.
 pub fn parse_ts_utc(ts: &str) -> Option<i64> {
-    let b = ts.as_bytes();
-    if b.len() != 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' || b[19] != b'Z'
-    {
+    if !has_ts_punctuation(ts.as_bytes()) {
         return None;
     }
     let field = |range: std::ops::Range<usize>| -> Option<i64> { ts.get(range)?.parse().ok() };
     let (y, mo, d) = (field(0..4)?, field(5..7)?, field(8..10)?);
     let (h, mi, s) = (field(11..13)?, field(14..16)?, field(17..19)?);
-    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || s > 60 {
-        return None;
-    }
-    Some(days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + s)
+    let in_range = (1..=12).contains(&mo) && (1..=31).contains(&d) && h <= 23 && mi <= 59 && s <= 60;
+    in_range.then(|| days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + s)
+}
+
+/// The fixed width and separators of a record `ts`: `YYYY-MM-DDTHH:MM:SSZ`.
+fn has_ts_punctuation(b: &[u8]) -> bool {
+    b.len() == 20 && [(4, b'-'), (7, b'-'), (10, b'T'), (13, b':'), (16, b':'), (19, b'Z')].iter().all(|&(i, c)| b[i] == c)
 }
 
 pub(crate) fn current_epoch_secs() -> i64 {

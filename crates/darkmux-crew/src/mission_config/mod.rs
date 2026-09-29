@@ -549,7 +549,13 @@ impl MissionInput {
     /// required. The one predicate the launcher's missing-input refusal and
     /// `mission show`'s listing both read.
     pub fn is_required_of_operator(&self) -> bool {
-        self.name != "mission_id" && self.required != Some(false)
+        !self.is_launcher_supplied() && self.required != Some(false)
+    }
+
+    /// The launcher fills this input itself (`mission_id`), so no surface asks
+    /// the operator for it.
+    pub fn is_launcher_supplied(&self) -> bool {
+        self.name == "mission_id"
     }
 }
 
@@ -887,6 +893,20 @@ impl std::fmt::Display for ValidationFinding {
 }
 
 impl MissionConfig {
+    /// One error per retired top-level key the document still carries (it
+    /// parses into `extras` and would otherwise be silently inert).
+    fn retired_key_findings(&self) -> Vec<ValidationFinding> {
+        [("gh_verb", GH_VERB_RETIRED), ("panel", PANEL_RETIRED)]
+            .into_iter()
+            .filter(|(key, _)| self.extras.contains_key(*key))
+            .map(|(key, why)| ValidationFinding {
+                severity: FindingSeverity::Error,
+                path: key.to_string(),
+                message: format!("config \"{}\" declares `{key}`, which was {why}", self.id),
+            })
+            .collect()
+    }
+
     /// Semantic validation — SEPARATE from parsing (contract 7): a
     /// lenient-on-read document always PARSES regardless of content; this
     /// is what a caller (`darkmux doctor`, Packet 3's launcher) runs to
@@ -923,20 +943,7 @@ impl MissionConfig {
         // name would silently lose its gate and run UNGATED, with the shell-out
         // it was protecting proceeding as if the operator had allowlisted it.
         // Loud at validate/doctor time, never a runtime surprise.
-        if self.extras.contains_key("gh_verb") {
-            findings.push(ValidationFinding {
-                severity: FindingSeverity::Error,
-                path: "gh_verb".to_string(),
-                message: format!("config \"{}\" declares `gh_verb`, which was {GH_VERB_RETIRED}", self.id),
-            });
-        }
-        if self.extras.contains_key("panel") {
-            findings.push(ValidationFinding {
-                severity: FindingSeverity::Error,
-                path: "panel".to_string(),
-                message: format!("config \"{}\" declares `panel`, which was {PANEL_RETIRED}", self.id),
-            });
-        }
+        findings.extend(self.retired_key_findings());
         if self.name.trim().is_empty() {
             findings.push(ValidationFinding {
                 severity: FindingSeverity::Error,

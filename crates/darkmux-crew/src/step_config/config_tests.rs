@@ -137,6 +137,7 @@ fn a_typo_inside_a_step_config_is_refused_at_its_full_path_with_the_closest_key(
 
 #[test]
 fn an_unknown_step_kind_is_refused_naming_the_kinds_darkmux_ships() {
+    // flow-action-guard:allow — a misspelled step kind id, not an action
     let text = rendered(&step_config_issues(&doc_with_step("dispatch.intrnal", json!({})))).join("\n");
     assert!(text.contains("`phases[0].tasks[0].steps[0].kind`"), "{text}");
     assert!(text.contains("dispatch.internal"), "{text}");
@@ -379,4 +380,13 @@ fn a_resolved_step_refusal_names_the_step_and_kind_for_every_problem() {
         let err = gate::check_resolved([("s1", kind, &config)]).unwrap_err().to_string();
         assert!(err.contains(expect), "{kind} {config}: wanted `{expect}` in\n{err}");
     }
+}
+
+#[test]
+fn ids_are_in_declaration_order_and_round_trip() {
+    for (i, kind) in ConfigKind::ALL.into_iter().enumerate() {
+        assert_eq!(kind as usize, i, "{kind:?} is out of order in ALL");
+        assert_eq!(ConfigKind::from_id(kind.id()), Some(kind), "{kind:?} does not round-trip through its id");
+    }
+    assert_eq!(ConfigKind::IDS.len(), ConfigKind::ALL.len());
 }

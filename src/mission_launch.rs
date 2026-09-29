@@ -675,7 +675,7 @@ pub fn launch(
     let mission_id = mint_run_id(config_id)?;
     let inputs_fingerprint = spec_fingerprint(&collected)?;
     let mut collected = collected;
-    if config.inputs.iter().any(|i| i.name == "mission_id") {
+    if config.inputs.iter().any(mission_config::MissionInput::is_launcher_supplied) {
         collected.insert("mission_id".to_string(), serde_json::Value::String(mission_id.clone()));
     }
 
@@ -2333,7 +2333,8 @@ fn print_dry_run_graph(config: &MissionConfig, collected: &BTreeMap<String, serd
                 serde_json::Value::String(s) => s.clone(),
                 other => other.to_string(),
             };
-            println!("  {k} = {rendered}");
+            let note = if k == "mission_id" { " (example id: a real launch mints a fresh one)" } else { "" };
+            println!("  {k} = {rendered}{note}");
         }
     }
     println!("graph:");
@@ -2492,7 +2493,7 @@ fn missing_inputs_message(config: &MissionConfig, missing: &[&mission_config::Mi
     msg.push_str("\nExample --input file:\n");
     let mut obj = serde_json::Map::new();
     for i in &config.inputs {
-        if i.name == "mission_id" {
+        if i.is_launcher_supplied() {
             continue; // launcher-supplied — never asked of the operator
         }
         obj.insert(i.name.clone(), serde_json::Value::String(format!("<{}>", i.name)));
@@ -2503,7 +2504,7 @@ fn missing_inputs_message(config: &MissionConfig, missing: &[&mission_config::Mi
         &config
             .inputs
             .iter()
-            .filter(|i| i.name != "mission_id")
+            .filter(|i| !i.is_launcher_supplied())
             .map(|i| format!("--param {}=<{}>", i.name, i.name))
             .collect::<Vec<_>>()
             .join(" "),
