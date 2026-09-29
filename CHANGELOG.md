@@ -33,6 +33,35 @@ darkmux release.
   `findings`, `mods` and `scope` a `deliver.github_review` step embeds) stay
   free-form. A step config the kind cannot load now fails the step naming the
   key, where a wrong-typed value used to fall back to a default.
+- **A step config is also checked by value, before anything runs** (B1). The
+  rules each kind's own reader enforces are now checked by the same code
+  before a launch starts, on the document where no `{{param}}` is involved
+  and again with the launch's `--param` values substituted (`--dry-run`
+  included, and each grown copy as it is minted). The refusal names the step,
+  the key and the rule: `crawl.unit` `draws` outside `1..=8` and
+  `timeout_seconds` of `0`; `plan.sites` `source: "diff"` with no `diff_file`,
+  or with neither `workspace` nor `github` plus `head_sha`; `crawl.plan` and
+  `plan.sites` with a blank `rule` (and `crawl.plan` a blank `workspace`) or a
+  `sizing.*` of `0`; `mods.gate` with a blank `for_key`; `dispatch.map` retry
+  budgets past `u32`; `deliver.github_review` with `findings` but no `mods` or
+  `diff`, or records that are not the record types. Still refused only when
+  the step runs, because no config alone decides them: a role named by neither
+  the task nor `dispatch.internal`'s config, a profile-registry endpoint id, a
+  directory or file that must exist, and a `dispatch.map` collection read from
+  a dependency's output. A step `config` that is not an object (a string, a
+  number or a list) is refused; a list used to load as its first values in
+  field order. `temperature` now accepts its text form (`"0.5"`), and a
+  `{{param}}` reference counts as a number or flag only when it is the whole
+  string (`"n={{n}}"` is refused).
+- **Some step config values now fail the step, and some now read as unset**
+  (B1). Now refused, where they were silently dropped: a `records.gather`
+  `not_attempted` entry that is not a string; a `deliver.github_review`
+  `emit`, `attribution` or (with no `findings`) `diff` that is not a string; a
+  `crawl.unit` `rule` that is not a string. Now read as unset, where they were
+  errors: `null` for a `sizing.max_*` or `no_progress_turns`. And a
+  `deliver.github_review` `findings: null` now reads as absent, so the step
+  takes its records from a `records.gather` step. **Migration:** delete the
+  key or fix its type; `darkmux doctor` names each.
 - **A `mission.verify` task takes no `role_id`** (A19, #2953). The step always
   dispatches `code-reviewer`, so the key never did anything; the shipped
   `coder-phase` config no longer sets it and a config that does is refused.

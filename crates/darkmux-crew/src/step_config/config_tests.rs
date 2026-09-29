@@ -50,23 +50,9 @@ fn sample(kind: ConfigKind) -> Value {
     }
 }
 
-/// The keys a kind's config cannot omit.
-fn required(kind: ConfigKind) -> &'static [&'static str] {
-    match kind {
-        ConfigKind::DispatchSingleShot => &["model"],
-        ConfigKind::DispatchMap => &["model", "user_template"],
-        ConfigKind::ProceduralShell => &["command"],
-        ConfigKind::ModsGate => &["for_key"],
-        ConfigKind::CrawlPlan => &["rule", "workspace"],
-        ConfigKind::PlanSites => &["rule"],
-        ConfigKind::CrawlUnit => &["plan", "unit"],
-        _ => &[],
-    }
-}
-
 /// `doc` as a kind sees it: `{{param}}` values are substituted before a kind loads.
 fn substituted(doc: &Value) -> Value {
-    let text = doc.to_string().replace("\"{{n}}\"", "\"5\"").replace("\"{{f}}\"", "\"true\"");
+    let text = doc.to_string().replace("\"{{n}}\"", "\"5\"").replace("\"{{f}}\"", "\"true\"").replace("\"{{p}}\"", "\"1\"");
     serde_json::from_str(&text).unwrap()
 }
 
@@ -74,7 +60,7 @@ fn substituted(doc: &Value) -> Value {
 fn every_kind_has_a_sample_the_gate_and_the_load_accept() {
     for kind in ConfigKind::ALL {
         let doc = sample(kind);
-        assert_eq!(rendered(&kind.issues(&doc, "config")), Vec::<String>::new(), "{}", kind.id());
+        assert_eq!(rendered(&kind.problems(&doc, "config", "s")), Vec::<String>::new(), "{}", kind.id());
         assert_eq!(kind.loads(&substituted(&doc)), Ok(()), "{}", kind.id());
     }
 }
@@ -101,16 +87,26 @@ fn a_kind_that_reads_no_config_refuses_every_key() {
     }
 }
 
+/// Every key a sample names, removed in turn: a kind that cannot load without
+/// the key (or refuses the config by a value rule) is one whose gate refuses
+/// the config too. The required keys are DERIVED from what each kind's own
+/// reader refuses, not listed here. (A rule can name a related key: without
+/// `github`, `plan.sites` names `workspace`.)
 #[test]
-fn a_missing_required_key_is_refused() {
+fn a_config_the_kind_cannot_load_without_a_key_is_refused_naming_that_key() {
+    let mut refused_removals = 0;
     for kind in ConfigKind::ALL {
-        for key in required(kind) {
+        for key in kind.keys() {
             let mut doc = sample(kind);
-            doc.as_object_mut().unwrap().remove(*key);
-            let issues = rendered(&kind.issues(&doc, "config"));
-            assert!(issues.iter().any(|i| i.contains(&format!("missing required key `config.{key}`"))), "{} {key}: {issues:?}", kind.id());
+            if doc.as_object_mut().unwrap().remove(&key).is_none() || kind.loads(&substituted(&doc)).is_ok() {
+                continue;
+            }
+            let issues = rendered(&kind.problems(&doc, "config", "s"));
+            assert!(!issues.is_empty(), "{} without {key} loads no more, and the gate passes it", kind.id());
+            refused_removals += 1;
         }
     }
+    assert!(refused_removals >= 10, "the derivation found only {refused_removals} required keys");
 }
 
 #[test]
@@ -136,20 +132,35 @@ fn a_wrong_type_is_refused_before_anything_runs() {
     }
 }
 
+/// Keys that hold an open value (a list of records, a scope object): a
+/// launch may substitute a whole JSON value there, which the text `1` this
+/// test substitutes for a reference is not.
+const OPEN_VALUE_KEYS: [&str; 3] = ["findings", "mods", "scope"];
+
 /// The promise's second half: whatever the gate accepts, the kind's own load
-/// accepts. Every key of every sample takes each of several values; a
-/// value the gate passes must load.
+/// (its value rules included) accepts. Every key of every sample takes each of
+/// several values, and is removed; a config the gate passes must load.
 #[test]
 fn whatever_the_step_gate_passes_the_kinds_load_accepts() {
-    let candidates = [json!(1), json!("a"), json!("7"), json!("true"), json!(true), json!(null), json!([1]), json!({"a": 1}), json!(-1), json!(1.5)];
+    let candidates = [
+        Some(json!(0)), Some(json!(1)), Some(json!(9)), Some(json!("a")), Some(json!("")), Some(json!("  ")), Some(json!("7")),
+        Some(json!("0")), Some(json!("true")), Some(json!("diff")), Some(json!(true)), Some(json!(null)), Some(json!([1])),
+        Some(json!({"a": 1})), Some(json!(-1)), Some(json!(1.5)), Some(json!("{{p}}")), Some(json!("n={{p}}")), None,
+    ];
     let mut disagreements = Vec::new();
     for kind in ConfigKind::ALL {
         for key in kind.keys() {
             for value in &candidates {
+                if matches!(value, Some(Value::String(t)) if t == "{{p}}") && OPEN_VALUE_KEYS.contains(&key.as_str()) {
+                    continue;
+                }
                 let mut doc = sample(kind);
-                doc.as_object_mut().unwrap().insert(key.clone(), value.clone());
-                if kind.issues(&doc, "config").is_empty() && kind.loads(&substituted(&doc)).is_err() {
-                    disagreements.push(format!("{} {key}={value}: {:?}", kind.id(), kind.loads(&substituted(&doc))));
+                match value {
+                    Some(v) => doc.as_object_mut().unwrap().insert(key.clone(), v.clone()),
+                    None => doc.as_object_mut().unwrap().remove(&key),
+                };
+                if kind.problems(&doc, "config", "s").is_empty() && kind.loads(&substituted(&doc)).is_err() {
+                    disagreements.push(format!("{} {key}={value:?}: {:?}", kind.id(), kind.loads(&substituted(&doc))));
                 }
             }
         }
@@ -250,4 +261,118 @@ fn every_shipped_step_config_loads_once_its_params_are_substituted() {
         }
     }
     assert!(checked > 30, "checked {checked} shipped steps");
+}
+
+/// One row per rule a kind's own reader enforces that the types alone do not:
+/// the config, and the text the refusal must carry.
+fn rule_cases() -> Vec<(ConfigKind, Value, &'static str)> {
+    let unit = |patch: Value| {
+        let mut doc = json!({"plan": "p", "unit": "u"});
+        doc.as_object_mut().unwrap().extend(patch.as_object().unwrap().clone());
+        doc
+    };
+    vec![
+        (ConfigKind::CrawlUnit, unit(json!({"draws": 0})), "config.draws must be >= 1, got 0"),
+        (ConfigKind::CrawlUnit, unit(json!({"draws": 9})), "config.draws is 9, above the cap of 8"),
+        (ConfigKind::CrawlUnit, unit(json!({"draws": "9"})), "above the cap of 8"),
+        (ConfigKind::CrawlUnit, unit(json!({"timeout_seconds": 0})), "config.timeout_seconds must be >= 1"),
+        (ConfigKind::CrawlUnit, unit(json!({"plan": " "})), "config.plan must not be blank"),
+        (ConfigKind::PlanSites, json!({"rule": "r", "source": "diff", "workspace": "w"}), "config.diff_file is required"),
+        (ConfigKind::PlanSites, json!({"rule": "r"}), "config.workspace is required, or set both config.github and config.head_sha"),
+        (ConfigKind::PlanSites, json!({"rule": "r", "github": "o/r"}), "config.workspace is required, or set both config.github and config.head_sha"),
+        (ConfigKind::PlanSites, json!({"rule": " ", "workspace": "w"}), "config.rule must not be blank"),
+        (ConfigKind::PlanSites, json!({"rule": "r", "workspace": "w", "sizing": {"max_est_tokens_per_unit": 0}}), "config.sizing.max_est_tokens_per_unit must be a positive integer"),
+        (ConfigKind::CrawlPlan, json!({"rule": "", "workspace": "w"}), "config.rule must not be blank"),
+        (ConfigKind::CrawlPlan, json!({"rule": "r", "workspace": ""}), "config.workspace must not be blank"),
+        (ConfigKind::CrawlPlan, json!({"rule": "r", "workspace": "w", "sizing": {"max_sites_per_unit": "0"}}), "config.sizing.max_sites_per_unit must be a positive integer"),
+        (ConfigKind::DeliverGithubReview, json!({"findings": []}), "config.mods is required when `findings` is set"),
+        (ConfigKind::DeliverGithubReview, json!({"findings": [], "mods": []}), "config.diff is required when `findings` is set"),
+        (ConfigKind::DeliverGithubReview, json!({"findings": [1], "mods": [], "diff": ""}), "config.findings is not a list of finding records"),
+        (ConfigKind::ModsGate, json!({"for_key": " "}), "config.for_key must not be blank"),
+        (ConfigKind::DispatchMap, json!({"model": "m", "user_template": "t", "retry_on_error": 4294967296u64}), "config.retry_on_error (4294967296) exceeds the maximum"),
+    ]
+}
+
+#[test]
+fn a_config_the_kinds_own_reader_refuses_by_value_is_refused_by_the_gate_naming_step_key_and_rule() {
+    for (kind, config, expect) in rule_cases() {
+        let doc = doc_with_step(kind.id(), config.clone());
+        let text = rendered(&step_config_issues(&doc)).join("\n");
+        assert!(text.contains(expect), "{} {config}: wanted `{expect}` in\n{text}", kind.id());
+        assert!(text.contains(&format!("step `s` (`{}`)", kind.id())), "the step is named: {text}");
+        assert!(text.contains("phases[0].tasks[0].steps[0].config."), "the key path is named: {text}");
+        assert!(kind.loads(&config).is_err(), "{}: the kind's own load refuses it too", kind.id());
+    }
+}
+
+#[test]
+fn a_placeholder_valued_config_is_left_to_the_launch_check_after_substitution() {
+    let doc = doc_with_step("crawl.unit", json!({"plan": "{{plan}}", "unit": "{{unit}}", "draws": "{{draws}}"}));
+    assert_eq!(rendered(&step_config_issues(&doc)), Vec::<String>::new());
+}
+
+#[test]
+fn a_config_that_is_not_an_object_is_refused_not_read_as_empty() {
+    for bad in [json!("oops"), json!(5), json!(["hello"]), json!(true)] {
+        for kind in [ConfigKind::ProceduralNoop, ConfigKind::CrawlSummary, ConfigKind::CrawlUnit] {
+            let text = rendered(&step_config_issues(&doc_with_step(kind.id(), bad.clone()))).join("\n");
+            assert!(text.contains("`phases[0].tasks[0].steps[0].config` must be an object"), "{} {bad}: {text}", kind.id());
+            assert!(kind.loads(&bad).is_err(), "{} {bad}: the load refuses it too", kind.id());
+            assert!(!kind.problems(&bad, "config", "s").is_empty(), "{} {bad}", kind.id());
+        }
+    }
+    let step = crate::types::Step {
+        id: "s".into(),
+        task_id: "t".into(),
+        gate: None,
+        kind: "procedural.noop".into(),
+        status: crate::types::NodeStatus::Planned,
+        config: json!(["hello"]),
+        started_ts: None,
+        completed_ts: None,
+        output: None,
+    };
+    let err = load::<NoopConfig>(&step, ConfigKind::ProceduralNoop).map(|c| c.output).unwrap_err();
+    assert!(err.to_string().contains("must be an object"), "{err}");
+    assert!(ConfigKind::ProceduralNoop.loads(&Value::Null).is_ok(), "null stays an empty config");
+}
+
+#[test]
+fn a_temperature_reads_its_number_and_its_text() {
+    let kind = ConfigKind::DispatchSingleShot;
+    for temp in [json!(0.5), json!("0.5"), json!("{{temp}}")] {
+        let doc = json!({"model": "m", "temperature": temp});
+        assert_eq!(rendered(&kind.problems(&doc, "config", "s")), Vec::<String>::new(), "{temp}");
+    }
+    let bad = json!({"model": "m", "temperature": "warm"});
+    assert!(!kind.problems(&bad, "config", "s").is_empty());
+    assert!(kind.loads(&json!({"model": "m", "temperature": "0.5"})).is_ok());
+    assert!(kind.problems(&json!({"model": "m", "max_tokens": "n={{n}}"}), "config", "s").iter().any(|i| i.path.ends_with("max_tokens")),
+        "a reference embedded in text is not a count");
+}
+
+/// The values whose treatment changed when the kinds began reading one typed
+/// struct: each is pinned so a later change to it is deliberate.
+#[test]
+fn values_the_typed_load_now_refuses_or_reads_as_unset() {
+    let refused = [
+        (ConfigKind::RecordsGather, json!({"not_attempted": [1]})),
+        (ConfigKind::DeliverGithubReview, json!({"emit": 5})),
+        (ConfigKind::DeliverGithubReview, json!({"attribution": 5})),
+        (ConfigKind::DeliverGithubReview, json!({"diff": 5})),
+        (ConfigKind::CrawlUnit, json!({"plan": "p", "unit": "u", "rule": 5})),
+    ];
+    for (kind, config) in refused {
+        assert!(kind.loads(&config).is_err(), "{} {config}", kind.id());
+        assert!(!kind.problems(&config, "config", "s").is_empty(), "{} {config}: the gate refuses it too", kind.id());
+    }
+    let unset = [
+        (ConfigKind::CrawlPlan, json!({"rule": "r", "workspace": "w", "sizing": {"max_sites_per_unit": null}})),
+        (ConfigKind::CrawlUnit, json!({"plan": "p", "unit": "u", "no_progress_turns": null})),
+        (ConfigKind::DeliverGithubReview, json!({"findings": null})),
+    ];
+    for (kind, config) in unset {
+        assert_eq!(kind.loads(&config), Ok(()), "{} {config}", kind.id());
+        assert!(kind.problems(&config, "config", "s").is_empty(), "{} {config}", kind.id());
+    }
 }

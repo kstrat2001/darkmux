@@ -55,7 +55,7 @@
 use crate::crawl::plan::{self, Plan, PlanParams};
 use anyhow::{anyhow, bail, Context, Result};
 use darkmux_crew::rules;
-use darkmux_crew::step_config::{load, non_blank, ConfigKind, CrawlPlanConfig};
+use darkmux_crew::step_config::{load_checked, ConfigKind, CrawlPlanConfig};
 use darkmux_crew::step_kinds::{Port, SeatClaim, StepKind, StepKindRegistry, StepOutcome, StepRunCtx};
 use darkmux_crew::types::{Step, Task};
 use darkmux_crew::workspace_spec::{materialize, MaterializeOptions, WorkspaceSpec};
@@ -184,10 +184,9 @@ pub struct PlanStepConfig {
 
 impl PlanStepConfig {
     pub fn from_step(step: &Step) -> Result<Self> {
-        let cfg: CrawlPlanConfig = load(step, ConfigKind::CrawlPlan)?;
-        let requires = |key: &str| anyhow!("step `{}`: `{CRAWL_PLAN_KIND}` requires config.{key}", step.id);
-        let rule = non_blank(Some(cfg.common.rule.clone())).ok_or_else(|| requires("rule"))?;
-        let workspace = non_blank(Some(cfg.workspace)).ok_or_else(|| requires("workspace"))?;
+        let cfg: CrawlPlanConfig = load_checked(step, ConfigKind::CrawlPlan)?;
+        let rule = cfg.common.rule.clone();
+        let workspace = cfg.workspace;
         // (#2310 P4c-2 review MUST-do 1) Shared with `plan_sites_step.rs`
         // so the two `plan.*` kinds cannot silently drift back apart on
         // CLI-string leniency the way they did before this review.

@@ -10,6 +10,8 @@
 //! `grow.config.<key>`; a grow key's problems are reported there too.
 
 use super::ConfigKind;
+use crate::mission_config::grow::GROWN_FROM_KEY;
+use anyhow::{bail, Result};
 use darkmux_types::user_files::{closest, key_issues, Issue, KeyIssue, COMMENT_KEY};
 use serde_json::{Map, Value};
 
@@ -24,6 +26,34 @@ pub fn step_config_issues(doc: &Value) -> Vec<KeyIssue> {
         task_issues(&path, task, &mut out);
     }
     out
+}
+
+/// Refuse every step, given as `(id, kind, config)` with its `{{param}}`s
+/// already substituted, whose config its kind cannot accept: a wrong type or
+/// unknown key, or a value its own reader refuses. The launch runs this on
+/// the static graph before anything mints (`--dry-run` included) and on each
+/// grown copy before it runs. A kind this crate does not ship is not judged
+/// here (the document walk names it).
+pub fn check_resolved<'a>(steps: impl IntoIterator<Item = (&'a str, &'a str, &'a Value)>) -> Result<()> {
+    let problems: Vec<String> = steps
+        .into_iter()
+        .filter_map(|(id, kind, config)| Some((id, ConfigKind::from_id(kind)?, config)))
+        .flat_map(|(id, kind, config)| kind.problems(&without_stamp(config), "config", id))
+        .map(|issue| issue.to_string())
+        .collect();
+    if !problems.is_empty() {
+        bail!("{} step config(s) refused before anything runs:\n  {}", problems.len(), problems.join("\n  "));
+    }
+    Ok(())
+}
+
+/// `config` without the provenance key grow stamps onto a grown step.
+fn without_stamp(config: &Value) -> Value {
+    let mut config = config.clone();
+    if let Some(object) = config.as_object_mut() {
+        object.remove(GROWN_FROM_KEY);
+    }
+    config
 }
 
 /// Every `(path, task)` of the document, in document order.
@@ -78,20 +108,31 @@ fn step_kind(step: &Value, step_path: &str, out: &mut Vec<KeyIssue>) -> Option<C
 }
 
 /// One step's issues: its `config` overlaid with the grow keys its kind
-/// names, checked against the kind's struct.
+/// names, checked against the kind's struct and its value rules. A `config`
+/// that is not an object is checked as it stands (the kind refuses it).
 fn step_issues(step_path: &str, step: &Value, kind: ConfigKind, grow: Option<&Map<String, Value>>, task_path: &str) -> Vec<KeyIssue> {
     let config_path = format!("{step_path}.config");
     let named = kind.keys();
     let from_grow: Vec<&String> = grow.into_iter().flat_map(|g| g.keys()).filter(|k| named.contains(k)).collect();
-    let mut overlay = step.get("config").and_then(Value::as_object).cloned().unwrap_or_default();
-    for key in &from_grow {
-        overlay.insert((*key).clone(), grow.and_then(|g| g.get(*key)).cloned().unwrap_or(Value::Null));
-    }
+    let overlay = match step.get("config") {
+        None | Some(Value::Null) => overlaid(Map::new(), grow, &from_grow),
+        Some(Value::Object(own)) => overlaid(own.clone(), grow, &from_grow),
+        Some(other) => other.clone(),
+    };
+    let step_id = step.get("id").and_then(Value::as_str).unwrap_or("?");
     let grow_path = format!("{task_path}.grow.config");
-    kind.issues(&Value::Object(overlay), &config_path)
+    kind.problems(&overlay, &config_path, step_id)
         .into_iter()
         .map(|issue| relocate(issue, &config_path, &grow_path, &from_grow))
         .collect()
+}
+
+/// `config` with each of the task's grow keys `keys` written over it.
+fn overlaid(mut config: Map<String, Value>, grow: Option<&Map<String, Value>>, keys: &[&String]) -> Value {
+    for key in keys {
+        config.insert((*key).clone(), grow.and_then(|g| g.get(*key)).cloned().unwrap_or(Value::Null));
+    }
+    Value::Object(config)
 }
 
 /// An issue about a key that came from `grow.config` is reported there, not

@@ -8,6 +8,17 @@
 //! missing required key inside a step's config is refused before anything
 //! runs, naming the file, the key path and the closest valid key.
 //!
+//! A struct also owns the kind's VALUE rules ([`ConfigRules`]): the bounds and
+//! required-together keys the kind refuses at run time although the keys have
+//! the right types (a `draws` of 0, a diff plan with no diff file). The kind's
+//! own reader calls the same rule function the gate does, so a launch refuses
+//! such a config before anything runs: on the document itself where no
+//! `{{param}}` is involved (`gate`), and again once a launch's params are
+//! substituted (`gate::check_resolved_steps`). What no config can decide
+//! alone stays a run-time refusal: a role named by neither the task nor the
+//! config, a profile-registry endpoint id, a directory or file that must
+//! exist, and a collection read from a dependency's output.
+//!
 //! [`ConfigKind`] is the closed set of kinds with a config struct. Its ids
 //! are THE ids: each kind's `id()` and its `*_KIND` constant come from
 //! [`ConfigKind::id`], and the registry conformance test proves every
@@ -20,7 +31,9 @@ pub use kinds::*;
 
 use crate::types::Step;
 use anyhow::{anyhow, Result};
+use darkmux_types::param_scalar::is_placeholder;
 use darkmux_types::user_files::{key_issues_at, no_retired, top_level_keys, Issue, KeyIssue};
+use std::fmt;
 use schemars::{json_schema, JsonSchema, Schema, SchemaGenerator};
 use std::borrow::Cow;
 use serde::de::DeserializeOwned;
@@ -45,6 +58,39 @@ pub enum ConfigKind {
     MissionWorktree,
     MissionCoder,
     MissionVerify,
+}
+
+/// A value a step kind refuses although its type is right: the key (dotted,
+/// under `config`) and the rule it breaks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleViolation {
+    pub key: String,
+    pub rule: String,
+}
+
+impl RuleViolation {
+    pub fn new(key: &str, rule: impl Into<String>) -> Self {
+        Self { key: key.to_string(), rule: rule.into() }
+    }
+}
+
+impl fmt::Display for RuleViolation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "config.{} {}", self.key, self.rule)
+    }
+}
+
+/// The value rules of one kind's config, checked by its own reader and by
+/// the gate. The default is "no rules beyond the types".
+pub trait ConfigRules {
+    fn check(&self) -> Result<(), RuleViolation> {
+        Ok(())
+    }
+}
+
+/// A text key that must say something: not empty, not blank.
+pub fn require_text(key: &str, value: &str) -> Result<(), RuleViolation> {
+    non_blank(Some(value.to_string())).map(|_| ()).ok_or_else(|| RuleViolation::new(key, "must not be blank"))
 }
 
 /// Run `$body` with `$t` bound to the config struct of `$kind`. The one place
@@ -117,12 +163,50 @@ impl ConfigKind {
         Self::ALL.into_iter().find(|k| k.id() == id)
     }
 
-    /// Every issue in `config` (`Null` reads as an empty object) against this
-    /// kind's struct, with paths written under `prefix`.
+    /// Every schema issue in `config` (`Null` reads as an empty object)
+    /// against this kind's struct, with paths written under `prefix`. A
+    /// config that is neither an object nor null is one wrong-type issue at
+    /// `prefix`.
     pub fn issues(self, config: &Value, prefix: &str) -> Vec<KeyIssue> {
-        let empty = Value::Object(Default::default());
-        let config = if config.is_null() { &empty } else { config };
-        with_config_type!(self, T => key_issues_at::<T>(config, &no_retired, prefix))
+        match object_config(config) {
+            Ok(object) => with_config_type!(self, T => key_issues_at::<T>(&object, &no_retired, prefix)),
+            Err(_) => vec![KeyIssue {
+                path: prefix.to_string(),
+                issue: Issue::WrongType { expected: "an object".to_string(), got: json_type(config).to_string() },
+            }],
+        }
+    }
+
+    /// The value rule `config` breaks, if any: what the kind's own reader
+    /// refuses although the types are right. `None` also for a config that
+    /// does not load at all ([`Self::issues`] names that).
+    ///
+    /// A `{{param}}` still in `config` is a value not known yet: it is read
+    /// as one that satisfies its key, and a rule broken AT such a key is not
+    /// reported. Every other key is checked as written, so a launch's
+    /// `--param` values are checked again once substituted.
+    pub fn violation(self, config: &Value) -> Option<RuleViolation> {
+        let assumed = assume_params(config);
+        let violation = with_config_type!(self, T => T::deserialize(&*object_config(&assumed).ok()?).ok()?.check().err())?;
+        let top = violation.key.split('.').next().unwrap_or_default();
+        let unresolved = config.get(top).and_then(Value::as_str).is_some_and(is_placeholder);
+        (!unresolved).then_some(violation)
+    }
+
+    /// Every problem of `config`: its schema issues, else the value rule it
+    /// breaks, written at `prefix` and naming `step_id`.
+    pub fn problems(self, config: &Value, prefix: &str, step_id: &str) -> Vec<KeyIssue> {
+        let issues = self.issues(config, prefix);
+        if !issues.is_empty() {
+            return issues;
+        }
+        self.violation(config)
+            .map(|v| KeyIssue {
+                path: format!("{prefix}.{}", v.key),
+                issue: Issue::Rule(format!("step `{step_id}` (`{}`): {v}", self.id())),
+            })
+            .into_iter()
+            .collect()
     }
 
     /// The top-level keys this kind's config names.
@@ -130,12 +214,46 @@ impl ConfigKind {
         with_config_type!(self, T => top_level_keys::<T>())
     }
 
-    /// Whether `config` loads as this kind's struct: what the kind's own
-    /// `load` will decide, without running anything.
+    /// Whether `config` is one the kind's own reader accepts, rules
+    /// included: what its `load` decides, without running anything.
     pub fn loads(self, config: &Value) -> Result<(), String> {
-        let empty = Value::Object(Default::default());
-        let config = if config.is_null() { &empty } else { config };
-        with_config_type!(self, T => serde_json::from_value::<T>(config.clone()).map(|_| ()).map_err(|e| e.to_string()))
+        with_config_type!(self, T => {
+            let typed = T::deserialize(&*object_config(config)?).map_err(|e| e.to_string())?;
+            typed.check().map_err(|v| v.to_string())
+        })
+    }
+}
+
+/// `value` with every whole-string `{{param}}` replaced by the text `1`,
+/// which reads as a string, a count, a decimal and a flag.
+fn assume_params(value: &Value) -> Value {
+    match value {
+        Value::String(text) if is_placeholder(text) => Value::String("1".to_string()),
+        Value::Array(items) => Value::Array(items.iter().map(assume_params).collect()),
+        Value::Object(map) => Value::Object(map.iter().map(|(k, v)| (k.clone(), assume_params(v))).collect()),
+        other => other.clone(),
+    }
+}
+
+/// `config` as a JSON object: `Null` reads as an empty one, anything else that
+/// is not an object is refused (a JSON array would otherwise load through
+/// serde's sequence visitor as a struct's fields in order).
+fn object_config(config: &Value) -> Result<Cow<'_, Value>, String> {
+    match config {
+        Value::Null => Ok(Cow::Owned(Value::Object(Default::default()))),
+        Value::Object(_) => Ok(Cow::Borrowed(config)),
+        other => Err(format!("a step's config must be an object, got {}", json_type(other))),
+    }
+}
+
+fn json_type(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
     }
 }
 
@@ -144,11 +262,10 @@ impl ConfigKind {
 /// missing (the gate's own wording, so a run and a preflight name them the
 /// same), else the parse error.
 pub fn load<T: DeserializeOwned>(step: &Step, kind: ConfigKind) -> Result<T> {
-    let empty = Value::Object(Default::default());
-    let config = if step.config.is_null() { &empty } else { &step.config };
-    T::deserialize(config).map_err(|parse| {
+    let config = object_config(&step.config).map_err(|why| anyhow!("step `{}`: `{}` config: {why}", step.id, kind.id()))?;
+    T::deserialize(&*config).map_err(|parse| {
         let named: Vec<String> = kind
-            .issues(config, "config")
+            .issues(&config, "config")
             .into_iter()
             .filter(|i| matches!(i.issue, Issue::WrongType { .. } | Issue::Missing { .. }))
             .map(|i| i.to_string())
@@ -156,6 +273,14 @@ pub fn load<T: DeserializeOwned>(step: &Step, kind: ConfigKind) -> Result<T> {
         let why = if named.is_empty() { parse.to_string() } else { named.join("; ") };
         anyhow!("step `{}`: `{}` config: {why}", step.id, kind.id())
     })
+}
+
+/// [`load`], then the kind's value rules ([`ConfigRules`]): the reader for a
+/// kind whose config the gate also checks by value.
+pub fn load_checked<T: DeserializeOwned + ConfigRules>(step: &Step, kind: ConfigKind) -> Result<T> {
+    let config: T = load(step, kind)?;
+    config.check().map_err(|v| anyhow!("step `{}`: `{}` {v}", step.id, kind.id()))?;
+    Ok(config)
 }
 
 /// `text` without surrounding blanks, `None` when nothing is left: a

@@ -10,11 +10,12 @@
 //! would fail those loads. The gate checks each kind against only the grow
 //! keys that kind names (`super::gate`).
 //!
-//! Numbers and flags are [`Count`] and [`Flag`]: a `--param` value reaches a
-//! step as text. A field that holds an open value says so in its own doc.
+//! Numbers and flags are [`Count`], [`Decimal`] and [`Flag`]: a `--param`
+//! value reaches a step as text. A field that holds an open value says so in its own doc.
 
+use super::{require_text, ConfigRules, RuleViolation};
 use crate::brief_refs::BriefRef;
-use darkmux_types::param_scalar::{BlankableCount, Count, Flag};
+use darkmux_types::param_scalar::{BlankableCount, Count, Decimal, Flag};
 use darkmux_types::{ModelEndpoint, session_id::SessionId};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -28,6 +29,21 @@ pub enum EndpointRef {
     Id(String),
     Inline(Box<ModelEndpoint>),
 }
+
+/// Kinds whose config has no rule beyond its types.
+macro_rules! no_rules {
+    ($($config:ty),+) => { $(impl ConfigRules for $config {})+ };
+}
+
+no_rules!(
+    DispatchInternalConfig,
+    SingleShotConfig,
+    ShellConfig,
+    NoopConfig,
+    RecordsGatherConfig,
+    NoConfig,
+    MissionCoderConfig
+);
 
 /// `dispatch.internal`: a full agentic dispatch of one role. The role, profile,
 /// workdir and image come from the owning task first and from these keys only
@@ -67,7 +83,7 @@ pub struct ModelCallConfig {
     pub max_tokens: Option<Count>,
     pub timeout_seconds: Option<Count>,
     /// Local dialect only.
-    pub temperature: Option<f64>,
+    pub temperature: Option<Decimal>,
     /// Present: the hosted dialect against this endpoint.
     pub endpoint: Option<EndpointRef>,
     /// Residency hints for a local model: the context length to load at, the
@@ -77,6 +93,13 @@ pub struct ModelCallConfig {
     pub model_key: Option<String>,
     /// `--profiles-file` passthrough.
     pub config_path: Option<String>,
+}
+
+impl ModelCallConfig {
+    /// The sampling temperature: the configured one, else 0.7.
+    pub fn temperature(&self) -> f32 {
+        self.temperature.map_or(0.7, |t| t.0) as f32
+    }
 }
 
 /// `dispatch.single_shot`: one chat-completions call, no agent loop.
@@ -123,6 +146,17 @@ pub struct MapConfig {
     pub call: ModelCallConfig,
 }
 
+impl ConfigRules for MapConfig {
+    fn check(&self) -> Result<(), RuleViolation> {
+        for (key, budget) in [("retry_on_empty", self.retry_on_empty), ("retry_on_error", self.retry_on_error)] {
+            if let Some(n) = budget.filter(|n| n.as_u32().is_none()) {
+                return Err(RuleViolation::new(key, format!("({}) exceeds the maximum of {}", n.0, u32::MAX)));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// `procedural.shell`: one shell command.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ShellConfig {
@@ -150,6 +184,12 @@ pub struct ModsGateConfig {
     pub test_command: Option<String>,
     /// The checkout the kit is applied against.
     pub workdir: Option<String>,
+}
+
+impl ConfigRules for ModsGateConfig {
+    fn check(&self) -> Result<(), RuleViolation> {
+        require_text("for_key", &self.for_key)
+    }
 }
 
 /// `records.gather`: collect a run's findings and mods for delivery.
@@ -187,6 +227,25 @@ pub struct Sizing {
     pub max_est_tokens_per_unit: Option<Count>,
 }
 
+impl Sizing {
+    /// The two limits, each `None` when unset. A limit is a positive integer
+    /// that fits a `usize`.
+    pub fn limits(&self) -> Result<(Option<usize>, Option<usize>), RuleViolation> {
+        let limit = |key: &str, count: Option<Count>| {
+            let Some(count) = count else { return Ok(None) };
+            count
+                .as_usize()
+                .filter(|n| *n > 0)
+                .map(Some)
+                .ok_or_else(|| RuleViolation::new(key, format!("must be a positive integer, got {}", count.0)))
+        };
+        Ok((
+            limit("sizing.max_sites_per_unit", self.max_sites_per_unit)?,
+            limit("sizing.max_est_tokens_per_unit", self.max_est_tokens_per_unit)?,
+        ))
+    }
+}
+
 /// What every planning kind reads.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct PlanCommon {
@@ -198,12 +257,26 @@ pub struct PlanCommon {
     pub plan_out: Option<String>,
 }
 
+impl ConfigRules for PlanCommon {
+    fn check(&self) -> Result<(), RuleViolation> {
+        require_text("rule", &self.rule)?;
+        self.sizing.as_ref().map_or(Ok(()), |s| s.limits().map(|_| ()))
+    }
+}
+
 /// `crawl.plan`: plan one rule over a workspace tree.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct CrawlPlanConfig {
     pub workspace: String,
     #[serde(flatten)]
     pub common: PlanCommon,
+}
+
+impl ConfigRules for CrawlPlanConfig {
+    fn check(&self) -> Result<(), RuleViolation> {
+        self.common.check()?;
+        require_text("workspace", &self.workspace)
+    }
 }
 
 /// Where `plan.sites` reads its sites from.
@@ -230,6 +303,46 @@ pub struct PlanSitesConfig {
     pub common: PlanCommon,
 }
 
+impl PlanSitesConfig {
+    /// Whether the config names a workspace itself, or the pair a workspace
+    /// is derived from.
+    fn names_a_workspace(&self) -> bool {
+        let named = |text: &Option<String>| text.as_deref().is_some_and(|t| !t.trim().is_empty());
+        named(&self.workspace) || (named(&self.head_sha) && named(&self.github))
+    }
+}
+
+impl ConfigRules for PlanSitesConfig {
+    fn check(&self) -> Result<(), RuleViolation> {
+        require_text("rule", &self.common.rule)?;
+        if !self.names_a_workspace() {
+            return Err(RuleViolation::new(
+                "workspace",
+                "is required, or set both config.github and config.head_sha to derive one",
+            ));
+        }
+        self.common.check()?;
+        if self.source == Some(SitesSource::Diff) && self.diff_file.is_none() {
+            return Err(RuleViolation::new("diff_file", "is required when `source` is \"diff\""));
+        }
+        Ok(())
+    }
+}
+
+/// The largest `draws` a `crawl.unit` config may name.
+///
+/// A draw is a WHOLE extra dispatch of the same unit: its own container, its
+/// own turn budget, its own tokens. So `draws` multiplies a run's cost
+/// linearly with nothing else in the pipeline bounding it. A mistyped
+/// `--param draws=80` is not a slightly more expensive run; it is an 80x one
+/// whose first visible symptom is an operator watching the same unit go
+/// round for an hour. Refused when the config is read rather than clamped:
+/// a silently lowered value would make the run's own `draws` a lie.
+///
+/// 8 is the ceiling because the technique this ports (the retired funnel's
+/// k-draw recall) never measured past a handful of draws.
+pub const MAX_UNIT_DRAWS: usize = 8;
+
 /// `crawl.unit`: dispatch one planned unit.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct CrawlUnitConfig {
@@ -242,6 +355,36 @@ pub struct CrawlUnitConfig {
     pub timeout_seconds: Option<BlankableCount>,
     pub intent_file: Option<String>,
     pub draws: Option<Count>,
+}
+
+impl ConfigRules for CrawlUnitConfig {
+    fn check(&self) -> Result<(), RuleViolation> {
+        require_text("plan", &self.plan)?;
+        require_text("unit", &self.unit)?;
+        if let Some(t) = self.timeout_seconds.and_then(|t| t.0).filter(|t| t.0 < 1) {
+            return Err(RuleViolation::new(
+                "timeout_seconds",
+                format!(
+                    "must be >= 1, got {}: `0` resolves to an already-expired inactivity deadline (an instant kill), \
+                     not 'unbounded'. Omit it for the standing default, or set a real positive bound",
+                    t.0
+                ),
+            ));
+        }
+        match self.draws {
+            Some(n) if n.0 < 1 => Err(RuleViolation::new("draws", format!("must be >= 1, got {}", n.0))),
+            Some(n) if n.0 > MAX_UNIT_DRAWS as u64 => Err(RuleViolation::new(
+                "draws",
+                format!(
+                    "is {}, above the cap of {MAX_UNIT_DRAWS}: every draw is a whole extra dispatch of this same \
+                     unit, so this run would cost {}x its own wall clock and tokens. Lower `draws`, or split \
+                     the work across units",
+                    n.0, n.0
+                ),
+            )),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// `crawl.summary`, `mission.worktree` and `mission.verify` read no config.

@@ -51,7 +51,8 @@ pub mod load;
 
 pub use grow::{grow_task, items_from_artifact, GrownFrom};
 pub use inputs::{
-    check_embedded_inputs_collected, check_placeholders_declared, check_supplied_inert_inputs,
+    check_embedded_inputs_collected, check_placeholders_declared, check_resolved_step_configs,
+    check_supplied_inert_inputs,
     find_unsubstituted_braces, substitute_step_config, undeclared_placeholders,
     unreferenced_inputs,
 };

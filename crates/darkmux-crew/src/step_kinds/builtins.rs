@@ -20,10 +20,9 @@ use super::types::{
 };
 use crate::remote_budget::RemoteBudget;
 use crate::step_config::{
-    load, ConfigKind, DispatchInternalConfig, MapConfig, ModelCallConfig, NoopConfig,
+    load, load_checked, ConfigKind, DispatchInternalConfig, MapConfig, ModelCallConfig, NoopConfig,
     MapSource, ShellConfig, SingleShotConfig,
 };
-use darkmux_types::param_scalar::Count;
 use crate::types::{Step, Task};
 use darkmux_types::execution_id::ExecutionId;
 use darkmux_types::session_id::{SessionId, SessionScope};
@@ -622,8 +621,7 @@ impl StepKind for DispatchInternalStepKind {
         _input: &std::collections::BTreeMap<String, String>,
         _ctx: &StepRunCtx,
     ) -> Option<String> {
-        let cfg: DispatchInternalConfig = load(step, ConfigKind::DispatchInternal).ok()?;
-        task.role_id.clone().or(cfg.role_id)
+        task.role_id.clone().or_else(|| load::<DispatchInternalConfig>(step, ConfigKind::DispatchInternal).ok()?.role_id)
     }
 
     /// (#2614 review, MUST FIX + "Also fix" wrong-problem-surfaced finding)
@@ -1027,7 +1025,7 @@ impl DispatchSingleShotStepKind {
 
             reply
         } else {
-            let temperature = call.temperature.unwrap_or(0.7) as f32;
+            let temperature = call.temperature();
             let req = SingleShotRequest {
                 base_url: None,
                 model: wire_model.as_ref(),
@@ -1575,18 +1573,6 @@ impl DispatchMapStepKind {
         }
     }
 
-    /// (#1605) Shared validation for a `dispatch.map` retry-budget config
-    /// key (`retry_on_empty`, `retry_on_error`): default 0/off when absent,
-    /// and a loud step-run-time `Err` (never silent coercion) when out of
-    /// `u32`'s range. Named after the key it reads so the error message
-    /// stays specific to whichever knob was misconfigured.
-    fn config_retry_budget(&self, step: &Step, key: &'static str, value: Option<Count>) -> Result<u32> {
-        let Some(n) = value else { return Ok(0) };
-        n.as_u32().ok_or_else(|| {
-            anyhow!("step `{}`: `{}` config.{key} ({}) exceeds the maximum of {}", step.id, self.id(), n.0, u32::MAX)
-        })
-    }
-
     /// (#1442) The shared map body behind both the ctx-free [`StepKind::run`]
     /// and the streaming [`StepKind::run_streaming`]. `ctx` is `None` for the
     /// unit-test/no-scheduler path (records batch into
@@ -1625,7 +1611,7 @@ impl DispatchMapStepKind {
             return Ok(StepOutcome { output: "[]".to_string(), flow_records: batched });
         }
 
-        let cfg: MapConfig = load(step, ConfigKind::DispatchMap)?;
+        let cfg: MapConfig = load_checked(step, ConfigKind::DispatchMap)?;
         let call = &cfg.call;
         // (#2570) The identifier this step actually ADDRESSES per item: the
         // bare `config.model` string for a hosted step (an endpoint
@@ -1645,22 +1631,14 @@ impl DispatchMapStepKind {
         let system = call.system.as_deref().unwrap_or("");
         let max_tokens = call.max_tokens.map_or(4096, |c| c.saturating_u32());
         let timeout_seconds = call.timeout_seconds.map_or(120, |c| c.saturating_u32());
-        // (#1442) The generic retry-on-empty budget (default 0/off) — see the
-        // struct doc. Read once for the whole collection loop. ABSENT → 0
-        // (optional, off). A PRESENT-but-invalid value is a LOUD config error
-        // at step-run time (matching this block's `require_config_*`
-        // "missing/invalid key is loud" doctrine), never silently coerced —
-        // an out-of-u32-range `retry_on_empty` must NOT become ~4 billion
-        // re-dispatches (the prior `u32::try_from(...).unwrap_or(u32::MAX)`
-        // did exactly that; #1442 gate CONSIDER).
-        let retry_on_empty = self.config_retry_budget(step, "retry_on_empty", cfg.retry_on_empty)?;
-        // (#1605) `retry_on_error` — same shape, same validation, default
-        // 0/off. See [`DispatchMapStepKind`]'s doc for the policy this opts
-        // a step INTO: a dispatch `Err` is retried up to this many times
-        // (short backoff between attempts) instead of isolating immediately.
-        // Off by default for every existing caller; the review pipeline's
-        // probe stage is the first to set it (darkmux#1605 cause 2).
-        let retry_on_error = self.config_retry_budget(step, "retry_on_error", cfg.retry_on_error)?;
+        // (#1442) The retry budgets (default 0/off), read once for the whole
+        // collection loop. A value beyond `u32`'s range was refused when the
+        // config loaded (`MapConfig`'s rules): it must never become ~4 billion
+        // re-dispatches. `retry_on_error` (#1605) retries a dispatch `Err`
+        // instead of isolating it immediately; see [`DispatchMapStepKind`]'s
+        // doc for the policy.
+        let retry_on_empty = cfg.retry_on_empty.map_or(0, |n| n.saturating_u32());
+        let retry_on_error = cfg.retry_on_error.map_or(0, |n| n.saturating_u32());
 
         // (#1607) Contract #2's liveness bookends are per ITEM (below): each
         // item is one role execution. They carry the endpoint label, which is
@@ -1742,7 +1720,7 @@ impl DispatchMapStepKind {
         // threaded into every item's arm; `None` on all production paths.
         let ovr = run_ctx.dispatch_override();
 
-        let temperature = call.temperature.unwrap_or(0.7) as f32;
+        let temperature = call.temperature();
         let mut results: Vec<MapItemResult> = Vec::with_capacity(items.len());
         for (index, item) in items.iter().enumerate() {
             // One item, one execution: its bookends, its usage records and
@@ -2994,6 +2972,24 @@ mod tests {
     /// implementations read the bus, so an empty one is sufficient here.
     fn bare_ctx() -> StepRunCtx {
         StepRunCtx::new(crate::test_run(), None, None, None, std::sync::Arc::new(crate::step_kinds::ArtifactBus::new()))
+    }
+
+    /// The consent gate names the role a `dispatch.internal` step dispatches;
+    /// a task's own role is that role even when the step's config fails to
+    /// load (`run` then refuses the config, but the gate must not be blind to
+    /// who the task staffs).
+    #[test]
+    fn dispatch_role_is_the_tasks_role_even_when_the_config_fails_to_load() {
+        let mut task = empty_task();
+        task.role_id = Some("coder".to_string());
+        let bad = step("s1", "dispatch.internal", json!({"timeout_seconds": "soon"}));
+        let role = DispatchInternalStepKind.dispatch_role(&bad, &task, &BTreeMap::new(), &bare_ctx());
+        assert_eq!(role.as_deref(), Some("coder"));
+
+        let configured = step("s1", "dispatch.internal", json!({"role_id": "reviewer"}));
+        let role = DispatchInternalStepKind.dispatch_role(&configured, &empty_task(), &BTreeMap::new(), &bare_ctx());
+        assert_eq!(role.as_deref(), Some("reviewer"));
+        assert_eq!(DispatchInternalStepKind.dispatch_role(&bad, &empty_task(), &BTreeMap::new(), &bare_ctx()), None);
     }
 
     // ── #2614 review: resume_precheck / message ordering ────────────────

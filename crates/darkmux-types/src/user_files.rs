@@ -183,6 +183,9 @@ pub enum Issue {
     /// A key the schema requires is absent, which fails the typed load the
     /// same way.
     Missing { expected: String },
+    /// A value the schema accepts but its consumer refuses: the rule it
+    /// breaks, named with the step and key.
+    Rule(String),
 }
 
 impl fmt::Display for KeyIssue {
@@ -196,7 +199,7 @@ impl fmt::Display for KeyIssue {
                 write!(f, " (valid keys here: {})", valid.join(", "))
             }
             Issue::Retired(line) => write!(f, "unknown key `{}`: {line}", self.path),
-            Issue::Removed(line) => write!(f, "`{}`: {line}", self.path),
+            Issue::Removed(line) | Issue::Rule(line) => write!(f, "`{}`: {line}", self.path),
             Issue::WrongType { expected, got } => write!(f, "`{}` must be {expected}, got {got}", self.path),
             Issue::Missing { expected } if expected.is_empty() => write!(f, "missing required key `{}`", self.path),
             Issue::Missing { expected } => write!(f, "missing required key `{}` ({expected})", self.path),

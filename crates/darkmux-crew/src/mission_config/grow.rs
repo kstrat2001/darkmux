@@ -24,6 +24,7 @@
 
 use super::{GrowSpec, TaskConfig};
 use anyhow::{bail, Context, Result};
+use darkmux_types::param_scalar::whole_placeholder;
 use serde::{Deserialize, Serialize};
 
 /// Where one grown task/step came from. Stamped onto every grown step's
@@ -192,6 +193,10 @@ pub fn grow_task(
     Ok(Growth { tasks, provenance })
 }
 
+/// The key grow stamps onto every grown step's `config`: where the copy came
+/// from. A step kind never reads it, and no document names it.
+pub const GROWN_FROM_KEY: &str = "grown_from";
+
 /// Merge the spec's rendered `config` templates plus `grown_from` into one
 /// step's config. A step whose config is `null` (the `procedural.noop`
 /// default) becomes an object here rather than losing the merge.
@@ -223,7 +228,7 @@ fn merge_grown_config(
         }
     }
     obj.insert(
-        "grown_from".to_string(),
+        GROWN_FROM_KEY.to_string(),
         serde_json::to_value(from).expect("GrownFrom serializes"),
     );
     Ok(())
@@ -288,7 +293,7 @@ fn render_value(
 ) -> Result<serde_json::Value> {
     match value {
         serde_json::Value::String(s) => {
-            if let Some(field) = whole_placeholder(s) {
+            if let Some(field) = whole_item_placeholder(s) {
                 // Type-preserving: `"{{item.est_tokens}}"` yields the
                 // number, not `"1200"`. A step kind reading a typed config
                 // key must not have its type silently changed by the fact
@@ -317,12 +322,8 @@ fn render_value(
 /// `"{{item.x}}"` (and nothing else) -> `Some("x")`. `{{from.output}}` is
 /// deliberately NOT a whole-placeholder: it is always a path string, so
 /// there is no item type to preserve, and [`render`] handles it.
-fn whole_placeholder(s: &str) -> Option<&str> {
-    let inner = s.strip_prefix("{{")?.strip_suffix("}}")?;
-    if inner.contains("{{") || inner.contains("}}") {
-        return None;
-    }
-    inner.trim().strip_prefix("item.")
+fn whole_item_placeholder(s: &str) -> Option<&str> {
+    whole_placeholder(s)?.strip_prefix("item.")
 }
 
 fn scalar_value(item: &serde_json::Value, field: &str, what: &str) -> Result<serde_json::Value> {

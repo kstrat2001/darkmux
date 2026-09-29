@@ -81,7 +81,7 @@ use crate::crawl::plan::{self, Plan, PlanParams};
 use crate::crawl::plan_step::{self, CRAWL_PLAN_OUTPUT_KIND};
 use anyhow::{anyhow, Context, Result};
 use darkmux_crew::rules;
-use darkmux_crew::step_config::{load, non_blank, ConfigKind, PlanSitesConfig, SitesSource};
+use darkmux_crew::step_config::{load_checked, non_blank, ConfigKind, PlanSitesConfig, SitesSource};
 use darkmux_crew::step_kinds::{Port, SeatClaim, StepKind, StepKindRegistry, StepOutcome, StepRunCtx};
 use darkmux_crew::types::{Step, Task};
 use darkmux_crew::workspace_spec::{materialize, MaterializeOptions, WorkspaceSpec};
@@ -208,19 +208,11 @@ struct SitesStepConfig {
 
 impl SitesStepConfig {
     fn from_step(step: &Step) -> Result<Self> {
-        let cfg: PlanSitesConfig = load(step, ConfigKind::PlanSites)?;
-        let rule = non_blank(Some(cfg.common.rule.clone()))
-            .ok_or_else(|| anyhow!("step `{}`: `{PLAN_SITES_KIND}` requires config.rule", step.id))?;
+        let cfg: PlanSitesConfig = load_checked(step, ConfigKind::PlanSites)?;
+        let rule = cfg.common.rule.clone();
         let workspace = non_blank(cfg.workspace.clone()).map(PathBuf::from);
         let head_sha = non_blank(cfg.head_sha.clone());
         let github = non_blank(cfg.github.clone());
-        if workspace.is_none() && !(head_sha.is_some() && github.is_some()) {
-            anyhow::bail!(
-                "step `{}`: `{PLAN_SITES_KIND}` requires config.workspace, or both \
-                 config.github and config.head_sha to derive one",
-                step.id
-            );
-        }
         // (#2310 P4c-2 review MUST-do 1) Shared with `plan_step.rs` so the
         // two `plan.*` kinds cannot silently drift back apart on
         // CLI-string leniency: both read `PlanCommon` through
@@ -231,12 +223,6 @@ impl SitesStepConfig {
             let p = PathBuf::from(s);
             std::fs::canonicalize(&p).unwrap_or(p)
         });
-        if source == SitesSource::Diff && diff_file.is_none() {
-            anyhow::bail!(
-                "step `{}`: `{PLAN_SITES_KIND}` config.source=\"diff\" requires config.diff_file",
-                step.id
-            );
-        }
         Ok(Self { rule, workspace, params, fetch, plan_out: cfg.common.plan_out.map(PathBuf::from), source, diff_file, head_sha, github })
     }
 

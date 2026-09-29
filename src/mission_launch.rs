@@ -650,6 +650,13 @@ pub fn launch(
     // placement as the check above: before `--dry-run`, before any mint.
     mission_config::check_embedded_inputs_collected(config, &collected)?;
 
+    // Every static step's config, with this launch's params substituted as a
+    // mint does, must be one its kind accepts: a `--param draws=0` the
+    // document's own `{{draws}}` reference let past the schema gate is
+    // refused here, before `--dry-run`'s short-circuit and before any mint.
+    // Grown copies are checked as they are minted (`grow_phase`).
+    mission_config::check_resolved_step_configs(config, &collected)?;
+
     // (#2384) The OTHER direction: a DECLARED input that no step config
     // (including a `grow.config` template) references and that this
     // launcher does not read itself. `review.json`'s `review-probe-high`
@@ -2123,6 +2130,11 @@ fn grow_phase(
 
         // (#2595) See `stamp_unit_timeout`'s own doc.
         stamp_unit_timeout(&mut grown_steps, timeout_seconds);
+
+        // A grown copy's config, its grow keys and items substituted, must be
+        // one its kind accepts: refused here, before the copy runs.
+        crew::step_config::gate::check_resolved(grown_steps.values().map(|s| (s.id.as_str(), s.kind.as_str(), &s.config)))
+            .with_context(|| format!("mission launch: growing task `{}`", task_cfg.id))?;
 
         // Same gate the statically-declared graph passes before it runs —
         // a grown step naming a kind this binary can't construct must fail
@@ -6299,6 +6311,46 @@ mod tests {
         let _ = guard;
     }
 
+    const DRAWS_PARAM_CONFIG: &str = r#"{
+        "id": "draws-param-test-mission",
+        "name": "Draws Param Test Mission",
+        "schema_version": "2.3",
+        "inputs": [
+            {"name": "draws", "description": "draws per unit", "default": "2"}
+        ],
+        "phases": [
+            {"id": "p1", "tasks": [{"id": "t1", "steps": [
+                {"id": "unit", "kind": "crawl.unit", "config": {"plan": "p", "unit": "u", "draws": "{{draws}}"}}
+            ]}]}
+        ]
+    }"#;
+
+    /// A step config the schema gate passes (`"{{draws}}"` is a reference) but
+    /// its kind refuses once the launch's `--param` is substituted is refused
+    /// before anything mints, `--dry-run` included, naming the step, the key
+    /// and the rule.
+    #[test]
+    #[serial_test::serial]
+    fn launch_refuses_a_param_that_breaks_its_steps_own_rule_before_minting() {
+        let guard = LaunchTestGuard::new();
+        guard.write_config("draws-param-test-mission", DRAWS_PARAM_CONFIG);
+        for (param, rule) in [("draws=0", "config.draws must be >= 1, got 0"), ("draws=99", "above the cap of 8")] {
+            for dry in [true, false] {
+                let mut params = vec![param.to_string()];
+                if dry {
+                    params.push("dry_run=true".to_string());
+                }
+                let err = launch("draws-param-test-mission", None, &params, None).expect_err("the rule must refuse the launch");
+                let msg = format!("{err:#}");
+                assert!(msg.contains("step `unit` (`crawl.unit`)") && msg.contains(rule), "{param} dry={dry}: {msg}");
+                assert!(all_mission_ids().is_empty(), "a refused launch must mint nothing");
+            }
+        }
+        let ok = launch("draws-param-test-mission", None, &["draws=3".to_string(), "dry_run=true".to_string()], None);
+        assert_eq!(ok.expect("a legal draws passes the check"), 0);
+        let _ = guard;
+    }
+
     /// (#2386 MF3) The mirror case: `knob` is declared with a `default`
     /// and the operator never named it on `--param`/stdin. Before the
     /// MF3 fix, `apply_input_defaults` ran BEFORE the supplied-set was
@@ -7415,73 +7467,25 @@ mod tests {
         assert_eq!(registered, typed);
     }
 
-    /// (silent-miss audit, 2026-09-06) `darkmux-crew`'s `records_gather`
-    /// scan (`scan_unit_and_plan_steps`) cannot depend on `darkmux-lab`,
-    /// so it keeps its own literal-string copies of the three step kind
-    /// ids it recognizes — `SCANNED_CRAWL_UNIT_KIND`/
-    /// `SCANNED_PLAN_SITES_KIND`/`SCANNED_CRAWL_PLAN_KIND`. This test
-    /// lives here because `src/` is the one place that depends on BOTH
-    /// crates and can hold both real constants side by side, plus the
-    /// fully-assembled `StepKindRegistry` (`all_step_kinds`) that proves
-    /// each literal actually resolves to a registered, constructible
-    /// kind — not just a string that happens to match today.
-    ///
-    /// Two ways this drifts silently without the test: (1) a lab-side
-    /// rename of one of the three constants leaves `records_gather`'s
-    /// copy stale — the scan then matches nothing for that kind, forever,
-    /// with no error; (2) a crew-side typo in one of the `SCANNED_*`
-    /// literals does the same from the other direction. Either failure
-    /// mode reproduces exactly the "closed list drifts silently" defect
-    /// this module's own doc names for a NEW kind — this guards the
-    /// EXISTING three from drifting the same way.
+    /// `darkmux-crew`'s `records_gather` scan reads a `crawl.unit` outcome's
+    /// `result` to tell a unit that REVIEWED its windows from one the thermal
+    /// breaker skipped before it ever dispatched (#2454). It cannot depend on
+    /// `darkmux-lab`, so it keeps its own copy of the skip marker
+    /// (`UNIT_RESULT_THERMAL_STOP`); this test lives here because `src/` is
+    /// the one place that sees both crates' real constants. Drift is silent
+    /// AND produces a false claim rather than a mere blind spot: a skipped
+    /// unit would go back to counting as covered, so a posted review would
+    /// assert coverage of hunks a thermally shortened run never looked at.
+    /// (The kind ids the scan matches are `ConfigKind` ids, and the registry
+    /// conformance test proves each is registered.)
     #[test]
-    fn records_gather_scanned_kinds_match_the_real_crawl_constants_and_are_registered() {
-        assert_eq!(
-            crew::step_kinds::SCANNED_CRAWL_UNIT_KIND,
-            darkmux_lab::crawl::unit_step::CRAWL_UNIT_KIND,
-            "records.gather's local literal has drifted from darkmux-lab's real \
-             `CRAWL_UNIT_KIND` — the scan will silently stop matching `crawl.unit` steps"
-        );
-        assert_eq!(
-            crew::step_kinds::SCANNED_PLAN_SITES_KIND,
-            darkmux_lab::crawl::plan_sites_step::PLAN_SITES_KIND,
-            "records.gather's local literal has drifted from darkmux-lab's real \
-             `PLAN_SITES_KIND` — the scan will silently stop matching `plan.sites` steps"
-        );
-        assert_eq!(
-            crew::step_kinds::SCANNED_CRAWL_PLAN_KIND,
-            darkmux_lab::crawl::plan_step::CRAWL_PLAN_KIND,
-            "records.gather's local literal has drifted from darkmux-lab's real \
-             `CRAWL_PLAN_KIND` — the scan will silently stop matching `crawl.plan` steps"
-        );
-
-        // (#2454) The same crate-boundary duplication, one level down: the
-        // scan reads a `crawl.unit` outcome's `result` to tell a unit that
-        // REVIEWED its windows from one the thermal breaker skipped before
-        // it ever dispatched. Drift here is silent AND produces a false
-        // claim rather than a mere blind spot — a skipped unit would go
-        // back to counting as covered, so the posted review would assert
-        // coverage of hunks a thermally shortened run never looked at.
+    fn records_gather_thermal_stop_marker_matches_the_lab_constant() {
         assert_eq!(
             crew::step_kinds::UNIT_RESULT_THERMAL_STOP,
             darkmux_lab::crawl::unit_step::THERMAL_STOP,
-            "records.gather's local literal has drifted from darkmux-lab's real `THERMAL_STOP` — \
+            "records.gather's local literal has drifted from darkmux-lab's real `THERMAL_STOP`: \
              thermally-skipped units would silently count as reviewed coverage again"
         );
-
-        let registry = all_step_kinds().expect("all_step_kinds must build cleanly in a test process");
-        let known = registry.ids();
-        for kind in [
-            crew::step_kinds::SCANNED_CRAWL_UNIT_KIND,
-            crew::step_kinds::SCANNED_PLAN_SITES_KIND,
-            crew::step_kinds::SCANNED_CRAWL_PLAN_KIND,
-        ] {
-            assert!(
-                known.iter().any(|k| k == kind),
-                "records.gather's scan recognizes `{kind}`, but `all_step_kinds`'s registry \
-                 has no such id — the scan would be matching a kind nothing can ever produce"
-            );
-        }
     }
 
     /// (#1530 — one global step-kind registry; #2310 P4d) The payoff this
@@ -9582,6 +9586,30 @@ mod tests {
         real_task_ids.insert("plan-task".to_string(), vec!["plan-task".to_string()]);
 
         (phase, real_task_ids, tasks_by_id, steps)
+    }
+
+    /// A grown copy whose grow keys break its kind's rule is refused when it
+    /// is minted, naming the step, the key and the rule; the same graph with a
+    /// legal value grows.
+    #[test]
+    fn grow_phase_refuses_a_grown_copy_whose_config_breaks_its_kinds_rule() {
+        let all_known = &[darkmux_lab::crawl::unit_step::CRAWL_UNIT_KIND];
+        let declared_inputs = std::collections::BTreeSet::new();
+        let collected = BTreeMap::new();
+        for (draws, refused) in [(0, true), (2, false)] {
+            let (mut phase, real_task_ids, tasks_by_id, steps) = two_template_crawl_phase_fixture();
+            let grow = phase.tasks[0].grow.as_mut().unwrap();
+            grow.config.as_object_mut().unwrap().insert("draws".to_string(), serde_json::json!(draws));
+            let grown = grow_phase(&phase, "crawl-phase", &real_task_ids, &tasks_by_id, &steps, all_known, &declared_inputs, &collected, None);
+            match (refused, grown) {
+                (true, Err(e)) => {
+                    let msg = format!("{e:#}");
+                    assert!(msg.contains("unit-rule-a") && msg.contains("config.draws must be >= 1, got 0"), "{msg}");
+                }
+                (false, Ok(batches)) => assert_eq!(batches.len(), 2),
+                (refused, other) => panic!("draws={draws}: refused expected {refused}, got {:?}", other.map(|b| b.len())),
+            }
+        }
     }
 
     #[test]

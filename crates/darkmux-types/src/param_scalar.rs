@@ -6,7 +6,7 @@
 //! field therefore has to accept both its JSON form (`3`, `true`) and its
 //! text form (`"3"`, `"true"`), and the unknown-key gate has to accept a
 //! `{{param}}` reference there before substitution. [`Count`] and [`Flag`]
-//! are those fields' types: one parse for the gate
+//! are those fields' types (with [`Decimal`] for a float): one parse for the gate
 //! ([`count_text_ok`] / [`flag_text_ok`], keyed by the schema `format`) and
 //! for the step kind's own load, so they cannot disagree.
 
@@ -22,18 +22,37 @@ pub const COUNT_FORMAT: &str = "darkmux-count";
 pub const BLANKABLE_COUNT_FORMAT: &str = "darkmux-count-or-blank";
 /// The schema `format` of the text form of a [`Flag`].
 pub const FLAG_FORMAT: &str = "darkmux-flag";
+/// The schema `format` of the text form of a [`Decimal`].
+pub const DECIMAL_FORMAT: &str = "darkmux-decimal";
 /// The schema `format` of a [`crate::session_id::SessionId`]'s wire string.
 pub const SESSION_ID_FORMAT: &str = "darkmux-session-id";
 
-/// Whether `text` is an unresolved `{{param}}` reference, which substitution
-/// replaces before a step kind reads it.
+/// `"{{name}}"` (and nothing else) -> `Some("name")`: the one definition of
+/// a whole-string `{{param}}` reference, shared by the mission config's
+/// substitution and this module's gate forms.
+pub fn whole_placeholder(text: &str) -> Option<&str> {
+    let inner = text.strip_prefix("{{")?.strip_suffix("}}")?;
+    if inner.contains("{{") || inner.contains("}}") {
+        return None;
+    }
+    Some(inner.trim())
+}
+
+/// Whether `text` is an unresolved whole-string `{{param}}` reference, which
+/// substitution replaces before a step kind reads it. An embedded one
+/// (`"n={{n}}"`) renders into a larger string, which is not a number.
 pub fn is_placeholder(text: &str) -> bool {
-    text.contains("{{")
+    whole_placeholder(text).is_some()
 }
 
 /// A non-negative integer from its number or its decimal text.
 fn parse_count(text: &str) -> Option<u64> {
     text.trim().parse().ok()
+}
+
+/// A finite decimal number from its text.
+fn parse_decimal(text: &str) -> Option<f64> {
+    text.trim().parse::<f64>().ok().filter(|n| n.is_finite())
 }
 
 /// A flag from its text: `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`, or
@@ -53,6 +72,7 @@ pub fn text_form_ok(format: &str, text: &str) -> Option<bool> {
         COUNT_FORMAT => is_placeholder(text) || parse_count(text).is_some(),
         BLANKABLE_COUNT_FORMAT => is_placeholder(text) || text.trim().is_empty() || parse_count(text).is_some(),
         FLAG_FORMAT => is_placeholder(text) || parse_flag(text).is_some(),
+        DECIMAL_FORMAT => is_placeholder(text) || parse_decimal(text).is_some(),
         SESSION_ID_FORMAT => crate::session_id::SessionId::parse(text).is_ok(),
         _ => return None,
     };
@@ -85,6 +105,10 @@ impl Count {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BlankableCount(pub Option<Count>);
 
+/// A finite decimal number, written as a number or as its text.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Decimal(pub f64);
+
 /// A boolean, written as `true`/`false` or as its text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Flag(pub bool);
@@ -107,6 +131,18 @@ impl<'de> Deserialize<'de> for BlankableCount {
             serde_json::Value::Null => Ok(Self(None)),
             serde_json::Value::String(s) if s.trim().is_empty() => Ok(Self(None)),
             other => Count::deserialize(other).map(|c| Self(Some(c))).map_err(de::Error::custom),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Decimal {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        match serde_json::Value::deserialize(d)? {
+            serde_json::Value::Number(n) => n.as_f64().map(Decimal).ok_or_else(|| de::Error::custom("must be a number")),
+            serde_json::Value::String(s) => parse_decimal(&s)
+                .map(Decimal)
+                .ok_or_else(|| de::Error::custom(format!("must be a number, got \"{s}\""))),
+            other => Err(de::Error::custom(format!("must be a number, got {other}"))),
         }
     }
 }
@@ -144,6 +180,20 @@ impl JsonSchema for BlankableCount {
 
     fn json_schema(_: &mut SchemaGenerator) -> Schema {
         json_schema!({"anyOf": [{"type": "integer", "minimum": 0}, {"type": "string", "format": BLANKABLE_COUNT_FORMAT}, {"type": "null"}]})
+    }
+
+    fn inline_schema() -> bool {
+        true
+    }
+}
+
+impl JsonSchema for Decimal {
+    fn schema_name() -> Cow<'static, str> {
+        "Decimal".into()
+    }
+
+    fn json_schema(_: &mut SchemaGenerator) -> Schema {
+        json_schema!({"anyOf": [{"type": "number"}, {"type": "string", "format": DECIMAL_FORMAT}]})
     }
 
     fn inline_schema() -> bool {
@@ -197,6 +247,29 @@ mod tests {
     }
 
     #[test]
+    fn only_a_whole_string_reference_is_a_placeholder() {
+        for whole in ["{{n}}", "{{ n }}", "{{item.id}}", "{{from.output}}"] {
+            assert!(is_placeholder(whole), "{whole:?}");
+        }
+        for not in ["n={{n}}", "{{a}}{{b}}", "{{a}} {{b}}", "x{{n}}", "{{n}}x", "{{", "{{}}x}}", "3"] {
+            assert!(!is_placeholder(not), "{not:?}");
+        }
+        assert_eq!(whole_placeholder("{{ workspace }}"), Some("workspace"));
+        assert_eq!(whole_placeholder("{{a}}{{b}}"), None);
+    }
+
+    #[test]
+    fn a_decimal_reads_its_number_and_its_text() {
+        assert_eq!(serde_json::from_value::<Decimal>(json!(0.5)).unwrap(), Decimal(0.5));
+        assert_eq!(serde_json::from_value::<Decimal>(json!(1)).unwrap(), Decimal(1.0));
+        assert_eq!(serde_json::from_value::<Decimal>(json!(" 0.25 ")).unwrap(), Decimal(0.25));
+        assert!(serde_json::from_value::<Decimal>(json!("warm")).is_err());
+        assert!(serde_json::from_value::<Decimal>(json!("")).is_err());
+        assert!(serde_json::from_value::<Decimal>(json!("NaN")).is_err());
+        assert!(serde_json::from_value::<Decimal>(json!(true)).is_err());
+    }
+
+    #[test]
     fn the_gate_and_the_load_agree_on_every_text_form() {
         for text in ["3", " 3 ", "three", "", "-1", "{{draws}}", "n={{n}}"] {
             let gate = text_form_ok(COUNT_FORMAT, text).unwrap();
@@ -210,6 +283,11 @@ mod tests {
             let gate = text_form_ok(FLAG_FORMAT, text).unwrap();
             let load = serde_json::from_value::<Flag>(json!(text)).is_ok();
             assert_eq!(gate, load || is_placeholder(text), "flag {text:?}");
+        }
+        for text in ["0.5", " 1 ", "hot", "", "{{temp}}", "t={{temp}}", "inf"] {
+            let gate = text_form_ok(DECIMAL_FORMAT, text).unwrap();
+            let load = serde_json::from_value::<Decimal>(json!(text)).is_ok();
+            assert_eq!(gate, load || is_placeholder(text), "decimal {text:?}");
         }
         assert_eq!(text_form_ok("uri", "x"), None);
     }

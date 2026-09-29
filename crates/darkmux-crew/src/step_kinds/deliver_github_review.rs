@@ -40,7 +40,7 @@
 
 use crate::findings::FindingRecord;
 use crate::mods::ModRecord;
-use crate::step_config::{load, non_blank, ConfigKind, DeliverGithubReviewConfig};
+use crate::step_config::{load, non_blank, ConfigKind, ConfigRules, DeliverGithubReviewConfig, RuleViolation};
 use crate::step_kinds::registry::StepKindRegistry;
 use crate::step_kinds::types::{CwdPolicy, Port, SeatClaim, StepKind, StepOutcome, StepRunCtx};
 use crate::types::{Step, Task};
@@ -1510,6 +1510,42 @@ struct DeliverConfig {
     absence_backstop: BTreeMap<String, crate::absence_backstop::AbsenceBackstopNote>,
 }
 
+/// The records a step's own `findings` / `mods` / `diff` / `scope` group
+/// carries, parsed.
+struct EmbeddedRecords {
+    findings: Vec<FindingRecord>,
+    mods: Vec<GatedMod>,
+    diff: String,
+    scope: DeliverScope,
+}
+
+impl DeliverGithubReviewConfig {
+    /// The embedded group, `None` when the step names no `findings` (its
+    /// records then come from a `records.gather` step). With `findings`, the
+    /// step also needs `mods` and `diff`, and every part must be its record
+    /// type.
+    fn embedded(&self) -> Result<Option<EmbeddedRecords>, RuleViolation> {
+        let Some(findings) = &self.findings else { return Ok(None) };
+        let findings = serde_json::from_value(findings.clone())
+            .map_err(|e| RuleViolation::new("findings", format!("is not a list of finding records: {e}")))?;
+        let mods = self.mods.clone().ok_or_else(|| RuleViolation::new("mods", "is required when `findings` is set"))?;
+        let mods = serde_json::from_value(mods)
+            .map_err(|e| RuleViolation::new("mods", format!("is not a list of gated mods: {e}")))?;
+        let diff = self.diff.clone().ok_or_else(|| RuleViolation::new("diff", "is required when `findings` is set"))?;
+        let scope = match self.scope.clone() {
+            Some(v) => serde_json::from_value(v).map_err(|e| RuleViolation::new("scope", format!("is not a delivery scope: {e}")))?,
+            None => DeliverScope::default(),
+        };
+        Ok(Some(EmbeddedRecords { findings, mods, diff, scope }))
+    }
+}
+
+impl ConfigRules for DeliverGithubReviewConfig {
+    fn check(&self) -> Result<(), RuleViolation> {
+        self.embedded().map(|_| ())
+    }
+}
+
 impl DeliverConfig {
     /// `input` is the step's own `gather_inputs` map (unused by every
     /// existing caller — every current test embeds `findings`/`mods`/
@@ -1525,6 +1561,7 @@ impl DeliverConfig {
     /// never data, and always come from `step.config` either way.
     fn from_step(step: &Step, input: &BTreeMap<String, String>) -> Result<Self> {
         let cfg: DeliverGithubReviewConfig = load(step, ConfigKind::DeliverGithubReview)?;
+        let embedded = cfg.embedded().map_err(|v| anyhow!("step `{}`: `{DELIVER_GITHUB_REVIEW_KIND}` {v}", step.id))?;
         let attribution = cfg.attribution;
         let emit = cfg.emit.map(PathBuf::from);
         // (#2429 part 4) A blank `{{head_sha}}` (the param unset at launch)
@@ -1532,18 +1569,17 @@ impl DeliverConfig {
         // payload as though it were a real sha.
         let head_sha = non_blank(cfg.head_sha);
 
-        if let Some(findings) = cfg.findings {
-            let requires = |key: &str| anyhow!("step `{}`: `{DELIVER_GITHUB_REVIEW_KIND}` requires config.{key}", step.id);
-            let findings: Vec<FindingRecord> = serde_json::from_value(findings)
-                .with_context(|| format!("step `{}`: config.findings", step.id))?;
-            let mods: Vec<GatedMod> = serde_json::from_value(cfg.mods.ok_or_else(|| requires("mods"))?)
-                .with_context(|| format!("step `{}`: config.mods", step.id))?;
-            let diff = cfg.diff.ok_or_else(|| requires("diff"))?;
-            let scope: DeliverScope = match cfg.scope {
-                Some(v) => serde_json::from_value(v).with_context(|| format!("step `{}`: config.scope", step.id))?,
-                None => DeliverScope::default(),
-            };
-            return Ok(Self { findings, mods, diff, scope, attribution, emit, head_sha, absence_backstop: BTreeMap::new() });
+        if let Some(embedded) = embedded {
+            return Ok(Self {
+                findings: embedded.findings,
+                mods: embedded.mods,
+                diff: embedded.diff,
+                scope: embedded.scope,
+                attribution,
+                emit,
+                head_sha,
+                absence_backstop: BTreeMap::new(),
+            });
         }
 
         let gathered = input.values().find_map(|raw| {

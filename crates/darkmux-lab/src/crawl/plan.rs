@@ -90,16 +90,9 @@ impl Default for PlanParams {
 pub fn plan_params(common: &PlanCommon, step_id: &str, kind: &str) -> Result<(PlanParams, bool)> {
     let mut params = PlanParams::default();
     if let Some(sizing) = &common.sizing {
-        for (key, value, slot) in [
-            ("max_sites_per_unit", sizing.max_sites_per_unit, &mut params.max_sites_per_unit),
-            ("max_est_tokens_per_unit", sizing.max_est_tokens_per_unit, &mut params.max_est_tokens_per_unit),
-        ] {
-            let Some(count) = value else { continue };
-            let n = count.as_usize().filter(|n| *n > 0).ok_or_else(|| {
-                anyhow::anyhow!("step `{step_id}`: `{kind}` config.sizing.{key} must be a positive integer, got {}", count.0)
-            })?;
-            *slot = n;
-        }
+        let (sites, tokens) = sizing.limits().map_err(|v| anyhow::anyhow!("step `{step_id}`: `{kind}` {v}"))?;
+        params.max_sites_per_unit = sites.unwrap_or(params.max_sites_per_unit);
+        params.max_est_tokens_per_unit = tokens.unwrap_or(params.max_est_tokens_per_unit);
     }
     Ok((params, !common.no_fetch.is_some_and(|f| f.0)))
 }

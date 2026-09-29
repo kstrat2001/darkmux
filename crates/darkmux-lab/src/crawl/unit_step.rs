@@ -44,7 +44,7 @@ use crate::crawl::plan::{Plan, ReadFileEntry, Site, Unit};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use darkmux_crew::dispatch::{CompactionDispatchArgs, DispatchOpts, DispatchResult};
 use darkmux_crew::rules::{self, Rule};
-use darkmux_crew::step_config::{crawl_identity, load, non_blank, ConfigKind, CrawlUnitConfig};
+use darkmux_crew::step_config::{crawl_identity, load_checked, non_blank, ConfigKind, CrawlUnitConfig};
 use darkmux_crew::step_kinds::{CwdPolicy, Port, SeatClaim, StepKind, StepKindRegistry, StepOutcome, StepRunCtx};
 use darkmux_crew::thermal_governor;
 use darkmux_crew::types::{Step, Task};
@@ -125,23 +125,6 @@ const MAX_UNIT_MAX_TURNS: u32 = 40;
 /// Default no-progress bound (#2193's "N=8"), overridable per step via
 /// `config.no_progress_turns`; `0` disables the check.
 const DEFAULT_NO_PROGRESS_TURNS: usize = 8;
-
-/// (#2310 fix-loop E2, S5-7) The largest `draws` a unit config may name.
-///
-/// A draw is a WHOLE extra dispatch of the same unit — its own container,
-/// its own turn budget, its own tokens — so `draws` multiplies a run's cost
-/// linearly with nothing else in the pipeline bounding it. A mistyped
-/// `--param draws=80` is not a slightly more expensive run; it is an 80x
-/// one whose first visible symptom is an operator watching the same unit go
-/// round for an hour. Refused at config-parse time
-/// ([`UnitStepConfig::from_step`]) rather than clamped: a silently-lowered
-/// value would make the run's own `draws` a lie, and operator sovereignty
-/// says surface the conflict rather than substitute a judgment.
-///
-/// 8 is the ceiling because the technique this ports (the retired funnel's
-/// k-draw recall) never measured past a handful of draws, and a value above
-/// [`UNIT_DRAWS_WARN_ABOVE`] is already warned about as unusual.
-pub const MAX_UNIT_DRAWS: usize = 8;
 
 /// (#2310 fix-loop E2, S5-7) Above this, `run` warns — the value is legal
 /// and honored, but it is far enough outside the measured range that a
@@ -841,78 +824,29 @@ pub struct UnitStepConfig {
 
 impl UnitStepConfig {
     pub fn from_step(step: &Step) -> Result<Self> {
-        let cfg: CrawlUnitConfig = load(step, ConfigKind::CrawlUnit)?;
-        let requires = |key: &str| anyhow!("step `{}`: `{CRAWL_UNIT_KIND}` requires config.{key}", step.id);
-        let plan = non_blank(Some(cfg.plan)).ok_or_else(|| requires("plan"))?;
-        let unit = non_blank(Some(cfg.unit)).ok_or_else(|| requires("unit"))?;
+        let cfg: CrawlUnitConfig = load_checked(step, ConfigKind::CrawlUnit)?;
+        let plan = cfg.plan;
+        let unit = cfg.unit;
         let no_progress_turns = match cfg.no_progress_turns {
             Some(n) => n.as_usize().context("no_progress_turns does not fit usize")?,
             None => DEFAULT_NO_PROGRESS_TURNS,
         };
-        // (#2542 follow-up review) A `--param timeout_seconds=45` reaches
-        // step config as text, which `BlankableCount` reads; a blank one (a
-        // `{{unit_timeout}}` no param supplied, #2595 review round 2,
-        // CONSIDER 6) reads as ABSENT, matching `plan` and `intent_file`.
-        let timeout_seconds = match cfg.timeout_seconds.and_then(|t| t.0) {
-            None => None,
-            Some(n) => {
-                // (#2542 follow-up review) `0` is refused, not accepted as
-                // "unbounded" or silently accepted as "instant kill": it
-                // resolves straight into `timeout_override_seconds`, which
-                // `effective_inactivity_timeout_seconds` treats as an
-                // already-elapsed inactivity deadline — the host watchdog
-                // kills the unit at its first poll. Mirrors `darkmux
-                // dispatch --timeout`'s own `range(1..)` clap validator
-                // (src/cli.rs, #2480 review blocker 6), which refused `0`
-                // for exactly this reason on the CLI path; a config-file
-                // route to the same field gets the same floor.
-                // (Second-round frontier review of #2610) No upper bound
-                // here, matching the CLI flag's own `1..` — deliberately.
-                // A crawl unit is a whole coding task an operator names in
-                // a mission config; how long that reasonably takes is the
-                // operator's own open-ended call, same as `--timeout`. The
-                // tool-bench workload provider's `taskTimeoutSeconds`
-                // manifest key sets this SAME `timeout_override_seconds`
-                // field but narrows to 30-3600 seconds — see that call
-                // site's own comment for why (one quick per-axis probe
-                // task inside a fixed bench sweep, not an open-ended unit).
-                anyhow::ensure!(
-                    n.0 >= 1,
-                    "step `{}`: `{CRAWL_UNIT_KIND}` config.timeout_seconds must be >= 1 — `0` \
-                     resolves to an already-expired inactivity deadline (an instant kill), not \
-                     'unbounded'. Omit `timeout_seconds` for the standing env/config/600 default, \
-                     or set a real positive bound.",
-                    step.id
-                );
-                Some(n.saturating_u32())
-            }
-        };
+        // A `--param timeout_seconds=45` reaches step config as text, which
+        // `BlankableCount` reads; a blank one (a `{{unit_timeout}}` no param
+        // supplied) reads as ABSENT, matching `plan` and `intent_file`. `0`
+        // was refused when the config loaded (`CrawlUnitConfig`'s rules).
+        let timeout_seconds = cfg.timeout_seconds.and_then(|t| t.0).map(|n| n.saturating_u32());
         // Empty-string filtered (matches `plan`'s convention above): an
         // unresolved `{{intent_file}}` template on a launch with no
         // `intent_file` param renders as `""`, which must read as ABSENT,
         // not as a path to read-and-fail-and-warn about on every run.
         let intent_file = non_blank(cfg.intent_file).map(PathBuf::from);
-        // (#2310 P4c-2b) `--param draws=3` reaches step config as text, which
-        // `Count` reads.
+        // `--param draws=3` reaches step config as text, which `Count`
+        // reads; the floor and the `MAX_UNIT_DRAWS` ceiling were checked on
+        // the PARSED value when the config loaded.
         let draws = match cfg.draws {
             None => 1,
-            Some(n) => {
-                anyhow::ensure!(n.0 >= 1, "step `{}`: `{CRAWL_UNIT_KIND}` config.draws must be >= 1, got {}", step.id, n.0);
-                // (#2310 fix-loop E2, S5-7) The ceiling, checked on the
-                // PARSED value so the text form (`--param draws=99`, which
-                // is the shape an operator actually types) is capped
-                // identically to the numeric one.
-                anyhow::ensure!(
-                    n.0 <= MAX_UNIT_DRAWS as u64,
-                    "step `{}`: `{CRAWL_UNIT_KIND}` config.draws is {}, above the cap of {MAX_UNIT_DRAWS} \
-                     — every draw is a whole extra dispatch of this same unit, so this run would cost \
-                     {}x its own wall clock and tokens. Lower `draws`, or split the work across units.",
-                    step.id,
-                    n.0,
-                    n.0
-                );
-                n.as_usize().context("draws does not fit usize")?
-            }
+            Some(n) => n.as_usize().context("draws does not fit usize")?,
         };
         Ok(Self { plan, unit, rule: cfg.rule, no_progress_turns, timeout_seconds, intent_file, draws })
     }

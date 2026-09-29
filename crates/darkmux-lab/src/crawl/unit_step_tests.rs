@@ -9,6 +9,7 @@
 //! or `DARKMUX_MODS_DIR` cannot make these tests share one directory.
 
 use super::*;
+use darkmux_crew::step_config::MAX_UNIT_DRAWS;
 use darkmux_crew::types::{NodeStatus, Phase, PhaseStatus};
 use darkmux_trajectory::TrajectoryFold;
 use std::fs;
