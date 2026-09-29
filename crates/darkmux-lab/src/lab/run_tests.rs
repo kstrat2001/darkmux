@@ -152,7 +152,7 @@ impl Lab {
     /// The sandbox a scripted workload's run is cloned from (no
     /// `requires_fixture`, so the `sandboxes/<id>` fallback).
     fn source_sandbox(&self, workload: &str) -> std::path::PathBuf {
-        paths::resolve(ResolveScope::Auto).sandboxes.join(workload)
+        paths::resolve(ResolveScope::ForceUser).sandboxes.join(workload)
     }
 
     pub(crate) fn scripted(workloads: &[&str]) -> Self {

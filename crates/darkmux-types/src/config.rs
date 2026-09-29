@@ -2176,13 +2176,8 @@ impl DarkmuxConfig {
     /// load path; a bad config must never brick the CLI — accessors fall through
     /// to env/built-in defaults).
     ///
-    /// (#1323) `ForceUser`, NOT `Auto`: config.json carries user/machine-level
-    /// state (redis/audit/lms/machine_id) — there is no legitimate per-project
-    /// config. Under `Auto`, the mere existence of a `<cwd>/.darkmux/` created
-    /// for an unrelated purpose (project-tier missions/phases/lessons) silently
-    /// resolved the "home" to the project dir, defaulting redis+audit OFF — a
-    /// real audit-trail hole on a self-hosted-runner checkout. Same shadowing
-    /// class as #1012/#1016; this is the config/flow-sink resolution path.
+    /// config.json carries user/machine-level state (redis/audit/lms/machine_id):
+    /// there is no per-project config, and a `<cwd>/.darkmux/` never shadows it.
     pub fn load_resolved() -> Self {
         let path = crate::paths::resolve(crate::paths::ResolveScope::ForceUser).config;
         Self::load_from(&path)
@@ -2207,9 +2202,9 @@ mod tests {
     /// `.darkmux/config.json` (created for missions/phases/lessons) must NEVER
     /// shadow the user-scope config. `DARKMUX_HOME` is UNSET on purpose — with it
     /// set, `paths::resolve` short-circuits to the same root for every scope, so
-    /// Auto and ForceUser wouldn't diverge and this guard would be hollow. If
-    /// `load_resolved` regresses to `ResolveScope::Auto`, it reads the project
-    /// shadow → the marker → this fails.
+    /// the project and user scopes wouldn't diverge and this guard would be
+    /// hollow. If `load_resolved` regresses to `ResolveScope::ForceProject`, it
+    /// reads the project shadow → the marker → this fails.
     #[serial_test::serial]
     #[test]
     fn config_load_resolved_ignores_project_darkmux_shadow() {
@@ -2227,9 +2222,8 @@ mod tests {
         unsafe { env::remove_var("DARKMUX_HOME") };
         env::set_current_dir(proj.path()).unwrap();
 
-        // Sanity: in THIS setup Auto and ForceUser genuinely diverge (Auto sees
-        // the project shadow), so the guard below actually exercises the choice.
-        let auto = crate::paths::resolve(crate::paths::ResolveScope::Auto).config;
+        // Sanity: in THIS setup the project and user scopes genuinely diverge, so the guard below actually exercises the choice.
+        let auto = crate::paths::resolve(crate::paths::ResolveScope::ForceProject).config;
         let force_user = crate::paths::resolve(crate::paths::ResolveScope::ForceUser).config;
         let cfg = DarkmuxConfig::load_resolved();
 
@@ -2242,9 +2236,9 @@ mod tests {
 
         assert_ne!(
             auto, force_user,
-            "sanity: with a project .darkmux/ and no DARKMUX_HOME, Auto must diverge from ForceUser"
+            "sanity: with a project .darkmux/ and no DARKMUX_HOME, the project scope must diverge from ForceUser"
         );
-        // The real guard: under the pre-#1323 `Auto`, load_resolved reads the
+        // The real guard: under the project scope, load_resolved reads the
         // project shadow → the marker → FAIL. Under `ForceUser` it never does.
         assert_ne!(
             cfg.machine_id.as_deref(),

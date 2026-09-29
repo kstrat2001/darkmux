@@ -22,27 +22,11 @@
 //! checkout's templates" is one env var away, deliberately, rather than an
 //! accident of `pwd`.
 //!
-//! **(#2590) The USER tier is now ALSO not cwd-sensitive.** #2553 closed only
-//! the on-disk tier above and left the user tier deliberately open, tracked
-//! separately: `lab::run::lab_run` and `lab::run::lab_workloads` both passed
-//! `paths::resolve(ResolveScope::Auto)`'s root as the workload user dir, which
-//! still returns `<cwd>/.darkmux` whenever that directory exists — so a
-//! `./.darkmux/workloads/<id>.json` could still silently outrank the embedded
-//! workload of the same id, and a cwd-only id could still resolve and appear
-//! in `lab workload list`, byte-for-byte the bug class #1012 closed for
-//! crew/mission state and #2432 closed for mission configs' own user tier.
-//! Two pieces of prior art in this crate already assumed the fix rather than
-//! the bug: `providers::coding_task`'s setupContent-key validation and its
-//! module doc both describe operator-installed workloads as living at
-//! `~/.darkmux/workloads/<id>.json` — home, unconditional, no cwd branch.
-//! Closed the same way: `lab_run` and `lab_workloads` now resolve the
-//! workload user dir via a SEPARATE `paths::resolve(ResolveScope::ForceUser)`
-//! call, not the `Auto`-resolved `paths` those functions also use for
-//! run-artifact placement (`config_access::lab_dir()`, independent and
-//! unchanged) and sandbox/fixture-registry lookup (`paths.sandboxes`,
-//! also unchanged) — both of which stay deliberately project-local. Only the
-//! workload id → document lookup moved to `ForceUser`; see `lab::run::lab_run`'s
-//! own doc comment for the split.
+//! The USER tier is not cwd-sensitive either: `lab::run::lab_run` and
+//! `lab::run::lab_workloads` pass `paths::resolve(ResolveScope::ForceUser)`'s
+//! root (`DARKMUX_HOME` when set, else `~/.darkmux`) as the workload user dir,
+//! and a `./.darkmux/workloads/<id>.json` is never read (it is named in the
+//! "not found" error instead).
 
 use crate::workloads::types::{LoadedWorkload, WorkloadManifest, WorkloadSource};
 use anyhow::{Context, Result, anyhow, bail};
@@ -187,37 +171,19 @@ pub(crate) fn load(id: &str, user_dir: Option<&Path>) -> Result<LoadedWorkload> 
 /// Callers only reach this from [`load`]'s "not found" tail, after every
 /// other tier (user, on-disk, embedded) already failed to resolve `id`.
 ///
-/// (MUST FIX, third-round frontier review) An earlier version of this
-/// function took `user_dir: Option<&Path>` and short-circuited to `None`
-/// up front whenever `user_dir == Some(auto_root)`, with a doc comment
-/// claiming THAT equality check was what enforced "only fires when a
-/// project-local `.darkmux` is genuinely being bypassed". It wasn't: when
-/// `user_dir` equals the `ResolveScope::Auto`-resolved root (no
-/// project-local `.darkmux/` exists, or `DARKMUX_HOME` is set — see
-/// `darkmux_types::paths::resolve`), `auto_root.join("workloads")` is the
-/// BYTE-IDENTICAL path `load` already searched for this exact `id` at its
-/// own top (`find_in_dir(&user_dir.join("workloads"), id)`) and already
-/// failed to find anything in — so the fallback `find_in_dir` call below
-/// was *already* guaranteed to return `None` again in that case, with or
-/// without the equality check. Deleting the whole equality-check block
-/// changed no observable behavior (confirmed: every existing test for
-/// this function still passes with it removed), which is the proof it was
-/// dead — a defensive-looking guard that claimed to be load-bearing but
-/// wasn't. The real reason a false-positive note can't fire is structural:
-/// this function only ever returns `Some` when the id resolves under
-/// `auto_root` in a lookup `load` had not already performed and failed —
-/// i.e. genuinely, not merely apparently, bypassed. `user_dir` itself adds
-/// nothing this function needs, so the parameter is gone too.
+/// The signpost for a workload document that exists only under the working
+/// directory's own `./.darkmux/workloads/`. 4.0 no longer reads a project-local
+/// `.darkmux/`, so such a document is ignored; the note names it and how to
+/// use it. It only fires after `load` failed to find `id` at the root, so the
+/// document it names is genuinely the one being bypassed.
 fn ignored_project_local_note(id: &str) -> Option<String> {
-    let auto_root = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::Auto).root;
-    let project_workloads = auto_root.join("workloads");
+    let project_workloads = env::current_dir().ok()?.join(".darkmux").join("workloads");
     let found = find_in_dir(&project_workloads, id)?;
     Some(format!(
-        "Note: `{id}` exists at {} but is ignored — the workload user tier \
-         resolves to the home directory unconditionally (#2590), never the \
-         current directory's own `.darkmux/`. Move it to \
-         ~/.darkmux/workloads/{id}.json (or export DARKMUX_HOME to point at \
-         a different root) if you want darkmux to use it.",
+        "Note: `{id}` exists at {} but is ignored: darkmux no longer reads a \
+         project-local `.darkmux/` (4.0). Move it to \
+         ~/.darkmux/workloads/{id}.json, or export DARKMUX_HOME=<dir> to make \
+         that directory the root.",
         display_under_cwd(&found),
     ))
 }
@@ -926,19 +892,7 @@ mod tests {
         let _home_guard = EnvVarGuard::set("HOME", home_tmp.path());
         let _templates_guard =
             EnvVarGuard::set("DARKMUX_TEMPLATES_DIR", home_tmp.path().join("nope"));
-        // (MUST FIX, third-round frontier review) `ignored_project_local_note`
-        // calls `paths::resolve(ResolveScope::Auto)`, which checks
-        // `DARKMUX_HOME` BEFORE it ever looks at cwd's own `.darkmux/` (see
-        // that function's own doc). An ambient `DARKMUX_HOME` in the shell
-        // running `cargo test` — not unusual on this project, which asks
-        // contributors to export it for flow provenance — would make
-        // `auto_root` resolve to that override instead of `cwd_tmp`'s
-        // project-local `.darkmux/`, so the note would never find the
-        // planted document and this test would fail red for an operator
-        // with it exported, even though nothing here is actually broken.
-        // CI never sets `DARKMUX_HOME`, so CI would never catch this drift.
-        // Same clear-guard pattern as `lab::run`'s `RealHomeGuard`, which
-        // documents the identical reasoning for the identical hazard.
+        // An ambient `DARKMUX_HOME` would relocate the root; clear it.
         let _darkmux_home_guard = EnvVarGuard::set("DARKMUX_HOME", "");
 
         let cwd_tmp = TempDir::new().unwrap();
@@ -949,9 +903,7 @@ mod tests {
         let _cwd_guard = CwdGuard::new(cwd_tmp.path());
 
         // Mirrors what `lab_run`/`lab_workloads`/`lab_inspect` actually pass:
-        // the `ResolveScope::ForceUser`-resolved root — home-tier,
-        // unconditionally — which here differs from what `Auto` would
-        // resolve from cwd (the project-local `.darkmux` just planted).
+        // the `ResolveScope::ForceUser`-resolved root.
         let forced_user_root = home_tmp.path().join(".darkmux");
         let err = load("cwd-only-ignored", Some(&forced_user_root)).unwrap_err();
         let msg = err.to_string();
@@ -962,23 +914,8 @@ mod tests {
         );
     }
 
-    /// The counterpart: when `user_dir` (the `ForceUser` root) already IS
-    /// what `Auto` resolves to — no project-local `.darkmux` exists in cwd
-    /// at all — nothing should be claimed as "ignored".
-    ///
-    /// (MUST FIX, third-round frontier review — corrected claim) This test
-    /// used to claim it also "guards against a note that fires whenever
-    /// ANY document exists at that id, whether or not it's actually the
-    /// document that's being bypassed" — it doesn't, and can't: nothing is
-    /// planted anywhere in this test, so there's no document for a
-    /// false-positive note to accidentally pick up in the first place.
-    /// What this test actually pins is narrower and still real: the "no
-    /// project `.darkmux` exists" shape produces no note. The broader
-    /// "genuinely bypassed, not merely apparently" guarantee is structural
-    /// (see `ignored_project_local_note`'s own doc) — it follows from
-    /// `load`'s fallback lookup being the byte-identical call `load`
-    /// already tried and failed, not from anything a black-box test on an
-    /// empty directory can additionally demonstrate.
+    /// The counterpart: no project-local `.darkmux` in cwd, so nothing is
+    /// claimed as "ignored".
     #[test]
     #[serial_test::serial]
     fn not_found_stays_bare_when_nothing_is_actually_ignored() {
@@ -991,8 +928,7 @@ mod tests {
         // shell it runs in.
         let _darkmux_home_guard = EnvVarGuard::set("DARKMUX_HOME", "");
 
-        // No project-local `.darkmux` anywhere in cwd — Auto falls back to
-        // the same home root ForceUser already resolved and searched.
+        // No project-local `.darkmux` anywhere in cwd.
         let cwd_tmp = TempDir::new().unwrap();
         let _cwd_guard = CwdGuard::new(cwd_tmp.path());
 

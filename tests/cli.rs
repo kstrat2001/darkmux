@@ -24,7 +24,7 @@ use tempfile::TempDir;
 // subprocess, so nothing about being launched FROM a test makes the
 // child read a test-shaped configuration. `DARKMUX_HOME` is the FIRST
 // tier of `paths::resolve` (`crates/darkmux-types/src/paths.rs`);
-// without it the child resolves `./.darkmux` and then the developer's
+// without it the child resolves the developer's
 // actual `~/.darkmux`, and every accessor that has no test-build guard
 // of its own (`crew_dir_override`, `fleet_file`,
 // `identity_path_override`, `ack_dir_override`) then reads and WRITES
@@ -416,11 +416,8 @@ fn darkmux_cmd() -> Command {
 /// `darkmux_std_cmd()` is untouched, so the `dirs::home_dir()` accessors
 /// (`fleet_file` and friends) still cannot reach the operator.
 ///
-/// Setting `DARKMUX_HOME` rather than relying on `paths::resolve`'s
-/// project tier finding `./.darkmux` on its own is deliberate: the two
-/// resolve to the identical set of paths (only `DarkmuxPaths::scope`
-/// differs, which no production code reads), and an explicit value can't
-/// be defeated by an inherited one.
+/// `DARKMUX_HOME` is the one relocation (a `./.darkmux` is never adopted on
+/// its own), and an explicit value can't be defeated by an inherited one.
 fn darkmux_cmd_in_project(dir: &std::path::Path) -> Command {
     let mut cmd = darkmux_cmd();
     cmd.current_dir(dir).env("DARKMUX_HOME", dir.join(".darkmux"));
@@ -439,9 +436,8 @@ fn darkmux_cmd_in_project(dir: &std::path::Path) -> Command {
 /// `DARKMUX_HOME`, so a helper that kept only the `DARKMUX_HOME` half
 /// fails here rather than passing.
 ///
-/// The child's cwd is a fresh tempdir so the `./.darkmux` tier of
-/// `paths::resolve` cannot quietly absorb the write and turn a real
-/// regression into a green run.
+/// The child's cwd is a fresh tempdir, so a write that fell through to the cwd
+/// shows up as a `./.darkmux` there.
 #[test]
 fn darkmux_cmd_keeps_a_child_out_of_the_process_home() {
     let mut cmd = darkmux_std_cmd();
@@ -514,8 +510,8 @@ fn darkmux_cmd_keeps_a_child_out_of_the_process_home() {
     );
     assert!(
         !empty_cwd.path().join(".darkmux").exists(),
-        "(#2184) the child fell through to the project-local `./.darkmux` tier of \
-         paths::resolve instead of the helper's root"
+        "(#2184) the child wrote a `./.darkmux` in its cwd instead of the \
+         helper's root"
     );
 }
 
@@ -2178,9 +2174,8 @@ fn lab_run_quick_q_from_clean_cwd_uses_embedded_workload() {
     )
     .unwrap();
 
-    // Force project-scope path resolution: paths::resolve(Auto) falls back to
-    // ~/.darkmux/ when `./.darkmux/` is absent. Pre-create the project dir so
-    // the test writes to the tempdir, not the user's home.
+    // Pre-create the project dir; `darkmux_cmd_in_project` points DARKMUX_HOME
+    // at it so the test writes to the tempdir, not the user's home.
     fs::create_dir_all(tmp.path().join(".darkmux")).unwrap();
 
     let mut cmd = darkmux_cmd_in_project(tmp.path());

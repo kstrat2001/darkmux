@@ -1,10 +1,11 @@
 //! Resolves the active darkmux workspace directory.
 //!
-//!   1. ./.darkmux/         — project-local (preferred when present)
-//!   2. ~/.darkmux/         — cross-project user state (fallback)
+//!   1. `$DARKMUX_HOME`     — the one relocation
+//!   2. `~/.darkmux/`       — the default
 //!
-//! Lab runs, sandboxes, profiles, and crews all live under one
-//! of these. Relative paths only — never absolute paths in any shipped
+//! A `./.darkmux/` in the working directory is never consulted: it does not
+//! move the root (4.0). Lab runs, sandboxes, profiles, and crews all live under
+//! the root. Relative paths only — never absolute paths in any shipped
 //! manifest.
 
 use anyhow::{Context, Result};
@@ -43,15 +44,11 @@ pub struct DarkmuxPaths {
     pub scope: Scope,
 }
 
-/// `ForceProject` / `ForceUser` are used in tests (which the release-mode
-/// dead-code lint doesn't see) and reserved for explicit-override
-/// callers (e.g. an agent that wants to resolve a specific scope
-/// regardless of the default Auto-resolve).
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, Default)]
+/// Which root [`resolve`] returns. There is no auto-detecting variant: a
+/// `./.darkmux/` in the working directory never becomes the root on its own.
+/// `ForceProject` exists for the per-repo lessons database only.
+#[derive(Debug, Clone, Copy)]
 pub enum ResolveScope {
-    #[default]
-    Auto,
     ForceProject,
     ForceUser,
 }
@@ -175,10 +172,25 @@ pub fn test_isolated_dir(name: &str) -> PathBuf {
     test_isolated_root().join(name)
 }
 
+/// A `./.darkmux/` in the working directory that darkmux is NOT using as its
+/// root. 4.0 dropped project-local discovery, so such a directory is inert
+/// (bar the per-repo `lessons.db`); `darkmux doctor` reports it and names
+/// `DARKMUX_HOME` as the way to adopt it. `None` when the cwd has no such
+/// directory or `DARKMUX_HOME` already points at it.
+pub fn ignored_project_dir() -> Option<PathBuf> {
+    let project = env::current_dir().ok()?.join(".darkmux");
+    if !project.is_dir() {
+        return None;
+    }
+    let root = resolve(ResolveScope::ForceUser).root;
+    let same = |a: &PathBuf, b: &PathBuf| fs::canonicalize(a).ok() == fs::canonicalize(b).ok();
+    (!same(&project, &root)).then_some(project)
+}
+
 pub fn resolve(scope: ResolveScope) -> DarkmuxPaths {
     // (#661) DARKMUX_HOME is the bootstrap pointer — it overrides the darkmux
     // root directory entirely (a relocated install, or test isolation), and
-    // wins over the project/user auto-resolve below. The pointer can't live
+    // wins over the user default below. The pointer can't live
     // inside the config it locates, so it stays a direct env read. Tilde-
     // expanded for ergonomics.
     #[cfg(any(test, feature = "test-support"))]
@@ -200,13 +212,6 @@ pub fn resolve(scope: ResolveScope) -> DarkmuxPaths {
     let (chosen, chosen_scope) = match scope {
         ResolveScope::ForceProject => (project_root, Scope::Project),
         ResolveScope::ForceUser => (user_root, Scope::User),
-        ResolveScope::Auto => {
-            if project_root.exists() {
-                (project_root, Scope::Project)
-            } else {
-                (user_root, Scope::User)
-            }
-        }
     };
 
     paths_from_root(chosen, chosen_scope)
@@ -268,8 +273,7 @@ mod tests {
     /// (#2643) `resolve` reads `DARKMUX_HOME` FIRST, unconditionally,
     /// BEFORE it ever looks at `scope` — so an ambient `DARKMUX_HOME` in
     /// the shell running `cargo test` silently pre-empts every scope this
-    /// module exercises (`ForceProject`, `ForceUser`, and `Auto`'s own
-    /// cwd-vs-home branch), not just `resolve_honors_darkmux_home_override`,
+    /// module exercises (`ForceProject` and `ForceUser`), not just `resolve_honors_darkmux_home_override`,
     /// which means to test the override itself. Reproduced directly:
     /// `DARKMUX_HOME=/tmp/w24a-scratch-home cargo test -p darkmux-types
     /// --lib paths::tests` failed `resolve_force_project_uses_cwd`,
@@ -340,49 +344,41 @@ mod tests {
         assert!(paths.root.ends_with(".darkmux"));
     }
 
+    /// 4.0: a `./.darkmux/` in the working directory never becomes the root.
+    /// The cwd holds one here and only the explicit `ForceProject` scope sees it.
     #[serial_test::serial]
     #[test]
-    fn resolve_auto_prefers_project_when_present() {
+    fn resolve_ignores_a_project_darkmux_dir() {
         let _clear_home = ClearDarkmuxHomeGuard::new();
         let tmp = TempDir::new().unwrap();
-        let project_root = tmp.path().join(".darkmux");
-        fs::create_dir_all(&project_root).unwrap();
-        let canonical_tmp = std::fs::canonicalize(tmp.path()).unwrap();
-
+        fs::create_dir_all(tmp.path().join(".darkmux")).unwrap();
         let prev = env::current_dir().unwrap();
         env::set_current_dir(tmp.path()).unwrap();
 
-        let paths = resolve(ResolveScope::Auto);
-        assert_eq!(paths.scope, Scope::Project);
-        assert!(
-            paths.root.starts_with(&canonical_tmp) || paths.root.starts_with(tmp.path()),
-            "root {:?} doesn't start with canonical tmp {:?}",
-            paths.root,
-            canonical_tmp
-        );
+        let user = resolve(ResolveScope::ForceUser);
+        let project = resolve(ResolveScope::ForceProject);
+        let ignored = ignored_project_dir();
 
         env::set_current_dir(prev).unwrap();
+        assert_eq!(user.scope, Scope::User);
+        assert_ne!(user.root, project.root, "the cwd dir is not the user root");
+        assert!(ignored.is_some_and(|p| p.ends_with(".darkmux")));
     }
 
     #[serial_test::serial]
     #[test]
-    fn resolve_auto_falls_back_to_user_when_project_missing() {
-        // (#2643) Didn't hard-fail under an ambient `DARKMUX_HOME` in the
-        // repro run above (the override happens to also land on
-        // `Scope::User`), but that is a VACUOUS pass, not a real one — the
-        // assertion would still go green even if the actual fallback
-        // branch this test names were broken. Same guard as the three
-        // tests above, for the same reason.
-        let _clear_home = ClearDarkmuxHomeGuard::new();
+    fn no_ignored_project_dir_when_the_cwd_has_none_or_home_relocates() {
         let tmp = TempDir::new().unwrap();
-        // Crucially do NOT create .darkmux in tmp.
         let prev = env::current_dir().unwrap();
         env::set_current_dir(tmp.path()).unwrap();
-
-        let paths = resolve(ResolveScope::Auto);
-        assert_eq!(paths.scope, Scope::User);
-
+        let _clear_home = ClearDarkmuxHomeGuard::new();
+        let none = ignored_project_dir();
+        fs::create_dir_all(tmp.path().join(".darkmux")).unwrap();
+        unsafe { env::set_var("DARKMUX_HOME", tmp.path().join(".darkmux")) };
+        let adopted = ignored_project_dir();
         env::set_current_dir(prev).unwrap();
+        assert_eq!(none, None);
+        assert_eq!(adopted, None, "DARKMUX_HOME pointing at the cwd dir is the documented way to use it");
     }
 
     #[serial_test::serial]
@@ -393,9 +389,8 @@ mod tests {
         let prev = env::var("DARKMUX_HOME").ok();
         unsafe { env::set_var("DARKMUX_HOME", &custom_root); }
 
-        // DARKMUX_HOME (#661) wins over the project/user auto-resolve and IS
-        // the root directly — config + profiles hang off it.
-        let paths = resolve(ResolveScope::Auto);
+        // DARKMUX_HOME (#661) IS the root directly — config + profiles hang off it.
+        let paths = resolve(ResolveScope::ForceUser);
         assert_eq!(paths.root, custom_root, "DARKMUX_HOME overrides the root");
         assert_eq!(paths.config, custom_root.join("config.json"));
         assert_eq!(paths.profiles, custom_root.join("profiles.json"));

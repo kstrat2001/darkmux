@@ -43,6 +43,6 @@ After listing, suggest the natural next steps to the user:
 
 ## Notes
 
-- Reads `.darkmux/runs/` (project-local) or `~/.darkmux/runs/` (user-global), depending on which is present in the current directory tree.
+- Reads `~/.darkmux/runs/` (`$DARKMUX_HOME/runs/` when that is set); a `./.darkmux/` in the cwd is never read.
 - "(no runs found under .darkmux/runs/)" means no dispatches have been recorded via `darkmux lab run` yet. Suggest `darkmux-lab-run <workload>` to create one.
 - Run dirs without a `manifest.json` are silently skipped (they typically come from interrupted dispatches).

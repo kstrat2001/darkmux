@@ -101,9 +101,9 @@ pub struct ImportStats {
 /// Per-repo (engagement-scoped) lessons db: `<repo>/.darkmux/lessons.db`.
 /// The engagement boundary for a coder dispatch is the repo it edits, so each
 /// engagement's lessons live in its own tree — a dispatch in repo X can
-/// never see repo Y's. Resolved via the PROJECT scope (cwd-relative), NOT
-/// `Auto` — `Auto` falls back to the user-global root when no project
-/// `.darkmux/` exists, which is the cross-engagement bleed this design avoids.
+/// never see repo Y's. Resolved via the PROJECT scope (cwd-relative), never
+/// the user root, so lessons cannot bleed across engagements. This is the one
+/// reader of a project-local `.darkmux/`.
 pub fn repo_db_path() -> PathBuf {
     resolve(ResolveScope::ForceProject).root.join("lessons.db")
 }

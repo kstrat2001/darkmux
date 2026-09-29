@@ -259,7 +259,7 @@ fn crawl_root_from_record_context(record_context: Option<&serde_json::Value>) ->
     if !valid_crawl_manifest_name(manifest_name) {
         return None;
     }
-    let root = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::Auto).root;
+    let root = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).root;
     Some(root.join("crawl").join(manifest_name))
 }
 
@@ -3078,7 +3078,7 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn no_workspace_value_can_escape_the_crawl_root() {
-        let root = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::Auto).root;
+        let root = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).root;
         let crawl_root = root.join("crawl");
 
         let corpus = [
@@ -3213,7 +3213,7 @@ mod tests {
     fn very_long_name_is_contained_even_though_accepted() {
         let name = "a".repeat(4096);
         let ctx = serde_json::json!({ "workspace": name, "unit": "u1" });
-        let root = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::Auto).root;
+        let root = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).root;
         let path = stop_file_path_from_record_context(Some(&ctx)).unwrap();
         assert!(path.starts_with(root.join("crawl")));
     }

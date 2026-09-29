@@ -381,19 +381,14 @@ fn split_gitdir_at(dir: &Path) -> Option<SplitGitdir> {
 /// Probed and confirmed broken (a `DARKMUX_HOME` tempdir still resolved to the
 /// real `~/.darkmux/worktrees`) before this fix.
 ///
-/// **`ForceUser`, deliberately — NOT the `Auto` its sibling defaults use.**
-/// `Auto` would prefer a project-local `./.darkmux` when the process happens
-/// to be standing in one, making this base CWD-DEPENDENT. That is unacceptable
-/// here specifically because this value feeds a SECURITY check: the daemon's
-/// `worktree_contained` / `validate_remote_workdir` containment test (#840)
-/// compares a tailnet-supplied workdir against this base, and `darkmux serve`
-/// (whose cwd is wherever the operator launched it) must agree with
-/// `coder_phase` (whose cwd is the repo) about what "the worktrees base" IS.
-/// Under `Auto` those two disagree exactly when one of them stands in a repo
-/// carrying a `./.darkmux` — which `lessons.rs` creates in every repo a coder
-/// dispatch has recorded a lesson in. `ForceUser` still honors `DARKMUX_HOME`
-/// (that branch short-circuits ahead of the scope match), which is the whole
-/// bug being fixed, while keeping the base a single per-machine constant.
+/// **`ForceUser`: the base is never CWD-DEPENDENT.** This value feeds a
+/// SECURITY check: the daemon's `worktree_contained` /
+/// `validate_remote_workdir` containment test (#840) compares a
+/// tailnet-supplied workdir against this base, and `darkmux serve` (whose cwd
+/// is wherever the operator launched it) must agree with `coder_phase` (whose
+/// cwd is the repo) about what "the worktrees base" IS. `ForceUser` honors
+/// `DARKMUX_HOME` (that branch short-circuits ahead of the scope match) and
+/// keeps the base a single per-machine constant.
 ///
 /// The single canonical implementation — previously triplicated across
 /// `coder_phase.rs`, this module, and `darkmux-serve/src/lib.rs`, two of

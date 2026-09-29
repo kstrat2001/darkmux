@@ -292,11 +292,11 @@ pub fn audit_dir() -> PathBuf {
 /// override would still (were `audit.enabled` on) write the hash-chained
 /// audit trail into the operator's REAL `~/.darkmux/audit`. Derived from the
 /// SAME root resolution every sibling darkmux directory resolves through —
-/// `darkmux_types::paths::resolve(Auto)`, which honors `DARKMUX_HOME` and a
-/// project-local `./.darkmux` before `~/.darkmux`.
+/// `darkmux_types::paths::resolve`, which honors `DARKMUX_HOME` before
+/// `~/.darkmux`.
 #[cfg(not(any(test, feature = "test-support")))]
 fn audit_dir_default() -> PathBuf {
-    darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::Auto)
+    darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser)
         .root
         .join("audit")
 }
@@ -309,7 +309,7 @@ fn audit_dir_default() -> PathBuf {
 /// verbatim, because a test that isolated itself means it.
 #[cfg(any(test, feature = "test-support"))]
 fn audit_dir_default() -> PathBuf {
-    let resolved = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::Auto);
+    let resolved = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser);
     let real_user_root = dirs::home_dir().map(|h| h.join(".darkmux"));
     if real_user_root.as_ref() == Some(&resolved.root) {
         return darkmux_types::paths::test_isolated_dir("audit");

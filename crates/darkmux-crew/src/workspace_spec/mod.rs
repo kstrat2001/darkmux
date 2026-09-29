@@ -511,7 +511,7 @@ impl WorkspaceSpec {
                  `root:` if you meant to place it somewhere specific"
             );
         }
-        Ok(darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::Auto)
+        Ok(darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser)
             .root
             .join("workspaces")
             .join(name))

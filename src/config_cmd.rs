@@ -271,11 +271,9 @@ const SECRET_KEYS: &[(&str, &str)] = &[
 /// no value (it describes the key, and still fails a script that forgot the
 /// value, as the old missing-argument usage error did; #2947 review C7).
 pub fn run(cmd: ConfigCmd) -> Result<i32> {
-    // (#1323) ForceUser, not Auto — `darkmux config get/set/list` operates on
-    // the user-scope config.json, matching `DarkmuxConfig::load_resolved`. Under
-    // Auto a stray project-local `.darkmux/` (missions/phases/lessons) would
-    // silently redirect reads/writes to the wrong file. Config is user/machine-
-    // level; there is no legitimate per-project config.
+    // `darkmux config get/set/list` operates on the user-scope config.json,
+    // matching `DarkmuxConfig::load_resolved`. Config is user/machine-level;
+    // there is no per-project config.
     let path = resolve(ResolveScope::ForceUser).config;
     match cmd {
         ConfigCmd::Set { key, value: Some(value) } => {

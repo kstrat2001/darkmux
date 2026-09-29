@@ -210,6 +210,7 @@ pub fn run() -> DoctorReport {
         check_role_tool_vocab_typos(),
         check_beat33_legacy_crew_dir(),
         check_flat_mission_files(),
+        check_ignored_project_darkmux(),
         check_mission_envelope_readability(),
     ]);
     let checks = [checks, check_enum_settings(), check_user_file_keys(), check_hooks(), eureka_checks()].concat();
@@ -392,6 +393,22 @@ fn installed_skill_content(targets: &[PathBuf], name: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// (4.0) A `./.darkmux/` in the working directory. Earlier releases adopted it
+/// as the darkmux root and split flows, lab runs and profiles from missions;
+/// 4.0 ignores it. Warn, naming the directory and the one relocation.
+fn check_ignored_project_darkmux() -> Check {
+    let name = "project-local .darkmux".to_string();
+    let Some(dir) = darkmux_types::paths::ignored_project_dir() else {
+        return Check { name, status: Status::Pass, message: "no ignored ./.darkmux in the working directory".into(), hint: None };
+    };
+    Check {
+        name,
+        status: Status::Warn,
+        message: format!("{} is ignored: darkmux no longer adopts a project-local .darkmux as its root (only its per-repo lessons.db is read)", dir.display()),
+        hint: Some(format!("to use it as the root, run darkmux with DARKMUX_HOME={}; otherwise move what you need to ~/.darkmux", dir.display())),
+    }
 }
 
 /// (4.0) Pre-#148 flat mission files: `<root>/missions/<id>.json` and
@@ -3622,7 +3639,7 @@ fn check_thermal_governor() -> Option<Check> {
 /// deliberately kept is not a defect, and deciding when evidence has
 /// served its purpose is the operator's call (#44), not doctor's.
 fn check_quarantined_mirrors() -> Check {
-    let workspaces = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::Auto)
+    let workspaces = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser)
         .root
         .join("workspaces");
     quarantined_mirrors_check_at(&workspaces)
@@ -4489,7 +4506,7 @@ fn check_crew_role_prompt_coverage() -> Check {
 /// nobody's manifest currently references would otherwise go unchecked
 /// forever).
 fn check_rules_registry() -> Check {
-    let user_dir = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::Auto)
+    let user_dir = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser)
         .root
         .join("rules");
     build_rules_check(Some(&user_dir))
@@ -9330,86 +9347,6 @@ mod tests {
         });
     }
 
-    #[serial_test::serial]
-    #[test]
-    fn check_liveness_retention_never_diverges_from_the_writer_dir_via_project_local_darkmux() {
-        // (#2653 MUST FIX 3) Before the fix, this check read
-        // `config_access::liveness_dir()`, which resolved through
-        // `paths::resolve(Auto)` — auto-detecting a project-local
-        // `./.darkmux` (a supported layout `lab run`/`lab fixture` create).
-        // `dispatch_liveness` (the actual WRITER) never does that
-        // auto-detect. So with a project-local `.darkmux/` in cwd, doctor
-        // read/counted the WRONG directory (a decoy file below) while the
-        // real liveness dir — where every heartbeat actually lands — grew
-        // unpruned and unseen underneath a "Pass".
-        let proj = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(proj.path().join(".darkmux").join("liveness")).unwrap();
-        std::fs::write(proj.path().join(".darkmux").join("liveness").join("999999.log"), "decoy")
-            .unwrap();
-
-        let prev_home = std::env::var("DARKMUX_HOME").ok();
-        let prev_cwd = std::env::current_dir().unwrap();
-        unsafe { std::env::remove_var("DARKMUX_HOME") };
-        std::env::set_current_dir(proj.path()).unwrap();
-
-        // Sanity: Auto really does diverge from the writer's own resolution
-        // in this setup, so the guard below exercises the actual choice.
-        let auto_dir =
-            darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::Auto).root.join("liveness");
-        // The writer's dir here is the FIXED test-isolation scratch path
-        // (#2653 MUST FIX 1) — shared with every other test in this binary
-        // that also runs with `DARKMUX_HOME` unset, so count by DELTA
-        // rather than an absolute number to stay deterministic under
-        // parallel/repeated runs. A pid-derived filename keeps this run's
-        // own marker distinguishable, and it is removed again below.
-        let writer_dir = darkmux_types::dispatch_liveness::liveness_dir();
-        std::fs::create_dir_all(&writer_dir).unwrap();
-        let baseline = count_pid_log_files(&writer_dir);
-        let marker = writer_dir.join(format!("{}.log", std::process::id()));
-        std::fs::write(&marker, "hi").unwrap();
-
-        let check = check_liveness_retention();
-        let after = count_pid_log_files(&writer_dir);
-        let _ = std::fs::remove_file(&marker);
-
-        // Restore env/cwd FIRST so a failed assert can't poison other
-        // serial tests.
-        std::env::set_current_dir(&prev_cwd).unwrap();
-        unsafe {
-            match prev_home {
-                Some(h) => std::env::set_var("DARKMUX_HOME", h),
-                None => std::env::remove_var("DARKMUX_HOME"),
-            }
-        }
-
-        assert_ne!(
-            auto_dir, writer_dir,
-            "sanity: a project-local .darkmux/ must actually diverge from the writer's dir here"
-        );
-        assert!(
-            check.message.contains(&writer_dir.display().to_string()),
-            "doctor must report the WRITER's directory, not the project-local one: {}",
-            check.message
-        );
-        assert_eq!(
-            after,
-            baseline + 1,
-            "doctor must count the writer's dir (one marker added), not the project-local decoy: {}",
-            check.message
-        );
-    }
-
-    /// Same `.log` + pid-named-stem filter `check_liveness_retention` itself
-    /// applies, for tests that need to compute a baseline/delta rather than
-    /// an absolute count against the shared test-isolation scratch dir.
-    fn count_pid_log_files(dir: &std::path::Path) -> usize {
-        std::fs::read_dir(dir)
-            .map(|entries| {
-                entries.filter_map(|e| e.ok()).filter(|e| darkmux_types::dispatch_liveness::is_pid_log_file(&e.path())).count()
-            })
-            .unwrap_or(0)
-    }
-
     // ─── (#2413) check_host_sampler — singleton lock Pass/Warn/Warn ───
 
     /// Isolate `host_sampler_lock_path()` to a fresh tempdir for the
@@ -11824,8 +11761,10 @@ mod tests {
         //
         // (4.0 unknown-key gate) 66: `check_user_file_keys` contributes one
         // Pass row when every user file is clean, as it is here.
+        //
+        // (4.0 project-local) 67: `check_ignored_project_darkmux` joined.
         let expected =
-            66 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
+            67 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
@@ -12435,9 +12374,9 @@ mod tests {
                 ca::identity_path_override().unwrap_or_else(|| state.join("identity.md")),
             ),
             // ── the root's own files ──
-            ("config.json", darkmux_types::paths::resolve(Default::default()).config),
-            ("profiles.json", darkmux_types::paths::resolve(Default::default()).profiles),
-            ("sandboxes", darkmux_types::paths::resolve(Default::default()).sandboxes),
+            ("config.json", darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).config),
+            ("profiles.json", darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).profiles),
+            ("sandboxes", darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).sandboxes),
         ];
 
         // Hold the LIST before iterating it. A loop over `resolved` can
@@ -12632,7 +12571,7 @@ mod tests {
             let _ = darkmux_crew::loader::missions_dir();
             let _ = darkmux_crew::loader::phases_dir();
             let _ = darkmux_crew::lessons::global_db_path();
-            let _ = darkmux_types::paths::resolve(Default::default());
+            let _ = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser);
         }
 
         // SAFETY: #[serial].
@@ -13574,6 +13513,38 @@ mod tests {
             .as_ref()
             .unwrap_or(&String::new())
             .contains("darkmux serve"));
+    }
+
+    /// (4.0) A cwd `.darkmux/` is reported as ignored, with `DARKMUX_HOME`
+    /// as the way to use it; a `DARKMUX_HOME` that already points at it, or no
+    /// such directory, is a Pass.
+    #[serial_test::serial]
+    #[test]
+    fn ignored_project_darkmux_is_warned_and_names_darkmux_home() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project = tmp.path().join(".darkmux");
+        std::fs::create_dir_all(&project).unwrap();
+        let prev_cwd = std::env::current_dir().unwrap();
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::remove_var("DARKMUX_HOME") };
+        std::env::set_current_dir(tmp.path()).unwrap();
+        let ignored = check_ignored_project_darkmux();
+        unsafe { std::env::set_var("DARKMUX_HOME", &project) };
+        let adopted = check_ignored_project_darkmux();
+        std::fs::remove_dir(&project).unwrap();
+        let absent = check_ignored_project_darkmux();
+        std::env::set_current_dir(prev_cwd).unwrap();
+        unsafe {
+            match prev_home {
+                Some(h) => std::env::set_var("DARKMUX_HOME", h),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+        assert_eq!(ignored.status, Status::Warn);
+        assert!(ignored.message.contains("is ignored"), "{}", ignored.message);
+        assert!(ignored.hint.as_deref().is_some_and(|h| h.contains("DARKMUX_HOME=")), "{:?}", ignored.hint);
+        assert_eq!(adopted.status, Status::Pass);
+        assert_eq!(absent.status, Status::Pass);
     }
 
     // ─── check_beat33_legacy_crew_dir ─────────────────────────────────

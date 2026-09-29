@@ -415,7 +415,6 @@ impl FleetNode {
             output_schema: None,
             prompt_path: None,
             bail_after_compactions: None,
-            escalation_posture: None,
             role_family: None,
             feedback_templates: None,
         };

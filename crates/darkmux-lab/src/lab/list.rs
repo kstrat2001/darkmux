@@ -163,31 +163,12 @@ mod tests {
     use tempfile::TempDir;
 
     /// (#2643) `list_runs` reads its scan root through `config_access::
-    /// lab_dir()`, which resolves through `paths::resolve(Auto)` — and
-    /// `DARKMUX_HOME`, when set, wins over a project-local `./.darkmux`
-    /// UNCONDITIONALLY (see `paths::resolve`'s own doc comment; this is
-    /// deliberate production behavior, not a bug). The three tests below
-    /// used to only `set_current_dir` to a tempdir holding a `.darkmux/`
-    /// and rely on the project-local fallback being chosen — which is only
-    /// true when `DARKMUX_HOME` happens to be unset in the shell running
-    /// `cargo test`. An operator (or CI) with `DARKMUX_HOME` exported
-    /// ambiently made `list_runs` scan `<DARKMUX_HOME>/runs` instead of the
-    /// fixture's tempdir, silently returning empty — reproduced directly:
-    /// `DARKMUX_HOME=/tmp/w24a-scratch-home cargo test -p darkmux-lab --lib
-    /// lab::list::tests` failed all three with the exact index-out-of-bounds
-    /// / length-0 / missing-"good" panics this comment now guards against.
-    ///
-    /// The structural fix (per this project's own doctrine: prefer a fix
-    /// that removes the hazard over one more test-local guard) is to stop
-    /// depending on cwd-relative project-local discovery at all and instead
-    /// set `DARKMUX_HOME` explicitly to the SAME root the fixture writes
-    /// under — exactly what every real caller (and this task's own
-    /// constraints) already does. That makes resolution agree with the
-    /// fixture regardless of what the ambient shell exports, and drops the
-    /// `set_current_dir` dance (one fewer piece of process-wide state these
-    /// tests have to serialize against). RAII (not a raw save/set/restore)
-    /// so a panicking assertion still restores the prior value — mirrors
-    /// `lab::run::tests::HomeGuard`.
+    /// lab_dir()`, which resolves through `paths::resolve`, where
+    /// `DARKMUX_HOME`, when set, is the root. The tests below set
+    /// `DARKMUX_HOME` explicitly to the SAME root the fixture writes under,
+    /// so resolution agrees with the fixture whatever the ambient shell
+    /// exports. RAII so a panicking assertion still restores the prior
+    /// value; mirrors `lab::run::tests::HomeGuard`.
     ///
     /// (The sentence that used to end this paragraph called that mirroring
     /// "this codebase's established per-module-guard convention". That

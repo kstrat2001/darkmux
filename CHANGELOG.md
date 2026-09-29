@@ -157,6 +157,16 @@ darkmux release.
 
 ### Changed (breaking, 4.0)
 
+- **A project-local `./.darkmux/` is no longer adopted.** The darkmux root is
+  `$DARKMUX_HOME` when set, else `~/.darkmux`, and nothing else: a `.darkmux/`
+  in the working directory used to become the root for flows, lab runs,
+  sandboxes and profiles while missions and roles stayed at home. It is now
+  ignored (the per-repo `lessons.db` is the one thing still read from it).
+  **Migration:** to keep using such a directory, run darkmux with
+  `DARKMUX_HOME=<that directory>`; otherwise move what you need into
+  `~/.darkmux`. `darkmux doctor`'s `project-local .darkmux` row warns when
+  the working directory holds one.
+
 - **An unknown key in a user file is refused (CONFIG 2.0).** `config.json`,
   `profiles.json`, role, skill and crew manifests, mission configs, rule
   files, workload documents, lab fixture manifests and a crawl's workspace

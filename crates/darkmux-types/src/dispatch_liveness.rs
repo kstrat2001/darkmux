@@ -192,9 +192,8 @@ fn append_heartbeat(pid: u32, line: &str) -> std::io::Result<()> {
 /// tilde-expanded) if set, else `~/.darkmux`. Resolved WITHOUT touching
 /// config resolution — the whole point of the floor is zero dependency on
 /// config/Redis/audit/flow: this mirrors the `DARKMUX_HOME` + user-root
-/// branches of `paths::resolve`, minus the project-local `.darkmux`
-/// auto-detect and all config reads — the floor can't afford a cwd stat or
-/// a full config load at the first instant of a possibly-already-hung
+/// branches of `paths::resolve`, minus all config reads — the floor
+/// can't afford a full config load at the first instant of a possibly-already-hung
 /// process. Shared by [`liveness_dir`] and [`retention_hours`]'s raw
 /// config-file peek.
 fn darkmux_home_dir() -> PathBuf {
@@ -261,10 +260,9 @@ fn darkmux_home_dir_fallback() -> PathBuf {
 /// The heartbeat directory: `<darkmux-home>/liveness/`.
 ///
 /// `pub` (#2653 MUST FIX 3): `config_access::liveness_dir` delegates
-/// straight here rather than through `paths::resolve(Auto)`'s project-local
-/// auto-detect, so every consumer (doctor's count, the host-sampler lock
-/// path) targets the exact directory this module actually writes to. See
-/// that function's doc for the divergence this closes.
+/// straight here rather than through `paths::resolve`, so every consumer
+/// (doctor's count, the host-sampler lock path) targets the exact directory
+/// this module actually writes to.
 pub fn liveness_dir() -> PathBuf {
     darkmux_home_dir().join("liveness")
 }

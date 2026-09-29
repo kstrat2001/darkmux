@@ -600,8 +600,7 @@ pub fn hooks_enabled() -> bool {
 }
 /// (#2093 merge-gate finding 8) Derived from the SAME root resolution
 /// every other darkmux directory resolves through —
-/// `paths::resolve(Auto)`, which honors `DARKMUX_HOME` and a
-/// project-local `./.darkmux` before `~/.darkmux` — mirroring
+/// `paths::resolve(ForceUser)`, which honors `DARKMUX_HOME` before `~/.darkmux` — mirroring
 /// `lab_dir_default`'s own doc. Before this fix, `hooks_outbox_dir`'s
 /// fallback went straight to `dirs::home_dir()`, so a `DARKMUX_HOME`-
 /// scoped install still wrote hook outbox files to the operator's REAL
@@ -609,18 +608,17 @@ pub fn hooks_enabled() -> bool {
 /// `lab_dir`, one directory over.
 #[cfg(not(any(test, feature = "test-support")))]
 fn hooks_outbox_dir_default() -> std::path::PathBuf {
-    crate::paths::resolve(crate::paths::ResolveScope::Auto).root.join("hooks")
+    crate::paths::resolve(crate::paths::ResolveScope::ForceUser).root.join("hooks")
 }
 
 /// Test builds must never default onto the operator's real
 /// `~/.darkmux/hooks` — same isolation discipline as `lab_dir_default`'s
 /// own test-build variant (#994). A test that DID isolate itself (a
 /// `DARKMUX_HOME` tempdir) is honored verbatim, because a test that isolated
-/// itself means it. A project-local `./.darkmux` does NOT apply here — the
-/// production resolution is `ForceUser`, see its own doc for why.
+/// itself means it.
 #[cfg(any(test, feature = "test-support"))]
 fn hooks_outbox_dir_default() -> std::path::PathBuf {
-    let resolved = crate::paths::resolve(crate::paths::ResolveScope::Auto);
+    let resolved = crate::paths::resolve(crate::paths::ResolveScope::ForceUser);
     let real_user_root = dirs::home_dir().map(|h| h.join(".darkmux"));
     if real_user_root.as_ref() == Some(&resolved.root) {
         return crate::paths::test_isolated_dir("hooks");
@@ -1586,23 +1584,10 @@ pub fn liveness_dir() -> std::path::PathBuf {
     liveness_dir_default()
 }
 
-/// (#2653 MUST FIX 3) Delegates straight to `dispatch_liveness::liveness_dir()`
-/// — the WRITER's own resolution — instead of `paths::resolve(Auto)`.
-///
-/// `paths::resolve(Auto)` auto-detects a project-local `./.darkmux` (a
-/// supported layout `lab run`/`lab fixture` create); `dispatch_liveness`
-/// deliberately never does that project-local auto-detect — its entire
-/// reason for existing is to avoid a cwd stat (or any config read) before
-/// config/Redis/audit/flow are even touched. With a project-local
-/// `.darkmux` present in cwd, this function used to resolve to a DIFFERENT
-/// directory than the one every heartbeat actually lands in: the doctor row
-/// whose whole purpose is making growth visible counted 0 files in the cwd
-/// directory while the real directory (`$HOME/.darkmux/liveness`, or
-/// `DARKMUX_HOME`) kept growing, unpruned and unseen, the entire time the
-/// check said "Pass". `host_sampler_lock_path` rides this same function, so
-/// the identical divergence would have put the host-sampler lock file
-/// somewhere `dispatch_liveness` never writes to either — this closes both
-/// at the resolution root rather than patching each consumer.
+/// Delegates straight to `dispatch_liveness::liveness_dir()` (the WRITER's own
+/// resolution, which reads no config) instead of `paths::resolve`, so the
+/// doctor row that counts heartbeat files and `host_sampler_lock_path` target
+/// the exact directory heartbeats land in.
 ///
 /// `dispatch_liveness::liveness_dir()` carries its OWN test isolation
 /// (#2653 MUST FIX 1: `DARKMUX_HOME` if set, else a per-process
@@ -1969,7 +1954,7 @@ pub fn mission_stale_active_days() -> u64 {
 
 /// The flows directory (the always-on LocalFileSink target):
 /// `env(DARKMUX_FLOWS_DIR) > config.dirs.flows > <darkmux root>/flows`. The
-/// root comes from `paths::resolve(Auto)` (below), so a HOME-less
+/// root comes from `paths::resolve(ForceUser)` (below), so a HOME-less
 /// environment falls back to `paths::resolve`'s own `/tmp` scoping rather
 /// than a separate literal here.
 pub fn flows_dir() -> std::path::PathBuf {
@@ -1984,8 +1969,8 @@ pub fn flows_dir() -> std::path::PathBuf {
 /// be isolated in test builds.
 ///
 /// (#2359) Derived from the SAME root resolution every other darkmux
-/// directory resolves through — `paths::resolve(Auto)`, which honors
-/// `DARKMUX_HOME` and a project-local `./.darkmux` before `~/.darkmux` —
+/// directory resolves through — `paths::resolve`, which honors
+/// `DARKMUX_HOME` before `~/.darkmux` —
 /// mirroring `findings_dir_default`/`mods_dir_default`/`lab_dir_default`/
 /// `hooks_outbox_dir_default`. Before this fix the default went straight to
 /// `dirs::home_dir()`, so a `DARKMUX_HOME`-scoped launch with no
@@ -1996,7 +1981,7 @@ pub fn flows_dir() -> std::path::PathBuf {
 /// real flow store exactly this way on 2026-09-05.
 #[cfg(not(any(test, feature = "test-support")))]
 fn flows_dir_default() -> std::path::PathBuf {
-    crate::paths::resolve(crate::paths::ResolveScope::Auto).root.join("flows")
+    crate::paths::resolve(crate::paths::ResolveScope::ForceUser).root.join("flows")
 }
 
 /// (#994) In test / `test-support` builds the default must NOT be the
@@ -2010,7 +1995,7 @@ fn flows_dir_default() -> std::path::PathBuf {
 /// construction in test builds" move the empty `config()` tier already makes.
 ///
 /// (#2359) But a test that DID isolate itself — by pointing `DARKMUX_HOME` at
-/// a tempdir, or via a project-local `./.darkmux` — is honored verbatim, same
+/// a tempdir — is honored verbatim, same
 /// isolation discipline as `lab_dir_default`'s own test-build variant: a test
 /// that isolated itself means it. Only a test that isolated NOTHING (so
 /// `paths::resolve` would otherwise land on the real user root) falls back to
@@ -2030,7 +2015,7 @@ fn flows_dir_default() -> std::path::PathBuf {
 /// the two facts are separated instead.)
 #[cfg(any(test, feature = "test-support"))]
 fn flows_dir_default() -> std::path::PathBuf {
-    let resolved = crate::paths::resolve(crate::paths::ResolveScope::Auto);
+    let resolved = crate::paths::resolve(crate::paths::ResolveScope::ForceUser);
     let real_user_root = dirs::home_dir().map(|h| h.join(".darkmux"));
     if real_user_root.as_ref() == Some(&resolved.root) {
         return crate::paths::test_isolated_dir("flows");
@@ -2055,24 +2040,24 @@ pub fn findings_dir() -> std::path::PathBuf {
 }
 
 /// Derived from the SAME root resolution every other darkmux directory
-/// resolves through — `paths::resolve(Auto)`, which honors `DARKMUX_HOME` and
-/// a project-local `./.darkmux` before `~/.darkmux` — mirroring
+/// resolves through — `paths::resolve`, which honors `DARKMUX_HOME` and
+/// the default `~/.darkmux` — mirroring
 /// `hooks_outbox_dir_default`. Reaching straight for `dirs::home_dir()` here
 /// would put a `DARKMUX_HOME`-scoped install's findings in the operator's real
 /// `~/.darkmux/findings`, the bug class #1585 fixed one directory over.
 #[cfg(not(any(test, feature = "test-support")))]
 fn findings_dir_default() -> std::path::PathBuf {
-    crate::paths::resolve(crate::paths::ResolveScope::Auto).root.join("findings")
+    crate::paths::resolve(crate::paths::ResolveScope::ForceUser).root.join("findings")
 }
 
 /// Test builds must never default onto the operator's real
 /// `~/.darkmux/findings` — same isolation discipline as `lab_dir_default`'s own
 /// test-build variant (#994). A test that DID isolate itself (a `DARKMUX_HOME`
-/// tempdir, or a project-local `./.darkmux`) is honored verbatim, because a
+/// tempdir) is honored verbatim, because a
 /// test that isolated itself means it.
 #[cfg(any(test, feature = "test-support"))]
 fn findings_dir_default() -> std::path::PathBuf {
-    let resolved = crate::paths::resolve(crate::paths::ResolveScope::Auto);
+    let resolved = crate::paths::resolve(crate::paths::ResolveScope::ForceUser);
     let real_user_root = dirs::home_dir().map(|h| h.join(".darkmux"));
     if real_user_root.as_ref() == Some(&resolved.root) {
         return crate::paths::test_isolated_dir("findings");
@@ -2096,22 +2081,22 @@ pub fn mods_dir() -> std::path::PathBuf {
 }
 
 /// Derived from the SAME root resolution every other darkmux directory
-/// resolves through — `paths::resolve(Auto)`, which honors `DARKMUX_HOME` and
-/// a project-local `./.darkmux` before `~/.darkmux`. Mirrors
+/// resolves through — `paths::resolve`, which honors `DARKMUX_HOME` and
+/// the default `~/.darkmux`. Mirrors
 /// `findings_dir_default`.
 #[cfg(not(any(test, feature = "test-support")))]
 fn mods_dir_default() -> std::path::PathBuf {
-    crate::paths::resolve(crate::paths::ResolveScope::Auto).root.join("mods")
+    crate::paths::resolve(crate::paths::ResolveScope::ForceUser).root.join("mods")
 }
 
 /// Test builds must never default onto the operator's real `~/.darkmux/mods`
 /// — same isolation discipline as `findings_dir_default`'s own test-build
 /// variant. A test that DID isolate itself (a `DARKMUX_HOME` tempdir, or a
-/// project-local `./.darkmux`) is honored verbatim, because a test that
+/// tempdir) is honored verbatim, because a test that
 /// isolated itself means it.
 #[cfg(any(test, feature = "test-support"))]
 fn mods_dir_default() -> std::path::PathBuf {
-    let resolved = crate::paths::resolve(crate::paths::ResolveScope::Auto);
+    let resolved = crate::paths::resolve(crate::paths::ResolveScope::ForceUser);
     let real_user_root = dirs::home_dir().map(|h| h.join(".darkmux"));
     if real_user_root.as_ref() == Some(&resolved.root) {
         return crate::paths::test_isolated_dir("mods");
@@ -2142,7 +2127,7 @@ pub fn lab_dir() -> std::path::PathBuf {
 }
 
 /// Derived from the SAME root resolution lab runs are written through —
-/// `paths::resolve(Auto)`, which honors `DARKMUX_HOME` and a project-local
+/// `paths::resolve`, which honors `DARKMUX_HOME` before
 /// `./.darkmux` before `~/.darkmux`.
 ///
 /// Deliberately not a hardcoded `~/.darkmux/runs`: that would reintroduce this
@@ -2153,7 +2138,7 @@ pub fn lab_dir() -> std::path::PathBuf {
 /// wired. Sharing the resolver makes read and write incapable of disagreeing.
 #[cfg(not(any(test, feature = "test-support")))]
 fn lab_dir_default() -> std::path::PathBuf {
-    crate::paths::resolve(crate::paths::ResolveScope::Auto).runs
+    crate::paths::resolve(crate::paths::ResolveScope::ForceUser).runs
 }
 
 /// Test builds must never default onto the operator's real `~/.darkmux/runs`
@@ -2168,12 +2153,11 @@ fn lab_dir_default() -> std::path::PathBuf {
 /// a replacement for tests that did.
 #[cfg(any(test, feature = "test-support"))]
 fn lab_dir_default() -> std::path::PathBuf {
-    let resolved = crate::paths::resolve(crate::paths::ResolveScope::Auto);
+    let resolved = crate::paths::resolve(crate::paths::ResolveScope::ForceUser);
     // Substitute the throwaway ONLY when resolution actually landed on the
-    // operator's real user root — that is the case this guard exists for. Both
-    // documented isolation forms (a `DARKMUX_HOME` tempdir, or a project-local
-    // `./.darkmux` reached via `set_current_dir`) resolve elsewhere and are
-    // honored verbatim, because a test that isolated itself means it.
+    // operator's real user root — that is the case this guard exists for. A
+    // `DARKMUX_HOME` tempdir resolves elsewhere and is honored verbatim,
+    // because a test that isolated itself means it.
     let real_user_root = dirs::home_dir().map(|h| h.join(".darkmux"));
     if real_user_root.as_ref() == Some(&resolved.root) {
         return crate::paths::test_isolated_dir("runs");
@@ -2188,8 +2172,8 @@ fn lab_dir_default() -> std::path::PathBuf {
 /// env/config override tier.
 ///
 /// (#2450) Derived from the SAME root resolution every other darkmux
-/// directory resolves through — `paths::resolve(Auto)`, which honors
-/// `DARKMUX_HOME` and a project-local `./.darkmux` before `~/.darkmux` —
+/// directory resolves through — `paths::resolve`, which honors
+/// `DARKMUX_HOME` before `~/.darkmux` —
 /// mirroring `fleet_file_default`/`flows_dir_default`. Before this fix, this
 /// went straight to `dirs::home_dir()`, so a `DARKMUX_HOME`-scoped install
 /// still cached the extracted runtime binary under the operator's REAL
@@ -2221,12 +2205,12 @@ fn lab_dir_default() -> std::path::PathBuf {
 /// cached binary.
 #[cfg(not(any(test, feature = "test-support")))]
 pub fn runtime_cache_dir() -> std::path::PathBuf {
-    crate::paths::resolve(crate::paths::ResolveScope::Auto).root.join("runtime")
+    crate::paths::resolve(crate::paths::ResolveScope::ForceUser).root.join("runtime")
 }
 
 #[cfg(any(test, feature = "test-support"))]
 pub fn runtime_cache_dir() -> std::path::PathBuf {
-    let resolved = crate::paths::resolve(crate::paths::ResolveScope::Auto);
+    let resolved = crate::paths::resolve(crate::paths::ResolveScope::ForceUser);
     let real_user_root = dirs::home_dir().map(|h| h.join(".darkmux"));
     if real_user_root.as_ref() == Some(&resolved.root) {
         return crate::paths::test_isolated_dir("runtime");
@@ -2248,12 +2232,12 @@ pub fn runtime_cache_dir() -> std::path::PathBuf {
 /// confirmed broken before this fix.
 #[cfg(not(any(test, feature = "test-support")))]
 pub fn cache_dir() -> std::path::PathBuf {
-    crate::paths::resolve(crate::paths::ResolveScope::Auto).root.join("cache")
+    crate::paths::resolve(crate::paths::ResolveScope::ForceUser).root.join("cache")
 }
 
 #[cfg(any(test, feature = "test-support"))]
 pub fn cache_dir() -> std::path::PathBuf {
-    let resolved = crate::paths::resolve(crate::paths::ResolveScope::Auto);
+    let resolved = crate::paths::resolve(crate::paths::ResolveScope::ForceUser);
     let real_user_root = dirs::home_dir().map(|h| h.join(".darkmux"));
     if real_user_root.as_ref() == Some(&resolved.root) {
         return crate::paths::test_isolated_dir("cache");
@@ -2285,8 +2269,8 @@ pub fn fleet_file() -> std::path::PathBuf {
 }
 
 /// (#2450) Derived from the SAME root resolution every other darkmux
-/// directory resolves through — `paths::resolve(Auto)`, which honors
-/// `DARKMUX_HOME` and a project-local `./.darkmux` before `~/.darkmux` —
+/// directory resolves through — `paths::resolve`, which honors
+/// `DARKMUX_HOME` before `~/.darkmux` —
 /// mirroring `flows_dir_default`/`hooks_outbox_dir_default`/`lab_dir_default`.
 /// Before this fix, `fleet_file`'s fallback went straight to
 /// `dirs::home_dir()`, so a `DARKMUX_HOME`-scoped install with no
@@ -2295,42 +2279,9 @@ pub fn fleet_file() -> std::path::PathBuf {
 /// for `lab_dir`, #2093 fixed for `hooks_outbox_dir`, and #2363 fixed for
 /// `flows_dir`, one directory over.
 ///
-/// **Behavior change for existing operators, stated out loud (#2450 review).**
-/// `Auto` does not only add the `DARKMUX_HOME` tier — it also prefers a
-/// project-local `./.darkmux` over `~/.darkmux` whenever the process happens
-/// to be standing in a directory that has one. So `darkmux machine add` /
-/// `machine list` run from such a directory now read and write
-/// `./.darkmux/fleet.json` instead of the user-global roster, and the
-/// operator's real fleet appears EMPTY there. This is reachable, not
-/// theoretical: `crew::lessons::repo_db_path` creates `<repo>/.darkmux/` in
-/// every repo a coder dispatch has recorded a lesson in, so any such repo is
-/// already a directory where this switch fires. Verified live with the built
-/// binary: from a cwd containing `./.darkmux`, `machine add` reported
-/// `roster: <cwd>/.darkmux/fleet.json`.
-///
-/// It is kept as `Auto` for consistency with every sibling default
-/// (`flows_dir`, `findings_dir`, `mods_dir`, `lab_dir`, `hooks_outbox_dir`),
-/// which all resolve project-local-first. If the roster should instead be a
-/// per-MACHINE constant — a defensible reading, since a fleet roster is not
-/// project-scoped state the way a run record or a finding is — the one-word
-/// change is `ResolveScope::ForceUser`, which still closes the `DARKMUX_HOME`
-/// escape this issue is about while dropping the cwd sensitivity.
-/// `workdir::worktrees_base_dir` and `dispatch::identity_path` took exactly
-/// that `ForceUser` route in this same change, for that same reason.
+/// A fleet roster is user-global state by nature, unlike a run record or a
+/// finding: the machines you own do not change because you cd'd.
 fn fleet_file_default() -> std::path::PathBuf {
-    // `ForceUser`, NOT `Auto` (#2450 review decision). Closing the
-    // `DARKMUX_HOME` escape must not smuggle in a NEW cwd sensitivity: before
-    // this fix the roster was `dirs::home_dir()/.darkmux/fleet.json`,
-    // unconditionally user-global, so `Auto` would have changed behavior for
-    // operators who never set `DARKMUX_HOME` at all. And it is reachable, not
-    // theoretical — `crew::lessons::repo_db_path` creates `<repo>/.darkmux/`
-    // in every repository a coder dispatch has recorded a lesson in, so
-    // `machine add` run from such a repo would silently read and write a
-    // project-local roster and report the fleet as empty.
-    //
-    // A fleet roster is user-global state by nature, unlike a run record or a
-    // finding: the machines you own do not change because you cd'd. Same call,
-    // for the same reason, as `worktrees_base_dir` and `identity_path`.
     crate::paths::resolve(crate::paths::ResolveScope::ForceUser).root.join("fleet.json")
 }
 
@@ -4002,7 +3953,7 @@ mod tests {
     }
 
     /// (#2093 merge-gate finding 8) `hooks_outbox_dir` resolves under
-    /// `paths::resolve(Auto)` — same root every other darkmux directory
+    /// `paths::resolve` — same root every other darkmux directory
     /// resolves under — so `DARKMUX_HOME` scopes it too. Before this fix
     /// it went straight to `dirs::home_dir()`, so a `DARKMUX_HOME`-scoped
     /// install (a relocated root, or test isolation) still wrote hook
