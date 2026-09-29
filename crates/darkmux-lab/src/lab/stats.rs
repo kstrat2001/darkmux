@@ -110,7 +110,7 @@ fn mean(xs: impl Iterator<Item = f64>) -> Option<f64> {
 /// degenerate finding therefore appears here
 /// with `aborts: 0`, which is exactly the shape that proves the policy was
 /// in effect.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, schemars::JsonSchema)]
 pub struct StreamGate {
     /// How many times output was sampled. A zero degenerate count against a
     /// large observation count is a far stronger statement than an absence
@@ -124,7 +124,7 @@ pub struct StreamGate {
 
 /// The per-call-cap gate (`dispatch.checkpoint`) — it judges the accumulated
 /// slice when a call hits `max_tokens_per_call`.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, schemars::JsonSchema)]
 pub struct CheckpointGate {
     pub observations: usize,
     /// Turns the runtime JUDGED degenerate (`would_conclude`), whatever the
@@ -146,13 +146,13 @@ pub struct CheckpointGate {
     pub policy: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, schemars::JsonSchema)]
 pub struct Gates {
     pub stream: StreamGate,
     pub checkpoint: CheckpointGate,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct SuspectTurn {
     pub seq: u64,
     pub reasoning_chars_per_token: f64,
@@ -164,7 +164,7 @@ pub struct SuspectTurn {
 /// these would have caught a specific wrong claim made before this module
 /// existed; [`RunStats::unreconciled`] turns the failures into the caveats a
 /// renderer prints next to the figures.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, schemars::JsonSchema)]
 pub struct RunChecks {
     pub telemetry_covers_run: bool,
     /// The policy the checkpoint records say RAN agrees with the one
@@ -203,7 +203,7 @@ pub struct RunChecks {
 /// Durations are milliseconds because that is the unit the artifacts use;
 /// converting to seconds is the renderer's job, and doing it here would
 /// round away differences the comparison depends on.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, schemars::JsonSchema)]
 pub struct RunStats {
     pub schema_version: &'static str,
     pub run: String,
@@ -294,7 +294,7 @@ pub struct RunStats {
     pub gates: Gates,
     /// `dispatch start.bounds` — the resolved caps with their provenance, so
     /// an arm's settings are read from the run rather than assumed.
-    pub bounds: BTreeMap<String, serde_json::Value>,
+    pub bounds: BTreeMap<String, darkmux_flow::payload::Knob>,
 
     // --- host -------------------------------------------------------------
     pub gpu_w_busy: Option<f64>,
@@ -398,14 +398,6 @@ fn thermal_delay_escalated(rests: &[darkmux_trajectory::RestTaken]) -> bool {
     thermal.windows(2).all(|w| w[1] >= w[0]) && thermal.windows(2).any(|w| w[1] > w[0])
 }
 
-fn as_u64(v: Option<&serde_json::Value>) -> Option<u64> {
-    v.and_then(|v| v.as_u64())
-}
-
-fn as_f64(v: Option<&serde_json::Value>) -> Option<f64> {
-    v.and_then(|v| v.as_f64())
-}
-
 /// One host telemetry sample, already narrowed to the run's window.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Sample {
@@ -441,7 +433,7 @@ pub const WINDOW_SLACK_MS: u64 = 5 * 60 * 1000;
 /// observer was negligible" is a claim the data can check rather than an
 /// assumption. The point of the bound: `files_read` and `lines_scanned` track
 /// the size of the RUN, not the size of the archive.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, schemars::JsonSchema)]
 pub struct FlowScan {
     pub files_total: usize,
     /// Last written before the run began, so they cannot hold any of it.
@@ -466,7 +458,7 @@ pub struct FlowScan {
 pub(crate) struct FlowFacts {
     samples: Vec<Sample>,
     records_for_session: usize,
-    bounds: BTreeMap<String, serde_json::Value>,
+    bounds: BTreeMap<String, darkmux_flow::payload::Knob>,
     scan: FlowScan,
 }
 
@@ -512,8 +504,15 @@ pub(crate) fn scan_flow_lines(
         }
         let Some(r) = darkmux_flow::reader::parse_value(line) else { continue };
         let action = darkmux_flow::reader::action_of(&r);
-        let p = r.get("payload");
-        let clock = p.and_then(|p| as_u64(p.get("sampled_at_ms")));
+        // Only a machine reading is read as its type; the rest of a day file is
+        // passed over without parsing a payload. A session's `dispatch.start`
+        // is read below as raw JSON, for its bounds map.
+        let payload = payload_this_read_wants(action.as_ref(), &r);
+        let sample = match &payload {
+            Some(darkmux_flow::Payload::MachineTelemetry(p)) => Some(p),
+            _ => None,
+        };
+        let clock = sample.map(|p| p.now.sampled_at_ms);
         if clock.is_some_and(|ts| ts > stop_after) {
             return (scanned, true, false);
         }
@@ -522,42 +521,56 @@ pub(crate) fn scan_flow_lines(
             if r.get("session_id").and_then(|v| v.as_str()) == Some(sid) {
                 facts.records_for_session += 1;
                 if action == Some(darkmux_flow::FlowAction::DispatchStart) {
-                    if let Some(b) = p.and_then(|p| p.get("bounds")).and_then(|b| b.as_object()) {
-                        for (k, v) in b {
-                            facts.bounds.entry(k.clone()).or_insert_with(|| v.clone());
-                        }
-                    }
+                    merge_bounds(&mut facts.bounds, &r);
                 }
             }
         }
 
-        if action != Some(darkmux_flow::FlowAction::MachineTelemetry) {
-            continue;
-        }
-        let (Some(p), Some(ts)) = (p, clock) else { continue };
+        let (Some(p), Some(ts)) = (sample, clock) else { continue };
         if ts < run_from || ts > run_to {
             continue;
         }
-        let Some(pw) = p.get("power_mw") else { continue };
-        let thermal = p.get("thermal");
-        facts.samples.push(Sample {
-            ts,
-            interval_ms: as_u64(p.get("interval_ms")),
-            gpu_pct: as_u64(p.get("gpu_pct")).unwrap_or(0),
-            w_gpu: as_f64(pw.get("gpu")).unwrap_or(0.0) / 1000.0,
-            w_cpu: as_f64(pw.get("cpu")).unwrap_or(0.0) / 1000.0,
-            w_total: as_f64(pw.get("total")).unwrap_or(0.0) / 1000.0,
-            thermal_state: thermal
-                .and_then(|t| t.get("state"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            cpu_speed_limit_pct: thermal
-                .and_then(|t| as_u64(t.get("cpu_speed_limit_pct")))
-                .unwrap_or(100),
-            mem_pct: as_u64(p.get("mem_pct")).unwrap_or(0),
-        });
+        facts.samples.extend(sample_of(p, ts));
     }
     (scanned, false, false)
+}
+
+/// A record's payload, read as its type, for the one action this read parses.
+fn payload_this_read_wants(action: Option<&darkmux_flow::FlowAction>, r: &serde_json::Value) -> Option<darkmux_flow::Payload> {
+    match action {
+        Some(darkmux_flow::FlowAction::MachineTelemetry) => darkmux_flow::reader::payload_of(r),
+        _ => None,
+    }
+}
+
+/// The first value each knob resolved to, across a session's `dispatch.start`
+/// records. Read from the record's own `bounds` map, not through
+/// `RuntimeBounds`, so a knob a newer writer adds is kept. An entry that is not
+/// a knob is skipped.
+fn merge_bounds(into: &mut BTreeMap<String, darkmux_flow::payload::Knob>, record: &serde_json::Value) {
+    let Some(serde_json::Value::Object(knobs)) = record.pointer("/payload/bounds") else { return };
+    for (name, raw) in knobs {
+        if let Ok(knob) = serde_json::from_value(raw.clone()) {
+            into.entry(name.clone()).or_insert(knob);
+        }
+    }
+}
+
+/// One `machine.telemetry` reading as a run sample; `None` for a reading that
+/// carries no power figure (a sampler without power access).
+fn sample_of(p: &darkmux_flow::payload::MachineTelemetryPayload, ts: u64) -> Option<Sample> {
+    let pw = p.now.power_mw.as_ref()?;
+    Some(Sample {
+        ts,
+        interval_ms: p.interval_ms,
+        gpu_pct: p.now.gpu_pct.unwrap_or(0),
+        w_gpu: pw.gpu as f64 / 1000.0,
+        w_cpu: pw.cpu as f64 / 1000.0,
+        w_total: pw.total as f64 / 1000.0,
+        thermal_state: p.now.thermal.as_ref().map(|t| t.state.clone()),
+        cpu_speed_limit_pct: p.now.thermal.as_ref().map_or(100, |t| t.cpu_speed_limit_pct),
+        mem_pct: p.now.mem_pct.unwrap_or(0),
+    })
 }
 
 fn mtime_ms(path: &Path) -> Option<u64> {
@@ -787,7 +800,7 @@ pub(crate) fn derive_stats(
     let bounds_policy = flows
         .bounds
         .get("detection_degeneracy_policy")
-        .and_then(|b| b.get("value"))
+        .and_then(|k| k.value.as_ref())
         .and_then(|v| v.as_str())
         .map(|v| v.to_string());
     let checkpoint = checkpoint_gate(fold, bounds_policy.clone());

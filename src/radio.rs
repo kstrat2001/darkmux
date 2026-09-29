@@ -67,6 +67,7 @@
 //! provenance for.
 
 use anyhow::Result;
+use darkmux_flow::payload::{RadioDecision, RadioRoutePayload};
 use serde::Deserialize;
 
 /// One entry in the model-facing command catalog — what the routing seat
@@ -189,20 +190,7 @@ pub fn route(text: &str, catalog: &[CatalogEntry], call: &mut ModelCall<'_>) -> 
 /// text + chosen route") needs to know which surface it came from.
 /// `src/radio_cli.rs` (the `darkmux radio` verb, Packet A) and the ACP
 /// no-slash channel (`src/acp.rs`, Packet B) are the two consumers today.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RadioSurface {
-    Cli,
-    Panel,
-}
-
-impl RadioSurface {
-    fn as_str(self) -> &'static str {
-        match self {
-            RadioSurface::Cli => "cli",
-            RadioSurface::Panel => "panel",
-        }
-    }
-}
+pub use darkmux_flow::payload::RadioSurface;
 
 /// How much of the raw source text wall 4's flow record carries — mirrors
 /// `dispatch.tool`'s own `args` cap (512 chars, FLOW_SCHEMA 1.16.0) so one
@@ -328,32 +316,37 @@ pub fn routing_thread_ended_early() -> RouteDecision {
 /// every other flow-record emission site in this codebase takes.
 fn emit_route_record(text: &str, surface: RadioSurface, decision: &RouteDecision) {
     let truncated: String = text.chars().take(SOURCE_TEXT_RECORD_CAP).collect();
-    let mut payload = serde_json::json!({
-        "surface": surface.as_str(),
-        "source_text": truncated,
-    });
+    let mut payload = RadioRoutePayload {
+        surface,
+        source_text: truncated,
+        decision: RadioDecision::Route,
+        command: None,
+        args: None,
+        reason: None,
+        error: None,
+        step_id: None,
+    };
     match decision {
         RouteDecision::Route { command, args } => {
-            payload["decision"] = serde_json::json!("route");
-            payload["command"] = serde_json::json!(command);
-            payload["args"] = serde_json::json!(args);
+            payload.decision = RadioDecision::Route;
+            payload.command = Some(command.clone());
+            payload.args = Some(args.clone());
         }
         RouteDecision::Refuse { reason } => {
-            payload["decision"] = serde_json::json!("refuse");
-            payload["reason"] = serde_json::json!(reason);
+            payload.decision = RadioDecision::Refuse;
+            payload.reason = Some(reason.clone());
         }
         RouteDecision::Unavailable { error } => {
-            payload["decision"] = serde_json::json!("unavailable");
-            payload["error"] = serde_json::json!(error);
+            payload.decision = RadioDecision::Unavailable;
+            payload.error = Some(error.clone());
         }
     }
-    let record = crate::crew::dispatch::build_session_record_with_payload(
+    let record = crate::crew::dispatch::build_session_record(
         crate::flow::Level::Info,
-        darkmux_flow::FlowAction::RadioRoute,
         crate::crew::loader::RADIO_ROUTER_ROLE_ID,
         &radio_session(crate::crew::loader::RADIO_ROUTER_ROLE_ID),
         None,
-        Some(payload),
+        darkmux_flow::Payload::RadioRoute(payload),
     );
     let _ = crate::flow::record(record);
 }

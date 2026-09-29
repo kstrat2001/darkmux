@@ -25,7 +25,7 @@ use crate::lab::stats::RunStats;
 use serde::Serialize;
 
 /// Median with the spread around it. The spread is part of the claim.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct Range {
     pub n: usize,
     pub median: f64,
@@ -51,7 +51,7 @@ impl Range {
 ///
 /// Numerators sum over EVERY run, passed or not; the denominator is the runs
 /// that passed. That asymmetry is the point.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, schemars::JsonSchema)]
 pub struct CostPerSuccess {
     pub active_ms: Option<f64>,
     /// Wall time the GPU was busy, from each run's duty cycle.
@@ -62,7 +62,7 @@ pub struct CostPerSuccess {
 }
 
 /// One set of runs — an arm of a comparison.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct SetSummary {
     pub n: usize,
     pub passed: usize,

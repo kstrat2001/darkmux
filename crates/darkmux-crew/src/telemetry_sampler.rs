@@ -46,6 +46,7 @@
 //! in `dispatch_internal.rs` next to the tailer + watchdog it mirrors;
 //! only the host-reading mechanism is shared here.
 
+use darkmux_flow::payload::{LmsEvent, LmsRole, TelemetryLmsPayload};
 use darkmux_types::LoadedModel;
 
 /// Compare two loaded-model snapshots and emit one telemetry payload per
@@ -70,26 +71,35 @@ use darkmux_types::LoadedModel;
 /// review pipeline's own `HostTelemetrySampler` needs the exact same
 /// load/unload-diff rule to emit `telemetry.lms` records, not just the
 /// host cpu/mem/gpu family this module already shares.
-pub fn lms_diff(prev: &[LoadedModel], cur: &[LoadedModel]) -> Vec<serde_json::Value> {
+pub fn lms_diff(prev: &[LoadedModel], cur: &[LoadedModel]) -> Vec<TelemetryLmsPayload> {
     let mut out = Vec::new();
 
     // Loads: in `cur`, not in `prev`.
     for m in cur {
         if !prev.iter().any(|p| p.model == m.model) {
-            out.push(serde_json::json!({
-                "event": "load",
-                "model": m.model,
-                "gb": gb_from_size_string(&m.size),
-            }));
+            out.push(TelemetryLmsPayload {
+                event: LmsEvent::Load,
+                model: m.model.clone(),
+                gb: Some(gb_from_size_string(&m.size)),
+                role: None,
+                baseline: None,
+                step_id: None,
+                context: None,
+            });
         }
     }
     // Unloads: in `prev`, not in `cur`.
     for p in prev {
         if !cur.iter().any(|m| m.model == p.model) {
-            out.push(serde_json::json!({
-                "event": "unload",
-                "model": p.model,
-            }));
+            out.push(TelemetryLmsPayload {
+                event: LmsEvent::Unload,
+                model: p.model.clone(),
+                gb: None,
+                role: None,
+                baseline: None,
+                step_id: None,
+                context: None,
+            });
         }
     }
 
@@ -146,15 +156,15 @@ pub fn lms_diff(prev: &[LoadedModel], cur: &[LoadedModel]) -> Vec<serde_json::Va
 /// size — the 4B/35B split here is a coincidence of this staffing, not a
 /// rule."* The only signal honored is which id THIS dispatch actually
 /// declared for which seat.
-pub fn role_for_load(model_id: &str, primary: &str, utility: Option<&str>) -> &'static str {
+pub fn role_for_load(model_id: &str, primary: &str, utility: Option<&str>) -> LmsRole {
     let bare = darkmux_gestalt::bare_model_key;
     let key = bare(model_id);
     if key == bare(primary) {
-        "primary"
+        LmsRole::Primary
     } else if utility.is_some_and(|u| bare(u) == key) {
-        "utility"
+        LmsRole::Utility
     } else {
-        "resident"
+        LmsRole::Resident
     }
 }
 
@@ -301,7 +311,7 @@ pub struct HostSampleAt {
 /// using each sample's OWN measured gap to the next (see [`HostSampleAt`]),
 /// not a synthetic `samples_above_80 × <nominal interval>` count that would
 /// silently assume a constant cadence.
-#[derive(Default, Debug, Clone, Copy)]
+#[derive(Default, Debug, Clone, Copy, serde::Serialize, schemars::JsonSchema)]
 pub struct MetricStats {
     pub peak_pct: Option<u64>,
     pub mean_pct: Option<f64>,
@@ -449,19 +459,13 @@ mod tests {
         let diff = lms_diff(&prev, &cur);
         assert_eq!(diff.len(), 2, "exactly one load + one unload; got {diff:?}");
 
-        let load = diff
-            .iter()
-            .find(|p| p["event"] == "load")
-            .expect("a load event");
-        assert_eq!(load["model"], "C");
-        assert_eq!(load["gb"], 19, "19.40 rounds down to 19");
+        let load = diff.iter().find(|p| p.event == LmsEvent::Load).expect("a load event");
+        assert_eq!(load.model, "C");
+        assert_eq!(load.gb, Some(19), "19.40 rounds down to 19");
 
-        let unload = diff
-            .iter()
-            .find(|p| p["event"] == "unload")
-            .expect("an unload event");
-        assert_eq!(unload["model"], "A");
-        assert!(unload.get("gb").is_none(), "unload carries no gb field");
+        let unload = diff.iter().find(|p| p.event == LmsEvent::Unload).expect("an unload event");
+        assert_eq!(unload.model, "A");
+        assert!(unload.gb.is_none(), "unload carries no gb field");
     }
 
     #[test]
@@ -480,9 +484,9 @@ mod tests {
         let cur = vec![loaded("A", "21.00 GB")];
         let diff = lms_diff(&prev, &cur);
         assert_eq!(diff.len(), 1);
-        assert_eq!(diff[0]["event"], "load");
-        assert_eq!(diff[0]["model"], "A");
-        assert_eq!(diff[0]["gb"], 21);
+        assert_eq!(diff[0].event, LmsEvent::Load);
+        assert_eq!(diff[0].model, "A");
+        assert_eq!(diff[0].gb, Some(21));
     }
 
     #[test]
@@ -494,9 +498,9 @@ mod tests {
         let cur = vec![loaded("primary", "18.00 GB"), loaded("compactor", "2.00 GB")];
         let diff = lms_diff(&[], &cur);
         assert_eq!(diff.len(), 2, "both resident models emit as loads; got {diff:?}");
-        assert!(diff.iter().all(|p| p["event"] == "load"));
+        assert!(diff.iter().all(|p| p.event == LmsEvent::Load));
         let models: std::collections::HashSet<&str> =
-            diff.iter().map(|p| p["model"].as_str().unwrap()).collect();
+            diff.iter().map(|p| p.model.as_str()).collect();
         assert!(models.contains("primary") && models.contains("compactor"));
     }
 
@@ -509,7 +513,7 @@ mod tests {
     fn role_for_load_tags_the_primary() {
         assert_eq!(
             role_for_load("qwen3.6-35b-a3b", "qwen3.6-35b-a3b", Some("qwen3-4b")),
-            "primary"
+            LmsRole::Primary
         );
     }
 
@@ -521,13 +525,13 @@ mod tests {
         // one tag is `utility`.
         assert_eq!(
             role_for_load("qwen3-4b-instruct-2507", "qwen3.6-35b-a3b-turboquant-mlx", Some("qwen3-4b-instruct-2507")),
-            "utility"
+            LmsRole::Utility
         );
     }
 
     #[test]
     fn role_for_load_tags_the_utility_model() {
-        assert_eq!(role_for_load("util-4b", "primary-35b", Some("util-4b")), "utility");
+        assert_eq!(role_for_load("util-4b", "primary-35b", Some("util-4b")), LmsRole::Utility);
     }
 
     #[test]
@@ -535,7 +539,7 @@ mod tests {
         // Not the primary, not the utility model — a model this dispatch
         // never declared (a leftover from an earlier session, or the
         // operator's own unrelated LMStudio use).
-        assert_eq!(role_for_load("leftover-from-earlier-session", "primary-35b", Some("util-4b")), "resident");
+        assert_eq!(role_for_load("leftover-from-earlier-session", "primary-35b", Some("util-4b")), LmsRole::Resident);
     }
 
     #[test]
@@ -544,7 +548,7 @@ mod tests {
         // own id still gets one unambiguous answer — primary wins over
         // utility, checked in that fixed order, rather than depending on
         // which branch happens to run first.
-        assert_eq!(role_for_load("shared", "shared", Some("shared")), "primary");
+        assert_eq!(role_for_load("shared", "shared", Some("shared")), LmsRole::Primary);
     }
 
     #[test]
@@ -553,7 +557,7 @@ mod tests {
         // this staffing, not a rule." A model whose NAME looks like a small
         // utility model, but was never declared as one, is still "resident"
         // — the classifier reads the declared ids, never the string shape.
-        assert_eq!(role_for_load("qwen3-4b-lookalike", "primary-35b", None), "resident");
+        assert_eq!(role_for_load("qwen3-4b-lookalike", "primary-35b", None), LmsRole::Resident);
     }
 
     // (#1934, review round 2) The NAMESPACE half, one case per seat. `lms ps`
@@ -572,7 +576,7 @@ mod tests {
         // "resident" — the run's own primary, unrecognized.
         assert_eq!(
             role_for_load("qwen3.6-35b-a3b", "darkmux:qwen3.6-35b-a3b", Some("qwen3-4b")),
-            "primary"
+            LmsRole::Primary
         );
     }
 
@@ -580,7 +584,7 @@ mod tests {
     fn role_for_load_matches_a_namespaced_compactor_against_a_bare_lms_key() {
         assert_eq!(
             role_for_load("qwen3-4b-instruct-2507", "primary-35b", Some("darkmux:qwen3-4b-instruct-2507")),
-            "utility"
+            LmsRole::Utility
         );
     }
 
@@ -591,7 +595,7 @@ mod tests {
         // `dispatch_internal_tests.rs`, arriving here through a second door.
         assert_eq!(
             role_for_load("qwen3-4b-instruct-2507", "primary-35b", Some("darkmux:qwen3-4b-instruct-2507")),
-            "utility"
+            LmsRole::Utility
         );
     }
 
@@ -603,7 +607,7 @@ mod tests {
         // this half broken.
         assert_eq!(
             role_for_load("darkmux:util-4b", "primary-35b", Some("util-4b")),
-            "utility"
+            LmsRole::Utility
         );
     }
 

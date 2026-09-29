@@ -381,11 +381,7 @@ fn file_mtime(path: &Path) -> Result<i64> {
 }
 
 fn escalation_tag(contract: &EscalationContract) -> &'static str {
-    match contract {
-        EscalationContract::BailWithExplanation => "bail-with-explanation",
-        EscalationContract::RetryWithHint => "retry-with-hint",
-        EscalationContract::HandOffTo(_) => "hand-off-to",
-    }
+    contract.kind().tag()
 }
 
 fn position_str(p: Position) -> &'static str {
@@ -833,30 +829,12 @@ fn is_detector_caution(rec: &darkmux_flow::FlowRecord) -> bool {
 fn caution_fields(
     rec: &darkmux_flow::FlowRecord,
 ) -> (String, String, String, Option<String>, Option<String>) {
-    let payload = rec.payload.as_ref();
-    let str_at = |k: &str| {
-        payload
-            .and_then(|v| v.get(k))
-            .and_then(|v| v.as_str())
-            .map(String::from)
+    let Some(darkmux_flow::Payload::TelemetryDetector(p)) = rec.payload.as_ref() else {
+        return ("unknown".to_string(), "warn".to_string(), String::new(), None, None);
     };
-    let kind = str_at("kind").unwrap_or_else(|| "unknown".to_string());
-    let severity = str_at("severity").unwrap_or_else(|| "warn".to_string());
-    let detail = str_at("detail").unwrap_or_default();
-
-    let area = payload.and_then(|v| v.get("area"));
-    let file = area
-        .and_then(|a| a.get("files"))
-        .and_then(|f| f.as_array())
-        .and_then(|arr| arr.first())
-        .and_then(|v| v.as_str())
-        .map(String::from);
-    let code_hash = area
-        .and_then(|a| a.get("code_hash"))
-        .and_then(|v| v.as_str())
-        .map(String::from);
-
-    (kind, severity, detail, file, code_hash)
+    let file = p.area.as_ref().and_then(|a| a.files.first().cloned());
+    let code_hash = p.area.as_ref().and_then(|a| a.code_hash.clone());
+    (p.kind.as_str().to_string(), p.severity.as_str().to_string(), p.detail.clone(), file, code_hash)
 }
 
 /// (#994) Derive the `cautions` table from the flow stream: scan the per-day
@@ -1197,8 +1175,17 @@ pub fn status() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use darkmux_flow::payload::{DetectorArea, DetectorKind, DetectorSeverity, TelemetryContextPayload, TelemetryDetectorPayload};
     use std::env;
     use tempfile::TempDir;
+
+    /// A warn-level detector finding as a flow payload.
+    fn finding(kind: DetectorKind, detail: &str, area: Option<DetectorArea>) -> darkmux_flow::Payload {
+        darkmux_flow::Payload::TelemetryDetector(TelemetryDetectorPayload {
+            area,
+            ..TelemetryDetectorPayload::new(kind, DetectorSeverity::Warn, detail.to_string())
+        })
+    }
 
     /// RAII guard: point DARKMUX_HOME at a TempDir for the test's
     /// lifetime. Mirrors the loader's pattern; serialized via #[serial].
@@ -1257,10 +1244,9 @@ mod tests {
     /// Build one flow-stream line via the SAME constructor the runtime capture
     /// path uses (`build_telemetry_record`), so the test fixture format can't
     /// drift from what `derive_cautions` parses.
-    fn detector_line(source: darkmux_flow::FlowSource, payload: serde_json::Value) -> String {
+    fn detector_line(source: darkmux_flow::FlowSource, payload: darkmux_flow::Payload) -> String {
         let rec = crate::dispatch::build_telemetry_record(
             darkmux_flow::Level::Info,
-            darkmux_flow::FlowAction::TelemetryDetector,
             source,
             "coder",
             &crate::mission_test_session("m1", "sess-1"), &darkmux_types::execution_id::ExecutionId::mint(),
@@ -1286,22 +1272,23 @@ mod tests {
                 // A file-keyed cycle firing → caution with file=src/x.rs.
                 detector_line(
                     darkmux_flow::FlowSource::Detector,
-                    serde_json::json!({
-                        "kind": "cycle", "severity": "warn", "detail": "`edit` called 3×",
-                        "area": { "files": ["src/x.rs"] }
-                    }),
+                    finding(DetectorKind::Cycle, "`edit` called 3×", Some(DetectorArea { files: vec!["src/x.rs".to_string()], code_hash: None })),
                 ),
                 // An engagement-level firing (no area) → caution with NULL file.
                 detector_line(
                     darkmux_flow::FlowSource::Detector,
-                    serde_json::json!({
-                        "kind": "reasoning-loop", "severity": "warn", "detail": "same reasoning 3×"
-                    }),
+                    finding(DetectorKind::ReasoningLoop, "same reasoning 3×", None),
                 ),
                 // A non-detector telemetry record (source=runtime) → ignored.
                 detector_line(
                     darkmux_flow::FlowSource::Runtime,
-                    serde_json::json!({ "kind": "context", "detail": "context fill 40%" }),
+                    darkmux_flow::Payload::TelemetryContext(TelemetryContextPayload {
+                        used: 40,
+                        max: Some(100),
+                        threshold: None,
+                        step_id: None,
+                        context: None,
+                    }),
                 ),
             ],
         );
@@ -1357,18 +1344,16 @@ mod tests {
             &[
                 detector_line(
                     darkmux_flow::FlowSource::Detector,
-                    serde_json::json!({
-                        "kind": "cycle", "severity": "warn", "detail": "`edit` called 3×",
-                        "area": { "files": ["src/x.rs"] }
-                    }),
+                    finding(DetectorKind::Cycle, "`edit` called 3×", Some(DetectorArea { files: vec!["src/x.rs".to_string()], code_hash: None })),
                 ),
                 detector_line(
                     darkmux_flow::FlowSource::Detector,
-                    serde_json::json!({
-                        "kind": "repetition", "severity": "warn",
-                        "detail": "observation 17: tail_ratio=0.242 over 68000 characters — \
-                                    the degeneracy gate judged this repeating (#2836)"
-                    }),
+                    finding(
+                        DetectorKind::Repetition,
+                        "observation 17: tail_ratio=0.242 over 68000 characters — \
+                         the degeneracy gate judged this repeating (#2836)",
+                        None,
+                    ),
                 ),
             ],
         );
@@ -1397,16 +1382,12 @@ mod tests {
     fn caution_fields_extracts_area_and_defaults() {
         let with_area = crate::dispatch::build_telemetry_record(
             darkmux_flow::Level::Info,
-            darkmux_flow::FlowAction::TelemetryDetector,
             darkmux_flow::FlowSource::Detector,
             "coder",
             &crate::test_session("s"), &darkmux_types::execution_id::ExecutionId::mint(),
             None,
             None,
-            serde_json::json!({
-                "kind": "cycle", "severity": "warn", "detail": "d",
-                "area": { "files": ["f.rs"], "code_hash": "abc" }
-            }),
+            finding(DetectorKind::Cycle, "d", Some(DetectorArea { files: vec!["f.rs".to_string()], code_hash: Some("abc".to_string()) })),
         );
         let (kind, sev, detail, file, code_hash) = caution_fields(&with_area);
         assert_eq!((kind.as_str(), sev.as_str(), detail.as_str()), ("cycle", "warn", "d"));
@@ -1415,13 +1396,12 @@ mod tests {
 
         let no_area = crate::dispatch::build_telemetry_record(
             darkmux_flow::Level::Info,
-            darkmux_flow::FlowAction::TelemetryDetector,
             darkmux_flow::FlowSource::Detector,
             "coder",
             &crate::test_session("s"), &darkmux_types::execution_id::ExecutionId::mint(),
             None,
             None,
-            serde_json::json!({ "kind": "reasoning-loop", "severity": "warn", "detail": "d2" }),
+            finding(DetectorKind::ReasoningLoop, "d2", None),
         );
         let (_, _, _, file2, hash2) = caution_fields(&no_area);
         assert_eq!(file2, None);
@@ -1430,13 +1410,12 @@ mod tests {
         // Malformed payload (no kind/severity/detail) → defaults, never panics.
         let malformed = crate::dispatch::build_telemetry_record(
             darkmux_flow::Level::Info,
-            darkmux_flow::FlowAction::TelemetryDetector,
             darkmux_flow::FlowSource::Detector,
             "coder",
             &crate::test_session("s"), &darkmux_types::execution_id::ExecutionId::mint(),
             None,
             None,
-            serde_json::json!({ "unexpected": true }),
+            darkmux_flow::Payload::settle(&darkmux_flow::FlowAction::TelemetryDetector, serde_json::json!({ "unexpected": true })),
         );
         let (k3, s3, d3, _, _) = caution_fields(&malformed);
         assert_eq!((k3.as_str(), s3.as_str(), d3.as_str()), ("unknown", "warn", ""));
@@ -1446,25 +1425,23 @@ mod tests {
     fn is_detector_caution_keys_on_category_and_source() {
         let detector = crate::dispatch::build_telemetry_record(
             darkmux_flow::Level::Info,
-            darkmux_flow::FlowAction::TelemetryDetector,
             darkmux_flow::FlowSource::Detector,
             "coder",
             &crate::test_session("s"), &darkmux_types::execution_id::ExecutionId::mint(),
             None,
             None,
-            serde_json::json!({}),
+            finding(DetectorKind::Cycle, "d", None),
         );
         assert!(is_detector_caution(&detector));
 
         let runtime = crate::dispatch::build_telemetry_record(
             darkmux_flow::Level::Info,
-            darkmux_flow::FlowAction::TelemetryRuntime,
             darkmux_flow::FlowSource::Runtime,
             "coder",
             &crate::test_session("s"), &darkmux_types::execution_id::ExecutionId::mint(),
             None,
             None,
-            serde_json::json!({}),
+            darkmux_flow::Payload::TelemetryRuntime(darkmux_flow::payload::TelemetryRuntimePayload { turns: 1, step_id: None, context: None }),
         );
         assert!(!is_detector_caution(&runtime), "non-detector telemetry is not a caution");
 

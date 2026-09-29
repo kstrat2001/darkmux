@@ -229,7 +229,8 @@
           "payload": {
             "scope": "endpoint",
             "endpoint_id": "azure",
-            "wait_ms": 86000000
+            "wait_ms": 86000000,
+            "message": "budget.wait"
           }
         }
       ],
@@ -247,7 +248,9 @@
           "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
           "payload": {
             "endpoint_id": "azure",
-            "wait_ms": 600000
+            "wait_ms": 600000,
+            "scope": "endpoint",
+            "message": "budget.wait"
           }
         }
       ],
@@ -265,7 +268,9 @@
           "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
           "payload": {
             "endpoint_id": "azure",
-            "wait_ms": 600000
+            "wait_ms": 600000,
+            "scope": "endpoint",
+            "message": "budget.wait"
           }
         }
       ],
@@ -283,7 +288,9 @@
           "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
           "payload": {
             "endpoint_id": "azure",
-            "wait_ms": 600000
+            "wait_ms": 600000,
+            "scope": "endpoint",
+            "message": "budget.wait"
           }
         }
       ],
@@ -302,7 +309,9 @@
           "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
           "payload": {
             "endpoint_id": "azure",
-            "wait_ms": 600000
+            "wait_ms": 600000,
+            "scope": "endpoint",
+            "message": "budget.wait"
           }
         },
         {
@@ -312,7 +321,9 @@
           "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
           "payload": {
             "endpoint_id": "azure",
-            "waited_ms": 60000
+            "waited_ms": 60000,
+            "scope": "endpoint",
+            "message": "budget.resume"
           }
         },
         {
@@ -337,7 +348,9 @@
           "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
           "payload": {
             "endpoint_id": "azure",
-            "wait_ms": 86000000
+            "wait_ms": 86000000,
+            "scope": "endpoint",
+            "message": "budget.wait"
           }
         },
         {
@@ -347,7 +360,9 @@
           "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
           "payload": {
             "endpoint_id": "azure",
-            "reason": "mission `m` is aborted"
+            "reason": "mission `m` is aborted",
+            "scope": "endpoint",
+            "message": "budget.stop"
           }
         }
       ],
@@ -366,7 +381,9 @@
           "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
           "payload": {
             "endpoint_id": "azure",
-            "wait_ms": 86000000
+            "wait_ms": 86000000,
+            "scope": "endpoint",
+            "message": "budget.wait"
           }
         },
         {
@@ -375,7 +392,9 @@
           "session_id": "crew-dispatch-coder-1",
           "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
           "payload": {
-            "endpoint_id": "azure"
+            "endpoint_id": "azure",
+            "scope": "endpoint",
+            "message": "budget.stop"
           }
         }
       ],
@@ -401,7 +420,9 @@
           "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
           "payload": {
             "endpoint_id": "azure",
-            "wait_ms": 86000000
+            "wait_ms": 86000000,
+            "scope": "endpoint",
+            "message": "budget.wait"
           }
         },
         {
@@ -411,7 +432,9 @@
           "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
           "payload": {
             "endpoint_id": "azure",
-            "reason": "the run was interrupted"
+            "reason": "the run was interrupted",
+            "scope": "endpoint",
+            "message": "budget.stop"
           }
         }
       ],
@@ -430,7 +453,9 @@
           "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
           "payload": {
             "endpoint_id": "azure",
-            "wait_ms": 86000000
+            "wait_ms": 86000000,
+            "scope": "endpoint",
+            "message": "budget.wait"
           }
         },
         {
@@ -440,7 +465,9 @@
           "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
           "payload": {
             "endpoint_id": "azure",
-            "reason": "mission `m` is aborted"
+            "reason": "mission `m` is aborted",
+            "scope": "endpoint",
+            "message": "budget.stop"
           }
         },
         {
@@ -634,7 +661,9 @@
           "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
           "payload": {
             "endpoint_id": "azure",
-            "wait_ms": 600000
+            "wait_ms": 600000,
+            "scope": "endpoint",
+            "message": "budget.wait"
           }
         }
       ],
@@ -652,7 +681,9 @@
           "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
           "payload": {
             "endpoint_id": "azure",
-            "wait_ms": 60000
+            "wait_ms": 60000,
+            "scope": "endpoint",
+            "message": "budget.wait"
           }
         },
         {
@@ -662,7 +693,9 @@
           "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
           "payload": {
             "endpoint_id": "azure",
-            "wait_ms": 600000
+            "wait_ms": 600000,
+            "scope": "endpoint",
+            "message": "budget.wait"
           }
         }
       ],
@@ -680,7 +713,9 @@
           "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
           "payload": {
             "endpoint_id": "azure",
-            "wait_ms": 600000
+            "wait_ms": 600000,
+            "scope": "endpoint",
+            "message": "budget.wait"
           }
         },
         {
@@ -1152,14 +1187,20 @@
           "session_id": "s1",
           "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
           "payload": {
-            "wait_ms": 1800000
+            "wait_ms": 1800000,
+            "scope": "endpoint",
+            "message": "budget.wait"
           }
         },
         {
           "ts": "2026-09-27T10:00:00Z",
           "action": "budget.resume",
           "session_id": "s1",
-          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001"
+          "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+          "payload": {
+            "scope": "endpoint",
+            "message": "budget.resume"
+          }
         }
       ],
       "phase": "stale",
@@ -1182,7 +1223,9 @@
           "session_id": "s1",
           "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
           "payload": {
-            "wait_ms": 1800000
+            "wait_ms": 1800000,
+            "scope": "endpoint",
+            "message": "budget.wait"
           }
         },
         {

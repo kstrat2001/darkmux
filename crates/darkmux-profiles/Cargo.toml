@@ -34,6 +34,8 @@ anyhow = "1.0"
 # /machine/resources).
 # Already throughout the workspace dependency tree — not a new external dep.
 serde = { version = "1.0", features = ["derive"] }
+# The `--json` contract golden derives its field schemas from the output types.
+schemars = "1.2"
 serde_json.workspace = true
 dirs = "5.0"
 

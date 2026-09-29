@@ -56,7 +56,7 @@
 import type { Route } from "./route";
 import { uidOf } from "./flow";
 import type { ProcSamplePoint } from "./hostStats";
-import { ACTION, CATEGORY, SOURCE, byTime, recordsAsOf, recordsSince, type NormRecord } from "./ingest";
+import { ACTION, CATEGORY, SOURCE, byTime, payloadOf, recordsAsOf, recordsSince, type NormRecord } from "./ingest";
 
 const DRAWER_ROLLING_WINDOW_MS = 10 * 60 * 1000;
 export const DRAWER_ROLLING_SCOPE_LABEL = "last 10 min";
@@ -85,24 +85,21 @@ export function isHostSampleRecord(r: NormRecord): boolean {
   );
 }
 
-function toPoint(r: NormRecord): ProcSamplePoint {
-  // Raw route/window records carry `payload`; a normalized render model
-  // (`flowToRenderModel`) renames it to `fields` — accept either so this
-  // works against whichever shape a caller hands it.
-  const f = (r.payload ?? r.fields) as Record<string, unknown> | undefined;
+/** A host sample's cpu/mem/gpu, from a `machine.telemetry` payload or, for a
+ *  record an older archive holds, the retired `telemetry.process` shape
+ *  (`source: "host"`, bare `cpu`/`mem`/`gpu`). */
+export function toPoint(r: NormRecord): ProcSamplePoint {
   const num = (v: unknown): number | undefined => {
+    if (v == null) return undefined;
     const n = Number(v);
     return Number.isFinite(n) ? n : undefined;
   };
-  // (#2413) `machine.telemetry` carries the full `host_probe` shape
-  // (`cpu_pct`/`mem_pct`/`gpu_pct`); the retired `telemetry.process`
-  // carried bare `cpu`/`mem`/`gpu`. Prefer the new keys, fall back to the
-  // old ones, so either record shape resolves to the same point.
-  return {
-    cpu: num(f?.cpu_pct ?? f?.cpu),
-    mem: num(f?.mem_pct ?? f?.mem),
-    gpu: num(f?.gpu_pct ?? f?.gpu),
-  };
+  const sample = payloadOf(r, ACTION.MachineTelemetry);
+  if (sample) return { cpu: num(sample.cpu_pct), mem: num(sample.mem_pct), gpu: num(sample.gpu_pct) };
+  // Raw route/window records carry `payload`; a normalized render model
+  // (`flowToRenderModel`) renames it to `fields`: accept either.
+  const legacy = (r.payload ?? r.fields) as { cpu?: unknown; mem?: unknown; gpu?: unknown } | undefined;
+  return { cpu: num(legacy?.cpu), mem: num(legacy?.mem), gpu: num(legacy?.gpu) };
 }
 
 export interface LastKnownSample {

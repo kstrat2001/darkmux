@@ -73,15 +73,19 @@ struct Folded {
 
 impl Folded {
     fn of(action: Option<&FlowAction>, mission: Option<&str>, ts: &str, v: &serde_json::Value) -> Self {
-        let payload = darkmux_crew::usage::payload_of(v);
+        let (names_a_reason, wait_ms) = match darkmux_flow::reader::payload_of(v) {
+            Some(darkmux_flow::Payload::BudgetStop(p)) => (p.reason.as_deref().is_some_and(|r| !r.is_empty()), 0),
+            Some(darkmux_flow::Payload::BudgetWait(p)) => (false, p.wait_ms.unwrap_or(0)),
+            _ => (false, 0),
+        };
         Folded {
             action: action.cloned(),
             mission: mission.map(str::to_string),
             execution: action.filter(|a| a.grain() == Some(Grain::Execution)).map(|_| darkmux_flow::legacy::execution_of(v)),
             ts: ts.to_string(),
             at: crate::runs::parse_flow_ts(ts),
-            names_a_reason: payload.get("reason").and_then(|r| r.as_str()).is_some_and(|r| !r.is_empty()),
-            wait_ms: payload.get("wait_ms").and_then(|w| w.as_u64()).unwrap_or(0),
+            names_a_reason,
+            wait_ms,
         }
     }
 

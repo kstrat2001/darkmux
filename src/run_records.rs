@@ -170,7 +170,7 @@ fn stats_runs(runs: &[String], baseline: &[String], json: bool) -> Result<i32> {
     if runs.len() == 1 && baseline.is_empty() {
         let s = lab::stats::run_stats(&runs[0])?;
         if json {
-            println!("{}", serde_json::to_string_pretty(&s)?);
+            crate::cli_json::emit(&s)?;
         } else {
             print!("{}", render::run_text(&s));
         }
@@ -179,7 +179,7 @@ fn stats_runs(runs: &[String], baseline: &[String], json: bool) -> Result<i32> {
     let cand = render::load_set(runs);
     let base = (!baseline.is_empty()).then(|| render::load_set(baseline));
     if json {
-        println!("{}", serde_json::to_string_pretty(&render::sets_json(&cand, base.as_ref()))?);
+        crate::cli_json::emit(&render::sets_json(&cand, base.as_ref()))?;
     } else {
         print!("{}", render::sets_text(&cand, base.as_ref()));
     }

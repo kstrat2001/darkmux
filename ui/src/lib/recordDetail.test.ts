@@ -7,12 +7,12 @@ import { norm } from "../testing/records";
  * (captured from `~/.darkmux/flows/2026-08-25.jsonl`, run
  * `crawl-error-discard-deep-1787669136-1`). */
 function toolRec(payload: Record<string, unknown>): NormRecord {
-  return norm({ ts: "2026-08-25T14:45:41Z", action: "dispatch.tool", fields: payload });
+  return norm({ ts: "2026-08-25T14:45:41Z", action: "dispatch.tool", payload: payload });
 }
 
 describe("dispatch.tool outcome (#2008)", () => {
   const rec = (fields: Record<string, unknown>) =>
-    norm({ action: "dispatch.tool", fields: { tool_name: "bash", args: "{}", result_chars: 12, ...fields } });
+    norm({ action: "dispatch.tool", payload: { tool_name: "bash", args: "{}", result_chars: 12, ...fields } });
 
   it("shows the exit code for a command that RAN and reported non-zero", () => {
     // A red test is the tool working. Marking it ❌ told the operator the
@@ -90,7 +90,7 @@ describe("recordDetail", () => {
     expect(recordDetail(toolRec({ tool_name: "read", args_chars: 76, result_chars: 1553 }))).toBe("read 76ch → 1553ch");
   });
 
-  it("reads `payload` as well as `fields` (records that never went through flowToRenderModel)", () => {
+  it("reads a record's `payload`", () => {
     const r = norm({
       ts: "2026-08-25T14:45:41Z",
       action: "dispatch.tool",
@@ -103,13 +103,13 @@ describe("recordDetail", () => {
     const r = norm({
       ts: "2026-08-25T14:45:41Z",
       action: "dispatch.turn",
-      fields: { turn_seq: 7, finish_reason: "length" },
+      payload: { turn_seq: 7, finish_reason: "length" },
     });
     expect(recordDetail(r)).toBe("turn 7 (length)");
   });
 
   it("returns nothing for a record kind with no preview", () => {
-    const r = norm({ ts: "2026-08-25T14:45:41Z", action: "dispatch.turn.heartbeat", fields: {} });
+    const r = norm({ ts: "2026-08-25T14:45:41Z", action: "dispatch.turn.heartbeat", payload: {} });
     expect(recordDetail(r)).toBe("");
   });
 
@@ -121,11 +121,11 @@ describe("recordDetail", () => {
   // at the SOURCE (inside `recordDetail` itself) so every caller — direct
   // or through `recordObject` — gets it for free.
   it("escapes a bidi override in its own output, not just recordObject's fallback", () => {
-    const toolRecord = norm({ ts: "2026-08-25T14:45:41Z", action: "dispatch.tool", fields: { tool_name: "bash", args: JSON.stringify({ command: "echo ok‮txt.exe" }) } });
+    const toolRecord = norm({ ts: "2026-08-25T14:45:41Z", action: "dispatch.tool", payload: { tool_name: "bash", args: JSON.stringify({ command: "echo ok‮txt.exe" }) } });
     expect(recordDetail(toolRecord)).not.toContain("‮");
     expect(recordDetail(toolRecord)).toContain("⟨U+202E⟩");
 
-    const reasoningRecord = norm({ ts: "2026-08-25T14:45:41Z", action: "dispatch.reasoning", fields: { reasoning_text: "Let me ‮esrever siht‬." } });
+    const reasoningRecord = norm({ ts: "2026-08-25T14:45:41Z", action: "dispatch.reasoning", payload: { reasoning_text: "Let me ‮esrever siht‬." } });
     expect(recordDetail(reasoningRecord)).not.toContain("‮");
     expect(recordDetail(reasoningRecord)).toContain("⟨U+202E⟩");
   });
@@ -162,7 +162,7 @@ describe("escapeBidiControls (#2863 review, finding 7)", () => {
 
 describe("recordObject", () => {
   const tool = (fields: Record<string, unknown>) =>
-    norm({ action: "dispatch.tool", fields: { result_chars: 10, ...fields } });
+    norm({ action: "dispatch.tool", payload: { result_chars: 10, ...fields } });
 
   it("names a file tool by its file, with the container prefix dropped", () => {
     const o = recordObject(tool({ tool_name: "edit", args: '{"path":"/workspace/test/tokenRotation.test.js","edits":[]}', ok: true, outcome: "ok" }));
@@ -344,7 +344,7 @@ describe("recordObject", () => {
   });
 
   it("a reasoning record with no text says so rather than showing a bare chip", () => {
-    const r = norm({ action: "dispatch.reasoning", fields: { reasoning_text: "\n\n" } });
+    const r = norm({ action: "dispatch.reasoning", payload: { reasoning_text: "\n\n" } });
     expect(recordObject(r).text).toBe("(no reasoning text)");
   });
 
@@ -377,18 +377,18 @@ describe("recordObject", () => {
   });
 
   it("(#2863 review, finding 7) escapes a bidi override in a reasoning row", () => {
-    const r = norm({ action: "dispatch.reasoning", fields: { reasoning_text: "Let me ‮esrever siht‬ read." } });
+    const r = norm({ action: "dispatch.reasoning", payload: { reasoning_text: "Let me ‮esrever siht‬ read." } });
     expect(recordObject(r).text).not.toContain("‮");
     expect(recordObject(r).text).toContain("⟨U+202E⟩");
   });
 
   it("a reasoning row is its first line, without the JSON-string quotes it sometimes carries", () => {
-    const r = norm({ action: "dispatch.reasoning", fields: { reasoning_text: '"Let me analyze the implementation.\n\nMore."' } });
+    const r = norm({ action: "dispatch.reasoning", payload: { reasoning_text: '"Let me analyze the implementation.\n\nMore."' } });
     expect(recordObject(r)).toEqual({ chip: "reasoning", kind: "think", text: "Let me analyze the implementation.", mono: false });
   });
 
   it("anything else keeps its existing one-line detail and no chip", () => {
-    const r = norm({ action: "dispatch.start", fields: { prompt_chars: 3204 } });
+    const r = norm({ action: "dispatch.start", payload: { prompt_chars: 3204 } });
     expect(recordObject(r)).toEqual({ text: "start (prompt: 3204ch)", mono: false });
   });
 });

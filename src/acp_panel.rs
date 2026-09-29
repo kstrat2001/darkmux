@@ -45,6 +45,7 @@ use crate::crew::mission_config::{self, LaunchParams, MissionConfig};
 use crate::crew::scheduler::SchedulerReport;
 use crate::crew::step_kinds::{Facts, FixedEstimator, StepKindRegistry};
 use crate::crew::types::{NodeStatus, Step, Task};
+use darkmux_flow::payload::{GhVerbExecutedPayload, RunPayload};
 use darkmux_types::session_id::{RunId, SessionId};
 use anyhow::{bail, Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -814,16 +815,13 @@ pub fn run_ephemeral(
             crate::flow::Edge::Error,
             &config_id_for_abort,
             &correlation_for_abort,
-            serde_json::json!({
-                "result_class": "error",
-                "error": "ephemeral panel run terminated before completion (early return or panic)",
-            }),
+            RunPayload::failed("ephemeral panel run terminated before completion (early return or panic)"),
         )
     });
     bookend.open(
         "run",
         "run",
-        crate::mission_launch::run_bookend_record(crate::flow::Edge::Start, &config.id, &correlation, serde_json::json!({})),
+        crate::mission_launch::run_bookend_record(crate::flow::Edge::Start, &config.id, &correlation, RunPayload::default()),
     );
 
     // (#1685) Track whether an operator sign-off gate was actually
@@ -891,10 +889,7 @@ pub fn run_ephemeral(
                     crate::flow::Edge::Error,
                     &config.id,
                     &correlation,
-                    serde_json::json!({
-                        "result_class": "error",
-                        "error": e.to_string(),
-                    }),
+                    RunPayload::failed(e.to_string()),
                 ),
             );
             return Err(e.context("running panel command graph"));
@@ -910,10 +905,7 @@ pub fn run_ephemeral(
                     crate::flow::Edge::Error,
                     &config.id,
                     &correlation,
-                    serde_json::json!({
-                        "result_class": "error",
-                        "error": e.to_string(),
-                    }),
+                    RunPayload::failed(e.to_string()),
                 ),
             );
             return Err(e);
@@ -926,9 +918,7 @@ pub fn run_ephemeral(
             if outcome.success { crate::flow::Edge::Complete } else { crate::flow::Edge::Error },
             &config.id,
             &correlation,
-            serde_json::json!({
-                "result_class": if outcome.success { "ok" } else { "error" },
-            }),
+            RunPayload::ended(outcome.success),
         ),
     );
 
@@ -975,19 +965,18 @@ pub(crate) fn emit_cmd_audit(verb: &str, args: &str, cwd: &Path, gate_confirmed:
     let record = crate::flow::FlowRecord {
         tier: crate::flow::Tier::Operator,
         source: Some(darkmux_flow::FlowSource::CmdGateAudit),
-        payload: Some(serde_json::json!({
-            "verb": verb,
-            "pr": pr,
-            "worktree": cwd.to_string_lossy(),
-            "confirmed": gate_confirmed,
-            "success": success,
-        })),
-        ..crate::flow::FlowRecord::for_session(
+        ..crate::flow::FlowRecord::for_session_with(
             &SessionId::run(run.clone()),
             if success { crate::flow::Level::Info } else { crate::flow::Level::Warn },
             crate::flow::Category::Audit,
             crate::flow::Stage::Review,
-            darkmux_flow::FlowAction::GhVerbExecuted,
+            darkmux_flow::Payload::GhVerbExecuted(GhVerbExecutedPayload {
+                verb: verb.to_string(),
+                pr,
+                worktree: cwd.to_string_lossy().into_owned(),
+                confirmed: gate_confirmed,
+                success,
+            }),
             handle,
         )
     };

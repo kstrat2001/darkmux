@@ -117,7 +117,8 @@ pub(crate) fn find_embedded(id: &str) -> Option<&'static str> {
 /// variants (unlike `workloads::WorkloadSource`'s two, which folds on-disk
 /// and embedded together under `Builtin`) because `darkmux doctor`'s
 /// mission-config check surfaces the tier explicitly, per the packet spec.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "kebab-case")]
 pub enum MissionConfigSource {
     /// `<mission_configs_dir()>/<id>.json` — operator override.
     User,

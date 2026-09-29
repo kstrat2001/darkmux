@@ -24,6 +24,8 @@ use crate::step_config::{
     MapSource, ShellConfig, SingleShotConfig,
 };
 use crate::types::{Step, Task};
+use darkmux_flow::payload::{DispatchEndPayload, DispatchStartPayload, ResultClass, StepResultPayload};
+use darkmux_trajectory::FailedExec;
 use darkmux_types::execution_id::ExecutionId;
 use darkmux_types::session_id::{SessionId, SessionScope};
 use anyhow::{anyhow, bail, Context, Result};
@@ -242,21 +244,6 @@ fn step_endpoint(call: &ModelCallConfig) -> Result<Option<darkmux_types::ModelEn
     crate::target::step_unmanaged_endpoint(call.endpoint.as_ref(), call.config_path.as_deref())
 }
 
-/// (#1230 Packet 4 DRY pass) One `failed_tool_invocations` entry from the
-/// internal runtime's `--json` envelope — a verifier command the dispatched
-/// role's tool loop attempted to run but never actually executed (missing
-/// binary, toolchain not present, etc). Moved here from `src/coder_phase.rs`
-/// (was mission-run-private) so ANY `dispatch.internal`-shaped step can
-/// surface it, not just `mission.coder` — see `parse_failed_verifiers` and
-/// `DispatchInternalStepKind`'s `parse_verifiers` config opt-in below.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct FailedVerifier {
-    #[serde(default)]
-    pub command: String,
-    #[serde(default)]
-    pub reason: String,
-}
-
 /// Best-effort parse of `failed_tool_invocations` from the internal
 /// runtime's `--json` envelope (a dispatch's stdout). In `--json` mode the
 /// runtime prints a single-line JSON envelope to stdout (status goes to
@@ -264,7 +251,7 @@ pub struct FailedVerifier {
 /// fallback is pure defense against an unexpected leading line. Returns
 /// EMPTY on any parse miss or absent field — a soft signal must never fire
 /// a FALSE alarm, so "couldn't tell" reads as "nothing failed."
-pub fn parse_failed_verifiers(envelope_stdout: &str) -> Vec<FailedVerifier> {
+pub fn parse_failed_verifiers(envelope_stdout: &str) -> Vec<FailedExec> {
     let as_json = |s: &str| serde_json::from_str::<serde_json::Value>(s.trim()).ok();
     let Some(v) = as_json(envelope_stdout).or_else(|| {
         envelope_stdout
@@ -279,7 +266,7 @@ pub fn parse_failed_verifiers(envelope_stdout: &str) -> Vec<FailedVerifier> {
         .and_then(|a| a.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|e| serde_json::from_value::<FailedVerifier>(e.clone()).ok())
+                .filter_map(|e| serde_json::from_value::<FailedExec>(e.clone()).ok())
                 .collect()
         })
         .unwrap_or_default()
@@ -353,7 +340,7 @@ pub struct DispatchInternalStepKind;
 /// is set — see `DispatchInternalStepKind`'s doc. `dispatch_as_crew_of_one`
 /// is the sole consumer today; kept `pub` (not `pub(crate)`) since a
 /// `Step.output` on disk is operator-inspectable data, same visibility as
-/// `FailedVerifier` above.
+/// `FailedExec`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RawDispatchOutcome {
     pub exit_code: i32,
@@ -555,18 +542,16 @@ impl StepKind for DispatchInternalStepKind {
             if !failed.is_empty() {
                 flow_records.push(darkmux_flow::FlowRecord {
                     source: Some(darkmux_flow::FlowSource::Scheduler),
-                    payload: Some(serde_json::json!({
-                        "step_id": step.id,
-                        "kind": "dispatch.internal",
-                        "failed_verifiers": failed,
-                        "count": failed.len(),
-                    })),
-                    ..darkmux_flow::FlowRecord::for_session(
+                    ..darkmux_flow::FlowRecord::for_session_with(
                         &SessionId::task(ctx.run_id().clone(), &step.task_id),
                         darkmux_flow::Level::Warn,
                         darkmux_flow::Category::Work,
                         darkmux_flow::Stage::Dispatch,
-                        darkmux_flow::FlowAction::StepResult,
+                        darkmux_flow::Payload::StepResult(StepResultPayload {
+                            count: Some(failed.len() as u64),
+                            failed_verifiers: Some(failed),
+                            ..StepResultPayload::new(&step.id, "dispatch.internal")
+                        }),
                         step.id.clone(),
                     )
                 });
@@ -714,23 +699,22 @@ fn hosted_single_shot_step_payload(
     max_tokens_requested: u32,
     max_tokens_sent: u32,
     reply: &crate::single_shot::SingleShotReply,
-) -> serde_json::Value {
+) -> StepResultPayload {
     let counts = &reply.counts;
-    serde_json::json!({
-        "step_id": step_id,
-        "kind": "dispatch.single_shot",
+    StepResultPayload {
         // (#2902 step 5, CLAUDE.md contract 8: the wire keeps its historical
         // spelling) The per-step cap, under the key v3.13.0 shipped.
-        "remote_max_tokens_per_execution": budget,
-        "max_tokens_requested": max_tokens_requested,
-        "max_tokens_sent": max_tokens_sent,
-        "prompt_tokens": counts.prompt,
-        "completion_tokens": counts.completion,
-        "total_tokens": counts.total_tokens(),
+        remote_max_tokens_per_execution: budget,
+        max_tokens_requested: Some(u64::from(max_tokens_requested)),
+        max_tokens_sent: Some(u64::from(max_tokens_sent)),
+        prompt_tokens: counts.prompt,
+        completion_tokens: counts.completion,
+        total_tokens: counts.total_tokens(),
         // (#1444, payload-additive — FLOW_SCHEMA_VERSION 1.44.0)
-        "reasoning_tokens": counts.reasoning,
-        "cached_tokens": counts.cached,
-    })
+        reasoning_tokens: counts.reasoning,
+        cached_tokens: counts.cached,
+        ..StepResultPayload::new(step_id, "dispatch.single_shot")
+    }
 }
 
 /// The contract-#2 bookend records of ONE role execution a Tier-1 step kind
@@ -741,8 +725,7 @@ fn hosted_single_shot_step_payload(
 /// The savings hero reads `payload.endpoint` off these bookends and off
 /// nothing else, so hosted spend is attributed to the endpoint the call went
 /// to. `endpoint_label` is `None` for a local call, which leaves the payload
-/// byte-identical to a purely-local dispatch's, the same no-op-when-None
-/// discipline `stamp_remote_classification` keeps.
+/// byte-identical to a purely-local dispatch's: the key is simply absent.
 struct ExecutionBookends<'a> {
     /// The step kind's id, stamped as the payload's `kind`.
     kind: &'static str,
@@ -754,46 +737,62 @@ struct ExecutionBookends<'a> {
 }
 
 impl ExecutionBookends<'_> {
-    fn record(&self, action: darkmux_flow::FlowAction, level: darkmux_flow::Level, extra: serde_json::Value) -> darkmux_flow::FlowRecord {
-        let mut payload = serde_json::json!({
-            "step_id": self.step.id,
-            "kind": self.kind,
-        });
-        if let (Some(obj), Some(ex)) = (payload.as_object_mut(), extra.as_object()) {
-            for (k, v) in ex {
-                obj.insert(k.clone(), v.clone());
-            }
-        }
-        darkmux_flow::stamp_remote_classification(&mut payload, self.endpoint_label, None);
+    /// This execution's record carrying `payload` (whose action is the
+    /// record's) at `level`.
+    fn record(&self, level: darkmux_flow::Level, payload: darkmux_flow::Payload) -> darkmux_flow::FlowRecord {
         darkmux_flow::FlowRecord {
             source: Some(darkmux_flow::FlowSource::Scheduler),
             model: Some(self.model.to_string()),
-            payload: Some(payload),
-            ..darkmux_flow::FlowRecord::for_execution(
+            ..darkmux_flow::FlowRecord::for_execution_with(
                 self.session,
                 self.execution,
                 level,
                 darkmux_flow::Category::Work,
                 darkmux_flow::Stage::Dispatch,
-                action,
+                payload,
                 self.step.id.clone(),
             )
         }
     }
 
-    /// Open the execution's liveness edge and arm its terminal: `start_extra`
-    /// rides the `dispatch.start`, and dropping the guard without `close`
-    /// (a `?`, a panic) writes a `dispatch.error` saying `abort_message`.
-    fn open<'c>(&self, ctx: Option<&'c StepRunCtx>, start_extra: serde_json::Value, abort_message: &str) -> StepBookend<'c> {
-        let mut abort = start_extra.clone();
-        if let Some(obj) = abort.as_object_mut() {
-            obj.insert("result_class".to_string(), serde_json::json!("error"));
-            obj.insert("error".to_string(), serde_json::json!(abort_message));
+    /// A `dispatch.start` payload naming this execution's step and kind, and
+    /// the hosted endpoint it calls (absent for a local call).
+    fn start_payload(&self, item_index: Option<u64>) -> DispatchStartPayload {
+        DispatchStartPayload {
+            step_id: Some(self.step.id.clone()),
+            kind: Some(self.kind.to_string()),
+            item_index,
+            endpoint: self.endpoint_label.map(str::to_string),
+            ..Default::default()
         }
+    }
+
+    /// A terminal payload naming this execution's step and kind, and the
+    /// hosted endpoint it called, for the caller to fill in.
+    fn end_payload(&self) -> DispatchEndPayload {
+        DispatchEndPayload {
+            step_id: Some(self.step.id.clone()),
+            kind: Some(self.kind.to_string()),
+            endpoint: self.endpoint_label.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    /// Open the execution's liveness edge and arm its terminal: the
+    /// `dispatch.start` names the map item (`item_index`) when it is one, and
+    /// dropping the guard without `close` (a `?`, a panic) writes a
+    /// `dispatch.error` saying `abort_message`.
+    fn open<'c>(&self, ctx: Option<&'c StepRunCtx>, item_index: Option<u64>, abort_message: &str) -> StepBookend<'c> {
+        let abort = DispatchEndPayload {
+            item_index,
+            result_class: Some(ResultClass::Error),
+            error: Some(abort_message.to_string()),
+            ..self.end_payload()
+        };
         StepBookend::new(
             ctx,
-            self.record(darkmux_flow::FlowAction::DispatchStart, darkmux_flow::Level::Info, start_extra),
-            self.record(darkmux_flow::FlowAction::DispatchError, darkmux_flow::Level::Error, abort),
+            self.record(darkmux_flow::Level::Info, darkmux_flow::Payload::DispatchStart(self.start_payload(item_index))),
+            self.record(darkmux_flow::Level::Error, darkmux_flow::Payload::DispatchError(abort)),
         )
     }
 }
@@ -942,7 +941,7 @@ impl DispatchSingleShotStepKind {
             model: wire_model.as_ref(),
             endpoint_label: endpoint_label.as_deref(),
         };
-        let mut bookend = records.open(ctx, serde_json::json!({}), "dispatch.single_shot terminated before completion (early return or panic)");
+        let mut bookend = records.open(ctx, None, "dispatch.single_shot terminated before completion (early return or panic)");
 
         // (#2344) Session-liveness heartbeat — the same in-process twin of
         // the container path's emitter (#638) `dispatch.map` grew, opened at
@@ -1011,14 +1010,20 @@ impl DispatchSingleShotStepKind {
             flow_records.push(darkmux_flow::FlowRecord {
                 source: Some(darkmux_flow::FlowSource::Scheduler),
                 model: Some(wire_model.to_string()),
-                payload: Some(hosted_single_shot_step_payload(
-                    &step.id,
-                    budget,
-                    max_tokens,
-                    max_tokens,
-                    &reply,
-                )),
-                ..darkmux_flow::FlowRecord::for_session(session, darkmux_flow::Level::Info, darkmux_flow::Category::Work, darkmux_flow::Stage::Dispatch, darkmux_flow::FlowAction::StepResult, step.id.clone())
+                ..darkmux_flow::FlowRecord::for_session_with(
+                    session,
+                    darkmux_flow::Level::Info,
+                    darkmux_flow::Category::Work,
+                    darkmux_flow::Stage::Dispatch,
+                    darkmux_flow::Payload::StepResult(hosted_single_shot_step_payload(
+                        &step.id,
+                        budget,
+                        max_tokens,
+                        max_tokens,
+                        &reply,
+                    )),
+                    step.id.clone(),
+                )
             });
 
             reply
@@ -1047,7 +1052,6 @@ impl DispatchSingleShotStepKind {
             endpoint_label.clone().unwrap_or_else(|| crate::usage::lmstudio_endpoint(None));
         let usage_record = crate::dispatch::build_telemetry_record(
             darkmux_flow::Level::Info,
-            darkmux_flow::FlowAction::TelemetryTokens,
             darkmux_flow::FlowSource::Tokens,
             &step.id,
             session,
@@ -1056,13 +1060,13 @@ impl DispatchSingleShotStepKind {
             None,
             // A step runs no role (#2914: `None` → the call's `purpose` is decided
             // by its kind alone).
-            reply.usage_payload(
+            darkmux_flow::Payload::TelemetryTokens(reply.usage_payload(
                 crate::usage::CallKind::SingleShot,
                 None,
                 wire_model.as_ref(),
                 &usage_endpoint,
                 endpoint.as_ref().and_then(|ep| ep.named_id()),
-            ),
+            )),
         );
         match ctx {
             Some(c) => c.emit(usage_record),
@@ -1076,12 +1080,12 @@ impl DispatchSingleShotStepKind {
             em.stop();
         }
         bookend.close(records.record(
-            darkmux_flow::FlowAction::DispatchComplete,
             darkmux_flow::Level::Info,
-            serde_json::json!({
-                "result_class": "ok",
-                "stdout_chars": reply.content.len(),
-                "total_tokens": reply.counts.total_tokens(),
+            darkmux_flow::Payload::DispatchComplete(DispatchEndPayload {
+                result_class: Some(ResultClass::Ok),
+                stdout_chars: Some(reply.content.len() as u64),
+                total_tokens: reply.counts.total_tokens(),
+                ..records.end_payload()
             }),
         ));
 
@@ -1475,22 +1479,28 @@ impl DispatchMapStepKind {
         darkmux_flow::FlowRecord {
             source: Some(darkmux_flow::FlowSource::Scheduler),
             model: Some(model.to_string()),
-            payload: Some(serde_json::json!({
-                "step_id": step.id,
-                "kind": "dispatch.map",
-                "index": res.index,
-                "ok": res.ok,
-                "remote": remote,
-                "total_tokens": res.total_tokens,
-                // (#1442) Per-item telemetry: the endpoint-reported served
-                // model (HOSTED only; `None` for a local item, by
-                // construction) and this item's cumulative dispatch wall-clock
-                // across every attempt.
-                "served_model": res.served_model,
-                "wall_ms": res.wall_ms,
-                "error": res.error,
-            })),
-            ..darkmux_flow::FlowRecord::for_execution(session, execution, if res.ok { darkmux_flow::Level::Info } else { darkmux_flow::Level::Warn }, darkmux_flow::Category::Work, darkmux_flow::Stage::Dispatch, darkmux_flow::FlowAction::StepResult, step.id.clone())
+            ..darkmux_flow::FlowRecord::for_execution_with(
+                session,
+                execution,
+                if res.ok { darkmux_flow::Level::Info } else { darkmux_flow::Level::Warn },
+                darkmux_flow::Category::Work,
+                darkmux_flow::Stage::Dispatch,
+                darkmux_flow::Payload::StepResult(StepResultPayload {
+                    index: Some(res.index as u64),
+                    ok: Some(res.ok),
+                    remote: Some(remote),
+                    total_tokens: res.total_tokens,
+                    // (#1442) Per-item telemetry: the endpoint-reported served
+                    // model (HOSTED only; absent for a local item, by
+                    // construction) and this item's cumulative dispatch wall-clock
+                    // across every attempt.
+                    served_model: res.served_model.clone(),
+                    wall_ms: Some(res.wall_ms),
+                    error: res.error.clone(),
+                    ..StepResultPayload::new(&step.id, "dispatch.map")
+                }),
+                step.id.clone(),
+            )
         }
     }
 
@@ -1499,22 +1509,21 @@ impl DispatchMapStepKind {
     /// for one that did not. `remote_tokens` is stamped only for a hosted
     /// item, and only what it spent, the figure its item record reports.
     fn item_terminal(records: &ExecutionBookends<'_>, res: &MapItemResult) -> darkmux_flow::FlowRecord {
-        let (action, level, class) = if res.ok {
-            (darkmux_flow::FlowAction::DispatchComplete, darkmux_flow::Level::Info, "ok")
-        } else {
-            (darkmux_flow::FlowAction::DispatchError, darkmux_flow::Level::Error, "error")
+        let payload = DispatchEndPayload {
+            item_index: Some(res.index as u64),
+            result_class: Some(if res.ok { ResultClass::Ok } else { ResultClass::Error }),
+            error: res.error.clone(),
+            wall_ms: Some(res.wall_ms),
+            // A hosted item's spend, only what it spent: the figure its item
+            // record reports.
+            remote_tokens: records.endpoint_label.map(|_| res.total_tokens.unwrap_or(0)),
+            ..records.end_payload()
         };
-        let mut done = records.record(
-            action,
-            level,
-            serde_json::json!({ "item_index": res.index, "result_class": class, "error": res.error, "wall_ms": res.wall_ms }),
-        );
-        if records.endpoint_label.is_some() {
-            if let Some(payload) = done.payload.as_mut() {
-                darkmux_flow::stamp_remote_classification(payload, None, Some(res.total_tokens.unwrap_or(0)));
-            }
+        if res.ok {
+            records.record(darkmux_flow::Level::Info, darkmux_flow::Payload::DispatchComplete(payload))
+        } else {
+            records.record(darkmux_flow::Level::Error, darkmux_flow::Payload::DispatchError(payload))
         }
-        done
     }
 
     /// (#1442 gate C1) The ONE step-level aggregate record emitted after the
@@ -1540,17 +1549,22 @@ impl DispatchMapStepKind {
         darkmux_flow::FlowRecord {
             source: Some(darkmux_flow::FlowSource::Scheduler),
             model: Some(model.to_string()),
-            payload: Some(serde_json::json!({
-                "step_id": step.id,
-                "kind": "dispatch.map",
-                "items_in": results.len(),
-                "ok_count": ok_count,
-                "failed_count": failed_count,
-                "remote": remote,
-                "total_tokens": total_tokens,
-                "total_wall_ms": total_wall_ms,
-            })),
-            ..darkmux_flow::FlowRecord::for_session(session, if failed_count == 0 { darkmux_flow::Level::Info } else { darkmux_flow::Level::Warn }, darkmux_flow::Category::Work, darkmux_flow::Stage::Dispatch, darkmux_flow::FlowAction::StepResult, step.id.clone())
+            ..darkmux_flow::FlowRecord::for_session_with(
+                session,
+                if failed_count == 0 { darkmux_flow::Level::Info } else { darkmux_flow::Level::Warn },
+                darkmux_flow::Category::Work,
+                darkmux_flow::Stage::Dispatch,
+                darkmux_flow::Payload::StepResult(StepResultPayload {
+                    items_in: Some(results.len() as u64),
+                    ok_count: Some(ok_count as u64),
+                    failed_count: Some(failed_count as u64),
+                    remote: Some(remote),
+                    total_tokens: Some(total_tokens),
+                    total_wall_ms: Some(total_wall_ms),
+                    ..StepResultPayload::new(&step.id, "dispatch.map")
+                }),
+                step.id.clone(),
+            )
         }
     }
 
@@ -1560,14 +1574,19 @@ impl DispatchMapStepKind {
         darkmux_flow::FlowRecord {
             source: Some(darkmux_flow::FlowSource::Scheduler),
             model: load::<MapConfig>(step, ConfigKind::DispatchMap).ok().map(|cfg| cfg.call.model),
-            payload: Some(serde_json::json!({
-                "step_id": step.id,
-                "kind": "dispatch.map",
-                "items_in": 0,
-                "items_out": 0,
-                "short_circuit": "empty collection — dispatch.map skipped before any model load",
-            })),
-            ..darkmux_flow::FlowRecord::for_session(session, darkmux_flow::Level::Info, darkmux_flow::Category::Work, darkmux_flow::Stage::Dispatch, darkmux_flow::FlowAction::StepResult, step.id.clone())
+            ..darkmux_flow::FlowRecord::for_session_with(
+                session,
+                darkmux_flow::Level::Info,
+                darkmux_flow::Category::Work,
+                darkmux_flow::Stage::Dispatch,
+                darkmux_flow::Payload::StepResult(StepResultPayload {
+                    items_in: Some(0),
+                    items_out: Some(0),
+                    short_circuit: Some("empty collection — dispatch.map skipped before any model load".to_string()),
+                    ..StepResultPayload::new(&step.id, "dispatch.map")
+                }),
+                step.id.clone(),
+            )
         }
     }
 
@@ -1734,7 +1753,7 @@ impl DispatchMapStepKind {
             };
             let mut bookend = records.open(
                 ctx,
-                serde_json::json!({ "item_index": index }),
+                Some(index as u64),
                 "dispatch.map item terminated before completion (early return or panic)",
             );
             let budget_caller = crate::budget::BudgetCaller {
@@ -1793,21 +1812,20 @@ impl DispatchMapStepKind {
                 push(
                     crate::dispatch::build_telemetry_record(
                         darkmux_flow::Level::Info,
-                        darkmux_flow::FlowAction::TelemetryTokens,
                         darkmux_flow::FlowSource::Tokens,
                         &step.id,
                         session,
                         execution,
                         Some(wire_model.as_ref()),
                         None,
-                        map_call_token_payload(
+                        darkmux_flow::Payload::TelemetryTokens(map_call_token_payload(
                             call,
                             res.index,
                             endpoint.is_some(),
                             wire_model.as_ref(),
                             &usage_endpoint,
                             endpoint.as_ref().and_then(|ep| ep.named_id()),
-                        ),
+                        )),
                     ),
                     &mut batched,
                 );
@@ -2064,7 +2082,7 @@ fn map_call_token_payload(
     requested_model: &str,
     endpoint: &str,
     endpoint_id: Option<&str>,
-) -> serde_json::Value {
+) -> crate::usage::UsagePayload {
     let mut payload = crate::usage::usage_payload(
         &crate::usage::CallFacts {
             call_kind: crate::usage::CallKind::MapItem,
@@ -2083,9 +2101,8 @@ fn map_call_token_payload(
     // for every other `telemetry.tokens` lineage without a version check.
     // `index` is the ITEM's position; an item that retried emits one record
     // per attempt, all carrying the same index.
-    let obj = payload.as_object_mut().expect("usage_payload builds an object");
-    obj.insert("remote".into(), serde_json::json!(remote));
-    obj.insert("index".into(), serde_json::json!(index));
+    payload.remote = Some(remote);
+    payload.index = Some(index as u64);
     payload
 }
 
@@ -2098,7 +2115,7 @@ fn map_item_token_payload(
     remote: bool,
     requested_model: &str,
     endpoint: &str,
-) -> Option<serde_json::Value> {
+) -> Option<crate::usage::UsagePayload> {
     let call = MapCall {
         counts: darkmux_trajectory::UsageCounts {
             prompt: res.prompt_tokens,
@@ -3332,7 +3349,7 @@ mod tests {
         let item_records: Vec<&darkmux_flow::FlowRecord> = out
             .flow_records
             .iter()
-            .filter(|r| r.action == darkmux_flow::FlowAction::StepResult && r.payload.as_ref().and_then(|p| p.get("index")).is_some())
+            .filter(|r| r.action == darkmux_flow::FlowAction::StepResult && r.payload_json().get("index").is_some())
             .collect();
         assert_eq!(item_records.len(), 2, "one `step result` record per item: {:?}", out.flow_records);
         for rec in &item_records {
@@ -3347,7 +3364,7 @@ mod tests {
         let aggregate = out
             .flow_records
             .iter()
-            .find(|r| r.action == darkmux_flow::FlowAction::StepResult && r.payload.as_ref().and_then(|p| p.get("items_in")).is_some())
+            .find(|r| r.action == darkmux_flow::FlowAction::StepResult && r.payload_json().get("items_in").is_some())
             .expect("aggregate_record must be present");
         assert_eq!(
             aggregate.model.as_deref(),
@@ -4457,7 +4474,7 @@ mod tests {
         let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         assert_eq!(out.output, "[]");
         assert_eq!(out.flow_records.len(), 1, "one short-circuit record");
-        let payload = out.flow_records[0].payload.as_ref().unwrap();
+        let payload = out.flow_records[0].payload_json();
         assert!(payload["short_circuit"].as_str().unwrap().contains("empty collection"));
     }
 
@@ -4594,7 +4611,7 @@ mod tests {
             0, &bucket, &map_ep(), "gpt-5.1", "sys", "user", 4_096, 0, 0, 0, Some(&ovr),
             &mut calls, "s1", &crate::budget::tests::solo_caller(),
         );
-        let record = map_call_token_payload(&calls[0], 0, true, "gpt-5.1", "ep", None);
+        let record = serde_json::to_value(map_call_token_payload(&calls[0], 0, true, "gpt-5.1", "ep", None)).unwrap();
         assert_eq!(record["total_tokens"], 42);
         assert_eq!(bucket.lock().unwrap().used(), 42, "settled with the record's amount, not the 4096 cap");
         assert_eq!(out.total_tokens, Some(42));
@@ -4619,7 +4636,7 @@ mod tests {
             0, &bucket, &map_ep(), "gpt-5.1", "sys", "user", 4_096, 0, 0, 0, Some(&ovr),
             &mut calls, "s1", &crate::budget::tests::solo_caller(),
         );
-        let record = map_call_token_payload(&calls[0], 0, true, "gpt-5.1", "ep", None);
+        let record = serde_json::to_value(map_call_token_payload(&calls[0], 0, true, "gpt-5.1", "ep", None)).unwrap();
         assert!(record.get("total_tokens").is_none_or(|t| t.is_null()), "{record}");
         assert_eq!(record["completion_tokens"], 12, "the partial count is still recorded");
         // `max_tokens` bounds only the completion: the prompt the request
@@ -4945,9 +4962,9 @@ mod tests {
         let recs = as_values(&out.flow_records);
         let step_rec = recs
             .iter()
-            .find(|r| r["payload"].get("remote_max_tokens_per_execution").is_some())
+            .find(|r| r["action"] == "step.result" && r["payload"].get("max_tokens_sent").is_some())
             .unwrap_or_else(|| panic!("the step's telemetry record: {recs:#?}"));
-        assert!(step_rec["payload"]["remote_max_tokens_per_execution"].is_null(), "no cap is reported: {step_rec}");
+        assert!(step_rec["payload"].get("remote_max_tokens_per_execution").is_none(), "no cap is reported: {step_rec}");
     }
 
     /// (#2902 step 5 review, 3rd pass MUST FIX 1) A hosted `dispatch.map`
@@ -5057,7 +5074,7 @@ mod tests {
             model: Some("hosted".to_string()),
             counts: darkmux_trajectory::UsageCounts { total: Some(1261), prompt: Some(75), completion: Some(1186), reasoning: Some(1024), cached: Some(64) },
         };
-        let payload = hosted_single_shot_step_payload("s1", Some(500_000), 4096, 4096, &reply);
+        let payload = serde_json::to_value(hosted_single_shot_step_payload("s1", Some(500_000), 4096, 4096, &reply)).unwrap();
         assert_eq!(payload["reasoning_tokens"], 1024);
         assert_eq!(payload["cached_tokens"], 64);
         // Neighbors, so a copy-paste slip between fields cannot pass.
@@ -5070,23 +5087,21 @@ mod tests {
         assert_eq!(payload["max_tokens_sent"], 4096);
     }
 
-    /// (#1444 review) An endpoint that reported no details object leaves
-    /// both keys PRESENT-and-null — never absent, never `0`. The runtime-
-    /// side `telemetry.tokens` producers use the same null convention, so a
-    /// consumer reading this family sees one answer for "didn't say".
+    /// (#1444 review, 4.0 typed payloads) An endpoint that reported no details
+    /// object leaves both keys ABSENT from the `step.result` payload, never a
+    /// fabricated `0`: the payload is one type shared by every step producer,
+    /// and an unreported count is an omitted key on it.
     #[test]
-    fn single_shot_step_telemetry_renders_unreported_details_as_null() {
+    fn single_shot_step_telemetry_omits_unreported_details() {
         let reply = crate::single_shot::SingleShotReply {
             content: "ok".to_string(),
             model: None,
             counts: darkmux_trajectory::UsageCounts { total: Some(42), prompt: Some(30), completion: Some(12), ..Default::default() },
         };
-        let payload = hosted_single_shot_step_payload("s1", Some(500_000), 4096, 4096, &reply);
+        let payload = serde_json::to_value(hosted_single_shot_step_payload("s1", Some(500_000), 4096, 4096, &reply)).unwrap();
         let obj = payload.as_object().expect("object");
-        assert!(obj.contains_key("reasoning_tokens"), "the key stays present");
-        assert!(payload["reasoning_tokens"].is_null(), "null, never a fabricated 0");
-        assert!(obj.contains_key("cached_tokens"));
-        assert!(payload["cached_tokens"].is_null());
+        assert!(!obj.contains_key("reasoning_tokens"), "absent, never a fabricated 0");
+        assert!(!obj.contains_key("cached_tokens"));
     }
 
     #[test]
@@ -5105,7 +5120,7 @@ mod tests {
             wall_ms: 0,
             retried: 0,
         };
-        let payload = map_item_token_payload(&res, false, "m", "ep").expect("a reply with usage emits a record");
+        let payload = serde_json::to_value(map_item_token_payload(&res, false, "m", "ep").expect("a reply with usage emits a record")).unwrap();
         assert_eq!(payload["total_tokens"], 4547);
         assert_eq!(payload["prompt_tokens"], 2490, "GENERATED/fresh/re-read read the split");
         assert_eq!(payload["completion_tokens"], 2057);
@@ -5140,11 +5155,11 @@ mod tests {
             wall_ms: 0,
             retried: 0,
         };
-        let payload = map_item_token_payload(&local, false, "m", "ep").expect("emits");
+        let payload = serde_json::to_value(map_item_token_payload(&local, false, "m", "ep").expect("emits")).unwrap();
         assert_eq!(payload["remote"], false, "a local seat's own tier, on its own token record");
         assert_eq!(payload["index"], 3, "which item of the fan-out this was");
 
-        let hosted = map_item_token_payload(&local, true, "m", "ep").expect("emits");
+        let hosted = serde_json::to_value(map_item_token_payload(&local, true, "m", "ep").expect("emits")).unwrap();
         assert_eq!(hosted["remote"], true);
         assert_eq!(hosted["index"], 3);
     }
@@ -5170,7 +5185,7 @@ mod tests {
             wall_ms: 0,
             retried: 0,
         };
-        let payload = map_item_token_payload(&res, false, "m", "ep").expect("emits");
+        let payload = serde_json::to_value(map_item_token_payload(&res, false, "m", "ep").expect("emits")).unwrap();
         let obj = payload.as_object().expect("object");
         assert!(obj.contains_key("remote"), "the key is present even when the seat is local");
         assert_eq!(obj["remote"], serde_json::Value::Bool(false));
@@ -5227,9 +5242,9 @@ mod tests {
             retried: 0,
         };
         for remote in [false, true] {
-            let tok = map_item_token_payload(&res, remote, "m", "ep").expect("emits");
+            let tok = serde_json::to_value(map_item_token_payload(&res, remote, "m", "ep").expect("emits")).unwrap();
             let item = DispatchMapStepKind::item_record(&task_session(), &ExecutionId::mint(), &step, "m", remote, &res);
-            let item_payload = item.payload.as_ref().expect("payload");
+            let item_payload = item.payload_json();
             assert_eq!(tok["remote"], item_payload["remote"], "one seat, one verdict");
             assert_eq!(tok["index"], item_payload["index"], "and one item position");
         }
@@ -5259,7 +5274,7 @@ mod tests {
             wall_ms: 0,
             retried: 0,
         };
-        let payload = map_item_token_payload(&res, true, "m", "ep").expect("a reply with usage emits a record");
+        let payload = serde_json::to_value(map_item_token_payload(&res, true, "m", "ep").expect("a reply with usage emits a record")).unwrap();
         assert_eq!(payload["reasoning_tokens"], 1024);
         assert_eq!(payload["cached_tokens"], 64);
         // The neighbors must still land where they belong.
@@ -5288,7 +5303,7 @@ mod tests {
             wall_ms: 0,
             retried: 0,
         };
-        let payload = map_item_token_payload(&res, false, "m", "ep").expect("emits");
+        let payload = serde_json::to_value(map_item_token_payload(&res, false, "m", "ep").expect("emits")).unwrap();
         assert_eq!(payload["reasoning_tokens"], 300);
         assert!(
             payload.get("cached_tokens").is_none(),
@@ -5297,7 +5312,7 @@ mod tests {
         );
 
         let neither = MapItemResult { reasoning_tokens: None, cached_tokens: None, ..res };
-        let payload = map_item_token_payload(&neither, false, "m", "ep").expect("emits");
+        let payload = serde_json::to_value(map_item_token_payload(&neither, false, "m", "ep").expect("emits")).unwrap();
         assert!(payload.get("reasoning_tokens").is_none());
         assert!(payload.get("cached_tokens").is_none());
     }
@@ -5341,7 +5356,7 @@ mod tests {
         let records: u64 = calls
             .iter()
             .map(|c| map_call_token_payload(c, 0, false, "m", "ep", None))
-            .map(|p| p["total_tokens"].as_u64().unwrap_or(0))
+            .map(|p| p.total_tokens.unwrap_or(0))
             .sum();
         assert_eq!(item.total_tokens, Some(142), "42 from the split + the provider's own 100");
         assert_eq!(item.total_tokens, Some(records), "the item and its records are one number");
@@ -5367,7 +5382,7 @@ mod tests {
             wall_ms: 0,
             retried: 0,
         };
-        let payload = map_item_token_payload(&res, false, "m", "ep").expect("a total alone still emits");
+        let payload = serde_json::to_value(map_item_token_payload(&res, false, "m", "ep").expect("a total alone still emits")).unwrap();
         assert_eq!(payload["total_tokens"], 1521);
         assert!(payload.get("prompt_tokens").is_none(), "never fabricate a split");
         assert!(payload.get("completion_tokens").is_none());
@@ -5394,7 +5409,7 @@ mod tests {
             wall_ms: 0,
             retried: 0,
         };
-        let payload = map_item_token_payload(&res, false, "m", "ep").expect("a split alone still emits");
+        let payload = serde_json::to_value(map_item_token_payload(&res, false, "m", "ep").expect("a split alone still emits")).unwrap();
         assert_eq!(payload["total_tokens"], 42, "arithmetic on reported parts, not fabrication");
         assert_eq!(payload["prompt_tokens"], 30);
         assert_eq!(payload["completion_tokens"], 12);
@@ -5431,7 +5446,7 @@ mod tests {
         ];
         let s = map_step(json!({}));
         let rec = DispatchMapStepKind::aggregate_record(&task_session(), &s, "m", true, &results);
-        let p = rec.payload.as_ref().unwrap();
+        let p = rec.payload_json();
         assert_eq!(p["kind"], "dispatch.map");
         assert_eq!(p["items_in"], 3);
         assert_eq!(p["ok_count"], 2);
@@ -5446,7 +5461,7 @@ mod tests {
         let clean = vec![MapItemResult { index: 0, ok: true, content: "a".to_string(), error: None, total_tokens: Some(5), prompt_tokens: None, completion_tokens: None, reasoning_tokens: None, cached_tokens: None, served_model: None, wall_ms: 0, retried: 0 }];
         let rec = DispatchMapStepKind::aggregate_record(&task_session(), &s, "m", false, &clean);
         assert!(matches!(rec.level, darkmux_flow::Level::Info));
-        assert_eq!(rec.payload.as_ref().unwrap()["remote"], false);
+        assert_eq!(rec.payload_json()["remote"], false);
     }
 
     #[test]
@@ -5479,7 +5494,7 @@ mod tests {
         // A per-item flow record for every item, PLUS the one step-level
         // aggregate after the loop (#1442 gate C1) — 3 + 1.
         assert_eq!(out.flow_records.len(), 4);
-        let agg = out.flow_records.last().unwrap().payload.as_ref().unwrap();
+        let agg = out.flow_records.last().unwrap().payload_json();
         assert_eq!(agg["items_in"], 3);
         assert_eq!(agg["ok_count"], 0);
         assert_eq!(agg["failed_count"], 3);
@@ -6022,7 +6037,7 @@ mod tests {
             out.flow_records.iter().filter(|r| r.action == darkmux_flow::FlowAction::TelemetryTokens).collect();
         assert_eq!(telemetry.len(), 2, "one per item that reported usage: {:?}", out.flow_records);
         for (i, rec) in telemetry.iter().enumerate() {
-            let payload = rec.payload.as_ref().expect("telemetry payload");
+            let payload = rec.payload_json();
             assert_eq!(
                 payload["remote"],
                 serde_json::Value::Bool(true),
@@ -6078,7 +6093,7 @@ mod tests {
             out.flow_records.iter().filter(|r| r.action == darkmux_flow::FlowAction::TelemetryTokens).collect();
         assert_eq!(telemetry.len(), 2, "one per item that reported usage: {:?}", out.flow_records);
         for (i, rec) in telemetry.iter().enumerate() {
-            let payload = rec.payload.as_ref().expect("telemetry payload");
+            let payload = rec.payload_json();
             assert_eq!(
                 payload["remote"],
                 serde_json::Value::Bool(false),
@@ -6163,7 +6178,7 @@ mod tests {
         assert_eq!(id_of(bookends[2]), id_of(bookends[3]));
         assert_ne!(id_of(bookends[0]), id_of(bookends[2]), "two items are two executions");
         for terminal in [bookends[1], bookends[3]] {
-            let payload = terminal.payload.as_ref().expect("terminal carries a payload");
+            let payload = terminal.payload_json();
             assert_eq!(
                 payload["endpoint"], "azure:example.cognitiveservices.azure.com/gpt-4o",
                 "the terminal names WHERE the seat ran, in the one format the viewer parses"
@@ -6845,7 +6860,8 @@ mod tests {
         }));
         let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         for r in &out.flow_records {
-            if let Some(p) = r.payload.as_ref() {
+            if r.payload.is_some() {
+                let p = r.payload_json();
                 assert!(
                     p.get("endpoint").is_none(),
                     "a local map must never stamp an endpoint: {p}"
@@ -6890,10 +6906,10 @@ mod tests {
         );
         // Per-item flow record (index 0) carries the same telemetry; the
         // aggregate (last) carries the SUMMED wall.
-        let item_payload = out.flow_records[0].payload.as_ref().unwrap();
+        let item_payload = out.flow_records[0].payload_json();
         assert_eq!(item_payload["served_model"], "served-model-x");
         assert!(item_payload["wall_ms"].as_u64().unwrap() >= 1);
-        let agg = out.flow_records.last().unwrap().payload.as_ref().unwrap();
+        let agg = out.flow_records.last().unwrap().payload_json();
         assert_eq!(
             agg["total_wall_ms"].as_u64().unwrap(),
             results[0].wall_ms,

@@ -75,7 +75,6 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
     ("crates/darkmux-types/src/endpoint.rs", ".keychain", 3, "THE credential order (credential_source), and validate()'s source check with its message"),
     ("crates/darkmux-crew/src/dispatch_internal.rs", ".keychain", 2, "resolve_endpoint_secret: the env var vanished between credential_source and the read, fall to the same declared item; and a message naming the field"),
     ("crates/darkmux-doctor/src/lib.rs", ".keychain", 3, "the probe's dedup key (two credentials to one deployment both probe) and two messages naming the field"),
-    ("crates/darkmux-crew/src/dispatch_internal.rs", "\"max_tokens\":", 1, "a telemetry snapshot of the configured cap (value + source), not a request body"),
     ("crates/darkmux-flow/src/hooks.rs", "strip_prefix(\"http://\")", 2, "the hooks destination URL policy, not a model endpoint"),
     ("crates/darkmux-serve/src/runs.rs", ".endpoint.is_some()", 1, "a run aggregate's recorded `endpoint` label (from flow records), not a profile endpoint"),
     ("crates/darkmux-serve/src/runs.rs", ".endpoint.is_none()", 1, "a run aggregate's recorded `endpoint` label (from flow records), not a profile endpoint"),

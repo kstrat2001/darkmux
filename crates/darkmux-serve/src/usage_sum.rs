@@ -33,7 +33,7 @@ use darkmux_crew::usage::UsagePurpose;
 
 /// The sum of a set of records: the Rust twin of `usageRecords.ts`'s
 /// `UsageSum`, field for field.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct UsageSum {
     /// Sum of each record's total (the provider's own, else prompt +
     /// completion, else a legacy complete's `remote_tokens`).
@@ -140,7 +140,7 @@ pub fn sum_usage<'a>(records: impl IntoIterator<Item = &'a serde_json::Value>) -
 /// is the endpoint it called, the model it requested, and the model the
 /// reply named when it carried one; each is a fact off the record, absent
 /// when the record did not carry it (a legacy complete, a pre-1.57 turn).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct UsageGroup {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
@@ -165,7 +165,7 @@ impl UsageGroup {
 }
 
 /// One purpose's share of a group.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct UsageSplit {
     /// Records counted (usage records or legacy completes).
     pub calls: u64,
@@ -192,7 +192,7 @@ impl UsageSplit {
 /// The breakdown `run list --usage` prints and `--json` emits: the overall
 /// sum plus one [`UsageGroup`] per (endpoint, requested model, reported
 /// model), largest first.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct UsageBreakdown {
     pub overall: UsageSum,
     pub groups: Vec<UsageGroup>,
@@ -313,7 +313,9 @@ impl UsageFold {
             utility: UsageSplit::default(),
         });
         match amount.purpose {
-            UsagePurpose::Work => g.work.add(amount),
+            // A purpose this build does not name is not known to be a utility job, and `Work` is
+            // "every call that is not a utility job": its tokens are counted, never dropped.
+            UsagePurpose::Work | UsagePurpose::Unknown => g.work.add(amount),
             UsagePurpose::Utility => g.utility.add(amount),
         }
     }

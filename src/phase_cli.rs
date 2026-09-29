@@ -12,6 +12,7 @@
 //! it directly at the sign-off gate; there is no longer a CLI verb over it.
 
 use anyhow::{Context, Result};
+use darkmux_flow::payload::{PhaseReviewVerdictPayload, ReviewVerdict};
 use darkmux_types::session_id::SessionId;
 use serde::Serialize;
 use serde_json::Value;
@@ -70,8 +71,7 @@ pub struct PhaseReviewOutput {
     pub by_severity: SeverityCounts,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub findings: Vec<ReviewFinding>,
-    /// `clean` | `flags-only` | `blockers`
-    pub verdict: String,
+    pub verdict: ReviewVerdict,
 }
 
 /// Breakdown of findings by severity level.
@@ -96,7 +96,7 @@ pub(crate) struct SignoffParse {
     block: usize,
     flag: usize,
     nit: usize,
-    verdict: String,
+    verdict: ReviewVerdict,
     findings: Vec<ReviewFinding>,
 }
 
@@ -227,18 +227,17 @@ pub fn parse_signoff(input: &str) -> SignoffParse {
     }
 
     let verdict = if block > 0 {
-        "blockers"
+        ReviewVerdict::Blockers
     } else if flag > 0 || nit > 0 {
-        "flags-only"
+        ReviewVerdict::FlagsOnly
     } else if input.contains("No findings. PR is mergeable.") {
-        "clean"
+        ReviewVerdict::Clean
     } else {
         // No findings, no explicit clean marker — reviewer may have failed
         // to engage with the format. Surface as indeterminate so operator
         // knows to inspect manually.
-        "indeterminate"
-    }
-    .to_string();
+        ReviewVerdict::Indeterminate
+    };
 
     SignoffParse {
         block,
@@ -272,23 +271,24 @@ fn count_files_changed(path: &Path, base: &str) -> usize {
 /// The review's verdict terminal: `phase.review.verdict`, the verdict itself
 /// in `payload.verdict`, the finding counts in `handle`.
 fn verdict_record(
-    verdict: &str,
+    verdict: ReviewVerdict,
     counts: String,
     session: &SessionId,
     phase_id: Option<&str>,
 ) -> crate::flow::FlowRecord {
-    let mut rec = build_review_record(
-        crate::flow::Level::Info,
-        crate::flow::Category::Review,
-        crate::flow::Tier::Frontier,
-        crate::flow::Stage::Review,
-        darkmux_flow::FlowAction::PhaseReviewVerdict,
-        counts,
-        session,
-        phase_id,
-    );
-    rec.payload = Some(serde_json::json!({ "verdict": verdict }));
-    rec
+    crate::flow::FlowRecord {
+        tier: crate::flow::Tier::Frontier,
+        phase_id: phase_id.map(String::from),
+        source: Some(darkmux_flow::FlowSource::PhaseReview),
+        ..crate::flow::FlowRecord::for_session_with(
+            session,
+            crate::flow::Level::Info,
+            crate::flow::Category::Review,
+            crate::flow::Stage::Review,
+            darkmux_flow::Payload::PhaseReviewVerdict(PhaseReviewVerdictPayload { verdict }),
+            counts,
+        )
+    }
 }
 
 /// Builds the record fired by `phase_review_output_at`'s bookend guard on
@@ -406,13 +406,13 @@ pub(crate) fn phase_review_output_at(
                 nit: 0,
             },
             findings: vec![],
-            verdict: "clean".to_string(),
+            verdict: ReviewVerdict::Clean,
         };
         // Emit verdict flow record. `close()` disarms the guard so this
         // named terminal is the only record for this exit path.
         bookend.close(
             "phase-review",
-            verdict_record("clean", "0B / 0F / 0N".to_string(), &session_id, phase_id),
+            verdict_record(ReviewVerdict::Clean, "0B / 0F / 0N".to_string(), &session_id, phase_id),
         );
         return Ok(output);
     }
@@ -557,14 +557,14 @@ pub(crate) fn phase_review_output_at(
             nit: signoff.nit,
         },
         findings: signoff.findings.clone(),
-        verdict: signoff.verdict.clone(),
+        verdict: signoff.verdict,
     };
 
     // Emit verdict flow record.
     bookend.close(
         "phase-review",
         verdict_record(
-            &signoff.verdict,
+            signoff.verdict,
             format!("{}B / {}F / {}N", signoff.block, signoff.flag, signoff.nit),
             &session_id,
             phase_id,
@@ -607,7 +607,7 @@ mod tests {
         assert_eq!(result.block, 0);
         assert_eq!(result.flag, 0);
         assert_eq!(result.nit, 0);
-        assert_eq!(result.verdict, "clean");
+        assert_eq!(result.verdict, ReviewVerdict::Clean);
     }
 
     #[test]
@@ -649,7 +649,7 @@ mod tests {
         assert_eq!(result.block, 1);
         assert_eq!(result.flag, 1);
         assert_eq!(result.nit, 1);
-        assert_eq!(result.verdict, "blockers");
+        assert_eq!(result.verdict, ReviewVerdict::Blockers);
         assert_eq!(result.findings.len(), 3);
         assert!(result.findings[1]
             .text
@@ -667,7 +667,7 @@ mod tests {
 
         assert_eq!(result.flag, 1);
         assert_eq!(result.nit, 1);
-        assert_eq!(result.verdict, "flags-only");
+        assert_eq!(result.verdict, ReviewVerdict::FlagsOnly);
     }
 
     #[test]
@@ -683,28 +683,28 @@ mod tests {
         assert_eq!(result.block, 1);
         assert_eq!(result.flag, 1);
         assert_eq!(result.nit, 1);
-        assert_eq!(result.verdict, "blockers");
+        assert_eq!(result.verdict, ReviewVerdict::Blockers);
     }
 
     #[test]
     fn verdict_mapping_returns_clean() {
         let input = "QA-REVIEW-SIGNOFF\nNo findings. PR is mergeable.";
         let result = parse_signoff(input);
-        assert_eq!(result.verdict, "clean");
+        assert_eq!(result.verdict, ReviewVerdict::Clean);
     }
 
     #[test]
     fn verdict_mapping_returns_flags_only() {
         let input = "QA-REVIEW-SIGNOFF\n- [FLAG] src/foo.rs:10 — unused variable";
         let result = parse_signoff(input);
-        assert_eq!(result.verdict, "flags-only");
+        assert_eq!(result.verdict, ReviewVerdict::FlagsOnly);
     }
 
     #[test]
     fn verdict_mapping_returns_blockers() {
         let input = "QA-REVIEW-SIGNOFF\n- [BLOCK] src/main.rs:5 — null pointer";
         let result = parse_signoff(input);
-        assert_eq!(result.verdict, "blockers");
+        assert_eq!(result.verdict, ReviewVerdict::Blockers);
     }
 
     // ── phase review flow record tests ───────────────────────────────────

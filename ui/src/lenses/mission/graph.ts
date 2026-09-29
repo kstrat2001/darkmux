@@ -25,7 +25,7 @@
  */
 import { compactThousands, fmtElapsed, type CompactStyle } from "../../lib/format";
 import { PURPOSE, isUsageRecord, stepTokensWithLegacyFallback, usageContribution } from "../../lib/usageRecords";
-import { ACTION, CATEGORY, SOURCE, byTime, byTimeNewestFirst, isAfter, isAsOf, isDispatchFamily, isDispatchTerminal, latestByTime, type NormAction, type NormRecord } from "../../lib/ingest";
+import { ACTION, CATEGORY, SOURCE, byTime, byTimeNewestFirst, isAfter, isAsOf, isDispatchFamily, isDispatchTerminal, latestByTime, payloadOf, stepIdOf, type NormAction, type NormRecord } from "../../lib/ingest";
 import { lifecycleAt, type LifecyclePhase, type LifecyclePolicy } from "../../lib/lifecycle";
 import { currentRun, groupOfRecords } from "../../lib/runRef";
 import type { GraphEdge } from "../../types/generated/GraphEdge";
@@ -369,8 +369,7 @@ export function tsToMs(stamp: string | number | null | undefined): number {
  * authoritative and never falls through. */
 export function stepForRecord(rec: NormRecord, idx: GraphIndex, missionId: string): string | null {
   if (rec.mission_id && rec.mission_id !== missionId) return null;
-  const p = rec.payload || {};
-  const stepId = typeof p.step_id === "string" ? p.step_id : undefined;
+  const stepId = stepIdOf(rec);
   if (stepId && idx.stepIds.has(stepId)) return stepId;
   if (rec.handle && idx.stepIds.has(rec.handle)) return rec.handle;
   return null;
@@ -407,8 +406,7 @@ export function stepDispatchSessions(records: NormRecord[], missionId: string): 
     // opposed to the session merely appearing in the record stream:
     // mission/phase/step bookkeeping and telemetry do not count.
     if (!isDispatchFamily(rec.action)) continue;
-    const p = rec.payload || {};
-    const stepId = typeof p.step_id === "string" ? p.step_id : "";
+    const stepId = stepIdOf(rec) ?? "";
     const sid = typeof rec.session_id === "string" ? rec.session_id : "";
     if (!stepId || !sid) continue;
     if (rec.mission_id && rec.mission_id !== missionId) continue;
@@ -460,13 +458,25 @@ function sameMetrics(a: StepMetrics, b: StepMetrics): boolean {
   );
 }
 
+/** The running and final counts one record carries, each read through its own
+ *  action's payload type; `null` for a count the record does not have. */
+function recordFigures(rec: NormRecord): { turnsSoFar: number | null; toolCallsSoFar: number | null; finalTok: number; totalTurns: number | null } {
+  const count = (n: unknown): number | null => (typeof n === "number" ? n : null);
+  const complete = payloadOf(rec, ACTION.DispatchComplete);
+  return {
+    turnsSoFar: count(payloadOf(rec, ACTION.DispatchTurn)?.turns_so_far),
+    toolCallsSoFar: count(payloadOf(rec, ACTION.DispatchTool)?.tool_calls_so_far),
+    finalTok: count((complete ?? payloadOf(rec, ACTION.StepResult))?.total_tokens) ?? 0,
+    totalTurns: count(complete?.total_turns),
+  };
+}
+
 /** `applyRecordToMetrics` — mission-graph.html. Folds one record into the
  * per-step metric accumulator, returning a NEW map only when something
  * changed (so a no-op record doesn't churn state). */
 export function applyRecordToMetrics(metrics: MetricsMap, rec: NormRecord, idx: GraphIndex, missionId: string): MetricsMap {
   const sid = stepForRecord(rec, idx, missionId);
   if (!sid) return metrics;
-  const p = rec.payload || {};
   const cur = metrics[sid] || EMPTY_METRICS;
   const recMs = rec.tMs ?? 0;
   const next: StepMetrics = { ...cur, lastTs: Math.max(cur.lastTs, recMs) };
@@ -492,18 +502,19 @@ export function applyRecordToMetrics(metrics: MetricsMap, rec: NormRecord, idx: 
   // the step is known to have been alive (the bad-timestamp policy).
   if (isTerminal) next.endTs = Math.max(next.endTs, recMs || next.lastTs || next.startTs);
 
-  const finalTok = (typeof p.total_tokens === "number" ? p.total_tokens : 0) || (typeof p.tokens === "number" ? p.tokens : 0);
+  const fig = recordFigures(rec);
+  const finalTok = fig.finalTok;
   const started = next.startTs > 0;
   if (isUsage && started) {
     next.usageSeen = true;
     next.tokRun += usage ? usage.total : 0;
   } else if (isTurn && started) {
-    next.turnRun = typeof p.turns_so_far === "number" ? Math.max(next.turnRun, p.turns_so_far) : next.turnRun + 1;
+    next.turnRun = fig.turnsSoFar !== null ? Math.max(next.turnRun, fig.turnsSoFar) : next.turnRun + 1;
   } else if (isTool && started) {
-    next.toolRun = typeof p.tool_calls_so_far === "number" ? Math.max(next.toolRun, p.tool_calls_so_far) : next.toolRun + 1;
+    next.toolRun = fig.toolCallsSoFar !== null ? Math.max(next.toolRun, fig.toolCallsSoFar) : next.toolRun + 1;
   } else if (isComplete) {
     if (finalTok) next.tokFinal = Math.max(next.tokFinal, finalTok);
-    if (typeof p.total_turns === "number") next.turnFinal = Math.max(next.turnFinal, p.total_turns);
+    if (fig.totalTurns !== null) next.turnFinal = Math.max(next.turnFinal, fig.totalTurns);
   } else if (isStepResult) {
     if (finalTok) next.tokFinal = Math.max(next.tokFinal, finalTok);
   }
@@ -742,7 +753,7 @@ export function recordInMission(rec: NormRecord, idx: GraphIndex, missionId: str
   if (rec.mission_id) return rec.mission_id === missionId;
   if (rec.phase_id && idx.phaseIds.has(rec.phase_id)) return true;
   if (rec.handle && (idx.nodeIds.has(rec.handle) || idx.stepIds.has(rec.handle))) return true;
-  const stepId = rec.payload && typeof rec.payload.step_id === "string" ? rec.payload.step_id : undefined;
+  const stepId = stepIdOf(rec);
   if (stepId && idx.stepIds.has(stepId)) return true;
   return false;
 }
@@ -980,8 +991,7 @@ export function buildStepHeaderFields(step: GraphStep, metrics: MetricsMap, now:
   for (const rec of stepRecords) {
     const isDetector = rec.action === ACTION.TelemetryDetector || (rec.category === CATEGORY.Telemetry && rec.source === SOURCE.Detector);
     if (!isDetector) continue;
-    const p = rec.payload;
-    const kind = p ? (typeof p.kind === "string" ? p.kind : typeof p.detector === "string" ? p.detector : undefined) : undefined;
+    const kind = payloadOf(rec, ACTION.TelemetryDetector)?.kind;
     if (kind) detectorKinds.add(kind);
   }
   if (detectorKinds.size) fields.push({ key: "detectors", label: "detectors", value: [...detectorKinds].sort().join(", ") });

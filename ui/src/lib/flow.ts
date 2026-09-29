@@ -28,7 +28,7 @@ import type { AbandonReason } from "../types/generated/AbandonReason";
 import { isPlainObject } from "./guards";
 import { missionClosed } from "./lifecycle";
 import { runIndex } from "./runRef";
-import { ACTION, CATEGORY, SOURCE, byTime, earliestByTime, ingestJsonl, ingestRecord, latestByTime, recKey, recordsAsOf, recordsSince, type NormRecord } from "./ingest";
+import { ACTION, CATEGORY, SOURCE, byTime, earliestByTime, ingestJsonl, ingestRecord, latestByTime, payloadOf, recKey, recordsAsOf, recordsSince, type NormRecord } from "./ingest";
 
 /** `LIVE_WINDOW_MS` — viewer.html:3374. The rolling live window `RAW` is
  * bounded to; also the "N records · last Nh" meta-line's hour figure. */
@@ -171,7 +171,7 @@ function perSessionRuntimeRecords(records: readonly NormRecord[]): NormRecord[] 
   const perSession = new Map<string, { turns: number; ts: string; machineId?: string; machineUid?: string }>();
   for (const r of records) {
     if (r.action !== ACTION.DispatchTurn || !r.session_id) continue;
-    const seq = Number((r.payload as { turn_seq?: unknown } | undefined)?.turn_seq) || 0;
+    const seq = Number(payloadOf(r, ACTION.DispatchTurn)?.turn_seq) || 0;
     const prev = perSession.get(r.session_id);
     const entry = prev ?? { turns: 0, ts: r.ts };
     entry.turns = Math.max(entry.turns, seq);
@@ -629,10 +629,10 @@ export function flowToRenderModel(records: readonly NormRecord[]): NormRecord[] 
     const o: NormRecord = { ...r };
     if (o.payload && !o.fields) o.fields = o.payload;
     if (o.action === ACTION.DispatchCompaction && !compTelemetryKeys.has(compKey(o.session_id, o.ts))) {
-      const p = (o.payload || {}) as { before_messages?: number; after_messages?: number };
+      const p = payloadOf(o, ACTION.DispatchCompaction);
       o.category = CATEGORY.Telemetry;
       o.source = SOURCE.Compaction;
-      o.fields = { from: p.before_messages || 0, to: p.after_messages || 0 };
+      o.fields = { from: p?.before_messages || 0, to: p?.after_messages || 0 };
     }
     if (!o.category) o.category = o.source ? CATEGORY.Telemetry : CATEGORY.Work;
     return o;

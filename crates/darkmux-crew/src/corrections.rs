@@ -41,7 +41,7 @@ use std::collections::HashSet;
 pub const ADJUDICATION_LOOKBACK_DAYS: usize = 7;
 
 /// One recorded adjudication correction, as it sits in the flow trail.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct Correction {
     /// The flow record's timestamp (RFC3339, as written).
     pub ts: String,

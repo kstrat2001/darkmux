@@ -26,9 +26,13 @@ import { CALL_KIND, PURPOSE, isUsageRecord, usagePurpose, type UsagePayload } fr
 import { mergeLive } from "./liveChannel";
 import { ACTION, isAsOf, isDispatchTerminal, type NormAction, type NormRecord } from "./ingest";
 
-/** Every `UtilityJobKind` variant, by name. A key missing or extra relative
- *  to the generated union is a type error. */
-export const UTILITY_JOB = { compaction: "compaction", radio_routing: "radio_routing" } as const satisfies { readonly [K in UtilityJobKind]: K };
+/** A job kind a writer produces: every generated variant but `unknown`, the
+ *  reader's word for a value from another build. */
+type KnownUtilityJob = Exclude<UtilityJobKind, "unknown">;
+
+/** Every `UtilityJobKind` a writer produces, by name. A key missing or extra
+ *  relative to the generated union is a type error. */
+export const UTILITY_JOB = { compaction: "compaction", radio_routing: "radio_routing" } as const satisfies { readonly [K in KnownUtilityJob]: K };
 
 /** The bound a `utility.start` that carries none is held to: the runtime's
  *  default inactivity window (`runtime.inactivity_timeout_seconds`, 600 s).
@@ -38,7 +42,7 @@ export const UTILITY_JOB_DEFAULT_STALL_MS = 600_000;
 const KNOWN: ReadonlySet<string> = new Set(Object.values(UTILITY_JOB));
 
 /** True for a job kind this build knows (a generated variant). */
-export function isKnownUtilityJob(v: unknown): v is UtilityJobKind {
+export function isKnownUtilityJob(v: unknown): v is KnownUtilityJob {
   return typeof v === "string" && KNOWN.has(v);
 }
 
@@ -46,7 +50,7 @@ export function isKnownUtilityJob(v: unknown): v is UtilityJobKind {
  *  has no visual for, so a new job still shows. */
 export type UtilityJobVisual = "radio" | "compacting" | "generic";
 
-const VISUAL: { readonly [K in UtilityJobKind]: UtilityJobVisual } = {
+const VISUAL: { readonly [K in KnownUtilityJob]: UtilityJobVisual } = {
   compaction: "compacting",
   radio_routing: "radio",
 };
@@ -58,7 +62,7 @@ export function utilityJobVisual(job: string | null): UtilityJobVisual {
 /** The word a job reads as on the fleet card's strip and the machine page.
  *  A job this build does not know reads as its own wire name (spaced), so
  *  the operator still learns what it is. */
-const WORD: { readonly [K in UtilityJobKind]: string } = {
+const WORD: { readonly [K in KnownUtilityJob]: string } = {
   compaction: "compacting",
   radio_routing: "radio routing",
 };

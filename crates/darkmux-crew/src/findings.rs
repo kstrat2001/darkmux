@@ -59,7 +59,7 @@ pub fn is_finding_tool(tool_name: &str) -> bool {
 
 /// Who proposed a finding. Named at write time from the dispatch's own
 /// identity — the role handle, the model that ran it, and the machine.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct Proposer {
     /// The role handle (the flow record's `handle`).
     pub handle: String,
@@ -79,7 +79,7 @@ pub struct Scope {
 }
 
 /// One finding, as stored at `<findings dir>/<execution>/<seq>/finding.json`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct FindingRecord {
     /// `<execution>/<seq>` — the address every other surface uses.
     pub key: String,
@@ -464,7 +464,7 @@ fn store_address_of(rec: &serde_json::Value) -> Option<String> {
 }
 
 /// What one `finding sync` pass did.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct SyncReport {
     /// Flow records inspected that named a finding tool and succeeded.
     pub scanned: usize,
@@ -527,29 +527,26 @@ pub fn sync_at(flows_dir: &Path, store_root: &Path, since: Option<&str>) -> Resu
             if darkmux_flow::reader::action_of(&rec) != Some(darkmux_flow::FlowAction::DispatchTool) {
                 continue;
             }
-            let payload = rec.get("payload").unwrap_or(&serde_json::Value::Null);
-            let tool_name = payload.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
-            if !is_finding_tool(tool_name) {
+            let Some(darkmux_flow::Payload::DispatchTool(payload)) = darkmux_flow::reader::payload_of(&rec) else {
                 continue;
-            }
-            if payload.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+            };
+            if !is_finding_tool(&payload.tool_name) || payload.ok != Some(true) {
                 continue;
             }
             report.scanned += 1;
-            let emitted = payload.get("emitted");
-            if emitted.is_none() || emitted == Some(&serde_json::Value::Null) {
+            let Some(emitted) = payload.emitted.as_ref() else {
                 // Pre-FLOW-1.33.0: the emission was never carried, so there is
                 // no record to make. Counted, and named in the human output.
                 report.skipped_no_emission += 1;
                 continue;
-            }
+            };
             let (Some(execution), Some(seq)) = (
                 store_address_of(&rec)
                     // An id that could escape the store is never joined onto a
                     // path — it is dropped here, before `materialize` has to
                     // refuse it, and counted like any other unaddressable call.
                     .filter(|d| is_safe_execution_segment(d)),
-                payload.get("emit_seq").and_then(|v| v.as_u64()),
+                payload.emit_seq,
             ) else {
                 // No execution to name (or an unsafe one), or an `emitted` with no
                 // `emit_seq` beside it (the tailer writes the pair together, so
@@ -564,7 +561,7 @@ pub fn sync_at(flows_dir: &Path, store_root: &Path, since: Option<&str>) -> Resu
                 &execution,
                 seq,
                 rec.get("ts").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-                tool_name,
+                payload.tool_name.as_str(),
                 Proposer {
                     handle: rec.get("handle").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
                     model: rec.get("model").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
@@ -580,10 +577,10 @@ pub fn sync_at(flows_dir: &Path, store_root: &Path, since: Option<&str>) -> Resu
                     // is read from there, with the top level as a fallback.
                     mission_id: str_field(&rec, "mission_id"),
                     phase_id: str_field(&rec, "phase_id"),
-                    step_id: str_field(payload, "step_id").or_else(|| str_field(&rec, "step_id")),
+                    step_id: payload.step_id.clone().or_else(|| str_field(&rec, "step_id")),
                 },
-                payload.get("context").cloned(),
-                emitted.cloned().unwrap_or(serde_json::Value::Null),
+                payload.context.clone().map(serde_json::Value::Object),
+                emitted.clone(),
             );
             match materialize(store_root, &record)? {
                 Materialized::Created => report.created += 1,
@@ -889,7 +886,10 @@ mod tests {
     }
 
     fn flow_line(sess: &str, tool: &str, ok: bool, emitted: Option<serde_json::Value>, seq: Option<u64>) -> String {
-        let mut payload = serde_json::json!({"tool_name": tool, "ok": ok});
+        let mut payload = serde_json::json!({
+            "tool_seq": 1, "tool_calls_so_far": 1, "tool_name": tool, "args": "{}", "args_chars": 2,
+            "result_chars": 0, "result": "", "ok": ok,
+        });
         if let Some(e) = emitted {
             payload["emitted"] = e;
         }

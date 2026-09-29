@@ -134,7 +134,7 @@ pub fn parse_record(line: &str) -> Option<FlowRecord> {
     v["action"] = Value::String(FlowAction::OperatorNote.as_str().to_string());
     let mut record: FlowRecord = serde_json::from_value(v).ok()?;
     record.action = action;
-    Some(record)
+    Some(record.settled())
 }
 
 /// The typed `source` of a JSON record, an old spelling upgraded; `None` when
@@ -149,6 +149,17 @@ pub fn source_of(record: &Value) -> Option<crate::FlowSource> {
 pub fn action_of(record: &Value) -> Option<FlowAction> {
     let read = crate::legacy::read_action(record.get("action")?.as_str()?);
     Some(crate::legacy::run_grain_of(&read, record).unwrap_or(read))
+}
+
+/// The typed payload of a JSON record: read as its (upgraded) action's type,
+/// [`Payload::Unread`] when it is not that type, `None` when the record has no
+/// payload or no action. For a reader that holds records as JSON; one that
+/// parses lines into [`FlowRecord`]s gets the same through
+/// [`FlowRecord::payload`].
+pub fn payload_of(record: &Value) -> Option<crate::Payload> {
+    let action = action_of(record)?;
+    let raw = record.get("payload").filter(|p| !p.is_null())?;
+    Some(crate::Payload::settle(&action, raw.clone()))
 }
 
 /// A tally of the unknown actions a read met, by name. Filled by
@@ -594,7 +605,7 @@ mod tests {
         let line = r#"{"ts":"t","level":"info","category":"review","tier":"frontier","stage":"review","action":"verdict: clean","handle":"h"}"#;
         let rec = parse_record(line).unwrap();
         assert_eq!(rec.action, FlowAction::PhaseReviewVerdict);
-        assert_eq!(rec.payload.unwrap()["verdict"], "clean");
+        assert_eq!(serde_json::to_value(rec.payload.unwrap()).unwrap()["verdict"], "clean");
     }
 
     #[test]

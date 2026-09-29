@@ -18,7 +18,7 @@
 //!
 //! The duplication is why the concrete bug this packet fixes (a review run
 //! with a remote-endpoint seat silently reporting 0 cloud tokens — see
-//! [`stamp_remote_classification`]) went unnoticed: `pr_review.rs`'s
+//! the `endpoint` stamp every remote bookend now carries) went unnoticed: `pr_review.rs`'s
 //! independently-reinvented terminal-record payload never got the
 //! `payload.endpoint` field the other two paths already carried. #1349
 //! later found a SECOND instance of the same duplication-shaped bug: the
@@ -32,7 +32,7 @@
 //! This module intentionally knows nothing about `FlowRecord`'s domain
 //! meaning beyond its existence — callers build every `started`/`finished`/
 //! abort record themselves (via their own crate's record builders,
-//! `darkmux-crew::dispatch::build_dispatch_record_with_payload` or the
+//! `darkmux-crew::dispatch::build_dispatch_record` or the
 //! binary crate's `review_bookend_record`) and hand the guard a fully-built
 //! [`FlowRecord`]. `darkmux-flow` is a dependency LEAF w.r.t. both
 //! `darkmux-crew` and `darkmux-lab` (neither of those crates' record
@@ -221,36 +221,6 @@ pub fn remote_route_label(host: &str, model_id: &str) -> String {
     format!("{kind}:{host}/{model_id}")
 }
 
-/// Stamp `payload.endpoint` / `payload.remote_tokens` on a dispatch-record
-/// payload — the canonical, single-source-of-truth shape every
-/// remote-seat-aware dispatch bookend uses (`dispatch_internal.rs`'s
-/// `dispatch_remote`/container path, and — the actual bug fix this
-/// function exists for — `pr_review.rs`'s `with_dispatch_bookends`, which
-/// previously stamped `remote_tokens` alone). `payload.endpoint` is the
-/// ONLY field the viewer's own `tokensOffMeter()`
-/// (`ui/src/lenses/fleet/savings.ts`; the legacy `viewer.html`'s copy of
-/// this function retired along with that file, #1806) reads to classify a
-/// session as cloud vs. local; a payload carrying `remote_tokens` without
-/// it renders as 100% local savings even though real cloud tokens were
-/// spent.
-///
-/// No-op per field when its argument is `None` — a fully-local dispatch
-/// (no remote seat) calls this with `(None, None)` and the payload is left
-/// byte-identical to not calling it at all, so this is safe to call
-/// unconditionally.
-pub fn stamp_remote_classification(
-    payload: &mut serde_json::Value,
-    endpoint_label: Option<&str>,
-    remote_tokens: Option<u64>,
-) {
-    if let Some(ep) = endpoint_label {
-        payload["endpoint"] = serde_json::json!(ep);
-    }
-    if let Some(tokens) = remote_tokens {
-        payload["remote_tokens"] = serde_json::json!(tokens);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,21 +370,5 @@ mod tests {
             "azure:myorg.cognitiveservices.azure.com/gpt-4o"
         );
         assert_eq!(remote_route_label("api.openai.com", "gpt-4o"), "openai:api.openai.com/gpt-4o");
-    }
-
-    #[test]
-    fn stamp_remote_classification_sets_both_fields_when_present() {
-        let mut payload = serde_json::json!({ "result_class": "ok" });
-        stamp_remote_classification(&mut payload, Some("azure:host/model"), Some(42));
-        assert_eq!(payload["endpoint"], "azure:host/model");
-        assert_eq!(payload["remote_tokens"], 42);
-    }
-
-    #[test]
-    fn stamp_remote_classification_no_op_when_both_none() {
-        let mut payload = serde_json::json!({ "result_class": "ok" });
-        let before = payload.clone();
-        stamp_remote_classification(&mut payload, None, None);
-        assert_eq!(payload, before);
     }
 }

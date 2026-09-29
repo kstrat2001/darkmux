@@ -142,7 +142,7 @@ pub fn mint_key() -> String {
 /// One `for` finding, as copied onto the mod at create time. Either the
 /// finding's own provenance (it was in the store) or a `missing` marker (it
 /// was not) — never nothing, so a reader can always tell the two apart.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
 pub struct ForFinding {
     /// The finding key exactly as the proposer named it.
     pub key: String,
@@ -170,7 +170,7 @@ pub struct ForFinding {
 
 /// What the mod carries about the findings it names, so a reader of the mod
 /// never has to go find them.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
 pub struct ModContext {
     #[serde(default)]
     pub findings: Vec<ForFinding>,
@@ -182,7 +182,7 @@ pub struct ModContext {
 /// enough to do per finding". Written once, by [`record_gate`], never
 /// re-run: a mod is a moment someone proposed a change, and confirming it
 /// is a moment too.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct GateOutcome {
     /// `true` — the mod's kit applied AND the command exited `0` against
     /// the PATCHED checkout. `false` — the kit failed to apply (see
@@ -238,7 +238,7 @@ pub struct GateOutcome {
 ///
 /// Every one of those is `Option`/`default` on read, which is what makes a
 /// `"1"` record still parse.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ModRecord {
     /// The minted key — the address every other surface uses.
     pub key: String,
@@ -967,7 +967,7 @@ fn stage_and_commit(
 
 /// One attachment as it arrived inside a runtime emission: the name it gets
 /// inside the mod, and its bytes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, schemars::JsonSchema)]
 pub struct InlineAttachment {
     pub name: String,
     pub bytes: Vec<u8>,

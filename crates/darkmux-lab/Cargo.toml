@@ -12,7 +12,7 @@ rust-version = "1.86"
 [dependencies]
 darkmux-types = { path = "../darkmux-types" }
 # (4.0) The trajectory event types and their one fold, shared with the runtime.
-darkmux-trajectory = { path = "../darkmux-trajectory" }
+darkmux-trajectory = { path = "../darkmux-trajectory", features = ["schemars"] }
 darkmux-crew = { path = "../darkmux-crew" }
 # (#1198) machine fingerprint for the scores.json fit key + RFC3339 ts.
 darkmux-flow = { path = "../darkmux-flow" }

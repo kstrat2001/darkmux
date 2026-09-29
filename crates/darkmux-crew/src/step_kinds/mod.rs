@@ -76,7 +76,7 @@ mod endpoint_conformance;
 
 pub use builtins::{
     parse_failed_verifiers, resolve_local_seat, DispatchInternalStepKind,
-    DispatchMapStepKind, DispatchSingleShotStepKind, FailedVerifier, MapItemResult,
+    DispatchMapStepKind, DispatchSingleShotStepKind, MapItemResult,
     ProceduralNoopStepKind, ProceduralShellStepKind, RawDispatchOutcome,
 };
 pub use deliver_github_review::{

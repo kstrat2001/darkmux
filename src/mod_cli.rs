@@ -19,7 +19,25 @@
 use anyhow::{Context, Result};
 use darkmux_crew::mods::{self, ModRecord};
 use darkmux_types::config_access;
+use serde::Serialize;
 use std::path::PathBuf;
+
+use crate::cli_json;
+
+/// `mod create --json`. `path` sits BESIDE the record, never inside it:
+/// `record` has to stay byte-equal to what is on disk, or a consumer that
+/// diffs the two sees a field darkmux invented.
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct ModCreated<'a> {
+    pub record: &'a ModRecord,
+    pub path: String,
+}
+
+/// `mod list --json`: the mods that matched, ts-ascending.
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct ModList<'a> {
+    pub mods: Vec<&'a ModRecord>,
+}
 
 /// How many characters of the raw kit `list` previews. Enough to recognize a
 /// mod, short enough to keep one mod on one line.
@@ -83,13 +101,7 @@ pub fn create(
         // `path` sits BESIDE the record, never inside it: `record` has to stay
         // byte-equal to what is on disk, or a consumer that diffs the two sees
         // a field darkmux invented.
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "record": &rec,
-                "path": path.to_string_lossy(),
-            }))?
-        );
+        cli_json::emit(&ModCreated { record: &rec, path: path.to_string_lossy().into_owned() })?;
         return Ok(0);
     }
 
@@ -111,6 +123,28 @@ pub fn create(
     }
     eprintln!("recorded {}", path.display());
     Ok(0)
+}
+
+/// One `mod list` row: key, time, author, the findings it answers, and a kit preview.
+fn list_row(m: &ModRecord) -> String {
+    let for_bit = if m.r#for.is_empty() {
+        "for (none)".to_string()
+    } else {
+        format!("for {}", m.r#for.join(", "))
+    };
+    let attach = match m.attachments.len() {
+        0 => String::new(),
+        n => format!("  {n} attachment(s)"),
+    };
+    // (#2310 P4c-2b neighbor check) A compact gate indicator, same
+    // discipline `mod show`'s own `gate` line follows.
+    let gate = match (&m.gate, &m.gate_skipped_reason) {
+        (Some(g), _) if g.passed => "  [gate: pass]".to_string(),
+        (Some(_), _) => "  [gate: fail]".to_string(),
+        (None, Some(_)) => "  [gate: skipped]".to_string(),
+        (None, None) => String::new(),
+    };
+    format!("{}  {}  {}  [{for_bit}]{attach}{gate}\n    {}", m.key, m.ts, m.by, preview(m.kit.as_deref()))
 }
 
 /// `mod list` — every mod in the store, ts-ascending.
@@ -138,7 +172,7 @@ pub fn list(for_key: Option<&str>, mission: Option<&str>, json: bool) -> Result<
         .collect();
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "mods": rows }))?);
+        cli_json::emit(&ModList { mods: rows })?;
         return Ok(0);
     }
 
@@ -163,27 +197,20 @@ pub fn list(for_key: Option<&str>, mission: Option<&str>, json: bool) -> Result<
     }
 
     for m in &rows {
-        let for_bit = if m.r#for.is_empty() {
-            "for (none)".to_string()
-        } else {
-            format!("for {}", m.r#for.join(", "))
-        };
-        let attach = match m.attachments.len() {
-            0 => String::new(),
-            n => format!("  {n} attachment(s)"),
-        };
-        // (#2310 P4c-2b neighbor check) A compact gate indicator, same
-        // discipline `mod show`'s own `gate` line follows.
-        let gate = match (&m.gate, &m.gate_skipped_reason) {
-            (Some(g), _) if g.passed => "  [gate: pass]".to_string(),
-            (Some(_), _) => "  [gate: fail]".to_string(),
-            (None, Some(_)) => "  [gate: skipped]".to_string(),
-            (None, None) => String::new(),
-        };
-        println!("{}  {}  {}  [{for_bit}]{attach}{gate}\n    {}", m.key, m.ts, m.by, preview(m.kit.as_deref()));
+        println!("{}", list_row(m));
     }
     println!("\n{} mod(s) in {}", rows.len(), root.display());
     Ok(0)
+}
+
+/// The `gate` line of `mod show`: passed, failed, skipped (with why), or not yet gated.
+fn gate_summary(rec: &ModRecord) -> String {
+    match (&rec.gate, &rec.gate_skipped_reason) {
+        (Some(g), _) if g.passed => format!("passed ({})", g.command),
+        (Some(g), _) => format!("failed ({})", g.command),
+        (None, Some(reason)) => format!("skipped — {reason}"),
+        (None, None) => "(not yet gated)".to_string(),
+    }
 }
 
 /// `mod show <key>` — one record, whole, with the kit printed RAW.
@@ -204,7 +231,7 @@ pub fn show(key: &str, json: bool) -> Result<i32> {
     };
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&rec)?);
+        cli_json::emit(&rec)?;
         return Ok(0);
     }
 
@@ -218,15 +245,7 @@ pub fn show(key: &str, json: bool) -> Result<i32> {
     // whole record serializes), but the plain-text rendering did not name
     // it at all, which would have made a gated mod look identical to a
     // never-gated one here.
-    println!(
-        "gate      {}",
-        match (&rec.gate, &rec.gate_skipped_reason) {
-            (Some(g), _) if g.passed => format!("passed ({})", g.command),
-            (Some(g), _) => format!("failed ({})", g.command),
-            (None, Some(reason)) => format!("skipped — {reason}"),
-            (None, None) => "(not yet gated)".to_string(),
-        }
-    );
+    println!("gate      {}", gate_summary(&rec));
     if rec.r#for.is_empty() {
         println!("for       (none)");
     } else {

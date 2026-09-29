@@ -9,6 +9,21 @@
 
 use super::*;
 
+/// A `dispatch.start` bounds block as a producer writes it: every required
+/// knob present, `overrides` laid over the built-in defaults.
+fn bounds_json(overrides: serde_json::Value) -> serde_json::Value {
+    let mut bounds = serde_json::json!({
+        "max_tokens_per_call": {"value": null, "source": "built-in"},
+        "inactivity_timeout_seconds": {"value": 600, "source": "built-in"},
+        "max_turns": {"value": null, "source": "built-in"},
+        "max_tokens": {"value": null, "source": "built-in"},
+    });
+    for (k, v) in overrides.as_object().expect("an object of knobs") {
+        bounds[k] = v.clone();
+    }
+    bounds
+}
+
 fn line(v: serde_json::Value) -> String {
     format!("{v}\n")
 }
@@ -379,9 +394,9 @@ fn telem(ts: u64, gpu_pct: u64, w: f64) -> String {
     line(serde_json::json!({
         "action": "machine.telemetry",
         "payload": {
-            "sampled_at_ms": ts, "gpu_pct": gpu_pct, "mem_pct": 62,
+            "sampled_at_ms": ts, "sampler_cost_ms": 1, "gpu_pct": gpu_pct, "mem_pct": 62,
             "thermal": {"state": "nominal", "cpu_speed_limit_pct": 100},
-            "power_mw": {"gpu": (w * 1000.0) as u64, "cpu": 5_000, "total": (w * 1000.0) as u64 + 5_000}
+            "power_mw": {"gpu": (w * 1000.0) as u64, "cpu": 5_000, "ane": 0, "total": (w * 1000.0) as u64 + 5_000}
         }
     }))
 }
@@ -400,9 +415,9 @@ fn power_is_averaged_over_busy_samples_only_with_a_duty_cycle() {
         line(serde_json::json!({
             "action": "machine.telemetry",
             "payload": {
-                "sampled_at_ms": from + off, "interval_ms": 25_000, "gpu_pct": gpu, "mem_pct": 62,
+                "sampled_at_ms": from + off, "sampler_cost_ms": 1, "interval_ms": 25_000, "gpu_pct": gpu, "mem_pct": 62,
                 "thermal": {"state": "nominal", "cpu_speed_limit_pct": 100},
-                "power_mw": {"gpu": (w * 1000.0) as u64, "cpu": 5_000, "total": (w * 1000.0) as u64 + 5_000}
+                "power_mw": {"gpu": (w * 1000.0) as u64, "cpu": 5_000, "ane": 0, "total": (w * 1000.0) as u64 + 5_000}
             }
         }))
     };
@@ -494,7 +509,7 @@ fn a_run_that_crossed_midnight_reads_both_days_files() {
         flows.path().join("2026-09-21.jsonl"),
         line(serde_json::json!({
             "action": "dispatch.start", "session_id": "sid-1",
-            "payload": {"bounds": {"max_tokens_per_call": {"value": 32_000, "source": "built-in"}}}
+            "payload": {"bounds": bounds_json(serde_json::json!({"max_tokens_per_call": {"value": 32_000, "source": "built-in"}}))}
         })),
     )
     .unwrap();
@@ -509,6 +524,42 @@ fn a_run_that_crossed_midnight_reads_both_days_files() {
     assert_eq!(s.flow_records_in_window, 1, "yesterday's session record");
     assert!(s.bounds.contains_key("max_tokens_per_call"), "bounds from yesterday's file");
     assert!(s.unreconciled().is_empty(), "a clean run quotes cleanly: {:?}", s.unreconciled());
+}
+
+/// A knob a newer writer adds to `dispatch.start.bounds` survives into the run's
+/// stats: the block is read as the map it is on the wire, not through the typed
+/// struct, which would drop a name this build does not declare.
+#[test]
+fn a_knob_this_build_does_not_declare_survives_into_the_stats() {
+    let run = tempfile::TempDir::new().unwrap();
+    let flows = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        run.path().join("trajectory.jsonl"),
+        format!(
+            "{}{}",
+            line(serde_json::json!({"type": "dispatch.start", "ts": 1_000, "model": "m"})),
+            line(serde_json::json!({"type": "dispatch.complete", "ts": 11_000, "result": "stop", "wall_ms": 10_000})),
+        ),
+    )
+    .unwrap();
+    std::fs::write(run.path().join("lifecycle.json"), serde_json::json!({"session_id": "sid-1"}).to_string()).unwrap();
+    std::fs::write(run.path().join("manifest.json"), serde_json::json!({"ok": true, "session_id": "sid-1"}).to_string()).unwrap();
+    std::fs::write(
+        flows.path().join("2026-09-21.jsonl"),
+        line(serde_json::json!({
+            "action": "dispatch.start", "session_id": "sid-1",
+            "payload": {"bounds": bounds_json(serde_json::json!({
+                "detection_degeneracy_policy": {"value": "enforce", "source": "env"},
+                "tomorrows_knob": {"value": 7, "source": "config"},
+            }))}
+        })),
+    )
+    .unwrap();
+    let s = compute_from_dir(run.path(), flows.path()).unwrap();
+    let future = s.bounds.get("tomorrows_knob").expect("the unknown knob is kept");
+    assert_eq!(future.value, Some(serde_json::json!(7)));
+    assert_eq!(future.source, darkmux_flow::payload::KnobSource::Config);
+    assert_eq!(s.gates.checkpoint.policy.as_deref(), Some("enforce"), "the policy still reads through the typed knob");
 }
 
 // ---------------------------------------------------------------------------
@@ -659,7 +710,7 @@ fn the_window_slack_keeps_session_records_but_not_outside_telemetry() {
         telem(start - 2 * MIN, 96, 40.0), // before the run: not a run sample
         line(serde_json::json!({
             "action": "dispatch.start", "session_id": "sid-9",
-            "payload": {"bounds": {"max_turns": {"value": null, "source": "built-in"}}}
+            "payload": {"bounds": bounds_json(serde_json::json!({"max_turns": {"value": null, "source": "built-in"}}))}
         })),
         telem(start + MIN, 96, 40.0),
     );
@@ -736,8 +787,8 @@ fn telem_at(ts: u64, gpu_pct: u64, interval_ms: u64) -> String {
     line(serde_json::json!({
         "action": "machine.telemetry",
         "payload": {
-            "sampled_at_ms": ts, "gpu_pct": gpu_pct, "interval_ms": interval_ms,
-            "power_mw": {"gpu": 30_000, "cpu": 5_000, "total": 35_000}
+            "sampled_at_ms": ts, "sampler_cost_ms": 1, "gpu_pct": gpu_pct, "interval_ms": interval_ms,
+            "power_mw": {"gpu": 30_000, "cpu": 5_000, "ane": 0, "total": 35_000}
         }
     }))
 }
@@ -844,7 +895,7 @@ fn a_file_last_written_just_before_the_run_is_still_opened() {
     let flows = tempfile::TempDir::new().unwrap();
     let body = line(serde_json::json!({
         "action": "dispatch.start", "session_id": "sid-4",
-        "payload": {"bounds": {"max_turns": {"value": null, "source": "built-in"}}}
+        "payload": {"bounds": bounds_json(serde_json::json!({"max_turns": {"value": null, "source": "built-in"}}))}
     }));
     flow_file(flows.path(), "d.jsonl", &body, start - 2 * MIN);
     let s = compute_from_dir(run.path(), flows.path()).unwrap();
@@ -940,7 +991,11 @@ fn with_policy_bound(value: &str) -> FlowFacts {
     let mut f = FlowFacts::default();
     f.bounds.insert(
         "detection_degeneracy_policy".into(),
-        serde_json::json!({"value": value, "source": "env"}),
+        darkmux_flow::payload::Knob {
+            value: Some(serde_json::json!(value)),
+            source: darkmux_flow::payload::KnobSource::Env,
+            configured_value: None,
+        },
     );
     f
 }
@@ -988,8 +1043,8 @@ fn old_telem(off: u64, gpu: u64) -> String {
     // Telemetry as recorded before 2026-09-05: no `interval_ms`.
     line(serde_json::json!({
         "action": "machine.telemetry",
-        "payload": {"sampled_at_ms": 1_000_000 + off, "gpu_pct": gpu,
-                    "power_mw": {"gpu": 30_000, "cpu": 5_000, "total": 35_000}}
+        "payload": {"sampled_at_ms": 1_000_000 + off, "sampler_cost_ms": 1, "gpu_pct": gpu,
+                    "power_mw": {"gpu": 30_000, "cpu": 5_000, "ane": 0, "total": 35_000}}
     }))
 }
 

@@ -18,7 +18,7 @@ use darkmux_flow::session_presence::SessionBeat;
 use darkmux_profiles::model_ledger::ModelLedger;
 use darkmux_types::config::BusyPolicy;
 use darkmux_types::LoadedModel;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::runs::{Run, RunsPolicy};
 use crate::source_state::SourceState;
@@ -106,7 +106,7 @@ pub struct MachineStatusResponse {
 }
 
 /// The configured machine utility model and whether it is resident.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize, schemars::JsonSchema)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct UtilityModel {
@@ -118,7 +118,7 @@ pub struct UtilityModel {
 }
 
 /// `GET /machine/specs`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize, schemars::JsonSchema)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct MachineSpecsResponse {
@@ -148,7 +148,7 @@ pub struct MachineSpecsResponse {
 
 /// `GET /machine/resources`: the memory ledger, the recorded cache cadence, and
 /// the host sampler's reading when one has landed.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct MachineResourcesResponse {
@@ -166,36 +166,7 @@ pub struct MachineResourcesResponse {
 }
 
 /// The daemon-side continuous host sampler's reading.
-#[derive(Debug, Clone, Serialize)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-#[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
-pub struct MachineLoad {
-    /// The slow-moving battery health fact; `null` on a machine with no battery.
-    pub battery_health: Option<darkmux_crew::host_probe::wire::BatteryHealthNow>,
-    pub now: darkmux_crew::host_probe::wire::HostSampleNow,
-    pub window: LoadWindow,
-}
-
-/// The window reductions over the sampler's ring.
-#[derive(Debug, Clone, Serialize)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-#[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
-pub struct LoadWindow {
-    pub samples: u32,
-    #[cfg_attr(test, ts(type = "number"))]
-    pub span_ms: u64,
-    /// The MEASURED mean gap between samples, not the configured cadence;
-    /// `null` with fewer than two samples.
-    #[cfg_attr(test, ts(type = "number | null"))]
-    pub interval_ms: Option<u64>,
-    pub cpu_pct: darkmux_crew::host_probe::wire::MetricWindow,
-    pub gpu_pct: darkmux_crew::host_probe::wire::MetricWindow,
-    pub mem_pct: darkmux_crew::host_probe::wire::MetricWindow,
-    pub power_mw: Option<darkmux_crew::host_probe::wire::PowerWindowWire>,
-    pub thermal: Option<darkmux_crew::host_probe::wire::ThermalWindowWire>,
-    /// The integral of total power over the window, in milliwatt-hours.
-    pub energy_mwh: Option<f64>,
-}
+pub use darkmux_flow::payload::{LoadWindow, MachineLoad};
 
 // ─── coverage ──────────────────────────────────────────────────────────────
 

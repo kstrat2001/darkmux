@@ -46,7 +46,7 @@ use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// What a graph node is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "lowercase")]
@@ -57,7 +57,7 @@ pub enum NodeKind {
 
 /// What an edge means: `Contains` (phase to task) or `DependsOn` (a real
 /// `Task::depends_on`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "snake_case")]
@@ -69,7 +69,7 @@ pub enum EdgeKind {
 /// A node's display status: a task's own display status, or a phase's. The two
 /// sets differ (`Degraded` is a phase-only verdict), so the wire type is their
 /// union and each variant serializes as its bare status word.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(untagged)]
@@ -90,7 +90,7 @@ pub enum GraphNodeStatus {
 /// the `mission_graph_json_fan_in_shape` route test now pins the exact
 /// key the JS reads so a rename on either side fails a test instead of
 /// silently flattening the layout.
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq, schemars::JsonSchema)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "camelCase")]
@@ -151,7 +151,7 @@ pub struct GraphNode {
 
 /// One row inside a Task node's card (#1401). Same `camelCase` wire
 /// contract as [`GraphNode`].
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq, schemars::JsonSchema)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "camelCase")]
@@ -237,7 +237,7 @@ pub struct StepRow {
 /// [`GraphNode`] (a no-op for the current single-word field names, but the
 /// attribute keeps a future two-word field from re-introducing the
 /// casing trap).
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq, schemars::JsonSchema)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "camelCase")]
@@ -259,7 +259,7 @@ pub struct GraphEdge {
 /// the page's JS reads it that way (`g.mission_id`, `g.mission_status`).
 /// Only the node/edge OBJECTS are camelCase — see [`GraphNode`]'s casing
 /// contract. The `mission_graph_json_fan_in_shape` test pins both casings.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct MissionGraph {
@@ -333,7 +333,7 @@ fn step_model_from_config(config: &serde_json::Value) -> Option<String> {
 /// in DISPLAY), while a Task's own status is read-only, derived fresh from
 /// its steps on every graph build (`Task` carries no `status` field of its
 /// own — #1230/#1341).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "lowercase")]
@@ -434,7 +434,7 @@ fn derive_task_status(steps: &[(NodeStatus, Option<u64>)]) -> TaskDisplayStatus 
 /// `Waiting` a task could never legitimately reach (task level keeps "any
 /// Error wins" unchanged, see `derive_task_status`) would widen the
 /// scheduler's own vocabulary for a concept that only exists one level up.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "lowercase")]
@@ -1013,8 +1013,8 @@ fn step_for_record<'a>(
             return None;
         }
     }
-    if let Some(sid) = rec.get("payload").and_then(|p| p.get("step_id")).and_then(|s| s.as_str()) {
-        if let Some(found) = step_ids.get(sid) {
+    if let Some(payload) = darkmux_flow::reader::payload_of(rec) {
+        if let Some(found) = payload.step_id().and_then(|sid| step_ids.get(sid)) {
             return Some(found.as_str());
         }
     }
@@ -1089,28 +1089,19 @@ where
         let Some(sid) = step_for_record(&rec, step_ids, mission_id) else {
             continue;
         };
-        let action = darkmux_flow::reader::action_of(&rec);
-        let payload = rec.get("payload");
-        let is_complete = action == Some(darkmux_flow::FlowAction::DispatchComplete);
-        let is_step_result = action == Some(darkmux_flow::FlowAction::StepResult);
-        if !is_complete && !is_step_result {
-            continue;
-        }
+        // (#1445 gate) The review vocabulary's `tokens` is read as
+        // `total_tokens` by the flow reader's upgrade, so one key is read here.
+        let (total_tokens, total_turns) = match darkmux_flow::reader::payload_of(&rec) {
+            Some(darkmux_flow::Payload::DispatchComplete(p)) => (p.total_tokens, p.total_turns),
+            Some(darkmux_flow::Payload::StepResult(p)) => (p.total_tokens, None),
+            _ => continue,
+        };
         let entry = out.entry(sid.to_string()).or_default();
-        // (#1445 gate) `total_tokens` wins when both are present; `tokens` is
-        // the review-vocabulary fallback. Same precedence as the JS fold.
-        let total_tokens = payload
-            .and_then(|p| p.get("total_tokens"))
-            .and_then(|v| v.as_u64())
-            .or_else(|| payload.and_then(|p| p.get("tokens")).and_then(|v| v.as_u64()));
-        let total_turns = payload.and_then(|p| p.get("total_turns")).and_then(|v| v.as_u64());
         if let Some(t) = total_tokens {
             entry.tokens = Some(entry.tokens.map_or(t, |cur| cur.max(t)));
         }
-        if is_complete {
-            if let Some(n) = total_turns {
-                entry.turns = Some(entry.turns.map_or(n, |cur| cur.max(n)));
-            }
+        if let Some(n) = total_turns {
+            entry.turns = Some(entry.turns.map_or(n, |cur| cur.max(n)));
         }
     }
     out
@@ -1633,7 +1624,7 @@ mod tests {
         let step_ids = ids(&["example-judge-step"]);
         let rec = serde_json::json!({
             "action": "step.result",
-            "payload": { "step_id": "example-judge-step", "total_tokens": 4200 }
+            "payload": { "kind": "k", "step_id": "example-judge-step", "total_tokens": 4200 }
         });
         let out = fold_step_finals(vec![rec], &step_ids, "m-this");
         assert_eq!(out["example-judge-step"].tokens, Some(4200));
@@ -1671,7 +1662,7 @@ mod tests {
             serde_json::json!({
                 "action": "step.result",
                 "mission_id": "m-this",
-                "payload": { "step_id": "s1", "total_tokens": 4200 }
+                "payload": { "kind": "k", "step_id": "s1", "total_tokens": 4200 }
             }),
             serde_json::json!({
                 "action": "step.timing",
@@ -1701,13 +1692,13 @@ mod tests {
             let mut rec = serde_json::json!({
                 "action": "step.result",
                 "mission_id": "m-other",
-                "payload": { "total_tokens": 4200 }
+                "payload": { "kind": "k", "total_tokens": 4200 }
             });
             rec.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
             rec
         };
         let recs = vec![
-            foreign(serde_json::json!({ "payload": { "step_id": "example-judge-step", "total_tokens": 4200 } })),
+            foreign(serde_json::json!({ "payload": { "kind": "k", "step_id": "example-judge-step", "total_tokens": 4200 } })),
             foreign(serde_json::json!({ "session_id": "step-example-judge-step" })),
             foreign(serde_json::json!({ "handle": "example-judge-step" })),
         ];
@@ -1729,11 +1720,11 @@ mod tests {
             serde_json::json!({
                 "action": "step.result",
                 "mission_id": "m-this",
-                "payload": { "step_id": "s1", "total_tokens": 100 }
+                "payload": { "kind": "k", "step_id": "s1", "total_tokens": 100 }
             }),
             serde_json::json!({
                 "action": "step.result",
-                "payload": { "step_id": "s2", "total_tokens": 200 }
+                "payload": { "kind": "k", "step_id": "s2", "total_tokens": 200 }
             }),
         ];
         let out = fold_step_finals(recs, &step_ids, "m-this");
@@ -1798,7 +1789,7 @@ mod tests {
             serde_json::json!({ "session_id": "step-judge-1", "mission_id": "m1", "payload": {} }),
             serde_json::json!({ "session_id": "step-verify-1-m1", "mission_id": "m1" }),
             serde_json::json!({ "session_id": "m1.step.s1", "mission_id": "m1", "payload": { "total_tokens": 3 } }),
-            serde_json::json!({ "session_id": "step-a", "mission_id": "m1", "payload": { "step_id": "kept" } }),
+            serde_json::json!({ "session_id": "step-a", "mission_id": "m1", "payload": { "kind": "k", "step_id": "kept" } }),
             serde_json::json!({ "session_id": "mission-other.step.s1", "mission_id": "m1" }),
             serde_json::json!({ "session_id": "task-t1", "mission_id": "m1" }),
             serde_json::json!({ "session_id": "step-s1", "mission_id": "m1", "payload": "not an object" }),
@@ -1867,7 +1858,7 @@ mod tests {
         let step_ids = ids(&["s1"]);
         let rec = serde_json::json!({
             "action": "step.result",
-            "payload": { "step_id": "s1", "total_tokens": 50, "endpoint": "https://api.example/v1" }
+            "payload": { "kind": "k", "step_id": "s1", "total_tokens": 50, "endpoint": "https://api.example/v1" }
         });
         let out = fold_step_finals(vec![rec], &step_ids, "m-this");
         assert_eq!(out["s1"].tokens, Some(50));
@@ -1879,7 +1870,7 @@ mod tests {
         let recs = vec![
             // Foreign step — not in this mission's set.
             serde_json::json!({ "action": "step.result",
-                                "payload": { "step_id": "someone-else", "total_tokens": 999 } }),
+                                "payload": { "kind": "k", "step_id": "someone-else", "total_tokens": 999 } }),
             // A RUNNING per-turn increment for my step — NOT a finalized total,
             // stays the SSE channel's job, must not fold here.
             serde_json::json!({ "action": "telemetry.tokens", "handle": "mine",
@@ -1903,6 +1894,9 @@ mod tests {
             "action": "step.result",
             "payload": { "step_id": "example-judge-step", "kind": "dispatch.map", "tokens": 4200 }
         });
+        // Records reach the fold through the flow reader, which reads the
+        // retired `tokens` spelling as `total_tokens`.
+        let rec = darkmux_flow::reader::parse_value(&rec.to_string()).expect("a record");
         let out = fold_step_finals(vec![rec], &step_ids, "m-this");
         assert_eq!(out["example-judge-step"].tokens, Some(4200), "a `tokens` payload folds");
     }
@@ -1914,7 +1908,7 @@ mod tests {
         let step_ids = ids(&["s1"]);
         let rec = serde_json::json!({
             "action": "step.result",
-            "payload": { "step_id": "s1", "total_tokens": 900, "tokens": 100 }
+            "payload": { "kind": "k", "step_id": "s1", "total_tokens": 900, "tokens": 100 }
         });
         let out = fold_step_finals(vec![rec], &step_ids, "m-this");
         assert_eq!(out["s1"].tokens, Some(900));
@@ -1928,7 +1922,7 @@ mod tests {
         let step_ids = ids(&["s1"]);
         let rec = serde_json::json!({
             "action": "dispatch.start", "handle": "s1",
-            "payload": { "step_id": "s1", "endpoint": "azure:example.azure.com/gpt" }
+            "payload": { "kind": "k", "step_id": "s1", "endpoint": "azure:example.azure.com/gpt" }
         });
         let out = fold_step_finals(vec![rec], &step_ids, "m-this");
         assert!(!out.contains_key("s1"), "a start folds no entry: {out:?}");
@@ -2066,7 +2060,7 @@ mod tests {
         let created_ts = (darkmux_flow::days_from_civil(2026, 7, 17) * 86400) as u64;
         let fold = |action: &str| {
             let tmp = tempfile::TempDir::new().unwrap();
-            let rec = serde_json::json!({ "action": action, "handle": "s1", "payload": { "total_tokens": 4200 } });
+            let rec = serde_json::json!({ "action": action, "handle": "s1", "payload": { "kind": "k", "total_tokens": 4200 } });
             write_day_file(tmp.path(), "2026-07-17", &[rec]);
             backfill_step_finals(tmp.path(), &step_ids, "m-this", created_ts)["s1"].tokens
         };

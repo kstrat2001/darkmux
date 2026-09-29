@@ -42,7 +42,7 @@ use serde::Serialize;
 /// Serializes as an internally-tagged object so a reader can switch on
 /// `state` and find the variant's fields alongside it:
 /// `{"state":"stale","age_ms":41200,"detail":"could not reach Redis"}`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(tag = "state", rename_all = "snake_case")]

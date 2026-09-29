@@ -55,7 +55,7 @@ CREATE TABLE IF NOT EXISTS lessons (
 /// an exported store back. The optional fields take `#[serde(default)]` so a
 /// hand-authored entry can carry just `title` + `body`; the timestamps default
 /// to `0`, which [`import_json`] reads as "stamp now".
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
 pub struct Lesson {
     /// DB rowid — `None` for a lesson being constructed for insert, `Some` when
     /// read back. [`edit`]/[`remove`] target it; [`import_json`] upserts on it.
@@ -84,7 +84,7 @@ pub struct Lesson {
 /// Self-describing envelope for [`export_json`]/[`import_json`] — carries the
 /// schema version alongside the rows so a hand-edited / git-committed dump is
 /// unambiguous and a future migration can branch on it.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
 pub struct LessonsExport {
     pub schema_version: i32,
     pub lessons: Vec<Lesson>,

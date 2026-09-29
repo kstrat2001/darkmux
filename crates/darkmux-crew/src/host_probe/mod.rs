@@ -172,57 +172,10 @@ pub fn epoch_ms_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// (#2111) One host reading's full "now" JSON shape — every field
-/// [`HostSampleFull`] carries, plus the wall-clock it was taken at
-/// (`sampled_at_ms` — the caller MUST pass UNIX epoch ms, e.g. from
-/// [`epoch_ms_now`]; this function does not derive or validate it, so a
-/// caller that hands it a relative offset silently produces a record that
-/// LOOKS well-formed but lies about when the sample was taken). Shared by
-/// TWO independent consumers so the mapping from `HostSampleFull` to wire
-/// JSON exists in exactly one place: `darkmux-serve`'s daemon-side ring
-/// (`/machine/resources`'s `load.now` block) and `darkmux-crew`'s
-/// dispatch-scoped sampler (the periodic `machine.telemetry` flow record,
-/// #2111). A field the probe could not read serializes as JSON `null`,
-/// never a zero — "not measured" and "measured, and idle" are different
-/// claims, and downstream consumers render them differently.
-pub fn sample_full_json(s: &HostSampleFull, sampled_at_ms: u64) -> serde_json::Value {
-    to_wire_json(&wire::HostSampleNow::new(s, sampled_at_ms))
-}
-
-/// (#2705) One battery CHARGE reading's wire shape. Extracted so the two
-/// consumers that render it, `sample_full_json` above (the telemetry ring
-/// and `machine.telemetry`) and `darkmux-serve`'s `machine.battery`
-/// transition record, cannot drift into two spellings of one reading.
-///
-/// `minutes_to_empty` serializes as JSON `null` whenever the OS declines to
-/// estimate; see [`battery::minutes_to_empty_from`] for why that must never
-/// become a zero.
-pub fn battery_sample_json(b: &BatterySample) -> serde_json::Value {
-    to_wire_json(&wire::BatteryCharge::from(b))
-}
-
-/// (#2705) One battery HEALTH reading's wire shape: the MACHINE-RECORD half,
-/// emitted only when a value actually changed (see
-/// `battery::HEALTH_POLL_INTERVAL_MS`), never per telemetry sample.
-///
-/// Both capacity ratios ride alongside the raw mAh counters they were derived
-/// from, each under a name that says WHICH reading it is. See the battery
-/// module's own doc for the measurement behind that: macOS's displayed figure
-/// reproduces from neither pair, so darkmux records what it read and does not
-/// synthesize the third. [`wire::BatteryHealthNow`] documents the three
-/// condition fields.
-pub fn battery_health_json(h: &BatteryHealth) -> serde_json::Value {
-    to_wire_json(&wire::BatteryHealthNow::from(h))
-}
-
-/// A wire struct as a JSON value. Every wire type here is plain data with
-/// string keys, for which serialization cannot fail.
-fn to_wire_json<T: serde::Serialize>(v: &T) -> serde_json::Value {
-    serde_json::to_value(v).unwrap_or(serde_json::Value::Null)
-}
-
 /// (#2413) Build one machine-SCOPED `machine.telemetry` flow record — the
-/// full host reading (`sample_full_json`, above) plus `interval_ms` (the
+/// full host reading ([`wire::host_sample_now`]: every field
+/// [`HostSampleFull`] carries plus the wall-clock it was taken at, which the
+/// caller MUST pass as UNIX epoch ms, e.g. from [`epoch_ms_now`]) plus `interval_ms` (the
 /// EFFECTIVE emission cadence for this tick), and explicitly NO
 /// session/handle/model/mission/phase fields. Shared by the two possible
 /// singleton-sampler owners: a dispatch process holding
@@ -273,10 +226,13 @@ pub fn build_machine_scoped_telemetry_record_with(
     interval_ms: u64,
     provenance: &crate::host_source::Provenance,
 ) -> darkmux_flow::FlowRecord {
-    let mut payload = sample_full_json(sample, sampled_at_ms);
-    if let Some(obj) = payload.as_object_mut() {
-        obj.insert("interval_ms".into(), serde_json::json!(interval_ms));
-    }
+    let mut payload = darkmux_flow::Payload::MachineTelemetry(darkmux_flow::payload::MachineTelemetryPayload {
+        now: wire::host_sample_now(sample, sampled_at_ms),
+        interval_ms: Some(interval_ms),
+        liveness_probe_ms: None,
+        prev_record_write_ms: None,
+        simulated_host_source: None,
+    });
     crate::host_source::stamp_with(provenance, &mut payload);
     let display_name = darkmux_flow::resolve_machine_id().unwrap_or_else(|| "unknown".to_string());
     darkmux_flow::FlowRecord {
@@ -1661,7 +1617,7 @@ mod tests {
     // HERE, not silently downstream in a UI test that happens to use a
     // different fixture.
     #[test]
-    fn battery_health_json_pins_condition_word_and_its_two_source_fields() {
+    fn the_battery_health_wire_pins_condition_word_and_its_two_source_fields() {
         let h = crate::host_probe::battery::BatteryHealth {
             health_condition: Some(String::new()),
             permanent_failure_status: Some(0),
@@ -1669,7 +1625,7 @@ mod tests {
             cycle_count: Some(28),
             ..Default::default()
         };
-        let v = battery_health_json(&h);
+        let v = serde_json::to_value(wire::BatteryHealthNow::from(&h)).unwrap();
         assert_eq!(v["condition_word"], "Normal", "the computed verdict, not the raw unreliable string");
         assert_eq!(v["health_condition"], "");
         assert_eq!(v["permanent_failure_status"], 0);
@@ -1682,6 +1638,6 @@ mod tests {
             permanent_failure_status: Some(2),
             ..Default::default()
         };
-        assert_eq!(battery_health_json(&failed)["condition_word"], "Service Battery");
+        assert_eq!(serde_json::to_value(wire::BatteryHealthNow::from(&failed)).unwrap()["condition_word"], "Service Battery");
     }
 }

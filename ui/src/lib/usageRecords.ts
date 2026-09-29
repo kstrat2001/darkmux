@@ -33,9 +33,10 @@ import type { CallKind } from "../types/generated/CallKind";
 import type { UsagePurpose } from "../types/generated/UsagePurpose";
 import { ACTION, CATEGORY, SOURCE, executionOf, type NormRecord } from "./ingest";
 
-/** Every `UsagePurpose` variant, by name. A key missing or extra relative to
- *  the generated union is a type error. */
-export const PURPOSE = { work: "work", utility: "utility" } as const satisfies { readonly [K in UsagePurpose]: K };
+/** Every `UsagePurpose` variant a writer produces, by name. A key missing or
+ *  extra relative to the generated union is a type error; `unknown` is the
+ *  reader's word for a value from another build, never written. */
+export const PURPOSE = { work: "work", utility: "utility" } as const satisfies { readonly [K in Exclude<UsagePurpose, "unknown">]: K };
 
 /** Every `CallKind` variant, by name. Same drift guard as `PURPOSE`. */
 export const CALL_KIND = {
@@ -43,7 +44,7 @@ export const CALL_KIND = {
   single_shot: "single_shot",
   map_item: "map_item",
   compaction: "compaction",
-} as const satisfies { readonly [K in CallKind]: K };
+} as const satisfies { readonly [K in Exclude<CallKind, "unknown">]: K };
 
 /** The fields of a usage record's payload this module reads. Loose, like the
  *  wire: every field may be absent on an older record. */

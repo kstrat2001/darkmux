@@ -1,0 +1,1117 @@
+# verbs: what each prints under --json
+dispatch <role> (a container execution)  DispatchEnvelope
+dispatch <role> (a hosted-endpoint execution)  DirectDispatchEnvelope
+finding list  FindingList
+finding show  FindingRecord
+finding sync  SyncReport
+flow drain  DrainOutput
+flow drain --file  StrayDrainOutput
+flow integrity-check  IntegrityCheckOutput
+flow status  FlowStatus
+lab loop  LoopReport
+lab loop --ab  LoopAbReport
+machine list  MachineListOutput
+machine resources  ModelLedger
+machine resources <peer>  MachineResourcesResponse
+machine status  MachineStatusOutput
+memory correction list  CorrectionList
+memory lesson export  LessonsExport
+memory lesson list  LessonTiers
+memory lesson recall  LessonTiers
+mission config list  ConfigList
+mission config show  ConfigShow
+mission debrief  DebriefReport
+mission show  MissionShow
+mission status  MissionBoard
+mod create  ModCreated
+mod list  ModList
+mod show  ModRecord
+profile draft  ProfileDraft
+profile list  ProfileList
+role list  RoleList
+role show  RoleShow
+run list  RunListOutput
+run stats <one run>  RunStats
+run stats <several runs, or --baseline>  RunSetStats
+
+# streams: one record per line
+flow tail  one flow record per line, verbatim; the record is pinned by FLOW_SCHEMA_VERSION, not by this file
+
+# types
+AbandonReason = "aborted" | "noterminal"
+ActiveWait
+  scope: string
+  subject: string
+  mission_id: string | null
+  execution_id: string | null
+  resume_at: string | null
+  resumes_in_secs: uint64 | null
+  message: string
+Attribution = "per_process" | "estimated" | "unavailable"
+BatteryCharge
+  charge_pct: uint8
+  on_ac: boolean
+  charging: boolean
+  minutes_to_empty: uint32 | null
+BatteryHealthNow
+  cycle_count: uint64 | null
+  design_capacity_mah: uint64 | null
+  raw_max_capacity_mah: uint64 | null
+  nominal_charge_capacity_mah: uint64 | null
+  raw_capacity_pct: double | null
+  nominal_capacity_pct: double | null
+  condition: string | null
+  health_condition: string | null
+  condition_word: string | null
+  permanent_failure_status: int64 | null
+  temperature_c: double | null
+  time_at_soc_ms: uint64[] | null
+  total_operating_ms: uint64 | null
+BoardDrift
+  kind: DriftKind
+  detail: string
+  suggest: string[]
+BoardMission
+  id: string
+  status: MissionStatus
+  ticket: string | null
+  phases: BoardPhases
+  graph: PruneReport | null
+  drift: BoardDrift[]
+BoardPhases
+  total: uint
+  complete: uint
+  degraded: uint
+  running: uint
+  planned: uint
+  abandoned: uint
+BoardSummary
+  total: uint
+  needs_attention: uint
+  fleet_complete: boolean
+BoundRef
+  kind: string
+  value: uint64 | null
+  source: string | null
+BudgetPolicy = "off" | "warn" | "wait"
+CapabilityProfile = { [key: string]: number }
+CheckpointGate
+  observations: uint
+  degenerate_turns: uint64[]
+  concluded_turns: uint64[]
+  degenerate_turns_by_ratio: uint64[]
+  min_tail_ratio: double | null
+  policy: string | null
+CheckpointSummary
+  total: uint
+  concluded: uint32
+  min_tail_ratio: double | null
+  mean_tail_ratio: double | null
+CompactionStrategy = "narrative" | "structured-slot"
+ConfigList
+  configs: ConfigListRow[]
+ConfigListRow
+  id: string
+  name: string | null
+  source: MissionConfigSource | null
+  manifest_path: string | null
+  phases: uint | null
+  tasks: uint | null
+  cmd: string | null
+  error: string | null
+ConfigShow
+  requested_id: string
+  id: string
+  name: string
+  description: string | null
+  source: MissionConfigSource
+  manifest_path: string
+  schema_version: string | null
+  inputs: InputJson[]
+  cmd: GhVerbJson | null
+  phases: PhaseJson[]
+  registry: RegistryJson
+  residency: ResidencyBlockJson
+  warnings: string[]
+Correction
+  ts: string
+  execution_id: string | null
+  text: string
+CorrectionList
+  corrections: Correction[]
+CostPerSuccess
+  active_ms: double | null
+  gpu_busy_ms: double | null
+  pkg_joules: double | null
+  withheld: string[]
+CpuClusterNow
+  name: string
+  cores: uint32
+  pct: uint64 | null
+  mhz: uint32 | null
+DebriefMission
+  id: string
+  description: string
+  status: MissionStatus
+DebriefPhase
+  id: string
+  description: string
+  status: DebriefPhaseStatus
+  reason: string | null
+DebriefPhaseStatus = "planned" | "running" | "complete" | "degraded" | "abandoned"
+DebriefReport
+  mission: DebriefMission
+  phases: DebriefPhase[]
+  cautions: string[]
+  corrections: string[]
+  records_emitted: RecordsEmitted | null
+DestinationProblem = "both_http_and_file" | "no_destination"
+DetectorArea
+  files: string[]
+  code_hash?: string | null
+DetectorCounts
+  cycle: uint32
+  reasoning_loop: uint32
+  repeated_failure: uint32
+  intra_turn_stall: uint32
+  empty_tool_calls: uint32
+  per_turn_cap: uint32
+  feedback_injected: uint32
+  promoted_calls: uint32
+DetectorKind = "cycle" | "reasoning-loop" | "tool-failure" | "intra-turn-stall" | "empty_tool_calls" | "per-turn-cap" | "discarded_tool_call" | "malformed_tool_names" | "escalation" | "repetition"
+DetectorSeverity = "warn" | "info"
+Dialect = "chat-completions" | "chat-completions-max-tokens"
+DirectDispatchEnvelope
+  result: string
+  final_assistant: string
+  metrics: DirectMetrics
+DirectMetrics
+  model: string
+  endpoint: string
+  wall_ms: uint64
+  turns: uint32
+  prompt_tokens: uint64 | null
+  completion_tokens: uint64 | null
+  total_tokens: uint64 | null
+  reasoning_tokens: uint64 | null
+  cached_tokens: uint64 | null
+DiskStatus
+  flows_dir: string
+  exists: boolean
+  day_files: uint64
+  total_bytes: uint64
+  observed_disk_schemas?: string[]
+DispatchEnvelope
+  result?: string | null
+  final_assistant: string | null
+  trajectory_path?: string | null
+  failed_tool_invocations?: FailedExec[] | null
+  resumed_from?: ResumedFrom | null
+  metrics: EnvelopeMetrics
+  detections: TelemetryDetectorPayload[]
+  bounds: RuntimeBounds
+  host?: EnvelopeHost | null
+  host_window?: HostWindow | null
+  findings?: FindingsSummary | null
+  degeneracy_warnings?: uint32 | null
+  checkpoints?: CheckpointSummary | null
+DraftCompaction
+  custom_instructions: string
+DraftModel
+  id: string
+  n_ctx: uint32
+DraftProfile
+  _comment: string[]
+  description: string
+  models: DraftModel[]
+  runtime: DraftRuntime
+DraftRuntime
+  context_tokens: uint64
+  compaction?: DraftCompaction | null
+DrainOutput
+  rule: uint | null
+  delivered: uint64
+  failed: uint64
+  remaining_undelivered: uint
+  timed_out: boolean
+  lock_held_rules: uint[]
+DriftKind = "done-not-finalized" | "all-phases-terminal-none-complete" | "mission-terminal-live-step" | "mission-terminal-open-phase" | "phase-terminal-live-step" | "stale-active" | "running-phase-execution-dead" | "planned-phase-nothing-advances"
+EdgeKind = "contains" | "depends_on"
+EndpointAuth
+  type?: EndpointAuthType | null
+  keychain?: string | null
+  key_env?: string | null
+EndpointAuthType = "api-key" | "bearer"
+EndpointField = string
+EnvelopeHost
+  cpu: MetricStats
+  mem: MetricStats
+  gpu: MetricStats
+  samples: uint32
+  sample_interval_ms: uint64 | null
+  power?: EnvelopePower | null
+  thermal?: EnvelopeThermal | null
+  energy_mwh?: double | null
+EnvelopeMetrics
+  model: string
+  wall_ms: uint64 | null
+  turns: uint32
+  compactions: uint32
+  prompt_tokens: uint64
+  completion_tokens: uint64
+  total_tokens: uint64
+  reasoning_tokens: uint64 | null
+  cached_tokens: uint64 | null
+  rest_ms: uint64
+  rests: uint32
+  turn_delay_effective_ms: uint64 | null
+EnvelopePower
+  cpu: PowerRail
+  gpu: PowerRail
+  total: PowerRail
+EnvelopeThermal
+  worst_state: string
+  above_nominal_ms: uint64
+  min_cpu_speed_limit_pct: uint64
+EscalationKind = "bail-with-explanation" | "retry-with-hint" | "hand-off-to"
+FailedExec
+  command: string
+  reason: string
+FindingList
+  findings: FindingRecord[]
+FindingRecord
+  key: string
+  execution: string
+  seq: uint64
+  ts: string
+  tool_name: string
+  proposer: Proposer
+  mission_id: string | null
+  phase_id: string | null
+  step_id: string | null
+  context: any
+  emitted: any
+  source?: string | null
+  schema_version: string
+FindingsSummary
+  count: uint
+  path: string
+FlowScan
+  files_total: uint
+  files_skipped: uint
+  files_read: uint
+  files_unreadable: uint
+  files_read_errors: uint
+  files_stopped_early: uint
+  lines_scanned: uint
+  gather_ms: uint64
+FlowStatus
+  schema_version: string
+  sinks: SinkSummary
+  redis?: RedisStatus | null
+  disk: DiskStatus
+  schema: SchemaSkew
+  overall_state: HealthState
+  warn_reasons?: string[]
+  fail_reasons?: string[]
+  hooks: HooksStatus
+ForFinding
+  key: string
+  mission_id?: string | null
+  context?: any
+  emitted?: any
+  missing?: boolean
+GateOutcome
+  passed: boolean
+  command: string
+  exit_code?: int32 | null
+  applied?: boolean | null
+  reason?: string | null
+Gates
+  stream: StreamGate
+  checkpoint: CheckpointGate
+GhVerbJson
+  verb: string
+  allowed: boolean
+GraphEdge
+  id: string
+  source: string
+  target: string
+  kind: EdgeKind
+GraphNode
+  id: string
+  label: string
+  kind: NodeKind
+  status: GraphNodeStatus
+  parentId?: string | null
+  startedTs?: uint64 | null
+  completedTs?: uint64 | null
+  depth: uint
+  description?: string | null
+  steps?: StepRow[] | null
+  statusNote?: string | null
+GraphNodeStatus = TaskDisplayStatus | PhaseDisplayStatus
+Grown
+  phase: string
+  task_template: string
+  from: string
+  source: string
+  items: uint
+  minted: string[]
+HealthState = "ok" | "warn" | "fail"
+HookRuleStatus
+  index: uint
+  match_desc: string
+  url: string
+  is_loopback: boolean
+  is_tailnet: boolean
+  is_refused: boolean
+  destination_problem?: DestinationProblem | null
+  signed: boolean
+  is_empty_match: boolean
+  undelivered: uint
+  last_delivery_ts?: string | null
+  last_error?: string | null
+  dropped_appends: uint64
+  cursor_write_failures: uint64
+  stalled: boolean
+  last_drainer_heartbeat?: string | null
+  quarantined_lines: uint
+  receiver_rejected_total: uint64
+  last_receiver_rejected_reasons: string[]
+HooksStatus
+  enabled: boolean
+  outbox_dir: string
+  rules: HookRuleStatus[]
+HostSampleNow
+  sampled_at_ms: uint64
+  sampler_cost_ms: uint64
+  cpu_pct: uint64 | null
+  cpu_clusters: CpuClusterNow[] | null
+  mem_pct: uint64 | null
+  gpu_pct: uint64 | null
+  gpu_mhz: uint32 | null
+  gpu_mem_bytes: uint64 | null
+  thermal: ThermalNow | null
+  battery: BatteryCharge | null
+  power_mw: PowerNow | null
+HostWindow
+  thermal_worst_state: string | null
+  above_nominal_ms: uint64 | null
+  min_cpu_speed_limit_pct: uint64 | null
+  thermal_serious_episodes: uint64 | null
+  thermal_duty_delay_ms: uint64 | null
+  simulated_host_source: string | null
+  power_mw_total: MetricWindow | null
+  energy_mwh: double | null
+  samples: uint64
+  span_ms: uint64
+InputJson
+  name: string
+  description: string | null
+  required: boolean
+  ignored: boolean
+  ignored_reason: string | null
+  default: any
+IntegrityCheckOutput
+  reports: IntegrityReport[]
+IntegrityReport
+  path: string
+  records_checked: uint64
+  chain_valid: boolean
+  break_at_line?: uint64 | null
+  break_reason?: string | null
+  legacy_format?: boolean
+  note?: string | null
+  writer_schema_version?: string | null
+Knob
+  value: any
+  source: KnobSource
+  configured_value?: Knob | null
+KnobSource = "env" | "config" | "built-in" | "launcher" | "cli" | "forced-agentic-remote"
+LedgerMessage
+  severity: Severity
+  text: string
+LedgerState = "green" | "amber" | "red" | "unknown"
+Lenient = ManagedBackend | any
+Lenient2 = Dialect | any
+Lenient3 = UsageLimits | any
+Lenient4 = BudgetPolicy | any
+Lesson
+  id?: int64 | null
+  title: string
+  body: string
+  file?: string | null
+  source?: string | null
+  created_ts: int64
+  updated_ts: int64
+LessonTiers
+  repo: Lesson[]
+  global: Lesson[]
+LessonsExport
+  schema_version: int32
+  lessons: Lesson[]
+LimitSource = "budget" | "physical_pool" | "unknown"
+LoadWindow
+  samples: uint32
+  span_ms: uint64
+  interval_ms: uint64 | null
+  cpu_pct: MetricWindow
+  gpu_pct: MetricWindow
+  mem_pct: MetricWindow
+  power_mw: PowerWindowWire | null
+  thermal: ThermalWindowWire | null
+  energy_mwh: double | null
+LoadedModel
+  identifier: string
+  model: string
+  status: string
+  size: string
+  context: uint64
+  queued?: uint64 | null
+LoopAbReport
+  ab: boolean
+  injected_context_chars: uint
+  verdict_shift: VerdictShift
+  without: LoopReport
+  with: LoopReport
+LoopReport
+  run_id: string
+  verdict: Verdict
+  dispatch_ok: boolean
+  verify_passed: boolean | null
+  sandbox_changed: boolean | null
+  tool_calls: uint32
+  turns: uint32
+  compactions: uint32
+  detectors: DetectorCounts
+  duration_ms: uint128
+  loop_config: string[]
+  notes: string[]
+MachineListOutput
+  roster_path: string
+  roster_version: string
+  local_machine_id: string | null
+  machines: MachineListRow[]
+MachineListRow
+  id: string
+  address: string
+  dialed_address: string
+  is_this_machine: boolean
+  description: string | null
+  added_unix_ms: uint64
+  machine_uid: string | null
+  reachable: boolean
+  resolved_address: string
+  probe_ms: uint64
+  probe_error: string | null
+  specs: MachineSpecsResponse | null
+  specs_auth_required: boolean
+  specs_route_missing: boolean
+  specs_unverified: boolean
+  specs_unreadable_peer_version: string | null
+MachineLoad
+  battery_health: BatteryHealthNow | null
+  now: HostSampleNow
+  window: LoadWindow
+MachineResourcesResponse
+  schema_version: string
+  generated_at_ms: uint64
+  gather_ms: uint64
+  limit_bytes: uint64 | null
+  limit_source: LimitSource
+  pool: PoolSnapshot | null
+  pressure: PressureSnapshot
+  models: ModelRow[]
+  machine: MachineTotals
+  attribution: Attribution
+  attribution_note: string
+  messages: LedgerMessage[]
+  cache_ttl_ms: uint64
+  load?: MachineLoad | null
+MachineSpecsResponse
+  darkmux_version: string
+  flow_schema_version: string
+  machine_id: string | null
+  machine_uid: string | null
+  os: string
+  ram_total_bytes: uint64 | null
+  ram_free_for_ai_bytes: uint64 | null
+  cpu_brand: string | null
+  loaded_models: LoadedModel[]
+  lms_unreachable: boolean
+  utility_model: UtilityModel | null
+  redis_url_redacted: string | null
+  generated_at_ms: uint64
+MachineStatusOutput
+  machine_id: string | null
+  lms_unreachable: boolean
+  managed: LoadedModel[]
+  user_state: LoadedModel[]
+  matching_profiles?: string[] | null
+  registry?: string | null
+MachineTotals
+  potential_bytes: uint64
+  unpriced_models: uint32
+  estimated_models: uint32
+  over_price_models: uint32
+  current_bytes: uint64 | null
+  other_used_bytes: uint64 | null
+  projected_total_bytes: uint64 | null
+  state: LedgerState
+  shrink_hint?: string | null
+ManagedBackend = "lmstudio"
+MetricStats
+  peak_pct: uint64 | null
+  mean_pct: double | null
+  p95_pct: uint64 | null
+  above_80_ms: uint64
+MetricWindow
+  mean: double | null
+  p95: uint64 | null
+  max: uint64 | null
+MissionBoard
+  missions: BoardMission[]
+  peer_missions: Run[]
+  fleet: SourceState
+  summary: BoardSummary
+  budget_waits: ActiveWait[]
+MissionConfigSource = "user" | "on-disk" | "embedded"
+MissionGraph
+  mission_id: string
+  mission_status: MissionStatus
+  nodes: GraphNode[]
+  edges: GraphEdge[]
+  legacy: boolean
+  note?: string | null
+  generated_at_ms: uint64
+MissionShow
+  id: string
+  status?: MissionStatus | null
+  description?: string | null
+  config?: ShownConfig | null
+  graph?: MissionGraph | null
+  runs: Run[]
+  tokens?: uint64 | null
+  link: string
+MissionStatus = "active" | "finalized" | "aborted"
+ModContext
+  findings: ForFinding[]
+ModCreated
+  record: ModRecord
+  path: string
+ModList
+  mods: ModRecord[]
+ModRecord
+  key: string
+  ts: string
+  by: string
+  for: string[]
+  kit: string | null
+  kit_looks_json: boolean
+  kit_kind?: string | null
+  attachments: string[]
+  context: ModContext
+  warnings?: string[]
+  mission_id: string | null
+  phase_id: string | null
+  step_id: string | null
+  source?: string | null
+  gate?: GateOutcome | null
+  gate_skipped_reason?: string | null
+  schema_version: string
+ModelEndpoint
+  url?: string | null
+  api_version?: string | null
+  auth?: EndpointAuth | null
+  reasoning_effort?: string | null
+  managed?: Lenient | null
+  dialect?: Lenient2 | null
+  limits?: Lenient3 | null
+ModelJson
+  id: string
+  remote: boolean
+  n_ctx: uint32 | null
+ModelLedger
+  schema_version: string
+  generated_at_ms: uint64
+  gather_ms: uint64
+  limit_bytes: uint64 | null
+  limit_source: LimitSource
+  pool: PoolSnapshot | null
+  pressure: PressureSnapshot
+  models: ModelRow[]
+  machine: MachineTotals
+  attribution: Attribution
+  attribution_note: string
+  messages: LedgerMessage[]
+ModelRow
+  identifier: string
+  model_key: string
+  owner: Owner
+  loaded_ctx: uint64
+  weights_bytes: uint64 | null
+  kv_per_token_bytes: uint64 | null
+  kv_bytes_at_ctx: uint64 | null
+  potential_bytes: uint64 | null
+  potential_source?: PotentialSource | null
+  current_bytes: uint64 | null
+  state: LedgerState
+  over_price_bytes?: uint64 | null
+  shrink_hint?: string | null
+NodeKind = "phase" | "task"
+NodeStatus = "planned" | "running" | "complete" | "abandoned" | "error"
+Owner = "darkmux" | "user"
+PhaseDisplayStatus = "planned" | "running" | "complete" | "error" | "abandoned" | "waiting" | "degraded"
+PhaseJson
+  id: string
+  display_name: string | null
+  description: string | null
+  tasks: TaskJson[]
+PoolSnapshot
+  capacity_bytes: uint64
+  used_bytes: uint64 | null
+  available_bytes: uint64 | null
+  free_bytes: uint64 | null
+PotentialSource = "arch" | "estimated"
+PowerNow
+  cpu: int64
+  gpu: int64
+  ane: int64
+  total: int64
+PowerRail
+  mean_mw: double | null
+  peak_mw: uint64 | null
+PowerWindowWire
+  total: MetricWindow
+  gpu: MetricWindow
+  cpu: MetricWindow
+PressureSnapshot
+  swap_used_bytes: uint64 | null
+  compressor_bytes: uint64 | null
+  margin_percent: uint64 | null
+  red: boolean
+Profile
+  description?: string | null
+  models: ProfileModel[]
+  default_model?: string | null
+  runtime?: ProfileRuntime | null
+  use_when?: any
+ProfileDraft = { [key: string]: DraftProfile }
+ProfileList
+  registry_path: string
+  registry: ProfileRegistry
+ProfileModel
+  id: string
+  n_ctx?: uint32 | null
+  identifier?: string | null
+  capabilities: CapabilityProfile
+  endpoint?: EndpointField | null
+ProfileRegistry
+  profiles: { [key: string]: Profile }
+  schema_version?: string | null
+  default_profile?: string | null
+  internal?: RegistryInternal | null
+  endpoints?: { [key: string]: ModelEndpoint }
+ProfileRuntime
+  context_tokens?: uint64 | null
+  compaction?: RuntimeCompactionConfig | null
+Proposer
+  handle: string
+  model: string
+  machine_id?: string | null
+PruneReport
+  phases_in_config: uint
+  phases_minted: uint
+  tasks_in_config: uint
+  tasks_minted: uint
+  steps_in_config: uint
+  steps_minted: uint
+  pruned: Pruned[]
+  grown?: Grown[]
+Pruned
+  id: string
+  kind: string
+  reason: string
+Range
+  n: uint
+  median: double
+  min: double
+  max: double
+RecordsEmitted
+  by_action: { [key: string]: uint64 }
+  total_records: uint64
+  total_bytes: uint64
+  dispatch_seconds: double
+  dispatch_pairs: uint64
+  open_dispatches: uint64
+  wall_seconds: double
+  machine_uid: string | null
+  host_samples_in_window: uint64
+RedisStatus
+  url: string
+  stream: string
+  max_len?: uint | null
+  reachable: boolean
+  reachability_error?: string | null
+  xlen?: uint64 | null
+  oldest_ts?: string | null
+  newest_ts?: string | null
+  last_probe_ms?: uint128 | null
+  near_max_len: boolean
+RegistryInternal
+  utility?: UtilityBinding | null
+RegistryJson
+  profiles_source: string | null
+  error: string | null
+ReserveConfig
+  bail_after_token_count?: uint64 | null
+  bail_after_compactions?: uint32 | null
+Residency = "loaded" | "loaded_stale_ctx" | "loaded_by_user" | "not_loaded" | "remote" | "unavailable" | "unknown"
+ResidencyBlockJson
+  available: boolean
+  error: string | null
+ResumedFrom
+  path: string
+  turn_index: uint64
+RoleList
+  roles: RoleListRow[]
+RoleListRow
+  id: string
+  description: string
+  skill_count: uint32
+  escalation: EscalationKind
+RoleProfileSource = "overridden" | "mapped" | "default_fallback"
+RoleResolution
+  role_id: string
+  profile: string | null
+  provenance: RoleProfileSource | null
+  model: ModelJson | null
+  residency: Residency
+  residency_detail: string | null
+  error: string | null
+RoleShow
+  id: string
+  description: string
+  prompt_path: string | null
+  skills: string[]
+  tool_palette: ToolPalette
+  escalation: EscalationKind
+  escalation_target: string | null
+Run
+  id: string
+  kind: RunKind
+  status: RunStatus
+  machine?: string | null
+  route?: string | null
+  role?: string | null
+  model?: string | null
+  started_ts?: uint64 | null
+  completed_ts?: uint64 | null
+  updated_ts?: uint64 | null
+  tracked: boolean
+  dispatch_id?: string | null
+  abandoned_reason?: AbandonReason | null
+  tokens?: uint64 | null
+  workload?: string | null
+  verify_passed?: boolean | null
+RunChecks
+  telemetry_covers_run: boolean
+  policy_consistent: boolean | null
+  rest_within_wall: boolean
+  have_telemetry_samples: boolean
+  have_flow_records: boolean
+  verdict_matches_ratio: boolean
+  all_streams_billed: boolean
+  frames_match_streams: boolean
+  streams_terminated: boolean
+RunKind = "mission" | "dispatch" | "lab"
+RunKindArg = "all" | "mission" | "dispatch" | "lab"
+RunListOutput
+  kind: RunKindArg
+  runs: Run[]
+  total: uint
+  fleet: SourceState
+  since?: string | null
+  usage?: UsageReport | null
+RunSetStats
+  runs: RunStats[]
+  summary: SetSummary
+  errors: SetError[]
+  duplicates: string[]
+  baseline?: SetView | null
+  cross_arm_overlap?: string[] | null
+RunStats
+  schema_version: string
+  run: string
+  model: string | null
+  result: string | null
+  verify: string | null
+  verify_ungated: boolean
+  ok: boolean | null
+  started_at_unix_ms: uint64 | null
+  wall_ms: uint64
+  rest_ms: uint64
+  active_ms: uint64
+  rest_events: uint
+  rest_delays_ms: uint64[]
+  rest_reasons: string[]
+  rest_states: string[]
+  thermal_ratchet_fired: boolean
+  rest_ms_per_turn: double | null
+  turns: uint64
+  compactions: uint64
+  reasoning_chars: uint64
+  content_chars: uint64
+  completion_tokens: uint64
+  reasoning_tokens: uint64
+  suspect_turns: SuspectTurn[]
+  tool_calls: { [key: string]: uint }
+  tool_calls_total: uint
+  tool_calls_failed: uint
+  streams: uint
+  streams_unbilled: uint
+  streams_unterminated: uint
+  turns_with_stream_abort: uint64[]
+  gen_ms_billed: uint64
+  gen_ms_all: uint64
+  unbilled_gen_ms: uint64
+  billed_gen_fraction: double | null
+  tok_per_s: double | null
+  reasoning_chars_per_s: double | null
+  gates: Gates
+  bounds: { [key: string]: Knob }
+  gpu_w_busy: double | null
+  cpu_w_busy: double | null
+  pkg_w_busy: double | null
+  gpu_duty_pct: double | null
+  samples_busy: uint
+  samples_idle: uint
+  busy_ms: uint64 | null
+  pkg_j_busy: double | null
+  pkg_j_per_1k_tokens: double | null
+  pkg_j_per_1k_reasoning_chars: double | null
+  thermal_states_busy: { [key: string]: uint }
+  cpu_speed_limit_min: uint64 | null
+  throttled_samples: uint
+  mem_pct_busy_max: uint64 | null
+  telemetry_max_gap_ms: uint64 | null
+  flow_records_in_window: uint
+  flow_scan: FlowScan
+  checks: RunChecks
+RunStatus = "planned" | "running" | "complete" | "error" | "abandoned" | "unparseable"
+RuntimeBounds
+  max_tokens_per_call: Knob
+  inactivity_timeout_seconds: Knob
+  max_turns: Knob
+  max_tokens: Knob
+  reasoning_checkpoint_interval_tokens?: Knob | null
+  turn_delay_ms?: Knob | null
+  feedback_injection?: Knob | null
+  detection_degeneracy_policy?: Knob | null
+  thermal_pacing_enabled?: Knob | null
+  battery_pause_enabled?: Knob | null
+  battery_pause_floor_pct?: Knob | null
+RuntimeCompactionConfig
+  strategy?: CompactionStrategy | null
+  threshold_tokens?: uint64 | null
+  threshold_ratio?: double | null
+  tier1?: Tier1Config | null
+  tier2?: Tier2Config | null
+  reserve?: ReserveConfig | null
+  custom_instructions?: string | null
+SchemaSkew
+  writer_version: string
+  observed_versions?: string[]
+  skew_detected: boolean
+  skew_reason?: string | null
+SetError
+  run: string
+  error: string
+SetSummary
+  n: uint
+  passed: uint
+  failed: uint
+  unverified: uint
+  passed_with_runtime_error: uint
+  models: string[]
+  active_ms: Range | null
+  wall_ms: Range | null
+  rest_ms: Range | null
+  turns: Range | null
+  completion_tokens: Range | null
+  tok_per_s: Range | null
+  billed_gen_fraction: Range | null
+  gpu_w_busy: Range | null
+  pkg_w_busy: Range | null
+  pkg_j_per_1k_tokens: Range | null
+  runs_with_degeneracy: uint
+  turns_cut: uint
+  cost_per_success: CostPerSuccess
+  flagged: ([string, string[]])[]
+SetView
+  runs: RunStats[]
+  summary: SetSummary
+  errors: SetError[]
+  duplicates: string[]
+Severity = "info" | "warn" | "error"
+ShownConfig
+  id: string
+  name: string
+  source: string
+  summary: string
+  inputs: ShownInput[]
+ShownInput
+  name: string
+  required: boolean
+SinkInfo
+  kind: string
+  config?: { [key: string]: string }
+  children?: SinkInfo[]
+SinkSummary
+  info: SinkInfo
+  active_kinds: string[]
+  composition: string
+SourceState = { state: "ok" } | { age_ms: uint64; detail: string; state: "stale" } | { detail: string; state: "unavailable" } | { state: "off" }
+StepJson
+  id: string
+  kind: string
+  constructible: boolean
+StepRow
+  id: string
+  label: string
+  kind: string
+  status: NodeStatus
+  startedTs?: uint64 | null
+  completedTs?: uint64 | null
+  tokensFinal?: uint64 | null
+  turnsFinal?: uint64 | null
+  model?: string | null
+StrayDrainOutput
+  file: string
+  to: string
+  delivered: uint
+  failed: uint
+  remaining_undelivered: uint
+StreamGate
+  observations: uint
+  degenerate_turns: uint64[]
+  aborts: uint
+  min_tail_ratio: double | null
+SuspectTurn
+  seq: uint64
+  reasoning_chars_per_token: double
+SyncReport
+  scanned: uint
+  created: uint
+  present: uint
+  skipped_no_emission: uint
+TaskDisplayStatus = "planned" | "running" | "complete" | "error" | "abandoned" | "waiting"
+TaskJson
+  id: string
+  enabled: boolean | null
+  display_name: string | null
+  description: string | null
+  depends_on: string[]
+  reads: string[]
+  role: RoleResolution | null
+  steps: StepJson[]
+TelemetryDetectorPayload
+  kind: DetectorKind
+  severity: DetectorSeverity
+  detail: string
+  turn_seq?: uint64 | null
+  observation?: uint64 | null
+  tail_ratio?: double | null
+  slice_chars?: uint64 | null
+  generated_chars?: uint64 | null
+  policy?: string | null
+  acted?: boolean | null
+  count?: uint64 | null
+  model?: string | null
+  sample_name_prefix?: string | null
+  reason?: string | null
+  prompt_tokens?: uint64 | null
+  name?: string | null
+  arguments_chars?: uint64 | null
+  cut?: string | null
+  area?: DetectorArea | null
+  bound?: BoundRef | null
+  step_id?: string | null
+  context?: { [key: string]: any } | null
+ThermalNow
+  state: string
+  cpu_speed_limit_pct: uint64
+ThermalWindowWire
+  worst_state: string
+  above_nominal_ms: uint64
+  min_cpu_speed_limit_pct: uint64
+  level_ms: { [key: string]: uint64 }
+  level_entries: { [key: string]: uint64 }
+Tier1Config
+  eviction_after_unreferenced_turns?: uint32 | null
+Tier2Config
+  schema_version?: string | null
+  slot_caps?: { [key: string]: uint32 }
+ToolPalette
+  allow: string[]
+  deny: string[]
+UsageGroup
+  endpoint?: string | null
+  requested_model?: string | null
+  reported_model?: string | null
+  work: UsageSplit
+  utility: UsageSplit
+UsageLimits
+  tokens_per_dispatch?: uint64 | null
+  concurrent_calls?: uint32 | null
+  window?: UsageWindow | null
+  policy?: Lenient4 | null
+  warn_at?: double | null
+UsageReport
+  since: string
+  default_window: boolean
+  overall: UsageSum
+  groups: UsageGroup[]
+UsageSplit
+  calls: uint64
+  total: uint64
+  input: uint64
+  cached?: uint64 | null
+  generated: uint64
+UsageSum
+  total: uint64
+  prompt: uint64
+  completion: uint64
+  cached?: uint64 | null
+  utility: uint64
+  usage_records: uint64
+  reported: uint64
+  legacy_completes: uint64
+UsageWindow
+  period?: string | null
+  tokens?: uint64 | null
+  calls?: uint64 | null
+UtilityBinding
+  id: string
+  n_ctx?: uint32 | null
+UtilityModel
+  id: string
+  loaded: boolean
+  n_ctx: uint32 | null
+Verdict = "productive" | "struggled" | "inert-false-pass" | "failed"
+VerdictShift = "improved" | "regressed" | "no-change"
+
+# untyped: fields (or types) that hold free-form JSON, each explained in DESIGN.md
+FindingRecord.context
+FindingRecord.emitted
+ForFinding.context
+ForFinding.emitted
+InputJson.default
+Knob.value
+Lenient
+Lenient2
+Lenient3
+Lenient4
+Profile.use_when
+TelemetryDetectorPayload.context

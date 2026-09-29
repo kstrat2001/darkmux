@@ -197,13 +197,13 @@ pub fn run_utility_single_shot(job: &UtilityJob<'_>) -> Result<UtilityReply> {
     if let Some(kind) = job_kind {
         let payload = crate::usage::utility_start_payload(kind, &job_id, &wire_model, None, u64::from(job.timeout_seconds).saturating_mul(1_000), started_at_ms);
         if let Some(tx) = live.as_mut() {
-            tx.send(&live_utility_edge(&payload, "start", job.role_id, &wire_model, started_at_ms));
+            let fields = serde_json::to_value(&payload).unwrap_or_default();
+            tx.send(&live_utility_edge(&fields, "start", job.role_id, &wire_model, started_at_ms));
         }
         let _ = darkmux_flow::record(crate::usage::utility_marker_record(
-            darkmux_flow::FlowAction::UtilityStart,
             job.role_id,
             &wire_model,
-            payload,
+            darkmux_flow::Payload::UtilityStart(payload),
         ));
     }
     let send_live_end = |live: &mut Option<darkmux_flow::live::LiveSender>, ended_at_ms: u64| {
@@ -223,13 +223,17 @@ pub fn run_utility_single_shot(job: &UtilityJob<'_>) -> Result<UtilityReply> {
             send_live_end(&mut live, crate::usage::unix_ms_now());
             // (#2915) The end of a started job that has no usage record.
             if let Some(kind) = job_kind {
-                let mut payload = serde_json::json!({ "job": kind, "model": wire_model });
-                crate::usage::stamp_utility_end(&mut payload, &job_id, started_at_ms, crate::usage::unix_ms_now());
+                let payload = crate::usage::utility_error_payload(
+                    kind,
+                    &wire_model,
+                    &job_id,
+                    started_at_ms,
+                    crate::usage::unix_ms_now(),
+                );
                 let _ = darkmux_flow::record(crate::usage::utility_marker_record(
-                    darkmux_flow::FlowAction::UtilityError,
                     job.role_id,
                     &wire_model,
-                    payload,
+                    darkmux_flow::Payload::UtilityError(payload),
                 ));
             }
             return Err(match crate::dispatch_internal::residency_lost_detail(&wire_model, &format!("{e:#}")) {
@@ -291,7 +295,7 @@ mod tests {
     #[test]
     fn live_utility_edge_names_the_job_and_the_event() {
         let start = crate::usage::utility_start_payload(crate::usage::UtilityJobKind::RadioRouting, "j-9", "u4b", None, 30_000, 1_000);
-        let s = live_utility_edge(&start, "start", "radio-router", "u4b", 1_000);
+        let s = live_utility_edge(&serde_json::to_value(&start).unwrap(), "start", "radio-router", "u4b", 1_000);
         assert_eq!(s.kind, darkmux_flow::live::LiveKind::Utility);
         assert_eq!((s.fields["event"].as_str(), s.fields["job"].as_str(), s.fields["job_id"].as_str()), (Some("start"), Some("radio_routing"), Some("j-9")));
         assert_eq!(s.session_id, None, "routing serves no execution");

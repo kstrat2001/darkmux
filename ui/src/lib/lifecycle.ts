@@ -58,7 +58,7 @@
  *    any of them is.
  */
 
-import { ACTION, byTime, isAsOf, isAtOrAfter, isBookendStart, isBookendTerminal, isExecutionAction, latestByTime, recordsAsOf, type NormAction, type NormRecord } from "./ingest";
+import { ACTION, byTime, isAsOf, isAtOrAfter, isBookendStart, isBookendTerminal, isExecutionAction, endPayloadOf, latestByTime, payloadOf, recordsAsOf, type NormAction, type NormRecord } from "./ingest";
 import type { RunState } from "./flow";
 import type { RunGroup, RunRecords } from "./runRef";
 import type { RunsPolicy } from "../types/generated/RunsPolicy";
@@ -192,13 +192,13 @@ const FIRST_OPENERS: ReadonlySet<NormAction> = new Set<NormAction>([
 ]);
 
 const exitCodeOf = (r: NormRecord): number | null => {
-  const c = (r.payload as { exit_code?: unknown } | undefined)?.exit_code;
+  const c = endPayloadOf(r)?.exit_code;
   return typeof c === "number" ? c : null;
 };
 
 const hasReason = (r: NormRecord): boolean => {
-  const p = (r.payload ?? r.fields) as { reason?: unknown } | undefined;
-  return typeof p?.reason === "string" && p.reason.length > 0;
+  const reason = payloadOf(r, ACTION.BudgetStop)?.reason;
+  return typeof reason === "string" && reason.length > 0;
 };
 
 /** The edge a closing record implies; `null` for any other record. */
@@ -356,7 +356,7 @@ function closeAsOf(a: Attempt, asOf: number): Close | null {
 }
 
 const waitMsOf = (r: NormRecord): number => {
-  const ms = ((r.payload ?? r.fields) as { wait_ms?: unknown } | undefined)?.wait_ms;
+  const ms = payloadOf(r, ACTION.BudgetWait)?.wait_ms;
   return typeof ms === "number" && Number.isFinite(ms) ? Math.max(0, ms) : 0;
 };
 
@@ -473,7 +473,7 @@ export function toRunState(l: Lifecycle): RunState {
  *  playback's elapsed readout both read it, so the two agree. */
 export function recordedWallMs(close: Close | null): number | null {
   if (!close || !isBookendTerminal(close.record.action)) return null;
-  const w = (close.record.payload as { wall_ms?: unknown } | undefined)?.wall_ms;
+  const w = endPayloadOf(close.record)?.wall_ms;
   return typeof w === "number" && Number.isFinite(w) ? w : null;
 }
 

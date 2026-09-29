@@ -3,7 +3,7 @@
 //! `LabCmd` arm unpacks its arguments and hands them to one handler below;
 //! `lab loop` (#986) lives in the `lab_loop` submodule.
 
-mod lab_loop;
+pub(crate) mod lab_loop;
 
 use anyhow::Result;
 

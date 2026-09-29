@@ -16,6 +16,75 @@ darkmux release.
 
 ### Changed (breaking, 4.0)
 
+- **CLI `--json` output is a contract** (C4). Every verb's `--json` output is now
+  one serialized, named type (`src/cli_json.rs`), pinned by
+  `tests/cli-json.golden`, which lists each verb and the fields and types of
+  everything it prints. The golden is derived from the types, so changing a
+  shape fails a test until the golden is regenerated on purpose. An output
+  carries no `schema_version` of its own (its version is darkmux's), except a
+  document that is also written to disk, which already named its schema. From
+  this release a shape change is a semver-visible change like a daemon route.
+  No field spells `session`. These fields changed, one line per verb; every
+  other output keeps its bytes:
+  - `role list`: each role's `skills` (a count) is now `skill_count`, so `skills`
+    is a list of skill ids in `role show` and absent from `role list`.
+  - `mission status`: the drift `kind` `running-phase-session-dead` is
+    `running-phase-execution-dead`; `budget_waits[].session_id` is
+    `execution_id`.
+  - `mission config show`: a role's `provenance` is now `overridden`, `mapped` or
+    `default_fallback` (it was the phrase `launch override (--param)`,
+    `role_profiles map` or `default_profile fallback`); the text view prints the
+    same phrases as before.
+  - `run stats` (several runs, or `--baseline`): each `errors` entry is
+    `{"run": ..., "error": ...}` (it was a `[run, error]` pair).
+  - `run stats`: `bounds` is typed as a map from a knob's name to
+    `{value, source, configured_value?}` and is read from the record's own
+    `bounds` map, so a knob a newer darkmux writes is kept (reading it through
+    `RuntimeBounds` would have dropped it). The JSON of a well-formed entry is
+    unchanged, so `RUN_STATS_SCHEMA_VERSION` stays; an entry that is not a knob
+    is now skipped instead of copied through.
+  - `memory correction list`: prints `{"corrections": [...]}` (it was a bare list).
+  - `flow integrity-check`: prints `{"reports": [...]}` (it was a bare list).
+  - `machine status`: every answer carries `machine_id` and `lms_unreachable`
+    (`false` when LMStudio answered). It was two shapes: the unreachable one had
+    both, the normal one neither.
+  - `machine status` (for a roster peer): a peer that answers in a shape this
+    darkmux does not read is refused with an error that names what the peer
+    reports (its `schema_version` or `darkmux_version`, when it gives one). It
+    was printed as raw JSON.
+  - `machine resources <peer>` prints the daemon's own response: the ledger plus
+    `cache_ttl_ms` and, when the peer's sampler has a reading, `load`. Head of
+    this release dropped both. A body this darkmux does not read (a newer peer's
+    unknown variant) is refused under `--json` with the peer's version named, and
+    in text mode prints a note naming it, exit 0. It was printed as raw JSON.
+  - `machine list --deep`: a peer's `specs` is the `/machine/specs` document as
+    this darkmux reads it (a field a newer peer adds is not carried), or `null`.
+    A body that names a `darkmux_version` but does not parse sets the new
+    `specs_unreadable_peer_version` to that version, and the table shows
+    `unreadable (peer <version>)`; any other body reads as unavailable.
+  - `dispatch` (`--json`): the runtime's keys print in the order `result`,
+    `final_assistant`, `trajectory_path`, `failed_tool_invocations`,
+    `resumed_from` (they were alphabetical), and a key the runtime does not
+    define is dropped. `result` and `trajectory_path` are absent when the runtime
+    did not send them (they printed as `""`). A runtime stdout that does not parse
+    as an envelope goes out as written, with one line on stderr saying why.
+    `detections`, `bounds` and `host_window` are the flow payload types
+    themselves (`TelemetryDetectorPayload`, `RuntimeBounds`, `HostWindow`), so
+    the golden pins them and two things changed inside them. A key that was
+    printed as an explicit `null` is now omitted: in `detections[]`,
+    `generated_chars` on a stream-gate observation and `tail_ratio` on a gate
+    abort (the same omission the flow records got). Key order follows the
+    struct's field order: in `bounds`, `reasoning_checkpoint_interval_tokens`
+    moves from second to fifth; `host_window.power_mw_total` prints `mean`,
+    `p95`, `max` (it was `mean`, `max`, `p95`); `detections[]` prints `kind`,
+    `severity`, `detail` and then the fields in the type's declared order
+    instead of the order each detector happened to add them. The golden lists
+    only values the verb can print: `DetectorKind`, `DetectorSeverity` and
+    `KnobSource` no longer offer `"unknown"`, which only a reader of another
+    build's archive can meet.
+  **Migration:** rename the fields above in any script that reads them, and
+  regenerate a golden you keep of these outputs.
+
 - **A mission config's step `config` is checked against its kind** (B1). It
   was open JSON, so a typo inside a step's config passed the unknown-key
   gate and silently did nothing. Each of the fifteen kinds darkmux ships
@@ -1022,6 +1091,48 @@ darkmux release.
   `bounds` block, which is keyed by the config knob a value came from) keep
   their names. darkmux's readers rename and convert an old record's keys on
   read.
+
+### Typed flow payloads (4.0, FLOW 2.0.0)
+
+- **Every flow record's payload is written from one Rust type per action, and
+  the viewer reads it through that type's generated twin.** A record is built
+  from a `Payload` variant, which fixes its action, and the write check refuses
+  a payload that is not its action's, one that did not parse as its action's
+  type, and a payload on an action that carries none (`session.end`,
+  `machine.online`, `machine.offline`, `phase.*`, `step.complete`,
+  `step.error`, `operator.note`, `operator.catch`, `stream.error`,
+  `tier.decision`, `mission.debrief.prompt`, `phase.review.begin|aborted|dispatch|failed`).
+  `mission.start`, `mission.close` and `mission.abort` keep an open JSON object
+  (a mission config authors that outcome document). `ui/src/lib/flowPayloads.ts`
+  is deleted; `FlowPayloads.ts` and one `<Action>Payload.ts` per type are
+  generated. **On the wire, key order in a payload now follows its type's
+  field order; no key is renamed and no value changes.**
+- **An optional key with no value is omitted, not written as `null`,** in
+  `dispatch.start`, `dispatch.complete`, `dispatch.error`, `dispatch.rest`,
+  `step.result`, `telemetry.detector` and `budget.*` payloads (for example
+  `reasoning_tokens`, `cached_tokens`, `stderr_excerpt`, `turn_delay_effective_ms`,
+  `policy`, `tail_ratio`, and the token counts of a call that reported none).
+  `telemetry.tokens` keeps `null` for "not reported", and so do the `--json`
+  envelope's own keys; the exception is `dispatch --json`'s `detections[]`,
+  which now omits an absent key like the flow record it shares a type with.
+  **Migration:** a hook rule that matches `payload.<key>: null` keeps working:
+  an expected `null` matches both a `null` value (archived records) and an
+  absent key (current records). A receiver or `jq` filter that tests
+  `.payload.<key> == null` still holds, since a missing key reads as `null`
+  in `jq`; code that tests for the key's presence (`has("key")`, an
+  `"key" in payload` check) must accept absence.
+- **Archives still read.** A payload that does not parse as its action's type
+  is kept as it was and never re-written. The retired review spelling `tokens`
+  reads as `total_tokens` on `dispatch.complete` and `step.result`. A field
+  an older version never wrote (`sampled_at_ms`, `tool_calls_so_far`, `result`,
+  `turns_so_far`, `parent_model`, `reason`, `delivery_id`, `seat_class`, `source`),
+  or wrote as `null`, reads as absent, never as zero. The role `compactor` reads
+  as the utility seat, and a word in a closed set (a result class, a detector
+  kind, a seat class) that this build does not name reads as `unknown` instead
+  of dropping the record. A refused write of a flow record is now said once per
+  action on stderr. A
+  `dispatch.start` `bounds` block from before the newer knobs existed reads with
+  the knobs it has.
 
 ### Added (4.0)
 

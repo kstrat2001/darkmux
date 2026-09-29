@@ -21,56 +21,9 @@
 //! addressable, and reproducible after the fact).
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// Which record store a [`BriefRef`]'s key addresses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum BriefRefKind {
-    /// A `findings` record — something an earlier dispatch observed.
-    Finding,
-    /// A `mods` record — a change someone proposed.
-    Mod,
-}
-
-impl BriefRefKind {
-    /// The wire word, used on the step config and the flow record alike.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            BriefRefKind::Finding => "finding",
-            BriefRefKind::Mod => "mod",
-        }
-    }
-
-    /// Parse the wire word. `None` for anything else — readers of a step
-    /// config or a flow record stay lenient, the way every other darkmux
-    /// data shape does.
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "finding" => Some(BriefRefKind::Finding),
-            "mod" => Some(BriefRefKind::Mod),
-            _ => None,
-        }
-    }
-}
-
-/// One record the brief carries: a kind plus the key its store answers to.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct BriefRef {
-    pub kind: BriefRefKind,
-    pub key: String,
-}
-
-impl BriefRef {
-    pub fn finding(key: impl Into<String>) -> Self {
-        BriefRef { kind: BriefRefKind::Finding, key: key.into() }
-    }
-
-    pub fn mod_(key: impl Into<String>) -> Self {
-        BriefRef { kind: BriefRefKind::Mod, key: key.into() }
-    }
-}
+pub use darkmux_flow::payload::{BriefRef, BriefRefKind};
 
 /// The two store roots a resolution reads. Grouped so the resolver's callers
 /// cannot pass them in the wrong order (they are both `PathBuf`s).
@@ -179,6 +132,10 @@ fn resolve(r: &BriefRef, dirs: &StoreDirs) -> Result<(String, BriefRef)> {
             let canonical = BriefRef::mod_(record.key.clone());
             Ok((crate::mods::brief_block(&record, &mount), canonical))
         }
+        BriefRefKind::Unknown => anyhow::bail!(
+            "a brief ref of a kind this build does not know (key {:?}); a ref is a `finding` or a `mod`",
+            r.key
+        ),
     }
 }
 
@@ -410,9 +367,14 @@ mod tests {
             ])
         );
         assert_eq!(serde_json::from_value::<Vec<BriefRef>>(v).unwrap(), refs);
-        // Strict on read: an unknown kind is refused, never silently dropped.
+        // Tolerant on read (an archive may name a kind this build does not), but
+        // never resolved: an unknown kind is refused, never silently dropped.
         let mixed = serde_json::json!([{"kind": "sandwich", "key": "k"}, {"kind": "mod", "key": "m1"}]);
-        assert!(serde_json::from_value::<Vec<BriefRef>>(mixed).is_err());
+        let parsed = serde_json::from_value::<Vec<BriefRef>>(mixed).unwrap();
+        assert_eq!(parsed[0].kind, BriefRefKind::Unknown);
+        let d = TempDir::new().unwrap();
+        let dirs = StoreDirs { findings: d.path().to_path_buf(), mods: d.path().to_path_buf() };
+        assert!(check_all(&parsed, &dirs).is_err());
     }
 
     #[test]

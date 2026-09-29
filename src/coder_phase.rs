@@ -30,6 +30,7 @@
 //! out the darkmux-side state.
 
 use anyhow::{anyhow, bail, Context, Result};
+use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -37,6 +38,7 @@ use crate::crew;
 use crate::fleet;
 use crate::flow;
 use darkmux_types::session_id::{RunId, SessionId};
+use darkmux_flow::payload::{MissionRunTerminalPayload, StepResultPayload};
 use darkmux_types::style;
 
 /// Emit a mission-run lifecycle flow record for the mission-level events
@@ -48,19 +50,11 @@ use darkmux_types::style;
 /// Best-effort (observability, never loop-failing).
 fn emit_run_record(
     level: flow::Level,
-    action: darkmux_flow::FlowAction,
     session: &SessionId,
     phase_id: &str,
-    payload: serde_json::Value,
+    payload: darkmux_flow::Payload,
 ) {
-    let _ = flow::record(crew::dispatch::build_session_record_with_payload(
-        level,
-        action,
-        "mission-run",
-        session,
-        Some(phase_id),
-        Some(payload),
-    ));
+    let _ = flow::record(crew::dispatch::build_session_record(level, "mission-run", session, Some(phase_id), payload));
 }
 
 /// (#1230 Packet 4) Emit a `"step result"` flow record — the rich,
@@ -85,25 +79,16 @@ fn emit_run_record(
 // reinventing a second vocabulary for the same event.
 pub(crate) fn emit_step_result(
     level: flow::Level,
-    kind: &str,
-    step_id: &str,
     session: &SessionId,
     phase_id: &str,
-    payload: serde_json::Value,
+    payload: StepResultPayload,
 ) {
-    let mut full = serde_json::json!({ "step_id": step_id, "kind": kind });
-    if let (serde_json::Value::Object(extra), serde_json::Value::Object(base)) =
-        (payload, &mut full)
-    {
-        base.extend(extra);
-    }
-    let _ = flow::record(crew::dispatch::build_session_record_with_payload(
+    let _ = flow::record(crew::dispatch::build_session_record(
         level,
-        darkmux_flow::FlowAction::StepResult,
         "mission-run",
         session,
         Some(phase_id),
-        Some(full),
+        darkmux_flow::Payload::StepResult(payload),
     ));
 }
 
@@ -639,16 +624,15 @@ impl StepKind for MissionWorktreeStepKind {
         );
         emit_step_result(
             flow::Level::Info,
-            "mission.worktree",
-            &step.id,
             &session,
             &ctx.phase_id,
-            serde_json::json!({
-                "role": ctx.role,
-                "base": ctx.base,
-                "branch": ctx.branch,
-                "worktree": ctx.wt_path.display().to_string(),
-            }),
+            StepResultPayload {
+                role: Some(ctx.role.to_string()),
+                base: Some(ctx.base.to_string()),
+                branch: Some(ctx.branch.to_string()),
+                worktree: Some(ctx.wt_path.display().to_string()),
+                ..StepResultPayload::new(&step.id, "mission.worktree")
+            },
         );
 
         Ok(StepOutcome {
@@ -668,7 +652,7 @@ impl StepKind for MissionWorktreeStepKind {
 // `run_step_graph` returns, same as `run()` does below, to build its own
 // `MissionEnvelope` summary.
 pub(crate) struct CoderStepResult {
-    pub(crate) failed_verifiers: Vec<crew::step_kinds::FailedVerifier>,
+    pub(crate) failed_verifiers: Vec<darkmux_trajectory::FailedExec>,
     pub(crate) tokens_total: u64,
 }
 
@@ -929,11 +913,13 @@ impl StepKind for MissionCoderStepKind {
             print_token_line(&tokens);
             emit_step_result(
                 flow::Level::Error,
-                "mission.coder",
-                &step.id,
                 &session,
                 &ctx.phase_id,
-                serde_json::json!({ "exit_code": exit_code, "total_tokens": tokens.total }),
+                StepResultPayload {
+                    exit_code: Some(i64::from(exit_code)),
+                    total_tokens: Some(tokens.total),
+                    ..StepResultPayload::new(&step.id, "mission.coder")
+                },
             );
             *result_slot.lock().expect("mission.coder result mutex poisoned") = Some(CoderStepResult {
                 failed_verifiers: Vec::new(),
@@ -952,15 +938,14 @@ impl StepKind for MissionCoderStepKind {
             } else {
                 flow::Level::Warn
             },
-            "mission.coder",
-            &step.id,
             &session,
             &ctx.phase_id,
-            serde_json::json!({
-                "failed_verifiers": failed_verifiers,
-                "count": failed_verifiers.len(),
-                "total_tokens": tokens.total,
-            }),
+            StepResultPayload {
+                count: Some(failed_verifiers.len() as u64),
+                failed_verifiers: Some(failed_verifiers.clone()),
+                total_tokens: Some(tokens.total),
+                ..StepResultPayload::new(&step.id, "mission.coder")
+            },
         );
 
         let stdout = result.stdout.clone();
@@ -1123,7 +1108,7 @@ impl StepKind for MissionVerifyStepKind {
         match crate::phase_cli::phase_review_output_at(&ctx.wt_path, Some(&ctx.base), Some(&ctx.phase_id)) {
             Ok(review) => {
                 print_review_summary(&review);
-                let verdict = review.verdict.clone();
+                let verdict = review.verdict.to_string();
                 *result_slot.lock().expect("mission.verify result mutex poisoned") = Some(Ok(review));
                 Ok(StepOutcome {
                     output: verdict,
@@ -1463,15 +1448,15 @@ fn teardown_and_terminate_phase(
     }
 
     let Ok(run) = RunId::mission(mission_id) else { return };
+    let terminal = MissionRunTerminalPayload { branch: branch.clone(), worktree: wt_display.clone() };
     emit_run_record(
         flow::Level::Info,
-        match kind {
-            MissionTerminal::Finalize => darkmux_flow::FlowAction::MissionRunFinalize,
-            MissionTerminal::Abort => darkmux_flow::FlowAction::MissionRunAbort,
-        },
         &SessionId::phase(run, &phase.id),
         &phase.id,
-        serde_json::json!({ "branch": branch, "worktree": wt_display }),
+        match kind {
+            MissionTerminal::Finalize => darkmux_flow::Payload::MissionRunFinalize(terminal),
+            MissionTerminal::Abort => darkmux_flow::Payload::MissionRunAbort(terminal),
+        },
     );
 }
 
@@ -2313,13 +2298,14 @@ fn mission_cautions(
             if !in_mission {
                 continue;
             }
-            let payload = r.get("payload");
-            let pstr = |k: &str| payload.and_then(|p| p.get(k)).and_then(|v| v.as_str());
-            let detail = pstr("detail").unwrap_or("");
+            let Some(darkmux_flow::Payload::TelemetryDetector(finding)) = darkmux_flow::reader::payload_of(&r) else {
+                continue;
+            };
+            let detail = finding.detail.as_str();
             if detail.is_empty() {
                 continue;
             }
-            let kind = pstr("kind").unwrap_or("caution");
+            let kind = finding.kind.as_str();
             // (#2887 F5) `repetition` (the degeneracy gate + reasoning
             // checkpoint) is darkmux-internal vocabulary an operator reads
             // on the run page, not a finding about the CODE the next
@@ -2333,14 +2319,9 @@ fn mission_cautions(
             if kind == "repetition" {
                 continue;
             }
-            let severity = pstr("severity").unwrap_or("warn");
-            let area = payload.and_then(|p| p.get("area"));
-            let file = area
-                .and_then(|a| a.get("files"))
-                .and_then(|f| f.as_array())
-                .and_then(|arr| arr.first())
-                .and_then(|v| v.as_str());
-            let code_hash = area.and_then(|a| a.get("code_hash")).and_then(|v| v.as_str());
+            let severity = finding.severity.as_str();
+            let file = finding.area.as_ref().and_then(|a| a.files.first()).map(String::as_str);
+            let code_hash = finding.area.as_ref().and_then(|a| a.code_hash.as_deref());
             let ts = r.get("ts").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let bullet = match file {
                 Some(f) => format!("- [{kind}] {detail} (in `{f}`)"),
@@ -2442,16 +2423,6 @@ fn engagement_lessons(intent: &std::collections::HashSet<String>) -> Vec<String>
         .collect()
 }
 
-fn phase_status_label(s: crew::types::PhaseStatus) -> &'static str {
-    use crew::types::PhaseStatus::*;
-    match s {
-        Planned => "planned",
-        Running => "running",
-        Complete => "complete",
-        Abandoned => "abandoned",
-    }
-}
-
 /// (#2406) The word the debrief prints for one phase, given what DISK says
 /// and what the mission's `envelope.json` recorded for it.
 ///
@@ -2471,13 +2442,42 @@ fn phase_status_label(s: crew::types::PhaseStatus) -> &'static str {
 fn phase_label_with_outcome(
     s: crew::types::PhaseStatus,
     outcome: Option<crew::envelope::PhaseOutcomeKind>,
-) -> &'static str {
-    if s == crew::types::PhaseStatus::Complete
-        && outcome == Some(crew::envelope::PhaseOutcomeKind::Degraded)
-    {
-        return "degraded";
+) -> DebriefPhaseStatus {
+    use crew::types::PhaseStatus as P;
+    match s {
+        P::Complete if outcome == Some(crew::envelope::PhaseOutcomeKind::Degraded) => {
+            DebriefPhaseStatus::Degraded
+        }
+        P::Planned => DebriefPhaseStatus::Planned,
+        P::Running => DebriefPhaseStatus::Running,
+        P::Complete => DebriefPhaseStatus::Complete,
+        P::Abandoned => DebriefPhaseStatus::Abandoned,
     }
-    phase_status_label(s)
+}
+
+/// How a phase reads in a debrief: the persisted status, with `Complete`
+/// refined to `Degraded` when the envelope says the phase shipped only part
+/// of its output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum DebriefPhaseStatus {
+    Planned,
+    Running,
+    Complete,
+    Degraded,
+    Abandoned,
+}
+
+impl DebriefPhaseStatus {
+    fn word(self) -> &'static str {
+        match self {
+            DebriefPhaseStatus::Planned => "planned",
+            DebriefPhaseStatus::Running => "running",
+            DebriefPhaseStatus::Complete => "complete",
+            DebriefPhaseStatus::Degraded => "degraded",
+            DebriefPhaseStatus::Abandoned => "abandoned",
+        }
+    }
 }
 
 /// (#2406) One phase's debrief row.
@@ -2488,26 +2488,16 @@ fn phase_label_with_outcome(
 /// `.reason` across `src` and `crates` returned writers only. So naming the
 /// mix here is mostly wiring up something already recorded, not computing
 /// anything new.
-#[derive(Debug, Clone)]
-struct DebriefPhase {
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub(crate) struct DebriefPhase {
     id: String,
     /// First line of the phase description.
     description: String,
-    /// `planned` / `running` / `complete` / `degraded` / `abandoned` — see
-    /// [`phase_label_with_outcome`].
-    status: &'static str,
+    /// See [`phase_label_with_outcome`].
+    status: DebriefPhaseStatus,
     /// The envelope's own provenance line for this phase's outcome, when it
     /// recorded one.
     reason: Option<String>,
-}
-
-fn mission_status_label(s: crew::types::MissionStatus) -> &'static str {
-    use crew::types::MissionStatus::*;
-    match s {
-        Active => "active",
-        Finalized => "finalized",
-        Aborted => "aborted",
-    }
 }
 
 /// Print a bullet list, or a dim "(none)" when empty — the debrief's
@@ -2531,13 +2521,21 @@ fn print_bullets_or_none(items: &[String]) {
     }
 }
 
+/// The mission a debrief is about.
+#[derive(Serialize, schemars::JsonSchema)]
+pub(crate) struct DebriefMission {
+    id: String,
+    description: String,
+    status: crew::types::MissionStatus,
+}
+
 /// (#1000) The debrief ceremony's gathered raw material for one mission. Owned
 /// (not borrowed from the loaded mission/phase Vecs) so the gather + render are
 /// cleanly separable and the gather is unit-testable without stdout capture.
-struct DebriefReport {
-    mission_id: String,
-    mission_description: String,
-    mission_status: &'static str,
+/// `mission debrief --json`.
+#[derive(Serialize, schemars::JsonSchema)]
+pub(crate) struct DebriefReport {
+    mission: DebriefMission,
     /// Per-phase debrief rows. See [`DebriefPhase`].
     phases: Vec<DebriefPhase>,
     /// Already bullet-formatted by [`mission_cautions`].
@@ -2609,9 +2607,11 @@ fn gather_debrief(mission_id: &str) -> Result<DebriefReport> {
         crew::corrections::PhaseSessions::new(mission_id, mission_phases.iter().map(|s| s.id.clone()));
 
     Ok(DebriefReport {
-        mission_id: mission.id.clone(),
-        mission_description: mission.description.clone(),
-        mission_status: mission_status_label(mission.status),
+        mission: DebriefMission {
+            id: mission.id.clone(),
+            description: mission.description.clone(),
+            status: mission.status,
+        },
         phases: mission_phases
             .iter()
             .map(|s| {
@@ -2662,42 +2662,15 @@ pub fn debrief(mission_id: &str, json: bool) -> Result<i32> {
     let report = gather_debrief(mission_id)?;
 
     if json {
-        let phases_json: Vec<serde_json::Value> = report
-            .phases
-            .iter()
-            .map(|p| {
-                // (#2406) `reason` is a NEW SIBLING key, and `status` can now
-                // read `degraded` where it previously read `complete` for a
-                // mixed phase — which is the whole point: the old value was
-                // wrong, not merely coarse.
-                serde_json::json!({
-                    "id": p.id,
-                    "description": p.description,
-                    "status": p.status,
-                    "reason": p.reason,
-                })
-            })
-            .collect();
-        let out = serde_json::json!({
-            "mission": {
-                "id": report.mission_id,
-                "description": report.mission_description,
-                "status": report.mission_status,
-            },
-            "phases": phases_json,
-            "cautions": report.cautions,
-            "corrections": report.corrections,
-            "records_emitted": report.records_emitted,
-        });
-        println!("{}", serde_json::to_string_pretty(&out)?);
+        crate::cli_json::emit(&report)?;
         return Ok(0);
     }
 
     println!(
         "{}",
-        style::header(&format!("debrief — mission `{}`", report.mission_id))
+        style::header(&format!("debrief — mission `{}`", report.mission.id))
     );
-    let desc = report.mission_description.lines().next().unwrap_or("").trim();
+    let desc = report.mission.description.lines().next().unwrap_or("").trim();
     if !desc.is_empty() {
         println!("  {desc}");
     }
@@ -2711,7 +2684,7 @@ pub fn debrief(mission_id: &str, json: bool) -> Result<i32> {
             println!(
                 "  {} [{}] {}",
                 style::accent(&p.id),
-                p.status,
+                p.status.word(),
                 style::dim(&p.description)
             );
             // (#2406) The mix, named. `[degraded]` alone is the same word
@@ -2839,12 +2812,13 @@ pub fn nudge_mission_debrief(mission_id: &str) {
 /// command that never ran. SOFT signal end to end: surfaced for the
 /// adjudicator, never an auto-fail (operator sovereignty #44).
 ///
-/// (#1230 Packet 4 DRY pass) `FailedVerifier`/`parse_failed_verifiers`
+/// (#1230 Packet 4 DRY pass) `FailedExec`/`parse_failed_verifiers`
 /// moved to `crew::step_kinds::builtins` so ANY `dispatch.internal`-shaped
 /// step can opt into this parse (`config.parse_verifiers: true`), not just
 /// `mission.coder` — re-exported here under their original names via `use`
 /// so every call site below is unchanged.
-use crew::step_kinds::{parse_failed_verifiers, FailedVerifier};
+use crew::step_kinds::parse_failed_verifiers;
+use darkmux_trajectory::FailedExec;
 
 /// (#799) Prominent gate banner naming the verifier commands that FAILED TO
 /// RUN. No-op on an honest run (empty list). Soft — it informs the frontier
@@ -2856,7 +2830,7 @@ use crew::step_kinds::{parse_failed_verifiers, FailedVerifier};
 /// never ran" is the contradiction this exists to surface.
 // (#1284 Packet 4a) `pub(crate)` — `mission_launch.rs`'s coder-phase gate
 // prints the SAME banner at the same decision point.
-pub(crate) fn print_unverified_banner(failed: &[FailedVerifier]) {
+pub(crate) fn print_unverified_banner(failed: &[FailedExec]) {
     if failed.is_empty() {
         return;
     }

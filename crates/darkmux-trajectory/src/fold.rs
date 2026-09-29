@@ -96,6 +96,7 @@ pub struct StreamGateFold {
 
 /// How often each detector-class event fired.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct DetectorCounts {
     pub cycle: u32,
     pub reasoning_loop: u32,
