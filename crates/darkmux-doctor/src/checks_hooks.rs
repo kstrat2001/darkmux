@@ -168,7 +168,7 @@ fn rule_flags(s: &HookRuleSummary, rule_match: &HookMatch) -> Vec<RuleFlag> {
         receiver_rejected_flag(s),
         observer_flag(rule_match),
         cannot_match_flag(rule_match),
-        old_spelling_flag(rule_match),
+        retired_spelling_flag(rule_match),
         transform_failed_flag(s),
     ]
     .into_iter()
@@ -321,32 +321,30 @@ fn observer_flag(rule_match: &HookMatch) -> Option<RuleFlag> {
 /// deliver, however quiet it looks. Decided from the vocabulary
 /// ([`darkmux_flow::hooks::action_pattern_can_match`], the same test
 /// `HookSink::new` warns with), never from what today's records happen to
-/// carry. The hint names the dotted twin only when that twin can match.
+/// carry. A retired spelling is [`retired_spelling_flag`]'s, not this.
 fn cannot_match_flag(rule_match: &HookMatch) -> Option<RuleFlag> {
     let configured = rule_match.action.as_deref()?;
-    if darkmux_flow::hooks::action_pattern_can_match(configured) {
+    if darkmux_flow::hooks::action_pattern_can_match(configured)
+        || darkmux_flow::hooks::retired_spelling_of(configured).is_some()
+    {
         return None;
     }
-    let hint = darkmux_flow::hooks::matching_dotted_twin(configured)
-        .map(|t| format!("; `{t}` matches the dotted actions, and more than the old spelling did"))
-        .unwrap_or_default();
     Some(RuleFlag::warn(format!(
         "CANNOT MATCH — action=\"{configured}\" matches no action darkmux writes \
-         (actions are spelled `<scope>.<event>`){hint}"
+         (actions are spelled `<scope>.<event>`)"
     )))
 }
 
-/// A rule written against a pre-4.0 spelling still delivers: the sink reads
-/// it as its current action ([`darkmux_flow::hooks::effective_action_pattern`]).
-/// Named so the config can be updated to what the sink actually matches.
-fn old_spelling_flag(rule_match: &HookMatch) -> Option<RuleFlag> {
+/// A rule written against a pre-4.0 spelling is refused: `HookSink::new`
+/// does not load the sink, and a dispatch's preflight refuses. Hook rules
+/// are the operator's file, so it is named here to be fixed, not read as
+/// the current spelling.
+fn retired_spelling_flag(rule_match: &HookMatch) -> Option<RuleFlag> {
     let configured = rule_match.action.as_deref()?;
-    let effective = darkmux_flow::hooks::effective_action_pattern(configured);
-    (effective != configured).then(|| {
-        RuleFlag::warn(format!(
-            "OLD SPELLING — action=\"{configured}\" is read as \"{effective}\"; write \"{effective}\" instead"
-        ))
-    })
+    let current = darkmux_flow::hooks::retired_spelling_of(configured)?;
+    Some(RuleFlag::fail(format!(
+        "RETIRED SPELLING — action=\"{configured}\" is a spelling darkmux retired in 4.0; write \"{current}\""
+    )))
 }
 
 /// (#2183) A `transform` that failed to load refuses THIS rule only
@@ -787,36 +785,21 @@ mod tests {
         named(&checks, "hooks.rule.0").clone()
     }
 
-    /// The CANNOT MATCH hint names a dotted twin only when the twin can
-    /// match: `dispatchh *` and `sprint *` get none.
+    /// (4.0) A rule written against a retired spelling FAILS the row and names
+    /// the spelling to write, an exact old spelling and a spaced glob alike;
+    /// it is not also reported as merely unable to match.
     #[test]
-    fn cannot_match_names_only_a_twin_that_can_match() {
-        let flag = cannot_match_flag(&one_rule_matching("dispatch *")[0].r#match.clone().unwrap()).unwrap();
-        assert!(flag.text.contains("`dispatch.*` matches"), "{}", flag.text);
-        for pattern in ["dispatchh *", "sprint *"] {
-            let flag = cannot_match_flag(&one_rule_matching(pattern)[0].r#match.clone().unwrap()).unwrap();
-            assert!(flag.text.contains("CANNOT MATCH"), "{}", flag.text);
-            assert!(!flag.text.contains(".*`"), "no twin hint for {pattern}: {}", flag.text);
+    fn hooks_check_fails_a_rule_written_against_a_retired_spelling() {
+        // flow-action-guard:allow-start — an old spelling is this test's input
+        let cases = [("dispatch complete", FlowAction::DispatchComplete.as_str()), ("dispatch *", "dispatch.*")];
+        // flow-action-guard:allow-end
+        for (old, current) in cases {
+            let rule = rule_row(old);
+            assert_eq!(rule.status, Status::Fail, "{old}: {}", rule.message);
+            assert!(rule.message.contains("RETIRED SPELLING"), "{old}: {}", rule.message);
+            assert!(rule.message.contains(&format!("write \"{current}\"")), "names the current one: {}", rule.message);
+            assert!(!rule.message.contains("CANNOT MATCH"), "{old}: {}", rule.message);
         }
-    }
-
-    /// (4.0) A rule written against an old spelling still delivers (the
-    /// hook layer reads it as its current action) and warns with what to
-    /// write instead; a spaced glob whose dotted twin would widen it cannot
-    /// match, and says so.
-    #[test]
-    fn hooks_check_warns_on_a_rule_written_against_a_retired_spelling() {
-        // flow-action-guard:allow — an old spelling is this test's input
-        let rule = rule_row("dispatch complete");
-        assert_eq!(rule.status, Status::Warn, "{}", rule.message);
-        assert!(rule.message.contains("OLD SPELLING"), "{}", rule.message);
-        assert!(!rule.message.contains("CANNOT MATCH"), "an upgraded spelling delivers: {}", rule.message);
-        let current = FlowAction::DispatchComplete.as_str();
-        assert!(rule.message.contains(&format!("write \"{current}\" instead")), "names the current one: {}", rule.message);
-        let rule = rule_row("dispatch *");
-        assert!(rule.message.contains("CANNOT MATCH"), "{}", rule.message);
-        assert!(rule.message.contains("`dispatch.*` matches"), "{}", rule.message);
-        assert!(!rule.message.contains("OLD SPELLING"), "a pattern that cannot match is not an old spelling: {}", rule.message);
     }
 
     /// A glob that matches no action at all (a typo, an invented scope, a
@@ -832,7 +815,7 @@ mod tests {
             let rule = rule_row(pattern);
             assert_eq!(rule.status, Status::Warn, "{pattern}: {}", rule.message);
             assert!(rule.message.contains("CANNOT MATCH"), "{pattern}: {}", rule.message);
-            assert!(!rule.message.contains("instead"), "{pattern}: {}", rule.message);
+            assert!(!rule.message.contains("RETIRED SPELLING"), "{pattern}: {}", rule.message);
         }
     }
 

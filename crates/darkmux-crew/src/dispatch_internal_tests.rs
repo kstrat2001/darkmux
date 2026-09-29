@@ -10150,6 +10150,23 @@
     /// `build_remote_record` is a pure function (no HTTP, no env, no
     /// filesystem) — this test calls it directly, so it kills that exact
     /// mutant in one assertion regardless of which caller reaches it.
+    /// A hosted-endpoint execution's record names who wrote it (darkmux),
+    /// never where the model ran: `tier` once read `local` on every record,
+    /// this one included, which claimed a topology it did not have.
+    #[test]
+    fn a_hosted_executions_record_claims_no_local_tier() {
+        let rec = build_remote_record(
+            "coder",
+            &crate::mission_test_session("m1", "sess-1"), &darkmux_types::execution_id::ExecutionId::mint(),
+            "gpt-remote",
+            None,
+            darkmux_flow::FlowAction::DispatchStart,
+            serde_json::json!({ "endpoint": "azure:host/gpt-remote" }),
+        );
+        assert!(matches!(rec.tier, darkmux_flow::Tier::Darkmux), "{:?}", rec.tier);
+        assert_eq!(serde_json::to_value(&rec).unwrap()["tier"], "darkmux");
+    }
+
     #[test]
     fn build_remote_record_threads_mission_id_through() {
         let rec = build_remote_record(
