@@ -66,7 +66,7 @@
 //!
 //! **Degrade, never fail (operator sovereignty, #44).** A config that fails
 //! to load is one row naming the error, not a missing row — the same rule
-//! `acp_panel::list_panel_commands` follows for the panel-command listing.
+//! `acp_panel::list_launchable` follows for the panel's `/mission list`.
 //! A role whose mapping is dangling, or whose profile registry couldn't be
 //! read at all, or whose residency can't be checked because `lms` isn't
 //! reachable, is one field naming the error, never an abort of the whole
@@ -110,7 +110,6 @@ pub(crate) struct ConfigListRow {
     pub manifest_path: Option<String>,
     pub phases: Option<usize>,
     pub tasks: Option<usize>,
-    pub panel: Option<bool>,
     pub cmd: Option<String>,
     pub error: Option<String>,
 }
@@ -118,7 +117,7 @@ pub(crate) struct ConfigListRow {
 /// Every discoverable mission-config id (`mission_config::list_ids()`,
 /// already sorted), each loaded and summarized. A load failure on one id
 /// never drops it from the list — it becomes an error row (mirrors
-/// `acp_panel::list_panel_commands`'s "one broken override must not hide
+/// `acp_panel::list_launchable`'s "one broken override must not hide
 /// the rest" rule) so a broken user-tier copy is visible, not silent.
 pub(crate) fn build_list() -> Vec<ConfigListRow> {
     mission_config::list_ids()
@@ -134,7 +133,6 @@ pub(crate) fn build_list() -> Vec<ConfigListRow> {
                     manifest_path: Some(loaded.manifest_path.display().to_string()),
                     phases: Some(loaded.config.phases.len()),
                     tasks: Some(total_tasks),
-                    panel: Some(loaded.config.panel.is_some()),
                     cmd: loaded.config.cmd.clone(),
                     error: None,
                 }
@@ -146,7 +144,6 @@ pub(crate) fn build_list() -> Vec<ConfigListRow> {
                 manifest_path: None,
                 phases: None,
                 tasks: None,
-                panel: None,
                 cmd: None,
                 error: Some(format!("{e:#}")),
             },
@@ -172,8 +169,8 @@ fn render_list_text(rows: &[ConfigListRow]) -> String {
         .unwrap_or(6)
         .max(6);
     out.push_str(&format!(
-        "{:<id_w$}  {:<name_w$}  {:<src_w$}  {:>6}  {:>5}  {:<5}  {}\n",
-        "id", "name", "source", "phases", "tasks", "panel", "cmd"
+        "{:<id_w$}  {:<name_w$}  {:<src_w$}  {:>6}  {:>5}  {}\n",
+        "id", "name", "source", "phases", "tasks", "cmd"
     ));
     for row in rows {
         if let Some(err) = &row.error {
@@ -182,13 +179,12 @@ fn render_list_text(rows: &[ConfigListRow]) -> String {
             continue;
         }
         out.push_str(&format!(
-            "{:<id_w$}  {:<name_w$}  {:<src_w$}  {:>6}  {:>5}  {:<5}  {}\n",
+            "{:<id_w$}  {:<name_w$}  {:<src_w$}  {:>6}  {:>5}  {}\n",
             row.id,
             name_of(row),
             row.source.as_deref().unwrap_or(""),
             row.phases.unwrap_or(0),
             row.tasks.unwrap_or(0),
-            if row.panel.unwrap_or(false) { "yes" } else { "no" },
             row.cmd.as_deref().unwrap_or("-"),
         ));
     }
@@ -228,12 +224,6 @@ pub(crate) struct InputJson {
     /// was false on both the text and `--json` surfaces, and a defaulted
     /// input was indistinguishable from an unset optional one.
     pub default: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct PanelJson {
-    pub description: Option<String>,
-    pub hint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -333,7 +323,6 @@ pub(crate) struct ConfigShow {
     pub manifest_path: String,
     pub schema_version: Option<String>,
     pub inputs: Vec<InputJson>,
-    pub panel: Option<PanelJson>,
     pub cmd: Option<GhVerbJson>,
     pub phases: Vec<PhaseJson>,
     pub registry: RegistryJson,
@@ -603,10 +592,6 @@ pub(crate) fn build_show(
         })
         .collect();
 
-    let panel = config.panel.as_ref().map(|p| PanelJson {
-        description: p.description.clone(),
-        hint: p.hint.clone(),
-    });
     let cmd = config.cmd.as_ref().map(|v| GhVerbJson {
         verb: v.clone(),
         allowed: darkmux_types::config_access::cmd_allowed(v),
@@ -647,7 +632,6 @@ pub(crate) fn build_show(
                 default: i.default.clone(),
             })
             .collect(),
-        panel,
         cmd,
         phases,
         registry: registry_json,
@@ -792,14 +776,6 @@ fn render_show_text(show: &ConfigShow) -> String {
             let names: Vec<&str> = role_inputs.iter().map(|i| i.name.as_str()).collect();
             out.push_str(&format!("    role overrides: {} (optional)\n", names.join(", ")));
         }
-    }
-    match &show.panel {
-        Some(p) => out.push_str(&format!(
-            "  panel: {}{}\n",
-            p.description.as_deref().unwrap_or(&show.name),
-            p.hint.as_ref().map(|h| format!(" (hint: {h})")).unwrap_or_default()
-        )),
-        None => out.push_str("  panel: (not panel-advertised)\n"),
     }
     match &show.cmd {
         Some(g) => out.push_str(&format!(
@@ -1007,7 +983,7 @@ fn show(id: &str, params: &[String], profiles_file: Option<&str>, json: bool) ->
 mod tests {
     use super::*;
     use crate::crew::mission_config::{
-        MissionConfigSource, MissionInput, PanelConfig, PhaseConfig, StepConfig, TaskConfig,
+        MissionConfigSource, MissionInput, PhaseConfig, StepConfig, TaskConfig,
     };
     use crate::crew::step_kinds::ProceduralNoopStepKind;
     use darkmux_types::{ModelEndpoint, Profile, ProfileModel};
@@ -1070,7 +1046,6 @@ mod tests {
             schema_version: None,
             inputs: Vec::new(),
             phases,
-            panel: None,
             cmd: None,
             outcome_from: None,
             source_input: None,
@@ -1473,12 +1448,11 @@ mod tests {
             manifest_path: None,
             phases: None,
             tasks: None,
-            panel: None,
             cmd: None,
             error: Some("boom".to_string()),
         };
         let v = serde_json::to_value(&row).unwrap();
-        for key in ["id", "name", "source", "manifest_path", "phases", "tasks", "panel", "cmd", "error"] {
+        for key in ["id", "name", "source", "manifest_path", "phases", "tasks", "cmd", "error"] {
             assert!(v.get(key).is_some(), "missing key {key} in {v}");
         }
         assert!(v["name"].is_null());
@@ -1888,22 +1862,5 @@ mod tests {
             text.contains("task create-mod") && text.contains("[disabled]"),
             "the text view marks the disabled task:\n{text}"
         );
-    }
-
-    #[test]
-    fn panel_json_reflects_the_config_panel_block() {
-        let mut cfg = doc(vec![]);
-        cfg.panel = Some(PanelConfig {
-            description: Some("desc".to_string()),
-            hint: Some("hint".to_string()),
-            accepts_args: None,
-            extras: Default::default(),
-        });
-        let loaded = loaded_doc(cfg);
-        let registry = StepKindRegistry::new();
-        let show = build_show("m", &loaded, &registry, Err("n/a"), &|_| RoleBinding::Unmapped, Err("n/a"), &[]);
-        let panel = show.panel.expect("panel must be Some");
-        assert_eq!(panel.description.as_deref(), Some("desc"));
-        assert_eq!(panel.hint.as_deref(), Some("hint"));
     }
 }

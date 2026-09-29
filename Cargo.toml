@@ -131,6 +131,9 @@ blake3 = "1.5"
 # dep-set discipline this project values.
 ureq = { version = "2.10", default-features = false }
 agent-client-protocol = "2.0.0"
+# `poll` on stdin so radio's confirmation prompt can end on an interrupt; also
+# pins a spawned daemon's open-file limit in a test (#2916 review M1).
+libc = "0.2"
 
 [dev-dependencies]
 # #463 — enable flow's test-only helpers (isolate_test_env_once) for the
@@ -142,8 +145,6 @@ darkmux-flow = { path = "crates/darkmux-flow", features = ["test-support"] }
 # needs to simulate a SIGINT arriving mid-dispatch without sending a real
 # OS signal. Mirrors the `darkmux-flow` entry above exactly.
 darkmux-types = { path = "crates/darkmux-types", features = ["test-support"] }
-# (#2916 review M1) Pin a spawned daemon's open-file limit in a test.
-libc = "0.2"
 # (#2916) The fake identity provider for `machine trust`'s tests.
 darkmux-fleet = { path = "crates/darkmux-fleet", features = ["test-support"] }
 tempfile = "3.10"

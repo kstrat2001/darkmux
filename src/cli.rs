@@ -428,20 +428,20 @@ pub(crate) enum Cmd {
         lab_dir: Option<std::path::PathBuf>,
     },
     /// Serve darkmux as an ACP (Agent Client Protocol) agent over stdio, for
-    /// editors like Zed. The advertised command catalog becomes the agent
-    /// panel's slash commands; free text goes through radio's routing and
-    /// answering seats. Wire it in Zed's `agent_servers` with
+    /// editors like Zed. The agent panel gets one slash command, `/mission`
+    /// (`list`, `launch <config>`, `show <id>`); free text goes through
+    /// radio's routing and answering seats. Wire it in Zed's `agent_servers` with
     /// `"command": "darkmux", "args": ["acp"]`. Guide: docs/guide/radio.html.
     Acp,
-    /// Route free text onto ONE advertised command via a bounded local
+    /// Route free text onto ONE launchable mission config via a bounded local
     /// classification dispatch, then execute it — the terminal twin of the
     /// panel's no-slash channel (#1698 Packet A; the ACP wiring itself is
     /// Packet B). Single exchange by design: one routing call, one
     /// execution, no loop, no REPL — precedent: `gh copilot suggest`.
-    /// Prints the resolved route ("routing to /<id> — from your text")
+    /// Prints the resolved route ("routing to `mission launch <id>` — from your text")
     /// before executing so the choice is never silent (issue #1698's
     /// "provenance boxes invisibility" wall); a message that doesn't
-    /// clearly map onto exactly one advertised command REFUSES instead of
+    /// clearly map onto exactly one launchable config REFUSES instead of
     /// guessing and lists the available commands.
     Radio {
         /// The free-text message to route.
@@ -647,6 +647,18 @@ pub(crate) enum MissionCmd {
         /// machine reader filters for itself.
         #[arg(long)]
         missions: bool,
+    },
+    /// One mission in full: the config it was launched from, its phases,
+    /// tasks and steps with each step's status, tokens and model, its runs,
+    /// the total tokens, and a viewer link. READ-ONLY. `mission status` is
+    /// the board of every mission; this is the one-mission read, and the
+    /// editor panel's `/mission show <id>` prints the same lines.
+    Show {
+        /// Mission id, as `mission status` lists it.
+        id: String,
+        /// Emit the mission as structured JSON instead of the text view.
+        #[arg(long)]
+        json: bool,
     },
     /// Debrief a mission (#1000) — the post-mission review ceremony's raw
     /// material in one place: the loop pathologies darkmux's detectors flagged
@@ -936,8 +948,8 @@ pub(crate) enum RunFamilyCmd {
 pub(crate) enum MissionConfigCmd {
     /// List every registered mission config.
     ///
-    /// One row per id: name, source tier, phase/task counts, whether it
-    /// advertises a panel command, and its `cmd` (if any), across the
+    /// One row per id: name, source tier, phase/task counts, and its
+    /// `cmd` (if any), across the
     /// same user, on-disk, and embedded tiers `mission launch` searches. A
     /// config that fails to load prints as a row naming the error instead
     /// of being silently dropped, so one broken user-tier override never

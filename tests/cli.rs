@@ -5488,7 +5488,7 @@ fn radio_sigterm_forwards_to_the_launched_child_which_finalizes() {
 
     let config_dir = home.path().join("mission-configs");
     fs::create_dir_all(&config_dir).unwrap();
-    // Advertised via `panel` (so radio's catalog names it) and classified
+    // Launchable (so radio's catalog names it) and classified
     // `Launch` (so it spawns a `mission launch` subprocess, not an
     // in-process ephemeral run) by having a `dispatch.internal` step — the
     // SAME shape `mission_launch_generic_sigterm_mid_dispatch_finalizes_and_reaps_curl`
@@ -5500,7 +5500,7 @@ fn radio_sigterm_forwards_to_the_launched_child_which_finalizes() {
         "id": "radio-forward-signal-test",
         "name": "Radio Forward Signal Test",
         "schema_version": "3.4",
-        "panel": { "description": "test-only launch target for #2477's forwarding proof" },
+        "description": "Test-only launch target for the signal-forwarding proof.",
         "phases": [{
             "id": "p1",
             "tasks": [{
@@ -5515,18 +5515,17 @@ fn radio_sigterm_forwards_to_the_launched_child_which_finalizes() {
     }"#;
     fs::write(config_dir.join("radio-forward-signal-test.json"), config_json).unwrap();
 
-    let mut radio_child = darkmux_std_cmd()
+    let mut radio_cmd = darkmux_std_cmd();
+    radio_cmd
         .env("HOME", os_home.path())
         .env("DARKMUX_HOME", home.path())
         .env("DARKMUX_FLOWS_DIR", flows.path())
         .env("DARKMUX_PROFILES", &profiles_path)
         .env("DARKMUX_LMSTUDIO_URL", format!("http://127.0.0.1:{route_port}"))
         .env("DARKMUX_LMS_BIN", "/usr/bin/true")
-        .args(["radio", "please help me with something"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawning darkmux radio");
+        .args(["radio", "please help me with something"]);
+    // Radio confirms the routed launch on a terminal, so this one has one.
+    let (mut radio_child, _pty) = spawn_answering_yes_on_a_pty(&mut radio_cmd);
     let radio_pid = radio_child.id();
 
     assert!(
@@ -5645,6 +5644,57 @@ fn start_hosted_error_stub() -> u16 {
     port
 }
 
+/// The controlling side of a pseudo-terminal a test hands a child as its
+/// stdin and stdout. Dropping it hangs the terminal up, so a test keeps it
+/// alive until the child has exited.
+#[cfg(unix)]
+struct PtyMaster {
+    _file: fs::File,
+}
+
+/// Start `cmd` with a pseudo-terminal as stdin and stdout (stderr null) and
+/// type `y` + Enter at it, the way a user answers radio's "Run it? [y/N]".
+/// Radio only asks on a real terminal, so a test that needs a routed launch
+/// to RUN has to give it one. A thread drains the terminal's output so the
+/// child never blocks writing to it.
+#[cfg(unix)]
+fn spawn_answering_yes_on_a_pty(cmd: &mut std::process::Command) -> (std::process::Child, PtyMaster) {
+    spawn_on_a_pty(cmd, b"y\n")
+}
+
+/// [`spawn_answering_yes_on_a_pty`] with `typed` written to the terminal
+/// instead of a `y` (nothing when it is empty), for a test that answers
+/// something else or never answers.
+#[cfg(unix)]
+fn spawn_on_a_pty(cmd: &mut std::process::Command, typed: &[u8]) -> (std::process::Child, PtyMaster) {
+    use std::io::{Read, Write};
+    use std::os::fd::FromRawFd;
+    let (mut master_fd, mut slave_fd) = (0, 0);
+    // SAFETY: both out-pointers are valid; the null pointers are the
+    // documented "default termios / window size".
+    let rc = unsafe {
+        libc::openpty(&mut master_fd, &mut slave_fd, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut())
+    };
+    assert_eq!(rc, 0, "openpty failed: {}", std::io::Error::last_os_error());
+    // SAFETY: openpty returned two fresh descriptors this function owns.
+    let (master, slave) = unsafe { (fs::File::from_raw_fd(master_fd), fs::File::from_raw_fd(slave_fd)) };
+    cmd.stdin(std::process::Stdio::from(slave.try_clone().unwrap()))
+        .stdout(std::process::Stdio::from(slave))
+        .stderr(std::process::Stdio::null());
+    let child = cmd.spawn().expect("spawning on a pty");
+    // Drop the command's copies of the slave, so the master sees the hangup
+    // when the child (and anything it spawned) exits.
+    *cmd = std::process::Command::new("true");
+    let mut typing = master.try_clone().unwrap();
+    typing.write_all(typed).expect("answering the confirmation");
+    let mut draining = master.try_clone().unwrap();
+    std::thread::spawn(move || {
+        let mut sink = [0u8; 4096];
+        while matches!(draining.read(&mut sink), Ok(n) if n > 0) {}
+    });
+    (child, PtyMaster { _file: master })
+}
+
 /// One `darkmux radio "<text>"` invocation that routes to `mission launch
 /// <config_id>` (the routing seat on the utility binding, answered by the
 /// route stub standing in as LMStudio, #2914), is NEVER signaled, and runs
@@ -5687,7 +5737,7 @@ fn run_radio_launch_to_completion(config_id: &str, dispatch_port: u16) -> (std::
             "id": "{config_id}",
             "name": "Radio Forward Signal Completion Test",
             "schema_version": "3.4",
-            "panel": {{ "description": "test-only launch target for #2477's inverted-direction proof" }},
+            "description": "Test-only launch target for the inverted-direction proof.",
             "phases": [{{
                 "id": "p1",
                 "tasks": [{{
@@ -5703,17 +5753,17 @@ fn run_radio_launch_to_completion(config_id: &str, dispatch_port: u16) -> (std::
     );
     fs::write(config_dir.join(format!("{config_id}.json")), config_json).unwrap();
 
-    let output = darkmux_std_cmd()
-        .env("HOME", os_home.path())
+    let mut cmd = darkmux_std_cmd();
+    cmd.env("HOME", os_home.path())
         .env("DARKMUX_HOME", home.path())
         .env("DARKMUX_FLOWS_DIR", flows.path())
         .env("DARKMUX_PROFILES", &profiles_path)
         .env("DARKMUX_LMSTUDIO_URL", format!("http://127.0.0.1:{route_port}"))
         .env("DARKMUX_LMS_BIN", "/usr/bin/true")
-        .args(["radio", "please help me with something unrelated"])
-        .output()
-        .expect("running darkmux radio to completion");
-    (output.status, home)
+        .args(["radio", "please help me with something unrelated"]);
+    let (mut child, _pty) = spawn_answering_yes_on_a_pty(&mut cmd);
+    let status = child.wait().expect("running darkmux radio to completion");
+    (status, home)
 }
 
 /// (#2918) A fake `lms` that records every argv it is called with to
@@ -5750,15 +5800,14 @@ fn write_recording_fake_lms(dir: &std::path::Path, argv_log: &std::path::Path, s
 /// (#2918) "Which models are loaded on this machine right now?" used to be
 /// REFUSED: the catalog radio hands its router had no machine command in it,
 /// so the question fell through to the answering seat. The built-in
-/// `machine-status` config is now advertised like any other panel command,
-/// and this proves the whole chain through the real binary: the router
-/// (mocked, answering `machine-status`) is OFFERED the command in its
-/// catalog, the routed command runs `darkmux machine status` in-process
-/// (procedural-only ⇒ ephemeral), and that verb reaches `lms ps --json` —
-/// the argv the fake `lms` records — whose one resident then renders in
-/// radio's own stdout. No model, no LM Studio, no Docker.
+/// `machine-status` config is now offered like any other launchable config:
+/// the router (mocked, answering `machine-status`) is OFFERED it in its
+/// catalog, and radio then prints the exact command and asks before running
+/// it. Here there is no terminal, so it prints the command, says it was not
+/// run, and exits 1 without touching `lms ps`. No model, no LM Studio, no
+/// Docker.
 #[test]
-fn radio_routes_a_loaded_models_question_to_machine_status_which_runs_lms_ps() {
+fn radio_routes_a_loaded_models_question_to_machine_status_and_confirms_before_running_it() {
     let (route_port, router_requests) = start_capturing_route_decision_stub("machine-status");
 
     let home = TempDir::new().unwrap();
@@ -5791,19 +5840,191 @@ fn radio_routes_a_loaded_models_question_to_machine_status_which_runs_lms_ps() {
         "the router's catalog must list the built-in machine-status command (#2918):\n{offered}"
     );
 
-    assert!(output.status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
-    assert!(stdout.contains("routing to /machine-status"), "{stdout}");
-    // `darkmux machine status` ran, against the fake: its ONE managed
-    // resident renders in radio's own output …
-    assert!(stdout.contains("darkmux-managed (1):"), "the routed `machine status` output must render:\n{stdout}");
-    assert!(stdout.contains("darkmux:stub-worker"), "{stdout}");
-    // … and the argv that produced it is the read-only listing, nothing
-    // that mutates: `machine eject` would call `lms unload`. (A `load
-    // stub-util …` line IS expected here — that is the ROUTER's own utility-
-    // model residency preflight, #2914, not the routed command.)
+    // The router's pick is never the consent: with no terminal to confirm on,
+    // radio prints the exact command, says it did not run it, and exits 1.
+    assert_eq!(output.status.code(), Some(1), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stdout.contains("routing to `mission launch machine-status`"), "{stdout}");
+    assert!(stdout.contains("    darkmux mission launch machine-status\n"), "the exact command is printed:\n{stdout}");
+    assert!(stdout.contains("not run") && stdout.contains("no interactive terminal"), "{stdout}");
+    // Nothing ran: `machine status` would have rendered the fake's one
+    // resident. (The recorded argv cannot tell: the ROUTER's own residency
+    // preflight, #2914, also calls `lms ps --json`.)
+    assert!(!stdout.contains("darkmux-managed"), "the routed command must not have run:\n{stdout}");
     let argv = fs::read_to_string(&argv_log).expect("the fake lms must have been called");
-    assert!(argv.lines().any(|l| l.trim() == "ps --json"), "expected `lms ps --json` in the recorded argv:\n{argv}");
-    assert!(!argv.contains("unload"), "read-only only — nothing that unloads (#2918):\n{argv}");
+    assert!(!argv.contains("unload"), "{argv}");
+}
+
+/// Count the `lms ps` calls a recording fake `lms` logged.
+fn count_lms_ps_calls(argv_log: &std::path::Path) -> usize {
+    fs::read_to_string(argv_log).unwrap_or_default().lines().filter(|l| l.trim().starts_with("ps")).count()
+}
+
+/// A routed `machine-status` pick, with the isolated env every radio test
+/// here uses, run either on a terminal that answers `y` or with no terminal.
+/// Returns the child's exit code and how many times `lms ps` ran.
+fn run_radio_machine_status(answer_yes_on_a_pty: bool) -> (Option<i32>, usize) {
+    let route_port = start_route_decision_stub("machine-status");
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let os_home = TempDir::new().unwrap();
+    let profiles_path = home.path().join("profiles.json");
+    fs::write(&profiles_path, utility_binding_profiles_json()).unwrap();
+    let argv_log = home.path().join("lms-argv.log");
+    let fake_lms = write_recording_fake_lms(home.path(), &argv_log, "idle");
+    let mut cmd = darkmux_std_cmd();
+    cmd.env("HOME", os_home.path())
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_PROFILES", &profiles_path)
+        .env("DARKMUX_LMSTUDIO_URL", format!("http://127.0.0.1:{route_port}"))
+        .env("DARKMUX_LMS_BIN", &fake_lms)
+        .args(["radio", "which models are loaded on this machine right now?"]);
+    let code = if answer_yes_on_a_pty {
+        let (mut child, _pty) = spawn_answering_yes_on_a_pty(&mut cmd);
+        child.wait().expect("waiting for darkmux radio").code()
+    } else {
+        cmd.output().expect("running darkmux radio").status.code()
+    };
+    (code, count_lms_ps_calls(&argv_log))
+}
+
+/// The other half of the consent gate: an APPROVED routed ephemeral launch
+/// really runs. `machine status` shells to `lms ps` itself, so the approved
+/// run makes strictly more `lms ps` calls than the unapproved one (the router's
+/// own residency preflight makes the same call in both).
+#[cfg(unix)]
+#[test]
+fn radio_runs_an_approved_ephemeral_pick() {
+    let (unanswered_code, unanswered_ps) = run_radio_machine_status(false);
+    let (approved_code, approved_ps) = run_radio_machine_status(true);
+    assert_eq!(unanswered_code, Some(1), "no terminal: not run, exit 1");
+    assert_eq!(approved_code, Some(0), "an approved run of machine-status exits 0");
+    assert!(
+        approved_ps > unanswered_ps,
+        "the approved run must have run `machine status` (lms ps calls: approved {approved_ps}, unanswered {unanswered_ps})"
+    );
+}
+
+/// A fresh git repo with two commits on `main`, so `review` has a diff to
+/// synthesize inputs from.
+fn two_commit_repo() -> TempDir {
+    let repo = TempDir::new().unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git").args(args).current_dir(repo.path()).output().expect("git runs");
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.email", "t@example.com"]);
+    git(&["config", "user.name", "t"]);
+    for i in 0..2 {
+        fs::write(repo.path().join("a.rs"), format!("fn f{i}() {{}}\n")).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", &format!("c{i}")]);
+    }
+    repo
+}
+
+/// `review` is the main free-text target and a shell launch never synthesizes
+/// its `diff_file`, so the confirmation has to show the inputs that WILL run
+/// and, with no terminal, say the printed command is not runnable as it stands.
+#[test]
+fn radio_review_pick_shows_the_synthesized_inputs_and_qualifies_the_advice() {
+    let route_port = start_route_decision_stub("review");
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let os_home = TempDir::new().unwrap();
+    let repo = two_commit_repo();
+    let profiles_path = home.path().join("profiles.json");
+    fs::write(&profiles_path, utility_binding_profiles_json()).unwrap();
+    let tmp = TempDir::new().unwrap();
+
+    let output = darkmux_std_cmd()
+        .current_dir(repo.path())
+        .env("TMPDIR", tmp.path())
+        .env("HOME", os_home.path())
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_PROFILES", &profiles_path)
+        .env("DARKMUX_LMSTUDIO_URL", format!("http://127.0.0.1:{route_port}"))
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args(["radio", "review this branch"])
+        .output()
+        .expect("running darkmux radio");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(1), "stdout:\n{stdout}");
+    for key in ["--param diff_file=", "--param workspace=", "--param head_sha="] {
+        assert!(stdout.contains(key), "the confirmation must show `{key}`:\n{stdout}");
+    }
+    assert!(
+        stdout.contains("diff_file, workspace above name temporary files"),
+        "the advice must say the synthesized FILE values do not outlive the process, and only those:\n{stdout}"
+    );
+    assert!(stdout.contains("darkmux mission config show <config>"), "{stdout}");
+    assert_eq!(dir_entries(tmp.path()), Vec::<String>::new(), "the synthesized inputs must be removed on exit");
+}
+
+/// The names in `dir`, sorted (empty when it is empty).
+fn dir_entries(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> =
+        fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    names.sort();
+    names
+}
+
+/// A Ctrl-C at radio's `Run it? [y/N]` prompt must end the prompt at once,
+/// run nothing, and leave no synthesized input behind. The SIGINT handler is
+/// installed with SA_RESTART, so a plain blocking read used to keep waiting
+/// (and a third signal killed the process past every destructor, leaking the
+/// temp dir).
+#[cfg(unix)]
+#[test]
+fn radio_ctrl_c_at_the_prompt_ends_it_promptly_and_removes_the_synthesized_inputs() {
+    let route_port = start_route_decision_stub("review");
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let os_home = TempDir::new().unwrap();
+    let repo = two_commit_repo();
+    let tmp = TempDir::new().unwrap();
+    let profiles_path = home.path().join("profiles.json");
+    fs::write(&profiles_path, utility_binding_profiles_json()).unwrap();
+
+    let mut cmd = darkmux_std_cmd();
+    cmd.current_dir(repo.path())
+        .env("TMPDIR", tmp.path())
+        .env("HOME", os_home.path())
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_PROFILES", &profiles_path)
+        .env("DARKMUX_LMSTUDIO_URL", format!("http://127.0.0.1:{route_port}"))
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args(["radio", "review this branch"]);
+    let (mut child, _pty) = spawn_on_a_pty(&mut cmd, b"");
+
+    // The temp dir appearing means the launch was prepared, so radio is at
+    // (or a moment from) the prompt.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while dir_entries(tmp.path()).is_empty() {
+        assert!(std::time::Instant::now() < deadline, "radio never prepared the review inputs");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let pid = child.id().to_string();
+    assert!(std::process::Command::new("kill").args(["-INT", &pid]).status().unwrap().success());
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("radio was still waiting at the prompt 5s after a SIGINT");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert_eq!(status.code(), Some(1), "an interrupted prompt is not-run, exit 1");
+    assert_eq!(dir_entries(tmp.path()), Vec::<String>::new(), "the synthesized inputs must be removed after an interrupt");
 }
 
 /// (#2917) One LM Studio instance serves one request at a time, so a radio
@@ -6380,8 +6601,8 @@ fn mission_launch_run_on_unknown_value_refused_before_minting() {
 //
 // No assert_cmd binary-level test exists for `radio`'s live routing path,
 // for a reason worth recording: the built-in `review` mission config
-// (`templates/builtin/mission-configs/review.json`) declares a `panel`
-// block, so it is ALWAYS merged into `radio::compile_catalog`'s output
+// (`templates/builtin/mission-configs/review.json`) is launchable, so it is
+// ALWAYS merged into `radio::compile_catalog`'s output
 // regardless of `DARKMUX_HOME` — built-ins are embedded at compile
 // time, independent of the user-tier root an isolated TempDir can
 // override. There is therefore no environment override that produces a

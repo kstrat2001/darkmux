@@ -51,6 +51,51 @@ darkmux release.
   read the old routes or fields must use the new names. `funnels.json` and
   `funnel-events.jsonl` in an old lab run directory are still read as archives
   (no writer produces them since #2310).
+
+- **The per-config `panel` block, and the panel's per-config slash commands**
+  (`/review`, `/machine-status`, `/pr-merge`, ...). The editor panel now has
+  one command, `/mission`, with three verbs, and every config `darkmux mission
+  launch` accepts is listable and launchable through it. `/mission list` and
+  radio's catalog run the same first check a launch does, so they list
+  configs exactly when a launch could start. A mission config
+  carrying a `panel` key is refused by the user-file gate and by `mission
+  config` validation, with a message naming `/mission launch <id>`.
+  `mission config list --json` rows and `mission config show --json` lose
+  their `panel` field, and the text list loses its `panel` column.
+  **Migration:** delete the `panel` block from your configs; run `/review` as
+  `/mission launch review`, `/pr-merge 2049` as `/mission launch pr-merge 2049`.
+  A config takes text after its id only if a task reads `__panel_args__`
+  (this replaces `panel.accepts_args`); text sent to a config that takes none
+  is refused, not dropped. Radio's router now reads the first sentence of a
+  config's `description` (else its `name`) where it read `panel.description`,
+  so a config you want routable should lead with one plain sentence. Panel
+  ids are the ones `mission launch` accepts (lowercase), so a config whose
+  file name has an uppercase letter is not listed. **One stale user-tier
+  mission config blocks every launch** (a leftover `panel` key is enough):
+  `mission launch`, `/mission list` and radio all refuse with the same text
+  until the file is fixed, and `darkmux doctor` names it. A value with spaces
+  in the panel is written `name="two words"`.
+- **Radio asks before it runs anything it chose.** The router can now pick any
+  launchable config from free text, so `darkmux radio` prepares the launch's
+  inputs first, prints the `darkmux mission launch <id> --param ...` command
+  with every param that will run (for `review`, the `diff_file`, `workspace`
+  and `head_sha` it makes from the current directory; the first two name
+  temporary files, and `head_sha` is a commit hash), and asks `Run it? [y/N]` before running it. A repo with nothing to
+  review is reported without asking. With no interactive terminal it prints
+  the command, says it was not run and, when inputs were made from the
+  current directory, that they are temporary and must be replaced with your
+  own, then exits 1. An interrupt at the prompt ends it within a moment, runs nothing
+  (even if a `y` follows) and removes the temporary files. A routed input
+  holding a control character or an invisible formatting character (a bidi
+  override, a zero-width space) is refused. The editor
+  agent panel does the same for free text (no slash): the pick is shown in a
+  code block in the panel's permission dialog, and only Allow runs it; Reject,
+  cancel or no answer runs nothing and the panel says "not run". An explicit
+  `/mission launch <id>` is your own command and is not asked again.
+  **Migration:** a script that relied on radio running its pick unattended
+  must run the printed command itself (for `review`, with its own
+  `diff_file` and `workspace`); a panel user answers the dialog once per
+  routed message.
 - **`darkmux mission dispatch` and the hand-built mission verbs** (#2954).
   Missions now come only from mission configs. Removed with no alias:
   `mission dispatch`, `mission add-phase`, `mission start`,
@@ -296,6 +341,31 @@ darkmux release.
   `bounds` block, which is keyed by the config knob a value came from) keep
   their names. darkmux's readers rename and convert an old record's keys on
   read.
+
+### Added (4.0)
+
+- **`darkmux mission show <id>`** and the panel's `/mission show <id>`: one
+  mission in full, from one derivation. The config it was launched from and
+  its declared inputs, every phase, task and step with status, tokens, turns
+  and model, its runs, total tokens, and a viewer link. `--json` is a
+  semver-bound shape (`MissionShow`: `id`, `status`, `description`, `config`,
+  `graph` (the daemon's `/mission/:id/graph.json` value), `runs` (the `run
+  list` rows for this mission), `tokens`, `link`). `mission status` stays the
+  board. An input the launcher fills itself, `mission_id`, reports
+  `required: false` in `config.inputs` (and is not marked required in the text
+  listing), since no caller has to pass it.
+- **`/mission list`, `/mission launch <config> [name=value ...]` and
+  `/mission show <id>` in the editor panel**, replacing the per-config
+  commands. Arguments after the config id map onto its declared inputs the way
+  `--param` does (a `name=value` token naming a declared input is a param, the
+  rest is the config's `__panel_args__` text). `/mission launch review` with
+  no inputs still synthesizes the diff, workspace and `head_sha` from the
+  session's cwd, now triggered by a declared required `diff_file` input and
+  skipped when you pass one.
+- **Panel values have no escapes.** In `/mission launch <config> name="two words"`
+  a backslash right before the closing quote is refused, naming the input,
+  instead of being guessed at; use the other kind of quote around a value that
+  holds one.
 
 ### Changed (breaking, 4.0)
 

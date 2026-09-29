@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>PR-flow panel verbs · darkmux user guide</title>
-<meta name="description" content="Author your own pr-list/pr-info/pr-approve/pr-merge slash commands in the darkmux agent panel: a per-verb gh allowlist, a permission dialog that shows CI/review/adjudication facts, and a flow-record audit trail.">
+<meta name="description" content="Author your own pr-list/pr-info/pr-approve/pr-merge mission configs and run them from the darkmux agent panel with /mission launch: a per-verb gh allowlist, a permission dialog that shows CI/review/adjudication facts, and a flow-record audit trail.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -32,7 +32,7 @@
   <div class="wrap">
     <div class="label">08 <span class="dot">·</span> advanced</div>
     <h1>PR-flow panel verbs</h1>
-    <p class="lede">Four repetitive PR-lifecycle acts, running as slash commands in the SAME agent panel you already dispatch missions from: <code>/pr-list</code>, <code>/pr-info</code>, <code>/pr-approve</code>, <code>/pr-merge</code>. They are operator-authored <code>procedural.shell</code> mission configs, not a built-in feature: darkmux ships the machinery (the allowlist, the permission dialog, the audit trail), you author the verbs against your own repos and your own <code>gh</code>.</p>
+    <p class="lede">Four repetitive PR-lifecycle acts, running from the SAME agent panel you already dispatch missions from: <code>/mission launch pr-list</code>, <code>/mission launch pr-info</code>, <code>/mission launch pr-approve</code>, <code>/mission launch pr-merge</code>. Any config in your registry is launchable that way, so there is nothing to register: <code>/mission list</code> shows them. They are operator-authored <code>procedural.shell</code> mission configs, not a built-in feature: darkmux ships the machinery (the allowlist, the permission dialog, the audit trail), you author the verbs against your own repos and your own <code>gh</code>.</p>
   </div>
 </header>
 
@@ -60,7 +60,7 @@
     "allowed": []
   }
 }</code></pre>
-    <p>A config opts into the gate by declaring a <code>cmd</code> name at its top level (schema 2.3): <code>"cmd": "pr-merge"</code>. Before darkmux runs a SINGLE step of that config's graph, on EITHER entry point (a panel slash command, or a bare <code>darkmux mission launch pr-merge</code> from the terminal), it checks <code>cmd.enabled == true</code> and that <code>"pr-merge"</code> is listed in <code>cmd.allowed</code>. Fails closed on both: the block off refuses everything regardless of the list; a verb absent from the list refuses even with the block on.</p>
+    <p>A config opts into the gate by declaring a <code>cmd</code> name at its top level (schema 2.3): <code>"cmd": "pr-merge"</code>. Before darkmux runs a SINGLE step of that config's graph, on EITHER entry point (the panel's <code>/mission launch</code>, or a bare <code>darkmux mission launch pr-merge</code> from the terminal), it checks <code>cmd.enabled == true</code> and that <code>"pr-merge"</code> is listed in <code>cmd.allowed</code>. Fails closed on both: the block off refuses everything regardless of the list; a verb absent from the list refuses even with the block on.</p>
     <pre><code>darkmux config set cmd.enabled true
 darkmux config set cmd.allowed pr-list,pr-info,pr-approve,pr-merge</code></pre>
     <p>The second command REPLACES the whole list (there is no incremental add today), so name every verb you want live. <code>darkmux doctor</code> shows the resolved state:</p>
@@ -118,11 +118,6 @@ darkmux config set cmd.allowed pr-list,pr-info,pr-approve,pr-merge</code></pre>
   "name": "PR List",
   "schema_version": "2.3",
   "cmd": "pr-list",
-  "panel": {
-    "description": "List open pull requests in this repo",
-    "hint": "(no arguments)",
-    "accepts_args": false
-  },
   "phases": [
     {
       "id": "list",
@@ -144,7 +139,7 @@ darkmux config set cmd.allowed pr-list,pr-info,pr-approve,pr-merge</code></pre>
 #1757  docs(guide): radio — full v2.6 surface  [docs/radio-guide] (draft)  @kstrat2001</code></pre>
 
     <h3><code>pr-info.json</code>: the shared gather logic, standalone</h3>
-    <p>Takes an optional PR number (<code>/pr-info 1776</code>); with none, resolves the CURRENT branch's PR via a bare <code>gh pr view</code>. This is the exact gather logic <code>pr-approve</code>/<code>pr-merge</code> reuse below, so reading it here first makes those two easier to follow.</p>
+    <p>Takes an optional PR number (<code>/mission launch pr-info 1776</code>); with none, resolves the CURRENT branch's PR via a bare <code>gh pr view</code>. This is the exact gather logic <code>pr-approve</code>/<code>pr-merge</code> reuse below, so reading it here first makes those two easier to follow.</p>
     <pre><code>{
   "id": "pr-info",
   "name": "PR Info",
@@ -154,10 +149,6 @@ darkmux config set cmd.allowed pr-list,pr-info,pr-approve,pr-merge</code></pre>
     { "name": "args", "required": false,
       "description": "The PR number, for a direct CLI launch (--param args=&lt;n&gt;). Omit to use the current branch's PR." }
   ],
-  "panel": {
-    "description": "Show CI status, review verdict, and adjudication state for a PR",
-    "hint": "[pr-number] (defaults to the current branch's PR)"
-  },
   "phases": [
     {
       "id": "info",
@@ -225,7 +216,7 @@ url: https://github.com/kstrat2001/darkmux/pull/1749</code></pre>
   <div class="wrap">
     <h2>Honest limits</h2>
     <ul>
-      <li><strong>Arguments work fully from the agent panel; a direct CLI launch defaults to the current branch when no <code>--param args</code> is given.</strong> <code>darkmux mission launch pr-info --param args=1776</code> DOES deliver <code>1776</code> into the gather step (this repo's own test suite proves it, and it was dogfooded live against a real PR while writing this page) &mdash; the CLI and panel routes share one injection mechanism. What the CLI route does not have is the panel's own argument PARSING (<code>/pr-info 1776</code> splitting the command name from its argument): from a terminal, name the value explicitly with <code>--param args=&lt;n&gt;</code>.</li>
+      <li><strong>Arguments work fully from the agent panel; a direct CLI launch defaults to the current branch when no <code>--param args</code> is given.</strong> <code>darkmux mission launch pr-info --param args=1776</code> DOES deliver <code>1776</code> into the gather step (this repo's own test suite proves it, and it was dogfooded live against a real PR while writing this page) &mdash; the CLI and panel routes share one injection mechanism. The panel maps the words after the config id onto the same input (<code>/mission launch pr-info 1776</code> passes <code>1776</code> as <code>args</code>, because the config reads <code>__panel_args__</code>); from a terminal, name the value explicitly with <code>--param args=&lt;n&gt;</code>.</li>
       <li><strong>The demotion rule is fixed prose, not a config.</strong> "Advisory only" vs "custom attribution present" is a simple text match on the posted review's tagline. If your workflow adopts a different higher-tier-confirmation convention, edit the <code>gather</code> step's jq to match it &mdash; darkmux has no opinion here.</li>
       <li><strong>One repo per session.</strong> Nothing aggregates PRs across repos or across concurrent darkmux sessions; that is deliberately the served viewer's job, not this surface's.</li>
       <li><strong><code>gh</code> and <code>jq</code> must be on the operator's <code>PATH</code>.</strong> darkmux never installs, configures, or authenticates either; <code>gh auth status</code> is the pre-flight check.</li>

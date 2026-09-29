@@ -14,10 +14,10 @@ use cli::*;
 
 // SPIKE (#1388) — `darkmux acp`. See src/acp.rs module docs.
 mod acp;
-// (#1684) Registry-advertised panel commands + ephemeral procedural
-// launches — the merged mission-config registry enumeration, command
-// routing decision, and in-process ephemeral graph runner `acp.rs`'s
-// session/new and session/prompt handlers call into. Split out of acp.rs
+// The editor panel's generic `/mission list|launch|show` verbs (launch
+// planning over the merged mission-config registry) and the in-process
+// ephemeral graph runner `acp.rs`'s session/new and session/prompt
+// handlers call into. Split out of acp.rs
 // itself so the ACP wire-protocol plumbing and the registry/scheduler
 // wiring stay independently readable.
 mod acp_panel;
@@ -62,6 +62,7 @@ pub use darkmux_lab::lab;
 mod lab_cli;
 mod config_cmd;
 mod conventions;
+mod mission_show;
 mod mission_status;
 mod retired_verbs;
 mod run_list;
@@ -873,6 +874,7 @@ fn cmd_finding(sub: cli::FindingCmd) -> Result<i32> {
 fn cmd_mission(sub: MissionCmd) -> Result<i32> {
     match sub {
         MissionCmd::Status { json, limit, all, missions } => mission_status::run(json, limit, all, missions),
+        MissionCmd::Show { id, json } => mission_show::run(&id, json),
         MissionCmd::Debrief { id, json } => coder_phase::debrief(&id, json),
         MissionCmd::Finalize { id, reasoning } => {
             coder_phase::finalize(&id, reasoning.as_deref())

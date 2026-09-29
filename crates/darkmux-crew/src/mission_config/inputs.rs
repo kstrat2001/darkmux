@@ -711,7 +711,6 @@ mod tests {
             }],
             phases,
             outcome_from: None,
-            panel: None,
             cmd: None,
             source_input: None,
             ticket: None,

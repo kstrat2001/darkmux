@@ -223,7 +223,7 @@ fn spec_origin_for(source: crew::mission_config::MissionConfigSource) -> crew::t
 /// pr-merge` typed by a human at a shell gets [`crew::gate::
 /// tty_prompt_handler`] (a y/N prompt); anything else — CI, a
 /// piped/redirected stdin OR stdout, an ACP-spawned `mission launch <id>`
-/// subprocess (the `RoutePlan::Launch` route in `src/acp_panel.rs` —
+/// subprocess (the `LaunchRoute::Launch` route in `src/acp_panel.rs` —
 /// headless by construction) — gets [`crew::gate::refusal_handler`], which
 /// fails CLOSED rather than hanging on input that will never arrive.
 ///
@@ -347,6 +347,69 @@ impl Drop for WatchdogStopGuard {
     }
 }
 
+/// The refusal every launch runs first: a stale or invalid user file the
+/// launch scope consumes (every effective user-tier mission config
+/// included) blocks ALL launches. [`resolve_config`] and the surfaces that
+/// list what can be launched (`/mission list`, radio's catalog) share this
+/// one call, so a list never offers what a launch would refuse.
+pub(crate) fn preflight_launch() -> Result<()> {
+    darkmux_crew::user_files::preflight(darkmux_types::config_enum::Scope::MissionLaunch)?;
+    Ok(())
+}
+
+/// Resolve a launchable config by id: the identifier check, the
+/// bad-enum-config refusal, and the registry load, with the refusal text a
+/// launch prints. `darkmux mission launch` and the editor panel's
+/// `/mission launch` both call this, so an unknown or unreadable config is
+/// refused with the same words on either surface.
+///
+/// (#2947) Bad enum config refuses before anything is loaded or minted, and
+/// before the `--dry-run` short-circuit: a dry run surfaces the same loud
+/// failures a real launch would, and a launch whose dispatches would each
+/// refuse is not worth planning. Not waived by `--force`, which overrides a
+/// thermal/battery READING, not a config value.
+pub(crate) fn resolve_config(config_id: &str) -> Result<mission_config::LoadedMissionConfig> {
+    fleet::validate_identifier("config_id", config_id)?;
+    preflight_launch()?;
+    mission_config::load(config_id).with_context(|| {
+        format!(
+            "loading mission config \"{config_id}\" — note: a user-tier copy \
+             (~/.darkmux/mission-configs/{config_id}.json) or an on-disk template overrides \
+             an embedded built-in; the failing file is named above if one was found"
+        )
+    })
+}
+
+/// The inputs a launch collected, after document defaults, and the names the
+/// operator themself supplied (captured before a single default lands: the
+/// inert-input checks in [`launch`] must tell "the operator passed this knob"
+/// apart from "the document defaulted it").
+pub(crate) struct ResolvedInputs {
+    pub collected: BTreeMap<String, serde_json::Value>,
+    pub operator_supplied: std::collections::BTreeSet<String>,
+}
+
+/// Parse `--input`/`--param`, apply the document's declared defaults, and
+/// refuse a launch that is missing a required input. The one input
+/// resolution both `darkmux mission launch` and the panel's in-process
+/// route run, so a missing required input reads the same on both.
+///
+/// (#2310 P4e) Document-declared defaults land BEFORE every consumer, so a
+/// defaulted input is indistinguishable from one the operator typed: an
+/// EMBEDDED placeholder naming an uncollected input is refused at mint, so
+/// without this a config could not ship a default at all.
+pub(crate) fn resolve_inputs(
+    config: &MissionConfig,
+    input_file: Option<&Path>,
+    params: &[String],
+) -> Result<ResolvedInputs> {
+    let mut collected = collect_inputs(input_file, params)?;
+    let operator_supplied: std::collections::BTreeSet<String> = collected.keys().cloned().collect();
+    apply_input_defaults(config, &mut collected);
+    refuse_bad_inputs(config, &collected)?;
+    Ok(ResolvedInputs { collected, operator_supplied })
+}
+
 pub fn launch(
     config_id: &str,
     input_file: Option<&Path>,
@@ -366,31 +429,7 @@ pub fn launch(
     // negative or wildly wrong duration that subtracting the mission's two
     // wall-clock timestamps could.
     let run_started = std::time::Instant::now();
-    fleet::validate_identifier("config_id", config_id)?;
-
-    // (#2947) Bad enum config refuses before anything is loaded or minted,
-    // and before the `--dry-run` short-circuit below: a dry run surfaces the
-    // same loud failures a real launch would, and a launch whose dispatches
-    // would each refuse is not worth planning. Not waived by `--force`,
-    // which overrides a thermal/battery READING, not a config value.
-    darkmux_crew::user_files::preflight(darkmux_types::config_enum::Scope::MissionLaunch)?;
-
-    // (#2301) `crawl` used to be routed by literal id to a bespoke
-    // launcher, BEFORE the config load below, because its Task/Step graph
-    // was computed at run time and there was no document to execute. There
-    // is one now: `crawl.json` declares a `crawl.plan` task per rule, grows
-    // a `crawl.unit` task per planned unit from each plan's output (#2300),
-    // and closes with a `crawl.summary`. Nothing about a crawl needs a
-    // launcher of its own any more, so it takes this path like every other
-    // config and `src/crawl_launch.rs` is gone.
-
-    let loaded = mission_config::load(config_id).with_context(|| {
-        format!(
-            "loading mission config \"{config_id}\" — note: a user-tier copy \
-             (~/.darkmux/mission-configs/{config_id}.json) or an on-disk template overrides \
-             an embedded built-in; the failing file is named above if one was found"
-        )
-    })?;
+    let loaded = resolve_config(config_id)?;
     let config = &loaded.config;
 
     // (#1685) The command allowlist gate — checked before ANY other work on
@@ -439,27 +478,7 @@ pub fn launch(
         ))
     );
 
-    let mut collected = collect_inputs(input_file, params)?;
-    // (#2386 MF3) The operator's OWN action, captured before a single
-    // default lands — the inert-input checks below need to tell "the
-    // operator passed this knob" apart from "the document defaulted it".
-    // Everything else in this function wants the POST-default view (see
-    // the next comment); this set does not, and reading it off `collected`
-    // after defaults apply would make every defaulted-but-inert input look
-    // operator-supplied and refuse a launch the operator never touched.
-    let operator_supplied: std::collections::BTreeSet<String> = collected.keys().cloned().collect();
-    // (#2310 P4e) Document-declared defaults land BEFORE every consumer
-    // below — the required check, the typo warning, the dry-run print, the
-    // inputs fingerprint and both placeholder passes — so a defaulted
-    // input is indistinguishable from one the operator typed. That is the
-    // point: `review`'s wait command interpolates `mod_wait_seconds`
-    // from inside a string, and an EMBEDDED placeholder naming an
-    // uncollected input is refused at mint (`check_embedded_inputs_
-    // collected`), so without this the config could not ship a default at
-    // all.
-    apply_input_defaults(config, &mut collected);
-    let collected = collected;
-    refuse_bad_inputs(config, &collected)?;
+    let ResolvedInputs { collected, operator_supplied } = resolve_inputs(config, input_file, params)?;
 
     // (#2310 P4f review, CONSIDER 3) `mod_seat_profile` names the profile
     // `review`'s optional endpoint create-mod seat dispatches to. A name
@@ -2442,8 +2461,7 @@ fn missing_required_inputs<'a>(
     config
         .inputs
         .iter()
-        .filter(|i| i.name != "mission_id")
-        .filter(|i| i.required != Some(false))
+        .filter(|i| i.is_required_of_operator())
         .filter(|i| !collected.contains_key(&i.name))
         .collect()
 }
@@ -6383,7 +6401,6 @@ mod tests {
             schema_version: None,
             inputs: vec![input("rules"), input("workdir")],
             phases: Vec::new(),
-            panel: None,
             cmd: None,
             outcome_from: None,
             source_input: None,
@@ -6440,7 +6457,6 @@ mod tests {
             schema_version: None,
             inputs: Vec::new(),
             phases: Vec::new(),
-            panel: None,
             cmd: None,
             outcome_from: None,
             source_input: None,
@@ -7273,7 +7289,6 @@ mod tests {
             ],
             phases: vec![],
             outcome_from: None,
-            panel: None,
             cmd: None,
             source_input: None,
             ticket: None,
@@ -7327,7 +7342,6 @@ mod tests {
                 input("image", Some(false)),
             ],
             phases: Vec::new(),
-            panel: None,
             cmd: None,
             outcome_from: None,
             source_input: None,
