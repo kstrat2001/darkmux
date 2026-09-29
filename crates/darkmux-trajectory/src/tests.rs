@@ -121,6 +121,16 @@ fn a_continuation_is_the_same_turn_and_its_usage_still_counts() {
     assert_eq!(null_count.tokens.total, 7);
 }
 
+/// A hand-back resume records its first call under the checkpoint's last
+/// turn (`seq` = that turn), so its own trajectory folds to the turns IT made:
+/// one here, though the whole task has made three. Two runs' `turns` must
+/// therefore not be summed across a resume (the shared turn counts twice).
+#[test]
+fn a_resumed_run_counts_only_its_own_turns() {
+    let resumed = fold(&[r#"{"type":"model.completed","seq":3,"finish_reason":"stop","usage":null}"#]);
+    assert_eq!(resumed.turns(), 1);
+}
+
 #[test]
 fn rests_split_routine_from_paced_and_sum_both() {
     let f = fold(&[

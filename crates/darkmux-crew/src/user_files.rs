@@ -5,7 +5,7 @@
 //! (`darkmux_profiles::preflight_with`) plus the crew-owned files its scope
 //! consumes. `darkmux-lab` adds workloads and fixtures for a lab run.
 
-use darkmux_types::config_enum::{InvalidSetting, PreflightRefusal, Scope, SetIn};
+use darkmux_types::config_enum::{PreflightRefusal, Scope};
 use darkmux_types::user_files::{check_dir, check_tiered, no_retired, FileProblem, Reach, UserFileKind};
 
 use crate::mission_config::MissionConfig;
@@ -87,29 +87,7 @@ pub fn preflight_with(scope: Scope, profiles_file: Option<&str>) -> Result<(), P
         .err()
         .unwrap_or_else(|| PreflightRefusal::none(scope));
     refusal.files.extend(UserFileKind::consumed_by(scope).flat_map(|k| problems(k, Reach::Effective)));
-    refusal
-        .invalid
-        .extend(retired_hook_actions(darkmux_types::config_access::hooks_enabled(), &darkmux_types::config_access::hooks_rules()));
     refusal.into_result()
-}
-
-/// A hook rule written against an action spelling 4.0 retired, as the
-/// refusal a preflight prints: where it is set, and the spelling to write.
-/// Hook rules are the operator's `config.json`, so a retired spelling is
-/// refused, never read as the current one. Nothing is refused while hooks
-/// are off: their rules are not loaded.
-fn retired_hook_actions(hooks_enabled: bool, rules: &[darkmux_types::config::HookRule]) -> Vec<InvalidSetting> {
-    if !hooks_enabled {
-        return Vec::new();
-    }
-    darkmux_flow::hooks::retired_rule_actions(rules)
-        .into_iter()
-        .map(|r| InvalidSetting {
-            set_in: SetIn::Config(r.config_path()),
-            problem: format!("`{}` is a spelling darkmux retired in 4.0", r.configured),
-            valid: format!("write `{}`", r.current),
-        })
-        .collect()
 }
 
 /// [`preflight_with`] against the default registry search.

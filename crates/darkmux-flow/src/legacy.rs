@@ -151,6 +151,10 @@ pub const OLD_SPELLINGS: &[(&str, FlowAction)] = &[
     ("catch", FlowAction::OperatorCatch),
 ];
 
+/// Every old scope spelling and the scope it is now: the Sprint→Phase
+/// rename, as a glob's first segment (`sprint *` is `phase.*`).
+pub const OLD_SCOPES: &[(&str, &str)] = &[("sprint", "phase")];
+
 /// Every old spelling of a current `source`, and the source it now is. The
 /// `kebab-case` and `sprint_*` spellings are the ones the closed
 /// [`FlowSource`] retired; `process` was the per-dispatch host sampler's,
@@ -186,6 +190,10 @@ pub enum ValueChange {
     /// A number (or an array of numbers) times this factor: a duration in a
     /// coarser or finer unit, now milliseconds.
     Scale(f64),
+    /// A number (or an array of numbers) divided by this divisor. Where the
+    /// current producer divides (`us as f64 / 1000.0`), dividing here gives
+    /// the same float, which multiplying by the reciprocal does not.
+    Divide(f64),
     /// An ISO `ts`-shaped string, now epoch milliseconds.
     IsoToEpochMs,
 }
@@ -243,14 +251,14 @@ pub const OLD_PAYLOAD_KEYS: &[PayloadRename] = &[
         within: Some("live"),
         old: "sampler_us",
         new: "sampler_ms",
-        change: ValueChange::Scale(0.001),
+        change: ValueChange::Divide(1_000.0),
     },
     PayloadRename {
         actions: &[FlowAction::DispatchComplete],
         within: Some("live"),
         old: "forward_us",
         new: "forward_ms",
-        change: ValueChange::Scale(0.001),
+        change: ValueChange::Divide(1_000.0),
     },
     PayloadRename {
         actions: &[FlowAction::MachineBatteryHealth],
@@ -302,24 +310,30 @@ fn rename_key(map: &mut serde_json::Map<String, Value>, rename: &PayloadRename) 
 
 fn convert(value: &Value, change: ValueChange) -> Option<Value> {
     match (change, value) {
-        (ValueChange::Scale(factor), Value::Array(items)) => {
-            items.iter().map(|v| scaled(v, factor)).collect::<Option<Vec<_>>>().map(Value::Array)
-        }
-        (ValueChange::Scale(factor), v) => scaled(v, factor),
         (ValueChange::IsoToEpochMs, Value::String(iso)) => {
             crate::parse_ts_utc(iso).map(|secs| Value::from(secs.saturating_mul(1_000)))
         }
         (ValueChange::IsoToEpochMs, _) => None,
+        (ValueChange::Scale(factor), v) => convert_numbers(v, &|n| n * factor),
+        (ValueChange::Divide(divisor), v) => convert_numbers(v, &|n| n / divisor),
     }
 }
 
-/// A number times `factor`: an integer when the product is whole, else a
+/// `f` applied to a number, or to every element of an array of numbers.
+fn convert_numbers(value: &Value, f: &dyn Fn(f64) -> f64) -> Option<Value> {
+    match value {
+        Value::Array(items) => items.iter().map(|v| converted(v, f)).collect::<Option<Vec<_>>>().map(Value::Array),
+        v => converted(v, f),
+    }
+}
+
+/// `f` applied to one number: an integer when the result is whole, else a
 /// float. `null` (an absent reading) stays `null`.
-fn scaled(value: &Value, factor: f64) -> Option<Value> {
+fn converted(value: &Value, f: &dyn Fn(f64) -> f64) -> Option<Value> {
     if value.is_null() {
         return Some(Value::Null);
     }
-    let product = value.as_f64()? * factor;
+    let product = f(value.as_f64()?);
     if product.fract() == 0.0 && product.abs() < 9.0e15 {
         Some(Value::from(product as i64))
     } else {

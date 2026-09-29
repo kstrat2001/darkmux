@@ -287,23 +287,24 @@ fn write_named(state: &IsolatedState, subdir: &str, id: &str, doc: &Value) {
     std::fs::write(dir.join(format!("{id}.json")), doc.to_string()).unwrap();
 }
 
-/// A hook rule written against a retired action spelling is refused by the
-/// preflight, naming where it is set and the spelling to write; a current
-/// spelling passes, and nothing is refused while hooks are off.
+/// A hook rule in a retired action spelling refuses the hooks sink, not the
+/// work: a dispatch-scope preflight passes with the stale rule present
+/// (`HOOK_RULE_NO_SCOPE`), while the sink named in its own doc refuses it.
 #[test]
-fn a_hook_rule_with_a_retired_action_spelling_is_refused() {
-    let rule = |action: &str| darkmux_types::config::HookRule {
-        r#match: Some(darkmux_types::config::HookMatch { action: Some(action.to_string()), ..Default::default() }),
-        ..Default::default()
-    };
+#[serial_test::serial]
+fn a_stale_hook_rule_refuses_the_sink_and_not_the_dispatch() {
+    let state = IsolatedState::new();
     // flow-action-guard:allow-start — an old spelling is this test's input
-    let rules = vec![rule("dispatch.tool"), rule("dispatch complete"), rule("step *")];
+    let config = json!({"hooks": {"enabled": true, "rules": [
+        {"match": {"action": "dispatch complete"}, "http": "http://127.0.0.1:8790/events"}
+    ]}});
     // flow-action-guard:allow-end
-    let refused = retired_hook_actions(true, &rules);
-    let lines: Vec<String> = refused.iter().map(ToString::to_string).collect();
-    assert_eq!(lines.len(), 2, "{lines:?}");
-    assert!(lines[0].contains("hooks.rules[1].match.action") && lines[0].contains("write `dispatch.complete`"), "{}", lines[0]);
-    assert!(lines[1].contains("hooks.rules[2].match.action") && lines[1].contains("write `step.*`"), "{}", lines[1]);
-    assert!(retired_hook_actions(false, &rules).is_empty(), "off: the rules are not loaded");
-    assert!(retired_hook_actions(true, &rules[..1]).is_empty(), "a current spelling passes");
+    let _config = darkmux_types::config_access::set_config_for_test(serde_json::from_value(config).unwrap());
+    let rules = darkmux_types::config_access::hooks_rules();
+    assert_eq!(rules.len(), 1, "the fixture must reach the resolver");
+    for scope in Scope::ALL {
+        assert_eq!(preflight(scope), Ok(()), "{scope:?}: a stale hook rule must not stop work");
+    }
+    let sink = darkmux_flow::hooks::HookSink::new(&rules, state.join("outbox"), std::sync::Arc::new(darkmux_flow::LocalFileSink));
+    assert!(sink.err().is_some_and(|e| e.to_string().contains("write `dispatch.complete`")), "the sink refuses, naming the spelling");
 }

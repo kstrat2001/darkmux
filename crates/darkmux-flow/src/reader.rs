@@ -431,6 +431,10 @@ mod tests {
         assert_eq!(rollup, json!({"period_ms": 60_000}));
         let complete = read(json!({"action": "dispatch.complete", "payload": {"live": {"sampler_us": 1500, "forward_us": 250}}}));
         assert_eq!(complete, json!({"live": {"sampler_ms": 1.5, "forward_ms": 0.25}}));
+        // The producer wrote `us as f64 / 1000.0`: a reader that multiplied by
+        // 0.001 would give 0.009000000000000001 for 9 us.
+        let exact = read(json!({"action": "dispatch.complete", "payload": {"live": {"sampler_us": 9, "forward_us": 3}}}));
+        assert_eq!(exact, json!({"live": {"sampler_ms": 0.009, "forward_ms": 0.003}}));
         let battery = read(json!({"action": "machine.battery_health", "payload": {
             "total_operating_time_hours": 2, "time_at_soc_hours": [0, 1, null]}}));
         assert_eq!(battery, json!({"total_operating_ms": 7_200_000, "time_at_soc_ms": [0, 3_600_000, null]}));

@@ -243,8 +243,11 @@ darkmux release.
   carry it.
 - **`dispatch.complete`'s and the envelope's `cumulative_turns` /
   `cumulative_compactions` are gone.** Every count on the record is this
-  invocation's own. **Migration:** a task's total across resumes is the sum
-  over its runs' `dispatch.complete` records.
+  invocation's own, and the whole-task count across resumes is no longer
+  reported (nothing read it). **Migration:** a resumed run's `turns` counts
+  only its own turns, and a hand-back resume continues the prior run's last
+  turn, so do not sum `turns` across a resume: that turn is counted in both
+  runs. Compaction counts do sum.
 - **One unit for time in payloads: durations are `*_ms`, instants are
   `*_at_ms` (epoch milliseconds).** Renamed, with the value converted:
   `budget.wait` `wait_seconds` is `wait_ms` and its ISO `resume_at` is
@@ -544,11 +547,18 @@ darkmux release.
   flow stream outside darkmux (a hook receiver, a script over the day files
   or Redis) must read the dotted spellings. A hook rule whose `match.action`
   names an old spelling, an exact one (`dispatch complete`) or a spaced glob
-  (`step *`), is refused: the hook sink does not load, a dispatch or mission
-  launch refuses at preflight, and `darkmux doctor` fails the rule
-  (`RETIRED SPELLING`), each naming the spelling to write (`dispatch.complete`,
-  `step.*`). Only the hook outbox, an archive of records already written, is
-  still read leniently.
+  (`step *`), is refused: the hook sink does not load (the run itself
+  continues without hooks, like any other bad hook rule) and `darkmux doctor`
+  fails the rule (`RETIRED SPELLING`), each naming the spelling to write
+  (`dispatch.complete`, `step.*`). A glob's dotted twin can match more than
+  the old spelling did (`dispatch.*` also matches every `dispatch.turn` and
+  `dispatch.tool` record); the refusal says so. A rule's outbox is keyed by a
+  hash of its `match`, so a rewritten rule starts a new outbox: records still
+  pending under the old spelling are not delivered (they stay in the outbox
+  directory as `<key>.outbox.jsonl`; delete the stale files). The key is not
+  derived to survive the rewrite because that would mean hashing the retired
+  spelling forever. Only the hook outbox, an archive of records already
+  written, is still read leniently.
 - **A whole run has its own bookends: `run.start` / `run.complete` /
   `run.error`** (FLOW 2.0.0, CLAUDE.md contract 8). `mission launch` and an
   ACP panel run used to bracket the whole run in `dispatch.start` /

@@ -137,7 +137,7 @@ fn warn_unmatchable_rules(rules: &[HookRule]) {
 }
 
 /// A spaced glob's dotted twin, only when the twin matches at least one
-/// action darkmux writes (`dispatchh *` and `sprint *` have none).
+/// action darkmux writes (`dispatchh *` has none).
 pub fn matching_dotted_twin(pattern: &str) -> Option<String> {
     dotted_twin(pattern).filter(|t| crate::FlowAction::KNOWN_WIRE.iter().any(|w| action_glob_matches(t, w)))
 }
@@ -167,8 +167,8 @@ pub fn retired_spelling_of(pattern: &str) -> Option<String> {
 
 /// A hook rule whose `match.action` is written in a spelling 4.0 retired.
 /// Hook rules are the operator's file, so it is refused, not read as the
-/// current spelling: the sink does not load ([`HookSink::new`]), a dispatch's
-/// preflight refuses, and `darkmux doctor` fails the rule.
+/// current spelling: the sink does not load ([`HookSink::new`], which logs and
+/// lets the run continue without hooks) and `darkmux doctor` fails the rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetiredRuleAction {
     pub index: usize,
@@ -179,17 +179,40 @@ pub struct RetiredRuleAction {
 }
 
 impl RetiredRuleAction {
+    /// The rule at `index` when its `configured` pattern is a retired spelling.
+    pub fn of(index: usize, configured: &str) -> Option<Self> {
+        Some(Self { index, configured: configured.to_string(), current: retired_spelling_of(configured)? })
+    }
+
     /// Where the pattern is set, as `darkmux config` names it.
     pub fn config_path(&self) -> String {
         format!("hooks.rules[{}].match.action", self.index)
     }
 
+    /// Set when the spelling to write is a glob: it matches more than the old
+    /// spelling did, so the operator is told rather than surprised.
+    pub fn widening_note(&self) -> Option<String> {
+        if !self.current.ends_with('*') {
+            return None;
+        }
+        let extra = if self.current.starts_with("dispatch.") {
+            " (`dispatch.*` also matches every `dispatch.turn` and `dispatch.tool` record)"
+        } else {
+            ""
+        };
+        Some(format!("the dotted glob matches more than the old spelling did{extra}"))
+    }
+
     /// The operator line: what is wrong and what to write.
     pub fn describe(&self) -> String {
-        format!(
+        let base = format!(
             "action `{}` is a spelling darkmux retired in 4.0; write `{}`",
             self.configured, self.current
-        )
+        );
+        match self.widening_note() {
+            Some(note) => format!("{base}; {note}"),
+            None => base,
+        }
     }
 }
 
@@ -198,16 +221,21 @@ pub fn retired_rule_actions(rules: &[HookRule]) -> Vec<RetiredRuleAction> {
     rules
         .iter()
         .enumerate()
-        .filter_map(|(index, r)| {
-            let configured = r.r#match.as_ref()?.action.as_deref()?;
-            Some(RetiredRuleAction { index, configured: configured.to_string(), current: retired_spelling_of(configured)? })
-        })
+        .filter_map(|(index, r)| RetiredRuleAction::of(index, r.r#match.as_ref()?.action.as_deref()?))
         .collect()
 }
 
-/// The dotted spelling of a spaced glob, when it has one.
-pub fn dotted_twin(pattern: &str) -> Option<String> {
-    (pattern.contains(' ') && pattern.contains('*')).then(|| pattern.replace(' ', "."))
+/// The dotted spelling of a spaced glob, when it has one (`sprint *` names
+/// `phase.*`: the scope it was renamed to).
+fn dotted_twin(pattern: &str) -> Option<String> {
+    if !(pattern.contains(' ') && pattern.contains('*')) {
+        return None;
+    }
+    let dotted = pattern.replace(' ', ".");
+    let renamed = crate::legacy::OLD_SCOPES.iter().find_map(|(old, now)| {
+        dotted.strip_prefix(old).filter(|rest| rest.starts_with('.')).map(|rest| format!("{now}{rest}"))
+    });
+    Some(renamed.unwrap_or(dotted))
 }
 
 /// True when `pattern` matches at least one action darkmux writes.
@@ -4635,6 +4663,7 @@ mod tests {
             ("sprint start", "phase.start"),
             ("step *", "step.*"),
             ("dispatch *", "dispatch.*"),
+            ("sprint *", "phase.*"),
         ];
         // flow-action-guard:allow-end
         for (old, current) in cases {
@@ -4651,6 +4680,8 @@ mod tests {
             };
             let err = err.to_string();
             assert!(err.contains(&format!("write `{current}`")) && err.contains("hooks.rules[0]"), "{old}: {err}");
+            assert_eq!(err.contains("matches more than the old spelling did"), old.ends_with('*'), "{old}: {err}");
+            assert_eq!(err.contains("`dispatch.turn`"), old == "dispatch *", "{old}: {err}");
         }
     }
 
@@ -4660,10 +4691,10 @@ mod tests {
     #[test]
     fn a_current_or_merely_mistyped_pattern_is_not_a_retired_spelling() {
         let rules: Vec<HookRule> =
-            ["dispatch.tool", "step.*", "*", "dispatchh.*", "dispatchh *", "sprint *"].map(rule_with_action).into();
+            ["dispatch.tool", "step.*", "*", "dispatchh.*", "dispatchh *"].map(rule_with_action).into();
         assert!(retired_rule_actions(&rules).is_empty(), "{:?}", retired_rule_actions(&rules));
         let bad: Vec<(usize, &str)> = unmatchable_rule_patterns(&rules);
-        assert_eq!(bad, vec![(3, "dispatchh.*"), (4, "dispatchh *"), (5, "sprint *")]);
+        assert_eq!(bad, vec![(3, "dispatchh.*"), (4, "dispatchh *")]);
         let tmp = tempfile::TempDir::new().unwrap();
         assert!(HookSink::new(&rules[..3], tmp.path().to_path_buf(), Arc::new(NullSink)).is_ok());
     }

@@ -336,14 +336,16 @@ fn cannot_match_flag(rule_match: &HookMatch) -> Option<RuleFlag> {
 }
 
 /// A rule written against a pre-4.0 spelling is refused: `HookSink::new`
-/// does not load the sink, and a dispatch's preflight refuses. Hook rules
+/// does not load the sink (the run continues without hooks). Hook rules
 /// are the operator's file, so it is named here to be fixed, not read as
 /// the current spelling.
 fn retired_spelling_flag(rule_match: &HookMatch) -> Option<RuleFlag> {
     let configured = rule_match.action.as_deref()?;
-    let current = darkmux_flow::hooks::retired_spelling_of(configured)?;
+    let retired = darkmux_flow::hooks::RetiredRuleAction::of(0, configured)?;
+    let note = retired.widening_note().map(|n| format!("; {n}")).unwrap_or_default();
     Some(RuleFlag::fail(format!(
-        "RETIRED SPELLING — action=\"{configured}\" is a spelling darkmux retired in 4.0; write \"{current}\""
+        "RETIRED SPELLING — action=\"{configured}\" is a spelling darkmux retired in 4.0; write \"{}\"{note}",
+        retired.current
     )))
 }
 
@@ -791,7 +793,7 @@ mod tests {
     #[test]
     fn hooks_check_fails_a_rule_written_against_a_retired_spelling() {
         // flow-action-guard:allow-start — an old spelling is this test's input
-        let cases = [("dispatch complete", FlowAction::DispatchComplete.as_str()), ("dispatch *", "dispatch.*")];
+        let cases = [("dispatch complete", FlowAction::DispatchComplete.as_str()), ("dispatch *", "dispatch.*"), ("sprint *", "phase.*")];
         // flow-action-guard:allow-end
         for (old, current) in cases {
             let rule = rule_row(old);
@@ -799,6 +801,7 @@ mod tests {
             assert!(rule.message.contains("RETIRED SPELLING"), "{old}: {}", rule.message);
             assert!(rule.message.contains(&format!("write \"{current}\"")), "names the current one: {}", rule.message);
             assert!(!rule.message.contains("CANNOT MATCH"), "{old}: {}", rule.message);
+            assert_eq!(rule.message.contains("`dispatch.turn`"), old == "dispatch *", "{old}: {}", rule.message);
         }
     }
 

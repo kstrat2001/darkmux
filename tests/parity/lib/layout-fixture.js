@@ -88,7 +88,7 @@ const budgetWait = (b, d, endpoint, secs) =>
     "budget.wait",
     {
       scope: "endpoint", endpoint_id: endpoint, policy: "wait", metric: "tokens", spent: 2000, limit: 2000, period: "1d",
-      wait_seconds: secs, resume_at: new Date(msOf(d, "12:00:08") + secs * 1000).toISOString().replace(".000Z", "Z"), pid: 1,
+      wait_ms: secs * 1000, resume_at_ms: msOf(d, "12:00:08") + secs * 1000, pid: 1,
       message: `darkmux: endpoint \`${endpoint}\` has reached its budget`,
     },
     { category: "telemetry", source: "budget", level: "warn", model: "gpt-layout" },
@@ -306,7 +306,7 @@ const STATES = [
     recs: (b, d) => [
       ...b.prefix(d),
       b.opener(d),
-      { ts: at(d, "12:00:08"), action: "utility.start", category: "telemetry", source: "utility", handle: "radio-router", ...MACHINE, payload: { job: "radio_routing", model: "darkmux:util-layout", stall_after_seconds: 30 } },
+      { ts: at(d, "12:00:08"), action: "utility.start", category: "telemetry", source: "utility", handle: "radio-router", ...MACHINE, payload: { job: "radio_routing", model: "darkmux:util-layout", stall_after_ms: 30_000 } },
     ],
   },
   {
@@ -316,7 +316,7 @@ const STATES = [
     recs: (b, d) => [
       ...b.prefix(d),
       b.opener(d),
-      { ts: at(d, "12:00:08"), action: "utility.start", category: "telemetry", source: "utility", handle: "dream-role", ...MACHINE, payload: { job: "dream_job", job_id: "dream-1", model: "darkmux:util-layout", stall_after_seconds: 30 } },
+      { ts: at(d, "12:00:08"), action: "utility.start", category: "telemetry", source: "utility", handle: "dream-role", ...MACHINE, payload: { job: "dream_job", job_id: "dream-1", model: "darkmux:util-layout", stall_after_ms: 30_000 } },
     ],
   },
   {
@@ -326,7 +326,7 @@ const STATES = [
     recs: (b, d) => [
       ...b.prefix(d),
       b.rec(at(d, "12:00:08"), "dispatch.rest", { ms: 120000 }),
-      { ts: at(d, "12:00:08"), action: "utility.start", category: "telemetry", source: "utility", handle: "radio-router", ...MACHINE, payload: { job: "radio_routing", job_id: "route-1", model: "darkmux:util-layout", stall_after_seconds: 30 } },
+      { ts: at(d, "12:00:08"), action: "utility.start", category: "telemetry", source: "utility", handle: "radio-router", ...MACHINE, payload: { job: "radio_routing", job_id: "route-1", model: "darkmux:util-layout", stall_after_ms: 30_000 } },
       tick(d, "12:00:45"),
     ],
   },
