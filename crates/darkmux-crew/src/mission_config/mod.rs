@@ -208,8 +208,8 @@ use std::collections::{BTreeMap, BTreeSet};
 /// `Abandoned`, eagerly, the moment an ancestor errors, so a task several
 /// hops downstream of the failure still sees a resolved terminal status
 /// this same pass rather than staying wedged `Planned`. See DESIGN.md's
-/// "Mission configs: a task's `run_on` decides which of its dependencies'
-/// failures it survives" for the full cascade design.
+/// "A task's `run_on` decides which of its dependencies' failures it
+/// survives" (under "Mission configs") for the full cascade design.
 ///
 /// Bumped to **"3.5"** (#2310 P4f) — additive: [`TaskConfig`] gained the
 /// optional `excludes` field — document-wide task ids that must not be

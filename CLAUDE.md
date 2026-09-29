@@ -133,7 +133,9 @@ lane. Speed is an ergonomics fix; trust is a separate, open problem.
 **And "CI is the gate" has one real hole**: `plugins/darkmux-bundler-rust` is
 workspace-excluded, so `t-all` and the workspace suite never run its tests. They
 run in exactly one place, the PR-diff mutation job, and only on a pull request
-whose diff touches the plugin (or `runtime/`). A change elsewhere that breaks it
+whose diff changes a mutable-looking line in the plugin's `*.rs` files (the
+`bundler_changed_lines` count in `quality.yml`). A `runtime/`-only PR, or a
+change to the plugin's `Cargo.toml` alone, runs none of them. A change elsewhere that breaks it
 reaches `main` unseen. Deferring to CI is right everywhere else; there, it is
 deferring to a check that mostly skips.
 
@@ -316,13 +318,15 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    (#1974). The containment ladder is **mission > phase > task > step > role execution**:
 
    - **run** — the UMBRELLA, never a grain: *a top-level unit of work the operator started*.
-     Exactly three kinds (`RunKind`): `mission`, `dispatch`, `lab`. The runs board lists runs;
+     Exactly three kinds (the runs-board `RunKind`): `mission`, `dispatch`, `lab`. The runs board lists runs;
      drilling into one opens that kind's own view. `darkmux run list` serves the same union.
    - **dispatch** — TOP-LEVEL ONLY: the verb `darkmux dispatch <role>`, and the `RunKind` it
      produces, which means *a run consisting of exactly one role execution*. It is named for
-     its CONTENT, not for the verb. Note `RunKind::Dispatch` is derived FROM a mission by
-     shape (`classify_mission`) — a crew-of-one graph — so it is a shape label on a mission,
-     not a third ontological peer of `Mission`.
+     its CONTENT, not for the verb. Note `RunKind::Dispatch` (the runs-board type, `darkmux_serve::runs::RunKind`) is
+     decided FROM a mission by `classify_mission`: a spec with `config_id == "dispatch"` is
+     Dispatch, any other spec is Mission, and only a mission with no spec falls back to shape
+     (a crew-of-one graph). So it is a label on a mission, not a third ontological peer of
+     `Mission`.
    - **role execution** — the INNER unit: *one role, running until it stops*. Many turns, not
      one model call (`max_turns`, `turn_seq`). This is deliberately named for the ROLE, not
      the model, because the model is DERIVED, not declared: `select_model(role, profile)`
@@ -372,7 +376,7 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
      the primary's metrics. They run lean (contract 2's amendment): a usage record and
      `utility.start`, with no bookends, session or run, so "sub-execution" means "attributed to
      its own role and model", not "has its own bookend pair". What counts as utility has
-     ONE definition, `darkmux_crew::usage::call_purpose` (compaction and the radio router —
+     ONE definition, `darkmux_crew::usage::utility_job` (`call_purpose` derives from it; compaction and the radio router ,
      darkmux's own jobs, run on the machine's one utility model, #2914; the scribe and
      mission-compiler roles this entry used to list were retired in #2912/#2913), and every
      consumer that splits work from utility reads it rather than keeping its own list. Naming the unit for the role is what lets attribution compose: a sub-execution is
@@ -490,7 +494,7 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    expensive while it is still moving. Do not reopen this as a naming question without new
    information about the semantics.
 
-   Conformance: every detail hash route is named for the `RunKind` it opens.
+   Conformance: every detail hash route is named for the runs-board `RunKind` it opens.
 
 9. **Enum-valued settings** — an unregistered value in an enum-typed setting is bad config
    (#2947). It is never resolved to a fallback, in either direction. Every entry point that COULD
@@ -554,7 +558,7 @@ darkmux's canonical config surface is **`~/.darkmux/config.json`** (#661), writt
   "audit":   { "enabled": false, "dir": "~/.darkmux/audit" },
   "runtime": { "inactivity_timeout_seconds": 600, "strict_selection": false, "feedback_injection": true, "check_updates": true },
   "remote":  { "max_tokens_per_step": null, "step_budget_policy": null, "concurrent_cap": 1 },
-  "serve":   { "token_keychain": false, "read_auth": false },
+  "serve":   { "port": 8765, "bind": "127.0.0.1", "token_keychain": false, "read_auth": false },
   "power":   { "min_battery_pct": 50, "refuse_start_below_min": true, "pause_running_below_min": true },
   "fleet":   { "mode": "standalone" }
 }
@@ -975,7 +979,7 @@ The recursive shape is the point: **darkmux uses local-AI to manage your local-A
 
 Two role families compose to make this work, and the distinction matters when picking models or proposing additions to a profile:
 
-- **Utility agents** — small model (4B-class), bounded I/O, high throughput, structured output. darkmux's own jobs on the machine's one utility model (#2914): today compaction and the radio router, and the one definition of which calls those are is `darkmux_crew::usage::call_purpose` (the scribe and mission-compiler roles that used to sit here were retired in #2912/#2913). Each capability is asymmetric to its compute cost — one small model fills every utility job. darkmux dispatches utility agents internally for its own operations; the operator rarely invokes them directly. Defined by: bounded inputs + structured outputs + low per-call failure cost + throughput matters + bounded reasoning rather than strategy.
+- **Utility agents**, small model (4B-class), bounded I/O, high throughput, structured output. darkmux's own jobs on the machine's one utility model (#2914): today compaction and the radio router, and the one definition of which calls those are is `darkmux_crew::usage::utility_job` (`call_purpose` derives from it) (the scribe and mission-compiler roles that used to sit here were retired in #2912/#2913). Each capability is asymmetric to its compute cost, one small model fills every utility job. darkmux dispatches utility agents internally for its own operations; the operator rarely invokes them directly. Defined by: bounded inputs + structured outputs + low per-call failure cost + throughput matters + bounded reasoning rather than strategy.
 - **Specialist agents** — larger model (35B-class+), judgment-dependent, lower throughput, free-form output. Coder, code-reviewer, analyst. Operator's call: which specialist for which phase, with what tilt. darkmux makes them addressable via `dispatch <role>` but doesn't substitute its judgment for the operator's.
 
 CLI primitives stay small and composable; the local model's built-in jobs are compaction (inside every role execution) and radio routing (`darkmux radio`), both utility-agent dispatches darkmux makes on its own behalf. Structuring work the operator used to get from built-in verbs (proposing a mission config, drafting a notebook entry) is the frontier orchestrator's job now, through bundled skills such as `darkmux-lab-notebook` (#2912/#2913). Both surfaces are part of the same project — the dual posture (small primitives + AI-first internals) is deliberate.

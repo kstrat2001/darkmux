@@ -1013,9 +1013,9 @@ fn plain_finding_comment_body(window: &FindingWindow, rule: Option<&str>) -> Str
     }
 }
 
-/// DESIGN.md "rules run, hunks covered / total, findings by delivery form,
-/// refused count, and what the review did not attempt. Never reads as
-/// complete."
+/// The scope line states rules run, hunks covered / total, findings by
+/// delivery form, refused count, and what the review did not attempt, so it
+/// never reads as complete (DESIGN.md, "The honest limit").
 fn scope_line(scope: &DeliverScope, findings_considered: usize, unresolved_rules: &BTreeSet<String>) -> String {
     // (#2310 fix-loop E2) "N of M rules reviewed" — loop D made the VALUES
     // honest (a rule with no completed unit no longer counts as run); the
@@ -1195,7 +1195,7 @@ fn unverified_scope_suffix(unverified: &[(String, String)]) -> Option<String> {
 
 /// (#2310 P4b review, M-B) A gate-passed mod's change becomes either
 /// inline GitHub suggestion(s) or a fenced block in the body — NEVER a
-/// suggestion for opaque text. DESIGN.md: "darkmux never opens a kit".
+/// suggestion for opaque text. A mod is opaque to darkmux (DESIGN.md, "Two records, both opaque").
 /// Pasting opaque model text verbatim into a ```suggestion block was the
 /// bug this function fixes: the common shape is itself a unified diff, so
 /// "Commit suggestion" would have replaced the anchored line with raw
