@@ -5,11 +5,11 @@
 //! (`src/radio_cli.rs`, this packet) and the ACP no-slash channel
 //! (Packet B). Both call INTO this module; neither owns any piece of it.
 //! This module in turn calls INTO `crate::acp_panel` (catalog enumeration,
-//! `RoutePlan`, `run_ephemeral`) rather than duplicating that logic — the
-//! same single-derivation principle the module doc there names ("the shared
-//! facts script"): there is exactly one place that decides which mission
-//! configs are advertised, and exactly one place that decides how an
-//! advertised command actually runs.
+//! `plan_launch`, `run_ephemeral`) rather than duplicating that logic:
+//! there is exactly one place that decides which mission configs are
+//! launchable, and exactly one place that decides how a launch runs. A
+//! routed command is a config id, and executing it is `mission launch <id>`
+//! (the panel's `/mission launch <id>`).
 //!
 //! # The two-seat receiver architecture (issue #1698, "naming ratified")
 //!
@@ -75,65 +75,56 @@ use serde::Deserialize;
 /// process starting and the router dispatch actually running).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatalogEntry {
-    /// The REGISTRY-RESOLVABLE id — see `crate::acp_panel::PanelCommand::id`'s
+    /// The REGISTRY-RESOLVABLE id — see `crate::acp_panel::LaunchableConfig::id`'s
     /// own doc for why this is never the document body's own `id` field.
     pub id: String,
-    /// The model-grounding text for THIS catalog — the config's TOP-LEVEL
-    /// `description` field — the SAME text `crate::acp_panel::
-    /// list_panel_commands` advertises to an editor's command palette
-    /// (`PanelConfig::description`, falling back to `MissionConfig.name`).
+    /// The model-grounding text for THIS catalog: the config's one-line
+    /// summary (`crate::acp_panel::config_summary`: the first sentence of its
+    /// `description`, else its `name`), the same line `/mission list` prints.
     ///
-    /// **Deliberately NOT `MissionConfig.description`** (the config's
-    /// TOP-LEVEL field) — an earlier draft of this module preferred that
-    /// field on the theory that a routing model benefits from more
-    /// substantive provenance text than a two-word palette label. Reviewed
-    /// against the actual advertised registry and reverted: the built-in
-    /// `review` config's top-level `description` is ~2KB of engineering
-    /// provenance (crate paths, issue numbers, `StepKind` names) — exactly
-    /// the darkmux-internal-jargon shape `acp_panel.rs`'s own `PanelCommand`
-    /// doc already calls out as "unsuitable to render... in an editor's
-    /// slash-command list", and CLAUDE.md's "Model-facing prompt
-    /// construction" audit question ("what does this read as to a
-    /// fresh-context model with no darkmux history?") answers the same way
-    /// for a routing model. `panel.description` is short, human-written FOR
-    /// exactly this kind of at-a-glance classification, and reusing it here
-    /// keeps [`compile_catalog`] a pure single-derivation `map`.
+    /// **Deliberately NOT the whole `MissionConfig.description`**: the
+    /// built-in `review` config's is ~2KB of engineering provenance (crate
+    /// paths, issue numbers, `StepKind` names), and CLAUDE.md's "Model-facing
+    /// prompt construction" audit question ("what does this read as to a
+    /// fresh-context model with no darkmux history?") answers badly for it.
+    /// A config's description therefore leads with one plain sentence saying
+    /// what it does for the user.
     pub description: String,
-    /// `panel.hint` — the same optional input hint the editor shows before
-    /// the user has typed anything after the command name.
+    /// An input hint shown to the router: `(no arguments)` for a command that
+    /// takes no text after its id, none otherwise.
     pub hint: Option<String>,
-    /// (#2050) `panel.accepts_args`, resolved (unset means `true`). When
-    /// `false`, [`validate_router_output`] DROPS whatever `args` the
-    /// routing seat carried over rather than forwarding them.
+    /// Whether the command takes text after its id
+    /// (`mission_config::takes_panel_args`: the config reads
+    /// `__panel_args__`). When `false`, [`validate_router_output`] DROPS
+    /// whatever `args` the routing seat carried over rather than forwarding
+    /// them.
     ///
     /// The seat is a 4B classifier reading one line of description text,
-    /// and it copies trailing words by default — measured live, `review my
+    /// and it copies trailing words by default: measured live, `review my
     /// working tree diff` routed to `review` carrying `"my working tree
-    /// diff"` as its argument. `review` declares no `__panel_args__`
-    /// reader at all, so those words are forwarded as `--param args=<raw>`
-    /// to a config with nothing to receive them: inert today (see
-    /// `radio_cli::spawn_mission_launch`'s own "args honesty note"), and
-    /// wrong the moment a config does declare one. Enforcing the
-    /// declaration here, rather than only instructing the model, is what
-    /// makes it a guarantee instead of a request: the model is free to
-    /// keep getting this wrong and the command still runs correctly.
+    /// diff"` as its argument, to a config with nothing to receive it.
+    /// Enforcing the declaration here, rather than only instructing the
+    /// model, is what makes it a guarantee instead of a request: the model
+    /// is free to keep getting this wrong and the command still runs
+    /// correctly.
     pub accepts_args: bool,
 }
 
-/// Compile the model-facing catalog from the SAME merged, panel-blocked
-/// enumeration `crate::acp_panel::list_panel_commands` already produces
-/// (single derivation of "what's advertised" — see this module's own doc).
-/// A pure `map`: no second registry load, no divergent filter logic.
-/// Deterministic ordering: `list_panel_commands` sorts by id, and this
-/// function's `map` preserves that order.
+/// The hint the router sees for a command that takes no text after its id.
+const NO_ARGUMENTS_HINT: &str = "(no arguments)";
+
+/// Compile the model-facing catalog from `crate::acp_panel::list_launchable`,
+/// the SAME enumeration `/mission list` prints (single derivation of "what
+/// can be launched"). A pure `map`: no second registry load, no divergent
+/// filter. `list_launchable` sorts by id, and this preserves that order.
 pub fn compile_catalog() -> Vec<CatalogEntry> {
-    crate::acp_panel::list_panel_commands()
+    crate::acp_panel::list_launchable()
         .into_iter()
-        .map(|cmd| CatalogEntry {
-            id: cmd.id,
-            description: cmd.description,
-            hint: cmd.hint,
-            accepts_args: cmd.accepts_args,
+        .map(|config| CatalogEntry {
+            id: config.id,
+            description: config.summary,
+            hint: (!config.accepts_args).then(|| NO_ARGUMENTS_HINT.to_string()),
+            accepts_args: config.accepts_args,
         })
         .collect()
 }
@@ -146,7 +137,7 @@ pub enum RouteDecision {
     /// `command` is guaranteed to be one of `catalog`'s own `id` strings,
     /// copied from the CATALOG entry (never the model's raw text) after a
     /// case-insensitive match — see [`validate_router_output`]'s doc for
-    /// why this mirrors `crate::acp_panel::route_command`'s own rule.
+    /// why this matches config ids case-insensitively.
     Route { command: String, args: String },
     /// A short, model- or validator-supplied reason. Never blank —
     /// [`validate_router_output`] and [`route`] always supply one.
@@ -480,33 +471,28 @@ fn validate_router_output(raw: &str, catalog: &[CatalogEntry]) -> RouteDecision 
             RouteDecision::Refuse { reason }
         }
         RawRouterOutput::Route { command, args } => {
-            // (wall 2) Case-insensitive match against the CATALOG, mirroring
-            // `crate::acp_panel::route_command`'s own rule — the resolved
-            // `command` is the CATALOG entry's own (correctly-cased) id,
+            // (wall 2) Case-insensitive match against the CATALOG — the
+            // resolved `command` is the CATALOG entry's own (correctly-cased) id,
             // never the model's raw text, so a model that echoes back a
             // differently-cased id still resolves correctly while an
             // out-of-catalog id still refuses.
             match catalog.iter().find(|c| c.id.eq_ignore_ascii_case(&command)) {
-                // (#2050) A command that declares `panel.accepts_args:
-                // false` receives NO arguments, whatever the seat carried
-                // over. Same posture as wall 2 one field across: the
-                // model's claim is checked against the catalog rather
+                // (#2050) A command that takes no text after its id
+                // (`accepts_args: false`) receives NO arguments, whatever the
+                // seat carried over. Same posture as wall 2 one field across:
+                // the model's claim is checked against the catalog rather
                 // than trusted, here for `args` as there for `command`.
                 //
-                // **Silently, and deliberately — unlike the direct slash
-                // path** (`acp_panel::enforce_accepts_args`, which tells
-                // the operator their text was dropped). The asymmetry is
-                // real and was raised in review; the reason it stands is
-                // that these `args` are not text the operator typed. They
-                // are the ROUTING SEAT'S extraction from a free-text
-                // message, and the operator's own message is neither
-                // discarded nor hidden — it is what produced the route,
-                // and the caller has already echoed "routing to /<cmd> —
-                // from your text". A notice here would report the loss of
-                // something the operator never wrote and cannot see, which
-                // is noise rather than provenance. On the slash path the
-                // dropped text IS the operator's, verbatim, which is why
-                // that one speaks up.
+                // **Silently, and deliberately: unlike `/mission launch
+                // <id> text`**, which refuses text a config cannot take
+                // (`acp_panel::map_launch_args`). These `args` are not text
+                // the operator typed. They are the ROUTING SEAT'S extraction
+                // from a free-text message, and the operator's own message is
+                // neither discarded nor hidden: it is what produced the route,
+                // and the caller has already echoed "routing to /mission
+                // launch <id> — from your text". A notice here would report
+                // the loss of something the operator never wrote and cannot
+                // see, which is noise rather than provenance.
                 Some(entry) if !entry.accepts_args => RouteDecision::Route {
                     command: entry.id.clone(),
                     args: String::new(),
@@ -644,14 +630,14 @@ mod tests {
             id: id.to_string(),
             description: description.to_string(),
             hint: hint.map(str::to_string),
-            // The unset-`panel.accepts_args` resolution (#2050) — what
+            // An entry whose config reads `__panel_args__` (#2050) — what
             // every config authored before that field existed compiles to.
             accepts_args: true,
         }
     }
 
     /// (#2050) A catalog entry for a command that declares
-    /// `panel.accepts_args: false` — the built-in `review`'s own shape.
+    /// `accepts_args: false` — the built-in `review`'s own shape.
     fn entry_taking_no_args(id: &str, description: &str, hint: Option<&str>) -> CatalogEntry {
         CatalogEntry { accepts_args: false, ..entry(id, description, hint) }
     }
@@ -782,7 +768,7 @@ mod tests {
         );
     }
 
-    // ── (#2050) `panel.accepts_args: false` is enforced, not requested ───
+    // ── (#2050) `accepts_args: false` is enforced, not requested ───
 
     #[test]
     fn validate_router_output_drops_args_for_a_command_that_takes_none() {
@@ -809,13 +795,13 @@ mod tests {
         assert_eq!(
             validate_router_output(raw, &catalog),
             RouteDecision::Route { command: "pr-view".to_string(), args: "482".to_string() },
-            "an unset `panel.accepts_args` still forwards the seat's argument verbatim"
+            "an `accepts_args` still forwards the seat's argument verbatim"
         );
     }
 
     #[test]
     fn validate_router_output_valid_route_case_insensitive_resolves_to_catalog_case() {
-        // Mirrors `crate::acp_panel::route_command`'s own case-insensitive
+        // Config ids match case-insensitively:
         // rule — the resolved command is the CATALOG's own casing, never
         // the model's raw text.
         let catalog = vec![entry("Pr-View", "View a PR.", None)];
@@ -1130,9 +1116,12 @@ mod tests {
         }
     }
 
+    /// Every config the registry can load is in the catalog, sorted by id,
+    /// described by the first sentence of its `description`, and carrying the
+    /// no-arguments hint exactly when it reads no `__panel_args__` task.
     #[test]
     #[serial_test::serial]
-    fn compile_catalog_advertises_panel_blocked_configs_sorted_with_the_panel_description() {
+    fn compile_catalog_lists_every_launchable_config_sorted_with_its_summary_sentence() {
         let tmp = tempfile::TempDir::new().unwrap();
         let prev = std::env::var("DARKMUX_HOME").ok();
         // SAFETY: this test is #[serial_test::serial].
@@ -1140,18 +1129,15 @@ mod tests {
 
         let dir = tmp.path().join("mission-configs");
         std::fs::create_dir_all(&dir).unwrap();
-        // Two panel-blocked configs (radio-advertised). Each carries a LONG
-        // top-level `description` (mimicking `review.json`'s real shape —
-        // engineering provenance, not routing text) to prove the catalog
-        // reads `panel.description`, never the top-level field.
         std::fs::write(
             dir.join("zzz-last.json"),
             serde_json::to_string(&serde_json::json!({
                 "id": "zzz-last",
                 "name": "ZZZ Last",
-                "description": "Long top-level engineering provenance text, never read by the router.",
-                "panel": {"description": "Short palette label", "hint": "some hint"},
-                "phases": []
+                "description": "Does the last thing. Then a long provenance paragraph the router must never read.",
+                "phases": [{"id": "p", "tasks": [
+                    {"id": "t", "reads": ["__panel_args__"], "steps": [{"id": "s", "kind": "procedural.noop"}]}
+                ]}]
             }))
             .unwrap(),
         )
@@ -1161,50 +1147,27 @@ mod tests {
             serde_json::to_string(&serde_json::json!({
                 "id": "aaa-first",
                 "name": "AAA First",
-                "description": "Another long top-level description, also never read by the router.",
-                "panel": {"description": "Another short label"},
-                "phases": []
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        // ... and one WITHOUT a panel block — must not be advertised.
-        std::fs::write(
-            dir.join("not-advertised.json"),
-            serde_json::to_string(&serde_json::json!({
-                "id": "not-advertised",
-                "name": "Not Advertised",
-                "description": "This config carries no panel block.",
+                "description": "Does the first thing. More provenance.",
                 "phases": []
             }))
             .unwrap(),
         )
         .unwrap();
 
-        // The built-in `review` config also declares a `panel` block (see
-        // `templates/builtin/mission-configs/review.json`), so it's ALWAYS
-        // merged in alongside the two user-tier fixtures above — this test
-        // asserts the fixtures' own ordering/content/exclusion rather than
-        // the full catalog contents, so it doesn't drift if a future
-        // built-in also opts into the panel.
         let catalog = compile_catalog();
-        assert!(
-            !catalog.iter().any(|c| c.id == "not-advertised"),
-            "a config without a `panel` block must never be advertised: {catalog:?}"
-        );
         let ids: Vec<&str> = catalog.iter().map(|c| c.id.as_str()).collect();
         assert!(ids.is_sorted(), "catalog must be id-sorted: {ids:?}");
-        let aaa = catalog.iter().find(|c| c.id == "aaa-first").expect("aaa-first must be advertised");
-        assert_eq!(aaa.description, "Another short label", "must read panel.description, not the top-level field");
-        assert_eq!(aaa.hint, None);
-        let zzz = catalog.iter().find(|c| c.id == "zzz-last").expect("zzz-last must be advertised");
-        assert_eq!(zzz.description, "Short palette label", "must read panel.description, not the top-level field");
-        assert_eq!(zzz.hint.as_deref(), Some("some hint"));
-        // `aaa-first` sorts before `zzz-last` (both are also confirmed
-        // present above); the built-in `review` sorts between them.
-        let aaa_pos = ids.iter().position(|id| *id == "aaa-first").unwrap();
-        let zzz_pos = ids.iter().position(|id| *id == "zzz-last").unwrap();
-        assert!(aaa_pos < zzz_pos, "aaa-first must sort before zzz-last: {ids:?}");
+        for builtin in ["review", "machine-status"] {
+            assert!(ids.contains(&builtin), "the built-in `{builtin}` must be launchable: {ids:?}");
+        }
+        let aaa = catalog.iter().find(|c| c.id == "aaa-first").expect("aaa-first must be listed");
+        assert_eq!(aaa.description, "Does the first thing.");
+        assert_eq!(aaa.hint.as_deref(), Some("(no arguments)"));
+        assert!(!aaa.accepts_args);
+        let zzz = catalog.iter().find(|c| c.id == "zzz-last").expect("zzz-last must be listed");
+        assert_eq!(zzz.description, "Does the last thing.");
+        assert_eq!(zzz.hint, None, "a config that reads `__panel_args__` takes text");
+        assert!(zzz.accepts_args);
 
         // SAFETY: this test is #[serial_test::serial].
         unsafe {
@@ -1217,11 +1180,10 @@ mod tests {
 
     /// (#2918) "Which models are loaded?" was refused because nothing in
     /// the catalog answered it: `darkmux machine status` does, but it was
-    /// not an advertised command. The built-in `machine-status` config
-    /// (`templates/builtin/mission-configs/machine-status.json`) is merged
-    /// into every catalog the same way `review` is — through its `panel`
-    /// block, never a special case in the router prompt — so this holds
-    /// with NO user-tier configs at all.
+    /// not a catalog entry. The built-in `machine-status` config
+    /// (`templates/builtin/mission-configs/machine-status.json`) is in every
+    /// catalog like any other launchable config, never a special case in the
+    /// router prompt, so this holds with NO user-tier configs at all.
     #[test]
     #[serial_test::serial]
     fn compile_catalog_advertises_the_built_in_machine_status_command() {
@@ -1237,7 +1199,7 @@ mod tests {
             .unwrap_or_else(|| panic!("the built-in machine-status command must be advertised (#2918): {catalog:?}"));
         assert!(
             entry.description.to_ascii_lowercase().contains("loaded"),
-            "the router reads the panel description, which must name the question it answers: {}",
+            "the router reads the config summary, which must name the question it answers: {}",
             entry.description
         );
         assert!(!entry.accepts_args, "`machine status` takes no arguments");
@@ -1253,7 +1215,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn compile_catalog_falls_back_to_the_configs_name_when_panel_description_is_absent() {
+    fn compile_catalog_falls_back_to_the_configs_name_when_it_has_no_description() {
         let tmp = tempfile::TempDir::new().unwrap();
         let prev = std::env::var("DARKMUX_HOME").ok();
         // SAFETY: this test is #[serial_test::serial].
@@ -1262,27 +1224,14 @@ mod tests {
         let dir = tmp.path().join("mission-configs");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
-            dir.join("no-panel-desc.json"),
-            serde_json::to_string(&serde_json::json!({
-                "id": "no-panel-desc",
-                "name": "No Panel Desc",
-                "description": "A long top-level description that must NOT be read here either.",
-                "panel": {},
-                "phases": []
-            }))
-            .unwrap(),
+            dir.join("no-desc.json"),
+            serde_json::to_string(&serde_json::json!({"id": "no-desc", "name": "No Desc", "phases": []})).unwrap(),
         )
         .unwrap();
 
-        // The built-in `review` config is also always merged in (see the
-        // sibling test's comment) — find this fixture's own entry rather
-        // than asserting the catalog's total length. `PanelConfig::
-        // description` absent falls back to `MissionConfig.name`
-        // (`crate::acp_panel::list_panel_commands`'s own rule) — never to
-        // the top-level `description`.
         let catalog = compile_catalog();
-        let found = catalog.iter().find(|c| c.id == "no-panel-desc").expect("no-panel-desc must be advertised");
-        assert_eq!(found.description, "No Panel Desc");
+        let found = catalog.iter().find(|c| c.id == "no-desc").expect("no-desc must be listed");
+        assert_eq!(found.description, "No Desc");
 
         // SAFETY: this test is #[serial_test::serial].
         unsafe {

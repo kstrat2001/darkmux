@@ -55,8 +55,8 @@ pub fn run(text: &str, dry_run: bool) -> Result<i32> {
     let catalog = radio::compile_catalog();
     if catalog.is_empty() {
         println!(
-            "radio: no commands are currently advertised — no mission config in the merged \
-             registry (built-ins + ~/.darkmux/mission-configs/) declares a `panel` block."
+            "radio: no mission config is launchable — the merged registry (built-ins + \
+             ~/.darkmux/mission-configs/) is empty."
         );
         return Ok(0);
     }
@@ -135,7 +135,7 @@ pub fn run(text: &str, dry_run: bool) -> Result<i32> {
             Ok(1)
         }
         RouteDecision::Route { command, args } => {
-            println!("radio: routing to /{command} — from your text");
+            println!("radio: routing to `mission launch {command}` — from your text");
             if dry_run {
                 if args.trim().is_empty() {
                     println!("radio: --dry-run — would invoke `{command}` with no arguments");
@@ -149,41 +149,35 @@ pub fn run(text: &str, dry_run: bool) -> Result<i32> {
     }
 }
 
-/// A human-readable fallback list, mirroring
-/// `crate::acp_panel::not_a_command_message`'s render shape (a comma-joined
-/// backtick-slash list) — not a direct call into that function, since it
-/// takes `&[PanelCommand]`, not `&[CatalogEntry]` (two different catalog
-/// shapes for two different consumers — see `radio.rs`'s doc on why
-/// `CatalogEntry::description` diverges from `PanelCommand::description`).
+/// A human-readable fallback list of what can be launched.
 fn advertised_list_message(catalog: &[CatalogEntry]) -> String {
-    let list = catalog.iter().map(|c| format!("`/{}`", c.id)).collect::<Vec<_>>().join(", ");
+    let list =
+        catalog.iter().map(|c| format!("`darkmux mission launch {}`", c.id)).collect::<Vec<_>>().join(", ");
     format!("Available commands: {list}.")
 }
 
-/// Turn a resolved (catalog-validated) command id into an actual execution.
-/// Re-derives the execution PLAN via `crate::acp_panel::route_command` —
-/// the SAME structural Review/Ephemeral/Launch decision the panel surface
-/// uses — rather than re-implementing that classification here.
-///
-/// `Launch` covers every routed command now (#2310 P4d retired the bespoke
-/// review arm along with its launcher). It is NOT true that a launched
-/// config has "no required inputs beyond the optional `args` hook": a
-/// diff-scoped config declares `diff_file` required, and `spawn_mission_
-/// launch` synthesizes it from the cwd — see
-/// `acp_panel::synthesize_diff_launch_inputs`, the same seam the editor
-/// panel uses, so the two surfaces cannot drift.
+/// Turn a routed command (a catalog config id) into an actual execution,
+/// through the SAME planning the editor panel's `/mission launch` uses
+/// ([`crate::acp_panel::plan_launch`] then [`crate::acp_panel::prepare_launch`]),
+/// so the two surfaces cannot drift: the same input mapping, the same
+/// refusals, the same diff synthesis from the cwd for a config that declares
+/// a required `diff_file`.
 fn execute(command: &str, args: &str) -> Result<i32> {
-    let advertised = crate::acp_panel::list_panel_commands();
-    let plan = crate::acp_panel::route_command(&advertised, command).ok_or_else(|| {
-        anyhow::anyhow!(
-            "radio: routed command `{command}` is no longer advertised (the registry changed \
-             between routing and execution)"
-        )
-    })?;
-
-    match plan {
-        crate::acp_panel::RoutePlan::Ephemeral(config) => run_ephemeral_and_report(&config, args),
-        crate::acp_panel::RoutePlan::Launch(id) => spawn_mission_launch(&id, args),
+    let plan = crate::acp_panel::plan_launch(command, args).with_context(|| format!("radio: routed command `{command}`"))?;
+    let cwd = std::env::current_dir().context("resolving current directory")?;
+    let prepared = match crate::acp_panel::prepare_launch(&plan.config, plan.params.clone(), &cwd)? {
+        crate::acp_panel::Prepared::Ready(prepared) => prepared,
+        crate::acp_panel::Prepared::Nothing(msg) => {
+            println!("radio: {msg}");
+            return Ok(0);
+        }
+    };
+    if let Some(note) = &prepared.note {
+        println!("radio: {note}");
+    }
+    match plan.route {
+        crate::acp_panel::LaunchRoute::Ephemeral => run_ephemeral_and_report(&plan.config, &prepared.params),
+        crate::acp_panel::LaunchRoute::Launch => spawn_mission_launch(&plan.config_id, &prepared.params),
     }
 }
 
@@ -197,10 +191,10 @@ fn execute(command: &str, args: &str) -> Result<i32> {
 /// `render_ephemeral_result`'s own doc) — the string-sniffing contract
 /// could never distinguish that case from a genuine clean success, so this
 /// CLI used to silently exit 0 for a partially-failed run.
-fn run_ephemeral_and_report(config: &crate::crew::mission_config::MissionConfig, args: &str) -> Result<i32> {
+fn run_ephemeral_and_report(config: &crate::crew::mission_config::MissionConfig, params: &[String]) -> Result<i32> {
     let cwd = std::env::current_dir().context("resolving current directory")?;
     let mut gate = cli_gate_handler();
-    match crate::acp_panel::run_ephemeral(config, args, &cwd, Some(&mut *gate)) {
+    match crate::acp_panel::run_ephemeral(config, params, &cwd, Some(&mut *gate)) {
         Ok(outcome) => {
             println!("{}", outcome.text);
             if outcome.success { Ok(0) } else { Ok(1) }
@@ -213,47 +207,22 @@ fn run_ephemeral_and_report(config: &crate::crew::mission_config::MissionConfig,
 }
 
 /// Spawn `darkmux mission launch <config_id>` as a child process INHERITING
-/// this process's stdio (`std::process::Command`'s default — unlike
+/// this process's stdio (`std::process::Command`'s default, unlike
 /// `src/acp.rs::run_launch_command`'s headless `Stdio::null()`/`piped()`
 /// spawn), so the child's own interactive tty sign-off gate
 /// (`mission_launch.rs`'s private `cli_gate_handler`) sees the SAME real
-/// terminal this `radio` invocation is running in. Forwards the raw text
-/// as `--param args=<raw>` when non-empty — the identical, already-
-/// documented forward-compatible hook `src/acp.rs::run_launch_command` uses
-/// (see that function's own "args honesty note": today no shipped config
-/// declares `args` as a `MissionInput`, so this is a hook, not yet a wired
-/// delivery — the same honest limitation applies here, unchanged).
-fn spawn_mission_launch(config_id: &str, args: &str) -> Result<i32> {
+/// terminal this `radio` invocation is running in. `params` are the
+/// `--param` values [`crate::acp_panel::plan_launch`] and
+/// [`crate::acp_panel::prepare_launch`] produced; the caller holds the
+/// [`crate::acp_panel::PreparedLaunch`] (and its synthesized-input tempdir)
+/// until this returns.
+fn spawn_mission_launch(config_id: &str, params: &[String]) -> Result<i32> {
     let exe = std::env::current_exe().context("resolving darkmux's own executable path")?;
     let mut cmd = std::process::Command::new(&exe);
     cmd.args(["mission", "launch", config_id]);
-    if !args.trim().is_empty() {
-        cmd.args(["--param", &format!("args={args}")]);
+    for param in params {
+        cmd.args(["--param", param]);
     }
-    // (#2310 P4d) Same synthesis the editor panel does, from the same
-    // function: a diff-scoped config gets its `diff_file`/`workspace`/
-    // `head_sha` from this cwd. `_synth`'s Drop removes the tempdir on
-    // every exit path below.
-    let cwd = std::env::current_dir().context("resolving current directory")?;
-    let config = crate::crew::mission_config::load(config_id)
-        .with_context(|| format!("loading mission config \"{config_id}\""))?
-        .config;
-    let _synth = match crate::acp_panel::synthesize_diff_launch_inputs(&config, &cwd)? {
-        crate::acp_panel::DiffLaunchInputs::NotNeeded => None,
-        crate::acp_panel::DiffLaunchInputs::Nothing(msg) => {
-            println!("radio: {msg}");
-            return Ok(0);
-        }
-        crate::acp_panel::DiffLaunchInputs::Ready(synth) => {
-            for p in synth.params() {
-                cmd.args(["--param", p]);
-            }
-            if let Some(note) = &synth.excluded_note {
-                println!("radio: {note}");
-            }
-            Some(synth)
-        }
-    };
     println!("radio: launching `{config_id}` …");
     // (#2463 review) POLL, do not `status()`. This child is deliberately NOT
     // in `child_registry` — the reap watchdog would SIGKILL it ~100ms after a
@@ -512,7 +481,7 @@ mod tests {
             radio::CatalogEntry { id: "pr-list".to_string(), description: "d2".to_string(), hint: None, accepts_args: true },
         ];
         let msg = advertised_list_message(&catalog);
-        assert!(msg.contains("`/review`"), "{msg}");
-        assert!(msg.contains("`/pr-list`"), "{msg}");
+        assert!(msg.contains("`darkmux mission launch review`"), "{msg}");
+        assert!(msg.contains("`darkmux mission launch pr-list`"), "{msg}");
     }
 }

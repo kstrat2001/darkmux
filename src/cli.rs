@@ -648,6 +648,18 @@ pub(crate) enum MissionCmd {
         #[arg(long)]
         missions: bool,
     },
+    /// One mission in full: the config it was launched from, its phases,
+    /// tasks and steps with each step's status, tokens and model, its runs,
+    /// the total tokens, and a viewer link. READ-ONLY. `mission status` is
+    /// the board of every mission; this is the one-mission read, and the
+    /// editor panel's `/mission show <id>` prints the same lines.
+    Show {
+        /// Mission id, as `mission status` lists it.
+        id: String,
+        /// Emit the mission as structured JSON instead of the text view.
+        #[arg(long)]
+        json: bool,
+    },
     /// Debrief a mission (#1000) — the post-mission review ceremony's raw
     /// material in one place: the loop pathologies darkmux's detectors flagged
     /// across the mission's runs (cautions), the corrections the reviewer

@@ -1,234 +1,216 @@
-//! Registry-advertised ACP panel commands + ephemeral procedural launches
-//! (#1684, Packet 1 of the #1684/#1685 arc).
+//! The generic `/mission` verbs of the ACP editor panel, plus the ephemeral
+//! runner for procedural-only configs.
 //!
-//! `src/acp.rs`'s spike hardcoded a single `/review` slash command. This
-//! module replaces that: it enumerates the SAME merged mission-config
-//! registry `darkmux mission launch`/`darkmux mission status` already use
-//! (`crew::mission_config::list_ids` + `crew::mission_config::load` — the
-//! user tier `~/.darkmux/mission-configs/` over the built-ins), filters to
-//! configs that declare a `panel` block ([`crew::mission_config::PanelConfig`]),
-//! and decides — per the operator-ratified design — how an invoked command
-//! should run:
+//! The panel advertises ONE slash command, `/mission`, with three verbs:
 //!
-//! - A config whose graph contains ZERO model-dispatching steps (every
-//!   step kind is `procedural.*`) runs EPHEMERAL: [`run_ephemeral`]
-//!   interprets the config's graph and drives it through
-//!   `darkmux_crew::scheduler::run_step_graph` directly, in-process, with
-//!   NO mission instance minted and NO lifecycle records — "instances for
-//!   work you'd revisit, flow records for acts you'd audit." Steps still
-//!   emit their own flow records through the ordinary flow sink
-//!   (`crate::flow::record`), each stamped with a per-invocation
-//!   correlation id (see `run_ephemeral`'s doc) so concurrent runs of the
-//!   same config don't collide in the viewer.
-//! - Anything else (at least one model-seated step) launches as a normal
-//!   `darkmux mission launch <id>` subprocess through `acp.rs`'s generic
-//!   `run_launch_command`. A panel invocation types no params, so a
-//!   config that declares a required `diff_file` input (`review` is the
-//!   only shipped one) needs its diff/workspace/`head_sha` params filled
-//!   from somewhere else: [`synthesize_diff_launch_inputs`] derives them
-//!   from the session's `cwd`. `run_launch_command` calls it directly;
-//!   `radio_cli.rs`'s headless launch path calls the same function for
-//!   the same reason.
+//! - `/mission list` lists every config `darkmux mission launch` can start
+//!   (the `mission config list` derivation, [`crate::mission_config_cli::build_list`]).
+//! - `/mission launch <config> [name=value ...] [free text]` launches one.
+//! - `/mission show <id>` renders one mission, from the SAME derivation
+//!   `darkmux mission show <id>` prints ([`crate::mission_show`]).
 //!
-//! **Advertised id vs. document id.** A [`PanelCommand`]'s `id` is always
-//! the REGISTRY-RESOLVABLE key (what `list_ids()`/`load()` key on — an
-//! on-disk filename stem, effectively), never the JSON body's own
-//! `MissionConfig.id` field — those two strings can differ on an
-//! operator's hand-edited config, and advertising the wrong one would show
-//! Zed a command that can never actually resolve. See [`PanelCommand`]'s
-//! own doc.
+//! No config names itself into the panel. Every config in the merged
+//! registry (`~/.darkmux/mission-configs/` over the built-ins) is launchable
+//! from the panel exactly when it is launchable from the CLI.
 //!
-//! This module owns the REGISTRY ENUMERATION, the ROUTING DECISION, and
-//! the EPHEMERAL RUNNER. `acp.rs` owns the ACP wire-protocol plumbing
-//! (session/new advertising, session/prompt dispatch, subprocess spawning
-//! for the `Launch`/`Review` routes) — split so each stays independently
-//! readable.
+//! **One launch code path.** [`plan_launch`] resolves the config through
+//! [`crate::mission_launch::resolve_config`] (the CLI's own load and its
+//! refusal text) and maps the words after the config id onto the config's
+//! declared inputs: a `name=value` token whose name the config declares is
+//! a `--param`, exactly what `darkmux mission launch <id> --param name=value`
+//! takes ([`crate::mission_launch::collect_inputs`] parses them); any other
+//! text goes to the config's `__panel_args__` reader as `--param args=...`,
+//! and is refused when the config has none.
+//!
+//! - A config whose graph contains ZERO model-dispatching steps (every step
+//!   kind is `procedural.*`) runs EPHEMERAL: [`run_ephemeral`] interprets the
+//!   graph and drives it through `darkmux_crew::scheduler::run_step_graph`
+//!   in-process, with NO mission instance minted, so the ACP
+//!   `session/request_permission` handler can approve an operator-gated step.
+//!   It resolves inputs through [`crate::mission_launch::resolve_inputs`], the
+//!   function `mission launch` calls.
+//! - Anything else launches as a `darkmux mission launch <id>` subprocess
+//!   (`acp.rs`'s `run_launch_command`): the CLI's own launcher, not a copy.
+//!
+//! A panel invocation types no diff, so [`prepare_launch`] fills a required
+//! `diff_file` (plus `workspace` and `head_sha`) from the session's cwd when
+//! the operator did not pass one. The trigger is the config's declared
+//! inputs, never its name. `darkmux mission launch` itself does not
+//! synthesize: a terminal user names the diff.
+//!
+//! This module owns the panel's invocation grammar, its launch planning, and
+//! the ephemeral runner. `acp.rs` owns the ACP wire-protocol plumbing.
 
 use crate::crew::mission_config::{self, LaunchParams, MissionConfig};
 use crate::crew::scheduler::SchedulerReport;
 use crate::crew::step_kinds::{Facts, FixedEstimator, StepKindRegistry};
 use crate::crew::types::{NodeStatus, Step, Task};
 use darkmux_types::session_id::{RunId, SessionId};
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-/// One entry `darkmux acp` advertises as a slash command in the editor's
-/// agent panel.
-///
-/// `id` is the REGISTRY-RESOLVABLE key — the same string
-/// `crew::mission_config::list_ids()` returned it under, and therefore the
-/// same string `crew::mission_config::load(id)` resolves — NEVER the
-/// document body's own `MissionConfig.id` field (#1684 QA finding: those
-/// two can differ when an operator's on-disk filename and the JSON body's
-/// `id` field drift, e.g. a copy-pasted config nobody renamed internally;
-/// advertising the body id would show a command in Zed that
-/// [`route_command`]/`mission_config::load` can never actually resolve).
-///
-/// `description` is [`PanelConfig::description`] (a short UI label),
-/// falling back to `MissionConfig.name` — NEVER `MissionConfig.description`
-/// (#1684 QA finding: that field is deliberately long-form developer
-/// provenance prose, unsuitable for a command-palette entry; the built-in
-/// `review` config's is ~2KB).
-#[derive(Debug, Clone)]
-pub struct PanelCommand {
+/// The one slash command the panel advertises.
+pub const MISSION_COMMAND: &str = "mission";
+
+/// The input hint the editor shows after `/mission`.
+pub const MISSION_HINT: &str = "list | launch <config> [name=value ...] | show <id>";
+
+/// The command-palette description of `/mission`.
+pub const MISSION_DESCRIPTION: &str =
+    "List the launchable mission configs, launch one, or show a mission's phases, runs and tokens";
+
+/// The usage line refusals end with.
+const MISSION_USAGE: &str = "Use `/mission list`, `/mission launch <config> [name=value ...]` or `/mission show <id>`.";
+
+/// One config `/mission list` offers and radio's router may choose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchableConfig {
+    /// The registry-resolvable id: what `mission_config::list_ids` returned
+    /// and `mission_config::load` resolves, never the document body's own
+    /// `id` field (those can differ on a hand-edited config).
     pub id: String,
-    pub description: String,
-    pub hint: Option<String>,
-    /// (#2050) [`PanelConfig::accepts_args`], resolved: an unset field
-    /// means `true`, so every config authored before that field existed
-    /// keeps advertising exactly as it did. `false` is a command that
-    /// takes no text after its name — see `crate::radio::CatalogEntry`'s
-    /// own field for the one consumer that acts on it.
+    /// One line saying what the config does: the first sentence of its
+    /// `description`, else its `name`.
+    pub summary: String,
+    /// Whether the config takes free text after its id
+    /// ([`mission_config::takes_panel_args`]).
     pub accepts_args: bool,
 }
 
-/// Enumerate every mission config in the merged registry (built-ins +
-/// `~/.darkmux/mission-configs/`) that declares a `panel` block — the
-/// advertising filter. Reuses `crew::mission_config::list_ids` +
-/// `crew::mission_config::load` (the SAME resolution `darkmux mission
-/// launch`/`darkmux mission status` already use) rather than
-/// re-implementing discovery. A config that fails to load (malformed JSON,
-/// e.g. from a hand-edited operator override) is skipped with a stderr
-/// note — one broken config must never take down the whole command list.
-pub fn list_panel_commands() -> Vec<PanelCommand> {
-    let mut out = Vec::new();
-    for id in mission_config::list_ids() {
-        let loaded = match mission_config::load(&id) {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!(
-                    "[darkmux-acp] skipping mission config \"{id}\" while listing panel \
-                     commands: {e:#}"
-                );
-                continue;
-            }
-        };
-        let Some(panel) = &loaded.config.panel else { continue };
-        out.push(PanelCommand {
-            // The RESOLVABLE key (`id`, from `list_ids()`), never
-            // `loaded.config.id` — see `PanelCommand`'s own doc.
-            id: id.clone(),
-            description: panel
-                .description
-                .clone()
-                .unwrap_or_else(|| loaded.config.name.clone()),
-            hint: panel.hint.clone(),
-            // Unset means "accepts arguments" — the behavior of every
-            // advertised config before #2050 added the field.
-            accepts_args: panel.accepts_args.unwrap_or(true),
-        });
+/// The longest summary line, in characters.
+const SUMMARY_CAP_CHARS: usize = 160;
+
+/// One line describing `config`: the first sentence of its `description`
+/// (capped), else its `name`. Long-form description prose stays in
+/// `mission config show`.
+pub fn config_summary(config: &MissionConfig) -> String {
+    let description = config.description.as_deref().map(str::trim).unwrap_or("");
+    if description.is_empty() {
+        return config.name.clone();
     }
-    out.sort_by(|a, b| a.id.cmp(&b.id));
+    crate::mission_status::cap_note(crate::mission_status::first_sentence(description), SUMMARY_CAP_CHARS)
+}
+
+/// Every config `darkmux mission launch` can start, sorted by id: the
+/// `mission config list` rows that load AND whose id `mission launch` accepts
+/// ([`crate::fleet::validate_identifier`], which refuses an id with an
+/// uppercase letter). A config that cannot be launched is skipped with a
+/// stderr note, so it is never offered and one broken override never hides
+/// the rest.
+pub fn list_launchable() -> Vec<LaunchableConfig> {
+    let mut out = Vec::new();
+    for row in crate::mission_config_cli::build_list() {
+        if let Some(err) = &row.error {
+            eprintln!("[darkmux-acp] skipping mission config \"{}\" while listing: {err}", row.id);
+            continue;
+        }
+        if let Err(e) = crate::fleet::validate_identifier("config_id", &row.id) {
+            eprintln!("[darkmux-acp] skipping mission config \"{}\" while listing: {e:#}", row.id);
+            continue;
+        }
+        match mission_config::load(&row.id) {
+            Ok(loaded) => out.push(LaunchableConfig {
+                summary: config_summary(&loaded.config),
+                accepts_args: mission_config::takes_panel_args(&loaded.config),
+                id: row.id,
+            }),
+            Err(e) => eprintln!("[darkmux-acp] skipping mission config \"{}\" while listing: {e:#}", row.id),
+        }
+    }
     out
 }
 
-/// A human-readable fallback for a prompt that didn't match any currently
-/// advertised command — lists the live command set instead of hardcoding
-/// `/review` the way the pre-#1684 spike did.
-pub fn not_a_command_message(commands: &[PanelCommand]) -> String {
-    if commands.is_empty() {
-        return "darkmux acp has no commands to advertise right now — no mission config in \
-                the merged registry (built-ins + ~/.darkmux/mission-configs/) declares a \
-                `panel` block."
-            .to_string();
-    }
-    format!("darkmux acp doesn't recognize that as a command. {}", command_listing(commands))
+/// What the panel does with `/mission`'s verb word.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MissionVerb {
+    /// `/mission list`.
+    List,
+    /// `/mission launch <config> [rest]`: `rest` is the raw text after the id.
+    Launch { config_id: String, rest: String },
+    /// `/mission show <id>`.
+    Show { id: String },
 }
 
-/// (#2050 sweep) The args a command will ACTUALLY receive, plus the notice
-/// the operator is owed when text of theirs was dropped.
-///
-/// `panel.accepts_args: false` was enforced on exactly one of the two
-/// invocation surfaces. `crate::radio::decide_route` clears the args a
-/// routing seat carried over (`src/radio.rs`), because a model's claim is
-/// checked against the catalog rather than trusted. The DIRECT
-/// `/command args` path never consulted the field at all: [`route_command`]
-/// matches on the name alone, and `acp::execute_route_plan` forwarded
-/// whatever followed it — straight into `--param args=…` for a launch, or
-/// into the `__panel_args__` task for an ephemeral.
-///
-/// Two things that fixes, one live and one latent:
-///
-/// - **Live, and operator-visible.** Typing `/review please look closely at
-///   X` built an unused `--param args=…`, discarded the text, and said
-///   nothing — while `/review`'s own hint reads "(no arguments)". Input
-///   accepted and thrown away without acknowledgement. Hence the notice:
-///   silently dropping it is the same defect one step quieter.
-/// - **Latent.** `validate()` does not stop a config declaring BOTH
-///   `accepts_args: false` and a task that `reads: ["__panel_args__"]`. The
-///   one shipped config using the field (`review.json`) declares no such
-///   task, so `inject_panel_args_task_if_referenced` is a no-op today and
-///   the smuggled text goes nowhere — by accident, not by construction.
-///   Clearing at the surface closes it by construction, which is why this
-///   is preferred over a validation-time refusal of the combination: that
-///   would close only the future case and leave the silent discard.
-///
-/// An UNADVERTISED `cmd` keeps its args: this function judges only what the
-/// registry declares, and an unresolvable name is [`route_command`]'s
-/// problem, not this one.
-pub fn enforce_accepts_args(advertised: &[PanelCommand], cmd: &str, args: &str) -> (String, Option<String>) {
-    let Some(entry) = advertised.iter().find(|c| c.id.eq_ignore_ascii_case(cmd)) else {
-        return (args.to_string(), None);
-    };
-    if entry.accepts_args || args.trim().is_empty() {
-        return (args.to_string(), None);
-    }
-    // The registry's own casing, not what the operator typed — the same
-    // rule `route_command` follows for the id it actually loads.
-    let notice = format!(
-        "darkmux: /{} takes no arguments, so the text after it was not passed on. Running \
-         /{} on its own.",
-        entry.id, entry.id
-    );
-    (String::new(), Some(notice))
+/// A parsed slash invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PanelInvocation {
+    /// A well-formed `/mission ...`.
+    Mission(MissionVerb),
+    /// Text starting with `/` that is not a well-formed `/mission ...`: the
+    /// reply to send back, naming what is available.
+    Refused(String),
 }
 
-/// The bare "Available commands: …" listing, WITHOUT the didn't-recognize-
-/// that preamble (#1698 Packet B2 gate). The answering seat appends a
-/// listing after an answer that names a `/command`, where the full
-/// `not_a_command_message` would contradict itself: RADIO answers the
-/// question, then the appended text tells the operator their message wasn't
-/// recognized. Same list, no refusal framing. Empty in ⇒ empty out, so a
-/// caller appending this to an answer adds nothing when there is nothing to
-/// list (the refusal path's own no-commands explanation stays above).
-pub fn command_listing(commands: &[PanelCommand]) -> String {
-    if commands.is_empty() {
-        return String::new();
+/// Split `text` into its first whitespace-delimited word and the trimmed rest.
+fn split_first_word(text: &str) -> (&str, &str) {
+    let text = text.trim();
+    match text.split_once(char::is_whitespace) {
+        Some((word, rest)) => (word, rest.trim()),
+        None => (text, ""),
     }
-    let list = commands.iter().map(|c| format!("`/{}`", c.id)).collect::<Vec<_>>().join(", ");
-    format!("Available commands: {list}.")
 }
 
-/// Split a raw prompt into `(command name, raw args)` — **the mode bit**
-/// (issue #1698, "the slash becomes the mode bit"). Matches ONLY when the
-/// first non-whitespace character is a literal `/`; anything else,
-/// including empty/whitespace-only text, is `None`.
+/// Parse the text after `/mission` into a verb. The verb word is matched
+/// case-insensitively; config and mission ids keep their case.
+pub fn parse_mission_verb(args: &str) -> std::result::Result<MissionVerb, String> {
+    let (verb, rest) = split_first_word(args);
+    let (id, extra) = split_first_word(rest);
+    match verb.to_ascii_lowercase().as_str() {
+        "list" if rest.is_empty() => Ok(MissionVerb::List),
+        "launch" if !id.is_empty() => Ok(MissionVerb::Launch { config_id: id.to_string(), rest: extra.to_string() }),
+        "show" if !id.is_empty() && extra.is_empty() => Ok(MissionVerb::Show { id: id.to_string() }),
+        "list" => Err(format!("`/mission list` takes no arguments. {MISSION_USAGE}")),
+        "launch" => Err(format!("`/mission launch` needs a config id; `/mission list` shows them. {MISSION_USAGE}")),
+        "show" => Err(format!("`/mission show` takes exactly one mission id. {MISSION_USAGE}")),
+        "" => Err(format!("`/mission` needs a verb. {MISSION_USAGE}")),
+        other => Err(format!("`/mission {other}` is not a verb. {MISSION_USAGE}")),
+    }
+}
+
+/// Parse a prompt into an invocation. `None` unless the first non-whitespace
+/// character is a literal `/` (see [`parse_command`]).
+pub fn parse_invocation(text: &str) -> Option<PanelInvocation> {
+    let (name, args) = parse_command(text)?;
+    if name != MISSION_COMMAND {
+        return Some(PanelInvocation::Refused(not_a_command_message()));
+    }
+    Some(match parse_mission_verb(&args) {
+        Ok(verb) => PanelInvocation::Mission(verb),
+        Err(reply) => PanelInvocation::Refused(reply),
+    })
+}
+
+/// The reply to a slash command the panel does not have.
+pub fn not_a_command_message() -> String {
+    format!("darkmux acp doesn't recognize that as a command. {}", command_listing())
+}
+
+/// The bare "Available commands: ..." line, without the didn't-recognize
+/// preamble: the answering seat appends it after an answer that names a
+/// command, where the full refusal would contradict itself.
+pub fn command_listing() -> String {
+    format!("Available commands: `/{MISSION_COMMAND}`. {MISSION_USAGE}")
+}
+
+/// `/mission list`, rendered: one line per launchable config.
+pub fn render_mission_list(configs: &[LaunchableConfig]) -> String {
+    if configs.is_empty() {
+        return "No mission configs are launchable (built-ins and ~/.darkmux/mission-configs/ are both empty).".to_string();
+    }
+    let lines: Vec<String> = configs.iter().map(|c| format!("- `{}`: {}", c.id, c.summary)).collect();
+    format!("Launchable mission configs (`/mission launch <config>`):\n{}", lines.join("\n"))
+}
+
+/// Split a prompt into `(command name, raw args)`: **the mode bit** (issue
+/// #1698, "the slash becomes the mode bit"). Matches ONLY when the first
+/// non-whitespace character is a literal `/`; anything else, including
+/// empty text, is `None`. A slash-less prompt is never a command: it goes to
+/// the radio channel, which classifies it.
 ///
-/// **Bare-word invocation is RETIRED (#1698 Packet B, "retired in the same
-/// change" as the no-slash interpreted channel).** Before this change, a
-/// leading slash was optional (matching the pre-#1684 spike's own
-/// `/review`-or-`review` leniency) — harmless while unmatched no-slash text
-/// hit a plain help wall, but load-bearing-wrong the instant free text
-/// gains meaning: with the no-slash interpreted channel now live
-/// (`src/acp.rs`'s `run_no_slash_route`), a bare command name racing
-/// against sentence-shaped text would be genuinely ambiguous — is
-/// `"review this with me when you have a sec"` a slash-optional command
-/// invocation (first token `review` happens to match) or a sentence the
-/// interpreted channel should route? **Empirically confirmed live** (this
-/// packet's own investigation, piping `darkmux acp` directly): under the
-/// PRE-fix parser, that exact sentence matched `review` as a bare command
-/// and launched the full review pipeline — the ambiguity this retirement
-/// closes is not hypothetical. `/x` is now law (exact, zero
-/// interpretation); no slash is always the interpreted channel's to
-/// classify, never a pattern match.
-///
-/// The first whitespace-delimited word after the slash, LOWERCASED
-/// (mission-config ids are conventionally lowercase-kebab, and the
-/// pre-#1684 spike itself lowercased — `/Review` must still resolve), is
-/// the command name; everything after it (trimmed, case PRESERVED) is the
-/// raw args string forwarded verbatim to whichever route the command
-/// resolves to.
+/// The first whitespace-delimited word after the slash, LOWERCASED, is the
+/// command name; everything after it (trimmed, case PRESERVED) is the raw
+/// args string.
 pub fn parse_command(text: &str) -> Option<(String, String)> {
     let trimmed = text.trim();
     let without_slash = trimmed.strip_prefix('/')?;
@@ -241,63 +223,126 @@ pub fn parse_command(text: &str) -> Option<(String, String)> {
     Some((name, args))
 }
 
-/// What `session/prompt`'s command dispatch decided to do with an invoked
-/// command name — see [`route_command`].
-pub enum RoutePlan {
-    /// The config's graph contains ZERO model-dispatching steps (every
-    /// step kind is `procedural.*`) — run in-process via [`run_ephemeral`],
-    /// no mission instance minted.
-    Ephemeral(Box<MissionConfig>),
-    /// The config's graph has at least one model-seated step — launch it
-    /// as a normal `darkmux mission launch <id>` subprocess (a full
-    /// instance), same pattern as `review`'s own subprocess.
-    Launch(String),
+/// How a launch runs: see the module doc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchRoute {
+    /// The graph has no model-dispatching step: run in-process via
+    /// [`run_ephemeral`], no mission instance minted.
+    Ephemeral,
+    /// The graph has at least one model-seated step: launch it as a
+    /// `darkmux mission launch <id>` subprocess.
+    Launch,
 }
 
-/// Decide how an invoked command name should run. `None` when `cmd` is not
-/// one of the CURRENTLY advertised commands — `advertised` is recomputed
-/// per prompt by the caller (the registry can change between `session/new`
-/// and a later `session/prompt`), never cached across the session's
-/// lifetime. A command that WAS advertised but no longer resolves (e.g.
-/// its file was deleted between `session/new` and this prompt) also
-/// returns `None` here rather than panicking — `advertised` already
-/// reflects the current registry, so this is defense in depth, not the
-/// primary check.
-///
-/// Matching is CASE-INSENSITIVE against the advertised registry keys
-/// (#1695 merge-gate finding 2) — `cmd` arrives already lowercased from
-/// [`parse_command`], but a registry key (an on-disk filename stem) keeps
-/// whatever case the operator gave the file, so a naive `==` would make a
-/// mixed-case filename permanently unreachable even though it was
-/// advertised. `advertised` is caller-sorted ([`list_panel_commands`]),
-/// so `.find()`'s first case-insensitive match is deterministic — two
-/// configs that collide only after lowercasing resolve to whichever sorts
-/// first, never a panic. The MATCHED entry's own (correctly-cased) `id` is
-/// what actually gets loaded/launched — never the lowercased `cmd` the
-/// user typed.
-pub fn route_command(advertised: &[PanelCommand], cmd: &str) -> Option<RoutePlan> {
-    let matched = advertised.iter().find(|c| c.id.eq_ignore_ascii_case(cmd))?;
-    let resolved_id = matched.id.clone();
-    let loaded = mission_config::load(&resolved_id).ok()?;
-    if is_procedural_only(&loaded.config) {
-        Some(RoutePlan::Ephemeral(Box::new(loaded.config)))
-    } else {
-        Some(RoutePlan::Launch(resolved_id))
+/// A resolved `/mission launch`: the config, how it runs, and its `--param`
+/// values.
+pub struct LaunchPlan {
+    /// The registry-resolvable id the operator typed.
+    pub config_id: String,
+    pub config: MissionConfig,
+    pub route: LaunchRoute,
+    /// `name=value` strings, the `--param` values `mission launch` takes.
+    pub params: Vec<String>,
+    /// The raw text the operator typed after the config id, for the shelf.
+    pub raw_args: String,
+}
+
+/// `true` iff `token` is `name=value` and the config declares an input `name`.
+fn is_declared_param(config: &MissionConfig, token: &str) -> bool {
+    token.split_once('=').is_some_and(|(name, _)| config.inputs.iter().any(|i| i.name == name))
+}
+
+/// The refusal for free text sent to a config with nowhere to put it.
+fn no_free_text_refusal(config: &MissionConfig, text: &str) -> String {
+    let declared: Vec<&str> = config.inputs.iter().map(|i| i.name.as_str()).collect();
+    if declared.is_empty() {
+        return format!("`{}` takes no arguments, so `{text}` was not passed on. Run `/mission launch {}` on its own.", config.id, config.id);
+    }
+    format!(
+        "`{}` takes no free text, so `{text}` was not passed on. Its inputs are {}: pass them as `name=value`.",
+        config.id,
+        declared.join(", ")
+    )
+}
+
+/// Map the words after a config id onto its declared inputs, the way
+/// `mission launch --param` receives them (see the module doc).
+pub fn map_launch_args(config: &MissionConfig, rest: &str) -> Result<Vec<String>> {
+    let (declared, free): (Vec<&str>, Vec<&str>) =
+        rest.split_whitespace().partition(|t| is_declared_param(config, t));
+    let mut params: Vec<String> = declared.iter().map(|t| t.to_string()).collect();
+    if free.is_empty() {
+        return Ok(params);
+    }
+    let text = free.join(" ");
+    if !mission_config::takes_panel_args(config) {
+        bail!("{}", no_free_text_refusal(config, &text));
+    }
+    params.push(format!("args={text}"));
+    Ok(params)
+}
+
+/// Resolve `/mission launch <config_id> <rest>` into a [`LaunchPlan`]. `Err`
+/// carries the refusal text: the CLI's own for an unknown config
+/// ([`crate::mission_launch::resolve_config`]), or this module's for
+/// arguments the config cannot take.
+pub fn plan_launch(config_id: &str, rest: &str) -> Result<LaunchPlan> {
+    let loaded = crate::mission_launch::resolve_config(config_id)?;
+    let params = map_launch_args(&loaded.config, rest)?;
+    let route = if is_procedural_only(&loaded.config) { LaunchRoute::Ephemeral } else { LaunchRoute::Launch };
+    Ok(LaunchPlan { config_id: config_id.to_string(), config: loaded.config, route, params, raw_args: rest.to_string() })
+}
+
+/// A launch's params after the panel filled in what it could, holding the
+/// tempdir of any synthesized input until it is dropped.
+pub struct PreparedLaunch {
+    pub params: Vec<String>,
+    /// Non-empty when the working tree carries changes a synthesized diff
+    /// does not cover.
+    pub note: Option<String>,
+    _synth: Option<SynthesizedInputs>,
+}
+
+/// What [`prepare_launch`] decided.
+pub enum Prepared {
+    Ready(PreparedLaunch),
+    /// A git repo with nothing committed to review: the message to show
+    /// instead of launching.
+    Nothing(String),
+}
+
+/// `true` iff the operator's params already name `key`.
+fn supplies(params: &[String], key: &str) -> bool {
+    params.iter().any(|p| p.split_once('=').is_some_and(|(k, _)| k == key))
+}
+
+/// Add the inputs a panel invocation cannot type (see the module doc).
+/// `Err` only for genuine IO failures and a cwd that is not a git repo.
+pub fn prepare_launch(config: &MissionConfig, mut params: Vec<String>, cwd: &Path) -> Result<Prepared> {
+    if supplies(&params, "diff_file") {
+        return Ok(Prepared::Ready(PreparedLaunch { params, note: None, _synth: None }));
+    }
+    match synthesize_diff_launch_inputs(config, cwd)? {
+        DiffLaunchInputs::NotNeeded => Ok(Prepared::Ready(PreparedLaunch { params, note: None, _synth: None })),
+        DiffLaunchInputs::Nothing(msg) => Ok(Prepared::Nothing(msg)),
+        DiffLaunchInputs::Ready(synth) => {
+            params.extend(synth.params().iter().cloned());
+            let note = synth.excluded_note.clone();
+            Ok(Prepared::Ready(PreparedLaunch { params, note, _synth: Some(synth) }))
+        }
     }
 }
 
 /// (#2310 P4d) The inputs a diff-scoped config needs that an invoked
-/// COMMAND surface (`/review` in the editor panel, `radio "review this"`)
-/// cannot type: the diff itself, and a workspace the planner can read the
-/// post-diff tree through.
+/// COMMAND surface (`/mission launch review` in the editor panel, `radio
+/// "review this"`) cannot type: the diff itself, and a workspace the
+/// planner can read the post-diff tree through.
 ///
-/// **Why this exists.** The bespoke review launcher used to synthesize
-/// `diff_file`/`worktree` for the panel before spawning; it retired with
-/// the funnel, while `review.json` still declares `diff_file` REQUIRED. A
-/// panel invocation therefore has to supply it or the launch bails on a
-/// missing input. Deciding that STRUCTURALLY — does this config declare a
-/// required `diff_file`? — rather than by matching the id `"review"` keeps
-/// a renamed variant working, the same discipline `route_command` follows.
+/// **Why this exists.** `review.json` declares `diff_file` REQUIRED, so a
+/// panel invocation has to supply it or the launch bails on a missing
+/// input. Deciding that STRUCTURALLY, from the config's declared inputs
+/// (does it declare a required `diff_file`?), rather than by matching the
+/// id `"review"`, keeps a renamed or copied variant working.
 ///
 /// **What it reviews, stated plainly.** The diff is the branch's COMMITTED
 /// work (`git diff <base>..HEAD`, base = the merge-base with the first of
@@ -548,7 +593,7 @@ pub fn is_procedural_only(config: &MissionConfig) -> bool {
 /// `None` fallback.
 pub fn run_ephemeral(
     config: &MissionConfig,
-    args: &str,
+    params: &[String],
     cwd: &Path,
     gate: Option<&mut crate::crew::gate::GateHandler<'_>>,
 ) -> Result<EphemeralOutcome> {
@@ -563,8 +608,15 @@ pub fn run_ephemeral(
         return Ok(EphemeralOutcome { text: format!("darkmux: command failed:\n\n{reason}"), success: false });
     }
 
+    // The inputs resolve through the function `mission launch` calls, so a
+    // missing required input is refused with the CLI's own text.
+    let inputs = match crate::mission_launch::resolve_inputs(config, None, params) {
+        Ok(resolved) => resolved.collected,
+        Err(e) => return Ok(EphemeralOutcome { text: format!("darkmux: command failed:\n\n{e:#}"), success: false }),
+    };
+    let args = inputs.get("args").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let mut config = config.clone();
-    mission_config::inject_panel_args_task_if_referenced(&mut config, args);
+    mission_config::inject_panel_args_task_if_referenced(&mut config, &args);
 
     // (#1684 QA finding — CONSIDER 7) `mission launch` runs
     // `MissionConfig::validate` at its consumption point before ever
@@ -592,9 +644,9 @@ pub fn run_ephemeral(
         anyhow::bail!("panel command config \"{}\" failed validation:\n{msg}", config.id);
     }
 
-    let params = LaunchParams::default();
+    let launch_params = LaunchParams { input_values: inputs, ..Default::default() };
     let (ordered_tasks, mut steps, interpret_warnings) =
-        mission_config::interpret(&config, &params).context("interpreting panel command graph")?;
+        mission_config::interpret(&config, &launch_params).context("interpreting panel command graph")?;
 
     apply_default_cwd(&mut steps, cwd);
 
@@ -757,7 +809,7 @@ pub fn run_ephemeral(
     // right"). Configs with no `cmd` (the ordinary case) never emit
     // this record at all.
     if let Some(verb) = config.cmd.as_deref() {
-        emit_cmd_audit(verb, args, cwd, gate_confirmed.get(), outcome.success, &correlation);
+        emit_cmd_audit(verb, &args, cwd, gate_confirmed.get(), outcome.success, &correlation);
     }
 
     Ok(outcome)
@@ -1021,7 +1073,7 @@ fn render_ephemeral_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crew::mission_config::{PanelConfig, PhaseConfig, StepConfig, TaskConfig, PANEL_ARGS_TASK_ID};
+    use crate::crew::mission_config::{MissionInput, PhaseConfig, StepConfig, TaskConfig, PANEL_ARGS_TASK_ID};
     use std::collections::BTreeMap as Map;
 
     fn step(id: &str, kind: &str, config: serde_json::Value) -> StepConfig {
@@ -1053,7 +1105,7 @@ mod tests {
         PhaseConfig { id: id.to_string(), description: None, display_name: None, tasks, enabled: None, extras: Map::new() }
     }
 
-    fn config(id: &str, panel: Option<PanelConfig>, phases: Vec<PhaseConfig>) -> MissionConfig {
+    fn config(id: &str, phases: Vec<PhaseConfig>) -> MissionConfig {
         MissionConfig {
             id: id.to_string(),
             name: id.to_string(),
@@ -1061,7 +1113,6 @@ mod tests {
             schema_version: None,
             inputs: Vec::new(),
             phases,
-            panel,
             cmd: None,
             outcome_from: None,
             source_input: None,
@@ -1173,7 +1224,6 @@ mod tests {
     fn a_config_with_only_procedural_steps_is_ephemeral() {
         let cfg = config(
             "echo-test",
-            None,
             vec![phase(
                 "p1",
                 vec![task("t1", &[], &[], vec![step("s1", "procedural.shell", serde_json::json!({"command": "echo hi"}))])],
@@ -1189,7 +1239,6 @@ mod tests {
         // actually dispatches a model.
         let cfg = config(
             "coder-verb",
-            None,
             vec![phase(
                 "p1",
                 vec![
@@ -1205,275 +1254,300 @@ mod tests {
     fn a_config_with_zero_steps_is_not_ephemeral() {
         // A freeform config (every phase manual) — nothing for an
         // in-process runner to execute; `mission launch` handles this path.
-        let cfg = config("freeform", None, vec![phase("p1", vec![])]);
+        let cfg = config("freeform", vec![phase("p1", vec![])]);
         assert!(!is_procedural_only(&cfg));
     }
 
-    // ── route_command ────────────────────────────────────────────────
+    // ── the /mission grammar ────────────────────────────────────────────
 
     #[test]
-    fn route_command_returns_none_for_an_unadvertised_command() {
-        let advertised =
-            vec![PanelCommand { id: "review".to_string(), description: "d".to_string(), hint: None, accepts_args: true }];
-        assert!(route_command(&advertised, "not-advertised").is_none());
-    }
-
-    /// (#1695 merge-gate finding 2) A mixed-case on-disk config filename
-    /// advertises under its own (correctly-cased) id, but a user typing
-    /// the command lowercases it (`parse_command`'s own normalization) —
-    /// `route_command` must still resolve it, and must resolve/launch
-    /// using the ORIGINAL-CASED registry key, never the lowercased text
-    /// the user typed (a case-sensitive filesystem would 404 on that).
-    #[test]
-    #[serial_test::serial]
-    fn route_command_matches_case_insensitively_and_launches_the_correctly_cased_id() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let prev = std::env::var("DARKMUX_HOME").ok();
-        // SAFETY: this test is #[serial_test::serial].
-        unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()) };
-
-        let dir = tmp.path().join("mission-configs");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("Pr-View.json"),
-            serde_json::to_string(&serde_json::json!({
-                "id": "Pr-View",
-                "name": "PR View",
-                "panel": {"description": "View a PR"},
-                "phases": [{
-                    "id": "p1",
-                    "tasks": [{"id": "t1", "steps": [{"id": "s1", "kind": "procedural.shell", "config": {"command": "echo hi"}}]}]
-                }]
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-
-        // The advertised entry keeps the file's own case; the user typed
-        // "/Pr-View", which `parse_command` lowercases to "pr-view" before
-        // it ever reaches `route_command`.
-        let advertised =
-            vec![PanelCommand { id: "Pr-View".to_string(), description: "View a PR".to_string(), hint: None, accepts_args: true }];
-        let plan = route_command(&advertised, "pr-view").expect("a mixed-case filename must still be invocable");
-        match plan {
-            RoutePlan::Ephemeral(config) => {
-                assert_eq!(config.id, "Pr-View", "the loaded config is the correctly-cased file's own document");
-            }
-            _ => panic!("expected an Ephemeral route for a procedural-only fixture"),
-        }
-
-        // SAFETY: this test is #[serial_test::serial].
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_HOME", v),
-                None => std::env::remove_var("DARKMUX_HOME"),
-            }
-        }
-    }
-
-    // ── (#2050) panel.accepts_args resolution ───────────────────────────
-
-    #[test]
-    #[serial_test::serial]
-    fn list_panel_commands_resolves_accepts_args_with_true_as_the_unset_default() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let prev = std::env::var("DARKMUX_HOME").ok();
-        // SAFETY: this test is #[serial_test::serial].
-        unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()) };
-
-        let dir = tmp.path().join("mission-configs");
-        std::fs::create_dir_all(&dir).unwrap();
-        // No `accepts_args` at all — the shape of every operator config
-        // authored before the field existed.
-        std::fs::write(
-            dir.join("legacy-cmd.json"),
-            serde_json::to_string(&serde_json::json!({
-                "id": "legacy-cmd",
-                "name": "Legacy",
-                "panel": {"description": "Takes whatever you type"},
-                "phases": []
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        // And one that declares it explicitly false.
-        std::fs::write(
-            dir.join("nullary-cmd.json"),
-            serde_json::to_string(&serde_json::json!({
-                "id": "nullary-cmd",
-                "name": "Nullary",
-                "panel": {"description": "Takes nothing", "accepts_args": false},
-                "phases": []
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-
-        let commands = list_panel_commands();
-        let find = |id: &str| {
-            commands
-                .iter()
-                .find(|c| c.id == id)
-                .unwrap_or_else(|| panic!("{id} must be advertised; got {:?}", commands.iter().map(|c| &c.id).collect::<Vec<_>>()))
-                .accepts_args
-        };
-        assert!(find("legacy-cmd"), "an unset `panel.accepts_args` must resolve to true, not false");
-        assert!(!find("nullary-cmd"), "an explicit `accepts_args: false` must survive the resolution");
-        // The SHIPPED built-in is the one this issue was filed about, and
-        // it merges into the same registry — so this asserts the actual
-        // artifact, not just the resolution rule.
-        assert!(
-            !find("review"),
-            "the built-in `review` config declares `panel.accepts_args: false` (#2050)"
-        );
-
-        // SAFETY: this test is #[serial_test::serial].
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_HOME", v),
-                None => std::env::remove_var("DARKMUX_HOME"),
-            }
-        }
-    }
-
-    // ── (#2050 sweep) accepts_args on the DIRECT slash surface ──────────
-
-    fn nullary(id: &str) -> PanelCommand {
-        PanelCommand { id: id.to_string(), description: "d".to_string(), hint: None, accepts_args: false }
-    }
-
-    fn nary(id: &str) -> PanelCommand {
-        PanelCommand { id: id.to_string(), description: "d".to_string(), hint: None, accepts_args: true }
-    }
-
-    #[test]
-    fn a_nullary_command_does_not_receive_typed_args() {
-        // The live defect: `/review please look closely at X` built an
-        // unused `--param args=…` and discarded the text. Now the args are
-        // cleared BEFORE the plan executes, which is also what closes the
-        // latent `__panel_args__` case by construction.
-        let advertised = vec![nullary("review")];
-        let (args, notice) = enforce_accepts_args(&advertised, "review", "please look closely at X");
-        assert_eq!(args, "", "a command declaring `accepts_args: false` must receive nothing");
-        let notice = notice.expect("dropping the operator's text silently is the same defect, quieter");
-        assert!(notice.contains("/review"), "the notice must name the command: {notice}");
-        assert!(notice.contains("takes no arguments"), "{notice}");
-    }
-
-    #[test]
-    fn a_command_that_takes_args_keeps_them() {
-        // The inverted case: every config authored before the field
-        // existed resolves to `accepts_args: true`, and clearing THOSE
-        // would break every advertised command that reads its text.
-        let advertised = vec![nary("pr-view")];
-        let (args, notice) = enforce_accepts_args(&advertised, "pr-view", "1234");
-        assert_eq!(args, "1234");
-        assert!(notice.is_none(), "nothing was dropped, so nothing is announced");
-    }
-
-    #[test]
-    fn a_nullary_command_invoked_bare_says_nothing() {
-        // No text was typed, so no text was dropped — a notice here would
-        // be noise on every plain `/review`.
-        let advertised = vec![nullary("review")];
-        for typed in ["", "   ", "\n"] {
-            let (args, notice) = enforce_accepts_args(&advertised, "review", typed);
-            assert_eq!(args, typed, "empty args pass through unchanged: {typed:?}");
-            assert!(notice.is_none(), "an empty invocation must not be announced: {typed:?}");
-        }
-    }
-
-    #[test]
-    fn accepts_args_is_matched_case_insensitively_and_reported_in_the_registrys_casing() {
-        // `parse_command` lowercases what the operator typed, while a
-        // registry key keeps the on-disk filename's case — the same
-        // mismatch `route_command`'s own doc guards against. A naive `==`
-        // here would let a mixed-case config smuggle args past the check.
-        let advertised = vec![nullary("Review-PR")];
-        let (args, notice) = enforce_accepts_args(&advertised, "review-pr", "some text");
-        assert_eq!(args, "");
-        assert!(notice.is_some_and(|n| n.contains("/Review-PR")), "the notice uses the registry's casing");
-    }
-
-    #[test]
-    fn an_unadvertised_command_keeps_its_args() {
-        // This function judges only what the registry declares; an
-        // unresolvable name is `route_command`'s problem, and it refuses
-        // the whole invocation a line later.
-        let advertised = vec![nullary("review")];
-        let (args, notice) = enforce_accepts_args(&advertised, "not-a-command", "some text");
-        assert_eq!(args, "some text");
-        assert!(notice.is_none());
-    }
-
-    // ── (#1684 QA finding — MUST-FIX 2/3) advertised id + description ──
-
-    #[test]
-    #[serial_test::serial]
-    fn list_panel_commands_advertises_the_resolvable_filename_not_the_document_body_id() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let prev = std::env::var("DARKMUX_HOME").ok();
-        // SAFETY: this test is #[serial_test::serial].
-        unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()) };
-
-        let dir = tmp.path().join("mission-configs");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("pr-view.json"),
-            serde_json::to_string(&serde_json::json!({
-                // Deliberately DIFFERENT from the filename stem — the
-                // exact drift #1684 QA finding 2 caught: a config file
-                // whose on-disk name and JSON body `id` don't match.
-                "id": "pr_view",
-                "name": "PR View — a very long developer-facing name nobody wants in a menu",
-                "description": "a 2000-character developer provenance essay stands in here in the real bug",
-                "panel": {"description": "View a PR"},
-                "phases": []
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-
-        let commands = list_panel_commands();
-        let found = commands
-            .iter()
-            .find(|c| c.description == "View a PR")
-            .expect("the injected config must be advertised (short panel.description, not the long one)");
+    fn parse_mission_verb_reads_each_verb_and_keeps_id_case() {
+        assert_eq!(parse_mission_verb("list"), Ok(MissionVerb::List));
+        assert_eq!(parse_mission_verb("  LIST  "), Ok(MissionVerb::List), "the verb word is case-insensitive");
         assert_eq!(
-            found.id, "pr-view",
-            "must advertise the RESOLVABLE filename stem, not the document body's mismatched `id` field"
+            parse_mission_verb("launch Pr-View 42 head=abc"),
+            Ok(MissionVerb::Launch { config_id: "Pr-View".to_string(), rest: "42 head=abc".to_string() }),
+            "a config id keeps its case; everything after it is the raw rest"
         );
-        // And what got advertised must actually be loadable under that id
-        // — the whole point of fixing MUST-FIX 2.
-        assert!(mission_config::load(&found.id).is_ok(), "the advertised id must resolve via mission_config::load");
+        assert_eq!(
+            parse_mission_verb("launch review"),
+            Ok(MissionVerb::Launch { config_id: "review".to_string(), rest: String::new() })
+        );
+        assert_eq!(parse_mission_verb("show m-1"), Ok(MissionVerb::Show { id: "m-1".to_string() }));
+    }
 
-        // SAFETY: this test is #[serial_test::serial].
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_HOME", v),
-                None => std::env::remove_var("DARKMUX_HOME"),
+    #[test]
+    fn parse_mission_verb_refuses_malformed_input_naming_the_usage() {
+        for bad in ["", "launch", "show", "show a b", "list extra", "finalize m-1", "abort"] {
+            let reply = parse_mission_verb(bad).expect_err(bad);
+            assert!(reply.contains("/mission launch <config>"), "`{bad}` must name the usage: {reply}");
+        }
+    }
+
+    #[test]
+    fn parse_invocation_accepts_only_the_mission_command() {
+        assert_eq!(parse_invocation("/mission list"), Some(PanelInvocation::Mission(MissionVerb::List)));
+        assert_eq!(parse_invocation("/MISSION list"), Some(PanelInvocation::Mission(MissionVerb::List)));
+        assert_eq!(parse_invocation("   "), None);
+        assert_eq!(parse_invocation("/"), None);
+        assert_eq!(parse_invocation("mission list"), None, "no slash is never a command");
+    }
+
+    /// The retired per-config commands are refused, naming what replaces them.
+    #[test]
+    fn a_retired_per_config_command_is_refused_naming_mission_launch() {
+        match parse_invocation("/review") {
+            Some(PanelInvocation::Refused(reply)) => {
+                assert!(reply.contains("/mission launch <config>"), "{reply}");
+                assert!(reply.contains("`/mission`"), "{reply}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    // ── argument mapping ────────────────────────────────────────────────
+
+    fn input(name: &str) -> MissionInput {
+        MissionInput { name: name.to_string(), description: None, required: Some(false), default: None, ignored: None, ignored_reason: None, extras: Map::new() }
+    }
+
+    fn config_with(inputs: &[&str], reads_args: bool) -> MissionConfig {
+        let reads: &[&str] = if reads_args { &[PANEL_ARGS_TASK_ID] } else { &[] };
+        let mut cfg = config(
+            "mapped",
+            vec![phase("p1", vec![task("t1", &[], reads, vec![step("s1", "procedural.noop", serde_json::Value::Null)])])],
+        );
+        cfg.inputs = inputs.iter().map(|n| input(n)).collect();
+        cfg
+    }
+
+    #[test]
+    fn a_declared_name_value_token_becomes_a_param_and_the_rest_is_free_text() {
+        let cfg = config_with(&["rules"], true);
+        assert_eq!(
+            map_launch_args(&cfg, "rules=a,b 42 --squash").unwrap(),
+            vec!["rules=a,b".to_string(), "args=42 --squash".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_undeclared_name_value_token_is_free_text_not_a_param() {
+        // The inverse: a token that merely contains `=` is a param only when
+        // the config declares that input, or free text with an `=` in it
+        // would be swallowed into an undeclared `--param`.
+        let cfg = config_with(&["rules"], true);
+        assert_eq!(map_launch_args(&cfg, "title=x").unwrap(), vec!["args=title=x".to_string()]);
+    }
+
+    #[test]
+    fn free_text_for_a_config_that_reads_no_args_is_refused_naming_its_inputs() {
+        let cfg = config_with(&["rules", "draws"], false);
+        let err = map_launch_args(&cfg, "please look closely").unwrap_err().to_string();
+        assert!(err.contains("takes no free text"), "{err}");
+        assert!(err.contains("rules, draws"), "the refusal names the declared inputs: {err}");
+        let bare = config_with(&[], false);
+        assert!(map_launch_args(&bare, "x").unwrap_err().to_string().contains("takes no arguments"));
+    }
+
+    #[test]
+    fn declared_params_alone_need_no_args_reader() {
+        let cfg = config_with(&["rules"], false);
+        assert_eq!(map_launch_args(&cfg, "rules=a").unwrap(), vec!["rules=a".to_string()]);
+        assert!(map_launch_args(&cfg, "").unwrap().is_empty());
+    }
+
+    // ── launch planning over the registry ───────────────────────────────
+
+    struct HomeGuard(Option<String>);
+
+    impl HomeGuard {
+        fn set(path: &Path) -> Self {
+            let prev = std::env::var("DARKMUX_HOME").ok();
+            // SAFETY: every caller is #[serial_test::serial].
+            unsafe { std::env::set_var("DARKMUX_HOME", path) };
+            HomeGuard(prev)
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            // SAFETY: every caller is #[serial_test::serial].
+            unsafe {
+                match &self.0 {
+                    Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                    None => std::env::remove_var("DARKMUX_HOME"),
+                }
             }
         }
     }
 
-    // ── not_a_command_message ────────────────────────────────────────
+    fn write_config(home: &Path, file_stem: &str, body: serde_json::Value) {
+        let dir = home.join("mission-configs");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{file_stem}.json")), serde_json::to_string(&body).unwrap()).unwrap();
+    }
 
+    /// THE PROMISE: the panel lists a config exactly when `mission launch`
+    /// accepts its id, and plans every one it lists, including a config whose
+    /// body id differs from its file stem. An id `mission launch` refuses
+    /// (an uppercase letter) is not offered, so `/mission list` never names a
+    /// config the CLI cannot start.
     #[test]
-    fn not_a_command_message_lists_the_advertised_commands() {
-        let advertised = vec![
-            PanelCommand { id: "review".to_string(), description: "d".to_string(), hint: None, accepts_args: true },
-            PanelCommand { id: "pr-list".to_string(), description: "d2".to_string(), hint: None, accepts_args: true },
-        ];
-        let msg = not_a_command_message(&advertised);
-        assert!(msg.contains("/review"), "{msg}");
-        assert!(msg.contains("/pr-list"), "{msg}");
+    #[serial_test::serial]
+    fn the_panel_lists_exactly_the_configs_launch_accepts_and_plans_each() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _home = HomeGuard::set(tmp.path());
+        let shell = serde_json::json!([{"id": "p1", "tasks": [{"id": "t1", "steps": [
+            {"id": "s1", "kind": "procedural.shell", "config": {"command": "echo hi"}}]}]}]);
+        write_config(tmp.path(), "pr-view", serde_json::json!({"id": "pr-view", "name": "PR View", "phases": shell}));
+        write_config(tmp.path(), "renamed", serde_json::json!({"id": "body-id-differs", "name": "Renamed", "phases": shell}));
+        write_config(tmp.path(), "Upper-Case", serde_json::json!({"id": "Upper-Case", "name": "Upper", "phases": shell}));
+
+        let listed: Vec<String> = list_launchable().into_iter().map(|c| c.id).collect();
+        for id in mission_config::list_ids() {
+            let launchable = crate::mission_launch::resolve_config(&id).is_ok();
+            assert_eq!(listed.contains(&id), launchable, "`{id}`: listed must equal launchable, listed = {listed:?}");
+            if launchable {
+                plan_launch(&id, "").unwrap_or_else(|e| panic!("`{id}` is listed, so it must plan: {e:#}"));
+            }
+        }
+        for id in ["pr-view", "renamed", "review", "machine-status", "crawl", "coder-phase"] {
+            assert!(listed.contains(&id.to_string()), "`{id}` must be listed: {listed:?}");
+        }
+        assert!(!listed.contains(&"Upper-Case".to_string()), "an id `mission launch` refuses is not offered");
+        assert_eq!(plan_launch("renamed", "").unwrap().config_id, "renamed", "the plan carries the id the operator typed");
     }
 
     #[test]
-    fn not_a_command_message_handles_an_empty_advertised_list() {
-        let msg = not_a_command_message(&[]);
-        assert!(!msg.is_empty());
-        assert!(!msg.contains("/review"));
+    #[serial_test::serial]
+    fn a_procedural_only_config_plans_ephemeral_and_a_dispatching_one_plans_a_launch() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _home = HomeGuard::set(tmp.path());
+        let shell = |kind: &str| serde_json::json!([{"id": "p1", "tasks": [{"id": "t1", "steps": [{"id": "s1", "kind": kind}]}]}]);
+        write_config(tmp.path(), "local-only", serde_json::json!({"id": "local-only", "name": "L", "phases": shell("procedural.noop")}));
+        write_config(tmp.path(), "seated", serde_json::json!({"id": "seated", "name": "S", "phases": shell("dispatch.internal")}));
+        assert_eq!(plan_launch("local-only", "").unwrap().route, LaunchRoute::Ephemeral);
+        assert_eq!(plan_launch("seated", "").unwrap().route, LaunchRoute::Launch);
+        assert_eq!(
+            plan_launch("machine-status", "").unwrap().route,
+            LaunchRoute::Ephemeral,
+            "the built-in machine-status still runs in-process as `/mission launch machine-status`"
+        );
+    }
+
+    /// An unknown config is refused with the words `mission launch` uses.
+    #[test]
+    #[serial_test::serial]
+    fn an_unknown_config_is_refused_with_the_launch_refusal_text() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _home = HomeGuard::set(tmp.path());
+        let panel = match plan_launch("no-such-config", "") {
+            Err(e) => format!("{e:#}"),
+            Ok(_) => panic!("an unknown config must be refused"),
+        };
+        let cli = format!("{:#}", crate::mission_launch::resolve_config("no-such-config").err().expect("the CLI refuses it"));
+        assert_eq!(panel, cli, "one refusal text on both surfaces");
+        assert!(panel.contains("loading mission config \"no-such-config\""), "{panel}");
+    }
+
+    /// The retired `panel` block is refused by the same gate `mission launch`
+    /// runs first, naming the replacement.
+    #[test]
+    #[serial_test::serial]
+    fn a_config_still_carrying_a_panel_block_is_refused_naming_mission_launch() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _home = HomeGuard::set(tmp.path());
+        write_config(
+            tmp.path(),
+            "old-style",
+            serde_json::json!({"id": "old-style", "name": "Old", "panel": {"description": "d"}, "phases": []}),
+        );
+        let err = format!("{:#}", plan_launch("old-style", "").err().expect("a panel block must be refused"));
+        assert!(err.contains("/mission launch <id>"), "{err}");
+    }
+
+    // ── /mission list ───────────────────────────────────────────────────
+
+    #[test]
+    fn render_mission_list_gives_one_line_per_config() {
+        let configs = vec![
+            LaunchableConfig { id: "a".to_string(), summary: "Does A.".to_string(), accepts_args: false },
+            LaunchableConfig { id: "b".to_string(), summary: "Does B.".to_string(), accepts_args: true },
+        ];
+        let text = render_mission_list(&configs);
+        assert!(text.contains("- `a`: Does A.") && text.contains("- `b`: Does B."), "{text}");
+        assert!(render_mission_list(&[]).contains("No mission configs"));
+    }
+
+    #[test]
+    fn config_summary_is_the_first_sentence_else_the_name() {
+        let mut cfg = config("x", vec![]);
+        cfg.name = "The Name".to_string();
+        assert_eq!(config_summary(&cfg), "The Name");
+        cfg.description = Some("Says what it does. Then a long paragraph of provenance.".to_string());
+        assert_eq!(config_summary(&cfg), "Says what it does.");
+    }
+
+    /// The shipped configs lead with a plain sentence: it is what the router
+    /// reads and what `/mission list` prints.
+    #[test]
+    fn the_builtin_summaries_name_what_they_do_in_plain_words() {
+        let review = config_summary(&embedded_review());
+        assert!(review.to_ascii_lowercase().contains("review"), "{review}");
+        assert!(!review.contains("#2310"), "no issue numbers in a router-facing summary: {review}");
+        let status = config_summary(&mission_config::load("machine-status").unwrap().config);
+        assert!(status.to_ascii_lowercase().contains("loaded"), "{status}");
+        assert!(!status.contains("#2918"), "{status}");
+    }
+
+    // ── prepare_launch: diff synthesis keyed on declared inputs ─────────
+
+    fn ready(prepared: Prepared) -> PreparedLaunch {
+        match prepared {
+            Prepared::Ready(p) => p,
+            Prepared::Nothing(msg) => panic!("expected Ready, got Nothing({msg})"),
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_renamed_copy_of_review_is_synthesized_because_it_declares_a_required_diff_file() {
+        let repo = temp_repo(2);
+        let mut copy = embedded_review();
+        copy.id = "my-review-copy".to_string();
+        let prepared = ready(prepare_launch(&copy, Vec::new(), repo.path()).unwrap());
+        for key in ["diff_file", "workspace", "head_sha"] {
+            assert!(supplies(&prepared.params, key), "`{key}` must be synthesized: {:?}", prepared.params);
+        }
+    }
+
+    /// An operator-supplied `diff_file` is never overridden by the cwd's.
+    #[test]
+    #[serial_test::serial]
+    fn a_supplied_diff_file_suppresses_synthesis() {
+        let not_a_repo = tempfile::TempDir::new().unwrap();
+        let given = vec!["diff_file=/tmp/mine.diff".to_string()];
+        let prepared = ready(prepare_launch(&embedded_review(), given.clone(), not_a_repo.path()).unwrap());
+        assert_eq!(prepared.params, given, "no synthesis, so a non-repo cwd is not even consulted");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_config_without_a_diff_input_passes_its_params_through_untouched() {
+        let repo = temp_repo(2);
+        let given = vec!["rules=a".to_string()];
+        let prepared = ready(prepare_launch(&config_with(&["rules"], false), given.clone(), repo.path()).unwrap());
+        assert_eq!(prepared.params, given);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_repo_with_nothing_to_review_reports_nothing_through_prepare_launch() {
+        let repo = temp_repo(1);
+        assert!(matches!(
+            prepare_launch(&embedded_review(), Vec::new(), repo.path()).unwrap(),
+            Prepared::Nothing(_)
+        ));
     }
 
     // ── run_ephemeral (required test: two-step procedural.shell chain) ──
@@ -1484,7 +1558,6 @@ mod tests {
     fn ephemeral_run_chains_two_procedural_shell_steps_via_step_input_env_var() {
         let cfg = config(
             "echo-chain",
-            None,
             vec![phase(
                 "p1",
                 vec![
@@ -1508,7 +1581,7 @@ mod tests {
             )],
         );
         let tmp = std::env::temp_dir();
-        let out = run_ephemeral(&cfg, "", &tmp, None).expect("ephemeral run succeeds");
+        let out = run_ephemeral(&cfg, &[], &tmp, None).expect("ephemeral run succeeds");
         assert_eq!(out.text.trim(), "got: hello-from-producer");
         assert!(out.success);
     }
@@ -1526,11 +1599,10 @@ mod tests {
 
         let cfg = config(
             "noop-test",
-            None,
             vec![phase("p1", vec![task("t1", &[], &[], vec![step("s1", "procedural.noop", serde_json::Value::Null)])])],
         );
         let cwd = std::env::temp_dir();
-        let out = run_ephemeral(&cfg, "", &cwd, None).expect("ephemeral run succeeds");
+        let out = run_ephemeral(&cfg, &[], &cwd, None).expect("ephemeral run succeeds");
         // `procedural.noop` with no `output` override defaults to its own
         // step id (see `ProceduralNoopStepKind::run`) — proves the run
         // actually executed, not just that no directory appeared.
@@ -1567,11 +1639,10 @@ mod tests {
 
         let cfg = config(
             "bookend-noop-test",
-            None,
             vec![phase("p1", vec![task("t1", &[], &[], vec![step("s1", "procedural.noop", serde_json::Value::Null)])])],
         );
         let cwd = std::env::temp_dir();
-        let out = run_ephemeral(&cfg, "", &cwd, None).expect("ephemeral run succeeds");
+        let out = run_ephemeral(&cfg, &[], &cwd, None).expect("ephemeral run succeeds");
         assert!(out.success);
 
         let records = read_all_flow_records();
@@ -1622,7 +1693,6 @@ mod tests {
 
         let cfg = config(
             "panel-args-test",
-            None,
             vec![phase(
                 "p1",
                 vec![task(
@@ -1635,9 +1705,9 @@ mod tests {
         );
         let cwd = std::env::temp_dir();
 
-        let out1 = run_ephemeral(&cfg, "", &cwd, None).expect("first ephemeral run succeeds");
+        let out1 = run_ephemeral(&cfg, &[], &cwd, None).expect("first ephemeral run succeeds");
         assert!(out1.success);
-        let out2 = run_ephemeral(&cfg, "", &cwd, None).expect("second ephemeral run succeeds");
+        let out2 = run_ephemeral(&cfg, &[], &cwd, None).expect("second ephemeral run succeeds");
         assert!(out2.success);
 
         let records = read_all_flow_records();
@@ -1715,7 +1785,7 @@ mod tests {
         let mut decline = |_s: &Step, _f: &Map<String, String>| crate::crew::gate::GateDecision::Declined {
             reason: "operator declined".to_string(),
         };
-        let out = run_ephemeral(&cfg, "", &tmp, Some(&mut decline))
+        let out = run_ephemeral(&cfg, &[], &tmp, Some(&mut decline))
             .expect("a declined gate still renders a command-failed message, not an Err");
         assert!(!out.success);
 
@@ -1744,7 +1814,6 @@ mod tests {
         // (case-folded).
         let cfg = config(
             "args-echo",
-            None,
             vec![phase(
                 "p1",
                 vec![task(
@@ -1760,7 +1829,7 @@ mod tests {
             )],
         );
         let tmp = std::env::temp_dir();
-        let out = run_ephemeral(&cfg, "hello world", &tmp, None).expect("ephemeral run succeeds");
+        let out = run_ephemeral(&cfg, &["args=hello world".to_string()], &tmp, None).expect("ephemeral run succeeds");
         assert_eq!(out.text.trim(), "arg: hello world");
     }
 
@@ -1773,7 +1842,6 @@ mod tests {
         // config must still interpret/run cleanly, not dangle.
         let cfg = config(
             "args-echo-empty",
-            None,
             vec![phase(
                 "p1",
                 vec![task(
@@ -1789,7 +1857,7 @@ mod tests {
             )],
         );
         let tmp = std::env::temp_dir();
-        let out = run_ephemeral(&cfg, "", &tmp, None).expect("ephemeral run succeeds");
+        let out = run_ephemeral(&cfg, &[], &tmp, None).expect("ephemeral run succeeds");
         assert_eq!(out.text.trim(), "arg:[]");
     }
 
@@ -1806,7 +1874,6 @@ mod tests {
         // output, never the synthetic args string.
         let cfg = config(
             "reserved-collision",
-            None,
             vec![phase(
                 "p1",
                 vec![
@@ -1837,7 +1904,7 @@ mod tests {
         // A NON-EMPTY args string — if injection had run anyway (ignoring
         // the collision), the reading task would see THIS value instead
         // of the document's own task output.
-        let out = run_ephemeral(&cfg, "this-should-be-ignored", &tmp, None).expect("ephemeral run succeeds, no duplicate-id bail");
+        let out = run_ephemeral(&cfg, &["args=this-should-be-ignored".to_string()], &tmp, None).expect("ephemeral run succeeds, no duplicate-id bail");
         assert_eq!(out.text.trim(), "got: operator-owned-value");
     }
 
@@ -1847,7 +1914,6 @@ mod tests {
     fn ephemeral_run_rejects_a_zero_step_task_at_validate_time_not_a_confusing_runtime_error() {
         let cfg = config(
             "hollow",
-            None,
             vec![phase(
                 "p1",
                 vec![
@@ -1856,7 +1922,7 @@ mod tests {
             )],
         );
         let tmp = std::env::temp_dir();
-        let err = run_ephemeral(&cfg, "", &tmp, None).expect_err("a zero-step task must fail validate(), not run");
+        let err = run_ephemeral(&cfg, &[], &tmp, None).expect_err("a zero-step task must fail validate(), not run");
         assert!(err.to_string().contains("failed validation"), "{err:#}");
     }
 
@@ -1978,7 +2044,6 @@ mod tests {
     fn gather_then_gated_config() -> MissionConfig {
         config(
             "gather-then-gated",
-            None,
             vec![phase(
                 "p1",
                 vec![
@@ -2020,7 +2085,7 @@ mod tests {
             received = Some(f.clone());
             crate::crew::gate::GateDecision::Approved
         };
-        let out = run_ephemeral(&cfg, "", &tmp, Some(&mut approve)).expect("ephemeral run succeeds");
+        let out = run_ephemeral(&cfg, &[], &tmp, Some(&mut approve)).expect("ephemeral run succeeds");
         assert_eq!(out.text.trim(), "merged", "an approved gate must let the executor step actually run");
         assert!(out.success);
         assert_eq!(
@@ -2045,7 +2110,7 @@ mod tests {
         // FAILURE (rendered as such, mirroring `render_ephemeral_result`'s
         // existing Error-terminal handling), never a hard `Err` propagated
         // across the ACP boundary.
-        let out = run_ephemeral(&cfg, "", &tmp, Some(&mut decline))
+        let out = run_ephemeral(&cfg, &[], &tmp, Some(&mut decline))
             .expect("a declined gate still renders a command-failed message, not an Err");
         assert!(!out.success, "a declined gate must report success: false");
         assert!(out.text.contains("darkmux: command failed"), "{}", out.text);
@@ -2160,7 +2225,7 @@ mod tests {
         let mut never_called = |_s: &Step, _f: &Map<String, String>| {
             panic!("the gate handler must never be invoked — the allowlist check refuses the whole config first")
         };
-        let out = run_ephemeral(&cfg, "", &tmp, Some(&mut never_called))
+        let out = run_ephemeral(&cfg, &[], &tmp, Some(&mut never_called))
             .expect("a blocked cmd-gate config still renders a command-failed message, not an Err");
         assert!(!out.success, "{}", out.text);
         assert!(out.text.contains("pr-merge"), "names the verb: {}", out.text);
@@ -2188,7 +2253,7 @@ mod tests {
         let cfg = gather_then_gated_config_with_verb("pr-merge");
         let tmp = std::env::temp_dir();
         let mut approve = |_s: &Step, _f: &Map<String, String>| crate::crew::gate::GateDecision::Approved;
-        let out = run_ephemeral(&cfg, "", &tmp, Some(&mut approve)).expect("ephemeral run succeeds");
+        let out = run_ephemeral(&cfg, &[], &tmp, Some(&mut approve)).expect("ephemeral run succeeds");
         assert_eq!(out.text.trim(), "merged", "allowlisted + approved must actually run the executor");
         assert!(out.success);
     }
@@ -2205,7 +2270,6 @@ mod tests {
         let _gh = GhEnvGuard::on("pr-merge");
         let cfg = config(
             "pr-merge",
-            None,
             vec![phase(
                 "p1",
                 vec![
@@ -2244,7 +2308,7 @@ mod tests {
             received = Some(f.clone());
             crate::crew::gate::GateDecision::Approved
         };
-        let out = run_ephemeral(&cfg, "", &tmp, Some(&mut approve)).expect("ephemeral run succeeds");
+        let out = run_ephemeral(&cfg, &[], &tmp, Some(&mut approve)).expect("ephemeral run succeeds");
         assert_eq!(out.text.trim(), "merged");
         let facts = received.expect("the gate handler must have been invoked");
         let gathered = facts.get("gather").expect("the gather task's output must be a fact");
@@ -2268,7 +2332,7 @@ mod tests {
         let cfg = gather_then_gated_config_with_verb("pr-merge");
         let worktree = std::env::temp_dir();
         let mut approve = |_s: &Step, _f: &Map<String, String>| crate::crew::gate::GateDecision::Approved;
-        let out = run_ephemeral(&cfg, "123", &worktree, Some(&mut approve)).expect("ephemeral run succeeds");
+        let out = run_ephemeral(&cfg, &["args=123".to_string()], &worktree, Some(&mut approve)).expect("ephemeral run succeeds");
         assert!(out.success);
 
         let records = read_all_flow_records();
@@ -2303,7 +2367,6 @@ mod tests {
 
         let cfg = config(
             "echo-test",
-            None,
             vec![phase(
                 "p1",
                 vec![task("t1", &[], &[], vec![step("s1", "procedural.shell", serde_json::json!({"command": "echo hi"}))])],
@@ -2311,7 +2374,7 @@ mod tests {
         );
         assert!(cfg.cmd.is_none());
         let tmp = std::env::temp_dir();
-        let out = run_ephemeral(&cfg, "", &tmp, None).expect("ephemeral run succeeds");
+        let out = run_ephemeral(&cfg, &[], &tmp, None).expect("ephemeral run succeeds");
         assert!(out.success);
         assert!(
             read_all_flow_records().iter().all(|r| r["action"] != "gh.verb.executed"),
@@ -2511,7 +2574,6 @@ mod tests {
         let repo = temp_repo(2);
         let cfg = config(
             "plain",
-            None,
             vec![phase("p1", vec![task("t1", &[], &[], vec![step("s1", "dispatch.internal", serde_json::Value::Null)])])],
         );
         assert!(matches!(

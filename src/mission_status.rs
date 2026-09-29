@@ -151,7 +151,7 @@ fn degraded_phase_ids(mission_id: &str) -> std::collections::BTreeSet<String> {
 /// Encoding is inline rather than a new dependency, per this repo's
 /// small-dep convention: the rule needed here is one line of RFC 3986
 /// unreserved-set logic, not a crate.
-fn mission_url(base: &str, id: &str) -> String {
+pub(crate) fn mission_url(base: &str, id: &str) -> String {
     let encoded: String = id
         .bytes()
         .map(|b| match b {
@@ -196,7 +196,7 @@ fn panel_deep_link(link_base: &str, target: &str) -> Option<String> {
 /// means the fix was not pinned. `viewer_link_base` handles the host half
 /// and short-circuits without spawning `tailscale` when no link will be
 /// emitted.
-fn board_link_base() -> String {
+pub(crate) fn board_link_base() -> String {
     darkmux_doctor::viewer_link_base(darkmux_types::config_access::serve_port())
 }
 
@@ -336,7 +336,7 @@ const DESCRIPTION_NOTE_CAP_CHARS: usize = 120;
 /// that as ordinary punctuation inside a token rather than a sentence
 /// boundary, and finds the terminator several dozen characters later
 /// instead.
-fn first_sentence(d: &str) -> &str {
+pub(crate) fn first_sentence(d: &str) -> &str {
     for (i, ch) in d.char_indices() {
         if ch == '.' {
             let after = &d[i + 1..];
@@ -356,7 +356,7 @@ fn first_sentence(d: &str) -> &str {
 /// feature's own second wall of text. Backs off to the last whitespace
 /// inside the cut rather than hard-truncating at `max`, so the ellipsis
 /// never lands mid-identifier (e.g. mid backtick-quoted code, mid word).
-fn cap_note(s: &str, max: usize) -> String {
+pub(crate) fn cap_note(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
     }
