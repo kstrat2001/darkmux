@@ -459,7 +459,7 @@ fn every_historical_config_key_is_named_as_retired() {
     let not_retired: Vec<String> =
         keys.iter().filter(|k| !matches!(k.issue, Issue::Retired(_))).map(ToString::to_string).collect();
     assert!(not_retired.is_empty(), "{not_retired:#?}");
-    assert_eq!(keys.len(), 11, "{keys:#?}");
+    assert_eq!(keys.len(), 12, "{keys:#?}");
     let msg: String = keys.iter().map(|k| format!("{k}\n")).collect();
     for says in ["`gh`: renamed to `cmd`", "`orchestrator`: removed", "`remote.stage_budget_policy`: renamed to `remote.step_budget_policy`", "host_sampler_interval_ms", "`runtime.daemon_auth_enabled`: replaced in 4.0 (#2988) by `serve.token_keychain`", "`dirs.crew`: removed in 4.0", "DARKMUX_HOME"] {
         assert!(msg.contains(says), "{says}: {msg}");

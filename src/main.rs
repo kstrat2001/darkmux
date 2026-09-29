@@ -135,8 +135,9 @@ pub(crate) fn test_run() -> darkmux_types::session_id::RunId {
 
 fn main() -> Result<()> {
     providers::register_builtins()?;
-    let argv: Vec<String> = std::env::args().collect();
-    if let Some(refusal) = retired_verbs::refusal(argv.get(1..).unwrap_or_default()) {
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let words: Vec<String> = argv.iter().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
+    if let Some(refusal) = retired_verbs::refusal(&words) {
         eprintln!("error: {refusal}");
         std::process::exit(2);
     }
