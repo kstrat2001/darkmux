@@ -217,7 +217,7 @@ describe("runDestination", () => {
       hash: "dispatch=crew-dispatch-analyst-1787557214045728-0&dispatch.mission=dispatch-analyst-1787557214-f5a8-0",
     });
     // Never gated on the graph being reachable — this route is a plain
-    // `/flow-session/<id>` fetch, not the graph lens's endpoint.
+    // `/flow-dispatch/<id>` fetch, not the graph lens's endpoint.
     expect(runDestination(tracked, false)).toEqual({
       kind: "hash",
       hash: "dispatch=crew-dispatch-analyst-1787557214045728-0&dispatch.mission=dispatch-analyst-1787557214-f5a8-0",
@@ -314,7 +314,7 @@ describe("runDestination", () => {
     }
   });
 
-  it("(#2511) a RUNNING lab row with a session_id drills to its live session, not the funnels-only detail view", () => {
+  it("(#2511) a RUNNING lab row with a session_id drills to its live session, not the reviews-only detail view", () => {
     // Before #2511's record-side fix, this session would ALSO surface as a
     // duplicate untracked `ghost_runs` dispatch row, and clicking THAT row
     // was the only way to watch the live dispatch (`LabRunDetail` renders no

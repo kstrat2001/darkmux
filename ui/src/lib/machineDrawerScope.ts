@@ -9,7 +9,7 @@
  *   frozen once it stops (no new samples arrive within the span, so the
  *   aggregate simply stops changing; no separate "frozen" flag needed).
  *   The caller's `routeRecords` for a dispatch route is the daemon's
- *   `/flow-session/<id>` fetch, which time+machine-joins the MACHINE-scoped
+ *   `/flow-dispatch/<id>` fetch, which time+machine-joins the MACHINE-scoped
  *   `machine.telemetry` sampler's records into that window server-side
  *   (`join_host_samples_into_session_records`,
  *   `crates/darkmux-serve/src/lib.rs`). Since schema 1.42.0 / #2413 that
@@ -56,7 +56,7 @@
 import type { Route } from "./route";
 import { uidOf } from "./flow";
 import type { ProcSamplePoint } from "./hostStats";
-import { ACTION, CATEGORY, byTime, recordsAsOf, recordsSince, type NormRecord } from "./ingest";
+import { ACTION, CATEGORY, SOURCE, byTime, recordsAsOf, recordsSince, type NormRecord } from "./ingest";
 
 const DRAWER_ROLLING_WINDOW_MS = 10 * 60 * 1000;
 export const DRAWER_ROLLING_SCOPE_LABEL = "last 10 min";
@@ -77,11 +77,11 @@ const LAST_KNOWN_LOOKBACK_MS = 24 * 60 * 60 * 1000;
  * by design, so old records keep showing SOMETHING rather than going
  * blank. The retired action is outside the flow vocabulary, so its arm
  * matches the shape it always carried (`category: "telemetry"`,
- * `source: "process"`). */
+ * `source: "host"`). */
 export function isHostSampleRecord(r: NormRecord): boolean {
   return (
     r.action === ACTION.MachineTelemetry ||
-    (r.category === CATEGORY.Telemetry && r.source === "process")
+    (r.category === CATEGORY.Telemetry && r.source === SOURCE.Host)
   );
 }
 

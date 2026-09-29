@@ -1,11 +1,12 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { panelAgeLabel } from "./format";
-import type { PanelResponse } from "../../types/handwritten";
+import type { PanelResponse } from "../../types/generated/PanelResponse";
 
 function body(overrides: Partial<PanelResponse> = {}): PanelResponse {
   return {
     panel: "mission-status",
     argv: ["mission", "status"],
+    opts: {},
     captured_ts_ms: Date.UTC(2026, 0, 1, 12, 0, 0),
     gather_ms: 8,
     exit_code: 0,

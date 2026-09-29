@@ -4,7 +4,7 @@ import {
   sumUsage,
   type UsagePayload,
 } from "../../lib/usageRecords";
-import { ACTION, CATEGORY, executionOf, type NormRecord } from "../../lib/ingest";
+import { ACTION, CATEGORY, SOURCE, executionOf, type NormRecord } from "../../lib/ingest";
 
 /**
  * `tokensOffMeter()` — the fleet hero's numbers (#783, #1186, #1607, #2902).
@@ -85,7 +85,7 @@ function dispatchCount(data: NormRecord[]): number {
   let runs = 0;
   for (const r of data) {
     const p = r.payload as (UsagePayload & { endpoint?: unknown }) | undefined;
-    if (r.category === CATEGORY.Telemetry && r.source === "tokens") {
+    if (r.category === CATEGORY.Telemetry && r.source === SOURCE.Tokens) {
       const u = p ?? {};
       if (u.call_kind !== CALL_KIND.single_shot && u.call_kind !== CALL_KIND.compaction && u.token_source !== "absent") inFlight.add(executionOf(r));
       continue;

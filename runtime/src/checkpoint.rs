@@ -365,22 +365,6 @@ mod tests {
         assert_eq!(loaded.total_completion_tokens, 5);
     }
 
-    /// The host reports a resumed run's whole-task turn count as the
-    /// checkpoint it resumed from plus what the run recorded, reading this
-    /// file through `darkmux_trajectory::CheckpointCounts`. A rename here
-    /// would zero that seed silently.
-    #[test]
-    fn the_host_reads_the_seeded_counters_this_writes() {
-        let mut checkpoint = sample();
-        checkpoint.turns = 7;
-        checkpoint.compactions = 2;
-        let json = serde_json::to_string(&checkpoint).unwrap();
-        assert_eq!(
-            darkmux_trajectory::CheckpointCounts::of(&json),
-            darkmux_trajectory::CheckpointCounts { turns: 7, compactions: 2 }
-        );
-    }
-
     #[test]
     fn write_is_atomic_no_tmp_file_left_behind() {
         let out_dir = tempfile::tempdir().unwrap();

@@ -70,10 +70,10 @@
   ],
   "edges": [
     {
-      "id": "phase-investigate->phase-adjudicate",
-      "source": "phase-investigate",
-      "target": "phase-adjudicate",
-      "kind": "phase_order"
+      "id": "phase-adjudicate->task-judge",
+      "source": "phase-adjudicate",
+      "target": "task-judge",
+      "kind": "contains"
     }
   ],
   "legacy": false,

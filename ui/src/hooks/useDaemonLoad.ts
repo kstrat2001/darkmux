@@ -48,11 +48,9 @@ import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../lib/fetcher";
 import { queryKeys } from "../lib/queryKeys";
 import { getSource } from "../lib/source";
-import type {
-  MachineLoad,
-  MachineResources,
-  MachineSpecs,
-} from "../types/handwritten";
+import type { MachineLoad } from "../types/generated/MachineLoad";
+import type { MachineResourcesResponse } from "../types/generated/MachineResourcesResponse";
+import type { MachineSpecsResponse } from "../types/generated/MachineSpecsResponse";
 
 export const DAEMON_LOAD_POLL_MS = 3_000;
 
@@ -68,7 +66,7 @@ export function useDaemonLoad(enabled: boolean): MachineLoad | null {
 
   const liveQuery = useQuery({
     queryKey: queryKeys.machineResources(),
-    queryFn: () => fetchJson<MachineResources>("/machine/resources"),
+    queryFn: () => fetchJson<MachineResourcesResponse>("/machine/resources"),
     refetchInterval: DAEMON_LOAD_POLL_MS,
     enabled: daemonBacked && enabled,
   });
@@ -76,7 +74,7 @@ export function useDaemonLoad(enabled: boolean): MachineLoad | null {
   const staticQuery = useQuery({
     queryKey: queryKeys.staticMachine(machineSrc ?? ""),
     queryFn: () =>
-      fetchJson<{ specs: MachineSpecs; resources: MachineResources }>(
+      fetchJson<{ specs: MachineSpecsResponse; resources: MachineResourcesResponse }>(
         machineSrc as string,
       ),
     enabled: !daemonBacked && machineSrc !== null && enabled,

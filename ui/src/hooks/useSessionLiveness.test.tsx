@@ -24,7 +24,7 @@ import { normAll } from "../testing/records";
  * `dispatch complete`, the page froze on its last live snapshot permanently.
  *
  * **Why these tests drive presence directly rather than through
- * `/fleet/sessions/live`.** The other blocks in `useRouteRecords.test.tsx` let
+ * `/fleet/dispatches/live`.** The other blocks in `useRouteRecords.test.tsx` let
  * the real presence query run and wait out real 5s intervals; that cannot
  * express THIS test. The presence poll and the session poll share a cadence,
  * so a session poll already scheduled when presence drops can land after the
@@ -95,7 +95,7 @@ function stubFetch() {
     };
   });
   vi.stubGlobal("fetch", fetchMock);
-  return { calls, sliceFetches: () => calls.filter((u) => u.startsWith("/flow-session/")).length };
+  return { calls, sliceFetches: () => calls.filter((u) => u.startsWith("/flow-dispatch/")).length };
 }
 
 const ROUTE: Route = { kind: "dispatch", dispatchId: SID, missionId: null };

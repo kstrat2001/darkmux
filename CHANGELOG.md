@@ -16,6 +16,41 @@ darkmux release.
 
 ### Removed (breaking, 4.0)
 
+- **The daemon HTTP API is a semver contract, and its aliases are gone** (C1,
+  A3, C2, C3). From this release the daemon's routes and response shapes change
+  only on purpose: every JSON body is a serialized Rust type in
+  `crates/darkmux-serve/src/wire.rs` with a generated TypeScript twin,
+  `ui/src/types/handwritten.ts` is deleted, and
+  `crates/darkmux-serve/route-table.golden` pins every route's method, path and
+  response type. **Removed with no alias (each answers 404):** `GET /next`,
+  `GET /mission/:id/graph`, `GET /flow-status`, `GET /worktree-summary/:session_id`.
+  **Renamed:** `GET /flow-session/:id` is `GET /flow-dispatch/:id`, and
+  `GET /fleet/sessions/live` is `GET /fleet/dispatches/live` with its `sessions`
+  array now `dispatches` ("session" is an internal join key, contract 8).
+  **Viewer links:** `#session=<id>` is `#dispatch=<id>`, `#lens=lab` is
+  `#lens=runs&kind=lab`, `#lens=machine&uid=<uid>` is `#lens=machine&machine=<key>`
+  and `panel=mission-status-all` is `panel=mission-status&opt.all=all`; the old
+  spellings open the "Unknown route" page instead of being rewritten. `darkmux
+  mission status` now prints `#mission=<id>` and `opt.all=all` links (it printed
+  the retired `/mission/<id>/graph` and `mission-status-all` forms).
+  **Response shapes changed on the wire:** `GET /machine/resources` answers
+  HTTP 500 with a plain-text body when the ledger gather panics, where it
+  answered 200 with an `{"error": ...}` body; `GET /fleet/roster` entries are a
+  fixed set of fields (the roster file's own unknown `extras` no longer leak
+  through); `GET /lab/runs` rows carry `has_reviews` (was `has_funnels`) and a
+  `staffing` reduced to each seat's `name`/`model`/`k`/`n_ctx`/`max_tokens`;
+  `GET /lab/run/detail` returns `reviews` (was `funnels`, the whole envelope) as
+  a six-field summary per case, and `scores` as `{role, mode, profile}` (was the
+  whole scores document). Every other route keeps the bytes it served; what
+  changed is that its shape is now one Rust type with a generated twin, and the
+  viewer's old hand-written copies were corrected to it (they had drifted:
+  `/runs` and `/flow-mission|dispatch/:id` had always sent `meta`, ledger fields
+  the viewer typed as numbers are nullable, a ledger state is `amber` not
+  `yellow`, a `SessionBeat` carries `display_name`, `role` and `model`).
+  **Migration:** none for operators; a script that
+  read the old routes or fields must use the new names. `funnels.json` and
+  `funnel-events.jsonl` in an old lab run directory are still read as archives
+  (no writer produces them since #2310).
 - **`darkmux mission dispatch` and the hand-built mission verbs** (#2954).
   Missions now come only from mission configs. Removed with no alias:
   `mission dispatch`, `mission add-phase`, `mission start`,
@@ -99,8 +134,7 @@ darkmux release.
   read from the trajectory, and its `--json` envelope carries no `metrics`
   block: the host writes that block from the fold, so `darkmux dispatch
   --json` still has one. `metrics.this_run` and `metrics.total_messages`
-  are gone: every figure in the block is this invocation's own, and only
-  `cumulative_turns`/`cumulative_compactions` count the whole task. The
+  are gone: every figure in the block is this invocation's own. The
   same holds on `dispatch.complete`: for a resumed dispatch its `rest_ms`
   and `rests` are now this invocation's rests (they were the whole task's,
   seeded from the checkpoint), like its token counts. A checkpoint no
@@ -114,7 +148,8 @@ darkmux release.
   was `metrics.json`. A usage record (`telemetry.tokens`) now omits a
   count the provider did not report rather than writing 0. **Migration:**
   a task's whole token total is the sum of its sessions' `telemetry.tokens`
-  records; `cumulative_turns`/`cumulative_compactions` stay.
+  records. (`cumulative_turns`/`cumulative_compactions` went too; see
+  "The flow record's leftover fields" below.)
 - **`radio.router_profile`, `DARKMUX_RADIO_ROUTER_PROFILE`, and the
   `role_profiles.radio-router` binding** (#2914). The radio routing seat
   now runs on the machine's one utility model (below), so there is no
@@ -204,6 +239,63 @@ darkmux release.
   `auto` and `pause` the same. A role manifest that still sets it is refused
   like any retired key. **Migration:** delete `escalation_posture` from your
   role manifests (`darkmux doctor`'s `user file keys` row names each file).
+
+### The flow record's leftover fields (breaking, 4.0, FLOW 2.0.0)
+
+- **`payload.runtime` is gone from every record.** It named the dispatch
+  topology (`internal`, `direct`, `scheduler`) and nothing outside the
+  viewer's run brief read it; the `--json` envelope's `metrics.runtime` for a
+  hosted single-shot goes with it. **Migration:** a receiver that branched on
+  it reads the record's `action` and `session_id`, or `payload.endpoint`.
+- **`FlowRecord.source` is a closed set with one spelling** (`snake_case`):
+  `crew_dispatch`, `scheduler`, `phase_lifecycle`, `mission_lifecycle`,
+  `phase_review`, `mission_debrief`, `host_sampler`, `presence_reconciler`,
+  `cmd_gate_audit`, `hook`, `host`, `detector`, `runtime`, `tokens`,
+  `context`, `compaction`, `lms`, `thermal`, `battery`, `budget`, `utility`,
+  and the four an operator writes. `host-sampler`, `presence-reconciler` and
+  `cmd-gate-audit` were kebab-case; they are `host_sampler`,
+  `presence_reconciler` and `cmd_gate_audit`. `darkmux flow
+  note|catch|record|tier-decision --source` accepts `orchestrator`,
+  `adjudication`, `manual` or `frontier` and refuses anything else
+  (`frontier-orchestrator` is `frontier`). darkmux's readers map the retired
+  spellings on read (`sprint_lifecycle`, `sprint_review`,
+  `frontier-orchestrator`, the per-dispatch sampler's `process`) and read a
+  source that maps nowhere as `unknown`. **Migration:** a receiver that
+  filters on `source` uses the `snake_case` spellings.
+- **`tier` says who acted, not where the model ran.** `local` (written on
+  every record, hosted-endpoint executions included) is now `darkmux`; the
+  values are `operator`, `frontier` and `darkmux`. `flow record --tier local`
+  is refused by the CLI's value list. **Migration:** read `payload.endpoint`
+  and `model` to learn where a call ran.
+- **`host.peak_cpu_pct` / `host.peak_mem_pct` are gone** from
+  `dispatch.complete`'s and the `--json` envelope's `host` block. They
+  mirrored `host.cpu.peak_pct` / `host.mem.peak_pct` for one release
+  (1.27.0) and that release ended long ago.
+- **`FlowRecord.work_id` / `attempt` are gone.** The work queue they came
+  from retired with #2916; an archive that carries them still reads.
+- **`stage: "estimate"` is gone** (nothing ever wrote it); a record that
+  carries it reads as `unknown`. `ship` stays: the hook sink's own records
+  carry it.
+- **`dispatch.complete`'s and the envelope's `cumulative_turns` /
+  `cumulative_compactions` are gone.** Every count on the record is this
+  invocation's own, and the whole-task count across resumes is no longer
+  reported (nothing read it). **Migration:** a resumed run's `turns` counts
+  only its own turns, and a hand-back resume continues the prior run's last
+  turn, so do not sum `turns` across a resume: that turn is counted in both
+  runs. Compaction counts do sum.
+- **One unit for time in payloads: durations are `*_ms`, instants are
+  `*_at_ms` (epoch milliseconds).** Renamed, with the value converted:
+  `budget.wait` `wait_seconds` is `wait_ms` and its ISO `resume_at` is
+  `resume_at_ms`; `utility.start` `stall_after_seconds` is `stall_after_ms`;
+  `machine.rollup` `period_seconds` is `period_ms`; `dispatch.complete`'s
+  `live` block `sampler_us` / `forward_us` are `sampler_ms` / `forward_ms`
+  (fractional); `machine.battery_health` `total_operating_time_hours` /
+  `time_at_soc_hours` are `total_operating_ms` / `time_at_soc_ms`, which
+  `GET /machine/resources` serves under the same keys in its `load.battery_health`
+  block. The config keys (`machine_rollup.period_seconds`, and the
+  `bounds` block, which is keyed by the config knob a value came from) keep
+  their names. darkmux's readers rename and convert an old record's keys on
+  read.
 
 ### Changed (breaking, 4.0)
 
@@ -489,19 +581,25 @@ darkmux release.
   --action` accepts only known actions. **Migration:** a consumer of the
   flow stream outside darkmux (a hook receiver, a script over the day files
   or Redis) must read the dotted spellings. A hook rule whose `match.action`
-  names an old exact spelling (`dispatch complete`) still matches: the hook
-  layer reads it as its current action, and `darkmux doctor` flags it `OLD
-  SPELLING` with what to write instead. A spaced glob is read as its dotted
-  twin only when that twin matches exactly what it used to (`step *` reads
-  as `step.*`); one that would match more (`dispatch *`, `mission *`,
-  `phase *`) matches nothing, and both `darkmux doctor` (`CANNOT MATCH`) and
-  the hook sink at startup say so.
+  names an old spelling, an exact one (`dispatch complete`) or a spaced glob
+  (`step *`), is refused: the hook sink does not load (the run itself
+  continues without hooks, like any other bad hook rule) and `darkmux doctor`
+  fails the rule (`RETIRED SPELLING`), each naming the spelling to write
+  (`dispatch.complete`, `step.*`). A glob's dotted twin can match more than
+  the old spelling did (`dispatch.*` also matches every `dispatch.turn` and
+  `dispatch.tool` record); the refusal says so. A rule's outbox is keyed by a
+  hash of its `match`, so a rewritten rule starts a new outbox: records still
+  pending under the old spelling are not delivered (they stay in the outbox
+  directory as `<key>.outbox.jsonl`; delete the stale files). The key is not
+  derived to survive the rewrite because that would mean hashing the retired
+  spelling forever. Only the hook outbox, an archive of records already
+  written, is still read leniently.
 - **A whole run has its own bookends: `run.start` / `run.complete` /
   `run.error`** (FLOW 2.0.0, CLAUDE.md contract 8). `mission launch` and an
   ACP panel run used to bracket the whole run in `dispatch.start` /
   `complete` / `error` with `source: "mission"` and `payload.runtime`
   (`mission` / `ephemeral`); they now write `run.*` on the run's own session
-  and neither field. `dispatch.*` means one role execution only. On the
+  and neither field (`payload.runtime` is gone from every record; see below). `dispatch.*` means one role execution only. On the
   viewer, the fleet card's DISPATCHES chip and the status line's "last
   dispatch" no longer count a run as a dispatch, and the event log files the
   run records as `run.start` / `run.complete` / `run.error` under MISSION.

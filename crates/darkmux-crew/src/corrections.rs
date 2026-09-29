@@ -122,7 +122,7 @@ pub fn scan(days: usize, scope: Scope<'_>) -> Vec<Correction> {
     for day in &recent {
         for r in darkmux_flow::reader::day_file_records(day) {
             if darkmux_flow::reader::action_of(&r) != Some(darkmux_flow::FlowAction::OperatorNote)
-                || r.get("source").and_then(|v| v.as_str()) != Some("adjudication")
+                || darkmux_flow::reader::source_of(&r) != Some(darkmux_flow::FlowSource::Adjudication)
             {
                 continue;
             }

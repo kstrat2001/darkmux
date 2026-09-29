@@ -108,7 +108,7 @@ function machineHeaderMatches(re: RegExp): boolean {
  *  hooks tolerate a bare array via `?? []`, which means a stale stub goes
  *  silently empty instead of failing — the exact trap that let the real
  *  breakage sit behind 222 green tests. Stubs speak the real shape. */
-const FLEET_OFF = (key: "machines" | "sessions") => ({
+const FLEET_OFF = (key: "machines" | "dispatches") => ({
   [key]: [],
   meta: { sources: { fleet: { state: "off" } }, complete: true },
 });
@@ -221,15 +221,15 @@ describe("App", () => {
         <App />
       </QueryClientProvider>,
     );
-    expect(screen.queryByText(/lens not ported yet/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/unknown route/i)).not.toBeInTheDocument();
     // (#1905 step 3) The default landing content is `run-list`'s own CLI
     // output now, not a client-rendered activity view's empty state.
     await waitFor(() => expect(screen.getByText("no runs")).toBeInTheDocument());
   });
 
-  it("renders the real session run view for #session=<id> (drill-in packet — SessionReplay is no longer a placeholder)", async () => {
+  it("renders the real dispatch run view for #dispatch=<id> (drill-in packet — SessionReplay is no longer a placeholder)", async () => {
     // `#lens=console` was this test's original target before Packet 6 ported
-    // the console lens for real, then `#session=<id>` rendered a bare
+    // the console lens for real, then `#dispatch=<id>` rendered a bare
     // `LensPlaceholder` before the drill-in packet landed `SessionReplay`'s
     // REAL render (`runRegions()`, see that component's own doc) — this is
     // the App-routing regression guard for that path: a session route
@@ -238,11 +238,11 @@ describe("App", () => {
     // `sessionRun.test.ts`'s job (including a byte-parity check against a
     // real recorded legacy golden); this test only proves App wires the
     // route to the real component.
-    window.location.hash = "#session=abc-123";
+    window.location.hash = "#dispatch=abc-123";
     vi.stubGlobal(
       "fetch",
       vi.fn((url: string) => {
-        if (typeof url === "string" && url.startsWith("/flow-session/")) {
+        if (typeof url === "string" && url.startsWith("/flow-dispatch/")) {
           return Promise.resolve(
             new Response(
               JSON.stringify({
@@ -264,7 +264,7 @@ describe("App", () => {
         <App />
       </QueryClientProvider>,
     );
-    expect(screen.queryByText(/lens not ported yet/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/unknown route/i)).not.toBeInTheDocument();
     await waitFor(() => expect(document.querySelector('.session-run[data-state="data"]')).not.toBeNull());
     // "CODER" is one of several sibling text nodes inside `.session-run__header`
     // (alongside the pill `<span>` and the meta `<span>`) — `getByText`'s
@@ -284,7 +284,7 @@ describe("App", () => {
         <App />
       </QueryClientProvider>,
     );
-    expect(screen.queryByText(/lens not ported yet/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/unknown route/i)).not.toBeInTheDocument();
     // The stagehdr line renders immediately (synchronous, no fetch needed
     // for its fallback text) even before the specs/flow-window queries
     // settle — see `MachineLens`'s `label` fallback ("this machine").
@@ -329,7 +329,7 @@ describe("App", () => {
         <App />
       </QueryClientProvider>,
     );
-    expect(screen.getByText(/lens not ported yet: unrecognized/i)).toBeInTheDocument();
+    expect(screen.getByText(/unknown route/i)).toBeInTheDocument();
     expect(screen.getByText(/lens=totally-bogus/)).toBeInTheDocument();
   });
 
@@ -346,7 +346,7 @@ describe("App", () => {
         <App />
       </QueryClientProvider>,
     );
-    expect(screen.getByText(/doesn't recognize that hash/i)).toBeInTheDocument();
+    expect(screen.getByText(/has no route for that hash/i)).toBeInTheDocument();
     expect(screen.getByText(/pick a lens from the tabs above/i)).toBeInTheDocument();
     expect(screen.queryByText(/legacy viewer/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/see.*get \//i)).not.toBeInTheDocument();
@@ -377,8 +377,8 @@ describe("App", () => {
       if (path.includes("/runs")) return Promise.resolve(new Response(JSON.stringify({ runs: [] }), { status: 200 }));
       if (path.includes("/fleet/machines/live"))
         return Promise.resolve(new Response(JSON.stringify(FLEET_OFF("machines")), { status: 200 }));
-      if (path.includes("/fleet/sessions/live"))
-        return Promise.resolve(new Response(JSON.stringify(FLEET_OFF("sessions")), { status: 200 }));
+      if (path.includes("/fleet/dispatches/live"))
+        return Promise.resolve(new Response(JSON.stringify(FLEET_OFF("dispatches")), { status: 200 }));
       if (path.includes("/fleet/") || path.includes("/flow")) return Promise.resolve(new Response("[]", { status: 200 }));
       return Promise.resolve(new Response("not recorded in this mock\n", { status: 404 }));
     });
@@ -401,7 +401,7 @@ describe("App", () => {
     expect(document.getElementById("lens-machine")!.className).toMatch(/\bon\b/);
   });
 
-  it("arriving on the legacy #lens=lab alias upgrades the address bar to the canonical #lens=runs&kind=lab", async () => {
+  it("arriving on the retired #lens=lab spelling shows the unknown-route page and leaves the address bar alone", async () => {
     window.location.hash = "#lens=lab";
     vi.stubGlobal("fetch", mockFleetLikeFetch());
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -410,8 +410,9 @@ describe("App", () => {
         <App />
       </QueryClientProvider>,
     );
-    await waitFor(() => expect(window.location.hash).toBe("#lens=runs&kind=lab"));
-    expect(document.getElementById("lens-runs")!.className).toMatch(/\bon\b/);
+    expect(await screen.findByText(/unknown route/i)).toBeInTheDocument();
+    expect(screen.getByText(/lens=lab/)).toBeInTheDocument();
+    expect(window.location.hash).toBe("#lens=lab");
   });
 
   it("a runs-lens kind-chip click writes the hash directly, without a route change", async () => {
@@ -449,7 +450,7 @@ describe("App", () => {
   // could own liveness; see `isLiveRoute`.) The replay case — day known,
   // transport shown — is covered below ("names its day in the chip").
   it("shows the live pill (#2412: the pill, not a separate badge) on a dispatch page whose day is not yet known", async () => {
-    window.location.hash = "#session=abc-123";
+    window.location.hash = "#dispatch=abc-123";
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const { container } = render(
@@ -659,7 +660,7 @@ describe("App", () => {
     // remembered to name is not a gate. Legacy's own rule is the general one:
     // `pollLiveMachines`, `pollLiveSessions` and `pollMachineSpecs` are all
     // live-mode-only polls, and a replay starts none of them.
-    for (const live of ["/fleet/machines/live", "/fleet/sessions/live", "/machine/specs"]) {
+    for (const live of ["/fleet/machines/live", "/fleet/dispatches/live", "/machine/specs"]) {
       expect(urls.some((u) => u.includes(live)), `a replay must not fetch ${live}`).toBe(false);
     }
     // …and the day WAS actually fetched, so a hook quietly requesting nothing
@@ -1189,11 +1190,11 @@ describe("App", () => {
             ? [{ ts: "2026-08-07T09:31:00.000Z", category: "mission", action: "mission.close", machine_uid: "m1", machine_id: "MacBook-Pro", session_id: "mission-m-one", mission_id: "m-one" }]
             : []),
         ];
-        if (path === "/flow-session/s1") return Promise.resolve(new Response(JSON.stringify({ records: recs, count: 2, truncated: false, generated_at_ms: 1 }), { status: 200 }));
+        if (path === "/flow-dispatch/s1") return Promise.resolve(new Response(JSON.stringify({ records: recs, count: 2, truncated: false, generated_at_ms: 1 }), { status: 200 }));
         if (path === "/flow-mission/m-one") return Promise.resolve(new Response(JSON.stringify({ records: recs, count: 2, truncated: false, generated_at_ms: 1 }), { status: 200 }));
         if (path === "/flow/2026-08-07") return Promise.resolve(new Response(JSON.stringify(recs), { status: 200 }));
         if (path.startsWith("/flow/")) return Promise.resolve(new Response("[]", { status: 200 }));
-        if (path === "/fleet/sessions/live") return Promise.resolve(new Response(JSON.stringify({ sessions: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }));
+        if (path === "/fleet/dispatches/live") return Promise.resolve(new Response(JSON.stringify({ dispatches: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }));
         if (path === "/fleet/machines/live") return Promise.resolve(new Response(JSON.stringify({ machines: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }));
         // Anything else (the mission graph, runs, specs) is absent: the lenses
         // render their honest not-found states rather than choking on "[]".
@@ -1228,10 +1229,10 @@ describe("App", () => {
       "fetch",
       vi.fn((url: string) => {
         const path = String(url);
-        if (path === "/flow-session/s-mid") return Promise.resolve(new Response(JSON.stringify({ records: session, count: 3, truncated: false, generated_at_ms: 1 }), { status: 200 }));
+        if (path === "/flow-dispatch/s-mid") return Promise.resolve(new Response(JSON.stringify({ records: session, count: 3, truncated: false, generated_at_ms: 1 }), { status: 200 }));
         // The daemon's day file holds only Aug 7: the run's last record is on Aug 8.
         if (path === "/flow/2026-08-07") return Promise.resolve(new Response(JSON.stringify(session.slice(0, 2)), { status: 200 }));
-        if (path === "/fleet/sessions/live") return Promise.resolve(new Response(JSON.stringify({ sessions: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }));
+        if (path === "/fleet/dispatches/live") return Promise.resolve(new Response(JSON.stringify({ dispatches: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }));
         if (path === "/fleet/machines/live") return Promise.resolve(new Response(JSON.stringify({ machines: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }));
         return Promise.resolve(new Response("not found", { status: 404 }));
       }),
@@ -1267,9 +1268,9 @@ describe("App", () => {
       "fetch",
       vi.fn((url: string) => {
         const path = String(url);
-        if (path === "/flow-session/s-shared") return Promise.resolve(new Response(JSON.stringify({ records: session, count: 5, truncated: false, generated_at_ms: 1 }), { status: 200 }));
+        if (path === "/flow-dispatch/s-shared") return Promise.resolve(new Response(JSON.stringify({ records: session, count: 5, truncated: false, generated_at_ms: 1 }), { status: 200 }));
         if (path.startsWith("/flow/")) return Promise.resolve(new Response(JSON.stringify(session), { status: 200 }));
-        if (path === "/fleet/sessions/live") return Promise.resolve(new Response(JSON.stringify({ sessions: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }));
+        if (path === "/fleet/dispatches/live") return Promise.resolve(new Response(JSON.stringify({ dispatches: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }));
         if (path === "/fleet/machines/live") return Promise.resolve(new Response(JSON.stringify({ machines: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }));
         return Promise.resolve(new Response("not found", { status: 404 }));
       }),
@@ -1287,8 +1288,8 @@ describe("App", () => {
       vi.fn((url: string) => {
         const path = String(url);
         const recs = [{ ts: "2026-08-07T09:00:00.000Z", category: "dispatch", action: "dispatch.start", machine_uid: "m1", machine_id: "MacBook-Pro", session_id: "s-live" }];
-        if (path === "/flow-session/s-live") return Promise.resolve(new Response(JSON.stringify({ records: recs, count: 1, truncated: false, generated_at_ms: 1 }), { status: 200 }));
-        if (path === "/fleet/sessions/live") return Promise.resolve(new Response(JSON.stringify({ sessions: [{ session_id: "s-live", machine_uid: "m1", beat_ts_ms: Date.now() }], meta: { sources: { fleet: { state: "ok" } }, complete: true } }), { status: 200 }));
+        if (path === "/flow-dispatch/s-live") return Promise.resolve(new Response(JSON.stringify({ records: recs, count: 1, truncated: false, generated_at_ms: 1 }), { status: 200 }));
+        if (path === "/fleet/dispatches/live") return Promise.resolve(new Response(JSON.stringify({ dispatches: [{ session_id: "s-live", machine_uid: "m1", beat_ts_ms: Date.now() }], meta: { sources: { fleet: { state: "ok" } }, complete: true } }), { status: 200 }));
         if (path === "/fleet/machines/live") return Promise.resolve(new Response(JSON.stringify({ machines: [], meta: { sources: { fleet: { state: "ok" } }, complete: true } }), { status: 200 }));
         if (path.startsWith("/flow/")) return Promise.resolve(new Response(JSON.stringify(recs), { status: 200 }));
         return Promise.resolve(new Response("not found", { status: 404 }));
@@ -1571,7 +1572,7 @@ describe("App", () => {
   // passed every one of those tests and still reproduced the bug live.
   // This fixture deliberately keeps the day window and the session's own
   // records DISJOINT — the day names only an UNRELATED session, and the
-  // real run's records arrive solely through `/flow-session/<id>`
+  // real run's records arrive solely through `/flow-dispatch/<id>`
   // (`routeRecords.records`), exactly mirroring the live daemon's shape.
   it("(#2346) a dispatch whose records are NOT in the loaded day window still gets its OWN span — the live-render finding", async () => {
     const runRecords = [
@@ -1604,11 +1605,11 @@ describe("App", () => {
       "fetch",
       vi.fn((url: string) => {
         const path = String(url);
-        if (path === "/flow-session/s-narrow") {
+        if (path === "/flow-dispatch/s-narrow") {
           return Promise.resolve(new Response(JSON.stringify({ records: runRecords, count: runRecords.length, truncated: false, generated_at_ms: 1 }), { status: 200 }));
         }
         if (path === "/flow/2026-09-04") return Promise.resolve(new Response(JSON.stringify(dayWindow), { status: 200 }));
-        if (path === "/fleet/sessions/live") return Promise.resolve(new Response(JSON.stringify({ sessions: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }));
+        if (path === "/fleet/dispatches/live") return Promise.resolve(new Response(JSON.stringify({ dispatches: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }));
         if (path === "/fleet/machines/live") return Promise.resolve(new Response(JSON.stringify({ machines: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }));
         return Promise.resolve(new Response("not found", { status: 404 }));
       }),
@@ -1958,7 +1959,7 @@ describe("(#2921) machine route chrome names a uid-only machine", () => {
   const FAKE_UID = "00000000-0000-4000-8000-ABCDEF000001";
   const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
   function mount(roster: unknown[]) {
-    window.location.hash = `#lens=machine&uid=${FAKE_UID}`;
+    window.location.hash = `#lens=machine&machine=${FAKE_UID}`;
     const today = new Date().toISOString().slice(0, 10);
     vi.stubGlobal(
       "fetch",
@@ -1981,7 +1982,7 @@ describe("(#2921) machine route chrome names a uid-only machine", () => {
     mount([{ id: "studio", address: "a:1", added_unix_ms: 1, machine_uid: FAKE_UID }]);
     await waitFor(() => expect(document.getElementById("logscope")?.textContent).toBe("studio"));
     expect(UUID_RE.test(document.body.textContent ?? "")).toBe(false);
-    // (#2929) The old `uid=` link is rewritten to the machine's key.
+    // (#2929) A hardware uid in `machine=` is rewritten to the machine's key.
     await waitFor(() => expect(window.location.hash).toBe("#lens=machine&machine=studio"));
   });
   it("unrostered: #logscope reads 'unnamed machine', never the uid", async () => {

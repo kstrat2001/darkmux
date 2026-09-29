@@ -10,7 +10,7 @@ import { norm, type RawRecord } from "../testing/records";
 const REC = {
   ts: "2026-08-09T05:14:06Z",
   level: "info",
-  tier: "local",
+  tier: "darkmux",
   stage: "dispatch",
   action: "dispatch.turn",
   handle: "coder",
@@ -58,7 +58,7 @@ describe("RecordView", () => {
   });
 
   it("renders an absent value as a dash, not as the word null", () => {
-    render(<RecordView record={norm({ ...REC, source: null } as unknown as RawRecord)} />);
+    render(<RecordView record={norm({ ...REC, mission_id: null } as unknown as RawRecord)} />);
     expect(screen.getByText("—")).toBeInTheDocument();
     expect(screen.queryByText("null")).toBeNull();
   });
@@ -205,7 +205,7 @@ const TELEMETRY_REC = {
   ts: "2026-09-23T00:00:27Z",
   level: "info",
   category: "machinery",
-  tier: "local",
+  tier: "darkmux",
   stage: "dispatch",
   action: "machine.telemetry",
   handle: "MacBook-Pro",

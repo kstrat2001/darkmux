@@ -57,9 +57,6 @@
 
 use darkmux_types::execution_id::ExecutionId;
 
-/// The flow-record telemetry `source` every usage record carries.
-pub const USAGE_SOURCE: &str = "tokens";
-
 /// Which kind of model call a usage record accounts for. Serialized into
 /// the payload's `call_kind` through serde (the variant names ARE the wire
 /// spelling), and exported to the viewer as a generated TS type.
@@ -144,8 +141,6 @@ pub fn call_purpose(call_kind: CallKind, role_id: Option<&str>) -> UsagePurpose 
     }
 }
 
-/// (#2915) The telemetry `source` `utility.start` / `utility.error` carry.
-pub const UTILITY_SOURCE: &str = "utility";
 
 /// (#2915 review, MUST 1) A fresh id for one utility job, echoed by its
 /// start and its end (usage record or `utility.error`), so the viewer pairs
@@ -186,7 +181,7 @@ pub fn stamp_utility_end(payload: &mut serde_json::Value, job_id: &str, started_
 
 /// (#2915) The payload of a `utility.start`: the `job`, the `model` it runs
 /// on (the wire id), the session id of the execution it `serves` (ABSENT
-/// when it serves none, as routing does), and `stall_after_seconds`, the
+/// when it serves none, as routing does), and `stall_after_ms`, the
 /// job's own bound, after which a start with no end reads as stalled (the
 /// inactivity window for a compaction, the call timeout for routing). The
 /// bound rides on the record so the viewer never guesses a knob the host
@@ -199,14 +194,14 @@ pub fn utility_start_payload(
     job_id: &str,
     model: &str,
     serves: Option<&str>,
-    stall_after_seconds: u64,
+    stall_after_ms: u64,
     started_at_ms: u64,
 ) -> serde_json::Value {
     let mut payload = serde_json::json!({
         "job": job,
         "job_id": job_id,
         "model": model,
-        "stall_after_seconds": stall_after_seconds,
+        "stall_after_ms": stall_after_ms,
         "started_at_ms": started_at_ms,
     });
     if let Some(sid) = serves {
@@ -227,7 +222,7 @@ pub fn utility_marker_record(action: darkmux_flow::FlowAction, job_role_id: &str
         rec.level = darkmux_flow::Level::Warn;
     }
     rec.action = action;
-    rec.source = Some(UTILITY_SOURCE.to_string());
+    rec.source = Some(darkmux_flow::FlowSource::Utility);
     rec
 }
 
@@ -303,14 +298,14 @@ pub fn utility_usage_record(job_role_id: &str, model: &str, execution: &Executio
         ts: darkmux_flow::ts_utc_now(),
         level: darkmux_flow::Level::Info,
         category: darkmux_flow::Category::Telemetry,
-        tier: darkmux_flow::Tier::Local,
+        tier: darkmux_flow::Tier::Darkmux,
         stage: darkmux_flow::Stage::Dispatch,
         action: darkmux_flow::FlowAction::TelemetryTokens,
         handle: job_role_id.to_string(),
         phase_id: None,
         session_id: None,
         execution_id: Some(execution.clone()),
-        source: Some(USAGE_SOURCE.to_string()),
+        source: Some(darkmux_flow::FlowSource::Tokens),
         model: Some(model.to_string()),
         reasoning: None,
         mission_id: None,
@@ -319,8 +314,6 @@ pub fn utility_usage_record(job_role_id: &str, model: &str, execution: &Executio
         prev_hash: None,
         hash: None,
         payload: Some(payload),
-        work_id: None,
-        attempt: None,
     }
 }
 
@@ -348,7 +341,7 @@ pub(crate) fn assert_one_usage_record<'a>(
 ) -> &'a serde_json::Value {
     let usage: Vec<&serde_json::Value> = records
         .iter()
-        .filter(|r| r["category"] == "telemetry" && r["source"] == USAGE_SOURCE)
+        .filter(|r| r["category"] == "telemetry" && r["source"] == "tokens")
         .collect();
     assert_eq!(
         usage.len(),
@@ -411,8 +404,8 @@ pub struct UsageAmount {
 /// True for a usage record (`telemetry.tokens`), by either mark it carries
 /// (category + source, or the action).
 pub fn is_usage_record(v: &serde_json::Value) -> bool {
-    let s = |k: &str| v.get(k).and_then(|x| x.as_str());
-    (s("category") == Some("telemetry") && s("source") == Some(USAGE_SOURCE))
+    let category = v.get("category").and_then(|x| x.as_str());
+    (category == Some("telemetry") && darkmux_flow::reader::source_of(v) == Some(darkmux_flow::FlowSource::Tokens))
         || darkmux_flow::reader::action_of(v) == Some(darkmux_flow::FlowAction::TelemetryTokens)
 }
 
@@ -639,18 +632,18 @@ mod tests {
     /// and `serves` only when the job serves an execution.
     #[test]
     fn utility_start_payload_names_job_model_bound_and_what_it_serves() {
-        let p = utility_start_payload(UtilityJobKind::Compaction, "j-1", "darkmux:u4b", Some("sid-1"), 600, 5);
+        let p = utility_start_payload(UtilityJobKind::Compaction, "j-1", "darkmux:u4b", Some("sid-1"), 600_000, 5);
         assert_eq!(p["job_id"], "j-1");
         assert_eq!(p["started_at_ms"], 5);
         assert_eq!(p["job"], "compaction");
         assert_eq!(p["model"], "darkmux:u4b");
         assert_eq!(p["serves"], "sid-1");
-        assert_eq!(p["stall_after_seconds"], 600);
-        let r = utility_start_payload(UtilityJobKind::RadioRouting, "j-2", "u4b", None, 30, 5);
+        assert_eq!(p["stall_after_ms"], 600_000);
+        let r = utility_start_payload(UtilityJobKind::RadioRouting, "j-2", "u4b", None, 30_000, 5);
         assert!(r.get("serves").is_none(), "absent, never null: {r}");
         let rec = utility_marker_record(darkmux_flow::FlowAction::UtilityStart, "radio-router", "u4b", r);
         assert_eq!(rec.action, darkmux_flow::FlowAction::UtilityStart);
-        assert_eq!(rec.source.as_deref(), Some(UTILITY_SOURCE));
+        assert_eq!(rec.source, Some(darkmux_flow::FlowSource::Utility));
         assert!(rec.session_id.is_none(), "a host-side utility job has no session");
     }
 

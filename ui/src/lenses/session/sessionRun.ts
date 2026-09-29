@@ -1,5 +1,5 @@
 /**
- * Pure logic for the session drill-in ("run detail" for a `#session=<id>`
+ * Pure logic for the session drill-in ("run detail" for a `#dispatch=<id>`
  * route) — a TypeScript port of `viewer.html`'s `runRegions()`
  * (viewer.html:2064-2285), the derivation behind `renderSubsystem()`
  * (viewer.html:2292-2309). This is the "whole separate render surface"
@@ -8,8 +8,8 @@
  *
  * Validated against the ONE real recorded golden this repo already has for
  * legacy's own render (`tests/parity/goldens/session-task-list.txt`'s
- * `=== stage ===` section, captured from `#session=task-list` against the
- * real corpus fixture `tests/parity/corpus/flow-session-task-list.json`) —
+ * `=== stage ===` section, captured from `#dispatch=task-list` against the
+ * real corpus fixture `tests/parity/corpus/flow-dispatch-task-list.json`) —
  * `sessionRun.test.ts` asserts this module's output matches that golden
  * BYTE-FOR-BYTE against the real fixture data, not a hand-rolled
  * approximation. That corpus happens to carry zero telemetry records
@@ -37,7 +37,7 @@
  * measures against — NOT `Date.now()`. This port has no scrubber for the
  * session route (`isLiveRoute` treats `session` as a historical-slice
  * fetch, not a live tail — see `route.ts`'s own doc), matching legacy's own
- * `state.t=tMax` set once at boot for a `#session=`/`#mission=` catalog
+ * `state.t=tMax` set once at boot for a `#dispatch=`/`#mission=` catalog
  * query and never advanced (no `startLiveTail` runs for it either) — so
  * `nowMs` here is the MAX ts across the fetched records, not wall-clock.
  * Verified against the golden: the session's own `frozen_clock_ms` capture
@@ -62,10 +62,11 @@ import { aggregateLiveState, aggregateTokenRate, averageGenerationRate, lastHear
 import type { LiveState, LiveStateReading } from "../../lib/tokenRate";
 import { mergeLive, type LiveOverlay } from "../../lib/liveChannel";
 import { PURPOSE, sumUsage } from "../../lib/usageRecords";
-import type { DispatchStartPayload, DispatchCompletePayload } from "../../types/handwritten";
+
 import { toolOutcome } from "../../lib/recordDetail";
 import type { RunStatus } from "../../types/generated/RunStatus";
-import { ACTION, CATEGORY, byTime, isBookendTerminal, latestByTime, recordsAsOf, type NormRecord } from "../../lib/ingest";
+import type { DispatchCompletePayload, DispatchStartPayload } from "../../lib/flowPayloads";
+import { ACTION, CATEGORY, SOURCE, byTime, isBookendTerminal, latestByTime, recordsAsOf, type NormRecord, type NormSource } from "../../lib/ingest";
 import { maxOf } from "../../lib/numbers";
 
 /** The run-time figure's long hover text, shared by SYSTEM's WALL CLOCK and
@@ -108,7 +109,7 @@ interface SessionHeader {
    * "open →" link, `data-act="session"` → `drillSession(sid)` — carries
    * that machine context forward and DOES render the machine link there).
    * The golden this module is checked against (`session-task-list.txt`)
-   * was captured via the OTHER real entry point — a bare `#session=<id>`
+   * was captured via the OTHER real entry point — a bare `#dispatch=<id>`
    * catalog deep-link, which never touches `state.machine` at all — so its
    * "(task-list on )" (nothing after "on ") is genuinely empty on THAT
    * path, but not evidence the field is dead everywhere.
@@ -122,7 +123,7 @@ interface SessionHeader {
    * instead of rendering its own rows. `RunsBoard`'s rows carry their OWN
    * drill-ins now (`/mission/<id>/graph` for a tracked mission/dispatch, the
    * in-page lab-run detail for a lab run — see `RunsBoard.tsx`'s
-   * `activateRun`), but neither is a `#session=` drill either. So the real
+   * `activateRun`), but neither is a `#dispatch=` drill either. So the real
    * residual gap is unchanged in shape, just relocated: an operator still
    * cannot reach a bare session-subsystem view (this file's own render
    * target) FROM a machine-scoped list, by any path this port builds today.
@@ -453,7 +454,7 @@ interface MissionModelRollup {
  * NOW, which is the LATEST sample's (`latestByTime`: an untimed sample only
  * when no timed one exists, the bad-timestamp policy). */
 function contextFigures(tel: readonly NormRecord[]): { samples: number; nctx: number; ctxPeak: number; ctxNow: number } {
-  const cx = tel.filter((r) => r.source === "context").sort(byTime);
+  const cx = tel.filter((r) => r.source === SOURCE.Context).sort(byTime);
   const used = (r: NormRecord | undefined) => Number((r?.fields as Record<string, unknown> | undefined)?.used) || 0;
   const max0 = cx.length ? Number((cx[0].fields as Record<string, unknown>)?.max) : NaN;
   return {
@@ -504,10 +505,10 @@ function rollUpMissionModelWork(siblings: readonly RunGroup[]): MissionModelRoll
  *  work. (#2902 step 2a) Its own tokens, utility excluded. */
 function executionFigures(own: readonly NormRecord[]): (ModelFigures & { loads: NormRecord[] }) | null {
   const tel = own.filter((r) => r.category === CATEGORY.Telemetry);
-  const rt = bySource(tel, "runtime").slice(-1)[0] ?? null;
+  const rt = bySource(tel, SOURCE.Runtime).slice(-1)[0] ?? null;
   const tok = executionTokens(own);
   const cx = contextFigures(tel);
-  const loads = bySource(tel, "lms").filter(isLoad);
+  const loads = bySource(tel, SOURCE.Lms).filter(isLoad);
   const turns = rt ? Number((rt.fields as Record<string, unknown>).turns) : null;
   const fig = { turns, tokIn: tok ? tok.prompt : null, tokOut: tok ? tok.completion : null, ctxPeak: cx.ctxPeak, ctxNow: cx.ctxNow, nctx: cx.nctx, loads };
   return loads.length > 0 || turns != null || tok != null || cx.samples > 0 ? fig : null;
@@ -643,23 +644,23 @@ interface AttemptTelemetry {
   comps: NormRecord[];
 }
 
-const bySource = (recs: readonly NormRecord[], source: string): NormRecord[] => recs.filter((r) => r.source === source);
+const bySource = (recs: readonly NormRecord[], source: NormSource): NormRecord[] => recs.filter((r) => r.source === source);
 
 const isLoad = (r: NormRecord): boolean => (r.fields as Record<string, unknown> | undefined)?.event === "load";
 
 function attemptTelemetry(visible: readonly NormRecord[], ctx: RunContext): AttemptTelemetry {
   const tel = visible.filter((r) => ctx.inAttempt(r) && r.category === CATEGORY.Telemetry);
-  const lms = bySource(tel, "lms");
+  const lms = bySource(tel, SOURCE.Lms);
   const loads = lms.filter(isLoad);
   return {
     tel,
     lms,
-    procs: [...bySource(tel, "process"), ...hostSamplesOf(visible, ctx)],
-    rt: bySource(tel, "runtime").slice(-1)[0] ?? null,
-    dets: bySource(tel, "detector"),
+    procs: [...bySource(tel, SOURCE.Host), ...hostSamplesOf(visible, ctx)],
+    rt: bySource(tel, SOURCE.Runtime).slice(-1)[0] ?? null,
+    dets: bySource(tel, SOURCE.Detector),
     loads,
     distinct: [...new Set(loads.map((r) => (r.fields as Record<string, unknown>).model as string))],
-    comps: bySource(tel, "compaction"),
+    comps: bySource(tel, SOURCE.Compaction),
   };
 }
 
@@ -708,12 +709,6 @@ function wallClock(ctx: RunContext, nowMs: number): { runWallMs: number; wallEla
   };
 }
 
-const RUNTIME_LABEL: Record<string, string> = {
-  internal: "internal container",
-  direct: "direct client (hosted · no container)",
-  openclaw: "openclaw shell-out",
-};
-
 /** (#2834) The route line: the dialect and address the dispatch record
  *  names, read as facts. `openai:` names the request FORMAT, not a vendor,
  *  so a local server speaking it is labelled by its address, never as
@@ -730,7 +725,6 @@ function routeLabel(ep: string | undefined): string {
 function briefRowsOf(sp: DispatchStartPayload, model: string | null, d: NormRecord | null, route: string, timing: string): BriefEntry[] {
   const rows: BriefEntry[] = [];
   pushKv(rows, "route", route);
-  pushKv(rows, "runtime", sp.runtime ? (RUNTIME_LABEL[sp.runtime] ?? sp.runtime) : "");
   pushKv(rows, "image", sp.image);
   pushKv(rows, "model", model);
   pushKv(rows, "workspace", sp.workspace);
@@ -1438,7 +1432,7 @@ function errorOutcome(edge: CloseEdge | undefined): string | undefined {
 
 /** `runRegions()` — viewer.html:2064-2285, minus the two SVG chart regions
  * (see this module's own top doc). `data` should already be scoped to ONE
- * session (the `/flow-session/<id>` response, through `flowToRenderModel`
+ * session (the `/flow-dispatch/<id>` response, through `flowToRenderModel`
  * — see that function's own doc) — `sid` further scopes every derivation
  * to it, matching legacy's `state.session`. */
 /**

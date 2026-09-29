@@ -8,7 +8,7 @@ import {
   machineLabel,
   type MachineKeyContext,
 } from "./machineKey";
-import type { PresenceBeat } from "../types/handwritten";
+import type { PresenceBeat } from "../types/generated/PresenceBeat";
 import type { NormRecord } from "./ingest";
 import { norm } from "../testing/records";
 

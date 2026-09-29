@@ -286,3 +286,25 @@ fn write_named(state: &IsolatedState, subdir: &str, id: &str, doc: &Value) {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join(format!("{id}.json")), doc.to_string()).unwrap();
 }
+
+/// A hook rule in a retired action spelling refuses the hooks sink, not the
+/// work: a dispatch-scope preflight passes with the stale rule present
+/// (`HOOK_RULE_NO_SCOPE`), while the sink named in its own doc refuses it.
+#[test]
+#[serial_test::serial]
+fn a_stale_hook_rule_refuses_the_sink_and_not_the_dispatch() {
+    let state = IsolatedState::new();
+    // flow-action-guard:allow-start — an old spelling is this test's input
+    let config = json!({"hooks": {"enabled": true, "rules": [
+        {"match": {"action": "dispatch complete"}, "http": "http://127.0.0.1:8790/events"}
+    ]}});
+    // flow-action-guard:allow-end
+    let _config = darkmux_types::config_access::set_config_for_test(serde_json::from_value(config).unwrap());
+    let rules = darkmux_types::config_access::hooks_rules();
+    assert_eq!(rules.len(), 1, "the fixture must reach the resolver");
+    for scope in Scope::ALL {
+        assert_eq!(preflight(scope), Ok(()), "{scope:?}: a stale hook rule must not stop work");
+    }
+    let sink = darkmux_flow::hooks::HookSink::new(&rules, state.join("outbox"), std::sync::Arc::new(darkmux_flow::LocalFileSink));
+    assert!(sink.err().is_some_and(|e| e.to_string().contains("write `dispatch.complete`")), "the sink refuses, naming the spelling");
+}

@@ -271,9 +271,9 @@ export function runDestination(run: Run, graphReachable: boolean): RunDestinatio
     return { kind: "hash", hash: dispatchHash(run.session_id, missionOfRow(run)) };
   }
   if (!run.tracked) {
-    // No `graphReachable` gate here — `/flow-session/<id>` is a plain
+    // No `graphReachable` gate here — `/flow-dispatch/<id>` is a plain
     // daemon fetch (`SessionReplay`'s own fetch, same as the ungated
-    // `#session=<sid>` bars `FleetLens.tsx`'s activity timeline already
+    // `#dispatch=<sid>` bars `FleetLens.tsx`'s activity timeline already
     // navigates to), not the mission-graph lens's endpoint.
     if (run.session_id) return { kind: "hash", hash: dispatchHash(run.session_id, missionOfRow(run)) };
     return { kind: "none" };

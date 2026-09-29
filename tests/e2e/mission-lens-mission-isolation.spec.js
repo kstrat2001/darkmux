@@ -63,7 +63,7 @@ const GRAPH = {
   generated_at_ms: 0,
 };
 
-const rec = (over) => ({ ts: `${TODAY}T10:00:00Z`, level: 'info', category: 'work', tier: 'local', stage: 'dispatch', handle: 's1', session_id: 'step-s1', ...over });
+const rec = (over) => ({ ts: `${TODAY}T10:00:00Z`, level: 'info', category: 'work', tier: 'darkmux', stage: 'dispatch', handle: 's1', session_id: 'step-s1', ...over });
 
 async function open(page, records) {
   const errors = [];

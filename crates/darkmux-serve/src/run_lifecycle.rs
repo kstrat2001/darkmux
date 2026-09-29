@@ -67,8 +67,8 @@ struct Folded {
     /// `budget.stop` producer writes is an operator's stop (an interrupt,
     /// `mission abort`/`finalize`, an abandoned phase).
     names_a_reason: bool,
-    /// A `budget.wait`'s announced wait, seconds.
-    wait_seconds: f64,
+    /// A `budget.wait`'s announced wait, milliseconds.
+    wait_ms: u64,
 }
 
 impl Folded {
@@ -81,7 +81,7 @@ impl Folded {
             ts: ts.to_string(),
             at: crate::runs::parse_flow_ts(ts),
             names_a_reason: payload.get("reason").and_then(|r| r.as_str()).is_some_and(|r| !r.is_empty()),
-            wait_seconds: payload.get("wait_seconds").and_then(|w| w.as_f64()).unwrap_or(0.0).max(0.0),
+            wait_ms: payload.get("wait_ms").and_then(|w| w.as_u64()).unwrap_or(0),
         }
     }
 
@@ -192,7 +192,7 @@ impl Attempt {
         if *action == FlowAction::BudgetWait {
             self.waited = true;
             self.wait_until_ms = r.at.map(|secs| {
-                secs.saturating_mul(1_000).saturating_add((r.wait_seconds * 1_000.0) as u64).saturating_add(crate::runs::BUDGET_WAIT_GRACE_MS)
+                secs.saturating_mul(1_000).saturating_add(r.wait_ms).saturating_add(crate::runs::BUDGET_WAIT_GRACE_MS)
             });
         } else if *action == FlowAction::BudgetResume {
             self.wait_until_ms = None;

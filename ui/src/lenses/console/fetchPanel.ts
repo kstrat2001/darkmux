@@ -11,7 +11,7 @@
  * so this module ports `loadPanel`'s exact error-text behavior instead of
  * reusing the shared wrapper and losing it.
  */
-import type { PanelResponse } from "../../types/handwritten";
+import type { PanelResponse } from "../../types/generated/PanelResponse";
 import { getSource } from "../../lib/source";
 
 export type PanelFetchOutcome = { ok: true; data: PanelResponse } | { ok: false; message: string };

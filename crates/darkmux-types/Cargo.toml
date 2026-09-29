@@ -22,8 +22,13 @@ rust-version = "1.86"
 # a plain dependency: the feature is only ever enabled through a dependent
 # crate's DEV-dependency, so no release build gains the dep.
 test-support = ["dep:tempfile"]
+# TypeScript bindings for the wire types the daemon serves (`LoadedModel`),
+# generated into `ui/src/types/generated/` by the `export_bindings` tests.
+# Off in every normal build; a dependent crate enables it as a dev-dependency.
+ts-export = ["dep:ts-rs"]
 
 [dependencies]
+ts-rs = { version = "10", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json.workspace = true
 anyhow = "1.0"

@@ -61,11 +61,10 @@ function literalCount(text: string, word: string): number {
 /** Existing uses of the word `compaction` in OTHER vocabularies. */
 const OTHER_VOCABULARY: Record<string, Record<string, number>> = {
   [UTILITY_JOB.compaction]: {
-    // the event log's `compaction` category, and `source === "compaction"`
-    [path.join("lib", "eventFilters.ts")]: 4,
-    // `telemetry.compaction`'s `source`
-    [path.join("lib", "flow.ts")]: 1,
-    [path.join("lenses", "session", "sessionRun.ts")]: 1,
+    // the event log's `compaction` category and its activity label
+    [path.join("lib", "eventFilters.ts")]: 3,
+    // `telemetry.compaction`'s `source`, spelled once, in `SOURCE`
+    [path.join("lib", "ingest.ts")]: 1,
     // `CALL_KIND.compaction` (the generated `CallKind`)
     [path.join("lib", "usageRecords.ts")]: 1,
   },

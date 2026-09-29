@@ -207,13 +207,15 @@
       }
     ],
     "machine_id": "Workstation",
+    "machine_uid": null,
     "os": "macos aarch64",
     "ram_free_for_ai_bytes": 98725027315,
     "ram_total_bytes": 274877906944,
     "redis_url_redacted": "redis://demo-hub.internal:6379",
     "utility_model": {
       "id": "darkmux:qwen3-4b-instruct-2507",
-      "loaded": true
+      "loaded": true,
+      "n_ctx": null
     }
   }
 }

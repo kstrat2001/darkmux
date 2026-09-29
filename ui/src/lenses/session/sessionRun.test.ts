@@ -117,8 +117,8 @@ function flattenView(view: ReturnType<typeof runRegions>): string[] {
 }
 
 describe("runRegions — byte parity against the real recorded legacy golden", () => {
-  it("matches goldens/session-task-list.txt's #stage section for the real flow-session-task-list.json corpus", () => {
-    const records = readCorpus("flow-session-task-list.json");
+  it("matches goldens/session-task-list.txt's #stage section for the real flow-dispatch-task-list.json corpus", () => {
+    const records = readCorpus("flow-dispatch-task-list.json");
     const data = flowToRenderModel(records);
     const view = runRegions(data, "task-list");
 
@@ -140,7 +140,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
         action: "dispatch.start",
         handle: "darkmux/coder",
         model: "darkmux:qwen3-coder",
-        payload: { runtime: "internal", image: "darkmux-runtime:latest", workspace: "/tmp/wt", prompt_chars: 500 },
+        payload: { image: "darkmux-runtime:latest", workspace: "/tmp/wt", prompt_chars: 500 },
       },
       {
         ts: "2026-01-01T00:05:00Z",
@@ -168,8 +168,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     expect(view.header.role).toBe("CODER");
     expect(view.briefLines.map((e) => e.text)).toContain("route");
     expect(view.briefLines.map((e) => e.text)).toContain("LMStudio · local · this machine");
-    expect(view.briefLines.map((e) => e.text)).toContain("runtime");
-    expect(view.briefLines.map((e) => e.text)).toContain("internal container");
+    expect(view.briefLines.map((e) => e.text)).not.toContain("runtime");
     expect(view.briefLines.map((e) => e.text)).toContain("image");
     expect(view.briefLines.map((e) => e.text)).toContain("darkmux-runtime:latest");
     expect(view.briefLines.map((e) => e.text)).toContain("model");
@@ -1019,7 +1018,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
       ts,
       session_id: "s1",
       category: "telemetry" as const,
-      source: "process",
+      source: "host",
       fields: { cpu, mem, gpu },
     });
     const data: RawRecord[] = [
@@ -1157,13 +1156,13 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     // the MODEL pane (where REST reads "budget · <endpoint>") must be there
     // while it waits, not grow in when the call is finally sent.
     const data: NormRecord[] = [
-      norm({ ts: BASE_TS, session_id: "s1", action: "budget.wait", handle: "coder", payload: { endpoint_id: "azure", wait_seconds: 600 } }),
+      norm({ ts: BASE_TS, session_id: "s1", action: "budget.wait", handle: "coder", payload: { endpoint_id: "azure", wait_ms: 600000 } }),
     ];
     expect(runRegions(flowToRenderModel(data), "s1").hasModelWork).toBe(true);
   });
 
   it("(#2902 step 5) a hosted wait stopped before its call closes the run; a later start reopens it", () => {
-    const wait = norm({ ts: BASE_TS, session_id: "s1", action: "budget.wait", payload: { endpoint_id: "azure", wait_seconds: 86000 } });
+    const wait = norm({ ts: BASE_TS, session_id: "s1", action: "budget.wait", payload: { endpoint_id: "azure", wait_ms: 86000000 } });
     const stop = norm({ ts: "2026-01-01T00:01:00Z", session_id: "s1", action: "budget.stop", payload: { endpoint_id: "azure", reason: "mission `m` is aborted" } });
     const stopped = runRegions(flowToRenderModel([wait, stop]), "s1", Date.parse("2026-01-01T05:00:00Z"));
     expect(stopped.live).toBe(false);
@@ -1556,7 +1555,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
         action: "dispatch.start",
         handle: "darkmux/coder",
         model: "darkmux:qwen3-coder",
-        payload: { runtime: "internal", image: "darkmux-runtime:latest", workspace: "/tmp/wt", prompt_chars: 500 },
+        payload: { image: "darkmux-runtime:latest", workspace: "/tmp/wt", prompt_chars: 500 },
       },
       { ts: "2026-01-01T00:01:00Z", session_id: "s1", category: "telemetry", source: "context", fields: { max: 262144, used: 19000 } },
       { ts: "2026-01-01T00:05:00Z", session_id: "s1", action: "dispatch.turn", payload: { turn_seq: 3 } },

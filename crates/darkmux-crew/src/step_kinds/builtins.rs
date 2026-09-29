@@ -599,7 +599,7 @@ impl StepKind for DispatchInternalStepKind {
             let failed = parse_failed_verifiers(&result.stdout);
             if !failed.is_empty() {
                 flow_records.push(darkmux_flow::FlowRecord {
-                    source: Some("scheduler".to_string()),
+                    source: Some(darkmux_flow::FlowSource::Scheduler),
                     payload: Some(serde_json::json!({
                         "step_id": step.id,
                         "kind": "dispatch.internal",
@@ -760,7 +760,6 @@ fn hosted_single_shot_step_payload(
     serde_json::json!({
         "step_id": step_id,
         "kind": "dispatch.single_shot",
-        "runtime": "direct",
         // (#2902 step 5, CLAUDE.md contract 8: the wire keeps its historical
         // spelling) The per-step cap, under the key v3.13.0 shipped.
         "remote_max_tokens_per_execution": budget,
@@ -800,7 +799,6 @@ impl ExecutionBookends<'_> {
         let mut payload = serde_json::json!({
             "step_id": self.step.id,
             "kind": self.kind,
-            "runtime": "scheduler",
         });
         if let (Some(obj), Some(ex)) = (payload.as_object_mut(), extra.as_object()) {
             for (k, v) in ex {
@@ -809,7 +807,7 @@ impl ExecutionBookends<'_> {
         }
         darkmux_flow::stamp_remote_classification(&mut payload, self.endpoint_label, None);
         darkmux_flow::FlowRecord {
-            source: Some("scheduler".to_string()),
+            source: Some(darkmux_flow::FlowSource::Scheduler),
             model: Some(self.model.to_string()),
             payload: Some(payload),
             ..darkmux_flow::FlowRecord::for_execution(
@@ -1061,7 +1059,7 @@ impl DispatchSingleShotStepKind {
             // single-shot step's token usage is visible even without the
             // full per-step bucket regime.
             flow_records.push(darkmux_flow::FlowRecord {
-                source: Some("scheduler".to_string()),
+                source: Some(darkmux_flow::FlowSource::Scheduler),
                 model: Some(wire_model.to_string()),
                 payload: Some(hosted_single_shot_step_payload(
                     &step.id,
@@ -1104,7 +1102,7 @@ impl DispatchSingleShotStepKind {
         let usage_record = crate::dispatch::build_telemetry_record(
             darkmux_flow::Level::Info,
             darkmux_flow::FlowAction::TelemetryTokens,
-            crate::usage::USAGE_SOURCE,
+            darkmux_flow::FlowSource::Tokens,
             &step.id,
             session,
             execution,
@@ -1523,7 +1521,7 @@ impl DispatchMapStepKind {
     /// reads a single-shot's.
     fn item_record(session: &SessionId, execution: &ExecutionId, step: &Step, model: &str, remote: bool, res: &MapItemResult) -> darkmux_flow::FlowRecord {
         darkmux_flow::FlowRecord {
-            source: Some("scheduler".to_string()),
+            source: Some(darkmux_flow::FlowSource::Scheduler),
             model: Some(model.to_string()),
             payload: Some(serde_json::json!({
                 "step_id": step.id,
@@ -1588,7 +1586,7 @@ impl DispatchMapStepKind {
         // re-folding the per-item records.
         let total_wall_ms: u64 = results.iter().map(|r| r.wall_ms).sum();
         darkmux_flow::FlowRecord {
-            source: Some("scheduler".to_string()),
+            source: Some(darkmux_flow::FlowSource::Scheduler),
             model: Some(model.to_string()),
             payload: Some(serde_json::json!({
                 "step_id": step.id,
@@ -1608,7 +1606,7 @@ impl DispatchMapStepKind {
     /// observability answers "why did this map not dispatch" directly.
     fn short_circuit_record(session: &SessionId, step: &Step) -> darkmux_flow::FlowRecord {
         darkmux_flow::FlowRecord {
-            source: Some("scheduler".to_string()),
+            source: Some(darkmux_flow::FlowSource::Scheduler),
             model: config_str(step, "model").map(str::to_string),
             payload: Some(serde_json::json!({
                 "step_id": step.id,
@@ -1878,7 +1876,7 @@ impl DispatchMapStepKind {
                     crate::dispatch::build_telemetry_record(
                         darkmux_flow::Level::Info,
                         darkmux_flow::FlowAction::TelemetryTokens,
-                        crate::usage::USAGE_SOURCE,
+                        darkmux_flow::FlowSource::Tokens,
                         &step.id,
                         session,
                         execution,
@@ -5130,7 +5128,7 @@ mod tests {
         assert_eq!(payload["total_tokens"], 1261);
         assert_eq!(payload["step_id"], "s1");
         assert_eq!(payload["kind"], "dispatch.single_shot");
-        assert_eq!(payload["runtime"], "direct");
+        assert!(payload.get("runtime").is_none(), "no topology key: {payload}");
         assert_eq!(payload["max_tokens_sent"], 4096);
     }
 

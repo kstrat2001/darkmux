@@ -34,7 +34,7 @@ const FIXTURE_RECORDS = fs
   .split('\n')
   .map((line) => JSON.parse(line));
 
-// (#1800) `/flow-session/<id>` is a real daemon endpoint
+// (#1800) `/flow-dispatch/<id>` is a real daemon endpoint
 // (`darkmux-serve::flow_session_handler`) that filters flow records by
 // `session_id`. This harness has no daemon behind it — `playwright.config.js`
 // serves `.served/` with a plain `python3 -m http.server` — so without this
@@ -48,7 +48,7 @@ const FIXTURE_RECORDS = fs
 // `viewer-session-url.spec.js`'s own `mockSession` helper already uses for
 // this exact endpoint on a different harness.
 async function mockFlowSessionEndpoint(page) {
-  await page.route(/\/flow-session\/[^/?]+/, (route) => {
+  await page.route(/\/flow-dispatch\/[^/?]+/, (route) => {
     const id = decodeURIComponent(new URL(route.request().url()).pathname.split('/').pop());
     const records = FIXTURE_RECORDS.filter((r) => r.session_id === id);
     route.fulfill({
@@ -86,7 +86,7 @@ async function assertInert(page, where) {
 //   legacy, independent of the port).
 // - The session drill (`data-act="session"` on `FleetLens.tsx`'s activity-
 //   lane bars) is a real, independently-built affordance, reached with a
-//   mocked `/flow-session/<id>` response (`mockFlowSessionEndpoint`, top of
+//   mocked `/flow-dispatch/<id>` response (`mockFlowSessionEndpoint`, top of
 //   file) so it exercises the real populated render, not just the error
 //   branch.
 // - The machine-card drill needs `[data-act="machine"][data-arg]`, not the

@@ -169,7 +169,7 @@ function mockFleetFetch(opts: {
   /** (#2965) Further days that answer `200 []`: the mock names today and
    *  yesterday when it is built, so a day reached by a rollover needs this. */
   emptyDays?: string[];
-  /** Session ids `/fleet/sessions/live` reports beating. */
+  /** Session ids `/fleet/dispatches/live` reports beating. */
   sessions?: string[];
 } = {}) {
   const today = todayUTC();
@@ -205,10 +205,10 @@ function mockFleetFetch(opts: {
         ),
       );
     }
-    if (path === "/fleet/sessions/live") {
-      const sessions = (opts.sessions ?? []).map((session_id) => ({ session_id }));
+    if (path === "/fleet/dispatches/live") {
+      const dispatches = (opts.sessions ?? []).map((session_id) => ({ session_id }));
       return Promise.resolve(
-        new Response(JSON.stringify({ sessions, meta: { sources: { fleet: { state: "ok" } }, complete: true } }), { status: 200 }),
+        new Response(JSON.stringify({ dispatches, meta: { sources: { fleet: { state: "ok" } }, complete: true } }), { status: 200 }),
       );
     }
     if (path === "/machine/specs") {
@@ -556,7 +556,7 @@ describe("FleetLens", () => {
    * renders `<FleetLens />` with NO props, so `historical` sits at its
    * default `false` and the live-only endpoints fired on the STATIC
    * demo — measured on the served build, `#lens=fleet` produced 404s for
-   * `/fleet/machines/live`, `/fleet/sessions/live` and `/machine/specs`
+   * `/fleet/machines/live`, `/fleet/dispatches/live` and `/machine/specs`
    * plus their console errors. The prop describes the CALLER's intent (a
    * replay); only the BUILD can answer "is there a daemon at all" — the
    * #1801 rule `MachineLens`/`useFlowWindow`/`route.ts::isLiveRoute`
@@ -598,7 +598,7 @@ describe("FleetLens", () => {
       await new Promise((r) => setTimeout(r, 50));
       expect(
         seen.filter(
-          (p) => p === "/fleet/machines/live" || p === "/fleet/sessions/live" || p === "/machine/specs" || p === "/fleet/roster",
+          (p) => p === "/fleet/machines/live" || p === "/fleet/dispatches/live" || p === "/machine/specs" || p === "/fleet/roster",
         ),
       ).toEqual([]);
     } finally {
@@ -639,7 +639,7 @@ describe("FleetLens", () => {
     try {
       const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
       const records = normAll([
-        { ts: "2026-08-26T10:00:00.000Z", machine_uid: "u1", machine_id: "m5-ultra-256gb", action: "machine.online", source: "presence-reconciler" },
+        { ts: "2026-08-26T10:00:00.000Z", machine_uid: "u1", machine_id: "m5-ultra-256gb", action: "machine.online", source: "presence_reconciler" },
       ]);
       render(
         <QueryClientProvider client={queryClient}>
@@ -1491,7 +1491,7 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
 
   it("(#2890) the machine name and hardware line carry their full text as a tooltip", async () => {
     const records = normAll([
-      { ts: "2026-08-26T10:00:00.000Z", machine_uid: "u1", machine_id: "m1-max-32gb-studio", action: "machine.online", source: "presence-reconciler" },
+      { ts: "2026-08-26T10:00:00.000Z", machine_uid: "u1", machine_id: "m1-max-32gb-studio", action: "machine.online", source: "presence_reconciler" },
     ]);
     renderFleetLens({ records, tMin: Date.parse("2026-08-26T09:00:00.000Z"), tMax: Date.parse("2026-08-26T10:00:00.000Z"), historical: true });
     await waitFor(() => expect(document.querySelector(".mach-name")).not.toBeNull());
@@ -1500,7 +1500,7 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
 
   it("(#2890) an online machine with nothing running shows its tube idle", async () => {
     const records = normAll([
-      { ts: "2026-08-26T10:00:00.000Z", machine_uid: "u1", machine_id: "m5", action: "machine.online", source: "presence-reconciler" },
+      { ts: "2026-08-26T10:00:00.000Z", machine_uid: "u1", machine_id: "m5", action: "machine.online", source: "presence_reconciler" },
     ]);
     renderFleetLens({ records, tMin: Date.parse("2026-08-26T09:00:00.000Z"), tMax: Date.parse("2026-08-26T10:00:00.000Z"), historical: true });
     await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
@@ -1919,7 +1919,7 @@ describe("FleetLens — a card says no signal until its first data arrives (#295
   for (const [what, held] of [
     ["the flow window", flowPaths],
     ["live machines", () => ["/fleet/machines/live"]],
-    ["live sessions", () => ["/fleet/sessions/live"]],
+    ["live sessions", () => ["/fleet/dispatches/live"]],
     ["/runs", () => ["/runs"]],
   ] as const) {
     it(`this machine's own card says 'no signal' while ${what} alone is unanswered, then 'idle'`, async () => {
@@ -1931,7 +1931,7 @@ describe("FleetLens — a card says no signal until its first data arrives (#295
       await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
       // Every other source has answered before the card is read: the held
       // one is the only thing standing between the card and its reading.
-      const others = { "/fleet/machines/live": queryKeys.fleetMachinesLive(), "/fleet/sessions/live": queryKeys.fleetSessionsLive(), "/runs": queryKeys.runs() };
+      const others = { "/fleet/machines/live": queryKeys.fleetMachinesLive(), "/fleet/dispatches/live": queryKeys.fleetSessionsLive(), "/runs": queryKeys.runs() };
       await waitFor(() => {
         for (const [path, key] of Object.entries(others)) {
           if (!paths.includes(path)) expect(queryClient.getQueryState(key)?.status, path).toBe("success");
@@ -1970,7 +1970,7 @@ describe("FleetLens — a card says no signal until its first data arrives (#295
       flowToday: [
         ...gen("s1", "coder"),
         ...gen("s2", "reviewer"),
-        { ts: t("10:01:59"), machine_uid: "u1", machine_id: "MacBook-Pro", action: "utility.start", source: "utility", handle: "radio-router", payload: { job: "radio_routing", model: "darkmux:util-4b", stall_after_seconds: 30 } },
+        { ts: t("10:01:59"), machine_uid: "u1", machine_id: "MacBook-Pro", action: "utility.start", source: "utility", handle: "radio-router", payload: { job: "radio_routing", model: "darkmux:util-4b", stall_after_ms: 30000 } },
       ],
       runs: [],
       hold: { "/runs": runs.promise },
@@ -2092,7 +2092,7 @@ describe("FleetLens — a card says no signal until its first data arrives (#295
         { ts: t("10:01:50"), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
         { ts: t("10:01:56"), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { turn_seq: 1, sampled_at_ms: ms("10:01:56"), generated_chars: 0 } },
         { ts: t("10:01:58"), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { turn_seq: 1, sampled_at_ms: ms("10:01:58"), generated_chars: 800 } },
-        { ts: t("10:01:59"), machine_uid: "u1", machine_id: "MacBook-Pro", action: "machine.offline", source: "presence-reconciler" },
+        { ts: t("10:01:59"), machine_uid: "u1", machine_id: "MacBook-Pro", action: "machine.offline", source: "presence_reconciler" },
       ],
       runs: [],
     });
@@ -2184,7 +2184,7 @@ describe("FleetLens — a card says no signal until its first data arrives (#295
 
   it("a replay has its records in hand and never shows 'no signal'", async () => {
     const records = normAll([
-      { ts: "2026-08-26T10:00:00.000Z", machine_uid: "u1", machine_id: "m5", action: "machine.online", source: "presence-reconciler" },
+      { ts: "2026-08-26T10:00:00.000Z", machine_uid: "u1", machine_id: "m5", action: "machine.online", source: "presence_reconciler" },
     ]);
     renderFleetLens({ records, tMin: Date.parse("2026-08-26T09:00:00.000Z"), tMax: Date.parse("2026-08-26T10:00:00.000Z"), historical: true });
     await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
@@ -2880,9 +2880,9 @@ describe("(#2915) fleet card: utility work is visible", () => {
   const rec = (hms: string, action: string, payload: Record<string, unknown>, more: Record<string, unknown> = {}) =>
     norm({ ts: `2026-09-26T${hms}Z`, action, category: "telemetry", machine_uid: "u1", machine_id: "pepper", payload, ...more });
   // Turn 9's tool completes at 10:52:09; turn 10's opener is 10:52:22.
-  const compactStart = rec("10:52:10", "utility.start", { job: "compaction", model: "darkmux:util-4b", serves: SID, stall_after_seconds: 600 }, { session_id: SID, source: "utility", handle: "compactor" });
+  const compactStart = rec("10:52:10", "utility.start", { job: "compaction", model: "darkmux:util-4b", serves: SID, stall_after_ms: 600000 }, { session_id: SID, source: "utility", handle: "compactor" });
   const compactEnd = rec("10:52:20", "telemetry.tokens", { purpose: "utility", call_kind: "compaction", job: "compaction", total_tokens: 900 }, { session_id: SID, source: "tokens", handle: "compactor" });
-  const routeStart = (job: string) => rec("10:52:12", "utility.start", { job, model: "darkmux:util-4b", stall_after_seconds: 30 }, { source: "utility", handle: "radio-router" });
+  const routeStart = (job: string) => rec("10:52:12", "utility.start", { job, model: "darkmux:util-4b", stall_after_ms: 30000 }, { source: "utility", handle: "radio-router" });
   const routeEnd = rec("10:52:14", "telemetry.tokens", { purpose: "utility", call_kind: "single_shot", job: "radio_routing", total_tokens: 40 }, { source: "tokens", handle: "radio-router" });
   const rateLine = () =>
     waitFor(() => {

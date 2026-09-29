@@ -581,6 +581,16 @@ pub(crate) const NON_PRODUCER_SOURCE_PATHS: &[(&str, &str)] = &[
          against the telemetry samples darkmux writes (`is_telemetry_sample`), builds nothing",
     ),
     (
+        "crates/darkmux-flow/src/legacy.rs",
+        "the read-side upgrade tables: names `machine.rollup` / `machine.battery_health` as the \
+         actions whose old payload keys it renames, and builds no record",
+    ),
+    (
+        "crates/darkmux-flow/src/reader.rs",
+        "the read-side upgrade: its tests feed old `machine.*` records through the reader, and \
+         nothing there builds a record",
+    ),
+    (
         "crates/darkmux-crew/src/records_emitted.rs",
         "consumer: filters a record stream on `action == \"machine.telemetry\"`, builds nothing",
     ),

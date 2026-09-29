@@ -195,7 +195,7 @@ pub fn run_utility_single_shot(job: &UtilityJob<'_>) -> Result<UtilityReply> {
     // viewer in the same delivery and it is never drawn open.
     let mut live = job_kind.and_then(|_| darkmux_flow::live::LiveSender::for_local_daemon());
     if let Some(kind) = job_kind {
-        let payload = crate::usage::utility_start_payload(kind, &job_id, &wire_model, None, u64::from(job.timeout_seconds), started_at_ms);
+        let payload = crate::usage::utility_start_payload(kind, &job_id, &wire_model, None, u64::from(job.timeout_seconds).saturating_mul(1_000), started_at_ms);
         if let Some(tx) = live.as_mut() {
             tx.send(&live_utility_edge(&payload, "start", job.role_id, &wire_model, started_at_ms));
         }
@@ -290,7 +290,7 @@ mod tests {
     /// event, and no session.
     #[test]
     fn live_utility_edge_names_the_job_and_the_event() {
-        let start = crate::usage::utility_start_payload(crate::usage::UtilityJobKind::RadioRouting, "j-9", "u4b", None, 30, 1_000);
+        let start = crate::usage::utility_start_payload(crate::usage::UtilityJobKind::RadioRouting, "j-9", "u4b", None, 30_000, 1_000);
         let s = live_utility_edge(&start, "start", "radio-router", "u4b", 1_000);
         assert_eq!(s.kind, darkmux_flow::live::LiveKind::Utility);
         assert_eq!((s.fields["event"].as_str(), s.fields["job"].as_str(), s.fields["job_id"].as_str()), (Some("start"), Some("radio_routing"), Some("j-9")));

@@ -13,7 +13,7 @@ import { test, expect } from "@playwright/test";
 //
 // Talks to the `bun run dev` vite server (port 5273 by default — see
 // `ui/vite.config.ts`), NOT a throwaway or the operator's real daemon: the
-// `/flow-session/<id>` fetch is mocked via `page.route` below, so no backend
+// `/flow-dispatch/<id>` fetch is mocked via `page.route` below, so no backend
 // data is needed at all — every field in the brief (`route`/`runtime`/
 // `image`/`model`/`workspace`/`timing`) is fully controlled here, matching
 // the shape already exercised by `ui/src/lenses/session/sessionRun.test.ts`'s
@@ -43,7 +43,7 @@ import { test, expect } from "@playwright/test";
 const SESSION_ID = "brief-pairing-2000";
 
 async function mockSessionAndGoto(page: import("@playwright/test").Page, width: number, height: number) {
-  await page.route(`**/flow-session/${SESSION_ID}`, (route) =>
+  await page.route(`**/flow-dispatch/${SESSION_ID}`, (route) =>
     route.fulfill({
       status: 200,
       contentType: "application/json",

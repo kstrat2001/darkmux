@@ -61,7 +61,7 @@ function installCorpusRoutes(page, meta) {
     if (p === "/flow-missions") return json("flow-missions.json");
     if (p === "/lab/runs") return json("lab-runs.json");
     if (p === "/fleet/machines/live") return json("fleet-machines-live.json");
-    if (p === "/fleet/sessions/live") return json("fleet-sessions-live.json");
+    if (p === "/fleet/dispatches/live") return json("fleet-dispatches-live.json");
     // (#1855) `/fleet/roster` — the operator's DECLARED topology. Not part
     // of the original recorded corpus (the endpoint didn't exist yet); this
     // fixture is a hand-authored empty roster (`{"machines":[],"error":null}`)
@@ -85,7 +85,7 @@ function installCorpusRoutes(page, meta) {
     // previously handled `/mission/:id/graph.json` at all, so it silently
     // fell through to `route.continue()` at the bottom of this handler and
     // hit the REAL daemon. Only the fixture id resolves to a recorded
-    // fixture; any other id 404s, mirroring the `/flow-session/` pattern
+    // fixture; any other id 404s, mirroring the `/flow-dispatch/` pattern
     // below and matching the real daemon's own 404 for a mission with no
     // local graph on this box (crates/darkmux-serve/src/mission_graph.rs).
     const missionGraphJsonMatch = p.match(/^\/mission\/([^/]+)\/graph\.json$/);
@@ -111,8 +111,8 @@ function installCorpusRoutes(page, meta) {
       return route.fulfill({ status: 200, contentType: "text/event-stream", body: "" });
     }
 
-    if (p === "/flow-session/task-list") return json("flow-session-task-list.json");
-    if (p.startsWith("/flow-session/")) return notFound("no recorded fixture for this session id\n");
+    if (p === "/flow-dispatch/task-list") return json("flow-dispatch-task-list.json");
+    if (p.startsWith("/flow-dispatch/")) return notFound("no recorded fixture for this session id\n");
     // (Packet 4) The REAL `/flow-mission/:id` handler (catalog_records_response
     // in crates/darkmux-serve/src/lib.rs) never 404s for an unmatched id — it
     // always answers 200 with `{records:[],count:0,...}` (an actually
@@ -144,18 +144,13 @@ function installCorpusRoutes(page, meta) {
 
     // (#1911) `mission-status` now carries a declared `--all` opt — the
     // ported client sends `opt.all=all` on the wire (never the retired
-    // `panel=mission-status-all` id, since `parseRoute` resolves that alias
+    // `panel=mission-status-all` id (retired), which `parseRoute` no longer resolves
     // to `{panel:"mission-status", opts:{all:"all"}}` BEFORE any fetch
     // happens). Branch on the query param, same as a real daemon's
     // `resolve_opts` would, to replay the "all missions" fixture content.
     if (p === "/panel/mission-status") {
       return url.searchParams.get("opt.all") === "all" ? json("panel-mission-status-all.json") : json("panel-mission-status.json");
     }
-    // Kept for one release (#1911's own compat posture): a stray
-    // `/panel/mission-status-all` request (a pre-#1911 client, or a test
-    // exercising the raw endpoint directly) still replays the same fixture
-    // a real daemon's `resolve_alias` would produce.
-    if (p === "/panel/mission-status-all") return json("panel-mission-status-all.json");
     if (p === "/panel/machine-status") return json("panel-machine-status.json");
     if (p === "/panel/flow-status") return json("panel-flow-status.json");
     if (p === "/panel/role-list") return json("panel-role-list.json");
@@ -204,7 +199,7 @@ function installBlankRoutes(page) {
       "/flow-missions",
       "/lab/runs",
       "/fleet/machines/live",
-      "/fleet/sessions/live",
+      "/fleet/dispatches/live",
       "/fleet/roster",
       "/machine/resources",
       "/machine/specs",
@@ -216,7 +211,7 @@ function installBlankRoutes(page) {
     if (/^\/mission\/[^/]+\/graph\.json$/.test(p)) return route.fulfill({ status: 404, contentType: "text/plain", body: "blank harness\n" });
     if (/^\/flow\/\d{4}-\d{2}-\d{2}$/.test(p)) return route.fulfill({ status: 404, contentType: "text/plain", body: "blank harness\n" });
     if (/^\/flow\/\d{4}-\d{2}-\d{2}\/stream$/.test(p)) return route.fulfill({ status: 200, contentType: "text/event-stream", body: "" });
-    if (p.startsWith("/flow-session/")) return route.fulfill({ status: 404, contentType: "text/plain", body: "blank harness\n" });
+    if (p.startsWith("/flow-dispatch/")) return route.fulfill({ status: 404, contentType: "text/plain", body: "blank harness\n" });
     if (p.startsWith("/flow-mission/")) return route.fulfill({ status: 404, contentType: "text/plain", body: "blank harness\n" });
     if (p.startsWith("/panel/")) return route.fulfill({ status: 404, contentType: "text/plain", body: "blank harness\n" });
     if (p.startsWith("/lab/run/")) return route.fulfill({ status: 404, contentType: "text/plain", body: "blank harness\n" });

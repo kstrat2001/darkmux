@@ -159,22 +159,14 @@ test.describe("nav chrome (Packet 1.5)", () => {
     expect(pageErrors, `pageerror events across the whole click sequence: ${pageErrors.join("; ")}`).toHaveLength(0);
   });
 
-  test("the legacy #lens=lab alias boots and the address bar upgrades to the canonical #lens=runs&kind=lab", async ({ page }) => {
+  test("the retired #lens=lab spelling shows the unknown-route page and leaves the address bar alone", async ({ page }) => {
     const meta = loadMeta();
     installCorpusRoutes(page, meta);
 
     await page.goto("/index.html#lens=lab");
-    await waitSettled(page, expect, '[data-state="data"], [data-state="pending"]');
-
-    await expect(async () => {
-      const gotHash = await page.evaluate(() => location.hash);
-      expect(gotHash).toBe("#lens=runs&kind=lab");
-    }).toPass({ timeout: 5000 });
-
-    // And the runs tab is the one lit — the upgrade is a REAL navigation
-    // outcome, not just an address-bar cosmetic.
-    await expect(page.locator("#lens-runs")).toHaveClass(/\bon\b/);
-    await page.screenshot({ path: shot("chrome-lens-lab-upgrade.png"), fullPage: true });
+    await expect(page.getByText("Unknown route")).toBeVisible({ timeout: 15000 });
+    expect(await page.evaluate(() => location.hash)).toBe("#lens=lab");
+    await page.screenshot({ path: shot("chrome-lens-lab-unknown.png"), fullPage: true });
   });
 
   test("a runs-lens kind-chip click writes the hash directly, without disturbing the active tab", async ({ page }) => {

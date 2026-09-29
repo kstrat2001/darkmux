@@ -40,11 +40,12 @@ import { dispatchHash, isLiveRoute, showsEventLog, tokRateConnectionEvidence } f
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "./lib/fetcher";
 import { queryKeys } from "./lib/queryKeys";
-import type { MachineSpecs } from "./types/handwritten";
+import type { MachineSpecsResponse } from "./types/generated/MachineSpecsResponse";
 import type { Route } from "./lib/route";
 import { ingest, recordsAsOf, type NormRecord } from "./lib/ingest";
 import { DEFAULT_POLICY, lifecycleAt, recordedWallMs } from "./lib/lifecycle";
 import { sessionRun } from "./lib/runRef";
+import type { FlowRecordsResponse } from "./types/generated/FlowRecordsResponse";
 
 /**
  * The app shell. A `switch` over the parsed [[Route]] (see `lib/route.ts` for
@@ -109,9 +110,7 @@ import { sessionRun } from "./lib/runRef";
  *   `syncLabHash()` — reflects the current `Route` back into `location.hash`
  *   via `replaceState` on every route change, so every view is bookmarkable
  *   (matches legacy's own reasoning: the phone dashboard is the first-class
- *   consumer). This is also what performs the legacy `#lens=lab` →
- *   `#lens=runs&kind=lab` upgrade, since arriving on the alias parses to
- *   the canonical `Route` already and the write-back just names it.
+ *   consumer).
  *   `RunsBoard`'s kind chips are the one piece of lens state that changes
  *   WITHOUT a route change (no `hashchange` fires) — that write goes
  *   straight from `RunsBoard.tsx`'s `selectKind` to `hashSync.ts`'s
@@ -173,7 +172,7 @@ export function App() {
 
   const flowWindow = useFlowWindow(nowMs);
   // (#1800 P1) The event log follows the ROUTE, not the clock. On a
-  // `#session=`/`#<date>` route this is that slice; on a live route it is
+  // `#dispatch=`/`#<date>` route this is that slice; on a live route it is
   // still the rolling window. Before this, every route got the live window,
   // so a session's stage and its event log described different things.
   const routeRecords = useRouteRecords(route, flowWindow);
@@ -219,7 +218,7 @@ export function App() {
   // the mission lens fetches, so this is cache reuse.
   const missionRecordsQuery = useQuery({
     queryKey: queryKeys.flowMission(route.kind === "mission" ? route.missionId : ""),
-    queryFn: () => fetchJson<unknown>(`/flow-mission/${encodeURIComponent(route.kind === "mission" ? route.missionId : "")}`),
+    queryFn: () => fetchJson<FlowRecordsResponse>(`/flow-mission/${encodeURIComponent(route.kind === "mission" ? route.missionId : "")}`),
     enabled: source.kind === "daemon" && route.kind === "mission",
   });
   const missionRecords = useMemo(
@@ -245,7 +244,7 @@ export function App() {
   // own span (its first record to its last), not the whole loaded day.
   //
   // The focus carries its OWN records — `routeRecords.records` (the
-  // dispatch's own `/flow-session/<id>` fetch, already resolved above) and
+  // dispatch's own `/flow-dispatch/<id>` fetch, already resolved above) and
   // `missionRecordsQuery.data` (the mission's own `/flow-mission/<id>`
   // fetch, also already resolved above) — rather than being derived by
   // filtering `dayRecords`. The first cut of this fix DID filter
@@ -479,7 +478,7 @@ export function App() {
   const specsQuery = useQuery({
     enabled: isLiveRoute(route),
     queryKey: queryKeys.machineSpecs(),
-    queryFn: () => fetchJson<MachineSpecs>("/machine/specs"),
+    queryFn: () => fetchJson<MachineSpecsResponse>("/machine/specs"),
   });
   const specs = isLiveRoute(route) && specsQuery.data?.ok ? specsQuery.data.data : null;
 
@@ -1084,7 +1083,7 @@ function renderRoute(
       // panel AND variant.
       return <ConsolePanel initialPanelId={route.panelId} initialOpts={route.opts} />;
     case "dispatch":
-      // Packet 4: a real fetch to /flow-session/<id> — see SessionReplay's
+      // Packet 4: a real fetch to /flow-dispatch/<id> — see SessionReplay's
       // own doc for why the RENDER (not the fetch) is still a not-ported
       // notice.
       return <SessionReplay sessionId={route.dispatchId} missionId={route.missionId} playhead={playhead} connected={connected} lastContactMs={routeLastContactMs} />;
@@ -1107,6 +1106,6 @@ function renderRoute(
       // replay-mode branches taken. See PlaybackLens's own doc.
       return <PlaybackLens date={route.date} playhead={playhead} />;
     case "unknown":
-      return <LensPlaceholder label="unrecognized" hash={route.hash} />;
+      return <LensPlaceholder hash={route.hash} />;
   }
 }

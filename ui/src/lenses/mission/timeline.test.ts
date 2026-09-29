@@ -175,7 +175,7 @@ describe("groupTimeline", () => {
 // finished — while tokens and turns on the same row were summed.
 describe("taskAggMetrics task-level duration (#2269)", () => {
   const T0 = 1_756_900_000_000; // epoch ms: `tsToMs` reads small numbers as SECONDS
-  const seq = (s1: Partial<GraphNode["steps"] extends (infer S)[] | undefined ? S : never>, s2: typeof s1, status = "running"): GraphNode => ({
+  const seq = (s1: Partial<GraphNode["steps"] extends (infer S)[] | undefined ? S : never>, s2: typeof s1, status: GraphNode["status"] = "running"): GraphNode => ({
     id: "t",
     label: "crawl",
     kind: "task",

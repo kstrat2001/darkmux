@@ -6,10 +6,10 @@
  * committed static flow file, a lab run's event feed, and the live channel's
  * samples. `ingest` parses each one ONCE:
  *
- * - `action`, `level`, `category`, `stage` and `tier` become opaque tags
+ * - `action`, `level`, `category`, `stage`, `tier` and `source` become opaque tags
  *   (`Tag`): the text the wire carried, typed so that the only thing they
  *   can be compared with is a constant from `ACTION`/`LEVEL`/`CATEGORY`/
- *   `STAGE`/`TIER`. A spelling this build does not know keeps its text and
+ *   `STAGE`/`TIER`/`SOURCE`. A spelling this build does not know keeps its text and
  *   equals no constant.
  * - `ts` is parsed once into `tMs`, under the bad-timestamp policy below.
  *
@@ -32,10 +32,11 @@
  * 3. It sorts after every timed record (`byTime`), in arrival order.
  */
 
-import type { FlowRecord } from "../types/handwritten";
+import type { FlowRecord } from "../types/generated/FlowRecord";
 import type { Category } from "../types/generated/Category";
 import type { ExecutionGrainAction } from "../types/generated/ExecutionGrainAction";
 import type { FlowAction } from "../types/generated/FlowAction";
+import type { FlowSource } from "../types/generated/FlowSource";
 import type { Level } from "../types/generated/Level";
 import type { RetiredAction } from "../types/generated/RetiredAction";
 import type { Stage } from "../types/generated/Stage";
@@ -74,19 +75,30 @@ type NormLevel = Tag<"level", string>;
 type NormCategory = Tag<"category", string>;
 type NormStage = Tag<"stage", string>;
 type NormTier = Tag<"tier", string>;
+export type NormSource = Tag<"source", string>;
 
 declare const normBrand: unique symbol;
 
 /** A flow record that has passed through `ingest`. Lenses and libs accept
  *  this type only; a raw `FlowRecord` does not satisfy it. */
-export interface NormRecord extends Omit<FlowRecord, "action" | "level" | "category" | "stage" | "tier" | "_type"> {
+export interface NormRecord extends Omit<FlowRecord, "action" | "level" | "category" | "stage" | "tier" | "source" | "_type"> {
   /** `ts` parsed once; `null` when it is missing or does not parse. */
   readonly tMs: number | null;
+  /** `payload`, aliased by the render model for records that only carry the
+   *  one spelling. Added by the viewer; the wire's `FlowRecord` has `payload`. */
+  fields?: Record<string, unknown>;
+  /** A human title for the mission, stamped only by the demo's importer onto
+   *  the committed playback file. No daemon writes it. */
+  mission_title?: string;
+  /** The `owner/repo#pr` a demo review mission reviewed; demo-only, like
+   *  `mission_title`. */
+  mission_reviewed?: string;
   action?: NormAction;
   level?: NormLevel;
   category?: NormCategory;
   stage?: NormStage;
   tier?: NormTier;
+  source?: NormSource;
   readonly [normBrand]: true;
 }
 
@@ -201,7 +213,6 @@ const CATEGORY_WIRE = {
 
 const STAGE_WIRE = {
   Scope: "scope",
-  Estimate: "estimate",
   Dispatch: "dispatch",
   Review: "review",
   Ship: "ship",
@@ -213,9 +224,38 @@ const STAGE_WIRE = {
 const TIER_WIRE = {
   Operator: "operator",
   Frontier: "frontier",
-  Local: "local",
+  Darkmux: "darkmux",
   Unknown: "unknown",
 } as const satisfies Record<string, Tier>;
+
+const SOURCE_WIRE = {
+  CrewDispatch: "crew_dispatch",
+  Scheduler: "scheduler",
+  PhaseLifecycle: "phase_lifecycle",
+  MissionLifecycle: "mission_lifecycle",
+  PhaseReview: "phase_review",
+  MissionDebrief: "mission_debrief",
+  HostSampler: "host_sampler",
+  PresenceReconciler: "presence_reconciler",
+  CmdGateAudit: "cmd_gate_audit",
+  Hook: "hook",
+  Host: "host",
+  Detector: "detector",
+  Runtime: "runtime",
+  Tokens: "tokens",
+  Context: "context",
+  Compaction: "compaction",
+  Lms: "lms",
+  Thermal: "thermal",
+  Battery: "battery",
+  Budget: "budget",
+  Utility: "utility",
+  Orchestrator: "orchestrator",
+  Adjudication: "adjudication",
+  Manual: "manual",
+  Frontier: "frontier",
+  Unknown: "unknown",
+} as const satisfies Record<string, FlowSource>;
 
 /** Every action by name, named as `darkmux_flow::action::FlowAction` names
  *  its variants. Call sites compare against these; a literal will not
@@ -225,6 +265,7 @@ export const LEVEL = tags<"level">()(LEVEL_WIRE);
 export const CATEGORY = tags<"category">()(CATEGORY_WIRE);
 export const STAGE = tags<"stage">()(STAGE_WIRE);
 export const TIER = tags<"tier">()(TIER_WIRE);
+export const SOURCE = tags<"source">()(SOURCE_WIRE);
 
 type ValuesOf<O> = O[keyof O];
 type Covers<U, O> = [Exclude<U, ValuesOf<O>>] extends [never] ? true : false;
@@ -240,6 +281,7 @@ export type EveryVariantNamed = [
   Assert<Covers<Category, typeof CATEGORY_WIRE>>,
   Assert<Covers<Stage, typeof STAGE_WIRE>>,
   Assert<Covers<Tier, typeof TIER_WIRE>>,
+  Assert<Covers<FlowSource, typeof SOURCE_WIRE>>,
 ];
 
 /** Every action darkmux retired with no current equivalent
@@ -336,7 +378,7 @@ export function ingestRecord(raw: unknown): NormRecord | null {
   return out as unknown as NormRecord;
 }
 
-const TAGGED_FIELDS = ["action", "level", "category", "stage", "tier"] as const;
+const TAGGED_FIELDS = ["action", "level", "category", "stage", "tier", "source"] as const;
 
 function assignTyped(out: Record<string, unknown>, key: string, v: unknown): void {
   if (v === undefined) delete out[key];

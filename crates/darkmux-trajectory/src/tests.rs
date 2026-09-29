@@ -121,6 +121,16 @@ fn a_continuation_is_the_same_turn_and_its_usage_still_counts() {
     assert_eq!(null_count.tokens.total, 7);
 }
 
+/// A hand-back resume records its first call under the checkpoint's last
+/// turn (`seq` = that turn), so its own trajectory folds to the turns IT made:
+/// one here, though the whole task has made three. Two runs' `turns` must
+/// therefore not be summed across a resume (the shared turn counts twice).
+#[test]
+fn a_resumed_run_counts_only_its_own_turns() {
+    let resumed = fold(&[r#"{"type":"model.completed","seq":3,"finish_reason":"stop","usage":null}"#]);
+    assert_eq!(resumed.turns(), 1);
+}
+
 #[test]
 fn rests_split_routine_from_paced_and_sum_both() {
     let f = fold(&[
@@ -274,29 +284,6 @@ fn checkpoint_ratios_report_the_worst_and_the_mean() {
     assert_eq!(min, Some(0.2));
     assert!((mean.unwrap() - (0.9 + 0.2 + 0.99) / 3.0).abs() < 1e-12);
     assert_eq!(fold(&[]).checkpoint_tail_ratios(), (None, None));
-}
-
-/// (#2263) A resumed run's whole-task turn count. The runtime numbers each
-/// call's `seq` with the task's own turn counter, seeded from the
-/// checkpoint, so the count is the later of the checkpoint's and the last
-/// seq this run recorded. A hand-back resume CONTINUES turn N (its first
-/// call is `seq: N`), a clean one starts turn N+1: adding the run's own
-/// turn count to the seed over-counts the first by one.
-#[test]
-fn a_resumed_runs_whole_task_turns_come_from_its_seqs() {
-    let seed = CheckpointCounts { turns: 3, compactions: 1 };
-    let hand_back = fold(&[r#"{"type":"model.completed","seq":3,"finish_reason":"stop"}"#]);
-    assert_eq!(seed.cumulative_turns(&hand_back), 3, "turn 3 continued, not a fourth turn");
-    let clean = fold(&[
-        r#"{"type":"model.completed","seq":4,"finish_reason":"tool_calls"}"#,
-        r#"{"type":"compaction","generation":2}"#,
-        r#"{"type":"model.completed","seq":5,"finish_reason":"stop"}"#,
-    ]);
-    assert_eq!(seed.cumulative_turns(&clean), 5);
-    assert_eq!(seed.cumulative_compactions(&clean), 2);
-    assert_eq!(seed.cumulative_turns(&fold(&[])), 3, "a run that made no call ends where it started");
-    let fresh = CheckpointCounts::default();
-    assert_eq!(fresh.cumulative_turns(&clean), 5);
 }
 
 /// One TEXT field of the wrong JSON type must not drop a whole known event:

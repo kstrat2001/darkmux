@@ -3,7 +3,7 @@
 // invisible to every unit test in the tree.
 //
 //   U5-1: `#lens=fleet` on darkmux.com/demo fired `/fleet/machines/live`,
-//         `/fleet/sessions/live` and `/machine/specs` — three 404s and their
+//         `/fleet/dispatches/live` and `/machine/specs` — three 404s and their
 //         console errors on a marketing page with no daemon anywhere near
 //         it. `FleetLens` gated those on its own `historical` PROP, and
 //         `App.tsx` renders `<FleetLens />` with no props at all, so the
@@ -29,7 +29,7 @@ const { test, expect } = require('@playwright/test');
 const DESKTOP = { width: 1456, height: 900 };
 
 // Every endpoint that only a running daemon can answer, on the fleet screen.
-const LIVE_ONLY = ['/fleet/machines/live', '/fleet/sessions/live', '/machine/specs'];
+const LIVE_ONLY = ['/fleet/machines/live', '/fleet/dispatches/live', '/machine/specs'];
 
 const LENSES = ['fleet', 'runs', 'machine', 'console'];
 

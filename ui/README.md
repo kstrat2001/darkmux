@@ -2,9 +2,8 @@
 
 React + TanStack Query workspace that builds to ONE committed, self-contained
 `crates/darkmux-serve/assets/next.html`. **This is the viewer** — it serves
-`GET /` and `GET /play/:date` as of the flip (#1800); `GET /next`, the route
-it grew up on, is now a permanent redirect to `/` so bookmarks and phone
-home-screen shortcuts keep working.
+`GET /` and `GET /play/:date`. The `GET /next` route it grew up on is gone: it
+answers 404, not a redirect.
 
 The gate for the flip was a NUMBER, not a judgement: 21 of 22 goldens recorded
 from the legacy viewer asserting real byte parity in a real browser

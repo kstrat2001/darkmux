@@ -19,8 +19,9 @@
 
 import { RUNNING_WORD } from "../../components/WorkStatus";
 import { shortModel } from "../lab/labSeries";
-import type { LabFunnelEnvelope, LabScoresDoc } from "../../types/handwritten";
-import { ACTION, CATEGORY, type NormRecord } from "../../lib/ingest";
+import type { LabReviewSummary } from "../../types/generated/LabReviewSummary";
+import type { LabScoresSummary } from "../../types/generated/LabScoresSummary";
+import { ACTION, CATEGORY, SOURCE, type NormRecord } from "../../lib/ingest";
 
 /** `computeLabPipeline()` — viewer.html:4756-4774. Folds the event feed
  * into per-`step_id` completion payloads (in first-seen order) plus a
@@ -87,7 +88,7 @@ function tallyStr(t: Record<string, number>): string {
  * stage (name, meta), in ARRIVAL order (the step_ids come straight from the
  * review graph / sequential driver, so this needs no hardcoded stage list),
  * plus a trailing synthesis stage. */
-export function labPipelineLines(pipe: LabPipeline, env: LabFunnelEnvelope | null): string[] {
+export function labPipelineLines(pipe: LabPipeline, env: LabReviewSummary | null): string[] {
   const lines: string[] = [];
   const order = pipe.order.length ? pipe.order : ["pipeline"];
   for (const id of order) {
@@ -119,7 +120,7 @@ export function labFeedRowLines(r: NormRecord): string[] {
   const tt = labFeedTs(r.ts);
   const f = r.payload || {};
 
-  if (r.category === CATEGORY.Telemetry && r.source === "process") {
+  if (r.category === CATEGORY.Telemetry && r.source === SOURCE.Host) {
     const cpu = f.cpu ?? "–";
     const mem = f.mem ?? "–";
     const gpu = f.gpu ?? "–";
@@ -188,13 +189,13 @@ export function labFeedStatusSuffix(isFinished: boolean, unreachable: boolean): 
  * modes run fixed reviewer roles and refuse a named role, so they omit it.
  * (4.0) This used to print the deleted funnel's `--roster-profile` and
  * `--exec-mode`, flags `lab eval` rejects. */
-export function labCliHint(scores: LabScoresDoc | null): string {
+export function labCliHint(scores: LabScoresSummary | null): string {
   const mode = scores?.mode ?? "strict";
   const experimental = mode === "freeform" || mode === "agentic" || mode === "dialectic";
   const parts = ["darkmux lab eval"];
   if (!experimental) parts.push(scores?.role || "<role>");
   parts.push("--cases-dir <cases-dir>");
-  if (scores?.provenance?.profile) parts.push(`--profile ${scores.provenance.profile}`);
+  if (scores?.profile) parts.push(`--profile ${scores.profile}`);
   if (mode === "freeform") parts.push("--freeform");
   if (mode === "agentic" || mode === "dialectic") parts.push(`--${mode} --workdirs <workdirs-root>`);
   return parts.join(" ");

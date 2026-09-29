@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
 import { machActive, specOf, buildFleetCard, busiestExecution, isStrictlyBusier, rosterOnlyEntries, rosterAliasFor, specUnknownLabel, cardFace } from "./cards";
-import type { MachineSpecs, PresenceBeat, RosterMachineEntry } from "../../types/handwritten";
+import type { MachineSpecsResponse } from "../../types/generated/MachineSpecsResponse";
+import type { PresenceBeat } from "../../types/generated/PresenceBeat";
+import type { RosterMachineEntry } from "../../types/generated/RosterMachineEntry";
 import type { ExecutionTokenReading } from "../../lib/tokenRate";
 import { norm, type RawRecord } from "../../testing/records";
 import type { Run } from "../../types/generated/Run";
@@ -23,10 +25,11 @@ function rosterEntry(overrides: Partial<RosterMachineEntry> & Pick<RosterMachine
   return { address: "100.64.1.2:8765", added_unix_ms: 1000, ...overrides };
 }
 
-function machineSpecs(overrides: Partial<MachineSpecs> & Pick<MachineSpecs, "machine_id">): MachineSpecs {
+function machineSpecs(overrides: Partial<MachineSpecsResponse> & Pick<MachineSpecsResponse, "machine_id">): MachineSpecsResponse {
   return {
     darkmux_version: "3.7.1",
     flow_schema_version: "1.18.0",
+    machine_uid: null,
     os: "macos",
     ram_total_bytes: null,
     ram_free_for_ai_bytes: null,
@@ -50,7 +53,7 @@ describe("machActive", () => {
   // while the wait is open, live or in playback, with or without presence.
   it("is true for a machine whose only session is an open budget wait (no dispatch start yet)", () => {
     const data: NormRecord[] = [
-      rec({ ts: "2026-08-08T20:00:00.000Z", machine_uid: "m1", session_id: "s1", action: "budget.wait", payload: { endpoint_id: "azure", wait_seconds: 86_000 } }),
+      rec({ ts: "2026-08-08T20:00:00.000Z", machine_uid: "m1", session_id: "s1", action: "budget.wait", payload: { endpoint_id: "azure", wait_ms: 86000000 } }),
     ];
     expect(machActive(data, new Set(), "m1", T_MAX)).toBe(true);
     expect(machActive(data, new Set(["s1"]), "m1", T_MAX)).toBe(true);
@@ -138,10 +141,11 @@ describe("machActive", () => {
 });
 
 describe("specOf", () => {
-  const specs: MachineSpecs = {
+  const specs: MachineSpecsResponse = {
     darkmux_version: "2.5.0",
     flow_schema_version: "1.18.0",
     machine_id: "MacBook-Pro",
+    machine_uid: null,
     os: "macos",
     ram_total_bytes: 137438953472, // 128 GiB
     ram_free_for_ai_bytes: null,
@@ -1213,10 +1217,10 @@ describe("(#2915) buildFleetCard's utility strip", () => {
   const at = (s: number) => new Date(Date.parse("2026-08-08T00:00:00.000Z") + s * 1000).toISOString();
   const tAt = (s: number) => Date.parse(at(s));
   const routeStart = (s: number, uid = "u1") =>
-    rec({ ts: at(s), machine_uid: uid, action: "utility.start", category: "telemetry", source: "utility", handle: "radio-router", model: "util-4b", payload: { job: "radio_routing", model: "util-4b", stall_after_seconds: 30 } });
+    rec({ ts: at(s), machine_uid: uid, action: "utility.start", category: "telemetry", source: "utility", handle: "radio-router", model: "util-4b", payload: { job: "radio_routing", model: "util-4b", stall_after_ms: 30000 } });
   const routeEnd = (s: number) =>
     rec({ ts: at(s), machine_uid: "u1", action: "telemetry.tokens", category: "telemetry", source: "tokens", handle: "radio-router", payload: { purpose: "utility", call_kind: "single_shot", job: "radio_routing", requested_model: "util-4b", total_tokens: 9 } });
-  const card = (data: NormRecord[], t: number, specs: MachineSpecs | null = null) => buildFleetCard(data, new Map(), specs, new Set(), false, "u1", true, t);
+  const card = (data: NormRecord[], t: number, specs: MachineSpecsResponse | null = null) => buildFleetCard(data, new Map(), specs, new Set(), false, "u1", true, t);
 
   it("shows the routing job while it runs, and is quiet once its usage record lands", () => {
     expect(card([routeStart(0)], tAt(2)).utility.job).toMatchObject({ job: "radio_routing", visual: "radio", stalled: false });
@@ -1238,7 +1242,7 @@ describe("(#2915) buildFleetCard's utility strip", () => {
   });
 
   it("the model and residency come from this machine's own /machine/specs", () => {
-    const specs = machineSpecs({ machine_id: "studio", machine_uid: "u1", utility_model: { id: "util-4b", loaded: true } });
+    const specs = machineSpecs({ machine_id: "studio", machine_uid: "u1", utility_model: { id: "util-4b", loaded: true, n_ctx: null } });
     expect(card([], T_MAX, specs).utility).toMatchObject({ model: "util-4b", resident: true, job: null });
   });
 
@@ -1248,7 +1252,7 @@ describe("(#2915) buildFleetCard's utility strip", () => {
   });
 
   it("a compaction on this machine shows as compacting, ended by its usage record", () => {
-    const start = rec({ ts: at(0), machine_uid: "u1", session_id: "s1", action: "utility.start", payload: { job: "compaction", model: "util-4b", serves: "s1", stall_after_seconds: 600 } });
+    const start = rec({ ts: at(0), machine_uid: "u1", session_id: "s1", action: "utility.start", payload: { job: "compaction", model: "util-4b", serves: "s1", stall_after_ms: 600000 } });
     const end = rec({ ts: at(4), machine_uid: "u1", session_id: "s1", action: "telemetry.tokens", category: "telemetry", source: "tokens", payload: { purpose: "utility", call_kind: "compaction", job: "compaction", total_tokens: 3 } });
     expect(card([start], tAt(2)).utility.job).toMatchObject({ job: "compaction", visual: "compacting" });
     expect(card([start, end], tAt(5)).utility.job).toBeNull();
@@ -1265,7 +1269,7 @@ describe("(#2928) buildFleetCard with the live overlay", () => {
   ];
   const liveModel = (at: number, gen: number, vis: number) =>
     JSON.stringify({ v: 1, kind: "model", session_id: "s1", at_ms: at, cadence_ms: 250, fields: { turn_seq: 1, sampled_at_ms: at, generated_chars: gen, cumulative_chars: vis } });
-  const selfSpecs = machineSpecs({ machine_id: "studio", machine_uid: "u1", utility_model: { id: "u4b", loaded: true } } as Partial<MachineSpecs> & Pick<MachineSpecs, "machine_id">);
+  const selfSpecs = machineSpecs({ machine_id: "studio", machine_uid: "u1", utility_model: { id: "u4b", loaded: true } } as Partial<MachineSpecsResponse> & Pick<MachineSpecsResponse, "machine_id">);
 
   it("no overlay: exactly the durable reading (playback and every existing caller)", () => {
     const a = buildFleetCard(durable, new Map(), null, new Set(["s1"]), false, "u1", true, T);
@@ -1294,7 +1298,7 @@ describe("(#2928) buildFleetCard with the live overlay", () => {
     const { LiveStore } = await import("../../lib/liveChannel");
     const { UTILITY_JOB } = await import("../../lib/utilityJobs");
     const store = new LiveStore();
-    store.ingest(JSON.stringify({ v: 1, kind: "utility", role: "radio-router", model: "u4b", at_ms: T, cadence_ms: 250, fields: { event: "start", job: UTILITY_JOB.radio_routing, job_id: "r1", stall_after_seconds: 30 } }), T);
+    store.ingest(JSON.stringify({ v: 1, kind: "utility", role: "radio-router", model: "u4b", at_ms: T, cadence_ms: 250, fields: { event: "start", job: UTILITY_JOB.radio_routing, job_id: "r1", stall_after_ms: 30000 } }), T);
     const self = buildFleetCard(durable, new Map(), selfSpecs, new Set(["s1"]), false, "u1", true, T + 100, undefined, [], true, null, [], store.snapshot());
     expect(self.utility.job?.visual).toBe("radio");
     const peer = buildFleetCard(durable, new Map(), selfSpecs, new Set(["s1"]), false, "u2", true, T + 100, undefined, [], true, null, [], store.snapshot());

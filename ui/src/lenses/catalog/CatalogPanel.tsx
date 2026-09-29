@@ -2,7 +2,10 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
 import { queryKeys } from "../../lib/queryKeys";
-import type { FlowDay, FlowDaysResponse, FlowMissionSummary, FlowMissionsResponse } from "../../types/handwritten";
+import type { FlowDay } from "../../types/generated/FlowDay";
+import type { FlowDaysResponse } from "../../types/generated/FlowDaysResponse";
+import type { FlowMissionSummary } from "../../types/generated/FlowMissionSummary";
+import type { FlowMissionsResponse } from "../../types/generated/FlowMissionsResponse";
 import { CATALOG_MISSION_CAP, daySummary, missionSummary, missionsHeader, todayUTC } from "./format";
 import { Shimmer } from "../../components/Placeholder";
 

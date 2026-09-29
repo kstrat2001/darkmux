@@ -2,7 +2,7 @@
   "name": "darkmux-viewer-next",
   "version": "0.0.0",
   "private": true,
-  "description": "Packet 1 of the viewer -> React port: the scaffold. React + TanStack Query + ts-rs types over the existing daemon JSON endpoints, built to one committed self-contained artifact (crates/darkmux-serve/assets/next.html) served at GET /next.",
+  "description": "Packet 1 of the viewer -> React port: the scaffold. React + TanStack Query + ts-rs types over the existing daemon JSON endpoints, built to one committed self-contained artifact (crates/darkmux-serve/assets/next.html) served at GET /.",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -13,7 +13,7 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "knip": "knip --no-progress",
-    "types:regen": "(cd .. && cargo test -p darkmux-serve export_bindings --lib && cargo test -p darkmux-flow --features ts-export export_bindings --lib && cargo test -p darkmux-crew --features ts-export export_bindings --lib && cargo test -p darkmux-lab --features ts-export export_bindings --lib)",
+    "types:regen": "(cd .. && cargo test -p darkmux-serve export_bindings --lib && cargo test -p darkmux-types --features ts-export export_bindings --lib && cargo test -p darkmux-profiles --features ts-export export_bindings --lib && cargo test -p darkmux-flow --features ts-export export_bindings --lib && cargo test -p darkmux-crew --features ts-export export_bindings --lib && cargo test -p darkmux-lab --features ts-export export_bindings --lib)",
     "types:check": "bun run types:regen && git diff --exit-code -- src/types/generated"
   },
   "dependencies": {

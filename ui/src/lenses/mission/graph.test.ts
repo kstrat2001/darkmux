@@ -47,30 +47,32 @@ function rec(over: RawRecord = {}): NormRecord {
   return norm({ ts: "2026-08-19T00:00:00Z", ...over });
 }
 
-const PHASE: GraphNode = { id: "p1", label: "Investigate", kind: "phase", status: "complete", depth: 0 };
+const PHASE: GraphNode = { id: "p1", label: "Investigate", kind: "phase", status: "complete" as const, depth: 0 };
 const TASK_A: GraphNode = {
   id: "a",
   label: "bundle",
   kind: "task",
-  status: "complete",
+  status: "complete" as const,
   parentId: "p1",
   depth: 0,
-  steps: [{ id: "a-step", label: "Shell", kind: "procedural.shell", status: "complete" }],
+  steps: [{ id: "a-step", label: "Shell", kind: "procedural.shell", status: "complete" as const }],
 };
 const TASK_B: GraphNode = {
   id: "b",
   label: "probe",
   kind: "task",
-  status: "complete",
+  status: "complete" as const,
   parentId: "p1",
   depth: 1,
-  steps: [{ id: "b-step", label: "Dispatch", kind: "dispatch.single_shot", status: "complete" }],
+  steps: [{ id: "b-step", label: "Dispatch", kind: "dispatch.single_shot", status: "complete" as const }],
 };
 
 function baseGraph(): MissionGraph {
   return {
     mission_id: "m1",
     mission_status: "active",
+    legacy: false,
+    generated_at_ms: 0,
     nodes: [PHASE, TASK_A, TASK_B],
     edges: [
       { id: "e1", source: "p1", target: "a", kind: "contains" },
@@ -83,7 +85,7 @@ function baseGraph(): MissionGraph {
 describe("computeLayout", () => {
   it("rebases each phase band to its own first column", () => {
     const deepTask: GraphNode = { ...TASK_B, id: "c", depth: 5, parentId: "p2" };
-    const phase2: GraphNode = { id: "p2", label: "Adjudicate", kind: "phase", status: "planned", depth: 1 };
+    const phase2: GraphNode = { id: "p2", label: "Adjudicate", kind: "phase", status: "planned" as const, depth: 1 };
     const layout = computeLayout([PHASE, TASK_A, TASK_B, phase2, deepTask]);
     // phase2's band has one task at raw depth 5 — rebased to column 0
     // (minDepth=5), so its x matches TASK_A's own column-0 x, not a
@@ -95,7 +97,7 @@ describe("computeLayout", () => {
     const manySteps: GraphNode = {
       ...TASK_A,
       id: "many",
-      steps: Array.from({ length: 5 }, (_, i) => ({ id: `s${i}`, label: `s${i}`, kind: "procedural.shell", status: "planned" })),
+      steps: Array.from({ length: 5 }, (_, i) => ({ id: `s${i}`, label: `s${i}`, kind: "procedural.shell", status: "planned" as const })),
     };
     const sibling: GraphNode = { ...TASK_A, id: "sib" };
     const layout = computeLayout([PHASE, manySteps, sibling]);
@@ -160,7 +162,7 @@ describe("computeLayout sizes task cards to their content (#2104)", () => {
   const withSteps: GraphNode = {
     ...TASK_A,
     id: "wide",
-    steps: Array.from({ length: 3 }, (_, i) => ({ id: `w${i}`, label: "crawl.unit", kind: "dispatch.internal", status: "complete" })),
+    steps: Array.from({ length: 3 }, (_, i) => ({ id: `w${i}`, label: "crawl.unit", kind: "dispatch.internal", status: "complete" as const })),
   };
   const bare: GraphNode = { ...TASK_A, id: "bare", steps: [] };
 
@@ -247,7 +249,7 @@ describe("statusFromRecord / applyFlowRecord", () => {
 
   it("advances a node's status on a matching handle", () => {
     const idx = indexGraph(baseGraph());
-    const g = applyFlowRecord({ ...baseGraph(), nodes: [{ ...PHASE, status: "planned" }, TASK_A, TASK_B] }, rec({ action: "phase.start", handle: "p1" }), idx, "m1");
+    const g = applyFlowRecord({ ...baseGraph(), nodes: [{ ...PHASE, status: "planned" as const }, TASK_A, TASK_B] }, rec({ action: "phase.start", handle: "p1" }), idx, "m1");
     expect(g.nodes[0].status).toBe("running");
   });
 
@@ -261,7 +263,7 @@ describe("statusFromRecord / applyFlowRecord", () => {
 
   it("flips a step ROW inside its owning task, not the task's own status", () => {
     const idx = indexGraph(baseGraph());
-    const running = { ...baseGraph(), nodes: [PHASE, { ...TASK_A, status: "running", steps: [{ ...TASK_A.steps![0], status: "planned" }] }, TASK_B] };
+    const running = { ...baseGraph(), nodes: [PHASE, { ...TASK_A, status: "running" as const, steps: [{ ...TASK_A.steps![0], status: "planned" as const }] }, TASK_B] };
     const g = applyFlowRecord(running, rec({ action: "step.start", handle: "a-step" }), idx, "m1");
     expect(g.nodes[1].steps![0].status).toBe("running");
     expect(g.nodes[1].status).toBe("running"); // untouched by the step flip
@@ -269,13 +271,13 @@ describe("statusFromRecord / applyFlowRecord", () => {
 
   it("a record stamped for a DIFFERENT mission never flips this mission's status", () => {
     const idx = indexGraph(baseGraph());
-    const g = applyFlowRecord({ ...baseGraph(), nodes: [{ ...PHASE, status: "planned" }, TASK_A, TASK_B] }, rec({ action: "phase.start", handle: "p1", mission_id: "other-mission" }), idx, "m1");
+    const g = applyFlowRecord({ ...baseGraph(), nodes: [{ ...PHASE, status: "planned" as const }, TASK_A, TASK_B] }, rec({ action: "phase.start", handle: "p1", mission_id: "other-mission" }), idx, "m1");
     expect(g.nodes[0].status).toBe("planned");
   });
 
   it("a legacy record with no mission_id still flows through (present-is-authoritative, absent falls through)", () => {
     const idx = indexGraph(baseGraph());
-    const g = applyFlowRecord({ ...baseGraph(), nodes: [{ ...PHASE, status: "planned" }, TASK_A, TASK_B] }, rec({ action: "phase.start", handle: "p1" }), idx, "m1");
+    const g = applyFlowRecord({ ...baseGraph(), nodes: [{ ...PHASE, status: "planned" as const }, TASK_A, TASK_B] }, rec({ action: "phase.start", handle: "p1" }), idx, "m1");
     expect(g.nodes[0].status).toBe("running");
   });
 
@@ -287,7 +289,7 @@ describe("statusFromRecord / applyFlowRecord", () => {
 
   it("foldFlowRecords applies a whole record set in order", () => {
     const idx = indexGraph(baseGraph());
-    const planned = { ...baseGraph(), nodes: [{ ...PHASE, status: "planned" }, TASK_A, TASK_B] };
+    const planned = { ...baseGraph(), nodes: [{ ...PHASE, status: "planned" as const }, TASK_A, TASK_B] };
     const g = foldFlowRecords(
       planned,
       [rec({ action: "phase.start", handle: "p1" }), rec({ action: "phase.complete", handle: "p1" })],
@@ -308,7 +310,7 @@ describe("statusFromRecord / applyFlowRecord", () => {
 // leave `keepPageStatus` itself (the unknown-status asymmetry) untouched.
 describe("foldFlowRecords snapshot-recency gate (#2518)", () => {
   const SNAPSHOT_MS = tsToMs("2026-08-19T00:00:00Z");
-  function snapshotWithPhase(status: string) {
+  function snapshotWithPhase(status: GraphNode["status"]) {
     return { ...baseGraph(), nodes: [{ ...PHASE, status }, TASK_A, TASK_B], generated_at_ms: SNAPSHOT_MS };
   }
 
@@ -368,7 +370,10 @@ describe("foldFlowRecords snapshot-recency gate (#2518)", () => {
 
   it("with no generated_at_ms on the snapshot, every record folds unfiltered (lenient default, pre-#2518 behavior)", () => {
     const idx = indexGraph(baseGraph());
-    const noTimestamp = { ...baseGraph(), nodes: [{ ...PHASE, status: "planned" }, TASK_A, TASK_B] };
+    // A committed static graph captured before the field existed has none; the wire type
+    // always carries it, so the fixture is built without it on purpose.
+    const { generated_at_ms: _omitted, ...withoutStamp } = baseGraph();
+    const noTimestamp = { ...withoutStamp, nodes: [{ ...PHASE, status: "planned" as const }, TASK_A, TASK_B] } as MissionGraph;
     expect(noTimestamp.generated_at_ms).toBeUndefined();
     const g = foldFlowRecords(noTimestamp, [rec({ ts: "2020-01-01T00:00:00Z", action: "phase.start", handle: "p1" })], idx, "m1");
     expect(g.nodes[0].status).toBe("running");
@@ -377,15 +382,15 @@ describe("foldFlowRecords snapshot-recency gate (#2518)", () => {
 
 describe("mergeGraphs", () => {
   it("keeps the page's more-advanced status over a lagging disk snapshot", () => {
-    const prev: MissionGraph = { ...baseGraph(), nodes: [{ ...PHASE, status: "running" }, TASK_A, TASK_B] };
-    const fresh: MissionGraph = { ...baseGraph(), nodes: [{ ...PHASE, status: "planned" }, TASK_A, TASK_B] };
+    const prev: MissionGraph = { ...baseGraph(), nodes: [{ ...PHASE, status: "running" as const }, TASK_A, TASK_B] };
+    const fresh: MissionGraph = { ...baseGraph(), nodes: [{ ...PHASE, status: "planned" as const }, TASK_A, TASK_B] };
     const merged = mergeGraphs(prev, fresh);
     expect(merged.nodes[0].status).toBe("running");
   });
 
   it("also monotone-merges per-STEP status inside a task", () => {
-    const prev: MissionGraph = { ...baseGraph(), nodes: [PHASE, { ...TASK_A, steps: [{ ...TASK_A.steps![0], status: "running" }] }, TASK_B] };
-    const fresh: MissionGraph = { ...baseGraph(), nodes: [PHASE, { ...TASK_A, steps: [{ ...TASK_A.steps![0], status: "planned" }] }, TASK_B] };
+    const prev: MissionGraph = { ...baseGraph(), nodes: [PHASE, { ...TASK_A, steps: [{ ...TASK_A.steps![0], status: "running" as const }] }, TASK_B] };
+    const fresh: MissionGraph = { ...baseGraph(), nodes: [PHASE, { ...TASK_A, steps: [{ ...TASK_A.steps![0], status: "planned" as const }] }, TASK_B] };
     const merged = mergeGraphs(prev, fresh);
     expect(merged.nodes[1].steps![0].status).toBe("running");
   });
@@ -656,7 +661,7 @@ describe("formatting helpers", () => {
   });
 
   it("stepLead falls back label -> kind -> 'step'; stepSeat pulls the colon suffix", () => {
-    expect(stepLead({ id: "s", label: "", kind: "review.probe", status: "planned" })).toBe("review.probe");
+    expect(stepLead({ id: "s", label: "", kind: "review.probe", status: "planned" as const })).toBe("review.probe");
     expect(stepSeat("review.probe:seat-1")).toBe("seat-1");
     expect(stepSeat("review.judge")).toBe("");
   });
@@ -669,7 +674,7 @@ describe("stepMeterFor wall time (#2269)", () => {
   const T0 = 1_756_900_000_000;
   const base = { tokRun: 0, tokFinal: 10, turnRun: 0, turnFinal: 1, toolRun: 0, toolFinal: 0, usageSeen: false };
   it("a completed step carries its wall time (end − start) and is not generating", () => {
-    const step = { id: "s", label: "u-0001", kind: "dispatch.internal", status: "complete" };
+    const step = { id: "s", label: "u-0001", kind: "dispatch.internal", status: "complete" as const };
     const m = { ...base, startTs: T0, endTs: T0 + 335_000, lastTs: T0 + 335_000 };
     const meter = stepMeterFor(step, { s: m }, T0 + 900_000);
     expect(meter.generating).toBe(false);
@@ -677,7 +682,7 @@ describe("stepMeterFor wall time (#2269)", () => {
     expect(meter.wallMs).toBe(335_000);
   });
   it("a running step's wall time is start → now, the same number the pulse shows", () => {
-    const step = { id: "s", label: "u-0002", kind: "dispatch.internal", status: "running" };
+    const step = { id: "s", label: "u-0002", kind: "dispatch.internal", status: "running" as const };
     const m = { ...base, startTs: T0, endTs: 0, lastTs: T0 + 40_000 };
     const meter = stepMeterFor(step, { s: m }, T0 + 45_000, new Map([["s", "open"]]));
     expect(meter.generating).toBe(true);
@@ -685,11 +690,11 @@ describe("stepMeterFor wall time (#2269)", () => {
     expect(meter.elapsedMs).toBe(45_000);
   });
   it("falls back to the node's own timestamps when the metrics stream has none", () => {
-    const step = { id: "s", label: "u-0003", kind: "dispatch.internal", status: "complete", startedTs: T0, completedTs: T0 + 120_000 };
+    const step = { id: "s", label: "u-0003", kind: "dispatch.internal", status: "complete" as const, startedTs: T0, completedTs: T0 + 120_000 };
     expect(stepMeterFor(step, {}, T0 + 500_000).wallMs).toBe(120_000);
   });
   it("a step that never started has no wall time", () => {
-    const step = { id: "s", label: "u-0004", kind: "dispatch.internal", status: "planned" };
+    const step = { id: "s", label: "u-0004", kind: "dispatch.internal", status: "planned" as const };
     expect(stepMeterFor(step, {}, T0).wallMs).toBe(0);
   });
 });
@@ -698,7 +703,7 @@ describe("stepMeterFor wall time (#2269)", () => {
 // the rule every surface judges a run by, fed the records the graph
 // attributes to the step.
 describe("stepMeterFor liveness", () => {
-  const step = { id: "a-step", label: "Shell", kind: "dispatch.internal", status: "running" };
+  const step = { id: "a-step", label: "Shell", kind: "dispatch.internal", status: "running" as const };
   const T0 = Date.parse("2026-08-19T00:00:00Z");
   const iso = (ms: number) => new Date(ms).toISOString();
   const meterAt = (raw: RawRecord[], now: number) => {
@@ -715,7 +720,7 @@ describe("stepMeterFor liveness", () => {
   });
 
   it("keeps generating through an announced budget wait, as the run page does", () => {
-    const records = [{ action: "dispatch.start", ts: iso(T0) }, { action: "budget.wait", ts: iso(T0 + 1_000), payload: { wait_seconds: 1800 } }];
+    const records = [{ action: "dispatch.start", ts: iso(T0) }, { action: "budget.wait", ts: iso(T0 + 1_000), payload: { wait_ms: 1800000 } }];
     expect(meterAt(records, T0 + 25 * 60_000).generating).toBe(true);
   });
 
@@ -781,8 +786,8 @@ describe("drawnEdges / phaseOrderEdges", () => {
   });
 
   it("produces N-1 consecutive phase-order edges for N phases, ordered by depth", () => {
-    const p2: GraphNode = { id: "p2", label: "Adjudicate", kind: "phase", status: "planned", depth: 1 };
-    const p3: GraphNode = { id: "p3", label: "Report", kind: "phase", status: "planned", depth: 2 };
+    const p2: GraphNode = { id: "p2", label: "Adjudicate", kind: "phase", status: "planned" as const, depth: 1 };
+    const p3: GraphNode = { id: "p3", label: "Report", kind: "phase", status: "planned" as const, depth: 2 };
     const edges = phaseOrderEdges([p3, PHASE, p2]);
     expect(edges.map((e) => [e.source, e.target])).toEqual([
       ["p1", "p2"],
@@ -904,7 +909,7 @@ describe("stepDispatchSessions (#2223) — the step drill-in's route to the disp
 
 describe("buildStepHeaderFields reads the newest record first", () => {
   it("an untimed record's value is used only when no timed record carries one", () => {
-    const step = { id: "s", label: "s", kind: "crawl.unit", status: "running" };
+    const step = { id: "s", label: "s", kind: "crawl.unit", status: "running" as const };
     const recs = [
       rec({ ts: "2026-08-19T00:00:01Z", payload: { rule: "OLD" } }),
       rec({ ts: "not-a-time", payload: { rule: "BAD" } }),

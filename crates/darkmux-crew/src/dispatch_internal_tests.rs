@@ -939,7 +939,7 @@
         );
         // The rest of the payload survives the extraction unchanged —
         // pinning the refactor didn't silently drop or rename a field.
-        assert_eq!(payload["runtime"], serde_json::json!("internal"));
+        assert!(payload.get("runtime").is_none(), "no topology key: {payload}");
         assert_eq!(payload["image"], serde_json::json!("darkmux-runtime:latest"));
         assert_eq!(payload["prompt_chars"], serde_json::json!("read x.txt".chars().count()));
         assert_eq!(payload["workspace"], serde_json::json!("/tmp/ws"));
@@ -10150,6 +10150,23 @@
     /// `build_remote_record` is a pure function (no HTTP, no env, no
     /// filesystem) — this test calls it directly, so it kills that exact
     /// mutant in one assertion regardless of which caller reaches it.
+    /// A hosted-endpoint execution's record names who wrote it (darkmux),
+    /// never where the model ran: `tier` once read `local` on every record,
+    /// this one included, which claimed a topology it did not have.
+    #[test]
+    fn a_hosted_executions_record_claims_no_local_tier() {
+        let rec = build_remote_record(
+            "coder",
+            &crate::mission_test_session("m1", "sess-1"), &darkmux_types::execution_id::ExecutionId::mint(),
+            "gpt-remote",
+            None,
+            darkmux_flow::FlowAction::DispatchStart,
+            serde_json::json!({ "endpoint": "azure:host/gpt-remote" }),
+        );
+        assert!(matches!(rec.tier, darkmux_flow::Tier::Darkmux), "{:?}", rec.tier);
+        assert_eq!(serde_json::to_value(&rec).unwrap()["tier"], "darkmux");
+    }
+
     #[test]
     fn build_remote_record_threads_mission_id_through() {
         let rec = build_remote_record(
@@ -10182,7 +10199,7 @@
 
     // ─── "direct"-runtime token key parity (#1444 review) ─────────────
 
-    /// (#1444 review) Both `runtime: "direct"` producers — `dispatch_remote`
+    /// (#1444 review) Both hosted single-shot producers — `dispatch_remote`
     /// and `dispatch_local_single_shot` — write their token block through
     /// `insert_direct_token_keys`, so their key SET cannot drift apart the
     /// way it did when #1444's first pass added `reasoning_tokens`/
@@ -10194,7 +10211,7 @@
     /// rewrote the constant.
     #[test]
     fn insert_direct_token_keys_always_writes_all_five_keys() {
-        let mut payload = serde_json::json!({ "runtime": "direct" });
+        let mut payload = serde_json::json!({});
         let obj = payload.as_object_mut().unwrap();
         insert_direct_token_keys(obj, &darkmux_trajectory::UsageCounts::default());
         for key in [
@@ -10207,7 +10224,7 @@
             assert!(obj.contains_key(key), "{key} must be PRESENT-and-null when unreported, never absent");
             assert!(obj[key].is_null(), "{key} must be null, never a fabricated 0");
         }
-        assert_eq!(obj.len(), 6, "the five token keys plus the pre-existing `runtime`");
+        assert_eq!(obj.len(), 5, "exactly the five token keys");
     }
 
     /// A direct completion record quotes the call's counts exactly as its
@@ -10568,6 +10585,9 @@
         // (#2928 review, C7) The stamped cost covers the sampler's work on
         // every chunk, not only the sends.
         assert!(live.sampler_us >= live.forward_us, "{live:?}");
+        let json = live.to_json();
+        assert_eq!(json["sampler_ms"], live.sampler_us as f64 / 1_000.0, "{json}");
+        assert!(json.get("sampler_us").is_none() && json.get("forward_us").is_none(), "milliseconds only: {json}");
     }
 
     /// (#2928 review, MF1) Through a silent tool-call write the HOST keeps
@@ -13581,7 +13601,6 @@ fn degeneracy_warnings_reach_the_envelope() {
         r#"{"result":"stop"}"#.to_string(),
         "m",
         &summary,
-        darkmux_trajectory::CheckpointCounts::default(),
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
@@ -13594,7 +13613,6 @@ fn degeneracy_warnings_reach_the_envelope() {
         r#"{"result":"stop"}"#.to_string(),
         "m",
         &summary_with(vec![]),
-        darkmux_trajectory::CheckpointCounts::default(),
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
@@ -13616,7 +13634,6 @@ fn a_detection_reaches_the_envelope() {
         r#"{"result":"stop"}"#.to_string(),
         "m",
         &summary_with(vec![det.clone()]),
-        darkmux_trajectory::CheckpointCounts::default(),
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
@@ -13637,7 +13654,6 @@ fn a_clean_run_reports_an_empty_array_not_an_absent_field() {
         r#"{"result":"stop"}"#.to_string(),
         "m",
         &summary_with(vec![]),
-        darkmux_trajectory::CheckpointCounts::default(),
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
@@ -13666,7 +13682,6 @@ fn bounds_argument_survives_into_the_envelope() {
         r#"{"result":"stop"}"#.to_string(),
         "m",
         &summary_with(vec![]),
-        darkmux_trajectory::CheckpointCounts::default(),
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
@@ -13699,7 +13714,6 @@ fn checkpoint_block(s: &super::TrajectorySummary) -> serde_json::Value {
         r#"{"result":"stop"}"#.to_string(),
         "m",
         s,
-        darkmux_trajectory::CheckpointCounts::default(),
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
@@ -13784,7 +13798,6 @@ fn a_dispatch_that_never_checkpointed_omits_the_block() {
         r#"{"result":"stop"}"#.to_string(),
         "m",
         &super::TrajectorySummary::default(),
-        darkmux_trajectory::CheckpointCounts::default(),
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
@@ -13798,7 +13811,7 @@ fn a_dispatch_that_never_checkpointed_omits_the_block() {
 /// The envelope's `metrics` block is the fold of the trajectory, the same
 /// computation the `dispatch complete` record reads, and it replaces any
 /// block the stdout already carried: there is no second tally beside it.
-/// A resumed run's `cumulative_*` add the checkpoint it resumed from.
+/// Only this run's counts: no `cumulative_*` tally rides beside them.
 #[test]
 fn the_envelope_metrics_are_the_fold_of_the_trajectory() {
     let mut s = super::TrajectorySummary::default();
@@ -13818,7 +13831,6 @@ fn the_envelope_metrics_are_the_fold_of_the_trajectory() {
         r#"{"result":"stop","metrics":{"turns":99,"prompt_tokens":0}}"#.to_string(),
         "darkmux:m",
         &s,
-        darkmux_trajectory::CheckpointCounts { turns: 3, compactions: 1 },
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
@@ -13833,41 +13845,7 @@ fn the_envelope_metrics_are_the_fold_of_the_trajectory() {
     assert_eq!((m["rest_ms"].clone(), m["rests"].clone()), (serde_json::json!(400), serde_json::json!(1)));
     assert_eq!(m["wall_ms"], 7777, "the runtime's own clock");
     assert_eq!(m["turn_delay_effective_ms"], 400);
-    assert_eq!((m["cumulative_turns"].clone(), m["cumulative_compactions"].clone()), (serde_json::json!(5), serde_json::json!(2)));
-}
-
-/// (#2263) A resume from a hand-back checkpoint CONTINUES the checkpoint's
-/// turn: its first call is `seq` = the checkpoint's turn count. The whole
-/// task has made 3 turns, not 4, on the envelope and the flow record alike.
-#[test]
-fn a_hand_back_resume_continues_the_checkpoints_turn() {
-    let mut s = super::TrajectorySummary::default();
-    for line in [
-        serde_json::json!({"type":"dispatch.start","ts":1000,"model":"m"}),
-        serde_json::json!({"type":"model.completed","seq":3,"finish_reason":"stop","usage":{"prompt_tokens":10,"completion_tokens":2}}),
-        serde_json::json!({"type":"dispatch.complete","ts":2000,"result":"stop","wall_ms":1000}),
-    ] {
-        s.fold.apply(&ev(line));
-    }
-    let seed = darkmux_trajectory::CheckpointCounts { turns: 3, compactions: 0 };
-    let out = super::enrich_envelope_with_summary(
-        r#"{"result":"stop"}"#.to_string(),
-        "darkmux:m",
-        &s,
-        seed,
-        &super::HostStats::default(),
-        &no_extras(),
-        no_findings_dir(),
-        serde_json::json!({}),
-        None,
-    );
-    let m = serde_json::from_str::<serde_json::Value>(&out).unwrap()["metrics"].clone();
-    assert_eq!(m["turns"], 1, "this run made one call");
-    assert_eq!(m["cumulative_turns"], 3, "{m}");
-    let payload = super::build_dispatch_complete_payload(
-        1000, "", "", 0, &s, seed, None, &super::HostStats::default(), &no_extras(), &None, None, None,
-    );
-    assert_eq!(payload["cumulative_turns"], 3, "{payload}");
+    assert!(m.get("cumulative_turns").is_none() && m.get("cumulative_compactions").is_none(), "no second tally: {m}");
 }
 
 #[test]
@@ -13879,7 +13857,6 @@ fn non_envelope_stdout_is_untouched_by_enrichment() {
         raw.to_string(),
         "m",
         &s,
-        darkmux_trajectory::CheckpointCounts::default(),
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
@@ -13989,13 +13966,12 @@ fn a_single_sample_has_no_measured_interval() {
 }
 
 #[test]
-fn host_stats_reach_the_envelope_nested_by_metric_with_top_level_aliases() {
+fn host_stats_reach_the_envelope_nested_by_metric_only() {
     let stats = super::reduce_host_stats(&worked_samples());
     let out = super::enrich_envelope_with_summary(
         r#"{"result":"stop"}"#.to_string(),
         "m",
         &super::TrajectorySummary::default(),
-        darkmux_trajectory::CheckpointCounts::default(),
         &stats,
         &no_extras(),
         no_findings_dir(),
@@ -14011,18 +13987,10 @@ fn host_stats_reach_the_envelope_nested_by_metric_with_top_level_aliases() {
     assert_eq!(v["host"]["gpu"]["peak_pct"], 95);
     assert_eq!(v["host"]["samples"], 5);
     assert_eq!(v["host"]["sample_interval_ms"], 2000);
-    // (#2107) Deprecated top-level aliases — kept for one release for any
-    // reader still looking at the pre-#2107 shape. They must read straight
-    // off the SAME nested peaks, never a second, independently-computed
-    // figure that could drift from them.
-    assert_eq!(
-        v["host"]["peak_cpu_pct"], 95,
-        "alias must mirror host.cpu.peak_pct exactly: {out}"
-    );
-    assert_eq!(
-        v["host"]["peak_mem_pct"], 78,
-        "alias must mirror host.mem.peak_pct exactly: {out}"
-    );
+    // The peaks live ONLY in the nested blocks: a top-level mirror would be a
+    // second spelling of the same number.
+    assert!(v["host"].get("peak_cpu_pct").is_none(), "no top-level alias: {out}");
+    assert!(v["host"].get("peak_mem_pct").is_none(), "no top-level alias: {out}");
 }
 
 #[test]
@@ -14051,7 +14019,6 @@ fn power_thermal_and_energy_reach_the_envelope_without_disturbing_the_2107_shape
         r#"{"result":"stop"}"#.to_string(),
         "m",
         &super::TrajectorySummary::default(),
-        darkmux_trajectory::CheckpointCounts::default(),
         &stats,
         &extras,
         no_findings_dir(),
@@ -14076,7 +14043,6 @@ fn power_thermal_and_energy_reach_the_envelope_without_disturbing_the_2107_shape
         r#"{"result":"stop"}"#.to_string(),
         "m",
         &super::TrajectorySummary::default(),
-        darkmux_trajectory::CheckpointCounts::default(),
         &stats,
         &no_extras(),
         no_findings_dir(),
@@ -14084,7 +14050,7 @@ fn power_thermal_and_energy_reach_the_envelope_without_disturbing_the_2107_shape
         None,
     );
     let w: serde_json::Value = serde_json::from_str(&without).unwrap();
-    for key in ["cpu", "mem", "gpu", "samples", "sample_interval_ms", "peak_cpu_pct", "peak_mem_pct"] {
+    for key in ["cpu", "mem", "gpu", "samples", "sample_interval_ms"] {
         assert_eq!(v["host"][key], w["host"][key], "#2108 must not move `host.{key}`");
     }
 }
@@ -14098,7 +14064,6 @@ fn a_host_without_power_or_thermal_sources_omits_those_blocks() {
         r#"{"result":"stop"}"#.to_string(),
         "m",
         &super::TrajectorySummary::default(),
-        darkmux_trajectory::CheckpointCounts::default(),
         &super::reduce_host_stats(&worked_samples()),
         &no_extras(),
         no_findings_dir(),
@@ -14123,7 +14088,6 @@ fn an_unsampled_run_omits_the_host_block_rather_than_reporting_zero() {
         r#"{"result":"stop"}"#.to_string(),
         "m",
         &super::TrajectorySummary::default(),
-        darkmux_trajectory::CheckpointCounts::default(),
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
@@ -14179,7 +14143,6 @@ fn the_envelope_reports_how_many_findings_the_crawl_recorded() {
         r#"{"result":"stop"}"#.to_string(),
         "m",
         &super::TrajectorySummary::default(),
-        darkmux_trajectory::CheckpointCounts::default(),
         &super::HostStats::default(),
         &no_extras(),
         td.path(),
@@ -14203,7 +14166,6 @@ fn a_trailing_newline_is_not_a_finding() {
         r#"{"result":"stop"}"#.to_string(),
         "m",
         &super::TrajectorySummary::default(),
-        darkmux_trajectory::CheckpointCounts::default(),
         &super::HostStats::default(),
         &no_extras(),
         td.path(),
@@ -14225,7 +14187,6 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         r#"{"result":"stop"}"#.to_string(),
         "m",
         &super::TrajectorySummary::default(),
-        darkmux_trajectory::CheckpointCounts::default(),
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
@@ -15699,7 +15660,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         let rec = build_machine_scoped_telemetry_record(&sample, 12_345, 5000);
         assert_eq!(rec.action, darkmux_flow::FlowAction::MachineTelemetry);
         assert!(matches!(rec.category, darkmux_flow::Category::Machinery));
-        assert_eq!(rec.source.as_deref(), Some("host"));
+        assert_eq!(rec.source, Some(darkmux_flow::FlowSource::Host));
         // (#2413) The whole point: no dispatch-scoped fields on a
         // machine-scoped record.
         assert!(rec.mission_id.is_none(), "machine-scoped: no mission context");
@@ -16118,7 +16079,6 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         r#"{"result":"stop"}"#.to_string(),
         "m",
         &super::TrajectorySummary::default(),
-        darkmux_trajectory::CheckpointCounts::default(),
         &stats,
         &extras,
         no_findings_dir(),
@@ -16158,7 +16118,6 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         r#"{"result":"stop"}"#.to_string(),
         "m",
         &super::TrajectorySummary::default(),
-        darkmux_trajectory::CheckpointCounts::default(),
         &stats,
         &no_extras(),
         no_findings_dir(),
@@ -16191,7 +16150,6 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             "",
             0,
             &super::TrajectorySummary::default(),
-            darkmux_trajectory::CheckpointCounts::default(),
             None,
             &stats,
             &no_extras(),
@@ -16217,7 +16175,6 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         r#"{"result":"stop"}"#.to_string(),
         "m",
         &super::TrajectorySummary::default(),
-        darkmux_trajectory::CheckpointCounts::default(),
         &stats,
         &no_extras(),
         no_findings_dir(),
@@ -16235,7 +16192,6 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         r#"{"result":"stop"}"#.to_string(),
         "m",
         &super::TrajectorySummary::default(),
-        darkmux_trajectory::CheckpointCounts::default(),
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
@@ -16274,7 +16230,6 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             "",
             0,
             &super::TrajectorySummary::default(),
-            darkmux_trajectory::CheckpointCounts::default(),
             None,
             &stats,
             &extras,
@@ -16320,7 +16275,6 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             "",
             0,
             &summary,
-            darkmux_trajectory::CheckpointCounts { turns: 7, compactions: 3 },
             None,
             &stats,
             &no_extras(),
@@ -16333,10 +16287,13 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         assert_eq!(payload["reasoning_tokens"], 500);
         assert_eq!(payload["cached_tokens"], 20);
         assert_eq!(payload["total_turns"], 1);
-        assert_eq!(payload["cumulative_turns"], 8, "7 resumed from + 1 recorded");
-        assert_eq!(payload["cumulative_compactions"], 3);
-        for retired in ["cumulative_prompt_tokens", "cumulative_completion_tokens"] {
-            assert!(payload.get(retired).is_none(), "{retired} was a second token number: {payload}");
+        for retired in [
+            "cumulative_turns",
+            "cumulative_compactions",
+            "cumulative_prompt_tokens",
+            "cumulative_completion_tokens",
+        ] {
+            assert!(payload.get(retired).is_none(), "{retired} was a second tally: {payload}");
         }
     }
 
@@ -16362,7 +16319,6 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             "",
             0,
             &state.summary,
-            darkmux_trajectory::CheckpointCounts::default(),
             None,
             &stats,
             &no_extras(),
@@ -16445,7 +16401,6 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             "boom: container crashed",
             137,
             &super::TrajectorySummary::default(),
-            darkmux_trajectory::CheckpointCounts::default(),
             Some("azure/gpt-x"),
             &stats,
             &extras,
@@ -16473,7 +16428,6 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             "",
             0,
             &super::TrajectorySummary::default(),
-            darkmux_trajectory::CheckpointCounts::default(),
             None,
             &super::HostStats::default(),
             &no_extras(),
@@ -17374,12 +17328,12 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         assert_eq!(st["handle"], "compactor", "{st}");
         assert_eq!(st["model"], "darkmux:compactor-4b", "{st}");
         assert_eq!(st["session_id"], crate::test_session("sess-utility-start").wire(), "a compaction serves its execution: {st}");
-        assert_eq!(st["source"], crate::usage::UTILITY_SOURCE, "{st}");
+        assert_eq!(st["source"], "utility", "{st}");
         let p = &st["payload"];
         assert_eq!(p["job"], "compaction", "{p}");
         assert_eq!(p["model"], "darkmux:compactor-4b", "{p}");
         assert_eq!(p["serves"], crate::test_session("sess-utility-start").wire(), "{p}");
-        assert_eq!(p["stall_after_seconds"], 600, "the dispatch's inactivity window: {p}");
+        assert_eq!(p["stall_after_ms"], 600_000, "the dispatch's inactivity window: {p}");
         assert_eq!(p["generation"], 3, "{p}");
         let start_at = records.iter().position(|r| r["action"] == "utility.start").unwrap();
         let usage_at = records.iter().position(|r| r["action"] == "telemetry.tokens").unwrap();

@@ -1961,7 +1961,7 @@ pub const STEP_LIFECYCLE_ACTIONS: [darkmux_flow::FlowAction; 3] = [
 /// One `FlowRecord` for a step-lifecycle transition (`"step start"` /
 /// `"step complete"` / `"step error"`). Mirrors `lifecycle.rs`'s
 /// `emit_phase_transition_record` shape (`Category::Work`,
-/// `Tier::Local` since these are scheduler-driven, not operator-explicit
+/// `Tier::Darkmux` since these are scheduler-driven, not operator-explicit
 /// like a Phase transition; `Stage::Dispatch` since a Step is
 /// dispatch-shaped work).
 ///
@@ -1988,7 +1988,7 @@ fn step_lifecycle_record(run: &RunId, step: &Step, action: darkmux_flow::FlowAct
 /// than guessing from a category.
 fn seat_unresolved_record(run: &RunId, step: &Step, reason: &str) -> FlowRecord {
     FlowRecord {
-        source: Some("scheduler".to_string()),
+        source: Some(darkmux_flow::FlowSource::Scheduler),
         payload: Some(serde_json::json!({
             "step_id": step.id,
             "kind": step.kind,
@@ -2022,7 +2022,7 @@ fn step_lifecycle_record_with_payload(
 ) -> FlowRecord {
     let level = if action == darkmux_flow::FlowAction::StepError { Level::Warn } else { Level::Info };
     FlowRecord {
-        source: Some("scheduler".to_string()),
+        source: Some(darkmux_flow::FlowSource::Scheduler),
         payload,
         ..FlowRecord::for_session(&SessionId::task(run.clone(), &step.task_id), level, Category::Work, Stage::Dispatch, action, step.id.clone())
     }
@@ -2056,7 +2056,7 @@ fn step_lifecycle_record_with_payload(
 /// complete"/"step timing" for one step by `session_id` + `handle`.
 fn step_timing_record(run: &RunId, step: &Step, rec: &StepRecord) -> FlowRecord {
     FlowRecord {
-        source: Some("scheduler".to_string()),
+        source: Some(darkmux_flow::FlowSource::Scheduler),
         payload: Some(serde_json::to_value(rec).expect("StepRecord always serializes")),
         ..FlowRecord::for_session(&SessionId::task(run.clone(), &step.task_id), Level::Info, Category::Work, Stage::Dispatch, darkmux_flow::FlowAction::StepTiming, step.id.clone())
     }
@@ -4256,7 +4256,7 @@ mod tests {
             emitted.iter().map(|r| r.action.as_str()).collect::<Vec<_>>()
         );
         let rec = timing[0];
-        assert_eq!(rec.source.as_deref(), Some("scheduler"));
+        assert_eq!(rec.source, Some(darkmux_flow::FlowSource::Scheduler));
         assert_eq!(rec.handle, "a-step");
         assert_eq!(
             rec.payload.as_ref(),

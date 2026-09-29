@@ -123,96 +123,124 @@ pub fn action_glob_matches(pattern: &str, action: &str) -> bool {
 }
 
 /// Say once, at load, which rules name an action pattern that matches no
-/// action darkmux writes (a spelling 4.0 retired, or a typo). They load and
-/// deliver nothing; `darkmux doctor` names them too.
+/// action darkmux writes (a typo, or a retired action). They load and
+/// deliver nothing; `darkmux doctor` names them too. A pattern written in a
+/// spelling 4.0 retired is not this case: it is refused
+/// ([`retired_rule_actions`]).
 fn warn_unmatchable_rules(rules: &[HookRule]) {
     for (index, pattern) in unmatchable_rule_patterns(rules) {
-        let hint = unmatchable_hint(pattern);
         eprintln!(
             "flow::HookSink: rule #{index}'s action `{pattern}` matches no action darkmux writes \
-             (actions are spelled `<scope>.<event>`){hint}"
+             (actions are spelled `<scope>.<event>`)"
         );
     }
 }
 
-/// The "did you mean" tail for an unmatchable pattern: its dotted twin, when
-/// that twin can match anything; empty otherwise.
-fn unmatchable_hint(pattern: &str) -> String {
-    matching_dotted_twin(pattern).map(|t| format!("; did you mean `{t}`?")).unwrap_or_default()
-}
-
 /// A spaced glob's dotted twin, only when the twin matches at least one
-/// action darkmux writes (`dispatchh *` and `sprint *` have none).
+/// action darkmux writes (`dispatchh *` has none).
 pub fn matching_dotted_twin(pattern: &str) -> Option<String> {
     dotted_twin(pattern).filter(|t| crate::FlowAction::KNOWN_WIRE.iter().any(|w| action_glob_matches(t, w)))
 }
 
-/// `(rule index, pattern)` for every rule whose action pattern cannot match.
+/// `(rule index, pattern)` for every rule whose action pattern cannot match
+/// and is not a retired spelling (those are [`retired_rule_actions`]').
 fn unmatchable_rule_patterns(rules: &[HookRule]) -> Vec<(usize, &str)> {
     rules
         .iter()
         .enumerate()
         .filter_map(|(i, r)| Some((i, r.r#match.as_ref()?.action.as_deref()?)))
-        .filter(|(_, p)| !action_pattern_can_match(p))
+        .filter(|(_, p)| !action_pattern_can_match(p) && retired_spelling_of(p).is_none())
         .collect()
 }
 
-/// A rule's match as the write path uses it: its `action` pattern read once,
-/// at load, through [`effective_action_pattern`], so [`hook_match`] stays a
-/// plain glob per record.
-pub fn resolve_match(mut m: HookMatch) -> HookMatch {
-    if let Some(pat) = m.action.take() {
-        m.action = Some(effective_action_pattern(&pat).into_owned());
-    }
-    m
-}
-
-/// The action glob a rule means under 4.0. A rule written before 4.0 names
-/// the old spellings (`dispatch complete`, `step *`); those would match
-/// nothing now, silently. So:
+/// The current spelling of a rule action written the pre-4.0 way: an exact
+/// old spelling (`dispatch complete`) reads as its current action, and a
+/// spaced glob (`step *`) as its dotted twin, when the twin can match
+/// anything. `None` for a pattern that is not a retired spelling.
 ///
-/// * an exact old spelling reads as its current action;
-/// * a spaced glob reads as its dotted twin (`step *` -> `step.*`) ONLY when
-///   the twin matches exactly the actions the old glob matched, upgraded. A
-///   twin that would match MORE (`dispatch *` -> `dispatch.*` would add every
-///   `dispatch.turn` and `dispatch.tool` record) is not taken: the rule stays
-///   as written, matches nothing, and `darkmux doctor` and [`HookSink::new`]
-///   say so.
-///
-/// Anything else is returned as written.
-pub fn effective_action_pattern(pattern: &str) -> std::borrow::Cow<'_, str> {
-    if let Some(current) = crate::legacy::upgrade_action(pattern) {
-        return std::borrow::Cow::Owned(current.as_str().to_string());
+/// A dotted twin can match MORE than the old glob did (`dispatch *` names
+/// `dispatch.*`, which adds every `dispatch.turn`), so a rule is never
+/// rewritten to it: it is refused, naming the spelling to write.
+pub fn retired_spelling_of(pattern: &str) -> Option<String> {
+    crate::legacy::upgrade_action(pattern).map(|a| a.as_str().to_string()).or_else(|| matching_dotted_twin(pattern))
+}
+
+/// A hook rule whose `match.action` is written in a spelling 4.0 retired.
+/// Hook rules are the operator's file, so it is refused, not read as the
+/// current spelling: the sink does not load ([`HookSink::new`], which logs and
+/// lets the run continue without hooks) and `darkmux doctor` fails the rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetiredRuleAction {
+    pub index: usize,
+    /// The pattern as configured.
+    pub configured: String,
+    /// The spelling to write.
+    pub current: String,
+}
+
+impl RetiredRuleAction {
+    /// The rule at `index` when its `configured` pattern is a retired spelling.
+    pub fn of(index: usize, configured: &str) -> Option<Self> {
+        Some(Self { index, configured: configured.to_string(), current: retired_spelling_of(configured)? })
     }
-    match dotted_twin(pattern) {
-        Some(twin) if !widens(pattern, &twin) => std::borrow::Cow::Owned(twin),
-        _ => std::borrow::Cow::Borrowed(pattern),
+
+    /// Where the pattern is set, as `darkmux config` names it.
+    pub fn config_path(&self) -> String {
+        format!("hooks.rules[{}].match.action", self.index)
+    }
+
+    /// Set when the spelling to write is a glob: it matches more than the old
+    /// spelling did, so the operator is told rather than surprised.
+    pub fn widening_note(&self) -> Option<String> {
+        if !self.current.ends_with('*') {
+            return None;
+        }
+        let extra = if self.current.starts_with("dispatch.") {
+            " (`dispatch.*` also matches every `dispatch.turn` and `dispatch.tool` record)"
+        } else {
+            ""
+        };
+        Some(format!("the dotted glob matches more than the old spelling did{extra}"))
+    }
+
+    /// The operator line: what is wrong and what to write.
+    pub fn describe(&self) -> String {
+        let base = format!(
+            "action `{}` is a spelling darkmux retired in 4.0; write `{}`",
+            self.configured, self.current
+        );
+        match self.widening_note() {
+            Some(note) => format!("{base}; {note}"),
+            None => base,
+        }
     }
 }
 
-/// The dotted spelling of a spaced glob, when it has one.
-pub fn dotted_twin(pattern: &str) -> Option<String> {
-    (pattern.contains(' ') && pattern.contains('*')).then(|| pattern.replace(' ', "."))
-}
-
-/// True when `twin` matches a current action that `pattern` (an old spaced
-/// glob) never matched in its old spelling, or matches none at all.
-fn widens(pattern: &str, twin: &str) -> bool {
-    let old: std::collections::BTreeSet<&str> = crate::legacy::OLD_SPELLINGS
+/// Every rule in `rules` that names a retired action spelling.
+pub fn retired_rule_actions(rules: &[HookRule]) -> Vec<RetiredRuleAction> {
+    rules
         .iter()
-        .filter(|(spelling, _)| action_glob_matches(pattern, spelling))
-        .map(|(_, action)| action.as_str())
-        .collect();
-    let new: std::collections::BTreeSet<&str> =
-        crate::FlowAction::KNOWN_WIRE.iter().copied().filter(|w| action_glob_matches(twin, w)).collect();
-    old.is_empty() || old != new
+        .enumerate()
+        .filter_map(|(index, r)| RetiredRuleAction::of(index, r.r#match.as_ref()?.action.as_deref()?))
+        .collect()
 }
 
-/// True when `pattern`, read as [`effective_action_pattern`] reads it,
-/// matches at least one action darkmux writes.
+/// The dotted spelling of a spaced glob, when it has one (`sprint *` names
+/// `phase.*`: the scope it was renamed to).
+fn dotted_twin(pattern: &str) -> Option<String> {
+    if !(pattern.contains(' ') && pattern.contains('*')) {
+        return None;
+    }
+    let dotted = pattern.replace(' ', ".");
+    let renamed = crate::legacy::OLD_SCOPES.iter().find_map(|(old, now)| {
+        dotted.strip_prefix(old).filter(|rest| rest.starts_with('.')).map(|rest| format!("{now}{rest}"))
+    });
+    Some(renamed.unwrap_or(dotted))
+}
+
+/// True when `pattern` matches at least one action darkmux writes.
 pub fn action_pattern_can_match(pattern: &str) -> bool {
-    let effective = effective_action_pattern(pattern);
-    crate::FlowAction::KNOWN_WIRE.iter().any(|w| action_glob_matches(&effective, w))
+    crate::FlowAction::KNOWN_WIRE.iter().any(|w| action_glob_matches(pattern, w))
 }
 
 fn segment_glob(pattern: &str, value: &str) -> bool {
@@ -967,8 +995,7 @@ fn read_last_status(path: &Path) -> Option<LastStatus> {
 #[derive(Debug, Clone)]
 pub struct ResolvedRule {
     pub index: usize,
-    /// The configured match with its action resolved ([`resolve_match`]);
-    /// the outbox key comes from the match as configured.
+    /// The configured match.
     pub match_: HookMatch,
     pub url: String,
     pub outbox_path: PathBuf,
@@ -1055,11 +1082,8 @@ pub fn resolve_one_rule(index: usize, r: &HookRule, outbox_dir: &Path) -> Result
             (format!("file://{}", expanded.display()), None, Some(expanded))
         }
     };
-    let configured = r.r#match.clone().unwrap_or_default();
-    // The outbox key is the CONFIGURED match's, so resolving the action does
-    // not strand an existing outbox.
-    let key = rule_key(&configured, &url);
-    let match_ = resolve_match(configured);
+    let match_ = r.r#match.clone().unwrap_or_default();
+    let key = rule_key(&match_, &url);
     let (outbox_path, cursor_path) = outbox_paths(outbox_dir, &key);
     let last_status_path = last_status_path(outbox_dir, &key);
     let drain_lock_path = drain_lock_path(outbox_dir, &key);
@@ -3491,14 +3515,14 @@ fn emit_hook_record_with(
         ts: schema::ts_utc_now(),
         level,
         category: Category::Machinery,
-        tier: Tier::Local,
+        tier: Tier::Darkmux,
         stage: Stage::Ship,
         action,
         handle: host,
         phase_id: None,
         session_id: None,
         execution_id: None,
-        source: Some("hook".to_string()),
+        source: Some(crate::FlowSource::Hook),
         model: None,
         reasoning: None,
         mission_id: None,
@@ -3511,8 +3535,6 @@ fn emit_hook_record_with(
         prev_hash: None,
         hash: None,
         payload: Some(payload),
-        work_id: None,
-        attempt: None,
     };
     let label = rec.action.to_string();
     if let Err(e) = crate::record_to(report_sink, rec) {
@@ -3537,14 +3559,14 @@ fn emit_dry_run_record(report_sink: &dyn FlowSink, rt: &RuleRuntime, delivered_l
         ts: schema::ts_utc_now(),
         level: Level::Info,
         category: Category::Machinery,
-        tier: Tier::Local,
+        tier: Tier::Darkmux,
         stage: Stage::Ship,
         action: crate::FlowAction::HookDryRun,
         handle: rt.rule.url.clone(),
         phase_id: None,
         session_id: None,
         execution_id: None,
-        source: Some("hook".to_string()),
+        source: Some(crate::FlowSource::Hook),
         model: None,
         reasoning: None,
         mission_id: None,
@@ -3553,8 +3575,6 @@ fn emit_dry_run_record(report_sink: &dyn FlowSink, rt: &RuleRuntime, delivered_l
         prev_hash: None,
         hash: None,
         payload: Some(payload),
-        work_id: None,
-        attempt: None,
     };
     if let Err(e) = crate::record_to(report_sink, rec) {
         eprintln!("flow::HookSink: failed to emit hook.dry_run: {e:#}");
@@ -3584,14 +3604,14 @@ fn maybe_warn_dropped(rt: &RuleRuntime, report_sink: &dyn FlowSink, max_outbox_m
         ts: schema::ts_utc_now(),
         level: Level::Error,
         category: Category::Machinery,
-        tier: Tier::Local,
+        tier: Tier::Darkmux,
         stage: Stage::Ship,
         action: crate::FlowAction::HookFailed,
         handle: host,
         phase_id: None,
         session_id: None,
         execution_id: None,
-        source: Some("hook".to_string()),
+        source: Some(crate::FlowSource::Hook),
         model: None,
         reasoning: None,
         mission_id: None,
@@ -3605,8 +3625,6 @@ fn maybe_warn_dropped(rt: &RuleRuntime, report_sink: &dyn FlowSink, max_outbox_m
             "error": reason,
             "dropped_count": dropped_count,
         })),
-        work_id: None,
-        attempt: None,
     };
     if let Err(e) = crate::record_to(report_sink, rec) {
         eprintln!("flow::HookSink: failed to emit hook.failed (dropped-append warning): {e:#}");
@@ -3642,14 +3660,14 @@ fn maybe_warn_busy(rt: &RuleRuntime, report_sink: &dyn FlowSink, orphan_count: u
         ts: schema::ts_utc_now(),
         level: Level::Error,
         category: Category::Machinery,
-        tier: Tier::Local,
+        tier: Tier::Darkmux,
         stage: Stage::Ship,
         action: crate::FlowAction::HookFailed,
         handle: host,
         phase_id: None,
         session_id: None,
         execution_id: None,
-        source: Some("hook".to_string()),
+        source: Some(crate::FlowSource::Hook),
         model: None,
         reasoning: None,
         mission_id: None,
@@ -3663,8 +3681,6 @@ fn maybe_warn_busy(rt: &RuleRuntime, report_sink: &dyn FlowSink, orphan_count: u
             "error": reason,
             "orphaned_transforms": orphan_count,
         })),
-        work_id: None,
-        attempt: None,
     };
     if let Err(e) = crate::record_to(report_sink, rec) {
         eprintln!("flow::HookSink: failed to emit hook.failed (busy warning): {e:#}");
@@ -4081,6 +4097,14 @@ impl HookSink {
         if !bad.is_empty() {
             let lines: Vec<String> = bad.iter().map(|b| format!("{}. {}", b.summary(), b.valid_line())).collect();
             anyhow::bail!("hook rule value refused (#2947):\n  {}", lines.join("\n  "));
+        }
+        // A rule written against a retired action spelling is refused the
+        // same way: it is the operator's file, and it would deliver nothing.
+        let retired = retired_rule_actions(rules);
+        if !retired.is_empty() {
+            let lines: Vec<String> =
+                retired.iter().map(|r| format!("hooks.rules[{}]: {}", r.index, r.describe())).collect();
+            anyhow::bail!("hook rule action refused:\n  {}", lines.join("\n  "));
         }
         // (#2183) Resolved rule-by-rule (not the batch `resolve_rules`)
         // so a `transform` that fails to load can be isolated to THAT
@@ -4600,7 +4624,7 @@ mod tests {
             ts: schema::ts_utc_now(),
             level: Level::Info,
             category: Category::Work,
-            tier: Tier::Local,
+            tier: Tier::Darkmux,
             stage: Stage::Dispatch,
             action,
             handle: "h".to_string(),
@@ -4616,78 +4640,75 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
-            work_id: None,
-            attempt: None,
         }
     }
 
-    /// (4.0) A rule written against an old spelling keeps matching: an
-    /// exact old spelling reads as its current action, and a spaced glob as
-    /// its dotted twin when that twin matches exactly what the old glob did.
-    #[test]
-    fn an_old_spelling_rule_reads_as_its_current_action() {
-        // flow-action-guard:allow-start — an old spelling is this test's input
-        assert_eq!(effective_action_pattern("dispatch complete"), "dispatch.complete");
-        assert_eq!(effective_action_pattern("sprint start"), "phase.start");
-        // flow-action-guard:allow-end
-        assert_eq!(effective_action_pattern("step *"), "step.*");
-        assert_eq!(effective_action_pattern("dispatch.tool"), "dispatch.tool", "a current pattern is untouched");
-        // Resolved once, at load: the write path's `hook_match` is a plain
-        // glob and does no upgrade work per record.
-        // flow-action-guard:allow — an old spelling is this test's input
-        let raw = HookMatch { action: Some("dispatch complete".to_string()), ..Default::default() };
-        assert!(!hook_match(&raw, &record(crate::FlowAction::DispatchComplete)), "no per-write upgrade");
-        let m = resolve_match(raw);
-        assert!(hook_match(&m, &record(crate::FlowAction::DispatchComplete)));
-        assert!(!hook_match(&m, &record(crate::FlowAction::DispatchError)));
-        let m = resolve_match(HookMatch { action: Some("step *".to_string()), ..Default::default() });
-        assert!(hook_match(&m, &record(crate::FlowAction::StepResult)));
-    }
-
-    /// A loaded rule carries its resolved action, and its outbox key is still
-    /// the configured match's (an existing outbox is not stranded).
-    #[test]
-    fn a_loaded_rule_is_resolved_once_and_keeps_its_outbox_key() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        // flow-action-guard:allow — an old spelling is this test's input
-        let configured = HookMatch { action: Some("dispatch complete".to_string()), ..Default::default() };
-        let rule = HookRule {
-            r#match: Some(configured.clone()),
+    fn rule_with_action(action: &str) -> HookRule {
+        HookRule {
+            r#match: Some(HookMatch { action: Some(action.to_string()), ..Default::default() }),
             http: Some("http://127.0.0.1:8790/events".to_string()),
             ..Default::default()
-        };
+        }
+    }
+
+    /// (4.0) A rule written against a retired spelling is refused, naming the
+    /// spelling to write: an exact old spelling as its current action, a
+    /// spaced glob as its dotted twin (even one that matches more than the
+    /// old glob did, which is why it is never applied silently).
+    #[test]
+    fn a_rule_written_against_a_retired_spelling_is_refused_naming_the_current_one() {
+        // flow-action-guard:allow-start — an old spelling is this test's input
+        let cases = [
+            ("dispatch complete", "dispatch.complete"),
+            ("sprint start", "phase.start"),
+            ("step *", "step.*"),
+            ("dispatch *", "dispatch.*"),
+            ("sprint *", "phase.*"),
+        ];
+        // flow-action-guard:allow-end
+        for (old, current) in cases {
+            let rules = vec![rule_with_action(old)];
+            let retired = retired_rule_actions(&rules);
+            assert_eq!(
+                retired,
+                vec![RetiredRuleAction { index: 0, configured: old.to_string(), current: current.to_string() }],
+                "{old}"
+            );
+            let tmp = tempfile::TempDir::new().unwrap();
+            let Err(err) = HookSink::new(&rules, tmp.path().to_path_buf(), Arc::new(NullSink)) else {
+                panic!("{old}: a retired spelling must refuse the sink");
+            };
+            let err = err.to_string();
+            assert!(err.contains(&format!("write `{current}`")) && err.contains("hooks.rules[0]"), "{old}: {err}");
+            assert_eq!(err.contains("matches more than the old spelling did"), old.ends_with('*'), "{old}: {err}");
+            assert_eq!(err.contains("`dispatch.turn`"), old == "dispatch *", "{old}: {err}");
+        }
+    }
+
+    /// The inverse: a current pattern is not refused, and a pattern that
+    /// merely matches nothing (a typo) is the unmatchable warning's, not a
+    /// retired spelling.
+    #[test]
+    fn a_current_or_merely_mistyped_pattern_is_not_a_retired_spelling() {
+        let rules: Vec<HookRule> =
+            ["dispatch.tool", "step.*", "*", "dispatchh.*", "dispatchh *"].map(rule_with_action).into();
+        assert!(retired_rule_actions(&rules).is_empty(), "{:?}", retired_rule_actions(&rules));
+        let bad: Vec<(usize, &str)> = unmatchable_rule_patterns(&rules);
+        assert_eq!(bad, vec![(3, "dispatchh.*"), (4, "dispatchh *")]);
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(HookSink::new(&rules[..3], tmp.path().to_path_buf(), Arc::new(NullSink)).is_ok());
+    }
+
+    /// A loaded rule matches exactly as configured, and its outbox key is
+    /// the configured match's.
+    #[test]
+    fn a_loaded_rule_keeps_its_configured_match_and_outbox_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rule = rule_with_action("dispatch.complete");
         let resolved = resolve_one_rule(0, &rule, tmp.path()).unwrap();
         assert_eq!(resolved.match_.action.as_deref(), Some("dispatch.complete"));
-        let key = rule_key(&configured, "http://127.0.0.1:8790/events");
+        let key = rule_key(rule.r#match.as_ref().unwrap(), "http://127.0.0.1:8790/events");
         assert_eq!(resolved.outbox_path, outbox_paths(tmp.path(), &key).0);
-    }
-
-    /// The load-time hint names a dotted twin only when the twin can match.
-    #[test]
-    fn the_unmatchable_hint_names_only_a_twin_that_can_match() {
-        assert_eq!(unmatchable_hint("dispatch *"), "; did you mean `dispatch.*`?");
-        assert_eq!(unmatchable_hint("dispatchh *"), "");
-        assert_eq!(unmatchable_hint("sprint *"), "");
-        assert_eq!(unmatchable_hint("dispatchh.*"), "");
-    }
-
-    /// The inverse: a spaced glob whose dotted twin would match MORE than it
-    /// used to is not widened, so it matches nothing and is reported.
-    #[test]
-    fn a_widening_glob_is_left_as_written_and_reported() {
-        for pattern in ["dispatch *", "mission *", "phase *"] {
-            assert_eq!(effective_action_pattern(pattern), pattern, "{pattern} must not widen");
-        }
-        let m = resolve_match(HookMatch { action: Some("dispatch *".to_string()), ..Default::default() });
-        assert!(!hook_match(&m, &record(crate::FlowAction::DispatchTurn)), "not silently widened");
-        let rule = |action: &str| HookRule {
-            r#match: Some(HookMatch { action: Some(action.to_string()), ..Default::default() }),
-            ..Default::default()
-        };
-        // flow-action-guard:allow — an old spelling is this test's input
-        let rules = vec![rule("dispatch *"), rule("step *"), rule("dispatchh.*"), rule("dispatch complete"), rule("*")];
-        let bad: Vec<(usize, &str)> = unmatchable_rule_patterns(&rules);
-        assert_eq!(bad, vec![(0, "dispatch *"), (2, "dispatchh.*")]);
     }
 
     /// (4.0) An outbox line a pre-4.0 binary enqueued is delivered with its

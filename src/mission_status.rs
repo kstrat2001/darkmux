@@ -127,11 +127,12 @@ fn degraded_phase_ids(mission_id: &str) -> std::collections::BTreeSet<String> {
         .unwrap_or_default()
 }
 
-/// (#1569 packet A) The daemon URL a mission id links to.
+/// (#1569 packet A) The viewer deep link a mission id links to: the graph
+/// lens's own hash route, `#mission=<id>`.
 ///
 /// The id IS percent-encoded: mission ids are not guaranteed path-safe, and
-/// an unencoded one would emit extra path segments that resolve to the wrong
-/// route or to nothing.
+/// an unencoded `&`, `#` or `=` would end or split the hash grammar the viewer
+/// parses, landing on the wrong lens or on nothing.
 ///
 /// **What encoding does and does not buy** (#1593 gate — the first version of
 /// this comment implied more): it makes the URL *well-formed*, not
@@ -162,12 +163,12 @@ fn mission_url(base: &str, id: &str) -> String {
         })
         .collect();
     // `base` always carries its trailing slash (see `viewer_link_base`).
-    format!("{base}mission/{encoded}/graph")
+    format!("{base}#mission={encoded}")
 }
 
-/// A deep link to another panel, but ONLY when this process is rendering
-/// into the console (`DARKMUX_PANEL`, set by the serve daemon's panel
-/// spawner) and is not already the target.
+/// The console deep link to the unlimited mission board, but ONLY when this
+/// process is rendering into the console (`DARKMUX_PANEL`, set by the serve
+/// daemon's panel spawner) and is not already showing every mission.
 ///
 /// The point is that the ADVICE has to match the surface. "`--all` for every
 /// mission" is actionable in a terminal and a dead end in a panel, where
@@ -175,13 +176,13 @@ fn mission_url(base: &str, id: &str) -> String {
 /// fixes it here rather than the viewer pattern-matching this text, because
 /// that matching is the twin drift `/panel/:id` exists to kill: the flag and
 /// its link are one edit, in one file.
-fn panel_deep_link(link_base: &str, target: &str) -> Option<String> {
-    let current = std::env::var("DARKMUX_PANEL").ok()?;
-    if current == target {
+fn panel_all_link(link_base: &str, unlimited: bool) -> Option<String> {
+    std::env::var_os("DARKMUX_PANEL")?;
+    if unlimited {
         return None;
     }
     // `link_base` always carries its trailing slash (see `viewer_link_base`).
-    Some(format!("{link_base}#lens=console&panel={target}"))
+    Some(format!("{link_base}#lens=console&panel=mission-status&opt.all=all"))
 }
 
 /// (#2765) The base URL the board's viewer deep links are built on — the
@@ -1479,7 +1480,7 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
         // CLICOLOR_FORCE, so it DOES resolve — bounded by the daemon's own
         // panel cache.
         let link_base = board_link_base();
-        let all_link = panel_deep_link(&link_base, "mission-status-all");
+        let all_link = panel_all_link(&link_base, unlimited);
         render_board(&Board {
             views: &views,
             peer: &peer,
@@ -1572,7 +1573,7 @@ struct Board<'a> {
     missions_only: bool,
     link_base: &'a str,
     /// The "show every mission" deep link, present only inside a console
-    /// panel (see [`panel_deep_link`]).
+    /// panel (see [`panel_all_link`]).
     all_link: Option<&'a str>,
 }
 
@@ -1828,7 +1829,7 @@ fn footer_lines(b: &Board, visible: &[&MissionView], hidden: &[&MissionView], an
     }
     // (#1709) The other half of the tab: a filter nobody can find doesn't
     // exist. Printed only when there is something to filter, and never in a
-    // panel, which has no prompt to type a flag at (see `panel_deep_link`).
+    // panel, which has no prompt to type a flag at (see `panel_all_link`).
     if !b.missions_only && b.all_link.is_none() && visible.iter().any(|v| is_minted_run(v.m)) {
         out.extend(wrap_indented("→ `--missions` for named missions only", 0, b.width).iter().map(|l| style::dim(l)));
     }
@@ -3138,30 +3139,28 @@ mod tests {
         assert_eq!(l.handle_width, 0);
     }
 
-    /// (#1569 packet A) Mission ids are NOT guaranteed path-safe — `pr-review`
-    /// ids embed a full TMPDIR path (#1563) — so an unencoded id would emit a
-    /// URL with extra path segments pointing at the wrong route, or none.
+    /// The all-missions link is offered only where a flag cannot be typed.
     #[test]
     #[serial_test::serial] // mutates DARKMUX_PANEL, a process-global
-    fn panel_deep_link_only_fires_inside_a_panel_and_never_at_itself() {
+    fn panel_all_link_only_fires_inside_a_panel_and_never_when_already_unlimited() {
         let base = "http://127.0.0.1:8765/";
         // A terminal has a prompt to type `--all` at, so the hint stays a
         // hint and no link is emitted.
         std::env::remove_var("DARKMUX_PANEL");
-        assert_eq!(panel_deep_link(base, "mission-status-all"), None);
+        assert_eq!(panel_all_link(base, false), None);
 
-        // Rendering into the base panel: the flag becomes reachable.
+        // Rendering into a panel: the flag becomes reachable, as the panel's
+        // own `all` option (never a retired panel id).
         std::env::set_var("DARKMUX_PANEL", "mission-status");
         assert_eq!(
-            panel_deep_link(base, "mission-status-all").as_deref(),
-            Some("http://127.0.0.1:8765/#lens=console&panel=mission-status-all")
+            panel_all_link(base, false).as_deref(),
+            Some("http://127.0.0.1:8765/#lens=console&panel=mission-status&opt.all=all")
         );
 
-        // Already the unlimited panel — a link to where you are is noise, and
+        // Already the unlimited board — a link to where you are is noise, and
         // it is the one case the caller's `shown < len` guard would not catch
         // if the section limit ever applied under `--all`.
-        std::env::set_var("DARKMUX_PANEL", "mission-status-all");
-        assert_eq!(panel_deep_link(base, "mission-status-all"), None);
+        assert_eq!(panel_all_link(base, true), None);
         std::env::remove_var("DARKMUX_PANEL");
     }
 
@@ -3192,21 +3191,21 @@ mod tests {
     #[test]
     fn mission_url_percent_encodes_ids_that_are_not_path_safe() {
         let base = "http://127.0.0.1:8765/";
-        assert_eq!(mission_url(base, "doom-loop-m4"), "http://127.0.0.1:8765/mission/doom-loop-m4/graph");
-        // The #1563 shape: a slash would otherwise open a new path segment.
+        assert_eq!(mission_url(base, "doom-loop-m4"), "http://127.0.0.1:8765/#mission=doom-loop-m4");
+        // The #1563 shape: a slash is not part of the id's own charset.
         assert_eq!(
             mission_url(base, "review-/tmp/x"),
-            "http://127.0.0.1:8765/mission/review-%2Ftmp%2Fx/graph"
+            "http://127.0.0.1:8765/#mission=review-%2Ftmp%2Fx"
         );
-        // `?`/`#` would truncate the path into a query/fragment.
+        // `?`/`#` would truncate the fragment.
         assert_eq!(
             mission_url(base, "a?b#c"),
-            "http://127.0.0.1:8765/mission/a%3Fb%23c/graph"
+            "http://127.0.0.1:8765/#mission=a%3Fb%23c"
         );
         // RFC 3986 unreserved characters survive unescaped.
         assert_eq!(
             mission_url(base, "a-b_c.d~e"),
-            "http://127.0.0.1:8765/mission/a-b_c.d~e/graph"
+            "http://127.0.0.1:8765/#mission=a-b_c.d~e"
         );
     }
 
@@ -3311,8 +3310,8 @@ mod tests {
         // The visible text is the elided form…
         assert!(strip_ansi(&cell).contains('…'), "{cell:?}");
         // …while the target carries the whole id, unelided.
-        assert!(cell.contains(&format!("mission/{full}/graph")), "{cell:?}");
-        assert!(!cell.contains(&format!("mission/{shown}/graph")), "elided id must never be the target: {cell:?}");
+        assert!(cell.contains(&format!("#mission={full}")), "{cell:?}");
+        assert!(!cell.contains(&format!("#mission={shown}")), "elided id must never be the target: {cell:?}");
     }
 
     /// Minimal ANSI/OSC stripper for the alignment assertion above — enough
@@ -5358,7 +5357,7 @@ mod tests {
         vs.reverse();
         let mut b = board(&vs);
         b.limit = Some(1);
-        b.all_link = Some("http://127.0.0.1:8765/#lens=console&panel=mission-status-all");
+        b.all_link = Some("http://127.0.0.1:8765/#lens=console&panel=mission-status&opt.all=all");
         let out = text(render_board(&b));
         assert!(out.contains("  … 2 more (1 of 3 shown)\n  ⚠ 1 hidden mission needs attention\n"), "{out}");
         assert!(out.contains("  … 1 more (1 of 2 shown)\n"), "{out}");
@@ -5408,7 +5407,7 @@ mod tests {
         assert!(out.contains("→ `--missions` for named missions only"), "{out}");
 
         let mut b = board(&vs);
-        b.all_link = Some("http://x/#lens=console&panel=mission-status-all");
+        b.all_link = Some("http://x/#lens=console&panel=mission-status&opt.all=all");
         assert!(!text(render_board(&b)).contains("--missions"), "no flag advice inside a panel");
 
         let mut b = board(&vs);

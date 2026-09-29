@@ -36,7 +36,7 @@ function mockDay(records: unknown[]) {
       if (String(url).startsWith("/flow/")) {
         // A BARE ARRAY — what `lib.rs`'s `flow_handler` actually returns.
         // An earlier version of this mock returned `{records}` here, which is
-        // `/flow-session/`'s shape, and was green while the decode was broken.
+        // `/flow-dispatch/`'s shape, and was green while the decode was broken.
         return { ok: true, status: 200, json: async () => records };
       }
       return { ok: false, status: 500, json: async () => ({}) };
@@ -56,7 +56,7 @@ afterEach(() => {
 describe("PlaybackLens", () => {
   it("renders the fleet hero over the day's records, not a placeholder", async () => {
     render(<PlaybackLens date="2026-08-07" />, { wrapper: wrapper() });
-    await waitFor(() => expect(screen.queryByText(/lens not ported yet/i)).not.toBeInTheDocument());
+    await waitFor(() => expect(screen.queryByText(/unknown route/i)).not.toBeInTheDocument());
     await waitFor(() => expect(document.querySelector(".fleet-lens")).toBeTruthy());
   });
 
@@ -68,7 +68,7 @@ describe("PlaybackLens", () => {
     // wrong" failure FleetLens's own doc names — a machine reading idle
     // because it is idle NOW, over records from a day it was busy.
     expect(calls.some((u) => u.includes("/fleet/machines/live"))).toBe(false);
-    expect(calls.some((u) => u.includes("/fleet/sessions/live"))).toBe(false);
+    expect(calls.some((u) => u.includes("/fleet/dispatches/live"))).toBe(false);
   });
 
   it("shows a loading state before the day resolves", () => {

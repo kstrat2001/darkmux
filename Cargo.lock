@@ -884,6 +884,7 @@ dependencies = [
  "serde_json",
  "serial_test",
  "tempfile",
+ "ts-rs",
 ]
 
 [[package]]
@@ -939,6 +940,7 @@ dependencies = [
  "serde_json",
  "serial_test",
  "tempfile",
+ "ts-rs",
 ]
 
 [[package]]

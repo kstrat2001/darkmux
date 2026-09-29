@@ -7479,7 +7479,6 @@ mod tests {
             written_at_unix_ms: checkpoint::unix_ms(),
         };
 
-        let seed_turns = resume_checkpoint.turns;
         let outcome = run_with_sleeper(
             &client, &client, "test-model", vec![], &tools, &mut traj, false, &cfg,
             Some(100), None, None, None, Some(u32::MAX), None, std::collections::BTreeMap::new(), None,
@@ -7502,11 +7501,9 @@ mod tests {
         assert_eq!(this_run.tokens.prompt, 140);
         assert_eq!(this_run.tokens.completion, 5);
         assert_eq!(this_run.compactions(), 0, "cfg is never_compact");
-        // The WHOLE dispatch's turn count, by the host's one rule (the loop
-        // writes no checkpoint after its terminal turn, so the one it resumed
-        // from is the seed, not the answer): turn 3, the turn it stopped on.
-        let seed = darkmux_trajectory::CheckpointCounts { turns: seed_turns, compactions: 0 };
-        assert_eq!(seed.cumulative_turns(&this_run), 3);
+        // The turn it stopped on is the task's own turn 3, not this run's
+        // first call.
+        assert_eq!(this_run.turn_detail.keys().copied().max(), Some(3));
     }
 
     /// (#2263) A resume from a #1221 hand-back checkpoint CONTINUES the
@@ -7561,8 +7558,6 @@ mod tests {
         assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
         let this_run = crate::trajectory::recorded(tmp.path());
         assert_eq!(this_run.turn_detail.keys().copied().collect::<Vec<_>>(), vec![3], "the continued turn keeps its seq");
-        let seed = darkmux_trajectory::CheckpointCounts { turns: 3, compactions: 0 };
-        assert_eq!(seed.cumulative_turns(&this_run), 3, "three turns, not four");
     }
 
     /// (#2263) The inverted case: a dispatch that was NEVER resumed records

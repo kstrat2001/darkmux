@@ -1,7 +1,7 @@
 //! CLI dispatcher for `darkmux flow` shortcut verbs.
 
 use crate::flow;
-use crate::flow::{Category, FlowAction, FlowRecord, Level, Stage, Tier};
+use crate::flow::{Category, FlowAction, FlowRecord, FlowSource, Level, OperatorSource, Stage, Tier};
 use anyhow::{bail, Context, Result};
 use clap::Subcommand;
 
@@ -22,8 +22,8 @@ pub enum FlowCmd {
         #[arg(long = "session-id")]
         session_id: Option<String>,
         /// Optional source label.
-        #[arg(long)]
-        source: Option<String>,
+        #[arg(long, value_enum)]
+        source: Option<OperatorSource>,
     },
     /// Record an operator-flagged catch / mid-stream observation.
     Catch {
@@ -36,8 +36,8 @@ pub enum FlowCmd {
         #[arg(long = "session-id")]
         session_id: Option<String>,
         /// Optional source label.
-        #[arg(long)]
-        source: Option<String>,
+        #[arg(long, value_enum)]
+        source: Option<OperatorSource>,
     },
     /// Record a raw flow event — all six fields explicit from flags.
     Record {
@@ -62,8 +62,8 @@ pub enum FlowCmd {
         #[arg(long = "session-id")]
         session_id: Option<String>,
         /// Optional source label.
-        #[arg(long)]
-        source: Option<String>,
+        #[arg(long, value_enum)]
+        source: Option<OperatorSource>,
         /// Optional operator-supplied reasoning. The audit substrate's
         /// WHY layer for events emitted via this raw verb.
         #[arg(long)]
@@ -109,19 +109,16 @@ pub enum FlowCmd {
         /// already-dispatched session — e.g., recorded after the fact).
         #[arg(long = "session-id")]
         session_id: Option<String>,
-        /// Optional source label (e.g., `frontier`, `operator-manual`).
-        #[arg(long)]
-        source: Option<String>,
+        /// Optional source label.
+        #[arg(long, value_enum)]
+        source: Option<OperatorSource>,
     },
     /// Print a diagnostic snapshot of the flow substrate (sinks, Redis
-    /// health, disk health, schema state). The store-status pill in
-    /// the shared shell polls this via the daemon's `/flow-status`
-    /// endpoint; the verb is also useful standalone for operators
-    /// debugging substrate problems.
+    /// health, disk health, schema state): useful to operators debugging
+    /// substrate problems.
     Status {
         /// Emit machine-readable JSON instead of the human-formatted
-        /// summary. The daemon's `/flow-status` endpoint also returns
-        /// this shape so the shell pill and the CLI share one format.
+        /// summary.
         #[arg(long)]
         json: bool,
     },
@@ -696,7 +693,7 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             phase_id,
             session_id,
             execution_id: None,
-            source,
+            source: source.map(FlowSource::from),
             model: None,
             reasoning: None,
             mission_id: None,
@@ -705,8 +702,6 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             prev_hash: None,
             hash: None,
             payload: None,
-            work_id: None,
-            attempt: None,
         },
         FlowCmd::Catch { text, phase_id, session_id, source } => FlowRecord {
             ts,
@@ -719,7 +714,7 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             phase_id,
             session_id,
             execution_id: None,
-            source,
+            source: source.map(FlowSource::from),
             model: None,
             reasoning: None,
             mission_id: None,
@@ -728,8 +723,6 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             prev_hash: None,
             hash: None,
             payload: None,
-            work_id: None,
-            attempt: None,
         },
         FlowCmd::Record {
             level,
@@ -754,7 +747,7 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             phase_id,
             session_id,
             execution_id: None,
-            source,
+            source: source.map(FlowSource::from),
             model: None,
             reasoning,
             mission_id,
@@ -763,8 +756,6 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             prev_hash: None,
             hash: None,
             payload: None,
-            work_id: None,
-            attempt: None,
         },
         FlowCmd::TierDecision {
             decision,
@@ -792,7 +783,7 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             phase_id,
             session_id,
             execution_id: None,
-            source,
+            source: source.map(FlowSource::from),
             model: None,
             reasoning: Some(format!("[{decision}] {reasoning}")),
             mission_id,
@@ -801,8 +792,6 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             prev_hash: None,
             hash: None,
             payload: None,
-            work_id: None,
-            attempt: None,
         },
         // Read verbs are intercepted by `run` before build_record.
         // Reaching here would mean run() was bypassed; assert loudly.
@@ -1070,7 +1059,7 @@ mod tests {
         run(FlowCmd::Record {
             level: Level::Error,
             category: Category::Machinery,
-            tier: Tier::Local,
+            tier: Tier::Darkmux,
             stage: Stage::Dispatch,
             action: FlowAction::OperatorNote,
             handle: "y".to_string(),
@@ -1085,7 +1074,7 @@ mod tests {
         let rec = single_record(&guard);
         assert_eq!(rec["level"], "error");
         assert_eq!(rec["category"], "machinery");
-        assert_eq!(rec["tier"], "local");
+        assert_eq!(rec["tier"], "darkmux");
         assert_eq!(rec["stage"], "dispatch");
         assert_eq!(rec["action"], "operator.note");
         assert_eq!(rec["handle"], "y");
@@ -1104,7 +1093,7 @@ mod tests {
             handle: "opt-handle".to_string(),
             phase_id: Some("66".to_string()),
             session_id: Some("abc".to_string()),
-            source: Some("manual".to_string()),
+            source: Some(OperatorSource::Manual),
             reasoning: None,
             mission_id: None,
         })
@@ -1114,6 +1103,34 @@ mod tests {
         assert_eq!(rec["phase_id"], "66");
         assert_eq!(rec["session_id"], "abc");
         assert_eq!(rec["source"], "manual");
+    }
+
+    /// `--source` is the operator-writable subset of `FlowSource`, and the
+    /// channels other features read (`adjudication`, `orchestrator`) parse to
+    /// the source they name; a source only darkmux writes is refused.
+    #[test]
+    fn source_flag_accepts_the_operator_writable_sources_only() {
+        use clap::Parser;
+        let parse = |source: &str| {
+            crate::cli::Cli::try_parse_from(["darkmux", "flow", "note", "--text", "t", "--source", source])
+        };
+        for (flag, want) in [
+            ("adjudication", FlowSource::Adjudication),
+            ("orchestrator", FlowSource::Orchestrator),
+            ("manual", FlowSource::Manual),
+            ("frontier", FlowSource::Frontier),
+        ] {
+            let cli = parse(flag).ok().unwrap_or_else(|| panic!("`--source {flag}` must parse"));
+            match cli.command {
+                crate::cli::Cmd::Flow { sub: FlowCmd::Note { source: Some(got), .. } } => {
+                    assert_eq!(FlowSource::from(got), want, "{flag}")
+                }
+                _ => panic!("`flow note --source {flag}` did not parse as a note"),
+            }
+        }
+        for refused in ["scheduler", "host-sampler", "frontier-orchestrator", "estimator"] {
+            assert!(parse(refused).is_err(), "`--source {refused}` is not operator-writable");
+        }
     }
 
     #[serial_test::serial]
@@ -1153,7 +1170,7 @@ mod tests {
             phase_id: Some("113-s1".into()),
             mission_id: Some("113-mission-propose-pipeline".into()),
             session_id: None,
-            source: Some("frontier".into()),
+            source: Some(OperatorSource::Frontier),
         })
         .unwrap();
 

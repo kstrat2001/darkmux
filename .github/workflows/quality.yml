@@ -804,7 +804,7 @@ jobs:
       - name: Generated TS bindings are in sync with the Rust types
         run: |
           if ! git diff --exit-code -- ui/src/types/generated; then
-            echo "::error::ui/src/types/generated is stale. Run 'bun run types:regen' in ui/ (it runs every crate's ts-export export_bindings: darkmux-serve, darkmux-flow, darkmux-crew, darkmux-lab) (and the same for any other crate with ts(export) types) and commit the regenerated bindings."
+            echo "::error::ui/src/types/generated is stale. Run 'bun run types:regen' in ui/ (it runs every crate's ts-export export_bindings: darkmux-serve, darkmux-types, darkmux-profiles, darkmux-flow, darkmux-crew, darkmux-lab) (and the same for any other crate with ts(export) types) and commit the regenerated bindings."
             exit 1
           fi
           echo "generated bindings match the Rust types"

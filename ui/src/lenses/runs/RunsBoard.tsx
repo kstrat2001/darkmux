@@ -14,7 +14,8 @@ import { useDecodedMachineKey, useMachineKeyContext } from "../../hooks/useMachi
 import { MACHINE_NOT_FOUND_LABEL, machineLabel } from "../../lib/machineKey";
 import { machineNames } from "../../lib/flow";
 import { LabRunDetail } from "./LabRunDetail";
-import type { RunsResponse, LabRunsResponse } from "../../types/handwritten";
+import type { RunsResponse } from "../../types/generated/RunsResponse";
+import type { LabRunsResponse } from "../../types/generated/LabRunsResponse";
 import type { PendingMove } from "../../types/generated/PendingMove";
 import type { Run } from "../../types/generated/Run";
 import {
@@ -110,8 +111,8 @@ import {
  *   scope — see `MISSION_GRAPH_UNREACHABLE_NOTICE`'s own doc for why a
  *   named notice stands in for it instead.
  * - (#1900, widened #1915) an untracked row that carries a `session_id`
- *   opens the session drill instead: `location.hash = "session=<id>"`,
- *   straight to `SessionReplay` (`/flow-session/<id>`) — ungated, no
+ *   opens the session drill instead: `location.hash = "dispatch=<id>"`,
+ *   straight to `SessionReplay` (`/flow-dispatch/<id>`) — ungated, no
  *   `missionGraphReachable()` check, same precedent as `FleetLens.tsx`'s
  *   activity-lane bars. This started (#1900) as a `kind==="dispatch"`-only
  *   carve-out — a ghost dispatch always has a real trajectory behind it
@@ -284,7 +285,7 @@ export function RunsBoard({
   // `kind: "dispatch"` row: server-side, `ghost_runs` (`crates/darkmux-
   // serve/src/runs.rs`) only ever synthesizes an untracked dispatch row for
   // a flow session that saw a real `dispatch start` record (its `has_start`
-  // gate), so it always has a real `/flow-session/<id>` behind it — a
+  // gate), so it always has a real `/flow-dispatch/<id>` behind it — a
   // trajectory, metrics, per-step records — even with no mission graph.
   //
   // (#1915) The same premise turned out false for an untracked MISSION row

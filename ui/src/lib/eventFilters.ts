@@ -13,7 +13,7 @@
  * it needs — didn't exist yet).
  */
 import { isPlainObject } from "./guards";
-import { ACTION, CATEGORY, tagText, wireOf, type NormAction, type NormRecord } from "./ingest";
+import { ACTION, CATEGORY, SOURCE, tagText, wireOf, type NormAction, type NormRecord } from "./ingest";
 
 /** `activityOf()` — viewer.html:1014-1042, the FULL mapping (every branch,
  * including session end / machine online-offline / note, which the port's
@@ -23,15 +23,15 @@ export function activityOf(r: NormRecord): string {
   const a = r.action;
   const named = a === undefined ? undefined : ACTIVITY_NAMES.get(a);
   if (named) return named;
-  if (a === ACTION.DispatchCompaction || r.source === "compaction") return "compaction";
-  const isNoteEvent = a === ACTION.OperatorNote || r.source === "adjudication";
+  if (a === ACTION.DispatchCompaction || r.source === SOURCE.Compaction) return "compaction";
+  const isNoteEvent = a === ACTION.OperatorNote || r.source === SOURCE.Adjudication;
   if (isNoteEvent) return "note";
   if (a === ACTION.MachineOnline) return "machine online";
   if (a === ACTION.MachineOffline) return "machine offline";
   if (a === ACTION.SessionEnd) return "session end";
   // (#2413) `machine.telemetry` is the machine-scoped replacement for the
   // retired per-dispatch `telemetry.process` — same friendly facet label
-  // as the `category: "telemetry", source: "process"` branch below, so a
+  // as the `category: "telemetry", source: "host"` branch below, so a
   // saved "host telemetry" filter keeps working across the schema change
   // (and across the retired mechanism's continuing partial use — see
   // `FLOW_SCHEMA_VERSION` 1.42.0's changelog) instead of fragmenting into
@@ -41,13 +41,13 @@ export function activityOf(r: NormRecord): string {
   // the machine (utility jobs are machine-level), not generic telemetry.
   if (a === ACTION.UtilityStart || a === ACTION.UtilityError) return "utility";
   if (r.category === CATEGORY.Telemetry) {
-    if (r.source === "detector") return "detector";
-    if (r.source === "tokens") return "tokens";
-    if (r.source === "process") return "host telemetry";
-    if (r.source === "lms") return "lms";
-    if (r.source === "runtime") return "runtime";
+    if (r.source === SOURCE.Detector) return "detector";
+    if (r.source === SOURCE.Tokens) return "tokens";
+    if (r.source === SOURCE.Host) return "host telemetry";
+    if (r.source === SOURCE.Lms) return "lms";
+    if (r.source === SOURCE.Runtime) return "runtime";
     // (#2902 step 5) budget.warn / budget.wait / budget.resume.
-    if (r.source === "budget") return "budget";
+    if (r.source === SOURCE.Budget) return "budget";
     return "telemetry";
   }
   return a === undefined ? "other" : tagText(a) || "other";
@@ -505,7 +505,7 @@ export function sortUnmappedActivities(values: string[]): string[] {
 export function computeFacets(records: NormRecord[]): Facets {
   const cat = [...new Set(records.flatMap((r) => (r.category == null ? [] : [tagText(r.category)])))];
   const tier = [...new Set(records.flatMap((r) => (r.tier == null ? [] : [tagText(r.tier)])))];
-  const src = [...new Set(records.map((r) => r.source).filter((v): v is string => v != null))];
+  const src = [...new Set(records.flatMap((r) => (r.source == null ? [] : [tagText(r.source)])))];
   const acts = new Set(records.map(activityOf));
   const act = ACT_ORDER.filter((a) => acts.has(a)).concat(
     sortUnmappedActivities([...acts].filter((a) => !ACT_ORDER.includes(a))),
@@ -741,7 +741,7 @@ export function matchesFilters(r: NormRecord, filters: FilterState): boolean {
   if (!filters.act.has(activityOf(r))) return false;
   if (r.category != null && !filters.cat.has(tagText(r.category))) return false;
   if (r.tier != null && !filters.tier.has(tagText(r.tier))) return false;
-  if (r.source != null && !filters.src.has(r.source)) return false;
+  if (r.source != null && !filters.src.has(tagText(r.source))) return false;
   if (filters.q) {
     const q = filters.q.trim().toLowerCase();
     if (q && !JSON.stringify(wireOf(r)).toLowerCase().includes(q)) return false;

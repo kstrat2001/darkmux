@@ -45,6 +45,39 @@ use darkmux_crew::types::{Mission, MissionStatus, NodeStatus, Phase, PhaseStatus
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// What a graph node is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
+#[serde(rename_all = "lowercase")]
+pub enum NodeKind {
+    Phase,
+    Task,
+}
+
+/// What an edge means: `Contains` (phase to task) or `DependsOn` (a real
+/// `Task::depends_on`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeKind {
+    Contains,
+    DependsOn,
+}
+
+/// A node's display status: a task's own display status, or a phase's. The two
+/// sets differ (`Degraded` is a phase-only verdict), so the wire type is their
+/// union and each variant serializes as its bare status word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
+#[serde(untagged)]
+pub enum GraphNodeStatus {
+    Task(TaskDisplayStatus),
+    Phase(PhaseDisplayStatus),
+}
+
 /// One node in the rendered graph — a Phase or a Task (steps render as
 /// rows inside a Task node, see the module doc — #1401).
 ///
@@ -58,17 +91,22 @@ use std::collections::{BTreeMap, BTreeSet};
 /// key the JS reads so a rename on either side fails a test instead of
 /// silently flattening the layout.
 #[derive(Debug, Clone, Serialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "camelCase")]
 pub struct GraphNode {
     pub id: String,
     pub label: String,
-    pub kind: &'static str,
-    pub status: &'static str,
+    pub kind: NodeKind,
+    pub status: GraphNodeStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub parent_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(type = "number", optional))]
     pub started_ts: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(type = "number", optional))]
     pub completed_ts: Option<u64>,
     /// Layering depth for layout (0 = a root with no known upstream
     /// dependency). Phase nodes use their position in
@@ -76,6 +114,7 @@ pub struct GraphNode {
     /// longest-path depth computed by [`layer_tasks_by_depth`].
     /// Diagram-only, never scheduler-authoritative — see that function's
     /// doc for the cycle/dangling-reference fallback.
+    #[cfg_attr(test, ts(type = "number"))]
     pub depth: usize,
     /// (#1398) The FULL phase/task description, for a tooltip/detail
     /// affordance — `label` above is the short operator-facing name
@@ -84,6 +123,7 @@ pub struct GraphNode {
     /// stays one hover away rather than truncating the node itself. `None`
     /// when the phase/task has no description text at all.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub description: Option<String>,
     /// (#1401) One row per Step in `Task.step_ids` order — empty for a
     /// phase node. The page renders each row as `label` + a status dot (a
@@ -91,8 +131,9 @@ pub struct GraphNode {
     /// matches an incoming step-lifecycle record's `handle` against to
     /// flip a row's status in place, without needing a separate node to
     /// look up.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub steps: Vec<StepRow>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub steps: Option<Vec<StepRow>>,
     /// (#2406, extended #2343) A phase node's task-count breakdown, e.g.
     /// `"7 complete · 1 errored · 4 running"` — populated ONLY for a phase
     /// node whose rolled-up status is `running`, `waiting`, or `degraded`
@@ -104,12 +145,15 @@ pub struct GraphNode {
     /// uniform (all-complete, all-planned, …) — a breakdown of a uniform
     /// set adds nothing.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub status_note: Option<String>,
 }
 
 /// One row inside a Task node's card (#1401). Same `camelCase` wire
 /// contract as [`GraphNode`].
 #[derive(Debug, Clone, Serialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "camelCase")]
 pub struct StepRow {
     pub id: String,
@@ -126,10 +170,12 @@ pub struct StepRow {
     /// step with no config-snapshot recovery — see `build_mission_graph`);
     /// the page then falls back to showing a meter only if metrics arrive.
     pub kind: String,
-    pub status: &'static str,
+    pub status: NodeStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(type = "number", optional))]
     pub started_ts: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(type = "number", optional))]
     pub completed_ts: Option<u64>,
     /// (#1432 item 4) FINALIZED token/turn totals folded from this
     /// mission's flow records at page-load time, so a completed step whose
@@ -160,8 +206,10 @@ pub struct StepRow {
     /// total, not just the live SSE meter (which #1488 already gated
     /// client-side on `startTs > 0`).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(type = "number", optional))]
     pub tokens_final: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(type = "number", optional))]
     pub turns_final: Option<u64>,
     /// (#1481) The resolved model this step's dispatch ran against, read from
     /// the persisted `Step.config` (`model`, else `model_key`). A
@@ -181,6 +229,7 @@ pub struct StepRow {
     /// every such case (operator sovereignty #44: show provenance where it
     /// exists, never fabricate it).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub model: Option<String>,
 }
 
@@ -189,6 +238,8 @@ pub struct StepRow {
 /// attribute keeps a future two-word field from re-introducing the
 /// casing trap).
 #[derive(Debug, Clone, Serialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "camelCase")]
 pub struct GraphEdge {
     pub id: String,
@@ -197,7 +248,7 @@ pub struct GraphEdge {
     /// `"contains"` (phase→task) or `"depends_on"` (a real `Task::depends_on`
     /// dependency — #1401 retired the derived step-granularity edges this
     /// used to carry; every dependency edge connects two TASK nodes now).
-    pub kind: &'static str,
+    pub kind: EdgeKind,
 }
 
 /// The full graph payload for one mission.
@@ -209,9 +260,11 @@ pub struct GraphEdge {
 /// Only the node/edge OBJECTS are camelCase — see [`GraphNode`]'s casing
 /// contract. The `mission_graph_json_fan_in_shape` test pins both casings.
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct MissionGraph {
     pub mission_id: String,
-    pub mission_status: &'static str,
+    pub mission_status: MissionStatus,
     pub nodes: Vec<GraphNode>,
     pub edges: Vec<GraphEdge>,
     /// `true` when the mission has phase data but NO task/step graph
@@ -220,16 +273,10 @@ pub struct MissionGraph {
     /// graph with a note instead of an error.
     pub legacy: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub note: Option<String>,
+    #[cfg_attr(test, ts(type = "number"))]
     pub generated_at_ms: u64,
-}
-
-fn mission_status_str(s: MissionStatus) -> &'static str {
-    match s {
-        MissionStatus::Active => "active",
-        MissionStatus::Finalized => "finalized",
-        MissionStatus::Aborted => "aborted",
-    }
 }
 
 /// (#1472) Map a `PhaseStatus` onto the `NodeStatus` lattice so a phase's
@@ -242,16 +289,6 @@ fn phase_status_to_node(s: PhaseStatus) -> NodeStatus {
         PhaseStatus::Running => NodeStatus::Running,
         PhaseStatus::Complete => NodeStatus::Complete,
         PhaseStatus::Abandoned => NodeStatus::Abandoned,
-    }
-}
-
-fn node_status_str(s: NodeStatus) -> &'static str {
-    match s {
-        NodeStatus::Planned => "planned",
-        NodeStatus::Running => "running",
-        NodeStatus::Complete => "complete",
-        NodeStatus::Abandoned => "abandoned",
-        NodeStatus::Error => "error",
     }
 }
 
@@ -296,8 +333,11 @@ fn step_model_from_config(config: &serde_json::Value) -> Option<String> {
 /// in DISPLAY), while a Task's own status is read-only, derived fresh from
 /// its steps on every graph build (`Task` carries no `status` field of its
 /// own — #1230/#1341).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TaskDisplayStatus {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
+#[serde(rename_all = "lowercase")]
+pub enum TaskDisplayStatus {
     Planned,
     /// (#2343) The task has made progress but nothing is genuinely
     /// executing right now — see [`derive_task_status`]'s own doc for the
@@ -312,16 +352,6 @@ enum TaskDisplayStatus {
 }
 
 impl TaskDisplayStatus {
-    fn as_str(self) -> &'static str {
-        match self {
-            TaskDisplayStatus::Planned => "planned",
-            TaskDisplayStatus::Waiting => "waiting",
-            TaskDisplayStatus::Running => "running",
-            TaskDisplayStatus::Complete => "complete",
-            TaskDisplayStatus::Error => "error",
-            TaskDisplayStatus::Abandoned => "abandoned",
-        }
-    }
 }
 
 /// Derive a Task's DISPLAY status from its Steps' statuses — `Task`
@@ -404,8 +434,11 @@ fn derive_task_status(steps: &[(NodeStatus, Option<u64>)]) -> TaskDisplayStatus 
 /// `Waiting` a task could never legitimately reach (task level keeps "any
 /// Error wins" unchanged, see `derive_task_status`) would widen the
 /// scheduler's own vocabulary for a concept that only exists one level up.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PhaseDisplayStatus {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
+#[serde(rename_all = "lowercase")]
+pub enum PhaseDisplayStatus {
     Planned,
     /// (#2343) None of the phase's tasks is GENUINELY running (see
     /// [`TaskDisplayStatus::Waiting`]'s own doc), but the phase is not
@@ -444,18 +477,6 @@ impl PhaseDisplayStatus {
             | PhaseDisplayStatus::Degraded
             | PhaseDisplayStatus::Error
             | PhaseDisplayStatus::Abandoned => 2,
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            PhaseDisplayStatus::Planned => "planned",
-            PhaseDisplayStatus::Waiting => "waiting",
-            PhaseDisplayStatus::Running => "running",
-            PhaseDisplayStatus::Complete => "complete",
-            PhaseDisplayStatus::Degraded => "degraded",
-            PhaseDisplayStatus::Error => "error",
-            PhaseDisplayStatus::Abandoned => "abandoned",
         }
     }
 
@@ -1119,19 +1140,6 @@ fn gate_finals_by_started(started: bool, fin: Option<&StepFinals>) -> (Option<u6
     (fin.and_then(|f| f.tokens), fin.and_then(|f| f.turns))
 }
 
-/// Days since the Unix epoch for a civil calendar date (Howard Hinnant's
-/// `days_from_civil`) — lets the backfill compare a flow day file's
-/// `YYYY-MM-DD` stem against a mission's `created_ts` without a date crate.
-fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let mp = (i64::from(m) + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + i64::from(d) - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe - 719468
-}
-
 /// Parse a flow day-file stem (`YYYY-MM-DD`) into days since the epoch.
 /// `None` for anything that isn't a well-formed date stem — which also
 /// excludes non-day `.jsonl` files from the backfill scan, matching
@@ -1147,10 +1155,10 @@ fn day_stem_to_epoch_days(stem: &str) -> Option<i64> {
     if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
         return None;
     }
-    Some(days_from_civil(y, m, d))
+    Some(darkmux_flow::days_from_civil(y, i64::from(m), i64::from(d)))
 }
 
-/// The inverse of [`days_from_civil`] (Hinnant's `civil_from_days`), as a
+/// The inverse of `darkmux_flow::days_from_civil` (Hinnant's `civil_from_days`), as a
 /// `YYYY-MM-DD` stem. Test-only: lets tests name a flow day file for "today"
 /// without a date crate, so the route-level backfill tests aren't pinned to
 /// the date they were written on.
@@ -1377,7 +1385,7 @@ pub fn build_mission_graph(
                 id: format!("contains:{}:{}", phase.id, task.id),
                 source: phase.id.clone(),
                 target: task.id.clone(),
-                kind: "contains",
+                kind: EdgeKind::Contains,
             });
 
             // One (status, started_ts) pair per step_ids entry — a step
@@ -1448,7 +1456,7 @@ pub fn build_mission_graph(
                             id: step.id.clone(),
                             label: resolve_step_label(&step.kind, &step.id),
                             kind: step.kind.clone(),
-                            status: node_status_str(step.status),
+                            status: step.status,
                             started_ts: step.started_ts,
                             completed_ts: step.completed_ts,
                             tokens_final,
@@ -1470,7 +1478,7 @@ pub fn build_mission_graph(
                                 id: step_id.clone(),
                                 label: resolve_step_label(&kind, step_id),
                                 kind,
-                                status: node_status_str(NodeStatus::Planned),
+                                status: NodeStatus::Planned,
                                 started_ts: None,
                                 completed_ts: None,
                                 tokens_final,
@@ -1489,14 +1497,14 @@ pub fn build_mission_graph(
             task_nodes.push(GraphNode {
                 id: task.id.clone(),
                 label: task.display_name.clone().unwrap_or_else(|| task.id.clone()),
-                kind: "task",
-                status: status.as_str(),
+                kind: NodeKind::Task,
+                status: GraphNodeStatus::Task(status),
                 parent_id: Some(phase.id.clone()),
                 started_ts,
                 completed_ts,
                 depth: *task_depth.get(&task.id).unwrap_or(&0),
                 description: description_or_none(&task.description),
-                steps: step_rows,
+                steps: (!step_rows.is_empty()).then_some(step_rows),
                 // (#2406) Task-level status keeps "any Error wins"
                 // (`derive_task_status`, unchanged) — a task genuinely IS
                 // one unit of work, so there is no mix to name here.
@@ -1518,7 +1526,7 @@ pub fn build_mission_graph(
                     id: edge_id,
                     source: dep_task_id.clone(),
                     target: task.id.clone(),
-                    kind: "depends_on",
+                    kind: EdgeKind::DependsOn,
                 });
             }
         }
@@ -1551,14 +1559,14 @@ pub fn build_mission_graph(
         nodes.push(GraphNode {
             id: phase.id.clone(),
             label: phase.display_name.clone().unwrap_or_else(|| phase.id.clone()),
-            kind: "phase",
-            status: phase_display.as_str(),
+            kind: NodeKind::Phase,
+            status: GraphNodeStatus::Phase(phase_display),
             parent_id: None,
             started_ts: phase.started_ts,
             completed_ts: phase_completed_ts,
             depth: phase_index,
             description: description_or_none(&phase.description),
-            steps: Vec::new(),
+            steps: None,
             // (#2406) Only `running`/`degraded` phases get a note — see
             // `phase_status_note`'s own doc.
             status_note: phase_status_note(phase_display, &phase_counts),
@@ -1584,7 +1592,7 @@ pub fn build_mission_graph(
 
     Ok(Some(MissionGraph {
         mission_id: mission.id.clone(),
-        mission_status: mission_status_str(mission.status),
+        mission_status: mission.status,
         nodes,
         edges,
         legacy,
@@ -2017,7 +2025,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let step_ids = ids(&["s1"]);
         // Mission created on 2026-07-17; margin admits 2026-07-16.
-        let created_ts = (days_from_civil(2026, 7, 17) * 86400) as u64;
+        let created_ts = (darkmux_flow::days_from_civil(2026, 7, 17) * 86400) as u64;
         // OUT of window: a matching record that must NOT fold.
         write_day_file(tmp.path(), "2020-01-01", &[complete_rec("s1", 999_999)]);
         // Margin day (created minus one): folds.
@@ -2036,7 +2044,7 @@ mod tests {
     fn backfill_caps_total_records_parsed() {
         let tmp = tempfile::TempDir::new().unwrap();
         let step_ids = ids(&["s1"]);
-        let created_ts = (days_from_civil(2026, 7, 17) * 86400) as u64;
+        let created_ts = (darkmux_flow::days_from_civil(2026, 7, 17) * 86400) as u64;
         // Three finalized records, ascending; a cap of 1 keeps only the first.
         write_day_file(
             tmp.path(),
@@ -2055,7 +2063,7 @@ mod tests {
     #[test]
     fn a_spaced_archive_folds_like_its_dotted_twin() {
         let step_ids = ids(&["s1"]);
-        let created_ts = (days_from_civil(2026, 7, 17) * 86400) as u64;
+        let created_ts = (darkmux_flow::days_from_civil(2026, 7, 17) * 86400) as u64;
         let fold = |action: &str| {
             let tmp = tempfile::TempDir::new().unwrap();
             let rec = serde_json::json!({ "action": action, "handle": "s1", "payload": { "total_tokens": 4200 } });
@@ -2072,7 +2080,7 @@ mod tests {
     fn backfill_skips_malformed_lines() {
         let tmp = tempfile::TempDir::new().unwrap();
         let step_ids = ids(&["s1"]);
-        let created_ts = (days_from_civil(2026, 7, 17) * 86400) as u64;
+        let created_ts = (darkmux_flow::days_from_civil(2026, 7, 17) * 86400) as u64;
         let good = serde_json::to_string(&complete_rec("s1", 4200)).unwrap();
         std::fs::write(
             tmp.path().join("2026-07-17.jsonl"),

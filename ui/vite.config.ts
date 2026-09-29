@@ -7,7 +7,7 @@ import { devProxyTarget } from "./devProxyTarget";
 // self-contained `dist/index.html` (inlined JS/CSS, no separate chunks), which
 // the `copy-artifact` script commits to
 // `crates/darkmux-serve/assets/next.html`. That file is `include_str!`'d by
-// the daemon at `GET /next` (see `crates/darkmux-serve/src/lib.rs`) so the
+// the daemon at `GET /` (see `crates/darkmux-serve/src/lib.rs`) so the
 // release binary stays self-contained and node-free — the same posture the
 // legacy `viewer.html` had before its retirement (#1806).
 //
@@ -41,9 +41,9 @@ import { devProxyTarget } from "./devProxyTarget";
 // skipped, and is pinned by `devProxyTarget.test.ts`.
 const DAEMON = devProxyTarget(process.env);
 const API_PREFIXES = [
-  "/flow", "/flow-days", "/flow-missions", "/flow-mission", "/flow-session",
-  "/flow-status", "/runs", "/missions", "/phases", "/machine", "/fleet",
-  "/lab", "/panel", "/worktree-summary", "/health", "/mission",
+  "/flow", "/flow-days", "/flow-missions", "/flow-mission", "/flow-dispatch",
+  "/runs", "/missions", "/phases", "/machine", "/fleet",
+  "/lab", "/panel", "/health", "/mission",
 ];
 
 export default defineConfig({

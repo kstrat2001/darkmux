@@ -22,7 +22,7 @@ async function main() {
         ts,
         level: "info",
         category: "work",
-        tier: "local",
+        tier: "darkmux",
         stage: "dispatch",
         action: i % 2 === 0 ? "dispatch.start" : "dispatch.complete",
         handle: "flood",
