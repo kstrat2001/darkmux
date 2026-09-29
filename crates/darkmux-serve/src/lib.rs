@@ -3476,9 +3476,7 @@ fn scan_flow_days(flows_dir: &std::path::Path) -> Vec<serde_json::Value> {
             }
             // A dispatch = a dispatch.start edge.
             if darkmux_flow::reader::action_of(&v) == Some(darkmux_flow::FlowAction::DispatchStart) {
-                if let Some(s) = v.get("session_id").and_then(|s| s.as_str()) {
-                    dispatches.insert(s.to_string());
-                }
+                dispatches.insert(darkmux_flow::legacy::execution_of(&v).to_string());
             }
         }
         days.push(serde_json::json!({
@@ -3745,9 +3743,7 @@ fn scan_flow_missions(
             e.last_date = date.to_string();
         }
         if darkmux_flow::reader::action_of(v) == Some(darkmux_flow::FlowAction::DispatchStart) {
-            if let Some(s) = v.get("session_id").and_then(|s| s.as_str()) {
-                e.dispatches.insert(s.to_string());
-            }
+            e.dispatches.insert(darkmux_flow::legacy::execution_of(v).to_string());
         }
         if let Some(mach) = v.get("machine_id").and_then(|m| m.as_str()) {
             if !mach.is_empty() {
