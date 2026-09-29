@@ -5659,6 +5659,14 @@ struct PtyMaster {
 /// child never blocks writing to it.
 #[cfg(unix)]
 fn spawn_answering_yes_on_a_pty(cmd: &mut std::process::Command) -> (std::process::Child, PtyMaster) {
+    spawn_on_a_pty(cmd, b"y\n")
+}
+
+/// [`spawn_answering_yes_on_a_pty`] with `typed` written to the terminal
+/// instead of a `y` (nothing when it is empty), for a test that answers
+/// something else or never answers.
+#[cfg(unix)]
+fn spawn_on_a_pty(cmd: &mut std::process::Command, typed: &[u8]) -> (std::process::Child, PtyMaster) {
     use std::io::{Read, Write};
     use std::os::fd::FromRawFd;
     let (mut master_fd, mut slave_fd) = (0, 0);
@@ -5678,7 +5686,7 @@ fn spawn_answering_yes_on_a_pty(cmd: &mut std::process::Command) -> (std::proces
     // when the child (and anything it spawned) exits.
     *cmd = std::process::Command::new("true");
     let mut typing = master.try_clone().unwrap();
-    typing.write_all(b"y\n").expect("answering the confirmation");
+    typing.write_all(typed).expect("answering the confirmation");
     let mut draining = master.try_clone().unwrap();
     std::thread::spawn(move || {
         let mut sink = [0u8; 4096];
@@ -5897,15 +5905,9 @@ fn radio_runs_an_approved_ephemeral_pick() {
     );
 }
 
-/// `review` is the main free-text target and a shell launch never synthesizes
-/// its `diff_file`, so the confirmation has to show the inputs that WILL run
-/// and, with no terminal, say the printed command is not runnable as it stands.
-#[test]
-fn radio_review_pick_shows_the_synthesized_inputs_and_qualifies_the_advice() {
-    let route_port = start_route_decision_stub("review");
-    let home = TempDir::new().unwrap();
-    let flows = TempDir::new().unwrap();
-    let os_home = TempDir::new().unwrap();
+/// A fresh git repo with two commits on `main`, so `review` has a diff to
+/// synthesize inputs from.
+fn two_commit_repo() -> TempDir {
     let repo = TempDir::new().unwrap();
     let git = |args: &[&str]| {
         let out = std::process::Command::new("git").args(args).current_dir(repo.path()).output().expect("git runs");
@@ -5919,11 +5921,26 @@ fn radio_review_pick_shows_the_synthesized_inputs_and_qualifies_the_advice() {
         git(&["add", "-A"]);
         git(&["commit", "-q", "-m", &format!("c{i}")]);
     }
+    repo
+}
+
+/// `review` is the main free-text target and a shell launch never synthesizes
+/// its `diff_file`, so the confirmation has to show the inputs that WILL run
+/// and, with no terminal, say the printed command is not runnable as it stands.
+#[test]
+fn radio_review_pick_shows_the_synthesized_inputs_and_qualifies_the_advice() {
+    let route_port = start_route_decision_stub("review");
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let os_home = TempDir::new().unwrap();
+    let repo = two_commit_repo();
     let profiles_path = home.path().join("profiles.json");
     fs::write(&profiles_path, utility_binding_profiles_json()).unwrap();
+    let tmp = TempDir::new().unwrap();
 
     let output = darkmux_std_cmd()
         .current_dir(repo.path())
+        .env("TMPDIR", tmp.path())
         .env("HOME", os_home.path())
         .env("DARKMUX_HOME", home.path())
         .env("DARKMUX_FLOWS_DIR", flows.path())
@@ -5939,9 +5956,75 @@ fn radio_review_pick_shows_the_synthesized_inputs_and_qualifies_the_advice() {
         assert!(stdout.contains(key), "the confirmation must show `{key}`:\n{stdout}");
     }
     assert!(
-        stdout.contains("diff_file, workspace, head_sha") && stdout.contains("temporary files"),
-        "the advice must say the synthesized values do not outlive the process:\n{stdout}"
+        stdout.contains("diff_file, workspace above name temporary files"),
+        "the advice must say the synthesized FILE values do not outlive the process, and only those:\n{stdout}"
     );
+    assert!(stdout.contains("darkmux mission config show <config>"), "{stdout}");
+    assert_eq!(dir_entries(tmp.path()), Vec::<String>::new(), "the synthesized inputs must be removed on exit");
+}
+
+/// The names in `dir`, sorted (empty when it is empty).
+fn dir_entries(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> =
+        fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    names.sort();
+    names
+}
+
+/// A Ctrl-C at radio's `Run it? [y/N]` prompt must end the prompt at once,
+/// run nothing, and leave no synthesized input behind. The SIGINT handler is
+/// installed with SA_RESTART, so a plain blocking read used to keep waiting
+/// (and a third signal killed the process past every destructor, leaking the
+/// temp dir).
+#[cfg(unix)]
+#[test]
+fn radio_ctrl_c_at_the_prompt_ends_it_promptly_and_removes_the_synthesized_inputs() {
+    let route_port = start_route_decision_stub("review");
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let os_home = TempDir::new().unwrap();
+    let repo = two_commit_repo();
+    let tmp = TempDir::new().unwrap();
+    let profiles_path = home.path().join("profiles.json");
+    fs::write(&profiles_path, utility_binding_profiles_json()).unwrap();
+
+    let mut cmd = darkmux_std_cmd();
+    cmd.current_dir(repo.path())
+        .env("TMPDIR", tmp.path())
+        .env("HOME", os_home.path())
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_PROFILES", &profiles_path)
+        .env("DARKMUX_LMSTUDIO_URL", format!("http://127.0.0.1:{route_port}"))
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args(["radio", "review this branch"]);
+    let (mut child, _pty) = spawn_on_a_pty(&mut cmd, b"");
+
+    // The temp dir appearing means the launch was prepared, so radio is at
+    // (or a moment from) the prompt.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while dir_entries(tmp.path()).is_empty() {
+        assert!(std::time::Instant::now() < deadline, "radio never prepared the review inputs");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let pid = child.id().to_string();
+    assert!(std::process::Command::new("kill").args(["-INT", &pid]).status().unwrap().success());
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("radio was still waiting at the prompt 5s after a SIGINT");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert_eq!(status.code(), Some(1), "an interrupted prompt is not-run, exit 1");
+    assert_eq!(dir_entries(tmp.path()), Vec::<String>::new(), "the synthesized inputs must be removed after an interrupt");
 }
 
 /// (#2917) One LM Studio instance serves one request at a time, so a radio

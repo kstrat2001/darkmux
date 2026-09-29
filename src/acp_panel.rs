@@ -365,14 +365,38 @@ pub fn plan_launch(config_id: &str, rest: &str) -> Result<LaunchPlan> {
     Ok(LaunchPlan { config_id: config_id.to_string(), config: loaded.config, route, params, raw_args: rest.to_string() })
 }
 
-/// Refuse a param whose value holds a control character (an escape sequence
-/// from a router's output would otherwise reach the terminal or the dialog
-/// as one). `Err` names the input.
+/// Whether `c` is an invisible Unicode format character (category Cf), which
+/// `char::is_control` does not cover: bidi overrides and isolates, zero-width
+/// characters, the byte-order mark, and the like. Any of them can make a
+/// printed command read differently from what it holds.
+fn is_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00ad}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061c}'
+            | '\u{06dd}'
+            | '\u{070f}'
+            | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206f}'
+            | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}'
+    )
+}
+
+/// Refuse a param whose value holds a control character or an invisible
+/// format character ([`is_format_char`]): an escape sequence from a router's
+/// output would otherwise reach the terminal or the dialog as one, and a
+/// bidi override would reorder the command the user is asked to confirm.
+/// `Err` names the input.
 fn refuse_control_chars(config_id: &str, params: &[String]) -> Result<()> {
     for param in params {
         let (name, value) = param.split_once('=').unwrap_or((param.as_str(), ""));
-        if value.chars().any(char::is_control) {
-            bail!("the value for `{name}` holds a control character, so `{config_id}` was not launched. Retype the input without it.");
+        if value.chars().any(|c| c.is_control() || is_format_char(c)) {
+            bail!("the value for `{name}` holds a control character or an invisible formatting character, so `{config_id}` was not launched. Retype the input without it.");
         }
     }
     Ok(())
@@ -491,6 +515,14 @@ impl Drop for SynthesizedInputs {
     }
 }
 
+/// The synthesized param that names the diff file.
+const DIFF_FILE_KEY: &str = "diff_file";
+/// The synthesized param that names the workspace spec file.
+const WORKSPACE_KEY: &str = "workspace";
+/// The synthesized params whose values name temporary files (the others,
+/// like `head_sha`, are plain values that outlive the process).
+pub const SYNTHESIZED_FILE_KEYS: [&str; 2] = [DIFF_FILE_KEY, WORKSPACE_KEY];
+
 /// Run `git` in `cwd`, returning trimmed stdout on success.
 fn git_out(cwd: &Path, args: &[&str]) -> Option<String> {
     let out = std::process::Command::new("git").args(args).current_dir(cwd).output().ok()?;
@@ -603,8 +635,8 @@ pub fn synthesize_diff_launch_inputs(config: &MissionConfig, cwd: &Path) -> Resu
         .with_context(|| format!("writing the synthesized workspace spec {}", spec_path.display()))?;
 
     synthesized.params = vec![
-        format!("diff_file={}", diff_path.display()),
-        format!("workspace={}", spec_path.display()),
+        format!("{DIFF_FILE_KEY}={}", diff_path.display()),
+        format!("{WORKSPACE_KEY}={}", spec_path.display()),
         format!("head_sha={head}"),
     ];
     let mut notes: Vec<String> = Vec::new();
@@ -1465,6 +1497,17 @@ pub(crate) mod tests {
         assert!(err.contains("`rules`") && err.contains("control character"), "{err}");
         // The inverse: a plain value plans.
         assert!(plan_launch("review", "rules=a,b").is_ok());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_format_character_in_a_planned_input_is_refused_naming_it() {
+        for (label, ch) in [("bidi override", '\u{202e}'), ("zero-width space", '\u{200b}'), ("BOM", '\u{feff}')] {
+            let err = plan_launch("review", &format!("rules=a{ch}b")).err().unwrap_or_else(|| panic!("{label} accepted")).to_string();
+            assert!(err.contains("`rules`") && err.contains("control character"), "{label}: {err}");
+        }
+        // The inverse: ordinary non-ASCII text plans.
+        assert!(plan_launch("review", "rules=caf\u{e9},\u{65e5}\u{672c}").is_ok());
     }
 
     /// The inverse: quotes outside a declared value are ordinary characters,

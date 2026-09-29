@@ -43,13 +43,15 @@ darkmux release.
   launchable config from free text, so `darkmux radio` prepares the launch's
   inputs first, prints the `darkmux mission launch <id> --param ...` command
   with every param that will run (for `review`, the `diff_file`, `workspace`
-  and `head_sha` it makes from the current directory, which name temporary
-  files), and asks `Run it? [y/N]` before running it. A repo with nothing to
+  and `head_sha` it makes from the current directory; the first two name
+  temporary files, and `head_sha` is a commit hash), and asks `Run it? [y/N]` before running it. A repo with nothing to
   review is reported without asking. With no interactive terminal it prints
   the command, says it was not run and, when inputs were made from the
   current directory, that they are temporary and must be replaced with your
-  own, then exits 1. An interrupt at the prompt runs nothing, even if a `y`
-  follows. A routed input holding a control character is refused. The editor
+  own, then exits 1. An interrupt at the prompt ends it within a moment, runs nothing
+  (even if a `y` follows) and removes the temporary files. A routed input
+  holding a control character or an invisible formatting character (a bidi
+  override, a zero-width space) is refused. The editor
   agent panel does the same for free text (no slash): the pick is shown in a
   code block in the panel's permission dialog, and only Allow runs it; Reject,
   cancel or no answer runs nothing and the panel says "not run". An explicit

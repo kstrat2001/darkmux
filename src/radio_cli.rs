@@ -197,18 +197,22 @@ fn shell_word(word: &str) -> String {
 
 /// What to tell a user who will run a printed command themselves, when some
 /// of its inputs were made from the cwd (see
-/// [`crate::acp_panel::PreparedLaunch::synthesized_keys`]): those values name
+/// [`crate::acp_panel::PreparedLaunch::synthesized_keys`]): the inputs among
+/// them that name files ([`crate::acp_panel::SYNTHESIZED_FILE_KEYS`]) name
 /// temporary files that are gone once this process ends, so the command is
-/// not runnable as printed. `None` when nothing was synthesized.
+/// not runnable as printed. `None` when none of the synthesized inputs is a
+/// file.
 pub(crate) fn synthesized_inputs_advice(keys: &[&str]) -> Option<String> {
-    if keys.is_empty() {
+    let files: Vec<&str> = keys.iter().copied().filter(|k| crate::acp_panel::SYNTHESIZED_FILE_KEYS.contains(k)).collect();
+    if files.is_empty() {
         return None;
     }
+    let example = files.iter().map(|k| format!("`--param {k}=<path>`")).collect::<Vec<_>>().join(" and ");
     Some(format!(
         "The values for {} above name temporary files, removed when this exits, so the command does not run as printed later. \
          To launch it yourself, save the diff and a workspace spec for your checkout to files of your own and pass them as \
-         `--param diff_file=<path>` and `--param workspace=<path>`; `darkmux mission show <id>` lists what each input takes.",
-        keys.join(", ")
+         {example}; `darkmux mission config show <config>` lists what each input takes.",
+        files.join(", ")
     ))
 }
 
@@ -238,6 +242,12 @@ fn confirm_launch<R: std::io::BufRead, W: std::io::Write>(
         }
         return Consent::Unanswered;
     }
+    // A Ctrl-C that landed while the launch was being prepared is honored
+    // here, before a prompt nobody is going to answer.
+    if darkmux_types::interrupt::is_set() {
+        let _ = writeln!(writer, "radio: not run: interrupted.");
+        return Consent::Unanswered;
+    }
     let _ = write!(writer, "Run it? [y/N] ");
     let _ = writer.flush();
     let mut line = String::new();
@@ -259,10 +269,49 @@ fn confirm_launch<R: std::io::BufRead, W: std::io::Write>(
     }
 }
 
+/// How long [`InterruptibleStdin`] waits for input before checking for an
+/// interrupt again.
+const INTERRUPT_POLL_MS: libc::c_int = 100;
+
+/// Stdin that gives up waiting once an interrupt is seen. The SIGINT handler
+/// is installed with `SA_RESTART`, and a plain `read` on a terminal resumes
+/// after it, so a Ctrl-C would leave the prompt waiting (and a third one,
+/// with the default disposition restored, would kill the process before the
+/// launch's temporary inputs are removed). This waits in `poll` in short
+/// slices instead and checks the flag between them. The error it returns is
+/// not `ErrorKind::Interrupted`, which `read_line` would retry.
+struct InterruptibleStdin;
+
+impl std::io::Read for InterruptibleStdin {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if darkmux_types::interrupt::is_set() {
+                return Err(std::io::Error::other("interrupted"));
+            }
+            let mut fds = libc::pollfd { fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0 };
+            // SAFETY: `fds` is one valid pollfd and the count says so.
+            let ready = unsafe { libc::poll(&mut fds, 1, INTERRUPT_POLL_MS) };
+            match ready {
+                0 => continue,
+                n if n > 0 => break,
+                _ => {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() != std::io::ErrorKind::Interrupted {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+        // Readable (a complete line, end of input, or a hangup), so this
+        // does not block.
+        std::io::stdin().lock().read(buf)
+    }
+}
+
 /// [`confirm_launch`] against this process's stdin and stdout.
 fn confirm_on_terminal(command_line: &str, synthesized: &[&str]) -> Consent {
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-    confirm_launch(std::io::BufReader::new(std::io::stdin()), std::io::stdout(), interactive, command_line, synthesized)
+    confirm_launch(std::io::BufReader::new(InterruptibleStdin), std::io::stdout(), interactive, command_line, synthesized)
 }
 
 /// The exit code for a consent that did not approve.
@@ -678,6 +727,30 @@ mod tests {
         let mut plain = Vec::new();
         confirm_launch(std::io::BufReader::new(NoRead), &mut plain, false, line, &[]);
         assert!(!String::from_utf8(plain).unwrap().contains("temporary"));
+    }
+
+    #[test]
+    fn the_advice_names_only_the_file_inputs_and_points_at_the_config_listing() {
+        let advice = synthesized_inputs_advice(&["diff_file", "workspace", "head_sha"]).expect("advice");
+        assert!(advice.contains("diff_file, workspace") && !advice.contains("head_sha"), "{advice}");
+        assert!(advice.contains("darkmux mission config show <config>"), "{advice}");
+        assert!(!advice.contains("mission show"), "{advice}");
+        // The inverse: a commit hash alone names no temporary file.
+        assert_eq!(synthesized_inputs_advice(&["head_sha"]), None);
+        assert_eq!(synthesized_inputs_advice(&[]), None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn an_interrupt_already_seen_before_the_prompt_ends_it_without_asking_or_reading() {
+        darkmux_types::interrupt::reset_for_test();
+        darkmux_types::interrupt::simulate_sigint_for_test();
+        let mut out = Vec::new();
+        let consent = confirm_launch(std::io::BufReader::new(NoRead), &mut out, true, "darkmux mission launch review", &[]);
+        darkmux_types::interrupt::reset_for_test();
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(consent, Consent::Unanswered);
+        assert!(out.contains("interrupted") && !out.contains("[y/N]"), "{out}");
     }
 
     #[test]
