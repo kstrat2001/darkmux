@@ -5188,14 +5188,14 @@
         std::fs::write(prior.path().join(CHECKPOINT_FILENAME), sample_checkpoint_json()).unwrap();
         write_resume_origin_meta(prior.path(), workspace.path(), false, Some("rust:latest"));
 
-        let hint = resume_hint_from_origin(prior.path(), "coder", Some("p-7"));
+        let hint = resume_hint_from_origin(prior.path(), "coder");
         let args = parse_hint_args(&hint);
 
         assert_eq!(args.first().map(String::as_str), Some("darkmux"));
         assert_eq!(args.get(1).map(String::as_str), Some("dispatch"));
         assert_eq!(args.get(2).map(String::as_str), Some("coder"));
         assert_eq!(flag_value(&args, "--image"), Some("rust:latest"), "hint: {hint}");
-        assert_eq!(flag_value(&args, "--phase-id"), Some("p-7"), "hint: {hint}");
+        assert!(!hint.contains("--phase-id"), "the flag was removed (#2954): {hint}");
 
         let resume_from = flag_value(&args, "--resume-from").expect("hint names --resume-from");
         let workdir = flag_value(&args, "--workdir").expect("hint names --workdir");
@@ -5249,7 +5249,7 @@
         std::fs::write(prior.path().join(CHECKPOINT_FILENAME), sample_checkpoint_json()).unwrap();
         write_resume_origin_meta(prior.path(), &ws, false, None);
 
-        let hint = resume_hint_from_origin(prior.path(), "coder", None);
+        let hint = resume_hint_from_origin(prior.path(), "coder");
         let args = parse_hint_args(&hint);
         let workdir = flag_value(&args, "--workdir").expect("hint names --workdir").to_string();
 
@@ -5306,13 +5306,12 @@
         std::fs::write(prior.path().join(CHECKPOINT_FILENAME), sample_checkpoint_json()).unwrap();
         write_resume_origin_meta(prior.path(), workspace.path(), true, None);
 
-        let hint = resume_hint_from_origin(prior.path(), "coder", None);
+        let hint = resume_hint_from_origin(prior.path(), "coder");
         let args = parse_hint_args(&hint);
         assert!(
             args.iter().any(|a| a == "--workspace-read-only"),
             "a read-only origin's hint must carry the flag, or the gate refuses it: {hint}"
         );
-        assert!(!args.iter().any(|a| a == "--phase-id"), "no phase, no flag: {hint}");
         assert!(!args.iter().any(|a| a == "--image"), "no image recorded, no flag: {hint}");
 
         let resume_from = flag_value(&args, "--resume-from").unwrap();
@@ -5364,7 +5363,7 @@
         std::fs::write(prior.path().join(CHECKPOINT_FILENAME), sample_checkpoint_json()).unwrap();
         write_resume_origin_meta(prior.path(), &workspace, false, None);
 
-        let hint = resume_hint_from_origin(prior.path(), "coder", None);
+        let hint = resume_hint_from_origin(prior.path(), "coder");
         assert!(hint.contains("'"), "a path with a space must be quoted: {hint}");
         let args = parse_hint_args(&hint);
         let workdir = flag_value(&args, "--workdir").unwrap();
@@ -5384,7 +5383,7 @@
     #[test]
     fn the_hint_says_so_plainly_when_no_resume_is_possible() {
         let prior = TempDir::new().unwrap(); // no resume_origin.json
-        let hint = resume_hint_from_origin(prior.path(), "coder", None);
+        let hint = resume_hint_from_origin(prior.path(), "coder");
         assert!(!hint.contains("darkmux dispatch"), "must not print an unusable command: {hint}");
         assert!(hint.contains("RESUME ORIGIN UNKNOWN"), "{hint}");
     }

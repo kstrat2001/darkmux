@@ -229,7 +229,6 @@ fn mission_status_str(s: MissionStatus) -> &'static str {
         MissionStatus::Active => "active",
         MissionStatus::Finalized => "finalized",
         MissionStatus::Aborted => "aborted",
-        MissionStatus::Paused => "paused",
     }
 }
 

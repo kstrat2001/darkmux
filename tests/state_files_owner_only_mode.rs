@@ -218,8 +218,8 @@ fn lifecycle_save_json_is_owner_only_mode() {
     // Drive lifecycle::save_json through a real CLI verb. Every verb that
     // lands on save_json with no other dependencies needs a live model,
     // so: pre-stage a mission file with default umask, then call
-    // `darkmux mission start <id>`, which goes through save_json + flips
-    // status to active.
+    // `darkmux mission abort <id>`, which goes through save_json + flips
+    // status to aborted.
     with_home(|home| {
         let mission_id = "test-mission-e11";
         let mission_dir = home.join(".darkmux").join("missions").join(mission_id);
@@ -229,9 +229,8 @@ fn lifecycle_save_json_is_owner_only_mode() {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        // Active + started_ts=None — `mission start` will rewrite via
-        // save_json. (Active+started bails; Closed bails; Paused
-        // routes to a different verb.)
+        // Active with no phases — `mission abort` rewrites it via
+        // save_json. (A terminal mission bails.)
         let body = serde_json::json!({
             "id": mission_id,
             "description": "e11 mode test",
@@ -249,19 +248,19 @@ fn lifecycle_save_json_is_owner_only_mode() {
             "staged fixture is already 0o600 (umask is restrictive?); test would pass for the wrong reason"
         );
 
-        // Trigger save_json via mission start.
+        // Trigger save_json via mission abort.
         let out = darkmux_cmd(home)
-            .args(["mission", "start", mission_id])
+            .args(["mission", "abort", mission_id])
             .output()
-            .expect("running `darkmux mission start`");
-        // We don't insist on success — mission start may bail on
+            .expect("running `darkmux mission abort`");
+        // We don't insist on success — mission abort may bail on
         // missing state in this isolated env. What we care about is
         // whether save_json fired AND set the mode. If the file mode
         // is still pre_mode, save_json didn't run; that's a setup
         // miss, not the bug we're testing for.
         if !out.status.success() {
             eprintln!(
-                "mission start failed (expected in isolated env); stdout={} stderr={}",
+                "mission abort failed (expected in isolated env); stdout={} stderr={}",
                 String::from_utf8_lossy(&out.stdout),
                 String::from_utf8_lossy(&out.stderr),
             );

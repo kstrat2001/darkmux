@@ -88,6 +88,19 @@ retired_actions! {
     MissionCompileError => "mission.compile.error";
     /// Terminal-mission reopen (#1284), retired in #1503.
     MissionReopen => "mission reopen";
+    /// The retired `mission pause` / `mission resume` / `add-phase` verbs
+    /// (#2954), in the dotted spelling and the pre-4.0 spaced ones. The
+    /// verbs only flipped a status label, and nothing emits these now.
+    // drift-guard:allow mission pause — the archived spelling, read only
+    MissionPause => "mission.pause";
+    // drift-guard:allow mission pause — the archived spelling, read only
+    MissionPauseSpaced => "mission pause";
+    MissionResume => "mission.resume";
+    // drift-guard:allow mission resume — the archived spelling, read only
+    MissionResumeSpaced => "mission resume";
+    PhaseAdded => "phase.added";
+    PhaseAddedSpaced => "phase added";
+    PhaseAddedSprintSpaced => "sprint added";
     /// The literal crawl launcher's records, retired with it (#2301).
     CrawlFinding => "crawl.finding";
     CrawlMissionStarted => "crawl.mission.started";
@@ -118,8 +131,6 @@ pub const OLD_SPELLINGS: &[(&str, FlowAction)] = &[
     ("sprint complete", FlowAction::PhaseComplete),
     ("phase abandon", FlowAction::PhaseAbandon),
     ("sprint abandon", FlowAction::PhaseAbandon),
-    ("phase added", FlowAction::PhaseAdded),
-    ("sprint added", FlowAction::PhaseAdded),
     ("ambiguous-phase-id", FlowAction::PhaseIdAmbiguous),
     ("phase review begin", FlowAction::PhaseReviewBegin),
     ("sprint review begin", FlowAction::PhaseReviewBegin),
@@ -129,8 +140,6 @@ pub const OLD_SPELLINGS: &[(&str, FlowAction)] = &[
     ("mission start", FlowAction::MissionStart),
     ("mission close", FlowAction::MissionClose),
     ("mission abort", FlowAction::MissionAbort),
-    ("mission pause", FlowAction::MissionPause),
-    ("mission resume", FlowAction::MissionResume),
     ("tier-decision", FlowAction::TierDecision),
     ("note", FlowAction::OperatorNote),
     ("catch", FlowAction::OperatorCatch),

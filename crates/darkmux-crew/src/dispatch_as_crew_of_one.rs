@@ -349,7 +349,6 @@ fn build_graph(opts: &DispatchOpts, mission_id: &str) -> (Mission, Phase, Task, 
         created_ts: now,
         started_ts: None,
         finalized_ts: None,
-        paused_ts: None,
         source_input: None,
         ticket: None,
         spec: Some(MissionSpec {
@@ -403,15 +402,6 @@ fn build_graph(opts: &DispatchOpts, mission_id: &str) -> (Mission, Phase, Task, 
         "json": opts.json,
         "preserve_dispatch_result": true,
     });
-    // `opts.phase_id` is a DIFFERENT concept from this graph's own `phase_id`
-    // above — it's the CLI's `--phase-id` flag, an operator-named EXTERNAL
-    // mission phase this dispatch's flow records should attribute to (see
-    // `DispatchOpts::phase_id`'s doc). Only set the key when present, so
-    // `DispatchInternalStepKind`'s `config_str(step, "phase_id")` reads
-    // `None` exactly like the pre-#1509 CLI's `opts.phase_id: None` default.
-    if let Some(external_phase_id) = &opts.phase_id {
-        config["phase_id"] = serde_json::Value::String(external_phase_id.clone());
-    }
     if let Some(max_tokens) = opts.max_completion_tokens {
         config["max_completion_tokens"] = serde_json::Value::from(max_tokens);
     }
@@ -1075,24 +1065,9 @@ mod tests {
 
     #[serial_test::serial]
     #[test]
-    fn build_graph_external_phase_id_is_a_separate_concept_from_the_graphs_own_phase() {
-        // `opts.phase_id` (the CLI's `--phase-id`, external mission-phase
-        // attribution) must land in `Step.config["phase_id"]` — a DIFFERENT
-        // string from this graph's OWN minted phase id (`task.phase_id`).
-        let mut opts = test_opts("coder", "hi");
-        opts.phase_id = Some("some-other-mission-phase".to_string());
-        let (_, phase, task, step) = build_graph(&opts, "dispatch-coder-1-abc");
-
-        assert_eq!(step.config["phase_id"], "some-other-mission-phase");
-        assert_eq!(task.phase_id, phase.id);
-        assert_ne!(task.phase_id, "some-other-mission-phase");
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn build_graph_omits_phase_id_key_when_the_cli_flag_is_unset() {
-        // Matches the pre-#1509 `DispatchOpts.phase_id: None` default —
-        // `config_str(step, "phase_id")` must read `None`, not `Some("")`.
+    fn build_graph_carries_no_phase_id_key() {
+        // The graph's own phase is the only phase a crew-of-one dispatch
+        // has: `config_str(step, "phase_id")` must read `None`, not `Some("")`.
         let opts = test_opts("coder", "hi");
         let (_, _, _, step) = build_graph(&opts, "dispatch-coder-1-abc");
         assert!(step.config.get("phase_id").is_none());

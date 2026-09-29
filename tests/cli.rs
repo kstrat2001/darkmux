@@ -931,40 +931,82 @@ fn lab_loop_rejects_an_out_of_range_compact_threshold_ratio() {
         .stderr(predicate::str::contains("--compact-threshold-ratio 5 is out of range"));
 }
 
-// `mission dispatch` names an unknown mission and points at `mission
-// launch`, and rejects an id outside the identifier charset, both before
-// any fan-out. Runs without Redis or a model (the redis e2e twin of the
-// charset check skips on CI runners with no redis-server, #2938).
+/// (#2954) 4.0 retired the hand-built mission verbs with no alias: missions
+/// come only from mission configs (`mission launch`). Each old spelling is
+/// refused by name, exit 2, with the line naming its replacement; a wrong
+/// argument count or an unknown id never gets past the refusal, because the
+/// verb itself is gone.
 #[test]
-fn mission_dispatch_names_an_unknown_mission_and_how_to_create_one() {
-    darkmux_cmd()
-        .args(["mission", "dispatch", "no-such-mission", "--role", "coder", "--machine", "studio"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("mission `no-such-mission` not found"))
-        .stderr(predicate::str::contains("darkmux mission launch <config-id>"));
+fn retired_mission_verbs_are_refused_naming_the_replacement() {
+    let cases: [(&[&str], &str, &[&str]); 6] = [
+        (
+            &["mission", "dispatch", "m1", "--role", "coder", "--machine", "studio"],
+            "darkmux mission dispatch",
+            &["--profile <profile>@<machine>", "darkmux mission launch <config>"],
+        ),
+        (
+            &["mission", "add-phase", "m1", "--phase-id", "p2", "--description", "x"],
+            "darkmux mission add-phase",
+            &["darkmux mission launch <config>"],
+        ),
+        (&["mission", "start", "m1"], "darkmux mission start", &["darkmux mission launch <config>"]),
+        (&["mission", "pause", "m1"], "darkmux mission pause", &["darkmux mission abort <id>"]),
+        (&["mission", "resume", "m1"], "darkmux mission resume", &["darkmux mission finalize <id>"]),
+        (
+            &["dispatch", "coder", "hello", "--phase-id", "p1"],
+            "darkmux dispatch --phase-id",
+            &["darkmux mission launch <config>"],
+        ),
+    ];
+    for (args, named, remedies) in cases {
+        let mut assert = darkmux_cmd()
+            .args(args)
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains(format!("`{named}` was removed in 4.0")));
+        for remedy in remedies {
+            assert = assert.stderr(predicate::str::contains(*remedy));
+        }
+    }
 }
 
-// (#2916) The shared fleet work queue is retired, so a phase goes to one
-// named machine: `mission dispatch` with no `--machine` refuses and says how
-// to run the phase here instead.
+/// (#2954) The `--phase-id=<id>` spelling is the same retired flag.
 #[test]
-fn mission_dispatch_without_a_machine_names_the_retired_queue_and_the_local_alternative() {
+fn retired_dispatch_phase_id_equals_spelling_is_refused() {
     darkmux_cmd()
-        .args(["mission", "dispatch", "some-mission", "--role", "coder"])
+        .args(["dispatch", "coder", "hello", "--phase-id=p1"])
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("mission dispatch needs --machine <id>"))
-        .stderr(predicate::str::contains("--phase-id <phase>"));
+        .code(2)
+        .stderr(predicate::str::contains("`darkmux dispatch --phase-id` was removed in 4.0"));
 }
 
+/// (#2954) A non-UTF-8 argument alongside a bad flag is clap's usage error
+/// (exit 2), never a panic (101) from decoding argv.
+#[cfg(unix)]
 #[test]
-fn mission_dispatch_rejects_a_mission_id_outside_the_charset() {
+fn a_non_utf8_argument_with_a_bad_flag_is_a_usage_error_not_a_panic() {
+    use std::os::unix::ffi::OsStrExt;
+    let bad = std::ffi::OsStr::from_bytes(b"m\xff");
     darkmux_cmd()
-        .args(["mission", "dispatch", "../evil", "--role", "coder"])
+        .arg("dispatch")
+        .arg("coder")
+        .arg(bad)
+        .arg("--bogus")
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("mission_id contains invalid char"));
+        .code(2)
+        .stderr(predicate::str::contains("panicked").not());
+}
+
+/// (#2954) The inverse: an unknown verb that was never darkmux's keeps clap's
+/// own error, so the refusal table never shadows a typo with a wrong remedy.
+#[test]
+fn an_unknown_mission_verb_that_was_never_retired_keeps_clap_s_error() {
+    darkmux_cmd()
+        .args(["mission", "frobnicate", "m1"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("unrecognized subcommand"))
+        .stderr(predicate::str::contains("was removed in 4.0").not());
 }
 
 #[test]
@@ -1269,8 +1311,7 @@ fn retired_mission_run_subverb_is_unknown() {
 /// (#1463) The `phase` top-level verb family retired ENTIRELY: `estimate` +
 /// `review` + the `start`/`complete`/`abandon` lifecycle trio. Every spelling —
 /// the bare family and each old sub-verb — is now an unknown TOP-LEVEL verb with
-/// no compat alias (pre-2.0 clean removal). (`mission add-phase` is a DIFFERENT,
-/// surviving verb — it is NOT `darkmux phase`; see the mission-surface test.)
+/// no compat alias (pre-2.0 clean removal).
 #[test]
 fn retired_phase_family_is_unknown_entirely() {
     for args in [
@@ -1311,13 +1352,14 @@ fn retired_mission_ship_and_close_subverbs_are_unknown() {
     }
 }
 
-/// (#1463) The replacement surface EXISTS: the `mission` family lists `finalize`
-/// and `abort` (the two whole-mission terminals) and keeps `add-phase`, while
-/// `ship`/`close` are gone. Proves the rename landed — a change that dropped
-/// `finalize` or re-added `ship`/`close` can't pass both this and the
-/// retirement test above.
+/// (#1463, #2954) The replacement surface EXISTS: the `mission` family lists
+/// `launch` and the two whole-mission terminals `finalize` and `abort`, while
+/// `ship`/`close` (#1463) and the hand-built verbs `add-phase`/`dispatch`/
+/// `start`/`pause`/`resume` (#2954) are gone. A change that dropped a
+/// terminal or re-added a retired verb can't pass both this and the
+/// retirement tests above.
 #[test]
-fn mission_family_has_finalize_abort_addphase_but_not_ship_close() {
+fn mission_family_has_launch_finalize_abort_but_no_retired_verb() {
     let out = darkmux_cmd()
         .args(["mission", "--help"])
         .output()
@@ -1346,16 +1388,16 @@ fn mission_family_has_finalize_abort_addphase_but_not_ship_close() {
             }
         }
     }
-    for present in ["finalize", "abort", "add-phase"] {
+    for present in ["launch", "finalize", "abort"] {
         assert!(
             verbs.iter().any(|v| v == present),
-            "mission help must list `{present}` (#1463); parsed verbs: {verbs:?}"
+            "mission help must list `{present}`; parsed verbs: {verbs:?}"
         );
     }
-    for gone in ["ship", "close"] {
+    for gone in ["ship", "close", "add-phase", "dispatch", "start", "pause", "resume"] {
         assert!(
             !verbs.iter().any(|v| v == gone),
-            "the `mission {gone}` verb must stay retired (#1463); parsed verbs: {verbs:?}"
+            "the `mission {gone}` verb must stay retired; parsed verbs: {verbs:?}"
         );
     }
 }
@@ -4168,7 +4210,6 @@ fn serve_sigterm_reaps_the_fleet_runners_curl_child() {
             "dialectic-judge",
             "cli-test-serve-sigterm-session",
         ),
-        None,
         None,
         None,
         None,
@@ -9234,83 +9275,49 @@ fn board_drift_kinds(home: &std::path::Path, flows: &std::path::Path, id: &str) 
         .collect()
 }
 
-/// (#2682 round 4) The one family where the BOARD was right and `darkmux
-/// run list` was wrong: a Paused mission whose dispatch session carried a
-/// `session.end`. #1642 already ruled that a paused mission must never
-/// decay into `Abandoned`, but its early-return sat BELOW the all-terminal
-/// branch, so the exemption leaked. The surfaces now agree.
-///
-/// NOT vacuous, and the second half is what proves it: the byte-identical
-/// fixture with `status: "active"` must still read `abandoned`. So the
-/// first half measures the pause exemption, not a fixture that was never
-/// near the boundary.
+/// A `mission.json` an older binary left at `"status": "paused"` is an
+/// ordinary open mission now: `darkmux run list` and the board both read it
+/// as `Active`, so a recorded `session.end` on its dispatch reads
+/// `abandoned` and the board names it, exactly as for an `active` mission.
 #[test]
-fn run_list_does_not_call_a_paused_mission_abandoned_from_a_recorded_session_end() {
-    let write_end_record = |flows: &std::path::Path, mission_id: &str| {
-        let day = darkmux_flow::day_utc_now();
-        fs::write(
-            flows.join(format!("{day}.jsonl")),
-            serde_json::json!({
-                "ts": "2024-01-01T09:00:00Z",
-                "action": "session.end",
-                "session_id": format!("{mission_id}-sess"),
-                "mission_id": mission_id,
-                "handle": "coder",
-            })
-            .to_string()
-                + "\n",
-        )
-        .unwrap();
-    };
+fn a_legacy_paused_mission_reads_as_active_on_run_list_and_the_board() {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-
     let home = TempDir::new().unwrap();
     let flows = TempDir::new().unwrap();
     write_mission_with_phases(
         home.path(),
-        "paused-end-e2e",
+        "legacy-paused-e2e",
         "paused",
         &[("p1", "running")],
         now - 25 * 60,
     );
-    write_end_record(flows.path(), "paused-end-e2e");
+    let day = darkmux_flow::day_utc_now();
+    fs::write(
+        flows.path().join(format!("{day}.jsonl")),
+        serde_json::json!({
+            "ts": "2024-01-01T09:00:00Z",
+            "action": "session.end",
+            "session_id": "legacy-paused-e2e-sess",
+            "mission_id": "legacy-paused-e2e",
+            "handle": "coder",
+        })
+        .to_string()
+            + "\n",
+    )
+    .unwrap();
     assert_eq!(
-        run_list_status(home.path(), flows.path(), "paused-end-e2e"),
-        "running",
-        "a paused mission must not read abandoned — `mission pause` never touches a process, so \
-         its dispatch not being alive is the expected state"
-    );
-    assert!(
-        board_drift_kinds(home.path(), flows.path(), "paused-end-e2e").is_empty(),
-        "and the board, which was already right, must not have gained a drift for it"
-    );
-
-    // The boundary control: the SAME records under an ACTIVE mission still
-    // read abandoned, and the board still names it. Without this the
-    // assertion above would pass with the whole recorded-end branch deleted.
-    let home2 = TempDir::new().unwrap();
-    let flows2 = TempDir::new().unwrap();
-    write_mission_with_phases(
-        home2.path(),
-        "paused-end-e2e",
-        "active",
-        &[("p1", "running")],
-        now - 25 * 60,
-    );
-    write_end_record(flows2.path(), "paused-end-e2e");
-    assert_eq!(
-        run_list_status(home2.path(), flows2.path(), "paused-end-e2e"),
+        run_list_status(home.path(), flows.path(), "legacy-paused-e2e"),
         "abandoned",
-        "the pause exemption must not disable the recorded-end verdict for an Active mission"
+        "a legacy paused mission is Active, so its recorded session end reads abandoned"
     );
     assert!(
-        board_drift_kinds(home2.path(), flows2.path(), "paused-end-e2e")
+        board_drift_kinds(home.path(), flows.path(), "legacy-paused-e2e")
             .iter()
             .any(|k| k == "running-phase-session-dead"),
-        "…and #2689's rule must still fire there"
+        "and the board names the dead session as it does for an active mission"
     );
 }
 

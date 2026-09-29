@@ -639,8 +639,6 @@ const STATUS_ACTIONS: ReadonlyMap<NormAction, string> = new Map<NormAction, stri
   [ACTION.PhaseAbandon, "abandoned"],
   [ACTION.MissionStart, "active"],
   [ACTION.MissionClose, "finalized"],
-  [ACTION.MissionPause, "paused"],
-  [ACTION.MissionResume, "active"],
   [ACTION.MissionAbort, "aborted"],
 ]);
 

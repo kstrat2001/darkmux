@@ -16,6 +16,26 @@ darkmux release.
 
 ### Removed (breaking, 4.0)
 
+- **`darkmux mission dispatch` and the hand-built mission verbs** (#2954).
+  Missions now come only from mission configs. Removed with no alias:
+  `mission dispatch`, `mission add-phase`, `mission start`,
+  `mission pause`, `mission resume`, and `dispatch --phase-id`. Each now
+  exits 2 with a line naming its replacement. `WorkJob.phase_id` is gone
+  from the work-submission wire (WORK_JOB 7 to 8), so a v7 sender gets the
+  version remedy. **Migration:** to run a role on another machine,
+  `darkmux dispatch <role> "<message>" --profile <profile>@<machine>
+  [--no-wait]`; to run a mission, write or edit its config and
+  `darkmux mission launch <config>` (it starts the mission it creates);
+  end it with `mission finalize <id>` or `mission abort <id>`. Growing a
+  running mission by hand, and pausing one, have no replacement. Routing a
+  mission's own steps to another machine comes back as a step-staffing
+  feature, not as a verb.
+- **The `paused` mission status and the `mission.pause`, `mission.resume` and
+  `phase.added` flow actions** (#2954). Nothing writes them any more. A
+  `mission.json` that says `"status": "paused"` still loads and reads as
+  `active` (a leftover `paused_ts` is ignored), and the three actions read
+  from an archive as retired. **Migration:** none; the mission board and
+  `run list` no longer show a `paused` group.
 - **The fleet page's orchestrator note** (#2983): the "Orchestrator note:"
   line under the token panel, its `history →` list, and the stock sentence
   it showed when no note existed. The panel is one line shorter; nothing

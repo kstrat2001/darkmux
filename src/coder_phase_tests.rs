@@ -1331,7 +1331,6 @@ edit loop detected on src/widget.rs in an earlier dispatch
             created_ts: 0,
             started_ts: None,
             finalized_ts: None,
-            paused_ts: None,
             source_input: None,
             ticket: None,
             spec: None,

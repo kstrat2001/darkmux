@@ -1,12 +1,11 @@
 //! Phase + Mission lifecycle transitions (#95).
 //!
 //! Phase/Mission state lives in JSON files under `<crew_root>/phases/<id>.json`
-//! and `<crew_root>/missions/<id>.json` respectively. This module provides the
-//! operator-facing verbs that transition status + timestamp those entities:
-//!
-//! - `phase start <id>` / `phase complete <id>` / `phase abandon <id>`
-//! - `mission start <id>` / `mission close <id>` / `mission pause <id>` /
-//!   `mission resume <id>`
+//! and `<crew_root>/missions/<id>.json` respectively. This module transitions
+//! status + timestamps on those entities. The drivers are `mission launch`,
+//! the crew-of-one dispatch path, and the `mission finalize` / `mission abort`
+//! terminals; no verb moves a phase or starts, pauses or resumes a mission by
+//! hand (#2954).
 //!
 //! Each transition does three things in order:
 //!
@@ -21,11 +20,9 @@
 //! a record never blocks the state transition. The JSON source-of-truth is
 //! the authority; the activity stream is observability.
 //!
-//! Operator-sovereignty: nothing auto-transitions. A phase stays `Running`
-//! forever until the operator runs `complete` or `abandon`. The wall-clock
-//! UI (consuming this data via Track B's API exposure) renders an unbounded
-//! sweep on stale `Running` phases — clearly-wrong-looking signals that
-//! the operator forgot to close one. By design.
+//! Nothing auto-transitions a phase to a terminal state behind the driver's
+//! back: a phase stays `Running` until its driver (or a mission terminal)
+//! completes or abandons it.
 //!
 //! State machines:
 //!
@@ -43,19 +40,11 @@
 //!   This is the only transition that clears a `*_ts` field.
 //!
 //! Mission:
-//!   | from        | start             | close                | pause                 | resume                |
-//!   |-------------|-------------------|----------------------|-----------------------|------------------------|
-//!   | `Active`    | error if          | → Finalized ✓        | → Paused ✓            | error: already Active |
-//!   |             | started_ts set ²  |                      |                       |                        |
-//!   | `Paused`    | error: use resume | → Finalized ✓        | error: already Paused | → Active ³            |
-//!   | `Finalized` | error: terminal   | error: already       | error: terminal       | error: terminal       |
-//!
-//! ² `mission_start` requires a fresh start — it stamps `started_ts=now()`
-//!   on first invocation and errors thereafter. Use `mission resume` to
-//!   come out of a paused state; use neither to keep a still-Active
-//!   mission running.
-//! ³ Resume does NOT clear `paused_ts` — operator may want to see when
-//!   the most recent pause occurred even after resuming.
+//!   | from        | start             | close                |
+//!   |-------------|-------------------|----------------------|
+//!   | `Active`    | error if          | → Finalized ✓        |
+//!   |             | started_ts set    |                      |
+//!   | `Finalized` | error: terminal   | error: already       |
 //!
 //! `Finalized` has no transition back to `Active` today — `mission_reopen`
 //! (#1372) once provided one for `mission_launch`'s implicit relaunch-by-
@@ -66,10 +55,8 @@
 //! human-operator-facing `darkmux mission reopen` verb — out of scope here,
 //! same as before.
 //!
-//! Missions have no `created_ts → started_ts` distinction at creation
-//! time; `start` is the explicit "this mission is now being worked on"
-//! transition, not "this mission exists." That's why creation alone
-//! leaves `started_ts: None`.
+//! A mission is created without `started_ts`; `mission_start_with_reasoning`
+//! is the explicit "this mission is now being worked on" transition.
 
 use crate::loader::load_phases;
 use crate::types::{Mission, MissionStatus, NodeStatus, Phase, PhaseStatus};
@@ -577,25 +564,6 @@ fn emit_phase_transition_record(phase_id: &str, mission_id: &str, action: darkmu
     });
 }
 
-#[allow(dead_code)]
-// Kept for back-compat + test ergonomics; CLI path uses
-// `emit_mission_transition_record_with_reasoning` directly.
-fn emit_mission_transition_record(mission_id: &str, action: darkmux_flow::FlowAction) {
-    emit_mission_transition_record_with_reasoning(mission_id, action, None);
-}
-
-/// Reasoning-aware variant. Optional operator-supplied prose explains
-/// *why* the mission transition happened — populates the audit substrate's
-/// WHY layer for lifecycle events, parallel to tier-decision records
-/// for routing events (#136).
-fn emit_mission_transition_record_with_reasoning(
-    mission_id: &str,
-    action: darkmux_flow::FlowAction,
-    reasoning: Option<&str>,
-) {
-    emit_mission_transition_record_with_reasoning_and_payload(mission_id, action, reasoning, None);
-}
-
 /// (#1959) Payload-carrying variant — lets a caller that mints a mission
 /// with its own numbers (the crawl launcher's `workspace`/`units_in_plan`/
 /// `units_selected`/`est_tokens`/`sources` on start;
@@ -617,34 +585,6 @@ fn emit_mission_transition_record_with_reasoning_and_payload(
         reasoning: reasoning.map(String::from),
         payload,
         ..FlowRecord::for_session(&session, Level::Info, Category::Work, Stage::Scope, action, mission_id.to_string())
-    });
-}
-
-/// Distinct from `emit_phase_transition_record` (which uses
-/// `source: phase_lifecycle` for status flips on an already-tracked
-/// phase). This one fires when the *mission's shape* changes — a
-/// new phase joining the plan — so the `source` field reflects that
-/// the change came from the mission_lifecycle surface even though the
-/// `handle` is the new phase id.
-#[allow(dead_code)]
-// Kept for back-compat + test ergonomics; CLI path uses
-// `emit_phase_added_record_with_reasoning` directly.
-fn emit_phase_added_record(phase_id: &str, mission_id: &str) {
-    emit_phase_added_record_with_reasoning(phase_id, mission_id, None);
-}
-
-fn emit_phase_added_record_with_reasoning(
-    phase_id: &str,
-    mission_id: &str,
-    reasoning: Option<&str>,
-) {
-    let Some(session) = mission_session(mission_id) else { return };
-    let _ = flow::record(FlowRecord {
-        tier: Tier::Operator,
-        phase_id: Some(phase_id.to_string()),
-        source: Some("mission_lifecycle".to_string()),
-        reasoning: reasoning.map(String::from),
-        ..FlowRecord::for_session(&session, Level::Info, Category::Work, Stage::Scope, darkmux_flow::FlowAction::PhaseAdded, phase_id.to_string())
     });
 }
 
@@ -963,7 +903,7 @@ fn phase_start_impl(id: &str, refuse_terminal_mission: bool) -> Result<Phase> {
                     phase.mission_id,
                     mission.status
                 ),
-                MissionStatus::Active | MissionStatus::Paused => {}
+                MissionStatus::Active => {}
             }
         }
     }
@@ -1030,21 +970,10 @@ pub fn phase_abandon(id: &str) -> Result<Phase> {
 
 // ─── Mission transitions ───────────────────────────────────────────────
 
-/// `mission start <id>` — the explicit "begin working on this mission" verb.
-/// Requires a fresh start: errors when `started_ts` is already set (the
-/// mission has been started before). Sets `started_ts = now()` on success.
-///
-/// This is NOT idempotent — calling it twice raises an error. The reason:
-/// `started_ts` should reflect a single ground-truth instant; overwriting
-/// it on every call would erase the start time the operator presumably
-/// cares about. To restart a Paused mission, use `mission resume`. To
-/// continue an already-running mission, do nothing (status is preserved
-/// across other lifecycle operations).
-#[allow(dead_code)]
-pub fn mission_start(id: &str) -> Result<Mission> {
-    mission_start_with_reasoning(id, None)
-}
-
+/// Begin a mission: stamps `started_ts = now()`. NOT idempotent: an already
+/// started or terminal mission errors, so `started_ts` stays the one
+/// ground-truth instant. Callers: `mission launch` and the crew-of-one
+/// dispatch path.
 pub fn mission_start_with_reasoning(id: &str, reasoning: Option<&str>) -> Result<Mission> {
     mission_start_with_reasoning_and_payload(id, reasoning, None)
 }
@@ -1062,7 +991,6 @@ pub fn mission_start_with_reasoning_and_payload(
         MissionStatus::Active if mission.started_ts.is_some() => {
             bail!("mission `{id}` is already Active and was started at ts={:?}", mission.started_ts)
         }
-        MissionStatus::Paused => bail!("mission `{id}` is Paused — use `mission resume` instead"),
         MissionStatus::Finalized | MissionStatus::Aborted => {
             bail!("mission `{id}` is terminal ({:?}) — create a new mission instead", mission.status)
         }
@@ -1073,12 +1001,6 @@ pub fn mission_start_with_reasoning_and_payload(
     save_json(&mission_path(id), &mission)?;
     emit_mission_transition_record_with_reasoning_and_payload(id, darkmux_flow::FlowAction::MissionStart, reasoning, payload);
     Ok(mission)
-}
-
-/// `mission close <id>` — Active/Paused → Finalized (terminal).
-#[allow(dead_code)]
-pub(crate) fn mission_close(id: &str) -> Result<Mission> {
-    mission_close_with_reasoning(id, None)
 }
 
 /// (#1504) Reconciles every non-terminal Phase belonging to this mission to
@@ -1125,7 +1047,7 @@ pub fn mission_terminal_with_reasoning_and_payload(
     );
     let mut mission = load_mission(id)?;
     match mission.status {
-        MissionStatus::Active | MissionStatus::Paused => {}
+        MissionStatus::Active => {}
         MissionStatus::Finalized => bail!("mission `{id}` is already Finalized"),
         MissionStatus::Aborted => bail!("mission `{id}` is already Aborted"),
     }
@@ -1145,51 +1067,6 @@ pub fn mission_terminal_with_reasoning_and_payload(
     Ok(mission)
 }
 
-/// `mission pause <id>` — Active → Paused. Updates `paused_ts` to now even
-/// if a prior pause was recorded (operator gets the most-recent pause time).
-#[allow(dead_code)]
-pub(crate) fn mission_pause(id: &str) -> Result<Mission> {
-    mission_pause_with_reasoning(id, None)
-}
-
-pub fn mission_pause_with_reasoning(id: &str, reasoning: Option<&str>) -> Result<Mission> {
-    let mut mission = load_mission(id)?;
-    match mission.status {
-        MissionStatus::Active => {}
-        MissionStatus::Paused => bail!("mission `{id}` is already Paused"),
-        MissionStatus::Finalized | MissionStatus::Aborted => {
-            bail!("mission `{id}` is terminal ({:?}) — can't pause a finished mission", mission.status)
-        }
-    }
-    mission.status = MissionStatus::Paused;
-    mission.paused_ts = Some(now_unix());
-    save_json(&mission_path(id), &mission)?;
-    emit_mission_transition_record_with_reasoning(id, darkmux_flow::FlowAction::MissionPause, reasoning);
-    Ok(mission)
-}
-
-/// `mission resume <id>` — Paused → Active. Does NOT clear `paused_ts` —
-/// the operator may want to see how long the mission was paused.
-#[allow(dead_code)]
-pub(crate) fn mission_resume(id: &str) -> Result<Mission> {
-    mission_resume_with_reasoning(id, None)
-}
-
-pub fn mission_resume_with_reasoning(id: &str, reasoning: Option<&str>) -> Result<Mission> {
-    let mut mission = load_mission(id)?;
-    match mission.status {
-        MissionStatus::Paused => {}
-        MissionStatus::Active => bail!("mission `{id}` is already Active"),
-        MissionStatus::Finalized | MissionStatus::Aborted => {
-            bail!("mission `{id}` is terminal ({:?}) — can't resume a finished mission", mission.status)
-        }
-    }
-    mission.status = MissionStatus::Active;
-    save_json(&mission_path(id), &mission)?;
-    emit_mission_transition_record_with_reasoning(id, darkmux_flow::FlowAction::MissionResume, reasoning);
-    Ok(mission)
-}
-
 // (#1503) `mission_reopen_with_reasoning` (Finalized → Active, #1372) is
 // removed. Its only caller was `mission_launch::ensure_mission_and_phases_
 // with_provenance`'s Finalized→reopen branch, which existed to service the
@@ -1202,168 +1079,12 @@ pub fn mission_resume_with_reasoning(id: &str, reasoning: Option<&str>) -> Resul
 // NAMED run id on purpose) remains a legitimate future feature — out of
 // scope here — and would reintroduce this same state transition when built.
 
-// ─── Mission scope growth ──────────────────────────────────────────────
-
-/// `mission add-phase` — operator-sovereign scope growth (#107).
-///
-/// Adds a new Phase to an existing Mission mid-flight. The alternative
-/// today is one of: (a) hand-edit the Mission JSON to append a phase id
-/// and hand-author a new Phase JSON, (b) create a separate Mission that
-/// loses the *"this composes with what we're already doing"* signal, or
-/// (c) leave the discovery as a GH issue with no Mission/Phase
-/// representation. None reflect how engineering work actually evolves
-/// during a phase.
-///
-/// Behavior:
-///   - Writes a new Phase JSON at `<crew_root>/phases/<phase-id>.json`
-///     with `status: Planned`, `mission_id`, `description`,
-///     `created_ts: now()`.
-///   - Inserts the phase id into the Mission's `phase_ids` array at
-///     `after`'s position (or appends — see `resolve_insert_position`),
-///     atomic write per the existing `save_json` semantics. (#1341)
-///     Phases are strictly linear — list POSITION is the only ordering;
-///     there is no separate dependency declaration.
-///   - Emits a `phase added` flow record (tier=operator, source=
-///     mission_lifecycle) so the addition is observable in the viewer.
-///
-/// Idempotent on EXACT match: re-adding a phase with the same id +
-/// mission + description is a no-op (no error). The phase_ids array
-/// gets the phase appended if it had drifted off (defensive). Non-
-/// matching descriptions error — we don't silently overwrite operator
-/// content.
-///
-/// Errors loudly when:
-///   - Mission doesn't exist.
-///   - Phase id is already in use under a *different* mission (would
-///     break the unique-id-per-phase invariant the loader relies on).
-///   - Phase id is in use under SAME mission but with different
-///     description (operator probably meant a different id or wants to
-///     explicitly edit; either way, don't paper over the conflict).
-///   - `after` names a phase id not already in the mission's `phase_ids`.
-#[allow(dead_code)]
-pub(crate) fn add_phase_to_mission(
-    mission_id: &str,
-    phase_id: &str,
-    description: &str,
-    after: Option<&str>,
-) -> Result<Phase> {
-    add_phase_to_mission_with_reasoning(mission_id, phase_id, description, after, None)
-}
-
-/// `add_phase_to_mission` with operator-supplied reasoning for the
-/// scope growth. Reasoning lands on the emitted flow record so the
-/// audit substrate captures *why* the mission grew here.
-pub fn add_phase_to_mission_with_reasoning(
-    mission_id: &str,
-    phase_id: &str,
-    description: &str,
-    after: Option<&str>,
-    reasoning: Option<&str>,
-) -> Result<Phase> {
-    let mut mission = load_mission(mission_id)?;
-
-    let all_phases = load_phases()?;
-
-    // Idempotency / collision check.
-    if let Some(existing) = all_phases.iter().find(|s| s.id == phase_id) {
-        if existing.mission_id != mission_id {
-            bail!(
-                "phase id `{phase_id}` already in use under mission `{}`; pick a fresh id",
-                existing.mission_id
-            );
-        }
-        if existing.description != description {
-            bail!(
-                "phase id `{phase_id}` already exists under this mission with a different description; \
-                 edit the existing JSON or pick a fresh id"
-            );
-        }
-        // Exact match — idempotent path. Defensive: ensure the mission's
-        // phase_ids still includes this id (operator may have hand-
-        // edited the JSON and removed it). Idempotent re-adds do NOT
-        // reposition; the operator has to remove the existing entry
-        // first if they want a different position. That keeps re-runs
-        // safe even when `--after` is non-default.
-        let already_listed = mission.phase_ids.iter().any(|s| s == phase_id);
-        if !already_listed {
-            let pos = resolve_insert_position(&mission.phase_ids, after)?;
-            mission.phase_ids.insert(pos, phase_id.to_string());
-            save_json(&mission_path(mission_id), &mission)?;
-        }
-        return Ok(existing.clone());
-    }
-
-    // Pre-validate the `--after` target BEFORE writing any state, so a
-    // typo'd `--after` doesn't leave a phase JSON on disk that's not
-    // referenced from any mission. Resolve to the insertion index now,
-    // then use it after the phase JSON is written.
-    let insert_pos = resolve_insert_position(&mission.phase_ids, after)?;
-
-    let phase = Phase {
-        id: phase_id.to_string(),
-        mission_id: mission_id.to_string(),
-        description: description.to_string(),
-        display_name: None,
-        status: PhaseStatus::Planned,
-        created_ts: now_unix(),
-        started_ts: None,
-        completed_ts: None,
-        abandoned_ts: None,
-        task_ids: Vec::new(),
-    };
-    save_json(&phase_path(mission_id, phase_id), &phase)?;
-
-    // Position into the mission's phase_ids. Belt-and-suspenders: the
-    // collision check above means we shouldn't see a duplicate here,
-    // but the idempotent guard makes the operation safe to retry on
-    // partial-failure paths.
-    if !mission.phase_ids.iter().any(|s| s == phase_id) {
-        mission.phase_ids.insert(insert_pos, phase_id.to_string());
-        save_json(&mission_path(mission_id), &mission)?;
-    }
-
-    emit_phase_added_record_with_reasoning(phase_id, mission_id, reasoning);
-
-    Ok(phase)
-}
-
-/// Compute the index at which a new phase should be inserted into
-/// the mission's `phase_ids` array. Pure — does NOT mutate the
-/// vector. Pre-validates `--after` so callers can write the new
-/// phase JSON without risking an orphan record when the reference
-/// is stale.
-///
-/// When `after` is `None`, returns `phase_ids.len()` (append). When
-/// `after` names a present phase, returns the index immediately
-/// after it. Errors when `after` names an absent phase — silently
-/// appending would obscure a typo or stale reference, which violates
-/// operator sovereignty (don't substitute system judgment for
-/// operator intent).
-fn resolve_insert_position(phase_ids: &[String], after: Option<&str>) -> Result<usize> {
-    match after {
-        None => Ok(phase_ids.len()),
-        Some(target) => {
-            let pos = phase_ids
-                .iter()
-                .position(|s| s == target)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "--after references phase `{target}` which isn't in this mission's phase_ids; \
-                         pick an id that's already in the plan (or omit --after to append)"
-                    )
-                })?;
-            Ok(pos + 1)
-        }
-    }
-}
-
 // ─── Tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::{Mission, MissionStatus, Phase, PhaseStatus};
-    use std::env;
 
     /// (#2697) A thin alias over the ONE guard
     /// ([`darkmux_types::test_isolation::IsolatedState`]), which pins
@@ -1410,7 +1131,6 @@ mod tests {
             created_ts: 1_700_000_000,
             started_ts: None,
             finalized_ts: None,
-            paused_ts: None,
             source_input: None,
             ticket: None,
             spec: None,
@@ -1522,19 +1242,6 @@ mod tests {
         assert_eq!(updated.status, PhaseStatus::Running);
     }
 
-    /// Same inverted case, Paused mission — the guard's other non-terminal
-    /// arm.
-    #[serial_test::serial]
-    #[test]
-    fn phase_start_succeeds_when_mission_paused() {
-        let _g = CrewGuard::new();
-        seed_mission("test-mission", MissionStatus::Paused);
-        seed_phase("s1507-pause", PhaseStatus::Abandoned);
-
-        let updated = phase_start("s1507-pause").unwrap();
-        assert_eq!(updated.status, PhaseStatus::Running);
-    }
-
     #[serial_test::serial]
     #[test]
     fn phase_complete_from_running_sets_complete_and_completed_ts() {
@@ -1599,7 +1306,7 @@ mod tests {
     fn mission_start_sets_active_and_started_ts() {
         let _g = CrewGuard::new();
         seed_mission("m1", MissionStatus::Active);
-        let updated = mission_start("m1").unwrap();
+        let updated = mission_start_with_reasoning("m1", None).unwrap();
         assert_eq!(updated.status, MissionStatus::Active);
         assert!(updated.started_ts.is_some());
     }
@@ -1610,19 +1317,10 @@ mod tests {
         let _g = CrewGuard::new();
         seed_mission("m2", MissionStatus::Active);
         // First start sets the timestamp.
-        let _ = mission_start("m2").unwrap();
+        let _ = mission_start_with_reasoning("m2", None).unwrap();
         // Second start should error (already started — started_ts is set).
-        let err = mission_start("m2").unwrap_err();
+        let err = mission_start_with_reasoning("m2", None).unwrap_err();
         assert!(err.to_string().contains("already Active"));
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn mission_start_from_paused_errors_with_resume_hint() {
-        let _g = CrewGuard::new();
-        seed_mission("m3", MissionStatus::Paused);
-        let err = mission_start("m3").unwrap_err();
-        assert!(err.to_string().contains("resume"));
     }
 
     #[serial_test::serial]
@@ -1630,7 +1328,7 @@ mod tests {
     fn mission_close_from_active_sets_finalized_and_finalized_ts() {
         let _g = CrewGuard::new();
         seed_mission("m4", MissionStatus::Active);
-        let updated = mission_close("m4").unwrap();
+        let updated = mission_close_with_reasoning("m4", None).unwrap();
         assert_eq!(updated.status, MissionStatus::Finalized);
         assert!(updated.finalized_ts.is_some());
     }
@@ -1640,39 +1338,8 @@ mod tests {
     fn mission_close_terminal_state_errors() {
         let _g = CrewGuard::new();
         seed_mission("m5", MissionStatus::Finalized);
-        let err = mission_close("m5").unwrap_err();
+        let err = mission_close_with_reasoning("m5", None).unwrap_err();
         assert!(err.to_string().contains("already Finalized"));
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn mission_pause_resume_preserves_paused_ts() {
-        let _g = CrewGuard::new();
-        seed_mission("m6", MissionStatus::Active);
-
-        let paused = mission_pause("m6").unwrap();
-        assert_eq!(paused.status, MissionStatus::Paused);
-        let original_paused_ts = paused.paused_ts.expect("paused_ts after pause");
-
-        let resumed = mission_resume("m6").unwrap();
-        assert_eq!(resumed.status, MissionStatus::Active);
-        // Resume does NOT clear paused_ts — operator wants to see most-recent pause time.
-        assert_eq!(
-            resumed.paused_ts,
-            Some(original_paused_ts),
-            "resume preserves paused_ts; got {:?}, expected {:?}",
-            resumed.paused_ts,
-            paused.paused_ts,
-        );
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn mission_resume_from_active_errors() {
-        let _g = CrewGuard::new();
-        seed_mission("m7", MissionStatus::Active);
-        let err = mission_resume("m7").unwrap_err();
-        assert!(err.to_string().contains("already Active"));
     }
 
     // (#1503) `mission_reopen` tests removed alongside `mission_reopen_
@@ -2019,7 +1686,7 @@ mod tests {
     #[test]
     fn mission_start_on_missing_id_errors() {
         let _g = CrewGuard::new();
-        let err = mission_start("does-not-exist").unwrap_err();
+        let err = mission_start_with_reasoning("does-not-exist", None).unwrap_err();
         assert!(err.to_string().contains("no mission with id"));
     }
 
@@ -2089,187 +1756,6 @@ mod tests {
         }"#;
         let m: Mission = serde_json::from_str(legacy_json).expect("legacy sprint_ids key must parse");
         assert_eq!(m.phase_ids, vec!["s1".to_string(), "s2".to_string()]);
-    }
-
-    // ─── add_phase_to_mission (#107) ───────────────────────────────────
-
-    #[serial_test::serial]
-    #[test]
-    fn add_phase_creates_planned_phase_and_extends_mission() {
-        let _g = CrewGuard::new();
-        let mission = seed_mission("test-mission", MissionStatus::Active);
-        assert!(mission.phase_ids.is_empty(), "starting state: empty phase list");
-
-        let s = add_phase_to_mission(
-            "test-mission",
-            "new-phase",
-            "discovered mid-flight",
-            None,
-        )
-        .unwrap();
-
-        assert_eq!(s.status, PhaseStatus::Planned);
-        assert_eq!(s.mission_id, "test-mission");
-        assert_eq!(s.description, "discovered mid-flight");
-        assert!(s.started_ts.is_none());
-        // Phase JSON exists on disk.
-        assert!(phase_path("test-mission", "new-phase").exists());
-        // Mission JSON's phase_ids was updated.
-        let reloaded = load_mission("test-mission").unwrap();
-        assert_eq!(reloaded.phase_ids, vec!["new-phase".to_string()]);
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn add_phase_is_idempotent_on_exact_match() {
-        let _g = CrewGuard::new();
-        seed_mission("m1", MissionStatus::Active);
-
-        let first = add_phase_to_mission("m1", "s-once", "same desc", None).unwrap();
-        let second = add_phase_to_mission("m1", "s-once", "same desc", None).unwrap();
-
-        // Same created_ts on the second call — we returned the existing phase, not a fresh one.
-        assert_eq!(first.created_ts, second.created_ts);
-        // Mission's phase_ids contains the id once, not twice.
-        let m = load_mission("m1").unwrap();
-        assert_eq!(m.phase_ids.iter().filter(|s| *s == "s-once").count(), 1);
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn add_phase_errors_when_id_collides_across_missions() {
-        let _g = CrewGuard::new();
-        seed_mission("m-a", MissionStatus::Active);
-        seed_mission("m-b", MissionStatus::Active);
-        add_phase_to_mission("m-a", "shared", "first", None).unwrap();
-
-        let err = add_phase_to_mission("m-b", "shared", "second", None).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("already in use under mission `m-a`"), "got: {msg}");
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn add_phase_errors_when_same_id_has_different_description() {
-        let _g = CrewGuard::new();
-        seed_mission("m1", MissionStatus::Active);
-        add_phase_to_mission("m1", "s1", "original", None).unwrap();
-
-        let err = add_phase_to_mission("m1", "s1", "different", None).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("different description"), "got: {msg}");
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn add_phase_errors_when_mission_missing() {
-        let _g = CrewGuard::new();
-        let err = add_phase_to_mission(
-            "ghost-mission",
-            "new-phase",
-            "desc",
-            None,
-        )
-        .unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("no mission") && msg.contains("ghost-mission"),
-            "got: {msg}",
-        );
-    }
-
-    /// (#1341) Phases are strictly linear now — no separate `depends_on`
-    /// declaration to dangle-check; `resolve_insert_position` (called
-    /// below, in the real add-phase path) already errors loud when
-    /// `--after` names a phase id not in the mission's `phase_ids`, which
-    /// is the equivalent "reference an unknown phase" failure mode.
-
-    // ─── --after positioning (insert-in-middle) ─────────────────────────
-
-    #[serial_test::serial]
-    #[test]
-    fn add_phase_with_after_inserts_in_middle_not_at_end() {
-        let _g = CrewGuard::new();
-        seed_mission("m1", MissionStatus::Active);
-        add_phase_to_mission("m1", "alpha", "first", None).unwrap();
-        add_phase_to_mission("m1", "beta", "second", None).unwrap();
-        add_phase_to_mission("m1", "gamma", "third", None).unwrap();
-
-        // Insert `delta` between `alpha` and `beta`.
-        add_phase_to_mission("m1", "delta", "inserted", Some("alpha")).unwrap();
-
-        let m = load_mission("m1").unwrap();
-        assert_eq!(
-            m.phase_ids,
-            vec![
-                "alpha".to_string(),
-                "delta".to_string(),
-                "beta".to_string(),
-                "gamma".to_string(),
-            ],
-            "delta should land immediately after alpha, not at the end"
-        );
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn add_phase_with_after_at_tail_inserts_after_last() {
-        // Edge case: --after the last phase should append (not error).
-        let _g = CrewGuard::new();
-        seed_mission("m1", MissionStatus::Active);
-        add_phase_to_mission("m1", "alpha", "first", None).unwrap();
-        add_phase_to_mission("m1", "beta", "second", None).unwrap();
-
-        add_phase_to_mission("m1", "gamma", "third", Some("beta")).unwrap();
-
-        let m = load_mission("m1").unwrap();
-        assert_eq!(m.phase_ids, vec!["alpha", "beta", "gamma"]);
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn add_phase_with_after_unknown_id_errors_loudly() {
-        let _g = CrewGuard::new();
-        seed_mission("m1", MissionStatus::Active);
-        add_phase_to_mission("m1", "alpha", "first", None).unwrap();
-
-        let err = add_phase_to_mission(
-            "m1",
-            "beta",
-            "second",
-            Some("nonexistent-id"),
-        )
-        .unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("--after references phase `nonexistent-id`"),
-            "got: {msg}"
-        );
-        // Mission was not mutated on error — alpha is still the only phase.
-        let m = load_mission("m1").unwrap();
-        assert_eq!(m.phase_ids, vec!["alpha".to_string()]);
-        // The phase JSON should NOT have been left behind either.
-        assert!(!phase_path("m1", "beta").exists(), "errored insert must not leave orphan phase");
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn add_phase_emits_phase_added_flow_record() {
-        let _g = CrewGuard::new();
-        seed_mission("m1", MissionStatus::Active);
-        add_phase_to_mission("m1", "new-phase", "desc", None).unwrap();
-
-        // Read the day's flow file from the temp DARKMUX_FLOWS_DIR.
-        let flows_dir = env::var("DARKMUX_FLOWS_DIR").unwrap();
-        let day = darkmux_flow::day_utc_now();
-        let path = std::path::PathBuf::from(flows_dir).join(format!("{day}.jsonl"));
-        let raw = std::fs::read_to_string(&path).expect("flow file should have been created");
-        let found = raw.lines().any(|line| {
-            line.contains("\"action\":\"phase.added\"")
-                && line.contains("\"handle\":\"new-phase\"")
-                && line.contains("\"source\":\"mission_lifecycle\"")
-        });
-        assert!(found, "expected a `phase added` flow record, got:\n{raw}");
     }
 
     // ─── (#1959) payload-carrying mission start/close ──────────────────

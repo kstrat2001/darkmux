@@ -11,6 +11,8 @@ use clap::Parser;
 // handlers already reference by bare name keeps resolving unchanged.
 mod cli;
 use cli::*;
+// (#2954) Removed verbs, refused with the line naming their replacement.
+mod retired_verbs;
 
 // SPIKE (#1388) — `darkmux acp`. See src/acp.rs module docs.
 mod acp;
@@ -133,9 +135,30 @@ pub(crate) fn test_run() -> darkmux_types::session_id::RunId {
 
 fn main() -> Result<()> {
     providers::register_builtins()?;
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => refuse_retired_or_exit(e),
+    };
     let code = run(cli.command)?;
     std::process::exit(code);
+}
+
+/// clap rejected the command line. When it names a verb darkmux removed,
+/// say what replaced it (exit 2, clap's usage-error code); otherwise clap's
+/// own error, unchanged.
+fn refuse_retired_or_exit(e: clap::Error) -> ! {
+    use clap::error::ErrorKind;
+    if matches!(e.kind(), ErrorKind::InvalidSubcommand | ErrorKind::UnknownArgument) {
+        let args: Vec<String> = std::env::args_os()
+            .skip(1)
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        if let Some(msg) = retired_verbs::refusal(&args) {
+            eprintln!("{msg}");
+            std::process::exit(2);
+        }
+    }
+    e.exit()
 }
 
 fn run(cmd: Cmd) -> Result<i32> {
@@ -155,7 +178,6 @@ fn run(cmd: Cmd) -> Result<i32> {
             timeout,
             workdir,
             workspace_read_only,
-            phase_id,
             skip_preflight,
             json,
             no_wait,
@@ -173,7 +195,6 @@ fn run(cmd: Cmd) -> Result<i32> {
             timeout,
             workdir,
             workspace_read_only,
-            phase_id,
             skip_preflight,
             json,
             no_wait,
@@ -861,35 +882,8 @@ fn cmd_mission(sub: MissionCmd) -> Result<i32> {
     match sub {
         MissionCmd::Status { json, limit, all, missions } => mission_status::run(json, limit, all, missions),
         MissionCmd::Debrief { id, json } => coder_phase::debrief(&id, json),
-        MissionCmd::Start { id, reasoning } => {
-            let m = crew::lifecycle::mission_start_with_reasoning(&id, reasoning.as_deref())?;
-            println!(
-                "mission `{}` → Active  started_ts={}",
-                m.id,
-                m.started_ts.unwrap_or(0)
-            );
-            Ok(0)
-        }
         MissionCmd::Finalize { id, reasoning } => {
             coder_phase::finalize(&id, reasoning.as_deref())
-        }
-        MissionCmd::Pause { id, reasoning } => {
-            let m = crew::lifecycle::mission_pause_with_reasoning(&id, reasoning.as_deref())?;
-            println!(
-                "mission `{}` → Paused  paused_ts={}",
-                m.id,
-                m.paused_ts.unwrap_or(0)
-            );
-            Ok(0)
-        }
-        MissionCmd::Resume { id, reasoning } => {
-            let m = crew::lifecycle::mission_resume_with_reasoning(&id, reasoning.as_deref())?;
-            println!(
-                "mission `{}` → Active  (paused_ts preserved: {})",
-                m.id,
-                m.paused_ts.unwrap_or(0)
-            );
-            Ok(0)
         }
         MissionCmd::Launch { config_id, input, params, timeout, dry_run, force } => {
             // (#1959) `--dry-run` reaches every launch path (crawl,
@@ -907,292 +901,11 @@ fn cmd_mission(sub: MissionCmd) -> Result<i32> {
             }
             mission_launch::launch(&config_id, input.as_deref(), &params, timeout)
         }
-        MissionCmd::AddPhase {
-            mission_id,
-            phase_id,
-            description,
-            after,
-            reasoning,
-        } => {
-            let s = crew::lifecycle::add_phase_to_mission_with_reasoning(
-                &mission_id,
-                &phase_id,
-                &description,
-                after.as_deref(),
-                reasoning.as_deref(),
-            )?;
-            let position = match after.as_deref() {
-                Some(a) => format!(" (after `{a}`)"),
-                None => String::new(),
-            };
-            println!(
-                "mission `{}` ← added phase `{}`{}",
-                mission_id, s.id, position
-            );
-            Ok(0)
-        }
-        MissionCmd::Dispatch {
-            mission_id,
-            role,
-            machine,
-            timeout,
-            no_wait,
-        } => cmd_mission_dispatch(&mission_id, &role, machine.as_deref(), timeout, !no_wait),
         MissionCmd::Abort {
             mission_id,
             phase,
         } => coder_phase::abort(&mission_id, phase.as_deref()),
         MissionCmd::Config { sub } => mission_config_cli::run(sub),
-    }
-}
-
-/// One validated work job per started phase of `mission_id`, each its own
-/// ad-hoc dispatch of `role_id` in the mission's run, unique however often
-/// the phase is dispatched: `(phase id, session, job)`.
-fn build_phase_jobs(
-    mission_id: &str,
-    role_id: &str,
-    machine: &str,
-    timeout_seconds: u32,
-    started: &[&crew::types::Phase],
-) -> Result<Vec<(String, darkmux_types::session_id::SessionId, fleet::WorkJob)>> {
-    let local_machine = flow::resolve_machine_id();
-    let run = darkmux_types::session_id::RunId::mission(mission_id)?;
-    let mut jobs = Vec::with_capacity(started.len());
-    for phase in started {
-        let session_id = darkmux_types::session_id::SessionId::adhoc(
-            run.clone(),
-            role_id,
-            format!("{}-{}", phase.id, crew::dispatch::fresh_nonce()),
-        );
-        let job = fleet::build_work_job(
-            machine.to_string(),
-            role_id.to_string(),
-            phase.description.clone(),
-            session_id.clone(),
-            None, // profile: the receiver resolves the role's binding
-            None,
-            Some(phase.id.clone()),
-            None, // image (#703 Slice 4) — the receiver's default
-            timeout_seconds,
-            local_machine.clone(),
-        );
-        job.validate()
-            .with_context(|| format!("pre-submit validation failed for phase `{}`", phase.id))?;
-        jobs.push((phase.id.clone(), session_id, job));
-    }
-    Ok(jobs)
-}
-
-fn cmd_mission_dispatch(
-    mission_id: &str,
-    role_id: &str,
-    machine: Option<&str>,
-    timeout_seconds: u32,
-    wait: bool,
-) -> Result<i32> {
-    use crew::loader::{load_missions, load_roles, load_phases};
-
-    // (#2947 review C1) Bad enum config refuses before any phase is flipped
-    // Planned -> Running: the dispatch-scope settings always (the work is a
-    // dispatch wherever it runs), and the fleet-submission ones when the
-    // work is sent to another machine.
-    darkmux_crew::user_files::preflight(darkmux_types::config_enum::Scope::Dispatch)?;
-    if machine.is_some() {
-        darkmux_types::config_enum::preflight(darkmux_types::config_enum::Scope::FleetSubmission)?;
-    }
-
-    // 0. CLI-boundary charset validation (Wave-E.5 #255 — security-
-    //    auditor MEDIUM from PR-D.1 review). `mission_id` flows into
-    //    the session_id format string + WorkJob payload + audit chain
-    //    + future "look up by mission" filters; charset enforcement
-    //    at the boundary protects all current AND future use of the
-    //    value. Rejects path-traversal, special chars, over-long ids.
-    fleet::validate_identifier("mission_id", mission_id)?;
-    fleet::validate_identifier("role_id", role_id)?;
-    // (#2916) The queue that let ANY runner claim a phase is retired; work
-    // now goes to one named machine, which checks who is asking. Required,
-    // and checked before any phase changes state.
-    let Some(machine) = machine else {
-        anyhow::bail!(
-            "mission dispatch needs --machine <id>: the fleet work queue any machine could claim \
-             from is retired (#2916), so a phase is submitted to one named machine. To run the \
-             phase here, `darkmux dispatch <role> <message> --phase-id <phase>`."
-        );
-    };
-    fleet::validate_machine_name("--machine", machine)?;
-
-    // 1. Validate the mission exists.
-    let missions = load_missions()?;
-    let mission = missions
-        .iter()
-        .find(|m| m.id == mission_id)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-            "mission `{mission_id}` not found. Run `darkmux mission launch <config-id>` first (`darkmux mission config list` shows the configs), or check the id."
-        )
-        })?;
-    if !matches!(mission.status, crew::types::MissionStatus::Active) {
-        eprintln!(
-            "darkmux mission dispatch: warning — mission `{mission_id}` status is {:?}, not Active. \
-             Proceeding anyway (operator-explicit override).",
-            mission.status
-        );
-    }
-
-    // 2. Confirm the role exists before submitting any phase.
-    let roles = load_roles()?;
-    if !roles.iter().any(|r| r.id == role_id) {
-        anyhow::bail!("role `{role_id}` not found");
-    }
-
-    // 3. Find the next runnable phase in THIS mission. (#1341) Phases are
-    //    strictly linear — ordered purely by position in
-    //    `Mission.phase_ids`, no `depends_on` of their own — so "ready"
-    //    is a linear scan: the FIRST phase in that order whose status is
-    //    `Planned` AND every phase before it is `Complete`. Replaces the
-    //    historical `crew::scheduler::is_ready`/`PhaseNode` graph check
-    //    (itself a replacement for the even older flat
-    //    `depends_on.is_empty()` filter) — a strictly-linear Phase list
-    //    has at most ONE next-runnable phase per mission, so `initial`
-    //    below holds 0 or 1 entries, never a real "fan-out" across
-    //    parallel phases (that capability lives at the Task level now,
-    //    within `mission run`'s own graph — see `types::Phase`'s doc).
-    //    `Running` phases are naturally excluded (not `Planned`). Wave-E.3
-    //    state-machine gate unchanged: the filtered phase goes through
-    //    `lifecycle::phase_start` BEFORE publish, flipping Planned →
-    //    Running, so a second `mission dispatch` invocation finds nothing
-    //    dispatchable and bails with exit 2.
-    let phases = load_phases()?;
-    let phase_by_id: std::collections::BTreeMap<String, &crew::types::Phase> =
-        phases.iter().map(|p| (p.id.clone(), p)).collect();
-    let mut initial: Vec<&crew::types::Phase> = Vec::new();
-    let mut all_prior_complete = true;
-    for phase_id in &mission.phase_ids {
-        let Some(phase) = phase_by_id.get(phase_id) else { continue };
-        if all_prior_complete && phase.status == crew::types::PhaseStatus::Planned {
-            initial.push(phase);
-            break;
-        }
-        if phase.status != crew::types::PhaseStatus::Complete {
-            all_prior_complete = false;
-        }
-    }
-
-    if initial.is_empty() {
-        eprintln!(
-            "darkmux mission dispatch: no runnable phase in mission `{mission_id}` — either \
-             every phase is already Running/Complete/Abandoned, or the next Planned phase is \
-             blocked on an incomplete predecessor. Nothing to fan out. (A Running phase from a \
-             previous dispatch becomes eligible again only once it reaches a terminal outcome — \
-             its launched run finalizing into the mission graph, or the whole mission driven \
-             terminal with `darkmux mission finalize` / `darkmux mission abort`, both of which \
-             reconcile the mission's phases. #1463)"
-        );
-        return Ok(2);
-    }
-
-    // 3b. Flip each filtered phase Planned → Running BEFORE publishing.
-    //     If a phase flipped between the filter and this call (unlikely
-    //     in single-operator scenarios but possible under racing CLIs),
-    //     `phase_start` bails on already-Running; skip and warn.
-    let mut started: Vec<&crew::types::Phase> = Vec::with_capacity(initial.len());
-    for phase in &initial {
-        match crew::lifecycle::phase_start(&phase.id) {
-            Ok(_) => started.push(*phase),
-            Err(e) => {
-                eprintln!(
-                    "darkmux mission dispatch: skipping phase `{}` — phase_start failed: {e:#}",
-                    phase.id
-                );
-            }
-        }
-    }
-    if started.is_empty() {
-        eprintln!(
-            "darkmux mission dispatch: no phases survived phase_start (all were \
-             already Running/Complete). Nothing to fan out."
-        );
-        return Ok(2);
-    }
-
-    // 4. (#2916) Build + pre-validate every job BEFORE submitting any
-    //    (all-or-nothing, HIGH-2 from the PR-D.1 review): an oversize
-    //    description is found before anything leaves this machine.
-    let jobs = build_phase_jobs(mission_id, role_id, machine, timeout_seconds, &started)?;
-
-    // 5. Submit, one phase at a time. The receiver answers each at once: it
-    //    runs it, queues it behind a busy seat (its `fleet.busy_policy`), or
-    //    refuses it with the reason.
-    eprintln!(
-        "darkmux mission dispatch: mission={mission_id} role={role_id} phases={} machine={machine}",
-        jobs.len()
-    );
-    let mut completed: usize = 0;
-    let mut failures: usize = 0;
-    for (phase_id, session_id, job) in jobs {
-        match fleet::submit_work(job, wait) {
-            Ok(reply) => match phase_outcome(&reply, &phase_id, &session_id, machine) {
-                PhaseOutcome::NotWaiting(line) => println!("{line}"),
-                PhaseOutcome::Finished { ok, line } => {
-                    completed += 1;
-                    if !ok {
-                        failures += 1;
-                    }
-                    eprintln!("{line}");
-                }
-            },
-            Err(e) => {
-                failures += 1;
-                eprintln!(
-                    "  ✗ phase={phase_id} not run: {e:#}\n    The phase was marked Running before \
-                     submitting; `darkmux mission abort {mission_id} --phase {phase_id}` resets it."
-                );
-            }
-        }
-    }
-    if wait {
-        println!("\nmission dispatch: completed={completed} failures={failures} (on {machine})");
-    }
-    Ok(if failures > 0 { 1 } else { 0 })
-}
-
-/// What `mission dispatch` reports for one submitted phase.
-#[derive(Debug, PartialEq, Eq)]
-enum PhaseOutcome {
-    /// Handed over and not waited on (accepted, or queued behind a busy
-    /// seat): not a failure.
-    NotWaiting(String),
-    /// The phase ran; `ok` is a zero exit code.
-    Finished { ok: bool, line: String },
-}
-
-/// (#2916 stage 2 review M3) One phase's reply as `mission dispatch` reports
-/// it. A `queued` reply is the receiver taking the phase, not a failure: its
-/// own reason is printed.
-fn phase_outcome(
-    reply: &fleet::SubmissionReply,
-    phase_id: &str,
-    session_id: &darkmux_types::session_id::SessionId,
-    machine: &str,
-) -> PhaseOutcome {
-    use fleet::ReplyStatus;
-    match reply.status {
-        ReplyStatus::Accepted => PhaseOutcome::NotWaiting(format!(
-            "  phase={phase_id} session_id={session_id} submitted to {machine} (not waiting)"
-        )),
-        ReplyStatus::Queued => PhaseOutcome::NotWaiting(format!(
-            "  phase={phase_id} session_id={session_id} queued on {machine} (not waiting): {}",
-            fleet::sanitize_remote_text(reply.reason.as_deref().unwrap_or("its seat is busy"))
-        )),
-        ReplyStatus::Completed | ReplyStatus::Error | ReplyStatus::Refused => {
-            let code = reply.exit_code.unwrap_or(1);
-            let mark = if code == 0 { "✓" } else { "✗" };
-            PhaseOutcome::Finished {
-                ok: code == 0,
-                line: format!("  {mark} phase={phase_id} exit_code={code} session={session_id}"),
-            }
-        }
     }
 }
 
@@ -1210,7 +923,6 @@ struct DispatchInvocation {
     timeout: Option<u32>,
     workdir: Option<std::path::PathBuf>,
     workspace_read_only: bool,
-    phase_id: Option<String>,
     skip_preflight: bool,
     json: bool,
     no_wait: bool,
@@ -1242,7 +954,6 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
         timeout,
         workdir,
         workspace_read_only,
-        phase_id,
         skip_preflight,
         json,
         no_wait,
@@ -1389,7 +1100,9 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
         skip_preflight,
         json,
         workdir,
-        phase_id,
+        // A CLI dispatch is its own crew-of-one run: it names no phase of
+        // another mission.
+        phase_id: None,
         // (#2916 stage 2) Set from the `profile@machine` address by
         // `dispatch_routed_via`, never from a flag.
         machine: None,
@@ -2206,56 +1919,6 @@ fn model_ctx_label(m: &types::ProfileModel, registry: &darkmux_types::ProfileReg
 
 #[cfg(test)]
 mod tests {
-    /// (#2916 stage 2 review M3) `mission dispatch --no-wait` reports a
-    /// queued phase as handed over, with the receiver's reason, never as a
-    /// failure; a finished phase is judged by its exit code.
-    #[test]
-    fn a_queued_phase_is_not_a_failure() {
-        use fleet::{ReplyStatus, SubmissionReply};
-        let queued = SubmissionReply {
-            reason: Some("studio is busy (x is running on big); the job is queued".into()),
-            ..SubmissionReply::of(ReplyStatus::Queued)
-        };
-        match super::phase_outcome(&queued, "p1", &crate::test_session("s1"), "studio") {
-            super::PhaseOutcome::NotWaiting(line) => {
-                assert!(line.contains("queued on studio") && line.contains("x is running on big"), "{line}")
-            }
-            other => panic!("a queued phase was reported as {other:?}"),
-        }
-        let accepted = SubmissionReply::of(ReplyStatus::Accepted);
-        assert!(matches!(super::phase_outcome(&accepted, "p", &crate::test_session("s"), "m"), super::PhaseOutcome::NotWaiting(_)));
-        let done = SubmissionReply { exit_code: Some(0), ..SubmissionReply::of(ReplyStatus::Completed) };
-        assert!(matches!(super::phase_outcome(&done, "p", &crate::test_session("s"), "m"), super::PhaseOutcome::Finished { ok: true, .. }));
-        let failed = SubmissionReply { exit_code: Some(2), ..SubmissionReply::of(ReplyStatus::Completed) };
-        assert!(matches!(super::phase_outcome(&failed, "p", &crate::test_session("s"), "m"), super::PhaseOutcome::Finished { ok: false, .. }));
-    }
-
-    /// (#2947 review C1) `mission dispatch` refuses bad enum config before
-    /// it looks up the mission or flips a phase: the dispatch-scope values
-    /// always, and the fleet-submission ones with `--machine`.
-    #[serial_test::serial]
-    #[test]
-    fn mission_dispatch_refuses_bad_enum_config_before_touching_the_mission() {
-        let prev = std::env::var("DARKMUX_THERMAL_PAUSE_AT").ok();
-        unsafe { std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", "seroius") };
-        let local = super::cmd_mission_dispatch("no-such-mission-2947", "coder", None, 5, true);
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", v),
-                None => std::env::remove_var("DARKMUX_THERMAL_PAUSE_AT"),
-            }
-        }
-        let msg = format!("{:#}", local.unwrap_err());
-        assert!(msg.contains("dispatch: refusing to start") && msg.contains("`seroius`"), "{msg}");
-
-        let remote = {
-            let _g = darkmux_types::config_access::set_config_for_test(crate::fleet_cli::tests::bad_provider_config());
-            super::cmd_mission_dispatch("no-such-mission-2947", "coder", Some("peer-x"), 5, true)
-        };
-        let msg = format!("{:#}", remote.unwrap_err());
-        assert!(msg.contains("fleet work submission: refusing to start"), "{msg}");
-    }
-
     use super::*;
 
     /// (#2902 re-review C2) `profile list` tells a quarantined endpoint

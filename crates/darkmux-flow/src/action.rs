@@ -185,8 +185,6 @@ flow_actions! {
     MissionStart => Mission, "mission.start";
     MissionClose => Mission, "mission.close";
     MissionAbort => Mission, "mission.abort";
-    MissionPause => Mission, "mission.pause";
-    MissionResume => Mission, "mission.resume";
     MissionGrow => Mission, "mission.grow";
     MissionDebriefPrompt => Mission, "mission.debrief.prompt";
     MissionRunFinalize => Mission, "mission.run.finalize";
@@ -196,7 +194,6 @@ flow_actions! {
     PhaseStart => Phase, "phase.start";
     PhaseComplete => Phase, "phase.complete";
     PhaseAbandon => Phase, "phase.abandon";
-    PhaseAdded => Phase, "phase.added";
     PhaseIdAmbiguous => Phase, "phase.id_ambiguous";
     PhaseReviewBegin => Phase, "phase.review.begin";
     PhaseReviewAborted => Phase, "phase.review.aborted";

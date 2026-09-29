@@ -5321,7 +5321,6 @@
             created_ts: now_unix(),
             started_ts: None,
             finalized_ts: None,
-            paused_ts: None,
             source_input: None,
             ticket: None,
             spec: None,
@@ -6399,8 +6398,6 @@
             FlowAction::PhaseAbandon,
             FlowAction::MissionStart,
             FlowAction::MissionClose,
-            FlowAction::MissionPause,
-            FlowAction::MissionResume,
         ] {
             let key = ts_action_key(&action);
             assert!(
