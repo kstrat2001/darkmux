@@ -145,9 +145,11 @@ const PANEL_SPAWN_TIMEOUT: Duration = Duration::from_secs(10);
 /// "observer joins the observed" failure, driven by a page the operator
 /// never opened on purpose.
 ///
-/// Bearer auth does not cover this: loopback is exempt by design, and under
-/// the documented `tailscale serve` phone-dashboard pattern every tailnet
-/// peer arrives as loopback too.
+/// Bearer auth does not cover this: a request from this machine
+/// (`is_local_request`) is exempt by design, and with read auth off every
+/// tailnet peer behind the documented `tailscale serve` phone dashboard
+/// reads the `Read` panels freely too (the `LocalOrToken` ones, see
+/// [`PanelAudience`], still need this machine or the token).
 pub(crate) const PANEL_HEADER: &str = "x-darkmux-panel";
 
 /// Server-enforced floor between runs of a MANUAL-ONLY panel (TTL 0).
@@ -244,6 +246,45 @@ const RUN_LIST_USAGE_OPT: PanelOpt = PanelOpt {
 const MISSION_STATUS_OPTS: &[PanelOpt] = &[ALL_OPT];
 const RUN_LIST_OPTS: &[PanelOpt] = &[RUN_LIST_KIND_OPT, ALL_OPT, RUN_LIST_USAGE_OPT];
 
+/// Who may run a panel. Every panel's output is a read of this machine, so
+/// `Read` panels follow the daemon's read posture (`serve.read_auth`). A
+/// panel whose output DESCRIBES THE EXECUTION SURFACE (the fleet listener's
+/// overlay address, port, busy policy, and the allow-list's node names and
+/// roles) is a map for the caller with the token, so `/health` withholds
+/// the same facts from a non-local caller; those panels hold the same line
+/// even with read auth off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PanelAudience {
+    /// Served under the read posture: open with read auth off, local or
+    /// token with it on.
+    Read,
+    /// Served only to a local request ([`crate::is_local_request`]) or a
+    /// caller presenting the serve token, whatever the read posture.
+    LocalOrToken,
+}
+
+/// Refuse a panel to a caller its [`PanelAudience`] does not admit: a
+/// `LocalOrToken` panel needs a local request or the serve token, whatever
+/// the read posture. A `Read` panel is already covered by the read gate.
+fn admit_audience(
+    spec: &PanelSpec,
+    peer: Option<std::net::SocketAddr>,
+    headers: &axum::http::HeaderMap,
+) -> Result<(), (StatusCode, String)> {
+    match spec.audience {
+        PanelAudience::Read => Ok(()),
+        PanelAudience::LocalOrToken if crate::caller_is_local_or_holds_token(peer, headers) => Ok(()),
+        PanelAudience::LocalOrToken => Err((
+            StatusCode::UNAUTHORIZED,
+            format!(
+                "panel \"{}\" describes this machine's fleet execution surface; it is served to this machine \
+                 or a caller presenting the serve token (Authorization: Bearer <token>)\n",
+                spec.id
+            ),
+        )),
+    }
+}
+
 /// One allowlist entry: the argv after the binary, whether the viewer may
 /// auto-refresh it, the cache TTL applied, and the closed option space (if
 /// any) it declares.
@@ -270,6 +311,9 @@ pub(crate) struct PanelSpec {
     /// (every other entry is a local-disk read) — see the module doc's
     /// "every panel until now reads local disk only".
     pub(crate) needs_fleet_snapshot: bool,
+    /// Who may run it — see [`PanelAudience`]. One classification per panel,
+    /// stated in [`panel_spec`]'s table.
+    pub(crate) audience: PanelAudience,
 }
 
 /// Every allowlisted BASE panel id (#1911: this counts base verbs, not
@@ -297,31 +341,45 @@ pub(crate) const PANEL_IDS: &[&str] = &[
 /// only here. `mission-status-all` is NOT a base verb here — see
 /// [`resolve_alias`].
 pub(crate) fn panel_spec(id: &str) -> Option<PanelSpec> {
-    let (id, argv, auto_refresh, ttl, opts): (
+    use PanelAudience::{LocalOrToken, Read};
+    let (id, argv, auto_refresh, ttl, opts, audience): (
         &'static str,
         &'static [&'static str],
         bool,
         Duration,
         &'static [PanelOpt],
+        PanelAudience,
     ) = match id {
+        // Read: mission and run state, the same facts `/runs` serves.
         "mission-status" => {
-            ("mission-status", &["mission", "status"], true, PANEL_CACHE_TTL, MISSION_STATUS_OPTS)
+            ("mission-status", &["mission", "status"], true, PANEL_CACHE_TTL, MISSION_STATUS_OPTS, Read)
         }
-        "role-list" => ("role-list", &["role", "list"], true, PANEL_CACHE_TTL, &[]),
-        "machine-status" => ("machine-status", &["machine", "status"], true, PANEL_CACHE_TTL, &[]),
-        "config-list" => ("config-list", &["config", "list"], true, PANEL_CACHE_TTL, &[]),
-        "flow-status" => ("flow-status", &["flow", "status"], true, PANEL_CACHE_TTL, &[]),
+        // Read: the role manifests the crew loads; no machine or fleet state.
+        "role-list" => ("role-list", &["role", "list"], true, PANEL_CACHE_TTL, &[], Read),
+        // Read: resident models and their ownership, the same facts
+        // `/machine/status` serves; no fleet listener or allow-list state.
+        "machine-status" => ("machine-status", &["machine", "status"], true, PANEL_CACHE_TTL, &[], Read),
+        // LocalOrToken: prints the whole config.json, which holds the
+        // listener's port and enablement and the `fleet.accept_work`
+        // allow-list (node names, roles, profiles, images).
+        "config-list" => ("config-list", &["config", "list"], true, PANEL_CACHE_TTL, &[], LocalOrToken),
+        // Read: the flow sinks' state, which `/health` and the flow routes
+        // already show; no listener or allow-list state.
+        "flow-status" => ("flow-status", &["flow", "status"], true, PANEL_CACHE_TTL, &[], Read),
+        // Read: registered lab fixtures; no machine or fleet state.
         "lab-fixture-list" => {
-            ("lab-fixture-list", &["lab", "fixture", "list"], true, PANEL_CACHE_TTL, &[])
+            ("lab-fixture-list", &["lab", "fixture", "list"], true, PANEL_CACHE_TTL, &[], Read)
         }
         // (#1911) The CLI twin of the RUNS lens's union — see
-        // `src/run_list.rs`'s own module doc.
-        "run-list" => ("run-list", &["run", "list"], true, PANEL_CACHE_TTL, RUN_LIST_OPTS),
+        // `src/run_list.rs`'s own module doc. Read: the same rows as `/runs`.
+        "run-list" => ("run-list", &["run", "list"], true, PANEL_CACHE_TTL, RUN_LIST_OPTS, Read),
         // Manual-run only (#1286): never auto-refreshed by the viewer,
         // TTL 0 so an explicit re-run is always a real run, and rate-
         // floored server-side (see MANUAL_MIN_INTERVAL) because
-        // "the viewer must honor it" is not enforcement.
-        "doctor" => ("doctor", &["doctor"], false, Duration::ZERO, &[]),
+        // "the viewer must honor it" is not enforcement. LocalOrToken: its
+        // fleet rows print the listener's overlay address, port and busy
+        // policy and the allow-list's node names and roles.
+        "doctor" => ("doctor", &["doctor"], false, Duration::ZERO, &[], LocalOrToken),
         _ => return None,
     };
     // (#1914, widened #1711) Derived from the SAME `id` just matched above,
@@ -336,8 +394,11 @@ pub(crate) fn panel_spec(id: &str) -> Option<PanelSpec> {
     // for its sibling. A future panel that reads the fleet stream must flip
     // this deliberately too — see `only_these_ids_need_a_fleet_snapshot`.
     let needs_fleet_snapshot = matches!(id, "run-list" | "mission-status");
-    Some(PanelSpec { id, argv, auto_refresh, cache_ttl: ttl, opts, needs_fleet_snapshot })
+    Some(PanelSpec { id, argv, auto_refresh, cache_ttl: ttl, opts, needs_fleet_snapshot, audience })
 }
+
+/// The `(name, value)` opt selections an alias forces.
+type ForcedOpts = &'static [(&'static str, &'static str)];
 
 /// One-release compatibility alias (#1911): the pre-opts client still
 /// requests `mission-status-all` by id (it has not yet migrated to
@@ -351,7 +412,7 @@ pub(crate) fn panel_spec(id: &str) -> Option<PanelSpec> {
 /// `["mission","status","--all"]` would fail the layer-2 flag guard if
 /// entered directly), so it must never be reachable by looking `panel_spec`
 /// up under its own name.
-fn resolve_alias(id: &str) -> (&str, &'static [(&'static str, &'static str)]) {
+fn resolve_alias(id: &str) -> (&str, ForcedOpts) {
     match id {
         "mission-status-all" => ("mission-status", &[("all", "all")]),
         other => (other, &[]),
@@ -578,7 +639,7 @@ fn clamp_cols(cols: Option<u16>) -> u16 {
 /// before it is consulted. That is the #1286 perturbation this floor
 /// exists to prevent, reached by nothing more exotic than two open
 /// consoles — the laptop browser and the tailnet phone dashboard both
-/// arrive as loopback by design.
+/// reach the daemon on loopback by design.
 ///
 /// The clock now advances at ADMISSION rather than at completion, which
 /// is a deliberate trade with two consequences worth stating:
@@ -720,14 +781,16 @@ fn manual_floor_wait(
     }
 }
 
-pub(crate) async fn panel_handler(
-    Path(id): Path<String>,
-    Query(params): Query<HashMap<String, String>>,
-    headers: axum::http::HeaderMap,
-    State(state): State<AppState>,
-) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
-    // The preflight forcer — see PANEL_HEADER. Checked BEFORE the allowlist
-    // lookup so a drive-by never even learns which ids exist.
+/// The gates in front of every panel request, in order: the preflight-forcing
+/// header (checked BEFORE the allowlist lookup so a drive-by never even learns
+/// which ids exist), the allowlist lookup, then the panel's audience. Returns
+/// the panel's spec and the alias's forced `(name, value)` selections.
+fn admit_panel_request(
+    id: &str,
+    peer: Option<std::net::SocketAddr>,
+    headers: &axum::http::HeaderMap,
+) -> Result<(PanelSpec, ForcedOpts), (StatusCode, String)> {
+    // The preflight forcer — see PANEL_HEADER.
     if !headers.contains_key(PANEL_HEADER) {
         return Err((
             StatusCode::FORBIDDEN,
@@ -743,13 +806,25 @@ pub(crate) async fn panel_handler(
     // `mission-status-all` request resolves to the `mission-status` spec
     // with its `all` opt forced — see `resolve_alias`'s own doc. Any other
     // id passes through unchanged.
-    let (base_id, forced_opts) = resolve_alias(&id);
+    let (base_id, forced_opts) = resolve_alias(id);
     let Some(spec) = panel_spec(base_id) else {
         return Err((
             StatusCode::NOT_FOUND,
             format!("unknown panel \"{id}\" — panels are a fixed allowlist, not arbitrary commands\n"),
         ));
     };
+    admit_audience(&spec, peer, headers)?;
+    Ok((spec, forced_opts))
+}
+
+pub(crate) async fn panel_handler(
+    Path(id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    headers: axum::http::HeaderMap,
+    State(state): State<AppState>,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
+    let (spec, forced_opts) = admit_panel_request(&id, peer.map(|c| c.0), &headers)?;
     // Canonical &'static id straight off the spec — one table, no second
     // lookup that could drift out from under it.
     let id: &'static str = spec.id;
@@ -969,6 +1044,18 @@ mod tests {
         assert!(panel_spec("rm -rf /").is_none());
         assert!(panel_spec("mission status").is_none(), "argv-looking ids are not ids");
         assert!(panel_spec("").is_none());
+    }
+
+    /// The classification table, stated independently of `panel_spec`: a
+    /// new panel must be placed here on purpose, with the reason in the
+    /// table's own comments.
+    #[test]
+    fn every_panel_has_a_stated_audience() {
+        let execution_surface = ["doctor", "config-list"];
+        for id in PANEL_IDS {
+            let want = if execution_surface.contains(id) { PanelAudience::LocalOrToken } else { PanelAudience::Read };
+            assert_eq!(panel_spec(id).unwrap().audience, want, "{id}");
+        }
     }
 
     /// The drift guard the three-parallel-tables shape could not have: the

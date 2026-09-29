@@ -233,13 +233,14 @@ impl Refusal {
         match self {
             Refusal::NoTokenConfigured => format!(
                 "{receiver} has no fleet token configured, so it takes no work from other machines \
-                 (the fleet token is the serve token: Keychain item `darkmux-serve-token` or \
-                 DARKMUX_SERVE_TOKEN, the same value on every machine)"
+                 (the fleet token is the serve token: Keychain item `darkmux-serve-token`, read only \
+                 when `serve.token_keychain` is on, or DARKMUX_SERVE_TOKEN; the same value on every machine)"
             ),
             Refusal::Token => format!(
                 "{receiver} refused the request: the fleet token is missing or does not match \
-                 (the serve token: Keychain item `darkmux-serve-token` or DARKMUX_SERVE_TOKEN; \
-                 every machine in the fleet holds the same value)"
+                 (the serve token: Keychain item `darkmux-serve-token`, read only when \
+                 `serve.token_keychain` is on, or DARKMUX_SERVE_TOKEN; every machine in the fleet holds \
+                 the same value)"
             ),
             Refusal::IdentityUnavailable { provider, detail } => format!(
                 "{receiver} cannot tell which machine sent this request ({provider}: {detail}), \
@@ -922,7 +923,8 @@ pub fn submit_work(job: WorkJob, wait: bool) -> Result<SubmissionReply> {
     if !darkmux_flow::serve_token_present() {
         return Err(anyhow!(
             "no fleet token on this machine: submitting work to {target} needs the serve token \
-             (Keychain item `darkmux-serve-token` or DARKMUX_SERVE_TOKEN), the same value {target} holds"
+             (Keychain item `darkmux-serve-token`, read only when `serve.token_keychain` is on, or \
+             DARKMUX_SERVE_TOKEN), the same value {target} holds"
         ));
     }
     let provider = sender_provider()?;
@@ -989,6 +991,17 @@ pub fn submit_work(job: WorkJob, wait: bool) -> Result<SubmissionReply> {
 mod tests {
     use super::*;
     use crate::identity::test_node;
+
+    /// (#2988 review) A machine whose Keychain item exists can still have no
+    /// token, because `serve.token_keychain` is the switch that reads it. The
+    /// no-token sentences name the switch, not only the item.
+    #[test]
+    fn the_no_token_sentence_names_the_switch_that_reads_the_keychain() {
+        let said = Refusal::NoTokenConfigured.reason("studio");
+        assert!(said.contains("serve.token_keychain"), "{said}");
+        let said = Refusal::Token.reason("studio");
+        assert!(said.contains("serve.token_keychain"), "{said}");
+    }
 
     fn entry(node_id: Option<&str>, profiles: &[&str], workspace: bool) -> AcceptWorkEntry {
         AcceptWorkEntry {

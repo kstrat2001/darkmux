@@ -552,7 +552,7 @@ pub fn address_host_is_bare_ip(address: &str) -> bool {
     // parses as the same IP once it's stripped.
     let unbracketed = unbracketed.strip_suffix('.').unwrap_or(unbracketed);
     if let Ok(ip) = unbracketed.parse::<std::net::IpAddr>() {
-        return !ip.is_loopback();
+        return !ip.to_canonical().is_loopback();
     }
     match without_scheme.rsplit_once(':') {
         Some((host, _port)) => {
@@ -562,7 +562,7 @@ pub fn address_host_is_bare_ip(address: &str) -> bool {
                 .unwrap_or(host);
             let host = host.strip_suffix('.').unwrap_or(host);
             host.parse::<std::net::IpAddr>()
-                .map(|ip| !ip.is_loopback())
+                .map(|ip| !ip.to_canonical().is_loopback())
                 .unwrap_or(false)
         }
         None => false,
@@ -864,6 +864,13 @@ mod address_host_is_bare_ip_tests {
     #[test]
     fn ipv4_with_port_is_a_bare_ip() {
         assert!(address_host_is_bare_ip("100.64.0.5:8765"));
+    }
+
+    #[test]
+    fn an_ipv4_mapped_loopback_is_loopback_not_a_bare_ip() {
+        assert!(!address_host_is_bare_ip("::ffff:127.0.0.1"));
+        assert!(!address_host_is_bare_ip("[::ffff:127.0.0.1]:8765"));
+        assert!(address_host_is_bare_ip("[::ffff:100.64.0.5]:8765"), "a mapped tailnet address is still bare");
     }
 
     #[test]

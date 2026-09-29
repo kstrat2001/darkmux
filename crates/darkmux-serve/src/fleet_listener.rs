@@ -534,7 +534,7 @@ impl Worker {
     /// re-applied. Returns the entry as it stands now and the profile.
     ///
     /// In production the daemon reads the fleet token once
-    /// (`serve_token`'s Keychain tier and `daemon_auth_enabled` are cached
+    /// (`serve_token`'s Keychain tier and `serve.token_keychain` are cached
     /// for the process), so a rotated or removed token is seen only after a
     /// restart, which drops the queue anyway; the token check here holds
     /// for whatever `state.token` returns.
@@ -756,7 +756,7 @@ pub(crate) fn listen_addr(local: &darkmux_fleet::NodeIdentity, port: u16) -> Res
         .or_else(|| local.addresses.first())
         .copied()
         .ok_or_else(|| "the identity provider reports no overlay address for this machine".to_string())?;
-    if ip.is_unspecified() || (ip.is_loopback() && !LOOPBACK_FOR_E2E) || ip.is_multicast() {
+    if ip.is_unspecified() || (ip.to_canonical().is_loopback() && !LOOPBACK_FOR_E2E) || ip.is_multicast() {
         return Err(format!("refusing to bind the fleet listener to {ip}: not a specific overlay address"));
     }
     Ok(SocketAddr::new(ip, port))
@@ -987,8 +987,9 @@ pub(crate) fn spawn_if_enabled(shutdown: tokio::sync::watch::Receiver<bool>) {
 
 async fn run(mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<(), String> {
     if !darkmux_flow::serve_token_present() {
-        return Err("no fleet token (the serve token: Keychain item `darkmux-serve-token` or \
-                    DARKMUX_SERVE_TOKEN); a listener that cannot check a token takes no work"
+        return Err("no fleet token (the serve token: Keychain item `darkmux-serve-token`, read only \
+                    when `serve.token_keychain` is on, or DARKMUX_SERVE_TOKEN); a listener that cannot \
+                    check a token takes no work"
             .into());
     }
     let provider: Arc<dyn IdentityProvider> =
@@ -1906,24 +1907,20 @@ mod tests {
         assert!(r.reason.unwrap().contains("as many jobs queued"));
     }
 
-    /// A caller without the token is answered before the allow-list is
-    /// read or the provider runs.
-    #[test]
-    fn a_caller_without_the_token_reads_nothing() {
-        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let r = reads.clone();
-        let provider = StaticIdentityProvider {
-            local: test_node("nSTUDIO", "studio", "100.64.0.2"),
-            peers: vec![laptop()],
-            down: None,
-        };
-        let state = FleetListenerState {
+    /// A listener state whose allow-list read is counted in `reads` and
+    /// whose executor must never run: for tests about what the gate refuses.
+    fn gate_only_state(reads: Arc<std::sync::atomic::AtomicUsize>) -> FleetListenerState {
+        FleetListenerState {
             receiver: "studio".into(),
-            provider: Arc::new(provider),
+            provider: Arc::new(StaticIdentityProvider {
+                local: test_node("nSTUDIO", "studio", "100.64.0.2"),
+                peers: vec![laptop()],
+                down: None,
+            }),
             local_node_id: Some("nSTUDIO".into()),
             token: Arc::new(|| Some(TOKEN.to_string())),
             allow_list: Arc::new(move || {
-                r.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok(allow())
             }),
             resolve_profile: Arc::new(|_, _| test_resolution(None)),
@@ -1936,20 +1933,53 @@ mod tests {
             refusal_log: Arc::new(RefusalLog::new()),
             node_slots: Arc::new(KeySlots::new(NODE_CAP)),
             config_preflight: Arc::new(|| Ok(())),
-        };
+        }
+    }
+
+    /// Submit a job from a loopback peer carrying `headers`; returns the
+    /// status and how many times the allow-list was read.
+    fn submit_from_loopback(headers: &[(&str, &str)]) -> (StatusCode, usize) {
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let state = gate_only_state(reads.clone());
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let resp = rt.block_on(async {
             use tower::ServiceExt;
             let body = serde_json::to_vec(&WorkSubmission::new(job("s", None), true)).unwrap();
-            let mut req = axum::http::Request::post(darkmux_fleet::SUBMISSION_PATH)
-                .header("Authorization", "Bearer wrong")
-                .body(axum::body::Body::from(body))
-                .unwrap();
+            let mut b = axum::http::Request::post(darkmux_fleet::SUBMISSION_PATH);
+            for (k, v) in headers {
+                b = b.header(*k, *v);
+            }
+            let mut req = b.body(axum::body::Body::from(body)).unwrap();
             req.extensions_mut().insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 5000))));
             router(state).oneshot(req).await.unwrap()
         });
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 0, "the allow-list was read for a caller without the token");
+        (resp.status(), reads.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// A caller without the token is answered before the allow-list is
+    /// read or the provider runs.
+    #[test]
+    fn a_caller_without_the_token_reads_nothing() {
+        let (status, reads) = submit_from_loopback(&[("Authorization", "Bearer wrong")]);
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(reads, 0, "the allow-list was read for a caller without the token");
+    }
+
+    /// (#2988 follow-up) Execution never inherits the read posture: a work
+    /// submission that arrives through a reverse proxy (`tailscale serve`'s
+    /// headers) with no token is refused before anything is read, whatever
+    /// `serve.read_auth` says. The fleet gate reads no read-auth switch.
+    #[test]
+    fn a_proxied_submission_without_the_token_is_refused() {
+        for proxied in [
+            ("X-Forwarded-For", "100.64.0.7"),
+            ("Tailscale-User-Login", "someone@example.com"),
+            ("Forwarded", "for=100.64.0.7"),
+        ] {
+            let (status, reads) = submit_from_loopback(&[proxied]);
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{proxied:?}");
+            assert_eq!(reads, 0, "{proxied:?}");
+        }
     }
 
     /// A request with no peer address is refused (fail closed), even with
@@ -2286,6 +2316,18 @@ mod tests {
         assert_eq!(listener_state(true).as_deref(), Some("listening on 100.64.0.2:8766"));
     }
 
+    /// (#2988 review) The listener's no-token reason names the switch that
+    /// reads the Keychain, so an operator with the item stored is not told it
+    /// is missing.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_listener_without_a_token_names_the_keychain_switch() {
+        unsafe { std::env::remove_var("DARKMUX_SERVE_TOKEN") };
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let said = run(rx).await.expect_err("no token, no listener");
+        assert!(said.contains("serve.token_keychain"), "{said}");
+    }
+
     #[test]
     fn the_open_file_limit_is_raised_never_lowered() {
         let (old, new) = crate::raise_open_file_limit(1).expect("getrlimit works");
@@ -2299,7 +2341,7 @@ mod tests {
     fn the_listener_binds_only_a_specific_overlay_address() {
         let local = test_node("n", "studio", "100.64.0.2");
         assert_eq!(listen_addr(&local, 8766).unwrap().to_string(), "100.64.0.2:8766");
-        for bad in ["0.0.0.0", "127.0.0.1", "::"] {
+        for bad in ["0.0.0.0", "127.0.0.1", "::", "::ffff:127.0.0.1"] {
             let n = test_node("n", "studio", bad);
             assert!(listen_addr(&n, 8766).is_err(), "{bad}");
         }

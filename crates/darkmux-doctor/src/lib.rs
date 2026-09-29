@@ -201,7 +201,8 @@ pub fn run() -> DoctorReport {
         check_audit_write_drops(),
         check_unknown_flow_actions(),
         check_state_file_permissions(),
-        check_daemon_auth(),
+        check_serve_daemon_token(),
+        check_serve_reads(),
         check_utility_model_binding(),
         check_utility_model_in_profiles(),
         check_unpriceable_residents(),
@@ -1027,7 +1028,7 @@ fn describe_root_violations(label: &str, tally: &RootTally) -> String {
 /// (#1839) Describes, never adjudicates: the message states counts and
 /// modes; the hint states the remedy. Neither ever characterizes the
 /// operator's exposure ("safe", "at risk", "for compliance") — see
-/// `daemon_auth_status`'s own doc for the same rule applied to the
+/// `serve_token_status`'s own doc for the same rule applied to the
 /// serve-token check.
 #[cfg(unix)]
 fn build_state_file_permissions_check(roots: &[ScanRoot], budget: usize) -> Check {
@@ -1162,47 +1163,80 @@ fn check_state_file_permissions() -> Check {
     not_applicable(STATE_FILE_PERMS_CHECK_NAME, "POSIX file modes only — Windows ACLs are a separate story")
 }
 
-/// Pure decision for `check_daemon_auth` (#881) — split out so both arms are
-/// testable without touching the Keychain/env. Always informational (never a
-/// Warn): a loopback-only daemon with no token is the SAFE default, and the
-/// refuse-to-bind gate already blocks the unsafe non-loopback-without-token
-/// state at runtime, so there's nothing to cry wolf about here.
-fn daemon_auth_status(token_present: bool) -> (Status, String, Option<String>) {
+/// Pure decision for the `serve daemon token` row (#881) — split out so both
+/// arms are testable without touching the Keychain/env. Always informational
+/// (never a Warn): a loopback-only daemon with no token is the ordinary
+/// single-machine state, and `serve` refuses the non-loopback bind itself.
+/// The token is the EXECUTION credential (#2988); what reads need is the
+/// separate `serve reads` row.
+fn serve_token_status(token_present: bool) -> (Status, String, Option<String>) {
     if token_present {
         (
             Status::Pass,
-            "serve token configured — non-loopback bind allowed; remote reads + /diff require the bearer token".into(),
+            "serve token resolves — fleet work submission requires it (with a verified sender); reads need it only \
+             when serve.read_auth is on"
+                .into(),
             None,
         )
     } else {
         (
             Status::Pass,
-            "no serve token — the daemon is loopback-only (a non-loopback `--bind` is refused)".into(),
+            "no serve token — the daemon is loopback-only and this machine takes and sends no fleet work".into(),
             Some(
-                "To expose the daemon across your fleet \
-                 (e.g. `fleet status --deep`), set ONE shared bearer token on every machine: \
+                "To take or send fleet work, set ONE shared bearer token on every machine: \
                  `security add-generic-password -U -a \"$USER\" -s darkmux-serve-token -w` (macOS) + \
-                 `daemon_auth_enabled: true` in ~/.darkmux/config.json, or export DARKMUX_SERVE_TOKEN."
+                 `darkmux config set serve.token_keychain true`, or export DARKMUX_SERVE_TOKEN."
                     .into(),
             ),
         )
     }
 }
 
-/// `serve daemon token`: reports whether a shared fleet token is configured
-/// (#881). Both arms return `Pass` by design — a loopback-only daemon with no
-/// token is the ordinary single-machine state, and the bind gate refuses the
-/// unsafe combination at runtime, so there is nothing here to cry wolf about.
-///
-/// Named for the STATE it reports, not for a posture (#1839). It was
-/// `serve daemon auth`, and a check that (a) names a security concern and
-/// (b) is structurally incapable of any status but ✓ reads, inside doctor's
-/// `● ok — every check passed` headline, as a security check that cleared.
-/// It never checked anything of the sort. `token` says what it actually
-/// looks at: whether one is set.
-fn check_daemon_auth() -> Check {
-    let (status, message, hint) = daemon_auth_status(darkmux_flow::serve_token_present());
+/// Pure decision for the `serve reads` row (#2988): what a READ from off
+/// this machine needs, independent of whether a token exists. Read auth on
+/// with no token is a `Fail` because `darkmux serve` refuses to start in it.
+fn serve_reads_status(read_auth: bool, token_present: bool) -> (Status, String, Option<String>) {
+    match (read_auth, token_present) {
+        (false, _) => (
+            Status::Pass,
+            "open to whatever reaches the daemon, including tailnet peers through `tailscale serve` \
+             (serve.read_auth off)"
+                .into(),
+            Some("To require the serve token for reads from off this machine: `darkmux config set serve.read_auth true`.".into()),
+        ),
+        (true, true) => (
+            Status::Pass,
+            "a read not from this machine needs the serve token, proxied requests included (serve.read_auth on)".into(),
+            None,
+        ),
+        (true, false) => (
+            Status::Fail,
+            "serve.read_auth is on but no serve token resolves — `darkmux serve` refuses to start".into(),
+            Some(
+                "Store the token: `security add-generic-password -U -a \"$USER\" -s darkmux-serve-token -w` + \
+                 `darkmux config set serve.token_keychain true` (or export DARKMUX_SERVE_TOKEN), or \
+                 `darkmux config set serve.read_auth false`."
+                    .into(),
+            ),
+        ),
+    }
+}
+
+/// `serve daemon token`: reports whether the shared fleet token resolves
+/// (#881). Named for the STATE it reports, not for a posture (#1839): a
+/// check that names a security concern and can only ever pass reads as a
+/// security check that cleared.
+fn check_serve_daemon_token() -> Check {
+    let (status, message, hint) = serve_token_status(darkmux_flow::serve_token_present());
     Check { name: "serve daemon token".into(), status, message, hint }
+}
+
+/// `serve reads`: the read posture (#2988), beside the token row so doctor
+/// shows both.
+fn check_serve_reads() -> Check {
+    let (status, message, hint) =
+        serve_reads_status(darkmux_types::config_access::serve_read_auth(), darkmux_flow::serve_token_present());
+    Check { name: "serve reads".into(), status, message, hint }
 }
 
 /// `utility model`: surfaces the machine-level `internal.utility` binding
@@ -11824,8 +11858,11 @@ mod tests {
         //
         // (4.0 unknown-key gate) 66: `check_user_file_keys` contributes one
         // Pass row when every user file is clean, as it is here.
+        //
+        // (#2988) 67: `check_serve_reads` joined beside the token row, so
+        // doctor shows the read posture and the execution posture.
         let expected =
-            66 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
+            67 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
@@ -11936,22 +11973,41 @@ mod tests {
         );
     }
 
-    // ─── check_daemon_auth (#881) ─────────────────────────────────────
+    // ─── serve token + serve reads (#881, #2988) ───────────────────────
     #[test]
-    fn daemon_auth_status_arms() {
-        // Token set → Pass, no hint.
-        let (s, _msg, hint) = daemon_auth_status(true);
+    fn serve_token_status_arms() {
+        // Token set → Pass, no hint; it is the execution credential.
+        let (s, msg, hint) = serve_token_status(true);
         assert_eq!(s, Status::Pass);
+        assert!(msg.contains("fleet work"), "says what the token is for: {msg}");
         assert!(hint.is_none());
-        // No token → still Pass (loopback-only is the SAFE default; the bind
-        // gate enforces safety), but with an actionable enabling hint.
-        let (s, _msg, hint) = daemon_auth_status(false);
+        // No token → still Pass (loopback-only is the ordinary single-machine
+        // state; the bind gate enforces it), with an actionable hint.
+        let (s, _msg, hint) = serve_token_status(false);
         assert_eq!(s, Status::Pass, "no-token is not a Warn — don't cry wolf on the safe default");
         let h = hint.expect("the no-token arm gives an enabling hint");
-        assert!(
-            h.contains("darkmux-serve-token") || h.contains("DARKMUX_SERVE_TOKEN"),
-            "hint should name how to set the token: {h}"
-        );
+        assert!(h.contains("darkmux-serve-token") && h.contains("serve.token_keychain"), "{h}");
+    }
+
+    /// (#2988 follow-up) The read posture is its own row, independent of the
+    /// token: off → reads open; on → a request not from this machine
+    /// (proxied included) needs the token; on without a token → `serve`
+    /// refuses to start, which doctor reports as the failure it is.
+    #[test]
+    fn serve_reads_status_reports_each_posture() {
+        for token in [false, true] {
+            let (s, msg, _) = serve_reads_status(false, token);
+            assert_eq!(s, Status::Pass);
+            assert!(msg.contains("open") && msg.contains("serve.read_auth"), "{msg}");
+        }
+        let (s, msg, hint) = serve_reads_status(true, true);
+        assert_eq!(s, Status::Pass);
+        assert!(msg.contains("proxied"), "names the proxied case: {msg}");
+        assert!(hint.is_none());
+        let (s, msg, hint) = serve_reads_status(true, false);
+        assert_eq!(s, Status::Fail);
+        assert!(msg.contains("refuses to start"), "{msg}");
+        assert!(hint.unwrap().contains("darkmux-serve-token"));
     }
 
     /// (#1839) darkmux describes its own state; it does not adjudicate the
@@ -11963,22 +12019,27 @@ mod tests {
     /// "Safe as-is for a single machine." Conditionally true, and false for
     /// the setup the project actually recommends — a loopback daemon behind a
     /// Tailscale reverse proxy, where the same daemon is reachable by the
-    /// whole tailnet and this check never looked at the proxy.
+    /// whole tailnet.
     #[test]
-    fn daemon_auth_and_redis_hints_state_facts_without_rendering_a_verdict() {
+    fn serve_auth_hints_state_facts_without_rendering_a_verdict() {
         let verdicts = ["safe as-is", "is fine", "secure", "protected", "no risk", "for compliance"];
-        let (_, msg_t, hint_t) = daemon_auth_status(true);
-        let (_, msg_f, hint_f) = daemon_auth_status(false);
-        for text in [msg_t, msg_f, hint_t.unwrap_or_default(), hint_f.unwrap_or_default()] {
+        let mut texts = Vec::new();
+        for t in [false, true] {
+            let (_, m, h) = serve_token_status(t);
+            texts.extend([m, h.unwrap_or_default()]);
+            for r in [false, true] {
+                let (_, m, h) = serve_reads_status(r, t);
+                texts.extend([m, h.unwrap_or_default()]);
+            }
+        }
+        for text in texts {
             let low = text.to_lowercase();
             for v in verdicts {
                 assert!(!low.contains(v), "doctor must not adjudicate the operator's posture ({v:?}): {text}");
             }
         }
-        // Still says the useful part: what is configured, and how to change it.
-        let (_, msg, hint) = daemon_auth_status(false);
+        let (_, msg, _) = serve_token_status(false);
         assert!(msg.contains("loopback-only"), "still reports the actual state: {msg}");
-        assert!(hint.unwrap().contains("darkmux-serve-token"), "still actionable");
     }
 
     // ─── check_state_file_permissions (#2452) ──────────────────────────

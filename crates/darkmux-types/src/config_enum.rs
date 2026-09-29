@@ -149,10 +149,15 @@ pub enum Scope {
     /// Fleet work submission: the daemon's work-submission listener and the
     /// sending side, both of which build the identity provider.
     FleetSubmission,
+    /// `darkmux serve`: the daemon reads `config.json` for its bind address,
+    /// its read posture and its fleet listener, so it refuses one that fails
+    /// the schema before it binds anything.
+    Serve,
 }
 
 impl Scope {
-    pub const ALL: [Scope; 4] = [Scope::Dispatch, Scope::MissionLaunch, Scope::LabRun, Scope::FleetSubmission];
+    pub const ALL: [Scope; 5] =
+        [Scope::Dispatch, Scope::MissionLaunch, Scope::LabRun, Scope::FleetSubmission, Scope::Serve];
 
     /// How the refusal names the entry point.
     pub fn label(self) -> &'static str {
@@ -161,6 +166,7 @@ impl Scope {
             Scope::MissionLaunch => "mission launch",
             Scope::LabRun => "lab run",
             Scope::FleetSubmission => "fleet work submission",
+            Scope::Serve => "serve",
         }
     }
 }
@@ -761,16 +767,19 @@ pub static ENUM_SETTINGS: &[EnumSetting] = &[
         "fleet.identity.provider",
         None,
         "tailscale",
-        &[Scope::FleetSubmission],
+        &[Scope::FleetSubmission, Scope::Serve],
         read_fleet_identity_provider,
     ),
     // (#2916 stage 2) Read by the fleet listener, which runs the fleet
-    // submission preflight when it builds its identity provider.
+    // submission preflight when it builds its identity provider. The serve
+    // daemon starts that listener, so `serve` refuses a bad value too
+    // (`fleet.identity.provider` above shares the reason). `fleet.mode` stays
+    // unscoped: nothing in the daemon or its listener reads it.
     EnumSetting::of::<crate::config::BusyPolicy>(
         "fleet.busy_policy",
         Some("DARKMUX_FLEET_BUSY_POLICY"),
         "refuse",
-        &[Scope::FleetSubmission],
+        &[Scope::FleetSubmission, Scope::Serve],
         read_fleet_busy_policy,
     ),
     // (#2947 review C2) A typo here used to match nothing, silently.
