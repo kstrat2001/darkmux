@@ -444,8 +444,6 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
-            work_id: None,
-            attempt: None,
         }
     }
 
@@ -911,8 +909,6 @@ mod cost_check {
                     prev_hash: None,
                     hash: None,
                     payload: None,
-                    work_id: None,
-                    attempt: None,
                 },
                 80,
             ));

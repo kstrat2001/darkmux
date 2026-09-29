@@ -358,8 +358,6 @@ pub fn build_machine_scoped_telemetry_record_with(
         prev_hash: None,
         hash: None,
         payload: Some(payload),
-        work_id: None,
-        attempt: None,
     }
 }
 

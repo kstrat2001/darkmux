@@ -3511,8 +3511,6 @@ fn emit_hook_record_with(
         prev_hash: None,
         hash: None,
         payload: Some(payload),
-        work_id: None,
-        attempt: None,
     };
     let label = rec.action.to_string();
     if let Err(e) = crate::record_to(report_sink, rec) {
@@ -3553,8 +3551,6 @@ fn emit_dry_run_record(report_sink: &dyn FlowSink, rt: &RuleRuntime, delivered_l
         prev_hash: None,
         hash: None,
         payload: Some(payload),
-        work_id: None,
-        attempt: None,
     };
     if let Err(e) = crate::record_to(report_sink, rec) {
         eprintln!("flow::HookSink: failed to emit hook.dry_run: {e:#}");
@@ -3605,8 +3601,6 @@ fn maybe_warn_dropped(rt: &RuleRuntime, report_sink: &dyn FlowSink, max_outbox_m
             "error": reason,
             "dropped_count": dropped_count,
         })),
-        work_id: None,
-        attempt: None,
     };
     if let Err(e) = crate::record_to(report_sink, rec) {
         eprintln!("flow::HookSink: failed to emit hook.failed (dropped-append warning): {e:#}");
@@ -3663,8 +3657,6 @@ fn maybe_warn_busy(rt: &RuleRuntime, report_sink: &dyn FlowSink, orphan_count: u
             "error": reason,
             "orphaned_transforms": orphan_count,
         })),
-        work_id: None,
-        attempt: None,
     };
     if let Err(e) = crate::record_to(report_sink, rec) {
         eprintln!("flow::HookSink: failed to emit hook.failed (busy warning): {e:#}");
@@ -4616,8 +4608,6 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
-            work_id: None,
-            attempt: None,
         }
     }
 

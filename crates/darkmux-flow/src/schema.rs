@@ -2134,9 +2134,11 @@ pub enum Tier {
 #[serde(rename_all = "kebab-case")]
 pub enum Stage {
     Scope,
-    Estimate,
     Dispatch,
     Review,
+    /// Delivery of records outward: the hook sink's own `hook.*` records
+    /// (delivery, dry run, dropped, busy). No work-lifecycle record carries
+    /// it.
     Ship,
     /// Post-mission review stage (#999, NASA vocabulary — Mission · Crew ·
     /// Debrief · Lessons). The mission debrief ceremony (#1000) distills the
@@ -2265,18 +2267,6 @@ pub struct FlowRecord {
     /// FlowRecord fields, just not the event-specific extras.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payload: Option<serde_json::Value>,
-    /// Work-queue claim id, from when a job could flow through the global
-    /// `darkmux:work` stream. That queue is retired (#2916), so no current
-    /// producer sets it; kept so archived records still parse. Schema 1.8
-    /// addition (#246).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub work_id: Option<String>,
-    /// Retry counter for queued work — 1 on first attempt, 2+ on retries
-    /// after lease expiry. Surfaces in `darkmux doctor` as a "recent
-    /// retries" rollup. Absent on direct local dispatches (no retry
-    /// semantics outside the queue). Schema 1.8 addition (#246).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub attempt: Option<u32>,
 }
 
 impl FlowRecord {
@@ -2313,8 +2303,6 @@ impl FlowRecord {
             prev_hash: None,
             hash: None,
             payload: None,
-            work_id: None,
-            attempt: None,
         }
     }
 }

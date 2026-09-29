@@ -5511,8 +5511,6 @@ fn synthetic_stream_error_record(stream_name: &str, attempts: u32, reason: &str)
         prev_hash: None,
         hash: None,
         payload: None,
-        work_id: None,
-        attempt: None,
     };
     serde_json::to_string(&record).unwrap_or_default()
 }

@@ -201,7 +201,6 @@ const CATEGORY_WIRE = {
 
 const STAGE_WIRE = {
   Scope: "scope",
-  Estimate: "estimate",
   Dispatch: "dispatch",
   Review: "review",
   Ship: "ship",

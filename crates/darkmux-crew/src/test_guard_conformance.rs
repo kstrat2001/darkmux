@@ -271,8 +271,6 @@ mod tests {
                 prev_hash: None,
                 hash: None,
                 payload: None,
-                work_id: None,
-                attempt: None,
             })
             .expect("the flow write must succeed, or this probe proves nothing");
 

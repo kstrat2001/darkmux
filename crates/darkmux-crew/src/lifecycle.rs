@@ -511,8 +511,6 @@ pub(crate) fn load_phase_by_id(phase_id: &str) -> Result<Phase> {
                 prev_hash: None,
                 hash: None,
                 payload: None,
-                work_id: None,
-                attempt: None,
             });
             Ok(chosen.clone())
         }

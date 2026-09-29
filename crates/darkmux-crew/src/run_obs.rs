@@ -83,8 +83,6 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
-            work_id: None,
-            attempt: None,
         });
     }
 }

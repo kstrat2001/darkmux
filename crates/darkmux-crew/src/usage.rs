@@ -319,8 +319,6 @@ pub fn utility_usage_record(job_role_id: &str, model: &str, execution: &Executio
         prev_hash: None,
         hash: None,
         payload: Some(payload),
-        work_id: None,
-        attempt: None,
     }
 }
 

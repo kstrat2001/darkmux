@@ -348,6 +348,17 @@ mod tests {
         assert_eq!(rec.execution_id.unwrap().as_str(), "legacy:task-t:m1");
     }
 
+    /// A record written before the queue fields were dropped still reads: the
+    /// typed record has no `work_id` / `attempt`, and parsing ignores them.
+    #[test]
+    fn an_archived_record_carrying_dropped_fields_still_parses() {
+        let line = r#"{"ts":"2026-01-01T00:00:00Z","level":"info","category":"work","tier":"local","stage":"estimate","action":"operator.note","handle":"h","work_id":"1-0","attempt":2}"#;
+        let record = parse_record(line).expect("archive line parses");
+        assert!(matches!(record.stage, crate::Stage::Unknown), "{:?}", record.stage);
+        let back = serde_json::to_value(&record).unwrap();
+        assert!(back.get("work_id").is_none() && back.get("attempt").is_none());
+    }
+
     #[test]
     fn a_current_spelling_is_left_alone() {
         let mut v = json!({"action": "dispatch.start"});

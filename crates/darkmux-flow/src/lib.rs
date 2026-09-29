@@ -2100,8 +2100,6 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
-            work_id: None,
-            attempt: None,
         }
     }
 
@@ -2206,8 +2204,6 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
-            work_id: None,
-            attempt: None,
         };
 
         record_at(&record, &path).unwrap();
@@ -2249,8 +2245,6 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
-            work_id: None,
-            attempt: None,
         };
 
         record_at(&r("first"), &path).unwrap();
@@ -2338,7 +2332,7 @@ mod tests {
             level: Level::Warn,
             category: Category::Audit,
             tier: Tier::Local,
-            stage: Stage::Estimate,
+            stage: Stage::Review,
             action: crate::FlowAction::OperatorNote,
             handle: "handle-42".to_string(),
             phase_id: Some("sp-100".to_string()),
@@ -2353,8 +2347,6 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
-            work_id: None,
-            attempt: None,
         };
 
         record_at(&record, &path).unwrap();
@@ -2371,7 +2363,7 @@ mod tests {
         assert_eq!(parsed["level"], "warn");
         assert_eq!(parsed["category"], "audit");
         assert_eq!(parsed["tier"], "local");
-        assert_eq!(parsed["stage"], "estimate");
+        assert_eq!(parsed["stage"], "review");
         assert_eq!(parsed["action"], "operator.note");
         assert_eq!(parsed["handle"], "handle-42");
 
@@ -2421,8 +2413,6 @@ mod tests {
                 prev_hash: None,
                 hash: None,
                 payload: None,
-                work_id: None,
-                attempt: None,
             },
             &tmp.path().join("custom.jsonl"),
         )
@@ -2468,8 +2458,6 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
-            work_id: None,
-            attempt: None,
         };
 
         record_at(&record, &path).unwrap();
@@ -2524,8 +2512,6 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
-            work_id: None,
-            attempt: None,
         };
 
         // Capture the day-key BEFORE calling record() so a midnight-UTC
@@ -2672,8 +2658,6 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
-            work_id: None,
-            attempt: None,
         };
         sink.write(&rec).unwrap();
 
@@ -2852,8 +2836,6 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
-            work_id: None,
-            attempt: None,
         };
 
         record_via(&sink, &rec).unwrap();
@@ -2894,8 +2876,6 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
-            work_id: None,
-            attempt: None,
         };
         tee.write(&rec).unwrap();
         tee.write(&rec).unwrap();
@@ -2950,8 +2930,6 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
-            work_id: None,
-            attempt: None,
         };
         let err = tee.write(&rec).unwrap_err();
         // Caller sees the error (so they can react if they want)
@@ -2994,8 +2972,6 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
-            work_id: None,
-            attempt: None,
         };
         super::record(rec).unwrap();
 
@@ -3404,6 +3380,15 @@ mod tests {
     }
 
     #[test]
+    fn a_retired_stage_reads_as_unknown_and_is_never_written() {
+        // `estimate` was a stage nothing ever emitted; an archive that
+        // somehow carries one still parses, as `Unknown`.
+        let parsed: Stage = serde_json::from_str("\"estimate\"").unwrap();
+        assert!(matches!(parsed, Stage::Unknown), "{parsed:?}");
+        assert_eq!(serde_json::to_string(&Stage::Unknown).unwrap(), "\"unknown\"");
+    }
+
+    #[test]
     fn stage_tier_decision_round_trips_as_kebab_case() {
         // Schema 1.3 introduced Stage::TierDecision and changed the
         // serde rename from `lowercase` to `kebab-case`. Both directions
@@ -3411,7 +3396,6 @@ mod tests {
         // for the existing single-word variants (which should be no-ops).
         for (variant, expected) in [
             (Stage::Scope, "scope"),
-            (Stage::Estimate, "estimate"),
             (Stage::Dispatch, "dispatch"),
             (Stage::Review, "review"),
             (Stage::Ship, "ship"),
@@ -3452,8 +3436,6 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
-            work_id: None,
-            attempt: None,
         };
         let serialized = serde_json::to_string(&rec).unwrap();
         assert!(!serialized.contains("reasoning"),
@@ -3488,8 +3470,6 @@ mod tests {
                 prev_hash: None,
                 hash: None,
                 payload: None,
-                work_id: None,
-                attempt: None,
             },
             &path,
         )
@@ -3672,8 +3652,6 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
-            work_id: None,
-            attempt: None,
         };
         let s = serde_json::to_string(&rec).unwrap();
         assert!(!s.contains("machine_id"), "machine_id should omit when None: {s}");
@@ -3701,8 +3679,6 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
-            work_id: None,
-            attempt: None,
         };
         let s = serde_json::to_string(&rec).unwrap();
         let parsed: FlowRecord = serde_json::from_str(&s).unwrap();
@@ -3745,8 +3721,6 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
-            work_id: None,
-            attempt: None,
         };
         super::record(rec).unwrap();
 
@@ -3797,8 +3771,6 @@ mod tests {
             prev_hash: Some("seed".to_string()),
             hash: None,
             payload: None,
-            work_id: None,
-            attempt: None,
         };
         let mut other = base.clone();
         other.hash = Some("anything".to_string());
@@ -3831,8 +3803,6 @@ mod tests {
             prev_hash: Some("seed".to_string()),
             hash: None,
             payload: None,
-            work_id: None,
-            attempt: None,
         };
         let h1 = audit_hash_of(&base).unwrap();
 
@@ -3843,103 +3813,6 @@ mod tests {
         let mut diff_prev = base.clone();
         diff_prev.prev_hash = Some("different-seed".to_string());
         assert_ne!(audit_hash_of(&diff_prev).unwrap(), h1);
-
-        // PR-A schema 1.8 fields — must each contribute to the hash so a
-        // future refactor that accidentally swapped `skip_serializing_if`
-        // for `skip` (which omits the field from serialization entirely)
-        // can't silently weaken the tamper-evidence invariant. (#246
-        // PR-A review M1)
-        let mut diff_work_id = base.clone();
-        diff_work_id.work_id = Some("1716192000000-0".to_string());
-        assert_ne!(
-            audit_hash_of(&diff_work_id).unwrap(),
-            h1,
-            "work_id must contribute to audit hash"
-        );
-
-        let mut diff_attempt = base.clone();
-        diff_attempt.attempt = Some(2);
-        assert_ne!(
-            audit_hash_of(&diff_attempt).unwrap(),
-            h1,
-            "attempt must contribute to audit hash"
-        );
-    }
-
-    /// Cross-version audit-chain walk: records that lack the schema-1.8
-    /// fields (work_id / attempt) must still validate
-    /// under 1.8 reader code. The invariant rides on
-    /// `skip_serializing_if = "Option::is_none"` — re-serialization of
-    /// a None-valued field produces the same bytes a pre-1.8 writer
-    /// would have produced, so the hash chain walks cleanly across the
-    /// version boundary. (#246 PR-A review M2)
-    #[serial_test::serial]
-    #[test]
-    fn integrity_walks_pre_1_8_records() {
-        let tmp = TempDir::new().unwrap();
-        let prev_audit = env::var("DARKMUX_AUDIT_DIR").ok();
-        unsafe { env::set_var("DARKMUX_AUDIT_DIR", tmp.path()); }
-
-        // Write records with all new schema-1.8 fields explicitly None.
-        // The on-disk JSON lines omit those keys (skip_serializing_if),
-        // which is byte-identical to what a pre-1.8 writer produced.
-        let sink = AuditFileSink::new();
-        for i in 0..3u32 {
-            let rec = FlowRecord {
-                ts: format!("2026-05-15T00:00:0{i}Z"),
-                level: Level::Info,
-                category: Category::Work,
-                tier: Tier::Operator,
-                stage: Stage::Scope,
-                action: crate::FlowAction::OperatorNote,
-                handle: format!("h-{i}"),
-                phase_id: None,
-                session_id: None,
-                execution_id: None,
-                source: None,
-                model: None,
-                reasoning: None,
-                mission_id: None,
-                machine_id: None,
-                machine_uid: None,
-                prev_hash: None,
-                hash: None,
-                payload: None,
-                work_id: None,
-                attempt: None,
-            };
-            sink.write(&rec).unwrap();
-        }
-
-        // Confirm the on-disk JSON does NOT carry the new keys — that's
-        // the "pre-1.8 shape" assertion.
-        let day = day_utc_now();
-        let path = tmp.path().join(format!("{day}.jsonl"));
-        let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            !raw.contains("\"work_id\""),
-            "None-valued work_id must be omitted"
-        );
-        assert!(
-            !raw.contains("\"attempt\""),
-            "None-valued attempt must be omitted"
-        );
-
-        // The chain walks cleanly — same invariant as a real pre-1.8 file
-        // produced by an older darkmux build.
-        let report = integrity_check_file(&path).unwrap();
-        assert!(
-            report.chain_valid,
-            "cross-version chain must validate; reason: {report:?}"
-        );
-        assert_eq!(report.records_checked, 3);
-
-        unsafe {
-            match prev_audit {
-                Some(v) => env::set_var("DARKMUX_AUDIT_DIR", v),
-                None => env::remove_var("DARKMUX_AUDIT_DIR"),
-            }
-        }
     }
 
     #[serial_test::serial]
@@ -3971,8 +3844,6 @@ mod tests {
                 prev_hash: None, // sink stamps this
                 hash: None,      // sink stamps this
                 payload: None,
-                work_id: None,
-                attempt: None,
             };
             sink.write(&rec).unwrap();
         }
@@ -4021,8 +3892,6 @@ mod tests {
                 prev_hash: None,
                 hash: None,
                 payload: None,
-                work_id: None,
-                attempt: None,
             };
             sink.write(&rec).unwrap();
         }
@@ -4093,8 +3962,6 @@ mod tests {
                 prev_hash: None,
                 hash: None,
                 payload: None,
-                work_id: None,
-                attempt: None,
             };
             sink.write(&rec).unwrap();
         }
@@ -4201,8 +4068,6 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
-            work_id: None,
-            attempt: None,
         };
         sink.write(&rec).expect("recovery should not bail");
 
@@ -4267,8 +4132,6 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
-            work_id: None,
-            attempt: None,
         };
 
         sink_a.write(&mk("a1")).unwrap();
@@ -4673,8 +4536,6 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
-            work_id: None,
-            attempt: None,
         };
 
         let start = std::time::Instant::now();
@@ -4885,8 +4746,6 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
-            work_id: None,
-            attempt: None,
         }
     }
 

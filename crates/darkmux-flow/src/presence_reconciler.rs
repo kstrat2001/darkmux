@@ -169,8 +169,6 @@ fn build_machine_edge_record(action: crate::FlowAction, machine_uid: &str, displ
         prev_hash: None,
         hash: None,
         payload: None,
-        work_id: None,
-        attempt: None,
     }
 }
 
@@ -248,8 +246,6 @@ fn build_session_end_record(beat: &SessionBeat) -> FlowRecord {
             prev_hash: None,
             hash: None,
             payload: None,
-            work_id: None,
-            attempt: None,
         },
     };
     FlowRecord {

@@ -366,8 +366,6 @@ fn build_thermal_transition_record_with(
         prev_hash: None,
         hash: None,
         payload: Some(payload),
-        work_id: None,
-        attempt: None,
     }
 }
 
@@ -493,8 +491,6 @@ fn build_battery_health_record(
         prev_hash: None,
         hash: None,
         payload: Some(payload),
-        work_id: None,
-        attempt: None,
     }
 }
 
@@ -669,8 +665,6 @@ fn build_battery_transition_record_with(
         prev_hash: None,
         hash: None,
         payload: Some(payload),
-        work_id: None,
-        attempt: None,
     }
 }
 
@@ -884,8 +878,6 @@ fn build_machine_rollup_record_with(
         prev_hash: None,
         hash: None,
         payload: Some(payload),
-        work_id: None,
-        attempt: None,
     }
 }
 
