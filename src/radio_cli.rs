@@ -179,7 +179,7 @@ enum Consent {
 
 /// `darkmux mission launch <id> --param k=v ...` as the user would type it,
 /// each param single-quoted when it needs it.
-fn launch_command_line(config_id: &str, params: &[String]) -> String {
+pub(crate) fn launch_command_line(config_id: &str, params: &[String]) -> String {
     let mut line = format!("darkmux mission launch {config_id}");
     for param in params {
         line.push_str(" --param ");

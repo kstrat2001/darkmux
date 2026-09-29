@@ -43,8 +43,13 @@ darkmux release.
   launchable config from free text, so `darkmux radio` prints the exact
   `darkmux mission launch <id> --param ...` command and asks `Run it? [y/N]`
   before running it. With no interactive terminal it prints the command and
-  exits 1 without running it. **Migration:** a script that relied on radio
-  running its pick unattended must run the printed command itself.
+  exits 1 without running it. The editor agent panel does the same for free
+  text (no slash): the pick is shown in the panel's permission dialog, and
+  only Allow runs it; Reject, cancel or no answer runs nothing and the panel
+  says "not run". An explicit `/mission launch <id>` is your own command and
+  is not asked again. **Migration:** a script that relied on radio running its
+  pick unattended must run the printed command itself; a panel user answers
+  the dialog once per routed message.
 - **`darkmux mission dispatch` and the hand-built mission verbs** (#2954).
   Missions now come only from mission configs. Removed with no alias:
   `mission dispatch`, `mission add-phase`, `mission start`,
