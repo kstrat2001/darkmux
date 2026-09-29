@@ -648,19 +648,30 @@ fn tail_match(line: &str, execution: Option<&ExecutionId>, json: bool) -> Option
         let ts = parsed.get("ts").and_then(|v| v.as_str()).unwrap_or("");
         let action = parsed.get("action").and_then(|v| v.as_str()).unwrap_or("-");
         let handle = parsed.get("handle").and_then(|v| v.as_str()).unwrap_or("-");
-        let session_id = parsed
-            .get("session_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("-");
+        let origin = tail_origin(&parsed);
         // Space-separated (not column-padded) → coloring is alignment-safe.
         Some(format!(
             "{} {} {} {}",
             style::dim(ts),
             style::accent(action),
             handle,
-            style::dim(session_id)
+            style::dim(&origin)
         ))
     }
+}
+
+/// What a tailed record is about, for its last column: the role execution
+/// when it names one it was minted with, else the run its session belongs to
+/// (a pre-4.0 execution record's synthesized id is built from its session,
+/// so it reads as no execution), else `-`. The session itself never shows.
+fn tail_origin(record: &serde_json::Value) -> String {
+    let text = |key: &str| record.get(key).and_then(|v| v.as_str());
+    if let Some(id) = text("execution_id").and_then(|wire| ExecutionId::parse_minted(wire).ok()) {
+        return id.to_string();
+    }
+    text("session_id")
+        .and_then(|sid| darkmux_types::session_id::SessionId::parse_legacy(sid, text("mission_id")))
+        .map_or_else(|| "-".to_string(), |session| session.run_id().to_string())
 }
 
 /// Run `darkmux flow tail`: read today's JSONL file, then follow new appends
@@ -1350,6 +1361,34 @@ mod tests {
     fn tail_match_no_execution_filter_always_some() {
         let line = r#"{"ts":"2025-01-01T00:00:00Z","action":"note","handle":"hello"}"#;
         assert!(tail_match(line, None, false).is_some());
+    }
+
+    /// The last column names the role execution, or the run for a record
+    /// outside any execution; the session never shows.
+    #[test]
+    fn tail_column_is_the_execution_or_else_the_run_never_the_session() {
+        let id = ExecutionId::mint();
+        let in_execution = format!(
+            r#"{{"ts":"2025-01-01T00:00:00Z","action":"dispatch.start","handle":"coder","session_id":"run-a.adhoc.coder.n1","execution_id":"{id}"}}"#
+        );
+        let shown = tail_match(&in_execution, None, false).unwrap();
+        assert!(shown.ends_with(id.as_str()), "{shown}");
+        assert!(!shown.contains("run-a.adhoc"), "{shown}");
+
+        let outside = r#"{"ts":"2025-01-01T00:00:00Z","action":"mission.start","handle":"m","session_id":"m-auth.phase.p1","mission_id":"m-auth"}"#;
+        let shown = tail_match(outside, None, false).unwrap();
+        assert!(shown.ends_with("m-auth"), "the run, not the phase session: {shown}");
+        assert!(!shown.contains("phase"), "{shown}");
+
+        // A pre-4.0 execution record reads with a synthesized id, which is
+        // built from its session: it shows the run instead.
+        let old = r#"{"ts":"2025-01-01T00:00:00Z","action":"dispatch start","handle":"coder","session_id":"mission-run-auth-s1","mission_id":"auth"}"#;
+        let shown = tail_match(old, None, false).unwrap();
+        assert!(shown.ends_with("auth"), "{shown}");
+        assert!(!shown.contains("legacy:") && !shown.contains("mission-run-auth-s1"), "{shown}");
+
+        let neither = r#"{"ts":"2025-01-01T00:00:00Z","action":"operator.note","handle":"hi"}"#;
+        assert!(tail_match(neither, None, false).unwrap().ends_with(" -"));
     }
 
     #[test]

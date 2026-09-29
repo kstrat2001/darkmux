@@ -26,7 +26,9 @@ darkmux release.
   its "execution id" line (it used to print the session id). A session id
   given to `--execution` is refused with exit 2, and a note recorded with
   `--execution` is stamped with that execution and its session; an execution
-  the last 30 days of the flow trail never saw is refused;
+  the flow trail has no `dispatch.start` for is refused (the id encodes when
+  it was minted, so only that UTC day and its neighbors are read, however old
+  the id is);
   `lab eval --freeform|--agentic|--dialectic` is `--mode
   freeform|agentic|dialectic` (one choice, `strict` by default; the dialectic
   per-seat profile flags are refused with exit 2 under any other mode);
@@ -34,6 +36,17 @@ darkmux release.
   `mission status --missions` is `--named`. The viewer's "try it yourself"
   `lab eval` line prints the new spelling. The `--no-wait` follow-up lines no
   longer print a `flow tail` command with an id.
+- **The session no longer shows in three operator outputs.** The session is an
+  internal join key; these now show the role execution or the run.
+  **Migration:** `memory correction list` prints `[exec-...]` (or `[no
+  execution recorded]` for a note written before executions carried an id), and
+  its `--json` rows carry `execution_id` (a string, or `null`) in place of
+  `session_id`; `flow tail`'s last column is the execution id, or the run id
+  for a record outside any execution (`flow tail --json` still forwards the raw
+  record, `session_id` included); `dispatch --no-wait` to another machine
+  prints `run=<id>` in place of `session_id=<id>`, followed by `darkmux run
+  list --kind dispatch` (the row id there is this value), and its "submitting
+  to" line says `run=` too.
 - **Mission state files are read in one spelling** (A18). A `mission.json`
   using `sprint_ids`, `closed_ts` or status `closed`, a task file using
   `sprint_id`, and a `sprints/` directory (the old name of `phases/`) are

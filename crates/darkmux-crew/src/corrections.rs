@@ -45,8 +45,9 @@ pub const ADJUDICATION_LOOKBACK_DAYS: usize = 7;
 pub struct Correction {
     /// The flow record's timestamp (RFC3339, as written).
     pub ts: String,
-    /// The session the adjudicated role execution ran under.
-    pub session_id: String,
+    /// The role execution the correction is about. `None` for a record that
+    /// names none of its own (written before executions carried an id).
+    pub execution_id: Option<ExecutionId>,
     /// The correction text — the `--text` the reviewer recorded.
     pub text: String,
 }
@@ -103,6 +104,14 @@ impl Scope<'_> {
     }
 }
 
+/// The execution a note record names: only a minted id counts. A note
+/// writes its execution through the same grammar, so anything else (a
+/// synthesized `legacy:` spelling, which is built from a session and not for
+/// showing) names none.
+fn execution_of(record: &serde_json::Value) -> Option<ExecutionId> {
+    ExecutionId::parse_minted(record.get("execution_id")?.as_str()?).ok()
+}
+
 /// Scan the most-recent `days` day-files of the flow trail for adjudication
 /// corrections within `scope`, returned **oldest→newest**.
 ///
@@ -148,7 +157,7 @@ pub fn scan(days: usize, scope: Scope<'_>) -> Vec<Correction> {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string(),
-                session_id: sid.to_string(),
+                execution_id: execution_of(&r),
                 text: text.to_string(),
             });
         }

@@ -542,13 +542,22 @@ fn cmd_correction(sub: CorrectionCmd) -> Result<i32> {
                 println!(
                     "  {} {}",
                     darkmux_types::style::accent(&c.ts),
-                    darkmux_types::style::dim(&format!("[{}]", c.session_id))
+                    darkmux_types::style::dim(&format!("[{}]", correction_origin(c)))
                 );
                 println!("    {}", c.text);
             }
             Ok(0)
         }
     }
+}
+
+/// What `memory correction list` names a correction as being about: its role
+/// execution, or, for an old record that names none, that plainly.
+fn correction_origin(correction: &crew::corrections::Correction) -> String {
+    correction
+        .execution_id
+        .as_ref()
+        .map_or_else(|| "no execution recorded".to_string(), |id| id.to_string())
 }
 
 fn print_lessons_tier(label: &str, entries: &[darkmux_crew::lessons::Lesson]) {
@@ -1921,6 +1930,14 @@ fn model_ctx_label(m: &types::ProfileModel, registry: &darkmux_types::ProfileReg
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_correction_shows_its_execution_or_says_it_has_none() {
+        let id = darkmux_types::execution_id::ExecutionId::mint();
+        let correction = |execution_id| crew::corrections::Correction { ts: "t".into(), execution_id, text: "x".into() };
+        assert_eq!(correction_origin(&correction(Some(id.clone()))), id.as_str());
+        assert_eq!(correction_origin(&correction(None)), "no execution recorded");
+    }
 
     /// The id `dispatch` prints is the execution's, not its session's, and
     /// is one every `--execution` flag takes.
