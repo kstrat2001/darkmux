@@ -2321,7 +2321,10 @@ impl FlowRecord {
 
 impl FlowRecord {
     /// [`FlowRecord::for_session`] for a record OF one role execution: the
-    /// only place an execution id is put on a record.
+    /// only place an execution id is put on a record that has a session. A
+    /// utility job mints no session, so its usage record names its execution
+    /// beside `session_id: None` (`darkmux_crew::usage::utility_usage_record`);
+    /// `for_session` needs a session, so it cannot build that one.
     pub fn for_execution(
         session: &darkmux_types::session_id::SessionId,
         execution: &darkmux_types::execution_id::ExecutionId,
