@@ -1521,7 +1521,7 @@ impl DispatchMapStepKind {
     /// [`DispatchSingleShotStepKind`]'s hosted "step result" record so a
     /// graph/parity consumer reads a map's per-item records the same way it
     /// reads a single-shot's.
-    fn item_record(session: &SessionId, step: &Step, model: &str, remote: bool, res: &MapItemResult) -> darkmux_flow::FlowRecord {
+    fn item_record(session: &SessionId, execution: &ExecutionId, step: &Step, model: &str, remote: bool, res: &MapItemResult) -> darkmux_flow::FlowRecord {
         darkmux_flow::FlowRecord {
             source: Some("scheduler".to_string()),
             model: Some(model.to_string()),
@@ -1540,7 +1540,7 @@ impl DispatchMapStepKind {
                 "wall_ms": res.wall_ms,
                 "error": res.error,
             })),
-            ..darkmux_flow::FlowRecord::for_session(session, if res.ok { darkmux_flow::Level::Info } else { darkmux_flow::Level::Warn }, darkmux_flow::Category::Work, darkmux_flow::Stage::Dispatch, darkmux_flow::FlowAction::StepResult, step.id.clone())
+            ..darkmux_flow::FlowRecord::for_execution(session, execution, if res.ok { darkmux_flow::Level::Info } else { darkmux_flow::Level::Warn }, darkmux_flow::Category::Work, darkmux_flow::Stage::Dispatch, darkmux_flow::FlowAction::StepResult, step.id.clone())
         }
     }
 
@@ -1849,7 +1849,7 @@ impl DispatchMapStepKind {
                 ),
             };
             // (#1442 gate C3) LIVE per-item emission when streaming.
-            push(Self::item_record(session, step, wire_model.as_ref(), endpoint.is_some(), &res), &mut batched);
+            push(Self::item_record(session, execution, step, wire_model.as_ref(), endpoint.is_some(), &res), &mut batched);
             // (#1442 ship-2b, #1361 continuity) `telemetry.tokens` records
             // for this item's calls (see #2902 below), so the fleet
             // dashboard's off-meter token sum (`category: telemetry,
@@ -5242,6 +5242,31 @@ mod tests {
         assert_eq!(obj["index"], 0);
     }
 
+    /// Each map item's `step result` record names that item's own execution,
+    /// the one its bookends and usage records carry, not just the task session
+    /// the items share.
+    #[test]
+    fn a_map_items_step_result_names_its_execution() {
+        let step = map_step(json!({}));
+        let res = MapItemResult {
+            index: 0,
+            ok: true,
+            content: String::new(),
+            error: None,
+            total_tokens: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            reasoning_tokens: None,
+            cached_tokens: None,
+            served_model: None,
+            wall_ms: 0,
+            retried: 0,
+        };
+        let execution = ExecutionId::mint();
+        let rec = DispatchMapStepKind::item_record(&task_session(), &execution, &step, "m", false, &res);
+        assert_eq!(rec.execution_id.as_ref(), Some(&execution));
+    }
+
     /// (#2690) The seat tier a map step stamps on its `telemetry.tokens`
     /// record and the one it stamps on that same item's `step result` record
     /// are the SAME fact, and the emission site derives both from one
@@ -5267,7 +5292,7 @@ mod tests {
         };
         for remote in [false, true] {
             let tok = map_item_token_payload(&res, remote, "m", "ep").expect("emits");
-            let item = DispatchMapStepKind::item_record(&task_session(), &step, "m", remote, &res);
+            let item = DispatchMapStepKind::item_record(&task_session(), &ExecutionId::mint(), &step, "m", remote, &res);
             let item_payload = item.payload.as_ref().expect("payload");
             assert_eq!(tok["remote"], item_payload["remote"], "one seat, one verdict");
             assert_eq!(tok["index"], item_payload["index"], "and one item position");
