@@ -223,7 +223,7 @@ fn spec_origin_for(source: crew::mission_config::MissionConfigSource) -> crew::t
 /// pr-merge` typed by a human at a shell gets [`crew::gate::
 /// tty_prompt_handler`] (a y/N prompt); anything else — CI, a
 /// piped/redirected stdin OR stdout, an ACP-spawned `mission launch <id>`
-/// subprocess (the `RoutePlan::Launch` route in `src/acp_panel.rs` —
+/// subprocess (the `LaunchRoute::Launch` route in `src/acp_panel.rs` —
 /// headless by construction) — gets [`crew::gate::refusal_handler`], which
 /// fails CLOSED rather than hanging on input that will never arrive.
 ///

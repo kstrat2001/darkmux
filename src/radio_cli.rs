@@ -9,7 +9,7 @@
 //! - Procedural-only targets run in-process via `crate::acp_panel::
 //!   run_ephemeral` (already `pub`, no hoist needed — surface neutrality
 //!   held without moving a single line of `acp_panel.rs`).
-//! - Model-seated targets (`RoutePlan::Launch` — #2310 P4d retired the
+//! - Model-seated targets (`LaunchRoute::Launch` — #2310 P4d retired the
 //!   separate Review arm along with the bespoke launcher behind it, so
 //!   every routed command resolves to the SAME `mission launch <id>`
 //!   invocation) spawn `darkmux mission launch <id>` as a

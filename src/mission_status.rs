@@ -2991,8 +2991,15 @@ mod tests {
         // and no longer a hand-rolled save/restore.
         let _home = DarkmuxHomeGuard::new();
 
-        let real_description =
-            crew::mission_config::load::load("review").unwrap().config.description.unwrap();
+        // The shape that once shipped in `review.json` and cut mid-identifier:
+        // a first sentence over the cap whose body holds the dotted step-kind
+        // name `review.*`. A literal, so the pin does not move when the
+        // shipped description is reworded.
+        let real_description = "The code review, built on the shared mission building blocks rather than \
+             a pipeline of its own \u{2014} and, since P4d, the ONLY `review`: the bespoke funnel launcher \
+             and its ten Tier-3 `review.*` step kinds were deleted, and the config now runs on generic blocks. \
+             A second sentence."
+            .to_string();
 
         let mut m = mission("review-1788656497-cf872b", MissionStatus::Active);
         m.description = real_description.clone();

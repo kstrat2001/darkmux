@@ -1633,14 +1633,14 @@ async fn execute_launch_plan(
 /// one edit.
 ///
 /// **Ordering (issue #1698: "a successful route sends the provenance chunk
-/// FIRST"):** on [`crate::radio::RouteDecision::Route`], the "routed to
-/// /x — from your text" chunk is sent BEFORE [`execute_route_plan`] runs —
+/// FIRST"):** on [`crate::radio::RouteDecision::Route`], the "routing to
+/// /mission launch <id> — from your text" chunk is sent BEFORE [`execute_launch_plan`] runs —
 /// the operator sees WHERE their sentence went before seeing what it did,
-/// same provenance contract the CLI's own `radio: routing to /x — from
+/// same provenance contract the CLI's own `radio: routing to `mission launch <id>` — from
 /// your text` line gives (wall 4: "provenance boxes invisibility").
-/// Execution then runs through the EXACT SAME `RoutePlan` machinery a
+/// Execution then runs through the EXACT SAME `LaunchPlan` machinery a
 /// slash invocation uses — identical behavior, identical gates; a routed
-/// `/pr-merge` still hits the native sign-off dialog.
+/// `pr-merge` still hits the native sign-off dialog.
 ///
 /// **On [`crate::radio::RouteDecision::Refuse`]:** the refusal reason is
 /// rendered VERBATIM (persona-bearing operator content — the operator's
@@ -2963,7 +2963,7 @@ mod tests {
 
         send_prompt(&mut writer, &session_id, "/mission launch no-such-config").await;
         let reply = recv_json(&mut reader).await;
-        let cli = format!("darkmux: {:#}", crate::mission_launch::resolve_config("no-such-config").err().unwrap());
+        let cli = format!("darkmux: {:#}", crate::mission_launch::resolve_config("no-such-config").map(|_| ()).unwrap_err());
         assert_eq!(chunk_text(&reply), cli);
         assert_end_turn(&recv_json(&mut reader).await);
     }

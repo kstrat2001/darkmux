@@ -1445,7 +1445,7 @@ mod tests {
             Err(e) => format!("{e:#}"),
             Ok(_) => panic!("an unknown config must be refused"),
         };
-        let cli = format!("{:#}", crate::mission_launch::resolve_config("no-such-config").err().expect("the CLI refuses it"));
+        let cli = format!("{:#}", crate::mission_launch::resolve_config("no-such-config").map(|_| ()).expect_err("the CLI refuses it"));
         assert_eq!(panel, cli, "one refusal text on both surfaces");
         assert!(panel.contains("loading mission config \"no-such-config\""), "{panel}");
     }
@@ -1462,7 +1462,7 @@ mod tests {
             "old-style",
             serde_json::json!({"id": "old-style", "name": "Old", "panel": {"description": "d"}, "phases": []}),
         );
-        let err = format!("{:#}", plan_launch("old-style", "").err().expect("a panel block must be refused"));
+        let err = format!("{:#}", plan_launch("old-style", "").map(|_| ()).expect_err("a panel block must be refused"));
         assert!(err.contains("/mission launch <id>"), "{err}");
     }
 
@@ -1869,7 +1869,7 @@ mod tests {
         let cfg = greeting_config(true);
         let out = run_ephemeral(&cfg, &[], &std::env::temp_dir(), None).expect("a refusal is an outcome, not an Err");
         assert!(!out.success);
-        let launch_text = format!("{:#}", crate::mission_launch::resolve_inputs(&cfg, None, &[]).err().expect("launch refuses too"));
+        let launch_text = format!("{:#}", crate::mission_launch::resolve_inputs(&cfg, None, &[]).map(|_| ()).expect_err("launch refuses too"));
         assert!(out.text.contains(&launch_text), "one refusal text on both surfaces:\n{}\nvs\n{launch_text}", out.text);
         assert!(!out.text.contains("greeting: "), "no step may have run: {}", out.text);
     }
