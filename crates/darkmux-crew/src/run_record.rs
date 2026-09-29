@@ -362,12 +362,10 @@ mod tests {
     #[test]
     fn seat_endpoint_shows_only_unmanaged_endpoints() {
         let pm = |ep: serde_json::Value| -> ProfileModel { ProfileModel::hosted_for_test("m", Some(1), ep) };
-        for managed in [serde_json::json!({ "managed": "lmstudio" })] {
-            let m = pm(managed.clone());
-            assert!(seat_endpoint(&m).is_none(), "{managed}");
-            assert!(seat_endpoint_host(&m).is_none(), "{managed}");
-            assert_eq!(seat_identifier(&m), "darkmux:m", "{managed}");
-        }
+        let m = pm(serde_json::json!({ "managed": "lmstudio" }));
+        assert!(seat_endpoint(&m).is_none());
+        assert!(seat_endpoint_host(&m).is_none());
+        assert_eq!(seat_identifier(&m), "darkmux:m");
         let hosted = pm(serde_json::json!({ "url": "https://tok@h.example/v1" }));
         assert!(seat_endpoint(&hosted).is_some());
         assert_eq!(seat_endpoint_host(&hosted).as_deref(), Some("h.example"));
