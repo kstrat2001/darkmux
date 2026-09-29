@@ -493,7 +493,7 @@ fn a_run_that_crossed_midnight_reads_both_days_files() {
     std::fs::write(
         flows.path().join("2026-09-21.jsonl"),
         line(serde_json::json!({
-            "action": "dispatch start", "session_id": "sid-1",
+            "action": "dispatch.start", "session_id": "sid-1",
             "payload": {"bounds": {"max_tokens_per_call": {"value": 32_000, "source": "built-in"}}}
         })),
     )
@@ -658,7 +658,7 @@ fn the_window_slack_keeps_session_records_but_not_outside_telemetry() {
         "{}{}{}",
         telem(start - 2 * MIN, 96, 40.0), // before the run: not a run sample
         line(serde_json::json!({
-            "action": "dispatch start", "session_id": "sid-9",
+            "action": "dispatch.start", "session_id": "sid-9",
             "payload": {"bounds": {"max_turns": {"value": null, "source": "built-in"}}}
         })),
         telem(start + MIN, 96, 40.0),
@@ -826,7 +826,7 @@ fn a_session_record_just_after_the_run_is_kept() {
     let body = format!(
         "{}{}",
         telem(start + 11 * MIN, 0, 0.0),
-        line(serde_json::json!({"action": "dispatch complete", "session_id": "sid-3", "payload": {}})),
+        line(serde_json::json!({"action": "dispatch.complete", "session_id": "sid-3", "payload": {}})),
     );
     flow_file(flows.path(), "d.jsonl", &body, start + 12 * MIN);
     let s = compute_from_dir(run.path(), flows.path()).unwrap();
@@ -843,7 +843,7 @@ fn a_file_last_written_just_before_the_run_is_still_opened() {
     std::fs::write(run.path().join("lifecycle.json"), r#"{"session_id":"sid-4"}"#).unwrap();
     let flows = tempfile::TempDir::new().unwrap();
     let body = line(serde_json::json!({
-        "action": "dispatch start", "session_id": "sid-4",
+        "action": "dispatch.start", "session_id": "sid-4",
         "payload": {"bounds": {"max_turns": {"value": null, "source": "built-in"}}}
     }));
     flow_file(flows.path(), "d.jsonl", &body, start - 2 * MIN);

@@ -259,7 +259,8 @@ fn run_mock_dispatch(
     // race, not evidence the diagnosis was wrong.
     let flows_dir_guard = EnvVarGuard::set("DARKMUX_FLOWS_DIR", flows_dir.path());
 
-    let session_id = format!("mock-model-proof-{}-{}", std::process::id(), port);
+    let session = darkmux_types::session_id::SessionId::adhoc(darkmux_types::session_id::RunId::standalone("test").unwrap(), "coder", format!("mock-model-proof-{}-{}", std::process::id(), port));
+    let session_id = session.wire();
     let opts = DispatchOpts {
         // (#2914) Work never runs on the utility model.
         allow_utility_model: false,
@@ -274,7 +275,7 @@ fn run_mock_dispatch(
         timeout_override_seconds: None, // (#2480)
         role_id: "analyst".to_string(),
         message: message.to_string(),
-        session_id: Some(session_id.clone()),
+        session: session.clone(),
         timeout_seconds: 120,
         skip_preflight: true,
         json: true,
@@ -759,7 +760,12 @@ fn run_mock_dispatch_with_timeout_override(
     let flows_dir_guard = EnvVarGuard::set("DARKMUX_FLOWS_DIR", flows_dir.path());
     let path_guard = PathPrependGuard::new(wrapper_dir.path());
 
-    let session_id = format!("mock-model-proof-i2596-{}-{}", std::process::id(), port);
+    let session = darkmux_types::session_id::SessionId::adhoc(
+        darkmux_types::session_id::RunId::standalone("test").unwrap(),
+        "coder",
+        format!("mock-model-proof-i2596-{}-{}", std::process::id(), port),
+    );
+    let session_id = session.wire();
     let opts = DispatchOpts {
         // (#2914) Work never runs on the utility model.
         allow_utility_model: false,
@@ -774,7 +780,7 @@ fn run_mock_dispatch_with_timeout_override(
         timeout_override_seconds: Some(timeout_override_seconds), // (#2596) the hop under test
         role_id: "analyst".to_string(),
         message: message.to_string(),
-        session_id: Some(session_id.clone()),
+        session: session.clone(),
         timeout_seconds: 120,
         skip_preflight: true,
         json: true,

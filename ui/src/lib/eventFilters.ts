@@ -610,7 +610,7 @@ export function activeFilterCount(state: FilterState, facets: Facets): number {
  * opinion" — the value follows `isDefaultOn`. This is the shape both
  * `absorbNewFacetValues` (deciding a brand-new value) and `applyStoredPicks`
  * (restoring a facet from storage) resolve against. */
-export interface FacetPicks {
+interface FacetPicks {
   include: Set<string>;
   exclude: Set<string>;
 }

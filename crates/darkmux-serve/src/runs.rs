@@ -25,51 +25,16 @@
 //! run's own detail/graph view (`GET /mission/:id/graph.json`). This module
 //! only ever emits ONE [`Run`] per mission/lab-run/ghost session.
 //!
-//! ## The mission_id gap (a load-bearing finding, not a redesign)
+//! ## Joining a session to its mission
 //!
-//! The obvious join key from a flow session back to its owning mission is
-//! `FlowRecord.mission_id`. Two GENUINELY DIFFERENT gaps in how that field
-//! gets populated both surfaced during review (fresh-context gate, #1523) —
-//! neither is a flow-emission bug worth fixing at the source for THIS PR;
-//! both are closed read-side here instead.
-//!
-//! **Gap 1 — crew-of-one dispatches (fixed read-side).**
-//! `dispatch_as_crew_of_one::build_graph` only sets `Step.config["phase_id"]`
-//! when the CLI's OWN `--phase-id` flag names some OTHER, pre-existing
-//! mission's phase (external attribution) — never for the crew-of-one's own
-//! internally-minted phase. With no `phase_id` in the step config,
-//! `crew::dispatch::resolve_mission_for_phase(None)` returns `None`, so the
-//! dispatch's `dispatch start`/`dispatch complete` flow records carry
-//! `mission_id: null`.
-//!
-//! **Gap 2 — generic config-launched missions (fixed read-side).**
-//! `mission_config::interpret::push_step` (the generic `mission launch
-//! <config>` graph builder — NOT the Tier-3 bespoke coder-phase/review
-//! launchers) never injects `phase_id` into a `dispatch.internal` or
-//! `dispatch.single_shot` step's config either. Any config-launched mission
-//! whose steps don't explicitly set `config.phase_id` hits the exact same
-//! `resolve_mission_for_phase(None) -> None` gap as gap 1, for every one of
-//! its steps.
-//!
-//! **The fix for both is the SAME read-side mechanism: join by
-//! `session_id`, not `mission_id`.** Every `Step` — crew-of-one OR
-//! generic-config — dispatches under a KNOWN session_id: the explicit
-//! `Step.config["session_id"]` when the step sets one, else the exact
-//! default its own step kind falls back to at dispatch time
-//! (`DispatchInternalStepKind` -> `session_id::step(&step.id)`;
-//! `DispatchSingleShotStepKind`'s hosted branch -> `session_id::task(&step.task_id)`
-//! — see `crates/darkmux-crew/src/step_kinds/builtins.rs`).
-//! [`collect_mission_step_sessions`] reconstructs that same session_id for
-//! EVERY step of EVERY loaded mission (not just the crew-of-one case), so a
-//! mission's own dispatches are always recognized and never double-listed
-//! as untracked ghosts — regardless of which gap (or neither, e.g.
-//! coder-phase/review, which DO pass a real `--phase-id` and so already
-//! carry `mission_id` correctly) produced its flow records.
-//!
-//! `Mission`-kind runs ALSO still join by `mission_id` (works today for
-//! coder-phase/review) — [`mission_to_run`] unions BOTH join keys per
-//! mission, so whichever mechanism actually stamped a session lands the
-//! same Run row exactly once.
+//! Every record carries its run: its `session_id` names the run, and its
+//! `mission_id` is that run when the run is a mission, both stamped from
+//! one session (`FlowRecord::for_session`). A mission's sessions are
+//! therefore exactly the sessions whose records carry its `mission_id`
+//! ([`build_mission_id_index`]); no session is predicted from the graph.
+//! A pre-4.0 record that carried no `mission_id` (a crew-of-one dispatch,
+//! a generic config step whose phase did not resolve) cannot be placed in
+//! a mission and reads as its own untracked session.
 //!
 //! ## Two callers, one union (#1905)
 //!
@@ -84,7 +49,6 @@
 
 use crate::LabRunSummary;
 use darkmux_crew::envelope::MissionOutcomeStatus;
-use darkmux_crew::step_kinds::StepKindRegistry;
 use darkmux_crew::types::{Mission, MissionStatus, Phase, PhaseStatus, Step, Task};
 use darkmux_flow::FlowAction;
 use std::borrow::Cow;
@@ -468,36 +432,19 @@ fn build_runs_in(
         .collect();
 
     let mut runs: Vec<Run> = Vec::with_capacity(missions.len());
-    // Dedup bookkeeping (see the module doc's "mission_id gap" section):
-    // a session already accounted for by a tracked run — either because its
-    // `mission_id` matches a loaded mission, or because it's one of that
-    // mission's OWN step sessions (reconstructed structurally, covering
-    // BOTH gap 1 and gap 2) — must never ALSO produce an untracked ghost
-    // for the same underlying work.
+    // Dedup bookkeeping: a session already accounted for by a tracked run —
+    // its `mission_id` matches a loaded mission, or it is a lab run's own
+    // dispatch session — must never ALSO produce an untracked ghost for the
+    // same underlying work.
     let mut known_mission_ids: HashSet<String> = HashSet::new();
     let mut known_session_ids: HashSet<String> = HashSet::new();
 
     for mission in &missions {
         known_mission_ids.insert(mission.id.clone());
         let (kind, shape) = classify_mission(mission, &phases_by_id);
-        // (#1523 gate must-fix 2) Registered for EVERY mission, not just
-        // Dispatch-kind — a generic config-launched Mission-kind mission's
-        // `dispatch.internal`/`dispatch.single_shot` steps hit the SAME
-        // mission_id gap crew-of-one dispatches do (see module doc, gap 2).
-        let step_sessions = collect_mission_step_sessions(mission);
-        known_session_ids.extend(step_sessions.iter().cloned());
-        let mut run = mission_to_run(
-            mission,
-            kind,
-            shape.as_ref(),
-            &step_sessions,
-            &mission_id_index,
-            &flow_index,
-            now_ms,
-        );
-        // (#2902 step 2b) Its records carry its `mission_id`, or (the
-        // scheduler's own shape) only one of its step sessions.
-        run.tokens = usage.tokens_for(Some(&mission.id), step_sessions.iter().map(String::as_str));
+        let mut run = mission_to_run(mission, kind, shape.as_ref(), &mission_id_index, &flow_index, now_ms);
+        // (#2902 step 2b) Its records carry its `mission_id`.
+        run.tokens = usage.tokens_for(Some(&mission.id), std::iter::empty());
         runs.push(run);
     }
 
@@ -626,7 +573,7 @@ fn peer_runs_from_index(
 /// its own local mission id set in hand (`mission status`'s board, which
 /// loads `Mission`/`Phase` JSON itself for its own local half). Calling
 /// `build_runs` for this would pay for the local mission→`Run` build
-/// (`classify_mission`/`collect_mission_step_sessions` per mission) and a
+/// (`classify_mission` per mission) and a
 /// SECOND `load_missions()`/`load_phases()` disk read the caller's own
 /// load already did — both wasted work for a caller that only wants this
 /// slice.
@@ -952,129 +899,6 @@ fn crew_of_one_shape(mission: &Mission, phases_by_id: &HashMap<String, Phase>) -
     Some((task, step))
 }
 
-/// Every session_id this mission's OWN steps dispatch under (#1523 gate
-/// must-fix 2) — read from `Step.config["session_id"]` when explicit, else
-/// the SAME per-kind default the step kind itself falls back to at
-/// dispatch time. Walks every phase in `mission.phase_ids`; a phase whose
-/// steps can't be loaded (deleted, malformed) contributes nothing rather
-/// than erroring — best-effort, matching this module's posture everywhere
-/// else. Bounded by the mission's own phase count, the same per-mission I/O
-/// shape `crew_of_one_shape` and `mission_graph::build_mission_graph`
-/// already pay.
-fn collect_mission_step_sessions(mission: &Mission) -> HashSet<String> {
-    let mut out = HashSet::new();
-    // Built once per mission, not per step — the registry allocates a
-    // handful of `Arc`s and a map.
-    let registry = attribution_registry();
-    for phase_id in &mission.phase_ids {
-        let Ok(steps) = darkmux_crew::lifecycle::load_steps_for_phase(&mission.id, phase_id) else {
-            continue;
-        };
-        for step in steps {
-            // (#1918 — considered, not applied) `step_session_id`
-            // reconstructs the per-KIND default (`session_id::task`/
-            // `session_id::step`) exactly as the producer computes it
-            // BEFORE composing this run's own identity in via
-            // `scope_to_run`. This predictor does NOT also predict the
-            // scoped form: every producer that applies `scope_to_run`
-            // (the launcher's `emit`-wrap, and `dispatch_internal::
-            // dispatch`'s own resolved-mission composition) does so in
-            // lock-step with populating `FlowRecord.mission_id` — the
-            // SAME resolved value drives both, unconditionally in the
-            // launcher's case and gated on the SAME `resolve_mission_
-            // for_phase` call in `dispatch_internal`'s. So a record's
-            // `session_id` is the SCOPED form if and only if that record
-            // ALSO carries `mission_id` — and a session with `mission_id`
-            // present is already correctly attributed and ghost-
-            // suppressed via `build_mission_id_index`/`known_mission_ids`,
-            // with no need for this predictor to also guess the scoped
-            // string. Only the UNSCOPED default below is ever needed here
-            // (the pre-existing #1523 "Gap 2": a step whose phase→mission
-            // resolution fails keeps the raw form on both mission_id AND
-            // session_id, together).
-            //
-            // (#1918 QA) This reasoning is specific to a MISSION-
-            // attribution join. It does NOT generalize: `mission_graph::
-            // step_for_record` asks WHICH STEP a record belongs to, which
-            // `mission_id` cannot answer, so that consumer does have to
-            // accept the scoped spelling and peels the suffix itself.
-            if let Some(sid) = step_session_id(&step, &registry) {
-                out.insert(sid);
-            }
-        }
-    }
-    out
-}
-
-/// (#2310 swarm F / S2-1) The registry [`step_session_id`] asks.
-///
-/// `with_builtins()` alone is not enough. `records.gather`, `mods.gate`
-/// and `deliver.github_review` are Tier-3 kinds registered per-launch by
-/// `mission launch` (`src/mission_launch.rs::all_step_kinds`), so they are
-/// absent here — and an ABSENT kind falls through to the trait DEFAULT,
-/// which is step-scoped. Each of those three declares
-/// `dispatch_session_id -> None` because it never dispatches a model at
-/// all; without registering them, this module claimed a session per
-/// gather/gate/deliver step that no record will ever carry, which is the
-/// exact "two files encoding one convention" failure #1979 set out to
-/// end, running in the other direction.
-///
-/// Only the kinds that live in `darkmux-crew` are registrable here — the
-/// review pipeline's own kinds live in `darkmux-lab` and coder-phase's in
-/// the binary, neither of which this crate may depend on. Those still
-/// take the documented default, which is the safe direction (over-claiming
-/// a session that never appears costs nothing; under-claiming one that
-/// does produces a phantom run on the board).
-fn attribution_registry() -> StepKindRegistry {
-    let registry = StepKindRegistry::with_builtins();
-    // Best-effort: a duplicate-id error here is a programming bug in the
-    // registrars, not a reason to fail a read-only board query.
-    let _ = darkmux_crew::step_kinds::register_records_gather_kind(&registry);
-    let _ = darkmux_crew::step_kinds::register_mods_gate_kind(&registry);
-    let _ = darkmux_crew::step_kinds::register_deliver_kind(&registry);
-    registry
-}
-
-/// A `Step`'s dispatch session_id — **asked of the kind, never re-derived
-/// here** (#1979).
-///
-/// This used to be a `match step.kind.as_str()` with a `_ => None` arm, so
-/// the convention lived in two files that nothing kept agreeing.
-///
-/// **Honest scope of the defect** (narrowed by the #1979 QA gate, which
-/// could not reproduce the original claim): an unlisted kind's session went
-/// unclaimed by [`collect_mission_step_sessions`], but that alone does NOT
-/// produce a ghost row. [`ghost_runs`] has a SECOND gate —
-/// `known_mission_ids.contains(agg.mission_id)` — and every production
-/// `run_step_graph` caller backfills `mission_id` (#1641), so a
-/// locally-launched mission's records were already suppressed by mission id.
-/// This is therefore defense-in-depth and a de-duplication of the
-/// convention, not a fix for a reproducible doubled row. Asking the kind is
-/// still right: two files encoding one convention with a silent catch-all is
-/// how the next emitter that skips the `mission_id` backfill becomes a bug
-/// nobody notices.
-///
-/// A kind not in the registry (a Tier 3 kind registered per-launch, e.g.
-/// review's or coder-phase's) falls back to the trait's own default rather
-/// than to `None`, so it is claimed by construction. That is the opposite
-/// of the old catch-all: an unknown kind is now assumed to dispatch under
-/// the documented default, not assumed to be invisible.
-fn step_session_id(step: &Step, registry: &StepKindRegistry) -> Option<String> {
-    match registry.get(&step.kind) {
-        Ok(kind) => kind.dispatch_session_id(step),
-        // Not a built-in. Reproduce the trait default rather than dropping
-        // the step: explicit config wins, else the step-scoped default.
-        Err(_) => {
-            if let Some(sid) = step.config.get("session_id").and_then(|v| v.as_str()) {
-                if !sid.is_empty() {
-                    return Some(sid.to_string());
-                }
-            }
-            Some(darkmux_types::session_id::step(&step.id))
-        }
-    }
-}
-
 /// Pre-group the flow session index by `mission_id` (#1523 gate CONSIDER
 /// 2) — one O(sessions) pass, read back in O(1) per mission by
 /// [`mission_to_run`] instead of a linear `flow_index` scan per mission.
@@ -1089,45 +913,32 @@ fn build_mission_id_index(flow_index: &HashMap<String, SessionAgg>) -> HashMap<S
 }
 
 /// (#2682 fix-pass) The RAW `(session_id, agg)` candidates one mission
-/// structurally or historically claims — every step-dispatch session
-/// [`collect_mission_step_sessions`] predicts for it, UNIONed with every
-/// session the merged flow record set has actually seen carrying this
+/// claims: every session the merged flow record set has seen carrying this
 /// mission's own id (`mission_id_index`). Pre-ambiguity-filter: each caller
 /// applies its own `!is_ambiguous()` filter afterward.
 ///
-/// Extracted out of [`mission_to_run`] (which used to inline this) so
-/// [`local_dispatch_status`] draws from the IDENTICAL pool `darkmux run
-/// list`'s own row-builder does — two independently hand-written versions
-/// of "which sessions belong to this mission" is exactly the kind of drift
-/// CLAUDE.md's cross-system-contracts section warns about, and is how
-/// #1918/#2487's ambiguity corruption slipped through in the first place.
+/// Shared by [`mission_to_run`] and [`local_dispatch_status`], so `darkmux
+/// run list`'s row-builder and radio's busy check draw from the IDENTICAL
+/// pool.
 fn mission_candidate_sessions<'a>(
     mission: &Mission,
-    step_sessions: &'a HashSet<String>,
     mission_id_index: &'a HashMap<String, Vec<String>>,
     flow_index: &'a HashMap<String, SessionAgg>,
 ) -> Vec<(&'a str, &'a SessionAgg)> {
-    let mut candidate_ids: HashSet<&str> = step_sessions.iter().map(String::as_str).collect();
-    if let Some(ids) = mission_id_index.get(&mission.id) {
-        candidate_ids.extend(ids.iter().map(String::as_str));
-    }
-    candidate_ids
+    mission_id_index
+        .get(&mission.id)
         .into_iter()
-        .filter_map(|sid| flow_index.get(sid).map(|agg| (sid, agg)))
+        .flatten()
+        .filter_map(|sid| flow_index.get(sid).map(|agg| (sid.as_str(), agg)))
         .collect()
 }
 
 /// Normalize one loaded `Mission` into a [`Run`]. Joins to its flow
-/// session(s) by the UNION of `step_sessions` (structural — covers both
-/// mission_id gaps, see the module doc) and `mission_id_index`'s lookup
-/// (covers the paths that already stamp `mission_id` correctly, e.g.
-/// coder-phase/review) — whichever mechanism produced the session, this
-/// finds it exactly once.
+/// session(s) by `mission_id` (see the module doc).
 fn mission_to_run(
     mission: &Mission,
     kind: RunKind,
     shape: Option<&(Task, Step)>,
-    step_sessions: &HashSet<String>,
     mission_id_index: &HashMap<String, Vec<String>>,
     flow_index: &HashMap<String, SessionAgg>,
     now_ms: u64,
@@ -1151,7 +962,7 @@ fn mission_to_run(
     // `mission_candidate_sessions`, shared with `local_dispatch_status` —
     // see that helper's own doc for why the sharing matters.
     let sessions: Vec<(&str, &SessionAgg)> =
-        mission_candidate_sessions(mission, step_sessions, mission_id_index, flow_index);
+        mission_candidate_sessions(mission, mission_id_index, flow_index);
 
     // (#2487) Filtered to unambiguous sessions BEFORE picking `representative`
     // — the SAME `is_ambiguous()` guard `sessions_by_start` below already
@@ -1228,23 +1039,13 @@ fn mission_to_run(
     //
     // (#1918 QA, widened by #2487) Built from `unambiguous_sessions` (above)
     // rather than re-filtering `sessions` here — `representative` and this
-    // list now draw from the SAME ambiguity-filtered pool, by the SAME
-    // detector `sessions_bare` (status, #1979) already uses, so role/model
-    // and machine/start_ts can no longer disagree about which sessions are
-    // trustworthy. The write-side scoping alone does not close this for a
-    // MIXED day file — the state every operator has for
-    // `RUNS_FLOW_SCAN_WINDOW_DAYS` after upgrading. A pre-1.43.0 record
-    // set still carries the bare `task-<id>`/`step-<id>` bucket that N
-    // missions shared; a NEW mission's structural prediction
-    // (`collect_mission_step_sessions`, which by design still predicts the
-    // unscoped form) claims that bucket, and because the legacy records
-    // are OLDER they sort FIRST here and would win every attribute over the
-    // new mission's own correctly-scoped session — role and model included,
-    // and (before #2487) machine and start_ts too. Proved: a new mission
-    // rendered `model: legacy-model-a` / `role: legacy-role` beside its own
-    // `correct-model` records. Membership (`sessions`, unfiltered) still
-    // keeps these aggs — claiming the session suppresses a ghost row; only
-    // ATTRIBUTION and ORDERING are narrowed, mirroring `sessions_bare`.
+    // list draw from the SAME ambiguity-filtered pool, by the SAME detector
+    // `sessions_bare` (status, #1979) uses, so role/model and
+    // machine/start_ts cannot disagree about which sessions are
+    // trustworthy. A pre-4.0 day file still holds bare `task-<id>` buckets
+    // that N missions shared, each record carrying its own mission: such a
+    // bucket is ambiguous, stays a member (`sessions`) and never lends an
+    // attribute or an order.
     let mut sessions_by_start: Vec<&SessionAgg> =
         unambiguous_sessions.iter().map(|(_, s)| *s).filter(|s| s.start_ts.is_some()).collect();
     sessions_by_start.sort_by(|a, b| a.start_ts.cmp(&b.start_ts));
@@ -1329,10 +1130,10 @@ fn mission_to_run(
 
     // (#1979 QA gate) STATUS is computed only over what this mission can
     // legitimately claim. A `session_id` whose records span more than one
-    // mission is shared — `session_id::task` hashes only `task_id`, which
-    // comes straight out of a mission CONFIG (`crew::scheduler`'s own doc),
-    // so every run of `coder-phase.json` shares `task-build-coder` — and its
-    // settled fields are its CURRENT attempt's, possibly another mission's.
+    // mission is shared — a pre-4.0 task session named only its task,
+    // straight out of a mission CONFIG, so every run of `coder-phase.json`
+    // shared `task-build-coder` — and its settled fields are its CURRENT
+    // attempt's, possibly another mission's.
     // Such a session is read through this mission's own attempts on it
     // (`mission_status_sessions`), never refused: refusing it left a mission
     // whose only session was shared reading Abandoned while it ran, and
@@ -1536,8 +1337,8 @@ fn mission_run_status_and_evidence(
                 // exact same mission (not two different missions — a fresh
                 // `mission launch` mints a new mission id every time,
                 // #1503) collide on the SAME `session_id`
-                // (`session_id::task`/`step` carry no per-attempt identity,
-                // only `scope_to_run`'s per-MISSION disambiguator), so both
+                // (a task or step session carries its run, not its
+                // attempt), so both
                 // attempts fold into ONE `SessionAgg` in
                 // `build_flow_session_index` — whose fold deliberately
                 // keeps only the FIRST terminal it sees. A same-session-id
@@ -1791,9 +1592,7 @@ pub fn local_dispatch_status(
     missions
         .iter()
         .map(|mission| {
-            let step_sessions = collect_mission_step_sessions(mission);
-            let candidates =
-                mission_candidate_sessions(mission, &step_sessions, &mission_id_index, &flow_index);
+            let candidates = mission_candidate_sessions(mission, &mission_id_index, &flow_index);
             // The SAME pool `mission_to_run` judges its row by, so radio's
             // busy check and `/runs` never disagree about one mission.
             let status_sessions = mission_status_sessions(&mission.id, &candidates);
@@ -3030,7 +2829,7 @@ mod tests {
         write_day_file(
             tmp.path(),
             &today(),
-            &[serde_json::json!({"level": "info", "category": "work", "tier": "local", "stage": "dispatch", "handle": "h", "ts": "2026-01-01T00:00:00Z", "action": "dispatch start", "session_id": "s1"})],
+            &[serde_json::json!({"level": "info", "category": "work", "tier": "local", "stage": "dispatch", "handle": "h", "ts": "2026-01-01T00:00:00Z", "action": "dispatch.start", "session_id": "s1"})],
         );
         let start_ms = parse_flow_ts("2026-01-01T00:00:00Z").unwrap() * 1000;
         assert!(any_dispatch_live_in(tmp.path(), &today(), start_ms + 5_000, 60_000));
@@ -3043,8 +2842,8 @@ mod tests {
             tmp.path(),
             &today(),
             &[
-                serde_json::json!({"level": "info", "category": "work", "tier": "local", "stage": "dispatch", "handle": "h", "ts": "2026-01-01T00:00:00Z", "action": "dispatch start", "session_id": "s1"}),
-                serde_json::json!({"level": "info", "category": "work", "tier": "local", "stage": "dispatch", "handle": "h", "ts": "2026-01-01T00:00:05Z", "action": "dispatch complete", "session_id": "s1"}),
+                serde_json::json!({"level": "info", "category": "work", "tier": "local", "stage": "dispatch", "handle": "h", "ts": "2026-01-01T00:00:00Z", "action": "dispatch.start", "session_id": "s1"}),
+                serde_json::json!({"level": "info", "category": "work", "tier": "local", "stage": "dispatch", "handle": "h", "ts": "2026-01-01T00:00:05Z", "action": "dispatch.complete", "session_id": "s1"}),
             ],
         );
         let start_ms = parse_flow_ts("2026-01-01T00:00:00Z").unwrap() * 1000;
@@ -3060,7 +2859,7 @@ mod tests {
         write_day_file(
             tmp.path(),
             &today(),
-            &[serde_json::json!({"level": "info", "category": "work", "tier": "local", "stage": "dispatch", "handle": "h", "ts": "2026-01-01T00:00:00Z", "action": "dispatch start", "session_id": "s1"})],
+            &[serde_json::json!({"level": "info", "category": "work", "tier": "local", "stage": "dispatch", "handle": "h", "ts": "2026-01-01T00:00:00Z", "action": "dispatch.start", "session_id": "s1"})],
         );
         let start_ms = parse_flow_ts("2026-01-01T00:00:00Z").unwrap() * 1000;
         assert!(
@@ -3076,9 +2875,9 @@ mod tests {
             tmp.path(),
             &today(),
             &[
-                serde_json::json!({"level": "info", "category": "work", "tier": "local", "stage": "dispatch", "handle": "h", "ts": "2026-01-01T00:00:00Z", "action": "dispatch start", "session_id": "s1"}),
-                serde_json::json!({"level": "info", "category": "work", "tier": "local", "stage": "dispatch", "handle": "h", "ts": "2026-01-01T00:00:01Z", "action": "dispatch complete", "session_id": "s1"}),
-                serde_json::json!({"level": "info", "category": "work", "tier": "local", "stage": "dispatch", "handle": "h", "ts": "2026-01-01T00:00:02Z", "action": "dispatch start", "session_id": "s2"}),
+                serde_json::json!({"level": "info", "category": "work", "tier": "local", "stage": "dispatch", "handle": "h", "ts": "2026-01-01T00:00:00Z", "action": "dispatch.start", "session_id": "s1"}),
+                serde_json::json!({"level": "info", "category": "work", "tier": "local", "stage": "dispatch", "handle": "h", "ts": "2026-01-01T00:00:01Z", "action": "dispatch.complete", "session_id": "s1"}),
+                serde_json::json!({"level": "info", "category": "work", "tier": "local", "stage": "dispatch", "handle": "h", "ts": "2026-01-01T00:00:02Z", "action": "dispatch.start", "session_id": "s2"}),
             ],
         );
         let start_ms = parse_flow_ts("2026-01-01T00:00:02Z").unwrap() * 1000;
@@ -3103,8 +2902,8 @@ mod tests {
             tmp.path(),
             &today(),
             &[
-                serde_json::json!({"level": "info", "category": "work", "tier": "operator", "stage": "scope", "handle": "h", "ts": "2026-01-01T00:00:00Z", "action": "mission start", "session_id": "mission-m1"}),
-                serde_json::json!({"level": "info", "category": "work", "tier": "operator", "stage": "scope", "handle": "h", "ts": "2026-01-01T00:00:01Z", "action": "mission close", "session_id": "mission-m1"}),
+                serde_json::json!({"level": "info", "category": "work", "tier": "operator", "stage": "scope", "handle": "h", "ts": "2026-01-01T00:00:00Z", "action": "mission.start", "session_id": "mission-m1"}),
+                serde_json::json!({"level": "info", "category": "work", "tier": "operator", "stage": "scope", "handle": "h", "ts": "2026-01-01T00:00:01Z", "action": "mission.close", "session_id": "mission-m1"}),
             ],
         );
         let ts_ms = parse_flow_ts("2026-01-01T00:00:01Z").unwrap() * 1000;
@@ -3250,125 +3049,6 @@ mod tests {
         let (kind, shape) = classify_mission(&mission, &phases_by_id);
         assert_eq!(kind, RunKind::Mission);
         assert!(shape.is_none());
-    }
-
-    // ── step_session_id / collect_mission_step_sessions ─────────────────
-
-    #[test]
-    fn step_session_id_prefers_explicit_config_over_the_kind_default() {
-        let step = minimal_step("s1", "t1", Some("explicit-sid"));
-        assert_eq!(step_session_id(&step, &StepKindRegistry::with_builtins()), Some("explicit-sid".to_string()));
-    }
-
-    #[test]
-    fn step_session_id_defaults_dispatch_internal_to_the_step_scoped_session() {
-        // (#1523 gate must-fix 2) `interpret::push_step` never injects a
-        // session_id — this default is what `DispatchInternalStepKind::run`
-        // itself falls back to when `config.session_id` is absent.
-        let mut step = minimal_step("s-generic", "t1", None);
-        step.kind = "dispatch.internal".to_string();
-        assert_eq!(step_session_id(&step, &StepKindRegistry::with_builtins()), Some(darkmux_types::session_id::step("s-generic")));
-    }
-
-    #[test]
-    fn step_session_id_defaults_dispatch_single_shot_to_the_task_scoped_session() {
-        let mut step = minimal_step("s-single", "t-owner", None);
-        step.kind = "dispatch.single_shot".to_string();
-        assert_eq!(step_session_id(&step, &StepKindRegistry::with_builtins()), Some(darkmux_types::session_id::task("t-owner")));
-    }
-
-    #[test]
-    fn step_session_id_procedural_kind_opts_out_explicitly() {
-        // (#1979) Renamed from `..._unknown_kind_has_no_default`, which
-        // conflated two different things under one `None`: a kind that
-        // DECLARES it never dispatches, and a kind nobody taught the
-        // resolver about. `procedural.noop` is the first — a registered
-        // kind whose own `dispatch_session_id` returns `None` on purpose.
-        // The second case is now the opposite behavior; see the next test.
-        let mut step = minimal_step("s-proc", "t1", None);
-        step.kind = "procedural.noop".to_string();
-        assert_eq!(step_session_id(&step, &StepKindRegistry::with_builtins()), None);
-    }
-
-    /// (#2310 swarm F / S2-1) `records.gather` and `mods.gate` declare
-    /// `dispatch_session_id -> None` — neither dispatches a model — and
-    /// the run view's step→session attribution must HONOR that
-    /// declaration, not fall through to the step-scoped default because
-    /// the kind happens to be registered per-launch rather than in
-    /// `with_builtins`. A session claimed for a step that emits no record
-    /// is a claim on nothing; `deliver.github_review` is the third kind
-    /// with the same contract and is pinned alongside them.
-    ///
-    /// Mutate any of those three kinds' `dispatch_session_id` to
-    /// `Some(..)`, or drop its registration from `attribution_registry`,
-    /// and this goes red.
-    #[test]
-    fn step_session_id_excludes_the_non_dispatching_review_kinds() {
-        let registry = attribution_registry();
-        for kind in ["records.gather", "mods.gate", "deliver.github_review"] {
-            let mut step = minimal_step("s-nd", "t-nd", None);
-            step.kind = kind.to_string();
-            assert_eq!(
-                step_session_id(&step, &registry),
-                None,
-                "`{kind}` never dispatches a model, so the run view must claim no session for it",
-            );
-        }
-    }
-
-    /// The other half: those three must actually BE in the attribution
-    /// registry. Without this, the test above would still pass the day
-    /// someone dropped a registration — an unregistered kind resolves
-    /// through the trait default, which is `Some(..)`, so it would go red
-    /// there; but if a kind's own override were ALSO deleted the two
-    /// failures could cancel. Pin the registration itself.
-    #[test]
-    fn the_attribution_registry_knows_the_crew_side_tier3_kinds() {
-        let registry = attribution_registry();
-        for kind in ["records.gather", "mods.gate", "deliver.github_review"] {
-            assert!(
-                registry.get(kind).is_ok(),
-                "`{kind}` must be registered here or its `None` declaration is never consulted",
-            );
-        }
-        // And the builtins are still all present.
-        assert!(registry.get("dispatch.internal").is_ok());
-    }
-
-    #[test]
-    fn step_session_id_unregistered_kind_is_claimed_by_the_default_not_dropped() {
-        // (#1979) THE behavior change. The old `match step.kind.as_str()`
-        // ended in `_ => None`, so any kind it had not been taught about —
-        // a Tier 3 kind registered per-launch, or simply a new one — had
-        // its session left unclaimed by `collect_mission_step_sessions`,
-        // and its records then surfaced as a duplicate untracked ghost row
-        // (`ghost_runs`'s `known_session_ids` gate). Nothing failed until
-        // an operator noticed the doubled row.
-        //
-        // An unregistered kind now falls back to the TRAIT DEFAULT, so it
-        // is claimed by construction. Assumed-dispatching is the safe
-        // direction: over-claiming a session that never appears costs
-        // nothing, while under-claiming one that does produces a phantom
-        // run on the board.
-        let mut step = minimal_step("s-tier3", "t1", None);
-        step.kind = "mission.coder".to_string();
-        assert_eq!(
-            step_session_id(&step, &StepKindRegistry::with_builtins()),
-            Some(darkmux_types::session_id::step("s-tier3")),
-        );
-    }
-
-    #[test]
-    fn step_session_id_unregistered_kind_still_honors_an_explicit_config_session() {
-        // The fallback must not swallow a caller-named session — the
-        // launch-owned Tier-3 steps DO set one, and claiming the wrong id
-        // would reintroduce the ghost this fixes from the other side.
-        let mut step = minimal_step("s-tier3", "t1", Some("mission-run-m1-p1"));
-        step.kind = "mission.coder".to_string();
-        assert_eq!(
-            step_session_id(&step, &StepKindRegistry::with_builtins()),
-            Some("mission-run-m1-p1".to_string()),
-        );
     }
 
     // ── mission_run_status ──────────────────────────────────────────────
@@ -3942,8 +3622,8 @@ mod tests {
             flows.path(),
             &today(),
             &[
-                serde_json::json!({ "ts": at(m_ago), "action": "step start", "session_id": "task-shared", "mission_id": "m-ambiguous-e2e", "source": "scheduler" }),
-                serde_json::json!({ "ts": at(other_ago), "action": "step start", "session_id": "task-shared", "mission_id": "some-other-mission", "source": "scheduler" }),
+                serde_json::json!({ "ts": at(m_ago), "action": "step.start", "session_id": "task-shared", "mission_id": "m-ambiguous-e2e", "source": "scheduler" }),
+                serde_json::json!({ "ts": at(other_ago), "action": "step.start", "session_id": "task-shared", "mission_id": "some-other-mission", "source": "scheduler" }),
             ],
         );
         let status = local_dispatch_status(std::slice::from_ref(&m), flows.path(), &[]);
@@ -3997,7 +3677,7 @@ mod tests {
             flows.path(),
             &today(),
             &[
-                serde_json::json!({ "ts": at(300), "action": "dispatch start", "session_id": "fleet-ended", "mission_id": "fleet-only", "handle": "coder" }),
+                serde_json::json!({ "ts": at(300), "action": "dispatch.start", "session_id": "fleet-ended", "mission_id": "fleet-only", "handle": "coder" }),
                 serde_json::json!({ "ts": at(60), "action": "session.end", "session_id": "fleet-ended", "mission_id": "fleet-only" }),
             ],
         );
@@ -4020,8 +3700,8 @@ mod tests {
             flows.path(),
             &today(),
             &[
-                serde_json::json!({ "ts": at(3600), "action": "dispatch start", "session_id": "task-shared-ghost", "mission_id": "ghost-a", "handle": "coder" }),
-                serde_json::json!({ "ts": at(20), "action": "dispatch start", "session_id": "task-shared-ghost", "mission_id": "ghost-b", "handle": "coder" }),
+                serde_json::json!({ "ts": at(3600), "action": "dispatch.start", "session_id": "task-shared-ghost", "mission_id": "ghost-a", "handle": "coder" }),
+                serde_json::json!({ "ts": at(20), "action": "dispatch.start", "session_id": "task-shared-ghost", "mission_id": "ghost-b", "handle": "coder" }),
                 serde_json::json!({ "ts": at(5), "action": "dispatch turn", "session_id": "task-shared-ghost", "mission_id": "ghost-b" }),
             ],
         );
@@ -4067,8 +3747,8 @@ mod tests {
             &today(),
             &[serde_json::json!({
                 "ts": "2026-01-01T09:00:00Z",
-                "action": "dispatch start",
-                "session_id": "crew-dispatch-coder-local-status",
+                "action": "dispatch.start",
+                "session_id": "crew-dispatch-coder-local-status", "mission_id": "dispatch-crashed-local-status",
                 "handle": "coder",
             })],
         );
@@ -4100,7 +3780,7 @@ mod tests {
         let _g = CrewGuard::new();
         let flows = TempDir::new().unwrap();
         let record = |sid: &str| {
-            serde_json::json!({"ts": "2026-01-01T09:00:00Z", "action": "dispatch start", "session_id": sid, "handle": "coder"})
+            serde_json::json!({"ts": "2026-01-01T09:00:00Z", "action": "dispatch.start", "session_id": sid, "handle": "coder"})
         };
         write_day_file(flows.path(), &today(), &[record("s-today")]);
         write_day_file(flows.path(), &cutoff_date_string(5), &[record("s-five-days-ago")]);
@@ -4161,8 +3841,8 @@ mod tests {
             &cutoff_date_string(3),
             &[serde_json::json!({
                 "ts": iso(now - 3 * 86_400),
-                "action": "dispatch start",
-                "session_id": "crew-dispatch-coder-long",
+                "action": "dispatch.start",
+                "session_id": "crew-dispatch-coder-long", "mission_id": "long-mission",
                 "handle": "coder",
                 "model": "qwen3.6-35b-a3b",
             })],
@@ -4173,7 +3853,7 @@ mod tests {
             &[serde_json::json!({
                 "ts": iso(now),
                 "action": "dispatch.turn.heartbeat",
-                "session_id": "crew-dispatch-coder-long",
+                "session_id": "crew-dispatch-coder-long", "mission_id": "long-mission",
             })],
         );
         let find = |runs: Vec<Run>| runs.into_iter().find(|r| r.id == "long-mission").expect("the mission is listed");
@@ -4791,14 +4471,14 @@ mod tests {
             &[
                 serde_json::json!({
                     "ts": "2026-08-07T07:57:43Z",
-                    "action": "step start",
+                    "action": "step.start",
                     "session_id": "task-__panel_args__",
                     "mission_id": "acp-ephemeral-pr-view-1786089463406811000-1",
                     "source": "scheduler",
                 }),
                 serde_json::json!({
                     "ts": "2026-08-07T07:58:00Z",
-                    "action": "step start",
+                    "action": "step.start",
                     "session_id": "task-__panel_args__",
                     "mission_id": "acp-ephemeral-pr-list-1786091297730112000-2",
                     "source": "scheduler",
@@ -4827,14 +4507,14 @@ mod tests {
             &[
                 serde_json::json!({
                     "ts": "2026-08-07T07:57:43Z",
-                    "action": "step start",
+                    "action": "step.start",
                     "session_id": "crew-dispatch-coder-1",
                     "mission_id": "mission-a",
                     "source": "scheduler",
                 }),
                 serde_json::json!({
                     "ts": "2026-08-07T07:58:00Z",
-                    "action": "step complete",
+                    "action": "step.complete",
                     "session_id": "crew-dispatch-coder-1",
                     "mission_id": "mission-a",
                     "source": "scheduler",
@@ -4860,13 +4540,13 @@ mod tests {
             &[
                 serde_json::json!({
                     "ts": "2026-07-24T10:00:00Z",
-                    "action": "dispatch start",
+                    "action": "dispatch.start",
                     "session_id": "sess-1",
                     "handle": "reviewer",
                 }),
                 serde_json::json!({
                     "ts": "2026-07-24T10:05:00Z",
-                    "action": "dispatch complete",
+                    "action": "dispatch.complete",
                     "session_id": "sess-1",
                     "handle": "reviewer",
                     "model": "gpt-4o",
@@ -4890,7 +4570,7 @@ mod tests {
             &[
                 serde_json::json!({
                     "ts": "2026-07-24T10:00:00Z",
-                    "action": "dispatch start",
+                    "action": "dispatch.start",
                     "session_id": "sess-2",
                     "handle": "coder",
                 }),
@@ -4926,13 +4606,13 @@ mod tests {
             &[
                 serde_json::json!({
                     "ts": "2026-07-24T10:00:00Z",
-                    "action": "dispatch start",
+                    "action": "dispatch.start",
                     "session_id": "sess-3",
                     "handle": "coder",
                 }),
                 serde_json::json!({
                     "ts": "2026-07-24T10:00:05Z",
-                    "action": "dispatch error",
+                    "action": "dispatch.error",
                     "session_id": "sess-3",
                     "handle": "coder",
                 }),
@@ -4962,7 +4642,7 @@ mod tests {
             "2000-01-01",
             &[serde_json::json!({
                 "ts": "2000-01-01T09:00:00Z",
-                "action": "dispatch start",
+                "action": "dispatch.start",
                 "session_id": "ancient-orphan-sess",
                 "handle": "coder",
             })],
@@ -4989,7 +4669,7 @@ mod tests {
             &[
                 serde_json::json!({
                     "ts": "2026-07-24T10:00:00Z",
-                    "action": "dispatch start",
+                    "action": "dispatch.start",
                     "session_id": "ticking-sess",
                     "handle": "coder",
                 }),
@@ -5028,7 +4708,7 @@ mod tests {
             &[
                 serde_json::json!({
                     "ts": "2026-07-24T10:00:00Z",
-                    "action": "dispatch start",
+                    "action": "dispatch.start",
                     "session_id": "outoforder-sess",
                     "handle": "coder",
                 }),
@@ -5186,9 +4866,8 @@ mod tests {
 
     #[test]
     fn ghost_runs_skips_a_session_already_covered_by_session_id() {
-        // The Dispatch-kind (crew-of-one) case: mission_id is None on the
-        // flow record (the module doc's "mission_id gap"), so dedup must
-        // key on session_id instead.
+        // A session claimed by id (a lab run's own dispatch session): its
+        // records carry no mission, so dedup keys on the session id.
         let mut idx = HashMap::new();
         idx.insert(
             "crew-dispatch-coder-abc".to_string(),
@@ -5454,22 +5133,21 @@ mod tests {
         );
         darkmux_crew::lifecycle::save_step("dispatch-coder-1", "dispatch-coder-1-phase", &step).unwrap();
 
-        // The dispatch's own flow records — mission_id DELIBERATELY absent
-        // (the mission_id gap), joined only by session_id.
+        // The dispatch's own flow records, carrying its mission.
         write_day_file(
             flows.path(),
             &today(),
             &[
                 serde_json::json!({
                     "ts": "2026-07-24T09:00:00Z",
-                    "action": "dispatch start",
-                    "session_id": "crew-dispatch-coder-xyz",
+                    "action": "dispatch.start",
+                    "session_id": "crew-dispatch-coder-xyz", "mission_id": "dispatch-coder-1",
                     "handle": "coder",
                 }),
                 serde_json::json!({
                     "ts": "2026-07-24T09:10:00Z",
-                    "action": "dispatch complete",
-                    "session_id": "crew-dispatch-coder-xyz",
+                    "action": "dispatch.complete",
+                    "session_id": "crew-dispatch-coder-xyz", "mission_id": "dispatch-coder-1",
                     "handle": "coder",
                     "model": "qwen3.6-35b-a3b",
                 }),
@@ -5544,14 +5222,14 @@ mod tests {
             &[
                 serde_json::json!({
                     "ts": "2020-01-01T09:00:00Z",
-                    "action": "dispatch start",
+                    "action": "dispatch.start",
                     "session_id": "crew-dispatch-ancient-xyz",
                     "handle": "coder",
                     "machine_id": "flow-derived-machine-should-not-win",
                 }),
                 serde_json::json!({
                     "ts": "2020-01-01T09:10:00Z",
-                    "action": "dispatch complete",
+                    "action": "dispatch.complete",
                     "session_id": "crew-dispatch-ancient-xyz",
                     "handle": "coder",
                     "model": "qwen3.6-35b-a3b",
@@ -5630,15 +5308,15 @@ mod tests {
             &[
                 serde_json::json!({
                     "ts": format!("{day}T09:00:00Z"),
-                    "action": "dispatch start",
-                    "session_id": "crew-dispatch-disagree-xyz",
+                    "action": "dispatch.start",
+                    "session_id": "crew-dispatch-disagree-xyz", "mission_id": "disagree-mission-1",
                     "handle": "coder",
                     "machine_id": "peer-runner-that-actually-ran-it",
                 }),
                 serde_json::json!({
                     "ts": format!("{day}T09:10:00Z"),
-                    "action": "dispatch complete",
-                    "session_id": "crew-dispatch-disagree-xyz",
+                    "action": "dispatch.complete",
+                    "session_id": "crew-dispatch-disagree-xyz", "mission_id": "disagree-mission-1",
                     "handle": "coder",
                     "model": "qwen3.6-35b-a3b",
                     "machine_id": "peer-runner-that-actually-ran-it",
@@ -5744,7 +5422,7 @@ mod tests {
             &[
                 serde_json::json!({
                     "ts": "2026-07-24T09:00:00Z",
-                    "action": "dispatch start",
+                    "action": "dispatch.start",
                     "session_id": "darkmux-coding-crawl-error-discard-live-1787676109556",
                     "handle": "crawler",
                 }),
@@ -5818,13 +5496,13 @@ mod tests {
             &[
                 serde_json::json!({
                     "ts": "2026-07-24T09:00:00Z",
-                    "action": "dispatch start",
+                    "action": "dispatch.start",
                     "session_id": "darkmux-coding-crawl-error-discard-1787676109556",
                     "handle": "crawler",
                 }),
                 serde_json::json!({
                     "ts": "2026-07-24T09:10:00Z",
-                    "action": "dispatch complete",
+                    "action": "dispatch.complete",
                     "session_id": "darkmux-coding-crawl-error-discard-1787676109556",
                     "handle": "crawler",
                     "model": "qwen3.6-35b-a3b",
@@ -5867,26 +5545,26 @@ mod tests {
             &[
                 serde_json::json!({
                     "ts": "2026-07-24T09:00:00Z",
-                    "action": "dispatch start",
+                    "action": "dispatch.start",
                     "session_id": "darkmux-coding-crawl-error-discard-1787676109556",
                     "handle": "crawler",
                 }),
                 serde_json::json!({
                     "ts": "2026-07-24T09:10:00Z",
-                    "action": "dispatch complete",
+                    "action": "dispatch.complete",
                     "session_id": "darkmux-coding-crawl-error-discard-1787676109556",
                     "handle": "crawler",
                     "model": "qwen3.6-35b-a3b",
                 }),
                 serde_json::json!({
                     "ts": "2026-07-24T09:05:00Z",
-                    "action": "dispatch start",
+                    "action": "dispatch.start",
                     "session_id": "an-entirely-unrelated-standalone-session",
                     "handle": "coder",
                 }),
                 serde_json::json!({
                     "ts": "2026-07-24T09:06:00Z",
-                    "action": "dispatch complete",
+                    "action": "dispatch.complete",
                     "session_id": "an-entirely-unrelated-standalone-session",
                     "handle": "coder",
                     "model": "qwen3.6-35b-a3b",
@@ -5961,13 +5639,13 @@ mod tests {
             &[
                 serde_json::json!({
                     "ts": "2026-07-24T09:00:00Z",
-                    "action": "dispatch start",
+                    "action": "dispatch.start",
                     "session_id": "darkmux-coding-crawl-error-discard-1787676109556",
                     "handle": "crawler",
                 }),
                 serde_json::json!({
                     "ts": "2026-07-24T09:10:00Z",
-                    "action": "dispatch complete",
+                    "action": "dispatch.complete",
                     "session_id": "darkmux-coding-crawl-error-discard-1787676109556",
                     "handle": "crawler",
                     "model": "qwen3.6-35b-a3b",
@@ -5990,11 +5668,9 @@ mod tests {
     }
 
     /// Launch path 2/4: a GENERIC `mission launch <config>` mission whose
-    /// `dispatch.internal` step config carries NO explicit `session_id` —
-    /// mirrors `interpret::push_step`'s real behavior (must-fix 2). The
-    /// step's flow records use the step kind's own default session_id
-    /// (`session_id::step(step.id)`) and carry `mission_id: null`, exactly
-    /// as the real emitter does.
+    /// `dispatch.internal` step config carries NO explicit `session_id`.
+    /// The step's flow records use the step's own session in the mission's
+    /// run and carry its `mission_id`, exactly as the real emitter does.
     #[test]
     #[serial_test::serial]
     fn build_runs_generic_config_mission_dispatch_step_is_not_also_listed_as_a_ghost() {
@@ -6015,24 +5691,28 @@ mod tests {
         let step = minimal_step("s-generic", "t-generic", None);
         darkmux_crew::lifecycle::save_step("generic-config-1", "p-generic", &step).unwrap();
 
-        let default_session = darkmux_types::session_id::step("s-generic");
+        let default_session = darkmux_types::session_id::SessionId::step(
+            darkmux_types::session_id::RunId::mission("generic-config-1").unwrap(),
+            "s-generic",
+        )
+        .wire();
         write_day_file(
             flows.path(),
             &today(),
             &[
                 serde_json::json!({
                     "ts": "2026-01-01T09:00:00Z",
-                    "action": "dispatch start",
+                    "action": "dispatch.start",
                     "session_id": default_session,
                     "handle": "coder",
-                    // mission_id DELIBERATELY absent — matches
-                    // resolve_mission_for_phase(None)'s real gap.
+                    "mission_id": "generic-config-1",
                 }),
                 serde_json::json!({
                     "ts": "2026-01-01T09:05:00Z",
-                    "action": "dispatch complete",
+                    "action": "dispatch.complete",
                     "session_id": default_session,
                     "handle": "coder",
+                    "mission_id": "generic-config-1",
                     "model": "qwen3.6-35b-a3b",
                 }),
             ],
@@ -6052,19 +5732,21 @@ mod tests {
     /// missions' step records landed under the identical config-derived
     /// `session_id` (`step-s-shared`), so `SessionAgg` folded them into
     /// ONE bucket and `mission_to_run`'s role/model attribution for
-    /// EITHER mission could read the OTHER's. This test writes the
-    /// POST-FIX (scoped) session ids each mission's own step-lifecycle
-    /// records now carry and asserts `build_runs` attributes role/model
-    /// to the mission that actually ran it — never the sibling's.
+    /// EITHER mission could read the OTHER's. This test writes the session
+    /// each mission's own step records carry (the step's session in its
+    /// run) and asserts `build_runs` attributes role/model to the mission
+    /// that actually ran it — never the sibling's.
     #[test]
     #[serial_test::serial]
     fn build_runs_two_missions_from_the_same_config_never_cross_attribute_role_or_model() {
         let _g = CrewGuard::new();
         let flows = TempDir::new().unwrap();
 
-        let raw_session = darkmux_types::session_id::step("s-shared");
-        let session_x = darkmux_types::session_id::scope_to_run(&raw_session, "mission-x");
-        let session_y = darkmux_types::session_id::scope_to_run(&raw_session, "mission-y");
+        let step_in = |m: &str| {
+            darkmux_types::session_id::SessionId::step(darkmux_types::session_id::RunId::mission(m).unwrap(), "s-shared")
+                .wire()
+        };
+        let (session_x, session_y) = (step_in("mission-x"), step_in("mission-y"));
         assert_ne!(session_x, session_y, "the two missions' scoped session ids must differ");
 
         // `write_day_file` truncates the day file on every call — collect
@@ -6096,14 +5778,14 @@ mod tests {
 
             all_records.push(serde_json::json!({
                 "ts": "2026-07-24T09:00:00Z",
-                "action": "dispatch start",
+                "action": "dispatch.start",
                 "session_id": session_id,
                 "handle": role,
                 "mission_id": mission_id,
             }));
             all_records.push(serde_json::json!({
                 "ts": "2026-07-24T09:10:00Z",
-                "action": "dispatch complete",
+                "action": "dispatch.complete",
                 "session_id": session_id,
                 "handle": role,
                 "mission_id": mission_id,
@@ -6128,24 +5810,26 @@ mod tests {
     /// (#1918 QA) The MIXED day file — the state every operator has for
     /// `RUNS_FLOW_SCAN_WINDOW_DAYS` after upgrading past FLOW 1.43.0:
     /// pre-1.43.0 records still carry the bare `step-<id>` bucket that N
-    /// missions shared, beside a new mission's correctly-scoped ones. A
-    /// new mission's structural prediction (`collect_mission_step_
-    /// sessions`, which by design still predicts the UNSCOPED form)
-    /// claims that legacy bucket, and its records are OLDER — so before
-    /// the `is_ambiguous` filter on `sessions_by_start` they sorted FIRST
-    /// and won BOTH `role` and `model`, which are precisely the two
-    /// attributes #1918 exists to stop cross-contaminating. Measured
-    /// before the fix: `model: legacy-model-a`, `role: legacy-role` on a
-    /// mission whose own records say `correct-model`/`coder`.
+    /// missions shared, beside a new mission's own. The legacy bucket's
+    /// records are OLDER, so were they ever to join the new mission they
+    /// would sort FIRST and win BOTH `role` and `model`, the two attributes
+    /// #1918 exists to stop cross-contaminating. Measured once: `model:
+    /// legacy-model-a`, `role: legacy-role` on a mission whose own records
+    /// say `correct-model`/`coder`.
     #[test]
     #[serial_test::serial]
     fn build_runs_a_mixed_day_never_attributes_the_legacy_shared_bucket_to_a_new_mission() {
         let _g = CrewGuard::new();
         let flows = TempDir::new().unwrap();
 
-        let raw = darkmux_types::session_id::step("s-shared");
-        let scoped_new = darkmux_types::session_id::scope_to_run(&raw, "mission-new");
-        assert_ne!(raw, scoped_new);
+        // The pre-4.0 bare step session N missions shared, and the new
+        // mission's own step session in its run.
+        let raw = "step-s-shared";
+        let scoped_new = darkmux_types::session_id::SessionId::step(
+            darkmux_types::session_id::RunId::mission("mission-new").unwrap(),
+            "s-shared",
+        )
+        .wire();
 
         let mission = minimal_mission(
             "mission-new",
@@ -6170,22 +5854,22 @@ mod tests {
         // the 49-missions/1-session bucket #1918 measured live.
         for (mid, model) in [("mission-old-a", "legacy-model-a"), ("mission-old-b", "legacy-model-b")] {
             recs.push(serde_json::json!({
-                "ts": "2026-07-20T09:00:00Z", "action": "dispatch start",
+                "ts": "2026-07-20T09:00:00Z", "action": "dispatch.start",
                 "session_id": raw, "handle": "legacy-role", "mission_id": mid,
             }));
             recs.push(serde_json::json!({
-                "ts": "2026-07-20T09:10:00Z", "action": "dispatch complete",
+                "ts": "2026-07-20T09:10:00Z", "action": "dispatch.complete",
                 "session_id": raw, "handle": "legacy-role", "mission_id": mid, "model": model,
             }));
         }
         // The new mission's OWN, correctly scoped records — LATER, so
         // only the ambiguity filter (not ordering) can save them.
         recs.push(serde_json::json!({
-            "ts": "2026-07-24T09:00:00Z", "action": "dispatch start",
+            "ts": "2026-07-24T09:00:00Z", "action": "dispatch.start",
             "session_id": scoped_new, "handle": "coder", "mission_id": "mission-new",
         }));
         recs.push(serde_json::json!({
-            "ts": "2026-07-24T09:10:00Z", "action": "dispatch complete",
+            "ts": "2026-07-24T09:10:00Z", "action": "dispatch.complete",
             "session_id": scoped_new, "handle": "coder", "mission_id": "mission-new",
             "model": "correct-model",
         }));
@@ -6269,7 +5953,7 @@ mod tests {
                 // `mission_bookend_record` itself sets).
                 serde_json::json!({
                     "ts": "2026-01-01T08:00:00Z",
-                    "action": "dispatch start",
+                    "action": "dispatch.start",
                     "session_id": "bookend-mission-1",
                     "handle": "coder-phase",
                     "mission_id": "bookend-mission-1",
@@ -6283,15 +5967,15 @@ mod tests {
                 // borrow a later session's value the way role/model now do.
                 serde_json::json!({
                     "ts": "2026-01-01T09:00:00Z",
-                    "action": "dispatch start",
-                    "session_id": "crew-dispatch-coder-bookend",
+                    "action": "dispatch.start",
+                    "session_id": "crew-dispatch-coder-bookend", "mission_id": "bookend-mission-1",
                     "handle": "coder",
                     "machine_id": "different-peer",
                 }),
                 serde_json::json!({
                     "ts": "2026-01-01T09:10:00Z",
-                    "action": "dispatch complete",
-                    "session_id": "crew-dispatch-coder-bookend",
+                    "action": "dispatch.complete",
+                    "session_id": "crew-dispatch-coder-bookend", "mission_id": "bookend-mission-1",
                     "handle": "coder",
                     "model": "qwen3.6-35b-a3b",
                     "machine_id": "different-peer",
@@ -6377,7 +6061,7 @@ mod tests {
                 // fixture above.
                 serde_json::json!({
                     "ts": "2026-01-01T08:00:00Z",
-                    "action": "dispatch start",
+                    "action": "dispatch.start",
                     "session_id": "collision-mission-1",
                     "handle": "coder-phase",
                     "mission_id": "collision-mission-1",
@@ -6389,7 +6073,7 @@ mod tests {
                 // id scheme colliding across missions).
                 serde_json::json!({
                     "ts": "2026-01-01T08:30:00Z",
-                    "action": "step start",
+                    "action": "step.start",
                     "session_id": "collision-mission-1",
                     "mission_id": "some-other-mission",
                     "source": "scheduler",
@@ -6401,7 +6085,7 @@ mod tests {
                 // from a field that was simply never populated.
                 serde_json::json!({
                     "ts": "2026-01-01T09:00:00Z",
-                    "action": "dispatch complete",
+                    "action": "dispatch.complete",
                     "session_id": "collision-mission-1",
                     "handle": "coder-phase",
                     "mission_id": "collision-mission-1",
@@ -6515,7 +6199,7 @@ mod tests {
                 // `earliest_by_start`'s pick if it weren't ambiguous.
                 serde_json::json!({
                     "ts": "2026-01-01T08:00:00Z",
-                    "action": "dispatch start",
+                    "action": "dispatch.start",
                     "session_id": "ambig-bookend-mission",
                     "handle": "coder-phase",
                     "mission_id": "ambig-bookend-mission",
@@ -6530,7 +6214,7 @@ mod tests {
                 // into the SAME bookend session, making it ambiguous.
                 serde_json::json!({
                     "ts": "2026-01-01T08:05:00Z",
-                    "action": "step start",
+                    "action": "step.start",
                     "session_id": "ambig-bookend-mission",
                     "mission_id": "some-other-mission",
                     "source": "scheduler",
@@ -6540,7 +6224,7 @@ mod tests {
                 // `machine`/`started_ts` actually recovered from it.
                 serde_json::json!({
                     "ts": "2026-01-01T09:00:00Z",
-                    "action": "dispatch start",
+                    "action": "dispatch.start",
                     "session_id": "crew-dispatch-coder-ambig",
                     "handle": "coder",
                     "mission_id": "ambig-bookend-mission",
@@ -6548,7 +6232,7 @@ mod tests {
                 }),
                 serde_json::json!({
                     "ts": "2026-01-01T09:10:00Z",
-                    "action": "dispatch complete",
+                    "action": "dispatch.complete",
                     "session_id": "crew-dispatch-coder-ambig",
                     "handle": "coder",
                     "mission_id": "ambig-bookend-mission",
@@ -6562,7 +6246,7 @@ mod tests {
                 // the row's first sort key.
                 serde_json::json!({
                     "ts": "2026-01-01T09:30:00Z",
-                    "action": "dispatch complete",
+                    "action": "dispatch.complete",
                     "session_id": "ambig-bookend-mission",
                     "handle": "coder-phase",
                     "mission_id": "ambig-bookend-mission",
@@ -6678,7 +6362,7 @@ mod tests {
                 // `earliest_by_start`'s `representative` pick.
                 serde_json::json!({
                     "ts": "2026-01-01T08:00:00Z",
-                    "action": "dispatch start",
+                    "action": "dispatch.start",
                     "session_id": "bookend-mission-2",
                     "handle": "coder-phase",
                     "mission_id": "bookend-mission-2",
@@ -6688,15 +6372,15 @@ mod tests {
                 // The coder step's OWN dispatch — a real role and model.
                 serde_json::json!({
                     "ts": "2026-01-01T09:00:00Z",
-                    "action": "dispatch start",
-                    "session_id": "crew-dispatch-coder-bookend2",
+                    "action": "dispatch.start",
+                    "session_id": "crew-dispatch-coder-bookend2", "mission_id": "bookend-mission-2",
                     "handle": "coder",
                     "machine_id": "different-peer",
                 }),
                 serde_json::json!({
                     "ts": "2026-01-01T09:10:00Z",
-                    "action": "dispatch complete",
-                    "session_id": "crew-dispatch-coder-bookend2",
+                    "action": "dispatch.complete",
+                    "session_id": "crew-dispatch-coder-bookend2", "mission_id": "bookend-mission-2",
                     "handle": "coder",
                     "model": "qwen3.6-35b-a3b",
                     "machine_id": "different-peer",
@@ -6708,7 +6392,7 @@ mod tests {
                 // FRONT of `sessions_by_start` despite the late `ts`.
                 serde_json::json!({
                     "ts": "2026-01-01T09:20:00Z",
-                    "action": "dispatch complete",
+                    "action": "dispatch.complete",
                     "session_id": "startless-session",
                     "handle": "STALE-ROLE",
                     "model": "STALE-MODEL",
@@ -6766,7 +6450,7 @@ mod tests {
             &[
                 serde_json::json!({
                     "ts": "2026-01-01T08:00:00Z",
-                    "action": "dispatch start",
+                    "action": "dispatch.start",
                     "session_id": "bookend-only-1",
                     "handle": "cmd-gate-approve",
                     "mission_id": "bookend-only-1",
@@ -6774,7 +6458,7 @@ mod tests {
                 }),
                 serde_json::json!({
                     "ts": "2026-01-01T08:00:05Z",
-                    "action": "dispatch complete",
+                    "action": "dispatch.complete",
                     "session_id": "bookend-only-1",
                     "handle": "cmd-gate-approve",
                     "mission_id": "bookend-only-1",
@@ -6818,14 +6502,14 @@ mod tests {
             &[
                 serde_json::json!({
                     "ts": "2026-01-01T08:00:00Z",
-                    "action": "dispatch start",
+                    "action": "dispatch.start",
                     "session_id": "owner/repo@deadbeef",
                     "handle": "review-probe-mid,review-judge",
                     "mission_id": "review-1700000000-abcdef",
                 }),
                 serde_json::json!({
                     "ts": "2026-01-01T08:20:00Z",
-                    "action": "dispatch complete",
+                    "action": "dispatch.complete",
                     "session_id": "owner/repo@deadbeef",
                     "handle": "review-probe-mid,review-judge",
                     "model": "gpt-4o",
@@ -6879,14 +6563,14 @@ mod tests {
             &[
                 serde_json::json!({
                     "ts": "2026-01-01T09:00:00Z",
-                    "action": "dispatch start",
-                    "session_id": "crew-dispatch-coder-crashed",
+                    "action": "dispatch.start",
+                    "session_id": "crew-dispatch-coder-crashed", "mission_id": "dispatch-crashed-1",
                     "handle": "coder",
                 }),
                 serde_json::json!({
                     "ts": "2026-01-01T09:05:00Z",
                     "action": "session.end",
-                    "session_id": "crew-dispatch-coder-crashed",
+                    "session_id": "crew-dispatch-coder-crashed", "mission_id": "dispatch-crashed-1",
                 }),
             ],
         );
@@ -6977,9 +6661,9 @@ mod tests {
             &[
                 // older mission — fully terminal, reusing the SAME probe
                 // task session id every review mission uses.
-                serde_json::json!({"ts":"2026-01-01T08:00:00Z","action":"mission start","session_id":"mission-review-1000000000-older","mission_id":"review-1000000000-older","source":"mission_lifecycle"}),
-                serde_json::json!({"ts":"2026-01-01T08:00:01Z","action":"dispatch start","session_id":"task-review-probe-mid-task","mission_id":"review-1000000000-older","role":"review-probe-mid"}),
-                serde_json::json!({"ts":"2026-01-01T08:20:00Z","action":"dispatch complete","session_id":"task-review-probe-mid-task","mission_id":"review-1000000000-older","model":"m-old"}),
+                serde_json::json!({"ts":"2026-01-01T08:00:00Z","action":"mission.start","session_id":"mission-review-1000000000-older","mission_id":"review-1000000000-older","source":"mission_lifecycle"}),
+                serde_json::json!({"ts":"2026-01-01T08:00:01Z","action":"dispatch.start","session_id":"task-review-probe-mid-task","mission_id":"review-1000000000-older","role":"review-probe-mid"}),
+                serde_json::json!({"ts":"2026-01-01T08:20:00Z","action":"dispatch.complete","session_id":"task-review-probe-mid-task","mission_id":"review-1000000000-older","model":"m-old"}),
                 // (#2487) The older mission's OWN run-level dispatch bookend,
                 // mirroring the active mission's `owner/repo@deadbeef` below.
                 // Before #2487 this row's `completed_ts` was read off the
@@ -6990,9 +6674,9 @@ mod tests {
                 // actually had: a bookend keyed on the older run's own commit
                 // sha, never reused across missions. The ordering assertion
                 // below therefore now tests ordering rather than tainted data.
-                serde_json::json!({"ts":"2026-01-01T08:00:00Z","action":"dispatch start","session_id":"owner/repo@cafebabe","mission_id":"review-1000000000-older","role":"deep+diff-review+probe-mid","handle":"deep+diff-review+probe-mid"}),
-                serde_json::json!({"ts":"2026-01-01T08:20:00Z","action":"dispatch complete","session_id":"owner/repo@cafebabe","mission_id":"review-1000000000-older"}),
-                serde_json::json!({"ts":"2026-01-01T08:20:01Z","action":"mission close","session_id":"mission-review-1000000000-older","mission_id":"review-1000000000-older"}),
+                serde_json::json!({"ts":"2026-01-01T08:00:00Z","action":"dispatch.start","session_id":"owner/repo@cafebabe","mission_id":"review-1000000000-older","role":"deep+diff-review+probe-mid","handle":"deep+diff-review+probe-mid"}),
+                serde_json::json!({"ts":"2026-01-01T08:20:00Z","action":"dispatch.complete","session_id":"owner/repo@cafebabe","mission_id":"review-1000000000-older"}),
+                serde_json::json!({"ts":"2026-01-01T08:20:01Z","action":"mission.close","session_id":"mission-review-1000000000-older","mission_id":"review-1000000000-older"}),
                 // active mission — mission-level bookend (its own unique
                 // session id, embeds the mission id — never reused) plus
                 // the run-level dispatch bookend (keyed on the commit sha in
@@ -7001,10 +6685,10 @@ mod tests {
                 // mission's exact session id and gets no fresh activity of
                 // its own here — exactly the ambiguous, excluded-from-
                 // liveness shape the real report hit.
-                serde_json::json!({"ts":"2026-01-01T09:39:00Z","action":"mission start","session_id":"mission-review-2000000000-active","mission_id":"review-2000000000-active","source":"mission_lifecycle"}),
-                serde_json::json!({"ts":"2026-01-01T09:39:01Z","action":"dispatch start","session_id":"owner/repo@deadbeef","mission_id":"review-2000000000-active","role":"deep+diff-review+probe-mid","handle":"deep+diff-review+probe-mid"}),
-                serde_json::json!({"ts": now, "action":"telemetry.process","session_id":"owner/repo@deadbeef","mission_id":"review-2000000000-active"}),
-                serde_json::json!({"ts":"2026-01-01T09:39:02Z","action":"step start","session_id":"task-review-probe-mid-task","mission_id":"review-2000000000-active","role":"review-probe-mid"}),
+                serde_json::json!({"ts":"2026-01-01T09:39:00Z","action":"mission.start","session_id":"mission-review-2000000000-active","mission_id":"review-2000000000-active","source":"mission_lifecycle"}),
+                serde_json::json!({"ts":"2026-01-01T09:39:01Z","action":"dispatch.start","session_id":"owner/repo@deadbeef","mission_id":"review-2000000000-active","role":"deep+diff-review+probe-mid","handle":"deep+diff-review+probe-mid"}),
+                serde_json::json!({"ts": now, "action":"machine.telemetry","session_id":"owner/repo@deadbeef","mission_id":"review-2000000000-active"}),
+                serde_json::json!({"ts":"2026-01-01T09:39:02Z","action":"step.start","session_id":"task-review-probe-mid-task","mission_id":"review-2000000000-active","role":"review-probe-mid"}),
             ],
         );
 
@@ -7101,13 +6785,13 @@ mod tests {
                 // The tracked mission's own session.
                 serde_json::json!({
                     "ts": "2026-07-24T09:00:00Z",
-                    "action": "dispatch start",
-                    "session_id": "crew-dispatch-coder-known",
+                    "action": "dispatch.start",
+                    "session_id": "crew-dispatch-coder-known", "mission_id": "dispatch-coder-2",
                 }),
                 // A genuinely orphaned session — no mission ever minted.
                 serde_json::json!({
                     "ts": orphan_ts,
-                    "action": "dispatch start",
+                    "action": "dispatch.start",
                     "session_id": "crew-dispatch-reviewer-orphan",
                     "handle": "reviewer",
                 }),
@@ -7175,23 +6859,22 @@ mod tests {
             flows.path(),
             &today(),
             &[
-                // The tracked mission's step session: records carry the
-                // session only (the scheduler's own shape), no mission_id.
-                serde_json::json!({ "ts": "2026-07-24T09:00:00Z", "action": "dispatch start", "session_id": "crew-dispatch-coder-known" }),
-                usage_record("2026-07-24T09:01:00Z", "crew-dispatch-coder-known", None, provider("turn", 120)),
-                usage_record("2026-07-24T09:02:00Z", "crew-dispatch-coder-known", None, provider("turn", 180)),
+                // The tracked mission's step session, carrying its mission.
+                serde_json::json!({ "ts": "2026-07-24T09:00:00Z", "action": "dispatch.start", "session_id": "crew-dispatch-coder-known", "mission_id": "dispatch-coder-2" }),
+                usage_record("2026-07-24T09:01:00Z", "crew-dispatch-coder-known", Some("dispatch-coder-2"), provider("turn", 120)),
+                usage_record("2026-07-24T09:02:00Z", "crew-dispatch-coder-known", Some("dispatch-coder-2"), provider("turn", 180)),
                 // Its complete must NOT be read: the run has usage records.
-                serde_json::json!({ "ts": "2026-07-24T09:03:00Z", "action": "dispatch complete", "session_id": "crew-dispatch-coder-known", "payload": { "total_tokens": 999 } }),
+                serde_json::json!({ "ts": "2026-07-24T09:03:00Z", "action": "dispatch.complete", "session_id": "crew-dispatch-coder-known", "mission_id": "dispatch-coder-2", "payload": { "total_tokens": 999 } }),
                 // A ghost with a work turn and a compactor sub-execution.
-                serde_json::json!({ "ts": now, "action": "dispatch start", "session_id": "crew-dispatch-reviewer-orphan", "handle": "reviewer" }),
+                serde_json::json!({ "ts": now, "action": "dispatch.start", "session_id": "crew-dispatch-reviewer-orphan", "handle": "reviewer" }),
                 usage_record(&now, "crew-dispatch-reviewer-orphan", None, provider("turn", 60)),
                 usage_record(&now, "crew-dispatch-reviewer-orphan", None, provider("compaction", 90)),
                 // A ghost whose only record reported nothing.
-                serde_json::json!({ "ts": now, "action": "dispatch start", "session_id": "crew-dispatch-silent", "handle": "reviewer" }),
+                serde_json::json!({ "ts": now, "action": "dispatch.start", "session_id": "crew-dispatch-silent", "handle": "reviewer" }),
                 usage_record(&now, "crew-dispatch-silent", None, serde_json::json!({ "call_kind": "turn", "token_source": "absent" })),
                 // A legacy ghost: no usage record at all, tokens on its complete.
-                serde_json::json!({ "ts": "2026-07-24T09:10:00Z", "action": "dispatch start", "session_id": "crew-dispatch-legacy", "handle": "reviewer" }),
-                serde_json::json!({ "ts": "2026-07-24T09:11:00Z", "action": "dispatch complete", "session_id": "crew-dispatch-legacy", "payload": { "total_tokens": 700 } }),
+                serde_json::json!({ "ts": "2026-07-24T09:10:00Z", "action": "dispatch.start", "session_id": "crew-dispatch-legacy", "handle": "reviewer" }),
+                serde_json::json!({ "ts": "2026-07-24T09:11:00Z", "action": "dispatch.complete", "session_id": "crew-dispatch-legacy", "payload": { "total_tokens": 700 } }),
             ],
         );
         // A peer mission, seen only in the fleet stream.
@@ -7199,7 +6882,7 @@ mod tests {
         peer_usage["category"] = serde_json::json!("telemetry");
         peer_usage["source"] = serde_json::json!("tokens");
         peer_usage["payload"] = provider("single_shot", 500);
-        let fleet = vec![peer_record("mission start", &now), peer_usage];
+        let fleet = vec![peer_record("mission.start", &now), peer_usage];
 
         let runs = build_runs(flows.path(), None, &fleet);
         let tokens = |id: &str| runs.iter().find(|r| r.id == id).unwrap_or_else(|| panic!("{id} in {runs:?}")).tokens;
@@ -7228,9 +6911,9 @@ mod tests {
             flows.path(),
             &today(),
             &[
-                serde_json::json!({ "ts": now, "action": "dispatch start", "session_id": "lab-sess-1", "handle": "coder" }),
+                serde_json::json!({ "ts": now, "action": "dispatch.start", "session_id": "lab-sess-1", "handle": "coder" }),
                 usage_record(&now, "lab-sess-1", None, serde_json::json!({ "call_kind": "turn", "token_source": "provider", "total_tokens": 4200 })),
-                serde_json::json!({ "ts": now, "action": "dispatch complete", "session_id": "lab-sess-1", "handle": "coder", "payload": { "total_tokens": 1 } }),
+                serde_json::json!({ "ts": now, "action": "dispatch.complete", "session_id": "lab-sess-1", "handle": "coder", "payload": { "total_tokens": 1 } }),
             ],
         );
         let runs = build_runs(flows.path(), Some(lab.path()), &[]);
@@ -7249,7 +6932,7 @@ mod tests {
         let _g = CrewGuard::new();
         let flows = TempDir::new().unwrap();
         let now = darkmux_flow::ts_utc_now();
-        let start = serde_json::json!({ "ts": now, "action": "dispatch start", "session_id": "both-sinks", "handle": "coder", "source": "crew_dispatch" });
+        let start = serde_json::json!({ "ts": now, "action": "dispatch.start", "session_id": "both-sinks", "handle": "coder", "source": "crew_dispatch" });
         let mut usage = usage_record(&now, "both-sinks", None, serde_json::json!({ "call_kind": "turn", "token_source": "provider", "total_tokens": 333 }));
         usage["handle"] = serde_json::json!("coder");
         write_day_file(flows.path(), &today(), &[start.clone(), usage.clone()]);
@@ -7282,7 +6965,7 @@ mod tests {
             flows.path(),
             &old_day,
             &[
-                serde_json::json!({ "ts": format!("{old_day}T12:00:00Z"), "action": "dispatch start", "session_id": "straddle", "handle": "coder" }),
+                serde_json::json!({ "ts": format!("{old_day}T12:00:00Z"), "action": "dispatch.start", "session_id": "straddle", "handle": "coder" }),
                 usage_record(&format!("{old_day}T12:01:00Z"), "straddle", None, serde_json::json!({ "call_kind": "turn", "token_source": "provider", "total_tokens": 900 })),
             ],
         );
@@ -7290,7 +6973,7 @@ mod tests {
         write_day_file(
             flows.path(),
             &today(),
-            &[serde_json::json!({ "ts": now, "action": "dispatch complete", "session_id": "straddle", "handle": "coder", "payload": { "total_tokens": 1000 } })],
+            &[serde_json::json!({ "ts": now, "action": "dispatch.complete", "session_id": "straddle", "handle": "coder", "payload": { "total_tokens": 1000 } })],
         );
         let built = build_runs_with_usage(flows.path(), None, &[], None);
         assert_eq!((built.usage.overall.total, built.usage.overall.legacy_completes), (1000, 1), "the bounded scan's reading");
@@ -7318,7 +7001,7 @@ mod tests {
             flows.path(),
             &old_day,
             &[
-                serde_json::json!({ "ts": format!("{old_day}T12:00:00Z"), "action": "dispatch start", "session_id": "old-session", "handle": "coder" }),
+                serde_json::json!({ "ts": format!("{old_day}T12:00:00Z"), "action": "dispatch.start", "session_id": "old-session", "handle": "coder" }),
                 usage_record(&format!("{old_day}T12:01:00Z"), "old-session", None, provider(1000)),
             ],
         );
@@ -7327,7 +7010,7 @@ mod tests {
             flows.path(),
             &today(),
             &[
-                serde_json::json!({ "ts": now, "action": "dispatch start", "session_id": "new-session", "handle": "coder" }),
+                serde_json::json!({ "ts": now, "action": "dispatch.start", "session_id": "new-session", "handle": "coder" }),
                 usage_record(&now, "new-session", None, provider(40)),
             ],
         );
@@ -7389,8 +7072,8 @@ mod tests {
         let flows = TempDir::new().unwrap(); // deliberately EMPTY: the peer's
         // records were never written to this machine's flows dir.
         let fleet = vec![
-            peer_record("dispatch start", &darkmux_flow::ts_utc_now()),
-            peer_record("dispatch complete", &darkmux_flow::ts_utc_now()),
+            peer_record("dispatch.start", &darkmux_flow::ts_utc_now()),
+            peer_record("dispatch.complete", &darkmux_flow::ts_utc_now()),
         ];
         let runs = build_runs(flows.path(), None, &fleet);
         let row = runs
@@ -7422,8 +7105,8 @@ mod tests {
         let _g = CrewGuard::new();
         let flows = TempDir::new().unwrap();
         let fleet = vec![
-            peer_record("dispatch start", &darkmux_flow::ts_utc_now()),
-            peer_record("dispatch complete", &darkmux_flow::ts_utc_now()),
+            peer_record("dispatch.start", &darkmux_flow::ts_utc_now()),
+            peer_record("dispatch.complete", &darkmux_flow::ts_utc_now()),
         ];
         let runs = build_runs(flows.path(), None, &fleet);
         let row = runs.iter().find(|r| r.id == "review-on-the-hub").unwrap();
@@ -7449,11 +7132,11 @@ mod tests {
         // same reason as the first of these, above.
         let _g = CrewGuard::new();
         let flows = TempDir::new().unwrap();
-        let mut collided_record = peer_record("dispatch start", &darkmux_flow::ts_utc_now());
+        let mut collided_record = peer_record("dispatch.start", &darkmux_flow::ts_utc_now());
         collided_record["mission_id"] = serde_json::json!("review-on-a-different-hub");
         let fleet = vec![
-            peer_record("dispatch start", &darkmux_flow::ts_utc_now()),
-            peer_record("dispatch complete", &darkmux_flow::ts_utc_now()),
+            peer_record("dispatch.start", &darkmux_flow::ts_utc_now()),
+            peer_record("dispatch.complete", &darkmux_flow::ts_utc_now()),
             // Same session_id ("peer-session-1", from `peer_record`), a
             // DIFFERENT mission_id — the collision.
             collided_record,
@@ -7498,7 +7181,7 @@ mod tests {
         // `/runs`/`darkmux run list` are answering the SAME question, and
         // two different answers is exactly #1711's own complaint.
         let flows = TempDir::new().unwrap();
-        let fleet = vec![peer_record("mission start", &darkmux_flow::ts_utc_now())];
+        let fleet = vec![peer_record("mission.start", &darkmux_flow::ts_utc_now())];
         let known: HashSet<String> = HashSet::new();
 
         let via_build_runs = build_runs(flows.path(), None, &fleet);
@@ -7526,7 +7209,7 @@ mod tests {
         // from `load_missions()`) must never see it echoed back as a "peer"
         // row just because it also has flow records.
         let flows = TempDir::new().unwrap();
-        let fleet = vec![peer_record("mission start", &darkmux_flow::ts_utc_now())];
+        let fleet = vec![peer_record("mission.start", &darkmux_flow::ts_utc_now())];
         let mut known: HashSet<String> = HashSet::new();
         known.insert("review-on-the-hub".to_string());
 
@@ -7562,7 +7245,7 @@ mod tests {
         let flows = TempDir::new().unwrap();
         let rec = serde_json::json!({
             "ts": darkmux_flow::ts_utc_now(), "level": "info", "category": "work",
-            "tier": "local", "stage": "dispatch", "action": "mission start",
+            "tier": "local", "stage": "dispatch", "action": "mission.start",
             "handle": "review", "session_id": "orphan-s1", "machine_id": "this-reader",
             "mission_id": "orphan-local-1",
         });
@@ -7597,7 +7280,7 @@ mod tests {
         let flows = TempDir::new().unwrap();
         let rec = serde_json::json!({
             "ts": darkmux_flow::ts_utc_now(), "level": "info", "category": "work",
-            "tier": "local", "stage": "dispatch", "action": "mission start",
+            "tier": "local", "stage": "dispatch", "action": "mission.start",
             "handle": "review", "session_id": "peer-s1", "machine_id": "genuinely-a-peer",
             "mission_id": "peer-local-1",
         });
@@ -7627,10 +7310,10 @@ mod tests {
         let _g = CrewGuard::new();
         let flows = TempDir::new().unwrap();
         let fleet = vec![
-            peer_record("dispatch start", &darkmux_flow::ts_utc_now()),
+            peer_record("dispatch.start", &darkmux_flow::ts_utc_now()),
             serde_json::json!({
                 "ts": darkmux_flow::ts_utc_now(),
-                "action": "mission close",
+                "action": "mission.close",
                 "source": "mission_lifecycle",
                 "session_id": "mission-review-on-the-hub",
                 "mission_id": "review-on-the-hub",
@@ -7669,7 +7352,7 @@ mod tests {
         // questions and this test pins the second one; `cutoff_date_string(1)`
         // is the same date arithmetic the window itself uses.
         let stale_ts = format!("{}T00:00:00Z", cutoff_date_string(1));
-        let fleet = vec![peer_record("dispatch start", &stale_ts)];
+        let fleet = vec![peer_record("dispatch.start", &stale_ts)];
         let runs = build_runs(flows.path(), None, &fleet);
         let row = runs.iter().find(|r| r.id == "review-on-the-hub").unwrap();
         assert_eq!(row.status, RunStatus::Abandoned);
@@ -7692,10 +7375,10 @@ mod tests {
         let _g = CrewGuard::new();
         let flows = TempDir::new().unwrap();
         let fleet = vec![
-            peer_record("dispatch start", &darkmux_flow::ts_utc_now()),
+            peer_record("dispatch.start", &darkmux_flow::ts_utc_now()),
             serde_json::json!({
                 "ts": darkmux_flow::ts_utc_now(),
-                "action": "mission abort",
+                "action": "mission.abort",
                 "source": "mission_lifecycle",
                 "session_id": "mission-review-on-the-hub",
                 "mission_id": "review-on-the-hub",
@@ -7735,7 +7418,7 @@ mod tests {
         // same reason as the first of these, above.
         let _g = CrewGuard::new();
         let flows = TempDir::new().unwrap();
-        let fleet = vec![peer_record("dispatch start", "2020-01-01T00:00:00Z")];
+        let fleet = vec![peer_record("dispatch.start", "2020-01-01T00:00:00Z")];
         let runs = build_runs(flows.path(), None, &fleet);
         assert!(
             !runs.iter().any(|r| r.id == "review-on-the-hub"),
@@ -7753,7 +7436,7 @@ mod tests {
         // The SAME record in the local day-file and in the fleet stream —
         // exactly what happens for this machine's own work, which is
         // written to both.
-        let rec = peer_record("dispatch start", &darkmux_flow::ts_utc_now());
+        let rec = peer_record("dispatch.start", &darkmux_flow::ts_utc_now());
         write_day_file(flows.path(), &today(), std::slice::from_ref(&rec));
         let idx = build_flow_session_index(flows.path(), std::slice::from_ref(&rec), RUNS_FLOW_SCAN_WINDOW_DAYS);
         let agg = idx.get("peer-session-1").expect("session present");
@@ -8070,7 +7753,7 @@ mod tests {
             flows.path(),
             &today(),
             &[
-                serde_json::json!({"ts": now, "action": "dispatch start", "session_id": sid, "handle": "coder"}),
+                serde_json::json!({"ts": now, "action": "dispatch.start", "session_id": sid, "handle": "coder"}),
                 serde_json::json!({"ts": now, "action": "dispatch.tool", "session_id": sid, "handle": "coder"}),
             ],
         );
@@ -8107,7 +7790,7 @@ mod tests {
             &today(),
             &[serde_json::json!({
                 "ts": "2026-01-01T00:00:00Z",
-                "action": "dispatch start",
+                "action": "dispatch.start",
                 "session_id": sid,
                 "handle": "coder",
             })],
@@ -8150,15 +7833,15 @@ mod tests {
             flows.path(),
             &today(),
             &[
-                serde_json::json!({"ts": now, "action": "dispatch start", "session_id": "lab-live-sess", "handle": "coder"}),
+                serde_json::json!({"ts": now, "action": "dispatch.start", "session_id": "lab-live-sess", "handle": "coder"}),
                 // an untracked ghost, still running
-                serde_json::json!({"ts": now, "action": "dispatch start", "session_id": "ghost-live", "handle": "reviewer"}),
+                serde_json::json!({"ts": now, "action": "dispatch.start", "session_id": "ghost-live", "handle": "reviewer"}),
                 // an untracked ghost that completed
-                serde_json::json!({"ts": "2026-07-24T09:00:00Z", "action": "dispatch start", "session_id": "ghost-done", "handle": "reviewer"}),
-                serde_json::json!({"ts": "2026-07-24T09:10:00Z", "action": "dispatch complete", "session_id": "ghost-done", "handle": "reviewer"}),
+                serde_json::json!({"ts": "2026-07-24T09:00:00Z", "action": "dispatch.start", "session_id": "ghost-done", "handle": "reviewer"}),
+                serde_json::json!({"ts": "2026-07-24T09:10:00Z", "action": "dispatch.complete", "session_id": "ghost-done", "handle": "reviewer"}),
                 // a peer's mission this daemon does not own
-                serde_json::json!({"ts": "2026-07-24T08:00:00Z", "action": "mission start", "session_id": "peer-sess", "mission_id": "peer-mission-1", "machine_id": "studio"}),
-                serde_json::json!({"ts": "2026-07-24T08:40:00Z", "action": "mission close", "session_id": "peer-sess", "mission_id": "peer-mission-1", "machine_id": "studio"}),
+                serde_json::json!({"ts": "2026-07-24T08:00:00Z", "action": "mission.start", "session_id": "peer-sess", "mission_id": "peer-mission-1", "machine_id": "studio"}),
+                serde_json::json!({"ts": "2026-07-24T08:40:00Z", "action": "mission.close", "session_id": "peer-sess", "mission_id": "peer-mission-1", "machine_id": "studio"}),
             ],
         );
 
@@ -8234,7 +7917,9 @@ mod tests {
             let s1 = idx.get("S1").expect("S1 indexed");
             (s1.has_start, s1.terminal_status, s1.start_ts.clone(), s1.terminal_ts.clone())
         };
+        // flow-action-guard:allow-start — an old spelling is this test's input
         let spaced = index("dispatch start", "dispatch complete");
+        // flow-action-guard:allow-end
         assert_eq!(spaced, index("dispatch.start", "dispatch.complete"));
         assert_eq!(spaced.1, Some(RunStatus::Complete));
         assert!(spaced.0, "the spaced start opens the session");

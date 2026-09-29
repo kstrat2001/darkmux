@@ -96,7 +96,8 @@ mod tests {
             _: &str,
             _: Option<&str>,
             _: Option<&crate::lab::loop_report::LoopCompactionOverride>,
-            _: &mut dyn FnMut(&str),
+            _: &darkmux_types::session_id::RunId,
+            _: &mut dyn FnMut(&darkmux_types::session_id::SessionId),
         ) -> Result<RunResult> {
             Ok(RunResult {
                 ok: true,

@@ -15,6 +15,9 @@ const DAY: &str = concat!(
     r#"{"ts":"2026-06-21T12:00:00Z","action":"note","source":"orchestrator","session_id":"mission-run-auth-s1","handle":"crew shipped it!"}"#, "\n",
     // An adjudication note with empty text — never a correction.
     r#"{"ts":"2026-06-21T12:30:00Z","action":"note","source":"adjudication","session_id":"mission-run-auth-s1","handle":"   "}"#, "\n",
+    // The 4.0 grammar: this mission's phase `s2`, and the sibling's `s1`.
+    r#"{"ts":"2026-06-21T12:40:00Z","action":"note","source":"adjudication","session_id":"auth.phase.s2","handle":"The current grammar reads too."}"#, "\n",
+    r#"{"ts":"2026-06-21T12:50:00Z","action":"note","source":"adjudication","session_id":"auth-v2.phase.s1","handle":"Also auth-v2 ONLY."}"#, "\n",
     // Unparsable line — skipped, must not poison the rest of the file.
     "{not json at all", "\n",
 );
@@ -38,10 +41,6 @@ fn with_flows<T>(f: impl FnOnce() -> T) -> T {
     out
 }
 
-fn ids(list: &[&str]) -> HashSet<String> {
-    list.iter().map(|s| s.to_string()).collect()
-}
-
 /// An exact-set scope reads only that mission's sessions. The load-bearing
 /// assertion is the sibling-mission exclusion: `auth-v2`'s note must NOT appear
 /// for `auth` (a prefix match would bleed it). Duplicates are NOT collapsed here
@@ -52,10 +51,10 @@ fn scan_exact_set_scopes_to_the_mission_family_and_excludes_siblings() {
     let got = with_flows(|| {
         scan(
             ADJUDICATION_LOOKBACK_DAYS,
-            Some(&ids(&["mission-run-auth-s1", "mission-run-auth-s2"])),
+            Scope::Phases(&PhaseSessions::new("auth", ["s1", "s2"].map(String::from))),
         )
     });
-    assert_eq!(got.len(), 3, "two unique + one verbatim duplicate, undeduped: {got:?}");
+    assert_eq!(got.len(), 4, "three unique (one in the 4.0 grammar) + one verbatim duplicate, undeduped: {got:?}");
     assert!(
         !got.iter().any(|c| c.text.contains("auth-v2")),
         "sibling mission auth-v2 must NOT bleed into auth (#849 prefix-bleed regression): {got:?}"
@@ -79,8 +78,8 @@ fn scan_exact_set_scopes_to_the_mission_family_and_excludes_siblings() {
 #[test]
 #[serial_test::serial]
 fn scan_unscoped_reads_every_session() {
-    let got = with_flows(|| scan(ADJUDICATION_LOOKBACK_DAYS, None));
-    assert_eq!(got.len(), 4, "three auth + one auth-v2, undeduped: {got:?}");
+    let got = with_flows(|| scan(ADJUDICATION_LOOKBACK_DAYS, Scope::All));
+    assert_eq!(got.len(), 6, "four auth + two auth-v2, undeduped: {got:?}");
     assert!(
         got.iter().any(|c| c.session_id == "mission-run-auth-v2-s1"),
         "unscoped includes the sibling mission: {got:?}"
@@ -91,7 +90,7 @@ fn scan_unscoped_reads_every_session() {
 #[test]
 #[serial_test::serial]
 fn scan_empty_scope_reads_as_none() {
-    let got = with_flows(|| scan(ADJUDICATION_LOOKBACK_DAYS, Some(&HashSet::new())));
+    let got = with_flows(|| scan(ADJUDICATION_LOOKBACK_DAYS, Scope::Phases(&PhaseSessions::new("auth", []))));
     assert!(got.is_empty(), "an empty session-id set reads as none: {got:?}");
 }
 
@@ -103,7 +102,7 @@ fn scan_missing_flows_dir_is_empty_not_an_error() {
     let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
     // SAFETY: serialized via #[serial]; restored below.
     unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", "/nonexistent/darkmux/flows/xyzzy") };
-    let got = scan(ADJUDICATION_LOOKBACK_DAYS, None);
+    let got = scan(ADJUDICATION_LOOKBACK_DAYS, Scope::All);
     unsafe {
         match prev {
             Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
@@ -131,8 +130,8 @@ fn scan_day_window_bounds_the_read() {
     let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
     // SAFETY: serialized via #[serial]; restored below.
     unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path()) };
-    let one = scan(1, None);
-    let two = scan(2, None);
+    let one = scan(1, Scope::All);
+    let two = scan(2, Scope::All);
     unsafe {
         match prev {
             Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),

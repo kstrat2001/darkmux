@@ -51,7 +51,7 @@ function grouped(n: number): string {
 }
 
 /** Middle-truncate. These ids share long PREFIXES
- *  (`crew-dispatch-coder-1786251936375019-0` vs `…-11db-0-step`), so cutting
+ *  (`<run>.adhoc.coder.1786251936375019-0` vs `<run>.step.s1`), so cutting
  *  the tail removes exactly the part that distinguishes two of them. */
 function midTruncate(s: string, max = 28): string {
   if (s.length <= max) return s;
@@ -248,7 +248,7 @@ function Group({ name, obj }: { name: string; obj: Record<string, unknown> }) {
  *  nothing they need here, since the record's own `machine_id` already says
  *  which machine wrote it. The field stays listed so the record's shape does
  *  not change. */
-export const MASKED_UID = "hidden";
+const MASKED_UID = "hidden";
 
 /** The record with every `machine_uid` (at any depth) replaced by
  *  `MASKED_UID`, for the rows and the raw JSON alike. */

@@ -38,6 +38,7 @@ import { isUnnamedMachineLabel } from "../../lib/flow";
 import { memBytes } from "../../lib/format";
 import { MACHINE_MEM_POLL_MS } from "../../lib/queryKeys";
 import type { MachineResources, MachineResourcesModel, MachineSpecs } from "../../types/handwritten";
+import { maxOf } from "../../lib/numbers";
 
 /** (#1854, altitude 1 — the row it is about) The `↳` hint under a resident
  * whose measured footprint has outgrown the potential darkmux priced it at.
@@ -149,7 +150,7 @@ export function attributionLine(b: MachineResources): string {
  * this file's own module doc for why it survived Stage 2/3 unchanged while
  * `machineTotalText`/`modelLines`/`pressureText`/`machineScale` did not. */
 export function perModelScale(models: MachineResourcesModel[]): number {
-  return Math.max(1, ...models.map((mm) => Math.max(Number(mm.potential_bytes) || 0, Number(mm.current_bytes) || 0)));
+  return Math.max(1, maxOf(models.map((mm) => Math.max(Number(mm.potential_bytes) || 0, Number(mm.current_bytes) || 0))) ?? 0);
 }
 
 /** The not-local placeholder sentence — viewer.html:1871. Named export

@@ -2831,20 +2831,14 @@ line two
     /// 1. This IS still used for the comparison below, defensively, so the
     ///    assertion never depends on which map type is compiled in.
     /// 2. It is what makes the WRITTEN golden file byte-stable regardless
-    ///    of which feature set generated it. `cargo llvm-cov --workspace`
-    ///    (CI's coverage job) unifies features across the workspace,
-    ///    which turns serde_json's `preserve_order` on for darkmux-lab
-    ///    (`agent-client-protocol` enables it elsewhere in the tree) —
-    ///    `cargo test -p darkmux-lab` alone does not. Before this fix,
-    ///    `serde_json::to_string_pretty` on the raw `Plan` value emitted
-    ///    keys in STRUCT-DECLARATION order under `preserve_order` and
-    ///    ALPHABETICAL order without it (`serde_json::Map` defaults to a
-    ///    `BTreeMap`), so the committed golden (written locally, without
-    ///    the feature) read as drifted under CI's workspace build even
-    ///    though nothing about the plan's CONTENT had changed. Same root
-    ///    cause `step_output::body_hash`'s own canonicalizer exists to
-    ///    fix (see that function's doc) — this is the same problem
-    ///    surfacing in a second place.
+    ///    of which feature set generated it. `serde_json::to_string_pretty`
+    ///    on the raw `Plan` value emits keys in STRUCT-DECLARATION order
+    ///    under serde_json's `preserve_order` feature and ALPHABETICAL order
+    ///    without it. The workspace now declares that feature once for every
+    ///    member (the root `Cargo.toml`'s `[workspace.dependencies]`), but a
+    ///    golden that only reads the same under one feature set would break
+    ///    again the day that changes. Same reasoning as
+    ///    `step_output::body_hash`'s own canonicalizer.
     fn canonicalize(v: &serde_json::Value) -> serde_json::Value {
         match v {
             serde_json::Value::Object(map) => {
@@ -3938,7 +3932,7 @@ line two
             run_on: darkmux_crew::types::default_run_on(),
         };
         let gather_out =
-            darkmux_crew::step_kinds::RecordsGatherStepKind.run(&gather_step, &task, &std::collections::BTreeMap::new()).unwrap();
+            darkmux_crew::step_kinds::RecordsGatherStepKind.run(&gather_step, &task, &std::collections::BTreeMap::new(), &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission("m-test").unwrap())).unwrap();
         let mut input = std::collections::BTreeMap::new();
         input.insert("records-gather-step".to_string(), gather_out.output);
 
@@ -3957,7 +3951,7 @@ line two
             completed_ts: None,
             output: None,
         };
-        darkmux_crew::step_kinds::DeliverGithubReviewStepKind.run(&deliver_step, &task, &input).unwrap();
+        darkmux_crew::step_kinds::DeliverGithubReviewStepKind.run(&deliver_step, &task, &input, &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission("m-test").unwrap())).unwrap();
         let payload: darkmux_crew::step_kinds::DeliverOutcome =
             serde_json::from_str(&fs::read_to_string(&emit_path).unwrap()).unwrap();
         assert_eq!(payload.mode, "review");
@@ -4052,9 +4046,11 @@ line two
             let expected = fs::read_to_string(&golden_path).unwrap_or_else(|_| {
                 panic!("read {} — run with DARKMUX_REVIEW_V2_GOLDEN_UPDATE=1 to generate it", golden_path.display())
             });
+            // Parsed, not textual: key order is a serde_json feature detail.
+            let parse = |t: &str| serde_json::from_str::<serde_json::Value>(t).expect("golden is JSON");
             assert_eq!(
-                actual.trim_end(),
-                expected.trim_end(),
+                parse(&actual),
+                parse(&expected),
                 "the rendered payload drifted from the committed golden at {}",
                 golden_path.display()
             );

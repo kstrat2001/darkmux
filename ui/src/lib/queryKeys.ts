@@ -26,11 +26,6 @@
  * |                              |        | (the unknown-status-wins-the-merge case, #1628)   |
  * |                              |        | can only ever be caught by re-fetching the         |
  * |                              |        | snapshot itself; folding flow records alone can't. |
- * | `MACHINE_RESOURCES_CACHE_MS` | 2000   | Server-side cache TTL                             |
- * |                              |        | (`MACHINE_RESOURCES_CACHE_TTL` in                 |
- * |                              |        | `crates/darkmux-serve/src/lib.rs`) — the daemon   |
- * |                              |        | itself won't produce a fresher answer than this,  |
- * |                              |        | so polling faster than it wastes a round trip.    |
  * | `MACHINE_MEM_POLL_MS`        | 5000   | `MACHINE_MEM_POLL_MS` — the machine lens's client |
  * |                              |        | poll cadence for `/machine/resources`.            |
  * | `PANEL_CACHE_MS`             | 3000   | `PANEL_CACHE_TTL` in                              |
@@ -56,7 +51,6 @@ export const RECONCILE_BACKSTOP_MS = 20_000;
  * records-arrived — a genuinely idle fleet emits no records for hours and is
  * perfectly healthy. */
 export const LIVE_CONTACT_TIMEOUT_MS = 2 * RECONCILE_BACKSTOP_MS;
-export const MACHINE_RESOURCES_CACHE_MS = 2_000;
 export const MACHINE_MEM_POLL_MS = 5_000;
 export const PANEL_CACHE_MS = 3_000;
 /** `LAB_POLL_STEADY_MS`/`LAB_POLL_BACKFILL_MS` (viewer.html:4020-4021) — the

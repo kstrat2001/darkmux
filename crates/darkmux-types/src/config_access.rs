@@ -1114,11 +1114,12 @@ pub fn remote_step_budget_policy() -> Result<crate::config::StepBudgetPolicy, cr
     resolve_enum("remote.step_budget_policy").map(|(v, _)| v)
 }
 
-/// (#2902 step 5) Every leftover RENAMED setting (`config::RENAMED_SETTINGS`)
-/// in the live config or env: read by nothing, so named loudly (doctor Warn,
-/// a preflight warning line). Never refused.
+/// (#2902 step 5) Every RENAMED setting (`config::RENAMED_SETTINGS`) whose
+/// old env var is still set: read by nothing, so named loudly (doctor Warn, a
+/// preflight warning line). A leftover old `config.json` key is refused as an
+/// unknown key instead (`user_files`).
 pub fn renamed_setting_leftovers() -> Vec<crate::config::RenamedLeftover> {
-    crate::config::renamed_leftovers(config(), &env_str)
+    crate::config::renamed_leftovers(&env_str)
 }
 
 /// (#1230 Packet 1) Max CONCURRENT remote dispatches

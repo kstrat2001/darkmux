@@ -713,6 +713,8 @@ mod tests {
             outcome_from: None,
             panel: None,
             cmd: None,
+            source_input: None,
+            ticket: None,
             extras: BTreeMap::new(),
         }
     }

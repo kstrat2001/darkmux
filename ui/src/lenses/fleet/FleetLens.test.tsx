@@ -19,6 +19,9 @@ import { __clockDebug } from "../../lib/clock";
 import type { NormRecord } from "../../lib/ingest";
 import { norm, normAll, type RawRecord } from "../../testing/records";
 
+/** The TokenScope props a probe serialized, as far as these tests read them. */
+type ScopeProbe = Record<string, unknown> & { clock: { kind: string; tMs: number }; restEndMs: number; centerUnit?: string };
+
 // (#2886 pass 5, MUST — fresh-reviewer finding F5) Several fixes in this
 // file stayed green while broken in the actual render path: the DOM-text
 // assertions elsewhere in this file (`.mach-scope__rate`'s textContent) all
@@ -60,7 +63,7 @@ function latestTokenScopeProps(): Record<string, unknown> {
   const nodes = document.querySelectorAll('[data-testid="token-scope-probe"]');
   const last = nodes[nodes.length - 1];
   if (!last) throw new Error("no TokenScope probe rendered");
-  return JSON.parse(last.getAttribute("data-props")!);
+  return JSON.parse(last.getAttribute("data-props")!) as Record<string, unknown>;
 }
 
 // (#1913) Every fixture below anchors its records at "T10:00" of `today`
@@ -1153,7 +1156,7 @@ describe("FleetLens pager (#2881)", () => {
 
   it("(#2890) PROMPT: the status line carries the estimated size; the tube is handed no center", async () => {
     const scopeProps = () =>
-      JSON.parse(document.querySelector('[data-testid="token-scope-probe"]')!.getAttribute("data-props")!);
+      JSON.parse(document.querySelector('[data-testid="token-scope-probe"]')!.getAttribute("data-props")!) as ScopeProbe;
     // One execution whose turn opener reported a 144,000-char prompt; no
     // billed turn yet, so the default 4 chars/token -> ~36k.
     const sized: NormRecord[] = normAll([
@@ -1202,7 +1205,7 @@ describe("FleetLens pager (#2881)", () => {
     // so this reads what the card HANDS the tube; TokenScope.test.tsx pins
     // how the tube renders a center label.
     const scopeProps = () =>
-      JSON.parse(document.querySelector('[data-testid="token-scope-probe"]')!.getAttribute("data-props")!);
+      JSON.parse(document.querySelector('[data-testid="token-scope-probe"]')!.getAttribute("data-props")!) as ScopeProbe;
     renderThree(5);
     await waitFor(() => expect(document.querySelector(".mach-scope__pager")).not.toBeNull());
     expect(document.querySelector(".mach-scope__rate")!.textContent).toBe("100 tok/s");
@@ -1847,7 +1850,7 @@ describe("FleetLens — hero grid-switch breakpoint accounts for the eventlog pa
 // "no signal" (stat word, tube, and a dash for the count) until then.
 describe("FleetLens — a card says no signal until its first data arrives (#2958)", () => {
   const BEAT = [{ machine_uid: "u1", display_name: "MacBook-Pro", schema_version: "1.43.0", beat_ts_ms: Date.parse(FROZEN_NOW) }];
-  const cardScope = (card: Element) => JSON.parse(card.querySelector('[data-testid="token-scope-probe"]')!.getAttribute("data-props")!);
+  const cardScope = (card: Element) => JSON.parse(card.querySelector('[data-testid="token-scope-probe"]')!.getAttribute("data-props")!) as ScopeProbe;
   const stat = (card: Element) => card.querySelector(".stat")!.textContent;
   const utilLabel = (card: Element) => card.querySelector(".mach-util")!.getAttribute("aria-label")!;
   const SPECS = { machine_id: "MacBook-Pro", machine_uid: "u-self", cpu_brand: "Apple M5 Max", ram_total_bytes: 137438953472 };

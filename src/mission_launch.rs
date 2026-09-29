@@ -69,6 +69,7 @@ use crate::coder_phase;
 use anyhow::{anyhow, bail, Context, Result};
 use crew::mission_config::{self, FindingSeverity, LaunchParams, MissionConfig, TaskOverride};
 use crew::types::{Mission, MissionSpec, MissionStatus, NodeStatus, Phase, PhaseStatus, Step};
+use darkmux_types::session_id::{RunId, SessionId};
 use darkmux_types::style;
 use std::any::Any;
 use std::collections::BTreeMap;
@@ -275,14 +276,14 @@ fn cli_gate_handler() -> Box<crew::gate::GateHandler<'static>> {
 fn emit_launch_cmd_audit(
     config: &MissionConfig,
     collected: &BTreeMap<String, serde_json::Value>,
-    mission_id: &str,
+    run: &RunId,
     gate_confirmed: Option<bool>,
     success: bool,
 ) {
     let Some(verb) = config.cmd.as_deref() else { return };
     let args = collected.get("args").and_then(|v| v.as_str()).unwrap_or("");
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    crate::acp_panel::emit_cmd_audit(verb, args, &cwd, gate_confirmed, success, mission_id);
+    crate::acp_panel::emit_cmd_audit(verb, args, &cwd, gate_confirmed, success, run);
 }
 
 /// (#1877 — "no blind runs" is now PRESCRIBED for the generic launch path,
@@ -313,16 +314,15 @@ pub(crate) fn mission_bookend_record(
     level: flow::Level,
     action: darkmux_flow::FlowAction,
     config_id: &str,
-    mission_id: &str,
+    run: &RunId,
     payload: serde_json::Value,
 ) -> flow::FlowRecord {
     let mut record = crew::dispatch::build_dispatch_record_with_payload(
         level,
         action,
         config_id,
-        mission_id,
+        &SessionId::run(run.clone()),
         None,
-        Some(mission_id),
         None,
         Some(payload),
     );
@@ -374,7 +374,7 @@ pub fn launch(
     // same loud failures a real launch would, and a launch whose dispatches
     // would each refuse is not worth planning. Not waived by `--force`,
     // which overrides a thermal/battery READING, not a config value.
-    darkmux_profiles::preflight(darkmux_types::config_enum::Scope::MissionLaunch)?;
+    darkmux_crew::user_files::preflight(darkmux_types::config_enum::Scope::MissionLaunch)?;
 
     // (#2301) `crawl` used to be routed by literal id to a bespoke
     // launcher, BEFORE the config load below, because its Task/Step graph
@@ -460,10 +460,7 @@ pub fn launch(
     // all.
     apply_input_defaults(config, &mut collected);
     let collected = collected;
-    let missing = missing_required_inputs(config, &collected);
-    if !missing.is_empty() {
-        bail!("{}", missing_inputs_message(config, &missing));
-    }
+    refuse_bad_inputs(config, &collected)?;
 
     // (#2310 P4f review, CONSIDER 3) `mod_seat_profile` names the profile
     // `review`'s optional endpoint create-mod seat dispatches to. A name
@@ -779,6 +776,7 @@ pub fn launch(
     // GROUPED for corpus analysis, via `Mission.spec` — a metadata field,
     // never identity. No `--mission-id` flag needed.
     let mission_id = mint_run_id(config_id)?;
+    let run = RunId::mission(mission_id.clone())?;
     let spec = MissionSpec {
         config_id: config_id.to_string(),
         inputs_fingerprint: spec_fingerprint(&collected)?,
@@ -1230,7 +1228,7 @@ pub fn launch(
     let mut dispatch_sink = |record: flow::FlowRecord| {
         let _ = flow::record(record);
     };
-    let mission_id_for_abort = mission_id.clone();
+    let run_for_abort = run.clone();
     let config_id_for_abort = config_id.to_string();
     // `BookendGuard`'s Drop fires this `on_abort` closure — building the
     // "dispatch error" abort record — for any exit between `open()` below
@@ -1256,7 +1254,7 @@ pub fn launch(
             flow::Level::Error,
             darkmux_flow::FlowAction::DispatchError,
             &config_id_for_abort,
-            &mission_id_for_abort,
+            &run_for_abort,
             serde_json::json!({
                 "runtime": "mission",
                 "result_class": "error",
@@ -1271,7 +1269,7 @@ pub fn launch(
             flow::Level::Info,
             darkmux_flow::FlowAction::DispatchStart,
             config_id,
-            &mission_id,
+            &run,
             serde_json::json!({ "runtime": "mission" }),
         ),
     );
@@ -1285,12 +1283,7 @@ pub fn launch(
     // redundant `session.end`), and otherwise at scope end after the bookend
     // has closed. The drop removes the key and suppresses the reconciler's
     // abandoned edge, same as a dispatch's.
-    let mission_presence = flow::session_presence::spawn_session_emitter(
-        mission_id.clone(),
-        None,
-        None,
-        Some(mission_id.clone()),
-    );
+    let mission_presence = flow::session_presence::spawn_session_emitter(&SessionId::run(run.clone()), None, None);
 
     // (#1503) The #1400 preflight that used to run here — warning that a
     // phase was already terminal-Complete from a prior finalized run — only
@@ -1496,7 +1489,7 @@ pub fn launch(
                         flow::Level::Info,
                         darkmux_flow::FlowAction::MissionGrow,
                         config_id,
-                        &mission_id,
+                        &run,
                         payload,
                     ));
                     for task in &grown_tasks {
@@ -1606,6 +1599,7 @@ pub fn launch(
         }
 
         graph_result = crew::scheduler::run_step_graph(
+        &run,
         &mut steps,
         &tasks_by_id,
         &registry,
@@ -1619,53 +1613,13 @@ pub fn launch(
         // change at all.
         darkmux_types::config_access::remote_concurrent_cap() as usize,
         &crew::concurrent_dispatch::lms_host_factory,
-        // (#1641) The launcher knows its own `mission_id` — stamp it onto
-        // every record this run's `run_step_graph` call produces that
-        // doesn't already carry a more specific one (`get_or_insert`, never
-        // overwrite). Without this, the scheduler's generic step-lifecycle
-        // records (`step_lifecycle_record`, `crates/darkmux-crew/src/
-        // scheduler.rs`) and any `StepKind`'s own `mission_id: None`-
-        // stamped records (e.g. `dispatch.map`'s per-item "step result")
-        // carry NO instance-scoped identity, so two missions launched from
-        // the SAME config collide on their shared CONFIG-scoped
-        // `session_id`/`handle` (e.g. `task-review-probe-mid-task` /
-        // `review-probe-mid-step`) in the viewer — one mission's step
-        // absorbing another's token counts, a dead step resurrected to
-        // "running" by the other mission's heartbeat.
-        &mut |mut record| {
-            record.mission_id.get_or_insert_with(|| mission_id.clone());
-            // (#1918) `session_id::task`/`session_id::step` carry no
-            // per-run identity of their own — see their own doc and
-            // `darkmux_types::session_id::scope_to_run`'s. Compose this
-            // run's own (now-resolved) `mission_id` into the session id
-            // right here, the SAME choke point that already backfills
-            // `mission_id` above, so every record this run's
-            // `run_step_graph` call produces — the scheduler's own
-            // step-lifecycle bookends AND any `StepKind`'s task-scoped
-            // dispatch session — stops colliding with every OTHER mission
-            // ever launched from this same config.
-            // Read-side: `darkmux-serve::runs`'s join needs no change (a
-            // scoped record always also carries `mission_id`, backfilled
-            // one line above), but `mission_graph::step_for_record` and
-            // its page-side twin DO peel this suffix — see
-            // `scope_to_run`'s own read-side inventory for why the two
-            // differ.
-            if let Some(mid) = record.mission_id.clone() {
-                record.session_id = record.session_id.map(|sid| darkmux_types::session_id::scope_to_run(&sid, &mid));
-            }
-            // (#1877, corrected #2413 round 3 MF3) Calls `flow::record`
-            // directly here (not `bookend.emit_now`) because `bookend`
-            // isn't reachable from inside this closure (it's constructed
-            // on the outer scope, and this closure is handed to `run_
-            // step_graph` by itself) — same underlying sink either way
-            // (`dispatch_sink` IS `flow::record`), so this is a
-            // borrow-driven split, not two different destinations. This
-            // used to ALSO drain a per-run `HostTelemetrySampler` right
-            // before this write, interleaving its buffered samples with
-            // the run's other records; that construction is deleted
-            // (#2413 M3) — host samples now come from the machine-scoped
-            // sampler and are joined to this run by time after the fact,
-            // so there is nothing left to drain here.
+        // Every record this run's `run_step_graph` call produces already
+        // carries this run: the scheduler and every step kind mint their
+        // sessions in the `run` handed to it.
+        &mut |record| {
+            // `flow::record` directly, not `bookend.emit_now`: the bookend
+            // is not reachable from inside this closure, and both write to
+            // the same sink.
             let _ = flow::record(record);
         },
         &mut |step| {
@@ -1760,7 +1714,7 @@ pub fn launch(
                 flow::Level::Error,
                 darkmux_flow::FlowAction::DispatchError,
                 config_id,
-                &mission_id,
+                &run,
                 serde_json::json!({
                     "runtime": "mission",
                     "result_class": "error",
@@ -1772,7 +1726,7 @@ pub fn launch(
         // operator's session tried to act as them" — audit-worthy on its
         // own (see `acp_panel::emit_cmd_audit`'s doc on why a failed
         // attempt is never silently dropped from the trail).
-        emit_launch_cmd_audit(config, &collected, &mission_id, gate_confirmed.get(), false);
+        emit_launch_cmd_audit(config, &collected, &run, gate_confirmed.get(), false);
         // (#2131) The terminal record above is already durable — a no-op
         // unless a signal was actually observed, in which case this reaps
         // every child the watchdog above may not have caught yet and
@@ -1835,9 +1789,9 @@ pub fn launch(
         // below — that one genuinely wants exit-code success, not
         // gate-reached; see `coder_branch_terminal_bookend`'s own doc for
         // why the bookend record itself keys on `reached_gate` instead.
-        let (_reached_gate, record) = coder_branch_terminal_bookend(&outcome, config_id, &mission_id);
+        let (_reached_gate, record) = coder_branch_terminal_bookend(&outcome, config_id, &run);
         bookend.close("dispatch", record);
-        emit_launch_cmd_audit(config, &collected, &mission_id, gate_confirmed.get(), success);
+        emit_launch_cmd_audit(config, &collected, &run, gate_confirmed.get(), success);
         // (#2131) A no-op unless a signal was actually observed — see the
         // scheduler-error branch above for what this does when one was.
         //
@@ -1947,7 +1901,7 @@ pub fn launch(
     // every one of them is a Tier-1-only `procedural.shell`/`procedural.noop`
     // graph, so this is where a direct `darkmux mission launch pr-merge`
     // gets its audit record in practice.
-    emit_launch_cmd_audit(config, &collected, &mission_id, gate_confirmed.get(), exit_code == 0);
+    emit_launch_cmd_audit(config, &collected, &run, gate_confirmed.get(), exit_code == 0);
     // (#1877) Explicit close on the gate-less generic finish — the third
     // and last KNOWN exit this guard covers.
     bookend.close(
@@ -1956,7 +1910,7 @@ pub fn launch(
             if exit_code == 0 { flow::Level::Info } else { flow::Level::Error },
             if exit_code == 0 { darkmux_flow::FlowAction::DispatchComplete } else { darkmux_flow::FlowAction::DispatchError },
             config_id,
-            &mission_id,
+            &run,
             serde_json::json!({
                 "runtime": "mission",
                 "result_class": if exit_code == 0 { "ok" } else { "error" },
@@ -2458,6 +2412,52 @@ pub(crate) fn collect_inputs(
     Ok(collected)
 }
 
+/// The collected inputs' launch checks, before anything is minted: every
+/// required input is present, and (review C5) the workspace spec an input
+/// names passes the user-file gate. The plan steps read that spec only
+/// after the mission is minted, so this is the launch's one look at it.
+fn refuse_bad_inputs(config: &MissionConfig, collected: &BTreeMap<String, serde_json::Value>) -> Result<()> {
+    let missing = missing_required_inputs(config, collected);
+    if !missing.is_empty() {
+        bail!("{}", missing_inputs_message(config, &missing));
+    }
+    refuse_bad_workspace_specs(config, collected)
+}
+
+/// The inputs a step's `workspace` names (`"workspace": "{{<input>}}"`, the
+/// shape every plan step in a shipped config uses).
+fn workspace_spec_inputs(config: &MissionConfig) -> std::collections::BTreeSet<String> {
+    let steps = config.phases.iter().flat_map(|p| &p.tasks).flat_map(|t| &t.steps);
+    steps
+        .filter_map(|s| s.config.get("workspace").and_then(serde_json::Value::as_str))
+        .filter_map(|v| v.strip_prefix("{{")?.strip_suffix("}}").map(|n| n.trim().to_string()))
+        .collect()
+}
+
+/// (review C5) The launch preflight's check of the workspace spec a launch
+/// input names: the same unknown-key/wrong-type gate as every user file
+/// (`darkmux_types::user_files`), refused before anything is minted. A
+/// value that is not a file (unset, or a spec the plan derives) is left to
+/// the plan step.
+fn refuse_bad_workspace_specs(config: &MissionConfig, collected: &BTreeMap<String, serde_json::Value>) -> Result<()> {
+    use darkmux_types::user_files::{check_path, no_retired, UserFileKind};
+    let mut refusal =
+        darkmux_types::config_enum::PreflightRefusal::none(darkmux_types::config_enum::Scope::MissionLaunch);
+    for name in workspace_spec_inputs(config) {
+        let Some(path) = collected.get(&name).and_then(serde_json::Value::as_str).map(std::path::PathBuf::from) else {
+            continue;
+        };
+        if path.is_file() {
+            refusal.files.extend(check_path::<darkmux_crew::workspace_spec::WorkspaceSpec>(
+                UserFileKind::WorkspaceSpec,
+                &path,
+                &no_retired,
+            ));
+        }
+    }
+    Ok(refusal.into_result()?)
+}
+
 /// (#2310 P4e) Fill every declared-but-unsupplied input that carries a
 /// document `default` into `collected`.
 ///
@@ -2574,14 +2574,14 @@ fn declared_inert_input_warning(config_id: &str, name: &str, has_default: bool) 
 /// declared input the typo was aimed at with its document DEFAULT, since
 /// the typo never touches it. A misspelled `--param rulez=<csv>` against a
 /// config that declares `rules` therefore runs with the config's full
-/// default rule set, silently — the did-you-mean suffix (via
-/// `config_cmd::nearest`, reused rather than re-implemented here) is what
-/// lets the operator catch this before the run, not after.
+/// default rule set, silently — the did-you-mean suffix (the one
+/// suggester, `darkmux_types::user_files::closest`) is what lets the
+/// operator catch this before the run, not after.
 fn undeclared_param_warning(config_id: &str, key: &str, config: &MissionConfig) -> String {
     let declared_names = config.inputs.iter().map(|i| i.name.as_str());
-    let near = crate::config_cmd::nearest(key, declared_names);
-    let did_you_mean =
-        if near.is_empty() { String::new() } else { format!(" — did you mean: {}?", near.join(", ")) };
+    let did_you_mean = darkmux_types::user_files::closest(key, declared_names)
+        .map(|near| format!(" — did you mean `{near}`?"))
+        .unwrap_or_default();
     format!(
         "mission launch: input `{key}` is not declared by config \"{config_id}\"'s \
          inputs{did_you_mean} — it is still carried into the resolved inputs and \
@@ -2718,15 +2718,10 @@ pub(crate) fn ensure_mission_and_phases_with_provenance_and_start_payload(
         started_ts: None,
         finalized_ts: None,
         paused_ts: None,
-        // (must-fix 2) Hydrate from the config's extras overflow — where
-        // a config's `source_input` preserves the operator's verbatim words (#815)
-        // and ticket id (#816). Absent keys stay None, same as before.
-        source_input: config
-            .extras
-            .get("source_input")
-            .and_then(|v| v.as_str())
-            .map(String::from),
-        ticket: config.extras.get("ticket").and_then(|v| v.as_str()).map(String::from),
+        // (must-fix 2) The config's `source_input` (the operator's verbatim
+        // words, #815) and `ticket` (#816) ride onto the mission record.
+        source_input: config.source_input.clone(),
+        ticket: config.ticket.clone(),
         spec,
         // (#1810) Stamped once at mint time so `/runs` has a durable
         // machine to read even after this mission ages out of the
@@ -3146,16 +3141,6 @@ fn precheck_coder_phase_inputs(
     Ok(())
 }
 
-/// The dispatch session id for a config-launched coder-phase execution.
-/// The canonical coder-phase id (#1436) — the SAME `mission-run-` prefix the
-/// retired `mission run` stamped and that `mission finalize`/`mission abort`
-/// reconstruct: the viewer's mission lens keys its per-run session grouping
-/// on that prefix, and this path emits the identical record vocabulary, so
-/// launched runs stay visible to the lens and legacy archives keep joining.
-fn launch_session_id(mission_id: &str, real_phase_id: &str) -> String {
-    darkmux_types::session_id::mission_run(mission_id, real_phase_id)
-}
-
 /// Handles `register_coder_phase_kinds` keeps back for the post-scheduler
 /// gate decision (#1284 review round 1, must-fix 1a): the two result slots
 /// the step kinds populate (the generic `StepOutcome.output: String`
@@ -3184,7 +3169,8 @@ pub(crate) struct CoderPhaseHandles {
     workdir: std::path::PathBuf,
     branch: String,
     real_phase_id: String,
-    session_id: String,
+    /// The phase's coder-run session (`SessionId::phase`).
+    session: SessionId,
 }
 
 /// Register `coder_phase.rs`'s three `coder-phase` Tier 3 kinds
@@ -3314,7 +3300,7 @@ fn register_coder_phase_kinds(
         .map(|p| p.id.clone())
         .ok_or_else(|| anyhow!("mission launch: internal error — no phase in `{}` declares a coder-phase step", config.id))?;
     let real_phase_id = real_phase_ids[&phase_doc_id].clone();
-    let session_id = launch_session_id(mission_id, &real_phase_id);
+    let session = SessionId::phase(RunId::mission(mission_id)?, &real_phase_id);
 
     // (#1546) Mission/phase records are no longer loaded here — that disk
     // read is composition's own run-time work now (see the
@@ -3379,7 +3365,6 @@ fn register_coder_phase_kinds(
         base,
         mission_id: mission_id.to_string(),
         phase_id: real_phase_id.clone(),
-        session_id: session_id.clone(),
         role,
     });
 
@@ -3390,7 +3375,7 @@ fn register_coder_phase_kinds(
         workdir,
         branch,
         real_phase_id,
-        session_id,
+        session,
     })
 }
 
@@ -3439,14 +3424,14 @@ fn gate_outcome_reached_no_gate(outcome: &Result<i32>) -> bool {
 fn coder_branch_terminal_bookend(
     outcome: &Result<i32>,
     config_id: &str,
-    mission_id: &str,
+    run: &RunId,
 ) -> (bool, flow::FlowRecord) {
     let reached_gate = !gate_outcome_reached_no_gate(outcome);
     let record = mission_bookend_record(
         if reached_gate { flow::Level::Info } else { flow::Level::Error },
         if reached_gate { darkmux_flow::FlowAction::DispatchComplete } else { darkmux_flow::FlowAction::DispatchError },
         config_id,
-        mission_id,
+        run,
         serde_json::json!({
             "runtime": "mission",
             "result_class": if reached_gate { "ok" } else { "error" },
@@ -3552,7 +3537,7 @@ fn coder_phase_gate_outcome(
     }
 
     let phase_id = &handles.real_phase_id;
-    let session_id = &handles.session_id;
+    let session_id = &handles.session;
 
     // Worktree creation failing is a hard stop — same as `mission run`'s
     // pre-migration `add_worktree(...)?` propagating out of `run()`.
@@ -3601,9 +3586,8 @@ fn coder_phase_gate_outcome(
             flow::Level::Warn,
             "mission.verify",
             &verify_step_id,
-            mission_id,
-            phase_id,
             session_id,
+            phase_id,
             serde_json::json!({ "error": err_text, "total_tokens": tokens_total }),
         );
         println!("\n{}", style::header("▶ gate — QA unavailable, manual review required"));
@@ -3664,9 +3648,8 @@ fn coder_phase_gate_outcome(
             flow::Level::Warn,
             "mission.verify",
             &verify_step_id,
-            mission_id,
-            phase_id,
             session_id,
+            phase_id,
             serde_json::json!({
                 "verdict": review.verdict,
                 "blockers": review.by_severity.block,
@@ -3711,9 +3694,8 @@ fn coder_phase_gate_outcome(
             flow::Level::Warn,
             "mission.verify",
             &verify_step_id,
-            mission_id,
-            phase_id,
             session_id,
+            phase_id,
             serde_json::json!({
                 "verdict": review.verdict,
                 "blockers": 0,
@@ -3743,9 +3725,8 @@ fn coder_phase_gate_outcome(
         flow::Level::Info,
         "mission.verify",
         &verify_step_id,
-        mission_id,
-        phase_id,
         session_id,
+        phase_id,
         serde_json::json!({
             "verdict": review.verdict,
             "blockers": 0,
@@ -4580,10 +4561,10 @@ fn print_run_summary(mission_id: &str, steps: &BTreeMap<String, crew::types::Ste
 /// with no meaningful spec (a bare test fixture, e.g.).
 ///
 /// Hydrates `Mission.source_input`/`Mission.ticket` from the config's
-/// `extras` (#1284 review round 1, must-fix 2) — that's where `mission
-/// `source_input`/`ticket` keys preserve the operator's verbatim words (#815) and ticket id
-/// (#816), and dropping them silently broke `coder_brief`'s source-input
-/// injection plus the conventions' `{ticket}` templates.
+/// `source_input`/`ticket` fields (#1284 review round 1, must-fix 2): the
+/// operator's verbatim words (#815) and ticket id (#816). Dropping them
+/// silently broke `coder_brief`'s source-input injection plus the
+/// conventions' `{ticket}` templates.
 ///
 /// Returns the doc phase id → real (composed) phase id map every subsequent
 /// step needs.
@@ -4992,7 +4973,7 @@ mod tests {
                 ..Default::default()
             }),
         );
-        crew::step_kinds::StepRunCtx::new(None, None, None, std::sync::Arc::new(bus))
+        crew::step_kinds::StepRunCtx::new(crate::test_run(), None, None, None, std::sync::Arc::new(bus))
     }
 
     /// (#1511) The role each registered kind ACTUALLY dispatches, pinned by
@@ -5136,7 +5117,7 @@ mod tests {
             &registry_path,
             serde_json::json!({
                 "default_profile": "p",
-                "profiles": {"p": {"models": [{"id": "m-local", "n_ctx": 8192, "role": "primary"}]}}
+                "profiles": {"p": {"models": [{"id": "m-local", "n_ctx": 8192}]}}
             })
             .to_string(),
         )
@@ -5983,9 +5964,8 @@ mod tests {
     }
 
     /// (#1918) Two missions launched from the SAME config must NOT share a
-    /// step-lifecycle `session_id`. Before this fix,
-    /// `session_id::task(&step.task_id)` was a literal string straight out
-    /// of the mission config document — byte-identical across every launch
+    /// step-lifecycle `session_id`. Before #1918 a task session was a
+    /// literal string straight out of the mission config document — byte-identical across every launch
     /// of the same config (`crates/darkmux-crew/src/scheduler.rs`'s
     /// `step_lifecycle_record` doc names this exact collision) — so
     /// `darkmux-serve`'s flow index, keyed by `session_id` ALONE, folded
@@ -5999,11 +5979,8 @@ mod tests {
     /// the bucket even though each record still carried its own correct
     /// `mission_id`.
     ///
-    /// The fix composes the launcher's own per-run `mission_id` into the
-    /// scheduler's config-derived `session_id::task`/`session_id::step`
-    /// forms, at the SAME `emit`-wrap choke point that already backfills
-    /// `mission_id` (#1641) — see
-    /// `darkmux_types::session_id::scope_to_run`. This test proves BOTH
+    /// Every session is now minted in its run (`SessionId`), and the
+    /// scheduler is handed the launch's run. This test proves BOTH
     /// directions: two runs of the same config now mint DIFFERENT session
     /// ids for the same task (the actual fix), and one run's OWN
     /// step-lifecycle records still share exactly ONE session id so a
@@ -6104,10 +6081,8 @@ mod tests {
              for the same task — this is the #1918 collision surface"
         );
 
-        // Each session id must carry its OWN mission's identity as the
-        // disambiguator (tying the fix to `mission_id`, not an unrelated
-        // opaque value) — matches `darkmux_types::session_id::scope_to_run`'s
-        // contract.
+        // Each session id must carry its OWN mission's identity: a session
+        // names its run.
         for sid in &first_sessions {
             assert!(sid.contains(&first_id), "session id `{sid}` must carry mission `{first_id}`'s own identity");
         }
@@ -6462,11 +6437,13 @@ mod tests {
             panel: None,
             cmd: None,
             outcome_from: None,
+            source_input: None,
+            ticket: None,
             extras: BTreeMap::new(),
         };
 
         let warn = undeclared_param_warning("review", "rulez", &cfg);
-        assert!(warn.contains("did you mean: rules"), "{warn}");
+        assert!(warn.contains("did you mean `rules`?"), "{warn}");
         assert!(warn.contains("`rulez`"), "{warn}");
         assert!(
             warn.contains("resolved inputs") && warn.contains("Mission.spec"),
@@ -6482,29 +6459,43 @@ mod tests {
         );
     }
 
-    /// A key with no close declared-input match falls back cleanly (no
-    /// dangling "did you mean:" with nothing after it).
+    /// (review C5) Both shipped plan configs name their spec through the
+    /// `workspace` input, and a clean spec passes the launch check.
     #[test]
-    fn undeclared_param_warning_with_no_close_match_has_no_did_you_mean_suffix() {
-        let input = |name: &str| mission_config::MissionInput {
-            name: name.to_string(),
-            description: None,
-            required: Some(false),
-            default: None,
-            ignored: None,
-            ignored_reason: None,
-            extras: BTreeMap::new(),
-        };
+    fn the_workspace_spec_input_is_found_and_a_clean_spec_passes() {
+        for id in ["crawl", "review"] {
+            let loaded = mission_config::load(id).unwrap();
+            let names = workspace_spec_inputs(&loaded.config);
+            assert_eq!(names.into_iter().collect::<Vec<_>>(), ["workspace"], "{id}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let spec = dir.path().join("spec.json");
+        std::fs::write(&spec, r#"{"name": "w", "sources": [{"id": "a", "path": "/x"}]}"#).unwrap();
+        let crawl = mission_config::load("crawl").unwrap();
+        let mut collected = BTreeMap::new();
+        collected.insert("workspace".to_string(), serde_json::json!(spec.to_str().unwrap()));
+        assert!(refuse_bad_workspace_specs(&crawl.config, &collected).is_ok());
+        std::fs::write(&spec, r#"{"name": "w", "sources": [{"id": "a", "path": "/x"}], "sourcs": []}"#).unwrap();
+        let err = refuse_bad_workspace_specs(&crawl.config, &collected).unwrap_err().to_string();
+        assert!(err.contains("unknown key `sourcs`"), "{err}");
+    }
+
+    /// A config that declares no inputs has nothing to suggest, so the
+    /// warning carries no dangling "did you mean" with nothing after it.
+    #[test]
+    fn undeclared_param_warning_with_no_declared_inputs_has_no_did_you_mean_suffix() {
         let cfg = MissionConfig {
             id: "review".to_string(),
             name: "Review".to_string(),
             description: None,
             schema_version: None,
-            inputs: vec![input("workdir")],
+            inputs: Vec::new(),
             phases: Vec::new(),
             panel: None,
             cmd: None,
             outcome_from: None,
+            source_input: None,
+            ticket: None,
             extras: BTreeMap::new(),
         };
 
@@ -6580,13 +6571,10 @@ mod tests {
         for kind in CODER_PHASE_TIER3_KINDS {
             assert!(registry.get(kind).is_ok(), "kind `{kind}` must be registered");
         }
-        // (#1284 review round 1, must-fix 4) The viewer's mission lens keys
-        // on the `mission-run-` session-id prefix — a config-launched run
-        // must stamp the SAME prefix or it's invisible to the lens.
-        assert!(
-            handles.session_id.starts_with("mission-run-"),
-            "session id must carry the viewer's mission-run- prefix, got {}",
-            handles.session_id
+        // The coder run's session is its phase's, in this mission.
+        assert_eq!(
+            handles.session,
+            SessionId::phase(RunId::mission(mission_id.as_str()).unwrap(), handles.real_phase_id.as_str()),
         );
         // (#1546) The build-time-stamp ↔ run-time-read seam. The launcher
         // stamps `injected_budget_chars` here; `MissionCoderStepKind::
@@ -6856,6 +6844,7 @@ mod tests {
             id: id.to_string(),
             task_id: format!("{id}-task"),
             gate: None,
+            // flow-action-guard:allow — a made-up step kind, not an action
             kind: "mission.test".to_string(),
             status,
             config: serde_json::Value::Null,
@@ -6885,7 +6874,7 @@ mod tests {
             workdir: std::path::PathBuf::from("/tmp/gate-test-worktree"),
             branch: "gate-test-branch".to_string(),
             real_phase_id: phase_id.to_string(),
-            session_id: launch_session_id("gate-test-mission", phase_id),
+            session: SessionId::phase(RunId::mission("gate-test-mission").unwrap(), phase_id),
         };
         let mut steps = BTreeMap::new();
         for (suffix, status) in [("worktree", worktree), ("coder", coder), ("verify", verify)] {
@@ -7118,11 +7107,35 @@ mod tests {
         );
     }
 
+    /// (review C5 follow-up) A workspace path that comes only from the
+    /// input's document DEFAULT is checked too: the spec check runs after
+    /// defaults land, still before minting and before `--dry-run`.
+    #[test]
+    #[serial_test::serial]
+    fn a_bad_workspace_spec_from_an_input_default_is_refused_before_minting() {
+        let guard = LaunchTestGuard::new();
+        let spec_dir = tempfile::tempdir().unwrap();
+        let spec = spec_dir.path().join("spec.json");
+        std::fs::write(&spec, r#"{"name": "w", "sources": [{"id": "a", "path": "/x"}], "sourcs": []}"#).unwrap();
+        let doc = serde_json::json!({
+            "id": "ws-default", "name": "WS default",
+            "inputs": [{"name": "workspace", "default": spec.to_str().unwrap()}],
+            "phases": [{"id": "p1", "tasks": [{"id": "t1", "steps": [
+                {"id": "s1", "kind": "procedural.noop", "config": {"workspace": "{{workspace}}"}}
+            ]}]}],
+        });
+        guard.write_config("ws-default", &doc.to_string());
+        let err = launch("ws-default", None, &["dry_run=true".to_string()], None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("refusing to start") && msg.contains("unknown key `sourcs`"), "{msg}");
+        assert!(all_mission_ids().is_empty(), "nothing was minted");
+    }
+
     // ── source_input/ticket hydration (#1284 review round 1, must-fix 2) ─
 
     #[test]
     #[serial_test::serial]
-    fn launch_hydrates_source_input_and_ticket_from_config_extras() {
+    fn launch_hydrates_source_input_and_ticket_from_the_config() {
         let guard = LaunchTestGuard::new();
         guard.write_config(
             "hydration-test",
@@ -7146,12 +7159,12 @@ mod tests {
         assert_eq!(
             mission.source_input.as_deref(),
             Some("the operator's original unabridged words"),
-            "source_input must ride config extras onto the mission record (#815)"
+            "source_input must ride the config onto the mission record (#815)"
         );
         assert_eq!(
             mission.ticket.as_deref(),
             Some("SAMPLE-4242"),
-            "ticket must ride config extras onto the mission record (#816)"
+            "ticket must ride the config onto the mission record (#816)"
         );
     }
 
@@ -7166,16 +7179,6 @@ mod tests {
         let id = mint_run_id("draft-blog-post").unwrap();
         assert!(id.starts_with("draft-blog-post-"), "a minted id is still config-id-prefixed, got {id}");
         assert_ne!(id, "draft-blog-post", "a minted id is never the bare config id — every launch is unique");
-    }
-
-    #[test]
-    fn launch_session_id_carries_the_viewer_mission_run_prefix() {
-        // (#1284 review round 1, must-fix 4) the viewer's mission lens keys
-        // per-run session grouping on the `mission-run-` prefix (originally
-        // the legacy `viewer.html`'s convention; that file retired #1806).
-        let sid = launch_session_id("m1", "m1-build");
-        assert_eq!(sid, "mission-run-m1-m1-build");
-        assert!(sid.starts_with("mission-run-"));
     }
 
     // ── gate-arm failure predicate (#1433 follow-up) ────────────────────
@@ -7324,6 +7327,8 @@ mod tests {
             outcome_from: None,
             panel: None,
             cmd: None,
+            source_input: None,
+            ticket: None,
             extras: BTreeMap::new(),
         };
 
@@ -7377,6 +7382,8 @@ mod tests {
             panel: None,
             cmd: None,
             outcome_from: None,
+            source_input: None,
+            ticket: None,
             extras: BTreeMap::new(),
         };
         let missing = missing_required_inputs(&cfg, &BTreeMap::new());
@@ -8765,12 +8772,12 @@ mod tests {
             flow::Level::Info,
             darkmux_flow::FlowAction::DispatchStart,
             "coder-phase",
-            "coder-phase-123-abcdef",
+            &RunId::mission("coder-phase-123-abcdef").unwrap(),
             serde_json::json!({ "runtime": "mission" }),
         );
         assert_eq!(rec.action, darkmux_flow::FlowAction::DispatchStart);
         assert_eq!(rec.handle, "coder-phase");
-        assert_eq!(rec.session_id.as_deref(), Some("coder-phase-123-abcdef"));
+        assert_eq!(rec.session_id.as_deref(), Some("coder-phase-123-abcdef.run"));
         assert_eq!(rec.mission_id.as_deref(), Some("coder-phase-123-abcdef"));
         // (#1877 requirement 2) `source` must be distinct from BOTH the
         // per-model-dispatch FROZEN `"crew_dispatch"` value and review's
@@ -8797,7 +8804,7 @@ mod tests {
 
     #[test]
     fn coder_branch_terminal_bookend_ok_0_clean_reaches_the_gate() {
-        let (reached_gate, rec) = coder_branch_terminal_bookend(&Ok(0), "coder-phase", "m-1");
+        let (reached_gate, rec) = coder_branch_terminal_bookend(&Ok(0), "coder-phase", &RunId::mission("m-1").unwrap());
         assert!(reached_gate);
         assert_eq!(rec.action, darkmux_flow::FlowAction::DispatchComplete);
         assert!(matches!(rec.level, flow::Level::Info), "{:?}", rec.level);
@@ -8811,7 +8818,7 @@ mod tests {
         // leaves the phase Running at the sign-off gate — real dispatch
         // work that started and FINISHED, same as clean. Must close
         // `dispatch complete`, never `dispatch error`.
-        let (reached_gate, rec) = coder_branch_terminal_bookend(&Ok(2), "coder-phase", "m-2");
+        let (reached_gate, rec) = coder_branch_terminal_bookend(&Ok(2), "coder-phase", &RunId::mission("m-2").unwrap());
         assert!(reached_gate, "Ok(2) (QA blockers) must still reach the gate");
         assert_eq!(rec.action, darkmux_flow::FlowAction::DispatchComplete);
         assert!(matches!(rec.level, flow::Level::Info), "{:?}", rec.level);
@@ -8819,7 +8826,7 @@ mod tests {
 
     #[test]
     fn coder_branch_terminal_bookend_ok_3_qa_unavailable_still_reaches_the_gate() {
-        let (reached_gate, rec) = coder_branch_terminal_bookend(&Ok(3), "coder-phase", "m-3");
+        let (reached_gate, rec) = coder_branch_terminal_bookend(&Ok(3), "coder-phase", &RunId::mission("m-3").unwrap());
         assert!(reached_gate, "Ok(3) (QA unavailable) must still reach the gate");
         assert_eq!(rec.action, darkmux_flow::FlowAction::DispatchComplete);
         assert!(matches!(rec.level, flow::Level::Info), "{:?}", rec.level);
@@ -8827,7 +8834,7 @@ mod tests {
 
     #[test]
     fn coder_branch_terminal_bookend_ok_1_coder_dispatch_failure_never_reaches_the_gate() {
-        let (reached_gate, rec) = coder_branch_terminal_bookend(&Ok(1), "coder-phase", "m-4");
+        let (reached_gate, rec) = coder_branch_terminal_bookend(&Ok(1), "coder-phase", &RunId::mission("m-4").unwrap());
         assert!(!reached_gate);
         assert_eq!(rec.action, darkmux_flow::FlowAction::DispatchError);
         assert!(matches!(rec.level, flow::Level::Error), "{:?}", rec.level);
@@ -8837,7 +8844,7 @@ mod tests {
     #[test]
     fn coder_branch_terminal_bookend_err_worktree_failure_never_reaches_the_gate() {
         let (reached_gate, rec) =
-            coder_branch_terminal_bookend(&Err(anyhow!("worktree already exists")), "coder-phase", "m-5");
+            coder_branch_terminal_bookend(&Err(anyhow!("worktree already exists")), "coder-phase", &RunId::mission("m-5").unwrap());
         assert!(!reached_gate);
         assert_eq!(rec.action, darkmux_flow::FlowAction::DispatchError);
         assert!(matches!(rec.level, flow::Level::Error), "{:?}", rec.level);
@@ -8854,7 +8861,7 @@ mod tests {
     /// ran, not just that SOME "dispatch error" record landed.
     #[test]
     fn coder_branch_terminal_bookend_payload_never_carries_an_error_key() {
-        let (_, rec) = coder_branch_terminal_bookend(&Err(anyhow!("boom")), "coder-phase", "m-6");
+        let (_, rec) = coder_branch_terminal_bookend(&Err(anyhow!("boom")), "coder-phase", &RunId::mission("m-6").unwrap());
         let payload = rec.payload.as_ref().unwrap();
         assert!(
             payload.get("error").is_none(),
@@ -8882,7 +8889,7 @@ mod tests {
                     flow::Level::Error,
                     darkmux_flow::FlowAction::DispatchError,
                     "panic-test-config",
-                    "panic-test-mission",
+                    &RunId::mission("panic-test-mission").unwrap(),
                     serde_json::json!({
                         "runtime": "mission",
                         "result_class": "error",
@@ -8897,7 +8904,7 @@ mod tests {
                     flow::Level::Info,
                     darkmux_flow::FlowAction::DispatchStart,
                     "panic-test-config",
-                    "panic-test-mission",
+                    &RunId::mission("panic-test-mission").unwrap(),
                     serde_json::json!({ "runtime": "mission" }),
                 ),
             );
@@ -8991,7 +8998,7 @@ mod tests {
         );
         for r in &starts {
             assert_eq!(r["mission_id"], serde_json::json!(mission_id));
-            assert_eq!(r["session_id"], serde_json::json!(mission_id));
+            assert_eq!(r["session_id"], serde_json::json!(format!("{mission_id}.run")));
         }
         drop(guard);
     }
@@ -9171,7 +9178,6 @@ mod tests {
             base: "HEAD".to_string(),
             mission_id: "m-test".to_string(),
             phase_id: "p-test".to_string(),
-            session_id: "s-test".to_string(),
             role: "coder".to_string(),
         };
         let seed_artifacts: Vec<(&'static str, Arc<dyn Any + Send + Sync>)> =
@@ -9211,6 +9217,7 @@ mod tests {
         let facts = crew::step_kinds::Facts::default();
         let est = crew::step_kinds::FixedEstimator::default();
         let report = crew::scheduler::run_step_graph(
+            &crate::test_run(),
             &mut steps,
             &tasks,
             &registry,

@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { tokensOffMeter } from "./savings";
 import { hasAnyTokenCounts } from "../../lib/usageRecords";
-import { CATEGORY, ACTION, recordsAsOf, timesOf, type NormRecord } from "../../lib/ingest";
+import { CATEGORY, ACTION, recordsAsOf, type NormRecord } from "../../lib/ingest";
 import { norm, normAll, type RawRecord } from "../../testing/records";
 
 /** (#2919) Vocabulary. `local` / `cloud` / `unknown` (and their `*Runs`
@@ -1592,7 +1592,7 @@ describe("tokensOffMeter — run-count terms (#2709)", () => {
 describe("tokensOffMeter — corpus playhead scrub (#2709)", () => {
   const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../..");
   const day = (name: string): NormRecord[] =>
-    normAll(JSON.parse(readFileSync(path.join(REPO_ROOT, `tests/parity/corpus/${name}.json`), "utf8")));
+    normAll(JSON.parse(readFileSync(path.join(REPO_ROOT, `tests/parity/corpus/${name}.json`), "utf8")) as RawRecord[]);
   const corpus = [...day("flow-yesterday"), ...day("flow-today")];
 
   /**
@@ -1608,7 +1608,7 @@ describe("tokensOffMeter — corpus playhead scrub (#2709)", () => {
    * positions. The other three never fall.
    */
   it("ALL TOKENS never falls across all 2,073 playheads", () => {
-    const heads = [...new Set(timesOf(corpus))].sort((a, b) => a - b);
+    const heads = [...new Set(corpus.flatMap((r) => (r.tMs === null ? [] : [r.tMs])))].sort((a, b) => a - b);
     expect(heads.length).toBe(2073);
     let prevTotal = 0;
     let last = tokensOffMeter([]);
@@ -1635,9 +1635,9 @@ describe("tokensOffMeter — corpus playhead scrub (#2709)", () => {
 
   /**
    * (round-2 review restatement) The 40 -> 52 number measures data recorded
-   * BEFORE #1918, which is already on main. `session_id::scope_to_run`
-   * composes the run id into every `task-`/`step-`-prefixed session id at
-   * the launcher, so post-#1918 ids are already run-unique and most of the
+   * BEFORE #1918. From #1918 the launcher composed the run id into every
+   * `task-`/`step-`-prefixed session id (and since 4.0 every session id
+   * names its run), so later ids are already run-unique and most of the
    * recurrence this change corrects cannot occur in new records. Replaying
    * that transform over this same corpus:
    *
@@ -1816,11 +1816,9 @@ describe("tokensOffMeter — runKey injectivity", () => {
    *
    * Mutation that survived: deleting the NUL from the template, making the
    * key a bare concatenation. Ids here are hyphen-delimited and drawn from
-   * one alphabet, and `session_id::scope_to_run`
-   * (`crates/darkmux-types/src/session_id.rs:166-173`) literally composes
-   * them as `format!("{session_id}-{run_id}")` — so a session id that
-   * already CONTAINS a mission id is a shape the producers emit, not a
-   * hypothetical.
+   * one alphabet, and FLOW 1.43.0 archives compose them as
+   * `{session_id}-{run_id}` — so a session id that already CONTAINS a
+   * mission id is a shape recorded archives hold, not a hypothetical.
    *
    * The pair below is constructed to be minimal rather than realistic; its
    * job is to prove the key is injective, which a concatenation is not.

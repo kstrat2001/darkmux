@@ -135,6 +135,17 @@ fn unit_step(config: serde_json::Value) -> Step {
     }
 }
 
+/// The session a unit of `rule` named `unit` dispatches under, in the
+/// test's mission: an ad-hoc dispatch of the crawler.
+fn unit_session(rule: &str, unit: &str) -> String {
+    darkmux_types::session_id::SessionId::adhoc(
+        darkmux_types::session_id::RunId::mission(MISSION).unwrap(),
+        "crawler",
+        format!("{rule}-{unit}"),
+    )
+    .wire()
+}
+
 fn unit_task() -> Task {
     Task {
         run_on: darkmux_crew::types::default_run_on(),
@@ -206,7 +217,7 @@ fn ok_result_with(stdout: String, out: PathBuf, trajectory: TrajectoryFold) -> R
         exit_code: 0,
         stdout,
         stderr: String::new(),
-        session_id: "s".into(),
+        session_id: darkmux_types::session_id::SessionId::run(darkmux_types::session_id::RunId::mission(MISSION).unwrap()),
         out_dir: Some(out),
         trajectory: Some(trajectory),
     })
@@ -220,7 +231,7 @@ fn interpret_dispatch_result_reads_the_envelope_metrics() {
         exit_code: 0,
         stdout: envelope("stop", 100, 20, 5_000),
         stderr: String::new(),
-        session_id: "s".into(),
+        session_id: darkmux_types::session_id::SessionId::run(darkmux_types::session_id::RunId::mission(MISSION).unwrap()),
         out_dir: None,
         trajectory: None,
     };
@@ -256,7 +267,7 @@ fn a_clean_unit_dispatch_produces_a_typed_outcome_and_counts_its_findings() {
     let step = unit_step(serde_json::json!({
         "plan": plan.to_string_lossy(), "unit": "u-0001", "rule": "unnamed-predicate"
     }));
-    let outcome = kind.run(&step, &unit_task(), &BTreeMap::new()).unwrap();
+    let outcome = kind.run(&step, &unit_task(), &BTreeMap::new(), &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission(MISSION).unwrap())).unwrap();
     let env = darkmux_crew::step_output::Output::<UnitOutcome>::read(&outcome.output, UNIT_OUTCOME_KIND)
         .expect("the output IS a wrapped UnitOutcome");
     assert_eq!(env.producer.mission, MISSION, "the envelope names who produced it");
@@ -335,7 +346,7 @@ fn config_timeout_seconds_routes_into_the_container_paths_override_field() {
         "plan": plan.to_string_lossy(), "unit": "u-0001", "rule": "unnamed-predicate",
         "timeout_seconds": 45
     }));
-    kind.run(&step, &unit_task(), &BTreeMap::new()).unwrap();
+    kind.run(&step, &unit_task(), &BTreeMap::new(), &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission(MISSION).unwrap())).unwrap();
 
     let opts = seen.lock().unwrap().take().unwrap();
     assert_eq!(
@@ -374,7 +385,7 @@ fn omitted_config_timeout_seconds_leaves_the_override_field_absent() {
     let step = unit_step(serde_json::json!({
         "plan": plan.to_string_lossy(), "unit": "u-0001", "rule": "unnamed-predicate"
     }));
-    kind.run(&step, &unit_task(), &BTreeMap::new()).unwrap();
+    kind.run(&step, &unit_task(), &BTreeMap::new(), &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission(MISSION).unwrap())).unwrap();
 
     let opts = seen.lock().unwrap().take().unwrap();
     assert_eq!(
@@ -416,7 +427,7 @@ fn config_timeout_seconds_string_form_routes_into_the_container_paths_override_f
         "plan": plan.to_string_lossy(), "unit": "u-0001", "rule": "unnamed-predicate",
         "timeout_seconds": "45"
     }));
-    kind.run(&step, &unit_task(), &BTreeMap::new()).unwrap();
+    kind.run(&step, &unit_task(), &BTreeMap::new(), &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission(MISSION).unwrap())).unwrap();
 
     let opts = seen.lock().unwrap().take().unwrap();
     assert_eq!(
@@ -533,7 +544,7 @@ fn a_thermal_stop_file_prevents_the_unit_from_dispatching() {
     let step = unit_step(serde_json::json!({
         "plan": plan.to_string_lossy(), "unit": "u-0001", "rule": "unnamed-predicate"
     }));
-    let outcome = kind.run(&step, &unit_task(), &BTreeMap::new()).unwrap();
+    let outcome = kind.run(&step, &unit_task(), &BTreeMap::new(), &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission(MISSION).unwrap())).unwrap();
 
     assert!(
         !called.load(std::sync::atomic::Ordering::SeqCst),
@@ -603,7 +614,7 @@ fn a_tier4_episode_limit_stop_is_not_reported_as_a_breaker_trip() {
     let step = unit_step(serde_json::json!({
         "plan": plan.to_string_lossy(), "unit": "u-0001", "rule": "unnamed-predicate"
     }));
-    let outcome = kind.run(&step, &unit_task(), &BTreeMap::new()).unwrap();
+    let outcome = kind.run(&step, &unit_task(), &BTreeMap::new(), &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission(MISSION).unwrap())).unwrap();
     assert!(
         !called.load(std::sync::atomic::Ordering::SeqCst),
         "a tier-4 hold still stops the unit - only the DESCRIPTION changes"
@@ -666,7 +677,7 @@ fn a_stop_file_from_a_previous_mission_does_not_block_this_one() {
     let step = unit_step(serde_json::json!({
         "plan": plan.to_string_lossy(), "unit": "u-0001", "rule": "unnamed-predicate"
     }));
-    let outcome = kind.run(&step, &unit_task(), &BTreeMap::new()).unwrap();
+    let outcome = kind.run(&step, &unit_task(), &BTreeMap::new(), &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission(MISSION).unwrap())).unwrap();
 
     assert!(
         called.load(std::sync::atomic::Ordering::SeqCst),
@@ -705,7 +716,7 @@ fn a_stop_file_naming_this_mission_still_stops_it() {
     let step = unit_step(serde_json::json!({
         "plan": plan.to_string_lossy(), "unit": "u-0001", "rule": "unnamed-predicate"
     }));
-    let outcome = kind.run(&step, &unit_task(), &BTreeMap::new()).unwrap();
+    let outcome = kind.run(&step, &unit_task(), &BTreeMap::new(), &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission(MISSION).unwrap())).unwrap();
 
     assert!(
         !called.load(std::sync::atomic::Ordering::SeqCst),
@@ -740,7 +751,7 @@ fn no_thermal_stop_file_dispatches_normally() {
     let step = unit_step(serde_json::json!({
         "plan": plan.to_string_lossy(), "unit": "u-0001", "rule": "unnamed-predicate"
     }));
-    let outcome = kind.run(&step, &unit_task(), &BTreeMap::new()).unwrap();
+    let outcome = kind.run(&step, &unit_task(), &BTreeMap::new(), &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission(MISSION).unwrap())).unwrap();
 
     assert!(called.load(std::sync::atomic::Ordering::SeqCst), "no STOP file present — the unit must dispatch");
     let parsed = darkmux_crew::step_output::Output::<UnitOutcome>::read(&outcome.output, UNIT_OUTCOME_KIND)
@@ -816,7 +827,7 @@ fn two_rules_growing_unit_u_0001_do_not_collide_on_disk() {
             exit_code: 0,
             stdout: envelope("stop", 10, 5, 100),
             stderr: String::new(),
-            session_id: opts.session_id.unwrap_or_default(),
+            session_id: opts.session,
             out_dir: Some(dir),
             trajectory: Some(TrajectoryFold::default()),
         })
@@ -830,13 +841,13 @@ fn two_rules_growing_unit_u_0001_do_not_collide_on_disk() {
     }));
 
     let outcome_a =
-        kind.run(&step_a, &unit_task(), &BTreeMap::new()).expect("the first rule's unit is first to the dir");
+        kind.run(&step_a, &unit_task(), &BTreeMap::new(), &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission(MISSION).unwrap())).expect("the first rule's unit is first to the dir");
     // Before the fix this is where #2360 reproduces: rule B's unit
     // resolves to the SAME `units/u-0001/out` rule A's dispatch already
     // populated, and the stub's collision check refuses it exactly the
     // way production does.
     let outcome_b = kind
-        .run(&step_b, &unit_task(), &BTreeMap::new())
+        .run(&step_b, &unit_task(), &BTreeMap::new(), &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission(MISSION).unwrap()))
         .expect("a second rule naming the same unit id must get its OWN on-disk home (#2360)");
 
     let a = darkmux_crew::step_output::Output::<UnitOutcome>::read(&outcome_a.output, UNIT_OUTCOME_KIND)
@@ -913,7 +924,7 @@ fn draws_dispatches_the_unit_n_times_and_dedups_matching_finding_refs() {
     let kind = CrawlUnitStepKind::with_dispatch(Arc::new(move |opts: DispatchOpts| {
         let n = {
             let mut c = captured.lock().unwrap();
-            c.push(opts.session_id.clone());
+            c.push(Some(opts.session.wire()));
             c.len()
         };
         let out = if n == 1 { out1.clone() } else { out2.clone() };
@@ -923,7 +934,7 @@ fn draws_dispatches_the_unit_n_times_and_dedups_matching_finding_refs() {
     let step = unit_step(serde_json::json!({
         "plan": plan.to_string_lossy(), "unit": "u-0001", "rule": "unnamed-predicate", "draws": 2
     }));
-    let outcome = kind.run(&step, &unit_task(), &BTreeMap::new()).unwrap();
+    let outcome = kind.run(&step, &unit_task(), &BTreeMap::new(), &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission(MISSION).unwrap())).unwrap();
     let parsed = darkmux_crew::step_output::Output::<UnitOutcome>::read(&outcome.output, UNIT_OUTCOME_KIND)
         .unwrap()
         .body;
@@ -934,7 +945,7 @@ fn draws_dispatches_the_unit_n_times_and_dedups_matching_finding_refs() {
         seen[0], seen[1],
         "two draws must never share a session id — the finding store addresses by <session>/<seq>"
     );
-    assert_eq!(seen[0].as_deref(), Some(format!("crawl-{MISSION}-unnamed-predicate-u-0001").as_str()), "draw 0 is unchanged");
+    assert_eq!(seen[0].as_deref(), Some(unit_session("unnamed-predicate", "u-0001").as_str()), "draw 0 is unchanged");
 
     assert_eq!(parsed.findings, 2, "the RAW total across both draws — every finding the store holds");
     assert_eq!(
@@ -986,7 +997,7 @@ fn draws_defaults_to_exactly_one_dispatch() {
     let step = unit_step(serde_json::json!({
         "plan": plan.to_string_lossy(), "unit": "u-0001", "rule": "unnamed-predicate"
     }));
-    kind.run(&step, &unit_task(), &BTreeMap::new()).unwrap();
+    kind.run(&step, &unit_task(), &BTreeMap::new(), &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission(MISSION).unwrap())).unwrap();
     assert_eq!(*calls.lock().unwrap(), 1);
 }
 
@@ -1021,7 +1032,7 @@ fn a_task_naming_a_different_role_dispatches_as_that_role_and_stamps_its_confirm
     }));
     let mut task = unit_task();
     task.role_id = Some("reviewer".to_string());
-    kind.run(&step, &task, &BTreeMap::new()).unwrap();
+    kind.run(&step, &task, &BTreeMap::new(), &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission(MISSION).unwrap())).unwrap();
 
     let opts = seen.lock().unwrap().take().unwrap();
     assert_eq!(opts.role_id, "reviewer", "the Task's own role_id, not the hardcoded default");
@@ -1066,7 +1077,7 @@ fn an_intent_file_in_config_lands_in_the_dispatched_message() {
         "plan": plan.to_string_lossy(), "unit": "u-0001", "rule": "intent-vs-diff",
         "intent_file": intent_file.to_string_lossy()
     }));
-    kind.run(&step, &unit_task(), &BTreeMap::new()).unwrap();
+    kind.run(&step, &unit_task(), &BTreeMap::new(), &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission(MISSION).unwrap())).unwrap();
 
     let opts = seen.lock().unwrap().take().unwrap();
     assert!(
@@ -1088,7 +1099,7 @@ fn max_turns_is_a_bound_not_a_failure_and_the_step_still_completes() {
     let kind =
         CrawlUnitStepKind::with_dispatch(Arc::new(move |_| ok_result(envelope("max_turns", 10, 5, 900), out.clone())));
     let step = unit_step(serde_json::json!({ "plan": plan.to_string_lossy(), "unit": "u-0001" }));
-    let outcome = kind.run(&step, &unit_task(), &BTreeMap::new()).unwrap();
+    let outcome = kind.run(&step, &unit_task(), &BTreeMap::new(), &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission(MISSION).unwrap())).unwrap();
     let parsed = darkmux_crew::step_output::Output::<UnitOutcome>::read(&outcome.output, UNIT_OUTCOME_KIND)
         .unwrap()
         .body;
@@ -1113,7 +1124,7 @@ fn a_no_progress_tail_ends_a_clean_stop_as_budget_exhausted() {
         let step = unit_step(serde_json::json!({
             "plan": plan.to_string_lossy(), "unit": "u-0001", "no_progress_turns": n
         }));
-        let outcome = kind.run(&step, &unit_task(), &BTreeMap::new()).unwrap();
+        let outcome = kind.run(&step, &unit_task(), &BTreeMap::new(), &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission(MISSION).unwrap())).unwrap();
         let parsed = darkmux_crew::step_output::Output::<UnitOutcome>::read(&outcome.output, UNIT_OUTCOME_KIND)
             .unwrap()
             .body;
@@ -1131,7 +1142,7 @@ fn a_dispatch_error_fails_the_step_naming_the_unit() {
     let plan = write_plan(ws.path(), "unnamed-predicate", "u-0001", &"d".repeat(40));
     let kind = CrawlUnitStepKind::with_dispatch(Arc::new(|_| Err(anyhow!("container refused"))));
     let step = unit_step(serde_json::json!({ "plan": plan.to_string_lossy(), "unit": "u-0001" }));
-    let err = format!("{:#}", kind.run(&step, &unit_task(), &BTreeMap::new()).unwrap_err());
+    let err = format!("{:#}", kind.run(&step, &unit_task(), &BTreeMap::new(), &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission(MISSION).unwrap())).unwrap_err());
     assert!(err.contains("u-0001") && err.contains("container refused"), "{err}");
 }
 
@@ -1150,7 +1161,7 @@ fn a_unit_the_plan_does_not_hold_is_refused_before_any_dispatch() {
         Err(anyhow!("unreachable"))
     }));
     let step = unit_step(serde_json::json!({ "plan": plan.to_string_lossy(), "unit": "u-9999" }));
-    let err = format!("{:#}", kind.run(&step, &unit_task(), &BTreeMap::new()).unwrap_err());
+    let err = format!("{:#}", kind.run(&step, &unit_task(), &BTreeMap::new(), &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission(MISSION).unwrap())).unwrap_err());
     assert!(err.contains("u-9999") && err.contains("no unit"), "{err}");
     assert!(!dispatched.load(std::sync::atomic::Ordering::SeqCst), "nothing dispatched");
 }
@@ -1167,7 +1178,7 @@ fn a_step_whose_rule_disagrees_with_the_plan_is_refused() {
     let step = unit_step(serde_json::json!({
         "plan": plan.to_string_lossy(), "unit": "u-0001", "rule": "swallowed-error"
     }));
-    let err = format!("{:#}", kind.run(&step, &unit_task(), &BTreeMap::new()).unwrap_err());
+    let err = format!("{:#}", kind.run(&step, &unit_task(), &BTreeMap::new(), &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission(MISSION).unwrap())).unwrap_err());
     assert!(err.contains("swallowed-error") && err.contains("disagree"), "{err}");
 }
 
@@ -1181,7 +1192,7 @@ fn an_empty_sha_is_refused_rather_than_stamped_onto_findings() {
     let plan = write_plan(ws.path(), "unnamed-predicate", "u-0001", "");
     let kind = CrawlUnitStepKind::with_dispatch(Arc::new(|_| Err(anyhow!("unreachable"))));
     let step = unit_step(serde_json::json!({ "plan": plan.to_string_lossy(), "unit": "u-0001" }));
-    let err = format!("{:#}", kind.run(&step, &unit_task(), &BTreeMap::new()).unwrap_err());
+    let err = format!("{:#}", kind.run(&step, &unit_task(), &BTreeMap::new(), &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission(MISSION).unwrap())).unwrap_err());
     assert!(err.contains("empty sha") && err.contains("unversioned"), "{err}");
 }
 
@@ -1986,7 +1997,7 @@ fn a_unit_step_reading_a_plan_wired_to_the_wrong_producer_is_refused() {
     .unwrap();
     let kind = CrawlUnitStepKind::with_dispatch(Arc::new(|_| Err(anyhow!("unreachable"))));
     let step = unit_step(serde_json::json!({ "plan": wrong.to_string_lossy(), "unit": "u-0001" }));
-    let err = format!("{:#}", kind.run(&step, &unit_task(), &BTreeMap::new()).unwrap_err());
+    let err = format!("{:#}", kind.run(&step, &unit_task(), &BTreeMap::new(), &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission(MISSION).unwrap())).unwrap_err());
     assert!(err.contains(UNIT_OUTCOME_KIND) && err.contains("crawl.plan"), "{err}");
 }
 
@@ -2170,7 +2181,7 @@ fn two_units_and_a_summary_run_through_the_real_scheduler() {
         &registry_path,
         serde_json::json!({
             "default_profile": "p",
-            "profiles": {"p": {"models": [{"id": "m-local", "n_ctx": 8192, "role": "primary"}]}}
+            "profiles": {"p": {"models": [{"id": "m-local", "n_ctx": 8192}]}}
         })
         .to_string(),
     )
@@ -2185,7 +2196,7 @@ fn two_units_and_a_summary_run_through_the_real_scheduler() {
     let dispatched: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let seen = dispatched.clone();
     let kind = CrawlUnitStepKind::with_dispatch(Arc::new(move |opts: DispatchOpts| {
-        seen.lock().unwrap().push(opts.session_id.clone().unwrap_or_default());
+        seen.lock().unwrap().push(opts.session.wire());
         ok_result(envelope("stop", 40, 8, 1_234), out.clone())
     }));
 
@@ -2244,6 +2255,7 @@ fn two_units_and_a_summary_run_through_the_real_scheduler() {
     // `mission_launch::launch` does (#2300).
     let run_phase = |steps: &mut BTreeMap<String, Step>| {
         darkmux_crew::scheduler::run_step_graph(
+            &darkmux_types::session_id::RunId::mission(MISSION).unwrap(),
             steps,
             &tasks_by_id,
             &registry,
@@ -2363,6 +2375,7 @@ fn run_one_failing_unit_through_the_real_scheduler(
 
     let run_phase = |steps: &mut BTreeMap<String, Step>| {
         darkmux_crew::scheduler::run_step_graph(
+            &darkmux_types::session_id::RunId::mission(MISSION).unwrap(),
             steps,
             &tasks_by_id,
             &registry,
@@ -2497,14 +2510,14 @@ fn a_units_outcome_names_every_finding_it_recorded_by_store_key() {
     let step = unit_step(serde_json::json!({
         "plan": plan.to_string_lossy(), "unit": "u-0001", "rule": "unnamed-predicate"
     }));
-    let outcome = kind.run(&step, &unit_task(), &BTreeMap::new()).unwrap();
+    let outcome = kind.run(&step, &unit_task(), &BTreeMap::new(), &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission(MISSION).unwrap())).unwrap();
     let body = darkmux_crew::step_output::Output::<UnitOutcome>::read(&outcome.output, UNIT_OUTCOME_KIND)
         .unwrap()
         .body;
 
     assert_eq!(body.findings, 2, "the count and the roster come from ONE read");
     assert_eq!(body.finding_refs.len(), 2, "one ref per accepted finding");
-    let session = format!("crawl-{MISSION}-unnamed-predicate-u-0001");
+    let session = unit_session("unnamed-predicate", "u-0001");
     assert_eq!(
         body.finding_refs.iter().map(|r| r.key.as_str()).collect::<Vec<_>>(),
         vec![format!("{session}/1"), format!("{session}/2")],
@@ -2512,7 +2525,7 @@ fn a_units_outcome_names_every_finding_it_recorded_by_store_key() {
     );
     assert_eq!(
         body.finding_refs[0].id,
-        format!("crawl-{MISSION}-unnamed-predicate-u-0001-1"),
+        format!("{}-1", unit_session("unnamed-predicate", "u-0001")),
         "`/` swapped for `-`: the id becomes a task id suffix"
     );
     assert_eq!(body.finding_refs[0].file.as_deref(), Some("src/a.ts"), "the container prefix is stripped");
@@ -2642,13 +2655,13 @@ fn a_key_keeps_the_runtimes_ordinal_even_when_a_line_does_not_parse() {
     let kind =
         CrawlUnitStepKind::with_dispatch(Arc::new(move |_| ok_result(envelope("stop", 1, 1, 10), out.clone())));
     let step = unit_step(serde_json::json!({ "plan": plan.to_string_lossy(), "unit": "u-0001" }));
-    let outcome = kind.run(&step, &unit_task(), &BTreeMap::new()).unwrap();
+    let outcome = kind.run(&step, &unit_task(), &BTreeMap::new(), &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission(MISSION).unwrap())).unwrap();
     let body = darkmux_crew::step_output::Output::<UnitOutcome>::read(&outcome.output, UNIT_OUTCOME_KIND)
         .unwrap()
         .body;
 
     assert_eq!(body.findings, 2, "only the readable lines are counted");
-    let session = format!("crawl-{MISSION}-unnamed-predicate-u-0001");
+    let session = unit_session("unnamed-predicate", "u-0001");
     assert_eq!(
         body.finding_refs.iter().map(|r| r.key.as_str()).collect::<Vec<_>>(),
         vec![format!("{session}/1"), format!("{session}/3")],
@@ -2656,34 +2669,32 @@ fn a_key_keeps_the_runtimes_ordinal_even_when_a_line_does_not_parse() {
     );
 }
 
-/// A session id that could not be a path segment under the finding store
-/// produces NO refs — a key nothing can resolve is worse than none — while
-/// the COUNT stays honest about what the unit observed.
+/// A unit id holding a path separator still names its findings: the
+/// session's wire string escapes it, so the key is always a store segment.
 #[test]
 #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
-fn an_unaddressable_session_id_yields_no_refs_but_still_counts_the_findings() {
+fn a_unit_id_holding_a_separator_still_names_its_findings() {
     let home = TempDir::new().unwrap();
     let _g = HomeGuard::set(home.path());
     save_phase(PHASE, MISSION);
     let ws = TempDir::new().unwrap();
-    // The session id is `crawl-<mission>-<unit id>`, so a unit id holding a
-    // separator is the one input that can make it unaddressable.
     let plan = write_plan(ws.path(), "unnamed-predicate", "u/0001", &"a".repeat(40));
     let out = seeded_out_dir(ws.path(), 2);
     let kind =
         CrawlUnitStepKind::with_dispatch(Arc::new(move |_| ok_result(envelope("stop", 1, 1, 10), out.clone())));
     let step = unit_step(serde_json::json!({ "plan": plan.to_string_lossy(), "unit": "u/0001" }));
-    let outcome = kind.run(&step, &unit_task(), &BTreeMap::new()).unwrap();
+    let outcome = kind.run(&step, &unit_task(), &BTreeMap::new(), &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission(MISSION).unwrap())).unwrap();
     let body = darkmux_crew::step_output::Output::<UnitOutcome>::read(&outcome.output, UNIT_OUTCOME_KIND)
         .unwrap()
         .body;
 
-    assert!(
-        !darkmux_crew::findings::is_safe_dispatch_segment(&format!("crawl-{MISSION}-u/0001")),
-        "the fixture's premise: this session id cannot be a store segment"
+    let session = unit_session("unnamed-predicate", "u/0001");
+    assert!(darkmux_crew::findings::is_safe_dispatch_segment(&session), "the wire escapes the separator: {session}");
+    assert_eq!(body.findings, 2);
+    assert_eq!(
+        body.finding_refs.iter().map(|r| r.key.as_str()).collect::<Vec<_>>(),
+        vec![format!("{session}/1"), format!("{session}/2")],
     );
-    assert_eq!(body.findings, 2, "the unit observed two findings, addressable or not");
-    assert!(body.finding_refs.is_empty(), "and named none of them: {:?}", body.finding_refs);
 }
 
 /// Points `DARKMUX_PROFILES` at a registry written for one test and restores
@@ -2724,13 +2735,13 @@ fn a_unit_declares_the_crawler_seats_residency_so_siblings_wave_pack() {
         &registry,
         serde_json::json!({
             "default_profile": "p",
-            "profiles": {"p": {"models": [{"id": "m-local", "n_ctx": 8192, "role": "primary"}]}}
+            "profiles": {"p": {"models": [{"id": "m-local", "n_ctx": 8192}]}}
         })
         .to_string(),
     )
     .unwrap();
     let kind = CrawlUnitStepKind::with_dispatch(Arc::new(|_| Err(anyhow!("residency never dispatches"))));
-    let ctx = darkmux_crew::step_kinds::StepRunCtx::new(None, None, None, Arc::new(darkmux_crew::step_kinds::ArtifactBus::new()));
+    let ctx = darkmux_crew::step_kinds::StepRunCtx::new(darkmux_types::session_id::RunId::mission(MISSION).unwrap(), None, None, None, Arc::new(darkmux_crew::step_kinds::ArtifactBus::new()));
     let SeatClaim::LocalModel(placement) =
         kind.seat(&unit_step(serde_json::json!({})), &unit_task(), &BTreeMap::new(), &ctx)
     else {
@@ -2779,14 +2790,14 @@ fn residency_resolves_the_tasks_own_role_not_a_hardcoded_crawler() {
         &registry,
         serde_json::json!({
             "default_profile": "p",
-            "profiles": {"p": {"models": [{"id": "m-local", "n_ctx": 8192, "role": "primary"}]}}
+            "profiles": {"p": {"models": [{"id": "m-local", "n_ctx": 8192}]}}
         })
         .to_string(),
     )
     .unwrap();
 
     let kind = CrawlUnitStepKind::with_dispatch(Arc::new(|_| Err(anyhow!("residency never dispatches"))));
-    let ctx = darkmux_crew::step_kinds::StepRunCtx::new(None, None, None, Arc::new(darkmux_crew::step_kinds::ArtifactBus::new()));
+    let ctx = darkmux_crew::step_kinds::StepRunCtx::new(darkmux_types::session_id::RunId::mission(MISSION).unwrap(), None, None, None, Arc::new(darkmux_crew::step_kinds::ArtifactBus::new()));
 
     // Sanity leg: the Task's role IS a registered role (unchanged from the
     // hardcoded-crawler test above, just spelled through the Task now) —
@@ -3176,7 +3187,7 @@ fn one_draw_keeps_two_distinct_findings_that_share_a_file_and_line() {
     let step = unit_step(serde_json::json!({
         "plan": plan.to_string_lossy(), "unit": "u-0001", "rule": "unnamed-predicate"
     }));
-    let outcome = kind.run(&step, &unit_task(), &BTreeMap::new()).unwrap();
+    let outcome = kind.run(&step, &unit_task(), &BTreeMap::new(), &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission(MISSION).unwrap())).unwrap();
     let parsed = darkmux_crew::step_output::Output::<UnitOutcome>::read(&outcome.output, UNIT_OUTCOME_KIND)
         .unwrap()
         .body;
@@ -3239,7 +3250,7 @@ fn two_draws_dedup_only_across_draws_never_within_one() {
     let step = unit_step(serde_json::json!({
         "plan": plan.to_string_lossy(), "unit": "u-0001", "rule": "unnamed-predicate", "draws": 2
     }));
-    let outcome = kind.run(&step, &unit_task(), &BTreeMap::new()).unwrap();
+    let outcome = kind.run(&step, &unit_task(), &BTreeMap::new(), &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission(MISSION).unwrap())).unwrap();
     let parsed = darkmux_crew::step_output::Output::<UnitOutcome>::read(&outcome.output, UNIT_OUTCOME_KIND)
         .unwrap()
         .body;
@@ -3290,14 +3301,14 @@ fn two_rules_first_units_never_share_a_dispatch_session_id() {
     let calls: Arc<std::sync::Mutex<Vec<Option<String>>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let captured = calls.clone();
     let kind = CrawlUnitStepKind::with_dispatch(Arc::new(move |opts: DispatchOpts| {
-        captured.lock().unwrap().push(opts.session_id.clone());
+        captured.lock().unwrap().push(Some(opts.session.wire()));
         ok_result(envelope("stop", 50, 10, 1_000), out.clone())
     }));
     for (plan, rule) in [(&plan_a, "unnamed-predicate"), (&plan_b, "swallowed-error")] {
         let step = unit_step(serde_json::json!({
             "plan": plan.to_string_lossy(), "unit": "u-0001", "rule": rule
         }));
-        kind.run(&step, &unit_task(), &BTreeMap::new()).unwrap();
+        kind.run(&step, &unit_task(), &BTreeMap::new(), &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission(MISSION).unwrap())).unwrap();
     }
     let seen = calls.lock().unwrap();
     assert_eq!(seen.len(), 2, "one dispatch per unit");
@@ -3305,8 +3316,8 @@ fn two_rules_first_units_never_share_a_dispatch_session_id() {
         seen[0], seen[1],
         "two rules' `u-0001` share a mission: same session id = same container name = the live 5/5 collision"
     );
-    assert_eq!(seen[0].as_deref(), Some(format!("crawl-{MISSION}-unnamed-predicate-u-0001").as_str()));
-    assert_eq!(seen[1].as_deref(), Some(format!("crawl-{MISSION}-swallowed-error-u-0001").as_str()));
+    assert_eq!(seen[0].as_deref(), Some(unit_session("unnamed-predicate", "u-0001").as_str()));
+    assert_eq!(seen[1].as_deref(), Some(unit_session("swallowed-error", "u-0001").as_str()));
 }
 
 /// (#2902 review C3) The crawl's provenance stamp names the model the unit's
@@ -3353,7 +3364,7 @@ fn out_dir_with_trajectory(dir: &Path, lines: &[String]) -> PathBuf {
 fn run_unit(kind: &CrawlUnitStepKind, plan: &Path, extra: Value) -> UnitOutcome {
     let mut config = serde_json::json!({ "plan": plan.to_string_lossy(), "unit": "u-0001" });
     config.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
-    let outcome = kind.run(&unit_step(config), &unit_task(), &BTreeMap::new()).unwrap();
+    let outcome = kind.run(&unit_step(config), &unit_task(), &BTreeMap::new(), &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission(MISSION).unwrap())).unwrap();
     darkmux_crew::step_output::Output::<UnitOutcome>::read(&outcome.output, UNIT_OUTCOME_KIND).unwrap().body
 }
 

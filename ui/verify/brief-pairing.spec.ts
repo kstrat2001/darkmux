@@ -52,7 +52,7 @@ async function mockSessionAndGoto(page: import("@playwright/test").Page, width: 
           {
             ts: "2026-09-08T21:45:00Z",
             session_id: SESSION_ID,
-            action: "dispatch start",
+            action: "dispatch.start",
             handle: "darkmux/coder",
             model: "qwen3.6-35b-a3b-turboquant-mlx",
             payload: {
@@ -67,7 +67,7 @@ async function mockSessionAndGoto(page: import("@playwright/test").Page, width: 
           {
             ts: "2026-09-08T21:45:29Z",
             session_id: SESSION_ID,
-            action: "dispatch complete",
+            action: "dispatch.complete",
             payload: { prompt_tokens: 1000, completion_tokens: 200, wall_ms: 29000 },
           },
         ],

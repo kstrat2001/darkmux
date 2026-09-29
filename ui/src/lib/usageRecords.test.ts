@@ -39,9 +39,23 @@ const golden: NormRecord[] = normAll(
   readFileSync(path.join(GOLDEN_DIR, "records.jsonl"), "utf8")
     .trim()
     .split("\n")
-    .map((l) => JSON.parse(l)),
+    .map((l) => JSON.parse(l) as RawRecord),
 );
-const expected = JSON.parse(readFileSync(path.join(GOLDEN_DIR, "expected.json"), "utf8"));
+/** The shape of a usage golden's expected.json, as far as these tests read it. */
+type GoldenTotals = { total: number; input: number; generated: number; cached?: number };
+interface UsageGolden {
+  overall: GoldenTotals;
+  excluding_utility: GoldenTotals;
+  usage_records: number;
+  legacy_completes_counted: number;
+  reported_entries: number;
+  by_purpose: Record<string, GoldenTotals>;
+  by_call_kind: unknown;
+  by_endpoint: unknown;
+  by_requested_model?: unknown;
+}
+
+const expected = JSON.parse(readFileSync(path.join(GOLDEN_DIR, "expected.json"), "utf8")) as UsageGolden;
 
 /** Group the golden's counted entries (usage records + legacy completes) by
  *  one payload field, `(none)` when an entry does not carry it: the
@@ -107,9 +121,9 @@ describe("the shared usage golden (tests/usage-golden)", () => {
       readFileSync(path.join(GOLDEN_DIR, recordsFile), "utf8")
         .trim()
         .split("\n")
-        .map((l) => JSON.parse(l)),
+        .map((l) => JSON.parse(l) as RawRecord),
     );
-    const exp = JSON.parse(readFileSync(path.join(GOLDEN_DIR, expectedFile), "utf8"));
+    const exp = JSON.parse(readFileSync(path.join(GOLDEN_DIR, expectedFile), "utf8")) as UsageGolden;
     const s = sumUsage(records);
     expect({ total: s.total, input: s.prompt, generated: s.completion, cached: s.cached }).toEqual(exp.overall);
     expect(s.usageRecords).toBe(exp.usage_records);

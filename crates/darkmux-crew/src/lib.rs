@@ -199,9 +199,38 @@ pub mod thermal_bands;
 // (#2110/#2109) Host-side thermal governor + breaker — see the module doc.
 pub mod thermal_governor;
 pub mod types;
+/// The crew library's user files through the unknown-key gate, and the
+/// preflight every work-starting entry point calls.
+pub mod user_files;
 // (#1959) A generic mission input: named sources materialized into a
 // read-only tree, filtered by include/exclude globs. Promoted out of the
 // crawl module's `CorpusManifest` — see the module doc for the descope
 // this packet states plainly (the crawl planner doesn't consume
 // `Materialized` yet).
 pub mod workspace_spec;
+
+/// A test's session: an ad-hoc dispatch `nonce` in a standalone test run.
+#[cfg(test)]
+pub(crate) fn test_session(nonce: &str) -> darkmux_types::session_id::SessionId {
+    darkmux_types::session_id::SessionId::adhoc(
+        darkmux_types::session_id::RunId::standalone("test").expect("a literal run id is never empty"),
+        "coder",
+        nonce,
+    )
+}
+
+/// A test's session in mission `mission`: an ad-hoc dispatch `nonce` there.
+#[cfg(test)]
+pub(crate) fn mission_test_session(mission: &str, nonce: &str) -> darkmux_types::session_id::SessionId {
+    darkmux_types::session_id::SessionId::adhoc(
+        darkmux_types::session_id::RunId::mission(mission).expect("a test's mission id is never empty"),
+        "coder",
+        nonce,
+    )
+}
+
+/// A test's mission run.
+#[cfg(test)]
+pub(crate) fn test_run() -> darkmux_types::session_id::RunId {
+    darkmux_types::session_id::RunId::mission("m-test").expect("a literal run id is never empty")
+}

@@ -12,6 +12,7 @@
 //! it directly at the sign-off gate; there is no longer a CLI verb over it.
 
 use anyhow::{Context, Result};
+use darkmux_types::session_id::SessionId;
 use serde::Serialize;
 use serde_json::Value;
 use std::path::Path;
@@ -26,35 +27,18 @@ pub(crate) fn build_review_record(
     stage: crate::flow::Stage,
     action: darkmux_flow::FlowAction,
     handle: String,
-    session_id: &str,
+    session: &SessionId,
     phase_id: Option<&str>,
 ) -> crate::flow::FlowRecord {
-    use crate::flow::ts_utc_now;
+    // Phase review records describe the review verb's lifecycle — they
+    // don't represent a single model's work (no `model`). The inner crew
+    // dispatch (`code-reviewer`) emits its own dispatch records with the
+    // model stamped.
     crate::flow::FlowRecord {
-        ts: ts_utc_now(),
-        level,
-        category,
         tier,
-        stage,
-        action,
-        handle,
         phase_id: phase_id.map(String::from),
         source: Some("phase_review".to_string()),
-        session_id: Some(session_id.to_string()),
-        // Phase review records describe the review verb's lifecycle —
-        // they don't represent a single model's work. The inner crew
-        // dispatch (`code-reviewer`) emits its own dispatch records via
-        // crew::dispatch::build_dispatch_record with model stamped.
-        model: None,
-        reasoning: None,
-        mission_id: None,
-        machine_id: None,
-        machine_uid: None,
-        prev_hash: None,
-        hash: None,
-        payload: None,
-        work_id: None,
-        attempt: None,
+        ..crate::flow::FlowRecord::for_session(session, level, category, stage, action, handle)
     }
 }
 
@@ -290,7 +274,7 @@ fn count_files_changed(path: &Path, base: &str) -> usize {
 fn verdict_record(
     verdict: &str,
     counts: String,
-    session_id: &str,
+    session: &SessionId,
     phase_id: Option<&str>,
 ) -> crate::flow::FlowRecord {
     let mut rec = build_review_record(
@@ -300,7 +284,7 @@ fn verdict_record(
         crate::flow::Stage::Review,
         darkmux_flow::FlowAction::PhaseReviewVerdict,
         counts,
-        session_id,
+        session,
         phase_id,
     );
     rec.payload = Some(serde_json::json!({ "verdict": verdict }));
@@ -315,7 +299,7 @@ fn verdict_record(
 /// Named separately so a test can drive the abort shape directly (#1413).
 fn phase_review_abort_record(
     branch: &str,
-    session_id: &str,
+    session: &SessionId,
     phase_id: Option<&str>,
 ) -> crate::flow::FlowRecord {
     build_review_record(
@@ -325,7 +309,7 @@ fn phase_review_abort_record(
         crate::flow::Stage::Review,
         darkmux_flow::FlowAction::PhaseReviewAborted,
         branch.to_string(),
-        session_id,
+        session,
         phase_id,
     )
 }
@@ -356,8 +340,12 @@ pub(crate) fn phase_review_output_at(
         })
         .unwrap_or_else(|| "unknown".to_string());
 
-    let session_id = darkmux_types::session_id::phase_review(
-        std::time::UNIX_EPOCH.elapsed().unwrap_or_default().as_secs(),
+    // The review IS a crew-of-one run of `code-reviewer` (its dispatch
+    // routes through `fleet::dispatch_routed`): its verb records and its
+    // dispatch share that run's session.
+    let session_id = crate::crew::dispatch_as_crew_of_one::dispatch_session(
+        "code-reviewer",
+        Some(format!("phase-review-{}", std::time::UNIX_EPOCH.elapsed().unwrap_or_default().as_secs())),
     );
 
     // (#1413) `phase.review.begin` / `phase.review.verdict` used to be plain
@@ -409,7 +397,7 @@ pub(crate) fn phase_review_output_at(
         let output = PhaseReviewOutput {
             branch: branch.clone(),
             base: base_ref.to_string(),
-            reviewer_session_id: Some(session_id.clone()),
+            reviewer_session_id: Some(session_id.wire()),
             diff_files_changed: 0,
             total_findings: 0,
             by_severity: SeverityCounts {
@@ -477,7 +465,7 @@ pub(crate) fn phase_review_output_at(
         timeout_override_seconds: None, // (#2480)
         role_id: "code-reviewer".to_string(),
         message: prompt,
-        session_id: Some(session_id.clone()),
+        session: session_id.clone(),
         timeout_seconds: 600,
         skip_preflight: false,
         // Phase review parses the SIGNOFF text from the dispatch's
@@ -520,7 +508,7 @@ pub(crate) fn phase_review_output_at(
         crate::flow::Tier::Local,
         crate::flow::Stage::Review,
         darkmux_flow::FlowAction::PhaseReviewDispatch,
-        session_id.clone(),
+        session_id.wire(),
         &session_id,
         phase_id,
     ));
@@ -560,7 +548,7 @@ pub(crate) fn phase_review_output_at(
     let output = PhaseReviewOutput {
         branch,
         base: base_ref.to_string(),
-        reviewer_session_id: Some(session_id.clone()),
+        reviewer_session_id: Some(session_id.wire()),
         diff_files_changed: files_changed,
         total_findings: signoff.block + signoff.flag + signoff.nit,
         by_severity: SeverityCounts {
@@ -842,7 +830,7 @@ mod tests {
             crate::flow::Stage::Review,
             darkmux_flow::FlowAction::PhaseReviewFailed,
             "openclaw exit 1".to_string(),
-            "phase-review-12345",
+            &crate::test_session("phase-review-12345"),
             Some("66"),
         );
 
@@ -854,7 +842,7 @@ mod tests {
         assert_eq!(json["action"], "phase.review.failed");
         assert_eq!(json["source"], "phase_review");
         assert_eq!(json["phase_id"], "66");
-        assert_eq!(json["session_id"], "phase-review-12345");
+        assert_eq!(json["session_id"], crate::test_session("phase-review-12345").wire());
     }
 
     #[serial_test::serial]
@@ -947,7 +935,7 @@ mod tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut sink = |r: crate::flow::FlowRecord| actions.push(r.action.to_string());
             let on_abort =
-                move |_id: &str, _kind: &str| phase_review_abort_record("main", "sess-1", Some("66"));
+                move |_id: &str, _kind: &str| phase_review_abort_record("main", &crate::test_session("sess-1"), Some("66"));
             let mut guard = crate::flow::BookendGuard::new(&mut sink, on_abort);
             guard.open(
                 "phase-review",
@@ -959,7 +947,7 @@ mod tests {
                     crate::flow::Stage::Review,
                     darkmux_flow::FlowAction::PhaseReviewBegin,
                     "main".to_string(),
-                    "sess-1",
+                    &crate::test_session("sess-1"),
                     Some("66"),
                 ),
             );

@@ -2037,6 +2037,7 @@ mod tests {
         assert!(record_via(&sink, &unknown).is_err());
         assert!(record_to(&sink, unknown).is_err());
         let mut retired = minimal_record();
+        // flow-action-guard:allow — a retired action the sink must refuse
         retired.action = crate::legacy::read_action("telemetry.process");
         assert!(matches!(retired.action, FlowAction::Retired(_)));
         assert!(record_via(&sink, &retired).is_err());

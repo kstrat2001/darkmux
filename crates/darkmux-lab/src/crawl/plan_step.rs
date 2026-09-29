@@ -145,7 +145,7 @@ impl StepKind for CrawlPlanStepKind {
         &PORTS
     }
 
-    fn run(&self, step: &Step, task: &Task, _input: &BTreeMap<String, String>) -> Result<StepOutcome> {
+    fn run(&self, step: &Step, task: &Task, _input: &BTreeMap<String, String>, _ctx: &StepRunCtx) -> Result<StepOutcome> {
         let cfg = PlanStepConfig::from_step(step)?;
         let out_path = match &cfg.plan_out {
             Some(p) => p.clone(),
@@ -396,7 +396,7 @@ mod tests {
             "plan_out": out.to_string_lossy(),
             "sizing": {"max_sites_per_unit": 7}
         }));
-        let outcome = CrawlPlanStepKind.run(&step, &task(), &BTreeMap::new()).unwrap();
+        let outcome = CrawlPlanStepKind.run(&step, &task(), &BTreeMap::new(), &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission("m-test").unwrap())).unwrap();
         assert_eq!(
             outcome.output,
             darkmux_crew::step_output::ref_output_string(&out),
@@ -425,7 +425,7 @@ mod tests {
         let step = step_with(serde_json::json!({
             "rule": "unnamed-predicate", "workspace": spec.to_string_lossy(), "plan_out": out.to_string_lossy()
         }));
-        let outcome = CrawlPlanStepKind.run(&step, &task(), &BTreeMap::new()).unwrap();
+        let outcome = CrawlPlanStepKind.run(&step, &task(), &BTreeMap::new(), &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission("m-test").unwrap())).unwrap();
         let err = darkmux_crew::step_output::Output::<Plan>::read(&outcome.output, "crawl.unit-outcome")
             .unwrap_err()
             .to_string();
@@ -441,7 +441,7 @@ mod tests {
         let step = step_with(serde_json::json!({
             "rule": "no-such-rule", "workspace": spec.to_string_lossy(), "plan_out": out.to_string_lossy()
         }));
-        let err = CrawlPlanStepKind.run(&step, &task(), &BTreeMap::new()).unwrap_err();
+        let err = CrawlPlanStepKind.run(&step, &task(), &BTreeMap::new(), &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission("m-test").unwrap())).unwrap_err();
         assert!(!out.exists(), "a refused plan writes nothing");
         let msg = format!("{err:#}");
         assert!(msg.contains("no-such-rule") && msg.contains("unnamed-predicate"), "{msg}");
@@ -463,7 +463,7 @@ mod tests {
         let step = step_with(serde_json::json!({
             "rule": "test-gap", "workspace": spec.to_string_lossy(), "plan_out": out.to_string_lossy()
         }));
-        let err = CrawlPlanStepKind.run(&step, &task(), &BTreeMap::new()).unwrap_err();
+        let err = CrawlPlanStepKind.run(&step, &task(), &BTreeMap::new(), &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission("m-test").unwrap())).unwrap_err();
         assert!(!out.exists(), "a refused plan writes nothing");
         let msg = format!("{err:#}");
         assert!(msg.contains("test-gap"), "{msg}");

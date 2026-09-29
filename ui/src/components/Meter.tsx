@@ -50,12 +50,12 @@ import { useCountUp } from "../hooks/useCountUp";
  * unchanged. Exported because `MachineHealthRegion.tsx` still needs `CX`
  * for the odometer layout it passes as `children`. */
 export const CX = 120;
-export const CY = 120;
-export const R = 86;
+const CY = 120;
+const R = 86;
 
 /** The half-circle track, drawn once and shared by every band/track path —
  * literally the VRAM dial's original constant. */
-export const HALF_ARC_D = `M 34 120 A ${R} ${R} 0 0 1 206 120`;
+const HALF_ARC_D = `M 34 120 A ${R} ${R} 0 0 1 206 120`;
 
 /** Track/band stroke width, in viewBox units — the VRAM dial's original. */
 const STROKE_W = 11;
@@ -76,7 +76,7 @@ const STROKE_W = 11;
 export const COMPACT_METER_WIDTH = 100;
 export const COMPACT_METER_HEIGHT = 70;
 
-export interface MeterGradient {
+interface MeterGradient {
   id: string;
   stops: Array<{ offset: number | string; color: string }>;
 }
@@ -118,7 +118,7 @@ export interface MeterTick {
 /** The default, plain numeral readout every compact CPU/GPU/MEM meter
  * uses — `now`/`avg`/`max` (or `high`, the drawer's own vocabulary; the
  * label under each number is the caller's to name via `numeralLabels`). */
-export interface MeterNumerals {
+interface MeterNumerals {
   now: number | null;
   avg: number | null;
   max: number | null;

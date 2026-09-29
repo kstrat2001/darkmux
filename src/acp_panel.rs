@@ -48,6 +48,7 @@ use crate::crew::mission_config::{self, LaunchParams, MissionConfig};
 use crate::crew::scheduler::SchedulerReport;
 use crate::crew::step_kinds::{Facts, FixedEstimator, StepKindRegistry};
 use crate::crew::types::{NodeStatus, Step, Task};
+use darkmux_types::session_id::{RunId, SessionId};
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -602,21 +603,14 @@ pub fn run_ephemeral(
     let facts = Facts::default();
     let est = FixedEstimator::default();
 
-    // (#1684 QA finding — MUST-FIX 4) A per-INVOCATION correlation id,
-    // backfilled onto every emitted flow record exactly the way
-    // `mission_launch.rs`'s `run_step_graph` call sites backfill their own
-    // minted `mission_id` (`record.mission_id.get_or_insert_with(...)`,
-    // never overwriting a record that already carries one — see
-    // `step_lifecycle_record`'s own doc in `darkmux-crew`'s scheduler for
-    // why the bare records carry NO mission_id and rely on the caller to
-    // backfill it). Without this, every ephemeral run of the SAME config
-    // shares one CONFIG-scoped `session_id` (`session_id::task` hashes
-    // only `step.task_id`) and no `mission_id` at all — two concurrent
-    // invocations collide in the viewer with nothing to tell them apart.
-    // This id is a FLOW-RECORD correlation label only — no mission
-    // instance is minted for it (rule D still holds: nothing under
-    // `<mission_id>/` is ever written).
-    let correlation_id = mint_ephemeral_correlation_id(&config.id);
+    // (#1684 QA finding — MUST-FIX 4) A per-INVOCATION run, the one every
+    // record of this ephemeral run carries (the scheduler mints its sessions
+    // in it). Without it, two concurrent invocations of the SAME config
+    // would collide in the viewer with nothing to tell them apart. It is a
+    // FLOW-RECORD correlation run only — no mission instance is minted for
+    // it (rule D still holds: nothing under `<mission_id>/` is ever
+    // written).
+    let correlation = RunId::mission(mint_ephemeral_correlation_id(&config.id))?;
 
     // (#1877 QA must-fix 1) A whole-run dispatch bookend, PRESCRIBED here
     // too — not just for `darkmux mission launch`. Before this, `run_
@@ -644,7 +638,7 @@ pub fn run_ephemeral(
         let _ = crate::flow::record(record);
     };
     let config_id_for_abort = config.id.clone();
-    let correlation_id_for_abort = correlation_id.clone();
+    let correlation_for_abort = correlation.clone();
     // `BookendGuard`'s Drop fires this `on_abort` closure for any exit
     // between `open()` below and a matching `close()` that this function
     // doesn't already reach explicitly — mirrors `launch`'s own bookend;
@@ -655,7 +649,7 @@ pub fn run_ephemeral(
             crate::flow::Level::Error,
             darkmux_flow::FlowAction::DispatchError,
             &config_id_for_abort,
-            &correlation_id_for_abort,
+            &correlation_for_abort,
             serde_json::json!({
                 "runtime": "ephemeral",
                 "result_class": "error",
@@ -670,7 +664,7 @@ pub fn run_ephemeral(
             crate::flow::Level::Info,
             darkmux_flow::FlowAction::DispatchStart,
             &config.id,
-            &correlation_id,
+            &correlation,
             serde_json::json!({ "runtime": "ephemeral" }),
         ),
     );
@@ -699,6 +693,7 @@ pub fn run_ephemeral(
     });
 
     let scheduler_result = crate::crew::scheduler::run_step_graph(
+        &correlation,
         &mut steps,
         &tasks,
         &registry,
@@ -710,24 +705,9 @@ pub fn run_ephemeral(
         // same change (see that accessor's own doc).
         darkmux_types::config_access::remote_concurrent_cap() as usize,
         &crate::crew::concurrent_dispatch::lms_host_factory,
-        &mut |mut record| {
-            record.mission_id.get_or_insert_with(|| correlation_id.clone());
-            // (#1918) Same fix, same reasoning, as `mission_launch.rs`'s
-            // identical `emit`-wrap: `session_id::task`/`session_id::step`
-            // carry no per-run identity of their own, so every ephemeral
-            // panel dispatch of the SAME document (e.g. every `pr-view`
-            // invocation sharing the reserved task id `__panel_args__`)
-            // collided on one `session_id` — the dominant collision case
-            // named in #1918's own report (49 missions, one session).
-            // Compose this run's own `mission_id` in, the same as `launch`
-            // does — see `darkmux_types::session_id::scope_to_run`.
-            if let Some(mid) = record.mission_id.clone() {
-                record.session_id = record.session_id.map(|sid| darkmux_types::session_id::scope_to_run(&sid, &mid));
-            }
-            // (#1877) Drain before emit — same interleaving discipline
-            // `launch`'s own emit closure uses, so telemetry streams
-            // alongside this run's other records rather than batching at
-            // the end (CLAUDE.md's "no blind runs" mandate).
+        // Every record already carries this run (`correlation`): the
+        // scheduler and every step kind mint their sessions in it.
+        &mut |record| {
             let _ = crate::flow::record(record);
         },
         &mut |_step: &Step| {
@@ -754,7 +734,7 @@ pub fn run_ephemeral(
                     crate::flow::Level::Error,
                     darkmux_flow::FlowAction::DispatchError,
                     &config.id,
-                    &correlation_id,
+                    &correlation,
                     serde_json::json!({
                         "runtime": "ephemeral",
                         "result_class": "error",
@@ -775,7 +755,7 @@ pub fn run_ephemeral(
                     crate::flow::Level::Error,
                     darkmux_flow::FlowAction::DispatchError,
                     &config.id,
-                    &correlation_id,
+                    &correlation,
                     serde_json::json!({
                         "runtime": "ephemeral",
                         "result_class": "error",
@@ -793,7 +773,7 @@ pub fn run_ephemeral(
             if outcome.success { crate::flow::Level::Info } else { crate::flow::Level::Error },
             if outcome.success { darkmux_flow::FlowAction::DispatchComplete } else { darkmux_flow::FlowAction::DispatchError },
             &config.id,
-            &correlation_id,
+            &correlation,
             serde_json::json!({
                 "runtime": "ephemeral",
                 "result_class": if outcome.success { "ok" } else { "error" },
@@ -809,7 +789,7 @@ pub fn run_ephemeral(
     // right"). Configs with no `cmd` (the ordinary case) never emit
     // this record at all.
     if let Some(verb) = config.cmd.as_deref() {
-        emit_cmd_audit(verb, args, cwd, gate_confirmed.get(), outcome.success, &correlation_id);
+        emit_cmd_audit(verb, args, cwd, gate_confirmed.get(), outcome.success, &correlation);
     }
 
     Ok(outcome)
@@ -835,30 +815,15 @@ pub fn run_ephemeral(
 /// of the raw args string, verbatim. darkmux core has no notion of what a
 /// PR number IS or whether the operator typed one; it only records what
 /// was typed after the slash command, exactly as `gh` itself received it.
-pub(crate) fn emit_cmd_audit(verb: &str, args: &str, cwd: &Path, gate_confirmed: Option<bool>, success: bool, correlation_id: &str) {
+pub(crate) fn emit_cmd_audit(verb: &str, args: &str, cwd: &Path, gate_confirmed: Option<bool>, success: bool, run: &RunId) {
     let pr = args.split_whitespace().next().map(str::to_string);
     let handle = match &pr {
         Some(pr) => format!("{verb} {pr}"),
         None => verb.to_string(),
     };
     let record = crate::flow::FlowRecord {
-        ts: crate::flow::ts_utc_now(),
-        level: if success { crate::flow::Level::Info } else { crate::flow::Level::Warn },
-        category: crate::flow::Category::Audit,
         tier: crate::flow::Tier::Operator,
-        stage: crate::flow::Stage::Review,
-        action: darkmux_flow::FlowAction::GhVerbExecuted,
-        handle,
-        phase_id: None,
-        session_id: None,
         source: Some("cmd-gate-audit".to_string()),
-        model: None,
-        reasoning: None,
-        mission_id: Some(correlation_id.to_string()),
-        machine_id: None,
-        machine_uid: None,
-        prev_hash: None,
-        hash: None,
         payload: Some(serde_json::json!({
             "verb": verb,
             "pr": pr,
@@ -866,8 +831,14 @@ pub(crate) fn emit_cmd_audit(verb: &str, args: &str, cwd: &Path, gate_confirmed:
             "confirmed": gate_confirmed,
             "success": success,
         })),
-        work_id: None,
-        attempt: None,
+        ..crate::flow::FlowRecord::for_session(
+            &SessionId::run(run.clone()),
+            if success { crate::flow::Level::Info } else { crate::flow::Level::Warn },
+            crate::flow::Category::Audit,
+            crate::flow::Stage::Review,
+            darkmux_flow::FlowAction::GhVerbExecuted,
+            handle,
+        )
     };
     let _ = crate::flow::record(record);
 }
@@ -1125,6 +1096,8 @@ mod tests {
             panel,
             cmd: None,
             outcome_from: None,
+            source_input: None,
+            ticket: None,
             extras: Map::new(),
         }
     }
@@ -1174,7 +1147,7 @@ mod tests {
         let kind = registry.get("procedural.shell").unwrap();
 
         let ran_in = |id: &str| {
-            let out = kind.run(&steps[id], &task, &BTreeMap::new()).unwrap();
+            let out = kind.run(&steps[id], &task, &BTreeMap::new(), &crate::crew::step_kinds::StepRunCtx::solo(crate::test_run())).unwrap();
             std::fs::canonicalize(out.output.trim()).unwrap()
         };
         // The behavioral claim first, so the mutation that reds this test
@@ -1660,7 +1633,7 @@ mod tests {
             mission_id.starts_with("acp-ephemeral-bookend-noop-test-"),
             "the bookend's mission_id must be the minted per-invocation correlation id: {mission_id}"
         );
-        assert_eq!(starts[0]["session_id"], serde_json::json!(mission_id));
+        assert_eq!(starts[0]["session_id"], serde_json::json!(format!("{mission_id}.run")));
         assert_eq!(completes[0]["mission_id"], serde_json::json!(mission_id));
         assert_eq!(completes[0]["payload"]["gate"], serde_json::Value::Null, "no coder-phase gate on this path");
 
@@ -1680,9 +1653,8 @@ mod tests {
     /// bucket on the reporting machine). Sibling of
     /// `mission_launch.rs`'s `two_launches_of_the_same_config_produce_
     /// distinct_step_lifecycle_session_ids` — same fix, same assertions,
-    /// proving the SAME `scope_to_run` composition applies at this
-    /// SEPARATE `run_step_graph` choke point (`run_ephemeral`'s own
-    /// `emit`-wrap), not just the generic `mission launch` path.
+    /// proving the run reaches this SEPARATE `run_step_graph` entry point
+    /// (`run_ephemeral`'s own), not just the generic `mission launch` path.
     #[test]
     #[serial_test::serial]
     fn two_ephemeral_runs_of_the_same_document_produce_distinct_step_lifecycle_session_ids() {

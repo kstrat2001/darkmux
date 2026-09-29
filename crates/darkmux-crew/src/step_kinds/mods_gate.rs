@@ -118,6 +118,7 @@ use crate::mods::{self, GateOutcome, ModRecord};
 use crate::step_kinds::registry::StepKindRegistry;
 use crate::step_kinds::types::{CwdPolicy, SeatClaim, StepKind, StepOutcome, StepRunCtx};
 use crate::types::{Step, Task};
+use darkmux_types::session_id::SessionScope;
 use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -181,8 +182,8 @@ impl StepKind for ModsGateStepKind {
 
     /// (#1979) No model work, no dispatch session — same opt-out
     /// `deliver.github_review`/`procedural.shell` use.
-    fn dispatch_session_id(&self, _step: &Step) -> Option<String> {
-        None
+    fn session_scope(&self) -> SessionScope {
+        SessionScope::None
     }
 
     /// (#2577 audit) `CwdPolicy::NoAmbientDependency` (the trait default,
@@ -196,7 +197,7 @@ impl StepKind for ModsGateStepKind {
         CwdPolicy::NoAmbientDependency
     }
 
-    fn run(&self, step: &Step, _task: &Task, _input: &BTreeMap<String, String>) -> Result<StepOutcome> {
+    fn run(&self, step: &Step, _task: &Task, _input: &BTreeMap<String, String>, _ctx: &StepRunCtx) -> Result<StepOutcome> {
         let for_key = step
             .config
             .get("for_key")
@@ -770,7 +771,7 @@ mod tests {
         mods::materialize(tmp.path(), &a_mod("mod-1", "sess-a/1")).unwrap();
 
         let outcome = ModsGateStepKind
-            .run(&step(json!({ "for_key": "sess-a/1" })), &task(), &BTreeMap::new())
+            .run(&step(json!({ "for_key": "sess-a/1" })), &task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test())
             .unwrap();
         let summary: serde_json::Value = serde_json::from_str(&outcome.output).unwrap();
         assert_eq!(summary["mods_seen"], 1);
@@ -812,6 +813,7 @@ mod tests {
                 })),
                 &task(),
                 &BTreeMap::new(),
+                &crate::step_kinds::StepRunCtx::for_test(),
             )
             .unwrap();
 
@@ -854,6 +856,7 @@ mod tests {
                 })),
                 &task(),
                 &BTreeMap::new(),
+                &crate::step_kinds::StepRunCtx::for_test(),
             )
             .unwrap();
         let elapsed = started.elapsed();
@@ -901,6 +904,7 @@ mod tests {
                 })),
                 &task(),
                 &BTreeMap::new(),
+                &crate::step_kinds::StepRunCtx::for_test(),
             )
             .unwrap();
 
@@ -948,6 +952,7 @@ mod tests {
                 })),
                 &task(),
                 &BTreeMap::new(),
+                &crate::step_kinds::StepRunCtx::for_test(),
             )
             .unwrap();
 
@@ -975,6 +980,7 @@ mod tests {
                 })),
                 &task(),
                 &BTreeMap::new(),
+                &crate::step_kinds::StepRunCtx::for_test(),
             )
             .unwrap();
         let rec = mods::load_at(mods_dir.path(), key).unwrap().unwrap();
@@ -1047,6 +1053,7 @@ mod tests {
                 &step(json!({ "for_key": "sess-a/1", "test_command": "true", "workdir": tree_root.to_string_lossy() })),
                 &task(),
                 &BTreeMap::new(),
+                &crate::step_kinds::StepRunCtx::for_test(),
             )
             .unwrap();
         let rec = mods::load_at(mods_dir.path(), "mod-src").unwrap().unwrap();
@@ -1097,6 +1104,7 @@ mod tests {
                 })),
                 &task(),
                 &BTreeMap::new(),
+                &crate::step_kinds::StepRunCtx::for_test(),
             )
             .unwrap();
 
@@ -1131,6 +1139,7 @@ mod tests {
                 })),
                 &task(),
                 &BTreeMap::new(),
+                &crate::step_kinds::StepRunCtx::for_test(),
             )
             .unwrap();
 
@@ -1164,6 +1173,7 @@ mod tests {
             })),
             &task(),
             &BTreeMap::new(),
+            &crate::step_kinds::StepRunCtx::for_test(),
         );
         assert!(result.is_ok(), "a non-applying kit is DATA, never a step failure: {result:?}");
 
@@ -1196,6 +1206,7 @@ mod tests {
                 })),
                 &task(),
                 &BTreeMap::new(),
+                &crate::step_kinds::StepRunCtx::for_test(),
             )
             .unwrap();
 
@@ -1224,6 +1235,7 @@ mod tests {
                 })),
                 &task(),
                 &BTreeMap::new(),
+                &crate::step_kinds::StepRunCtx::for_test(),
             )
             .unwrap();
 
@@ -1293,6 +1305,7 @@ mod tests {
                 })),
                 &task(),
                 &BTreeMap::new(),
+                &crate::step_kinds::StepRunCtx::for_test(),
             )
             .unwrap();
 
@@ -1318,7 +1331,7 @@ mod tests {
         .unwrap();
 
         let outcome = ModsGateStepKind
-            .run(&step(json!({ "for_key": "sess-a/4", "test_command": "false" })), &task(), &BTreeMap::new())
+            .run(&step(json!({ "for_key": "sess-a/4", "test_command": "false" })), &task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test())
             .unwrap();
         let summary: serde_json::Value = serde_json::from_str(&outcome.output).unwrap();
         assert_eq!(summary["mods_gated"], 0, "already gated — the second pass changes nothing");
@@ -1333,7 +1346,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let _guard = ModsDirGuard::set(tmp.path());
         let outcome =
-            ModsGateStepKind.run(&step(json!({ "for_key": "sess-a/nope" })), &task(), &BTreeMap::new()).unwrap();
+            ModsGateStepKind.run(&step(json!({ "for_key": "sess-a/nope" })), &task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         let summary: serde_json::Value = serde_json::from_str(&outcome.output).unwrap();
         assert_eq!(summary["mods_seen"], 0);
         assert_eq!(summary["mods_gated"], 0);
@@ -1342,7 +1355,7 @@ mod tests {
     #[test]
     #[serial_test::serial] // scopes DARKMUX_MODS_DIR, a process-global
     fn a_missing_for_key_is_refused_by_name() {
-        let err = ModsGateStepKind.run(&step(json!({})), &task(), &BTreeMap::new()).unwrap_err();
+        let err = ModsGateStepKind.run(&step(json!({})), &task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap_err();
         assert!(err.to_string().contains("for_key"), "{err}");
     }
 

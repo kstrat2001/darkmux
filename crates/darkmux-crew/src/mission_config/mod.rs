@@ -25,12 +25,14 @@
 //! [`MISSION_CONFIG_SCHEMA`]'s doc) once #1512's review dissolution moved
 //! the one real consumer to static per-role tasks.
 //!
-//! **Lenient-on-read (contract 7, `CLAUDE.md` "Cross-system contracts"):**
-//! every struct here carries `#[serde(flatten)] extras` overflow, optional
-//! fields stay `Option`, and an unrecognized field or a newer
-//! `schema_version` never fails PARSING. Semantic validation is the
-//! SEPARATE [`MissionConfig::validate`] pass — never invoked on the hot
-//! load path ([`load`] never calls it).
+//! **Loading never fails on an unknown key (contract 7, `CLAUDE.md`
+//! "Cross-system contracts"):** every struct here carries
+//! `#[serde(flatten)] extras` overflow, optional fields stay `Option`, and
+//! an unrecognized field or a newer `schema_version` never fails PARSING.
+//! An unknown key is refused where the document is consumed: the mission
+//! launch preflight and `darkmux doctor` (`crate::user_files`). Semantic
+//! validation is the SEPARATE [`MissionConfig::validate`] pass — never
+//! invoked on the hot load path ([`load`] never calls it).
 //!
 //! **Naming note.** This `MissionConfig` is a MISSION GRAPH document
 //! (phases/tasks/steps) — a completely different concept from the OPERATOR
@@ -84,8 +86,7 @@ use std::collections::{BTreeMap, BTreeSet};
 /// editor's agent panel — absence means the config stays launch-only
 /// (`darkmux mission launch <id>`), never
 /// panel-visible. `PanelConfig` itself carries `#[serde(flatten)] extras`
-/// overflow (contract 7), so a future sub-field is safe to add without
-/// another schema bump.
+/// overflow (contract 7), so a future sub-field is a minor bump.
 ///
 /// Bumped to **"2.0"** (#1550 cluster item 2) — a MAJOR bump, not minor:
 /// `TaskConfig::expand`/`ExpansionSpec`/`interpret::LaunchParams::expansions`
@@ -230,7 +231,29 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const MISSION_CONFIG_SCHEMA: &str = "3.5";
 
 /// One mission config document — the whole graph SHAPE, as data.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Why a mission config's `gh_verb` key is refused. One text for
+/// `MissionConfig::validate` and the unknown-key gate ([`retired_key`]).
+const GH_VERB_RETIRED: &str = "RENAMED to `cmd` in schema 3.0 (see MISSION_CONFIG_SCHEMA's doc): the key is \
+     ignored, so this config would run WITHOUT the allowlist gate it asked for. Rename the field to `cmd` and set \
+     `schema_version` to \"3.0\"; the allowlist it is checked against is now `cmd.allowed` (was `gh.allowed`)";
+
+/// Why a task's `expand` key is refused. One text for
+/// `MissionConfig::validate` and the unknown-key gate ([`retired_key`]).
+const EXPAND_RETIRED: &str = "REMOVED in schema 2.0 (see MISSION_CONFIG_SCHEMA's doc): the key is ignored, \
+     dropping the fan-out this document expected. Declare the expanded tasks explicitly instead, one TaskConfig \
+     per item (the built-in \"review\" config's probe stage is the reference shape, #1512)";
+
+/// A mission config's retired keys, by path (array indices dropped), for
+/// the unknown-key gate (`darkmux_types::user_files`).
+pub(crate) fn retired_key(path: &str) -> Option<String> {
+    match path {
+        "gh_verb" => Some(GH_VERB_RETIRED.to_string()),
+        "phases.tasks.expand" => Some(EXPAND_RETIRED.to_string()),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MissionConfig {
     pub id: String,
     pub name: String,
@@ -304,9 +327,19 @@ pub struct MissionConfig {
     /// GitHub comment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome_from: Option<String>,
+    /// (#815) The operator's verbatim words this mission came from, carried
+    /// onto the minted `Mission.source_input` (the coder phase briefs from
+    /// it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_input: Option<String>,
+    /// (#816) The tracker ticket this mission works, carried onto the minted
+    /// `Mission.ticket`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket: Option<String>,
     /// Forward-compat overflow — unknown top-level keys land here and
     /// re-serialize flat (a newer document read by an older binary).
     #[serde(flatten)]
+    #[schemars(skip)]
     pub extras: BTreeMap<String, serde_json::Value>,
 }
 
@@ -344,7 +377,7 @@ pub fn check_cmd(config: &MissionConfig) -> Option<String> {
 /// as a slash command (see `src/acp_panel.rs` in the `darkmux` binary
 /// crate, which enumerates the merged mission-config registry and filters
 /// on `panel.is_some()`).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PanelConfig {
     /// A short, UI-facing label for the command palette. `MissionConfig.
     /// description` is deliberately long-form dev prose (provenance,
@@ -378,6 +411,7 @@ pub struct PanelConfig {
     /// Lenient-on-read overflow (contract 7) — a future sub-field on this
     /// block is safe to add without another schema bump.
     #[serde(flatten)]
+    #[schemars(skip)]
     pub extras: BTreeMap<String, serde_json::Value>,
 }
 
@@ -493,7 +527,7 @@ pub fn inject_panel_args_task_if_referenced(config: &mut MissionConfig, args: &s
 /// yet; Packet 3 decides how a named input maps onto the composed
 /// `Task`/`Step` fields it feeds (workdir, role override, step config
 /// substitution, …).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MissionInput {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -546,6 +580,7 @@ pub struct MissionInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ignored_reason: Option<String>,
     #[serde(flatten)]
+    #[schemars(skip)]
     pub extras: BTreeMap<String, serde_json::Value>,
 }
 
@@ -559,7 +594,7 @@ pub struct MissionInput {
 /// automated Task/Step graph underneath): a duration-container phase
 /// ("wait for the trip") or a blog-post phase ("draft by hand, no
 /// dispatch"). `validate()` does not require `tasks` to be non-empty.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PhaseConfig {
     pub id: String,
     /// (#2299) `false` prunes this item at mint: it never exists in the run —
@@ -583,6 +618,7 @@ pub struct PhaseConfig {
     #[serde(default)]
     pub tasks: Vec<TaskConfig>,
     #[serde(flatten)]
+    #[schemars(skip)]
     pub extras: BTreeMap<String, serde_json::Value>,
 }
 
@@ -618,7 +654,7 @@ pub struct PhaseConfig {
 /// originally used, before that launcher was deleted, #2310 P4d) — writes
 /// them verbatim, no substitution. Each built-in config names which
 /// convention it uses in its own top-level `description`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TaskConfig {
     pub id: String,
     /// (#2299) `false` prunes this item at mint: it never exists in the run —
@@ -721,6 +757,7 @@ pub struct TaskConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grow: Option<GrowSpec>,
     #[serde(flatten)]
+    #[schemars(skip)]
     pub extras: BTreeMap<String, serde_json::Value>,
 }
 
@@ -758,7 +795,7 @@ pub struct TaskConfig {
 ///
 /// **Edges.** `depends_on`/`reads` declared on the template apply to every
 /// copy; copies never depend on each other, so a track fails alone.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct GrowSpec {
     /// Task id, in an EARLIER phase, whose last step output is the path to
     /// the JSON artifact to grow from.
@@ -772,6 +809,7 @@ pub struct GrowSpec {
     #[serde(default)]
     pub config: serde_json::Value,
     #[serde(flatten)]
+    #[schemars(skip)]
     pub extras: BTreeMap<String, serde_json::Value>,
 }
 
@@ -786,7 +824,7 @@ pub struct GrowSpec {
 /// mission-bespoke id (e.g. `"review.bundle"`, `"mission.worktree"`, #1352).
 /// `config` is kind-specific and opaque to this schema — mirrors
 /// `crew::types::Step.config`'s own flat `serde_json::Value` bag.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct StepConfig {
     pub id: String,
     pub kind: String,
@@ -819,6 +857,7 @@ pub struct StepConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate: Option<String>,
     #[serde(flatten)]
+    #[schemars(skip)]
     pub extras: BTreeMap<String, serde_json::Value>,
 }
 
@@ -917,14 +956,7 @@ impl MissionConfig {
             findings.push(ValidationFinding {
                 severity: FindingSeverity::Error,
                 path: "gh_verb".to_string(),
-                message: format!(
-                    "config \"{}\" declares `gh_verb`, which was RENAMED to `cmd` in schema 3.0 \
-                     (see MISSION_CONFIG_SCHEMA's doc) — this key now overflows into extras and \
-                     is silently ignored, so this config would run WITHOUT the allowlist gate it \
-                     asked for. Rename the field to `cmd` and set `schema_version` to \"3.0\"; \
-                     the allowlist it is checked against is now `cmd.allowed` (was `gh.allowed`)",
-                    self.id
-                ),
+                message: format!("config \"{}\" declares `gh_verb`, which was {GH_VERB_RETIRED}", self.id),
             });
         }
         if self.name.trim().is_empty() {
@@ -1286,15 +1318,7 @@ impl MissionConfig {
                     findings.push(ValidationFinding {
                         severity: FindingSeverity::Error,
                         path: format!("{task_path}.expand"),
-                        message: format!(
-                            "task \"{}\" declares `expand`, which was REMOVED in schema 2.0 \
-                             (see MISSION_CONFIG_SCHEMA's doc) — this key now overflows into \
-                             extras and is silently ignored, dropping the fan-out this document \
-                             expected. Declare the expanded tasks explicitly instead, one \
-                             TaskConfig per item (the built-in \"review\" config's probe stage \
-                             is the reference shape, #1512)",
-                            task.id
-                        ),
+                        message: format!("task \"{}\" declares `expand`, which was {EXPAND_RETIRED}", task.id),
                     });
                 }
 
@@ -1932,6 +1956,8 @@ mod tests {
             panel: None,
             cmd: None,
             outcome_from: None,
+            source_input: None,
+            ticket: None,
             extras: BTreeMap::new(),
         }
     }
@@ -2444,9 +2470,7 @@ mod tests {
         // (#1550 QA finding) An empty-extras task alone would not catch a
         // guard that fired on ANY extras key rather than on `expand`
         // specifically. Parsed through serde so the extras map is populated
-        // the way production populates it — `notes` is a real key the
-        // built-in review config carries on two tasks, so this is the shape
-        // that would actually regress.
+        // the way production populates it (any unknown key lands there).
         let with_other_extras: MissionConfig = serde_json::from_str(
             r#"{
                 "id": "t", "name": "T",

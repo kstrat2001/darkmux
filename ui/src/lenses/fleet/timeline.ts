@@ -65,6 +65,7 @@ import type { RunStatus } from "../../types/generated/RunStatus";
 import { DEFAULT_POLICY, endMs, lifecycleAt, spanOf, toRunState, type LifecyclePolicy, type Presence } from "../../lib/lifecycle";
 import { currentRun, runIndex, type RunGroup } from "../../lib/runRef";
 import { dispatchHash } from "../../lib/route";
+import { maxOf } from "../../lib/numbers";
 
 /** The live-only window presets (#1151) — minutes, matching legacy's
  * `[{l:'10m',m:10},{l:'1h',m:60},{l:'4h',m:240},{l:'24h',m:1440}]` verbatim.
@@ -79,7 +80,7 @@ export const ACTIVITY_WINDOW_PRESETS: { label: string; minutes: number }[] = [
 
 export const DEFAULT_ACTIVITY_WINDOW_MIN = 1440;
 
-export interface TimelineBar {
+interface TimelineBar {
   /** The session id — still the click-through target (`#dispatch=<sid>`,
    * `FleetLens.tsx`) and the `data-arg` shown to the operator, unchanged.
    * NOT guaranteed unique within a lane on its own (#2125) — a review
@@ -101,7 +102,7 @@ export interface TimelineBar {
   title: string;
 }
 
-export interface TimelineLane {
+interface TimelineLane {
   uid: string;
   name: string;
   bars: TimelineBar[];
@@ -127,7 +128,7 @@ export interface ActivityTimeline {
  * the `.lname` column to the longest machine name so short names don't leave
  * a fixed gap. Visual-only (no text-parity effect). */
 function labelWidthPx(uids: string[], data: NormRecord[], liveMachines: Map<string, PresenceBeat>, specs: SelfIdentity | null, roster: readonly RosterName[]): number {
-  const maxLen = uids.length ? Math.max(...uids.map((m) => displayNameOf(data, liveMachines, specs, m, roster).length)) : 8;
+  const maxLen = maxOf(uids.map((m) => displayNameOf(data, liveMachines, specs, m, roster).length)) ?? 8;
   return Math.round(Math.min(170, Math.max(54, maxLen * 7.4 + 10)));
 }
 

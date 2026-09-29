@@ -14,8 +14,7 @@
       "must_not_contain": ["FAILED"]
     },
     "expected": {
-      "fast_cluster_seconds": [15, 60],
-      "test_count_baseline": 5
+      "fast_cluster_seconds": [15, 60]
     }
   }
 }

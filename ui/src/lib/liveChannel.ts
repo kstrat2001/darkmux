@@ -32,7 +32,7 @@ import { ACTION, ingestRecord, recordsSince, type NormRecord } from "./ingest";
  */
 
 /** The wire shape `darkmux_flow::live::LiveSample` serializes to. */
-export interface LiveSampleWire {
+interface LiveSampleWire {
   v: number;
   kind: "model" | "utility";
   session_id?: string;
@@ -43,7 +43,7 @@ export interface LiveSampleWire {
   fields: Record<string, unknown>;
 }
 
-export const LIVE_WIRE_VERSION = 1;
+const LIVE_WIRE_VERSION = 1;
 
 /** Marks a record built from a live sample. Never set on a durable one. */
 export interface LiveRecordMark {
@@ -73,7 +73,7 @@ export const MAX_LIVE_PER_SESSION = 64;
 export const LIVE_SESSION_TTL_MS = 60_000;
 /** Utility edges are kept this long (a start past it has a stall bound the
  *  durable record carries anyway). */
-export const LIVE_UTILITY_TTL_MS = 15 * 60_000;
+const LIVE_UTILITY_TTL_MS = 15 * 60_000;
 
 function isoMs(ms: number): string {
   return new Date(ms).toISOString();
@@ -228,7 +228,7 @@ export const TRANSIENT_FRAME_MS = 32;
 export const MAX_TRANSIENT_FRAMES_PER_SESSION = 4;
 export const MAX_TRANSIENT_TRAIN = 12;
 /** How often idle entries are pruned while the store holds any (C9). */
-export const LIVE_PRUNE_EVERY_MS = 5_000;
+const LIVE_PRUNE_EVERY_MS = 5_000;
 
 interface SessionMode {
   mode: Mode;

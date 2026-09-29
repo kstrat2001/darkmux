@@ -19,11 +19,11 @@
 
 export const TUBE_MIN = 88;
 export const TUBE_MAX = 150;
-export const TUBE_WIDTH_SHARE = 0.45;
+const TUBE_WIDTH_SHARE = 0.45;
 /** The text column's floor beside a phone tube: the widest lines ("dispatch
  *  in flight", the hardware line) measure up to about 180px. */
-export const TEXT_RESERVE = 184;
-export const STACKED_SHARE = 0.55;
+const TEXT_RESERVE = 184;
+const STACKED_SHARE = 0.55;
 export const STACKED_MIN = 120;
 export const STACKED_MAX = 180;
 

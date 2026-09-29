@@ -709,7 +709,6 @@ dependencies = [
  "darkmux-trajectory",
  "darkmux-types",
  "dirs",
- "futures",
  "libc",
  "predicates",
  "redis",
@@ -719,10 +718,8 @@ dependencies = [
  "serial_test",
  "tempfile",
  "tokio",
- "tokio-stream",
  "tokio-util",
  "tower",
- "tower-http",
  "ureq",
 ]
 
@@ -742,6 +739,7 @@ dependencies = [
  "httpmock",
  "libc",
  "rusqlite",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "serial_test",
@@ -761,6 +759,7 @@ dependencies = [
  "darkmux-gestalt",
  "darkmux-hardware",
  "darkmux-heuristics",
+ "darkmux-lab",
  "darkmux-profiles",
  "darkmux-types",
  "dirs",
@@ -777,7 +776,6 @@ dependencies = [
  "darkmux-hardware",
  "darkmux-profiles",
  "darkmux-types",
- "dirs",
  "serde",
  "serde_json",
 ]
@@ -845,8 +843,10 @@ version = "4.0.0-rc.1"
 dependencies = [
  "darkmux-hardware",
  "darkmux-profiles",
+ "darkmux-types",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -864,6 +864,7 @@ dependencies = [
  "darkmux-types",
  "dirs",
  "regex",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "serial_test",
@@ -933,6 +934,7 @@ dependencies = [
  "darkmux-types",
  "dirs",
  "libc",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "serial_test",

@@ -8,6 +8,5 @@
   "required_files": [
     "src/parser.py",
     "tests/test_parser.py"
-  ],
-  "hash_exclude": ["__pycache__", ".pytest_cache"]
+  ]
 }

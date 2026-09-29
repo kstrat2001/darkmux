@@ -4,7 +4,23 @@
 
 use super::*;
 use darkmux_types::{BudgetPolicy, EndpointSource, ModelEndpoint, UsageLimits, UsageWindow};
+use darkmux_types::session_id::{RunId, SessionId};
 use std::cell::{Cell, RefCell};
+
+/// A caller in its own standalone test run: no mission to be stopped by.
+pub(crate) fn solo_caller() -> BudgetCaller<'static> {
+    caller_in(SessionId::adhoc(RunId::standalone("budget-test").unwrap(), "coder", "1"))
+}
+
+/// A task-seat caller in mission `mid`.
+pub(crate) fn mission_caller(mid: &str) -> BudgetCaller<'static> {
+    caller_in(SessionId::task(RunId::mission(mid).unwrap(), "probe"))
+}
+
+/// A caller under `session` (leaked: a test's caller lives for the test).
+fn caller_in(session: SessionId) -> BudgetCaller<'static> {
+    BudgetCaller { session: Box::leak(Box::new(session)), role_id: None, model: None, phase_id: None, profiles_file: None }
+}
 
 const T0: i64 = 1_790_000_000; // a fixed epoch second, the frozen "now"
 const DAY: i64 = 86_400;
@@ -89,6 +105,10 @@ impl FakeEnv {
     pub(crate) fn payload(&self, action: darkmux_flow::FlowAction) -> serde_json::Value {
         self.emitted.borrow().iter().find(|r| r.action == action).and_then(|r| r.payload.clone()).unwrap()
     }
+    /// The first record emitted with `action`.
+    pub(crate) fn record(&self, action: darkmux_flow::FlowAction) -> Option<darkmux_flow::FlowRecord> {
+        self.emitted.borrow().iter().find(|r| r.action == action).cloned()
+    }
 }
 
 impl BudgetEnv for FakeEnv {
@@ -106,7 +126,7 @@ impl BudgetEnv for FakeEnv {
     }
     fn stop_reason(&self, caller: &BudgetCaller<'_>) -> Option<String> {
         if self.disk_stops {
-            if let Some(r) = run_stop_reason(caller.mission_id, caller.phase_id) {
+            if let Some(r) = run_stop_reason(caller.session.mission_id(), caller.phase_id) {
                 return Some(r);
             }
         }
@@ -219,28 +239,29 @@ fn a_typo_in_limits_is_an_error_never_no_budget() {
 
 /// (review MF2) The reviewer's four misspelled-KEY probes, committed. Each
 /// used to disarm the budget silently (no window, the default policy, a
-/// dropped token budget); each is now an error naming the key and the
-/// nearest valid one, at the gate and in preflight's registry pass.
+/// dropped token budget). Each is now an unknown key in `profiles.json`,
+/// which every dispatching preflight refuses (`darkmux_types::user_files`),
+/// naming the key and the nearest valid one.
 #[test]
-fn a_misspelled_key_in_limits_is_an_error_naming_it() {
+fn a_misspelled_key_in_limits_is_an_unknown_key_naming_the_nearest() {
     let probes = [
-        (serde_json::json!({"windw": {"period": "1d", "tokens": 10}, "policy": "wait"}), "windw", "window"),
-        (serde_json::json!({"polcy": "wait", "window": {"period": "1d", "tokens": 10}}), "polcy", "policy"),
-        (serde_json::json!({"policy": "wait", "window": {"period": "1d", "tokns": 10, "calls": 400}}), "tokns", "tokens"),
-        (serde_json::json!({"policy": "wait", "window": {"tokns": 10}}), "tokns", "tokens"),
+        (serde_json::json!({"windw": {"period": "1d", "tokens": 10}, "policy": "wait"}), "limits.windw", "limits.window"),
+        (serde_json::json!({"polcy": "wait", "window": {"period": "1d", "tokens": 10}}), "limits.polcy", "limits.policy"),
+        (serde_json::json!({"policy": "wait", "window": {"period": "1d", "tokns": 10, "calls": 400}}), "limits.window.tokns", "limits.window.tokens"),
+        (serde_json::json!({"policy": "wait", "window": {"tokns": 10}}), "limits.window.tokns", "limits.window.tokens"),
     ];
     for (limits, key, nearest) in probes {
-        let err = EndpointBudget::of(&named(limits.clone())).expect_err(&format!("{limits} must not be Ok"));
-        assert!(err.contains(&format!("unknown key `{key}`")) && err.contains(&format!("did you mean `{nearest}`")), "{limits}: {err}");
-        let mut reg: darkmux_types::ProfileRegistry = serde_json::from_value(serde_json::json!({
+        let doc = serde_json::json!({
             "profiles": {"p": {"models": [{"id": "m", "endpoint": "azure"}]}},
             "endpoints": {"azure": {"url": "https://h.example/v1", "limits": limits}},
-        }))
-        .unwrap();
-        reg.materialize_endpoints();
-        let invalid = darkmux_types::config_enum::invalid_endpoint_limits(&reg);
-        assert_eq!(invalid.len(), 1, "{limits}: {invalid:?}");
-        assert!(invalid[0].problem.contains(key), "{:?}", invalid[0]);
+        });
+        let keys = darkmux_types::user_files::key_issues::<darkmux_types::ProfileRegistry>(&doc, &darkmux_types::user_files::no_retired);
+        let msgs: Vec<String> = keys.iter().map(ToString::to_string).collect();
+        assert_eq!(keys.len(), 1, "{limits}: {msgs:?}");
+        assert!(
+            msgs[0].contains(&format!("unknown key `endpoints.azure.{key}`: did you mean `endpoints.azure.{nearest}`?")),
+            "{limits}: {msgs:?}"
+        );
     }
     // A policy that governs nothing is named too.
     let err = EndpointBudget::of(&named(serde_json::json!({"policy": "wait"}))).unwrap_err();
@@ -309,7 +330,7 @@ fn a_wait_on_a_partial_window_names_its_floor() {
     for i in 1..=5 {
         env.records.borrow_mut().push((T0 - 100 + i, Spend::partial(400_000)));
     }
-    admit_with(budget(BudgetPolicy::Wait, Some(100_000), None, None), &BudgetCaller::default(), &env).unwrap();
+    admit_with(budget(BudgetPolicy::Wait, Some(100_000), None, None), &solo_caller(), &env).unwrap();
     let w = env.payload(darkmux_flow::FlowAction::BudgetWait);
     assert_eq!((w["spent"].as_u64(), w["unmetered_calls"].as_u64()), (Some(2_000_000), Some(5)), "{w}");
     assert!(w["message"].as_str().unwrap().contains("at least 2000000 of 100000"), "{w}");
@@ -324,7 +345,7 @@ fn a_calls_budget_is_never_unmetered() {
     let env = FakeEnv::new(vec![(T0 - 60, 10), (T0 - 50, 10)]);
     env.records.borrow_mut().push((T0 - 40, Spend::partial(0)));
     let b = budget(BudgetPolicy::Warn, None, Some(5), Some(0.5));
-    let caller = BudgetCaller::default();
+    let caller = solo_caller();
     admit_with(b.clone(), &caller, &env).unwrap();
     assert_eq!(env.actions().len(), 1, "3 of 5 calls: early");
     let p = env.payload(darkmux_flow::FlowAction::BudgetWarn);
@@ -344,7 +365,7 @@ fn an_early_warning_after_an_unmetered_one_is_still_said() {
     let env = FakeEnv::new(vec![]);
     env.records.borrow_mut().push((T0 - 60, Spend::partial(10)));
     let b = budget(BudgetPolicy::Warn, Some(1_000), None, Some(0.5));
-    let caller = BudgetCaller::default();
+    let caller = solo_caller();
     admit_with(b.clone(), &caller, &env).unwrap();
     assert_eq!(env.actions().len(), 1, "unmetered, under every threshold: said once");
     admit_with(b.clone(), &caller, &env).unwrap();
@@ -457,13 +478,13 @@ fn warn_at_warns_early_and_is_never_guessed() {
 #[test]
 fn the_warning_names_the_policy_it_runs_under() {
     let env = FakeEnv::new(vec![(T0 - 60, 900)]);
-    admit_with(budget(BudgetPolicy::Wait, Some(1_000), None, Some(0.8)), &BudgetCaller::default(), &env).unwrap();
+    admit_with(budget(BudgetPolicy::Wait, Some(1_000), None, Some(0.8)), &solo_caller(), &env).unwrap();
     let said = env.said.borrow()[0].clone();
     assert!(said.contains("policy wait: continuing; calls wait once the budget is reached"), "{said}");
     assert!(!said.contains("policy warn"), "{said}");
     assert_eq!(env.payload(darkmux_flow::FlowAction::BudgetWarn)["policy"], "wait");
     let env = FakeEnv::new(vec![(T0 - 60, 900)]);
-    admit_with(budget(BudgetPolicy::Warn, Some(1_000), None, Some(0.8)), &BudgetCaller::default(), &env).unwrap();
+    admit_with(budget(BudgetPolicy::Warn, Some(1_000), None, Some(0.8)), &solo_caller(), &env).unwrap();
     assert!(env.said.borrow()[0].contains("policy warn: continuing"), "{:?}", env.said.borrow());
 }
 
@@ -481,7 +502,7 @@ fn off_never_acts_even_if_evaluated() {
 fn warn_surfaces_the_breach_once_and_never_holds_the_call() {
     let env = FakeEnv::new(vec![(T0 - 60, 2_000)]);
     let b = budget(BudgetPolicy::Warn, Some(1_000), None, None);
-    let caller = BudgetCaller { session_id: Some("s1"), mission_id: Some("m1"), ..Default::default() };
+    let caller = mission_caller("m1");
     admit_with(b.clone(), &caller, &env).unwrap();
     admit_with(b.clone(), &caller, &env).unwrap();
     assert_eq!(env.slept_ms.get(), 0, "warn never waits");
@@ -490,7 +511,7 @@ fn warn_surfaces_the_breach_once_and_never_holds_the_call() {
     assert_eq!((p["spent"].as_u64(), p["limit"].as_u64(), p["level"].as_str()), (Some(2_000), Some(1_000), Some("at_limit")));
     assert!(env.said.borrow()[0].contains("continuing"), "{:?}", env.said.borrow());
     let rec = env.emitted.borrow()[0].clone();
-    assert_eq!((rec.session_id.as_deref(), rec.mission_id.as_deref()), (Some("s1"), Some("m1")), "lands on the run");
+    assert_eq!((rec.session_id.as_deref(), rec.mission_id.as_deref()), (Some("m1.task.probe"), Some("m1")), "lands on the run");
     // Spend leaves the window, then returns: a second crossing warns again.
     env.records.borrow_mut().clear();
     admit_with(b.clone(), &caller, &env).unwrap();
@@ -499,23 +520,25 @@ fn warn_surfaces_the_breach_once_and_never_holds_the_call() {
     assert_eq!(env.actions().len(), 2);
 }
 
-/// (6th review MF) A budget record lands on its RUN's session: a hosted
-/// step's caller carries the bare `task-<id>` session every mission from
-/// one config shares, and a record that bypasses `mission_launch`'s
-/// `scope_to_run` would let mission A's `budget.stop` close mission B's
-/// wait. Scoped here, once, for every budget record with a mission; a
-/// caller with no mission (a standalone dispatch) keeps its own id.
+/// A budget record lands on its caller's session, and so on its run: the
+/// wait and the stop a run's abort ends carry that run's session and
+/// mission; a caller in a standalone run carries no mission.
 #[test]
-fn budget_records_are_scoped_to_their_run() {
+fn budget_records_land_on_the_callers_run() {
     let env = FakeEnv::full_window().stopped_after(1, "mission `m-a` is aborted");
-    let caller = BudgetCaller { session_id: Some("task-probe"), mission_id: Some("m-a"), ..Default::default() };
-    let _ = admit_with(budget(BudgetPolicy::Wait, Some(1_000), None, None), &caller, &env);
-    let sids: Vec<Option<String>> = env.emitted.borrow().iter().map(|r| r.session_id.clone()).collect();
-    assert_eq!(sids, vec![Some("task-probe-m-a".to_string()); 2], "wait and stop, both on mission A's run");
+    let _ = admit_with(budget(BudgetPolicy::Wait, Some(1_000), None, None), &mission_caller("m-a"), &env);
+    let got: Vec<(Option<String>, Option<String>)> =
+        env.emitted.borrow().iter().map(|r| (r.session_id.clone(), r.mission_id.clone())).collect();
+    let on_a = (Some("m-a.task.probe".to_string()), Some("m-a".to_string()));
+    assert_eq!(got, vec![on_a.clone(), on_a], "wait and stop, both on mission A's run");
     let env = FakeEnv::new(vec![(T0 - 60, 2_000)]);
-    let solo = BudgetCaller { session_id: Some("dispatch-coder-1"), ..Default::default() };
-    admit_with(budget(BudgetPolicy::Warn, Some(1_000), None, None), &solo, &env).unwrap();
-    assert_eq!(env.emitted.borrow()[0].session_id.as_deref(), Some("dispatch-coder-1"), "no mission: unchanged");
+    admit_with(budget(BudgetPolicy::Warn, Some(1_000), None, None), &solo_caller(), &env).unwrap();
+    let rec = env.emitted.borrow()[0].clone();
+    assert_eq!(
+        (rec.session_id.as_deref(), rec.mission_id.as_deref()),
+        (Some("budget-test.solo.adhoc.coder.1"), None),
+        "a standalone run: no mission"
+    );
 }
 
 /// `wait` holds the call until the rolling window has room, says how
@@ -525,7 +548,7 @@ fn wait_holds_until_the_window_has_room_then_resumes() {
     // 1000 of 1000 spent; the only record leaves at T0 - 60 + DAY + 1.
     let env = FakeEnv::new(vec![(T0 - DAY + 90, 1_000)]);
     let b = budget(BudgetPolicy::Wait, Some(1_000), None, None);
-    admit_with(b, &BudgetCaller::default(), &env).unwrap();
+    admit_with(b, &solo_caller(), &env).unwrap();
     // Room at T0 + 90 (+1 s, the leave-at-exactly-t+period rule).
     assert!(env.now.get() >= T0 + 90 && env.now.get() <= T0 + 91, "{}", env.now.get());
     assert_eq!(env.paused_ms.get(), env.slept_ms.get(), "every waited ms is recorded as pause");
@@ -543,7 +566,7 @@ fn wait_holds_until_the_window_has_room_then_resumes() {
 fn a_stopped_run_ends_a_wait_and_nothing_is_sent() {
     let env = FakeEnv::new(vec![(T0 - 10, 1_000)]).stopped_after(2_000, "mission `m` is aborted");
     let b = budget(BudgetPolicy::Wait, Some(1_000), None, None);
-    let err = admit_with(b, &BudgetCaller::default(), &env).unwrap_err().to_string();
+    let err = admit_with(b, &solo_caller(), &env).unwrap_err().to_string();
     assert!(err.contains("mission `m` is aborted") && err.contains("nothing was sent"), "{err}");
     assert!(env.slept_ms.get() <= 2_500, "stopped within one slice: {}", env.slept_ms.get());
     assert_eq!(env.actions(), vec![darkmux_flow::FlowAction::BudgetWait, darkmux_flow::FlowAction::BudgetStop], "an announced wait records its stop");
@@ -573,7 +596,7 @@ fn an_aborted_mission_on_disk_stops_its_waiter_without_sending() {
     let aborted = run_stop_reason(Some("m1"), None);
     // The waiter itself, end to end on the real disk read.
     let env = FakeEnv::new(vec![(T0 - 10, 1_000)]).reading_disk_for_stops();
-    let caller = BudgetCaller { mission_id: Some("m1"), ..Default::default() };
+    let caller = mission_caller("m1");
     let res = admit_with(budget(BudgetPolicy::Wait, Some(1_000), None, None), &caller, &env);
     let live = LiveEnv.stop_reason(&caller);
     unsafe {
@@ -597,7 +620,7 @@ fn an_aborted_mission_on_disk_stops_its_waiter_without_sending() {
 #[test]
 fn an_abort_in_the_last_slice_of_a_wait_still_sends_nothing() {
     let env = FakeEnv::new(vec![(T0 - DAY + 12, 1_000)]).stopped_after(11_800, "mission `m` is aborted");
-    let err = admit_with(budget(BudgetPolicy::Wait, Some(1_000), None, None), &BudgetCaller::default(), &env)
+    let err = admit_with(budget(BudgetPolicy::Wait, Some(1_000), None, None), &solo_caller(), &env)
         .unwrap_err()
         .to_string();
     assert!(err.contains("mission `m` is aborted") && err.contains("nothing was sent"), "{err}");
@@ -610,7 +633,7 @@ fn an_abort_in_the_last_slice_of_a_wait_still_sends_nothing() {
 fn an_endpoint_removed_while_waiting_releases_it() {
     let env = FakeEnv::new(vec![(T0 - 10, 1_000)]);
     *env.reload_to.borrow_mut() = Some(None);
-    admit_with(budget(BudgetPolicy::Wait, Some(1_000), None, None), &BudgetCaller::default(), &env).unwrap();
+    admit_with(budget(BudgetPolicy::Wait, Some(1_000), None, None), &solo_caller(), &env).unwrap();
     assert_eq!(env.actions(), vec![darkmux_flow::FlowAction::BudgetWait, darkmux_flow::FlowAction::BudgetResume]);
 }
 
@@ -621,7 +644,7 @@ fn an_endpoint_removed_while_waiting_releases_it() {
 fn an_abort_and_a_removal_in_one_slice_still_send_nothing() {
     let env = FakeEnv::full_window().stopped_after(1, "mission `m` is aborted");
     *env.reload_to.borrow_mut() = Some(None);
-    let err = admit_with(budget(BudgetPolicy::Wait, Some(1_000), None, None), &BudgetCaller::default(), &env)
+    let err = admit_with(budget(BudgetPolicy::Wait, Some(1_000), None, None), &solo_caller(), &env)
         .unwrap_err()
         .to_string();
     assert!(err.contains("mission `m` is aborted") && err.contains("nothing was sent"), "{err}");
@@ -681,7 +704,7 @@ fn a_budget_switched_off_while_waiting_releases_it() {
     let env = FakeEnv::new(vec![(T0 - 10, 1_000)]);
     *env.reload_to.borrow_mut() = Some(None);
     let b = budget(BudgetPolicy::Wait, Some(1_000), None, None);
-    admit_with(b, &BudgetCaller::default(), &env).unwrap();
+    admit_with(b, &solo_caller(), &env).unwrap();
     assert!(env.slept_ms.get() <= 30_000, "released at the first re-read: {}", env.slept_ms.get());
     assert_eq!(env.actions(), vec![darkmux_flow::FlowAction::BudgetWait, darkmux_flow::FlowAction::BudgetResume]);
 }
@@ -693,7 +716,7 @@ fn a_budget_switched_off_while_waiting_releases_it() {
 fn a_zero_budget_built_directly_waits_until_raised() {
     let env = FakeEnv::new(vec![]);
     *env.reload_to.borrow_mut() = Some(Some(budget(BudgetPolicy::Wait, Some(5), None, None)));
-    admit_with(budget(BudgetPolicy::Wait, Some(0), None, None), &BudgetCaller::default(), &env).unwrap();
+    admit_with(budget(BudgetPolicy::Wait, Some(0), None, None), &solo_caller(), &env).unwrap();
     assert!(env.payload(darkmux_flow::FlowAction::BudgetWait)["resume_at"].is_null());
     let said = env.said.borrow()[0].clone();
     assert!(said.contains("until its window has room") && !said.contains("budget is 0"), "{said}");
@@ -708,7 +731,7 @@ fn a_step_under_warn_never_holds_and_warns_once_on_crossing() {
     let bucket = Mutex::new(crate::remote_budget::RemoteBudget::new(Some(1_000), StepBudgetPolicy::Warn));
     for _ in 0..3 {
         admit_step(&bucket, 4_096);
-        settle_step(&bucket, 4_096, 600, 1, "probe", &BudgetCaller::default(), &env);
+        settle_step(&bucket, 4_096, 600, 1, "probe", &solo_caller(), &env);
     }
     assert_eq!(env.slept_ms.get(), 0);
     assert_eq!(env.actions(), vec![darkmux_flow::FlowAction::BudgetWarn], "one warning, at the crossing");
@@ -742,7 +765,7 @@ fn the_pacer_pauses_through_the_pace_file_and_releases() {
     let dir = tempfile::tempdir().unwrap();
     let env = FakeEnv::new(vec![(T0 - DAY + 10, 1_000)]);
     let mut p = BudgetPacer::new(budget(BudgetPolicy::Wait, Some(1_000), None, None), None);
-    let c = BudgetCaller::default();
+    let c = solo_caller();
     let free = OtherPacing::default();
     let held = OtherPacing { pausing: true, duty_cycle: None };
     let ev = p.on_tick(0, dir.path(), &free, &c, &env);
@@ -774,7 +797,7 @@ fn the_pacer_release_keeps_a_thermal_duty_cycle() {
     let dir = tempfile::tempdir().unwrap();
     let env = FakeEnv::new(vec![(T0 - DAY + 10, 1_000)]);
     let mut p = BudgetPacer::new(budget(BudgetPolicy::Wait, Some(1_000), None, None), None);
-    let c = BudgetCaller::default();
+    let c = solo_caller();
     let duty = OtherPacing { pausing: false, duty_cycle: Some((15_000, "fair".into())) };
     assert!(matches!(p.on_tick(0, dir.path(), &duty, &c, &env), Some(PacerEvent::Paused { .. })));
     env.now.set(T0 + 11);
@@ -792,7 +815,7 @@ fn the_pacer_never_releases_a_stopped_run() {
     let dir = tempfile::tempdir().unwrap();
     let env = FakeEnv::new(vec![(T0 - DAY + 10, 1_000)]);
     let mut p = BudgetPacer::new(budget(BudgetPolicy::Wait, Some(1_000), None, None), None);
-    let c = BudgetCaller { mission_id: Some("m1"), ..Default::default() };
+    let c = mission_caller("m1");
     let free = OtherPacing::default();
     assert!(matches!(p.on_tick(0, dir.path(), &free, &c, &env), Some(PacerEvent::Paused { .. })));
     *env.stop.borrow_mut() = Some((0, "mission `m1` is aborted".into()));
@@ -813,7 +836,7 @@ fn a_stopped_run_with_a_full_window_is_held_and_stopped() {
     let dir = tempfile::tempdir().unwrap();
     let env = FakeEnv::new(vec![(T0 - 10, 1_000)]).stopped("the run was interrupted");
     let mut p = BudgetPacer::new(budget(BudgetPolicy::Wait, Some(1_000), None, None), None);
-    let ev = p.on_tick(0, dir.path(), &OtherPacing::default(), &BudgetCaller::default(), &env);
+    let ev = p.on_tick(0, dir.path(), &OtherPacing::default(), &solo_caller(), &env);
     assert!(matches!(ev, Some(PacerEvent::Stopped { .. })), "{ev:?}");
     assert_eq!(pace(dir.path())["pause"], true);
     // (5th review C6) No wait was announced, so no `budget.stop` either
@@ -829,7 +852,7 @@ fn the_pacer_under_warn_never_pauses() {
     let dir = tempfile::tempdir().unwrap();
     let env = FakeEnv::new(vec![(T0 - 10, 5_000)]);
     let mut p = BudgetPacer::new(budget(BudgetPolicy::Warn, Some(1_000), None, None), None);
-    assert_eq!(p.on_tick(0, dir.path(), &OtherPacing::default(), &BudgetCaller::default(), &env), None);
+    assert_eq!(p.on_tick(0, dir.path(), &OtherPacing::default(), &solo_caller(), &env), None);
     assert!(!crate::pace_file::path(dir.path()).exists());
     assert_eq!(env.actions(), vec![darkmux_flow::FlowAction::BudgetWarn]);
 }
@@ -841,7 +864,7 @@ fn the_pacer_reloads_from_the_commands_registry() {
     let dir = tempfile::tempdir().unwrap();
     let env = FakeEnv::new(vec![(T0 - DAY + 100, 1_000)]);
     let mut p = BudgetPacer::new(budget(BudgetPolicy::Wait, Some(1_000), None, None), Some("/x/profiles.json".into()));
-    let c = BudgetCaller::default();
+    let c = solo_caller();
     p.on_tick(0, dir.path(), &OtherPacing::default(), &c, &env);
     p.on_tick(PACER_RELOAD_MS, dir.path(), &OtherPacing::default(), &c, &env);
     assert_eq!(*env.reloaded_from.borrow(), vec![Some("/x/profiles.json".to_string())]);
@@ -929,10 +952,10 @@ fn a_day_file_rewritten_larger_is_read_again() {
 fn budget_messages_have_no_double_spaces() {
     use darkmux_types::config::StepBudgetPolicy;
     let env = FakeEnv::new(vec![(T0 - DAY + 90, 1_000)]);
-    let caller = BudgetCaller { mission_id: Some("m1"), ..Default::default() };
+    let caller = mission_caller("m1");
     admit_with(budget(BudgetPolicy::Wait, Some(1_000), None, None), &caller, &env).unwrap();
     admit_with(budget(BudgetPolicy::Warn, Some(10), None, None), &caller, &env).unwrap();
-    admit_with(budget(BudgetPolicy::Wait, Some(0), None, None), &BudgetCaller::default(), &FakeEnv::new(vec![]).stopped("x"))
+    admit_with(budget(BudgetPolicy::Wait, Some(0), None, None), &solo_caller(), &FakeEnv::new(vec![]).stopped("x"))
         .unwrap_err();
     let bucket = Mutex::new(crate::remote_budget::RemoteBudget::new(Some(1), StepBudgetPolicy::Warn));
     admit_step(&bucket, 1);
@@ -942,10 +965,12 @@ fn budget_messages_have_no_double_spaces() {
     let mut pacer = BudgetPacer::new(budget(BudgetPolicy::Wait, Some(1_000), None, None), None);
     pacer.on_tick(0, dir.path(), &OtherPacing::default(), &caller, &stop_env);
     env.said.borrow_mut().extend(stop_env.said.borrow().iter().cloned());
-    for e in ["2M", "windw"] {
-        let limits = if e == "2M" { serde_json::json!({"window": {"period": "1d", "tokens": "2M"}}) } else { serde_json::json!({"windw": {}}) };
-        env.said.borrow_mut().push(EndpointBudget::of(&named(limits)).unwrap_err());
-    }
+    let limits = serde_json::json!({"window": {"period": "1d", "tokens": "2M"}});
+    env.said.borrow_mut().push(EndpointBudget::of(&named(limits)).unwrap_err());
+    // A misspelled `limits` key is the unknown-key gate's message.
+    let typo = serde_json::json!({"endpoints": {"a": {"url": "https://h.example/v1", "limits": {"windw": {}}}}});
+    let keys = darkmux_types::user_files::key_issues::<darkmux_types::ProfileRegistry>(&typo, &darkmux_types::user_files::no_retired);
+    env.said.borrow_mut().extend(keys.iter().map(ToString::to_string));
     let mut messages: Vec<String> = env.said.borrow().clone();
     messages.extend(env.emitted.borrow().iter().filter_map(|r| r.payload.as_ref()?.get("message")?.as_str().map(str::to_string)));
     let err = EndpointBudget::of(&named(serde_json::json!({"window": {"period": "1d", "tokens": "2M"}}))).unwrap_err();

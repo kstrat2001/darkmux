@@ -42,11 +42,11 @@ mod tests {
     /// Write-or-assert. The whole point is that a shape change is LOUD, so the
     /// default path only ever compares; rewriting takes an explicit env var.
     fn golden(name: &str, value: &impl serde::Serialize) {
-        let json = serde_json::to_string_pretty(value).expect("wire type must serialize");
         let dir = fixture_dir();
         let path = dir.join(name);
 
         if std::env::var("DARKMUX_REGENERATE_FIXTURES").is_ok() {
+            let json = serde_json::to_string_pretty(value).expect("wire type must serialize");
             std::fs::create_dir_all(&dir).expect("creating the fixture dir");
             std::fs::write(&path, format!("{json}\n")).expect("writing the fixture");
             return;
@@ -60,14 +60,80 @@ mod tests {
             )
         });
 
+        // Compared as parsed JSON, not as text: two objects with the same keys
+        // and values are the same wire shape whatever order the keys print in.
+        let on_disk: serde_json::Value = serde_json::from_str(&on_disk)
+            .unwrap_or_else(|e| panic!("generated fixture `{}` is not JSON ({e})", path.display()));
+        let served = serde_json::to_value(value).expect("wire type must serialize");
         assert_eq!(
-            on_disk.trim(),
-            json.trim(),
+            on_disk,
+            served,
             "\n\nThe wire shape of `{name}` changed and its generated fixture did not.\n\
              Every Playwright spec built on this fixture is now feeding a shape the server\n\
              no longer produces — which renders as an empty page, not as a failed assertion.\n\n\
              Regenerate: DARKMUX_REGENERATE_FIXTURES=1 cargo test -p darkmux-serve wire_fixtures\n"
         );
+    }
+
+    /// (4.0) A pre-4.0 mission archive, as `/flow-mission/<id>` serves it.
+    ///
+    /// The day file holds raw 3.x records: step sessions spelled
+    /// `step-<id>` and, from FLOW 1.43.0, `step-<id>-<mission>`, with no
+    /// `payload.step_id` on the records that carry a step's tokens and turns.
+    /// The viewer never parses a session id, so the daemon names each step as
+    /// `payload.step_id` on the way out. `mission-lens-legacy-archive.spec.js`
+    /// feeds this served body to the lens and asserts the steps still show
+    /// their tokens and turns, so the pair pins the archive end to end.
+    #[tokio::test]
+    async fn flow_mission_legacy_archive_wire_shape() {
+        let served: serde_json::Value = serde_json::from_slice(&serve_legacy_archive().await).unwrap();
+        golden("flow-mission-legacy-archive.json", &served["records"]);
+    }
+
+    /// The daemon serves an archived record's keys in the order the archive
+    /// holds them, in every build of this crate. `serde_json` sorts object
+    /// keys unless its `preserve_order` feature is on, and a dependency of the
+    /// binary turns it on, so before the workspace declared it once the key
+    /// order on the wire depended on which crates were linked.
+    #[tokio::test]
+    async fn served_records_keep_the_archives_key_order() {
+        let body = String::from_utf8(serve_legacy_archive().await).unwrap();
+        let first = &body[body.find("\"records\"").expect("the body carries records")..];
+        let ts = first.find("\"ts\"").unwrap();
+        let level = first.find("\"level\"").unwrap();
+        let action = first.find("\"action\"").unwrap();
+        assert!(ts < level && level < action, "keys left the archive's order: {first}");
+    }
+
+    /// `/flow-mission/<id>` over a one-day archive of raw 3.x records, as
+    /// the served bytes.
+    async fn serve_legacy_archive() -> Vec<u8> {
+        use tower::ServiceExt;
+        let m = "review-1785400940-legacy";
+        let day = [
+            serde_json::json!({ "ts": "2026-08-20T09:00:00Z", "level": "info", "category": "work", "tier": "local", "stage": "dispatch", "action": "dispatch.start", "handle": "judge", "session_id": "step-judge-1", "mission_id": m, "source": "crew_dispatch", "payload": {} }),
+            serde_json::json!({ "ts": "2026-08-20T09:00:05Z", "level": "info", "category": "work", "tier": "local", "stage": "dispatch", "action": "dispatch.turn", "handle": "judge", "session_id": "step-judge-1", "mission_id": m, "source": "crew_dispatch", "payload": { "turn_seq": 4, "turns_so_far": 4 } }),
+            serde_json::json!({ "ts": "2026-08-20T09:00:06Z", "level": "info", "category": "telemetry", "tier": "local", "stage": "dispatch", "action": "telemetry.tokens", "handle": "judge", "session_id": "step-judge-1", "mission_id": m, "source": "tokens", "payload": { "total_tokens": 5000 } }),
+            serde_json::json!({ "ts": "2026-08-20T09:00:07Z", "level": "info", "category": "work", "tier": "local", "stage": "dispatch", "action": "dispatch.complete", "handle": "judge", "session_id": "step-judge-1", "mission_id": m, "source": "crew_dispatch" }),
+            serde_json::json!({ "ts": "2026-08-20T09:01:00Z", "level": "info", "category": "work", "tier": "local", "stage": "dispatch", "action": "dispatch.start", "handle": "verifier", "session_id": format!("step-verify-1-{m}"), "mission_id": m, "source": "crew_dispatch", "payload": {} }),
+            serde_json::json!({ "ts": "2026-08-20T09:01:04Z", "level": "info", "category": "work", "tier": "local", "stage": "dispatch", "action": "dispatch.turn", "handle": "verifier", "session_id": format!("step-verify-1-{m}"), "mission_id": m, "source": "crew_dispatch", "payload": { "turn_seq": 2, "turns_so_far": 2 } }),
+            serde_json::json!({ "ts": "2026-08-20T09:01:05Z", "level": "info", "category": "telemetry", "tier": "local", "stage": "dispatch", "action": "telemetry.tokens", "handle": "verifier", "session_id": format!("step-verify-1-{m}"), "mission_id": m, "source": "tokens", "payload": { "total_tokens": 18000 } }),
+            serde_json::json!({ "ts": "2026-08-20T09:01:06Z", "level": "info", "category": "work", "tier": "local", "stage": "dispatch", "action": "dispatch.complete", "handle": "verifier", "session_id": format!("step-verify-1-{m}"), "mission_id": m, "source": "crew_dispatch" }),
+        ];
+        let flows = tempfile::TempDir::new().unwrap();
+        let body: String = day.iter().map(|r| format!("{r}\n")).collect();
+        std::fs::write(flows.path().join("2026-08-20.jsonl"), body).unwrap();
+        let response = crate::build_router_local(flows.path().to_path_buf())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/flow-mission/{m}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap().to_vec()
     }
 
     /// A `/runs` row with every optional field POPULATED.

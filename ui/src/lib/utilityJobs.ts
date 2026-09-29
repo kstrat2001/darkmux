@@ -244,7 +244,7 @@ export function machineUtilityJob(records: readonly NormRecord[], nowMs: number)
 /** The latest utility model a machine's records name (a start's `model`, or
  *  a utility usage record's `requested_model`), for a machine whose own
  *  binding the viewer cannot ask (a fleet peer). `null` when none. */
-export function lastUtilityModel(records: readonly NormRecord[], nowMs: number): string | null {
+function lastUtilityModel(records: readonly NormRecord[], nowMs: number): string | null {
   let best: { atMs: number; model: string } | null = null;
   for (const r of records) {
     if (!isAsOf(r, nowMs)) continue;

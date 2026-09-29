@@ -16,6 +16,7 @@
 
 use crate::dispatch::DispatchResult;
 use crate::dispatch::DispatchOpts;
+use darkmux_types::session_id::SessionId;
 use crate::loader::{load_autonomous_dispatch_preamble, load_roles};
 use anyhow::{anyhow, bail, Context, Result};
 use std::fs;
@@ -1817,7 +1818,7 @@ pub struct DockerRunConfig {
     /// description's own example, which one seat copied onto six mods that
     /// linked to nothing. Not secret (it is already in the container name
     /// and on every flow record), so plain argv visibility is fine.
-    pub session_id: String,
+    pub session_id: SessionId,
     /// Resolved model name for the runtime CLI.
     pub model: String,
     /// Full system prompt (preamble + role prompt, specialist roles only).
@@ -2133,7 +2134,7 @@ pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
     // finding-key namespace on every dispatch, not only on a crawl — any
     // role with the `create_finding`/`create_mod` palette mints keys.
     args.push("--session-id".to_string());
-    args.push(config.session_id.clone());
+    args.push(config.session_id.wire());
     args.push("--system".to_string());
     args.push(config.system_prompt.clone());
     // (#1038) Role-declared output schema → runtime `--response-schema` →
@@ -2401,9 +2402,8 @@ impl<'a> DispatchBookendGuard<'a> {
     fn new(
         sink: &'a mut dyn darkmux_flow::BookendSink,
         role_id: String,
-        session_id: String,
+        session: SessionId,
         model: String,
-        mission_id: Option<String>,
         phase_id: Option<String>,
         // (#1959) Same provenance merge as every other record this
         // dispatch's flow-record surface emits — see `merge_record_context`'s
@@ -2425,9 +2425,8 @@ impl<'a> DispatchBookendGuard<'a> {
                 darkmux_flow::Level::Error,
                 darkmux_flow::FlowAction::DispatchError,
                 &role_id,
-                &session_id,
+                &session,
                 Some(&model),
-                mission_id.as_deref(),
                 phase_id.as_deref(),
                 Some(payload),
             )
@@ -3266,14 +3265,12 @@ pub(crate) fn parse_hosted_response(
 
 /// (#2902 step 1a) Emit one single-shot call's usage record through the
 /// process-wide sink — the same sink the bookends of `dispatch_remote` and
-/// `dispatch_local_single_shot` go through — with the SAME role, session,
-/// mission and phase those bookends carry, so the record joins its run
-/// (the savings hero keys runs on `(session_id, mission_id)`).
+/// `dispatch_local_single_shot` go through — with the SAME role, session
+/// and phase those bookends carry, so the record joins its run.
 fn emit_single_shot_usage(
     role_id: &str,
-    session_id: &str,
+    session: &SessionId,
     model: &str,
-    mission_id: Option<&str>,
     phase_id: Option<&str>,
     payload: serde_json::Value,
 ) {
@@ -3282,9 +3279,8 @@ fn emit_single_shot_usage(
         darkmux_flow::FlowAction::TelemetryTokens,
         crate::usage::USAGE_SOURCE,
         role_id,
-        session_id,
+        session,
         Some(model),
-        mission_id,
         phase_id,
         payload,
     ));
@@ -3304,9 +3300,8 @@ fn emit_single_shot_usage(
 /// `payload.result_class`/`payload.error`, not the record level.
 fn build_remote_record(
     role_id: &str,
-    session_id: &str,
+    session: &SessionId,
     model: &str,
-    mission_id: Option<&str>,
     phase_id: Option<&str>,
     action: darkmux_flow::FlowAction,
     payload: serde_json::Value,
@@ -3315,15 +3310,8 @@ fn build_remote_record(
         darkmux_flow::Level::Info,
         action,
         role_id,
-        session_id,
+        session,
         Some(model),
-        // (#1645) Was hardcoded `None` — every hosted/local-single-shot
-        // record went out unstamped even when `phase_id` resolved to a
-        // real mission, because this constructor never looked. Same
-        // resolution `resolve_mission_for_phase` gives the container path
-        // (#714); no caller threaded this before, now every caller of
-        // this shared builder does.
-        mission_id,
         phase_id,
         Some(payload),
     )
@@ -3385,10 +3373,7 @@ fn dispatch_remote(
 ) -> Result<DispatchResult> {
     let ep = &target.endpoint;
     let pm = &target.model;
-    let session_id = opts
-        .session_id
-        .clone()
-        .unwrap_or_else(|| crate::dispatch::fresh_session_id(&opts.role_id));
+    let session = &opts.session;
     let label = crate::target::endpoint_route_label(ep, &pm.id);
     eprintln!(
         "darkmux dispatch: runtime=direct (hosted) — endpoint: {label} — model={}",
@@ -3401,30 +3386,6 @@ fn dispatch_remote(
     let url = target.chat_url.clone();
     let auth = remote_auth_header(ep)?;
     let phase = opts.phase_id.as_deref();
-    // (#1645) Resolved once, same as the container path (#714) — every
-    // record this hosted arm emits below (start/error/complete) now
-    // carries the SAME mission_id, instead of the hardcoded `None` that
-    // used to bypass this lookup entirely on the remote branch.
-    let mission_id = crate::dispatch::resolve_mission_for_phase(phase);
-    // (#1645 fix-pass — same composition `dispatch_internal::dispatch`
-    // already applies, see that function's own comment on this exact
-    // call) `dispatch_opts_for` (the `dispatch.internal` StepKind's own
-    // opts builder) hands every unconfigured step the SAME config-derived
-    // `session_id::step(&step.id)` default regardless of which arm the
-    // resolved profile routes to — this hosted arm is one of the TWO
-    // routes into that default that never applied `scope_to_run` before
-    // this fix (`dispatch_local_single_shot` below is the other). Without
-    // it, two DIFFERENT missions launching the identical config's
-    // tool-less/hosted step emit the byte-identical session_id with
-    // DIFFERENT `mission_id`s now that this fix populates that field —
-    // worse than the pre-fix silence, since `is_ambiguous()` reads BOTH
-    // fields off the same session. A no-op for every session_id that
-    // doesn't start with `task-`/`step-` (a caller-chosen id, or
-    // `fresh_session_id`'s own form) — see `scope_to_run`'s own doc.
-    let session_id = match &mission_id {
-        Some(mid) => darkmux_types::session_id::scope_to_run(&session_id, mid),
-        None => session_id,
-    };
 
     // (#2902 step 5) The budgets, BEFORE any bookend is emitted: the
     // endpoint's rolling-window budget, then this dispatch's per-step cap (a
@@ -3443,16 +3404,14 @@ fn dispatch_remote(
     // in between (a stopped wait included), `SessionEmitter::drop` (#2344)
     // removes the presence key itself.
     let mut session_emitter = darkmux_flow::session_presence::spawn_session_emitter(
-        session_id.clone(),
+        session,
         Some(opts.role_id.clone()),
         Some(pm.id.clone()),
-        mission_id.clone(),
     );
     let budget_caller = crate::budget::BudgetCaller {
         role_id: Some(&opts.role_id),
-        session_id: Some(&session_id),
+        session,
         model: Some(&pm.id),
-        mission_id: mission_id.as_deref(),
         phase_id: phase,
         profiles_file: opts.config_path.as_deref(),
     };
@@ -3471,9 +3430,8 @@ fn dispatch_remote(
         let _ = darkmux_flow::record(r);
     };
     let role_id_for_abort = opts.role_id.clone();
-    let session_id_for_abort = session_id.clone();
+    let session_for_abort = session.clone();
     let model_for_abort = pm.id.clone();
-    let mission_id_for_abort = mission_id.clone();
     let phase_for_abort = phase.map(str::to_string);
     let label_for_abort = label.clone();
     let on_abort = move |_id: &str, _kind: &str| {
@@ -3481,9 +3439,8 @@ fn dispatch_remote(
             darkmux_flow::Level::Error,
             darkmux_flow::FlowAction::DispatchError,
             &role_id_for_abort,
-            &session_id_for_abort,
+            &session_for_abort,
             Some(&model_for_abort),
-            mission_id_for_abort.as_deref(),
             phase_for_abort.as_deref(),
             Some(serde_json::json!({
                 "runtime": "direct",
@@ -3502,9 +3459,8 @@ fn dispatch_remote(
         "dispatch",
         build_remote_record(
             &opts.role_id,
-            &session_id,
+            session,
             &pm.id,
-            mission_id.as_deref(),
             phase,
             darkmux_flow::FlowAction::DispatchStart,
             serde_json::json!({
@@ -3548,9 +3504,8 @@ fn dispatch_remote(
                 "dispatch",
                 build_remote_record(
                     &opts.role_id,
-                    &session_id,
+                    session,
                     &pm.id,
-                    mission_id.as_deref(),
                     phase,
                     darkmux_flow::FlowAction::DispatchError,
                     serde_json::json!({ "runtime": "direct", "endpoint": label, "wall_ms": wall_ms, "error": e.to_string() }),
@@ -3571,9 +3526,8 @@ fn dispatch_remote(
     // than its completion.
     emit_single_shot_usage(
         &opts.role_id,
-        &session_id,
+        session,
         &pm.id,
-        mission_id.as_deref(),
         phase,
         reply.usage_payload(
             crate::usage::CallKind::SingleShot,
@@ -3621,9 +3575,8 @@ fn dispatch_remote(
         "dispatch",
         build_remote_record(
             &opts.role_id,
-            &session_id,
+            session,
             &pm.id,
-            mission_id.as_deref(),
             phase,
             darkmux_flow::FlowAction::DispatchComplete,
             complete_payload,
@@ -3650,7 +3603,7 @@ fn dispatch_remote(
         exit_code: 0,
         stdout,
         stderr: String::new(),
-        session_id,
+        session_id: session.clone(),
         out_dir: None,
         trajectory: None,
     })
@@ -3717,7 +3670,7 @@ fn dispatch_remote(
 /// than adding speculative shape for a consumer that doesn't exist yet.
 pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> {
     // (#2947) Bad enum config refuses before anything, same as `dispatch`.
-    darkmux_profiles::preflight_with(darkmux_types::config_enum::Scope::Dispatch, opts.config_path.as_deref())?;
+    crate::user_files::preflight_with(darkmux_types::config_enum::Scope::Dispatch, opts.config_path.as_deref())?;
     darkmux_flow::daemon_probe::nudge_if_daemon_unreachable("dispatch");
     crate::dispatch::require_licensed_adjacent_ack(&opts.role_id)
         .context("licensed-adjacent role dispatch requires acknowledgment")?;
@@ -3830,38 +3783,23 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
         opts.allow_utility_model,
     )?;
 
-    let session_id = opts
-        .session_id
-        .clone()
-        .unwrap_or_else(|| crate::dispatch::fresh_session_id(&opts.role_id));
+    let session = &opts.session;
     let phase = opts.phase_id.as_deref();
-    // (#1645) Same resolution `dispatch_remote` and the container path use
-    // (#714) — this container-free local arm previously never looked.
-    let mission_id = crate::dispatch::resolve_mission_for_phase(phase);
-    // (#1645 fix-pass) Same composition `dispatch_remote` and
-    // `dispatch_internal::dispatch` both apply now — see either of those
-    // call sites' own comment for the full collision this closes.
-    let session_id = match &mission_id {
-        Some(mid) => darkmux_types::session_id::scope_to_run(&session_id, mid),
-        None => session_id,
-    };
 
     let mut flow_sink = |r: darkmux_flow::FlowRecord| {
         let _ = darkmux_flow::record(r);
     };
     let role_id_for_abort = opts.role_id.clone();
-    let session_id_for_abort = session_id.clone();
+    let session_for_abort = session.clone();
     let model_for_abort = model_id.clone();
-    let mission_id_for_abort = mission_id.clone();
     let phase_for_abort = phase.map(str::to_string);
     let on_abort = move |_id: &str, _kind: &str| {
         crate::dispatch::build_dispatch_record_with_payload(
             darkmux_flow::Level::Error,
             darkmux_flow::FlowAction::DispatchError,
             &role_id_for_abort,
-            &session_id_for_abort,
+            &session_for_abort,
             Some(&model_for_abort),
-            mission_id_for_abort.as_deref(),
             phase_for_abort.as_deref(),
             Some(serde_json::json!({
                 "runtime": "direct",
@@ -3877,9 +3815,8 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
         "dispatch",
         build_remote_record(
             &opts.role_id,
-            &session_id,
+            session,
             &model_id,
-            mission_id.as_deref(),
             phase,
             darkmux_flow::FlowAction::DispatchStart,
             serde_json::json!({
@@ -3901,10 +3838,9 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
     // ONLY interactive local-AI surface darkmux ships was also the one the
     // live fleet view could never show as running.
     let mut session_emitter = darkmux_flow::session_presence::spawn_session_emitter(
-        session_id.clone(),
+        session,
         Some(opts.role_id.clone()),
         Some(model_id.clone()),
-        mission_id.clone(),
     );
 
     let t0 = SystemTime::now();
@@ -3942,9 +3878,8 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
                 "dispatch",
                 build_remote_record(
                     &opts.role_id,
-                    &session_id,
+                    session,
                     &model_id,
-                    mission_id.as_deref(),
                     phase,
                     darkmux_flow::FlowAction::DispatchError,
                     serde_json::json!({ "runtime": "direct", "wall_ms": wall_ms, "error": e.to_string() }),
@@ -3959,9 +3894,8 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
     // override when set, else the configured `lmstudio_url`).
     emit_single_shot_usage(
         &opts.role_id,
-        &session_id,
+        session,
         &model_id,
-        mission_id.as_deref(),
         phase,
         reply.usage_payload(
             crate::usage::CallKind::SingleShot,
@@ -3996,9 +3930,8 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
         "dispatch",
         build_remote_record(
             &opts.role_id,
-            &session_id,
+            session,
             &model_id,
-            mission_id.as_deref(),
             phase,
             darkmux_flow::FlowAction::DispatchComplete,
             complete_payload,
@@ -4009,7 +3942,7 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
         exit_code: 0,
         stdout: reply.content,
         stderr: String::new(),
-        session_id,
+        session_id: session.clone(),
         out_dir: None,
         trajectory: None,
     })
@@ -4871,22 +4804,6 @@ fn tailer_endpoint_id(agentic: Option<&crate::target::Target>) -> Option<String>
     agentic.and_then(|t| t.endpoint.named_id().map(str::to_string))
 }
 
-/// The container path's session id: the caller's own, else
-/// `crew-dispatch-<role>-<unix_micros>-internal`, scoped to its mission run
-/// (#1918, see `dispatch`'s own comment at its use). One function so the
-/// early agentic-remote budget gate (#2902 step 5) and the records the
-/// dispatch emits later name the same session.
-fn internal_session_id(opts: &DispatchOpts, unix_micros: u128, mission_id: Option<&str>) -> String {
-    let session_id = opts
-        .session_id
-        .clone()
-        .unwrap_or_else(|| format!("crew-dispatch-{}-{unix_micros}-internal", opts.role_id));
-    match mission_id {
-        Some(mid) => darkmux_types::session_id::scope_to_run(&session_id, mid),
-        None => session_id,
-    }
-}
-
 pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // (#2947) Bad enum config refuses FIRST: before the daemon nudge, the
     // ack gate, any session id or flow record. Every host-side dispatch
@@ -4895,7 +4812,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // is the one place that covers them all. Deliberately NOT gated on
     // `opts.skip_preflight`: that flag skips the Docker/daemon probe, and a
     // bad config value is not a probe result that could be stale.
-    darkmux_profiles::preflight_with(darkmux_types::config_enum::Scope::Dispatch, opts.config_path.as_deref())?;
+    crate::user_files::preflight_with(darkmux_types::config_enum::Scope::Dispatch, opts.config_path.as_deref())?;
     // 0. Pre-flight: nudge the operator if the daemon isn't up. The
     //    dispatch will still write flow records to disk, but they
     //    won't be observable in the viewer until the daemon comes up.
@@ -4976,8 +4893,6 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // over, pausing the runtime through the pace file the way the thermal
     // governor does.
     if let Some(t) = &agentic_pm {
-        let mission_id = crate::dispatch::resolve_mission_for_phase(opts.phase_id.as_deref());
-        let session_id = internal_session_id(&opts, unix_micros, mission_id.as_deref());
         // (#2902 step 5 review) A held start is live work: a heartbeat while
         // the gate may wait (no bookend: contract 2 keeps those around model
         // work). Only for an endpoint that HAS a budget, the one case the
@@ -4986,19 +4901,17 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         // the container path's own emitter takes over from there.
         let _gate_beat = matches!(crate::budget::EndpointBudget::of(&t.endpoint), Ok(Some(_))).then(|| {
             darkmux_flow::session_presence::spawn_session_emitter(
-                session_id.clone(),
+                &opts.session,
                 Some(opts.role_id.clone()),
                 Some(t.model.id.clone()),
-                mission_id.clone(),
             )
         });
         crate::budget::admit_endpoint(
             &t.endpoint,
             &crate::budget::BudgetCaller {
                 role_id: Some(&opts.role_id),
-                session_id: Some(&session_id),
+                session: &opts.session,
                 model: Some(&t.model.id),
-                mission_id: mission_id.as_deref(),
                 phase_id: opts.phase_id.as_deref(),
                 profiles_file: opts.config_path.as_deref(),
             },
@@ -5322,38 +5235,10 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             .unwrap_or_default()
     );
 
-    // 3. Resolve session id. (`unix_micros` computed earlier, above — see
-    // the #2162 comment on the resume-checkpoint hoist for why.)
-    // (#714) Resolve the phase → mission once so every flow record this
-    // dispatch emits (start / turn / tool / compaction / complete / telemetry)
-    // carries `mission_id`/`phase_id` and groups under its mission in the
-    // observability view. Best-effort: None when this isn't a phase-bound
-    // dispatch. The router (dispatch.rs) returns here before its own phase
-    // wiring, so the internal path resolves it directly from `opts`.
-    let mission_id = crate::dispatch::resolve_mission_for_phase(opts.phase_id.as_deref());
-    // (#1918) `DispatchInternalStepKind::run` defaults an unconfigured
-    // step's `session_id` to `session_id::step(&step.id)` — a literal out
-    // of the mission config document, byte-identical across every launch
-    // of the same config, so a GENERIC config-launched mission's own
-    // agentic dispatch bookends (`dispatch start`/`dispatch.turn`/
-    // `dispatch.tool`/`dispatch complete`/telemetry — everything this
-    // function emits below, live) collided exactly like the scheduler's
-    // step-lifecycle bookends did. This is the SAME resolved `mission_id`
-    // this function already uses for those records' `mission_id` field
-    // (the comment above) — composing it into `session_id` too closes the
-    // collision for this producer, which streams its own records directly
-    // (bypassing `StepOutcome.flow_records`/`StepRunCtx::emit`, both of
-    // which the launcher's `emit`-wrap already scopes — see
-    // `darkmux_types::session_id::scope_to_run`'s doc for the full
-    // producer inventory). (#1645 fix-pass) NOT the only such producer any
-    // more: `dispatch_remote` and `dispatch_local_single_shot` (this same
-    // file) route around this function entirely for a remote-resolved
-    // profile, and both apply the identical composition at their own
-    // `mission_id` resolution site now — see either one's own comment. A
-    // no-op for crew-of-one's `{mission_id}-task`-embedded ids and
-    // coder-phase/review's explicit `mission-run-<…>` session — both
-    // already carry their own run identity.
-    let session_id = internal_session_id(&opts, unix_micros, mission_id.as_deref());
+    // 3. The session is the caller's (`opts.session`): it names this
+    // dispatch's run, so every record below carries that run with no
+    // lookup.
+    let session = opts.session.clone();
     let phase_id = opts.phase_id.clone();
 
     // (#2294) Consumer 3 of the preflight detection: a durable record.
@@ -5396,9 +5281,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
                 // the legacy spelling — a new record must not join them.
                 darkmux_flow::FlowAction::DispatchWorkdirGitUnavailable,
                 &opts.role_id,
-                &session_id,
+                &session,
                 Some(&model),
-                mission_id.as_deref(),
                 phase_id.as_deref(),
                 Some(serde_json::json!({
                     "issue": 2294,
@@ -5596,9 +5480,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     let mut bookend = DispatchBookendGuard::new(
         &mut dispatch_flow_sink,
         opts.role_id.clone(),
-        session_id.clone(),
+        session.clone(),
         model.clone(),
-        mission_id.clone(),
         phase_id.clone(),
         opts.record_context.clone(),
     );
@@ -5606,9 +5489,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         darkmux_flow::Level::Info,
         darkmux_flow::FlowAction::DispatchStart,
         &opts.role_id,
-        &session_id,
+        &session,
         Some(&model),
-        mission_id.as_deref(),
         phase_id.as_deref(),
         Some(dispatch_start_payload),
     ));
@@ -5627,10 +5509,9 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // drop` (#2344) now removes the key itself the same way `stop()` does,
     // rather than only halting the thread and leaving the TTL to age it out.
     let session_emitter = darkmux_flow::session_presence::spawn_session_emitter(
-        session_id.clone(),
+        &session,
         Some(opts.role_id.clone()),
         Some(model.clone()),
-        mission_id.clone(),
     );
 
     // 6. Spawn the docker container. Async via `spawn()` (vs the older
@@ -5646,7 +5527,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // [a-zA-Z0-9][a-zA-Z0-9_.-]*.
     let container_name = format!(
         "darkmux-dispatch-{}",
-        session_id
+        session
+            .wire()
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-' {
                 c
@@ -5858,7 +5740,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         image: run_image.clone(),
         role_id: opts.role_id.clone(),
         // (#2386) The SAME id `materialize_finding` keys stored findings by.
-        session_id: session_id.clone(),
+        session_id: session.clone(),
         model: model.clone(),
         system_prompt: system_prompt.clone(),
         output_schema: role.output_schema.clone(),
@@ -6073,10 +5955,9 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         // (#out-of-band) The trajectory now lands in the out-dir, not the
         // workspace. The tailer reads from there.
         host_out.clone(),
-        session_id.clone(),
+        session.clone(),
         opts.role_id.clone(),
         model.clone(),
-        mission_id.clone(),
         phase_id.clone(),
         step_id.clone(),
         Arc::clone(&inactivity_deadline),
@@ -6197,7 +6078,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     let (_sampler_stop_guard, sampler_handle) = spawn_guarded_sampler(
         &sampler_stop,
         opts.role_id.clone(),
-        session_id.clone(),
+        session.clone(),
         model.clone(),
         // (#1934) This dispatch's own declared compactor/utility model ids,
         // resolved earlier in this same function — threaded through so the
@@ -6207,7 +6088,6 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         // was staffing the compactor/utility exactly as declared.
         compaction.compactor_model.clone(),
         utility_model.clone(),
-        mission_id.clone(),
         phase_id.clone(),
         // (#2110/#2109) The thermal governor/breaker rides this same
         // sampler thread — it already reads `probe.sample().thermal` every
@@ -6540,9 +6420,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         level,
         action,
         &opts.role_id,
-        &session_id,
+        &session,
         Some(&model),
-        mission_id.as_deref(),
         phase_id.as_deref(),
         Some(dispatch_complete_payload),
     ));
@@ -6561,9 +6440,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         darkmux_flow::FlowAction::TelemetryRuntime,
         "runtime",
         &opts.role_id,
-        &session_id,
+        &session,
         Some(&model),
-        mission_id.as_deref(),
         phase_id.as_deref(),
         serde_json::json!({ "turns": trajectory_summary.fold.turns() }),
     ));
@@ -6580,7 +6458,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         exit_code,
         stdout,
         stderr,
-        session_id,
+        session_id: session,
         // Host path where the runtime's `.darkmux-runtime/` bookkeeping
         // landed (mounted at `/darkmux-out` in the container). Callers
         // that keep the run's artifacts (coding_task) copy them out of it
@@ -7416,10 +7294,9 @@ fn lock_deadline(deadline: &Mutex<Instant>) -> MutexGuard<'_, Instant> {
 fn spawn_guarded_tailer(
     stop_flag: &Arc<AtomicBool>,
     out_dir: PathBuf,
-    session_id: String,
+    session: SessionId,
     role_id: String,
     model: String,
-    mission_id: Option<String>,
     phase_id: Option<String>,
     step_id: Option<String>,
     inactivity_deadline: Arc<Mutex<Instant>>,
@@ -7442,10 +7319,9 @@ fn spawn_guarded_tailer(
     let handle = crate::concurrent_dispatch::spawn_detached_named(move || {
         run_tailer(
             out_dir,
-            session_id,
+            session,
             role_id,
             model,
-            mission_id,
             phase_id,
             step_id,
             stop,
@@ -7490,10 +7366,9 @@ fn run_tailer(
     // from the workspace so the tailer reads the runtime's own
     // bookkeeping, not the tree the agent is editing.
     out_dir: PathBuf,
-    session_id: String,
+    session: SessionId,
     role_id: String,
     model: String,
-    mission_id: Option<String>,
     phase_id: Option<String>,
     step_id: Option<String>,
     stop_flag: Arc<AtomicBool>,
@@ -7512,13 +7387,13 @@ fn run_tailer(
         .join("trajectory.jsonl");
     let mut state = TailerState::new(
         trajectory_path,
-        session_id,
+        session,
         role_id,
         model,
         inactivity_deadline,
         inactivity_secs,
     )
-    .with_mission(mission_id, phase_id)
+    .with_phase(phase_id)
     .with_step(step_id)
     .with_compaction_threshold(compaction_threshold)
     .with_compactor_model(compactor_model)
@@ -8167,11 +8042,10 @@ impl LmsTelemetryTracker {
 fn spawn_guarded_sampler(
     sampler_stop: &Arc<AtomicBool>,
     role_id: String,
-    session_id: String,
+    session: SessionId,
     model: String,
     compactor_model: Option<String>,
     utility_model: Option<String>,
-    mission_id: Option<String>,
     phase_id: Option<String>,
     host_out: PathBuf,
     record_context: Option<serde_json::Value>,
@@ -8185,11 +8059,10 @@ fn spawn_guarded_sampler(
         run_telemetry_sampler(
             stop,
             role_id,
-            session_id,
+            session,
             model,
             compactor_model,
             utility_model,
-            mission_id,
             phase_id,
             host_out,
             record_context,
@@ -8204,7 +8077,7 @@ fn spawn_guarded_sampler(
 fn run_telemetry_sampler(
     stop_flag: Arc<AtomicBool>,
     role_id: String,
-    session_id: String,
+    session: SessionId,
     model: String,
     // (#1934) This dispatch's own declared compactor/utility model ids —
     // `None` when this dispatch runs no compaction, or utility-model
@@ -8213,7 +8086,6 @@ fn run_telemetry_sampler(
     // loading logic.
     compactor_model: Option<String>,
     utility_model: Option<String>,
-    mission_id: Option<String>,
     phase_id: Option<String>,
     host_out: PathBuf,
     record_context: Option<serde_json::Value>,
@@ -8264,7 +8136,7 @@ fn run_telemetry_sampler(
         crate::thermal_governor::ladder_state_file_path_from_record_context(record_context.as_ref());
     let thermal_governor =
         crate::thermal_governor::ThermalGovernor::new(thermal_config)
-            .owned_by(mission_id.as_deref())
+            .owned_by(session.mission_id())
             .seeded_from_mission(thermal_ladder_state_file.as_deref());
     // (#2774 round-3 MF1) A `pause_at`/`resume_at` pair that leaves a tier
     // no usable band runs that tier not at all. `darkmux doctor` warns
@@ -8343,9 +8215,8 @@ fn run_telemetry_sampler(
             darkmux_flow::Level::Info,
             darkmux_flow::FlowAction::DispatchRest,
             &role_id,
-            &session_id,
+            &session,
             Some(&model),
-            mission_id.as_deref(),
             phase_id.as_deref(),
             Some(payload),
         ));
@@ -8356,9 +8227,8 @@ fn run_telemetry_sampler(
             action,
             source,
             &role_id,
-            &session_id,
+            &session,
             Some(&model),
-            mission_id.as_deref(),
             phase_id.as_deref(),
             payload,
         ));
@@ -8384,9 +8254,8 @@ fn run_telemetry_sampler(
                 level,
                 darkmux_flow::FlowAction::DispatchRest,
                 &role_id,
-                &session_id,
+                &session,
                 Some(&model),
-                mission_id.as_deref(),
                 phase_id.as_deref(),
                 Some(payload),
             ));
@@ -8551,9 +8420,8 @@ fn run_telemetry_sampler(
                             darkmux_flow::FlowAction::ThermalStopUnresolved,
                             "thermal",
                             &role_id,
-                            &session_id,
+                            &session,
                             Some(&model),
-                            mission_id.as_deref(),
                             phase_id.as_deref(),
                             payload,
                         ));
@@ -8670,9 +8538,8 @@ fn run_telemetry_sampler(
                             darkmux_flow::FlowAction::ThermalStopUnresolved,
                             "thermal",
                             &role_id,
-                            &session_id,
+                            &session,
                             Some(&model),
-                            mission_id.as_deref(),
                             phase_id.as_deref(),
                             payload,
                         ));
@@ -8737,9 +8604,8 @@ fn run_telemetry_sampler(
                         darkmux_flow::FlowAction::BatteryPauseUnsupported,
                         "battery",
                         &role_id,
-                        &session_id,
+                        &session,
                         Some(&model),
-                        mission_id.as_deref(),
                         phase_id.as_deref(),
                         payload,
                     ));
@@ -8760,9 +8626,8 @@ fn run_telemetry_sampler(
             };
             let caller = crate::budget::BudgetCaller {
                 role_id: Some(&role_id),
-                session_id: Some(&session_id),
+                session: &session,
                 model: Some(&model),
-                mission_id: mission_id.as_deref(),
                 phase_id: phase_id.as_deref(),
                 profiles_file: None,
             };
@@ -9038,13 +8903,12 @@ struct TailerState {
     /// (#2863) Turns whose generation time a `dispatch.turn` record already
     /// carried.
     generation_reported: std::collections::HashSet<u64>,
-    session_id: String,
+    session: SessionId,
     role_id: String,
     model: String,
     /// (#714) Mission/phase this dispatch belongs to (when phase-bound),
     /// stamped onto every per-event flow record so they group under the
     /// mission in the observability view. `None` for a one-off dispatch.
-    mission_id: Option<String>,
     phase_id: Option<String>,
     /// (#1483) The mission-graph step id this dispatch runs as, stamped into
     /// every live per-event flow record's payload (`dispatch.turn`,
@@ -9206,7 +9070,7 @@ fn runtime_rest_payload(
 impl TailerState {
     fn new(
         trajectory_path: PathBuf,
-        session_id: String,
+        session: SessionId,
         role_id: String,
         model: String,
         inactivity_deadline: Arc<Mutex<Instant>>,
@@ -9225,10 +9089,9 @@ impl TailerState {
             offset: 0,
             pending: Vec::new(),
             generation_reported: std::collections::HashSet::new(),
-            session_id,
+            session,
             role_id,
             model,
-            mission_id: None,
             phase_id: None,
             step_id: None,
             last_heartbeat_at: None,
@@ -9356,7 +9219,7 @@ impl TailerState {
     fn model_sample(&self, payload: serde_json::Value) -> darkmux_flow::live::LiveSample {
         let cadence = self.live.as_ref().map(|l| l.cadence_ms).unwrap_or(0);
         let mut s = darkmux_flow::live::LiveSample::new(darkmux_flow::live::LiveKind::Model, crate::usage::unix_ms_now(), cadence);
-        s.session_id = Some(self.session_id.clone());
+        s.session_id = Some(self.session.wire());
         s.role = Some(self.role_id.clone());
         s.model = Some(self.model.clone());
         if let serde_json::Value::Object(map) = payload {
@@ -9372,7 +9235,7 @@ impl TailerState {
     fn live_utility(&mut self, fields: serde_json::Value, model: Option<&str>) {
         let Some(live) = self.live.as_mut() else { return };
         let mut s = darkmux_flow::live::LiveSample::new(darkmux_flow::live::LiveKind::Utility, crate::usage::unix_ms_now(), live.cadence_ms);
-        s.session_id = Some(self.session_id.clone());
+        s.session_id = Some(self.session.wire());
         s.role = Some(COMPACTOR_ROLE.to_string());
         s.model = model.filter(|m| !m.is_empty()).map(str::to_string);
         if let serde_json::Value::Object(map) = fields {
@@ -9398,8 +9261,7 @@ impl TailerState {
     /// per-event flow records group under the mission. Builder-style so the
     /// `new`/`new_for_test` call sites (incl. unit tests) stay unchanged;
     /// only the production `run_tailer` opts in.
-    fn with_mission(mut self, mission_id: Option<String>, phase_id: Option<String>) -> Self {
-        self.mission_id = mission_id;
+    fn with_phase(mut self, phase_id: Option<String>) -> Self {
         self.phase_id = phase_id;
         self
     }
@@ -9437,7 +9299,7 @@ impl TailerState {
     #[cfg(test)]
     fn new_for_test(
         trajectory_path: PathBuf,
-        session_id: String,
+        session: SessionId,
         role_id: String,
         model: String,
     ) -> Self {
@@ -9454,10 +9316,9 @@ impl TailerState {
             offset: 0,
             pending: Vec::new(),
             generation_reported: std::collections::HashSet::new(),
-            session_id,
+            session,
             role_id,
             model,
-            mission_id: None,
             phase_id: None,
             step_id: None,
             last_heartbeat_at: None,
@@ -9767,13 +9628,13 @@ impl TailerState {
         // refused attempt can repeat its generation); the event's own ms `ts`
         // is the start time.
         self.compaction_attempts += 1;
-        let job_id = format!("{}:compaction:{}", self.session_id, self.compaction_attempts);
+        let job_id = format!("{}:compaction:{}", self.session, self.compaction_attempts);
         self.open_compaction = Some((job_id.clone(), c.ts));
         let mut payload = crate::usage::utility_start_payload(
             crate::usage::UtilityJobKind::Compaction,
             &job_id,
             &model,
-            Some(&self.session_id),
+            Some(&self.session.wire()),
             self.inactivity_secs,
             c.ts,
         );
@@ -9783,7 +9644,7 @@ impl TailerState {
         // never seen open.
         let mut live = payload.clone();
         live["event"] = serde_json::json!("start");
-        live["serves"] = serde_json::json!(self.session_id);
+        live["serves"] = serde_json::json!(self.session.wire());
         self.live_utility(live, Some(&model));
         self.emit_telemetry_as(
             COMPACTOR_ROLE,
@@ -10009,9 +9870,8 @@ impl TailerState {
             level,
             action,
             &self.role_id,
-            &self.session_id,
+            &self.session,
             Some(&self.model),
-            self.mission_id.as_deref(),
             self.phase_id.as_deref(),
             Some(payload),
         ));
@@ -10058,7 +9918,7 @@ impl TailerState {
             return;
         };
         let record = crate::findings::build_record(
-            &self.session_id,
+            &self.session.wire(),
             seq,
             darkmux_flow::ts_utc_now(),
             tool_name,
@@ -10072,7 +9932,7 @@ impl TailerState {
                 // this tailer emits carries. Top-level on the flow record, and
                 // deliberately not merged into `context` — that blob is the
                 // launcher's, verbatim.
-                mission_id: self.mission_id.clone(),
+                mission_id: self.session.mission_id().map(str::to_string),
                 phase_id: self.phase_id.clone(),
                 step_id: self.step_id.clone(),
             },
@@ -10208,7 +10068,7 @@ impl TailerState {
             kit,
             &attachments,
             crate::findings::Scope {
-                mission_id: self.mission_id.clone(),
+                mission_id: self.session.mission_id().map(str::to_string),
                 phase_id: self.phase_id.clone(),
                 step_id: self.step_id.clone(),
             },
@@ -10265,9 +10125,8 @@ impl TailerState {
             action,
             source,
             role_id,
-            &self.session_id,
+            &self.session,
             model,
-            self.mission_id.as_deref(),
             self.phase_id.as_deref(),
             payload,
         ));

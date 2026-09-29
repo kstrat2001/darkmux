@@ -21,8 +21,11 @@ darkmux-gestalt = { path = "../darkmux-gestalt" }
 # (#2916 stage 2) Fleet identity knowledge (roster names, presence, flow
 # history) lives in the fleet library now; doctor re-exports its types.
 darkmux-fleet = { path = "../darkmux-fleet" }
+# The unknown-key gate's doctor rows cover the lab's user files (workloads,
+# fixture manifests), whose types live in the lab crate.
+darkmux-lab = { path = "../darkmux-lab" }
 anyhow = "1.0"
-serde_json = "1.0"
+serde_json.workspace = true
 dirs = "5.0"
 
 [dev-dependencies]

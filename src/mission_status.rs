@@ -3636,6 +3636,7 @@ mod tests {
         // `StaleNoTerminal` is a genuine liveness judgment (a real session
         // existed and went stale), so abort stays a real option here.
         assert!(
+            // flow-action-guard:allow — the CLI verb, not an action
             hit.suggest.iter().any(|s| s.contains("mission abort")),
             "a genuinely stale session should still offer abort: {:?}",
             hit.suggest
@@ -3713,6 +3714,7 @@ mod tests {
             hit.detail
         );
         assert!(
+            // flow-action-guard:allow — the CLI verb, not an action
             hit.suggest.iter().any(|s| s.contains("mission abort")),
             "a positively recorded end is a reasonable abort case: {:?}",
             hit.suggest
@@ -4069,13 +4071,13 @@ mod tests {
                     let live = darkmux_flow::ts_utc_now();
                     let lines: Vec<String> = match fs {
                         MatrixFlow::NoRecords => Vec::new(),
-                        MatrixFlow::LiveSession => vec![rec("dispatch start", &live)],
-                        MatrixFlow::StaleOpenSession => vec![rec("dispatch start", old)],
+                        MatrixFlow::LiveSession => vec![rec("dispatch.start", &live)],
+                        MatrixFlow::StaleOpenSession => vec![rec("dispatch.start", old)],
                         MatrixFlow::RecordedEnd => {
-                            vec![rec("dispatch start", old), rec("session.end", old)]
+                            vec![rec("dispatch.start", old), rec("session.end", old)]
                         }
                         MatrixFlow::ErrorTerminal => {
-                            vec![rec("dispatch start", old), rec("dispatch error", old)]
+                            vec![rec("dispatch.start", old), rec("dispatch.error", old)]
                         }
                     };
                     if !lines.is_empty() {
@@ -4276,8 +4278,9 @@ mod tests {
             "{}",
             serde_json::json!({
                 "ts": "2024-01-01T09:00:00Z",
-                "action": "dispatch start",
+                "action": "dispatch.start",
                 "session_id": "crew-dispatch-coder-2682",
+                "mission_id": "dispatch-crashed-2682",
                 "handle": "coder",
             })
         )
@@ -4944,8 +4947,8 @@ mod tests {
             // `darkmux-serve`'s own suite.
             let ts = darkmux_flow::ts_utc_now();
             let fleet = vec![
-                flow_record("review-peer-1", "hub", "mission start", &ts, "s1"),
-                flow_record("review-peer-1", "hub", "mission close", &ts, "s1"),
+                flow_record("review-peer-1", "hub", "mission.start", &ts, "s1"),
+                flow_record("review-peer-1", "hub", "mission.close", &ts, "s1"),
             ];
             let known = std::collections::HashSet::new();
             let peer = peer_mission_runs(flows.path(), &fleet, &known);
@@ -4990,7 +4993,7 @@ mod tests {
             let flows = tempfile::tempdir().unwrap();
             let now = now_unix();
             let recent = chrono_like_ts(now.saturating_sub(5));
-            let fleet = vec![flow_record("review-peer-2", "peer-2", "mission start", &recent, "s2")];
+            let fleet = vec![flow_record("review-peer-2", "peer-2", "mission.start", &recent, "s2")];
             let known = std::collections::HashSet::new();
             let peer = peer_mission_runs(flows.path(), &fleet, &known);
             assert_eq!(peer.len(), 1, "{peer:?}");
@@ -5021,7 +5024,7 @@ mod tests {
             // green. A recent ts is what makes the assertion load-bearing
             // again.
             let ts = darkmux_flow::ts_utc_now();
-            let fleet = vec![flow_record("review-local-1", "hub", "mission start", &ts, "s1")];
+            let fleet = vec![flow_record("review-local-1", "hub", "mission.start", &ts, "s1")];
             let mut known = std::collections::HashSet::new();
             known.insert("review-local-1".to_string());
             let peer = peer_mission_runs(flows.path(), &fleet, &known);

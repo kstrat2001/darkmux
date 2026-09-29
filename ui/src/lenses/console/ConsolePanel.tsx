@@ -139,7 +139,6 @@ export function ConsolePanel({
         return next;
       });
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialPanelId, initialOpts]);
 
   const activeSelection: Readonly<Record<string, string>> = selections.get(panelId) ?? {};
@@ -632,7 +631,6 @@ function EnumToken({
       document.removeEventListener("keydown", handleKeyDown);
       document.removeEventListener("click", handleClick);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
   function onOptionKeyDown(e: ReactKeyboardEvent<HTMLLIElement>, v: string) {

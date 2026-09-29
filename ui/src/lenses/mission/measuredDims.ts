@@ -25,7 +25,7 @@
  */
 import type { Node, NodeChange } from "reactflow";
 
-export interface NodeDimensions {
+interface NodeDimensions {
   width: number;
   height: number;
 }
@@ -79,7 +79,7 @@ export function withMeasuredDimensions(nodes: Node[], dims: NodeDimensionsMap): 
  * from the container's own layout, not a second hardcoded constant here
  * that would drift from it; see `clampCanvasHeight`'s own doc, #2618).
  */
-export const MIN_VALID_CANVAS_PX = 1;
+const MIN_VALID_CANVAS_PX = 1;
 
 /**
  * (#2520, round 2 — #2618 CI regression) How tall the mission canvas's own

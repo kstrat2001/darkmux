@@ -26,8 +26,7 @@ vi.mock("./lenses/fleet/FleetLens", async (importOriginal) => {
       fleetLensProbe.enabled ? (
         <div data-testid="fleet-lens-probe" data-props={JSON.stringify(props)} />
       ) : (
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        <actual.FleetLens {...(props as any)} />
+        <actual.FleetLens {...(props as unknown as Parameters<typeof actual.FleetLens>[0])} />
       ),
   };
 });
@@ -170,7 +169,7 @@ describe("App", () => {
       </QueryClientProvider>,
     );
     await waitFor(() => expect(document.querySelector('[data-testid="fleet-lens-probe"]')).toBeInTheDocument());
-    const props = JSON.parse(document.querySelector('[data-testid="fleet-lens-probe"]')!.getAttribute("data-props")!);
+    const props = JSON.parse(document.querySelector('[data-testid="fleet-lens-probe"]')!.getAttribute("data-props")!) as { connected: unknown; lastContactMs: unknown };
     expect(props.connected).toBe(false);
     expect(typeof props.lastContactMs).toBe("number");
   });
@@ -1030,22 +1029,21 @@ describe("App", () => {
     await waitFor(() => expect(window.location.hash).toBe("#dispatch=crew-dispatch-coder-1788254029192466-0&dispatch.mission=m1"));
   });
 
-  it("(#2223) a generic-launch step drills into its emitter-default `step-<id>` dispatch session", async () => {
-    // `step-step-a` is the session `session_id::step` mints for a
-    // `dispatch.internal` step with no configured session — which is what
-    // EVERY generic `mission launch <config>` step rides. The fixture's
-    // dispatch bookends attest a real dispatch ran under it, so the tap
-    // must reach the detail view. (An earlier version of this test used
-    // the same fixture to pin the OPPOSITE behavior, mislabeled as "graph-
-    // minted" — the adversarial review caught that this shape is byte-for-
-    // byte a real generic-launch dispatch.)
-    mockMissionDispatchFixture("step-step-a");
+  it("(#2223) a generic-launch step drills into its own step session", async () => {
+    // `m1.step.step-a` is the session a `dispatch.internal` step dispatches
+    // under — what EVERY generic `mission launch <config>` step rides. The
+    // fixture's dispatch bookends attest a real dispatch ran under it, so
+    // the tap must reach the detail view. (An earlier version of this test
+    // pinned the OPPOSITE behavior, reading the session's spelling as
+    // "graph-minted"; dispatch evidence is the discriminator, never the
+    // session id's shape.)
+    mockMissionDispatchFixture("m1.step.step-a");
     window.location.hash = "#mission=m1";
     renderApp();
     await waitFor(() => expect(document.querySelector('[data-act="step-row"]')).not.toBeNull());
     await waitFor(() => expect(document.querySelectorAll(".eventlog__rec")).toHaveLength(2));
     fireEvent.click(document.querySelector('[data-act="step-row"]')!);
-    await waitFor(() => expect(window.location.hash).toBe("#dispatch=step-step-a&dispatch.mission=m1"));
+    await waitFor(() => expect(window.location.hash).toBe("#dispatch=m1.step.step-a&dispatch.mission=m1"));
   });
 
   it("(#2223) a step with records but NO dispatch evidence still scopes, never routing to an empty detail view", async () => {

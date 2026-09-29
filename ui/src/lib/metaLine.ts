@@ -19,15 +19,14 @@
 
 import { relAgoFrom } from "./format";
 import type { PresenceBeat } from "../types/handwritten";
-import { ACTION, timesOf, type NormRecord } from "./ingest";
+import { ACTION, latestByTime, type NormRecord } from "./ingest";
 
 /** How long ago the newest dispatch STARTED, as of `nowMs` ("" when none
  *  has, or the newest lies after `nowMs`). The idle headline and the ready
  *  parts both read it, so the two can never date "last dispatch" differently.
  */
 function lastDispatchAgo(data: NormRecord[], nowMs: number): string {
-  const starts = timesOf(data.filter((r) => r.action === ACTION.DispatchStart));
-  const last = starts.length ? Math.max(...starts) : null;
+  const last = latestByTime(data.filter((r) => r.action === ACTION.DispatchStart))?.tMs ?? null;
   const known = last != null && nowMs - last >= 0;
   return known ? relAgoFrom(nowMs, last as number) : "";
 }

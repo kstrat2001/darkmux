@@ -253,16 +253,63 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    the blocking instance and suggests; it never touches. This supersedes the #408-derived
    preflight behavior of reusing/unloading foreign residents.
 5. **Schema versioning** — flow/rules/config/profiles data shapes change only through their
-   documented semver rules; consumers are lenient-on-read, loud in doctor.
+   documented semver rules. Flow-archive readers are lenient-on-read; user files follow
+   contract 7.
 6. **Frozen model-facing text** — measured prompts/personas live in ONE artifact with golden
    tests generated from the reference implementation; assembly and request bodies are
    byte-locked (#1256). "Frozen" means one hash, not one intention.
-7. **Config leniency** — registries and config files are lenient-on-read: one bad value never
-   fails the whole-file parse, so it can never discard the other settings. Semantic validation
-   lives at resolution/consumption time and in `darkmux doctor`, never on the hot load path
-   (#1269). Lenient READING is not lenient CONSUMING: a value that fails validation is refused
-   where it is consumed and named by doctor, never quietly replaced by a default. For enum-valued
-   settings that rule is contract 9.
+7. **User files: unknown keys are refused** — a user file is a JSON document the operator
+   writes and darkmux reads at run time: `config.json`, `profiles.json`, role / skill / crew
+   manifests, mission configs, rule files, workload documents, lab fixture manifests, and a
+   crawl's workspace spec (`darkmux_types::user_files::UserFileKind` is the set). None of
+   them is compile-time. A key a file's schema does not know, a typo or a key an older or
+   newer darkmux spelled differently, is bad config. **Loading never crashes on it**: the
+   typed load survives (a `#[serde(flatten)] extras` overflow catches the key, so one typo
+   never discards the rest of the file), and `darkmux doctor` still runs against a file that
+   is not even JSON. **Consuming refuses**: every entry point that consumes the file refuses
+   at preflight, before minting anything, and doctor reports it as Fail, one row per file.
+   A preflight refuses only over a file the operation would load: the effective copy of each
+   mission config and workload id (a copy another tier shadows never loads), and the one lab
+   fixture the run's workload binds. Doctor fails every file, and says when one is shadowed
+   or only read by a run that binds it.
+   Both name the file, the key's dotted path and the closest valid key (the same shape as
+   contract 9's enum refusal); a retired key names what replaced it instead of a guess.
+   **A value of the wrong type, or a missing required key, is refused the same way**, naming the path, the expected
+   type and what it got: one such value fails the whole typed load, which for `config.json`
+   means every setting falls back to its default (Redis and audit silently off) and for a
+   user role, skill or rule means the builtin of the same id silently stands in. The
+   registry is the one exception: it already quarantines a mistyped profile or endpoint
+   entry by name (#1282), loudly, so the gate leaves that to it.
+   `darkmux config set` refuses an unknown key through the same suggester. Semantic
+   validation of a known key's VALUE still lives at resolution and in doctor, never on the
+   load path (#1269), and a value that fails it is refused where it is consumed, never
+   replaced by a default; for enum-valued settings that rule is contract 9. Only readers of
+   append-only flow archives stay lenient.
+
+   The mechanism is one module, `darkmux-types/src/user_files.rs`: each kind's valid keys
+   are its Rust type's derived JSON schema (`schemars::JsonSchema`), walked against the raw
+   document, so a new field is valid the moment it exists and no key list can drift; nested
+   blocks, list items, map values and enum variants are walked too, and each value is checked
+   against the schema's type, integer range, enum tokens and variant tags. The `extras` overflow is
+   `#[schemars(skip)]` (it catches keys, it does not validate them); a flattened map that IS
+   the schema (a hook rule's `match`) stays open, and each kind's `open_objects` test pins
+   that set. `_comment` is valid in any struct-shaped object, as a note for the reader; inside
+   a map it is an entry and is checked as one. A missing required key is refused too. The
+   structural guard is `whatever_the_gate_passes_the_typed_load_accepts`: for every shipped
+   template and example, and variants inserting `_comment`, an unknown key, or a value of
+   each JSON type at every level, a document the gate passes must load with serde. `closest` is the only
+   "did you mean" in darkmux. The preflight chain is `config_enum::preflight` (config.json)
+   inside `darkmux_profiles::preflight_with` (the registry) inside
+   `darkmux_crew::user_files::preflight_with` (roles, skills, mission configs, rules), which
+   every dispatch, mission launch, radio and ACP entry point calls; `darkmux_lab::user_files::
+   preflight_with` adds workloads and fixtures for a lab run. Conformance: each owning
+   crate's `user_files` tests (an unknown top-level key, an unknown nested key and a near-miss
+   per kind, refused at every consuming scope and at no other), `every_shipped_template_file_
+   has_no_unknown_keys` (everything under `templates/builtin/` plus both example files), and
+   `tests/cli.rs`'s `an_unknown_key_in_a_user_file_is_refused_by_every_consuming_entry_point`.
+   A crawl's workspace spec has no fixed location: the mission-launch preflight checks the
+   spec a launch input names (`"workspace": "{{<input>}}"` in a step) before minting, and
+   `WorkspaceSpec::load` checks it again in the plan step.
 8. **Work-unit vocabulary** — the four operator-visible work nouns each denote ONE grain,
    and every surface (CLI verb, hash route, wire type, UI label, doc) uses them at that grain
    (#1974). The containment ladder is **mission > phase > task > step > role execution**:
@@ -309,11 +356,13 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
      (what the work is done to), review's **seats** (which staffed model does it), and
      **draws** (one invocation, `MemberRecord.draws`). They all bottom out in one model call,
      which is what `dispatch` already means.
-   - **session** — INTERNAL ONLY: a join key tying a family of flow records together
-     (`darkmux-types/src/session_id.rs`). Never an operator-facing word, because it is also
-     minted for mission lifecycle transitions that are not executions at all
-     (`session_id::mission()`). The `session_id` FIELD keeps its name on disk — renaming it
-     strands every archive, and consumers already treat it opaquely.
+   - **session** — INTERNAL ONLY: a join key tying a family of flow records together,
+     typed as `SessionId { kind, run }` (`darkmux-types/src/session_id.rs`): no session
+     exists without its run, `wire()` is its only string form, and pre-4.0 strings read
+     only through `SessionId::parse_legacy`. Never an operator-facing word, because it is
+     also minted for mission lifecycle transitions that are not executions at all (the
+     run's own session, `SessionKind::Run`). The `session_id` FIELD keeps its name on
+     disk — renaming it strands every archive.
 
    Two consequences that new code inherits:
 
@@ -340,16 +389,23 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    wire string lives in exactly one place: `crates/darkmux-flow/src/action.rs`. Producers
    build the enum; no constructor, builder or helper takes an action as a string, and
    `FlowAction`'s public deserializer refuses an unknown or retired action. Consumers match
-   on the enum, never on a string. The pre-4.0 spellings (`dispatch start`, `step result`,
+   on the enum, never on a string.
+   <!-- flow-action-guard:allow-start — names the old spellings to say where they live -->
+   The pre-4.0 spellings (`dispatch start`, `step result`,
    `mission close`, `note`, `verdict: <v>`, `sprint *`, ...) live only in
    `darkmux_flow::legacy`, and every reader goes through `darkmux_flow::reader`, which
    upgrades them on read; archives are append-only and are never rewritten. An action
    darkmux retired with no current equivalent (`telemetry.process`, `funnel.*`, ...) reads as
    `FlowAction::Retired`; one this build does not know reads as `FlowAction::Other` and is
-   counted by `darkmux doctor`. Neither can be written: every sink write goes through
+   counted by `darkmux doctor`.
+   <!-- flow-action-guard:allow-end -->
+   Neither can be written: every sink write goes through
    `FlowSinkWrite::write`, which refuses both before any sink sees the record.
-   `scripts/flow-action-guard.py` (CI) fails on a flow action written by hand (a literal, a
-   format string, a prefix test, `concat!`, or JSON inside a string) outside the vocabulary.
+   `scripts/flow-action-guard.py` (CI) fails on a flow action written by hand in production
+   Rust (a literal, a format string, a prefix test, `concat!`, or JSON inside a string), and,
+   in test code, the viewer, docs, skills, templates and fixtures, on any string that looks
+   like an action and is not a current one (an old spelling, or a made-up
+   `<scope>.<event>`); recorded archives are exempt.
    Hook rules written in an old exact spelling are read as the current action. The bookends
    `dispatch.start`/`dispatch.complete` are still emitted at BOTH grains today (the whole
    run, and an inner role execution); separating the run grain is the migration below. What
@@ -442,7 +498,7 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    `ENUM_SETTINGS` (key, env var, shipped value, and the consuming `Scope`s: dispatch, mission
    launch, lab run, fleet submission; or a per-item entry such as `hooks.rules[].match.level`,
    checked where the list is loaded).
-   Storage stays a string parsed at the accessor, so contract 7's lenient read holds. A new enum
+   Storage stays a string parsed at the accessor, so a bad value never fails the load. A new enum
    setting is those two declarations plus a one-line accessor over `config_access::resolve_enum`.
    Conformance: `config_cmd::every_enum_setting_obeys_the_rule_on_every_surface` iterates the
    registry across preflight, doctor, `config set` and help; `tests/cli.rs`'s
@@ -469,7 +525,7 @@ darkmux's canonical config surface is **`~/.darkmux/config.json`** (#661), writt
 
 ```json
 {
-  "schema_version": "1.33",
+  "schema_version": "2.0",
   "machine_id": "studio",
   "lms_bin": "lms",
   "lmstudio_url": "http://localhost:1234",
@@ -489,7 +545,7 @@ When proposing a config change to an operator, write the visible field; don't re
 - **Serve-daemon bearer token → macOS Keychain** (item `darkmux-serve-token`) — #881, same carve-out shape as the Redis password. `config.runtime` holds only the non-secret `daemon_auth_enabled` gate; the token is read at runtime via `security find-generic-password`, wrapped in `RawServeToken` (redacted `Display` + `Debug`; raw bytes only via `expose_for_compare`), and lives in `darkmux-flow` beside the Redis-secret machinery. `serve_token()` resolves `env(DARKMUX_SERVE_TOKEN) verbatim > daemon_auth_enabled + Keychain > off`. Auth is *active* iff a token resolves; a non-loopback `--bind` is refused without one, and remote reads + `/diff` then require `Authorization: Bearer <token>` (loopback stays open).
 - **`DARKMUX_HOME`** — the bootstrap pointer that *locates* the config root (`<root>/config.json`); it can't live inside the config it finds, so it stays an env var.
 
-**Schema is minor-bump + lenient on read** (all-`Option` + `#[serde(flatten)] extras` overflow): an older binary tolerates a newer config, and a partial/hand-edited/malformed config never bricks the CLI — loud validation belongs to `darkmux doctor`, not the hot load path. `CONFIG_SCHEMA_VERSION` lives in `darkmux-types/src/config.rs`.
+**Loading never bricks, consuming refuses** (CONFIG 2.0, contract 7): all-`Option` + `#[serde(flatten)] extras` overflow means a partial, hand-edited or malformed config never bricks the CLI and `darkmux doctor` always runs, but a key the schema does not know is refused at every entry point's preflight and failed by doctor, naming the closest valid key. So an older binary refuses a newer config's new key: add fields as a minor bump, and upgrade the binary before writing them. `CONFIG_SCHEMA_VERSION` lives in `darkmux-types/src/config.rs`.
 
 **Don't confuse `config.json` with the profiles registry.** `~/.darkmux/profiles.json` (the model profiles) is a SEPARATE file, overridden by `--profiles-file` / `DARKMUX_PROFILES` — **renamed in #661 from the misleading `--config` / `DARKMUX_CONFIG`** (those names are retired, not reused, because a real `config.json` now exists).
 

@@ -141,22 +141,7 @@ fn oversize_phase_aborts_publish_with_no_orphans() {
     let node = harness.node("node-a").unwrap();
 
     // Set up a tdd-coder role + the mission + phases.
-    let role_json = serde_json::json!({
-        "id": "tdd-coder",
-        "description": "test role",
-        "skills": [],
-        "tool_palette": {"allow": [], "deny": []},
-        "escalation_contract": "bail-with-explanation",
-        "tier": "inference"
-    });
-    let role_dir = node.crew_root.join("roles");
-    std::fs::create_dir_all(&role_dir).unwrap();
-    std::fs::write(
-        role_dir.join("tdd-coder.json"),
-        serde_json::to_string_pretty(&role_json).unwrap(),
-    )
-    .unwrap();
-    std::fs::write(role_dir.join("tdd-coder.md"), "test prompt").unwrap();
+    node.register_role("tdd-coder");
 
     write_mission_with_oversize_phase(
         &node.crew_root,

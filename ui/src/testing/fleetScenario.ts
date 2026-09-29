@@ -24,7 +24,7 @@ import type { PresenceBeat, RosterMachineEntry } from "../types/handwritten";
  * none of them is needed to cover the upgrade.
  */
 
-export interface ScenarioMachine {
+interface ScenarioMachine {
   uid: string;
   /** What the machine calls itself NOW. */
   name: string;

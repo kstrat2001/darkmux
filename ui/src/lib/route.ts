@@ -83,7 +83,7 @@ export type PanelId = (typeof PANEL_IDS)[number];
  * `panel=mission-status&opt.all=all` form — the SAME upgrade path
  * `#lens=lab` → `#lens=runs&kind=lab` already uses. Dropped entirely once
  * every emitter has migrated, per the pre-1.0 no-compat-baggage posture. */
-export const PANEL_ALIASES: Readonly<Record<string, { panelId: PanelId; opts: Readonly<Record<string, string>> }>> = {
+const PANEL_ALIASES: Readonly<Record<string, { panelId: PanelId; opts: Readonly<Record<string, string>> }>> = {
   "mission-status-all": { panelId: "mission-status", opts: { all: "all" } },
 };
 
@@ -471,6 +471,7 @@ export function parseRoute(): Route {
   // rewrite idempotent rather than oscillating.
   const dispatch = get("dispatch") || get("session");
   if (dispatch) {
+    // flow-action-guard:allow — a URL parameter, not an action
     return { kind: "dispatch", dispatchId: dispatch, missionId: get("dispatch.mission") || null };
   }
 
@@ -552,6 +553,7 @@ export function parseRoute(): Route {
 export function dispatchHash(sessionId: string, missionId: string | null): string {
   const p = new URLSearchParams();
   p.set("dispatch", sessionId);
+  // flow-action-guard:allow — a URL parameter, not an action
   if (missionId) p.set("dispatch.mission", missionId);
   return p.toString();
 }

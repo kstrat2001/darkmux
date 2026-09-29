@@ -140,18 +140,75 @@ darkmux release.
   never changed a run.
 - **Doctor's "legacy compaction extras" check.** The openclaw-shape keys
   it warned about (`mode`, `maxHistoryShare`, `recentTurnsPreserve`,
-  `customInstructions` under `runtime.compaction`) now ride as ordinary
-  unrecognized extras: kept on round-trip, read by nothing. **Migration:**
-  none required; delete the keys if you like (`custom_instructions` is the
-  typed field).
+  `customInstructions` under `runtime.compaction`) are now retired keys,
+  refused by name like any unknown key (CONFIG 2.0, below). **Migration:**
+  delete them (`custom_instructions` is the typed field).
 - **Doctor's residue checks for pre-3.x removals:** the `crews` map in
   `profiles.json`, the `review{}` config block,
   `runtime.telemetry_record_every_samples`, and the "daemon predates the
-  build field" verdict. Each key is still read leniently and ignored.
-  **Migration:** delete any of those keys still present (3.x's `darkmux
-  doctor` names them).
+  build field" verdict. Each key is now a retired key, refused by name
+  (CONFIG 2.0, below). **Migration:** delete any of those keys still
+  present (`darkmux doctor`'s `user file keys` rows name them).
 
 ### Changed (breaking, 4.0)
+
+- **An unknown key in a user file is refused (CONFIG 2.0).** `config.json`,
+  `profiles.json`, role, skill and crew manifests, mission configs, rule
+  files, workload documents, lab fixture manifests and a crawl's workspace
+  spec used to ignore a key they did not know, so a typo silently did
+  nothing. Now every entry point that reads the file refuses to start,
+  naming the file, the key's path and the closest valid key, and `darkmux
+  doctor` fails it. Files still load, so doctor always runs. A retired key
+  is named with what replaced it; the tables come from `git log`, so every
+  key an older darkmux read or `init` wrote is covered: in `config.json`,
+  `remote.max_tokens_per_execution`, `remote.stage_budget_policy`, `gh`,
+  `orchestrator`, `review`, `dirs.notebook`, `dirs.openclaw_config`,
+  `dirs.runtime_agents`, `radio.router_profile` and
+  `runtime.telemetry_record_every_samples` (the first three used to be warned
+  about and ignored, the rest silently ignored); in `profiles.json`, `crews`,
+  `hooks`, a model's `role`, a profile's `runtime.config_path` /
+  `configPath` / `contextTokens` and the openclaw compaction keys (`mode`,
+  `model`, `customInstructions`, `maxHistoryShare`, `recentTurnsPreserve`);
+  a role's `capabilities` and `tier`; a mission config's `gh_verb` and a
+  task's `expand`; a workload's `agent` and `expected.test_count_baseline`;
+  a fixture manifest's `hash_exclude` and `hash_include`. `_comment` is accepted anywhere as a note. A value of the wrong
+  type (`"port": "x"`) is refused the same way, naming the expected type and
+  what it got: one used to make `config.json` silently fall back to every
+  default (Redis and audit off), and made a user role, skill or rule
+  silently lose to the builtin of the same id. A mistyped `profiles.json`
+  entry keeps its loud per-entry quarantine instead. **Migration:** run
+  `darkmux doctor` and delete or rename each key its `user file keys` rows
+  name. A preflight refuses only over files the run would load: the
+  effective copy of each mission config and workload (a shadowed copy is
+  reported by doctor, not refused), and the fixture the run binds. A fixture
+  registered from an older darkmux checkout keeps its old
+  `.fixture.json`; delete `hash_exclude` from it, or re-run
+  `scripts/lab-init.sh --force` from a current checkout.
+- **A mission config's `source_input` and `ticket` are declared fields.**
+  They were read out of the unknown-key overflow; a non-string value is now a
+  parse error. **Migration:** none for a string value.
+- **`tool-bench` workload knobs are declared fields** (`trials`,
+  `taskTimeoutSeconds`, `chainDepths`, `seed`); a bad value's message reads
+  ``workload `trials` must be …`` rather than `workload extras.trials must be …`.
+  **Migration:** none.
+
+- **A session id is a typed identity that names its run.** Every flow
+  record's `session_id` is now `<run>[.lab|.solo].<kind>[.<field>...]`
+  (FLOW 2.0.0; see its schema entry): a task session reads
+  `review-1790000000-ab12cd.task.probe`, not `task-probe`, so two launches
+  of one config never share a session, a presence key or a budget record,
+  and `mission_id` always agrees with the session. `mission-<m>` and the
+  bare `<m>` of the whole-run bookend are one session, `<m>.run`. A fleet
+  receiver runs a submitted job under a relay of the sender's session in a
+  standalone run (WORK_JOB 7), never one of its own missions, so the
+  `-from-` rule on machine names is gone. `darkmux dispatch --session-id
+  <name>` now names the dispatch within its crew-of-one run
+  (`<run>.adhoc.<role>.<name>`). Archives are never rewritten: an old id
+  still reads for step attribution and corrections. **Migration:** a script
+  that matched session prefixes (`task-`, `step-`, `mission-run-`,
+  `crew-dispatch-`) should key on `mission_id`, or on the printed session
+  id as a whole; a `flow note --session-id` names the session a dispatch
+  printed.
 
 - **A lab run with no verify spec reports verify "not checked", not a pass**
   (#2982). A `prompt` workload that declares no verify used to record

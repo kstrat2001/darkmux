@@ -68,7 +68,7 @@ function payloadOf(r: NormRecord): UsagePayload {
  *  number's integer range. The Rust twin (`usage_sum::MAX_COUNT`) clamps to
  *  the same edge, so a sum of clamped counts is one arithmetic on both
  *  sides. */
-export const MAX_COUNT = 2 ** 53;
+const MAX_COUNT = 2 ** 53;
 
 /** THE value domain, shared with the Rust twin's `num`: a finite number is
  *  floored to an integer and clamped to [0, MAX_COUNT]; anything else (a
@@ -152,11 +152,11 @@ export function usageContribution(r: NormRecord, opts: SumOptions = {}): UsageAm
 }
 
 /** The identity of ONE RUN: `(session_id, mission_id)`. A bare session id
- *  is not one: `session_id::task`/`mission_run` are deterministic, so the
- *  same id recurs across unrelated runs (#2690/#2709). The legacy fallback
+ *  is not one: pre-4.0 task and mission-run ids were deterministic, so the
+ *  same id recurred across unrelated runs (#2690/#2709); archives keep them. The legacy fallback
  *  and the hero's run count both key on this. A sessionless record gets a
  *  composite of its own; `\u0000` cannot occur inside either id. */
-export function runKey(r: NormRecord): string {
+function runKey(r: NormRecord): string {
   const sid = r.session_id || `ts:${r.ts}:${r.handle || ""}:${r.machine_uid || ""}`;
   return `${sid}\u0000${r.mission_id || ""}`;
 }

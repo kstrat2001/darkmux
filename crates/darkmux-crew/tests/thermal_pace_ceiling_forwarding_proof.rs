@@ -228,7 +228,7 @@ fn captured_docker_argv_with(
         timeout_override_seconds: None,
         role_id: "analyst".to_string(),
         message: "#2774 pace-ceiling forwarding proof — never reaches a model.".to_string(),
-        session_id: Some(format!(
+        session: darkmux_types::session_id::SessionId::adhoc(darkmux_types::session_id::RunId::standalone("test").unwrap(), "coder", format!(
             "thermal-pace-ceiling-forwarding-proof-{}-{max_pause_ms}",
             std::process::id()
         )),

@@ -13,6 +13,7 @@ import {
 } from "./flow";
 import { ingest, ingestJsonl, recordsAsOf, __asOfFilterRuns, type NormRecord } from "./ingest";
 import { norm, normAll, type RawRecord } from "../testing/records";
+import type { PresenceBeat } from "../types/handwritten";
 import { tokensOffMeter } from "../lenses/fleet/savings";
 import { DEFAULT_POLICY, lifecycleAt } from "./lifecycle";
 import { runIndex, sessionRun, __runIndexBuilds } from "./runRef";
@@ -361,7 +362,7 @@ describe("presence coverage is partial, not all-or-nothing (#2123)", () => {
    * terminal record, fresh telemetry: open on its own records. */
   const reviewSession: NormRecord[] = normAll([
     { ts: "2026-08-29T15:46:31Z", session_id: "owner/repo@deadbeef", action: "dispatch.start" },
-    { ts: "2026-08-29T16:07:12Z", session_id: "owner/repo@deadbeef", action: "telemetry.process" },
+    { ts: "2026-08-29T16:07:12Z", session_id: "owner/repo@deadbeef", action: "machine.telemetry" },
   ]);
   const phase = (data: NormRecord[], presence: Set<string>) =>
     lifecycleAt(sessionRun(data, "owner/repo@deadbeef", NOW)!, NOW, DEFAULT_POLICY, presence).phase;
@@ -472,7 +473,7 @@ describe("(#2911) runIndex — the per-window run index", () => {
     // mutable array (the directive below would then be unused). Never run.
     const typeOnly = () => {
       // @ts-expect-error a run's records are readonly
-      runIndex(data).groupsOfSession("a")[0].records.push(data[0]);
+      runIndex(data).groupsOfSession("a")[0].records.push(data[0]); // eslint-disable-line @typescript-eslint/no-unsafe-call
     };
     void typeOnly;
   });
@@ -569,7 +570,7 @@ describe("displayNameOf: roster and unnamed ordinals", () => {
   const B = "00000000-0000-4000-8000-ABCDEF000003";
   const C = "00000000-0000-4000-8000-ABCDEF000005";
   const uidOnly = (uid: string, ts: string) => norm({ ts, action: "dispatch.turn", machine_uid: uid });
-  const none = new Map();
+  const none = new Map<string, PresenceBeat>();
 
   it("a roster entry declared for the uid names a uid-only machine", () => {
     const data = [uidOnly(A, "2026-09-26T10:00:00Z")];

@@ -840,6 +840,7 @@ mod tests {
         let est = crew::step_kinds::FixedEstimator::default();
 
         crew::scheduler::run_step_graph(
+            &crate::test_run(),
             &mut steps,
             &tasks,
             &registry,

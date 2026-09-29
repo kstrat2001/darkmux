@@ -36,6 +36,7 @@ use std::process::Command;
 use crate::crew;
 use crate::fleet;
 use crate::flow;
+use darkmux_types::session_id::{RunId, SessionId};
 use darkmux_types::style;
 
 /// Emit a mission-run lifecycle flow record for the mission-level events
@@ -48,18 +49,16 @@ use darkmux_types::style;
 fn emit_run_record(
     level: flow::Level,
     action: darkmux_flow::FlowAction,
-    mission_id: &str,
+    session: &SessionId,
     phase_id: &str,
-    session_id: &str,
     payload: serde_json::Value,
 ) {
     let _ = flow::record(crew::dispatch::build_dispatch_record_with_payload(
         level,
         action,
         "mission-run",
-        session_id,
+        session,
         None,
-        Some(mission_id),
         Some(phase_id),
         Some(payload),
     ));
@@ -89,9 +88,8 @@ pub(crate) fn emit_step_result(
     level: flow::Level,
     kind: &str,
     step_id: &str,
-    mission_id: &str,
+    session: &SessionId,
     phase_id: &str,
-    session_id: &str,
     payload: serde_json::Value,
 ) {
     let mut full = serde_json::json!({ "step_id": step_id, "kind": kind });
@@ -104,9 +102,8 @@ pub(crate) fn emit_step_result(
         level,
         darkmux_flow::FlowAction::StepResult,
         "mission-run",
-        session_id,
+        session,
         None,
-        Some(mission_id),
         Some(phase_id),
         Some(full),
     ));
@@ -518,7 +515,6 @@ pub(crate) struct CoderPhaseContext {
     pub(crate) base: String,
     pub(crate) mission_id: String,
     pub(crate) phase_id: String,
-    pub(crate) session_id: String,
     pub(crate) role: String,
 }
 
@@ -612,18 +608,6 @@ impl StepKind for MissionWorktreeStepKind {
         &PORTS
     }
 
-    fn run(
-        &self,
-        _step: &crew::types::Step,
-        _task: &crew::types::Task,
-        _input: &std::collections::BTreeMap<String, String>,
-    ) -> Result<StepOutcome> {
-        panic!(
-            "MissionWorktreeStepKind only runs through `run_streaming` — it reads the run-scoped \
-             ArtifactBus (#1530 Packet 3b-1)"
-        )
-    }
-
     /// (#2577 audit) `CwdPolicy::NoAmbientDependency` (the trait default,
     /// stated explicitly here) — `add_worktree`'s `git worktree add` always
     /// runs against `ctx.repo_root`, resolved once at launch setup (before
@@ -636,7 +620,7 @@ impl StepKind for MissionWorktreeStepKind {
         CwdPolicy::NoAmbientDependency
     }
 
-    fn run_streaming(
+    fn run(
         &self,
         step: &crew::types::Step,
         _task: &crew::types::Task,
@@ -646,6 +630,8 @@ impl StepKind for MissionWorktreeStepKind {
         let ctx = run_ctx
             .artifact::<CoderPhaseContext>(CODER_CONTEXT_ARTIFACT)
             .expect("register_coder_phase_kinds seeds the coder.context artifact before the graph runs");
+        // The phase's coder-run session, in this step's run.
+        let session = SessionId::phase(run_ctx.run_id().clone(), &ctx.phase_id);
         add_worktree(&ctx.repo_root, &ctx.wt_path, &ctx.branch, &ctx.base)?;
 
         println!(
@@ -656,9 +642,8 @@ impl StepKind for MissionWorktreeStepKind {
             flow::Level::Info,
             "mission.worktree",
             &step.id,
-            &ctx.mission_id,
+            &session,
             &ctx.phase_id,
-            &ctx.session_id,
             serde_json::json!({
                 "role": ctx.role,
                 "base": ctx.base,
@@ -797,18 +782,6 @@ impl StepKind for MissionCoderStepKind {
 
     fn run(
         &self,
-        _step: &crew::types::Step,
-        _task: &crew::types::Task,
-        _input: &std::collections::BTreeMap<String, String>,
-    ) -> Result<StepOutcome> {
-        panic!(
-            "MissionCoderStepKind only runs through `run_streaming` — it reads/writes the \
-             run-scoped ArtifactBus (#1530 Packet 3b-1)"
-        )
-    }
-
-    fn run_streaming(
-        &self,
         step: &crew::types::Step,
         _task: &crew::types::Task,
         _input: &std::collections::BTreeMap<String, String>,
@@ -820,6 +793,8 @@ impl StepKind for MissionCoderStepKind {
         let ctx = run_ctx
             .artifact::<CoderPhaseContext>(CODER_CONTEXT_ARTIFACT)
             .expect("register_coder_phase_kinds seeds the coder.context artifact before the graph runs");
+        // The phase's coder-run session, in this step's run.
+        let session = SessionId::phase(run_ctx.run_id().clone(), &ctx.phase_id);
 
         // (#1546) Compose the brief HERE — the pipeline's ONE call site for
         // it (see this struct's own doc for the full reasoning: no other
@@ -911,7 +886,7 @@ impl StepKind for MissionCoderStepKind {
             timeout_override_seconds: None, // (#2480)
             role_id: ctx.role.clone(),
             message,
-            session_id: Some(ctx.session_id.clone()),
+            session: session.clone(),
             timeout_seconds,
             skip_preflight: false,
             json: true,
@@ -929,17 +904,16 @@ impl StepKind for MissionCoderStepKind {
             // (#1483) Stamp the graph step id so the live trajectory tailer
             // can attribute this AGENTIC seat's per-turn / per-tool /
             // per-token flow records to the coder seat card. The coder
-            // dispatch runs under the shared `mission-run-<…>` session (NOT
-            // the `step-<id>` default the viewer's session->step map
-            // resolves), so without the step id its live turn+tool climb
-            // was unattributable and the seat never ticked.
+            // dispatch runs under its phase's session, not the step's own,
+            // so without the step id its live turn+tool climb was
+            // unattributable and the seat never ticked.
             step_id: Some(step.id.clone()),
             system_prompt_override: None,
         };
         let result = crew::dispatch::dispatch(opts)?;
         eprintln!(
             "{}",
-            style::dim(&format!("darkmux coder-phase: session id `{}`", ctx.session_id))
+            style::dim(&format!("darkmux coder-phase: session id `{session}`"))
         );
 
         let tokens = coder_tokens(&result);
@@ -963,9 +937,8 @@ impl StepKind for MissionCoderStepKind {
                 flow::Level::Error,
                 "mission.coder",
                 &step.id,
-                &ctx.mission_id,
+                &session,
                 &ctx.phase_id,
-                &ctx.session_id,
                 serde_json::json!({ "exit_code": exit_code, "total_tokens": tokens.total }),
             );
             *result_slot.lock().expect("mission.coder result mutex poisoned") = Some(CoderStepResult {
@@ -987,9 +960,8 @@ impl StepKind for MissionCoderStepKind {
             },
             "mission.coder",
             &step.id,
-            &ctx.mission_id,
+            &session,
             &ctx.phase_id,
-            &ctx.session_id,
             serde_json::json!({
                 "failed_verifiers": failed_verifiers,
                 "count": failed_verifiers.len(),
@@ -1126,18 +1098,6 @@ impl StepKind for MissionVerifyStepKind {
     }
 
     fn run(
-        &self,
-        _step: &crew::types::Step,
-        _task: &crew::types::Task,
-        _input: &std::collections::BTreeMap<String, String>,
-    ) -> Result<StepOutcome> {
-        panic!(
-            "MissionVerifyStepKind only runs through `run_streaming` — it reads/writes the \
-             run-scoped ArtifactBus (#1530 Packet 3b-1)"
-        )
-    }
-
-    fn run_streaming(
         &self,
         _step: &crew::types::Step,
         // (#1550 cluster item 5) `_task.role_id` is never read — the
@@ -1508,16 +1468,15 @@ fn teardown_and_terminate_phase(
         ),
     }
 
-    let session_id = darkmux_types::session_id::mission_run(mission_id, &phase.id);
+    let Ok(run) = RunId::mission(mission_id) else { return };
     emit_run_record(
         flow::Level::Info,
         match kind {
             MissionTerminal::Finalize => darkmux_flow::FlowAction::MissionRunFinalize,
             MissionTerminal::Abort => darkmux_flow::FlowAction::MissionRunAbort,
         },
-        mission_id,
+        &SessionId::phase(run, &phase.id),
         &phase.id,
-        &session_id,
         serde_json::json!({ "branch": branch, "worktree": wt_display }),
     );
 }
@@ -1948,15 +1907,10 @@ pub(crate) fn coder_brief_with_injected_context(
     let mission = load_mission_record(mission_id)?;
     let phase = load_phase_record(mission_id, phase_id)?;
 
-    // The mission's EXACT dispatch session ids (built from its real phase
-    // ids), so the collectors scope to THIS mission's sessions — an exact-set
-    // match, never a `mission-run-<id>-` prefix that would bleed a sibling
-    // mission whose id is a hyphen-extension (see `mission_adjudication_notes`).
-    let mission_session_ids: std::collections::HashSet<String> = mission
-        .phase_ids
-        .iter()
-        .map(|pid| darkmux_types::session_id::mission_run(mission_id, pid))
-        .collect();
+    // The mission's phases' coder runs, so the collectors scope to THIS
+    // mission's sessions (an exact phase match, never a prefix that would
+    // bleed a sibling mission whose id is a hyphen-extension).
+    let mission_sessions = crew::corrections::PhaseSessions::new(mission_id, mission.phase_ids.iter().cloned());
     // (#1002) Files this dispatch is about to work on (from the phase
     // description) — used to rank file-in-play cautions + lessons above
     // engagement-level ones, and to staleness-check cautions against the
@@ -1966,8 +1920,8 @@ pub(crate) fn coder_brief_with_injected_context(
     // (#994) The three injected-context sources, each fully ranked but UNCAPPED
     // here — the proportional budget (#1011) decides how much of each lands.
     // Authority order: corrections > lessons > cautions.
-    let corrections = mission_adjudication_notes(&mission_session_ids);
-    let cautions = mission_cautions(&mission_session_ids, &intent, wt_path);
+    let corrections = mission_adjudication_notes(&mission_sessions);
+    let cautions = mission_cautions(&mission_sessions, &intent, wt_path);
     let authored = engagement_lessons(&intent);
 
     // (#1011) Distribute the caller-resolved budget — a fraction of the
@@ -2053,12 +2007,11 @@ pub(crate) fn injected_context_for_lab(
     let intent = std::collections::HashSet::new();
     let (corrections, cautions) = match mission_id {
         Some(mid) => {
-            let ids: std::collections::HashSet<String> = load_phases()
-                .unwrap_or_default()
-                .iter()
-                .filter(|s| s.mission_id.as_str() == mid)
-                .map(|s| darkmux_types::session_id::mission_run(mid, &s.id))
-                .collect();
+            let phases = load_phases().unwrap_or_default();
+            let ids = crew::corrections::PhaseSessions::new(
+                mid,
+                phases.iter().filter(|s| s.mission_id.as_str() == mid).map(|s| s.id.clone()),
+            );
             (
                 mission_adjudication_notes(&ids),
                 mission_cautions(&ids, &intent, workspace_root),
@@ -2092,11 +2045,9 @@ pub(crate) fn lab_context_window(role: Option<&str>, profile: Option<&str>, prof
 /// (#849 half 1) The adjudication corrections recorded across this mission's
 /// dispatches, for injection into the next coder brief. Scans the flow trail
 /// for `action=note` + `source=adjudication` whose `session_id` is one of the
-/// mission's EXACT dispatch session ids (`mission_session_ids`, built from the
-/// mission's phases as `mission-run-<mission>-<phase>`). Exact-set match, NOT
-/// a `mission-run-<mission>-` prefix — a prefix bleeds a sibling mission whose
-/// id is a hyphen-extension (`auth` would swallow `auth-v2`'s notes, since
-/// `mission-run-auth-v2-s1` starts with `mission-run-auth-`). Mission-scoped,
+/// mission's phases' coder runs (`crew::corrections::PhaseSessions`). An exact
+/// phase match, NOT a prefix — a prefix bleeds a sibling mission whose id is a
+/// hyphen-extension (`auth` would swallow `auth-v2`'s notes). Mission-scoped,
 /// not phase-scoped, by design — a correction like "don't rename that field"
 /// applies mission-wide. Best-effort: any IO/parse problem reads as "no
 /// corrections" (the loop just doesn't get the carry-forward, never errors).
@@ -2109,11 +2060,11 @@ pub(crate) fn lab_context_window(role: Option<&str>, profile: Option<&str>, prof
 /// list` so the verb can never show the operator a different set than the one
 /// this brief injects. The dedup + newest-first ordering below stay HERE: they
 /// are this path's budget policy (#1011), not part of what a correction is.
-fn mission_adjudication_notes(mission_session_ids: &std::collections::HashSet<String>) -> Vec<String> {
+fn mission_adjudication_notes(mission_sessions: &crew::corrections::PhaseSessions) -> Vec<String> {
     let mut notes: Vec<String> = Vec::new();
     for c in crew::corrections::scan(
         crew::corrections::ADJUDICATION_LOOKBACK_DAYS,
-        Some(mission_session_ids),
+        crew::corrections::Scope::Phases(mission_sessions),
     ) {
         // Skip exact duplicates (a correction re-recorded verbatim shouldn't
         // repeat in the brief). The reader already drops empties.
@@ -2317,8 +2268,8 @@ fn allocate_injected_context(
 /// Reads the flow stream DIRECTLY — always fresh, no dependency on the SQLite
 /// index's derive-on-rebuild freshness (the index serves the query/recall +
 /// status surface; this hot per-dispatch path mirrors the corrections
-/// collector). Scoped to the mission's EXACT dispatch session ids (exact-set,
-/// not a `mission-run-<id>-` prefix — same sibling-bleed guard as #849), deduped,
+/// collector). Scoped to the mission's phases' coder runs (an exact phase
+/// match, not a prefix — same sibling-bleed guard as #849), deduped,
 /// over the most-recent `CAUTION_LOOKBACK_DAYS` day-files. Fully ranked but NOT
 /// count-capped (#1011 — the proportional budget governs how many land).
 /// (#1002) Ranked **file-in-play first** (a caution about a file this
@@ -2337,12 +2288,12 @@ fn allocate_injected_context(
 /// representations. Keep them in sync: a change to `source`/`category` semantics
 /// must update BOTH.
 fn mission_cautions(
-    mission_session_ids: &std::collections::HashSet<String>,
+    mission_sessions: &crew::corrections::PhaseSessions,
     intent: &std::collections::HashSet<String>,
     workspace_root: &Path,
 ) -> Vec<String> {
     const CAUTION_LOOKBACK_DAYS: usize = 7;
-    if mission_session_ids.is_empty() {
+    if mission_sessions.is_empty() {
         return Vec::new();
     }
     let flows_dir = darkmux_types::config_access::flows_dir();
@@ -2364,7 +2315,7 @@ fn mission_cautions(
             let in_mission = r
                 .get("session_id")
                 .and_then(|v| v.as_str())
-                .is_some_and(|s| mission_session_ids.contains(s));
+                .is_some_and(|s| mission_sessions.admits(s));
             if !in_mission {
                 continue;
             }
@@ -2616,9 +2567,9 @@ struct DebriefReport {
 /// each ended. READ-ONLY.
 ///
 /// The flow stream IS the mission's durable history (the #557 single-stream
-/// doctrine); this reads it scoped to the mission's EXACT dispatch session ids
-/// (same `mission-run-<id>-<phase>` construction as the run path, so a sibling
-/// mission whose id is a hyphen-extension never bleeds in). It does NOT assume a
+/// doctrine); this reads it scoped to the mission's phases' coder runs (the
+/// same `PhaseSessions` scope as the run path, so a sibling mission whose id
+/// is a hyphen-extension never bleeds in). It does NOT assume a
 /// coding mission — no git diffs are reconstructed here: for a coding mission
 /// the `darkmux-mission-debrief` skill pulls the actual patch with `git show`,
 /// and a non-coding mission simply has no coding activity.
@@ -2659,13 +2610,10 @@ fn gather_debrief(mission_id: &str) -> Result<DebriefReport> {
         .unwrap_or_default();
     let records_emitted = envelope.as_ref().and_then(|env| env.records_emitted.clone());
 
-    // The mission's exact dispatch session ids — the coder-phase dispatch id
-    // for each phase, so the collectors scope to THIS mission's sessions (no
-    // sibling bleed).
-    let mission_session_ids: std::collections::HashSet<String> = mission_phases
-        .iter()
-        .map(|s| darkmux_types::session_id::mission_run(mission_id, &s.id))
-        .collect();
+    // The mission's phases' coder runs, so the collectors scope to THIS
+    // mission's sessions (no sibling bleed).
+    let mission_sessions =
+        crew::corrections::PhaseSessions::new(mission_id, mission_phases.iter().map(|s| s.id.clone()));
 
     Ok(DebriefReport {
         mission_id: mission.id.clone(),
@@ -2691,14 +2639,14 @@ fn gather_debrief(mission_id: &str) -> Result<DebriefReport> {
         // budget governs there); a debrief is a readable summary, so cap the
         // display here at the most-relevant `DEBRIEF_DISPLAY` of each.
         cautions: mission_cautions(
-            &mission_session_ids,
+            &mission_sessions,
             &std::collections::HashSet::new(),
             &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         )
         .into_iter()
         .take(DEBRIEF_DISPLAY)
         .collect(),
-        corrections: mission_adjudication_notes(&mission_session_ids)
+        corrections: mission_adjudication_notes(&mission_sessions)
             .into_iter()
             .take(DEBRIEF_DISPLAY)
             .collect(),
@@ -2866,31 +2814,22 @@ fn format_records_emitted_lines(records_emitted: &Option<crew::records_emitted::
 /// happened live (corrections + cautions carried phase→phase at run time);
 /// this is the cross-MISSION lesson-banking step.
 pub fn nudge_mission_debrief(mission_id: &str) {
-    let _ = flow::record(flow::FlowRecord {
-        ts: flow::ts_utc_now(),
-        level: flow::Level::Info,
-        category: flow::Category::Review,
-        tier: flow::Tier::Operator,
-        stage: flow::Stage::Debrief,
-        action: darkmux_flow::FlowAction::MissionDebriefPrompt,
-        handle: mission_id.to_string(),
-        phase_id: None,
-        // (#1436) The canonical mission-lifecycle session id — the same hyphen
-        // form the close transition just emitted under, so the debrief prompt
-        // lands in the SAME viewer session bucket as the close record.
-        session_id: Some(darkmux_types::session_id::mission(mission_id)),
-        source: Some("mission_debrief".to_string()),
-        model: None,
-        reasoning: None,
-        mission_id: Some(mission_id.to_string()),
-        machine_id: None,
-        machine_uid: None,
-        prev_hash: None,
-        hash: None,
-        payload: None,
-        work_id: None,
-        attempt: None,
-    });
+    // Under the mission's own run session, so the debrief prompt lands in
+    // the SAME viewer session bucket as the close record just emitted.
+    if let Ok(run) = RunId::mission(mission_id) {
+        let _ = flow::record(flow::FlowRecord {
+            tier: flow::Tier::Operator,
+            source: Some("mission_debrief".to_string()),
+            ..flow::FlowRecord::for_session(
+                &SessionId::run(run),
+                flow::Level::Info,
+                flow::Category::Review,
+                flow::Stage::Debrief,
+                darkmux_flow::FlowAction::MissionDebriefPrompt,
+                mission_id,
+            )
+        });
+    }
     println!(
         "{}",
         style::dim(&format!(

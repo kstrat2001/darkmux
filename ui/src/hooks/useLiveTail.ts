@@ -5,7 +5,7 @@ import { queryKeys, PRESENCE_POLL_MS, LIVE_CONTACT_TIMEOUT_MS } from "../lib/que
 import { mergeTailRecords, prevDateUTC, todayUTC, LIVE_WINDOW_MS } from "../lib/flow";
 import { startFlowTail, type FlowTailHandle } from "../lib/sse";
 import { liveStore } from "../lib/liveChannel";
-import { ingest, timesOf, type NormRecord } from "../lib/ingest";
+import { ingest, latestByTime, type NormRecord } from "../lib/ingest";
 
 /**
  * Port of `viewer.html`'s live-tail wiring — `startLiveTail` (3587-3627),
@@ -122,7 +122,7 @@ async function reconcile(
     const existingTail = queryClient.getQueryData<NormRecord[]>(tailKey) ?? [];
     const dayResult = queryClient.getQueryData<{ ok: boolean; data?: unknown }>(dayKey);
     const existingDay = dayResult && dayResult.ok ? ingest(dayResult.data) : [];
-    const newest = [...timesOf(existingDay), ...timesOf(existingTail)].reduce((m, t) => (t > m ? t : m), 0);
+    const newest = latestByTime([...existingDay, ...existingTail])?.tMs ?? 0;
     const sinceMs = newest ? Math.max(cutMs, newest - RECONCILE_OVERLAP_MS) : cutMs;
     const sinceIso = new Date(sinceMs).toISOString().replace(/\.\d+Z$/, "Z");
     let res;

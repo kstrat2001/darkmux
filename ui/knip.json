@@ -1,0 +1,17 @@
+{
+  "$schema": "https://unpkg.com/knip@6/schema.json",
+  "entry": [
+    "scripts/*.mjs",
+    "verify/playwright.config.ts",
+    "verify/*.spec.ts"
+  ],
+  "project": [
+    "src/**/*.{ts,tsx}",
+    "*.ts",
+    "scripts/*.mjs",
+    "verify/*.ts"
+  ],
+  "ignore": [
+    "src/types/generated/**"
+  ]
+}

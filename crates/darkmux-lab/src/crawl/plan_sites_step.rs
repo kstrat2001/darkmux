@@ -155,7 +155,7 @@ impl StepKind for PlanSitesStepKind {
         &PORTS
     }
 
-    fn run(&self, step: &Step, task: &Task, _input: &BTreeMap<String, String>) -> Result<StepOutcome> {
+    fn run(&self, step: &Step, task: &Task, _input: &BTreeMap<String, String>, _ctx: &StepRunCtx) -> Result<StepOutcome> {
         let cfg = SitesStepConfig::from_step(step)?;
         let out_path = match &cfg.plan_out {
             Some(p) => p.clone(),

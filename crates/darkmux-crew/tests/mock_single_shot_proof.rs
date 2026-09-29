@@ -146,7 +146,8 @@ fn container_free_single_shot_dispatch_round_trips_through_a_real_http_mock_serv
     let prev_flows_dir = std::env::var("DARKMUX_FLOWS_DIR").ok();
     unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", flows_dir.path()) };
 
-    let session_id = format!("mock-single-shot-proof-{}", std::process::id());
+    let session = darkmux_types::session_id::SessionId::adhoc(darkmux_types::session_id::RunId::standalone("test").unwrap(), "coder", format!("mock-single-shot-proof-{}", std::process::id()));
+    let session_id = session.wire();
     let opts = DispatchOpts {
         // (#2914) Work never runs on the utility model.
         allow_utility_model: false,
@@ -169,7 +170,7 @@ fn container_free_single_shot_dispatch_round_trips_through_a_real_http_mock_serv
                   server ignores request content and returns its fixed scripted reply \
                   regardless"
             .to_string(),
-        session_id: Some(session_id.clone()),
+        session: session.clone(),
         timeout_seconds: 30,
         skip_preflight: true,
         json: false,
@@ -330,7 +331,12 @@ fn container_free_single_shot_dispatch_stamps_mission_id_resolved_from_phase() {
         std::env::set_var("DARKMUX_CREW_DIR", crew_dir.path());
     }
 
-    let session_id = format!("mock-single-shot-mission-proof-{}", std::process::id());
+    let session = darkmux_types::session_id::SessionId::adhoc(
+        darkmux_types::session_id::RunId::mission(MISSION_ID).unwrap(),
+        "radio-host",
+        format!("mock-single-shot-mission-proof-{}", std::process::id()),
+    );
+    let session_id = session.wire();
     let opts = DispatchOpts {
         // (#2914) Work never runs on the utility model.
         allow_utility_model: false,
@@ -346,7 +352,7 @@ fn container_free_single_shot_dispatch_stamps_mission_id_resolved_from_phase() {
         // (#2914) The answering seat; see the sibling test above.
         role_id: "radio-host".to_string(),
         message: "content doesn't matter — the mock server ignores it".to_string(),
-        session_id: Some(session_id.clone()),
+        session: session.clone(),
         timeout_seconds: 30,
         skip_preflight: true,
         json: false,
@@ -393,13 +399,11 @@ fn container_free_single_shot_dispatch_stamps_mission_id_resolved_from_phase() {
             Some("dispatch.complete") | Some("dispatch.error") => saw_complete = true,
             _ => {}
         }
-        // The fix under test: EVERY record this dispatch emits must carry
-        // the mission the phase resolves to — not the hardcoded `None`
-        // `build_remote_record` used to bake in regardless of `phase_id`.
+        // EVERY record this dispatch emits carries its session's mission.
         assert_eq!(
             record.get("mission_id").and_then(Value::as_str),
             Some(MISSION_ID),
-            "record must carry mission_id resolved from phase_id={PHASE_ID:?}, got: {record:?}"
+            "record must carry its session's mission, got: {record:?}"
         );
         assert_eq!(
             record.get("phase_id").and_then(Value::as_str),

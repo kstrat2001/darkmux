@@ -41,7 +41,7 @@ export interface PanelDef {
  * there is no consumer here that would silently misbehave if a future edit
  * broke the convention the way the server's compose/cache-key logic
  * would). */
-export interface PanelOptValue {
+interface PanelOptValue {
   readonly value: string;
   readonly argv: readonly string[];
 }
@@ -292,7 +292,7 @@ export const DEFAULT_PANEL_ID: PanelId = "run-list";
  * but an explicit user action may run them (#1286 — "the observer must not
  * join the observed"). Selecting the tab must NEVER auto-fetch; only the
  * panel's own "run"/"re-run" button may. */
-export const MANUAL_PANELS: ReadonlySet<PanelId> = new Set(["doctor"]);
+const MANUAL_PANELS: ReadonlySet<PanelId> = new Set(["doctor"]);
 
 export function isManualPanel(id: PanelId): boolean {
   return MANUAL_PANELS.has(id);

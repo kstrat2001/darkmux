@@ -53,6 +53,7 @@ use crate::step_kinds::deliver_github_review::{DeliverScope, GatedMod};
 use crate::step_kinds::registry::StepKindRegistry;
 use crate::step_kinds::types::{CwdPolicy, Port, SeatClaim, StepKind, StepOutcome, StepRunCtx};
 use crate::types::{Step, Task};
+use darkmux_types::session_id::SessionScope;
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -174,8 +175,8 @@ impl StepKind for RecordsGatherStepKind {
 
     /// (#1979) No model work, no dispatch session — same opt-out
     /// `deliver.github_review`/`procedural.shell`/`procedural.noop` use.
-    fn dispatch_session_id(&self, _step: &Step) -> Option<String> {
-        None
+    fn session_scope(&self) -> SessionScope {
+        SessionScope::None
     }
 
     /// (#2577 audit) `CwdPolicy::NoAmbientDependency` (the trait default,
@@ -191,7 +192,7 @@ impl StepKind for RecordsGatherStepKind {
         CwdPolicy::NoAmbientDependency
     }
 
-    fn run(&self, step: &Step, task: &Task, _input: &BTreeMap<String, String>) -> Result<StepOutcome> {
+    fn run(&self, step: &Step, task: &Task, _input: &BTreeMap<String, String>, _ctx: &StepRunCtx) -> Result<StepOutcome> {
         let mission_id = mission_id_for(task)?;
 
         let diff = match step.config.get("diff_file").and_then(|v| v.as_str()) {
@@ -922,7 +923,7 @@ mod tests {
             &[("plan-test-gap", "disabled"), ("plan-union-vs-enum", "not_selected")],
         );
 
-        let outcome = RecordsGatherStepKind.run(&step(json!({})), &task(), &BTreeMap::new()).unwrap();
+        let outcome = RecordsGatherStepKind.run(&step(json!({})), &task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         let wrapped =
             crate::step_output::Output::<GatherOutput>::read(&outcome.output, RECORDS_GATHER_OUTPUT_KIND).unwrap();
         let scope = &wrapped.body.scope;
@@ -955,7 +956,7 @@ mod tests {
         save_phase();
         save_snapshot_and_prune_report(&["intent-vs-diff"], &[("summarize", "disabled")]);
 
-        let outcome = RecordsGatherStepKind.run(&step(json!({})), &task(), &BTreeMap::new()).unwrap();
+        let outcome = RecordsGatherStepKind.run(&step(json!({})), &task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         let wrapped =
             crate::step_output::Output::<GatherOutput>::read(&outcome.output, RECORDS_GATHER_OUTPUT_KIND).unwrap();
         assert!(
@@ -999,7 +1000,7 @@ mod tests {
         .unwrap();
         crate::lifecycle::save_config_snapshot(MISSION, &config).unwrap();
 
-        let outcome = RecordsGatherStepKind.run(&step(json!({})), &task(), &BTreeMap::new()).unwrap();
+        let outcome = RecordsGatherStepKind.run(&step(json!({})), &task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         let wrapped =
             crate::step_output::Output::<GatherOutput>::read(&outcome.output, RECORDS_GATHER_OUTPUT_KIND).unwrap();
         assert_eq!(
@@ -1021,7 +1022,7 @@ mod tests {
         crate::mods::materialize(&crate::mods::mods_dir(), &a_mod("mod-2", "sess-b/1", Some("other-mission")))
             .unwrap();
 
-        let out = RecordsGatherStepKind.run(&step(json!({})), &task(), &BTreeMap::new()).unwrap();
+        let out = RecordsGatherStepKind.run(&step(json!({})), &task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         let wrapped = crate::step_output::Output::<GatherOutput>::read(&out.output, RECORDS_GATHER_OUTPUT_KIND).unwrap();
         assert_eq!(wrapped.body.findings.len(), 1, "{:?}", wrapped.body.findings);
         assert_eq!(wrapped.body.findings[0].key, "sess-a/1");
@@ -1043,7 +1044,7 @@ mod tests {
         .unwrap();
 
         let out = RecordsGatherStepKind
-            .run(&step(json!({ "diff_file": diff_path.to_string_lossy() })), &task(), &BTreeMap::new())
+            .run(&step(json!({ "diff_file": diff_path.to_string_lossy() })), &task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test())
             .unwrap();
         let wrapped = crate::step_output::Output::<GatherOutput>::read(&out.output, RECORDS_GATHER_OUTPUT_KIND).unwrap();
         assert_eq!(wrapped.body.diff, std::fs::read_to_string(&diff_path).unwrap());
@@ -1076,7 +1077,7 @@ mod tests {
         )
         .unwrap();
 
-        let out = RecordsGatherStepKind.run(&step(json!({})), &task(), &BTreeMap::new()).unwrap();
+        let out = RecordsGatherStepKind.run(&step(json!({})), &task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         let wrapped = crate::step_output::Output::<GatherOutput>::read(&out.output, RECORDS_GATHER_OUTPUT_KIND).unwrap();
         // (#2310 P4c-2b PR #2357 review CONSIDER F, proven wrong) A
         // gate-failed mod is a DOUBLE-CHECK thread (`render_github_review`
@@ -1136,12 +1137,13 @@ mod tests {
                 config: json!({}),
                 started_ts: None,
                 completed_ts: None,
+                // flow-action-guard:allow — step output prose, not an action
                 output: Some("dispatch error".into()),
             },
         )
         .unwrap();
 
-        let out = RecordsGatherStepKind.run(&step(json!({})), &task(), &BTreeMap::new()).unwrap();
+        let out = RecordsGatherStepKind.run(&step(json!({})), &task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         let wrapped = crate::step_output::Output::<GatherOutput>::read(&out.output, RECORDS_GATHER_OUTPUT_KIND).unwrap();
         assert_eq!(wrapped.body.scope.refused, 3, "{:?}", wrapped.body.scope);
         assert!(
@@ -1221,7 +1223,7 @@ mod tests {
         }
 
         let out = RecordsGatherStepKind
-            .run(&step(json!({ "diff_file": diff_path.to_string_lossy() })), &task(), &BTreeMap::new())
+            .run(&step(json!({ "diff_file": diff_path.to_string_lossy() })), &task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test())
             .unwrap();
         let wrapped = crate::step_output::Output::<GatherOutput>::read(&out.output, RECORDS_GATHER_OUTPUT_KIND).unwrap();
         let scope = &wrapped.body.scope;
@@ -1254,7 +1256,7 @@ mod tests {
         save_unit_step("unit-step-3", "union-vs-enum", "u-0001", NodeStatus::Complete);
 
         let out = RecordsGatherStepKind
-            .run(&step(json!({ "diff_file": diff_path.to_string_lossy() })), &task(), &BTreeMap::new())
+            .run(&step(json!({ "diff_file": diff_path.to_string_lossy() })), &task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test())
             .unwrap();
         let wrapped = crate::step_output::Output::<GatherOutput>::read(&out.output, RECORDS_GATHER_OUTPUT_KIND).unwrap();
         assert_eq!(wrapped.body.scope.hunks_covered, 2, "{:?}", wrapped.body.scope);
@@ -1286,7 +1288,7 @@ mod tests {
         save_unit_step_with_result("unit-step-2", "union-vs-enum", "u-0001", NodeStatus::Complete, "thermal_stop");
 
         let out = RecordsGatherStepKind
-            .run(&step(json!({ "diff_file": diff_path.to_string_lossy() })), &task(), &BTreeMap::new())
+            .run(&step(json!({ "diff_file": diff_path.to_string_lossy() })), &task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test())
             .unwrap();
         let wrapped = crate::step_output::Output::<GatherOutput>::read(&out.output, RECORDS_GATHER_OUTPUT_KIND).unwrap();
         let scope = &wrapped.body.scope;
@@ -1363,7 +1365,7 @@ mod tests {
         diff_with_n_hunks(&diff_path, &["a.ts", "b.ts", "c.ts", "d.ts"]);
 
         let out = RecordsGatherStepKind
-            .run(&step(json!({ "diff_file": diff_path.to_string_lossy() })), &task(), &BTreeMap::new())
+            .run(&step(json!({ "diff_file": diff_path.to_string_lossy() })), &task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test())
             .unwrap();
         let wrapped = crate::step_output::Output::<GatherOutput>::read(&out.output, RECORDS_GATHER_OUTPUT_KIND).unwrap();
         assert_eq!(wrapped.body.scope.rules_run, vec!["existing-solution".to_string(), "union-vs-enum".to_string()]);
@@ -1396,7 +1398,7 @@ mod tests {
         diff_with_n_hunks(&diff_path, &["a.ts", "b.ts"]);
 
         let out = RecordsGatherStepKind
-            .run(&step(json!({ "diff_file": diff_path.to_string_lossy() })), &task(), &BTreeMap::new())
+            .run(&step(json!({ "diff_file": diff_path.to_string_lossy() })), &task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test())
             .unwrap();
         let wrapped = crate::step_output::Output::<GatherOutput>::read(&out.output, RECORDS_GATHER_OUTPUT_KIND).unwrap();
         assert_eq!(
@@ -1411,7 +1413,7 @@ mod tests {
     fn a_task_naming_an_unrecorded_phase_is_refused_by_name() {
         let _tmp = IsolatedState::new();
         // No `save_phase()` call — the phase record does not exist.
-        let err = RecordsGatherStepKind.run(&step(json!({})), &task(), &BTreeMap::new()).unwrap_err();
+        let err = RecordsGatherStepKind.run(&step(json!({})), &task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap_err();
         assert!(err.to_string().contains(PHASE), "{err}");
     }
 
@@ -1428,7 +1430,7 @@ mod tests {
         findings::materialize(&findings::findings_dir(), &a_finding("sess-a", 1, Some(MISSION))).unwrap();
 
         let gather_out =
-            RecordsGatherStepKind.run(&step(json!({})), &task(), &BTreeMap::new()).unwrap();
+            RecordsGatherStepKind.run(&step(json!({})), &task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         let mut input = BTreeMap::new();
         input.insert("records-gather-step".to_string(), gather_out.output);
 
@@ -1444,7 +1446,7 @@ mod tests {
             output: None,
         };
         let outcome =
-            super::super::deliver_github_review::DeliverGithubReviewStepKind.run(&deliver_step, &task(), &input).unwrap();
+            super::super::deliver_github_review::DeliverGithubReviewStepKind.run(&deliver_step, &task(), &input, &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         // (#2310 fix-loop E2) The deliver step's output is a promotable
         // `{mode, summary, emit}` object; the destination is the `emit`
         // field.
@@ -1519,7 +1521,7 @@ mod tests {
         std::fs::write(&diff_path, "diff --git a/a.ts b/a.ts\n--- a/a.ts\n+++ a.ts\n@@ -1,1 +1,1 @@\n-old\n+export function foo() { return 1; }\n").unwrap();
 
         let gather_out = RecordsGatherStepKind
-            .run(&step(json!({ "diff_file": diff_path.to_string_lossy() })), &task(), &BTreeMap::new())
+            .run(&step(json!({ "diff_file": diff_path.to_string_lossy() })), &task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test())
             .unwrap();
         // The backstop's own finding-level output, before it ever reaches
         // `deliver.github_review` — proves the WIRING point, not just the
@@ -1544,7 +1546,7 @@ mod tests {
             completed_ts: None,
             output: None,
         };
-        super::super::deliver_github_review::DeliverGithubReviewStepKind.run(&deliver_step, &task(), &input).unwrap();
+        super::super::deliver_github_review::DeliverGithubReviewStepKind.run(&deliver_step, &task(), &input, &crate::step_kinds::StepRunCtx::for_test()).unwrap();
 
         let posted: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&emit_path).unwrap()).unwrap();
         let body = posted["review"]["comments"][0]["body"].as_str().expect("one posted comment");
@@ -1581,12 +1583,13 @@ mod tests {
                 config: json!({}),
                 started_ts: None,
                 completed_ts: None,
+                // flow-action-guard:allow — step output prose, not an action
                 output: Some("dispatch error".into()),
             },
         )
         .unwrap();
 
-        let out = RecordsGatherStepKind.run(&step(json!({})), &task(), &BTreeMap::new()).unwrap();
+        let out = RecordsGatherStepKind.run(&step(json!({})), &task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         let wrapped = crate::step_output::Output::<GatherOutput>::read(&out.output, RECORDS_GATHER_OUTPUT_KIND).unwrap();
         assert!(
             wrapped.body.scope.errored.iter().any(|e| e.contains("crawl.summary") && e.contains("weird-step-1")),
@@ -1625,7 +1628,7 @@ mod tests {
         )
         .unwrap();
 
-        let out = RecordsGatherStepKind.run(&step(json!({})), &task(), &BTreeMap::new()).unwrap();
+        let out = RecordsGatherStepKind.run(&step(json!({})), &task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         let wrapped = crate::step_output::Output::<GatherOutput>::read(&out.output, RECORDS_GATHER_OUTPUT_KIND).unwrap();
         assert!(
             wrapped.body.scope.errored.is_empty(),
@@ -1689,7 +1692,7 @@ mod tests {
         )
         .unwrap();
 
-        let out = RecordsGatherStepKind.run(&step(json!({})), &task(), &BTreeMap::new()).unwrap();
+        let out = RecordsGatherStepKind.run(&step(json!({})), &task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         let wrapped = crate::step_output::Output::<GatherOutput>::read(&out.output, RECORDS_GATHER_OUTPUT_KIND).unwrap();
         assert!(
             wrapped.body.scope.errored.is_empty(),
@@ -1724,6 +1727,7 @@ mod tests {
                 config: json!({}),
                 started_ts: None,
                 completed_ts: None,
+                // flow-action-guard:allow — step output prose, not an action
                 output: Some("dispatch error".into()),
             },
         )
@@ -1745,7 +1749,7 @@ mod tests {
         )
         .unwrap();
 
-        let out = RecordsGatherStepKind.run(&step(json!({})), &task(), &BTreeMap::new()).unwrap();
+        let out = RecordsGatherStepKind.run(&step(json!({})), &task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         let wrapped = crate::step_output::Output::<GatherOutput>::read(&out.output, RECORDS_GATHER_OUTPUT_KIND).unwrap();
         assert!(
             wrapped.body.scope.errored.is_empty(),
@@ -1784,12 +1788,13 @@ mod tests {
                 config: json!({ "rule": "existing-solution" }),
                 started_ts: None,
                 completed_ts: None,
+                // flow-action-guard:allow — step output prose, not an action
                 output: Some("dispatch error".into()),
             },
         )
         .unwrap();
 
-        let out = RecordsGatherStepKind.run(&step(json!({})), &task(), &BTreeMap::new()).unwrap();
+        let out = RecordsGatherStepKind.run(&step(json!({})), &task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         let wrapped = crate::step_output::Output::<GatherOutput>::read(&out.output, RECORDS_GATHER_OUTPUT_KIND).unwrap();
         assert!(
             wrapped.body.scope.not_attempted.contains(&"existing-solution".to_string()),
@@ -1834,7 +1839,7 @@ mod tests {
         )
         .unwrap();
 
-        let out = RecordsGatherStepKind.run(&step(json!({})), &task(), &BTreeMap::new()).unwrap();
+        let out = RecordsGatherStepKind.run(&step(json!({})), &task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         let wrapped = crate::step_output::Output::<GatherOutput>::read(&out.output, RECORDS_GATHER_OUTPUT_KIND).unwrap();
         assert_eq!(
             wrapped.body.scope.refused, 0,
@@ -1864,7 +1869,7 @@ mod tests {
         std::fs::create_dir_all(&steps_dir).unwrap();
         std::fs::write(steps_dir.join("corrupt.json"), "{ not valid json at all").unwrap();
 
-        let out = RecordsGatherStepKind.run(&step(json!({})), &task(), &BTreeMap::new()).unwrap();
+        let out = RecordsGatherStepKind.run(&step(json!({})), &task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         let wrapped = crate::step_output::Output::<GatherOutput>::read(&out.output, RECORDS_GATHER_OUTPUT_KIND).unwrap();
         assert!(
             wrapped.body.unreadable.iter().any(|u| u.contains(PHASE)),

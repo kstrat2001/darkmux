@@ -237,6 +237,7 @@ mod tests {
 
     #[test]
     fn a_spaced_bookend_is_upgraded_in_place() {
+        // flow-action-guard:allow — an old spelling is this test's input
         let mut v = json!({"action": "dispatch start", "handle": "coder"});
         assert_eq!(upgrade(&mut v), ActionRead::Upgraded);
         assert_eq!(v["action"], "dispatch.start");
@@ -267,6 +268,7 @@ mod tests {
 
     #[test]
     fn the_typed_and_json_reads_agree_on_a_retired_spelling() {
+        // flow-action-guard:allow — an old spelling is this test's input
         let line = r#"{"ts":"t","level":"info","category":"work","tier":"local","stage":"dispatch","action":"step result","handle":"h"}"#;
         assert_eq!(parse_record(line).unwrap().action, FlowAction::StepResult);
         let v = parse_value(line).unwrap();
@@ -280,6 +282,7 @@ mod tests {
         assert!(matches!(upgrade_line(current), Some(std::borrow::Cow::Borrowed(l)) if l == current));
         let unknown = r#"{"action":"future.thing"}"#;
         assert_eq!(upgrade_line(unknown).unwrap(), unknown);
+        // flow-action-guard:allow — an old spelling is this test's input
         let old = r#"{"action":"dispatch start","handle":"h"}"#;
         let up: Value = serde_json::from_str(&upgrade_line(old).unwrap()).unwrap();
         assert_eq!(up["action"], "dispatch.start");
@@ -323,6 +326,7 @@ mod tests {
             std::fs::write(tmp.path().join(format!("{day}.jsonl")), body).unwrap();
         };
         write("2026-01-01", &["ancient.thing"]);
+        // flow-action-guard:allow — an old spelling is this test's input
         write("2026-01-02", &["future.thing", "dispatch start"]);
         write("2026-01-03", &["future.thing", "dispatch.turn"]);
         std::fs::write(tmp.path().join("notes.jsonl"), "{\"action\":\"not.a.day\"}\n").unwrap();
@@ -347,6 +351,7 @@ mod tests {
             tally.observe(&v);
             assert_eq!(tally.total(), 0, "{wire} is retired, not unknown");
         }
+        // flow-action-guard:allow — an old spelling is this test's input
         let mut sprint = json!({ "action": "sprint start" });
         assert_eq!(upgrade(&mut sprint), ActionRead::Upgraded);
         assert_eq!(sprint["action"], "phase.start");
@@ -377,12 +382,14 @@ mod tests {
     #[test]
     fn unknown_actions_are_counted_by_name_and_known_ones_are_not() {
         let mut tally = UnknownActions::default();
+        // flow-action-guard:allow — an old spelling is this test's input
         for a in ["future.thing", "future.thing", "dispatch start", "dispatch.turn", "other.x"] {
             tally.observe(&json!({ "action": a }));
         }
         assert_eq!(tally.total(), 3);
         assert_eq!(tally.by_name().get("future.thing"), Some(&2));
         assert_eq!(tally.by_name().get("other.x"), Some(&1));
+        // flow-action-guard:allow — an old spelling is this test's input
         assert!(!tally.by_name().contains_key("dispatch start"), "a retired spelling is upgraded, not unknown");
     }
 }

@@ -52,7 +52,7 @@ import { currentRun, runIndex, type RunGroup } from "../../lib/runRef";
  *  entry per `(session, mission)` run, so two missions sharing a session id
  *  are two runs, and one mission's end never closes the other's (#2125).
  *  `presence` only adds: it holds a silent run open, never a closed one. */
-export function runningRuns(data: NormRecord[], presence: Presence, m: string, t: number, policy: LifecyclePolicy = DEFAULT_POLICY): RunGroup[] {
+function runningRuns(data: NormRecord[], presence: Presence, m: string, t: number, policy: LifecyclePolicy = DEFAULT_POLICY): RunGroup[] {
   return runIndex(data)
     .groupsOn(m)
     .filter((g) => g.grain !== "lifecycle" && isRunning(lifecycleAt(currentRun(g, t), t, policy, presence)));
@@ -126,7 +126,7 @@ export function specOf(
  * drill-in lands on the mission, not on whichever seat happened to be seen
  * first). A run with no mission (a standalone dispatch, a lab run) always
  * counts on its own. */
-export function topLevelRuns(runs: readonly RunGroup[]): RunGroup[] {
+function topLevelRuns(runs: readonly RunGroup[]): RunGroup[] {
   const standalone: RunGroup[] = [];
   const repForMission = new Map<string, RunGroup>();
   for (const g of runs) {
@@ -183,7 +183,7 @@ export function topLevelRuns(runs: readonly RunGroup[]): RunGroup[] {
  * `/runs` is deliberately NOT counted here — that activity is already
  * accounted for by the flow runs (via `topLevelRuns` above,
  * post-#2060), and counting it again here would double-count it. */
-export function runningLabRunCount(machineRuns: Run[]): number {
+function runningLabRunCount(machineRuns: Run[]): number {
   return machineRuns.filter((r) => r.kind === "lab" && r.status === "running").length;
 }
 

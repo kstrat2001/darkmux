@@ -929,7 +929,7 @@ mod tests {
         std::fs::write(
             &day_file,
             format!(
-                r#"{{"ts":"{today}T10:00:00Z","action":"mission start","mission_id":"{MISSION_ID}","machine_id":"{PEER}"}}"#
+                r#"{{"ts":"{today}T10:00:00Z","action":"mission.start","mission_id":"{MISSION_ID}","machine_id":"{PEER}"}}"#
             ) + "\n",
         )
         .unwrap();

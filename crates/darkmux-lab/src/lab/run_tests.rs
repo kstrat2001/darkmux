@@ -62,10 +62,11 @@ impl WorkloadProvider for ScriptedProvider {
         _: &str,
         _: Option<&str>,
         _: Option<&crate::lab::loop_report::LoopCompactionOverride>,
-        on_session_id: &mut dyn FnMut(&str),
+        run: &darkmux_types::session_id::RunId,
+        on_session_id: &mut dyn FnMut(&darkmux_types::session_id::SessionId),
     ) -> Result<RunResult> {
         let s = SCRIPT.lock().unwrap().clone().unwrap_or_default();
-        on_session_id("darkmux-stub-scripted");
+        on_session_id(&darkmux_types::session_id::SessionId::adhoc(run.clone(), "stub", "darkmux-stub-scripted"));
         let nth = SCRIPT_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         if s.run_err_on_call == Some(nth) {
             return Err(anyhow!("scripted failure on run {nth}"));

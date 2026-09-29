@@ -11,6 +11,7 @@ use crate::workloads::types::{
     InspectionReport, LoadedWorkload, RunMode, RunResult, WorkloadProvider,
 };
 use anyhow::{anyhow, bail, Context, Result};
+use darkmux_types::session_id::{RunId, SessionId};
 // (#875) `env` is now only used in tests (the default_role read moved to
 // config_access); gate the import so the non-test build has no unused-import
 // warning under `-D warnings`.
@@ -19,7 +20,6 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) struct CodingTaskProvider;
 
@@ -223,7 +223,8 @@ impl WorkloadProvider for CodingTaskProvider {
         profile_name: &str,
         config_path: Option<&str>,
         loop_override: Option<&crate::lab::loop_report::LoopCompactionOverride>,
-        on_session_id: &mut dyn FnMut(&str),
+        run: &RunId,
+        on_session_id: &mut dyn FnMut(&SessionId),
     ) -> Result<RunResult> {
         // (#365/#544) The profile↔loaded envelope check now lives once at
         // the lab-run level (`lab::run` → `profile_check::envelope_warnings`,
@@ -235,16 +236,7 @@ impl WorkloadProvider for CodingTaskProvider {
         let raw_prompt = resolve_prompt(loaded)?;
         let prompt = expand_placeholders_with(&raw_prompt, "/workspace");
         let role = pick_role(loaded);
-        // (#1436) Through the canonical session-id helper; byte-identical shape.
-        let session_id = darkmux_types::session_id::session_id(
-            "darkmux-coding",
-            &loaded.manifest.workload.id,
-            &SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0)
-                .to_string(),
-        );
+        let session_id = SessionId::adhoc(run.clone(), &role, &loaded.manifest.workload.id);
         // (#2511) Report the id back to the lab harness BEFORE dispatching —
         // this is the ONE mint for this run, so it is the run's own
         // governing dispatch session.
@@ -756,7 +748,7 @@ fn pick_role(loaded: &LoadedWorkload) -> String {
 fn dispatch_via_internal(
     role_id: &str,
     prompt: &str,
-    session_id: &str,
+    session_id: &SessionId,
     workdir: Option<PathBuf>,
     compaction: darkmux_crew::dispatch::CompactionDispatchArgs,
     profile_name: &str,
@@ -780,7 +772,7 @@ fn dispatch_via_internal(
         timeout_override_seconds: None, // (#2480)
         role_id: role_id.to_string(),
         message: prompt.to_string(),
-        session_id: Some(session_id.to_string()),
+        session: session_id.clone(),
         timeout_seconds: 3600,
         skip_preflight: false,
         json: true,
@@ -1288,6 +1280,10 @@ mod tests {
             verify: None,
             expected: None,
             image: None,
+            trials: None,
+            task_timeout_seconds: None,
+            chain_depths: None,
+            seed: None,
             extras: BTreeMap::new(),
         }
     }

@@ -15,7 +15,7 @@ const PHASE_PER_TPS = 0.09;
 /** Up to this many radians per frame the step is the prototype's exactly
  *  (0.35 of a lobe: at 120 Hz everything up to 40 tok/s is unchanged).
  *  Above it the step is compressed smoothly toward `PHASE_STEP_CAP`. */
-export const PHASE_STEP_KNEE = 0.35 * Math.PI * 2;
+const PHASE_STEP_KNEE = 0.35 * Math.PI * 2;
 /** The most the wave may move per frame, 0.45 of a lobe, under Nyquist (half
  *  a lobe, `π` in phase). A `k`-lobe pattern that jumps more than half a lobe
  *  between two frames reads as moving BACKWARD (the issue's measurement: on
@@ -73,13 +73,13 @@ export interface LobeBlend {
   mix: number;
 }
 
-export const LOBE_MIN = 3;
-export const LOBE_MAX = 8;
+const LOBE_MIN = 3;
+const LOBE_MAX = 8;
 const LOBE_PER_TPS = 1 / 22;
 /** The count only moves when the rate's own (fractional) count is more than
  *  this far from the drawn one, so a rate hovering at a boundary does not
  *  flicker between two counts. */
-export const LOBE_HYSTERESIS = 0.6;
+const LOBE_HYSTERESIS = 0.6;
 /** How long a crossfade between two counts takes, in seconds. */
 export const LOBE_FADE_SEC = 0.6;
 

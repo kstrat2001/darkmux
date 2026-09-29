@@ -21,6 +21,7 @@ const proc = (
   ts,
   category: "telemetry",
   source: "process",
+  // flow-action-guard:allow — a retired action, as an archive still holds it
   action: "telemetry.process",
   payload: { cpu, gpu, mem },
 });
@@ -509,6 +510,7 @@ describe("MachineDrawer — idle state (no samples)", () => {
       ts: new Date(NOW - 60 * 60_000).toISOString(), // 1h before NOW
       category: "telemetry",
       source: "process",
+      // flow-action-guard:allow — a retired action, as an archive still holds it
       action: "telemetry.process",
       payload: { cpu: 40, gpu: 55, mem: 30 },
     });

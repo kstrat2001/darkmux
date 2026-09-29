@@ -836,13 +836,13 @@ fn fixture_json() -> &'static str {
             "fast": {
                 "description": "bounded tasks",
                 "models": [
-                    {"id": "model-a", "n_ctx": 32000, "role": "primary"}
+                    {"id": "model-a", "n_ctx": 32000}
                 ]
             },
             "deep": {
                 "description": "long tasks",
                 "models": [
-                    {"id": "model-a", "n_ctx": 100000, "role": "primary"},
+                    {"id": "model-a", "n_ctx": 100000},
                     {"id": "model-b", "n_ctx": 50000, "role": "compactor"}
                 ]
             }
@@ -2169,7 +2169,7 @@ fn lab_run_quick_q_from_clean_cwd_uses_embedded_workload() {
                 "deep": {
                     "description": "test deep stack",
                     "models": [
-                        {"id": "model-a", "n_ctx": 100000, "role": "primary"}
+                        {"id": "model-a", "n_ctx": 100000}
                     ]
                 }
             },
@@ -3343,7 +3343,7 @@ fn dispatch_host_side_unset_compactor_disclosure_fires_on_the_local_path() {
                 "fast": {
                     "description": "no compactor bound, a real context window",
                     "models": [
-                        {"id": "model-a", "n_ctx": 32000, "role": "primary"}
+                        {"id": "model-a", "n_ctx": 32000}
                     ]
                 }
             },
@@ -3480,7 +3480,7 @@ fn dispatch_with_fake_docker(
     let profiles_path = tmp.join("profiles.json");
     fs::write(
         &profiles_path,
-        r#"{"profiles":{"fast":{"models":[{"id":"model-a","n_ctx":32000,"role":"primary"}]}},"default_profile":"fast"}"#,
+        r#"{"profiles":{"fast":{"models":[{"id":"model-a","n_ctx":32000}]}},"default_profile":"fast"}"#,
     )
     .unwrap();
     let ack_dir = tmp.join("ack");
@@ -4163,7 +4163,11 @@ fn serve_sigterm_reaps_the_fleet_runners_curl_child() {
         "cli-test-serve-node".to_string(),
         "dialectic-judge".to_string(),
         "hang please".to_string(),
-        "cli-test-serve-sigterm-session".to_string(),
+        darkmux_types::session_id::SessionId::adhoc(
+            darkmux_types::session_id::RunId::mission("cli-test").unwrap(),
+            "dialectic-judge",
+            "cli-test-serve-sigterm-session",
+        ),
         None,
         None,
         None,
@@ -6681,12 +6685,12 @@ fn run_list_usage_breakdown_end_to_end() {
         serde_json::json!({ "ts": now, "action": "telemetry.tokens", "category": "telemetry", "source": "tokens", "session_id": sid, "handle": "coder", "payload": payload })
     };
     let records = [
-        serde_json::json!({ "ts": now, "action": "dispatch start", "session_id": "sess-modern", "handle": "coder" }),
+        serde_json::json!({ "ts": now, "action": "dispatch.start", "session_id": "sess-modern", "handle": "coder" }),
         usage("sess-modern", serde_json::json!({ "call_kind": "turn", "purpose": "work", "requested_model": "qwen-a", "reported_model": "qwen-a-served", "endpoint": "http://127.0.0.1:1234/v1", "token_source": "provider", "prompt_tokens": 1000, "completion_tokens": 200, "total_tokens": 1200, "cached_tokens": 300 })),
         usage("sess-modern", serde_json::json!({ "call_kind": "compaction", "purpose": "utility", "requested_model": "util-4b", "endpoint": "http://127.0.0.1:1234/v1", "token_source": "provider", "prompt_tokens": 80, "completion_tokens": 10, "total_tokens": 90 })),
-        serde_json::json!({ "ts": now, "action": "dispatch complete", "session_id": "sess-modern", "handle": "coder", "payload": { "total_tokens": 99_999 } }),
-        serde_json::json!({ "ts": now, "action": "dispatch start", "session_id": "sess-legacy", "handle": "reviewer" }),
-        serde_json::json!({ "ts": now, "action": "dispatch complete", "session_id": "sess-legacy", "handle": "reviewer", "payload": { "total_tokens": 700, "prompt_tokens": 600, "completion_tokens": 100 } }),
+        serde_json::json!({ "ts": now, "action": "dispatch.complete", "session_id": "sess-modern", "handle": "coder", "payload": { "total_tokens": 99_999 } }),
+        serde_json::json!({ "ts": now, "action": "dispatch.start", "session_id": "sess-legacy", "handle": "reviewer" }),
+        serde_json::json!({ "ts": now, "action": "dispatch.complete", "session_id": "sess-legacy", "handle": "reviewer", "payload": { "total_tokens": 700, "prompt_tokens": 600, "completion_tokens": 100 } }),
     ];
     let body: String = records.iter().map(|r| format!("{r}\n")).collect();
     fs::write(flows.path().join(format!("{day}.jsonl")), body).unwrap();
@@ -9032,6 +9036,7 @@ fn mission_status_recorded_session_end_describes_an_observation_not_an_absence()
     );
     let suggest: Vec<&str> = hit["suggest"].as_array().unwrap().iter().map(|s| s.as_str().unwrap()).collect();
     assert!(
+        // flow-action-guard:allow — the CLI verb, not an action
         suggest.iter().any(|s| s.contains("mission abort")),
         "a positively recorded end is a reasonable abort case: {suggest:?}"
     );
@@ -9076,7 +9081,7 @@ fn mission_status_stale_session_with_no_terminal_drifts_and_renders_for_a_human(
         flows.path().join(format!("{day}.jsonl")),
         serde_json::json!({
             "ts": "2024-01-01T09:00:00Z",
-            "action": "dispatch start",
+            "action": "dispatch.start",
             "session_id": "e2e-stale-session",
             "mission_id": "stale-session-e2e",
             "handle": "coder",
@@ -9108,6 +9113,7 @@ fn mission_status_stale_session_with_no_terminal_drifts_and_renders_for_a_human(
     );
     let suggest: Vec<&str> = hit["suggest"].as_array().unwrap().iter().map(|s| s.as_str().unwrap()).collect();
     assert!(
+        // flow-action-guard:allow — the CLI verb, not an action
         suggest.iter().any(|s| s.contains("mission abort")),
         "a genuinely stale session is a real abort case: {suggest:?}"
     );
@@ -11622,7 +11628,7 @@ fn write_peer_mission_day_file(
     let start = now - 3600;
     let (day, start_ts) = utc_day_and_ts(start);
     let (_, close_ts) = utc_day_and_ts(start + 300);
-    let mut lines = vec![rec(&start_ts, "mission start")];
+    let mut lines = vec![rec(&start_ts, "mission.start")];
     if let Some(action) = terminal_action {
         lines.push(rec(&close_ts, action));
     }
@@ -12990,4 +12996,144 @@ fn lab_characterize_sigterm_mid_dispatch_finalizes_lifecycle_interrupted() {
 #[test]
 fn lab_tune_sigterm_mid_dispatch_finalizes_lifecycle_interrupted() {
     assert_lab_verb_sigterm_finalizes_interrupted(&["lab", "tune"], "lab tune");
+}
+
+/// Where a spawn built by [`darkmux_std_cmd`] puts its darkmux root.
+fn darkmux_home_of(cmd: &std::process::Command) -> std::path::PathBuf {
+    cmd.get_envs()
+        .find(|(k, _)| *k == "DARKMUX_HOME")
+        .and_then(|(_, v)| v.map(std::path::PathBuf::from))
+        .expect("the spawn helper sets DARKMUX_HOME")
+}
+
+/// (4.0) A user file with a key its schema does not know is refused at
+/// preflight by every CLI entry point that consumes it, naming the file,
+/// the key and the closest valid key, before anything is minted. `PATH` is
+/// empty, so an entry point that skipped the gate fails for some other
+/// reason and the text assertions turn red.
+#[test]
+fn an_unknown_key_in_a_user_file_is_refused_by_every_consuming_entry_point() {
+    let empty_path = TempDir::new().unwrap();
+    // (file under DARKMUX_HOME, its text, the key path, the closest key, the entry points that consume it)
+    let role = r#"{"id":"probe-role","description":"d","tool_palette":{"allow":[]},"escalation_contract":"bail-with-explanation","skils":[]}"#;
+    let mission = r#"{"id":"probe-mc","name":"P","phase":[]}"#;
+    let workload = r#"{"workload":{"id":"probe-wl","provider":"prompt","promt":"hi"}}"#;
+    let dispatch: &[&str] = &["dispatch", "code-reviewer", "hello"];
+    let launch: &[&str] = &["mission", "launch", "review", "--dry-run"];
+    let lab: &[&str] = &["lab", "run", "quick-q"];
+    // `config.json` is not among them: this binary's test build reads an
+    // empty config tier by construction (#811), so its file is covered by
+    // `darkmux-types`' `user_files` tests against the same check.
+    type EntryPoints<'a> = &'a [&'a [&'a str]];
+    let cases: &[(&str, &str, &str, &str, EntryPoints)] = &[
+        ("roles/probe-role.json", role, "skils", "skills", &[dispatch, launch, lab]),
+        ("mission-configs/probe-mc.json", mission, "phase", "phases", &[launch]),
+        ("workloads/probe-wl.json", workload, "workload.promt", "workload.prompt", &[lab]),
+    ];
+    let mut exercised = 0;
+    for (file, text, key, closest, entry_points) in cases {
+        for args in *entry_points {
+            let mut cmd = darkmux_std_cmd();
+            cmd.env("PATH", empty_path.path()).args(*args);
+            let home = darkmux_home_of(&cmd);
+            let path = home.join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, text).unwrap();
+            let out = cmd.output().unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(!out.status.success(), "{args:?} with a bad {file} succeeded: {stderr}");
+            assert!(stderr.contains("refusing to start: bad config"), "{args:?}: {stderr}");
+            assert!(stderr.contains(&path.display().to_string()), "{args:?}: names the file: {stderr}");
+            assert!(
+                stderr.contains(&format!("unknown key `{key}`: did you mean `{closest}`?")),
+                "{args:?}: names the key and the closest: {stderr}"
+            );
+            let mut written = Vec::new();
+            collect_files(&home, &mut written);
+            written.retain(|p| p != &path && !p.components().any(|c| c.as_os_str() == "liveness"));
+            assert!(written.is_empty(), "{args:?} wrote state before refusing: {written:?}");
+            exercised += 1;
+        }
+    }
+    assert_eq!(exercised, 5);
+}
+
+/// `darkmux doctor` runs to completion against a user file that is not JSON
+/// and one with an unknown key, reporting each as a Fail row with the
+/// preflight's message. (A role manifest stands in for `config.json`, which
+/// this binary's test build does not read, #811.)
+#[test]
+fn doctor_runs_to_completion_against_broken_user_files() {
+    for (text, expect) in [
+        (r#"{"id": "#, "not valid JSON"),
+        (
+            r#"{"id":"probe-role","description":"d","tool_palette":{"alow":[]},"escalation_contract":"bail-with-explanation"}"#,
+            "unknown key `tool_palette.alow`: did you mean `tool_palette.allow`?",
+        ),
+    ] {
+        let mut cmd = darkmux_std_cmd();
+        cmd.args(["doctor", "-v"]);
+        let home = darkmux_home_of(&cmd);
+        fs::create_dir_all(home.join("roles")).unwrap();
+        fs::write(home.join("roles/probe-role.json"), text).unwrap();
+        let out = cmd.output().unwrap();
+        // Rows wrap to the terminal width; compare with whitespace folded.
+        let stdout = String::from_utf8_lossy(&out.stdout).split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(stdout.contains("user file keys: probe-role.json"), "the row is present: {stdout}");
+        assert!(stdout.contains(expect), "{expect}: {stdout}");
+        assert!(stdout.contains("✓ build"), "doctor ran to completion: {stdout}");
+    }
+}
+
+/// A user role with one mistyped value would be skipped by the loader and
+/// silently replaced by the builtin of the same id. Every consuming entry
+/// point refuses it instead, naming the file, the path, the expected type
+/// and what it got, before minting anything.
+#[test]
+fn a_mistyped_value_in_a_user_file_is_refused_by_every_consuming_entry_point() {
+    let empty_path = TempDir::new().unwrap();
+    let role = r#"{"id":"code-reviewer","description":"d","tool_palette":{"allow":[]},"escalation_contract":"bail-with-explanation","skills":"code-reviewing"}"#;
+    for args in [
+        &["dispatch", "code-reviewer", "hello"][..],
+        &["mission", "launch", "review", "--dry-run"][..],
+        &["lab", "run", "quick-q"][..],
+    ] {
+        let mut cmd = darkmux_std_cmd();
+        cmd.env("PATH", empty_path.path()).args(args);
+        let home = darkmux_home_of(&cmd);
+        let path = home.join("roles/code-reviewer.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, role).unwrap();
+        let out = cmd.output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{args:?} succeeded: {stderr}");
+        assert!(stderr.contains("refusing to start: bad config") && stderr.contains(&path.display().to_string()), "{args:?}: {stderr}");
+        assert!(stderr.contains("`skills` must be a list, got \"code-reviewing\""), "{args:?}: {stderr}");
+        let mut written = Vec::new();
+        collect_files(&home, &mut written);
+        written.retain(|p| p != &path && !p.components().any(|c| c.as_os_str() == "liveness"));
+        assert!(written.is_empty(), "{args:?} wrote state before refusing: {written:?}");
+    }
+}
+
+/// (review C5) The workspace spec a launch input names is read by the plan
+/// steps, after the mission is minted. The launch preflight checks it first,
+/// so a bad spec refuses before anything exists (a dry run too).
+#[test]
+fn a_bad_workspace_spec_is_refused_before_the_launch_mints() {
+    let mut cmd = darkmux_std_cmd();
+    let home = darkmux_home_of(&cmd);
+    fs::create_dir_all(&home).unwrap();
+    let spec = home.join("spec.json");
+    fs::write(&spec, r#"{"name": "w", "sources": [{"id": "a", "path": "/x"}], "sourcs": []}"#).unwrap();
+    cmd.args(["mission", "launch", "crawl", "--param"]).arg(format!("workspace={}", spec.display())).arg("--dry-run");
+    let out = cmd.output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("mission launch: refusing to start: bad config"), "{stderr}");
+    assert!(stderr.contains("workspace spec") && stderr.contains("unknown key `sourcs`: did you mean `sources`?"), "{stderr}");
+    let mut written = Vec::new();
+    collect_files(&home, &mut written);
+    written.retain(|p| p != &spec && !p.components().any(|c| c.as_os_str() == "liveness"));
+    assert!(written.is_empty(), "wrote state before refusing: {written:?}");
 }

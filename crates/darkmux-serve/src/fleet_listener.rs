@@ -85,13 +85,13 @@ pub(crate) struct FleetListenerState {
     pub node_slots: Arc<KeySlots<String>>,
     /// (#2947) This machine's dispatch-scope config preflight, run per
     /// submission before the job is accepted. `Err` carries the refusal
-    /// text. Production: `darkmux_profiles::preflight(Scope::Dispatch)`.
+    /// text. Production: `darkmux_crew::user_files::preflight(Scope::Dispatch)`.
     pub config_preflight: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
 }
 
 /// (#2947) The production config preflight a submission runs.
 pub(crate) fn dispatch_config_preflight() -> Result<(), String> {
-    darkmux_profiles::preflight(darkmux_types::config_enum::Scope::Dispatch).map_err(|e| e.to_string())
+    darkmux_crew::user_files::preflight(darkmux_types::config_enum::Scope::Dispatch).map_err(|e| e.to_string())
 }
 
 impl FleetListenerState {
@@ -453,10 +453,10 @@ fn start_or_refuse(
     state: &FleetListenerState,
     admitted: &Admitted,
     scoped: &ScopedJob,
-    session_id: &str,
+    session_id: &darkmux_types::session_id::SessionId,
     sub: &WorkSubmission,
 ) -> Result<Start, Refusal> {
-    let occupied = match state.seats.try_claim(&scoped.seat, session_id) {
+    let occupied = match state.seats.try_claim(&scoped.seat, &session_id.wire()) {
         Ok(guard) => return Ok(Start::Now(guard)),
         Err(occupied) => occupied,
     };
@@ -579,8 +579,8 @@ impl Worker {
     ) -> Option<(SeatGuard, Admitted, String)> {
         let state = &self.state;
         let receiver = &state.receiver;
-        let sid = &self.job.session_id;
-        let waited = state.seats.claim_waiting(&self.scoped.seat, sid, state.queue_heartbeat, deadline, &|| self.sender_gone(), |o| {
+        let sid = self.job.session_id.wire();
+        let waited = state.seats.claim_waiting(&self.scoped.seat, &sid, state.queue_heartbeat, deadline, &|| self.sender_gone(), |o| {
             if let Some(p) = &self.progress {
                 let _ = p.send(reply_line(&queued_reply(&self.base, receiver, &o.what)));
             }
@@ -666,9 +666,11 @@ async fn submit_handler(
         Err(r) => return refuse(&state, Some(peer_addr.ip()), &r),
     };
 
-    // (#2916 review C2) The receiver's own id for this run, never the
-    // sender's verbatim.
-    sub.job.session_id = darkmux_fleet::receiver_session_id(&sub.job.session_id, &admitted.peer_name);
+    // (#2916 review C2) The receiver's own session for this job, never the
+    // sender's verbatim: a relay of it, in a standalone run, so a peer can
+    // neither reuse one of this machine's sessions nor name one of its
+    // missions.
+    sub.job.session_id = darkmux_types::session_id::SessionId::relay(sub.job.session_id.clone(), &admitted.peer_name);
     // (#2916 re-review C4) A submitted job is never attributed to one of
     // THIS machine's own missions: no allow-list scope grants that, so any
     // `phase_id` the sender set is dropped here.
@@ -1225,7 +1227,7 @@ mod tests {
                 origins_c.lock().unwrap().push(origin);
                 std::thread::sleep(Duration::from_millis(job_ms));
                 assert!(job.phase_id.is_none(), "a submitted job's phase_id must be dropped (#2916 re-review C4)");
-                ran_c.lock().unwrap().push((job.session_id.clone(), profile.clone()));
+                ran_c.lock().unwrap().push((job.session_id.wire(), profile.clone()));
                 Ok(DispatchResult {
                     exit_code: 0,
                     stdout: format!("ran {} on {profile}", job.role_id),
@@ -1262,12 +1264,28 @@ mod tests {
         test_node("nLAPTOP", "macbook-pro", "127.0.0.1")
     }
 
+    /// The sender's session `nonce`: an ad-hoc `radio-host` dispatch in its
+    /// mission `m-1`.
+    fn sender(nonce: &str) -> darkmux_types::session_id::SessionId {
+        darkmux_types::session_id::SessionId::adhoc(
+            darkmux_types::session_id::RunId::mission("m-1").unwrap(),
+            "radio-host",
+            nonce,
+        )
+    }
+
+    /// The receiver's relay session for the sender's `nonce` from the
+    /// laptop, as a wire string.
+    fn relay(nonce: &str) -> String {
+        darkmux_types::session_id::SessionId::relay(sender(nonce), "macbook-pro").wire()
+    }
+
     fn job(session: &str, profile: Option<&str>) -> WorkJob {
         darkmux_fleet::build_work_job(
             "studio".into(),
             "radio-host".into(),
             "hello".into(),
-            session.into(),
+            sender(session),
             profile.map(str::to_string),
             None,
             Some("receivers-own-phase".into()),
@@ -1290,8 +1308,8 @@ mod tests {
         assert_eq!(reply.exit_code, Some(0));
         assert_eq!(reply.stdout.as_deref(), Some("ran radio-host on host"));
         assert_eq!(reply.profile.as_deref(), Some("host"));
-        assert_eq!(reply.session_id.as_deref(), Some("s-ok-from-macbook-pro"), "the receiver's own session id");
-        assert_eq!(h.ran.lock().unwrap().as_slice(), &[("s-ok-from-macbook-pro".to_string(), "host".to_string())]);
+        assert_eq!(reply.session_id.map(|s| s.wire()), Some(relay("s-ok")), "the receiver's own session id");
+        assert_eq!(h.ran.lock().unwrap().as_slice(), &[(relay("s-ok"), "host".to_string())]);
     }
 
     /// Every refusal over real HTTP: immediate, with the reason, and nothing
@@ -1420,7 +1438,7 @@ mod tests {
         assert_eq!(code, 503);
         let reason = reply.reason.unwrap();
         assert!(reason.starts_with("busy: studio"), "{reason}");
-        assert!(reason.contains("s-long-from-macbook-pro is running on big"), "names what is running: {reason}");
+        assert!(reason.contains(&format!("{} is running on big", relay("s-long"))), "names what is running: {reason}");
         assert!(started.elapsed() < Duration::from_millis(500), "busy is answered at once, not queued");
         // The seat frees when the first job ends.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -1481,9 +1499,9 @@ mod tests {
         assert_eq!(reply.stdout.as_deref(), Some("ran radio-host on host"));
         assert!(!progress.is_empty(), "the sender was never told it waits");
         let first = progress[0].reason.clone().unwrap();
-        assert!(first.contains("queued") && first.contains("s-first-from-macbook-pro"), "{first}");
+        assert!(first.contains("queued") && first.contains(&relay("s-first")), "{first}");
         let ran = h.ran.lock().unwrap().clone();
-        assert_eq!(ran.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>(), vec!["s-first-from-macbook-pro", "s-second-from-macbook-pro"]);
+        assert_eq!(ran.iter().map(|(s, _)| s.clone()).collect::<Vec<_>>(), vec![relay("s-first"), relay("s-second")]);
     }
 
     /// (#2916 stage 2) `queue` without `--wait`: the answer is `queued`,
