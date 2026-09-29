@@ -397,6 +397,9 @@ pub(crate) fn panel_spec(id: &str) -> Option<PanelSpec> {
     Some(PanelSpec { id, argv, auto_refresh, cache_ttl: ttl, opts, needs_fleet_snapshot, audience })
 }
 
+/// The `(name, value)` opt selections an alias forces.
+type ForcedOpts = &'static [(&'static str, &'static str)];
+
 /// One-release compatibility alias (#1911): the pre-opts client still
 /// requests `mission-status-all` by id (it has not yet migrated to
 /// `opt.all=all` — that migration is a separate, client-side PR). Resolves
@@ -409,7 +412,7 @@ pub(crate) fn panel_spec(id: &str) -> Option<PanelSpec> {
 /// `["mission","status","--all"]` would fail the layer-2 flag guard if
 /// entered directly), so it must never be reachable by looking `panel_spec`
 /// up under its own name.
-fn resolve_alias(id: &str) -> (&str, &'static [(&'static str, &'static str)]) {
+fn resolve_alias(id: &str) -> (&str, ForcedOpts) {
     match id {
         "mission-status-all" => ("mission-status", &[("all", "all")]),
         other => (other, &[]),
@@ -778,15 +781,16 @@ fn manual_floor_wait(
     }
 }
 
-pub(crate) async fn panel_handler(
-    Path(id): Path<String>,
-    Query(params): Query<HashMap<String, String>>,
-    peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
-    headers: axum::http::HeaderMap,
-    State(state): State<AppState>,
-) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
-    // The preflight forcer — see PANEL_HEADER. Checked BEFORE the allowlist
-    // lookup so a drive-by never even learns which ids exist.
+/// The gates in front of every panel request, in order: the preflight-forcing
+/// header (checked BEFORE the allowlist lookup so a drive-by never even learns
+/// which ids exist), the allowlist lookup, then the panel's audience. Returns
+/// the panel's spec and the alias's forced `(name, value)` selections.
+fn admit_panel_request(
+    id: &str,
+    peer: Option<std::net::SocketAddr>,
+    headers: &axum::http::HeaderMap,
+) -> Result<(PanelSpec, ForcedOpts), (StatusCode, String)> {
+    // The preflight forcer — see PANEL_HEADER.
     if !headers.contains_key(PANEL_HEADER) {
         return Err((
             StatusCode::FORBIDDEN,
@@ -802,14 +806,25 @@ pub(crate) async fn panel_handler(
     // `mission-status-all` request resolves to the `mission-status` spec
     // with its `all` opt forced — see `resolve_alias`'s own doc. Any other
     // id passes through unchanged.
-    let (base_id, forced_opts) = resolve_alias(&id);
+    let (base_id, forced_opts) = resolve_alias(id);
     let Some(spec) = panel_spec(base_id) else {
         return Err((
             StatusCode::NOT_FOUND,
             format!("unknown panel \"{id}\" — panels are a fixed allowlist, not arbitrary commands\n"),
         ));
     };
-    admit_audience(&spec, peer.map(|c| c.0), &headers)?;
+    admit_audience(&spec, peer, headers)?;
+    Ok((spec, forced_opts))
+}
+
+pub(crate) async fn panel_handler(
+    Path(id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    headers: axum::http::HeaderMap,
+    State(state): State<AppState>,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
+    let (spec, forced_opts) = admit_panel_request(&id, peer.map(|c| c.0), &headers)?;
     // Canonical &'static id straight off the spec — one table, no second
     // lookup that could drift out from under it.
     let id: &'static str = spec.id;
