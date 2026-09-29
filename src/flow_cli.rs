@@ -236,13 +236,10 @@ pub fn run(cmd: FlowCmd) -> Result<()> {
     }
     let mut record = build_record(cmd);
     stamp_execution_session(&mut record, |id| {
-        flow::reader::session_of_execution(&flow::flows_dir(), EXECUTION_LOOKBACK_DAYS, id)
+        flow::reader::session_of_execution(&flow::flows_dir(), id)
     })?;
     flow::record(record).context("writing flow record")
 }
-
-/// How many of the most-recent day files a `--execution` id is looked up in.
-const EXECUTION_LOOKBACK_DAYS: usize = 30;
 
 /// The value of an `--execution` flag: the `exec-...` id `darkmux dispatch`
 /// prints. Anything else, a session id included, is refused at parse time,
@@ -265,7 +262,7 @@ fn stamp_execution_session(
     let Some(execution) = record.execution_id.as_ref() else { return Ok(()) };
     let session = resolve(execution).with_context(|| {
         format!(
-            "no role execution `{execution}` in the last {EXECUTION_LOOKBACK_DAYS} days of the flow trail \
+            "no role execution `{execution}` in the flow trail around the day it was minted \
              (`darkmux flow tail` lists recent records); refusing to record a note nothing can find"
         )
     })?;
