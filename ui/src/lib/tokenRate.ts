@@ -544,6 +544,36 @@ interface StateMarker {
   stallAfterMs?: number;
 }
 
+/** A rest, with the reason it reads under: the same words the rest rows and
+ *  the scope use (`restReasonLabel`). */
+function restMarker(atMs: number, restMs: number, reason: unknown, detail: unknown): StateMarker {
+  const m: StateMarker = { atMs, kind: "rest", restMs };
+  const why = restReasonLabel(reason, typeof detail === "string" ? detail : undefined);
+  if (why !== null) {
+    m.restReason = why;
+    m.restReasonWord = restReasonWord(reason) ?? why;
+  }
+  return m;
+}
+
+/** This execution's compactor is running. (#2915 review, C4) The start's own
+ *  ms time counts the millisecond, and a start that names no stall bound
+ *  gets the default. */
+function compactionStartMarker(r: NormRecord, atMs: number): StateMarker {
+  const start = payloadOf(r, ACTION.UtilityStart);
+  const bound = num(start?.stall_after_ms);
+  const startedAt = num(start?.started_at_ms);
+  return { atMs: startedAt !== null && startedAt > 0 ? startedAt : atMs, kind: "compacting", stallAfterMs: bound !== null && bound > 0 ? bound : UTILITY_JOB_DEFAULT_STALL_MS };
+}
+
+/** The compaction ended: the next step is the next prompt, at its own ms end
+ *  time and never before the start it ends. */
+function compactionEndMarker(r: NormRecord, atMs: number, startedAtMs: number): StateMarker {
+  const ended = payloadOf(r, ACTION.UtilityError) ?? payloadOf(r, ACTION.TelemetryTokens);
+  const endedAt = num(ended?.ended_at_ms);
+  return { atMs: Math.max(endedAt !== null && endedAt > 0 ? endedAt : atMs, startedAtMs), kind: "prompt" };
+}
+
 /** The single state derivation both the run page (`sessionRun.ts`'s
  * `liveTokScope`) and the fleet card (`cards.ts`'s `buildFleetCard`) read —
  * one function, no live/playback branch, because both callers already pass
@@ -669,11 +699,7 @@ export function deriveLiveState(records: NormRecord[], nowMs: number): LiveState
       // (#2915) This execution's compactor is running. A routing job (or any
       // other job that serves no execution) never lands here: it carries no
       // session, so it is not in an execution's records at all.
-      const start = payloadOf(r, ACTION.UtilityStart);
-      const bound = num(start?.stall_after_ms);
-      // (#2915 review, C4) The start's own ms time counts the millisecond.
-      const startedAt = num(start?.started_at_ms);
-      m = { atMs: startedAt !== null && startedAt > 0 ? startedAt : atMs, kind: "compacting", stallAfterMs: bound !== null && bound > 0 ? bound : UTILITY_JOB_DEFAULT_STALL_MS };
+      m = compactionStartMarker(r, atMs);
     } else if (
       marker?.kind === "compacting" &&
       ((isUtilityEnd(r) && utilityJobOf(r) === UTILITY_JOB.compaction) || r.action === ACTION.DispatchCompaction)
@@ -683,9 +709,7 @@ export function deriveLiveState(records: NormRecord[], nowMs: number): LiveState
       // usage record is not a marker (a run from before 1.61.0 reads as it
       // always did). (#2915 review, C4) At its own ms end time, and never
       // before the start it ends (both can share one whole-second `ts`).
-      const ended = payloadOf(r, ACTION.UtilityError) ?? payloadOf(r, ACTION.TelemetryTokens);
-      const endedAt = num(ended?.ended_at_ms);
-      m = { atMs: Math.max(endedAt !== null && endedAt > 0 ? endedAt : atMs, marker.atMs), kind: "prompt" };
+      m = compactionEndMarker(r, atMs, marker.atMs);
     } else if (r.action === ACTION.BudgetWait) {
       // (#2902 step 5) A HOSTED call held by its endpoint's budget (a
       // dispatch, a single-shot or map step): the host announces the wait
@@ -694,14 +718,7 @@ export function deriveLiveState(records: NormRecord[], nowMs: number): LiveState
       // pause does: "budget · <endpoint>", counting down to the resume time.
       const f = payloadOf(r, ACTION.BudgetWait);
       const waitMs = num(f?.wait_ms);
-      if (f && waitMs !== null && waitMs > 0) {
-        m = { atMs, kind: "rest", restMs: waitMs };
-        const why = restReasonLabel("budget", typeof f.endpoint_id === "string" ? f.endpoint_id : undefined);
-        if (why !== null) {
-          m.restReason = why;
-          m.restReasonWord = restReasonWord("budget") ?? why;
-        }
-      }
+      if (f && waitMs !== null && waitMs > 0) m = restMarker(atMs, waitMs, "budget", f.endpoint_id);
     } else if (r.action === ACTION.BudgetResume || r.action === ACTION.BudgetStop) {
       // The held call went ahead (or the run stopped): the wait is over.
       m = { atMs, kind: "prompt" };
@@ -712,14 +729,7 @@ export function deriveLiveState(records: NormRecord[], nowMs: number): LiveState
       // `sessionRun.ts`'s REST tiles already apply).
       const f = payloadOf(r, ACTION.DispatchRest);
       const ms = num(f?.ms);
-      if (f && ms !== null && ms > 0) {
-        m = { atMs, kind: "rest", restMs: ms };
-        const why = restReasonLabel(f.reason, f.state);
-        if (why !== null) {
-          m.restReason = why;
-          m.restReasonWord = restReasonWord(f.reason) ?? why;
-        }
-      }
+      if (f && ms !== null && ms > 0) m = restMarker(atMs, ms, f.reason, f.state);
     }
     if (m && (!marker || m.atMs >= marker.atMs)) marker = m;
   }

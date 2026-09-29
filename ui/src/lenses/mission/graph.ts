@@ -458,6 +458,19 @@ function sameMetrics(a: StepMetrics, b: StepMetrics): boolean {
   );
 }
 
+/** The running and final counts one record carries, each read through its own
+ *  action's payload type; `null` for a count the record does not have. */
+function recordFigures(rec: NormRecord): { turnsSoFar: number | null; toolCallsSoFar: number | null; finalTok: number; totalTurns: number | null } {
+  const count = (n: unknown): number | null => (typeof n === "number" ? n : null);
+  const complete = payloadOf(rec, ACTION.DispatchComplete);
+  return {
+    turnsSoFar: count(payloadOf(rec, ACTION.DispatchTurn)?.turns_so_far),
+    toolCallsSoFar: count(payloadOf(rec, ACTION.DispatchTool)?.tool_calls_so_far),
+    finalTok: count((complete ?? payloadOf(rec, ACTION.StepResult))?.total_tokens) ?? 0,
+    totalTurns: count(complete?.total_turns),
+  };
+}
+
 /** `applyRecordToMetrics` — mission-graph.html. Folds one record into the
  * per-step metric accumulator, returning a NEW map only when something
  * changed (so a no-op record doesn't churn state). */
@@ -489,22 +502,19 @@ export function applyRecordToMetrics(metrics: MetricsMap, rec: NormRecord, idx: 
   // the step is known to have been alive (the bad-timestamp policy).
   if (isTerminal) next.endTs = Math.max(next.endTs, recMs || next.lastTs || next.startTs);
 
-  const turn = payloadOf(rec, ACTION.DispatchTurn);
-  const tool = payloadOf(rec, ACTION.DispatchTool);
-  const complete = payloadOf(rec, ACTION.DispatchComplete);
-  const stepResult = payloadOf(rec, ACTION.StepResult);
-  const finalTok = (typeof (complete ?? stepResult)?.total_tokens === "number" ? (complete ?? stepResult)!.total_tokens! : 0);
+  const fig = recordFigures(rec);
+  const finalTok = fig.finalTok;
   const started = next.startTs > 0;
   if (isUsage && started) {
     next.usageSeen = true;
     next.tokRun += usage ? usage.total : 0;
   } else if (isTurn && started) {
-    next.turnRun = typeof turn?.turns_so_far === "number" ? Math.max(next.turnRun, turn.turns_so_far) : next.turnRun + 1;
+    next.turnRun = fig.turnsSoFar !== null ? Math.max(next.turnRun, fig.turnsSoFar) : next.turnRun + 1;
   } else if (isTool && started) {
-    next.toolRun = typeof tool?.tool_calls_so_far === "number" ? Math.max(next.toolRun, tool.tool_calls_so_far) : next.toolRun + 1;
+    next.toolRun = fig.toolCallsSoFar !== null ? Math.max(next.toolRun, fig.toolCallsSoFar) : next.toolRun + 1;
   } else if (isComplete) {
     if (finalTok) next.tokFinal = Math.max(next.tokFinal, finalTok);
-    if (typeof complete?.total_turns === "number") next.turnFinal = Math.max(next.turnFinal, complete.total_turns);
+    if (fig.totalTurns !== null) next.turnFinal = Math.max(next.turnFinal, fig.totalTurns);
   } else if (isStepResult) {
     if (finalTok) next.tokFinal = Math.max(next.tokFinal, finalTok);
   }

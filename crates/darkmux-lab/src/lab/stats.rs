@@ -506,10 +506,7 @@ pub(crate) fn scan_flow_lines(
         let action = darkmux_flow::reader::action_of(&r);
         // Only the two actions this read is about are read as their type; the
         // rest of a day file is passed over without parsing a payload.
-        let payload = match action {
-            Some(darkmux_flow::FlowAction::MachineTelemetry | darkmux_flow::FlowAction::DispatchStart) => darkmux_flow::reader::payload_of(&r),
-            _ => None,
-        };
+        let payload = payload_this_read_wants(action.as_ref(), &r);
         let sample = match &payload {
             Some(darkmux_flow::Payload::MachineTelemetry(p)) => Some(p),
             _ => None,
@@ -523,12 +520,7 @@ pub(crate) fn scan_flow_lines(
             if r.get("session_id").and_then(|v| v.as_str()) == Some(sid) {
                 facts.records_for_session += 1;
                 if let Some(darkmux_flow::Payload::DispatchStart(start)) = &payload {
-                    let bounds = start.bounds.as_ref().and_then(|b| serde_json::to_value(b).ok());
-                    if let Some(serde_json::Value::Object(b)) = bounds {
-                        for (k, v) in b {
-                            facts.bounds.entry(k).or_insert(v);
-                        }
-                    }
+                    merge_bounds(&mut facts.bounds, start.bounds.as_ref());
                 }
             }
         }
@@ -537,20 +529,44 @@ pub(crate) fn scan_flow_lines(
         if ts < run_from || ts > run_to {
             continue;
         }
-        let Some(pw) = &p.now.power_mw else { continue };
-        facts.samples.push(Sample {
-            ts,
-            interval_ms: p.interval_ms,
-            gpu_pct: p.now.gpu_pct.unwrap_or(0),
-            w_gpu: pw.gpu as f64 / 1000.0,
-            w_cpu: pw.cpu as f64 / 1000.0,
-            w_total: pw.total as f64 / 1000.0,
-            thermal_state: p.now.thermal.as_ref().map(|t| t.state.clone()),
-            cpu_speed_limit_pct: p.now.thermal.as_ref().map_or(100, |t| t.cpu_speed_limit_pct),
-            mem_pct: p.now.mem_pct.unwrap_or(0),
-        });
+        facts.samples.extend(sample_of(p, ts));
     }
     (scanned, false, false)
+}
+
+/// A record's payload, read as its type, for the two actions this read is
+/// about.
+fn payload_this_read_wants(action: Option<&darkmux_flow::FlowAction>, r: &serde_json::Value) -> Option<darkmux_flow::Payload> {
+    match action {
+        Some(darkmux_flow::FlowAction::MachineTelemetry | darkmux_flow::FlowAction::DispatchStart) => darkmux_flow::reader::payload_of(r),
+        _ => None,
+    }
+}
+
+/// The first value each knob resolved to, across a session's `dispatch.start`
+/// records.
+fn merge_bounds(into: &mut BTreeMap<String, serde_json::Value>, bounds: Option<&darkmux_flow::payload::RuntimeBounds>) {
+    let Some(serde_json::Value::Object(knobs)) = bounds.and_then(|b| serde_json::to_value(b).ok()) else { return };
+    for (k, v) in knobs {
+        into.entry(k).or_insert(v);
+    }
+}
+
+/// One `machine.telemetry` reading as a run sample; `None` for a reading that
+/// carries no power figure (a sampler without power access).
+fn sample_of(p: &darkmux_flow::payload::MachineTelemetryPayload, ts: u64) -> Option<Sample> {
+    let pw = p.now.power_mw.as_ref()?;
+    Some(Sample {
+        ts,
+        interval_ms: p.interval_ms,
+        gpu_pct: p.now.gpu_pct.unwrap_or(0),
+        w_gpu: pw.gpu as f64 / 1000.0,
+        w_cpu: pw.cpu as f64 / 1000.0,
+        w_total: pw.total as f64 / 1000.0,
+        thermal_state: p.now.thermal.as_ref().map(|t| t.state.clone()),
+        cpu_speed_limit_pct: p.now.thermal.as_ref().map_or(100, |t| t.cpu_speed_limit_pct),
+        mem_pct: p.now.mem_pct.unwrap_or(0),
+    })
 }
 
 fn mtime_ms(path: &Path) -> Option<u64> {

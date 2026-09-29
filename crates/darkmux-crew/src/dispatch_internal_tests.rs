@@ -903,7 +903,7 @@
 
     // ─── MUST FIX 3 (merge-gate review of #2165): pin the two `bounds`
     //     WIRING sites — deleting either insertion failed no test before
-    //     this. `dispatch_start_payload_json` below covers the first
+    //     this. `dispatch_start_payload` below covers the first
     //     (`dispatch()`'s real construction was un-unit-testable before the
     //     #2165 review extracted it into this pure fn); the
     //     `enrich_envelope_with_summary` tests further down cover the
@@ -911,7 +911,7 @@
 
     #[test]
     #[serial]
-    fn dispatch_start_payload_json_carries_the_bounds_key_with_the_expected_shape() {
+    fn dispatch_start_payload_carries_the_bounds_key_with_the_expected_shape() {
         let prev = std::env::var("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL").ok();
         unsafe { std::env::remove_var("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL") };
 
@@ -928,16 +928,16 @@
         ).unwrap()).unwrap();
 
         // The wiring itself: this key would be ABSENT entirely if the
-        // `"bounds": resolved_runtime_bounds_json(is_agentic_remote)` line
-        // were ever deleted from `dispatch_start_payload_json` — proving
+        // `"bounds": resolved_runtime_bounds(is_agentic_remote)` line
+        // were ever deleted from `dispatch_start_payload` — proving
         // this assertion actually exercises the insertion, not just the
         // helper's own internal logic (already pinned by the
-        // `resolved_runtime_bounds_json_*` tests below).
+        // `resolved_runtime_bounds_*` tests below).
         assert!(payload.get("bounds").is_some(), "dispatch_start_payload must carry a bounds key: {payload}");
         assert_eq!(
             payload["bounds"]["max_tokens_per_call"],
             serde_json::json!({"value": null, "source": "built-in"}),
-            "bounds must be the SAME shape resolved_runtime_bounds_json produces: {payload}"
+            "bounds must be the SAME shape resolved_runtime_bounds produces: {payload}"
         );
         // The rest of the payload survives the extraction unchanged —
         // pinning the refactor didn't silently drop or rename a field.
@@ -968,10 +968,10 @@
     /// The agentic-remote half of the same wiring: `is_agentic_remote=true`
     /// must reach `bounds.turn_delay_ms`'s `forced-agentic-remote` shape
     /// (MUST FIX 2) through this real call path, not just through
-    /// `resolved_runtime_bounds_json` called directly.
+    /// `resolved_runtime_bounds` called directly.
     #[serial]
     #[test]
-    fn dispatch_start_payload_json_forces_turn_delay_ms_for_agentic_remote() {
+    fn dispatch_start_payload_forces_turn_delay_ms_for_agentic_remote() {
         let payload = serde_json::to_value(dispatch_start_payload(
             "darkmux-runtime:latest",
             "msg",
@@ -987,7 +987,7 @@
         assert_eq!(payload["turn_delay_ms"], serde_json::json!(0), "the top-level stamp is also forced");
     }
 
-    // ─── #2165: resolved_runtime_bounds_json — the SAME block shared by
+    // ─── #2165: resolved_runtime_bounds — the SAME block shared by
     //     dispatch_start_payload["bounds"] and the envelope's own `bounds` ───
     //
     // (#811 test-isolation) darkmux-crew's dev-dependency on
@@ -1000,7 +1000,7 @@
     // `*_with_source` tests, which construct it directly.
     #[test]
     #[serial]
-    fn resolved_runtime_bounds_json_names_built_in_when_nothing_is_set() {
+    fn resolved_runtime_bounds_names_built_in_when_nothing_is_set() {
         for k in [
             "DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL",
             "DARKMUX_RUNTIME_REASONING_CHECKPOINT_INTERVAL",
@@ -1040,7 +1040,7 @@
 
     #[test]
     #[serial]
-    fn resolved_runtime_bounds_json_names_built_in_for_thermal_and_battery_pacing() {
+    fn resolved_runtime_bounds_names_built_in_for_thermal_and_battery_pacing() {
         for k in [
             "DARKMUX_THERMAL_ENABLED",
             "DARKMUX_POWER_PAUSE_RUNNING_BELOW_MIN",
@@ -1068,7 +1068,7 @@
 
     #[test]
     #[serial]
-    fn resolved_runtime_bounds_json_names_env_when_thermal_and_battery_pacing_are_overridden() {
+    fn resolved_runtime_bounds_names_env_when_thermal_and_battery_pacing_are_overridden() {
         for k in [
             "DARKMUX_THERMAL_ENABLED",
             "DARKMUX_POWER_PAUSE_RUNNING_BELOW_MIN",
@@ -1094,7 +1094,7 @@
 
     #[test]
     #[serial]
-    fn resolved_runtime_bounds_json_names_env_when_an_env_var_wins() {
+    fn resolved_runtime_bounds_names_env_when_an_env_var_wins() {
         for k in [
             "DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL",
             "DARKMUX_RUNTIME_REASONING_CHECKPOINT_INTERVAL",
@@ -1124,7 +1124,7 @@
         }
     }
 
-    // ─── #2193: effective_max_turns / resolved_runtime_bounds_json's
+    // ─── #2193: effective_max_turns / resolved_runtime_bounds's
     //     max_turns block — operator-explicit vs caller-derived precedence ──
 
     #[test]
@@ -1149,7 +1149,7 @@
 
     #[test]
     #[serial]
-    fn resolved_runtime_bounds_json_max_turns_names_launcher_when_the_override_wins() {
+    fn resolved_runtime_bounds_max_turns_names_launcher_when_the_override_wins() {
         unsafe { std::env::remove_var("DARKMUX_RUNTIME_MAX_TURNS") };
         let bounds = serde_json::to_value(resolved_runtime_bounds(false, Some(15), None).unwrap()).unwrap();
         assert_eq!(bounds["max_turns"], serde_json::json!({"value": 15, "source": "launcher"}));
@@ -1157,7 +1157,7 @@
 
     #[test]
     #[serial]
-    fn resolved_runtime_bounds_json_max_turns_names_env_when_the_operator_set_one() {
+    fn resolved_runtime_bounds_max_turns_names_env_when_the_operator_set_one() {
         unsafe { std::env::set_var("DARKMUX_RUNTIME_MAX_TURNS", "5") };
         let bounds = serde_json::to_value(resolved_runtime_bounds(false, Some(15), None).unwrap()).unwrap();
         assert_eq!(
@@ -1169,7 +1169,7 @@
     }
 
     // ─── #2480: effective_inactivity_timeout_seconds /
-    //     resolved_runtime_bounds_json's inactivity_timeout_seconds block —
+    //     resolved_runtime_bounds's inactivity_timeout_seconds block —
     //     `darkmux dispatch --timeout <n>` wins OUTRIGHT (opposite
     //     precedence from max_turns above — see the function's own doc for
     //     why: this override is direct operator input at the point of
@@ -1247,7 +1247,7 @@
 
     #[test]
     #[serial]
-    fn resolved_runtime_bounds_json_inactivity_timeout_names_cli_when_the_override_wins() {
+    fn resolved_runtime_bounds_inactivity_timeout_names_cli_when_the_override_wins() {
         let prev = std::env::var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS").ok();
         unsafe { std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", "1200") };
         let bounds = serde_json::to_value(resolved_runtime_bounds(false, None, Some(30)).unwrap()).unwrap();
@@ -1267,7 +1267,7 @@
 
     #[test]
     #[serial]
-    fn resolved_runtime_bounds_json_inactivity_timeout_passes_through_with_no_override() {
+    fn resolved_runtime_bounds_inactivity_timeout_passes_through_with_no_override() {
         let prev = std::env::var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS").ok();
         unsafe { std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS") };
         let bounds = serde_json::to_value(resolved_runtime_bounds(false, None, None).unwrap()).unwrap();
@@ -1282,7 +1282,7 @@
 
     #[test]
     #[serial]
-    fn resolved_runtime_bounds_json_turn_delay_ms_passes_through_for_a_local_dispatch() {
+    fn resolved_runtime_bounds_turn_delay_ms_passes_through_for_a_local_dispatch() {
         let prev = std::env::var("DARKMUX_TURN_DELAY_MS").ok();
         unsafe { std::env::set_var("DARKMUX_TURN_DELAY_MS", "3000") };
         let bounds = serde_json::to_value(resolved_runtime_bounds(false, None, None).unwrap()).unwrap();
@@ -1313,7 +1313,7 @@
     /// configured value.
     #[test]
     #[serial]
-    fn resolved_runtime_bounds_json_turn_delay_ms_is_self_explaining_when_forced_agentic_remote() {
+    fn resolved_runtime_bounds_turn_delay_ms_is_self_explaining_when_forced_agentic_remote() {
         let prev = std::env::var("DARKMUX_TURN_DELAY_MS").ok();
         unsafe { std::env::set_var("DARKMUX_TURN_DELAY_MS", "5000") };
         let bounds = serde_json::to_value(resolved_runtime_bounds(true, None, None).unwrap()).unwrap();
@@ -1340,7 +1340,7 @@
     /// shape — the override applies regardless of what it overrode.
     #[test]
     #[serial]
-    fn resolved_runtime_bounds_json_turn_delay_ms_forced_shape_holds_even_at_the_default() {
+    fn resolved_runtime_bounds_turn_delay_ms_forced_shape_holds_even_at_the_default() {
         let prev = std::env::var("DARKMUX_TURN_DELAY_MS").ok();
         unsafe { std::env::remove_var("DARKMUX_TURN_DELAY_MS") };
         let bounds = serde_json::to_value(resolved_runtime_bounds(true, None, None).unwrap()).unwrap();
@@ -13670,7 +13670,7 @@ fn a_clean_run_reports_an_empty_array_not_an_absent_field() {
 /// was unpinned — every other `enrich_envelope_with_summary` test in this
 /// file passes `serde_json::json!({})` as the `bounds` arg, so deleting the
 /// insert line failed nothing. Passes a DISTINCTIVE, non-empty value (never
-/// the shape `resolved_runtime_bounds_json` would actually produce) so this
+/// the shape `resolved_runtime_bounds` would actually produce) so this
 /// assertion could only pass if the caller's `bounds` argument genuinely
 /// made it into the envelope, not some other field coincidentally matching.
 #[test]
@@ -14942,7 +14942,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
     // ─── (#2234 follow-up review) the clamp above was REVERTED — see
     // `effective_inactivity_timeout_seconds`'s own doc for why (invisible,
     // silently overrode `--timeout`'s deliberately-unbounded parser,
-    // desynced `resolved_runtime_bounds_json`, and its 315_360_000 figure
+    // desynced `resolved_runtime_bounds`, and its 315_360_000 figure
     // was ~29 billion× more aggressive than the panic it cited —
     // 9_223_372_036_847_700_827, measured by binary search). A future
     // clamp is tracked in the issue filed alongside this revert (see the
@@ -16086,7 +16086,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         );
     }
 
-    // ─── (#2111) host_window_json — the dispatch-summary flow-record field ─
+    // ─── (#2111) host_window — the dispatch-summary flow-record field ─
 
     #[test]
     fn host_window_reaches_the_envelope_with_the_flattened_summary_shape() {
@@ -16138,7 +16138,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
     }
 
     /// (#2774 review F4) The two ladder fields were pinned by NOTHING:
-    /// deleting both lines from `host_window_json` left the crate green,
+    /// deleting both lines from `host_window` left the crate green,
     /// because every call-site test threaded `ThermalLadderSummary::
     /// default()` and asserted on the other keys. This threads DISTINCT,
     /// non-default values and asserts both reach the envelope — so a
@@ -16474,7 +16474,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
     // otherwise — so a request/advertised gap is visible in the artifact.
     #[serial]
     #[test]
-    fn dispatch_start_payload_json_carries_tools_requested_or_null() {
+    fn dispatch_start_payload_carries_tools_requested_or_null() {
         let none = serde_json::to_value(dispatch_start_payload(
             "darkmux-runtime:latest",
             "msg",

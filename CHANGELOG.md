@@ -297,6 +297,35 @@ darkmux release.
   their names. darkmux's readers rename and convert an old record's keys on
   read.
 
+### Typed flow payloads (4.0, FLOW 2.0.0)
+
+- **Every flow record's payload is written from one Rust type per action, and
+  the viewer reads it through that type's generated twin.** A record is built
+  from a `Payload` variant, which fixes its action, and the write check refuses
+  a payload that is not its action's, one that did not parse as its action's
+  type, and a payload on an action that carries none (`session.end`,
+  `machine.online`, `machine.offline`, `phase.*`, `step.complete`,
+  `step.error`, `operator.note`, `operator.catch`, `stream.error`,
+  `tier.decision`, `mission.debrief.prompt`, `phase.review.begin|aborted|dispatch|failed`).
+  `mission.start`, `mission.close` and `mission.abort` keep an open JSON object
+  (a mission config authors that outcome document). `ui/src/lib/flowPayloads.ts`
+  is deleted; `FlowPayloads.ts` and one `<Action>Payload.ts` per type are
+  generated. **On the wire, key order in a payload now follows its type's
+  field order; no key is renamed and no value changes.**
+- **An optional key with no value is omitted, not written as `null`,** in
+  `dispatch.start`, `dispatch.complete`, `dispatch.error`, `dispatch.rest`,
+  `step.result`, `telemetry.detector` and `budget.*` payloads (for example
+  `reasoning_tokens`, `cached_tokens`, `stderr_excerpt`, `turn_delay_effective_ms`,
+  `policy`, `tail_ratio`, and the token counts of a call that reported none).
+  `telemetry.tokens` and the `--json` envelope keep `null` for "not reported".
+  **Migration:** a hook rule or receiver that matched `payload.<key>: null`
+  matches on the key being absent instead.
+- **Archives still read.** A payload that does not parse as its action's type
+  is kept as it was and never re-written. The retired review spelling `tokens`
+  reads as `total_tokens` on `dispatch.complete` and `step.result`. A
+  `dispatch.start` `bounds` block from before the newer knobs existed reads with
+  the knobs it has.
+
 ### Changed (breaking, 4.0)
 
 - **Read auth and execution auth are separate switches** (#2988). A serve

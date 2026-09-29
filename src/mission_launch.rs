@@ -1928,7 +1928,7 @@ type GrowthBatch = (
 /// silently overridden by the hardcoded 600 on every default `review`
 /// launch (the mission type most likely to need a longer bound), and the
 /// resulting dispatch's bounds block mislabeled its own provenance as
-/// `"cli"` (`dispatch_internal::resolved_runtime_bounds_json`'s
+/// `"cli"` (`dispatch_internal::resolved_runtime_bounds`'s
 /// `Some(n) => ... "source": "cli"` arm) even though no CLI flag was ever
 /// typed. Threading the raw `Option` removes the false choice: an omitted
 /// flag leaves `config.timeout_seconds` exactly as the template produced
@@ -9652,7 +9652,7 @@ mod tests {
             // one field `dispatch_internal::effective_inactivity_timeout_
             // seconds` reads (`DispatchOpts::timeout_override_seconds`,
             // `unit_step.rs:1496`). `dispatch_internal`'s own suite
-            // (`resolved_runtime_bounds_json_inactivity_timeout_passes_
+            // (`resolved_runtime_bounds_inactivity_timeout_passes_
             // through_with_no_override` and
             // `effective_inactivity_timeout_seconds_cli_override_wins_
             // over_a_configured_env_value`) is what proves a `None` here

@@ -2531,14 +2531,17 @@ pub fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
+/// Whether `b` has the fixed width and separators of a record `ts`.
+fn has_ts_punctuation(b: &[u8]) -> bool {
+    b.len() == 20 && [(4, b'-'), (7, b'-'), (10, b'T'), (13, b':'), (16, b':'), (19, b'Z')].iter().all(|&(i, c)| b[i] == c)
+}
+
 /// The epoch second of a record-`ts`-shaped string (`YYYY-MM-DDTHH:MM:SSZ`,
 /// fixed width): the inverse of [`ts_utc_at`]. `None` for anything that is
 /// not exactly that shape, so a malformed `ts` degrades to "no timestamp"
 /// and never panics.
 pub fn parse_ts_utc(ts: &str) -> Option<i64> {
-    let b = ts.as_bytes();
-    if b.len() != 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' || b[19] != b'Z'
-    {
+    if !has_ts_punctuation(ts.as_bytes()) {
         return None;
     }
     let field = |range: std::ops::Range<usize>| -> Option<i64> { ts.get(range)?.parse().ok() };

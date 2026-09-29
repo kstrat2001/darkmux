@@ -191,6 +191,22 @@ pub(crate) fn apply_volume_mounts(args: &mut Vec<String>, workspace: &Path, host
     args.push(format!("{}:/darkmux-out", host_out.display()));
 }
 
+/// One checkout whose `.git` points outside the workdir, as the
+/// `dispatch.workdir_git_unavailable` record names it.
+fn git_checkout(workdir: &Path, found: &darkmux_types::workdir::SplitGitdir) -> GitCheckout {
+    GitCheckout {
+        checkout: found.checkout.display().to_string(),
+        gitdir_target: found.target.display().to_string(),
+        kind: match found.kind {
+            darkmux_types::workdir::GitdirPointerKind::Worktree => GitdirKind::Worktree,
+            darkmux_types::workdir::GitdirPointerKind::Submodule => GitdirKind::Submodule,
+            darkmux_types::workdir::GitdirPointerKind::Separate => GitdirKind::Separate,
+        },
+        superproject: found.superproject.as_ref().map(|p| p.display().to_string()),
+        container_path: container_path_for(workdir, &found.checkout),
+    }
+}
+
 /// (#2294) The container path a split-gitdir checkout is mounted at, so
 /// both the operator warning and the model-facing note name a path the
 /// reader can actually see. `apply_volume_mounts` above mounts the
@@ -1638,7 +1654,7 @@ fn effective_max_turns(max_turns_override: Option<u32>) -> Option<u32> {
 /// worse than the `(env 45)` it printed before and self-correcting on the
 /// next image refresh.
 ///
-/// `resolved_runtime_bounds_json` (the operator-facing bounds JSON on the
+/// `resolved_runtime_bounds` (the operator-facing bounds JSON on the
 /// flow record + envelope) still does NOT reuse this helper — it hand-rolls
 /// its own `"cli"`-labeled block, the same way it hand-rolls `"launcher"`
 /// and `"forced-agentic-remote"`. The two spell the same tier the same way.
@@ -1653,7 +1669,7 @@ fn effective_max_turns(max_turns_override: Option<u32>) -> Option<u32> {
 /// "deliberately unbounded above ... the operator's own call" — the
 /// parser refused to bound the operator and the resolver did it behind
 /// their back 5,000 lines away — and it desynchronized
-/// `resolved_runtime_bounds_json` (which resolves the config tier
+/// `resolved_runtime_bounds` (which resolves the config tier
 /// directly, bypassing this function) from the container/watchdog value
 /// this function actually produced, the opposite of this function's own
 /// stated purpose ("so no two of them can disagree about the budget").
@@ -1734,7 +1750,7 @@ fn apply_runtime_limit_flags(cmd: &mut Command, max_turns_override: Option<u32>)
     warn_if_unparseable_u32("DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL");
     // (#2193) `effective_max_turns` is the ONE place that decides operator-
     // explicit vs caller-derived precedence — this flag emission and the
-    // `resolved_runtime_bounds_json`'s `bounds.max_turns` block (what the
+    // `resolved_runtime_bounds`'s `bounds.max_turns` block (what the
     // flow record/envelope tell the operator governed the run) both call
     // it, so the two can't independently drift on what actually bounded
     // the container.
@@ -3500,7 +3516,7 @@ fn dispatch_remote(
                 prompt: Some(crate::dispatch::capped_prompt(&opts.message)),
                 prompt_chars: Some(opts.message.chars().count() as u64),
                 // (#2295) Same field, same reason as the container path's
-                // `dispatch_start_payload_json`: the prompt is capped in the
+                // `dispatch_start_payload`: the prompt is capped in the
                 // record, so which records a dispatch was briefed on has to be
                 // its own key on EVERY dispatch path, not just one.
                 brief_refs: Some(opts.brief_refs.clone()),
@@ -5305,20 +5321,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // of what the daemon serves; the day file itself always has it.
     if let Some(workdir) = opts.workdir.as_deref() {
         if !workdir_split_gitdirs.is_empty() {
-            let checkouts: Vec<GitCheckout> = workdir_split_gitdirs
-                .iter()
-                .map(|found| GitCheckout {
-                    checkout: found.checkout.display().to_string(),
-                    gitdir_target: found.target.display().to_string(),
-                    kind: match found.kind {
-                        darkmux_types::workdir::GitdirPointerKind::Worktree => GitdirKind::Worktree,
-                        darkmux_types::workdir::GitdirPointerKind::Submodule => GitdirKind::Submodule,
-                        darkmux_types::workdir::GitdirPointerKind::Separate => GitdirKind::Separate,
-                    },
-                    superproject: found.superproject.as_ref().map(|p| p.display().to_string()),
-                    container_path: container_path_for(workdir, &found.checkout),
-                })
-                .collect();
+            let checkouts: Vec<GitCheckout> = workdir_split_gitdirs.iter().map(|found| git_checkout(workdir, found)).collect();
             // Dotted, matching this crate's current record vocabulary.
             // The dispatch-liveness bookends are the only records in
             // `darkmux-crew` a consumer keys on by spelling; a new record
@@ -6842,11 +6845,11 @@ fn enrich_envelope_with_summary(
     extras: &HostExtras,
     out_dir: &std::path::Path,
     // (#2165) The SAME `bounds` block `dispatch_start_payload` carries —
-    // built once at the call site (`resolved_runtime_bounds_json`) so the
+    // built once at the call site (`resolved_runtime_bounds`) so the
     // start record and the finished envelope can't independently drift on
     // what "the resolved knobs" means.
     bounds: serde_json::Value,
-    // (#2774) See `host_window_json`'s own doc.
+    // (#2774) See `host_window`'s own doc.
     thermal_ladder: Option<crate::thermal_governor::ThermalLadderSummary>,
 ) -> String {
     let trimmed = stdout.trim();
@@ -6937,7 +6940,7 @@ fn enrich_envelope_with_summary(
         }
         obj.insert("host".into(), host);
         // (#2111) The flatter dispatch-summary shape — see
-        // `host_window_json`'s own doc for why it exists alongside `host`
+        // `host_window`'s own doc for why it exists alongside `host`
         // above rather than replacing it.
         if let Some(hw) = host_window(stats, extras, thermal_ladder) {
             obj.insert("host_window".into(), serde_json::to_value(hw).unwrap_or_default());
@@ -7562,7 +7565,7 @@ fn host_window(
 /// `host_window` insert left the whole test suite green because nothing
 /// exercised this exact code path; only the SEPARATE envelope path
 /// (`enrich_envelope_with_summary`) had coverage. `host_stats`/
-/// `host_extras` feed the SAME `host_window_json` the envelope's `host`
+/// `host_extras` feed the SAME `host_window` the envelope's `host`
 /// block is built from, so the flow record and the envelope can never
 /// independently drift on what "was this dispatch thermally comfortable"
 /// means. `record_context` merges last, matching every other

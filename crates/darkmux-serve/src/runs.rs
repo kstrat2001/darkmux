@@ -2274,19 +2274,24 @@ fn fold_session_record(idx: &mut HashMap<String, SessionAgg>, v: &serde_json::Va
     // Check EVERY execution bookend's payload for `endpoint`, not just the
     // start (#1518, applied server-side; see `SessionAgg::endpoint`'s doc).
     if agg.endpoint.is_none() && grain == Some(Grain::Execution) {
-        use darkmux_flow::Payload;
-        let endpoint = match darkmux_flow::reader::payload_of(v) {
-            Some(Payload::DispatchStart(p)) => p.endpoint,
-            Some(Payload::DispatchComplete(p) | Payload::DispatchError(p)) => p.endpoint,
-            _ => None,
-        };
-        if let Some(ep) = endpoint.filter(|e| !e.is_empty()) {
+        if let Some(ep) = execution_endpoint(v) {
             agg.endpoint = Some(ep);
         }
     }
 
     let mission = v.get("mission_id").and_then(|m| m.as_str()).filter(|m| !m.is_empty());
     agg.lifecycle.fold(action.as_ref(), mission, ts, v);
+}
+
+/// The endpoint an execution bookend's payload names, when it names one.
+fn execution_endpoint(v: &serde_json::Value) -> Option<String> {
+    use darkmux_flow::Payload;
+    let endpoint = match darkmux_flow::reader::payload_of(v)? {
+        Payload::DispatchStart(p) => p.endpoint,
+        Payload::DispatchComplete(p) | Payload::DispatchError(p) => p.endpoint,
+        _ => None,
+    };
+    endpoint.filter(|e| !e.is_empty())
 }
 
 /// The attempt-scoped fields of every session, from its lifecycle fold's

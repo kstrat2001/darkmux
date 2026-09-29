@@ -53,6 +53,23 @@ export type TurnItem =
   | { kind: "rest"; rec: NormRecord }
   | { kind: "rec"; rec: NormRecord };
 
+/** Add one call's count to its turn's running sum. */
+function addCall(sums: Map<string, number>, turn: string, n: number | null): void {
+  if (n !== null) sums.set(turn, (sums.get(turn) ?? 0) + n);
+}
+
+/** A turn's wall time: the runtime's own measure when it sent one, else the
+ *  span from the turn's first heartbeat (approximate, never negative). */
+function turnDuration(exact: number | null, approxMs: number | null): { durationMs: number | null; approx: boolean } {
+  return { durationMs: exact ?? (approxMs !== null && approxMs >= 0 ? approxMs : null), approx: exact === null };
+}
+
+/** Why the turn ended: it answered, or it called this many tools. */
+function turnWhy(f: { finish_reason?: string; tool_calls_count?: number } | undefined): string {
+  const tools = num(f?.tool_calls_count) ?? 0;
+  return f?.finish_reason === "stop" ? "answered" : `${tools} tool${tools === 1 ? "" : "s"}`;
+}
+
 /** The turn a record names, for the actions whose payload carries one. */
 function turnSeqOf(r: NormRecord): number | null {
   const p = anyPayload(r);
@@ -174,11 +191,8 @@ export function turnItems(visible: NormRecord[], all: NormRecord[], asOfArg?: nu
       firstBeat.set(own, r.tMs);
     }
     if (r.action === ACTION.TelemetryTokens && own !== null) {
-      const usage = payloadOf(r, ACTION.TelemetryTokens);
-      const out = num(usage?.completion_tokens);
-      const think = num(usage?.reasoning_tokens);
-      if (out !== null) callOut.set(own, (callOut.get(own) ?? 0) + out);
-      if (think !== null) callThink.set(own, (callThink.get(own) ?? 0) + think);
+      addCall(callOut, own, num(payloadOf(r, ACTION.TelemetryTokens)?.completion_tokens));
+      addCall(callThink, own, num(payloadOf(r, ACTION.TelemetryTokens)?.reasoning_tokens));
     }
     if (r.action === ACTION.TelemetryContext) {
       const context = payloadOf(r, ACTION.TelemetryContext);
@@ -189,18 +203,14 @@ export function turnItems(visible: NormRecord[], all: NormRecord[], asOfArg?: nu
 
   const info = (r: NormRecord): TurnInfo => {
     const f = payloadOf(r, ACTION.DispatchTurn);
-    const seq = num(f?.turn_seq) ?? 0;
     const k = turnOf.get(r) ?? "";
-    const usage = f?.usage;
-    const exact = num(f?.generation_ms);
     const beat = firstBeat.get(k);
-    const approxMs = beat !== undefined && r.tMs !== null ? r.tMs - beat : null;
-    const tools = num(f?.tool_calls_count) ?? 0;
+    const usage = f?.usage;
+    const duration = turnDuration(num(f?.generation_ms), beat !== undefined && r.tMs !== null ? r.tMs - beat : null);
     return {
-      seq,
-      why: f?.finish_reason === "stop" ? "answered" : `${tools} tool${tools === 1 ? "" : "s"}`,
-      durationMs: exact ?? (approxMs !== null && approxMs >= 0 ? approxMs : null),
-      approx: exact === null,
+      seq: num(f?.turn_seq) ?? 0,
+      why: turnWhy(f),
+      ...duration,
       inTok: num(usage?.prompt_tokens),
       outTok: callOut.get(k) ?? num(usage?.completion_tokens),
       thinkTok: callThink.get(k) ?? num(usage?.reasoning_tokens),

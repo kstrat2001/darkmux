@@ -195,6 +195,7 @@ impl RetiredRuleAction {
         if !self.current.ends_with('*') {
             return None;
         }
+        // flow-action-guard:allow — a prefix the operator typed into a hook rule, not an action
         let extra = if self.current.starts_with("dispatch.") {
             " (`dispatch.*` also matches every `dispatch.turn` and `dispatch.tool` record)"
         } else {

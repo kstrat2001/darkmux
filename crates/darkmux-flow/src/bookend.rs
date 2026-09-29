@@ -32,7 +32,7 @@
 //! This module intentionally knows nothing about `FlowRecord`'s domain
 //! meaning beyond its existence — callers build every `started`/`finished`/
 //! abort record themselves (via their own crate's record builders,
-//! `darkmux-crew::dispatch::build_dispatch_record_with_payload` or the
+//! `darkmux-crew::dispatch::build_dispatch_record` or the
 //! binary crate's `review_bookend_record`) and hand the guard a fully-built
 //! [`FlowRecord`]. `darkmux-flow` is a dependency LEAF w.r.t. both
 //! `darkmux-crew` and `darkmux-lab` (neither of those crates' record

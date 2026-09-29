@@ -221,7 +221,7 @@ impl HostSamplerRing {
         let span_ms = raw.last().unwrap().at_ms.saturating_sub(raw.first().unwrap().at_ms);
         drop(g);
 
-        // (#2111) The "now" shape is the shared `sample_full_json` mapping —
+        // (#2111) The "now" shape is the shared `host_sample_now` mapping —
         // the same one `dispatch_internal::run_telemetry_sampler` uses for
         // the periodic `machine.telemetry` flow record's payload — so the
         // two never independently drift on what a host reading's JSON shape
