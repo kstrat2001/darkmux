@@ -3814,10 +3814,11 @@ fn responding_endpoint_profiles_json(port: u16) -> String {
             "profiles": {{
                 "stub": {{
                     "models": [
-                        {{"id": "stub-model", "n_ctx": 8000, "endpoint": {{"url": "http://127.0.0.1:{port}"}}}}
+                        {{"id": "stub-model", "n_ctx": 8000, "endpoint": "stub"}}
                     ]
                 }}
             }},
+            "endpoints": {{"stub": {{"url": "http://127.0.0.1:{port}"}}}},
             "default_profile": "stub"
         }}"#
     )
@@ -3843,10 +3844,11 @@ fn hanging_endpoint_profiles_json(port: u16) -> String {
             "profiles": {{
                 "hang": {{
                     "models": [
-                        {{"id": "stub-model", "n_ctx": 8000, "endpoint": {{"url": "http://127.0.0.1:{port}"}}}}
+                        {{"id": "stub-model", "n_ctx": 8000, "endpoint": "hang"}}
                     ]
                 }}
             }},
+            "endpoints": {{"hang": {{"url": "http://127.0.0.1:{port}"}}}},
             "default_profile": "hang"
         }}"#
     )
@@ -5414,10 +5416,11 @@ fn radio_sigterm_forwards_to_the_launched_child_which_finalizes() {
                 "profiles": {{
                     "hang-stub": {{
                         "models": [
-                            {{"id": "stub-model", "n_ctx": 8000, "endpoint": {{"url": "http://127.0.0.1:{}"}}}}
+                            {{"id": "stub-model", "n_ctx": 8000, "endpoint": "hang"}}
                         ]
                     }}
                 }},
+                "endpoints": {{"hang": {{"url": "http://127.0.0.1:{}"}}}},
                 "default_profile": "hang-stub",
                 "internal": {{ "utility": {{ "id": "stub-util", "n_ctx": 8000 }} }}
             }}"#,
@@ -5609,9 +5612,10 @@ fn run_radio_launch_to_completion(config_id: &str, dispatch_port: u16) -> (std::
             r#"{{
                 "profiles": {{
                     "dispatch-stub": {{
-                        "models": [{{"id": "stub-model", "n_ctx": 8000, "endpoint": {{"url": "http://127.0.0.1:{dispatch_port}"}}}}]
+                        "models": [{{"id": "stub-model", "n_ctx": 8000, "endpoint": "dispatch"}}]
                     }}
                 }},
+                "endpoints": {{"dispatch": {{"url": "http://127.0.0.1:{dispatch_port}"}}}},
                 "default_profile": "dispatch-stub",
                 "internal": {{ "utility": {{ "id": "stub-util", "n_ctx": 8000 }} }}
             }}"#
@@ -7988,8 +7992,9 @@ fn a_template_grows_one_dispatch_per_finding_carrying_its_key_in_brief_refs() {
             "schema_version": "1.5",
             "default_profile": "stub",
             "profiles": {"stub": {"models": [
-                {"id": "stub-model", "n_ctx": 8000, "endpoint": {"url": "http://127.0.0.1:9"}}
-            ]}}
+                {"id": "stub-model", "n_ctx": 8000, "endpoint": "stub"}
+            ]}},
+            "endpoints": {"stub": {"url": "http://127.0.0.1:9"}}
         })
         .to_string(),
     )
@@ -10743,9 +10748,10 @@ fn endpoint_seat_fixture() -> EndpointSeatFixture {
             "profiles": {
                 "local-default": {"models": [{"id": "local-model", "n_ctx": 8000}]},
                 "grok-endpoint": {"models": [
-                    {"id": "grok-model", "n_ctx": 8000, "endpoint": {"url": "http://127.0.0.1:9"}}
+                    {"id": "grok-model", "n_ctx": 8000, "endpoint": "grok"}
                 ]}
-            }
+            },
+            "endpoints": {"grok": {"url": "http://127.0.0.1:9"}}
         })
         .to_string(),
     )

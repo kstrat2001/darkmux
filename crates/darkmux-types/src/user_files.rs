@@ -172,6 +172,10 @@ pub enum Issue {
     Unknown { closest: Option<String>, valid: Vec<String> },
     /// A key darkmux retired: the operator line naming what replaced it.
     Retired(String),
+    /// A key or shape darkmux removed, that a schema no longer describes: the
+    /// operator line naming the rewrite (a profile model's inline `endpoint`
+    /// object).
+    Removed(String),
     /// A known key whose value the schema does not accept. One such value
     /// fails the whole typed load (`config.json` falls back to every
     /// default), so it is refused like an unknown key.
@@ -192,6 +196,7 @@ impl fmt::Display for KeyIssue {
                 write!(f, " (valid keys here: {})", valid.join(", "))
             }
             Issue::Retired(line) => write!(f, "unknown key `{}`: {line}", self.path),
+            Issue::Removed(line) => write!(f, "`{}`: {line}", self.path),
             Issue::WrongType { expected, got } => write!(f, "`{}` must be {expected}, got {got}", self.path),
             Issue::Missing { expected } if expected.is_empty() => write!(f, "missing required key `{}`", self.path),
             Issue::Missing { expected } => write!(f, "missing required key `{}` ({expected})", self.path),
@@ -798,10 +803,26 @@ pub fn check_text<T: JsonSchema + 'static>(
     text: &str,
     retired: RetiredLookup<'_>,
 ) -> Option<FileProblem> {
+    check_text_and::<T>(kind, path, text, retired, &|_| Vec::new())
+}
+
+/// Issues a document carries that its schema cannot express, found by reading
+/// the document itself ([`check_text_and`]).
+pub type ExtraIssues<'a> = &'a dyn Fn(&Value) -> Vec<KeyIssue>;
+
+/// [`check_text`] plus `extra`: issues about a shape the schema cannot say.
+pub fn check_text_and<T: JsonSchema + 'static>(
+    kind: UserFileKind,
+    path: &Path,
+    text: &str,
+    retired: RetiredLookup<'_>,
+    extra: ExtraIssues<'_>,
+) -> Option<FileProblem> {
     let problem = match serde_json::from_str::<Value>(text) {
         Err(e) => Problem::NotJson(e.to_string()),
         Ok(doc) => {
-            let keys = key_issues::<T>(&doc, retired);
+            let mut keys = key_issues::<T>(&doc, retired);
+            keys.extend(extra(&doc));
             if keys.is_empty() {
                 return None;
             }
@@ -830,11 +851,21 @@ fn read_bounded(path: &Path) -> std::io::Result<String> {
 
 /// Check the file at `path` against `T`. `None` when it is clean or absent.
 pub fn check_path<T: JsonSchema + 'static>(kind: UserFileKind, path: &Path, retired: RetiredLookup<'_>) -> Option<FileProblem> {
+    check_path_and::<T>(kind, path, retired, &|_| Vec::new())
+}
+
+/// [`check_path`] plus `extra` ([`check_text_and`]).
+pub fn check_path_and<T: JsonSchema + 'static>(
+    kind: UserFileKind,
+    path: &Path,
+    retired: RetiredLookup<'_>,
+    extra: ExtraIssues<'_>,
+) -> Option<FileProblem> {
     if is_operator_state(path) {
         return None;
     }
     match read_bounded(path) {
-        Ok(text) => check_text::<T>(kind, path, &text, retired),
+        Ok(text) => check_text_and::<T>(kind, path, &text, retired, extra),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => Some(FileProblem { kind, path: path.to_path_buf(), problem: Problem::Unreadable(e.to_string()), note: None }),
     }

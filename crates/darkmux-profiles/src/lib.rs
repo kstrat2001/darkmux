@@ -113,6 +113,29 @@ mod user_file_tests {
         }
     }
 
+    /// A profile model's inline `endpoint` object is refused by every
+    /// dispatching preflight, naming the exact rewrite (the `endpoints` id to
+    /// move it to). The same document with the endpoint named by id passes.
+    #[test]
+    fn an_inline_endpoint_object_is_refused_naming_the_rewrite() {
+        let inline = r#"{"profiles": {"p": {"models": [{"id": "gpt", "endpoint": {"url": "https://api.example/v1"}}]}}}"#;
+        let (_d, path) = write(inline);
+        for scope in [Scope::Dispatch, Scope::MissionLaunch, Scope::LabRun] {
+            let msg = crate::preflight_with(scope, Some(&path)).expect_err(inline).to_string();
+            assert!(msg.contains("profiles.p.models[0].endpoint"), "names the model's endpoint: {msg}");
+            assert!(
+                msg.contains("removed in 4.0")
+                    && msg.contains("endpoints.\"api.example\"")
+                    && msg.contains("\"endpoint\": \"api.example\""),
+                "names the rewrite: {msg}"
+            );
+        }
+        let named = r#"{"profiles": {"p": {"models": [{"id": "gpt", "endpoint": "api"}]}},
+                        "endpoints": {"api": {"url": "https://api.example/v1"}}}"#;
+        let (_d, path) = write(named);
+        assert_eq!(crate::preflight_with(Scope::Dispatch, Some(&path)), Ok(()));
+    }
+
     #[test]
     fn the_file_check_reports_every_unknown_key() {
         let (_d, path) = write(&with_key("/profiles/p", "modles"));

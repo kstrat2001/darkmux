@@ -380,11 +380,11 @@
         opts.role_id = "pr-reviewer".to_string();
         opts.session = crate::test_session(&format!("budget-gate-remote-{}", std::process::id()));
         opts.phase_id = None;
-        let mut pm: darkmux_types::ProfileModel = serde_json::from_str(&format!(
-            r#"{{"id":"gpt-remote","endpoint":{{"url":"{base_url}","limits":{{"policy":"wait","window":{{"period":"1d","tokens":1}}}}}}}}"#
-        ))
-        .unwrap();
-        pm.endpoint.as_mut().unwrap().source = darkmux_types::EndpointSource::Named("azure".into());
+        let pm = darkmux_types::ProfileModel::hosted_for_test(
+            "gpt-remote",
+            None,
+            serde_json::json!({"url": base_url, "limits": {"policy": "wait", "window": {"period": "1d", "tokens": 1}}}),
+        );
         let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::full_window().stopped_after(1, "mission `m` is aborted"));
         let result = crate::budget::with_test_env(env.clone(), || {
             dispatch_remote(&opts, &quarantine_test_role(), "system prompt", &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap())
@@ -1437,10 +1437,10 @@
             r#"{"profiles":{
                     "fast":{"models":[{"id":"model-a","n_ctx":32000}]},
                     "cloud":{"models":[
-                        {"id":"gpt-remote","n_ctx":100000,
-                         "endpoint":{"url":"https://example.azure.com/openai"}}
+                        {"id":"gpt-remote","n_ctx":100000,"endpoint":"azure"}
                     ]}
                 },
+                "endpoints":{"azure":{"url":"https://example.azure.com/openai"}},
                 "default_profile":"fast",
                 "crews":{"bad":{"seats":{"review-probe":[{"profile":"cloud"}]}}}}"#,
         )
@@ -2649,9 +2649,9 @@
             &pf,
             format!(
                 r#"{{"profiles":{{"cloud":{{"models":[
-                        {{"id":"gpt-remote","n_ctx":100000,
-                         "endpoint":{{"url":"{base_url}"}}}}
+                        {{"id":"gpt-remote","n_ctx":100000,"endpoint":"mock"}}
                     ]}}}},
+                    "endpoints":{{"mock":{{"url":"{base_url}"}}}},
                     "default_profile":"cloud"}}"#
             ),
         )
@@ -2763,10 +2763,7 @@
         opts.json = false;
 
         let role = quarantine_test_role(); // `dispatch_remote` ignores `_role` entirely
-        let pm: darkmux_types::ProfileModel = serde_json::from_str(&format!(
-            r#"{{"id":"gpt-remote","n_ctx":100000,"endpoint":{{"url":"{base_url}"}}}}"#
-        ))
-        .unwrap();
+        let pm = darkmux_types::ProfileModel::hosted_for_test("gpt-remote", Some(100000), serde_json::json!({"url": base_url}));
 
         let result = dispatch_remote(&opts, &role, "system prompt", &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap());
 
@@ -2858,10 +2855,7 @@
             opts.session = step_session.clone();
             opts.phase_id = Some(phase_id.to_string());
             opts.json = false;
-            let pm: darkmux_types::ProfileModel = serde_json::from_str(&format!(
-                r#"{{"id":"gpt-remote","n_ctx":100000,"endpoint":{{"url":"{base_url}"}}}}"#
-            ))
-            .unwrap();
+            let pm = darkmux_types::ProfileModel::hosted_for_test("gpt-remote", Some(100000), serde_json::json!({"url": base_url}));
             let result =
                 dispatch_remote(&opts, &role, "system prompt", &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap()).expect("dispatch_remote must succeed");
             assert_eq!(result.session_id, step_session, "dispatch_remote runs under its caller's session");
@@ -2917,9 +2911,9 @@
             &pf,
             format!(
                 r#"{{"profiles":{{"cloud":{{"models":[
-                        {{"id":"gpt-remote","n_ctx":100000,
-                         "endpoint":{{"url":"{base_url}"}}}}
+                        {{"id":"gpt-remote","n_ctx":100000,"endpoint":"mock"}}
                     ]}}}},
+                    "endpoints":{{"mock":{{"url":"{base_url}"}}}},
                     "default_profile":"cloud"}}"#
             ),
         )
@@ -5833,8 +5827,7 @@
     #[test]
     fn container_dialect_flag_is_set_only_for_a_declared_non_default_dialect() {
         let target = |ep: serde_json::Value| {
-            let pm: darkmux_types::ProfileModel =
-                serde_json::from_value(serde_json::json!({ "id": "m", "endpoint": ep })).unwrap();
+            let pm = darkmux_types::ProfileModel::hosted_for_test("m", None, ep);
             crate::target::target_for("p".into(), Default::default(), pm).unwrap()
         };
         assert_eq!(super::container_dialect_flag(&target(serde_json::json!({ "url": "https://h/v1" }))), None);
@@ -5856,10 +5849,11 @@
     /// managed dispatch.
     #[test]
     fn agentic_brain_flags_carry_the_hosted_targets_url_and_dialect() {
-        let pm: darkmux_types::ProfileModel = serde_json::from_value(serde_json::json!({
-            "id": "m", "endpoint": { "url": "https://h.example/v1", "dialect": "chat-completions-max-tokens" }
-        }))
-        .unwrap();
+        let pm = darkmux_types::ProfileModel::hosted_for_test(
+            "m",
+            None,
+            serde_json::json!({ "url": "https://h.example/v1", "dialect": "chat-completions-max-tokens" }),
+        );
         let t = crate::target::target_for("p".into(), Default::default(), pm).unwrap();
         let (url, dialect) = super::agentic_brain_flags(Some(&t));
         assert_eq!(url.as_deref(), Some("https://h.example/v1/chat/completions"));
@@ -13217,8 +13211,9 @@ fn local_target_names_the_instance_a_dispatch_would_send_to_and_none_for_a_hoste
         r#"{"profiles":{
                 "work":{"models":[{"id":"worker-35b","n_ctx":65536}]},
                 "aliased":{"models":[{"id":"darkmux:worker-35b","n_ctx":65536,"identifier":"my-alias"}]},
-                "hosted":{"models":[{"id":"gpt-4o","n_ctx":128000,"endpoint":{"url":"https://example.invalid/v1"}}]}
+                "hosted":{"models":[{"id":"gpt-4o","n_ctx":128000,"endpoint":"hosted"}]}
             },
+            "endpoints":{"hosted":{"url":"https://example.invalid/v1"}},
             "internal":{"utility":{"id":"util-4b","n_ctx":16000}},
             "default_profile":"work"}"#,
     )
@@ -17034,10 +17029,10 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
     /// named, nothing for an inline endpoint or a local brain.
     #[test]
     fn the_tailer_endpoint_id_is_the_hosted_brains_registry_id() {
-        let mut pm: darkmux_types::ProfileModel =
-            serde_json::from_str(r#"{"id":"gpt-remote","endpoint":{"url":"https://h.example/v1"}}"#).unwrap();
+        let mut pm = darkmux_types::ProfileModel::hosted_for_test("gpt-remote", None, serde_json::json!({"url": "https://h.example/v1"}));
+        pm.endpoint.as_mut().unwrap().source = darkmux_types::EndpointSource::Inline;
         let inline = crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap();
-        assert_eq!(tailer_endpoint_id(Some(&inline)), None, "an inline endpoint has no id");
+        assert_eq!(tailer_endpoint_id(Some(&inline)), None, "an endpoint with no registry id has none");
         pm.endpoint.as_mut().unwrap().source = darkmux_types::EndpointSource::Named("azure".into());
         let named = crate::target::target_for("p".into(), Default::default(), pm).unwrap();
         assert_eq!(tailer_endpoint_id(Some(&named)).as_deref(), Some("azure"));
@@ -17124,9 +17119,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         opts.role_id = "pr-reviewer".to_string();
         opts.session = crate::test_session(&session);
         opts.phase_id = None;
-        let mut pm: darkmux_types::ProfileModel =
-            serde_json::from_str(&format!(r#"{{"id":"gpt-remote","endpoint":{{"url":"{base_url}"}}}}"#)).unwrap();
-        pm.endpoint.as_mut().unwrap().source = darkmux_types::EndpointSource::Named("azure".into());
+        let pm = darkmux_types::ProfileModel::hosted_for_test("gpt-remote", None, serde_json::json!({"url": base_url}));
         let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::new(vec![]));
         let result = crate::budget::with_test_env(env.clone(), || {
             dispatch_remote(
@@ -17178,9 +17171,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         opts.role_id = "pr-reviewer".to_string();
         opts.session = crate::test_session(&session);
         opts.phase_id = None;
-        let mut pm: darkmux_types::ProfileModel =
-            serde_json::from_str(&format!(r#"{{"id":"gpt-remote","endpoint":{{"url":"{base_url}"}}}}"#)).unwrap();
-        pm.endpoint.as_mut().unwrap().source = darkmux_types::EndpointSource::Named("azure".into());
+        let pm = darkmux_types::ProfileModel::hosted_for_test("gpt-remote", None, serde_json::json!({"url": base_url}));
         let env = std::rc::Rc::new(crate::budget::tests::FakeEnv::new(vec![]));
         let result = crate::budget::with_test_env(env.clone(), || {
             dispatch_remote(
@@ -17473,10 +17464,11 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         opts.phase_id = None;
         opts.json = false;
         opts.max_completion_tokens = Some(55);
-        let pm: darkmux_types::ProfileModel = serde_json::from_value(serde_json::json!({
-            "id": "vllm-model", "endpoint": { "url": base_url, "dialect": "chat-completions-max-tokens" }
-        }))
-        .unwrap();
+        let pm = darkmux_types::ProfileModel::hosted_for_test(
+            "vllm-model",
+            None,
+            serde_json::json!({ "url": base_url, "dialect": "chat-completions-max-tokens" }),
+        );
         let result = dispatch_remote(
             &opts,
             &quarantine_test_role(),
@@ -17519,10 +17511,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         opts.session = crate::test_session(&session_id);
         opts.phase_id = None;
         opts.json = false;
-        let pm: darkmux_types::ProfileModel = serde_json::from_str(&format!(
-            r#"{{"id":"gpt-remote","n_ctx":100000,"endpoint":{{"url":"{base_url}"}}}}"#
-        ))
-        .unwrap();
+        let pm = darkmux_types::ProfileModel::hosted_for_test("gpt-remote", Some(100000), serde_json::json!({"url": base_url}));
         let result = dispatch_remote(&opts, &quarantine_test_role(), "system prompt", &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap());
         unsafe {
             match prev_home {

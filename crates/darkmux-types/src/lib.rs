@@ -164,13 +164,12 @@ pub struct ProfileModel {
     #[schemars(with = "CapabilityProfileSchema")]
     pub capabilities: CapabilityProfile,
     /// The endpoint this model is served from. Absent ⇒ the managed LM
-    /// Studio default. (#2902 step 4) Written as an id naming an entry of the
-    /// registry's `endpoints` map (`"endpoint": "azure-east"`), or, the
-    /// pre-4.0 spelling, as an inline object (still read; `darkmux doctor`
-    /// names the move to an id). The loader materializes an id into the
-    /// definition's fields; see [`endpoint`]. On an unmanaged endpoint `n_ctx`
-    /// is a *declared* window (darkmux cannot load-set it) rather than a
-    /// load parameter.
+    /// Studio default. Written as an id naming an entry of the registry's
+    /// `endpoints` map (`"endpoint": "azure-east"`); an inline object is
+    /// refused (`ProfileRegistry::inline_endpoint_rewrites` names the move).
+    /// The loader materializes an id into the definition's fields; see
+    /// [`endpoint`]. On an unmanaged endpoint `n_ctx` is a *declared* window
+    /// (darkmux cannot load-set it) rather than a load parameter.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "endpoint::endpoint_field")]
     #[schemars(with = "Option<endpoint::EndpointFieldSchema>")]
     pub endpoint: Option<ModelEndpoint>,
@@ -182,6 +181,15 @@ pub struct ProfileModel {
 }
 
 impl ProfileModel {
+    /// A model on the named endpoint `endpoint_json` declares (as an
+    /// `endpoints` entry does), built without a registry.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn hosted_for_test(id: &str, n_ctx: Option<u32>, endpoint_json: serde_json::Value) -> Self {
+        let mut ep: ModelEndpoint = serde_json::from_value(endpoint_json).expect("a valid endpoint definition");
+        ep.source = EndpointSource::Named("azure".to_string());
+        ProfileModel { id: id.to_string(), n_ctx, endpoint: Some(ep), ..Default::default() }
+    }
+
     /// (#2902 step 3) What darkmux does at this model's endpoint. No endpoint
     /// ⇒ the managed LM Studio default. THE classification every consumer
     /// reads (dispatch routing, residency, doctor, `profile list`); an
@@ -578,8 +586,10 @@ impl Profile {
 // retypes a value: a binary from before it reads `"endpoint": "<id>"` as a
 // type error and quarantines that profile (#1282). Folded into 2.0 rather
 // than a 2.1 because no binary has shipped 2.0 yet, so there is no released
-// 2.x reader it could break. Inline endpoint objects still read unchanged,
-// and gained three optional fields (`managed`, `dialect`, `limits`).
+// 2.x reader it could break. A profile model's inline endpoint OBJECT is
+// removed in the same major (refused, naming the rewrite to `endpoints`), and
+// an endpoint declares `managed` or a `url`: there is no implicit kind. An
+// endpoint gained three optional fields (`managed`, `dialect`, `limits`).
 // Also in 2.0 (#2902 step 5, same unreleased major, so no bump of its own):
 // `limits` gained two optional fields, `policy` (`off` / `warn` / `wait`, a
 // registered `ConfigEnum`, read leniently and refused at preflight when
@@ -794,102 +804,88 @@ impl ProfileRegistry {
     /// windows, in one pass, with no I/O (credential PRESENCE is doctor's live
     /// check). `darkmux doctor` prints these; resolution refuses the same
     /// problems at use. Assumes [`Self::materialize_endpoints`] has run.
-    pub fn validate(&self) -> Vec<RegistryIssue> {
+    pub fn validate(&self) -> Vec<String> {
         let mut out = Vec::new();
-        let suggestions = self.inline_endpoint_ids();
         for (id, def) in &self.endpoints {
             if let Err(reason) = def.validate() {
-                out.push(RegistryIssue::error(format!("endpoint \"{id}\": {reason}")));
+                out.push(format!("endpoint \"{id}\": {reason}"));
             }
         }
         for (pname, profile) in &self.profiles {
             for m in &profile.models {
-                if let Some(ep) = &m.endpoint {
-                    match &ep.source {
-                        EndpointSource::Unresolved(id) => {
-                            // The entry itself, else (re-review MF1) the whole
-                            // `endpoints` value, when that was not an object.
-                            let why = match self
-                                .quarantined
-                                .iter()
-                                .filter(|q| q.kind == QuarantinedEntryKind::Endpoint)
-                                .find(|q| &q.name == id)
-                                .or_else(|| {
-                                    self.quarantined
-                                        .iter()
-                                        .find(|q| q.kind == QuarantinedEntryKind::Endpoint && q.name == "endpoints")
-                                })
-                            {
-                                Some(q) => format!("whose `endpoints` entry is quarantined ({})", q.error),
-                                None => "which `endpoints` does not define".to_string(),
-                            };
-                            out.push(RegistryIssue::error(format!(
-                                "profile \"{pname}\" model \"{}\" names endpoint \"{id}\", {why}",
-                                m.id
-                            )))
-                        }
-                        EndpointSource::Inline => {
-                            if let Err(reason) = ep.validate() {
-                                out.push(RegistryIssue::error(format!(
-                                    "profile \"{pname}\" model \"{}\": {reason}",
-                                    m.id
-                                )));
-                            }
-                            let suggested = suggestions.get(&endpoint_key(ep)).cloned().unwrap_or_default();
-                            out.push(RegistryIssue::advice(format!(
-                                "profile \"{pname}\" model \"{}\" declares its endpoint inline; move the \
-                                 object to `endpoints.\"{suggested}\"` and write `\"endpoint\": \"{suggested}\"` \
-                                 on the model (inline endpoints still read)",
-                                m.id
-                            )));
-                        }
-                        EndpointSource::Named(_) => {}
-                    }
+                if let Some(EndpointSource::Unresolved(id)) = m.endpoint.as_ref().map(|e| &e.source) {
+                    out.push(format!(
+                        "profile \"{pname}\" model \"{}\" names endpoint \"{id}\", {}",
+                        m.id,
+                        self.unresolved_reason(id)
+                    ));
                 }
                 if m.missing_managed_n_ctx() {
-                    out.push(RegistryIssue::error(format!(
+                    out.push(format!(
                         "profile \"{pname}\" model \"{}\" is local (no endpoint) but declares no n_ctx — \
                          swap/dispatch on it will fail at resolution",
                         m.id
-                    )));
+                    ));
                 }
             }
         }
         out
     }
 
-    /// (#2902 review C6) A suggested `endpoints` id for each DISTINCT inline
-    /// endpoint definition (keyed by [`endpoint_key`]): its host (or
-    /// `lmstudio` for a managed one); when several distinct definitions
-    /// share a host, the host plus the URL's last path segment (an Azure
-    /// deployment name); then a numeric suffix until the id is unique, never
-    /// reusing an id `endpoints` already defines. The same definition used by
-    /// several models gets one id.
-    fn inline_endpoint_ids(&self) -> BTreeMap<String, String> {
-        let mut defs: Vec<(String, String, String)> = Vec::new(); // (key, host base, last segment)
-        for profile in self.profiles.values() {
-            for m in &profile.models {
-                let Some(ep) = m.endpoint.as_ref().filter(|e| e.source == EndpointSource::Inline) else { continue };
-                let key = endpoint_key(ep);
-                if defs.iter().any(|(k, _, _)| *k == key) {
-                    continue;
-                }
-                let base = ep.host().unwrap_or_else(|| "lmstudio".to_string());
-                // The last segment of the URL's PATH (never the host).
-                let last = ep
-                    .url
-                    .as_deref()
-                    .and_then(|u| u.split_once("://"))
-                    .and_then(|(_, rest)| rest.trim_end_matches('/').split_once('/'))
-                    .and_then(|(_, path)| path.rsplit('/').next())
-                    .filter(|seg| !seg.is_empty() && !seg.eq_ignore_ascii_case("v1"))
-                    .unwrap_or_default()
-                    .to_string();
-                defs.push((key, base, last));
+    /// Why endpoint `id` did not resolve: its entry (else, when `endpoints`
+    /// was not an object, the whole value) is quarantined, or `endpoints`
+    /// does not define it.
+    fn unresolved_reason(&self, id: &str) -> String {
+        let entry = self.quarantined.iter().filter(|q| q.kind == QuarantinedEntryKind::Endpoint);
+        match entry.clone().find(|q| q.name == id).or_else(|| entry.clone().find(|q| q.name == "endpoints")) {
+            Some(q) => format!("whose `endpoints` entry is quarantined ({})", q.error),
+            None => "which `endpoints` does not define".to_string(),
+        }
+    }
+
+    /// Every profile model in the profiles.json document `doc` that declares
+    /// its endpoint as an inline object, which 4.0 refuses, with the id to
+    /// move it to: each DISTINCT definition gets its host (or `lmstudio` for
+    /// one with no `url`); when several distinct definitions share a host,
+    /// the host plus the URL's last path segment (an Azure deployment name);
+    /// then a numeric suffix until the id is unique, never reusing an id
+    /// `endpoints` already defines. The same definition used by several
+    /// models gets one id. Reads the document, not the typed registry: a
+    /// profile with an inline object does not parse into one.
+    pub fn inline_endpoint_rewrites(doc: &serde_json::Value) -> Vec<InlineEndpointRewrite> {
+        let mut found: Vec<(String, ModelEndpoint)> = Vec::new(); // (path, definition)
+        let profiles = doc.get("profiles").and_then(|p| p.as_object()).into_iter().flatten();
+        for (pname, profile) in profiles {
+            let models = profile.get("models").and_then(|m| m.as_array()).into_iter().flatten();
+            for (i, model) in models.enumerate() {
+                let Some(obj) = model.get("endpoint").filter(|e| e.is_object()) else { continue };
+                let ep = serde_json::from_value::<ModelEndpoint>(obj.clone()).unwrap_or_default();
+                found.push((format!("profiles.{pname}.models[{i}].endpoint"), ep));
             }
         }
-        let mut taken: std::collections::BTreeSet<String> = self.endpoints.keys().cloned().collect();
-        let mut out = BTreeMap::new();
+        let taken: std::collections::BTreeSet<String> =
+            doc.get("endpoints").and_then(|e| e.as_object()).into_iter().flat_map(|m| m.keys().cloned()).collect();
+        let mut defs: Vec<(String, String, String)> = Vec::new(); // (key, host base, last segment)
+        for (_, ep) in &found {
+            let key = endpoint_key(ep);
+            if defs.iter().any(|(k, _, _)| *k == key) {
+                continue;
+            }
+            let base = ep.host().unwrap_or_else(|| "lmstudio".to_string());
+            // The last segment of the URL's PATH (never the host).
+            let last = ep
+                .url
+                .as_deref()
+                .and_then(|u| u.split_once("://"))
+                .and_then(|(_, rest)| rest.trim_end_matches('/').split_once('/'))
+                .and_then(|(_, path)| path.rsplit('/').next())
+                .filter(|seg| !seg.is_empty() && !seg.eq_ignore_ascii_case("v1"))
+                .unwrap_or_default()
+                .to_string();
+            defs.push((key, base, last));
+        }
+        let mut taken = taken;
+        let mut ids: BTreeMap<String, String> = BTreeMap::new();
         for (key, base, last) in &defs {
             let shared = defs.iter().filter(|(_, b, _)| b == base).count() > 1;
             let mut id = if shared && !last.is_empty() { format!("{base}-{last}") } else { base.clone() };
@@ -900,9 +896,15 @@ impl ProfileRegistry {
                 n += 1;
             }
             taken.insert(id.clone());
-            out.insert(key.clone(), id);
+            ids.insert(key.clone(), id);
         }
-        out
+        found
+            .into_iter()
+            .map(|(path, ep)| {
+                let suggested_id = ids.get(&endpoint_key(&ep)).cloned().unwrap_or_default();
+                InlineEndpointRewrite { path, suggested_id }
+            })
+            .collect()
     }
 
     pub fn quarantine_error_for(&self, name: &str) -> Option<String> {
@@ -932,29 +934,23 @@ fn named_endpoint(endpoints: &BTreeMap<String, ModelEndpoint>, id: &str) -> Mode
     }
 }
 
-/// (#2902 step 4) One finding from [`ProfileRegistry::validate`].
+/// One profile model whose `endpoint` is an inline object (refused in 4.0):
+/// where it is, and the `endpoints` id to move it to.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RegistryIssue {
-    pub severity: IssueSeverity,
-    /// The whole operator-facing sentence, naming the entry and the fix.
-    pub message: String,
+pub struct InlineEndpointRewrite {
+    /// The dotted path of the model's `endpoint` (`profiles.p.models[0].endpoint`).
+    pub path: String,
+    pub suggested_id: String,
 }
 
-/// How much a [`RegistryIssue`] matters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IssueSeverity {
-    /// The entry fails when used.
-    Error,
-    /// The entry works; a better spelling is named.
-    Advice,
-}
-
-impl RegistryIssue {
-    fn error(message: String) -> Self {
-        RegistryIssue { severity: IssueSeverity::Error, message }
-    }
-    fn advice(message: String) -> Self {
-        RegistryIssue { severity: IssueSeverity::Advice, message }
+impl InlineEndpointRewrite {
+    /// The operator line: what was removed and the exact rewrite.
+    pub fn line(&self) -> String {
+        format!(
+            "an inline endpoint object was removed in 4.0: declare it once under `endpoints` and name it by id. \
+             Move this object to `endpoints.\"{id}\"` and write `\"endpoint\": \"{id}\"` on the model",
+            id = self.suggested_id
+        )
     }
 }
 
@@ -1156,7 +1152,7 @@ mod tests {
     fn profile_model_n_ctx_absent_parses_and_round_trips_absent() {
         let json = r#"{
             "id": "gpt-4o",
-            "endpoint": { "url": "https://example.azure.com/openai" }
+            "endpoint": "azure"
         }"#;
         let m: ProfileModel = serde_json::from_str(json).unwrap();
         assert_eq!(m.n_ctx, None);
@@ -1198,18 +1194,19 @@ mod tests {
 
     #[test]
     fn profile_model_endpoint_round_trips() {
-        // A remote model names its endpoint URL + auth. The Keychain item
-        // NAME is stored — never the secret.
+        // A remote model names an `endpoints` entry by id; the entry carries
+        // the URL + auth. The Keychain item NAME is stored, never the secret.
         let json = r#"{
-            "id": "gpt-5.1",
-            "n_ctx": 200000,
-            "endpoint": {
+            "profiles": {"p": {"models": [{"id": "gpt-5.1", "n_ctx": 200000, "endpoint": "azure"}]}},
+            "endpoints": {"azure": {
                 "url": "https://example-aoai.cognitiveservices.azure.com/openai/deployments/gpt-4o",
                 "api_version": "2025-01-01-preview",
                 "auth": { "type": "api-key", "keychain": "darkmux-azure-example" }
-            }
+            }}
         }"#;
-        let m: ProfileModel = serde_json::from_str(json).unwrap();
+        let mut r: ProfileRegistry = serde_json::from_str(json).unwrap();
+        r.materialize_endpoints();
+        let m = &r.profiles["p"].models[0];
         let ep = m.endpoint.as_ref().expect("endpoint parsed");
         assert_eq!(ep.kind().unwrap(), EndpointKind::Unmanaged);
         assert_eq!(
@@ -1220,10 +1217,12 @@ mod tests {
         let auth = ep.auth.as_ref().expect("auth parsed");
         assert_eq!(auth.auth_type, Some(EndpointAuthType::ApiKey));
         assert_eq!(auth.keychain.as_deref(), Some("darkmux-azure-example"));
-        // full round-trip preserves the endpoint
-        let back: ProfileModel =
-            serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
-        assert_eq!(back.endpoint, m.endpoint);
+        // full round-trip preserves the endpoint, written back as its id
+        let out = serde_json::to_value(&r).unwrap();
+        assert_eq!(out["profiles"]["p"]["models"][0]["endpoint"], "azure");
+        let mut back: ProfileRegistry = serde_json::from_value(out).unwrap();
+        back.materialize_endpoints();
+        assert_eq!(back.profiles["p"].models[0].endpoint, m.endpoint);
     }
 
     #[test]
@@ -1237,10 +1236,10 @@ mod tests {
 
     #[serial_test::serial]
     #[test]
-    fn endpoint_default_is_managed() {
-        // No url ⇒ managed LM Studio; its chat URL is the configured LM
-        // Studio address (a URL).
-        let ep = ModelEndpoint::default();
+    fn managed_lmstudio_endpoint_uses_the_configured_address() {
+        // The managed endpoint's chat URL is the configured LM Studio address
+        // (a URL).
+        let ep = ModelEndpoint::managed_lmstudio();
         assert_eq!(ep.kind().unwrap(), EndpointKind::Managed(ManagedBackend::Lmstudio));
         let url = ep.chat_url().unwrap();
         assert!(url.contains("://"), "chat_url should be a URL, got {url:?}");

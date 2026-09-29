@@ -34,10 +34,11 @@ fn write_endpoint_profiles(dir: &Path, base_url: &str) -> std::path::PathBuf {
         "profiles": {
             "stub": {
                 "models": [
-                    { "id": "stub-model", "n_ctx": 8000, "endpoint": { "url": base_url } }
+                    { "id": "stub-model", "n_ctx": 8000, "endpoint": "stub" }
                 ]
             }
-        }
+        },
+        "endpoints": { "stub": { "url": base_url } }
     });
     std::fs::write(&path, serde_json::to_string_pretty(&body).unwrap())
         .expect("writing temp profiles.json");

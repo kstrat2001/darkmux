@@ -245,7 +245,7 @@ fn hosted_chat_body_in(
 pub(crate) fn local_chat_url(base_url: Option<&str>) -> String {
     match base_url {
         Some(base) => darkmux_types::endpoint::lmstudio_chat_url(base),
-        None => darkmux_types::ModelEndpoint::default()
+        None => darkmux_types::ModelEndpoint::managed_lmstudio()
             .chat_url()
             .expect("the default endpoint is managed and always has a chat URL"),
     }

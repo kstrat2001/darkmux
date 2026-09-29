@@ -67,8 +67,14 @@ fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
 /// ([`parse_registry_lenient`], #1282); a broken registry shell fails the
 /// load outright. Neither is silent.
 pub fn user_file_problem(path: &Path) -> Option<darkmux_types::user_files::FileProblem> {
-    use darkmux_types::user_files::{check_path, Issue, Problem, UserFileKind};
-    let mut found = check_path::<ProfileRegistry>(UserFileKind::Profiles, path, &registry_retired)?;
+    use darkmux_types::user_files::{check_path_and, Issue, KeyIssue, Problem, UserFileKind};
+    let inline_endpoints = |doc: &serde_json::Value| -> Vec<KeyIssue> {
+        ProfileRegistry::inline_endpoint_rewrites(doc)
+            .into_iter()
+            .map(|r| KeyIssue { issue: Issue::Removed(r.line()), path: r.path })
+            .collect()
+    };
+    let mut found = check_path_and::<ProfileRegistry>(UserFileKind::Profiles, path, &registry_retired, &inline_endpoints)?;
     if let Problem::Keys(keys) = &mut found.problem {
         keys.retain(|k| !matches!(k.issue, Issue::WrongType { .. } | Issue::Missing { .. }));
         if keys.is_empty() {
@@ -778,8 +784,9 @@ mod tests {
         write(
             &p,
             r#"{"profiles":{"azure-x":{"models":[
-                    {"id":"gpt-4o","endpoint":{"url":"https://example.azure.com/openai"}}
-                ]}}}"#,
+                    {"id":"gpt-4o","endpoint":"azure"}
+                ]}},
+                "endpoints":{"azure":{"url":"https://example.azure.com/openai"}}}"#,
         );
         let loaded = load_registry(Some(p.to_str().unwrap())).unwrap();
         assert!(loaded.registry.quarantined.is_empty());
@@ -854,7 +861,7 @@ mod tests {
         assert!(on_bad.endpoint_kind().unwrap_err().to_string().contains("bad"));
         let on_good = &get_profile(&loaded.registry, "on-good").unwrap().models[0];
         assert!(on_good.endpoint_kind().is_ok());
-        let issues: Vec<String> = loaded.registry.validate().into_iter().map(|i| i.message).collect();
+        let issues: Vec<String> = loaded.registry.validate();
         assert!(
             issues.iter().any(|m| m.contains("\"bad\"") && m.contains("quarantined")),
             "the reference names the quarantine: {issues:?}"
@@ -887,7 +894,7 @@ mod tests {
         let p = tmp.path().join("profiles.json");
         write(&p, r#"{"profiles":{"h":{"models":[{"id":"gpt","endpoint":"x"}]}},"endpoints":[]}"#);
         let loaded = load_registry(Some(p.to_str().unwrap())).unwrap();
-        let issues: Vec<String> = loaded.registry.validate().into_iter().map(|i| i.message).collect();
+        let issues: Vec<String> = loaded.registry.validate();
         assert!(issues.iter().any(|m| m.contains("\"x\"") && m.contains("quarantined")), "{issues:?}");
     }
 

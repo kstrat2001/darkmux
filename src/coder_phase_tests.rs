@@ -1816,11 +1816,12 @@ edit loop detected on src/widget.rs in an earlier dispatch
                     "test": {
                         "models": [
                             {"id": "local-model", "n_ctx": 32000},
-                            {"id": "remote-model", "n_ctx": 32000, "endpoint": {"url": "https://example.com/v1"}}
+                            {"id": "remote-model", "n_ctx": 32000, "endpoint": "hosted"}
                         ],
                         "default_model": "local-model"
                     }
                 },
+                "endpoints": {"hosted": {"url": "https://example.com/v1"}},
                 "default_profile": "test"
             }"#,
         )
@@ -1848,11 +1849,12 @@ edit loop detected on src/widget.rs in an earlier dispatch
                 "profiles": {
                     "test": {
                         "models": [
-                            {"id": "remote-model", "n_ctx": 32000, "endpoint": {"url": "https://example.com/v1"}}
+                            {"id": "remote-model", "n_ctx": 32000, "endpoint": "hosted"}
                         ],
                         "default_model": "remote-model"
                     }
                 },
+                "endpoints": {"hosted": {"url": "https://example.com/v1"}},
                 "default_profile": "test"
             }"#,
         )

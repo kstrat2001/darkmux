@@ -1995,6 +1995,9 @@ fn user_file_hint(p: &darkmux_types::user_files::FileProblem) -> String {
         Problem::Keys(keys) if keys.iter().any(|k| matches!(k.issue, Issue::WrongType { .. } | Issue::Missing { .. })) => {
             format!("fix each value named and add each missing key; until then {unloaded}")
         }
+        Problem::Keys(keys) if keys.iter().any(|k| matches!(k.issue, Issue::Removed(_))) => {
+            format!("make each rewrite named (and rename or delete any other key listed); until then {unloaded}")
+        }
         Problem::Keys(_) => "rename each key to the valid one named, or delete it; until then it does nothing".to_string(),
     }
 }
@@ -3893,23 +3896,18 @@ fn check_remote_endpoint_credentials() -> Check {
     let mut problems: Vec<String> = Vec::new();
     let mut checked = 0usize;
 
-    // (#2902 step 4) A named endpoint is checked once, under its id; an
-    // inline one per model that declares it.
+    // A named endpoint is checked once, under its id.
     let mut seen_named: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for (profile_name, profile) in &registry.registry.profiles {
+    for profile in registry.registry.profiles.values() {
         for model in &profile.models {
             let Some(ep) = model.endpoint.as_ref() else {
                 continue;
             };
-            let subject = match ep.named_id() {
-                Some(id) => {
-                    if !seen_named.insert(id.to_string()) {
-                        continue;
-                    }
-                    format!("endpoint `{id}`")
-                }
-                None => format!("profile `{profile_name}` model `{}`", model.id),
-            };
+            let Some(id) = ep.named_id() else { continue };
+            if !seen_named.insert(id.to_string()) {
+                continue;
+            }
+            let subject = format!("endpoint `{id}`");
             let Some(auth) = ep.auth.as_ref() else {
                 continue;
             };
@@ -3992,8 +3990,8 @@ fn keychain_item_present(name: &str) -> bool {
 
 /// (#2902 steps 4 and 5) `endpoints`: what the registry's `endpoints` map
 /// declares, one line per endpoint (what darkmux does there, the request
-/// dialect, where the credential lives by NAME, its limits and its budget),
-/// and the move to name each inline endpoint by id. For a budget that
+/// dialect, where the credential lives by NAME, its limits and its budget).
+/// For a budget that
 /// counts, the line shows its policy and the spend so far in its rolling
 /// window (this machine's usage records, read through the same window
 /// reader the gate uses). An unregistered budget `policy` is Fail: every
@@ -4115,52 +4113,12 @@ fn endpoints_status(
         let budget = endpoint_budget_note(id, ep, spend);
         lines.push(format!("`{id}`: {kind}, {dialect}, {credential}{limits}{budget}"));
     }
-    let mut advice: Vec<String> = registry
-        .validate()
-        .into_iter()
-        .filter(|i| i.severity == darkmux_types::IssueSeverity::Advice)
-        .map(|i| i.message)
-        .collect();
-    // (#2902 step 5) A window budget on an INLINE endpoint is not enforced:
-    // its usage records carry no `endpoints` id to sum by.
-    for (pname, profile) in &registry.profiles {
-        for m in &profile.models {
-            let Some(ep) = m.endpoint.as_ref().filter(|e| e.source == darkmux_types::EndpointSource::Inline) else {
-                continue;
-            };
-            if ep.known_limits().and_then(|l| l.window.as_ref()).is_some_and(|w| w.is_set()) {
-                advice.push(format!(
-                    "profile \"{pname}\" model \"{}\" sets a window budget on an inline endpoint, which is \
-                     not enforced: a budget is summed by `endpoints` id, so declare the endpoint there",
-                    m.id
-                ));
-            }
-        }
-    }
     let listed = if lines.is_empty() {
         "no `endpoints` declared".to_string()
     } else {
         format!("{} endpoint(s): {}", lines.len(), lines.join("; "))
     };
-    // (#2902 review C6) Advice, not a warning: an inline endpoint works, so
-    // the check passes and names the move instead of flagging every
-    // working pre-4.0 config.
-    if advice.is_empty() {
-        Check { name, status: Status::Pass, message: listed, hint: None }
-    } else {
-        Check {
-            name,
-            status: Status::Pass,
-            message: format!("{listed}; advice: {}", advice.join("; ")),
-            hint: Some(
-                "Inline `endpoint` objects still work. Declaring each endpoint once under the \
-                 top-level `endpoints` map and naming it by id (`\"endpoint\": \"<id>\"`) keeps \
-                 its url, auth and limits in one place for every profile that uses it, and is \
-                 what lets its window budget be enforced. (#2902)"
-                    .into(),
-            ),
-        }
-    }
+    Check { name, status: Status::Pass, message: listed, hint: None }
 }
 
 /// (#1177) Live endpoint probes — NOT part of [`run`]'s offline check set.
@@ -5766,23 +5724,14 @@ fn check_profile_registry() -> Check {
             //   2. (#2902 step 4) every error `ProfileRegistry::validate`
             //      finds — the ONE place the registry's rules live: managed
             //      models missing `n_ctx`, endpoints that cannot work as
-            //      written, and ids no `endpoints` entry defines. (Its advice,
-            //      inline endpoints to move to an id, is the `endpoints`
-            //      check's.)
+            //      written, and ids no `endpoints` entry defines.
             let mut findings: Vec<String> = loaded
                 .registry
                 .quarantined
                 .iter()
                 .map(|q| format!("quarantined {} \"{}\": {}", q.kind, q.name, q.error))
                 .collect();
-            findings.extend(
-                loaded
-                    .registry
-                    .validate()
-                    .into_iter()
-                    .filter(|i| i.severity == darkmux_types::IssueSeverity::Error)
-                    .map(|i| i.message),
-            );
+            findings.extend(loaded.registry.validate());
 
             if findings.is_empty() {
                 Check {
@@ -11650,17 +11599,6 @@ mod tests {
         assert!(c.message.contains("limits.window.tokens is 0") && c.message.contains("set policy off"), "{}", c.message);
     }
 
-    /// (#2902 step 4) An inline endpoint still works; doctor names the move.
-    #[test]
-    fn endpoints_check_names_the_move_from_inline_to_an_id() {
-        let r = materialized(r#"{"profiles":{"p":{"models":[{"id":"grok-4","endpoint":{"url":"https://api.x.ai/v1"}}]}}}"#);
-        let c = endpoints_status(&r, &mut no_spend);
-        assert_eq!(c.status, Status::Pass, "advice, not a warning, for a working inline endpoint");
-        assert!(c.message.contains("advice: "), "{}", c.message);
-        assert!(c.message.contains("move the object to `endpoints.\"api.x.ai\"`"), "{}", c.message);
-        assert!(c.hint.as_deref().is_some_and(|h| h.contains("still work")));
-    }
-
     #[test]
     #[serial_test::serial]
     fn run_returns_static_plus_eureka_checks() {
@@ -12693,8 +12631,9 @@ mod tests {
         let registry: darkmux_types::ProfileRegistry = serde_json::from_value(serde_json::json!({
             "internal": { "utility": { "id": "util-4b", "n_ctx": 120000 } },
             "profiles": {
-                "hosted": { "models": [{ "id": "util-4b", "endpoint": { "url": "https://provider.example/v1" } }] }
-            }
+                "hosted": { "models": [{ "id": "util-4b", "endpoint": "provider" }] }
+            },
+            "endpoints": { "provider": { "url": "https://provider.example/v1" } }
         }))
         .unwrap();
         let c = super::utility_in_profiles_status(&registry);
@@ -14771,8 +14710,9 @@ mod tests {
         std::fs::write(
             &config_path,
             r#"{"profiles":{"cloud":{"models":[
-                    {"id":"gpt-4o","endpoint":{"url":"https://example.azure.com/openai"}}
-                ]}}}"#,
+                    {"id":"gpt-4o","endpoint":"azure"}
+                ]}},
+                "endpoints":{"azure":{"url":"https://example.azure.com/openai"}}}"#,
         )
         .unwrap();
 
@@ -14813,10 +14753,11 @@ mod tests {
                     "models": [{
                         "id": "proxy-model",
                         "n_ctx": 32768,
-                        "endpoint": { "url": "http://localhost:8080/v1" }
+                        "endpoint": "proxy"
                     }]
                 }
-            }
+            },
+            "endpoints": { "proxy": { "url": "http://localhost:8080/v1" } }
         }"#;
         std::fs::write(&config_path, registry_json).unwrap();
 
@@ -14835,20 +14776,20 @@ mod tests {
                     "models": [{
                         "id": "gpt-4o",
                         "n_ctx": 128000,
-                        "endpoint": {
-                            "url": "https://x.cognitiveservices.azure.com/openai/deployments/gpt-4o",
-                            "auth": { "type": "api-key" }
-                        }
+                        "endpoint": "azure"
                     }]
                 }
-            }
+            },
+            "endpoints": { "azure": {
+                "url": "https://x.cognitiveservices.azure.com/openai/deployments/gpt-4o",
+                "auth": { "type": "api-key" }
+            } }
         }"#;
         std::fs::write(&config_path, registry_json).unwrap();
 
         let check = check_remote_endpoint_credentials();
         assert_eq!(check.status, Status::Warn);
-        assert!(check.message.contains("azure-profile"));
-        assert!(check.message.contains("gpt-4o"));
+        assert!(check.message.contains("endpoint `azure`"), "{}", check.message);
         // (#1312) The message now names BOTH credential sources (keychain OR
         // key_env), since either satisfies the auth.
         assert!(check.message.contains("no credential source resolved"), "{}", check.message);
@@ -14866,16 +14807,17 @@ mod tests {
                     "models": [{
                         "id": "gpt-4o",
                         "n_ctx": 128000,
-                        "endpoint": {
-                            "url": "https://x.cognitiveservices.azure.com/openai/deployments/gpt-4o",
-                            "auth": {
-                                "type": "api-key",
-                                "keychain": "darkmux-doctor-test-definitely-nonexistent-item-xyz123"
-                            }
-                        }
+                        "endpoint": "azure"
                     }]
                 }
-            }
+            },
+            "endpoints": { "azure": {
+                "url": "https://x.cognitiveservices.azure.com/openai/deployments/gpt-4o",
+                "auth": {
+                    "type": "api-key",
+                    "keychain": "darkmux-doctor-test-definitely-nonexistent-item-xyz123"
+                }
+            } }
         }"#;
         std::fs::write(&config_path, registry_json).unwrap();
 
@@ -14903,17 +14845,18 @@ mod tests {
                     "models": [{{
                         "id": "gpt-4o",
                         "n_ctx": 128000,
-                        "endpoint": {{
-                            "url": "https://x.cognitiveservices.azure.com/openai/deployments/gpt-4o",
-                            "auth": {{
-                                "type": "api-key",
-                                "keychain": "darkmux-doctor-test-definitely-nonexistent-item-xyz123",
-                                "key_env": "{var}"
-                            }}
-                        }}
+                        "endpoint": "azure"
                     }}]
                 }}
-            }}
+            }},
+            "endpoints": {{ "azure": {{
+                "url": "https://x.cognitiveservices.azure.com/openai/deployments/gpt-4o",
+                "auth": {{
+                    "type": "api-key",
+                    "keychain": "darkmux-doctor-test-definitely-nonexistent-item-xyz123",
+                    "key_env": "{var}"
+                }}
+            }} }}
         }}"#
         );
         std::fs::write(&config_path, registry_json).unwrap();
@@ -14997,17 +14940,18 @@ mod tests {
                     "models": [{{
                         "id": "gpt-probe",
                         "n_ctx": 128000,
-                        "endpoint": {{ "url": "http://127.0.0.1:{port}/v1" }}
+                        "endpoint": "mock"
                     }}]
                 }},
                 "review-b": {{
                     "models": [{{
                         "id": "gpt-probe",
                         "n_ctx": 128000,
-                        "endpoint": {{ "url": "http://127.0.0.1:{port}/v1" }}
+                        "endpoint": "mock"
                     }}]
                 }}
-            }}
+            }},
+            "endpoints": {{ "mock": {{ "url": "http://127.0.0.1:{port}/v1" }} }}
         }}"#
         );
         std::fs::write(&config_path, registry_json).unwrap();
@@ -16194,6 +16138,26 @@ mod user_file_key_tests {
         for text in [&row.name, &row.message] {
             assert!(!text.contains('\n') && !text.contains('\u{202e}'), "{text:?}");
         }
+    }
+
+    /// A profile model's inline `endpoint` object is a Fail row naming the
+    /// exact rewrite and that every dispatching entry point refuses to start.
+    #[test]
+    fn an_inline_endpoint_object_is_a_fail_row_naming_the_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        std::fs::write(
+            &path,
+            r#"{"profiles":{"p":{"models":[{"id":"gpt","endpoint":{"url":"https://api.example/v1"}}]}}}"#,
+        )
+        .unwrap();
+        let problem = darkmux_profiles::profiles::user_file_problem(&path).unwrap();
+        let row = &user_file_key_rows(&[problem])[0];
+        assert_eq!(row.status, Status::Fail);
+        assert!(row.message.contains("profiles.p.models[0].endpoint"), "{}", row.message);
+        assert!(row.message.contains("endpoints.\"api.example\""), "{}", row.message);
+        assert!(row.message.contains("Refused at preflight by"), "{}", row.message);
+        assert!(row.hint.as_deref().is_some_and(|h| h.contains("rewrite")), "{:?}", row.hint);
     }
 
     /// Doctor runs to completion against a user file with a syntax error and

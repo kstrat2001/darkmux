@@ -8,13 +8,14 @@
 //! (`lms`), on an unmanaged one it only sends requests.
 //!
 //! An endpoint is declared once in the registry's `endpoints` map and named
-//! by id from each profile model (`"endpoint": "<id>"`), or, for configs
-//! written before 4.0, inline as an object on the model (still read; doctor
-//! names the move to an id). Both spellings become one [`ModelEndpoint`];
-//! everything that decides a URL, a dialect, a host or a credential source
-//! reads it through the methods here, so the rules live in one place.
+//! by id from each profile model (`"endpoint": "<id>"`). A profile model has
+//! no inline endpoint object: 4.0 refuses one, naming the rewrite
+//! ([`crate::ProfileRegistry::inline_endpoint_rewrites`]). Everything that
+//! decides a URL, a dialect, a host or a credential source reads a
+//! [`ModelEndpoint`] through the methods here, so the rules live in one
+//! place.
 
-use serde::de::{self, Deserializer, MapAccess, Visitor};
+use serde::de::{self, Deserializer, Visitor};
 use serde::{Deserialize, Serialize, Serializer};
 
 /// What darkmux does at an endpoint: its own action, never the endpoint's
@@ -390,8 +391,8 @@ impl<T> Lenient<T> {
 /// deserializer and the registry loader, never serialized itself.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum EndpointSource {
-    /// An inline object on the model (the pre-4.0 spelling), or an entry of
-    /// the `endpoints` map itself.
+    /// An `endpoints` entry itself, or an inline object on a mission step's
+    /// `config.endpoint`. Never a profile model's own endpoint.
     #[default]
     Inline,
     /// `"endpoint": "<id>"`, matched to the `endpoints` map's definition,
@@ -409,11 +410,9 @@ pub enum EndpointSource {
 pub struct ModelEndpoint {
     /// Base URL of an UNMANAGED OpenAI-compatible server, up to (not
     /// including) `/chat/completions`, e.g. `https://api.openai.com/v1`.
-    /// A managed endpoint has none: its address is `lmstudio_url`.
-    ///
-    /// Legacy rule, kept so every pre-4.0 config reads unchanged: an inline
-    /// endpoint with no `url` and no `managed` is managed LM Studio; one with
-    /// a `url` and no `managed` is unmanaged.
+    /// A managed endpoint has none: its address is `lmstudio_url`. An
+    /// endpoint with a `url` is one darkmux only sends requests to; one with
+    /// neither `url` nor `managed` is refused (there is no implicit kind).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     /// API-version query parameter (Azure OpenAI requires one, e.g.
@@ -432,7 +431,7 @@ pub struct ModelEndpoint {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
     /// What darkmux manages here: `"lmstudio"`, or absent for none (see
-    /// [`EndpointKind`] and the legacy rule on `url`).
+    /// [`EndpointKind`]). An endpoint declares `managed` or a `url`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub managed: Option<Lenient<ManagedBackend>>,
     /// The request shape, when it differs from the kind's default
@@ -466,6 +465,11 @@ impl std::fmt::Display for EndpointError {
 impl std::error::Error for EndpointError {}
 
 impl ModelEndpoint {
+    /// The managed LM Studio endpoint a model with no `endpoint` runs on.
+    pub fn managed_lmstudio() -> Self {
+        ModelEndpoint { managed: Some(ManagedBackend::Lmstudio.into()), ..Default::default() }
+    }
+
     /// A reference to `endpoints.<id>` that has not been matched to a
     /// definition yet (what `"endpoint": "<id>"` deserializes to).
     pub fn reference(id: impl Into<String>) -> Self {
@@ -502,17 +506,21 @@ impl ModelEndpoint {
                     quoted_tokens::<ManagedBackend>()
                 )))
             }
-            (None, None) => EndpointKind::Managed(ManagedBackend::Lmstudio),
+            (None, None) => {
+                return Err(EndpointError(
+                    "darkmux: an endpoint declares what darkmux does at it: `\"managed\": \"lmstudio\"` for a \
+                     server darkmux loads models into, or a `url` for one it only sends requests to. \
+                     This one declares neither (4.0 has no implicit kind). (#2902)"
+                        .to_string(),
+                ))
+            }
             (None, Some(_)) => EndpointKind::Unmanaged,
         };
         // (#2902 review M3, C5) A managed endpoint's address is the machine's
         // `lmstudio_url` and its request shape is LM Studio's. Declaring
         // either otherwise is refused here, at use, rather than silently
         // sent to the local LM Studio. Only an EXPLICIT `managed` refuses a
-        // `url`/`api_version` (without one, a `url` means unmanaged, and the
-        // pre-4.0 inline `{api_version}` shape keeps reading as before; doctor
-        // names it); a declared `dialect` is new in 4.0, so no config predates
-        // the refusal.
+        // `url`/`api_version` (without one, a `url` means unmanaged).
         if kind.is_managed() {
             let explicit = self.managed.is_some();
             if explicit && self.url.is_some() {
@@ -759,10 +767,8 @@ impl EndpointAuth {
     }
 }
 
-/// The schema of `ProfileModel.endpoint` (read through [`endpoint_field`]):
-/// an id naming an `endpoints` entry, or an inline endpoint object. Used only
-/// as `#[schemars(with)]`, so the unknown-key gate checks an inline
-/// endpoint's keys against [`ModelEndpoint`].
+/// The schema of `ProfileModel.endpoint` (read through [`endpoint_field`]): an
+/// id naming an `endpoints` entry. Used only as `#[schemars(with)]`.
 pub struct EndpointFieldSchema;
 
 impl schemars::JsonSchema for EndpointFieldSchema {
@@ -770,15 +776,16 @@ impl schemars::JsonSchema for EndpointFieldSchema {
         "EndpointField".into()
     }
     fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        schemars::json_schema!({"anyOf": [{"type": "string"}, generator.subschema_for::<ModelEndpoint>()]})
+        let _ = generator;
+        schemars::json_schema!({"type": "string"})
     }
 }
 
 /// `serde(with)` for `ProfileModel.endpoint`: a string names an `endpoints`
-/// entry by id; an object is the inline (pre-4.0) spelling. A named endpoint
-/// serializes back as its id, so a model's endpoint keeps the spelling it
-/// was written in (a quarantined `endpoints` entry is not in the loaded
-/// registry at all, like a quarantined profile).
+/// entry by id, and nothing else reads (an inline object is refused, naming
+/// the rewrite). A named endpoint serializes back as its id (a quarantined
+/// `endpoints` entry is not in the loaded registry at all, like a
+/// quarantined profile).
 pub(crate) mod endpoint_field {
     use super::*;
 
@@ -787,6 +794,8 @@ pub(crate) mod endpoint_field {
             None => s.serialize_none(),
             Some(ep) => match ep.named_id() {
                 Some(id) => s.serialize_some(id),
+                // Only an in-memory value built without an id has none; a
+                // loaded registry's model endpoint always names one.
                 None => s.serialize_some(ep),
             },
         }
@@ -797,7 +806,10 @@ pub(crate) mod endpoint_field {
         impl<'de> Visitor<'de> for V {
             type Value = Option<ModelEndpoint>;
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("an endpoint id (a string naming an `endpoints` entry) or an inline endpoint object")
+                f.write_str(
+                    "an endpoint id: a string naming an `endpoints` entry (an inline endpoint object was \
+                     removed in 4.0: declare it once under `endpoints` and name it by id)",
+                )
             }
             fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
                 Ok(None)
@@ -810,9 +822,6 @@ pub(crate) mod endpoint_field {
             }
             fn visit_str<E: de::Error>(self, id: &str) -> Result<Self::Value, E> {
                 Ok(Some(ModelEndpoint::reference(id)))
-            }
-            fn visit_map<M: MapAccess<'de>>(self, m: M) -> Result<Self::Value, M::Error> {
-                ModelEndpoint::deserialize(de::value::MapAccessDeserializer::new(m)).map(Some)
             }
         }
         d.deserialize_option(V)
@@ -846,18 +855,30 @@ mod tests {
         serde_json::from_str(json).unwrap()
     }
 
+    /// What darkmux does at an endpoint is declared, never inferred: `managed`
+    /// or a `url`. A model with no endpoint is the managed default; an
+    /// endpoint declaring neither is refused.
     #[test]
-    fn kind_follows_managed_then_the_legacy_url_rule() {
-        let absent = pm(r#"{"id":"m","n_ctx":1}"#);
-        assert_eq!(absent.endpoint_kind().unwrap(), EndpointKind::Managed(ManagedBackend::Lmstudio));
-        let no_url = pm(r#"{"id":"m","n_ctx":1,"endpoint":{"reasoning_effort":"high"}}"#);
-        assert_eq!(no_url.endpoint_kind().unwrap(), EndpointKind::Managed(ManagedBackend::Lmstudio));
-        let url = pm(r#"{"id":"m","endpoint":{"url":"http://localhost:1234/v1"}}"#);
-        assert_eq!(url.endpoint_kind().unwrap(), EndpointKind::Unmanaged, "a url means darkmux only sends");
-        let explicit = pm(r#"{"id":"m","n_ctx":1,"endpoint":{"managed":"lmstudio"}}"#);
-        assert_eq!(explicit.endpoint_kind().unwrap(), EndpointKind::Managed(ManagedBackend::Lmstudio));
-        assert!(explicit.is_managed());
-        assert!(!url.is_managed());
+    fn kind_is_declared_and_never_implied() {
+        let r = registry(
+            r#"{"profiles":{"p":{"models":[
+                    {"id":"absent","n_ctx":1},
+                    {"id":"hosted","endpoint":"hosted"},
+                    {"id":"lms","n_ctx":1,"endpoint":"lms"},
+                    {"id":"bare","n_ctx":1,"endpoint":"bare"}]}},
+                "endpoints":{"hosted":{"url":"http://localhost:1234/v1"},
+                             "lms":{"managed":"lmstudio"},
+                             "bare":{"reasoning_effort":"high"}}}"#,
+        );
+        let models = &r.profiles["p"].models;
+        let managed = EndpointKind::Managed(ManagedBackend::Lmstudio);
+        assert_eq!(models[0].endpoint_kind().unwrap(), managed, "no endpoint: the managed default");
+        assert_eq!(models[1].endpoint_kind().unwrap(), EndpointKind::Unmanaged, "a url: darkmux only sends");
+        assert_eq!(models[2].endpoint_kind().unwrap(), managed);
+        assert!(models[2].is_managed() && !models[1].is_managed());
+        let err = models[3].endpoint_kind().unwrap_err().to_string();
+        assert!(err.contains("neither") && err.contains("managed") && err.contains("url"), "{err}");
+        assert!(!models[3].is_managed(), "an endpoint of no declared kind is never loaded on a guess");
     }
 
     #[test]
@@ -872,17 +893,21 @@ mod tests {
         assert_eq!(out["endpoint"], "azure-east");
     }
 
+    /// A profile model's inline endpoint object is refused at parse, naming
+    /// the rewrite.
     #[test]
-    fn an_inline_object_keeps_field_level_parse_errors() {
-        let err = serde_json::from_str::<ProfileModel>(r#"{"id":"m","endpoint":{"url":5}}"#)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("invalid type"), "serde's own field error survives: {err}");
+    fn an_inline_object_is_refused_naming_the_rewrite() {
+        for object in [r#"{"url":"https://h/v1"}"#, r#"{"url":5}"#, "{}"] {
+            let err = serde_json::from_str::<ProfileModel>(&format!(r#"{{"id":"m","endpoint":{object}}}"#))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("removed in 4.0") && err.contains("`endpoints`"), "{object}: {err}");
+        }
     }
 
     #[test]
     fn dialect_defaults_by_kind_and_can_be_declared() {
-        let managed = ModelEndpoint::default();
+        let managed = ModelEndpoint::managed_lmstudio();
         assert_eq!(managed.resolved_dialect().unwrap(), Dialect::ChatCompletionsMaxTokens);
         let hosted = ModelEndpoint { url: Some("https://h/v1".into()), ..Default::default() };
         assert_eq!(hosted.resolved_dialect().unwrap(), Dialect::ChatCompletions);
@@ -900,7 +925,7 @@ mod tests {
     fn chat_url_is_built_one_way_per_kind() {
         let prev = std::env::var("DARKMUX_LMSTUDIO_URL").ok();
         unsafe { std::env::set_var("DARKMUX_LMSTUDIO_URL", "http://127.0.0.1:4321/v1/") };
-        let managed = ModelEndpoint::default().chat_url().unwrap();
+        let managed = ModelEndpoint::managed_lmstudio().chat_url().unwrap();
         unsafe {
             match prev {
                 Some(v) => std::env::set_var("DARKMUX_LMSTUDIO_URL", v),
@@ -924,7 +949,7 @@ mod tests {
     fn host_is_the_authority_without_userinfo_and_none_when_managed() {
         let ep = ModelEndpoint { url: Some("https://tok@proxy.example:8443/v1/x".into()), ..Default::default() };
         assert_eq!(ep.host().as_deref(), Some("proxy.example:8443"));
-        assert_eq!(ModelEndpoint::default().host(), None);
+        assert_eq!(ModelEndpoint::managed_lmstudio().host(), None);
         assert_eq!(url_host("no-scheme.example/v1"), None);
     }
 
@@ -1060,28 +1085,17 @@ mod tests {
         let r = registry(
             r#"{"profiles":{"p":{"models":[
                     {"id":"a","endpoint":"missing"},
-                    {"id":"b","endpoint":{"url":"https://inline.example/v1"}},
                     {"id":"c"},
                     {"id":"d","n_ctx":1,"endpoint":"bad"}]}},
                 "endpoints":{"bad":{"url":"ftp://nope"}}}"#,
         );
         let issues = r.validate();
-        let errors: Vec<&str> = issues
-            .iter()
-            .filter(|i| i.severity == crate::IssueSeverity::Error)
-            .map(|i| i.message.as_str())
-            .collect();
-        let advice: Vec<&str> = issues
-            .iter()
-            .filter(|i| i.severity == crate::IssueSeverity::Advice)
-            .map(|i| i.message.as_str())
-            .collect();
+        let errors: Vec<&str> = issues.iter().map(String::as_str).collect();
         assert!(errors.iter().any(|m| m.contains("\"missing\"") && m.contains("does not define")), "{errors:?}");
         assert!(errors.iter().any(|m| m.contains("endpoint \"bad\"") && m.contains("http://")), "{errors:?}");
         assert!(errors.iter().any(|m| m.contains("model \"c\"") && m.contains("n_ctx")), "{errors:?}");
         assert!(!errors.iter().any(|m| m.contains("model \"a\"") && m.contains("n_ctx")), "an unresolved endpoint is not a managed model missing n_ctx");
-        assert_eq!(advice.len(), 1, "{advice:?}");
-        assert!(advice[0].contains("model \"b\"") && advice[0].contains("endpoints.\"inline.example\""), "{advice:?}");
+        assert_eq!(errors.len(), 3, "{errors:?}");
     }
 
     /// (#2902 review M1) The three new fields read leniently: a value this
@@ -1091,20 +1105,29 @@ mod tests {
     /// `managed`/`dialect` (they decide routing), in `validate` for all three.
     #[test]
     fn unknown_values_in_the_new_fields_read_leniently_and_are_refused_at_use() {
-        let dialect = pm(r#"{"id":"m","endpoint":{"url":"https://h/v1","dialect":"responses"}}"#);
+        let r = registry(
+            r#"{"profiles":{"p":{"models":[
+                    {"id":"dialect","endpoint":"dialect"},
+                    {"id":"managed","n_ctx":1,"endpoint":"managed"},
+                    {"id":"limits","endpoint":"limits"}]}},
+                "endpoints":{
+                    "dialect":{"url":"https://h/v1","dialect":"responses"},
+                    "managed":{"managed":"machine"},
+                    "limits":{"url":"https://h/v1","limits":{"tokens_per_dispatch":"500k"}}}}"#,
+        );
+        let models = &r.profiles["p"].models;
+        let dialect = &models[0];
         let ep = dialect.endpoint.as_ref().unwrap();
         assert_eq!(ep.kind().unwrap(), EndpointKind::Unmanaged);
         assert!(ep.resolved_dialect().unwrap_err().to_string().contains("responses"));
         assert!(ep.validate().unwrap_err().contains("responses"));
-        assert_eq!(serde_json::to_value(&dialect).unwrap()["endpoint"]["dialect"], "responses", "written back as read");
+        assert_eq!(serde_json::to_value(&r).unwrap()["endpoints"]["dialect"]["dialect"], "responses", "written back as read");
 
-        let managed = pm(r#"{"id":"m","n_ctx":1,"endpoint":{"managed":"machine"}}"#);
-        let err = managed.endpoint_kind().unwrap_err().to_string();
+        let err = models[1].endpoint_kind().unwrap_err().to_string();
         assert!(err.contains("machine") && err.contains("lmstudio"), "{err}");
-        assert!(!managed.is_managed(), "an unknown kind is never loaded on a guess");
+        assert!(!models[1].is_managed(), "an unknown kind is never loaded on a guess");
 
-        let limits = pm(r#"{"id":"m","endpoint":{"url":"https://h/v1","limits":{"tokens_per_dispatch":"500k"}}}"#);
-        let ep = limits.endpoint.as_ref().unwrap();
+        let ep = models[2].endpoint.as_ref().unwrap();
         assert_eq!(ep.kind().unwrap(), EndpointKind::Unmanaged, "unreadable limits never decide routing");
         assert!(ep.validate().unwrap_err().contains("limits"), "{:?}", ep.validate());
         assert_eq!(ep.limits_summary(), "(unreadable)");
@@ -1113,16 +1136,16 @@ mod tests {
     /// (#2902 review M3, C5) A managed endpoint's address is `lmstudio_url`
     /// and its request shape is LM Studio's: an explicit `managed` that also
     /// declares a `url`, an `api_version` or another dialect is refused at
-    /// use (never silently sent to the local LM Studio). The pre-4.0 inline
-    /// shape (no `managed`, no `url`) keeps reading as before; validate()
-    /// still names what it ignores.
+    /// use (never silently sent to the local LM Studio). An endpoint that
+    /// declares neither `managed` nor `url` is refused too.
     #[test]
     fn a_managed_endpoint_that_declares_an_address_or_dialect_is_refused_at_use() {
         for (json, needle) in [
             (r#"{"managed":"lmstudio","url":"http://h:1234"}"#, "lmstudio_url"),
             (r#"{"managed":"lmstudio","api_version":"v1"}"#, "api_version"),
             (r#"{"managed":"lmstudio","dialect":"chat-completions"}"#, "dialect"),
-            (r#"{"dialect":"chat-completions"}"#, "dialect"),
+            (r#"{"dialect":"chat-completions"}"#, "neither"),
+            (r#"{"api_version":"v1"}"#, "neither"),
         ] {
             let ep: ModelEndpoint = serde_json::from_str(json).unwrap();
             let err = ep.kind().unwrap_err().to_string();
@@ -1131,9 +1154,6 @@ mod tests {
         }
         let ok: ModelEndpoint = serde_json::from_str(r#"{"managed":"lmstudio","dialect":"chat-completions-max-tokens"}"#).unwrap();
         assert_eq!(ok.kind().unwrap(), EndpointKind::Managed(ManagedBackend::Lmstudio));
-        let legacy: ModelEndpoint = serde_json::from_str(r#"{"api_version":"v1"}"#).unwrap();
-        assert_eq!(legacy.kind().unwrap(), EndpointKind::Managed(ManagedBackend::Lmstudio), "pre-4.0 shape unchanged");
-        assert!(legacy.validate().unwrap_err().contains("api_version"));
     }
 
     /// (#2902 review C6) Each distinct inline endpoint gets a UNIQUE
@@ -1141,29 +1161,31 @@ mod tests {
     /// deployment, the same definition shared by two models gets one id, and
     /// an id `endpoints` already defines is never suggested again.
     #[test]
-    fn inline_advice_suggests_a_unique_id_per_distinct_endpoint() {
-        let r = registry(
+    fn inline_rewrites_suggest_a_unique_id_per_distinct_endpoint() {
+        let doc: serde_json::Value = serde_json::from_str(
             r#"{"profiles":{"p":{"models":[
                     {"id":"a","endpoint":{"url":"https://r.example/openai/deployments/gpt-4o","api_version":"v1"}},
                     {"id":"b","endpoint":{"url":"https://r.example/openai/deployments/gpt-5","api_version":"v1"}},
                     {"id":"c","endpoint":{"url":"https://r.example/openai/deployments/gpt-5","api_version":"v1"}},
-                    {"id":"d","endpoint":{"url":"https://api.x.ai/v1"}}]}},
+                    {"id":"d","endpoint":{"url":"https://api.x.ai/v1"}},
+                    {"id":"e","endpoint":"named"}]}},
                 "endpoints":{"api.x.ai":{"url":"https://other.example/v1"}}}"#,
+        )
+        .unwrap();
+        let rewrites = crate::ProfileRegistry::inline_endpoint_rewrites(&doc);
+        let suggested: Vec<(&str, &str)> = rewrites.iter().map(|r| (r.path.as_str(), r.suggested_id.as_str())).collect();
+        assert_eq!(
+            suggested,
+            [
+                ("profiles.p.models[0].endpoint", "r.example-gpt-4o"),
+                ("profiles.p.models[1].endpoint", "r.example-gpt-5"),
+                ("profiles.p.models[2].endpoint", "r.example-gpt-5"),
+                ("profiles.p.models[3].endpoint", "api.x.ai-2"),
+            ],
+            "one definition, one id; never an id `endpoints` already defines; a named endpoint is not inline"
         );
-        let advice: Vec<String> = r
-            .validate()
-            .into_iter()
-            .filter(|i| i.severity == crate::IssueSeverity::Advice)
-            .map(|i| i.message)
-            .collect();
-        let suggested = |model: &str| {
-            let line = advice.iter().find(|m| m.contains(&format!("model \"{model}\""))).unwrap();
-            line.split("`endpoints.\"").nth(1).unwrap().split('"').next().unwrap().to_string()
-        };
-        assert_eq!(suggested("a"), "r.example-gpt-4o");
-        assert_eq!(suggested("b"), "r.example-gpt-5");
-        assert_eq!(suggested("c"), "r.example-gpt-5", "one definition, one id");
-        assert_eq!(suggested("d"), "api.x.ai-2", "never an id `endpoints` already defines");
+        let line = rewrites[3].line();
+        assert!(line.contains("endpoints.\"api.x.ai-2\"") && line.contains("\"endpoint\": \"api.x.ai-2\""), "{line}");
     }
 
     #[test]

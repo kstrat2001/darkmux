@@ -3164,9 +3164,9 @@ mod tests {
         std::fs::write(
             &pf,
             r#"{"profiles":{"cloud":{"models":[
-                    {"id":"gpt-remote","n_ctx":100000,
-                     "endpoint":{"url":"http://127.0.0.1:1"}}
+                    {"id":"gpt-remote","n_ctx":100000,"endpoint":"mock"}
                 ]}},
+                "endpoints":{"mock":{"url":"http://127.0.0.1:1"}},
                 "default_profile":"cloud"}"#,
         )
         .unwrap();
@@ -7195,8 +7195,8 @@ mod tests {
     }
 
     /// (#2902 step 3) A seat whose selected model is on an UNMANAGED
-    /// endpoint is the silent `Remote` miss (no local residency to plan),
-    /// named by id or inline; an undefined id is a loud resolution failure.
+    /// endpoint is the silent `Remote` miss (no local residency to plan);
+    /// an undefined id is a loud resolution failure.
     #[serial_test::serial]
     #[test]
     fn placement_classifies_through_the_one_resolver() {
@@ -7210,7 +7210,6 @@ mod tests {
                 "profiles": {
                     "local": {"models": [{"id": "m-local", "n_ctx": 4096}]},
                     "named": {"models": [{"id": "gpt", "endpoint": "hosted"}]},
-                    "inline": {"models": [{"id": "gpt", "endpoint": {"url": "https://i.example/v1"}}]},
                     "dangling": {"models": [{"id": "gpt", "endpoint": "nope"}]}
                 }
             })
@@ -7228,7 +7227,6 @@ mod tests {
         };
         assert_eq!(pick("local"), Ok("m-local".into()));
         assert_eq!(pick("named"), Err("remote".into()));
-        assert_eq!(pick("inline"), Err("remote".into()));
         let err = pick("dangling").unwrap_err();
         assert!(err.contains("nope") && err != "remote", "{err}");
     }

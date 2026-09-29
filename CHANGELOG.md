@@ -157,6 +157,18 @@ darkmux release.
 
 ### Changed (breaking, 4.0)
 
+- **A profile model's inline `endpoint` object is refused, and an endpoint
+  declares its kind (PROFILES 2.0).** A model names an `endpoints` entry by
+  id (`"endpoint": "azure-east"`); the object form is gone, and so is the
+  implicit-kind rule (no `url` meant managed, a `url` meant unmanaged): an
+  `endpoints` entry declares `"managed": "lmstudio"` or a `url`, and one
+  with neither is refused at use. Every dispatching preflight and `darkmux
+  doctor` name each inline object with the exact rewrite. **Migration:**
+  for each `"endpoint": { ... }` on a model, move the object to
+  `endpoints."<id>"` and write `"endpoint": "<id>"` on the model (the
+  refusal prints the id); a model on the LM Studio darkmux manages needs no
+  `endpoint` at all.
+
 - **`dirs.crew` and `DARKMUX_CREW_DIR` are removed; `DARKMUX_HOME` is the one
   relocation.** "Crew" is a retired concept: roles, missions, phases, crews
   and skills live directly under the darkmux root, and the knob meant two
