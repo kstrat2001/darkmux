@@ -465,6 +465,35 @@ fn every_historical_config_key_is_named_as_retired() {
     }
 }
 
+/// (#2988 review) A wrong-typed value is a reported problem, not a silent
+/// drop to defaults: `serve.read_auth` written as a string used to make the
+/// lenient loader discard the whole file, turning read auth off.
+#[test]
+fn a_wrong_typed_config_value_is_a_reported_problem() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    std::fs::write(&path, r#"{"serve":{"read_auth":"true"}}"#).unwrap();
+    let found = config_json_problem_at(&path).expect("a string read_auth is a problem");
+    let shown = format!("{found:?}");
+    assert!(shown.contains("read_auth"), "{shown}");
+    std::fs::write(&path, r#"{"serve":{"read_auth":true}}"#).unwrap();
+    assert!(config_json_problem_at(&path).is_none(), "the same key with the right type is clean");
+}
+
+/// `darkmux serve` is an entry point of its own: its preflight refuses the
+/// retired auth switch by name, and points at both replacements.
+#[test]
+#[serial_test::serial]
+fn the_serve_preflight_refuses_the_retired_auth_switch_naming_both_replacements() {
+    let cfg: crate::config::DarkmuxConfig =
+        serde_json::from_str(r#"{"runtime": {"daemon_auth_enabled": true}}"#).unwrap();
+    let _guard = crate::config_access::set_config_for_test(cfg);
+    let refusal = crate::config_enum::preflight(Scope::Serve).expect_err("refused").to_string();
+    for says in ["runtime.daemon_auth_enabled", "serve.token_keychain", "serve.read_auth"] {
+        assert!(refusal.contains(says), "{says}: {refusal}");
+    }
+}
+
 /// (review minor) A file larger than the cap is not read into memory: it is
 /// reported, the same cap the crew loader holds manifests to.
 #[test]

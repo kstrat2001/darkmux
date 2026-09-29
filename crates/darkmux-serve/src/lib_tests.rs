@@ -2366,6 +2366,30 @@
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// (#2988 review) `serve` runs the config gate every other entry point
+    /// runs, so a config that fails it never starts a daemon. A retired
+    /// `runtime.daemon_auth_enabled` is refused by name with both
+    /// replacements. `run` would serve forever on a config it accepted, so
+    /// the call is bounded: a hang is the failure.
+    #[test]
+    #[serial_test::serial]
+    fn serve_refuses_to_start_on_a_config_that_fails_the_gate() {
+        let cfg: darkmux_types::config::DarkmuxConfig =
+            serde_json::from_str(r#"{"runtime": {"daemon_auth_enabled": true}}"#).unwrap();
+        let _guard = darkmux_types::config_access::set_config_for_test(cfg);
+        let dir = tempfile::tempdir().unwrap();
+        let flows = dir.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(run(0, "127.0.0.1".to_string(), flows, None).map_err(|e| format!("{e:#}")));
+        });
+        let outcome = rx.recv_timeout(std::time::Duration::from_secs(10)).expect("serve must refuse, not start");
+        let refusal = outcome.expect_err("serve started on a config that fails the gate");
+        for says in ["runtime.daemon_auth_enabled", "serve.token_keychain", "serve.read_auth"] {
+            assert!(refusal.contains(says), "{says}: {refusal}");
+        }
+    }
+
     const NO_AUTH: ServeAuth = ServeAuth { read_auth: false, token_present: false };
     const TOKEN_ONLY: ServeAuth = ServeAuth { read_auth: false, token_present: true };
     const READ_AUTH: ServeAuth = ServeAuth { read_auth: true, token_present: true };

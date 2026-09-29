@@ -12094,6 +12094,9 @@ fn every_enum_setting_is_refused_by_every_cli_entry_point_that_consumes_it() {
                 // No CLI verb starts fleet submission on its own; covered
                 // by darkmux-fleet's `configured_provider` test.
                 Scope::FleetSubmission => continue,
+                // `serve` checks only the config.json schema; no enum
+                // setting lists it, so it never reaches this loop.
+                Scope::Serve => continue,
             };
             for args in cases {
                 let mut cmd = darkmux_std_cmd();

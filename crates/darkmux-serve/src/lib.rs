@@ -1428,6 +1428,11 @@ pub fn listen_socket_addr(bind: &str, port: u16) -> Result<std::net::SocketAddr>
 }
 
 pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>) -> Result<()> {
+    // (#2988 review) The config gate every entry point runs: a wrong-typed
+    // value (`serve.read_auth: "true"`) or a retired key would otherwise be
+    // dropped by the lenient loader and this daemon would start on defaults,
+    // read auth off, with no word said.
+    darkmux_types::config_enum::preflight(darkmux_types::config_enum::Scope::Serve)?;
     // (#1461) Capture the mtime of the binary we were launched from BEFORE
     // serving anything. It has to be read at startup, not lazily on the first
     // `/health`: `cargo install` REPLACES the file on disk, so a later read

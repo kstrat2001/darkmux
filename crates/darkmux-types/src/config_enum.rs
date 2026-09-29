@@ -149,10 +149,15 @@ pub enum Scope {
     /// Fleet work submission: the daemon's work-submission listener and the
     /// sending side, both of which build the identity provider.
     FleetSubmission,
+    /// `darkmux serve`: the daemon reads `config.json` for its bind address,
+    /// its read posture and its fleet listener, so it refuses one that fails
+    /// the schema before it binds anything.
+    Serve,
 }
 
 impl Scope {
-    pub const ALL: [Scope; 4] = [Scope::Dispatch, Scope::MissionLaunch, Scope::LabRun, Scope::FleetSubmission];
+    pub const ALL: [Scope; 5] =
+        [Scope::Dispatch, Scope::MissionLaunch, Scope::LabRun, Scope::FleetSubmission, Scope::Serve];
 
     /// How the refusal names the entry point.
     pub fn label(self) -> &'static str {
@@ -161,6 +166,7 @@ impl Scope {
             Scope::MissionLaunch => "mission launch",
             Scope::LabRun => "lab run",
             Scope::FleetSubmission => "fleet work submission",
+            Scope::Serve => "serve",
         }
     }
 }
