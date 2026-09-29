@@ -10,9 +10,11 @@
 //!   spelling arrives as its current variant.
 //! * [`parse_value`] / [`upgrade`] for a consumer that keeps the record as
 //!   JSON (the daemon, which serves records on to the viewer with every
-//!   field intact). [`upgrade`] rewrites the `action` field in place, so the
-//!   JSON a route serves carries the current spelling too. [`action_of`] is
-//!   the typed read of that field.
+//!   field intact). [`upgrade`] rewrites the `action` field in place, and the
+//!   retired `source` / `tier` spellings and payload keys with it
+//!   ([`crate::legacy`]), so the JSON a route serves carries the current
+//!   spelling too. [`action_of`] and [`source_of`] are the typed reads of
+//!   those fields.
 //!
 //! Lenient on read (contract 5): an action this binary does not know is kept
 //! verbatim, as [`FlowAction::Other`]; one darkmux retired reads as
@@ -42,6 +44,8 @@ pub enum ActionRead {
 }
 
 /// Rewrite a record's retired action spelling to its current one, in place,
+/// its retired `source` / `tier` spellings and payload keys
+/// ([`crate::legacy::upgrade_fields`], [`crate::legacy::upgrade_payload`]),
 /// and give a pre-4.0 record of an execution its synthesized execution id
 /// ([`crate::legacy::stamp_execution`]).
 pub fn upgrade(record: &mut Value) -> ActionRead {
@@ -49,7 +53,7 @@ pub fn upgrade(record: &mut Value) -> ActionRead {
 }
 
 /// [`upgrade`], and whether it changed the record in any way (a respelled
-/// action, or a synthesized execution id).
+/// action, source, tier or payload key, or a synthesized execution id).
 fn upgrade_noting_rewrite(record: &mut Value) -> (ActionRead, bool) {
     let Some(read) = action_of(record) else {
         return (ActionRead::Absent, false);
@@ -105,7 +109,7 @@ pub fn parse_value(line: &str) -> Option<Value> {
 
 /// One raw JSONL line as a consumer that forwards lines should send it: the
 /// line itself, byte for byte, unless [`upgrade`] changed the record (a
-/// retired spelling, a synthesized execution id), in which case the upgraded
+/// retired spelling or key, a synthesized execution id), in which case the upgraded
 /// record re-serialized. `None` for a line that is not a JSON object.
 pub fn upgrade_line(line: &str) -> Option<std::borrow::Cow<'_, str>> {
     let mut v: Value = serde_json::from_str(line).ok()?;

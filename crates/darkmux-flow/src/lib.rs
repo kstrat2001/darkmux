@@ -3365,7 +3365,12 @@ mod tests {
         //            write; retired spellings upgrade on read. Also drops
         //            `dispatch.complete`'s `cumulative_prompt_tokens` /
         //            `cumulative_completion_tokens` (their source,
-        //            `metrics.json`, is retired).
+        //            `metrics.json`, is retired), `cumulative_turns` and
+        //            `cumulative_compactions`, `payload.runtime`,
+        //            `host.peak_cpu_pct` / `host.peak_mem_pct`, and
+        //            `FlowRecord.work_id` / `attempt`; `source` is closed
+        //            (`FlowSource`), `tier` names who acted, and payload
+        //            time keys use `*_ms` / `*_at_ms`. See schema.rs.
         assert_eq!(FLOW_SCHEMA_VERSION, "2.0.0");
     }
 

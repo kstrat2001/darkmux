@@ -1,4 +1,4 @@
-//! Pre-4.0 action spellings, and the one read-side upgrade that maps them.
+//! Pre-4.0 spellings, and the one read-side upgrade that maps them.
 //!
 //! Flow archives are append-only and never rewritten, so a 3.x day file
 //! still holds the spellings 4.0 retired: the spaced bookends

@@ -668,8 +668,8 @@ def main():
     for m in world["machines"]:
         records.append({
             "ts": iso(now_ms - 90_000), "level": "info", "category": "machinery",
-            "tier": "local", "stage": "dispatch", "action": "machine.online",
-            "handle": disp(m), "source": "presence-reconciler",
+            "tier": "darkmux", "stage": "dispatch", "action": "machine.online",
+            "handle": disp(m), "source": "presence_reconciler",
             "machine_id": disp(m), "machine_uid": m["uid"],
         })
 

@@ -138,7 +138,7 @@ mission.close            <span class="comment"># units_completed/errored/skipped
  "payload":{"graph":{"tasks_in_config":9,"tasks_minted":3,
                      "pruned":[{"id":"plan-unnamed-predicate","reason":"not_selected"}]}}}
 
-{"action":"dispatch.rest","tier":"local","mission_id":"crawl-1787979698-b5961a",
+{"action":"dispatch.rest","tier":"darkmux","mission_id":"crawl-1787979698-b5961a",
  "payload":{"ms":2000,"turn":1,"rest_ms":2000,"rests":1,
             "context":{"workspace":"darkmux-self","rule":"swallowed-error","unit":"u-0001"}}}
 
@@ -148,7 +148,7 @@ mission.close            <span class="comment"># units_completed/errored/skipped
          "findings":2,"findings_rejected":2,"prompt_tokens":657998,"completion_tokens":11719,
          "wall_ms":265649,"rest_ms":34000}}
 
-{"action":"dispatch.complete","tier":"local","mission_id":"crawl-1787979698-b5961a",
+{"action":"dispatch.complete","tier":"darkmux","mission_id":"crawl-1787979698-b5961a",
  "payload":{"wall_ms":268865,"rest_ms":34000,"rests":17,"turn_delay_effective_ms":2000,
             "exit_code":0,"result_class":"ok","total_turns":18,"total_tools":55,
             "total_tokens":669717}}
@@ -203,7 +203,7 @@ emitted
 
     <h3>The finding on the flow stream</h3>
     <p>The store is built from the same <code>dispatch.tool</code> record hooks match on: <code>payload.tool_name</code>, <code>payload.ok</code>, <code>payload.emitted</code> (the model's object, verbatim), and <code>payload.emit_seq</code> (1-based within the dispatch). The same finding as above; captured before the rename, so <code>payload.tool_name</code> still reads <code>report_finding</code>.</p>
-    <pre><code>{"ts":"2026-09-03T01:59:29Z","action":"dispatch.tool","tier":"local","handle":"crawler",
+    <pre><code>{"ts":"2026-09-03T01:59:29Z","action":"dispatch.tool","tier":"darkmux","handle":"crawler",
  "mission_id":"crawl-1788400556-b1119b","session_id":"crawl-crawl-1788400556-b1119b-u-0001",
  "model":"qwen3.6-35b-a3b-turboquant-mlx","machine_id":"MacBook-Pro",
  "payload":{"tool_name":"report_finding","emit_seq":1,"ok":true,
@@ -260,6 +260,8 @@ darkmux mod show &lt;key&gt;</code></pre>
 
     <h3>The match vocabulary</h3>
     <p>A rule's <code>match</code> ANDs every key it names. Top-level fields: <code>action</code>, <code>session_id</code>, <code>mission_id</code>, <code>machine_id</code>, <code>category</code>, <code>level</code>; a trailing <code>*</code> matches any action with that prefix. A <code>"payload.&lt;dotted.path&gt;"</code> key is an exact scalar match inside the record's payload, which is how you subscribe to one tool call's outcome. A key the payload doesn't carry never matches.</p>
+    <!-- flow-action-guard:allow — the retired spellings this paragraph names -->
+    <p>An <code>action</code> is spelled <code>&lt;scope&gt;.&lt;event&gt;</code>. A rule written in a spelling darkmux retired (<code>dispatch complete</code>, <code>step *</code>) is refused rather than guessed at: the hooks sink does not load, a dispatch or mission launch refuses at preflight, and <code>darkmux doctor</code> fails the rule, each naming the spelling to write.</p>
 
     <h3><code>hook.fired</code> / <code>hook.failed</code></h3>
     <p>Every delivery attempt emits its own flow record: <code>hook.fired</code> on a 2xx, <code>hook.failed</code> once bounded retries give up (a permanent 4xx, a redirect, or a receiver that stays down). Both carry <code>delivery_id</code>, the same id the HTTP request carried.</p>

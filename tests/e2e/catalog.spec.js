@@ -27,8 +27,8 @@ test('catalog picker renders days + missions inertly and wires navigation', asyn
       body: JSON.stringify([
         {
           ts: '2026-01-02T00:00:00Z', level: 'info', category: 'machinery',
-          tier: 'local', stage: 'dispatch', action: 'machine.online',
-          source: 'presence-reconciler', machine_id: 'demo-machine', machine_uid: 'demo-machine-uid',
+          tier: 'darkmux', stage: 'dispatch', action: 'machine.online',
+          source: 'presence_reconciler', machine_id: 'demo-machine', machine_uid: 'demo-machine-uid',
         },
       ]),
     })

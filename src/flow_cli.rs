@@ -1077,7 +1077,7 @@ mod tests {
         let rec = single_record(&guard);
         assert_eq!(rec["level"], "error");
         assert_eq!(rec["category"], "machinery");
-        assert_eq!(rec["tier"], "local");
+        assert_eq!(rec["tier"], "darkmux");
         assert_eq!(rec["stage"], "dispatch");
         assert_eq!(rec["action"], "operator.note");
         assert_eq!(rec["handle"], "y");
@@ -1106,6 +1106,34 @@ mod tests {
         assert_eq!(rec["phase_id"], "66");
         assert_eq!(rec["session_id"], "abc");
         assert_eq!(rec["source"], "manual");
+    }
+
+    /// `--source` is the operator-writable subset of `FlowSource`, and the
+    /// channels other features read (`adjudication`, `orchestrator`) parse to
+    /// the source they name; a source only darkmux writes is refused.
+    #[test]
+    fn source_flag_accepts_the_operator_writable_sources_only() {
+        use clap::Parser;
+        let parse = |source: &str| {
+            crate::cli::Cli::try_parse_from(["darkmux", "flow", "note", "--text", "t", "--source", source])
+        };
+        for (flag, want) in [
+            ("adjudication", FlowSource::Adjudication),
+            ("orchestrator", FlowSource::Orchestrator),
+            ("manual", FlowSource::Manual),
+            ("frontier", FlowSource::Frontier),
+        ] {
+            let cli = parse(flag).ok().unwrap_or_else(|| panic!("`--source {flag}` must parse"));
+            match cli.command {
+                crate::cli::Cmd::Flow { sub: FlowCmd::Note { source: Some(got), .. } } => {
+                    assert_eq!(FlowSource::from(got), want, "{flag}")
+                }
+                _ => panic!("`flow note --source {flag}` did not parse as a note"),
+            }
+        }
+        for refused in ["scheduler", "host-sampler", "frontier-orchestrator", "estimator"] {
+            assert!(parse(refused).is_err(), "`--source {refused}` is not operator-writable");
+        }
     }
 
     #[serial_test::serial]

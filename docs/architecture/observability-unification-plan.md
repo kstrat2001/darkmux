@@ -64,7 +64,7 @@ Fold per-run telemetry into the flow stream as `FlowRecord`s. The schema is alre
 ```
 FlowRecord { ts, level, category, tier, stage, action, handle,
              phase_id?, session_id?, source?, model?, mission_id?, machine_id?,
-             orchestrator?, prev_hash?, hash?, payload?, work_id?, attempt? }
+             orchestrator?, prev_hash?, hash?, payload? }
 ```
 
 - `source` is the *same* field instrument samples already use (`lms`/`process`/`meta`).

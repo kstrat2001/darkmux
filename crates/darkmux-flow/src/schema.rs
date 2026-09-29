@@ -100,10 +100,31 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
 //           Their only source was the runtime's `metrics.json`, which 4.0
 //           no longer writes; the task's token total is the sum of its
 //           `telemetry.tokens` usage records. `cumulative_turns` /
-//           `cumulative_compactions` stay, computed from the resume
-//           checkpoint and this invocation's trajectory by
-//           `darkmux_trajectory::CheckpointCounts` (a hand-back resume
-//           continues the checkpoint's turn rather than adding one).
+//           `cumulative_compactions` are removed too: every count on the
+//           record is this invocation's own.
+//
+//           Also (4.0, the wire's last leftovers). Removed: `payload.runtime`
+//           (a dispatch-topology label) on every record; the top-level
+//           `host.peak_cpu_pct` / `host.peak_mem_pct` (the nested
+//           `host.cpu.peak_pct` / `host.mem.peak_pct` carry them);
+//           `FlowRecord.work_id` / `attempt` (the retired work queue's);
+//           `Stage::Estimate` (nothing wrote it). Closed: `source` is a
+//           `FlowSource` (one `snake_case` spelling each), and `tier` names
+//           who acted (`operator`, `frontier`, `darkmux`), not where a model
+//           ran, so a hosted-endpoint execution's records no longer read
+//           `local`. Renamed, one unit for time (a duration is `*_ms`, an
+//           instant `*_at_ms` in epoch milliseconds): `budget.wait`'s
+//           `wait_seconds` / ISO `resume_at` are `wait_ms` / `resume_at_ms`,
+//           `utility.start`'s `stall_after_seconds` is `stall_after_ms`,
+//           `machine.rollup`'s `period_seconds` is `period_ms`,
+//           `dispatch.complete`'s `live.sampler_us` / `forward_us` are
+//           `sampler_ms` / `forward_ms`, `machine.battery_health`'s
+//           `total_operating_time_hours` / `time_at_soc_hours` are
+//           `total_operating_ms` / `time_at_soc_ms`. A reader of an archive
+//           maps every old spelling and key
+//           (`darkmux_flow::legacy::{OLD_SOURCES, OLD_TIERS,
+//           OLD_PAYLOAD_KEYS}`); no file is rewritten. A hook rule naming a
+//           retired action spelling is refused, not read as the current one.
 //
 //           Also (4.0): a usage record whose provider sent no prompt count
 //           (and no total) carries no `total_tokens`: its full spend is
@@ -2138,7 +2159,7 @@ pub enum Tier {
 /// The component that wrote a record: one spelling each, `snake_case`. The
 /// set is closed; a spelling this build does not know reads as
 /// [`FlowSource::Unknown`] (see [`Level::Unknown`]) and is never written.
-/// Pre-4.0 spellings map on read (`crate::legacy::upgrade_source`).
+/// Pre-4.0 spellings map on read (`crate::legacy::OLD_SOURCES`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]

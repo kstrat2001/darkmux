@@ -837,7 +837,7 @@ mod tests {
         let json = serde_json::to_value(&record).unwrap();
         assert_eq!(json["level"], "error");
         assert_eq!(json["category"], "machinery");
-        assert_eq!(json["tier"], "local");
+        assert_eq!(json["tier"], "darkmux");
         assert_eq!(json["stage"], "review");
         assert_eq!(json["action"], "phase.review.failed");
         assert_eq!(json["source"], "phase_review");

@@ -331,12 +331,13 @@ per-model endpoint addressing is deferred.
 ### The flow stream
 
 Every dispatch, decision, and review is recorded as a `FlowRecord`, the audit
-and coordination substrate. The schema version is **`1.9.0`**
-(`crates/darkmux-flow/src/schema.rs:14`). The fields group as:
+and coordination substrate. The schema version is **`2.0.0`**
+(`FLOW_SCHEMA_VERSION` in `crates/darkmux-flow/src/schema.rs`). The fields group as:
 
 - **Core (always present):** `ts`, `level`, `category`, `tier`, `stage`,
   `action`, `handle`.
-- **Correlation:** `phase_id`, `session_id`, `mission_id`, `source`.
+- **Correlation:** `phase_id`, `session_id`, `execution_id`, `mission_id`, `source` (one
+  of a closed set of `snake_case` spellings).
 - **Provenance (env-stamped at write time):** `model`, `machine_id` (from
   `DARKMUX_MACHINE_ID`). *(The `machine_tier` provenance field was removed in
   schema 1.9.0, #587: the {inference/hub/client} machine-capacity tier is
@@ -348,7 +349,8 @@ and coordination substrate. The schema version is **`1.9.0`**
   (#163). Deliberately *not* "chain-of-custody": that claim needs external
   timestamping and custodial controls darkmux does not provide, as
   `skills/darkmux-enable-audit` already states plainly.
-- **Parallel-dispatch (#246, schema 1.8):** `work_id`, `attempt`.
+- **Retired:** `work_id` and `attempt` (schema 1.8, the work queue) were removed in
+  schema 2.0.0; an archive that carries them still reads.
 - **Extension point:** **`payload`**: an optional `serde_json::Value` map (added
   in schema 1.6.0, #204) that gives new event types
   (`dispatch.turn`/`dispatch.tool`/`dispatch.compaction`/`dispatch.reasoning`/

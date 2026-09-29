@@ -100,14 +100,14 @@ test('activity lane: drilling a session.end-only session does not throw', async 
       body: JSON.stringify({
         records: [
           {
-            ts: '2026-01-01T00:01:00Z', level: 'info', category: 'work', tier: 'local', stage: 'dispatch',
+            ts: '2026-01-01T00:01:00Z', level: 'info', category: 'work', tier: 'darkmux', stage: 'dispatch',
             action: 'dispatch.start', handle: 'darkmux/coder', model: 'qwen',
             session_id: 'sess-ended-via-sessionend', machine_id: 'lifecycle-mac', machine_uid: 'lifecycle-mac-uid',
             payload: { prompt_chars: 42 },
           },
           {
-            ts: '2026-01-01T00:02:00Z', level: 'info', category: 'machinery', tier: 'local', stage: 'dispatch',
-            action: 'session.end', source: 'presence-reconciler',
+            ts: '2026-01-01T00:02:00Z', level: 'info', category: 'machinery', tier: 'darkmux', stage: 'dispatch',
+            action: 'session.end', source: 'presence_reconciler',
             session_id: 'sess-ended-via-sessionend', machine_id: 'lifecycle-mac', machine_uid: 'lifecycle-mac-uid',
           },
         ],

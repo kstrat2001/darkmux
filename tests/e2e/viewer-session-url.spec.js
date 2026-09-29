@@ -50,12 +50,12 @@ function sessionRecords(id) {
   return {
     records: [
       {
-        ts: '2026-08-03T12:00:00Z', level: 'info', category: 'work', tier: 'local', stage: 'dispatch',
+        ts: '2026-08-03T12:00:00Z', level: 'info', category: 'work', tier: 'darkmux', stage: 'dispatch',
         source: 'crew_dispatch', machine_id: 'fixture-box', machine_uid: 'FIXTURE-UID',
         action: 'dispatch.start', handle: 'coder', session_id: id, payload: { runtime: 'internal' },
       },
       {
-        ts: '2026-08-03T12:00:02Z', level: 'info', category: 'work', tier: 'local', stage: 'dispatch',
+        ts: '2026-08-03T12:00:02Z', level: 'info', category: 'work', tier: 'darkmux', stage: 'dispatch',
         source: 'crew_dispatch', machine_id: 'fixture-box', machine_uid: 'FIXTURE-UID',
         action: 'dispatch.complete', handle: 'coder', session_id: id,
         payload: { runtime: 'internal', result_class: 'ok', total_turns: 1, total_tools: 0, total_tokens: 100 },
@@ -125,19 +125,19 @@ async function bootLiveWithSession(page, sid) {
   const laterTs = new Date(Date.now() - 60_000).toISOString();
   const records = [
     {
-      ts: startTs, level: 'info', category: 'work', tier: 'local', stage: 'dispatch',
+      ts: startTs, level: 'info', category: 'work', tier: 'darkmux', stage: 'dispatch',
       source: 'crew_dispatch', machine_id: 'fixture-box', machine_uid: 'FIXTURE-UID',
       action: 'dispatch.start', handle: 'coder', session_id: sid, payload: { runtime: 'internal' },
     },
     {
-      ts: completeTs, level: 'info', category: 'work', tier: 'local', stage: 'dispatch',
+      ts: completeTs, level: 'info', category: 'work', tier: 'darkmux', stage: 'dispatch',
       source: 'crew_dispatch', machine_id: 'fixture-box', machine_uid: 'FIXTURE-UID',
       action: 'dispatch.complete', handle: 'coder', session_id: sid,
       payload: { runtime: 'internal', result_class: 'ok', total_turns: 1, total_tools: 0, total_tokens: 100 },
     },
     {
-      ts: laterTs, level: 'info', category: 'machinery', tier: 'local', stage: 'dispatch',
-      source: 'presence-reconciler', machine_id: 'fixture-box', machine_uid: 'FIXTURE-UID', action: 'machine.online',
+      ts: laterTs, level: 'info', category: 'machinery', tier: 'darkmux', stage: 'dispatch',
+      source: 'presence_reconciler', machine_id: 'fixture-box', machine_uid: 'FIXTURE-UID', action: 'machine.online',
     },
   ];
   await page.route(/\/flow\/\d{4}-\d{2}-\d{2}(\?.*)?$/, (r) =>

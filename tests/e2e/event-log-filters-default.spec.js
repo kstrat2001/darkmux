@@ -14,8 +14,8 @@ const PHONE = { width: 390, height: 844 };
 // (2026-09-06, live review) `tests/fixtures/filters-default-flow.jsonl`
 // carries 7 records across 4 distinct `act` facet values (`reasoning` x2,
 // `dispatch start`, `machine online`, `heartbeat` x3), 2 `cat` values
-// (`machinery`, `work`), 1 `tier` value (`local`), and 1 `src` value
-// (`presence-reconciler`, the only record that carries a `source` field
+// (`machinery`, `work`), 1 `tier` value (`darkmux`), and 1 `src` value
+// (`presence_reconciler`, the only record that carries a `source` field
 // at all). `defaultFilterState` (`lib/eventFilters.ts`) leaves `cat`/
 // `tier`/`src` fully selected — 0 hidden on each — and restricts `act` to
 // `DEFAULT_ACTIVITIES` (reasoning/checkpoint/tool call/turn/dispatch
