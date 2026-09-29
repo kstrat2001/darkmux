@@ -53,7 +53,6 @@
   "crates/darkmux-doctor/src/lib.rs::check_roster_identity": 27,
   "crates/darkmux-doctor/src/lib.rs::check_thermal_governor": 22,
   "crates/darkmux-doctor/src/lib.rs::endpoint_budget_note": 16,
-  "crates/darkmux-doctor/src/lib.rs::endpoints_status": 17,
   "crates/darkmux-doctor/src/lib.rs::role_profiles_status": 16,
   "crates/darkmux-doctor/src/lib.rs::roster_name_issue": 17,
   "crates/darkmux-fleet/src/job.rs::WorkJob::validate": 18,
