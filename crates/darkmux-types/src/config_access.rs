@@ -2141,6 +2141,85 @@ pub fn lab_dir() -> std::path::PathBuf {
     )
 }
 
+/// (4.0) Where the lab-run root stands relative to the pre-4.0 one.
+///
+/// Before 4.0 the default lab root was `<root>/runs`. Contract 8 makes "run"
+/// the umbrella over mission, dispatch and lab runs, so a directory named
+/// `runs` that held only lab runs named the umbrella for one kind; 4.0 moved
+/// the default to `<root>/lab`, beside `missions/`. darkmux never moves the
+/// operator's data itself: this reports the state, and the command that
+/// settles it, for `darkmux doctor` and the lab verbs to print.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LabDirState {
+    /// Nothing to move: the pre-4.0 dir is absent or empty, or the operator
+    /// set the lab dir explicitly (`DARKMUX_LAB_DIR` / `dirs.lab`).
+    Current,
+    /// The pre-4.0 dir holds runs and the 4.0 dir does not exist yet: one
+    /// `mv` moves them. Lab verbs refuse until it has run.
+    MovePending { from: std::path::PathBuf, to: std::path::PathBuf },
+    /// Both dirs hold something, so the pre-4.0 runs are not read. The
+    /// command merges them without overwriting either side.
+    Split { from: std::path::PathBuf, to: std::path::PathBuf },
+}
+
+impl LabDirState {
+    /// The command that settles this state, paths shell-quoted for pasting.
+    pub fn command(&self) -> Option<String> {
+        let q = |p: &std::path::Path| crate::shell::quote(&p.display().to_string());
+        match self {
+            LabDirState::Current => None,
+            LabDirState::MovePending { from, to } => Some(format!("mv {} {}", q(from), q(to))),
+            // Entry by entry, `-n` so a run id present on both sides is
+            // skipped rather than overwritten; `rmdir` then fails loudly on
+            // whatever was skipped instead of deleting it.
+            LabDirState::Split { from, to } => {
+                Some(format!("mv -n {}/* {}/ && rmdir {}", q(from), q(to), q(from)))
+            }
+        }
+    }
+}
+
+/// [`LabDirState`] for the lab dir this process resolves.
+pub fn lab_dir_state() -> LabDirState {
+    lab_dir_state_in(&lab_dir(), &lab_dir_default())
+}
+
+/// Pure half of [`lab_dir_state`]: `lab` is the resolved lab dir, `default`
+/// the one darkmux would pick with no override.
+fn lab_dir_state_in(lab: &std::path::Path, default: &std::path::Path) -> LabDirState {
+    let has_entries = |p: &std::path::Path| std::fs::read_dir(p).is_ok_and(|mut d| d.next().is_some());
+    let from = default.with_file_name("runs");
+    if lab != default || !has_entries(&from) {
+        return LabDirState::Current;
+    }
+    let to = lab.to_path_buf();
+    if to.exists() {
+        LabDirState::Split { from, to }
+    } else {
+        LabDirState::MovePending { from, to }
+    }
+}
+
+/// Refuse when [`lab_dir_state`] is [`LabDirState::MovePending`], naming the
+/// `mv` that settles it. Every lab verb calls this first: reading or writing
+/// the empty 4.0 dir while the runs sit in the pre-4.0 one would hide them.
+pub fn require_current_lab_dir() -> anyhow::Result<()> {
+    require_state_current(&lab_dir_state())
+}
+
+fn require_state_current(state: &LabDirState) -> anyhow::Result<()> {
+    match state {
+        LabDirState::MovePending { from, to } => anyhow::bail!(
+            "lab runs are still in {} (the pre-4.0 location); 4.0 reads them from {}. \
+             darkmux does not move your data itself. Move them, then re-run:\n\n  {}\n",
+            from.display(),
+            to.display(),
+            state.command().unwrap_or_default()
+        ),
+        LabDirState::Current | LabDirState::Split { .. } => Ok(()),
+    }
+}
+
 /// Derived from the SAME root resolution lab runs are written through —
 /// `paths::resolve(Auto)`, which honors `DARKMUX_HOME` and a project-local
 /// `./.darkmux` before `~/.darkmux`.
@@ -2153,7 +2232,7 @@ pub fn lab_dir() -> std::path::PathBuf {
 /// wired. Sharing the resolver makes read and write incapable of disagreeing.
 #[cfg(not(any(test, feature = "test-support")))]
 fn lab_dir_default() -> std::path::PathBuf {
-    crate::paths::resolve(crate::paths::ResolveScope::Auto).runs
+    crate::paths::resolve(crate::paths::ResolveScope::Auto).lab
 }
 
 /// Test builds must never default onto the operator's real `~/.darkmux/runs`
@@ -2176,9 +2255,9 @@ fn lab_dir_default() -> std::path::PathBuf {
     // honored verbatim, because a test that isolated itself means it.
     let real_user_root = dirs::home_dir().map(|h| h.join(".darkmux"));
     if real_user_root.as_ref() == Some(&resolved.root) {
-        return crate::paths::test_isolated_dir("runs");
+        return crate::paths::test_isolated_dir("lab");
     }
-    resolved.runs
+    resolved.lab
 }
 
 /// (#703) Host cache dir for the extracted static `darkmux-runtime` binary,
@@ -3419,12 +3498,73 @@ mod tests {
         unsafe {
             std::env::remove_var("DARKMUX_LAB_DIR");
         }
-        assert!(lab_dir().ends_with("runs"), "unset must resolve to a runs dir, not nothing");
+        assert!(lab_dir().ends_with("lab"), "unset must resolve to the lab dir, not nothing");
         if let Some(v) = prev {
             unsafe {
                 std::env::set_var("DARKMUX_LAB_DIR", v);
             }
         }
+    }
+
+    /// (4.0) A pre-4.0 `runs/` holding runs, and no `lab/` yet: one `mv`
+    /// settles it, and that `mv` is exactly what gets printed.
+    #[test]
+    fn lab_dir_state_is_move_pending_when_only_the_pre_4_0_dir_holds_runs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("my root");
+        std::fs::create_dir_all(root.join("runs").join("quick-q-1")).unwrap();
+        let lab = root.join("lab");
+        let state = lab_dir_state_in(&lab, &lab);
+        assert_eq!(state, LabDirState::MovePending { from: root.join("runs"), to: lab.clone() });
+        let want = format!(
+            "mv {} {}",
+            crate::shell::quote(&root.join("runs").display().to_string()),
+            crate::shell::quote(&lab.display().to_string())
+        );
+        assert_eq!(state.command().as_deref(), Some(want.as_str()));
+        assert!(want.contains("'"), "a path with a space must be quoted: {want}");
+        let err = require_state_current(&state).unwrap_err().to_string();
+        assert!(err.contains(&want), "the refusal names the exact command: {err}");
+    }
+
+    /// The inverse cases: nothing to move, so nothing refuses.
+    #[test]
+    fn lab_dir_state_is_current_when_there_is_nothing_to_move() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let lab = root.join("lab");
+        // Neither dir.
+        assert_eq!(lab_dir_state_in(&lab, &lab), LabDirState::Current);
+        // An EMPTY pre-4.0 dir (every pre-4.0 install created one) moves nothing.
+        std::fs::create_dir_all(root.join("runs")).unwrap();
+        assert_eq!(lab_dir_state_in(&lab, &lab), LabDirState::Current);
+        // An explicit lab dir (env / config) is the operator's choice: the
+        // default's sibling is not consulted even when it holds runs.
+        std::fs::create_dir_all(root.join("runs").join("r1")).unwrap();
+        let custom = root.join("elsewhere");
+        assert_eq!(lab_dir_state_in(&custom, &lab), LabDirState::Current);
+        assert!(require_state_current(&LabDirState::Current).is_ok());
+    }
+
+    /// Recovery: after the printed `mv`, the state is current. And when the
+    /// operator ended up with BOTH dirs holding runs, it is a split, whose
+    /// command merges without overwriting, and which does not refuse.
+    #[test]
+    fn lab_dir_state_after_the_move_is_current_and_both_full_is_split() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let (from, lab) = (root.join("runs"), root.join("lab"));
+        std::fs::create_dir_all(from.join("r1")).unwrap();
+        std::fs::rename(&from, &lab).unwrap();
+        assert_eq!(lab_dir_state_in(&lab, &lab), LabDirState::Current);
+
+        std::fs::create_dir_all(from.join("r0")).unwrap();
+        let state = lab_dir_state_in(&lab, &lab);
+        assert_eq!(state, LabDirState::Split { from: from.clone(), to: lab.clone() });
+        let cmd = state.command().unwrap();
+        assert!(cmd.starts_with("mv -n "), "a merge never overwrites: {cmd}");
+        assert!(cmd.ends_with(&format!("rmdir {}", from.display())), "{cmd}");
+        assert!(require_state_current(&state).is_ok(), "a split warns in doctor, it does not refuse");
     }
 
     #[serial_test::serial]

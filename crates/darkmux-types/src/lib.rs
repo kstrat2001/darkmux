@@ -23,6 +23,7 @@ pub mod profile_address;
 pub mod residency_lease;
 pub mod run_pause;
 pub mod session_id;
+pub mod shell;
 pub mod size;
 /// (#2695/#2697/#2698) The single test-isolation guard. Gated the same
 /// way `env_audit` is: available to a crate's TEST build via the
