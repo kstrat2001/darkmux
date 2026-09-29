@@ -13989,7 +13989,7 @@ fn a_single_sample_has_no_measured_interval() {
 }
 
 #[test]
-fn host_stats_reach_the_envelope_nested_by_metric_with_top_level_aliases() {
+fn host_stats_reach_the_envelope_nested_by_metric_only() {
     let stats = super::reduce_host_stats(&worked_samples());
     let out = super::enrich_envelope_with_summary(
         r#"{"result":"stop"}"#.to_string(),
@@ -14011,18 +14011,10 @@ fn host_stats_reach_the_envelope_nested_by_metric_with_top_level_aliases() {
     assert_eq!(v["host"]["gpu"]["peak_pct"], 95);
     assert_eq!(v["host"]["samples"], 5);
     assert_eq!(v["host"]["sample_interval_ms"], 2000);
-    // (#2107) Deprecated top-level aliases — kept for one release for any
-    // reader still looking at the pre-#2107 shape. They must read straight
-    // off the SAME nested peaks, never a second, independently-computed
-    // figure that could drift from them.
-    assert_eq!(
-        v["host"]["peak_cpu_pct"], 95,
-        "alias must mirror host.cpu.peak_pct exactly: {out}"
-    );
-    assert_eq!(
-        v["host"]["peak_mem_pct"], 78,
-        "alias must mirror host.mem.peak_pct exactly: {out}"
-    );
+    // The peaks live ONLY in the nested blocks: a top-level mirror would be a
+    // second spelling of the same number.
+    assert!(v["host"].get("peak_cpu_pct").is_none(), "no top-level alias: {out}");
+    assert!(v["host"].get("peak_mem_pct").is_none(), "no top-level alias: {out}");
 }
 
 #[test]
@@ -14084,7 +14076,7 @@ fn power_thermal_and_energy_reach_the_envelope_without_disturbing_the_2107_shape
         None,
     );
     let w: serde_json::Value = serde_json::from_str(&without).unwrap();
-    for key in ["cpu", "mem", "gpu", "samples", "sample_interval_ms", "peak_cpu_pct", "peak_mem_pct"] {
+    for key in ["cpu", "mem", "gpu", "samples", "sample_interval_ms"] {
         assert_eq!(v["host"][key], w["host"][key], "#2108 must not move `host.{key}`");
     }
 }

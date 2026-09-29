@@ -6883,10 +6883,9 @@ fn enrich_envelope_with_summary(
     //
     // (#2107) `cpu`/`mem`/`gpu` each carry the full peak/mean/p95/duty
     // reduction — a peak alone answers "did this ever spike"; it can't say
-    // how hard the host was driven ON AVERAGE. `peak_cpu_pct`/`peak_mem_pct`
-    // stay at the TOP LEVEL as aliases for one release in case a reader
-    // still looks there (the pre-#2107 shape); they read straight off the
-    // same nested `cpu.peak_pct`/`mem.peak_pct`, so the two can't drift.
+    // how hard the host was driven ON AVERAGE. The peaks live only in the
+    // nested blocks (`cpu.peak_pct`, `mem.peak_pct`); there is no
+    // top-level mirror.
     //
     // (#2108) `power`/`thermal`/`energy_mwh` join them when the host probe
     // could read those sources. They answer a question the percentages
@@ -6915,9 +6914,6 @@ fn enrich_envelope_with_summary(
             "gpu": metric_json(&stats.gpu),
             "samples": stats.samples,
             "sample_interval_ms": stats.sample_interval_ms,
-            // Deprecated top-level aliases — see the comment above.
-            "peak_cpu_pct": stats.cpu.peak_pct,
-            "peak_mem_pct": stats.mem.peak_pct,
         });
         // (#2108) Power, thermal and energy — each present only when the
         // probe actually read that source on this host, for the same reason
