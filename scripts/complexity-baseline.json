@@ -47,7 +47,7 @@
   "crates/darkmux-doctor/src/checks_power.rs::describe": 34,
   "crates/darkmux-doctor/src/fleet_submission.rs::trust_row": 19,
   "crates/darkmux-doctor/src/lib.rs::check_installed_skills_freshness": 22,
-  "crates/darkmux-doctor/src/lib.rs::check_mission_config_registry": 19,
+  "crates/darkmux-doctor/src/lib.rs::check_mission_config_registry": 17,
   "crates/darkmux-doctor/src/lib.rs::check_roster_identity": 27,
   "crates/darkmux-doctor/src/lib.rs::check_thermal_governor": 22,
   "crates/darkmux-doctor/src/lib.rs::endpoint_budget_note": 16,

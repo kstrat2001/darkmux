@@ -295,7 +295,7 @@ const UUID_FIELDS = new Set(["machine_uid"]);
 const SAFE_FIELDS = new Set([
   "_type", "action", "ansi_text", "args", "argv", "attribution", "build",
   "captured_date", "captured_prev_date", "case_ids", "category", "command",
-  "condition", "condition_word", "health_condition", "config_id", "cpu_brand", "crew", "daemon_url",
+  "condition", "condition_word", "health_condition", "config_id", "dispatch_id", "cpu_brand", "crew", "daemon_url",
   "darkmux_version", "date", "decision", "dir", "display_name", "endpoint",
   "event", "exec_mode", "extra", "file", "finish_reason", "first_date",
   "first_ts", "flow_schema_version", "handle", "http_status", "id",

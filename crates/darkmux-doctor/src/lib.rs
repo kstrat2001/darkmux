@@ -6045,6 +6045,80 @@ fn parse_major_minor(v: &str) -> Option<(u32, u32)> {
     Some((major, minor))
 }
 
+/// How a user-tier mission config's declared schema compares with this
+/// binary's.
+enum SchemaDrift {
+    /// Same version, or no parseable version (the validate pass reports that).
+    None,
+    /// An older MAJOR: the 4.0 major broke old documents.
+    OlderMajor { doc_major: u32 },
+    /// Same major, newer minor: a field minted after this build is inert.
+    NewerMinor(String),
+    /// Same major, older minor: the number is stale, the document is fine.
+    OlderMinor(String),
+}
+
+fn user_schema_drift(declared: Option<&str>) -> SchemaDrift {
+    let Some((doc_major, doc_minor)) = declared.and_then(parse_major_minor) else {
+        return SchemaDrift::None;
+    };
+    let (bin_major, bin_minor) = parse_major_minor(darkmux_crew::mission_config::MISSION_CONFIG_SCHEMA)
+        .expect("MISSION_CONFIG_SCHEMA is a valid MAJOR.MINOR constant");
+    if doc_major < bin_major {
+        return SchemaDrift::OlderMajor { doc_major };
+    }
+    if doc_major != bin_major {
+        return SchemaDrift::None;
+    }
+    if doc_minor > bin_minor {
+        SchemaDrift::NewerMinor(format!(
+            "declares schema {doc_major}.{doc_minor}, NEWER than this binary's \
+             {bin_major}.{bin_minor}, so any field minted after {bin_major}.{bin_minor} is \
+             swallowed by the lenient-on-read `extras` and silently does nothing here (a run \
+             would still complete green)"
+        ))
+    } else if doc_minor < bin_minor {
+        SchemaDrift::OlderMinor(format!(
+            "declares schema {doc_major}.{doc_minor}, older than this binary's \
+             {bin_major}.{bin_minor}: every field it names is one this build understands, so \
+             the number alone is stale, not broken"
+        ))
+    } else {
+        SchemaDrift::None
+    }
+}
+
+/// The informational notes for user-tier configs whose declared schema trails
+/// this binary's: an older MAJOR names the file, a same-major older minor is
+/// only a stale number.
+fn schema_drift_notes(older_major: &[(String, u32)], minor_drift: &[(String, String)]) -> String {
+    let mut notes = String::new();
+    let bin_major = parse_major_minor(darkmux_crew::mission_config::MISSION_CONFIG_SCHEMA)
+        .expect("MISSION_CONFIG_SCHEMA is a valid MAJOR.MINOR constant")
+        .0;
+    for (file, doc_major) in older_major {
+        notes.push_str(&format!(
+            "; {file}: schema major ({doc_major}) is older than this darkmux's ({bin_major}); \
+             check it for keys this release refuses (a `panel` block) or step config it now \
+             validates"
+        ));
+    }
+    if !minor_drift.is_empty() {
+        notes.push_str(&format!(
+            "; {} declare a same-major schema_version OLDER than this binary's, naming only \
+             fields this build understands (informational: the number is stale, and this \
+             check has not inspected the documents' contents beyond validation): {}",
+            minor_drift.len(),
+            minor_drift
+                .iter()
+                .map(|(id, note)| format!("\"{id}\": {note}"))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        ));
+    }
+    notes
+}
+
 /// (#1284 Packet 1) Registered mission configs — enumerates every
 /// discoverable mission-config document (`darkmux_crew::mission_config::
 /// list_ids()`, unioned user → on-disk → embedded), loads + `validate()`s
@@ -6104,6 +6178,10 @@ fn check_mission_config_registry() -> Check {
     // drift — informational only, never blocking. See the loop body below
     // for why this is no longer in `blocking`.
     let mut minor_drift: Vec<(String, String)> = Vec::new();
+    // (file name, declared major) for a user-tier config whose schema MAJOR is
+    // older than the binary's: the 4.0 major broke old documents (a refused
+    // `panel` key, checked step config), and this points at the file.
+    let mut older_major: Vec<(String, u32)> = Vec::new();
 
     for id in &ids {
         match mission_config::load(id) {
@@ -6170,37 +6248,18 @@ fn check_mission_config_registry() -> Check {
                 // brew-stable runs it with an older binary. So this direction
                 // stays a WARN.
                 if loaded.source == mission_config::MissionConfigSource::User {
-                    if let Some((doc_major, doc_minor)) = loaded
-                        .config
-                        .schema_version
-                        .as_deref()
-                        .and_then(parse_major_minor)
-                    {
-                        let (bin_major, bin_minor) =
-                            parse_major_minor(mission_config::MISSION_CONFIG_SCHEMA)
-                                .expect("MISSION_CONFIG_SCHEMA is a valid MAJOR.MINOR constant");
-                        if doc_major == bin_major && doc_minor > bin_minor {
-                            blocking.push((
-                                id.clone(),
-                                format!(
-                                    "declares schema {doc_major}.{doc_minor}, NEWER than this \
-                                     binary's {bin_major}.{bin_minor} — any field minted after \
-                                     {bin_major}.{bin_minor} is swallowed by the lenient-on-read \
-                                     `extras` and silently does nothing here (a run would still \
-                                     complete green)"
-                                ),
-                            ));
-                        } else if doc_major == bin_major && doc_minor < bin_minor {
-                            minor_drift.push((
-                                id.clone(),
-                                format!(
-                                    "declares schema {doc_major}.{doc_minor}, older than this \
-                                     binary's {bin_major}.{bin_minor} — every field it names is \
-                                     one this build understands, so the number alone is stale, \
-                                     not broken"
-                                ),
-                            ));
+                    match user_schema_drift(loaded.config.schema_version.as_deref()) {
+                        SchemaDrift::None => {}
+                        SchemaDrift::OlderMajor { doc_major } => {
+                            let file = loaded
+                                .manifest_path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| id.clone());
+                            older_major.push((file, doc_major));
                         }
+                        SchemaDrift::NewerMinor(note) => blocking.push((id.clone(), note)),
+                        SchemaDrift::OlderMinor(note) => minor_drift.push((id.clone(), note)),
                     }
                 }
                 if !kind_warnings.is_empty() {
@@ -6226,19 +6285,7 @@ fn check_mission_config_registry() -> Check {
             kind_warning_ids.join(", ")
         ));
     }
-    if !minor_drift.is_empty() {
-        notes.push_str(&format!(
-            "; {} declare a same-major schema_version OLDER than this binary's, naming only \
-             fields this build understands (informational — the number is stale, and this \
-             check has not inspected the documents' contents beyond validation): {}",
-            minor_drift.len(),
-            minor_drift
-                .iter()
-                .map(|(id, note)| format!("\"{id}\": {note}"))
-                .collect::<Vec<_>>()
-                .join(" | ")
-        ));
-    }
+    notes.push_str(&schema_drift_notes(&older_major, &minor_drift));
 
     if blocking.is_empty() {
         let mut message =
@@ -14331,6 +14378,49 @@ mod tests {
         assert!(check.message.contains("major-version mismatch"), "{}", check.message);
     }
 
+    /// The 3.x to 4.0 major bump made two changes that break old documents
+    /// (the `panel` key is refused, step config is checked). The gates name
+    /// the real key problems; this note points an operator at the file whose
+    /// declared major is older than this darkmux's.
+    #[serial_test::serial]
+    #[test]
+    fn check_mission_config_registry_notes_a_user_tier_config_on_an_older_major() {
+        let guard = CrewRootGuard::new();
+        std::fs::create_dir_all(guard.path().join("mission-configs")).unwrap();
+        std::fs::write(
+            guard.path().join("mission-configs").join("mine-older.json"),
+            r#"{"id":"mine-older","name":"Mine","schema_version":"3.5"}"#,
+        )
+        .unwrap();
+
+        let check = check_mission_config_registry();
+        assert!(check.message.contains("mine-older.json"), "{}", check.message);
+        assert!(
+            check.message.contains("schema major (3) is older than this darkmux's (4)"),
+            "{}",
+            check.message
+        );
+    }
+
+    /// Inverse: a user-tier config AT the current major draws no such note.
+    #[serial_test::serial]
+    #[test]
+    fn check_mission_config_registry_has_no_older_major_note_at_the_current_major() {
+        let guard = CrewRootGuard::new();
+        std::fs::create_dir_all(guard.path().join("mission-configs")).unwrap();
+        std::fs::write(
+            guard.path().join("mission-configs").join("mine-current.json"),
+            format!(
+                r#"{{"id":"mine-current","name":"Mine","schema_version":"{}"}}"#,
+                darkmux_crew::mission_config::MISSION_CONFIG_SCHEMA
+            ),
+        )
+        .unwrap();
+
+        let check = check_mission_config_registry();
+        assert!(!check.message.contains("is older than this darkmux's"), "{}", check.message);
+    }
+
     /// (#2428) The direct reproduction of the reported bug: a user-tier
     /// config trailing the binary's schema by one minor validates cleanly
     /// (it's the same "review" fixture the neighboring — now historical —
@@ -14585,7 +14675,7 @@ mod tests {
         // an Error-tier finding in `MissionConfig::validate()`.
         std::fs::write(
             guard.path().join("mission-configs").join("nameless.json"),
-            r#"{"id":"nameless","name":"","schema_version":"3.5"}"#,
+            r#"{"id":"nameless","name":"","schema_version":"4.0"}"#,
         )
         .unwrap();
         // ... and an unrelated one whose only remark is the informational

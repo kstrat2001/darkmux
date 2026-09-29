@@ -692,7 +692,7 @@ export function buildFleetCardBase(
   // dispatch's session id is carried on the start-time `lifecycle.json` as
   // soon as a single-dispatch provider mints it — no longer recorded only
   // in the run manifest `providers/coding_task.rs` writes AFTER the
-  // dispatch returns — and `Run.session_id` is populated for a lab row too
+  // dispatch returns, and `Run.dispatch_id` is populated for a lab row too
   // (its own doc covers exactly when). This card has not been updated to
   // USE that join yet — `runningSessionIds`/`labRunning` still merge by
   // `Math.max` rather than collapsing on the shared session id the way

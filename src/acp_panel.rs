@@ -269,7 +269,8 @@ fn is_declared_input(config: &MissionConfig, name: &str) -> bool {
 
 /// The refusal for free text sent to a config with nowhere to put it.
 fn no_free_text_refusal(config: &MissionConfig, text: &str) -> String {
-    let declared: Vec<&str> = config.inputs.iter().map(|i| i.name.as_str()).collect();
+    let declared: Vec<&str> =
+        config.inputs.iter().filter(|i| !i.is_launcher_supplied()).map(|i| i.name.as_str()).collect();
     if declared.is_empty() {
         return format!("`{}` takes no arguments, so `{text}` was not passed on. Run `/mission launch {}` on its own.", config.id, config.id);
     }
@@ -1534,6 +1535,18 @@ pub(crate) mod tests {
         assert!(err.contains("rules, draws"), "the refusal names the declared inputs: {err}");
         let bare = config_with(&[], false);
         assert!(map_launch_args(&bare, "x").unwrap_err().to_string().contains("takes no arguments"));
+    }
+
+    #[test]
+    fn the_refusal_does_not_offer_an_input_the_launcher_fills() {
+        let cfg = config_with(&["mission_id", "rules"], false);
+        let err = map_launch_args(&cfg, "please look").unwrap_err().to_string();
+        assert!(err.contains("rules"), "{err}");
+        assert!(!err.contains("mission_id"), "the launcher overwrites mission_id: {err}");
+        // Only launcher-supplied inputs declared: nothing left to offer.
+        let only = config_with(&["mission_id"], false);
+        let err = map_launch_args(&only, "x").unwrap_err().to_string();
+        assert!(err.contains("takes no arguments"), "{err}");
     }
 
     #[test]

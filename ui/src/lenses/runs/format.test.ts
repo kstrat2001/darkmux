@@ -210,7 +210,7 @@ describe("runDestination", () => {
       kind: "dispatch",
       status: "complete",
       tracked: true,
-      session_id: "crew-dispatch-analyst-1787557214045728-0",
+      dispatch_id: "crew-dispatch-analyst-1787557214045728-0",
     });
     expect(runDestination(tracked, true)).toEqual({
       kind: "hash",
@@ -226,7 +226,7 @@ describe("runDestination", () => {
 
   it("(#1973) a tracked dispatch with NO session falls back to the graph rather than linking to nothing", () => {
     // 36 of 63 tracked dispatch rows on the reporting machine carried no
-    // `session_id` — their flow records had aged out of the scan window. The
+    // `dispatch_id`, their flow records had aged out of the scan window. The
     // detail view is keyed by session, so there is nothing to address; the
     // graph is the honest destination rather than a dead link.
     const aged = run({ id: "dispatch-old-1", kind: "dispatch", status: "complete", tracked: true });
@@ -240,7 +240,7 @@ describe("runDestination", () => {
     expect(runDestination(mission, true)).toEqual({ kind: "hash", hash: "mission=coder-phase-abc" });
   });
 
-  it("(#1915) an UNTRACKED mission row with a session_id drills to that session — the defect this issue fixed", () => {
+  it("(#1915) an UNTRACKED mission row with a dispatch_id drills to that session, the defect this issue fixed", () => {
     // Before #1915, `runDestination` only special-cased `kind ===
     // "dispatch"` for the untracked-but-openable case (#1900); a mission
     // row in this exact shape read as `{kind: "none"}` even though the
@@ -252,7 +252,7 @@ describe("runDestination", () => {
       kind: "mission",
       status: "running",
       tracked: false,
-      session_id: "peer-session-1",
+      dispatch_id: "peer-session-1",
     });
     expect(runDestination(peerMission, true)).toEqual({ kind: "hash", hash: "dispatch=peer-session-1&dispatch.mission=review-on-the-hub" });
     // `graphReachable` must not matter here — a session drill is never
@@ -261,11 +261,11 @@ describe("runDestination", () => {
   });
 
   it("an untracked dispatch ghost row drills to its own id as the session (#1900, still true after the #1915 generalization)", () => {
-    const ghost = run({ id: "ghost-1", kind: "dispatch", status: "abandoned", tracked: false, session_id: "ghost-1" });
+    const ghost = run({ id: "ghost-1", kind: "dispatch", status: "abandoned", tracked: false, dispatch_id: "ghost-1" });
     expect(runDestination(ghost, true)).toEqual({ kind: "hash", hash: "dispatch=ghost-1" });
   });
 
-  it("(#1915) an untracked row with NO session_id at all has genuinely nowhere to go", () => {
+  it("(#1915) an untracked row with NO dispatch_id at all has genuinely nowhere to go", () => {
     // The one shape #1915 leaves inert on purpose: a mission this daemon
     // knows only from a terminal record, with no dispatch session ever
     // joined to it (`flow_mission_to_run` can legitimately produce this —
@@ -274,9 +274,9 @@ describe("runDestination", () => {
     expect(runDestination(bareUntracked, true)).toEqual({ kind: "none" });
   });
 
-  it("a TRACKED mission still opens its mission graph, never a session — even when it also carries a session_id", () => {
-    // (#1915) The server populates `session_id` uniformly for every
-    // mission row, tracked or not (see `Run.session_id`'s own doc) — this
+  it("a TRACKED mission still opens its mission graph, never a session, even when it also carries a dispatch_id", () => {
+    // (#1915) The server populates `dispatch_id` uniformly for every
+    // mission row, tracked or not (see `Run.dispatch_id`'s own doc), this
     // is the regression `runDestination` must not have: a tracked row
     // must keep resolving to `#mission=<id>` unconditionally, not fall
     // into the untracked branch just because the field happens to be set.
@@ -285,7 +285,7 @@ describe("runDestination", () => {
       kind: "mission",
       status: "complete",
       tracked: true,
-      session_id: "some-session-that-must-be-ignored",
+      dispatch_id: "some-session-that-must-be-ignored",
     });
     expect(runDestination(tracked, true)).toEqual({ kind: "hash", hash: "mission=tracked-mission-1" });
   });
@@ -301,11 +301,11 @@ describe("runDestination", () => {
     // <workload>` never writes: every finished workload run read RUNNING
     // there, with an empty pipeline and no events, while the list said
     // complete. One run, one detail view, whatever its status.
-    const lab = run({ id: "lab-dir-1", kind: "lab", status: "complete", tracked: true, session_id: "sess-done-1" });
+    const lab = run({ id: "lab-dir-1", kind: "lab", status: "complete", tracked: true, dispatch_id: "sess-done-1" });
     expect(runDestination(lab, true)).toEqual({ kind: "hash", hash: "dispatch=sess-done-1" });
   });
 
-  it("(#2860) a lab row with NO session_id falls back to its own dir, whatever its status", () => {
+  it("(#2860) a lab row with NO dispatch_id falls back to its own dir, whatever its status", () => {
     // Archived runs from before lab rows carried a session have nothing
     // else to open.
     for (const status of ["complete", "abandoned", "running"] as const) {
@@ -314,7 +314,7 @@ describe("runDestination", () => {
     }
   });
 
-  it("(#2511) a RUNNING lab row with a session_id drills to its live session, not the reviews-only detail view", () => {
+  it("(#2511) a RUNNING lab row with a dispatch_id drills to its live session, not the reviews-only detail view", () => {
     // Before #2511's record-side fix, this session would ALSO surface as a
     // duplicate untracked `ghost_runs` dispatch row, and clicking THAT row
     // was the only way to watch the live dispatch (`LabRunDetail` renders no
@@ -322,11 +322,11 @@ describe("runDestination", () => {
     // exists). #2511 also suppresses that duplicate ghost row server-side
     // (`known_session_ids`) — so without this branch, a live lab run would
     // have no drill-in left at all.
-    const running = run({ id: "live/case-1", kind: "lab", status: "running", tracked: true, session_id: "sess-live-1" });
+    const running = run({ id: "live/case-1", kind: "lab", status: "running", tracked: true, dispatch_id: "sess-live-1" });
     expect(runDestination(running, true)).toEqual({ kind: "hash", hash: "dispatch=sess-live-1" });
   });
 
-  it("(#2511) a RUNNING lab row with NO session_id yet falls back to its own dir rather than a dead link", () => {
+  it("(#2511) a RUNNING lab row with NO dispatch_id yet falls back to its own dir rather than a dead link", () => {
     const running = run({ id: "live/case-2", kind: "lab", status: "running", tracked: true });
     expect(runDestination(running, true)).toEqual({ kind: "lab", dir: "live/case-2" });
   });

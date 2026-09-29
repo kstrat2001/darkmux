@@ -2,7 +2,7 @@
   "id": "machine-status",
   "name": "Machine status",
   "description": "Show which models are loaded in LM Studio on this machine right now, grouped by darkmux-managed and user-loaded, with the profile they match. Read-only: it answers what is loaded, what is resident, or which model is running. (#2918) The read-only `darkmux machine status` verb as a launchable config, so the radio routing seat and the editor panel (`/mission launch machine-status`) can route \"which models are loaded?\" to it instead of refusing. One `procedural.shell` step (procedural-only, so the panel runs it in-process with no mission instance) that calls THIS darkmux through `DARKMUX_BIN` (#2310 P4e) — never whatever `darkmux` is on PATH. Nothing here mutates machine state: `machine eject` and every other mutating verb stay out of the launchable set on purpose. The verb lists `lms ps` grouped by ownership (darkmux-managed under the `darkmux:` namespace vs user state) plus the registered profile(s) the loaded set matches.",
-  "schema_version": "3.5",
+  "schema_version": "4.0",
   "phases": [
     {
       "id": "run",

@@ -2333,7 +2333,8 @@ fn print_dry_run_graph(config: &MissionConfig, collected: &BTreeMap<String, serd
                 serde_json::Value::String(s) => s.clone(),
                 other => other.to_string(),
             };
-            let note = if k == "mission_id" { " (example id: a real launch mints a fresh one)" } else { "" };
+            let launcher_supplied = config.inputs.iter().any(|i| i.is_launcher_supplied() && i.name == *k);
+            let note = if launcher_supplied { " (example id: a real launch mints a fresh one)" } else { "" };
             println!("  {k} = {rendered}{note}");
         }
     }
@@ -6401,7 +6402,7 @@ mod tests {
     const MISSION_ID_IN_GATE_CONFIG: &str = r#"{
         "id": "mission-id-gate-test",
         "name": "Mission Id Gate Test",
-        "schema_version": "3.5",
+        "schema_version": "4.0",
         "inputs": [{"name": "mission_id", "required": false}],
         "phases": [
             {"id": "p1", "tasks": [{"id": "t1", "steps": [

@@ -922,7 +922,7 @@ mod tests {
             // (#1915) This CLI-verb test helper only exercises filtering/
             // sorting, never drill-in — `None` is the honest value for a
             // synthetic row that was never joined to a real flow session.
-            session_id: None,
+            dispatch_id: None,
             // (#1907) None of this module's tests exercise `abandoned_reason`
             // directly — that behavior is covered in `darkmux-serve`'s own
             // `runs.rs` tests, where every construction site lives. This

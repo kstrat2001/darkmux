@@ -903,10 +903,12 @@ impl StepKind for MissionCoderStepKind {
             system_prompt_override: None,
         };
         let result = crew::dispatch::dispatch(opts)?;
-        eprintln!(
-            "{}",
-            style::dim(&format!("darkmux coder-phase: session id `{session}`"))
-        );
+        if let Some(execution) = &result.execution {
+            eprintln!(
+                "{}",
+                style::dim(&format!("darkmux coder-phase: role execution `{execution}`"))
+            );
+        }
 
         let tokens = coder_tokens(&result);
 

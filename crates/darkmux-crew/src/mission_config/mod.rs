@@ -225,10 +225,17 @@ use std::collections::{BTreeMap, BTreeSet};
 /// disabled, an older binary's behavior on one is unchanged, the additive
 /// contract.
 ///
+/// Bumped to **"4.0"** (the 4.0 release), a MAJOR bump, because two changes
+/// break documents that parsed before: the `panel` key (and per-config slash
+/// commands) is refused rather than ignored, and a step's `config` is checked
+/// against its kind's schema at validate time instead of passing through. A
+/// 3.x document naming either now fails its gate, and `darkmux doctor` notes
+/// a user-tier config whose schema major is older than this build's.
+///
 /// Bump discipline (see `CLAUDE.md`'s "Versioning" — same rule, different
 /// data shape): additive field/section → minor; rename/retype/removed
 /// field/new-required-field → major.
-pub const MISSION_CONFIG_SCHEMA: &str = "3.5";
+pub const MISSION_CONFIG_SCHEMA: &str = "4.0";
 
 /// One mission config document — the whole graph SHAPE, as data.
 /// Why a mission config's `gh_verb` key is refused. One text for
@@ -3067,7 +3074,10 @@ mod tests {
         // whatever `enabled` says — and every shipped document keeps one
         // of each excluded pair disabled, so nothing already shipped
         // changes meaning under this bump either.
-        assert_eq!(MISSION_CONFIG_SCHEMA, "3.5");
+        //
+        // Bumped to "4.0" (MAJOR): the `panel` key is refused and step
+        // `config` is checked, so 3.x documents can now fail their gates.
+        assert_eq!(MISSION_CONFIG_SCHEMA, "4.0");
     }
 
     // ── (#2300) `grow` — the run-time fan-out ────────────────────────────

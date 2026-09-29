@@ -81,405 +81,6 @@ darkmux release.
   **Migration:** delete the `role_id` from the task; to review with another
   role, `darkmux dispatch <role> ...`.
 
-### Removed (breaking, 4.0)
-
-- **The daemon HTTP API is a semver contract, and its aliases are gone** (C1,
-  A3, C2, C3). From this release the daemon's routes and response shapes change
-  only on purpose: every JSON body is a serialized Rust type in
-  `crates/darkmux-serve/src/wire.rs` with a generated TypeScript twin,
-  `ui/src/types/handwritten.ts` is deleted, and
-  `crates/darkmux-serve/route-table.golden` pins every route's method, path and
-  response type. **Removed with no alias (each answers 404):** `GET /next`,
-  `GET /mission/:id/graph`, `GET /flow-status`, `GET /worktree-summary/:session_id`.
-  **Renamed:** `GET /flow-session/:id` is `GET /flow-dispatch/:id`, and
-  `GET /fleet/sessions/live` is `GET /fleet/dispatches/live` with its `sessions`
-  array now `dispatches` ("session" is an internal join key, contract 8).
-  **Viewer links:** `#session=<id>` is `#dispatch=<id>`, `#lens=lab` is
-  `#lens=runs&kind=lab`, `#lens=machine&uid=<uid>` is `#lens=machine&machine=<key>`
-  and `panel=mission-status-all` is `panel=mission-status&opt.all=all`. The old
-  `#lens=` spellings and any hash carrying `session=` open the "Unknown route"
-  page instead of being rewritten (the session id is withheld from that page). `darkmux
-  mission status` now prints `#mission=<id>` and `opt.all=all` links (it printed
-  the retired `/mission/<id>/graph` and `mission-status-all` forms).
-  **Response shapes changed on the wire:** `GET /machine/resources` answers
-  HTTP 500 with a plain-text body when the ledger gather panics, where it
-  answered 200 with an `{"error": ...}` body; `GET /fleet/roster` entries are a
-  fixed set of fields (the roster file's own unknown `extras` no longer leak
-  through); `GET /lab/runs` rows carry `has_reviews` (was `has_funnels`) and a
-  `staffing` reduced to each seat's `name`/`model`/`k`/`n_ctx`/`max_tokens`;
-  `GET /lab/run/detail` returns `reviews` (was `funnels`, the whole envelope) as
-  a six-field summary per case, and `scores` as `{role, mode, profile}` (was the
-  whole scores document). Every other route keeps the bytes it served; what
-  changed is that its shape is now one Rust type with a generated twin, and the
-  viewer's old hand-written copies were corrected to it (they had drifted:
-  `/runs` and `/flow-mission|dispatch/:id` had always sent `meta`, ledger fields
-  the viewer typed as numbers are nullable, a ledger state is `amber` not
-  `yellow`, a `SessionBeat` carries `display_name`, `role` and `model`).
-  **Migration:** none for operators; a script that
-  read the old routes or fields must use the new names. `funnels.json` and
-  `funnel-events.jsonl` in an old lab run directory are still read as archives
-  (no writer produces them since #2310).
-
-- **The per-config `panel` block, and the panel's per-config slash commands**
-  (`/review`, `/machine-status`, `/pr-merge`, ...). The editor panel now has
-  one command, `/mission`, with three verbs, and every config `darkmux mission
-  launch` accepts is listable and launchable through it. `/mission list` and
-  radio's catalog run the same first check a launch does, so they list
-  configs exactly when a launch could start. A mission config
-  carrying a `panel` key is refused by the user-file gate and by `mission
-  config` validation, with a message naming `/mission launch <id>`.
-  `mission config list --json` rows and `mission config show --json` lose
-  their `panel` field, and the text list loses its `panel` column.
-  **Migration:** delete the `panel` block from your configs; run `/review` as
-  `/mission launch review`, `/pr-merge 2049` as `/mission launch pr-merge 2049`.
-  A config takes text after its id only if a task reads `__panel_args__`
-  (this replaces `panel.accepts_args`); text sent to a config that takes none
-  is refused, not dropped. Radio's router now reads the first sentence of a
-  config's `description` (else its `name`) where it read `panel.description`,
-  so a config you want routable should lead with one plain sentence. Panel
-  ids are the ones `mission launch` accepts (lowercase), so a config whose
-  file name has an uppercase letter is not listed. **One stale user-tier
-  mission config blocks every launch** (a leftover `panel` key is enough):
-  `mission launch`, `/mission list` and radio all refuse with the same text
-  until the file is fixed, and `darkmux doctor` names it. A value with spaces
-  in the panel is written `name="two words"`.
-- **Radio asks before it runs anything it chose.** The router can now pick any
-  launchable config from free text, so `darkmux radio` prepares the launch's
-  inputs first, prints the `darkmux mission launch <id> --param ...` command
-  with every param that will run (for `review`, the `diff_file`, `workspace`
-  and `head_sha` it makes from the current directory; the first two name
-  temporary files, and `head_sha` is a commit hash), and asks `Run it? [y/N]` before running it. A repo with nothing to
-  review is reported without asking. With no interactive terminal it prints
-  the command, says it was not run and, when inputs were made from the
-  current directory, that they are temporary and must be replaced with your
-  own, then exits 1. An interrupt at the prompt ends it within a moment, runs nothing
-  (even if a `y` follows) and removes the temporary files. A routed input
-  holding a control character or an invisible formatting character (a bidi
-  override, a zero-width space) is refused. The editor
-  agent panel does the same for free text (no slash): the pick is shown in a
-  code block in the panel's permission dialog, and only Allow runs it; Reject,
-  cancel or no answer runs nothing and the panel says "not run". An explicit
-  `/mission launch <id>` is your own command and is not asked again.
-  **Migration:** a script that relied on radio running its pick unattended
-  must run the printed command itself (for `review`, with its own
-  `diff_file` and `workspace`); a panel user answers the dialog once per
-  routed message.
-
-- **Flag spellings that named the internal noun "session", or a misleading
-  grain, are renamed** (A10 to A13). No aliases: each retired spelling exits 2
-  naming its replacement.
-  **Migration:** `dispatch --session-id` is `--name`;
-  `flow note|catch|record|tier-decision --session-id`, `flow tail --session`
-  and `memory correction list --session` are `--execution`, which takes the
-  `exec-...` id of a role execution, the one `darkmux dispatch` now prints on
-  its "execution id" line (it used to print the session id). A session id
-  given to `--execution` is refused with exit 2, and a note recorded with
-  `--execution` is stamped with that execution and its session; an execution
-  the flow trail has no `dispatch.start` for is refused (the id encodes when
-  it was minted, so only that UTC day and its neighbors are read, however old
-  the id is);
-  `lab eval --freeform|--agentic|--dialectic` is `--mode
-  freeform|agentic|dialectic` (one choice, `strict` by default; the dialectic
-  per-seat profile flags are refused with exit 2 under any other mode);
-  `lab run --runs` and `lab tune --runs` are `--repeat` (`-n` is unchanged);
-  `mission status --missions` is `--named`. The viewer's "try it yourself"
-  `lab eval` line prints the new spelling. The `--no-wait` follow-up lines no
-  longer print a `flow tail` command with an id.
-- **The session no longer shows in three operator outputs.** The session is an
-  internal join key; these now show the role execution or the run.
-  **Migration:** `memory correction list` prints `[exec-...]` (or `[no
-  execution recorded]` for a note written before executions carried an id), and
-  its `--json` rows carry `execution_id` (a string, or `null`) in place of
-  `session_id`; `flow tail`'s last column is the execution id, or the run id
-  for a record outside any execution (`flow tail --json` still forwards the raw
-  record, `session_id` included); `dispatch --no-wait` to another machine
-  prints `run=<id>` in place of `session_id=<id>`, followed by `darkmux run
-  list --kind dispatch` (the row id there is this value), and its "submitting
-  to" line says `run=` too.
-- **Mission state files are read in one spelling** (A18). A `mission.json`
-  using `sprint_ids`, `closed_ts` or status `closed`, a task file using
-  `sprint_id`, and a `sprints/` directory (the old name of `phases/`) are
-  refused, naming the fix, instead of loading as if the field were absent.
-  `darkmux doctor` fails each one in its "mission state files" row (which also
-  reports the flat pre-#148 files). Flow archives still read a record's
-  `sprint_id`. **Migration:** rename the key (`sprint_ids` to `phase_ids`,
-  `closed_ts` to `finalized_ts`, `"closed"` to `"finalized"`, a task's
-  `sprint_id` to `phase_id`) or rename `sprints/` to `phases/`.
-
-- **`darkmux mission dispatch` and the hand-built mission verbs** (#2954).
-  Missions now come only from mission configs. Removed with no alias:
-  `mission dispatch`, `mission add-phase`, `mission start`,
-  `mission pause`, `mission resume`, and `dispatch --phase-id`. Each now
-  exits 2 with a line naming its replacement. `WorkJob.phase_id` is gone
-  from the work-submission wire (WORK_JOB 7 to 8), so a v7 sender gets the
-  version remedy. **Migration:** to run a role on another machine,
-  `darkmux dispatch <role> "<message>" --profile <profile>@<machine>
-  [--no-wait]`; to run a mission, write or edit its config and
-  `darkmux mission launch <config>` (it starts the mission it creates);
-  end it with `mission finalize <id>` or `mission abort <id>`. Growing a
-  running mission by hand, and pausing one, have no replacement. Routing a
-  mission's own steps to another machine comes back as a step-staffing
-  feature, not as a verb.
-- **The `paused` mission status and the `mission.pause`, `mission.resume` and
-  `phase.added` flow actions** (#2954). Nothing writes them any more. A
-  `mission.json` that says `"status": "paused"` still loads and reads as
-  `active` (a leftover `paused_ts` is ignored), and the three actions read
-  from an archive as retired. **Migration:** none; the mission board and
-  `run list` no longer show a `paused` group.
-- **One run noun: recorded lab runs are read through `darkmux run`, and live in
-  `lab/`** (B4, B5). Contract 8 makes "run" the umbrella over mission, dispatch
-  and lab runs, so a `runs/` directory holding only lab runs and a
-  `lab run list|inspect|stats|compare` family beside `darkmux run list` were
-  the umbrella's name on one kind. **Migration (CLI):** `darkmux lab run list`
-  is `darkmux run list --kind lab`; `lab run inspect|stats|compare` are
-  `darkmux run inspect|stats|compare`, with the same output and the same
-  `--json` documents. The old spellings fail naming the replacement.
-  `run inspect|stats|compare` read lab runs only and refuse a mission or
-  dispatch run id, naming where to look. `darkmux lab run <workload>` is the
-  launcher only; a workload named `list` still launches with the escape,
-  `darkmux lab run -- list`. The
-  workload/profile/verify table `lab run list` printed is gone with it: the
-  `run list` rows carry kind, status, start, duration, tokens and id; a lab
-  row's subtitle names the workload and its verify outcome (`verify pass`,
-  `verify FAIL`, `verify —` for not checked). A bare run id now resolves under
-  the lab dir only: a same-named directory in the cwd is no longer read (pass a
-  path to read one).
-  **Migration (disk):** the lab-run root default moved from
-  `~/.darkmux/runs/` to `~/.darkmux/lab/`. darkmux does not move your data.
-  While the old directory holds runs and the new one does not exist, `darkmux
-  doctor` fails and prints the exact command, and every lab verb (`lab run`,
-  `lab eval`, `lab loop`, `run list --kind lab`, `run inspect|stats|compare`)
-  refuses, naming it: `mv ~/.darkmux/runs ~/.darkmux/lab` (`rmdir` the new dir
-  first when it already exists and is empty, which the printed command does).
-  `lab doctor` does not touch the lab dir and is not gated. `darkmux serve`
-  still starts: it names the move in its startup banner and on `GET /lab/runs`
-  (`pending_move`). If both hold runs, doctor warns and prints a merge that
-  never overwrites. An explicit
-  `DARKMUX_LAB_DIR` / `dirs.lab` is untouched.
-- **The fleet page's orchestrator note** (#2983): the "Orchestrator note:"
-  line under the token panel, its `history →` list, and the stock sentence
-  it showed when no note existed. The panel is one line shorter; nothing
-  else on the page changed size. **Migration:** the fleet page no longer shows an
-  orchestrator note; `darkmux flow note --source orchestrator` is no longer
-  rendered anywhere. The verb still writes the record, old note records in
-  flow archives still read, and `--session-id <sid> --source adjudication`
-  notes keep feeding coder briefs, `darkmux memory correction list`, and
-  `mission debrief` unchanged.
-  A non-note record tagged `--source orchestrator` (a `flow catch`, say) now
-  files under its own action in the event log, not under "note".
-- **`metrics.json`: the runtime no longer writes it, and nothing reads it.**
-  Every count (turns, compactions, tokens, rests) is now a fold of the
-  run's `trajectory.jsonl`, the one log the live tailer, `lab run stats`,
-  `lab run inspect` and `lab loop` all read (the new `darkmux-trajectory`
-  crate). The file was written only on a clean exit, so a killed run kept
-  whichever run's copy was there before: in one measured archive, 37 of
-  241 disagreed with their own trajectory, and every time the file was the
-  wrong one. The checks and flags that existed only to catch that
-  disagreement are gone with it: `RunChecks.tokens_reconcile`,
-  `turns_match_trajectory`, `rest_matches_trajectory`, `metrics_stale`,
-  `missing_required_events`, `checkpoint_parse_consistent` and
-  `checkpoint_events_seen`, and the `STALE-METRICS`, `TOKENS`, `PARSE` and
-  `COUNTS` flags (`RUN_STATS` 2.0.0). A lab run records no copy of the file
-  (coding-task manifest v7, tool-bench v3). **Migration:** read totals from
-  `darkmux lab run stats <run> --json` or the envelope's `metrics` block,
-  never from `metrics.json`; an old run directory still reports its totals
-  from its trajectory, and a leftover `metrics.json` in it is ignored.
-- **The runtime's own totals output.** Its plain-text summary is now a
-  `--- run ---` block (result, turns, compactions, tokens, rests, wall)
-  read from the trajectory, and its `--json` envelope carries no `metrics`
-  block: the host writes that block from the fold, so `darkmux dispatch
-  --json` still has one. `metrics.this_run` and `metrics.total_messages`
-  are gone: every figure in the block is this invocation's own. The
-  same holds on `dispatch.complete`: for a resumed dispatch its `rest_ms`
-  and `rests` are now this invocation's rests (they were the whole task's,
-  seeded from the checkpoint), like its token counts. A checkpoint no
-  longer carries the prompt-token and rest running totals, which nothing
-  read; an older checkpoint that has them still resumes.
-  **Migration:** read `metrics.prompt_tokens` (and the rest) where you
-  read `metrics.this_run.*`; sum a task's rests over its runs'
-  `dispatch.complete` records.
-- **`dispatch.complete`'s `cumulative_prompt_tokens` /
-  `cumulative_completion_tokens`** (FLOW_SCHEMA 2.0.0). Their one source
-  was `metrics.json`. A usage record (`telemetry.tokens`) now omits a
-  count the provider did not report rather than writing 0. **Migration:**
-  a task's whole token total is the sum of its sessions' `telemetry.tokens`
-  records. (`cumulative_turns`/`cumulative_compactions` went too; see
-  "The flow record's leftover fields" below.)
-- **`radio.router_profile`, `DARKMUX_RADIO_ROUTER_PROFILE`, and the
-  `role_profiles.radio-router` binding** (#2914). The radio routing seat
-  now runs on the machine's one utility model (below), so there is no
-  profile to bind it to. Removed outright, no deprecation release, no
-  compatibility read: `darkmux config set radio.router_profile` rejects the
-  key, `config set role_profiles.radio-router` is refused with the fix, and
-  `darkmux doctor` names whichever of the three is still set. CONFIG 1.28.
-  **Migration:** delete `radio.router_profile` from `config.json` (and the
-  `radio-router` entry from `role_profiles`, and the env var from your
-  shell); a profile that existed only for the router (a 16K `radio`
-  profile, typically) can be deleted. `radio.answerer_profile` and
-  `role_profiles.radio-host` stay: answering the user is work. Radio and
-  ACP routing now REQUIRE `internal.utility`: with no utility model
-  registered, a message cannot be routed (the router returns a refusal
-  naming the fix), where before it fell through to `default_profile`.
-- **The compactor's window is no longer read from a profile's `models[]`**
-  (#2914). It comes from `internal.utility` alone (below). A profile entry
-  for the utility model is inert: `darkmux doctor` names each such profile
-  with the window it declared and the binding to move it into.
-- **`darkmux mission propose` and the `mission-compiler` role** (#2912).
-  The verb dispatched a local utility model to turn pasted text into a
-  Mission plus Phases, the pre-graph mission shape from before missions
-  became task/step graphs, so even a perfect proposal could not be
-  launched. Removed outright, no deprecation release, no compatibility
-  read. **Migration:** write the mission config yourself (or have your
-  orchestrator write it from the intent text) at
-  `~/.darkmux/mission-configs/<id>.json`, then `darkmux mission launch
-  <id>`; `darkmux mission config list`/`show` render the configs you can
-  launch. A config's `ticket` key still sets the mission's ticket (the
-  old `--ticket` flag went with the verb). A leftover
-  `<DARKMUX_HOME>/roles/mission-compiler.json` (or `scribe.json`, below)
-  still loads as a user role and shows in `darkmux role list`, though
-  nothing dispatches it; delete it. `darkmux doctor` names any such file
-  still present, and names any role whose `skills` list points at a skill
-  that no longer exists (the old `mission-compiler` manifest names the
-  deleted `mission-compiling` skill). The crew index skips that one link
-  with a warning instead of failing, so `role list` and `role show` keep
-  working.
-- **`darkmux lab notebook draft` / `lab notebook list`, the `scribe`
-  role, and the `DARKMUX_NOTEBOOK_DIR` / `dirs.notebook` setting**
-  (#2913). Built-in notebook prose is not needed when a skill can do it
-  with the orchestrator, and the data side now exists in a better form
-  (`darkmux lab run stats <run> --json`). Removed outright; the
-  `<root>/notebook` directory is no longer created by `init`.
-  **Migration:** run `darkmux init` to install the bundled
-  `darkmux-lab-notebook` skill, which drafts an entry from `lab run stats
-  --json` (and the run's `manifest.json` when needed) and writes it
-  wherever your own instructions say your notebook lives. Delete
-  `dirs.notebook` from `config.json` and unset `DARKMUX_NOTEBOOK_DIR`;
-  neither is read any more, and `darkmux doctor` warns naming whichever
-  is still set with the exact change to make. `darkmux config set
-  dirs.notebook ...` now rejects the key. Existing entries on disk are
-  untouched.
-- **`darkmux mission migrate` and the pre-#148 flat mission layout.**
-  Flat `<root>/missions/<id>.json` / `<root>/phases/<id>.json` files are
-  not read; `darkmux doctor` FAILS naming each one still present.
-  **Migration:** run `darkmux mission migrate --apply` on 3.x before
-  upgrading.
-- **The pre-Beat-33 `<root>/crew/{roles,missions,phases,crews,skills}`
-  fallback read.** User state resolves under `<root>/<subdir>/` only;
-  `darkmux doctor` now FAILS on a leftover `crew/` subdir and prints the
-  move script. **Migration:** run the script `darkmux doctor` prints.
-- **Dispatching with no resolvable profile no longer probes LMStudio's
-  first loaded model.** With no `--profile`, no `role_profiles.<role>`
-  binding and no `default_profile` (or a profile that selects no model for
-  the role), the dispatch now fails with an error naming the fix, where 3.x
-  printed a deprecation warning and ran against whatever was loaded.
-  **Migration:** set `"default_profile"` in `profiles.json`.
-- **`darkmux lab eval --k`, `--roster-profile`, `--exec-mode` and
-  `--bundler`.** They configured the funnel mode deleted in #2310 P4d and
-  were accepted and silently ignored since; `--k` claimed a value above 1
-  was a loud error, and it was not. **Migration:** drop the flags; they
-  never changed a run.
-- **Doctor's "legacy compaction extras" check.** The openclaw-shape keys
-  it warned about (`mode`, `maxHistoryShare`, `recentTurnsPreserve`,
-  `customInstructions` under `runtime.compaction`) are now retired keys,
-  refused by name like any unknown key (CONFIG 2.0, below). **Migration:**
-  delete them (`custom_instructions` is the typed field).
-- **Doctor's residue checks for pre-3.x removals:** the `crews` map in
-  `profiles.json`, the `review{}` config block,
-  `runtime.telemetry_record_every_samples`, and the "daemon predates the
-  build field" verdict. Each key is now a retired key, refused by name
-  (CONFIG 2.0, below). **Migration:** delete any of those keys still
-  present (`darkmux doctor`'s `user file keys` rows name them).
-
-- **A role's `escalation_posture`.** Nothing read it: the runtime treated
-  `auto` and `pause` the same. A role manifest that still sets it is refused
-  like any retired key. **Migration:** delete `escalation_posture` from your
-  role manifests (`darkmux doctor`'s `user file keys` row names each file).
-
-### The flow record's leftover fields (breaking, 4.0, FLOW 2.0.0)
-
-- **`payload.runtime` is gone from every record.** It named the dispatch
-  topology (`internal`, `direct`, `scheduler`) and nothing outside the
-  viewer's run brief read it; the `--json` envelope's `metrics.runtime` for a
-  hosted single-shot goes with it. **Migration:** a receiver that branched on
-  it reads the record's `action` and `session_id`, or `payload.endpoint`.
-- **`FlowRecord.source` is a closed set with one spelling** (`snake_case`):
-  `crew_dispatch`, `scheduler`, `phase_lifecycle`, `mission_lifecycle`,
-  `phase_review`, `mission_debrief`, `host_sampler`, `presence_reconciler`,
-  `cmd_gate_audit`, `hook`, `host`, `detector`, `runtime`, `tokens`,
-  `context`, `compaction`, `lms`, `thermal`, `battery`, `budget`, `utility`,
-  and the four an operator writes. `host-sampler`, `presence-reconciler` and
-  `cmd-gate-audit` were kebab-case; they are `host_sampler`,
-  `presence_reconciler` and `cmd_gate_audit`. `darkmux flow
-  note|catch|record|tier-decision --source` accepts `orchestrator`,
-  `adjudication`, `manual` or `frontier` and refuses anything else
-  (`frontier-orchestrator` is `frontier`). darkmux's readers map the retired
-  spellings on read (`sprint_lifecycle`, `sprint_review`,
-  `frontier-orchestrator`, the per-dispatch sampler's `process`) and read a
-  source that maps nowhere as `unknown`. **Migration:** a receiver that
-  filters on `source` uses the `snake_case` spellings.
-- **`tier` says who acted, not where the model ran.** `local` (written on
-  every record, hosted-endpoint executions included) is now `darkmux`; the
-  values are `operator`, `frontier` and `darkmux`. `flow record --tier local`
-  is refused by the CLI's value list. **Migration:** read `payload.endpoint`
-  and `model` to learn where a call ran.
-- **`host.peak_cpu_pct` / `host.peak_mem_pct` are gone** from
-  `dispatch.complete`'s and the `--json` envelope's `host` block. They
-  mirrored `host.cpu.peak_pct` / `host.mem.peak_pct` for one release
-  (1.27.0) and that release ended long ago.
-- **`FlowRecord.work_id` / `attempt` are gone.** The work queue they came
-  from retired with #2916; an archive that carries them still reads.
-- **`stage: "estimate"` is gone** (nothing ever wrote it); a record that
-  carries it reads as `unknown`. `ship` stays: the hook sink's own records
-  carry it.
-- **`dispatch.complete`'s and the envelope's `cumulative_turns` /
-  `cumulative_compactions` are gone.** Every count on the record is this
-  invocation's own, and the whole-task count across resumes is no longer
-  reported (nothing read it). **Migration:** a resumed run's `turns` counts
-  only its own turns, and a hand-back resume continues the prior run's last
-  turn, so do not sum `turns` across a resume: that turn is counted in both
-  runs. Compaction counts do sum.
-- **One unit for time in payloads: durations are `*_ms`, instants are
-  `*_at_ms` (epoch milliseconds).** Renamed, with the value converted:
-  `budget.wait` `wait_seconds` is `wait_ms` and its ISO `resume_at` is
-  `resume_at_ms`; `utility.start` `stall_after_seconds` is `stall_after_ms`;
-  `machine.rollup` `period_seconds` is `period_ms`; `dispatch.complete`'s
-  `live` block `sampler_us` / `forward_us` are `sampler_ms` / `forward_ms`
-  (fractional); `machine.battery_health` `total_operating_time_hours` /
-  `time_at_soc_hours` are `total_operating_ms` / `time_at_soc_ms`, which
-  `GET /machine/resources` serves under the same keys in its `load.battery_health`
-  block. The config keys (`machine_rollup.period_seconds`, and the
-  `bounds` block, which is keyed by the config knob a value came from) keep
-  their names. darkmux's readers rename and convert an old record's keys on
-  read.
-
-### Added (4.0)
-
-- **`darkmux mission show <id>`** and the panel's `/mission show <id>`: one
-  mission in full, from one derivation. The config it was launched from and
-  its declared inputs, every phase, task and step with status, tokens, turns
-  and model, its runs, total tokens, and a viewer link. `--json` is a
-  semver-bound shape (`MissionShow`: `id`, `status`, `description`, `config`,
-  `graph` (the daemon's `/mission/:id/graph.json` value), `runs` (the `run
-  list` rows for this mission), `tokens`, `link`). `mission status` stays the
-  board. An input the launcher fills itself, `mission_id`, reports
-  `required: false` in `config.inputs` (and is not marked required in the text
-  listing), since no caller has to pass it. The link is the graph lens's
-  `#mission=<id>` route.
-- **`/mission list`, `/mission launch <config> [name=value ...]` and
-  `/mission show <id>` in the editor panel**, replacing the per-config
-  commands. Arguments after the config id map onto its declared inputs the way
-  `--param` does (a `name=value` token naming a declared input is a param, the
-  rest is the config's `__panel_args__` text). `/mission launch review` with
-  no inputs still synthesizes the diff, workspace and `head_sha` from the
-  session's cwd, now triggered by a declared required `diff_file` input and
-  skipped when you pass one.
-- **Panel values have no escapes.** In `/mission launch <config> name="two words"`
-  a backslash right before the closing quote is refused, naming the input,
-  instead of being guessed at; use the other kind of quote around a value that
-  holds one.
-
-### Changed (breaking, 4.0)
-
 - **Read auth and execution auth are separate switches** (#2988). A serve
   token used to close the whole read surface to peers, so a hub that took
   fleet work (which needs the token) could not also serve its viewer over
@@ -623,14 +224,14 @@ darkmux release.
   bare `<m>` of the whole-run bookend are one session, `<m>.run`. A fleet
   receiver runs a submitted job under a relay of the sender's session in a
   standalone run (WORK_JOB 7), never one of its own missions, so the
-  `-from-` rule on machine names is gone. `darkmux dispatch --session-id
+  `-from-` rule on machine names is gone. `darkmux dispatch --name
   <name>` now names the dispatch within its crew-of-one run
   (`<run>.adhoc.<role>.<name>`). Archives are never rewritten: an old id
   still reads for step attribution and corrections. **Migration:** a script
   that matched session prefixes (`task-`, `step-`, `mission-run-`,
   `crew-dispatch-`) should key on `mission_id`, or on the printed session
-  id as a whole; a `flow note --session-id` names the session a dispatch
-  printed.
+  id as a whole; a `flow note --execution` names the execution `darkmux
+  dispatch` printed.
 
 - **A lab run with no verify spec reports verify "not checked", not a pass**
   (#2982). A `prompt` workload that declares no verify used to record
@@ -861,8 +462,8 @@ darkmux release.
   --machine <m> [--profile <p>]` becomes `darkmux dispatch <role> --profile
   <p>@<m>`; name the profile on `<m>` that the job should run on (with no
   `--profile`, the old form resolved the role's binding on `<m>`; name that
-  profile now). `darkmux mission dispatch` keeps its own `--machine` until
-  it is retired (#2954).
+  profile now). `darkmux mission dispatch`, which also took `--machine`,
+  is removed in this release (#2954, below).
 
 - **`remote.concurrent_cap = 0` means unbounded everywhere** (#2916 stage 2).
   The scheduler's hosted track used to clamp `0` to `1`, while the fleet
@@ -900,7 +501,7 @@ darkmux release.
   possibly still running. Only jobs from other machines count: this machine's own
   dispatches are not seen by the listener. When a connection drops after
   the receiver may have taken the job, the sender says the job may still be
-  running there and names the session to follow. The sender prints the
+  running there and names the run to follow. The sender prints the
   receiver's words verbatim. A bad value is refused at the listener's start and reported
   Fail by `darkmux doctor` (#2947). The work-submission wire moves to
   schema `6` (a reply body is newline-delimited: `queued` lines, then the
@@ -928,7 +529,7 @@ darkmux release.
   `enforce`, `fleet.mode` used to read as `standalone`, and a typo in
   `runtime.thermal.pause_at` / `resume_at` used to pass through and disarm
   the thermal governor's soft tiers. Now `darkmux dispatch`, `mission
-  launch` (dry runs included), `mission dispatch`, `lab run` / `lab eval`,
+  launch` (dry runs included), `lab run` / `lab eval`,
   `radio` and the ACP panel refuse before starting anything, naming the
   value, where it was set (env var or `config.json` key) and the valid
   values. Fleet work submission does the same for
@@ -948,14 +549,14 @@ darkmux release.
   is refused where it is used (CONFIG 1.31, above). **Migration:** run
   `darkmux doctor`; fix any Fail row it names with the fix it prints.
 
-- **Fleet work no longer travels through Redis; `--machine` submits
-  straight to the target machine, which checks who is asking** (#2916,
+- **Fleet work no longer travels through Redis; a `profile@machine` address
+  submits straight to the target machine, which checks who is asking** (#2916,
   stage 1). The `darkmux:work` queue could not say who wrote an entry and
   every node that could write the hub's Redis could fill it, and every
   `darkmux serve` with Redis configured ran whatever it claimed. The queue
   is retired outright: the daemon no longer consumes `darkmux:work` (no
   `darkmux-runners` consumer group, no claim loop), and nothing publishes to
-  it. `darkmux dispatch --machine <id>` now sends the job to that machine's
+  it. `darkmux dispatch <role> --profile <p>@<id>` now sends the job to that machine's
   **fleet listener** (the roster host of `<id>` on `fleet.listener.port`,
   default 8766) with the fleet token (the serve token, #881, one value on
   every machine). The receiver runs it only when the overlay network
@@ -963,16 +564,15 @@ darkmux release.
   names the sending node as one on its allow-list, and only on a profile in
   that entry's scope (never one that runs on the utility model, #2914; a
   `--workdir` only with `workspace`). Deny by default; no identity answer
-  is a refusal. `--machine` is no longer an advisory hint: the named
+  is a refusal. The address is no longer an advisory hint: the named
   machine runs the job or answers at once with the reason ("studio does not
   accept work from macbook-pro", "not in the allow-list scope: profile
   X", "studio is busy running <session>": one submitted job at a time).
   With `--wait` (the default) the reply carries the remote exit code and
   output instead of a synthetic line read back off the flow stream, so a
   cross-machine `--wait` no longer needs Redis at all. `--profile` now
-  crosses (it names a profile on the target). `darkmux mission dispatch`
-  requires `--machine` (there is no "any machine claims it" any more) and
-  runs the mission's next phase there. The job wire shape is schema v5:
+  crosses (it names a profile on the target). There is no "any machine
+  claims it" any more: a submission names its target. The job wire shape is schema v5:
   `target_machine` required, `profile` added, `attempt` and
   `published_by_orchestrator` removed. **Migration:** on every machine
   that should take work, store the fleet token if it has none (`security
@@ -1037,6 +637,417 @@ darkmux release.
   `darkmux doctor` also reports the entry renamed, remove it and add it
   under the machine's current name instead, as that row says). `darkmux
   doctor` lists each one.
+
+- **The mission config schema is 4.0** (was 3.5), a major bump: a `panel`
+  key is now refused, and a step's `config` is checked against its kind's
+  schema, so a 3.x document that carried either can fail where it loaded
+  before. The shipped configs declare `"4.0"`.
+  `darkmux doctor` notes each user-tier mission config whose schema major is
+  older than this darkmux's, naming the file. **Migration:** run `darkmux
+  doctor`, fix what it names (the `panel` block and unknown step-config keys
+  are the usual ones), and set `"schema_version": "4.0"`.
+- **A run row's `session_id` is `dispatch_id`** (`darkmux run list --json`,
+  `darkmux mission show --json`'s `runs`, and the daemon's `GET /runs`). It is
+  the id the viewer's `#dispatch=<id>` route and `GET /flow-dispatch/:id`
+  take; its value is unchanged. **Migration:** a script that read
+  `.session_id` on a run row reads `.dispatch_id`.
+
+### Removed (breaking, 4.0)
+
+- **The daemon HTTP API is a semver contract, and its aliases are gone** (C1,
+  A3, C2, C3). From this release the daemon's routes and response shapes change
+  only on purpose: every JSON body is a serialized Rust type in
+  `crates/darkmux-serve/src/wire.rs` with a generated TypeScript twin,
+  `ui/src/types/handwritten.ts` is deleted, and
+  `crates/darkmux-serve/route-table.golden` pins every route's method, path and
+  response type. **Removed with no alias (each answers 404):** `GET /next`,
+  `GET /mission/:id/graph`, `GET /flow-status`, `GET /worktree-summary/:session_id`.
+  **Renamed:** `GET /flow-session/:id` is `GET /flow-dispatch/:id`, and
+  `GET /fleet/sessions/live` is `GET /fleet/dispatches/live` with its `sessions`
+  array now `dispatches` ("session" is an internal join key, contract 8).
+  **Viewer links:** `#session=<id>` is `#dispatch=<id>`, `#lens=lab` is
+  `#lens=runs&kind=lab`, `#lens=machine&uid=<uid>` is `#lens=machine&machine=<key>`
+  and `panel=mission-status-all` is `panel=mission-status&opt.all=all`. The old
+  `#lens=` spellings and any hash carrying `session=` open the "Unknown route"
+  page instead of being rewritten (the session id is withheld from that page). `darkmux
+  mission status` now prints `#mission=<id>` and `opt.all=all` links (it printed
+  the retired `/mission/<id>/graph` and `mission-status-all` forms).
+  **Response shapes changed on the wire:** `GET /machine/resources` answers
+  HTTP 500 with a plain-text body when the ledger gather panics, where it
+  answered 200 with an `{"error": ...}` body; `GET /fleet/roster` entries are a
+  fixed set of fields (the roster file's own unknown `extras` no longer leak
+  through); `GET /lab/runs` rows carry `has_reviews` (was `has_funnels`) and a
+  `staffing` reduced to each seat's `name`/`model`/`k`/`n_ctx`/`max_tokens`;
+  `GET /lab/run/detail` returns `reviews` (was `funnels`, the whole envelope) as
+  a six-field summary per case, and `scores` as `{role, mode, profile}` (was the
+  whole scores document). Every other route keeps the bytes it served; what
+  changed is that its shape is now one Rust type with a generated twin, and the
+  viewer's old hand-written copies were corrected to it (they had drifted:
+  `/runs` and `/flow-mission|dispatch/:id` had always sent `meta`, ledger fields
+  the viewer typed as numbers are nullable, a ledger state is `amber` not
+  `yellow`, a `SessionBeat` carries `display_name`, `role` and `model`).
+  **Migration:** none for operators; a script that
+  read the old routes or fields must use the new names. `funnels.json` and
+  `funnel-events.jsonl` in an old lab run directory are still read as archives
+  (no writer produces them since #2310).
+
+- **The per-config `panel` block, and the panel's per-config slash commands**
+  (`/review`, `/machine-status`, `/pr-merge`, ...). The editor panel now has
+  one command, `/mission`, with three verbs, and every config `darkmux mission
+  launch` accepts is listable and launchable through it. `/mission list` and
+  radio's catalog run the same first check a launch does, so they list
+  configs exactly when a launch could start. A mission config
+  carrying a `panel` key is refused by the user-file gate and by `mission
+  config` validation, with a message naming `/mission launch <id>`.
+  `mission config list --json` rows and `mission config show --json` lose
+  their `panel` field, and the text list loses its `panel` column.
+  **Migration:** delete the `panel` block from your configs; run `/review` as
+  `/mission launch review`, `/pr-merge 2049` as `/mission launch pr-merge 2049`.
+  A config takes text after its id only if a task reads `__panel_args__`
+  (this replaces `panel.accepts_args`); text sent to a config that takes none
+  is refused, not dropped. Radio's router now reads the first sentence of a
+  config's `description` (else its `name`) where it read `panel.description`,
+  so a config you want routable should lead with one plain sentence. Panel
+  ids are the ones `mission launch` accepts (lowercase), so a config whose
+  file name has an uppercase letter is not listed. **One stale user-tier
+  mission config blocks every launch** (a leftover `panel` key is enough):
+  `mission launch`, `/mission list` and radio all refuse with the same text
+  until the file is fixed, and `darkmux doctor` names it. A value with spaces
+  in the panel is written `name="two words"`.
+- **Radio asks before it runs anything it chose.** The router can now pick any
+  launchable config from free text, so `darkmux radio` prepares the launch's
+  inputs first, prints the `darkmux mission launch <id> --param ...` command
+  with every param that will run (for `review`, the `diff_file`, `workspace`
+  and `head_sha` it makes from the current directory; the first two name
+  temporary files, and `head_sha` is a commit hash), and asks `Run it? [y/N]` before running it. A repo with nothing to
+  review is reported without asking. With no interactive terminal it prints
+  the command, says it was not run and, when inputs were made from the
+  current directory, that they are temporary and must be replaced with your
+  own, then exits 1. An interrupt at the prompt ends it within a moment, runs nothing
+  (even if a `y` follows) and removes the temporary files. A routed input
+  holding a control character or an invisible formatting character (a bidi
+  override, a zero-width space) is refused. The editor
+  agent panel does the same for free text (no slash): the pick is shown in a
+  code block in the panel's permission dialog, and only Allow runs it; Reject,
+  cancel or no answer runs nothing and the panel says "not run". An explicit
+  `/mission launch <id>` is your own command and is not asked again.
+  **Migration:** a script that relied on radio running its pick unattended
+  must run the printed command itself (for `review`, with its own
+  `diff_file` and `workspace`); a panel user answers the dialog once per
+  routed message.
+
+- **Flag spellings that named the internal noun "session", or a misleading
+  grain, are renamed** (A10 to A13). No aliases: each retired spelling exits 2
+  naming its replacement.
+  **Migration:** `dispatch --session-id` is `--name`;
+  `flow note|catch|record|tier-decision --session-id`, `flow tail --session`
+  and `memory correction list --session` are `--execution`, which takes the
+  `exec-...` id of a role execution, the one `darkmux dispatch` now prints on
+  its "execution id" line (it used to print the session id). A session id
+  given to `--execution` is refused with exit 2, and a note recorded with
+  `--execution` is stamped with that execution and its session; an execution
+  the flow trail has no `dispatch.start` for is refused (the id encodes when
+  it was minted, so only that UTC day and its neighbors are read, however old
+  the id is);
+  `lab eval --freeform|--agentic|--dialectic` is `--mode
+  freeform|agentic|dialectic` (one choice, `strict` by default; the dialectic
+  per-seat profile flags are refused with exit 2 under any other mode);
+  `lab run --runs` and `lab tune --runs` are `--repeat` (`-n` is unchanged);
+  `mission status --missions` is `--named`. The viewer's "try it yourself"
+  `lab eval` line prints the new spelling. The `--no-wait` follow-up lines no
+  longer print a `flow tail` command with an id.
+- **The session no longer shows in three operator outputs.** The session is an
+  internal join key; these now show the role execution or the run.
+  **Migration:** `memory correction list` prints `[exec-...]` (or `[no
+  execution recorded]` for a note written before executions carried an id), and
+  its `--json` rows carry `execution_id` (a string, or `null`) in place of
+  `session_id`; `flow tail`'s last column is the execution id, or the run id
+  for a record outside any execution (`flow tail --json` still forwards the raw
+  record, `session_id` included); `dispatch --no-wait` to another machine
+  prints `run=<id>` in place of `session_id=<id>`, followed by `darkmux run
+  list --kind dispatch` (the row id there is this value), and its "submitting
+  to" line says `run=` too.
+- **Mission state files are read in one spelling** (A18). A `mission.json`
+  using `sprint_ids`, `closed_ts` or status `closed`, a task file using
+  `sprint_id`, and a `sprints/` directory (the old name of `phases/`) are
+  refused, naming the fix, instead of loading as if the field were absent.
+  `darkmux doctor` fails each one in its "mission state files" row (which also
+  reports the flat pre-#148 files). Flow archives still read a record's
+  `sprint_id`. **Migration:** rename the key (`sprint_ids` to `phase_ids`,
+  `closed_ts` to `finalized_ts`, `"closed"` to `"finalized"`, a task's
+  `sprint_id` to `phase_id`) or rename `sprints/` to `phases/`.
+
+- **`darkmux mission dispatch` and the hand-built mission verbs** (#2954).
+  Missions now come only from mission configs. Removed with no alias:
+  `mission dispatch`, `mission add-phase`, `mission start`,
+  `mission pause`, `mission resume`, and `dispatch --phase-id`. Each now
+  exits 2 with a line naming its replacement. `WorkJob.phase_id` is gone
+  from the work-submission wire (WORK_JOB 7 to 8), so a v7 sender gets the
+  version remedy. **Migration:** to run a role on another machine,
+  `darkmux dispatch <role> "<message>" --profile <profile>@<machine>
+  [--no-wait]`; to run a mission, write or edit its config and
+  `darkmux mission launch <config>` (it starts the mission it creates);
+  end it with `mission finalize <id>` or `mission abort <id>`. Growing a
+  running mission by hand, and pausing one, have no replacement. Routing a
+  mission's own steps to another machine comes back as a step-staffing
+  feature, not as a verb.
+- **The `paused` mission status and the `mission.pause`, `mission.resume` and
+  `phase.added` flow actions** (#2954). Nothing writes them any more. A
+  `mission.json` that says `"status": "paused"` still loads and reads as
+  `active` (a leftover `paused_ts` is ignored), and the three actions read
+  from an archive as retired. **Migration:** none; the mission board and
+  `run list` no longer show a `paused` group.
+- **One run noun: recorded lab runs are read through `darkmux run`, and live in
+  `lab/`** (B4, B5). Contract 8 makes "run" the umbrella over mission, dispatch
+  and lab runs, so a `runs/` directory holding only lab runs and a
+  `lab run list|inspect|stats|compare` family beside `darkmux run list` were
+  the umbrella's name on one kind. **Migration (CLI):** `darkmux lab run list`
+  is `darkmux run list --kind lab`; `lab run inspect|stats|compare` are
+  `darkmux run inspect|stats|compare`, with the same output and the same
+  `--json` documents. The old spellings fail naming the replacement.
+  `run inspect|stats|compare` read lab runs only and refuse a mission or
+  dispatch run id, naming where to look. `darkmux lab run <workload>` is the
+  launcher only; a workload named `list` still launches with the escape,
+  `darkmux lab run -- list`. The
+  workload/profile/verify table `lab run list` printed is gone with it: the
+  `run list` rows carry kind, status, start, duration, tokens and id; a lab
+  row's subtitle names the workload and its verify outcome (`verify pass`,
+  `verify FAIL`, `verify —` for not checked). A bare run id now resolves under
+  the lab dir only: a same-named directory in the cwd is no longer read (pass a
+  path to read one).
+  **Migration (disk):** the lab-run root default moved from
+  `~/.darkmux/runs/` to `~/.darkmux/lab/`. darkmux does not move your data.
+  While the old directory holds runs and the new one does not exist, `darkmux
+  doctor` fails and prints the exact command, and every lab verb (`lab run`,
+  `lab eval`, `lab loop`, `run list --kind lab`, `run inspect|stats|compare`)
+  refuses, naming it: `mv ~/.darkmux/runs ~/.darkmux/lab` (`rmdir` the new dir
+  first when it already exists and is empty, which the printed command does).
+  `lab doctor` does not touch the lab dir and is not gated. `darkmux serve`
+  still starts: it names the move in its startup banner and on `GET /lab/runs`
+  (`pending_move`). If both hold runs, doctor warns and prints a merge that
+  never overwrites. An explicit
+  `DARKMUX_LAB_DIR` / `dirs.lab` is untouched.
+- **The fleet page's orchestrator note** (#2983): the "Orchestrator note:"
+  line under the token panel, its `history →` list, and the stock sentence
+  it showed when no note existed. The panel is one line shorter; nothing
+  else on the page changed size. **Migration:** the fleet page no longer shows an
+  orchestrator note; `darkmux flow note --source orchestrator` is no longer
+  rendered anywhere. The verb still writes the record, old note records in
+  flow archives still read, and `--execution <id> --source adjudication`
+  notes keep feeding coder briefs, `darkmux memory correction list`, and
+  `mission debrief` unchanged.
+  A non-note record tagged `--source orchestrator` (a `flow catch`, say) now
+  files under its own action in the event log, not under "note".
+- **`metrics.json`: the runtime no longer writes it, and nothing reads it.**
+  Every count (turns, compactions, tokens, rests) is now a fold of the
+  run's `trajectory.jsonl`, the one log the live tailer, `lab run stats`,
+  `lab run inspect` and `lab loop` all read (the new `darkmux-trajectory`
+  crate). The file was written only on a clean exit, so a killed run kept
+  whichever run's copy was there before: in one measured archive, 37 of
+  241 disagreed with their own trajectory, and every time the file was the
+  wrong one. The checks and flags that existed only to catch that
+  disagreement are gone with it: `RunChecks.tokens_reconcile`,
+  `turns_match_trajectory`, `rest_matches_trajectory`, `metrics_stale`,
+  `missing_required_events`, `checkpoint_parse_consistent` and
+  `checkpoint_events_seen`, and the `STALE-METRICS`, `TOKENS`, `PARSE` and
+  `COUNTS` flags (`RUN_STATS` 2.0.0). A lab run records no copy of the file
+  (coding-task manifest v7, tool-bench v3). **Migration:** read totals from
+  `darkmux lab run stats <run> --json` or the envelope's `metrics` block,
+  never from `metrics.json`; an old run directory still reports its totals
+  from its trajectory, and a leftover `metrics.json` in it is ignored.
+- **The runtime's own totals output.** Its plain-text summary is now a
+  `--- run ---` block (result, turns, compactions, tokens, rests, wall)
+  read from the trajectory, and its `--json` envelope carries no `metrics`
+  block: the host writes that block from the fold, so `darkmux dispatch
+  --json` still has one. `metrics.this_run` and `metrics.total_messages`
+  are gone: every figure in the block is this invocation's own. The
+  same holds on `dispatch.complete`: for a resumed dispatch its `rest_ms`
+  and `rests` are now this invocation's rests (they were the whole task's,
+  seeded from the checkpoint), like its token counts. A checkpoint no
+  longer carries the prompt-token and rest running totals, which nothing
+  read; an older checkpoint that has them still resumes.
+  **Migration:** read `metrics.prompt_tokens` (and the rest) where you
+  read `metrics.this_run.*`; sum a task's rests over its runs'
+  `dispatch.complete` records.
+- **`dispatch.complete`'s `cumulative_prompt_tokens` /
+  `cumulative_completion_tokens`** (FLOW_SCHEMA 2.0.0). Their one source
+  was `metrics.json`. A usage record (`telemetry.tokens`) now omits a
+  count the provider did not report rather than writing 0. **Migration:**
+  a task's whole token total is the sum of its sessions' `telemetry.tokens`
+  records. (`cumulative_turns`/`cumulative_compactions` went too; see
+  "The flow record's leftover fields" below.)
+- **`radio.router_profile`, `DARKMUX_RADIO_ROUTER_PROFILE`, and the
+  `role_profiles.radio-router` binding** (#2914). The radio routing seat
+  now runs on the machine's one utility model (below), so there is no
+  profile to bind it to. Removed outright, no deprecation release, no
+  compatibility read: `darkmux config set radio.router_profile` rejects the
+  key, `config set role_profiles.radio-router` is refused with the fix, and
+  `darkmux doctor` names whichever of the three is still set. CONFIG 1.28.
+  **Migration:** delete `radio.router_profile` from `config.json` (and the
+  `radio-router` entry from `role_profiles`, and the env var from your
+  shell); a profile that existed only for the router (a 16K `radio`
+  profile, typically) can be deleted. `radio.answerer_profile` and
+  `role_profiles.radio-host` stay: answering the user is work. Radio and
+  ACP routing now REQUIRE `internal.utility`: with no utility model
+  registered, a message cannot be routed (the router returns a refusal
+  naming the fix), where before it fell through to `default_profile`.
+- **The compactor's window is no longer read from a profile's `models[]`**
+  (#2914). It comes from `internal.utility` alone (below). A profile entry
+  for the utility model is inert: `darkmux doctor` names each such profile
+  with the window it declared and the binding to move it into.
+- **`darkmux mission propose` and the `mission-compiler` role** (#2912).
+  The verb dispatched a local utility model to turn pasted text into a
+  Mission plus Phases, the pre-graph mission shape from before missions
+  became task/step graphs, so even a perfect proposal could not be
+  launched. Removed outright, no deprecation release, no compatibility
+  read. **Migration:** write the mission config yourself (or have your
+  orchestrator write it from the intent text) at
+  `~/.darkmux/mission-configs/<id>.json`, then `darkmux mission launch
+  <id>`; `darkmux mission config list`/`show` render the configs you can
+  launch. A config's `ticket` key still sets the mission's ticket (the
+  old `--ticket` flag went with the verb). A leftover
+  `<DARKMUX_HOME>/roles/mission-compiler.json` (or `scribe.json`, below)
+  still loads as a user role and shows in `darkmux role list`, though
+  nothing dispatches it; delete it. `darkmux doctor` names any such file
+  still present, and names any role whose `skills` list points at a skill
+  that no longer exists (the old `mission-compiler` manifest names the
+  deleted `mission-compiling` skill). The crew index skips that one link
+  with a warning instead of failing, so `role list` and `role show` keep
+  working.
+- **`darkmux lab notebook draft` / `lab notebook list`, the `scribe`
+  role, and the `DARKMUX_NOTEBOOK_DIR` / `dirs.notebook` setting**
+  (#2913). Built-in notebook prose is not needed when a skill can do it
+  with the orchestrator, and the data side now exists in a better form
+  (`darkmux lab run stats <run> --json`). Removed outright; the
+  `<root>/notebook` directory is no longer created by `init`.
+  **Migration:** run `darkmux init` to install the bundled
+  `darkmux-lab-notebook` skill, which drafts an entry from `lab run stats
+  --json` (and the run's `manifest.json` when needed) and writes it
+  wherever your own instructions say your notebook lives. Delete
+  `dirs.notebook` from `config.json` and unset `DARKMUX_NOTEBOOK_DIR`;
+  neither is read any more, and `darkmux doctor` warns naming whichever
+  is still set with the exact change to make. `darkmux config set
+  dirs.notebook ...` now rejects the key. Existing entries on disk are
+  untouched.
+- **`darkmux mission migrate` and the pre-#148 flat mission layout.**
+  Flat `<root>/missions/<id>.json` / `<root>/phases/<id>.json` files are
+  not read; `darkmux doctor` FAILS naming each one still present.
+  **Migration:** run `darkmux mission migrate --apply` on 3.x before
+  upgrading.
+- **The pre-Beat-33 `<root>/crew/{roles,missions,phases,crews,skills}`
+  fallback read.** User state resolves under `<root>/<subdir>/` only;
+  `darkmux doctor` now FAILS on a leftover `crew/` subdir and prints the
+  move script. **Migration:** run the script `darkmux doctor` prints.
+- **Dispatching with no resolvable profile no longer probes LMStudio's
+  first loaded model.** With no `--profile`, no `role_profiles.<role>`
+  binding and no `default_profile` (or a profile that selects no model for
+  the role), the dispatch now fails with an error naming the fix, where 3.x
+  printed a deprecation warning and ran against whatever was loaded.
+  **Migration:** set `"default_profile"` in `profiles.json`.
+- **`darkmux lab eval --k`, `--roster-profile`, `--exec-mode` and
+  `--bundler`.** They configured the funnel mode deleted in #2310 P4d and
+  were accepted and silently ignored since; `--k` claimed a value above 1
+  was a loud error, and it was not. **Migration:** drop the flags; they
+  never changed a run.
+- **Doctor's "legacy compaction extras" check.** The openclaw-shape keys
+  it warned about (`mode`, `maxHistoryShare`, `recentTurnsPreserve`,
+  `customInstructions` under `runtime.compaction`) are now retired keys,
+  refused by name like any unknown key (CONFIG 2.0, below). **Migration:**
+  delete them (`custom_instructions` is the typed field).
+- **Doctor's residue checks for pre-3.x removals:** the `crews` map in
+  `profiles.json`, the `review{}` config block,
+  `runtime.telemetry_record_every_samples`, and the "daemon predates the
+  build field" verdict. Each key is now a retired key, refused by name
+  (CONFIG 2.0, below). **Migration:** delete any of those keys still
+  present (`darkmux doctor`'s `user file keys` rows name them).
+
+- **A role's `escalation_posture`.** Nothing read it: the runtime treated
+  `auto` and `pause` the same. A role manifest that still sets it is refused
+  like any retired key. **Migration:** delete `escalation_posture` from your
+  role manifests (`darkmux doctor`'s `user file keys` row names each file).
+
+### The flow record's leftover fields (breaking, 4.0, FLOW 2.0.0)
+
+- **`payload.runtime` is gone from every record.** It named the dispatch
+  topology (`internal`, `direct`, `scheduler`) and nothing outside the
+  viewer's run brief read it; the `--json` envelope's `metrics.runtime` for a
+  hosted single-shot goes with it. **Migration:** a receiver that branched on
+  it reads the record's `action` and `session_id`, or `payload.endpoint`.
+- **`FlowRecord.source` is a closed set with one spelling** (`snake_case`):
+  `crew_dispatch`, `scheduler`, `phase_lifecycle`, `mission_lifecycle`,
+  `phase_review`, `mission_debrief`, `host_sampler`, `presence_reconciler`,
+  `cmd_gate_audit`, `hook`, `host`, `detector`, `runtime`, `tokens`,
+  `context`, `compaction`, `lms`, `thermal`, `battery`, `budget`, `utility`,
+  and the four an operator writes. `host-sampler`, `presence-reconciler` and
+  `cmd-gate-audit` were kebab-case; they are `host_sampler`,
+  `presence_reconciler` and `cmd_gate_audit`. `darkmux flow
+  note|catch|record|tier-decision --source` accepts `orchestrator`,
+  `adjudication`, `manual` or `frontier` and refuses anything else
+  (`frontier-orchestrator` is `frontier`). darkmux's readers map the retired
+  spellings on read (`sprint_lifecycle`, `sprint_review`,
+  `frontier-orchestrator`, the per-dispatch sampler's `process`) and read a
+  source that maps nowhere as `unknown`. **Migration:** a receiver that
+  filters on `source` uses the `snake_case` spellings.
+- **`tier` says who acted, not where the model ran.** `local` (written on
+  every record, hosted-endpoint executions included) is now `darkmux`; the
+  values are `operator`, `frontier` and `darkmux`. `flow record --tier local`
+  is refused by the CLI's value list. **Migration:** read `payload.endpoint`
+  and `model` to learn where a call ran.
+- **`host.peak_cpu_pct` / `host.peak_mem_pct` are gone** from
+  `dispatch.complete`'s and the `--json` envelope's `host` block. They
+  mirrored `host.cpu.peak_pct` / `host.mem.peak_pct` for one release
+  (1.27.0) and that release ended long ago.
+- **`FlowRecord.work_id` / `attempt` are gone.** The work queue they came
+  from retired with #2916; an archive that carries them still reads.
+- **`stage: "estimate"` is gone** (nothing ever wrote it); a record that
+  carries it reads as `unknown`. `ship` stays: the hook sink's own records
+  carry it.
+- **`dispatch.complete`'s and the envelope's `cumulative_turns` /
+  `cumulative_compactions` are gone.** Every count on the record is this
+  invocation's own, and the whole-task count across resumes is no longer
+  reported (nothing read it). **Migration:** a resumed run's `turns` counts
+  only its own turns, and a hand-back resume continues the prior run's last
+  turn, so do not sum `turns` across a resume: that turn is counted in both
+  runs. Compaction counts do sum.
+- **One unit for time in payloads: durations are `*_ms`, instants are
+  `*_at_ms` (epoch milliseconds).** Renamed, with the value converted:
+  `budget.wait` `wait_seconds` is `wait_ms` and its ISO `resume_at` is
+  `resume_at_ms`; `utility.start` `stall_after_seconds` is `stall_after_ms`;
+  `machine.rollup` `period_seconds` is `period_ms`; `dispatch.complete`'s
+  `live` block `sampler_us` / `forward_us` are `sampler_ms` / `forward_ms`
+  (fractional); `machine.battery_health` `total_operating_time_hours` /
+  `time_at_soc_hours` are `total_operating_ms` / `time_at_soc_ms`, which
+  `GET /machine/resources` serves under the same keys in its `load.battery_health`
+  block. The config keys (`machine_rollup.period_seconds`, and the
+  `bounds` block, which is keyed by the config knob a value came from) keep
+  their names. darkmux's readers rename and convert an old record's keys on
+  read.
+
+### Added (4.0)
+
+- **`darkmux mission show <id>`** and the panel's `/mission show <id>`: one
+  mission in full, from one derivation. The config it was launched from and
+  its declared inputs, every phase, task and step with status, tokens, turns
+  and model, its runs, total tokens, and a viewer link. `--json` is a
+  semver-bound shape (`MissionShow`: `id`, `status`, `description`, `config`,
+  `graph` (the daemon's `/mission/:id/graph.json` value), `runs` (the `run
+  list` rows for this mission), `tokens`, `link`). `mission status` stays the
+  board. An input the launcher fills itself, `mission_id`, reports
+  `required: false` in `config.inputs` (and is not marked required in the text
+  listing), since no caller has to pass it. The link is the graph lens's
+  `#mission=<id>` route.
+- **`/mission list`, `/mission launch <config> [name=value ...]` and
+  `/mission show <id>` in the editor panel**, replacing the per-config
+  commands. Arguments after the config id map onto its declared inputs the way
+  `--param` does (a `name=value` token naming a declared input is a param, the
+  rest is the config's `__panel_args__` text). `/mission launch review` with
+  no inputs still synthesizes the diff, workspace and `head_sha` from the
+  editor's working directory, now triggered by a declared required
+  `diff_file` input and skipped when you pass one.
+- **Panel values have no escapes.** In `/mission launch <config> name="two words"`
+  a backslash right before the closing quote is refused, naming the input,
+  instead of being guessed at; use the other kind of quote around a value that
+  holds one.
 
 ### Added
 
@@ -1113,7 +1124,7 @@ darkmux release.
   (its jobs write into live worktrees your own git and test commands run
   in): grant it only to a machine you would give a shell.
 - **Every request that carries the fleet token checks where it is going**
-  (#2916): a `--machine` dispatch, `machine status`/`resources <id>`,
+  (#2916): a `profile@machine` dispatch, `machine status`/`resources <id>`,
   `machine list --deep` and the daemon's peer mission-graph proxy all go
   through one helper that resolves the roster address, requires the node
   there to be the tailnet node pinned for that entry (pinned by `machine
@@ -1137,8 +1148,8 @@ darkmux release.
   The token is checked before the provider runs. The listener serves at
   most 32 connections and 3 per peer address, allows 3 s for request
   headers, logs refusals at most 5 per peer address per minute (the rest
-  counted), drops a submitted job's `phase_id`, and runs it under its own
-  session id (`<sender id>-from-<peer>`). `/health` reports the listener's
+  counted), drops a submitted job's `phase_id`, and runs it under a relay of the
+  sender's session in a standalone run. `/health` reports the listener's
   state (in full only to this machine). CONFIG 1.29 adds
   `fleet.identity{provider,bin}`, `fleet.listener{enabled,port}` and
   `fleet.accept_work`; env `DARKMUX_FLEET_LISTENER_ENABLED` /
@@ -1238,14 +1249,15 @@ darkmux release.
   `loopback_intended`) or an operator's hand-added one; unknown entry
   fields are now written back unchanged.
 
-- **`/machine-status` is a built-in advertised command** (#2918). "Which
+- **`machine-status` is a built-in mission config** (#2918). "Which
   models are loaded on this machine right now?" was refused: the catalog
   radio's router (and the editor panel) route over had no machine command
   in it, so the question fell through to the answering seat. The read-only
-  `darkmux machine status` verb now ships as a built-in mission config with
-  a `panel` block, advertised exactly the way an operator's own commands
-  are, so the router routes to it and the panel lists it. Read-only only:
-  `machine eject` stays un-advertised.
+  `darkmux machine status` verb now ships as a built-in mission config,
+  listed like an operator's own configs, so the router routes to it and
+  `/mission list` lists it; run it in the panel as
+  `/mission launch machine-status`. Read-only only: `machine eject` stays
+  un-advertised.
 
 ### Fixed
 

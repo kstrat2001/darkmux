@@ -84,7 +84,7 @@ import {
  *
  * Row-click destinations (drill-in packet — both now real, see `RunRow`'s
  * own doc for the split):
- * - (#2860) a `kind==="lab"` row that carries a `session_id` opens the
+ * - (#2860) a `kind==="lab"` row that carries a `dispatch_id` opens the
  *   shared session view, running or finished, from the list or a `run=<dir>`
  *   deep link alike (see `runDestination`, `format.ts`).
  *   A lab row WITHOUT one (a bench run, or a run from before lab rows
@@ -110,7 +110,7 @@ import {
  *   fallback (`renderMissionStatic()`'s static summary) is genuinely out of
  *   scope — see `MISSION_GRAPH_UNREACHABLE_NOTICE`'s own doc for why a
  *   named notice stands in for it instead.
- * - (#1900, widened #1915) an untracked row that carries a `session_id`
+ * - (#1900, widened #1915) an untracked row that carries a `dispatch_id`
  *   opens the session drill instead: `location.hash = "dispatch=<id>"`,
  *   straight to `SessionReplay` (`/flow-dispatch/<id>`) — ungated, no
  *   `missionGraphReachable()` check, same precedent as `FleetLens.tsx`'s
@@ -122,8 +122,8 @@ import {
  *   or a local ephemeral with no durable record): the server picks the
  *   same representative session for it that it already computed for role/
  *   model/route, just never carried out to the client before #1915. The
- *   rule is now kind-agnostic: "untracked, has a `session_id`" opens a
- *   session; "untracked, no `session_id`" is the only row with genuinely
+ *   rule is now kind-agnostic: "untracked, has a `dispatch_id`" opens a
+ *   session; "untracked, no `dispatch_id`" is the only row with genuinely
  *   nothing to open (see `runDestination`, `format.ts`, for the full
  *   reasoning).
  *
@@ -291,15 +291,15 @@ export function RunsBoard({
   // (#1915) The same premise turned out false for an untracked MISSION row
   // too — 40 of 104 rows on the reported machine, the entire newest page a
   // person actually sees. The server now carries the SAME representative-
-  // session pick uniformly, as `Run.session_id`, for every kind that has
+  // session pick uniformly, as `Run.dispatch_id`, for every kind that has
   // one; the client-side rule generalized to match: "untracked, but carries
-  // a `session_id`" opens a session, ANY kind, no more per-kind arms. The
+  // a `dispatch_id`" opens a session, ANY kind, no more per-kind arms. The
   // one case that still has genuinely nothing to open is an untracked row
-  // with no `session_id` at all — a peer mission this daemon knows only
+  // with no `dispatch_id` at all, a peer mission this daemon knows only
   // from a terminal record, with no dispatch session ever joined to it
   // (`flow_mission_to_run`, #1705). `runDestination`'s own doc (`format.ts`)
   // has the full reasoning, including why a TRACKED mission never takes
-  // this branch even though it also carries a `session_id`.
+  // this branch even though it also carries a `dispatch_id`.
   //
   // (#1904 QA fix) The decision itself moved to the shared `runDestination`
   // (`format.ts`) — this function only decides what to DO with each

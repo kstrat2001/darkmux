@@ -322,17 +322,36 @@ pub struct FlowMissionsResponse {
     pub meta: CoverageMeta,
 }
 
+/// The TypeScript shape of one raw archive line. It is `FlowRecord` with
+/// `source` and `stage` opened to any string.
+///
+/// The archive is append-only and the legacy reader keeps 3.x values verbatim
+/// by design (`source: "mission"` and `"review"` are what the run-grain
+/// derivation keys on; a free-text `--source` or a retired `stage` such as
+/// `"estimate"` also survives), so those two fields can hold a value the
+/// closed `FlowSource` and `Stage` unions do not list. The viewer's ingest
+/// module normalizes them to open tags. Only a TypeScript name: the server
+/// sends the lines as JSON values and never builds one of these.
+#[cfg(test)]
+#[derive(ts_rs::TS)]
+#[ts(
+    export,
+    export_to = "../../../ui/src/types/generated/",
+    type = "Omit<import(\"./FlowRecord\").FlowRecord, \"source\" | \"stage\"> & { source?: import(\"./FlowSource\").FlowSource | string, stage: import(\"./Stage\").Stage | string }"
+)]
+pub struct ArchiveFlowRecord;
+
 /// `GET /flow-mission/:id` and `GET /flow-dispatch/:id`: the records of one
 /// mission or one dispatch, across days and fleet.
 ///
 /// The records are the raw archive lines (an archive line may carry a field this
 /// binary does not model), so the field holds JSON values whose documented shape
-/// is `FlowRecord`.
+/// is `ArchiveFlowRecord`, not `FlowRecord`.
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct FlowRecordsResponse {
-    #[cfg_attr(test, ts(as = "Vec<darkmux_flow::FlowRecord>"))]
+    #[cfg_attr(test, ts(as = "Vec<ArchiveFlowRecord>"))]
     pub records: Vec<serde_json::Value>,
     #[cfg_attr(test, ts(type = "number"))]
     pub count: usize,
@@ -502,7 +521,7 @@ pub struct LabRunDetailResponse {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct LabRunEventsResponse {
-    #[cfg_attr(test, ts(as = "Vec<darkmux_flow::FlowRecord>"))]
+    #[cfg_attr(test, ts(as = "Vec<ArchiveFlowRecord>"))]
     pub lines: Vec<serde_json::Value>,
     #[cfg_attr(test, ts(type = "number"))]
     pub next_offset: u64,
