@@ -147,14 +147,14 @@ pub(crate) enum Cmd {
         /// the profile here.
         #[arg(long, value_name = "PROFILE[@MACHINE]")]
         profile: Option<String>,
-        /// Name this dispatch within its run. The recorded session is
+        /// Name this dispatch within its run. The role execution's id is
         /// `<run>.adhoc.<role>.<name>`, where the run is the crew-of-one
         /// mission this dispatch mints. Default: a fresh
         /// `<unix-micros>-<process-counter>`, so consecutive dispatches never
-        /// share session state (which would pollute one task with another's
+        /// share state (which would pollute one task with another's
         /// context).
         #[arg(long)]
-        session_id: Option<String>,
+        name: Option<String>,
         /// (#2480) Per-invocation timeout override, in seconds — what it
         /// bounds depends on which dispatch path the role resolves to.
         ///
@@ -239,9 +239,9 @@ pub(crate) enum Cmd {
         json: bool,
         /// With `--profile <p>@<machine>`: return as soon as the other
         /// machine accepts (or queues) the job instead of waiting for its
-        /// result. The CLI prints the `session_id`; follow it with `darkmux
-        /// flow tail --session <id>` or in the viewer. Ignored for local
-        /// dispatches (always synchronous).
+        /// result. The CLI prints the job's session; follow it in the
+        /// viewer, or on that machine with `darkmux flow tail`. Ignored for
+        /// local dispatches (always synchronous).
         #[arg(long)]
         no_wait: bool,
         /// (#703) Dispatch into a specific Docker image. Default: the
@@ -628,7 +628,7 @@ pub(crate) enum MissionCmd {
         #[arg(long)]
         limit: Option<usize>,
         /// Show every mission in every section, ignoring `--limit`. Combined
-        /// with `--missions`, that means every NAMED mission — the filter
+        /// with `--named`, that means every NAMED mission — the filter
         /// still applies; `--all` controls pagination, not membership.
         #[arg(long)]
         all: bool,
@@ -646,7 +646,7 @@ pub(crate) enum MissionCmd {
         /// Ignored under `--json`, which always emits the whole board — a
         /// machine reader filters for itself.
         #[arg(long)]
-        missions: bool,
+        named: bool,
     },
     /// One mission in full: the config it was launched from, its phases,
     /// tasks and steps with each step's status, tokens and model, its runs,
@@ -1268,18 +1268,19 @@ pub(crate) enum MemoryCmd {
 #[derive(Subcommand)]
 pub(crate) enum CorrectionCmd {
     /// List the adjudication corrections recorded in the flow trail's recent
-    /// window, oldest→newest. With no scope flag, every session in the window;
-    /// `--mission` scopes to one mission's dispatches (exactly as the coder
-    /// brief does), `--session` to a single dispatch.
+    /// window, oldest→newest. With no scope flag, every role execution in the
+    /// window; `--mission` scopes to one mission's dispatches (exactly as the
+    /// coder brief does), `--execution` to a single role execution.
     List {
-        /// Scope to one mission's dispatch sessions — the same exact-set match
+        /// Scope to one mission's role executions — the same exact-set match
         /// the coder brief uses, so this shows precisely what that mission's
-        /// next brief would carry. Conflicts with `--session`.
-        #[arg(long, conflicts_with = "session")]
+        /// next brief would carry. Conflicts with `--execution`.
+        #[arg(long, conflicts_with = "execution")]
         mission: Option<String>,
-        /// Scope to a single dispatch session id.
-        #[arg(long)]
-        session: Option<String>,
+        /// Scope to a single role execution (the `exec-...` id `darkmux
+        /// dispatch` prints).
+        #[arg(long, value_parser = crate::flow_cli::parse_execution_arg)]
+        execution: Option<darkmux_types::execution_id::ExecutionId>,
         /// How many of the most-recent day-files to read. Defaults to the same
         /// window the coder-brief injection reads.
         #[arg(long, default_value_t = darkmux_crew::corrections::ADJUDICATION_LOOKBACK_DAYS)]
@@ -1443,8 +1444,8 @@ pub(crate) enum LabCmd {
         workload: String,
         #[arg(long, short = 'p')]
         profile: Option<String>,
-        #[arg(long, short = 'n', default_value = "1")]
-        runs: u32,
+        #[arg(long = "repeat", short = 'n', default_value = "1")]
+        repeat: u32,
         #[command(flatten)]
         profiles: ProfilesFileArg,
         #[arg(long, short = 'q')]
@@ -1473,8 +1474,8 @@ pub(crate) enum LabCmd {
         /// The role to evaluate against the corpus. Defaults to `pr-reviewer`
         /// (the original `review-bench` behavior). The scorer is role-agnostic
         /// — it matches the role's emitted `{verdict, findings}` JSON against
-        /// the ground-truth labels. The experimental condition flags below
-        /// (`--freeform`/`--agentic`/`--dialectic`) are
+        /// the ground-truth labels. The experimental conditions of `--mode`
+        /// (`freeform`, `agentic`, `dialectic`) are
         /// `pr-reviewer`-specific and ignore this positional (they dispatch
         /// fixed reviewer variant roles / pipelines); a follow-up moves those
         /// behind per-role config (#1465).
@@ -1499,40 +1500,37 @@ pub(crate) enum LabCmd {
         /// `review-bench-<ts>/scores.json` under the runs dir).
         #[arg(long = "scores-out")]
         scores_out: Option<std::path::PathBuf>,
-        /// Dispatch the free-form `pr-reviewer-freeform` role (ordinary prose,
-        /// `MUST FIX:`/`CONSIDER:` marker lines, no JSON grammar lock) instead
-        /// of the shipped grammar-constrained `pr-reviewer` — to measure
-        /// whether the JSON contract itself suppresses recall.
-        #[arg(long, conflicts_with = "agentic")]
-        freeform: bool,
-        /// Dispatch the `pr-reviewer-agentic` role with each case's repository
-        /// tree (at the reviewed commit) mounted as the workdir — the
-        /// production agentic condition (#1197). Requires --workdirs.
-        #[arg(long)]
-        agentic: bool,
-        /// (#1222) Dispatch the dialectic (adversarial) pipeline instead of a
-        /// single reviewer: prosecutor → defender → judge as three chained
-        /// dispatches; the judge's sustained charges are the review, and each
-        /// case's debate envelope lands beside scores.json. The advocates run
-        /// agentic, so this requires --workdirs.
-        #[arg(long, conflicts_with_all = ["freeform", "agentic"])]
-        dialectic: bool,
-        /// Evidence root for --agentic / --dialectic: one
+        /// The experimental condition. `strict` (the default) dispatches the
+        /// shipped grammar-constrained role. `freeform` dispatches
+        /// `pr-reviewer-freeform` (ordinary prose, `MUST FIX:`/`CONSIDER:`
+        /// marker lines, no JSON grammar lock) to measure whether the JSON
+        /// contract itself suppresses recall. `agentic` dispatches
+        /// `pr-reviewer-agentic` with each case's repository tree (at the
+        /// reviewed commit) mounted as the workdir, the production agentic
+        /// condition (#1197); it requires --workdirs. `dialectic` (#1222)
+        /// runs the adversarial pipeline instead of a single reviewer:
+        /// prosecutor, defender, judge as three chained dispatches; the
+        /// judge's sustained charges are the review, and each case's debate
+        /// envelope lands beside scores.json. The advocates run agentic, so
+        /// it requires --workdirs too.
+        #[arg(long, value_enum, default_value_t)]
+        mode: crate::lab::review_bench::BenchMode,
+        /// Evidence root for `--mode agentic` / `--mode dialectic`: one
         /// subdirectory per case id holding that case's repo tree
         /// (`git archive <commit> | tar -x -C <root>/<id>`).
         #[arg(long)]
         workdirs: Option<std::path::PathBuf>,
         /// (#1222) Per-seat profile override (dialectic); falls back to
         /// --profile. Debug phase: leave unset — one profile, all seats.
-        #[arg(long = "prosecutor-profile", requires = "dialectic")]
+        #[arg(long = "prosecutor-profile")]
         prosecutor_profile: Option<String>,
         /// (#1222) Per-seat profile override (dialectic); falls back to --profile.
-        #[arg(long = "defender-profile", requires = "dialectic")]
+        #[arg(long = "defender-profile")]
         defender_profile: Option<String>,
         /// (#1222) Per-seat profile override (dialectic); falls back to
         /// --profile. The later single-variable escalation: point this at a
         /// denser local or remote-endpoint profile while the advocates stay.
-        #[arg(long = "judge-profile", requires = "dialectic")]
+        #[arg(long = "judge-profile")]
         judge_profile: Option<String>,
     },
     /// Loop lab (#986) — run ONE dispatch under a chosen harness config and
@@ -1625,8 +1623,8 @@ pub(crate) enum LabCmd {
         profile: Option<String>,
         /// Number of dispatches (default 6 — enough for a meaningful bimodal
         /// signal without burning hours on Apple Silicon).
-        #[arg(long, short = 'n', default_value = "6")]
-        runs: u32,
+        #[arg(long = "repeat", short = 'n', default_value = "6")]
+        repeat: u32,
         #[command(flatten)]
         profiles: ProfilesFileArg,
     },

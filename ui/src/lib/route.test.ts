@@ -129,9 +129,11 @@ describe("parseRoute", () => {
     expect(parseRoute()).toEqual({ kind: "dispatch", dispatchId: "abc-123", missionId: null });
   });
 
-  it("#session=<id> is retired: it names no route, so it falls through to the default fleet view", () => {
+  it("#session=<id> is retired: an unknown route that withholds the id, never the default fleet view", () => {
     setHash("#session=abc-123");
-    expect(parseRoute()).toEqual({ kind: "fleet" });
+    const route = parseRoute();
+    expect(route.kind).toBe("unknown");
+    expect(JSON.stringify(route)).not.toContain("abc-123");
   });
 
   it("carries the run's mission when the link names one (a session id several missions share)", () => {
@@ -139,9 +141,11 @@ describe("parseRoute", () => {
     expect(parseRoute()).toEqual({ kind: "dispatch", dispatchId: "abc-123", missionId: "m-1" });
   });
 
-  it("a hash carrying both dispatch= and a retired session= reads only dispatch=", () => {
+  it("a hash carrying both dispatch= and a retired session= is refused, not half-read", () => {
     setHash("#dispatch=canonical&session=legacy");
-    expect(parseRoute()).toEqual({ kind: "dispatch", dispatchId: "canonical", missionId: null });
+    const route = parseRoute();
+    expect(route.kind).toBe("unknown");
+    expect(JSON.stringify(route)).not.toContain("legacy");
   });
 
   it("parses #mission=<id> as the mission-graph lens route (#1868)", () => {

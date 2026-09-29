@@ -1,4 +1,4 @@
-//! `darkmux lab tune <workload> --runs N` — multi-run distribution
+//! `darkmux lab tune <workload> --repeat N` — multi-run distribution
 //! characterization with bimodal cluster detection.
 //!
 //! Wraps `lab_run` with multiple iterations, then computes:

@@ -214,6 +214,29 @@ pub fn day_file_records(path: &Path) -> Vec<Value> {
     text.lines().filter_map(parse_value).collect()
 }
 
+/// The session a role execution ran under: the `session_id` its
+/// `dispatch.start` record carries.
+///
+/// The id encodes the moment it was minted, and its `dispatch.start` follows
+/// within moments, so the record is in the day file of that UTC day, or in
+/// the neighboring days when the mint sat near midnight or clocks differ.
+/// Only those three files are read, however old the id is; a line that does
+/// not contain the id is skipped without being parsed. `None` when the id
+/// carries no mint time (a synthesized legacy id) or no such record is there.
+pub fn session_of_execution(dir: &Path, execution: &darkmux_types::execution_id::ExecutionId) -> Option<String> {
+    let minted = execution.minted_at_secs()?;
+    [0, 1, -1].into_iter().find_map(|day_offset| {
+        let path = dir.join(format!("{}.jsonl", crate::day_utc_at(minted + day_offset * 86_400)));
+        let text = std::fs::read_to_string(path).ok()?;
+        text.lines().filter(|line| line.contains(execution.as_str())).filter_map(parse_value).find_map(|r| {
+            let of_it = r.get("execution_id").and_then(Value::as_str) == Some(execution.as_str());
+            (of_it && action_of(&r) == Some(FlowAction::DispatchStart))
+                .then(|| r.get("session_id").and_then(Value::as_str).map(str::to_string))
+                .flatten()
+        })
+    })
+}
+
 /// Tally the unknown actions in the `days` newest day files under `dir`.
 /// Reads only each line's `action` field ([`action_field`]), not the whole
 /// record, so a week of busy day files costs a scan, not a parse.
@@ -255,6 +278,75 @@ fn quick_action_field(line: &str) -> Option<&str> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// An id minted at `secs`, in the grammar [`ExecutionId::mint`] writes.
+    fn exec_at(secs: i64, tag: u32) -> darkmux_types::execution_id::ExecutionId {
+        darkmux_types::execution_id::ExecutionId::parse_minted(&format!("exec-{:x}-1-{tag:x}", secs * 1_000_000)).unwrap()
+    }
+
+    fn start_line(exec: &darkmux_types::execution_id::ExecutionId, action: &str, session: &str) -> String {
+        json!({"action": action, "execution_id": exec.as_str(), "session_id": session}).to_string()
+    }
+
+    #[test]
+    fn an_execution_resolves_to_the_session_its_dispatch_start_carries() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = 1_790_564_400; // 2026-09-28T03:00:00Z
+        let (mine, other) = (exec_at(now, 1), exec_at(now, 2));
+        // The note names the execution too, under a session of its own: only
+        // the `dispatch.start` record says which session the execution ran in.
+        let body = [
+            start_line(&other, "dispatch.start", "run-a.adhoc.coder.other"),
+            start_line(&mine, "operator.note", "not-the-session"),
+            start_line(&mine, "dispatch.start", "run-b.adhoc.coder.mine"),
+        ]
+        .join("\n");
+        std::fs::write(dir.path().join(format!("{}.jsonl", crate::day_utc_at(now))), body).unwrap();
+
+        assert_eq!(session_of_execution(dir.path(), &mine).as_deref(), Some("run-b.adhoc.coder.mine"));
+        assert_eq!(session_of_execution(dir.path(), &exec_at(now, 3)), None, "an unknown execution");
+    }
+
+    #[test]
+    fn an_old_execution_resolves_however_old_it_is() {
+        // No look-back window: the id names its own day.
+        let dir = tempfile::tempdir().unwrap();
+        let then = 1_790_564_400 - 400 * 86_400;
+        let mine = exec_at(then, 1);
+        std::fs::write(dir.path().join(format!("{}.jsonl", crate::day_utc_at(then))), start_line(&mine, "dispatch.start", "run-o.adhoc.coder.old")).unwrap();
+        for newer in 1..=40 {
+            std::fs::write(dir.path().join(format!("{}.jsonl", crate::day_utc_at(then + newer * 86_400 + 43_200))), "{}").unwrap();
+        }
+        assert_eq!(session_of_execution(dir.path(), &mine).as_deref(), Some("run-o.adhoc.coder.old"));
+    }
+
+    #[test]
+    fn only_the_days_around_the_mint_are_read() {
+        // A record in a far-away day file is not reached: the mint time bounds
+        // the search, which is what keeps an unknown id off the whole archive.
+        let dir = tempfile::tempdir().unwrap();
+        let now = 1_790_564_400;
+        let mine = exec_at(now, 1);
+        std::fs::write(dir.path().join(format!("{}.jsonl", crate::day_utc_at(now - 10 * 86_400))), start_line(&mine, "dispatch.start", "run-x.adhoc.coder.far")).unwrap();
+        assert_eq!(session_of_execution(dir.path(), &mine), None);
+    }
+
+    #[test]
+    fn an_execution_started_across_midnight_of_its_mint_is_found_in_the_next_day() {
+        let dir = tempfile::tempdir().unwrap();
+        let just_before_midnight = 1_790_553_599; // 2026-09-27T23:59:59Z
+        let mine = exec_at(just_before_midnight, 1);
+        let next = crate::day_utc_at(just_before_midnight + 1);
+        std::fs::write(dir.path().join(format!("{next}.jsonl")), start_line(&mine, "dispatch.start", "run-n.adhoc.coder.next")).unwrap();
+        assert_eq!(session_of_execution(dir.path(), &mine).as_deref(), Some("run-n.adhoc.coder.next"));
+    }
+
+    #[test]
+    fn an_id_with_no_mint_time_resolves_to_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = darkmux_types::execution_id::ExecutionId::legacy(Some("s"), None, "t", "h", "u");
+        assert_eq!(session_of_execution(dir.path(), &legacy), None);
+    }
 
     #[test]
     fn a_spaced_bookend_is_upgraded_in_place() {

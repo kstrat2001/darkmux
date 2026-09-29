@@ -84,6 +84,14 @@ impl ExecutionId {
         &self.0
     }
 
+    /// The wall-clock second this identity was minted, from the microseconds
+    /// [`ExecutionId::mint`] encodes. `None` for a synthesized (legacy) or
+    /// otherwise foreign spelling, which carries no time.
+    pub fn minted_at_secs(&self) -> Option<i64> {
+        let micros = u128::from_str_radix(self.0.strip_prefix("exec-")?.split('-').next()?, 16).ok()?;
+        i64::try_from(micros / 1_000_000).ok()
+    }
+
     /// Whether this identity was synthesized by the reader for a pre-4.0
     /// record, rather than minted by a host entry.
     pub fn is_legacy(&self) -> bool {
@@ -146,6 +154,17 @@ mod tests {
         for bad in ["", "legacy:s:m", "exec-", "exec-1-2", "exec-1-2-3-4", "exec-1-2-", "exec-G-2-3", "exec-1-2-3\n", "exec-1/2-3-4", "EXEC-1-2-3", "exec-1-2-\u{1b}"] {
             assert!(ExecutionId::parse_minted(bad).is_err(), "{bad:?} is not a minted id");
         }
+    }
+
+    #[test]
+    fn a_minted_id_names_the_second_it_was_minted_and_a_legacy_one_names_none() {
+        let before = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        let minted = ExecutionId::mint().minted_at_secs().expect("a minted id carries its time");
+        let after = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        assert!((before..=after).contains(&minted), "{before} <= {minted} <= {after}");
+        assert_eq!(ExecutionId::parse_minted("exec-65c8243026c00-1a2b-0").unwrap().minted_at_secs(), Some(1_790_564_400));
+        let legacy = ExecutionId::legacy(Some("task-t"), Some("m1"), "2026-08-20T01:00:00Z", "coder", "u1");
+        assert_eq!(legacy.minted_at_secs(), None);
     }
 
     #[test]

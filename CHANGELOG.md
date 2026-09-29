@@ -97,8 +97,8 @@ darkmux release.
   **Viewer links:** `#session=<id>` is `#dispatch=<id>`, `#lens=lab` is
   `#lens=runs&kind=lab`, `#lens=machine&uid=<uid>` is `#lens=machine&machine=<key>`
   and `panel=mission-status-all` is `panel=mission-status&opt.all=all`. The old
-  `#lens=` spellings open the "Unknown route" page instead of being rewritten;
-  a `#session=<id>` link names no route and opens the default fleet view. `darkmux
+  `#lens=` spellings and any hash carrying `session=` open the "Unknown route"
+  page instead of being rewritten (the session id is withheld from that page). `darkmux
   mission status` now prints `#mission=<id>` and `opt.all=all` links (it printed
   the retired `/mission/<id>/graph` and `mission-status-all` forms).
   **Response shapes changed on the wire:** `GET /machine/resources` answers
@@ -164,6 +164,48 @@ darkmux release.
   must run the printed command itself (for `review`, with its own
   `diff_file` and `workspace`); a panel user answers the dialog once per
   routed message.
+
+- **Flag spellings that named the internal noun "session", or a misleading
+  grain, are renamed** (A10 to A13). No aliases: each retired spelling exits 2
+  naming its replacement.
+  **Migration:** `dispatch --session-id` is `--name`;
+  `flow note|catch|record|tier-decision --session-id`, `flow tail --session`
+  and `memory correction list --session` are `--execution`, which takes the
+  `exec-...` id of a role execution, the one `darkmux dispatch` now prints on
+  its "execution id" line (it used to print the session id). A session id
+  given to `--execution` is refused with exit 2, and a note recorded with
+  `--execution` is stamped with that execution and its session; an execution
+  the flow trail has no `dispatch.start` for is refused (the id encodes when
+  it was minted, so only that UTC day and its neighbors are read, however old
+  the id is);
+  `lab eval --freeform|--agentic|--dialectic` is `--mode
+  freeform|agentic|dialectic` (one choice, `strict` by default; the dialectic
+  per-seat profile flags are refused with exit 2 under any other mode);
+  `lab run --runs` and `lab tune --runs` are `--repeat` (`-n` is unchanged);
+  `mission status --missions` is `--named`. The viewer's "try it yourself"
+  `lab eval` line prints the new spelling. The `--no-wait` follow-up lines no
+  longer print a `flow tail` command with an id.
+- **The session no longer shows in three operator outputs.** The session is an
+  internal join key; these now show the role execution or the run.
+  **Migration:** `memory correction list` prints `[exec-...]` (or `[no
+  execution recorded]` for a note written before executions carried an id), and
+  its `--json` rows carry `execution_id` (a string, or `null`) in place of
+  `session_id`; `flow tail`'s last column is the execution id, or the run id
+  for a record outside any execution (`flow tail --json` still forwards the raw
+  record, `session_id` included); `dispatch --no-wait` to another machine
+  prints `run=<id>` in place of `session_id=<id>`, followed by `darkmux run
+  list --kind dispatch` (the row id there is this value), and its "submitting
+  to" line says `run=` too.
+- **Mission state files are read in one spelling** (A18). A `mission.json`
+  using `sprint_ids`, `closed_ts` or status `closed`, a task file using
+  `sprint_id`, and a `sprints/` directory (the old name of `phases/`) are
+  refused, naming the fix, instead of loading as if the field were absent.
+  `darkmux doctor` fails each one in its "mission state files" row (which also
+  reports the flat pre-#148 files). Flow archives still read a record's
+  `sprint_id`. **Migration:** rename the key (`sprint_ids` to `phase_ids`,
+  `closed_ts` to `finalized_ts`, `"closed"` to `"finalized"`, a task's
+  `sprint_id` to `phase_id`) or rename `sprints/` to `phases/`.
+
 - **`darkmux mission dispatch` and the hand-built mission verbs** (#2954).
   Missions now come only from mission configs. Removed with no alias:
   `mission dispatch`, `mission add-phase`, `mission start`,

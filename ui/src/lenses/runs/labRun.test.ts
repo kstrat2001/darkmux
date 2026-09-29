@@ -207,13 +207,13 @@ describe("labCliHint", () => {
 
   it("an experimental mode keeps the default role and adds its own flags", () => {
     expect(labCliHint({ role: "pr-reviewer", mode: "agentic" })).toBe(
-      "darkmux lab eval --cases-dir <cases-dir> --agentic --workdirs <workdirs-root>",
+      "darkmux lab eval --cases-dir <cases-dir> --mode agentic --workdirs <workdirs-root>",
     );
     expect(labCliHint({ role: "pr-reviewer", mode: "dialectic" })).toBe(
-      "darkmux lab eval --cases-dir <cases-dir> --dialectic --workdirs <workdirs-root>",
+      "darkmux lab eval --cases-dir <cases-dir> --mode dialectic --workdirs <workdirs-root>",
     );
     expect(labCliHint({ role: "pr-reviewer", mode: "freeform" })).toBe(
-      "darkmux lab eval --cases-dir <cases-dir> --freeform",
+      "darkmux lab eval --cases-dir <cases-dir> --mode freeform",
     );
   });
 

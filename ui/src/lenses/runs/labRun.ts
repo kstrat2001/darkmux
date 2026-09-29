@@ -183,7 +183,7 @@ export function labFeedStatusSuffix(isFinished: boolean, unreachable: boolean): 
 }
 
 /** The "try it yourself" line: a `lab eval` invocation rebuilt from what
- * `scores.json` records (`role`, `mode`, `provenance.profile`). The cases
+ * `scores.json` records (`role`, `mode`, `profile`). The cases
  * dir and `--workdirs` root are not recorded, so they stay explicit
  * placeholders rather than a guess dressed up as fact. The experimental
  * modes run fixed reviewer roles and refuse a named role, so they omit it.
@@ -196,8 +196,8 @@ export function labCliHint(scores: LabScoresSummary | null): string {
   if (!experimental) parts.push(scores?.role || "<role>");
   parts.push("--cases-dir <cases-dir>");
   if (scores?.profile) parts.push(`--profile ${scores.profile}`);
-  if (mode === "freeform") parts.push("--freeform");
-  if (mode === "agentic" || mode === "dialectic") parts.push(`--${mode} --workdirs <workdirs-root>`);
+  if (mode === "freeform") parts.push("--mode freeform");
+  if (mode === "agentic" || mode === "dialectic") parts.push(`--mode ${mode} --workdirs <workdirs-root>`);
   return parts.join(" ");
 }
 

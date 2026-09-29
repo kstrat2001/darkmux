@@ -911,6 +911,38 @@ fn lab_loop_rejects_an_out_of_range_compact_threshold_ratio() {
         .stderr(predicate::str::contains("--compact-threshold-ratio 5 is out of range"));
 }
 
+/// A seat profile outside `--mode dialectic` is a usage error: exit 2, the
+/// same as a clap-rejected argument, not the generic failure exit 1.
+#[test]
+fn a_seat_profile_outside_dialectic_mode_exits_2() {
+    darkmux_cmd()
+        .args(["lab", "eval", "--mode", "strict", "--judge-profile", "p"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("`--judge-profile` applies only to `--mode dialectic`"));
+}
+
+/// `--execution` takes the `exec-...` id `dispatch` prints. A session-shaped
+/// value is a usage error (exit 2) on every verb that has the flag, naming
+/// what the flag wants; it never reaches the flow trail.
+#[test]
+fn execution_flags_refuse_a_session_shaped_value() {
+    let session = "run-a.adhoc.coder.x";
+    let cases: [&[&str]; 4] = [
+        &["flow", "tail", "--execution", session],
+        &["flow", "note", "--text", "t", "--execution", session],
+        &["memory", "correction", "list", "--execution", session],
+        &["flow", "tier-decision", "--decision", "direct", "--reasoning", "r", "--execution", session],
+    ];
+    for args in cases {
+        darkmux_cmd()
+            .args(args)
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("is not a role execution id"));
+    }
+}
+
 /// (#2954) 4.0 retired the hand-built mission verbs with no alias: missions
 /// come only from mission configs (`mission launch`). Each old spelling is
 /// refused by name, exit 2, with the line naming its replacement; a wrong
@@ -947,6 +979,30 @@ fn retired_mission_verbs_are_refused_naming_the_replacement() {
         for remedy in remedies {
             assert = assert.stderr(predicate::str::contains(*remedy));
         }
+    }
+}
+
+/// (4.0) The retired flag spellings exit 2 through the real binary, naming the
+/// replacement; the replacement itself is never refused.
+#[test]
+fn retired_flag_spellings_are_refused_at_entry_naming_the_replacement() {
+    let cases: &[(&[&str], &str, &str)] = &[
+        (&["dispatch", "coder", "hello", "--session-id", "x"], "darkmux dispatch --session-id", "--name"),
+        (&["flow", "note", "--text", "t", "--session-id", "s"], "darkmux flow note --session-id", "--execution"),
+        (&["flow", "tail", "--session", "s"], "darkmux flow tail --session", "--execution"),
+        (&["memory", "correction", "list", "--session", "s"], "darkmux memory correction list --session", "--execution"),
+        (&["lab", "eval", "--freeform"], "darkmux lab eval --freeform", "--mode freeform"),
+        (&["lab", "run", "quick-q", "--runs", "2"], "darkmux lab run --runs", "--repeat"),
+        (&["lab", "tune", "quick-q", "--runs", "2"], "darkmux lab tune --runs", "--repeat"),
+        (&["mission", "status", "--missions"], "darkmux mission status --missions", "--named"),
+    ];
+    for (args, named, replacement) in cases {
+        darkmux_cmd()
+            .args(*args)
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains(format!("`{named}` was removed in 4.0")))
+            .stderr(predicate::str::contains(*replacement));
     }
 }
 
@@ -13335,7 +13391,7 @@ fn lab_eval_refuses_an_empty_or_missing_cases_dir() {
         )));
     let missing = lab.home.path().join("nope");
     lab.cmd()
-        .args(["lab", "eval", "--dialectic", "--cases-dir"])
+        .args(["lab", "eval", "--mode", "dialectic", "--cases-dir"])
         .arg(&missing)
         .assert()
         .failure()

@@ -773,14 +773,10 @@ edit loop detected on src/widget.rs in an earlier dispatch
         let mid = "m-debrief";
         let phases_dir = home.path().join("missions").join(mid).join("phases");
         std::fs::create_dir_all(&phases_dir).unwrap();
-        // Legacy on-disk shape (pre-Closed→Finalized rename, #1463 lineage):
-        // `"status":"closed"` deliberately, exercising the `alias = "closed"`
-        // lenient-read path — a mission finalized before this rename shipped
-        // must still deserialize.
         std::fs::write(
             home.path().join("missions").join(mid).join("mission.json"),
             format!(
-                r#"{{"id":"{mid}","description":"close the doom loop","status":"closed","phase_ids":["s1","s2"],"created_ts":1700000000}}"#
+                r#"{{"id":"{mid}","description":"close the doom loop","status":"finalized","phase_ids":["s1","s2"],"created_ts":1700000000}}"#
             ),
         )
         .unwrap();

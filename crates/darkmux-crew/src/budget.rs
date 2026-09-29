@@ -623,7 +623,7 @@ fn status_at(path: &Path) -> Option<String> {
 pub fn run_stop_reason(mission_id: Option<&str>, phase_id: Option<&str>) -> Option<String> {
     let mid = mission_id?;
     if let Some(status) = status_at(&crate::lifecycle::mission_path(mid)) {
-        if matches!(status.as_str(), "aborted" | "finalized" | "closed") {
+        if matches!(status.as_str(), "aborted" | "finalized") {
             return Some(format!("mission `{mid}` is {status}"));
         }
     }

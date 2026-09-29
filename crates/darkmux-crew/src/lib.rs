@@ -144,6 +144,7 @@ pub mod power_policy;
 // `dispatch.map` fan-out and `darkmux-lab`'s review pipeline construct.
 pub mod budget;
 pub mod remote_budget;
+pub mod retired_state;
 // (#2421) Mission-envelope records-emitted aggregation — see the module doc
 // for why this lives here rather than in `darkmux-serve`.
 pub mod records_emitted;

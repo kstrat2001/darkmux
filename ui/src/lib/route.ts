@@ -363,6 +363,11 @@ export function parseRoute(): Route {
   // invention.
   const lens = get("lens").toLowerCase();
 
+  // A retired `session=` link must not silently open the default view, or a
+  // different route the hash also names. The unknown-route page shows this
+  // hash, so the id it carried is withheld like the retired `uid=` value.
+  if (get("session")) return { kind: "unknown", hash: "session=(retired, value withheld)" };
+
   // (#1920) `fleet` is the bare-root default (no hash at all falls
   // through to `{kind:"fleet"}` at the bottom of this function) but had no
   // EXPLICIT `lens=` form of its own — an operator typing or sharing

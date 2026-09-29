@@ -3,7 +3,7 @@
  * reaches this component (`App.tsx`'s `renderRoute` switch gives every named
  * `Route` kind its own lens). An unrecognized route must be VISIBLE, never
  * silent: `hash` shows the hash the operator arrived with, so a broken bookmark
- * is debuggable at a glance (a retired `uid=` link is shown with its value withheld). That includes a retired link
+ * is debuggable at a glance (a retired `uid=` or `session=` link is shown with its value withheld). That includes a retired link
  * spelling (`#session=`, `#lens=lab`, `uid=`, `panel=mission-status-all`): the
  * viewer keeps no aliases, so an old link lands here rather than being
  * silently rewritten.

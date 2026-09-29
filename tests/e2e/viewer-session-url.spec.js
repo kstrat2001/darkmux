@@ -165,13 +165,14 @@ test('drilling into a session writes it to the address bar', async ({ page }) =>
   expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
 });
 
-test('booting on the retired #session= spelling opens the default fleet view, not a dispatch (#1974)', async ({ page }) => {
-  // The 4.0 break: `#session=<id>` names no route and has no alias, so the
-  // page falls through to the default fleet view rather than opening a dispatch. `#dispatch=<id>` (the
-  // test above and below) is the one spelling.
+test('booting on the retired #session= spelling opens the Unknown route page, not a dispatch or the fleet view (#1974)', async ({ page }) => {
+  // The 4.0 break: `#session=<id>` has no alias, and a retired link must never
+  // silently show something else, so it lands on the "Unknown route" page.
+  // `#dispatch=<id>` (the test above and below) is the one spelling.
   await mockSession(page, 'sess-in-flight');
   const errors = await bootLive(page, '#session=sess-in-flight');
-  await expect(page.locator('.fleet-lens')).toBeVisible();
+  await expect(page.locator('.lens-placeholder__title')).toHaveText('Unknown route');
+  await expect(page.locator('.lens-placeholder__hash')).not.toContainText('sess-in-flight');
   await expect(page.locator('.session-run')).toHaveCount(0);
   expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
 });

@@ -126,7 +126,7 @@ FINALIZED (93)
   • Fix misleading APIM subscription copy i…rs on Subscriptions Create/Edit pages.   8w    1/1  ▓▓▓▓
   • Live diff view for an active dispatch (…form' differentiation feature for 1.0.   8w    1/1  ▓▓▓▓
   ◆ Build the shared inline Rust styling mo… never corrupted by ANSI escape codes.   8w    3/3  ▓▓▓▓
-→ `--missions` for named missions only
+→ `--named` for named missions only
 
 ✓ board is clean — every mission's phases are reconciled
 

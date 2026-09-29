@@ -209,7 +209,7 @@ pub fn run() -> DoctorReport {
         check_role_profiles(),
         check_role_tool_vocab_typos(),
         check_beat33_legacy_crew_dir(),
-        check_flat_mission_files(),
+        check_mission_state_files(),
         check_lab_dir_location(),
         check_ignored_project_darkmux(),
         check_mission_envelope_readability(),
@@ -430,13 +430,17 @@ fn ignored_project_status(state: Option<darkmux_types::paths::IgnoredProjectStat
     }
 }
 
-/// (4.0) Pre-#148 flat mission files: `<root>/missions/<id>.json` and
-/// `<root>/phases/<id>.json`. 4.0 deleted `mission migrate` and does not read
-/// them, so a leftover one is state the operator would otherwise lose
-/// silently. Fail, naming every file. Read-only: no migration logic here.
-fn check_flat_mission_files() -> Check {
+/// (4.0) Mission state 4.0 no longer reads, so a leftover is state the
+/// operator would otherwise lose silently. Fail, naming every file. Two
+/// kinds: pre-#148 flat files (`<root>/missions/<id>.json`,
+/// `<root>/phases/<id>.json`, whose `mission migrate` is gone), and files or
+/// directories using a renamed spelling (`sprint_ids`, `closed_ts`, status
+/// `closed`, a task's `sprint_id`, a `sprints/` directory), each with its
+/// one-line fix from `darkmux_crew::retired_state`. Read-only: no migration
+/// logic here.
+fn check_mission_state_files() -> Check {
     let root = darkmux_crew::loader::user_state_root();
-    let mut found: Vec<String> = Vec::new();
+    let mut flat: Vec<String> = Vec::new();
     for sub in ["missions", "phases"] {
         let Ok(entries) = std::fs::read_dir(root.join(sub)) else {
             continue;
@@ -444,30 +448,44 @@ fn check_flat_mission_files() -> Check {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_file() && path.extension().is_some_and(|e| e == "json") {
-                found.push(path.display().to_string());
+                flat.push(path.display().to_string());
             }
         }
     }
-    found.sort();
-    if found.is_empty() {
+    flat.sort();
+    let retired = darkmux_crew::retired_state::scan(&darkmux_crew::loader::missions_dir());
+    if flat.is_empty() && retired.is_empty() {
         return Check {
-            name: "flat mission files".into(),
+            name: "mission state files".into(),
             status: Status::Pass,
-            message: "no flat mission files".into(),
+            message: "no flat or retired-spelling mission files".into(),
             hint: None,
         };
     }
-    Check {
-        name: "flat mission files".into(),
-        status: Status::Fail,
-        message: format!(
+    let mut messages = Vec::new();
+    let mut hints = Vec::new();
+    if !flat.is_empty() {
+        messages.push(format!(
             "{} pre-#148 flat mission file(s) that 4.0 no longer reads: {}",
-            found.len(),
-            found.join(", ")
-        ),
-        hint: Some(
-            "run `darkmux mission migrate --apply` on 3.x before upgrading, or delete them".into(),
-        ),
+            flat.len(),
+            flat.join(", ")
+        ));
+        hints.push("run `darkmux mission migrate --apply` on 3.x before upgrading, or delete the flat files");
+    }
+    if !retired.is_empty() {
+        let each: Vec<String> = retired.iter().map(|p| format!("{}: {}", p.path.display(), p.fix)).collect();
+        messages.push(format!(
+            "{} mission state file(s) using a spelling 4.0 no longer reads: {}",
+            retired.len(),
+            each.join(" | ")
+        ));
+        hints.push("apply the one-line fix named for each file; darkmux refuses a file until it does");
+    }
+    Check {
+        name: "mission state files".into(),
+        status: Status::Fail,
+        message: messages.join("; "),
+        hint: Some(hints.join("; ")),
     }
 }
 
@@ -11701,7 +11719,7 @@ mod tests {
         // `check_enum_settings`, which contributes one row per registered
         // enum setting.
         //
-        // (4.0 cleanup) 63: `check_flat_mission_files` joined (the Fail
+        // (4.0 cleanup) 63: `check_mission_state_files` (then `check_flat_mission_files`) joined (the Fail
         // that replaced the `mission migrate` pointer). Before it, 62:
         // `check_legacy_mission_layout` left with the
         // `mission migrate` verb it pointed at,
@@ -13735,7 +13753,7 @@ mod tests {
         assert!(split.hint.unwrap().starts_with("mv -n "), "a merge never overwrites");
     }
 
-    // ─── (4.0) check_flat_mission_files ──────────────────────────────
+    // ─── (4.0) check_mission_state_files ──────────────────────────────
 
     #[serial_test::serial]
     #[test]
@@ -13745,14 +13763,43 @@ mod tests {
         std::fs::create_dir_all(guard.path().join("phases")).unwrap();
         std::fs::write(guard.path().join("missions").join("alpha.json"), "{}").unwrap();
         std::fs::write(guard.path().join("phases").join("s1.json"), "{}").unwrap();
-        let check = check_flat_mission_files();
+        let check = check_mission_state_files();
         assert_eq!(check.status, Status::Fail, "{}", check.message);
         assert!(check.message.contains("missions/alpha.json"), "{}", check.message);
         assert!(check.message.contains("phases/s1.json"), "{}", check.message);
         assert!(check.message.contains("4.0 no longer reads"), "{}", check.message);
         let hint = check.hint.expect("names the fix");
         assert!(hint.contains("darkmux mission migrate --apply"), "{hint}");
-        assert!(hint.contains("delete them"), "{hint}");
+        assert!(hint.contains("delete the flat files"), "{hint}");
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn retired_mission_spellings_fail_naming_the_file_and_the_fix() {
+        let guard = CrewRootGuard::new();
+        let m = guard.path().join("missions").join("alpha");
+        std::fs::create_dir_all(m.join("sprints")).unwrap();
+        std::fs::write(
+            m.join("mission.json"),
+            r#"{"id": "alpha", "description": "d", "status": "closed", "sprint_ids": [], "created_ts": 1}"#,
+        )
+        .unwrap();
+        let check = check_mission_state_files();
+        assert_eq!(check.status, Status::Fail, "{}", check.message);
+        assert!(check.message.contains("alpha/mission.json"), "{}", check.message);
+        assert!(check.message.contains("`sprint_ids` was renamed to `phase_ids`"), "{}", check.message);
+        assert!(check.message.contains("status `closed` was renamed to `finalized`"), "{}", check.message);
+        assert!(check.message.contains("alpha/sprints"), "{}", check.message);
+        assert!(check.message.contains("rename `sprints/` to `phases/`"), "{}", check.message);
+        assert!(check.hint.expect("names the fix").contains("one-line fix"));
+        // Recovery: the fixed files pass.
+        std::fs::remove_dir(m.join("sprints")).unwrap();
+        std::fs::write(
+            m.join("mission.json"),
+            r#"{"id": "alpha", "description": "d", "status": "finalized", "phase_ids": [], "created_ts": 1}"#,
+        )
+        .unwrap();
+        assert_eq!(check_mission_state_files().status, Status::Pass);
     }
 
     #[serial_test::serial]
@@ -13765,9 +13812,9 @@ mod tests {
         std::fs::create_dir_all(m.join("phases")).unwrap();
         std::fs::write(m.join("mission.json"), "{}").unwrap();
         std::fs::write(m.join("phases").join("s1.json"), "{}").unwrap();
-        let check = check_flat_mission_files();
+        let check = check_mission_state_files();
         assert_eq!(check.status, Status::Pass, "{}", check.message);
-        assert!(check.message.contains("no flat mission files"), "{}", check.message);
+        assert!(check.message.contains("no flat or retired-spelling mission files"), "{}", check.message);
     }
 
     #[serial_test::serial]

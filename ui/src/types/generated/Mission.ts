@@ -7,11 +7,9 @@ import type { MissionStatus } from "./MissionStatus";
  */
 export type Mission = { id: string, description: string, status: MissionStatus, 
 /**
- * Sprint→Phase rename read-compat: pre-rename mission JSON on disk
- * carries this list under the old key `sprint_ids`. `alias` lets
- * serde accept either wire name on read; every subsequent
- * `save_json` write emits the canonical `phase_ids` key, so a
- * mission self-migrates its field name the next time it's touched.
+ * The mission's phases. A `mission.json` still using the pre-rename key
+ * `sprint_ids` is refused by [`crate::retired_state`], never read as an
+ * empty list.
  */
 phase_ids: Array<string>, created_ts: number, 
 /**
@@ -22,9 +20,8 @@ started_ts?: number,
 /**
  * When the mission transitioned to `Finalized`. Finalized is
  * terminal — once set, lifecycle verbs can't move the mission
- * elsewhere. Field renamed from `closed_ts` (#1463 terminology
- * consistency); `alias` accepts the pre-rename wire name on read,
- * every subsequent write emits `finalized_ts`.
+ * elsewhere. A `mission.json` still using the old key `closed_ts` is
+ * refused by [`crate::retired_state`].
  */
 finalized_ts?: number, 
 /**

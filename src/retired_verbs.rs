@@ -30,6 +30,12 @@ macro_rules! run_read_remedy {
     };
 }
 
+/// The remedy for a retired `--session-id` flag on a `flow` verb: its
+/// replacement takes the `exec-...` id of the role execution the record is
+/// about (what `darkmux dispatch` prints), not the session id the old flag took.
+const EXECUTION_ID_REMEDY: &str = "Use `--execution <id>`, which takes the `exec-...` id of the role \
+                                   execution (`darkmux dispatch` prints it), not a session id.";
+
 const RETIRED: &[RetiredVerb] = &[
     RetiredVerb {
         words: &["lab", "run", "list"],
@@ -95,6 +101,77 @@ const RETIRED: &[RetiredVerb] = &[
         remedy: "A dispatch no longer attaches to another mission's phase. Run the work as a \
                  step of a mission config (`darkmux mission launch <config>`), or dispatch \
                  without `--phase-id`.",
+    },
+    RetiredVerb {
+        words: &["dispatch"],
+        flag: Some("--session-id"),
+        remedy: "`session` is an internal word, and the flag names the dispatch, not a session: \
+                 use `darkmux dispatch <role> \"<message>\" --name <name>`.",
+    },
+    RetiredVerb {
+        words: &["flow", "note"],
+        flag: Some("--session-id"),
+        remedy: EXECUTION_ID_REMEDY,
+    },
+    RetiredVerb {
+        words: &["flow", "catch"],
+        flag: Some("--session-id"),
+        remedy: EXECUTION_ID_REMEDY,
+    },
+    RetiredVerb {
+        words: &["flow", "record"],
+        flag: Some("--session-id"),
+        remedy: EXECUTION_ID_REMEDY,
+    },
+    RetiredVerb {
+        words: &["flow", "tier-decision"],
+        flag: Some("--session-id"),
+        remedy: EXECUTION_ID_REMEDY,
+    },
+    RetiredVerb {
+        words: &["flow", "tail"],
+        flag: Some("--session"),
+        remedy: "Use `darkmux flow tail --execution <id>`, which takes the `exec-...` id of a role \
+                 execution (`darkmux dispatch` prints it), not a session id.",
+    },
+    RetiredVerb {
+        words: &["memory", "correction", "list"],
+        flag: Some("--session"),
+        remedy: "Use `darkmux memory correction list --execution <id>`, which takes the `exec-...` id \
+                 of a role execution (`darkmux dispatch` prints it), not a session id.",
+    },
+    RetiredVerb {
+        words: &["lab", "eval"],
+        flag: Some("--freeform"),
+        remedy: "The three condition flags are one choice: use `darkmux lab eval --mode freeform`.",
+    },
+    RetiredVerb {
+        words: &["lab", "eval"],
+        flag: Some("--agentic"),
+        remedy: "The three condition flags are one choice: use `darkmux lab eval --mode agentic`.",
+    },
+    RetiredVerb {
+        words: &["lab", "eval"],
+        flag: Some("--dialectic"),
+        remedy: "The three condition flags are one choice: use `darkmux lab eval --mode dialectic`.",
+    },
+    RetiredVerb {
+        words: &["lab", "run"],
+        flag: Some("--runs"),
+        remedy: "`run` names the umbrella over mission, dispatch and lab runs, not a repeat count: \
+                 use `darkmux lab run <workload> --repeat N` (`-n N` still works).",
+    },
+    RetiredVerb {
+        words: &["lab", "tune"],
+        flag: Some("--runs"),
+        remedy: "`run` names the umbrella over mission, dispatch and lab runs, not a repeat count: \
+                 use `darkmux lab tune <workload> --repeat N` (`-n N` still works).",
+    },
+    RetiredVerb {
+        words: &["mission", "status"],
+        flag: Some("--missions"),
+        remedy: "The flag hides machine-minted runs and shows the missions you named: use \
+                 `darkmux mission status --named`.",
     },
 ];
 
@@ -174,6 +251,60 @@ mod tests {
         assert!(msg.contains("`darkmux finding list --dispatch` was removed"), "{msg}");
         assert!(msg.contains("--execution"), "{msg}");
         assert!(refusal(&args(&["finding", "list", "--execution", "k"])).is_none());
+    }
+
+    /// `(argv, the spelling the refusal names, the replacement it must name)`.
+    const RETIRED_FLAGS: &[(&[&str], &str, &str)] = &[
+        (&["dispatch", "coder", "hi", "--session-id", "x"], "darkmux dispatch --session-id", "--name"),  // drift-guard:allow retired flag: asserts the refusal names it
+        (&["flow", "note", "--text", "t", "--session-id=s"], "darkmux flow note --session-id", "--execution"),  // drift-guard:allow retired flag: asserts the refusal names it
+        (&["flow", "catch", "--text", "t", "--session-id", "s"], "darkmux flow catch --session-id", "--execution"),  // drift-guard:allow retired flag: asserts the refusal names it
+        (&["flow", "record", "--session-id", "s"], "darkmux flow record --session-id", "--execution"),  // drift-guard:allow retired flag: asserts the refusal names it
+        (&["flow", "tier-decision", "--session-id", "s"], "darkmux flow tier-decision --session-id", "--execution"),  // drift-guard:allow retired flag: asserts the refusal names it
+        (&["flow", "tail", "--session", "s"], "darkmux flow tail --session", "--execution"),  // drift-guard:allow retired flag: asserts the refusal names it
+        (&["memory", "correction", "list", "--session", "s"], "darkmux memory correction list --session", "--execution"),  // drift-guard:allow retired flag: asserts the refusal names it
+        (&["lab", "eval", "--freeform"], "darkmux lab eval --freeform", "--mode freeform"),  // drift-guard:allow retired flag: asserts the refusal names it
+        (&["lab", "eval", "pr-reviewer", "--agentic"], "darkmux lab eval --agentic", "--mode agentic"),  // drift-guard:allow retired flag: asserts the refusal names it
+        (&["lab", "eval", "--dialectic"], "darkmux lab eval --dialectic", "--mode dialectic"),  // drift-guard:allow retired flag: asserts the refusal names it
+        (&["lab", "run", "quick-q", "--runs", "3"], "darkmux lab run --runs", "--repeat"),  // drift-guard:allow retired flag: asserts the refusal names it
+        (&["lab", "tune", "quick-q", "--runs=3"], "darkmux lab tune --runs", "--repeat"),  // drift-guard:allow retired flag: asserts the refusal names it
+        (&["mission", "status", "--missions"], "darkmux mission status --missions", "--named"),  // drift-guard:allow retired flag: asserts the refusal names it
+    ];
+
+    #[test]
+    fn each_retired_flag_is_refused_naming_its_replacement() {
+        for (argv, spelling, replacement) in RETIRED_FLAGS {
+            let msg = refusal(&args(argv)).unwrap_or_else(|| panic!("{argv:?} was not refused"));
+            assert!(msg.contains(&format!("`{spelling}` was removed")), "{msg}");
+            assert!(msg.contains(replacement), "{msg}");
+        }
+    }
+
+    /// The replacements are live spellings that parse, and a retired flag
+    /// after the `--` separator is message text, never a flag.
+    #[test]
+    fn the_replacement_spellings_parse_and_are_not_refused() {
+        use clap::Parser;
+        for argv in [
+            &["dispatch", "coder", "hi", "--name", "x"][..],
+            &["flow", "note", "--text", "t", "--execution", "exec-1-2-3"],
+            &["flow", "catch", "--text", "t", "--execution", "exec-1-2-3"],
+            &["flow", "tail", "--execution", "exec-1-2-3"],
+            &["memory", "correction", "list", "--execution", "exec-1-2-3"],
+            &["lab", "eval", "--mode", "freeform"],
+            &["lab", "eval", "--mode", "dialectic"],
+            &["lab", "run", "quick-q", "--repeat", "3"],
+            &["lab", "run", "quick-q", "-n", "3"],
+            &["lab", "tune", "quick-q", "--repeat", "3"],
+            &["mission", "status", "--named"],
+        ] {
+            assert!(refusal(&args(argv)).is_none(), "{argv:?}");
+            let mut full = vec!["darkmux"];
+            full.extend_from_slice(argv);
+            if let Err(e) = crate::cli::Cli::try_parse_from(&full) {
+                panic!("{full:?} did not parse: {e}");
+            }
+        }
+        assert!(refusal(&args(&["dispatch", "coder", "--", "--session-id"])).is_none());
     }
 
     #[test]

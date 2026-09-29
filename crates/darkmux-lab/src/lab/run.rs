@@ -358,7 +358,7 @@ fn errored_outcome(
 }
 
 /// Envelope warnings already printed, so a mismatch that holds across
-/// `--runs N` warns once rather than once per run.
+/// `--repeat N` warns once rather than once per run.
 #[derive(Default)]
 struct EnvelopeWarnings {
     last: Option<Vec<String>>,
