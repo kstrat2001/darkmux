@@ -4,7 +4,7 @@
 
 The forward [charters](./README.md) (M4–M8) say where darkmux is going. This page is the other half: the **completed** milestones, so the whole arc M1 → M8 is legible in one place.
 
-This is the milestone-by-milestone *shipped record*. The decision-level **why** (the sequence of forks that shaped the architecture) lives in [`DESIGN.md` → How it got here](../../DESIGN.md#how-it-got-here--the-evolution); read that for the reasoning. Here we trace what each completed milestone actually delivered, and where its work flows into the themes still open.
+This is the milestone-by-milestone *shipped record*. The decision-level **why** (the sequence of forks that shaped the architecture) lives in [`DESIGN.md` → How it got here](../../DESIGN.md#how-it-got-here-the-evolution); read that for the reasoning. Here we trace what each completed milestone actually delivered, and where its work flows into the themes still open.
 
 A note on shape: these milestones are *not* four coequal themes. M1 and M2 were small early steps; M3 is where most of darkmux was actually built; 1.0 was the foundations-first hardening into a stable release. The sizes below reflect that.
 
