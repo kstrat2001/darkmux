@@ -290,9 +290,7 @@ fn pick_parsed_with_source<T: FromStr + Copy>(
 
 /// The **override tier** for a directory setting: `env > config tier
 /// (tilde-expanded)`, or `None` when neither is set. The caller then supplies
-/// its own default — used where one env var overrides two *different* derived
-/// defaults (e.g. `DARKMUX_CREW_DIR` overrides both the crew root and the
-/// user-state root). `env` is the already-empty-filtered `env_str` output, used
+/// its own default. `env` is the already-empty-filtered `env_str` output, used
 /// raw (the shell expands `~`); the config tier is tilde-expanded (operators
 /// hand-write `~/...`) and an empty/whitespace value falls through. Pure +
 /// testable — the reusable spine of every dir accessor (#661 Slice 3).
@@ -1112,12 +1110,12 @@ pub fn remote_step_budget_policy() -> Result<crate::config::StepBudgetPolicy, cr
     resolve_enum("remote.step_budget_policy").map(|(v, _)| v)
 }
 
-/// (#2902 step 5) Every RENAMED setting (`config::RENAMED_SETTINGS`) whose
-/// old env var is still set: read by nothing, so named loudly (doctor Warn, a
-/// preflight warning line). A leftover old `config.json` key is refused as an
-/// unknown key instead (`user_files`).
-pub fn renamed_setting_leftovers() -> Vec<crate::config::RenamedLeftover> {
-    crate::config::renamed_leftovers(&env_str)
+/// Every renamed or retired setting (`config::RENAMED_SETTINGS`,
+/// `config::RETIRED_SETTINGS`) whose env var is still set: refused at every
+/// preflight and failed by doctor. A leftover `config.json` key is refused as
+/// an unknown key instead (`user_files`).
+pub fn retired_env_leftovers() -> Vec<crate::config::RetiredLeftover> {
+    crate::config::retired_env_leftovers(&env_str)
 }
 
 /// (#1230 Packet 1) Max CONCURRENT remote dispatches
@@ -2243,19 +2241,6 @@ pub fn cache_dir() -> std::path::PathBuf {
         return crate::paths::test_isolated_dir("cache");
     }
     resolved.root.join("cache")
-}
-
-/// The crew-state directory **override** (`env(DARKMUX_CREW_DIR) >
-/// config.dirs.crew`), or `None` when neither is set. Returns the override only
-/// — the env var points at the directory *containing* the crew subdirs, and it
-/// overrides two distinct derived defaults (the crew root `<root>/crew` and the
-/// user-state root `<root>`), so each caller in `darkmux-crew` applies its own
-/// (`crew_root` / `user_state_root`).
-pub fn crew_dir_override() -> Option<std::path::PathBuf> {
-    pick_dir_override(
-        env_str("DARKMUX_CREW_DIR"),
-        config().dirs.as_ref().and_then(|d| d.crew.as_deref()),
-    )
 }
 
 /// The fleet roster file: `env(DARKMUX_FLEET_FILE) > config.dirs.fleet_file >
@@ -3393,19 +3378,6 @@ mod tests {
                 None => std::env::remove_var("DARKMUX_LAB_DIR"),
             }
         }
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn crew_dir_override_env_then_none() {
-        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
-        unsafe { std::env::set_var("DARKMUX_CREW_DIR", "/custom/crew"); }
-        assert_eq!(crew_dir_override(), Some(std::path::PathBuf::from("/custom/crew")));
-        // No env, and (in CI) no config → no override; the caller supplies its
-        // own default (crew root vs user-state root).
-        unsafe { std::env::remove_var("DARKMUX_CREW_DIR"); }
-        assert_eq!(crew_dir_override(), None);
-        if let Some(v) = prev { unsafe { std::env::set_var("DARKMUX_CREW_DIR", v); } }
     }
 
     #[serial_test::serial]

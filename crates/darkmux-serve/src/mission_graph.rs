@@ -2639,7 +2639,7 @@ mod tests {
     #[test]
     fn kind_from_config_snapshot_none_when_no_snapshot_exists() {
         // No mission dir at all under this id in the test's isolated
-        // DARKMUX_CREW_DIR — the function must return None, not error.
+        // DARKMUX_HOME — the function must return None, not error.
         assert_eq!(kind_from_config_snapshot("no-such-mission-xyz", "t1", "s1"), None);
     }
 }

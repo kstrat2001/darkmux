@@ -669,8 +669,8 @@ mod tests {
     #[test]
     fn dispatch_reconciled_production_entry_point_resolves_and_falls_through_for_an_unknown_role() {
         // (#2638 audit) `dispatch_reconciled` -> `resolve_local_seat` reads
-        // `DARKMUX_HOME` (+ the `DARKMUX_CREW_DIR`/`DARKMUX_PROFILES`
-        // overrides it derives from) through the same chokepoints its
+        // `DARKMUX_HOME` (+ the `DARKMUX_PROFILES`
+        // override it derives from) through the same chokepoints its
         // sibling tests below guard with `LeaseTestEnv` + `#[serial]` — this
         // test called the real production entry point unguarded, so it
         // could observe a sibling test's tempdir mid-flight, or the

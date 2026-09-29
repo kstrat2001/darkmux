@@ -483,11 +483,15 @@ fn check_beat33_legacy_crew_dir() -> Check {
     // only ever named for deletion, never moved.
     let promoted_subdirs = ["roles", "missions", "phases", "crews", "skills"];
     let pins_file = "role-model-pins.json";
+    let preamble_file = darkmux_crew::loader::PREAMBLE_OVERRIDE_FILE;
     let mut present_subdirs: Vec<&str> = promoted_subdirs
         .iter()
         .filter(|s| legacy_dir.join(s).is_dir())
         .copied()
         .collect();
+    if legacy_dir.join(preamble_file).is_file() {
+        present_subdirs.push(preamble_file);
+    }
     let pins_present = legacy_dir.join(pins_file).is_file();
     present_subdirs.sort();
     let pins_note = format!(
@@ -533,7 +537,7 @@ fn check_beat33_legacy_crew_dir() -> Check {
     // Three things the emitted lines have to get right, each of which was a
     // SILENT no-op-and-exit-0 before (#1715 review):
     //
-    // - Every path is DOUBLE-QUOTED. `DARKMUX_CREW_DIR` is an operator-set
+    // - Every path is DOUBLE-QUOTED. `DARKMUX_HOME` is an operator-set
     //   path and can hold a space (`~/Library/Application Support/...`, a
     //   folder named by hand); unquoted, the `for` header word-splits into
     //   two non-matching literals, the loop body never runs, and the block
@@ -552,7 +556,10 @@ fn check_beat33_legacy_crew_dir() -> Check {
         let dest = root.join(subdir);
         let legacy = legacy_dir.display();
         let root_disp = root.display();
-        if dest.is_dir() {
+        if legacy_dir.join(subdir).is_file() {
+            script_lines.push(format!("# {subdir}: the autonomous-dispatch preamble override now lives at the root"));
+            script_lines.push(format!("mv -n \"{legacy}/{subdir}\" \"{root_disp}/{subdir}\""));
+        } else if dest.is_dir() {
             script_lines.push(format!(
                 "# {subdir}: destination directory already exists — merging entries, not \
                  moving the directory (a plain `mv` would nest it)"
@@ -600,9 +607,8 @@ fn check_beat33_legacy_crew_dir() -> Check {
              exists at the flattened destination is left where it is and the script prints a \
              `LEFTOVERS in ...` line naming the directory it stayed in — compare those two \
              copies yourself and delete the stale one. A clean run prints nothing.\n\n\
-             Note: if you set DARKMUX_CREW_DIR explicitly, this check assumes the env var \
-             points at the post-flatten root (e.g. `~/.darkmux/`), and this script's paths \
-             are computed from the env var value as-given.{pins_hint}",
+             Note: the paths above are computed from the darkmux root (`DARKMUX_HOME` when \
+             set, else `~/.darkmux`).{pins_hint}",
             script = script_lines.join("\n")
         )),
     }
@@ -2231,28 +2237,28 @@ fn resolved_config_path() -> std::path::PathBuf {
     darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).config
 }
 
-/// (#2902 step 5) Settings RENAMED in 4.0 with no alias
-/// (`darkmux_types::config::RENAMED_SETTINGS`: the per-step cap's
-/// `remote.max_tokens_per_execution` -> `remote.max_tokens_per_step`). A
-/// leftover old env var is read by nothing: named with the rename and what to
-/// do. Warn, not Fail: nothing refuses to run. A leftover old `config.json`
-/// key is an unknown key, which the user-file keys row fails.
+/// Settings RENAMED or RETIRED in 4.0 with no alias
+/// (`darkmux_types::config::RENAMED_SETTINGS` / `RETIRED_SETTINGS`: the
+/// per-step cap's `remote.max_tokens_per_execution`, `DARKMUX_CREW_DIR`). A
+/// leftover env var is read by nothing and every preflight refuses it, so this
+/// row fails, naming the replacement. A leftover old `config.json` key is an
+/// unknown key, which the user-file keys row fails.
 fn check_renamed_budget_settings() -> Check {
     renamed_settings_status(&|k| std::env::var(k).ok())
 }
 
 /// Pure decision for [`check_renamed_budget_settings`].
 fn renamed_settings_status(env: &dyn Fn(&str) -> Option<String>) -> Check {
-    let name = "renamed settings (4.0)";
-    let leftovers = darkmux_types::config::renamed_leftovers(env);
+    let name = "retired env vars (4.0)";
+    let leftovers = darkmux_types::config::retired_env_leftovers(env);
     if leftovers.is_empty() {
         return Check { name: name.into(), status: Status::Pass, message: "none present".into(), hint: None };
     }
     Check {
         name: name.into(),
-        status: Status::Warn,
+        status: Status::Fail,
         message: leftovers.iter().map(|l| l.line.clone()).collect::<Vec<_>>().join("; "),
-        hint: Some("Nothing reads the old names; remove the old env var from your shell rc.".into()),
+        hint: Some("Nothing reads the old names and darkmux refuses to start with them set; remove the export from your shell rc.".into()),
     }
 }
 
@@ -11534,15 +11540,15 @@ mod tests {
         r
     }
 
-    /// (#2902 step 5) A leftover old budget env var is named with its exact
+    /// A leftover renamed or retired env var fails, named with its exact
     /// rename; nothing set passes. (A leftover old `config.json` key is an
     /// unknown key, failed by the user-file keys row.)
     #[test]
     fn renamed_budget_settings_are_named_with_the_exact_rename() {
         let env = |k: &str| (k == "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION").then(|| "5".to_string());
         let c = renamed_settings_status(&env);
-        assert_eq!(c.status, Status::Warn, "{}", c.message);
-        assert!(c.message.contains("env var DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION (5) is ignored"), "{}", c.message);
+        assert_eq!(c.status, Status::Fail, "{}", c.message);
+        assert!(c.message.contains("env var DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION (5) is refused"), "{}", c.message);
         assert!(
             c.message.contains("delete it unless you chose that number (500000 was darkmux's old default)"),
             "{}",
@@ -11550,6 +11556,15 @@ mod tests {
         );
         assert!(c.message.contains("set remote.max_tokens_per_step only if you want one"), "{}", c.message);
         assert_eq!(renamed_settings_status(&|_| None).status, Status::Pass);
+    }
+
+    /// A set `DARKMUX_CREW_DIR` (retired) fails, naming `DARKMUX_HOME`.
+    #[test]
+    fn a_set_crew_dir_fails_naming_darkmux_home() {
+        let env = |k: &str| (k == "DARKMUX_CREW_DIR").then(|| "/somewhere".to_string());
+        let c = renamed_settings_status(&env);
+        assert_eq!(c.status, Status::Fail, "{}", c.message);
+        assert!(c.message.contains("DARKMUX_CREW_DIR") && c.message.contains("DARKMUX_HOME"), "{}", c.message);
     }
 
     fn no_spend(_: &darkmux_crew::budget::EndpointBudget) -> darkmux_crew::budget::WindowEntries {
@@ -12273,21 +12288,11 @@ mod tests {
     /// probe destination that resolves outside the isolated root fails
     /// this test with that destination named.
     ///
-    /// **Why it used to be backwards.** The previous cut set only
-    /// `DARKMUX_HOME` and then asserted `missions_dir()` landed under it.
-    /// But `user_state_root()` resolves `crew_dir_override()` — that is,
-    /// `env(DARKMUX_CREW_DIR) > config.dirs.crew` — BEFORE `DARKMUX_HOME`
-    /// ever gets a look in. So the assertion was correct and the setup was
-    /// not: anyone who had exported a scratch `DARKMUX_CREW_DIR`, which is
-    /// the careful thing to do and what agent sessions are told to do, got
-    /// a red suite for doing it right, while anyone who exported nothing
-    /// got a green one INCLUDING in the case the guard exists to catch. A
-    /// suite run with `DARKMUX_CREW_DIR` exported wrote 102 mission
-    /// directories into a real board and reported 98 passed.
-    ///
-    /// The fix is to neutralize every override that outranks the root,
-    /// enumerated from the resolvers rather than from memory — which is
-    /// exactly what `IsolatedState` is, so this test simply holds one.
+    /// **Why it holds an `IsolatedState`.** Setting only `DARKMUX_HOME` and
+    /// asserting `missions_dir()` landed under it is correct for the root but
+    /// silent about every override that outranks it. Neutralizing those,
+    /// enumerated from the resolvers rather than from memory, is exactly
+    /// what `IsolatedState` is, so this test simply holds one.
     ///
     /// **The residual it also measures.** Six destinations have no env
     /// tier at all — `hooks_outbox_dir()` and `hooks_adapters_dir()` are
@@ -12348,7 +12353,7 @@ mod tests {
             ("liveness heartbeats", ca::liveness_dir()),
             ("host-sampler lock", ca::host_sampler_lock_path()),
             ("cache", ca::cache_dir()),
-            // ── crew/user state: `DARKMUX_CREW_DIR` OUTRANKS the root ──
+            // ── crew/user state: the root itself ──
             ("crew user-state root", darkmux_crew::loader::user_state_root()),
             ("mission/phase state", darkmux_crew::loader::missions_dir()),
             ("phase state", darkmux_crew::loader::phases_dir()),
@@ -13551,10 +13556,10 @@ mod tests {
     //
     // The doctor check detects an operator on the pre-Beat-33
     // `<root>/crew/{subdirs}` layout and emits an mv-script. Tests run
-    // serially because they mutate DARKMUX_CREW_DIR — the env var is
+    // serially because they mutate DARKMUX_HOME — the env var is
     // process-global.
 
-    /// RAII: redirect DARKMUX_CREW_DIR to a TempDir for the test's duration.
+    /// RAII: redirect the darkmux root (DARKMUX_HOME) to a TempDir for the test's duration.
     struct CrewRootGuard {
         prev: Option<String>,
         _tmp: tempfile::TempDir,
@@ -13579,10 +13584,10 @@ mod tests {
             let tmp = tempfile::TempDir::new().expect("tempdir");
             let root = pick(tmp.path());
             std::fs::create_dir_all(&root).expect("crew root");
-            let prev = std::env::var("DARKMUX_CREW_DIR").ok();
+            let prev = std::env::var("DARKMUX_HOME").ok();
             // SAFETY: tests using this guard MUST be #[serial].
             unsafe {
-                std::env::set_var("DARKMUX_CREW_DIR", &root);
+                std::env::set_var("DARKMUX_HOME", &root);
             }
             Self { prev, _tmp: tmp, root }
         }
@@ -13597,8 +13602,8 @@ mod tests {
             // SAFETY: tests using this guard MUST be #[serial].
             unsafe {
                 match &self.prev {
-                    Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-                    None => std::env::remove_var("DARKMUX_CREW_DIR"),
+                    Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                    None => std::env::remove_var("DARKMUX_HOME"),
                 }
             }
         }
@@ -13775,6 +13780,20 @@ mod tests {
         // no longer read, not that it keeps working. Strip newlines before
         // substring-matching so rewrapping doesn't move the goalposts.
         assert!(hint.replace('\n', " ").contains("darkmux no longer reads"));
+    }
+
+    /// (4.0) A preamble override left under `<root>/crew/` is state darkmux
+    /// stopped reading (it lives at the root now): Fail, with a move line.
+    #[serial_test::serial]
+    #[test]
+    fn beat33_names_a_preamble_override_left_under_crew() {
+        let guard = CrewRootGuard::new();
+        std::fs::create_dir_all(guard.path().join("crew")).unwrap();
+        std::fs::write(guard.path().join("crew").join("AUTONOMOUS_DISPATCH_PREAMBLE.md"), "x").unwrap();
+        let check = check_beat33_legacy_crew_dir();
+        assert_eq!(check.status, Status::Fail, "{}", check.message);
+        let hint = check.hint.expect("a move line");
+        assert!(hint.contains("mv -n") && hint.contains("AUTONOMOUS_DISPATCH_PREAMBLE.md"), "{hint}");
     }
 
     /// (4.0) A `crew/` holding ONLY the retired `role-model-pins.json` is

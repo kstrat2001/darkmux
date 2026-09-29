@@ -26,7 +26,7 @@ use tempfile::TempDir;
 // tier of `paths::resolve` (`crates/darkmux-types/src/paths.rs`);
 // without it the child resolves the developer's
 // actual `~/.darkmux`, and every accessor that has no test-build guard
-// of its own (`crew_dir_override`, `fleet_file`,
+// of its own (`fleet_file`,
 // `identity_path_override`, `ack_dir_override`) then reads and WRITES
 // the operator's real state. Measured 2026-09-07 against this file's own
 // binary: with `DARKMUX_HOME` unset, `darkmux machine add` created
@@ -151,27 +151,11 @@ fn pin_child_tmpdir(cmd: &mut std::process::Command, home: &std::path::Path) {
 /// written). They point at the same tree, so a child sees one coherent
 /// root either way it resolves.
 ///
-/// (#2682 fix-pass round 3, MUST FIX 1) And one `env_remove`, because
-/// `DARKMUX_CREW_DIR` OUTRANKS both of them. `crew::loader::
-/// user_state_root()` — the resolver behind every `missions/` and
-/// `phases/` read and write — asks `config_access::crew_dir_override()`
-/// first and only falls back to the `DARKMUX_HOME` tier when that
-/// override is absent, so a child spawned by this helper with
-/// `DARKMUX_CREW_DIR` merely INHERITED from the ambient environment reads
-/// and writes the operator's real board, whatever root the two vars above
-/// name. Measured at this head with a sentinel exported: `cargo test
-/// --test cli mission_status_` failed 4 of 8, because each test's fixture
-/// (written under its own `DARKMUX_HOME`) was invisible to the subprocess
-/// reading it back. Clearing it here restores the intended
-/// `DARKMUX_HOME`-tier resolution for every spawn at once; the handful of
-/// tests that genuinely exercise the override still set it explicitly
-/// afterward, and a later `.env` wins over this `.env_remove`.
-///
 /// (#2704 fix-pass, MUST FIX 4) And now EVERY other state variable, taken
 /// from `test_isolation`'s two lists rather than one at a time. Hand-
 /// maintaining this helper's own little set is the bug class #2697
-/// filed, reproduced here: `DARKMUX_CREW_DIR` was cleared because someone
-/// hit it, and the other twelve were inherited straight from the ambient
+/// filed, reproduced here: one variable was cleared because someone
+/// hit it, and the others were inherited straight from the ambient
 /// shell. `DARKMUX_AUDIT_DIR` is the one that mattered. Measured at this
 /// head with the dir set exported to a sentinel and a fake `$HOME`:
 /// `cargo test --test cli -- machine_ flow_ init_ config_` returned
@@ -1027,7 +1011,7 @@ fn retired_top_level_notebook_verb_is_unknown() {
 fn retired_mission_migrate_verb_is_unknown() {
     let tmp = TempDir::new().unwrap();
     darkmux_cmd()
-        .env("DARKMUX_CREW_DIR", tmp.path())
+        .env("DARKMUX_HOME", tmp.path())
         .args(["mission", "migrate"])
         .assert()
         .failure()
@@ -1405,7 +1389,7 @@ fn mission_run_verb_absent_from_help_but_launch_present() {
 }
 
 // (#1860) `mission config list`/`show` wiring — help-level presence plus one
-// real end-to-end invocation of each, isolated via `DARKMUX_CREW_DIR` so the
+// real end-to-end invocation of each, isolated via `DARKMUX_HOME` so the
 // user tier is empty and deterministic (the on-disk `templates/builtin/`
 // tier still resolves from cwd, and the two embedded built-ins always
 // resolve regardless of either).
@@ -6337,8 +6321,8 @@ fn mission_launch_run_on_unknown_value_refused_before_minting() {
 // for a reason worth recording: the built-in `review` mission config
 // (`templates/builtin/mission-configs/review.json`) declares a `panel`
 // block, so it is ALWAYS merged into `radio::compile_catalog`'s output
-// regardless of `DARKMUX_CREW_DIR` — built-ins are embedded at compile
-// time, independent of the user-tier crew dir an isolated TempDir can
+// regardless of `DARKMUX_HOME` — built-ins are embedded at compile
+// time, independent of the user-tier root an isolated TempDir can
 // override. There is therefore no environment override that produces a
 // genuinely EMPTY catalog (the fail-closed short-circuit
 // `radio::route_with_empty_catalog_refuses_without_invoking_call` covers),
@@ -6586,7 +6570,7 @@ fn run_list_binary_agrees_with_the_shared_union_it_calls() {
         .env("DARKMUX_HOME", home.path())
         .env("DARKMUX_FLOWS_DIR", flows.path())
         .env("DARKMUX_LAB_DIR", lab.path())
-        .env("DARKMUX_CREW_DIR", crew.path())
+        .env("DARKMUX_HOME", crew.path())
         .env_remove("DARKMUX_REDIS_URL")
         .output()
         .unwrap();
@@ -6606,9 +6590,9 @@ fn run_list_binary_agrees_with_the_shared_union_it_calls() {
     // restored rather than leaked. `build_runs` takes the flows and lab
     // paths as ARGUMENTS, so `DARKMUX_FLOWS_DIR`/`DARKMUX_LAB_DIR` would
     // be inert here; `darkmux-types` is compiled with `test-support` in
-    // this binary, so `config()` is empty and `DARKMUX_HOME` buys nothing;
+    // this binary, so `config()` is empty;
     // and the fleet slice is literally `&[]`, so Redis is never consulted.
-    // That leaves `DARKMUX_CREW_DIR`, which `crew_dir_override()` feeds to
+    // That leaves `DARKMUX_HOME`, which `user_state_root()` feeds to
     // `load_missions()` — without it the in-process half would read the
     // developer's REAL `~/.darkmux` missions and this comparison would be
     // an accident.
@@ -6627,7 +6611,7 @@ fn run_list_binary_agrees_with_the_shared_union_it_calls() {
     // `DARKMUX_HOME` at 55 of them, so the rest inherited whatever the
     // developer's shell had (usually nothing, which resolves their real
     // `~/.darkmux`).
-    let _crew_guard = EnvVarGuard::set("DARKMUX_CREW_DIR", crew.path());
+    let _crew_guard = EnvVarGuard::set("DARKMUX_HOME", crew.path());
     let direct = darkmux_serve::build_runs(flows.path(), Some(lab.path()), &[]);
     let mut direct_ids: Vec<String> = direct
         .iter()
@@ -6696,7 +6680,7 @@ fn run_list_usage_breakdown_end_to_end() {
             .env("DARKMUX_HOME", home.path())
             .env("DARKMUX_FLOWS_DIR", flows.path())
             .env("DARKMUX_LAB_DIR", lab.path())
-            .env("DARKMUX_CREW_DIR", crew.path())
+            .env("DARKMUX_HOME", crew.path())
             .env_remove("DARKMUX_REDIS_URL")
             .output()
             .unwrap()
@@ -12245,26 +12229,32 @@ fn config_set_refuses_the_renamed_per_execution_key() {
     );
 }
 
-/// (#2902 step 5) A leftover pre-4.0 per-execution cap in the env is read
-/// by nothing: a dispatch says so on stderr (once), naming the new key and
-/// the advice, and is NOT refused for it.
+/// A renamed or retired setting's env var, still set, is refused at preflight
+/// like any other bad config: the pre-4.0 per-execution cap (renamed) and
+/// `DARKMUX_CREW_DIR` (retired) each name their replacement.
 #[test]
-fn a_leftover_renamed_cap_is_named_at_preflight_and_not_refused() {
-    let empty_path = TempDir::new().unwrap();
-    let out = darkmux_std_cmd()
-        .env("PATH", empty_path.path())
-        .env("DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION", "500000")
-        .args(["dispatch", "code-reviewer", "hello"])
-        .output()
-        .unwrap();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("env var DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION (500000) is ignored: renamed to `remote.max_tokens_per_step`"),
-        "{stderr}"
-    );
-    assert!(stderr.contains("500000 was darkmux's old default"), "{stderr}");
-    assert!(!stderr.contains("refusing to start: bad config"), "a leftover is never refused: {stderr}");
-    assert_eq!(stderr.matches("is ignored: renamed to").count(), 1, "once per process: {stderr}");
+fn a_leftover_retired_env_var_is_refused_at_preflight_naming_the_replacement() {
+    let cases = [
+        (
+            "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION",
+            "env var DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION (500000) is refused: renamed to `remote.max_tokens_per_step`",
+        ),
+        ("DARKMUX_CREW_DIR", "env var DARKMUX_CREW_DIR (/x) is refused: removed in 4.0"),
+    ];
+    for (var, says) in cases {
+        let empty_path = TempDir::new().unwrap();
+        let value = if var == "DARKMUX_CREW_DIR" { "/x" } else { "500000" };
+        let out = darkmux_std_cmd()
+            .env("PATH", empty_path.path())
+            .env(var, value)
+            .args(["dispatch", "code-reviewer", "hello"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{var} must refuse: {stderr}");
+        assert!(stderr.contains("refusing to start: bad config"), "{var}: {stderr}");
+        assert!(stderr.contains(says), "{var}: {stderr}");
+    }
 }
 
 fn collect_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {

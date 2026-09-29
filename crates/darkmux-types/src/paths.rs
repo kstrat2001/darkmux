@@ -4,7 +4,7 @@
 //!   2. `~/.darkmux/`       — the default
 //!
 //! A `./.darkmux/` in the working directory is never consulted: it does not
-//! move the root (4.0). Lab runs, sandboxes, profiles, and crews all live under
+//! move the root (4.0). Lab runs, sandboxes, and profiles all live under
 //! the root. Relative paths only — never absolute paths in any shipped
 //! manifest.
 
@@ -36,7 +36,6 @@ pub struct DarkmuxPaths {
     /// unrepresentable is cheaper than remembering not to take it.
     pub(crate) runs: PathBuf,
     pub sandboxes: PathBuf,
-    pub crew: PathBuf,
     pub profiles: PathBuf,
     /// (#661) The config.json location (`<root>/config.json`). The config
     /// subsystem reads + `darkmux init` writes here.
@@ -67,7 +66,6 @@ impl DarkmuxPaths {
         DarkmuxPaths {
             runs: root.join("runs"),
             sandboxes: root.join("sandboxes"),
-            crew: root.join("crew"),
             profiles: root.join("profiles.json"),
             config: root.join("config.json"),
             scope: Scope::User,
@@ -224,7 +222,6 @@ fn paths_from_root(chosen: PathBuf, chosen_scope: Scope) -> DarkmuxPaths {
     DarkmuxPaths {
         runs: chosen.join("runs"),
         sandboxes: chosen.join("sandboxes"),
-        crew: chosen.join("crew"),
         profiles: chosen.join("profiles.json"),
         config: chosen.join("config.json"),
         scope: chosen_scope,
@@ -255,7 +252,6 @@ pub fn ensure(paths: &DarkmuxPaths) -> Result<()> {
         &paths.root,
         &paths.runs,
         &paths.sandboxes,
-        &paths.crew,
     ] {
         if !p.exists() {
             fs::create_dir_all(p)
@@ -424,7 +420,6 @@ mod tests {
             root: tmp.path().join(".darkmux"),
             runs: tmp.path().join(".darkmux/runs"),
             sandboxes: tmp.path().join(".darkmux/sandboxes"),
-            crew: tmp.path().join(".darkmux/crew"),
             profiles: tmp.path().join(".darkmux/profiles.json"),
             config: tmp.path().join(".darkmux/config.json"),
             scope: Scope::Project,
@@ -433,7 +428,6 @@ mod tests {
         assert!(paths.root.exists());
         assert!(paths.runs.exists());
         assert!(paths.sandboxes.exists());
-        assert!(paths.crew.exists());
     }
 
     #[test]
@@ -443,7 +437,6 @@ mod tests {
             root: tmp.path().join(".darkmux"),
             runs: tmp.path().join(".darkmux/runs"),
             sandboxes: tmp.path().join(".darkmux/sandboxes"),
-            crew: tmp.path().join(".darkmux/crew"),
             profiles: tmp.path().join(".darkmux/profiles.json"),
             config: tmp.path().join(".darkmux/config.json"),
             scope: Scope::Project,

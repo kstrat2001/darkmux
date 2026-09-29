@@ -450,7 +450,7 @@ fn every_historical_config_key_is_named_as_retired() {
         "orchestrator": "claude",
         "gh": {"enabled": true, "allowed": []},
         "review": {"judge_concurrency": 2, "judge_fail_on_any_skip": true},
-        "dirs": {"notebook": "/n", "openclaw_config": "/o", "runtime_agents": "/r"},
+        "dirs": {"notebook": "/n", "openclaw_config": "/o", "runtime_agents": "/r", "crew": "/c"},
         "radio": {"router_profile": "p"},
         "remote": {"max_tokens_per_execution": 1, "stage_budget_policy": "warn"},
         "runtime": {"telemetry_record_every_samples": 5},
@@ -459,9 +459,9 @@ fn every_historical_config_key_is_named_as_retired() {
     let not_retired: Vec<String> =
         keys.iter().filter(|k| !matches!(k.issue, Issue::Retired(_))).map(ToString::to_string).collect();
     assert!(not_retired.is_empty(), "{not_retired:#?}");
-    assert_eq!(keys.len(), 10, "{keys:#?}");
+    assert_eq!(keys.len(), 11, "{keys:#?}");
     let msg: String = keys.iter().map(|k| format!("{k}\n")).collect();
-    for says in ["`gh`: renamed to `cmd`", "`orchestrator`: removed", "`remote.stage_budget_policy`: renamed to `remote.step_budget_policy`", "host_sampler_interval_ms"] {
+    for says in ["`gh`: renamed to `cmd`", "`orchestrator`: removed", "`remote.stage_budget_policy`: renamed to `remote.step_budget_policy`", "host_sampler_interval_ms", "`dirs.crew`: removed in 4.0", "DARKMUX_HOME"] {
         assert!(msg.contains(says), "{says}: {msg}");
     }
 }

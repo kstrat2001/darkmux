@@ -259,9 +259,9 @@ mod tests {
     impl CrewDirGuard {
         fn new() -> Self {
             let tmp = TempDir::new().unwrap();
-            let prev = env::var("DARKMUX_CREW_DIR").ok();
+            let prev = env::var("DARKMUX_HOME").ok();
             unsafe {
-                env::set_var("DARKMUX_CREW_DIR", tmp.path());
+                env::set_var("DARKMUX_HOME", tmp.path());
             }
             Self { prev, tmp }
         }
@@ -275,8 +275,8 @@ mod tests {
         fn drop(&mut self) {
             unsafe {
                 match &self.prev {
-                    Some(v) => env::set_var("DARKMUX_CREW_DIR", v),
-                    None => env::remove_var("DARKMUX_CREW_DIR"),
+                    Some(v) => env::set_var("DARKMUX_HOME", v),
+                    None => env::remove_var("DARKMUX_HOME"),
                 }
             }
         }

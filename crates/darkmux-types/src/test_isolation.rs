@@ -7,8 +7,7 @@
 //! test suite grew its own little guard pinning the one environment
 //! variable whose leak had most recently been noticed — a `CrewGuard` for
 //! `DARKMUX_CREW_DIR`, a `FlowsDirGuard` for `DARKMUX_FLOWS_DIR`, a
-//! `DarkmuxHomeGuard` for `DARKMUX_HOME` (later amended to also pin the
-//! crew dir, because `user_state_root()` resolves that first). Every such
+//! `DarkmuxHomeGuard` for `DARKMUX_HOME`. Every such
 //! guard is correct about its own variable and silent about the other
 //! twelve, so each newly-added write destination leaks until someone
 //! notices — and "someone notices" has meant a reviewer running with a
@@ -24,7 +23,7 @@
 //!   and — when `audit.enabled` — the hash-chained audit sink, where they
 //!   cannot be removed without breaking the chain.
 //! * The isolation guard test itself only neutralized `DARKMUX_HOME`, so
-//!   it went RED for anyone who pinned a scratch `DARKMUX_CREW_DIR` (the
+//!   it went RED for anyone who pinned a scratch directory variable (the
 //!   careful thing to do) and stayed GREEN for anyone who pinned nothing
 //!   — exactly backwards from what a guard is for.
 //! * A guard's restore could be made a no-op with the suite fully green,
@@ -108,19 +107,11 @@ use std::path::{Path, PathBuf};
 ///
 /// Derived from the resolvers, NOT from any incident: every accessor in
 /// `config_access` that returns a path and reads an env tier appears here,
-/// plus `darkmux_crew::loader::user_state_root`'s `DARKMUX_CREW_DIR`
-/// (which outranks `DARKMUX_HOME`, and is the one that made the keystone
-/// test fail) and the `DARKMUX_HOME` root itself.
+/// plus the `DARKMUX_HOME` root itself.
 pub const PINNED_STATE_VARS: &[(&str, &str)] = &[
     // The root. Every default below derives from it; pinned first so the
     // rest are belt-and-braces rather than load-bearing.
     ("DARKMUX_HOME", ""),
-    // OUTRANKS `DARKMUX_HOME` in `user_state_root()`/`crew_root()`, which
-    // is what every `missions/`, `phases/`, `roles/`, `crews/` and
-    // `skills/` write resolves through. The variable names the directory
-    // CONTAINING those subdirs, so it pins to the root itself, not a
-    // subpath.
-    ("DARKMUX_CREW_DIR", ""),
     ("DARKMUX_FLOWS_DIR", "flows"),
     ("DARKMUX_FINDINGS_DIR", "findings"),
     ("DARKMUX_MODS_DIR", "mods"),
@@ -183,6 +174,8 @@ pub const PINNED_STATE_VARS: &[(&str, &str)] = &[
 /// written. Out of scope by construction, the same way a non-file
 /// destination is (see [`StateLeakSentinel`]'s doc).
 pub const CLEARED_STATE_VARS: &[&str] = &[
+    // Retired in 4.0: nothing reads it and every preflight refuses it while set.
+    "DARKMUX_CREW_DIR",
     "DARKMUX_AUDIT_DIR",
     "DARKMUX_PROFILES",
     "DARKMUX_TEMPLATES_DIR",
@@ -365,7 +358,7 @@ impl Default for IsolatedState {
 /// rather than the ambient shell's value. That second shape is what the
 /// four targets above are for, and it is exactly what made them the most
 /// exposed of the set: they pinned `HOME` and then inherited a
-/// `DARKMUX_CREW_DIR` / `DARKMUX_AUDIT_DIR` that OUTRANKS it.
+/// `DARKMUX_AUDIT_DIR` that OUTRANKS it.
 ///
 /// Taken from [`PINNED_STATE_VARS`] and [`CLEARED_STATE_VARS`] rather than
 /// written out, so a destination added to either list is covered at every
@@ -433,13 +426,12 @@ pub fn neutralize_state_vars(cmd: &mut std::process::Command) {
 /// the whole design
 ///
 /// **A variable that outranks the root is the right thing to CLEAR and the
-/// wrong thing to PIN.** `DARKMUX_CREW_DIR` outranks `DARKMUX_HOME` in
-/// `user_state_root()`; `DARKMUX_LAB_DIR`, `DARKMUX_FINDINGS_DIR` and
-/// `DARKMUX_MODS_DIR` outrank it in their own accessors. Pinning one of
+/// wrong thing to PIN.** `DARKMUX_LAB_DIR`, `DARKMUX_FINDINGS_DIR` and
+/// `DARKMUX_MODS_DIR` outrank `DARKMUX_HOME` in their own accessors. Pinning one of
 /// those to a single scratch path does not isolate the target — it
 /// OVERRIDES every per-test guard inside it with one shared value, so
 /// tests that isolate themselves correctly are forced onto one directory
-/// and collide. Measured on `darkmux-lab`: with `DARKMUX_CREW_DIR` pinned,
+/// and collide. Measured on `darkmux-lab`: with one such directory variable pinned,
 /// 31 crawl tests fail on the shared directory (a rename hits `ENOENT`
 /// after a sibling's cleanup); with the pin removed, 2,416 of 2,416 pass.
 /// Same binary, same diff — the failures were the harness, not the code.
@@ -1350,9 +1342,9 @@ mod tests {
     /// other darkmux state variable, including `DARKMUX_AUDIT_DIR`.
     ///
     /// This is the assertion that keeps the harness from manufacturing its
-    /// own failures. A variable that outranks the root (`DARKMUX_CREW_DIR`
-    /// in `user_state_root()`, `DARKMUX_LAB_DIR`/`DARKMUX_FINDINGS_DIR`/
-    /// `DARKMUX_MODS_DIR` in their accessors) pinned to one scratch path
+    /// own failures. A variable that outranks the root
+    /// (`DARKMUX_LAB_DIR`/`DARKMUX_FINDINGS_DIR`/`DARKMUX_MODS_DIR` in their
+    /// accessors) pinned to one scratch path
     /// overrides every per-test guard in the target and forces them onto a
     /// shared directory: measured on `darkmux-lab`, 31 crawl tests fail
     /// that way and 2,416 of 2,416 pass with the pin removed.

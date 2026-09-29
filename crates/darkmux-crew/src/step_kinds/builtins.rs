@@ -4783,8 +4783,8 @@ mod tests {
     #[serial_test::serial]
     fn a_map_item_waiting_on_an_aborted_missions_budget_never_sends() {
         let crew = tempfile::TempDir::new().unwrap();
-        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
-        unsafe { std::env::set_var("DARKMUX_CREW_DIR", crew.path()) };
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::set_var("DARKMUX_HOME", crew.path()) };
         let mpath = crate::lifecycle::mission_path("m-aborted");
         std::fs::create_dir_all(mpath.parent().unwrap()).unwrap();
         std::fs::write(&mpath, r#"{"id":"m-aborted","status":"aborted"}"#).unwrap();
@@ -4805,8 +4805,8 @@ mod tests {
         });
         unsafe {
             match prev {
-                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-                None => std::env::remove_var("DARKMUX_CREW_DIR"),
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
             }
         }
         assert!(!out.ok);
@@ -4909,8 +4909,8 @@ mod tests {
     #[serial_test::serial]
     fn an_abort_in_one_launch_never_ends_another_launchs_wait() {
         let crew = tempfile::TempDir::new().unwrap();
-        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
-        unsafe { std::env::set_var("DARKMUX_CREW_DIR", crew.path()) };
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::set_var("DARKMUX_HOME", crew.path()) };
         for (mid, status) in [("launch-a", "aborted"), ("launch-b", "active")] {
             let mpath = crate::lifecycle::mission_path(mid);
             std::fs::create_dir_all(mpath.parent().unwrap()).unwrap();
@@ -4945,8 +4945,8 @@ mod tests {
         launch("launch-b", env_b.clone());
         unsafe {
             match prev {
-                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-                None => std::env::remove_var("DARKMUX_CREW_DIR"),
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
             }
         }
         use darkmux_flow::FlowAction::{BudgetResume, BudgetStop, BudgetWait};

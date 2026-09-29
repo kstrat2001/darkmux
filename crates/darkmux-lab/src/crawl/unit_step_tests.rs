@@ -4,13 +4,9 @@
 //! holds a `HomeGuard`, so nothing here reads or writes the operator's real
 //! root.
 //!
-//! (#2718) That claim used to be made of a guard that pinned `DARKMUX_HOME`
-//! and nothing else, and it held only for a reader with no
-//! `DARKMUX_CREW_DIR` exported — that variable outranks `DARKMUX_HOME` in
-//! `user_state_root()`, so for anyone who had one these tests wrote their
-//! missions and findings into it and shared one directory. The guard is
-//! now `IsolatedState`-backed; see its own comment for the four-cell
-//! measurement.
+//! The guard is `IsolatedState`-backed: it pins EVERY darkmux write
+//! destination under one throwaway root, so an ambient `DARKMUX_FINDINGS_DIR`
+//! or `DARKMUX_MODS_DIR` cannot make these tests share one directory.
 
 use super::*;
 use darkmux_crew::types::{NodeStatus, Phase, PhaseStatus};
@@ -27,37 +23,12 @@ struct HomeGuard {
 }
 impl HomeGuard {
     fn set(p: &Path) -> Self {
-        // (#2718) `IsolatedState` first — it pins EVERY darkmux write
-        // destination under one throwaway root and records what it
-        // displaced — then re-point the ones these fixtures stage at `p`.
-        //
-        // The `DARKMUX_HOME`-only version this replaces is the guard
-        // class #2693 retired in `darkmux-crew` for a measured reason, and
-        // it had the same consequence here: `DARKMUX_CREW_DIR` OUTRANKS
-        // `DARKMUX_HOME` in `user_state_root()` (and
-        // `DARKMUX_FINDINGS_DIR`/`DARKMUX_MODS_DIR` outrank it in their
-        // own accessors), so for anyone who has one exported these tests
-        // isolated nothing and shared one directory.
-        //
-        // Measured, `cargo test -p darkmux-lab --lib`, four cells:
-        //
-        //   guard        DARKMUX_CREW_DIR exported   result
-        //   home-only    yes                         15 failed / 681 passed
-        //   home-only    no                          696 passed
-        //   this one     yes                         696 passed
-        //   this one     no                          696 passed
-        //
-        // The failures are environmental — they are an ambient variable,
-        // not a defect in the code under test — which is exactly why they
-        // are worth removing: an operator who exports a scratch crew dir
-        // should not be handed fifteen red tests that have nothing to do
-        // with their change. Same finding as #2693, one package over.
-        //
-        // No `Drop` of its own: `IsolatedState` restores every variable it
-        // pinned, these three included.
+        // `IsolatedState` first: it pins EVERY darkmux write destination
+        // under one throwaway root and records what it displaced. Then
+        // re-point the ones these fixtures stage at `p`. No `Drop` of its
+        // own: `IsolatedState` restores every variable it pinned.
         let isolated = darkmux_types::test_isolation::IsolatedState::new();
         std::env::set_var("DARKMUX_HOME", p);
-        std::env::set_var("DARKMUX_CREW_DIR", p);
         std::env::set_var("DARKMUX_FINDINGS_DIR", p.join("findings"));
         std::env::set_var("DARKMUX_MODS_DIR", p.join("mods"));
         Self { _isolated: isolated }

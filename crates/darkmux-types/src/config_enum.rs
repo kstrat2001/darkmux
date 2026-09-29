@@ -572,18 +572,21 @@ pub struct PreflightRefusal {
     /// User files the scope consumes that carry a key their schema does not
     /// know, or are not JSON (`crate::user_files`).
     pub files: Vec<crate::user_files::FileProblem>,
+    /// A retired or renamed setting's env var that is still set
+    /// (`crate::config::retired_env_leftovers`).
+    pub retired_env: Vec<crate::config::RetiredLeftover>,
 }
 
 impl PreflightRefusal {
     /// A refusal with nothing in it yet, for a caller that adds its own
     /// passes.
     pub fn none(scope: Scope) -> Self {
-        PreflightRefusal { scope, bad: Vec::new(), invalid: Vec::new(), files: Vec::new() }
+        PreflightRefusal { scope, bad: Vec::new(), invalid: Vec::new(), files: Vec::new(), retired_env: Vec::new() }
     }
 
     /// Nothing refused.
     pub fn is_empty(&self) -> bool {
-        self.bad.is_empty() && self.invalid.is_empty() && self.files.is_empty()
+        self.bad.is_empty() && self.invalid.is_empty() && self.files.is_empty() && self.retired_env.is_empty()
     }
 
     /// `Ok` when nothing is refused.
@@ -620,6 +623,7 @@ impl std::fmt::Display for PreflightRefusal {
             .collect();
         lines.extend(self.invalid.iter().map(|v| format!("  {}: {}\n    valid: {}", v.set_in, v.problem, v.valid)));
         lines.extend(self.files.iter().map(|p| format!("  {p}")));
+        lines.extend(self.retired_env.iter().map(|l| format!("  {}", l.line)));
         write!(f, "{}", lines.join("\n"))
     }
 }
@@ -640,7 +644,8 @@ pub fn preflight(scope: Scope) -> Result<(), PreflightRefusal> {
         .flat_map(crate::config_access::enum_bad_values)
         .collect();
     let files = crate::user_files::config_json_problems();
-    PreflightRefusal { scope, bad, invalid: Vec::new(), files }.into_result()
+    let retired_env = crate::config_access::retired_env_leftovers();
+    PreflightRefusal { scope, bad, invalid: Vec::new(), files, retired_env }.into_result()
 }
 
 /// Look up a registered setting by its dotted key.

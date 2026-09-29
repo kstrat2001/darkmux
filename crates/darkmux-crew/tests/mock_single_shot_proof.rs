@@ -325,10 +325,10 @@ fn container_free_single_shot_dispatch_stamps_mission_id_resolved_from_phase() {
     // OTHER test in this file, both are `#[serial_test::serial]`, so there
     // is no cross-test race on either env var this test mutates.
     let prev_flows_dir = std::env::var("DARKMUX_FLOWS_DIR").ok();
-    let prev_crew_dir = std::env::var("DARKMUX_CREW_DIR").ok();
+    let prev_crew_dir = std::env::var("DARKMUX_HOME").ok();
     unsafe {
         std::env::set_var("DARKMUX_FLOWS_DIR", flows_dir.path());
-        std::env::set_var("DARKMUX_CREW_DIR", crew_dir.path());
+        std::env::set_var("DARKMUX_HOME", crew_dir.path());
     }
 
     let session = darkmux_types::session_id::SessionId::adhoc(
@@ -381,9 +381,9 @@ fn container_free_single_shot_dispatch_stamps_mission_id_resolved_from_phase() {
         unsafe { std::env::remove_var("DARKMUX_FLOWS_DIR") };
     }
     if let Some(prev) = prev_crew_dir {
-        unsafe { std::env::set_var("DARKMUX_CREW_DIR", prev) };
+        unsafe { std::env::set_var("DARKMUX_HOME", prev) };
     } else {
-        unsafe { std::env::remove_var("DARKMUX_CREW_DIR") };
+        unsafe { std::env::remove_var("DARKMUX_HOME") };
     }
 
     let result = result.expect("dispatch_local_single_shot must return Ok — the mock round-trip succeeded");

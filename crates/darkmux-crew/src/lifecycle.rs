@@ -93,9 +93,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 //
 // Loaders + writers go through the helpers below.
 //
-// Test isolation: `crew_root()` honors `DARKMUX_CREW_DIR` (see
-// `crew::loader::crew_root`). Tests should `std::env::set_var(
-// "DARKMUX_CREW_DIR", tmp.path())` and mark themselves
+// Test isolation: `user_state_root()` is the darkmux root (see
+// `crew::loader::user_state_root`). Tests should `std::env::set_var(
+// "DARKMUX_HOME", tmp.path())` and mark themselves
 // `#[serial_test::serial]` since env var mutation isn't thread-safe.
 
 /// Directory holding the mission's JSON and its phases/ subdir.
@@ -1369,7 +1369,7 @@ mod tests {
     /// ([`darkmux_types::test_isolation::IsolatedState`]), which pins
     /// EVERY darkmux write destination under a single throwaway root.
     ///
-    /// It used to pin two variables by hand — `DARKMUX_CREW_DIR` and
+    /// It used to pin two variables by hand — `DARKMUX_HOME` and
     /// `DARKMUX_FLOWS_DIR` — which is the per-variable pattern that
     /// produced this bug class: each guard knows about the destinations
     /// whose leak somebody already noticed and is silent about the rest,
@@ -2365,12 +2365,12 @@ mod path_helper_tests {
 
     fn with_test_root<F: FnOnce(&std::path::Path)>(f: F) {
         let tmp = tempfile::tempdir().unwrap();
-        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
-        std::env::set_var("DARKMUX_CREW_DIR", tmp.path());
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        std::env::set_var("DARKMUX_HOME", tmp.path());
         f(tmp.path());
         match prev {
-            Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-            None => std::env::remove_var("DARKMUX_CREW_DIR"),
+            Some(v) => std::env::set_var("DARKMUX_HOME", v),
+            None => std::env::remove_var("DARKMUX_HOME"),
         }
     }
 
@@ -2449,7 +2449,7 @@ mod task_step_storage_tests {
     /// ([`darkmux_types::test_isolation::IsolatedState`]), which pins
     /// EVERY darkmux write destination under a single throwaway root.
     ///
-    /// It used to pin two variables by hand — `DARKMUX_CREW_DIR` and
+    /// It used to pin two variables by hand — `DARKMUX_HOME` and
     /// `DARKMUX_FLOWS_DIR` — which is the per-variable pattern that
     /// produced this bug class: each guard knows about the destinations
     /// whose leak somebody already noticed and is silent about the rest,

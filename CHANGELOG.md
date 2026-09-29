@@ -157,6 +157,19 @@ darkmux release.
 
 ### Changed (breaking, 4.0)
 
+- **`dirs.crew` and `DARKMUX_CREW_DIR` are removed; `DARKMUX_HOME` is the one
+  relocation.** "Crew" is a retired concept: roles, missions, phases, crews
+  and skills live directly under the darkmux root, and the knob meant two
+  things (the preamble-override directory `<root>/crew`, and the root of
+  that state). `dirs.crew` in `config.json` is an unknown key, refused by
+  the gate, and a set `DARKMUX_CREW_DIR` is refused at every preflight and
+  failed by `darkmux doctor`. The autonomous-dispatch preamble override is now
+  `<root>/AUTONOMOUS_DISPATCH_PREAMBLE.md` (it was `<root>/crew/...`).
+  **Migration:** delete `dirs.crew`, unset `DARKMUX_CREW_DIR`, and if you
+  relocated darkmux with it set `DARKMUX_HOME` instead. `darkmux doctor`'s
+  `beat-33 crew/ layout` row prints the move for a preamble override left
+  under `<root>/crew/`.
+
 - **A project-local `./.darkmux/` is no longer adopted.** The darkmux root is
   `$DARKMUX_HOME` when set, else `~/.darkmux`, and nothing else: a `.darkmux/`
   in the working directory used to become the root for flows, lab runs,
@@ -323,9 +336,9 @@ darkmux release.
   `DARKMUX_REMOTE_MAX_TOKENS_PER_STEP`): a per-step cap on hosted tokens,
   where `dispatch.map` steps naming the same `bucket_group` share one
   allowance. Clean break, no alias: `darkmux config set` refuses the old key
-  naming the new one, the old key is read by nothing, and `darkmux doctor`
-  names a leftover old key in `config.json` or the env with the exact
-  rename. It has no built-in default any more (unset means no cap), and
+  naming the new one, and a leftover old key in `config.json` or old env var
+  is refused at every preflight and failed by `darkmux doctor`, naming the
+  exact rename. It has no built-in default any more (unset means no cap), and
   reaching a cap never stops the step: the new `remote.step_budget_policy`
   (env `DARKMUX_REMOTE_STEP_BUDGET_POLICY`) is `warn` (the default: a CLI
   line and a `budget.warn` flow record, and the step keeps going) or `off`.
@@ -337,8 +350,8 @@ darkmux release.
   means unbounded), where before it refused every hosted call. `init`
   writes both keys visibly as `null`. CONFIG 1.32. **Migration:** a
   `config.json` written by an earlier `init` carries
-  `"max_tokens_per_execution": 500000` in its `remote` block; nothing reads
-  it now, so it no longer caps anything. Delete it, or, to keep a cap, run
+  `"max_tokens_per_execution": 500000` in its `remote` block; darkmux now
+  refuses it. Delete it, or, to keep a cap, run
   `darkmux config set remote.max_tokens_per_step <n>` (and rename an
   exported `DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION`).
 - **Flow actions have one spelling per event** (FLOW 2.0.0). Every action

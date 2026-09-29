@@ -1439,15 +1439,15 @@ mod tests {
         let dir = tmp.path().join("mission-configs");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("broken-config.json"), "{ not json").unwrap();
-        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
-        unsafe { std::env::set_var("DARKMUX_CREW_DIR", tmp.path()) };
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()) };
 
         let rows = build_list();
 
         unsafe {
             match &prev {
-                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-                None => std::env::remove_var("DARKMUX_CREW_DIR"),
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
             }
         }
 

@@ -203,9 +203,7 @@ fn captured_docker_argv_with(
 
     let real_path = std::env::var("PATH").unwrap_or_default();
 
-    // DARKMUX_HOME, never DARKMUX_CREW_DIR — `user_state_root()` resolves
-    // against HOME, and pinning the crew dir instead would defeat this
-    // test's own isolation from the operator's real `~/.darkmux`.
+    // DARKMUX_HOME: `user_state_root()` resolves against it.
     let _home = EnvVarGuard::set("DARKMUX_HOME", &home_dir);
     let _flows = EnvVarGuard::set("DARKMUX_FLOWS_DIR", &flows_dir);
     let _ack = EnvVarGuard::set("DARKMUX_ACK_DIR", &ack_dir);

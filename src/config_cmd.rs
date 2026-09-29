@@ -210,7 +210,6 @@ const KEYS: &[(&str, Ty)] = &[
     ("dirs.flows", Ty::Str),
     ("dirs.audit", Ty::Str),
     ("dirs.skills", Ty::Str),
-    ("dirs.crew", Ty::Str),
     ("dirs.templates", Ty::Str),
     ("dirs.ack", Ty::Str),
     ("dirs.identity", Ty::Str),
@@ -404,6 +403,10 @@ fn set_at(path: &Path, key: &str, value: &str) -> Result<String> {
         bail!(
             "`{key}` was renamed to `{new_key}` in 4.0 (#2902): darkmux config set {new_key} {value}"
         );
+    }
+    // A key an older darkmux read, removed: name what to do instead.
+    if let Some(retired) = darkmux_types::config::RETIRED_SETTINGS.iter().find(|r| r.key == key) {
+        bail!("`{key}`: {}", retired.line);
     }
     // (#2914) The one role id the dynamic map refuses: radio routing runs on
     // the machine's utility model (`internal.utility`), not on a profile, so
@@ -905,7 +908,7 @@ mod tests {
         let p = f.path();
         // flow-action-guard:allow — a retired config key, refused by name
         let err = set_at(p, "radio.router_profile", "radio").unwrap_err().to_string();
-        assert!(err.contains("unknown config key"), "{err}");
+        assert!(err.contains("removed in CONFIG 1.28") && err.contains("internal.utility"), "names the fix: {err}");
         let err = set_at(p, "role_profiles.radio-router", "radio").unwrap_err().to_string();
         assert!(err.contains("utility model") && err.contains("internal.utility"), "names the fix: {err}");
         // (C6) A leftover binding is removed by hand: no `config unset`
@@ -1249,6 +1252,18 @@ mod tests {
                 assert!(preflight(scope).is_ok(), "{}: {scope:?} still refusing after cleanup", s.key);
             }
         }
+    }
+
+    /// `config set` refuses a retired key, naming what replaced it, and writes
+    /// nothing.
+    #[test]
+    fn config_set_refuses_a_retired_key_naming_the_replacement() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, "{}").unwrap();
+        let err = set_at(&path, "dirs.crew", "/x").unwrap_err().to_string();
+        assert!(err.contains("`dirs.crew`") && err.contains("DARKMUX_HOME"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}", "nothing was written");
     }
 
     /// (#2902 step 5) `config set` refuses a renamed budget key, naming the

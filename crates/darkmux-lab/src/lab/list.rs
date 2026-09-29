@@ -203,9 +203,8 @@ mod tests {
             let isolated = darkmux_types::test_isolation::IsolatedState::new();
             // SAFETY: every caller holds `#[serial_test::serial]`.
             unsafe {
-                std::env::set_var("DARKMUX_HOME", dir);
                 // OUTRANKS `DARKMUX_HOME` in `user_state_root()`.
-                std::env::set_var("DARKMUX_CREW_DIR", dir);
+                std::env::set_var("DARKMUX_HOME", dir);
                 // OUTRANKS it in `lab_dir()`, which is what `list_runs`
                 // and `run` actually resolve through.
                 std::env::set_var("DARKMUX_LAB_DIR", dir.join("runs"));

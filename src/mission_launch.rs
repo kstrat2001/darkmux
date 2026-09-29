@@ -5480,11 +5480,11 @@ mod tests {
         fn new() -> Self {
             let tmp_crew = TempDir::new().unwrap();
             let tmp_flows = TempDir::new().unwrap();
-            let prev_crew = env::var("DARKMUX_CREW_DIR").ok();
+            let prev_crew = env::var("DARKMUX_HOME").ok();
             let prev_flows = env::var("DARKMUX_FLOWS_DIR").ok();
             // SAFETY: serialized via #[serial_test::serial] on every caller.
             unsafe {
-                env::set_var("DARKMUX_CREW_DIR", tmp_crew.path());
+                env::set_var("DARKMUX_HOME", tmp_crew.path());
                 env::set_var("DARKMUX_FLOWS_DIR", tmp_flows.path());
             }
             Self { _tmp_crew: tmp_crew, _tmp_flows: tmp_flows, prev_crew, prev_flows }
@@ -5502,8 +5502,8 @@ mod tests {
             // SAFETY: serialized via #[serial_test::serial] on every caller.
             unsafe {
                 match &self.prev_crew {
-                    Some(v) => env::set_var("DARKMUX_CREW_DIR", v),
-                    None => env::remove_var("DARKMUX_CREW_DIR"),
+                    Some(v) => env::set_var("DARKMUX_HOME", v),
+                    None => env::remove_var("DARKMUX_HOME"),
                 }
                 match &self.prev_flows {
                     Some(v) => env::set_var("DARKMUX_FLOWS_DIR", v),

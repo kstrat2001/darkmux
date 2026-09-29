@@ -103,7 +103,7 @@ pub(crate) const BUILTIN_SKILLS: &[(&str, &str)] = &[
 ];
 
 /// Role system prompts (`.md`) compiled into the binary. Used as the
-/// fallback source when no user-side `<crew_root>/roles/<id>.md` exists.
+/// fallback source when no user-side `<root>/roles/<id>.md` exists.
 /// One entry per role advertised in `BUILTIN_ROLES`; the
 /// `crew_role_prompt_coverage` doctor check verifies this invariant.
 pub(crate) const BUILTIN_ROLE_PROMPTS: &[(&str, &str)] = &[
@@ -153,16 +153,20 @@ pub(crate) const BUILTIN_ROLE_PROMPTS: &[(&str, &str)] = &[
 const AUTONOMOUS_DISPATCH_PREAMBLE: &str =
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/AUTONOMOUS_DISPATCH_PREAMBLE.md"));
 
+/// The operator's override of the autonomous-dispatch preamble, a file directly
+/// under the darkmux root.
+pub const PREAMBLE_OVERRIDE_FILE: &str = "AUTONOMOUS_DISPATCH_PREAMBLE.md";
+
 /// (#425) Resolve the autonomous-dispatch preamble — operator-side
-/// override at `<crew_root>/AUTONOMOUS_DISPATCH_PREAMBLE.md` wins
+/// override at `<root>/AUTONOMOUS_DISPATCH_PREAMBLE.md` wins
 /// if present; otherwise the embedded default is returned.
 ///
 /// The override path lets operators tune nudge wording per fleet /
-/// per machine without recompiling. Lives in the crew root rather
+/// per machine without recompiling. Lives in the root rather
 /// than per-role so the preamble stays uniform across the
 /// specialist set.
 pub(crate) fn load_autonomous_dispatch_preamble() -> String {
-    let user_path = crew_root().join("AUTONOMOUS_DISPATCH_PREAMBLE.md");
+    let user_path = user_state_root().join(PREAMBLE_OVERRIDE_FILE);
     if user_path.is_file() {
         if let Ok(content) = fs::read_to_string(&user_path) {
             return content;
@@ -190,35 +194,11 @@ const BUILTIN_MISSIONS: &[(&str, &str)] = &[];
 /// Phases compiled into the binary at build time.
 const BUILTIN_PHASES: &[(&str, &str)] = &[];
 
-/// The user-side crew root: `DARKMUX_CREW_DIR` if set, else `<paths.crew>`
-/// from the active workspace. Its one reader is the operator's
-/// autonomous-dispatch preamble override. User state (roles, missions,
-/// phases, crews, skills) lives under [`user_state_root`], never here.
-pub(crate) fn crew_root() -> PathBuf {
-    // env(DARKMUX_CREW_DIR) > config.dirs.crew > <root>/crew (#661 Slice 3).
-    // (#1012) ForceUser, NOT Auto: crew manifests are operator/fleet-level state.
-    // Auto flipped to PROJECT scope the moment a bare `<cwd>/.darkmux/` existed
-    // (e.g. created by repo-tier `memory lesson add` or lab runs), silently shadowing
-    // the operator's user-scope crew/missions. DARKMUX_HOME + the explicit
-    // override above still win; only the default no longer hijacks on a stray dir.
-    darkmux_types::config_access::crew_dir_override()
-        .unwrap_or_else(|| resolve(ResolveScope::ForceUser).crew)
-}
-
-/// User-state root for the post-Beat-33 flattened layout. Returns
-/// `DARKMUX_CREW_DIR` if set (operator override; unchanged semantics —
-/// the env var points at the directory CONTAINING the subdirs, with no
-/// `crew/` nesting), otherwise `<paths.root>` (e.g., `~/.darkmux/`).
+/// The user-state root: the darkmux root itself (`DARKMUX_HOME` when set,
+/// else `~/.darkmux`). Roles, missions, phases, crews and skills live
+/// directly under it.
 pub fn user_state_root() -> PathBuf {
-    // Same override as crew_root, but the no-override default is the bare root
-    // (no `crew/` nesting). env(DARKMUX_CREW_DIR) > config.dirs.crew > <root>.
-    // (#1012) ForceUser, NOT Auto — missions/phases are operator-level work
-    // tracking (the operator's board lives in ~/.darkmux), never a project's
-    // stray `.darkmux/`. Auto made them VANISH from the CLI + viewer the moment
-    // a repo got a bare `.darkmux/` (from `memory lesson add` / lab runs). DARKMUX_HOME
-    // and the explicit override still win.
-    darkmux_types::config_access::crew_dir_override()
-        .unwrap_or_else(|| resolve(ResolveScope::ForceUser).root)
+    resolve(ResolveScope::ForceUser).root
 }
 
 /// A user-state subdirectory: `<root>/<subdir>/`. The pre-Beat-33
@@ -289,8 +269,7 @@ pub(crate) fn skills_dir() -> PathBuf {
 /// User-side mission-configs directory (#1284 Packet 1) — the top tier of
 /// `mission_config::load`'s user → on-disk → embedded resolution, mirroring
 /// `workloads::load`'s search order. `<root>/mission-configs/`, honoring the
-/// SAME `env(DARKMUX_CREW_DIR) > config.dirs.crew` override every other
-/// crew-state dir does (`user_state_root`'s doc). No legacy-layout fallback
+/// SAME root every other user-state dir does (`user_state_root`). No legacy-layout fallback
 /// — mission configs postdate the Beat-33 flatten, so there's no
 /// `<root>/crew/mission-configs/` to have ever existed (per the "no compat
 /// baggage pre-1.0" doctrine — nothing to be compatible WITH here).
@@ -299,7 +278,7 @@ pub fn mission_configs_dir() -> PathBuf {
 }
 
 /// Resolve a role's system-prompt text. Search order:
-///   1. User dir: `<crew_root>/roles/<role-id>.md` (operator override)
+///   1. User dir: `<root>/roles/<role-id>.md` (operator override)
 ///   2. Embedded `BUILTIN_ROLE_PROMPTS` (binary-bundled defaults)
 ///
 /// Returns the prompt content if found, `None` if neither source has a
@@ -322,7 +301,7 @@ pub(crate) fn load_role_prompt(role_id: &str) -> Option<String> {
 
 /// (#1550 cluster item 3) Resolve a role's system-prompt text, honoring an
 /// explicit `Role.prompt_path` FIRST — before falling to the conventional
-/// search [`load_role_prompt`] performs (sibling `<crew_root>/roles/<id>.md`,
+/// search [`load_role_prompt`] performs (sibling `<root>/roles/<id>.md`,
 /// then the embedded table).
 ///
 /// Before this, `prompt_path` was preserved from a user manifest (see
@@ -373,7 +352,7 @@ pub(crate) fn load_role_prompt_for(role: &Role) -> Option<String> {
 /// — so it needs the raw
 /// system-prompt text itself rather than a full role dispatch, and
 /// `load_role_prompt` is `pub(crate)`, invisible outside this crate.
-/// Same search order: user override (`<crew_root>/roles/<id>.md`), then
+/// Same search order: user override (`<root>/roles/<id>.md`), then
 /// the embedded `BUILTIN_ROLE_PROMPTS`.
 pub fn role_prompt(role_id: &str) -> Option<String> {
     load_role_prompt(role_id)
@@ -494,10 +473,8 @@ pub(crate) fn builtin_role(id: &str) -> Result<Option<Role>> {
 
 /// Load all roles from the user dir, falling back to built-in templates.
 ///
-/// `DARKMUX_CREW_DIR` overrides the crew root — useful for tests and
-/// non-standard layouts. (The Phase A Era env var was `DARKMUX_CREW_DIR`;
-/// renamed for the Crew doctrine + to fix the typo. Anyone who set the old
-/// one needs to update.)
+/// `DARKMUX_HOME` relocates the root — useful for tests and non-standard
+/// layouts.
 pub fn load_roles() -> Result<Vec<Role>> {
     let roles_dir = roles_dir();
 
@@ -621,9 +598,9 @@ pub(crate) fn load_crews() -> Result<Vec<Crew>> {
 
 /// Load all missions from the per-mission nested layout.
 ///
-/// Walks `<crew_root>/missions/` and for each **subdirectory** containing a
+/// Walks `<root>/missions/` and for each **subdirectory** containing a
 /// `mission.json`, deserializes it. A plain file directly under
-/// `<crew_root>/missions/` is not a mission and is skipped here;
+/// `<root>/missions/` is not a mission and is skipped here;
 /// `darkmux doctor` fails on a pre-#148 flat `<id>.json` so the skip is
 /// never silent.
 ///
@@ -676,9 +653,9 @@ pub fn load_missions() -> Result<Vec<Mission>> {
 
 /// Load all phases from the new per-mission nested layout.
 ///
-/// Walks every `<crew_root>/missions/<mission-id>/phases/*.json`.  The
+/// Walks every `<root>/missions/<mission-id>/phases/*.json`.  The
 /// Phase JSON already carries `mission_id`, so no inference from the dir
-/// name is needed.  Legacy flat phase files under `<crew_root>/phases/`
+/// name is needed.  Legacy flat phase files under `<root>/phases/`
 /// are silently ignored — the migration verb is the bridge.
 pub fn load_phases() -> Result<Vec<Phase>> {
     use crate::lifecycle;

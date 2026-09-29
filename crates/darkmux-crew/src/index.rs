@@ -1200,7 +1200,7 @@ mod tests {
     use std::env;
     use tempfile::TempDir;
 
-    /// RAII guard: point DARKMUX_CREW_DIR at a TempDir for the test's
+    /// RAII guard: point DARKMUX_HOME at a TempDir for the test's
     /// lifetime. Mirrors the loader's pattern; serialized via #[serial].
     ///
     /// (#994) Also isolates DARKMUX_FLOWS_DIR to an (initially absent) subdir of
@@ -1218,10 +1218,10 @@ mod tests {
     impl CrewDirGuard {
         fn new() -> Self {
             let tmp = TempDir::new().unwrap();
-            let prev_crew = env::var("DARKMUX_CREW_DIR").ok();
+            let prev_crew = env::var("DARKMUX_HOME").ok();
             let prev_flows = env::var("DARKMUX_FLOWS_DIR").ok();
             unsafe {
-                env::set_var("DARKMUX_CREW_DIR", tmp.path());
+                env::set_var("DARKMUX_HOME", tmp.path());
                 env::set_var("DARKMUX_FLOWS_DIR", tmp.path().join("flows"));
             }
             Self { prev_crew, prev_flows, tmp }
@@ -1243,8 +1243,8 @@ mod tests {
         fn drop(&mut self) {
             unsafe {
                 match &self.prev_crew {
-                    Some(v) => env::set_var("DARKMUX_CREW_DIR", v),
-                    None => env::remove_var("DARKMUX_CREW_DIR"),
+                    Some(v) => env::set_var("DARKMUX_HOME", v),
+                    None => env::remove_var("DARKMUX_HOME"),
                 }
                 match &self.prev_flows {
                     Some(v) => env::set_var("DARKMUX_FLOWS_DIR", v),

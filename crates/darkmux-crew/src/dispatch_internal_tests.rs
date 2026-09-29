@@ -2719,8 +2719,8 @@
     /// uses), with a real on-disk phase resolving to a real mission, and
     /// reads back every flow record it actually wrote to disk.
     ///
-    /// Isolates `DARKMUX_HOME` (config.json / remote-budget resolution),
-    /// `DARKMUX_CREW_DIR` (phase lookup) and `DARKMUX_FLOWS_DIR` (record
+    /// Isolates `DARKMUX_HOME` (config.json / remote-budget resolution and phase
+    /// lookup) and `DARKMUX_FLOWS_DIR` (record
     /// readback) so this never touches the operator's real `~/.darkmux`.
     #[test]
     #[serial]
@@ -2729,7 +2729,6 @@
             r#"{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
         );
 
-        let home = TempDir::new().unwrap();
         let crew_dir = TempDir::new().unwrap();
         let flows_dir = TempDir::new().unwrap();
 
@@ -2746,11 +2745,9 @@
         .unwrap();
 
         let prev_home = std::env::var("DARKMUX_HOME").ok();
-        let prev_crew = std::env::var("DARKMUX_CREW_DIR").ok();
         let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
         unsafe {
-            std::env::set_var("DARKMUX_HOME", home.path());
-            std::env::set_var("DARKMUX_CREW_DIR", crew_dir.path());
+            std::env::set_var("DARKMUX_HOME", crew_dir.path());
             std::env::set_var("DARKMUX_FLOWS_DIR", flows_dir.path());
         }
 
@@ -2777,10 +2774,6 @@
             match prev_home {
                 Some(v) => std::env::set_var("DARKMUX_HOME", v),
                 None => std::env::remove_var("DARKMUX_HOME"),
-            }
-            match prev_crew {
-                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-                None => std::env::remove_var("DARKMUX_CREW_DIR"),
             }
             match prev_flows {
                 Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
@@ -2824,7 +2817,6 @@
     #[test]
     #[serial]
     fn dispatch_remote_scopes_a_config_derived_session_id_by_mission_so_two_missions_diverge() {
-        let home = TempDir::new().unwrap();
         let crew_dir = TempDir::new().unwrap();
         let flows_dir = TempDir::new().unwrap();
 
@@ -2841,11 +2833,9 @@
         }
 
         let prev_home = std::env::var("DARKMUX_HOME").ok();
-        let prev_crew = std::env::var("DARKMUX_CREW_DIR").ok();
         let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
         unsafe {
-            std::env::set_var("DARKMUX_HOME", home.path());
-            std::env::set_var("DARKMUX_CREW_DIR", crew_dir.path());
+            std::env::set_var("DARKMUX_HOME", crew_dir.path());
             std::env::set_var("DARKMUX_FLOWS_DIR", flows_dir.path());
         }
 
@@ -2882,10 +2872,6 @@
             match prev_home {
                 Some(v) => std::env::set_var("DARKMUX_HOME", v),
                 None => std::env::remove_var("DARKMUX_HOME"),
-            }
-            match prev_crew {
-                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-                None => std::env::remove_var("DARKMUX_CREW_DIR"),
             }
             match prev_flows {
                 Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
