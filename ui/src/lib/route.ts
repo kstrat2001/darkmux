@@ -344,6 +344,16 @@ function hashParams(): URLSearchParams {
   return new URLSearchParams((location.hash || "").replace(/^#/, ""));
 }
 
+/** A retired link must not silently open some other view. `session=`
+ * (anywhere) and `uid=` on the machine lens land on the unknown-route page,
+ * and the value they carried is withheld from it: a session id is internal,
+ * and a uid is hardware identity. */
+function retiredLink(lens: string, get: (name: string) => string): Route | null {
+  if (get("session")) return { kind: "unknown", hash: "session=(retired, value withheld)" };
+  if (lens === "machine" && get("uid")) return { kind: "unknown", hash: "lens=machine&uid=(retired, value withheld)" };
+  return null;
+}
+
 /** Parse the CURRENT `location.hash` into a [[Route]]. Pure function of
  * `location.hash` (and, matching the legacy grammar, `location.search` as a
  * fallback source for the same param names) — call it fresh on every
@@ -363,10 +373,8 @@ export function parseRoute(): Route {
   // invention.
   const lens = get("lens").toLowerCase();
 
-  // A retired `session=` link must not silently open the default view, or a
-  // different route the hash also names. The unknown-route page shows this
-  // hash, so the id it carried is withheld like the retired `uid=` value.
-  if (get("session")) return { kind: "unknown", hash: "session=(retired, value withheld)" };
+  const retired = retiredLink(lens, get);
+  if (retired) return retired;
 
   // (#1920) `fleet` is the bare-root default (no hash at all falls
   // through to `{kind:"fleet"}` at the bottom of this function) but had no
@@ -394,10 +402,6 @@ export function parseRoute(): Route {
   }
 
   if (lens === "machine") {
-    // A retired `uid=` link must not silently open the local machine. The
-    // unknown-route page shows this hash, and the old value is a hardware
-    // uid, so the hash it names is the redacted spelling, never the raw one.
-    if (get("uid")) return { kind: "unknown", hash: "lens=machine&uid=(retired, value withheld)" };
     const machine = get("machine");
     return { kind: "machine", machine: machine ? machine : null };
   }
