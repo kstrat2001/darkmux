@@ -1,5 +1,71 @@
 # darkmux design notes
 
+This document is the **why**: how darkmux is built, the decisions behind the shape, and the measurements that forced them. It is written against the code at the 5.0.0 release. Where a section names a symbol, a test or a golden file, that is where to check the claim, and where a claim is a known gap or an unmeasured guess, the section says so. History is kept only where it still explains the code; the record of what changed release to release is [`CHANGELOG.md`](CHANGELOG.md), and the doctrine that binds every change is [`CLAUDE.md`](CLAUDE.md).
+
+**Versions.** darkmux ships as 5.0.0, and the numbers that matter for compatibility are the data shapes' own: the flow schema (`FLOW_SCHEMA_VERSION`), the config and profile registry schemas (`CONFIG_SCHEMA_VERSION`, `PROFILES_SCHEMA_VERSION`), the mission config schema (`MISSION_CONFIG_SCHEMA`) and the fleet work wire (`WORK_JOB_SCHEMA_VERSION`). Each changes by its own semver rules (contract 5). The daemon's HTTP routes and every verb's `--json` output are semver-bound to the binary, and each is pinned by a golden file.
+
+**What this is and how it got here**
+
+- [What darkmux is](#what-darkmux-is)
+- [What darkmux is NOT](#what-darkmux-is-not)
+- [How it got here: the evolution](#how-it-got-here-the-evolution)
+- [How we decide](#how-we-decide)
+
+**Vocabulary and identity**
+
+- [Work units: the ladder and its words](#work-units-the-ladder-and-its-words)
+- [Identities: runs, sessions and executions](#identities-runs-sessions-and-executions)
+- [The flow vocabulary: one closed list, one spelling per event](#the-flow-vocabulary-one-closed-list-one-spelling-per-event)
+- [One reader, and the legacy mapping](#one-reader-and-the-legacy-mapping)
+- [Typed flow payloads](#typed-flow-payloads)
+- [Two logs: the flow stream and the trajectory](#two-logs-the-flow-stream-and-the-trajectory)
+- [One token truth](#one-token-truth)
+
+**Configuration and the user's files**
+
+- [Configuration: visible defaults, gated features, secret carve-outs](#configuration-visible-defaults-gated-features-secret-carve-outs)
+- [User files: the unknown-key gate and enum settings](#user-files-the-unknown-key-gate-and-enum-settings)
+- [Endpoints: what darkmux does there, not where they are](#endpoints-what-darkmux-does-there-not-where-they-are)
+- [Endpoint budgets](#endpoint-budgets)
+- [The utility model and lean utility jobs](#the-utility-model-and-lean-utility-jobs)
+- [Public surfaces: the daemon's HTTP routes are a contract](#public-surfaces-the-daemons-http-routes-are-a-contract)
+- [CLI `--json` is a contract](#cli---json-is-a-contract)
+
+**The runtime**
+
+- [Schema isolation: darkmux owns its own config](#schema-isolation-darkmux-owns-its-own-config)
+- [Scope of the internal runtime: workflow-fit, not feature creep](#scope-of-the-internal-runtime-workflow-fit-not-feature-creep)
+- [Compaction: tiers, structured slots, and graceful degradation](#compaction-tiers-structured-slots-and-graceful-degradation)
+- [Runtime resilience: struggle detection + feedback injection](#runtime-resilience-struggle-detection--feedback-injection)
+- [The check-in: observing a stream instead of truncating it](#the-check-in-observing-a-stream-instead-of-truncating-it)
+- [Lab reproducibility: fixtures + content hashing](#lab-reproducibility-fixtures--content-hashing)
+
+**Running a mission**
+
+- [Seat classes: every step says what it consumes](#seat-classes-every-step-says-what-it-consumes)
+- [Phase status: a set of tasks is not one unit of work](#phase-status-a-set-of-tasks-is-not-one-unit-of-work)
+- [The command gate: darkmux runs your shell-outs, not its own](#the-command-gate-darkmux-runs-your-shell-outs-not-its-own)
+- [Mission configs](#mission-configs)
+- [The shared run lifecycle](#the-shared-run-lifecycle)
+- [Crawl as a mission: the shapes and how data flows between them](#crawl-as-a-mission-the-shapes-and-how-data-flows-between-them)
+- [Findings and mods: what was observed, and how it could change](#findings-and-mods-what-was-observed-and-how-it-could-change)
+- [Code review as a second config on the crawl's building blocks](#code-review-as-a-second-config-on-the-crawls-building-blocks)
+
+**Many machines**
+
+- [Multi-machine substrate](#multi-machine-substrate)
+- [Hooks: how records leave the machine, and who is allowed to hold a credential](#hooks-how-records-leave-the-machine-and-who-is-allowed-to-hold-a-credential)
+
+**Editors and the terminal**
+
+- [ACP: darkmux inside the editor](#acp-darkmux-inside-the-editor)
+- [Radio: free text onto one command, and a confirmation before it runs](#radio-free-text-onto-one-command-and-a-confirmation-before-it-runs)
+
+**Keeping it true**
+
+- [Guardrails: what CI holds so the design stays true](#guardrails-what-ci-holds-so-the-design-stays-true)
+- [Composability](#composability)
+
 ## What darkmux is
 
 darkmux is an **AI-first orchestrator for local LLMs**. It does three things, and the notes below trace how each one earned its place:
@@ -10,7 +76,15 @@ darkmux is an **AI-first orchestrator for local LLMs**. It does three things, an
 
 The through-line is the doctrine in [`CLAUDE.md`](CLAUDE.md): *optimization, not replacement; the harness before the model; the operator always in the loop with full provenance.* darkmux uses local AI to manage your local AI.
 
-This document is the **why**: the decisions, and the data behind them. darkmux's architecture wasn't designed up front; it was **measured into existence**. Nearly every section names the lab run, dogfood, or research finding that drove the choice, because [that's how we decide](#how-we-decide).
+darkmux's architecture wasn't designed up front; it was **measured into existence**. Nearly every section names the lab run, dogfood, or research finding that drove the choice, because [that's how we decide](#how-we-decide).
+
+## What darkmux is NOT
+
+- Not a model-swap optimizer (LMStudio handles the actual load; we orchestrate).
+- Not an inference framework (vLLM/SGLang have that covered).
+- Not an agent framework (LangChain/AutoGen have that covered).
+- Not a prompt router across cloud providers (LiteLLM has that covered, and it's cloud-oriented).
+- Not *designed* for multi-tenant deployment. **darkmux is single-operator, multi-machine.** A hobbyist or individual engineer's "few Macs joined over a mesh VPN" is the natural deployment shape. The trust boundary is the operator-controlled tailnet, plus one authenticated path: running work on another machine needs the fleet token, a network-verified sender and an allow-list entry, and is denied by default ([Fleet](#fleet-addresses-trust-and-the-execution-channel)). Everything else rests on the tailnet and the operator's own assertions: `DARKMUX_REDIS_URL` carries no auth beyond what the underlying mesh and Redis ACLs already provide; `DARKMUX_MACHINE_ID` is operator-asserted provenance, not authenticated identity; reads of the daemon are open to the tailnet unless `serve.read_auth` is on ([Read auth and execution auth](#read-auth-and-execution-auth)); cross-machine state on the shared substrate assumes all participants are the same operator. Fork-friendly if multi-tenant matters to you: the substrate is a reasonable starting point, and the missing pieces (per-user identity, ACLs on reads, fairness across distrusting users) are well-trodden elsewhere.
 
 ## How it got here: the evolution
 
@@ -34,7 +108,7 @@ That inverted the priority order and gave darkmux a reason to exist beyond swapp
 
 ### Compaction: the biggest lever, measured
 
-Of all the harness knobs, **compaction had the largest measured wall-clock impact**, so it earned the most defensive engineering. The data pointed somewhere specific: a small, dedicated compactor at a modest context (~68K) cut wall-clock substantially versus reusing a large all-purpose model, and the `default` strategy beat the more conservative `safeguard` one for local models. Those aren't taste; they're [measured defaults](#compaction-tiers-structured-slots-and-graceful-degradation), and the anti-patterns doc warns against deviating from them without naming the empirical reason.
+Of all the harness knobs, **compaction had the largest measured wall-clock impact**, so it earned the most defensive engineering. The data pointed somewhere specific: a small, dedicated compactor at a modest context (~68K) cut wall-clock substantially versus reusing a large all-purpose model, and the `default` strategy beat the more conservative `safeguard` one for local models (the two modes of the runtime darkmux replaced). Those aren't taste; they're [measured defaults](#compaction-tiers-structured-slots-and-graceful-degradation), the small dedicated compactor is why compaction runs on [the machine's one utility model](#the-utility-model-and-lean-utility-jobs), and the anti-patterns doc warns against deviating from them without naming the empirical reason.
 
 The deeper bet, that **a small model fills labeled slots more reliably than it writes good prose**, produced structured-slot compaction. [That section](#compaction-tiers-structured-slots-and-graceful-degradation) is the template for how darkmux decisions get made: a hypothesis, a measurement, a typed design that degrades gracefully instead of failing.
 
@@ -44,7 +118,7 @@ Choosing which local model fills a role isn't preference, it's a [documented hea
 
 ### The internal runtime: owning the loop
 
-Early dispatch shelled out to an external agent runtime (openclaw). darkmux now ships its **own** container-bounded runtime: a Rust agent loop in a per-dispatch Docker container. Owning the loop is what makes everything downstream possible: kernel-enforced workspace isolation, a trajectory format darkmux fully controls, and telemetry emitted straight into the flow stream rather than scraped back out of someone else's logs. The openclaw shell-out path stayed first-class for a while as an opt-in alternative, but was removed on the 2.0 track ([#1405](https://github.com/kstrat2001/darkmux/issues/1405)) to keep the build and test surface small; the internal runtime is now the only dispatch path. The filter for what the internal runtime *adds* is [workflow-fit, not feature creep](#scope-of-the-internal-runtime-workflow-fit-not-feature-creep), a principle that outlived the comparison it was coined for.
+Early dispatch shelled out to an external agent runtime (openclaw), through the 0.x line an opt-in alternative to darkmux's own. darkmux now ships its **own** container-bounded runtime: a Rust agent loop in a per-dispatch Docker container. Owning the loop is what makes everything downstream possible: kernel-enforced workspace isolation, a trajectory format darkmux fully controls ([Two logs](#two-logs-the-flow-stream-and-the-trajectory)), and telemetry emitted straight into the flow stream rather than scraped back out of someone else's logs. The shell-out path was removed on the 2.0 track ([#1405](https://github.com/kstrat2001/darkmux/issues/1405)) to keep the build and test surface small; the internal runtime is the only dispatch path. Two things outlived the comparison: the filter for what the runtime *adds*, [workflow-fit, not feature creep](#scope-of-the-internal-runtime-workflow-fit-not-feature-creep), and [schema isolation](#schema-isolation-darkmux-owns-its-own-config).
 
 ### The dispatch-to-PR loop: the defining capability
 
@@ -57,410 +131,111 @@ mission launch coder-phase → coder → fresh-context review → fix → fronti
 This is what the [M4 roadmap charter](docs/roadmap/M4.md) hardens, and it's grounded in both research and dogfood: failures we *measured*, then found the literature that explained them.
 
 - **Verification has to be real.** A production dogfood surfaced a *fabricated* sign-off: a coder reported a type-check "passed" when the slim sandbox couldn't actually run the project's toolchain, and a separate run reported the same failure honestly, so the fabrication was **nondeterministic**. You can't trust self-reporting to catch it. The fix: the runtime stamps the dispatch envelope when a verifier didn't run, so a claimed sign-off is mechanically contradicted ([#799](https://github.com/kstrat2001/darkmux/issues/799)). Process-reward-model research confirms step-wise verification catches the *silent errors* outcome-only checks miss ([arXiv 2604.24198](https://arxiv.org/abs/2604.24198)).
-- **Self-review is mostly confirmatory.** At one gate a coder's full test suite + linter were *all green on its own broken work*; only a *fresh-context* review caught the regressions. The Self-Verification Dilemma ([arXiv 2602.03485](https://arxiv.org/abs/2602.03485)) measures exactly this: re-checking in your own context entrenches the original answer, while cross-context *re-thinking* corrects it. So the reviewer runs in a fresh context, and escalation is becoming codified loop policy ([#849](https://github.com/kstrat2001/darkmux/issues/849)).
+- **Self-review is mostly confirmatory.** At one gate a coder's full test suite + linter were *all green on its own broken work*; only a *fresh-context* review caught the regressions. The Self-Verification Dilemma ([arXiv 2602.03485](https://arxiv.org/abs/2602.03485)) measures exactly this: re-checking in your own context entrenches the original answer, while cross-context *re-thinking* corrects it. So the reviewer runs in a fresh context, and escalation is codified loop policy ([#849](https://github.com/kstrat2001/darkmux/issues/849)).
 - **A wrong, confident diagnosis is worse than none.** A lab run caught a reviewer verdict that *sounded* authoritative but was wrong; it sent the next coder in circles for 600 seconds, zero net progress, then a watchdog timeout. The fix: detect the no-progress signature and escalate instead of looping ([#453](https://github.com/kstrat2001/darkmux/issues/453)).
 
 darkmux drives this loop on **real production work** (the production services of a private fintech engagement) and on darkmux itself. The recursive case is the strongest evidence: darkmux's own observability features were built *through* `mission launch`, so the data those features visualize is the data the loop produced while building them. One self-building phase ran 106 turns and ~5.2M prompt tokens with **zero compactions** (context peaked near 70K of a 262K window), which retired a standing question by turning it into a measurement: on a window that large the compaction threshold is a *cost* knob, not a correctness one.
 
 ### Observability: from a telemetry sketch to a unified stream
 
-The original observability idea was a per-request telemetry hook: useful, but bolted on. It became something better: a **single typed flow stream** every dispatch emits into (tokens, context occupancy, detector firings, runtime events), read by one daemon and one drill-down viewer ([#557](https://github.com/kstrat2001/darkmux/issues/557)). The token view is the payoff, splitting the fleet's usage into **local tokens** (your hardware, no API bill) and **cloud tokens** (the paid endpoint you chose; [#1186](https://github.com/kstrat2001/darkmux/issues/1186)). **Tokens only, never currency, on either tier**: claiming to save or cost another person money is a liability we don't take on; the operator multiplies by their own rate. A dogfood day's data taught its own lesson, that the bulk of a long dispatch's tokens are *re-read* context, not generated output, which is itself a compaction-design input.
+The original observability idea was a per-request telemetry hook: useful, but bolted on. It became something better: a **single typed flow stream** every dispatch emits into (tokens, context occupancy, detector firings, runtime events), read by one daemon and one drill-down viewer ([#557](https://github.com/kstrat2001/darkmux/issues/557)). The stream is one closed vocabulary through one reader ([The flow vocabulary](#the-flow-vocabulary-one-closed-list-one-spelling-per-event)), and it is separate from each execution's own trajectory. The token view is the payoff: usage is one record per model call, summed and split by the endpoint and model darkmux invoked, never by a local-or-cloud label ([One token truth](#one-token-truth)). **Tokens only, never currency**: claiming to save or cost another person money is a liability we don't take on; the operator multiplies by their own rate. A dogfood day's data taught its own lesson, that the bulk of a long dispatch's tokens are *re-read* context, not generated output, which is itself a compaction-design input.
 
 ### Fleet: many machines become one
 
-The multi-machine substrate (the v0.4 line, current) lets a single operator's couple of Macs over a tailnet function as one development environment, [detailed below](#multi-machine-substrate). The design target is deliberately **heterogeneous**: a high-memory laptop as the inference peer, a smaller always-on machine as the hub. That heterogeneity is the white space. Nearly all distributed-agent research assumes cloud or homogeneous hardware, so a heterogeneous local fleet of Apple-Silicon Macs is darkmux's to define rather than follow (see the [roadmap](ROADMAP.md)).
+The multi-machine substrate lets a single operator's couple of Macs over a tailnet function as one development environment, [detailed below](#multi-machine-substrate), with an authenticated channel for running a dispatch on another machine. The design target is deliberately **heterogeneous**: a high-memory laptop as the inference peer, a smaller always-on machine as the hub. That heterogeneity is the white space. Nearly all distributed-agent research assumes cloud or homogeneous hardware, so a heterogeneous local fleet of Apple-Silicon Macs is darkmux's to define rather than follow (see the [roadmap](ROADMAP.md)).
+
+## How we decide
+
+darkmux's design decisions are **grounded in data and in published research where it exists**: we'd rather cite a measurement or a paper than assert from intuition. The framing is *convergence, not priority*: independent research and this project keep arriving at the same architecture (fresh-context review, verifiable-check termination, structured compaction), and the citations explain *why* it works. See the roadmap's [*How we decide*](ROADMAP.md#how-we-decide) for the citation-verification discipline (every cited source re-fetched and confirmed; a confident citation under a correctly-recalled label is exactly where fabrication hides).
+
+The data comes from three places, and the lab notebook captures the *evidence* behind each call so the reasoning survives even when the underlying work is private:
+
+- **Lab runs**: reproducible workloads against registered fixtures, with content-hash proof that two runs started and ended in the same state. This is where harness hypotheses get tested one variable at a time (baseline → single change → re-measure → compare → record).
+- **Bake-offs**: documented per-hardware-tier model comparisons with criteria fixed before the runs.
+- **Dogfood**: darkmux run against real work, including darkmux building itself through `mission launch` and a private fintech engagement's production services. The failure modes those runs surface (a fabricated sign-off, a confidently-wrong review, a doom loop) are the specs for the next hardening pass. The *data* is what's load-bearing; the sensitive work behind it never has to appear here.
+
+When a decision can't point to a measurement, a citation, or a dogfood observation, that's a flag, not a reason to ship it on intuition.
 
 ---
 
 The rest of this document is **reference**: how the current architecture works, section by section. The decisions above are why it's shaped this way.
 
-## Multi-machine substrate
+## Work units: the ladder and its words
 
-Single-operator multi-machine is the design target. The operator owns a couple of Macs on a tailnet they control; darkmux makes them function as one development environment without becoming team tooling.
-
-**Architecture** (current):
-
-- **Observability substrate**: Redis Streams via `RedisSink` (opt-in via `DARKMUX_REDIS_URL`):
-  - `darkmux:flow`: fleet-wide event log. Every machine's `TeeSink` includes a `RedisSink` leg; `XADD` per record. Read by the daemon's `/flow/<date>` endpoint for the decentralized topology UI.
-- **Audit substrate**: `AuditFileSink` (opt-in via `DARKMUX_AUDIT_DIR`). BLAKE3-chained, `flock(2)`-serialized, per-machine per-day. `darkmux flow integrity-check` walks the chain and exits 2 on a break, so cron/CI can flag tampering. Composes with the casual `LocalFileSink` via `TeeSink`.
-- **Provenance fields** (FlowRecord schema 1.14.0): `machine_id`, `orchestrator`, per-turn `telemetry.tokens`. All operator-asserted (env-stamped); no authenticated identity. (The pre-1.4.0 `machine_tier` field was removed when machine-capacity tier stopped routing work; see [#590](https://github.com/kstrat2001/darkmux/issues/590).)
-- **Machine-to-machine work submission** ([#2916](https://github.com/kstrat2001/darkmux/issues/2916), stage 1; replaced the #590 `darkmux:work` Redis queue, which could not say who wrote an entry and which every peer could write). `darkmux dispatch <role> --profile <profile>@<machine>` (stage 2; the `--machine` flag of stage 1 is gone) POSTs the job to that machine's fleet listener: a second daemon listener bound only to the address the identity provider reports for the machine (never `0.0.0.0`, loopback, or a `tailscale serve` front, which would make every caller arrive as loopback). The receiver runs it only when BOTH hold: the request carries the fleet token (the #881 serve token, one shared secret), AND the provider (`fleet.identity.provider`, a value: `"tailscale"`, via `whois` on the connection's peer address) names a node on the receiver's allow-list (`fleet.accept_work.<machine>`, whose `node_id` `darkmux machine trust` resolves, never typed). Then the job must fit that entry's scope: the RESOLVED profile is one it lists and is not utility-only (#2914), a `workdir` needs `workspace` (#755). Deny by default, fail closed (no identity answer = refused), busy decided per seat (stage 2: one job per local model, hosted jobs up to the receiver's `remote.concurrent_cap`; past that `fleet.busy_policy` refuses at once or queues, and a waiting sender reads `queued` lines on the same connection), every refusal answered at once with its reason. The token is checked before the allow-list is read or the provider runs, so a caller without it never makes the receiver spawn anything; its connection still costs a slot, so the listener serves at most 32 connections at once (one more is closed on accept), gives each 10 s to send its headers, and the daemon raises its open-file limit at start, so a flood of half-sent requests cannot starve the viewer port of descriptors (#2916 review M1). The entry also scopes roles (explicit, utility refused) and images (darkmux's runtime unless listed); a submitted job runs with the receiver's own session (a relay of the sender's, `SessionKind::Relay`, in a standalone run so it is never one of the receiver's missions) and never mounts the shared toolchain cache. The SENDER verifies the receiver before the token leaves: the roster address must resolve to a tailnet node, pinned per roster entry, and remote output is stripped of control characters. Machine names compare ASCII case-insensitively. No lookup cache (~25 ms per call, measured), so `untrust` or a node leaving the tailnet takes effect on the next request; the allow-list is read from `config.json` per request for the same reason. `machine_uid` is never an input. A routed dispatch still emits a `dispatch.route` flow record (`target_machine` + `decision`, plus `profile_address` since stage 2), and never a token count: the machine that runs the model counts tokens. Stage 2 splits a `profile@machine` address on the sender (`darkmux_types::profile_address`, one parser for every consumer) and sends the owner's bare profile name; the owner is the only judge of it (`classify_profile`), and a local-only resolver refuses an address rather than reading it as an undefined name that would fall to `default_profile`.
-- **Per-machine introspection**: `GET /machine/specs` returns version, machine_id, RAM total/free, CPU brand, OS, loaded models from `lms ps`, redacted Redis URL. Consumed by `darkmux machine list --deep` (HTTP fan-out across reachable peers).
-- **Daemon resilience**: the SSE Redis tail at `GET /flow/<date>/stream` is bounded. Connect wedges bounded by `REDIS_CONNECT_TIMEOUT`, persistent failures exit cleanly via a synthetic `stream.error` record, and the producer→consumer channel is capped with drop-newest semantics. Concurrent SSE streams are capped and per-route requests are timed out, so a misbehaving viewer tab can't exhaust the daemon. Reads and execution are authorized separately ([#881](https://github.com/kstrat2001/darkmux/issues/881), [#2988](https://github.com/kstrat2001/darkmux/issues/2988)): fleet work always needs the bearer token (Keychain-stored) plus a network-verified sender; reads need it only when `serve.read_auth` is on, and then only a request from this machine stays open (a loopback peer with no reverse-proxy header, so a peer arriving through `tailscale serve` needs the token). A non-loopback bind requires read auth on.
-- **CORS posture**: default deny-all — no origin, `null` included, is allowed until named ([#2155](https://github.com/kstrat2001/darkmux/issues/2155); `null` was previously allowed unconditionally so the bundled file:// viewer worked out of the box, but `null` is also the origin of a sandboxed iframe, so any site could embed one and read the daemon's read routes via CORS). Operator opts in to specific origins — including `null`, to restore the file:// viewer — via `DARKMUX_DAEMON_CORS_ORIGINS` (exact-match, normalized). Literal `*` is rejected with a stderr hint.
-
-**Out of scope (today; may revisit)**:
-
-- Multi-tenant authn/authz (see [What darkmux is NOT](#what-darkmux-is-not)).
-- Cross-machine mission/phase state replication (per-machine FS today; tracked as a future architectural pivot, [#280](https://github.com/kstrat2001/darkmux/issues/280)).
-- Mission priority + cross-fleet pause/resume ([#282](https://github.com/kstrat2001/darkmux/issues/282)).
-- Elastic-hub failover (any peer promotable to hub), which would close the SPOF of a fixed-hub deployment.
-
-## What darkmux is NOT
-
-- Not a model-swap optimizer (LMStudio handles the actual load; we orchestrate).
-- Not an inference framework (vLLM/SGLang have that covered).
-- Not an agent framework (LangChain/AutoGen have that covered).
-- Not a prompt router across cloud providers (LiteLLM has that covered, and it's cloud-oriented).
-- Not *designed* for multi-tenant deployment. **darkmux is single-operator, multi-machine.** A hobbyist or individual engineer's "few Macs joined over a mesh VPN" is the natural deployment shape. The trust boundary is the operator-controlled tailnet, not enforcement in darkmux's code: `DARKMUX_REDIS_URL` carries no auth beyond what the underlying mesh + Redis ACLs already provide; `DARKMUX_MACHINE_ID` is operator-asserted provenance, not authenticated identity; cross-machine state on the shared substrate assumes all participants are the same operator. Fork-friendly if multi-tenant matters to you: the substrate is a reasonable starting point, and the missing pieces (auth, ACLs, fairness across distrusting users) are well-trodden elsewhere.
-
-## History: the openclaw shell-out path (removed in 2.0)
-
-Through the 0.x line, darkmux ran dispatches through either its own internal container-bounded runtime (the default) or an opt-in shell-out to a separately-installed openclaw process (`--runtime openclaw`), with a `crew sync` verb keeping openclaw's `agents.list[]` aligned with darkmux's role manifests. The two paths were deliberately schema-isolated (darkmux never translated its profile fields into openclaw's config shape, and vice versa), so an upstream openclaw schema change had zero impact on darkmux.
-
-The openclaw path was removed on the 2.0 track ([#1405](https://github.com/kstrat2001/darkmux/issues/1405), operator decision on [#1386](https://github.com/kstrat2001/darkmux/issues/1386) theme 5) to keep the build and test surface small: the internal runtime is now the only dispatch path, and the schema-isolation doctrine below continues to apply to it on its own terms.
-
-### Scope of the internal runtime: workflow-fit, not feature creep
-
-When deciding what to add to the internal runtime, the filter is **workflow-fit**: does the feature serve darkmux's own workflow, not "does some other agent runtime have it." darkmux is shaped by three load-bearing decisions:
-
-- **Mission-as-contract.** A phase is a bounded unit of work with explicit inputs (prior phase outputs, scope file), explicit outputs (typed text file persisted to disk), and explicit verify criteria. Cross-phase memory is file-mediated by design, so the frontier orchestrator sees what state moves between phases. Hidden session-state that survives across dispatches breaks this contract.
-- **Utility/specialist split.** Utility agents (4B-class: the compactor, the radio router) handle bounded structured work at high throughput. Specialist agents (35B+: coder, code-reviewer, analyst) handle judgment-dependent work at lower throughput. Features that push specialists toward utility work (mid-dispatch planning, todo tracking, autonomous replanning) collapse the layering that makes the split valuable, turning judgment-bearing work into hidden utility work.
-- **Operator sovereignty + frontier-as-strategic-layer.** The frontier orchestrator (Claude Code) holds the strategic context; utility agents structure under that context; specialists execute within it. Features that move strategic choices *down* into utility or specialist dispatches (opaque session state, automated replanning, scoped planning verbs) quietly relocate decision authority into layers that lack the context to make them well.
-
-The filter for any proposed internal-runtime feature: **does this reinforce mission-as-contract, the utility/specialist split, and frontier-as-strategic-layer, or does it blur them?** Features that reinforce land cleanly even when they're small. Features that blur produce "works technically but feels wrong" outcomes that surface as bugs months later.
-
-### Schema isolation: darkmux owns its own config
-
-Every field an operator sees in a darkmux profile maps to a darkmux-typed schema entry the internal runtime consumes: no decorative fields that look tunable but have no effect. The internal-runtime path (`src/crew/dispatch_internal.rs`, `runtime/src/`) reads only darkmux-native typed fields from `profile.runtime.*`; darkmux owns these field names, their semantics, and their evolution. An untyped `extras` map exists for forward-compat parse only (so an older binary tolerates a newer config); nothing in the internal-runtime path reads from it (enforced by explicit "must not auto-populate" tests). This discipline predates and outlived the openclaw path: it started as "don't let openclaw's config shape leak into darkmux's," and now stands on its own as "the profile schema is purely darkmux-typed, full stop."
-
-## Lab reproducibility: fixtures + content hashing
-
-The lab harness only earns the word "measurement" if a run is reproducible. The fixture cluster ([#487](https://github.com/kstrat2001/darkmux/issues/487)) closed the two gaps that made earlier `coding-task` numbers untrustworthy: runs mutating their own inputs, and no way to prove two runs started (or ended) in the same place.
-
-- **Per-run COW isolation.** Each run operates on a copy-on-write clone of the source fixture, never the source. The clone is cheap on COW filesystems (`clonefile` on APFS, `--reflink` on btrfs/xfs/zfs) and falls back to a deep copy elsewhere. The provider trait is unchanged: providers see a sandbox path and don't know it's a clone. This eliminated the cross-run baseline drift observed in earlier lab runs.
-- **Content hashing as proof, not policy.** `baseline_hash` (source state at clone time) and `final_hash` (post-dispatch sandbox state) are BLAKE3 over a deterministic walk that excludes derived dirs (`.git`, `node_modules`, `target`, `__pycache__`, `.darkmux-runtime`). Determinism is the point: same content + same layout → same hash, independent of mtimes or inode order. Equal `final_hash` across two runs is the strongest reproducibility signal the lab can emit. Hashing is best-effort: a failure logs and records `null` rather than aborting the dispatch.
-- **Registry, not embedded sandboxes.** A fixture is an operator-owned directory with a `.fixture.json` manifest; the registry (`lab-registry.json`) is a name→path lookup plus integrity metadata. `lab fixture register`/`lab fixture unregister` never move or delete the directory (operator sovereignty: `lab fixture unregister` drops the *entry*, full stop). Workloads bind to fixtures abstractly via `requires_fixture: "<name>@<version>"`, resolved against each fixture's `satisfies` declaration. `lab doctor` makes drift detectable offline before a dispatch is wasted on it.
-
-## Compaction: tiers, structured slots, and graceful degradation
-
-Compaction is the harness lever with the largest measured wall-clock impact (Articles 1–2), so it gets the most defensive engineering. Two strategies coexist behind one config knob (`profile.runtime.compaction.strategy`):
-
-- **Narrative** (default): prose summary, replaces the middle of the conversation with a synthetic `user`-role message. The Article-2-era shape.
-- **Structured-slot** (tier-2, [#352](https://github.com/kstrat2001/darkmux/issues/352)): the compactor is called in JSON mode and emits a typed `StructuredCompactionOutput` (objective, current-truth, completed-decisions, errors-to-preserve, next-actions, verify-criteria), rendered as labeled markdown into a synthetic `system`-role message. Per-slot character caps bound each field. The default compactor prompt (the empirically-won "reality-discipline" prompt) frames every slot as *show, don't tell* to suppress the hallucination-class regressions earlier prompt versions produced.
-
-The design bet behind structured-slot is that **a small model fills labeled slots more reliably than it writes good prose**, and that typed output degrades more gracefully. Three degradation layers make that real, in order:
-
-1. **Lexical JSON repair** ([#401](https://github.com/kstrat2001/darkmux/issues/401) layer 1): a truncated compactor response (runaway escapes, an unterminated string, unbalanced brackets) is walked byte-by-byte and closed off, producing a parseable (if lossy) value rather than a dispatch bail.
-2. **Schema patch** (#401 layer 2): if required fields are still missing after parse, safe defaults are inserted and `compaction_metadata.truncation_patched` is set so downstream analysis can flag the run.
-3. **Escalation bound** ([#377](https://github.com/kstrat2001/darkmux/issues/377)): `reserve.bail_after_compactions` caps how many times one dispatch may compact; past the bound the runtime emits an `EscalationTriggered` terminal for frontier handoff rather than looping forever.
-
-Two model-shape accommodations round it out: thinking-mode models route JSON to `reasoning_content`, so `extract_compactor_content()` falls back there when `content` is empty; and the JSON-mode request uses LMStudio's `json_schema` response format (decode-time shape enforcement), not OpenAI's looser `json_object`. The dispatch budget (turns/tokens used vs caps) is folded into the structured output's metadata so the model sees its remaining runway, framed as a *floor, not a ceiling*. Every field is darkmux-typed; `custom_instructions` is a typed field appended to the base prompt, not an `extras` passthrough.
-
-## Runtime resilience: struggle detection + feedback injection
-
-A local model in an agent loop fails in characteristic ways: re-reading the same file, re-reasoning the same dead end, hammering a tool that keeps erroring, emitting reasoning until it hits the token cap with nothing to show. The internal runtime carries a family of cheap, edge-triggered detectors for these, plus the recovery and budget machinery to act on them. Three design commitments shape the family:
-
-- **Observability before intervention.** Each detector (cycle, reasoning-loop, tool-failure cascade, cadence-drift) writes a trajectory event and, by default, nothing else changes: the MVP is *visible struggle*, not auto-bail. `MAX_TURNS` and the inactivity deadline catch genuinely-stuck dispatches *late*; the detectors exist to surface the struggle *early*, for the operator and (via feedback injection) for the model.
-- **Recover, don't discard.** When a turn hits the per-call token cap but emitted well-formed tool calls, those calls are salvaged rather than treated as a failed turn. The check-in that used to create those cap hits no longer truncates anything — see [The check-in](#the-check-in-observing-a-stream-instead-of-truncating-it) below, which supersedes the mechanism described here while keeping the commitment. A `finish_reason=length` turn with no content and no tool calls (pure runaway reasoning) is dropped, nudged, and retried within a small budget before escalating. Tool calls the model wrote as plain text (bracket, harmony, or darkmux's XML extension) are promoted back to structured calls instead of being lost ([#406](https://github.com/kstrat2001/darkmux/issues/406)). Each recovery is itself a trajectory event so bail/recovery rates stay visible.
-- **Feedback injection is the model-facing half.** Detectors and recovery paths queue synthetic `[darkmux-runtime]`-prefixed `system` messages drained into the next turn's prompt: telemetry the model can act on, not just telemetry the operator reads after the fact. The bracketed prefix is the term-provenance contract (see the model-facing-prompt doctrine in [`CLAUDE.md`](CLAUDE.md)); per-signal wording is overridable per role via the manifest's `feedback_templates`, and the whole channel is disable-able with `DARKMUX_FEEDBACK_INJECTION=0`. The deadline and budget caps (`--max-turns` / `--max-tokens`, opt-in; `DARKMUX_INACTIVITY_TIMEOUT_SECONDS` with a 75% soft warning before the host's 100% hard kill) are the coarse backstops underneath the fine-grained detectors.
-
-The unifying principle is operator-sovereignty applied to the runtime: every detector is observable in the trajectory, every nudge is attributable to a named signal, every bound is operator-tunable, and nothing silently changes the dispatch without leaving a record of why.
-
-## The check-in: observing a stream instead of truncating it
-
-A long model turn needs a point at which the runtime can ask "is this still productive?". Before [#2836](https://github.com/kstrat2001/darkmux/issues/2836) that point was created by stopping the model: the check-in interval was sent as `max_tokens` on the chat-completions request, the endpoint truncated the response at that many tokens, and the runtime inspected what came back and handed it forward as a prefill.
-
-### Why that design failed
-
-`tool_calls` and `content` are separate fields in the response, but they are produced by one generation pass. A cut at N tokens lands wherever the model happens to be. When it landed inside a tool call's `arguments`, the result was JSON that does not parse. Such a call cannot be dispatched, and it cannot be sent back either — an assistant message containing malformed `arguments` causes the next request to fail — so it was discarded. The model's own reasoning, which described the action it had just committed to, was handed back with the action missing. Measured: the model reads that transcript, concludes it has already answered, and stops.
-
-Four runs on the same fixture, before the fix: **9 of 14 check-in firings destroyed a tool call (64%)**. Every one was an `edit` call cut after a single character of arguments. No run passed its verify step. The discards left no trajectory record at all, so a run that lost nine tool calls was indistinguishable, from its own artifacts, from a run that had not used tools.
-
-### The design
-
-The interval is no longer sent to the endpoint. It becomes an **observation cadence**: the runtime already receives the response as a stream, so it reads each chunk as it arrives, accumulates the generated text, and at each cadence boundary runs the same degeneracy check the old design ran after truncating. A clean verdict costs nothing — no truncation, no round trip, no re-sent prefill, and nothing the model can observe. Intervention happens only when the check fires.
-
-| Bound | Sent to the endpoint | Enforced by | Purpose |
-|---|---|---|---|
-| Check-in interval (`reasoning_checkpoint_interval_tokens`, `generation_checkpoint_interval_tokens`) | no | runtime, per streamed chunk | how often the output is examined |
-| Per-call ceiling (`max_tokens_per_call`) | yes, as `max_tokens` | endpoint | backstop against unbounded generation |
-| Read timeout | n/a | transport | detects an endpoint that has stopped sending |
-
-Four properties of the runtime-side check are load-bearing:
-
-**The cadence counts characters, not chunks and not tokens.** A staged plan proposed counting chunks, based on a measurement that chunks tracked tokens roughly 1:1 on one engine. Across 61 later calls that ratio ran 0.02 to 1.00 — a 43x spread — because a speculative-decoding engine emits however many draft tokens the verify step accepted in a single chunk. Characters are read directly off the deltas and need no conversion. The token-denominated interval an operator configures is converted using a constant of 4 characters per token, and each call's measured ratio is recorded on `model.streaming.end` so the constant stays checkable. Being wrong there costs cadence, not correctness: a boundary landing early or late only changes how often a healthy stream is examined for free.
-
-**The check is suspended for any call that has begun emitting a tool call.** The degeneracy metric scores JSON at 0.003 against a 0.25 threshold, so a call writing structured arguments reads as maximally repetitive. This is wider than "while the arguments are open" on purpose: once a tool call starts, the check does not run again for the rest of that call. A model that emits a call and then repeats in a long answer is left to the ceiling. Suspending costs nothing; a false positive costs committed work.
-
-**The verdict sees the whole turn, not one call.** A turn is many calls — a check-in continuation deliberately does not consume a turn — and a model re-treading ground from three continuations ago produces calls that each look novel in isolation. The runtime-side check is therefore seeded with the turn's accumulated output before reading the first chunk of the current call. An earlier version judged only the current call and aborted one turn six times in a row while the post-turn check, looking at the full accumulation, returned "continue" every time.
-
-**The runtime ends the stream itself, so the terminal state is synthesized.** `finish_reason` and `usage` arrive only on the endpoint's final chunk, which a runtime abort never receives. The abort therefore sets `finish_reason: "length"` — routing into the existing path that closes the reasoning region and hands the accumulation back — and records the cut source explicitly, because downstream predicates that used to infer "did we cut this?" from a token comparison have no token count to compare.
-
-### Cut sources
-
-Two predicates need to distinguish a bound the runtime imposed from the model's context window overflowing. Both used to compare `completion_tokens` against the cap that was sent, and they resolved an absent `usage` in opposite directions, several hundred lines apart, with nothing naming the difference. They now read a `CutSource`:
-
-| Source | Meaning |
-|---|---|
-| `None` | the model stopped on its own (`stop`, `tool_calls`) |
-| `ServerLength { measured_at_cap }` | the endpoint reported `length`; whether that was our cap is measured, or unknown when no `usage` arrived |
-| `RuntimeAbort(Degenerate \| Silent)` | the runtime ended the stream |
-
-The salvage path asks `is_ours_confirmed()`, where unknown reads as *no*: salvaging dispatches tool calls that may have been truncated. The overflow check asks `is_ours_or_unknown()`, where unknown reads as *yes*: the alternative is a hard error that ends the dispatch and discards every banked continuation, and diagnosing an overflow requires a measured count below the cap to diagnose from.
-
-### The per-call ceiling
-
-`max_tokens_per_call` was documented as a failure boundary against runaway generation, set to 10,000 because the only way to notice a runaway was to stop and look. The runtime-side check now looks continuously, and a runaway is repetition, which is what the check detects. The ceiling is therefore no longer the mechanism that notices anything; it is a backstop.
-
-It is raised to **32,000** and left on the wire. Raised, because the largest productive call observed on this workload was 18,875 tokens and the runaway signature the constant was written against is roughly 50,000. Left on the wire, because the endpoint counts tokens and the runtime counts characters: measured across 85 calls, the true ratio of generated characters to `completion_tokens` spans 0.01 to 3.89, so no constant converts one to the other. An attempt to enforce the ceiling runtime-side failed live for exactly that reason — the runtime was still below its character threshold when the endpoint's own cap cut a tool call at 12,000 tokens.
-
-Two premises in the constant's original rationale are also no longer true, and both were arguments for keeping it low:
-
-- *A capped turn's reasoning is discarded entirely.* It is handed back as a prefill and the turn resumes.
-- *The cap limits what a turn may spend.* It does not. A turn is many calls, so the same work arrives either way; a low cap only decides whether it arrives as one call or several, each re-sending the accumulated prefill. Measured: 8 calls and 20,000 completion tokens inside one turn.
-
-Raising the ceiling also moved `max_generation_continuations`, which is `(max_tokens_per_call / generation_interval).max(4)`, from 4 to 8. That is past the first point at which the degeneracy check can return a verdict on a verbatim loop (a fixed k=5, since the metric's numerator and denominator scale together). A repeating turn now ends on the repetition that was observed rather than on a continuation budget expiring, which is an accounting fact true of any turn of that length. A regression test asserts that relationship directly, so retuning either constant back into collision fails with a message naming the constant to change.
-
-### The silence guard
-
-Repetition is visible in the stream. An endpoint that has stopped sending is not distinguishable from one that is merely slow, which makes silence the one failure this design cannot detect by reading output. It is bounded by the transport instead.
-
-The HTTP client uses a **read** timeout, not an overall request timeout. The distinction matters: the overall timeout in use previously included body read, so it bounded how long a call could take rather than how long it could be idle. Nothing hit it while the check-in was chopping every call at 1,000 tokens; removing that chopping made a single 18,875-token call plausible, which at measured generation rates is close to the 900-second bound.
-
-An idle stream ends the turn as `RuntimeAbort(Silent)` and the accumulation is handed back. Previously it propagated as an error, which produces a dispatch result of `error` with no envelope, no metrics and no deliverable — every banked continuation of a long turn lost because the endpoint went quiet at the end of it. Genuine transport failures still propagate. The two are distinguished by a typed marker rather than by matching on the error's text, because a text match fails silently when a dependency rewords its message and a failed match is indistinguishable from "not a timeout".
-
-### What the records say
-
-| Record | Field | Answers |
-|---|---|---|
-| `dispatch.tool_call.discarded` | `name`, `arguments_chars`, `cut` | a tool call was destroyed, which one, how much was written, and what cut it |
-| `dispatch.gate.abort` | `slice_chars`, `generated_chars`, `tool_call_in_flight` | the runtime ended a call, what it judged, and how much of that was this call |
-| `dispatch.checkpoint` | `judged_chars` | how much text the verdict was computed over |
-| `model.streaming.end` | `observations`, `chars_per_token` | how many times the stream was examined without being touched, and the measured cadence calibration |
-
-`judged_chars` exists because a verdict of "continue" could not previously be distinguished from a check that had nothing to examine. Both appear identical in the record. One turn produced six consecutive `continue` verdicts over **zero characters**: closing the reasoning region switches the examined region to the answer, a model that reasons entirely through the separate `reasoning_content` field never writes an answer, and the check read an empty string from then on. A pass computed over no input is not evidence of health.
-
-`chars_per_token` is recorded only on calls that emitted no tool calls. The cadence counts text and deliberately excludes tool-call arguments; `completion_tokens` counts both. On a tool-calling call the ratio therefore collapses — median 1.58 against 3.93 on text-only calls — and publishing it would suggest the conversion constant is twice too high when it is correct.
-
-### Measured outcome
-
-| | before | after |
-|---|---|---|
-| tool calls destroyed by the check-in | 9 in 61 calls | **0** |
-| share of check-in firings that destroyed work | 64% | 0% |
-| verify passing | 0 of 4 runs | 3 of 4 runs |
-
-### Known gaps
-
-- **The non-streaming path is unchanged.** The interval can only come off the wire because the runtime can observe the stream instead; with `--no-stream` there is nothing to observe, so the endpoint-side bound remains the only check-in available.
-- **A second degenerate verdict after the reasoning region is closed escalates immediately** ([#2839](https://github.com/kstrat2001/darkmux/issues/2839)). That is correct in that it hands off rather than looping, but it leaves one remedy between "continue" and "stop". Two of three runs in one series ended this way; whether the threshold is too eager is not yet measured at a useful sample size.
-- **The conversion constant is a single value for all content.** It is checkable from the records but not yet adaptive.
-
-## Execution: one substrate, four identities
-
-> **Status: this section describes the TARGET, and the tree is partway to it.** Each claim
-> below is marked *(holds)* where the code already works this way or *(target)* where it does
-> not yet. That distinction is load-bearing: an architecture document that reads as present
-> tense while describing an intention is how a stated rule becomes something every consumer
-> quietly implements differently. Tracked as [#1979](https://github.com/kstrat2001/darkmux/issues/1979).
-
-Every piece of work darkmux performs — a mission with forty steps, a one-shot `dispatch`, a
-lab run — is the same substrate at a different scale. The reason that has not always been
-visible is that four different identities were doing overlapping jobs with nothing saying
-which answered which question.
+Every piece of work darkmux performs (a mission with forty steps, a one-shot `dispatch`, a lab run) is the same substrate at a different scale. Which word names which grain is contract 8 in [`CLAUDE.md`](CLAUDE.md)'s registry; this section is why the words are what they are, and where each grain lives in the code. The identities that carry the grains on the wire are in [Identities](#identities-runs-sessions-and-executions).
 
 ### The ladder
 
-**mission › phase › task › step › role execution.** A *run* is the umbrella, never a grain: one
-top-level unit of work the operator started, in exactly three kinds (mission, dispatch, lab).
-A *step* is a graph node; a *role execution* is what the node did. A `procedural.shell` step
-has none; `dispatch.internal` has one; `dispatch.map` has one per collection item, and the
-review pipeline's probe and judge steps have seats × draws. That 0..N cardinality is what
-makes the step layer real rather than a wrapper.
+**mission › phase › task › step › role execution.** A *run* is the umbrella, never a grain: one top-level unit of work the operator started, in exactly three kinds (mission, dispatch, lab). A *step* is a graph node; a *role execution* is what the node did. A `procedural.shell` step has none; `dispatch.internal` has one; `dispatch.map` has one per collection item; a `crawl.unit` step has one per draw. That zero-to-many cardinality is what makes the step layer real rather than a wrapper, and it is why no further noun sits between a step and a role execution: the many already have domain names that are not synonyms (a `dispatch.map`'s *items*, a seat's *draws*), and they all bottom out in one model-facing execution.
 
-The inner unit is named for the **role**, not the model, because the model is derived rather
-than declared: `select_model(role, profile)` resolves it at dispatch entry, `DispatchOpts`
-takes `role_id` as required and `profile_name` as an optional override, and an
-endpoint-staffed seat has no local model at all. Role is the stable identity across local and
-remote. `dispatch` is then unambiguously TOP-LEVEL — the verb, and the `RunKind` meaning *a
-run consisting of exactly one role execution* — which is what stops one word naming both ends
-of the ladder. The full definition, and its consequences for
-attribution and escalation, is contract 8 in [`CLAUDE.md`](CLAUDE.md)'s cross-system contract
-registry. *(holds — the vocabulary is stated and the hash routes are named for their run kind)*
+The inner unit is named for the **role**, not the model, because the model is derived rather than declared: `select_model(role, profile)` resolves it at dispatch entry, `DispatchOpts` takes `role_id` as required and `profile_name` as an optional override, and an endpoint-staffed seat has no local model at all. Role is the stable identity across local and remote; the model is a consequence of the profile. `dispatch` then names the top of the ladder only: the verb, and the run kind it produces, *a run consisting of exactly one role execution*. That is what stops one word naming both ends of the ladder.
 
-### What each field means
+The grains have their own bookends. `run.*` brackets a whole run and `dispatch.*` brackets one role execution, so a consumer never has to read a `source` field to tell them apart ([The flow vocabulary](#the-flow-vocabulary-one-closed-list-one-spelling-per-event)).
 
-The flow-record schema already carries enough to answer *whose work is this?* The problem was
-never missing data; it was that nothing stated which field answers which question, so every
-consumer picked its own subset.
-
-- **`payload.step_id` — the canonical record-to-step attribution.** Stamped by the producer,
-  not reconstructed by a reader. *(partly holds — `dispatch_internal`'s `stamp_step_id`
-  does this for graph-step dispatches; other step-executing paths are the target)*
-- **`session_id` — a producer-chosen GROUPING key, deliberately not an identity.** Its grain
-  is per kind, and the variation is correct rather than accidental: step-scoped for a solo
-  dispatch, task-scoped for fan-out siblings that must share a join key so a seat's tokens
-  can be tied to its endpoint. It is opaque to consumers, never an operator-facing noun, and
-  never the address of a page. *(holds as behavior; the "not an identity" part is the target
-  — one consumer still addresses a page by it)*
-- **`mission_id` — the authoritative outer scope, filtered first, always.** This is not
-  optional tidiness. A task-scoped `session_id` hashes only the task id, which comes straight
-  out of a mission config, so two concurrent runs of the same config produce colliding
-  session ids and only the `mission_id` backfill tells them apart. *(holds)*
-- **`handle` — a read-side fallback, permanently.** Archives are append-only and never
-  rewritten, so every key that has ever been correct stays supported for reading. *(holds)*
-
-### One resolver
-
-Mapping a record to its step is a three-key chain — `payload.step_id`, then a step-scoped
-`session_id`, then `handle` — with `mission_id` authoritative above all three. That chain is
-correct and already written twice, once per language. What is wrong is that it is not
-universally *used*: a second, ad-hoc resolver matches on step-kind strings with a silent
-catch-all, and the step detail lens scopes by raw session id instead of by step.
-
-The target is one resolver per language, bound by a shared fixture both test suites consume
-so the two implementations cannot drift, and **no kind-keyed registry in any consumer** — a
-consumer that switches on the step's `kind` to infer record shape is the snowflake being deleted,
-not a fix for it. Attribution must be inferable from records alone. *(target)*
-
-### Dispatch names the top of the ladder, not the bottom
-
-`dispatch` names the top of the ladder only: the verb, and the `RunKind` it produces. Naming
-the INNER unit instead — the role execution — is what resolves the overload, and it is the
-cheaper direction by a wide margin: the flow-record bookends `dispatch.start` / `dispatch
-complete` keep their historical spelling at both grains, so the four consumers that key on
-them at the session grain (`runs.rs`'s `terminal_status_for_action`, the runs board's
-representative-session pick, `cards.ts`'s fleet activity, `metaLine.ts`'s last-dispatch) are
-untouched. Archives are append-only and grain is already recoverable from `session_id` and
-`source`, so renaming the wire would buy a consumer migration for no behavioral gain. What
-changes is the word used in code, docs and UI. *(holds for the vocabulary; the review
-pipeline still wraps a whole multi-model crew in one pair, which is a separate defect)*
-
-Utility work inside a role execution — compaction above all — is a **sub-execution**:
-itself a role execution, of a utility role, attributed to its own role and model rather than
-blended into the specialist's. Naming the unit for the role is what makes this compose
-instead of needing a special case — a sub-execution is the same kind of thing as its parent,
-one level in. Getting this wrong is not
-cosmetic: filing the compactor's residency under the specialist is what makes a healthy run
-report a model swap that never happened. *(target)*
+**A specialist change is an execution boundary.** Escalation mints a new role execution; it never puts a second specialist inside one. Utility work inside an execution (compaction above all) is a sub-execution attributed to its own model, never blended into the specialist's ([The utility model](#the-utility-model-and-lean-utility-jobs)). Getting this wrong is not cosmetic: filing the compactor's residency under the specialist is what makes a healthy run report a model swap that never happened, so a declared utility role going resident is not a swap.
 
 ### Where the substrate lives, and why that is the whole lesson
 
-The substrate a serious run needs — host telemetry sampling, per-step records, budget
-accounting, liveness bookends, the resolved-knob snapshot — belongs in the **shared
-control-flow path every run already crosses**: the launcher and the scheduler. Not in an
-importable type that each mission may or may not adopt.
+The substrate a serious run needs (host telemetry sampling, per-step records, budget accounting, liveness bookends, the resolved-knob snapshot) belongs in the **shared control-flow path every run already crosses**: the launcher and the scheduler. Not in an importable type that each mission may or may not adopt.
 
-This is not a preference; it is the measured outcome of trying it both ways in the same arc.
-When the telemetry sampler moved into the launcher and per-step records moved into the
-scheduler, every mission gained them with *zero changes in its own module* — a mission
-author cannot forget what they never had to remember. When the same arc left a piece as an
-importable type plus a paragraph of doctrine, it acquired exactly one consumer: the module it
-was extracted from, importing it back under its old name.
+This is the measured outcome of trying it both ways in the same arc. When the telemetry sampler moved into the launcher and per-step records moved into the scheduler, every mission gained them with *zero changes in its own module*: a mission author cannot forget what they never had to remember. When the same arc left a piece as an importable type plus a paragraph of doctrine, it acquired exactly one consumer, the module it was extracted from, importing it back under its old name.
 
-**Moving a type one crate over and importing it back is a relocation, not a layering.** The
-test of whether a capability is really shared is not where it is defined; it is whether a
-mission that never mentions it still gets it. *(holds for telemetry, per-step records,
-budgets and outcome; the staffing snapshot is the remaining piece that is still caller
-choice)*
+**Moving a type one crate over and importing it back is a relocation, not a layering.** The test of whether a capability is really shared is not where it is defined; it is whether a mission that never mentions it still gets it.
 
 ### The vocabulary, and why each word sits where it does
 
-darkmux names a lot of layers, and the names were not arrived at freely — most of the obvious
-ones were already spoken for. This is the map.
+darkmux names a lot of layers, and the names were not arrived at freely: most of the obvious ones were already spoken for. This is the map.
 
 **The containment ladder.** `mission › phase › task › step › role execution`.
 
 | Term | What it is |
 |---|---|
-| **run** | The UMBRELLA: one top-level unit of work the operator started. Never a grain. Three kinds — `mission`, `dispatch`, `lab`. |
+| **run** | The UMBRELLA: one top-level unit of work the operator started. Never a grain. Three kinds: `mission`, `dispatch`, `lab`. |
 | **mission** | A whole task graph, launched from a config. |
 | **phase** | A grouping of tasks within a mission (`Mission.phase_ids` → `Phase.task_ids`). |
-| **task** | A group of steps — and where resource ASSIGNMENT lives (role, profile, workdir, image), which is why a step inherits staffing rather than declaring it. |
+| **task** | A group of steps, and where resource ASSIGNMENT lives (role, profile, workdir, image), which is why a step inherits staffing rather than declaring it. |
 | **step** | One graph node. Contains **0..N** role executions. |
-| **role execution** | The inner unit: one role, running many turns until it stops. |
-| **dispatch** | TOP-LEVEL ONLY — the verb `darkmux dispatch <role>`, and the `RunKind` meaning *a run consisting of exactly one role execution*. |
+| **role execution** | The inner unit: one role, running many turns until it stops. Named by an `execution_id`. |
+| **dispatch** | TOP-LEVEL ONLY: the verb `darkmux dispatch <role>`, and the run kind meaning *a run consisting of exactly one role execution*. |
 | **crew** / **crew member** / **position** | Who staffs a mission, and where each member sits. |
 | **role** | A stance, a tool palette, and a system prompt. The declared identity of a role execution. |
-| **profile** | The staffing registry entry: which model at what context, local or hosted endpoint. |
+| **profile** | The registry entry that says which model, at what context, on which endpoint. |
 | **seat** | A staffed model position within a run (`MemberRecord`), with a `draws` count. |
 | **draw** | One invocation of a seat. |
-| **item** | One element of a `dispatch.map` collection. Reserved shape: an object with exactly the keys `system` (a string) and `item` is a per-item persona override, and the `item` field is the payload; every other value is the item itself (#2310 P1). |
+| **item** | One element of a `dispatch.map` collection. Reserved shape: an object with exactly two keys, `system` (a string) and `item`, is a per-item persona override and its `item` value is the payload; every other value is the item itself. |
 | **session** | An INTERNAL join key tying a family of flow records together. Never operator-facing. |
 | **workload** / **fixture** | Lab-only: the thing being run, and the pinned sandbox it runs against. |
 
-**Why the inner unit is named for the ROLE and not the model.** The model is derived, not
-declared: `select_model(role, profile)` resolves it at dispatch entry, `DispatchOpts` takes
-`role_id` as required and `profile_name` as an optional override, and an endpoint-staffed seat
-has no local model at all. Role is the stable identity across local and remote; the model is a
-consequence of the profile. Naming it for the role also makes sub-executions compose — a
-compactor's work inside a specialist's is simply another role execution, one level in, rather
-than a special case needing its own rule.
-
-**The mission metaphor is deliberate, and it has to close.**
-
-darkmux's operator-facing vocabulary commits to the **NASA mission metaphor**. `Mission` and
-`Crew` were canonical from the start; the rest is named to *complete* the metaphor rather than
-to borrow from a software subculture.
-
-Locked terms (decided 2026-06-22):
+**The mission metaphor is deliberate, and it has to close.** darkmux's operator-facing vocabulary commits to the **NASA mission metaphor**. `Mission` and `Crew` were canonical from the start; the rest is named to *complete* the metaphor rather than to borrow from a software subculture.
 
 | Term | What it names |
 |---|---|
 | **Mission** / **Crew** | The work, and who staffs it. |
 | **Debrief** | The post-mission review ceremony (`Stage::Debrief`). |
-| **Lessons** | The durable engagement-context store — previously "knowledge". |
+| **Lessons** | The durable engagement-context store, previously "knowledge". |
 | **Cautions** | The auto-detected loop pathologies. Already on-theme: spacecraft carry a *Caution & Warning System*. |
 
-And the metaphor closes, which is the point of it: **a mission's runs raise cautions → the
-debrief distills them into lessons → lessons brief the next crew.**
+The metaphor closes, which is the point of it: **a mission's runs raise cautions → the debrief distills them into lessons → lessons brief the next crew.**
 
-**Why a metaphor rather than accurate jargon.** Metaphors endure because they are *coherent and
-relatable*, not because they are literal. Xerox PARC and early Apple gave us the **Desktop**,
-the **Trash**, **Files** — none of which are literally inside a computer. They lasted because
-the metaphor was complete and drawn from a world people already knew.
+**Why a metaphor rather than accurate jargon.** Metaphors endure because they are *coherent and relatable*, not because they are literal. Xerox PARC and early Apple gave us the **Desktop**, the **Trash**, **Files**, none of which are literally inside a computer. They lasted because the metaphor was complete and drawn from a world people already knew. Software-tribal terms fracture it, and each carries baggage the metaphor does not: a *retrospective* imports Scrum, which not everyone practices and which means nothing outside engineering; a *post-mortem* imports death. A whole metaphor is something a person can hold. Half a metaphor is just inconsistency.
 
-Software-tribal terms fracture it, and each carries baggage the metaphor does not: a
-*retrospective* imports Scrum, which not everyone practices and some actively dislike, and which
-means nothing outside engineering; a *post-mortem* imports death. A whole metaphor is something a
-person can hold. Half a metaphor is just inconsistency. We are not sending rockets to the moon,
-but software ships with a rocket emoji, because the metaphor lands.
+**How to apply it.** When naming any new operator-facing surface (a verb, a stage, a concept, a file), prefer the term that completes the mission metaphor, and check that it *completes* rather than merely coexists. Where a real NASA term exists, lean on it: "Lessons Learned" (NASA's LLIS) is the authentic version of what dev culture gestures at with "retro notes". **Reject "it is already there" as a naming argument.** Consistency with an unconsidered placeholder is not consistency: `Stage::Retrospect` was renamed to `Stage::Debrief` on exactly that basis.
 
-**How to apply it.** When naming any new operator-facing surface — a verb, a stage, a concept, a
-file — prefer the term that completes the mission metaphor, and check that it *completes* rather
-than merely coexists. Where a real NASA term exists, lean on it: "Lessons Learned" (NASA's LLIS)
-is the authentic version of what dev culture gestures at with "retro notes".
+**The boundary.** This governs the OPERATOR-facing surface only. Model-facing text (role prompts, skill descriptions, the autonomous-dispatch preamble, feedback-injection templates) defaults to AI-convention terminology instead ("the user", "system message", "tool calls"), because a local model under clean dispatch context has no darkmux history to ground a metaphor against. See the model-facing prompt doctrine in `CLAUDE.md`. The two rules do not compete; they apply to different readers. A naming rule that exists only in someone's memory is not a rule the project has, which is why this one is written down here.
 
-**Reject "it is already there" as a naming argument.** Consistency with an unconsidered
-placeholder is not consistency. `Stage::Retrospect` was renamed to `Stage::Debrief` on exactly
-that basis — it existed, and existing was the only thing it had going for it.
+**Names that are taken, and by what.** Every humanized word that reads naturally for "one crew member's bounded piece of work" turned out to already name a *different* layer of this same system, which is itself the finding:
 
-**The boundary.** This governs the OPERATOR-facing surface only. Model-facing text — role
-prompts, skill descriptions, the autonomous-dispatch preamble, feedback-injection templates —
-defaults to AI-convention terminology instead ("the user", "system message", "tool calls"),
-because a local model under clean dispatch context has no darkmux history to ground a metaphor
-against. See the model-facing prompt doctrine in `CLAUDE.md`. The two rules do not compete; they
-apply to different readers.
+- **task**: the grouping layer above steps.
+- **job**: fleet work submission (`darkmux_fleet::WorkJob`, `WorkSubmission`), one dispatch sent to another machine's fleet listener. `WORK_JOB_SCHEMA_VERSION` makes it a wire contract, not just a word.
+- **deployment**: the Azure hosted-model endpoint (`/openai/deployments/<name>`), surfaced in `darkmux doctor`'s own remedy text. Reusing it for the execution would re-fuse the exact thing choosing *role* over *model* was meant to keep apart.
+- **activity**: the viewer's activity lanes.
+- **assignment**: a Task's resource assignment.
+- **turn**: one iteration of the agent loop; a role execution has many.
+- **pass**: the review pipeline's probe, judge and verify passes.
 
-One consequence worth stating, since it is what put this section here: this doctrine was decided
-and then lived nowhere in the repository for two months. A fresh agent session — the recursive
-success criterion darkmux sets for itself — would have named new surfaces from dev jargon with
-nothing to say it was wrong. A naming rule that exists only in someone's memory is not a rule
-the project has.
+`shift` and `stint` are genuinely unused and were weighed as more humanized alternatives; `execution` won on precision and on composing cleanly for sub-executions.
 
-**Names that are taken, and by what.** Every humanized word that reads naturally for "one crew
-member's bounded piece of work" turned out to already name a *different* layer of this same
-system — which is itself the finding, because those layers were named with the same instinct:
-
-- **task** — the grouping layer above steps.
-- **job** — fleet work submission (`fleet::WorkJob`, `WorkSubmission`), where a job is one
-  dispatch sent to another machine's fleet listener (a Redis-queued phase before #2916).
-  `WORK_JOB_SCHEMA_VERSION` makes it a wire contract, not just a word.
-- **deployment** — the Azure hosted-model endpoint (`/openai/deployments/<name>`), surfaced in
-  `darkmux doctor`'s own remedy text. Reusing it for the execution would re-fuse the exact
-  thing choosing *role* over *model* was meant to keep apart.
-- **activity** — the viewer's activity lanes.
-- **assignment** — a Task's resource assignment.
-- **turn** — one iteration of the agent loop; a role execution has many.
-- **pass** — the review pipeline's probe/judge/verify passes.
-
-`shift` and `stint` are genuinely unused and were weighed as more humanized alternatives;
-`execution` won on precision and on composing cleanly for sub-executions.
-
-**"Rule" already sits at three grains, and none of them touch.** The word slipped past the
-discipline above — three subsystems own it, each with its own schema, and one of them even has
-a `match` field like another's:
+**"Rule" already sits at three grains, and none of them touch.** Three subsystems own the word, each with its own schema, and two of them even have a `match` field:
 
 | Which "rule" | Where it lives | What it decides |
 |---|---|---|
@@ -468,41 +243,211 @@ a `match` field like another's:
 | **crawl pattern** | a crawl rule file (e.g. `swallowed-error`: `match`/`no_match` prose + `evidence`/`why_hint`) | what COUNTS AS A FINDING. Given to the model verbatim as `<pattern name="…">`; named by id in the manifest, the envelope, and a receiver's `rule` column. |
 | **eureka rule** | `darkmux-eureka`'s `RuleDef`s (`RULES_SCHEMA_VERSION`) | what the detection engine flags, surfaced by `darkmux doctor`. |
 
-The collision is survivable because the keys never meet — a hook rule's `match` is a record
-predicate, a crawl pattern's `match` is instructions for a model — but prose that says "the
-rule fired" is ambiguous in exactly the way this section exists to prevent. Naming discipline,
-not renames: say **hook rule**, **crawl pattern** (the model-facing tag already says
-`<pattern>`), and **eureka rule**. A fourth "rules" surface must pick a different word.
+The collision is survivable because the keys never meet (a hook rule's `match` is a record predicate, a crawl pattern's `match` is instructions for a model), but prose that says "the rule fired" is ambiguous in exactly the way this section exists to prevent. Say **hook rule**, **crawl pattern** (the model-facing tag already says `<pattern>`), and **eureka rule**. A fourth "rules" surface must pick a different word.
 
-**The rule this leaves behind:** before naming a new layer, check whether the word already
-names a different grain in this system. A word at two grains is the defect that produced this
-whole section — `dispatch` meant both a top-level run kind and the innermost unit, and nothing
-said so, so every consumer picked a meaning and they disagreed.
+**The rule this leaves behind:** before naming a new layer, check whether the word already names a different grain in this system. A word at two grains is the defect that produced this whole section: `dispatch` meant both a top-level run kind and the innermost unit, and nothing said so, so every consumer picked a meaning and they disagreed.
 
 ### Lab stays separate, deliberately
 
-Lab runs write per-run-local artifacts and stay off the fleet flow stream. That boundary is a
-measurement-integrity decision, not an inconsistency to be tidied away: the point of a lab
-run is that it is reproducible in isolation, and a bench that quietly enriched the shared
-stream would make its own numbers a function of what else the fleet was doing. Lab's one
-genuine defect is a route naming its drill-in `run=` while `run` is the umbrella everywhere
-else. *(holds)*
+Lab runs write per-run-local artifacts and stay off the fleet flow stream. That boundary is a measurement-integrity decision, not an inconsistency to be tidied away: the point of a lab run is that it is reproducible in isolation, and a bench that quietly enriched the shared stream would make its own numbers a function of what else the fleet was doing. What was unified is the noun on the operator's side. Recorded lab runs live under the darkmux root's `lab/` directory (`DARKMUX_LAB_DIR`, one resolver for the writer and every reader) and are read through `darkmux run`: `run list --kind lab` lists them, and `run inspect`, `run stats` and `run compare` read a lab run's recorded artifacts and refuse a mission or dispatch run id, naming where to look. `darkmux lab run <workload>` is the launcher only. Contract 8 makes "run" the umbrella over mission, dispatch and lab runs, so a `runs/` directory that held only lab runs and a read family beside `darkmux run list` were the umbrella's name on one kind.
 
-## Composability
+## Identities: runs, sessions and executions
 
-darkmux is designed to live BELOW agent frameworks and ABOVE inference engines:
+Three identities answer three different questions about a flow record, and each is a type rather than a convention.
 
-```
-[ agent framework / frontier orchestrator: Claude Code, OpenClaw, Aider, Cline, … ]
-                    |
-                    v
-               [ darkmux ]   (swap · dispatch · observe)
-                    |
-                    v
-[ inference engine: LMStudio, Ollama, llama.cpp ]
-```
+| Identity | Answers | Type | Minted |
+|---|---|---|---|
+| **run** | which top-level unit of work the operator started | `RunId` in `darkmux_types::session_id` | at launch: a mission id, a lab run id, or a standalone run |
+| **session** | which family of records belongs together | `SessionId { kind, run }` in the same module | by the code that opens the family; `wire()` is its only string form |
+| **execution** | which role execution a record is about | `ExecutionId` in `darkmux_types::execution_id` | once per role execution, at the host entry that runs it |
 
-darkmux is **not** a proxy that sits in the request path (an OpenAI-compatible router was the v0.2 plan and was deliberately *not* built; see the evolution above). It operates the layer instead of intercepting it: it swaps the resident stack, dispatches work through a runtime it owns, and emits the observability stream. No changes to the inference engine; the frontier orchestrator drives darkmux rather than routing through it.
+**A session cannot exist without its run.** A `SessionId` is built from a `RunId` and a `SessionKind` (`Run`, `Phase`, `Task`, `Step`, `Adhoc`, `Relay`), so two launches of one config can never share a session, a presence key or a budget record: the task session of a review is `<run>.task.<task>`, not a string that hashes only the task id. `mission_id` on a record therefore always agrees with its session (a lab run and a standalone run stamp none). The wire grammar is `run [ "." run-kind ] "." kind { "." field }`, every component escaped so it never contains the `.` separator, and it is injective: two identities never share a string, and `SessionId::parse` reads one back exactly. Strings written before this grammar read only through `SessionId::parse_legacy`, the one place that knows their shapes. `session` stays an internal join key and never an operator-facing word; the `session_id` field keeps its name on disk because renaming it would strand every archive.
+
+Two types are called `RunKind`, for different jobs. `darkmux_types::session_id::RunKind` (mission, lab, standalone) says how a run's identity is built. `darkmux_serve::runs::RunKind` (mission, dispatch, lab) is the operator-facing kind on the runs board, and `dispatch` there is a shape label derived from a mission by `classify_mission`: a crew-of-one graph.
+
+**A fleet receiver runs submitted work under a relay.** A job another machine submitted runs under `SessionKind::Relay`, which carries the sender's own session and the peer it came from. Its run is the standalone twin of the sender's, so the receiver groups a sender's run together but never stamps it as one of its own missions, whatever id the sender names.
+
+**An execution is named on every record that is about it.** `ExecutionId::mint` is the only way to a new one, and the host entries mint exactly one per execution: `crew::dispatch::dispatch` (which covers the hosted single-shot path), `dispatch_local_single_shot`, the `dispatch.single_shot` step kind, and each item of a `dispatch.map`. A `dispatch.map` step therefore writes one bookend pair per item and none of its own; the scheduler's step records cover the step. The id is stamped through one builder path (`FlowRecord::for_execution` and `for_execution_with`) on every action whose row declares the execution grain, and `CheckedRecord::check` refuses to write one without it. A resumed dispatch continues its id (it rides in the out-dir's `resume_origin.json`); a change of specialist is an execution boundary and mints a new one. A compaction is a sub-execution of the same execution, so its records carry the parent's id and its usage record says `purpose: utility`; a host-side utility job (radio routing) mints its own for its usage record. Consumers key on the execution: token sums, the DISPATCHES chip, `records_emitted`'s pairing, both lifecycle executors' attempts, and the finding store's key.
+
+**Archives get a synthesized identity, never a rewrite.** A record of an execution written before executions were named carries none, and the reader gives it `legacy:<session>:<mission>` (`ExecutionId::legacy`, applied by `darkmux_flow::legacy::execution_of` and mirrored by the viewer's `ingest.ts`). That is the only place the old `(session, mission)` grouping survives.
+
+Known gap: the legacy identity is as coarse as the old grouping was. Two executions that shared a session and a mission before the change read as one.
+
+## The flow vocabulary: one closed list, one spelling per event
+
+The flow stream is the record of what darkmux did, and every consumer (the daemon, the viewer, hooks, doctor, the lab, the audit chain) reads the same records, so the words in them have to mean one thing. An action used to be a free string, the same event had two spellings, and each consumer kept its own list.
+
+**One list.** Every action is a `darkmux_flow::FlowAction` variant, declared once in the `flow_actions!` invocation in `crates/darkmux-flow/src/action.rs`. Its wire string follows one grammar, `<scope>.<event>[.<detail>]`: lowercase ASCII, two or three dot-separated segments. The first segment is the row's `FlowScope`, declared beside it and pinned to the string by a test. Producers build the enum; no constructor, builder or helper takes an action as a string, and consumers match on the enum.
+
+**Bookends and grains are declared on the row.** A row that opens or closes a unit says so, and `FlowAction::bookend` and `FlowAction::grain` read that back, so "which actions bracket a run, and which bracket a role execution" and "which records must name an execution" each have one answer. `run.start`, `run.complete` and `run.error` bracket a whole run; `dispatch.start`, `dispatch.complete` and `dispatch.error` bracket one role execution. The two grains never share a spelling, which is what lets `dispatch` mean one grain. The run pair is written by a guard that closes it on every exit path, so a panic or an early return still writes `run.error`. The viewer's `bookendOf` mirrors the table, and the rules that read bookends (liveness, the lifecycle below) key on `Bookend` and never on a string.
+
+**Writing is refused, not normalized.** Every sink write goes through `FlowSinkWrite::write`, which builds the `CheckedRecord` a sink accepts. It refuses an action darkmux does not write today (`FlowAction::Other`, one this build does not know, and `FlowAction::Retired`, one darkmux retired with no current equivalent), an execution-grain record with no `execution_id`, and a payload that is not its action's type. `darkmux flow record --action` accepts only known actions.
+
+**Utility jobs sit outside the bookends.** A utility job (compaction, radio routing) writes `utility.start` and its usage record, and `utility.error` when a routing call fails, and nothing else: no session of its own, no bookends, no run. See [The utility model](#the-utility-model-and-lean-utility-jobs).
+
+**A guard keeps it closed.** `scripts/flow-action-guard.py` runs in CI, reads its list from `action.rs` and `legacy.rs` so it cannot drift from them, and self-tests before it scans. In production Rust it forbids writing an action by hand in any shape it lists (a literal, a format string that builds one, a prefix test, `concat!`, JSON inside a string). In test code, the viewer, docs, skills, templates and fixtures, it forbids any string that looks like an action and is not a current one. Recorded archives are exempt, and a comment may name a spelling. It reads source text, so an action assembled at run time in a shape it does not list is not seen.
+
+**A fleet upgrades together.** A reader from before the closed vocabulary does not know the dotted spellings, so an old hub misreads a new peer's records: its missions never end and its step results are not folded. Current readers upgrade an old peer's records (next section), but nothing upgrades an old reader.
+
+## One reader, and the legacy mapping
+
+Every consumer that reads records back goes through `darkmux_flow::reader`: the day files, the Redis stream, a peer's records, the audit chain's JSON bodies. `parse_record` returns a typed `FlowRecord`; `parse_value` and `upgrade` serve the daemon, which passes records on to the viewer as JSON with every field intact.
+
+`darkmux_flow::legacy` is the one place the older shapes live, and the reader is the one place that applies it: a retired action spelling maps to its current variant (`read_action`, `upgrade_action`), retired `source` and `tier` spellings and payload keys and units map to current ones, a pre-run-bookend whole-run pair reads as `run.*` (`run_grain_of`), and a record of an execution that names none gets its synthesized id (`stamp_execution`). Nothing else sniffs a prefix. A read returns one of five outcomes (`ActionRead`): `Current`, `Upgraded`, `Retired` (known, never counted), `Unknown` (kept verbatim) and `Absent` (a schema header line or a foreign line). `UnknownActions` counts the unknown ones by name, so `darkmux doctor` and the viewer (`· N unknown` beside the event count) can say so instead of dropping them.
+
+The reader is lenient because an archive outlives the binary that wrote it, and rewriting one would destroy the evidence it is. This is the one place the user-file gate's strictness deliberately does not apply. A golden archive pair under `tests/flow-archive-golden/` (a day file as an older darkmux wrote it, and its upgraded form) is read by the flow crate, the daemon's usage sum and the viewer's ingest test, so the three readers cannot drift apart.
+
+Known gap: the mapping exists twice, in Rust (`legacy`) and in TypeScript (`ingest.ts`), and the golden is what holds the two together.
+
+## Typed flow payloads
+
+A record's payload is one Rust type per action. `Payload` (`crates/darkmux-flow/src/payload/mod.rs`) has one variant per payload-bearing action, listed once in `flow_payloads!`. A record is built from a variant, so it takes its action from the payload and a producer cannot pair an action with another action's payload; an action with no row carries none, and the write check refuses one. The TypeScript twins are generated (`FlowPayloads.ts` and one file per payload type under `ui/src/types/generated/`), so the viewer reads a payload through the type the producer wrote.
+
+- **Open payloads are declared, never implied.** `OpenPayload` holds keys someone other than darkmux chose: a mission config's outcome document on `mission.start`, `mission.close` and `mission.abort`, and a model's own `create_finding` arguments. Every action that carries one is named in the list, so "which payloads are free-form" is one grep.
+- **One vocabulary on the wire.** Durations are `*_ms` and instants are `*_at_ms` (epoch milliseconds). An optional key with no value is omitted rather than written as `null`; `telemetry.tokens` keeps `null` for "not reported", and a hook rule that matches `payload.<key>: null` matches both a `null` and an absent key. Key order follows the type's field order. `FlowRecord.source` is a closed `snake_case` set, and `tier` says who acted (`operator`, `frontier`, `darkmux`), never where a model ran.
+- **Reading an archive is tolerant.** A payload that does not parse as its action's type is kept as `UnreadPayload`: its JSON is preserved and re-serializes byte for byte, a typed reader treats it as absent, and it is never written. A field an older version never wrote reads as absent, never as zero, and a word in a closed set this build does not name (a result class, a detector kind, a seat class) reads as `unknown` instead of dropping the record.
+
+Known gap: the types are the contract for new records, but a renamed field is a wire break for every archive already written. Only the mapping in `legacy` keeps old archives readable, and each rename has to add to it.
+
+## Two logs: the flow stream and the trajectory
+
+darkmux keeps two logs, and they are not the same thing.
+
+| | Flow stream | Trajectory |
+|---|---|---|
+| What | typed records about the machine's work: bookends, steps, budgets, usage, hooks, machine samples | one execution's own event log: every stream, turn, tool call, checkpoint and detector firing |
+| Written by | the host, through `FlowSinkWrite::write` | the runtime, inside its container, to `<out>/.darkmux-runtime/trajectory.jsonl` |
+| Read by | the daemon, the viewer, hooks, doctor, the audit chain, other machines | the host's live tailer while the execution runs, and the lab afterward, both through one fold |
+| Lives | append-only day files, optionally Redis and the audit chain, shared across a fleet | in the execution's run directory |
+
+The runtime is not a workspace member and depends only on `darkmux-trajectory`, not on the flow crate. That boundary is the design: the runtime writes what it saw, and the host turns it into flow records. The tailer reads each trajectory event as it lands and writes the flow record that matters beyond this execution (`telemetry.tokens` for each call's usage, the detector and checkpoint records).
+
+The two share words. `dispatch.checkpoint` is both a flow action and a trajectory event, and they are different records: the trajectory event is the runtime's own note, and the flow record is the host's, written from it. `dispatch.tool_call.discarded`, `dispatch.gate.abort` and `model.streaming.end` are trajectory events only. A reader looking for a record should first ask which log holds it; [The check-in](#the-check-in-observing-a-stream-instead-of-truncating-it) tabulates its records that way.
+
+**The trajectory is the only per-execution record of turns, rests and per-call usage.** `darkmux_trajectory::TrajectoryFold` is the one reading of it: turns, tool calls, compactions, rests, tokens, checkpoints, detector firings and stream timing are all derived there, one event at a time. The host's live tailer applies each event as it streams and the lab folds a finished file, both through `TrajectoryFold::apply`, so a live number and a post-hoc number are the same computation.
+
+## One token truth
+
+A token count has one source and one sum.
+
+**The unit of accounting is the model call.** Every call darkmux makes to a model endpoint writes exactly one `telemetry.tokens` record when its reply returns. `darkmux_crew::usage::usage_payload` builds it, so every producer (the container path's per-turn tailer, hosted and local single-shot, `dispatch.map` items, each compactor call) stamps the same vocabulary: the call kind, its purpose (`work` or `utility`), the endpoint darkmux invoked, the model it requested and the model the reply named, and the counts. A count the provider did not report is omitted, never written as zero, and `token_source` says whether the reply carried a usage block. `darkmux_trajectory::UsageCounts::total_tokens` is the one rule for a total: the provider's own total wins, and `prompt + completion` is used only when the provider reported the split and no total. A split missing a half is not a total.
+
+**A total anywhere is a plain sum of those records.** The daemon's `usage_sum` module and the viewer's `sumUsage` are the two executors, and the shared golden `tests/usage-golden/` pins them to one answer. There is no execution keying in the sum, no estimate, and no local-or-cloud classification: the sum reports what darkmux invoked (the endpoint string and the model), and utility tokens are counted under their own chip. The one exception is data written before usage records existed: an execution with zero usage records counts its token-bearing completion once.
+
+**A call with no prompt count has an unknown spend and is never charged as small.** A hosted call's settlement against the per-step cap charges such a call (and one with no usage at all) at the whole granted `max_tokens` plus the prompt, estimated from the request at `CHARS_PER_TOKEN` (four) characters a token. Under an endpoint's window budget the halves that were reported still count, as a floor, and the window is flagged as not fully metered (`unmetered_calls` on `budget.warn` and `budget.wait`, and "spent at least" in doctor). A call that reported no usage at all adds nothing to a window's known spend, so it can warn but never make a token budget wait on its own. A calls budget is never flagged, since a call count is exact.
+
+**`metrics.json` is gone.** The runtime used to write a totals file on a clean exit, and every reader had to be checked against the trajectory for the times the two disagreed: a killed run kept whichever run's copy was there before. In one measured archive 37 of 241 disagreed with their own trajectory, and every time the file was the wrong one. The file, the flags that policed the disagreement and the fields that mirrored it are deleted, and every count is a fold of the trajectory. A dispatch envelope's `metrics` block is written by the host from that fold.
+
+Known gaps: the per-step charge for an unknown spend is a stated estimate (four characters per token), not a measurement, and a window budget sees only this machine's usage records.
+
+## Configuration: visible defaults, gated features, secret carve-outs
+
+darkmux's settings live in one file, `~/.darkmux/config.json`, resolved with a single precedence everywhere: **env var > `config.json` > built-in default**. The env layer survives as a live override (CI, tests, a one-off shell); `config.json` is the durable surface; the built-in default is the floor. The whole precedence lives in one module (`darkmux_types::config_access`) so a reader never has to wonder where a value came from, the same *operator sovereignty* principle the rest of darkmux is built on: every default overridable, every value's source explainable.
+
+Four choices shape it:
+
+**Visible defaults, not hidden code-defaults.** `darkmux init` writes the common knobs *into the file* with their default values, rather than leaving them implicit in the binary. The cost is that a default written today doesn't silently change on upgrade, but that's the point: the operator can *see* what's configurable without reading source, and *change* a default with a file edit instead of a recompile. A config meant to replace env-var sprawl has to be discoverable, or it isn't a config at all.
+
+**Off-by-default features are `enabled`-gated blocks, not presence-gated.** Redis coordination, the audit log and the fleet listener are written as complete blocks with `"enabled": false` and every connection knob populated; the serve daemon's `token_keychain` and `read_auth` are written visibly as `false`. The block's *presence* doesn't turn the feature on; the `enabled` flag does. So the whole surface is discoverable (you see exactly what Redis would need) and one edit from on, without darkmux guessing intent from whether a `host` happens to be set.
+
+**Secrets are carved out, never plaintext config.** A `config.json` is a file an operator writes, edits, and might share or commit. So the one thing it never holds is a password: the Redis password and the serve-daemon bearer token live in the macOS Keychain, read at runtime and wrapped so they can only ever reach a log redacted. `config.redis` holds the non-secret connection bits; the Keychain holds the secret. (One other carve-out, for a different reason: `DARKMUX_HOME`, the pointer that *locates* the config root, stays an env var because it can't live inside the file it's there to find. It is the one relocation of the darkmux root: a `./.darkmux/` in the working directory is never adopted.)
+
+**A `0` on a bound means unbounded, and a policy value names the action.** A `0` reads as "no limit" everywhere (`redis.maxlen`, `runtime.step_command_timeout_seconds`, `remote.concurrent_cap`, `remote.max_tokens_per_step`), never as "instantly", except where a zero would be an eternal wait and is refused instead (a budget window). And a setting that says what happens at a limit says it in a word that names the action (`off`, `record`, `warn`, `wait`, `conclude`), never a guessed number: budgets ship off, and warn once set.
+
+Loading is lenient (every field optional, unknown keys caught by an overflow map), so a hand-edited or malformed file never panics the CLI and `darkmux doctor` always runs. Consuming is not: a key the schema does not know is refused at every entry point's preflight and failed by doctor, naming the closest valid key, so a typo can never silently do nothing ([User files](#user-files-the-unknown-key-gate-and-enum-settings)). Additive schema changes are a minor version bump, and an older binary refuses a newer file's new key, so the binary is upgraded before the file is written.
+
+## User files: the unknown-key gate and enum settings
+
+A **user file** is a JSON document the operator writes and darkmux reads at run time: `config.json`, `profiles.json`, role, skill and crew manifests, mission configs, rule files, workload documents, lab fixture manifests, and a crawl's workspace spec (`darkmux_types::user_files::UserFileKind` is the set). None of them is compile-time, so a key the file's schema does not know (a typo, or a key a newer or older darkmux spelled differently) used to do nothing, silently.
+
+**Loading never crashes on it; consuming refuses.** The typed load survives an unknown key (a `#[serde(flatten)] extras` overflow catches it, so one typo never discards the rest of the file) and `darkmux doctor` still runs against a file that is not even JSON. But every entry point that consumes the file refuses at preflight, before minting anything, and doctor reports it as a failure, one row per file. Both name the file, the key's dotted path and the closest valid key. A value of the wrong type, or a missing required key, is refused the same way, because one such value fails the whole typed load: for `config.json` every setting would fall back to its default (Redis and audit silently off), and for a user role, skill or rule the builtin of the same id would silently stand in.
+
+**The valid keys are derived, never listed.** Each kind's keys and value types are its Rust type's derived JSON schema (`schemars::JsonSchema`), walked against the raw document by `key_issues`, so a new field is valid the moment it exists and no key list can drift. The schema honors serde's own attributes (`rename`, `flatten`, `tag`, `untagged`). The `extras` overflow is `#[schemars(skip)]`: it catches keys, it does not make them valid. A flattened map that is itself the schema (a hook rule's `match`) stays open, and each kind's `open_objects` test pins that set. `_comment` is valid in any struct-shaped object, as a note for the reader. `closest` is the only "did you mean" in darkmux: the gate, `darkmux config set` and `mission launch`'s undeclared-parameter warning all call it. Its structural guard is `whatever_the_gate_passes_the_typed_load_accepts`: for every shipped template and example, and for variants that insert a `_comment`, an unknown key or a value of each JSON type at every level, a document the gate passes must load with serde.
+
+**One preflight chain.** `config_enum::preflight` (the config) runs inside `darkmux_profiles::preflight_with` (the registry), which runs inside `darkmux_crew::user_files::preflight_with` (roles, skills, mission configs, rules); every dispatch, mission launch, radio and ACP entry point calls it, and `darkmux_lab::user_files::preflight_with` adds workloads and fixtures for a lab run. A preflight refuses only over a file the operation would load: the effective copy of each mission config and workload id (a copy another tier shadows never loads), and the one fixture the run's workload binds. Doctor fails every file and says when one is shadowed. A workspace spec has no fixed location, so the launch preflight checks the one a launch input names, and `WorkspaceSpec::load` checks it again where the plan step reads it. A step's own `config` is checked the same way against its kind's struct ([Typed step config](#mission-configs-a-steps-config-is-checked)).
+
+**Semantic validation stays at consumption.** The gate answers "is this a key and a type the schema has". Whether a known key's value makes sense (a profile name that resolves, a window that fits) is checked where it is consumed and in doctor, never on the load path, and a value that fails is refused there, never replaced by a default.
+
+**Enum-valued settings follow one rule.** An unregistered value in an enum-typed setting is bad config and is never resolved to a fallback, in either direction. Two declarations in `darkmux-types/src/config_enum.rs` carry everything: a `ConfigEnum` (implemented with `config_enum!`, one row per value with its token and one-line meaning, plus any retired spellings, with an exhaustive `match` so the value list cannot drift from the Rust enum) and an entry in `ENUM_SETTINGS` (the dotted key, the env var, the shipped value and the entry-point scopes that could consume it). Storage stays a string parsed at the accessor, so a bad value never fails the load. Preflight refuses it at every entry point that could consume it (whether or not one particular run would read it), `darkmux doctor` fails it, `darkmux config set` refuses it, and help lists the valid values with their meanings. `--skip-preflight` does not waive it: that flag skips a Docker probe, and a bad config value is not a probe result. Policy values name the action (`off`, `record`, `warn`, `conclude`), never `enforce` or `observe`. Two settings are refused by no preflight, by design, and each registry entry carries a `no_scope_reason` that doctor prints instead of claiming a refusal: `fleet.mode` (no command that starts work reads it) and a hook rule's `match.level` and `match.category` (a bad value turns the hook sink off, loudly, while the run continues). Per-endpoint `profiles.json` enums (`managed`, `dialect`) share the value tables but keep their own refuse-at-use path through `Lenient<T>`.
+
+**The exceptions are named.** The profile registry quarantines a mistyped profile or endpoint entry by name, loudly, instead of failing the file, and the gate leaves that to it. Flow archives stay lenient on read. Nothing else is.
+
+Known gaps: the enum-registry conformance test cannot see a string compared with `==` against a literal outside the registered accessors; that stays a review question. Whatever the schema types as an open value (a mission-config `dispatch.map` collection, a hook rule's `match`) is open to the gate and is checked only where it is consumed.
+
+### Retired spellings are refused, and they name their replacement
+
+A rename is not read as its old name. Each surface that can be misspelled has its own table of retired spellings, and each refusal names what replaced the spelling. There are no aliases.
+
+- **Config keys** are `RENAMED_SETTINGS` and `RETIRED_SETTINGS` in `darkmux_types::config`, each with the line naming its replacement; each other user-file kind has a `RetiredLookup` for its own retired keys. `darkmux config set` refuses a retired key and names the new one.
+- **Environment variables**: `retired_env_leftovers` is one check at CLI entry that refuses every command except `doctor` and `config` (and `--help` and `--version`) while a retired variable is set, and doctor lists each with what replaced it.
+- **Verbs and flags**: `src/retired_verbs.rs` holds the one `RETIRED` table, and `refusal` runs on the raw command line before clap, because a retired spelling can still parse (a retired `lab run <read verb>` reads as the launcher for a workload of that name), so clap's own rejection cannot be the trigger. It exits 2 naming the replacement. `scripts/rs-drift-guard.py` scans Rust string literals for retired verbs, and the docs-drift job scans the docs.
+- **Mission state files** in a retired spelling (a `sprint_ids` key, a `sprints/` directory) are refused by `darkmux_crew::retired_state`, naming the rewrite, and doctor fails each one.
+- **Hook rules** that name a retired action spelling are refused: the hook sink does not load, and doctor fails the rule, naming the spelling to write.
+
+The one place a rename is read leniently is a flow archive, which is never rewritten ([One reader](#one-reader-and-the-legacy-mapping)).
+
+## Endpoints: what darkmux does there, not where they are
+
+darkmux records what it invoked, the endpoint and the model, and never classifies an endpoint by location or cost. The one distinction it draws is its own action (#2902):
+
+| Kind | What darkmux does | What it knows |
+|---|---|---|
+| **Managed** (`"managed": "lmstudio"`, or no endpoint at all) | loads and unloads models with `lms`, dispatches to its own `darkmux:` instance (#2240), plans residency under the RAM budget | the loaded model and window, because it loaded them |
+| **Unmanaged** (an endpoint with a `url`) | only sends requests | the model it requested and whatever the reply reports; what serves the endpoint can change without darkmux seeing it |
+
+The kind is an enum so a further kind is additive. (A fleet machine is not one: running on another machine is a property of the profile address, [`profile@machine`](#fleet-addresses-trust-and-the-execution-channel), and the receiver's own endpoints decide what it does there.) The ROUTING decisions (the dispatch's hosted-or-container branch, the data-boundary check, the busy check's local target, the scheduler's seat placement, and a step's `config.endpoint`) match on it exhaustively with no catch-all, so a new kind is a compile error at each of them. The remaining consumers (residency, labels, doctor, `profile list`) ask the boolean `is_managed()`, and a new kind reads there as "not managed" until each is revisited.
+
+**One resolver, one set of rules.** Endpoints are declared once in `profiles.json`'s `endpoints` map (url, `managed`, `dialect`, `auth` naming where the credential lives, `limits`) and named by id from a profile model. An endpoint declares its kind, either `"managed": "lmstudio"` or a `url` (one with neither is refused at use), and an inline endpoint object on a model is refused, with the exact rewrite named by every dispatching preflight and by `darkmux doctor`. Every path that turns (role, profile) into a request goes through `crew::target::resolve_in`, which returns the SELECTED model together with its own endpoint, dialect, chat URL and window. The endpoint rules themselves (classification, the chat URL, the host a label may show, the credential order) live on `darkmux_types::ModelEndpoint`. Before this there were three resolvers, three "is this remote?" tests, two URL builders, three body builders, three host extractions and the credential order twice, and fixes landed in one copy only (#2904, #2905); the compaction window even came from the profile's default model while selection had picked another. `step_kinds::endpoint_conformance` walks the workspace and fails when a new call site decides any of these on its own.
+
+**Limits are the operator's and they are enforced.** An endpoint's `limits` is a rolling budget with a policy; it is parsed and validated at preflight, shown by `darkmux doctor`, and enforced before each hosted call ([Endpoint budgets](#endpoint-budgets)).
+
+## Endpoint budgets
+
+A budget is the operator's own limit on what darkmux spends at an endpoint, and what reaching it does. **Nothing runs unless the operator sets one**: darkmux ships no number, an endpoint with no `limits.window` (or with `policy: "off"`) is returned as no budget before any file is opened, and a `limits` that cannot be used as written (unreadable, or a period that does not parse) is an error at preflight, never "no budget", so a typo cannot silently disarm one.
+
+An endpoint declares `"limits": {"window": {"period": "1d", "tokens": 2000000}}` (tokens, calls, or both; the period is `<n>m`, `<n>h` or `<n>d`) and a `policy`:
+
+| Policy | On reaching the budget |
+|---|---|
+| `off` | nothing is counted |
+| `warn` (the default once a budget is set) | a CLI line and a Warn-level `budget.warn` record; the call goes ahead. An optional `warn_at` fraction warns once earlier |
+| `wait` | calls to the endpoint pause until enough of the window has expired to leave room, saying how long (a CLI line and a `budget.wait` record), then resume and write `budget.resume` |
+
+**A breach never stops the run.** A waiting call loses no work: the wait is recorded in `darkmux_types::run_pause`, which extends the run's wall-clock bound (the host-side twin of the thermal governor's pause). Every half second the wait checks whether its run was stopped: the process was interrupted, or its mission was aborted or finalized, or its phase abandoned, on disk. `darkmux mission abort` runs in another process and only writes that terminal state, so the waiter reads it rather than being signalled: a pid is not the operator's handle on a run. A stopped wait errors, writes `budget.stop`, and the call is never sent.
+
+**The window is rolling, not calendar.** "The last `period` from now": its spend is the sum of this machine's usage records that carry the endpoint's id (`endpoint_id`), read with the same per-record reading the token sum uses, and both purposes count (a budget is about what the endpoint served). `0` is not a budget and is refused; set `policy` to `off` instead, because read either way a zero would be an eternal wait. "Room" is `spent < budget`, and the next call's cost is unknowable until it returns, so a call admitted with room can overshoot by itself: a soft ceiling.
+
+**Cost was measured.** The window is read before every hosted call to a budgeted endpoint, so it must not rescan history each time. `Ledger` opens only the day files the window can touch and remembers, per file, the byte offset it has read to. The first read in a process pays for the whole window (measured on release builds: about 5 ms for a one-day window, 45 ms for seven days, 180 ms for thirty on a busy machine); every later read costs 0.1 to 0.7 ms.
+
+**The per-step cap is a different knob.** `remote.max_tokens_per_step` caps the hosted tokens one step may spend, and `remote.step_budget_policy` has only `warn` (the default) and `off`, because a step has no rolling window to wait for. It has no default number, `0` is no cap, and `dispatch.map` steps that name the same `bucket_group` share one allowance. The agentic-remote container loop is not metered by the per-step cap; an endpoint budget covers it.
+
+Known gaps: another machine's spend at the same endpoint is not seen, since each window reads its own machine's flow log; records written before an endpoint had an id carry none and are not counted; and a call with no usage at all adds nothing to a token window's known spend ([One token truth](#one-token-truth)). Tokens only, never currency.
+
+## The utility model and lean utility jobs
+
+Some work is darkmux's own: compacting a long conversation, and routing free text onto one mission config for `darkmux radio` and the editor panel. These are bounded, structured jobs where a small model is enough (the utility half of the role families in [CLAUDE.md](CLAUDE.md)). They run on **the machine's one utility model**, declared once in `profiles.json` as `internal.utility`: `{ "id": "<model>", "n_ctx": <window> }`, an object with its window. The bare-string spelling is refused, and the registry does not load with it.
+
+- **Profiles hold work models only.** Every task and step selection path sets the utility binding aside. A profile that still lists it puts work on its other model, a profile that lists only it is a loud error naming the fix, and `mission launch` refuses, before minting anything, a task whose staffing (or a `dispatch.single_shot` or `dispatch.map` step's `config.model`) resolves to it. The lab can still benchmark a candidate utility model through a profile that lists it.
+- **Its window is declared, not inferred.** The compaction payload is bounded by the binding's `n_ctx`. An object with no `n_ctx` declares no window, falls back to a named default, and doctor nudges. With no utility model at all, compaction is off outright for the dispatch, disclosed at dispatch time, and radio and ACP routing refuse to route, naming the fix. There is no fallback to `default_profile`.
+- **Utility jobs are lean.** What counts as one has a single definition, `darkmux_crew::usage::utility_job` (every runtime compactor call and every call by the radio routing role; `call_purpose` and `UtilityJobKind` read it). A job writes `utility.start` when it starts and its `telemetry.tokens` record (`purpose: utility`, `job`) when it ends, and nothing else: no session, no bookends, no run. The markers are emitted at the one chokepoint each half passes through (`darkmux_crew::utility::run_utility_single_shot` on the host; the runtime's compaction-start trajectory event through the tailer).
+- **Accounted and visible, not listed.** The fleet total sums utility under its own chip, and the fleet card's utility strip and the "compacting" scope reading key on `utility.start`, but the runs board, the fleet card's activity and the status line's last dispatch key on bookends, so they show work only. That is the intent: the board used to list dozens of routing runs a day.
+- **The trade is stated.** A routing call can wait behind a compaction on the one utility instance, by decision (#2914). Radio reports what LM Studio says while it waits ([Radio](#radio-free-text-onto-one-command-and-a-confirmation-before-it-runs)).
+
+Radio's *answering* seat is work, not a utility job: it keeps its bookends and its run, staffed through `radio.answerer_profile` and `role_profiles.radio-host`.
+
+Known gap: compaction records (`dispatch.compaction`, `telemetry.compaction`) still carry the specialist's role and model at record level and name the compactor only in `payload.compactor_model`; the per-call usage record is the one that attributes correctly.
+
+## Public surfaces: the daemon's HTTP routes are a contract
+
+The daemon's routes and response shapes are semver contracts, the same as the CLI's `--json` output (next section). A script, another machine's `darkmux machine list --deep`, or the viewer binds to what a route returns, so it changes only on purpose.
+
+**The route table is the one place a route exists.** `crates/darkmux-serve/src/routes.rs` builds the router from `table()`, and `route-table.golden` pins every route's method, path and response type. Adding, removing or renaming a route fails `route_table_matches_the_golden` until the golden is regenerated on purpose (`DARKMUX_REGENERATE_FIXTURES=1 cargo test -p darkmux-serve routes`), which puts the change in the diff, and a CHANGELOG line goes with it. The fleet listener's one route (`POST /fleet/work`, NDJSON) is in the golden too.
+
+**Every JSON body is a named type.** A handler returns one of the types in `crates/darkmux-serve/src/wire.rs` (or a type that lives beside what it describes), through the `json!` and `json_list!` macros, which fail to compile if the type does not exist. A handler builds no `json!` object by hand. The TypeScript the viewer imports is generated from those types (`bun run types:regen`), `bun run types:check` regenerates and diffs so a stale twin fails CI, and `generatedOnly.test.ts` fails when the viewer's `fetchJson<T>` names a type that is not generated. There is no hand-written copy of a route's shape to drift.
+
+**Fields the producer could not read are `null` on the wire**, never a zero or an empty string; an optional field the type marks `skip_serializing_if` is absent instead, and its generated twin is optional. `session` is an internal word (contract 8), so it names no route or field: the drill-in route is `/flow-dispatch/:id` and its fleet twin `/fleet/dispatches/live`.
+
+Known gap: a route's *behavior* (a filter, a status code on an error) is pinned only where a test asserts it; the golden pins the shape.
 
 ## CLI `--json` is a contract
 
@@ -524,67 +469,179 @@ A script or an orchestrator binds to what a verb prints under `--json`, so from 
 - `FindingRecord.emitted` and `ForFinding.emitted`: the model's tool-call arguments, verbatim and opaque by design.
 - `InputJson.default`: a mission input's declared default, which may be a string, a number or a bool.
 - `Profile.use_when`: the profile author's free-form routing hint, kept as written.
-- `Lenient`, `Lenient2`, `Lenient3`, `Lenient4` (a `ManagedBackend`, `Dialect`, `UsageLimits` and `BudgetPolicy` as read from `profiles.json`): each is `T | any` because an unrecognized value from a newer darkmux or a typo is kept and printed as read rather than failing the registry (config leniency, contract 7); `doctor` reports it.
+- `Lenient`, `Lenient2`, `Lenient3`, `Lenient4` (a `ManagedBackend`, `Dialect`, `UsageLimits` and `BudgetPolicy` as read from `profiles.json`): each is `T | any` because an unrecognized value from a newer darkmux or a typo is kept and printed as read rather than failing the registry (an enum value on a registry entry is refused where it is used, contract 9); `doctor` reports it.
 
-## Configuration: visible defaults, gated features, secret carve-outs
+## Schema isolation: darkmux owns its own config
 
-darkmux's settings live in one file, `~/.darkmux/config.json`, resolved with a single precedence everywhere: **env var > `config.json` > built-in default**. The env layer survives as a live override (CI, tests, a one-off shell); `config.json` is the durable surface; the built-in default is the floor. The whole precedence lives in one module so a reader never has to wonder where a value came from, the same *operator sovereignty* principle the rest of darkmux is built on: every default overridable, every value's source explainable.
+Every field an operator sees in a darkmux profile maps to a darkmux-typed schema entry the internal runtime consumes: no decorative fields that look tunable but have no effect. The internal-runtime path (`crates/darkmux-crew/src/dispatch_internal.rs`, `runtime/src/`) reads only darkmux-native typed fields from `profile.runtime.*`; darkmux owns these field names, their semantics, and their evolution. An untyped `extras` map catches keys the type does not know so that a load survives them; nothing in the internal-runtime path reads from it (`from_profile_ignores_openclaw_custom_instructions_extras` and its neighbors pin that), and the [user-file gate](#user-files-the-unknown-key-gate-and-enum-settings) refuses an unknown key at consumption, so forward compatibility means upgrading the binary first. This discipline began when darkmux could shell out to a separately installed agent runtime: the two paths were deliberately schema-isolated (darkmux never translated its profile fields into the other runtime's config shape, and vice versa), so an upstream schema change had zero impact on darkmux. The shell-out was removed ([#1405](https://github.com/kstrat2001/darkmux/issues/1405)), and the rule now stands on its own as "the profile schema is purely darkmux-typed, full stop."
 
-Three choices shape it:
+## Scope of the internal runtime: workflow-fit, not feature creep
 
-**Visible defaults, not hidden code-defaults.** `darkmux init` writes the common knobs *into the file* with their default values, rather than leaving them implicit in the binary. The cost is that a default written today doesn't silently change on upgrade, but that's the point: the operator can *see* what's configurable without reading source, and *change* a default with a file edit instead of a recompile. A config meant to replace env-var sprawl has to be discoverable, or it isn't a config at all.
+When deciding what to add to the internal runtime, the filter is **workflow-fit**: does the feature serve darkmux's own workflow, not "does some other agent runtime have it." darkmux is shaped by three load-bearing decisions:
 
-**Off-by-default features are `enabled`-gated blocks, not presence-gated.** Redis coordination and the audit log are written as complete blocks with `"enabled": false` and every connection knob populated. The block's *presence* doesn't turn the feature on; the `enabled` flag does. So the whole surface is discoverable (you see exactly what Redis would need) and one edit from on, without darkmux guessing intent from whether a `host` happens to be set.
+- **Mission-as-contract.** A phase is a bounded unit of work with explicit inputs (prior phase outputs, scope file), explicit outputs (typed text file persisted to disk), and explicit verify criteria. Cross-phase memory is file-mediated by design, so the frontier orchestrator sees what state moves between phases. Hidden session-state that survives across dispatches breaks this contract.
+- **Utility/specialist split.** Utility agents (4B-class: the compactor, the radio router) handle bounded structured work at high throughput. Specialist agents (35B+: coder, code-reviewer, analyst) handle judgment-dependent work at lower throughput. Features that push specialists toward utility work (mid-dispatch planning, todo tracking, autonomous replanning) collapse the layering that makes the split valuable, turning judgment-bearing work into hidden utility work.
+- **Operator sovereignty + frontier-as-strategic-layer.** The frontier orchestrator (Claude Code) holds the strategic context; utility agents structure under that context; specialists execute within it. Features that move strategic choices *down* into utility or specialist dispatches (opaque session state, automated replanning, scoped planning verbs) quietly relocate decision authority into layers that lack the context to make them well.
 
-**Secrets are carved out, never plaintext config.** A `config.json` is a file an operator writes, edits, and might share or commit. So the one thing it never holds is a password: the Redis password and the serve-daemon bearer token live in the macOS Keychain, read at runtime and wrapped so they can only ever reach a log redacted. `config.redis` holds the non-secret connection bits; the Keychain holds the secret. (One other carve-out, for a different reason: `DARKMUX_HOME`, the pointer that *locates* the config root, stays an env var because it can't live inside the file it's there to find.)
+The filter for any proposed internal-runtime feature: **does this reinforce mission-as-contract, the utility/specialist split, and frontier-as-strategic-layer, or does it blur them?** Features that reinforce land cleanly even when they're small. Features that blur produce "works technically but feels wrong" outcomes that surface as bugs months later.
 
-Loading is lenient (every field optional, unknown keys caught by an overflow map), so a hand-edited or malformed file never panics the CLI and `darkmux doctor` always runs. Consuming is not: since CONFIG 2.0 a key the schema does not know is refused at every entry point's preflight and failed by doctor, naming the closest valid key, so a typo can never silently do nothing. The valid keys are derived from the Rust type (`darkmux_types::user_files`), and the same gate covers every user file. Additive schema changes are a minor version bump; an older binary refuses a newer file's new key.
+## Compaction: tiers, structured slots, and graceful degradation
 
-## Endpoints: what darkmux does there, not where they are
+Compaction is the harness lever with the largest measured wall-clock impact (Articles 1–2), so it gets the most defensive engineering. Two strategies coexist behind one config knob (`profile.runtime.compaction.strategy`):
 
-darkmux records what it invoked, the endpoint and the model, and never classifies an endpoint by location or cost. The one distinction it draws is its own action (#2902):
+- **Narrative** (default): prose summary, replaces the middle of the conversation with a synthetic `user`-role message. The Article-2-era shape.
+- **Structured-slot** (tier-2, [#352](https://github.com/kstrat2001/darkmux/issues/352)): the compactor is called in JSON mode and emits a typed `StructuredCompactionOutput` (objective, current-truth, completed-decisions, errors-to-preserve, next-actions, verify-criteria), rendered as labeled markdown into a synthetic `system`-role message. Per-slot character caps bound each field. The default compactor prompt (the empirically-won "reality-discipline" prompt) frames every slot as *show, don't tell* to suppress the hallucination-class regressions earlier prompt versions produced.
 
-| Kind | What darkmux does | What it knows |
+The design bet behind structured-slot is that **a small model fills labeled slots more reliably than it writes good prose**, and that typed output degrades more gracefully. Three degradation layers make that real, in order:
+
+1. **Lexical JSON repair** ([#401](https://github.com/kstrat2001/darkmux/issues/401) layer 1): a truncated compactor response (runaway escapes, an unterminated string, unbalanced brackets) is walked byte-by-byte and closed off, producing a parseable (if lossy) value rather than a dispatch bail.
+2. **Schema patch** (#401 layer 2): if required fields are still missing after parse, safe defaults are inserted and `compaction_metadata.truncation_patched` is set so downstream analysis can flag the run.
+3. **Escalation bound** ([#377](https://github.com/kstrat2001/darkmux/issues/377)): `reserve.bail_after_compactions` caps how many times one dispatch may compact; past the bound the runtime emits an `EscalationTriggered` terminal for frontier handoff rather than looping forever.
+
+**Who compacts, and with what window.** Compaction is a utility job: it runs on the machine's one utility model (`internal.utility`), which declares its own window, and it writes `utility.start` and a usage record (`purpose: utility`) rather than a bookend pair ([The utility model](#the-utility-model-and-lean-utility-jobs)). The window the compaction *serves* is the selected work model's own, resolved by `crew::target::resolve_in`, not the profile's default model's. With no utility model registered, compaction is off for the dispatch and the dispatch says so; nothing falls back silently.
+
+Two model-shape accommodations round it out: thinking-mode models route JSON to `reasoning_content`, so `extract_compactor_content()` falls back there when `content` is empty; and the JSON-mode request uses LMStudio's `json_schema` response format (decode-time shape enforcement), not OpenAI's looser `json_object`. The dispatch budget (turns/tokens used vs caps) is folded into the structured output's metadata so the model sees its remaining runway, framed as a *floor, not a ceiling*. Every field is darkmux-typed; `custom_instructions` is a typed field appended to the base prompt, not an `extras` passthrough.
+
+## Runtime resilience: struggle detection + feedback injection
+
+A local model in an agent loop fails in characteristic ways: re-reading the same file, re-reasoning the same dead end, hammering a tool that keeps erroring, emitting reasoning until it hits the token cap with nothing to show. The internal runtime carries a family of cheap, edge-triggered detectors for these, plus the recovery and budget machinery to act on them. Three design commitments shape the family:
+
+- **Observability before intervention.** Each detector (cycle, reasoning-loop, tool-failure cascade, cadence-drift) writes a trajectory event and feeds the model a nudge, and nothing else changes: the default is *visible struggle*, not auto-bail. `MAX_TURNS` and the inactivity deadline catch genuinely-stuck dispatches *late*; the detectors exist to surface the struggle *early*, for the operator and (via feedback injection) for the model. The one detector that may act has its authority set by the operator, as a policy value that names the action (`runtime.detection.degeneracy.policy`, an enum setting): `off` does not measure, `record` measures and records silently, `warn` also surfaces a warning, and `conclude` (the shipped default) closes the model's thought so it answers from what it has, escalating if the output keeps repeating; nothing is discarded.
+- **Recover, don't discard.** When a turn hits the per-call token cap but emitted well-formed tool calls, those calls are salvaged rather than treated as a failed turn. The check-in that used to create those cap hits no longer truncates anything: see [The check-in](#the-check-in-observing-a-stream-instead-of-truncating-it) below, which supersedes the mechanism described here while keeping the commitment. A `finish_reason=length` turn with no content and no tool calls (pure runaway reasoning) is dropped, nudged, and retried within a small budget before escalating. Tool calls the model wrote as plain text (bracket, harmony, or darkmux's XML extension) are promoted back to structured calls instead of being lost ([#406](https://github.com/kstrat2001/darkmux/issues/406)). Each recovery is itself a trajectory event so bail/recovery rates stay visible.
+- **Feedback injection is the model-facing half.** Detectors and recovery paths queue synthetic `[darkmux-runtime]`-prefixed `system` messages drained into the next turn's prompt: telemetry the model can act on, not just telemetry the operator reads after the fact. The bracketed prefix is the term-provenance contract (see the model-facing-prompt doctrine in [`CLAUDE.md`](CLAUDE.md)); per-signal wording is overridable per role via the manifest's `feedback_templates`, and the whole channel is disable-able with `DARKMUX_FEEDBACK_INJECTION=0`. The deadline and budget caps (`--max-turns` / `--max-tokens`, opt-in; `DARKMUX_INACTIVITY_TIMEOUT_SECONDS` with a 75% soft warning before the host's 100% hard kill) are the coarse backstops underneath the fine-grained detectors.
+
+The unifying principle is operator-sovereignty applied to the runtime: every detector is observable in the trajectory, every nudge is attributable to a named signal, every bound is operator-tunable, and nothing silently changes the dispatch without leaving a record of why.
+
+## The check-in: observing a stream instead of truncating it
+
+A long model turn needs a point at which the runtime can ask "is this still productive?". Before [#2836](https://github.com/kstrat2001/darkmux/issues/2836) that point was created by stopping the model: the check-in interval was sent as `max_tokens` on the chat-completions request, the endpoint truncated the response at that many tokens, and the runtime inspected what came back and handed it forward as a prefill.
+
+### Why that design failed
+
+`tool_calls` and `content` are separate fields in the response, but they are produced by one generation pass. A cut at N tokens lands wherever the model happens to be. When it landed inside a tool call's `arguments`, the result was JSON that does not parse. Such a call cannot be dispatched, and it cannot be sent back either (an assistant message containing malformed `arguments` causes the next request to fail), so it was discarded. The model's own reasoning, which described the action it had just committed to, was handed back with the action missing. Measured: the model reads that transcript, concludes it has already answered, and stops.
+
+Four runs on the same fixture, before the fix: **9 of 14 check-in firings destroyed a tool call (64%)**. Every one was an `edit` call cut after a single character of arguments. No run passed its verify step. The discards left no trajectory record at all, so a run that lost nine tool calls was indistinguishable, from its own artifacts, from a run that had not used tools.
+
+### The design
+
+The interval is no longer sent to the endpoint. It becomes an **observation cadence**: the runtime already receives the response as a stream, so it reads each chunk as it arrives, accumulates the generated text, and at each cadence boundary runs the same degeneracy check the old design ran after truncating. A clean verdict costs nothing: no truncation, no round trip, no re-sent prefill, and nothing the model can observe. Intervention happens only when the check fires.
+
+| Bound | Sent to the endpoint | Enforced by | Purpose |
+|---|---|---|---|
+| Check-in interval (`reasoning_checkpoint_interval_tokens`, `generation_checkpoint_interval_tokens`) | no | runtime, per streamed chunk | how often the output is examined |
+| Per-call ceiling (`max_tokens_per_call`) | yes, as `max_tokens` | endpoint | backstop against unbounded generation |
+| Read timeout | n/a | transport | detects an endpoint that has stopped sending |
+
+Four properties of the runtime-side check are load-bearing:
+
+**The cadence counts characters, not chunks and not tokens.** A staged plan proposed counting chunks, based on a measurement that chunks tracked tokens roughly 1:1 on one engine. Across 61 later calls that ratio ran 0.02 to 1.00 (a 43x spread), because a speculative-decoding engine emits however many draft tokens the verify step accepted in a single chunk. Characters are read directly off the deltas and need no conversion. The token-denominated interval an operator configures is converted using a constant of 4 characters per token, and each call's measured ratio is recorded on `model.streaming.end` so the constant stays checkable. Being wrong there costs cadence, not correctness: a boundary landing early or late only changes how often a healthy stream is examined for free.
+
+**The check is suspended for any call that has begun emitting a tool call.** The degeneracy metric scores JSON at 0.003 against a 0.25 threshold, so a call writing structured arguments reads as maximally repetitive. This is wider than "while the arguments are open" on purpose: once a tool call starts, the check does not run again for the rest of that call. A model that emits a call and then repeats in a long answer is left to the ceiling. Suspending costs nothing; a false positive costs committed work.
+
+**The verdict sees the whole turn, not one call.** A turn is many calls (a check-in continuation deliberately does not consume a turn), and a model re-treading ground from three continuations ago produces calls that each look novel in isolation. The runtime-side check is therefore seeded with the turn's accumulated output before reading the first chunk of the current call. An earlier version judged only the current call and aborted one turn six times in a row while the post-turn check, looking at the full accumulation, returned "continue" every time.
+
+**The runtime ends the stream itself, so the terminal state is synthesized.** `finish_reason` and `usage` arrive only on the endpoint's final chunk, which a runtime abort never receives. The abort therefore sets `finish_reason: "length"` (routing into the existing path that closes the reasoning region and hands the accumulation back) and records the cut source explicitly, because downstream predicates that used to infer "did we cut this?" from a token comparison have no token count to compare.
+
+### Cut sources
+
+Two predicates need to distinguish a bound the runtime imposed from the model's context window overflowing. Both used to compare `completion_tokens` against the cap that was sent, and they resolved an absent `usage` in opposite directions, several hundred lines apart, with nothing naming the difference. They now read a `CutSource`:
+
+| Source | Meaning |
+|---|---|
+| `None` | the model stopped on its own (`stop`, `tool_calls`) |
+| `ServerLength { measured_at_cap }` | the endpoint reported `length`; whether that was our cap is measured, or unknown when no `usage` arrived |
+| `RuntimeAbort(Degenerate \| Silent)` | the runtime ended the stream |
+
+The salvage path asks `is_ours_confirmed()`, where unknown reads as *no*: salvaging dispatches tool calls that may have been truncated. The overflow check asks `is_ours_or_unknown()`, where unknown reads as *yes*: the alternative is a hard error that ends the dispatch and discards every banked continuation, and diagnosing an overflow requires a measured count below the cap to diagnose from.
+
+### The per-call ceiling
+
+`max_tokens_per_call` was documented as a failure boundary against runaway generation, set to 10,000 because the only way to notice a runaway was to stop and look. The runtime-side check now looks continuously, and a runaway is repetition, which is what the check detects. The ceiling is therefore no longer the mechanism that notices anything; it is a backstop.
+
+It is raised to **32,000** and left on the wire. Raised, because the largest productive call observed on this workload was 18,875 tokens and the runaway signature the constant was written against is roughly 50,000. Left on the wire, because the endpoint counts tokens and the runtime counts characters: measured across 85 calls, the true ratio of generated characters to `completion_tokens` spans 0.01 to 3.89, so no constant converts one to the other. An attempt to enforce the ceiling runtime-side failed live for exactly that reason: the runtime was still below its character threshold when the endpoint's own cap cut a tool call at 12,000 tokens.
+
+Two premises in the constant's original rationale are also no longer true, and both were arguments for keeping it low:
+
+- *A capped turn's reasoning is discarded entirely.* It is handed back as a prefill and the turn resumes.
+- *The cap limits what a turn may spend.* It does not. A turn is many calls, so the same work arrives either way; a low cap only decides whether it arrives as one call or several, each re-sending the accumulated prefill. Measured: 8 calls and 20,000 completion tokens inside one turn.
+
+Raising the ceiling also moved `max_generation_continuations`, which is `(max_tokens_per_call / generation_interval).max(4)`, from 4 to 8. That is past the first point at which the degeneracy check can return a verdict on a verbatim loop (a fixed k=5, since the metric's numerator and denominator scale together). A repeating turn now ends on the repetition that was observed rather than on a continuation budget expiring, which is an accounting fact true of any turn of that length. A regression test asserts that relationship directly, so retuning either constant back into collision fails with a message naming the constant to change.
+
+### The silence guard
+
+Repetition is visible in the stream. An endpoint that has stopped sending is not distinguishable from one that is merely slow, which makes silence the one failure this design cannot detect by reading output. It is bounded by the transport instead.
+
+The HTTP client uses a **read** timeout, not an overall request timeout. The distinction matters: the overall timeout in use previously included body read, so it bounded how long a call could take rather than how long it could be idle. Nothing hit it while the check-in was chopping every call at 1,000 tokens; removing that chopping made a single 18,875-token call plausible, which at measured generation rates is close to the 900-second bound.
+
+An idle stream ends the turn as `RuntimeAbort(Silent)` and the accumulation is handed back. Previously it propagated as an error, which produces a dispatch result of `error` with no envelope, no metrics and no deliverable: every banked continuation of a long turn lost because the endpoint went quiet at the end of it. Genuine transport failures still propagate. The two are distinguished by a typed marker rather than by matching on the error's text, because a text match fails silently when a dependency rewords its message and a failed match is indistinguishable from "not a timeout".
+
+### What the records say
+
+| Event | Log | Field | Answers |
+|---|---|---|---|
+| `dispatch.tool_call.discarded` | trajectory | `name`, `arguments_chars`, `cut` | a tool call was destroyed, which one, how much was written, and what cut it |
+| `dispatch.gate.abort` | trajectory | `slice_chars`, `generated_chars`, `tool_call_in_flight` | the runtime ended a call, what it judged, and how much of that was this call |
+| `dispatch.checkpoint` | trajectory (the flow record the host writes from it omits this field) | `judged_chars` | how much text the verdict was computed over |
+| `model.streaming.end` | trajectory | `observations`, `chars_per_token` | how many times the stream was examined without being touched, and the measured cadence calibration |
+
+The runtime writes these to the trajectory, not to the flow stream ([Two logs](#two-logs-the-flow-stream-and-the-trajectory)); a reader looking for one in the flow stream will not find it.
+
+`judged_chars` exists because a verdict of "continue" could not previously be distinguished from a check that had nothing to examine. Both appear identical in the record. One turn produced six consecutive `continue` verdicts over **zero characters**: closing the reasoning region switches the examined region to the answer, a model that reasons entirely through the separate `reasoning_content` field never writes an answer, and the check read an empty string from then on. A pass computed over no input is not evidence of health.
+
+`chars_per_token` is recorded only on calls that emitted no tool calls. The cadence counts text and deliberately excludes tool-call arguments; `completion_tokens` counts both. On a tool-calling call the ratio therefore collapses (median 1.58 against 3.93 on text-only calls), and publishing it would suggest the conversion constant is twice too high when it is correct.
+
+### Measured outcome
+
+| | before | after |
 |---|---|---|
-| **Managed** (`"managed": "lmstudio"`, or no endpoint at all) | loads and unloads models with `lms`, dispatches to its own `darkmux:` instance (#2240), plans residency under the RAM budget | the loaded model and window, because it loaded them |
-| **Unmanaged** (an endpoint with a `url`) | only sends requests | the model it requested and whatever the reply reports; what serves the endpoint can change without darkmux seeing it |
+| tool calls destroyed by the check-in | 9 in 61 calls | **0** |
+| share of check-in firings that destroyed work | 64% | 0% |
+| verify passing | 0 of 4 runs | 3 of 4 runs |
 
-The kind is an enum so a third one is additive (a fleet machine, #2916). The ROUTING decisions (the dispatch's hosted-or-container branch, the data-boundary check, the busy check's local target, the scheduler's seat placement, and a step's `config.endpoint`) match on it exhaustively with no catch-all, so a new kind is a compile error at each of them. The remaining consumers (residency, labels, doctor, `profile list`) ask the boolean `is_managed()`, and a new kind reads there as "not managed" until each is revisited.
+### Known gaps
 
-**One resolver, one set of rules.** Endpoints are declared once in `profiles.json`'s `endpoints` map (url, `managed`, `dialect`, `auth` naming where the credential lives, `limits`) and named by id from a profile model; an inline object on the model is the pre-4.0 spelling, still read. Every path that turns (role, profile) into a request goes through `crew::target::resolve_in`, which returns the SELECTED model together with its own endpoint, dialect, chat URL and window. The endpoint rules themselves (classification, the chat URL, the host a label may show, the credential order) live on `darkmux_types::ModelEndpoint`. Before this there were three resolvers, three "is this remote?" tests, two URL builders, three body builders, three host extractions and the credential order twice, and fixes landed in one copy only (#2904, #2905); the compaction window even came from the profile's default model while selection had picked another. `step_kinds::endpoint_conformance` walks the workspace and fails when a new call site decides any of these on its own.
+- **The non-streaming path is unchanged.** The interval can only come off the wire because the runtime can observe the stream instead; with `--no-stream` there is nothing to observe, so the endpoint-side bound remains the only check-in available.
+- **A second degenerate verdict after the reasoning region is closed escalates immediately** ([#2839](https://github.com/kstrat2001/darkmux/issues/2839)). That is correct in that it hands off rather than looping, but it leaves one remedy between "continue" and "stop". Two of three runs in one series ended this way; whether the threshold is too eager is not yet measured at a useful sample size.
+- **The conversion constant is a single value for all content.** It is checkable from the records but not yet adaptive.
 
-**Limits are declared before they are enforced.** Each endpoint's `limits` is parsed, validated and shown by `darkmux doctor` today; enforcement is a separate step that replaces the `remote.*` knobs with one per-endpoint regime. A value that changes nothing is labeled as such wherever it is shown.
+## Lab reproducibility: fixtures + content hashing
+
+The lab harness only earns the word "measurement" if a run is reproducible. The fixture cluster ([#487](https://github.com/kstrat2001/darkmux/issues/487)) closed the two gaps that made earlier `coding-task` numbers untrustworthy: runs mutating their own inputs, and no way to prove two runs started (or ended) in the same place.
+
+- **Per-run COW isolation.** Each run operates on a copy-on-write clone of the source fixture, never the source. The clone is cheap on COW filesystems (`clonefile` on APFS, `--reflink` on btrfs/xfs/zfs) and falls back to a deep copy elsewhere. The provider trait is unchanged: providers see a sandbox path and don't know it's a clone. This eliminated the cross-run baseline drift observed in earlier lab runs.
+- **Content hashing as proof, not policy.** `baseline_hash` (source state at clone time) and `final_hash` (post-dispatch sandbox state) are BLAKE3 over a deterministic walk that excludes derived dirs (`.git`, `node_modules`, `target`, `__pycache__`, `.darkmux-runtime`). Determinism is the point: same content + same layout → same hash, independent of mtimes or inode order. Equal `final_hash` across two runs is the strongest reproducibility signal the lab can emit. Hashing is best-effort: a failure logs and records `null` rather than aborting the dispatch.
+- **Registry, not embedded sandboxes.** A fixture is an operator-owned directory with a `.fixture.json` manifest; the registry (`lab-registry.json`) is a name→path lookup plus integrity metadata. `lab fixture register`/`lab fixture unregister` never move or delete the directory (operator sovereignty: `lab fixture unregister` drops the *entry*, full stop). Workloads bind to fixtures abstractly via `requires_fixture: "<name>@<version>"`, resolved against each fixture's `satisfies` declaration. `lab doctor` makes drift detectable offline before a dispatch is wasted on it.
 
 ## Seat classes: every step says what it consumes
 
 A mission is a graph of steps, and the scheduler has to decide, for each one, how many of its siblings may run alongside it. That decision needs one fact: what does this step consume?
 
-For a long time the question was asked in a form that could not carry the answer. A step kind was asked for an *optional model placement*, and the default answer — the one every kind got for free by never implementing the hook — was "none". But "none" was three different facts wearing one word: *this seat is a hosted endpoint*, *this step speaks to no model at all*, and *this was supposed to be a local model and resolution broke*. The scheduler could only act on the word, so it treated all three as hosted endpoints and bounded them by the cap that exists to respect a hosted provider's rate limit.
+For a long time the question was asked in a form that could not carry the answer. A step kind was asked for an *optional model placement*, and the default answer (the one every kind got for free by never implementing the hook) was "none". But "none" was three different facts wearing one word: *this seat is a hosted endpoint*, *this step speaks to no model at all*, and *this was supposed to be a local model and resolution broke*. The scheduler could only act on the word, so it treated all three as hosted endpoints and bounded them by the cap that exists to respect a hosted provider's rate limit.
 
-That cap is 1 on a mission launch. So six `procedural.shell` steps waiting for six independent things — none of which involves a model, a network call, or a rate limit — ran strictly one at a time, each waiting out the previous one's full timeout. A nine-minute window became fifty-four minutes, and nothing in the run's records said why: six steps with the same start second, and one `sleep` running at any moment.
+That cap is 1 on a mission launch. So six `procedural.shell` steps waiting for six independent things (none of which involves a model, a network call, or a rate limit) ran strictly one at a time, each waiting out the previous one's full timeout. A nine-minute window became fifty-four minutes, and nothing in the run's records said why: six steps with the same start second, and one `sleep` running at any moment.
 
 The fix is not a special case for shell steps. It is making the question answerable. A step kind now declares a **seat class**, and there are four:
 
 | Claim | What it means | How it is scheduled |
 |---|---|---|
-| `LocalModel(placement)` | needs this model resident locally | gestalt plans a wave for it; it holds a residency lease so a concurrent darkmux command cannot pass-1-evict its model as not-desired, whether that command is running in ANOTHER process or is a same-process sibling dispatch (#2663) — a live sibling's model at the SAME model key but an insufficient context is protected too (#2669), and two siblings that are BOTH merely racing to acquire the same identifier (neither loaded yet) no longer mutually Block each other either (#2672): the placement Blocks (with a bounded hold-not-fail retry, gated to the genuinely clearable case) instead of unloading it out from under the sibling. Qualifier: this protection covers `darkmux:*`-namespaced pins and a placement's own exact-alias self-match; a pin naming a DIFFERENT process's custom (non-`darkmux:`) alias identifier is not yet seeded into the claimed set (#2672 CONSIDER 6, a known residual gap) |
-| `RemoteEndpoint` | a hosted endpoint | bounded by `remote.concurrent_cap` — consumes no local pool |
+| `LocalModel(placement)` | needs this model resident locally | gestalt plans a wave for it; it holds a residency lease so a concurrent darkmux command cannot pass-1-evict its model as not-desired, whether that command is running in ANOTHER process or is a same-process sibling dispatch (#2663): a live sibling's model at the SAME model key but an insufficient context is protected too (#2669), and two siblings that are BOTH merely racing to acquire the same identifier (neither loaded yet) no longer mutually Block each other either (#2672): the placement Blocks (with a bounded hold-not-fail retry, gated to the genuinely clearable case) instead of unloading it out from under the sibling. Qualifier: this protection covers `darkmux:*`-namespaced pins and a placement's own exact-alias self-match; a pin naming a DIFFERENT process's custom (non-`darkmux:`) alias identifier is not yet seeded into the claimed set (#2672 CONSIDER 6, a known residual gap) |
+| `RemoteEndpoint` | a hosted endpoint | bounded by `remote.concurrent_cap`: consumes no local pool |
 | `NoModel` | dispatches nothing at all | bounded by `runtime.dispatch_free_concurrency` (default 8), and per command by `runtime.step_command_timeout_seconds` |
-| `LocalModelUnresolved { reason }` | meant to be local; the placement would not resolve | runs under the remote cap, exactly as before — but loudly, naming the step and the reason on stderr and in the flow stream |
+| `LocalModelUnresolved { reason }` | meant to be local; the placement would not resolve | runs under the remote cap, exactly as before, but loudly, naming the step and the reason on stderr and in the flow stream |
 
 Three properties are worth stating, because each was chosen against an alternative.
 
 **There is no default.** The hook is required, with no body to inherit. A new step kind does not compile until its author says what it consumes. This is the same reason the fourth claim exists at all rather than folding back into the second: the old fail-open was *correct behavior* for a genuinely remote seat and a *silently lost safety guarantee* for a broken local one, and one return value could not tell an operator which had happened. Now the run's own records say.
 
-**Extension is a variant, and the compiler finds every site.** Adding a fifth class is a new enum variant; the places that must handle it — the executor's partition into tracks, the label stamped onto the record — are exhaustive matches with no catch-all arm, so they fail to compile until they are updated. The old shape had the opposite property: a new case fell into an existing arm and behaved like something it was not, which is exactly how this bug lived.
+**Extension is a variant, and the compiler finds every site.** Adding a fifth class is a new enum variant; the places that must handle it (the executor's partition into tracks, the label stamped onto the record) are exhaustive matches with no catch-all arm, so they fail to compile until they are updated. The old shape had the opposite property: a new case fell into an existing arm and behaved like something it was not, which is exactly how this bug lived.
 
-**The caps stay separate.** It is tempting to make the dispatch-free track unbounded — nothing there is rate-limited by anyone. But `mods.gate` runs an operator-supplied test command per mod, and "as many test suites at once as the graph happens to contain" is a real machine load, not a free lunch. It gets a generous default and a visible knob, which is the same shape every other bound in darkmux has.
+**The caps stay separate.** It is tempting to make the dispatch-free track unbounded: nothing there is rate-limited by anyone. But `mods.gate` runs an operator-supplied test command per mod, and "as many test suites at once as the graph happens to contain" is a real machine load, not a free lunch. It gets a generous default and a visible knob, which is the same shape every other bound in darkmux has.
 
 ## Phase status: a set of tasks is not one unit of work
 
-A mission graph has two levels that look alike and are not. A **task** is one unit of work — a chain of steps that either did the thing or did not. A **phase** is a *set of independent tasks* that happen to run together.
+A mission graph has two levels that look alike and are not. A **task** is one unit of work: a chain of steps that either did the thing or did not. A **phase** is a *set of independent tasks* that happen to run together.
 
-For a long time one predicate served both: *any `Error` wins; else any `Running`; else all-`Complete`; else `Abandoned`; else `Planned`*. At the task level that is exactly right — a task whose second step failed is a failed task, and no amount of earlier success changes it. Applied to a phase, the same words say something false. A review mission's Review phase read **ERROR** while one of twelve unit tasks had errored, seven had completed, and four were still running. The phase was not failed. It was not even over.
+For a long time one predicate served both: *any `Error` wins; else any `Running`; else all-`Complete`; else `Abandoned`; else `Planned`*. At the task level that is exactly right: a task whose second step failed is a failed task, and no amount of earlier success changes it. Applied to a phase, the same words say something false. A review mission's Review phase read **ERROR** while one of twelve unit tasks had errored, seven had completed, and four were still running. The phase was not failed. It was not even over.
 
 The envelope collapsed the same way from the other side: `errored > 0` became `Abandoned("N step(s) errored")`, so a debrief called a phase with eleven successes "abandoned".
 
@@ -603,69 +660,129 @@ Task level is untouched. `Degraded` is the word the mission vocabulary already u
 
 Five properties are worth stating, because each was chosen against an alternative.
 
-**`Degraded` is terminal, and it closes the phase on disk.** It drives `lifecycle::phase_complete`, exactly as `Complete` does. This looks like the bug returning — the CLI counting a mixed phase as complete — and it is not the same thing. The phase *is* finished and it *did* produce output; a lifecycle that reopened it would be lying in the other direction. What changed is that the reporting surfaces can tell the two apart. Where the lifecycle needs one bit (is this phase still consuming a seat?), the operator needs the distinction, and those are different questions that were being answered by one field.
+**`Degraded` is terminal, and it closes the phase on disk.** It drives `lifecycle::phase_complete`, exactly as `Complete` does. This looks like the bug returning (the CLI counting a mixed phase as complete), and it is not the same thing. The phase *is* finished and it *did* produce output; a lifecycle that reopened it would be lying in the other direction. What changed is that the reporting surfaces can tell the two apart. Where the lifecycle needs one bit (is this phase still consuming a seat?), the operator needs the distinction, and those are different questions that were being answered by one field.
 
-**The counts travel with the status, as text.** `Degraded` alone cannot separate eleven-of-twelve succeeded from one-of-twelve succeeded, and those deserve different reactions. So the status carries `7 complete · 1 errored · 4 running` wherever it is shown — and *shown* means rendered, not `title=`. A tooltip does not exist on a phone, and this viewer is driven from one.
+**The counts travel with the status, as text.** `Degraded` alone cannot separate eleven-of-twelve succeeded from one-of-twelve succeeded, and those deserve different reactions. So the status carries `7 complete · 1 errored · 4 running` wherever it is shown, and *shown* means rendered, not `title=`. A tooltip does not exist on a phone, and this viewer is driven from one.
 
-**Every reporting surface gets the distinction, or the fix is half-done.** The first cut taught the graph lens and the envelope about `Degraded` and left `mission status` and `mission debrief` counting it as plain `complete`. That is not a smaller version of the fix; it is the same defect with the volume turned down — the board moved from wrong-and-loud ("abandoned") to wrong-and-quiet ("complete"), which is worse, because nobody investigates a green board. A status vocabulary is a contract across surfaces or it is decoration on one. That is a claim about the surfaces that *read* a phase outcome, and deliberately not yet a claim about every *producer* of one: `src/coder_phase.rs`'s `finalize_mission_if_complete` still derives each `PhaseOutcome` from the persisted `PhaseStatus` alone (`Complete` maps to `Complete`, anything else to `Abandoned`), so a coder-phase mission's envelope cannot carry `Degraded` whatever its tasks did. Nothing reads wrong because of it — the word simply never arrives from that producer — but a surface can only draw a distinction its producer made, so that one is named, not finished.
+**Every reporting surface gets the distinction, or the fix is half-done.** The first cut taught the graph lens and the envelope about `Degraded` and left `mission status` and `mission debrief` counting it as plain `complete`. That is not a smaller version of the fix; it is the same defect with the volume turned down: the board moved from wrong-and-loud ("abandoned") to wrong-and-quiet ("complete"), which is worse, because nobody investigates a green board. A status vocabulary is a contract across surfaces or it is decoration on one. That is a claim about the surfaces that *read* a phase outcome, and deliberately not yet a claim about every *producer* of one: `src/coder_phase.rs`'s `finalize_mission_if_complete` still derives each `PhaseOutcome` from the persisted `PhaseStatus` alone (`Complete` maps to `Complete`, anything else to `Abandoned`), so a coder-phase mission's envelope cannot carry `Degraded` whatever its tasks did. Nothing reads wrong because of it (the word simply never arrives from that producer), but a surface can only draw a distinction its producer made, so that one is named, not finished.
 
-**The envelope counts tasks, not steps — the same rule, one level down.** The first cut had the display roll up *tasks* while the envelope rolled up raw *steps*, and they disagreed on any phase whose mix lived inside a single multi-step task: `[Complete, Abandoned]` steps in one task read `Degraded` in the envelope and `Abandoned` in the lens, with `complete` on disk — three words for one phase. Counting steps is the mirror image of the bug this section exists to fix, applied one level too low: a task's steps are *stages*, not independent deliverables, so a half-finished unit is not "output shipped, something lost", it is a unit that did not finish. The envelope now groups by `task_id` first. One divergence is deliberately left: `[Complete, Error]` inside one task reads `error` on one side and `Abandoned` on the other, because `PhaseOutcomeKind` has no `Error` variant — that predates this change, and it is written into the test rather than papered over by forcing agreement.
+**The envelope counts tasks, not steps: the same rule, one level down.** The first cut had the display roll up *tasks* while the envelope rolled up raw *steps*, and they disagreed on any phase whose mix lived inside a single multi-step task: `[Complete, Abandoned]` steps in one task read `Degraded` in the envelope and `Abandoned` in the lens, with `complete` on disk: three words for one phase. Counting steps is the mirror image of the bug this section exists to fix, applied one level too low: a task's steps are *stages*, not independent deliverables, so a half-finished unit is not "output shipped, something lost", it is a unit that did not finish. The envelope now groups by `task_id` first. One divergence is deliberately left: `[Complete, Error]` inside one task reads `error` on one side and `Abandoned` on the other, because `PhaseOutcomeKind` has no `Error` variant: that predates this change, and it is written into the test rather than papered over by forcing agreement.
 
-**An additive enum variant on a persisted shape needs a catch-all in the same change.** `PhaseOutcomeKind` gained `Degraded` and, in the same commit, `#[serde(other)] Unknown`. Without it an older binary reading a newer envelope does not degrade one phase — `serde` fails the **whole document**, because `#[serde(default)]` on the `phases` vector covers a missing field, not a failing element. The lesson generalizes past this enum: on any shape that outlives the binary that wrote it, the catch-all is part of adding the variant, not a follow-up.
+**An additive enum variant on a persisted shape needs a catch-all in the same change.** `PhaseOutcomeKind` gained `Degraded` and, in the same commit, `#[serde(other)] Unknown`. Without it an older binary reading a newer envelope does not degrade one phase: `serde` fails the **whole document**, because `#[serde(default)]` on the `phases` vector covers a missing field, not a failing element. The lesson generalizes past this enum: on any shape that outlives the binary that wrote it, the catch-all is part of adding the variant, not a follow-up.
 
 ## The command gate: darkmux runs your shell-outs, not its own
 
-Some mission configs exist to run a command that changes something outside darkmux — approve a pull request, merge it, apply a deployment. They are ordinary `procedural.shell` graphs an operator wrote, shelling out to a tool the operator already has installed and signed in, exactly like the `lms` and `zed` shell-outs elsewhere in the binary.
+Some mission configs exist to run a command that changes something outside darkmux: approve a pull request, merge it, apply a deployment. They are ordinary `procedural.shell` graphs an operator wrote, shelling out to a tool the operator already has installed and signed in, exactly like the `lms` and `zed` shell-outs elsewhere in the binary.
 
 **darkmux holds no credentials of its own.** That is the whole security posture, and it is what makes the gate necessary rather than paranoid: darkmux is borrowing the operator's authenticated tool. A config that can run `gh pr merge` on your behalf is a config that can merge a pull request with your identity, and nothing in darkmux authenticated to earn that.
 
-So a config may declare a `cmd` — a name — and darkmux refuses to run it until that exact name appears in the operator's own allowlist:
+So a config may declare a `cmd` (a name) and darkmux refuses to run it until that exact name appears in the operator's own allowlist:
 
 ```json
 { "cmd": { "enabled": true, "allowed": ["pr-approve", "pr-merge"] } }
 ```
 
-It **fails closed on both counts**: `enabled: false` blocks every declaring config regardless of the list, and a name absent from the list is blocked even when the gate is on. `darkmux init` writes the block visible, disabled, with an empty list — darkmux ships no opinion about which commands exist.
+It **fails closed on both counts**: `enabled: false` blocks every declaring config regardless of the list, and a name absent from the list is blocked even when the gate is on. `darkmux init` writes the block visible, disabled, with an empty list: darkmux ships no opinion about which commands exist.
 
 **The gate knows nothing about what it is gating.** It compares one string against a list. It has no model of pull requests, no knowledge of any tool's subcommands, no notion of what "merge" means. That is deliberate: the operator's configs name their own commands, and the operator opts each one in.
 
-<!-- flow-action-guard:allow — a policy field, not an action -->
-This is why the field is `cmd` and not `gh_verb`, which is what it was called until schema 3.0. The mechanism was always neutral, but the *name* was not, and a name is what people build on: a GitLab user was allowlisting `mr-merge` under `gh.allowed`, and a config gating `terraform apply` — which wants this gate exactly as much — had to declare a GitHub-shaped field to get a check that has nothing to do with GitHub. Renaming it cost one schema major and zero migrations, because no document had declared it yet. Waiting would have cost both.
+<!-- flow-action-guard:allow, a policy field, not an action -->
+This is why the field is `cmd` and not `gh_verb`, which is what it was called until schema 3.0. The mechanism was always neutral, but the *name* was not, and a name is what people build on: a GitLab user was allowlisting `mr-merge` under `gh.allowed`, and a config gating `terraform apply` (which wants this gate exactly as much) had to declare a GitHub-shaped field to get a check that has nothing to do with GitHub. Renaming it cost one schema major and zero migrations, because no document had declared it yet. Waiting would have cost both.
 
-**One asymmetry is worth stating plainly, because it drove the migration's design.** The gate fails *open* for configs that declare nothing: a config with no `cmd` is never blocked, which is correct — most configs dispatch models and touch nothing outside darkmux, and requiring every one of them to declare a name would make the gate noise. But it means a config that *loses* its declaration silently loses its gate. So a document still carrying the old `gh_verb` key is a loud validation **Error**, never a quiet overflow into the forward-compat bag where unknown keys normally land. An unrecognized field is usually harmless; this one would specifically un-protect the thing it was added to protect.
+**One asymmetry is worth stating plainly, because it drove the migration's design.** The gate fails *open* for configs that declare nothing: a config with no `cmd` is never blocked, which is correct: most configs dispatch models and touch nothing outside darkmux, and requiring every one of them to declare a name would make the gate noise. But it means a config that *loses* its declaration silently loses its gate. So a document still carrying the old `gh_verb` key is refused by name, as a retired key of the [user-file gate](#user-files-the-unknown-key-gate-and-enum-settings) (its message says the key is ignored and the config would run without the allowlist it asked for), never a quiet overflow. An unrecognized field is usually harmless; this one would specifically un-protect the thing it was added to protect.
 
-## Hooks: how records leave the machine, and who is allowed to hold a credential
+## Mission configs
 
-A hook is not a feature bolted onto the crawler or the review pipeline. It is a **`FlowSink` like every other** — the fourth child of the same tee that already fans a record out to the local day file, the audit chain, and Redis. Its `write` matches the record against operator-configured rules and appends matches to a per-rule on-disk outbox; a drainer thread POSTs them and advances a cursor only after a success.
+A mission config is a JSON document that declares a whole graph as data: `inputs`, then phases holding tasks holding steps. `darkmux mission launch <config>` is the only way a mission graph is made from a config (a one-shot `darkmux dispatch` mints a crew-of-one mission of its own), and the generic launcher (`src/mission_launch.rs`) is the only path a config takes to a graph: it interprets the config, mints the graph, and drives it one phase at a time through the scheduler. The verbs that built missions by hand are gone, and so is every bespoke launcher; `review` and `crawl` are ordinary configs (the shipped four are `coder-phase`, `review`, `crawl` and `machine-status`). What follows is what makes a config safe to author and predictable to run: its step configs are checked before anything starts, a disabled step never exists in the run, a step's output can grow the graph, and a task can declare which failures it survives. `MISSION_CONFIG_SCHEMA` is the config's own semver, and a major bump refuses documents the older shape accepted.
 
-Two consequences fall out of that placement, and both are the reason it was placed there. Every record kind is hookable with **zero producer-side awareness** — thermal transitions, tool calls, and mission bookends all became deliverable without one line of change at the site that emits them. And delivery is **at-least-once, durable across restarts**: the queue is a file, the cursor moves after the 2xx, and a receiver that is down is an outage to wait out rather than data lost.
+### A step's config is checked
 
-**The receiver cannot always be adapted, which decides where transforms live.** When darkmux owns the receiver — the local crawl tracker — the honest shape is a thin adapter in the receiver: darkmux ships one wire contract (the flow record verbatim, schema-versioned, lenient on read) and the receiver projects it into whatever it stores. That stops being available the moment the destination is somebody else's SaaS. You get an API; you cannot put code inside Jira. So for anything not your own, the transform has to live on the **sending** side.
+A step's `config` is a JSON object whose keys belong to its `kind`, and each of the fifteen kinds darkmux ships has ONE typed struct (`darkmux_crew::step_config`, `ConfigKind` is the closed list) that is both its schema and the only way the kind reads its config. The unknown-key gate (`darkmux_types::user_files`) derives its schema from that struct: a mission config whose step config has a misspelled, wrong-type or missing key, or whose `kind` is none of the fifteen, is refused at preflight and failed by doctor, naming the file, the key path and the closest valid key, and whatever the gate accepts the kind's own load accepts (`whatever_the_step_gate_passes_the_kinds_load_accepts`). "Load" includes the kind's value rules (`ConfigRules`: a `draws` bound, a diff plan's required `diff_file`, the records a deliver step embeds): the struct owns each rule as one function, the kind's reader and the gate both call it, and the launch runs it again on the static graph with the launch's params substituted (before `--dry-run`'s short-circuit and before any mint) and on each grown copy as it is minted. The launch substitutes params as the mint does, including the `mission_id` it mints before checking, and every refusal after substitution names the step and its kind. What no config alone decides stays a run-time refusal: a role named by neither the task nor the config, a profile-registry endpoint id, a rule id that names no known rule (or a diff-only rule on a tree plan), a path that must exist (a workspace spec, a diff, a plan or an intent file, a workdir), a collection read from a dependency's output, and a deliver step with no embedded `findings` and no `records.gather` output to read. Each crawl kind's own reader is also swept against the gate (`every_config_the_gate_accepts_is_one_from_step_reads`); the kinds that read inside `run` next to their I/O (`dispatch.*`, `procedural.*`, `mods.gate`, `records.gather`, `mission.coder`) are covered only by the `ConfigKind::loads` comparison. A struct is closed to the gate but tolerant at load, because a task's `grow.config` merges every key into EVERY step of its copies (and the scheduler adds `grown_from`); the gate therefore checks a step as its own `config` overlaid with the grow keys ITS kind names, and refuses a grow key no step of the task names.
 
-**Two orthogonal axes, and only one of them ever holds authority.**
+An open map is declared, never implied: a field that holds free-form data is typed as an open value in the struct with a doc line saying so (`dispatch.map`'s `collection`, `deliver.github_review`'s `findings`/`mods`/`scope`), and every other key of that config stays closed. Numbers and flags are `Count` and `Flag` (`darkmux_types::param_scalar`), which read both `3` and `"3"`, because a `--param` value reaches a step as text and a `{{param}}` reference must pass the gate before it is substituted. Adding a kind means adding its struct and its `ConfigKind` arm; `every_registered_step_kind_has_a_config_struct_and_every_struct_a_kind` fails until both exist.
 
-| Axis | Job | Authority |
-|---|---|---|
-| **transform** (a `.jq` adapter) | the *shape*: record → request body | **none, by construction** |
-| **transport** (`http` · `file` · `cmd` — `cmd` planned, not yet built) | the *destination and its credentials* | http: one Keychain header value · cmd: the operator's own CLI |
+### A disabled step never exists in the run
 
-The split is the whole design. A transform is a **pure function** — it needs no filesystem, no socket, no subprocess — so it is given none of those. jq is the language because it *is* JSON-to-JSON with no I/O in its grammar: there is nothing to sandbox. Three properties follow. A crawl finding's `evidence` is a source line copied verbatim out of a repo under audit; through a shell-spawning adapter that is an injection target, and through jq it is a string, so the hostile-data class disappears. The transform receives only the record, so it **cannot** read a credential — the delivery path resolves those separately and the two never meet. And because the evaluation is in-process, the outbox's guarantee extends all the way to the real destination rather than stopping at a hop.
+A phase, task or step in a mission config may carry `enabled: false`. It is pruned when the run is minted, before anything is interpreted or persisted, so the run's graph is exactly what will execute. There is no gray state: a nightly crawl config with ten plan tasks and six enabled shows six. A task whose steps were all disabled goes with them, a phase whose tasks all went goes too, and a task whose every dependency was pruned is pruned in turn, while one live dependency keeps it and it simply sees fewer inputs. Provenance is the resolved-config snapshot the run already keeps, which carries the flags verbatim, plus a `graph-report.json` beside it naming what was declared, what was minted, and each pruned item's reason; `mission status` prints the one-line count and the `mission.start` record carries the same report. There is deliberately no CLI override. The config is the only place a run's shape comes from: edit the JSON, run, and the snapshot records it.
 
-**What was rejected, and why, since each looks reasonable from a distance.** A *declarative template* with `{dotted.path}` substitution is safe and becomes a bad programming language the first time someone needs a conditional or a nested document — Jira's ADF `description` alone is enough to break it. *Executing an operator script as the transform* hands a pure function full operator authority — filesystem, network, spawn, Keychain — to do a job that requires none of it, and it walks around the command gate that already exists for exactly this class of thing. *Shipping named adapters for Jira, Slack, and friends* is the safest option of all and re-creates precisely the coupling this whole design refuses: the sender would own N destination schemas and every new API would be darkmux's maintenance. A *sidecar adapter service* on loopback works today with no new code, and quietly breaks the delivery guarantee — darkmux's `hook.fired` would mean "handed to a process that may have dropped it," so the retries and quarantine records would describe the wrong hop. It stays documented as the escape hatch for integrations that need their own state or batching, with the honest note that the operator owns delivery from that point on.
+### A step's output grows the graph
 
-**The transport set is closed at three, and `cmd` is what makes closing it possible.** Two of the three ship today — `http` and `file`; **`cmd` is designed but not yet implemented**, a separately-gated packet, and the paragraph below describes the intended shape rather than current behavior. A rule naming only `cmd` is refused at load today, the same as any rule with no destination. `http` covers the ninety percent with a static credential — Jira, Slack, Telegram, PagerDuty, a webhook, an Azure Function key. `file` writes the delivery to disk instead of sending it, which is the no-network tier for testing an adapter end to end. `cmd` pipes the transformed body to an allowlisted program on stdin and **treats its exit code as the delivery ack**: zero advances the cursor, non-zero enters the existing retry and quarantine policy. That is what keeps at-least-once intact through an arbitrary destination, and it means the protocol library is the operator's own CLI rather than darkmux's source tree. SMTP is a script piping to `mail`; SQS and anything else SigV4-signed is `aws`, which already implements SigV4; gRPC is `grpcurl`; Postgres is `psql`; an Azure AD-protected endpoint is `az account get-access-token` and a curl. darkmux will not learn SigV4, OAuth refresh, SMTP, or gRPC natively — each would be the same coupling wearing a different hat. The one extension planned in advance is `auth: { cmd, ttl_seconds }`, an allowlisted command that prints a header value and is cached for its TTL, which covers every token-refresh case without darkmux implementing OAuth.
+A task may declare `grow` instead of being a task:
 
-**Credentials follow the posture the command gate already states: darkmux holds none of its own.** A rule names a Keychain item; the item holds the **complete header value** — `Basic <base64(email:token)>`, `Bearer …`, whatever the destination wants — not a raw token to be assembled. darkmux therefore has no credential-formatting logic to get wrong and stays scheme-agnostic, and the value is redacted in every record, log line, doctor row, and dry-run dump. The exec transport inherits the same gate as any other shell-out: a **name**, not a path, refused until that exact name appears in the operator's own allowlist, spawned directly rather than through a shell, with the record on stdin only so that nothing derived from a crawled repository can reach a shell parser.
+```json
+"grow": { "from": "plan-task", "items": "units", "id": "{{item.id}}",
+          "config": { "unit": "{{item.id}}", "rule": "{{item.rule}}" } }
+```
 
-**One limit stated plainly rather than discovered later.** At-least-once is not idempotent, and a create-issue API has no idempotency key, so a lost response can produce a duplicate. The delivery id is stable across retries and an adapter can write it into a searchable field, but a genuine check-then-create needs two requests — which is the `cmd` transport's job, not the transform's.
+The task is then a **template** and is never minted. After the phase containing `from` completes, the launcher reads that task's last step `output` as a path to a JSON file (the contract every producing step honors), loads it, takes the array at `items`, and mints one copy of the template, with all its steps, per item. `{{item.<field>}}` renders from the item's own top-level scalar fields, into the copy's id suffix and into every step's config; a whole-string placeholder keeps the field's JSON type, so a number stays a number. Zero items mints zero copies, and the phase is explicitly started and completed with `grew_nothing` recorded rather than failing: a phase with no steps is invisible to the step-driven phase open/close, so without that it would sit `Planned` all run and be swept to `Abandoned` by the finalize backstop, recording a failure where the plan simply planned nothing. Every other way this can go wrong (the producer never ran, produced no output, named a path that isn't there, or wrote a shape the template didn't ask for) is a loud error naming the task and the path, never a quiet zero. That is deliberate: the retired `expand` primitive (schema 1.1–1.4) shipped for two schema versions silently expanding to nothing, and the whole point of `grow` is that its input is produced by the run rather than handed in at launch.
+
+**Growth happens at a phase boundary, and that is a real trade.** `run_step_graph` takes its task map by shared reference, so the graph cannot grow mid-run. The generic launcher therefore runs one graph call per phase, in config order, and expands a phase's templates just before minting it. The cost: two phases with no edge between them no longer overlap. That is acceptable because phases are already sequential by design here (`phase_order` and the lazy phase-close logic both assume a strictly linear order), and parallelism lives *inside* a phase, where the wave scheduler still runs every independent task concurrently.
+
+Provenance is on the record, not in the operator's head: every grown step's `config` carries `grown_from: {task, item, index}`, and the item's `rule` lands on `config.rule` through the template. Neither is *rendered* yet (the graph lens builds its step rows without `config`, and `finding list` reads the unit and rule out of a finding's own context), so surfacing them in the viewer, which is what would let an operator filter a run by track, is follow-up. What is readable today: the run's `graph-report.json` gains a `grown` entry per growth event naming the template, the `from` task whose output was read, the producing step's id, the item count and the real task ids minted: `source` holds that step's id and never the artifact's path, since `mission.grow` rides the fleet stream and an absolute host path means nothing on another machine; the artifact stays reachable as the named step's own `output` on its step record; one `mission.grow` flow record carries the same facts live; the phase record's `task_ids` lists the grown tasks alongside the phase's declared ones; and `mission status` prints "grew N task(s) from `<from>`".
+
+### A task's `run_on` decides which of its dependencies' failures it survives
+
+A task may declare `"run_on": ["complete", "error"]`. The default is `["complete"]`: a task becomes ready only once every task it `depends_on`/`reads` reaches `Complete`: the behavior the scheduler always had. A task that adds `"error"` becomes ready once each of those dependencies reaches ANY terminal status: `Complete`, or `Error`, or `Abandoned`. `Abandoned` is folded into the same `"error"` acceptance rather than a literal an operator could name on its own, because a task only ever reaches `Abandoned` as the *transitive* form of some ancestor's `Error`: there is no scenario where accepting one but not the other is what was meant.
+
+The cascade is what makes that transitive form exist. The moment a step's failure makes its owning task's derived status `Error`, the scheduler walks forward over every OTHER task that names it in `depends_on`/`reads`, direct and transitive, and rolls each one to `Abandoned` immediately (in the same pass, not lazily on the next readiness check) *unless* that task's own `run_on` accepts `"error"`, in which case the walk stops there: that task gets a real chance to run, and its own fate (complete, or error and cascade further) is decided only when it actually does. This is why declaring `run_on` on one summary/report task at the end of a chain is enough to unwedge it even when several tasks separate it from the failure: each intermediate task, left at the default, is cascade-abandoned in turn, and the terminal status that finally reaches the summary task is `Abandoned`, which its `"error"` acceptance treats exactly like the `Error` that caused it.
+
+**The walk is scoped to other tasks, never to the errored task's own remaining steps.** A multi-step task whose first step errors already reads as `Error` (a task's derived status is `Error` if ANY of its steps is): its own later, still-`Planned` steps are left exactly where they are; `step_is_ready`'s intra-task rule (each step needs its immediately-previous SAME-task step `Complete`) already keeps them from ever becoming ready, and they are swept to `Abandoned` only by the ordinary close-time reconcile (`lifecycle::reconcile_phase_steps_terminal`), same as any other stranded step on a stopped run, never by the cascade itself. The cascade's whole domain is CROSS-task edges (`depends_on`/`reads`); it does not reach inside the task that actually failed.
+
+Also scoped, deliberately: `cascade_abandon` propagates exactly ONE originating step's id and reason text per abandonment chain (the step whose error triggered that walk), not a running tally across every independent failure a run might contain. Two unrelated tasks erroring independently each start their own walk, and a downstream task reachable from both keeps whichever reason the LATER walk wrote. This is a known, accepted simplification (every review.json scenario today has exactly one true origin per run) rather than a general N-origin aggregator.
+
+A task rolled to `Abandoned` this way is never silently dropped: its `Step.output` carries the ORIGINATING step's own id and failure text VERBATIM (an `"<origin-step-id>: <origin's own recorded message>"`-shaped string), not a generic "depends on X" placeholder that would lose the real reason a single hop downstream. Every task the cascade rolls in one walk carries the SAME origin text, so a task several hops from the actual failure still reads the true root cause directly off its own dependency's forwarded output, without needing to trace the chain by hand. It is persisted through the same `persist` hook every other transition uses, and its status is visible to any reader of the run's step state (`mission status`, the mission-graph lens) exactly like `Complete`/`Error` are. What it does *not* get is a fourth live flow-record action: `STEP_LIFECYCLE_ACTIONS` stays the three-string contract (`"step.start"` / `"step.complete"` / `"step.error"`) the mission-graph lens's SSE matcher is keyed on; the same convention `lifecycle::reconcile_phase_steps_terminal` already uses when a phase closes around a still-live step (same status, same output-names-why discipline, no new live action either).
+
+The built-in `review.json` uses exactly one `run_on: ["complete", "error"]` declaration, on its `deliver` task: when any upstream stage errors, every task between it and delivery is cascade-abandoned, the delivery task becomes ready anyway, and its step kind (`deliver.github_review`) renders a degraded, self-describing payload rather than the run silently producing no comment at all: the graph-native replacement for what used to be a separate fallback render the bespoke launcher ran *outside* the graph when its report step never started.
+
+### Typed step outputs
+
+**Every value one step kind hands to another is a typed serde struct with a `schema_version`**, required fields plain, optional fields `#[serde(default)]`, never a free-form JSON blob and never a string protocol. The consumer deserializes through that struct, and **the read IS the check**: a producer that drifted fails at the read, by field name, instead of being silently summarized as zeros. Required-versus-optional is expressed in the body struct itself, so there is one place to look. Comparing two schemas at CONFIG time is only worth building when composition can wire two different families' outputs together; until then the read is enough.
+
+The body rides in a thin envelope (`darkmux_crew::step_output::Output<T>`), so a consumer knows what it is holding before it looks:
+
+```json
+{ "schema_version": "1.0", "kind": "crawl.unit-outcome",
+  "producer": { "mission": "crawl-…", "task": "unit-…", "step": "unit-…-step", "machine_id": "laptop" },
+  "produced_at": "2026-09-04T…Z",
+  "hash": "9f2c…",
+  "body": { "schema_version": "1.0", "unit": "u-0001", "result": "stop", "findings": 2, … } }
+```
+
+`kind` is a CONTENT id the reader checks against the value it expects **before** deserializing `body`; a mismatch is a refusal naming both, which turns a mis-wired graph into one clear error instead of a confusing field error deep inside a body struct. A **data port's label is the same string as the `kind` its output carries** (`crawl.plan` provides `crawl.plan`, `crawl.unit` requires `crawl.plan` and provides `crawl.unit-outcome`, `crawl.summary` requires `crawl.unit-outcome` and provides `crawl.summary`), so a graph validator (#2312) can compare a producer's `provides` against a consumer's `requires` directly, with no rename table in between. The two concepts stay distinct (a port says where a value flows, `kind` says what is in it); they just agree on their spelling.
+
+`hash` is blake3 over the body written in a canonical form, every object's keys emitted in sorted order, all the way down, arrays left in their own (meaningful) order, so field order can never change the digest, and `Output::read` recomputes it and refuses a mismatch. The sort is explicit rather than inherited from `serde_json::Map`'s default `BTreeMap`, because serde_json's `preserve_order` feature makes that map insertion-ordered and cargo unifies features across a workspace: in darkmux's own tree `agent-client-protocol` enables it, which made the digest stable under `cargo test -p darkmux-crew` and unstable under `cargo test --workspace` until the canonicalizer sorted keys itself. A hash whose value depends on who else is being compiled is not a hash. The reason is not tampering: a consumer must be able to tell a **complete** file from a partial one, and a **stale** copy from the current one, whatever moved it there. A length check cannot and a timestamp lies. Bodies (and plan files) are written once via tmp + rename and never rewritten, so a body whose hash disagrees is a truncated write or a copy that is not the one this run produced. A synced or shared filesystem (iCloud, a network share) is **never** the transport for a `ref`: those deliver partial files as ordinary reads, which is exactly the case this check names. When `body` lives in a file, the hash is of that file's body bytes.
+
+A step's `output` is a string, so `Output::read` accepts an inline envelope, a `{"ref": {"path": "…"}}` pointer, or a bare path (the shape `crawl.plan` still writes). The grow seam's `items_from_artifact` looks inside `body` when it finds an envelope and at the top level when it does not, so a producer that does not wrap keeps working.
+
+**Who wraps today:** the crawl kinds (`crawl.plan` → `Plan`, `crawl.unit` → `UnitOutcome`, `crawl.summary` → `CrawlSummary`), `plan.sites`, and review's `records.gather` and `deliver.github_review`. The coder-phase kinds and `dispatch.*` steps do not wrap yet. Fleet transport comes after the wrapper exists everywhere: once every producer wraps, a `ref` can name a MACHINE as well as a path and be fetched from the producing machine's daemon, with the hash as the completeness check on arrival. No body struct changes when that lands.
+
+**The drift guard is the exported types**, not a second hand-written schema. These structs derive `ts_rs::TS` behind each crate's `ts-export` feature and export into `ui/src/types/generated/`: the same generated file the viewer already consumes and CI already diffs (`bun run types:check`). No `schemars`, no hand-written zod: one definition in Rust, one generated TypeScript file, one `git diff --exit-code`.
+
+## The shared run lifecycle
+
+"Has this run started, is it running, waiting, finished, or gone quiet" is asked by the fleet card, the activity timeline, the run page, the mission graph's step meter, playback, and the daemon's `/runs`. It has one answer: one rule set with two executors, `ui/src/lib/lifecycle.ts` for the viewer and `crates/darkmux-serve/src/run_lifecycle.rs` for the daemon, judged by one corpus, `tests/lifecycle/cases.json`. The two share no code (one is TypeScript, one is Rust), so the corpus is the contract: each case is a set of records, an as-of instant and the phase and status every surface must state.
+
+The rules, in the order they apply:
+
+1. **Attempts.** A session's records segment into attempts in time order. An attempt opens on its first opening record (a bookend start at either grain, a `budget.wait`, `mission.start`, `step.start`, or, when nothing opened yet, a turn, heartbeat, tool call or rest). A record of an execution joins the latest attempt of that execution, so a `dispatch.map` session holding several keeps each one's close apart; any other record joins by mission. A second bookend start in an attempt, or a reopening record after it closed, starts the next attempt (a relaunch under one id).
+2. **Close.** An attempt closes on its earliest closing record. A close stamped before anything opened (clock skew across machines) closes the first attempt that has none and is marked skewed.
+3. **Outcome.** How it ended comes from the attempt's bookend terminal when it has one, so a `session.end` that lands first does not erase a clean `run.complete`.
+4. **Waiting.** An open `budget.wait` holds the attempt live until its announced resume time plus a grace, then the staleness clock runs from there.
+5. **Stale.** An open attempt silent for longer than the window, or superseded by a later attempt of its own mission, has stopped with no ending recorded. Another mission's later attempt on the same session does not supersede it, so a session two missions share is two runs (#2125). A session names its run, so new records cannot share one that way; the rule stays because archives, and peers on an older darkmux, hold sessions that two missions launched from one config shared.
+
+Presence is the one input the daemon lacks. In the viewer it can only add: it holds a session's current run open against the staleness clock, never one a later attempt superseded, never one that has not started, and never against a record that closed it.
+
+The window is twice the inactivity budget (`darkmux_serve::runs::stale_after_ms`, from `runtime.inactivity_timeout_seconds`), and the wait grace is a fixed minute. `/runs` publishes the numbers it judged by as `policy`, and `/health` publishes the same object as `lifecycle_policy`, which is where the viewer reads them, so no client hard-codes a threshold. Every other surface is a projection of this lifecycle, not a second judgment.
+
+Known gap: the daemon cannot judge a run held open by presence, so the corpus marks that one input as viewer-only.
 
 ## Crawl as a mission: the shapes and how data flows between them
 
-Ratified with the operator in #2297 and landing in pieces (#2298 plan step, #2299 `enabled`, #2300 grow seam, #2301 launcher retirement, #2302 create-mods steps — **delivered**, #2303 admission). This section is the map: every record the crawl touches, its shape, who writes it, who reads it. Where a piece is not built yet, it says so, so a reader can tell design from delivery.
+The crawl (#2297) is an ordinary mission config on the generic launcher: a plan step per rule, a grown set of unit tasks, a summary, and an optional create-mods phase. This section is the map: every record the crawl touches, its shape, who writes it, who reads it. Where a piece is not built, it says so, so a reader can tell design from delivery.
 
 ### The two documents: config is the shape, plan is the instance
 
-**Mission config** (`templates/builtin/mission-configs/crawl.json`, schema 3.3) is the shape of the work and is the same file for every crawl of every repo. It declares `inputs` (the workspace spec path, the rule ids, sizing knobs), and phases holding tasks holding steps. The `plan` phase holds **one task per rule**, explicitly, each with a single `crawl.plan` step:
+**Mission config** (`templates/builtin/mission-configs/crawl.json`) is the shape of the work and is the same file for every crawl of every repo. It declares `inputs` (the workspace spec path, the rule ids, sizing knobs), and phases holding tasks holding steps. The `plan` phase holds **one task per rule**, explicitly, each with a single `crawl.plan` step:
 
 ```json
 { "id": "plan-unnamed-predicate", "enabled": true,
@@ -673,7 +790,7 @@ Ratified with the operator in #2297 and landing in pieces (#2298 plan step, #229
               "config": { "rule": "unnamed-predicate", "workspace": "{{workspace}}" } }] }
 ```
 
-A task with `"enabled": false` is pruned when the run is minted and never exists in the run (see "Mission configs: a disabled step never exists in the run"). Ten rules are ten tasks; a nightly that wants six disables four; the run shows six. The config is the only place a run's shape comes from: no CLI override, edit the JSON and run, the snapshot records it.
+A task with `"enabled": false` is pruned when the run is minted and never exists in the run (see [A disabled step never exists in the run](#a-disabled-step-never-exists-in-the-run)). N rules are N tasks; a nightly that wants a subset disables the rest; the run shows only the live ones. The config is the only place a run's shape comes from: no CLI override, edit the JSON and run, the snapshot records it.
 
 **Plan** (`<missions>/<mission-id>/plan/<rule>.json`, plan schema 1.1) is the instance data for one run of one rule, and it is a **step's output**, never a mission input. Its shape:
 
@@ -690,9 +807,9 @@ A task with `"enabled": false` is pruned when the run is minted and never exists
 
 The test for which document a field belongs to: would you change it without changing what the run is about? Sizing knobs, model, profile, rule ids are config or launch parameters. Units, sites, sha are plan. `rules` and `params` ride the plan so it is self-describing for later comparison, not so anyone edits them there.
 
-### The `crawl.plan` step kind, and why there is exactly one
+### The `crawl.plan` step kind: one kind, never one per rule
 
-Control flow: load the workspace spec, materialize it (bare mirror plus checked-out tree, per source, at a recorded sha), run the rule's prefilter over the files its globs admit, cut a window around each hit, pack sites into units under the sizing knobs, write the plan, hand the plan's path downstream as the step's `output`. That flow is new, so by #1352's test it is a kind. It is Tier 3, co-located with the crawl module (`crates/darkmux-lab/src/crawl/plan_step.rs`), because no second mission plans. Materialization itself is serialized and self-checking (#2399): a `materialize` call takes an advisory `flock(2)` on `<root>/.materialize.lock` and hands the guard back inside the `Materialized` value, so the workspace stays held for as long as the caller reads the trees it named — the 8-wide `plan.sites` steps #2397 made concurrent therefore take one workspace in turn rather than tearing each other's trees down mid-walk (a step that dropped the value early would see missing files recorded as `skipped`, under-reporting its own coverage), and a tree already checked out at the resolved sha with nothing modified is reused rather than rebuilt. A mirror that already exists is verified bare and pointing at the spec's own origin before anything fetches into it; one that fails is moved aside to `<mirror>.corrupt-<unix-ts>`, announced on stderr, and re-cloned — unless `--no-fetch` means no re-clone could follow, in which case it is left untouched and the step refuses. `darkmux doctor` lists what has been quarantined.
+Control flow: load the workspace spec, materialize it (bare mirror plus checked-out tree, per source, at a recorded sha), run the rule's prefilter over the files its globs admit, cut a window around each hit, pack sites into units under the sizing knobs, write the plan, hand the plan's path downstream as the step's `output`. That flow is new, so by #1352's test it is a kind. The windowing and packing half is the Tier 2 `plan_sites` pattern (`crates/darkmux-crew/src/step_kinds/patterns/plan_sites.rs`), which crawl plugs a tree walk into (`TreeSource`) and review's `plan.sites` step plugs a diff's hunks into (`DiffSource`); the survey, the prefilter and the materialization stay in the crawl module (`crates/darkmux-lab/src/crawl/plan_step.rs`). Materialization itself is serialized and self-checking (#2399): a `materialize` call takes an advisory `flock(2)` on `<root>/.materialize.lock` and hands the guard back inside the `Materialized` value, so the workspace stays held for as long as the caller reads the trees it named: the 8-wide `plan.sites` steps #2397 made concurrent therefore take one workspace in turn rather than tearing each other's trees down mid-walk (a step that dropped the value early would see missing files recorded as `skipped`, under-reporting its own coverage), and a tree already checked out at the resolved sha with nothing modified is reused rather than rebuilt. A mirror that already exists is verified bare and pointing at the spec's own origin before anything fetches into it; one that fails is moved aside to `<mirror>.corrupt-<unix-ts>`, announced on stderr, and re-cloned, unless `--no-fetch` means no re-clone could follow, in which case it is left untouched and the step refuses. `darkmux doctor` lists what has been quarantined.
 
 Rules vary in **what a site is and who finds it**, not in how planning runs, so there is never a kind per rule. The site producer is a mux keyed by the rule's declared `prefilter` shape:
 
@@ -703,30 +820,6 @@ Rules vary in **what a site is and who finds it**, not in how planning runs, so 
 | none | whole files, sized by tokens | `read`-kind rules |
 
 Semantic rules with no cheap prefilter (`doc-contradicts-code`) are the part a linter cannot do and the model is for. When the command shape lands, it is a `procedural.shell` step ahead of the plan step whose output is a site list; the plan step consumes sites in one shape regardless of who produced them.
-
-### Typed step outputs
-
-**Every value one step kind hands to another is a typed serde struct with a `schema_version`** — required fields plain, optional fields `#[serde(default)]` — never a free-form JSON blob and never a string protocol. The consumer deserializes through that struct, and **the read IS the check**: a producer that drifted fails at the read, by field name, instead of being silently summarized as zeros. Required-versus-optional is expressed in the body struct itself, so there is one place to look. Comparing two schemas at CONFIG time is only worth building when composition can wire two different families' outputs together; until then the read is enough.
-
-The body rides in a thin envelope (`darkmux_crew::step_output::Output<T>`), so a consumer knows what it is holding before it looks:
-
-```json
-{ "schema_version": "1.0", "kind": "crawl.unit-outcome",
-  "producer": { "mission": "crawl-…", "task": "unit-…", "step": "unit-…-step", "machine_id": "laptop" },
-  "produced_at": "2026-09-04T…Z",
-  "hash": "9f2c…",
-  "body": { "schema_version": "1.0", "unit": "u-0001", "result": "stop", "findings": 2, … } }
-```
-
-`kind` is a CONTENT id the reader checks against the value it expects **before** deserializing `body`; a mismatch is a refusal naming both, which turns a mis-wired graph into one clear error instead of a confusing field error deep inside a body struct. A **data port's label is the same string as the `kind` its output carries** — `crawl.plan` provides `crawl.plan`, `crawl.unit` requires `crawl.plan` and provides `crawl.unit-outcome`, `crawl.summary` requires `crawl.unit-outcome` and provides `crawl.summary` — so a graph validator (#2312) can compare a producer's `provides` against a consumer's `requires` directly, with no rename table in between. The two concepts stay distinct (a port says where a value flows, `kind` says what is in it); they just agree on their spelling.
-
-`hash` is blake3 over the body written in a canonical form — every object's keys emitted in sorted order, all the way down, arrays left in their own (meaningful) order — so field order can never change the digest, and `Output::read` recomputes it and refuses a mismatch. The sort is explicit rather than inherited from `serde_json::Map`'s default `BTreeMap`, because serde_json's `preserve_order` feature makes that map insertion-ordered and cargo unifies features across a workspace: in darkmux's own tree `agent-client-protocol` enables it, which made the digest stable under `cargo test -p darkmux-crew` and unstable under `cargo test --workspace` until the canonicalizer sorted keys itself. A hash whose value depends on who else is being compiled is not a hash. The reason is not tampering: a consumer must be able to tell a **complete** file from a partial one, and a **stale** copy from the current one, whatever moved it there. A length check cannot and a timestamp lies. Bodies (and plan files) are written once via tmp + rename and never rewritten, so a body whose hash disagrees is a truncated write or a copy that is not the one this run produced. A synced or shared filesystem (iCloud, a network share) is **never** the transport for a `ref` — those deliver partial files as ordinary reads, which is exactly the case this check names. When `body` lives in a file, the hash is of that file's body bytes.
-
-A step's `output` is a string, so `Output::read` accepts an inline envelope, a `{"ref": {"path": "…"}}` pointer, or a bare path (the shape `crawl.plan` used before the wrapper, still read for the transition). The grow seam's `items_from_artifact` looks inside `body` when it finds an envelope and at the top level when it does not, so a pre-wrapper producer keeps working.
-
-**Crawl is the pilot**, in that order: crawl (`crawl.plan` → `Plan`, `crawl.unit` → `UnitOutcome`, `crawl.summary` → `CrawlSummary`), then the coder phase, then review. Fleet transport comes after the wrapper exists everywhere: once every producer wraps, a `ref` can name a MACHINE as well as a path and be fetched from the producing machine's daemon, with the hash as the completeness check on arrival. No body struct changes when that lands.
-
-**The drift guard is the exported types**, not a second hand-written schema. These structs derive `ts_rs::TS` behind each crate's `ts-export` feature and export into `ui/src/types/generated/` — the same generated file the viewer already consumes and CI already diffs (`bun run types:check`). No `schemars`, no hand-written zod: one definition in Rust, one generated TypeScript file, one `git diff --exit-code`.
 
 ### How data flows, phase by phase
 
@@ -744,14 +837,16 @@ crawl.json ──prune(enabled)──▶ minted run: plan phase, one task per LI
                      ┌───────────────────────────────────────────────────────┼─────────────────────────┐
                      ▼                                                       ▼                         ▼
       hook rule → jq transform → external tracker           finding sync → ~/.darkmux/findings/    create-mods step per finding (OFF)
-      (metadata + emitted, destination owned by the hook)   <dispatch>/<seq>/finding.json         (brief_refs: [{finding, key}])
+      (metadata + emitted, destination owned by the hook)   <execution_id>/<seq>/finding.json  (brief_refs: [{finding, key}])
                                                                              │
                                                         dispatch --finding / --mod, or a mission step with brief_refs
                                                                              ▼
                                                         create_mod / mod create ──▶ ~/.darkmux/mods/<key>/ (kit + attachments)
 ```
 
-Every arrow above the finding row is delivered. The grow arrow is #2300 (a task may declare `grow`; the generic launcher expands it at the phase boundary — see "Mission configs: a step's output grows the graph" below), and #2301 finished the picture: **the literal-routed crawl launcher is retired.** `src/crawl_launch.rs` is deleted, the `config_id == "crawl"` branch in `mission_launch::launch` is gone, and `crawl.json` declares the whole crawl — a `crawl.plan` task per rule, a `crawl.unit` GROW template per rule, and one `crawl.summary`. `darkmux mission launch crawl --param workspace=<spec.json>` is an ordinary generic launch. Its inputs are `workspace` (required), `rules` (which rule tracks to mint), `max_sites_per_unit`, `max_est_tokens_per_unit`, `no_fetch` and the generic `dry_run`; the launcher's own `source`/`rule` one-shot pair is gone (a one-shot crawl is a one-source spec file), and so are `plan` (a plan is always written under the run), `plan_out`, `units`, `limit` and `resume` (per-unit reuse becomes the scheduler's step-output reuse, #2303). `--param rules=a,b` prunes the tracks it does not name at mint, with reason `not_selected` in `graph-report.json` — the same mechanism `enabled: false` uses, so a run's graph is always exactly what will execute. Grown unit task ids are unprefixed (`unit-<rule>-<unit-id>`) while declared ids carry the mission-id prefix; that is the shape the phase record's `task_ids` holds. #2302 closed the last arrow: `crawl.json` declares a fourth phase, `create-mods`, whose one task is a grow template over the summary's `finding_refs` — one `coder` `dispatch.internal` step per finding, each carrying `brief_refs: [{"kind": "finding", "key": "<dispatch>/<seq>"}]` and the materialized tree the finding was observed in as its `workdir`, and each asked to record its change with `create_mod` naming that same key in `for`. **It ships OFF** (`"enabled": false` on the task, which prunes the task and then the emptied phase at mint), because the hook → tracker path is still the default exit. To turn it on, copy `templates/builtin/mission-configs/crawl.json` to `~/.darkmux/mission-configs/crawl.json` and set `"enabled": true` on that one task; `darkmux mission config show crawl` reports the gate per task either way. Two consequences are worth stating before an operator flips it. First, the enabled create-mods becomes the LAST phase, and the close-payload rule below promotes that phase's last step output only when it is a JSON OBJECT. A coder `dispatch.internal` step's output is the model's final text, not an object, so an enabled create-mods leaves `mission.close` with `payload: null` and the `CrawlSummary` stops reaching it — the summary is still its own step's output on disk either way, no reader keys on `payload.findings` today, and a copy that wants the payload back ends the create-mods phase with its own summarizing task. Second, a `brief_refs` key that addresses no stored record REFUSES the step, loudly and before any container work, so a create-mods step that outran the finding tailer fails naming the key rather than dispatching a coder that never saw the finding. Tracks run in parallel under machine-aware admission (#2303), fail independently, and resume alone; a minted step records the plan it came from and, later, the admission decision that scheduled it, so the operator never wonders where a step came from.
+Every arrow above is built. A task may declare `grow` and the generic launcher expands it at the phase boundary ([A step's output grows the graph](#a-steps-output-grows-the-graph)), which is what lets `crawl.json` declare the whole crawl: a `crawl.plan` task per rule, a `crawl.unit` grow template per rule, and one `crawl.summary`. `darkmux mission launch crawl --param workspace=<spec.json>` is an ordinary generic launch. Its inputs are `workspace` (required), `rules` (which rule tracks to mint), `max_sites_per_unit`, `max_est_tokens_per_unit`, `no_fetch` and the generic `dry_run`; a one-shot crawl is a one-source spec file. `--param rules=a,b` prunes the tracks it does not name at mint, with reason `not_selected` in `graph-report.json`, the same mechanism `enabled: false` uses, so a run's graph is always exactly what will execute. Grown unit task ids are unprefixed (`unit-<rule>-<unit-id>`) while declared ids carry the mission-id prefix; that is the shape the phase record's `task_ids` holds. Tracks run in parallel (the scheduler's wave admission places each on the machine's resources, see [Seat classes](#seat-classes-every-step-says-what-it-consumes)), fail independently, and resume alone: per-unit reuse is the scheduler's step-output reuse. A minted step records the plan it came from, so the operator never wonders where a step came from.
+
+The last phase, `create-mods`, has one grow template over the summary's `finding_refs`: one `coder` `dispatch.internal` step per finding, each carrying `brief_refs: [{"kind": "finding", "key": "<execution_id>/<seq>"}]` and the materialized tree the finding was observed in as its `workdir`, and each asked to record its change with `create_mod` naming that same key in `for`. **It ships OFF** (`"enabled": false` on the task, which prunes the task and then the emptied phase at mint), because the hook → tracker path is the default exit. To turn it on, copy `templates/builtin/mission-configs/crawl.json` to `~/.darkmux/mission-configs/crawl.json` and set `"enabled": true` on that one task; `darkmux mission config show crawl` reports the gate per task either way. Two consequences are worth stating before an operator flips it. First, the enabled create-mods becomes the LAST phase, and the close-payload rule below promotes that phase's last step output only when it is a JSON OBJECT. A coder `dispatch.internal` step's output is the model's final text, not an object, so an enabled create-mods leaves `mission.close` with `payload: null` and the `CrawlSummary` stops reaching it (the summary is still its own step's output on disk, and a copy that wants the payload back ends the create-mods phase with its own summarizing task). Second, a `brief_refs` key that addresses no stored record REFUSES the step, loudly and before any container work, so a create-mods step that outran the finding tailer fails naming the key rather than dispatching a coder that never saw the finding.
 
 ### What each record is for
 
@@ -763,18 +858,18 @@ Every arrow above the finding row is delivered. The grow arrow is #2300 (a task 
 | `Output<T>` envelope | every typed producer (#2301) | every typed consumer, through `Output::read` | `kind` + `hash` |
 | `UnitOutcome` (`crawl.unit-outcome`) | `crawl.unit` step | `crawl.summary`; the run-detail lens (step output) | unit id |
 | `CrawlSummary` (`crawl.summary`) | `crawl.summary` step | the `mission.close` payload; the viewer's crawl surfaces | mission id |
-| `FindingRef` (on `UnitOutcome.finding_refs` / `CrawlSummary.finding_refs`) | `crawl.unit`, from the same one read of the dispatch's `findings.jsonl` that counts them | the create-mods grow template (`items: "finding_refs"`); `brief_refs` resolution, by `key` | `<dispatch>/<seq>` (and `id`, the same key with `/` → `-`, because a task id is one segment) |
-
-The close payload is a **generic** rule, not a crawl one: the launcher promotes the LAST phase's last step `output` to the `mission.close` payload whenever that output is a JSON object (unwrapping an `Output` envelope's `body` when it is one). Before #2301 the generic path always closed with a `null` payload, so any config whose final step emits a JSON object now has one — read the config id, never infer the crawl shape from a payload's presence.
+| `FindingRef` (on `UnitOutcome.finding_refs` / `CrawlSummary.finding_refs`) | `crawl.unit`, from the same one read of the dispatch's `findings.jsonl` that counts them | the create-mods grow template (`items: "finding_refs"`); `brief_refs` resolution, by `key` | `<execution_id>/<seq>` (and `id`, the same key with `/` → `-`, because a task id is one segment) |
 | `grown_from` on a grown step's `config` | the grow seam | the on-disk step record; `graph-report.json` carries the same triple per copy | `{task, item, index}` |
 | `graph-report.json`'s `grown[]` | the grow seam (appended post-mint) | `mission status`; the `mission.grow` flow record carries the same facts | mission id |
-| `dispatch.tool` record with `emitted` | the runtime, via `create_finding` | hooks (external trackers); `finding sync` | dispatch session + `emit_seq` |
-| `findings/<dispatch>/<seq>/finding.json` | `finding sync` (the tailer) | `finding list/show`; `dispatch --finding`; brief refs | `<dispatch>/<seq>` |
+| `dispatch.tool` record with `emitted` | the runtime, via `create_finding` | hooks (external trackers); `finding sync` | execution + `emit_seq` |
+| `findings/<execution_id>/<seq>/finding.json` | `finding sync` (the tailer) | `finding list/show`; `dispatch --finding`; brief refs | `<execution_id>/<seq>` |
 | `mods/<key>/mod.json` + `attachments/` | `mod create`; `create_mod` | `mod list/show`; `dispatch --mod`; the integration mission | minted `mod-<secs>-<hex>` |
+
+The close payload is a **generic** rule, not a crawl one: the launcher promotes the LAST phase's last step `output` to the `mission.close` payload whenever that output is a JSON object (unwrapping an `Output` envelope's `body` when it is one). Any config whose final step emits a JSON object has a payload, so read the config id, never infer the crawl shape from a payload's presence.
 
 ## Findings and mods: what was observed, and how it could change
 
-Settled with the operator on 2026-09-03, after the first crawl findings reached a tracker and the first PR was made from them by an agent that knew nothing about crawls.
+This design was settled after the first crawl findings reached a tracker and an agent that knew nothing about crawls made the first PR from them.
 
 ### darkmux is the worker
 
@@ -782,11 +877,11 @@ Imagine the tracker is GitHub. The orchestration layer above darkmux knows its j
 
 ### Two records, both opaque
 
-A **finding** is what was observed. It is an event: it happened at a moment, from a dispatch, and it is never rewritten. Its key is `<dispatch>/<seq>` — the dispatch that produced it and the ordinal of the acceptance within that dispatch — which every finding has, crawl or not. A crawl adds context (mission, unit, rule, source, sha) when it launches the dispatch; nothing about a finding requires a crawl. The runtime tool that produces one is `create_finding` (renamed from `report_finding` on 2026-09-03: the tool *creates* a record; a hook is what *reports* it). darkmux does not interpret the emission: the record is metadata plus the model's arguments verbatim (`emitted`, see the flow schema's 1.33.0 entry), and a hook's transform composes whatever a destination needs from that. A finding's location is domain-specific — a line for text, a page for a PDF, a rect for an image — so no field for it exists on darkmux's side.
+A **finding** is what was observed. It is an event: it happened at a moment, in a role execution, and it is never rewritten. Its key is `<execution_id>/<seq>`: the role execution that produced it and the ordinal of the acceptance within that execution, which every finding has, crawl or not. (Two items of one `dispatch.map` step share a task session, so a per-session ordinal would have conflated their seats; the execution does not. A finding filed before executions were named keeps its old address.) A crawl adds context (mission, unit, rule, source, sha) when it launches the dispatch; nothing about a finding requires a crawl. The runtime tool that produces one is `create_finding` (the tool *creates* a record; a hook is what *reports* it, which is why it is not named `report_finding`). darkmux does not interpret the emission: the record is metadata plus the model's arguments verbatim (`emitted`), and a hook's transform composes whatever a destination needs from that. A finding's location is domain-specific (a line for text, a page for a PDF, a rect for an image) so no field for it exists on darkmux's side.
 
-A **mod** is how something could change. It is a *kit*: instructions plus data, in whatever form the proposer chose — a diff, a sentence, pixel data, a config value — enough for an AI to make the change correctly later, given the mod's own context. darkmux never types a kit and never opens it. A mod has its own minted key and its own store; it may carry provenance, `for`: zero or more finding references. That is the only stored link between the two records, it lives on the thing created later, and it is a list, because one change can address three observations and one observation can attract three competing changes. The view from a finding to its mods is derived by scanning mods, never stored on the finding.
+A **mod** is how something could change. It is a *kit*: instructions plus data, in whatever form the proposer chose (a diff, a sentence, pixel data, a config value), enough for an AI to make the change correctly later, given the mod's own context. darkmux never types a kit and never opens it. A mod has its own minted key and its own store; it may carry provenance, `for`: zero or more finding references. That is the only stored link between the two records, it lives on the thing created later, and it is a list, because one change can address three observations and one observation can attract three competing changes. The view from a finding to its mods is derived by scanning mods, never stored on the finding.
 
-Two producers write the same mod record, and both exist: the CLI, for a change made outside darkmux (`darkmux mod create --by <actor> [--for <finding>]... --kit ... [--attach ...]`), and the runtime tool `create_mod`, for a change made inside a dispatch (its emission rides the same `dispatch.tool` record a finding's does, and the host materializes the record from it — attachments included, since no host path reaches the container's copy of the file). Whoever made it, the record names the proposer and the time. A mod is written even when part of it could not be kept — an attachment that did not decode, a `for` key that addresses no finding — with the reason recorded on the mod itself, because the kit is the product of the work and a malformed sibling field is not a reason to lose it.
+Two producers write the same mod record, and both exist: the CLI, for a change made outside darkmux (`darkmux mod create --by <actor> [--for <finding>]... --kit ... [--attach ...]`), and the runtime tool `create_mod`, for a change made inside a dispatch (its emission rides the same `dispatch.tool` record a finding's does, and the host materializes the record from it: attachments included, since no host path reaches the container's copy of the file). Whoever made it, the record names the proposer and the time. A mod is written even when part of it could not be kept (an attachment that did not decode, a `for` key that addresses no finding), with the reason recorded on the mod itself, because the kit is the product of the work and a malformed sibling field is not a reason to lose it.
 
 ### Why the key is minted per mod
 
@@ -794,59 +889,19 @@ Two agents review the same finding at different times. One proposes the code cha
 
 ### Verbs, and what is deliberately absent
 
-`finding list` / `finding show` read the store (the flow stream stays the audit trail; the directory is the queryable copy — JSON on disk is the truth, as with roles). `finding sync` is that store's second producer: it replays the flow stream into the store for anything the live dispatch tailer missed — an older binary, a killed process — and is idempotent because the store is write-once, so the two producers can race without ever disagreeing. `mod create` / `mod list` likewise, and `mod show <key>` prints one mod whole with its kit raw. **Verbatim means byte-exact**: a kit is stored as the text that was written and is never parsed on write, because parsing and re-serializing a JSON-looking kit silently collapses duplicate keys and rounds large integers — a kit is not darkmux's data to normalize. A `for` key is canonicalized to `<dispatch>/<seq>` on create, so one finding has one address; a key that can address no finding is refused rather than stored as a link nothing can follow. `dispatch <role> --finding <key>` appends the finding's stored record to the brief, verbatim, so a role has the *what*; its palette decides whether it may `create_mod`.
+`finding list` / `finding show` read the store (the flow stream stays the audit trail; the directory is the queryable copy: JSON on disk is the truth, as with roles). `finding sync` is that store's second producer: it replays the flow stream into the store for anything the live dispatch tailer missed (an older binary, a killed process) and is idempotent because the store is write-once, so the two producers can race without ever disagreeing. `mod create` / `mod list` likewise, and `mod show <key>` prints one mod whole with its kit raw. **Verbatim means byte-exact**: a kit is stored as the text that was written and is never parsed on write, because parsing and re-serializing a JSON-looking kit silently collapses duplicate keys and rounds large integers: a kit is not darkmux's data to normalize. A `for` key is canonicalized to `<execution_id>/<seq>` on create, so one finding has one address; a key that can address no finding is refused rather than stored as a link nothing can follow. `dispatch <role> --finding <key>` appends the finding's stored record to the brief, verbatim, so a role has the *what*; its palette decides whether it may `create_mod`.
 
-Both record kinds reach a brief the same way, and the mechanism is a **step config field, not a verb**. A `dispatch.internal` step carries `brief_refs: [{"kind": "finding"|"mod", "key": "..."}]`, and the step kind that runs it is where each ref is resolved against its store, rendered as a block the model can ground, and appended verbatim after the user's own message, in the order given. That placement is the whole point: the step kind is the single place every producer converges on, so a mission graph that sets the field gets exactly the brief the `dispatch` verb does. The verb's `--finding` / `--mod` flags only write the field (and check the keys early, so a typo refuses before the acknowledgment gate rather than one layer down); the rendering happens once, in one place. A key that addresses no stored record fails the step before any container work, so a dispatch never runs on a silently missing block. A mod ref also bind-mounts that mod's `attachments/` read-only at `/darkmux-mods/<key>/attachments` — the path its block names, from the same constant — after the key is re-validated and the host path is proven to resolve inside the mod store. The refs are **darkmux record kinds only**, never an arbitrary file: the workspace mount is the file channel, and a ref is provenance-bearing by construction. One gap is named rather than papered over: the fleet work job's shape carries no refs, so a `profile@machine` dispatch that names one is refused instead of routed without its blocks.
+Both record kinds reach a brief the same way, and the mechanism is a **step config field, not a verb**. A `dispatch.internal` step carries `brief_refs: [{"kind": "finding"|"mod", "key": "..."}]`, and the step kind that runs it is where each ref is resolved against its store, rendered as a block the model can ground, and appended verbatim after the user's own message, in the order given. That placement is the whole point: the step kind is the single place every producer converges on, so a mission graph that sets the field gets exactly the brief the `dispatch` verb does. The verb's `--finding` / `--mod` flags only write the field (and check the keys early, so a typo refuses before the acknowledgment gate rather than one layer down); the rendering happens once, in one place. A key that addresses no stored record fails the step before any container work, so a dispatch never runs on a silently missing block. A mod ref also bind-mounts that mod's `attachments/` read-only at `/darkmux-mods/<key>/attachments` (the path its block names, from the same constant), after the key is re-validated and the host path is proven to resolve inside the mod store. The refs are **darkmux record kinds only**, never an arbitrary file: the workspace mount is the file channel, and a ref is provenance-bearing by construction. One gap is named rather than papered over: the fleet work job's shape carries no refs, so a `profile@machine` dispatch that names one is refused instead of routed without its blocks.
 
-There is no `integrate` verb. If darkmux integrates mods, that is a mission: a shared workspace, one step per mod applying its kit onto the accumulating change and handing the workspace to the next, a failed step failing itself and not the mission. It composes from existing pieces — a worktree step, shell or coder steps — so the concept lives in a mission config, not in the CLI. Each step names its seat, which is what lets the operator decide, per integration, whether a local model or a frontier model does it.
+There is no `integrate` verb. If darkmux integrates mods, that is a mission: a shared workspace, one step per mod applying its kit onto the accumulating change and handing the workspace to the next, a failed step failing itself and not the mission. It composes from existing pieces (a worktree step, shell or coder steps) so the concept lives in a mission config, not in the CLI. Each step names its seat, which is what lets the operator decide, per integration, whether a local model or a frontier model does it.
 
 ### What this makes measurable
 
 Tokens on the local seat versus the frontier seat per crawl PR. The frontier-only baseline (a Sonnet agent doing both creation and integration for seven findings, PR #2285) is the number every local-seat experiment is compared against.
 
-
-### Mission configs: a step's config is checked
-
-A step's `config` is a JSON object whose keys belong to its `kind`, and each of the fifteen kinds darkmux ships has ONE typed struct (`darkmux_crew::step_config`, `ConfigKind` is the closed list) that is both its schema and the only way the kind reads its config. The unknown-key gate (`darkmux_types::user_files`) derives its schema from that struct: a mission config whose step config has a misspelled, wrong-type or missing key, or whose `kind` is none of the fifteen, is refused at preflight and failed by doctor, naming the file, the key path and the closest valid key, and whatever the gate accepts the kind's own load accepts (`whatever_the_step_gate_passes_the_kinds_load_accepts`). "Load" includes the kind's value rules (`ConfigRules`: a `draws` bound, a diff plan's required `diff_file`, the records a deliver step embeds): the struct owns each rule as one function, the kind's reader and the gate both call it, and the launch runs it again on the static graph with the launch's params substituted (before `--dry-run`'s short-circuit and before any mint) and on each grown copy as it is minted. The launch substitutes params as the mint does, including the `mission_id` it mints before checking, and every refusal after substitution names the step and its kind. What no config alone decides stays a run-time refusal: a role named by neither the task nor the config, a profile-registry endpoint id, a rule id that names no known rule (or a diff-only rule on a tree plan), a path that must exist (a workspace spec, a diff, a plan or an intent file, a workdir), a collection read from a dependency's output, and a deliver step with no embedded `findings` and no `records.gather` output to read. Each crawl kind's own reader is also swept against the gate (`every_config_the_gate_accepts_is_one_from_step_reads`); the kinds that read inside `run` next to their I/O (`dispatch.*`, `procedural.*`, `mods.gate`, `records.gather`, `mission.coder`) are covered only by the `ConfigKind::loads` comparison. A struct is closed to the gate but tolerant at load, because a task's `grow.config` merges every key into EVERY step of its copies (and the scheduler adds `grown_from`); the gate therefore checks a step as its own `config` overlaid with the grow keys ITS kind names, and refuses a grow key no step of the task names.
-
-An open map is declared, never implied: a field that holds free-form data is typed as an open value in the struct with a doc line saying so (`dispatch.map`'s `collection`, `deliver.github_review`'s `findings`/`mods`/`scope`), and every other key of that config stays closed. Numbers and flags are `Count` and `Flag` (`darkmux_types::param_scalar`), which read both `3` and `"3"`, because a `--param` value reaches a step as text and a `{{param}}` reference must pass the gate before it is substituted. Adding a kind means adding its struct and its `ConfigKind` arm; `every_registered_step_kind_has_a_config_struct_and_every_struct_a_kind` fails until both exist.
-
-### Mission configs: a disabled step never exists in the run
-
-A phase, task or step in a mission config may carry `enabled: false`. It is pruned when the run is minted, before anything is interpreted or persisted, so the run's graph is exactly what will execute. There is no gray state: a nightly crawl config with ten plan tasks and six enabled shows six. A task whose steps were all disabled goes with them, a phase whose tasks all went goes too, and a task whose every dependency was pruned is pruned in turn, while one live dependency keeps it and it simply sees fewer inputs. Provenance is the resolved-config snapshot the run already keeps, which carries the flags verbatim, plus a `graph-report.json` beside it naming what was declared, what was minted, and each pruned item's reason; `mission status` prints the one-line count and the `mission.start` record carries the same report. There is deliberately no CLI override. The config is the only place a run's shape comes from: edit the JSON, run, and the snapshot records it.
-
-### Mission configs: a step's output grows the graph
-
-A task may declare `grow` instead of being a task:
-
-```json
-"grow": { "from": "plan-task", "items": "units", "id": "{{item.id}}",
-          "config": { "unit": "{{item.id}}", "rule": "{{item.rule}}" } }
-```
-
-The task is then a **template** and is never minted. After the phase containing `from` completes, the launcher reads that task's last step `output` as a path to a JSON file — the contract every producing step honors — loads it, takes the array at `items`, and mints one copy of the template, with all its steps, per item. `{{item.<field>}}` renders from the item's own top-level scalar fields, into the copy's id suffix and into every step's config; a whole-string placeholder keeps the field's JSON type, so a number stays a number. Zero items mints zero copies, and the phase is explicitly started and completed with `grew_nothing` recorded rather than failing — a phase with no steps is invisible to the step-driven phase open/close, so without that it would sit `Planned` all run and be swept to `Abandoned` by the finalize backstop, recording a failure where the plan simply planned nothing. Every other way this can go wrong — the producer never ran, produced no output, named a path that isn't there, or wrote a shape the template didn't ask for — is a loud error naming the task and the path, never a quiet zero. That is deliberate: the retired `expand` primitive (schema 1.1–1.4) shipped for two schema versions silently expanding to nothing, and the whole point of `grow` is that its input is produced by the run rather than handed in at launch.
-
-**Growth happens at a phase boundary, and that is a real trade.** `run_step_graph` takes its task map by shared reference, so the graph cannot grow mid-run. The generic launcher therefore runs one graph call per phase, in config order, and expands a phase's templates just before minting it. The cost: two phases with no edge between them no longer overlap. That is acceptable because phases are already sequential by design here (`phase_order` and the lazy phase-close logic both assume a strictly linear order), and parallelism lives *inside* a phase, where the wave scheduler still runs every independent task concurrently.
-
-Provenance is on the record, not in the operator's head: every grown step's `config` carries `grown_from: {task, item, index}`, and the item's `rule` lands on `config.rule` through the template. Neither is *rendered* yet — the graph lens builds its step rows without `config`, and `finding list` reads the unit and rule out of a finding's own context — so surfacing them in the viewer, which is what would let an operator filter a run by track, is follow-up. What is readable today: the run's `graph-report.json` gains a `grown` entry per growth event naming the template, the `from` task whose output was read, the producing step's id, the item count and the real task ids minted — `source` holds that step's id and never the artifact's path, since `mission.grow` rides the fleet stream and an absolute host path means nothing on another machine; the artifact stays reachable as the named step's own `output` on its step record; one `mission.grow` flow record carries the same facts live; the phase record's `task_ids` lists the grown tasks alongside the phase's declared ones (the generic launcher writes that field now, matching `crawl_launch.rs`); and `mission status` prints "grew N task(s) from `<from>`".
-
-### Mission configs: a task's `run_on` decides which of its dependencies' failures it survives (#2310 P4/P4a, schema 3.4)
-
-A task may declare `"run_on": ["complete", "error"]`. The default, every pre-3.4 document included, is `["complete"]`: a task becomes ready only once every task it `depends_on`/`reads` reaches `Complete` — the behavior the scheduler always had. A task that adds `"error"` becomes ready once each of those dependencies reaches ANY terminal status: `Complete`, or `Error`, or `Abandoned`. `Abandoned` is folded into the same `"error"` acceptance rather than a literal an operator could name on its own, because a task only ever reaches `Abandoned` as the *transitive* form of some ancestor's `Error` — there is no scenario where accepting one but not the other is what was meant.
-
-The cascade is what makes that transitive form exist. The moment a step's failure makes its owning task's derived status `Error`, the scheduler walks forward over every OTHER task that names it in `depends_on`/`reads`, direct and transitive, and rolls each one to `Abandoned` immediately — in the same pass, not lazily on the next readiness check — *unless* that task's own `run_on` accepts `"error"`, in which case the walk stops there: that task gets a real chance to run, and its own fate (complete, or error and cascade further) is decided only when it actually does. This is why declaring `run_on` on one summary/report task at the end of a chain is enough to unwedge it even when several tasks separate it from the failure: each intermediate task, left at the default, is cascade-abandoned in turn, and the terminal status that finally reaches the summary task is `Abandoned` — which its `"error"` acceptance treats exactly like the `Error` that caused it.
-
-**The walk is scoped to other tasks, never to the errored task's own remaining steps.** A multi-step task whose first step errors already reads as `Error` (a task's derived status is `Error` if ANY of its steps is) — its own later, still-`Planned` steps are left exactly where they are; `step_is_ready`'s intra-task rule (each step needs its immediately-previous SAME-task step `Complete`) already keeps them from ever becoming ready, and they are swept to `Abandoned` only by the ordinary close-time reconcile (`lifecycle::reconcile_phase_steps_terminal`), same as any other stranded step on a stopped run — never by the cascade itself. The cascade's whole domain is CROSS-task edges (`depends_on`/`reads`); it does not reach inside the task that actually failed.
-
-Also scoped, deliberately: `cascade_abandon` propagates exactly ONE originating step's id and reason text per abandonment chain (the step whose error triggered that walk) — not a running tally across every independent failure a run might contain. Two unrelated tasks erroring independently each start their own walk, and a downstream task reachable from both keeps whichever reason the LATER walk wrote. This is a known, accepted simplification (every review.json scenario today has exactly one true origin per run) rather than a general N-origin aggregator.
-
-A task rolled to `Abandoned` this way is never silently dropped: its `Step.output` carries the ORIGINATING step's own id and failure text VERBATIM (an `"<origin-step-id>: <origin's own recorded message>"`-shaped string) — not a generic "depends on X" placeholder that would lose the real reason a single hop downstream. Every task the cascade rolls in one walk carries the SAME origin text, so a task several hops from the actual failure still reads the true root cause directly off its own dependency's forwarded output, without needing to trace the chain by hand. It is persisted through the same `persist` hook every other transition uses, and its status is visible to any reader of the run's step state (`mission status`, the mission-graph lens) exactly like `Complete`/`Error` are. What it does *not* get is a fourth live flow-record action — `STEP_LIFECYCLE_ACTIONS` stays the three-string contract (`"step.start"` / `"step.complete"` / `"step.error"`) the mission-graph lens's SSE matcher is keyed on; the same convention `lifecycle::reconcile_phase_steps_terminal` already uses when a phase closes around a still-live step (same status, same output-names-why discipline, no new live action either).
-
-The built-in `review.json` uses exactly one `run_on: ["complete", "error"]` declaration, on its `deliver` task: when any upstream stage errors, every task between it and delivery is cascade-abandoned, the delivery task becomes ready anyway, and its step kind (`deliver.github_review`) renders a degraded, self-describing payload rather than the run silently producing no comment at all — the graph-native replacement for what used to be a separate fallback render the bespoke launcher ran *outside* the graph when its report step never started.
-
 ## Code review as a second config on the crawl's building blocks
 
-Designed 2026-09-04 with the operator while retiring the bespoke review launcher (#2310); **delivered 2026-09-05**, when P4d deleted the ten bespoke `review.*` step kinds, the ~3.6k-line launcher, and the funnel document, and the config below took the `review` id. `darkmux mission launch review` is now a mission config on the crawl's shared blocks, run by the generic launcher: **the ladder** (plan by rule → detect per unit → confirm in isolation → deliver), **the seat boundary as a hook** (detection is local, writing the patch is a frontier mod the run waits for, bounded, or does without), and **two seats** (a small reviewer seat per unit; a coder seat only for the optional unattended mod). One thing stays unmeasured and is the go/no-go: whether a rules catalog on small seats finds things worth saying. Everything below says for itself what is built.
+`darkmux mission launch review` is a mission config on the crawl's shared blocks, run by the generic launcher. It was designed while retiring the bespoke review launcher (#2310), whose ten step kinds, ~3.6k-line launcher and funnel document were deleted (P4d) when this config took the `review` id. It is: **the ladder** (plan by rule → detect per unit → confirm in isolation → deliver), **the seat boundary as a hook** (detection is local, writing the patch is a frontier mod the run waits for, bounded, or does without), and **two seats** (a small reviewer seat per unit; a coder seat only for the optional unattended mod). One thing stays unmeasured and is the go/no-go: whether a rules catalog on small seats finds things worth saying. Everything below says for itself what is built.
 
 ### What the retirement measured
 
@@ -861,8 +916,8 @@ Looked at beside the crawl (the section above), the funnel is the crawl's ladder
 - **Planner.** Crawl's plan step does rules times source, then windows, then units. The control flow is the same for review; only the source enumeration differs (a tree walk against a diff's hunks). The planner's source becomes a strategy on one shared pattern. Built in #2353: `step_kinds/patterns/plan_sites.rs` owns the merge-windows-and-pack-units procedure and takes the enumeration as a caller-supplied `SiteSource`, with `crawl::plan`'s `TreeSource` (the tree walk) and `DiffSource` (a diff's hunks) as its two impls.
 - **Units.** Already generic: a map step over units with a role that carries the finding tool. Review supplies a reviewer role and its rules files. A draws-per-unit knob, off by default, ports the measured k-draw recall technique from the funnel. Built in #2357: `crawl.unit`'s `config.draws` dispatches the same unit N times (absent means 1, one dispatch per unit), and a unit's `finding_refs` are deduped on `(rule, file, line)` before anything grows from them.
 - **Findings and mods.** The stores, the runtime tools, and the hooks are shared infrastructure today (see "Findings and mods"). Review reused crawl's create-mods phase verbatim until #2310 P4e; it now waits for a mod instead of dispatching a coder to write one (see "The seat boundary is a hook" below), while crawl's own create-mods task is unchanged.
-- **Delivery.** Review's own kind: mods and findings in, the GitHub review payload out. Pure render, no model, so the harness covers it. Built in #2353 as `deliver.github_review` (`step_kinds/deliver_github_review.rs`), and hardened in #2365 — model text cannot break out of its markdown container, and a run that covered less of the diff than it planned to renders degraded rather than noop. The retired funnel's own report kind was its ancestor.
-- **Scheduler.** A delivery task has to run after an upstream error. That is the `run_on` contract (see "Mission configs: a task's `run_on`"), needed by both configs. Built in #2350.
+- **Delivery.** Review's own kind: mods and findings in, the GitHub review payload out. Pure render, no model, so the harness covers it. Built in #2353 as `deliver.github_review` (`step_kinds/deliver_github_review.rs`), and hardened in #2365: model text cannot break out of its markdown container, and a run that covered less of the diff than it planned to renders degraded rather than noop. The retired funnel's own report kind was its ancestor.
+- **Scheduler.** A delivery task has to run after an upstream error. That is the `run_on` contract (see [A task's `run_on`](#a-tasks-run_on-decides-which-of-its-dependencies-failures-it-survives)), needed by both configs. Built in #2350.
 
 Working hypothesis, deliberately undecided: crawl may turn out to be *the pattern* (plan, detect by rule, confirm in isolation, mod) rather than a general tool, with crawl and review both configs on it. If the planner extraction produces exactly that shape, it belongs in `step_kinds/patterns/` as a named Tier 2 pattern. Decide from what the extraction looks like, not up front.
 
@@ -886,15 +941,15 @@ Refused and rejected findings are counted in the summary line and never posted.
 
 ### The seat boundary is a hook
 
-Written 2026-09-05 after measuring the one step above that a small seat could not do. Detection held up: a local seat reading one hunk against one written-down rule produces findings. **Writing the patch did not.** Across three local coder seats given the same create-mod message and the same finding, applying unified diffs came back 1 of 4, 0 of 3 and 1 of 10 — container paths instead of repo-relative ones, miscounted hunk headers, code fences, missing trailing newlines — while a clean-context frontier session given the identical instructions wrote 4 of 4. The gate had already been taught to absorb three of those shapes mechanically; the residue is judgment about what the smallest correct change is, and that is the thing the tier split exists to route.
+Written after measuring the one step above that a small seat could not do. Detection held up: a local seat reading one hunk against one written-down rule produces findings. **Writing the patch did not.** Across three local coder seats given the same create-mod message and the same finding, applying unified diffs came back 1 of 4, 0 of 3 and 1 of 10 (container paths instead of repo-relative ones, miscounted hunk headers, code fences, missing trailing newlines) while a clean-context frontier session given the identical instructions wrote 4 of 4. The gate had already been taught to absorb three of those shapes mechanically; the residue is judgment about what the smallest correct change is, and that is the thing the tier split exists to route.
 
-So the seat that writes a mod moved to the frontier, and the operator's own words name the mechanism: *we already created hooks for this reason.* darkmux does not gain a frontier client, an API key, or a "call Claude" step kind — it would be the one place in the system where darkmux stopped being the worker. What it already had was a sink that fires on a matched flow record, and `create_finding` is a matched flow record. The operator adds one rule to their own config; their orchestrator session sees the fired match; the bundled `darkmux-mod-create` skill sends a subagent to read the finding, open the pinned checkout and write the diff; and that subagent records it with the ordinary `darkmux mod create --for <key>` verb. Every darkmux-side surface in that sentence already existed. **A tier boundary is an integration point, not a dependency** — which is the same reason escalation leaves the system as an identifiable artifact rather than a stronger model being called from inside it.
+So the seat that writes a mod moved to the frontier, and the operator's own words name the mechanism: *we already created hooks for this reason.* darkmux does not gain a frontier client, an API key, or a "call Claude" step kind: it would be the one place in the system where darkmux stopped being the worker. What it already had was a sink that fires on a matched flow record, and `create_finding` is a matched flow record. The operator adds one rule to their own config; their orchestrator session sees the fired match; the bundled `darkmux-mod-create` skill sends a subagent to read the finding, open the pinned checkout and write the diff; and that subagent records it with the ordinary `darkmux mod create --for <key>` verb. Every darkmux-side surface in that sentence already existed. **A tier boundary is an integration point, not a dependency**, which is the same reason escalation leaves the system as an identifiable artifact rather than a stronger model being called from inside it.
 
-What review's `create-mods` phase does now is WAIT, bounded, for that mod: a Tier-1 `procedural.shell` poll of `mod list --for <key>` on a ~5s cadence, then the unchanged `mods.gate` and `deliver.github_review`. **A wait that ends with no mod is a clean outcome**, exit 0 with `found: false` — the gate records its ordinary no-mod skip and the finding delivers as a question. That is deliberate and was a review correction: the frontier reading a finding and declining to write a mod is the CORRECT answer for a search-form finding and for one that does not hold (the skill instructs it explicitly), so erroring there would have marked every run that took the design's own advice Degraded. Only a malformed bound and a genuine infra failure error the step. The wait's own bound, `mod_wait_seconds`, **defaults to 0, meaning do not wait**, because the unattended path is real and is not a degraded version of the attended one: the self-hosted runner that runs review on every PR has no orchestrator session to receive the hook and no frontier seat, so waiting there buys nothing and costs a per-finding stall. Unattended runs therefore deliver **detections only** — every finding as a question, honestly labeled. An attended run opts in with `--param mod_wait_seconds=<N>` and gets suggestions for the findings whose mods pass their gate. The same config, two honest modes, distinguished by one number rather than by a second document.
+What review's `create-mods` phase does now is WAIT, bounded, for that mod: a Tier-1 `procedural.shell` poll of `mod list --for <key>` on a ~5s cadence, then the unchanged `mods.gate` and `deliver.github_review`. **A wait that ends with no mod is a clean outcome**, exit 0 with `found: false`: the gate records its ordinary no-mod skip and the finding delivers as a question. That is deliberate and was a review correction: the frontier reading a finding and declining to write a mod is the CORRECT answer for a search-form finding and for one that does not hold (the skill instructs it explicitly), so erroring there would have marked every run that took the design's own advice Degraded. Only a malformed bound and a genuine infra failure error the step. The wait's own bound, `mod_wait_seconds`, **defaults to 0, meaning do not wait**, because the unattended path is real and is not a degraded version of the attended one: the self-hosted runner that runs review on every PR has no orchestrator session to receive the hook and no frontier seat, so waiting there buys nothing and costs a per-finding stall. Unattended runs therefore deliver **detections only**: every finding as a question, honestly labeled. An attended run opts in with `--param mod_wait_seconds=<N>` and gets suggestions for the findings whose mods pass their gate. The same config, two honest modes, distinguished by one number rather than by a second document.
 
-Two consequences worth stating. First, the frontier is now inside the run's latency, which is why the bound is an operator knob and why `runtime.step_command_timeout_seconds` (the bound every step command already had) stays the outer limit — a wait that outruns it is killed by the step bound and errors naming that, not `mod_wait_seconds`. Second, `crawl.json` keeps its coder dispatch. Crawl's findings are proposals over a read-only corpus with no test target implied and its create-mods task ships off by default; review's are diff-scoped with the changed files naming the tests. The two configs diverged here for the reason the section above predicted they would diverge anywhere — because what is code-specific about review is real.
+Two consequences worth stating. First, the frontier is now inside the run's latency, which is why the bound is an operator knob and why `runtime.step_command_timeout_seconds` (the bound every step command already had) stays the outer limit: a wait that outruns it is killed by the step bound and errors naming that, not `mod_wait_seconds`. Second, `crawl.json` keeps its coder dispatch. Crawl's findings are proposals over a read-only corpus with no test target implied and its create-mods task ships off by default; review's are diff-scoped with the changed files naming the tests. The two configs diverged here for the reason the section above predicted they would diverge anywhere, because what is code-specific about review is real.
 
-**The unattended seat (#2310 P4f).** The wait needs a session watching the hook, and the runner has none — so for the unattended path the answer is not a shorter wait, it is a different SEAT. What the measurement actually found was a TIER boundary, not an attendance one: a frontier-class model wrote applying diffs and the small local seats did not, and a hosted frontier-class endpoint is a seat a runner can staff. So `create-mods` ships a SECOND grow template beside the first, `create-mod-dispatch`: a `coder` dispatch on an endpoint profile named by a new `mod_seat_profile` input, off by default, carrying the create-mod message `crawl.json` carries — byte-identical again, and pinned as such by a test, because it is the same job specified for a different tier. The two templates are mutually exclusive through a new schema-3.5 `excludes` field: exactly one may be enabled, both is a validate-time Error naming both, and the dry-run graph shows whichever is live because the other is pruned at mint. This does NOT give darkmux a frontier client — an endpoint profile is operator config the profile-uniformity contract already covers, and the dispatch is the ordinary `dispatch.internal` step kind reading the ordinary `profile_name` override; nothing here knows what a frontier is. Two limits stated rather than papered over. The seat sends the finding and the source it names to a third party, so it is for public repositories only — work under a client boundary keeps the local seat and the attended hook. And the agentic-remote container path is not metered by the per-step cap (`remote.max_tokens_per_step`, #1187); since 4.0 an endpoint budget (`endpoints.<id>.limits`, #2902) covers it, and otherwise the inactivity budget and the turn cap are its only ceilings; the guide says so in the same breath as the recipe for measuring what the seat actually costs per diff, which is tokens read off each `dispatch.complete` record, never currency.
+**The unattended seat (#2310 P4f).** The wait needs a session watching the hook, and the runner has none, so for the unattended path the answer is not a shorter wait, it is a different SEAT. What the measurement actually found was a TIER boundary, not an attendance one: a frontier-class model wrote applying diffs and the small local seats did not, and a hosted frontier-class endpoint is a seat a runner can staff. So `create-mods` ships a SECOND grow template beside the first, `create-mod-dispatch`: a `coder` dispatch on an endpoint profile named by a new `mod_seat_profile` input, off by default, carrying the create-mod message `crawl.json` carries: byte-identical again, and pinned as such by a test, because it is the same job specified for a different tier. The two templates are mutually exclusive through a new schema-3.5 `excludes` field: exactly one may be enabled, both is a validate-time Error naming both, and the dry-run graph shows whichever is live because the other is pruned at mint. This does NOT give darkmux a frontier client: an endpoint profile is operator config the profile-uniformity contract already covers, and the dispatch is the ordinary `dispatch.internal` step kind reading the ordinary `profile_name` override; nothing here knows what a frontier is. Two limits stated rather than papered over. The seat sends the finding and the source it names to a third party, so it is for public repositories only: work under a client boundary keeps the local seat and the attended hook. And the agentic-remote container path is not metered by the per-step cap (`remote.max_tokens_per_step`, #1187); an endpoint budget (`endpoints.<id>.limits`, #2902) covers it, and otherwise the inactivity budget and the turn cap are its only ceilings; the guide says so in the same breath as the recipe for measuring what the seat actually costs per diff, which is tokens read off each `dispatch.complete` record, never currency.
 
 ### A rule is a procedure, because a small seat has no intuition
 
@@ -911,40 +966,171 @@ For "a well-known package does this", the model's own knowledge is the unreliabl
 
 A rule-shaped review is narrow by construction: very good catches, rarely broad. A good comment on a big diff can need architectural knowledge that no window carries; out of context is out of knowledge, for a local seat and a frontier model alike. Two consequences. The review's summary must state its scope (rules run, windows covered, what it did not attempt) so a narrow review never reads as complete. And breadth stays where the two-tier review policy already puts it: the local rule-based review is the always-on first tier that logs onto the PR; the frontier gate keeps the architectural read.
 
-### Sequence
+### History: how the review config was built
 
-P4a, the `run_on` scheduler contract, shipped first because both configs need it (#2350). P4b extracted the planner source into a strategy and added the deliver kind, both model-free and golden-tested (#2353). P4c landed the new review config with its first rules catalog — intent-vs-diff, existing-solution, shared-symbol-callers, union-vs-enum, swallowed-error, unnamed-predicate, test-gap — each rule carrying a scope and one of the three confirmation forms (#2354); P4c-2a made a declared input substitute into any step config at mint, which is how the launch's `intent_file`, `test_command` and `draws` reach a grown step at all (#2355); and P4c-2b added the mod gate, the draws knob and the gather-and-deliver task that turns this run's own stores into a GitHub review payload (#2357).
+The order was: the `run_on` scheduler contract first, because both configs need it (#2350); then the planner source extracted into a strategy and the model-free deliver kind (#2353); then the review config with its first rules catalog (intent-vs-diff, existing-solution, shared-symbol-callers, union-vs-enum, swallowed-error, unnamed-predicate, test-gap), each rule carrying a scope and one of the three confirmation forms (#2354); a declared input substituting into any step config at mint, which is how the launch's `intent_file`, `test_command` and `draws` reach a grown step (#2355); and the mod gate, the draws knob and the gather-and-deliver task that turns a run's own stores into a GitHub review payload (#2357).
 
-Then it ran for real, which is the part no amount of golden testing substitutes for. The first live run, 2026-09-05, planned and dispatched the catalog against a live diff end to end. It found three seam defects nothing in the suite could have: per-rule plans collided because every plan named its first unit `u-0001` and they shared one on-disk home (#2360, fixed); the delivered scope line miscounted what the run had actually covered, reading a completed step as a covered hunk and carrying container paths out to the host (#2361, open); and a `DARKMUX_HOME` install wrote its flow and audit records into the real `~/.darkmux` rather than under the resolved root (#2359, fixed) — a config-wide leak the review config happened to be the first thing to trip. A five-swarm review of the arc followed, and its fix loop is what the packets after #2365 are working through. The rules catalog's own hit rate — whether a small seat with a written-down procedure says anything worth reading — is the measurement still owed, and it is the go or no-go.
+Then it ran for real, which is the part no amount of golden testing substitutes for. The first live run planned and dispatched the catalog against a live diff end to end and found three seam defects nothing in the suite could have: per-rule plans collided because every plan named its first unit `u-0001` and they shared one on-disk home; the delivered scope line miscounted what the run had covered, reading a completed step as a covered hunk and carrying container paths out to the host; and a run under a relocated `DARKMUX_HOME` wrote its flow and audit records into the real `~/.darkmux`, a config-wide leak the review config happened to be the first thing to trip. That is why a live run, not a green suite, gates a release. The deletion of the bespoke launcher (P4d) left every frozen `--param` name declared, the ones with no consumer marked `ignored` rather than dropped, so the self-review workflow's command line is unchanged, and `plan.sites` learned to derive its own one-source workspace from `github` plus `head_sha` so a runner with git credentials and no workspace spec plans against the checked-out head. The catalog's own hit rate, whether a small seat with a written-down procedure says anything worth reading, is the measurement still owed, and it is the go or no-go.
 
-P4d (2026-09-05) deleted the ten review kinds, the bespoke launcher, its conformance harness and the funnel document, and swapped the new config onto the `review` id. The self-review workflow's command line is byte-identical: every frozen `--param` name stays declared, the ones with no consumer are marked `ignored` rather than dropped, and `plan.sites` learned to derive its own one-source workspace from `github` + `head_sha` so a runner with git credentials and no workspace spec plans against the checked-out head. The `review{}` config block's funnel-era knobs (`judge_concurrency`, `judge_fail_on_any_skip`) are retired too — CONFIG schema 1.22 removed the block. What is still owed as of this writing: folding `plan.sites`/`crawl.unit`/`crawl.summary` (still living under `darkmux-lab/src/crawl/`, so neither config's step names carry the other's vocabulary) into mission-agnostic ids and moving them into `darkmux-crew`'s `step_kinds/`, so `records.gather` stops knowing other kinds by string (#2430); a typed `Action` registry — canonical wire spelling plus read aliases, ts-exported — so emitters, tests and the viewer can no longer spell an event differently from each other (#2425); turning every `deliver.github_review` finding into its own inline conversation (a suggestion when its mod passed the gate, a comment otherwise), fixing the stray `? Candidates:` suffix, and checking the PR head at post time (#2429, in flight as PR #2431); and the Redis-side half of the dispatch-liveness-bookend hole #2409 fixed for the local file path — a busy Redis stream's `XREVRANGE … COUNT 10000` can still push a `dispatch.start` below the read window the same way a busy day file used to, and there is no server-side filter-by-action read to special-case it with (documented in place at `crates/darkmux-serve/src/lib.rs` ~L3750).
+## Multi-machine substrate
+
+Single-operator multi-machine is the design target. The operator owns a couple of Macs on a tailnet they control, and darkmux makes them function as one development environment without becoming team tooling. The substrate is four things: a daemon on each machine that serves the machine's records and introspection ([The daemon](#the-daemon-and-its-read-surface)), two separate authorizations for reading that surface and for running work through it ([Read auth and execution auth](#read-auth-and-execution-auth)), the fleet channel that lets one machine run a dispatch on another ([Fleet](#fleet-addresses-trust-and-the-execution-channel)), and the shared record stream with its optional audit chain ([Provenance and the audit chain](#provenance-and-the-audit-chain)).
+
+### The daemon and its read surface
+
+`darkmux serve` is one process per machine. It serves that machine's flow stream (`GET /flow/<date>`, and a live SSE tail at `GET /flow/<date>/stream`), the bundled drill-down viewer (`crates/darkmux-serve/assets/next.html`, built from `ui/src` and compiled into the binary; the public demo is the same viewer in playback mode, and CI regenerates it and fails on a diff), and per-machine introspection. `GET /machine/specs` returns the version, `machine_id`, RAM, CPU brand, OS, loaded models from `lms ps` and the redacted Redis URL, and `darkmux machine list --deep` fans out over HTTP to every reachable peer's. The routes are a contract ([Public surfaces](#public-surfaces-the-daemons-http-routes-are-a-contract)).
+
+- **A misbehaving viewer tab cannot exhaust the daemon.** The Redis tail behind the SSE route is bounded: connect wedges are bounded by `REDIS_CONNECT_TIMEOUT`, a persistent failure ends the stream cleanly with a synthetic `stream.error` record, and the producer-to-consumer channel is capped with drop-newest semantics. Concurrent SSE streams are capped (`MAX_CONCURRENT_SSE`, held by an `SseSlot` guard), and every non-streaming route has a request timeout; the event stream is kept apart so the timeout never applies to it.
+- **CORS is deny-all by default.** No origin, `null` included, is allowed until named (#2155). `null` was once allowed so a `file://` viewer worked, but it is also the origin of a sandboxed iframe, so any site could embed one and read the daemon's routes. The operator opts in to specific origins through `DARKMUX_DAEMON_CORS_ORIGINS` (exact match after normalization; a literal `*` is rejected with a hint on stderr).
+- **A live channel carries sub-second model state and persists nothing.** While an execution runs, its dispatch process sends samples (the model's state 250 ms apart, and every transition) over a unix datagram socket to the local daemon (`darkmux_flow::live::local_socket_path`), and `live_hub` fans them out to open viewers as SSE `live` events on the same stream. A bounded broadcast ring drops a slow viewer's oldest samples instead of holding the others back; the receiver accepts only what `LiveSample::from_datagram` accepts and re-serializes it, so a local process cannot push arbitrary bytes into a viewer. Nothing in the path writes a day file, Redis, the audit chain or the trajectory, so the durable heartbeat stays at two seconds and no history grows. It is local only (another machine's cards stay at the heartbeat), and its cadence is `runtime.live_sample_ms` (`0` is off). The observer must not join the observed: a slow or absent daemon never slows a dispatch.
+- **The unit of the daemon is the machine.** Mission and phase state live in each machine's own filesystem. Replicating them across machines is out of scope, tracked as a future architectural pivot (#280), as are mission priority with cross-fleet pause (#282) and elastic-hub failover, which would close the single point of failure of a fixed hub.
+
+### Read auth and execution auth
+
+Running work and reading records are different powers, and they are authorized by two separate switches.
+
+- **Execution** is fleet work submission, the only surface that starts work. It always requires the fleet token plus a network-verified sender, whatever else is set ([Fleet](#fleet-addresses-trust-and-the-execution-channel)).
+- **Reads** (the viewer, every JSON route, the live stream) are governed by `serve.read_auth`, default `false`: reads stay open to whatever reaches the daemon, by design, because the tailnet is the trust boundary and a viewer over `tailscale serve` is the point. With it on, only a request from this machine stays open; every other read needs `Authorization: Bearer <token>`.
+
+They were one switch until a token that closed reads made it impossible for a hub that takes fleet work (which needs the token) to also serve its viewer to the tailnet. The token itself is a Keychain item (`serve.token_keychain` gates whether it is read; `DARKMUX_SERVE_TOKEN` overrides), wrapped in `RawServeToken` so it can only reach a log redacted.
+
+**"This machine" is one predicate**, `is_local_request` in `darkmux-serve`, used for every local decision. A request is local when its peer is loopback (an IPv4-mapped loopback included), it carries no reverse-proxy header, and it has a single `Host` naming the daemon (`localhost`, `127.0.0.1`, `[::1]` or the bound address, with no port or the bound port). A request through `tailscale serve` arrives from loopback with proxy headers (`X-Forwarded-For`, `Tailscale-User-*`), so it is not local and needs the token; a page rebound by DNS to loopback has a loopback peer and the attacker's `Host`, so it is not local either; a request with no `Host` or no peer address is not local. The failure direction is deliberate: a local process that fakes a header only makes itself look remote, which shows less.
+
+Two panels describe the execution surface (`doctor` shows the fleet listener's overlay address, port, busy policy and the allow-list's node names and roles; `config-list` shows the whole `config.json`, allow-list included), so they are served only to a local request or a token holder even with read auth off, and `/health` withholds the same facts. `darkmux serve` runs the same config gate as every other entry point before it binds, so a wrong-typed `serve.read_auth` or a retired key refuses the start instead of dropping the file to defaults, and it refuses to start with read auth on and no token. A non-loopback `--bind` requires read auth on.
+
+Known limit: `Host` is client-set, so a non-browser client behind a TCP forward that adds no headers can send `Host: localhost` and cannot be told apart from this machine. For that setup use the HTTPS `tailscale serve` (it adds headers), or keep read auth on with a non-loopback bind. `darkmux doctor` and the `serve` banner state both postures.
+
+### Fleet: addresses, trust and the execution channel
+
+A machine's work runs on another machine only through an authenticated channel, and the address that names it is part of the profile.
+
+**The address.** `darkmux dispatch <role> --profile <profile>@<machine>` runs the dispatch on `<machine>`. `darkmux_types::profile_address` is the one parser: it splits at the last `@`, the machine part is a `machine_id` (letters, digits, `-` and `_`, at most 64, compared case-insensitively), and a profile name that itself contains `@` cannot be addressed. The sender sends the owner's bare profile name, and **the owner is the only judge of it**: the receiving machine resolves the name against its own registry, and an undefined name is refused by name, never replaced by its `default_profile`. A path that runs only on this machine (the lab, a mission step) refuses an address instead of reading it as an undefined local name. The address is a profile property, not an endpoint kind.
+
+**The listener.** With `fleet.listener.enabled`, the daemon runs a second listener bound only to the address the identity provider reports for this machine: never `0.0.0.0`, never loopback, and never behind a `tailscale serve` front, which would make every caller arrive as loopback and unidentifiable. It serves one route, `POST /fleet/work`, and every request passes `darkmux_fleet::admit` first.
+
+**Three checks, in this order, deny by default.**
+
+1. **The fleet token**, compared in constant time. A caller without it costs one compare and never makes the receiver spawn anything. The token is the serve token, one shared secret on every machine.
+2. **The network identity of the sender.** `fleet.identity.provider` (a registered value, `tailscale`) answers `whois` for the connection's peer address. No answer is a refusal (fail closed). There is no cache (about 25 ms a call, measured), so `untrust`, or a node leaving the network, takes effect on the next request; the allow-list is likewise read from `config.json` per request.
+3. **The allow-list** (`fleet.accept_work.<machine>`). An entry names the node (`node_id`, which `darkmux machine trust` resolves through the provider and an operator never types), and scopes what the peer may run: the *resolved* profile must be one it lists and must not be utility-only; roles are an explicit list (a role is a tool palette and a system prompt, so "any role" would grant every palette this machine has); images run on darkmux's own runtime image unless listed; a `workdir` needs `workspace`. `machine_uid` is never an input, and machine names compare ASCII case-insensitively.
+
+**Connections are bounded.** A tokenless peer could open many half-sent requests and exhaust the daemon's descriptors, taking the viewer port down with the listener. The listener serves at most 32 connections at once (one more is closed on accept), at most 3 per peer address, gives each 3 seconds to send its headers, and caps a connection's lifetime; the daemon raises its open-file limit at start, and refusals are logged at most five times per peer address per minute.
+
+**Busy is decided per seat.** A local model serves one request at a time, so a job on a local model holds that model for its run, and a second job for the same model is busy while a job for another local model runs beside it. A hosted job runs beside others up to the receiver's `remote.concurrent_cap` (`0` is unbounded). Past a limit the receiver's `fleet.busy_policy` answers: `refuse` (the default) says so at once, naming what runs; `queue` holds the job first come first served per seat, at most four per sending machine (`NODE_CAP`), with a `queued` line every 20 seconds so the connection never looks dead, and a queued job passes every admission check again when its seat frees, so `untrust` also stops jobs already waiting. Only jobs from other machines count; this machine's own dispatches are not seen by the listener.
+
+**The sender verifies the receiver too.** Before the token leaves, the roster address must resolve to a tailnet node, pinned per roster entry on first contact (`PeerTarget::pinned_ip` and `newly_pinned`), and a loopback target gets no token. A roster entry's id is the machine's own `machine_id`, and `machine add` refuses an address that reaches only the reading machine (loopback forms) unless `--allow-loopback`, because other machines read the roster and a loopback address reaches whichever machine reads it. Remote output is stripped of control characters before it prints.
+
+**What a routed dispatch records.** The sender writes `dispatch.route` (`target_machine`, `decision`, `profile_address`) and never a token count: the machine that ran the model counts tokens. The receiver runs the job under a relay session in a standalone run, so it is never one of the receiver's own missions, and it never mounts the shared toolchain cache.
+
+**The wire is versioned.** `WORK_JOB_SCHEMA_VERSION` is the job's shape, and a reply body is newline-delimited (queued lines, then the answer). Both machines must run the same darkmux: a mismatch is refused naming both versions.
+
+Known gaps: the identity provider is one value today (`tailscale`); a mission's own steps cannot yet name a `profile@machine` (only `dispatch` routes); a work job carries no `brief_refs`, so a routed dispatch that names one is refused instead of routed without its blocks; rotating or removing the fleet token takes effect when the daemon restarts, since it reads the token once; and a sender that vanishes without closing its connection (a laptop that sleeps) keeps its queue place until TCP gives up.
+
+### Provenance and the audit chain
+
+Two optional sinks sit beside the local day file in one `TeeSink`.
+
+- **Redis Streams**, through `RedisSink` (`redis.enabled`, or `DARKMUX_REDIS_URL`): `darkmux:flow` is the fleet-wide event log, and every machine's tee includes a Redis leg that appends each record. The daemon's `/flow/<date>` reads it for the decentralized topology view. The password is a Keychain item, never config.
+- **The audit chain**, through `AuditFileSink` (`audit.enabled` and `audit.dir`): a per-machine, per-day file in which each line is a BLAKE3 hash of the record's exact bytes chained to the previous line, serialized with `flock(2)`. `darkmux flow integrity-check` recomputes each chain and reports the first divergence: exit `0` when every chain walked clean, `2` when a break is found, and `3` under `--strict` when a file could not be content-verified at all (a pre-chain legacy file). A break outranks an unverifiable file.
+
+A record's `machine_id` is **operator-asserted**: named by the operator and stamped from the environment, with no authenticated identity behind it. The chain's stated limit is that it is anchorless: a writer with access to the files can rewrite a whole file (fresh header, recomputed hashes, relinked `prev_hash`) and reach exit `0`, and a legacy file carries no evidence either way. darkmux describes what the check does; it makes no claim about what a clean run proves.
+
+## Hooks: how records leave the machine, and who is allowed to hold a credential
+
+A hook is not a feature bolted onto the crawler or the review pipeline. It is a **`FlowSink` like every other**: the fourth child of the same tee that already fans a record out to the local day file, the audit chain, and Redis. Its `write` matches the record against operator-configured rules and appends matches to a per-rule on-disk outbox; a drainer thread POSTs them and advances a cursor only after a success.
+
+Two consequences fall out of that placement, and both are the reason it was placed there. Every record kind is hookable with **zero producer-side awareness**: thermal transitions, tool calls, and mission bookends all became deliverable without one line of change at the site that emits them. And delivery is **at-least-once, durable across restarts**: the queue is a file, the cursor moves after the 2xx, and a receiver that is down is an outage to wait out rather than data lost.
+
+**Rules match the closed vocabulary.** A rule's `match.action` is checked against the flow vocabulary ([The flow vocabulary](#the-flow-vocabulary-one-closed-list-one-spelling-per-event)): a rule that names a retired spelling, an exact one or a spaced glob, is refused. The hook sink does not load (the run itself continues without hooks, like any other bad hook rule) and `darkmux doctor` fails the rule, naming the spelling to write. A dotted glob can match more than its old spelling did (`dispatch.*` also matches every turn and tool record), and the refusal says so. A rule's outbox is keyed by a hash of its `match`, so a rewritten rule starts a new outbox, and records still pending under the old spelling are not delivered; the key is not derived to survive the rewrite, because that would mean hashing the retired spelling forever. Only the outbox, an archive of records already written, is still read leniently.
+
+**The receiver cannot always be adapted, which decides where transforms live.** When darkmux owns the receiver (the local crawl tracker), the honest shape is a thin adapter in the receiver: darkmux ships one wire contract (the flow record verbatim, schema-versioned, lenient on read) and the receiver projects it into whatever it stores. That stops being available the moment the destination is somebody else's SaaS. You get an API; you cannot put code inside Jira. So for anything not your own, the transform has to live on the **sending** side.
+
+**Two orthogonal axes, and only one of them ever holds authority.**
+
+| Axis | Job | Authority |
+|---|---|---|
+| **transform** (a `.jq` adapter) | the *shape*: record → request body | **none, by construction** |
+| **transport** (`http` · `file` · `cmd`: `cmd` planned, not yet built) | the *destination and its credentials* | http: one Keychain header value · cmd: the operator's own CLI |
+
+The split is the whole design. A transform is a **pure function** (it needs no filesystem, no socket, no subprocess), so it is given none of those. jq is the language because it *is* JSON-to-JSON with no I/O in its grammar: there is nothing to sandbox. Three properties follow. A crawl finding's `evidence` is a source line copied verbatim out of a repo under audit; through a shell-spawning adapter that is an injection target, and through jq it is a string, so the hostile-data class disappears. The transform receives only the record, so it **cannot** read a credential: the delivery path resolves those separately and the two never meet. And because the evaluation is in-process, the outbox's guarantee extends all the way to the real destination rather than stopping at a hop.
+
+**What was rejected, and why, since each looks reasonable from a distance.** A *declarative template* with `{dotted.path}` substitution is safe and becomes a bad programming language the first time someone needs a conditional or a nested document: Jira's ADF `description` alone is enough to break it. *Executing an operator script as the transform* hands a pure function full operator authority (filesystem, network, spawn, Keychain) to do a job that requires none of it, and it walks around the command gate that already exists for exactly this class of thing. *Shipping named adapters for Jira, Slack, and friends* is the safest option of all and re-creates precisely the coupling this whole design refuses: the sender would own N destination schemas and every new API would be darkmux's maintenance. A *sidecar adapter service* on loopback works today with no new code, and quietly breaks the delivery guarantee: darkmux's `hook.fired` would mean "handed to a process that may have dropped it," so the retries and quarantine records would describe the wrong hop. It stays documented as the escape hatch for integrations that need their own state or batching, with the honest note that the operator owns delivery from that point on.
+
+**The transport set is closed at three, and `cmd` is what makes closing it possible.** Two of the three ship today: `http` and `file`; **`cmd` is designed but not yet implemented**, a separately-gated packet, and the paragraph below describes the intended shape rather than current behavior. A rule naming only `cmd` is refused at load today, the same as any rule with no destination. `http` covers the ninety percent with a static credential: Jira, Slack, Telegram, PagerDuty, a webhook, an Azure Function key. `file` writes the delivery to disk instead of sending it, which is the no-network tier for testing an adapter end to end. `cmd` pipes the transformed body to an allowlisted program on stdin and **treats its exit code as the delivery ack**: zero advances the cursor, non-zero enters the existing retry and quarantine policy. That is what keeps at-least-once intact through an arbitrary destination, and it means the protocol library is the operator's own CLI rather than darkmux's source tree. SMTP is a script piping to `mail`; SQS and anything else SigV4-signed is `aws`, which already implements SigV4; gRPC is `grpcurl`; Postgres is `psql`; an Azure AD-protected endpoint is `az account get-access-token` and a curl. darkmux will not learn SigV4, OAuth refresh, SMTP, or gRPC natively: each would be the same coupling wearing a different hat. The one extension planned in advance is `auth: { cmd, ttl_seconds }`, an allowlisted command that prints a header value and is cached for its TTL, which covers every token-refresh case without darkmux implementing OAuth.
+
+**Credentials follow the posture the command gate already states: darkmux holds none of its own.** A rule names a Keychain item; the item holds the **complete header value**, `Basic <base64(email:token)>`, `Bearer …`, whatever the destination wants, not a raw token to be assembled. darkmux therefore has no credential-formatting logic to get wrong and stays scheme-agnostic, and the value is redacted in every record, log line, doctor row, and dry-run dump. The exec transport inherits the same gate as any other shell-out: a **name**, not a path, refused until that exact name appears in the operator's own allowlist, spawned directly rather than through a shell, with the record on stdin only so that nothing derived from a crawled repository can reach a shell parser.
+
+**One limit stated plainly rather than discovered later.** At-least-once is not idempotent, and a create-issue API has no idempotency key, so a lost response can produce a duplicate. The delivery id is stable across retries and an adapter can write it into a searchable field, but a genuine check-then-create needs two requests, which is the `cmd` transport's job, not the transform's.
+
 ## ACP: darkmux inside the editor
 
-`darkmux acp` speaks the [Agent Client Protocol](https://github.com/agentclientprotocol/agent-client-protocol) over stdio, so an editor like Zed can drive darkmux from its own agent panel: you type `/mission launch review` in the editor and a local crew works the PR, with progress rendering in the panel rather than a terminal you have to go find.
+`darkmux acp` speaks the [Agent Client Protocol](https://github.com/agentclientprotocol/agent-client-protocol) over stdio, so an editor like Zed can drive darkmux from its own agent panel. You type `/mission launch review` in the editor and a local crew works the PR, with the result rendering in the panel rather than a terminal you have to go find. `src/acp.rs` owns the wire-protocol plumbing, and `src/acp_panel.rs` owns the panel's grammar, its launch planning and the ephemeral runner.
 
-**It is still labeled a spike in its own module docs, and that label is honest.** What works, works in Zed today; what is spike-grade is named in `src/acp.rs` rather than papered over. The most fragile piece *was* review-stage progress, recognized by pattern-matching substrings out of the review subprocess's stderr; that whole path went with the bespoke review route in #2310 P4d, and `/mission launch review` now runs as an ordinary `mission launch`. A structured progress channel every command can render is still the real fix, and it is a feature, not a spike's job.
+**The panel has one command, and it is generic.** `/mission list` lists every config `darkmux mission launch` can start, `/mission launch <config> [name=value ...]` launches one, and `/mission show <id>` prints one mission from the same derivation `darkmux mission show <id>` prints (`mission_show`, and its `--json` is a semver-bound shape). No config names itself into the panel: adding a launchable command is writing a JSON file, with no rebuild, no registration call and no darkmux release. A mission config that still carries the retired per-config `panel` block is refused by the user-file gate, naming `/mission launch <id>`. Words after the config id map onto the config's declared inputs the way `--param` does (a `name=value` token naming a declared input is a parameter), and any other text goes to the config's `__panel_args__` reader and is refused when the config has none, rather than dropped. Values have no escape syntax: a backslash right before a closing quote is refused, naming the input, instead of being guessed at.
 
-**The panel has one command, and it is generic.** `/mission list` lists every config `darkmux mission launch` can start, `/mission launch <config> [name=value ...]` launches one, and `/mission show <id>` prints one mission from the same derivation `darkmux mission show <id>` prints. No config names itself into the panel: the per-config `panel` block is retired (a config still carrying one is refused, naming `/mission launch <id>`), so adding a launchable command is writing a JSON file, with no rebuild, no registration call, and no darkmux release. Words after the config id map onto its declared inputs the way `--param` does, and text with nowhere to go (no task reads `__panel_args__`) is refused rather than dropped.
+**The panel and the CLI share one launch path.** `plan_launch` resolves the config through `mission_launch::resolve_config` (the CLI's own load and its refusal text), so `/mission list` and radio's catalog run the same first check a launch does and list configs exactly when a launch could start. How an invoked command runs is decided **structurally, never by matching an id**:
 
-How an invoked command runs is decided **structurally, never by matching an id** (#2310 P4d removed the third arm, the bespoke review route, along with the launcher behind it):
+- a config whose graph dispatches **no models at all** runs as an ephemeral in-process graph (`run_ephemeral`, through the scheduler's `run_step_graph`): no mission record, no run artifacts, because a command that shells out and prints a result is not a mission and recording it as one would pollute the mission board. It is also what lets an operator-gated step ask the editor for approval through `session/request_permission`.
+- anything else is a real `darkmux mission launch <id>` subprocess.
 
-- a config whose graph dispatches **no models at all** runs as an ephemeral in-process graph — no mission record, no run artifacts, because a command that shells out and prints a result is not a mission and recording it as one would pollute the mission board
-- anything else is a real `mission launch`
+A panel invocation types no diff, so `prepare_launch` fills a declared required `diff_file` (plus `workspace` and `head_sha`) from the session's working directory when the operator passed none. The trigger is the config's declared inputs, never its name, and the CLI does not synthesize: a terminal user names the diff.
 
-The test is the same one `mission launch` itself uses, so the two entry points can't drift into disagreeing about what a config is.
+**A long-lived agent process needs a way to stop.** ACP gives an agent no disconnect notification, so a naive implementation leaks a session per editor thread forever. `session/close` is advertised and handled: it aborts anything in flight for that session and drops its state, and `session/cancel` shares the same abort-handle registry, so a cancelled command is genuinely aborted rather than left running with its output discarded. Because a client may never send a close, there is also a two-tier process-level backstop (#1781). A process no client ever attached a session to (spawned and abandoned) exits once it has been idle for `runtime.acp_idle_exit_minutes`; a process that has had a session attached is reclaimed only after a week-scale hard ceiling with no traffic. The predicate is "has a session ever attached", never "is one attached right now": the latter goes true again the moment `session/close` prunes the map, so a client that closes one thread and opens another minutes later would have its live process exit in between.
 
-**A long-lived agent process needs a way to stop.** ACP gives an agent no disconnect notification, so a naive implementation leaks a session per editor thread forever. `session/close` is advertised and handled: it aborts anything in flight for that session and drops its state. Because a client may never send it, there is also a process-level backstop — but a two-tier one (#1781). A process no client ever attached a session to (spawned and abandoned) exits once it has been idle for `runtime.acp_idle_exit_minutes`; a process that has had a session attached is reclaimed only after a week-scale hard ceiling with no traffic at all (the leak is bounded, not unbounded — but the bound sits far outside ordinary use, because a leaked ACP process costs a few MB while a killed panel costs an IDE restart). The predicate is "has a session ever attached", never "is one attached right now" — the latter goes true again the moment `session/close` prunes the map, so a client that closes one thread and opens another minutes later would have its still-live process exit in between, which is the original bug on a second path. `session/cancel` shares the same abort-handle registry, so a cancelled command is genuinely aborted rather than left running with its output discarded.
+Known gap: there is no structured progress channel that every command can render; a launch reports that it started and then its final output.
 
-**`darkmux radio` is the terminal twin.** It routes free text onto exactly one launchable config through a bounded local classification dispatch, then executes it: one routing call, one execution, no loop. It prints the route it chose (`radio: routing to `mission launch <id>` from your text`) *before* executing, so the choice is never silent, and text that doesn't map cleanly onto one command **refuses and lists the options** rather than guessing. A router that guesses wrong on a command that mutates external state is exactly the failure the command gate above exists to prevent, so it declines instead.
+## Radio: free text onto one command, and a confirmation before it runs
 
-## How we decide
+`darkmux radio` is the terminal twin of the panel's free-text channel: it routes text onto exactly one launchable config, then (after the operator confirms) runs it. The core is surface-neutral (`src/radio.rs`), and the CLI verb and the editor channel both call into it; both call into `acp_panel` for the catalog and the launch plan, so there is one place that decides what is launchable and one place that decides how a launch runs.
 
-darkmux's design decisions are **grounded in data and in published research where it exists**: we'd rather cite a measurement or a paper than assert from intuition. The framing is *convergence, not priority*: independent research and this project keep arriving at the same architecture (fresh-context review, verifiable-check termination, structured compaction), and the citations explain *why* it works. See the roadmap's [*How we decide*](ROADMAP.md#how-we-decide) for the citation-verification discipline (every cited source re-fetched and confirmed; a confident citation under a correctly-recalled label is exactly where fabrication hides).
+- **Routing is a utility job.** One bounded classification call runs on the machine's utility model, through the lean utility path: free text and the catalog in, one config id and its arguments (or a refusal) out. The router requires `internal.utility`; with none registered it refuses, naming the fix. It reads the first sentence of a config's `description` (else its `name`) to describe each candidate, so a config that should be routable leads with one plain sentence.
+- **Selection, never composition.** A route can only name a command that was in the catalog the call was given; `validate_router_output` re-checks the model's claimed id against the catalog after parsing. Text that does not map cleanly onto one command refuses and lists the options rather than guessing, because a router that guesses wrong on a command that changes external state is the failure the command gate exists to prevent.
+- **It asks before it runs anything it chose.** Radio prepares the launch's inputs first and prints the exact `darkmux mission launch <id> --param ...` command with every parameter that will run (for `review`, the temporary `diff_file` and `workspace` and the `head_sha` it made from the current directory), then asks `Run it? [y/N]`. With no interactive terminal it prints the command, says it was not run and exits 1; an interrupt at the prompt runs nothing and removes the temporary files. A routed input holding a control character or an invisible formatting character (a bidi override, a zero-width space) is refused. The editor channel does the same for free text: the pick is shown in the panel's permission dialog and only Allow runs it. An explicit `/mission launch <id>` is the operator's own command and is not asked again.
+- **It says when the model is busy instead of queueing silently.** One LM Studio instance serves one request at a time, and darkmux caps concurrency only within one process, so a radio call fired while a coder runs used to queue inside LM Studio with no visibility and fail at the call's ceiling after minutes of silence. Two facts something else already holds decide it: LM Studio's own status and queue for the instance, and the residency leases other live darkmux processes hold. The answering seat asks before it sends and answers "busy" at once, naming the occupant when darkmux knows it. The routing seat waits behind whatever occupies the one utility instance, by decision (#2914), but after a delay the surface says what LM Studio reports and keeps waiting to the ceiling. The check runs just before the send, so work that starts in between can still queue a call.
 
-The data comes from three places, and the lab notebook captures the *evidence* behind each call so the reasoning survives even when the underlying work is private:
+The *answering* seat (grounded answers over session artifacts) is ordinary work: a full dispatch and a run, staffed through `radio.answerer_profile` and `role_profiles.radio-host`.
 
-- **Lab runs**: reproducible workloads against registered fixtures, with content-hash proof that two runs started and ended in the same state. This is where harness hypotheses get tested one variable at a time (baseline → single change → re-measure → compare → record).
-- **Bake-offs**: documented per-hardware-tier model comparisons with criteria fixed before the runs.
-- **Dogfood**: darkmux run against real work, including darkmux building itself through `mission launch` and a private fintech engagement's production services. The failure modes those runs surface (a fabricated sign-off, a confidently-wrong review, a doom loop) are the specs for the next hardening pass. The *data* is what's load-bearing; the sensitive work behind it never has to appear here.
+## Guardrails: what CI holds so the design stays true
 
-When a decision can't point to a measurement, a citation, or a dogfood observation, that's a flag, not a reason to ship it on intuition.
+A rule that only lives in a paragraph gets skipped under time pressure, so most of this document's invariants are held by something that fails a build. The principle is the same for each: a guard that should block a merge lives where the merge already waits, it reads its list from the code it guards so it cannot drift, and it proves it can fail (`--self-test`) before its pass is trusted.
+
+**The static guards are one required job.** The `docs-drift` job in `.github/workflows/ci.yml` is a required check on `main`. A guard that should block a merge lives in that job rather than in a job of its own, because a new job is not required until the ruleset names it.
+
+| Guard | What it forbids | What it cannot see |
+|---|---|---|
+| Retired terms in docs (`docs-drift`) | a retired verb spelling, a retired role family name or a retired identity phrase in the user-facing docs, `DESIGN.md`, `CLAUDE.md`, `packaging/`, `skills/` and `templates/`; a line that narrates a removal must carry its issue number | prose that misdescribes a live feature without using a retired word |
+| `scripts/rs-drift-guard.py` | the same retired verbs inside Rust string literals (help text, error hints, banners); an inline `// drift-guard:allow` marker with a reason covers a deliberate one | a retired verb assembled at run time |
+| `scripts/flow-action-guard.py` | a flow action written by hand in production Rust, and an old or made-up action in tests, the viewer, docs, skills, templates and fixtures ([The flow vocabulary](#the-flow-vocabulary-one-closed-list-one-spelling-per-event)) | an action assembled at run time in a shape it does not list |
+| `scripts/complexity-ratchet.py` | a new function above cyclomatic complexity 15, and any function whose complexity rises | complexity that lives in data or in a test |
+| `scripts/engagement-sentinel-guard.py` | an engagement-private identifier (an employer, a private repo, a hosted endpoint, a tracker key) entering this public repo, and a UUID-shaped string outside the fake fixture form | a fixture that reproduces private content without spelling a sentinel word; field-policy review is still a human job |
+| `cargo machete` | a dependency a crate declares and never uses | what only a build would show: it reads sources, not the build, so a false positive is listed under the crate's `[package.metadata.cargo-machete] ignored` with a reason |
+| `scripts/verify-tap-pin.py --self-test` | its own logic drifting; the live half runs at release time against the tap | (a pull request has no tag to check) |
+| tracked-but-ignored files, demo sync | a file `.gitignore` says to ignore but git still tracks; a demo page that has drifted from the served viewer | |
+
+**The complexity ratchet** measures Rust with `rust-code-analysis-cli` (pinned) and TypeScript with ESLint's `complexity` rule, both over production code with test code excluded. A function is keyed by name and never by position (its path, its inline `mod` blocks, its impl or trait, and any function it is nested in), so an edit above it does not move it and a new function cannot inherit another's baseline. `scripts/complexity-baseline.json` records the debt measured when the ratchet was set; only `--prune` rewrites it, and prune only lowers an entry or drops it. `scripts/complexity-allowlist.json` holds deliberate exceptions by hand, each with a reason and a maximum of 25. A gain never fails: a function that got simpler, or was split or removed, passes with a notice naming `--prune`, which keeps the gain.
+
+**Generated and derived artifacts are regenerated and diffed.** The TypeScript twins of the daemon's types and the flow payloads are regenerated by `bun run types:check` and fail on a diff; the committed viewer bundle is rebuilt from `ui/src` and diffed; `route-table.golden` and `tests/cli-json.golden` are derived from the types and fail their test until regenerated on purpose (`DARKMUX_REGENERATE_FIXTURES=1`), which puts the change in the diff. A golden is a review surface, not a snapshot to accept.
+
+**Test isolation is checked by its effect.** The isolation leak check runs each test unit under a sentinel state tree and counts what it wrote, and the verdict is the file count, never the child's exit status (three of four leaking targets once went red and one stayed green while leaking). It runs on every push to `main` and on a pull request labeled `full-ci`; without the label a leak is caught on `main` after the merge. A source scan in `tests/cli.rs` is the faster pre-check that names the line, and the effect check reaches the shapes the scan cannot see.
+
+**Two CI tiers, and what "green" means.** An ordinary pull request gets the light gate: build, the full nextest suite, clippy, the runtime crate, and the static guards above. Mutation and coverage are advisory about their findings (a surviving mutant is a number and a diff, never a block) but gate on their own integrity: a run that did not actually run, or reported numbers that contradict its exit code, fails, because a check is allowed to say nothing and is not allowed to say "clean" when it never ran.
+
+**Known gaps.** `plugins/darkmux-bundler-rust` is outside the workspace, so the workspace suite never runs its tests: they run only in the PR-diff mutation job, and only on a pull request whose diff touches it. Every guard above reads text, so each has the blind spot named in its row; a passing guard narrows the class of defect that can ship, and it does not prove none can.
+
+## Composability
+
+darkmux is designed to live BELOW agent frameworks and ABOVE inference backends:
+
+```
+[ agent framework / frontier orchestrator: Claude Code, OpenClaw, Aider, Cline, … ]
+                    |
+                    v
+          [ darkmux ]   (dispatch · missions · observe)
+                    |
+                    v
+[ inference backend: LM Studio ]
+```
+
+darkmux is **not** a proxy that sits in the request path (an OpenAI-compatible router was the v0.2 plan and was deliberately *not* built; see the evolution above). It operates the layer instead of intercepting it: it loads what each dispatch's staffing declares, dispatches work through a runtime it owns, and emits the observability stream. No changes to the inference backend; the frontier orchestrator drives darkmux rather than routing through it.
+
+**The backend is LM Studio, and only LM Studio.** The residency arbiter, the `darkmux:` namespace convention, the empirical profile defaults and every `lms` shell-out in `darkmux-gestalt` are LM Studio-shaped, and an earlier claim that darkmux drives "LM Studio, Ollama and llama.cpp" was an aspiration, not a capability. A model-backend abstraction is tracked (#316) and deliberately not built; it gets revisited when a real second backend has a real user. Until then: do not deepen the coupling gratuitously, and do not pretend the abstraction is there. What is not LM Studio is an *unmanaged* endpoint ([Endpoints](#endpoints-what-darkmux-does-there-not-where-they-are)): any URL darkmux only sends requests to, on which it loads and unloads nothing.
