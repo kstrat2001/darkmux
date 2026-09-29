@@ -121,7 +121,7 @@ darkmux role show coder          <span class="comment"># full details for one ro
       </tr>
       <tr>
         <td>Decomposed plan</td>
-        <td>Mission + N phases. Pre-plan or grow via <code>mission add-phase</code>.</td>
+        <td>Mission + N phases. Declare the phases in the config.</td>
         <td>Multi-step work where the wall-clock arcs per phase matter, dependencies between phases matter, or you want the viewer's timeline as an explicit feedback surface.</td>
       </tr>
     </table>
@@ -234,7 +234,7 @@ darkmux mission finalize draft-blog-post
 }</code></pre>
     <p>Then <code>darkmux mission launch japan-trip-2026-05</code> once, when the trip begins, and <code>darkmux mission finalize japan-trip-2026-05</code> when it ends. The viewer will show the wall-clock duration.</p>
 
-    <p>You can also <code>mission add-phase</code> later if structure emerges mid-trip. The empty-phase mission grows into a decomposed one as needed.</p>
+    <p>If structure emerges mid-trip, add phases to the config and launch it again as a new run: a mission's phases come only from its config.</p>
 
     <h3>Growing the plan: the multi-phase shape</h3>
     <p>For mission-shaped work with clear decomposition (a campaign, a deploy, a multi-week research arc), the natural pattern is one config with one phase entry per planned step. Same shape as the minimum-viable example, just more phases in the array.</p>
@@ -248,30 +248,9 @@ darkmux mission finalize draft-blog-post
     <h3>Drive the lifecycle</h3>
     <pre><code><span class="comment"># Mission state machine</span>
 darkmux mission launch &lt;config&gt;   <span class="comment"># mint + start the instance → Active (stamps started_ts)</span>
-darkmux mission pause &lt;id&gt;        <span class="comment"># Active → Paused</span>
-darkmux mission resume &lt;id&gt;       <span class="comment"># Paused → Active (paused_ts preserved)</span>
 darkmux mission finalize &lt;id&gt;     <span class="comment"># → Finalized (success terminal: phases → Complete, worktrees torn down)</span>
 darkmux mission abort &lt;id&gt;        <span class="comment"># → Finalized (kill terminal: phases → Abandoned, worktrees torn down)</span></code></pre>
     <p>There's no manual per-phase lifecycle any more: the mission graph derives each phase's status, and the whole-mission terminals (<code>finalize</code>/<code>abort</code>) reconcile the phases for you. Every transition emits a flow record. Open <a href="../flow/" target="_blank" rel="noopener">the viewer in a new tab</a> as you run these. The phase-progress widget in the header shows N/M done across active missions, and the record stream below shows the cyan operator-tier transitions in order.</p>
-  </div>
-</section>
-
-<section>
-  <div class="wrap">
-    <h2>Adding a phase mid-flight</h2>
-    <p>If you discover scope mid-mission that belongs in the current plan rather than a new mission, use <code>darkmux mission add-phase</code>:</p>
-    <pre><code><span class="comment"># Append a new phase to the end of the mission's plan</span>
-darkmux mission add-phase &lt;mission-id&gt; \
-  --phase-id &lt;new-id&gt; \
-  --description "..." \
-  [--depends-on &lt;other-phase-id&gt;]
-
-<span class="comment"># Insert in the middle, immediately after an existing phase</span>
-darkmux mission add-phase &lt;mission-id&gt; \
-  --phase-id &lt;new-id&gt; \
-  --description "..." \
-  --after &lt;existing-phase-id&gt;</code></pre>
-    <p>The verb writes the new Phase JSON, updates the Mission's <code>phase_ids</code> array (at the right position), and emits a <code>phase.added</code> flow record. Idempotent on exact-match (same id + mission + description); errors on collision or dangling <code>--after</code>.</p>
   </div>
 </section>
 
@@ -398,8 +377,8 @@ darkmux mission finalize deploy-rewrite    <span class="comment"># close out dar
       <p style="margin: 8px 0 0;">As of darkmux #1230, the coder-phase loop executes through a generic Task/Step dependency-graph scheduler (worktree → dispatch → QA → gate, each a Step within a Task) rather than hardcoded control flow, the same engine the PR-review pipeline runs on. This is implementation detail today: Task/Step aren't yet a CLI surface you author directly, and the viewer doesn't render the graph yet (that's a tracked follow-up). Mentioned here so the vocabulary isn't a surprise if you see <code>task_id</code>/<code>step_id</code> fields in a flow record's payload.</p>
     </div>
 
-    <h3>Fleet fan-out: <code>mission dispatch</code></h3>
-    <p>Everything above runs on this machine. If you're coordinating a fleet, <code>darkmux mission dispatch &lt;mission&gt; --role &lt;role&gt; --machine &lt;id&gt;</code> sends the mission's next ready phase to that machine, which runs it if it trusts this one (see <a href="fleet.html#part-2">the fleet guide</a>). This is the multi-machine sibling of the local coder-phase launch, not a replacement for it; a single-machine setup has no reason to reach for it.</p>
+    <h3>Fleet fan-out: <code>dispatch --profile &lt;p&gt;@&lt;machine&gt;</code></h3>
+    <p>Everything above runs on this machine. If you're coordinating a fleet, <code>darkmux dispatch &lt;role&gt; "&lt;message&gt;" --profile &lt;profile&gt;@&lt;machine&gt;</code> sends one role execution to that machine, which runs it if it trusts this one (see <a href="fleet.html#part-2">the fleet guide</a>). Missions themselves come only from mission configs (<code>mission launch</code>); the multi-machine routing of a mission's own steps is not built yet.</p>
   </div>
 </section>
 
@@ -413,7 +392,6 @@ darkmux mission finalize deploy-rewrite    <span class="comment"># close out dar
       <li>Dispatch the work: <code>darkmux dispatch coder "&lt;phase task&gt;"</code>: local/green records (start + complete) with the model field stamped, and the duration arc visible in the wall-clock graphic.</li>
       <li><code>darkmux mission launch review</code>: QA pass; verdict emits to the viewer. Address findings.</li>
       <li>Ship the git work by hand: commit, push, <code>gh pr create</code>, and <code>gh pr merge</code> when the verdict was clean (or flags-only with nothing material).</li>
-      <li>Discover scope mid-flight? <code>darkmux mission add-phase</code> rather than filing a separate mission.</li>
       <li><code>darkmux mission finalize &lt;m&gt;</code> when the plan is done.</li>
     </ol>
     <p>The automated equivalent of steps 2–5 above: <code>darkmux mission launch coder-phase --param workdir=&lt;path&gt; --param branch=&lt;name&gt; --param base=main</code>, adjudicate the QA findings it surfaces, ship the git work by hand, then <code>darkmux mission finalize &lt;m&gt;</code>. See the previous section.</p>

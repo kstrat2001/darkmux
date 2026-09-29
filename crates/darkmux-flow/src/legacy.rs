@@ -129,7 +129,9 @@ pub const OLD_SPELLINGS: &[(&str, FlowAction)] = &[
     ("mission start", FlowAction::MissionStart),
     ("mission close", FlowAction::MissionClose),
     ("mission abort", FlowAction::MissionAbort),
+    // drift-guard:allow mission pause — archived flow records still carry the old action strings
     ("mission pause", FlowAction::MissionPause),
+    // drift-guard:allow mission resume — same archive vocabulary
     ("mission resume", FlowAction::MissionResume),
     ("tier-decision", FlowAction::TierDecision),
     ("note", FlowAction::OperatorNote),

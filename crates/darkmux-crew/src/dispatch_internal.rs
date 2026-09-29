@@ -1036,7 +1036,6 @@ fn shell_quote(s: &str) -> String {
 pub(crate) fn resume_hint_from_origin(
     host_out: &Path,
     role_id: &str,
-    phase_id: Option<&str>,
 ) -> String {
     let origin = read_out_dir_text(host_out, RESUME_ORIGIN_FILENAME)
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
@@ -1073,10 +1072,6 @@ pub(crate) fn resume_hint_from_origin(
     if let Some(image) = image {
         cmd.push_str(" --image ");
         cmd.push_str(&shell_quote(image));
-    }
-    if let Some(phase_id) = phase_id {
-        cmd.push_str(" --phase-id ");
-        cmd.push_str(&shell_quote(phase_id));
     }
     format!("{cmd} (once conditions look better — this pause does not clear on its own)")
 }
@@ -8491,7 +8486,7 @@ fn run_telemetry_sampler(
                     // `validate_resume_checkpoint` for every dispatch; see
                     // `resume_hint_from_origin`'s own doc.
                     let resume_hint =
-                        resume_hint_from_origin(&host_out, &role_id, phase_id.as_deref());
+                        resume_hint_from_origin(&host_out, &role_id);
                     // (#2774 round-3 C9) "this mission", not "this run":
                     // F5 made the episode count MISSION-scoped (seeded
                     // across dispatches from the ladder-state file), so a

@@ -336,7 +336,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             600,
             None,
         )

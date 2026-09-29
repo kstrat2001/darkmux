@@ -671,10 +671,6 @@ async fn submit_handler(
     // neither reuse one of this machine's sessions nor name one of its
     // missions.
     sub.job.session_id = darkmux_types::session_id::SessionId::relay(sub.job.session_id.clone(), &admitted.peer_name);
-    // (#2916 re-review C4) A submitted job is never attributed to one of
-    // THIS machine's own missions: no allow-list scope grants that, so any
-    // `phase_id` the sender set is dropped here.
-    sub.job.phase_id = None;
     let session_id = sub.job.session_id.clone();
 
     // (#2916 stage 2) Busy is per seat: one job per local model, hosted jobs
@@ -1226,7 +1222,6 @@ mod tests {
             execute: Arc::new(move |job: WorkJob, profile: String, origin: String| {
                 origins_c.lock().unwrap().push(origin);
                 std::thread::sleep(Duration::from_millis(job_ms));
-                assert!(job.phase_id.is_none(), "a submitted job's phase_id must be dropped (#2916 re-review C4)");
                 ran_c.lock().unwrap().push((job.session_id.wire(), profile.clone()));
                 Ok(DispatchResult {
                     exit_code: 0,
@@ -1288,7 +1283,6 @@ mod tests {
             sender(session),
             profile.map(str::to_string),
             None,
-            Some("receivers-own-phase".into()),
             None,
             60,
             Some("macbook-pro".into()),

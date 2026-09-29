@@ -184,9 +184,8 @@ impl WorkJob {
 
 
 /// Charset+length check for an identifier-shaped field — the canonical
-/// validator used both at the queue boundary (`WorkJob::validate`) and
-/// at the CLI boundary (`darkmux mission dispatch <mission_id>` etc.,
-/// Wave-E.5 #255).
+/// validator used both at the submission boundary (`WorkJob::validate`) and
+/// at the CLI boundary (Wave-E.5 #255).
 ///
 /// Allowlist: `[a-z0-9_-]` (ASCII lowercase + digits + underscore +
 /// hyphen), length 1..=MAX_WORK_IDENTIFIER_LEN. The full `label`

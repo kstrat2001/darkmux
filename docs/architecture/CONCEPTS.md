@@ -153,10 +153,10 @@ A crew is a **static manifest**: `id`, `description`, and
 indexed and queryable.
 
 **Crews are not dynamically composed per mission today.** A mission has no
-`crew_id` field; `darkmux mission dispatch` takes an explicit `role` and
-submits the mission's next ready phase to the machine named by `--machine`,
-which runs it if its allow-list trusts the sender (#2916). The operator names the role per
-dispatch; dynamic per-mission crew assembly is
+`crew_id` field; `darkmux dispatch <role> "<message>" --profile <p>@<machine>`
+takes an explicit role and submits that one role execution to the named
+machine, which runs it if its allow-list trusts the sender (#2916). The
+operator names the role per dispatch; dynamic per-mission crew assembly is
 [planned](#8-planned-not-yet-shipped), not shipped.
 
 ### Phase
@@ -174,18 +174,19 @@ Burn-down/remaining-work tracking is [planned](#8-planned-not-yet-shipped).
 
 ### Lifecycle state machines
 
-- **Mission:** `Active ⇄ Paused → Finalized` (terminal). Operator verbs: `start`,
-  `pause`, `resume`, and the two terminals, `finalize` (success: drive
-  non-terminal phases → Complete, tear down worktrees, mission → Finalized) and
-  `abort` (kill: the same teardown, phases → Abandoned). Each persisted with
-  operator reasoning.
+- **Mission:** `Active → Finalized | Aborted` (terminal). `mission launch`
+  creates and starts it; the operator's verbs are the two terminals,
+  `finalize` (success: drive non-terminal phases → Complete, tear down
+  worktrees, mission → Finalized) and `abort` (kill: the same teardown, phases
+  → Abandoned). Each persisted with operator reasoning. (`mission start`,
+  `pause` and `resume` were removed in 4.0, #2954.)
 - **Phase:** `Planned → Running → Complete | Abandoned`. Phase status is
   **derived by the mission graph** and reconciled by `mission finalize` /
   `mission abort` (#1463 retired the manual `phase start/complete/abandon`
   verbs; the graph, not the operator, drives per-phase transitions now).
 
-`darkmux mission add-phase` inserts a phase with cross-reference validation
-(mission exists, `depends_on` ids resolve, no id collision).
+A mission's phases come only from its mission config: `mission add-phase` was
+removed in 4.0 (#2954), so write or edit the config and `mission launch` it.
 
 ---
 
@@ -198,8 +199,7 @@ All of the following are **shipped**:
 |---|---|---|
 | `darkmux mission launch <config>` | Mints a running mission instance from a mission CONFIG (built-in, or one written at `~/.darkmux/mission-configs/<id>.json`) and drives it as a task graph, every dispatch gated on operator sign-off (#1284 Packet 4a). The `mission propose` verb that used to draft a config from unstructured intent was removed in 4.0 (#2912); the frontier orchestrator writes the config. | `src/mission_launch.rs` |
 | `darkmux mission launch review` | The code-review mission (#2310 P4d): one diff-scoped `plan.sites` task per rule, one reviewer dispatch per planned unit, an optional gated mod, then a rendered GitHub review payload. A config on the crawl's shared blocks — no launcher of its own (the bespoke funnel and its ten `review.*` step kinds were deleted). The coder-phase pipeline still runs its own in-gate `code-reviewer` QA pass (`src/coder_phase.rs`). | `templates/builtin/mission-configs/review.json`; `crates/darkmux-lab/src/crawl/` |
-| `darkmux mission dispatch` | Loads a mission, validates status, confirms the role exists, submits its next ready phase to the `--machine` it names over that machine's fleet listener (#2916); waits for the result or returns the session id. | `src/main.rs` |
-| `darkmux dispatch <role>` | Single-turn dispatch to a named role through the internal runtime. | see `CLAUDE.md` → operator-facing commands |
+| `darkmux dispatch <role>` | Single-turn dispatch to a named role through the internal runtime. With `--profile <p>@<machine>` it is submitted to that machine's fleet listener (#2916), which runs it if its allow-list trusts the sender; `--no-wait` returns once it is accepted. (`mission dispatch` was removed in 4.0, #2954.) | see `CLAUDE.md` → operator-facing commands |
 
 The **operator sign-off on every `mission launch` dispatch** is the sovereignty
 contract in action: darkmux proposes the next step; the operator approves before

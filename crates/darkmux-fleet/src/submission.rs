@@ -1017,7 +1017,6 @@ mod tests {
             session_id: crate::test_session("s-1"),
             profile: profile.map(str::to_string),
             workdir: None,
-            phase_id: None,
             image: None,
             timeout_seconds: 60,
             published_at_unix_ms: 1,

@@ -1922,7 +1922,7 @@ mod tests {
 
     #[test]
     fn dispatch_record_with_payload_omits_mission_when_not_phase_bound() {
-        // A one-off dispatch (no --phase-id) carries neither field — they
+        // A one-off dispatch (no phase) carries neither field — they
         // serialize away (skip_serializing_if), so old viewers and the
         // ungrouped-session rendering are untouched.
         let rec = build_dispatch_record_with_payload(

@@ -404,8 +404,8 @@ fn build_graph(opts: &DispatchOpts, mission_id: &str) -> (Mission, Phase, Task, 
         "preserve_dispatch_result": true,
     });
     // `opts.phase_id` is a DIFFERENT concept from this graph's own `phase_id`
-    // above — it's the CLI's `--phase-id` flag, an operator-named EXTERNAL
-    // mission phase this dispatch's flow records should attribute to (see
+    // above — it names an EXTERNAL mission phase (a crawl unit's, or a
+    // `dispatch.internal` step's) this dispatch's flow records attribute to (see
     // `DispatchOpts::phase_id`'s doc). Only set the key when present, so
     // `DispatchInternalStepKind`'s `config_str(step, "phase_id")` reads
     // `None` exactly like the pre-#1509 CLI's `opts.phase_id: None` default.
@@ -1076,7 +1076,7 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn build_graph_external_phase_id_is_a_separate_concept_from_the_graphs_own_phase() {
-        // `opts.phase_id` (the CLI's `--phase-id`, external mission-phase
+        // `opts.phase_id` (external mission-phase
         // attribution) must land in `Step.config["phase_id"]` — a DIFFERENT
         // string from this graph's OWN minted phase id (`task.phase_id`).
         let mut opts = test_opts("coder", "hi");

@@ -4196,7 +4196,6 @@ fn serve_sigterm_reaps_the_fleet_runners_curl_child() {
         None,
         None,
         None,
-        None,
         // (#2976) The job's own timeout (curl's `-m`) must far outlast
         // FLEET_TEST_HANG_BOUND: a curl that gives up on its own also closes
         // its connection, and the close-wait below could no longer tell a

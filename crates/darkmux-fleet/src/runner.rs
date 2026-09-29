@@ -147,7 +147,7 @@ impl WorkJob {
             // through WorkJob, this can read self.json.)
             json: false,
             workdir: self.workdir.map(PathBuf::from),
-            phase_id: self.phase_id,
+            phase_id: None,
             // A received job runs HERE: never forwarded to another machine
             // (that would bounce jobs between machines); always synchronous.
             machine: None,
@@ -193,7 +193,6 @@ mod tests {
             session_id: crate::test_session("s"),
             profile: Some("host".into()),
             workdir: None,
-            phase_id: Some("p".into()),
             image: Some("rust:slim".into()),
             timeout_seconds: 60,
             published_at_unix_ms: 1,
@@ -209,7 +208,7 @@ mod tests {
         assert_eq!(o.role_id, "coder");
         assert_eq!(o.profile_name.as_deref(), Some("host"));
         assert_eq!(o.session, crate::test_session("s"));
-        assert_eq!(o.phase_id.as_deref(), Some("p"));
+        assert!(o.phase_id.is_none(), "a received job carries no phase (#2954)");
         assert_eq!(o.image.as_deref(), Some("rust:slim"));
         assert!(o.machine.is_none(), "a received job runs here; it is never forwarded");
         assert!(!o.allow_utility_model);

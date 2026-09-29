@@ -293,7 +293,7 @@ pub struct Mission {
     pub phase_ids: Vec<String>,
     pub created_ts: u64,
     /// When the mission first transitioned to `Active`. None until
-    /// `darkmux mission start` runs. Used by the wall-clock UI.
+    /// `mission launch` starts it. Used by the wall-clock UI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_ts: Option<u64>,
     /// When the mission transitioned to `Finalized`. Finalized is
