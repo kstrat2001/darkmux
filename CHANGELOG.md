@@ -182,8 +182,9 @@ darkmux release.
   and skills live directly under the darkmux root, and the knob meant two
   things (the preamble-override directory `<root>/crew`, and the root of
   that state). `dirs.crew` in `config.json` is an unknown key, refused by
-  the gate, and a set `DARKMUX_CREW_DIR` is refused at every preflight and
-  failed by `darkmux doctor`. The autonomous-dispatch preamble override is now
+  the gate, and a set `DARKMUX_CREW_DIR` is refused by every command
+  (`doctor` and `config` excepted, so you can find and fix it) and failed by
+  `darkmux doctor`. The autonomous-dispatch preamble override is now
   `<root>/AUTONOMOUS_DISPATCH_PREAMBLE.md` (it was `<root>/crew/...`).
   **Migration:** delete `dirs.crew`, unset `DARKMUX_CREW_DIR`, and if you
   relocated darkmux with it set `DARKMUX_HOME` instead. `darkmux doctor`'s
@@ -194,11 +195,26 @@ darkmux release.
   `$DARKMUX_HOME` when set, else `~/.darkmux`, and nothing else: a `.darkmux/`
   in the working directory used to become the root for flows, lab runs,
   sandboxes and profiles while missions and roles stayed at home. It is now
-  ignored (the per-repo `lessons.db` is the one thing still read from it).
-  **Migration:** to keep using such a directory, run darkmux with
-  `DARKMUX_HOME=<that directory>`; otherwise move what you need into
-  `~/.darkmux`. `darkmux doctor`'s `project-local .darkmux` row warns when
-  the working directory holds one.
+  ignored: only the per-repo `lessons.db` and `conventions.json` are still
+  read from it. The same goes for a `./.darkmux/profiles.json` or
+  `./.darkmux.json` registry, which used to be searched ahead of
+  `~/.darkmux/profiles.json`: the registry now comes from the root
+  (`DARKMUX_HOME` or `~/.darkmux`), or `--profiles-file` /
+  `DARKMUX_PROFILES`. **Migration:** to keep using such a directory, run
+  darkmux with `DARKMUX_HOME=<that directory>`; otherwise move what you need
+  into `~/.darkmux` (a registry is `~/.darkmux/profiles.json`). `darkmux
+  doctor`'s `project-local .darkmux` row warns when the working directory
+  holds anything besides those per-repo files, naming what is stranded.
+
+- **A retired setting's env var is refused by every command.**
+  `DARKMUX_CREW_DIR`, `DARKMUX_NOTEBOOK_DIR`, `DARKMUX_RADIO_ROUTER_PROFILE`
+  and the renamed `DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION` used to be
+  refused only by the dispatch, mission-launch, lab and fleet entry points
+  (or, for the notebook and radio-router ones, only warned about). One check
+  at CLI entry now refuses to start while any is set, for every command
+  except `doctor` and `config` (and `--help` / `--version`). **Migration:**
+  remove the export from your shell rc; `darkmux doctor` lists each one with
+  what replaced it.
 
 - **An unknown key in a user file is refused (CONFIG 2.0).** `config.json`,
   `profiles.json`, role, skill and crew manifests, mission configs, rule

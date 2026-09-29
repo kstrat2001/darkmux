@@ -168,7 +168,6 @@ pub fn run() -> DoctorReport {
         check_redis_config(),
         check_gh_allowlist(),
         check_removed_radio_router_staffing(),
-        check_removed_notebook_settings(),
         check_renamed_budget_settings(),
         check_retired_role_leftovers(),
         check_role_skill_references(),
@@ -395,19 +394,37 @@ fn installed_skill_content(targets: &[PathBuf], name: &str) -> Option<String> {
     None
 }
 
-/// (4.0) A `./.darkmux/` in the working directory. Earlier releases adopted it
-/// as the darkmux root and split flows, lab runs and profiles from missions;
-/// 4.0 ignores it. Warn, naming the directory and the one relocation.
+/// (4.0) State in the working directory that darkmux no longer reads. Earlier
+/// releases adopted a `./.darkmux/` as the darkmux root (splitting flows, lab
+/// runs and profiles from missions) and a `./.darkmux.json` as the profile
+/// registry; 4.0 ignores both. A repo's `.darkmux/` is normal: it holds the
+/// per-repo `lessons.db` and `conventions.json`, which darkmux still reads,
+/// so only what else is in it is stranded. Warn, naming each stranded entry.
 fn check_ignored_project_darkmux() -> Check {
+    ignored_project_status(darkmux_types::paths::ignored_project_state())
+}
+
+/// Pure decision for [`check_ignored_project_darkmux`]. The `DARKMUX_HOME`
+/// relocation is offered only when the directory holds a `config.json` or
+/// `profiles.json` to relocate; a leftover registry file is moved into the root.
+fn ignored_project_status(state: Option<darkmux_types::paths::IgnoredProjectState>) -> Check {
     let name = "project-local .darkmux".to_string();
-    let Some(dir) = darkmux_types::paths::ignored_project_dir() else {
-        return Check { name, status: Status::Pass, message: "no ignored ./.darkmux in the working directory".into(), hint: None };
+    let Some(state) = state else {
+        return Check { name, status: Status::Pass, message: "nothing stranded in the working directory".into(), hint: None };
+    };
+    let listed = state.stranded.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ");
+    let hint = match &state.adoptable_dir {
+        Some(dir) => format!(
+            "to use that directory as the root, run darkmux with DARKMUX_HOME={}; otherwise move what you need to ~/.darkmux (a registry is ~/.darkmux/profiles.json)",
+            dir.display()
+        ),
+        None => "move what you need to ~/.darkmux (a registry is ~/.darkmux/profiles.json) and delete the rest".into(),
     };
     Check {
         name,
         status: Status::Warn,
-        message: format!("{} is ignored: darkmux no longer adopts a project-local .darkmux as its root (only its per-repo lessons.db is read)", dir.display()),
-        hint: Some(format!("to use it as the root, run darkmux with DARKMUX_HOME={}; otherwise move what you need to ~/.darkmux", dir.display())),
+        message: format!("stranded, darkmux no longer reads a project-local root or registry: {listed}"),
+        hint: Some(hint),
     }
 }
 
@@ -1457,49 +1474,39 @@ fn utility_in_profiles_status(registry: &darkmux_types::ProfileRegistry) -> Chec
     }
 }
 
-/// (#2914, CONFIG 1.28) The removed radio ROUTING-seat staffing that is not
-/// a config key: `role_profiles.radio-router` (a binding in the dynamic map)
-/// and the `DARKMUX_RADIO_ROUTER_PROFILE` env var. Routing runs on the
-/// machine's utility model now, so each is inert; `Warn` naming whichever are
-/// still set, with the one fix. (A leftover `radio.router_profile` key is a
-/// retired key, refused by the user-file keys row.)
+/// (#2914, CONFIG 1.28) The removed radio ROUTING-seat staffing that is not a
+/// config key or an env var: `role_profiles.radio-router`, a binding in the
+/// dynamic map. Routing runs on the machine's utility model now, so it is
+/// inert; `Warn` naming it, with the one fix. (A leftover `radio.router_profile`
+/// key is a retired key, refused by the user-file keys row, and
+/// `DARKMUX_RADIO_ROUTER_PROFILE` a retired env var, refused at CLI entry and
+/// failed by the retired-env row: both are `config::RETIRED_SETTINGS`.)
 fn check_removed_radio_router_staffing() -> Check {
     let role_binding = darkmux_types::config_access::role_profile("radio-router");
-    let env_set = std::env::var("DARKMUX_RADIO_ROUTER_PROFILE").ok().is_some_and(|s| !s.trim().is_empty());
-    removed_radio_router_staffing_status(role_binding.as_deref(), env_set)
+    removed_radio_router_staffing_status(role_binding.as_deref())
 }
 
 /// Pure decision for [`check_removed_radio_router_staffing`].
-/// A leftover `radio.router_profile` key is not this check's: it is an
-/// unknown key, which the user-file keys row fails with its removal line
-/// (`config::RETIRED_SETTINGS`).
-fn removed_radio_router_staffing_status(role_binding: Option<&str>, env_set: bool) -> Check {
+fn removed_radio_router_staffing_status(role_binding: Option<&str>) -> Check {
     let name = "radio router staffing (removed)".to_string();
-    let mut leftovers: Vec<String> = Vec::new();
-    if let Some(profile) = role_binding {
+    let Some(profile) = role_binding else {
+        return Check { name, status: Status::Pass, message: "not present".into(), hint: None };
+    };
+    Check {
+        name,
+        status: Status::Warn,
         // (C6) No CLI removes a `role_profiles` binding (`config set`
         // refuses a blank value like any other, and there is no `config
         // unset`), so this is a hand edit, the way every other removed key's
         // check says: name the file and the block.
-        leftovers.push(format!(
+        message: format!(
             "config.json binds `role_profiles.radio-router` to `{profile}` — the router has no profile; \
              delete the `radio-router` entry from the `role_profiles` block in ~/.darkmux/config.json by hand"
-        ));
-    }
-    if env_set {
-        leftovers.push("`DARKMUX_RADIO_ROUTER_PROFILE` is set in this shell — removed in CONFIG 1.28; unset it".into());
-    }
-    if leftovers.is_empty() {
-        return Check { name, status: Status::Pass, message: "not present".into(), hint: None };
-    }
-    Check {
-        name,
-        status: Status::Warn,
-        message: leftovers.join("; "),
+        ),
         hint: Some(
             "Since 4.0 (#2914) radio routing runs on the machine's utility model, declared once as \
              `internal.utility` in ~/.darkmux/profiles.json (with its `n_ctx`), never on a profile. \
-             None of these settings has any effect; a profile that existed only for the router can \
+             This binding has no effect; a profile that existed only for the router can \
              be deleted. The answering seat is still staffed by `radio.answerer_profile` / \
              `role_profiles.radio-host`."
                 .into(),
@@ -2243,7 +2250,7 @@ fn resolved_config_path() -> std::path::PathBuf {
 /// Settings RENAMED or RETIRED in 4.0 with no alias
 /// (`darkmux_types::config::RENAMED_SETTINGS` / `RETIRED_SETTINGS`: the
 /// per-step cap's `remote.max_tokens_per_execution`, `DARKMUX_CREW_DIR`). A
-/// leftover env var is read by nothing and every preflight refuses it, so this
+/// leftover env var is read by nothing and every command but `doctor` and `config` refuses it, so this
 /// row fails, naming the replacement. A leftover old `config.json` key is an
 /// unknown key, which the user-file keys row fails.
 fn check_renamed_budget_settings() -> Check {
@@ -2262,37 +2269,6 @@ fn renamed_settings_status(env: &dyn Fn(&str) -> Option<String>) -> Check {
         status: Status::Fail,
         message: leftovers.iter().map(|l| l.line.clone()).collect::<Vec<_>>().join("; "),
         hint: Some("Nothing reads the old names and darkmux refuses to start with them set; remove the export from your shell rc.".into()),
-    }
-}
-
-/// (#2913, 4.0) `DARKMUX_NOTEBOOK_DIR` is removed: `lab notebook
-/// draft`/`list` retired outright in 4.0, replaced by the bundled
-/// `darkmux-lab-notebook` skill, which writes the entry wherever the
-/// operator's own instructions say. The env var is read by nothing, so this
-/// is the one place an operator learns it is dead. (A leftover
-/// `dirs.notebook` key in `config.json` is an unknown key, which the
-/// user-file keys row fails with its removal line.)
-///
-/// `Pass` when it is unset; `Warn` with the removal step when it is set. An
-/// empty value reads as unset, matching every other env-tier accessor.
-fn check_removed_notebook_settings() -> Check {
-    let name = "DARKMUX_NOTEBOOK_DIR (removed)";
-    let env_set = std::env::var("DARKMUX_NOTEBOOK_DIR")
-        .ok()
-        .is_some_and(|s| !s.trim().is_empty());
-    if !env_set {
-        return Check { name: name.into(), status: Status::Pass, message: "not present".into(), hint: None };
-    }
-    Check {
-        name: name.into(),
-        status: Status::Warn,
-        message: "`DARKMUX_NOTEBOOK_DIR` is exported — removed in 4.0 (#2913); nothing reads it".into(),
-        hint: Some(
-            "unset DARKMUX_NOTEBOOK_DIR (remove the export from your shell rc). The notebook verbs retired \
-             in 4.0; the bundled `darkmux-lab-notebook` skill (installed by `darkmux init`) drafts an entry \
-             from `darkmux lab run stats <run-id> --json` and writes it wherever your own instructions say"
-                .into(),
-        ),
     }
 }
 
@@ -2366,9 +2342,8 @@ fn check_role_skill_references() -> Check {
 /// retired with `mission propose` and `lab notebook`. A user-tier copy of
 /// either (a `.json` override or a `.md` prompt left in `<root>/roles/`) is
 /// not inert: the `.json` still loads as a user role and shows in `darkmux
-/// role list`, though nothing in darkmux dispatches it. Same shape as
-/// `check_removed_notebook_settings`: `Pass` when none is present, `Warn`
-/// naming each file with the removal step.
+/// role list`, though nothing in darkmux dispatches it. `Pass` when none is present,
+/// `Warn` naming each file with the removal step.
 fn check_retired_role_leftovers() -> Check {
     let name = "retired roles (mission-compiler, scribe)";
     let dir = darkmux_crew::loader::user_roles_dir();
@@ -9137,56 +9112,6 @@ mod tests {
         }
     }
 
-    // ─── (#2913, 4.0) check_removed_notebook_settings — the removed env var ─
-
-    /// Runs `check_removed_notebook_settings` with `DARKMUX_NOTEBOOK_DIR`
-    /// pinned to `env_value`, restored after the call.
-    fn notebook_settings_check(env_value: Option<&str>) -> Check {
-        let prev_nb = std::env::var("DARKMUX_NOTEBOOK_DIR").ok();
-        unsafe {
-            match env_value {
-                Some(v) => std::env::set_var("DARKMUX_NOTEBOOK_DIR", v),
-                None => std::env::remove_var("DARKMUX_NOTEBOOK_DIR"),
-            }
-        }
-        let check = check_removed_notebook_settings();
-        unsafe {
-            match prev_nb {
-                Some(v) => std::env::set_var("DARKMUX_NOTEBOOK_DIR", v),
-                None => std::env::remove_var("DARKMUX_NOTEBOOK_DIR"),
-            }
-        }
-        check
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn check_removed_notebook_settings_passes_when_unset() {
-        let check = notebook_settings_check(None);
-        assert_eq!(check.status, Status::Pass, "{}", check.message);
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn check_removed_notebook_settings_warns_on_leftover_env_var() {
-        let check = notebook_settings_check(Some("/tmp/nb"));
-        assert_eq!(check.status, Status::Warn, "{}", check.message);
-        assert!(check.message.contains("DARKMUX_NOTEBOOK_DIR"), "names the var: {}", check.message);
-        let hint = check.hint.expect("a removal step");
-        assert!(hint.contains("unset DARKMUX_NOTEBOOK_DIR"), "the exact change: {hint}");
-        assert!(hint.contains("darkmux-lab-notebook"), "names the replacement: {hint}");
-    }
-
-    /// An empty env value is "unset", the same reading every other env-tier
-    /// accessor gives it — a stale `export DARKMUX_NOTEBOOK_DIR=` must not
-    /// warn.
-    #[serial_test::serial]
-    #[test]
-    fn check_removed_notebook_settings_treats_empty_env_as_unset() {
-        let check = notebook_settings_check(Some("  "));
-        assert_eq!(check.status, Status::Pass, "{}", check.message);
-    }
-
     // ─── (#2653) check_liveness_retention ───
 
     #[serial_test::serial]
@@ -11689,7 +11614,8 @@ mod tests {
         // Every check should appear regardless of environment — even if the
         // underlying probe couldn't read state.
         // 65 with #2902's endpoints check, plus three 4.0 retirement checks:
-        // (#2913) `check_removed_notebook_settings`, and (#2912/#2913 review)
+        // (#2913) the notebook env-var check (since folded into the retired-env
+        // row), and (#2912/#2913 review)
         // `check_retired_role_leftovers` and `check_role_skill_references`.
         // (#2928) 69: `check_live_channel` joined the static array.
         //
@@ -11716,8 +11642,11 @@ mod tests {
         // Pass row when every user file is clean, as it is here.
         //
         // (4.0 project-local) 67: `check_ignored_project_darkmux` joined.
+        //
+        // (4.0 retired env vars) 66: `check_removed_notebook_settings` left; its
+        // env var is a `RETIRED_SETTINGS` entry the retired-env row reports.
         let expected =
-            67 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
+            66 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
@@ -12645,32 +12574,23 @@ mod tests {
     /// and names the path, the way every other removed key's check does.
     #[test]
     fn removed_radio_router_binding_says_to_edit_config_json_by_hand() {
-        let c = super::removed_radio_router_staffing_status(Some("radio"), false);
+        let c = super::removed_radio_router_staffing_status(Some("radio"));
         assert!(c.message.contains("~/.darkmux/config.json"), "names the file: {}", c.message);
         assert!(c.message.contains("by hand"), "{}", c.message);
     }
 
-    /// (#2914) The removed routing-seat staffing: `role_profiles.radio-router`
-    /// and the `DARKMUX_RADIO_ROUTER_PROFILE` env var each get named, with
-    /// the fix; nothing set is a Pass. (A leftover `radio.router_profile` key
-    /// is an unknown key, failed by the user-file keys row.)
+    /// (#2914) The removed routing-seat binding `role_profiles.radio-router` is
+    /// named with the fix; nothing set is a Pass.
     #[test]
-    fn removed_radio_router_staffing_names_each_leftover() {
-        let c = super::removed_radio_router_staffing_status(None, false);
+    fn removed_radio_router_staffing_names_the_leftover_binding() {
+        let c = super::removed_radio_router_staffing_status(None);
         assert_eq!(c.status, Status::Pass, "{}", c.message);
 
-        let c = super::removed_radio_router_staffing_status(Some("radio"), false);
+        let c = super::removed_radio_router_staffing_status(Some("radio"));
         assert_eq!(c.status, Status::Warn);
         assert!(c.message.contains("role_profiles.radio-router") && c.message.contains("radio"), "{}", c.message);
-
-        let c = super::removed_radio_router_staffing_status(None, true);
-        assert_eq!(c.status, Status::Warn);
-        assert!(c.message.contains("DARKMUX_RADIO_ROUTER_PROFILE"), "{}", c.message);
-
-        let c = super::removed_radio_router_staffing_status(Some("radio"), true);
         let hint = c.hint.clone().unwrap_or_default();
-        assert!(hint.contains("internal.utility"), "the fix, once: {hint}");
-        assert!(c.message.matches("radio").count() >= 2, "every leftover named: {}", c.message);
+        assert!(hint.contains("internal.utility"), "the fix: {hint}");
     }
 
     /// (#2914) The binding check reports the declared window, and points a
@@ -13459,24 +13379,30 @@ mod tests {
             .contains("darkmux serve"));
     }
 
-    /// (4.0) A cwd `.darkmux/` is reported as ignored, with `DARKMUX_HOME`
-    /// as the way to use it; a `DARKMUX_HOME` that already points at it, or no
-    /// such directory, is a Pass.
-    #[serial_test::serial]
-    #[test]
-    fn ignored_project_darkmux_is_warned_and_names_darkmux_home() {
+    /// Runs `check_ignored_project_darkmux` from a fresh cwd holding `files`
+    /// (paths relative to it; a trailing `/` makes a directory), with
+    /// `DARKMUX_HOME` set to `home_rel` under it when given.
+    fn ignored_project_check(files: &[&str], home_rel: Option<&str>) -> Check {
         let tmp = tempfile::TempDir::new().unwrap();
-        let project = tmp.path().join(".darkmux");
-        std::fs::create_dir_all(&project).unwrap();
+        for f in files {
+            let path = tmp.path().join(f);
+            if f.ends_with('/') {
+                std::fs::create_dir_all(&path).unwrap();
+            } else {
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, "{}").unwrap();
+            }
+        }
         let prev_cwd = std::env::current_dir().unwrap();
         let prev_home = std::env::var("DARKMUX_HOME").ok();
-        unsafe { std::env::remove_var("DARKMUX_HOME") };
+        unsafe {
+            match home_rel {
+                Some(h) => std::env::set_var("DARKMUX_HOME", tmp.path().join(h)),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
         std::env::set_current_dir(tmp.path()).unwrap();
-        let ignored = check_ignored_project_darkmux();
-        unsafe { std::env::set_var("DARKMUX_HOME", &project) };
-        let adopted = check_ignored_project_darkmux();
-        std::fs::remove_dir(&project).unwrap();
-        let absent = check_ignored_project_darkmux();
+        let check = check_ignored_project_darkmux();
         std::env::set_current_dir(prev_cwd).unwrap();
         unsafe {
             match prev_home {
@@ -13484,11 +13410,55 @@ mod tests {
                 None => std::env::remove_var("DARKMUX_HOME"),
             }
         }
-        assert_eq!(ignored.status, Status::Warn);
-        assert!(ignored.message.contains("is ignored"), "{}", ignored.message);
-        assert!(ignored.hint.as_deref().is_some_and(|h| h.contains("DARKMUX_HOME=")), "{:?}", ignored.hint);
-        assert_eq!(adopted.status, Status::Pass);
-        assert_eq!(absent.status, Status::Pass);
+        check
+    }
+
+    /// A repo's `.darkmux/` holding only what darkmux still reads there
+    /// (`lessons.db`, `conventions.json`) is a normal state, not a warning.
+    #[serial_test::serial]
+    #[test]
+    fn a_repo_darkmux_dir_holding_only_per_repo_files_is_a_pass() {
+        let c = ignored_project_check(&[".darkmux/lessons.db", ".darkmux/conventions.json"], None);
+        assert_eq!(c.status, Status::Pass, "{}", c.message);
+    }
+
+    /// Anything else in a cwd `.darkmux/` is stranded: the warning names it,
+    /// and offers the `DARKMUX_HOME` relocation only when it holds a
+    /// `config.json` or `profiles.json` to relocate.
+    #[serial_test::serial]
+    #[test]
+    fn stranded_project_contents_are_named_and_relocation_is_offered_only_for_root_files() {
+        let c = ignored_project_check(&[".darkmux/lessons.db", ".darkmux/roles/x.json"], None);
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.message.contains("roles"), "names the stranded entry: {}", c.message);
+        assert!(!c.message.contains("lessons.db"), "the per-repo file is not stranded: {}", c.message);
+        assert!(c.hint.as_deref().is_some_and(|h| !h.contains("DARKMUX_HOME=")), "{:?}", c.hint);
+
+        let c = ignored_project_check(&[".darkmux/config.json"], None);
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.hint.as_deref().is_some_and(|h| h.contains("DARKMUX_HOME=")), "{:?}", c.hint);
+    }
+
+    /// A cwd `./.darkmux.json` (the old project-local registry) is ignored
+    /// too, and named.
+    #[serial_test::serial]
+    #[test]
+    fn a_cwd_dot_darkmux_json_registry_is_named_as_ignored() {
+        let c = ignored_project_check(&[".darkmux.json"], None);
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.message.contains(".darkmux.json"), "{}", c.message);
+        assert!(c.hint.as_deref().is_some_and(|h| h.contains("profiles.json")), "{:?}", c.hint);
+    }
+
+    /// `DARKMUX_HOME` pointing at the cwd's `.darkmux` makes it the root, so
+    /// nothing in it is stranded; no directory at all is a Pass too.
+    #[serial_test::serial]
+    #[test]
+    fn a_project_dir_adopted_via_darkmux_home_or_absent_is_a_pass() {
+        let adopted = ignored_project_check(&[".darkmux/config.json"], Some(".darkmux"));
+        assert_eq!(adopted.status, Status::Pass, "{}", adopted.message);
+        let absent = ignored_project_check(&[], None);
+        assert_eq!(absent.status, Status::Pass, "{}", absent.message);
     }
 
     // ─── check_beat33_legacy_crew_dir ─────────────────────────────────

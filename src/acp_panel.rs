@@ -2581,6 +2581,7 @@ mod tests {
             _ => panic!("expected Ready"),
         };
         let mut cmd = std::process::Command::cargo_bin("darkmux").unwrap();
+        darkmux_types::test_isolation::neutralize_state_vars(&mut cmd);
         cmd.args(["mission", "launch", "review"]);
         for p in synth.params() {
             cmd.args(["--param", p]);

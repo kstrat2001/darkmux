@@ -12235,7 +12235,7 @@ fn config_set_refuses_the_renamed_per_execution_key() {
     );
 }
 
-/// A renamed or retired setting's env var, still set, is refused at preflight
+/// A renamed or retired setting's env var, still set, is refused at CLI entry
 /// like any other bad config: the pre-4.0 per-execution cap (renamed) and
 /// `DARKMUX_CREW_DIR` (retired) each name their replacement.
 #[test]
@@ -12261,6 +12261,67 @@ fn a_leftover_retired_env_var_is_refused_at_preflight_naming_the_replacement() {
         assert!(stderr.contains("refusing to start: bad config"), "{var}: {stderr}");
         assert!(stderr.contains(says), "{var}: {stderr}");
     }
+}
+
+/// A retired setting's env var is refused by EVERY command, through the one
+/// check at CLI entry: a read-only verb (`mission status`, `role list`, a
+/// lesson read) that uses the darkmux root refuses as loudly as a dispatch.
+#[test]
+fn a_retired_env_var_is_refused_by_read_only_commands_too() {
+    let cases: [&[&str]; 4] =
+        [&["mission", "status"], &["role", "list"], &["memory", "lesson", "list"], &["machine", "status"]];
+    for args in cases {
+        let out = darkmux_std_cmd().env("DARKMUX_CREW_DIR", "/x").args(args).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{args:?} must refuse: {stderr}");
+        assert!(stderr.contains("refusing to start"), "{args:?}: {stderr}");
+        assert!(stderr.contains("DARKMUX_CREW_DIR"), "{args:?}: {stderr}");
+    }
+}
+
+/// `serve` refuses too, before it binds anything. Spawned with a deadline: a
+/// daemon that does start would otherwise hang this test.
+#[test]
+fn serve_refuses_a_retired_env_var_before_binding() {
+    let mut cmd = darkmux_std_cmd();
+    let mut child = cmd
+        .env("DARKMUX_CREW_DIR", "/x")
+        .args(["serve", "--bind", "127.0.0.1", "--port", "38917"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break Some(s);
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let status = status.expect("`serve` started with a retired env var set instead of refusing");
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
+    assert!(!status.success(), "{stderr}");
+    assert!(stderr.contains("refusing to start") && stderr.contains("DARKMUX_CREW_DIR"), "{stderr}");
+}
+
+/// The exemptions: `doctor` and `config` still run with a retired env var
+/// set, because they are how the operator finds and fixes it. Doctor reports
+/// it; neither refuses to start.
+#[test]
+fn doctor_and_config_run_with_a_retired_env_var_set() {
+    for args in [&["config", "list"][..], &["doctor"][..]] {
+        let out = darkmux_std_cmd().env("DARKMUX_CREW_DIR", "/x").args(args).output().unwrap();
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(!text.contains("refusing to start"), "{args:?} must not refuse: {text}");
+    }
+    let doctor = darkmux_std_cmd().env("DARKMUX_CREW_DIR", "/x").arg("doctor").output().unwrap();
+    assert!(String::from_utf8_lossy(&doctor.stdout).contains("DARKMUX_CREW_DIR"), "doctor names the leftover");
 }
 
 fn collect_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {

@@ -110,7 +110,6 @@
 //! deadline tighter than ~430ms on the very first marker), that is
 //! follow-up work, not something this module does today.
 
-use crate::paths::expand_tilde;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -188,73 +187,14 @@ fn append_heartbeat(pid: u32, line: &str) -> std::io::Result<()> {
     writeln!(f, "{line}")
 }
 
-/// The darkmux home root: `DARKMUX_HOME` (the #661 bootstrap pointer,
-/// tilde-expanded) if set, else `~/.darkmux`. Resolved WITHOUT touching
-/// config resolution — the whole point of the floor is zero dependency on
-/// config/Redis/audit/flow: this mirrors the `DARKMUX_HOME` + user-root
-/// branches of `paths::resolve`, minus all config reads — the floor
-/// can't afford a full config load at the first instant of a possibly-already-hung
-/// process. Shared by [`liveness_dir`] and [`retention_hours`]'s raw
-/// config-file peek.
+/// The darkmux home root, `paths::user_root_guarded` (`DARKMUX_HOME`, else
+/// `~/.darkmux`; never the real home in a test build). Path resolution only:
+/// no config, Redis, audit or flow is touched, which is the point of the
+/// floor: it can't afford a full config load at the first instant of a
+/// possibly-already-hung process. Shared by [`liveness_dir`] and
+/// [`retention_hours`]'s raw config-file peek.
 fn darkmux_home_dir() -> PathBuf {
-    #[cfg(any(test, feature = "test-support"))]
-    crate::env_audit::audit_env_read("DARKMUX_HOME");
-    if let Ok(root) = std::env::var("DARKMUX_HOME") {
-        let root = root.trim();
-        if !root.is_empty() {
-            return expand_tilde(root);
-        }
-    }
-    darkmux_home_dir_fallback()
-}
-
-/// **Production** fallback when `DARKMUX_HOME` is unset: the operator's real
-/// `~/.darkmux`.
-#[cfg(not(any(test, feature = "test-support")))]
-fn darkmux_home_dir_fallback() -> PathBuf {
-    dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".darkmux")
-}
-
-/// (#2653 MUST FIX 1, #2777) **Test / `test-support`** fallback when
-/// `DARKMUX_HOME` is unset: a non-home scratch path — NEVER the operator's
-/// real `~/.darkmux`.
-///
-/// **It isolates from the operator's HOME; since #2777 it also isolates
-/// test processes from each other.** The distinction is worth stating
-/// plainly because the name invites over-reading: through #2653 this
-/// returned one FIXED machine-global path, so it fully guaranteed the first
-/// property and none of the second. It now returns
-/// [`crate::paths::test_isolated_root`] — `<system temp>/
-/// darkmux-test-isolated-<pid>`, a per-process SIBLING directly under the
-/// temp root, not a `<pid>` subdirectory — which keeps the home guarantee
-/// and adds per-process separation. See that function's doc for the
-/// measured residue, the ten sites that shared the old path, and why a
-/// per-pid split is safe.
-///
-/// Before this existed, a test that forgot to set `DARKMUX_HOME` fell
-/// through to `dirs::home_dir()` (which honors `$HOME`) same as
-/// production. For every OTHER accessor in this codebase that was merely a
-/// stray-file risk; `config_access::liveness_dir_default` already carries
-/// the identical isolation guard for exactly that reason. But this
-/// module's own [`prune_once_per_dir`] runs on every heartbeat write and
-/// actively DELETES `.log` files older than the retention window — so a
-/// forgotten guard here does not leave a stray file behind, it destroys
-/// real operator history the first time an un-isolated test happens to
-/// touch any liveness call site (proved 2026-09-11: a single unrelated
-/// `dispatch_internal` unit test, run with `DARKMUX_HOME` unset, deleted
-/// three seeded heartbeat files outright).
-///
-/// Returns the SAME isolated root every sibling accessor redirects to
-/// (`crate::paths::test_isolated_root`), so all of them land on one
-/// isolated tree rather than ten, when a test forgets to isolate.
-/// Deliberately NOT keyed off comparing against `dirs::home_dir()`
-/// (that comparison is what `config_access` does, via `paths::resolve`) —
-/// this module's whole reason for existing is to avoid exactly that kind
-/// of resolution machinery, so in test builds it just never resolves to a
-/// real home at all, full stop.
-#[cfg(any(test, feature = "test-support"))]
-fn darkmux_home_dir_fallback() -> PathBuf {
-    crate::paths::test_isolated_root()
+    crate::paths::user_root_guarded()
 }
 
 /// The heartbeat directory: `<darkmux-home>/liveness/`.
@@ -481,6 +421,28 @@ mod tests {
             .collect();
         assert_eq!(logs.len(), 1, "expected exactly one heartbeat file, got {logs:?}");
         fs::read_to_string(logs.pop().unwrap()).unwrap()
+    }
+
+    /// The floor's home IS the resolved root (`paths::resolve`): a padded
+    /// `DARKMUX_HOME` is used trimmed, and with it unset a test build lands
+    /// under the isolated root, never the operator's real `~/.darkmux`.
+    #[serial_test::serial]
+    #[test]
+    fn the_floor_home_is_the_resolved_root_and_never_the_real_home_in_tests() {
+        let tmp = TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::set_var("DARKMUX_HOME", format!(" {} ", tmp.path().display())); }
+        let set = liveness_dir();
+        unsafe { std::env::remove_var("DARKMUX_HOME"); }
+        let unset = liveness_dir();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+        assert_eq!(set, tmp.path().join("liveness"));
+        assert_eq!(unset, crate::paths::test_isolated_root().join("liveness"));
     }
 
     #[serial_test::serial]

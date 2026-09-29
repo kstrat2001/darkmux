@@ -134,8 +134,19 @@ pub(crate) fn test_run() -> darkmux_types::session_id::RunId {
 fn main() -> Result<()> {
     providers::register_builtins()?;
     let cli = Cli::parse();
+    refuse_retired_env(&cli.command)?;
     let code = run(cli.command)?;
     std::process::exit(code);
+}
+
+/// The ONE refusal of a retired or renamed setting's env var. Every command
+/// but `doctor` (which reports it) and `config` (which fixes it) refuses to
+/// start while one is set; `--help` / `--version` never reach `run`.
+fn refuse_retired_env(cmd: &Cmd) -> Result<()> {
+    match cmd {
+        Cmd::Doctor { .. } | Cmd::Config { .. } => Ok(()),
+        _ => Ok(darkmux_types::config_access::refuse_retired_env()?),
+    }
 }
 
 fn run(cmd: Cmd) -> Result<i32> {

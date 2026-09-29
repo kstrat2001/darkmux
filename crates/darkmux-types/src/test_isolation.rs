@@ -174,8 +174,14 @@ pub const PINNED_STATE_VARS: &[(&str, &str)] = &[
 /// written. Out of scope by construction, the same way a non-file
 /// destination is (see [`StateLeakSentinel`]'s doc).
 pub const CLEARED_STATE_VARS: &[&str] = &[
-    // Retired in 4.0: nothing reads it and every preflight refuses it while set.
+    // Retired or renamed in 4.0: nothing reads them and every command but
+    // doctor/config refuses to start while one is set, so an ambient export
+    // would fail every spawned darkmux. `every_retired_env_var_is_cleared`
+    // keeps this in step with `config::RETIRED_SETTINGS` / `RENAMED_SETTINGS`.
     "DARKMUX_CREW_DIR",
+    "DARKMUX_NOTEBOOK_DIR",
+    "DARKMUX_RADIO_ROUTER_PROFILE",
+    "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION",
     "DARKMUX_AUDIT_DIR",
     "DARKMUX_PROFILES",
     "DARKMUX_TEMPLATES_DIR",
@@ -901,6 +907,17 @@ pub fn process_scratch_dir(prefix: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    /// A spawned darkmux refuses to start while a retired or renamed
+    /// setting's env var is set, so the guard must clear every one of them.
+    #[test]
+    fn every_retired_env_var_is_cleared() {
+        let retired = crate::config::RETIRED_SETTINGS.iter().filter_map(|r| r.env);
+        let renamed = crate::config::RENAMED_SETTINGS.iter().map(|r| r.old_env);
+        for var in retired.chain(renamed) {
+            assert!(CLEARED_STATE_VARS.contains(&var), "{var} is retired but not cleared by the isolation guard");
+        }
+    }
+
     use super::*;
 
     /// [`InactivityBudget`]'s restore, asserted for all three shapes it

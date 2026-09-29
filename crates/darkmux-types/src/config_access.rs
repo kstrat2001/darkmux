@@ -1111,11 +1111,21 @@ pub fn remote_step_budget_policy() -> Result<crate::config::StepBudgetPolicy, cr
 }
 
 /// Every renamed or retired setting (`config::RENAMED_SETTINGS`,
-/// `config::RETIRED_SETTINGS`) whose env var is still set: refused at every
-/// preflight and failed by doctor. A leftover `config.json` key is refused as
-/// an unknown key instead (`user_files`).
+/// `config::RETIRED_SETTINGS`) whose env var is still set. The ONE refusal of
+/// them is `refuse_retired_env`, called once at CLI entry; `doctor` reads this
+/// list to report them. A leftover `config.json` key is refused as an unknown
+/// key instead (`user_files`).
 pub fn retired_env_leftovers() -> Vec<crate::config::RetiredLeftover> {
     crate::config::retired_env_leftovers(&env_str)
+}
+
+/// `Err` when any retired or renamed setting's env var is set. Called once at
+/// the top of the CLI's command dispatch for every command but `doctor` and
+/// `config`, so no entry point (a read-only verb, `serve`, the fleet
+/// listener it hosts) starts under a setting that nothing reads any more.
+pub fn refuse_retired_env() -> Result<(), crate::config::RetiredEnvRefusal> {
+    let left = retired_env_leftovers();
+    if left.is_empty() { Ok(()) } else { Err(crate::config::RetiredEnvRefusal(left)) }
 }
 
 /// (#1230 Packet 1) Max CONCURRENT remote dispatches

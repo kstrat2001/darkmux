@@ -372,8 +372,9 @@ pub const CONFIG_SCHEMA_VERSION: &str = "2.0";
 /// refuses the old key naming the new one; a leftover old key in
 /// `config.json` is an unknown key, refused by every preflight and failed by
 /// `darkmux doctor` with this rename as its message (`user_files`); a
-/// leftover old env var is failed by doctor and refused by every preflight
-/// ([`retired_env_leftovers`]).
+/// leftover old env var is failed by doctor and refused by every command
+/// (`config_access::refuse_retired_env`, once at CLI entry; see
+/// [`retired_env_leftovers`]).
 #[derive(Debug, Clone, Copy)]
 pub struct RenamedSetting {
     pub old_key: &'static str,
@@ -417,14 +418,14 @@ pub struct RetiredSetting {
 pub const RETIRED_SETTINGS: &[RetiredSetting] = &[
     RetiredSetting {
         key: "dirs.notebook",
-        env: None,
+        env: Some("DARKMUX_NOTEBOOK_DIR"),
         line: "removed in 4.0 (#2913): the notebook verbs retired; the bundled `darkmux-lab-notebook` skill writes \
                an entry wherever your own instructions say. Delete it",
     },
     RetiredSetting {
         // flow-action-guard:allow — a retired config key, refused by name
         key: "radio.router_profile",
-        env: None,
+        env: Some("DARKMUX_RADIO_ROUTER_PROFILE"),
         line: "removed in CONFIG 1.28: radio routing runs on the machine's utility model, `internal.utility` in \
                profiles.json. Delete it",
     },
@@ -504,6 +505,24 @@ pub fn retired_env_leftovers(env: &dyn Fn(&str) -> Option<String>) -> Vec<Retire
         })
         .collect()
 }
+
+/// What the CLI-entry check refuses with: every retired or renamed setting
+/// whose env var is still set, one operator line each. Its `Display` is the
+/// whole message; `doctor` and `config` are the only commands that run past it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetiredEnvRefusal(pub Vec<RetiredLeftover>);
+
+impl std::fmt::Display for RetiredEnvRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "refusing to start: bad config")?;
+        for l in &self.0 {
+            write!(f, "\n  {}", l.line)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for RetiredEnvRefusal {}
 
 /// The `~/.darkmux/config.json` document. All fields optional + skipped when
 /// `None`, so a fresh/empty config serializes to `{}` and any field absent
@@ -2356,6 +2375,12 @@ mod tests {
         let found = retired_env_leftovers(&crew);
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(found[0].line.contains("DARKMUX_CREW_DIR") && found[0].line.contains("DARKMUX_HOME"), "{found:?}");
+        for var in ["DARKMUX_NOTEBOOK_DIR", "DARKMUX_RADIO_ROUTER_PROFILE"] {
+            let one = |k: &str| (k == var).then(|| "/x".to_string());
+            let found = retired_env_leftovers(&one);
+            assert_eq!(found.len(), 1, "{var} is a retired env var, refused with the rest: {found:?}");
+            assert!(found[0].line.contains(var), "{found:?}");
+        }
     }
 
     /// (#2914) `radio.router_profile` is REMOVED (CONFIG 1.28): routing runs

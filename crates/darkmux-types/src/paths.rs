@@ -11,7 +11,7 @@
 use anyhow::{Context, Result};
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
@@ -170,19 +170,54 @@ pub fn test_isolated_dir(name: &str) -> PathBuf {
     test_isolated_root().join(name)
 }
 
-/// A `./.darkmux/` in the working directory that darkmux is NOT using as its
-/// root. 4.0 dropped project-local discovery, so such a directory is inert
-/// (bar the per-repo `lessons.db`); `darkmux doctor` reports it and names
-/// `DARKMUX_HOME` as the way to adopt it. `None` when the cwd has no such
-/// directory or `DARKMUX_HOME` already points at it.
-pub fn ignored_project_dir() -> Option<PathBuf> {
-    let project = env::current_dir().ok()?.join(".darkmux");
-    if !project.is_dir() {
-        return None;
+/// What a `<repo>/.darkmux/` directory legitimately holds: the files darkmux
+/// still reads from a repo (the per-repo lessons database with its SQLite
+/// side files, and `conventions.json`). Everything else in it is stranded.
+const PER_REPO_FILES: &[&str] =
+    &["lessons.db", "lessons.db-wal", "lessons.db-shm", "lessons.db-journal", "conventions.json"];
+
+/// State in the working directory that darkmux ignores. 4.0 dropped
+/// project-local discovery: only [`PER_REPO_FILES`] are read from a repo's
+/// `.darkmux/`, and a `./.darkmux.json` registry is not read at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IgnoredProjectState {
+    /// Each stranded entry: a `./.darkmux/` child that is not a per-repo
+    /// file, and a `./.darkmux.json`. Sorted.
+    pub stranded: Vec<PathBuf>,
+    /// The `./.darkmux/` directory when it holds a `config.json` or
+    /// `profiles.json`, so `DARKMUX_HOME=<it>` would adopt real root state.
+    pub adoptable_dir: Option<PathBuf>,
+}
+
+/// [`ignored_project_state_at`] for the process's working directory and
+/// resolved root. `None` when nothing is stranded.
+pub fn ignored_project_state() -> Option<IgnoredProjectState> {
+    let cwd = env::current_dir().ok()?;
+    ignored_project_state_at(&cwd, &resolve(ResolveScope::ForceUser).root)
+}
+
+fn ignored_project_state_at(cwd: &Path, root: &Path) -> Option<IgnoredProjectState> {
+    let project = cwd.join(".darkmux");
+    let same = |a: &Path, b: &Path| fs::canonicalize(a).ok() == fs::canonicalize(b).ok();
+    let mut stranded: Vec<PathBuf> = Vec::new();
+    let mut adoptable_dir = None;
+    if project.is_dir() && !same(&project, root) {
+        let entries = fs::read_dir(&project).into_iter().flatten().flatten();
+        stranded.extend(
+            entries
+                .filter(|e| !PER_REPO_FILES.contains(&e.file_name().to_string_lossy().as_ref()))
+                .map(|e| e.path()),
+        );
+        if project.join("config.json").is_file() || project.join("profiles.json").is_file() {
+            adoptable_dir = Some(project);
+        }
     }
-    let root = resolve(ResolveScope::ForceUser).root;
-    let same = |a: &PathBuf, b: &PathBuf| fs::canonicalize(a).ok() == fs::canonicalize(b).ok();
-    (!same(&project, &root)).then_some(project)
+    let registry = cwd.join(".darkmux.json");
+    if registry.is_file() {
+        stranded.push(registry);
+    }
+    stranded.sort();
+    (!stranded.is_empty()).then_some(IgnoredProjectState { stranded, adoptable_dir })
 }
 
 pub fn resolve(scope: ResolveScope) -> DarkmuxPaths {
@@ -190,29 +225,48 @@ pub fn resolve(scope: ResolveScope) -> DarkmuxPaths {
     // root directory entirely (a relocated install, or test isolation), and
     // wins over the user default below. The pointer can't live
     // inside the config it locates, so it stays a direct env read. Tilde-
-    // expanded for ergonomics.
+    // expanded for ergonomics; a blank value is unset, and a set one is used
+    // trimmed.
     #[cfg(any(test, feature = "test-support"))]
     crate::env_audit::audit_env_read("DARKMUX_HOME");
     if let Some(root) = env::var("DARKMUX_HOME")
         .ok()
-        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
         .map(|s| expand_tilde(&s))
     {
         return paths_from_root(root, Scope::User);
     }
 
-    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let project_root = cwd.join(".darkmux");
-    let user_root = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".darkmux");
-
     let (chosen, chosen_scope) = match scope {
-        ResolveScope::ForceProject => (project_root, Scope::Project),
-        ResolveScope::ForceUser => (user_root, Scope::User),
+        ResolveScope::ForceProject => {
+            let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            (cwd.join(".darkmux"), Scope::Project)
+        }
+        ResolveScope::ForceUser => {
+            let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+            (home.join(".darkmux"), Scope::User)
+        }
     };
 
     paths_from_root(chosen, chosen_scope)
+}
+
+/// The darkmux root for the per-process registries that must work before any
+/// config is read (`dispatch_liveness`, `residency_lease`): exactly
+/// `resolve(ForceUser).root`, so they agree with every other directory on
+/// where "home" is. In a test build a root that IS the operator's real
+/// `~/.darkmux` is redirected to [`test_isolated_root`]: a test that forgot to
+/// set `DARKMUX_HOME` must not touch real state, and these registries prune
+/// (delete) old files on write (proved: an unrelated unit test deleted three
+/// seeded heartbeat files). A test that isolated itself is honored verbatim.
+pub fn user_root_guarded() -> PathBuf {
+    let root = resolve(ResolveScope::ForceUser).root;
+    #[cfg(any(test, feature = "test-support"))]
+    if dirs::home_dir().map(|h| h.join(".darkmux")).as_ref() == Some(&root) {
+        return test_isolated_root();
+    }
+    root
 }
 
 /// Build the full `DarkmuxPaths` from a chosen root, applying the per-dir
@@ -353,28 +407,53 @@ mod tests {
 
         let user = resolve(ResolveScope::ForceUser);
         let project = resolve(ResolveScope::ForceProject);
-        let ignored = ignored_project_dir();
 
         env::set_current_dir(prev).unwrap();
         assert_eq!(user.scope, Scope::User);
         assert_ne!(user.root, project.root, "the cwd dir is not the user root");
-        assert!(ignored.is_some_and(|p| p.ends_with(".darkmux")));
     }
 
+    /// Only what darkmux does not read is stranded: the per-repo files are
+    /// not, and a `config.json` / `profiles.json` makes the directory
+    /// adoptable through `DARKMUX_HOME`.
+    #[test]
+    fn ignored_state_names_only_stranded_entries() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("elsewhere");
+        let project = tmp.path().join(".darkmux");
+        fs::create_dir_all(&project).unwrap();
+        for f in ["lessons.db", "lessons.db-wal", "conventions.json"] {
+            fs::write(project.join(f), "x").unwrap();
+        }
+        assert_eq!(ignored_project_state_at(tmp.path(), &root), None, "per-repo files only");
+
+        fs::write(project.join("profiles.json"), "{}").unwrap();
+        fs::write(tmp.path().join(".darkmux.json"), "{}").unwrap();
+        let state = ignored_project_state_at(tmp.path(), &root).unwrap();
+        assert_eq!(state.stranded, vec![project.join("profiles.json"), tmp.path().join(".darkmux.json")]);
+        assert_eq!(state.adoptable_dir, Some(project));
+    }
+
+    /// `DARKMUX_HOME` pointing at the cwd's `.darkmux` is the documented way
+    /// to use it: the directory is the root, so its contents are not stranded.
+    #[test]
+    fn ignored_state_is_empty_when_the_root_is_the_project_dir() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path().join(".darkmux");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("config.json"), "{}").unwrap();
+        assert_eq!(ignored_project_state_at(tmp.path(), &project), None);
+    }
+
+    /// `DARKMUX_HOME` is used trimmed, the same way it is tested for blank.
     #[serial_test::serial]
     #[test]
-    fn no_ignored_project_dir_when_the_cwd_has_none_or_home_relocates() {
-        let tmp = TempDir::new().unwrap();
-        let prev = env::current_dir().unwrap();
-        env::set_current_dir(tmp.path()).unwrap();
+    fn darkmux_home_is_used_trimmed() {
         let _clear_home = ClearDarkmuxHomeGuard::new();
-        let none = ignored_project_dir();
-        fs::create_dir_all(tmp.path().join(".darkmux")).unwrap();
-        unsafe { env::set_var("DARKMUX_HOME", tmp.path().join(".darkmux")) };
-        let adopted = ignored_project_dir();
-        env::set_current_dir(prev).unwrap();
-        assert_eq!(none, None);
-        assert_eq!(adopted, None, "DARKMUX_HOME pointing at the cwd dir is the documented way to use it");
+        let tmp = TempDir::new().unwrap();
+        unsafe { env::set_var("DARKMUX_HOME", format!("  {}  ", tmp.path().display())) };
+        let root = resolve(ResolveScope::ForceUser).root;
+        assert_eq!(root, tmp.path());
     }
 
     #[serial_test::serial]
