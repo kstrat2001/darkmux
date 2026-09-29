@@ -178,8 +178,8 @@ Burn-down/remaining-work tracking is [planned](#8-planned-not-yet-shipped).
   creates and starts it; the operator's verbs are the two terminals,
   `finalize` (success: drive non-terminal phases → Complete, tear down
   worktrees, mission → Finalized) and `abort` (kill: the same teardown, phases
-  → Abandoned). Each persisted with operator reasoning. (`mission start`,
-  `pause` and `resume` were removed in 4.0, #2954.)
+  → Abandoned). Each persisted with operator reasoning. (The hand-built
+  `start`, `pause` and `resume` verbs were removed in 4.0, #2954.)
 - **Phase:** `Planned → Running → Complete | Abandoned`. Phase status is
   **derived by the mission graph** and reconciled by `mission finalize` /
   `mission abort` (#1463 retired the manual `phase start/complete/abandon`
