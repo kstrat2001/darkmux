@@ -5195,7 +5195,7 @@
         assert_eq!(args.get(1).map(String::as_str), Some("dispatch"));
         assert_eq!(args.get(2).map(String::as_str), Some("coder"));
         assert_eq!(flag_value(&args, "--image"), Some("rust:latest"), "hint: {hint}");
-        assert!(!hint.contains("--phase-id"), "`dispatch --phase-id` no longer exists (#2954): {hint}");
+        assert!(!hint.contains("--phase-id"), "the flag was removed (#2954): {hint}");
 
         let resume_from = flag_value(&args, "--resume-from").expect("hint names --resume-from");
         let workdir = flag_value(&args, "--workdir").expect("hint names --workdir");
