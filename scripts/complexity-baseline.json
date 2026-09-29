@@ -97,7 +97,6 @@
   "crates/darkmux-serve/src/host_sampler.rs::spawn": 25,
   "crates/darkmux-serve/src/lib.rs::build_lab_run_summary": 24,
   "crates/darkmux-serve/src/lib.rs::redis_tail_task": 17,
-  "crates/darkmux-serve/src/lib.rs::scan_flow_missions": 16,
   "crates/darkmux-serve/src/lib.rs::xread_block_once": 21,
   "crates/darkmux-serve/src/panel.rs::panel_handler": 19,
   "crates/darkmux-serve/src/runs.rs::build_flow_mission_index_in": 16,
