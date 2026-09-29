@@ -2154,9 +2154,11 @@ pub enum LabDirState {
     /// Nothing to move: the pre-4.0 dir is absent or empty, or the operator
     /// set the lab dir explicitly (`DARKMUX_LAB_DIR` / `dirs.lab`).
     Current,
-    /// The pre-4.0 dir holds runs and the 4.0 dir does not exist yet: one
-    /// `mv` moves them. Lab verbs refuse until it has run.
-    MovePending { from: std::path::PathBuf, to: std::path::PathBuf },
+    /// The pre-4.0 dir holds runs and the 4.0 dir holds none: one command
+    /// moves them. Lab verbs refuse until it has run. `onto_empty_dir` is set
+    /// when the 4.0 dir already exists (empty): a plain `mv` into it would
+    /// nest the runs as `lab/runs`, so the command removes it first.
+    MovePending { from: std::path::PathBuf, to: std::path::PathBuf, onto_empty_dir: bool },
     /// Both dirs hold something, so the pre-4.0 runs are not read. The
     /// command merges them without overwriting either side.
     Split { from: std::path::PathBuf, to: std::path::PathBuf },
@@ -2168,7 +2170,12 @@ impl LabDirState {
         let q = |p: &std::path::Path| crate::shell::quote(&p.display().to_string());
         match self {
             LabDirState::Current => None,
-            LabDirState::MovePending { from, to } => Some(format!("mv {} {}", q(from), q(to))),
+            LabDirState::MovePending { from, to, onto_empty_dir: false } => {
+                Some(format!("mv {} {}", q(from), q(to)))
+            }
+            LabDirState::MovePending { from, to, onto_empty_dir: true } => {
+                Some(format!("rmdir {} && mv {} {}", q(to), q(from), q(to)))
+            }
             // Entry by entry, `-n` so a run id present on both sides is
             // skipped rather than overwritten; `rmdir` then fails loudly on
             // whatever was skipped instead of deleting it.
@@ -2187,16 +2194,22 @@ pub fn lab_dir_state() -> LabDirState {
 /// Pure half of [`lab_dir_state`]: `lab` is the resolved lab dir, `default`
 /// the one darkmux would pick with no override.
 fn lab_dir_state_in(lab: &std::path::Path, default: &std::path::Path) -> LabDirState {
-    let has_entries = |p: &std::path::Path| std::fs::read_dir(p).is_ok_and(|mut d| d.next().is_some());
     let from = default.with_file_name("runs");
-    if lab != default || !has_entries(&from) {
+    // A dotfile (`.DS_Store`) is not a run, so a dir holding only those is
+    // empty for the pre-4.0 side.
+    let holds_runs = std::fs::read_dir(&from).is_ok_and(|d| {
+        d.flatten().any(|e| !e.file_name().to_string_lossy().starts_with('.'))
+    });
+    if lab != default || !holds_runs {
         return LabDirState::Current;
     }
     let to = lab.to_path_buf();
-    if to.exists() {
+    let to_holds_entries = std::fs::read_dir(&to).is_ok_and(|mut d| d.next().is_some());
+    if to_holds_entries {
         LabDirState::Split { from, to }
     } else {
-        LabDirState::MovePending { from, to }
+        let onto_empty_dir = to.is_dir();
+        LabDirState::MovePending { from, to, onto_empty_dir }
     }
 }
 
@@ -2209,7 +2222,7 @@ pub fn require_current_lab_dir() -> anyhow::Result<()> {
 
 fn require_state_current(state: &LabDirState) -> anyhow::Result<()> {
     match state {
-        LabDirState::MovePending { from, to } => anyhow::bail!(
+        LabDirState::MovePending { from, to, .. } => anyhow::bail!(
             "lab runs are still in {} (the pre-4.0 location); 4.0 reads them from {}. \
              darkmux does not move your data itself. Move them, then re-run:\n\n  {}\n",
             from.display(),
@@ -3515,7 +3528,7 @@ mod tests {
         std::fs::create_dir_all(root.join("runs").join("quick-q-1")).unwrap();
         let lab = root.join("lab");
         let state = lab_dir_state_in(&lab, &lab);
-        assert_eq!(state, LabDirState::MovePending { from: root.join("runs"), to: lab.clone() });
+        assert_eq!(state, LabDirState::MovePending { from: root.join("runs"), to: lab.clone(), onto_empty_dir: false });
         let want = format!(
             "mv {} {}",
             crate::shell::quote(&root.join("runs").display().to_string()),
@@ -3565,6 +3578,84 @@ mod tests {
         assert!(cmd.starts_with("mv -n "), "a merge never overwrites: {cmd}");
         assert!(cmd.ends_with(&format!("rmdir {}", from.display())), "{cmd}");
         assert!(require_state_current(&state).is_ok(), "a split warns in doctor, it does not refuse");
+    }
+
+    /// Every cell of (pre-4.0 dir) x (4.0 dir). The 4.0 dir existing but EMPTY
+    /// must not read as a split: that hid every old run behind an exit-0
+    /// "no recorded lab runs yet".
+    #[test]
+    fn lab_dir_state_table_covers_every_from_and_to_cell() {
+        #[derive(Clone, Copy, Debug)]
+        enum Dir {
+            Absent,
+            Empty,
+            OnlyDotfiles,
+            Runs,
+        }
+        let make = |p: &std::path::Path, d: Dir| match d {
+            Dir::Absent => {}
+            Dir::Empty => std::fs::create_dir_all(p).unwrap(),
+            Dir::OnlyDotfiles => {
+                std::fs::create_dir_all(p).unwrap();
+                std::fs::write(p.join(".DS_Store"), "").unwrap();
+            }
+            Dir::Runs => std::fs::create_dir_all(p.join("quick-q-1")).unwrap(),
+        };
+        use Dir::*;
+        // (from, to, expected: None = Current, Some(onto_empty_dir) = MovePending,
+        // and the sentinel Split handled below)
+        #[derive(Debug, PartialEq)]
+        enum Want {
+            Current,
+            Pending { onto_empty_dir: bool },
+            Split,
+        }
+        let cells = [
+            (Absent, Absent, Want::Current),
+            (Absent, Empty, Want::Current),
+            (Absent, Runs, Want::Current),
+            (Empty, Absent, Want::Current),
+            (Empty, Runs, Want::Current),
+            (OnlyDotfiles, Absent, Want::Current),
+            (OnlyDotfiles, Empty, Want::Current),
+            (OnlyDotfiles, Runs, Want::Current),
+            (Runs, Absent, Want::Pending { onto_empty_dir: false }),
+            (Runs, Empty, Want::Pending { onto_empty_dir: true }),
+            (Runs, Runs, Want::Split),
+        ];
+        for (from_d, to_d, want) in cells {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (from, lab) = (tmp.path().join("runs"), tmp.path().join("lab"));
+            make(&from, from_d);
+            make(&lab, to_d);
+            let got = match lab_dir_state_in(&lab, &lab) {
+                LabDirState::Current => Want::Current,
+                LabDirState::MovePending { onto_empty_dir, .. } => Want::Pending { onto_empty_dir },
+                LabDirState::Split { .. } => Want::Split,
+            };
+            assert_eq!(got, want, "from={from_d:?} to={to_d:?}");
+        }
+    }
+
+    /// The command for an existing-but-empty 4.0 dir removes it first: a plain
+    /// `mv runs lab` would nest the runs as `lab/runs`, still hidden.
+    #[test]
+    fn lab_dir_state_onto_an_empty_dir_prints_rmdir_then_mv_and_it_works() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (from, lab) = (tmp.path().join("runs"), tmp.path().join("lab"));
+        std::fs::create_dir_all(from.join("quick-q-1")).unwrap();
+        std::fs::write(from.join(".DS_Store"), "").unwrap();
+        std::fs::create_dir_all(&lab).unwrap();
+        let state = lab_dir_state_in(&lab, &lab);
+        let q = |p: &std::path::Path| crate::shell::quote(&p.display().to_string());
+        let want = format!("rmdir {} && mv {} {}", q(&lab), q(&from), q(&lab));
+        assert_eq!(state.command().as_deref(), Some(want.as_str()));
+        assert!(require_state_current(&state).is_err(), "the lab verbs refuse until it has run");
+        // Recovery: running the printed command settles it.
+        let ok = std::process::Command::new("sh").arg("-c").arg(&want).status().unwrap();
+        assert!(ok.success());
+        assert!(lab.join("quick-q-1").is_dir(), "runs land at lab/<id>, not lab/runs/<id>");
+        assert_eq!(lab_dir_state_in(&lab, &lab), LabDirState::Current);
     }
 
     #[serial_test::serial]

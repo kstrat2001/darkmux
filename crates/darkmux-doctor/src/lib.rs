@@ -457,7 +457,7 @@ fn lab_dir_location_check(state: &darkmux_types::config_access::LabDirState) -> 
                 hint: None,
             }
         }
-        LabDirState::MovePending { from, to } => (
+        LabDirState::MovePending { from, to, .. } => (
             Status::Fail,
             format!(
                 "lab runs are still in {} (the pre-4.0 location); 4.0 reads {}, so the lab verbs refuse until they are moved",
@@ -13760,11 +13760,24 @@ mod tests {
     #[test]
     fn lab_dir_location_fails_with_the_exact_mv_while_runs_sit_in_the_old_dir() {
         use darkmux_types::config_access::LabDirState;
-        let state = LabDirState::MovePending { from: "/r/runs".into(), to: "/r/lab".into() };
+        let state = LabDirState::MovePending { from: "/r/runs".into(), to: "/r/lab".into(), onto_empty_dir: false };
         let check = lab_dir_location_check(&state);
         assert_eq!(check.status, Status::Fail, "{}", check.message);
         assert!(check.message.contains("/r/runs") && check.message.contains("/r/lab"), "{}", check.message);
         assert_eq!(check.hint.as_deref(), Some("mv /r/runs /r/lab"));
+    }
+
+    #[test]
+    fn lab_dir_location_hint_removes_an_existing_empty_lab_dir_first() {
+        use darkmux_types::config_access::LabDirState;
+        let state = LabDirState::MovePending {
+            from: "/r/runs".into(),
+            to: "/r/lab".into(),
+            onto_empty_dir: true,
+        };
+        let check = lab_dir_location_check(&state);
+        assert_eq!(check.status, Status::Fail, "{}", check.message);
+        assert_eq!(check.hint.as_deref(), Some("rmdir /r/lab && mv /r/runs /r/lab"));
     }
 
     #[test]
