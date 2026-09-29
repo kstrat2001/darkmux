@@ -14,7 +14,7 @@ darkmux-types = { path = "../darkmux-types" }
 serde = { version = "1.0", features = ["derive"] }
 # Only for LoadReport.extras — the lenient host-reported load-config overflow
 # (#1257). The planning core itself never touches serde_json.
-serde_json = "1.0"
+serde_json.workspace = true
 
 [dev-dependencies]
 # (#811) Empty the config tier by construction in this crate's TEST build.

@@ -141,13 +141,13 @@ darkmux release.
 - **Doctor's "legacy compaction extras" check.** The openclaw-shape keys
   it warned about (`mode`, `maxHistoryShare`, `recentTurnsPreserve`,
   `customInstructions` under `runtime.compaction`) are now retired keys,
-  refused by name like any unknown key (CONFIG 2.0, above). **Migration:**
+  refused by name like any unknown key (CONFIG 2.0, below). **Migration:**
   delete them (`custom_instructions` is the typed field).
 - **Doctor's residue checks for pre-3.x removals:** the `crews` map in
   `profiles.json`, the `review{}` config block,
   `runtime.telemetry_record_every_samples`, and the "daemon predates the
   build field" verdict. Each key is now a retired key, refused by name
-  (CONFIG 2.0, above). **Migration:** delete any of those keys still
+  (CONFIG 2.0, below). **Migration:** delete any of those keys still
   present (`darkmux doctor`'s `user file keys` rows name them).
 
 - **A role's `escalation_posture`.** Nothing read it: the runtime treated

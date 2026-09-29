@@ -42,11 +42,11 @@ mod tests {
     /// Write-or-assert. The whole point is that a shape change is LOUD, so the
     /// default path only ever compares; rewriting takes an explicit env var.
     fn golden(name: &str, value: &impl serde::Serialize) {
-        let json = serde_json::to_string_pretty(value).expect("wire type must serialize");
         let dir = fixture_dir();
         let path = dir.join(name);
 
         if std::env::var("DARKMUX_REGENERATE_FIXTURES").is_ok() {
+            let json = serde_json::to_string_pretty(value).expect("wire type must serialize");
             std::fs::create_dir_all(&dir).expect("creating the fixture dir");
             std::fs::write(&path, format!("{json}\n")).expect("writing the fixture");
             return;
@@ -60,9 +60,14 @@ mod tests {
             )
         });
 
+        // Compared as parsed JSON, not as text: two objects with the same keys
+        // and values are the same wire shape whatever order the keys print in.
+        let on_disk: serde_json::Value = serde_json::from_str(&on_disk)
+            .unwrap_or_else(|e| panic!("generated fixture `{}` is not JSON ({e})", path.display()));
+        let served = serde_json::to_value(value).expect("wire type must serialize");
         assert_eq!(
-            on_disk.trim(),
-            json.trim(),
+            on_disk,
+            served,
             "\n\nThe wire shape of `{name}` changed and its generated fixture did not.\n\
              Every Playwright spec built on this fixture is now feeding a shape the server\n\
              no longer produces — which renders as an empty page, not as a failed assertion.\n\n\
@@ -81,6 +86,28 @@ mod tests {
     /// their tokens and turns, so the pair pins the archive end to end.
     #[tokio::test]
     async fn flow_mission_legacy_archive_wire_shape() {
+        let served: serde_json::Value = serde_json::from_slice(&serve_legacy_archive().await).unwrap();
+        golden("flow-mission-legacy-archive.json", &served["records"]);
+    }
+
+    /// The daemon serves an archived record's keys in the order the archive
+    /// holds them, in every build of this crate. `serde_json` sorts object
+    /// keys unless its `preserve_order` feature is on, and a dependency of the
+    /// binary turns it on, so before the workspace declared it once the key
+    /// order on the wire depended on which crates were linked.
+    #[tokio::test]
+    async fn served_records_keep_the_archives_key_order() {
+        let body = String::from_utf8(serve_legacy_archive().await).unwrap();
+        let first = &body[body.find("\"records\"").expect("the body carries records")..];
+        let ts = first.find("\"ts\"").unwrap();
+        let level = first.find("\"level\"").unwrap();
+        let action = first.find("\"action\"").unwrap();
+        assert!(ts < level && level < action, "keys left the archive's order: {first}");
+    }
+
+    /// `/flow-mission/<id>` over a one-day archive of raw 3.x records, as
+    /// the served bytes.
+    async fn serve_legacy_archive() -> Vec<u8> {
         use tower::ServiceExt;
         let m = "review-1785400940-legacy";
         let day = [
@@ -106,9 +133,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), axum::http::StatusCode::OK);
-        let served: serde_json::Value =
-            serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
-        golden("flow-mission-legacy-archive.json", &served["records"]);
+        axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap().to_vec()
     }
 
     /// A `/runs` row with every optional field POPULATED.

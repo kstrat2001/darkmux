@@ -38,7 +38,7 @@ futures = "0.3"
 blake3 = "1.5"
 tower-http = { version = "0.5", features = ["cors", "timeout"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json.workspace = true
 redis = { version = "0.27", default-features = false, features = ["streams"] }
 # (#1914) Promoted from dev-only: the fleet-snapshot handoff file a spawned
 # `run-list` panel child reads (`write_fleet_snapshot_file` in lib.rs,

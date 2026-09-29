@@ -25,7 +25,7 @@ darkmux-fleet = { path = "../darkmux-fleet" }
 # fixture manifests), whose types live in the lab crate.
 darkmux-lab = { path = "../darkmux-lab" }
 anyhow = "1.0"
-serde_json = "1.0"
+serde_json.workspace = true
 dirs = "5.0"
 
 [dev-dependencies]
