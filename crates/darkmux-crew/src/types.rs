@@ -249,7 +249,13 @@ pub struct Crew {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum MissionStatus {
+    /// A mission that is running or ready to run. `paused` is read as
+    /// `Active`: the retired `mission pause` verb only flipped this label and
+    /// the scheduler never honored it, so a `mission.json` an older binary
+    /// left at `"status":"paused"` is simply an open mission. It is written
+    /// back as `active` the next time the mission is saved.
     #[default]
+    #[serde(alias = "paused")]
     Active,
     /// Terminal (SUCCESS path). Renamed from `Closed` for 2.0 terminology
     /// consistency with the `mission finalize` verb (#1463 renamed the
@@ -274,7 +280,6 @@ pub enum MissionStatus {
     /// Deliberately a distinct TERMINAL rather than a flavor of Finalized:
     /// both end the mission, but only one of them means the work happened.
     Aborted,
-    Paused,
 }
 
 /// A mission — a named objective tying phases together.
@@ -308,11 +313,6 @@ pub struct Mission {
         skip_serializing_if = "Option::is_none"
     )]
     pub finalized_ts: Option<u64>,
-    /// When the mission most recently transitioned to `Paused`. Resume
-    /// flips status back to `Active` but does NOT clear this field —
-    /// the operator may want to see when the most recent pause occurred.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub paused_ts: Option<u64>,
     /// (#815) The operator's VERBATIM intent (a config's `source_input` key) — the
     /// unabridged prose that was summarized into the
     /// description + phase descriptions. `mission run` dispatches this
@@ -1207,6 +1207,28 @@ mod tests {
         assert_eq!(a, round_tripped);
     }
 
+    /// A `mission.json` written before `mission pause` was retired can say
+    /// `"status":"paused"` and carry a `paused_ts`. It still loads, reads as
+    /// `Active`, and a re-save drops the retired key and the paused label.
+    #[test]
+    fn a_legacy_paused_mission_loads_as_active_and_resaves_clean() {
+        let legacy = serde_json::json!({
+            "id": "m-old",
+            "description": "left by an older binary",
+            "status": "paused",
+            "phase_ids": [],
+            "created_ts": 1700000000u64,
+            "started_ts": 1700000100u64,
+            "paused_ts": 1700000200u64,
+        });
+        let m: Mission = serde_json::from_value(legacy).expect("a paused mission must still load");
+        assert_eq!(m.status, MissionStatus::Active);
+        assert_eq!(m.started_ts, Some(1700000100));
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(r#""status":"active""#), "got {s}");
+        assert!(!s.contains("paused"), "the retired label and key must not be written back, got {s}");
+    }
+
     /// The canonical (post-rename) wire shape round-trips, and writing a
     /// `Finalized` mission always emits the new field/value names —
     /// self-migration happens the next time the mission is saved.
@@ -1220,7 +1242,6 @@ mod tests {
             created_ts: 1700000000,
             started_ts: None,
             finalized_ts: Some(1700000900),
-            paused_ts: None,
             source_input: None,
             ticket: None,
             spec: None,
@@ -1243,7 +1264,6 @@ mod tests {
             created_ts: 0,
             started_ts: None,
             finalized_ts: None,
-            paused_ts: None,
             source_input: None,
             ticket: None,
             spec: None,

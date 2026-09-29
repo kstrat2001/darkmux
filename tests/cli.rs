@@ -9258,83 +9258,49 @@ fn board_drift_kinds(home: &std::path::Path, flows: &std::path::Path, id: &str) 
         .collect()
 }
 
-/// (#2682 round 4) The one family where the BOARD was right and `darkmux
-/// run list` was wrong: a Paused mission whose dispatch session carried a
-/// `session.end`. #1642 already ruled that a paused mission must never
-/// decay into `Abandoned`, but its early-return sat BELOW the all-terminal
-/// branch, so the exemption leaked. The surfaces now agree.
-///
-/// NOT vacuous, and the second half is what proves it: the byte-identical
-/// fixture with `status: "active"` must still read `abandoned`. So the
-/// first half measures the pause exemption, not a fixture that was never
-/// near the boundary.
+/// A `mission.json` an older binary left at `"status": "paused"` is an
+/// ordinary open mission now: `darkmux run list` and the board both read it
+/// as `Active`, so a recorded `session.end` on its dispatch reads
+/// `abandoned` and the board names it, exactly as for an `active` mission.
 #[test]
-fn run_list_does_not_call_a_paused_mission_abandoned_from_a_recorded_session_end() {
-    let write_end_record = |flows: &std::path::Path, mission_id: &str| {
-        let day = darkmux_flow::day_utc_now();
-        fs::write(
-            flows.join(format!("{day}.jsonl")),
-            serde_json::json!({
-                "ts": "2024-01-01T09:00:00Z",
-                "action": "session.end",
-                "session_id": format!("{mission_id}-sess"),
-                "mission_id": mission_id,
-                "handle": "coder",
-            })
-            .to_string()
-                + "\n",
-        )
-        .unwrap();
-    };
+fn a_legacy_paused_mission_reads_as_active_on_run_list_and_the_board() {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-
     let home = TempDir::new().unwrap();
     let flows = TempDir::new().unwrap();
     write_mission_with_phases(
         home.path(),
-        "paused-end-e2e",
+        "legacy-paused-e2e",
         "paused",
         &[("p1", "running")],
         now - 25 * 60,
     );
-    write_end_record(flows.path(), "paused-end-e2e");
+    let day = darkmux_flow::day_utc_now();
+    fs::write(
+        flows.path().join(format!("{day}.jsonl")),
+        serde_json::json!({
+            "ts": "2024-01-01T09:00:00Z",
+            "action": "session.end",
+            "session_id": "legacy-paused-e2e-sess",
+            "mission_id": "legacy-paused-e2e",
+            "handle": "coder",
+        })
+        .to_string()
+            + "\n",
+    )
+    .unwrap();
     assert_eq!(
-        run_list_status(home.path(), flows.path(), "paused-end-e2e"),
-        "running",
-        "a paused mission must not read abandoned — `mission pause` never touches a process, so \
-         its dispatch not being alive is the expected state"
-    );
-    assert!(
-        board_drift_kinds(home.path(), flows.path(), "paused-end-e2e").is_empty(),
-        "and the board, which was already right, must not have gained a drift for it"
-    );
-
-    // The boundary control: the SAME records under an ACTIVE mission still
-    // read abandoned, and the board still names it. Without this the
-    // assertion above would pass with the whole recorded-end branch deleted.
-    let home2 = TempDir::new().unwrap();
-    let flows2 = TempDir::new().unwrap();
-    write_mission_with_phases(
-        home2.path(),
-        "paused-end-e2e",
-        "active",
-        &[("p1", "running")],
-        now - 25 * 60,
-    );
-    write_end_record(flows2.path(), "paused-end-e2e");
-    assert_eq!(
-        run_list_status(home2.path(), flows2.path(), "paused-end-e2e"),
+        run_list_status(home.path(), flows.path(), "legacy-paused-e2e"),
         "abandoned",
-        "the pause exemption must not disable the recorded-end verdict for an Active mission"
+        "a legacy paused mission is Active, so its recorded session end reads abandoned"
     );
     assert!(
-        board_drift_kinds(home2.path(), flows2.path(), "paused-end-e2e")
+        board_drift_kinds(home.path(), flows.path(), "legacy-paused-e2e")
             .iter()
             .any(|k| k == "running-phase-session-dead"),
-        "…and #2689's rule must still fire there"
+        "and the board names the dead session as it does for an active mission"
     );
 }
 

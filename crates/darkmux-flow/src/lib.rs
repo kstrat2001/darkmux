@@ -2047,6 +2047,35 @@ mod tests {
         assert_eq!(sink.0.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
+    /// The verbs behind `mission.pause`, `mission.resume` and `phase.added`
+    /// are gone (#2954), so each spelling reads as retired and no write path
+    /// can name one: it is not a current action, and both entry points
+    /// refuse a record that carries it.
+    #[test]
+    fn the_retired_pause_resume_and_added_actions_read_but_cannot_be_written() {
+        struct Never;
+        impl FlowSink for Never {
+            fn persist(&self, _record: crate::CheckedRecord<'_>) -> Result<()> {
+                panic!("a retired action reached a sink");
+            }
+            fn info(&self) -> SinkInfo {
+                SinkInfo { kind: "Never".into(), config: Default::default(), children: vec![], raw_url: None }
+            }
+        }
+        // flow-action-guard:allow-start — the retired spellings are this test's input
+        // drift-guard:allow mission pause — the retired spelling is this test's input
+        // drift-guard:allow mission resume — same
+        for wire in ["mission.pause", "mission pause", "mission.resume", "mission resume", "phase.added", "phase added", "sprint added"] {
+            assert!(!FlowAction::KNOWN_WIRE.contains(&wire), "{wire} is still a current action");
+            let mut r = minimal_record();
+            r.action = crate::legacy::read_action(wire);
+            assert!(matches!(r.action, FlowAction::Retired(_)), "{wire} must read as retired");
+            assert!(record_via(&Never, &r).is_err(), "{wire}");
+            assert!(record_to(&Never, r).is_err(), "{wire}");
+        }
+        // flow-action-guard:allow-end
+    }
+
     fn minimal_record() -> FlowRecord {
         FlowRecord {
             ts: "2025-01-15T12:34:56Z".to_string(),

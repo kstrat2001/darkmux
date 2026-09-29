@@ -108,7 +108,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// `MISSION_STATUS_VALUES` (see its doc comment) instead of hand-widened,
 /// and a stale on-disk index built under the old, too-narrow CHECK needs
 /// this version bump to force a rebuild onto the fixed schema.
-const SCHEMA_VERSION: i32 = 8;
+///
+/// Bumped 8 -> 9 (#2954): `MissionStatus::Paused` and `Mission.paused_ts` are
+/// gone, so the `missions` table lost its `paused_ts` column and the status
+/// CHECK lost `'paused'`. A stale index is detected by this bump and rebuilt
+/// from `mission.json`, which still reads a `paused` status as `active`.
+const SCHEMA_VERSION: i32 = 9;
 
 /// Canonical wire-form values for every `MissionStatus` variant. Single
 /// source of truth for the `missions.status` CHECK constraint baked into
@@ -119,7 +124,7 @@ const SCHEMA_VERSION: i32 = 8;
 /// This is the fix for #2142: the constraint used to be a hand-widened SQL
 /// literal that silently fell behind the enum for the better part of a
 /// milestone.
-const MISSION_STATUS_VALUES: &[&str] = &["active", "finalized", "aborted", "paused"];
+const MISSION_STATUS_VALUES: &[&str] = &["active", "finalized", "aborted"];
 
 /// Build the `IN (...)` list for the `missions.status` CHECK from
 /// [`MISSION_STATUS_VALUES`] — see that constant's doc comment.
@@ -228,8 +233,7 @@ CREATE TABLE IF NOT EXISTS missions (
     status       TEXT NOT NULL CHECK (status IN ({MISSION_STATUS_LIST})),
     created_ts   INTEGER NOT NULL,
     started_ts   INTEGER,  -- Active transition; #95
-    finalized_ts INTEGER,  -- Finalized transition (terminal); #95, renamed from closed_ts (#1463 lineage)
-    paused_ts    INTEGER   -- most-recent Paused transition; #95
+    finalized_ts INTEGER   -- Finalized transition (terminal); #95, renamed from closed_ts (#1463 lineage)
 );
 
 CREATE TABLE IF NOT EXISTS phases (
@@ -402,7 +406,6 @@ fn mission_status_str(s: MissionStatus) -> &'static str {
         MissionStatus::Active => "active",
         MissionStatus::Finalized => "finalized",
         MissionStatus::Aborted => "aborted",
-        MissionStatus::Paused => "paused",
     }
 }
 
@@ -710,8 +713,8 @@ fn populate(conn: &mut Connection) -> Result<()> {
     for mission in &missions {
         let status_str = mission_status_str(mission.status);
         let inserted = tx.execute(
-            "INSERT INTO missions (id, description, status, created_ts, started_ts, finalized_ts, paused_ts)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO missions (id, description, status, created_ts, started_ts, finalized_ts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 mission.id,
                 mission.description,
@@ -719,7 +722,6 @@ fn populate(conn: &mut Connection) -> Result<()> {
                 mission.created_ts as i64,
                 mission.started_ts.map(|t| t as i64),
                 mission.finalized_ts.map(|t| t as i64),
-                mission.paused_ts.map(|t| t as i64),
             ],
         );
         if let Err(e) = inserted {
@@ -1621,7 +1623,6 @@ mod tests {
             MissionStatus::Active,
             MissionStatus::Finalized,
             MissionStatus::Aborted,
-            MissionStatus::Paused,
         ];
         let produced: Vec<&str> = variants.iter().map(|v| mission_status_str(*v)).collect();
         assert_eq!(
@@ -2099,7 +2100,7 @@ mod tests {
     }
 
     /// (#914) A pre-#95 index whose `missions` table predates the
-    /// `started_ts`/`finalized_ts`/`paused_ts` columns. Pre-fix, the
+    /// `started_ts`/`finalized_ts` columns. Pre-fix, the
     /// `CREATE TABLE IF NOT EXISTS` in SCHEMA_SQL skipped the existing table
     /// (so a `populate` INSERT with `started_ts` crashed, or rolled back to
     /// stale data). The self-healing drop+recreate in `init_schema` must
@@ -2371,7 +2372,6 @@ mod tests {
                     "description",
                     "finalized_ts",
                     "id",
-                    "paused_ts",
                     "started_ts",
                     "status",
                 ],

@@ -30,6 +30,12 @@ darkmux release.
   running mission by hand, and pausing one, have no replacement. Routing a
   mission's own steps to another machine comes back as a step-staffing
   feature, not as a verb.
+- **The `paused` mission status and the `mission.pause`, `mission.resume` and
+  `phase.added` flow actions** (#2954). Nothing writes them any more. A
+  `mission.json` that says `"status": "paused"` still loads and reads as
+  `active` (a leftover `paused_ts` is ignored), and the three actions read
+  from an archive as retired. **Migration:** none; the mission board and
+  `run list` no longer show a `paused` group.
 - **The fleet page's orchestrator note** (#2983): the "Orchestrator note:"
   line under the token panel, its `history →` list, and the stock sentence
   it showed when no note existed. The panel is one line shorter; nothing

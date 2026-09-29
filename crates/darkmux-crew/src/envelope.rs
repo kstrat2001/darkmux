@@ -815,7 +815,7 @@ mod tests {
             FinalizeRefusal::Drift
         );
         assert_eq!(
-            classify_mission_close_refusal(Some(MissionStatus::Paused)),
+            classify_mission_close_refusal(Some(MissionStatus::Aborted)),
             FinalizeRefusal::Drift
         );
         // Unknown status (mission unreadable) is loud.
@@ -857,7 +857,6 @@ mod tests {
             created_ts: 1_700_000_000,
             started_ts: Some(1_700_000_000),
             finalized_ts: None,
-            paused_ts: None,
             source_input: None,
             ticket: None,
             spec: None,

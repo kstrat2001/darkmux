@@ -48,7 +48,10 @@ fn every_archived_spelling_but_the_one_unknown_reads_as_a_known_action() {
         }
         retired += usize::from(matches!(action, FlowAction::Retired(_)));
     }
-    assert_eq!(retired, 3, "telemetry.process, funnel.step and crawl.finding read as retired");
+    assert_eq!(
+        retired, 6,
+        "telemetry.process, funnel.step, crawl.finding, phase added, mission pause and mission resume read as retired"
+    );
     assert_eq!(unknown.total(), 1);
     assert_eq!(unknown.by_name().get("future.thing"), Some(&1));
 }

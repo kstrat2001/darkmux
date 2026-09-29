@@ -349,7 +349,6 @@ fn build_graph(opts: &DispatchOpts, mission_id: &str) -> (Mission, Phase, Task, 
         created_ts: now,
         started_ts: None,
         finalized_ts: None,
-        paused_ts: None,
         source_input: None,
         ticket: None,
         spec: Some(MissionSpec {

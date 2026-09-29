@@ -2513,7 +2513,6 @@ fn mission_status_label(s: crew::types::MissionStatus) -> &'static str {
         Active => "active",
         Finalized => "finalized",
         Aborted => "aborted",
-        Paused => "paused",
     }
 }
 

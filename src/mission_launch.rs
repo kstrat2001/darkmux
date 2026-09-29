@@ -2717,7 +2717,6 @@ pub(crate) fn ensure_mission_and_phases_with_provenance_and_start_payload(
         created_ts: now,
         started_ts: None,
         finalized_ts: None,
-        paused_ts: None,
         // (must-fix 2) The config's `source_input` (the operator's verbatim
         // words, #815) and `ticket` (#816) ride onto the mission record.
         source_input: config.source_input.clone(),
@@ -6909,7 +6908,6 @@ mod tests {
             created_ts: now,
             started_ts: Some(now),
             finalized_ts: None,
-            paused_ts: None,
             source_input: None,
             ticket: None,
             spec: None,
@@ -8039,7 +8037,6 @@ mod tests {
             created_ts: now,
             started_ts: Some(now),
             finalized_ts: None,
-            paused_ts: None,
             source_input: None,
             ticket: None,
             spec: None,

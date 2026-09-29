@@ -44,11 +44,7 @@
 //!   |-------------|-------------------|----------------------|
 //!   | `Active`    | error if          | → Finalized ✓        |
 //!   |             | started_ts set    |                      |
-//!   | `Paused` ¹  | error: Paused     | → Finalized ✓        |
 //!   | `Finalized` | error: terminal   | error: already       |
-//!
-//! ¹ No verb enters `Paused` since #2954; the state stays readable so a
-//!   mission paused on disk by an older binary still loads and closes.
 //!
 //! `Finalized` has no transition back to `Active` today — `mission_reopen`
 //! (#1372) once provided one for `mission_launch`'s implicit relaunch-by-
@@ -907,7 +903,7 @@ fn phase_start_impl(id: &str, refuse_terminal_mission: bool) -> Result<Phase> {
                     phase.mission_id,
                     mission.status
                 ),
-                MissionStatus::Active | MissionStatus::Paused => {}
+                MissionStatus::Active => {}
             }
         }
     }
@@ -995,7 +991,6 @@ pub fn mission_start_with_reasoning_and_payload(
         MissionStatus::Active if mission.started_ts.is_some() => {
             bail!("mission `{id}` is already Active and was started at ts={:?}", mission.started_ts)
         }
-        MissionStatus::Paused => bail!("mission `{id}` is Paused (a state no verb enters any more) and cannot be started"),
         MissionStatus::Finalized | MissionStatus::Aborted => {
             bail!("mission `{id}` is terminal ({:?}) — create a new mission instead", mission.status)
         }
@@ -1058,7 +1053,7 @@ pub fn mission_terminal_with_reasoning_and_payload(
     );
     let mut mission = load_mission(id)?;
     match mission.status {
-        MissionStatus::Active | MissionStatus::Paused => {}
+        MissionStatus::Active => {}
         MissionStatus::Finalized => bail!("mission `{id}` is already Finalized"),
         MissionStatus::Aborted => bail!("mission `{id}` is already Aborted"),
     }
@@ -1142,7 +1137,6 @@ mod tests {
             created_ts: 1_700_000_000,
             started_ts: None,
             finalized_ts: None,
-            paused_ts: None,
             source_input: None,
             ticket: None,
             spec: None,
@@ -1254,19 +1248,6 @@ mod tests {
         assert_eq!(updated.status, PhaseStatus::Running);
     }
 
-    /// Same inverted case, Paused mission — the guard's other non-terminal
-    /// arm.
-    #[serial_test::serial]
-    #[test]
-    fn phase_start_succeeds_when_mission_paused() {
-        let _g = CrewGuard::new();
-        seed_mission("test-mission", MissionStatus::Paused);
-        seed_phase("s1507-pause", PhaseStatus::Abandoned);
-
-        let updated = phase_start("s1507-pause").unwrap();
-        assert_eq!(updated.status, PhaseStatus::Running);
-    }
-
     #[serial_test::serial]
     #[test]
     fn phase_complete_from_running_sets_complete_and_completed_ts() {
@@ -1346,15 +1327,6 @@ mod tests {
         // Second start should error (already started — started_ts is set).
         let err = mission_start_with_reasoning("m2", None).unwrap_err();
         assert!(err.to_string().contains("already Active"));
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn mission_start_from_paused_errors() {
-        let _g = CrewGuard::new();
-        seed_mission("m3", MissionStatus::Paused);
-        let err = mission_start_with_reasoning("m3", None).unwrap_err();
-        assert!(err.to_string().contains("is Paused"), "{err}");
     }
 
     #[serial_test::serial]
