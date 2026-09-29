@@ -366,7 +366,9 @@ mod tests {
 
     /// (#2954) v8 dropped `phase_id`: a job still carrying one is a field
     /// the receiver does not know, refused whole, and the wire version says
-    /// so. The same job without it parses.
+    /// so: a v7 submission carrying one gets the version remedy through
+    /// `WorkSubmission::parse`, never a field error. The same job without
+    /// it parses.
     #[test]
     fn a_job_carrying_a_phase_id_is_refused_at_v8() {
         assert_eq!(WORK_JOB_SCHEMA_VERSION, "8");
@@ -376,6 +378,15 @@ mod tests {
         v["phase_id"] = serde_json::json!("phase-1");
         let err = serde_json::from_value::<WorkJob>(v).unwrap_err().to_string();
         assert!(err.contains("phase_id"), "{err}");
+
+        // What a v7 sender actually posts: a submission whose job has one.
+        let mut sub = serde_json::to_value(crate::WorkSubmission::new(make_valid_job(), true)).unwrap();
+        sub["schema"] = "7".into();
+        sub["job"]["phase_id"] = serde_json::json!("phase-1");
+        assert_eq!(
+            crate::WorkSubmission::parse(&serde_json::to_vec(&sub).unwrap()).unwrap_err(),
+            crate::Refusal::SchemaMismatch { got: "7".into() }
+        );
     }
 
     /// (#2916) A session id is a join key and part of file names on the
