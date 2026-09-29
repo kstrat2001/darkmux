@@ -380,6 +380,10 @@ export interface StepMetrics {
    * stand-in for legacy's out-of-React `STEP_LAST_RX` wall-clock ref; see
    * this module's own doc for why. */
   lastTs: number;
+  /** Whether the step's own `step.start` bookend has been seen. Such a step
+   *  ends only on its `step.complete`/`step.error`: a dispatch terminal is
+   *  one execution's end (a map step holds one per item), not the step's. */
+  stepBookended?: boolean;
 }
 
 const EMPTY_METRICS: StepMetrics = {
@@ -513,7 +517,9 @@ export function applyRecordToMetrics(metrics: MetricsMap, rec: NormRecord, idx: 
   const isComplete = action === ACTION.DispatchComplete;
   const isStepResult = action === ACTION.StepResult;
   const isStart = action === ACTION.DispatchStart || action === ACTION.StepStart;
-  const isTerminal = action === ACTION.StepComplete || action === ACTION.StepError || isDispatchTerminal(action);
+  const stepBookended = cur.stepBookended || action === ACTION.StepStart;
+  if (stepBookended) next.stepBookended = true;
+  const isTerminal = action === ACTION.StepComplete || action === ACTION.StepError || (!stepBookended && isDispatchTerminal(action));
 
   if (isStart && recMs) next.startTs = next.startTs ? Math.min(next.startTs, recMs) : recMs;
   // A terminal with no usable time still ends the step, at the latest time
@@ -546,6 +552,7 @@ export function applyRecordToMetrics(metrics: MetricsMap, rec: NormRecord, idx: 
     next.usageSeen === cur.usageSeen &&
     next.startTs === cur.startTs &&
     next.endTs === cur.endTs &&
+    next.stepBookended === cur.stepBookended &&
     next.lastTs === cur.lastTs
   ) {
     return metrics;

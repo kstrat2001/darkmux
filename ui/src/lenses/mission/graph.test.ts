@@ -507,6 +507,19 @@ describe("applyRecordToMetrics", () => {
     expect(m["a-step"].endTs).toBe(Date.parse("2026-08-19T00:00:09Z"));
   });
 
+  // A map step holds one execution per item; item 1 finishing is not the
+  // step finishing. Only the step's own bookend ends a step that has one.
+  it("a bookended step is still running after its first item's dispatch terminal", () => {
+    let m: MetricsMap = {};
+    const at = (s: number) => `2026-08-19T00:00:0${s}Z`;
+    m = applyRecordToMetrics(m, rec({ handle: "a-step", action: "step.start", ts: at(0) }), idx, "m1");
+    for (const i of [1, 2, 3]) m = applyRecordToMetrics(m, rec({ handle: "a-step", action: "dispatch.start", ts: at(i) }), idx, "m1");
+    m = applyRecordToMetrics(m, rec({ handle: "a-step", action: "dispatch.complete", ts: at(4) }), idx, "m1");
+    expect(m["a-step"].endTs).toBe(0);
+    m = applyRecordToMetrics(m, rec({ handle: "a-step", action: "step.complete", ts: at(9) }), idx, "m1");
+    expect(m["a-step"].endTs).toBe(Date.parse(at(9)));
+  });
+
   it("returns the SAME map reference when a record changes nothing", () => {
     let m: MetricsMap = {};
     m = applyRecordToMetrics(m, rec({ handle: "a-step", action: "dispatch.start" }), idx, "m1");
