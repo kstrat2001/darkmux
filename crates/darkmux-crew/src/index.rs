@@ -87,16 +87,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Bumped 5 -> 6 for the Sprint -> Phase rename: the `cautions` table's
 /// `sprint_id` column is now `phase_id`. A stale on-disk index still
 /// carrying the old column name is harmless — it's just detected as
-/// stale by this bump and rebuilt from the JSON source-of-truth (which
-/// itself is read-compat via serde aliases, see `Mission::phase_ids`).
+/// stale by this bump and rebuilt from the JSON source-of-truth.
 ///
 /// Bumped 6 -> 7 for the Closed -> Finalized rename (#1463 lineage): the
 /// `missions` table's `closed_ts` column is now `finalized_ts`, and the
 /// `status` CHECK constraint's `'closed'` literal is now `'finalized'`.
 /// Same self-heal story as the prior bump — a stale on-disk index is
 /// harmless, detected as stale by this bump, and rebuilt from the JSON
-/// source-of-truth (itself read-compat via `MissionStatus`'s `alias =
-/// "closed"` / `Mission::finalized_ts`'s `alias = "closed_ts"`).
+/// source-of-truth.
 ///
 /// Bumped 7 -> 8 (#2142): the `missions.status` CHECK constraint never
 /// widened to include `'aborted'` when `MissionStatus::Aborted` was added

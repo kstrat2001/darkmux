@@ -950,6 +950,30 @@ fn retired_mission_verbs_are_refused_naming_the_replacement() {
     }
 }
 
+/// (4.0) The retired flag spellings exit 2 through the real binary, naming the
+/// replacement; the replacement itself is never refused.
+#[test]
+fn retired_flag_spellings_are_refused_at_entry_naming_the_replacement() {
+    let cases: &[(&[&str], &str, &str)] = &[
+        (&["dispatch", "coder", "hello", "--session-id", "x"], "darkmux dispatch --session-id", "--name"),
+        (&["flow", "note", "--text", "t", "--session-id", "s"], "darkmux flow note --session-id", "--execution"),
+        (&["flow", "tail", "--session", "s"], "darkmux flow tail --session", "--execution"),
+        (&["memory", "correction", "list", "--session", "s"], "darkmux memory correction list --session", "--execution"),
+        (&["lab", "eval", "--freeform"], "darkmux lab eval --freeform", "--mode freeform"),
+        (&["lab", "run", "quick-q", "--runs", "2"], "darkmux lab run --runs", "--repeat"),
+        (&["lab", "tune", "quick-q", "--runs", "2"], "darkmux lab tune --runs", "--repeat"),
+        (&["mission", "status", "--missions"], "darkmux mission status --missions", "--named"),
+    ];
+    for (args, named, replacement) in cases {
+        darkmux_cmd()
+            .args(*args)
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains(format!("`{named}` was removed in 4.0")))
+            .stderr(predicate::str::contains(*replacement));
+    }
+}
+
 /// (#2954) The `--phase-id=<id>` spelling is the same retired flag.
 #[test]
 fn retired_dispatch_phase_id_equals_spelling_is_refused() {

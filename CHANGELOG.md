@@ -16,6 +16,29 @@ darkmux release.
 
 ### Removed (breaking, 4.0)
 
+- **Flag spellings that named the internal noun "session", or a misleading
+  grain, are renamed** (A10 to A13). No aliases: each retired spelling exits 2
+  naming its replacement, and each flag does exactly what it did.
+  **Migration:** `dispatch --session-id` is `--name`;
+  `flow note|catch|record|tier-decision --session-id`, `flow tail --session`
+  and `memory correction list --session` are `--execution` (the role execution
+  id `darkmux dispatch` prints, now labeled "execution id");
+  `lab eval --freeform|--agentic|--dialectic` is `--mode
+  freeform|agentic|dialectic` (one choice, `strict` by default; the dialectic
+  per-seat profile flags are refused under any other mode);
+  `lab run --runs` and `lab tune --runs` are `--repeat` (`-n` is unchanged);
+  `mission status --missions` is `--named`. The viewer's "try it yourself"
+  `lab eval` line prints the new spelling.
+- **Mission state files are read in one spelling** (A18). A `mission.json`
+  using `sprint_ids`, `closed_ts` or status `closed`, a task file using
+  `sprint_id`, and a `sprints/` directory (the old name of `phases/`) are
+  refused, naming the fix, instead of loading as if the field were absent.
+  `darkmux doctor` fails each one in its "mission state files" row (which also
+  reports the flat pre-#148 files). Flow archives still read a record's
+  `sprint_id`. **Migration:** rename the key (`sprint_ids` to `phase_ids`,
+  `closed_ts` to `finalized_ts`, `"closed"` to `"finalized"`, a task's
+  `sprint_id` to `phase_id`) or rename `sprints/` to `phases/`.
+
 - **`darkmux mission dispatch` and the hand-built mission verbs** (#2954).
   Missions now come only from mission configs. Removed with no alias:
   `mission dispatch`, `mission add-phase`, `mission start`,

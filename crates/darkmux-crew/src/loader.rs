@@ -4,6 +4,7 @@
 
 #![allow(dead_code)]
 
+use crate::retired_state::{self, parse_state, StateKind};
 use crate::types::*;
 use darkmux_types::paths::{resolve, ResolveScope};
 use anyhow::{Context, Result};
@@ -632,9 +633,9 @@ pub fn load_missions() -> Result<Vec<Mission>> {
         }
         let text = fs::read_to_string(&mission_file)
             .with_context(|| format!("reading {}", mission_file.display()))?;
-        match serde_json::from_str::<Mission>(&text) {
+        match parse_state::<Mission>(StateKind::Mission, &mission_file, &text) {
             Ok(m) => { map.insert(m.id.clone(), m); }
-            Err(e) => eprintln!("warning: failed to parse mission at {}: {e}", mission_file.display()),
+            Err(e) => eprintln!("warning: failed to read mission: {e:#}"),
         }
     }
 
@@ -678,6 +679,9 @@ pub fn load_phases() -> Result<Vec<Phase>> {
             Some(s) => s.to_string(),
             None => continue,
         };
+        if let Some(retired) = retired_state::retired_phases_dir(&path) {
+            eprintln!("warning: {}: {}", retired.path.display(), retired.fix);
+        }
         let phases_dir = lifecycle::phases_dir(&mission_id);
         if !phases_dir.is_dir() {
             continue;
@@ -695,9 +699,9 @@ pub fn load_phases() -> Result<Vec<Phase>> {
             }
             let text = fs::read_to_string(&phase_path)
                 .with_context(|| format!("reading {}", phase_path.display()))?;
-            match serde_json::from_str::<Phase>(&text) {
+            match parse_state::<Phase>(StateKind::Phase, &phase_path, &text) {
                 Ok(s) => { map.insert((s.mission_id.clone(), s.id.clone()), s); }
-                Err(e) => eprintln!("warning: failed to parse phase at {}: {e}", phase_path.display()),
+                Err(e) => eprintln!("warning: failed to read phase: {e:#}"),
             }
         }
     }

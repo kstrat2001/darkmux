@@ -247,14 +247,9 @@ pub enum MissionStatus {
     #[default]
     #[serde(alias = "paused")]
     Active,
-    /// Terminal (SUCCESS path). Renamed from `Closed` for 2.0 terminology
-    /// consistency with the `mission finalize` verb (#1463 renamed the
-    /// lifecycle VERB; this rename catches the STATUS up to it). Pre-2.0
-    /// mission.json on disk carries `"status":"closed"` — `alias` accepts
-    /// it on read; every subsequent write emits the canonical
-    /// `"finalized"`, so a mission self-migrates the next time it's
-    /// touched (same pattern as `phase_ids`'s `sprint_ids` alias above).
-    #[serde(alias = "closed")]
+    /// Terminal (SUCCESS path). Named for the `mission finalize` verb. A
+    /// `mission.json` still saying `"status":"closed"` is refused by
+    /// [`crate::retired_state`], never read as this.
     Finalized,
     /// Terminal (FAILURE path). A mission the operator tore down with
     /// `mission abort`, or one reconciled after its process died.
@@ -279,12 +274,10 @@ pub struct Mission {
     pub description: String,
     #[serde(default)]
     pub status: MissionStatus,
-    /// Sprint→Phase rename read-compat: pre-rename mission JSON on disk
-    /// carries this list under the old key `sprint_ids`. `alias` lets
-    /// serde accept either wire name on read; every subsequent
-    /// `save_json` write emits the canonical `phase_ids` key, so a
-    /// mission self-migrates its field name the next time it's touched.
-    #[serde(default, alias = "sprint_ids")]
+    /// The mission's phases. A `mission.json` still using the pre-rename key
+    /// `sprint_ids` is refused by [`crate::retired_state`], never read as an
+    /// empty list.
+    #[serde(default)]
     pub phase_ids: Vec<String>,
     pub created_ts: u64,
     /// When the mission first transitioned to `Active`. None until
@@ -293,15 +286,9 @@ pub struct Mission {
     pub started_ts: Option<u64>,
     /// When the mission transitioned to `Finalized`. Finalized is
     /// terminal — once set, lifecycle verbs can't move the mission
-    /// elsewhere. Field renamed from `closed_ts` (#1463 terminology
-    /// consistency); `alias` accepts the pre-rename wire name on read,
-    /// every subsequent write emits `finalized_ts`.
-    #[serde(
-        default,
-        rename = "finalized_ts",
-        alias = "closed_ts",
-        skip_serializing_if = "Option::is_none"
-    )]
+    /// elsewhere. A `mission.json` still using the old key `closed_ts` is
+    /// refused by [`crate::retired_state`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finalized_ts: Option<u64>,
     /// (#815) The operator's VERBATIM intent (a config's `source_input` key) — the
     /// unabridged prose that was summarized into the
@@ -751,12 +738,8 @@ pub fn default_run_on() -> Vec<String> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
     pub id: String,
-    /// Sprint→Phase rename read-compat: accepts the pre-rename wire key
-    /// `sprint_id` as well as the canonical `phase_id` (see `Mission::phase_ids`'s
-    /// alias for the same rationale). Task/Step storage postdates the rename
-    /// by only a few days (#1230 Packet 2), so this is defensive more than
-    /// load-bearing, but costs nothing to keep consistent.
-    #[serde(alias = "sprint_id")]
+    /// The phase this task belongs to. A task file still using the pre-rename
+    /// key `sprint_id` is refused by [`crate::retired_state`].
     pub phase_id: String,
     pub description: String,
     /// (#1398) Operator-facing short label — same overload split as
@@ -1137,26 +1120,6 @@ mod tests {
                 Capability::AgenticToolUse,
             ],
         );
-    }
-
-    /// Closed→Finalized terminology rename (#1463 lineage): a mission.json
-    /// written by a pre-rename binary carries `"status":"closed"` and
-    /// `"closed_ts"`. Lenient-read must accept both — a mission finalized
-    /// yesterday can't stop deserializing the day this ships. Mirrors the
-    /// `sprint_ids` alias precedent for `phase_ids` above.
-    #[test]
-    fn mission_status_old_shape_closed_deserializes_to_finalized() {
-        let legacy_json = r#"{
-            "id": "m-old",
-            "description": "pre-rename mission",
-            "status": "closed",
-            "phase_ids": [],
-            "created_ts": 1700000000,
-            "closed_ts": 1700000900
-        }"#;
-        let m: Mission = serde_json::from_str(legacy_json).unwrap();
-        assert_eq!(m.status, MissionStatus::Finalized);
-        assert_eq!(m.finalized_ts, Some(1700000900));
     }
 
     /// (#1503) A pre-#1503 mission.json — id derived from an input hash,
