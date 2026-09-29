@@ -3,13 +3,13 @@ import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../lib/queryKeys";
 import { degradedFleetSource, type DegradedFleetSource } from "../lib/fleetCoverage";
-import type { FleetSessionsLiveResponse } from "../types/handwritten";
+import type { FleetDispatchesLiveResponse } from "../types/generated/FleetDispatchesLiveResponse";
 
 /** `useLiveSessionIds`'s return shape — the live session set PLUS whether the
  * read that produced it could actually see the fleet.
  *
  * (#2725) `coverage` is the half this hook used to THROW AWAY.
- * `/fleet/sessions/live` carries the same `meta.sources.fleet` report
+ * `/fleet/dispatches/live` carries the same `meta.sources.fleet` report
  * `/fleet/machines/live` does (`fleet_sessions_live_handler` and
  * `fleet_machines_live_handler` both call `source_state::coverage_meta`), and
  * this hook read the `sessions` array and dropped the rest — so every
@@ -49,7 +49,7 @@ export function useLiveSessionIds(enabled = true): LiveSessionsResult {
   const query = useQuery({
     enabled,
     queryKey: queryKeys.fleetSessionsLive(),
-    queryFn: () => fetchJson<FleetSessionsLiveResponse>("/fleet/sessions/live"),
+    queryFn: () => fetchJson<FleetDispatchesLiveResponse>("/fleet/dispatches/live"),
     refetchInterval: PRESENCE_POLL_MS,
   });
 
@@ -57,7 +57,7 @@ export function useLiveSessionIds(enabled = true): LiveSessionsResult {
     const set = new Set<string>();
     const missions = new Set<string>();
     if (query.data?.ok) {
-      for (const beat of query.data.data.sessions ?? []) {
+      for (const beat of query.data.data.dispatches ?? []) {
         if (beat?.session_id) set.add(beat.session_id);
         if (beat?.mission_id) missions.add(beat.mission_id);
       }

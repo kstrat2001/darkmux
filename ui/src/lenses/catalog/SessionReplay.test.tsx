@@ -445,7 +445,7 @@ describe("SessionReplay", () => {
         payload: { event: "load", model: "qwen3.6-35b-a3b-turboquant-mlx", gb: 20 },
       },
     ];
-    // Host samples as the daemon really serves them: `/flow-session` attaches
+    // Host samples as the daemon really serves them: `/flow-dispatch` attaches
     // the run window's `machine.telemetry` (no session_id, no mission_id);
     // `/flow-mission` does not. Replacing the session's records with the
     // mission's dropped these and blanked the SYSTEM host tiles.
@@ -458,14 +458,14 @@ describe("SessionReplay", () => {
       payload: { cpu_pct: 30 + i * 20, mem_pct: 70, gpu_pct: 50 },
     }));
     const fetchMock = vi.fn((url: string) => {
-      if (url.startsWith("/fleet/sessions/live")) {
-        return Promise.resolve(new Response(JSON.stringify({ sessions: [], meta: {} }), { status: 200 }));
+      if (url.startsWith("/fleet/dispatches/live")) {
+        return Promise.resolve(new Response(JSON.stringify({ dispatches: [], meta: {} }), { status: 200 }));
       }
       const own = [...allRecords.filter((r) => r.session_id === missionId), ...hostSamples];
       const body = url.startsWith("/flow-mission/")
         ? { records: allRecords, count: allRecords.length, truncated: false, generated_at_ms: 0 }
         : {
-            // `/flow-session/<id>` — the run's OWN records plus the run
+            // `/flow-dispatch/<id>` — the run's OWN records plus the run
             // window's host samples, matching the real daemon.
             records: own,
             count: own.length,
@@ -852,20 +852,20 @@ describe("SessionReplay", () => {
     const calls: string[] = [];
     const fetchMock = vi.fn((url: string) => {
       calls.push(url);
-      const body = url.startsWith("/fleet/sessions/live")
+      const body = url.startsWith("/fleet/dispatches/live")
         ? // The hook reads presence BEATS and pulls `session_id` off each —
           // a bare id list parses to an empty set and the page never polls.
-          { sessions: [{ session_id: "s-live" }], meta: {} }
+          { dispatches: [{ session_id: "s-live" }], meta: {} }
         : { records: [], count: 0, truncated: false, generated_at_ms: 0 };
       return Promise.resolve(new Response(JSON.stringify(body), { status: 200 }));
     });
     vi.stubGlobal("fetch", fetchMock);
     renderReplay("s-live");
-    await waitFor(() => expect(calls.some((u) => u.includes("/flow-session/"))).toBe(true));
-    const firstRound = calls.filter((u) => u.includes("/flow-session/")).length;
+    await waitFor(() => expect(calls.some((u) => u.includes("/flow-dispatch/"))).toBe(true));
+    const firstRound = calls.filter((u) => u.includes("/flow-dispatch/")).length;
     // The refetch interval is real time; give it one cycle plus slack.
     await waitFor(
-      () => expect(calls.filter((u) => u.includes("/flow-session/")).length).toBeGreaterThan(firstRound),
+      () => expect(calls.filter((u) => u.includes("/flow-dispatch/")).length).toBeGreaterThan(firstRound),
       { timeout: 9000 },
     );
   }, 12_000);
@@ -893,7 +893,7 @@ describe("SessionReplay", () => {
   });
 
   it("renders the real run view — header, brief, metrics, signals — against the recorded corpus fixture", async () => {
-    const raw: unknown = JSON.parse(readFileSync(path.join(REPO_ROOT, "tests/parity/corpus/flow-session-task-list.json"), "utf8"));
+    const raw: unknown = JSON.parse(readFileSync(path.join(REPO_ROOT, "tests/parity/corpus/flow-dispatch-task-list.json"), "utf8"));
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify(raw), { status: 200 }))));
     renderReplay("task-list");
     // The chip is the one element that says the running word; other text may too.
@@ -1028,19 +1028,19 @@ describe("SessionReplay", () => {
     );
     vi.stubGlobal("fetch", fetchMock);
     renderReplay("a/b c");
-    // (#1972) Order-independent: the page also queries `/fleet/sessions/live`
+    // (#1972) Order-independent: the page also queries `/fleet/dispatches/live`
     // to decide whether to POLL, and that request can land first. Asserting
     // `calls[0]` pinned an incidental ordering rather than the behaviour.
     await waitFor(() =>
-      expect(fetchMock.mock.calls.map((c) => c[0])).toContain("/flow-session/a%2Fb%20c"),
+      expect(fetchMock.mock.calls.map((c) => c[0])).toContain("/flow-dispatch/a%2Fb%20c"),
     );
   });
 });
 
 /**
  * (#2065) On a daemon-less static build (darkmux.com/demo) there is no
- * `/flow-session/<id>` — every dispatch-row tap rendered "couldn't reach
- * /flow-session/… (HTTP 404)". The replay reads the committed flow file
+ * `/flow-dispatch/<id>` — every dispatch-row tap rendered "couldn't reach
+ * /flow-dispatch/… (HTTP 404)". The replay reads the committed flow file
  * (`darkmux-flow-src`) and slices this session out of it instead.
  */
 describe("SessionReplay — static build (#2065)", () => {
@@ -1048,7 +1048,7 @@ describe("SessionReplay — static build (#2065)", () => {
     document.head.querySelectorAll('meta[name^="darkmux-"]').forEach((m) => m.remove());
   });
 
-  it("replays the session from the flow-src file and never asks for /flow-session", async () => {
+  it("replays the session from the flow-src file and never asks for /flow-dispatch", async () => {
     const meta = document.createElement("meta");
     meta.name = "darkmux-flow-src";
     meta.content = "./demo-flow.jsonl";
@@ -1079,7 +1079,7 @@ describe("SessionReplay — static build (#2065)", () => {
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     expect(document.body.textContent).toContain("the static brief");
     expect(document.body.textContent).not.toContain("somebody else's brief");
-    expect(seen.filter((u) => u.startsWith("/flow-session/"))).toEqual([]);
+    expect(seen.filter((u) => u.startsWith("/flow-dispatch/"))).toEqual([]);
   });
 });
 
@@ -1146,7 +1146,7 @@ describe("SessionReplay — dispatch-focus playhead never precedes the run's own
   });
 });
 
-// (#2862) The session page drew a bare "loading…" line while `/flow-session`
+// (#2862) The session page drew a bare "loading…" line while `/flow-dispatch`
 // was in flight, even though the session id is already known from the URL.
 // The fix draws the real header (with the known id), the info card's labels
 // (route, runtime, model, workspace, timing), and the MODEL/SYSTEM tile

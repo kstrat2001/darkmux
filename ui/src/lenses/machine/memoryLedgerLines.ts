@@ -37,7 +37,9 @@
 import { isUnnamedMachineLabel } from "../../lib/flow";
 import { memBytes } from "../../lib/format";
 import { MACHINE_MEM_POLL_MS } from "../../lib/queryKeys";
-import type { MachineResources, MachineResourcesModel, MachineSpecs } from "../../types/handwritten";
+import type { MachineResourcesResponse } from "../../types/generated/MachineResourcesResponse";
+import type { ModelRow } from "../../types/generated/ModelRow";
+import type { MachineSpecsResponse } from "../../types/generated/MachineSpecsResponse";
 import { maxOf } from "../../lib/numbers";
 
 /** (#1854, altitude 1 — the row it is about) The `↳` hint under a resident
@@ -56,7 +58,7 @@ import { maxOf } from "../../lib/numbers";
  * and not a severity. Spending the state channel on it would mint a second
  * meaning for color (the same argument that rejected forcing the machine
  * verdict to UNKNOWN — see #1854). */
-export function overPriceHint(m: Pick<MachineResourcesModel, "over_price_bytes" | "current_bytes">): string | null {
+export function overPriceHint(m: Pick<ModelRow, "over_price_bytes" | "current_bytes">): string | null {
   const over = m.over_price_bytes;
   if (over == null || !(Number(over) > 0)) return null;
   return `holds ${memBytes(over)} more than priced — the fit projection counts the measured ${memBytes(m.current_bytes)}`;
@@ -113,7 +115,7 @@ export function estimatedSummaryLine(estimatedCount: number): string | null {
  * specs-confirmed local machine reports a utility tier, so a remote or
  * unresolved machine yields `null` and badges nothing — never a fabricated
  * marker for a machine this daemon cannot see. */
-export function utilityModelId(specs: MachineSpecs | null, isLocalSpecs: boolean): string | null {
+export function utilityModelId(specs: MachineSpecsResponse | null, isLocalSpecs: boolean): string | null {
   if (!isLocalSpecs) return null;
   return specs?.utility_model?.id ?? null;
 }
@@ -132,14 +134,14 @@ export function limitDescription(limitSource: string | null | undefined): string
 }
 
 /** `memStampText()` — viewer.html:4879. */
-export function stampLine(b: MachineResources): string {
+export function stampLine(b: MachineResourcesResponse): string {
   const gather = b.gather_ms != null ? String(b.gather_ms) : "—";
   const cache = b.cache_ttl_ms != null ? String(b.cache_ttl_ms) : "—";
   return `gather ${gather} ms (zero model dispatches) · server cache ${cache} ms · polled every ${MACHINE_MEM_POLL_MS / 1000}s`;
 }
 
 /** The attribution footer line — viewer.html:1930. */
-export function attributionLine(b: MachineResources): string {
+export function attributionLine(b: MachineResourcesResponse): string {
   return `attribution: ${b.attribution_note || b.attribution || "—"}`;
 }
 
@@ -149,7 +151,7 @@ export function attributionLine(b: MachineResources): string {
  * Re-exported from `machineGauge.ts` for that module's own consumers — see
  * this file's own module doc for why it survived Stage 2/3 unchanged while
  * `machineTotalText`/`modelLines`/`pressureText`/`machineScale` did not. */
-export function perModelScale(models: MachineResourcesModel[]): number {
+export function perModelScale(models: ModelRow[]): number {
   return Math.max(1, maxOf(models.map((mm) => Math.max(Number(mm.potential_bytes) || 0, Number(mm.current_bytes) || 0))) ?? 0);
 }
 

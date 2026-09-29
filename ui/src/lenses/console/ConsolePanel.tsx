@@ -8,7 +8,7 @@ import { canonicalHash, writeHash } from "../../lib/hashSync";
 import { panelAgeLabel } from "./format";
 import { useIsMobile } from "../../hooks/useIsMobile";
 import { AnsiText } from "./ansi";
-import type { PanelResponse } from "../../types/handwritten";
+import type { PanelResponse } from "../../types/generated/PanelResponse";
 
 /**
  * The console lens — `#lens=console&panel=<id>`. Pure port of
@@ -181,9 +181,17 @@ export function ConsolePanel({
   // `replaceState` (inside `writeHash`) rather than a push, deliberately —
   // clicking through five tabs to find the right one should not put five
   // entries in history for Back to walk out of one at a time.
-  const selectPanel = (next: PanelId) => {
+  //
+  // A panel deep link carries the opts it means (`opt.all=all`), which replace
+  // that panel's selection: the link names one variant, not "whatever was
+  // picked last".
+  const selectPanel = (next: PanelId, linkOpts?: Readonly<Record<string, string>>) => {
+    const opts = linkOpts && Object.keys(linkOpts).length > 0 ? { ...linkOpts } : (selections.get(next) ?? {});
+    if (linkOpts && Object.keys(linkOpts).length > 0) {
+      setSelections((prev) => new Map(prev).set(next, opts));
+    }
     setPanelId(next);
-    writeHash(canonicalHash({ kind: "console", panelId: next, opts: selections.get(next) ?? {} }));
+    writeHash(canonicalHash({ kind: "console", panelId: next, opts }));
   };
 
   return (
@@ -240,7 +248,7 @@ function CliPanelView({
    * "picked the default" and "never touched it" land in the SAME query. */
   opts: Readonly<Record<string, string>>;
   onOptChange: (name: string, value: string) => void;
-  onPanelSwitch: (id: PanelId) => void;
+  onPanelSwitch: (id: PanelId, opts: Readonly<Record<string, string>>) => void;
 }) {
   const manual = isManualPanel(id);
   const wireOpts = Object.fromEntries(canonicalOptPairs(id, opts));
@@ -849,7 +857,7 @@ function PanelBody({
   ansiText: string | null;
   exitCode: number | null;
   stderrTail: string;
-  onPanelSwitch: (id: PanelId) => void;
+  onPanelSwitch: (id: PanelId, opts: Readonly<Record<string, string>>) => void;
 }) {
   const staleClass = stale ? " pc-body-stale" : "";
   if (loading) return <div className="panelout">running…</div>;

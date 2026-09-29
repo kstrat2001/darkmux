@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
-import type { MachineResourcesModel, MachineSpecs } from "../../types/handwritten";
+import type { ModelRow } from "../../types/generated/ModelRow";
+import type { MachineSpecsResponse } from "../../types/generated/MachineSpecsResponse";
 import { utilitySectionView } from "./utilitySectionView";
 import type { NormRecord } from "../../lib/ingest";
 import { norm } from "../../testing/records";
@@ -7,13 +8,13 @@ import { norm } from "../../testing/records";
 const U = "m1";
 const at = (s: number) => new Date(Date.UTC(2026, 8, 27, 9, 0, s)).toISOString();
 const ms = (s: number) => Date.parse(at(s));
-const specs = (over: Partial<MachineSpecs["utility_model"]> | null): MachineSpecs =>
-  ({ machine_id: "studio", machine_uid: U, utility_model: over === null ? null : { id: "darkmux:util-4b", loaded: true, n_ctx: 120000, ...over } }) as unknown as MachineSpecs;
+const specs = (over: Partial<MachineSpecsResponse["utility_model"]> | null): MachineSpecsResponse =>
+  ({ machine_id: "studio", machine_uid: U, utility_model: over === null ? null : { id: "darkmux:util-4b", loaded: true, n_ctx: 120000, ...over } }) as unknown as MachineSpecsResponse;
 const usage = (s: number, job: string | null, tokens: number, extra: Record<string, unknown> = {}) =>
   norm({ ts: at(s), action: "telemetry.tokens", category: "telemetry", source: "tokens", machine_uid: U, payload: { purpose: "utility", call_kind: job === "compaction" ? "compaction" : "single_shot", ...(job ? { job } : {}), total_tokens: tokens, requested_model: "darkmux:util-4b" }, ...extra });
 const start = (s: number, job: string) =>
   norm({ ts: at(s), action: "utility.start", machine_uid: U, payload: { job, model: "darkmux:util-4b", stall_after_seconds: 30 } });
-const row = { current_bytes: 2 ** 30 * 14.61 } as unknown as MachineResourcesModel;
+const row = { current_bytes: 2 ** 30 * 14.61 } as unknown as ModelRow;
 
 describe("(#2915) the machine page's Utility section", () => {
   test("this machine: model, declared window, residency with its footprint, idle", () => {

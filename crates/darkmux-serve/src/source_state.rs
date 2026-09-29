@@ -34,6 +34,7 @@
 //! `detail` is populated ONLY from our own literals, and the full error goes
 //! to stderr where the operator already looks for it.
 
+use crate::wire::{CoverageMeta, CoverageSources};
 use serde::Serialize;
 
 /// How completely one underlying source answered for this response.
@@ -42,6 +43,8 @@ use serde::Serialize;
 /// `state` and find the variant's fields alongside it:
 /// `{"state":"stale","age_ms":41200,"detail":"could not reach Redis"}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum SourceState {
     /// The read succeeded; this response covers the source completely.
@@ -49,7 +52,11 @@ pub enum SourceState {
     /// The read failed and the last-known-good snapshot is being served in
     /// its place. `age_ms` is how long ago that snapshot was taken — the
     /// number a client needs to decide whether to warn or to shrug.
-    Stale { age_ms: u64, detail: &'static str },
+    Stale {
+        #[cfg_attr(test, ts(type = "number"))]
+        age_ms: u64,
+        detail: &'static str,
+    },
     /// The read failed with nothing cached to fall back on. Whatever this
     /// source would have contributed is simply MISSING from the response;
     /// a client must not render the result as a complete picture.
@@ -88,11 +95,8 @@ impl SourceState {
 /// marker never requires enumerating (and re-deriving the meaning of) every
 /// state. It stays correct as sources are added: a response is complete only
 /// when EVERY tracked source is.
-pub(crate) fn coverage_meta(fleet: &SourceState) -> serde_json::Value {
-    serde_json::json!({
-        "sources": { "fleet": fleet },
-        "complete": fleet.is_complete(),
-    })
+pub(crate) fn coverage_meta(fleet: &SourceState) -> CoverageMeta {
+    CoverageMeta { sources: CoverageSources { fleet: fleet.clone() }, complete: fleet.is_complete() }
 }
 
 #[cfg(test)]
@@ -132,7 +136,7 @@ mod tests {
         // grow a fabricated `local: ok` for symmetry's sake. If a future
         // change adds `local`, it must come with real local-failure
         // tracking — and this assertion is where that conversation starts.
-        let meta = coverage_meta(&SourceState::Ok);
+        let meta = serde_json::to_value(coverage_meta(&SourceState::Ok)).unwrap();
         assert_eq!(
             meta,
             serde_json::json!({"sources": {"fleet": {"state": "ok"}}, "complete": true})
@@ -148,14 +152,8 @@ mod tests {
         // The inverted case is the one that matters: `off` must NOT set
         // `complete: false`, or every standalone machine renders a permanent
         // warning for a fleet it was never configured to have.
-        assert_eq!(coverage_meta(&SourceState::Off)["complete"], serde_json::json!(true));
-        assert_eq!(
-            coverage_meta(&SourceState::Unavailable { detail: "x" })["complete"],
-            serde_json::json!(false)
-        );
-        assert_eq!(
-            coverage_meta(&SourceState::Stale { age_ms: 5, detail: "x" })["complete"],
-            serde_json::json!(false)
-        );
+        assert!(coverage_meta(&SourceState::Off).complete);
+        assert!(!coverage_meta(&SourceState::Unavailable { detail: "x" }).complete);
+        assert!(!coverage_meta(&SourceState::Stale { age_ms: 5, detail: "x" }).complete);
     }
 }

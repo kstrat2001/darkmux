@@ -114,14 +114,11 @@ pub enum FlowCmd {
         source: Option<String>,
     },
     /// Print a diagnostic snapshot of the flow substrate (sinks, Redis
-    /// health, disk health, schema state). The store-status pill in
-    /// the shared shell polls this via the daemon's `/flow-status`
-    /// endpoint; the verb is also useful standalone for operators
-    /// debugging substrate problems.
+    /// health, disk health, schema state): useful to operators debugging
+    /// substrate problems.
     Status {
         /// Emit machine-readable JSON instead of the human-formatted
-        /// summary. The daemon's `/flow-status` endpoint also returns
-        /// this shape so the shell pill and the CLI share one format.
+        /// summary.
         #[arg(long)]
         json: bool,
     },

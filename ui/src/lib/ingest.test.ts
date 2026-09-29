@@ -3,7 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import { QueryClient } from "@tanstack/react-query";
-import type { FlowRecord } from "../types/handwritten";
+import type { FlowRecord } from "../types/generated/FlowRecord";
 import {
   ACTION,
   CATEGORY,
@@ -121,7 +121,7 @@ describe("ingest: one test per entry point", () => {
     expect(ingest([...body])).not.toBe(first);
   });
 
-  it("a /flow-session or /flow-mission body: {records}", () => {
+  it("a /flow-dispatch or /flow-mission body: {records}", () => {
     expect(ingest({ records: [raw("dispatch.start", 0)], count: 1, truncated: false })[0].action).toBe(ACTION.DispatchStart);
   });
 
@@ -215,7 +215,15 @@ describe("vocabulary skew is loud", () => {
 
 describe("ingest: raw records cannot reach a lens", () => {
   it("a FlowRecord does not satisfy NormRecord", () => {
-    const wire: FlowRecord = { ts: at(0), action: "dispatch.start" };
+    const wire: FlowRecord = {
+      ts: at(0),
+      level: "info",
+      category: "work",
+      tier: "local",
+      stage: "dispatch",
+      action: "dispatch.start",
+      handle: "h",
+    };
     // @ts-expect-error a raw wire record has not passed through `ingest`
     expect(activityOf(wire)).toBe("dispatch start");
     // @ts-expect-error nor does an array of them
@@ -291,6 +299,7 @@ describe("the bad-timestamp policy", () => {
     const graph: MissionGraph = {
       mission_id: "m1",
       mission_status: "active",
+      legacy: false,
       generated_at_ms: T0 + 1_000,
       edges: [],
       nodes: [{ id: "t", label: "t", kind: "task", status: "running", depth: 0, steps: [{ id: "s", label: "s", kind: "dispatch.internal", status: "running" }] }],

@@ -32,7 +32,7 @@ MACHINE_ROUTES = {"/machine/specs": "specs", "/machine/resources": "resources",
 # no live machines. Same override rationale as /machine/*: fixture only what a
 # probe (or a substrate) would have to answer.
 FLEET_ROUTES = {"/fleet/machines/live": "fleet-machines-live.json",
-                "/fleet/sessions/live": "fleet-sessions-live.json"}
+                "/fleet/dispatches/live": "fleet-dispatches-live.json"}
 
 
 def free_port():

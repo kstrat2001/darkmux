@@ -19,7 +19,7 @@
  * validate-before-port step exists to catch.
  */
 
-import type { PresenceBeat } from "../types/handwritten";
+import type { PresenceBeat } from "../types/generated/PresenceBeat";
 // (#2813) The canonical status axis, generated from the Rust enum. Importing
 // it here is the point: the label below is a total function of it, so the two
 // cannot drift apart again.
@@ -319,7 +319,7 @@ export function machineNames(
  * you are standing on has its own config and its own hardware probe and
  * needs no network, no peer and no history to identify itself.
  *
- * It did not hold, because `MachineSpecs` carried only `machine_id` — a
+ * It did not hold, because `MachineSpecsResponse` carried only `machine_id` — a
  * NAME. With no identity to join on, the answer had to be derived from
  * names: "is the name specs reports one of the names this uid has been
  * OBSERVED under" (`machineNames`). Observations live in the rolling flow
@@ -353,10 +353,10 @@ export function isSelfMachine(
   return !!specs.machine_id && machineNames(data, liveMachines, m).has(specs.machine_id);
 }
 
-/** The identity fields of `MachineSpecs` this module needs — structurally
+/** The identity fields of `MachineSpecsResponse` this module needs — structurally
  * typed rather than importing the whole interface, so `lib/flow.ts` (the
  * identity module every lens depends on) does not take a dependency on the
- * shape of one HTTP endpoint's whole response. Any `MachineSpecs` satisfies
+ * shape of one HTTP endpoint's whole response. Any `MachineSpecsResponse` satisfies
  * it. */
 export interface SelfIdentity {
   machine_id?: string | null;
@@ -605,7 +605,7 @@ function compKey(sessionId: string | undefined, ts: string | undefined): string 
 }
 
 /** `flowToRenderModel()` — viewer.html:3171-3242. Shapes an ingested
- * record array (the `/flow-session/<id>` or `/flow-mission/<id>` "replay this
+ * record array (the `/flow-dispatch/<id>` or `/flow-mission/<id>` "replay this
  * thing" payload — the session drill-in's data source, `lenses/session/
  * sessionRun.ts`) into the shape `runRegions()` reads:
  *

@@ -33,7 +33,7 @@ Only what a probe or a substrate would have to answer is overridden:
 | route | why it cannot come from records |
 |---|---|
 | `/machine/specs`, `/machine/resources`, `/machine/status` | host probes (`vm_stat`, `sysctl`, `lms`). The demo machine is a 256 GB M5 Ultra; the machine you are on is not. |
-| `/fleet/machines/live`, `/fleet/sessions/live` | presence rides Redis, which the demo deliberately does not run. |
+| `/fleet/machines/live`, `/fleet/dispatches/live` | presence rides Redis, which the demo deliberately does not run. |
 | `/panel/doctor`, `/panel/machine-status` | these CLI verbs probe the host. Every OTHER panel (`run list`, `flow status`, `config list`, ...) is passed through and renders from demo data for free. |
 
 `serve.py` also filters one record class out of `/flow/<date>`: the daemon
@@ -47,8 +47,8 @@ the hero.
 `world.json` declares the fleet. Edit it and rebuild; every figure is DERIVED
 from what you declare, so the parts can never disagree with the totals —
 `build.py::ledger_for` computes KV-at-context, potential, current, pool and
-projected totals using the rules documented on `MachineResources` in
-`ui/src/types/handwritten.ts`.
+projected totals using the rules documented on `ModelLedger` in
+`crates/darkmux-profiles/src/model_ledger.rs`.
 
 Three machines, deliberately heterogeneous, because muxing across unlike
 hardware is the product:

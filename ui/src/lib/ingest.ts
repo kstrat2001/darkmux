@@ -32,7 +32,7 @@
  * 3. It sorts after every timed record (`byTime`), in arrival order.
  */
 
-import type { FlowRecord } from "../types/handwritten";
+import type { FlowRecord } from "../types/generated/FlowRecord";
 import type { Category } from "../types/generated/Category";
 import type { ExecutionGrainAction } from "../types/generated/ExecutionGrainAction";
 import type { FlowAction } from "../types/generated/FlowAction";
@@ -82,6 +82,15 @@ declare const normBrand: unique symbol;
 export interface NormRecord extends Omit<FlowRecord, "action" | "level" | "category" | "stage" | "tier" | "_type"> {
   /** `ts` parsed once; `null` when it is missing or does not parse. */
   readonly tMs: number | null;
+  /** `payload`, aliased by the render model for records that only carry the
+   *  one spelling. Added by the viewer; the wire's `FlowRecord` has `payload`. */
+  fields?: Record<string, unknown>;
+  /** A human title for the mission, stamped only by the demo's importer onto
+   *  the committed playback file. No daemon writes it. */
+  mission_title?: string;
+  /** The `owner/repo#pr` a demo review mission reviewed; demo-only, like
+   *  `mission_title`. */
+  mission_reviewed?: string;
   action?: NormAction;
   level?: NormLevel;
   category?: NormCategory;

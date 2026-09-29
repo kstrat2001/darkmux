@@ -9,7 +9,8 @@
  * wired into `machineStatsContent.tsx`'s shared `body`/`HostExtras`; it is
  * consumed only from `MachineLens.tsx`.
  */
-import type { BatteryHealth, BatterySample } from "../types/handwritten";
+import type { BatteryHealthNow } from "../types/generated/BatteryHealthNow";
+import type { BatteryCharge } from "../types/generated/BatteryCharge";
 import { gaugeFillColor } from "../components/Meter";
 
 /** `Nh Mm` from a minute count — the same coarse shape `relAgoFrom` uses
@@ -37,7 +38,7 @@ function fmtHm(totalMinutes: number): string {
  *   show, and an icon can't carry a number. */
 export type BatteryIconKind = "bolt" | "plug" | null;
 
-export function batteryIcon(b: BatterySample): BatteryIconKind {
+export function batteryIcon(b: BatteryCharge): BatteryIconKind {
   if (b.charging) return "bolt";
   if (b.on_ac) return "plug";
   return null;
@@ -50,7 +51,7 @@ export function batteryIcon(b: BatterySample): BatteryIconKind {
  * Never a fabricated "0 min left" — the estimator's absence-never-zero
  * rule already governs `minutes_to_empty` on the wire; this just states
  * what arrives, in words. */
-export function batteryStateText(b: BatterySample): string {
+export function batteryStateText(b: BatteryCharge): string {
   if (b.charging) return "charging";
   if (b.on_ac) return "on AC, not charging";
   const time = b.minutes_to_empty != null ? `, ${fmtHm(b.minutes_to_empty)} left` : "";
@@ -64,7 +65,7 @@ export function batteryStateText(b: BatterySample): string {
  * `batteryIcon`'s glyph, and a discharging reading with no estimate yet
  * has nothing honest to print (never a fabricated "0 min left" placeholder
  * where the OS declined to estimate). */
-export function batteryTimeLeftText(b: BatterySample | null): string | null {
+export function batteryTimeLeftText(b: BatteryCharge | null): string | null {
   if (b === null || b.on_ac || b.minutes_to_empty == null) return null;
   return `${fmtHm(b.minutes_to_empty)} left`;
 }
@@ -77,7 +78,7 @@ export function batteryTimeLeftText(b: BatterySample | null): string | null {
  * shows. `null` sample renders the caller's own absent case — this
  * function is never called for one (`BatteryLensBlock` returns early), but
  * is total anyway rather than partial. */
-export function batteryAriaLabel(sample: BatterySample | null): string {
+export function batteryAriaLabel(sample: BatteryCharge | null): string {
   if (sample === null) return "battery unmeasured";
   const pct = sample.charge_pct == null ? "unmeasured" : `${sample.charge_pct}%`;
   return `battery ${pct}, ${batteryStateText(sample)}`;
@@ -131,7 +132,7 @@ export function batteryRampStops(segments = 12): Array<{ offset: string; color: 
  * tone. Prefers the COMPUTED `condition_word` — derived server-side from
  * `health_condition` (the authoritative `BatteryHealthCondition` signal),
  * with `permanent_failure_status` acting only as a failure override; see
- * `BatteryHealth`'s own doc for the corrected derivation and the
+ * `BatteryHealthNow`'s own doc for the corrected derivation and the
  * measurement backing it (the reference machine's raw `condition` string
  * read "Check Battery" while `health_condition`/`condition_word` and
  * `system_profiler` agreed "Normal"). `warn` fires for ANY non-"Normal"
@@ -139,7 +140,7 @@ export function batteryRampStops(segments = 12): Array<{ offset: string; color: 
  * never just a fixed two-word enum. Falls back to labeling the raw
  * `condition` string PRECISELY (never as "the" condition) only when no
  * computed word is available at all. */
-export function conditionRow(h: BatteryHealth | null): { value: string; warn: boolean } | null {
+export function conditionRow(h: BatteryHealthNow | null): { value: string; warn: boolean } | null {
   if (h === null) return null;
   if (h.condition_word != null) {
     return { value: h.condition_word, warn: h.condition_word !== "Normal" };
@@ -181,7 +182,7 @@ export interface CapacityDisplay {
 
 /** The MAX CHARGE and ORIGINAL CAPACITY rows. `null` when either figure is
  * missing. */
-export function capacityLine(h: BatteryHealth | null): CapacityDisplay | null {
+export function capacityLine(h: BatteryHealthNow | null): CapacityDisplay | null {
   if (h === null) return null;
   const design = h.design_capacity_mah;
   const raw = h.raw_max_capacity_mah;

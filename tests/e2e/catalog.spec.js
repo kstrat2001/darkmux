@@ -123,8 +123,8 @@ test('a long mission id truncates on the phone instead of wrapping the masthead 
   await page.route('**/fleet/machines/live', (r) =>
     r.fulfill({ contentType: 'application/json', body: JSON.stringify({ machines: [], meta: { sources: { fleet: { state: 'ok' } }, complete: true } }) })
   );
-  await page.route('**/fleet/sessions/live', (r) =>
-    r.fulfill({ contentType: 'application/json', body: JSON.stringify({ sessions: [], meta: { sources: { fleet: { state: 'ok' } }, complete: true } }) })
+  await page.route('**/fleet/dispatches/live', (r) =>
+    r.fulfill({ contentType: 'application/json', body: JSON.stringify({ dispatches: [], meta: { sources: { fleet: { state: 'ok' } }, complete: true } }) })
   );
 
   await page.goto('/index-live.html');
@@ -222,8 +222,8 @@ test('the masthead pads for the iOS safe-area-inset-top on a phone', async ({ pa
   await page.route('**/fleet/machines/live', (r) =>
     r.fulfill({ contentType: 'application/json', body: JSON.stringify({ machines: [], meta: { sources: { fleet: { state: 'ok' } }, complete: true } }) })
   );
-  await page.route('**/fleet/sessions/live', (r) =>
-    r.fulfill({ contentType: 'application/json', body: JSON.stringify({ sessions: [], meta: { sources: { fleet: { state: 'ok' } }, complete: true } }) })
+  await page.route('**/fleet/dispatches/live', (r) =>
+    r.fulfill({ contentType: 'application/json', body: JSON.stringify({ dispatches: [], meta: { sources: { fleet: { state: 'ok' } }, complete: true } }) })
   );
 
   await page.goto('/index-live.html');
@@ -261,8 +261,8 @@ test('the masthead adds no phantom band on a phone with no safe-area inset', asy
   await page.route('**/fleet/machines/live', (r) =>
     r.fulfill({ contentType: 'application/json', body: JSON.stringify({ machines: [], meta: { sources: { fleet: { state: 'ok' } }, complete: true } }) })
   );
-  await page.route('**/fleet/sessions/live', (r) =>
-    r.fulfill({ contentType: 'application/json', body: JSON.stringify({ sessions: [], meta: { sources: { fleet: { state: 'ok' } }, complete: true } }) })
+  await page.route('**/fleet/dispatches/live', (r) =>
+    r.fulfill({ contentType: 'application/json', body: JSON.stringify({ dispatches: [], meta: { sources: { fleet: { state: 'ok' } }, complete: true } }) })
   );
 
   await page.goto('/index-live.html');
@@ -284,8 +284,8 @@ test('the masthead is unaffected by the safe-area fix on desktop', async ({ page
   await page.route('**/fleet/machines/live', (r) =>
     r.fulfill({ contentType: 'application/json', body: JSON.stringify({ machines: [], meta: { sources: { fleet: { state: 'ok' } }, complete: true } }) })
   );
-  await page.route('**/fleet/sessions/live', (r) =>
-    r.fulfill({ contentType: 'application/json', body: JSON.stringify({ sessions: [], meta: { sources: { fleet: { state: 'ok' } }, complete: true } }) })
+  await page.route('**/fleet/dispatches/live', (r) =>
+    r.fulfill({ contentType: 'application/json', body: JSON.stringify({ dispatches: [], meta: { sources: { fleet: { state: 'ok' } }, complete: true } }) })
   );
 
   await page.goto('/index-live.html');

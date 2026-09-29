@@ -163,10 +163,10 @@ function onActivateKeyDown(onActivate: () => void) {
  *
  * **`records` is whatever `useRouteRecords` says this ROUTE means** — the
  * rolling live 2-day window on live routes, and the FETCHED SLICE on
- * `session` (`/flow-session/<id>`) and `playback` (`/flow/<date>`).
+ * `session` (`/flow-dispatch/<id>`) and `playback` (`/flow/<date>`).
  *
  * (#1800 P1) It used to be the live window on every route — named here as a
- * deliberate deferral, which is honest but meant a `#session=` route listed
+ * deliberate deferral, which is honest but meant a `#dispatch=` route listed
  * unrelated live traffic beside a stage headed "session replay". Legacy never
  * had that: `boot()` re-scopes `RAW` to the fetched slice before rendering.
  * The fix needed no second pipeline, because this column already took

@@ -32,7 +32,9 @@ import {
   liveStateWhileConnected,
 } from "../../lib/tokenRate";
 import type { ExecutionTokenReading, LiveState } from "../../lib/tokenRate";
-import type { MachineSpecs, PresenceBeat, RosterMachineEntry } from "../../types/handwritten";
+import type { MachineSpecsResponse } from "../../types/generated/MachineSpecsResponse";
+import type { PresenceBeat } from "../../types/generated/PresenceBeat";
+import type { RosterMachineEntry } from "../../types/generated/RosterMachineEntry";
 // (#2814) `isSelfMachine`/`displayNameOf` live in `lib/flow.ts` beside
 // `nameOf`/`machineNames`/`localMachineUid` rather than here, because the
 // machine lens and the app shell need the identical self-identity rule and a
@@ -71,7 +73,7 @@ export function machActive(data: NormRecord[], presence: Presence, m: string, t:
 export function specOf(
   data: NormRecord[],
   liveMachines: Map<string, PresenceBeat>,
-  specs: MachineSpecs | null,
+  specs: MachineSpecsResponse | null,
   m: string,
   /** (#2067) Where a REMOTE card's hardware line comes from. Defaults to the
    * presence beats; a static build passes its committed fleet snapshot
@@ -250,7 +252,7 @@ export function rosterOnlyEntries(
    * available — see this function's own doc, F1. `null` on a build that
    * hasn't fetched it (a static build, or before the live query resolves);
    * every pre-existing call site keeps behaving exactly as before. */
-  specs: MachineSpecs | null = null,
+  specs: MachineSpecsResponse | null = null,
 ): RosterMachineEntry[] {
   const knownUids = new Set(machineUids(data, liveMachines));
   const knownNames = new Set<string>();
@@ -550,7 +552,7 @@ export interface FleetCard {
 export function buildFleetCard(
   data: NormRecord[],
   liveMachines: Map<string, PresenceBeat>,
-  specs: MachineSpecs | null,
+  specs: MachineSpecsResponse | null,
   presence: Presence,
   machAbsent: boolean,
   m: string,
@@ -639,7 +641,7 @@ export interface FleetCardBase extends Omit<FleetCard, "liveTokRate" | "liveTokS
 export function buildFleetCardBase(
   data: NormRecord[],
   liveMachines: Map<string, PresenceBeat>,
-  specs: MachineSpecs | null,
+  specs: MachineSpecsResponse | null,
   presence: Presence,
   machAbsent: boolean,
   m: string,
@@ -780,7 +782,7 @@ export interface CardSourcesAnswered {
   flow: boolean;
   /** `/fleet/machines/live`: who is beating. */
   presence: boolean;
-  /** `/fleet/sessions/live`: which sessions are running. */
+  /** `/fleet/dispatches/live`: which sessions are running. */
   sessions: boolean;
   /** `/runs`: a lab run in flight, which never rides the flow stream (#1923). */
   runs: boolean;

@@ -16,6 +16,41 @@ darkmux release.
 
 ### Removed (breaking, 4.0)
 
+- **The daemon HTTP API is a semver contract, and its aliases are gone** (C1,
+  A3, C2, C3). From this release the daemon's routes and response shapes change
+  only on purpose: every JSON body is a serialized Rust type in
+  `crates/darkmux-serve/src/wire.rs` with a generated TypeScript twin,
+  `ui/src/types/handwritten.ts` is deleted, and
+  `crates/darkmux-serve/route-table.golden` pins every route's method, path and
+  response type. **Removed with no alias (each answers 404):** `GET /next`,
+  `GET /mission/:id/graph`, `GET /flow-status`, `GET /worktree-summary/:session_id`.
+  **Renamed:** `GET /flow-session/:id` is `GET /flow-dispatch/:id`, and
+  `GET /fleet/sessions/live` is `GET /fleet/dispatches/live` with its `sessions`
+  array now `dispatches` ("session" is an internal join key, contract 8).
+  **Viewer links:** `#session=<id>` is `#dispatch=<id>`, `#lens=lab` is
+  `#lens=runs&kind=lab`, `#lens=machine&uid=<uid>` is `#lens=machine&machine=<key>`
+  and `panel=mission-status-all` is `panel=mission-status&opt.all=all`; the old
+  spellings open the "Unknown route" page instead of being rewritten. `darkmux
+  mission status` now prints `#mission=<id>` and `opt.all=all` links (it printed
+  the retired `/mission/<id>/graph` and `mission-status-all` forms).
+  **Response shapes changed on the wire:** `GET /machine/resources` answers
+  HTTP 500 with a plain-text body when the ledger gather panics, where it
+  answered 200 with an `{"error": ...}` body; `GET /fleet/roster` entries are a
+  fixed set of fields (the roster file's own unknown `extras` no longer leak
+  through); `GET /lab/runs` rows carry `has_reviews` (was `has_funnels`) and a
+  `staffing` reduced to each seat's `name`/`model`/`k`/`n_ctx`/`max_tokens`;
+  `GET /lab/run/detail` returns `reviews` (was `funnels`, the whole envelope) as
+  a six-field summary per case, and `scores` as `{role, mode, profile}` (was the
+  whole scores document). Every other route keeps the bytes it served; what
+  changed is that its shape is now one Rust type with a generated twin, and the
+  viewer's old hand-written copies were corrected to it (they had drifted:
+  `/runs` and `/flow-mission|dispatch/:id` had always sent `meta`, ledger fields
+  the viewer typed as numbers are nullable, a ledger state is `amber` not
+  `yellow`, a `SessionBeat` carries `display_name`, `role` and `model`).
+  **Migration:** none for operators; a script that
+  read the old routes or fields must use the new names. `funnels.json` and
+  `funnel-events.jsonl` in an old lab run directory are still read as archives
+  (no writer produces them since #2310).
 - **`darkmux mission dispatch` and the hand-built mission verbs** (#2954).
   Missions now come only from mission configs. Removed with no alias:
   `mission dispatch`, `mission add-phase`, `mission start`,

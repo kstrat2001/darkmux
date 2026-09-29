@@ -15,7 +15,9 @@ import { useFleetRoster, useLiveMachines, useStaticFleetBeats } from "../../hook
 import { getSource, runsSrc, runsReachable } from "../../lib/source";
 import { useLiveSessionIds } from "../../hooks/useLiveSessionIds";
 import { machineUids, machPresent, machineNames, LIVE_WINDOW_MS } from "../../lib/flow";
-import type { FleetMachinesLiveResponse, FleetSessionsLiveResponse, RunsResponse } from "../../types/handwritten";
+import type { FleetMachinesLiveResponse } from "../../types/generated/FleetMachinesLiveResponse";
+import type { FleetDispatchesLiveResponse } from "../../types/generated/FleetDispatchesLiveResponse";
+import type { RunsResponse } from "../../types/generated/RunsResponse";
 import { fmtN, fmtC } from "../../lib/format";
 import { MachineIcon } from "../../components/MachineIcon";
 import { Shimmer } from "../../components/Placeholder";
@@ -29,7 +31,7 @@ import { tokensOffMeter } from "./savings";
 import { buildFleetCardBase, withLiveReadings, busiestExecution, isStrictlyBusier, rosterOnlyEntries, rosterAliasFor, specUnknownLabel, cardFace, NO_SIGNAL_STAT, type CardSourcesAnswered } from "./cards";
 import { useLatch } from "../../hooks/useLatch";
 import { buildActivityTimeline, ACTIVITY_WINDOW_PRESETS, DEFAULT_ACTIVITY_WINDOW_MIN } from "./timeline";
-import type { MachineSpecs } from "../../types/handwritten";
+import type { MachineSpecsResponse } from "../../types/generated/MachineSpecsResponse";
 import { runsForMachine } from "../runs/format";
 import { recordsAsOf, type NormRecord } from "../../lib/ingest";
 import { dispatchHash } from "../../lib/route";
@@ -279,7 +281,7 @@ const SavingsHero = memo(function SavingsHero({
  *
  * Data sources: `/flow/<today>` + `/flow/<yesterday>` (the live window every
  * number here derives from — `useFlowWindow`), `/fleet/machines/live` +
- * `/fleet/sessions/live` (presence), `/machine/specs` (this machine's own
+ * `/fleet/dispatches/live` (presence), `/machine/specs` (this machine's own
  * hardware string).
  */
 // (#1729) The presence-coverage notice this lens used to own MOVED to
@@ -377,7 +379,7 @@ const TimelineLanes = memo(function TimelineLanes({ timeline }: { timeline: Retu
                 `MachineLens.tsx`'s own doc, and `viewer-session-url.spec.js`'s
                 module doc for the full gap history). Since #1809 nothing
                 ANYWHERE in this port reaches `SessionReplay` by clicking,
-                even though the fetch + render it needs (`/flow-session/<id>`
+                even though the fetch + render it needs (`/flow-dispatch/<id>`
                 → `runRegions`) has worked since Packet 4.
                 This is a deliberate WIDENING beyond legacy's own address-bar
                 behavior, same precedent as `machineDrillHash`'s machine key and
@@ -518,7 +520,7 @@ export function FleetLens({
    * `App.tsx` renders `<FleetLens />` propless, so `historical` defaults to
    * `false` on the daemon-less static demo too, and the three live-only
    * endpoints below fired there: measured on the served build, `#lens=fleet`
-   * produced 404s for `/fleet/machines/live`, `/fleet/sessions/live` and
+   * produced 404s for `/fleet/machines/live`, `/fleet/dispatches/live` and
    * `/machine/specs` plus their console errors. Gating on the BUILD is the
    * #1801 rule `MachineLens`, `useFlowWindow` and `route.ts::isLiveRoute`
    * already follow: a daemon-less build is never live, on any lens, whatever
@@ -662,7 +664,7 @@ export function FleetLens({
   const specsQuery = useQuery({
     enabled: livePolling,
     queryKey: queryKeys.machineSpecs(),
-    queryFn: () => fetchJson<MachineSpecs>("/machine/specs"),
+    queryFn: () => fetchJson<MachineSpecsResponse>("/machine/specs"),
   });
   const specs = livePolling && specsQuery.data?.ok ? specsQuery.data.data : null;
 
@@ -730,7 +732,7 @@ export function FleetLens({
   const sessionsState = useQuery({
     enabled: false,
     queryKey: queryKeys.fleetSessionsLive(),
-    queryFn: () => fetchJson<FleetSessionsLiveResponse>("/fleet/sessions/live"),
+    queryFn: () => fetchJson<FleetDispatchesLiveResponse>("/fleet/dispatches/live"),
   });
   // Each latched: the FIRST answer counts (`useLatch`), so the flow
   // window's new day key at UTC midnight does not blink every card back to

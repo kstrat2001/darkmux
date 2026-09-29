@@ -1,6 +1,7 @@
 import { ACTION, type NormRecord } from "../lib/ingest";
 import { norm } from "./records";
-import type { PresenceBeat, RosterMachineEntry } from "../types/handwritten";
+import type { PresenceBeat } from "../types/generated/PresenceBeat";
+import type { RosterMachineEntry } from "../types/generated/RosterMachineEntry";
 
 /**
  * (#2818) FLEET SCENARIOS AS FIXTURES.

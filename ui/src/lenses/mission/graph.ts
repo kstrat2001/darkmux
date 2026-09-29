@@ -28,71 +28,20 @@ import { PURPOSE, isUsageRecord, stepTokensWithLegacyFallback, usageContribution
 import { ACTION, CATEGORY, byTime, byTimeNewestFirst, isAfter, isAsOf, isDispatchFamily, isDispatchTerminal, latestByTime, type NormAction, type NormRecord } from "../../lib/ingest";
 import { lifecycleAt, type LifecyclePhase, type LifecyclePolicy } from "../../lib/lifecycle";
 import { currentRun, groupOfRecords } from "../../lib/runRef";
+import type { GraphEdge } from "../../types/generated/GraphEdge";
+import type { GraphNode } from "../../types/generated/GraphNode";
+import type { MissionGraph } from "../../types/generated/MissionGraph";
+import type { StepRow } from "../../types/generated/StepRow";
 
 // ─── wire types (crates/darkmux-serve/src/mission_graph.rs) ────────────────
+//
+// Generated from the server's own structs (`bun run types:regen`). `GraphStep`
+// is the server's `StepRow`, renamed here because this lens has a `StepRow`
+// component of its own.
 
-export interface GraphStep {
-  id: string;
-  label: string;
-  kind: string;
-  status: string;
-  startedTs?: number;
-  completedTs?: number;
-  tokensFinal?: number;
-  turnsFinal?: number;
-  toolsFinal?: number;
-  model?: string;
-}
+export type { GraphEdge, GraphNode, MissionGraph };
+export type GraphStep = StepRow;
 
-export interface GraphNode {
-  id: string;
-  label: string;
-  kind: "phase" | "task";
-  status: string;
-  /** (#2406) A phase node's task-count breakdown ("7 complete · 1 errored ·
-   *  4 running") — present only when `status` is `running` or `degraded`.
-   *  Always absent on a task node. See `mission_graph.rs::phase_status_note`. */
-  statusNote?: string;
-  parentId?: string;
-  startedTs?: number;
-  completedTs?: number;
-  depth: number;
-  description?: string;
-  steps?: GraphStep[];
-}
-
-export interface GraphEdge {
-  id: string;
-  source: string;
-  target: string;
-  kind: "contains" | "depends_on" | "phase_order";
-}
-
-export interface MissionGraph {
-  mission_id: string;
-  mission_status: string;
-  nodes: GraphNode[];
-  edges: GraphEdge[];
-  note?: string;
-  /** (#2518) Epoch ms this snapshot was BUILT server-side
-   * (`mission_graph.rs::MissionGraph.generated_at_ms`, always present on
-   * the wire — `current_millis()` at build time). Was already being sent
-   * and silently dropped by this type before #2518; now load-bearing —
-   * see `foldFlowRecords`'s own doc for why a snapshot's own build time is
-   * what tells a STALE flow record (already baked into this snapshot's own
-   * fresh computation) apart from a NEWER one (arrived since, still worth
-   * folding). Optional so a fixture with no opinion on freshness (most of
-   * this file's own test fixtures) falls back to today's fold-everything
-   * behavior — see `foldFlowRecords`. */
-  generated_at_ms?: number;
-}
-
-// ─── layout (mission-graph.html: computeLayout) ────────────────────────────
-// The JS-side counterpart to the Rust `layer_tasks_by_depth`, which stamps
-// `depth` onto every task node server-side. Positions nodes in bands: one
-// band per phase (stacked top-to-bottom), tasks within a band laid out
-// left-to-right by `depth` (rebased to the phase's own first column — see
-// the inline comment below) so dependency order reads left-to-right.
 export const COL_W = 260;
 /** (#2104) A task card that carries step rows. Measured on the real
  * finalized crawl `crawl-1788402801-729335` at desktop width (2026-09-03):
@@ -583,20 +532,20 @@ export function seedMetricsFromGraph(metrics: MetricsMap, g: { nodes: GraphNode[
     for (const s of n.steps || []) {
       const tf = typeof s.tokensFinal === "number" ? s.tokensFinal : 0;
       const nf = typeof s.turnsFinal === "number" ? s.turnsFinal : 0;
-      const cf = typeof s.toolsFinal === "number" ? s.toolsFinal : 0;
       const st = tsToMs(s.startedTs);
-      if (hasNoMetricsData({ tokensFinal: tf, turnsFinal: nf, toolsFinal: cf, startedMs: st })) continue;
+      // A graph step carries no tool total (the server's `StepRow` has none):
+      // tool counts come from the step's flow records alone.
+      if (hasNoMetricsData({ tokensFinal: tf, turnsFinal: nf, toolsFinal: 0, startedMs: st })) continue;
       const cur = out[s.id] || EMPTY_METRICS;
       const ntf = Math.max(cur.tokFinal, tf);
       const nnf = Math.max(cur.turnFinal, nf);
-      const ncf = Math.max(cur.toolFinal, cf);
       const curSt = cur.startTs || 0;
       const nst = curSt ? (st ? Math.min(curSt, st) : curSt) : st;
-      if (ntf === cur.tokFinal && nnf === cur.turnFinal && ncf === cur.toolFinal && nst === curSt) {
+      if (ntf === cur.tokFinal && nnf === cur.turnFinal && nst === curSt) {
         continue;
       }
       if (out === metrics) out = { ...metrics };
-      out[s.id] = { ...cur, tokFinal: ntf, turnFinal: nnf, toolFinal: ncf, startTs: nst };
+      out[s.id] = { ...cur, tokFinal: ntf, turnFinal: nnf, startTs: nst };
     }
   }
   return out;
@@ -680,7 +629,7 @@ export function applyFlowRecord(graph: MissionGraph, rec: NormRecord, idx: Graph
       const advanced = advance(n.status);
       if (advanced === n.status) return n;
       changed = true;
-      return { ...n, status: advanced! };
+      return { ...n, status: advanced as GraphNode["status"] };
     });
     return changed ? { ...graph, nodes } : graph;
   }
@@ -695,7 +644,7 @@ export function applyFlowRecord(graph: MissionGraph, rec: NormRecord, idx: Graph
       const advanced = advance(s.status);
       if (advanced === s.status) return s;
       changed = true;
-      return { ...s, status: advanced! };
+      return { ...s, status: advanced as GraphStep["status"] };
     });
     return changed ? { ...n, steps } : n;
   });
@@ -770,11 +719,11 @@ export function mergeGraphs(prevGraph: MissionGraph | null, fresh: MissionGraph)
   }
   const nodes = fresh.nodes.map((n) => {
     const old = prevStatus[n.id];
-    let merged = old !== undefined && keepPageStatus(old, n.status) ? { ...n, status: old } : n;
+    let merged = old !== undefined && keepPageStatus(old, n.status) ? { ...n, status: old as GraphNode["status"] } : n;
     if (merged.steps && merged.steps.length) {
       const steps = merged.steps.map((s) => {
         const oldS = prevStepStatus[s.id];
-        return oldS !== undefined && keepPageStatus(oldS, s.status) ? { ...s, status: oldS } : s;
+        return oldS !== undefined && keepPageStatus(oldS, s.status) ? { ...s, status: oldS as GraphStep["status"] } : s;
       });
       merged = { ...merged, steps };
     }
@@ -1043,9 +992,14 @@ export function buildStepHeaderFields(step: GraphStep, metrics: MetricsMap, now:
 // ─── phase-order edges + React-Flow-ready node/edge shaping
 // (mission-graph.html: phaseOrderEdges, toRfNodes, toRfEdges) ──────────────
 
-export function phaseOrderEdges(nodes: GraphNode[]): GraphEdge[] {
+/** An edge as drawn: the server's `contains` / `depends_on` edges, plus the
+ *  `phase_order` edges this viewer derives itself from phase depth (the server
+ *  never sends one). */
+export type DrawnEdge = Omit<GraphEdge, "kind"> & { kind: GraphEdge["kind"] | "phase_order" };
+
+export function phaseOrderEdges(nodes: GraphNode[]): DrawnEdge[] {
   const phases = nodes.filter((n) => n.kind === "phase").sort((a, b) => a.depth - b.depth);
-  const edges: GraphEdge[] = [];
+  const edges: DrawnEdge[] = [];
   for (let i = 0; i < phases.length - 1; i++) {
     edges.push({ id: "phase-order:" + phases[i].id + ":" + phases[i + 1].id, source: phases[i].id, target: phases[i + 1].id, kind: "phase_order" });
   }
@@ -1055,6 +1009,7 @@ export function phaseOrderEdges(nodes: GraphNode[]): GraphEdge[] {
 /** Every edge this canvas actually DRAWS (`contains` is dropped — drawn by
  * phase-container enclosure instead — plus the client-synthesized
  * `phase_order` edges appended), regardless of rendering library. */
-export function drawnEdges(graphEdges: GraphEdge[], graphNodes: GraphNode[]): GraphEdge[] {
-  return graphEdges.filter((e) => e.kind !== "contains").concat(phaseOrderEdges(graphNodes));
+export function drawnEdges(graphEdges: GraphEdge[], graphNodes: GraphNode[]): DrawnEdge[] {
+  const serverEdges: DrawnEdge[] = graphEdges.filter((e) => e.kind !== "contains");
+  return serverEdges.concat(phaseOrderEdges(graphNodes));
 }

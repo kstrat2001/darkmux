@@ -58,7 +58,11 @@ import { isLiveRoute, type Route } from "../lib/route";
 import { useDaemonLoad } from "../hooks/useDaemonLoad";
 import { useCountUp } from "../hooks/useCountUp";
 import type { LiveTailStatus } from "../hooks/useLiveTail";
-import type { BatteryHealth, BatterySample, MachineLoad, MachineSpecs, PresenceBeat, ThermalState } from "../types/handwritten";
+import type { BatteryHealthNow } from "../types/generated/BatteryHealthNow";
+import type { BatteryCharge } from "../types/generated/BatteryCharge";
+import type { MachineLoad } from "../types/generated/MachineLoad";
+import type { MachineSpecsResponse } from "../types/generated/MachineSpecsResponse";
+import type { PresenceBeat } from "../types/generated/PresenceBeat";
 import {
   batteryAriaLabel,
   batteryFillWidth,
@@ -194,6 +198,9 @@ function fmtAboveNominal(ms: number): string {
   if (ms < 60_000) return `${Math.round(ms / 1000)}s`;
   return `${Math.round(ms / 60_000)} min`;
 }
+
+/** `ProcessInfo.thermalState`, verbatim. A plain string: the kernel owns the vocabulary, and a level a later macOS adds must render rather than fail to parse. */
+type ThermalState = string;
 
 /** Title-cases a `ThermalState` for display — "nominal" → "Nominal". An
  * unrecognized future state (the `| string` fallback on the type) still
@@ -479,7 +486,7 @@ const BATTERY_ICON_CY = BATTERY_BODY_Y + BATTERY_BODY_H / 2 + 4;
  *    `<title>` for mouse hover; the outer `<svg>`'s `aria-label`
  *    (`batteryAriaLabel`) states the same fact in words for a screen
  *    reader, which never sees the decorative (`aria-hidden`) glyph. */
-function BatteryBar({ sample }: { sample: BatterySample }) {
+function BatteryBar({ sample }: { sample: BatteryCharge }) {
   const fillW = batteryFillWidth(sample.charge_pct, BATTERY_FILL_MAX_W);
   const icon = batteryIcon(sample);
   return (
@@ -533,7 +540,7 @@ function BatteryBar({ sample }: { sample: BatterySample }) {
   );
 }
 
-function BatteryLensBlock({ sample, health }: { sample: BatterySample | null; health: BatteryHealth | null }) {
+function BatteryLensBlock({ sample, health }: { sample: BatteryCharge | null; health: BatteryHealthNow | null }) {
   if (sample === null && health === null) return null;
   const cond = conditionRow(health);
   const capacity = capacityLine(health);
@@ -705,7 +712,7 @@ export interface MachineStatsInput {
   flowWindow: NormRecord[];
   localUid: string | null;
   liveMachines: Map<string, PresenceBeat>;
-  specs: MachineSpecs | null;
+  specs: MachineSpecsResponse | null;
   liveStatus: LiveTailStatus;
   /** (#2107, #1833) Whether the caller's own surface — the desktop
    * `<Dialog id="imodalbg">`, or the phone drawer's Machine tab — is
@@ -943,7 +950,7 @@ export function useMachineStatsContent({
   // Sourced from `specs` where it has the field, so each fact carries its
   // own label instead of being concatenated into a phrase. `Kv` hides an
   // empty value, so a route without `specs` shows fewer rows rather than
-  // empty ones. Disk is absent because nothing collects it — `MachineSpecs`
+  // empty ones. Disk is absent because nothing collects it — `MachineSpecsResponse`
   // has no disk field. Clock speed is deliberately NOT duplicated here: the
   // CPU clusters section already reports per-cluster MHz, which is the
   // honest form, since the clusters run at different speeds and a single

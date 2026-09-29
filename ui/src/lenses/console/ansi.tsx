@@ -17,6 +17,7 @@
  */
 import type { ReactNode } from "react";
 import { PANEL_IDS, type PanelId } from "../../lib/route";
+import { sanitizeOptParams } from "./panels";
 
 /** viewer.html: `const ANSI_SGR_CLASS = {...}`. */
 export const ANSI_SGR_CLASS: Record<number, string> = {
@@ -102,6 +103,25 @@ export function panelSwitchId(href: string): PanelId | null {
   if (h.get("lens") !== "console") return null;
   const id = h.get("panel");
   return id && (PANEL_IDS as readonly string[]).includes(id) ? (id as PanelId) : null;
+}
+
+/**
+ * The `opt.<name>=<value>` selections a same-origin panel deep link carries
+ * (`…&panel=mission-status&opt.all=all`), validated against the panel's own
+ * declared options exactly as `parseRoute` validates a hash. Without them an
+ * in-page switch would land on the panel's default variant, and the CLI's
+ * "show every mission" link would show the same limited board it was clicked
+ * on.
+ */
+function panelSwitchOpts(href: string, id: PanelId): Record<string, string> {
+  const raw: Record<string, string> = {};
+  try {
+    const h = new URLSearchParams(new URL(href, window.location.href).hash.replace(/^#/, ""));
+    for (const [k, v] of h.entries()) if (k.startsWith("opt.")) raw[k.slice(4)] = v;
+  } catch {
+    return {};
+  }
+  return sanitizeOptParams(id, raw);
 }
 
 export interface AnsiSegment {
@@ -207,13 +227,20 @@ export function parseAnsi(text: string): AnsiSegment[] {
  * called (and the click prevented from navigating) for a link whose
  * `switchTo` resolved; every other link is a real anchor and behaves like
  * one (copy-link, middle-click, `Cmd`-click all keep working). */
-export function AnsiText({ text, onPanelSwitch }: { text: string; onPanelSwitch: (id: PanelId) => void }): ReactNode {
+export function AnsiText({
+  text,
+  onPanelSwitch,
+}: {
+  text: string;
+  onPanelSwitch: (id: PanelId, opts: Readonly<Record<string, string>>) => void;
+}): ReactNode {
   const segments = parseAnsi(text);
   return segments.map((seg, idx) => {
     const content = seg.classes.length ? <span className={seg.classes.join(" ")}>{seg.text}</span> : seg.text;
     if (!seg.link) return <span key={idx}>{content}</span>;
     if (seg.switchTo) {
       const id = seg.switchTo;
+      const opts = panelSwitchOpts(seg.link, id);
       return (
         <a
           key={idx}
@@ -223,7 +250,7 @@ export function AnsiText({ text, onPanelSwitch }: { text: string; onPanelSwitch:
           data-arg={id}
           onClick={(e) => {
             e.preventDefault();
-            onPanelSwitch(id);
+            onPanelSwitch(id, opts);
           }}
         >
           {content}

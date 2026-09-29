@@ -48,7 +48,7 @@ darkmux already has every primitive this feature needs. The gap is not missing d
 ### 1.4 Presence — live fleet membership already exists
 
 - `darkmux:presence:<machine_uid>` keys with TTL give "which machines are live right now," and each beat carries the writer's `schema_version` and `display_name` — `crates/darkmux-flow/src/presence.rs:46-67`. The skew check can key on *live* schema, not stream scraping.
-- Daemon endpoints already serve this: `/fleet/machines/live`, `/fleet/sessions/live`, `/flow-status`, `/machine/specs`, `/missions` — `crates/darkmux-serve/src/lib.rs:156-167`.
+- Daemon endpoints already serve this: `/fleet/machines/live`, `/fleet/dispatches/live`, `/flow-status`, `/machine/specs`, `/missions` — `crates/darkmux-serve/src/lib.rs:156-167`.
 
 **Where it breaks down:** presence answers "is the machine here" but isn't cross-referenced against the roster ("you have `mini-1` in your roster but it hasn't beaten in 4 minutes") or against version coherence ("the live beat says `mini-1` is on schema 1.9, you're on 1.10").
 
@@ -317,7 +317,7 @@ Every finding is `f(live state, versioned rules)`. The rules live where the eure
 `try_fix` (`lib.rs:2484`) only ever touches *this* machine's state, only for rules with a registered handler, only after the operator passes `--fix`. Fleet findings (§2.4) are **never** auto-fixable — they require a command on another machine, which crosses the sovereignty line. They render with a Fix block but no `--fix` handler. This must be explicit in the UX: a fleet finding's Fix block omits the "`darkmux doctor --fix` can apply this" affordance that a local finding shows.
 
 ### 3.5 Web viewer (secondary)
-The daemon already serves `/flow-status`, `/fleet/machines/live`, `/fleet/sessions/live`, `/missions` (`serve/lib.rs:156-167`), and the viewer already has a live fleet view + missions lens. **Recommendation: add a "coherence" lens to the existing fleet view, not a new page.** It renders the §2.4 matrix from a new `/fleet/coherence` endpoint (which is just the fleet-layer verdict computed server-side and returned as JSON — the same data `doctor --fleet --json` produces). The viewer is read-only by nature, which fits the diagnose-don't-push constraint perfectly: it can *show* the version split-brain and the silent peer, but the Fix commands stay copy-only (the operator runs them in a terminal on the named machine). CLI stays the primary surface; the viewer is the ambient "is my fleet coherent right now" glance. This is a follow-on, not part of the first cut.
+The daemon already serves `/flow-status`, `/fleet/machines/live`, `/fleet/dispatches/live`, `/missions` (`serve/lib.rs:156-167`), and the viewer already has a live fleet view + missions lens. **Recommendation: add a "coherence" lens to the existing fleet view, not a new page.** It renders the §2.4 matrix from a new `/fleet/coherence` endpoint (which is just the fleet-layer verdict computed server-side and returned as JSON — the same data `doctor --fleet --json` produces). The viewer is read-only by nature, which fits the diagnose-don't-push constraint perfectly: it can *show* the version split-brain and the silent peer, but the Fix commands stay copy-only (the operator runs them in a terminal on the named machine). CLI stays the primary surface; the viewer is the ambient "is my fleet coherent right now" glance. This is a follow-on, not part of the first cut.
 
 ---
 

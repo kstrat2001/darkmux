@@ -56,6 +56,8 @@ pub const DEFAULT_TTL_SECS: u64 = 15;
 /// on a heartbeat. Re-adding it here means populating it in the same
 /// commit.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct PresenceBeat {
     /// Stable hardware identity (`darkmux_hardware::machine_uid`) — the key
     /// suffix and the join key for this machine's flow records. Immutable.
@@ -69,6 +71,7 @@ pub struct PresenceBeat {
     /// Unix-ms at beat-write time. Diagnostic / "last beat" display only —
     /// liveness is governed by Redis key existence (TTL), NOT by comparing
     /// this against the reader's clock.
+    #[cfg_attr(feature = "ts-export", ts(type = "number"))]
     pub beat_ts_ms: u64,
     /// One-line machine summary, best-effort. The producer
     /// (`darkmux_hardware::format_spec_summary`) emits `"<chip> · <N> GB"`,
@@ -78,6 +81,7 @@ pub struct PresenceBeat {
     /// cores` and no producer ever emitted the third field. Display-only:
     /// never parsed, never keyed on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
     pub specs: Option<String>,
     /// (#1580) The darkmux version this daemon's binary is. `None` from a peer
     /// running a build that predates this field.
@@ -90,6 +94,7 @@ pub struct PresenceBeat {
     /// proved the pattern works; the darkmux version is the other half of the
     /// same question and was the half nobody could get.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
     pub darkmux_version: Option<String>,
 }
 

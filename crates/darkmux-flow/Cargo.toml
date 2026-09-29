@@ -20,7 +20,7 @@ test-support = ["darkmux-types/test-support"]
 # Generates `ui/src/types/generated/{FlowAction,FlowScope,Level,Category,Stage,Tier}.ts`
 # from the flow schema's enums, like darkmux-crew's own `ts-export`. Test-only:
 # the release binary never pulls `ts-rs` in.
-ts-export = ["dep:ts-rs"]
+ts-export = ["dep:ts-rs", "darkmux-types/ts-export"]
 
 [dependencies]
 anyhow = "1.0"

@@ -14,7 +14,7 @@ const PHONE = { width: 390, height: 844 };
 const BOARD_52 =
   '\x1b[1;36mmission status — 84 missions\x1b[0m\n\n' +
   '\x1b[2mFINALIZED (84)\x1b[0m\n' +
-  '  • \x1b]8;;http://127.0.0.1:8765/mission/dispatch-code-reviewer-1785589698-5d6a-0/graph\x1b\\code-reviewer\x1b]8;;\x1b\\  \x1b[2m5d6a\x1b[0m    \x1b[2m1d\x1b[0m    1/1  ▓▓▓▓\n' +
+  '  • \x1b]8;;http://127.0.0.1:8765/#mission=dispatch-code-reviewer-1785589698-5d6a-0\x1b\\code-reviewer\x1b]8;;\x1b\\  \x1b[2m5d6a\x1b[0m    \x1b[2m1d\x1b[0m    1/1  ▓▓▓▓\n' +
   '\x1b[32m✓ board is clean\x1b[0m\n';
 
 function panelBody(ansi, over = {}) {

@@ -21,7 +21,7 @@ import type { NormRecord } from "../../lib/ingest";
  * pipeline" was true when written, before Packet 5 built the first one.
  *
  * `historical` is passed so the hero drops `/fleet/machines/live` and
- * `/fleet/sessions/live`. Those endpoints describe NOW; asserting today's
+ * `/fleet/dispatches/live`. Those endpoints describe NOW; asserting today's
  * presence over a replayed day is the "confidently wrong" failure `FleetLens`'s
  * own doc warns about. A replay knows what its records know.
  *

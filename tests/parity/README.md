@@ -238,9 +238,9 @@ one's vocabulary.
 |---|---|---|
 | fleet (default) | `#` (no hash) | `fleet.txt` (the live rolling window at `meta.frozen_clock_ms`), `fleet-two-day.txt` (#2702 — the SAME boot at a clock where the 24h filter truncates nothing, so the hero sums the whole `[yesterday, today]` concatenation; see "Which window does the hero actually load" below) |
 | console | `#lens=console` (`&panel=<id>`, `&opt.<name>=<value>` since #1911) | `console.txt` (the bare default — `run-list`, a real CLI panel, since #1905 step 3; BYTE-IDENTICAL to `console-run-list.txt`, its own explicit-deep-link golden, the same relationship `mission-status`/`console.txt` had before #1904's now-deleted `ActivityPanel` default briefly broke it), plus one golden per allowlisted CLI panel: `console-mission-status.txt`, `console-mission-status-all.txt` (the one-release `mission-status-all` alias, #1911 — folds into `mission-status`'s own `--all` opt), `console-machine-status.txt`, `console-flow-status.txt`, `console-role-list.txt`, `console-config-list.txt`, `console-lab-fixture-list.txt`, `console-run-list.txt`, `console-doctor-not-run.txt` (the manual-only "not yet run" placeholder — selecting the tab must never auto-fetch, #1286) and `console-doctor.txt` (after clicking "run"). Eight allowlisted panels total (`panel.rs::PANEL_IDS`'s own doctrine cap) — the pill row briefly carried two additional client-only entries ("activity"/"all activity") under #1904; #1905 step 3 deleted them after the operator rejected a ten-pill render on sight. |
-| runs | `#lens=runs` (`&kind=<all\|mission\|dispatch\|lab>`; legacy alias `#lens=lab`) | `runs.txt` (kind=all), `runs-kind-mission.txt`, `runs-kind-dispatch.txt`, `runs-kind-lab.txt` (all four filter chips, Packet 3), `runs-series.txt` (kind=lab + the `◧ series` toggle — the ONE thing `/lab/runs` actually feeds, see the correction below; Packet 3), `runs-lens-boot.txt` (a FRESH `#lens=runs` boot, exercising `boot()`'s own `lq` deep-link branch rather than a click-through — content is byte-identical to `runs.txt` by design, since both land on kind=all over the same corpus; the golden's value is proving the boot mechanism independently, Packet 3) |
+| runs | `#lens=runs` (`&kind=<all\|mission\|dispatch\|lab>`) | `runs.txt` (kind=all), `runs-kind-mission.txt`, `runs-kind-dispatch.txt`, `runs-kind-lab.txt` (all four filter chips, Packet 3), `runs-series.txt` (kind=lab + the `◧ series` toggle — the ONE thing `/lab/runs` actually feeds, see the correction below; Packet 3), `runs-lens-boot.txt` (a FRESH `#lens=runs` boot, exercising `boot()`'s own `lq` deep-link branch rather than a click-through — content is byte-identical to `runs.txt` by design, since both land on kind=all over the same corpus; the golden's value is proving the boot mechanism independently, Packet 3) |
 | machine | `#lens=machine` | `machine.txt` (click-navigation path), `machine-deeplink.txt` (fresh boot with `#lens=machine` already set — Packet 2, a genuinely different code path: `boot()`'s `machineQuery()` branch fires before `renderFleet()` ever runs) |
-| session drill-in | `#session=<id>` | `session-task-list.txt` |
+| session drill-in | `#dispatch=<id>` | `session-task-list.txt` |
 | catalog picker | `#catpanel` (toggled via `#srcbadge`, not a hash route — global chrome, Packet 4) | `catalog-open.txt` (six regions: topbar/crumb/meta/logscope/stage + the `=== catalog ===` section — see "Extraction target" below) |
 | mission graph lens | `#mission=<id>` (#1868, renamed from "mission replay-by-query") | `mission-graph-canvas.txt` / `mission-graph-timeline.txt` (graded by the SEPARATE `next-parity-graph` suite, item 4 above — see that suite's own doc); `mission-replay.txt` survives only as a historical record, see the note below |
 | bare-date playback | `#<date>` (Packet 4) | `playback-date.txt` |
@@ -284,7 +284,7 @@ the same fleet render machinery, not new top-level lenses.
 ## Endpoints recorded
 
 The plan's named set (`/runs /missions /phases /flow-days /flow-missions
-/flow/<today> /fleet/machines/live /fleet/sessions/live /machine/resources
+/flow/<today> /fleet/machines/live /fleet/dispatches/live /machine/resources
 /machine/specs /panel/mission-status`) plus three extensions the viewer's own
 code demanded for a complete render, not named in the plan's list but
 required to reach it honestly:
@@ -306,11 +306,11 @@ required to reach it honestly:
   this harness's `runs-kind-lab` golden does NOT currently exercise (see
   KNOWN COVERAGE GAPS). It's recorded correctly and sanitized correctly; it
   just isn't exercised by any committed golden yet.
-- `/flow-session/task-list` — the concrete target for the `#session=<id>`
+- `/flow-dispatch/task-list` — the concrete target for the `#dispatch=<id>`
   golden. `task-list` was chosen specifically because it carries no client
   identifiers, avoiding URL-encoding a sanitized compound id in route
   matching.
-- `/panel/mission-status-all`, `/panel/machine-status`, `/panel/flow-status`,
+- `/panel/machine-status`, `/panel/flow-status`,
   `/panel/role-list`, `/panel/config-list`, `/panel/lab-fixture-list`,
   `/panel/doctor` (Packet 6) — the seven console panels 0a didn't record
   (only `/panel/mission-status`, the default tab, was recorded there). Each
@@ -462,7 +462,7 @@ scope:
   see the lens inventory table above. `doctor` specifically has TWO
   (`console-doctor-not-run.txt`, `console-doctor.txt`) since it's the one
   manual-only panel and both states are real, distinct, reachable behavior.
-- **Deep-link boot paths other than `#session=<id>`, `#lens=runs`,
+- **Deep-link boot paths other than `#dispatch=<id>`, `#lens=runs`,
   `#lens=machine`, `#mission=<id>`, and a bare `#<date>`** (`#lens=runs` and
   `#lens=machine` closed by Packets 3 and 2 — `runs-lens-boot.txt` /
   `machine-deeplink.txt`) — `#lens=console&panel=<id>` AS A FRESH BOOT was
@@ -488,7 +488,7 @@ scope:
   `#mission=<id>` note above: the unknown-id in-page path is now
   golden-tested (`mission-replay.txt`); the populated/navigates-away case
   still needs real per-mission record fixtures this corpus doesn't have.
-- **`fleet-sessions-live.json` was recorded empty** (`[]`) — no session was
+- **`fleet-dispatches-live.json` was recorded empty** (`[]`) — no session was
   live on the operator's daemon at record time, so this corpus fixture has
   never actually exercised the viewer's non-empty rendering path for that
   endpoint. Re-recording while a session is active would close this gap.

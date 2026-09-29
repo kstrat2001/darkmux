@@ -17,7 +17,8 @@
 import { fmtC, memBytes } from "../../lib/format";
 import { uidOf } from "../../lib/flow";
 import { utilityJobWord, utilityStrip, utilityUsageByJob, type UtilityStrip } from "../../lib/utilityJobs";
-import type { MachineResourcesModel, MachineSpecs } from "../../types/handwritten";
+import type { ModelRow } from "../../types/generated/ModelRow";
+import type { MachineSpecsResponse } from "../../types/generated/MachineSpecsResponse";
 import { recordsAsOf, type NormRecord } from "../../lib/ingest";
 
 export interface UtilitySectionView {
@@ -39,10 +40,10 @@ export function utilitySectionView(args: {
   uid: string;
   nowMs: number;
   /** This machine's own `/machine/specs`, when the page is about it. */
-  specs: MachineSpecs | null;
+  specs: MachineSpecsResponse | null;
   isLocal: boolean;
   /** The residency row for the utility model, when resident (local only). */
-  residentRow: MachineResourcesModel | null;
+  residentRow: ModelRow | null;
   /** (#2958) Whether the records this reads have arrived. Omitted: true. */
   settled?: boolean;
   /** (#2958) Whether the page knows which machine it shows and, for this

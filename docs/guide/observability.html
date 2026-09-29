@@ -146,40 +146,77 @@ curl -s http://127.0.0.1:8765/health
 
 <section>
   <div class="wrap">
-    <h2>Other daemon endpoints</h2>
+    <h2>Daemon routes</h2>
+    <p>Routes and response shapes are semver contracts. Each JSON response is a Rust type in <code>crates/darkmux-serve/src/wire.rs</code>, its TypeScript twin is generated into <code>ui/src/types/generated/</code>, and the route table is pinned by <code>crates/darkmux-serve/route-table.golden</code>. There are no aliases: a retired route answers 404.</p>
     <table>
       <tr><th>Endpoint</th><th>What it returns</th></tr>
       <tr>
-        <td><code>GET /health</code></td>
-        <td>darkmux version + flow schema version. Used by doctor.</td>
+        <td><code>GET /</code></td>
+        <td>The viewer. <code>GET /play/&lt;YYYY-MM-DD&gt;</code> serves it in playback mode for one day.</td>
       </tr>
       <tr>
-        <td><code>GET /flow/&lt;YYYY-MM-DD&gt;.jsonl</code></td>
-        <td>That day's full flow file as JSONL.</td>
+        <td><code>GET /health</code></td>
+        <td>darkmux version, build, flow schema version, the lifecycle policy, and the listener and live-channel state. Used by doctor. Response type <code>HealthResponse</code>.</td>
+      </tr>
+      <tr>
+        <td><code>GET /flow/&lt;YYYY-MM-DD&gt;</code></td>
+        <td>That day's flow records as a JSON array (<code>FlowRecord[]</code>); <code>?since=&lt;iso-ts&gt;</code> narrows it.</td>
       </tr>
       <tr>
         <td><code>GET /flow/&lt;YYYY-MM-DD&gt;/stream</code></td>
         <td>Server-Sent Events stream: new records appended to that day's file, in real time.</td>
       </tr>
       <tr>
+        <td><code>GET /flow-days</code></td>
+        <td>One row per day file on disk (<code>FlowDaysResponse</code>).</td>
+      </tr>
+      <tr>
+        <td><code>GET /flow-missions</code></td>
+        <td>A cross-day rollup per mission id (<code>FlowMissionsResponse</code>).</td>
+      </tr>
+      <tr>
+        <td><code>GET /flow-mission/&lt;id&gt;</code></td>
+        <td>Every flow record of one mission, across days and machines (<code>FlowRecordsResponse</code>).</td>
+      </tr>
+      <tr>
+        <td><code>GET /flow-dispatch/&lt;id&gt;</code></td>
+        <td>Every flow record of one dispatch, across days and machines (<code>FlowRecordsResponse</code>). Renamed from <code>/flow-session/&lt;id&gt;</code>.</td>
+      </tr>
+      <tr>
+        <td><code>GET /runs</code></td>
+        <td>The flat, kind-tagged run list the viewer's runs lens reads (<code>RunsResponse</code>).</td>
+      </tr>
+      <tr>
+        <td><code>GET /missions, GET /phases</code></td>
+        <td>Missions and phases from <code>~/.darkmux/missions/</code> (<code>MissionsResponse</code>, <code>PhasesResponse</code>).</td>
+      </tr>
+      <tr>
+        <td><code>GET /mission/&lt;id&gt;/graph.json</code></td>
+        <td>The node and edge snapshot of one mission's task graph (<code>MissionGraph</code>).</td>
+      </tr>
+      <tr>
         <td><code>GET /machine/status</code></td>
-        <td>Snapshot of <code>lms ps --json</code>, loaded models grouped by ownership. Backs the <code>darkmux machine status &lt;id&gt;</code> peer read. (#1426: renamed from the retired <code>/model/status</code> alongside the <code>machine</code> CLI family.)</td>
+        <td>Snapshot of <code>lms ps --json</code>. Backs the <code>darkmux machine status &lt;id&gt;</code> peer read (<code>MachineStatusResponse</code>).</td>
+      </tr>
+      <tr>
+        <td><code>GET /machine/specs</code></td>
+        <td>Version, machine id, RAM, CPU brand, OS and loaded models. Backs <code>darkmux machine list --deep</code> (<code>MachineSpecsResponse</code>).</td>
       </tr>
       <tr>
         <td><code>GET /machine/resources</code></td>
-        <td>Live machine resources: per-model RAM commitment vs observed footprint plus pressure rows. Backs <code>darkmux machine resources</code> and the viewer's machine lens. Read-only, zero model dispatches.</td>
+        <td>Live machine resources: per-model RAM commitment vs observed footprint, pressure rows and the host sampler's reading. Read-only, zero model dispatches (<code>MachineResourcesResponse</code>).</td>
       </tr>
       <tr>
-        <td><code>GET /missions</code></td>
-        <td>All missions from <code>~/.darkmux/missions/</code> (status, phase_ids, timestamps).</td>
+        <td><code>GET /fleet/machines/live, GET /fleet/dispatches/live, GET /fleet/roster</code></td>
+        <td>The machines beating right now, the dispatches with a live heartbeat (renamed from <code>/fleet/sessions/live</code>), and the declared roster.</td>
       </tr>
       <tr>
-        <td><code>GET /phases</code></td>
-        <td>All phases from <code>~/.darkmux/phases/</code> (status, mission_id, depends_on, timestamps).</td>
+        <td><code>GET /lab/runs, GET /lab/run/detail, GET /lab/run/events</code></td>
+        <td>The lab observer: run directories, one run's reviews and scores, and a poll-based tail of its events.</td>
       </tr>
       <tr>
-        <td><code>GET /flow-status</code></td>
-        <td>Diagnostic snapshot of the flow substrate (active sinks, Redis health, disk health, schema drift). Same JSON shape as <code>darkmux flow status --json</code>; consumed by the store-status pill in the shared shell.</td>
+        <td><code>GET /panel/&lt;id&gt;</code></td>
+        <td>An allowlisted CLI command's own rendered output (<code>PanelResponse</code>).</td>
       </tr>
     </table>
   </div>

@@ -101,12 +101,12 @@ impl IngestState {
         self.bound.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn health_json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "socket_id": darkmux_flow::live::socket_fingerprint(&self.path),
-            "socket_port": self.port,
-            "bound": self.bound(),
-        })
+    pub(crate) fn health(&self) -> crate::wire::LiveIngestHealth {
+        crate::wire::LiveIngestHealth {
+            socket_id: darkmux_flow::live::socket_fingerprint(&self.path),
+            socket_port: self.port,
+            bound: self.bound(),
+        }
     }
 
     fn still_ours(&self) -> bool {

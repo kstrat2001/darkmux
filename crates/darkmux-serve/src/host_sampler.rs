@@ -40,9 +40,11 @@
 
 use darkmux_crew::host_probe::{
     battery, reduce_host_extras, BatteryHealth, BatterySample, HostExtraAt, HostProbe,
-    HostSampleFull, MwStats,
+    HostSampleFull,
 };
+use darkmux_crew::host_probe::wire::{BatteryHealthNow, HostSampleNow, PowerWindowWire, ThermalWindowWire};
 use darkmux_crew::telemetry_sampler::{reduce_host_stats, HostSampleAt};
+use crate::wire::{LoadWindow, MachineLoad};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -108,40 +110,6 @@ pub(crate) struct HostSamplerRing {
     battery_health: Arc<Mutex<Option<BatteryHealth>>>,
 }
 
-/// `mean`/`p95`/`max` — the ROUTE's wire names for one metric's window
-/// reduction. Deliberately different from the internal
-/// `peak_pct`/`mean_pct`/`p95_pct` naming: this is what
-/// `/machine/resources` promises callers (`ui/src/types/handwritten.ts`'s
-/// `MachineLoadMetric`), not a re-export of the reduction type. The internal
-/// numbers FEED these; they are never re-derived here.
-fn metric_json(m: &darkmux_crew::telemetry_sampler::MetricStats) -> serde_json::Value {
-    serde_json::json!({ "mean": m.mean_pct, "p95": m.p95_pct, "max": m.peak_pct })
-}
-
-/// The same wire shape for a power rail, in milliwatts.
-fn mw_json(m: &MwStats) -> serde_json::Value {
-    serde_json::json!({ "mean": m.mean_mw, "p95": m.p95_mw, "max": m.max_mw })
-}
-
-/// (#2775) One window's thermal summary on the wire — the ONE spelling, so
-/// `/machine/resources`' `load.window.thermal` and the `machine.rollup`
-/// record's `window.thermal` are the same object built by the same code.
-///
-/// `level_ms` and `level_entries` answer two different questions that a
-/// single "above nominal" bucket collapses: how LONG the machine spent at
-/// each level, and how OFTEN it arrived there. See
-/// `darkmux_crew::host_probe::ThermalWindow`'s own field docs for why
-/// entries count transitions rather than samples.
-fn thermal_window_json(t: &darkmux_crew::host_probe::ThermalWindow) -> serde_json::Value {
-    serde_json::json!({
-        "worst_state": t.worst_state,
-        "above_nominal_ms": t.above_nominal_ms,
-        "min_cpu_speed_limit_pct": t.min_cpu_speed_limit_pct,
-        "level_ms": t.level_ms,
-        "level_entries": t.level_entries,
-    })
-}
-
 impl HostSamplerRing {
     pub(crate) fn new() -> Self {
         Self {
@@ -193,8 +161,7 @@ impl HostSamplerRing {
     }
 
     /// The `load` block for `GET /machine/resources` (host-sample-shape v2 —
-    /// the contract mirrored in `ui/src/types/handwritten.ts`'s
-    /// `MachineLoad`). `None` when no sample has landed yet (the sampler
+    /// [`MachineLoad`], whose generated twin the viewer imports). `None` when no sample has landed yet (the sampler
     /// just started, or is disabled via `runtime.host_sampler_interval_ms:
     /// 0`, in which case the caller never spawned the thread and this ring
     /// simply stays empty forever).
@@ -202,7 +169,7 @@ impl HostSamplerRing {
     /// Every field the probe could not read is emitted as JSON `null` rather
     /// than as a zero — "not measured" and "measured, and idle" are
     /// different claims, and the viewer renders them differently.
-    pub(crate) fn snapshot(&self) -> Option<serde_json::Value> {
+    pub(crate) fn snapshot(&self) -> Option<MachineLoad> {
         let g = match self.inner.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
@@ -255,32 +222,32 @@ impl HostSamplerRing {
         // not a reduction over the window — it is a slow-moving machine
         // FACT, refreshed hourly. `null` on a machine with no battery.
         let health = self.battery_health.lock().ok().and_then(|h| h.clone());
-        Some(serde_json::json!({
-            "battery_health": health.as_ref().map(darkmux_crew::host_probe::battery_health_json),
-            "now": darkmux_crew::host_probe::sample_full_json(&latest.sample, latest.at_ms),
-            "window": {
-                "samples": stats.samples,
-                "span_ms": span_ms,
+        Some(MachineLoad {
+            battery_health: health.as_ref().map(BatteryHealthNow::from),
+            now: HostSampleNow::new(&latest.sample, latest.at_ms),
+            window: LoadWindow {
+                samples: stats.samples,
+                span_ms,
                 // MEASURED mean gap between samples, not the nominal
                 // configured cadence — see this module's own doc.
-                "interval_ms": stats.sample_interval_ms,
-                "cpu_pct": metric_json(&stats.cpu),
-                "gpu_pct": metric_json(&stats.gpu),
-                "mem_pct": metric_json(&stats.mem),
-                "power_mw": ex.power.as_ref().map(|p| serde_json::json!({
-                    "total": mw_json(&p.total),
-                    "cpu": mw_json(&p.cpu),
-                    "gpu": mw_json(&p.gpu),
-                })),
+                interval_ms: stats.sample_interval_ms,
+                cpu_pct: (&stats.cpu).into(),
+                gpu_pct: (&stats.gpu).into(),
+                mem_pct: (&stats.mem).into(),
+                power_mw: ex.power.as_ref().map(PowerWindowWire::from),
                 // (#2775) `level_ms`/`level_entries` ride the SAME reduction
                 // `above_nominal_ms` comes from, so the machine lens and the
                 // `machine.rollup` record cannot disagree about how long the
-                // machine spent hot or how often it got there. Additive on
-                // the wire — an existing consumer ignores two new keys.
-                "thermal": ex.thermal.as_ref().map(thermal_window_json),
-                "energy_mwh": ex.energy_mwh,
+                // machine spent hot or how often it got there.
+                thermal: ex.thermal.as_ref().map(ThermalWindowWire::from),
+                energy_mwh: ex.energy_mwh,
             },
-        }))
+        })
+    }
+
+    /// The snapshot as the JSON value the `machine.rollup` record embeds.
+    pub(crate) fn snapshot_json(&self) -> Option<serde_json::Value> {
+        self.snapshot().map(|load| serde_json::to_value(load).unwrap_or(serde_json::Value::Null))
     }
 }
 
@@ -1155,7 +1122,7 @@ pub(crate) fn spawn(
                     // one out. Found by writing the test that pins the
                     // seeding, which is why it had survived: every existing
                     // test asked only whether a record eventually lands.
-                    if let Some(load) = ring.snapshot() {
+                    if let Some(load) = ring.snapshot_json() {
                         ms_since_rollup = 0;
                         let ledger = darkmux_profiles::model_ledger::gather();
                         let residency = residency_json(&ledger);
@@ -1583,7 +1550,7 @@ mod tests {
     fn the_snapshot_carries_battery_health_as_a_machine_fact_beside_the_window() {
         let ring = HostSamplerRing::new();
         ring.push(entry(0, 50, 60, 70, 5));
-        let v = ring.snapshot().expect("samples present");
+        let v = ring.snapshot_json().expect("samples present");
         assert!(v["battery_health"].is_null(), "no health polled yet ⇒ null, never a fabricated block");
         assert!(
             v["window"].get("battery_health").is_none(),
@@ -1591,7 +1558,7 @@ mod tests {
         );
 
         *ring.battery_health.lock().expect("lock") = Some(health_with(26));
-        let v = ring.snapshot().expect("samples present");
+        let v = ring.snapshot_json().expect("samples present");
         assert_eq!(v["battery_health"]["cycle_count"], 26);
         assert_eq!(v["battery_health"]["raw_capacity_pct"], 90.4);
     }
@@ -1600,7 +1567,7 @@ mod tests {
     fn the_now_block_carries_charge_and_reads_null_on_a_machine_with_no_battery() {
         let ring = HostSamplerRing::new();
         ring.push(RingEntry { at_ms: 0, sample: sample_with_battery(None) });
-        let v = ring.snapshot().expect("samples present");
+        let v = ring.snapshot_json().expect("samples present");
         assert!(v["now"]["battery"].is_null(), "not measured must never serialize as a zero");
 
         let ring = HostSamplerRing::new();
@@ -1613,7 +1580,7 @@ mod tests {
                 minutes_to_empty: None,
             })),
         });
-        let v = ring.snapshot().expect("samples present");
+        let v = ring.snapshot_json().expect("samples present");
         assert_eq!(v["now"]["battery"]["charge_pct"], 42);
         assert_eq!(v["now"]["battery"]["on_ac"], false);
         assert!(
@@ -1625,7 +1592,7 @@ mod tests {
     #[test]
     fn empty_ring_snapshots_to_none() {
         let ring = HostSamplerRing::new();
-        assert!(ring.snapshot().is_none(), "no samples yet ⇒ no load block");
+        assert!(ring.snapshot_json().is_none(), "no samples yet ⇒ no load block");
     }
 
     #[test]
@@ -1635,7 +1602,7 @@ mod tests {
         ring.push(entry(2000, 90, 65, 85, 6));
         ring.push(entry(4000, 40, 62, 30, 4));
 
-        let v = ring.snapshot().expect("samples present");
+        let v = ring.snapshot_json().expect("samples present");
         assert_eq!(v["now"]["cpu_pct"], 40, "now reflects the LATEST sample");
         assert_eq!(v["now"]["mem_pct"], 62);
         assert_eq!(v["now"]["gpu_pct"], 30);
@@ -1654,7 +1621,7 @@ mod tests {
     fn unmeasured_fields_are_null_never_zero() {
         let ring = HostSamplerRing::new();
         ring.push(entry(0, 50, 60, 70, 5));
-        let v = ring.snapshot().expect("samples present");
+        let v = ring.snapshot_json().expect("samples present");
         for key in ["cpu_clusters", "gpu_mhz", "gpu_mem_bytes", "thermal", "power_mw"] {
             assert!(
                 v["now"][key].is_null(),
@@ -1719,7 +1686,7 @@ mod tests {
         // "held continuously for the whole gap" arithmetic.
         ring.push(mk(3_600_000));
 
-        let v = ring.snapshot().expect("samples present");
+        let v = ring.snapshot_json().expect("samples present");
         assert_eq!(v["now"]["sampler_cost_ms"], 7);
         assert_eq!(v["now"]["cpu_clusters"][0]["name"], "Super");
         assert_eq!(v["now"]["cpu_clusters"][0]["cores"], 6);
@@ -1754,7 +1721,7 @@ mod tests {
         for i in 0..(RING_CAPACITY + 5) {
             ring.push(entry(i as u64 * 1000, 1, 1, 1, 1));
         }
-        let v = ring.snapshot().expect("samples present");
+        let v = ring.snapshot_json().expect("samples present");
         assert_eq!(v["window"]["samples"], RING_CAPACITY as u64, "capped at RING_CAPACITY");
         // The oldest 5 entries (at_ms 0..5000) must have been evicted — the
         // window's span should reflect only the newest RING_CAPACITY entries.
@@ -1768,7 +1735,7 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let handle = spawn(0, ring.clone(), stop);
         assert!(handle.is_none(), "0ms interval must not spawn a thread");
-        assert!(ring.snapshot().is_none(), "and the ring stays empty");
+        assert!(ring.snapshot_json().is_none(), "and the ring stays empty");
     }
 
     /// (#2762) `spawn` takes the singleton sampler lock, and `lock_path()`
@@ -1795,10 +1762,10 @@ mod tests {
         // Wait (bounded) for at least one sample. The bound allows for the
         // probe's one-time construction cost (~100ms on macOS).
         let deadline = Instant::now() + Duration::from_secs(10);
-        while ring.snapshot().is_none() && Instant::now() < deadline {
+        while ring.snapshot_json().is_none() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(ring.snapshot().is_some(), "at least one sample landed within the deadline");
+        assert!(ring.snapshot_json().is_some(), "at least one sample landed within the deadline");
 
         let t0 = Instant::now();
         stop.store(true, Ordering::SeqCst);
@@ -2236,7 +2203,7 @@ mod tests {
             );
             // Still samples its OWN ring regardless (the ring is
             // unconditional, per the issue's own rule).
-            assert!(ring.snapshot().is_some(), "the ring keeps sampling regardless of who holds the lock");
+            assert!(ring.snapshot_json().is_some(), "the ring keeps sampling regardless of who holds the lock");
         });
     }
 
@@ -2534,7 +2501,7 @@ mod tests {
         ring.set_configured_interval_for_test(5_000);
         ring.push_for_test(0, 10, 20, 30, 7);
         ring.push_for_test(5_000, 50, 60, 70, 8);
-        let load = ring.snapshot().expect("two samples are in the ring");
+        let load = ring.snapshot_json().expect("two samples are in the ring");
 
         let rec = build_machine_rollup_record(
             load,
@@ -2621,7 +2588,7 @@ mod tests {
                 ..Default::default()
             },
         });
-        let load = ring.snapshot().expect("one sample");
+        let load = ring.snapshot_json().expect("one sample");
         let rec = build_machine_rollup_record(load, None, Some("serious"), 60, 60_000, 1, 0);
         assert!(matches!(rec.level, darkmux_flow::Level::Info));
     }
@@ -2645,7 +2612,7 @@ mod tests {
                 ..Default::default()
             },
         });
-        let load = ring.snapshot().expect("one sample");
+        let load = ring.snapshot_json().expect("one sample");
 
         // Real hardware first: the absence is what makes the presence below
         // mean something, and an explicit `null` would NOT do — the flow
@@ -2730,7 +2697,7 @@ mod tests {
                 },
             });
         }
-        let load = ring.snapshot().expect("samples");
+        let load = ring.snapshot_json().expect("samples");
         let from_lens = load["window"]["thermal"].clone();
         assert_eq!(from_lens["level_entries"]["fair"], 1, "one arrival, not two samples");
         assert_eq!(from_lens["level_ms"]["fair"], 10_000);

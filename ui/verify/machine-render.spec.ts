@@ -48,7 +48,7 @@ test("live daemon (8793): the machine lens renders clean — zero pageerrors, no
   });
 
   await page.setViewportSize({ width: 390, height: 844 });
-  await page.goto("/next#lens=machine");
+  await page.goto("/#lens=machine");
   await page.waitForSelector("#stage");
   await page.waitForSelector('.machine-lens__health[data-state]:not([data-state="loading"])', { timeout: 15_000 });
 
@@ -70,7 +70,7 @@ test("live daemon (8793): the machine lens renders clean — zero pageerrors, no
 
 test("live daemon (8793): desktop-width screenshot for review", async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 900 });
-  await page.goto("/next#lens=machine");
+  await page.goto("/#lens=machine");
   await page.waitForSelector('.machine-lens__health[data-state]:not([data-state="loading"])', { timeout: 15_000 });
   await page.screenshot({ path: screenshotPath("live-8793-1280px.png"), fullPage: true });
 });

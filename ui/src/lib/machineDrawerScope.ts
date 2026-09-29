@@ -9,7 +9,7 @@
  *   frozen once it stops (no new samples arrive within the span, so the
  *   aggregate simply stops changing; no separate "frozen" flag needed).
  *   The caller's `routeRecords` for a dispatch route is the daemon's
- *   `/flow-session/<id>` fetch, which time+machine-joins the MACHINE-scoped
+ *   `/flow-dispatch/<id>` fetch, which time+machine-joins the MACHINE-scoped
  *   `machine.telemetry` sampler's records into that window server-side
  *   (`join_host_samples_into_session_records`,
  *   `crates/darkmux-serve/src/lib.rs`). Since schema 1.42.0 / #2413 that

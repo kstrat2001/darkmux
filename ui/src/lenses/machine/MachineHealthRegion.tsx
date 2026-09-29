@@ -29,7 +29,8 @@ import { memBytes, reclaimableNote, relAgoFrom } from "../../lib/format";
 import { attributionLine, DAEMON_UNREACHABLE_MESSAGE, estimatedSummaryLine, limitDescription, notLocalMessage, overPriceHint, stampLine, STALE_BANNER_TEXT } from "./memoryLedgerLines";
 import { Meter, CX, type MeterBand, type MeterTick } from "../../components/Meter";
 import { useIsMobile } from "../../hooks/useIsMobile";
-import type { MachineResources, MachineResourcesModel } from "../../types/handwritten";
+import type { MachineResourcesResponse } from "../../types/generated/MachineResourcesResponse";
+import type { ModelRow } from "../../types/generated/ModelRow";
 
 /**
  * (#1806 Stage 2/3 — the machine-lens redesign, `docs/design/machine-lens/proposal.md` in the design
@@ -121,7 +122,7 @@ function odoLayout(chars: string[]): { cells: { ch: string; x: number; w: number
   return { cells, width };
 }
 
-function Gauge({ resources, stale }: { resources: MachineResources; stale: boolean }) {
+function Gauge({ resources, stale }: { resources: MachineResourcesResponse; stale: boolean }) {
   const geo = computeGaugeGeometry(resources);
   const pressureRed = !!resources.pressure?.red;
   const overLimit = isOverLimit(resources.machine.current_bytes, resources.limit_bytes);
@@ -278,7 +279,7 @@ function Gauge({ resources, stale }: { resources: MachineResources; stale: boole
  * (`used - darkmux`), and giving it a swatch would present arithmetic as a
  * measured band.
  */
-function GaugeLegend({ resources, band }: { resources: MachineResources; band: ReturnType<typeof computeBandGeometry> }) {
+function GaugeLegend({ resources, band }: { resources: MachineResourcesResponse; band: ReturnType<typeof computeBandGeometry> }) {
   const growth = band.growth.lengthPct > 0;
   const other = resources.pool?.used_bytes != null && resources.machine.current_bytes != null
     ? Math.max(0, Number(resources.pool.used_bytes) - Number(resources.machine.current_bytes))
@@ -318,7 +319,7 @@ function LampRow({
   resourcesErrored,
   residencyChanged,
 }: {
-  resources: MachineResources;
+  resources: MachineResourcesResponse;
   resourcesErrored: boolean;
   residencyChanged: boolean;
 }) {
@@ -369,7 +370,7 @@ function LampRow({
  * the fact still exists exactly once, just behind the one control rather
  * than three.
  */
-function Odometer({ resources }: { resources: MachineResources }) {
+function Odometer({ resources }: { resources: MachineResourcesResponse }) {
   const tiles = odometerTiles(resources.pressure);
 
   return (
@@ -451,7 +452,7 @@ function ModelRow({
   nowMs: number;
   machineState: string | null | undefined;
 }) {
-  const m: MachineResourcesModel = row.model;
+  const m: ModelRow = row.model;
   const isGhost = row.status === "ghost";
   const isNew = row.status === "new";
   const overHint = overPriceHint(m);
@@ -605,7 +606,7 @@ function ModelRows({
 export interface HealthRegionProps {
   isLocalMach: boolean;
   machineName: string;
-  resources: MachineResources | null; // the last GOOD payload — see #1812
+  resources: MachineResourcesResponse | null; // the last GOOD payload — see #1812
   resourcesErrored: boolean; // the LATEST poll failed (may still have `resources` from an earlier one)
   residencyRows?: ResidencyRowView[];
   residencyChanged?: boolean;

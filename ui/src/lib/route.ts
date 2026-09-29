@@ -8,8 +8,8 @@
  * resolving once `/next` takes over.
  *
  * Precedence when the hash carries multiple intents (same order `boot()`
- * checks them in): `lens=fleet` > `lens=runs`/`lens=lab` > `lens=machine` >
- * `lens=console` > `mission=`/`dispatch=` (alias `session=`) > a static-build's
+ * checks them in): `lens=fleet` > `lens=runs` > `lens=machine` >
+ * `lens=console` > `mission=`/`dispatch=` > a static-build's
  * `darkmux-flow-src` meta (#1801 — see below) > a bare `#<date>` (or
  * `?date=`) playback pin > default fleet. `lens=fleet` (#1920) is just the
  * EXPLICIT name for the same default the bottom of this function already
@@ -20,7 +20,7 @@
  * recognize even after lowercasing (not
  * `fleet`/`runs`/`lab`/`machine`/`console`, and no bare `mission=`/
  * `dispatch=`/date present either) falls through to `unknown` — a visible
- * "lens not ported yet" placeholder naming the raw hash, never a blank
+ * "unknown route" page naming the raw hash, never a blank
  * page (the overnight runbook's render-sanity contract).
  *
  * (Packet 4) The bare-date form is `targetDate()`'s convenience in
@@ -51,13 +51,10 @@ export type RunsKind = (typeof RUNS_KINDS)[number];
  * `lenses/console/panels.ts` — this list is the routing-grammar's business,
  * not the lens's.
  *
- * (#1911) `mission-status-all` dropped out of this list — it is no longer a
- * base verb, exactly mirroring `panel.rs`'s own layer-2 guard ("flags are
- * opts, ids are verbs": its old argv `["mission","status","--all"]` bakes a
- * flag into base argv, which the Rust-side allowlist no longer tolerates as
- * a direct entry). It survives only as a one-release alias — see
- * `PANEL_ALIASES` below, the client twin of `panel.rs`'s `resolve_alias`.
- * `run-list` joins in its place, the CLI twin of the RUNS lens's union
+ * (#1911) There is no `mission-status-all`: the unlimited board is
+ * `mission-status` with `opt.all=all`, mirroring `panel.rs`'s own layer-2
+ * guard ("flags are opts, ids are verbs"). A `panel=mission-status-all` hash
+ * is an unknown panel. `run-list` is the CLI twin of the RUNS lens's union
  * (`src/run_list.rs`). */
 export const PANEL_IDS = [
   "mission-status",
@@ -70,22 +67,6 @@ export const PANEL_IDS = [
   "doctor",
 ] as const;
 export type PanelId = (typeof PANEL_IDS)[number];
-
-/** One-release compatibility alias (#1911): the client twin of `panel.rs`'s
- * `resolve_alias`. A `panel=mission-status-all` deep link — the CLI has
- * printed these (`panel_deep_link` in `src/mission_status.rs`) and an
- * operator may have bookmarked one — resolves to the BASE id `panelId`
- * plus the FORCED opt selections that reproduce the old entry's exact
- * behavior. `parseRoute` applies the forced opts LAST (after any `opt.*`
- * the hash also carried), matching the server's own "the alias's whole
- * point is a fixed, non-negotiable selection" ordering. `hashSync`'s
- * `canonicalHash` then rewrites the address bar to the canonical
- * `panel=mission-status&opt.all=all` form — the SAME upgrade path
- * `#lens=lab` → `#lens=runs&kind=lab` already uses. Dropped entirely once
- * every emitter has migrated, per the pre-1.0 no-compat-baggage posture. */
-const PANEL_ALIASES: Readonly<Record<string, { panelId: PanelId; opts: Readonly<Record<string, string>> }>> = {
-  "mission-status-all": { panelId: "mission-status", opts: { all: "all" } },
-};
 
 export type Route =
   | { kind: "fleet" }
@@ -110,8 +91,7 @@ export type Route =
    * (#2929) The value is a machine KEY (`lib/machineKey.ts`: the machine's
    * name, or `<name>~<hash>` / `unnamed-<hash>`), never the hardware uid — a uid in the address
    * bar identifies the physical machine to anyone shown a screenshot or a
-   * link. The parser stays lenient: an old link's uid lands here verbatim,
-   * and `RunsBoard` resolves it and rewrites the hash to the key. */
+   * link. */
   | { kind: "runs"; runsKind: RunsKind; run: string | null; machine: string | null }
   /** `machine` (named `uid` before #2929) — widened in the drill-in packet
    * to carry a SPECIFIC machine: `null` for the nav-tab/deep-link entry
@@ -131,8 +111,8 @@ export type Route =
    *
    * (#2929) Renamed `uid` -> `machine`, and the param with it: the value is
    * a machine KEY (`lib/machineKey.ts`), never the hardware uid, written as
-   * `machine=<key>` like the runs lens's pin. An old `uid=<uid>` link still
-   * parses (into this same field) and `MachineLens` rewrites it to the key. */
+   * `machine=<key>` like the runs lens's pin. The `uid=` spelling is gone: a
+   * hash carrying it is not a machine route. */
   | { kind: "machine"; machine: string | null }
   /** `panelId` is `""` for "no explicit panel requested" AND for "an
    * unrecognized id" — both parse the same way, matching legacy's
@@ -168,12 +148,9 @@ export type Route =
    * (`RUNS_KINDS`, `RunKind::Dispatch`, `darkmux dispatch <role>`); only the
    * route said "session".
    *
-   * `session=` is accepted as a ONE-RELEASE ALIAS (see `parseRoute`), the
-   * same shape `PANEL_ALIASES` below uses, because this module's header
-   * requires every bookmark and printed deep link to keep resolving. The
-   * `dispatchId` is still the flow `session_id` on the wire — that FIELD
-   * keeps its name (renaming it strands every archive, and #1974 demotes
-   * "session" to an internal join key rather than deleting it). An open
+   * There is no `session=` spelling. The `dispatchId` is still the flow
+   * `session_id` on the wire: that FIELD keeps its name (renaming it strands
+   * every archive; "session" is an internal join key). An open
    * string, same precedent as `machine.machine` above.
    *
    * `missionId` (`dispatch.mission=<id>`, see {@link dispatchHash}) names
@@ -207,7 +184,7 @@ export type Route =
    * OTHER date, forcing the playback fetch branch instead of the live
    * window — a genuinely different render, not just a different label on
    * the same one. See `route.ts`'s own module doc for the precedence this
-   * sits at (lowest, below every `lens=`/`mission=`/`session=` form).
+   * sits at (lowest, below every `lens=`/`mission=`/`dispatch=` form).
    *
    * (#1801) `date` is `string | null` — `null` ONLY when a static build (`getSource().kind`)
    * forced this route (see below): a static demo build has no server-
@@ -401,8 +378,8 @@ export function parseRoute(): Route {
     return { kind: "fleet" };
   }
 
-  if (lens === "runs" || lens === "lab") {
-    const rawKind = (get("kind") || (lens === "lab" ? "lab" : "all")).toLowerCase();
+  if (lens === "runs") {
+    const rawKind = (get("kind") || "all").toLowerCase();
     const runsKind = (RUNS_KINDS as readonly string[]).includes(rawKind)
       ? (rawKind as RunsKind)
       : "all";
@@ -412,19 +389,13 @@ export function parseRoute(): Route {
   }
 
   if (lens === "machine") {
-    // (#2929) `machine=<key>` is canonical; `uid=` is an old link's spelling.
-    const machine = get("machine") || get("uid");
+    const machine = get("machine");
     return { kind: "machine", machine: machine ? machine : null };
   }
 
   if (lens === "console") {
     const rawPanel = get("panel");
-    const alias = PANEL_ALIASES[rawPanel];
-    const panelId: PanelId | "" = alias
-      ? alias.panelId
-      : (PANEL_IDS as readonly string[]).includes(rawPanel)
-        ? (rawPanel as PanelId)
-        : "";
+    const panelId: PanelId | "" = (PANEL_IDS as readonly string[]).includes(rawPanel) ? (rawPanel as PanelId) : "";
     // (#1911) `opt.<name>` — read from BOTH the hash and the query string,
     // same dual-source posture `get()` already gives every other param;
     // hash wins on a name present in both. Validated against `panelId`'s
@@ -434,8 +405,8 @@ export function parseRoute(): Route {
     // (#1920) Hash first, then search fills only what the hash did not
     // set — so a non-empty SEARCH value wins, matching `get()` above
     // (`search.get(name) || hash.get(name)`) and therefore every other
-    // NAMED param: `lens`, `panel`, `machine`, `uid`, `mission`,
-    // `session`. The first draft appended hash last and let it overwrite
+    // NAMED param: `lens`, `panel`, `machine`, `mission`,
+    // `dispatch`. The first draft appended hash last and let it overwrite
     // unconditionally, so `opt.kind=` and `panel=` on one page obeyed
     // opposite rules.
     //
@@ -447,11 +418,7 @@ export function parseRoute(): Route {
     const rawOpts: Record<string, string> = {};
     for (const [k, v] of hash.entries()) if (k.startsWith("opt.")) rawOpts[k.slice(4)] = v;
     for (const [k, v] of search.entries()) if (k.startsWith("opt.") && v !== "") rawOpts[k.slice(4)] = v;
-    let opts: Readonly<Record<string, string>> = panelId ? sanitizeOptParams(panelId, rawOpts) : {};
-    // The alias's forced selection wins over anything a stray `opt.*`
-    // param claimed — mirrors `panel.rs::resolve_alias`'s own doc: "the
-    // alias's whole point is a fixed, non-negotiable selection".
-    if (alias) opts = { ...opts, ...alias.opts };
+    const opts: Readonly<Record<string, string>> = panelId ? sanitizeOptParams(panelId, rawOpts) : {};
     return { kind: "console", panelId, opts };
   }
 
@@ -465,11 +432,7 @@ export function parseRoute(): Route {
     return { kind: "mission", missionId: mission, stepId: step ? step : null };
   }
 
-  // (#1974) `dispatch=` is canonical; `session=` is the one-release alias.
-  // Canonical wins when both are present — a hash carrying both is already
-  // malformed, and preferring the new spelling makes `canonicalHash`'s
-  // rewrite idempotent rather than oscillating.
-  const dispatch = get("dispatch") || get("session");
+  const dispatch = get("dispatch");
   if (dispatch) {
     // flow-action-guard:allow — a URL parameter, not an action
     return { kind: "dispatch", dispatchId: dispatch, missionId: get("dispatch.mission") || null };
@@ -494,7 +457,7 @@ export function parseRoute(): Route {
   // renders the one file it has and lets the file's own first record
   // relabel the date (`firstRecordDate`, `lib/flow.ts`), never treats the
   // hash as a request for a day that doesn't exist. Only `lens=`/`mission=`/
-  // `session=` (already checked above) can still preempt this — matching
+  // `dispatch=` (already checked above) can still preempt this — matching
   // this port's existing precedence order (see this file's own module doc);
   // legacy's stricter `cq` suppression of mission/session under flowSrc
   // (`(flowSrc||lq||mq||nq!=null) ? null : catalogQuery()`) is NOT ported —

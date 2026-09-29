@@ -1,5 +1,5 @@
 /**
- * Pure logic for the session drill-in ("run detail" for a `#session=<id>`
+ * Pure logic for the session drill-in ("run detail" for a `#dispatch=<id>`
  * route) — a TypeScript port of `viewer.html`'s `runRegions()`
  * (viewer.html:2064-2285), the derivation behind `renderSubsystem()`
  * (viewer.html:2292-2309). This is the "whole separate render surface"
@@ -8,8 +8,8 @@
  *
  * Validated against the ONE real recorded golden this repo already has for
  * legacy's own render (`tests/parity/goldens/session-task-list.txt`'s
- * `=== stage ===` section, captured from `#session=task-list` against the
- * real corpus fixture `tests/parity/corpus/flow-session-task-list.json`) —
+ * `=== stage ===` section, captured from `#dispatch=task-list` against the
+ * real corpus fixture `tests/parity/corpus/flow-dispatch-task-list.json`) —
  * `sessionRun.test.ts` asserts this module's output matches that golden
  * BYTE-FOR-BYTE against the real fixture data, not a hand-rolled
  * approximation. That corpus happens to carry zero telemetry records
@@ -37,7 +37,7 @@
  * measures against — NOT `Date.now()`. This port has no scrubber for the
  * session route (`isLiveRoute` treats `session` as a historical-slice
  * fetch, not a live tail — see `route.ts`'s own doc), matching legacy's own
- * `state.t=tMax` set once at boot for a `#session=`/`#mission=` catalog
+ * `state.t=tMax` set once at boot for a `#dispatch=`/`#mission=` catalog
  * query and never advanced (no `startLiveTail` runs for it either) — so
  * `nowMs` here is the MAX ts across the fetched records, not wall-clock.
  * Verified against the golden: the session's own `frozen_clock_ms` capture
@@ -62,9 +62,10 @@ import { aggregateLiveState, aggregateTokenRate, averageGenerationRate, lastHear
 import type { LiveState, LiveStateReading } from "../../lib/tokenRate";
 import { mergeLive, type LiveOverlay } from "../../lib/liveChannel";
 import { PURPOSE, sumUsage } from "../../lib/usageRecords";
-import type { DispatchStartPayload, DispatchCompletePayload } from "../../types/handwritten";
+
 import { toolOutcome } from "../../lib/recordDetail";
 import type { RunStatus } from "../../types/generated/RunStatus";
+import type { DispatchCompletePayload, DispatchStartPayload } from "../../lib/flowPayloads";
 import { ACTION, CATEGORY, byTime, isBookendTerminal, latestByTime, recordsAsOf, type NormRecord } from "../../lib/ingest";
 import { maxOf } from "../../lib/numbers";
 
@@ -108,7 +109,7 @@ interface SessionHeader {
    * "open →" link, `data-act="session"` → `drillSession(sid)` — carries
    * that machine context forward and DOES render the machine link there).
    * The golden this module is checked against (`session-task-list.txt`)
-   * was captured via the OTHER real entry point — a bare `#session=<id>`
+   * was captured via the OTHER real entry point — a bare `#dispatch=<id>`
    * catalog deep-link, which never touches `state.machine` at all — so its
    * "(task-list on )" (nothing after "on ") is genuinely empty on THAT
    * path, but not evidence the field is dead everywhere.
@@ -122,7 +123,7 @@ interface SessionHeader {
    * instead of rendering its own rows. `RunsBoard`'s rows carry their OWN
    * drill-ins now (`/mission/<id>/graph` for a tracked mission/dispatch, the
    * in-page lab-run detail for a lab run — see `RunsBoard.tsx`'s
-   * `activateRun`), but neither is a `#session=` drill either. So the real
+   * `activateRun`), but neither is a `#dispatch=` drill either. So the real
    * residual gap is unchanged in shape, just relocated: an operator still
    * cannot reach a bare session-subsystem view (this file's own render
    * target) FROM a machine-scoped list, by any path this port builds today.
@@ -1438,7 +1439,7 @@ function errorOutcome(edge: CloseEdge | undefined): string | undefined {
 
 /** `runRegions()` — viewer.html:2064-2285, minus the two SVG chart regions
  * (see this module's own top doc). `data` should already be scoped to ONE
- * session (the `/flow-session/<id>` response, through `flowToRenderModel`
+ * session (the `/flow-dispatch/<id>` response, through `flowToRenderModel`
  * — see that function's own doc) — `sid` further scopes every derivation
  * to it, matching legacy's `state.session`. */
 /**

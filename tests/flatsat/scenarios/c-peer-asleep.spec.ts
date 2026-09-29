@@ -11,7 +11,7 @@
 // containers run linux/arm64 (Docker Desktop's VM — see Dockerfile's
 // module doc for why a host-built binary can't run there anyway), so
 // NEITHER hub NOR peer ever publishes a presence heartbeat: `/fleet/
-// machines/live` and `/fleet/sessions/live` are permanently `[]` in this
+// machines/live` and `/fleet/dispatches/live` are permanently `[]` in this
 // harness, on every machine, always — there is no live-presence signal to
 // pause-and-watch-expire in the first place. This is a real fleet-wide
 // darkmux constraint the flatsat SURFACES rather than one it introduces;

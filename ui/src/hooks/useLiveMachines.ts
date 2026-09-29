@@ -2,7 +2,11 @@ import { useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../lib/queryKeys";
-import type { CoverageMeta, FleetMachinesLiveResponse, FleetRosterResponse, PresenceBeat, RosterMachineEntry } from "../types/handwritten";
+import type { CoverageMeta } from "../types/generated/CoverageMeta";
+import type { FleetMachinesLiveResponse } from "../types/generated/FleetMachinesLiveResponse";
+import type { FleetRosterResponse } from "../types/generated/FleetRosterResponse";
+import type { PresenceBeat } from "../types/generated/PresenceBeat";
+import type { RosterMachineEntry } from "../types/generated/RosterMachineEntry";
 import { getSource } from "../lib/source";
 
 /** (#2067) The committed fleet snapshot a daemon-less build ships

@@ -13,7 +13,7 @@ import { SessionReplay } from "./SessionReplay";
  * were never wrong. Only the TRANSITION was.
  *
  * Presence is a test INPUT here for the reason `useSessionLiveness.test.tsx`
- * gives at length: driven through the real `/fleet/sessions/live` query, a
+ * gives at length: driven through the real `/fleet/dispatches/live` query, a
  * session poll already scheduled when presence drops can deliver the terminal
  * record on its own and mask the missing fetch.
  *

@@ -1,0 +1,31 @@
+GET /  html
+GET /play/:date  html
+GET /health  json HealthResponse
+GET /flow/:date  json FlowRecord[]
+GET /flow/:date/stream  sse FlowRecord
+GET /flow-days  json FlowDaysResponse
+GET /flow-missions  json FlowMissionsResponse
+GET /flow-mission/:id  json FlowRecordsResponse
+GET /flow-dispatch/:id  json FlowRecordsResponse
+GET /machine/status  json MachineStatusResponse
+GET /machine/specs  json MachineSpecsResponse
+GET /machine/resources  json MachineResourcesResponse
+GET /missions  json MissionsResponse
+GET /runs  json RunsResponse
+GET /panel/:id  json PanelResponse
+GET /phases  json PhasesResponse
+GET /mission/:id/graph.json  json MissionGraph
+GET /manifest.webmanifest  manifest
+GET /apple-touch-icon.png  png
+GET /icon-192.png  png
+GET /favicon-32.png  png
+GET /favicon-16.png  png
+GET /icon-512.png  png
+GET /icon-512-maskable.png  png
+GET /fleet/dispatches/live  json FleetDispatchesLiveResponse
+GET /fleet/machines/live  json FleetMachinesLiveResponse
+GET /fleet/roster  json FleetRosterResponse
+GET /lab/runs  json LabRunsResponse
+GET /lab/run/detail  json LabRunDetailResponse
+GET /lab/run/events  json LabRunEventsResponse
+POST /fleet/work  ndjson (darkmux_fleet submission; fleet listener, not the viewer daemon)

@@ -70,7 +70,7 @@ def ledger_for(machine, world, now_ms):
     Every figure is COMPUTED from the residents and the machine's declared
     headroom, never written down twice, so editing world.json can't produce a
     ledger whose parts disagree with its totals. The derivation rules are the
-    ones documented on `MachineResources` in ui/src/types/handwritten.ts:
+    ones documented on `ModelLedger` in crates/darkmux-profiles/src/model_ledger.rs:
       other_used      = declared non-darkmux usage
       pool.used       = other_used + darkmux current
       projected_total = other_used + darkmux potential
@@ -790,8 +790,8 @@ def main():
         } for m in world["machines"]],
         "meta": {"sources": {"fleet": {"state": "ok"}}, "complete": True},
     }, indent=2))
-    (fx / "fleet-sessions-live.json").write_text(json.dumps({
-        "sessions": [{"session_id": s} for s in live_ids],
+    (fx / "fleet-dispatches-live.json").write_text(json.dumps({
+        "dispatches": [{"session_id": s, "display_name": "demo", "beat_ts_ms": now_ms} for s in live_ids],
         "meta": {"sources": {"fleet": {"state": "ok"}}, "complete": True},
     }, indent=2))
 
