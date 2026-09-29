@@ -4,7 +4,7 @@ This file is for any AI agent (Claude Code, Cursor, OpenClaw, etc.) that's helpi
 
 ## What darkmux is
 
-A Rust CLI (v2.x) that is two things for users running local LLMs:
+A Rust CLI that is two things for users running local LLMs:
 
 1. **Mission orchestrator**: config-defined missions launched with `darkmux mission launch <config>` that run as a live task graph. A crew of local-AI roles works the phases through the internal Docker-bounded runtime (any seat can instead be staffed by a hosted cloud endpoint), every dispatch gated on operator sign-off, each run finalizing into a typed envelope. `darkmux dispatch <role> <message>` is the task-grain entry point (one role, one turn). This is the 2.0 headline.
 2. **Lab harness**: `darkmux lab run <workload>` dispatches a workload against the same internal runtime and records timing + trajectory + verify outcome under `.darkmux/lab/<run-id>/`.
@@ -130,11 +130,12 @@ Faster tests are not more trustworthy tests. A suite with a false-green gate
 (#1716) or a vacuous assertion (#1664) returns its wrong answer sooner in a
 lane. Speed is an ergonomics fix; trust is a separate, open problem.
 
-**And "CI is the gate" has one real hole**: `plugins/darkmux-bundler-rust` has
-37 tests that **no CI job runs** — it is workspace-excluded, and the only
-workflow touching it merely `cargo build`s it on manual dispatch. So `t-all`
-misses it and CI does not cover it either. Deferring to CI is right everywhere
-else; there, it is deferring to nothing.
+**And "CI is the gate" has one real hole**: `plugins/darkmux-bundler-rust` is
+workspace-excluded, so `t-all` and the workspace suite never run its tests. They
+run in exactly one place, the PR-diff mutation job, and only on a pull request
+whose diff touches the plugin (or `runtime/`). A change elsewhere that breaks it
+reaches `main` unseen. Deferring to CI is right everywhere else; there, it is
+deferring to a check that mostly skips.
 
 ## Releasing — the gate, and where the steps live
 
@@ -334,9 +335,9 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
 
      *Candidates rejected on collision, recorded so they are not re-proposed:* **task** and
      **job** and **activity** and **assignment** are all TAKEN at other grains — `task` is the
-     parent layer; `job` is the fleet work queue (`fleet::WorkJob`/`ClaimedJob`/`claim_job`,
-     and `WORK_JOB_SCHEMA_VERSION` is a wire schema), where a job is a PHASE claimed by a peer
-     machine; `activity` is the viewer's activity lanes; `assignment` is Task-level resource
+     parent layer; `job` is fleet work submission (`darkmux_fleet::WorkJob`/`WorkSubmission`,
+     and `WORK_JOB_SCHEMA_VERSION` is a wire schema), where a job is one dispatch sent to a
+     peer machine's fleet listener; `activity` is the viewer's activity lanes; `assignment` is Task-level resource
      assignment. Reusing any of them would recreate this exact defect one word over. `shift`
      and `stint` are genuinely free and were weighed for being more humanized; `execution`
      won on precision and on composing cleanly for sub-executions.
@@ -350,7 +351,7 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
      layer exists.** `procedural.shell`/`procedural.noop` contain zero; `dispatch.internal` and
      `dispatch.single_shot` contain one; `dispatch.map` contains one per collection item
      (with per-item error isolation — its own doc contrasts it with "a single-dispatch
-     step"), and the review pipeline's probe and judge steps contain seats x draws. Do NOT
+     step"), and a `crawl.unit` step contains one per draw. Do NOT
      insert a further noun between step and role execution to name the N: a 1:1 wrapper earns nothing, and
      the N already has three domain names that are not synonyms — `dispatch.map`'s **items**
      (what the work is done to), review's **seats** (which staffed model does it), and
@@ -367,13 +368,15 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    Two consequences that new code inherits:
 
    - **A role execution has exactly one SPECIALIST role.** Utility invocations inside it
-     are SUB-EXECUTIONS — themselves role executions, of a utility role — attributed to their
-     OWN role and model, never blended into the primary's metrics. What counts as utility has
+     are SUB-EXECUTIONS, attributed to a utility role and their OWN model, never blended into
+     the primary's metrics. They run lean (contract 2's amendment): a usage record and
+     `utility.start`, with no bookends, session or run, so "sub-execution" means "attributed to
+     its own role and model", not "has its own bookend pair". What counts as utility has
      ONE definition, `darkmux_crew::usage::call_purpose` (compaction and the radio router —
      darkmux's own jobs, run on the machine's one utility model, #2914; the scribe and
      mission-compiler roles this entry used to list were retired in #2912/#2913), and every
-     consumer that splits work from utility reads it rather than keeping its own list. Naming the unit for the role is what makes this compose rather than needing a
-     special case: a sub-execution is the same kind of thing as its parent, one level in. The compactor's per-call usage record
+     consumer that splits work from utility reads it rather than keeping its own list. Naming the unit for the role is what lets attribution compose: a sub-execution is
+     attributed the way its parent is, one level in. The compactor's per-call usage record
      (`telemetry.tokens`, `call_kind: "compaction"`) conforms since #2902 step 1b: its `handle` is `compactor`
      and its `model` the compactor's. The `dispatch.compaction` and `telemetry.compaction` records still carry
      the specialist's `role_id`/`model` at record level, naming the compactor only in `payload.compactor_model`
@@ -406,18 +409,20 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    in test code, the viewer, docs, skills, templates and fixtures, on any string that looks
    like an action and is not a current one (an old spelling, or a made-up
    `<scope>.<event>`); recorded archives are exempt.
-   Hook rules written in an old exact spelling are read as the current action. What entry 8
+   A hook rule that names a retired action spelling, an exact one or a spaced glob, is refused
+   (`darkmux_flow::hooks::retired_rule_actions`): the hook sink does not load and doctor fails
+   the rule, naming the spelling to write. What entry 8
    fixes is the WORD used in code, docs, UI and on the wire, where `dispatch` had come to
    mean both ends of the ladder at once; the run grain now has its own bookends (below).
    Both contracts stand: contract 2 says liveness must be visible, contract 8 says which
    noun means which grain.
 
-   Verified by enumerating every completion-endpoint (`chat/completions`) call site — five
-   modules. Two host-side entry points bookend per execution and are correct:
-   `crew::dispatch::dispatch` and `dispatch_local_single_shot`. Everything model-bearing
-   routes through one of them: all three lab providers (`providers/prompt.rs:209`,
-   `coding_task.rs:835`, `tool_bench.rs:1037`), coder-phase, and radio (`src/radio.rs:539`).
-   Two things do not:
+   Verified by enumerating every completion-endpoint (`chat/completions`) call site. Two
+   host-side entry points bookend per execution and are correct: `crew::dispatch::dispatch`
+   and `dispatch_local_single_shot`. Everything model-bearing routes through one of them: all
+   three lab providers (`prompt`, `coding_task` and `tool_bench` under
+   `crates/darkmux-lab/src/providers/`), coder-phase, and radio's answering seat. Two things
+   do not bookend:
 
    - **Compaction is a sub-execution.** `runtime/src/compaction.rs` calls the endpoint with
      its own `compactor_model` (a 4B utility agent) inside the specialist's role execution,
@@ -434,8 +439,9 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
      (`crawl.unit` → `darkmux_crew::dispatch::dispatch`, bookended, for `reviewer`;
      `dispatch.internal` for the optional `coder` seat), so the bypass this bullet describes
      no longer exists. The surviving `single_shot_chat` call site is the generic Tier-1
-     `dispatch.single_shot` kind (`crates/darkmux-crew/src/step_kinds/builtins.rs:794`,
-     hosted twin at `:738`) — not review-specific, and not used by `review.json`.
+     `dispatch.single_shot` kind (`crates/darkmux-crew/src/step_kinds/builtins.rs`, its hosted
+     twin beside it), which bookends each execution through `ExecutionBookends`. It is not
+     review-specific, and not used by `review.json`.
 
    **Every record of an execution names it: `execution_id` (4.0).** The id
    (`darkmux_types::execution_id::ExecutionId`) is minted ONCE per role execution at the
@@ -548,6 +554,7 @@ darkmux's canonical config surface is **`~/.darkmux/config.json`** (#661), writt
   "audit":   { "enabled": false, "dir": "~/.darkmux/audit" },
   "runtime": { "inactivity_timeout_seconds": 600, "strict_selection": false, "feedback_injection": true, "check_updates": true },
   "remote":  { "max_tokens_per_step": null, "step_budget_policy": null, "concurrent_cap": 1 },
+  "serve":   { "token_keychain": false, "read_auth": false },
   "power":   { "min_battery_pct": 50, "refuse_start_below_min": true, "pause_running_below_min": true },
   "fleet":   { "mode": "standalone" }
 }
@@ -632,8 +639,11 @@ src/                          CLI command layer (clap)
   cli.rs                      The clap Command enum (the top-level verb surface)
   (dispatch is a top-level verb; the per-command modules:)
   mission_launch.rs           `mission launch <config>`: mint + drive a mission instance from a config (the `review` config's dedicated launcher — bundle→probe→dedup→judge→verify→synthesis — was deleted in #2310 P4d; `review` now runs through this generic launcher, same as any other config)
-  acp_panel.rs                Registry-advertised ACP panel commands (#1684 Packet 1); `synthesize_diff_launch_inputs` derives diff/head_sha/workspace params for a no-argument `/review`-style panel launch from the cwd's own git state
-  crawl_launch.rs             The crawl launcher (#1959) — `mission launch crawl`'s Task/Step graph is computed at run time from a resolved crawl plan (darkmux-lab's `crawl::plan`), never declared in a mission-config document; routed by literal config id, BEFORE `mission_config::load` runs
+  acp_panel.rs                The ACP panel's ONE generic `/mission list|launch|show` command and the ephemeral runner for model-free configs; `prepare_launch` derives diff/head_sha/workspace params for a no-argument `/mission launch review` from the cwd's own git state
+  mission_show.rs             `mission show <id>` (and the panel's `/mission show`): one mission in full, from one derivation
+  mission_config_cli.rs       `mission config list|show`: the launchable configs and their declared inputs
+  radio.rs / radio_cli.rs / radio_busy.rs  `darkmux radio`: free text routed onto one launchable config on the utility model, confirmed before it runs; the busy check answers from facts
+  cli_json.rs                 `--json` output contract: one named type per verb (`cli_outputs!`), pinned by `tests/cli-json.golden`
   coder_phase.rs              coder-phase pipeline StepKinds (worktree/coder/verify): Tier-3 bespoke, launch-owned (`mission run` retired #1426 ship-4)
   mission_status.rs           `mission status`: the read-only mission board
   run_list.rs                 `run list`: the cross-kind union (mission, dispatch, lab), the CLI twin of `GET /runs`
@@ -694,8 +704,8 @@ tests/cli.rs                  Integration tests (spawn the binary)
 
 ## Conventions to follow
 
-- **Don't add dependencies casually.** The dep set is deliberately small (`anyhow`, `clap`, `serde`, `serde_json`, `dirs`). A 10-line inline module beats a crate for small one-off needs (see `mod pathdiff` in `src/providers/coding_task.rs`).
-- **Trait providers, not feature flags.** New workload kinds go through the `WorkloadProvider` trait in `src/workloads/types.rs`, registered in `src/workloads/registry.rs::register_builtins()`. Don't bolt new behavior into the lab orchestrator.
+- **Don't add dependencies casually.** The dep set is deliberately small (`anyhow`, `clap`, `serde`, `serde_json`, `dirs`). A 10-line inline module beats a crate for small one-off needs.
+- **Trait providers, not feature flags.** New workload kinds go through the `WorkloadProvider` trait in `crates/darkmux-lab/src/workloads/types.rs`, registered in `register_builtins()` in `crates/darkmux-lab/src/providers/mod.rs`. Don't bolt new behavior into the lab orchestrator.
 - **Manifests are JSON.** Workload manifests, profile registries, run manifests — all JSON. The repo briefly used YAML; that switch is done. Don't reintroduce YAML.
 - **Tests over prints.** Mutating-state tests (cwd, env vars) need `#[serial_test::serial]` to avoid races. Integration tests in `tests/cli.rs` use `assert_cmd` to spawn the binary.
 
@@ -762,8 +772,8 @@ If a user asks you to:
 
 | Ask | Do |
 |---|---|
-| "add a new workload" | Drop a JSON manifest at `templates/builtin/workloads/<id>.json`. If it's a `prompt` workload, register it in `EMBEDDED_WORKLOADS` in `src/workloads/load.rs`. coding-task workloads need a sandbox seed dir and CAN'T be embedded. |
-| "add a new provider" | Implement `WorkloadProvider` in `src/providers/<name>.rs`, register it in `src/workloads/registry.rs::register_builtins()`. |
+| "add a new workload" | Drop a JSON manifest at `templates/builtin/workloads/<id>.json`. If it's a `prompt` workload, register it in `EMBEDDED_WORKLOADS` in `crates/darkmux-lab/src/workloads/load.rs`. coding-task workloads need a sandbox seed dir and CAN'T be embedded. |
+| "add a new provider" | Implement `WorkloadProvider` in `crates/darkmux-lab/src/providers/<name>.rs`, register it in `register_builtins()` in `crates/darkmux-lab/src/providers/mod.rs`. |
 | "add a lab fixture" | Create a dir with a `.fixture.json` manifest (`name` required; `satisfies`, `verify_command`, `required_files` optional), then `darkmux lab fixture register <path>`. A workload binds to it via `requires_fixture: "<name>@<version>"`. Built-ins live under `templates/builtin/lab-fixtures/` and register via `scripts/lab-init.sh`. |
 | "check fixtures are healthy" | `darkmux lab doctor` — offline check that registered paths exist, manifests load, required files are present, and content hashes haven't drifted. |
 | "run the smoke test" | `cargo install --path . && darkmux lab run quick-q`. Should complete in ~6-10s if a model is loaded. |
