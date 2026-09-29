@@ -23,7 +23,13 @@ pub fn problems(kind: UserFileKind, reach: Reach) -> Vec<FileProblem> {
         UserFileKind::MissionConfig => {
             let docs: Vec<(String, std::path::PathBuf)> =
                 crate::mission_config::load::on_disk_dirs().iter().flat_map(|d| json_docs_by_stem(d)).collect();
-            check_tiered::<MissionConfig>(kind, &docs, &crate::mission_config::retired_key, reach)
+            check_tiered::<MissionConfig>(
+                kind,
+                &docs,
+                &crate::mission_config::retired_key,
+                &crate::step_config::gate::step_config_issues,
+                reach,
+            )
         }
         UserFileKind::Rule => check_dir::<Rule>(kind, &crate::rules::user_rules_dir(), &no_retired)
             .into_iter()

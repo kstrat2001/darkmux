@@ -1181,20 +1181,19 @@ pub fn run_step_graph(
             // shared bucket (get-or-create), so grouped siblings share ONE
             // allowance. Ungrouped steps carry `None` and fall back to a
             // step-scoped bucket inside the kind.
-            let remote_bucket = match step_snapshot.config.get("bucket_group").and_then(|v| v.as_str()) {
+            let remote_bucket = match crate::step_config::bucket_of(&step_snapshot.kind, &step_snapshot.config) {
                 None => None,
-                Some(group) => {
+                Some((group, explicit)) => {
                     // (#1442 ship-2b) A launcher may stamp the group's
-                    // budget into the step's own config (`bucket_budget`,
-                    // u64), the same key `dispatch.map`'s step-scoped
-                    // fallback honors. Sibling steps of one group are
-                    // expected to declare the SAME value; the first step to
-                    // create the group's bucket wins (the bucket lives for
-                    // the whole graph run). Absent, `remote.max_tokens_per_
-                    // step` applies, and (#2902 step 5) with neither there
-                    // is no per-step cap.
-                    let explicit = step_snapshot.config.get("bucket_budget").and_then(|v| v.as_u64());
-                    let bucket = match bucket_groups.get(group) {
+                    // budget into the step's own config (`bucket_budget`),
+                    // the same key `dispatch.map`'s step-scoped fallback
+                    // honors. Sibling steps of one group are expected to
+                    // declare the SAME value; the first step to create the
+                    // group's bucket wins (the bucket lives for the whole
+                    // graph run). Absent, `remote.max_tokens_per_step`
+                    // applies, and (#2902 step 5) with neither there is no
+                    // per-step cap.
+                    let bucket = match bucket_groups.get(&group) {
                         Some(b) => b.clone(),
                         None => {
                             let b = std::sync::Arc::new(std::sync::Mutex::new(
@@ -1202,7 +1201,7 @@ pub fn run_step_graph(
                                     .map_err(|e| anyhow::anyhow!(e.to_string()))
                                     .with_context_step(&step_snapshot)?,
                             ));
-                            bucket_groups.insert(group.to_string(), b.clone());
+                            bucket_groups.insert(group, b.clone());
                             b
                         }
                     };
@@ -3782,7 +3781,9 @@ mod tests {
     /// once, then spends the WHOLE remaining allowance (so a shared bucket is
     /// exhausted for the next grouped sibling). Records `(step_id,
     /// had_shared_bucket, admitted)` so a test can prove one allowance was
-    /// shared across siblings — vs an ungrouped step getting `None`.
+    /// shared across siblings — vs an ungrouped step getting `None`. It
+    /// stands in for `dispatch.map`, the one kind that meters through a
+    /// group (`step_config::bucket_of`).
     struct BucketProbeKind {
         log: Arc<Mutex<Vec<(String, bool, bool)>>>,
     }
@@ -3808,7 +3809,7 @@ mod tests {
             SeatClaim::NoModel
         }
         fn id(&self) -> &'static str {
-            "test.bucket-probe"
+            "dispatch.map"
         }
         fn run(
             &self,
@@ -3881,8 +3882,8 @@ mod tests {
         let log = Arc::new(Mutex::new(Vec::new()));
         let kind = Arc::new(BucketProbeKind { log: log.clone() });
         let cfg = json!({ "bucket_group": "probe" });
-        let (ta, sa) = kinded_step("a", "test.bucket-probe", cfg.clone(), &[]);
-        let (tb, sb) = kinded_step("b", "test.bucket-probe", cfg, &["a"]);
+        let (ta, sa) = kinded_step("a", "dispatch.map", cfg.clone(), &[]);
+        let (tb, sb) = kinded_step("b", "dispatch.map", cfg, &["a"]);
         let (tasks, mut steps) = graph(vec![(ta, sa), (tb, sb)]);
 
         run_graph_with_kind(kind, &tasks, &mut steps);
@@ -3908,7 +3909,7 @@ mod tests {
         // step-scoped bucket inside its own kind, never joining a group.
         let log = Arc::new(Mutex::new(Vec::new()));
         let kind = Arc::new(BucketProbeKind { log: log.clone() });
-        let (ta, sa) = kinded_step("solo", "test.bucket-probe", json!({}), &[]);
+        let (ta, sa) = kinded_step("solo", "dispatch.map", json!({}), &[]);
         let (tasks, mut steps) = graph(vec![(ta, sa)]);
 
         run_graph_with_kind(kind, &tasks, &mut steps);

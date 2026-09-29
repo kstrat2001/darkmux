@@ -115,6 +115,7 @@
 //! gate skips with `"no test_command configured"`.
 
 use crate::mods::{self, GateOutcome, ModRecord};
+use crate::step_config::{load, non_blank, ConfigKind, ModsGateConfig};
 use crate::step_kinds::registry::StepKindRegistry;
 use crate::step_kinds::types::{CwdPolicy, SeatClaim, StepKind, StepOutcome, StepRunCtx};
 use crate::types::{Step, Task};
@@ -125,7 +126,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-pub const MODS_GATE_KIND: &str = "mods.gate";
+pub const MODS_GATE_KIND: &str = ConfigKind::ModsGate.id();
 
 /// What one `mods.gate` step reports as its own output — a small summary,
 /// never the gated mods themselves (a reader wanting those reads the mod
@@ -198,15 +199,13 @@ impl StepKind for ModsGateStepKind {
     }
 
     fn run(&self, step: &Step, _task: &Task, _input: &BTreeMap<String, String>, _ctx: &StepRunCtx) -> Result<StepOutcome> {
-        let for_key = step
-            .config
-            .get("for_key")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.trim().is_empty())
+        let cfg: ModsGateConfig = load(step, ConfigKind::ModsGate)?;
+        let for_key = non_blank(Some(cfg.for_key))
             .ok_or_else(|| anyhow!("step `{}`: `{MODS_GATE_KIND}` requires config.for_key", step.id))?;
-        let test_command =
-            step.config.get("test_command").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty());
-        let workdir = step.config.get("workdir").and_then(|v| v.as_str());
+        let for_key = for_key.as_str();
+        let test_command = non_blank(cfg.test_command);
+        let test_command = test_command.as_deref();
+        let workdir = cfg.workdir.as_deref();
 
         let root = mods::mods_dir();
         let all = mods::load_all_at(&root).context("loading the mod store")?;

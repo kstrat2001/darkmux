@@ -19,6 +19,7 @@ pub mod execution_id;
 pub mod flock;
 #[cfg(unix)]
 pub mod interrupt;
+pub mod param_scalar;
 pub mod paths;
 pub mod profile_address;
 pub mod residency_lease;

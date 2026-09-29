@@ -456,7 +456,8 @@ fn config_timeout_seconds_garbage_value_is_refused_by_name() {
     }));
     let err = UnitStepConfig::from_step(&step).expect_err("a non-numeric timeout_seconds must be refused");
     let msg = format!("{err:#}");
-    assert!(msg.contains("must be a positive"), "{msg}");
+    assert!(msg.contains("`config.timeout_seconds` must be"), "{msg}");
+    assert!(msg.contains("non-negative integer"), "{msg}");
     assert!(msg.contains("soon"), "the offending value is named: {msg}");
 }
 

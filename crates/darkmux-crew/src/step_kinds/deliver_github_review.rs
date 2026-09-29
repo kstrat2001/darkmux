@@ -40,6 +40,7 @@
 
 use crate::findings::FindingRecord;
 use crate::mods::ModRecord;
+use crate::step_config::{load, non_blank, ConfigKind, DeliverGithubReviewConfig};
 use crate::step_kinds::registry::StepKindRegistry;
 use crate::step_kinds::types::{CwdPolicy, Port, SeatClaim, StepKind, StepOutcome, StepRunCtx};
 use crate::types::{Step, Task};
@@ -50,7 +51,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-pub const DELIVER_GITHUB_REVIEW_KIND: &str = "deliver.github_review";
+pub const DELIVER_GITHUB_REVIEW_KIND: &str = ConfigKind::DeliverGithubReview.id();
 
 /// One mod plus whether it passed its gate — the fact a bare [`ModRecord`]
 /// does not carry. A mod record is the proposed change (#2265's own
@@ -1523,30 +1524,23 @@ impl DeliverConfig {
     /// from it as a group. `attribution`/`emit` are launch-time strings,
     /// never data, and always come from `step.config` either way.
     fn from_step(step: &Step, input: &BTreeMap<String, String>) -> Result<Self> {
-        let attribution = step.config.get("attribution").and_then(|v| v.as_str()).map(str::to_string);
-        let emit = step.config.get("emit").and_then(|v| v.as_str()).map(PathBuf::from);
+        let cfg: DeliverGithubReviewConfig = load(step, ConfigKind::DeliverGithubReview)?;
+        let attribution = cfg.attribution;
+        let emit = cfg.emit.map(PathBuf::from);
         // (#2429 part 4) A blank `{{head_sha}}` (the param unset at launch)
         // reads the same as absent — never echo an empty string into the
         // payload as though it were a real sha.
-        let head_sha = step.config.get("head_sha").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty()).map(str::to_string);
+        let head_sha = non_blank(cfg.head_sha);
 
-        if step.config.get("findings").is_some() {
-            let field = |key: &str| -> Result<serde_json::Value> {
-                step.config.get(key).cloned().ok_or_else(|| {
-                    anyhow!("step `{}`: `{DELIVER_GITHUB_REVIEW_KIND}` requires config.{key}", step.id)
-                })
-            };
-            let findings: Vec<FindingRecord> = serde_json::from_value(field("findings")?)
+        if let Some(findings) = cfg.findings {
+            let requires = |key: &str| anyhow!("step `{}`: `{DELIVER_GITHUB_REVIEW_KIND}` requires config.{key}", step.id);
+            let findings: Vec<FindingRecord> = serde_json::from_value(findings)
                 .with_context(|| format!("step `{}`: config.findings", step.id))?;
-            let mods: Vec<GatedMod> = serde_json::from_value(field("mods")?)
+            let mods: Vec<GatedMod> = serde_json::from_value(cfg.mods.ok_or_else(|| requires("mods"))?)
                 .with_context(|| format!("step `{}`: config.mods", step.id))?;
-            let diff = field("diff")?
-                .as_str()
-                .map(str::to_string)
-                .ok_or_else(|| anyhow!("step `{}`: config.diff must be a string", step.id))?;
-            let scope: DeliverScope = match step.config.get("scope") {
-                Some(v) => serde_json::from_value(v.clone())
-                    .with_context(|| format!("step `{}`: config.scope", step.id))?,
+            let diff = cfg.diff.ok_or_else(|| requires("diff"))?;
+            let scope: DeliverScope = match cfg.scope {
+                Some(v) => serde_json::from_value(v).with_context(|| format!("step `{}`: config.scope", step.id))?,
                 None => DeliverScope::default(),
             };
             return Ok(Self { findings, mods, diff, scope, attribution, emit, head_sha, absence_backstop: BTreeMap::new() });

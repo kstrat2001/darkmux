@@ -575,7 +575,7 @@ pub fn launch(
     let config_as_declared: &MissionConfig = &config_owned;
     let (config_pruned, prune_report) = match &selection {
         Some(wanted) => mission_config::prune::prune_with_selection(config_as_declared, &|task| {
-            task_declares_rule(task).is_none_or(|rule| wanted.contains(rule))
+            task_declares_rule(task).is_none_or(|rule| wanted.contains(&rule))
         }),
         None => mission_config::prune::prune_disabled(config_as_declared),
     };
@@ -2376,7 +2376,7 @@ fn refuse_bad_inputs(config: &MissionConfig, collected: &BTreeMap<String, serde_
 fn workspace_spec_inputs(config: &MissionConfig) -> std::collections::BTreeSet<String> {
     let steps = config.phases.iter().flat_map(|p| &p.tasks).flat_map(|t| &t.steps);
     steps
-        .filter_map(|s| s.config.get("workspace").and_then(serde_json::Value::as_str))
+        .filter_map(|s| crew::step_config::workspace_of(&s.kind, &s.config))
         .filter_map(|v| v.strip_prefix("{{")?.strip_suffix("}}").map(|n| n.trim().to_string()))
         .collect()
 }
@@ -2954,8 +2954,8 @@ pub(crate) fn promoted_step_body(value: serde_json::Value) -> Option<serde_json:
 /// (#2301) The rule id a task is FOR — the `rule` key on any of its step
 /// configs. A task with no such key (the crawl's own `summary`, and every
 /// task in every other config) belongs to no rule and is never deselected.
-fn task_declares_rule(task: &mission_config::TaskConfig) -> Option<&str> {
-    task.steps.iter().find_map(|s| s.config.get("rule").and_then(|v| v.as_str()))
+fn task_declares_rule(task: &mission_config::TaskConfig) -> Option<String> {
+    task.steps.iter().find_map(|s| crew::step_config::crawl_identity(&s.kind, &s.config).rule)
 }
 
 /// (#2301) The set `--param rules=<csv>` names, or `None` when the operator
@@ -4577,10 +4577,8 @@ fn refuse_utility_staffed_tasks(
         // profile_name` (`task_or_config_str`); the gate reads the same two
         // sources so a config-authored staffing is checked too.
         let step_staffing = task.step_ids.iter().filter_map(|id| steps.get(id)).find_map(|step| {
-            (step.kind == "dispatch.internal")
-                .then(|| step.config.get("role_id").and_then(|v| v.as_str()).map(str::to_string))
-                .flatten()
-                .map(|role| (role, step.config.get("profile_name").and_then(|v| v.as_str()).map(str::to_string)))
+            let (role, profile) = crew::step_config::dispatch_staffing(&step.kind, &step.config);
+            role.map(|role| (role, profile))
         });
         let (role, profile_name) = match (task.role_id.as_deref(), step_staffing) {
             (Some(role), _) => (Some(role.to_string()), task.profile_name.clone()),
@@ -4612,18 +4610,16 @@ fn refuse_utility_staffed_tasks(
             // deployment name, never the local utility instance.
             // (#2902) Through the one resolver: an unmanaged endpoint (or one
             // that cannot be resolved, which `run` refuses) skips the check.
+            let Some(call) = crew::step_config::model_call(&step.kind, &step.config) else { continue };
             if !matches!(
-                crew::target::step_unmanaged_endpoint(
-                    &step.config,
-                    step.config.get("config_path").and_then(|v| v.as_str())
-                ),
+                crew::target::step_unmanaged_endpoint(call.endpoint.as_ref(), call.config_path.as_deref()),
                 Ok(None)
             ) {
                 continue;
             }
-            let named = ["model_key", "model"]
-                .iter()
-                .filter_map(|k| step.config.get(k).and_then(|v| v.as_str()))
+            let named = [call.model_key.as_deref(), Some(call.model.as_str())]
+                .into_iter()
+                .flatten()
                 .find(|m| crew::select::names_utility_model(m, utility));
             if let Some(model) = named {
                 bail!(
@@ -7069,7 +7065,7 @@ mod tests {
             "id": "ws-default", "name": "WS default",
             "inputs": [{"name": "workspace", "default": spec.to_str().unwrap()}],
             "phases": [{"id": "p1", "tasks": [{"id": "t1", "steps": [
-                {"id": "s1", "kind": "procedural.noop", "config": {"workspace": "{{workspace}}"}}
+                {"id": "s1", "kind": "crawl.plan", "config": {"rule": "swallowed-error", "workspace": "{{workspace}}"}}
             ]}]}],
         });
         guard.write_config("ws-default", &doc.to_string());
@@ -7402,6 +7398,21 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The step-config gate's promise covers every kind darkmux ships: a
+    /// registered kind with no config struct would take any config
+    /// unchecked, and a struct with no registered kind is checking nothing.
+    /// `all_step_kinds` is the production registry, so this pins the two
+    /// lists to each other.
+    #[test]
+    fn every_registered_step_kind_has_a_config_struct_and_every_struct_a_kind() {
+        let registry = all_step_kinds().expect("all_step_kinds must build cleanly in a test process");
+        let mut registered = registry.ids();
+        registered.sort();
+        let mut typed: Vec<String> = crew::step_config::ConfigKind::ALL.iter().map(|k| k.id().to_string()).collect();
+        typed.sort();
+        assert_eq!(registered, typed);
     }
 
     /// (silent-miss audit, 2026-09-06) `darkmux-crew`'s `records_gather`

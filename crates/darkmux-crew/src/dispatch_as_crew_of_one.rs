@@ -963,10 +963,9 @@ mod tests {
         );
         // The step kind must read back exactly what was written — the two
         // halves of the hand-off asserted against each other, not separately.
-        assert_eq!(
-            crate::brief_refs::from_json(step.config.get("brief_refs")),
-            opts.brief_refs
-        );
+        let read: crate::step_config::DispatchInternalConfig =
+            crate::step_config::load(&step, crate::step_config::ConfigKind::DispatchInternal).unwrap();
+        assert_eq!(read.brief_refs.unwrap_or_default(), opts.brief_refs);
     }
 
     #[serial_test::serial]

@@ -190,6 +190,7 @@ pub mod utility;
 /// One consumer reads another's value THROUGH a struct; the deserialize is
 /// the validation.
 pub mod step_output;
+pub mod step_config;
 pub mod step_kinds;
 pub mod telemetry_sampler;
 // (#2774 round-4) Validated severity bands for the thermal ladder's soft

@@ -861,9 +861,7 @@ fn apply_default_cwd(steps: &mut BTreeMap<String, Step>, cwd: &Path) {
         // `"cwd": ""` is a config defect the resolver names precisely
         // ("step config `cwd` is set but empty"), and silently substituting
         // the panel's directory for it would hide exactly that.
-        let authored =
-            ["cwd", "workdir"].iter().any(|key| step.config.get(*key).and_then(|v| v.as_str()).is_some());
-        if authored {
+        if darkmux_crew::step_config::shell_names_a_directory(&step.config) {
             continue;
         }
         match &mut step.config {

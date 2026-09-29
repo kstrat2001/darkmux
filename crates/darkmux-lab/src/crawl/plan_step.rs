@@ -55,6 +55,7 @@
 use crate::crawl::plan::{self, Plan, PlanParams};
 use anyhow::{anyhow, bail, Context, Result};
 use darkmux_crew::rules;
+use darkmux_crew::step_config::{load, non_blank, ConfigKind, CrawlPlanConfig};
 use darkmux_crew::step_kinds::{Port, SeatClaim, StepKind, StepKindRegistry, StepOutcome, StepRunCtx};
 use darkmux_crew::types::{Step, Task};
 use darkmux_crew::workspace_spec::{materialize, MaterializeOptions, WorkspaceSpec};
@@ -62,7 +63,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-pub const CRAWL_PLAN_KIND: &str = "crawl.plan";
+pub const CRAWL_PLAN_KIND: &str = ConfigKind::CrawlPlan.id();
 
 /// (#2301) The CONTENT id of what this kind produces — the value a
 /// consumer checks before deserializing the body as a [`Plan`]. Same
@@ -183,22 +184,15 @@ pub struct PlanStepConfig {
 
 impl PlanStepConfig {
     pub fn from_step(step: &Step) -> Result<Self> {
-        let str_field = |key: &str| -> Result<String> {
-            step.config
-                .get(key)
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.trim().is_empty())
-                .map(String::from)
-                .ok_or_else(|| anyhow!("step `{}`: `{CRAWL_PLAN_KIND}` requires config.{key}", step.id))
-        };
-        let rule = str_field("rule")?;
-        let workspace = PathBuf::from(str_field("workspace")?);
+        let cfg: CrawlPlanConfig = load(step, ConfigKind::CrawlPlan)?;
+        let requires = |key: &str| anyhow!("step `{}`: `{CRAWL_PLAN_KIND}` requires config.{key}", step.id);
+        let rule = non_blank(Some(cfg.common.rule.clone())).ok_or_else(|| requires("rule"))?;
+        let workspace = non_blank(Some(cfg.workspace)).ok_or_else(|| requires("workspace"))?;
         // (#2310 P4c-2 review MUST-do 1) Shared with `plan_sites_step.rs`
         // so the two `plan.*` kinds cannot silently drift back apart on
         // CLI-string leniency the way they did before this review.
-        let (params, fetch) = plan::parse_sizing_and_no_fetch(&step.config, &step.id, CRAWL_PLAN_KIND)?;
-        let plan_out = step.config.get("plan_out").and_then(|v| v.as_str()).map(PathBuf::from);
-        Ok(Self { rule, workspace, params, fetch, plan_out })
+        let (params, fetch) = plan::plan_params(&cfg.common, &step.id, CRAWL_PLAN_KIND)?;
+        Ok(Self { rule, workspace: PathBuf::from(workspace), params, fetch, plan_out: cfg.common.plan_out.map(PathBuf::from) })
     }
 }
 

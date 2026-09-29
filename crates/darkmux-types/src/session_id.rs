@@ -381,6 +381,21 @@ impl<'de> serde::Deserialize<'de> for SessionId {
     }
 }
 
+/// A string in the wire form [`SessionId::parse`] reads.
+impl schemars::JsonSchema for SessionId {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "SessionId".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({"type": "string", "format": crate::param_scalar::SESSION_ID_FORMAT})
+    }
+
+    fn inline_schema() -> bool {
+        true
+    }
+}
+
 /// Which session a step kind's own dispatch records land under, as the kind
 /// DECLARES it. The run comes from whoever runs the step, never from the
 /// kind: [`SessionScope::session`] composes the two.

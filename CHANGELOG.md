@@ -14,6 +14,31 @@ darkmux release.
 
 ## [Unreleased]
 
+### Changed (breaking, 4.0)
+
+- **A mission config's step `config` is checked against its kind** (B1). It
+  was open JSON, so a typo inside a step's config passed the unknown-key
+  gate and silently did nothing. Each of the fifteen kinds darkmux ships
+  (`dispatch.internal`, `dispatch.single_shot`, `dispatch.map`,
+  `procedural.shell`, `procedural.noop`, `mods.gate`, `records.gather`,
+  `deliver.github_review`, `crawl.plan`, `crawl.unit`, `crawl.summary`,
+  `plan.sites`, `mission.worktree`, `mission.coder`, `mission.verify`) now
+  has one typed config. A misspelled, wrong-type or missing key in a step
+  config, a `grow.config` key no step of the task reads, or a step `kind`
+  that is none of the fifteen, is refused at preflight and failed by
+  `darkmux doctor`, naming the file, the key path and the closest valid key.
+  **Migration:** run `darkmux doctor` and fix what it names; a key that did
+  nothing has no replacement. Numbers and flags still accept their text form
+  (`"draws": "3"`), and the open fields (`dispatch.map`'s `collection`, the
+  `findings`, `mods` and `scope` a `deliver.github_review` step embeds) stay
+  free-form. A step config the kind cannot load now fails the step naming the
+  key, where a wrong-typed value used to fall back to a default.
+- **A `mission.verify` task takes no `role_id`** (A19, #2953). The step always
+  dispatches `code-reviewer`, so the key never did anything; the shipped
+  `coder-phase` config no longer sets it and a config that does is refused.
+  **Migration:** delete the `role_id` from the task; to review with another
+  role, `darkmux dispatch <role> ...`.
+
 ### Removed (breaking, 4.0)
 
 - **`darkmux mission dispatch` and the hand-built mission verbs** (#2954).
