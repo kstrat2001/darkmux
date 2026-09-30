@@ -82,7 +82,7 @@ darkmux config set machine_id mini-1              <span class="comment"># operat
 darkmux doctor</code></pre>
     <p><code>darkmux doctor</code> should read <code>✓</code> on <strong>flow sink health</strong> (a Redis-backed sink reaching the hub) and <strong>machine_id</strong>, and the verdict banner should land on <code>● ok</code> (a <code>⚠</code> on out-of-scope checks like "no profile loaded yet" is fine). Then prove the end-to-end write:</p>
     <pre><code>darkmux flow note --text "hello from mini-1"</code></pre>
-    <p>Open the hub's live viewer (the hub itself, or <code>https://&lt;hub&gt;.&lt;tailnet&gt;.ts.net/</code> if you set up <a href="always-on-hub.html#viewer">Tailscale Serve</a>). The note appears, tagged with this machine's id. That's the peer participating: its records flow to the hub, you see the whole fleet in one place.</p>
+    <p>Open the hub's live viewer (the hub itself, or <code>http://&lt;hub&gt;/</code> from any device if you set up <a href="always-on-hub.html#viewer">Tailscale Serve</a>). The note appears, tagged with this machine's id. That's the peer participating: its records flow to the hub, you see the whole fleet in one place.</p>
     <div class="callout">
       <strong>No daemon required for this.</strong> Writing flow records to the hub happens in-process on every <code>darkmux</code> command; the peer does not need to run <code>darkmux serve</code> for its activity to show up in the hub's viewer. (The trade-off: without a local daemon, the peer won't appear with a card in <code>darkmux machine list</code>, which asks each machine's daemon for it. Its flow records are still in the hub viewer.)
     </div>
@@ -109,6 +109,9 @@ darkmux dispatch coder "implement the X feature"</code></pre>
 <section id="part-2">
   <div class="wrap">
     <h2>Part 2: Run it as a fleet worker</h2>
+    <div class="callout">
+      <strong>Do you need Tailscale Serve? Not for the fleet.</strong> The fleet listener binds the machine's own tailnet address by itself, so cards and work travel with nothing extra enabled. Serve is only for opening a machine's own viewer from another device: plain HTTP, tailnet-only, and never Funnel. See <a href="always-on-hub.html#viewer">the cross-tailnet viewer</a>.
+    </div>
     <p>A fleet worker takes work from other machines over its <strong>fleet listener</strong>: a second port the daemon opens on the machine's own tailnet address (never <code>0.0.0.0</code>, never loopback, and not behind Tailscale Serve, which would make every caller look like the machine itself). A request is run only when <strong>both</strong> checks pass:</p>
     <ul>
       <li><strong>The fleet token.</strong> It is the serve token (Keychain item <code>darkmux-serve-token</code>, or <code>DARKMUX_SERVE_TOKEN</code>), one value shared by every machine in the fleet. The check is that the caller holds that shared token. That keeps out something on an allowed machine that cannot read it (an agent container can reach tailnet addresses, but not the Keychain). It is not proof the caller is darkmux: any process running as your user can read the Keychain item, and <code>machine list</code> sends the same token to every machine in the roster.</li>
