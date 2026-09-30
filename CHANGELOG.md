@@ -1144,6 +1144,18 @@ darkmux release.
 
 ### Fixed (4.0)
 
+- **The fleet lens reads `GET /fleet/view` for its machine list, hardware and
+  liveness.** A peer with Redis off has no presence beat, and the lens drew it as
+  "offline, hardware unknown" even when the daemon had read its card. Each card
+  now comes from the view's row: a machine whose card was read is never shown
+  offline, and one the daemon could not reach shows the typed reason on its
+  subtitle line ("listener off"), never an address or a uid. A peer shows what it
+  lets this machine do ("runs diff-review · radio-host here") beside its
+  hardware, except on a phone. The static demo reads a committed snapshot of the
+  view. Machines outside the view (an unverified source, one nobody rostered) are
+  still drawn from flow and presence, and a replay draws every machine that way.
+  The lens no longer calls `GET /machine/specs`.
+
 - **`darkmux doctor`'s `crew/` merge script and its flat-mission check now
   agree.** The script moved pre-#148 flat mission files into `missions/`, where
   the `mission state files` check then refused them and told you to run a
