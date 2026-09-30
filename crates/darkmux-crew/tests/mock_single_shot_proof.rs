@@ -289,6 +289,80 @@ fn container_free_single_shot_dispatch_round_trips_through_a_real_http_mock_serv
     }
 }
 
+/// A local single-shot call the server refuses ends in ONE `dispatch.error`
+/// carrying the failure text, the call's wall time and the endpoint, not the
+/// generic `aborted` terminal the bookend guard writes when nothing closed it.
+#[test]
+#[serial_test::serial]
+fn a_refused_local_single_shot_ends_in_an_error_terminal_with_its_context() {
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(POST).path("/v1/chat/completions");
+        then.status(500).body("model exploded");
+    });
+    let registry_dir = tempfile::tempdir().expect("tempdir for profiles registry");
+    let profiles_path = write_mock_profiles_registry(registry_dir.path());
+    let flows_dir = tempfile::tempdir().expect("tempdir for flow records");
+    let prev_flows_dir = std::env::var("DARKMUX_FLOWS_DIR").ok();
+    unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", flows_dir.path()) };
+
+    let session = darkmux_types::session_id::SessionId::adhoc(
+        darkmux_types::session_id::RunId::standalone("test").unwrap(),
+        "coder",
+        format!("mock-single-shot-error-{}", std::process::id()),
+    );
+    let session_id = session.wire();
+    let opts = DispatchOpts {
+        allow_utility_model: false,
+        remote_origin: None,
+        live_channel: true,
+        brief_refs: Vec::new(),
+        workspace_read_only: false,
+        record_context: None,
+        resume_from: None,
+        host_out: None,
+        max_turns_override: None,
+        timeout_override_seconds: None,
+        role_id: "radio-host".to_string(),
+        message: "hello".to_string(),
+        session: session.clone(),
+        timeout_seconds: 30,
+        skip_preflight: true,
+        json: false,
+        workdir: None,
+        phase_id: None,
+        machine: None,
+        wait: true,
+        compaction: CompactionDispatchArgs::default(),
+        profile_name: Some("mock".to_string()),
+        config_path: Some(profiles_path.to_string_lossy().to_string()),
+        force_container: false,
+        max_completion_tokens: None,
+        image: None,
+        model_base_url_override: Some(server.base_url()),
+        step_id: None,
+        system_prompt_override: None,
+    };
+    let result = dispatch_local_single_shot(opts);
+    match prev_flows_dir {
+        Some(prev) => unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", prev) },
+        None => unsafe { std::env::remove_var("DARKMUX_FLOWS_DIR") },
+    }
+    let err = result.expect_err("a 500 fails the dispatch");
+
+    let records = flow_records_for_session(flows_dir.path(), &session_id);
+    let terminals: Vec<&Value> = records.iter().filter(|r| r["action"] == "dispatch.error").collect();
+    assert_eq!(terminals.len(), 1, "exactly one error terminal: {records:#?}");
+    assert!(
+        !records.iter().any(|r| r["action"] == "dispatch.complete"),
+        "a failed call has no completion: {records:#?}"
+    );
+    let p = &terminals[0]["payload"];
+    assert_eq!(p["error"], err.to_string(), "the terminal carries the error the caller got: {p}");
+    assert!(p["error"].as_str().is_some_and(|e| e.contains("500") || e.contains("exploded")), "{p}");
+    assert!(p["wall_ms"].is_u64(), "the call's wall time is recorded: {p}");
+}
+
 /// (#1645) `dispatch_local_single_shot`'s hosted/local single-shot records
 /// (`dispatch start`/`dispatch complete`, built by `dispatch_internal.rs`'s
 /// `build_remote_record`) used to hardcode `mission_id: None` regardless of

@@ -17274,6 +17274,65 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         assert_eq!((w["scope"].as_str(), w["spent"].as_u64(), w["limit"].as_u64()), (Some("step"), Some(9), Some(5)), "{w}");
     }
 
+    /// A hosted single-shot call the endpoint refuses ends in ONE
+    /// `dispatch.error` that says why: the HTTP failure, the call's wall
+    /// time, and the endpoint label the `dispatch.start` carried. Losing any of
+    /// the three leaves the operator a bare `aborted` terminal.
+    #[test]
+    #[serial]
+    fn dispatch_remote_failure_terminal_carries_error_wall_and_endpoint() {
+        let server = httpmock::MockServer::start();
+        server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/v1/chat/completions");
+            then.status(500).body("upstream exploded");
+        });
+        let home = TempDir::new().unwrap();
+        let flows_dir = TempDir::new().unwrap();
+        let keys = ["DARKMUX_HOME", "DARKMUX_FLOWS_DIR", "DARKMUX_REDIS_URL"];
+        let prev: Vec<Option<String>> = keys.iter().map(|k| std::env::var(k).ok()).collect();
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", home.path());
+            std::env::set_var("DARKMUX_FLOWS_DIR", flows_dir.path());
+            std::env::remove_var("DARKMUX_REDIS_URL");
+        }
+        let session = format!("remote-error-terminal-{}", std::process::id());
+        let mut opts = dispatch_preflight_probe_opts();
+        opts.role_id = "pr-reviewer".to_string();
+        opts.session = crate::test_session(&session);
+        opts.phase_id = None;
+        let pm = darkmux_types::ProfileModel::hosted_for_test(
+            "gpt-remote",
+            None,
+            serde_json::json!({"url": format!("{}/v1", server.base_url())}),
+        );
+        let result = dispatch_remote(
+            &opts,
+            &darkmux_types::execution_id::ExecutionId::mint(),
+            &quarantine_test_role(),
+            "system prompt",
+            &crate::target::target_for("p".into(), Default::default(), pm.clone()).unwrap(),
+        );
+        let records = drain_flow_records_for_session(flows_dir.path(), &crate::test_session(&session));
+        unsafe {
+            for (k, v) in keys.iter().zip(prev) {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        let err = result.expect_err("a 500 fails the dispatch");
+        let terminals: Vec<&serde_json::Value> = records.iter().filter(|r| r["action"] == "dispatch.error").collect();
+        assert_eq!(terminals.len(), 1, "exactly one error terminal: {records:#?}");
+        let p = &terminals[0]["payload"];
+        assert_eq!(p["error"], err.to_string(), "the terminal carries the error the caller got: {p}");
+        assert!(p["error"].as_str().is_some_and(|e| !e.is_empty() && e != "aborted"), "{p}");
+        assert!(p["wall_ms"].is_u64(), "the call's wall time is recorded: {p}");
+        let start = records.iter().find(|r| r["action"] == "dispatch.start").expect("a start bookend");
+        assert!(p["endpoint"].as_str().is_some_and(|e| e.contains("127.0.0.1")), "{p}");
+        assert_eq!(p["endpoint"], start["payload"]["endpoint"], "the terminal names the endpoint the start named");
+    }
+
     /// A reply with no prompt count has an unknown spend: the step settles
     /// the granted cap plus the prompt it sent, and the usage record carries
     /// no total.
