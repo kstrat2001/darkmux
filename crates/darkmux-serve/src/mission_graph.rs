@@ -1064,8 +1064,11 @@ pub fn stamp_session_steps(records: &mut [serde_json::Value], mission_id: &str) 
 
 /// Pure: fold a stream of flow records into per-step FINALIZED totals.
 /// Only TERMINAL totals are folded — `dispatch complete`/`dispatch.complete`
-/// (`total_tokens` + `total_turns`) and `step result` — taking the max
-/// across records (a re-run's later complete wins). A `step result`'s token
+/// (`total_tokens` + `total_turns`) and `step result`. Tokens take the max
+/// across records (a re-run's later complete wins; a `dispatch.map` step's
+/// aggregate record is the sum the max must see). Turns are SUMMED: each
+/// terminal is one execution's own turn count, and a step holds one per
+/// execution, so the step's turns are their total. A `step result`'s token
 /// total reads `payload.total_tokens` first, falling back to `payload.tokens`
 /// (#1445 gate: the review vocabulary's probe/judge/verify step results carry
 /// `tokens`, never `total_tokens` — without the fallback the most-viewed
@@ -1101,7 +1104,7 @@ where
             entry.tokens = Some(entry.tokens.map_or(t, |cur| cur.max(t)));
         }
         if let Some(n) = total_turns {
-            entry.turns = Some(entry.turns.map_or(n, |cur| cur.max(n)));
+            entry.turns = Some(entry.turns.unwrap_or(0).saturating_add(n));
         }
     }
     out
@@ -1680,6 +1683,38 @@ mod tests {
     }
 
     #[test]
+    fn fold_finals_sums_a_steps_turns_across_its_executions() {
+        // A step holds one execution per item (`dispatch.map`) or per attempt; each terminal
+        // states its own turns, so the step's are their total (3 + 4), not the largest.
+        let step_ids = ids(&["s1"]);
+        let complete = |turns: u64| {
+            serde_json::json!({
+                "action": "dispatch.complete",
+                "mission_id": "m-this",
+                "handle": "s1",
+                "payload": { "total_turns": turns }
+            })
+        };
+        let out = fold_step_finals(vec![complete(3), complete(4)], &step_ids, "m-this");
+        assert_eq!(out["s1"].turns, Some(7), "{out:?}");
+    }
+
+    #[test]
+    fn fold_finals_reads_a_single_shot_steps_turns_from_its_only_terminal() {
+        // A single-shot step writes no `dispatch.turn` records: this terminal is the only place
+        // its one turn is stated.
+        let step_ids = ids(&["s1"]);
+        let recs = vec![serde_json::json!({
+            "action": "dispatch.complete",
+            "mission_id": "m-this",
+            "handle": "s1",
+            "payload": { "total_turns": 1, "total_tokens": 10 }
+        })];
+        let out = fold_step_finals(recs, &step_ids, "m-this");
+        assert_eq!(out["s1"].turns, Some(1), "{out:?}");
+    }
+
+    #[test]
     fn fold_finals_rejects_a_record_stamped_with_a_foreign_mission_id() {
         // (#1641) THE defect, server-side: step ids are config-scoped, so
         // mission B's records carry the byte-identical step_id/handle/
@@ -1839,8 +1874,9 @@ mod tests {
     }
 
     #[test]
-    fn fold_finals_handle_key_and_max_across_records() {
-        // Correlation key 3 (handle == step id) + max wins across a re-run.
+    fn fold_finals_handle_key_tokens_take_the_max_turns_sum_across_records() {
+        // Correlation key 3 (handle == step id). Tokens: max wins across a re-run. Turns: each
+        // complete is one execution's own count, so they add.
         let step_ids = ids(&["s1"]);
         let recs = vec![
             serde_json::json!({ "action": "dispatch.complete", "handle": "s1",
@@ -1850,7 +1886,7 @@ mod tests {
         ];
         let out = fold_step_finals(recs, &step_ids, "m-this");
         assert_eq!(out["s1"].tokens, Some(900), "later/higher complete wins");
-        assert_eq!(out["s1"].turns, Some(5));
+        assert_eq!(out["s1"].turns, Some(7), "2 + 5: one term per execution");
     }
 
     #[test]

@@ -497,6 +497,32 @@ describe("applyRecordToMetrics", () => {
     expect(d.turns).toBe(3);
   });
 
+  it("a single-shot-shaped step (a complete with total_turns, no dispatch.turn) shows that turn count", () => {
+    let m: MetricsMap = {};
+    m = applyRecordToMetrics(m, rec({ handle: "a-step", action: "dispatch.start" }), idx, "m1");
+    m = applyRecordToMetrics(m, rec({ handle: "a-step", action: "dispatch.complete", payload: { total_turns: 1 } }), idx, "m1");
+    expect(stepDisplayMetrics(m["a-step"]).turns).toBe(1);
+  });
+
+  it("a step with two executions (3 and 4 turns) shows 7, the way its tokens sum", () => {
+    let m: MetricsMap = {};
+    for (const turns of [3, 4]) {
+      m = applyRecordToMetrics(m, rec({ handle: "a-step", action: "dispatch.start" }), idx, "m1");
+      m = applyRecordToMetrics(m, rec({ handle: "a-step", action: "dispatch.complete", payload: { total_turns: turns } }), idx, "m1");
+    }
+    expect(stepDisplayMetrics(m["a-step"]).turns).toBe(7);
+  });
+
+  it("the server's finalized turns and the folded terminals are not added together", () => {
+    // The seed and the fold read the same records; the display takes the larger.
+    let m = seedMetricsFromGraph({}, { nodes: [{ steps: [{ id: "a-step", turnsFinal: 7, startedTs: "2026-01-01T00:00:00Z" }] }] } as never);
+    for (const turns of [3, 4]) {
+      m = applyRecordToMetrics(m, rec({ handle: "a-step", action: "dispatch.start" }), idx, "m1");
+      m = applyRecordToMetrics(m, rec({ handle: "a-step", action: "dispatch.complete", payload: { total_turns: turns } }), idx, "m1");
+    }
+    expect(stepDisplayMetrics(m["a-step"]).turns).toBe(7);
+  });
+
   it("(legacy) a step with no usage record reads its finalized total", () => {
     let m: MetricsMap = {};
     m = applyRecordToMetrics(m, rec({ handle: "a-step", action: "dispatch.start" }), idx, "m1");
@@ -573,7 +599,7 @@ describe("applyRecordToMetrics", () => {
 describe("seedMetricsFromGraph", () => {
   it("seeds finalized totals and takes the max against a live value already climbing", () => {
     const g: MissionGraph = { ...baseGraph(), nodes: [PHASE, { ...TASK_A, steps: [{ ...TASK_A.steps![0], tokensFinal: 900, turnsFinal: 4 }] }, TASK_B] };
-    let m: MetricsMap = { "a-step": { tokRun: 950, tokFinal: 0, turnRun: 0, turnFinal: 0, toolRun: 0, toolFinal: 0, usageSeen: false, startTs: 0, endTs: 0, lastTs: 0 } };
+    let m: MetricsMap = { "a-step": { tokRun: 950, tokFinal: 0, turnRun: 0, turnFinal: 0, turnsEnded: 0, toolRun: 0, toolFinal: 0, usageSeen: false, startTs: 0, endTs: 0, lastTs: 0 } };
     m = seedMetricsFromGraph(m, g);
     expect(m["a-step"].tokFinal).toBe(900);
     // the live running sum is untouched, but `stepDisplayMetrics` prefers
@@ -609,9 +635,9 @@ describe("hasNoMetricsData", () => {
 describe("missionTotals", () => {
   it("sums every step's own figure (no local/cloud/unknown split)", () => {
     const m: MetricsMap = {
-      a: { tokRun: 0, tokFinal: 100, turnRun: 0, turnFinal: 1, toolRun: 0, toolFinal: 0, usageSeen: false, startTs: 0, endTs: 0, lastTs: 0 },
-      b: { tokRun: 0, tokFinal: 50, turnRun: 0, turnFinal: 1, toolRun: 0, toolFinal: 0, usageSeen: false, startTs: 0, endTs: 0, lastTs: 0 },
-      c: { tokRun: 0, tokFinal: 30, turnRun: 0, turnFinal: 1, toolRun: 0, toolFinal: 0, usageSeen: false, startTs: 0, endTs: 0, lastTs: 0 },
+      a: { tokRun: 0, tokFinal: 100, turnRun: 0, turnFinal: 1, turnsEnded: 0, toolRun: 0, toolFinal: 0, usageSeen: false, startTs: 0, endTs: 0, lastTs: 0 },
+      b: { tokRun: 0, tokFinal: 50, turnRun: 0, turnFinal: 1, turnsEnded: 0, toolRun: 0, toolFinal: 0, usageSeen: false, startTs: 0, endTs: 0, lastTs: 0 },
+      c: { tokRun: 0, tokFinal: 30, turnRun: 0, turnFinal: 1, turnsEnded: 0, toolRun: 0, toolFinal: 0, usageSeen: false, startTs: 0, endTs: 0, lastTs: 0 },
     };
     const tot = missionTotals(m);
     expect(tot).toEqual({ total: 180, turns: 3 });
@@ -672,7 +698,7 @@ describe("formatting helpers", () => {
 // token counts with no idea which step took the hour.
 describe("stepMeterFor wall time (#2269)", () => {
   const T0 = 1_756_900_000_000;
-  const base = { tokRun: 0, tokFinal: 10, turnRun: 0, turnFinal: 1, toolRun: 0, toolFinal: 0, usageSeen: false };
+  const base = { tokRun: 0, tokFinal: 10, turnRun: 0, turnFinal: 1, turnsEnded: 0, toolRun: 0, toolFinal: 0, usageSeen: false };
   it("a completed step carries its wall time (end − start) and is not generating", () => {
     const step = { id: "s", label: "u-0001", kind: "dispatch.internal", status: "complete" as const };
     const m = { ...base, startTs: T0, endTs: T0 + 335_000, lastTs: T0 + 335_000 };

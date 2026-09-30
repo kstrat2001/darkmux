@@ -316,7 +316,14 @@ export interface StepMetrics {
   tokRun: number;
   tokFinal: number;
   turnRun: number;
+  /** The server's finalized turns for the step (`seedMetricsFromGraph`): the sum of its
+   *  executions' `total_turns`. */
   turnFinal: number;
+  /** The `total_turns` of every terminal folded so far, summed: one term per execution,
+   *  as `tokRun` sums one term per usage record. Kept apart from `turnFinal` because the
+   *  seed and the fold read the same records, so adding one to the other would count
+   *  them twice; the display takes the larger. */
+  turnsEnded: number;
   toolRun: number;
   toolFinal: number;
   /** (#2902 step 2a) Whether any usage record for this step has been folded.
@@ -340,6 +347,7 @@ const EMPTY_METRICS: StepMetrics = {
   tokFinal: 0,
   turnRun: 0,
   turnFinal: 0,
+  turnsEnded: 0,
   toolRun: 0,
   toolFinal: 0,
   usageSeen: false,
@@ -448,6 +456,7 @@ function sameMetrics(a: StepMetrics, b: StepMetrics): boolean {
     a.tokFinal === b.tokFinal &&
     a.turnRun === b.turnRun &&
     a.turnFinal === b.turnFinal &&
+    a.turnsEnded === b.turnsEnded &&
     a.toolRun === b.toolRun &&
     a.toolFinal === b.toolFinal &&
     a.usageSeen === b.usageSeen &&
@@ -514,7 +523,7 @@ export function applyRecordToMetrics(metrics: MetricsMap, rec: NormRecord, idx: 
     next.toolRun = fig.toolCallsSoFar !== null ? Math.max(next.toolRun, fig.toolCallsSoFar) : next.toolRun + 1;
   } else if (isComplete) {
     if (finalTok) next.tokFinal = Math.max(next.tokFinal, finalTok);
-    if (fig.totalTurns !== null) next.turnFinal = Math.max(next.turnFinal, fig.totalTurns);
+    if (fig.totalTurns !== null) next.turnsEnded += fig.totalTurns;
   } else if (isStepResult) {
     if (finalTok) next.tokFinal = Math.max(next.tokFinal, finalTok);
   }
@@ -574,7 +583,7 @@ export function stepDisplayMetrics(m: StepMetrics | undefined): DisplayMetrics {
   // (#2902 step 2a) The usage records' plain sum once any has been folded;
   // the legacy fallback (no usage records) reads the finalized total.
   const tokens = stepTokensWithLegacyFallback(m.tokRun, m.usageSeen, m.tokFinal) || 0;
-  const turns = m.turnFinal || m.turnRun || 0;
+  const turns = Math.max(m.turnFinal, m.turnsEnded) || m.turnRun || 0;
   const tools = m.toolFinal || m.toolRun || 0;
   return { tokens, turns, tools, has: tokens > 0 || turns > 0 || tools > 0 };
 }
