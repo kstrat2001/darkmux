@@ -524,7 +524,7 @@ impl StepKind for DispatchInternalStepKind {
             };
             let output = serde_json::to_string(&payload)
                 .context("serializing RawDispatchOutcome for preserve_dispatch_result")?;
-            return Ok(StepOutcome { output, flow_records: Vec::new() });
+            return Ok(StepOutcome { output, flow_records: Vec::new(), degraded: None });
         }
 
         if result.exit_code != 0 {
@@ -561,6 +561,7 @@ impl StepKind for DispatchInternalStepKind {
         Ok(StepOutcome {
             output: result.stdout,
             flow_records,
+            degraded: None,
         })
     }
 
@@ -1097,6 +1098,7 @@ impl DispatchSingleShotStepKind {
         Ok(StepOutcome {
             output: reply.content,
             flow_records,
+            degraded: None,
         })
     }
 }
@@ -1619,7 +1621,7 @@ impl DispatchMapStepKind {
         task: &Task,
         input: &BTreeMap<String, String>,
         run_ctx: &StepRunCtx,
-    ) -> Result<StepOutcome> {
+    ) -> Result<MapRun> {
         let ctx = run_ctx.live();
         let session = &run_ctx.session(self, step)?;
         let items = resolve_map_collection(step, task, input)?;
@@ -1642,7 +1644,10 @@ impl DispatchMapStepKind {
             // empty-docket short-circuit). `residency` already returned
             // `None` for this input, so no model was loaded.
             push(Self::short_circuit_record(session, step), &mut batched);
-            return Ok(StepOutcome { output: "[]".to_string(), flow_records: batched });
+            return Ok(MapRun {
+                outcome: StepOutcome { output: "[]".to_string(), flow_records: batched, degraded: None },
+                verdict: MapVerdict::Clean,
+            });
         }
 
         let cfg: MapConfig = load_checked(step, ConfigKind::DispatchMap)?;
@@ -1876,7 +1881,60 @@ impl DispatchMapStepKind {
         push(Self::aggregate_record(session, step, wire_model.as_ref(), endpoint.is_some(), &results), &mut batched);
 
         let output = serde_json::to_string(&results).context("serializing dispatch.map results")?;
-        Ok(StepOutcome { output, flow_records: batched })
+        Ok(MapRun {
+            outcome: StepOutcome { output, flow_records: batched, degraded: None },
+            verdict: MapVerdict::of(&results),
+        })
+    }
+}
+
+/// How a `dispatch.map` step's items came out, decided once from its
+/// results: every item failing is the step failing (nothing usable came out),
+/// some failing is a degraded step (its output is real but incomplete), none
+/// failing is a clean step.
+#[derive(Debug, PartialEq, Eq)]
+enum MapVerdict {
+    AllFailed { total: usize, first_error: String },
+    Partial { failed: usize, total: usize },
+    Clean,
+}
+
+/// What one pass over a map's items produced: the step's outcome as if every
+/// item had been fine, and how the items actually came out.
+struct MapRun {
+    outcome: StepOutcome,
+    verdict: MapVerdict,
+}
+
+impl MapRun {
+    /// The step's real outcome: an error when every item failed, the outcome
+    /// marked degraded when some did, unchanged when none did.
+    fn into_outcome(self, step_id: &str) -> Result<StepOutcome> {
+        match self.verdict {
+            MapVerdict::AllFailed { total, first_error } => Err(anyhow!(
+                "step `{step_id}` dispatch.map: all {total} item(s) failed; first error: {first_error}"
+            )),
+            MapVerdict::Partial { failed, total } => Ok(StepOutcome {
+                degraded: Some(format!("dispatch.map step `{step_id}`: {failed} of {total} item(s) failed")),
+                ..self.outcome
+            }),
+            MapVerdict::Clean => Ok(self.outcome),
+        }
+    }
+}
+
+impl MapVerdict {
+    fn of(results: &[MapItemResult]) -> Self {
+        let failed = results.iter().filter(|r| !r.ok).count();
+        let total = results.len();
+        match failed {
+            0 => MapVerdict::Clean,
+            n if n == total => MapVerdict::AllFailed {
+                total,
+                first_error: results.iter().find_map(|r| r.error.clone()).unwrap_or_else(|| "no error recorded".to_string()),
+            },
+            failed => MapVerdict::Partial { failed, total },
+        }
     }
 }
 
@@ -2489,7 +2547,7 @@ impl StepKind for DispatchMapStepKind {
     /// names one. A context with no emitter (a step run on its own) batches
     /// every record into `StepOutcome.flow_records`.
     fn run(&self, step: &Step, task: &Task, input: &BTreeMap<String, String>, ctx: &StepRunCtx) -> Result<StepOutcome> {
-        self.run_map(step, task, input, ctx)
+        self.run_map(step, task, input, ctx)?.into_outcome(&step.id)
     }
 
     /// (#1442, restated as a seat claim by #2394) Four genuinely different
@@ -2843,6 +2901,7 @@ impl StepKind for ProceduralShellStepKind {
                 Ok(StepOutcome {
                     output: String::from_utf8_lossy(&stdout).to_string(),
                     flow_records: Vec::new(),
+                    degraded: None,
                 })
             }
             // A killed command produced no output this step could hand on,
@@ -2945,6 +3004,7 @@ impl StepKind for ProceduralNoopStepKind {
         Ok(StepOutcome {
             output,
             flow_records: Vec::new(),
+            degraded: None,
         })
     }
 }
@@ -3567,7 +3627,7 @@ mod tests {
             "user_template": "check {item}",
             "collection": ["a"],
         }));
-        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test());
+        let out = DispatchMapStepKind.run_map(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).map(|run| run.outcome);
 
         unsafe {
             match prev {
@@ -3576,7 +3636,7 @@ mod tests {
             }
         }
 
-        let out = out.expect("dispatch.map itself completes Ok even when an item fails");
+        let out = out.expect("the item pass completes even when an item fails");
         let results: Vec<MapItemResult> = serde_json::from_str(&out.output).unwrap();
         assert_eq!(results.len(), 1);
         assert!(!results[0].ok, "the item must be marked failed: {results:?}");
@@ -5481,6 +5541,73 @@ mod tests {
         assert_eq!(rec.payload_json()["remote"], false);
     }
 
+    fn map_item(index: usize, ok: bool) -> MapItemResult {
+        MapItemResult {
+            index,
+            ok,
+            content: String::new(),
+            error: (!ok).then(|| format!("item {index} boom")),
+            total_tokens: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            reasoning_tokens: None,
+            cached_tokens: None,
+            served_model: None,
+            wall_ms: 0,
+            retried: 0,
+        }
+    }
+
+    fn run_of(results: &[MapItemResult]) -> MapRun {
+        MapRun {
+            outcome: StepOutcome { output: serde_json::to_string(results).unwrap(), flow_records: Vec::new(), degraded: None },
+            verdict: MapVerdict::of(results),
+        }
+    }
+
+    /// The step's verdict follows its items: every item failing is the step
+    /// failing (nothing usable came out), some failing is a degraded step whose
+    /// output is still delivered, none failing is a clean step.
+    #[test]
+    fn map_run_verdict_maps_item_outcomes_to_the_step_outcome() {
+        let all_failed = run_of(&[map_item(0, false), map_item(1, false)]).into_outcome("m1");
+        let msg = format!("{:#}", all_failed.expect_err("every item failed, so the step errors"));
+        assert!(msg.contains("all 2 item(s) failed") && msg.contains("item 0 boom"), "{msg}");
+
+        let partial = run_of(&[map_item(0, true), map_item(1, false), map_item(2, true)]).into_outcome("m1").unwrap();
+        assert_eq!(partial.degraded.as_deref(), Some("dispatch.map step `m1`: 1 of 3 item(s) failed"));
+        let kept: Vec<MapItemResult> = serde_json::from_str(&partial.output).unwrap();
+        assert_eq!(kept.len(), 3, "a degraded step still delivers every item's result");
+
+        let clean = run_of(&[map_item(0, true), map_item(1, true)]).into_outcome("m1").unwrap();
+        assert_eq!(clean.degraded, None);
+    }
+
+    /// Through the real step kind: a map whose every item cannot reach its
+    /// endpoint is an errored step, not a completed one that reads Clean.
+    #[test]
+    #[serial_test::serial]
+    fn dispatch_map_where_every_item_failed_errors_the_step() {
+        let url_key = "DARKMUX_LMSTUDIO_URL";
+        let prev = std::env::var(url_key).ok();
+        unsafe { std::env::set_var(url_key, "http://127.0.0.1:1") };
+        let s = map_step(json!({
+            "model": "m",
+            "user_template": "check {item}",
+            "collection": ["a", "b"],
+            "timeout_seconds": 1,
+        }));
+        let result = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test());
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(url_key, v),
+                None => std::env::remove_var(url_key),
+            }
+        }
+        let msg = format!("{:#}", result.expect_err("all items failed"));
+        assert!(msg.contains("all 2 item(s) failed"), "{msg}");
+    }
+
     #[test]
     #[serial_test::serial]
     fn dispatch_map_local_per_item_error_isolation_continues_past_a_failure() {
@@ -5489,7 +5616,8 @@ mod tests {
         // policy under test is that each failure is CAPTURED into that item's
         // result and the loop CONTINUES to the next, rather than the first
         // error aborting the whole step. Three items in -> three ok:false
-        // results out, step still Ok.
+        // results out (the step-level verdict, an error when every item
+        // failed, is `map_run_verdict_maps_item_outcomes_to_the_step_outcome`).
         let url_key = "DARKMUX_LMSTUDIO_URL";
         let prev = std::env::var(url_key).ok();
         unsafe {
@@ -5501,7 +5629,7 @@ mod tests {
             "collection": ["a", "b", "c"],
             "timeout_seconds": 1,
         }));
-        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
+        let out = DispatchMapStepKind.run_map(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap().outcome;
         let results: Vec<MapItemResult> = serde_json::from_str(&out.output).unwrap();
         assert_eq!(results.len(), 3, "every item produced a result despite each failing");
         assert!(results.iter().all(|r| !r.ok), "each item's dispatch failed and was isolated");
@@ -5538,7 +5666,7 @@ mod tests {
             "collection": ["only"],
             "timeout_seconds": 1,
         }));
-        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
+        let out = DispatchMapStepKind.run_map(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap().outcome;
         let results: Vec<MapItemResult> = serde_json::from_str(&out.output).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].index, 0);
@@ -5892,7 +6020,7 @@ mod tests {
             "endpoint": { "url": "https://example.com" },
             "retry_on_error": 1,
         }));
-        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
+        let out = DispatchMapStepKind.run_map(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap().outcome;
         clear_hosted_override();
         let results: Vec<MapItemResult> = serde_json::from_str(&out.output).unwrap();
         assert_eq!(results.len(), 1);
@@ -5935,7 +6063,7 @@ mod tests {
             "collection": ["a"],
             "endpoint": { "url": "https://example.com" },
         }));
-        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
+        let out = DispatchMapStepKind.run_map(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap().outcome;
         clear_hosted_override();
         let results: Vec<MapItemResult> = serde_json::from_str(&out.output).unwrap();
         assert_eq!(results.len(), 1);
@@ -6194,6 +6322,18 @@ mod tests {
         assert_eq!(id_of(bookends[0]), id_of(bookends[1]), "an item's start and terminal name one execution");
         assert_eq!(id_of(bookends[2]), id_of(bookends[3]));
         assert_ne!(id_of(bookends[0]), id_of(bookends[2]), "two items are two executions");
+        // Each item's bookends name the item and, on the start, the endpoint the
+        // call goes to (the live view keys on the start).
+        for (bookend, index) in [(bookends[0], 0), (bookends[1], 0), (bookends[2], 1), (bookends[3], 1)] {
+            assert_eq!(bookend.payload_json()["item_index"].as_u64(), Some(index), "{bookend:?}");
+        }
+        for start in [bookends[0], bookends[2]] {
+            assert_eq!(
+                start.payload_json()["endpoint"],
+                "azure:example.cognitiveservices.azure.com/gpt-4o",
+                "the START names where the seat runs, before any terminal exists"
+            );
+        }
         for terminal in [bookends[1], bookends[3]] {
             let payload = terminal.payload_json();
             assert_eq!(
@@ -7010,7 +7150,7 @@ mod tests {
             "collection": ["a", "b"],
             "timeout_seconds": 1,
         }));
-        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
+        let out = DispatchMapStepKind.run_map(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap().outcome;
         let results: Vec<MapItemResult> = serde_json::from_str(&out.output).unwrap();
         assert_eq!(results.len(), 2);
         assert!(
@@ -7393,6 +7533,9 @@ mod tests {
         assert_eq!(p["requested_model"], "darkmux:qwen3-4b");
         assert_eq!(p["reported_model"], "served-by-mock");
         assert_eq!(p["endpoint"], format!("{}/v1", server.base_url()));
+        // The record's own `model` is the wire identifier the call went to,
+        // not the bare model key: usage attributes to the instance that answered.
+        assert_eq!(rec["model"], "darkmux:qwen3-4b", "{rec}");
         assert_eq!(p["token_source"], "provider");
         assert_eq!(p["total_tokens"], 12, "provider total wins over 7+3");
         assert_eq!(rec["session_id"], darkmux_types::session_id::SessionId::task(crate::test_run(), &s.task_id).wire());

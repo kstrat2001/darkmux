@@ -185,6 +185,22 @@ impl TokenSum {
 mod tests {
     use super::*;
 
+    /// `None` on a sum means no call reported the field: not zero. A reported
+    /// zero is a real reading and makes the sum `Some(0)`.
+    #[test]
+    fn a_sum_of_calls_that_never_reported_cached_or_reasoning_has_none_not_zero() {
+        let mut sum = TokenSum::default();
+        sum.add(&UsageCounts { prompt: Some(10), completion: Some(5), ..Default::default() });
+        sum.add(&UsageCounts { prompt: Some(3), completion: Some(2), ..Default::default() });
+        assert_eq!((sum.prompt, sum.completion, sum.total), (13, 7, 20));
+        assert_eq!((sum.cached, sum.reasoning), (None, None), "unreported is not zero");
+
+        sum.add(&UsageCounts { prompt: Some(1), completion: Some(1), cached: Some(0), reasoning: Some(4), ..Default::default() });
+        assert_eq!((sum.cached, sum.reasoning), (Some(0), Some(4)), "a reported zero is a reading, and the first report starts the sum");
+        sum.add(&UsageCounts { prompt: Some(1), completion: Some(1), cached: Some(6), ..Default::default() });
+        assert_eq!((sum.cached, sum.reasoning), (Some(6), Some(4)), "a later call that omits a field leaves it alone");
+    }
+
     #[test]
     fn the_provider_total_wins_and_the_split_is_only_the_fallback() {
         let c = UsageCounts { prompt: Some(9970), completion: Some(128), total: Some(11598), ..Default::default() };

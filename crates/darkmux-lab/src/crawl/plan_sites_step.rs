@@ -171,7 +171,7 @@ impl StepKind for PlanSitesStepKind {
             darkmux_crew::step_output::Producer::of(&plan_step::mission_id_of(task), &task.id, &step.id),
         );
         plan_step::write_plan(&out_path, &wrapped)?;
-        Ok(StepOutcome { output: darkmux_crew::step_output::ref_output_string(&out_path), flow_records: Vec::new() })
+        Ok(StepOutcome { output: darkmux_crew::step_output::ref_output_string(&out_path), flow_records: Vec::new(), degraded: None })
     }
 }
 
