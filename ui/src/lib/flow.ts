@@ -28,7 +28,7 @@ import type { AbandonReason } from "../types/generated/AbandonReason";
 import { isPlainObject } from "./guards";
 import { missionClosed } from "./lifecycle";
 import { runIndex } from "./runRef";
-import { uidOf } from "./machineIdentity";
+import { findUid, sameUid, uidOf } from "./machineIdentity";
 import { ACTION, CATEGORY, SOURCE, byTime, earliestByTime, ingestJsonl, ingestRecord, latestByTime, payloadOf, recKey, recordsAsOf, recordsSince, type NormRecord } from "./ingest";
 
 /** `LIVE_WINDOW_MS` — viewer.html:3374. The rolling live window `RAW` is
@@ -285,9 +285,9 @@ export function machPresent(
   tMax: number,
   m: string,
 ): boolean | null {
-  if (liveMachines.has(m)) return true;
+  if (findUid(liveMachines.keys(), m) !== null) return true;
   const edges = recordsAsOf(data, tMax).filter(
-    (r) => uidOf(r) === m && (r.action === ACTION.MachineOnline || r.action === ACTION.MachineOffline),
+    (r) => sameUid(uidOf(r), m) && (r.action === ACTION.MachineOnline || r.action === ACTION.MachineOffline),
   );
   // The latest edge by time; an untimed one only when no edge is timed.
   const last = latestByTime(edges);

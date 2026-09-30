@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { fetchStaticFlowRecords, firstRecordDate, buildFlowWindow, bodyTruncated, missionReplayDate } from "./flow";
+import { fetchStaticFlowRecords, firstRecordDate, buildFlowWindow, bodyTruncated, machPresent, missionReplayDate } from "./flow";
 import { ingest, ingestJsonl, recordsAsOf, __asOfFilterRuns, type NormRecord } from "./ingest";
 import { norm, normAll, type RawRecord } from "../testing/records";
 import { tokensOffMeter } from "../lenses/fleet/savings";
@@ -385,3 +385,19 @@ describe("(#2911) recordsAsOf: the window as of now, without a filter per tick",
   });
 });
 
+
+describe("machPresent asks about a machine by uid, in either case", () => {
+  const UID = "00000000-0000-4000-8000-ABCDEF000021";
+  it("a presence beat keyed in the other case is the machine being present", () => {
+    const beat = { machine_uid: UID.toLowerCase(), display_name: "x", schema_version: "1", beat_ts_ms: 1 } as never;
+    expect(machPresent([], new Map([[UID.toLowerCase(), beat]]), Date.now(), UID)).toBe(true);
+  });
+  it("the machine's own online edge, stamped with the uid in the other case, counts", () => {
+    const edge = norm({ ts: "2026-09-01T10:00:00Z", machine_uid: UID.toLowerCase(), action: "machine.online" });
+    expect(machPresent([edge], new Map(), Date.parse("2026-09-01T11:00:00Z"), UID)).toBe(true);
+  });
+  it("another machine's edge says nothing", () => {
+    const edge = norm({ ts: "2026-09-01T10:00:00Z", machine_uid: "00000000-0000-4000-8000-ABCDEF000022", action: "machine.online" });
+    expect(machPresent([edge], new Map(), Date.parse("2026-09-01T11:00:00Z"), UID)).toBeNull();
+  });
+});

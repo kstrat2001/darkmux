@@ -285,3 +285,13 @@ describe("replayPlaybackKvValue", () => {
     expect(replayPlaybackKvValue(day, "2026-08-26")).not.toContain("reviewed");
   });
 });
+
+describe("the replay census counts machines, not spellings of a uid", () => {
+  it("one machine whose uid is spelled in two cases is one machine", () => {
+    const parts = replayMetaParts(
+      [rec({ machine_uid: "00000000-0000-4000-8000-ABCDEF000021" }), rec({ machine_uid: "00000000-0000-4000-8000-abcdef000021" }), rec({ machine_uid: "00000000-0000-4000-8000-ABCDEF000022" })],
+      "2026-08-07",
+    );
+    expect(parts.census).toBe("3 records · 2 machines");
+  });
+});

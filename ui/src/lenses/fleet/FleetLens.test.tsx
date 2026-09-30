@@ -3326,6 +3326,18 @@ describe("FleetLens: cards belong to machines by uid", () => {
     await waitFor(() => expect(cards().map((c) => c.querySelector(".mach-name")?.textContent).sort()).toEqual(["MacBook-Pro", "darkbook"]));
   });
 
+  it("this machine's uid, reported by the daemon in the other case, is one machine: one card and one activity lane", async () => {
+    mockFleetFetch({
+      flowToday: [flowRec(FLEET_UID.mbp, "MacBook-Pro", "s-mbp")],
+      specs: { machine_id: "MacBook-Pro", machine_uid: lower(FLEET_UID.mbp) },
+      runs: [],
+    });
+    renderFleetLens();
+    await waitFor(() => expect(cards()).toHaveLength(1));
+    await waitFor(() => expect(document.querySelectorAll(".lane").length).toBeGreaterThan(0));
+    expect(document.querySelectorAll(".lane")).toHaveLength(1);
+  });
+
   it("a lab run goes to the card of its uid; a second machine with the same display name does not claim it", async () => {
     mockFleetFetch({
       flowToday: [flowRec(FLEET_UID.macA, "Mac", "s-a"), flowRec(FLEET_UID.macB, "Mac", "s-b")].map((r) => ({ ...r, action: "dispatch.complete" })),

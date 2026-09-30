@@ -19,7 +19,7 @@ import { useCardOrderGate } from "./cardOrderGate";
 import { getSource, runsSrc, runsReachable } from "../../lib/source";
 import { useLiveSessionIds } from "../../hooks/useLiveSessionIds";
 import { machPresent, LIVE_WINDOW_MS } from "../../lib/flow";
-import { isSelfMachine, machineMatch, machineUids, uidForName } from "../../lib/machineIdentity";
+import { findUid, isSelfMachine, machineMatch, machineUids, uidForName } from "../../lib/machineIdentity";
 import type { FleetMachinesLiveResponse } from "../../types/generated/FleetMachinesLiveResponse";
 import type { FleetDispatchesLiveResponse } from "../../types/generated/FleetDispatchesLiveResponse";
 import type { RunsResponse } from "../../types/generated/RunsResponse";
@@ -832,7 +832,7 @@ export function FleetLens({
   const uids = useMemo(() => {
     const derived = machineUids(flowWindow.data, liveMachines);
     const selfUid = specs?.machine_uid;
-    return selfUid && !derived.includes(selfUid) ? [...derived, selfUid] : derived;
+    return selfUid && findUid(derived, selfUid) === null ? [...derived, selfUid] : derived;
   }, [flowWindow.data, liveMachines, specs]);
   // The machine list. Every row of the view is a card, whether or not
   // anything was ever recorded about it: a peer with Redis off, a machine
