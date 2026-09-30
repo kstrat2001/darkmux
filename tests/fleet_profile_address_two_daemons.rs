@@ -1016,3 +1016,152 @@ fn the_peer_answers_under_radios_persona_and_limits() {
         assert_eq!(requested_budget(&bodies[0]), Some(u64::from(ALPHA_TOKEN_CAP)), "{seat}: the sender's budget: {}", bodies[0]);
     }
 }
+
+// ── the boundary, check mode, versions and typed refusals ─────────────
+
+use darkmux_fleet::{
+    Boundary, CheckReport, EndpointClass, RefusalCode, SeatOutlook, SingleShotJob, SubmissionMode, SubmissionReply,
+    WorkJob, WorkSubmission,
+};
+
+/// A `radio-host` single-shot job for beta's `profile`, as alpha's node
+/// would send it. The test process connects from 127.0.0.1, which alpha's and
+/// beta's fake identity tools both name as the OTHER node, so beta sees alpha.
+fn answering_job(profile: &str, nonce: &str) -> WorkJob {
+    let session = SessionId::adhoc(darkmux_types::session_id::RunId::standalone("e2e").unwrap(), "radio-host", nonce);
+    let mut job = darkmux_fleet::build_work_job(
+        "beta".into(),
+        "radio-host".into(),
+        "what is running?".into(),
+        session,
+        Some(profile.into()),
+        None,
+        None,
+        60,
+        Some("alpha".into()),
+    );
+    job.single_shot = Some(SingleShotJob {
+        humor: 10,
+        surface: darkmux_flow::payload::RadioSurface::Cli,
+        max_completion_tokens: 200,
+    });
+    job
+}
+
+fn beta_work_url(f: &Fleet) -> String {
+    format!("http://127.0.0.1:{}{}", f.fleet_port, darkmux_fleet::SUBMISSION_PATH)
+}
+
+fn post_to_beta(f: &Fleet, submission: &WorkSubmission) -> (u16, SubmissionReply) {
+    darkmux_fleet::post_submission(&beta_work_url(f), TOKEN, submission, Duration::from_secs(30)).expect("beta answered")
+}
+
+/// The promise: beta enforces the boundary against the profile it RESOLVES
+/// to, whatever alpha believed about it. `managed_only` runs on a profile
+/// beta serves itself and is refused, with the `boundary` code and before
+/// anything reaches a model, on a hosted one.
+#[test]
+fn the_receiver_refuses_a_managed_only_job_on_a_hosted_profile_and_runs_it_on_a_managed_one() {
+    let f = boot_with("refuse", Some(&["cloud", "deep"]), BetaModels::HostedAndLocal, &[]);
+    let mut hosted = answering_job("cloud", "b1");
+    hosted.boundary = Some(Boundary::ManagedOnly);
+    let (code, reply) = post_to_beta(&f, &WorkSubmission::new(hosted, true));
+    assert_eq!((code, reply.refusal), (403, Some(RefusalCode::Boundary)), "{reply:?}");
+    assert_eq!(f.mock.served.load(Ordering::SeqCst), 0, "nothing reached the hosted endpoint");
+    assert_eq!(beta_dispatch_starts(&f), 0);
+
+    let mut managed = answering_job("deep", "b2");
+    managed.boundary = Some(Boundary::ManagedOnly);
+    let (code, reply) = post_to_beta(&f, &WorkSubmission::new(managed, true));
+    assert_eq!((code, reply.status), (200, darkmux_fleet::ReplyStatus::Completed), "{reply:?}");
+    assert!(reply.stdout.unwrap_or_default().contains(MOCK_REPLY));
+    assert_eq!(f.mock.served.load(Ordering::SeqCst), 1);
+}
+
+/// The promise: a check gives the answer a run would, and runs nothing.
+/// Each outcome, against a real listener resolving real profiles.
+#[test]
+fn a_check_gives_the_answer_a_run_would_and_runs_nothing() {
+    // alpha's entry lists `cloud` only, so `deep` is defined but out of scope.
+    let f = boot_with("refuse", Some(&["cloud"]), BetaModels::HostedAndLocal, &[]);
+    let check = |profile: &str, boundary: Option<Boundary>, nonce: &str| {
+        let mut job = answering_job(profile, nonce);
+        job.mode = SubmissionMode::Check;
+        job.boundary = boundary;
+        post_to_beta(&f, &WorkSubmission::new(job, false)).1
+    };
+    let refused = |r: &SubmissionReply, code: RefusalCode| assert_eq!((r.status, r.refusal), (darkmux_fleet::ReplyStatus::Refused, Some(code)), "{r:?}");
+
+    let ok = check("cloud", None, "k1");
+    assert_eq!(ok.status, darkmux_fleet::ReplyStatus::Checked, "{ok:?}");
+    assert_eq!(ok.check, Some(CheckReport { endpoint: EndpointClass::Unmanaged, seat: SeatOutlook::Free }));
+    assert_eq!(ok.profile.as_deref(), Some("cloud"));
+    refused(&check("cloud", Some(Boundary::ManagedOnly), "k2"), RefusalCode::Boundary);
+    refused(&check("deep", None, "k3"), RefusalCode::ProfileNotAllowed);
+    refused(&check("nope", None, "k4"), RefusalCode::ProfileUndefined);
+
+    // Busy: beta's hosted seat is held by a slow job (remote.concurrent_cap
+    // is 1, busy_policy refuse). A check says so, and holds nothing itself.
+    f.mock.delay_ms.store(3_000, Ordering::SeqCst);
+    let (code, _) = post_to_beta(&f, &WorkSubmission::new(answering_job("cloud", "k5-running"), false));
+    assert_eq!(code, 202);
+    refused(&check("cloud", None, "k6"), RefusalCode::Busy);
+
+    // Nothing above ran a job of its own: one dispatch, the slow one.
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(beta_dispatch_starts(&f), 1, "a check started a dispatch");
+}
+
+/// The versions: a newer minor and another major are refused naming both
+/// versions, with the `version` code, before anything runs.
+#[test]
+fn a_newer_minor_and_another_major_are_refused_naming_both_versions() {
+    let f = boot("refuse");
+    for other in ["8.1", "9.0", "7.0", "8"] {
+        let mut sub = WorkSubmission::new(answering_job("cloud", "v1"), true);
+        sub.schema = other.into();
+        let (code, reply) = post_to_beta(&f, &sub);
+        assert_eq!((code, reply.refusal), (400, Some(RefusalCode::Version)), "{other}: {reply:?}");
+        let reason = reply.reason.unwrap();
+        assert!(reason.contains(&format!("v{other}")) && reason.contains("v8.0"), "{other}: both versions named: {reason}");
+    }
+    assert_eq!(f.mock.served.load(Ordering::SeqCst), 0);
+}
+
+/// The promise: when the peer's profile is hosted, radio's full-grounding
+/// job is refused at the boundary, ONCE, and the question is asked again
+/// with the hosted-safe grounding, saying so in one stderr line. The peer's
+/// model is asked exactly once, and never sees this machine's config.
+#[test]
+fn radio_resubmits_once_with_safe_grounding_when_the_peer_is_hosted() {
+    let f = boot("refuse");
+    let (router, env) = arm_alpha_radio(&f, SeatConfig::AnswererProfile("cloud@beta"));
+    let out = radio(&f.alpha, &env);
+    let t = text(&out);
+    assert!(out.status.success(), "{t}");
+    assert!(String::from_utf8_lossy(&out.stdout).contains(MOCK_REPLY), "{t}");
+    assert_eq!(router.served.load(Ordering::SeqCst), 1, "{t}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stderr.matches("runs that profile on a hosted endpoint").count(), 1, "one line, once: {t}");
+    let bodies = f.mock.bodies.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 1, "beta's model was asked once: {bodies:?}");
+    let (_, user) = system_and_user(&bodies[0]);
+    assert!(user.contains("what is running?"), "{user}");
+    assert!(!user.contains("answerer_profile"), "alpha's config never reached the hosted endpoint: {user}");
+}
+
+/// The other half: a peer profile beta serves itself takes the full grounding
+/// (alpha's config surface among it) under `managed_only`, with no re-submit.
+#[test]
+fn radio_sends_full_grounding_to_a_peer_that_serves_the_profile_itself() {
+    let f = boot_with("refuse", Some(&["cloud", "deep"]), BetaModels::HostedAndLocal, &[]);
+    let (_router, env) = arm_alpha_radio(&f, SeatConfig::AnswererProfile("deep@beta"));
+    let out = radio(&f.alpha, &env);
+    let t = text(&out);
+    assert!(out.status.success(), "{t}");
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("runs that profile on a hosted endpoint"), "no re-submit: {t}");
+    let bodies = f.mock.bodies.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 1, "{bodies:?}");
+    let (_, user) = system_and_user(&bodies[0]);
+    assert!(user.contains("answerer_profile"), "alpha's config rode along: {user}");
+}

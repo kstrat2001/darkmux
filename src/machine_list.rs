@@ -337,7 +337,7 @@ mod tests {
     fn card_json(version: &str) -> serde_json::Value {
         serde_json::json!({
             "card_schema_version": "1.0",
-            "work_job_schema_version": "8",
+            "work_job_schema_version": "8.0",
             "specs": {
                 "darkmux_version": version, "flow_schema_version": "2.0.0", "machine_id": "studio",
                 "machine_uid": null, "os": "macos aarch64", "ram_total_bytes": null,

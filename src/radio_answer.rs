@@ -728,7 +728,7 @@ fn render_surface_block(surface: RadioSurface) -> String {
 /// system prompt (with `{{humor}}` substituted) is baked in by
 /// [`dispatch_answerer_call_with`] before the call, since tests inject a canned
 /// closure and never dispatch a real model.
-pub type AnswererCall<'a> = dyn FnMut(&str) -> Result<String> + 'a;
+pub type AnswererCall<'a> = dyn FnMut(&str, Option<crate::fleet::Boundary>) -> Result<String> + 'a;
 
 /// The answering seat's reply.
 #[derive(Debug, Clone)]
@@ -1425,6 +1425,48 @@ pub fn build_answer_message(text: &str, grounding: &str) -> String {
     )
 }
 
+/// Assemble the grounding for `scope`, and ask the seat once.
+///
+/// Full grounding goes out under [`crate::fleet::Boundary::ManagedOnly`]: a
+/// peer seat's machine enforces it against the profile the job resolves to
+/// (its own registry, checked when the job arrives and again when it gets its
+/// seat), so this machine's cached card is only the first guess. When the
+/// peer refuses at that boundary, the question is asked once more with the
+/// hosted-safe grounding and no boundary, and one stderr line says so. A
+/// local seat has no peer to enforce anything, so it ignores the boundary.
+fn ask_answering_seat(
+    text: &str,
+    catalog: &[CatalogEntry],
+    shelf: &ArtifactShelf,
+    cwd: &Path,
+    scope: GroundingScope,
+    surface: RadioSurface,
+    call: &mut AnswererCall<'_>,
+) -> Result<String> {
+    let message = build_answer_message(text, &assemble_grounding(text, catalog, shelf, cwd, scope, surface));
+    if scope != GroundingScope::Full {
+        return call(&message, None);
+    }
+    match call(&message, Some(crate::fleet::Boundary::ManagedOnly)) {
+        Err(e) if refused_at_boundary(&e) => {
+            eprintln!(
+                "darkmux radio: the answering seat's machine runs that profile on a hosted endpoint, so \
+                 this question is sent with the command catalog and `--help` only (this machine's config, \
+                 mission board and artifact shelf are withheld)"
+            );
+            let safe = assemble_grounding(text, catalog, shelf, cwd, GroundingScope::RemoteSafe, surface);
+            call(&build_answer_message(text, &safe), None)
+        }
+        other => other,
+    }
+}
+
+/// Whether a peer refused the job at its boundary: read from the refusal's
+/// typed code, never its sentence.
+fn refused_at_boundary(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<crate::fleet::SubmitRefused>().is_some_and(|r| r.code == crate::fleet::RefusalCode::Boundary)
+}
+
 /// Route `text` to the answering seat: assemble grounding, dispatch once,
 /// post-process. `call` is the injected [`AnswererCall`] — production wires
 /// [`dispatch_answerer_call_with`]; tests inject a canned closure (no live model
@@ -1438,9 +1480,7 @@ pub fn answer(
     surface: RadioSurface,
     call: &mut AnswererCall<'_>,
 ) -> Result<AnswerOutcome> {
-    let grounding = assemble_grounding(text, catalog, shelf, cwd, scope, surface);
-    let message = build_answer_message(text, &grounding);
-    let raw = call(&message)?;
+    let raw = ask_answering_seat(text, catalog, shelf, cwd, scope, surface, call)?;
     let reply = raw.trim().to_string();
     // (#1861 defects 1 + 2, rebuilt by #2050) The mechanical backstop.
     // A reply that names a command the operator cannot actually run here
@@ -1570,7 +1610,10 @@ fn local_when_naming_this_machine(seat: AnsweringSeat) -> AnsweringSeat {
 /// when the answering seat resolves to a hosted endpoint on this machine.
 /// Fails closed via `crew::dispatch::dispatch_resolves_remote`, and for a
 /// malformed address. A fleet peer is one of the operator's own machines,
-/// not a hosted endpoint: the scope is [`GroundingScope::Full`].
+/// not a hosted endpoint: the scope is [`GroundingScope::Full`], and the peer
+/// itself enforces it: the job carries `managed_only`, and a peer whose
+/// profile is hosted refuses it ([`ask_answering_seat`] then asks again with
+/// hosted-safe grounding).
 pub fn grounding_scope_for(overrides: &AnswererOverrides) -> GroundingScope {
     match resolved_answering_seat(overrides) {
         Ok(AnsweringSeat::Here { explicit }) => {
@@ -1620,6 +1663,7 @@ pub fn dispatch_answerer_call_with(
     user_message: &str,
     overrides: &AnswererOverrides,
     surface: RadioSurface,
+    boundary: Option<crate::fleet::Boundary>,
 ) -> Result<String> {
     let humor = overrides.humor.unwrap_or_else(darkmux_types::config_access::radio_humor);
     let seat = resolved_answering_seat(overrides).map_err(|e| anyhow::anyhow!("radio answering seat: {e}"))?;
@@ -1676,7 +1720,7 @@ pub fn dispatch_answerer_call_with(
         system_prompt_override,
     };
     let result =
-        crate::fleet::dispatch_routed_single_shot(opts, single_shot, crate::crew::dispatch::dispatch_local_single_shot)
+        crate::fleet::dispatch_routed_single_shot(opts, single_shot, boundary, crate::crew::dispatch::dispatch_local_single_shot)
             .map_err(|e| match &seat_label {
                 Some(address) => e.context(format!("the answering seat `{address}`")),
                 None => e,
@@ -1741,8 +1785,8 @@ pub fn answer_live(
              shelf, and any deep artifact are withheld (they never leave this machine)."
         );
     }
-    answer(text, catalog, shelf, cwd, scope, surface, &mut |m: &str| {
-        dispatch_answerer_call_with(m, overrides, surface)
+    answer(text, catalog, shelf, cwd, scope, surface, &mut |m: &str, boundary| {
+        dispatch_answerer_call_with(m, overrides, surface, boundary)
     })
     .map(LiveAnswer::Answered)
     .context("dispatching the radio answering seat")
@@ -1886,11 +1930,77 @@ mod tests {
         assert!(answering_seat_target(&seat_overrides("deep@laptop")).is_some(), "this machine's own address is local");
     }
 
+    fn refused(code: crate::fleet::RefusalCode) -> anyhow::Error {
+        anyhow::Error::from(crate::fleet::SubmitRefused { code, reason: "the peer said no".into() })
+            .context("the answering seat `cloud@studio`")
+    }
+
+    /// Ask the seat with `scope`, recording each (message, boundary) the call
+    /// saw; `script` decides each call's result.
+    fn ask_recording(
+        scope: GroundingScope,
+        mut script: impl FnMut(usize) -> Result<String>,
+    ) -> (Result<String>, Vec<(String, Option<crate::fleet::Boundary>)>) {
+        let mut seen = Vec::new();
+        let shelf = ArtifactShelf::default();
+        let out = ask_answering_seat("what is loaded?", &fixture_catalog(), &shelf, Path::new("/tmp"), scope, RadioSurface::Cli, &mut |m: &str, b| {
+            seen.push((m.to_string(), b));
+            script(seen.len() - 1)
+        });
+        (out, seen)
+    }
+
+    /// Full grounding goes out under `managed_only`; a peer that refuses at
+    /// the boundary is asked once more, with public-surface grounding only
+    /// and no boundary. Never a third time.
+    #[test]
+    fn a_boundary_refusal_is_asked_again_once_with_safe_grounding() {
+        let (out, seen) = ask_recording(GroundingScope::Full, |i| match i {
+            0 => Err(refused(crate::fleet::RefusalCode::Boundary)),
+            _ => Ok("the safe answer".into()),
+        });
+        assert_eq!(out.unwrap(), "the safe answer");
+        assert_eq!(seen.len(), 2, "one re-submit");
+        assert_eq!(seen[0].1, Some(crate::fleet::Boundary::ManagedOnly));
+        assert_eq!(seen[1].1, None, "the re-submit carries no boundary");
+        assert!(seen[0].0.len() > seen[1].0.len(), "the second message is the smaller, hosted-safe grounding");
+        assert_eq!(
+            seen[1].0,
+            build_answer_message(
+                "what is loaded?",
+                &assemble_grounding("what is loaded?", &fixture_catalog(), &ArtifactShelf::default(), Path::new("/tmp"), GroundingScope::RemoteSafe, RadioSurface::Cli)
+            )
+        );
+
+        let (out, seen) = ask_recording(GroundingScope::Full, |_| Err(refused(crate::fleet::RefusalCode::Boundary)));
+        assert!(out.is_err());
+        assert_eq!(seen.len(), 2, "a second boundary refusal is the end of it");
+    }
+
+    /// Only a boundary refusal, read from its code, re-sends. Any other
+    /// refusal (even one whose sentence mentions the boundary), or any other
+    /// error, ends the question; and a seat with no full grounding sends no
+    /// boundary at all.
+    #[test]
+    fn only_a_boundary_code_triggers_the_resubmit() {
+        for code in [crate::fleet::RefusalCode::Busy, crate::fleet::RefusalCode::Unknown, crate::fleet::RefusalCode::ProfileNotAllowed] {
+            let (out, seen) = ask_recording(GroundingScope::Full, |_| Err(refused(code)));
+            assert!(out.is_err());
+            assert_eq!(seen.len(), 1, "{code:?} is not a boundary refusal");
+        }
+        let (out, seen) = ask_recording(GroundingScope::Full, |_| Err(anyhow::anyhow!("managed_only boundary hosted endpoint")));
+        assert!(out.is_err());
+        assert_eq!(seen.len(), 1, "a sentence is never parsed");
+        let (out, seen) = ask_recording(GroundingScope::RemoteSafe, |_| Ok("fine".into()));
+        assert_eq!(out.unwrap(), "fine");
+        assert_eq!(seen.iter().map(|(_, b)| *b).collect::<Vec<_>>(), vec![None], "safe grounding needs no boundary");
+    }
+
     #[test]
     fn a_malformed_address_fails_the_data_boundary_closed() {
         let o = AnswererOverrides { profile_name: Some("a@b@c".into()), humor: None };
         assert_eq!(grounding_scope_for(&o), GroundingScope::RemoteSafe);
-        let err = dispatch_answerer_call_with("hi", &o, RadioSurface::Cli).unwrap_err();
+        let err = dispatch_answerer_call_with("hi", &o, RadioSurface::Cli, None).unwrap_err();
         assert!(format!("{err:#}").contains("a@b@c"), "{err:#}");
     }
 
@@ -2488,7 +2598,7 @@ mod tests {
 
     #[test]
     fn answer_referencing_a_slash_command_gets_the_listing_appended() {
-        let mut call = |_msg: &str| -> Result<String> { Ok("Try running /mission launch pr-list to see them.".to_string()) };
+        let mut call = |_msg: &str, _boundary: Option<crate::fleet::Boundary>| -> Result<String> { Ok("Try running /mission launch pr-list to see them.".to_string()) };
         let shelf = ArtifactShelf::default();
         let outcome =
             answer("anything mergeable?", &fixture_catalog(), &shelf, Path::new("/tmp"), GroundingScope::Full, RadioSurface::Panel, &mut call)
@@ -2498,7 +2608,7 @@ mod tests {
 
     #[test]
     fn answer_not_referencing_a_command_stays_bare() {
-        let mut call = |_msg: &str| -> Result<String> { Ok("darkmux is a local-AI orchestrator CLI.".to_string()) };
+        let mut call = |_msg: &str, _boundary: Option<crate::fleet::Boundary>| -> Result<String> { Ok("darkmux is a local-AI orchestrator CLI.".to_string()) };
         let shelf = ArtifactShelf::default();
         let outcome = answer(
             "is this darkmux?",
@@ -2515,7 +2625,7 @@ mod tests {
 
     #[test]
     fn answer_dispatch_error_propagates_as_err() {
-        let mut call = |_msg: &str| -> Result<String> { Err(anyhow::anyhow!("no model loaded")) };
+        let mut call = |_msg: &str, _boundary: Option<crate::fleet::Boundary>| -> Result<String> { Err(anyhow::anyhow!("no model loaded")) };
         let shelf = ArtifactShelf::default();
         let result =
             answer("is this darkmux?", &fixture_catalog(), &shelf, Path::new("/tmp"), GroundingScope::Full, RadioSurface::Panel, &mut call);
@@ -2606,7 +2716,7 @@ mod tests {
 
     #[test]
     fn answer_falls_back_rather_than_shipping_an_invented_command() {
-        let mut call = |_msg: &str| -> Result<String> { Ok("Run `/machine` to see your crew.".to_string()) };
+        let mut call = |_msg: &str, _boundary: Option<crate::fleet::Boundary>| -> Result<String> { Ok("Run `/machine` to see your crew.".to_string()) };
         let shelf = ArtifactShelf::default();
         let err = answer(
             "how do I see my crew?",
@@ -2630,7 +2740,7 @@ mod tests {
         // so it is shipped rather than discarded, and the question is only
         // whether the listing gets bolted on.
         let mut call =
-            |_msg: &str| -> Result<String> { Ok("Run `darkmux machine status` to see them.".to_string()) };
+            |_msg: &str, _boundary: Option<crate::fleet::Boundary>| -> Result<String> { Ok("Run `darkmux machine status` to see them.".to_string()) };
         let shelf = ArtifactShelf::default();
         let outcome = answer(
             "anything loaded?",
@@ -3313,7 +3423,7 @@ mod tests {
         // panel-only command on the CLI surface must not reach the user as
         // a bare shell instruction. It reaches them as the plain refusal
         // plus the live listing instead.
-        let mut call = |_msg: &str| -> Result<String> {
+        let mut call = |_msg: &str, _boundary: Option<crate::fleet::Boundary>| -> Result<String> {
             Ok("Run `review` to execute the code review pipeline against your current \
                 working-tree diff. It will report any bugs it finds."
                 .to_string())
@@ -3349,7 +3459,7 @@ mod tests {
         // reply goes and the caller prints the plain refusal instead.
         let seat_reply = "Run `/review` — it will scan your current working-tree diff for bugs and \
                           report back. Let me know if it flags anything worth fixing.";
-        let mut call = |_msg: &str| -> Result<String> { Ok(seat_reply.to_string()) };
+        let mut call = |_msg: &str, _boundary: Option<crate::fleet::Boundary>| -> Result<String> { Ok(seat_reply.to_string()) };
         let shelf = ArtifactShelf::default();
         let err = answer(
             "run the review pipeline",
@@ -3373,7 +3483,7 @@ mod tests {
         // rather than the predicate: the seat returns Ok, the reply reads
         // perfectly, and `machine roster` does not exist. Before this it
         // shipped verbatim as `outcome.rendered`.
-        let mut call = |_msg: &str| -> Result<String> {
+        let mut call = |_msg: &str, _boundary: Option<crate::fleet::Boundary>| -> Result<String> {
             Ok("You can run darkmux machine roster to see your crew from here. It lists every \
                 model this machine has loaded."
                 .to_string())
@@ -3396,7 +3506,7 @@ mod tests {
     fn answer_still_renders_a_reply_that_names_no_command_at_all() {
         // The inverted case: ordinary prose must still reach the operator,
         // or every answer collapses to the fallback and the seat goes dark.
-        let mut call = |_msg: &str| -> Result<String> {
+        let mut call = |_msg: &str, _boundary: Option<crate::fleet::Boundary>| -> Result<String> {
             Ok("Your context window is 100000 tokens on the current profile.".to_string())
         };
         let shelf = ArtifactShelf::default();

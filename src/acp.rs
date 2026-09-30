@@ -703,7 +703,8 @@ type RouterCall = Arc<dyn Fn(&str) -> Result<String> + Send + Sync>;
 /// [`crate::radio::RadioSurface::Panel`] — ACP is the panel surface by
 /// construction, so that argument is never a runtime choice here the way
 /// it is in `radio_cli.rs` (#1861).
-type AnswererCall = Arc<dyn Fn(&str, &crate::radio_answer::AnswererOverrides) -> Result<String> + Send + Sync>;
+type AnswererCall =
+    Arc<dyn Fn(&str, &crate::radio_answer::AnswererOverrides, Option<crate::fleet::Boundary>) -> Result<String> + Send + Sync>;
 
 /// The DATA-BOUNDARY seam (#1698 Packet B2 gate): how much of this
 /// machine's state may go into the answering seat's grounding bundle, given
@@ -757,9 +758,11 @@ pub fn run() -> Result<i32> {
     // (#1861) ACP is the panel surface by construction — pinned here, not
     // threaded as a runtime choice the way `radio_cli.rs` threads the CLI
     // surface. Pinned by a test; see this file's test module.
-    let answerer: AnswererCall = Arc::new(|m: &str, overrides: &crate::radio_answer::AnswererOverrides| {
-        crate::radio_answer::dispatch_answerer_call_with(m, overrides, crate::radio::RadioSurface::Panel)
-    });
+    let answerer: AnswererCall = Arc::new(
+        |m: &str, overrides: &crate::radio_answer::AnswererOverrides, boundary: Option<crate::fleet::Boundary>| {
+            crate::radio_answer::dispatch_answerer_call_with(m, overrides, crate::radio::RadioSurface::Panel, boundary)
+        },
+    );
     let scope: ScopeCall = Arc::new(crate::radio_answer::grounding_scope_for);
     let busy: BusyCall = Arc::new(crate::radio_busy::answering_seat_busy);
     rt.block_on(async {
@@ -1907,7 +1910,7 @@ async fn answer_no_slash_refusal(
             &cwd_owned,
             scope,
             crate::radio::RadioSurface::Panel,
-            &mut |m: &str| (seat.call)(m, &overrides),
+            &mut |m: &str, boundary| (seat.call)(m, &overrides, boundary),
         )
     })
     .await
@@ -2764,7 +2767,7 @@ mod tests {
     fn both_acp_answering_call_sites_pin_the_panel_surface() {
         let src = production_source();
         assert!(
-            src.contains("dispatch_answerer_call_with(m, overrides, crate::radio::RadioSurface::Panel)"),
+            src.contains("dispatch_answerer_call_with(m, overrides, crate::radio::RadioSurface::Panel, boundary)"),
             "run()'s answerer closure must pin the panel surface"
         );
         assert!(
@@ -2878,7 +2881,10 @@ mod tests {
     /// refusal-path tests inject a real canned reply.
     fn spawn_test_agent(
         router: impl Fn(&str) -> Result<String> + Send + Sync + 'static,
-        answerer: impl Fn(&str, &crate::radio_answer::AnswererOverrides) -> Result<String> + Send + Sync + 'static,
+        answerer: impl Fn(&str, &crate::radio_answer::AnswererOverrides, Option<crate::fleet::Boundary>) -> Result<String>
+            + Send
+            + Sync
+            + 'static,
     ) -> (DuplexStream, BufReader<DuplexStream>) {
         let (writer, reader, _idle) = spawn_test_agent_observing_idle(router, answerer);
         (writer, reader)
@@ -2891,7 +2897,10 @@ mod tests {
     /// respect it if it were.
     fn spawn_test_agent_observing_idle(
         router: impl Fn(&str) -> Result<String> + Send + Sync + 'static,
-        answerer: impl Fn(&str, &crate::radio_answer::AnswererOverrides) -> Result<String> + Send + Sync + 'static,
+        answerer: impl Fn(&str, &crate::radio_answer::AnswererOverrides, Option<crate::fleet::Boundary>) -> Result<String>
+            + Send
+            + Sync
+            + 'static,
     ) -> (DuplexStream, BufReader<DuplexStream>, Arc<IdleState>) {
         // (#2917) Pinned to "not busy": these tests exercise the wire, and
         // the production busy check shells to `lms ps` — see `BusyCall`.
@@ -2903,7 +2912,10 @@ mod tests {
     /// test needs and every other test pins to "not busy".
     fn spawn_test_agent_with_busy(
         router: impl Fn(&str) -> Result<String> + Send + Sync + 'static,
-        answerer: impl Fn(&str, &crate::radio_answer::AnswererOverrides) -> Result<String> + Send + Sync + 'static,
+        answerer: impl Fn(&str, &crate::radio_answer::AnswererOverrides, Option<crate::fleet::Boundary>) -> Result<String>
+            + Send
+            + Sync
+            + 'static,
         busy: impl Fn(&crate::radio_answer::AnswererOverrides) -> Option<crate::radio_busy::BusyReport>
             + Send
             + Sync
@@ -2936,7 +2948,11 @@ mod tests {
     /// to be reached — panics loudly rather than silently dispatching a
     /// live model, same "fail loud, not quiet" contract `router`'s own
     /// panic-on-call fixtures already use in this module.
-    fn never_answer(_msg: &str, _overrides: &crate::radio_answer::AnswererOverrides) -> Result<String> {
+    fn never_answer(
+        _msg: &str,
+        _overrides: &crate::radio_answer::AnswererOverrides,
+        _boundary: Option<crate::fleet::Boundary>,
+    ) -> Result<String> {
         panic!("the answering seat must not be reached by this scenario");
     }
 
@@ -3430,7 +3446,7 @@ mod tests {
         let router = |_msg: &str| -> Result<String> {
             Err(anyhow::anyhow!("darkmux: profile `balanced` still names the placeholder `<your-worker-model-id>`"))
         };
-        let answerer = |_msg: &str, _overrides: &crate::radio_answer::AnswererOverrides| -> Result<String> {
+        let answerer = |_msg: &str, _overrides: &crate::radio_answer::AnswererOverrides, _boundary: Option<crate::fleet::Boundary>| -> Result<String> {
             panic!("the answering seat must not run when the routing seat could not reach a model")
         };
         let (mut writer, mut reader) = spawn_test_agent(router, answerer);
@@ -3472,7 +3488,7 @@ mod tests {
         let router = |_msg: &str| -> Result<String> {
             Ok("```json\n{\"refuse\": \"that's outside the scope of mission comms\"}\n```".to_string())
         };
-        let answerer = |_msg: &str, _overrides: &crate::radio_answer::AnswererOverrides| -> Result<String> {
+        let answerer = |_msg: &str, _overrides: &crate::radio_answer::AnswererOverrides, _boundary: Option<crate::fleet::Boundary>| -> Result<String> {
             Ok("RADIO: that's outside my mission comms scope too.".to_string())
         };
         let (mut writer, mut reader) = spawn_test_agent(router, answerer);
@@ -3517,7 +3533,7 @@ mod tests {
         let router = |_msg: &str| -> Result<String> {
             Ok("```json\n{\"refuse\": \"that's outside the scope of mission comms\"}\n```".to_string())
         };
-        let answerer = |_msg: &str, _overrides: &crate::radio_answer::AnswererOverrides| -> Result<String> {
+        let answerer = |_msg: &str, _overrides: &crate::radio_answer::AnswererOverrides, _boundary: Option<crate::fleet::Boundary>| -> Result<String> {
             Err(anyhow::anyhow!("no model loaded"))
         };
         let (mut writer, mut reader) = spawn_test_agent(router, answerer);
@@ -3553,7 +3569,7 @@ mod tests {
         let router = |_msg: &str| -> Result<String> {
             Ok("```json\n{\"refuse\": \"that's outside the scope of mission comms\"}\n```".to_string())
         };
-        let answerer = |_msg: &str, _overrides: &crate::radio_answer::AnswererOverrides| -> Result<String> {
+        let answerer = |_msg: &str, _overrides: &crate::radio_answer::AnswererOverrides, _boundary: Option<crate::fleet::Boundary>| -> Result<String> {
             panic!("a busy answering seat must never be dispatched to (#2917)")
         };
         let busy = |_overrides: &crate::radio_answer::AnswererOverrides| {
@@ -3618,7 +3634,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(600));
             Ok("```json\n{\"refuse\": \"outside the scope of mission comms\"}\n```".to_string())
         };
-        let answerer = |_msg: &str, _overrides: &crate::radio_answer::AnswererOverrides| -> Result<String> {
+        let answerer = |_msg: &str, _overrides: &crate::radio_answer::AnswererOverrides, _boundary: Option<crate::fleet::Boundary>| -> Result<String> {
             Ok("RADIO: the answer.".to_string())
         };
         let (mut writer, mut reader) = spawn_test_agent(router, answerer);
@@ -3658,7 +3674,7 @@ mod tests {
         };
         let received_message: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let received_message_for_answerer = received_message.clone();
-        let answerer = move |msg: &str, _overrides: &crate::radio_answer::AnswererOverrides| -> Result<String> {
+        let answerer = move |msg: &str, _overrides: &crate::radio_answer::AnswererOverrides, _boundary: Option<crate::fleet::Boundary>| -> Result<String> {
             *received_message_for_answerer.lock().unwrap() = Some(msg.to_string());
             Ok("RADIO: acknowledged.".to_string())
         };
@@ -3707,7 +3723,7 @@ mod tests {
         };
         let received_overrides: Arc<Mutex<Option<crate::radio_answer::AnswererOverrides>>> = Arc::new(Mutex::new(None));
         let received_overrides_for_answerer = received_overrides.clone();
-        let answerer = move |_msg: &str, overrides: &crate::radio_answer::AnswererOverrides| -> Result<String> {
+        let answerer = move |_msg: &str, overrides: &crate::radio_answer::AnswererOverrides, _boundary: Option<crate::fleet::Boundary>| -> Result<String> {
             *received_overrides_for_answerer.lock().unwrap() = Some(overrides.clone());
             Ok("RADIO: acknowledged.".to_string())
         };
@@ -3795,7 +3811,7 @@ mod tests {
         // ("ambiguous...") is never rendered directly, so this scenario
         // needs its own canned reply rather than asserting on the router's
         // own text.
-        let answerer = |_msg: &str, _overrides: &crate::radio_answer::AnswererOverrides| -> Result<String> {
+        let answerer = |_msg: &str, _overrides: &crate::radio_answer::AnswererOverrides, _boundary: Option<crate::fleet::Boundary>| -> Result<String> {
             Ok("RADIO: I can't tell what you meant by that.".to_string())
         };
         let (mut writer, mut reader) = spawn_test_agent(router, answerer);
