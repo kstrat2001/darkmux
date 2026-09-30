@@ -891,7 +891,8 @@ describe("MachineLens — battery surfaces (#2821, lens only)", () => {
     await waitFor(() => expect(screen.getByText("80%")).toBeInTheDocument());
     const icon = container.querySelector(".battery-bar-icon")!;
     expect(icon).not.toBeNull();
-    expect(icon.textContent).toContain("⚡");
+    expect(icon.getAttribute("data-kind")).toBe("bolt");
+    expect(container.querySelector(".battery-bar text")).toBeNull(); // a drawn path, never an emoji
   });
 
   it("plug icon when on AC but not charging (topped off) — never a bolt", async () => {
@@ -900,7 +901,8 @@ describe("MachineLens — battery surfaces (#2821, lens only)", () => {
     await waitFor(() => expect(screen.getByText("100%")).toBeInTheDocument());
     const icon = container.querySelector(".battery-bar-icon")!;
     expect(icon).not.toBeNull();
-    expect(icon.textContent).toContain("🔌");
+    expect(icon.getAttribute("data-kind")).toBe("plug");
+    expect(container.querySelector(".battery-bar text")).toBeNull();
   });
 
   it("held: a marker at the held level and a labeled tooltip; the other states draw neither", async () => {

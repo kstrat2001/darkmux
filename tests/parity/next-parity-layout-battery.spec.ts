@@ -44,6 +44,9 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
         fs.mkdirSync(process.env.DARKMUX_BATTERY_SHOTS, { recursive: true });
         await page.locator(".battery-block").screenshot({ path: path.join(process.env.DARKMUX_BATTERY_SHOTS, `${state.id}-${vpName}.png`) });
       }
+      if ((state.id === "held" || state.id === "charging") && process.env.DARKMUX_BATTERY_SHOTS) {
+        await page.locator(".battery-bar").screenshot({ path: path.join(process.env.DARKMUX_BATTERY_SHOTS, `zoom-glyph-${state.id}-${vpName}.png`) });
+      }
       if (state.held && process.env.DARKMUX_BATTERY_SHOTS) {
         const zoom = page.locator(".battery-bar-row");
         await zoom.screenshot({ path: path.join(process.env.DARKMUX_BATTERY_SHOTS, `zoom-held-i-${vpName}.png`), scale: "device" });
