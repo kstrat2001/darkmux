@@ -1,5 +1,5 @@
 {
-  "schema_version": "2.0.0",
+  "schema_version": "2.1.0",
   "run": "run-a",
   "model": "m",
   "result": "stop",
@@ -22,6 +22,7 @@
   "content_chars": 0,
   "completion_tokens": 300,
   "reasoning_tokens": 0,
+  "calls_unreported": 0,
   "suspect_turns": [],
   "tool_calls": {},
   "tool_calls_total": 0,
