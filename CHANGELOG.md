@@ -1149,6 +1149,15 @@ darkmux release.
 
 ### Fixed (4.0)
 
+- **A turn the runtime ended now counts toward the run's tokens and its cap.**
+  A call cut by the degeneracy gate or a silent stream never receives the
+  endpoint's usage, so its tokens were dropped from the totals and the
+  cumulative cap never saw them, and the per-call budget line printed
+  `<unknown>`. The runtime now counts what streamed past, records it as
+  `completion_estimate` beside a null `usage` (an estimate, never a reported
+  figure), and adds it to the cumulative cap. `run stats` and the dispatch
+  envelope report `unreported_calls` and `estimated_completion_tokens`, so a
+  total read beside them is known to be a floor.
 - **A daemon started with `--port N` is found by every client on the machine (#3007).** `darkmux serve` now records where it actually bound (`<darkmux home>/run/daemon.json`: pid, host, port) and removes the record on clean shutdown. Doctor, the dispatch nudge, `machine list` and the viewer links resolve the daemon's address from a live record first, then env, config and the built-in 8765, and the `daemon reachable` row names which source it used. A record whose pid is gone is ignored. Before, a daemon on `--port 8766` read as "not reachable at 127.0.0.1:8765" and the `fleet token` row failed against it.
 - **Doctor's `fleet token` row no longer fails for a shell without the token when the daemon has it.** `/health` now carries `fleet_token_set` (a boolean, this machine only, never the value); when the shell cannot resolve a token but the local daemon reports one, the row passes and says the token is set in the daemon's environment only.
 - **Dispatching to a peer whose listener is off names the listener.** The error was `no answer from http://<host>:8766/fleet/work: ... Connection refused (os error 61)`. It now reads `the fleet listener at <url> is not accepting connections (off, or the daemon is down); nothing was sent`, the same sentence `/fleet/view` gives as the detail of its `listener_off` outcome (one classifier, `is_listener_off`).

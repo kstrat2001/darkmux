@@ -87,6 +87,7 @@ fn a_written_event_reads_back_equal() {
         tool_calls: Some(vec![ToolCallEntry { id: "a".into(), name: "read".into(), arguments_chars: 5, path: Some("f".into()), runs: Some(false) }]),
         reported_model: None,
         calls_planned: true,
+        completion_estimate: Some(7),
     });
     let line = serde_json::to_string(&e).unwrap();
     assert_eq!(parse_line(&line), Some(e));
@@ -101,6 +102,22 @@ fn a_written_event_reads_back_equal() {
 
 fn fold(lines: &[&str]) -> TrajectoryFold {
     TrajectoryFold::from_lines(&lines.join("\n"))
+}
+
+/// (B1) A call the runtime cut has no usage. Its estimate is kept apart from
+/// the reported sum, and the call is counted as unreported so a total read
+/// beside it is known to be a floor.
+#[test]
+fn a_cut_call_is_counted_unreported_with_its_estimate_kept_out_of_the_reported_sum() {
+    let f = fold(&[
+        r#"{"type":"model.completed","seq":1,"finish_reason":"tool_calls","usage":{"prompt_tokens":100,"completion_tokens":10,"total_tokens":110}}"#,
+        r#"{"type":"model.completed","seq":2,"finish_reason":"length","usage":null,"completion_estimate":900}"#,
+    ]);
+    assert_eq!(f.unreported_calls, 1);
+    assert_eq!(f.estimated_completion_tokens, 900);
+    assert_eq!(f.tokens.completion, 10, "the estimate is never folded into the reported sum");
+    let clean = fold(&[r#"{"type":"model.completed","seq":1,"finish_reason":"stop","usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#]);
+    assert_eq!((clean.unreported_calls, clean.estimated_completion_tokens), (0, 0));
 }
 
 #[test]

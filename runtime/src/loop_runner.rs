@@ -586,6 +586,17 @@ fn saturating_u32(n: u64) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
 
+/// How the per-call-budget line names a turn's completion tokens: the
+/// endpoint's count, else the runtime's estimate marked as one, else the
+/// plain statement that the server reported none.
+fn completion_tokens_label(reported: Option<u32>, estimate: Option<u32>) -> String {
+    match (reported, estimate) {
+        (Some(n), _) => format!("{n} completion tokens"),
+        (None, Some(n)) => format!("~{n} completion tokens (the runtime's estimate; the server reported none)"),
+        (None, None) => "an unknown number of completion tokens (not reported by the server)".to_string(),
+    }
+}
+
 fn extend_deadline_by_rest(deadline: std::time::Instant, rest_ms: u64) -> std::time::Instant {
     deadline + std::time::Duration::from_millis(rest_ms)
 }
@@ -2766,7 +2777,7 @@ fn run_with_sleeper(
         // one. Read-only from here down.
         let opened_a_new_turn = !resuming_after_checkpoint;
         let next_seq = if resuming_after_checkpoint { turns } else { turns + 1 };
-        let (mut response, runtime_cut) = if streaming {
+        let (mut response, runtime_cut, cut_estimate) = if streaming {
             let outcome = run_streaming_turn(
                 client,
                 &request,
@@ -2780,13 +2791,13 @@ fn run_with_sleeper(
                     tick: STREAM_TICK,
                 },
             )?;
-            (outcome.response, outcome.cut)
+            (outcome.response, outcome.cut, outcome.estimated_completion_tokens)
         } else {
             // (#2836) Nothing to observe on a non-streamed call: the whole
             // response arrives at once, so the runtime never has the chance
             // to end it early. The server is the only possible cutter here,
             // and it stays that way through Stage 1.
-            (client.chat(&request)?, CutSource::None)
+            (client.chat(&request)?, CutSource::None, None)
         };
         // (#1221) A checkpoint continuation is the SAME logical turn resuming,
         // so it must not consume a turn. It is a new API CALL, which is why
@@ -2909,7 +2920,13 @@ fn run_with_sleeper(
         // distinction matters.
         let usage = response.usage.as_ref();
         let this_turn_completion_tokens: Option<u32> = usage.and_then(|u| u.completion).map(saturating_u32);
-        total_completion_tokens = total_completion_tokens.saturating_add(this_turn_completion_tokens.unwrap_or(0));
+        // (B1) A turn the runtime cut has no endpoint count, but its tokens
+        // were spent: the run's total and the cumulative cap take the
+        // runtime's own estimate. The trajectory keeps the two apart
+        // (`usage: null` plus `completion_estimate`), so nothing downstream
+        // reads the estimate as a reported figure.
+        total_completion_tokens = total_completion_tokens
+            .saturating_add(this_turn_completion_tokens.or(cut_estimate).unwrap_or(0));
         // The prompt count is the ground truth everything below calibrates
         // against, so all of it needs one the endpoint actually reported.
         if let Some(prompt_tokens) = usage.and_then(|u| u.prompt).map(saturating_u32) {
@@ -3017,6 +3034,7 @@ fn run_with_sleeper(
             trajectory_tool_calls.as_deref(),
             Some(&call_runs),
             response.served_model(),
+            cut_estimate.map(u64::from),
         );
 
         // Take the first choice — LMStudio's OpenAI-compatible endpoint
@@ -4861,9 +4879,7 @@ fn run_with_sleeper(
                     messages.pop();
                     turn.hand_back(&mut messages);
                 }
-                let tokens_str = this_turn_completion_tokens
-                    .map(|n| n.to_string())
-                    .unwrap_or_else(|| "<unknown>".to_string());
+                let tokens_str = completion_tokens_label(this_turn_completion_tokens, cut_estimate);
                 let shape = if is_useless_stall {
                     "reasoning-only up to the cap"
                 } else {
@@ -4874,7 +4890,7 @@ fn run_with_sleeper(
                 // one-per-hit summary the operator scans for.
                 eprintln!(
                     "darkmux-runtime: ⏸ per-call budget reached — turn {turns} \
-                     emitted {tokens_str} completion tokens ({shape}); the turn's \
+                     emitted {tokens_str} ({shape}); the turn's \
                      reasoning was NOT discarded. Recovery budget \
                      {stall_recoveries_used}/{stall_recovery_budget}. (#1221)"
                 );
@@ -5131,6 +5147,7 @@ fn run_streaming_turn(
     }
     let partial_count = accumulator.partial_count();
     let total_content = accumulator.content_bytes();
+    let generated_bytes = accumulator.generated_bytes();
     let reasoning_content = accumulator.take_reasoning_content();
     let mut response = accumulator.into_response();
     let tool_calls_count = response
@@ -5154,6 +5171,11 @@ fn run_streaming_turn(
         }
         response.usage = None;
     }
+    // (B1) The only count a cut call has: what the runtime itself saw
+    // stream past before it ended the call. Marked as an estimate all the
+    // way to the trajectory; never folded in as a reported figure.
+    let estimated_completion_tokens = matches!(cut, CutSource::RuntimeAbort(_))
+        .then(|| saturating_u32(generated_bytes.div_ceil(crate::stream_gate::CHARS_PER_TOKEN) as u64));
     // (#2836) Stamped ONLY on a call that emitted no tool calls, and the
     // restriction is the whole point rather than a nicety.
     //
@@ -5201,7 +5223,7 @@ fn run_streaming_turn(
     // itself, so the runtime is never the cutter here. Stage 1 feeds each
     // chunk to a `StreamGate` and reports `RuntimeAbort` when it
     // intervenes; the caller already routes on this field.
-    Ok(StreamOutcome { response, cut })
+    Ok(StreamOutcome { response, cut, estimated_completion_tokens })
 }
 
 /// Measure per-turn context size: returns `(system_chars, prompt_chars)`.
@@ -8849,6 +8871,68 @@ mod tests {
             .expect("the stream gate itself must have aborted the call");
         assert_eq!(abort["policy"], "conclude", "got {abort}");
         assert_eq!(abort["acted"], true, "got {abort}");
+    }
+
+    /// (B1) Promise: every model call's tokens reach the run's totals and
+    /// its caps, including a turn the RUNTIME ended. The cut call never gets
+    /// the endpoint's `usage`, so the runtime counts what streamed past. The
+    /// trajectory keeps that apart from a reported figure (`usage` stays
+    /// null, `completion_estimate` carries the number), and the cumulative
+    /// cap sees it: without it a run cut every turn escapes the cap.
+    #[test]
+    #[serial_test::serial]
+    fn a_runtime_cut_turn_counts_toward_the_cumulative_cap_and_is_marked_an_estimate() {
+        let looped: String = "the same thing over and over ".repeat(400);
+        let server = crate::test_support::GuardedMockServer::start();
+        let mut pieces: Vec<&str> = vec!["<think>"];
+        pieces.extend(looped.split_inclusive(' '));
+        let body = sse(&pieces, "stop", 2_000);
+        server.mock(move |when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).header("content-type", "text/event-stream").body(body.clone());
+        });
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("cut-accounting").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let cfg = compaction::CompactionConfig::never_compact();
+        let outcome = run_with_sleeper(
+            &client, &client, "m",
+            vec![Message::system("s"), Message::user("go")],
+            &[Tool::Read], &mut traj, true, &cfg,
+            Some(5), Some(100), Some(9_000), Some(1_000), Some(1_000),
+            None, std::collections::BTreeMap::new(), None,
+            tmp.path(), "test-role", None, &RealSleeper,
+        )
+        .expect("a cut turn must never be fatal to the dispatch");
+        assert_eq!(
+            outcome.terminal_reason,
+            TerminalReason::EscalationTriggered(EscalationReason::CumulativeTokensExceeded),
+            "the cut turn's tokens must reach the cumulative cap"
+        );
+        let text = std::fs::read_to_string(tmp.path().join(".darkmux-runtime").join("trajectory.jsonl")).unwrap();
+        let completed = text
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["type"] == "model.completed")
+            .expect("a model.completed record for the cut turn");
+        assert!(completed["usage"].is_null(), "the cut call has no reported usage; got {completed}");
+        assert!(
+            completed["completion_estimate"].as_u64().unwrap_or(0) > 100,
+            "the runtime's estimate is recorded apart from usage; got {completed}"
+        );
+    }
+
+    /// (B1) The per-call-budget line never says a bare `<unknown>`: it names
+    /// the count, the runtime's estimate as an estimate, or that the server
+    /// reported none.
+    #[test]
+    fn the_per_call_budget_line_names_what_it_knows_about_a_turns_tokens() {
+        assert_eq!(completion_tokens_label(Some(7), None), "7 completion tokens");
+        assert_eq!(completion_tokens_label(Some(7), Some(9)), "7 completion tokens");
+        assert!(completion_tokens_label(None, Some(9)).contains("~9"));
+        assert!(completion_tokens_label(None, Some(9)).contains("estimate"));
+        assert!(completion_tokens_label(None, None).contains("not reported by the server"));
+        assert!(!completion_tokens_label(None, None).contains("<unknown>"));
     }
 
     /// (#2846) `record` (was `observe`) measures and records without acting.

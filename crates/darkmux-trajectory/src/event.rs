@@ -302,6 +302,12 @@ pub struct ModelCompleted {
     /// True when `tool_calls` carry their `runs` marks.
     #[serde(default, skip_serializing_if = "is_false")]
     pub calls_planned: bool,
+    /// The runtime's own estimate of the completion tokens of a call IT cut
+    /// (the degeneracy gate, a silent stream). Such a call has `usage: None`
+    /// because the endpoint never sent one; this is what streamed past
+    /// before the cut, never a reported count.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_estimate: Option<u64>,
 }
 
 impl ModelCompleted {
