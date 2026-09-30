@@ -7,7 +7,8 @@
 //! `tailscale serve`: that front proxies to loopback, so every peer would
 //! arrive as 127.0.0.1 and could not be told apart.
 //!
-//! Two routes, `POST /fleet/work` (a job) and `GET /fleet/card` (this
+//! Two routes, `POST /fleet/work` (a job, or a check of one: `mode: check`
+//! answers what a run would meet and runs nothing) and `GET /fleet/card` (this
 //! machine's card, and what this machine lets the caller do), and every
 //! request on this listener (any path) is AUTHENTICATED first
 //! ([`darkmux_fleet::authenticate`]): the fleet token, then the connecting
@@ -47,8 +48,9 @@ use axum::{
 };
 use darkmux_crew::dispatch::DispatchResult;
 use darkmux_fleet::{
-    Admitted, IdentityProvider, NodeIdentity, ProfileResolution, Refusal, ReplyStatus, ScopedJob, SeatBook,
-    SeatGuard, SubmissionReply, TokenCheck, Waited, WorkJob, WorkSubmission,
+    Admitted, CheckReport, EndpointClass, IdentityProvider, NodeIdentity, Occupied, ProfileResolution, Refusal,
+    ReplyStatus, ScopedJob, SeatBook, SeatGuard, SeatOutlook, SubmissionMode, SubmissionReply, TokenCheck, Waited,
+    WorkJob, WorkSeat, WorkSubmission,
 };
 use darkmux_types::config::{AcceptWorkEntry, BusyPolicy};
 use std::collections::BTreeMap;
@@ -598,6 +600,27 @@ fn queue_deadline(limits: &QueueLimits, wait: bool, job_timeout_seconds: u32) ->
     (!window.is_zero()).then(|| std::time::Instant::now() + window)
 }
 
+/// What a busy seat means for a job under this machine's busy policy: how
+/// long it may wait for the seat, or the refusal it gets instead. The one
+/// reading of `fleet.busy_policy`, shared by a real start and a check.
+fn wait_or_refuse(
+    state: &FleetListenerState,
+    sub: &WorkSubmission,
+    occupied: &Occupied,
+) -> Result<std::time::Instant, Refusal> {
+    match state.busy_policy {
+        BusyPolicy::Refuse => Err(Refusal::Busy { what: occupied.what.clone() }),
+        BusyPolicy::Queue => queue_deadline(&state.queue_limits, sub.wait, sub.job.timeout_seconds).ok_or_else(|| {
+            Refusal::Busy {
+                what: format!(
+                    "{}; a job with a {}s timeout has no time left to wait inside one connection",
+                    occupied.what, sub.job.timeout_seconds
+                ),
+            }
+        }),
+    }
+}
+
 /// Decide how a scoped job starts: its seat now, a place in the queue, or a
 /// busy refusal.
 fn start_or_refuse(
@@ -611,23 +634,60 @@ fn start_or_refuse(
         Ok(guard) => return Ok(Start::Now(guard)),
         Err(occupied) => occupied,
     };
-    match state.busy_policy {
-        BusyPolicy::Refuse => Err(Refusal::Busy { what: occupied.what }),
-        BusyPolicy::Queue => {
-            let Some(deadline) = queue_deadline(&state.queue_limits, sub.wait, sub.job.timeout_seconds) else {
-                return Err(Refusal::Busy {
-                    what: format!(
-                        "{}; a job with a {}s timeout has no time left to wait inside one connection",
-                        occupied.what, sub.job.timeout_seconds
-                    ),
-                });
-            };
-            match state.queue_slots.try_take(admitted.peer_name.clone()) {
-                Some(queue_slot) => Ok(Start::Queued { what: occupied.what, queue_slot, deadline }),
-                None => Err(Refusal::QueueFull { peer: admitted.peer_name.clone(), what: occupied.what }),
-            }
-        }
+    let deadline = wait_or_refuse(state, sub, &occupied)?;
+    match state.queue_slots.try_take(admitted.peer_name.clone()) {
+        Some(queue_slot) => Ok(Start::Queued { what: occupied.what, queue_slot, deadline }),
+        None => Err(Refusal::QueueFull { peer: admitted.peer_name.clone(), what: occupied.what }),
     }
+}
+
+/// What [`start_or_refuse`] would decide for a scoped job right now, without
+/// taking a seat or a queue slot: the seat it meets, or the refusal a run
+/// would get.
+fn seat_outlook(
+    state: &FleetListenerState,
+    admitted: &Admitted,
+    scoped: &ScopedJob,
+    sub: &WorkSubmission,
+) -> Result<SeatOutlook, Refusal> {
+    let Some(occupied) = state.seats.peek(&scoped.seat) else { return Ok(SeatOutlook::Free) };
+    wait_or_refuse(state, sub, &occupied)?;
+    if state.queue_slots.has_room(&admitted.peer_name) {
+        Ok(SeatOutlook::WouldQueue)
+    } else {
+        Err(Refusal::QueueFull { peer: admitted.peer_name.clone(), what: occupied.what })
+    }
+}
+
+/// The `checked` reply for a scoped job: the profile it would run on and
+/// what it meets. Nothing ran, and no seat or queue slot was held.
+fn checked_reply(
+    state: &FleetListenerState,
+    admitted: &Admitted,
+    scoped: &ScopedJob,
+    sub: &WorkSubmission,
+) -> Result<SubmissionReply, Refusal> {
+    let seat = seat_outlook(state, admitted, scoped, sub)?;
+    let endpoint = match scoped.seat {
+        WorkSeat::Local { .. } => EndpointClass::Managed,
+        WorkSeat::Hosted { .. } => EndpointClass::Unmanaged,
+    };
+    let receiver = &state.receiver;
+    Ok(SubmissionReply {
+        machine: Some(receiver.clone()),
+        profile: Some(scoped.profile.clone()),
+        reason: Some(format!(
+            "{receiver} would take this job on profile {}; {}",
+            scoped.profile,
+            match seat {
+                SeatOutlook::Free => "its seat is free",
+                SeatOutlook::WouldQueue => "its seat is busy, so the job would queue",
+                SeatOutlook::Unknown => "its seat is unknown",
+            }
+        )),
+        check: Some(CheckReport { endpoint, seat }),
+        ..SubmissionReply::of(ReplyStatus::Checked)
+    })
 }
 
 /// Everything a submitted job's worker thread needs.
@@ -826,6 +886,26 @@ impl axum::extract::FromRequestParts<FleetListenerState> for Authorized {
     }
 }
 
+/// Parse a request body and check the job against the admitted peer's scope:
+/// the version, the shape, the profile as this machine resolves it, the
+/// allow-list scope and the boundary. The one path a job (or a check) takes
+/// to a [`ScopedJob`].
+async fn scope_submission(
+    state: &FleetListenerState,
+    admitted: &Admitted,
+    body: &[u8],
+) -> Result<(WorkSubmission, ScopedJob), Refusal> {
+    let sub = WorkSubmission::parse(body)?;
+    let resolve = state.resolve_profile.clone();
+    let (role, requested) = (sub.job.role_id.clone(), sub.job.profile.clone());
+    let resolution = match tokio::task::spawn_blocking(move || resolve(&role, requested.as_deref())).await {
+        Ok(r) => r,
+        Err(e) => ProfileResolution::Unresolved(format!("profile resolution did not finish: {e}")),
+    };
+    let scoped = darkmux_fleet::check_scope(&state.receiver, admitted, &sub.job, resolution)?;
+    Ok((sub, scoped))
+}
+
 async fn submit_handler(
     State(state): State<FleetListenerState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
@@ -842,20 +922,19 @@ async fn submit_handler(
         return refuse(&state, Some(peer_addr.ip()), &Refusal::BadConfig { detail });
     }
     let receiver = state.receiver.clone();
-    let mut sub = match WorkSubmission::parse(&body) {
-        Ok(s) => s,
+    let (mut sub, scoped) = match scope_submission(&state, &admitted, &body).await {
+        Ok(got) => got,
         Err(r) => return refuse(&state, Some(peer_addr.ip()), &r),
     };
-    let resolve = state.resolve_profile.clone();
-    let (role, requested) = (sub.job.role_id.clone(), sub.job.profile.clone());
-    let resolution = match tokio::task::spawn_blocking(move || resolve(&role, requested.as_deref())).await {
-        Ok(r) => r,
-        Err(e) => ProfileResolution::Unresolved(format!("profile resolution did not finish: {e}")),
-    };
-    let scoped = match darkmux_fleet::check_scope(&receiver, &admitted, &sub.job, resolution) {
-        Ok(s) => s,
-        Err(r) => return refuse(&state, Some(peer_addr.ip()), &r),
-    };
+
+    // A check answers here: every gate above has run, and nothing below (a
+    // relay session, a seat, a worker) is started for it.
+    if sub.job.mode == SubmissionMode::Check {
+        return match checked_reply(&state, &admitted, &scoped, &sub) {
+            Ok(reply) => (StatusCode::OK, Json(reply)).into_response(),
+            Err(r) => refuse(&state, Some(peer_addr.ip()), &r),
+        };
+    }
 
     // (#2916 review C2) The receiver's own session for this job, never the
     // sender's verbatim: a relay of it, in a standalone run, so a peer can
@@ -1120,6 +1199,12 @@ impl<K: std::hash::Hash + Eq + Clone> KeySlots<K> {
         Self { max, counts: Mutex::new(Default::default()) }
     }
 
+    /// Whether `key` could take a slot now (without taking one).
+    pub(crate) fn has_room(&self, key: &K) -> bool {
+        let c = self.counts.lock().unwrap_or_else(|p| p.into_inner());
+        c.get(key).copied().unwrap_or(0) < self.max
+    }
+
     pub(crate) fn try_take(self: &Arc<Self>, key: K) -> Option<KeySlot<K>> {
         let mut c = self.counts.lock().unwrap_or_else(|p| p.into_inner());
         let n = c.entry(key.clone()).or_insert(0);
@@ -1316,6 +1401,8 @@ mod tests {
         queue_slots: Arc<KeySlots<String>>,
         /// When set, the default profile resolves to another local model.
         model_moved: Arc<std::sync::atomic::AtomicBool>,
+        /// When set, the default profile resolves to a hosted endpoint.
+        went_hosted: Arc<std::sync::atomic::AtomicBool>,
         /// The fleet token the listener expects; a test may rotate it.
         token: Arc<Mutex<Option<String>>>,
         /// What the identity provider answers; a test may change it.
@@ -1411,6 +1498,8 @@ mod tests {
         let queue_slots = Arc::new(KeySlots::new(NODE_CAP));
         let model_moved = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let moved = model_moved.clone();
+        let went_hosted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hosted_now = went_hosted.clone();
         let local = test_node("nSTUDIO", "studio", "100.64.0.2");
         let network = Arc::new(Switchable(
             Mutex::new(StaticIdentityProvider {
@@ -1436,6 +1525,12 @@ mod tests {
             token: Arc::new(move || token_read.lock().unwrap().clone()),
             allow_list: Arc::new(move || Ok(allow_read.lock().unwrap().clone())),
             resolve_profile: Arc::new(move |_role, requested| {
+                if requested.is_none() && hosted_now.load(std::sync::atomic::Ordering::SeqCst) {
+                    return ProfileResolution::Work {
+                        profile: "host".into(),
+                        seat: darkmux_fleet::WorkSeat::Hosted { model: "gpt-x".into() },
+                    };
+                }
                 if requested.is_none() && moved.load(std::sync::atomic::Ordering::SeqCst) {
                     return ProfileResolution::Work {
                         profile: "host".into(),
@@ -1481,7 +1576,7 @@ mod tests {
                 serve_bounded(l, router(state), ConnLimits::PRODUCTION, rx).await;
             });
         });
-        Harness { refusal_log, url: format!("http://127.0.0.1:{port}{}", darkmux_fleet::SUBMISSION_PATH), ran, seats, allow: allow_now, queue_slots, model_moved, token: token_now, network, origins }
+        Harness { refusal_log, url: format!("http://127.0.0.1:{port}{}", darkmux_fleet::SUBMISSION_PATH), ran, seats, allow: allow_now, queue_slots, model_moved, went_hosted, token: token_now, network, origins }
     }
 
     fn laptop() -> darkmux_fleet::NodeIdentity {
@@ -2196,6 +2291,178 @@ mod tests {
         assert_eq!(reply.status, ReplyStatus::Refused, "{reply:?}");
         assert!(reply.reason.unwrap().contains("different model"));
         assert_eq!(h.ran.lock().unwrap().len(), 1, "only the first job ran");
+    }
+
+    fn managed_only(mut j: WorkJob) -> WorkJob {
+        j.boundary = Some(darkmux_fleet::Boundary::ManagedOnly);
+        j
+    }
+
+    fn check(mut j: WorkJob) -> WorkJob {
+        j.mode = darkmux_fleet::SubmissionMode::Check;
+        j
+    }
+
+    /// The boundary is checked when the job ARRIVES, against the profile the
+    /// receiver resolves it to: a managed profile runs under `managed_only`,
+    /// a hosted one is refused with the `boundary` code and nothing runs,
+    /// and a job with no boundary runs on either.
+    #[test]
+    fn a_managed_only_job_is_refused_on_a_hosted_profile_and_runs_on_a_managed_one() {
+        let h = start(Some(laptop()), false, 0);
+        let (code, reply) = post(&h, TOKEN, managed_only(job("s-managed", Some("host"))), true);
+        assert_eq!((code, reply.status), (200, ReplyStatus::Completed), "{reply:?}");
+        let (code, reply) = post(&h, TOKEN, managed_only(job("s-hosted", Some("cloud"))), true);
+        assert_eq!((code, reply.status, reply.refusal), (403, ReplyStatus::Refused, Some(darkmux_fleet::RefusalCode::Boundary)), "{reply:?}");
+        assert!(reply.reason.unwrap().contains("hosted endpoint"), "the sentence says why");
+        let (code, reply) = post(&h, TOKEN, job("s-free", Some("cloud")), true);
+        assert_eq!((code, reply.status), (200, ReplyStatus::Completed), "no boundary, no restriction: {reply:?}");
+        assert_eq!(h.ran.lock().unwrap().len(), 2, "the refused job never ran");
+    }
+
+    /// A boundary this receiver cannot enforce is refused, never run.
+    #[test]
+    fn a_boundary_the_receiver_does_not_know_is_refused() {
+        let h = start(Some(laptop()), false, 0);
+        let mut j = job("s-future", Some("host"));
+        j.boundary = Some(darkmux_fleet::Boundary::Unknown);
+        let (code, reply) = post(&h, TOKEN, j, true);
+        assert_eq!((code, reply.refusal), (403, Some(darkmux_fleet::RefusalCode::Boundary)), "{reply:?}");
+        assert!(h.ran.lock().unwrap().is_empty());
+    }
+
+    /// The typed code reaches the sender for each refusal, beside the
+    /// sentence, over real HTTP.
+    #[test]
+    fn each_refusal_reaches_the_sender_with_its_code() {
+        use darkmux_fleet::RefusalCode as C;
+        let h = start(Some(laptop()), false, 0);
+        let cases: Vec<(&str, WorkJob, C)> = vec![
+            ("wrong-token", job("c1", None), C::Token),
+            (TOKEN, job("c2", Some("coder-big")), C::ProfileNotAllowed),
+            (TOKEN, job("c3", Some("utility")), C::ProfileNotAllowed),
+            (TOKEN, { let mut j = job("c4", None); j.workdir = Some("/x".into()); j }, C::WorkspaceNotAllowed),
+            (TOKEN, { let mut j = job("c5", None); j.target_machine = "mini".into(); j }, C::Misaddressed),
+            (TOKEN, { let mut j = job("c6", None); j.role_id = "coder".into(); j }, C::RoleNotAllowed),
+            (TOKEN, { let mut j = job("c7", None); j.image = Some("evil.example/x".into()); j }, C::ImageNotAllowed),
+        ];
+        for (token, j, want) in cases {
+            let (_, reply) = post(&h, token, j, true);
+            assert_eq!(reply.refusal, Some(want), "{reply:?}");
+        }
+    }
+
+    /// (M1 of the boundary) A queued job is checked against its boundary
+    /// again when its seat frees: a profile that moved to a hosted endpoint
+    /// while the job waited refuses it with the `boundary` code, and it never
+    /// runs. Deterministic: the first job holds the seat until the flip is
+    /// made, and the waiter is decided only after it frees.
+    #[test]
+    fn a_queued_managed_only_job_is_refused_when_its_profile_went_hosted_while_it_waited() {
+        let h = start_full(Some(laptop()), false, 600, Arc::new(|| Ok(())), BusyPolicy::Queue, 1, WIDE);
+        assert_eq!(post(&h, TOKEN, job("s-first", None), false).0, 202);
+        let waiting = post_in_background(&h, managed_only(job("s-queued", None)));
+        std::thread::sleep(Duration::from_millis(200));
+        h.went_hosted.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (_, reply, heard) = waiting.join().unwrap();
+        assert!(!heard.is_empty(), "it was queued first, on its managed seat");
+        assert_eq!(reply.status, ReplyStatus::Refused, "{reply:?}");
+        assert_eq!(reply.refusal, Some(darkmux_fleet::RefusalCode::Boundary), "{reply:?}");
+        wait_idle(&h);
+        assert_eq!(h.ran.lock().unwrap().len(), 1, "only the first job ran");
+    }
+
+    /// A check answers `checked` with what a run would meet, and runs
+    /// nothing, holds no seat, and starts no worker.
+    #[test]
+    fn a_check_answers_what_a_run_would_meet_and_runs_nothing() {
+        let h = start(Some(laptop()), false, 0);
+        let (code, reply) = post(&h, TOKEN, check(managed_only(job("k1", Some("host")))), true);
+        assert_eq!((code, reply.status), (200, ReplyStatus::Checked), "{reply:?}");
+        assert_eq!(reply.profile.as_deref(), Some("host"));
+        assert_eq!(
+            reply.check,
+            Some(darkmux_fleet::CheckReport { endpoint: darkmux_fleet::EndpointClass::Managed, seat: darkmux_fleet::SeatOutlook::Free })
+        );
+        assert_eq!(reply.session_id, None, "no session was minted for a check");
+        let (_, hosted) = post(&h, TOKEN, check(job("k2", Some("cloud"))), true);
+        assert_eq!(hosted.check.unwrap().endpoint, darkmux_fleet::EndpointClass::Unmanaged);
+        assert!(h.ran.lock().unwrap().is_empty(), "a check ran a job");
+        assert!(h.seats.running().is_empty(), "a check held a seat");
+    }
+
+    /// A check meets every gate a run meets and refuses with the same code:
+    /// the token, the allow-list, role and profile scope, the boundary, the
+    /// version, and the busy seat under `refuse`.
+    #[test]
+    fn a_check_is_refused_exactly_as_a_run_would_be() {
+        use darkmux_fleet::RefusalCode as C;
+        let h = start_full(Some(laptop()), false, 800, Arc::new(|| Ok(())), BusyPolicy::Refuse, 1, WIDE);
+        let cases: Vec<(&str, WorkJob, C)> = vec![
+            ("wrong-token", check(job("k1", None)), C::Token),
+            (TOKEN, check(job("k2", Some("coder-big"))), C::ProfileNotAllowed),
+            (TOKEN, check({ let mut j = job("k4", None); j.role_id = "coder".into(); j }), C::RoleNotAllowed),
+            (TOKEN, check(managed_only(job("k5", Some("cloud")))), C::Boundary),
+        ];
+        for (token, j, want) in cases {
+            let mut run = j.clone();
+            run.mode = darkmux_fleet::SubmissionMode::Run;
+            let (_, checked) = post(&h, token, j, true);
+            let (_, ran) = post(&h, token, run, false);
+            assert_eq!(checked.status, ReplyStatus::Refused, "{checked:?}");
+            assert_eq!(checked.refusal, Some(want), "{checked:?}");
+            assert_eq!(ran.refusal, Some(want), "the run is refused the same way: {ran:?}");
+        }
+        // Busy under `refuse`: the same code a run gets, and the check
+        // itself never took the seat.
+        assert_eq!(post(&h, TOKEN, job("k-first", None), false).0, 202);
+        let (_, busy) = post(&h, TOKEN, check(job("k6", None)), true);
+        assert_eq!((busy.status, busy.refusal), (ReplyStatus::Refused, Some(C::Busy)), "{busy:?}");
+        wait_ran(&h, 1);
+        wait_idle(&h);
+        let (_, free) = post(&h, TOKEN, check(job("k7", None)), true);
+        assert_eq!(free.status, ReplyStatus::Checked, "the seat is free again: {free:?}");
+        assert_eq!(h.ran.lock().unwrap().len(), 1, "no check ran anything");
+    }
+
+    /// Under `queue` a check on a busy seat says the run would wait, takes no
+    /// queue slot, and leaves the queue as it was.
+    #[test]
+    fn a_check_on_a_busy_seat_under_queue_says_would_queue_and_takes_no_slot() {
+        let h = start_full(Some(laptop()), false, 600, Arc::new(|| Ok(())), BusyPolicy::Queue, 1, WIDE);
+        assert_eq!(post(&h, TOKEN, job("q-first", None), false).0, 202);
+        for i in 0..NODE_CAP + 2 {
+            let (_, reply) = post(&h, TOKEN, check(job(&format!("q-check-{i}"), None)), true);
+            assert_eq!(reply.check.map(|c| c.seat), Some(darkmux_fleet::SeatOutlook::WouldQueue), "check {i}: {reply:?}");
+        }
+        wait_ran(&h, 1);
+        wait_idle(&h);
+        assert_eq!(h.ran.lock().unwrap().len(), 1, "no check ran, and none was queued to run");
+    }
+
+    /// A check answers a full queue as a run does: `busy`.
+    #[test]
+    fn a_check_when_the_peers_queue_is_full_is_refused_busy() {
+        let h = start_full(Some(laptop()), false, 1_500, Arc::new(|| Ok(())), BusyPolicy::Queue, 1, WIDE);
+        assert_eq!(post(&h, TOKEN, job("f-first", None), false).0, 202);
+        let _slots: Vec<_> = (0..NODE_CAP).map(|_| h.queue_slots.try_take("macbook-pro".into()).unwrap()).collect();
+        let (_, reply) = post(&h, TOKEN, check(job("f-check", None)), true);
+        assert_eq!((reply.status, reply.refusal), (ReplyStatus::Refused, Some(darkmux_fleet::RefusalCode::Busy)), "{reply:?}");
+    }
+
+    /// A newer minor is refused naming both versions, over the wire, with the
+    /// `version` code; the current version is taken.
+    #[test]
+    fn a_newer_minor_is_refused_with_the_version_code_over_the_wire() {
+        let h = start(Some(laptop()), false, 0);
+        let mut newer = WorkSubmission::new(job("v1", None), true);
+        newer.schema = "8.9".into();
+        let (code, reply) =
+            darkmux_fleet::post_submission(&h.url, TOKEN, &newer, Duration::from_secs(10)).unwrap();
+        assert_eq!((code, reply.refusal), (400, Some(darkmux_fleet::RefusalCode::Version)), "{reply:?}");
+        let reason = reply.reason.unwrap();
+        assert!(reason.contains("v8.9") && reason.contains(&format!("v{}", darkmux_fleet::WORK_JOB_SCHEMA_VERSION)), "{reason}");
+        assert!(h.ran.lock().unwrap().is_empty());
     }
 
     /// (#2916 stage 2 review M2) A sender that waits on a queued job and then
