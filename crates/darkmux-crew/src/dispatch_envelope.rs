@@ -76,9 +76,23 @@ pub struct EnvelopeMetrics {
     pub total_tokens: u64,
     pub reasoning_tokens: Option<u64>,
     pub cached_tokens: Option<u64>,
+    /// Model calls that reported no usage (a stream the runtime cut, or an
+    /// endpoint that sent none). When non-zero the token figures above are a
+    /// floor, not the spend.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub unreported_calls: u32,
+    /// The runtime's own estimate of the completion tokens of the calls it
+    /// cut. Not included in `completion_tokens`, which is reported figures
+    /// only.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub estimated_completion_tokens: u64,
     pub rest_ms: u64,
     pub rests: u32,
     pub turn_delay_effective_ms: Option<u64>,
+}
+
+fn is_zero<T: Default + PartialEq>(n: &T) -> bool {
+    *n == T::default()
 }
 
 impl EnvelopeMetrics {
@@ -94,6 +108,8 @@ impl EnvelopeMetrics {
             total_tokens: total,
             reasoning_tokens: reasoning,
             cached_tokens: cached,
+            unreported_calls: fold.unreported_calls,
+            estimated_completion_tokens: fold.estimated_completion_tokens,
             rest_ms: fold.rest_ms(),
             rests: fold.rest_count(),
             turn_delay_effective_ms: fold.complete.as_ref().and_then(|c| c.turn_delay_effective_ms),

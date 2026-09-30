@@ -76,7 +76,6 @@
   "crates/darkmux-lab/src/lab/review_bench.rs::print_summary": 18,
   "crates/darkmux-lab/src/lab/review_bench.rs::run_review_bench": 28,
   "crates/darkmux-lab/src/lab/stats_render.rs::sets_text": 21,
-  "crates/darkmux-lab/src/lab/stats_set.rs::flags": 18,
   "crates/darkmux-lab/src/lab/verify_gate.rs::evaluate": 16,
   "crates/darkmux-lab/src/providers/coding_task.rs::WorkloadProvider for CodingTaskProvider::run": 20,
   "crates/darkmux-lab/src/providers/coding_task.rs::WorkloadProvider for CodingTaskProvider::setup": 24,
