@@ -61,12 +61,12 @@ import { aggregateHostSamples, roundPct } from "../../lib/hostStats";
 import { aggregateLiveState, aggregateTokenRate, averageGenerationRate, lastHeartbeatMs, liveStateWhileConnected } from "../../lib/tokenRate";
 import type { LiveState, LiveStateReading } from "../../lib/tokenRate";
 import { mergeLive, type LiveOverlay } from "../../lib/liveChannel";
-import { PURPOSE, sumUsage } from "../../lib/usageRecords";
+import { PURPOSE, sumUsage, usageModel } from "../../lib/usageRecords";
 
 import { toolOutcome } from "../../lib/recordDetail";
 import type { RunStatus } from "../../types/generated/RunStatus";
 import type { DispatchStartPayload } from "../../types/generated/DispatchStartPayload";
-import { ACTION, CATEGORY, SOURCE, byTime, endPayloadOf, payloadOf, isBookendTerminal, latestByTime, recordsAsOf, type NormRecord, type NormSource } from "../../lib/ingest";
+import { ACTION, CATEGORY, SOURCE, byTime, endPayloadOf, payloadOf, isBookendTerminal, isDispatchTerminal, latestByTime, recordsAsOf, type NormRecord, type NormSource } from "../../lib/ingest";
 import { maxOf } from "../../lib/numbers";
 
 /** The run-time figure's long hover text, shared by SYSTEM's WALL CLOCK and
@@ -505,13 +505,29 @@ function rollUpMissionModelWork(siblings: readonly RunGroup[]): MissionModelRoll
  *  work. (#2902 step 2a) Its own tokens, utility excluded. */
 function executionFigures(own: readonly NormRecord[]): (ModelFigures & { loads: NormRecord[] }) | null {
   const tel = own.filter((r) => r.category === CATEGORY.Telemetry);
-  const rt = bySource(tel, SOURCE.Runtime).slice(-1)[0] ?? null;
   const tok = executionTokens(own);
   const cx = contextFigures(tel);
   const loads = bySource(tel, SOURCE.Lms).filter(isLoad);
-  const turns = rt ? Number((rt.fields as Record<string, unknown>).turns) : null;
+  const turns = turnCount(own);
   const fig = { turns, tokIn: tok ? tok.prompt : null, tokOut: tok ? tok.completion : null, ctxPeak: cx.ctxPeak, ctxNow: cx.ctxNow, nctx: cx.nctx, loads };
   return loads.length > 0 || turns != null || tok != null || cx.samples > 0 ? fig : null;
+}
+
+/** THE turn count of one execution, for every dispatch path. A finished
+ *  execution's is the `total_turns` its own terminal record wrote (one type,
+ *  `DispatchEndPayload`, for `dispatch.complete` and `dispatch.error`): the
+ *  agent loop, a single-shot call (always 1) and a hosted call all write it.
+ *  One still in progress has no terminal yet, so it reads the turns so far,
+ *  the `runtime` telemetry record (the container loop's own, or the one
+ *  `flowToRenderModel` derives from the `dispatch.turn` records).
+ *  `null` when neither exists. */
+function turnCount(records: readonly NormRecord[]): number | null {
+  const end = latestByTime(records.filter((r) => isDispatchTerminal(r.action)));
+  const total = endPayloadOf(end)?.total_turns;
+  if (typeof total === "number") return total;
+  const runtime = bySource(records, SOURCE.Runtime).slice(-1)[0];
+  const sofar = Number((runtime?.fields as Record<string, unknown> | undefined)?.turns);
+  return runtime && Number.isFinite(sofar) ? sofar : null;
 }
 
 const addOpt = (a: number | null, b: number | null): number | null => (b == null ? a : (a ?? 0) + b);
@@ -636,7 +652,6 @@ interface AttemptTelemetry {
   /** Host cpu/ram/gpu samples: the retired per-session `telemetry.process`
    *  and the machine's own `machine.telemetry` over the run's window. */
   procs: NormRecord[];
-  rt: NormRecord | null;
   dets: NormRecord[];
   loads: NormRecord[];
   /** The models loaded, first-seen order. */
@@ -656,7 +671,6 @@ function attemptTelemetry(visible: readonly NormRecord[], ctx: RunContext): Atte
     tel,
     lms,
     procs: [...bySource(tel, SOURCE.Host), ...hostSamplesOf(visible, ctx)],
-    rt: bySource(tel, SOURCE.Runtime).slice(-1)[0] ?? null,
     dets: bySource(tel, SOURCE.Detector),
     loads,
     distinct: [...new Set(loads.map((r) => (r.fields as Record<string, unknown>).model as string))],
@@ -1013,19 +1027,26 @@ const loadFields = (r: NormRecord): Record<string, unknown> => r.fields as Recor
 type ModelEntry = { name: string; gb: number | null; ran: boolean | null };
 
 /** The loaded-models track, the model that ran first. `endpointModel` is
- *  the model an endpoint-served run names (it has no loads to list); a run
- *  that loaded nothing itself falls back to its mission's (`rollupLines`,
- *  unlabeled: primary/also-loaded compare this run's own fields), then to
+ *  the model an endpoint-served run names (it has no loads to list). A run
+ *  that loaded nothing itself falls back, in order, to: the model its own
+ *  calls ran on (`residentModel`, from its usage records: it was already
+ *  resident, so nothing here loaded it), its mission's loads (`rollupLines`,
+ *  unlabeled: primary/also-loaded compare this run's own fields), then
  *  "no telemetry yet". */
-function modelTrackOf(loads: readonly NormRecord[], primaryModel: string | null, endpointModel: string | null, rollupLines: string[]): { modelEntries?: ModelEntry[]; modelTrackLines: string[] } {
+function modelTrackOf(loads: readonly NormRecord[], primaryModel: string | null, endpointModel: string | null, residentModel: string | null, rollupLines: string[]): { modelEntries?: ModelEntry[]; modelTrackLines: string[] } {
   if (endpointModel !== null) return { modelTrackLines: [endpointModel] };
   const isRan = (r: NormRecord) => primaryModel != null && bareModel(loadFields(r).model) === bareModel(primaryModel);
   const ordered = [...loads].sort((a, b) => Number(isRan(b)) - Number(isRan(a)));
-  if (!ordered.length) return { modelTrackLines: rollupLines.length ? rollupLines : ["no telemetry yet"] };
+  if (!ordered.length) return { modelTrackLines: fallbackTrackLines(residentModel, rollupLines) };
   return {
     modelEntries: ordered.map((r) => modelEntryOf(loadFields(r), primaryModel == null ? null : isRan(r))),
     modelTrackLines: ordered.map((r) => modelLineOf(loadFields(r), primaryModel == null ? null : isRan(r))),
   };
+}
+
+function fallbackTrackLines(residentModel: string | null, rollupLines: string[]): string[] {
+  if (residentModel !== null) return [`${bareModel(residentModel)} · already resident`];
+  return rollupLines.length ? rollupLines : ["no telemetry yet"];
 }
 
 function modelEntryOf(f: Record<string, unknown>, ran: boolean | null): ModelEntry {
@@ -1493,9 +1514,9 @@ export function runRegions(
   const ctx = runContext(data, sid, nowMs, policy, presence);
   const { run, l, d, firstSessRec, startTs, inAttempt, endTs, c, done, skewedClose, state } = ctx;
   const visible = recordsAsOf(data, nowMs);
-  const { tel, lms, procs, rt, dets, loads, distinct, comps } = attemptTelemetry(visible, ctx);
-
-  const turnsValue = rt ? Number((rt.fields as Record<string, unknown>).turns) : null;
+  const { tel, lms, procs, dets, loads, distinct, comps } = attemptTelemetry(visible, ctx);
+  const attemptRecs = visible.filter(inAttempt);
+  const turnsValue = turnCount(attemptRecs);
 
   const { samples: ctxSamples, nctx, ctxPeak, ctxNow } = contextFigures(tel);
 
@@ -1503,7 +1524,6 @@ export function runRegions(
   // heartbeats alone — a run emitting turns and tool results is demonstrably
   // alive whether or not a heartbeat happens to have landed recently, and
   // keying only on heartbeats would make a busy run look dead.
-  const attemptRecs = visible.filter(inAttempt);
   const lastBeatMs = latestByTime(attemptRecs)?.tMs ?? null;
 
   const { runWallMs, wallElapsed, wallBase, wallSub } = wallClock(ctx, nowMs);
@@ -1625,6 +1645,9 @@ export function runRegions(
   }
   push(modelIdx, { value: effTokIn != null ? fmtC(effTokIn) : "—", label: "TOKENS IN" });
   push(modelIdx, { value: effTokOut != null ? fmtC(effTokOut) : "—", label: "TOKENS OUT" });
+  // A single-shot call records no `telemetry.context` sample and neither
+  // bookend names the model's window, so its prompt has nothing to be a share
+  // of: the tile reads a dash rather than a guessed window.
   push(modelIdx, ctxTileOf(eff, ctxTileFigures));
   // (#2877, #2890) A finished run's average generation rate: the MODEL
   // hero scope's center once the run is done. A run still in progress shows
@@ -1688,7 +1711,7 @@ export function runRegions(
   // load telemetry reports the bare key; compared as-is they never matched,
   // and every model on a real run, including the one that ran, read "also
   // loaded". The model that ran is listed first.
-  const { modelEntries, modelTrackLines } = modelTrackOf(loads, primaryModel, ep ? (model || "unknown") : null, rollup?.loadLines ?? []);
+  const { modelEntries, modelTrackLines } = modelTrackOf(loads, primaryModel, ep ? (model || "unknown") : null, usageModel(tel), rollup?.loadLines ?? []);
 
   const { signalGroups, signalsLabel, repetitionOff, repetitionRecorded } = runSignals({
     skewedClose,

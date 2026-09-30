@@ -2359,3 +2359,66 @@ describe("runRegions — MODEL section content (#2890)", () => {
     expect(view.metrics.find((m) => m.label === "ACTIVE TIME")).toBeUndefined();
   });
 });
+
+// The MODEL panel's turn count, resident model and speed for a run that made
+// ONE model call with no tools (a single-shot dispatch: a radio answer). Its
+// only turn record is the `total_turns` its own `dispatch.complete` wrote; the
+// container agent loop's `telemetry.runtime` never exists for it.
+describe("runRegions: every dispatch path's MODEL panel reads its own dispatch.complete", () => {
+  const T0 = "2026-01-01T00:00:00Z";
+  const usage = { call_kind: "single_shot", purpose: "work", requested_model: "darkmux:qwen-x", reported_model: "qwen-x", token_source: "provider", prompt_tokens: 5042, completion_tokens: 205 };
+  const singleShot = (extra: RawRecord[] = []): RawRecord[] => [
+    { ts: T0, session_id: "ss", action: "dispatch.start", handle: "radio", model: "darkmux:qwen-x", payload: { prompt_chars: 100 } },
+    { ts: "2026-01-01T00:00:27Z", session_id: "ss", category: "telemetry", source: "tokens", action: "telemetry.tokens", payload: usage },
+    ...extra,
+    { ts: "2026-01-01T00:00:27Z", session_id: "ss", action: "dispatch.complete", payload: { total_turns: 1, wall_ms: 27071, prompt_tokens: 5042, completion_tokens: 205 } },
+  ] as RawRecord[];
+  const view = (data: RawRecord[], sid = "ss") => runRegions(flowToRenderModel(data), sid);
+  const tile = (v: ReturnType<typeof runRegions>, label: string) => v.metrics.find((m) => m.label === label);
+
+  it("a single-shot run shows the turn count its dispatch.complete recorded", () => {
+    expect(tile(view(singleShot()), "TURNS")?.value).toBe("1");
+  });
+
+  it("a single-shot run names the model it ran on, marked already resident, when it loaded none", () => {
+    const v = view(singleShot());
+    expect(v.modelTrackLines).toEqual(["qwen-x · already resident"]);
+    expect(v.modelEntries).toBeUndefined();
+  });
+
+  it("a single-shot run's speed is the wall-clock average, labeled (no generation timing is recorded for it), and its context stays a dash", () => {
+    const v = view(singleShot());
+    expect(v.finishedTokRate).toEqual({ average: "8", sub: "avg · wall clock" });
+    expect(tile(v, "CONTEXT")?.value).toBe("—");
+  });
+
+  it("the turn count is the complete's, not a live count of turn records", () => {
+    const data = [
+      { ts: T0, session_id: "ag", action: "dispatch.start", handle: "coder", model: "darkmux:m" },
+      { ts: "2026-01-01T00:00:05Z", session_id: "ag", action: "dispatch.turn", payload: { turn_seq: 3 } },
+      { ts: "2026-01-01T00:00:09Z", session_id: "ag", action: "dispatch.complete", payload: { total_turns: 4 } },
+    ] as RawRecord[];
+    expect(tile(view(data, "ag"), "TURNS")?.value).toBe("4");
+  });
+
+  it("an agent run still in progress counts its turns so far (no complete yet)", () => {
+    const data = [
+      { ts: T0, session_id: "ag", action: "dispatch.start", handle: "coder", model: "darkmux:m" },
+      { ts: "2026-01-01T00:00:05Z", session_id: "ag", action: "dispatch.turn", payload: { turn_seq: 3 } },
+    ] as RawRecord[];
+    expect(tile(view(data, "ag"), "TURNS")?.value).toBe("3");
+  });
+
+  it("a run that loaded a model lists that load, never the already-resident line", () => {
+    const load = { ts: "2026-01-01T00:00:01Z", session_id: "ss", category: "telemetry", source: "lms", fields: { event: "load", model: "qwen-x", gb: 20 } } as unknown as RawRecord;
+    const v = view(singleShot([load]));
+    expect(v.modelTrackLines).toEqual(["qwen-x · 20GB · primary"]);
+  });
+
+  it("a run with no model telemetry still says no telemetry yet, with a dash for turns", () => {
+    const data = [{ ts: T0, session_id: "ns", action: "dispatch.start", handle: "radio" }] as RawRecord[];
+    const v = view(data, "ns");
+    expect(v.modelTrackLines).toEqual(["no telemetry yet"]);
+    expect(tile(v, "TURNS")?.value).toBe("—");
+  });
+});

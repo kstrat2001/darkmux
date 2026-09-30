@@ -56,6 +56,9 @@ export interface UsagePayload {
   prompt_tokens?: unknown;
   completion_tokens?: unknown;
   cached_tokens?: unknown;
+  /** The model id darkmux put on the wire, and the one the response named. */
+  requested_model?: unknown;
+  reported_model?: unknown;
   /** The retired review path's spelling of its own spend, on a legacy
    *  `dispatch complete` only. */
   remote_tokens?: unknown;
@@ -114,6 +117,21 @@ export function isCompactionUsage(p: UsagePayload | null | undefined): boolean {
 export function isTurnUsage(p: UsagePayload | null | undefined): boolean {
   if (!p) return true;
   return p.call_kind === undefined || p.call_kind === CALL_KIND.turn;
+}
+
+/** The model a run's calls ran on, from its usage records: the response's own
+ *  `reported_model`, else the `requested_model` darkmux sent, of the LATEST
+ *  record that names one. Work calls are preferred; a run whose only calls
+ *  are utility jobs (a radio-routing dispatch) reads those. `null` when no
+ *  usage record names a model. */
+export function usageModel(records: readonly NormRecord[]): string | null {
+  const usage = records.filter(isUsageRecord);
+  const work = usage.filter((r) => usagePurpose(payloadOf(r)) === PURPOSE.work);
+  for (const r of [...(work.length ? work : usage)].reverse()) {
+    const p = payloadOf(r);
+    for (const name of [p.reported_model, p.requested_model]) if (typeof name === "string" && name !== "") return name;
+  }
+  return null;
 }
 
 /** One record's contribution to a sum. `cached` is `null` when the record
