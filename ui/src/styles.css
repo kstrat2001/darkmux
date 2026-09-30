@@ -3535,6 +3535,13 @@ body {
      `history →` link. Restore both when the drill-in lands. */
   transition: border-color 0.15s;
 }
+/* The cards' order is not final yet (`FleetLens`'s `orderPending`): each card
+   keeps its box and its panel, its content is not painted, so the empty card
+   is exactly the size the real one will be and nothing moves when the order
+   settles. Not `display: none`: that would change the grid's size. */
+.fleet[data-order="pending"] .mach > * {
+  visibility: hidden;
+}
 .mach:hover {
   /* intentionally inert — see `.mach` */
 }

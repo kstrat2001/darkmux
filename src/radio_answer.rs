@@ -1991,6 +1991,30 @@ mod tests {
         assert_eq!(grounding_scope_for(&seat_overrides("cloud@studio")), GroundingScope::Full);
     }
 
+    /// The routing layer sends no boundary for a dispatch that stays on this
+    /// machine, so for a seat addressed at this machine the data boundary IS
+    /// the grounding scope. A hosted profile written `cloud@<this machine>` is
+    /// asked once, with the hosted-safe grounding and no boundary; a local one
+    /// gets full grounding under `managed_only`.
+    #[test]
+    #[serial_test::serial]
+    fn a_seat_addressed_at_this_machine_is_grounded_by_where_its_model_runs() {
+        let _env = SeatEnv::new(Some("Laptop"));
+        let safe = build_answer_message(
+            "what is loaded?",
+            &assemble_grounding("what is loaded?", &fixture_catalog(), &ArtifactShelf::default(), None, GroundingScope::RemoteSafe, RadioSurface::Cli),
+        );
+        let scope = grounding_scope_for(&seat_overrides("cloud@laptop"));
+        let (out, seen) = ask_recording(scope, |_| Ok("ok".into()));
+        assert!(out.is_ok());
+        assert_eq!(seen, vec![(safe, None)], "a hosted seat here: one ask, safe grounding, no boundary");
+
+        let scope = grounding_scope_for(&seat_overrides("deep@laptop"));
+        let (_, seen) = ask_recording(scope, |_| Ok("ok".into()));
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].1, Some(crate::fleet::Boundary::ManagedOnly), "a local seat here is grounded in full");
+    }
+
     /// (#2917) The busy check reads THIS machine's instance, so it exists
     /// for a local seat and never for a peer's.
     #[test]

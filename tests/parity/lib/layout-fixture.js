@@ -505,7 +505,7 @@ const OFFLINE_ROW = viewRow(
   },
 );
 
-async function installLayoutRoutes(page, { blockStream = false, machineSpecs = false, holdRuns = false, roster = false, holdPresence = false, presence, fleetView } = {}) {
+async function installLayoutRoutes(page, { blockStream = false, machineSpecs = false, holdRuns = false, roster = false, holdPresence = false, holdView = null, presence, fleetView } = {}) {
   await page.route("**/*", async (route) => {
     const url = new URL(route.request().url());
     const p = url.pathname;
@@ -518,6 +518,9 @@ async function installLayoutRoutes(page, { blockStream = false, machineSpecs = f
     // machine the view cannot read and never hears, which renders as an
     // offline card beside this machine's own.
     if (holdPresence && p === "/fleet/machines/live") return new Promise(() => {});
+    // `holdView`: a promise the fleet view's answer waits on, so a test can
+    // look at the page while the cards' order is not final and again after.
+    if (holdView && p === "/fleet/view") await holdView;
     // (#2902 step 5) Redis session presence for a state that has it: the
     // sessions the daemon reports as beating right now.
     if (presence && p === "/fleet/dispatches/live") return json({ dispatches: presence, meta: { sources: { fleet: { state: "ok" } }, complete: true } });
