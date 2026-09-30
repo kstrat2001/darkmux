@@ -10894,6 +10894,26 @@ mod tests {
         }
     }
 
+    /// `fleet.mode` changes one thing today: which address a viewer link
+    /// names (`viewer_link_base`). Its doctor row says that, and never says a
+    /// machine on it "coordinates nothing": a standalone-mode machine can run
+    /// a fleet listener and have peers in its roster.
+    #[test]
+    #[serial_test::serial]
+    fn the_fleet_mode_row_says_it_controls_viewer_links_only() {
+        let prev = std::env::var("DARKMUX_FLEET_MODE").ok();
+        unsafe { std::env::remove_var("DARKMUX_FLEET_MODE") };
+        let rows = check_enum_settings();
+        unsafe {
+            if let Some(v) = prev {
+                std::env::set_var("DARKMUX_FLEET_MODE", v);
+            }
+        }
+        let row = rows.iter().find(|c| c.name == "fleet.mode").expect("the fleet.mode row");
+        assert!(row.message.contains("viewer links"), "{}", row.message);
+        assert!(!row.message.contains("coordinates nothing"), "{}", row.message);
+    }
+
     #[test]
     #[serial_test::serial]
     fn viewer_link_base_standalone_is_loopback_even_at_a_tty() {
