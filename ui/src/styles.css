@@ -8044,11 +8044,17 @@ body {
    knockout glyph rather than disappearing into whichever fill color is
    under it at the moment. */
 .battery-bar-icon {
-  fill: var(--fg);
-  stroke: var(--bg);
-  stroke-width: 0.8px;
-  paint-order: stroke;
+  fill: none;
+  stroke-linecap: round;
   stroke-linejoin: round;
+}
+.battery-bar-icon__halo {
+  stroke: var(--bg);
+  stroke-width: 3.6px;
+}
+.battery-bar-icon__line {
+  stroke: var(--fg);
+  stroke-width: 2px;
 }
 /* A `held` reading: a thin marker at the level macOS is holding the charge at. Drawn over the
    fill in the page's own foreground so it reads against any point on the ramp. */
