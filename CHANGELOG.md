@@ -1144,6 +1144,7 @@ darkmux release.
 
 ### Fixed (4.0)
 
+- **Doctor's `fleet token` row no longer fails for a shell without the token when the daemon has it.** `/health` now carries `fleet_token_set` (a boolean, this machine only, never the value); when the shell cannot resolve a token but the local daemon reports one, the row passes and says the token is set in the daemon's environment only.
 - **Dispatching to a peer whose listener is off names the listener.** The error was `no answer from http://<host>:8766/fleet/work: ... Connection refused (os error 61)`. It now reads `the fleet listener at <url> is not accepting connections (off, or the daemon is down); nothing was sent`, the same sentence `/fleet/view` gives as the detail of its `listener_off` outcome (one classifier, `is_listener_off`).
 - **A switched-off fleet listener says so.** `/health` reported `fleet_listener: null` when `fleet.listener.enabled` is false; it now reports `off` (`off (fleet.listener.enabled is false)` to this machine), and the startup banner says the listener is off instead of describing the token as if it were serving work.
 - **A relayed run's id is greppable on the receiver.** The receiver's session id was `radio.solo.relay.<peer>.radio_2Esolo_2Eadhoc_...`, the sender's id with every dot escaped. A relay now ends with the sender's wire string verbatim (`radio.solo.relay.<peer>.radio.solo.adhoc....`), so the id the sender printed is a substring of the receiver's. Session ids written by an earlier 4.0 build no longer parse.

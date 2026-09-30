@@ -793,6 +793,7 @@ pub(crate) fn fleet_submission_doctor_checks() -> Vec<crate::doctor::Check> {
         trusted,
         retired_streams: retired.0,
         queue_consumers: retired.1,
+        daemon_token_set: daemon_health().and_then(|h| h.get("fleet_token_set")?.as_bool()),
         daemon_listener_state: if listener_enabled && listener_bound != Some(true) {
             daemon_listener_state()
         } else {

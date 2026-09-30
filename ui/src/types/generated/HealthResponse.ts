@@ -28,6 +28,11 @@ fleet_listener: string | null,
  */
 fleet_busy: FleetBusy | null, 
 /**
+ * Whether this daemon resolved a fleet token (the serve token) in its own
+ * environment; never the value. This machine only.
+ */
+fleet_token_set: boolean | null, 
+/**
  * The open-file soft limit this daemon runs with; this machine only.
  */
 open_file_limit: number | null, 

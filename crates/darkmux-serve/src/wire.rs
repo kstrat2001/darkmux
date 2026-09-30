@@ -45,6 +45,9 @@ pub struct HealthResponse {
     /// The busy policy and hosted-job bound the running listener uses; this
     /// machine only.
     pub fleet_busy: Option<FleetBusy>,
+    /// Whether this daemon resolved a fleet token (the serve token) in its own
+    /// environment; never the value. This machine only.
+    pub fleet_token_set: Option<bool>,
     /// The open-file soft limit this daemon runs with; this machine only.
     #[cfg_attr(test, ts(type = "number | null"))]
     pub open_file_limit: Option<u64>,

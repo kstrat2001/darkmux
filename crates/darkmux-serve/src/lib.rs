@@ -1723,6 +1723,9 @@ async fn health(
         // (#2916 stage 2 review C5) The busy policy and hosted-job bound the
         // running listener uses, for this machine only.
         fleet_busy: fleet_listener::listener_busy(loopback_caller),
+        // Whether THIS process resolved a token, for `darkmux doctor` run from
+        // a shell that may not have the one the daemon was started with.
+        fleet_token_set: loopback_caller.then(darkmux_flow::serve_token_present),
         // (#2916 re-review C3) The open-file soft limit this daemon runs
         // with (raised at start), for this machine only.
         open_file_limit: if loopback_caller { current_open_file_limit() } else { None },
