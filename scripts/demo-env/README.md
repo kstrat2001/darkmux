@@ -34,6 +34,7 @@ Only what a probe or a substrate would have to answer is overridden:
 |---|---|
 | `/machine/specs`, `/machine/resources`, `/machine/status` | host probes (`vm_stat`, `sysctl`, `lms`). The demo machine is a 256 GB M5 Ultra; the machine you are on is not. |
 | `/fleet/machines/live`, `/fleet/dispatches/live` | presence rides Redis, which the demo deliberately does not run. |
+| `/fleet/view` | the daemon gathers it from a roster and live peers the demo does not have, so it is fixtured from the world's machines. |
 | `/panel/doctor`, `/panel/machine-status` | these CLI verbs probe the host. Every OTHER panel (`run list`, `flow status`, `config list`, ...) is passed through and renders from demo data for free. |
 
 `serve.py` also filters one record class out of `/flow/<date>`: the daemon

@@ -278,6 +278,50 @@ def specs_for(machine, world, ledger, now_ms, version, schema):
     }
 
 
+def fleet_view_for(world, hero, ledgers, now_ms, version, schema):
+    """`GET /fleet/view`, as the demo daemon answers it: one row per machine.
+    The hero is the machine serving the page; every other machine is a peer
+    whose card the hero read. Each card's `specs` is the SAME document that
+    machine's `/machine/specs` fixture holds, so the fleet cards' hardware
+    line and the machine lens agree by construction."""
+    # What each peer lets the hero do: demo values, keyed by machine id.
+    grants = {
+        "m1-max-32gb-studio": {"profiles": ["reviewer"], "roles": ["radio-host"]},
+        "mac-mini-m4-16gb": {"profiles": [], "roles": ["radio-host"]},
+    }
+    rows = []
+    for m in world["machines"]:
+        specs = specs_for(m, world, ledgers[m["id"]], now_ms, version, schema)
+        is_hero = m["id"] == hero["id"]
+        grant = grants.get(m["id"])
+        rows.append({
+            "entry": None if is_hero else {"id": disp(m), "address": "demo-peer.internal:8765",
+                                           "added_unix_ms": now_ms, "machine_uid": m["uid"]},
+            "is_this_machine": is_hero,
+            "machine_uid": m["uid"],
+            "uid_source": None,
+            "liveness": "live",
+            "last_beat_ms": now_ms,
+            "received_at_ms": now_ms,
+            "fetch_ms": 0 if is_hero else 12,
+            "card": {"state": "available", "source": "local" if is_hero else "listener", "card": {
+                "card_schema_version": "1.0.0", "work_job_schema_version": "8.0",
+                "specs": specs, "profiles": [], "default_profile": None, "profiles_error": None,
+                "governor": {"thermal": None, "battery": None,
+                             "battery_gate": {"floor_pct": 20, "refuse_start_below_min": False,
+                                              "pause_running_below_min": False,
+                                              "refusing_start": None}},
+                "generated_at_ms": now_ms, "gather_ms": 0, "cache_ttl_ms": 0}},
+            "accepts": ({"state": "this_machine"} if is_hero else
+                        {"state": "granted", "accepts": {
+                            "peer_name": disp(hero), "profiles": grant["profiles"],
+                            "roles": grant["roles"], "images": [], "workspace": False}}),
+        })
+    return {"gathered_by": "daemon", "local_machine_id": disp(hero),
+            "presence": {"state": "off"}, "roster_error": None,
+            "fetched_at_ms": now_ms, "cache_ttl_ms": 0, "gather_ms": 0, "machines": rows}
+
+
 # ------------------------------------------------------------- record replay
 
 # What the demo day contains. Each entry replays the committed session under a
@@ -772,6 +816,8 @@ def main():
         (fx / "panel" / "doctor-widths.json").write_text(json.dumps(captured))
 
     live_ids = [sid for sid, plan in minted if plan.get("live")]
+    (fx / "fleet-view.json").write_text(json.dumps(
+        fleet_view_for(world, hero, ledgers, now_ms, version, schema), indent=2))
     (fx / "fleet-machines-live.json").write_text(json.dumps({
         # `specs` is what a REMOTE card renders as its hardware line
         # (cards.ts::specOf falls through to the beat for any machine that is

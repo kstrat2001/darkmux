@@ -32,7 +32,8 @@ MACHINE_ROUTES = {"/machine/specs": "specs", "/machine/resources": "resources",
 # no live machines. Same override rationale as /machine/*: fixture only what a
 # probe (or a substrate) would have to answer.
 FLEET_ROUTES = {"/fleet/machines/live": "fleet-machines-live.json",
-                "/fleet/dispatches/live": "fleet-dispatches-live.json"}
+                "/fleet/dispatches/live": "fleet-dispatches-live.json",
+                "/fleet/view": "fleet-view.json"}
 
 
 def free_port():
@@ -72,8 +73,11 @@ def make_handler(inner, fx, hero, demo_uids, home):
                     now = int(time.time() * 1000)
                     # A heartbeat is only meaningful relative to now; a fixture
                     # frozen at build time reads as a fleet that went silent.
-                    for m in d.get("machines", []):
-                        m["beat_ts_ms"] = now
+                    if base == "/fleet/view":
+                        d["fetched_at_ms"] = now
+                    else:
+                        for m in d.get("machines", []):
+                            m["beat_ts_ms"] = now
                     return json.dumps(d).encode()
             if base.startswith("/panel/"):
                 pid = base[len("/panel/"):]
