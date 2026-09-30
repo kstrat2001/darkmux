@@ -452,6 +452,23 @@ pub struct UtilityBinding {
     pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
+/// The operator line for a bare-string `internal.utility` naming `id`: what
+/// 4.0 removed and the object to write in its place.
+fn bare_utility_line(id: &str) -> String {
+    format!(
+        "`internal.utility` is a bare string (\"{id}\"), which 4.0 removed: write \
+         `\"utility\": {{ \"id\": \"{id}\", \"n_ctx\": <the window it is loaded at> }}`"
+    )
+}
+
+/// The dotted path of a registry document's `internal.utility` and its
+/// operator line, when the document writes it as a bare string. Reads the
+/// document, not the typed registry: such a document does not parse into one.
+pub fn bare_utility_in(doc: &serde_json::Value) -> Option<(&'static str, String)> {
+    let id = doc.get("internal")?.get("utility")?.as_str()?;
+    Some(("internal.utility", bare_utility_line(id)))
+}
+
 /// `serde(deserialize_with)` for `internal.utility`: the object form only. A
 /// bare string is refused with the object to write in its place, since the
 /// typed parse of `internal` is not per-entry-quarantined and a vague error
@@ -460,10 +477,7 @@ fn deserialize_utility_binding<'de, D: serde::Deserializer<'de>>(d: D) -> Result
     use serde::de::Error;
     match Option::<serde_json::Value>::deserialize(d)? {
         None => Ok(None),
-        Some(serde_json::Value::String(id)) => Err(D::Error::custom(format!(
-            "`internal.utility` is a bare string (\"{id}\"), which 4.0 removed: write \
-             `\"utility\": {{ \"id\": \"{id}\", \"n_ctx\": <the window it is loaded at> }}`"
-        ))),
+        Some(serde_json::Value::String(id)) => Err(D::Error::custom(bare_utility_line(&id))),
         Some(other) => serde_json::from_value(other).map(Some).map_err(D::Error::custom),
     }
 }

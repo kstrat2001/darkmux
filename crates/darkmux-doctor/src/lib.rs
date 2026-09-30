@@ -1495,7 +1495,7 @@ fn check_utility_model_in_profiles() -> Check {
         Err(_) => Check {
             name: "utility model in profiles".into(),
             status: Status::Warn,
-            message: "no profile registry — can't check whether a profile lists the utility model".into(),
+            message: "the profile registry did not load (see the `profile registry` row) — can't check whether a profile lists the utility model".into(),
             hint: None,
         },
     }
@@ -1709,7 +1709,7 @@ fn check_unreachable_darkmux_residents() -> Check {
             return Check {
                 name: "unreachable residents".into(),
                 status: Status::Warn,
-                message: "no profile registry — can't check resident reachability".into(),
+                message: "the profile registry did not load (see the `profile registry` row) — can't check resident reachability".into(),
                 hint: None,
             };
         }
@@ -1868,7 +1868,7 @@ fn check_role_profiles() -> Check {
         Err(e) => Check {
             name: "role profiles".into(),
             status: Status::Warn,
-            message: format!("can't verify the role->profile map (profile registry load failed: {e})"),
+            message: format!("can't verify the role->profile map (profile registry load failed: {e:#})"),
             hint: Some("Fix the profile registry (`darkmux doctor` profile-registry check), then re-run.".into()),
         },
     }
@@ -2059,9 +2059,10 @@ fn user_file_problems(kind: darkmux_types::user_files::UserFileKind) -> Vec<dark
     use darkmux_types::user_files::UserFileKind;
     match kind {
         UserFileKind::Config => darkmux_types::user_files::config_json_problems(),
-        UserFileKind::Profiles => darkmux_profiles::profiles::load_registry_quiet(None)
-            .ok()
-            .and_then(|loaded| darkmux_profiles::profiles::user_file_problem(&loaded.path))
+        // The file itself, not the loaded registry: a file the typed load
+        // refuses is the one whose every refused shape must be named.
+        UserFileKind::Profiles => darkmux_profiles::profiles::registry_path(None)
+            .and_then(|path| darkmux_profiles::profiles::user_file_problem(&path))
             .into_iter()
             .collect(),
         UserFileKind::Role
@@ -3956,7 +3957,7 @@ fn check_remote_endpoint_credentials() -> Check {
                 name: name.into(),
                 status: Status::Warn,
                 message: format!(
-                    "can't check remote endpoint credentials (profile registry load failed: {e})"
+                    "can't check remote endpoint credentials (profile registry load failed: {e:#})"
                 ),
                 hint: None,
             };
@@ -4079,7 +4080,7 @@ fn check_endpoints() -> Check {
         Err(e) => Check {
             name: "endpoints".into(),
             status: Status::Warn,
-            message: format!("can't list endpoints (profile registry load failed: {e})"),
+            message: format!("can't list endpoints (profile registry load failed: {e:#})"),
             hint: None,
         },
     }
@@ -4210,7 +4211,7 @@ pub fn probe_remote_endpoints() -> Vec<Check> {
                 name: "probe: remote endpoints".into(),
                 status: Status::Warn,
                 message: format!(
-                    "can't probe remote endpoints (profile registry load failed: {e})"
+                    "can't probe remote endpoints (profile registry load failed: {e:#})"
                 ),
                 hint: None,
             }];
@@ -5829,17 +5830,27 @@ fn check_profile_registry() -> Check {
                 }
             }
         }
-        Err(e) => Check {
-            name: "profile registry".into(),
-            status: Status::Fail,
-            message: e
-                .to_string()
-                .lines()
-                .next()
-                .unwrap_or("load failed")
-                .to_string(),
-            hint: Some("run `darkmux init` to create one".into()),
-        },
+        Err(e) => profile_registry_load_failure(&e),
+    }
+}
+
+/// The Fail row for a registry that did not load. The whole cause chain is
+/// the message; `darkmux init` is advised only when there is no file to fix.
+fn profile_registry_load_failure(e: &anyhow::Error) -> Check {
+    let present = profiles::registry_path(None).is_some_and(|p| p.exists());
+    let hint = if present {
+        format!(
+            "fix what the message names; the `{USER_FILE_KEYS_CHECK_NAME}: profiles.json` row lists every \
+             other shape in the file this release refuses"
+        )
+    } else {
+        "run `darkmux init` to create one".to_string()
+    };
+    Check {
+        name: "profile registry".into(),
+        status: Status::Fail,
+        message: format!("{e:#}"),
+        hint: Some(hint),
     }
 }
 
@@ -6415,7 +6426,7 @@ fn check_profile_loaded_match() -> Check {
             return Check {
                 name: "profile match".into(),
                 status: Status::Warn,
-                message: "no profile registry — can't check match".into(),
+                message: "the profile registry did not load (see the `profile registry` row) — can't check match".into(),
                 hint: None,
             };
         }
@@ -6828,7 +6839,7 @@ fn check_ram_headroom_load_projection() -> Check {
 
     let registry = match profiles::load_registry(None) {
         Ok(r) => r,
-        Err(_) => return skip("no profile registry"),
+        Err(_) => return skip("the profile registry did not load (see the `profile registry` row)"),
     };
     let loaded = match lms::list_loaded() {
         Ok(l) => l,
@@ -14960,6 +14971,62 @@ mod tests {
 
         let check = check_profile_registry();
         assert_eq!(check.status, Status::Pass, "{}", check.message);
+    }
+
+    // ─── a registry that fails to load: the cause, not `init` ───
+
+    /// A file that EXISTS and fails to load gets the whole cause chain and
+    /// the cause's own fix; `darkmux init` is never suggested for it.
+    #[serial_test::serial]
+    #[test]
+    fn a_present_registry_that_fails_to_load_shows_its_cause_and_not_init() {
+        let (_guard, config_path) = ConfigPathGuard::at_tempfile("profiles.json");
+        std::fs::write(
+            &config_path,
+            r#"{"profiles":{"p":{"models":[{"id":"a","n_ctx":1}]}},"internal":{"utility":"util-4b"}}"#,
+        )
+        .unwrap();
+        let check = check_profile_registry();
+        assert_eq!(check.status, Status::Fail);
+        assert!(check.message.contains("bare string"), "the cause is shown: {}", check.message);
+        assert!(check.message.contains("\"n_ctx\": <the window"), "with its fix: {}", check.message);
+        let hint = check.hint.unwrap_or_default();
+        assert!(!hint.contains("darkmux init"), "init does not fix an existing file: {hint}");
+        assert!(hint.contains("user file keys"), "points at the row listing every problem: {hint}");
+    }
+
+    /// The inverse: no file at all is the one case that suggests `init`.
+    #[serial_test::serial]
+    #[test]
+    fn an_absent_registry_suggests_init() {
+        let (_guard, _absent) = ConfigPathGuard::at_tempfile("profiles.json");
+        let check = check_profile_registry();
+        assert_eq!(check.status, Status::Fail);
+        assert!(check.hint.as_deref().is_some_and(|h| h.contains("darkmux init")), "{:?}", check.hint);
+    }
+
+    /// One run names every refused shape in a registry that does not load.
+    #[serial_test::serial]
+    #[test]
+    fn every_refused_shape_in_an_unloadable_registry_is_named_in_one_run() {
+        let (_guard, config_path) = ConfigPathGuard::at_tempfile("profiles.json");
+        std::fs::write(
+            &config_path,
+            serde_json::json!({
+                "profiles": {"p": {"models": [
+                    {"id": "m", "n_ctx": 1, "role": "primary"},
+                    {"id": "g", "endpoint": {"url": "https://api.example/v1"}}
+                ]}},
+                "internal": {"utility": "util-4b"}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let rows = check_user_file_keys();
+        let text: String = rows.iter().map(|r| r.message.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("internal.utility") && text.contains("bare string"), "{text}");
+        assert!(text.contains("profiles.p.models[0].role"), "{text}");
+        assert!(text.contains("profiles.p.models[1].endpoint"), "{text}");
     }
 
     // ─── #85/#91: check_remote_endpoint_credentials tests ───────
