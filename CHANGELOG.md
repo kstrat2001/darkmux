@@ -1144,6 +1144,7 @@ darkmux release.
 
 ### Fixed (4.0)
 
+- **A dispatch running inside the daemon no longer probes for a daemon.** Relayed fleet work ran in-process under `darkmux serve --port 8766` and printed "darkmux serve isn't reachable on 127.0.0.1:8765". The nudge is now silent inside the daemon, and it suggests `brew services start darkmux` only for a Homebrew binary (otherwise `darkmux serve`). Doctor's `daemon reachable` row already follows `DARKMUX_SERVE_PORT` / `serve.port`; a `--port` flag exists only in the daemon's own process, so set one of those for doctor to find a non-default port.
 - **`darkmux doctor`'s `crew/` merge script and its flat-mission check now
   agree.** The script moved pre-#148 flat mission files into `missions/`, where
   the `mission state files` check then refused them and told you to run a

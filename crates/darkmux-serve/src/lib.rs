@@ -1429,6 +1429,8 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
     // would return the mtime of the new binary and report a stale daemon as
     // fresh — the exact false negative this check exists to prevent.
     let _ = STARTUP_EXE_MTIME.set(current_exe_mtime());
+    // Relayed work runs in this process: its dispatches must not probe for a daemon.
+    darkmux_flow::daemon_probe::mark_running_inside_daemon();
     // (#2916 review M1) 10240 is macOS's per-process ceiling (OPEN_MAX).
     let _ = raise_open_file_limit(10_240);
 
