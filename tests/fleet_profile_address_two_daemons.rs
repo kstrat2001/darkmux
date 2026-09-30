@@ -196,7 +196,21 @@ fn write_identity_tool(dir: &Path, me: (&str, &str), other: (&str, &str)) -> Pat
     // Run it once now: macOS scans a freshly written executable on its first
     // run, which can outlast the provider's 3 s bound and send the listener
     // into its 30 s retry.
-    let out = Command::new(&tool).args(["status", "--json"]).output().unwrap();
+    //
+    // On Linux the same write can race a concurrent fork in this test binary:
+    // a child forked while our write handle was still open holds the file, and
+    // exec fails with ETXTBSY until that child execs. That error, and only that
+    // error, is retried, bounded; any other failure still fails the test.
+    let mut attempts = 0;
+    let out = loop {
+        match Command::new(&tool).args(["status", "--json"]).output() {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 50 => {
+                attempts += 1;
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            r => break r.unwrap(),
+        }
+    };
     assert!(out.status.success(), "the fake identity tool does not run");
     tool
 }
