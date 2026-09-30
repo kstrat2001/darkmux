@@ -185,7 +185,8 @@ pub(crate) fn try_peer_graph(
     // (#2916 re-review MUST 3) The token goes only to a verified target:
     // the provider checks the owner's roster address is its pinned tailnet
     // node (a loopback same-host entry excepted), and the request dials
-    // that verified address. The daemon never persists a first-contact pin.
+    // that verified address. A first-contact pin is saved in the roster before
+    // the token is attached, exactly as a work submission does.
     let provider = darkmux_fleet::configured_provider_or_unavailable();
     try_peer_graph_with(mission_id, &owner, self_machine.as_deref(), &roster, &live, provider.as_ref())
 }
@@ -219,26 +220,36 @@ fn try_peer_graph_with(
     let PeerLookup::Live { machine, entry } = classify_peer(owner, roster, live_machines) else {
         return None;
     };
-    let target = match darkmux_fleet::peer_target(
-        &machine,
-        &entry,
+    let target = settled_peer_target(&machine, &entry, provider)?;
+    let mut graph = fetch_peer_graph_json(&target, mission_id, &machine)?;
+    stamp_provenance(&mut graph, &machine);
+    Some(graph)
+}
+
+/// The token-bearing target for a live peer: verified by the identity
+/// provider, and pinned in the roster on first contact through the ONE
+/// first-contact pin (`darkmux_fleet::pin_on_first_contact`). `None`, with the
+/// reason on stderr, when the address is not a verified node or the pin could
+/// not be saved: the token is not sent to a node whose pin is not persisted.
+fn settled_peer_target(
+    machine: &str,
+    entry: &darkmux_fleet::MachineEntry,
+    provider: &dyn darkmux_fleet::IdentityProvider,
+) -> Option<darkmux_fleet::SettledTarget> {
+    let refused = |e: &dyn std::fmt::Display| {
+        eprintln!("peer_graph: peer `{machine}` not asked: {}", darkmux_fleet::sanitize_remote_line(&format!("{e}")));
+    };
+    let target = darkmux_fleet::peer_target(
+        machine,
+        entry,
         None,
         darkmux_flow::daemon_probe::DEFAULT_DAEMON_PORT,
         true,
         provider,
-    ) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!(
-                "peer_graph: peer `{machine}` not asked: {}",
-                darkmux_fleet::sanitize_remote_line(&format!("{e:#}"))
-            );
-            return None;
-        }
-    };
-    let mut graph = fetch_peer_graph_json(&target, mission_id, &machine)?;
-    stamp_provenance(&mut graph, &machine);
-    Some(graph)
+    )
+    .inspect_err(|e| refused(e))
+    .ok()?;
+    darkmux_fleet::pin_on_first_contact(target, entry, provider).inspect_err(|e| refused(&format!("{e:#}"))).ok()
 }
 
 /// Which machines currently hold a live presence beat, by the SAME
@@ -292,7 +303,7 @@ fn live_machine_names() -> HashSet<String> {
 /// naming the outcome (never a verdict about the peer or the operator's
 /// network) matches `fetch_peer_json`'s own precedent in
 /// `src/fleet_cli.rs` (#1466 gate CONSIDER 6).
-fn fetch_peer_graph_json(target: &darkmux_fleet::PeerTarget, mission_id: &str, peer_id: &str) -> Option<serde_json::Value> {
+fn fetch_peer_graph_json(target: &darkmux_fleet::SettledTarget, mission_id: &str, peer_id: &str) -> Option<serde_json::Value> {
     let path = format!("/mission/{mission_id}/graph.json");
     let url = format!("{}{path}", target.base());
     // (#2916 re-review MUST 3) Through the one token-attaching helper; it
@@ -461,19 +472,142 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         listener.set_nonblocking(true).unwrap();
         // A non-loopback address of this machine (its outbound one).
-        let Some(ip) = std::net::UdpSocket::bind("0.0.0.0:0")
+        let ip = require_outbound_ip();
+        let roster = roster_with("studio", &format!("{ip}:{port}"));
+        assert_eq!(try_peer_graph_with("m", "studio", None, &roster, &live(&["studio"]), &no_provider()), None);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(listener.accept().is_err(), "an unverified peer must never be dialed");
+    }
+
+    /// This machine's outbound non-loopback address, when it has one.
+    fn outbound_ip() -> Option<std::net::IpAddr> {
+        std::net::UdpSocket::bind("0.0.0.0:0")
             .and_then(|s| s.connect("192.0.2.1:9").map(|_| s))
             .and_then(|s| s.local_addr())
             .ok()
             .map(|a| a.ip())
             .filter(|ip| !ip.to_canonical().is_loopback() && !ip.is_unspecified())
-        else {
-            return;
-        };
+    }
+
+    /// This machine's non-loopback address, which these tests need (a loopback
+    /// peer is exempt from verification, so it cannot exercise the pin). A
+    /// machine without one FAILS the test with the reason: a green run that
+    /// asserted nothing would be worse than a red one.
+    fn require_outbound_ip() -> std::net::IpAddr {
+        outbound_ip().unwrap_or_else(|| {
+            panic!(
+                "this test needs a non-loopback local address and this machine has none; a loopback peer is \
+                 exempt from verification, so it cannot exercise the pin. Run it on a machine with a network interface."
+            )
+        })
+    }
+
+    /// A provider naming `studio` as the node at `ip`.
+    fn provider_with_studio_at(ip: std::net::IpAddr) -> darkmux_fleet::StaticIdentityProvider {
+        darkmux_fleet::StaticIdentityProvider {
+            local: darkmux_fleet::test_node("nLAPTOP", "laptop", "100.64.0.7"),
+            peers: vec![darkmux_fleet::test_node("nSTUDIO", "studio", &ip.to_string())],
+            down: None,
+        }
+    }
+
+    /// Run `f` with the fleet token and roster file set, restoring both.
+    fn with_token_and_roster_file<T>(roster_file: &std::path::Path, f: impl FnOnce() -> T) -> T {
+        let prev_token = std::env::var("DARKMUX_SERVE_TOKEN").ok();
+        let prev_file = std::env::var("DARKMUX_FLEET_FILE").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_SERVE_TOKEN", "sk-first-contact");
+            std::env::set_var("DARKMUX_FLEET_FILE", roster_file);
+        }
+        let out = f();
+        unsafe {
+            match prev_token {
+                Some(v) => std::env::set_var("DARKMUX_SERVE_TOKEN", v),
+                None => std::env::remove_var("DARKMUX_SERVE_TOKEN"),
+            }
+            match prev_file {
+                Some(v) => std::env::set_var("DARKMUX_FLEET_FILE", v),
+                None => std::env::remove_var("DARKMUX_FLEET_FILE"),
+            }
+        }
+        out
+    }
+
+    /// A one-shot graph responder on all interfaces; the returned cell holds
+    /// the request's Authorization line once a request arrived.
+    fn auth_recording_graph_server() -> (u16, Arc<std::sync::Mutex<Option<String>>>, Arc<AtomicBool>) {
+        let listener = TcpListener::bind("0.0.0.0:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let auth = Arc::new(std::sync::Mutex::new(None));
+        let hit = Arc::new(AtomicBool::new(false));
+        let (auth2, hit2) = (auth.clone(), hit.clone());
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                hit2.store(true, Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                *auth2.lock().unwrap() =
+                    req.lines().find(|l| l.to_ascii_lowercase().starts_with("authorization:")).map(str::to_string);
+                let body = r#"{"mission_id":"m","nodes":[],"edges":[],"legacy":false,"generated_at_ms":0}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        (port, auth, hit)
+    }
+
+    /// The promise: the fleet token is never sent to a node whose pin is not
+    /// persisted. A first-contact peer is pinned, and only then sent the token.
+    #[test]
+    #[serial_test::serial]
+    fn a_first_contact_peer_is_pinned_and_then_sent_the_token() {
+        let ip = require_outbound_ip();
+        let (port, auth, hit) = auth_recording_graph_server();
         let roster = roster_with("studio", &format!("{ip}:{port}"));
-        assert_eq!(try_peer_graph_with("m", "studio", None, &roster, &live(&["studio"]), &no_provider()), None);
-        std::thread::sleep(Duration::from_millis(100));
-        assert!(listener.accept().is_err(), "an unverified peer must never be dialed");
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("fleet.json");
+        let provider = provider_with_studio_at(ip);
+        let (out, pinned) = with_token_and_roster_file(&file, || {
+            darkmux_fleet::mutate_roster(|r| {
+                r.machines = roster.machines.clone();
+                Ok(())
+            })
+            .unwrap();
+            let out = try_peer_graph_with("m", "studio", None, &roster, &live(&["studio"]), &provider);
+            (out, darkmux_fleet::load_roster().unwrap().machines["studio"].node_id.clone())
+        });
+        assert!(out.is_some(), "the peer was asked");
+        assert!(hit.load(Ordering::SeqCst));
+        assert_eq!(pinned.as_deref(), Some("nSTUDIO"), "the pin was saved");
+        assert_eq!(
+            auth.lock().unwrap().clone().map(|l| l.to_ascii_lowercase()),
+            Some("authorization: bearer sk-first-contact".to_string())
+        );
+    }
+
+    /// The `PinNotSaved` shape: a roster that cannot be written means nothing
+    /// is sent, not even a connection.
+    #[test]
+    #[serial_test::serial]
+    fn an_unwritable_roster_means_the_peer_is_not_sent_the_token() {
+        let ip = require_outbound_ip();
+        let (port, auth, hit) = auth_recording_graph_server();
+        let roster = roster_with("studio", &format!("{ip}:{port}"));
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, "a file, not a directory").unwrap();
+        let provider = provider_with_studio_at(ip);
+        let out = with_token_and_roster_file(&blocker.join("fleet.json"), || {
+            try_peer_graph_with("m", "studio", None, &roster, &live(&["studio"]), &provider)
+        });
+        assert_eq!(out, None);
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!hit.load(Ordering::SeqCst), "nothing was sent to a peer whose pin was not saved");
+        assert_eq!(auth.lock().unwrap().clone(), None);
     }
 
     fn roster_with(id: &str, address: &str) -> FleetRoster {

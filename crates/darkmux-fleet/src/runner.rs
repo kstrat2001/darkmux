@@ -277,6 +277,17 @@ mod tests {
         assert!(!dispatch_in_flight());
     }
 
+    /// The last guard before execution: a boundary this darkmux does not
+    /// know fails closed, and the dispatch closure never runs.
+    #[test]
+    fn execute_job_refuses_an_unknown_boundary() {
+        let mut j = job();
+        j.boundary = Some(crate::Boundary::Unknown);
+        let err = execute_job_with(j, "host".into(), "laptop".into(), |_| panic!("never dispatched")).unwrap_err();
+        assert!(format!("{err:#}").contains("boundary no longer holds"), "{err:#}");
+        assert!(!dispatch_in_flight());
+    }
+
     /// A workdir outside the worktrees base is refused before dispatch.
     #[test]
     fn execute_job_refuses_a_workdir_outside_the_worktrees_base() {

@@ -1149,6 +1149,7 @@ darkmux release.
 
 ### Fixed (4.0)
 
+- **The daemon's peer mission-graph proxy no longer sends the fleet token to a peer whose pin is not saved.** On first contact it verified the peer's node but never pinned it, and attached the token anyway. `fleet_get` and `fleet_post_json` now take only a `SettledTarget`, which exists only after the first-contact pin was written to the roster (or the target needed none: loopback, this machine, already pinned). The proxy pins on first contact like a work submission, and with an unwritable roster it sends nothing. The pin is written compare-and-set under the roster lock: a removed entry, an edited address, or a different node pinned meanwhile refuses instead of pinning the wrong node. `machine status <id>` and `machine resources <id>` go through the same single pin helper. A dispatch that stays on this machine under a `managed_only` boundary is now refused when its profile resolves to a hosted endpoint.
 - **An interrupted lab run keeps its trajectory (#3014).** A run stopped with
   Ctrl-C or SIGTERM left its trajectory only in a temp directory, so
   `darkmux run stats` said "no trajectory events" for an hour of evidence. The
