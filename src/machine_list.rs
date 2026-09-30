@@ -63,6 +63,7 @@ fn unreachable_phrase(reason: UnreachableReason, detail: Option<&str>) -> String
         UnreachableReason::IdentityUnavailable => "the network identity tool could not verify it; nothing sent",
         UnreachableReason::NotOnOverlay => "address is not a node on the network; nothing sent",
         UnreachableReason::PinMismatch => "address is not its pinned node; nothing sent",
+        UnreachableReason::PinNotSaved => "its node could not be pinned in the roster; nothing sent",
         UnreachableReason::ListenerOff => "its fleet listener did not answer",
         UnreachableReason::AuthRequired => "did not accept this machine's fleet token",
         UnreachableReason::RefusedByPeer => "its fleet listener refused this machine",
@@ -246,8 +247,9 @@ fn row_name(view: &FleetView, m: &FleetMachine) -> String {
 }
 
 /// The reasons a peer is not asked at all, in the order their remedies print.
-const UNVERIFIED_REASONS: [UnreachableReason; 5] = [
+const UNVERIFIED_REASONS: [UnreachableReason; 6] = [
     UnreachableReason::PinMismatch,
+    UnreachableReason::PinNotSaved,
     UnreachableReason::NotOnOverlay,
     UnreachableReason::DnsFailed,
     UnreachableReason::IdentityUnavailable,
@@ -687,6 +689,7 @@ mod tests {
             (UnreachableReason::IdentityUnavailable, darkmux_fleet::TargetFault::IdentityUnavailable),
             (UnreachableReason::NotOnOverlay, darkmux_fleet::TargetFault::NotOnOverlay),
             (UnreachableReason::PinMismatch, darkmux_fleet::TargetFault::PinMismatch),
+            (UnreachableReason::PinNotSaved, darkmux_fleet::TargetFault::PinNotSaved),
         ];
         for (reason, fault) in cases {
             assert_eq!(reason.target_fault(), Some(fault));

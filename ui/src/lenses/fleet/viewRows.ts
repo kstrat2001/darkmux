@@ -31,6 +31,8 @@ function unreachableLine(reason: UnreachableReason): string {
       return "identity unavailable";
     case "not_on_overlay":
       return "not on the overlay network";
+    case "pin_not_saved":
+      return "pin not saved";
     case "pin_mismatch":
       return "identity mismatch";
     case "listener_off":

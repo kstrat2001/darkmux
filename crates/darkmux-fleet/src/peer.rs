@@ -81,6 +81,8 @@ pub enum TargetFault {
     IdentityUnavailable,
     NotOnOverlay,
     PinMismatch,
+    /// The peer verified, but its node could not be written into the roster.
+    PinNotSaved,
     OwnAddress,
 }
 
@@ -102,6 +104,11 @@ impl TargetFault {
             ),
             TargetFault::PinMismatch => format!(
                 "If {target} really was replaced, re-pin it with `darkmux machine add {target} --address <its tailnet DNS name>`."
+            ),
+            TargetFault::PinNotSaved => format!(
+                "The roster file could not be written, so {target}'s node was not pinned and the fleet token was \
+                 not sent. Check that the roster file and its directory are writable (`darkmux machine list` \
+                 shows the roster path)."
             ),
             TargetFault::OwnAddress => "Check `serve.bind`.".to_string(),
         }

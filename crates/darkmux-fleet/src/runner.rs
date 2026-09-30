@@ -116,6 +116,11 @@ pub fn execute_job_with(
 /// at a hosted endpoint the boundary forbids. This asks the resolution
 /// dispatch itself routes on (`dispatch_resolves_remote`, which fails closed)
 /// and refuses before anything is reconciled, loaded or sent.
+///
+/// Known residual: dispatch reads the registry once more after this check, a
+/// window of a few milliseconds in which a further edit still wins. The full
+/// fix is to carry the resolved target in `DispatchOpts` so dispatch never
+/// resolves it again; that field would touch every `DispatchOpts` literal.
 fn assert_boundary_still_holds(job: &WorkJob, profile: &str) -> Result<()> {
     let holds = match job.boundary {
         None => true,

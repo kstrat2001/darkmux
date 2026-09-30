@@ -105,6 +105,9 @@ pub enum UnreachableReason {
     /// The node at the roster address is not the one the entry pinned:
     /// nothing, and no token, was sent.
     PinMismatch,
+    /// The node at the roster address verified, but pinning it in the roster
+    /// failed (the file is not writable): nothing, and no token, was sent.
+    PinNotSaved,
     /// Nothing answered on the peer's fleet listener port: its listener is
     /// off, or not reachable from this machine. `detail` carries the
     /// transport's word.
@@ -140,6 +143,7 @@ impl UnreachableReason {
             UnreachableReason::IdentityUnavailable => Some(TargetFault::IdentityUnavailable),
             UnreachableReason::NotOnOverlay => Some(TargetFault::NotOnOverlay),
             UnreachableReason::PinMismatch => Some(TargetFault::PinMismatch),
+            UnreachableReason::PinNotSaved => Some(TargetFault::PinNotSaved),
             UnreachableReason::ListenerOff
             | UnreachableReason::AuthRequired
             | UnreachableReason::RefusedByPeer
@@ -752,6 +756,7 @@ fn unreachable_for(e: &TargetError) -> UnreachableReason {
         TargetFault::IdentityUnavailable => UnreachableReason::IdentityUnavailable,
         TargetFault::NotOnOverlay => UnreachableReason::NotOnOverlay,
         TargetFault::PinMismatch => UnreachableReason::PinMismatch,
+        TargetFault::PinNotSaved => UnreachableReason::PinNotSaved,
         // Only a caller that passes this machine's own daemon address can
         // hit it; a roster entry never does.
         TargetFault::OwnAddress => UnreachableReason::BadAddress,
@@ -780,8 +785,8 @@ fn listener_target(
 /// [`listener_target`], with the peer's node pinned in the roster on first
 /// contact, exactly as a work submission pins it: the gap between "the address
 /// is a node" and "the address is the node this entry means" closes after the
-/// first gather. A roster that cannot be written is logged, not fatal: the
-/// node was still verified this gather, and the next one tries the pin again.
+/// first gather. Fails closed: a roster that cannot be written means the
+/// token is not sent this gather ([`UnreachableReason::PinNotSaved`]).
 fn pinned_listener_target(
     provider: &dyn IdentityProvider,
     entry: &MachineEntry,
@@ -790,6 +795,7 @@ fn pinned_listener_target(
     let target = listener_target(provider, entry, listener_port)?;
     if let Err(e) = darkmux_fleet::pin_on_first_contact(&target, &entry.id, provider) {
         eprintln!("darkmux serve: could not pin {} in the roster: {e:#}", entry.id);
+        return Err(UnreachableReason::PinNotSaved);
     }
     Ok(target)
 }
@@ -1617,6 +1623,28 @@ pub(crate) mod tests {
         assert_eq!(reason, Some(UnreachableReason::PinMismatch));
         assert_eq!(pinned.as_deref(), Some("nSOMEONE-ELSE"), "a mismatch never re-pins");
         assert!(listener.paths().is_empty(), "no request, so no token, reached the listener");
+    }
+
+    /// A roster that cannot be written cannot record the pin, so the token is
+    /// not sent that gather: the node is refused with its own reason.
+    #[test]
+    #[serial_test::serial]
+    fn an_unwritable_roster_means_no_token_is_sent() {
+        let listener = serve_card("200 OK", listener_body());
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, "a file, not a directory").unwrap();
+        let prev = std::env::var("DARKMUX_FLEET_FILE").ok();
+        unsafe { std::env::set_var("DARKMUX_FLEET_FILE", blocker.join("fleet.json")) };
+        let reason = with_fleet_token(|| pinned_listener_target(&provider(true), &studio(), listener.port).err());
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLEET_FILE", v),
+                None => std::env::remove_var("DARKMUX_FLEET_FILE"),
+            }
+        }
+        assert_eq!(reason, Some(UnreachableReason::PinNotSaved));
+        assert!(listener.paths().is_empty(), "no request, so no token, reached the peer");
     }
 
     /// Symmetry: a peer that does not list this machine still gives its card,

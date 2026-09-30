@@ -51,6 +51,7 @@ const UNREACHABLE: Record<UnreachableReason, string> = {
   identity_unavailable: "identity unavailable",
   not_on_overlay: "not on the overlay network",
   pin_mismatch: "identity mismatch",
+  pin_not_saved: "pin not saved",
   listener_off: "listener off",
   auth_required: "auth required",
   refused_by_peer: "refused by peer",

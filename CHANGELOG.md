@@ -1264,7 +1264,7 @@ darkmux release.
     (`no_card_route`, `other_schema_major` or `unparseable`) and the peer's version
     with its source (`peer` or `presence`, the peer's own answer preferred).
     Unreachable reasons are `bad_address`, `dns_failed`, `identity_unavailable`,
-    `not_on_overlay`, `pin_mismatch`, `listener_off`, `auth_required`,
+    `not_on_overlay`, `pin_mismatch`, `pin_not_saved`, `listener_off`, `auth_required`,
     `refused_by_peer`, `listener_unavailable` and `bad_answer` (`connect_failed` is
     now `listener_off`).
   - Seats state facts only: `seats.local` is `[{model, held_by_peer_job}]`,
