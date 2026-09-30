@@ -3660,6 +3660,14 @@ body {
   opacity: 0.5;
   font-style: italic;
 }
+/* What the peer lets this machine do rides the hardware line. Beside the
+   phone's tube there is no room for it (it would clip to "·…"), so it is
+   dropped there; the full line stays in the tooltip. */
+@media (max-width: 560px) {
+  .mach .spec__grant {
+    display: none;
+  }
+}
 .mach .stat {
   margin-top: 12px;
   font: calc(12px * var(--fs-scale)) var(--font-mono);

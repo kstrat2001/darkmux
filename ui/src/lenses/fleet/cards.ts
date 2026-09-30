@@ -33,14 +33,14 @@ import {
 } from "../../lib/tokenRate";
 import type { ExecutionTokenReading, LiveState } from "../../lib/tokenRate";
 import type { MachineSpecsResponse } from "../../types/generated/MachineSpecsResponse";
+import { specsLine, type RowFacts, type Standing } from "./viewRows";
 import type { PresenceBeat } from "../../types/generated/PresenceBeat";
-import type { RosterMachineEntry } from "../../types/generated/RosterMachineEntry";
 // (#2814) `isSelfMachine`/`displayNameOf` live in `lib/flow.ts` beside
 // `nameOf`/`machineNames`/`localMachineUid` rather than here, because the
 // machine lens and the app shell need the identical self-identity rule and a
 // second copy of it is how the two surfaces disagree about which machine
 // they are on.
-import { machineNames, machineUids, isSelfMachine, displayNameOf, uidOf } from "../../lib/flow";
+import { displayNameOf, isSelfMachine, uidOf } from "../../lib/flow";
 import type { RosterName } from "../../lib/flow";
 import type { Run } from "../../types/generated/Run";
 import { utilityStrip, type UtilityStrip } from "../../lib/utilityJobs";
@@ -75,10 +75,6 @@ export function specOf(
   liveMachines: Map<string, PresenceBeat>,
   specs: MachineSpecsResponse | null,
   m: string,
-  /** (#2067) Where a REMOTE card's hardware line comes from. Defaults to the
-   * presence beats; a static build passes its committed fleet snapshot
-   * instead, since it cannot poll presence at all. */
-  specBeats: Map<string, PresenceBeat> = liveMachines,
 ): string {
   if (m === "unknown") {
     const ns = [...new Set(data.filter((r) => uidOf(r) === "unknown" && r.machine_id).map((r) => r.machine_id as string))];
@@ -95,24 +91,27 @@ export function specOf(
   // reports the current one. Same identity rule as
   // `lib/flow.ts::localMachineUid`; see `machineNames` for why one machine
   // accumulates several names.
-  // (#2067) Keyed off `liveMachines`, not `specBeats`, on purpose: this
-  // branch answers "is `m` the machine `/machine/specs` describes", a
-  // liveness-side identity question, and `specs` is null on a static build
-  // (the query is live-only) so the branch never runs there. If a static
-  // machine-specs source is ever wired in, this alias lookup must read the
-  // snapshot too.
   // (#2814) The identity half of this condition moved into `isSelfMachine`,
   // which joins on `specs.machine_uid` when the daemon reports one — no
   // `data`, no `liveMachines`, no window. See that function's own doc for
   // why the alias set could not answer this question durably. The
   // `cpu_brand` half stays here: it is about whether there is anything to
   // SHOW, not about who this is.
-  if (isSelfMachine(data, liveMachines, specs, m) && specs?.cpu_brand) {
-    const gb = specs.ram_total_bytes ? ` · ${Math.round(specs.ram_total_bytes / 1073741824)} GB` : "";
-    return specs.cpu_brand + gb;
-  }
-  const beat = specBeats.get(m);
+  if (isSelfMachine(data, liveMachines, specs, m) && specs?.cpu_brand) return specsLine(specs);
+  const beat = liveMachines.get(m);
   return beat?.specs || "";
+}
+
+/** The dim line shown in place of the hardware: the view's typed status for
+ * a machine it could not read, else why no hardware is known. */
+export function specDimLabel(card: { note: string | null; specUnknown: SpecUnknownReason | null }): string {
+  return card.note ?? specUnknownLabel(card.specUnknown ?? "not-reported");
+}
+
+/** The card's subtitle: the hardware line, then what the peer lets this
+ * machine do. One line, so the card keeps its height. */
+export function specLine(card: { spec: string; grant: string | null }): string {
+  return card.grant ? `${card.spec} · ${card.grant}` : card.spec;
 }
 
 /** (#2060) Collapse a machine's running runs down to TOP-LEVEL runs: a
@@ -185,158 +184,6 @@ function topLevelRuns(runs: readonly RunGroup[]): RunGroup[] {
  * post-#2060), and counting it again here would double-count it. */
 function runningLabRunCount(machineRuns: Run[]): number {
   return machineRuns.filter((r) => r.kind === "lab" && r.status === "running").length;
-}
-
-/** (#1855) Which of the operator's DECLARED roster entries have NO known
- * identity in this window at all — no flow record under that name, no live
- * presence beat under it either. These are the entries the card list would
- * otherwise drop silently: `machineUids` only ever unions flow-derived uids
- * with CURRENTLY-beating presence keys, so a machine the operator added via
- * `darkmux machine add` and which has never once started its daemon (or is
- * down right now, with zero history) produces no uid for it to fall back
- * on — the exact "rostered-but-silent machine vanishes entirely" defect.
- *
- * A roster entry IS excluded here — deliberately NOT double-reported —
- * when its `id` matches any alias (`machineNames`) any known uid has ever
- * used, whether that uid is currently beating or only has past flow
- * history, OR when it matches THIS machine's own confirmed identity
- * (`specs.machine_id`, see below), OR when a normalized form of it
- * (`normalizeMachineAlias`) matches a normalized known alias.
- *
- * Two review findings, one fix:
- *
- * (F1 — self-machine phantom) Presence self-disables when Redis is unset
- * (`darkmux-flow/src/presence.rs`'s `spawn_emitter_thread` doc), which is
- * the off-by-default state. So on a quiet flow window a machine can have
- * ZERO beats and zero flow history under its own roster name — including
- * the machine serving the very page rendering the card, whose roster entry
- * this project's own `darkmux-add-machine` skill walks the operator
- * through creating at step 7. Without a self-check that entry then falls
- * through `knownNames` exactly like a genuinely-silent peer, and the card
- * renders "offline" / "hardware not reported" for the daemon that is
- * answering the request right now, with the hardware it calls unreported
- * sitting in the very `/machine/specs` response used to draw the page.
- * `specs.machine_id` is `machine_specs_handler`'s own identity read
- * (`darkmux_flow::resolve_machine_id()`), unconditionally available for
- * whichever daemon answers `/machine/specs` — it does not depend on Redis,
- * a beat, or any flow record existing at all, which is exactly the
- * guarantee `knownNames` cannot make on a quiet window. `specOf` (above)
- * already trusts this same field for the identical question three
- * functions away.
- *
- * (F2 — mismatched-name duplicate) Matching used to be exact-string only,
- * and the roster `id` is operator-typed prose (`src/cli.rs`'s `machine add`
- * prompt) with nothing validating it against what the peer actually beats
- * or logs as — the issue's own wire dump showed real fleet members beating
- * under macOS hostname defaults, not necessarily the id an operator typed.
- * A live peer beating as one name and rostered under a near-miss of that
- * name (case, whitespace, or the mDNS `.local` suffix legacy already hits
- * for a SINGLE machine's own two aliases — `nameOf`'s #2030 doc,
- * `localMachineUid`'s alias set) used to render THREE cards for two
- * machines: the live one, plus a dim "offline" phantom beside it asserting
- * the same machine is down. `normalizeMachineAlias` folds case, leading and
- * trailing whitespace, and a trailing `.local` out of the comparison, on
- * both sides, so those near-misses land in the same alias bucket instead of
- * drawing a second card. It does not — and structurally cannot — resolve a
- * roster id that shares no substring with what the peer actually beats as;
- * that remains the operator's to align, same as before. */
-function normalizeMachineAlias(name: string): string {
-  return name.trim().toLowerCase().replace(/\.local$/, "");
-}
-
-export function rosterOnlyEntries(
-  data: NormRecord[],
-  liveMachines: Map<string, PresenceBeat>,
-  roster: RosterMachineEntry[],
-  /** (#1855 follow-up) This machine's own `/machine/specs` read, when
-   * available — see this function's own doc, F1. `null` on a build that
-   * hasn't fetched it (a static build, or before the live query resolves);
-   * every pre-existing call site keeps behaving exactly as before. */
-  specs: MachineSpecsResponse | null = null,
-): RosterMachineEntry[] {
-  const knownUids = new Set(machineUids(data, liveMachines));
-  const knownNames = new Set<string>();
-  for (const uid of knownUids) {
-    for (const name of machineNames(data, liveMachines, uid)) knownNames.add(name);
-  }
-  if (specs?.machine_id) knownNames.add(specs.machine_id);
-  // (#2814) The uid half of the same F1 self-check, and it is now load-bearing
-  // rather than belt-and-braces: `FleetLens` puts this machine's own uid into
-  // the card list unconditionally once specs report one, so a roster entry the
-  // operator declared under a name this machine NO LONGER USES — `laptop` for
-  // a machine that now calls itself `MacBook-Pro`, the live #2796 shape — is
-  // no longer caught by any name check and would draw a second, "offline"
-  // card beside the machine's own live one. The uid is the join that survives
-  // a rename; a uid-less entry still falls through to the name checks below
-  // exactly as #2768 requires.
-  if (specs?.machine_uid) knownUids.add(specs.machine_uid);
-
-  const normalizedKnown = new Set([...knownNames].map(normalizeMachineAlias));
-  return roster.filter((entry) => {
-    // (#2768) A roster entry that DECLARES a hardware identity — resolved at
-    // `machine add` time, or hand-set — and that identity IS one of the
-    // uids currently known (beating, or with flow history) is, by
-    // construction, that exact machine, no matter what name either side
-    // happens to carry. This is what closes the gap the name-based checks
-    // below cannot: three generations of rename (`laptop` →
-    // `MacBook-Pro.local` → `MacBook-Pro`) share no substring for
-    // `normalizeMachineAlias` to fold on, but the uid never changed. See
-    // `MachineEntry::machine_uid`'s own doc for why an ABSENT uid must
-    // never take this branch — that stays exactly the name-matching logic
-    // below, unchanged.
-    if (entry.machine_uid && knownUids.has(entry.machine_uid)) return false;
-    if (knownNames.has(entry.id)) return false;
-    return !normalizedKnown.has(normalizeMachineAlias(entry.id));
-  });
-}
-
-/** (#2768) The operator-declared LABEL for a currently-known uid, when the
- * roster has a resolved identity for it — either `machine add`'s
- * self-registration path (`darkmux_hardware::machine_uid()`) or a
- * hand-edited roster entry (`FleetRoster`'s own doc: hand-edits are a
- * supported way to set this file). This is what turns the SAME uid match
- * `rosterOnlyEntries` uses to suppress a second card into the positive half
- * of #2768's fix: rather than drawing a duplicate "offline" card for a
- * renamed machine, the machine's real, live card is relabeled with the name
- * the operator actually declared for it — which may be neither `nameOf`'s
- * most-recently-seen flow alias nor the live beat's `display_name`.
- *
- * Returns `undefined` when no roster entry names this uid — callers keep
- * whatever name they already derived; this never invents one. */
-/** (#2802 regression fix) The operator's roster name for a uid, when it adds
- * information — i.e. when they declared one and it is NOT already what the
- * machine calls itself.
- *
- * This REPLACES `rosterLabelFor`, which returned the same string for a
- * different purpose: #2768 used it to OVERRIDE the card's title, so a roster
- * entry whose `machine_uid` matched a card renamed that card. That was inert
- * while roster entries carried no uid. #2802 then began back-filling uids
- * from flow history — correctly, to stop stale entries drawing phantom cards
- * — and the override started firing on entries nobody had aliased on
- * purpose. Live result: the card for this machine was titled `laptop` (a
- * roster id from June, pointing at a port with no daemon) while the activity
- * lane directly beneath it said `MacBook-Pro`. One machine, two names, one
- * screen.
- *
- * The machine's own `machine_id` wins the TITLE now. It is what every flow
- * record carries, what the activity lanes and run rows use, what `nameOf` was
- * fixed in #2030 to track, and it is current in a way an operator-typed alias
- * from four months ago is not. The alias is not discarded — it rides along as
- * secondary text, so "which of my roster entries is this?" stays answerable
- * without the view contradicting itself.
- *
- * Returns `undefined` when the alias equals the machine's own name, because
- * showing a name twice is noise rather than provenance. */
-export function rosterAliasFor(
-  uid: string,
-  roster: RosterMachineEntry[],
-  machineName: string,
-): string | undefined {
-  const declared = roster.find((entry) => entry.machine_uid === uid)?.id;
-  if (!declared) return undefined;
-  return normalizeMachineAlias(declared) === normalizeMachineAlias(machineName)
-    ? undefined
-    : declared;
 }
 
 /** (#1855) WHY a card has no hardware line. `""` from `specOf` is not one
@@ -422,23 +269,23 @@ export function isStrictlyBusier(candidate: ExecutionTokenReading, current: Exec
 }
 
 export interface FleetCard {
-  /** (#2802 regression fix) The operator's own roster name for this machine,
-   * when they declared one AND it differs from what the machine calls
-   * itself. Rendered as secondary text, never as the title — see
-   * `rosterAliasFor`. `undefined` when there is no roster entry, or when the
-   * alias already agrees with the machine's own id and would be noise. */
-  rosterAlias?: string;
-  /** (#2958) Drawn from a roster entry nothing else accounts for (see
-   * `rosterOnlyEntries`). Until `/machine/specs` answers, such an entry may
-   * be THIS machine's own, so its negative claims wait for specs too (see
-   * `cardFace`). */
-  rosterOnly?: boolean;
   uid: string;
   name: string;
   /** "" means the `specdim` fallback — `specUnknown` below says which one. */
   spec: string;
   /** (#1855) `null` iff `spec` is non-empty. See `SpecUnknownReason`. */
   specUnknown: SpecUnknownReason | null;
+  /** The view's typed status line for a machine whose card it could not
+   *  read ("listener off"); shown in place of the hardware line. `null` for
+   *  a machine the view read, and for one the view does not hold. */
+  note: string | null;
+  /** What this peer lets this machine do, as one compact line; `null` for
+   *  this machine's own card and for any peer without a grant to show. */
+  grant: string | null;
+  /** Whether the machine is up: the view's own `liveness` (a card it read
+   *  is proof of life), or, for a machine the view does not hold, the flow
+   *  window's online/offline edges. */
+  standing: Standing;
   active: boolean;
   absent: boolean;
   stat: string;
@@ -567,9 +414,10 @@ export function buildFleetCard(
    * day's true max in live mode (there is no scrubber on `/next`'s default
    * route). Every run's lifecycle is read as of it. */
   t: number,
-  /** (#2067) See `specOf`'s own doc — the spec source, when it is not the
-   * presence beats (a static build). */
-  specBeats: Map<string, PresenceBeat> = liveMachines,
+  /** The fleet view's row for this machine, when the view holds one: its
+   * hardware line, status note, grant and standing replace the flow-derived
+   * ones. */
+  row: RowFacts | null = null,
   /** (#1923) This machine's rows from `GET /runs` — see `runningLabRunCount`'s
    * own doc for why reading this here is a display-layer join, not a sink
    * crossing. Defaults to `[]` so every pre-#1923 call site (none of which
@@ -609,12 +457,53 @@ export function buildFleetCard(
   policy: LifecyclePolicy = DEFAULT_POLICY,
 ): FleetCard {
   return withLiveReadings(
-    buildFleetCardBase(data, liveMachines, specs, presence, machAbsent, m, _liveMode, t, specBeats, machineRuns, roster, policy),
+    buildFleetCardBase(data, liveMachines, specs, presence, machAbsent, m, _liveMode, t, row, machineRuns, roster, policy),
     t,
     connected,
     lastContactMs,
     live,
   );
+}
+
+/** What a card says about WHO the machine is and whether it is up. A machine
+ * the view holds reads its hardware line, status note, grant and standing
+ * from its row; any other (an unverified source, a beating machine nobody
+ * rostered, a replay) reads presence and the flow window. */
+function cardIdentity(
+  data: NormRecord[],
+  liveMachines: Map<string, PresenceBeat>,
+  specs: MachineSpecsResponse | null,
+  machAbsent: boolean,
+  m: string,
+  roster: readonly RosterName[],
+  row: RowFacts | null,
+) {
+  if (!row) {
+    const spec = specOf(data, liveMachines, specs, m);
+    return {
+      name: displayNameOf(data, liveMachines, specs, m, roster),
+      spec,
+      // (#1855) `specUnknown` says whether a beat existed to carry hardware.
+      specUnknown: spec ? null : liveMachines.has(m) ? ("not-reported" as const) : ("not-seen" as const),
+      note: null,
+      grant: null,
+      standing: machAbsent ? ("offline" as const) : ("online" as const),
+      self: false,
+    };
+  }
+  return {
+    // (#2814) `nameOf` plus the self-identity floor: see `displayNameOf`. A
+    // machine only the view knows is named by its roster id.
+    name: row.known ? displayNameOf(data, liveMachines, specs, m, roster) : (row.name ?? m),
+    spec: row.spec,
+    specUnknown: row.spec ? null : ("not-reported" as const),
+    note: row.note,
+    grant: row.grant,
+    standing: row.standing,
+    // (#2915) The view says which row is this machine; a peer's model is
+    // read off its own utility records and its residency is unknown.
+    self: row.isSelf,
+  };
 }
 
 /** (#2928 re-review, C-1) Everything on a card that reads the WINDOW of
@@ -647,7 +536,7 @@ export function buildFleetCardBase(
   m: string,
   _liveMode: boolean,
   t: number,
-  specBeats: Map<string, PresenceBeat> = liveMachines,
+  row: RowFacts | null = null,
   machineRuns: Run[] = [],
   roster: readonly RosterName[] = [],
   policy: LifecyclePolicy = DEFAULT_POLICY,
@@ -661,7 +550,9 @@ export function buildFleetCardBase(
   const flowActive = running.length > 0;
   const labRunning = runningLabRunCount(machineRuns);
   const active = flowActive || labRunning > 0;
-  const stat = machAbsent ? "offline" : active ? "dispatch in flight" : "idle";
+  const id = cardIdentity(data, liveMachines, specs, machAbsent, m, roster, row);
+  const standing = id.standing;
+  const stat = standing === "offline" ? "offline" : active ? "dispatch in flight" : standing === "unknown" ? NO_SIGNAL_STAT : "idle";
   // (#2060) `topLevelRuns` collapses a mission's own session together with
   // any of its seat/step dispatches into ONE entry — a mission with one seat
   // running reads "1 running", not "2 running", in both modes.
@@ -724,27 +615,16 @@ export function buildFleetCardBase(
   // heartbeat 6h in the day's future vs the correct 95 tok/s as of `t`).
   const runningSids = running.map((g) => g.sessionId);
   const durableSets = running.map((g) => recordsAsOf(g.records, t));
-  const spec = specOf(data, liveMachines, specs, m, specBeats);
-  // (#1855) `specBeats` is the SAME map `specOf` falls back to for a remote
-  // machine's hardware line, so "was there anything to read" is exactly
-  // "does that map hold an entry for this uid" — not a second, parallel
-  // notion of presence that could disagree with the one the spec came from.
-  const specUnknown: SpecUnknownReason | null = spec ? null : specBeats.has(m) ? "not-reported" : "not-seen";
-  // (#2814) `nameOf` plus the self-identity floor — see `displayNameOf`'s own
-  // doc for why a card titled with a raw 36-character UUID is the display
-  // half of "self is unknown", and why the floor can never outvote a name the
-  // window actually observed.
-  const name = displayNameOf(data, liveMachines, specs, m, roster);
-  // (#2915) `/machine/specs` answers for THIS machine only; a peer's model is
-  // read off its own utility records and its residency is unknown.
-  const self = specs != null && isSelfMachine(data, liveMachines, specs, m);
   return {
     uid: m,
-    name,
-    spec,
-    specUnknown,
+    name: id.name,
+    spec: id.spec,
+    specUnknown: id.specUnknown,
+    note: id.note,
+    grant: id.grant,
+    standing,
     active,
-    absent: machAbsent,
+    absent: standing === "offline",
     stat,
     runsCount,
     // (Playback parity, Change A, finding #3) Always "running" now — a
@@ -753,7 +633,7 @@ export function buildFleetCardBase(
     // "running" (a gerund, not a count noun) never pluralizes.
     runsLabel: "running",
     runningSessionIds,
-    liveInputs: { data, runningSids, durableSets, policy, presence, self, binding: self ? (specs?.utility_model ?? null) : null },
+    liveInputs: { data, runningSids, durableSets, policy, presence, self: id.self, binding: id.self ? (specs?.utility_model ?? null) : null },
   };
 }
 
@@ -771,25 +651,21 @@ export const NO_SIGNAL_STAT = "no signal";
  *  hold "no signal" forever. The flow window is the exception (#2965): its
  *  failed read yields an empty window, which every negative claim here would
  *  read as "nothing happened", so `flow` is false while a day's read is
- *  failing (and `FlowReadNotice` names it). `/fleet/roster` and `/machine/specs` are not
- *  sources here: they decide which cards exist and what hardware they name,
- *  never what a machine is doing. The caller latches each one, so only the
+ *  failing (and `FlowReadNotice` names it). `/fleet/roster` is not a
+ *  source here: it names machines, never says what one is doing. The caller latches each one, so only the
  *  FIRST answer counts: a later pending read (a refetch, or the flow
  *  window's new day key at UTC midnight) never re-enters "no signal". */
 export interface CardSourcesAnswered {
   /** The flow window: sessions, activity, `machine.online/offline` edges,
    *  utility jobs. */
   flow: boolean;
-  /** `/fleet/machines/live`: who is beating. */
+  /** Who is up: `/fleet/view` (each row's liveness) and `/fleet/machines/live`
+   *  (a machine the view does not hold). */
   presence: boolean;
   /** `/fleet/dispatches/live`: which sessions are running. */
   sessions: boolean;
   /** `/runs`: a lab run in flight, which never rides the flow stream (#1923). */
   runs: boolean;
-  /** `/machine/specs`: this machine's own identity. A roster-only card may
-   *  be this machine's own entry until specs says otherwise
-   *  (`rosterOnlyEntries`' F1 uid check), so its negative claims wait on it. */
-  specs: boolean;
 }
 
 /** (#2958) What a card may say, given what has answered so far. */
@@ -824,11 +700,11 @@ export interface CardFace {
  *    a `/runs` row that says so), a running count of one or more, a running
  *    utility job. A count read before `/runs` answers is a lower bound: the
  *    lab count can only raise it (`Math.max`, #1923).
- *  - "offline": waits on presence and the flow window (a beat, or a
- *    `machine.online` edge, contradicts it). It wins over a reading: an
+ *  - "offline": waits on presence, the view and the flow window (a beat, or
+ *    a `machine.online` edge, contradicts it). It wins over a reading: an
  *    offline card's tube is powered off.
- *  - A roster-only card's negative claims also wait on `/machine/specs`,
- *    which is what tells this machine's own roster entry from a silent peer.
+ *  - A machine whose standing is unknown (presence could not say and its card
+ *    was not read) never says "idle": it says "no signal".
  *  - "idle", "no model working", "0 running": wait on every source.
  *  - A quiet utility strip's "idle": waits on the flow window, the only
  *    source of utility jobs.
@@ -836,21 +712,19 @@ export interface CardFace {
  *  execution's line says when the page loses the daemon (#2886), in the
  *  same boxes. */
 export function cardFace(
-  card: { absent: boolean; active: boolean; runsCount: number; rosterOnly?: boolean },
+  card: { absent: boolean; active: boolean; runsCount: number; standing: Standing },
   hasReading: boolean,
   answered: CardSourcesAnswered,
 ): CardFace {
-  // A roster-only card is a silent peer only once `/machine/specs` has said
-  // it is not this machine's own entry.
-  const identityKnown = !card.rosterOnly || answered.specs;
-  const all = answered.flow && answered.presence && answered.sessions && answered.runs && identityKnown;
-  const offlineKnown = answered.flow && answered.presence && identityKnown;
+  const all = answered.flow && answered.presence && answered.sessions && answered.runs;
+  const offlineKnown = answered.flow && answered.presence;
   const absent = card.absent && offlineKnown;
   const active = card.active && !absent;
-  const stat = absent ? "offline" : card.active ? "dispatch in flight" : all && !card.absent ? "idle" : NO_SIGNAL_STAT;
+  const idleKnown = all && card.standing === "online";
+  const stat = absent ? "offline" : card.active ? "dispatch in flight" : idleKnown ? "idle" : NO_SIGNAL_STAT;
   // Offline wins: a machine said to be gone draws the powered-off screen,
   // even over a reading its last records left behind.
-  const tube = absent ? "off" : hasReading ? "reading" : all && !card.absent ? "idle" : "nosignal";
+  const tube = absent ? "off" : hasReading ? "reading" : idleKnown ? "idle" : "nosignal";
   return {
     stat,
     absent,

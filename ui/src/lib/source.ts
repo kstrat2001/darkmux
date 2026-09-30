@@ -53,6 +53,14 @@ export function getSource(): Source {
   };
 }
 
+/** Where `/fleet/view` comes from on THIS page: the daemon route, or the
+ * committed snapshot a static build ships (`darkmux-fleet-src`); `null` when
+ * a static build shipped none, so nothing can answer. */
+export function fleetViewSrc(): string | null {
+  const s = getSource();
+  return s.kind === "daemon" ? "/fleet/view" : s.fleet;
+}
+
 /** The runs / lab-runs endpoints, which exist on both kinds of page: the
  * daemon route by default, the committed fixture on a static build. */
 export function runsSrc(): string {

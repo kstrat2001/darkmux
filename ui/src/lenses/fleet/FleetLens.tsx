@@ -11,10 +11,11 @@ import { useFlowWindow } from "../../hooks/useFlowWindow";
 import { useNowMs } from "../../lib/clock";
 import { REPLAY_GRANULARITY_NOTE, useLiveOverlay } from "../../lib/liveChannel";
 import { useCountUp } from "../../hooks/useCountUp";
-import { useFleetRoster, useLiveMachines, useStaticFleetBeats } from "../../hooks/useLiveMachines";
+import { useFleetRoster, useLiveMachines } from "../../hooks/useLiveMachines";
+import { useFleetView } from "../../hooks/useFleetView";
 import { getSource, runsSrc, runsReachable } from "../../lib/source";
 import { useLiveSessionIds } from "../../hooks/useLiveSessionIds";
-import { machineUids, machPresent, machineNames, LIVE_WINDOW_MS } from "../../lib/flow";
+import { machineUids, machPresent, machineNames, isSelfMachine, LIVE_WINDOW_MS } from "../../lib/flow";
 import type { FleetMachinesLiveResponse } from "../../types/generated/FleetMachinesLiveResponse";
 import type { FleetDispatchesLiveResponse } from "../../types/generated/FleetDispatchesLiveResponse";
 import type { RunsResponse } from "../../types/generated/RunsResponse";
@@ -28,10 +29,10 @@ import { UtilityGlyph } from "../../components/UtilityGlyph";
 import { scopeStateOf } from "../../lib/scopeMorph";
 import { liveStateLabel, reasonForLine } from "../../lib/tokenRate";
 import { tokensOffMeter } from "./savings";
-import { buildFleetCardBase, withLiveReadings, busiestExecution, isStrictlyBusier, rosterOnlyEntries, rosterAliasFor, specUnknownLabel, cardFace, NO_SIGNAL_STAT, type CardSourcesAnswered } from "./cards";
+import { buildFleetCardBase, withLiveReadings, busiestExecution, isStrictlyBusier, specDimLabel, specLine, cardFace, NO_SIGNAL_STAT, type CardSourcesAnswered, type FleetCard } from "./cards";
 import { useLatch } from "../../hooks/useLatch";
 import { buildActivityTimeline, ACTIVITY_WINDOW_PRESETS, DEFAULT_ACTIVITY_WINDOW_MIN } from "./timeline";
-import type { MachineSpecsResponse } from "../../types/generated/MachineSpecsResponse";
+import { rowFacts, rowSpecs } from "./viewRows";
 import { runsForMachine } from "../runs/format";
 import { recordsAsOf, type NormRecord } from "../../lib/ingest";
 import { dispatchHash } from "../../lib/route";
@@ -109,6 +110,24 @@ function machineRunsHash(machineKey: string, runningSessionIds: string[]): strin
   if (runningSessionIds.length === 0) return null;
   if (runningSessionIds.length === 1) return dispatchHash(runningSessionIds[0], null);
   return machineDrillHash(machineKey);
+}
+
+/** The card's subtitle line: the hardware, then (on a desktop) what the peer
+ * lets this machine do; when the view could not read the machine, its typed
+ * status in the dim style. One line, so the card keeps its height. */
+function CardSpec({ card }: { card: FleetCard }) {
+  return (
+    <div className="spec" title={specLine(card) || undefined}>
+      {card.spec ? (
+        <>
+          {card.spec}
+          {card.grant ? <span className="spec__grant"> · {card.grant}</span> : null}
+        </>
+      ) : (
+        <span className="specdim">{specDimLabel(card)}</span>
+      )}
+    </div>
+  );
 }
 
 /** `sc()` — viewer.html:1633. One token-class chip (value over label).
@@ -642,31 +661,17 @@ export function FleetLens({
   // signal anywhere that the read had failed, silently reproducing the
   // exact "machine vanishes" symptom #1855 exists to fix.
   const { machines: roster, error: rosterError } = useFleetRoster(livePolling);
-  // (#2067) A static build cannot poll presence, so its cards' hardware line
-  // comes from the committed fleet snapshot instead — spec lookup ONLY;
-  // presence at the playhead still derives from the records.
-  const staticBeats = useStaticFleetBeats();
-  const specBeats = getSource().kind === "static" ? staticBeats : liveMachines;
-  // `/machine/specs` is the THIRD live-only endpoint on this screen, and the
-  // one that got away in the first pass. It describes the hardware of the
-  // machine serving the page RIGHT NOW — `pollMachineSpecs` is the live-only
-  // 5s poll, and legacy states outright that "playback mode never starts that
-  // poll" (viewer.html:2696), leaving `MACHINE_SPECS` null so `specOf` returns
-  // "" and the card reads "hardware not reported". Rendering today's CPU and
-  // RAM against a replayed day is the same confidently-wrong claim as
-  // rendering today's presence.
-  //
-  // It also made the parity test genuinely FLAKY rather than merely wrong:
-  // whether the specs response landed before the assertion was a race, so a
-  // local run passed and CI failed on the identical commit. Gating it removes
-  // the race at its source — the request never happens — instead of waiting
-  // harder for a value that should not be read.
-  const specsQuery = useQuery({
-    enabled: livePolling,
-    queryKey: queryKeys.machineSpecs(),
-    queryFn: () => fetchJson<MachineSpecsResponse>("/machine/specs"),
-  });
-  const specs = livePolling && specsQuery.data?.ok ? specsQuery.data.data : null;
+  // The fleet view (`GET /fleet/view`, or a static build's committed
+  // snapshot of it): the machine list, and for each machine its card, its
+  // liveness and what it lets this machine do. A replay never asks (a view
+  // describes now); the machine serving the page is the row that says so, and
+  // its card's specs are the self identity the naming and key rules read.
+  const fleetView = useFleetView(liveMode);
+  const viewRows = fleetView.rows;
+  const specs = useMemo(() => {
+    const self = viewRows?.find((r) => r.is_this_machine);
+    return self ? rowSpecs(self) : null;
+  }, [viewRows]);
 
   // (#1923) `GET /runs` — already fleet-aware, already unions lab + flow
   // sources server-side (`build_runs`) — read here ONLY to fill the gap
@@ -741,9 +746,9 @@ export function FleetLens({
   const presenceAnswered = useLatch(!livePolling || presenceState.status !== "pending");
   const sessionsAnswered = useLatch(!livePolling || sessionsState.status !== "pending");
   const runsAnswered = useLatch(!(liveMode && runsReachable()) || runsQuery.status !== "pending");
-  // `/machine/specs` is live-only (see `specsQuery`); a replay has no self
-  // identity to wait for.
-  const specsAnswered = useLatch(!livePolling || specsQuery.status !== "pending");
+  // The view says who is up for every machine it holds, so "offline" waits on
+  // it as well as on presence.
+  const viewAnswered = useLatch(fleetView.answered);
   // (#2965) A failed flow read settles the window with no records, which
   // is what a quiet window looks like: the flow source has not answered
   // while its read is failing, so the claims it backs hold "no signal".
@@ -751,8 +756,8 @@ export function FleetLens({
   // midnight rollover: a new day's PENDING key is not a failure.
   const flowKnown = flowAnswered && flowWindow.failure === null;
   const answered = useMemo<CardSourcesAnswered>(
-    () => ({ flow: flowKnown, presence: presenceAnswered, sessions: sessionsAnswered, runs: runsAnswered, specs: specsAnswered }),
-    [flowKnown, presenceAnswered, sessionsAnswered, runsAnswered, specsAnswered],
+    () => ({ flow: flowKnown, presence: presenceAnswered && viewAnswered, sessions: sessionsAnswered, runs: runsAnswered }),
+    [flowKnown, presenceAnswered, viewAnswered, sessionsAnswered, runsAnswered],
   );
 
 
@@ -811,39 +816,32 @@ export function FleetLens({
   // playhead on a live day judges from records up to the playhead alone.
   const presence = judgementAt(playhead ?? null, playheadT, liveSessionIds).presence;
   const policy = useLifecyclePolicy();
-  // (#2814) SELF IS NEVER UNKNOWN — and before this, self could be ABSENT.
-  //
-  // `machineUids` unions flow-derived uids with currently-beating presence
-  // keys. Both are empty on a fresh install, on a machine whose Redis is off
-  // (presence self-disables — `darkmux-flow/src/presence.rs`), and on any
-  // machine whose last record has aged out of the retained window. The
-  // roster could not cover the gap either: `rosterOnlyEntries`' F1
-  // self-check correctly suppresses this machine's own entry as
-  // already-accounted-for, so in that state NOTHING accounted for it and the
-  // daemon answering the request rendered no card about itself at all.
-  //
-  // The uid the daemon probes for itself is not an observation and does not
-  // belong to the window, so it is appended unconditionally when specs
-  // report one. Deduped against the derived set, so the ordinary case — this
-  // machine has records, as it does whenever anything has run — is unchanged.
-  // No replay concern: `specs` is null unless `livePolling`.
+  // (#2814) SELF IS NEVER UNKNOWN. `machineUids` unions flow-derived uids
+  // with currently-beating presence keys, both empty on a machine whose
+  // Redis is off or whose last record aged out of the window. The uid the
+  // daemon reports for itself is not an observation and does not belong to
+  // the window, so it is appended when the view's self row carries one.
+  // Deduped against the derived set. `specs` is null in a replay.
   const uids = useMemo(() => {
     const derived = machineUids(flowWindow.data, liveMachines);
     const selfUid = specs?.machine_uid;
     return selfUid && !derived.includes(selfUid) ? [...derived, selfUid] : derived;
   }, [flowWindow.data, liveMachines, specs]);
-  // (#1855) The roster entries with NO known identity anywhere in this
-  // window — not beating, no flow history under this name either, not this
-  // machine's own `/machine/specs` identity, not a normalized near-miss of
-  // any of those. See `rosterOnlyEntries`'s own doc (F1/F2 in its comment)
-  // for why `specs` has to be threaded through here: it is the one
-  // confirmed-local identity that survives a quiet flow window with no
-  // beats, which is exactly the state a Redis-off self-machine card can be
-  // rendered in.
-  const rosterOnly = useMemo(
-    () => rosterOnlyEntries(flowWindow.data, liveMachines, roster, specs),
-    [flowWindow.data, liveMachines, roster, specs],
-  );
+  // The machine list. Every row of the view is a card, whether or not
+  // anything was ever recorded about it: a peer with Redis off, a machine
+  // down, a peer whose card could not be read. A machine the view does not
+  // hold (an unverified source, a beating machine nobody rostered, or every
+  // machine when there is no view: a replay, a failed read) is drawn from
+  // flow and presence alone.
+  const viewCards = useMemo(() => {
+    const known = new Set(uids);
+    const selfUid = specs ? (uids.find((u) => isSelfMachine(flowWindow.data, liveMachines, specs, u)) ?? null) : null;
+    return (viewRows ?? []).map((row) => ({ row, facts: rowFacts(row, known, selfUid) }));
+  }, [viewRows, uids, specs, flowWindow.data, liveMachines]);
+  const flowOnlyUids = useMemo(() => {
+    const covered = new Set(viewCards.flatMap(({ row, facts }) => [facts.uid, row.machine_uid ?? facts.uid]));
+    return uids.filter((m) => !covered.has(m));
+  }, [viewCards, uids]);
   // (#2929) What a card's link names its machine by: the key the runs board
   // resolves back from the same window, beats, specs and roster.
   const machineKeyCtx = useMemo(
@@ -860,8 +858,27 @@ export function FleetLens({
   // window. A replay keys the base on the playhead itself.
   const baseCards = useMemo(
     () => [
-      ...uids.map((m) => {
-        const card = buildFleetCardBase(
+      ...viewCards.map(({ facts }) =>
+        buildFleetCardBase(
+          flowWindow.data,
+          liveMachines,
+          specs,
+          presence,
+          false,
+          facts.uid,
+          liveMode,
+          playheadT,
+          facts,
+          // (#1923) `Run.machine` carries only a display NAME
+          // (`runsForMachine`'s own doc): the machine's aliases, plus the
+          // name the view gives it.
+          runsForMachine(runs, new Set([...machineNames(flowWindow.data, liveMachines, facts.uid), ...(facts.name ? [facts.name] : [])])),
+          roster,
+          policy,
+        ),
+      ),
+      ...flowOnlyUids.map((m) =>
+        buildFleetCardBase(
           flowWindow.data,
           liveMachines,
           specs,
@@ -870,59 +887,15 @@ export function FleetLens({
           m,
           liveMode,
           playheadT,
-          specBeats,
-          // (#1923) `machineNames`, not a bare uid match — `Run.machine`
-          // carries only a display NAME (`runsForMachine`'s own doc), same
-          // alias-set lookup `specOf`/`nameOf` already use for this uid.
+          null,
           runsForMachine(runs, machineNames(flowWindow.data, liveMachines, m)),
           roster,
           policy,
-        );
-        // (#2768, corrected by the #2802 regression fix) A roster entry
-        // whose declared hardware identity matches this uid still prevents a
-        // SECOND card — that is `rosterOnlyEntries` below — but it no longer
-        // overrides this card's TITLE. The machine's own name wins; the
-        // operator's alias rides along as secondary text. See
-        // `rosterAliasFor` for why.
-        const rosterAlias = rosterAliasFor(m, roster, card.name);
-        return rosterAlias ? { ...card, rosterAlias } : card;
-      }),
-      // (#1855) A rostered entry with no known identity is, by definition,
-      // not currently beating — `machAbsent` is forced `true` rather than
-      // derived through `machPresent` (which would answer `null`/"unknown"
-      // for a uid it has never heard of, not `false`/"absent"). Forcing it
-      // is what renders these on the SAME "offline" stat/CSS branch a
-      // machine that WAS seen and has since gone quiet already uses — the
-      // shared indicator this project's "no snowflakes" rule asks for,
-      // rather than a new vocabulary for "silent". `entry.id` doubles as
-      // the card's `uid`: a roster entry carries no hardware uid (it is
-      // declared before the machine has ever proven one), and `id` is
-      // already the identity `specOf` falls back to for an unknown `m`.
-      // (#2921) Its TITLE is the roster id, set here: `nameOf` no longer
-      // echoes an unknown `m` back (that echo was how a raw hardware uid
-      // reached a card title), so the operator's declared name is passed
-      // explicitly rather than inherited from the fallback.
-      ...rosterOnly.map((entry) => ({
-        ...buildFleetCardBase(
-          flowWindow.data,
-          liveMachines,
-          specs,
-          presence,
-          /* machAbsent */ true,
-          entry.id,
-          liveMode,
-          playheadT,
-          specBeats,
-          undefined,
-          undefined,
-          policy,
         ),
-        name: entry.id,
-        rosterOnly: true,
-      })),
+      ),
     ],
     // eslint-disable-next-line react-hooks/exhaustive-deps -- `playheadT` is read through `liveEdgeClock` on purpose (#2928, above).
-    [uids, rosterOnly, flowWindow.data, liveEdgeClock, liveMachines, specs, presence, liveMode, specBeats, runs, roster, policy],
+    [viewCards, flowOnlyUids, flowWindow.data, liveEdgeClock, liveMachines, specs, presence, liveMode, runs, roster, policy],
   );
   const cards = useMemo(
     () => baseCards.map((b) => withLiveReadings(b, playheadT, connected, lastContactMs, liveOverlay)),
@@ -1126,13 +1099,7 @@ export function FleetLens({
                 cards this issue made visible in the first place). The
                 wording lives in `cards.ts::specUnknownLabel` so the card and
                 its tests read the same string. */}
-            <div className="spec" title={card.spec || undefined}>
-              {card.spec ? (
-                card.spec
-              ) : (
-                <span className="specdim">{specUnknownLabel(card.specUnknown ?? "not-reported")}</span>
-              )}
-            </div>
+            <CardSpec card={card} />
             {/* (#2877) Status, rate and running count on the left; while the
                 machine generates, the scope sits to their right at the
                 concept's card size, spanning those rows, so the card does
