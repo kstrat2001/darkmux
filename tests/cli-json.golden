@@ -1120,7 +1120,7 @@ ToolPalette
   deny: string[]
 UidSource = "card" | "declared" | "flow_history" | "unknown"
 UnavailableWhy = "no_card_route" | "other_schema_major" | "unparseable" | "unknown"
-UnreachableReason = "bad_address" | "dns_failed" | "identity_unavailable" | "not_on_overlay" | "pin_mismatch" | "listener_off" | "auth_required" | "refused_by_peer" | "listener_unavailable" | "bad_answer" | "unknown"
+UnreachableReason = "bad_address" | "dns_failed" | "identity_unavailable" | "not_on_overlay" | "pin_mismatch" | "pin_not_saved" | "listener_off" | "auth_required" | "refused_by_peer" | "listener_unavailable" | "bad_answer" | "unknown"
 UsageGroup
   endpoint?: string | null
   requested_model?: string | null
