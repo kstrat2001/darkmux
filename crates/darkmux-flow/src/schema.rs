@@ -636,7 +636,7 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
 //   1.50.0 (#2705, #2706): battery. THREE additive changes, all MINOR:
 //
 //           * `machine.telemetry`'s payload gains a `battery` object —
-//             `{charge_pct, on_ac, charging, minutes_to_empty}`, or `null`
+//             `{charge_pct, on_ac, state, minutes_to_empty}`, or `null`
 //             on a machine with no battery. It rides `sample_full_json`,
 //             so `/machine/resources`' `load.now` block carries the same
 //             shape from the same producer. `minutes_to_empty` is `null`

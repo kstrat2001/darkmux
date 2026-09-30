@@ -49,6 +49,7 @@ pub mod thermal;
 pub mod wire;
 
 pub use battery::{BatteryHealth, BatterySample};
+pub use darkmux_flow::payload::ChargeState;
 pub use thermal::ThermalSample;
 
 // Only used by `attach_cluster_mhz` and its direct unit tests, both

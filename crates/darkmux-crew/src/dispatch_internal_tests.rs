@@ -15728,6 +15728,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
                 charge_pct: 64,
                 on_ac: false,
                 charging: false,
+                state: darkmux_flow::payload::ChargeState::Discharging,
                 minutes_to_empty: Some(121),
             }),
         };

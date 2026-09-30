@@ -52,7 +52,7 @@ pub use lifecycle::{
     ReviewVerdict, RunPayload, SeatClass, StepResultPayload, StepSeatUnresolvedPayload, StepStartPayload, StepTimingPayload,
 };
 pub use machine::{
-    BatteryCharge, BatteryHealthNow, BatteryTransition, CpuClusterNow, HostSampleNow, LoadWindow, MachineBatteryHealthPayload,
+    BatteryCharge, BatteryHealthNow, ChargeState, BatteryTransition, CpuClusterNow, HostSampleNow, LoadWindow, MachineBatteryHealthPayload,
     MachineBatteryPayload, MachineLoad, MachineRollupPayload, MachineTelemetryPayload, MachineThermalPayload, MetricWindow,
     PowerNow, PowerWindowWire, ThermalNow, ThermalWindowWire,
 };

@@ -179,6 +179,12 @@ pub struct ScriptedBattery {
     pub on_ac: bool,
     #[serde(default)]
     pub charging: bool,
+    /// IOPS `Is Charged`; absent means the source did not say.
+    #[serde(default)]
+    pub fully_charged: Option<bool>,
+    /// IOPS `Current` in milliamps, signed; absent means the source did not say.
+    #[serde(default)]
+    pub current_ma: Option<i64>,
     #[serde(default)]
     pub minutes_to_empty: Option<u32>,
 }
@@ -217,6 +223,7 @@ impl ScenarioFrame {
                 charge_pct: b.charge_pct,
                 on_ac: b.on_ac,
                 charging: b.charging,
+                state: battery::charge_state_from(b.on_ac, b.charging, b.fully_charged, b.current_ma),
                 minutes_to_empty: b.minutes_to_empty,
             }),
         }

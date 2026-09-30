@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   batteryAriaLabel,
   batteryFillWidth,
+  batteryHeldExplanation,
+  batteryHeldTitle,
   batteryIcon,
   batteryRampStops,
   batteryStateText,
@@ -15,7 +17,7 @@ import type { BatteryHealthNow } from "../types/generated/BatteryHealthNow";
 import type { BatteryCharge } from "../types/generated/BatteryCharge";
 
 function sample(over: Partial<BatteryCharge> = {}): BatteryCharge {
-  return { charge_pct: 78, on_ac: false, charging: false, minutes_to_empty: 130, ...over };
+  return { charge_pct: 78, on_ac: false, state: "discharging", minutes_to_empty: 130, ...over };
 }
 
 function health(over: Partial<BatteryHealthNow> = {}): BatteryHealthNow {
@@ -44,22 +46,48 @@ function health(over: Partial<BatteryHealthNow> = {}): BatteryHealthNow {
 //    that state has to say instead. ─────────────────────────────────────
 describe("batteryIcon", () => {
   it("bolt while charging (current actually flowing)", () => {
-    expect(batteryIcon(sample({ on_ac: true, charging: true }))).toBe("bolt");
+    expect(batteryIcon(sample({ on_ac: true, state: "charging" }))).toBe("bolt");
   });
   it("plug when on AC but NOT charging — topped off/held, never a false bolt", () => {
-    expect(batteryIcon(sample({ on_ac: true, charging: false }))).toBe("plug");
+    expect(batteryIcon(sample({ on_ac: true, state: "unknown" }))).toBe("plug");
   });
   it("no icon while discharging", () => {
-    expect(batteryIcon(sample({ on_ac: false, charging: false }))).toBeNull();
+    expect(batteryIcon(sample({ on_ac: false }))).toBeNull();
+  });
+});
+
+describe("held state (macOS holding the charge level)", () => {
+  const held = sample({ charge_pct: 80, on_ac: true, state: "held", minutes_to_empty: null });
+
+  it("names the held level in the tooltip, and never states a limit it did not observe", () => {
+    expect(batteryHeldTitle(held)).toBe("Held at 80% by macOS (charge limit): plugged in, not charging");
+  });
+  it("the (i) explanation states the level, that the hold is deliberate, and that it is not draining", () => {
+    expect(batteryHeldExplanation(held)).toBe(
+      "Held at 80% by macOS's charge limit. It is plugged in and not charging on purpose, which protects the battery. It is not draining.",
+    );
+    expect(batteryHeldExplanation(sample({ on_ac: true, state: "full" }))).toBeNull();
+  });
+  it("is null for every other state, so nothing claims a hold it did not see", () => {
+    for (const state of ["charging", "discharging", "full", "unknown"] as const) {
+      expect(batteryHeldTitle(sample({ on_ac: true, state }))).toBeNull();
+    }
+  });
+  it("the accessible name says held, and keeps the plug icon", () => {
+    expect(batteryAriaLabel(held)).toBe("battery 80%, held at 80% by macOS, on AC, not charging");
+    expect(batteryIcon(held)).toBe("plug");
+  });
+  it("an on-AC reading that is not held keeps the old wording", () => {
+    expect(batteryStateText(sample({ on_ac: true, state: "unknown" }))).toBe("on AC, not charging");
   });
 });
 
 describe("batteryStateText", () => {
   it('"charging" while current is flowing', () => {
-    expect(batteryStateText(sample({ on_ac: true, charging: true }))).toBe("charging");
+    expect(batteryStateText(sample({ on_ac: true, state: "charging" }))).toBe("charging");
   });
   it('"on AC, not charging" when connected but topped off', () => {
-    expect(batteryStateText(sample({ on_ac: true, charging: false }))).toBe("on AC, not charging");
+    expect(batteryStateText(sample({ on_ac: true, state: "unknown" }))).toBe("on AC, not charging");
   });
   it('"on battery, H h M m left" while discharging with an estimate', () => {
     expect(batteryStateText(sample({ on_ac: false, minutes_to_empty: 130 }))).toBe("on battery, 2 h 10 m left");
@@ -71,8 +99,8 @@ describe("batteryStateText", () => {
 
 describe("batteryTimeLeftText — the ONLY visible power-state text left (icon carries the rest)", () => {
   it("is null on AC, charging or not — the icon carries that state now", () => {
-    expect(batteryTimeLeftText(sample({ on_ac: true, charging: true }))).toBeNull();
-    expect(batteryTimeLeftText(sample({ on_ac: true, charging: false }))).toBeNull();
+    expect(batteryTimeLeftText(sample({ on_ac: true, state: "charging" }))).toBeNull();
+    expect(batteryTimeLeftText(sample({ on_ac: true, state: "unknown" }))).toBeNull();
   });
   it("reads the time-left estimate while discharging", () => {
     expect(batteryTimeLeftText(sample({ on_ac: false, minutes_to_empty: 130 }))).toBe("2 h 10 m left");
@@ -166,12 +194,12 @@ describe("fmtOperatingHours", () => {
 
 describe("batteryAriaLabel", () => {
   it("states percent, on AC, not charging", () => {
-    expect(batteryAriaLabel(sample({ charge_pct: 100, on_ac: true, charging: false }))).toBe(
+    expect(batteryAriaLabel(sample({ charge_pct: 100, on_ac: true, state: "unknown" }))).toBe(
       "battery 100%, on AC, not charging",
     );
   });
   it("states percent and charging", () => {
-    expect(batteryAriaLabel(sample({ charge_pct: 62, on_ac: true, charging: true }))).toBe("battery 62%, charging");
+    expect(batteryAriaLabel(sample({ charge_pct: 62, on_ac: true, state: "charging" }))).toBe("battery 62%, charging");
   });
   it("states percent, on battery, and a time-left estimate while discharging", () => {
     expect(batteryAriaLabel(sample({ charge_pct: 35, on_ac: false, minutes_to_empty: 130 }))).toBe(
@@ -212,16 +240,20 @@ describe("batteryRampStops — the REVERSED ramp (red empty -> green full)", () 
     expect(stops[stops.length - 1].color).toBe(gaugeFillColor(0)); // green
   });
 
-  it("each stop is gaugeFillColor at the MIRRORED percent — same palette as every other dial, opposite direction", () => {
-    const stops = batteryRampStops(8);
-    stops.forEach((s, i) => {
-      const t = i / 8;
-      expect(s.color).toBe(gaugeFillColor((1 - t) * 100));
-    });
-    // The midpoint (50% full) reproduces the palette's own amber, same as
-    // it would at the dial's own 50% — the ramp is mirrored, not a
-    // different palette.
-    expect(stops[4].color).toBe(gaugeFillColor(50));
+  it("red is confined to the low end: fully green from 50% up, amber at a quarter", () => {
+    const stops = batteryRampStops(20); // a stop every 5%
+    const at = (pct: number) => stops[pct / 5].color;
+    expect(at(0)).toBe(gaugeFillColor(100)); // red
+    expect(at(25)).toBe(gaugeFillColor(50)); // the palette's amber
+    for (const pct of [50, 80, 100]) expect(at(pct), `${pct}%`).toBe(gaugeFillColor(0)); // green
+  });
+
+  it("the color at a level moves monotonically toward green up to 50%, never back", () => {
+    const stops = batteryRampStops(20);
+    const seen = new Set<string>();
+    for (const pct of [10, 25, 50]) seen.add(stops[pct / 5].color);
+    expect(seen.size).toBe(3);
+    expect(stops[10].color).not.toBe(stops[4].color); // 50% differs from 20%
   });
 
   it("offsets are evenly (linearly) spaced, unlike the arc's cosine-spaced stops — the bar is a straight rectangle", () => {

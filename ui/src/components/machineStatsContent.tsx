@@ -35,7 +35,9 @@
  * renders its OWN top-level element would force an extra wrapper div into
  * both call sites for no reason.
  */
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { InfoGlyph } from "./InfoGlyph";
+import { PowerGlyph } from "./PowerGlyph";
+import { useEffect, useId, useMemo, useState, type ReactNode } from "react";
 import {
   Meter,
   compactMeterProps,
@@ -66,6 +68,8 @@ import type { PresenceBeat } from "../types/generated/PresenceBeat";
 import {
   batteryAriaLabel,
   batteryFillWidth,
+  batteryHeldExplanation,
+  batteryHeldTitle,
   batteryIcon,
   batteryRampStops,
   batteryTimeLeftText,
@@ -450,7 +454,6 @@ const BATTERY_FILL_MAX_W = BATTERY_BODY_W - BATTERY_FILL_INSET * 2;
 const BATTERY_FILL_H = BATTERY_BODY_H - BATTERY_FILL_INSET * 2;
 const BATTERY_FILL_RX = 2;
 const BATTERY_ICON_CX = BATTERY_BODY_X + BATTERY_BODY_W / 2;
-const BATTERY_ICON_CY = BATTERY_BODY_Y + BATTERY_BODY_H / 2 + 4;
 
 /** The battery-shaped bar (operator, 2026-09-23/24 — the full arc of this
  * surface's own history):
@@ -485,10 +488,51 @@ const BATTERY_ICON_CY = BATTERY_BODY_Y + BATTERY_BODY_H / 2 + 4;
  *    against any color the gradient happens to show underneath it, and a
  *    `<title>` for mouse hover; the outer `<svg>`'s `aria-label`
  *    (`batteryAriaLabel`) states the same fact in words for a screen
- *    reader, which never sees the decorative (`aria-hidden`) glyph. */
+ *    reader, which never sees the decorative (`aria-hidden`) glyph.
+ * 5. (operator, 2026-09-30: "the charge limit could be shown on the
+ *    battery graphic") A `held` reading (macOS holding the level: on AC,
+ *    not charging, not full) also draws a thin marker at the fill's end
+ *    (`.battery-bar-hold`) and a short "held" label after the percent.
+ *    Both sit inside the existing rows: the glyph's viewBox and the row's
+ *    height are unchanged. */
+/** The `(i)` button after the HELD label: the same `.mm-odo-i` glyph the health region uses.
+ * Opens on hover, focus and tap; Escape or leaving closes it. The explanation floats over the
+ * row (`.battery-held-tip` is out of flow), so the row keeps its size. */
+function HeldInfo({ text }: { text: string }) {
+  const [open, setOpen] = useState(false);
+  const id = useId();
+  return (
+    <span className="battery-held-info" onMouseEnter={() => setOpen(true)} onMouseLeave={() => setOpen(false)}>
+      <button
+        type="button"
+        className="mm-odo-i"
+        aria-label="what held means"
+        aria-expanded={open}
+        aria-describedby={open ? id : undefined}
+        onClick={() => setOpen((o) => !o)}
+        onFocus={() => setOpen(true)}
+        onBlur={() => setOpen(false)}
+        onKeyDown={(e) => {
+          if (e.key === "Escape") setOpen(false);
+        }}
+      >
+        <InfoGlyph />
+      </button>
+      {open && (
+        <span id={id} role="tooltip" className="battery-held-tip">
+          {text}
+        </span>
+      )}
+    </span>
+  );
+}
+
 function BatteryBar({ sample }: { sample: BatteryCharge }) {
   const fillW = batteryFillWidth(sample.charge_pct, BATTERY_FILL_MAX_W);
   const icon = batteryIcon(sample);
+  const heldTitle = batteryHeldTitle(sample);
+  const heldExplanation = batteryHeldExplanation(sample);
+  const holdX = BATTERY_FILL_X + (fillW ?? 0);
   return (
     <div className="battery-bar-row">
       <svg
@@ -524,18 +568,24 @@ function BatteryBar({ sample }: { sample: BatteryCharge }) {
             rx={BATTERY_FILL_RX}
           />
         )}
-        {icon && (
-          <text className="battery-bar-icon" x={BATTERY_ICON_CX} y={BATTERY_ICON_CY} textAnchor="middle" aria-hidden="true">
-            <title>{icon === "bolt" ? "charging" : "on AC"}</title>
-            {icon === "bolt" ? "⚡" : "🔌"}
-          </text>
+        {heldTitle && fillW != null && (
+          <line className="battery-bar-hold" x1={holdX} x2={holdX} y1={BATTERY_BODY_Y + 2} y2={BATTERY_BODY_Y + BATTERY_BODY_H - 2}>
+            <title>{heldTitle}</title>
+          </line>
         )}
+        {icon && <PowerGlyph kind={icon} cx={BATTERY_ICON_CX} cy={BATTERY_BODY_Y + BATTERY_BODY_H / 2} />}
       </svg>
       {/* (#2878) Counts up/down to a new reading rather than snapping —
           the same `useCountUp` mechanism every other live readout on this
           page uses, formatted with the SAME `fmtPct` this span always
           used. */}
       <span className="battery-bar-pct">{useCountUp(sample.charge_pct, fmtPct)}</span>
+      {heldTitle && (
+        <span className="battery-bar-held" title={heldTitle}>
+          held
+        </span>
+      )}
+      {heldExplanation && <HeldInfo text={heldExplanation} />}
     </div>
   );
 }

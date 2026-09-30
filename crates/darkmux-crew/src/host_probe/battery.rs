@@ -80,6 +80,8 @@
 //! cycle count means. #2706's gate is the one action taken on any of it,
 //! and it enforces a threshold the OPERATOR wrote.
 
+use darkmux_flow::payload::ChargeState;
+
 /// The IORegistry class every Mac laptop's battery publishes, and no
 /// desktop does. Absence of this node is exactly "this machine has no
 /// battery" — not an error, not a zero.
@@ -112,6 +114,42 @@ pub const TIME_ESTIMATE_UNAVAILABLE: i64 = 65535;
 /// match the last one emits nothing.
 pub const HEALTH_POLL_INTERVAL_MS: u64 = 60 * 60 * 1000;
 
+/// The charging state, derived in one place from the facts a reading observed.
+///
+/// `fully_charged` is IOPS's `Is Charged`; `current_ma` is IOPS's signed `Current`. Both are
+/// optional because a source can decline to publish either, and a missing fact must never be
+/// promoted to a state:
+///
+/// - not on AC: `Discharging`;
+/// - charging: `Charging`;
+/// - on AC, reported full: `Full`;
+/// - on AC, not charging, reported NOT full, current within [`HELD_CURRENT_TOLERANCE_MA`] of zero:
+///   `Held`, macOS holding the level;
+/// - anything else, including any missing fact those arms need: `Unknown`.
+pub fn charge_state_from(
+    on_ac: bool,
+    charging: bool,
+    fully_charged: Option<bool>,
+    current_ma: Option<i64>,
+) -> ChargeState {
+    if !on_ac {
+        return ChargeState::Discharging;
+    }
+    if charging {
+        return ChargeState::Charging;
+    }
+    match (fully_charged, current_ma) {
+        (Some(true), _) => ChargeState::Full,
+        (Some(false), Some(ma)) if ma.abs() <= HELD_CURRENT_TOLERANCE_MA => ChargeState::Held,
+        _ => ChargeState::Unknown,
+    }
+}
+
+/// How far from zero milliamps the pack's current may read and still count as "no current".
+/// A tolerance for gauge noise, not an Apple-documented figure. A reading outside it is
+/// `Unknown`, never `Held`.
+pub const HELD_CURRENT_TOLERANCE_MA: i64 = 10;
+
 /// One CHARGE reading — the fast half, sampled on the host-telemetry
 /// cadence beside CPU and thermal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +167,8 @@ pub struct BatterySample {
     pub on_ac: bool,
     /// `IsCharging` — current is actually flowing into the pack.
     pub charging: bool,
+    /// See [`charge_state_from`].
+    pub state: ChargeState,
     /// Minutes until empty, when the OS supplies an estimate.
     ///
     /// **`None` is the common case, and is not a failure**: absent on AC
@@ -392,6 +432,8 @@ mod imp {
     const K_CURRENT_CAPACITY: &str = "Current Capacity";
     const K_MAX_CAPACITY: &str = "Max Capacity";
     const K_IS_CHARGING: &str = "Is Charging";
+    const K_IS_CHARGED: &str = "Is Charged";
+    const K_CURRENT: &str = "Current";
     const K_POWER_SOURCE_STATE: &str = "Power Source State";
     const K_TIME_TO_EMPTY: &str = "Time to Empty";
     /// `kIOPSACPowerValue` — the `Power Source State` string for "a charger
@@ -471,6 +513,12 @@ mod imp {
                     charge_pct,
                     on_ac,
                     charging,
+                    state: super::charge_state_from(
+                        on_ac,
+                        charging,
+                        iokit::dict_bool(desc, K_IS_CHARGED),
+                        iokit::dict_i64(desc, K_CURRENT),
+                    ),
                     // IOPS reports `-1` while the estimator has not
                     // settled, where `AppleSmartBattery` reports 65535 —
                     // `minutes_to_empty_from` rejects BOTH (`v <= 0` and
@@ -583,6 +631,30 @@ pub fn health() -> Option<BatteryHealth> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn charge_state_table() {
+        use ChargeState::*;
+        // (on_ac, charging, fully_charged, current_ma, expected)
+        type Row = (bool, bool, Option<bool>, Option<i64>, ChargeState);
+        let table: [Row; 10] = [
+            // the reported case: AC, not charging, not full, zero current
+            (true, false, Some(false), Some(0), Held),
+            (true, false, Some(false), Some(-10), Held),
+            (true, true, Some(false), Some(1500), Charging),
+            (false, false, Some(false), Some(-900), Discharging),
+            (true, false, Some(true), Some(0), Full),
+            // missing or contradicting facts never become `Held`
+            (true, false, None, Some(0), Unknown),
+            (true, false, Some(false), None, Unknown),
+            (true, false, Some(false), Some(-800), Unknown),
+            (true, false, Some(false), Some(11), Unknown),
+            (true, false, None, None, Unknown),
+        ];
+        for (ac, ch, full, ma, want) in table {
+            assert_eq!(charge_state_from(ac, ch, full, ma), want, "ac={ac} charging={ch} full={full:?} ma={ma:?}");
+        }
+    }
 
     #[test]
     fn charge_percent_is_the_ratio_so_it_works_on_both_architectures() {
