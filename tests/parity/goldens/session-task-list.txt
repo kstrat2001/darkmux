@@ -20,7 +20,7 @@ task-list
 === stage ===
 COMPLETE LIST-STEP (task-list on MacBook-Pro)
 route
-LMStudio · local · MacBook-Pro
+LMStudio · local · this machine
 timing
 01:28:40 → 01:28:42 (0:02)
 0:02
