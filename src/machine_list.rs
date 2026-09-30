@@ -280,6 +280,86 @@ fn remedies(view: &FleetView) -> Vec<String> {
     out
 }
 
+/// The view every fleet reader here uses: the one this machine's own daemon
+/// gathered when it answers, else one gathered in this process. The single
+/// place that choice is made.
+pub(crate) fn local_fleet_view() -> FleetView {
+    darkmux_serve::fleet_view::fetch_local_daemon_view(&darkmux_types::config_access::serve_client_addr())
+        .unwrap_or_else(darkmux_serve::fleet_view::gather_fleet_view_now)
+}
+
+/// The most a machine's profiles, loaded models or granted lists show in the
+/// grounding block before "and N more".
+const GROUNDING_LIST_MAX: usize = 12;
+
+fn capped_list(items: &[String]) -> String {
+    match items.len() {
+        0 => "none".to_string(),
+        n if n <= GROUNDING_LIST_MAX => items.join(", "),
+        n => format!("{}, and {} more", items[..GROUNDING_LIST_MAX].join(", "), n - GROUNDING_LIST_MAX),
+    }
+}
+
+fn liveness_words(l: Liveness) -> &'static str {
+    match l {
+        Liveness::Live => "live",
+        Liveness::NoBeat => "no beat seen",
+        Liveness::Unknown => "unknown",
+    }
+}
+
+/// What the card outcome says, in one clause a model can quote.
+fn card_words(outcome: &CardOutcome) -> String {
+    match outcome {
+        CardOutcome::Available { .. } => "card read".to_string(),
+        CardOutcome::Unavailable { why, peer_version, peer_version_source } => {
+            unavailable_phrase(*why, &peer_words(peer_version.as_deref(), *peer_version_source))
+        }
+        CardOutcome::Mismatch { .. } => "answered as another machine; its card was not used".to_string(),
+        CardOutcome::Unreachable { reason, .. } => unreachable_phrase(*reason, None),
+        CardOutcome::Unknown => "an answer this darkmux does not know".to_string(),
+    }
+}
+
+/// One machine's lines in the grounding block. Never a machine uid, a node
+/// name, an address or a token: only what the card states and what the user
+/// can act on.
+fn grounding_lines(view: &FleetView, m: &FleetMachine) -> Vec<String> {
+    let name = row_name(view, m);
+    let here = if m.is_this_machine { " (this machine)" } else { "" };
+    let mut lines = vec![format!("- {name}{here}: liveness {}; {}", liveness_words(m.liveness), card_words(&m.card))];
+    if let CardOutcome::Available { card, .. } = &m.card {
+        let loaded: Vec<String> = card.specs.loaded_models.iter().map(|x| x.identifier.clone()).collect();
+        lines.push(format!("  loaded models: {}", capped_list(&loaded)));
+        lines.push(format!("  {}", profiles_line(card)));
+    }
+    if let Some(phrase) = accepts_phrase(&m.accepts) {
+        lines.push(format!("  {phrase}"));
+    }
+    lines
+}
+
+/// The "fleet" section of radio's grounding: every machine the view lists,
+/// from the same [`FleetView`] the daemon serves. Each darkmux term is
+/// defined once, before its first use, for a model with no darkmux history.
+pub(crate) fn render_grounding(view: &FleetView) -> String {
+    let mut out = String::from(
+        "A fleet is the user's own machines that run darkmux together. Each line below is one machine, \
+         from the card that machine states about itself. \"liveness\" is whether the machine sent a recent \
+         presence beat (\"no beat seen\" is not proof it is down). A profile is a named model setup; \
+         \"managed\" means the machine loads and serves the model itself, \"unmanaged\" means it only sends \
+         requests to a hosted endpoint. \"accepts from this machine\" is what that machine lets the user's \
+         work started here run on it.\n",
+    );
+    for m in &view.machines {
+        for line in grounding_lines(view, m) {
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 /// The whole text view.
 pub(crate) fn render_text(view: &FleetView, roster_path: &str) -> String {
     let mut out = String::new();
@@ -424,6 +504,42 @@ mod tests {
         m.entry = None;
         m.is_this_machine = true;
         m
+    }
+
+    /// The grounding block carries what a question about the fleet needs (who
+    /// is live, what is loaded, profiles with their endpoint kind, what this
+    /// machine may run there) and none of what must never reach a model:
+    /// uids, addresses, transport detail.
+    #[test]
+    fn the_grounding_block_answers_fleet_questions_and_leaks_no_identity() {
+        let granted = AcceptsState::Granted {
+            accepts: darkmux_serve::machine_card::CardAccepts {
+                peer_name: "laptop".into(),
+                profiles: vec!["deep".into()],
+                roles: vec!["diff-review".into()],
+                images: vec![],
+                workspace: false,
+            },
+        };
+        let mut studio = with_accepts(machine("studio", Liveness::Live, read(card("5.0.0"))), granted);
+        studio.machine_uid = Some("00000000-0000-4000-8000-ABCDEF000001".into());
+        let mini = unreachable("mini", UnreachableReason::ListenerOff, Some("connect to 100.64.0.9:8765 refused"));
+        let out = render_grounding(&view(vec![own_row(), studio, mini]));
+
+        for want in [
+            "- studio: liveness live; card read",
+            "loaded models: darkmux:qwen",
+            "profiles: deep (managed), cloud (unmanaged)",
+            "accepts from this machine: profiles deep; roles diff-review",
+            "- mini: liveness unknown; unreachable: its fleet listener did not answer",
+            "(this machine)",
+            "\"managed\" means the machine loads and serves the model itself",
+        ] {
+            assert!(out.contains(want), "{want} missing:\n{out}");
+        }
+        for banned in ["ABCDEF000001", "example.invalid", "100.64.0.9", "8765", "token", "Bearer"] {
+            assert!(!out.contains(banned), "{banned} leaked:\n{out}");
+        }
     }
 
     #[test]

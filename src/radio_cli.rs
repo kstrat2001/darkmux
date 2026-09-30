@@ -615,7 +615,7 @@ mod tests {
             reason: "studio does not accept work from laptop".into(),
         })
         .context("the answering seat `host@studio`");
-        let err = crate::radio_answer::answer("what is a profile?", &catalog(), &crate::radio_answer::ArtifactShelf::default(), std::path::Path::new("/tmp"), crate::radio_answer::GroundingScope::Full, radio::RadioSurface::Cli, &mut |_: &str, _| Err(anyhow::anyhow!("{seat:#}")))
+        let err = crate::radio_answer::answer("what is a profile?", &catalog(), &crate::radio_answer::ArtifactShelf::default(), std::path::Path::new("/tmp"), None, crate::radio_answer::GroundingScope::Full, radio::RadioSurface::Cli, &mut |_: &str, _| Err(anyhow::anyhow!("{seat:#}")))
             .unwrap_err();
         let out = answer_failure_output(&err, "Darkmux does not define profiles", &catalog());
         assert!(out.answer.contains("the answering seat was unavailable"), "{}", out.answer);

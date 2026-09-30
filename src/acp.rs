@@ -730,6 +730,13 @@ type ScopeCall = Arc<dyn Fn(&crate::radio_answer::AnswererOverrides) -> crate::r
 /// otherwise depend on the host's LM Studio.
 type BusyCall = Arc<dyn Fn(&crate::radio_answer::AnswererOverrides) -> Option<crate::radio_busy::BusyReport> + Send + Sync>;
 
+/// The FLEET seam: the "fleet" section of the answering seat's grounding.
+/// Production wires `radio_answer::fleet_grounding`, which reads the fleet
+/// view (this machine's daemon, else a gather in this process, both of which
+/// dial the roster's peers). Injectable for the same reason [`ScopeCall`]
+/// is: a wire test must not depend on the host's roster or network.
+type FleetCall = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
 /// The answering seat's injectable seams, carried together: the model
 /// call, the data-boundary decision that governs what may be put IN
 /// that call (#1698 Packet B2 gate), and (#2917) the busy check that
@@ -742,6 +749,7 @@ struct SeatCalls {
     call: AnswererCall,
     scope: ScopeCall,
     busy: BusyCall,
+    fleet: FleetCall,
 }
 
 /// Entry point for `darkmux acp`. Builds its own tokio runtime and blocks on
@@ -765,6 +773,7 @@ pub fn run() -> Result<i32> {
     );
     let scope: ScopeCall = Arc::new(crate::radio_answer::grounding_scope_for);
     let busy: BusyCall = Arc::new(crate::radio_busy::answering_seat_busy);
+    let fleet: FleetCall = Arc::new(crate::radio_answer::fleet_grounding);
     rt.block_on(async {
         // (#2476) Reap-on-signal for the whole long-lived host — see
         // `host_shutdown_reap_loop`'s own doc for why this exits the
@@ -773,7 +782,7 @@ pub fn run() -> Result<i32> {
         // FIX 2) for why it treats `mission launch` children differently
         // from every other registered dispatch child.
         tokio::spawn(host_shutdown_reap_loop(reap_on_host_shutdown));
-        serve(router, SeatCalls { call: answerer, scope, busy }, Arc::new(IdleState::new()), AcpStdio::new()).await
+        serve(router, SeatCalls { call: answerer, scope, busy, fleet }, Arc::new(IdleState::new()), AcpStdio::new()).await
     })?;
     Ok(0)
 }
@@ -1899,7 +1908,11 @@ async fn answer_no_slash_refusal(
     }
     let text_owned = text.to_string();
     let cwd_owned = cwd.to_path_buf();
+    let fleet_call = seat.fleet.clone();
     let outcome = tokio::task::spawn_blocking(move || {
+        // The fleet view dials peers, so it is read here on the blocking
+        // thread, and only for a seat that may be handed this machine's state.
+        let fleet = (scope == crate::radio_answer::GroundingScope::Full).then(|| fleet_call()).flatten();
         // A launch refusal that empties the catalog is already the reason
         // this turn is answering, so the answer is grounded on no commands.
         let catalog = crate::radio::compile_catalog().unwrap_or_default();
@@ -1908,6 +1921,7 @@ async fn answer_no_slash_refusal(
             &catalog,
             &shelf,
             &cwd_owned,
+            fleet.as_deref(),
             scope,
             crate::radio::RadioSurface::Panel,
             &mut |m: &str, boundary| (seat.call)(m, &overrides, boundary),
@@ -2935,13 +2949,14 @@ mod tests {
         // WIRE, not the data boundary — see `ScopeCall`'s own doc.
         let scope_call: ScopeCall = Arc::new(|_| crate::radio_answer::GroundingScope::Full);
         let busy_call: BusyCall = Arc::new(busy);
+        let fleet_call: FleetCall = Arc::new(|| None);
         let transport = ByteStreams::new(agent_writer.compat_write(), agent_reader.compat());
         let idle = Arc::new(IdleState::new());
         let idle_for_serve = idle.clone();
         tokio::spawn(async move {
             let _ = serve(
                 router_call,
-                SeatCalls { call: answerer_call, scope: scope_call, busy: busy_call },
+                SeatCalls { call: answerer_call, scope: scope_call, busy: busy_call, fleet: fleet_call },
                 idle_for_serve,
                 transport,
             )

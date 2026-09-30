@@ -208,6 +208,7 @@ pub fn run() -> DoctorReport {
         check_unreachable_darkmux_residents(),
         check_role_profiles(),
         check_radio_peer_seat(),
+        check_fleet_routes(),
         check_role_tool_vocab_typos(),
         check_beat33_legacy_crew_dir(),
         check_mission_state_files(),
@@ -2009,6 +2010,128 @@ fn radio_peer_seat_status(seats: &[(String, String)], known_machines: &std::coll
                 .into(),
         ),
     }
+}
+
+/// One role binding (or the radio seat) written as `<profile>@<machine>`: where
+/// it is written, the role that would run there, and the address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FleetRoute {
+    source: String,
+    role: String,
+    address: String,
+}
+
+/// The routes to ask a peer about: `radio.answerer_profile` (which runs the
+/// `radio-host` role) and every `role_profiles.<role>` value that is a
+/// well-formed `<profile>@<machine>` naming a machine other than `local`
+/// (an address naming this machine runs here, so there is no peer to ask).
+/// A bare profile name is the registry's, and a malformed address is
+/// `role_profiles`'s.
+fn fleet_routes(
+    answerer: Option<String>,
+    bindings: &std::collections::BTreeMap<String, String>,
+    local: Option<&str>,
+) -> Vec<FleetRoute> {
+    let written = answerer
+        .map(|a| ("radio.answerer_profile".to_string(), "radio-host".to_string(), a))
+        .into_iter()
+        .chain(bindings.iter().map(|(role, a)| (format!("role_profiles.{role}"), role.clone(), a.clone())));
+    written
+        .filter(|(_, _, address)| {
+            darkmux_types::profile_address::ProfileAddress::parse(address)
+                .ok()
+                .and_then(|a| a.machine)
+                .is_some_and(|m| !local.is_some_and(|l| darkmux_fleet::same_machine(l, &m)))
+        })
+        .map(|(source, role, address)| FleetRoute { source, role, address })
+        .collect()
+}
+
+/// A refusal code as its wire word (`not_listed`, `role_not_allowed`).
+fn refusal_word(code: darkmux_fleet::RefusalCode) -> String {
+    serde_json::to_value(code).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_else(|| "unknown".into())
+}
+
+/// What one route's check found, in a clause.
+fn route_finding(route: &FleetRoute, outcome: &darkmux_fleet::CheckOutcome) -> (bool, String) {
+    use darkmux_fleet::{CheckOutcome, EndpointClass, SeatOutlook};
+    let head = format!("{} = `{}`", route.source, route.address);
+    match outcome {
+        CheckOutcome::Routable { profile, report } => {
+            let endpoint = match report.endpoint {
+                EndpointClass::Managed => "managed",
+                EndpointClass::Unmanaged => "unmanaged",
+                EndpointClass::Unknown => "endpoint unknown",
+            };
+            let seat = match report.seat {
+                SeatOutlook::Free => "seat free",
+                SeatOutlook::WouldQueue => "seat busy, a run would queue",
+                SeatOutlook::Unknown => "seat unknown",
+            };
+            (true, format!("{head}: the receiver would run role {} on {profile} ({endpoint}; {seat})", route.role))
+        }
+        CheckOutcome::Refused { code, reason } => {
+            (false, format!("{head}: refused by the receiver ({}): {reason}", refusal_word(*code)))
+        }
+        CheckOutcome::Unanswered { detail } => (false, format!("{head}: the receiver could not be asked: {detail}")),
+    }
+}
+
+/// Pure decision for [`check_fleet_routes`]. A route the receiver refuses, or
+/// that could not be asked (an unreachable peer), is a Warn that says which
+/// and why, never a Fail: doctor reports the route, it does not depend on the
+/// peer being up.
+fn fleet_routes_status(results: &[(FleetRoute, darkmux_fleet::CheckOutcome)]) -> Check {
+    let name = "fleet routes".to_string();
+    if results.is_empty() {
+        return Check {
+            name,
+            status: Status::Pass,
+            message: "no role binding or radio seat is addressed to a fleet peer".into(),
+            hint: None,
+        };
+    }
+    let findings: Vec<(bool, String)> = results.iter().map(|(r, o)| route_finding(r, o)).collect();
+    let message = findings.iter().map(|(_, m)| m.as_str()).collect::<Vec<_>>().join("; ");
+    if findings.iter().all(|(ok, _)| *ok) {
+        return Check { name, status: Status::Pass, message, hint: None };
+    }
+    Check {
+        name,
+        status: Status::Warn,
+        message,
+        hint: Some(
+            "Each route was checked with its receiver, which runs the same gates a real job meets and \
+             answers without running anything. Its sentence above names the fix: on the receiver, \
+             `darkmux machine trust` for a sender it does not list or a role or profile it does not \
+             grant; or fix the address, the fleet token, or the receiver's listener."
+                .into(),
+        ),
+    }
+}
+
+/// The check behind [`fleet_routes_status`]: asks each peer route's receiver
+/// whether it would take the job ([`darkmux_fleet::check_route`]), all at
+/// once, each bounded by the fleet client's own timeout.
+fn check_fleet_routes() -> Check {
+    let routes = fleet_routes(
+        darkmux_types::config_access::radio_answerer_profile(),
+        &darkmux_types::config_access::role_profiles(),
+        darkmux_flow::resolve_machine_id().as_deref(),
+    );
+    let results: Vec<(FleetRoute, darkmux_fleet::CheckOutcome)> = std::thread::scope(|s| {
+        let asked: Vec<_> = routes
+            .into_iter()
+            .map(|r| {
+                s.spawn(move || {
+                    let outcome = darkmux_fleet::check_route(&r.address, &r.role, None);
+                    (r, outcome)
+                })
+            })
+            .collect();
+        asked.into_iter().filter_map(|h| h.join().ok()).collect()
+    });
+    fleet_routes_status(&results)
 }
 
 /// A `radio-host` binding written as a well-formed `<profile>@<machine>`
@@ -12015,8 +12138,10 @@ mod tests {
         //
         // (radio on a peer) 69: `check_radio_peer_seat` joined beside the
         // role-profiles row.
+        //
+        // (fleet route check) 70: `check_fleet_routes` joined beside it.
         let expected =
-            69 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
+            70 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
@@ -13448,6 +13573,72 @@ mod tests {
 
     fn machines(names: &[&str]) -> std::collections::BTreeSet<String> {
         names.iter().map(|n| n.to_string()).collect()
+    }
+
+    fn route(source: &str, role: &str, address: &str) -> super::FleetRoute {
+        super::FleetRoute { source: source.into(), role: role.into(), address: address.into() }
+    }
+
+    fn routable() -> darkmux_fleet::CheckOutcome {
+        darkmux_fleet::CheckOutcome::Routable {
+            profile: "deep".into(),
+            report: darkmux_fleet::CheckReport {
+                endpoint: darkmux_fleet::EndpointClass::Managed,
+                seat: darkmux_fleet::SeatOutlook::Free,
+            },
+        }
+    }
+
+    /// Only a well-formed address naming ANOTHER machine is a route to check:
+    /// the answerer runs `radio-host`, each binding its own role; a bare
+    /// profile, a malformed address and this machine's own name are not.
+    #[test]
+    fn only_addresses_naming_another_machine_are_routes() {
+        let bindings: std::collections::BTreeMap<String, String> = [
+            ("radio-host", "deep@studio"),
+            ("coder", "coder-big"),
+            ("analyst", "x@y@z"),
+            ("reviewer", "deep@Laptop"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let routes = super::fleet_routes(Some("fast@mini".into()), &bindings, Some("laptop"));
+        assert_eq!(
+            routes,
+            vec![
+                route("radio.answerer_profile", "radio-host", "fast@mini"),
+                route("role_profiles.radio-host", "radio-host", "deep@studio"),
+            ]
+        );
+        assert!(super::fleet_routes(None, &Default::default(), None).is_empty());
+    }
+
+    /// A routable route passes and says what would run. A refusal is a Warn
+    /// carrying the receiver's typed code and sentence; an unreachable peer is
+    /// a Warn with the reason, never a Fail. One bad route among good ones
+    /// still warns.
+    #[test]
+    fn a_route_is_ok_or_the_receivers_typed_refusal_and_never_a_fail() {
+        use darkmux_fleet::{CheckOutcome, RefusalCode};
+        let r = route("radio.answerer_profile", "radio-host", "deep@studio");
+        let c = super::fleet_routes_status(&[(r.clone(), routable())]);
+        assert_eq!(c.status, Status::Pass);
+        assert!(c.message.contains("would run role radio-host on deep (managed; seat free)"), "{}", c.message);
+
+        let refused = CheckOutcome::Refused { code: RefusalCode::RoleNotAllowed, reason: "studio lets laptop run roles: none".into() };
+        let c = super::fleet_routes_status(&[(r.clone(), refused)]);
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.message.contains("refused by the receiver (role_not_allowed): studio lets laptop run roles: none"), "{}", c.message);
+
+        let down = CheckOutcome::Unanswered { detail: "studio did not answer".into() };
+        let c = super::fleet_routes_status(&[(r.clone(), down)]);
+        assert_eq!(c.status, Status::Warn, "an unreachable peer warns");
+        assert!(c.message.contains("could not be asked: studio did not answer"), "{}", c.message);
+
+        let c = super::fleet_routes_status(&[(r.clone(), routable()), (route("role_profiles.coder", "coder", "big@mini"), CheckOutcome::Unanswered { detail: "x".into() })]);
+        assert_eq!(c.status, Status::Warn);
+        assert_eq!(super::fleet_routes_status(&[]).status, Status::Pass);
     }
 
     fn seats(pairs: &[(&str, &str)]) -> Vec<(String, String)> {

@@ -130,6 +130,9 @@ const CONFIG_CAP_CHARS: usize = 3_200;
 /// Mission-board summary cap: ~400 tokens (within the issue's "300-1K when
 /// relevant" range).
 const BOARD_CAP_CHARS: usize = 1_600;
+/// Fleet block cap: ~1K tokens, enough for a few machines' loaded models,
+/// profiles and grants.
+const FLEET_CAP_CHARS: usize = 4_000;
 /// Top-level `--help` block cap: ~400 tokens.
 /// (#1784/#1862) The verb index's cap. Sized from the measurement in
 /// `radio_index::tests::rendered_index_fits_its_cap` with headroom; the
@@ -170,6 +173,8 @@ struct Sections {
     catalog: Option<String>,
     config: Option<String>,
     board: Option<String>,
+    /// The fleet view, as radio's grounding words it. Machine-local scope only.
+    fleet: Option<String>,
     help: Option<String>,
     shelf: Vec<String>,
     deep_artifact: Option<String>,
@@ -177,7 +182,7 @@ struct Sections {
 
 impl Sections {
     fn total_chars(&self) -> usize {
-        [&self.surface, &self.catalog, &self.config, &self.board, &self.help, &self.deep_artifact]
+        [&self.surface, &self.catalog, &self.config, &self.board, &self.fleet, &self.help, &self.deep_artifact]
             .into_iter()
             .flatten()
             .map(|s| s.chars().count())
@@ -189,7 +194,7 @@ impl Sections {
     /// "dropping in reverse priority (shelf tail and help yield before a
     /// named artifact)" (issue #1698's own B2 context-budget comment). Drop
     /// order: help (whole section) → shelf, oldest entry first → board
-    /// (whole section) → deep artifact → config → catalog.
+    /// (whole section) → fleet (whole section) → deep artifact → config → catalog.
     ///
     /// **Currently unreachable from [`assemble_grounding`] in practice**
     /// (a fresh-review finding worth naming honestly, not hiding): the SUM
@@ -214,6 +219,9 @@ impl Sections {
                 continue;
             }
             if self.board.take().is_some() {
+                continue;
+            }
+            if self.fleet.take().is_some() {
                 continue;
             }
             if self.help.take().is_some() {
@@ -255,6 +263,10 @@ impl Sections {
             out.push_str("\nMission board summary:\n");
             out.push_str(b);
             out.push('\n');
+        }
+        if let Some(f) = &self.fleet {
+            out.push_str("\nFleet (the user's machines running darkmux):\n");
+            out.push_str(f);
         }
         if let Some(h) = &self.help {
             out.push_str(
@@ -649,6 +661,7 @@ pub fn assemble_grounding(
     catalog: &[CatalogEntry],
     shelf: &ArtifactShelf,
     _cwd: &Path,
+    fleet: Option<&str>,
     scope: GroundingScope,
     surface: RadioSurface,
 ) -> String {
@@ -663,6 +676,9 @@ pub fn assemble_grounding(
         // Machine-local only — see `GroundingScope`.
         config: machine_local.then(config_block).flatten(),
         board: machine_local.then(render_board_block).flatten(),
+        // Machine-local only: machine ids, loaded models and grants are this
+        // fleet's, and never go to a hosted endpoint.
+        fleet: fleet.filter(|_| machine_local).map(|f| truncate_chars(f, FLEET_CAP_CHARS)),
         shelf: if machine_local {
             shelf
                 .entries()
@@ -1440,11 +1456,12 @@ fn ask_answering_seat(
     catalog: &[CatalogEntry],
     shelf: &ArtifactShelf,
     cwd: &Path,
+    fleet: Option<&str>,
     scope: GroundingScope,
     surface: RadioSurface,
     call: &mut AnswererCall<'_>,
 ) -> Result<String> {
-    let message = build_answer_message(text, &assemble_grounding(text, catalog, shelf, cwd, scope, surface));
+    let message = build_answer_message(text, &assemble_grounding(text, catalog, shelf, cwd, fleet, scope, surface));
     if scope != GroundingScope::Full {
         return call(&message, None);
     }
@@ -1455,7 +1472,7 @@ fn ask_answering_seat(
                  this question is sent with the command catalog and `--help` only (this machine's config, \
                  mission board and artifact shelf are withheld)"
             );
-            let safe = assemble_grounding(text, catalog, shelf, cwd, GroundingScope::RemoteSafe, surface);
+            let safe = assemble_grounding(text, catalog, shelf, cwd, None, GroundingScope::RemoteSafe, surface);
             call(&build_answer_message(text, &safe), None)
         }
         other => other,
@@ -1477,11 +1494,12 @@ pub fn answer(
     catalog: &[CatalogEntry],
     shelf: &ArtifactShelf,
     cwd: &Path,
+    fleet: Option<&str>,
     scope: GroundingScope,
     surface: RadioSurface,
     call: &mut AnswererCall<'_>,
 ) -> Result<AnswerOutcome> {
-    let raw = ask_answering_seat(text, catalog, shelf, cwd, scope, surface, call)
+    let raw = ask_answering_seat(text, catalog, shelf, cwd, fleet, scope, surface, call)
         .map_err(|e| anyhow::Error::new(SeatUnavailable { why: format!("{e:#}") }))?;
     let reply = raw.trim().to_string();
     // (#1861 defects 1 + 2, rebuilt by #2050) The mechanical backstop.
@@ -1837,11 +1855,21 @@ pub fn answer_live(
              shelf, and any deep artifact are withheld (they never leave this machine)."
         );
     }
-    answer(text, catalog, shelf, cwd, scope, surface, &mut |m: &str, boundary| {
+    let fleet = (scope == GroundingScope::Full).then(fleet_grounding).flatten();
+    answer(text, catalog, shelf, cwd, fleet.as_deref(), scope, surface, &mut |m: &str, boundary| {
         dispatch_answerer_call_with(m, overrides, surface, boundary)
     })
     .map(LiveAnswer::Answered)
     .context("dispatching the radio answering seat")
+}
+
+/// The "fleet" section of the grounding, drawn from the same view `machine
+/// list` and the daemon's `GET /fleet/view` give ([`crate::machine_list::
+/// local_fleet_view`]: this machine's daemon when it answers, else a view
+/// gathered in this process). `None` when the view lists no machine.
+pub fn fleet_grounding() -> Option<String> {
+    let view = crate::machine_list::local_fleet_view();
+    (!view.machines.is_empty()).then(|| crate::machine_list::render_grounding(&view))
 }
 
 /// The profile names available for the "radio host" session config-option
@@ -1995,7 +2023,7 @@ mod tests {
     ) -> (Result<String>, Vec<(String, Option<crate::fleet::Boundary>)>) {
         let mut seen = Vec::new();
         let shelf = ArtifactShelf::default();
-        let out = ask_answering_seat("what is loaded?", &fixture_catalog(), &shelf, Path::new("/tmp"), scope, RadioSurface::Cli, &mut |m: &str, b| {
+        let out = ask_answering_seat("what is loaded?", &fixture_catalog(), &shelf, Path::new("/tmp"), None, scope, RadioSurface::Cli, &mut |m: &str, b| {
             seen.push((m.to_string(), b));
             script(seen.len() - 1)
         });
@@ -2020,7 +2048,7 @@ mod tests {
             seen[1].0,
             build_answer_message(
                 "what is loaded?",
-                &assemble_grounding("what is loaded?", &fixture_catalog(), &ArtifactShelf::default(), Path::new("/tmp"), GroundingScope::RemoteSafe, RadioSurface::Cli)
+                &assemble_grounding("what is loaded?", &fixture_catalog(), &ArtifactShelf::default(), Path::new("/tmp"), None, GroundingScope::RemoteSafe, RadioSurface::Cli)
             )
         );
 
@@ -2102,7 +2130,7 @@ mod tests {
         use crate::fleet::{Boundary, CheckOutcome, RefusalCode};
         let submits = std::cell::RefCell::new(Vec::new());
         let shelf = ArtifactShelf::default();
-        let out = ask_answering_seat("what is loaded?", &fixture_catalog(), &shelf, Path::new("/tmp"), GroundingScope::Full, RadioSurface::Cli, &mut |m: &str, b| {
+        let out = ask_answering_seat("what is loaded?", &fixture_catalog(), &shelf, Path::new("/tmp"), None, GroundingScope::Full, RadioSurface::Cli, &mut |m: &str, b| {
             submit_after_check(
                 "host@studio",
                 "radio-host",
@@ -2132,7 +2160,7 @@ mod tests {
         let mut refused_call = |_: &str, _: Option<crate::fleet::Boundary>| -> Result<String> {
             Err(refused(crate::fleet::RefusalCode::NotListed))
         };
-        let err = answer("what is a profile?", &fixture_catalog(), &shelf, Path::new("/tmp"), GroundingScope::Full, RadioSurface::Cli, &mut refused_call)
+        let err = answer("what is a profile?", &fixture_catalog(), &shelf, Path::new("/tmp"), None, GroundingScope::Full, RadioSurface::Cli, &mut refused_call)
             .unwrap_err();
         let notice = seat_unavailable_notice(&err.context("dispatching the radio answering seat")).expect("a seat failure has a notice");
         assert!(notice.contains("the answering seat was unavailable") && notice.contains("the peer said no"), "{notice}");
@@ -2143,7 +2171,7 @@ mod tests {
         assert!(notice.lines().count() <= 2, "one or two sentences: {notice}");
 
         let mut invented = |_: &str, _: Option<crate::fleet::Boundary>| -> Result<String> { Ok("Run `darkmux zzz-invented` now.".into()) };
-        let err = answer("hi", &fixture_catalog(), &shelf, Path::new("/tmp"), GroundingScope::Full, RadioSurface::Cli, &mut invented).unwrap_err();
+        let err = answer("hi", &fixture_catalog(), &shelf, Path::new("/tmp"), None, GroundingScope::Full, RadioSurface::Cli, &mut invented).unwrap_err();
         assert_eq!(seat_unavailable_notice(&err), None, "a rejected reply is not an unavailable seat: {err:#}");
     }
 
@@ -2195,6 +2223,7 @@ mod tests {
             catalog: Some(big(1_000)),
             config: Some(big(1_000)),
             board: Some(big(1_000)),
+            fleet: Some(big(1_000)),
             help: Some(big(1_000)),
             shelf: vec![big(1_000), big(1_000), big(1_000)],
             deep_artifact: Some("THE NAMED ARTIFACT".to_string()),
@@ -2223,6 +2252,7 @@ mod tests {
             catalog: Some("small".to_string()),
             config: Some("small".to_string()),
             board: Some("small".to_string()),
+            fleet: Some("small".to_string()),
             help: Some("small".to_string()),
             shelf: vec!["small".to_string()],
             deep_artifact: Some("small".to_string()),
@@ -2673,6 +2703,19 @@ mod tests {
         shelf
     }
 
+    /// The fleet section rides machine-local grounding only: a hosted seat
+    /// is never handed machine ids, loaded models or grants.
+    #[test]
+    fn the_fleet_section_is_machine_local_only() {
+        let shelf = ArtifactShelf::default();
+        let ground = |scope| assemble_grounding("what is loaded on studio?", &fixture_catalog(), &shelf, Path::new("/tmp"), Some("- studio: liveness live"), scope, RadioSurface::Cli);
+        let full = ground(GroundingScope::Full);
+        assert!(full.contains("Fleet (the user's machines running darkmux):\n- studio: liveness live"), "{full}");
+        assert!(!ground(GroundingScope::RemoteSafe).contains("liveness live"), "a hosted seat must not get the fleet section");
+        let none = assemble_grounding("hi", &fixture_catalog(), &shelf, Path::new("/tmp"), None, GroundingScope::Full, RadioSurface::Cli);
+        assert!(!none.contains("Fleet ("), "no view, no section");
+    }
+
     #[test]
     fn remote_safe_grounding_withholds_the_shelf_config_and_board() {
         let grounding = assemble_grounding(
@@ -2680,6 +2723,7 @@ mod tests {
             &fixture_catalog(),
             &shelf_with_private_output(),
             Path::new("/tmp"),
+            None,
             GroundingScope::RemoteSafe,
             RadioSurface::Panel,
         );
@@ -2704,6 +2748,7 @@ mod tests {
             &fixture_catalog(),
             &shelf_with_private_output(),
             Path::new("/tmp"),
+            None,
             GroundingScope::Full,
             RadioSurface::Panel,
         );
@@ -2752,7 +2797,7 @@ mod tests {
         let mut call = |_msg: &str, _boundary: Option<crate::fleet::Boundary>| -> Result<String> { Ok("Try running /mission launch pr-list to see them.".to_string()) };
         let shelf = ArtifactShelf::default();
         let outcome =
-            answer("anything mergeable?", &fixture_catalog(), &shelf, Path::new("/tmp"), GroundingScope::Full, RadioSurface::Panel, &mut call)
+            answer("anything mergeable?", &fixture_catalog(), &shelf, Path::new("/tmp"), None, GroundingScope::Full, RadioSurface::Panel, &mut call)
                 .unwrap();
         assert!(outcome.rendered.len() > outcome.text.len(), "the listing must be appended: {outcome:?}");
     }
@@ -2766,6 +2811,7 @@ mod tests {
             &fixture_catalog(),
             &shelf,
             Path::new("/tmp"),
+            None,
             GroundingScope::Full,
             RadioSurface::Panel,
             &mut call,
@@ -2779,7 +2825,7 @@ mod tests {
         let mut call = |_msg: &str, _boundary: Option<crate::fleet::Boundary>| -> Result<String> { Err(anyhow::anyhow!("no model loaded")) };
         let shelf = ArtifactShelf::default();
         let result =
-            answer("is this darkmux?", &fixture_catalog(), &shelf, Path::new("/tmp"), GroundingScope::Full, RadioSurface::Panel, &mut call);
+            answer("is this darkmux?", &fixture_catalog(), &shelf, Path::new("/tmp"), None, GroundingScope::Full, RadioSurface::Panel, &mut call);
         assert!(result.is_err(), "a dispatch failure must propagate, not be swallowed into a bogus answer");
     }
 
@@ -2874,6 +2920,7 @@ mod tests {
             &fixture_catalog(),
             &shelf,
             Path::new("/tmp"),
+            None,
             GroundingScope::Full,
             RadioSurface::Panel,
             &mut call,
@@ -2898,6 +2945,7 @@ mod tests {
             &fixture_catalog(),
             &shelf,
             Path::new("/tmp"),
+            None,
             GroundingScope::Full,
             RadioSurface::Cli,
             &mut call,
@@ -3585,6 +3633,7 @@ mod tests {
             &fixture_catalog(),
             &shelf,
             Path::new("/tmp"),
+            None,
             GroundingScope::Full,
             RadioSurface::Cli,
             &mut call,
@@ -3617,6 +3666,7 @@ mod tests {
             &fixture_catalog(),
             &shelf,
             Path::new("/tmp"),
+            None,
             GroundingScope::Full,
             RadioSurface::Cli,
             &mut call,
@@ -3645,6 +3695,7 @@ mod tests {
             &fixture_catalog(),
             &shelf,
             Path::new("/tmp"),
+            None,
             GroundingScope::Full,
             RadioSurface::Cli,
             &mut call,
@@ -3666,6 +3717,7 @@ mod tests {
             &fixture_catalog(),
             &shelf,
             Path::new("/tmp"),
+            None,
             GroundingScope::Full,
             RadioSurface::Cli,
             &mut call,
@@ -3737,12 +3789,12 @@ mod tests {
         // surface block is scope-independent, and this needs no config,
         // board, or shelf.
         let shelf = ArtifactShelf::default();
-        let cli = assemble_grounding("how do I run it?", &[], &shelf, Path::new("/tmp"), GroundingScope::RemoteSafe, RadioSurface::Cli);
+        let cli = assemble_grounding("how do I run it?", &[], &shelf, Path::new("/tmp"), None, GroundingScope::RemoteSafe, RadioSurface::Cli);
         assert!(cli.contains("Surface: command line"), "{cli}");
         assert!(cli.contains("Never write a bare `/id`"), "{cli}");
         assert!(cli.contains("darkmux mission launch <id>"), "{cli}");
         let panel =
-            assemble_grounding("how do I run it?", &[], &shelf, Path::new("/tmp"), GroundingScope::RemoteSafe, RadioSurface::Panel);
+            assemble_grounding("how do I run it?", &[], &shelf, Path::new("/tmp"), None, GroundingScope::RemoteSafe, RadioSurface::Panel);
         assert!(panel.contains("Surface: editor panel"), "{panel}");
         assert!(panel.contains("/mission launch <id>"), "{panel}");
         assert!(!panel.contains("Surface: command line"), "{panel}");
@@ -3752,7 +3804,7 @@ mod tests {
     fn grounding_carries_the_verb_index_with_subverbs_and_options() {
         let shelf = ArtifactShelf::default();
         let bundle =
-            assemble_grounding("how do I see what is loaded?", &[], &shelf, Path::new("/tmp"), GroundingScope::Full, RadioSurface::Panel);
+            assemble_grounding("how do I see what is loaded?", &[], &shelf, Path::new("/tmp"), None, GroundingScope::Full, RadioSurface::Panel);
         assert!(bundle.contains("darkmux machine status"), "{bundle}");
         assert!(bundle.contains("darkmux machine list [") && bundle.contains("--json"), "{bundle}");
         assert!(bundle.contains("darkmux mission launch"), "{bundle}");
