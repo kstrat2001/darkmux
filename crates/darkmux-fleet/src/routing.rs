@@ -872,6 +872,9 @@ mod tests {
         opts.profile_name = Some("host@peer-b".to_string());
         let msg = format!("{:#}", dispatch_routed_via(opts, |_| panic!("never local")).unwrap_err());
         assert!(msg.contains("nothing was sent") && !msg.contains("may still be running"), "{msg}");
+        // The refused connection names the listener, not a raw errno.
+        assert!(msg.contains("fleet listener") && msg.contains("not accepting connections"), "{msg}");
+        assert!(!msg.contains("os error"), "{msg}");
     }
 
     /// (#2916 stage 2) Queued without `--wait`: the answer is the
@@ -880,7 +883,7 @@ mod tests {
     #[serial]
     fn a_queued_answer_without_wait_is_reported_verbatim() {
         let (port, _rx) = spawn_scripted_peer(
-            "{\"status\":\"queued\",\"session_id\":\"m-1.solo.relay.local-a.m-1_2Eadhoc_2Ecoder_2En\",\"reason\":\"peer-b is busy (x is running on big); the job is queued and runs when its seat frees\"}\n",
+            "{\"status\":\"queued\",\"session_id\":\"m-1.solo.relay.local-a.m-1.adhoc.coder.n\",\"reason\":\"peer-b is busy (x is running on big); the job is queued and runs when its seat frees\"}\n",
         );
         let _env = PeerEnv::new(port);
         peer_b_is_verified();

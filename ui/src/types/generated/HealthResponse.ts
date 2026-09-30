@@ -17,8 +17,9 @@ build: string,
  */
 binary_mtime: number | null, flow_schema_version: string, 
 /**
- * What the fleet listener is doing (`null` when it is off): the detail for a
- * caller on this machine, a coarse state for anyone else.
+ * What the fleet listener is doing (`off` when `fleet.listener.enabled` is
+ * false): the detail for a caller on this machine, a coarse state for
+ * anyone else.
  */
 fleet_listener: string | null, 
 /**
@@ -26,6 +27,11 @@ fleet_listener: string | null,
  * machine only.
  */
 fleet_busy: FleetBusy | null, 
+/**
+ * Whether this daemon resolved a fleet token (the serve token) in its own
+ * environment; never the value. This machine only.
+ */
+fleet_token_set: boolean | null, 
 /**
  * The open-file soft limit this daemon runs with; this machine only.
  */

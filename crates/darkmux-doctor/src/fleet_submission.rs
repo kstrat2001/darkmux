@@ -81,6 +81,10 @@ pub struct FleetSubmissionFacts {
     /// What the running daemon reports about its listener (`/health`'s
     /// `fleet_listener`), when the daemon answered.
     pub daemon_listener_state: Option<String>,
+    /// Whether the running daemon reports a fleet token in ITS environment
+    /// (`/health`'s `fleet_token_set`), when it answered. The shell doctor
+    /// runs in may not have the one the daemon was started with.
+    pub daemon_token_set: Option<bool>,
     /// (#2916 stage 2) How the listener answers a busy seat.
     pub busy: BusyFacts,
     /// (#2916 stage 2) This machine's resolved `machine_id`: the name a
@@ -150,6 +154,15 @@ pub fn fleet_submission_checks(f: &FleetSubmissionFacts) -> Vec<Check> {
 fn token_row(f: &FleetSubmissionFacts) -> Check {
     if f.token_present {
         check("fleet token", Status::Pass, "resolves (the serve token)".into(), None)
+    } else if f.daemon_token_set == Some(true) {
+        check(
+            "fleet token",
+            Status::Pass,
+            "set in the running daemon's environment only: this shell cannot resolve it, so a \
+             `dispatch` from here cannot send fleet work"
+                .into(),
+            None,
+        )
     } else {
         check(
             "fleet token",
@@ -396,6 +409,7 @@ mod tests {
             retired_streams: vec![],
             queue_consumers: vec![],
             daemon_listener_state: None,
+            daemon_token_set: None,
             busy: BusyFacts { running: Some(refuse(1)), configured: Some(refuse(1)) },
             local_machine: Some("studio".into()),
         }
@@ -468,6 +482,22 @@ mod tests {
     fn a_single_machine_gets_no_rows() {
         let f = FleetSubmissionFacts { listener_enabled: false, trusted: Ok(vec![]), ..facts() };
         assert!(fleet_submission_checks(&f).is_empty());
+    }
+
+    /// The shell has no token but the running daemon does: the row passes and
+    /// says whose environment holds it. Without that word from the daemon
+    /// (none reachable, or it reports none) the row keeps failing.
+    #[test]
+    fn a_token_only_the_daemon_holds_passes_with_a_note() {
+        let f = FleetSubmissionFacts { token_present: false, daemon_token_set: Some(true), ..facts() };
+        let r = fleet_submission_checks(&f);
+        let r = row(&r, "fleet token");
+        assert_eq!(r.status, Status::Pass);
+        assert!(r.message.contains("daemon's environment only"), "{}", r.message);
+        for daemon in [None, Some(false)] {
+            let f = FleetSubmissionFacts { token_present: false, daemon_token_set: daemon, ..facts() };
+            assert_eq!(row(&fleet_submission_checks(&f), "fleet token").status, Status::Fail, "{daemon:?}");
+        }
     }
 
     #[test]

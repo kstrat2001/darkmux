@@ -49,8 +49,10 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
 //           session within one run, `.`-separated and begun by its run:
 //           `<run>[.lab|.solo].<kind>[.<field>...]`, kind one of `run`,
 //           `phase.<p>`, `task.<t>`, `step.<s>`, `adhoc.<role>.<nonce>`,
-//           `relay.<peer>.<sender>`, every component escaped (`[A-Za-z0-9-]`
-//           kept, any other byte `_XX`). Replaces the free-form ids
+//           `relay.<peer>.<sender wire>`, every component escaped (`[A-Za-z0-9-]`
+//           kept, any other byte `_XX`) except the sender's wire, which a
+//           relay carries verbatim as its tail so a receiver's session id
+//           contains the id the sender printed. Replaces the free-form ids
 //           (`mission-<m>`, bare `<m>`, `mission-run-<m>-<p>`,
 //           `task-<t>[-<m>]`, `step-<s>[-<m>]`, `crew-dispatch-...`,
 //           `crawl-...`, `radio-...`, `phase-review-...`, the lab forms and

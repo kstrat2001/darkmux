@@ -719,14 +719,16 @@ fn host_names_this_daemon(headers: &axum::http::HeaderMap, bound: Option<SocketA
 /// (#881, #2988) The startup banner's two auth lines: the read posture and
 /// the execution posture. `serve_auth_preflight` has already refused a
 /// posture reads could not be answered in, so these only describe.
-fn auth_banner_lines(auth: ServeAuth) -> [String; 2] {
+fn auth_banner_lines(auth: ServeAuth, listener_enabled: bool) -> [String; 2] {
     let reads = if auth.read_auth {
         "  reads:          token required unless from this machine (serve.read_auth on; proxied requests included)"
     } else {
         "  reads:          open to whatever reaches this daemon (serve.read_auth off)"
     };
-    let exec = if auth.token_present {
+    let exec = if auth.token_present && listener_enabled {
         "  fleet work:     token set; the fleet listener requires it plus a verified sender".to_string()
+    } else if auth.token_present {
+        "  fleet work:     token set; the fleet listener is off (fleet.listener.enabled is false), so this machine takes no fleet work".to_string()
     } else {
         format!("  fleet work:     {}", darkmux_types::style::dim("no serve token; this machine takes and sends no fleet work"))
     };
@@ -1312,7 +1314,7 @@ fn build_startup_banner(
 
     // (#881, #2988) Both auth postures, so the operator sees at a glance
     // what reads need and what execution needs.
-    lines.extend(auth_banner_lines(ServeAuth::resolve()));
+    lines.extend(auth_banner_lines(ServeAuth::resolve(), darkmux_types::config_access::fleet_listener_enabled()));
 
     if !flows_dir_exists {
         lines.push(darkmux_types::style::warn(
@@ -1429,6 +1431,8 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
     // would return the mtime of the new binary and report a stale daemon as
     // fresh — the exact false negative this check exists to prevent.
     let _ = STARTUP_EXE_MTIME.set(current_exe_mtime());
+    // Relayed work runs in this process: its dispatches must not probe for a daemon.
+    darkmux_flow::daemon_probe::mark_running_inside_daemon();
     // (#2916 review M1) 10240 is macOS's per-process ceiling (OPEN_MAX).
     let _ = raise_open_file_limit(10_240);
 
@@ -1719,6 +1723,9 @@ async fn health(
         // (#2916 stage 2 review C5) The busy policy and hosted-job bound the
         // running listener uses, for this machine only.
         fleet_busy: fleet_listener::listener_busy(loopback_caller),
+        // Whether THIS process resolved a token, for `darkmux doctor` run from
+        // a shell that may not have the one the daemon was started with.
+        fleet_token_set: loopback_caller.then(darkmux_flow::serve_token_present),
         // (#2916 re-review C3) The open-file soft limit this daemon runs
         // with (raised at start), for this machine only.
         open_file_limit: if loopback_caller { current_open_file_limit() } else { None },

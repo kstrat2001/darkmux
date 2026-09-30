@@ -754,7 +754,14 @@ fn fetch_listener_card(target: &PeerTarget, entry: &MachineEntry, known_version:
     match darkmux_fleet::fleet_get(target, darkmux_fleet::CARD_PATH, PEER_CARD_TIMEOUT, &[]) {
         Ok(resp) => parse_listener_card(resp, entry, known_version),
         Err(ureq::Error::Status(code, resp)) => refusal_outcome(code, resp, known_version),
-        Err(ureq::Error::Transport(t)) => unreachable(UnreachableReason::ListenerOff, Some(format!("{:?}", t.kind()))),
+        Err(ureq::Error::Transport(t)) => {
+            let detail = if darkmux_fleet::is_listener_off(&t) {
+                darkmux_fleet::listener_off_sentence(&target.base())
+            } else {
+                format!("{:?}", t.kind())
+            };
+            unreachable(UnreachableReason::ListenerOff, Some(detail))
+        }
     }
 }
 
@@ -1567,6 +1574,12 @@ pub(crate) mod tests {
             fetch_listener_card(&target, &studio(), None)
         });
         assert_eq!(reason_of(&f), UnreachableReason::ListenerOff);
+        match &f.outcome {
+            CardOutcome::Unreachable { detail, .. } => {
+                assert!(detail.as_deref().unwrap_or("").contains("not accepting connections"), "{detail:?}")
+            }
+            other => panic!("{other:?}"),
+        }
         assert!(daemon.paths().is_empty(), "a daemon is never asked for a card");
     }
 

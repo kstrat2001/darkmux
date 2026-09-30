@@ -18,12 +18,15 @@
 //! kind     = "run"                         (no field)
 //!          | "phase" | "task" | "step"     (the phase, task or step id)
 //!          | "adhoc"                       (role, nonce)
-//!          | "relay"                       (peer, the sender's wire)
+//!          | "relay"                       (peer, then the sender's wire, verbatim)
 //! ```
 //!
-//! Every component is escaped: `[A-Za-z0-9-]` is kept, any other byte is
+//! Every component is escaped, except a relay's LAST one: `[A-Za-z0-9-]` is kept, any other byte is
 //! written `_XX` (two uppercase hex digits), so a component never contains
-//! the `.` separator. Ids with no `_` or `.` read as written:
+//! the `.` separator. A relay ends with the sender's own wire string,
+//! unescaped: it is last and the peer before it is escaped, so the split is
+//! still unambiguous, and an id the sender printed is a plain substring of
+//! the receiver's. Ids with no `_` or `.` read as written:
 //! `review-1790000000-ab12cd.task.probe`.
 //!
 //! Archives written before 4.0 carry the old free-form strings
@@ -228,7 +231,7 @@ impl SessionId {
             SessionKind::Step { step } => parts.extend(["step".to_string(), escape(step)]),
             SessionKind::Adhoc { role, nonce } => parts.extend(["adhoc".to_string(), escape(role), escape(nonce)]),
             SessionKind::Relay { sender, peer } => {
-                parts.extend(["relay".to_string(), escape(peer), escape(&sender.wire())])
+                parts.extend(["relay".to_string(), escape(peer), sender.wire()])
             }
         }
         parts.join(".")
@@ -264,7 +267,10 @@ impl SessionId {
     /// name.
     fn parse_kind(run: RunId, tag: &str, fields: &[&str], bad: &dyn Fn(&str) -> IdError) -> Result<Self, IdError> {
         let tag = WireKind::parse(tag).ok_or_else(|| bad("unknown session kind"))?;
-        if fields.len() != tag.arity() {
+        let Some(arity) = tag.arity() else {
+            return Self::parse_relay(run, fields, bad);
+        };
+        if fields.len() != arity {
             return Err(bad("wrong number of fields"));
         }
         let f: Vec<String> = fields
@@ -278,15 +284,21 @@ impl SessionId {
             WireKind::Task => SessionId::task(run, &f[0]),
             WireKind::Step => SessionId::step(run, &f[0]),
             WireKind::Adhoc => SessionId::adhoc(run, &f[0], &f[1]),
-            WireKind::Relay => {
-                let relay = SessionId::relay(SessionId::parse(&f[1])?, &f[0]);
-                if relay.run != run {
-                    return Err(bad("a relay's run is not its sender's, standalone"));
-                }
-                relay
-            }
+            WireKind::Relay => unreachable!("a relay is read by parse_relay"),
         };
         Ok(id)
+    }
+
+    /// A relay's fields: the escaped peer, then the sender's wire string,
+    /// which is everything after it (its own dots included).
+    fn parse_relay(run: RunId, fields: &[&str], bad: &dyn Fn(&str) -> IdError) -> Result<Self, IdError> {
+        let (peer, tail) = fields.split_first().filter(|(_, t)| !t.is_empty()).ok_or_else(|| bad("a relay names no sender"))?;
+        let peer = unescape(peer).ok_or_else(|| bad("a field is not escaped as written"))?;
+        let relay = SessionId::relay(SessionId::parse(&tail.join("."))?, peer);
+        if relay.run != run {
+            return Err(bad("a relay's run is not its sender's, standalone"));
+        }
+        Ok(relay)
     }
 
     /// Read a session id from a record of ANY age, for attribution: a
@@ -351,12 +363,14 @@ impl WireKind {
         }
     }
 
-    /// How many escaped fields follow the tag.
-    fn arity(self) -> usize {
+    /// How many escaped fields follow the tag; `None` for a relay, whose
+    /// tail is the sender's wire and has no fixed count.
+    fn arity(self) -> Option<usize> {
         match self {
-            WireKind::Run => 0,
-            WireKind::Phase | WireKind::Task | WireKind::Step => 1,
-            WireKind::Adhoc | WireKind::Relay => 2,
+            WireKind::Run => Some(0),
+            WireKind::Phase | WireKind::Task | WireKind::Step => Some(1),
+            WireKind::Adhoc => Some(2),
+            WireKind::Relay => None,
         }
     }
 }
@@ -592,6 +606,30 @@ mod tests {
             }
         }
         assert!(seen.len() > 5_000, "the generator must actually vary: {}", seen.len());
+    }
+
+    /// The sender's wire survives on the receiver verbatim (as a suffix), so
+    /// an id the sender printed can be grepped on the receiver.
+    #[test]
+    fn a_relay_carries_the_senders_wire_verbatim() {
+        let sender = SessionId::adhoc(RunId::standalone("radio").unwrap(), "radio-host", "1790747737017533-1");
+        let relay = SessionId::relay(sender.clone(), "MacBook-Pro");
+        assert_eq!(sender.wire(), "radio.solo.adhoc.radio-host.1790747737017533-1");
+        assert_eq!(
+            relay.wire(),
+            "radio.solo.relay.MacBook-Pro.radio.solo.adhoc.radio-host.1790747737017533-1"
+        );
+        assert_eq!(SessionId::parse(&relay.wire()).unwrap(), relay);
+        // A relay of a relay nests the same way and still reads back.
+        let again = SessionId::relay(relay.clone(), "studio");
+        assert!(again.wire().ends_with(&relay.wire()));
+        assert_eq!(SessionId::parse(&again.wire()).unwrap(), again);
+    }
+
+    #[test]
+    fn a_relay_whose_tail_is_not_a_session_is_refused() {
+        assert!(SessionId::parse("m.solo.relay.peer.not.a.session").is_err());
+        assert!(SessionId::parse("m.solo.relay.peer").is_err());
     }
 
     #[test]

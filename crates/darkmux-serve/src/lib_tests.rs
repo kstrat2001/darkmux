@@ -4,6 +4,16 @@
     /// declared window, `null` when undeclared, beside the residency match
     /// (by namespaced identifier or bare key).
     #[test]
+    fn the_startup_banner_says_the_listener_is_off_when_it_is() {
+        let auth = ServeAuth { read_auth: false, token_present: true };
+        let on = auth_banner_lines(auth, true);
+        assert!(on[1].contains("requires it plus a verified sender"), "{}", on[1]);
+        let off = auth_banner_lines(auth, false);
+        assert!(off[1].contains("listener is off"), "{}", off[1]);
+        assert!(!off[1].contains("requires it"), "{}", off[1]);
+    }
+
+    #[test]
     fn utility_model_carries_the_declared_window() {
         let lm = |identifier: &str, model: &str| darkmux_types::LoadedModel {
             identifier: identifier.into(),
@@ -2025,6 +2035,29 @@
         let resp = app.oneshot(req).await.unwrap();
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// `/health` tells this machine whether the DAEMON resolved a fleet token
+    /// (never its value), and a peer, or a proxied request, learns nothing.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn health_reports_token_presence_to_this_machine_only() {
+        let k = "DARKMUX_SERVE_TOKEN";
+        let prev = std::env::var(k).ok();
+        unsafe { std::env::set_var(k, "not-a-real-token") };
+        let set = loopback_health(&[]).await;
+        let proxied = loopback_health(&[("X-Forwarded-For", "100.64.0.7")]).await;
+        unsafe { std::env::remove_var(k) };
+        let unset = loopback_health(&[]).await;
+        unsafe {
+            if let Some(v) = prev {
+                std::env::set_var(k, v)
+            }
+        }
+        assert_eq!(set["fleet_token_set"], true, "{set}");
+        assert!(proxied["fleet_token_set"].is_null(), "{proxied}");
+        assert_eq!(unset["fleet_token_set"], false, "{unset}");
+        assert!(!set.to_string().contains("not-a-real-token"), "the value never appears");
     }
 
     /// (#2916 stage 2 review C5) The `/health` fields for this machine only
