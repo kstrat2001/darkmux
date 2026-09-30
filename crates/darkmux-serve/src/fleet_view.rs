@@ -1792,10 +1792,22 @@ pub(crate) mod tests {
         studio["uid_source"] = serde_json::json!("tpm");
         studio["accepts"] = serde_json::json!({"state": "delegated"});
         studio["card"]["source"] = serde_json::json!("relay");
-        let mut other = studio.clone();
-        other["entry"]["id"] = serde_json::json!("other");
-        other["card"] = serde_json::json!({"state": "teleported", "how": "unknown"});
-        v["machines"].as_array_mut().unwrap().push(other);
+        let template = studio.clone();
+        let with_card = |id: &str, card: serde_json::Value| {
+            let mut m = template.clone();
+            m["entry"]["id"] = serde_json::json!(id);
+            m["card"] = card;
+            m
+        };
+        let extra = [
+            with_card("other", serde_json::json!({"state": "teleported", "how": "unknown"})),
+            with_card("unreachable", serde_json::json!({"state": "unreachable", "reason": "quantum", "detail": null})),
+            with_card(
+                "unavailable",
+                serde_json::json!({"state": "unavailable", "why": "moved", "peer_version": "9.9.9", "peer_version_source": "blockchain"}),
+            ),
+        ];
+        v["machines"].as_array_mut().unwrap().extend(extra);
         let view: FleetView = serde_json::from_value(v).expect("unknown enum values must not discard the view");
         assert_eq!(view.gathered_by, GatheredBy::Unknown);
         assert!(matches!(view.presence, SourceState::Unavailable { .. }), "an unknown presence state reads as unavailable, the cautious reading");
@@ -1803,6 +1815,11 @@ pub(crate) mod tests {
         assert_eq!((studio.liveness, studio.uid_source, &studio.accepts), (Liveness::Unknown, Some(UidSource::Unknown), &AcceptsState::Unknown));
         assert!(matches!(&studio.card, CardOutcome::Available { source: CardSource::Unknown, card } if card.profiles.len() == 2), "the card is intact");
         assert!(matches!(row(&view, "other").card, CardOutcome::Unknown));
+        assert!(matches!(row(&view, "unreachable").card, CardOutcome::Unreachable { reason: UnreachableReason::Unknown, .. }));
+        assert!(
+            matches!(row(&view, "unavailable").card, CardOutcome::Unavailable { why: UnavailableWhy::Unknown, peer_version_source: Some(VersionSource::Unknown), .. }),
+            "the version is kept, and its unknown source is not read as the peer's or presence's"
+        );
     }
 
     // ── the routes ──────────────────────────────────────────────────────
