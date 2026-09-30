@@ -1919,7 +1919,7 @@ fn run_with_sleeper(
     // (#2793) Consecutive compactions that installed and still left occupancy
     // above the trigger. (#2805) No latch — reaching the bound escalates and
     // returns, so the episode cannot repeat within a dispatch.
-    let mut consecutive_unproductive_compactions: u32 = 0;
+    let mut unproductive_compactions = crate::unproductive_compactions::UnproductiveCompactions::new();
     let mut compaction_repeat = crate::compaction_repeat::CompactionRepeat::new();
 
     // (#2114) Reads + parses `pace.json` on demand (not once at startup
@@ -4194,12 +4194,8 @@ fn run_with_sleeper(
                         // successful, which is exactly why this is invisible
                         // from the compaction records alone.
                         let trigger = compaction_cfg.effective_trigger_tokens();
-                        if tokens_after >= trigger {
-                            consecutive_unproductive_compactions =
-                                consecutive_unproductive_compactions.saturating_add(1);
-                        } else {
-                            consecutive_unproductive_compactions = 0;
-                        }
+                        let consecutive_unproductive_compactions =
+                            unproductive_compactions.record(tokens_after, trigger);
                         // (#2805) No "fire once" latch any more: this block
                         // RETURNS, so the condition cannot recur within a
                         // dispatch. #2793 needed the latch because it reported
@@ -4356,7 +4352,7 @@ fn run_with_sleeper(
                     // needed none means the thread came back under the line
                     // on its own. Without this the count would carry across a
                     // resolved episode and fire early on the next one.
-                    consecutive_unproductive_compactions = 0;
+                    unproductive_compactions.end_episode();
                 }
 
                 // Loop back and call chat() again.
@@ -15097,6 +15093,204 @@ mod tests {
             TerminalReason::EscalationTriggered(EscalationReason::CompactionRereadLoop),
             "new files after each compaction are progress"
         );
+    }
+
+    // ---- (B4) loop-level pins for the model-facing nudges, the silent arm and the episode reset ----
+    //
+    // Each of these was proven by mutation to leave the whole suite green when
+    // its production line was deleted: the detectors' trajectory events were
+    // asserted, but nothing checked that the nudge reached the NEXT REQUEST,
+    // which is the point of the signal.
+
+    /// Serve a mock that answers `done` (a clean stop) to any request whose
+    /// body carries `nudge`, and registers the looping `then` reply after it.
+    /// Registered first, so it wins whenever the nudge is present: the run
+    /// only ends `Stop` if the nudge reached a request.
+    fn stop_when_request_carries(server: &crate::test_support::GuardedMockServer, nudge: &'static str, looping: serde_json::Value) {
+        let _nudge_mock = server.mock(move |when, then| {
+            when.method(POST).path("/v1/chat/completions").body_contains("\"model\":\"test-primary\"").body_contains(nudge);
+            then.status(200).json_body(chat_response_json(Some("done"), None, "stop", 100, 5));
+        });
+        let _looping_mock = server.mock(move |when, then| {
+            when.method(POST).path("/v1/chat/completions").body_contains("\"model\":\"test-primary\"");
+            then.status(200).json_body(looping.clone());
+        });
+    }
+
+    fn assert_nudge_reached_the_request(outcome: &LoopOutcome, kind: &str, tmp: &std::path::Path) {
+        assert_eq!(
+            outcome.terminal_reason,
+            TerminalReason::Stop,
+            "the run ends only if a request carried the nudge; MaxTurns means it never did"
+        );
+        let raw = std::fs::read_to_string(tmp.join(".darkmux-runtime").join("trajectory.jsonl")).unwrap();
+        assert!(
+            raw.lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .filter(|v| v["type"] == "dispatch.feedback.injected")
+                .any(|v| v["signal_kinds"].as_array().is_some_and(|k| k.iter().any(|x| x == kind))),
+            "and the injection is recorded under `{kind}`"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_tool_failure_cascade_nudge_reaches_the_next_request() {
+        std::env::remove_var("DARKMUX_FEEDBACK_INJECTION");
+        let server = crate::test_support::GuardedMockServer::start();
+        stop_when_request_carries(
+            &server,
+            "the tool or its environment failing",
+            chat_response_json(None, Some(read_call_json("/workspace/no-such-file.txt")), "tool_calls", 100, 10),
+        );
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("nudge-cascade").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let outcome = run(
+            &client, &client, "test-primary", vec![Message::system("s"), Message::user("go")], &[Tool::Read], &mut traj,
+            false, &compaction::CompactionConfig::never_compact(), Some(12), None, None, None, std::collections::BTreeMap::new(), None,
+        )
+        .expect("the run completes");
+        assert_nudge_reached_the_request(&outcome, "tool_failure_cascade", tmp.path());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_reasoning_loop_nudge_reaches_the_next_request() {
+        std::env::remove_var("DARKMUX_FEEDBACK_INJECTION");
+        let server = crate::test_support::GuardedMockServer::start();
+        let same_thought = "<think>I should read the file again to be sure what it says before I do anything else at all here.</think>";
+        stop_when_request_carries(
+            &server,
+            "revisited the same line of reasoning",
+            chat_response_json(
+                Some(same_thought),
+                Some(serde_json::json!([{
+                    "id": "call_r", "type": "function",
+                    "function": {"name": "echo", "arguments": "{\"text\":\"again\"}"},
+                }])),
+                "tool_calls",
+                100,
+                10,
+            ),
+        );
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("nudge-reasoning").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let outcome = run(
+            &client, &client, "test-primary", vec![Message::system("s"), Message::user("go")], &[Tool::Echo], &mut traj,
+            false, &compaction::CompactionConfig::never_compact(), Some(12), None, None, None, std::collections::BTreeMap::new(), None,
+        )
+        .expect("the run completes");
+        assert_nudge_reached_the_request(&outcome, "reasoning_loop", tmp.path());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_post_compaction_nudge_reaches_the_next_request() {
+        std::env::remove_var("DARKMUX_FEEDBACK_INJECTION");
+        let server = crate::test_support::GuardedMockServer::start();
+        let _compactor = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").body_contains("\"model\":\"test-compactor\"");
+            then.status(200).json_body(chat_response_json(Some(SHORT_SUMMARY), None, "stop", 500, 30));
+        });
+        // `echo`, not `read`: a re-read after every compaction is bounded on
+        // purpose (#3013) and would end the run first.
+        stop_when_request_carries(
+            &server,
+            "Working memory was just compressed",
+            chat_response_json(
+                None,
+                Some(serde_json::json!([{
+                    "id": "call_e", "type": "function",
+                    "function": {"name": "echo", "arguments": "{\"text\":\"working\"}"},
+                }])),
+                "tool_calls",
+                9_000,
+                50,
+            ),
+        );
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("nudge-compaction").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let outcome = run(
+            &client, &client, "test-primary", seeded_thread(), &[Tool::Echo], &mut traj,
+            false, &productive_compaction_cfg(), Some(12), None, None, None, std::collections::BTreeMap::new(), None,
+        )
+        .expect("the run completes");
+        assert_nudge_reached_the_request(&outcome, "post_compaction", tmp.path());
+    }
+
+    /// A hand-rolled SSE server: the FIRST connection sends one chunk then
+    /// goes silent past the client's read timeout; every later connection
+    /// answers with a clean `done`. httpmock cannot express "bytes stop".
+    fn silent_then_clean_server() -> String {
+        use std::io::{BufRead, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for (n, conn) in listener.incoming().enumerate() {
+                let Ok(mut sock) = conn else { return };
+                std::thread::spawn(move || {
+                    let mut head = std::io::BufReader::new(sock.try_clone().unwrap());
+                    let mut content_length = 0usize;
+                    loop {
+                        let mut line = String::new();
+                        if head.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                            break;
+                        }
+                        if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                            content_length = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    let mut body = vec![0u8; content_length];
+                    let _ = head.read_exact(&mut body);
+                    let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n");
+                    let frame = |sock: &mut std::net::TcpStream, payload: String| {
+                        let _ = sock.write_all(format!("{:x}\r\n{payload}\r\n", payload.len()).as_bytes());
+                        let _ = sock.flush();
+                    };
+                    if n == 0 {
+                        frame(&mut sock, "data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"<think>working through the problem step by step\"}}]}\n\n".to_string());
+                        std::thread::sleep(std::time::Duration::from_secs(4));
+                    } else {
+                        frame(&mut sock, "data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":12}}\n\n".to_string());
+                        frame(&mut sock, "data: [DONE]\n\n".to_string());
+                        let _ = sock.write_all(b"0\r\n\r\n");
+                    }
+                });
+            }
+        });
+        format!("http://{addr}/v1")
+    }
+
+    /// (B4) An endpoint that goes silent mid-stream ends THAT CALL, not the
+    /// dispatch: everything it produced is handed back and the run continues.
+    /// Deleting the silent arm makes this an `Err` (and loses every banked
+    /// checkpoint of a long turn).
+    #[test]
+    #[serial_test::serial]
+    fn a_silent_stream_hands_back_what_it_produced_instead_of_failing_the_dispatch() {
+        let url = silent_then_clean_server();
+        let client = LmStudioClient::with_base_url_and_read_timeout(url, std::time::Duration::from_millis(400));
+        let tmp = tempfile::Builder::new().prefix("silent-arm").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let outcome = run_with_sleeper(
+            &client, &client, "m", vec![Message::system("s"), Message::user("go")], &[Tool::Read], &mut traj, true,
+            &compaction::CompactionConfig::never_compact(), Some(6), None, Some(9_000), Some(1_000), Some(1_000),
+            None, std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &RealSleeper,
+        )
+        .expect("a silent endpoint must not fail the dispatch");
+        assert_eq!(outcome.terminal_reason, TerminalReason::Stop, "the run carried on after the silent call");
+        let raw = std::fs::read_to_string(tmp.path().join(".darkmux-runtime").join("trajectory.jsonl")).unwrap();
+        let first_completed = raw
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["type"] == "model.completed")
+            .expect("the silent call is recorded");
+        assert_eq!(first_completed["finish_reason"], "length", "a cut call closes as length");
+        assert!(first_completed["usage"].is_null(), "no usage arrived: {first_completed}");
+        assert!(first_completed["completion_estimate"].as_u64().unwrap_or(0) > 0, "its tokens are still counted: {first_completed}");
     }
 
     /// (#2114 finding 1) Resume-compaction parity: a checkpoint whose

@@ -42,6 +42,7 @@ mod budget_request;
 mod reasoning_loop;
 mod stream_gate;
 mod tool_result_prune;
+mod unproductive_compactions;
 mod tools;
 mod trajectory;
 #[cfg(test)]
