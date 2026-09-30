@@ -252,7 +252,14 @@ pub(crate) fn dispatch_reconciled_with(
             let lease_guard = residency_lease::LeaseGuard::acquire();
             let est = FixedEstimator::default();
             let mut host = host_factory();
-            crate::concurrent_dispatch::ensure_wave_loaded(&[placement], &est, host.as_mut(), &lease_guard).with_context(
+            crate::concurrent_dispatch::ensure_wave_loaded(
+                &[placement],
+                &est,
+                host.as_mut(),
+                &lease_guard,
+                crate::concurrent_dispatch::standing_utility_binding(opts.config_path.as_deref()).as_deref(),
+            )
+            .with_context(
                 || {
                     format!(
                         "darkmux: reconciling darkmux-owned residency before dispatching role `{}`",

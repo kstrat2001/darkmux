@@ -112,6 +112,20 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
+/// The registry's standing utility model (`internal.utility`) as the
+/// darkmux-namespaced identifier it is loaded under, for
+/// [`Facts::utility_binding`]. Every `Facts` a planning call is built from
+/// carries it, so the planner holds that resident by policy: a dispatch never
+/// unloads it, and only `darkmux machine eject` releases it. `None` when no
+/// utility model is registered or the registry does not load (the planner
+/// then has nothing to hold, which is the fail-open the registry read
+/// already has everywhere else).
+pub fn standing_utility_binding(config_path: Option<&str>) -> Option<String> {
+    let loaded = darkmux_profiles::profiles::load_registry_quiet(config_path).ok()?;
+    let id = loaded.registry.utility_model_id()?;
+    Some(crate::dispatch_internal::compactor_wire_model_id(id))
+}
+
 /// One job's completed outcome: its own value plus every flow record it
 /// produced (see the module doc's "Flow-record ordering" section).
 pub type JobOutcome<T> = Result<(T, Vec<FlowRecord>)>;
@@ -375,7 +389,9 @@ pub fn run_bounded<T: Send + 'static>(
         // Sibling scoped threads — genuinely interleaved wall-clock windows
         // (module doc: "interleaved with, never blocked behind").
         let local_track = (!local_by_seat.is_empty() || !schedule.refusals.is_empty()).then(|| {
-            spawn_scoped_named(scope, || run_local_waves(schedule, local_by_seat, &results, est, host_factory))
+            spawn_scoped_named(scope, || {
+                run_local_waves(schedule, local_by_seat, &results, est, host_factory, facts.utility_binding.as_deref())
+            })
         });
         let remote_track = (!remote_jobs.is_empty())
             .then(|| spawn_scoped_named(scope, || run_capped_batches(remote_jobs, remote_cap, &results)));
@@ -457,6 +473,7 @@ fn run_local_waves<T: Send + 'static>(
     results: &ResultsSink<T>,
     est: &(dyn FootprintEstimator + Sync),
     host_factory: &(dyn Fn() -> Box<dyn ModelHost> + Sync),
+    utility_binding: Option<&str>,
 ) {
     // One host instance for this whole local track — waves within it run
     // strictly sequentially (the `for wave in &schedule.waves` loop below),
@@ -491,7 +508,7 @@ fn run_local_waves<T: Send + 'static>(
         }
     }
     for wave in &schedule.waves {
-        if let Err(e) = ensure_wave_loaded(wave, est, host.as_mut(), &lease_guard) {
+        if let Err(e) = ensure_wave_loaded(wave, est, host.as_mut(), &lease_guard, utility_binding) {
             for placement in wave {
                 if let Some((index, _job)) = by_seat.remove(&placement.seat) {
                     results.lock().expect("results mutex poisoned").push((
@@ -858,6 +875,10 @@ fn partial_execution_note(committed: &[String]) -> String {
 /// evict them. See `dispatch_reconciled`'s own module doc for the full
 /// list of which callers this is and is not safe for.
 ///
+/// `utility_binding` is [`Facts::utility_binding`] for this reconcile's fresh
+/// snapshot (see [`standing_utility_binding`]): the planner holds that
+/// resident, so pass 1 keeps it and no eviction arm takes it.
+///
 /// `lease` (#2651) is the CALLER's own already-acquired
 /// [`residency_lease::LeaseGuard`] — never acquired here, and never a bare
 /// pid-keyed write. Threading the specific guard through explicitly is what
@@ -870,6 +891,7 @@ pub(crate) fn ensure_wave_loaded(
     est: &(dyn FootprintEstimator + Sync),
     host: &mut dyn ModelHost,
     lease: &residency_lease::LeaseGuard,
+    utility_binding: Option<&str>,
 ) -> Result<()> {
     // (#1442 ship-2b, found live) A wave's placements are per-STEP, and the
     // seats x k fan-out makes SAME-MODEL duplicates the norm (k sibling
@@ -927,7 +949,7 @@ pub(crate) fn ensure_wave_loaded(
             .list_resident()
             .map_err(|e| anyhow!("darkmux: could not read LMStudio residents (`lms ps`): {e}"))?;
         let pools = MacProbe.pools().unwrap_or_default();
-        let facts = Facts { residents, pools, ..Default::default() };
+        let facts = Facts { residents, pools, utility_binding: utility_binding.map(str::to_string), ..Default::default() };
 
         // Every OTHER live holder's lease, read fresh every attempt (the
         // blocker this attempt is retrying past may free between
@@ -1253,7 +1275,7 @@ mod tests {
             Placement { model_key: "m".into(), identifier: "darkmux:m".into(), min_ctx: 64_000, seat: "step:probe-1".into() },
         ];
         let lease_guard = residency_lease::LeaseGuard::acquire();
-        ensure_wave_loaded(&wave, &est, &mut host, &lease_guard)
+        ensure_wave_loaded(&wave, &est, &mut host, &lease_guard, None)
             .expect("duplicate placements reconcile once, never a second NotResident unload");
 
         let unloads: Vec<_> = host
@@ -1288,7 +1310,7 @@ mod tests {
         let wave = vec![placement("m", 8_000)];
 
         let lease_guard = residency_lease::LeaseGuard::acquire();
-        ensure_wave_loaded(&wave, &est, &mut host, &lease_guard).expect("the wanted model loads");
+        ensure_wave_loaded(&wave, &est, &mut host, &lease_guard, None).expect("the wanted model loads");
 
         assert_eq!(
             host.ops,
@@ -1303,6 +1325,56 @@ mod tests {
             ],
             "the stale orphan is evicted (pass 1) before the desired model loads"
         );
+    }
+
+    /// The reported live case: a dispatch that stages only its own model
+    /// must leave the registry's standing utility model loaded. The
+    /// binding is the ONLY difference from the orphan-eviction test above.
+    #[serial_test::serial]
+    #[test]
+    fn ensure_wave_loaded_keeps_the_standing_utility_binding_resident() {
+        let _env = LeaseTestEnv::new();
+        let est = FixedEstimator(BTreeMap::from([("m".to_string(), 1_000u64)]));
+        let mut host = MockHost::new()
+            .resident("darkmux:util-4b", "util-4b", 32_000, Some(1_000))
+            .cataloged("m", 1_000);
+        let wave = vec![placement("m", 8_000)];
+
+        let lease_guard = residency_lease::LeaseGuard::acquire();
+        ensure_wave_loaded(&wave, &est, &mut host, &lease_guard, Some("darkmux:util-4b"))
+            .expect("the wanted model loads");
+
+        assert_eq!(
+            host.ops,
+            vec![
+                darkmux_gestalt::mock::HostOp::ListResident,
+                darkmux_gestalt::mock::HostOp::Load {
+                    model_key: "m".to_string(),
+                    identifier: "darkmux:m".to_string(),
+                    min_ctx: 8_000,
+                },
+            ],
+            "the utility binding is never unloaded by a dispatch that does not name it"
+        );
+    }
+
+    /// `standing_utility_binding` resolves the registry's `internal.utility`
+    /// to the namespaced identifier it is loaded under, from either spelling.
+    #[test]
+    fn standing_utility_binding_is_the_namespaced_identifier() {
+        let dir = tempfile::tempdir().unwrap();
+        for (spelling, expected) in [("qwen/qwen3-4b-2507", "darkmux:qwen/qwen3-4b-2507"), ("darkmux:util-4b", "darkmux:util-4b")] {
+            let path = dir.path().join("profiles.json");
+            std::fs::write(
+                &path,
+                format!(r#"{{"profiles":{{"p":{{"models":[{{"id":"m","n_ctx":8000}}]}}}},"internal":{{"utility":{{"id":"{spelling}","n_ctx":32000}}}}}}"#),
+            )
+            .unwrap();
+            assert_eq!(standing_utility_binding(path.to_str()).as_deref(), Some(expected));
+        }
+        let none = dir.path().join("none.json");
+        std::fs::write(&none, r#"{"profiles":{"p":{"models":[{"id":"m","n_ctx":8000}]}}}"#).unwrap();
+        assert_eq!(standing_utility_binding(none.to_str()), None);
     }
 
     /// (#1487 PR2) The concurrency-safety delta test: the SAME orphan as
@@ -1337,7 +1409,7 @@ mod tests {
         let wave = vec![placement("m", 8_000)];
 
         let lease_guard = residency_lease::LeaseGuard::acquire();
-        ensure_wave_loaded(&wave, &est, &mut host, &lease_guard).expect("the wanted model loads");
+        ensure_wave_loaded(&wave, &est, &mut host, &lease_guard, None).expect("the wanted model loads");
 
         let unloads: Vec<_> = host
             .ops
@@ -1406,7 +1478,7 @@ mod tests {
         let wave = vec![placement("m", 68_000)];
 
         let own_guard = residency_lease::LeaseGuard::acquire();
-        let err = ensure_wave_loaded(&wave, &est, &mut host, &own_guard)
+        let err = ensure_wave_loaded(&wave, &est, &mut host, &own_guard, None)
             .expect_err("a live sibling's model at insufficient ctx must Block, not reconcile");
 
         assert!(
@@ -1466,7 +1538,7 @@ mod tests {
         let wave = vec![placement("m", 68_000)];
 
         let lease_guard = residency_lease::LeaseGuard::acquire();
-        let err = ensure_wave_loaded(&wave, &est, &mut host, &lease_guard).expect_err(
+        let err = ensure_wave_loaded(&wave, &est, &mut host, &lease_guard, None).expect_err(
             "a live EXTERNAL process's pinned model at insufficient ctx must Block, not reconcile",
         );
 
@@ -1502,7 +1574,7 @@ mod tests {
         let wave = vec![placement("m", 68_000)];
 
         let lease_guard = residency_lease::LeaseGuard::acquire();
-        ensure_wave_loaded(&wave, &est, &mut host, &lease_guard)
+        ensure_wave_loaded(&wave, &est, &mut host, &lease_guard, None)
             .expect("an unpinned stale resident still reconciles");
 
         assert_eq!(
@@ -2099,7 +2171,7 @@ mod tests {
         let wave = vec![placement("m", 68_000)];
 
         let own_guard = residency_lease::LeaseGuard::acquire();
-        let err = ensure_wave_loaded(&wave, &est, &mut host, &own_guard)
+        let err = ensure_wave_loaded(&wave, &est, &mut host, &own_guard, None)
             .expect_err("every reload attempt fails");
 
         let msg = err.to_string();
@@ -2165,7 +2237,7 @@ mod tests {
         let wave = vec![placement("m", 68_000)];
 
         let own_guard = residency_lease::LeaseGuard::acquire();
-        let err = ensure_wave_loaded(&wave, &est, &mut host, &own_guard)
+        let err = ensure_wave_loaded(&wave, &est, &mut host, &own_guard, None)
             .expect_err("the claimed resident blocks this wave");
 
         let msg = err.to_string();
@@ -2213,7 +2285,7 @@ mod tests {
         let wave = vec![placement("m", 68_000)];
 
         let own_guard = residency_lease::LeaseGuard::acquire();
-        let err = ensure_wave_loaded(&wave, &est, &mut host, &own_guard)
+        let err = ensure_wave_loaded(&wave, &est, &mut host, &own_guard, None)
             .expect_err("the claimed resident blocks this wave");
 
         assert!(
@@ -2266,7 +2338,7 @@ mod tests {
         let wave = vec![placement("a", 68_000), placement("b", 68_000)];
 
         let own_guard = residency_lease::LeaseGuard::acquire();
-        let err = ensure_wave_loaded(&wave, &est, &mut host, &own_guard)
+        let err = ensure_wave_loaded(&wave, &est, &mut host, &own_guard, None)
             .expect_err("the claimed resident blocks this wave");
 
         assert!(
@@ -2308,7 +2380,7 @@ mod tests {
         let wave = vec![placement("m", 68_000)];
 
         let lease_guard = residency_lease::LeaseGuard::acquire();
-        let err = ensure_wave_loaded(&wave, &est, &mut host, &lease_guard)
+        let err = ensure_wave_loaded(&wave, &est, &mut host, &lease_guard, None)
             .expect_err("the reload fails");
 
         let msg = err.to_string();
@@ -2362,7 +2434,7 @@ mod tests {
         let wave = vec![placement("m", 68_000)];
 
         let own_guard = residency_lease::LeaseGuard::acquire();
-        let err = ensure_wave_loaded(&wave, &est, &mut host, &own_guard)
+        let err = ensure_wave_loaded(&wave, &est, &mut host, &own_guard, None)
             .expect_err("a permanently claimed resident never becomes reconcilable");
 
         let list_attempts = host
@@ -2513,12 +2585,12 @@ mod tests {
                 let handle_a = spawn_scoped_named(scope, move || {
                     let mut host_a = host_a;
                     barrier_ref.wait();
-                    ensure_wave_loaded(&wave_a, est_ref, &mut host_a, guard_a_ref)
+                    ensure_wave_loaded(&wave_a, est_ref, &mut host_a, guard_a_ref, None)
                 });
                 let handle_b = spawn_scoped_named(scope, move || {
                     let mut host_b = host_b;
                     barrier_ref.wait();
-                    ensure_wave_loaded(&wave_b, est_ref, &mut host_b, guard_b_ref)
+                    ensure_wave_loaded(&wave_b, est_ref, &mut host_b, guard_b_ref, None)
                 });
 
                 (handle_a.join().expect("thread A joins"), handle_b.join().expect("thread B joins"))
@@ -2583,7 +2655,7 @@ mod tests {
         // a completely different model, in the SAME process as the
         // sibling above.
         let own_guard = residency_lease::LeaseGuard::acquire();
-        ensure_wave_loaded(&wave, &est, &mut host, &own_guard).expect("the wanted model loads");
+        ensure_wave_loaded(&wave, &est, &mut host, &own_guard, None).expect("the wanted model loads");
 
         let unloads: Vec<_> = host
             .ops
@@ -2643,7 +2715,7 @@ mod tests {
         let wave = vec![placement("m", 8_000)];
 
         let own_guard = residency_lease::LeaseGuard::acquire();
-        ensure_wave_loaded(&wave, &est, &mut host, &own_guard).expect("the wanted model loads");
+        ensure_wave_loaded(&wave, &est, &mut host, &own_guard, None).expect("the wanted model loads");
 
         assert!(
             host.ops.iter().any(|op| matches!(
@@ -2688,7 +2760,7 @@ mod tests {
         let wave = vec![placement("m", 8_000)];
 
         let own_guard = residency_lease::LeaseGuard::acquire();
-        ensure_wave_loaded(&wave, &est, &mut host, &own_guard).expect("the wanted model loads");
+        ensure_wave_loaded(&wave, &est, &mut host, &own_guard, None).expect("the wanted model loads");
 
         let unloaded: Vec<String> = host
             .ops
@@ -2726,7 +2798,7 @@ mod tests {
         let wave = vec![placement("m", 8_000)];
 
         let lease_guard = residency_lease::LeaseGuard::acquire();
-        ensure_wave_loaded(&wave, &est, &mut host, &lease_guard).expect("the model loads");
+        ensure_wave_loaded(&wave, &est, &mut host, &lease_guard, None).expect("the model loads");
 
         // Read back as if from a DIFFERENT process — own-pid exclusion is
         // exactly what `residency_lease`'s own unit tests already prove, so
@@ -2768,7 +2840,7 @@ mod tests {
         let wave = vec![placement("m", 8_000)];
 
         let lease_guard = residency_lease::LeaseGuard::acquire();
-        ensure_wave_loaded(&wave, &est, &mut host, &lease_guard)
+        ensure_wave_loaded(&wave, &est, &mut host, &lease_guard, None)
             .expect("a pinned-external shortfall retries past the scripted failure and succeeds");
 
         let load_attempts = host
@@ -2796,7 +2868,7 @@ mod tests {
         let wave = vec![placement("m", 8_000)];
 
         let lease_guard = residency_lease::LeaseGuard::acquire();
-        let err = ensure_wave_loaded(&wave, &est, &mut host, &lease_guard)
+        let err = ensure_wave_loaded(&wave, &est, &mut host, &lease_guard, None)
             .expect_err("no pinned holder explains the shortfall — this can never be transient");
         assert!(
             err.to_string().contains("no concurrent darkmux"),
@@ -2857,7 +2929,7 @@ mod tests {
         ];
 
         let lease_guard = residency_lease::LeaseGuard::acquire();
-        let err = ensure_wave_loaded(&wave, &est, &mut host, &lease_guard)
+        let err = ensure_wave_loaded(&wave, &est, &mut host, &lease_guard, None)
             .expect_err("a same-plan collision is never satisfiable by waiting");
         assert!(
             err.to_string().contains("never resolve by waiting"),
@@ -3213,6 +3285,74 @@ mod tests {
              identifiers overlap with each other — a={}, b={}",
             tracker_a.max_observed(),
             tracker_b.max_observed()
+        );
+    }
+
+    /// The `run_bounded` seam of the utility hold: `facts.utility_binding`
+    /// must reach the reconcile inside `run_local_waves`. A host that
+    /// records every unload sees none for the utility resident, while an
+    /// unrelated orphan is still unloaded (so the recorder can see unloads).
+    #[serial_test::serial]
+    #[test]
+    fn run_bounded_threads_the_utility_binding_to_the_reconcile() {
+        struct RecHost {
+            inner: MockHost,
+            unloads: Arc<Mutex<Vec<String>>>,
+        }
+        impl ModelHost for RecHost {
+            fn list_resident(&mut self) -> Result<Vec<darkmux_gestalt::ResidentFact>, darkmux_gestalt::HostError> {
+                self.inner.list_resident()
+            }
+            fn list_catalog(&mut self) -> Result<Vec<darkmux_gestalt::CatalogFact>, darkmux_gestalt::HostError> {
+                self.inner.list_catalog()
+            }
+            fn load(
+                &mut self,
+                model_key: &str,
+                identifier: &str,
+                min_ctx: u32,
+                deadline: Deadline,
+            ) -> Result<darkmux_gestalt::LoadReport, darkmux_gestalt::HostError> {
+                self.inner.load(model_key, identifier, min_ctx, deadline)
+            }
+            fn unload(
+                &mut self,
+                target: &darkmux_gestalt::OwnedTarget,
+                deadline: Deadline,
+            ) -> Result<(), darkmux_gestalt::HostError> {
+                self.unloads.lock().unwrap().push(target.identifier().to_string());
+                self.inner.unload(target, deadline)
+            }
+        }
+        let _env = LeaseTestEnv::new();
+        unsafe { std::env::remove_var("DARKMUX_LOCAL_DISPATCH_CONCURRENCY") };
+        let est = FixedEstimator(BTreeMap::from([("m".to_string(), 1_000u64)]));
+        let facts = Facts { utility_binding: Some("darkmux:util-4b".to_string()), ..Default::default() };
+        let unloads = Arc::new(Mutex::new(Vec::new()));
+        let factory = {
+            let unloads = unloads.clone();
+            move || -> Box<dyn ModelHost> {
+                Box::new(RecHost {
+                    inner: MockHost::new()
+                        .resident("darkmux:util-4b", "util-4b", 32_000, Some(1_000))
+                        .resident("darkmux:orphan", "orphan", 32_000, Some(1_000))
+                        .cataloged("m", 1_000),
+                    unloads: unloads.clone(),
+                })
+            }
+        };
+        let marker = Arc::new(AtomicU32::new(0));
+        let jobs = vec![QueuedJob {
+            index: 0,
+            seat: SeatClaim::LocalModel(placement("m", 8_000)),
+            job: ok_job(0, marker.clone()),
+        }];
+        let results = run_bounded(jobs, &facts, &est, 4, 4, &factory).expect("planning never fails under Auto");
+        assert!(results[0].1.is_ok(), "the wave must run");
+        assert_eq!(
+            *unloads.lock().unwrap(),
+            vec!["darkmux:orphan".to_string()],
+            "the orphan goes; the utility binding is never unloaded"
         );
     }
 
