@@ -382,7 +382,7 @@ fn peer_target_with(
         true,
         provider,
     )?;
-    Ok(fleet::pin_on_first_contact(target, &entry.id, provider)?)
+    fleet::pin_on_first_contact(target, &entry.id, provider)
 }
 
 /// (#2924 MF-3) The address to dial for a roster entry. This machine's own
