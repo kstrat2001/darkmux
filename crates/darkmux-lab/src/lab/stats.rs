@@ -344,6 +344,9 @@ impl RunStats {
     pub fn unreconciled(&self) -> Vec<&'static str> {
         let c = &self.checks;
         let mut out = Vec::new();
+        if self.result.as_deref() == Some(darkmux_trajectory::RESULT_INTERRUPTED) {
+            out.push("the run was interrupted: these figures cover only what completed");
+        }
         if !c.rest_within_wall {
             out.push("rest exceeds wall");
         }

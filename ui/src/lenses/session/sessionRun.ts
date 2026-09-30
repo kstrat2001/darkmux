@@ -54,7 +54,7 @@
  */
 
 import { statusLabel, computeTMax, type RunState } from "../../lib/flow";
-import { DEFAULT_POLICY, NO_PRESENCE, endMs, isRunning, lifecycleAt, recordedWallMs, toRunState, type Close, type CloseEdge, type Lifecycle, type LifecyclePolicy, type Presence } from "../../lib/lifecycle";
+import { DEFAULT_POLICY, NO_PRESENCE, endMs, isRunning, lifecycleAt, recordedActiveMs, recordedWallMs, toRunState, type Close, type CloseEdge, type Lifecycle, type LifecyclePolicy, type Presence } from "../../lib/lifecycle";
 import { runIndex, sessionRun, type RunGroup, type RunRecords } from "../../lib/runRef";
 import { fmtElapsed, clk, clkAt, fmtC } from "../../lib/format";
 import { aggregateHostSamples, roundPct } from "../../lib/hostStats";
@@ -66,13 +66,19 @@ import { PURPOSE, sumUsage } from "../../lib/usageRecords";
 import { toolOutcome } from "../../lib/recordDetail";
 import type { RunStatus } from "../../types/generated/RunStatus";
 import type { DispatchStartPayload } from "../../types/generated/DispatchStartPayload";
-import { ACTION, CATEGORY, SOURCE, byTime, endPayloadOf, payloadOf, isBookendTerminal, latestByTime, recordsAsOf, type NormRecord, type NormSource } from "../../lib/ingest";
+import { ACTION, CATEGORY, SOURCE, byTime, endPayloadOf, payloadOf, isBookendTerminal, isDispatchTerminal, latestByTime, recordsAsOf, type NormRecord, type NormSource } from "../../lib/ingest";
 import { maxOf } from "../../lib/numbers";
 
-/** The run-time figure's long hover text, shared by SYSTEM's WALL CLOCK and
- *  (#2890) the MODEL section's ACTIVE TIME, which show the same number. */
+/** SYSTEM's WALL CLOCK hover text, for a unit with no model section (the MODEL
+ *  section's ACTIVE TIME has its own, below: it shows wall minus rest). */
 const WALL_HINT_TITLE =
-  "run time — the runtime's own measure of this execution, INCLUDING any thermal rest. A mission step's badge covers a WIDER span (setup and gate included) and reads longer.";
+  "run time — the runtime's own measure of this execution, INCLUDING any rest. A mission step's badge covers a WIDER span (setup and gate included) and reads longer.";
+
+/** The MODEL section's ACTIVE TIME hover text: wall clock minus every rest, the
+ *  figure `darkmux run stats` prints as active. The brief's timing line beside it
+ *  keeps the wall clock. */
+const ACTIVE_HINT_TITLE =
+  "run time, active: the run's wall clock minus every rest it took (the figure darkmux run stats reports as active); the timing line in the brief shows the wall clock. A mission step's badge covers a WIDER span (setup and gate included) and reads longer. While the run is live this is the time elapsed so far; rests settle in the final figure.";
 
 /** (#2863) The detectors a clean run passed, in the order the old sentence
  * named them (`cycle, tool-failure, reasoning-loop, edit-drift`). One list,
@@ -505,13 +511,30 @@ function rollUpMissionModelWork(siblings: readonly RunGroup[]): MissionModelRoll
  *  work. (#2902 step 2a) Its own tokens, utility excluded. */
 function executionFigures(own: readonly NormRecord[]): (ModelFigures & { loads: NormRecord[] }) | null {
   const tel = own.filter((r) => r.category === CATEGORY.Telemetry);
-  const rt = bySource(tel, SOURCE.Runtime).slice(-1)[0] ?? null;
   const tok = executionTokens(own);
   const cx = contextFigures(tel);
   const loads = bySource(tel, SOURCE.Lms).filter(isLoad);
-  const turns = rt ? Number((rt.fields as Record<string, unknown>).turns) : null;
+  const turns = turnCount(own);
   const fig = { turns, tokIn: tok ? tok.prompt : null, tokOut: tok ? tok.completion : null, ctxPeak: cx.ctxPeak, ctxNow: cx.ctxNow, nctx: cx.nctx, loads };
   return loads.length > 0 || turns != null || tok != null || cx.samples > 0 ? fig : null;
+}
+
+/** THE turn count of a set of records, for every dispatch path: the SUM of the
+ *  `total_turns` of the executions' terminal records (one type,
+ *  `DispatchEndPayload`, for `dispatch.complete` and `dispatch.error`; every
+ *  producer states it). It sums over the same records `executionTokens` sums
+ *  usage over, so an execution retried within the set, or several sharing one
+ *  session, count once each in both figures. With no terminal that states it
+ *  (a run still in progress, or an archive from before every producer did) it
+ *  falls back to the turns so far: the `runtime` telemetry record, which
+ *  `flowToRenderModel` derives from the `dispatch.turn` records. `null` when
+ *  neither exists. */
+function turnCount(records: readonly NormRecord[]): number | null {
+  const stated = records.filter((r) => isDispatchTerminal(r.action)).flatMap((r) => endPayloadOf(r)?.total_turns ?? []);
+  if (stated.length > 0) return stated.reduce((a, b) => a + b, 0);
+  const runtime = bySource(records, SOURCE.Runtime).slice(-1)[0];
+  const sofar = Number((runtime?.fields as Record<string, unknown> | undefined)?.turns);
+  return runtime && Number.isFinite(sofar) ? sofar : null;
 }
 
 const addOpt = (a: number | null, b: number | null): number | null => (b == null ? a : (a ?? 0) + b);
@@ -636,7 +659,6 @@ interface AttemptTelemetry {
   /** Host cpu/ram/gpu samples: the retired per-session `telemetry.process`
    *  and the machine's own `machine.telemetry` over the run's window. */
   procs: NormRecord[];
-  rt: NormRecord | null;
   dets: NormRecord[];
   loads: NormRecord[];
   /** The models loaded, first-seen order. */
@@ -656,7 +678,6 @@ function attemptTelemetry(visible: readonly NormRecord[], ctx: RunContext): Atte
     tel,
     lms,
     procs: [...bySource(tel, SOURCE.Host), ...hostSamplesOf(visible, ctx)],
-    rt: bySource(tel, SOURCE.Runtime).slice(-1)[0] ?? null,
     dets: bySource(tel, SOURCE.Detector),
     loads,
     distinct: [...new Set(loads.map((r) => (r.fields as Record<string, unknown>).model as string))],
@@ -685,7 +706,10 @@ function hostSamplesOf(visible: readonly NormRecord[], ctx: RunContext): NormRec
   );
 }
 
-/** (#2011) The run's duration and the run-time tile's figures. A finished
+/** (#2011) The run's duration and the run-time tile's figures. `activeElapsed`
+ * is the ACTIVE TIME figure: a finished run's `recordedActiveMs` (wall minus
+ * rest), else what `wallElapsed` reads (a live run's elapsed so far, a close
+ * with no recorded wall). A finished
  * run's duration is its dispatch terminal's own `wall_ms` (the runtime's
  * measure, `recordedWallMs`), not recomputed from two timestamps: a page
  * whose records go stale keeps counting, and taking the number from the
@@ -697,13 +721,14 @@ function hostSamplesOf(visible: readonly NormRecord[], ctx: RunContext): NormRec
  * minus its start. (U3-7/U5-2) `fmtElapsed` says hours past an hour.
  * (#2860) How it ended rides the tile's `sub` line, never the figure, which
  * is contracted to one short `nowrap` value. */
-function wallClock(ctx: RunContext, nowMs: number): { runWallMs: number; wallElapsed: string; wallBase: string; wallSub: string | undefined } {
+function wallClock(ctx: RunContext, nowMs: number): { runWallMs: number; activeElapsed: string; wallBase: string; wallSub: string | undefined } {
   const recorded = recordedWallMs(ctx.l?.close ?? null);
   const runWallMs = recorded ?? (ctx.endTs !== null ? ctx.endTs - ctx.startTs : NaN);
   const wallElapsed = ctx.done ? fmtElapsed(runWallMs) : fmtElapsed(nowMs - ctx.startTs);
+  const activeMs = recordedActiveMs(ctx.l?.close ?? null);
   return {
     runWallMs,
-    wallElapsed,
+    activeElapsed: ctx.done && activeMs !== null ? fmtElapsed(activeMs) : wallElapsed,
     wallBase: ctx.done ? wallElapsed : `${wallElapsed} so far`,
     wallSub: errorOutcome(ctx.l?.close?.edge),
   };
@@ -1013,19 +1038,27 @@ const loadFields = (r: NormRecord): Record<string, unknown> => r.fields as Recor
 type ModelEntry = { name: string; gb: number | null; ran: boolean | null };
 
 /** The loaded-models track, the model that ran first. `endpointModel` is
- *  the model an endpoint-served run names (it has no loads to list); a run
- *  that loaded nothing itself falls back to its mission's (`rollupLines`,
- *  unlabeled: primary/also-loaded compare this run's own fields), then to
+ *  the model an endpoint-served run names (it has no loads to list). A run
+ *  that loaded nothing itself falls back, in order, to: the model it ran on
+ *  (`residentModel`: the model its `dispatch.start` names, which every path
+ *  writes, given to it only once the run has model evidence; it was already
+ *  resident, so nothing here loaded it), its mission's loads (`rollupLines`,
+ *  unlabeled: primary/also-loaded compare this run's own fields), then
  *  "no telemetry yet". */
-function modelTrackOf(loads: readonly NormRecord[], primaryModel: string | null, endpointModel: string | null, rollupLines: string[]): { modelEntries?: ModelEntry[]; modelTrackLines: string[] } {
+function modelTrackOf(loads: readonly NormRecord[], primaryModel: string | null, endpointModel: string | null, residentModel: string | null, rollupLines: string[]): { modelEntries?: ModelEntry[]; modelTrackLines: string[] } {
   if (endpointModel !== null) return { modelTrackLines: [endpointModel] };
   const isRan = (r: NormRecord) => primaryModel != null && bareModel(loadFields(r).model) === bareModel(primaryModel);
   const ordered = [...loads].sort((a, b) => Number(isRan(b)) - Number(isRan(a)));
-  if (!ordered.length) return { modelTrackLines: rollupLines.length ? rollupLines : ["no telemetry yet"] };
+  if (!ordered.length) return { modelTrackLines: fallbackTrackLines(residentModel, rollupLines) };
   return {
     modelEntries: ordered.map((r) => modelEntryOf(loadFields(r), primaryModel == null ? null : isRan(r))),
     modelTrackLines: ordered.map((r) => modelLineOf(loadFields(r), primaryModel == null ? null : isRan(r))),
   };
+}
+
+function fallbackTrackLines(residentModel: string | null, rollupLines: string[]): string[] {
+  if (residentModel !== null) return [`${bareModel(residentModel)} · already resident`];
+  return rollupLines.length ? rollupLines : ["no telemetry yet"];
 }
 
 function modelEntryOf(f: Record<string, unknown>, ran: boolean | null): ModelEntry {
@@ -1493,9 +1526,9 @@ export function runRegions(
   const ctx = runContext(data, sid, nowMs, policy, presence);
   const { run, l, d, firstSessRec, startTs, inAttempt, endTs, c, done, skewedClose, state } = ctx;
   const visible = recordsAsOf(data, nowMs);
-  const { tel, lms, procs, rt, dets, loads, distinct, comps } = attemptTelemetry(visible, ctx);
-
-  const turnsValue = rt ? Number((rt.fields as Record<string, unknown>).turns) : null;
+  const { tel, lms, procs, dets, loads, distinct, comps } = attemptTelemetry(visible, ctx);
+  const attemptRecs = visible.filter(inAttempt);
+  const turnsValue = turnCount(attemptRecs);
 
   const { samples: ctxSamples, nctx, ctxPeak, ctxNow } = contextFigures(tel);
 
@@ -1503,10 +1536,9 @@ export function runRegions(
   // heartbeats alone — a run emitting turns and tool results is demonstrably
   // alive whether or not a heartbeat happens to have landed recently, and
   // keying only on heartbeats would make a busy run look dead.
-  const attemptRecs = visible.filter(inAttempt);
   const lastBeatMs = latestByTime(attemptRecs)?.tMs ?? null;
 
-  const { runWallMs, wallElapsed, wallBase, wallSub } = wallClock(ctx, nowMs);
+  const { runWallMs, activeElapsed, wallBase, wallSub } = wallClock(ctx, nowMs);
 
   const role = roleOf(d ?? firstSessRec);
   const svLabel = statusLabel(state);
@@ -1621,10 +1653,13 @@ export function runRegions(
     // numbers rolled up).
     const tools = toolCounts(tokRateRuns === ownRuns ? attemptRecs : recordsAsOf(tokRateRuns.flatMap((g) => g.records), nowMs));
     push(modelIdx, { value: String(tools.calls), label: "TOOL CALLS", sub: `${tools.failed} failed` });
-    push(modelIdx, { value: wallElapsed, label: "ACTIVE TIME", hintTitle: WALL_HINT_TITLE, sub: activeTimeSub(done, wallSub, rests.get("thermal"), armed.thermal === true) });
+    push(modelIdx, { value: activeElapsed, label: "ACTIVE TIME", hintTitle: ACTIVE_HINT_TITLE, sub: activeTimeSub(done, wallSub, rests.get("thermal"), armed.thermal === true) });
   }
   push(modelIdx, { value: effTokIn != null ? fmtC(effTokIn) : "—", label: "TOKENS IN" });
   push(modelIdx, { value: effTokOut != null ? fmtC(effTokOut) : "—", label: "TOKENS OUT" });
+  // A single-shot call records no `telemetry.context` sample and neither
+  // bookend names the model's window, so its prompt has nothing to be a share
+  // of: the tile reads a dash rather than a guessed window.
   push(modelIdx, ctxTileOf(eff, ctxTileFigures));
   // (#2877, #2890) A finished run's average generation rate: the MODEL
   // hero scope's center once the run is done. A run still in progress shows
@@ -1688,7 +1723,7 @@ export function runRegions(
   // load telemetry reports the bare key; compared as-is they never matched,
   // and every model on a real run, including the one that ran, read "also
   // loaded". The model that ran is listed first.
-  const { modelEntries, modelTrackLines } = modelTrackOf(loads, primaryModel, ep ? (model || "unknown") : null, rollup?.loadLines ?? []);
+  const { modelEntries, modelTrackLines } = modelTrackOf(loads, primaryModel, ep ? (model || "unknown") : null, ownHasTelemetryEvidence ? primaryModel : null, rollup?.loadLines ?? []);
 
   const { signalGroups, signalsLabel, repetitionOff, repetitionRecorded } = runSignals({
     skewedClose,

@@ -19,6 +19,7 @@ use darkmux_types::session_id::{RunId, SessionId};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::process::Command;
 
 pub(crate) struct CodingTaskProvider;
@@ -272,6 +273,13 @@ impl WorkloadProvider for CodingTaskProvider {
         if let Some(ov) = loop_override {
             ov.apply(&mut compaction);
         }
+        // (#3014) Name the out dir BEFORE dispatching, so an interrupted or
+        // failed dispatch (which returns `Err` with no `DispatchResult` to
+        // read the path from) still has its trajectory preserved into the
+        // run dir. The guard covers every exit before the success-path copy
+        // below: `?`, a panic that unwinds, a signal that ends the dispatch.
+        let out_dir = named_out_dir(&role);
+        let mut preserve = TrajectoryPreserver::new(out_dir.clone(), run_dir.to_path_buf());
         // Pass sandbox_dir as --workdir so the runtime mounts it at
         // /workspace, matching the placeholder substitution above (#337 fix).
         let (stdout, stderr, ok, dispatch_out_dir) = dispatch_via_internal(
@@ -283,6 +291,7 @@ impl WorkloadProvider for CodingTaskProvider {
             profile_name,
             loaded.manifest.workload.image.as_deref(),
             config_path,
+            out_dir,
         )?;
         let duration_ms = started.elapsed().as_millis();
 
@@ -333,6 +342,7 @@ impl WorkloadProvider for CodingTaskProvider {
             }
             refused_artifacts = preserved.refused;
         }
+        preserve.disarm();
 
         let verify_outcome = run_verify_command(loaded, run_dir, sandbox_dir)?;
 
@@ -754,6 +764,7 @@ fn dispatch_via_internal(
     profile_name: &str,
     image: Option<&str>,
     config_path: Option<&str>,
+    host_out: PathBuf,
 ) -> Result<(String, String, bool, Option<PathBuf>)> {
     use darkmux_crew::dispatch::{dispatch, DispatchOpts};
     let opts = DispatchOpts {
@@ -767,7 +778,7 @@ fn dispatch_via_internal(
         workspace_read_only: false,
         record_context: None,
         resume_from: None,
-        host_out: None,
+        host_out: Some(host_out),
         max_turns_override: None,
         timeout_override_seconds: None, // (#2480)
         role_id: role_id.to_string(),
@@ -809,6 +820,54 @@ fn dispatch_via_internal(
         result.exit_code == 0,
         result.out_dir,
     ))
+}
+
+/// The out dir a lab dispatch is given, named in the shape a dispatch names
+/// its own (`darkmux-out-<role>-<unix micros>`), so `darkmux doctor`'s
+/// temp-residue check treats it the same. Only the NAME is chosen here; the
+/// dispatch creates the directory and refuses one that already exists.
+fn named_out_dir(role_id: &str) -> PathBuf {
+    let micros = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_micros()).unwrap_or(0);
+    std::env::temp_dir().join(format!("darkmux-out-{role_id}-{micros}"))
+}
+
+/// (#3014) Preserves the runtime's trajectory and findings into the run dir
+/// when the dispatch's exit is not the success path, so an interrupted run's
+/// evidence is in its run dir instead of a temp dir the OS may reclaim.
+/// Armed until [`Self::disarm`]: the success path copies the same files
+/// itself (it needs the copy's outcome), then disarms.
+///
+/// A trajectory that never got a terminal record (the container was
+/// SIGKILLed) is closed with `interrupted`, so `darkmux run stats` reports
+/// what completed and says so, rather than reading an open-ended run.
+struct TrajectoryPreserver {
+    out_dir: PathBuf,
+    run_dir: PathBuf,
+    armed: bool,
+}
+
+impl TrajectoryPreserver {
+    fn new(out_dir: PathBuf, run_dir: PathBuf) -> Self {
+        Self { out_dir, run_dir, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TrajectoryPreserver {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let preserved = preserve_runtime_artifacts(&self.out_dir, &self.run_dir, &["trajectory.jsonl", "findings.jsonl"]);
+        if preserved.copied.iter().any(|n| n == "trajectory.jsonl") {
+            if let Err(e) = darkmux_trajectory::close_if_unterminated(&self.run_dir.join("trajectory.jsonl")) {
+                eprintln!("darkmux: warn — could not mark the preserved trajectory interrupted: {e}");
+            }
+        }
+    }
 }
 
 /// (#420) Result of comparing the agent's final-message claim against
@@ -1576,6 +1635,53 @@ mod tests {
         assert!(got.refused.is_empty(), "an absent file is not a refusal: {:?}", got.refused);
         assert_eq!(fs::read_to_string(run.join("trajectory.jsonl")).unwrap(), "{\"t\":1}\n");
         assert!(!run.join("findings.jsonl").exists());
+    }
+
+    /// (#3014) Promise: an interrupted run's trajectory is in its run dir,
+    /// with a terminal event saying it was interrupted. A dispatch that
+    /// returns `Err` (a signal ended it, or it failed) never reaches the
+    /// success-path copy, so the guard is the only thing that can save the
+    /// evidence. The container was SIGKILLed here: no terminal record.
+    #[test]
+    fn a_dispatch_that_errors_out_still_lands_its_trajectory_in_the_run_dir() {
+        let (_tmp, out, run, _secret) = out_dir_with_secret();
+        fs::write(
+            out.join(".darkmux-runtime/trajectory.jsonl"),
+            "{\"type\":\"dispatch.start\",\"ts\":1000,\"model\":\"m\"}\n\
+             {\"type\":\"model.completed\",\"seq\":1,\"ts\":2000,\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":2,\"total_tokens\":6}}\n",
+        )
+        .unwrap();
+        let attempt = |out: PathBuf, run: PathBuf| -> Result<()> {
+            let _preserve = TrajectoryPreserver::new(out, run);
+            bail!("dispatch interrupted");
+        };
+        assert!(attempt(out, run.clone()).is_err());
+        let fold = darkmux_trajectory::TrajectoryFold::from_path(&run.join("trajectory.jsonl"));
+        assert_eq!(fold.turns(), 1, "what completed is in the run dir");
+        assert_eq!(fold.complete.expect("a terminal record").result, darkmux_trajectory::RESULT_INTERRUPTED);
+    }
+
+    /// The runtime's own terminal record (a SIGTERM it caught) is kept as
+    /// written, not replaced by the host's.
+    #[test]
+    fn a_trajectory_the_runtime_closed_itself_is_preserved_as_written() {
+        let (_tmp, out, run, _secret) = out_dir_with_secret();
+        let body = "{\"type\":\"dispatch.start\",\"ts\":1}\n{\"type\":\"dispatch.complete\",\"ts\":9,\"result\":\"interrupted\",\"wall_ms\":8}\n";
+        fs::write(out.join(".darkmux-runtime/trajectory.jsonl"), body).unwrap();
+        drop(TrajectoryPreserver::new(out, run.clone()));
+        assert_eq!(fs::read_to_string(run.join("trajectory.jsonl")).unwrap(), body);
+    }
+
+    /// The success path copies the files itself and disarms: the guard then
+    /// writes nothing, and never marks a finished run interrupted.
+    #[test]
+    fn a_disarmed_guard_copies_nothing() {
+        let (_tmp, out, run, _secret) = out_dir_with_secret();
+        fs::write(out.join(".darkmux-runtime/trajectory.jsonl"), "{\"type\":\"dispatch.start\",\"ts\":1}\n").unwrap();
+        let mut guard = TrajectoryPreserver::new(out, run.clone());
+        guard.disarm();
+        drop(guard);
+        assert!(!run.join("trajectory.jsonl").exists());
     }
 
     #[test]

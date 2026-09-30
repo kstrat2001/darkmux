@@ -770,12 +770,17 @@ impl ExecutionBookends<'_> {
 
     /// A terminal payload naming this execution's step and kind, and the
     /// hosted endpoint it called, for the caller to fill in.
-    fn end_payload(&self) -> DispatchEndPayload {
+    fn end_payload(&self, total_turns: u64) -> DispatchEndPayload {
+        self.stamp(DispatchEndPayload::new(total_turns))
+    }
+
+    /// `payload` naming this execution's step, kind and endpoint.
+    fn stamp(&self, payload: DispatchEndPayload) -> DispatchEndPayload {
         DispatchEndPayload {
             step_id: Some(self.step.id.clone()),
             kind: Some(self.kind.to_string()),
             endpoint: self.endpoint_label.map(str::to_string),
-            ..Default::default()
+            ..payload
         }
     }
 
@@ -788,7 +793,7 @@ impl ExecutionBookends<'_> {
             item_index,
             result_class: Some(ResultClass::Error),
             error: Some(abort_message.to_string()),
-            ..self.end_payload()
+            ..self.end_payload(0)
         };
         StepBookend::new(
             ctx,
@@ -964,6 +969,7 @@ impl DispatchSingleShotStepKind {
 
         let mut flow_records = Vec::new();
 
+        let call_started = std::time::Instant::now();
         let reply = if let Some(endpoint) = &endpoint {
 
             // (#2902 step 5) Both budgets before the network, never after:
@@ -1082,12 +1088,11 @@ impl DispatchSingleShotStepKind {
         }
         bookend.close(records.record(
             darkmux_flow::Level::Info,
-            darkmux_flow::Payload::DispatchComplete(DispatchEndPayload {
-                result_class: Some(ResultClass::Ok),
-                stdout_chars: Some(reply.content.len() as u64),
-                total_tokens: reply.counts.total_tokens(),
-                ..records.end_payload()
-            }),
+            darkmux_flow::Payload::DispatchComplete(records.stamp(crate::dispatch_internal::single_call_complete(
+                &crate::dispatch_envelope::DirectTokens::of(&reply.counts),
+                call_started.elapsed().as_millis() as u64,
+                reply.content.len() as u64,
+            ))),
         ));
 
         Ok(StepOutcome {
@@ -1511,15 +1516,27 @@ impl DispatchMapStepKind {
     /// for one that did not. `remote_tokens` is stamped only for a hosted
     /// item, and only what it spent, the figure its item record reports.
     fn item_terminal(records: &ExecutionBookends<'_>, res: &MapItemResult) -> darkmux_flow::FlowRecord {
+        let tokens = crate::dispatch_envelope::DirectTokens {
+            prompt_tokens: res.prompt_tokens,
+            completion_tokens: res.completion_tokens,
+            total_tokens: res.total_tokens,
+            reasoning_tokens: res.reasoning_tokens,
+            cached_tokens: res.cached_tokens,
+        };
+        // A reply is one turn with its own counts; an item that produced none took none.
+        let base = if res.ok {
+            crate::dispatch_internal::single_call_complete(&tokens, res.wall_ms, res.content.chars().count() as u64)
+        } else {
+            DispatchEndPayload { wall_ms: Some(res.wall_ms), ..DispatchEndPayload::new(0) }
+        };
         let payload = DispatchEndPayload {
             item_index: Some(res.index as u64),
             result_class: Some(if res.ok { ResultClass::Ok } else { ResultClass::Error }),
             error: res.error.clone(),
-            wall_ms: Some(res.wall_ms),
             // A hosted item's spend, only what it spent: the figure its item
             // record reports.
             remote_tokens: records.endpoint_label.map(|_| res.total_tokens.unwrap_or(0)),
-            ..records.end_payload()
+            ..records.stamp(base)
         };
         if res.ok {
             records.record(darkmux_flow::Level::Info, darkmux_flow::Payload::DispatchComplete(payload))
@@ -6324,6 +6341,8 @@ mod tests {
                 "the terminal names WHERE the seat ran, in the one format the viewer parses"
             );
             assert_eq!(payload["remote_tokens"].as_u64(), Some(42), "remote spend is the item's own");
+            assert_eq!(payload["total_turns"].as_u64(), Some(1), "an item that produced a reply is one turn");
+            assert!(payload["wall_ms"].is_u64(), "and carries its own wall clock: {payload}");
             assert_eq!(
                 terminal.session_id.as_deref(),
                 Some(darkmux_types::session_id::SessionId::task(crate::test_run(), "t1").wire().as_str()),
@@ -6882,13 +6901,21 @@ mod tests {
         );
 
         // Bookends — the half this kind never had at all.
-        let actions: Vec<darkmux_flow::FlowAction> = rx
+        let records: Vec<darkmux_flow::FlowRecord> = rx
             .into_iter()
             .filter_map(|sig| match sig {
-                crate::step_kinds::WaveSignal::Record(r) => Some(r.action),
+                crate::step_kinds::WaveSignal::Record(r) => Some(r),
                 _ => None,
             })
             .collect();
+        let actions: Vec<darkmux_flow::FlowAction> = records.iter().map(|r| r.action.clone()).collect();
+        // Every `dispatch.complete` states its turn count and its own accounting: this one
+        // call is one turn, with the split its usage record carries.
+        let complete = records.iter().find(|r| r.action == darkmux_flow::FlowAction::DispatchComplete).expect("a terminal").payload_json();
+        assert_eq!(complete["total_turns"].as_u64(), Some(1), "one call is one turn");
+        assert!(complete["wall_ms"].is_u64(), "the call's own wall clock: {complete}");
+        assert_eq!(complete["prompt_tokens"].as_u64(), Some(5));
+        assert_eq!(complete["completion_tokens"].as_u64(), Some(5));
         assert_eq!(
             actions.iter().filter(|a| **a == darkmux_flow::FlowAction::DispatchStart).count(),
             1,

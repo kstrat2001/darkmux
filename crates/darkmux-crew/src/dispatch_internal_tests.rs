@@ -10237,8 +10237,7 @@
             darkmux_trajectory::UsageCounts { prompt: Some(300), completion: Some(45), ..Default::default() },
             darkmux_trajectory::UsageCounts { reasoning: Some(0), cached: Some(64), ..Default::default() },
         ] {
-            let mut end = DispatchEndPayload::default();
-            set_direct_token_counts(&mut end, &counts);
+            let end = single_call_complete(&crate::dispatch_envelope::DirectTokens::of(&counts), 0, 0);
             let complete = serde_json::to_value(&end).unwrap();
             let record = crate::usage::usage_payload(&facts, &counts);
             for key in ["prompt_tokens", "completion_tokens", "total_tokens", "reasoning_tokens", "cached_tokens"] {
