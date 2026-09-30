@@ -6177,6 +6177,18 @@ mod tests {
         assert_eq!(id_of(bookends[0]), id_of(bookends[1]), "an item's start and terminal name one execution");
         assert_eq!(id_of(bookends[2]), id_of(bookends[3]));
         assert_ne!(id_of(bookends[0]), id_of(bookends[2]), "two items are two executions");
+        // Each item's bookends name the item and, on the start, the endpoint the
+        // call goes to (the live view keys on the start).
+        for (bookend, index) in [(bookends[0], 0), (bookends[1], 0), (bookends[2], 1), (bookends[3], 1)] {
+            assert_eq!(bookend.payload_json()["item_index"].as_u64(), Some(index), "{bookend:?}");
+        }
+        for start in [bookends[0], bookends[2]] {
+            assert_eq!(
+                start.payload_json()["endpoint"],
+                "azure:example.cognitiveservices.azure.com/gpt-4o",
+                "the START names where the seat runs, before any terminal exists"
+            );
+        }
         for terminal in [bookends[1], bookends[3]] {
             let payload = terminal.payload_json();
             assert_eq!(
@@ -7366,6 +7378,9 @@ mod tests {
         assert_eq!(p["requested_model"], "darkmux:qwen3-4b");
         assert_eq!(p["reported_model"], "served-by-mock");
         assert_eq!(p["endpoint"], format!("{}/v1", server.base_url()));
+        // The record's own `model` is the wire identifier the call went to,
+        // not the bare model key: usage attributes to the instance that answered.
+        assert_eq!(rec["model"], "darkmux:qwen3-4b", "{rec}");
         assert_eq!(p["token_source"], "provider");
         assert_eq!(p["total_tokens"], 12, "provider total wins over 7+3");
         assert_eq!(rec["session_id"], darkmux_types::session_id::SessionId::task(crate::test_run(), &s.task_id).wire());
