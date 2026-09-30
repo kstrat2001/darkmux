@@ -282,6 +282,8 @@ export interface FleetCard {
   /** What this peer lets this machine do, as one compact line; `null` for
    *  this machine's own card and for any peer without a grant to show. */
   grant: string | null;
+  /** The machine's own card declares `fleet.mode hub`. */
+  hub: boolean;
   /** Whether the machine is up: the view's own `liveness` (a card it read
    *  is proof of life), or, for a machine the view does not hold, the flow
    *  window's online/offline edges. */
@@ -487,6 +489,7 @@ function cardIdentity(
       specUnknown: spec ? null : liveMachines.has(m) ? ("not-reported" as const) : ("not-seen" as const),
       note: null,
       grant: null,
+      hub: false,
       standing: machAbsent ? ("offline" as const) : ("online" as const),
       self: false,
     };
@@ -499,6 +502,7 @@ function cardIdentity(
     specUnknown: row.spec ? null : ("not-reported" as const),
     note: row.note,
     grant: row.grant,
+    hub: row.hub,
     standing: row.standing,
     // (#2915) The view says which row is this machine; a peer's model is
     // read off its own utility records and its residency is unknown.
@@ -622,6 +626,7 @@ export function buildFleetCardBase(
     specUnknown: id.specUnknown,
     note: id.note,
     grant: id.grant,
+    hub: id.hub,
     standing,
     active,
     absent: standing === "offline",

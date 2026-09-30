@@ -1597,6 +1597,29 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
     expect(card.textContent).not.toContain("hardware not reported");
   });
 
+  // (#3022) The badge is the card's own declaration, read from the view: only
+  // the machine whose card says `hub` carries it, never the others, and never
+  // a machine whose card could not be read.
+  it("the HUB badge renders on the machine whose card declares hub and on no other", async () => {
+    const declaring = (id: string, uid: string, mode: "hub" | "peer") =>
+      viewRow(
+        { machine_id: id, machine_uid: uid, cpu_brand: "Apple M1 Max" },
+        {
+          entry: { id, address: `${id}.example:8765`, added_unix_ms: 1000 },
+          card: { state: "available", card: { specs: { machine_id: id, machine_uid: uid, cpu_brand: "Apple M1 Max" }, fleet_mode: mode } as never, source: "listener" },
+        },
+      );
+    mockFleetFetch({
+      specs: { machine_id: "MacBook-Pro", machine_uid: "u-self", cpu_brand: "Apple M5 Max" },
+      view: [declaring("mini", "u-mini", "hub"), declaring("studio", "u-studio", "peer"), unreachableRow("ghost", "listener_off")],
+      runs: [],
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelectorAll(".mach")).toHaveLength(4));
+    const badged = [...document.querySelectorAll(".mach")].filter((c) => c.querySelector('[data-testid="hub-badge"]') !== null);
+    expect(badged.map((c) => c.querySelector(".mach-name")!.textContent)).toEqual(["mini"]);
+  });
+
   // THE REPORTED CASE: a peer whose Redis is off has no presence beat and no
   // flow here, yet the daemon read its card. The view says it is available,
   // so the lens must not call it offline or its hardware unknown.

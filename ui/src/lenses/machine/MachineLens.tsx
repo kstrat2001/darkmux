@@ -11,6 +11,9 @@ import { useFleetRoster, useLiveMachines } from "../../hooks/useLiveMachines";
 import { localMachineUid, displayNameOf } from "../../lib/flow";
 import { relAgoFrom } from "../../lib/format";
 import { specOf } from "../fleet/cards";
+import { machineIsHub } from "../fleet/viewRows";
+import { HubBadge } from "../../components/HubBadge";
+import { useFleetView } from "../../hooks/useFleetView";
 import { utilityModelId } from "./memoryLedgerLines";
 import { MachineHealthRegion } from "./MachineHealthRegion";
 import { advanceResidency, isUtilityTierRow, residencyChangedThisPoll, type ResidencyRowView, type ResidencyState } from "./machineGauge";
@@ -418,6 +421,9 @@ export function MachineLens({
   // otherwise the machine's own presence-beat `specs` string (a remote
   // machine's hardware line, as broadcast by ITS heartbeat).
   const spec = targetUid != null ? specOf(flowWindow.data, liveMachines, specs, targetUid) : "";
+  // (#3022) Whether this machine's own card declares `fleet.mode hub`, read
+  // from the same view the fleet lens draws its HUB badge from.
+  const hub = machineIsHub(useFleetView(true).rows, targetUid, isLocalMach);
 
   return (
     <div className="machine-lens">
@@ -448,6 +454,7 @@ export function MachineLens({
             it, only the name. */}
         {" › machine"}
         {spec ? ` — ${spec}` : ""}
+        <HubBadge declared={hub} />
       </div>
 
       {/* `data-state` is the parity harness's post-fetch content marker —

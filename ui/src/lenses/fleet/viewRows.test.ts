@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { flowUidByName, grantLine, outcomeLine, rowFacts, rowStanding, rowUid } from "./viewRows";
+import { flowUidByName, grantLine, machineIsHub, outcomeLine, rowFacts, rowIsHub, rowStanding, rowUid } from "./viewRows";
 import type { AcceptsState } from "../../types/generated/AcceptsState";
 import type { CardOutcome } from "../../types/generated/CardOutcome";
 import type { FleetMachine } from "../../types/generated/FleetMachine";
@@ -205,5 +205,29 @@ describe("rowUid: keyed the way the rest of the page knows the machine", () => {
     expect(rowUid(self, new Set(["u1"]), "u1")).toBe("u1");
     // A peer never borrows it.
     expect(rowUid(row({ entry: null, machine_uid: null }), new Set(["u1"]), "u1")).toBe("unknown");
+  });
+});
+
+describe("the declared hub (#3022)", () => {
+  const declaring = (mode: "hub" | "peer" | "standalone" | "unknown", over: Partial<FleetMachine> = {}) =>
+    row({ card: { state: "available", card: { ...CARD, fleet_mode: mode } as MachineCard, source: "listener" }, ...over });
+
+  it("only a card that declares hub is the hub", () => {
+    expect(rowIsHub(declaring("hub"))).toBe(true);
+    for (const mode of ["peer", "standalone", "unknown"] as const) expect(rowIsHub(declaring(mode))).toBe(false);
+    expect(rowIsHub(row({ card: { state: "unreachable", reason: "listener_off", detail: null } }))).toBe(false);
+    expect(rowFacts(declaring("hub"), new Set(), null).hub).toBe(true);
+    expect(rowFacts(declaring("peer"), new Set(), null).hub).toBe(false);
+  });
+
+  it("a machine page is the hub when its row is found by uid, roster id, or as this machine", () => {
+    const hub = declaring("hub");
+    expect(machineIsHub([hub], "UID-STUDIO", false)).toBe(true);
+    expect(machineIsHub([declaring("hub", { machine_uid: null })], "studio", false)).toBe(true);
+    expect(machineIsHub([hub], "UID-OTHER", false)).toBe(false);
+    expect(machineIsHub([declaring("peer")], "UID-STUDIO", false)).toBe(false);
+    expect(machineIsHub([declaring("hub", { is_this_machine: true })], null, true)).toBe(true);
+    expect(machineIsHub([declaring("hub", { is_this_machine: true })], "UID-STUDIO", false)).toBe(false);
+    expect(machineIsHub(null, "UID-STUDIO", false)).toBe(false);
   });
 });

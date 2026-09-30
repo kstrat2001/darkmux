@@ -695,6 +695,25 @@ body {
   padding: 4px 8px;
   border-radius: 3px;
 }
+/* (#3022) The small `.chip`: the same outlined label at a size that fits the
+   fleet card's name row (under the row's own height, set by the machine icon)
+   and the machine lens header line, so a badge changes no box's size
+   (`next-parity-layout-hub.spec.ts` measures it). */
+.chip--sm {
+  font-size: calc(10px * var(--fs-scale));
+  letter-spacing: 0.08em;
+  padding: 2px 6px;
+}
+/* The HUB badge (`components/HubBadge.tsx`): never shrinks below its word, so
+   a long machine name ellipsizes beside it instead. */
+.hub-badge {
+  flex: 0 0 auto;
+  vertical-align: middle;
+  margin-left: 8px;
+}
+.mach .name .hub-badge {
+  margin-left: 0;
+}
 @media (max-width: 768px) {
   /* (operator, on the phone, 2026-08-28) "leave the branding on the left
      alone and everything else right justified": on a phone the brand is

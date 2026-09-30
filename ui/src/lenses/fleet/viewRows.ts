@@ -155,6 +155,24 @@ export function rowSpecs(row: FleetMachine): MachineSpecsResponse | null {
   return row.card.state === "available" ? row.card.card.specs : null;
 }
 
+/** Whether the row's own card declares `fleet.mode hub`. A machine whose card
+ * was not read declares nothing the view can show. */
+export function rowIsHub(row: FleetMachine): boolean {
+  return row.card.state === "available" && row.card.card.fleet_mode === "hub";
+}
+
+/** Whether the machine a page shows is one the view's rows say declares
+ * `hub`. `isLocal`: the page shows THIS machine, whose row is the view's own.
+ * Any other machine is found by the hardware uid its card carries or by its
+ * roster id, the two keys a machine page is reached by. */
+export function machineIsHub(rows: readonly FleetMachine[] | null, targetUid: string | null, isLocal: boolean): boolean {
+  return (rows ?? []).some(
+    (row) =>
+      rowIsHub(row) &&
+      (row.is_this_machine ? isLocal : targetUid !== null && (row.machine_uid === targetUid || row.entry?.id === targetUid)),
+  );
+}
+
 export interface RowFacts {
   /** The identity the rest of the lens keys a card by (see `rowUid`). */
   uid: string;
@@ -171,6 +189,8 @@ export interface RowFacts {
   grant: string | null;
   standing: Standing;
   isSelf: boolean;
+  /** The row's card declares `fleet.mode hub`. */
+  hub: boolean;
 }
 
 /** The flow uid each machine NAME belongs to, for the names one uid alone
@@ -227,5 +247,6 @@ export function rowFacts(
     grant: row.is_this_machine ? null : grantLine(row.accepts),
     standing: rowStanding(row),
     isSelf: row.is_this_machine,
+    hub: rowIsHub(row),
   };
 }
