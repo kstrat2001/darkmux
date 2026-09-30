@@ -1165,6 +1165,37 @@ darkmux release.
 
 ### Added (4.0)
 
+- **The fleet work wire is `major.minor` and grows by minors from here; the
+  receiver enforces a data boundary; a check asks "would this route work"; every
+  refusal carries a typed code** (`WORK_JOB_SCHEMA_VERSION` is `"8.0"`, the
+  version this wire freezes at). A receiver takes the same major with a minor at
+  or below its own, and refuses a newer minor, another major, or a schema that is
+  not `major.minor` (a bare `"8"` included) naming both versions; unknown fields
+  are still refused within a minor, so a new optional field ships as a minor and
+  the sender leaves it out for a peer whose card says an older minor. New on the
+  wire, all optional: the job's `boundary` (`managed_only`: the message may go
+  only to a model the receiver serves itself) and `mode` (`run`, the default, or
+  `check`); the reply's `refusal` (`token`, `identity`, `not_listed`,
+  `role_not_allowed`, `profile_not_allowed`, `image_not_allowed`,
+  `workspace_not_allowed`, `profile_undefined`, `boundary`, `busy`,
+  `seat_changed`, `version`, `misaddressed`, `self`, `bad_config`,
+  `bad_request`, or `unknown` for a code a newer darkmux sends), `check` and the
+  `checked` status. The receiver checks `managed_only` against the profile the
+  job resolves to, when it arrives and again when a queued job gets its seat, so
+  a profile repointed at a hosted endpoint is never sent a private message
+  because a card was stale. A `check` runs every gate a run meets (token,
+  network identity, allow-list, role and profile scope, boundary, seat, version)
+  and answers `checked` (with the profile, whether its model is `managed`, and
+  whether the seat is `free` or the job `would_queue`) or the refusal a run
+  would get, without running anything, taking a seat or a queue slot, or writing
+  dispatch records. `darkmux_fleet::check_route` is its sender side. Radio's
+  peer answering seat sends full grounding under `managed_only`; a peer whose
+  profile is hosted refuses it, and radio asks once more with the hosted-safe
+  grounding and says so on stderr. **Migration:** run the same darkmux major on
+  both machines; a 4.0 release candidate that still speaks `"8"` is refused
+  with the version remedy. `tests/fixtures` in `crates/darkmux-fleet` pin the
+  8.0 wire: a shape change without a version change fails a test.
+
 - **Fleet awareness: one view every machine reads** (#3004). A machine's card, one
   typed `MachineCard`, travels between machines on ONE channel: its fleet listener,
   `GET /fleet/card`, the only surface that can say who is calling. It describes the
