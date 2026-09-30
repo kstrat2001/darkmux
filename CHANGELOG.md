@@ -1219,6 +1219,24 @@ darkmux release.
 
 ### Added (4.0)
 
+- **A machine states its fleet role, and the hub hands out fleet defaults (#3022,
+  CONFIG 2.1).** The machine card carries `fleet_mode` (`standalone`, `hub`,
+  `peer`, from `fleet.mode`) and `hosts_fleet_redis` (whether the machine's own
+  `redis.host` is loopback or itself); presence beats and `machine.telemetry`
+  records carry `fleet_mode` too, so nobody has to ask a machine which one is
+  the hub. The fleet card and the machine page show a HUB badge for it. The new
+  `fleet.defaults` block, meaningful on the hub only, holds the first default,
+  `fleet.defaults.radio.answerer_profile` (`<profile>@<machine>`; `config set`
+  refuses a bare profile name). The hub serves it only in its machine card,
+  never through Redis, and a card that does not declare `hub` has its defaults
+  refused. Radio's answering seat resolves this machine's own setting first, then
+  the hub's default, then the built-in, keeps the last copy it read under the
+  darkmux home (used when the hub cannot be asked), and prints which one it used
+  on every answer. `darkmux doctor` gains a `fleet hub` row (exactly one machine
+  declares `hub`, and it hosts the Redis this machine points at) and a `fleet
+  defaults` row (the resolved seat and its source). Machine card schema 1.0 and
+  FLOW 2.0.0 are unreleased and were edited in place.
+
 - **`run stats` counts the model calls that reported no usage** (`calls_unreported`, RunStats 2.1.0, `--json` too). A call that reports no usage adds 0 to the token figures, so a partly reported run read as a smaller run. Above zero, `completion_tokens` and `reasoning_tokens` are a lower bound, and the run's unreconciled list says so.
 
 - **The fleet work wire is `major.minor` and grows by minors from here; the
