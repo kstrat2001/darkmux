@@ -458,3 +458,36 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
     }
   });
 }
+
+// The cards' order is not final until the fleet view answers (the grid keeps
+// the cards' boxes, unpainted); nothing below the cards may move when it
+// does. The first activity lane's top is the same before and after, however
+// the lane got there: a lane that slid in from another place while the page
+// settled (a motion that is not a reorder) fails here.
+for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
+  test(`fleet lanes: the first lane keeps its place when the cards' order goes final (${vpName})`, async ({ browser }) => {
+    const finished = STATES.find((s) => s.id === "finished");
+    const ctx = await browser.newContext({ viewport, timezoneId: "UTC", locale: "en-US" });
+    const page = await ctx.newPage();
+    await page.clock.setFixedTime(finished.nowMs);
+    let release;
+    const held = new Promise((r) => (release = r));
+    await installLayoutRoutes(page, { fleetView: [SELF_ROW], holdView: held });
+    await page.goto("/index.html#lens=fleet");
+    await expect(page.locator(".fleet")).toHaveAttribute("data-order", "pending");
+    await expect(page.locator(".lane").first()).toBeVisible();
+    const laneTop = () => page.locator(".lane").first().evaluate((e) => Math.round(e.getBoundingClientRect().top * 10) / 10);
+    const pending = [];
+    for (let i = 0; i < 4; i++) {
+      pending.push(await laneTop());
+      await page.waitForTimeout(60);
+    }
+    await expect(page.locator(".fleet"), "still pending while sampled").toHaveAttribute("data-order", "pending");
+    release();
+    await expect(page.locator(".fleet")).toHaveAttribute("data-order", "final");
+    await page.waitForTimeout(500);
+    const final = await laneTop();
+    expect(new Set([...pending, final]).size, `first lane top over pending ${JSON.stringify(pending)} then final ${final}`).toBe(1);
+    await ctx.close();
+  });
+}

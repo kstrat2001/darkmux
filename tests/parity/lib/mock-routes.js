@@ -255,4 +255,4 @@ function installBlankRoutes(page) {
   });
 }
 
-module.exports = { loadMeta, installCorpusRoutes, installBlankRoutes };
+module.exports = { corpusFleetView, loadMeta, installCorpusRoutes, installBlankRoutes };

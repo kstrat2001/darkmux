@@ -30,7 +30,7 @@ import { test, expect } from "@playwright/test";
 import { readFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { GOLDENS_DIR, CORPUS_DIR } from "./lib/paths.js";
-import { loadMeta, installCorpusRoutes, installBlankRoutes } from "./lib/mock-routes.js";
+import { corpusFleetView, loadMeta, installCorpusRoutes, installBlankRoutes } from "./lib/mock-routes.js";
 import { extractLensText, waitSettled, installFrozenClock, regionText, normalize } from "./lib/extract-lens.js";
 
 // Overnight-runbook render-sanity contract (every UI packet's standing
@@ -740,4 +740,35 @@ test("next: the two-day golden is non-vacuous where fleet.txt is structurally bl
   await waitSettled(page, expect, FLEET_LOADED);
   const oneDay = await extractLensText(page);
   expect(oneDay, "fleet.txt must be blind to this — that blindness is the gap #2702 names").toBe(readGolden("fleet"));
+});
+
+// The cards' order is not final until the fleet view answers (the grid keeps
+// the cards' boxes, unpainted). Nothing below them may move when it does, and
+// no lane may slide in while the page settles: the first lane's top is the
+// same the moment the cards appear (view still held) and after the view
+// lands. Sampled at the first painted card, so a lane still in flight from
+// where the cards' arrival pushed it away (a motion that is not a reorder)
+// reads as a different top.
+test("next: the first activity lane keeps its place when the fleet view answers", async ({ page }) => {
+  const meta = loadMeta();
+  await installFrozenClock(page, meta.frozen_clock_ms);
+  installCorpusRoutes(page, meta);
+  let release: () => void = () => {};
+  const held = new Promise<void>((r) => (release = r));
+  await page.route("**/fleet/view", async (route) => {
+    const body = corpusFleetView();
+    await held;
+    await route.fulfill({ json: body });
+  });
+  await page.setViewportSize({ width: 1470, height: 900 });
+  await page.goto("/index.html");
+  await page.waitForSelector(".fleet .mach");
+  await page.waitForSelector(".lane");
+  const laneTop = () => page.locator(".lane").first().evaluate((e) => Math.round(e.getBoundingClientRect().top * 10) / 10);
+  const pending = await laneTop();
+  expect(await page.getAttribute(".fleet", "data-order"), "sampled while the order is pending").toBe("pending");
+  release();
+  await page.waitForSelector('.fleet[data-order="final"]');
+  await page.waitForTimeout(500);
+  expect(await laneTop(), "first lane top after the view answered").toBe(pending);
 });

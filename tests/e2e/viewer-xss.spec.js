@@ -170,7 +170,13 @@ test('viewer renders attacker-controlled flow records inertly across every view'
   // moved one screen earlier. `mockFlowSessionEndpoint` (top of file) is what
   // lets the click reach the real populated render instead of just the
   // error branch's bare session-id text.
-  const sess = page.locator('[data-act="session"]').first();
+  // The probe records (the `xss-probe-*` tool calls asserted below) belong to
+  // the first machine's session, whose id starts `xss'`. Lane order is by
+  // machine key, not file order, so the first bar is not necessarily that
+  // session: find it by its id rather than by position.
+  const bars = page.locator('[data-act="session"]');
+  const probeAt = await bars.evaluateAll((els) => els.findIndex((e) => (e.getAttribute('data-arg') ?? '').startsWith("xss'")));
+  const sess = probeAt >= 0 ? bars.nth(probeAt) : bars.first();
   if (await sess.count()) {
     await sess.click();
     await page.waitForSelector('.session-run');
