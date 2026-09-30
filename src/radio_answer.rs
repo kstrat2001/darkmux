@@ -131,7 +131,7 @@ const CONFIG_CAP_CHARS: usize = 3_200;
 const BOARD_CAP_CHARS: usize = 1_600;
 /// Fleet block cap: ~1K tokens, enough for a few machines' loaded models,
 /// profiles and grants.
-const FLEET_CAP_CHARS: usize = 4_000;
+pub(crate) const FLEET_CAP_CHARS: usize = 4_000;
 /// Top-level `--help` block cap: ~400 tokens.
 /// (#1784/#1862) The verb index's cap. Sized from the measurement in
 /// `radio_index::tests::rendered_index_fits_its_cap` with headroom; the
@@ -148,7 +148,7 @@ const DEEP_ARTIFACT_CAP_CHARS: usize = 6_000;
 /// small, fixed-size message) and the user's own raw question text.
 const HARD_CAP_CHARS: usize = 40_000;
 
-fn truncate_chars(s: &str, max_chars: usize) -> String {
+pub(crate) fn truncate_chars(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
         return s.to_string();
     }

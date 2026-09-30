@@ -356,11 +356,77 @@ fn grounding_lines(view: &FleetView, m: &FleetMachine) -> Vec<String> {
     if let CardOutcome::Available { card, .. } = &m.card {
         let loaded: Vec<String> = card.specs.loaded_models.iter().map(|x| x.identifier.clone()).collect();
         lines.push(format!("  loaded models: {}", capped_list(&loaded)));
-        lines.push(format!("  {}", profiles_line(card, Voice::Grounding)));
+        lines.push(format!("  {}", grounding_profiles_line(card, &m.accepts)));
     }
     if let Some(phrase) = accepts_phrase(&m.accepts, Voice::Grounding) {
         lines.push(format!("  {phrase}"));
     }
+    lines
+}
+
+/// A machine with more profiles than this lists only the ones a question is
+/// likely to be about (loaded now, or accepted from the user's machine) plus a
+/// count of the rest. It is a readability bound, not a policy knob: at six
+/// entries a profiles line stays under about 400 characters, short enough that
+/// a small model reads the whole line instead of skimming it. (A 27-profile
+/// machine measured about 1,500 characters and crowded out the loaded models.)
+const GROUNDING_PROFILES_MAX: usize = 6;
+
+/// The namespace darkmux puts on a model it loaded, dropped for readability.
+/// The rest of the id is left exact.
+fn bare_model_id(identifier: &str) -> &str {
+    identifier.strip_prefix("darkmux:").unwrap_or(identifier)
+}
+
+/// The profiles line in the grounding voice. Under [`GROUNDING_PROFILES_MAX`]
+/// it is the full list; above it, the profiles running a loaded model or named
+/// in the accepts block, then "and N more".
+fn grounding_profiles_line(card: &MachineCard, accepts: &AcceptsState) -> String {
+    let full = profiles_line(card, Voice::Grounding);
+    let profiles = &card.profiles;
+    if card.profiles_error.is_some() || profiles.len() <= GROUNDING_PROFILES_MAX {
+        return full;
+    }
+    let loaded: Vec<&str> = card.specs.loaded_models.iter().map(|x| bare_model_id(&x.identifier)).collect();
+    let accepted: &[String] = match accepts {
+        AcceptsState::Granted { accepts } => &accepts.profiles,
+        _ => &[],
+    };
+    let shown: Vec<String> = profiles
+        .iter()
+        .filter(|p| accepted.contains(&p.name) || p.models.iter().any(|m| loaded.contains(&m.id.as_str())))
+        .map(|p| profile_phrase(p, Voice::Grounding))
+        .collect();
+    let rest = profiles.len() - shown.len();
+    if shown.is_empty() {
+        return format!("profiles: {rest} (none runs a model loaded now; names omitted)");
+    }
+    if rest == 0 {
+        return format!("profiles: {}", shown.join(", "));
+    }
+    format!("profiles (those running a loaded model or accepted from the user's machine): {}, and {rest} more", shown.join(", "))
+}
+
+/// The fleet-wide "loaded now" block: one line per model id, naming every
+/// machine that has it loaded. Read from the cards' loaded models only, never
+/// from profiles, so a small model answers "where is X loaded" from one line.
+fn loaded_now_lines(view: &FleetView) -> Vec<String> {
+    let mut by_model: std::collections::BTreeMap<&str, Vec<String>> = std::collections::BTreeMap::new();
+    for m in &view.machines {
+        let CardOutcome::Available { card, .. } = &m.card else { continue };
+        let name = if m.is_this_machine { format!("{} (the user's machine)", row_name(view, m)) } else { row_name(view, m) };
+        for x in &card.specs.loaded_models {
+            let hosts = by_model.entry(bare_model_id(&x.identifier)).or_default();
+            if !hosts.contains(&name) {
+                hosts.push(name.clone());
+            }
+        }
+    }
+    let mut lines = vec!["loaded now (model → machines that have it loaded):".to_string()];
+    if by_model.is_empty() {
+        lines.push("- none".to_string());
+    }
+    lines.extend(by_model.iter().map(|(model, hosts)| format!("- {model} → {}", hosts.join(", "))));
     lines
 }
 
@@ -374,10 +440,15 @@ pub(crate) fn render_grounding(view: &FleetView) -> String {
          presence beat (\"no beat seen\" is not proof it is down). A profile is a named model setup; \
          \"managed\" means the machine loads and serves the model itself, \"unmanaged\" means it only sends \
          requests to a hosted endpoint; the model ids after the colon are the models that profile runs. A profile is not a \
-         loaded model: \"loaded models\" is what a machine has loaded right now. \"the user's machine\" is the \
+         loaded model. The \"loaded now\" block is the answer to where a model is loaded: it lists, per model, the \
+         machines that have it loaded right now; a model that appears only in a profile is not loaded. \"the user's machine\" is the \
          machine where the user asked the question; \"accepts from the user's machine\" is what that machine lets \
          the user's work started there run on it.\n",
     );
+    for line in loaded_now_lines(view) {
+        out.push_str(&line);
+        out.push('\n');
+    }
     for m in &view.machines {
         for line in grounding_lines(view, m) {
             out.push_str(&line);
@@ -741,5 +812,144 @@ mod tests {
         let out = text(&v);
         assert!(out.contains("not observed: no daemon running"), "{out}");
         assert!(out.contains("seats, thermal state and battery"), "{out}");
+    }
+
+    /// A card with the given loaded model identifiers and (name, model id)
+    /// managed profiles.
+    fn card_with(loaded: &[&str], profiles: &[(String, &str)]) -> Box<MachineCard> {
+        let mut j = card_json("5.0.0");
+        j["specs"]["loaded_models"] = loaded
+            .iter()
+            .map(|id| serde_json::json!({"identifier": id, "model": id, "status": "idle", "size": "1 GB", "context": 4096}))
+            .collect();
+        j["profiles"] = profiles
+            .iter()
+            .map(|(name, model)| {
+                serde_json::json!({"name": name, "description": null, "is_default": false, "endpoint_kind": "managed",
+                    "models": [{"id": model, "n_ctx": 4096, "endpoint_kind": "managed"}]})
+            })
+            .collect();
+        Box::new(serde_json::from_value(j).expect("a card of this build's shape"))
+    }
+
+    fn many_profiles(n: usize) -> Vec<(String, &'static str)> {
+        (0..n).map(|i| (format!("profile-{i:02}"), "qwen/other-model")).collect()
+    }
+
+    fn granted(profiles: &[&str]) -> AcceptsState {
+        AcceptsState::Granted {
+            accepts: darkmux_serve::machine_card::CardAccepts {
+                peer_name: "laptop".into(),
+                profiles: profiles.iter().map(|p| p.to_string()).collect(),
+                roles: vec![],
+                images: vec![],
+                workspace: false,
+            },
+        }
+    }
+
+    /// The shape that misled two small models: the Studio has devstral loaded,
+    /// the MacBook has it only in a profile (among many).
+    fn two_machine_view() -> FleetView {
+        let mut own = own_row();
+        let mut profiles = many_profiles(26);
+        profiles.push(("diff-review".into(), "mistralai/devstral-small-2-2512"));
+        own.card = read(card_with(&["darkmux:qwen3-4b-instruct-2507"], &profiles));
+        let studio = with_accepts(
+            machine(
+                "m1-max-32gb-studio",
+                Liveness::Unknown,
+                read(card_with(
+                    &["darkmux:mistralai/devstral-small-2-2512", "darkmux:qwen/qwen3-4b-2507"],
+                    &[("diff-review".into(), "mistralai/devstral-small-2-2512")],
+                )),
+            ),
+            granted(&["diff-review"]),
+        );
+        view(vec![own, studio])
+    }
+
+    /// The loaded-now block: its header and the lines under it, up to the
+    /// first per-machine line.
+    fn loaded_block(out: &str) -> String {
+        let lines = out.lines().skip_while(|l| !l.starts_with("loaded now (")).take_while(|l| !l.contains(": liveness"));
+        lines.collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn loaded_now_names_only_the_machine_that_has_the_model_loaded() {
+        let out = render_grounding(&two_machine_view());
+        let block = loaded_block(&out);
+        let devstral: Vec<&str> = block.lines().filter(|l| l.contains("devstral")).collect();
+        assert_eq!(devstral, ["- mistralai/devstral-small-2-2512 → m1-max-32gb-studio"], "{block}");
+        assert!(block.contains("- qwen3-4b-instruct-2507 → laptop (the user's machine)"), "{block}");
+        assert!(!block.contains("darkmux:"), "namespace prefix not stripped:\n{block}");
+    }
+
+    #[test]
+    fn loaded_now_says_none_when_nothing_is_loaded() {
+        let mut own = own_row();
+        own.card = read(card_with(&[], &[]));
+        let out = render_grounding(&view(vec![own]));
+        assert!(out.contains("loaded now (model → machines that have it loaded):\n- none\n"), "{out}");
+    }
+
+    #[test]
+    fn a_long_profile_list_is_shortened_but_never_drops_an_accepted_profile() {
+        let out = render_grounding(&two_machine_view());
+        // Own row: 27 profiles and none runs a model loaded there.
+        assert!(out.contains("  profiles: 27 (none runs a model loaded now; names omitted)"), "{out}");
+        assert!(!out.contains("profile-00"), "{out}");
+
+        // One profile runs a loaded model: it is listed, the rest counted.
+        let mut ps = many_profiles(12);
+        ps.push(("live".into(), "qwen/loaded-one"));
+        let m = machine("peer", Liveness::Live, read(card_with(&["darkmux:qwen/loaded-one"], &ps)));
+        let out = render_grounding(&view(vec![m]));
+        assert!(out.contains("live (managed: qwen/loaded-one), and 12 more"), "{out}");
+
+        // A profile named in accepts is listed even when it runs nothing loaded.
+        let mut m = with_accepts(machine("peer", Liveness::Live, read(card_with(&[], &many_profiles(10)))), granted(&["profile-07"]));
+        m.entry = None;
+        let out = render_grounding(&view(vec![m]));
+        assert!(out.contains("profile-07 (managed: qwen/other-model), and 9 more"), "{out}");
+    }
+
+    #[test]
+    fn a_short_profile_list_and_the_cli_table_are_unchanged() {
+        let out = render_grounding(&view(vec![with_accepts(machine("s", Liveness::Live, read(card("5.0.0"))), granted(&[]))]));
+        assert!(out.contains("  profiles: deep (managed: qwen), cloud (unmanaged: gpt)"), "{out}");
+        let long = card_with(&[], &many_profiles(30));
+        let cli = profiles_line(&long, Voice::Cli);
+        assert_eq!(cli.matches("(managed)").count(), 30, "{cli}");
+        assert!(!cli.contains("more"), "{cli}");
+    }
+
+    #[test]
+    fn the_loaded_now_block_survives_the_fleet_cap_ahead_of_per_machine_detail() {
+        // Twenty peers, each accepting ten profiles: per-machine detail alone
+        // is far past the cap.
+        let names: Vec<String> = (0..10).map(|i| format!("profile-{i:02}")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut machines = vec![own_row()];
+        machines[0].card = read(card_with(&["darkmux:qwen3-4b-instruct-2507"], &many_profiles(10)));
+        machines.push(machine("studio", Liveness::Live, read(card_with(&["darkmux:mistralai/devstral-small-2-2512"], &many_profiles(10)))));
+        for i in 0..20 {
+            machines.push(with_accepts(machine(&format!("peer-{i:02}"), Liveness::Live, read(card_with(&[], &many_profiles(10)))), granted(&names)));
+        }
+        let full = render_grounding(&view(machines));
+        let out = crate::radio_answer::truncate_chars(&full, crate::radio_answer::FLEET_CAP_CHARS);
+        assert!(out.contains("- mistralai/devstral-small-2-2512 → studio\n"), "{out}");
+        assert!(full.chars().count() > crate::radio_answer::FLEET_CAP_CHARS, "the fixture must exceed the cap to prove anything");
+        assert!(out.contains("- qwen3-4b-instruct-2507 → laptop (the user's machine)"), "{out}");
+    }
+
+    /// Writes the rendered section for the two-machine shape so it can be
+    /// replayed across models; a no-op unless the path variable is set.
+    #[test]
+    fn emit_two_machine_fleet_section() {
+        if let Ok(path) = std::env::var("DARKMUX_TEST_FLEET_SECTION_OUT") {
+            std::fs::write(path, render_grounding(&two_machine_view())).expect("write section");
+        }
     }
 }
