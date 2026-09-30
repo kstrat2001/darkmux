@@ -145,13 +145,6 @@ export const UPGRADE_SKEW: ScenarioSpec = {
   roster: [{ id: "laptop" }, { id: "m1-max-32gb-studio" }],
 };
 
-/** The same fleet AFTER retention rolls past the rename — the alias that is
- *  currently holding the roster join together is gone. Nothing else changed. */
-export const UPGRADE_SKEW_ALIAS_EXPIRED: ScenarioSpec = {
-  ...UPGRADE_SKEW,
-  machines: UPGRADE_SKEW.machines.map((m) => ({ ...m, formerNames: [] })),
-};
-
 /** Mid-upgrade: the older peer's daemon is restarting, so it has records in
  *  the window but no live beat. */
 export const UPGRADE_IN_PROGRESS: ScenarioSpec = {

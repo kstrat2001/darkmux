@@ -1149,6 +1149,19 @@ darkmux release.
 - **A switched-off fleet listener says so.** `/health` reported `fleet_listener: null` when `fleet.listener.enabled` is false; it now reports `off` (`off (fleet.listener.enabled is false)` to this machine), and the startup banner says the listener is off instead of describing the token as if it were serving work.
 - **A relayed run's id is greppable on the receiver.** The receiver's session id was `radio.solo.relay.<peer>.radio_2Esolo_2Eadhoc_...`, the sender's id with every dot escaped. A relay now ends with the sender's wire string verbatim (`radio.solo.relay.<peer>.radio.solo.adhoc....`), so the id the sender printed is a substring of the receiver's. Session ids written by an earlier 4.0 build no longer parse.
 - **A dispatch running inside the daemon no longer probes for a daemon.** Relayed fleet work ran in-process under `darkmux serve --port 8766` and printed "darkmux serve isn't reachable on 127.0.0.1:8765". The nudge is now silent inside the daemon, and it suggests `brew services start darkmux` only for a Homebrew binary (otherwise `darkmux serve`). Doctor's `daemon reachable` row already follows `DARKMUX_SERVE_PORT` / `serve.port`; a `--port` flag exists only in the daemon's own process, so set one of those for doctor to find a non-default port.
+
+- **The fleet lens reads `GET /fleet/view` for its machine list, hardware and
+  liveness.** A peer with Redis off has no presence beat, and the lens drew it as
+  "offline, hardware unknown" even when the daemon had read its card. Each card
+  now comes from the view's row: a machine whose card was read is never shown
+  offline, and one the daemon could not reach shows the typed reason on its
+  subtitle line ("listener off"), never an address or a uid. A peer shows what it
+  lets this machine do ("runs diff-review · radio-host here") beside its
+  hardware, except on a phone. The static demo reads a committed snapshot of the
+  view. Machines outside the view (an unverified source, one nobody rostered) are
+  still drawn from flow and presence, and a replay draws every machine that way.
+  The lens no longer calls `GET /machine/specs`.
+
 - **`darkmux doctor`'s `crew/` merge script and its flat-mission check now
   agree.** The script moved pre-#148 flat mission files into `missions/`, where
   the `mission state files` check then refused them and told you to run a

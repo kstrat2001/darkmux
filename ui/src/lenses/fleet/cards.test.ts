@@ -1,8 +1,8 @@
 import { describe, it, expect } from "vitest";
-import { machActive, specOf, buildFleetCard, busiestExecution, isStrictlyBusier, rosterOnlyEntries, rosterAliasFor, specUnknownLabel, cardFace } from "./cards";
+import { machActive, specOf, buildFleetCard, busiestExecution, isStrictlyBusier, specUnknownLabel, specLine, cardFace } from "./cards";
+import type { RowFacts } from "./viewRows";
 import type { MachineSpecsResponse } from "../../types/generated/MachineSpecsResponse";
 import type { PresenceBeat } from "../../types/generated/PresenceBeat";
-import type { RosterMachineEntry } from "../../types/generated/RosterMachineEntry";
 import type { ExecutionTokenReading } from "../../lib/tokenRate";
 import { norm, type RawRecord } from "../../testing/records";
 import type { Run } from "../../types/generated/Run";
@@ -21,8 +21,9 @@ function beat(overrides: Partial<PresenceBeat>): PresenceBeat {
   return { machine_uid: "u1", display_name: "studio", schema_version: "1.18.0", beat_ts_ms: 1, ...overrides };
 }
 
-function rosterEntry(overrides: Partial<RosterMachineEntry> & Pick<RosterMachineEntry, "id">): RosterMachineEntry {
-  return { address: "100.64.1.2:8765", added_unix_ms: 1000, ...overrides };
+/** A fleet-view row's facts, as `viewRows.ts::rowFacts` would hand them to a card. */
+function rowFactsFor(overrides: Partial<RowFacts> = {}): RowFacts {
+  return { uid: "u1", known: true, name: null, spec: "", note: null, grant: null, standing: "online", isSelf: false, ...overrides };
 }
 
 function machineSpecs(overrides: Partial<MachineSpecsResponse> & Pick<MachineSpecsResponse, "machine_id">): MachineSpecsResponse {
@@ -672,7 +673,7 @@ describe("buildFleetCard", () => {
   it("(#1923) a running lab run makes the card active even with zero flow presence", () => {
     const data: NormRecord[] = [];
     const machineRuns: Run[] = [run({ id: "lab-1", kind: "lab", status: "running", machine: "u1" })];
-    const card = buildFleetCard(data, new Map(), null, new Set(), false, "u1", true, T_MAX, new Map(), machineRuns);
+    const card = buildFleetCard(data, new Map(), null, new Set(), false, "u1", true, T_MAX, null, machineRuns);
     expect(card.stat).toBe("dispatch in flight");
     expect(card.runsCount).toBe(1);
   });
@@ -696,7 +697,7 @@ describe("buildFleetCard", () => {
     const labSession = "darkmux-coding-long-agentic-1756000000000";
     const data: NormRecord[] = [rec({ machine_uid: "u1", session_id: labSession, action: "dispatch.start" })];
     const machineRuns: Run[] = [run({ id: "long-agentic-balanced-1756000000-1", kind: "lab", status: "running", machine: "u1" })];
-    const card = buildFleetCard(data, new Map(), null, new Set([labSession]), false, "u1", true, T_MAX, new Map(), machineRuns);
+    const card = buildFleetCard(data, new Map(), null, new Set([labSession]), false, "u1", true, T_MAX, null, machineRuns);
     expect(card.runsCount).toBe(1);
     expect(card.stat).toBe("dispatch in flight");
   });
@@ -712,7 +713,7 @@ describe("buildFleetCard", () => {
       rec({ machine_uid: "u1", session_id: "solo-1", action: "dispatch.start" }),
     ];
     const machineRuns: Run[] = [run({ id: "long-agentic-balanced-1756000000-1", kind: "lab", status: "running", machine: "u1" })];
-    const card = buildFleetCard(data, new Map(), null, new Set([labSession, "solo-1"]), false, "u1", true, T_MAX, new Map(), machineRuns);
+    const card = buildFleetCard(data, new Map(), null, new Set([labSession, "solo-1"]), false, "u1", true, T_MAX, null, machineRuns);
     expect(card.runsCount).toBe(2);
   });
 
@@ -724,7 +725,7 @@ describe("buildFleetCard", () => {
       run({ id: "lab-a", kind: "lab", status: "running", machine: "u1" }),
       run({ id: "lab-b", kind: "lab", status: "running", machine: "u1" }),
     ];
-    const card = buildFleetCard([], new Map(), null, new Set(), false, "u1", true, T_MAX, new Map(), machineRuns);
+    const card = buildFleetCard([], new Map(), null, new Set(), false, "u1", true, T_MAX, null, machineRuns);
     expect(card.runsCount).toBe(2);
   });
 
@@ -733,7 +734,7 @@ describe("buildFleetCard", () => {
   it("(#1923) a completed lab run does not count as active", () => {
     const data: NormRecord[] = [];
     const machineRuns: Run[] = [run({ id: "lab-1", kind: "lab", status: "complete", machine: "u1" })];
-    const card = buildFleetCard(data, new Map(), null, new Set(), false, "u1", true, T_MAX, new Map(), machineRuns);
+    const card = buildFleetCard(data, new Map(), null, new Set(), false, "u1", true, T_MAX, null, machineRuns);
     expect(card.stat).toBe("idle");
     expect(card.runsCount).toBe(0);
   });
@@ -744,7 +745,7 @@ describe("buildFleetCard", () => {
   it("(#1923) a running mission row in /runs is not double-counted against flow presence", () => {
     const data: NormRecord[] = [rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" })];
     const machineRuns: Run[] = [run({ id: "s1", kind: "dispatch", status: "running", machine: "u1" })];
-    const card = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX, new Map(), machineRuns);
+    const card = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX, null, machineRuns);
     expect(card.runsCount).toBe(1);
   });
 
@@ -800,241 +801,12 @@ describe("buildFleetCard", () => {
   });
 });
 
-describe("rosterOnlyEntries", () => {
-  // (#1855) THE defect this closes: `machineUids` only ever unions
-  // flow-derived uids with CURRENTLY-beating presence keys, so a roster
-  // entry with neither produced no uid for the card list to fall back on —
-  // the machine vanished from the dashboard entirely, indistinguishable
-  // from never having been added.
-  it("a roster entry with no flow record and no presence beat is reported roster-only", () => {
-    const roster = [rosterEntry({ id: "studio" })];
-    expect(rosterOnlyEntries([], new Map(), roster)).toEqual(roster);
-  });
-
-  // The INVERTED case, and the one that proves this doesn't just echo the
-  // roster back unfiltered: a machine that IS live (or has flow history)
-  // under the exact name the roster declares must NOT be reported here too
-  // — reporting it would draw a duplicate "offline" card next to its real,
-  // live one for the same machine.
-  it("a roster entry already covered by a live presence beat under the same name is excluded", () => {
-    const roster = [rosterEntry({ id: "studio" })];
-    const live = new Map([["u1", beat({ machine_uid: "u1", display_name: "studio" })]]);
-    expect(rosterOnlyEntries([], live, roster)).toEqual([]);
-  });
-
-  // Same exclusion, but via flow history rather than live presence — a
-  // machine that has previously reported under this name (and might simply
-  // be between beats right now) is already covered by the ordinary
-  // `machineUids` union and must not ALSO get a roster-only phantom card.
-  it("a roster entry already covered by flow history under the same name is excluded", () => {
-    const roster = [rosterEntry({ id: "studio" })];
-    const data: NormRecord[] = [rec({ machine_uid: "u1", machine_id: "studio" })];
-    expect(rosterOnlyEntries(data, new Map(), roster)).toEqual([]);
-  });
-
-  // A mixed roster: one entry covered, one genuinely silent — only the
-  // silent one comes back. Proves the filter is per-entry, not all-or-none.
-  it("filters a mixed roster down to only the genuinely-unaccounted entries", () => {
-    const roster = [rosterEntry({ id: "studio" }), rosterEntry({ id: "mini-1" })];
-    const live = new Map([["u1", beat({ machine_uid: "u1", display_name: "studio" })]]);
-    expect(rosterOnlyEntries([], live, roster)).toEqual([rosterEntry({ id: "mini-1" })]);
-  });
-
-  it("an empty roster reports nothing, on an otherwise busy fleet", () => {
-    const data: NormRecord[] = [rec({ machine_uid: "u1", machine_id: "studio" })];
-    expect(rosterOnlyEntries(data, new Map(), [])).toEqual([]);
-  });
-
-  // (#1855 follow-up, F1) The self-machine phantom: presence self-disables
-  // when Redis is unset, so a quiet window can carry NO flow record and NO
-  // beat for the daemon serving the page, even though its own roster entry
-  // exists (`darkmux-add-machine`'s own step 7). Without consulting
-  // `/machine/specs` this used to fall straight through `knownNames`,
-  // reporting the daemon's own roster entry as a phantom "offline" card —
-  // served by the very machine it calls offline.
-  it("excludes a roster entry matching THIS machine's own /machine/specs identity, even with zero flow/presence history", () => {
-    const roster = [rosterEntry({ id: "studio" })];
-    const specs = machineSpecs({ machine_id: "studio" });
-    expect(rosterOnlyEntries([], new Map(), roster, specs)).toEqual([]);
-  });
-
-  // The inverted case pinned again at THIS call site (not just `specOf`'s):
-  // a `specs.machine_id` that doesn't match the roster entry must not
-  // suppress it — this is a targeted self-check, not a blanket "specs
-  // present, trust everything" escape hatch.
-  it("does NOT exclude a roster entry that specs.machine_id doesn't match", () => {
-    const roster = [rosterEntry({ id: "studio" })];
-    const specs = machineSpecs({ machine_id: "some-other-machine" });
-    expect(rosterOnlyEntries([], new Map(), roster, specs)).toEqual(roster);
-  });
-
-  // No specs at all (the default, pre-existing call sites, or a static
-  // build) behaves exactly as before — `specs` is optional and additive.
-  it("with no specs argument, behaves exactly as before (backward compatible)", () => {
-    const roster = [rosterEntry({ id: "studio" })];
-    expect(rosterOnlyEntries([], new Map(), roster)).toEqual(roster);
-  });
-
-  // (#1855 follow-up, F2) The mismatched-name duplicate: a live peer beating
-  // under one alias and rostered under a near-miss of it (case, stray
-  // whitespace, or the mDNS `.local` suffix) used to render BOTH a live
-  // card and a phantom "offline" roster-only card for the same machine.
-  it("excludes a roster entry that differs from a live beat only by case", () => {
-    const roster = [rosterEntry({ id: "Studio" })];
-    const live = new Map([["u1", beat({ machine_uid: "u1", display_name: "studio" })]]);
-    expect(rosterOnlyEntries([], live, roster)).toEqual([]);
-  });
-
-  it("excludes a roster entry that differs from flow history only by the mDNS .local suffix", () => {
-    const roster = [rosterEntry({ id: "MacBook-Pro" })];
-    const data: NormRecord[] = [rec({ machine_uid: "u1", machine_id: "MacBook-Pro.local" })];
-    expect(rosterOnlyEntries(data, new Map(), roster)).toEqual([]);
-  });
-
-  it("excludes a roster entry with stray leading/trailing whitespace around an otherwise-matching name", () => {
-    const roster = [rosterEntry({ id: "  studio  " })];
-    const live = new Map([["u1", beat({ machine_uid: "u1", display_name: "studio" })]]);
-    expect(rosterOnlyEntries([], live, roster)).toEqual([]);
-  });
-
-  // The inverted case for F2: a roster id sharing no normalized substring
-  // with any known alias is still reported — widening the match must not
-  // become "everything on the roster is presumed accounted for."
-  it("still reports a roster entry whose name shares nothing with any known alias", () => {
-    const roster = [rosterEntry({ id: "mini-1" })];
-    const live = new Map([["u1", beat({ machine_uid: "u1", display_name: "studio" })]]);
-    expect(rosterOnlyEntries([], live, roster)).toEqual(roster);
-  });
-
-  // (#2768) THE defect this closes: three generations of rename share no
-  // substring at all — `laptop` and `MacBook-Pro` fail every name-based
-  // check above (exact, case-fold, `.local`-strip, whitespace-trim). A
-  // same-name fixture would pass against the bug this is meant to catch;
-  // this one is deliberately shaped so ONLY the uid join can exclude it.
-  it("excludes a roster entry whose machine_uid matches a live beat reporting under a WHOLLY DIFFERENT name", () => {
-    const roster = [rosterEntry({ id: "laptop", machine_uid: "00000000-0000-4000-8000-ABCDEF000020" })];
-    const live = new Map([["00000000-0000-4000-8000-ABCDEF000020", beat({ machine_uid: "00000000-0000-4000-8000-ABCDEF000020", display_name: "MacBook-Pro" })]]);
-    expect(rosterOnlyEntries([], live, roster)).toEqual([]);
-  });
-
-  // Same shape, via flow history under the new name rather than a live beat
-  // — the uid join must work off `machineUids`'s flow-derived half too, not
-  // only the presence-beat half.
-  it("excludes a roster entry whose machine_uid matches flow history under a different name", () => {
-    const roster = [rosterEntry({ id: "laptop", machine_uid: "00000000-0000-4000-8000-ABCDEF000020" })];
-    const data: NormRecord[] = [rec({ machine_uid: "00000000-0000-4000-8000-ABCDEF000020", machine_id: "MacBook-Pro" })];
-    expect(rosterOnlyEntries(data, new Map(), roster)).toEqual([]);
-  });
-
-  // The inverted case, red-proving the join is keyed on the VALUE, not
-  // merely on the field's presence: a roster entry CARRYING a machine_uid
-  // that does not match anything currently known is still a genuinely
-  // silent machine and must still be reported — "rostered, never seen"
-  // stays a real, renderable state (issue #2768's own constraint).
-  it("still reports a roster entry with a machine_uid that matches no known uid", () => {
-    const roster = [rosterEntry({ id: "mini-1", machine_uid: "UNSEEN-UID" })];
-    const live = new Map([["00000000-0000-4000-8000-ABCDEF000020", beat({ machine_uid: "00000000-0000-4000-8000-ABCDEF000020", display_name: "MacBook-Pro" })]]);
-    expect(rosterOnlyEntries([], live, roster)).toEqual(roster);
-  });
-
-  // An entry with NO machine_uid at all (every pre-#2768 roster, and every
-  // remote peer added by network address) behaves exactly as before — the
-  // uid branch never fires, so the pre-existing name-based checks are the
-  // only thing that can exclude it. Constraint 1 from #2768: absence must
-  // never fall back to a uid guess.
-  it("a roster entry with no machine_uid falls through to the pre-existing name-matching behavior unchanged", () => {
-    const roster = [rosterEntry({ id: "laptop" })];
-    const live = new Map([["00000000-0000-4000-8000-ABCDEF000020", beat({ machine_uid: "00000000-0000-4000-8000-ABCDEF000020", display_name: "MacBook-Pro" })]]);
-    // No uid to join on, and the names share nothing — still reported.
-    expect(rosterOnlyEntries([], live, roster)).toEqual(roster);
-  });
-
-  // (#2814) The F1 self-check above already suppresses a roster entry whose
-  // id equals `specs.machine_id`. It cannot suppress one the operator
-  // declared under an OLD name — `laptop` for a machine that now calls
-  // itself `MacBook-Pro` — and since #2814 puts the self uid into the card
-  // list unconditionally, that entry would draw a second, "offline" card
-  // beside the machine's own live one. The uid is the join that survives
-  // the rename.
-  it("(#2814) excludes a roster entry declaring THIS machine's uid under a stale name, on an empty window", () => {
-    const roster = [rosterEntry({ id: "laptop", machine_uid: "00000000-0000-4000-8000-ABCDEF000020" })];
-    const specs = machineSpecs({ machine_id: "MacBook-Pro", machine_uid: "00000000-0000-4000-8000-ABCDEF000020" });
-    expect(rosterOnlyEntries([], new Map(), roster, specs)).toEqual([]);
-  });
-
-  it("(#2814) still reports a roster entry whose uid is NOT this machine's, on the same empty window", () => {
-    // Inverted: the self uid must suppress only the entry that names it.
-    const roster = [rosterEntry({ id: "studio", machine_uid: "OTHER-UID" })];
-    const specs = machineSpecs({ machine_id: "MacBook-Pro", machine_uid: "00000000-0000-4000-8000-ABCDEF000020" });
-    expect(rosterOnlyEntries([], new Map(), roster, specs)).toEqual(roster);
-  });
-});
-
-describe("rosterAliasFor", () => {
-  // (#2802 regression fix) This replaces `rosterLabelFor`, which returned the
-  // same string to OVERRIDE a card's title. That override was inert while
-  // roster entries carried no uid; once #2802 began back-filling uids from
-  // flow history it started firing on entries nobody had aliased on purpose,
-  // and the card for this machine rendered as `laptop` while the activity
-  // lane beneath it said `MacBook-Pro`.
-  it("returns the operator's alias when it differs from the machine's own name", () => {
-    const roster = [rosterEntry({ id: "laptop", machine_uid: "00000000-0000-4000-8000-ABCDEF000020" })];
-    expect(rosterAliasFor("00000000-0000-4000-8000-ABCDEF000020", roster, "MacBook-Pro")).toBe("laptop");
-  });
-
-  // THE REGRESSION, pinned: the alias must never become the title. A caller
-  // applies this as secondary text; the machine's own name is the title.
-  it("does not return an alias equal to the machine's own name", () => {
-    const roster = [rosterEntry({ id: "MacBook-Pro", machine_uid: "00000000-0000-4000-8000-ABCDEF000020" })];
-    expect(
-      rosterAliasFor("00000000-0000-4000-8000-ABCDEF000020", roster, "MacBook-Pro"),
-    ).toBeUndefined();
-  });
-
-  // Same machine, same name, different spelling — `.local` and case are the
-  // two aliases a single machine legitimately carries (see `nameOf`'s #2030
-  // doc), and showing either beside the other is noise, not provenance.
-  it("folds a .local or case variant rather than showing the name twice", () => {
-    const roster = [rosterEntry({ id: "macbook-pro.local", machine_uid: "00000000-0000-4000-8000-ABCDEF000020" })];
-    expect(
-      rosterAliasFor("00000000-0000-4000-8000-ABCDEF000020", roster, "MacBook-Pro"),
-    ).toBeUndefined();
-  });
-
-  // Inverted case: no roster entry names this uid — never invent an alias.
-  it("returns undefined when no roster entry names this uid", () => {
-    const roster = [rosterEntry({ id: "laptop", machine_uid: "00000000-0000-4000-8000-ABCDEF000020" })];
-    expect(rosterAliasFor("some-other-uid", roster, "MacBook-Pro")).toBeUndefined();
-  });
-
-  // An entry with no machine_uid at all never matches any uid.
-  it("returns undefined for a roster with no resolved uids", () => {
-    const roster = [rosterEntry({ id: "laptop" })];
-    expect(rosterAliasFor("00000000-0000-4000-8000-ABCDEF000020", roster, "MacBook-Pro")).toBeUndefined();
-  });
-});
-
-/**
- * (#1855) A card with no hardware line used to say ONE thing for two facts.
- *
- * The issue's own wire dump is the `not-reported` case: both real machines
- * beat with no `specs` key at all, because the emitter hardcoded
- * `specs: None` until #2083. That peer ANSWERED and said nothing about its
- * hardware, and "hardware not reported" is the honest sentence for it.
- *
- * The `not-seen` case is the one #1855's roster cards created. A machine the
- * operator declared with `darkmux machine add` that is down, or has never
- * started its daemon, now renders a card instead of vanishing — and that card
- * was asserting the machine had reported and withheld its hardware, when
- * nothing had ever been received from it at all. Same class as the vanishing
- * itself: a confident answer the page cannot back up.
- */
 describe("(#1855) the spec line says WHICH kind of unknown", () => {
   const T = 9e15;
 
   it("a machine that beat WITHOUT specs reads 'not-reported' — it answered and said nothing", () => {
     const live = new Map([["u1", beat({ machine_uid: "u1" })]]);
-    const card = buildFleetCard([], live, null, new Set(), false, "u1", true, T, live);
+    const card = buildFleetCard([], live, null, new Set(), false, "u1", true, T);
     expect(card.spec).toBe("");
     expect(card.specUnknown).toBe("not-reported");
     expect(specUnknownLabel(card.specUnknown!)).toBe("hardware not reported");
@@ -1051,7 +823,7 @@ describe("(#1855) the spec line says WHICH kind of unknown", () => {
   it("a machine WITH hardware reports no unknown at all", () => {
     // Inverted case 1 — the healthy card must carry no marker of any kind.
     const live = new Map([["u1", beat({ machine_uid: "u1", specs: "Apple M5 Max · 128 GB" })]]);
-    const card = buildFleetCard([], live, null, new Set(), false, "u1", true, T, live);
+    const card = buildFleetCard([], live, null, new Set(), false, "u1", true, T);
     expect(card.spec).toBe("Apple M5 Max · 128 GB");
     expect(card.specUnknown).toBeNull();
   });
@@ -1220,7 +992,8 @@ describe("(#2915) buildFleetCard's utility strip", () => {
     rec({ ts: at(s), machine_uid: uid, action: "utility.start", category: "telemetry", source: "utility", handle: "radio-router", model: "util-4b", payload: { job: "radio_routing", model: "util-4b", stall_after_ms: 30000 } });
   const routeEnd = (s: number) =>
     rec({ ts: at(s), machine_uid: "u1", action: "telemetry.tokens", category: "telemetry", source: "tokens", handle: "radio-router", payload: { purpose: "utility", call_kind: "single_shot", job: "radio_routing", requested_model: "util-4b", total_tokens: 9 } });
-  const card = (data: NormRecord[], t: number, specs: MachineSpecsResponse | null = null) => buildFleetCard(data, new Map(), specs, new Set(), false, "u1", true, t);
+  const card = (data: NormRecord[], t: number, specs: MachineSpecsResponse | null = null) =>
+    buildFleetCard(data, new Map(), specs, new Set(), false, "u1", true, t, specs ? rowFactsFor({ isSelf: true }) : null);
 
   it("shows the routing job while it runs, and is quiet once its usage record lands", () => {
     expect(card([routeStart(0)], tAt(2)).utility.job).toMatchObject({ job: "radio_routing", visual: "radio", stalled: false });
@@ -1299,9 +1072,9 @@ describe("(#2928) buildFleetCard with the live overlay", () => {
     const { UTILITY_JOB } = await import("../../lib/utilityJobs");
     const store = new LiveStore();
     store.ingest(JSON.stringify({ v: 1, kind: "utility", role: "radio-router", model: "u4b", at_ms: T, cadence_ms: 250, fields: { event: "start", job: UTILITY_JOB.radio_routing, job_id: "r1", stall_after_ms: 30000 } }), T);
-    const self = buildFleetCard(durable, new Map(), selfSpecs, new Set(["s1"]), false, "u1", true, T + 100, undefined, [], true, null, [], store.snapshot());
+    const self = buildFleetCard(durable, new Map(), selfSpecs, new Set(["s1"]), false, "u1", true, T + 100, rowFactsFor({ isSelf: true }), [], true, null, [], store.snapshot());
     expect(self.utility.job?.visual).toBe("radio");
-    const peer = buildFleetCard(durable, new Map(), selfSpecs, new Set(["s1"]), false, "u2", true, T + 100, undefined, [], true, null, [], store.snapshot());
+    const peer = buildFleetCard(durable, new Map(), selfSpecs, new Set(["s1"]), false, "u2", true, T + 100, rowFactsFor({ uid: "u2" }), [], true, null, [], store.snapshot());
     expect(peer.utility.job).toBeNull();
   });
 });
@@ -1310,9 +1083,9 @@ describe("(#2928) buildFleetCard with the live overlay", () => {
 // (#2958) Positive readings at once; negative claims once every source that
 // could contradict them has answered.
 describe("cardFace (#2958)", () => {
-  const none = { flow: false, presence: false, sessions: false, runs: false, specs: false };
-  const all = { flow: true, presence: true, sessions: true, runs: true, specs: true };
-  const quiet = { absent: false, active: false, runsCount: 0 };
+  const none = { flow: false, presence: false, sessions: false, runs: false };
+  const all = { flow: true, presence: true, sessions: true, runs: true };
+  const quiet = { absent: false, active: false, runsCount: 0, standing: "online" as const };
 
   it("nothing answered: an idle card says no signal, with no-signal static and no count", () => {
     expect(cardFace(quiet, false, none)).toMatchObject({ stat: "no signal", noSignal: true, tube: "nosignal", countShown: false, utilityQuietKnown: false, active: false, absent: false });
@@ -1326,47 +1099,73 @@ describe("cardFace (#2958)", () => {
     for (const k of ["flow", "presence", "sessions", "runs"] as const) {
       expect(cardFace(quiet, false, { ...all, [k]: false }).stat, k).toBe("no signal");
     }
-    // A roster-only card waits on /machine/specs as well.
-    for (const k of Object.keys(all) as Array<keyof typeof all>) {
-      expect(cardFace({ ...quiet, rosterOnly: true }, false, { ...all, [k]: false }).stat, k).toBe("no signal");
-    }
   });
 
   it("a live reading and 'dispatch in flight' show before anything else answers", () => {
-    const f = cardFace({ absent: false, active: true, runsCount: 2 }, true, { ...none, flow: true });
+    const f = cardFace({ ...quiet, active: true, runsCount: 2 }, true, { ...none, flow: true });
     expect(f).toMatchObject({ stat: "dispatch in flight", active: true, noSignal: false, tube: "reading", countShown: true });
   });
 
   it("in flight with no model working: the tube's 'no model working' waits for every source", () => {
-    expect(cardFace({ absent: false, active: true, runsCount: 1 }, false, { ...all, sessions: false }).tube).toBe("nosignal");
-    expect(cardFace({ absent: false, active: true, runsCount: 1 }, false, all).tube).toBe("idle");
+    expect(cardFace({ ...quiet, active: true, runsCount: 1 }, false, { ...all, sessions: false }).tube).toBe("nosignal");
+    expect(cardFace({ ...quiet, active: true, runsCount: 1 }, false, all).tube).toBe("idle");
   });
 
   it("offline waits on presence and the flow window, not on /runs; it keeps the tube's box, powered off", () => {
-    const gone = { absent: true, active: false, runsCount: 0 };
+    const gone = { absent: true, active: false, runsCount: 0, standing: "offline" as const };
     expect(cardFace(gone, false, { ...all, presence: false })).toMatchObject({ stat: "no signal", absent: false, tube: "nosignal" });
     expect(cardFace(gone, false, { ...all, flow: false })).toMatchObject({ stat: "no signal", absent: false });
-    expect(cardFace(gone, false, { flow: true, presence: true, sessions: false, runs: false, specs: false })).toMatchObject({ stat: "offline", absent: true, tube: "off", noSignal: false, countShown: false });
+    expect(cardFace(gone, false, { flow: true, presence: true, sessions: false, runs: false })).toMatchObject({ stat: "offline", absent: true, tube: "off", noSignal: false, countShown: false });
     expect(cardFace(gone, false, all)).toMatchObject({ stat: "offline", absent: true, tube: "off", countShown: true });
   });
 
   it("offline wins over a reading: an offline card's tube is powered off", () => {
-    const gone = { absent: true, active: true, runsCount: 1 };
+    const gone = { absent: true, active: true, runsCount: 1, standing: "offline" as const };
     expect(cardFace(gone, true, all)).toMatchObject({ stat: "offline", absent: true, active: false, tube: "off" });
     // Before presence has answered, the reading stays: it is a positive one.
     expect(cardFace(gone, true, { ...all, presence: false })).toMatchObject({ stat: "dispatch in flight", tube: "reading" });
   });
 
-  it("a roster-only card's offline and idle wait on /machine/specs too; other cards do not", () => {
-    const rostered = { absent: true, active: false, runsCount: 0, rosterOnly: true };
-    expect(cardFace(rostered, false, { ...all, specs: false })).toMatchObject({ stat: "no signal", absent: false, tube: "nosignal", countShown: false });
-    expect(cardFace(rostered, false, all)).toMatchObject({ stat: "offline", absent: true, tube: "off", countShown: true });
-    expect(cardFace({ absent: true, active: false, runsCount: 0 }, false, { ...all, specs: false })).toMatchObject({ stat: "offline", tube: "off", countShown: true });
-    expect(cardFace(quiet, false, { ...all, specs: false })).toMatchObject({ stat: "idle", tube: "idle" });
-  });
-
   it("a quiet utility strip waits only on the flow window", () => {
     expect(cardFace(quiet, false, { ...none, flow: true }).utilityQuietKnown).toBe(true);
     expect(cardFace(quiet, false, { ...all, flow: false }).utilityQuietKnown).toBe(false);
+  });
+});
+
+describe("buildFleetCard: a machine the fleet view holds", () => {
+  it("reads its hardware line, grant and standing from its row, not from presence", () => {
+    // No beat, no records: the reported case. Presence says nothing about
+    // this peer; the view read its card.
+    const row = rowFactsFor({ uid: "studio", known: false, name: "studio", spec: "Apple M1 Max · 32 GB", grant: "runs diff-review", standing: "online" });
+    const card = buildFleetCard([], new Map(), null, new Set(), false, "studio", true, T_MAX, row);
+    expect(card).toMatchObject({ name: "studio", spec: "Apple M1 Max · 32 GB", grant: "runs diff-review", standing: "online", absent: false, stat: "idle" });
+    expect(specLine(card)).toBe("Apple M1 Max · 32 GB · runs diff-review");
+  });
+
+  it("an unreachable peer carries the view's status note and no hardware", () => {
+    const row = rowFactsFor({ uid: "studio", known: false, name: "studio", note: "listener off", standing: "offline" });
+    const card = buildFleetCard([], new Map(), null, new Set(), false, "studio", true, T_MAX, row);
+    expect(card).toMatchObject({ spec: "", note: "listener off", standing: "offline", absent: true, stat: "offline" });
+  });
+
+  it("a standing the view could not decide says no signal, never idle", () => {
+    const row = rowFactsFor({ uid: "studio", known: false, name: "studio", note: "listener unavailable", standing: "unknown" });
+    const card = buildFleetCard([], new Map(), null, new Set(), false, "studio", true, T_MAX, row);
+    expect(card).toMatchObject({ absent: false, stat: "no signal" });
+  });
+
+  it("a machine outside the view keeps the flow-derived standing", () => {
+    expect(buildFleetCard([], new Map(), null, new Set(), true, "u9", true, T_MAX).standing).toBe("offline");
+    expect(buildFleetCard([], new Map(), null, new Set(), false, "u9", true, T_MAX).standing).toBe("online");
+  });
+});
+
+describe("cardFace: an undecided standing is no signal, not idle", () => {
+  const all = { flow: true, presence: true, sessions: true, runs: true };
+  it("says no signal with the no-signal tube, and offline only when the standing is offline", () => {
+    const base = { absent: false, active: false, runsCount: 0 };
+    expect(cardFace({ ...base, standing: "unknown" }, false, all)).toMatchObject({ stat: "no signal", tube: "nosignal", absent: false });
+    expect(cardFace({ ...base, standing: "online" }, false, all)).toMatchObject({ stat: "idle", tube: "idle" });
+    expect(cardFace({ ...base, absent: true, standing: "offline" }, false, all)).toMatchObject({ stat: "offline", tube: "off", absent: true });
   });
 });

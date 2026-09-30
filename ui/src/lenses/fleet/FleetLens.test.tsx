@@ -17,6 +17,9 @@ import { queryKeys } from "../../lib/queryKeys";
 import { machineKeyHash } from "../../lib/machineKey";
 import { __clockDebug } from "../../lib/clock";
 import type { NormRecord } from "../../lib/ingest";
+import type { FleetMachine } from "../../types/generated/FleetMachine";
+import type { FleetView } from "../../types/generated/FleetView";
+import type { MachineSpecsResponse } from "../../types/generated/MachineSpecsResponse";
 import { norm, normAll, type RawRecord } from "../../testing/records";
 
 /** The TokenScope props a probe serialized, as far as these tests read them. */
@@ -107,7 +110,59 @@ function renderFleetLens(
   );
 }
 
-/** Waits until `/fleet/machines/live`, `/fleet/roster`, and `/machine/specs`
+/** A `/fleet/view` row whose card the daemon read: chip, RAM and identity from
+ * `specs`. `viewRow` overrides any field of the row itself. */
+function viewRow(specs: Partial<MachineSpecsResponse> = {}, over: Partial<FleetMachine> = {}): FleetMachine {
+  const full: MachineSpecsResponse = {
+    darkmux_version: "5.0.0",
+    flow_schema_version: "1.60.0",
+    machine_id: null,
+    machine_uid: null,
+    os: "macos",
+    ram_total_bytes: null,
+    ram_free_for_ai_bytes: null,
+    cpu_brand: null,
+    loaded_models: [],
+    lms_unreachable: false,
+    utility_model: null,
+    redis_url_redacted: null,
+    generated_at_ms: 0,
+    ...specs,
+  };
+  return {
+    entry: null,
+    is_this_machine: false,
+    machine_uid: full.machine_uid,
+    uid_source: null,
+    liveness: "live",
+    last_beat_ms: null,
+    received_at_ms: null,
+    fetch_ms: 1,
+    card: { state: "available", card: { specs: full } as never, source: "listener" },
+    accepts: { state: "unknown" },
+    ...over,
+  };
+}
+
+/** This daemon's own row: the machine serving the page. */
+function selfRow(specs: Partial<MachineSpecsResponse>): FleetMachine {
+  return viewRow(specs, { is_this_machine: true, accepts: { state: "this_machine" } });
+}
+
+/** A rostered peer the daemon could not read a card from. */
+function unreachableRow(id: string, reason: "listener_off" | "unknown", over: Partial<FleetMachine> = {}): FleetMachine {
+  return viewRow(
+    {},
+    {
+      entry: { id, address: "100.64.1.2:8765", added_unix_ms: 1000 },
+      liveness: "no_beat",
+      card: { state: "unreachable", reason, detail: null },
+      ...over,
+    },
+  );
+}
+
+/** Waits until `/fleet/machines/live`, `/fleet/roster`, and `/fleet/view`
  * have all settled (success or error) in `queryClient`'s cache, rather than
  * inferring settlement from an incidental DOM condition.
  *
@@ -123,7 +178,7 @@ function renderFleetLens(
  * query states removes the race instead of hoping the timing works out. */
 async function waitForFleetQueriesSettled(queryClient: QueryClient) {
   await waitFor(() => {
-    for (const key of [queryKeys.fleetMachinesLive(), queryKeys.fleetRoster(), queryKeys.machineSpecs()]) {
+    for (const key of [queryKeys.fleetMachinesLive(), queryKeys.fleetRoster(), queryKeys.fleetView("/fleet/view")]) {
       const state = queryClient.getQueryState(key);
       expect(state?.status, `query ${JSON.stringify(key)} settled`).not.toBe("pending");
     }
@@ -137,13 +192,12 @@ function mockFleetFetch(opts: {
   flowToday?: unknown[];
   flowYesterday?: unknown[];
   machines?: unknown[];
-  /** (#1809) This daemon's OWN `/machine/specs` — the confirmed-local
-   * signal `localMachineUid` resolves against. Omitted (the default) keeps
-   * the pre-existing 404 (no daemon has confirmed ANY card as local), so
-   * every pre-#1809 test in this file is unaffected by this field's
-   * addition. Set it to make ONE uid resolve as local — see the two
-   * locality-split tests below for why that distinction now matters. */
-  specs?: unknown;
+  /** This daemon's OWN specs, served as the `is_this_machine` row of
+   * `/fleet/view` (the confirmed-local signal `localMachineUid` resolves
+   * against). Omitted with no `view` keeps the view a 404. */
+  specs?: Partial<MachineSpecsResponse>;
+  /** Further `/fleet/view` rows: the peers the daemon read (or could not). */
+  view?: FleetMachine[];
   /** (#1923) `GET /runs` rows — omitted (the default) keeps the pre-existing
    * 404 (every pre-#1923 test in this file is unaffected), same pattern as
    * `specs` above. */
@@ -211,9 +265,20 @@ function mockFleetFetch(opts: {
         new Response(JSON.stringify({ dispatches, meta: { sources: { fleet: { state: "ok" } }, complete: true } }), { status: 200 }),
       );
     }
-    if (path === "/machine/specs") {
-      if (opts.specs === undefined) return Promise.resolve(new Response("{}", { status: 404 }));
-      return Promise.resolve(new Response(JSON.stringify(opts.specs), { status: 200 }));
+    if (path === "/fleet/view") {
+      if (opts.specs === undefined && opts.view === undefined) return Promise.resolve(new Response("{}", { status: 404 }));
+      const machines = [...(opts.specs === undefined ? [] : [selfRow(opts.specs)]), ...(opts.view ?? [])];
+      const view: FleetView = {
+        gathered_by: "daemon",
+        local_machine_id: null,
+        presence: { state: "off" },
+        roster_error: null,
+        fetched_at_ms: 1,
+        cache_ttl_ms: 0,
+        gather_ms: 0,
+        machines,
+      };
+      return Promise.resolve(new Response(JSON.stringify(view), { status: 200 }));
     }
     if (path === "/runs") {
       if (opts.runs === undefined) return Promise.resolve(new Response("not recorded\n", { status: 404 }));
@@ -598,7 +663,7 @@ describe("FleetLens", () => {
       await new Promise((r) => setTimeout(r, 50));
       expect(
         seen.filter(
-          (p) => p === "/fleet/machines/live" || p === "/fleet/dispatches/live" || p === "/machine/specs" || p === "/fleet/roster",
+          (p) => p === "/fleet/machines/live" || p === "/fleet/dispatches/live" || p === "/fleet/view" || p === "/fleet/roster",
         ),
       ).toEqual([]);
     } finally {
@@ -606,7 +671,7 @@ describe("FleetLens", () => {
     }
   });
 
-  it("(#2067) on a static build the card's hardware line comes from the committed fleet snapshot, never from a daemon route", async () => {
+  it("(#2067) on a static build the card's hardware line comes from the committed fleet view, never from a daemon route", async () => {
     for (const [name, content] of [
       ["darkmux-flow-src", "./demo-flow.jsonl"],
       ["darkmux-fleet-src", "./demo-fleet.json"],
@@ -626,9 +691,15 @@ describe("FleetLens", () => {
           return Promise.resolve(
             new Response(
               JSON.stringify({
-                machines: [{ machine_uid: "u1", display_name: "m5-ultra-256gb", specs: "Apple M5 Ultra · 256 GB", beat_ts_ms: 1 }],
-                meta: { sources: { fleet: { state: "ok" } }, complete: true },
-              }),
+                gathered_by: "daemon",
+                local_machine_id: null,
+                presence: { state: "off" },
+                roster_error: null,
+                fetched_at_ms: 1,
+                cache_ttl_ms: 0,
+                gather_ms: 0,
+                machines: [selfRow({ machine_id: "m5-ultra-256gb", machine_uid: "u1", cpu_brand: "Apple M5 Ultra", ram_total_bytes: 274877906944 })],
+              } satisfies FleetView),
               { status: 200 },
             ),
           );
@@ -643,12 +714,12 @@ describe("FleetLens", () => {
       ]);
       render(
         <QueryClientProvider client={queryClient}>
-          <FleetLens records={records} tMax={Date.parse("2026-08-26T10:00:00.000Z")} historical />
+          <FleetLens records={records} tMax={Date.parse("2026-08-26T10:00:00.000Z")} />
         </QueryClientProvider>,
       );
       await waitFor(() => expect(screen.getByText("Apple M5 Ultra · 256 GB")).toBeInTheDocument());
       expect(screen.queryByText("hardware not reported")).not.toBeInTheDocument();
-      expect(seen.filter((p) => p === "/fleet/machines/live" || p === "/machine/specs")).toEqual([]);
+      expect(seen.filter((p) => p === "/fleet/machines/live" || p === "/fleet/view")).toEqual([]);
     } finally {
       document.head.querySelectorAll('meta[name^="darkmux-"]').forEach((m) => m.remove());
     }
@@ -1472,7 +1543,7 @@ describe("FleetLens pager (#2881)", () => {
 // entirely — indistinguishable from never having been added.
 describe("FleetLens — rostered-but-silent machine (#1855)", () => {
   it("a machine on the roster with zero flow history and no live beat renders an offline card, not nothing", async () => {
-    mockFleetFetch({ roster: [{ id: "studio", address: "100.64.1.2:8765", added_unix_ms: 1000 }] });
+    mockFleetFetch({ view: [unreachableRow("studio", "unknown")] });
     renderFleetLens();
     // (#2958) "offline" waits on presence and the flow window.
     await waitFor(() => expect(document.querySelector(".mach")?.textContent).toContain("offline"));
@@ -1516,13 +1587,72 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
   // "hardware not reported" reads as a fact about the machine — it answered
   // and withheld its hardware — and nothing has been received from this one
   // at all.
-  it("a rostered-but-silent card says its hardware is unknown, not that the machine failed to report it", async () => {
-    mockFleetFetch({ roster: [{ id: "studio", address: "100.64.1.2:8765", added_unix_ms: 1000 }] });
+  it("a peer the view could not reach shows the view's typed reason, not a hardware claim", async () => {
+    mockFleetFetch({ view: [unreachableRow("studio", "listener_off")] });
     renderFleetLens();
     await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
     const card = document.querySelector(".mach")!;
-    expect(card.textContent).toContain("hardware unknown — nothing received");
+    expect(card.querySelector(".spec")!.textContent).toBe("listener off");
+    expect(card.textContent).not.toContain("hardware unknown");
     expect(card.textContent).not.toContain("hardware not reported");
+  });
+
+  // THE REPORTED CASE: a peer whose Redis is off has no presence beat and no
+  // flow here, yet the daemon read its card. The view says it is available,
+  // so the lens must not call it offline or its hardware unknown.
+  it("a peer the view reports available is never shown offline or hardware-unknown, whatever presence says", async () => {
+    mockFleetFetch({
+      specs: { machine_id: "MacBook-Pro", machine_uid: "u-self", cpu_brand: "Apple M5 Max", ram_total_bytes: 137438953472 },
+      view: [
+        viewRow(
+          { machine_id: "studio", machine_uid: "u-studio", cpu_brand: "Apple M1 Max", ram_total_bytes: 34359738368 },
+          {
+            entry: { id: "studio", address: "100.64.1.2:8765", added_unix_ms: 1000 },
+            liveness: "no_beat",
+            accepts: { state: "granted", accepts: { peer_name: "laptop", profiles: ["diff-review"], roles: ["radio-host"], images: [], workspace: false } },
+          },
+        ),
+      ],
+      runs: [],
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelectorAll(".mach")).toHaveLength(2));
+    await waitFor(() => expect(document.querySelector('.savings[data-settled="true"]')).not.toBeNull());
+    const studio = [...document.querySelectorAll(".mach")].find((c) => c.querySelector(".mach-name")!.textContent === "studio")!;
+    await waitFor(() => expect(studio.querySelector(".stat")!.textContent).toBe("idle"));
+    expect(studio.className).not.toContain("absent");
+    expect(studio.textContent).not.toContain("offline");
+    expect(studio.querySelector(".spec")!.textContent).toBe("Apple M1 Max · 32 GB · runs diff-review · radio-host here");
+    // This machine's own card shows no grant.
+    const self = [...document.querySelectorAll(".mach")].find((c) => c !== studio)!;
+    expect(self.querySelector(".spec")!.textContent).toBe("Apple M5 Max · 128 GB");
+  });
+
+  // The inverse: with the same row unreachable and presence silent, the
+  // card IS offline, and says why.
+  it("the same peer, unreachable with no beat, is offline and names the reason", async () => {
+    mockFleetFetch({
+      specs: { machine_id: "MacBook-Pro", machine_uid: "u-self" },
+      view: [unreachableRow("studio", "listener_off")],
+      runs: [],
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelectorAll(".mach")).toHaveLength(2));
+    const studio = [...document.querySelectorAll(".mach")].find((c) => c.querySelector(".mach-name")!.textContent === "studio")!;
+    await waitFor(() => expect(studio.querySelector(".stat")!.textContent).toBe("offline"));
+    expect(studio.className).toContain("absent");
+    expect(studio.querySelector(".spec")!.textContent).toBe("listener off");
+  });
+
+  it("an unreachable peer whose liveness the view cannot decide says no signal, never idle", async () => {
+    mockFleetFetch({ view: [unreachableRow("studio", "listener_off", { liveness: "unknown" })], runs: [] });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    await waitFor(() => expect(document.querySelector('.savings[data-settled="true"]')).not.toBeNull());
+    const card = document.querySelector(".mach")!;
+    expect(card.querySelector(".stat")!.textContent).toBe("no signal");
+    expect(card.textContent).not.toContain("idle");
+    expect(card.className).not.toContain("absent");
   });
 
   // The INVERTED case for that line: a machine that DID beat, carrying no
@@ -1598,16 +1728,20 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
   // request. The honest render, absent any presence/flow evidence, is NO
   // card — same as the "genuinely gone" case just above — not a lying
   // "offline" one.
-  it("a roster entry matching THIS machine's own /machine/specs identity, with zero flow/presence evidence, renders no phantom offline card", async () => {
+  it("this machine's own roster entry is its one card: the view names it once, so no phantom offline card", async () => {
     mockFleetFetch({
-      specs: { machine_id: "studio", cpu_brand: "Apple M5 Max" },
+      view: [selfRow({ machine_id: "studio", machine_uid: "u-self", cpu_brand: "Apple M5 Max" })].map((r) => ({
+        ...r,
+        entry: { id: "studio", address: "100.64.1.2:8765", added_unix_ms: 1000 },
+      })),
       roster: [{ id: "studio", address: "100.64.1.2:8765", added_unix_ms: 1000 }],
     });
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     renderFleetLens({}, queryClient);
-    await waitFor(() => expect(screen.getByText(/tokens · last/i)).toBeInTheDocument());
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
     await waitForFleetQueriesSettled(queryClient);
-    expect(document.querySelector(".mach")).toBeNull();
+    expect(document.querySelectorAll(".mach")).toHaveLength(1);
+    expect(document.querySelector(".mach")!.className).not.toContain("absent");
   });
 
   // (#1855 follow-up, F2) THE MISMATCHED-NAME DUPLICATE: the roster id is
@@ -1686,7 +1820,8 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
   it("a roster entry with a machine_uid matching no known machine still renders its own offline card", async () => {
     mockFleetFetch({
       machines: [{ machine_uid: "00000000-0000-4000-8000-ABCDEF000020", display_name: "MacBook-Pro", schema_version: "1.20.0", beat_ts_ms: 1 }],
-      roster: [{ id: "mini-1", address: "100.64.1.9:8765", added_unix_ms: 1000, machine_uid: "NEVER-SEEN-UID" }],
+      specs: { machine_id: "MacBook-Pro", machine_uid: "00000000-0000-4000-8000-ABCDEF000020" },
+      view: [unreachableRow("mini-1", "unknown", { machine_uid: "NEVER-SEEN-UID" })],
     });
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     renderFleetLens({}, queryClient);
@@ -1715,7 +1850,7 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
   });
 
   it("a healthy (non-corrupt) roster renders no roster-unreadable notice", async () => {
-    mockFleetFetch({ roster: [{ id: "studio", address: "100.64.1.2:8765", added_unix_ms: 1000 }] });
+    mockFleetFetch({ view: [unreachableRow("studio", "unknown")], roster: [{ id: "studio", address: "100.64.1.2:8765", added_unix_ms: 1000 }] });
     renderFleetLens();
     await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
     expect(screen.queryByText(/fleet roster unreadable/i)).not.toBeInTheDocument();
@@ -2000,7 +2135,7 @@ describe("FleetLens — a card says no signal until its first data arrives (#295
   // presence says it is gone it keeps that box with the screen powered off.
   it("a rostered-but-silent machine: 'no signal' while presence is unanswered, then 'offline' with a powered-off tube", async () => {
     const presence = gate();
-    mockFleetFetch({ roster: [{ id: "studio", address: "100.64.1.2:8765", added_unix_ms: 1000 }], runs: [], hold: { "/fleet/machines/live": presence.promise } });
+    mockFleetFetch({ view: [unreachableRow("studio", "unknown")], runs: [], hold: { "/fleet/machines/live": presence.promise } });
     renderFleetLens();
     await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
     await waitFor(() => expect(document.querySelector('.savings[data-settled="true"]')).not.toBeNull());
@@ -2043,18 +2178,18 @@ describe("FleetLens — a card says no signal until its first data arrives (#295
     expect(document.querySelector(".mach")!.className).not.toContain("nosignal");
   });
 
-  // (#2958 second review, point 1) A roster entry is told apart from THIS
-  // machine by `/machine/specs` (`rosterOnlyEntries`' F1 uid check). Until
-  // specs answers, this machine's own roster entry is indistinguishable from
-  // a silent peer, so its card must not say "offline" or "0 running": once
-  // specs answers, that card is replaced by the machine's own idle one.
-  it("this machine's own roster entry says 'no signal', not 'offline', while /machine/specs is unanswered", async () => {
-    const specs = gate();
+  // (#2958 second review, point 1) Until the view answers, this machine's
+  // own roster entry is unknown to the page, so no card may say "offline" or
+  // "0 running" for it; once the view answers, the machine's own idle card
+  // is the only one.
+  it("this machine's own roster entry says 'no signal', not 'offline', while /fleet/view is unanswered", async () => {
+    const view = gate();
     mockFleetFetch({
       roster: [{ id: "laptop", address: "100.64.1.1:8765", added_unix_ms: 1000, machine_uid: "u-self" }],
       specs: SPECS,
       runs: [],
-      hold: { "/machine/specs": specs.promise },
+      machines: BEAT,
+      hold: { "/fleet/view": view.promise },
     });
     const queryClient = newClient();
     renderFleetLens({}, queryClient);
@@ -2065,7 +2200,7 @@ describe("FleetLens — a card says no signal until its first data arrives (#295
       }
     });
     await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
-    expect(queryClient.getQueryState(queryKeys.machineSpecs())?.status, "/machine/specs is still unanswered").toBe("pending");
+    expect(queryClient.getQueryState(queryKeys.fleetView("/fleet/view"))?.status, "/fleet/view is still unanswered").toBe("pending");
     const card = document.querySelector(".mach")!;
     expect(stat(card)).toBe("no signal");
     expect(card.textContent).not.toContain("offline");
@@ -2074,10 +2209,11 @@ describe("FleetLens — a card says no signal until its first data arrives (#295
     expect(card.className).not.toContain("absent");
     expect(cardScope(card)).toMatchObject({ state: "nosignal" });
 
-    specs.open();
-    await waitFor(() => expect(document.querySelector(".mach")!.textContent).toContain("MacBook-Pro"));
-    await waitFor(() => expect(stat(document.querySelector(".mach")!)).toBe("idle"));
-    expect(document.querySelectorAll(".mach")).toHaveLength(1);
+    view.open();
+    await waitFor(() => expect(document.querySelectorAll(".mach")).toHaveLength(2));
+    await waitFor(() => {
+      for (const c of document.querySelectorAll(".mach")) expect(stat(c)).toBe("idle");
+    });
   });
 
   // (#2958 second review, point 4) Offline wins over a reading: a machine

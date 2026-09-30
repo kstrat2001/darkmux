@@ -78,9 +78,8 @@ export const queryKeys = {
   /** `GET /fleet/roster` (#1855) — the operator's DECLARED topology
    * (`darkmux machine add`), independent of presence. Distinct cache entry
    * from `fleetMachinesLive` above: that one is "who's beating right now",
-   * this one is "who did the operator say belongs here" — see
-   * `cards.ts::rosterOnlyEntries` for how the two are reconciled into one
-   * card list without double-reporting a machine that is both. */
+   * this one is "who did the operator say belongs here". The fleet lens's
+   * cards read `fleetView` below; this feeds machine naming and keys. */
   fleetRoster: () => ["fleet", "roster"] as const,
   runs: () => ["runs"] as const,
   labRuns: () => ["lab", "runs"] as const,
@@ -133,10 +132,10 @@ export const queryKeys = {
    * EVERY mission's graph at once, matching `staticMachine`'s own
    * one-fixture-one-fetch shape, not `missionGraph`'s per-id shape). */
   staticGraphs: (src: string) => ["mission", "graph", "static", src] as const,
-  /** `source.ts, the fleet fixture`'s committed `/fleet/machines/live`
-   * snapshot (#2067) — the fleet cards' hardware line on a static build.
-   * Keyed by SRC like every other static twin here. */
-  staticFleet: (src: string) => ["fleet", "machines", "static", src] as const,
+  /** `GET /fleet/view`, or the committed snapshot of it a daemon-less build
+   * ships (`source.ts::fleetViewSrc`). Keyed by SRC so the two never share a
+   * cache entry. */
+  fleetView: (src: string) => ["fleet", "view", src] as const,
   flowSession: (id: string) => ["flow", "session", id] as const,
   /** `GET /lab/run/detail?dir=` — the lab-run detail view's one-shot fetch
    * (`LabRunDetail.tsx`). The event-feed poll (`/lab/run/events`) is NOT a
