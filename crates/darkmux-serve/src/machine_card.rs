@@ -740,7 +740,7 @@ pub(crate) mod tests {
     fn a_grant_is_listed_not_listed_or_unknown_and_never_guessed() {
         use darkmux_fleet::Refusal;
         assert!(matches!(CardGrant::from_authorization(&Ok(admitted())), CardGrant::Listed { accepts } if accepts.peer_name == "laptop"));
-        assert_eq!(CardGrant::from_authorization(&Err(Refusal::NotAllowed { node_name: "phone".into() })), CardGrant::NotListed);
+        assert_eq!(CardGrant::from_authorization(&Err(Refusal::NotAllowed { node_name: "phone".into(), ask: Default::default() })), CardGrant::NotListed);
         for other in [
             Refusal::AmbiguousEntry { names: vec!["a".into(), "b".into()] },
             Refusal::BadRequest("the allow-list cannot be read".into()),

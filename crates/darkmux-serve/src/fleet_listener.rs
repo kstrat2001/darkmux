@@ -862,14 +862,18 @@ async fn card_handler(State(state): State<FleetListenerState>, Extension(auth): 
     }
 }
 
-/// A caller the gate authenticated AND the allow-list lists: what a job needs
-/// and a card read does not. The gate does not require the allow-list entry;
-/// this extractor reads it, and refuses with the listener's own sentence when
-/// the authenticated node has none.
-struct Authorized(Admitted);
+/// A caller the gate authenticated, and what the allow-list said of it: what
+/// a job needs and a card read does not. The gate does not require the
+/// allow-list entry. This extractor reads it and leaves the refusal to the
+/// handler, which has the body: an unlisted sender's refusal names the trust
+/// command for the job it posted.
+struct Authorization {
+    node: NodeIdentity,
+    result: Result<Admitted, Refusal>,
+}
 
 #[axum::async_trait]
-impl axum::extract::FromRequestParts<FleetListenerState> for Authorized {
+impl axum::extract::FromRequestParts<FleetListenerState> for Authorization {
     type Rejection = Response;
 
     async fn from_request_parts(
@@ -882,7 +886,26 @@ impl axum::extract::FromRequestParts<FleetListenerState> for Authorized {
             let provider = state.provider.provider_name().to_string();
             return Err(refuse(state, peer, &Refusal::IdentityUnavailable { provider, detail }));
         };
-        state.admission().authorize(auth.node).await.map(Authorized).map_err(|r| refuse(state, peer, &r))
+        let result = state.admission().authorize(auth.node.clone()).await;
+        Ok(Self { node: auth.node, result })
+    }
+}
+
+impl Authorization {
+    /// The admitted caller, or the response that refuses it. An unlisted
+    /// caller's refusal carries the `machine trust` command that admits it,
+    /// resolved against this machine's roster and the job in `body`.
+    fn admitted(self, state: &FleetListenerState, peer: std::net::IpAddr, body: &[u8]) -> Result<Admitted, Response> {
+        self.result.map_err(|r| {
+            let r = match r {
+                Refusal::NotAllowed { .. } => {
+                    let roster = darkmux_fleet::load_roster().unwrap_or_default();
+                    r.with_trust_ask(darkmux_fleet::TrustAsk::for_sender(&self.node, &roster, body))
+                }
+                other => other,
+            };
+            refuse(state, Some(peer), &r)
+        })
     }
 }
 
@@ -909,10 +932,14 @@ async fn scope_submission(
 async fn submit_handler(
     State(state): State<FleetListenerState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
-    Authorized(admitted): Authorized,
+    authorization: Authorization,
     Extension(token): Extension<TokenFingerprint>,
     body: Bytes,
 ) -> Response {
+    let admitted = match authorization.admitted(&state, peer_addr.ip(), &body) {
+        Ok(a) => a,
+        Err(refused) => return refused,
+    };
     // (#2947 review M1) A job this machine would refuse at its dispatch
     // preflight (a bad enum config value) is refused HERE, synchronously,
     // before a seat is taken or the job is accepted: otherwise the sender
@@ -1658,7 +1685,11 @@ mod tests {
         let h = start(Some(test_node("nPHONE", "phone", "127.0.0.1")), false, 0);
         let (code, reply) = post(&h, TOKEN, job("s", None), true);
         assert_eq!(code, 403);
-        assert!(reply.reason.unwrap().starts_with("studio does not accept work from phone"));
+        let said = reply.reason.unwrap();
+        assert!(said.starts_with("studio does not accept work from phone"), "{said}");
+        // The remedy carries the role the job asked for, read from the body
+        // the extractor could not see.
+        assert!(said.contains("--roles radio-host"), "{said}");
         assert!(h.ran.lock().unwrap().is_empty());
     }
 

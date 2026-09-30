@@ -181,8 +181,7 @@ pub struct SingleShotJob {
 ///
 /// The version is `major.minor` ([`WorkVersion`]) from "8.0", the release
 /// this wire freezes at. A receiver takes the same major with a minor at or
-/// below its own; a sender leaves out fields a peer's minor does not know
-/// ([`WorkJob::for_peer`]). Unknown fields are still refused within a minor
+/// below its own. Unknown fields are still refused within a minor
 /// (a sender cannot smuggle fields a receiver might start interpreting), so
 /// the minor is what lets the wire grow: a new optional field ships as a
 /// minor bump, and an older receiver refuses a newer minor by naming both
@@ -224,41 +223,6 @@ impl WorkVersion {
 impl std::fmt::Display for WorkVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}.{}", self.major, self.minor)
-    }
-}
-
-/// The peer speaks a work version this darkmux cannot write to.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VersionGap {
-    pub ours: WorkVersion,
-    pub peer: WorkVersion,
-}
-
-impl std::fmt::Display for VersionGap {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "this darkmux writes work-submission schema v{} and the peer speaks v{}: a different major \
-             version; run the same darkmux major version on both machines",
-            self.ours, self.peer
-        )
-    }
-}
-
-impl std::error::Error for VersionGap {}
-
-impl WorkJob {
-    /// This job as a peer speaking work version `peer` can take it: the
-    /// fields its minor does not know left out. Every field this darkmux
-    /// writes exists at 8.0, so today the only peer it cannot write to is
-    /// another major; a field added in a later minor is dropped here for a
-    /// peer below that minor (or, for a field the peer must enforce, refused).
-    pub fn for_peer(&self, peer: WorkVersion) -> Result<WorkJob, VersionGap> {
-        let ours = WorkVersion::current();
-        if peer.major != ours.major {
-            return Err(VersionGap { ours, peer });
-        }
-        Ok(self.clone())
     }
 }
 
@@ -468,7 +432,7 @@ fn validate_session_id(value: &SessionId) -> Result<()> {
 /// Wraps `validate_identifier` with the `"WorkJob.{field}"` label
 /// prefix used throughout `WorkJob::validate`. Kept as a thin shim so
 /// the existing internal call-sites read tightly.
-fn validate_work_identifier(field: &str, value: &str) -> Result<()> {
+pub(crate) fn validate_work_identifier(field: &str, value: &str) -> Result<()> {
     validate_identifier(&format!("WorkJob.{field}"), value)
 }
 
@@ -684,20 +648,6 @@ mod tests {
         for not_a_version in ["8", "", "8.", ".0", "8.0.1", "v8.0", "8.-1", "8.x", " 8.0"] {
             assert_eq!(WorkVersion::parse(not_a_version), None, "{not_a_version:?}");
         }
-    }
-
-    /// A sender writes to a peer of its own major and to no other.
-    #[test]
-    fn a_sender_writes_to_its_own_major_only() {
-        let job = make_valid_job();
-        let ours = WorkVersion::current();
-        assert_eq!(job.for_peer(ours).unwrap(), job);
-        let newer_minor = WorkVersion { major: ours.major, minor: ours.minor + 4 };
-        assert_eq!(job.for_peer(newer_minor).unwrap(), job, "a peer that knows more takes everything");
-        let other_major = WorkVersion { major: ours.major + 1, minor: 0 };
-        let gap = job.for_peer(other_major).unwrap_err();
-        let text = gap.to_string();
-        assert!(text.contains("v8.0") && text.contains("v9.0"), "the gap names both versions: {text}");
     }
 
     /// `boundary` and `mode` are additive: a job that sets neither writes
