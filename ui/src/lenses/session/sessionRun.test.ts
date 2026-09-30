@@ -167,7 +167,8 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     expect(view.header.status).toBe("complete");
     expect(view.header.role).toBe("CODER");
     expect(view.briefLines.map((e) => e.text)).toContain("route");
-    expect(view.briefLines.map((e) => e.text)).toContain("LMStudio · local · this machine");
+    // The records name no machine, so the route claims none (it used to say "this machine").
+    expect(view.briefLines.map((e) => e.text)).toContain("LMStudio · local");
     expect(view.briefLines.map((e) => e.text)).not.toContain("runtime");
     expect(view.briefLines.map((e) => e.text)).toContain("image");
     expect(view.briefLines.map((e) => e.text)).toContain("darkmux-runtime:latest");
@@ -2473,5 +2474,52 @@ describe("runRegions: turns and tokens sum over the same executions", () => {
     const rolled = runRegions(shapeSession(normAll(withRun)), "run-1");
     expect(tile(rolled, "TURNS")).toBe("5");
     expect(tile(rolled, "TOKENS IN")).toBe("300");
+  });
+});
+
+// The route line names the machine the run executed on, from the run's own records,
+// and says "this machine" only for the viewer's own.
+describe("runRegions: the route line names where the run ran", () => {
+  const RELAY = "radio.solo.relay.darkbook.radio.solo.macbook-1";
+  const records = (sid: string, machine: { machine_id: string; machine_uid: string }): RawRecord[] =>
+    [
+      { ts: "2026-01-01T00:00:00Z", session_id: sid, action: "dispatch.start", handle: "radio", model: "darkmux:qwen-x", ...machine, payload: { prompt_chars: 10 } },
+      { ts: "2026-01-01T00:00:05Z", session_id: sid, category: "telemetry", source: "tokens", action: "telemetry.tokens", ...machine, payload: { call_kind: "single_shot", purpose: "work", token_source: "provider", prompt_tokens: 50, completion_tokens: 20 } },
+      { ts: "2026-01-01T00:00:05Z", session_id: sid, action: "dispatch.complete", ...machine, payload: { total_turns: 1, wall_ms: 5000, prompt_tokens: 50, completion_tokens: 20 } },
+    ] as RawRecord[];
+  const MAC = { machine_id: "macbook", machine_uid: "UID-MAC" };
+  const DARK = { machine_id: "darkbook", machine_uid: "UID-DARK" };
+  const routeOf = (view: ReturnType<typeof runRegions>) => {
+    const i = view.briefLines.findIndex((e) => e.text === "route");
+    return view.briefLines[i + 1]?.text;
+  };
+  const run = (data: RawRecord[], sid: string, viewerUid: string | null) =>
+    runRegions(flowToRenderModel(data), sid, undefined, true, null, null, undefined, undefined, viewerUid);
+
+  it("a run on the viewer's own machine reads this machine", () => {
+    expect(routeOf(run(records("s1", MAC), "s1", "UID-MAC"))).toBe("LMStudio · local · this machine");
+  });
+
+  it("the viewer's own machine is recognized whatever case its uid is spelled in", () => {
+    expect(routeOf(run(records("s1", MAC), "s1", "uid-mac"))).toBe("LMStudio · local · this machine");
+  });
+
+  it("the same records viewed from another machine name the machine that ran them", () => {
+    expect(routeOf(run(records("s1", MAC), "s1", "UID-DARK"))).toBe("LMStudio · local · macbook");
+  });
+
+  it("a viewer with no known identity claims nothing about which machine is its own", () => {
+    expect(routeOf(run(records("s1", MAC), "s1", null))).toBe("LMStudio · local · macbook");
+  });
+
+  it("a relayed single-shot run names the executing machine and shows its one turn", () => {
+    // Relayed from the viewer's own machine, executed on darkbook: no dispatch.turn records.
+    const v = run(records(RELAY, DARK), RELAY, "UID-MAC");
+    expect(routeOf(v)).toBe("LMStudio · local · darkbook");
+    expect(v.metrics.find((m) => m.label === "TURNS")?.value).toBe("1");
+  });
+
+  it("a machine named by its name alone (no uid) is matched by name", () => {
+    expect(routeOf(run(records("s1", { machine_id: "macbook", machine_uid: "" }), "s1", "macbook"))).toBe("LMStudio · local · this machine");
   });
 });

@@ -890,7 +890,7 @@ export function App() {
               navigation: switching tabs remounts the boundary, which is the
               recovery an operator will reach for first. */}
           <LensErrorBoundary key={route.kind} name={route.kind}>
-            {renderRoute(route, playhead, onMissionEvents, onSelectStep, onStepHeader, liveStatus, lastContactRef.current)}
+            {renderRoute(route, playhead, onMissionEvents, onSelectStep, onStepHeader, liveStatus, lastContactRef.current, localUid)}
           </LensErrorBoundary>
         </main>
         {!isMobile && (
@@ -1064,6 +1064,8 @@ function renderRoute(
    *  value is a stale mount-time `Date.now()` that means nothing, and must
    *  never feed the half-open check. */
   lastContactMs: number | null,
+  /** This page's own machine identity (`localMachineUid`), for the run page's route line. */
+  localUid: string | null,
 ) {
   // (#2886 pass 4) The fold itself is `lib/route.ts::tokRateConnectionEvidence`
   // — extracted there so it has its own unit tests independent of this
@@ -1087,7 +1089,7 @@ function renderRoute(
       // Packet 4: a real fetch to /flow-dispatch/<id> — see SessionReplay's
       // own doc for why the RENDER (not the fetch) is still a not-ported
       // notice.
-      return <SessionReplay sessionId={route.dispatchId} missionId={route.missionId} playhead={playhead} connected={connected} lastContactMs={routeLastContactMs} />;
+      return <SessionReplay sessionId={route.dispatchId} missionId={route.missionId} playhead={playhead} connected={connected} lastContactMs={routeLastContactMs} viewerUid={localUid} />;
     case "mission":
       // #1868: the mission-graph lens, folded in-place — see
       // `MissionGraphLens`'s own doc for the data sources and why this

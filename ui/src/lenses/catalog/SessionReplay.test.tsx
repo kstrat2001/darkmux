@@ -33,11 +33,11 @@ function latestTokenScopeProps(): Record<string, unknown> {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "../../../..");
 
-function renderReplay(sessionId: string) {
+function renderReplay(sessionId: string, viewerUid: string | null = null) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={queryClient}>
-      <SessionReplay sessionId={sessionId} />
+      <SessionReplay sessionId={sessionId} viewerUid={viewerUid} />
     </QueryClientProvider>,
   );
 }
@@ -890,6 +890,13 @@ describe("SessionReplay", () => {
     await waitFor(() => expect(screen.getByText(/no records found for session s1/i)).toBeInTheDocument());
   });
 
+  it("the route line says this machine when the page's own identity is the run's machine", async () => {
+    const raw: unknown = JSON.parse(readFileSync(path.join(REPO_ROOT, "tests/parity/corpus/flow-dispatch-task-list.json"), "utf8"));
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify(raw), { status: 200 }))));
+    renderReplay("task-list", "00000000-0000-4000-8000-ABFCA7779F06");
+    await waitFor(() => expect(screen.getByText("LMStudio · local · this machine")).toBeInTheDocument());
+  });
+
   it("renders the real run view — header, brief, metrics, signals — against the recorded corpus fixture", async () => {
     const raw: unknown = JSON.parse(readFileSync(path.join(REPO_ROOT, "tests/parity/corpus/flow-dispatch-task-list.json"), "utf8"));
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify(raw), { status: 200 }))));
@@ -901,7 +908,7 @@ describe("SessionReplay", () => {
     await waitFor(() => expect(document.querySelector(".session-run__header .pill")?.textContent?.toLowerCase()).toContain("complete"));
     expect(screen.getByText(/LIST-STEP/)).toBeInTheDocument();
     expect(screen.getByText(/task-list on/)).toBeInTheDocument();
-    expect(screen.getByText("LMStudio · local · this machine")).toBeInTheDocument();
+    expect(screen.getByText("LMStudio · local · MacBook-Pro")).toBeInTheDocument();
     expect(screen.getByText(/^\d\d:28:40 → \d\d:28:42 \(0:02\)$/)).toBeInTheDocument();
     expect(screen.getByText("0:02")).toBeInTheDocument();
     // Same reason as the track below: this corpus did no model work, so the
