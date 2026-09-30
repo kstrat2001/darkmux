@@ -734,12 +734,32 @@ function wallClock(ctx: RunContext, nowMs: number): { runWallMs: number; activeE
   };
 }
 
+/** The machine a run executed on, from its own records: the `dispatch.start`'s
+ *  (else the session's first record's) machine name and hardware uid. The one
+ *  derivation the header's "on <machine>" and the route line both read. */
+function ranOn(d: NormRecord | null, first: NormRecord | null | undefined): { name: string; uid: string } {
+  return { name: String(d?.machine_id || first?.machine_id || ""), uid: String(d?.machine_uid || first?.machine_uid || "") };
+}
+
+/** Whether the run executed on the machine showing it. `viewerUid` is the page's
+ *  own identity (`localMachineUid`: a hardware uid, or its name when no uid is
+ *  known); `null` when it is not known yet, which claims nothing. */
+function ranHere(on: { name: string; uid: string }, viewerUid: string | null): boolean {
+  return viewerUid !== null && ((on.uid !== "" && on.uid === viewerUid) || (on.name !== "" && on.name === viewerUid));
+}
+
 /** (#2834) The route line: the dialect and address the dispatch record
  *  names, read as facts. `openai:` names the request FORMAT, not a vendor,
  *  so a local server speaking it is labelled by its address, never as
- *  having left the machine. */
-function routeLabel(ep: string | undefined): string {
-  if (!ep) return "LMStudio · local · this machine";
+ *  having left the machine. A run on local LM Studio names the machine it
+ *  ran on: "this machine" only when that machine IS the viewer's own, else
+ *  its name (a relayed run ran on the peer), and nothing when the records
+ *  name none. */
+function routeLabel(ep: string | undefined, on: { name: string; uid: string }, viewerUid: string | null): string {
+  if (!ep) {
+    if (ranHere(on, viewerUid)) return "LMStudio · local · this machine";
+    return on.name !== "" ? `LMStudio · local · ${on.name}` : "LMStudio · local";
+  }
   const i = ep.indexOf(":");
   const kind = i >= 0 ? ep.slice(0, i) : "";
   const rest = i >= 0 ? ep.slice(i + 1) : ep;
@@ -1515,6 +1535,9 @@ export function runRegions(
   presence: Presence = NO_PRESENCE,
   /** The daemon's lifecycle policy (`/runs.policy`). */
   policy: LifecyclePolicy = DEFAULT_POLICY,
+  /** The viewing page's own machine identity (`localMachineUid`), so the route
+   *  line says "this machine" only for a run that ran on it. `null` when unknown. */
+  viewerUid: string | null = null,
 ): SessionRunView {
   const tMax = computeTMax(data);
   const nowMs = nowOverride != null ? Math.max(nowOverride, tMax) : tMax;
@@ -1561,7 +1584,7 @@ export function runRegions(
   // CLOCK stamps stay record-derived: they are timestamps, not a duration.
   const briefTiming = `${clk(startTs)}${done ? ` → ${clkAt(endTs)} (${fmtElapsed(runWallMs)})` : " · running"}`;
   const ep = remoteEp;
-  const briefRows = briefRowsOf(sp, model, d, routeLabel(ep), briefTiming);
+  const briefRows = briefRowsOf(sp, model, d, routeLabel(ep, ranOn(d, firstSessRec), viewerUid), briefTiming);
   const { promptLines, disclosures } = promptOf(sp);
 
   // No "run" heading inside the block: the region's own `<h2>` directly above
@@ -1751,7 +1774,7 @@ export function runRegions(
       status: state.status,
       role,
       sid,
-      machineName: String(d?.machine_id || firstSessRec?.machine_id || ""),
+      machineName: ranOn(d, firstSessRec).name,
     },
     briefLines,
     disclosures,
