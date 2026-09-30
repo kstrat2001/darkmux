@@ -12470,7 +12470,7 @@ fn pre_4_0_lab_runs_dir_refuses_every_lab_verb_naming_the_mv_until_moved() {
     let old = home.path().join("runs");
     let new = home.path().join("lab");
     stats_run_dir(&old, "run-a");
-    let want = format!("mv {} {}", old.display(), new.display());
+    let want = format!("mv -n {} {}", old.display(), new.display());
     let cmd = || {
         let mut c = darkmux_cmd();
         c.env("DARKMUX_HOME", home.path()).env("DARKMUX_FLOWS_DIR", home.path().join("flows"));
@@ -12525,7 +12525,7 @@ fn an_empty_lab_dir_beside_a_full_runs_dir_still_refuses_and_the_printed_command
         c.env("DARKMUX_HOME", home.path()).env("DARKMUX_FLOWS_DIR", home.path().join("flows"));
         c
     };
-    let want = format!("rmdir {} && mv {} {}", new.display(), old.display(), new.display());
+    let want = format!("rmdir {} && mv -n {} {}", new.display(), old.display(), new.display());
     cmd().args(["run", "list", "--kind", "lab"]).assert().failure().stderr(predicate::str::contains(&want));
 
     let ran = std::process::Command::new("sh").arg("-c").arg(&want).status().unwrap();
