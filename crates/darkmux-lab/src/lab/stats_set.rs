@@ -102,6 +102,16 @@ pub struct SetSummary {
     pub flagged: Vec<(String, Vec<&'static str>)>,
 }
 
+/// The flag for the runtime's own terminal result, if it names one.
+fn result_flag(result: Option<&str>) -> Option<&'static str> {
+    match result {
+        Some("error") => Some("RUNTIME-ERROR"),
+        Some(darkmux_trajectory::RESULT_INTERRUPTED) => Some("INTERRUPTED"),
+        Some(r) if r.starts_with("escalation") => Some("ESCALATED"),
+        _ => None,
+    }
+}
+
 /// Short codes for a run's failed checks and notable conditions, for a table
 /// column. Each maps to a [`crate::lab::stats::RunChecks`] field or a derived
 /// condition; `RunStats::unreconciled` holds the long form.
@@ -112,12 +122,7 @@ pub fn flags(s: &RunStats) -> Vec<&'static str> {
     // doing the task: when a fixture's verify command is green on the
     // untouched tree, a run that errored in its first seconds records `pass`.
     // Flagged, never reclassified; the outcome is the fixture's to define.
-    match s.result.as_deref() {
-        Some("error") => f.push("RUNTIME-ERROR"),
-        Some(darkmux_trajectory::RESULT_INTERRUPTED) => f.push("INTERRUPTED"),
-        Some(r) if r.starts_with("escalation") => f.push("ESCALATED"),
-        _ => {}
-    }
+    f.extend(result_flag(s.result.as_deref()));
     if !c.verdict_matches_ratio {
         f.push("VERDICT");
     }

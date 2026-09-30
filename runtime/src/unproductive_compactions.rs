@@ -29,10 +29,6 @@ impl UnproductiveCompactions {
     pub fn end_episode(&mut self) {
         self.consecutive = 0;
     }
-
-    pub fn count(&self) -> u32 {
-        self.consecutive
-    }
 }
 
 #[cfg(test)]
@@ -62,7 +58,6 @@ mod tests {
             u.record(900, 500);
         }
         u.end_episode();
-        assert_eq!(u.count(), 0);
         for expected in 1..=3 {
             assert_eq!(u.record(900, 500), expected, "the count restarts after the healthy turn");
         }

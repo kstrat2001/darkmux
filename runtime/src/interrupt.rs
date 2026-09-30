@@ -67,6 +67,14 @@ pub fn install(mut writer: InterruptWriter, on_done: fn(i32)) -> bool {
     true
 }
 
+/// Production wiring: install the handlers for `traj`, exiting the process
+/// with 128 + signal once the terminal record is written.
+pub fn install_for(traj: &crate::trajectory::Trajectory) {
+    if let Some(writer) = traj.interrupt_writer() {
+        install(writer, |code| std::process::exit(code));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
