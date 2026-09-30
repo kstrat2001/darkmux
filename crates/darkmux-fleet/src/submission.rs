@@ -985,7 +985,7 @@ pub(crate) fn read_reply_lines(
 /// answer the receiver gave (including a refusal); `Err` only when no
 /// answer came. `on_progress` hears each `queued` line as it arrives.
 pub fn send_submission(
-    target: &crate::peer::PeerTarget,
+    target: &crate::peer::SettledTarget,
     submission: &WorkSubmission,
     read_timeout: Duration,
     on_progress: &mut dyn FnMut(&SubmissionReply),
@@ -1225,23 +1225,35 @@ impl std::fmt::Display for NotPinned {
 impl std::error::Error for NotPinned {}
 
 /// First contact with a verified node: pin it in the roster, or, for a
-/// read-only caller, stop before anything is sent to it.
-fn settle_pin(peer: &crate::peer::PeerTarget, id: &str, target: &str, pins: PinPolicy, provider: &str) -> Result<()> {
+/// read-only caller, stop before anything is sent to it. The `Ok` is the only
+/// way to a [`crate::peer::SettledTarget`] for a target whose pin was pending.
+fn settle_pin(
+    peer: crate::peer::PeerTarget,
+    id: &str,
+    target: &str,
+    pins: PinPolicy,
+    provider: &str,
+) -> Result<crate::peer::SettledTarget> {
     if peer.newly_pinned.is_none() {
-        return Ok(());
+        return Ok(crate::peer::SettledTarget::new(peer));
     }
     if pins == PinPolicy::RequirePinned {
         return Err(NotPinned { machine: target.to_string() }.into());
     }
-    crate::peer::persist_pin(id, peer).context("pinning the target's node in the roster")?;
+    crate::peer::persist_pin(id, &peer).context("pinning the target's node in the roster")?;
     eprintln!("darkmux: pinned {target} to its {provider} node (first contact); later contacts check it");
-    Ok(())
+    Ok(crate::peer::SettledTarget::new(peer))
 }
 
 /// Pin a freshly verified peer's node in the roster before the fleet token is
 /// sent to it, exactly as a work submission does ([`send_job`]): the ONE
-/// first-contact pin. A no-op for a peer already pinned.
-pub fn pin_on_first_contact(peer: &crate::peer::PeerTarget, id: &str, provider: &dyn IdentityProvider) -> Result<()> {
+/// first-contact pin, and the one way to a token-bearing target for a peer
+/// whose pin is pending. A peer already pinned settles without a write.
+pub fn pin_on_first_contact(
+    peer: crate::peer::PeerTarget,
+    id: &str,
+    provider: &dyn IdentityProvider,
+) -> Result<crate::peer::SettledTarget> {
     settle_pin(peer, id, id, PinPolicy::PinOnFirstContact, provider.provider_name())
 }
 
@@ -1274,7 +1286,7 @@ fn send_job(job: WorkJob, wait: bool, pins: PinPolicy) -> Result<(u16, Submissio
     // Every address is verified for work, loopback included (the listener
     // never binds loopback, so a real provider refuses it).
     let peer = crate::peer::peer_target(&target, &entry, None, port, false, provider.as_ref())?.at_listener(port);
-    settle_pin(&peer, &entry.id, &target, pins, provider.provider_name())?;
+    let peer = settle_pin(peer, &entry.id, &target, pins, provider.provider_name())?;
     let read_timeout = if wait {
         Duration::from_secs(u64::from(job.timeout_seconds).saturating_add(120))
     } else {

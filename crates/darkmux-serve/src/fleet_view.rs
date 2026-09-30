@@ -43,7 +43,7 @@
 use crate::machine_card::{gather_local_card, CardAccepts, CardGrant, ListenerCard, MachineCard, CARD_SCHEMA_VERSION};
 use crate::source_state::SourceState;
 use crate::wire::RosterMachineEntry;
-use darkmux_fleet::{IdentityProvider, MachineEntry, PeerTarget, TargetError};
+use darkmux_fleet::{IdentityProvider, MachineEntry, PeerTarget, SettledTarget, TargetError};
 use darkmux_flow::presence::PresenceBeat;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
@@ -423,10 +423,10 @@ pub(crate) trait FleetSources: Send + Sync {
     fn local_card(&self) -> MachineCard;
     /// Verify the node behind a roster entry's address and aim at its fleet
     /// listener. Blocking (the identity lookup).
-    fn verify_peer(&self, entry: &MachineEntry) -> Result<PeerTarget, UnreachableReason>;
+    fn verify_peer(&self, entry: &MachineEntry) -> Result<SettledTarget, UnreachableReason>;
     /// Ask a verified peer's listener for its card. Blocking.
     /// `known_version` is the darkmux version its presence beat reported.
-    fn fetch_card(&self, target: &PeerTarget, entry: &MachineEntry, known_version: Option<&str>) -> Fetched;
+    fn fetch_card(&self, target: &SettledTarget, entry: &MachineEntry, known_version: Option<&str>) -> Fetched;
 }
 
 /// Whether a roster entry is THIS machine. Decided by the strongest evidence
@@ -540,7 +540,7 @@ impl GatherCtx<'_> {
     fn entry_row(&self, entry: &MachineEntry, from_history: bool) -> FleetMachine {
         let started = std::time::Instant::now();
         let route = self.src.verify_peer(entry);
-        let verified_node = route.as_ref().ok().and_then(|t| t.node_id.as_deref());
+        let verified_node = route.as_ref().ok().and_then(|t| t.node_id());
         if is_this_machine(&self.local, verified_node, entry) {
             return self.self_row(Some(entry), from_history, started);
         }
@@ -704,12 +704,12 @@ impl FleetSources for ProcessSources {
         }
     }
 
-    fn verify_peer(&self, entry: &MachineEntry) -> Result<PeerTarget, UnreachableReason> {
+    fn verify_peer(&self, entry: &MachineEntry) -> Result<SettledTarget, UnreachableReason> {
         let listener_port = darkmux_types::config_access::fleet_listener_port();
         pinned_listener_target(self.provider.as_ref(), entry, listener_port)
     }
 
-    fn fetch_card(&self, target: &PeerTarget, entry: &MachineEntry, known_version: Option<&str>) -> Fetched {
+    fn fetch_card(&self, target: &SettledTarget, entry: &MachineEntry, known_version: Option<&str>) -> Fetched {
         fetch_listener_card(target, entry, known_version)
     }
 }
@@ -735,6 +735,8 @@ pub fn fetch_local_daemon_view(daemon_addr: &str) -> Option<FleetView> {
         darkmux_flow::daemon_probe::DEFAULT_DAEMON_PORT,
         provider.as_ref(),
     )
+    .ok()?
+    .already_settled()
     .ok()?;
     let resp = darkmux_fleet::fleet_get(&target, "/fleet/view", LOCAL_VIEW_TIMEOUT, &[]).ok()?;
     let mut v = read_json(resp)?;
@@ -791,13 +793,12 @@ fn pinned_listener_target(
     provider: &dyn IdentityProvider,
     entry: &MachineEntry,
     listener_port: u16,
-) -> Result<PeerTarget, UnreachableReason> {
+) -> Result<SettledTarget, UnreachableReason> {
     let target = listener_target(provider, entry, listener_port)?;
-    if let Err(e) = darkmux_fleet::pin_on_first_contact(&target, &entry.id, provider) {
+    darkmux_fleet::pin_on_first_contact(target, &entry.id, provider).map_err(|e| {
         eprintln!("darkmux serve: could not pin {} in the roster: {e:#}", entry.id);
-        return Err(UnreachableReason::PinNotSaved);
-    }
-    Ok(target)
+        UnreachableReason::PinNotSaved
+    })
 }
 
 fn unreachable(reason: UnreachableReason, detail: Option<String>) -> Fetched {
@@ -805,7 +806,7 @@ fn unreachable(reason: UnreachableReason, detail: Option<String>) -> Fetched {
 }
 
 /// Ask a verified peer's fleet listener for its card.
-fn fetch_listener_card(target: &PeerTarget, entry: &MachineEntry, known_version: Option<&str>) -> Fetched {
+fn fetch_listener_card(target: &SettledTarget, entry: &MachineEntry, known_version: Option<&str>) -> Fetched {
     match darkmux_fleet::fleet_get(target, darkmux_fleet::CARD_PATH, PEER_CARD_TIMEOUT, &[]) {
         Ok(resp) => parse_listener_card(resp, entry, known_version),
         Err(ureq::Error::Status(code, resp)) => refusal_outcome(code, resp, known_version),
@@ -1060,15 +1061,13 @@ pub(crate) mod tests {
             card.specs.machine_uid = self.local.machine_uid.clone();
             card
         }
-        fn verify_peer(&self, entry: &MachineEntry) -> Result<PeerTarget, UnreachableReason> {
+        fn verify_peer(&self, entry: &MachineEntry) -> Result<SettledTarget, UnreachableReason> {
             let verdict = self.verify.lock().unwrap().get(&entry.id).cloned().unwrap_or_else(|| Ok(format!("n-{}", entry.id)));
             verdict.map(|node| {
-                let mut t = darkmux_fleet::unverified_target_for_test("http://127.0.0.1:1");
-                t.node_id = Some(node);
-                t
+                darkmux_fleet::unverified_target_for_test("http://127.0.0.1:1").with_node_id_for_test(&node)
             })
         }
-        fn fetch_card(&self, _target: &PeerTarget, entry: &MachineEntry, known_version: Option<&str>) -> Fetched {
+        fn fetch_card(&self, _target: &SettledTarget, entry: &MachineEntry, known_version: Option<&str>) -> Fetched {
             self.dials.lock().unwrap().push((entry.id.clone(), known_version.map(str::to_string)));
             let (delay, fetched) = self.fetches.lock().unwrap().get(&entry.id).cloned().expect("a scripted fetch");
             std::thread::sleep(Duration::from_millis(delay));
@@ -1698,9 +1697,11 @@ pub(crate) mod tests {
     #[serial_test::serial]
     fn a_peer_with_its_listener_off_is_unreachable_with_a_typed_reason() {
         let daemon = FakePeer::serve(vec![("/machine/card", "200 OK", serde_json::to_string(&sample_card()).unwrap())]);
-        let f = with_fleet_token(|| {
-            let target = listener_target(&provider(true), &studio(), closed_port()).map_err(|e| format!("{e:?}")).unwrap();
-            fetch_listener_card(&target, &studio(), None)
+        let (f, _) = with_roster_holding(&studio(), || {
+            with_fleet_token(|| {
+                let target = pinned_listener_target(&provider(true), &studio(), closed_port()).map_err(|e| format!("{e:?}")).unwrap();
+                fetch_listener_card(&target, &studio(), None)
+            })
         });
         assert_eq!(reason_of(&f), UnreachableReason::ListenerOff);
         match &f.outcome {
@@ -1842,9 +1843,9 @@ pub(crate) mod tests {
         let mut e = entry("studio");
         e.address = "https://127.0.0.1:9443".into();
         let t = listener_target(&provider(true), &e, 8766).map_err(|e| format!("{e:?}")).unwrap();
-        assert_eq!((t.scheme.as_str(), t.port), ("http", 8766));
-        assert_eq!(t.node_id.as_deref(), Some("nSTUDIO"));
-        assert_eq!(t.pinned_ip, Some("127.0.0.1".parse().unwrap()));
+        assert_eq!(t.base(), "http://127.0.0.1:8766");
+        assert_eq!(t.node_id(), Some("nSTUDIO"));
+        assert_eq!(t.pinned_ip(), Some("127.0.0.1".parse().unwrap()));
     }
 
     /// Each way an address can fail to verify has its own reason, so each can
@@ -1883,9 +1884,11 @@ pub(crate) mod tests {
                 drop(stream);
             }
         });
-        let f = with_fleet_token(|| {
-            let target = listener_target(&provider(true), &studio(), port).map_err(|e| format!("{e:?}")).unwrap();
-            fetch_listener_card(&target, &studio(), None)
+        let (f, _) = with_roster_holding(&studio(), || {
+            with_fleet_token(|| {
+                let target = pinned_listener_target(&provider(true), &studio(), port).map_err(|e| format!("{e:?}")).unwrap();
+                fetch_listener_card(&target, &studio(), None)
+            })
         });
         assert_eq!(reason_of(&f), UnreachableReason::ListenerUnavailable);
         let CardOutcome::Unreachable { detail, .. } = &f.outcome else { unreachable!() };
@@ -1914,9 +1917,11 @@ pub(crate) mod tests {
             }
         });
         let started = std::time::Instant::now();
-        let f = with_fleet_token(|| {
-            let target = listener_target(&provider(true), &studio(), port).map_err(|e| format!("{e:?}")).unwrap();
-            fetch_listener_card(&target, &studio(), None)
+        let (f, _) = with_roster_holding(&studio(), || {
+            with_fleet_token(|| {
+                let target = pinned_listener_target(&provider(true), &studio(), port).map_err(|e| format!("{e:?}")).unwrap();
+                fetch_listener_card(&target, &studio(), None)
+            })
         });
         let took = started.elapsed();
         assert_eq!(reason_of(&f), UnreachableReason::BadAnswer, "a 200 whose body never finished is a bad answer");

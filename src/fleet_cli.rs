@@ -361,20 +361,28 @@ const PEER_FIELD_MAX_CHARS: usize = 80;
 /// `entry` may go: this machine's own daemon (loopback) for its own entry,
 /// a loopback entry as written, else the verified, pinned tailnet node.
 /// A first-contact pin is persisted.
-fn peer_target_for(entry: &fleet::MachineEntry, local_id: Option<&str>) -> Result<fleet::PeerTarget> {
+fn peer_target_for(entry: &fleet::MachineEntry, local_id: Option<&str>) -> Result<fleet::SettledTarget> {
+    let provider = fleet::configured_provider_or_unavailable();
+    peer_target_with(entry, local_id, provider.as_ref())
+}
+
+/// [`peer_target_for`] with the identity provider supplied by the caller.
+fn peer_target_with(
+    entry: &fleet::MachineEntry,
+    local_id: Option<&str>,
+    provider: &dyn fleet::IdentityProvider,
+) -> Result<fleet::SettledTarget> {
     let is_self = local_id.is_some_and(|l| fleet::same_machine(l, &entry.id)) && !fleet::address_host_is_loopback(&entry.address);
     let local_addr = is_self.then(darkmux_types::config_access::serve_client_addr);
-    let provider = fleet::configured_provider_or_unavailable();
     let target = fleet::peer_target(
         &entry.id,
         entry,
         local_addr.as_deref(),
         crate::serve::DEFAULT_DAEMON_PORT,
         true,
-        provider.as_ref(),
+        provider,
     )?;
-    fleet::persist_pin(&entry.id, &target)?;
-    Ok(target)
+    Ok(fleet::pin_on_first_contact(target, &entry.id, provider)?)
 }
 
 /// (#2924 MF-3) The address to dial for a roster entry. This machine's own
