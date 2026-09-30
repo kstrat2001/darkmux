@@ -3352,16 +3352,26 @@ fn build_remote_record(
     )
 }
 
-/// The five token counts of a direct (single-shot) call on its `dispatch.complete` payload, from
-/// the same [`DirectTokens`](crate::dispatch_envelope::DirectTokens) the hosted envelope prints, so
-/// the two producers cannot drift on the key set or the total rule. Absent when unreported.
-fn set_direct_token_counts(payload: &mut DispatchEndPayload, counts: &darkmux_trajectory::UsageCounts) {
-    let t = crate::dispatch_envelope::DirectTokens::of(counts);
-    payload.prompt_tokens = t.prompt_tokens;
-    payload.completion_tokens = t.completion_tokens;
-    payload.total_tokens = t.total_tokens;
-    payload.reasoning_tokens = t.reasoning_tokens;
-    payload.cached_tokens = t.cached_tokens;
+/// The `dispatch.complete` payload of one direct model call: one turn, no tools, no
+/// compactions, its own wall clock and reply size, and the five token counts from the same
+/// [`DirectTokens`](crate::dispatch_envelope::DirectTokens) the hosted envelope prints, so every
+/// single-call producer (hosted, local, the `dispatch.single_shot` step kind, a `dispatch.map`
+/// item) agrees on the key set and the total rule. Counts are absent when unreported.
+pub(crate) fn single_call_complete(tokens: &crate::dispatch_envelope::DirectTokens, wall_ms: u64, reply_chars: u64) -> DispatchEndPayload {
+    DispatchEndPayload {
+        result_class: Some(ResultClass::Ok),
+        exit_code: Some(0),
+        total_tools: Some(0),
+        total_compactions: Some(0),
+        wall_ms: Some(wall_ms),
+        stdout_chars: Some(reply_chars),
+        prompt_tokens: tokens.prompt_tokens,
+        completion_tokens: tokens.completion_tokens,
+        total_tokens: tokens.total_tokens,
+        reasoning_tokens: tokens.reasoning_tokens,
+        cached_tokens: tokens.cached_tokens,
+        ..DispatchEndPayload::new(1)
+    }
 }
 
 /// The hosted single-shot dispatch (#1177). Precondition: `target` is an
@@ -3511,7 +3521,7 @@ fn dispatch_remote(
                         endpoint: Some(label.clone()),
                         wall_ms: Some(wall_ms),
                         error: Some(e.to_string()),
-                        ..Default::default()
+                        ..DispatchEndPayload::new(0)
                     }),
                 ),
             );
@@ -3556,20 +3566,12 @@ fn dispatch_remote(
     );
 
 
-    let mut complete_payload = DispatchEndPayload {
-        result_class: Some(ResultClass::Ok),
-        exit_code: Some(0),
+    // (#1444) The counts and the one-turn shape are owned by `single_call_complete`,
+    // so this producer, the local one and the step kinds cannot drift apart.
+    let complete_payload = DispatchEndPayload {
         endpoint: Some(label.clone()),
-        total_turns: Some(1),
-        total_tools: Some(0),
-        total_compactions: Some(0),
-        wall_ms: Some(wall_ms),
-        stdout_chars: Some(reply.content.len() as u64),
-        ..Default::default()
+        ..single_call_complete(&crate::dispatch_envelope::DirectTokens::of(&counts), wall_ms, reply.content.len() as u64)
     };
-    // (#1444) Counts owned by `set_direct_token_counts`, so this producer
-    // and the local single-shot one cannot drift apart.
-    set_direct_token_counts(&mut complete_payload, &counts);
 
     // (#2344) See the error arm above — the call is done, so the session is
     // no longer running; stop the beat before the terminal record.
@@ -3891,7 +3893,7 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
                     darkmux_flow::Payload::DispatchError(DispatchEndPayload {
                         wall_ms: Some(wall_ms),
                         error: Some(e.to_string()),
-                        ..Default::default()
+                        ..DispatchEndPayload::new(0)
                     }),
                 ),
             );
@@ -3918,20 +3920,13 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
     );
 
 
-    let mut complete_payload = DispatchEndPayload {
-        result_class: Some(ResultClass::Ok),
-        exit_code: Some(0),
-        total_turns: Some(1),
-        total_tools: Some(0),
-        total_compactions: Some(0),
-        wall_ms: Some(wall_ms),
-        stdout_chars: Some(reply.content.len() as u64),
-        ..Default::default()
-    };
-    // (#1444) Counts owned by `set_direct_token_counts`, the same as
-    // `dispatch_remote`'s: the call's own counts, the ones its usage record
-    // carries.
-    set_direct_token_counts(&mut complete_payload, &reply.counts);
+    // The call's own counts, the ones its usage record carries, through the
+    // same `single_call_complete` as `dispatch_remote`.
+    let complete_payload = single_call_complete(
+        &crate::dispatch_envelope::DirectTokens::of(&reply.counts),
+        wall_ms,
+        reply.content.len() as u64,
+    );
 
     // (#2344) See the error arm above — stop the beat before the terminal.
     if let Some(em) = session_emitter.take() {
@@ -7443,7 +7438,6 @@ fn build_dispatch_complete_payload(
             .then(|| crate::dispatch::tail_excerpt(stderr, crate::dispatch::STDERR_EXCERPT_MAX)),
         exit_code: Some(i64::from(exit_code)),
         result_class: Some(if exit_code == 0 { ResultClass::Ok } else { ResultClass::Error }),
-        total_turns: Some(fold.turns() as u64),
         total_tools: Some(fold.tool_calls() as u64),
         // (#2169) What `total_tools` alone conflated: a dispatched call that
         // came back `ok: false`, versus structured calls that never ran,
@@ -7478,7 +7472,7 @@ fn build_dispatch_complete_payload(
         host_window: host_window(host_stats, host_extras, thermal_ladder),
         // (#2114 follow-up) Same field, same reason as `dispatch_start_payload`.
         resumed_from: resume_from.map(|rf| rf.display().to_string()),
-        ..Default::default()
+        ..DispatchEndPayload::new(fold.turns() as u64)
     }
 }
 
