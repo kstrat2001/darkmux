@@ -680,7 +680,7 @@ impl FleetSources for ProcessSources {
 
     fn verify_peer(&self, entry: &MachineEntry) -> Result<PeerTarget, UnreachableReason> {
         let listener_port = darkmux_types::config_access::fleet_listener_port();
-        listener_target(self.provider.as_ref(), entry, listener_port)
+        pinned_listener_target(self.provider.as_ref(), entry, listener_port)
     }
 
     fn fetch_card(&self, target: &PeerTarget, entry: &MachineEntry, known_version: Option<&str>) -> Fetched {
@@ -738,9 +738,9 @@ fn unreachable_for(e: &TargetError) -> UnreachableReason {
 /// The verified node behind a roster entry, aimed at its fleet listener: plain
 /// `http` at the listener's port on the overlay address, whatever scheme the
 /// roster wrote (the address names the viewer daemon, which may sit behind
-/// `tailscale serve` on https). The daemon never writes a first-contact pin
-/// (the roster is operator state); `peer_target` still refuses an address that
-/// is not the pinned node, before any token is attached. An address no node
+/// `tailscale serve` on https). `peer_target` refuses an address that is not
+/// the pinned node, before any token is attached; the first-contact pin is
+/// [`pinned_listener_target`]'s. An address no node
 /// stands behind, loopback included, is refused: the token goes nowhere
 /// unverified.
 fn listener_target(
@@ -752,6 +752,23 @@ fn listener_target(
     darkmux_fleet::peer_target(&entry.id, entry, None, daemon_port, false, provider)
         .map(|t| t.at_listener(listener_port))
         .map_err(|e| unreachable_for(&e))
+}
+
+/// [`listener_target`], with the peer's node pinned in the roster on first
+/// contact, exactly as a work submission pins it: the gap between "the address
+/// is a node" and "the address is the node this entry means" closes after the
+/// first gather. A roster that cannot be written is logged, not fatal: the
+/// node was still verified this gather, and the next one tries the pin again.
+fn pinned_listener_target(
+    provider: &dyn IdentityProvider,
+    entry: &MachineEntry,
+    listener_port: u16,
+) -> Result<PeerTarget, UnreachableReason> {
+    let target = listener_target(provider, entry, listener_port)?;
+    if let Err(e) = darkmux_fleet::pin_on_first_contact(&target, &entry.id, provider) {
+        eprintln!("darkmux serve: could not pin {} in the roster: {e:#}", entry.id);
+    }
+    Ok(target)
 }
 
 fn unreachable(reason: UnreachableReason, detail: Option<String>) -> Fetched {
@@ -1494,13 +1511,47 @@ pub(crate) mod tests {
         serde_json::json!({"status": "refused", "machine": "studio", "reason": reason}).to_string()
     }
 
+    /// Run `f` with a roster file holding only `entry`, and return what it
+    /// returned and the node the roster pins `entry` to afterward.
+    fn with_roster_holding<T>(entry: &MachineEntry, f: impl FnOnce() -> T) -> (T, Option<String>) {
+        let dir = tempfile::tempdir().unwrap();
+        let prev = std::env::var("DARKMUX_FLEET_FILE").ok();
+        unsafe { std::env::set_var("DARKMUX_FLEET_FILE", dir.path().join("fleet.json")) };
+        let out = (|| {
+            darkmux_fleet::mutate_roster(|r| {
+                r.machines.insert(entry.id.clone(), entry.clone());
+                Ok(())
+            })
+            .unwrap();
+            let out = f();
+            let pinned = darkmux_fleet::load_roster().unwrap().machines[&entry.id].node_id.clone();
+            (out, pinned)
+        })();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLEET_FILE", v),
+                None => std::env::remove_var("DARKMUX_FLEET_FILE"),
+            }
+        }
+        out
+    }
+
     /// Ask `studio`'s listener (the fake) for its card, through the same
-    /// verification a gather runs.
-    fn fetch(listener: &FakePeer, known_version: Option<&str>) -> Fetched {
-        with_fleet_token(|| {
-            let target = listener_target(&provider(true), &studio(), listener.port).map_err(|e| format!("{e:?}")).unwrap();
-            fetch_listener_card(&target, &studio(), known_version)
+    /// verification and first-contact pin a gather runs; also returns the
+    /// node the roster pins `studio` to afterward.
+    fn fetch_pinned(listener: &FakePeer, known_version: Option<&str>) -> (Fetched, Option<String>) {
+        with_roster_holding(&studio(), || {
+            with_fleet_token(|| {
+                let target = pinned_listener_target(&provider(true), &studio(), listener.port)
+                    .map_err(|e| format!("{e:?}"))
+                    .unwrap();
+                fetch_listener_card(&target, &studio(), known_version)
+            })
         })
+    }
+
+    fn fetch(listener: &FakePeer, known_version: Option<&str>) -> Fetched {
+        fetch_pinned(listener, known_version).0
     }
 
     fn serve_card(status: &'static str, body: String) -> FakePeer {
@@ -1520,13 +1571,30 @@ pub(crate) mod tests {
     #[serial_test::serial]
     fn the_listener_is_asked_with_the_token_and_its_card_carries_the_grant() {
         let listener = serve_card("200 OK", listener_body());
-        let f = fetch(&listener, None);
+        let (f, pinned) = fetch_pinned(&listener, None);
+        assert_eq!(pinned.as_deref(), Some("nSTUDIO"), "the token went to a node the roster now pins");
         let CardOutcome::Available { card, source } = f.outcome else { panic!("a card") };
         assert_eq!(source, CardSource::Listener);
         assert_eq!(f.accepts, AcceptsState::Granted { accepts: grant() });
         assert_eq!(card.specs.machine_id.as_deref(), Some("studio"));
         assert_eq!(listener.paths(), vec![darkmux_fleet::CARD_PATH.to_string()]);
         assert_eq!(listener.authorization_of(darkmux_fleet::CARD_PATH), Some(format!("Bearer {FLEET_TOKEN}")));
+    }
+
+    /// A node the roster pins to a different node is never sent the token,
+    /// and the roster is left as the operator wrote it.
+    #[test]
+    #[serial_test::serial]
+    fn a_pin_mismatch_never_sends_the_token() {
+        let listener = serve_card("200 OK", listener_body());
+        let mut entry = studio();
+        entry.node_id = Some("nSOMEONE-ELSE".into());
+        let (reason, pinned) = with_roster_holding(&entry, || {
+            with_fleet_token(|| pinned_listener_target(&provider(true), &entry, listener.port).err())
+        });
+        assert_eq!(reason, Some(UnreachableReason::PinMismatch));
+        assert_eq!(pinned.as_deref(), Some("nSOMEONE-ELSE"), "a mismatch never re-pins");
+        assert!(listener.paths().is_empty(), "no request, so no token, reached the listener");
     }
 
     /// Symmetry: a peer that does not list this machine still gives its card,

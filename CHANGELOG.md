@@ -1254,6 +1254,9 @@ darkmux release.
     is not dialed; `GET /fleet/roster` and the view read one roster.
   - Every roster peer is dialed: presence is display only, `liveness` is `live`,
     `no_beat` or `unknown` (`gone` and the `presence_gone` reason are removed).
+  - Gathering the view pins each peer's node in the roster on first contact, as a
+    work submission does, before the fleet token is sent to it; a node that does
+    not match its pin is never sent the token.
   - A card that cannot be read says why: `unavailable` carries `why`
     (`no_card_route`, `other_schema_major` or `unparseable`) and the peer's version
     with its source (`peer` or `presence`, the peer's own answer preferred).

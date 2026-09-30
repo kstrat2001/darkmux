@@ -32,7 +32,7 @@
 //! the shared observability stream.
 
 use crate::job::{Boundary, SubmissionMode, WorkJob, WorkVersion, WORK_JOB_SCHEMA_VERSION};
-use crate::identity::NodeIdentity;
+use crate::identity::{IdentityProvider, NodeIdentity};
 use crate::peer::TargetError;
 use anyhow::{anyhow, Context, Result};
 use darkmux_types::config::AcceptWorkEntry;
@@ -1234,8 +1234,15 @@ fn settle_pin(peer: &crate::peer::PeerTarget, id: &str, target: &str, pins: PinP
         return Err(NotPinned { machine: target.to_string() }.into());
     }
     crate::peer::persist_pin(id, peer).context("pinning the target's node in the roster")?;
-    eprintln!("darkmux dispatch: pinned {target} to its {provider} node (first contact); later sends check it");
+    eprintln!("darkmux: pinned {target} to its {provider} node (first contact); later contacts check it");
     Ok(())
+}
+
+/// Pin a freshly verified peer's node in the roster before the fleet token is
+/// sent to it, exactly as a work submission does ([`send_job`]): the ONE
+/// first-contact pin. A no-op for a peer already pinned.
+pub fn pin_on_first_contact(peer: &crate::peer::PeerTarget, id: &str, provider: &dyn IdentityProvider) -> Result<()> {
+    settle_pin(peer, id, id, PinPolicy::PinOnFirstContact, provider.provider_name())
 }
 
 /// Send `job` to the machine it is addressed to and return the receiver's
