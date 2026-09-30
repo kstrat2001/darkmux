@@ -165,20 +165,7 @@ impl WorkJob {
         validate_work_identifier("role_id", &self.role_id)?;
         validate_session_id(&self.session_id)?;
         if let Some(p) = &self.profile {
-            if p.is_empty() || p.len() > MAX_WORK_IDENTIFIER_LEN || !p.chars().all(|c| c.is_ascii_graphic()) {
-                return Err(anyhow!(
-                    "WorkJob.profile must be 1..={MAX_WORK_IDENTIFIER_LEN} printable ASCII characters \
-                     with no spaces: {p:?}"
-                ));
-            }
-            // (#2916 stage 2) The sender splits `profile@machine`; the
-            // machine rides in `target_machine`, never in `profile`.
-            if p.contains('@') {
-                return Err(anyhow!(
-                    "WorkJob.profile is the receiver's own profile name and never contains `@` (the \
-                     sender splits a `profile@machine` address): {p:?}"
-                ));
-            }
+            validate_job_profile(p)?;
         }
         if self.message.len() > MAX_WORK_MESSAGE_BYTES {
             return Err(anyhow!(
@@ -196,18 +183,7 @@ impl WorkJob {
                 ));
             }
         }
-        if self.timeout_seconds == 0 {
-            return Err(anyhow!(
-                "WorkJob.timeout_seconds must be non-zero (0 would never complete)"
-            ));
-        }
-        if self.timeout_seconds > MAX_WORK_TIMEOUT_SECONDS {
-            return Err(anyhow!(
-                "WorkJob.timeout_seconds exceeds {}-second cap (was {})",
-                MAX_WORK_TIMEOUT_SECONDS,
-                self.timeout_seconds
-            ));
-        }
+        validate_job_timeout(self.timeout_seconds)?;
         if let Some(img) = &self.image {
             validate_work_image(img)?;
         }
@@ -253,6 +229,42 @@ impl WorkJob {
 }
 
 
+
+/// A job's `profile`: the receiver's own profile name, never an address.
+fn validate_job_profile(p: &str) -> Result<()> {
+    if p.is_empty() || p.len() > MAX_WORK_IDENTIFIER_LEN || !p.chars().all(|c| c.is_ascii_graphic()) {
+        return Err(anyhow!(
+            "WorkJob.profile must be 1..={MAX_WORK_IDENTIFIER_LEN} printable ASCII characters \
+             with no spaces: {p:?}"
+        ));
+    }
+    // (#2916 stage 2) The sender splits `profile@machine`; the
+    // machine rides in `target_machine`, never in `profile`.
+    if p.contains('@') {
+        return Err(anyhow!(
+            "WorkJob.profile is the receiver's own profile name and never contains `@` (the \
+             sender splits a `profile@machine` address): {p:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// A job's timeout: non-zero, and within the cap.
+fn validate_job_timeout(timeout_seconds: u32) -> Result<()> {
+    if timeout_seconds == 0 {
+        return Err(anyhow!(
+            "WorkJob.timeout_seconds must be non-zero (0 would never complete)"
+        ));
+    }
+    if timeout_seconds > MAX_WORK_TIMEOUT_SECONDS {
+        return Err(anyhow!(
+            "WorkJob.timeout_seconds exceeds {}-second cap (was {})",
+            MAX_WORK_TIMEOUT_SECONDS,
+            timeout_seconds
+        ));
+    }
+    Ok(())
+}
 
 /// Charset+length check for an identifier-shaped field — the canonical
 /// validator used both at the submission boundary (`WorkJob::validate`) and

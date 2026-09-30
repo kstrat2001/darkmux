@@ -2019,6 +2019,44 @@ fn is_peer_binding(role: &str, profile: &str) -> bool {
         && darkmux_types::profile_address::ProfileAddress::parse(profile).is_ok_and(|a| a.machine.is_some())
 }
 
+/// The role->profile bindings that are off target, sorted by why (see
+/// [`role_profiles_status`]).
+#[derive(Default)]
+struct BindingSort<'a> {
+    unknown_role_pairs: Vec<(&'a String, &'a String)>,
+    quarantined_pairs: Vec<(&'a String, &'a String)>,
+    undefined_pairs: Vec<(&'a String, &'a String)>,
+}
+
+fn sort_role_bindings<'a>(
+    map: &'a std::collections::BTreeMap<String, String>,
+    known_profiles: &std::collections::BTreeMap<String, darkmux_types::Profile>,
+    quarantined: &std::collections::BTreeSet<String>,
+    known_roles: &std::collections::BTreeSet<String>,
+) -> BindingSort<'a> {
+    let mut sorted = BindingSort::default();
+    for (role, profile) in map.iter() {
+        // known_roles is empty only when the caller had no bindings to check
+        // (the empty-map arm above returns before reaching here) — so an
+        // empty set here means the role library itself was unavailable, which
+        // check_role_profiles already turns into its own Warn before calling
+        // this function; a real known_roles is always non-empty in practice.
+        if !known_roles.contains(role.as_str()) {
+            sorted.unknown_role_pairs.push((role, profile));
+            continue;
+        }
+        if known_profiles.contains_key(profile.as_str()) || is_peer_binding(role, profile) {
+            continue; // both halves defined + healthy, or the profile lives on a fleet peer
+        }
+        if quarantined.contains(profile.as_str()) {
+            sorted.quarantined_pairs.push((role, profile));
+        } else {
+            sorted.undefined_pairs.push((role, profile));
+        }
+    }
+    sorted
+}
+
 /// Pure decision for `check_role_profiles`, split out so every arm is
 /// unit-testable without a real config.json / registry. `known_profiles` is the
 /// registry's DEFINED profiles; `quarantined` is the set of profile names whose
@@ -2051,28 +2089,8 @@ fn role_profiles_status(
     // the registry doesn't DEFINE. Split by why: unknown role (checked first —
     // no profile-side wording is useful when the role itself can't resolve),
     // then quarantined (in profiles.json but broken) vs genuinely undefined.
-    let mut unknown_role_pairs: Vec<(&String, &String)> = Vec::new();
-    let mut quarantined_pairs: Vec<(&String, &String)> = Vec::new();
-    let mut undefined_pairs: Vec<(&String, &String)> = Vec::new();
-    for (role, profile) in map.iter() {
-        // known_roles is empty only when the caller had no bindings to check
-        // (the empty-map arm above returns before reaching here) — so an
-        // empty set here means the role library itself was unavailable, which
-        // check_role_profiles already turns into its own Warn before calling
-        // this function; a real known_roles is always non-empty in practice.
-        if !known_roles.contains(role.as_str()) {
-            unknown_role_pairs.push((role, profile));
-            continue;
-        }
-        if known_profiles.contains_key(profile.as_str()) || is_peer_binding(role, profile) {
-            continue; // both halves defined + healthy, or the profile lives on a fleet peer
-        }
-        if quarantined.contains(profile.as_str()) {
-            quarantined_pairs.push((role, profile));
-        } else {
-            undefined_pairs.push((role, profile));
-        }
-    }
+    let BindingSort { unknown_role_pairs, quarantined_pairs, undefined_pairs } =
+        sort_role_bindings(map, known_profiles, quarantined, known_roles);
     if unknown_role_pairs.is_empty() && quarantined_pairs.is_empty() && undefined_pairs.is_empty() {
         return Check {
             name,
