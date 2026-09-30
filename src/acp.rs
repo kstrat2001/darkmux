@@ -737,7 +737,7 @@ type BusyCall = Arc<dyn Fn(&crate::radio_answer::AnswererOverrides) -> Option<cr
 /// a caller holding the ability to dispatch the seat must also hold the
 /// rule about what it may be handed, and the rule about when not to.
 #[derive(Clone)]
-struct AnsweringSeat {
+struct SeatCalls {
     call: AnswererCall,
     scope: ScopeCall,
     busy: BusyCall,
@@ -770,7 +770,7 @@ pub fn run() -> Result<i32> {
         // FIX 2) for why it treats `mission launch` children differently
         // from every other registered dispatch child.
         tokio::spawn(host_shutdown_reap_loop(reap_on_host_shutdown));
-        serve(router, AnsweringSeat { call: answerer, scope, busy }, Arc::new(IdleState::new()), AcpStdio::new()).await
+        serve(router, SeatCalls { call: answerer, scope, busy }, Arc::new(IdleState::new()), AcpStdio::new()).await
     })?;
     Ok(0)
 }
@@ -893,7 +893,7 @@ fn slash_verb(text: &str) -> std::result::Result<crate::acp_panel::MissionVerb, 
 /// asserted fact rather than an assumed one.
 async fn serve(
     router_call: RouterCall,
-    seat: AnsweringSeat,
+    seat: SeatCalls,
     idle: Arc<IdleState>,
     transport: impl agent_client_protocol::ConnectTo<Agent> + 'static,
 ) -> Result<()> {
@@ -1707,7 +1707,7 @@ async fn run_no_slash_route(
     cwd: &Path,
     cx: &ConnectionTo<Client>,
     router_call: RouterCall,
-    seat: AnsweringSeat,
+    seat: SeatCalls,
     sessions: &Sessions,
 ) -> Result<()> {
     // (#2947 review C4) Bad enum config refuses before the routing call,
@@ -1864,7 +1864,7 @@ async fn answer_no_slash_refusal(
     refusal_reason: &str,
     cwd: &Path,
     cx: &ConnectionTo<Client>,
-    seat: AnsweringSeat,
+    seat: SeatCalls,
     sessions: &Sessions,
 ) -> Result<()> {
     let (shelf, overrides) = session_answer_context(sessions, session_id);
@@ -2923,7 +2923,7 @@ mod tests {
         tokio::spawn(async move {
             let _ = serve(
                 router_call,
-                AnsweringSeat { call: answerer_call, scope: scope_call, busy: busy_call },
+                SeatCalls { call: answerer_call, scope: scope_call, busy: busy_call },
                 idle_for_serve,
                 transport,
             )

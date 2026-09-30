@@ -225,7 +225,8 @@ impl WorkJob {
     fn validate_single_shot(&self, single_shot: &SingleShotJob) -> Result<()> {
         if self.role_id != darkmux_crew::loader::RADIO_HOST_ROLE_ID {
             return Err(anyhow!(
-                "WorkJob.single_shot is the radio answering seat's mode and only role `{}` has it                  (the job names role `{}`)",
+                "WorkJob.single_shot is the radio answering seat's mode and only role `{}` has it \
+                 (the job names role `{}`)",
                 darkmux_crew::loader::RADIO_HOST_ROLE_ID,
                 self.role_id
             ));
@@ -233,12 +234,18 @@ impl WorkJob {
         if single_shot.humor > 100 {
             return Err(anyhow!("WorkJob.single_shot.humor is a percentage, 0..=100 (was {})", single_shot.humor));
         }
+        if single_shot.surface == darkmux_flow::payload::RadioSurface::Unknown {
+            return Err(anyhow!(
+                "WorkJob.single_shot.surface names no surface this darkmux knows (it answers for `cli` or `panel`)"
+            ));
+        }
         if single_shot.max_completion_tokens == 0 {
             return Err(anyhow!("WorkJob.single_shot.max_completion_tokens must be non-zero"));
         }
         if self.image.is_some() || self.workdir.is_some() {
             return Err(anyhow!(
-                "WorkJob.single_shot runs one exchange with no container and no workspace, so it                  takes neither `image` nor `workdir`"
+                "WorkJob.single_shot runs one exchange with no container and no workspace, so it \
+                 takes neither `image` nor `workdir`"
             ));
         }
         Ok(())
@@ -434,6 +441,15 @@ mod tests {
         let mut budget = job.clone();
         budget.single_shot = Some(SingleShotJob { max_completion_tokens: 0, ..single_shot() });
         assert!(budget.validate().unwrap_err().to_string().contains("max_completion_tokens"));
+
+        let mut surface = job.clone();
+        surface.single_shot =
+            Some(SingleShotJob { surface: darkmux_flow::payload::RadioSurface::Unknown, ..single_shot() });
+        let err = surface.validate().unwrap_err().to_string();
+        assert!(err.contains("surface") && err.contains("cli") && err.contains("panel"), "{err}");
+        // And the refused messages carry no stray run of spaces from a lost line continuation.
+        assert!(!err.contains("  "), "{err}");
+        assert!(!other_role.validate().unwrap_err().to_string().contains("  "));
 
         let mut image = job.clone();
         image.image = Some("rust:slim".into());

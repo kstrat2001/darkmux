@@ -1888,6 +1888,13 @@ fn check_radio_peer_seat() -> Check {
     if let Some(reference) = darkmux_types::config_access::role_profile("radio-host") {
         seats.push(("role_profiles.radio-host".to_string(), reference));
     }
+    // Only a seat written as `<profile>@<machine>` (or a malformed one) needs the roster.
+    let needs_roster = seats.iter().any(|(_, reference)| {
+        darkmux_types::profile_address::ProfileAddress::parse(reference).map_or(true, |a| a.machine.is_some())
+    });
+    if !needs_roster {
+        return radio_peer_seat_status(&seats, &std::collections::BTreeSet::new());
+    }
     let mut known: std::collections::BTreeSet<String> = match darkmux_fleet::load_roster() {
         Ok(roster) => roster.machines.into_keys().collect(),
         Err(e) => {
