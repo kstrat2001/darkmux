@@ -115,7 +115,7 @@ export function batteryFillWidth(chargePct: number | null, maxWidth: number): nu
 /** (operator, 2026-09-30: "reddish for too long... fully green by about 50%") The fraction of
  * the bar at which the ramp reaches its green end. Below it the palette runs red to green
  * (amber at a quarter); above it the ramp stays green. */
-export const BATTERY_GREEN_AT = 0.5;
+const BATTERY_GREEN_AT = 0.5;
 
 /** The gradient id the battery bar's own `<linearGradient>` uses — a
  * separate constant from `COMPACT_RAMP_ID` (Meter.tsx) even though only
