@@ -8058,7 +8058,7 @@ body {
   stroke-linecap: round;
 }
 .battery-bar-held {
-  font: 600 calc(max(11px, var(--bat-w) * 0.075) * var(--fs-scale))/1.2 var(--font-mono);
+  font: 600 calc(clamp(11px, var(--bat-w) * 0.075, 16px) * var(--fs-scale))/1.2 var(--font-mono);
   color: var(--info);
   text-transform: uppercase;
   letter-spacing: 0.04em;
@@ -8082,7 +8082,7 @@ body {
   border-radius: 6px;
 }
 .battery-bar-pct {
-  font: 700 calc(max(15px, var(--bat-w) * 0.11) * var(--fs-scale))/1.2 var(--font-mono);
+  font: 700 calc(clamp(15px, var(--bat-w) * 0.11, 24px) * var(--fs-scale))/1.2 var(--font-mono);
   color: var(--fg);
   font-variant-numeric: tabular-nums;
 }
@@ -8105,8 +8105,8 @@ body {
 }
 /* (operator, 2026-09-30: "plenty of room to make the battery graphics bigger/wider") The
    graphic scales with the lens's own width: the block is the size container, and `--bat-w` is
-   the glyph's width (about 1.9x the old 84px on a phone, 1.5x beside the info rows on a
-   desktop). The percent and the HELD label scale off the same variable. */
+   the glyph's width (about 1.9x the old 84px on a phone; beside the info rows on a desktop it takes 17% of
+   the block up to 260px). The percent and the HELD label scale off the same variable. */
 .battery-block {
   container-type: inline-size;
 }
@@ -8134,7 +8134,7 @@ body {
     gap: 48px;
   }
   .battery-meter {
-    --bat-w: clamp(84px, 15cqw, 140px);
+    --bat-w: clamp(140px, 17cqw, 260px);
     flex: 0 0 auto;
   }
   .battery-info {

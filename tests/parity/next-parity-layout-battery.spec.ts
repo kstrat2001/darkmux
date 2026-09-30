@@ -22,7 +22,10 @@ const STATES = [
   { id: "full", battery: { charge_pct: 100, on_ac: true, charging: false, state: "full", minutes_to_empty: null }, held: false },
 ];
 
-for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
+// Desktop is checked at three battery-block widths, 868 (the shared desktop viewport), 1470 (the
+// operator's real panel) and 2000, by widening the viewport: the events column takes 412px.
+const WIDTHS = { ...VIEWPORTS, "desktop-1470": { width: 1882, height: 1000 }, "desktop-2000": { width: 2412, height: 1000 } };
+for (const [vpName, viewport] of Object.entries(WIDTHS)) {
   test(`machine lens battery meter: glyph is scaled to its container and holds one size in every charge state (${vpName})`, async ({ browser }) => {
     const rows = [];
     for (const state of STATES) {
@@ -77,12 +80,11 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
     }
     console.log(`${vpName}: ${JSON.stringify(rows)}`);
     // The graphic scales with the block's width (`--bat-w` in styles.css): 44% of it on a phone,
-    // 15% beside the info rows on a desktop, clamped to 84-180px and 84-140px. Pinned here, with
+    // 17% beside the info rows on a desktop, clamped to 84-180px and 140-260px. Pinned here, with
     // the old 84px width as the floor the operator asked to beat.
-    const share = vpName === "phone" ? 0.44 : 0.15;
-    const cap = vpName === "phone" ? 180 : 140;
+    const [share, min, cap] = vpName === "phone" ? [0.44, 84, 180] : [0.17, 140, 260];
     for (const r of rows) {
-      const w = Math.min(cap, Math.max(84, r.blockW * share));
+      const w = Math.min(cap, Math.max(min, r.blockW * share));
       expect(r.glyph.w, `glyph width (${vpName}, ${r.state})`).toBeCloseTo(w, 0);
       expect(r.glyph.h, `glyph keeps its 64:28 shape (${vpName}, ${r.state})`).toBeCloseTo((w * 28) / 64, 0);
       expect(r.glyph.w, `bigger than the old 84px (${vpName})`).toBeGreaterThan(84 * 1.4);
