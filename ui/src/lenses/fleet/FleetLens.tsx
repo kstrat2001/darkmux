@@ -14,8 +14,8 @@ import { useCountUp } from "../../hooks/useCountUp";
 import { useFleetRoster, useLiveMachines } from "../../hooks/useLiveMachines";
 import { useFleetView } from "../../hooks/useFleetView";
 import { useFlip } from "../../hooks/useFlip";
-import type { MachineSpecsResponse } from "../../types/generated/MachineSpecsResponse";
 import { cardOrderKey, orderCards } from "./cardOrder";
+import { useCardOrderGate } from "./cardOrderGate";
 import { getSource, runsSrc, runsReachable } from "../../lib/source";
 import { useLiveSessionIds } from "../../hooks/useLiveSessionIds";
 import { machineUids, machPresent, machineNames, isSelfMachine, LIVE_WINDOW_MS } from "../../lib/flow";
@@ -380,23 +380,6 @@ function RosterUnreadableNotice({ error }: { error: string | null }) {
  *  timeline object: live samples re-render the fleet lens several times a
  *  second, and the timeline (rebuilt once per wall second or data change)
  *  never reads them, so its hundreds of bars are not re-diffed per sample. */
-/** How long the cards wait for the fleet view before laying out in key order
- *  anyway. The view is cached daemon-side and normally answers in tens of
- *  milliseconds, but it probes every peer, and a slow one held a read for
- *  seconds; a second is the point where a wait reads as the page being slow,
- *  so past it the cards show and any later move animates (`useFlip`). */
-const ORDER_WAIT_MS = 1000;
-
-/** `true` once `ms` have passed since mount. */
-function useOrderWait(ms: number): boolean {
-  const [waited, setWaited] = useState(false);
-  useEffect(() => {
-    const t = setTimeout(() => setWaited(true), ms);
-    return () => clearTimeout(t);
-  }, [ms]);
-  return waited;
-}
-
 const NO_RUNS: import("../../types/generated/Run").Run[] = [];
 
 const TimelineLanes = memo(function TimelineLanes({ timeline }: { timeline: ReturnType<typeof buildActivityTimeline> }) {
@@ -695,26 +678,6 @@ export function FleetLens({
     const self = viewRows?.find((r) => r.is_this_machine);
     return self ? rowSpecs(self) : null;
   }, [viewRows]);
-  // This machine's identity for ORDERING, known before the view answers. The
-  // view gathers every peer's card (a slow peer can hold it for seconds),
-  // while `/machine/specs` is the daemon's own hardware probe, read by the app
-  // shell into this cache slot; a disabled observer here reads it without a
-  // second fetch (the same pattern as `presenceState` below). The view's own
-  // self row wins once it lands. Live only: a replay describes a past day.
-  const machineSpecsState = useQuery({
-    enabled: false,
-    queryKey: queryKeys.machineSpecs(),
-    queryFn: () => fetchJson<MachineSpecsResponse>("/machine/specs"),
-  });
-  const shellSpecs = liveMode && machineSpecsState.data?.ok ? machineSpecsState.data.data : null;
-  const orderSelf = specs ?? shellSpecs;
-  // The cards are laid out only once their order is final: when the view has
-  // answered, or when this machine is already known from the shell's specs
-  // (self is first from the first paint), or after `ORDER_WAIT_MS`. Until then
-  // the grid keeps the cards' boxes, unpainted (`.fleet[data-order="pending"]`),
-  // so nothing moves under the operator's eye and the page does not change size.
-  const orderWaited = useOrderWait(ORDER_WAIT_MS);
-
   // (#1923) `GET /runs` — already fleet-aware, already unions lab + flow
   // sources server-side (`build_runs`) — read here ONLY to fill the gap
   // flow presence structurally cannot: a lab run in flight, which
@@ -791,7 +754,7 @@ export function FleetLens({
   // The view says who is up for every machine it holds, so "offline" waits on
   // it as well as on presence.
   const viewAnswered = useLatch(fleetView.answered);
-  const orderPending = !viewAnswered && !shellSpecs?.machine_uid && !orderWaited;
+  const { orderSelf, orderState } = useCardOrderGate(liveMode, specs, viewAnswered);
   // (#2965) A failed flow read settles the window with no records, which
   // is what a quiet window looks like: the flow source has not answered
   // while its read is failing, so the claims it backs hold "no signal".
@@ -1006,7 +969,7 @@ export function FleetLens({
       />
       <RunsUnreadableNotice unreadable={runsUnreadable} message={runsErrorMessage} />
       <RosterUnreadableNotice error={rosterError} />
-      <div className="fleet" ref={fleetRef} data-order={orderPending ? "pending" : "final"}>
+      <div className="fleet" ref={fleetRef} data-order={orderState}>
         {cards.map((card) => {
           // (#2881) Pager selection for this card. `execs` is already
           // sorted by session id (`cards.ts::buildFleetCard`'s own doc) —
