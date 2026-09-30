@@ -1644,6 +1644,42 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
     expect(studio.querySelector(".spec")!.textContent).toBe("listener off");
   });
 
+  // (fleet review C2) A view row that carries no uid (its card was not read)
+  // is keyed by its roster id. The same machine, seen in flow and presence
+  // under its hardware uid, is the SAME machine when the names agree
+  // (machine names are ASCII case-insensitive): one card, not an offline one
+  // beside an idle one.
+  it("a view row with no uid and the flow machine of the same name are one card", async () => {
+    const today = todayUTC();
+    mockFleetFetch({
+      flowToday: [{ ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "studio", session_id: "s1", action: "dispatch.start", handle: "coder" }],
+      machines: [{ machine_uid: "u1", display_name: "Mac-Studio", schema_version: "1.20.0", beat_ts_ms: 1 }],
+      specs: { machine_id: "MacBook-Pro", machine_uid: "u-self" },
+      view: [unreachableRow("Studio", "listener_off", { liveness: "live" })],
+      runs: [],
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelectorAll(".mach").length).toBeGreaterThan(0));
+    await waitFor(() => expect(document.querySelector('.savings[data-settled="true"]')).not.toBeNull());
+    const names = [...document.querySelectorAll(".mach-name")].map((n) => n.textContent);
+    expect(names.filter((n) => n?.toLowerCase().includes("studio"))).toHaveLength(1);
+    expect(document.querySelectorAll(".mach")).toHaveLength(2);
+  });
+
+  // The inverse: a flow machine with another name is another machine, and a
+  // name shared by two flow uids is not decided for either.
+  it("a view row is not merged into a flow machine of another name", async () => {
+    const today = todayUTC();
+    mockFleetFetch({
+      flowToday: [{ ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "mini", session_id: "s1", action: "dispatch.start", handle: "coder" }],
+      specs: { machine_id: "MacBook-Pro", machine_uid: "u-self" },
+      view: [unreachableRow("studio", "listener_off")],
+      runs: [],
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelectorAll(".mach")).toHaveLength(3));
+  });
+
   it("an unreachable peer whose liveness the view cannot decide says no signal, never idle", async () => {
     mockFleetFetch({ view: [unreachableRow("studio", "listener_off", { liveness: "unknown" })], runs: [] });
     renderFleetLens();

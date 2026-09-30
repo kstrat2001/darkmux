@@ -171,21 +171,51 @@ export interface RowFacts {
   isSelf: boolean;
 }
 
+/** The flow uid each machine NAME belongs to, for the names one uid alone
+ * holds. Machine names are ASCII case-insensitive (`same_machine` in
+ * `darkmux-fleet`), so keys are lowercased; a name two uids share decides
+ * nothing and is left out. `namesOf` gives every name a uid was seen under. */
+export function flowUidByName(uids: readonly string[], namesOf: (uid: string) => Iterable<string>): Map<string, string> {
+  const byName = new Map<string, string>();
+  const shared = new Set<string>();
+  for (const uid of uids) {
+    for (const name of new Set([...namesOf(uid)].map((n) => n.toLowerCase()))) {
+      if (byName.has(name) && byName.get(name) !== uid) shared.add(name);
+      byName.set(name, uid);
+    }
+  }
+  for (const name of shared) byName.delete(name);
+  return byName;
+}
+
 /** The uid a card is keyed by. This machine's own row, when the daemon
  * reports no hardware uid, takes `selfUid`: the flow uid the page recognizes
  * as this machine. A machine the page already knows by its
  * hardware uid (flow, presence, itself) keeps that uid; one only the view
  * knows is keyed by its roster id, the same key `lib/machineKey.ts` gives a
  * roster-only machine, so the card's link resolves. */
-export function rowUid(row: FleetMachine, knownUids: ReadonlySet<string>, selfUid: string | null): string {
-  const uid = row.machine_uid ?? (row.is_this_machine ? selfUid : null);
+export function rowUid(
+  row: FleetMachine,
+  knownUids: ReadonlySet<string>,
+  selfUid: string | null,
+  flowUids: ReadonlyMap<string, string> = new Map(),
+): string {
+  // A row whose card was not read has no uid of its own; the flow machine
+  // that goes by its roster id is the same machine (`flowUidByName`).
+  const named = row.entry ? flowUids.get(row.entry.id.toLowerCase()) : undefined;
+  const uid = row.machine_uid ?? (row.is_this_machine ? selfUid : null) ?? named ?? null;
   if (uid && knownUids.has(uid)) return uid;
   return row.entry?.id ?? uid ?? "unknown";
 }
 
-export function rowFacts(row: FleetMachine, knownUids: ReadonlySet<string>, selfUid: string | null): RowFacts {
+export function rowFacts(
+  row: FleetMachine,
+  knownUids: ReadonlySet<string>,
+  selfUid: string | null,
+  flowUids: ReadonlyMap<string, string> = new Map(),
+): RowFacts {
   const specs = rowSpecs(row);
-  const uid = rowUid(row, knownUids, selfUid);
+  const uid = rowUid(row, knownUids, selfUid, flowUids);
   return {
     uid,
     known: knownUids.has(uid),

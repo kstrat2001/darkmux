@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { grantLine, outcomeLine, rowFacts, rowStanding, rowUid } from "./viewRows";
+import { flowUidByName, grantLine, outcomeLine, rowFacts, rowStanding, rowUid } from "./viewRows";
 import type { AcceptsState } from "../../types/generated/AcceptsState";
 import type { CardOutcome } from "../../types/generated/CardOutcome";
 import type { FleetMachine } from "../../types/generated/FleetMachine";
@@ -162,6 +162,26 @@ describe("rowFacts", () => {
   it("a card with no chip named has no hardware line", () => {
     const noChip = { specs: { ...SPECS, cpu_brand: null } } as unknown as MachineCard;
     expect(rowFacts(row({ card: { state: "available", card: noChip, source: "listener" } }), new Set(), null).spec).toBe("");
+  });
+});
+
+describe("flowUidByName: a flow machine that goes by a roster id", () => {
+  const names: Record<string, string[]> = { u1: ["studio", "Mac-Studio"], u2: ["mini"], u3: ["MINI"] };
+  const byName = flowUidByName(["u1", "u2", "u3"], (u) => names[u]);
+
+  it("matches a name case-insensitively, whichever of the uid's names it is", () => {
+    expect(byName.get("studio")).toBe("u1");
+    expect(byName.get("mac-studio")).toBe("u1");
+  });
+
+  it("decides nothing for a name two uids share", () => {
+    expect(byName.has("mini")).toBe(false);
+  });
+
+  it("re-keys a row with no uid of its own, and never a row that has one", () => {
+    expect(rowUid(row({ machine_uid: null }), new Set(["u1"]), null, byName)).toBe("u1");
+    expect(rowUid(row({ machine_uid: "OTHER" }), new Set(["u1"]), null, byName)).toBe("studio");
+    expect(rowUid(row({ machine_uid: null, entry: { id: "nobody", address: "a", added_unix_ms: 1 } }), new Set(["u1"]), null, byName)).toBe("nobody");
   });
 });
 

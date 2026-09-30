@@ -32,7 +32,7 @@ import { tokensOffMeter } from "./savings";
 import { buildFleetCardBase, withLiveReadings, busiestExecution, isStrictlyBusier, specDimLabel, specLine, cardFace, NO_SIGNAL_STAT, type CardSourcesAnswered, type FleetCard } from "./cards";
 import { useLatch } from "../../hooks/useLatch";
 import { buildActivityTimeline, ACTIVITY_WINDOW_PRESETS, DEFAULT_ACTIVITY_WINDOW_MIN } from "./timeline";
-import { rowFacts, rowSpecs } from "./viewRows";
+import { flowUidByName, rowFacts, rowSpecs } from "./viewRows";
 import { runsForMachine } from "../runs/format";
 import { recordsAsOf, type NormRecord } from "../../lib/ingest";
 import { dispatchHash } from "../../lib/route";
@@ -836,7 +836,8 @@ export function FleetLens({
   const viewCards = useMemo(() => {
     const known = new Set(uids);
     const selfUid = specs ? (uids.find((u) => isSelfMachine(flowWindow.data, liveMachines, specs, u)) ?? null) : null;
-    return (viewRows ?? []).map((row) => ({ row, facts: rowFacts(row, known, selfUid) }));
+    const flowUids = flowUidByName(uids, (u) => machineNames(flowWindow.data, liveMachines, u));
+    return (viewRows ?? []).map((row) => ({ row, facts: rowFacts(row, known, selfUid, flowUids) }));
   }, [viewRows, uids, specs, flowWindow.data, liveMachines]);
   const flowOnlyUids = useMemo(() => {
     const covered = new Set(viewCards.flatMap(({ row, facts }) => [facts.uid, row.machine_uid ?? facts.uid]));
