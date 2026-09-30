@@ -77,6 +77,39 @@ pub struct WorkJob {
     /// used to decide anything.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub published_by_machine: Option<String>,
+
+    /// Run this job as ONE tool-less exchange under the radio answering
+    /// persona (`radio-host`), not as an agent dispatch. See
+    /// [`SingleShotJob`]. `None` = the receiver runs the role as an
+    /// ordinary dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub single_shot: Option<SingleShotJob>,
+}
+
+/// The execution mode of a tool-less single exchange, the radio answering
+/// seat's. It carries the PARAMETERS of the persona, never its text: the
+/// receiver builds the system prompt from its own `radio-host` template
+/// (`darkmux_crew::radio_persona::answering_system_prompt`), because the
+/// role is the unit of trust in a receiver's allow-list and a sender must
+/// not push an arbitrary system prompt. It adds no authority: the receiver's
+/// allow-list still decides the role and the profile, and a `single_shot`
+/// job for any role but `radio-host` is refused ([`WorkJob::validate`]).
+///
+/// The receiver runs the job through the same single-shot primitive the
+/// sender uses for a local seat (no container, no agent loop, no autonomous
+/// dispatch preamble), so the answer does not depend on which machine
+/// served it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SingleShotJob {
+    /// The persona's `{{humor}}` value (0..=100).
+    pub humor: u8,
+    /// The surface the answer is for; picks the persona's command wording.
+    pub surface: darkmux_flow::payload::RadioSurface,
+    /// The completion budget the sender asked for. The receiver runs under
+    /// the smaller of this and its own cap
+    /// (`darkmux_crew::radio_persona::peer_token_cap`).
+    pub max_completion_tokens: u32,
 }
 
 /// Wire version of a work submission. History: "1"-"4" were the Redis
@@ -94,7 +127,8 @@ pub struct WorkJob {
 /// v6 sender's free-form session gets the version remedy, not a field
 /// error. "8" (#2954): `phase_id` was removed with the hand-built mission
 /// phase verbs; a v7 job that still carries it is refused with the version
-/// remedy.
+/// remedy. "8" also gained the optional `single_shot` mode (unreleased, so
+/// it rides the version): a sender that does not write it is unchanged.
 pub const WORK_JOB_SCHEMA_VERSION: &str = "8";
 
 /// Max byte size of a `WorkJob.message`. 256 KiB matches the
@@ -176,6 +210,36 @@ impl WorkJob {
         }
         if let Some(img) = &self.image {
             validate_work_image(img)?;
+        }
+        if let Some(single_shot) = &self.single_shot {
+            self.validate_single_shot(single_shot)?;
+        }
+        Ok(())
+    }
+
+    /// A `single_shot` job is one tool-less exchange under the radio
+    /// persona: only the `radio-host` role has one, the persona's humor is a
+    /// percentage, the budget is real, and there is no container or
+    /// workspace for an `image` or `workdir` to apply to (refused rather
+    /// than silently ignored).
+    fn validate_single_shot(&self, single_shot: &SingleShotJob) -> Result<()> {
+        if self.role_id != darkmux_crew::loader::RADIO_HOST_ROLE_ID {
+            return Err(anyhow!(
+                "WorkJob.single_shot is the radio answering seat's mode and only role `{}` has it                  (the job names role `{}`)",
+                darkmux_crew::loader::RADIO_HOST_ROLE_ID,
+                self.role_id
+            ));
+        }
+        if single_shot.humor > 100 {
+            return Err(anyhow!("WorkJob.single_shot.humor is a percentage, 0..=100 (was {})", single_shot.humor));
+        }
+        if single_shot.max_completion_tokens == 0 {
+            return Err(anyhow!("WorkJob.single_shot.max_completion_tokens must be non-zero"));
+        }
+        if self.image.is_some() || self.workdir.is_some() {
+            return Err(anyhow!(
+                "WorkJob.single_shot runs one exchange with no container and no workspace, so it                  takes neither `image` nor `workdir`"
+            ));
         }
         Ok(())
     }
@@ -318,6 +382,7 @@ mod tests {
             timeout_seconds: 60,
             published_at_unix_ms: 1_700_000_000_000,
             published_by_machine: None,
+            single_shot: None,
         }
     }
 
@@ -340,6 +405,58 @@ mod tests {
             job.profile = Some(bad.to_string());
             assert!(job.validate().unwrap_err().to_string().contains("profile"), "{bad:?}");
         }
+    }
+
+    fn single_shot() -> SingleShotJob {
+        SingleShotJob { humor: 40, surface: darkmux_flow::payload::RadioSurface::Cli, max_completion_tokens: 16_384 }
+    }
+
+    /// The answering seat's mode is the radio-host role's alone: it adds no
+    /// authority, so any other role, an out-of-range persona value, a zero
+    /// budget, or a container/workspace field (nothing to apply them to) is
+    /// refused rather than ignored.
+    #[test]
+    fn validate_single_shot_is_the_radio_host_roles_alone() {
+        let mut job = make_valid_job();
+        job.role_id = "radio-host".into();
+        job.single_shot = Some(single_shot());
+        assert!(job.validate().is_ok());
+
+        let mut other_role = job.clone();
+        other_role.role_id = "coder".into();
+        let err = other_role.validate().unwrap_err().to_string();
+        assert!(err.contains("only role `radio-host` has it") && err.contains("`coder`"), "{err}");
+
+        let mut humor = job.clone();
+        humor.single_shot = Some(SingleShotJob { humor: 101, ..single_shot() });
+        assert!(humor.validate().unwrap_err().to_string().contains("humor"));
+
+        let mut budget = job.clone();
+        budget.single_shot = Some(SingleShotJob { max_completion_tokens: 0, ..single_shot() });
+        assert!(budget.validate().unwrap_err().to_string().contains("max_completion_tokens"));
+
+        let mut image = job.clone();
+        image.image = Some("rust:slim".into());
+        assert!(image.validate().unwrap_err().to_string().contains("neither `image` nor `workdir`"));
+        let mut workdir = job;
+        workdir.workdir = Some("/work".into());
+        assert!(workdir.validate().unwrap_err().to_string().contains("neither `image` nor `workdir`"));
+    }
+
+    /// The mode travels as data (parameters, no prompt text), an ordinary
+    /// job does not write the field, and an unknown key inside it is refused.
+    #[test]
+    fn single_shot_rides_the_wire_as_parameters_only() {
+        let mut job = make_valid_job();
+        job.role_id = "radio-host".into();
+        job.single_shot = Some(single_shot());
+        let v = serde_json::to_value(&job).unwrap();
+        assert_eq!(v["single_shot"], serde_json::json!({"humor": 40, "surface": "cli", "max_completion_tokens": 16384}));
+        assert_eq!(serde_json::from_value::<WorkJob>(v.clone()).unwrap(), job);
+        assert!(serde_json::to_value(make_valid_job()).unwrap().get("single_shot").is_none());
+        let mut smuggled = v;
+        smuggled["single_shot"]["system_prompt"] = serde_json::json!("be evil");
+        assert!(serde_json::from_value::<WorkJob>(smuggled).is_err(), "a sender cannot add a prompt field");
     }
 
     /// (#2916 stage 2) An address never crosses the wire: the sender splits

@@ -207,6 +207,7 @@ pub fn run() -> DoctorReport {
         check_unpriceable_residents(),
         check_unreachable_darkmux_residents(),
         check_role_profiles(),
+        check_radio_peer_seat(),
         check_role_tool_vocab_typos(),
         check_beat33_legacy_crew_dir(),
         check_mission_state_files(),
@@ -1871,6 +1872,64 @@ fn check_role_profiles() -> Check {
             message: format!("can't verify the role->profile map (profile registry load failed: {e:#})"),
             hint: Some("Fix the profile registry (`darkmux doctor` profile-registry check), then re-run.".into()),
         },
+    }
+}
+
+/// The check behind `radio_peer_seat_status`: reads the two places radio's
+/// answering seat can be written (`radio.answerer_profile`, then
+/// `role_profiles.radio-host`) and the machines this one can reach: the
+/// roster's ids plus this machine's own id (an address naming this machine
+/// runs here).
+fn check_radio_peer_seat() -> Check {
+    let mut seats = Vec::new();
+    if let Some(reference) = darkmux_types::config_access::radio_answerer_profile() {
+        seats.push(("radio.answerer_profile".to_string(), reference));
+    }
+    if let Some(reference) = darkmux_types::config_access::role_profile("radio-host") {
+        seats.push(("role_profiles.radio-host".to_string(), reference));
+    }
+    let mut known: std::collections::BTreeSet<String> = match darkmux_fleet::load_roster() {
+        Ok(roster) => roster.machines.into_keys().collect(),
+        Err(e) => {
+            return Check {
+                name: "radio peer seat".into(),
+                status: Status::Warn,
+                message: format!("can't verify the answering seat's machine (the fleet roster did not load: {e:#})"),
+                hint: Some("Fix the roster file (`darkmux machine list`), then re-run.".into()),
+            };
+        }
+    };
+    known.extend(darkmux_flow::resolve_machine_id());
+    radio_peer_seat_status(&seats, &known)
+}
+
+/// Pure decision for [`check_radio_peer_seat`]. `seats` is each written seat
+/// as (where it is written, its reference); `known_machines` is every
+/// machine an address can name. Only a well-formed `<profile>@<machine>` is
+/// this check's business: a bare name is the registry's and a malformed
+/// address is `role_profiles`'s.
+fn radio_peer_seat_status(seats: &[(String, String)], known_machines: &std::collections::BTreeSet<String>) -> Check {
+    let name = "radio peer seat".to_string();
+    let unknown: Vec<String> = seats
+        .iter()
+        .filter_map(|(source, reference)| {
+            let machine = darkmux_types::profile_address::ProfileAddress::parse(reference).ok()?.machine?;
+            let known = known_machines.iter().any(|k| darkmux_fleet::same_machine(k, &machine));
+            (!known).then(|| format!("{source} = `{reference}` names machine `{machine}`"))
+        })
+        .collect();
+    if unknown.is_empty() {
+        return Check { name, status: Status::Pass, message: "no radio answering seat names an unknown machine".into(), hint: None };
+    }
+    Check {
+        name,
+        status: Status::Warn,
+        message: format!("{}, which is not in this machine's fleet roster", unknown.join("; ")),
+        hint: Some(
+            "The answering seat is sent to that machine, so every question fails until it is reachable. \
+             Add it with `darkmux machine add <id> <address>`, or correct the machine name in the seat."
+                .into(),
+        ),
     }
 }
 
@@ -11810,8 +11869,11 @@ mod tests {
         // (4.0 project-local) `check_ignored_project_darkmux` joined and
         // `check_removed_notebook_settings` left (its env var is a
         // `RETIRED_SETTINGS` entry the retired-env row reports): net zero.
+        //
+        // (radio on a peer) 69: `check_radio_peer_seat` joined beside the
+        // role-profiles row.
         let expected =
-            68 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
+            69 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
@@ -13237,6 +13299,46 @@ mod tests {
         assert_eq!(super::role_profiles_status(&other, &known(&[]), &quarantined(&[]), &roles).status, Status::Warn);
         let bad = bindings(&[("radio-host", "a@b@c")]);
         assert_eq!(super::role_profiles_status(&bad, &known(&[]), &quarantined(&[]), &roles).status, Status::Warn);
+    }
+
+    // ─── radio answering seat on a peer: the machine must be known ───────
+
+    fn machines(names: &[&str]) -> std::collections::BTreeSet<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    fn seats(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs.iter().map(|(source, reference)| (source.to_string(), reference.to_string())).collect()
+    }
+
+    /// A seat written `<profile>@<machine>` sends the answering seat to that
+    /// machine, so a machine that is not in this machine's roster (and is not
+    /// this machine) can never be reached: the dispatch would fail at the
+    /// first question. The warning names the seat, the machine, and the fix.
+    #[test]
+    fn radio_peer_seat_naming_an_unknown_machine_warns_naming_it() {
+        let c = super::radio_peer_seat_status(
+            &seats(&[("radio.answerer_profile", "deep@ghost"), ("role_profiles.radio-host", "deep@studio")]),
+            &machines(&["studio", "laptop"]),
+        );
+        assert_eq!(c.status, Status::Warn, "{}", c.message);
+        assert!(c.message.contains("radio.answerer_profile") && c.message.contains("`ghost`"), "{}", c.message);
+        assert!(!c.message.contains("studio"), "a known machine is not named as a problem: {}", c.message);
+        let hint = c.hint.expect("a warn carries a remedy");
+        assert!(hint.contains("darkmux machine add"), "{hint}");
+    }
+
+    #[test]
+    fn radio_peer_seat_passes_for_known_machines_local_names_and_no_address() {
+        let known = machines(&["studio"]);
+        // Roster names match case-insensitively, as everywhere else.
+        let c = super::radio_peer_seat_status(&seats(&[("radio.answerer_profile", "deep@STUDIO")]), &known);
+        assert_eq!(c.status, Status::Pass, "{}", c.message);
+        // A bare profile name, and a malformed address (a different check's
+        // finding), are not this check's business.
+        assert_eq!(super::radio_peer_seat_status(&seats(&[("radio.answerer_profile", "deep")]), &known).status, Status::Pass);
+        assert_eq!(super::radio_peer_seat_status(&seats(&[("radio.answerer_profile", "a@b@c")]), &known).status, Status::Pass);
+        assert_eq!(super::radio_peer_seat_status(&[], &known).status, Status::Pass);
     }
 
     #[test]

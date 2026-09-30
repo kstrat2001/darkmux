@@ -70,7 +70,11 @@ pub fn execute_job(job: WorkJob, profile: String, origin: String) -> Result<Disp
     // `dispatch_reconciled`'s lease is a per-guard union that pins every
     // live same-process sibling's model (#2651, #2663), so one job's
     // reconcile does not evict another's.
-    execute_job_with(job, profile, origin, darkmux_crew::dispatch_reconciled::dispatch_reconciled)
+    let primitive = match job.single_shot {
+        Some(_) => darkmux_crew::dispatch_reconciled::dispatch_reconciled_single_shot,
+        None => darkmux_crew::dispatch_reconciled::dispatch_reconciled,
+    };
+    execute_job_with(job, profile, origin, primitive)
 }
 
 /// [`execute_job`] with the dispatch primitive injected, so what reaches
@@ -88,9 +92,13 @@ pub fn execute_job_with(
             .context("workdir validation failed")?;
         job.workdir = Some(canonical.to_string_lossy().into_owned());
     }
+    let single_shot = job.single_shot;
     let mut opts = job.into_dispatch_opts();
     opts.profile_name = Some(profile);
     opts.remote_origin = Some(origin);
+    if let Some(single_shot) = single_shot {
+        apply_single_shot(&mut opts, single_shot)?;
+    }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _in_flight = DispatchInFlightGuard::new();
         dispatch(opts)
@@ -99,6 +107,19 @@ pub fn execute_job_with(
         Ok(r) => r,
         Err(_) => Err(anyhow::anyhow!("the dispatch panicked; the listener survived it")),
     }
+}
+
+/// Give a `single_shot` job's dispatch what the sender's local seat would
+/// have given it: the persona built from THIS machine's own `radio-host`
+/// template (a sender never sends prompt text), and a token budget of the
+/// smaller of the sender's ask and this machine's own cap. The dispatch
+/// primitive for such a job is the single-shot one ([`execute_job`]), which
+/// with an override skips the specialist preamble.
+fn apply_single_shot(opts: &mut darkmux_crew::dispatch::DispatchOpts, single_shot: crate::SingleShotJob) -> Result<()> {
+    use darkmux_crew::radio_persona::{answering_system_prompt, peer_token_cap};
+    opts.system_prompt_override = Some(answering_system_prompt(single_shot.humor, single_shot.surface)?);
+    opts.max_completion_tokens = Some(peer_token_cap(single_shot.max_completion_tokens));
+    Ok(())
 }
 
 impl WorkJob {
@@ -197,6 +218,7 @@ mod tests {
             timeout_seconds: 60,
             published_at_unix_ms: 1,
             published_by_machine: None,
+            single_shot: None,
         }
     }
 
@@ -244,6 +266,78 @@ mod tests {
         });
         assert!(r.is_ok());
         assert_eq!(seen, Some((Some("resolved-host".into()), Some("laptop".into()), None)));
+    }
+
+    fn ok_result() -> Result<DispatchResult> {
+        Ok(DispatchResult { exit_code: 0, stdout: String::new(), stderr: String::new(), session_id: crate::test_session("s"), execution: None, out_dir: None, trajectory: None })
+    }
+
+    fn answering_job(max_completion_tokens: u32) -> WorkJob {
+        WorkJob {
+            role_id: "radio-host".into(),
+            image: None,
+            single_shot: Some(crate::SingleShotJob {
+                humor: 37,
+                surface: darkmux_flow::payload::RadioSurface::Panel,
+                max_completion_tokens,
+            }),
+            ..job()
+        }
+    }
+
+    /// The receiver builds the answering seat's persona from its OWN
+    /// `radio-host` template: every placeholder filled, the humor and
+    /// surface the sender named, no autonomous-dispatch preamble, and the
+    /// budget the sender asked for (under this machine's cap).
+    #[test]
+    fn a_single_shot_job_gets_the_receivers_own_persona_and_the_requested_budget() {
+        let mut seen = None;
+        execute_job_with(answering_job(5_000), "deep".into(), "laptop".into(), |o| {
+            seen = Some((o.system_prompt_override.clone(), o.max_completion_tokens));
+            ok_result()
+        })
+        .unwrap();
+        let (prompt, cap) = seen.unwrap();
+        let prompt = prompt.expect("the receiver built a system prompt");
+        assert!(!prompt.contains("{{"), "no placeholder reaches the model: {prompt}");
+        assert!(prompt.contains("37%"), "the sender's humor: {prompt}");
+        assert!(prompt.contains("/mission launch <id>"), "the panel surface's wording: {prompt}");
+        assert!(!prompt.contains("Autonomous dispatch context"), "no specialist preamble: {prompt}");
+        assert_eq!(cap, Some(5_000));
+    }
+
+    /// The machine that runs the model owns its limit: a sender asking for
+    /// more than this machine's cap runs under the cap.
+    #[test]
+    fn a_single_shot_budget_is_bounded_by_the_receivers_own_cap() {
+        let mut seen = None;
+        execute_job_with(answering_job(u32::MAX), "deep".into(), "laptop".into(), |o| {
+            seen = o.max_completion_tokens;
+            ok_result()
+        })
+        .unwrap();
+        assert_eq!(seen, Some(darkmux_crew::radio_persona::answer_token_cap()));
+    }
+
+    /// An ordinary job is untouched: no override, no budget.
+    #[test]
+    fn an_ordinary_job_carries_no_persona_and_no_budget() {
+        let mut seen = None;
+        execute_job_with(job(), "host".into(), "laptop".into(), |o| {
+            seen = Some((o.system_prompt_override.clone(), o.max_completion_tokens));
+            ok_result()
+        })
+        .unwrap();
+        assert_eq!(seen, Some((None, None)));
+    }
+
+    /// `single_shot` on another role never reaches dispatch.
+    #[test]
+    fn a_single_shot_job_for_another_role_is_refused_before_dispatch() {
+        let mut j = answering_job(1_000);
+        j.role_id = "coder".into();
+        let err = execute_job_with(j, "host".into(), "laptop".into(), |_| panic!("never dispatched")).unwrap_err();
+        assert!(format!("{err:#}").contains("only role `radio-host` has it"), "{err:#}");
     }
 
     /// (#2916 stage 2) Several jobs may run at once: in-flight stays true

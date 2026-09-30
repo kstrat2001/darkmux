@@ -172,6 +172,9 @@ pub mod run_obs;
 /// (#2923) Which runtime image a dispatch runs, and the check that it was
 /// built for this darkmux.
 pub mod runtime_image;
+/// The radio answering seat's persona and token budget, shared by the
+/// sender's local dispatch and a fleet peer that runs it for the sender.
+pub mod radio_persona;
 pub mod select;
 // (#2112) The `PreventUserIdleSystemSleep` RAII assertion held for a
 // mission/crawl's life — see the module doc for why it does not override a

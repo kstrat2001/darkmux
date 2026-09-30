@@ -40,7 +40,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const TOKEN: &str = "e2e-fleet-token-2916";
@@ -90,6 +90,8 @@ struct MockChat {
     port: u16,
     delay_ms: Arc<AtomicU64>,
     served: Arc<AtomicUsize>,
+    /// The JSON body of every request served, in arrival order.
+    bodies: Arc<Mutex<Vec<serde_json::Value>>>,
 }
 
 impl MockChat {
@@ -103,13 +105,19 @@ impl MockChat {
         let port = listener.local_addr().unwrap().port();
         let delay_ms = Arc::new(AtomicU64::new(0));
         let served = Arc::new(AtomicUsize::new(0));
-        let (d, n) = (delay_ms.clone(), served.clone());
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let (d, n, b) = (delay_ms.clone(), served.clone(), bodies.clone());
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut s) = stream else { continue };
-                let (d, n) = (d.clone(), n.clone());
+                let (d, n, b) = (d.clone(), n.clone(), b.clone());
                 std::thread::spawn(move || {
-                    let _ = read_request(&mut s);
+                    let request = read_request(&mut s);
+                    if let Some((_, body)) = request.split_once("\r\n\r\n") {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+                            b.lock().unwrap().push(v);
+                        }
+                    }
                     std::thread::sleep(Duration::from_millis(d.load(Ordering::SeqCst)));
                     let body = serde_json::json!({
                         "id": "mock-1", "object": "chat.completion", "created": 0, "model": "mock-model",
@@ -126,7 +134,7 @@ impl MockChat {
                 });
             }
         });
-        Self { port, delay_ms, served }
+        Self { port, delay_ms, served, bodies }
     }
 }
 
@@ -179,6 +187,17 @@ fn write_identity_tool(dir: &Path, me: (&str, &str), other: (&str, &str)) -> Pat
     let out = Command::new(&tool).args(["status", "--json"]).output().unwrap();
     assert!(out.status.success(), "the fake identity tool does not run");
     tool
+}
+
+/// A stand-in for the `lms` CLI: nothing is resident, and every other
+/// command succeeds. Beta's residency reconcile reads `lms ps --json`, which
+/// must be a JSON array.
+fn write_fake_lms(dir: &Path) -> PathBuf {
+    let lms = dir.join("fake-lms");
+    std::fs::write(&lms, "#!/bin/sh\ncase \"$1\" in\n  ps) echo '[]' ;;\n  *) exit 0 ;;\nesac\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&lms, std::fs::Permissions::from_mode(0o755)).unwrap();
+    lms
 }
 
 struct Node {
@@ -268,6 +287,22 @@ fn boot(busy_policy: &str) -> Fleet {
 /// [`boot`] with beta's allow-list entry for alpha granting `profiles`, or,
 /// with `None`, no entry for alpha at all.
 fn boot_trusting(busy_policy: &str, profiles: Option<&[&str]>) -> Fleet {
+    boot_with(busy_policy, profiles, BetaModels::Hosted)
+}
+
+/// What beta's `deep` profile is, besides its hosted `cloud`.
+#[derive(Clone, Copy, PartialEq)]
+enum BetaModels {
+    /// Only `cloud`, a hosted endpoint on the mock chat server.
+    Hosted,
+    /// Also `deep`, a LOCAL-kind profile served by the mock chat server as
+    /// beta's model server, with no `docker` on beta's `PATH`: an answer that
+    /// reaches the mock took the single-shot path, and a container dispatch
+    /// could only fail.
+    HostedAndLocal,
+}
+
+fn boot_with(busy_policy: &str, profiles: Option<&[&str]>, models: BetaModels) -> Fleet {
     let accept_work = match profiles {
         Some(profiles) => serde_json::json!({"alpha": {"node_id": "nALPHA", "profiles": profiles, "roles": ["radio-host"], "workspace": false}}),
         None => serde_json::json!({}),
@@ -317,12 +352,16 @@ fn boot_trusting(busy_policy: &str, profiles: Option<&[&str]>) -> Fleet {
         .to_string(),
     )
     .unwrap();
+    let mut beta_profiles = serde_json::json!({
+        "cloud": {"models": [{"id": "mock-model", "n_ctx": 32000, "endpoint": "mock"}]}
+    });
+    if models == BetaModels::HostedAndLocal {
+        beta_profiles["deep"] = serde_json::json!({"models": [{"id": "stub-deep", "n_ctx": 8000}]});
+    }
     std::fs::write(
         beta.home.join("profiles.json"),
         serde_json::json!({
-            "profiles": {
-                "cloud": {"models": [{"id": "mock-model", "n_ctx": 32000, "endpoint": "mock"}]}
-            },
+            "profiles": beta_profiles,
             "endpoints": {"mock": {"url": format!("http://127.0.0.1:{}/v1", mock.port)}},
             "default_profile": "cloud"
         })
@@ -336,6 +375,11 @@ fn boot_trusting(busy_policy: &str, profiles: Option<&[&str]>) -> Fleet {
         let port = free_port();
         let log = node.home.join("daemon.log");
         let mut cmd = node.cmd();
+        if node.name == "beta" && models == BetaModels::HostedAndLocal {
+            cmd.env("DARKMUX_LMSTUDIO_URL", format!("http://127.0.0.1:{}", mock.port))
+                .env("DARKMUX_LMS_BIN", write_fake_lms(&node.home))
+                .env("PATH", "/usr/bin:/bin");
+        }
         cmd.args(["serve", "--bind", "127.0.0.1", "--port", &port.to_string()])
             .stdout(Stdio::null())
             .stderr(std::fs::File::create(&log).unwrap());
@@ -468,6 +512,11 @@ fn a_queued_job_is_announced_then_runs() {
     assert_eq!(f.mock.served.load(Ordering::SeqCst), 2);
 }
 
+/// The humor and per-call budget alpha's config sets: what a peer's answering
+/// seat must run under, since they differ from every default.
+const ALPHA_HUMOR: u8 = 37;
+const ALPHA_TOKEN_CAP: u32 = 3_000;
+
 /// The refusal decision radio's routing seat returns, so the exchange
 /// reaches the answering seat.
 const ROUTER_REFUSES: &str = "{\"refuse\": \"no command fits this question\"}";
@@ -488,9 +537,13 @@ fn arm_alpha_radio(f: &Fleet, seat: SeatConfig) -> (MockChat, Vec<(&'static str,
     let cfg_path = f.alpha.home.join("config.json");
     let mut cfg: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
     match seat {
-        SeatConfig::AnswererProfile(p) => cfg["radio"] = serde_json::json!({"answerer_profile": p}),
-        SeatConfig::RadioHostBinding(p) => cfg["role_profiles"] = serde_json::json!({"radio-host": p}),
+        SeatConfig::AnswererProfile(p) => cfg["radio"] = serde_json::json!({"answerer_profile": p, "humor": ALPHA_HUMOR}),
+        SeatConfig::RadioHostBinding(p) => {
+            cfg["radio"] = serde_json::json!({"humor": ALPHA_HUMOR});
+            cfg["role_profiles"] = serde_json::json!({"radio-host": p});
+        }
     }
+    cfg["runtime"] = serde_json::json!({"max_tokens_per_call": ALPHA_TOKEN_CAP});
     std::fs::write(&cfg_path, cfg.to_string()).unwrap();
     std::fs::write(
         f.alpha.home.join("profiles.json"),
@@ -557,5 +610,57 @@ fn radio_names_the_address_when_the_peer_refuses_and_never_answers_locally() {
         assert!(!String::from_utf8_lossy(&out.stdout).contains(MOCK_REPLY), "{t}");
         assert_eq!(f.mock.served.load(Ordering::SeqCst), 0, "nothing ran on beta: {t}");
         assert_eq!(router.served.load(Ordering::SeqCst), 1, "no local fallback dispatched a second call: {t}");
+    }
+}
+
+/// The completion budget a captured chat request asked for, in either dialect.
+fn requested_budget(body: &serde_json::Value) -> Option<u64> {
+    body["max_tokens"].as_u64().or_else(|| body["max_completion_tokens"].as_u64())
+}
+
+/// The system and user messages of a captured chat request.
+fn system_and_user(body: &serde_json::Value) -> (String, String) {
+    let content = |role: &str| {
+        body["messages"]
+            .as_array()
+            .and_then(|m| m.iter().find(|m| m["role"] == role))
+            .and_then(|m| m["content"].as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    (content("system"), content("user"))
+}
+
+/// What the peer's model is actually sent: the persona built by the RECEIVER
+/// from its own `radio-host` template (no raw placeholder, the humor and
+/// surface the sender configured, no specialist preamble, not the sender's
+/// own override of the template), under the token budget the sender's
+/// config sets. Runs for a hosted profile and for a local one on the peer.
+#[test]
+fn the_peer_answers_under_radios_persona_and_limits() {
+    for (models, seat) in [(BetaModels::Hosted, "cloud@beta"), (BetaModels::HostedAndLocal, "deep@beta")] {
+        let f = boot_with("refuse", Some(&["cloud", "deep"]), models);
+        // The sender's own override of the template must not reach the peer.
+        let roles = f.alpha.home.join("roles");
+        std::fs::create_dir_all(&roles).unwrap();
+        std::fs::write(roles.join("radio-host.md"), "SENDER-OVERRIDE-MARKER humor {{humor}}").unwrap();
+        let (_router, env) = arm_alpha_radio(&f, SeatConfig::AnswererProfile(seat));
+
+        let out = radio(&f.alpha, &env);
+        let t = text(&out);
+        assert!(out.status.success(), "{seat}: {t}");
+        assert!(String::from_utf8_lossy(&out.stdout).contains(MOCK_REPLY), "{seat}: {t}");
+
+        let bodies = f.mock.bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 1, "{seat}: beta's model got exactly one request: {bodies:?}");
+        let (system, user) = system_and_user(&bodies[0]);
+        assert!(system.contains("You are RADIO"), "{seat}: beta's own template: {system}");
+        assert!(!system.contains("{{"), "{seat}: no raw placeholder reaches the model: {system}");
+        assert!(system.contains(&format!("Humor setting: {ALPHA_HUMOR}%")), "{seat}: the sender's humor: {system}");
+        assert!(system.contains("darkmux mission launch <id>"), "{seat}: the CLI surface's wording: {system}");
+        assert!(!system.contains("Autonomous dispatch context"), "{seat}: no specialist preamble: {system}");
+        assert!(!system.contains("SENDER-OVERRIDE-MARKER"), "{seat}: a sender never pushes prompt text: {system}");
+        assert!(user.contains("what is running?"), "{seat}: the question arrived: {user}");
+        assert_eq!(requested_budget(&bodies[0]), Some(u64::from(ALPHA_TOKEN_CAP)), "{seat}: the sender's budget: {}", bodies[0]);
     }
 }
