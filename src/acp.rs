@@ -1926,11 +1926,17 @@ async fn answer_no_slash_refusal(
             Ok(cx.send_notification(agent_chunk(session_id, outcome.rendered))?)
         }
         Err(e) => {
-            eprintln!("[darkmux-acp] radio answering seat failed: {e:#}; falling back to the plain refusal");
-            Ok(cx.send_notification(agent_chunk(
-                session_id,
-                format!("{refusal_reason}\n\n{}", crate::acp_panel::not_a_command_message()),
-            ))?)
+            let text = match crate::radio_answer::seat_unavailable_notice(&e) {
+                Some(notice) => {
+                    eprintln!("[darkmux-acp] radio answering seat unavailable: {e:#}");
+                    notice
+                }
+                None => {
+                    eprintln!("[darkmux-acp] radio answering seat failed: {e:#}; falling back to the plain refusal");
+                    format!("{refusal_reason}\n\n{}", crate::acp_panel::not_a_command_message())
+                }
+            };
+            Ok(cx.send_notification(agent_chunk(session_id, text))?)
         }
     }
 }
@@ -3519,13 +3525,13 @@ mod tests {
         );
     }
 
-    /// A last-resort fallback specimen: when the ANSWERING seat's own
-    /// dispatch fails (e.g. no model loaded), the bare refusal reason +
-    /// live command listing render — the pre-B2 behavior, now scoped to
-    /// exactly this failure path.
+    /// When the ANSWERING seat's own dispatch fails (e.g. no model loaded),
+    /// the reply says the seat was unavailable and why. It carries neither
+    /// the router's refusal reason nor the command listing: the question was
+    /// never judged unanswerable.
     #[tokio::test]
     #[serial_test::serial]
-    async fn no_slash_refusal_falls_back_to_the_plain_listing_when_the_answering_seat_errors() {
+    async fn no_slash_refusal_says_the_seat_was_unavailable_and_why_when_it_errors() {
         let crew_tmp = tempfile::TempDir::new().unwrap();
         let _crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
         write_echo_fixture(crew_tmp.path(), "echo-fixture", "fixture output");
@@ -3535,6 +3541,37 @@ mod tests {
         };
         let answerer = |_msg: &str, _overrides: &crate::radio_answer::AnswererOverrides, _boundary: Option<crate::fleet::Boundary>| -> Result<String> {
             Err(anyhow::anyhow!("no model loaded"))
+        };
+        let (mut writer, mut reader) = spawn_test_agent(router, answerer);
+        let cwd = std::env::temp_dir();
+        let session_id = handshake(&mut writer, &mut reader, &cwd).await;
+
+        send_prompt(&mut writer, &session_id, "what's the weather like on mars?").await;
+
+        let fallback = recv_json(&mut reader).await;
+        let text = chunk_text(&fallback);
+        assert!(text.contains("the answering seat was unavailable: no model loaded"), "{text}");
+        assert!(!text.contains("outside the scope") && !text.contains("/mission launch"), "no router reason, no catalog: {text}");
+
+        let final_response = recv_json(&mut reader).await;
+        assert_end_turn(&final_response);
+    }
+
+    /// A seat that answered with text radio rejects (it named a command that
+    /// cannot be run) is not an unavailable seat: the plain refusal and the
+    /// live listing stay the fallback.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn no_slash_refusal_falls_back_to_the_plain_listing_when_the_reply_is_rejected() {
+        let crew_tmp = tempfile::TempDir::new().unwrap();
+        let _crew_guard = EnvGuard::set("DARKMUX_HOME", crew_tmp.path());
+        write_echo_fixture(crew_tmp.path(), "echo-fixture", "fixture output");
+
+        let router = |_msg: &str| -> Result<String> {
+            Ok("```json\n{\"refuse\": \"that's outside the scope of mission comms\"}\n```".to_string())
+        };
+        let answerer = |_msg: &str, _overrides: &crate::radio_answer::AnswererOverrides, _boundary: Option<crate::fleet::Boundary>| -> Result<String> {
+            Ok("Try `darkmux zzz-invented --now` for that.".to_string())
         };
         let (mut writer, mut reader) = spawn_test_agent(router, answerer);
         let cwd = std::env::temp_dir();

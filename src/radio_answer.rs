@@ -1429,11 +1429,12 @@ pub fn build_answer_message(text: &str, grounding: &str) -> String {
 ///
 /// Full grounding goes out under [`crate::fleet::Boundary::ManagedOnly`]: a
 /// peer seat's machine enforces it against the profile the job resolves to
-/// (its own registry, checked when the job arrives and again when it gets its
-/// seat), so this machine's cached card is only the first guess. When the
-/// peer refuses at that boundary, the question is asked once more with the
-/// hosted-safe grounding and no boundary, and one stderr line says so. A
-/// local seat has no peer to enforce anything, so it ignores the boundary.
+/// (its own registry). The call asks that machine first
+/// ([`submit_after_check`]), so when it says the boundary is not met, the
+/// refusal arrives here before any job was sent, and the question is asked
+/// once more with the hosted-safe grounding and no boundary, and one stderr
+/// line says so. A local seat has no peer to enforce anything, so it ignores
+/// the boundary.
 fn ask_answering_seat(
     text: &str,
     catalog: &[CatalogEntry],
@@ -1480,7 +1481,8 @@ pub fn answer(
     surface: RadioSurface,
     call: &mut AnswererCall<'_>,
 ) -> Result<AnswerOutcome> {
-    let raw = ask_answering_seat(text, catalog, shelf, cwd, scope, surface, call)?;
+    let raw = ask_answering_seat(text, catalog, shelf, cwd, scope, surface, call)
+        .map_err(|e| anyhow::Error::new(SeatUnavailable { why: format!("{e:#}") }))?;
     let reply = raw.trim().to_string();
     // (#1861 defects 1 + 2, rebuilt by #2050) The mechanical backstop.
     // A reply that names a command the operator cannot actually run here
@@ -1612,8 +1614,8 @@ fn local_when_naming_this_machine(seat: AnsweringSeat) -> AnsweringSeat {
 /// malformed address. A fleet peer is one of the operator's own machines,
 /// not a hosted endpoint: the scope is [`GroundingScope::Full`], and the peer
 /// itself enforces it: the job carries `managed_only`, and a peer whose
-/// profile is hosted refuses it ([`ask_answering_seat`] then asks again with
-/// hosted-safe grounding).
+/// profile is hosted says so when asked ([`ask_answering_seat`] then asks
+/// again with hosted-safe grounding).
 pub fn grounding_scope_for(overrides: &AnswererOverrides) -> GroundingScope {
     match resolved_answering_seat(overrides) {
         Ok(AnsweringSeat::Here { explicit }) => {
@@ -1719,13 +1721,63 @@ pub fn dispatch_answerer_call_with(
         step_id: None,
         system_prompt_override,
     };
-    let result =
+    let submit = || {
         crate::fleet::dispatch_routed_single_shot(opts, single_shot, boundary, crate::crew::dispatch::dispatch_local_single_shot)
-            .map_err(|e| match &seat_label {
-                Some(address) => e.context(format!("the answering seat `{address}`")),
-                None => e,
-            })?;
+    };
+    let result = match &seat_label {
+        None => submit()?,
+        Some(address) => submit_after_check(address, crate::crew::loader::RADIO_HOST_ROLE_ID, boundary, crate::fleet::check_route, submit)
+            .map_err(|e| e.context(format!("the answering seat `{address}`")))?,
+    };
     answer_text(&result.stdout, cap)
+}
+
+/// Submit a job to the peer seat `address` only after the receiver has said
+/// it would take it. The receiver answers `check` with every gate a real job
+/// meets (its token, the allow-list, the role and profile scope, the
+/// boundary, its seat), so a refusal comes back here typed and `submit` is
+/// never called: radio does not send a job the receiver has already said it
+/// would refuse. A peer that cannot be asked is not sent to either.
+fn submit_after_check<T>(
+    address: &str,
+    role: &str,
+    boundary: Option<crate::fleet::Boundary>,
+    check: impl FnOnce(&str, &str, Option<crate::fleet::Boundary>) -> crate::fleet::CheckOutcome,
+    submit: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    use crate::fleet::CheckOutcome;
+    match check(address, role, boundary) {
+        CheckOutcome::Routable { .. } => submit(),
+        CheckOutcome::Refused { code, reason } => Err(crate::fleet::SubmitRefused { code, reason }.into()),
+        CheckOutcome::Unanswered { detail } => Err(anyhow::anyhow!("the route could not be checked: {detail}")),
+    }
+}
+
+/// The answering seat could not answer: it was not reached, refused the
+/// question, or returned nothing. Distinct from a seat that answered with
+/// text radio then rejected, because the two mean different things to the
+/// user: this one says nothing about the question or about darkmux.
+#[derive(Debug)]
+pub struct SeatUnavailable {
+    why: String,
+}
+
+impl std::fmt::Display for SeatUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the answering seat was unavailable: {}", self.why)
+    }
+}
+
+impl std::error::Error for SeatUnavailable {}
+
+/// What to tell the user when `e` is a [`SeatUnavailable`]: that the seat
+/// was unavailable and why, and that the question went unanswered. Nothing
+/// about darkmux's features and no command catalog, because the question was
+/// never judged unanswerable. `None` for any other failure, whose surface
+/// keeps its own fallback.
+pub fn seat_unavailable_notice(e: &anyhow::Error) -> Option<String> {
+    let seat = e.chain().find_map(|c| c.downcast_ref::<SeatUnavailable>())?;
+    Some(format!("radio: {seat}. Your question was not answered."))
 }
 
 /// (#2917) The local LM Studio instance the answering seat would send to
@@ -1994,6 +2046,105 @@ mod tests {
         let (out, seen) = ask_recording(GroundingScope::RemoteSafe, |_| Ok("fine".into()));
         assert_eq!(out.unwrap(), "fine");
         assert_eq!(seen.iter().map(|(_, b)| *b).collect::<Vec<_>>(), vec![None], "safe grounding needs no boundary");
+    }
+
+    fn routable() -> crate::fleet::CheckOutcome {
+        crate::fleet::CheckOutcome::Routable {
+            profile: "host".into(),
+            report: crate::fleet::CheckReport { endpoint: crate::fleet::EndpointClass::Managed, seat: crate::fleet::SeatOutlook::Free },
+        }
+    }
+
+    /// The promise: radio never submits a job the receiver has already said
+    /// it would refuse. Every non-routable check ends before `submit`, the
+    /// refusal keeps its typed code, and an unanswered check sends nothing.
+    #[test]
+    fn a_job_the_receiver_would_refuse_is_never_submitted() {
+        use crate::fleet::{CheckOutcome, RefusalCode};
+        let submitted = std::cell::Cell::new(0);
+        let submit = || {
+            submitted.set(submitted.get() + 1);
+            Ok("sent")
+        };
+        for code in [RefusalCode::NotListed, RefusalCode::RoleNotAllowed, RefusalCode::ProfileNotAllowed, RefusalCode::Busy, RefusalCode::Boundary] {
+            let refusal = CheckOutcome::Refused { code, reason: "the receiver said no".into() };
+            let err = submit_after_check("host@studio", "radio-host", None, |_, _, _| refusal, submit).unwrap_err();
+            assert_eq!(err.downcast_ref::<crate::fleet::SubmitRefused>().map(|r| r.code), Some(code), "{err:#}");
+        }
+        let unanswered = CheckOutcome::Unanswered { detail: "studio did not answer".into() };
+        let err = submit_after_check("host@studio", "radio-host", None, |_, _, _| unanswered, submit).unwrap_err();
+        assert!(format!("{err:#}").contains("studio did not answer"), "{err:#}");
+        assert_eq!(submitted.get(), 0, "no refused or unchecked route was submitted to");
+
+        // The inverse: a routable check submits exactly once, with the address,
+        // role and boundary the caller named.
+        let asked = std::cell::RefCell::new(Vec::new());
+        let out = submit_after_check(
+            "host@studio",
+            "radio-host",
+            Some(crate::fleet::Boundary::ManagedOnly),
+            |a, r, b| {
+                asked.borrow_mut().push((a.to_string(), r.to_string(), b));
+                routable()
+            },
+            submit,
+        );
+        assert_eq!(out.unwrap(), "sent");
+        assert_eq!(submitted.get(), 1);
+        assert_eq!(asked.into_inner(), [("host@studio".to_string(), "radio-host".to_string(), Some(crate::fleet::Boundary::ManagedOnly))]);
+    }
+
+    /// The whole chain: a check that says `boundary` moves the question to
+    /// the safe grounding decided from the CHECK, and nothing is submitted
+    /// for the first ask.
+    #[test]
+    fn a_boundary_check_refusal_re_asks_safe_without_a_submit() {
+        use crate::fleet::{Boundary, CheckOutcome, RefusalCode};
+        let submits = std::cell::RefCell::new(Vec::new());
+        let shelf = ArtifactShelf::default();
+        let out = ask_answering_seat("what is loaded?", &fixture_catalog(), &shelf, Path::new("/tmp"), GroundingScope::Full, RadioSurface::Cli, &mut |m: &str, b| {
+            submit_after_check(
+                "host@studio",
+                "radio-host",
+                b,
+                |_, _, boundary| match boundary {
+                    Some(Boundary::ManagedOnly) => CheckOutcome::Refused { code: RefusalCode::Boundary, reason: "hosted".into() },
+                    _ => routable(),
+                },
+                || {
+                    submits.borrow_mut().push((m.len(), b));
+                    Ok("the safe answer".to_string())
+                },
+            )
+        });
+        assert_eq!(out.unwrap(), "the safe answer");
+        let submits = submits.into_inner();
+        assert_eq!(submits.len(), 1, "only the re-ask is ever sent");
+        assert_eq!(submits[0].1, None);
+    }
+
+    /// A seat that could not answer says so and why, and asserts nothing
+    /// about darkmux and lists no commands. A seat that answered with a reply
+    /// radio rejects keeps the plain-refusal fallback (no notice).
+    #[test]
+    fn a_seat_that_could_not_answer_is_reported_as_unavailable() {
+        let shelf = ArtifactShelf::default();
+        let mut refused_call = |_: &str, _: Option<crate::fleet::Boundary>| -> Result<String> {
+            Err(refused(crate::fleet::RefusalCode::NotListed))
+        };
+        let err = answer("what is a profile?", &fixture_catalog(), &shelf, Path::new("/tmp"), GroundingScope::Full, RadioSurface::Cli, &mut refused_call)
+            .unwrap_err();
+        let notice = seat_unavailable_notice(&err.context("dispatching the radio answering seat")).expect("a seat failure has a notice");
+        assert!(notice.contains("the answering seat was unavailable") && notice.contains("the peer said no"), "{notice}");
+        assert!(notice.contains("not answered"), "{notice}");
+        for banned in ["Available commands", "mission launch", "does not define", "darkmux does not"] {
+            assert!(!notice.contains(banned), "{banned}: {notice}");
+        }
+        assert!(notice.lines().count() <= 2, "one or two sentences: {notice}");
+
+        let mut invented = |_: &str, _: Option<crate::fleet::Boundary>| -> Result<String> { Ok("Run `darkmux zzz-invented` now.".into()) };
+        let err = answer("hi", &fixture_catalog(), &shelf, Path::new("/tmp"), GroundingScope::Full, RadioSurface::Cli, &mut invented).unwrap_err();
+        assert_eq!(seat_unavailable_notice(&err), None, "a rejected reply is not an unavailable seat: {err:#}");
     }
 
     #[test]
