@@ -61,7 +61,9 @@ darkmux release.
     machine with the card it states about itself. It is no longer the reachability
     probe plus `--deep` specs: `probe_ms`, `resolved_address`, `dialed_address`,
     `reachable`, `specs` and the four `specs_*` flags are gone, and each row is
-    `{entry, is_this_machine, liveness, last_beat_ms, card}`. See "Fleet awareness"
+    `{entry, is_this_machine, machine_uid, uid_source, liveness, last_beat_ms,
+    received_at_ms, fetch_ms, card, accepts}`, with a row for this machine always
+    present (`entry` is `null` when the roster has none). See "Fleet awareness"
     under Added.
   - `dispatch` (`--json`): the runtime's keys print in the order `result`,
     `final_assistant`, `trajectory_path`, `failed_tool_invocations`,
@@ -1163,39 +1165,66 @@ darkmux release.
 
 ### Added (4.0)
 
-- **Fleet awareness: one view every machine reads** (#3004, part 1). Every daemon
-  serves `GET /machine/card`, one typed `MachineCard` describing that machine
-  truthfully: its identity and specs (the `/machine/specs` document), its
+- **Fleet awareness: one view every machine reads** (#3004). A machine's card, one
+  typed `MachineCard`, travels between machines on ONE channel: its fleet listener,
+  `GET /fleet/card`, the only surface that can say who is calling. It describes the
+  machine truthfully: its identity and specs (the `/machine/specs` document), its
   profiles with each endpoint's kind (`managed`, `unmanaged`, `mixed` or
   `unresolved`, from the same target resolution dispatch uses) and models, its
-  seats (held and free per class, and the busy policy) when its fleet listener
-  runs, and its governor state (the OS thermal word, the battery reading and
-  the battery gate the operator wrote; the gate's decision is `null` when no
-  sampler ran). The fleet listener also serves `GET /fleet/card`, behind its
-  gate: the same card plus `accepts`, the calling machine's own allow-list
-  entry and no other. That is the only place a grant is stated, so the daemon's
-  card has no `accepts`. Every daemon also serves `GET /fleet/view`, a
-  `FleetView` with a row per roster machine: liveness from presence, and the
-  card fetched from the peer itself over the verified peer path (its listener
-  first, then its daemon; in parallel, single-flight, cached 5 s, recorded as
-  `cache_ttl_ms`). Each row says which endpoint answered (`source`) and what
-  the peer accepts from this machine (`accepts`: `granted` with the entry,
-  `refused` with the peer's own reason, or `unknown` with why: its listener is
-  off, it could not answer, or no node was verified). A card that is another
-  machine's is a `mismatch` and is not attributed to the row. An unreachable
-  peer says why (`bad_address`, `dns_failed`, `identity_unavailable`,
-  `not_on_overlay`, `pin_mismatch`, `auth_required`, `connect_failed`,
-  `bad_answer`), a peer on an older darkmux shows `card unavailable (peer
-  <version>)`, and a peer presence reports gone is not dialed. Cards never come
-  from Redis. `darkmux machine list` prints this view (this machine's own
-  daemon's when one runs, else one gathered in process and marked `gathered_by:
+  seats when its fleet listener runs, and its governor state (the OS thermal word,
+  the battery reading and the battery gate the operator wrote; the gate's decision
+  is `null` when no sampler ran). Every daemon serves `GET /fleet/view`, a
+  `FleetView` with a row per roster machine and always a row for this machine,
+  gathered in parallel, single-flight, cached 5 s (`cache_ttl_ms`), from each
+  peer's listener over the verified peer path and never from Redis. A machine is
+  visible to every fleet node that authenticates, whether or not it lets that node
+  run work. `darkmux machine list` prints the view (this machine's own daemon's
+  when one runs, else one gathered in process and marked `gathered_by:
   cli_process`, with this machine's seats, thermal state and battery not
-  observed); `--json` prints the `FleetView`. A machine's card is visible to
-  its peers with `accepts` only while its fleet listener is enabled. Both
-  daemon routes and the listener route are in `route-table.golden`, and their
-  types have generated twins. The card listener route takes a per-node slot of
-  its own, so a sender whose jobs fill its request slots still gets its card.
-  Work submission and card reads now dial the listener over plain http whatever
+  observed); `--json` prints the `FleetView`. The contracts, one line each:
+  - `GET /machine/card` is retired: the daemon serves no card, and a machine reads
+    its own card from its own row of `GET /fleet/view`. There is no daemon
+    fallback: a peer whose listener is off is `unreachable` with reason
+    `listener_off`.
+  - `GET /fleet/card` authenticates (the fleet token, the sender's node, not this
+    machine) and does not require an allow-list entry; it answers
+    `ListenerCard { card, grant }` with `grant` one of `listed` (with the caller's
+    own entry and no other), `not_listed` or `unknown`. A job still authorizes:
+    `darkmux_fleet::admit` is `authenticate` then `authorize`.
+  - A row carries `accepts` (`granted` with the entry, `not_listed`,
+    `this_machine`, `withheld` or `unknown`) beside `card`, no longer inside it.
+    `accepts` and each card's seat block go only to this machine or a token holder
+    (the doctor panel's audience); any other reader gets `withheld` and no seats.
+  - A row carries a resolved `machine_uid` and its `uid_source` (`card`,
+    `declared` or `flow_history`), `received_at_ms` (this machine's clock) and
+    `fetch_ms`. This machine is recognized by the verified node behind an entry's
+    address, else by uid, else by name, so a roster alias folds into its row and
+    is not dialed; `GET /fleet/roster` and the view read one roster.
+  - Every roster peer is dialed: presence is display only, `liveness` is `live`,
+    `no_beat` or `unknown` (`gone` and the `presence_gone` reason are removed).
+  - A card that cannot be read says why: `unavailable` carries `why`
+    (`no_card_route`, `other_schema_major` or `unparseable`) and the peer's version
+    with its source (`peer` or `presence`, the peer's own answer preferred).
+    Unreachable reasons are `bad_address`, `dns_failed`, `identity_unavailable`,
+    `not_on_overlay`, `pin_mismatch`, `listener_off`, `auth_required`,
+    `refused_by_peer`, `listener_unavailable` and `bad_answer` (`connect_failed` is
+    now `listener_off`).
+  - Seats state facts only: `seats.local` is `[{model, held_by_peer_job}]`,
+    `seats.hosted` is `{held_by_peer_jobs, cap}`, and `seats.counts_own_work` is
+    `false`; `free_models` and `hosted.free` are removed, since the listener does
+    not see this machine's own dispatches. `seats.busy_policy` is the wire enum
+    `CardBusyPolicy` (`refuse`, `queue`, `unknown`).
+  - Every enum on a card or a view, and `ReplyStatus` on the work wire, has an
+    `unknown` arm: a value a newer darkmux invents reads as `unknown` and the rest
+    of the card is shown, and `unknown` is never read as a known value. A card
+    carries `cache_ttl_ms`, and its shape is tied to `CARD_SCHEMA_VERSION` (1.0) by
+    a golden hash and committed 1.0 fixtures.
+  - Cost: the serving machine caches its card 2 s and its identity lookups for
+    card reads 10 s (a job never reads that cache), the per-address connection cap
+    is 6 (was 3) so waited jobs cannot starve card reads, and the flow-history uid
+    scan runs at most every 5 minutes.
+  Both routes are in `route-table.golden`, and their types have generated twins.
+  Work submission and card reads dial the listener over plain http whatever
   scheme the roster address wrote.
 - **Radio's answering seat can run on a fleet peer.** Set `radio.answerer_profile`
   (or `role_profiles.radio-host`) to `<profile>@<machine>` and the seat's dispatch

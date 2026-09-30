@@ -979,7 +979,7 @@ pub(crate) fn resolved_roster(flows_dir: &std::path::Path) -> Result<ResolvedRos
     Ok(ResolvedRoster { machines, uid_from_history })
 }
 
-/// GET /fleet/roster (#1855) — the operator's DECLARED fleet topology
+/// GET /fleet/roster (#1855): the operator's DECLARED fleet topology
 /// (`darkmux machine add`'s `fleet.json`), independent of whether any of it
 /// is beating right now.
 ///
@@ -987,7 +987,7 @@ pub(crate) fn resolved_roster(flows_dir: &std::path::Path) -> Result<ResolvedRos
 /// half of #1855: `/fleet/machines/live` only ever reports a machine that is
 /// currently publishing a presence beat, so a machine the operator
 /// deliberately added and which is down, unreachable, or has simply never
-/// started its daemon produced no card, no offline row, nothing — it read
+/// started its daemon produced no card, no offline row, nothing: it read
 /// as though it had never been added. Roster membership is a SEPARATE
 /// question from liveness, and the viewer needs both to tell "not on my
 /// fleet" from "on my fleet, not answering right now".
@@ -1000,7 +1000,7 @@ pub(crate) fn resolved_roster(flows_dir: &std::path::Path) -> Result<ResolvedRos
 ///
 /// Never 500s. A missing file is an empty roster (`load_roster`'s own
 /// fresh-install contract, not an error); a PRESENT but corrupt file
-/// reports the parse failure in `error` (a fixed literal — see
+/// reports the parse failure in `error` (a fixed literal, see
 /// [`ROSTER_READ_FAILED`]'s own doc on why, not the underlying error text)
 /// rather than silently discarding the roster and answering as if nothing
 /// were ever added.

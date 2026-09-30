@@ -802,18 +802,37 @@ async fn card_handler(State(state): State<FleetListenerState>, Extension(auth): 
     }
 }
 
+/// A caller the gate authenticated AND the allow-list lists: what a job needs
+/// and a card read does not. The gate does not require the allow-list entry;
+/// this extractor reads it, and refuses with the listener's own sentence when
+/// the authenticated node has none.
+struct Authorized(Admitted);
+
+#[axum::async_trait]
+impl axum::extract::FromRequestParts<FleetListenerState> for Authorized {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &FleetListenerState,
+    ) -> Result<Self, Self::Rejection> {
+        let peer = parts.extensions.get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip());
+        let Some(auth) = parts.extensions.get::<Authenticated>().cloned() else {
+            let detail = "the request did not pass the gate".to_string();
+            let provider = state.provider.provider_name().to_string();
+            return Err(refuse(state, peer, &Refusal::IdentityUnavailable { provider, detail }));
+        };
+        state.admission().authorize(auth.node).await.map(Authorized).map_err(|r| refuse(state, peer, &r))
+    }
+}
+
 async fn submit_handler(
     State(state): State<FleetListenerState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
-    Extension(auth): Extension<Authenticated>,
+    Authorized(admitted): Authorized,
     Extension(token): Extension<TokenFingerprint>,
     body: Bytes,
 ) -> Response {
-    // A job needs the allow-list entry the gate did not require.
-    let admitted = match state.admission().authorize(auth.node).await {
-        Ok(a) => a,
-        Err(r) => return refuse(&state, Some(peer_addr.ip()), &r),
-    };
     // (#2947 review M1) A job this machine would refuse at its dispatch
     // preflight (a bad enum config value) is refused HERE, synchronously,
     // before a seat is taken or the job is accepted: otherwise the sender

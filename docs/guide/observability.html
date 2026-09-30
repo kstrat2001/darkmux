@@ -200,11 +200,7 @@ curl -s http://127.0.0.1:8765/health
       </tr>
       <tr>
         <td><code>GET /machine/specs</code></td>
-        <td>Version, machine id, RAM, CPU brand, OS and loaded models (<code>MachineSpecsResponse</code>). The machine card embeds it.</td>
-      </tr>
-      <tr>
-        <td><code>GET /machine/card</code></td>
-        <td>What this machine says about itself: the specs, its profiles and each endpoint's kind (<code>managed</code>, <code>unmanaged</code>, <code>mixed</code> or <code>unresolved</code>), its seats and busy policy, and its thermal and battery state (<code>MachineCard</code>). It states no grant: what this machine accepts from a caller is served by the fleet listener at <code>GET /fleet/card</code>, which returns the same card with the verified caller's own allow-list entry (<code>ListenerCard</code>).</td>
+        <td>Version, machine id, RAM, CPU brand, OS and loaded models (<code>MachineSpecsResponse</code>). The machine card, which travels on the fleet listener, embeds it.</td>
       </tr>
       <tr>
         <td><code>GET /machine/resources</code></td>
@@ -216,7 +212,7 @@ curl -s http://127.0.0.1:8765/health
       </tr>
       <tr>
         <td><code>GET /fleet/view</code></td>
-        <td>One row per roster machine: liveness from presence and the machine's own card, fetched from the peer's fleet listener (else its daemon) over the verified peer path, in parallel and cached for 5 seconds, with which endpoint answered and what the peer accepts from this machine (<code>FleetView</code>). Backs <code>darkmux machine list</code>.</td>
+        <td>One row per roster machine, and always a row for this machine: presence as a display column, the machine's own card (this machine&rsquo;s built locally, a peer&rsquo;s fetched from its fleet listener over the verified peer path, in parallel and cached for 5 seconds), its resolved hardware uid, and what the machine accepts from this one (<code>FleetView</code>). <code>accepts</code> and seats are shown only to this machine or a token holder. Backs <code>darkmux machine list</code>. A machine&rsquo;s card is served to its peers by its fleet listener at <code>GET /fleet/card</code>, not by the daemon.</td>
       </tr>
       <tr>
         <td><code>GET /lab/runs, GET /lab/run/detail, GET /lab/run/events</code></td>

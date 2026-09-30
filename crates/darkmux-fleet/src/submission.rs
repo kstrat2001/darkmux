@@ -1004,6 +1004,13 @@ pub fn submit_work(job: WorkJob, wait: bool) -> Result<SubmissionReply> {
             }
             Err(other) => other,
         })?;
+    reply_outcome(&target, code, reply)
+}
+
+/// What a receiver's final reply means to the sender: the reply for a job it
+/// took, an error for one it did not, ran badly, or answered in a status this
+/// darkmux does not know (never read as taken).
+fn reply_outcome(target: &str, code: u16, reply: SubmissionReply) -> Result<SubmissionReply> {
     match reply.status {
         ReplyStatus::Completed | ReplyStatus::Accepted | ReplyStatus::Queued => Ok(reply),
         ReplyStatus::Error => Err(anyhow!(
@@ -1176,6 +1183,16 @@ mod tests {
             authenticate(TokenCheck::Match, || Err("down".into()), "t", peer, None),
             Err(Refusal::IdentityUnavailable { .. })
         ));
+    }
+
+    /// A status this darkmux does not know is an error to the sender, whatever
+    /// else the reply carries: never a job that was taken.
+    #[test]
+    fn an_unrecognized_final_status_is_an_error_not_a_taken_job() {
+        let reply = SubmissionReply { exit_code: Some(0), ..SubmissionReply::of(ReplyStatus::Unknown) };
+        let err = reply_outcome("studio", 200, reply).unwrap_err().to_string();
+        assert!(err.contains("does not recognize"), "{err}");
+        assert!(reply_outcome("studio", 200, SubmissionReply::of(ReplyStatus::Completed)).is_ok());
     }
 
     /// A reply status a newer darkmux sends reads as `unknown`, not as a parse
