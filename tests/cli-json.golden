@@ -51,7 +51,6 @@ Attribution = "per_process" | "estimated" | "unavailable"
 BatteryCharge
   charge_pct: uint8
   on_ac: boolean
-  charging: boolean
   state: ChargeState
   minutes_to_empty: uint32 | null
 BatteryHealthNow

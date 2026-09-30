@@ -1685,7 +1685,7 @@ mod tests {
                     on_ac: false,
                     charging: false,
                     state: ChargeState::Discharging,
-                minutes_to_empty: Some(184),
+                    minutes_to_empty: Some(184),
                 }),
             },
         };

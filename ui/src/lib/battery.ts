@@ -39,7 +39,7 @@ function fmtHm(totalMinutes: number): string {
 export type BatteryIconKind = "bolt" | "plug" | null;
 
 export function batteryIcon(b: BatteryCharge): BatteryIconKind {
-  if (b.charging) return "bolt";
+  if (b.state === "charging") return "bolt";
   if (b.on_ac) return "plug";
   return null;
 }
@@ -52,7 +52,7 @@ export function batteryIcon(b: BatteryCharge): BatteryIconKind {
  * rule already governs `minutes_to_empty` on the wire; this just states
  * what arrives, in words. */
 export function batteryStateText(b: BatteryCharge): string {
-  if (b.charging) return "charging";
+  if (b.state === "charging") return "charging";
   if (b.state === "held") return `held at ${b.charge_pct}% by macOS, on AC, not charging`;
   if (b.on_ac) return "on AC, not charging";
   const time = b.minutes_to_empty != null ? `, ${fmtHm(b.minutes_to_empty)} left` : "";

@@ -16,10 +16,10 @@ const RESOURCES = JSON.parse(fs.readFileSync(path.join(__dirname, "corpus", "mac
 const SIZED = { glyph: ".battery-bar", row: ".battery-bar-row", fill: ".battery-bar-fill" };
 
 const STATES = [
-  { id: "held", battery: { charge_pct: 80, on_ac: true, charging: false, state: "held", minutes_to_empty: null }, held: true },
-  { id: "charging", battery: { charge_pct: 80, on_ac: true, charging: true, state: "charging", minutes_to_empty: null }, held: false },
-  { id: "discharging", battery: { charge_pct: 80, on_ac: false, charging: false, state: "discharging", minutes_to_empty: 130 }, held: false },
-  { id: "full", battery: { charge_pct: 100, on_ac: true, charging: false, state: "full", minutes_to_empty: null }, held: false },
+  { id: "held", battery: { charge_pct: 80, on_ac: true, state: "held", minutes_to_empty: null }, held: true },
+  { id: "charging", battery: { charge_pct: 80, on_ac: true, state: "charging", minutes_to_empty: null }, held: false },
+  { id: "discharging", battery: { charge_pct: 80, on_ac: false, state: "discharging", minutes_to_empty: 130 }, held: false },
+  { id: "full", battery: { charge_pct: 100, on_ac: true, state: "full", minutes_to_empty: null }, held: false },
 ];
 
 // Desktop is checked at three battery-block widths, 868 (the shared desktop viewport), 1470 (the

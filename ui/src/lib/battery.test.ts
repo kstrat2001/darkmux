@@ -17,7 +17,7 @@ import type { BatteryHealthNow } from "../types/generated/BatteryHealthNow";
 import type { BatteryCharge } from "../types/generated/BatteryCharge";
 
 function sample(over: Partial<BatteryCharge> = {}): BatteryCharge {
-  return { charge_pct: 78, on_ac: false, charging: false, state: "discharging", minutes_to_empty: 130, ...over };
+  return { charge_pct: 78, on_ac: false, state: "discharging", minutes_to_empty: 130, ...over };
 }
 
 function health(over: Partial<BatteryHealthNow> = {}): BatteryHealthNow {
@@ -46,18 +46,18 @@ function health(over: Partial<BatteryHealthNow> = {}): BatteryHealthNow {
 //    that state has to say instead. ─────────────────────────────────────
 describe("batteryIcon", () => {
   it("bolt while charging (current actually flowing)", () => {
-    expect(batteryIcon(sample({ on_ac: true, charging: true }))).toBe("bolt");
+    expect(batteryIcon(sample({ on_ac: true, state: "charging" }))).toBe("bolt");
   });
   it("plug when on AC but NOT charging — topped off/held, never a false bolt", () => {
-    expect(batteryIcon(sample({ on_ac: true, charging: false }))).toBe("plug");
+    expect(batteryIcon(sample({ on_ac: true, state: "unknown" }))).toBe("plug");
   });
   it("no icon while discharging", () => {
-    expect(batteryIcon(sample({ on_ac: false, charging: false }))).toBeNull();
+    expect(batteryIcon(sample({ on_ac: false }))).toBeNull();
   });
 });
 
 describe("held state (macOS holding the charge level)", () => {
-  const held = sample({ charge_pct: 80, on_ac: true, charging: false, state: "held", minutes_to_empty: null });
+  const held = sample({ charge_pct: 80, on_ac: true, state: "held", minutes_to_empty: null });
 
   it("names the held level in the tooltip, and never states a limit it did not observe", () => {
     expect(batteryHeldTitle(held)).toBe("Held at 80% by macOS (charge limit): plugged in, not charging");
@@ -84,10 +84,10 @@ describe("held state (macOS holding the charge level)", () => {
 
 describe("batteryStateText", () => {
   it('"charging" while current is flowing', () => {
-    expect(batteryStateText(sample({ on_ac: true, charging: true }))).toBe("charging");
+    expect(batteryStateText(sample({ on_ac: true, state: "charging" }))).toBe("charging");
   });
   it('"on AC, not charging" when connected but topped off', () => {
-    expect(batteryStateText(sample({ on_ac: true, charging: false }))).toBe("on AC, not charging");
+    expect(batteryStateText(sample({ on_ac: true, state: "unknown" }))).toBe("on AC, not charging");
   });
   it('"on battery, H h M m left" while discharging with an estimate', () => {
     expect(batteryStateText(sample({ on_ac: false, minutes_to_empty: 130 }))).toBe("on battery, 2 h 10 m left");
@@ -99,8 +99,8 @@ describe("batteryStateText", () => {
 
 describe("batteryTimeLeftText — the ONLY visible power-state text left (icon carries the rest)", () => {
   it("is null on AC, charging or not — the icon carries that state now", () => {
-    expect(batteryTimeLeftText(sample({ on_ac: true, charging: true }))).toBeNull();
-    expect(batteryTimeLeftText(sample({ on_ac: true, charging: false }))).toBeNull();
+    expect(batteryTimeLeftText(sample({ on_ac: true, state: "charging" }))).toBeNull();
+    expect(batteryTimeLeftText(sample({ on_ac: true, state: "unknown" }))).toBeNull();
   });
   it("reads the time-left estimate while discharging", () => {
     expect(batteryTimeLeftText(sample({ on_ac: false, minutes_to_empty: 130 }))).toBe("2 h 10 m left");
@@ -194,12 +194,12 @@ describe("fmtOperatingHours", () => {
 
 describe("batteryAriaLabel", () => {
   it("states percent, on AC, not charging", () => {
-    expect(batteryAriaLabel(sample({ charge_pct: 100, on_ac: true, charging: false }))).toBe(
+    expect(batteryAriaLabel(sample({ charge_pct: 100, on_ac: true, state: "unknown" }))).toBe(
       "battery 100%, on AC, not charging",
     );
   });
   it("states percent and charging", () => {
-    expect(batteryAriaLabel(sample({ charge_pct: 62, on_ac: true, charging: true }))).toBe("battery 62%, charging");
+    expect(batteryAriaLabel(sample({ charge_pct: 62, on_ac: true, state: "charging" }))).toBe("battery 62%, charging");
   });
   it("states percent, on battery, and a time-left estimate while discharging", () => {
     expect(batteryAriaLabel(sample({ charge_pct: 35, on_ac: false, minutes_to_empty: 130 }))).toBe(

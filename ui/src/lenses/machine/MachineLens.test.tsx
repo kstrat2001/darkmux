@@ -715,7 +715,7 @@ const LOAD_WITH_EXTRAS = {
     gpu_mem_bytes: null,
     thermal: { state: "fair", cpu_speed_limit_pct: 87 },
     power_mw: null,
-    battery: { charge_pct: 78, on_ac: false, charging: false, state: "discharging", minutes_to_empty: 130 },
+    battery: { charge_pct: 78, on_ac: false, state: "discharging", minutes_to_empty: 130 },
   },
   window: {
     samples: 3,
@@ -827,15 +827,17 @@ describe("MachineLens — battery surfaces (#2821, lens only)", () => {
   function machineWithBattery(battery: {
     charge_pct: number;
     on_ac: boolean;
-    charging: boolean;
+    /** Test shorthand only: `true` means state "charging". Never sent on the wire. */
+    charging?: boolean;
     state?: BatteryCharge["state"];
     minutes_to_empty?: number | null;
   }) {
+    const { charging, ...wire } = battery;
     return {
       specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max" },
       resources: {
         ...RESOURCES,
-        load: { ...LOAD_WITH_EXTRAS, now: { ...LOAD_WITH_EXTRAS.now, battery: { state: "unknown", minutes_to_empty: null, ...battery } } },
+        load: { ...LOAD_WITH_EXTRAS, now: { ...LOAD_WITH_EXTRAS.now, battery: { state: charging ? "charging" : "unknown", minutes_to_empty: null, ...wire } } },
       },
     };
   }
@@ -906,7 +908,7 @@ describe("MachineLens — battery surfaces (#2821, lens only)", () => {
   });
 
   it("held: a marker at the held level and a labeled tooltip; the other states draw neither", async () => {
-    mockMachineFetch(machineWithBattery({ charge_pct: 80, on_ac: true, charging: false, state: "held" }));
+    mockMachineFetch(machineWithBattery({ charge_pct: 80, on_ac: true, state: "held" }));
     const { container } = renderMachine(null);
     await waitFor(() => expect(screen.getByText("80%")).toBeInTheDocument());
     const mark = container.querySelector(".battery-bar-hold")!;
@@ -919,7 +921,7 @@ describe("MachineLens — battery surfaces (#2821, lens only)", () => {
     cleanup();
 
     for (const state of ["charging", "discharging", "full", "unknown"] as const) {
-      mockMachineFetch(machineWithBattery({ charge_pct: 80, on_ac: true, charging: state === "charging", state }));
+      mockMachineFetch(machineWithBattery({ charge_pct: 80, on_ac: true, state }));
       const r = renderMachine(null);
       await waitFor(() => expect(screen.getByText("80%")).toBeInTheDocument());
       expect(r.container.querySelector(".battery-bar-hold"), state).toBeNull();
@@ -929,7 +931,7 @@ describe("MachineLens — battery surfaces (#2821, lens only)", () => {
   });
 
   it("held: an (i) button after the label explains the hold on focus, and is absent in other states", async () => {
-    mockMachineFetch(machineWithBattery({ charge_pct: 80, on_ac: true, charging: false, state: "held" }));
+    mockMachineFetch(machineWithBattery({ charge_pct: 80, on_ac: true, state: "held" }));
     const { container } = renderMachine(null);
     await waitFor(() => expect(screen.getByText("80%")).toBeInTheDocument());
     const btn = screen.getByRole("button", { name: "what held means" });

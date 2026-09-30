@@ -6,7 +6,7 @@ import type { ChargeState } from "./ChargeState";
  * battery. `minutes_to_empty` is `null` on AC, while charging, and whenever
  * the OS declines to estimate; never a synthesized zero.
  */
-export type BatteryCharge = { charge_pct: number, on_ac: boolean, charging: boolean, 
+export type BatteryCharge = { charge_pct: number, on_ac: boolean, 
 /**
  * What the pack is doing, derived once by the probe from the facts it observed.
  */

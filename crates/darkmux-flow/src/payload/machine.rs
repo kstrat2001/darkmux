@@ -86,7 +86,6 @@ pub enum ChargeState {
 pub struct BatteryCharge {
     pub charge_pct: u8,
     pub on_ac: bool,
-    pub charging: bool,
     /// What the pack is doing, derived once by the probe from the facts it observed.
     pub state: ChargeState,
     pub minutes_to_empty: Option<u32>,
