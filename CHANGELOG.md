@@ -1136,6 +1136,16 @@ darkmux release.
 
 ### Fixed (4.0)
 
+- **`darkmux doctor`'s `crew/` merge script and its flat-mission check now
+  agree.** The script moved pre-#148 flat mission files into `missions/`, where
+  the `mission state files` check then refused them and told you to run a
+  `mission migrate` that no longer exists. The script now keeps flat mission and
+  phase files and `crew/sprints` in `<root>/archive/pre-148-missions/` (kept,
+  `mv -n`, never deleted), and the check's remedy is the same move. The script
+  is wrapped in `bash <<'DARKMUX_CREW_MERGE'` so it also runs when pasted into
+  zsh, where an unmatched `.[!.]*` glob aborts, and doctor prints that block
+  unwrapped at column zero, since word-wrapping split its long quoted paths.
+
 - **`darkmux doctor` names why a `profiles.json` that exists does not load**,
   and all of it at once. The `profile registry` row prints the whole cause
   chain instead of "parsing JSON", and suggests `darkmux init` only when there
@@ -1163,6 +1173,15 @@ darkmux release.
   malformed address for either key, `doctor` no longer reports a `radio-host`
   address binding as an undefined profile, and a new `radio peer seat` check
   warns when the address names a machine that is not in the roster.
+
+- **An optional, one-time upgrade skill for a 3.x home**,
+  `docs/upgrade/darkmux-upgrade/SKILL.md`. An agent follows it to apply what
+  `darkmux doctor` names: back the home up, then fix `config.json`,
+  `profiles.json`, missions and the rest in order, never overwriting, keeping the
+  user's own notes, and asking before any judgment call. It is not bundled and
+  `darkmux init` does not install it; `darkmux doctor` links it when it finds
+  retired keys, spellings or paths, and the getting-started guide describes it.
+
 - **`darkmux mission show <id>`** and the panel's `/mission show <id>`: one
   mission in full, from one derivation. The config it was launched from and
   its declared inputs, every phase, task and step with status, tokens, turns
