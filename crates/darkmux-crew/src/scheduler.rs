@@ -414,6 +414,14 @@ pub fn gather_inputs(
 
 // ─── The scheduler loop ─────────────────────────────────────────────────
 
+/// A step that completed but whose own work partly failed: see
+/// [`StepOutcome::degraded`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DegradedStep {
+    pub step_id: String,
+    pub reason: String,
+}
+
 /// Summary of one `run_step_graph` call: which steps completed, which
 /// errored, and how many wave iterations it took. Steps left `Planned`
 /// at the end (possible only if their owning Task's dependency chain
@@ -426,6 +434,11 @@ pub fn gather_inputs(
 #[derive(Debug, Default, Clone)]
 pub struct SchedulerReport {
     pub completed: Vec<String>,
+    /// Steps that completed with part of their own work failed
+    /// ([`StepOutcome::degraded`]): also in `completed`, since downstream
+    /// steps read their output, but a run's verdict must not read Clean over
+    /// them.
+    pub degraded: Vec<DegradedStep>,
     pub errored: Vec<String>,
     pub iterations: usize,
     pub warnings: Vec<String>,
@@ -823,6 +836,7 @@ pub fn run_step_graph(
                             None,
                             Err(reason),
                             Vec::new(),
+                            None,
                         );
                     }
                 }
@@ -1077,6 +1091,7 @@ pub fn run_step_graph(
                         None,
                         Err(format!("{e:#}")),
                         Vec::new(),
+                        None,
                     );
                     continue;
                 }
@@ -1096,6 +1111,7 @@ pub fn run_step_graph(
                             None,
                             Err(format!("{e:#}")),
                             Vec::new(),
+                            None,
                         );
                     }
                 }
@@ -1287,6 +1303,7 @@ pub fn run_step_graph(
                     match result {
                         Ok(outcome) => {
                             let output = outcome.output;
+                            let degraded = outcome.degraded;
                             // Stream the terminal transition LIVE. The main
                             // thread applies it (status + `completed_ts` +
                             // lifecycle record + persist) on receipt, freezing
@@ -1297,6 +1314,7 @@ pub fn run_step_graph(
                                 wall_ms,
                                 result: Ok(output.clone()),
                                 flow_records: outcome.flow_records,
+                                degraded,
                             });
                             // The returned value is consumed by `run_bounded`
                             // for index accounting + panic reconciliation only;
@@ -1312,6 +1330,7 @@ pub fn run_step_graph(
                                 wall_ms,
                                 result: Err(format!("{e:#}")),
                                 flow_records: Vec::new(),
+                                degraded: None,
                             });
                             Err(e)
                         }
@@ -1386,7 +1405,7 @@ pub fn run_step_graph(
                         step.started_ts = Some(at);
                         persist(step);
                     }
-                    crate::step_kinds::WaveSignal::StepTerminal { index, at, wall_ms, result, flow_records } => {
+                    crate::step_kinds::WaveSignal::StepTerminal { index, at, wall_ms, result, flow_records, degraded } => {
                         apply_step_terminal(
                             run,
                             steps,
@@ -1399,6 +1418,7 @@ pub fn run_step_graph(
                             Some(wall_ms),
                             result,
                             flow_records,
+                            degraded,
                         );
                         applied.insert(index);
                     }
@@ -1446,6 +1466,7 @@ pub fn run_step_graph(
                 None,
                 result,
                 flow_records,
+                None,
             );
         }
 
@@ -1497,6 +1518,7 @@ fn apply_step_terminal(
     wall_ms: Option<u64>,
     result: std::result::Result<String, String>,
     flow_records: Vec<FlowRecord>,
+    degraded: Option<String>,
 ) {
     let step = steps.get_mut(id).expect("id came from ready_ids itself");
     for record in flow_records {
@@ -1538,6 +1560,9 @@ fn apply_step_terminal(
             emit(step_lifecycle_record(run, step, darkmux_flow::FlowAction::StepComplete));
             persist(step);
             report.completed.push(id.to_string());
+            if let Some(reason) = degraded {
+                report.degraded.push(DegradedStep { step_id: id.to_string(), reason });
+            }
         }
         Err(message) => {
             step.status = NodeStatus::Error;
@@ -3826,7 +3851,7 @@ mod tests {
                 None => (step.id.clone(), false, false),
             };
             self.log.lock().unwrap().push(entry);
-            Ok(StepOutcome { output: "ok".to_string(), flow_records: vec![] })
+            Ok(StepOutcome { output: "ok".to_string(), flow_records: vec![], degraded: None })
         }
     }
 
@@ -3912,6 +3937,59 @@ mod tests {
         assert!(!solo.1, "ungrouped step receives no scheduler-shared bucket (step-scoped instead)");
     }
 
+    /// A model-free step kind that completes with `degraded` set, standing in
+    /// for a `dispatch.map` where some items failed.
+    struct DegradedKind;
+    impl StepKind for DegradedKind {
+        fn dispatch_role(&self, _s: &Step, _t: &Task, _i: &BTreeMap<String, String>, _c: &StepRunCtx) -> Option<String> {
+            None
+        }
+        fn seat(&self, _s: &Step, _t: &Task, _i: &BTreeMap<String, String>, _c: &StepRunCtx) -> SeatClaim {
+            SeatClaim::NoModel
+        }
+        fn id(&self) -> &'static str {
+            "test.degraded"
+        }
+        fn run(&self, _s: &Step, _t: &Task, _i: &BTreeMap<String, String>, _c: &StepRunCtx) -> Result<StepOutcome> {
+            Ok(StepOutcome { output: "partial".to_string(), flow_records: vec![], degraded: Some("1 of 2 item(s) failed".to_string()) })
+        }
+    }
+
+    /// A step that completes degraded stays `Complete` (downstream reads its
+    /// output) and is reported in `SchedulerReport::degraded`, so a caller
+    /// building a verdict cannot read the run as Clean.
+    #[test]
+    #[serial_test::serial]
+    fn a_degraded_step_completes_and_is_reported_degraded() {
+        let (ta, sa) = kinded_step("a", "test.degraded", json!({}), &[]);
+        let (tasks, mut steps) = graph(vec![(ta, sa)]);
+        let kinds = StepKindRegistry::new();
+        kinds.register(Arc::new(DegradedKind)).unwrap();
+        let report = run_step_graph(
+            &crate::test_run(),
+            &mut steps,
+            &tasks,
+            &kinds,
+            &Facts::default(),
+            &FixedEstimator::default(),
+            8,
+            &mock_host_factory,
+            &mut |_| {},
+            &mut |_step| {},
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(steps["a-step"].status, NodeStatus::Complete);
+        assert_eq!(steps["a-step"].output.as_deref(), Some("partial"));
+        assert_eq!(
+            report.degraded,
+            vec![DegradedStep { step_id: "a-step".to_string(), reason: "1 of 2 item(s) failed".to_string() }]
+        );
+        assert!(report.errored.is_empty());
+    }
+
     // ─── #1530 Packet 0: the run-scoped `ArtifactBus` ──────────────────
 
     /// (#1530 Packet 0) Declares ONE `Artifact` port (`"test.shared-log"`,
@@ -3961,7 +4039,7 @@ mod tests {
                 .artifact::<Mutex<Vec<String>>>("test.shared-log")
                 .expect("the scheduler materialized this port from `provides()` before the wave ran");
             log.lock().unwrap().push(step.id.clone());
-            Ok(StepOutcome { output: "wrote".to_string(), flow_records: vec![] })
+            Ok(StepOutcome { output: "wrote".to_string(), flow_records: vec![], degraded: None })
         }
     }
 
@@ -4006,7 +4084,7 @@ mod tests {
                 .artifact::<Mutex<Vec<String>>>("test.shared-log")
                 .expect("the writer step's `provides()` materialized this port for the whole run");
             let seen = log.lock().unwrap().join(",");
-            Ok(StepOutcome { output: seen, flow_records: vec![] })
+            Ok(StepOutcome { output: seen, flow_records: vec![], degraded: None })
         }
     }
 
@@ -4089,7 +4167,7 @@ mod tests {
         fn run(&self, step: &Step, _t: &Task, _i: &BTreeMap<String, String>, _ctx: &StepRunCtx) -> Result<StepOutcome> {
             let ms = step.config.get("sleep_ms").and_then(|v| v.as_u64()).unwrap_or(0);
             std::thread::sleep(std::time::Duration::from_millis(ms));
-            Ok(StepOutcome { output: step.id.clone(), flow_records: vec![] })
+            Ok(StepOutcome { output: step.id.clone(), flow_records: vec![], degraded: None })
         }
     }
 
@@ -4568,7 +4646,7 @@ mod tests {
             (self.0)()
         }
         fn run(&self, _s: &Step, _t: &Task, _i: &BTreeMap<String, String>, _ctx: &StepRunCtx) -> Result<StepOutcome> {
-            Ok(StepOutcome { output: "declared".to_string(), flow_records: vec![] })
+            Ok(StepOutcome { output: "declared".to_string(), flow_records: vec![], degraded: None })
         }
     }
 
@@ -5074,7 +5152,7 @@ mod tests {
             Self::role_of(step, task)
         }
         fn run(&self, _step: &Step, _task: &Task, _input: &BTreeMap<String, String>, _ctx: &StepRunCtx) -> Result<StepOutcome> {
-            Ok(StepOutcome { output: "ok".to_string(), flow_records: vec![] })
+            Ok(StepOutcome { output: "ok".to_string(), flow_records: vec![], degraded: None })
         }
         /// (#2614 review, MUST FIX) Stands in for `dispatch.internal`'s
         /// real `resume_precheck` — reads an optional `resume_from` string
@@ -5189,7 +5267,7 @@ mod tests {
             Self::role_of(ctx)
         }
         fn run(&self, _step: &Step, _task: &Task, _input: &BTreeMap<String, String>, _ctx: &StepRunCtx) -> Result<StepOutcome> {
-            Ok(StepOutcome { output: "ok".to_string(), flow_records: vec![] })
+            Ok(StepOutcome { output: "ok".to_string(), flow_records: vec![], degraded: None })
         }
     }
 
@@ -5689,7 +5767,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(15));
             let real_wall_ms = t0.elapsed().as_millis() as u64;
             let reported_ms = self.report_ms_override.unwrap_or(real_wall_ms);
-            Ok(StepOutcome { output: reported_ms.to_string(), flow_records: vec![] })
+            Ok(StepOutcome { output: reported_ms.to_string(), flow_records: vec![], degraded: None })
         }
     }
 
@@ -5881,7 +5959,7 @@ mod tests {
                 }));
                 ctx.emit(rec);
             }
-            Ok(StepOutcome { output: "done".to_string(), flow_records: vec![] })
+            Ok(StepOutcome { output: "done".to_string(), flow_records: vec![], degraded: None })
         }
     }
 
@@ -5956,7 +6034,7 @@ mod tests {
                 .and_then(|v| v.as_str())
                 .unwrap_or("[]")
                 .to_string();
-            Ok(StepOutcome { output: out, flow_records: vec![] })
+            Ok(StepOutcome { output: out, flow_records: vec![], degraded: None })
         }
     }
 
@@ -6136,7 +6214,7 @@ mod tests {
             _i: &BTreeMap<String, String>,
             _ctx: &StepRunCtx,
         ) -> anyhow::Result<StepOutcome> {
-            Ok(StepOutcome { output: String::new(), flow_records: Vec::new() })
+            Ok(StepOutcome { output: String::new(), flow_records: Vec::new(), degraded: None })
         }
     }
 

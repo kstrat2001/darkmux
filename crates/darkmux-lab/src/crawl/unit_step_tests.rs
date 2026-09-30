@@ -2143,6 +2143,32 @@ fn graph_step(id: &str, task_id: &str, kind: &str, config: serde_json::Value) ->
     }
 }
 
+/// The crawl kinds that run no model claim `NoModel`, so they schedule under
+/// the dispatch-free cap instead of queueing behind the hosted-endpoint cap
+/// (#2394). Re-classing any of the three must redden this.
+#[test]
+fn the_crawl_kinds_that_run_no_model_claim_no_model() {
+    use darkmux_crew::step_kinds::{SeatClaim, StepKind, StepRunCtx};
+    let kinds: [(&dyn StepKind, &str); 3] = [
+        (&super::super::plan_step::CrawlPlanStepKind, "crawl.plan"),
+        (&super::super::plan_sites_step::PlanSitesStepKind, "plan.sites"),
+        (&CrawlSummaryStepKind, "crawl.summary"),
+    ];
+    let ctx = StepRunCtx::new(
+        darkmux_types::session_id::RunId::mission("seat-table").unwrap(),
+        None,
+        None,
+        None,
+        std::sync::Arc::new(darkmux_crew::step_kinds::ArtifactBus::new()),
+    );
+    for (kind, id) in kinds {
+        assert_eq!(kind.id(), id);
+        let step = graph_step("s1", "t1", id, serde_json::json!({}));
+        let claim = kind.seat(&step, &graph_task("t1", "s1", &[]), &BTreeMap::new(), &ctx);
+        assert!(matches!(claim, SeatClaim::NoModel), "`{id}` must claim NoModel");
+    }
+}
+
 #[test]
 #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
 fn two_units_and_a_summary_run_through_the_real_scheduler() {

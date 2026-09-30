@@ -638,6 +638,7 @@ impl StepKind for MissionWorktreeStepKind {
         Ok(StepOutcome {
             output: ctx.wt_path.display().to_string(),
             flow_records: Vec::new(),
+            degraded: None,
         })
     }
 }
@@ -958,6 +959,7 @@ impl StepKind for MissionCoderStepKind {
         Ok(StepOutcome {
             output: stdout,
             flow_records: Vec::new(),
+            degraded: None,
         })
     }
 
@@ -1113,6 +1115,7 @@ impl StepKind for MissionVerifyStepKind {
                 Ok(StepOutcome {
                     output: verdict,
                     flow_records: Vec::new(),
+                    degraded: None,
                 })
             }
             Err(e) => {

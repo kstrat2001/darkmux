@@ -1150,6 +1150,8 @@ darkmux release.
 ### Fixed (4.0)
 
 - **A daemon resumes publishing to the fleet hub on its own after an outage (#3023).** The Redis flow sink used to disable itself after three failures "for the rest of the process", so a hub restart left a long-lived `darkmux serve` silent until someone restarted it, and the other machines never saw what it did meanwhile. `darkmux serve` now probes the hub on a capped backoff (2s doubling to 60s, each probe bounded by the 500 ms connect timeout), re-enables when it answers, and re-sends its own records from the local day files (current and previous UTC day, in `ts` order, from the first record that failed) as stream entries marked `late`; readers already de-duplicate by record identity. CLI invocations keep the old behavior. `/health` carries `hub_link` (`connected`, or `unreachable` with since and reason; this machine only) and `darkmux doctor` has a `flow hub link` row.
+- **A `dispatch.map` step whose every item failed is an errored step, and one with some failed items reads degraded.** The step used to complete regardless, so a mission where every item errored could finish Clean with exit 0. Now all items failing fails the step with the first item's error. Some items failing keeps the step `complete` (its output still reaches later steps) but marks the mission envelope `degraded`, with a warning naming the step and how many items failed. No shipped mission config uses `dispatch.map` today, so this affects your own configs.
+
 - **The daemon's peer mission-graph proxy no longer sends the fleet token to a peer whose pin is not saved.** On first contact it verified the peer's node but never pinned it, and attached the token anyway. `fleet_get` and `fleet_post_json` now take only a `SettledTarget`, which exists only after the first-contact pin was written to the roster (or the target needed none: loopback, this machine, already pinned). The proxy pins on first contact like a work submission, and with an unwritable roster it sends nothing. The pin is written compare-and-set under the roster lock: a removed entry, an edited address, or a different node pinned meanwhile refuses instead of pinning the wrong node. `machine status <id>` and `machine resources <id>` go through the same single pin helper. A dispatch that stays on this machine under a `managed_only` boundary is now refused when its profile resolves to a hosted endpoint.
 - **An interrupted lab run keeps its trajectory (#3014).** A run stopped with
   Ctrl-C or SIGTERM left its trajectory only in a temp directory, so
@@ -1216,6 +1218,8 @@ darkmux release.
   say it did not load, with the cause, instead of "no profile registry".
 
 ### Added (4.0)
+
+- **`run stats` counts the model calls that reported no usage** (`calls_unreported`, RunStats 2.1.0, `--json` too). A call that reports no usage adds 0 to the token figures, so a partly reported run read as a smaller run. Above zero, `completion_tokens` and `reasoning_tokens` are a lower bound, and the run's unreconciled list says so.
 
 - **The fleet work wire is `major.minor` and grows by minors from here; the
   receiver enforces a data boundary; a check asks "would this route work"; every

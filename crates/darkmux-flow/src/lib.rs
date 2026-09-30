@@ -3985,6 +3985,52 @@ mod tests {
         assert_eq!(parsed.machine_id.as_deref(), Some("studio"));
     }
 
+    /// A sink that remembers the provenance each record arrived with.
+    struct ProvenanceSink(std::sync::Mutex<Vec<(Option<String>, Option<String>)>>);
+    impl FlowSink for ProvenanceSink {
+        fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
+            let r = record.get();
+            self.0.lock().unwrap().push((r.machine_id.clone(), r.machine_uid.clone()));
+            Ok(())
+        }
+        fn info(&self) -> SinkInfo {
+            SinkInfo { kind: "Provenance".into(), config: Default::default(), children: vec![], raw_url: None }
+        }
+    }
+
+    /// A record that already names its machine (one forwarded from another
+    /// machine) keeps that identity; only an absent one is stamped with this
+    /// machine's. Stamping over a preset id would attribute a peer's work to
+    /// the local machine.
+    #[serial_test::serial]
+    #[test]
+    fn record_to_keeps_a_preset_machine_id_and_uid_and_stamps_absent_ones() {
+        isolate_test_env_once();
+        let prev = env::var("DARKMUX_MACHINE_ID").ok();
+        unsafe { env::set_var("DARKMUX_MACHINE_ID", "local-machine") };
+        let sink = ProvenanceSink(Default::default());
+
+        let mut forwarded = minimal_record();
+        forwarded.machine_id = Some("peer-machine".to_string());
+        forwarded.machine_uid = Some("PEER-UID".to_string());
+        record_to(&sink, forwarded).unwrap();
+        record_to(&sink, minimal_record()).unwrap();
+
+        unsafe {
+            match prev {
+                Some(v) => env::set_var("DARKMUX_MACHINE_ID", v),
+                None => env::remove_var("DARKMUX_MACHINE_ID"),
+            }
+        }
+        let seen = sink.0.lock().unwrap().clone();
+        assert_eq!(seen[0], (Some("peer-machine".to_string()), Some("PEER-UID".to_string())), "a preset identity wins");
+        assert_eq!(
+            seen[1],
+            (Some("local-machine".to_string()), darkmux_hardware::machine_uid().map(str::to_string)),
+            "an absent identity is stamped with this machine's"
+        );
+    }
+
     #[serial_test::serial]
     #[test]
     fn record_auto_populates_machine_id() {

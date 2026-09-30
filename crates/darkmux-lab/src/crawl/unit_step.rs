@@ -1220,6 +1220,7 @@ impl StepKind for CrawlUnitStepKind {
                     )
                     .to_output_string()?,
                     flow_records: Vec::new(),
+                    degraded: None,
                 });
             }
         }
@@ -1557,6 +1558,7 @@ impl StepKind for CrawlUnitStepKind {
             )
             .to_output_string()?,
             flow_records: Vec::new(),
+            degraded: None,
         })
     }
 }
@@ -1698,6 +1700,7 @@ impl StepKind for CrawlSummaryStepKind {
             )
             .to_output_string()?,
             flow_records: Vec::new(),
+            degraded: None,
         })
     }
 }

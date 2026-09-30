@@ -250,6 +250,7 @@ impl StepKind for ModsGateStepKind {
         Ok(StepOutcome {
             output: serde_json::to_string(&summary).context("serializing the gate summary")?,
             flow_records: Vec::new(),
+            degraded: None,
         })
     }
 }

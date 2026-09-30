@@ -162,6 +162,7 @@ mod tests {
             Ok(StepOutcome {
                 output: "stub".to_string(),
                 flow_records: Vec::new(),
+                degraded: None,
             })
         }
     }
@@ -179,6 +180,98 @@ mod tests {
             "procedural.shell" | "procedural.noop" => SessionScope::None,
             _ => return None,
         })
+    }
+
+    /// The scheduling class a kind's seat claim puts it in, for pinning by
+    /// value. Matched exhaustively: a new `SeatClaim` variant is a compile
+    /// error here, not a silently unclassified seat.
+    #[derive(Debug, PartialEq, Eq)]
+    enum SeatClass {
+        Local,
+        Remote,
+        NoModel,
+        Unresolved,
+    }
+
+    impl SeatClass {
+        fn of(claim: &SeatClaim) -> Self {
+            match claim {
+                SeatClaim::LocalModel(_) => SeatClass::Local,
+                SeatClaim::RemoteEndpoint => SeatClass::Remote,
+                SeatClaim::NoModel => SeatClass::NoModel,
+                SeatClaim::LocalModelUnresolved { .. } => SeatClass::Unresolved,
+            }
+        }
+    }
+
+    /// The seat class each crew-crate step kind MUST claim, with a
+    /// representative step config where the answer depends on it. The kinds
+    /// that run no model (`procedural.*`, `mods.gate`, `records.gather`,
+    /// `deliver.github_review`) must be `NoModel`: claiming `Remote` puts them
+    /// behind the hosted-endpoint cap, which a mission launch sets to 1, so
+    /// independent shell and gate steps run one at a time (#2394).
+    fn expected_seat(kind_id: &str) -> Option<(SeatClass, serde_json::Value)> {
+        use serde_json::json;
+        let endpoint = json!({ "url": "https://h.example/v1" });
+        Some(match kind_id {
+            "procedural.shell" | "procedural.noop" | "mods.gate" | "records.gather" | "deliver.github_review" => {
+                (SeatClass::NoModel, json!({}))
+            }
+            "dispatch.single_shot" => (SeatClass::Remote, json!({ "model": "m", "user": "hi", "endpoint": endpoint })),
+            "dispatch.map" => (
+                SeatClass::Remote,
+                json!({ "model": "m", "user_template": "check {item}", "collection": ["a"], "endpoint": endpoint }),
+            ),
+            // No role on the task or in config: nothing to resolve.
+            "dispatch.internal" => (SeatClass::Unresolved, json!({})),
+            _ => return None,
+        })
+    }
+
+    #[test]
+    fn every_crew_step_kind_claims_the_seat_class_pinned_for_it() {
+        let registry = StepKindRegistry::with_builtins();
+        for extra in [
+            Arc::new(super::super::mods_gate::ModsGateStepKind) as Arc<dyn StepKind>,
+            Arc::new(super::super::records_gather::RecordsGatherStepKind),
+            Arc::new(super::super::deliver_github_review::DeliverGithubReviewStepKind),
+        ] {
+            registry.register(extra).expect("distinct ids");
+        }
+        assert_eq!(registry.ids().len(), 8, "five builtins plus the three dispatch-free crew kinds: {:?}", registry.ids());
+        for id in registry.ids() {
+            let (expected, config) = expected_seat(&id).unwrap_or_else(|| {
+                panic!("step kind `{id}` is registered but has no row in `expected_seat`; state whether it claims a model")
+            });
+            let kind = registry.get(&id).unwrap();
+            let step = Step {
+                id: "s1".to_string(),
+                task_id: "t1".to_string(),
+                gate: None,
+                kind: id.clone(),
+                status: crate::types::NodeStatus::Planned,
+                config,
+                started_ts: None,
+                completed_ts: None,
+                output: None,
+            };
+            let task = Task {
+                run_on: crate::types::default_run_on(),
+                id: "t1".to_string(),
+                phase_id: "p1".to_string(),
+                description: "t".to_string(),
+                display_name: None,
+                step_ids: vec!["s1".to_string()],
+                depends_on: Vec::new(),
+                reads: Vec::new(),
+                role_id: None,
+                profile_name: None,
+                workdir: None,
+                image: None,
+            };
+            let claim = kind.seat(&step, &task, &BTreeMap::new(), &StepRunCtx::for_test());
+            assert_eq!(SeatClass::of(&claim), expected, "`{id}` claims a different seat class than the one pinned");
+        }
     }
 
     #[test]

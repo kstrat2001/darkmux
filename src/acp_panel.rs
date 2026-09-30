@@ -43,7 +43,7 @@
 
 use crate::crew::mission_config::{self, LaunchParams, MissionConfig};
 use crate::crew::scheduler::SchedulerReport;
-use crate::crew::step_kinds::{Facts, FixedEstimator, StepKindRegistry};
+use crate::crew::step_kinds::{FixedEstimator, StepKindRegistry};
 use crate::crew::types::{NodeStatus, Step, Task};
 use darkmux_flow::payload::{GhVerbExecutedPayload, RunPayload};
 use darkmux_types::session_id::{RunId, SessionId};
@@ -784,10 +784,7 @@ pub fn run_ephemeral(
 
     let tasks: BTreeMap<String, Task> = ordered_tasks.iter().map(|t| (t.id.clone(), t.clone())).collect();
     let registry = StepKindRegistry::with_builtins();
-    let facts = Facts {
-        utility_binding: crate::crew::concurrent_dispatch::standing_utility_binding(None),
-        ..Facts::default()
-    };
+    let facts = crate::crew::concurrent_dispatch::standing_facts(None);
     let est = FixedEstimator::default();
 
     // (#1684 QA finding — MUST-FIX 4) A per-INVOCATION run, the one every

@@ -31,6 +31,51 @@
         }
     }
 
+    /// The seat class of each coder-phase kind, pinned by value: the worktree
+    /// kind runs no model (`NoModel`, so it schedules under the dispatch-free
+    /// cap, #2394); the coder and the verify (code-reviewer) seats need a local
+    /// model, and with no run context on the artifact bus say so as an
+    /// unresolved local seat rather than claiming no model.
+    #[test]
+    fn coder_phase_kinds_claim_the_seat_class_pinned_for_each() {
+        use crew::step_kinds::SeatClaim;
+        let kinds: [(&dyn StepKind, bool); 3] = [
+            (&MissionWorktreeStepKind, true),
+            (&MissionVerifyStepKind, false),
+            (&MissionCoderStepKind, false),
+        ];
+        let ctx = StepRunCtx::new(
+            crate::test_run(),
+            None,
+            None,
+            None,
+            Arc::new(crew::step_kinds::ArtifactBus::new()),
+        );
+        let task = test_task("t1");
+        for (kind, no_model) in kinds {
+            let step = crew::types::Step {
+                id: "s1".to_string(),
+                task_id: "t1".to_string(),
+                gate: None,
+                kind: kind.id().to_string(),
+                status: NodeStatus::Planned,
+                config: serde_json::Value::Null,
+                started_ts: None,
+                completed_ts: None,
+                output: None,
+            };
+            let claim = kind.seat(&step, &task, &std::collections::BTreeMap::new(), &ctx);
+            match (claim, no_model) {
+                (SeatClaim::NoModel, true) | (SeatClaim::LocalModelUnresolved { .. }, false) => {}
+                (_, expected_no_model) => panic!(
+                    "`{}` claims the wrong seat class (expected {})",
+                    kind.id(),
+                    if expected_no_model { "NoModel" } else { "an unresolved local seat" }
+                ),
+            }
+        }
+    }
+
     /// The coder's tokens are the dispatch result's fold, never a second read
     /// of the model-writable out-dir: here the out-dir holds a trajectory
     /// reporting 999 tokens and the fold 130. With no fold the count is zero,

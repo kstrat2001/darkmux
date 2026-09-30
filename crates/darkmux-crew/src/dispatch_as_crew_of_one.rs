@@ -52,7 +52,7 @@ use crate::dispatch::{DispatchOpts, DispatchResult};
 use darkmux_types::session_id::{RunId, SessionId};
 use crate::envelope::{MissionEnvelope, MissionOutcomeStatus};
 use crate::lifecycle;
-use crate::step_kinds::{Facts, FixedEstimator, RawDispatchOutcome, StepKindRegistry};
+use crate::step_kinds::{FixedEstimator, RawDispatchOutcome, StepKindRegistry};
 use crate::types::{Mission, MissionSpec, MissionStatus, NodeStatus, Phase, PhaseStatus, Step, Task};
 use anyhow::{anyhow, bail, Context, Result};
 use darkmux_gestalt::ModelHost;
@@ -191,10 +191,7 @@ pub(crate) fn dispatch_as_crew_of_one_with(
     let mut tasks: BTreeMap<String, Task> = BTreeMap::new();
     tasks.insert(task_id, task);
 
-    let facts = Facts {
-        utility_binding: crate::concurrent_dispatch::standing_utility_binding(opts.config_path.as_deref()),
-        ..Facts::default()
-    };
+    let facts = crate::concurrent_dispatch::standing_facts(opts.config_path.as_deref());
     let est = FixedEstimator::default();
 
     let graph_result = crate::scheduler::run_step_graph(
@@ -760,7 +757,7 @@ mod tests {
                 out_dir: None,
             };
             let output = serde_json::to_string(&payload).unwrap();
-            Ok(StepOutcome { output, flow_records: Vec::new() })
+            Ok(StepOutcome { output, flow_records: Vec::new(), degraded: None })
         }
 
         /// (#2394) A LOCAL model seat, said explicitly — this fixture
@@ -1199,6 +1196,55 @@ mod tests {
         assert!(calls.lock().unwrap().is_empty(), "the step ran");
         let minted = std::fs::read_dir(crate::loader::missions_dir()).map(|d| d.count()).unwrap_or(0);
         assert_eq!(minted, 0, "a mission was minted before the refusal");
+    }
+
+    /// The utility binding at this launcher's own seam: a crew-of-one dispatch
+    /// whose registry names a standing utility model leaves that resident
+    /// loaded, while the same dispatch with no utility registered evicts it as
+    /// an orphan (the inverse, which proves the assertion can fail).
+    #[test]
+    #[serial_test::serial]
+    fn a_crew_of_one_dispatch_holds_the_registrys_standing_utility_resident() {
+        use darkmux_gestalt::mock::HostOp;
+        let _guard = RunGuard::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut unloads = Vec::new();
+        for (name, internal) in [
+            ("with", r#","internal":{"utility":{"id":"util-4b","n_ctx":32000}}"#),
+            ("without", ""),
+        ] {
+            let pf = dir.path().join(format!("{name}.json"));
+            std::fs::write(&pf, format!(r#"{{"profiles":{{"p":{{"models":[{{"id":"m","n_ctx":4096}}]}}}}{internal}}}"#)).unwrap();
+            let kind = FakeDispatchKind {
+                exit_code: 0,
+                stdout: "ok".to_string(),
+                stderr: String::new(),
+                should_err: false,
+                placement: placement(),
+                calls: Arc::new(Mutex::new(Vec::new())),
+            };
+            let registry = test_registry(kind);
+            let host = Arc::new(Mutex::new(
+                MockHost::new()
+                    .resident("darkmux:util-4b", "util-4b", 32_000, Some(1_000))
+                    .cataloged("test-model", 5_000_000_000),
+            ));
+            let host_for_factory = host.clone();
+            let host_factory = move || -> Box<dyn darkmux_gestalt::ModelHost> {
+                Box::new(SharedMockHost(host_for_factory.clone()))
+            };
+            let mut opts = test_opts("coder", "x");
+            opts.config_path = Some(pf.to_string_lossy().to_string());
+            dispatch_as_crew_of_one_with(opts, &registry, &host_factory).unwrap();
+            let evicted = host
+                .lock()
+                .unwrap()
+                .ops
+                .iter()
+                .any(|op| matches!(op, HostOp::Unload { identifier } if identifier == "darkmux:util-4b"));
+            unloads.push((name, evicted));
+        }
+        assert_eq!(unloads, vec![("with", false), ("without", true)]);
     }
 
     #[test]
