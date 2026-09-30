@@ -437,8 +437,7 @@ fn route_missing_message(id: &str, path: &str, address: &str) -> String {
 /// readings; with no daemon running, the view is gathered here and says so
 /// (`gathered_by`).
 pub(crate) fn cmd_machine_list(emit_json: bool) -> Result<i32> {
-    let view = darkmux_serve::fleet_view::fetch_local_daemon_view(&darkmux_types::config_access::serve_client_addr())
-        .unwrap_or_else(darkmux_serve::fleet_view::gather_fleet_view_now);
+    let view = crate::machine_list::local_fleet_view();
     if emit_json {
         // (#776) Machine-readable output stays byte-clean: force color off so
         // any accidental downstream style call can't leak ANSI into the JSON.
@@ -1717,6 +1716,42 @@ mod trust_tests {
         let mut after_minus = after.clone();
         after_minus["fleet"]["accept_work"].as_object_mut().unwrap().remove("workbook");
         assert_eq!(after_minus, before, "nothing but fleet.accept_work.workbook changed");
+    }
+
+    /// The receiver's refusal remedy, fed back to the real `machine trust`
+    /// parser and core, admits the sender under the entry the allow-list and
+    /// roster already key it by. Following it must not add a second key for
+    /// the same node.
+    #[test]
+    fn the_refusal_remedy_targets_the_existing_allow_list_key() {
+        use clap::Parser;
+        let node = provider().peers[0].clone();
+        let roster: fleet::FleetRoster = serde_json::from_value(serde_json::json!({
+            "machines": { "Laptop-Mac": { "id": "Laptop-Mac", "address": "laptop.tailnet-example.ts.net:8765", "added_unix_ms": 1 } }
+        }))
+        .unwrap();
+        let job = serde_json::json!({ "job": { "role_id": "radio-host", "published_by_machine": "laptop" } });
+        let ask = fleet::TrustAsk::for_sender(&node, &roster, &serde_json::to_vec(&job).unwrap());
+        let said = fleet::Refusal::NotAllowed { node_name: node.name.clone(), ask }.reason("studio");
+        let command = said.split('`').nth(1).expect("the remedy is one backticked command");
+
+        let argv: Vec<String> = command.replace("<profile>", "host").split_whitespace().map(str::to_string).collect();
+        let crate::cli::Cmd::Machine { sub: Some(crate::cli::MachineCmd::Trust { name, node: node_hint, profiles, roles: asked_roles, .. }) } =
+            crate::cli::Cli::try_parse_from(&argv).expect("the printed command parses").command
+        else {
+            panic!("`{command}` did not parse as `machine trust`");
+        };
+
+        let d = tempfile::TempDir::new().unwrap();
+        let p = cfg(&d, r#"{"fleet":{"accept_work":{"Laptop-Mac":{"node_id":"nOLD","profiles":["coder-studio"],"roles":["coder"]}}}}"#);
+        let roster_host = fleet::find_machine(&roster, &name).unwrap().and_then(|e| fleet::address_host(&e.address));
+        let req = TrustRequest { name: &name, node_hint: node_hint.as_deref(), profiles: &profiles, roles: &asked_roles, ..Default::default() };
+        trust_at(&p, &req, &provider(), &registry(), &roles(), roster_host.as_deref()).unwrap();
+
+        let after: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        let keys: Vec<&String> = after["fleet"]["accept_work"].as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["Laptop-Mac"], "the remedy `{command}` must update the existing key, not add one");
+        assert_eq!(entry(&p, "Laptop-Mac")["node_id"], "nLAPTOP");
     }
 
     #[test]

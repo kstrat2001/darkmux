@@ -284,8 +284,9 @@ pub enum Refusal {
     IdentityUnavailable { provider: String, detail: String },
     /// No node on the overlay holds the connecting address.
     NotOnOverlay { provider: String, addr: String },
-    /// A node, but not one on the allow-list.
-    NotAllowed { node_name: String },
+    /// A node, but not one on the allow-list. `ask` says which
+    /// `darkmux machine trust` command admits it.
+    NotAllowed { node_name: String, ask: TrustAsk },
     /// The allow-list names the same node under several machine names.
     AmbiguousEntry { names: Vec<String> },
     /// Addressed to another machine name.
@@ -365,7 +366,65 @@ impl OutOfScope {
     }
 }
 
+/// What the receiver's `darkmux machine trust` needs to admit a sender that
+/// is on no allow-list entry. Resolved once by [`TrustAsk::for_sender`] and
+/// printed by [`TrustAsk::command`], so the sentence names an entry the
+/// receiver's own tools resolve.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrustAsk {
+    /// The NAME argument: the receiver's roster id for the verified node,
+    /// or the machine id the sender claimed. `None` names the node itself.
+    pub name: Option<String>,
+    /// `--node`: needed when NAME is not the roster entry of the node
+    /// (a claimed id), because the lookup then has no roster address to use.
+    pub node: Option<String>,
+    /// The role the job asked for.
+    pub role: Option<String>,
+}
+
+impl TrustAsk {
+    /// The ask for `node`, refused with `body` (the job it posted, read
+    /// loosely: only its role and claimed machine id, each kept only when
+    /// well formed). When the receiver's `roster` has an entry for the node,
+    /// that entry's id is NAME and the roster address finds the node. Else
+    /// the sender's claimed id is NAME, with `--node` naming the node.
+    pub fn for_sender(node: &NodeIdentity, roster: &crate::roster::FleetRoster, body: &[u8]) -> Self {
+        let job = serde_json::from_slice::<serde_json::Value>(body).ok().and_then(|v| v.get("job").cloned());
+        let text = |field: &str| job.as_ref().and_then(|j| j.get(field)).and_then(|f| f.as_str()).map(str::to_string);
+        let role = text("role_id").filter(|r| crate::job::validate_work_identifier("role_id", r).is_ok());
+        let on_roster = roster.machines.values().find(|m| {
+            node.answers_to(&m.id) || crate::roster::address_host(&m.address).is_some_and(|h| node.answers_to(&h))
+        });
+        if let Some(entry) = on_roster {
+            return Self { name: Some(entry.id.clone()), node: None, role };
+        }
+        let claimed = text("published_by_machine")
+            .filter(|c| darkmux_types::profile_address::machine_name_problem(c).is_none());
+        match claimed {
+            Some(c) => Self { name: Some(c), node: Some(node.name.clone()), role },
+            None => Self { name: None, node: None, role },
+        }
+    }
+
+    /// The command, for a node the network calls `node_name`.
+    fn command(&self, node_name: &str) -> String {
+        let name = self.name.as_deref().unwrap_or(node_name);
+        let node = self.node.as_ref().map(|n| format!(" --node {n}")).unwrap_or_default();
+        let role = self.role.as_deref().unwrap_or("<role>");
+        format!("darkmux machine trust {name}{node} --profiles <profile> --roles {role}")
+    }
+}
+
 impl Refusal {
+    /// This refusal with `ask` as the trust command, when it is a
+    /// [`Refusal::NotAllowed`]; any other refusal is returned unchanged.
+    pub fn with_trust_ask(self, ask: TrustAsk) -> Self {
+        match self {
+            Refusal::NotAllowed { node_name, .. } => Refusal::NotAllowed { node_name, ask },
+            other => other,
+        }
+    }
+
     /// HTTP status for the reply.
     pub fn http_status(&self) -> u16 {
         match self {
@@ -435,10 +494,9 @@ impl Refusal {
                 "{receiver} does not accept work from {addr}: the connection did not come from a \
                  node on the {provider} network (a LAN or public address is never accepted)"
             ),
-            Refusal::NotAllowed { node_name } => format!(
-                "{receiver} does not accept work from {node_name} (on {receiver}: `darkmux machine \
-                 trust {node_name} --profiles <profile>`)"
-            ),
+            Refusal::NotAllowed { node_name, ask } => {
+                format!("{receiver} does not accept work from {node_name} (on {receiver}: `{}`)", ask.command(node_name))
+            }
             Refusal::AmbiguousEntry { names } => format!(
                 "{receiver}'s allow-list names the sending machine more than once ({}); \
                  remove all but one with `darkmux machine untrust <name>` on {receiver}",
@@ -613,7 +671,7 @@ fn match_entry(
         .filter(|(_, e)| e.node_id.as_deref().is_some_and(|id| !id.is_empty() && id == node_id))
         .collect();
     match matches.as_slice() {
-        [] => Err(Refusal::NotAllowed { node_name: node_name.to_string() }),
+        [] => Err(Refusal::NotAllowed { node_name: node_name.to_string(), ask: TrustAsk::default() }),
         [(name, entry)] => Ok(Admitted {
             peer_name: (*name).clone(),
             node_id: node_id.to_string(),
@@ -1456,7 +1514,7 @@ mod tests {
                     let want: std::result::Result<String, fn(&Refusal) -> bool> = match (t, n, p) {
                         (TokenCheck::Mismatch, _, _) => Err(|r| matches!(r, Refusal::Token)),
                         (TokenCheck::NotConfigured, _, _) => Err(|r| matches!(r, Refusal::NoTokenConfigured)),
-                        (_, Node::Unknown, _) => Err(|r| matches!(r, Refusal::NotAllowed { node_name } if node_name == "phone")),
+                        (_, Node::Unknown, _) => Err(|r| matches!(r, Refusal::NotAllowed { node_name, .. } if node_name == "phone")),
                         (_, Node::NotOnOverlay, _) => Err(|r| matches!(r, Refusal::NotOnOverlay { .. })),
                         (_, Node::Unresolvable, _) => Err(|r| matches!(r, Refusal::IdentityUnavailable { .. })),
                         (_, Node::Allowed, Prof::InScope) => Ok("host".to_string()),
@@ -1488,7 +1546,7 @@ mod tests {
         let node = authenticate(TokenCheck::Match, || Ok(Some(stranger.clone())), "tailscale", peer, Some("nSTUDIO"))
             .expect("a node the network names, holding the token, is authenticated");
         assert_eq!(node.node_id, "nPHONE");
-        assert!(matches!(authorize(&node, || Ok(allow())), Err(Refusal::NotAllowed { node_name }) if node_name == "phone"));
+        assert!(matches!(authorize(&node, || Ok(allow())), Err(Refusal::NotAllowed { node_name, .. }) if node_name == "phone"));
         let listed = test_node("nLAPTOP", "macbook-pro", "100.64.0.7");
         assert_eq!(authorize(&listed, || Ok(allow())).unwrap().peer_name, "macbook-pro");
         let unreadable = authorize(&listed, || Err("no such file".into()));
@@ -1628,10 +1686,64 @@ mod tests {
         ));
     }
 
+    fn roster_with(entries: &[(&str, &str)]) -> crate::roster::FleetRoster {
+        let machines: serde_json::Map<String, serde_json::Value> = entries
+            .iter()
+            .map(|(id, address)| (id.to_string(), serde_json::json!({ "id": id, "address": address, "added_unix_ms": 1 })))
+            .collect();
+        serde_json::from_value(serde_json::json!({ "machines": machines })).expect("a roster")
+    }
+
+    fn body(role: &str, claimed: Option<&str>) -> Vec<u8> {
+        let mut j = serde_json::to_value(job(None)).unwrap();
+        j["role_id"] = role.into();
+        match claimed {
+            Some(c) => j["published_by_machine"] = c.into(),
+            None => {
+                j.as_object_mut().unwrap().remove("published_by_machine");
+            }
+        }
+        serde_json::to_vec(&serde_json::json!({ "job": j })).unwrap()
+    }
+
+    /// The remedy names the receiver's roster entry for the verified node
+    /// (its id, not the network name) and the role that was asked for.
+    #[test]
+    fn the_trust_remedy_names_the_roster_entry_for_the_node() {
+        let node = test_node("nLAPTOP", "laptop", "100.64.0.2");
+        let roster = roster_with(&[("Laptop-Mac", "laptop.tailnet-example.ts.net:8765"), ("mini", "mini:8765")]);
+        let ask = TrustAsk::for_sender(&node, &roster, &body("radio-host", Some("workbook")));
+        let said = Refusal::NotAllowed { node_name: "laptop".into(), ask }.reason("studio");
+        assert!(
+            said.contains("`darkmux machine trust Laptop-Mac --profiles <profile> --roles radio-host`"),
+            "{said}"
+        );
+        assert!(!said.contains("--node"), "the roster address already finds the node: {said}");
+    }
+
+    /// No roster entry: the sender's claimed machine id is NAME, and `--node`
+    /// names the node. A claim that is not a machine name is ignored.
+    #[test]
+    fn the_trust_remedy_falls_back_to_the_claimed_id_then_the_node() {
+        let node = test_node("nLAPTOP", "laptop", "100.64.0.2");
+        let empty = crate::roster::FleetRoster::default();
+        let said = |claimed: Option<&str>| {
+            let ask = TrustAsk::for_sender(&node, &empty, &body("radio-host", claimed));
+            Refusal::NotAllowed { node_name: "laptop".into(), ask }.reason("studio")
+        };
+        assert!(said(Some("Laptop-Mac")).contains("`darkmux machine trust Laptop-Mac --node laptop --profiles <profile> --roles radio-host`"), "{}", said(Some("Laptop-Mac")));
+        for hostile in [None, Some("a b; rm -rf"), Some("")] {
+            let s = said(hostile);
+            assert!(s.contains("`darkmux machine trust laptop --profiles <profile> --roles radio-host`"), "{s}");
+        }
+        let junk_role = TrustAsk::for_sender(&node, &empty, &body("no spaces allowed", None));
+        assert_eq!(junk_role.role, None);
+    }
+
     /// The replies say what the operator needs, and never carry a node id.
     #[test]
     fn refusal_replies_name_the_reason() {
-        let r = Refusal::NotAllowed { node_name: "macbook-pro".into() };
+        let r = Refusal::NotAllowed { node_name: "macbook-pro".into(), ask: TrustAsk::default() };
         assert!(r.reason("studio").starts_with("studio does not accept work from macbook-pro"), "{}", r.reason("studio"));
         assert_eq!(r.http_status(), 403);
         let r = Refusal::OutOfScope { peer: "macbook-pro".into(), item: OutOfScope::Profile { profile: "x".into(), allowed: vec!["host".into()] } };
@@ -1718,7 +1830,7 @@ mod tests {
             (Refusal::Token, RefusalCode::Token),
             (Refusal::IdentityUnavailable { provider: s(), detail: s() }, RefusalCode::Identity),
             (Refusal::NotOnOverlay { provider: s(), addr: s() }, RefusalCode::Identity),
-            (Refusal::NotAllowed { node_name: s() }, RefusalCode::NotListed),
+            (Refusal::NotAllowed { node_name: s(), ask: TrustAsk::default() }, RefusalCode::NotListed),
             (Refusal::AmbiguousEntry { names: vec![s()] }, RefusalCode::BadConfig),
             (Refusal::Misaddressed { target: s() }, RefusalCode::Misaddressed),
             (Refusal::OutOfScope { peer: s(), item: OutOfScope::Workspace }, RefusalCode::WorkspaceNotAllowed),

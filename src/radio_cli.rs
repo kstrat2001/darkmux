@@ -105,10 +105,9 @@ pub fn run(text: &str, dry_run: bool) -> Result<i32> {
         // LAST RESORT, printed only when the answering dispatch itself
         // fails (e.g. no model loaded) — never silently swallowed.
         RouteDecision::Refuse { reason } => {
-            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             let shelf = crate::radio_answer::ArtifactShelf::default();
             let overrides = crate::radio_answer::AnswererOverrides::default();
-            match crate::radio_answer::answer_live(text, &catalog, &shelf, &cwd, &overrides, radio::RadioSurface::Cli) {
+            match crate::radio_answer::answer_live(text, &catalog, &shelf, &overrides, radio::RadioSurface::Cli) {
                 Ok(crate::radio_answer::LiveAnswer::Answered(outcome)) => {
                     println!("radio: {}", outcome.rendered);
                     Ok(0)
@@ -122,15 +121,9 @@ pub fn run(text: &str, dry_run: bool) -> Result<i32> {
                     println!("radio: {}", busy.answering_seat_message());
                     Ok(1)
                 }
-                Err(e) => {
-                    eprintln!("radio: the answering seat failed ({e:#}); falling back to the plain refusal");
-                    println!("radio: {reason}");
-                    println!("{}", advertised_list_message(&catalog));
-                    // The model was reached for routing but not for answering:
-                    // the user got a degraded reply, and a script must be able
-                    // to tell.
-                    Ok(1)
-                }
+                // The model was reached for routing but not for answering: the
+                // user got a degraded reply, and a script must be able to tell.
+                Err(e) => Ok(print_answer_failure(&answer_failure_output(&e, &reason, &catalog))),
             }
         }
         // The routing seat never ran. Nothing downstream can do better with
@@ -154,6 +147,39 @@ pub fn run(text: &str, dry_run: bool) -> Result<i32> {
             }
             execute(&command, &args)
         }
+    }
+}
+
+/// What `radio` prints when the answering step failed: the `answer` for
+/// stdout, and a `diagnostic` for stderr when there is one.
+struct AnswerFailureOutput {
+    answer: String,
+    diagnostic: Option<String>,
+}
+
+/// Print `out` (the diagnostic to stderr, the answer to stdout) and return the
+/// exit code: 1, because the question was not answered and a script must be
+/// able to tell that from an answer.
+fn print_answer_failure(out: &AnswerFailureOutput) -> i32 {
+    if let Some(diagnostic) = &out.diagnostic {
+        eprintln!("{diagnostic}");
+    }
+    println!("{}", out.answer);
+    1
+}
+
+/// The output for a failed answering step. A seat that could not answer says
+/// so and why, and nothing about darkmux: the router's refusal reason and the
+/// command listing answer a question that WAS judged unanswerable, not this
+/// one. Any other failure (a reply radio rejected) keeps the router's reason
+/// and the listing, with the failure on stderr.
+fn answer_failure_output(e: &anyhow::Error, reason: &str, catalog: &[CatalogEntry]) -> AnswerFailureOutput {
+    match crate::radio_answer::seat_unavailable_notice(e) {
+        Some(notice) => AnswerFailureOutput { answer: notice, diagnostic: None },
+        None => AnswerFailureOutput {
+            answer: format!("radio: {reason}\n{}", advertised_list_message(catalog)),
+            diagnostic: Some(format!("radio: the answering seat failed ({e:#}); falling back to the plain refusal")),
+        },
     }
 }
 
@@ -579,6 +605,38 @@ fn cli_gate_handler() -> Box<crate::crew::gate::GateHandler<'static>> {
 mod tests {
     use super::*;
 
+    fn catalog() -> Vec<CatalogEntry> {
+        vec![CatalogEntry { id: "pr-list".into(), description: "list PRs".into(), hint: None, accepts_args: true }]
+    }
+
+    /// A seat that could not answer is reported as that, with its reason, and
+    /// carries neither the router's refusal sentence nor the catalog.
+    #[test]
+    fn an_unavailable_seat_prints_only_the_seat_failure() {
+        let seat = anyhow::Error::new(crate::fleet::SubmitRefused {
+            code: crate::fleet::RefusalCode::NotListed,
+            reason: "studio does not accept work from laptop".into(),
+        })
+        .context("the answering seat `host@studio`");
+        let err = crate::radio_answer::answer("what is a profile?", &catalog(), &crate::radio_answer::ArtifactShelf::default(), None, crate::radio_answer::GroundingScope::Full, radio::RadioSurface::Cli, &mut |_: &str, _| Err(anyhow::anyhow!("{seat:#}")))
+            .unwrap_err();
+        let out = answer_failure_output(&err, "Darkmux does not define profiles", &catalog());
+        assert!(out.answer.contains("the answering seat was unavailable"), "{}", out.answer);
+        assert!(out.answer.contains("studio does not accept work from laptop"), "{}", out.answer);
+        assert!(!out.answer.contains("does not define") && !out.answer.contains("mission launch"), "{}", out.answer);
+        assert_eq!(out.diagnostic, None);
+    }
+
+    /// Any other failure (a reply radio rejected) keeps the router's reason
+    /// and the listing.
+    #[test]
+    fn any_other_failure_keeps_the_plain_refusal() {
+        let out = answer_failure_output(&anyhow::anyhow!("the reply named a command that cannot be run"), "not a command", &catalog());
+        assert!(out.answer.contains("radio: not a command"), "{}", out.answer);
+        assert!(out.answer.contains("`darkmux mission launch pr-list`"), "{}", out.answer);
+        assert!(out.diagnostic.is_some());
+    }
+
     /// (#1861 review) This file's PRODUCTION half — everything ahead of
     /// its own test module. Searched instead of the whole file on purpose:
     /// a needle spelled out in a test must never be able to satisfy an
@@ -598,7 +656,7 @@ mod tests {
     fn the_cli_entry_point_answers_on_the_cli_surface() {
         let src = production_source();
         assert!(
-            src.contains("answer_live(text, &catalog, &shelf, &cwd, &overrides, radio::RadioSurface::Cli)"),
+            src.contains("answer_live(text, &catalog, &shelf, &overrides, radio::RadioSurface::Cli)"),
             "the CLI answering call must pass the CLI surface"
         );
         assert!(

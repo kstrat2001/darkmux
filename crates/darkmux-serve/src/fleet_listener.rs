@@ -171,7 +171,7 @@ impl FleetListenerState {
 /// gate.
 pub(crate) fn router(state: FleetListenerState) -> Router {
     Router::new()
-        .route(darkmux_fleet::SUBMISSION_PATH, axum::routing::post(submit_handler))
+        .route(darkmux_fleet::SUBMISSION_PATH, axum::routing::post(submit_route))
         .route(darkmux_fleet::CARD_PATH, axum::routing::get(card_handler))
         .layer(axum::middleware::from_fn_with_state(state.clone(), gate))
         .with_state(state)
@@ -862,14 +862,18 @@ async fn card_handler(State(state): State<FleetListenerState>, Extension(auth): 
     }
 }
 
-/// A caller the gate authenticated AND the allow-list lists: what a job needs
-/// and a card read does not. The gate does not require the allow-list entry;
-/// this extractor reads it, and refuses with the listener's own sentence when
-/// the authenticated node has none.
-struct Authorized(Admitted);
+/// A caller the gate authenticated, and what the allow-list said of it: what
+/// a job needs and a card read does not. The gate does not require the
+/// allow-list entry. This extractor reads it and leaves the refusal to the
+/// handler, which has the body: an unlisted sender's refusal names the trust
+/// command for the job it posted.
+struct Authorization {
+    node: NodeIdentity,
+    result: Result<Admitted, Refusal>,
+}
 
 #[axum::async_trait]
-impl axum::extract::FromRequestParts<FleetListenerState> for Authorized {
+impl axum::extract::FromRequestParts<FleetListenerState> for Authorization {
     type Rejection = Response;
 
     async fn from_request_parts(
@@ -882,7 +886,23 @@ impl axum::extract::FromRequestParts<FleetListenerState> for Authorized {
             let provider = state.provider.provider_name().to_string();
             return Err(refuse(state, peer, &Refusal::IdentityUnavailable { provider, detail }));
         };
-        state.admission().authorize(auth.node).await.map(Authorized).map_err(|r| refuse(state, peer, &r))
+        let result = state.admission().authorize(auth.node.clone()).await;
+        Ok(Self { node: auth.node, result })
+    }
+}
+
+impl Authorization {
+    /// The admitted caller, or the refusal. An unlisted caller's refusal
+    /// carries the `machine trust` command that admits it, resolved against
+    /// this machine's roster and the job in `body`.
+    fn admitted(self, body: &[u8]) -> Result<Admitted, Refusal> {
+        self.result.map_err(|r| match r {
+            Refusal::NotAllowed { .. } => {
+                let roster = darkmux_fleet::load_roster().unwrap_or_default();
+                r.with_trust_ask(darkmux_fleet::TrustAsk::for_sender(&self.node, &roster, body))
+            }
+            other => other,
+        })
     }
 }
 
@@ -906,11 +926,26 @@ async fn scope_submission(
     Ok((sub, scoped))
 }
 
-async fn submit_handler(
+/// `POST` a job or a check: refuses a caller the allow-list does not list,
+/// with the remedy for the job it posted, else hands the admitted job on.
+async fn submit_route(
     State(state): State<FleetListenerState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
-    Authorized(admitted): Authorized,
+    authorization: Authorization,
     Extension(token): Extension<TokenFingerprint>,
+    body: Bytes,
+) -> Response {
+    match authorization.admitted(&body) {
+        Ok(admitted) => submit_handler(state, peer_addr, admitted, token, body).await,
+        Err(refusal) => refuse(&state, Some(peer_addr.ip()), &refusal),
+    }
+}
+
+async fn submit_handler(
+    state: FleetListenerState,
+    peer_addr: SocketAddr,
+    admitted: Admitted,
+    token: TokenFingerprint,
     body: Bytes,
 ) -> Response {
     // (#2947 review M1) A job this machine would refuse at its dispatch
@@ -1659,7 +1694,11 @@ mod tests {
         let h = start(Some(test_node("nPHONE", "phone", "127.0.0.1")), false, 0);
         let (code, reply) = post(&h, TOKEN, job("s", None), true);
         assert_eq!(code, 403);
-        assert!(reply.reason.unwrap().starts_with("studio does not accept work from phone"));
+        let said = reply.reason.unwrap();
+        assert!(said.starts_with("studio does not accept work from phone"), "{said}");
+        // The remedy carries the role the job asked for, read from the body
+        // the extractor could not see.
+        assert!(said.contains("--roles radio-host"), "{said}");
         assert!(h.ran.lock().unwrap().is_empty());
     }
 

@@ -1207,9 +1207,9 @@ darkmux release.
   whether the seat is `free` or the job `would_queue`) or the refusal a run
   would get, without running anything, taking a seat or a queue slot, or writing
   dispatch records. `darkmux_fleet::check_route` is its sender side. Radio's
-  peer answering seat sends full grounding under `managed_only`; a peer whose
-  profile is hosted refuses it, and radio asks once more with the hosted-safe
-  grounding and says so on stderr. **Migration:** run the same darkmux major on
+  peer answering seat sends full grounding under `managed_only`; when the
+  receiver's check says its profile is hosted, radio asks once more with the
+  hosted-safe grounding and says so on stderr. **Migration:** run the same darkmux major on
   both machines; a 4.0 release candidate that still speaks `"8"` is refused
   with the version remedy. `tests/fixtures` in `crates/darkmux-fleet` pin the
   8.0 wire: a shape change without a version change fails a test.
@@ -1275,6 +1275,26 @@ darkmux release.
   Both routes are in `route-table.golden`, and their types have generated twins.
   Work submission and card reads dial the listener over plain http whatever
   scheme the roster address wrote.
+- **Radio and doctor check a fleet route before using it.** For a `<profile>@<machine>`
+  answering seat, radio asks the receiver first (`darkmux_fleet::check_route`) and
+  submits the job only when the receiver says it would run it, so a job the
+  receiver would refuse is never sent. A refused or unreachable seat prints "the
+  answering seat was unavailable" with the receiver's own reason, on the CLI and in
+  the panel, and no longer prints the router's refusal text or the command
+  catalog (a reply radio rejects keeps the old fallback). Radio's grounding gains
+  a "fleet" section from the same `FleetView` `machine list` and
+  `GET /fleet/view` give (machine, liveness, card outcome, loaded models, profiles
+  with their endpoint kind, what this machine may run there; never a uid, node
+  name, address or token), so "what is loaded on studio?" is answerable from any
+  machine; a hosted seat does not get it. `darkmux doctor` gains a `fleet routes`
+  row that runs the same check for `radio.answerer_profile` and every
+  `role_profiles` address naming a peer: ok, or the receiver's typed refusal, and a
+  warn (never a fail) when the peer cannot be asked.
+- **A refused sender's `machine trust` remedy names an entry that works.** It named
+  the sender's network host, so following it wrote a second allow-list key. It now
+  names the receiver's roster entry for the verified node, else the machine id the
+  job claims with `--node <host>`, and shows the role the job asked for.
+  `WorkJob::for_peer` is removed (the receiver's version gate is the authority).
 - **Radio's answering seat can run on a fleet peer.** Set `radio.answerer_profile`
   (or `role_profiles.radio-host`) to `<profile>@<machine>` and the seat's dispatch
   is submitted to that machine, which runs it on its own profile; the peer must
