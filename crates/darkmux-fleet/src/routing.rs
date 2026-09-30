@@ -754,6 +754,28 @@ mod tests {
         }
     }
 
+    /// A profile address naming THIS machine runs here, and the boundary is
+    /// not sent anywhere: the local dispatch gets the address spent and the
+    /// data boundary is the caller's own seat classification (radio asks
+    /// `grounding_scope_for` before it assembles grounding). Nothing crosses
+    /// the wire.
+    #[test]
+    #[serial]
+    fn an_address_naming_this_machine_runs_here_and_sends_nothing_for_a_boundary() {
+        let (port, rx) = spawn_scripted_peer("{\"status\":\"completed\",\"exit_code\":0,\"stdout\":\"done\"}\n");
+        let _env = PeerEnv::new(port);
+        let mut opts = local_opts("radio-host");
+        opts.profile_name = Some("host@local-a".to_string());
+        let mut seen = None;
+        let r = dispatch_routed_single_shot(opts, None, Some(Boundary::ManagedOnly), |o| {
+            seen = Some((o.machine.clone(), o.profile_name.clone()));
+            Ok(DispatchResult { exit_code: 0, stdout: "here".into(), stderr: String::new(), session_id: crate::test_session("s"), execution: None, out_dir: None, trajectory: None })
+        });
+        assert_eq!(r.unwrap().stdout, "here");
+        assert_eq!(seen, Some((None, Some("host".to_string()))), "the address is spent before the local dispatch");
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "nothing was submitted to a peer");
+    }
+
     /// The boundary crosses with the job, and a refusal at it reaches the
     /// sender as a typed code: the sender's caller reads the code, never the
     /// sentence.
