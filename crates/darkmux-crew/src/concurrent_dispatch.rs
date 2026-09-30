@@ -3288,6 +3288,74 @@ mod tests {
         );
     }
 
+    /// The `run_bounded` seam of the utility hold: `facts.utility_binding`
+    /// must reach the reconcile inside `run_local_waves`. A host that
+    /// records every unload sees none for the utility resident, while an
+    /// unrelated orphan is still unloaded (so the recorder can see unloads).
+    #[serial_test::serial]
+    #[test]
+    fn run_bounded_threads_the_utility_binding_to_the_reconcile() {
+        struct RecHost {
+            inner: MockHost,
+            unloads: Arc<Mutex<Vec<String>>>,
+        }
+        impl ModelHost for RecHost {
+            fn list_resident(&mut self) -> Result<Vec<darkmux_gestalt::ResidentFact>, darkmux_gestalt::HostError> {
+                self.inner.list_resident()
+            }
+            fn list_catalog(&mut self) -> Result<Vec<darkmux_gestalt::CatalogFact>, darkmux_gestalt::HostError> {
+                self.inner.list_catalog()
+            }
+            fn load(
+                &mut self,
+                model_key: &str,
+                identifier: &str,
+                min_ctx: u32,
+                deadline: Deadline,
+            ) -> Result<darkmux_gestalt::LoadReport, darkmux_gestalt::HostError> {
+                self.inner.load(model_key, identifier, min_ctx, deadline)
+            }
+            fn unload(
+                &mut self,
+                target: &darkmux_gestalt::OwnedTarget,
+                deadline: Deadline,
+            ) -> Result<(), darkmux_gestalt::HostError> {
+                self.unloads.lock().unwrap().push(target.identifier().to_string());
+                self.inner.unload(target, deadline)
+            }
+        }
+        let _env = LeaseTestEnv::new();
+        unsafe { std::env::remove_var("DARKMUX_LOCAL_DISPATCH_CONCURRENCY") };
+        let est = FixedEstimator(BTreeMap::from([("m".to_string(), 1_000u64)]));
+        let facts = Facts { utility_binding: Some("darkmux:util-4b".to_string()), ..Default::default() };
+        let unloads = Arc::new(Mutex::new(Vec::new()));
+        let factory = {
+            let unloads = unloads.clone();
+            move || -> Box<dyn ModelHost> {
+                Box::new(RecHost {
+                    inner: MockHost::new()
+                        .resident("darkmux:util-4b", "util-4b", 32_000, Some(1_000))
+                        .resident("darkmux:orphan", "orphan", 32_000, Some(1_000))
+                        .cataloged("m", 1_000),
+                    unloads: unloads.clone(),
+                })
+            }
+        };
+        let marker = Arc::new(AtomicU32::new(0));
+        let jobs = vec![QueuedJob {
+            index: 0,
+            seat: SeatClaim::LocalModel(placement("m", 8_000)),
+            job: ok_job(0, marker.clone()),
+        }];
+        let results = run_bounded(jobs, &facts, &est, 4, 4, &factory).expect("planning never fails under Auto");
+        assert!(results[0].1.is_ok(), "the wave must run");
+        assert_eq!(
+            *unloads.lock().unwrap(),
+            vec!["darkmux:orphan".to_string()],
+            "the orphan goes; the utility binding is never unloaded"
+        );
+    }
+
     /// Remote jobs never touch `plan_waves`'s local-model arithmetic at
     /// all — an empty local set plus an unconfigured budget/catalog is a
     /// legal, always-fits input.

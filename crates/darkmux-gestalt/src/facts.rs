@@ -110,7 +110,7 @@ pub struct Facts {
     /// resolved by the caller to its namespaced identifier; `None` when
     /// unconfigured. Planning holds it resident by policy: no arm (pass 1,
     /// the budget arm, the pool arm, release) ever unloads it, and a load
-    /// that fits only by evicting it Blocks with
+    /// the #1243 budget refuses only because of it Blocks with
     /// [`crate::plan::Reason::UtilityHeldResident`]. Only the operator's
     /// explicit `darkmux machine eject` releases it. A caller that leaves
     /// this `None` forfeits the protection.

@@ -199,12 +199,11 @@ pub enum Reason {
     /// Block on every retry. Callers use this to gate whether a bounded
     /// retry-hold is worth attempting at all (see `ensure_wave_loaded`).
     ClaimedResidentInsufficientCtx { identifier: String, resident_ctx: u64, min_ctx: u32, clearable: bool },
-    /// Block: the load would fit only by unloading the registry's standing
-    /// utility binding, which darkmux holds resident by policy: no arm ever
-    /// evicts it, so the plan names it and points at the explicit release.
-    /// `limit_bytes` is the limit the load had to fit within (the #1243
-    /// budget, or the pool headroom left after every planned free).
-    UtilityHeldResident { identifier: String, held_bytes: u64, est_bytes: u64, limit_bytes: u64 },
+    /// Block (budget arm): the load pushes darkmux-owned residency over the
+    /// #1243 budget by `over_bytes`, and would fit if the registry's
+    /// standing utility binding (`held_bytes`) were released. No arm evicts
+    /// it, so the plan names it instead.
+    UtilityHeldResident { identifier: String, held_bytes: u64, est_bytes: u64, over_bytes: u64, budget_bytes: u64 },
 }
 
 /// Display-only GB rendering for the operator-facing suggestion strings
@@ -259,11 +258,12 @@ impl fmt::Display for Reason {
             Reason::ClaimedResidentInsufficientCtx { identifier, resident_ctx, min_ctx, clearable } => {
                 fmt_claimed_resident(f, identifier, *resident_ctx, *min_ctx, *clearable)
             }
-            Reason::UtilityHeldResident { identifier, held_bytes, est_bytes, limit_bytes } => write!(
+            Reason::UtilityHeldResident { identifier, held_bytes, est_bytes, over_bytes, budget_bytes } => write!(
                 f,
-                "an estimated {} load fits within the {} limit only by unloading the utility model \"{identifier}\" ({}), which darkmux holds resident by policy; release it explicitly with `darkmux machine eject`, or pick a smaller model",
+                "an estimated {} load exceeds the {} AI RAM budget by {}; it would fit if the utility model \"{identifier}\" ({}, held resident by policy) were released. Lasting remedies: a smaller `internal.utility` model or context, or a larger budget (`darkmux machine eject` releases it only until the next dispatch's compactor preflight reloads it)",
                 gb(*est_bytes),
-                gb(*limit_bytes),
+                gb(*budget_bytes),
+                gb(*over_bytes),
                 gb(*held_bytes)
             ),
         }
