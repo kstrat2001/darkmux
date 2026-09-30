@@ -188,6 +188,8 @@ brew services restart darkmux
 darkmux doctor 2>&1 | grep -i fleet
 ```
 
+**Tailscale Serve is not part of joining the fleet.** The fleet listener binds this machine's tailnet address by itself. Serve only matters if the operator wants to open this machine's viewer from another device. Then use `tailscale serve --bg --http=<port> http://127.0.0.1:<serve.port>` (plain HTTP, tailnet-only, no tailnet settings to change). Never propose `--https` unless the operator asks: it needs the tailnet HTTPS-certificates setting, which publishes the machine name. Never propose Funnel: it exposes the daemon to the internet.
+
 Needs the fleet token (Keychain item `darkmux-serve-token`, the same value as on the sender). The `fleet` doctor rows should read: token resolves, identity names this machine, listener listening on its tailnet address, and the sender listed with its scope. Never propose a profile that runs on the utility model: it is refused anyway, since utility work never crosses machines.
 
 ## Idempotency note

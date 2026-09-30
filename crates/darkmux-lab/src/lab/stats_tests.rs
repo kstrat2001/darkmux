@@ -1240,3 +1240,45 @@ fn a_pre_gate_run_on_an_unbaselined_fixture_is_not_flagged_ungated() {
     let s = compute_from_dir(run.path(), flows.path()).unwrap();
     assert!(!s.verify_ungated);
 }
+
+// ---------------------------------------------------------------------------
+// An interrupted run (#3014)
+// ---------------------------------------------------------------------------
+
+/// Promise: `run stats` on an interrupted run reports what completed plus an
+/// interrupted marker, not "no trajectory events". The run dir holds what the
+/// interrupt path preserved: the events so far and a terminal `interrupted`.
+#[test]
+fn an_interrupted_run_reports_what_completed_and_says_it_was_interrupted() {
+    let run = tempfile::TempDir::new().unwrap();
+    let flows = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        run.path().join("trajectory.jsonl"),
+        format!(
+            "{}{}{}",
+            line(serde_json::json!({"type": "dispatch.start", "ts": 1_000_000u64, "model": "test-model"})),
+            line(serde_json::json!({"type": "model.completed", "seq": 1, "ts": 1_004_000u64,
+                "usage": {"prompt_tokens": 100, "completion_tokens": 40, "total_tokens": 140}})),
+            line(serde_json::json!({"type": "dispatch.complete", "ts": 1_005_000u64,
+                "result": darkmux_trajectory::RESULT_INTERRUPTED, "wall_ms": 5_000})),
+        ),
+    )
+    .unwrap();
+    let s = compute_from_dir(run.path(), flows.path()).unwrap();
+    assert_eq!(s.result.as_deref(), Some("interrupted"));
+    assert_eq!(s.turns, 1, "what completed is reported");
+    assert!(
+        s.unreconciled().iter().any(|r| r.contains("interrupted")),
+        "the caveat prints with the figures: {:?}",
+        s.unreconciled()
+    );
+    assert!(crate::lab::stats_set::flags(&s).contains(&"INTERRUPTED"), "and the table flags it");
+}
+
+/// The inverse: a run that ended on its own carries no interrupted caveat.
+#[test]
+fn a_run_that_ended_on_its_own_is_not_flagged_interrupted() {
+    let s = compute_from_dir(run_at(1_000_000, 5_000).path(), tempfile::TempDir::new().unwrap().path()).unwrap();
+    assert!(!s.unreconciled().iter().any(|r| r.contains("interrupted")));
+    assert!(!crate::lab::stats_set::flags(&s).contains(&"INTERRUPTED"));
+}

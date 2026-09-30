@@ -40,6 +40,11 @@ blake3 = "1.5"
 # Dockerfile.dockerignore beside it).
 darkmux-trajectory = { path = "../crates/darkmux-trajectory" }
 
+# (#3014) SIGTERM/SIGINT handling, so an interrupted execution leaves a
+# terminal `interrupted` record. Already in the dependency tree (ureq and
+# tempfile pull it in), so no new license surface.
+libc = "0.2"
+
 # HTTP client. ureq is blocking + tokio-free → smaller binary + simpler
 # call sites. The agent loop is inherently sequential per dispatch, so
 # async buys us nothing here.

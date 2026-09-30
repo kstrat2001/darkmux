@@ -129,6 +129,14 @@ pub struct TrajectoryFold {
     /// `None` for a call that returned no usage (a cut stream is never
     /// billed).
     pub frames: Vec<Option<u64>>,
+    /// `model.completed` events that carried no usage: their tokens are
+    /// missing from `tokens`, so a total read beside a non-zero count is a
+    /// floor, not the spend.
+    pub unreported_calls: u32,
+    /// The runtime's own estimate of the completion tokens of the calls it
+    /// cut (`model.completed.completion_estimate`). Kept OUT of `tokens`,
+    /// which holds only what an endpoint reported.
+    pub estimated_completion_tokens: u64,
     pub turn_detail: BTreeMap<u64, TurnDetail>,
     pub streams: Vec<Stream>,
     compaction_events: u32,
@@ -176,7 +184,11 @@ impl TrajectoryFold {
                 }
             }
             E::DispatchComplete(c) => self.complete = Some(c.clone()),
-            E::ModelCompleted(m) => self.model_completed(m.seq, UsageCounts::of(m.usage.as_ref())),
+            E::ModelCompleted(m) => {
+                self.model_completed(m.seq, UsageCounts::of(m.usage.as_ref()));
+                self.estimated_completion_tokens =
+                    self.estimated_completion_tokens.saturating_add(m.completion_estimate.unwrap_or(0));
+            }
             E::StreamingStart(s) => self.streams.push(Stream {
                 seq: s.seq,
                 start_ms: s.ts,
@@ -265,6 +277,9 @@ impl TrajectoryFold {
         self.turn_seqs.insert(seq);
         self.model_calls = self.model_calls.saturating_add(1);
         self.tokens.add(&counts);
+        if !counts.reported() {
+            self.unreported_calls = self.unreported_calls.saturating_add(1);
+        }
         self.frames.push(counts.completion);
         let t = self.turn_detail.entry(seq).or_default();
         t.completion_tokens = t.completion_tokens.saturating_add(counts.completion.unwrap_or(0));

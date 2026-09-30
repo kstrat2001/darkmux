@@ -202,3 +202,15 @@ fn the_compactor_role_is_the_utility_seat_and_an_unknown_word_is_unknown() {
     }
     assert_eq!(seen, 4);
 }
+
+/// Every terminal states its turn count on the wire: an execution that ended before any model
+/// call says 0. An archived terminal written before the field existed reads it as absent, never
+/// as a fabricated 0.
+#[test]
+fn a_dispatch_terminal_always_carries_its_turn_count() {
+    use darkmux_flow::payload::DispatchEndPayload;
+    let aborted = serde_json::to_value(DispatchEndPayload::aborted(None)).unwrap();
+    assert_eq!(aborted["total_turns"], 0);
+    let archived: DispatchEndPayload = serde_json::from_str(r#"{"wall_ms": 5}"#).unwrap();
+    assert_eq!(archived.total_turns, None);
+}

@@ -25,7 +25,7 @@
  */
 import { compactThousands, fmtElapsed, type CompactStyle } from "../../lib/format";
 import { PURPOSE, isUsageRecord, stepTokensWithLegacyFallback, usageContribution } from "../../lib/usageRecords";
-import { ACTION, CATEGORY, SOURCE, byTime, byTimeNewestFirst, isAfter, isAsOf, isDispatchFamily, isDispatchTerminal, latestByTime, payloadOf, stepIdOf, type NormAction, type NormRecord } from "../../lib/ingest";
+import { ACTION, CATEGORY, SOURCE, byTime, byTimeNewestFirst, isAfter, isAsOf, endPayloadOf, isDispatchFamily, isDispatchTerminal, latestByTime, payloadOf, stepIdOf, type NormAction, type NormRecord } from "../../lib/ingest";
 import { lifecycleAt, type LifecyclePhase, type LifecyclePolicy } from "../../lib/lifecycle";
 import { currentRun, groupOfRecords } from "../../lib/runRef";
 import type { GraphEdge } from "../../types/generated/GraphEdge";
@@ -314,9 +314,24 @@ export function isAiKind(kind: string | undefined): boolean {
 
 export interface StepMetrics {
   tokRun: number;
+  /** The server's finalized tokens for the step (`seedMetricsFromGraph`); see `turnFinal`. */
   tokFinal: number;
+  /** The `total_tokens` of every dispatch terminal folded so far, summed (one term per
+   *  execution: attempts and map items alike), as `turnsEnded` sums turns. */
+  tokEnded: number;
+  /** The largest `step result` total folded: the legacy figure for a step whose executions
+   *  wrote no terminal totals. Only read when `tokEnded` is 0, so a step-level aggregate that
+   *  already sums its items is never added to the item terminals it sums. */
+  tokResult: number;
   turnRun: number;
+  /** The server's finalized turns for the step (`seedMetricsFromGraph`): the sum of its
+   *  executions' `total_turns`. */
   turnFinal: number;
+  /** The `total_turns` of every terminal folded so far, summed: one term per execution,
+   *  as `tokRun` sums one term per usage record. Kept apart from `turnFinal` because the
+   *  seed and the fold read the same records, so adding one to the other would count
+   *  them twice; the display takes the larger. */
+  turnsEnded: number;
   toolRun: number;
   toolFinal: number;
   /** (#2902 step 2a) Whether any usage record for this step has been folded.
@@ -338,8 +353,11 @@ export interface StepMetrics {
 const EMPTY_METRICS: StepMetrics = {
   tokRun: 0,
   tokFinal: 0,
+  tokEnded: 0,
+  tokResult: 0,
   turnRun: 0,
   turnFinal: 0,
+  turnsEnded: 0,
   toolRun: 0,
   toolFinal: 0,
   usageSeen: false,
@@ -446,8 +464,11 @@ function sameMetrics(a: StepMetrics, b: StepMetrics): boolean {
   return (
     a.tokRun === b.tokRun &&
     a.tokFinal === b.tokFinal &&
+    a.tokEnded === b.tokEnded &&
+    a.tokResult === b.tokResult &&
     a.turnRun === b.turnRun &&
     a.turnFinal === b.turnFinal &&
+    a.turnsEnded === b.turnsEnded &&
     a.toolRun === b.toolRun &&
     a.toolFinal === b.toolFinal &&
     a.usageSeen === b.usageSeen &&
@@ -462,12 +483,12 @@ function sameMetrics(a: StepMetrics, b: StepMetrics): boolean {
  *  action's payload type; `null` for a count the record does not have. */
 function recordFigures(rec: NormRecord): { turnsSoFar: number | null; toolCallsSoFar: number | null; finalTok: number; totalTurns: number | null } {
   const count = (n: unknown): number | null => (typeof n === "number" ? n : null);
-  const complete = payloadOf(rec, ACTION.DispatchComplete);
+  const end = endPayloadOf(rec);
   return {
     turnsSoFar: count(payloadOf(rec, ACTION.DispatchTurn)?.turns_so_far),
     toolCallsSoFar: count(payloadOf(rec, ACTION.DispatchTool)?.tool_calls_so_far),
-    finalTok: count((complete ?? payloadOf(rec, ACTION.StepResult))?.total_tokens) ?? 0,
-    totalTurns: count(complete?.total_turns),
+    finalTok: count((end ?? payloadOf(rec, ACTION.StepResult))?.total_tokens) ?? 0,
+    totalTurns: count(end?.total_turns),
   };
 }
 
@@ -490,7 +511,6 @@ export function applyRecordToMetrics(metrics: MetricsMap, rec: NormRecord, idx: 
   const isUsage = isUsageRecord(rec);
   const isTurn = action === ACTION.DispatchTurn;
   const isTool = action === ACTION.DispatchTool;
-  const isComplete = action === ACTION.DispatchComplete;
   const isStepResult = action === ACTION.StepResult;
   const isStart = action === ACTION.DispatchStart || action === ACTION.StepStart;
   const stepBookended = cur.stepBookended || action === ACTION.StepStart;
@@ -512,11 +532,11 @@ export function applyRecordToMetrics(metrics: MetricsMap, rec: NormRecord, idx: 
     next.turnRun = fig.turnsSoFar !== null ? Math.max(next.turnRun, fig.turnsSoFar) : next.turnRun + 1;
   } else if (isTool && started) {
     next.toolRun = fig.toolCallsSoFar !== null ? Math.max(next.toolRun, fig.toolCallsSoFar) : next.toolRun + 1;
-  } else if (isComplete) {
-    if (finalTok) next.tokFinal = Math.max(next.tokFinal, finalTok);
-    if (fig.totalTurns !== null) next.turnFinal = Math.max(next.turnFinal, fig.totalTurns);
+  } else if (isDispatchTerminal(action)) {
+    next.tokEnded += finalTok;
+    if (fig.totalTurns !== null) next.turnsEnded += fig.totalTurns;
   } else if (isStepResult) {
-    if (finalTok) next.tokFinal = Math.max(next.tokFinal, finalTok);
+    next.tokResult = Math.max(next.tokResult, finalTok);
   }
 
   if (sameMetrics(next, cur)) return metrics;
@@ -573,8 +593,8 @@ export function stepDisplayMetrics(m: StepMetrics | undefined): DisplayMetrics {
   if (!m) return { tokens: 0, turns: 0, tools: 0, has: false };
   // (#2902 step 2a) The usage records' plain sum once any has been folded;
   // the legacy fallback (no usage records) reads the finalized total.
-  const tokens = stepTokensWithLegacyFallback(m.tokRun, m.usageSeen, m.tokFinal) || 0;
-  const turns = m.turnFinal || m.turnRun || 0;
+  const tokens = stepTokensWithLegacyFallback(m.tokRun, m.usageSeen, Math.max(m.tokFinal, m.tokEnded || m.tokResult)) || 0;
+  const turns = Math.max(m.turnFinal, m.turnsEnded) || m.turnRun || 0;
   const tools = m.toolFinal || m.toolRun || 0;
   return { tokens, turns, tools, has: tokens > 0 || turns > 0 || tools > 0 };
 }

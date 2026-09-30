@@ -2037,7 +2037,7 @@ mod tests {
             &crate::test_session("session-abc"), &darkmux_types::execution_id::ExecutionId::mint(),
             Some("darkmux:foo"),
             None,
-            darkmux_flow::Payload::DispatchComplete(DispatchEndPayload::default()),
+            darkmux_flow::Payload::DispatchComplete(DispatchEndPayload::new(0)),
         );
         let err = build_dispatch_record(
             darkmux_flow::Level::Error,
@@ -2045,7 +2045,7 @@ mod tests {
             &crate::test_session("session-abc"), &darkmux_types::execution_id::ExecutionId::mint(),
             Some("darkmux:foo"),
             None,
-            darkmux_flow::Payload::DispatchError(DispatchEndPayload::default()),
+            darkmux_flow::Payload::DispatchError(DispatchEndPayload::new(0)),
         );
         assert!(matches!(ok.level, darkmux_flow::Level::Info));
         assert!(matches!(err.level, darkmux_flow::Level::Error));
@@ -2067,8 +2067,8 @@ mod action_vocabulary_conformance {
         use darkmux_flow::payload::{DispatchEndPayload, DispatchStartPayload};
         for (payload, wire) in [
             (darkmux_flow::Payload::DispatchStart(DispatchStartPayload::default()), "dispatch.start"),
-            (darkmux_flow::Payload::DispatchComplete(DispatchEndPayload::default()), "dispatch.complete"),
-            (darkmux_flow::Payload::DispatchError(DispatchEndPayload::default()), "dispatch.error"),
+            (darkmux_flow::Payload::DispatchComplete(DispatchEndPayload::new(0)), "dispatch.complete"),
+            (darkmux_flow::Payload::DispatchError(DispatchEndPayload::new(0)), "dispatch.error"),
         ] {
             let action = payload.action();
             let rec = build_dispatch_record(
