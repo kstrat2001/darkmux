@@ -222,6 +222,24 @@ mod tests {
         assert!(failed[0].error.contains("device busy"), "the cause must survive: {:?}", failed[0]);
     }
 
+    /// The standing utility model is held resident against every dispatch
+    /// (the planner never evicts it), so the explicit eject is its only
+    /// release: the sweep must include it, unloading it like any other
+    /// `darkmux:` resident.
+    #[test]
+    fn eject_releases_the_standing_utility_model() {
+        let rows = vec![loaded("darkmux:qwen/qwen3-4b-2507"), loaded("darkmux:coder")];
+        let (managed, _) = partition_by_ownership(&rows);
+        let unloaded = std::cell::RefCell::new(Vec::new());
+        let (ejected, failed) = eject_each(&managed, false, &|id| {
+            unloaded.borrow_mut().push(id.to_string());
+            Ok(())
+        });
+        assert!(failed.is_empty());
+        assert_eq!(ejected.len(), 2);
+        assert!(unloaded.borrow().contains(&"darkmux:qwen/qwen3-4b-2507".to_string()), "{:?}", unloaded.borrow());
+    }
+
     #[test]
     fn a_clean_eject_reports_no_failures_and_a_dry_run_attempts_nothing() {
         let rows = vec![loaded("darkmux:a"), loaded("darkmux:b")];
