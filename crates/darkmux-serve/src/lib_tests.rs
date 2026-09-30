@@ -2103,6 +2103,41 @@
         assert!(proxied["open_file_limit"].is_null(), "{proxied}");
     }
 
+    /// Every header a reverse proxy adds is, ALONE, enough to make a loopback
+    /// request "not this machine". The list here is written out on purpose: a
+    /// test that iterates `PROXY_HEADERS` stays green when an entry is deleted.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn each_proxy_header_alone_makes_a_loopback_request_non_local() {
+        const EXPECTED: [&str; 15] = [
+            "x-forwarded-for",
+            "x-forwarded-host",
+            "x-forwarded-proto",
+            "x-forwarded-port",
+            "x-forwarded-server",
+            "x-real-ip",
+            "forwarded",
+            "via",
+            "cf-connecting-ip",
+            "true-client-ip",
+            "tailscale-user-login",
+            "tailscale-user-name",
+            "tailscale-headers-info",
+            "tailscale-funnel-request",
+            "tailscale-app-capabilities",
+        ];
+        assert_eq!(PROXY_HEADERS.len(), EXPECTED.len(), "a header was added or removed: update this list on purpose");
+        let lo: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let bound: SocketAddr = "127.0.0.1:8765".parse().unwrap();
+        assert!(is_local_at(Some(lo), &headers_with(&[("Host", "localhost:8765")]), Some(bound)), "the inverse: no proxy header is local");
+        for h in EXPECTED {
+            let hm = headers_with(&[("Host", "localhost:8765"), (h, "x")]);
+            assert!(!is_local_at(Some(lo), &hm, Some(bound)), "{h} alone must make the request non-local");
+            let v = loopback_health(&[("Host", "localhost:8765"), (h, "x")]).await;
+            assert!(v["open_file_limit"].is_null(), "/health shows this machine's limit behind {h}: {v}");
+        }
+    }
+
     fn headers_with(pairs: &[(&str, &str)]) -> axum::http::HeaderMap {
         let mut hm = axum::http::HeaderMap::new();
         for (k, v) in pairs {
