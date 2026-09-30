@@ -197,7 +197,7 @@ Doctor lists each file under `user file keys: <file>`. The fixes it names:
   - Delete `role_id` on a task whose step is `mission.verify`; it had no effect (#2953).
   - `gh_verb` is renamed `cmd`, with `schema_version` set to `"3.0"`. A task's `expand` key was removed: declaring the expanded tasks explicitly is a judgment, so ask.
   - An older `schema_version` major only warns. Leave it, or bump it after the file passes.
-  - A task's free-text `notes` is not refused. If the user wants it kept where darkmux reads it, fold it into the task's `description`; never delete it.
+  - A task's `notes` in a mission config is refused as an unknown key (doctor names it, e.g. `phases[0].tasks[1].notes`). It is the user's own text, so fold it into that task's `description` (if it is a list of lines, join them), then delete `notes`. Never delete it alone.
 - **Workloads** (`<root>/workloads/*.json`): delete `workload.expected.test_count_baseline` (#2833; a coding workload's baseline lives in its fixture's `baseline.test_count`). Rename `workload.agent` to `role` (#328).
 - **Lab fixtures** (each registered fixture's `.fixture.json`, which may live outside the darkmux root): delete `hash_exclude` and `hash_include` (#610).
 
