@@ -429,6 +429,10 @@ fn set_at(path: &Path, key: &str, value: &str) -> Result<String> {
     // top context), so the operator always sees the specific hint —
     // "invalid value for `fleet.mode`: invalid fleet.mode `hubb` — valid: …".
     let parsed = parse_value(ty, value).map_err(|e| anyhow!("invalid value for `{key}`: {e}"))?;
+    if names_the_answering_seat(key) {
+        darkmux_types::profile_address::ProfileAddress::parse(value)
+            .map_err(|e| anyhow!("invalid value for `{key}`: {e}"))?;
+    }
 
     let mut root = load_object(path)?;
     set_path(&mut root, key, parsed.clone());
@@ -458,6 +462,14 @@ fn set_at(path: &Path, key: &str, value: &str) -> Result<String> {
         "set `{key}` = {parsed} in {}\n{RESTART_CLAUSE}",
         path.display()
     ))
+}
+
+/// The two keys that staff radio's answering seat. Their value may be a
+/// `<profile>@<machine>` address (the seat then runs on that fleet peer), so
+/// it is parsed where it is written: a malformed address is refused here, not
+/// found when the seat is first used.
+fn names_the_answering_seat(key: &str) -> bool {
+    key == "radio.answerer_profile" || key == "role_profiles.radio-host"
 }
 
 /// (#2782 C6) Appended to EVERY `config set` confirmation.
@@ -919,6 +931,23 @@ mod tests {
         // The answering seat is still ordinary work, still a profile binding.
         set_at(p, "role_profiles.radio-host", "deep").unwrap();
         set_at(p, "radio.answerer_profile", "deep").unwrap();
+    }
+
+    /// The answering seat may run on a fleet peer: its two keys take a valid
+    /// `<profile>@<machine>` address and refuse a malformed one, naming it.
+    #[test]
+    fn the_answering_seat_keys_take_a_valid_profile_address_and_refuse_a_malformed_one() {
+        let f = tmp();
+        let p = f.path();
+        for key in ["radio.answerer_profile", "role_profiles.radio-host"] {
+            set_at(p, key, "deep@studio").unwrap_or_else(|e| panic!("{key}: {e:#}"));
+            assert!(get_at(p, key).unwrap().contains("deep@studio"), "{key} reads back the address");
+            for bad in ["deep@", "@studio", "a@b@c", "deep@stu dio"] {
+                let err = set_at(p, key, bad).unwrap_err().to_string();
+                assert!(err.contains(bad) && err.contains(key), "{key} refuses `{bad}` naming both: {err}");
+            }
+            assert!(get_at(p, key).unwrap().contains("deep@studio"), "a refused write leaves the old value");
+        }
     }
 
     #[test]

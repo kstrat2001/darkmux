@@ -20,6 +20,11 @@ use std::path::PathBuf;
 /// definition ([`crate::usage::call_purpose`], #2914) name the same role.
 pub const RADIO_ROUTER_ROLE_ID: &str = "radio-router";
 
+/// The radio answering seat's role id: the one role whose persona
+/// ([`crate::radio_persona`]) a fleet job may ask a peer to build for a
+/// tool-less single exchange.
+pub const RADIO_HOST_ROLE_ID: &str = "radio-host";
+
 pub(crate) const BUILTIN_ROLES: &[(&str, &str)] = &[
     ("coder", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/coder.json"))),
     ("code-reviewer", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/code-reviewer.json"))),

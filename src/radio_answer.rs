@@ -31,6 +31,7 @@
 //!   persona template (`templates/builtin/roles/radio-host.md`) carries a
 //!   `{{humor}}` placeholder substituted here from `radio.humor` config.
 
+use crate::crew::radio_persona::{answer_token_cap, answering_system_prompt};
 use crate::radio::{CatalogEntry, RadioSurface};
 use anyhow::{Context, Result};
 use std::collections::VecDeque;
@@ -716,27 +717,6 @@ fn render_surface_block(surface: RadioSurface) -> String {
              command here, and never name a catalog command by its id alone. Any other darkmux \
              verb is a command the user types in a separate darkmux CLI shell, not in this panel \
              — name it as the full line from the command index below."
-            .to_string(),
-    }
-}
-
-/// The `{{surface_instructions}}` substitution for the persona's rule 2
-/// (`templates/builtin/roles/radio-host.md`) — the SAME per-surface fact
-/// [`render_surface_block`] states in the grounding bundle, phrased to
-/// slot into that rule's own sentence. Two statements of one fact, from
-/// one source of truth (this module), rather than the grounding and the
-/// instruction drifting independently.
-fn surface_instructions(surface: RadioSurface) -> String {
-    match surface {
-        RadioSurface::Cli | RadioSurface::Unknown => "on the command line, a catalog command is `darkmux mission launch \
-             <id>` — never a bare `/id` and never the id on its own, since there is no shell \
-             here that runs `/anything` and no such subcommand either; any other darkmux verb \
-             is the full line from the command index (e.g. `darkmux machine status`)."
-            .to_string(),
-        RadioSurface::Panel => "in this panel, a catalog command runs as `/mission launch <id>` \
-             (e.g. `/mission launch pr-list`), never as `/<id>` or the id on its own; any other \
-             darkmux verb is a command the user types in a separate darkmux CLI shell, cited as \
-             the full line from the command index (e.g. `darkmux machine status`)."
             .to_string(),
     }
 }
@@ -1513,57 +1493,96 @@ pub struct AnswererOverrides {
     pub humor: Option<u8>,
 }
 
-/// The production [`AnswererCall`] implementation, parameterized by session
-/// overrides. Loads the `radio-host` persona template (honoring an
-/// operator-tier override, per `crate::crew::loader::role_prompt`'s own
-/// precedence — "operator overrides are sovereign"), substitutes
-/// `{{humor}}` from the resolved humor value, and dispatches through the
-/// SAME container-free single-shot path (`dispatch_local_single_shot`) the
-/// router uses — via `DispatchOpts.system_prompt_override` so the
-/// substituted persona text is sent VERBATIM rather than re-resolved by the
-/// loader (see that field's own doc on `DispatchOpts`).
-/// The answering seat's explicitly-selected profile, if any: the session
-/// picker wins over `radio.answerer_profile`; `None` means "no explicit
-/// selection" and lets dispatch's own `role_profiles.radio-host` →
-/// `default_profile` precedence decide.
-///
-/// Factored so [`dispatch_answerer_call_with`] and [`grounding_scope_for`]
-/// resolve the SAME name. Two copies of this two-line precedence would be
-/// a data-boundary bug waiting to happen: the gate would be deciding about
-/// one profile while the dispatch went to another.
-fn resolved_answerer_profile(overrides: &AnswererOverrides) -> Option<String> {
-    overrides
-        .profile_name
-        .clone()
-        .or_else(darkmux_types::config_access::radio_answerer_profile)
+/// Where the answering seat runs, parsed ONCE from its profile reference.
+/// Every decision about the seat (grounding scope, busy check, dispatch
+/// options) matches on this, so none of them can read `studio-host@studio`
+/// as a profile literally named that.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AnsweringSeat {
+    /// This machine. `explicit` is the picker or `radio.answerer_profile`
+    /// name; `None` lets dispatch's own `role_profiles.radio-host` ->
+    /// `default_profile` precedence decide.
+    Here { explicit: Option<String> },
+    /// A fleet peer: the seat's dispatch is submitted to `machine`, which
+    /// runs it on its own `profile`. Whether that profile is local or hosted
+    /// is the peer's registry's business, and its busy policy is the peer's
+    /// too.
+    Peer { profile: String, machine: String },
 }
 
-/// The grounding scope this dispatch is allowed — [`GroundingScope::RemoteSafe`]
-/// when the answering seat resolves to a remote endpoint. Fails closed via
-/// `crew::dispatch::dispatch_resolves_remote`.
-pub fn grounding_scope_for(overrides: &AnswererOverrides) -> GroundingScope {
-    let profile = resolved_answerer_profile(overrides);
-    if crate::crew::dispatch::dispatch_resolves_remote("radio-host", profile.as_deref(), None) {
-        GroundingScope::RemoteSafe
-    } else {
-        GroundingScope::Full
+/// The seat for a resolved reference pair. `explicit` (picker, then
+/// `radio.answerer_profile`) wins over `binding` (the `role_profiles.
+/// radio-host` entry). An unaddressed binding stays [`AnsweringSeat::Here`]
+/// with no explicit name: dispatch resolves it, loudly, against the local
+/// registry. A malformed address is the `Err`, naming the fix.
+fn answering_seat_from(explicit: Option<&str>, binding: Option<&str>) -> Result<AnsweringSeat, String> {
+    let (reference, is_explicit) = match (explicit, binding) {
+        (Some(e), _) => (e, true),
+        (None, Some(b)) => (b, false),
+        (None, None) => return Ok(AnsweringSeat::Here { explicit: None }),
+    };
+    let address = darkmux_types::profile_address::ProfileAddress::parse(reference)?;
+    Ok(match address.machine {
+        Some(machine) => AnsweringSeat::Peer { profile: address.profile, machine },
+        None if is_explicit => AnsweringSeat::Here { explicit: Some(address.profile) },
+        None => AnsweringSeat::Here { explicit: None },
+    })
+}
+
+/// The seat under `overrides`: the session picker wins over
+/// `radio.answerer_profile`, which wins over `role_profiles.radio-host`.
+/// Factored so [`dispatch_answerer_call_with`], [`grounding_scope_for`] and
+/// [`answering_seat_target`] all decide about the SAME seat: two copies of
+/// this precedence would be a data-boundary bug waiting to happen (the gate
+/// deciding about one profile while the dispatch went to another).
+fn resolved_answering_seat(overrides: &AnswererOverrides) -> Result<AnsweringSeat, String> {
+    let explicit = overrides
+        .profile_name
+        .clone()
+        .or_else(darkmux_types::config_access::radio_answerer_profile);
+    let binding = darkmux_types::config_access::role_profile("radio-host");
+    answering_seat_from(explicit.as_deref(), binding.as_deref()).map(local_when_naming_this_machine)
+}
+
+/// An address naming THIS machine is a local seat. `dispatch_routed_via`
+/// runs such an address here (its `routing_decision` says `Local`), so the
+/// seat's data boundary is the local one: a hosted profile written as
+/// `cloud@<this machine>` must withhold grounding like a bare `cloud`. The
+/// comparison is that same `routing_decision`, not a second one. When this
+/// machine's id cannot be resolved, `routing_decision` says `Remote` and
+/// `dispatch_routed_via` submits to the named machine, so the seat stays a
+/// [`AnsweringSeat::Peer`], matching what happens.
+fn local_when_naming_this_machine(seat: AnsweringSeat) -> AnsweringSeat {
+    use crate::crew::dispatch::{routing_decision, RoutingDecision};
+    match seat {
+        AnsweringSeat::Peer { profile, machine } => {
+            let local = darkmux_flow::resolve_machine_id();
+            match routing_decision(Some(&machine), local.as_deref()) {
+                RoutingDecision::Local { .. } => AnsweringSeat::Here { explicit: Some(profile) },
+                RoutingDecision::Remote { .. } => AnsweringSeat::Peer { profile, machine },
+            }
+        }
+        here @ AnsweringSeat::Here { .. } => here,
     }
 }
 
-/// The answering seat's per-call completion budget when the operator has
-/// not set `runtime.max_tokens_per_call`. The single-shot path's own
-/// default is 4096, and a 35B thinking model spent exactly that reasoning
-/// about "how do I see what is loaded?" and returned no text (2026-08-28).
-/// 16,384 is the figure the same path already uses when reasoning effort
-/// is set; a thinking model is the radio-host's normal staffing.
-pub const RADIO_ANSWER_TOKEN_CAP: u32 = 16_384;
-
-/// `runtime.max_tokens_per_call` when set (env or config.json), else
-/// [`RADIO_ANSWER_TOKEN_CAP`]. The knob's documented meaning is exactly this
-/// budget (reasoning + content of one call), so radio honors it rather than
-/// growing a knob of its own.
-pub fn answer_token_cap() -> u32 {
-    darkmux_types::config_access::max_tokens_per_call().unwrap_or(RADIO_ANSWER_TOKEN_CAP)
+/// The grounding scope this dispatch is allowed: [`GroundingScope::RemoteSafe`]
+/// when the answering seat resolves to a hosted endpoint on this machine.
+/// Fails closed via `crew::dispatch::dispatch_resolves_remote`, and for a
+/// malformed address. A fleet peer is one of the operator's own machines,
+/// not a hosted endpoint: the scope is [`GroundingScope::Full`].
+pub fn grounding_scope_for(overrides: &AnswererOverrides) -> GroundingScope {
+    match resolved_answering_seat(overrides) {
+        Ok(AnsweringSeat::Here { explicit }) => {
+            if crate::crew::dispatch::dispatch_resolves_remote("radio-host", explicit.as_deref(), None) {
+                GroundingScope::RemoteSafe
+            } else {
+                GroundingScope::Full
+            }
+        }
+        Ok(AnsweringSeat::Peer { .. }) => GroundingScope::Full,
+        Err(_) => GroundingScope::RemoteSafe,
+    }
 }
 
 /// The seat's text, or an error when there is none. `single_shot` returns
@@ -1582,31 +1601,41 @@ pub fn answer_text(stdout: &str, cap: u32) -> Result<String> {
     Ok(text.to_string())
 }
 
-/// Substitute every placeholder in the `radio-host` persona template.
-/// Split out of [`dispatch_answerer_call_with`] as a PURE function so the
-/// substitution is assertable on the FINISHED text (#1861): the persona
-/// golden below pins the TEMPLATE, and a template golden structurally
-/// cannot catch a substitution that stops firing and ships a raw
-/// `{{surface_instructions}}` to the model. Takes `persona` rather than
-/// loading it, so a test can pin the SHIPPED template without resolving an
-/// operator's own `~/.darkmux/roles/radio-host.md` override.
-fn substitute_persona(persona: &str, humor: u8, surface: RadioSurface) -> String {
-    persona
-        .replace("{{humor}}", &humor.to_string())
-        .replace("{{surface_instructions}}", &surface_instructions(surface))
-}
-
+/// The production [`AnswererCall`] implementation, parameterized by session
+/// overrides. Resolves the answering seat once ([`resolved_answering_seat`])
+/// and runs it through `dispatch_routed_single_shot` with the container-free
+/// single-shot primitive:
+///
+/// - [`AnsweringSeat::Here`]: on this machine. The persona is this
+///   machine's `radio-host` template (an operator-tier override wins, per
+///   `crate::crew::loader::role_prompt`) with `{{humor}}` and the surface
+///   substituted, handed over via `DispatchOpts.system_prompt_override`.
+/// - [`AnsweringSeat::Peer`]: submitted to that peer's fleet listener as a
+///   `single_shot` job. What crosses is the humor, the surface and the token
+///   budget, never prompt text: the PEER builds the persona from ITS OWN
+///   `radio-host` template (so this machine's override of that template does
+///   not reach a peer) and runs the exchange under the smaller of the
+///   budget sent here and its own `runtime.max_tokens_per_call`.
 pub fn dispatch_answerer_call_with(
     user_message: &str,
     overrides: &AnswererOverrides,
     surface: RadioSurface,
 ) -> Result<String> {
-    let persona = crate::crew::loader::role_prompt("radio-host").ok_or_else(|| {
-        anyhow::anyhow!("radio-host role has no readable .md persona template — cannot dispatch the answering seat")
-    })?;
     let humor = overrides.humor.unwrap_or_else(darkmux_types::config_access::radio_humor);
-    let system_prompt = substitute_persona(&persona, humor, surface);
-    let profile_name = resolved_answerer_profile(overrides);
+    let seat = resolved_answering_seat(overrides).map_err(|e| anyhow::anyhow!("radio answering seat: {e}"))?;
+    let cap = answer_token_cap();
+    let (profile_name, machine, system_prompt_override, single_shot, seat_label) = match &seat {
+        AnsweringSeat::Here { explicit } => {
+            (explicit.clone(), None, Some(answering_system_prompt(humor, surface)?), None, None)
+        }
+        AnsweringSeat::Peer { profile, machine } => (
+            Some(profile.clone()),
+            Some(machine.clone()),
+            None,
+            Some(crate::fleet::SingleShotJob { humor, surface, max_completion_tokens: cap }),
+            Some(format!("{profile}@{machine}")),
+        ),
+    };
 
     let opts = crate::crew::dispatch::DispatchOpts {
         // (#2914) Work never runs on the utility model.
@@ -1620,7 +1649,7 @@ pub fn dispatch_answerer_call_with(
         host_out: None,
         max_turns_override: None,
         timeout_override_seconds: None, // (#2480)
-        role_id: "radio-host".to_string(),
+        role_id: crate::crew::loader::RADIO_HOST_ROLE_ID.to_string(),
         message: user_message.to_string(),
         session: crate::radio::radio_session("radio-host"),
         timeout_seconds: 300,
@@ -1628,7 +1657,9 @@ pub fn dispatch_answerer_call_with(
         json: false,
         workdir: None,
         phase_id: None,
-        machine: None,
+        // A peer seat is submitted to that machine's fleet listener by
+        // `dispatch_routed_single_shot`.
+        machine,
         wait: true,
         compaction: crate::crew::dispatch::CompactionDispatchArgs::default(),
         // (#1698 Packet B2, scope E/F) session override (the "radio host"
@@ -1638,27 +1669,36 @@ pub fn dispatch_answerer_call_with(
         profile_name,
         config_path: None,
         force_container: false,
-        max_completion_tokens: Some(answer_token_cap()),
+        max_completion_tokens: Some(cap),
         image: None,
         model_base_url_override: None,
         step_id: None,
-        system_prompt_override: Some(system_prompt),
+        system_prompt_override,
     };
-    let result = crate::fleet::dispatch_routed_via(opts, crate::crew::dispatch::dispatch_local_single_shot)?;
-    answer_text(&result.stdout, answer_token_cap())
+    let result =
+        crate::fleet::dispatch_routed_single_shot(opts, single_shot, crate::crew::dispatch::dispatch_local_single_shot)
+            .map_err(|e| match &seat_label {
+                Some(address) => e.context(format!("the answering seat `{address}`")),
+                None => e,
+            })?;
+    answer_text(&result.stdout, cap)
 }
 
 /// (#2917) The local LM Studio instance the answering seat would send to
-/// under `overrides` — the SAME profile precedence [`dispatch_answerer_call_with`]
-/// dispatches on (picker > `radio.answerer_profile` > `role_profiles.
-/// radio-host` > `default_profile`), resolved through the SAME crew helper
-/// family `grounding_scope_for` uses, so the instance checked for busy is
-/// the instance sent to. `None` for a hosted seat (it queues on the
-/// provider's side, not on this machine's one instance) or an
-/// unresolvable one (the dispatch itself then says why).
+/// under `overrides`, resolved from the SAME [`resolved_answering_seat`]
+/// [`dispatch_answerer_call_with`] dispatches on, so the instance checked
+/// for busy is the instance sent to. `None` for a hosted seat (it queues on
+/// the provider's side, not on this machine's one instance), an
+/// unresolvable one (the dispatch itself then says why), and a fleet peer's
+/// seat: whether its instance is busy is the receiver's busy policy, applied
+/// when the job arrives, never a lookup of a local instance.
 pub fn answering_seat_target(overrides: &AnswererOverrides) -> Option<crate::crew::dispatch::LocalTarget> {
-    let profile = resolved_answerer_profile(overrides);
-    crate::crew::dispatch::dispatch_local_target("radio-host", profile.as_deref(), None)
+    match resolved_answering_seat(overrides) {
+        Ok(AnsweringSeat::Here { explicit }) => {
+            crate::crew::dispatch::dispatch_local_target("radio-host", explicit.as_deref(), None)
+        }
+        Ok(AnsweringSeat::Peer { .. }) | Err(_) => None,
+    }
 }
 
 /// (#2917) What [`answer_live`] hands back: the seat's answer, or the fact
@@ -1728,6 +1768,132 @@ pub const HUMOR_PRESETS: &[u8] = &[10, 50, 75, 100];
 
 #[cfg(test)]
 mod tests {
+    // ── the answering seat: an address is a peer, never a local profile name ──
+
+    #[test]
+    fn a_profile_address_is_a_peer_seat() {
+        assert_eq!(
+            answering_seat_from(Some("deep@studio"), None),
+            Ok(AnsweringSeat::Peer { profile: "deep".into(), machine: "studio".into() })
+        );
+    }
+
+    #[test]
+    fn an_address_bound_to_the_radio_host_role_is_a_peer_seat() {
+        assert_eq!(
+            answering_seat_from(None, Some("deep@studio")),
+            Ok(AnsweringSeat::Peer { profile: "deep".into(), machine: "studio".into() })
+        );
+    }
+
+    #[test]
+    fn the_explicit_reference_wins_over_the_role_binding() {
+        assert_eq!(
+            answering_seat_from(Some("mine"), Some("deep@studio")),
+            Ok(AnsweringSeat::Here { explicit: Some("mine".into()) })
+        );
+        assert_eq!(
+            answering_seat_from(Some("deep@studio"), Some("mine")),
+            Ok(AnsweringSeat::Peer { profile: "deep".into(), machine: "studio".into() })
+        );
+    }
+
+    #[test]
+    fn an_unaddressed_binding_stays_with_dispatch_to_resolve() {
+        assert_eq!(answering_seat_from(None, Some("mine")), Ok(AnsweringSeat::Here { explicit: None }));
+        assert_eq!(answering_seat_from(None, None), Ok(AnsweringSeat::Here { explicit: None }));
+    }
+
+    #[test]
+    fn a_malformed_address_is_refused_naming_it() {
+        for bad in ["deep@", "@studio", "a@b@c", "deep@stu dio"] {
+            let err = answering_seat_from(Some(bad), None).unwrap_err();
+            assert!(err.contains(bad), "the refusal names `{bad}`: {err}");
+        }
+    }
+
+    #[test]
+    fn a_peer_seat_is_not_a_hosted_endpoint_and_has_no_local_instance_to_check() {
+        let o = AnswererOverrides { profile_name: Some("deep@studio".into()), humor: None };
+        assert_eq!(grounding_scope_for(&o), GroundingScope::Full);
+        assert_eq!(answering_seat_target(&o), None);
+    }
+
+    /// A throwaway machine: `DARKMUX_HOME`, a registry with a hosted-endpoint
+    /// profile `cloud` and a local profile `deep`, and this machine's id.
+    struct SeatEnv {
+        _home: tempfile::TempDir,
+        _guards: Vec<EnvGuard>,
+    }
+
+    impl SeatEnv {
+        fn new(machine_id: Option<&str>) -> Self {
+            let home = tempfile::TempDir::new().unwrap();
+            let profiles = home.path().join("profiles.json");
+            std::fs::write(
+                &profiles,
+                r#"{"profiles":{"cloud":{"models":[{"id":"hosted-model","n_ctx":32000,"endpoint":"mock"}]},
+                                "deep":{"models":[{"id":"local-deep","n_ctx":8000}]}},
+                    "endpoints":{"mock":{"url":"http://127.0.0.1:9/v1"}},
+                    "default_profile":"deep"}"#,
+            )
+            .unwrap();
+            let mut guards = vec![
+                EnvGuard::set("DARKMUX_HOME", home.path().to_str().unwrap()),
+                EnvGuard::set("DARKMUX_PROFILES", profiles.to_str().unwrap()),
+                EnvGuard::set("DARKMUX_RADIO_ANSWERER_PROFILE", ""),
+            ];
+            if let Some(id) = machine_id {
+                guards.push(EnvGuard::set("DARKMUX_MACHINE_ID", id));
+            }
+            Self { _home: home, _guards: guards }
+        }
+    }
+
+    fn seat_overrides(reference: &str) -> AnswererOverrides {
+        AnswererOverrides { profile_name: Some(reference.into()), humor: None }
+    }
+
+    /// The data boundary follows where the model RUNS. `dispatch_routed_via`
+    /// runs an address naming this machine here, so a hosted profile written
+    /// as `cloud@<this machine>` must withhold grounding exactly like a bare
+    /// `cloud`; and the same address is spelled case-insensitively.
+    #[test]
+    #[serial_test::serial]
+    fn an_address_naming_this_machine_is_a_local_seat_for_the_data_boundary() {
+        let _env = SeatEnv::new(Some("Laptop"));
+        assert_eq!(grounding_scope_for(&seat_overrides("cloud")), GroundingScope::RemoteSafe);
+        assert_eq!(grounding_scope_for(&seat_overrides("cloud@laptop")), GroundingScope::RemoteSafe);
+        assert_eq!(grounding_scope_for(&seat_overrides("deep@LAPTOP")), GroundingScope::Full);
+        assert_eq!(
+            resolved_answering_seat(&seat_overrides("deep@laptop")),
+            Ok(AnsweringSeat::Here { explicit: Some("deep".into()) })
+        );
+        // Another machine stays a peer.
+        assert_eq!(grounding_scope_for(&seat_overrides("cloud@studio")), GroundingScope::Full);
+    }
+
+    /// (#2917) The busy check reads THIS machine's instance, so it exists
+    /// for a local seat and never for a peer's.
+    #[test]
+    #[serial_test::serial]
+    fn the_busy_check_targets_a_local_seat_and_never_a_peer() {
+        let _env = SeatEnv::new(Some("laptop"));
+        let target = answering_seat_target(&seat_overrides("deep")).expect("a local profile has an instance");
+        assert_eq!(target.model_key, "local-deep");
+        assert_eq!(answering_seat_target(&seat_overrides("deep@studio")), None);
+        assert_eq!(answering_seat_target(&seat_overrides("cloud")), None, "a hosted seat has no local instance");
+        assert!(answering_seat_target(&seat_overrides("deep@laptop")).is_some(), "this machine's own address is local");
+    }
+
+    #[test]
+    fn a_malformed_address_fails_the_data_boundary_closed() {
+        let o = AnswererOverrides { profile_name: Some("a@b@c".into()), humor: None };
+        assert_eq!(grounding_scope_for(&o), GroundingScope::RemoteSafe);
+        let err = dispatch_answerer_call_with("hi", &o, RadioSurface::Cli).unwrap_err();
+        assert!(format!("{err:#}").contains("a@b@c"), "{err:#}");
+    }
+
     use super::*;
 
     fn entry(id: &str, description: &str) -> CatalogEntry {
@@ -3247,34 +3413,6 @@ mod tests {
         assert_eq!(outcome.text, "Your context window is 100000 tokens on the current profile.");
     }
 
-    // ── persona substitution (#1861 review) ──────────────────────────────
-
-    #[test]
-    fn substitute_persona_fills_every_placeholder_per_surface() {
-        // The golden below pins the TEMPLATE; only this pins the finished
-        // text, which is what actually reaches the model.
-        const SHIPPED_TEMPLATE: &str =
-            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/templates/builtin/roles/radio-host.md"));
-        assert!(SHIPPED_TEMPLATE.contains("{{surface_instructions}}"), "the template must still carry the placeholder");
-        for (surface, needle) in
-            // (#2050) The CLI needle is the BARE-ID clause, not just the
-            // canonical form: the instruction already named the canonical
-            // form and the seat still wrote a bare id, so what this pins
-            // is the sentence that closes that gap.
-            [(RadioSurface::Cli, "never the id on its own"), (RadioSurface::Panel, "/mission launch <id>")]
-        {
-            let prompt = substitute_persona(SHIPPED_TEMPLATE, 40, surface);
-            assert!(!prompt.contains("{{"), "no placeholder may reach the model ({surface:?}): {prompt}");
-            assert!(prompt.contains(needle), "the {surface:?} instruction must be substituted in: {prompt}");
-            assert!(prompt.contains("40"), "the humor value must still substitute: {prompt}");
-        }
-        assert_ne!(
-            substitute_persona(SHIPPED_TEMPLATE, 40, RadioSurface::Cli),
-            substitute_persona(SHIPPED_TEMPLATE, 40, RadioSurface::Panel),
-            "the two surfaces must not produce the same system prompt"
-        );
-    }
-
     // ── build_answer_message ─────────────────────────────────────────────
 
     #[test]
@@ -3400,20 +3538,6 @@ mod tests {
         assert!(err.contains("runtime.max_tokens_per_call"), "{err}");
         assert!(err.to_lowercase().contains("reason"), "{err}");
         assert_eq!(answer_text("Run `darkmux machine status`.", 4096).unwrap(), "Run `darkmux machine status`.");
-    }
-
-    /// The seat's per-call budget honors the operator's knob and otherwise
-    /// gives a reasoning model room: the single-shot default of 4096 is what
-    /// produced the empty answer.
-    #[test]
-    #[serial_test::serial]
-    fn answer_token_cap_honors_the_config_knob_and_defaults_above_4096() {
-        let _g = EnvGuard::set("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL", "12000");
-        assert_eq!(answer_token_cap(), 12000);
-        drop(_g);
-        let _g = EnvGuard::set("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL", "");
-        assert!(answer_token_cap() > 4096, "{}", answer_token_cap());
-        assert_eq!(answer_token_cap(), RADIO_ANSWER_TOKEN_CAP);
     }
 }
 

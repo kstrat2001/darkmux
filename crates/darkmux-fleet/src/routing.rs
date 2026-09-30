@@ -53,6 +53,7 @@ pub fn build_work_job(
         timeout_seconds,
         published_at_unix_ms,
         published_by_machine,
+        single_shot: None,
     }
 }
 
@@ -66,6 +67,7 @@ pub fn build_work_job(
 // `runner::execute_job`, which never re-routes.
 // ─────────────────────────────────────────────────────────────────────────
 
+use crate::job::SingleShotJob;
 use darkmux_crew::dispatch::{self, DispatchOpts, DispatchResult, RoutingDecision};
 
 /// Route a dispatch local-vs-remote, then run it locally via the raw
@@ -126,7 +128,21 @@ fn address_label(opts: &DispatchOpts, target: &str) -> String {
 /// (#1509): the CLI verb passes `dispatch_as_crew_of_one`, radio passes its
 /// single-shot primitive, `phase_cli` the raw one via [`dispatch_routed`].
 pub fn dispatch_routed_via(
+    opts: DispatchOpts,
+    local_dispatch: impl FnOnce(DispatchOpts) -> Result<DispatchResult>,
+) -> Result<DispatchResult> {
+    dispatch_routed_single_shot(opts, None, local_dispatch)
+}
+
+/// [`dispatch_routed_via`] for a caller whose exchange is ONE tool-less
+/// single-shot under the radio persona (the answering seat). `single_shot`
+/// travels with a job submitted to a peer, which then builds the persona
+/// itself and runs the exchange through the single-shot primitive
+/// ([`SingleShotJob`]); a dispatch that stays here ignores it, because the
+/// caller's `local_dispatch` is already that primitive.
+pub fn dispatch_routed_single_shot(
     mut opts: DispatchOpts,
+    single_shot: Option<SingleShotJob>,
     local_dispatch: impl FnOnce(DispatchOpts) -> Result<DispatchResult>,
 ) -> Result<DispatchResult> {
     apply_profile_address(&mut opts)?;
@@ -185,7 +201,7 @@ pub fn dispatch_routed_via(
                 // #290 — the pinned route record, so the audit trail and
                 // topology UI see the operator-pinned routing decision.
                 dispatch::emit_route_record(&opts, Some(&target));
-                return dispatch_via_submission(opts, &target);
+                return dispatch_via_submission(opts, &target, single_shot);
             }
             RoutingDecision::Remote {
                 target,
@@ -207,7 +223,7 @@ pub fn dispatch_routed_via(
                     ));
                 }
                 dispatch::emit_route_record(&opts, Some(&target));
-                return dispatch_via_submission(opts, &target);
+                return dispatch_via_submission(opts, &target, single_shot);
             }
             RoutingDecision::Local {
                 matches_was_explicit: false,
@@ -230,12 +246,14 @@ pub fn dispatch_routed_via(
 ///
 /// What crosses: role, message, session id, `--profile`, `--workdir` (a
 /// path on the RECEIVER, and only if its allow-list entry grants
-/// `workspace`), `--image`, `timeout_seconds`. What does not:
-/// `--timeout`'s inactivity override, `--max-completion-tokens`, compaction
-/// flags, `--json` (the receiver's human output is returned as stdout).
-fn dispatch_via_submission(opts: DispatchOpts, target: &str) -> Result<DispatchResult> {
+/// `workspace`), `--image`, `timeout_seconds`, and, for the radio answering
+/// seat, `single_shot` (persona parameters and the token budget, never a
+/// system prompt). What does not: `--timeout`'s inactivity override,
+/// `--max-completion-tokens` (outside `single_shot`), compaction flags,
+/// `--json` (the receiver's human output is returned as stdout).
+fn dispatch_via_submission(opts: DispatchOpts, target: &str, single_shot: Option<SingleShotJob>) -> Result<DispatchResult> {
     let session_id = opts.session.clone();
-    let job = build_work_job(
+    let mut job = build_work_job(
         target.to_string(),
         opts.role_id.clone(),
         opts.message.clone(),
@@ -246,6 +264,7 @@ fn dispatch_via_submission(opts: DispatchOpts, target: &str) -> Result<DispatchR
         opts.timeout_seconds,
         darkmux_flow::resolve_machine_id(),
     );
+    job.single_shot = single_shot;
     eprintln!(
         "darkmux dispatch: submitting to {target} (run={}{})…",
         session_id.wire(),
@@ -668,6 +687,31 @@ mod tests {
         assert_eq!(sent["job"]["profile"], "host", "the owner's own profile name crosses: {sent}");
         assert_eq!(sent["job"]["target_machine"], "Peer-B");
         assert_eq!(sent["schema"], crate::WORK_JOB_SCHEMA_VERSION);
+    }
+
+    /// The answering seat's single-shot mode rides the job to the peer as
+    /// parameters; an ordinary dispatch to the same peer writes no such field.
+    #[test]
+    #[serial]
+    fn a_single_shot_dispatch_submits_its_mode_to_the_peer() {
+        let single_shot = crate::SingleShotJob {
+            humor: 61,
+            surface: darkmux_flow::payload::RadioSurface::Cli,
+            max_completion_tokens: 9_000,
+        };
+        for (mode, expected) in [
+            (Some(single_shot), serde_json::json!({"humor": 61, "surface": "cli", "max_completion_tokens": 9000})),
+            (None, serde_json::Value::Null),
+        ] {
+            let (port, rx) = spawn_scripted_peer("{\"status\":\"completed\",\"exit_code\":0,\"stdout\":\"done\"}\n");
+            let _env = PeerEnv::new(port);
+            peer_b_is_verified();
+            let mut opts = local_opts("radio-host");
+            opts.profile_name = Some("host@Peer-B".to_string());
+            dispatch_routed_single_shot(opts, mode, |_| panic!("never local")).unwrap();
+            let sent: serde_json::Value = serde_json::from_str(&rx.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap();
+            assert_eq!(sent["job"]["single_shot"], expected, "{sent}");
+        }
     }
 
     /// (#2916 stage 2) An address naming THIS machine runs here, on the

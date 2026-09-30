@@ -1157,6 +1157,23 @@ darkmux release.
 
 ### Added (4.0)
 
+- **Radio's answering seat can run on a fleet peer.** Set `radio.answerer_profile`
+  (or `role_profiles.radio-host`) to `<profile>@<machine>` and the seat's dispatch
+  is submitted to that machine, which runs it on its own profile; the peer must
+  trust the sender for the profile and the `radio-host` role (`darkmux machine
+  trust <sender> --profiles <profile> --roles radio-host`). A peer seat is not
+  read as a hosted endpoint (grounding is not withheld), its busy check is the
+  peer's, and every refusal names the address. The peer builds radio's persona
+  from its own `radio-host` prompt and runs one tool-less exchange (a new
+  optional `single_shot` field on the fleet job, still version 8: humor,
+  surface and token budget, never prompt text; only the `radio-host` role has
+  it), under the smaller of the sender's `runtime.max_tokens_per_call` and its
+  own. An address naming the machine you are on is a local seat, so a hosted
+  profile written that way still withholds grounding. `config set` refuses a
+  malformed address for either key, `doctor` no longer reports a `radio-host`
+  address binding as an undefined profile, and a new `radio peer seat` check
+  warns when the address names a machine that is not in the roster.
+
 - **An optional, one-time upgrade skill for a 3.x home**,
   `docs/upgrade/darkmux-upgrade/SKILL.md`. An agent follows it to apply what
   `darkmux doctor` names: back the home up, then fix `config.json`,
