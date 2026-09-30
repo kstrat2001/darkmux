@@ -1034,6 +1034,7 @@ mod tests {
             timeout_seconds: 60,
             published_at_unix_ms: 1,
             published_by_machine: Some("macbook-pro".into()),
+            single_shot: None,
         }
     }
 

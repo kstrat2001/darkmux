@@ -183,6 +183,23 @@ use darkmux_types::residency_lease;
 /// protection the CLI verb and mission engine already have — see the
 /// module doc for which callers that is and is not.
 pub fn dispatch_reconciled(opts: DispatchOpts) -> Result<DispatchResult> {
+    reconcile_then(opts, crate::dispatch::dispatch)
+}
+
+/// [`dispatch_reconciled`] for one tool-less single exchange: the same seat
+/// resolution, Exclusive reconcile and lease, then the container-free
+/// [`crate::dispatch::dispatch_local_single_shot`] instead of the agent
+/// loop. A fleet peer runs a submitted `single_shot` job (the radio
+/// answering seat) here, so the peer answers the way the sender's own local
+/// seat would have.
+pub fn dispatch_reconciled_single_shot(opts: DispatchOpts) -> Result<DispatchResult> {
+    reconcile_then(opts, crate::dispatch::dispatch_local_single_shot)
+}
+
+fn reconcile_then(
+    opts: DispatchOpts,
+    local_dispatch: impl FnOnce(DispatchOpts) -> Result<DispatchResult>,
+) -> Result<DispatchResult> {
     let seat = format!("dispatch-reconciled:{}", opts.role_id);
     let claim = crate::step_kinds::resolve_local_seat(
         &opts.role_id,
@@ -190,7 +207,7 @@ pub fn dispatch_reconciled(opts: DispatchOpts) -> Result<DispatchResult> {
         opts.config_path.as_deref(),
         &seat,
     );
-    dispatch_reconciled_with(opts, claim, crate::dispatch::dispatch, &crate::concurrent_dispatch::lms_host_factory)
+    dispatch_reconciled_with(opts, claim, local_dispatch, &crate::concurrent_dispatch::lms_host_factory)
 }
 
 /// The injectable core: `claim` and `local_dispatch` arrive as values so a
