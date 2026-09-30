@@ -30,6 +30,7 @@ mod cycle_detector;
 mod detection;
 mod failure_rate;
 mod feedback;
+mod interrupt;
 mod json_repair;
 mod lmstudio;
 mod checkpoint;
@@ -972,6 +973,10 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // the tree it's operating on). The container is --rm, so this is what
     // survives it.
     let mut traj = trajectory::Trajectory::open(Path::new(trajectory::RUNTIME_OUT_BASE));
+    // (#3014) A SIGTERM/SIGINT closes the trajectory with `interrupted`.
+    if let Some(writer) = traj.interrupt_writer() {
+        interrupt::install(writer, |code| std::process::exit(code));
+    }
     let system_chars = initial_messages[0].content.as_deref().map(str::len).unwrap_or(0);
     let prompt_chars = initial_messages[1].content.as_deref().map(str::len).unwrap_or(0);
     traj.append_dispatch_start(&model, system_chars, prompt_chars, &tool_names);

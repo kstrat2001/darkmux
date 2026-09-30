@@ -153,6 +153,7 @@ darkmux lab run pepper-grinder</code></pre>
     <ul>
       <li><strong><code>OVERLAP</code></strong> (set view only): this run's window overlaps another run's in the same set. Host telemetry is matched by time window, so two overlapping runs would each claim the whole host's power; GPU-busy time and package energy are excluded from the set's ranges and from cost per success for both, rather than apportioned.</li>
       <li><strong><code>RUNTIME-ERROR</code></strong> / <strong><code>ESCALATED</code></strong>: the runtime's own terminal result. A run can pass verify without doing the task (an untouched-tree fixture is green from second zero), so this is flagged, never reclassified.</li>
+      <li><strong><code>INTERRUPTED</code></strong>: a signal ended the run. The figures cover what completed before it, and the trajectory's terminal record says <code>interrupted</code>.</li>
       <li><strong><code>VERDICT</code></strong>: the runtime's recorded degeneracy verdicts don't match what the tail-ratio threshold would derive &mdash; a sign the constant here no longer matches the build that produced the run.</li>
       <li><strong><code>UNBILLED</code></strong> / <strong><code>STREAMS</code></strong>: a gate cut a stream before its usage frame arrived (tok/s then covers only the billed subset), or a stream started but never ended.</li>
       <li><strong><code>REST</code></strong>: rest exceeds wall &mdash; two counters measuring different windows.</li>

@@ -166,14 +166,20 @@ pub struct DispatchStart {
     pub tools: Vec<String>,
 }
 
+/// The `dispatch.complete` result of an execution a signal ended (the
+/// runtime's SIGTERM/SIGINT path, or a host that found no terminal record
+/// after the execution died). Never a reason the loop chose.
+pub const RESULT_INTERRUPTED: &str = "interrupted";
+
 /// `dispatch.complete`: the last event, written on every exit the runtime
-/// reaches (a hard kill writes none).
+/// reaches. A SIGTERM or SIGINT writes it with `result: "interrupted"`
+/// ([`RESULT_INTERRUPTED`]); SIGKILL is uncatchable and writes none.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DispatchComplete {
     pub ts: u64,
     /// The terminal reason: `stop`, `max_turns`, an `escalation_*` reason,
-    /// or `error`.
+    /// `error`, or `interrupted` ([`RESULT_INTERRUPTED`]).
     pub result: String,
     /// The runtime's own wall clock for the execution, rests included.
     pub wall_ms: u64,

@@ -305,6 +305,8 @@ EnvelopeMetrics
   total_tokens: uint64
   reasoning_tokens: uint64 | null
   cached_tokens: uint64 | null
+  unreported_calls?: uint32
+  estimated_completion_tokens?: uint64
   rest_ms: uint64
   rests: uint32
   turn_delay_effective_ms: uint64 | null

@@ -114,6 +114,7 @@ pub fn flags(s: &RunStats) -> Vec<&'static str> {
     // Flagged, never reclassified; the outcome is the fixture's to define.
     match s.result.as_deref() {
         Some("error") => f.push("RUNTIME-ERROR"),
+        Some(darkmux_trajectory::RESULT_INTERRUPTED) => f.push("INTERRUPTED"),
         Some(r) if r.starts_with("escalation") => f.push("ESCALATED"),
         _ => {}
     }

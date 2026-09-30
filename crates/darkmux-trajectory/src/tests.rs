@@ -395,3 +395,36 @@ fn a_partial_envelope_prints_no_empty_string_for_what_it_lacked() {
     assert!(v.get("result").is_none() && v.get("trajectory_path").is_none(), "{v}");
     assert_eq!(v["final_assistant"], "hi");
 }
+
+/// (#3014) A killed execution's copy gets a terminal `interrupted` record;
+/// one that already ended, or has nothing in it, is left alone.
+#[test]
+fn an_unterminated_trajectory_is_closed_as_interrupted_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("trajectory.jsonl");
+    // A kill mid-write leaves a partial last line.
+    std::fs::write(
+        &path,
+        concat!(
+            r#"{"type":"dispatch.start","ts":1000,"model":"m"}"#, "\n",
+            r#"{"type":"model.completed","seq":1,"ts":4000,"finish_reason":"stop","usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}"#, "\n",
+            r#"{"type":"tool.comple"#,
+        ),
+    )
+    .unwrap();
+    assert!(close_if_unterminated(&path).unwrap());
+    let f = TrajectoryFold::from_path(&path);
+    let done = f.complete.expect("a terminal record now exists");
+    assert_eq!(done.result, RESULT_INTERRUPTED);
+    assert_eq!(done.wall_ms, 3000, "the wall time the events cover");
+    assert_eq!(f.tokens.completion, 2, "what completed is kept");
+    assert!(!close_if_unterminated(&path).unwrap(), "a closed trajectory is left alone");
+
+    let empty = dir.path().join("empty.jsonl");
+    std::fs::write(&empty, "").unwrap();
+    assert!(!close_if_unterminated(&empty).unwrap(), "no events: nothing to close");
+    let ended = dir.path().join("ended.jsonl");
+    std::fs::write(&ended, "{\"type\":\"dispatch.start\",\"ts\":1}\n{\"type\":\"dispatch.complete\",\"ts\":2,\"result\":\"stop\",\"wall_ms\":1}\n").unwrap();
+    assert!(!close_if_unterminated(&ended).unwrap(), "the runtime's own terminal record stands");
+    assert_eq!(TrajectoryFold::from_path(&ended).complete.unwrap().result, "stop");
+}

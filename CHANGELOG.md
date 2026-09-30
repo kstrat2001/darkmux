@@ -1149,6 +1149,15 @@ darkmux release.
 
 ### Fixed (4.0)
 
+- **An interrupted lab run keeps its trajectory (#3014).** A run stopped with
+  Ctrl-C or SIGTERM left its trajectory only in a temp directory, so
+  `darkmux run stats` said "no trajectory events" for an hour of evidence. The
+  lab harness now names the dispatch's out directory up front and copies the
+  trajectory and findings into the run directory on every exit path, and the
+  runtime catches SIGTERM and SIGINT and closes the trajectory with a
+  `dispatch.complete` whose `result` is `interrupted` (a SIGKILLed run gets the
+  same record from the host). `run stats` reports what completed, prints an
+  interrupted caveat with the figures, and flags the run `INTERRUPTED`.
 - **A compaction loop that never stops is now bounded (#3013).** When every
   compaction succeeds but the turn after each one re-reads exactly what the
   turn before it read, no occupancy counter grew and the run went on until

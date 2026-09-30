@@ -18,6 +18,8 @@ use darkmux_trajectory as dt;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::lmstudio::ToolCall;
@@ -94,6 +96,37 @@ pub struct Trajectory {
     /// silently). All append methods become no-ops in that case.
     file: Option<File>,
     started: Instant,
+    /// Set by whichever of the normal exit and the interrupt path writes the
+    /// terminal `dispatch.complete` first, so a run never carries two.
+    terminal_written: Arc<AtomicBool>,
+}
+
+/// A second handle on the trajectory file for the signal path (#3014): it can
+/// write the terminal `interrupted` record while the main thread is stopped
+/// mid-turn, and it never writes a terminal record the run already has.
+pub struct InterruptWriter {
+    file: File,
+    started: Instant,
+    terminal_written: Arc<AtomicBool>,
+}
+
+impl InterruptWriter {
+    /// Write `dispatch.complete` with `result: "interrupted"`. `false` when
+    /// the run had already written its terminal record (nothing is written).
+    pub fn write_interrupted(&mut self) -> bool {
+        if self.terminal_written.swap(true, Ordering::SeqCst) {
+            return false;
+        }
+        let event = dt::TrajectoryEvent::DispatchComplete(dt::DispatchComplete {
+            ts: unix_ms(),
+            result: dt::RESULT_INTERRUPTED.to_string(),
+            wall_ms: u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            turn_delay_effective_ms: None,
+        });
+        let mut line = serde_json::to_string(&event).unwrap_or_default();
+        line.push('\n');
+        self.file.write_all(line.as_bytes()).and_then(|()| self.file.sync_data()).is_ok()
+    }
 }
 
 /// (#2836) What a checkpoint verdict was, and what it was computed OVER.
@@ -146,6 +179,7 @@ impl Trajectory {
                 Self {
                     file: Some(file),
                     started: Instant::now(),
+                    terminal_written: Arc::new(AtomicBool::new(false)),
                 }
             }
             Err(e) => {
@@ -156,9 +190,21 @@ impl Trajectory {
                 Self {
                     file: None,
                     started: Instant::now(),
+                    terminal_written: Arc::new(AtomicBool::new(false)),
                 }
             }
         }
+    }
+
+    /// (#3014) A second handle on the open file for the signal path; `None`
+    /// when recording is degraded to a no-op or the descriptor cannot be
+    /// duplicated.
+    pub fn interrupt_writer(&self) -> Option<InterruptWriter> {
+        Some(InterruptWriter {
+            file: self.file.as_ref()?.try_clone().ok()?,
+            started: self.started,
+            terminal_written: Arc::clone(&self.terminal_written),
+        })
     }
 
     /// dispatch.start — first event in the trajectory.
@@ -1191,6 +1237,10 @@ impl Trajectory {
         wall_ms: u128,
         turn_delay_effective_ms: Option<u64>,
     ) {
+        // The interrupt path may have written the terminal record already.
+        if self.terminal_written.swap(true, Ordering::SeqCst) {
+            return;
+        }
         self.write_event(dt::TrajectoryEvent::DispatchComplete(dt::DispatchComplete {
             ts: unix_ms(),
             result: result.to_string(),
@@ -1827,14 +1877,22 @@ mod tests {
         let ws = tempfile::Builder::new().prefix("traj-tdem").tempdir().unwrap();
         let mut t = Trajectory::open(ws.path());
         t.append_dispatch_complete("stop", 3000, Some(500));
+        // A run has ONE terminal record: a second one is dropped.
         t.append_dispatch_complete("error", 10, None);
         drop(t);
         let body = fs::read_to_string(ws.path().join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE)).unwrap();
         let lines: Vec<serde_json::Value> = body.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(lines.len(), 1, "{body}");
         assert_eq!(lines[0]["type"], "dispatch.complete");
         assert_eq!(lines[0]["turn_delay_effective_ms"], 500);
         assert_eq!(lines[0]["wall_ms"], 3000);
-        assert!(lines[1]["turn_delay_effective_ms"].is_null(), "{}", lines[1]);
+        let ws2 = tempfile::Builder::new().prefix("traj-tdem2").tempdir().unwrap();
+        let mut errored = Trajectory::open(ws2.path());
+        errored.append_dispatch_complete("error", 10, None);
+        drop(errored);
+        let body = fs::read_to_string(ws2.path().join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE)).unwrap();
+        let line: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+        assert!(line["turn_delay_effective_ms"].is_null(), "{line}");
     }
 
     #[test]
