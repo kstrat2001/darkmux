@@ -1084,7 +1084,7 @@ compile_error!("the `e2e-fleet-loopback` feature is for the debug-build two-daem
 /// (#2916 review C8): a daemon started by launchd can fail where a shell
 /// succeeds, and the reason used to live only in the daemon's log. Coarse
 /// phrases only: no provider output, no ids.
-static LISTENER_STATE: std::sync::Mutex<Option<(&'static str, String)>> = std::sync::Mutex::new(None);
+pub(crate) static LISTENER_STATE: std::sync::Mutex<Option<(&'static str, String)>> = std::sync::Mutex::new(None);
 
 /// (#2916 stage 2 review C5) The busy policy and hosted-job bound the
 /// running listener was started with (it reads config once), so `darkmux

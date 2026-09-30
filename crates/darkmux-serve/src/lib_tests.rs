@@ -2085,6 +2085,24 @@
         *crate::fleet_listener::LISTENER_BUSY.lock().unwrap() = None;
     }
 
+    /// The listener's detail (its address and why it is up or down) and the
+    /// open-file limit are this machine's business: a peer's `/health` shows
+    /// the coarse word and no limit, and this machine's shows both.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn health_gives_a_non_local_caller_only_the_coarse_listener_word_and_no_file_limit() {
+        *crate::fleet_listener::LISTENER_STATE.lock().unwrap() =
+            Some(("listening", "listening on 100.64.0.2:8766".to_string()));
+        let local = loopback_health(&[]).await;
+        let proxied = loopback_health(&[("X-Forwarded-For", "100.64.0.7")]).await;
+        *crate::fleet_listener::LISTENER_STATE.lock().unwrap() = None;
+        assert_eq!(local["fleet_listener"], "listening on 100.64.0.2:8766", "{local}");
+        assert!(local["open_file_limit"].is_number(), "{local}");
+        assert_eq!(proxied["fleet_listener"], "listening", "a peer learns the word, not the address: {proxied}");
+        assert!(!proxied.to_string().contains("100.64.0.2"), "{proxied}");
+        assert!(proxied["open_file_limit"].is_null(), "{proxied}");
+    }
+
     fn headers_with(pairs: &[(&str, &str)]) -> axum::http::HeaderMap {
         let mut hm = axum::http::HeaderMap::new();
         for (k, v) in pairs {
