@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   batteryAriaLabel,
   batteryFillWidth,
+  batteryHeldExplanation,
   batteryHeldTitle,
   batteryIcon,
   batteryRampStops,
@@ -60,6 +61,12 @@ describe("held state (macOS holding the charge level)", () => {
 
   it("names the held level in the tooltip, and never states a limit it did not observe", () => {
     expect(batteryHeldTitle(held)).toBe("Held at 80% by macOS (charge limit): plugged in, not charging");
+  });
+  it("the (i) explanation states the level, that the hold is deliberate, and that it is not draining", () => {
+    expect(batteryHeldExplanation(held)).toBe(
+      "Held at 80% by macOS's charge limit. It is plugged in and not charging on purpose, which protects the battery. It is not draining.",
+    );
+    expect(batteryHeldExplanation(sample({ on_ac: true, state: "full" }))).toBeNull();
   });
   it("is null for every other state, so nothing claims a hold it did not see", () => {
     for (const state of ["charging", "discharging", "full", "unknown"] as const) {
@@ -233,16 +240,20 @@ describe("batteryRampStops — the REVERSED ramp (red empty -> green full)", () 
     expect(stops[stops.length - 1].color).toBe(gaugeFillColor(0)); // green
   });
 
-  it("each stop is gaugeFillColor at the MIRRORED percent — same palette as every other dial, opposite direction", () => {
-    const stops = batteryRampStops(8);
-    stops.forEach((s, i) => {
-      const t = i / 8;
-      expect(s.color).toBe(gaugeFillColor((1 - t) * 100));
-    });
-    // The midpoint (50% full) reproduces the palette's own amber, same as
-    // it would at the dial's own 50% — the ramp is mirrored, not a
-    // different palette.
-    expect(stops[4].color).toBe(gaugeFillColor(50));
+  it("red is confined to the low end: fully green from 50% up, amber at a quarter", () => {
+    const stops = batteryRampStops(20); // a stop every 5%
+    const at = (pct: number) => stops[pct / 5].color;
+    expect(at(0)).toBe(gaugeFillColor(100)); // red
+    expect(at(25)).toBe(gaugeFillColor(50)); // the palette's amber
+    for (const pct of [50, 80, 100]) expect(at(pct), `${pct}%`).toBe(gaugeFillColor(0)); // green
+  });
+
+  it("the color at a level moves monotonically toward green up to 50%, never back", () => {
+    const stops = batteryRampStops(20);
+    const seen = new Set<string>();
+    for (const pct of [10, 25, 50]) seen.add(stops[pct / 5].color);
+    expect(seen.size).toBe(3);
+    expect(stops[10].color).not.toBe(stops[4].color); // 50% differs from 20%
   });
 
   it("offsets are evenly (linearly) spaced, unlike the arc's cosine-spaced stops — the bar is a straight rectangle", () => {

@@ -44,6 +44,21 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
         fs.mkdirSync(process.env.DARKMUX_BATTERY_SHOTS, { recursive: true });
         await page.locator(".battery-block").screenshot({ path: path.join(process.env.DARKMUX_BATTERY_SHOTS, `${state.id}-${vpName}.png`) });
       }
+      if (state.held) {
+        // Opening the explanation must not move the row either: it floats over the page.
+        await page.getByRole("button", { name: "what held means" }).focus();
+        await expect(page.getByRole("tooltip")).toBeVisible();
+        const open = await measure(page, SIZED);
+        expect(open.row[0].h, "the row grew when the (i) opened").toBe(m.row[0].h);
+        if (process.env.DARKMUX_BATTERY_SHOTS) {
+          await page.locator(".battery-bar-row").scrollIntoViewIfNeeded();
+          await page.evaluate(() => window.scrollBy(0, 120));
+          const r = await page.locator(".battery-bar-row").boundingBox();
+          const t = await page.getByRole("tooltip").boundingBox();
+          const clip = { x: 0, y: Math.max(0, r.y - 40), width: viewport.width, height: Math.min(viewport.height - Math.max(0, r.y - 40), t.y + t.height - r.y + 80) };
+          await page.screenshot({ path: path.join(process.env.DARKMUX_BATTERY_SHOTS, `held-tooltip-${vpName}.png`), clip });
+        }
+      }
       await ctx.close();
     }
     console.log(`${vpName}: ${JSON.stringify(rows)}`);

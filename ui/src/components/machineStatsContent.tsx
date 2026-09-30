@@ -35,7 +35,7 @@
  * renders its OWN top-level element would force an extra wrapper div into
  * both call sites for no reason.
  */
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useId, useMemo, useState, type ReactNode } from "react";
 import {
   Meter,
   compactMeterProps,
@@ -66,6 +66,7 @@ import type { PresenceBeat } from "../types/generated/PresenceBeat";
 import {
   batteryAriaLabel,
   batteryFillWidth,
+  batteryHeldExplanation,
   batteryHeldTitle,
   batteryIcon,
   batteryRampStops,
@@ -493,10 +494,43 @@ const BATTERY_ICON_CY = BATTERY_BODY_Y + BATTERY_BODY_H / 2 + 4;
  *    (`.battery-bar-hold`) and a short "held" label after the percent.
  *    Both sit inside the existing rows: the glyph's viewBox and the row's
  *    height are unchanged. */
+/** The `(i)` button after the HELD label: the same `.mm-odo-i` glyph the health region uses.
+ * Opens on hover, focus and tap; Escape or leaving closes it. The explanation floats over the
+ * row (`.battery-held-tip` is out of flow), so the row keeps its size. */
+function HeldInfo({ text }: { text: string }) {
+  const [open, setOpen] = useState(false);
+  const id = useId();
+  return (
+    <span className="battery-held-info" onMouseEnter={() => setOpen(true)} onMouseLeave={() => setOpen(false)}>
+      <button
+        type="button"
+        className="mm-odo-i"
+        aria-label="what held means"
+        aria-expanded={open}
+        aria-describedby={open ? id : undefined}
+        onClick={() => setOpen((o) => !o)}
+        onFocus={() => setOpen(true)}
+        onBlur={() => setOpen(false)}
+        onKeyDown={(e) => {
+          if (e.key === "Escape") setOpen(false);
+        }}
+      >
+        i
+      </button>
+      {open && (
+        <span id={id} role="tooltip" className="battery-held-tip">
+          {text}
+        </span>
+      )}
+    </span>
+  );
+}
+
 function BatteryBar({ sample }: { sample: BatteryCharge }) {
   const fillW = batteryFillWidth(sample.charge_pct, BATTERY_FILL_MAX_W);
   const icon = batteryIcon(sample);
   const heldTitle = batteryHeldTitle(sample);
+  const heldExplanation = batteryHeldExplanation(sample);
   const holdX = BATTERY_FILL_X + (fillW ?? 0);
   return (
     <div className="battery-bar-row">
@@ -555,6 +589,7 @@ function BatteryBar({ sample }: { sample: BatteryCharge }) {
           held
         </span>
       )}
+      {heldExplanation && <HeldInfo text={heldExplanation} />}
     </div>
   );
 }

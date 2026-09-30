@@ -926,6 +926,29 @@ describe("MachineLens — battery surfaces (#2821, lens only)", () => {
     }
   });
 
+  it("held: an (i) button after the label explains the hold on focus, and is absent in other states", async () => {
+    mockMachineFetch(machineWithBattery({ charge_pct: 80, on_ac: true, charging: false, state: "held" }));
+    const { container } = renderMachine(null);
+    await waitFor(() => expect(screen.getByText("80%")).toBeInTheDocument());
+    const btn = screen.getByRole("button", { name: "what held means" });
+    expect(container.querySelector(".battery-bar-held")!.nextElementSibling).toBe(btn.parentElement);
+    expect(screen.queryByRole("tooltip")).toBeNull();
+    act(() => btn.focus());
+    const tip = await screen.findByRole("tooltip");
+    expect(tip.textContent).toContain("Held at 80% by macOS's charge limit");
+    expect(tip.textContent).toContain("not charging on purpose");
+    expect(tip.textContent).toContain("not draining");
+    expect(btn.getAttribute("aria-describedby")).toBe(tip.id);
+    act(() => btn.blur());
+    expect(screen.queryByRole("tooltip")).toBeNull();
+    cleanup();
+
+    mockMachineFetch(machineWithBattery({ charge_pct: 80, on_ac: true, charging: false, state: "full" }));
+    renderMachine(null);
+    await waitFor(() => expect(screen.getByText("80%")).toBeInTheDocument());
+    expect(screen.queryByRole("button", { name: "what held means" })).toBeNull();
+  });
+
   it("no icon while discharging", async () => {
     mockMachineFetch(machineWithBattery({ charge_pct: 35, on_ac: false, charging: false, minutes_to_empty: 60 }));
     const { container } = renderMachine(null);

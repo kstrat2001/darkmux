@@ -7978,6 +7978,7 @@ body {
 /* The battery-shaped bar's own layout: the glyph, then the percent beside
    it. */
 .battery-bar-row {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 10px;
@@ -8050,6 +8051,20 @@ body {
   color: var(--info);
   text-transform: uppercase;
   letter-spacing: 0.04em;
+}
+.battery-held-tip {
+  position: absolute;
+  z-index: 5;
+  top: calc(100% + 4px);
+  left: 0;
+  width: max-content;
+  max-width: min(260px, 80vw);
+  padding: 8px 10px;
+  font: calc(11px * var(--fs-scale))/1.4 var(--font-mono);
+  color: var(--fg);
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
 }
 .battery-bar-pct {
   font: 700 calc(15px * var(--fs-scale))/1.2 var(--font-mono);
