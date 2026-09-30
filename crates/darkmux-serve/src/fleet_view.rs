@@ -1539,7 +1539,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let prev = std::env::var("DARKMUX_FLEET_FILE").ok();
         unsafe { std::env::set_var("DARKMUX_FLEET_FILE", dir.path().join("fleet.json")) };
-        let out = (|| {
+        let out = {
             darkmux_fleet::mutate_roster(|r| {
                 r.machines.insert(entry.id.clone(), entry.clone());
                 Ok(())
@@ -1548,7 +1548,7 @@ pub(crate) mod tests {
             let out = f();
             let pinned = darkmux_fleet::load_roster().unwrap().machines[&entry.id].node_id.clone();
             (out, pinned)
-        })();
+        };
         unsafe {
             match prev {
                 Some(v) => std::env::set_var("DARKMUX_FLEET_FILE", v),
