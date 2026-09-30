@@ -137,7 +137,6 @@ CardSeats
   hosted: CardHostedSeats
   waiting: uint32
 CardSource = "local" | "listener" | "unknown"
-
 ChargeState = "charging" | "held" | "discharging" | "full" | "unknown"
 CheckpointGate
   observations: uint

@@ -37,7 +37,7 @@
 use crate::wire::MachineSpecsResponse;
 use darkmux_crew::power_policy::{self, PowerPolicyConfig, StartDecision};
 use darkmux_fleet::{Admitted, SeatSnapshot};
-use darkmux_flow::payload::{BatteryCharge, HostSampleNow, ThermalNow};
+use darkmux_flow::payload::{BatteryCharge, ChargeState, HostSampleNow, ThermalNow};
 use darkmux_types::config::BusyPolicy;
 use darkmux_types::{EndpointKind, ProfileRegistry};
 use serde::{Deserialize, Serialize};
@@ -403,7 +403,8 @@ pub(crate) fn card_governor(now: Option<&HostSampleNow>, cfg: &PowerPolicyConfig
     let sample = battery.as_ref().map(|b| darkmux_crew::host_probe::BatterySample {
         charge_pct: b.charge_pct,
         on_ac: b.on_ac,
-        charging: b.charging,
+        charging: b.state == ChargeState::Charging,
+        state: b.state,
         minutes_to_empty: b.minutes_to_empty,
     });
     let refusing_start =
@@ -658,7 +659,7 @@ pub(crate) mod tests {
     }
 
     fn charge(pct: u8) -> BatteryCharge {
-        BatteryCharge { charge_pct: pct, on_ac: false, charging: false, minutes_to_empty: None }
+        BatteryCharge { charge_pct: pct, on_ac: false, state: ChargeState::Discharging, minutes_to_empty: None }
     }
 
     fn cfg(refuse: bool) -> PowerPolicyConfig {
