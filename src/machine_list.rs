@@ -64,7 +64,7 @@ fn unreachable_phrase(reason: UnreachableReason, detail: Option<&str>) -> String
         UnreachableReason::NotOnOverlay => "address is not a node on the network; nothing sent",
         UnreachableReason::PinMismatch => "address is not its pinned node; nothing sent",
         UnreachableReason::ListenerOff => "its fleet listener did not answer",
-        UnreachableReason::AuthRequired => "needs a fleet token this machine is not sending",
+        UnreachableReason::AuthRequired => "did not accept this machine's fleet token",
         UnreachableReason::RefusedByPeer => "its fleet listener refused this machine",
         UnreachableReason::ListenerUnavailable => "its fleet listener cannot serve a card now",
         UnreachableReason::BadAnswer => "answered with something that is not a card",
@@ -245,6 +245,15 @@ fn row_name(view: &FleetView, m: &FleetMachine) -> String {
     }
 }
 
+/// The reasons a peer is not asked at all, in the order their remedies print.
+const UNVERIFIED_REASONS: [UnreachableReason; 5] = [
+    UnreachableReason::PinMismatch,
+    UnreachableReason::NotOnOverlay,
+    UnreachableReason::DnsFailed,
+    UnreachableReason::IdentityUnavailable,
+    UnreachableReason::BadAddress,
+];
+
 fn remedies(view: &FleetView) -> Vec<String> {
     let names = |want: &dyn Fn(&CardOutcome) -> bool| -> Vec<String> {
         view.machines.iter().filter(|m| want(&m.card)).map(|m| row_name(view, m)).collect()
@@ -258,31 +267,11 @@ fn remedies(view: &FleetView) -> Vec<String> {
             out.push(format!("! {} machine(s) {what} ({}): {fix}", names.len(), names.join(", ")));
         }
     };
-    note(
-        reason(UnreachableReason::PinMismatch),
-        "not asked",
-        "the address is not their pinned tailnet node, so the fleet token was not sent. Re-add each by its tailnet DNS name (`darkmux machine add <id> --address <dns-name>`).",
-    );
-    note(
-        reason(UnreachableReason::NotOnOverlay),
-        "not asked",
-        "the address is not a node on the network, so the fleet token was not sent. Re-add each by its tailnet DNS name (`darkmux machine add <id> --address <dns-name>`).",
-    );
-    note(
-        reason(UnreachableReason::DnsFailed),
-        "not asked",
-        "the roster address did not resolve. Check the name (`darkmux machine list` shows the roster path) or this machine's DNS.",
-    );
-    note(
-        reason(UnreachableReason::IdentityUnavailable),
-        "not asked",
-        "the network identity tool could not verify the address (is it running and signed in on this machine?). `darkmux doctor` names the tool's own error.",
-    );
-    note(
-        reason(UnreachableReason::BadAddress),
-        "not asked",
-        "the roster address is not a usable address. Re-add each with `darkmux machine add <id> --address <dns-name>`.",
-    );
+    for r in UNVERIFIED_REASONS {
+        if let Some(fault) = r.target_fault() {
+            note(reason(r), "not asked", &format!("the fleet token was not sent. {}", fault.remedy("<id>")));
+        }
+    }
     note(
         reason(UnreachableReason::ListenerOff),
         "did not answer on their fleet listener",
@@ -290,8 +279,8 @@ fn remedies(view: &FleetView) -> Vec<String> {
     );
     note(
         reason(UnreachableReason::AuthRequired),
-        "require a fleet token this machine isn't sending",
-        "set DARKMUX_SERVE_TOKEN (or the darkmux-serve-token Keychain item) to the shared fleet token.",
+        "did not accept this machine's fleet token",
+        "the token is missing here or is not theirs. Set DARKMUX_SERVE_TOKEN (or the darkmux-serve-token Keychain item) to the shared fleet token, the same value on every machine.",
     );
     note(
         reason(UnreachableReason::RefusedByPeer),
@@ -660,26 +649,49 @@ mod tests {
         assert!(out.contains("its fleet listener cannot serve a card now"), "{out}");
         assert!(out.contains("a reason this darkmux does not know"), "{out}");
         assert!(out.contains("enable `fleet.listener`"), "the listener-off fix is named: {out}");
-        assert!(out.contains("DARKMUX_SERVE_TOKEN") && out.contains("pinned tailnet node"), "the fixes are named: {out}");
+        assert!(out.contains("DARKMUX_SERVE_TOKEN") && out.contains("Set DARKMUX_SERVE_TOKEN"), "the fixes are named: {out}");
     }
 
     /// Each reason a card could not be asked for has its own remedy: a DNS
     /// failure is not a down identity tool is not an address that is not a node.
     #[test]
     fn every_unverified_reason_names_its_own_remedy() {
-        let cases = [
-            (UnreachableReason::BadAddress, "not a usable address"),
-            (UnreachableReason::DnsFailed, "did not resolve"),
-            (UnreachableReason::IdentityUnavailable, "identity tool could not verify"),
-            (UnreachableReason::NotOnOverlay, "not a node on the network"),
-            (UnreachableReason::PinMismatch, "not their pinned tailnet node"),
-        ];
-        for (reason, want) in cases {
+        let remedy = |r: UnreachableReason| r.target_fault().unwrap().remedy("<id>");
+        for reason in UNVERIFIED_REASONS {
             let out = text(&view(vec![unreachable("m", reason, None)]));
-            assert!(out.contains(want), "{reason:?}: {out}");
-            for (other, other_want) in cases.iter().filter(|(r, _)| *r != reason) {
-                assert!(!out.contains(other_want), "{reason:?} printed {other:?}'s remedy: {out}");
+            assert!(out.contains(&remedy(reason)), "{reason:?}: {out}");
+            for other in UNVERIFIED_REASONS.iter().filter(|r| **r != reason) {
+                assert!(!out.contains(&remedy(*other)), "{reason:?} printed {other:?}'s remedy: {out}");
             }
+        }
+    }
+
+    /// A 401 means the peer did not accept the token this machine sent: it
+    /// may be missing or wrong, so the row and its remedy say neither
+    /// "not sending" nor blame only one of the two.
+    #[test]
+    fn a_refused_token_is_not_described_as_a_missing_one() {
+        let out = text(&view(vec![unreachable("m", UnreachableReason::AuthRequired, None)]));
+        assert!(!out.contains("isn't sending") && !out.contains("is not sending"), "{out}");
+        assert!(out.contains("did not accept this machine's fleet token"), "{out}");
+        assert!(out.contains("the same value on every machine"), "{out}");
+    }
+
+    /// The remedy for a reason that is a `TargetError` is the one
+    /// `darkmux-fleet` words for it: the CLI restates none of it.
+    #[test]
+    fn the_remedy_for_an_unverified_address_is_the_one_the_fleet_crate_words() {
+        let cases = [
+            (UnreachableReason::BadAddress, darkmux_fleet::TargetFault::BadAddress),
+            (UnreachableReason::DnsFailed, darkmux_fleet::TargetFault::DoesNotResolve),
+            (UnreachableReason::IdentityUnavailable, darkmux_fleet::TargetFault::IdentityUnavailable),
+            (UnreachableReason::NotOnOverlay, darkmux_fleet::TargetFault::NotOnOverlay),
+            (UnreachableReason::PinMismatch, darkmux_fleet::TargetFault::PinMismatch),
+        ];
+        for (reason, fault) in cases {
+            assert_eq!(reason.target_fault(), Some(fault));
+            let out = text(&view(vec![unreachable("m", reason, None)]));
+            assert!(out.contains(&fault.remedy("<id>")), "{reason:?}: {out}");
         }
     }
 

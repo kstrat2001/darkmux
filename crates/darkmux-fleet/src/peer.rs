@@ -70,32 +70,93 @@ pub enum TargetError {
     OwnAddress { address: String },
 }
 
+/// Which way a roster address failed, without the names. The ONE place each
+/// fault's remedy is worded ([`TargetFault::remedy`]): a sender's error
+/// ([`TargetError`]'s text) and a reader of the fleet view (which has only the
+/// typed reason) both print it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetFault {
+    BadAddress,
+    DoesNotResolve,
+    IdentityUnavailable,
+    NotOnOverlay,
+    PinMismatch,
+    OwnAddress,
+}
+
+impl TargetFault {
+    /// What to do about this fault, for the roster entry `target`.
+    pub fn remedy(self, target: &str) -> String {
+        match self {
+            TargetFault::BadAddress => format!(
+                "Re-add {target} with a usable address: `darkmux machine add {target} --address <its tailnet DNS name>`."
+            ),
+            TargetFault::DoesNotResolve => {
+                "Check the name (`darkmux machine list` shows the roster path) and this machine's DNS.".to_string()
+            }
+            TargetFault::IdentityUnavailable => "Is the network identity tool running and signed in on this \
+                machine? `darkmux doctor` names its own error."
+                .to_string(),
+            TargetFault::NotOnOverlay => format!(
+                "Point the entry at {target}'s tailnet DNS name: `darkmux machine add {target} --address <its tailnet DNS name>`."
+            ),
+            TargetFault::PinMismatch => format!(
+                "If {target} really was replaced, re-pin it with `darkmux machine add {target} --address <its tailnet DNS name>`."
+            ),
+            TargetFault::OwnAddress => "Check `serve.bind`.".to_string(),
+        }
+    }
+}
+
+impl TargetError {
+    pub fn fault(&self) -> TargetFault {
+        match self {
+            TargetError::BadAddress { .. } => TargetFault::BadAddress,
+            TargetError::DoesNotResolve { .. } => TargetFault::DoesNotResolve,
+            TargetError::IdentityUnavailable { .. } => TargetFault::IdentityUnavailable,
+            TargetError::NotOnOverlay { .. } => TargetFault::NotOnOverlay,
+            TargetError::PinMismatch { .. } => TargetFault::PinMismatch,
+            TargetError::OwnAddress { .. } => TargetFault::OwnAddress,
+        }
+    }
+
+    /// The roster entry the error is about, when it names one.
+    fn target(&self) -> &str {
+        match self {
+            TargetError::DoesNotResolve { target, .. }
+            | TargetError::IdentityUnavailable { target, .. }
+            | TargetError::NotOnOverlay { target, .. }
+            | TargetError::PinMismatch { target, .. } => target,
+            TargetError::BadAddress { .. } | TargetError::OwnAddress { .. } => "<id>",
+        }
+    }
+}
+
 impl std::fmt::Display for TargetError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let remedy = self.fault().remedy(self.target());
         match self {
             TargetError::BadAddress { detail } => f.write_str(detail),
             TargetError::DoesNotResolve { target, address } => {
-                write!(f, "the roster address for {target} (`{address}`) does not resolve; nothing was sent")
+                write!(f, "the roster address for {target} (`{address}`) does not resolve; nothing was sent. {remedy}")
             }
             TargetError::IdentityUnavailable { target, provider, detail } => {
-                write!(f, "cannot verify {target}'s address with {provider} ({detail}); nothing was sent")
+                write!(f, "cannot verify {target}'s address with {provider} ({detail}); nothing was sent. {remedy}")
             }
             TargetError::NotOnOverlay { target, address, provider } => write!(
                 f,
                 "the roster address for {target} (`{address}`) is not a node on the {provider} network, so nothing \
-                 was sent to it (not the fleet token, not the request). Point the entry at {target}'s \
-                 tailnet DNS name: `darkmux machine add {target} --address <its tailnet DNS name>`"
+                 was sent to it (not the fleet token, not the request). {remedy}"
             ),
             TargetError::PinMismatch { target, node_name } => write!(
                 f,
                 "the node at {target}'s address (`{node_name}`) is not the one this roster pinned for {target}; \
-                 nothing was sent. If {target} really was replaced, re-pin it with `darkmux machine add \
-                 {target} --address <its tailnet DNS name>`"
+                 nothing was sent. {remedy}"
             ),
             TargetError::OwnAddress { address } => write!(
                 f,
                 "this machine's own daemon address `{address}` is neither loopback nor one of this \
-                 machine's tailnet addresses (check `serve.bind`)"
+                 machine's tailnet addresses. {remedy}"
             ),
         }
     }
@@ -315,6 +376,21 @@ pub fn unverified_target_for_test(url_base: &str) -> PeerTarget {
 
 #[cfg(test)]
 mod tests {
+    /// A sender's error and a reader of the fleet view print the SAME remedy:
+    /// the error's text carries exactly what `TargetFault::remedy` words.
+    #[test]
+    fn a_target_error_prints_its_faults_remedy() {
+        let errors = [
+            TargetError::DoesNotResolve { target: "studio".into(), address: "x".into() },
+            TargetError::IdentityUnavailable { target: "studio".into(), provider: "p".into(), detail: "d".into() },
+            TargetError::NotOnOverlay { target: "studio".into(), address: "x".into(), provider: "p".into() },
+            TargetError::PinMismatch { target: "studio".into(), node_name: "n".into() },
+        ];
+        for e in errors {
+            assert!(e.to_string().contains(&e.fault().remedy("studio")), "{e}");
+        }
+    }
+
     use super::*;
     use crate::identity::{test_node, StaticIdentityProvider};
 

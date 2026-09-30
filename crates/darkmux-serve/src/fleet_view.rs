@@ -129,6 +129,27 @@ pub enum UnreachableReason {
     Unknown,
 }
 
+impl UnreachableReason {
+    /// The address fault this reason reports, when it is one: the reasons whose
+    /// remedy [`darkmux_fleet::TargetFault`] words.
+    pub fn target_fault(self) -> Option<darkmux_fleet::TargetFault> {
+        use darkmux_fleet::TargetFault;
+        match self {
+            UnreachableReason::BadAddress => Some(TargetFault::BadAddress),
+            UnreachableReason::DnsFailed => Some(TargetFault::DoesNotResolve),
+            UnreachableReason::IdentityUnavailable => Some(TargetFault::IdentityUnavailable),
+            UnreachableReason::NotOnOverlay => Some(TargetFault::NotOnOverlay),
+            UnreachableReason::PinMismatch => Some(TargetFault::PinMismatch),
+            UnreachableReason::ListenerOff
+            | UnreachableReason::AuthRequired
+            | UnreachableReason::RefusedByPeer
+            | UnreachableReason::ListenerUnavailable
+            | UnreachableReason::BadAnswer
+            | UnreachableReason::Unknown => None,
+        }
+    }
+}
+
 /// Which endpoint a card came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(test, derive(ts_rs::TS))]
@@ -724,15 +745,16 @@ const LOCAL_VIEW_TIMEOUT: Duration = Duration::from_secs(12);
 // ─── asking one peer ───────────────────────────────────────────────────────
 
 fn unreachable_for(e: &TargetError) -> UnreachableReason {
-    match e {
-        TargetError::BadAddress { .. } => UnreachableReason::BadAddress,
-        TargetError::DoesNotResolve { .. } => UnreachableReason::DnsFailed,
-        TargetError::IdentityUnavailable { .. } => UnreachableReason::IdentityUnavailable,
-        TargetError::NotOnOverlay { .. } => UnreachableReason::NotOnOverlay,
-        TargetError::PinMismatch { .. } => UnreachableReason::PinMismatch,
+    use darkmux_fleet::TargetFault;
+    match e.fault() {
+        TargetFault::BadAddress => UnreachableReason::BadAddress,
+        TargetFault::DoesNotResolve => UnreachableReason::DnsFailed,
+        TargetFault::IdentityUnavailable => UnreachableReason::IdentityUnavailable,
+        TargetFault::NotOnOverlay => UnreachableReason::NotOnOverlay,
+        TargetFault::PinMismatch => UnreachableReason::PinMismatch,
         // Only a caller that passes this machine's own daemon address can
         // hit it; a roster entry never does.
-        TargetError::OwnAddress { .. } => UnreachableReason::BadAddress,
+        TargetFault::OwnAddress => UnreachableReason::BadAddress,
     }
 }
 

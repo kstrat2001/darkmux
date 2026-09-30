@@ -1254,6 +1254,9 @@ darkmux release.
     is not dialed; `GET /fleet/roster` and the view read one roster.
   - Every roster peer is dialed: presence is display only, `liveness` is `live`,
     `no_beat` or `unknown` (`gone` and the `presence_gone` reason are removed).
+  - `machine list` words each unverified-address remedy from the fleet crate's one
+    `TargetFault::remedy`, the same text a refused send prints, and a 401 row says the
+    peer did not accept this machine's token (missing or wrong), not that none was sent.
   - Gathering the view pins each peer's node in the roster on first contact, as a
     work submission does, before the fleet token is sent to it; a node that does
     not match its pin is never sent the token.
