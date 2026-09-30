@@ -8,7 +8,7 @@
 //!    token. That keeps out something on an allowed machine that cannot
 //!    read it (an agent container, which reaches overlay addresses but not
 //!    the Keychain); any process running as the operator's user can read it
-//!    (`security find-generic-password`), and `machine list --deep` sends it
+//!    (`security find-generic-password`), and `machine list` sends it
 //!    to every roster peer.
 //! 2. the connection comes from a **node on the receiver's allow-list**
 //!    (`fleet.accept_work`), as the overlay network itself reports it

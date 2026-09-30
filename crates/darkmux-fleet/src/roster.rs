@@ -121,7 +121,7 @@ pub struct MachineEntry {
     /// (#2916 review C1) The overlay network's stable id for the node this
     /// entry's address reached, pinned by `machine add` or by the first
     /// token-bearing request from the CLI (a work submission, `machine
-    /// status`/`resources <id>`, `machine list --deep`). EVERY token-bearing
+    /// status`/`resources <id>`, `machine list`). EVERY token-bearing
     /// request (`darkmux_fleet::peer`) checks the node at the address is
     /// this one before anything is sent, and an entry with no pin must at
     /// least resolve to a tailnet node. The daemon's peer-graph proxy checks

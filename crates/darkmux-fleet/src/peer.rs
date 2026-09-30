@@ -2,7 +2,7 @@
 //! (#2916 re-review MUST 3).
 //!
 //! Every token-bearing request to another machine (work submission,
-//! `machine status`/`resources <id>`, `machine list --deep`, the daemon's
+//! `machine status`/`resources <id>`, `machine list`, the daemon's
 //! peer mission-graph proxy) goes through [`peer_target`] + [`fleet_get`] /
 //! [`fleet_post_json`]. A target is either this machine's own daemon (a
 //! loopback address: the token is already on this machine) or a roster

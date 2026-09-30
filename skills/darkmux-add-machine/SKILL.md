@@ -128,7 +128,7 @@ Verify:
 darkmux machine list
 ```
 
-Should show one entry — this machine, marked as this machine and probed at the local daemon (so it reads reachable even though the daemon binds loopback). The DNS name in the ADDRESS column is what OTHER machines dial; `machine list` run on a peer is where that address gets tested.
+Should show one entry — this machine, marked as this machine, with its card built locally (so it reads live even though the daemon binds loopback). The DNS name in the ADDRESS column is what OTHER machines dial; `machine list` run on a peer is where that address gets tested.
 
 ## Step 7 — Tell the OTHER machines about this new one
 

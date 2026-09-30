@@ -55,7 +55,7 @@ fn unreachable_phrase(reason: UnreachableReason, detail: Option<&str>) -> String
 /// The table cells of one machine: headroom, OS, version, and the last
 /// column (loaded models, or why there is no card).
 fn cells(m: &FleetMachine) -> [String; 4] {
-    let dash = || "—".to_string();
+    let dash = || "-".to_string();
     match &m.card {
         CardOutcome::Available { card } => {
             let s = &card.specs;
@@ -164,22 +164,22 @@ pub(crate) fn render_text(view: &FleetView, roster_path: &str) -> String {
         style::dim(view.local_machine_id.as_deref().unwrap_or("<unknown>"))
     ));
     if view.machines.is_empty() {
-        out.push_str("(no peers in roster — single-machine fleet)\n\n");
+        out.push_str("(no peers in roster: single-machine fleet)\n\n");
         out.push_str("Add a peer: darkmux machine add <id> --address <dns-name>\n");
         return out;
     }
     out.push_str(&format!(
         "{}\n",
-        style::dim(&format!("{:<14} {:<5} {:<11} {:<10} {:<12} LOADED", "MACHINE", "LIVE", "AI-HEADROOM", "OS", "VERSION"))
+        style::dim(&format!("{:<14} {:<5} {:<11} {:<13} {:<12} LOADED", "MACHINE", "LIVE", "AI-HEADROOM", "OS", "VERSION"))
     ));
     for m in &view.machines {
         let [ram, os, version, last] = cells(m);
         let row = format!(
-            "{:<14} {:<5} {:<11} {:<10} {:<12} {}",
+            "{:<14} {:<5} {:<11} {:<13} {:<12} {}",
             darkmux_fleet::truncate_chars(&m.entry.id, 14),
             liveness_cell(m.liveness),
             darkmux_fleet::truncate_chars(&ram, 11),
-            darkmux_fleet::truncate_chars(&os, 10),
+            darkmux_fleet::truncate_chars(&os, 13),
             darkmux_fleet::truncate_chars(&version, 12),
             darkmux_fleet::truncate_chars(&last, MODELS_COL_CHARS)
         );

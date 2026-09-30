@@ -890,11 +890,17 @@ pub(crate) mod tests {
 
     const TOKEN: &str = "fleet-card-test-token";
 
-    /// An admission whose network knows the laptop at 10.0.0.9 and the mini
-    /// at 10.0.0.10, and whose allow-list grants each something different.
+    /// An admission whose network knows the laptop at 10.0.0.9, the mini at
+    /// 10.0.0.10 and, deliberately, an allow-listed node at 127.0.0.1 (so a
+    /// loopback caller WOULD be admitted if the guard against it were gone),
+    /// and whose allow-list grants each something different.
     fn admission() -> Admission {
         let mut allow = std::collections::BTreeMap::new();
-        for (name, node, profiles) in [("macbook-pro", "nLAPTOP", vec!["deep"]), ("mini-1", "nMINI", vec!["secret-profile"])] {
+        for (name, node, profiles) in [
+            ("macbook-pro", "nLAPTOP", vec!["deep"]),
+            ("mini-1", "nMINI", vec!["secret-profile"]),
+            ("proxy", "nPROXY", vec!["via-proxy"]),
+        ] {
             allow.insert(
                 name.to_string(),
                 AcceptWorkEntry {
@@ -909,7 +915,11 @@ pub(crate) mod tests {
         }
         let provider = StaticIdentityProvider {
             local: test_node("nSELF", "self", "10.0.0.1"),
-            peers: vec![test_node("nLAPTOP", "laptop", "10.0.0.9"), test_node("nMINI", "mini", "10.0.0.10")],
+            peers: vec![
+                test_node("nLAPTOP", "laptop", "10.0.0.9"),
+                test_node("nMINI", "mini", "10.0.0.10"),
+                test_node("nPROXY", "proxy", "127.0.0.1"),
+            ],
             down: None,
         };
         Admission {

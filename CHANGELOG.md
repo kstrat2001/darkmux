@@ -57,11 +57,12 @@ darkmux release.
     this release dropped both. A body this darkmux does not read (a newer peer's
     unknown variant) is refused under `--json` with the peer's version named, and
     in text mode prints a note naming it, exit 0. It was printed as raw JSON.
-  - `machine list --deep`: a peer's `specs` is the `/machine/specs` document as
-    this darkmux reads it (a field a newer peer adds is not carried), or `null`.
-    A body that names a `darkmux_version` but does not parse sets the new
-    `specs_unreadable_peer_version` to that version, and the table shows
-    `unreadable (peer <version>)`; any other body reads as unavailable.
+  - `machine list`: prints the fleet view (`FleetView`), one row per roster
+    machine with the card it states about itself. It is no longer the reachability
+    probe plus `--deep` specs: `probe_ms`, `resolved_address`, `dialed_address`,
+    `reachable`, `specs` and the four `specs_*` flags are gone, and each row is
+    `{entry, is_this_machine, liveness, last_beat_ms, card}`. See "Fleet awareness"
+    under Added.
   - `dispatch` (`--json`): the runtime's keys print in the order `result`,
     `final_assistant`, `trajectory_path`, `failed_tool_invocations`,
     `resumed_from` (they were alphabetical), and a key the runtime does not
@@ -723,6 +724,11 @@ darkmux release.
 
 ### Removed (breaking, 4.0)
 
+- **`darkmux machine list --deep` is retired.** The card is the default content
+  of `machine list`, so there is nothing to ask for; the flag is refused, naming
+  that. **Migration:** drop the flag. A script that read `--json`'s `specs`,
+  `reachable` or `probe_ms` reads `card.card.specs` and `card.state` instead.
+
 - **The daemon HTTP API is a semver contract, and its aliases are gone** (C1,
   A3, C2, C3). From this release the daemon's routes and response shapes change
   only on purpose: every JSON body is a serialized Rust type in
@@ -1157,6 +1163,24 @@ darkmux release.
 
 ### Added (4.0)
 
+- **Fleet awareness: one view every machine reads** (#3004, part 1). Every daemon
+  serves `GET /machine/card`, one typed `MachineCard` describing that machine
+  truthfully: its identity and specs (the `/machine/specs` document), its
+  profiles with each endpoint's kind (`managed` or `unmanaged`, from the same
+  registry resolution dispatch uses) and models, its seats (held and free per
+  class, and the busy policy) when its fleet listener runs, and its governor
+  state (the OS thermal word, the battery reading and the battery gate the
+  operator wrote). A request that carries the fleet token from a node the
+  overlay network names and the allow-list lists also gets an `accepts` block:
+  that caller's own allow-list entry, and no other. Every daemon also serves
+  `GET /fleet/view`, a `FleetView` with a row per roster machine: liveness from
+  presence, and the card fetched from the peer itself over the verified peer path
+  (in parallel, single-flight, cached 5 s, recorded as `cache_ttl_ms`), or
+  `unreachable` with a typed reason. A peer presence reports gone is not dialed,
+  and a peer on an older darkmux (no card route) shows as `card unavailable
+  (peer <version>)`. Cards never come from Redis. `darkmux machine list` prints
+  this view; `--json` prints the `FleetView`. Both routes are in
+  `route-table.golden`, and their types have generated twins.
 - **An optional, one-time upgrade skill for a 3.x home**,
   `docs/upgrade/darkmux-upgrade/SKILL.md`. An agent follows it to apply what
   `darkmux doctor` names: back the home up, then fix `config.json`,
@@ -1265,12 +1289,12 @@ darkmux release.
   in): grant it only to a machine you would give a shell.
 - **Every request that carries the fleet token checks where it is going**
   (#2916): a `profile@machine` dispatch, `machine status`/`resources <id>`,
-  `machine list --deep` and the daemon's peer mission-graph proxy all go
+  `machine list` and the daemon's peer mission-graph proxy all go
   through one helper that resolves the roster address, requires the node
   there to be the tailnet node pinned for that entry (pinned by `machine
   add` or first contact), and connects to that verified address; only this
   machine's own daemon and loopback entries skip it. A peer that fails the
-  check is shown as `unverified` in `machine list --deep`. Everything a
+  check is shown as `unreachable` with the reason `unverified` in `machine list`. Everything a
   peer sends back is printed with control characters, bidirectional
   overrides and zero-width characters removed; a field shown in a table
   or on one line also loses newlines and tabs and is cut to its column,

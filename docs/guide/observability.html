@@ -200,7 +200,11 @@ curl -s http://127.0.0.1:8765/health
       </tr>
       <tr>
         <td><code>GET /machine/specs</code></td>
-        <td>Version, machine id, RAM, CPU brand, OS and loaded models. Backs <code>darkmux machine list --deep</code> (<code>MachineSpecsResponse</code>).</td>
+        <td>Version, machine id, RAM, CPU brand, OS and loaded models (<code>MachineSpecsResponse</code>). The machine card embeds it.</td>
+      </tr>
+      <tr>
+        <td><code>GET /machine/card</code></td>
+        <td>What this machine says about itself: the specs, its profiles and each endpoint's kind (<code>managed</code> or <code>unmanaged</code>), its seats and busy policy, and its thermal and battery state. A request holding the fleet token from an allow-listed node also gets that caller's own allow-list entry (<code>MachineCard</code>).</td>
       </tr>
       <tr>
         <td><code>GET /machine/resources</code></td>
@@ -209,6 +213,10 @@ curl -s http://127.0.0.1:8765/health
       <tr>
         <td><code>GET /fleet/machines/live, GET /fleet/dispatches/live, GET /fleet/roster</code></td>
         <td>The machines beating right now, the dispatches with a live heartbeat (renamed from <code>/fleet/sessions/live</code>), and the declared roster.</td>
+      </tr>
+      <tr>
+        <td><code>GET /fleet/view</code></td>
+        <td>One row per roster machine: liveness from presence and the machine's own card, fetched from the peer over the verified peer path, in parallel and cached for 5 seconds (<code>FleetView</code>). Backs <code>darkmux machine list</code>.</td>
       </tr>
       <tr>
         <td><code>GET /lab/runs, GET /lab/run/detail, GET /lab/run/events</code></td>
