@@ -293,6 +293,21 @@ pub(crate) fn reply_to_dispatch_result(
             crate::sanitize_remote_text(reply.reason.as_deref().unwrap_or("its seat is busy"))
         ),
         ReplyStatus::Accepted => format!("submitted to {target}; not waiting (run={run}). {follow}\n"),
+        // A status this darkmux does not know is never read as success: it
+        // fails, whatever exit code the reply carried.
+        ReplyStatus::Unknown => {
+            return DispatchResult {
+                exit_code: 1,
+                stdout: String::new(),
+                stderr: format!(
+                    "{target} answered with a status this darkmux does not recognize (is it on a newer darkmux?)\n"
+                ),
+                session_id,
+                execution: None,
+                out_dir: None,
+                trajectory: None,
+            }
+        }
         // (#2916 review C1) Remote output never reaches the terminal raw.
         ReplyStatus::Completed | ReplyStatus::Error | ReplyStatus::Refused => {
             return DispatchResult {
@@ -370,6 +385,20 @@ mod tests {
         let r = reply_to_dispatch_result(queued, &local, "studio");
         assert!(r.stdout.contains(&format!("queued on studio; not waiting (run={})", local.wire())), "{}", r.stdout);
         assert!(!r.stdout.contains("session"), "{}", r.stdout);
+    }
+
+    /// A status this darkmux does not know fails the dispatch, even when the
+    /// reply carries an exit code of 0: an unrecognized status is never read
+    /// as a success.
+    #[test]
+    fn an_unrecognized_reply_status_is_never_read_as_success() {
+        let reply: crate::SubmissionReply =
+            serde_json::from_str(r#"{"status": "paused", "exit_code": 0, "stdout": "done"}"#).unwrap();
+        assert_eq!(reply.status, crate::ReplyStatus::Unknown);
+        let r = reply_to_dispatch_result(reply, &crate::test_session("s-local"), "studio");
+        assert_eq!(r.exit_code, 1);
+        assert!(r.stderr.contains("does not recognize"), "{}", r.stderr);
+        assert!(r.stdout.is_empty(), "the unknown reply's output is not passed through: {}", r.stdout);
     }
 
     // (#1509) `dispatch_routed_via`'s local-dispatch injection seam. No

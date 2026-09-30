@@ -43,6 +43,11 @@ pub struct PeerTarget {
     /// The node id pinned by THIS lookup (first contact), for the caller to
     /// persist; `None` when the entry was already pinned or is loopback.
     pub newly_pinned: Option<String>,
+    /// The node the identity provider named at `pinned_ip` and that passed
+    /// the roster's pin; `None` for a target no node was verified behind (a
+    /// loopback one). A reader that asks "is this machine's own node behind
+    /// this target" compares it to the provider's own node.
+    pub node_id: Option<String>,
 }
 
 /// Why a roster entry is not a target this machine may send to. Typed so a
@@ -156,11 +161,11 @@ pub fn local_daemon_target(
     let (scheme, host, port) = split_bad(addr, default_port)?;
     let ip = host.parse::<IpAddr>().ok().map(|i| i.to_canonical());
     if ip.is_some_and(|ip| ip.is_loopback()) || host == "localhost" {
-        return Ok(PeerTarget { scheme, host, port, pinned_ip: None, newly_pinned: None });
+        return Ok(PeerTarget { scheme, host, port, pinned_ip: None, newly_pinned: None, node_id: None });
     }
     let own = provider.local_node().map(|n| n.addresses).unwrap_or_default();
     match ip.filter(|ip| own.contains(ip)) {
-        Some(ip) => Ok(PeerTarget { scheme, host, port, pinned_ip: Some(ip), newly_pinned: None }),
+        Some(ip) => Ok(PeerTarget { scheme, host, port, pinned_ip: Some(ip), newly_pinned: None, node_id: None }),
         None => Err(TargetError::OwnAddress { address: addr.to_string() }),
     }
 }
@@ -192,7 +197,7 @@ pub fn peer_target(
     }
     let (scheme, host, port) = split_bad(&entry.address, default_port)?;
     if loopback_ok && crate::roster::address_host_is_loopback(&entry.address) {
-        return Ok(PeerTarget { scheme, host, port, pinned_ip: None, newly_pinned: None });
+        return Ok(PeerTarget { scheme, host, port, pinned_ip: None, newly_pinned: None, node_id: None });
     }
     let v = crate::submission::verify_target(name, entry, provider)?;
     Ok(PeerTarget {
@@ -201,6 +206,7 @@ pub fn peer_target(
         port,
         pinned_ip: Some(v.ip),
         newly_pinned: v.newly_pinned.then(|| v.node.node_id.clone()),
+        node_id: Some(v.node.node_id),
     })
 }
 
@@ -304,7 +310,7 @@ pub fn post_json_with_token_for_test(
 pub fn unverified_target_for_test(url_base: &str) -> PeerTarget {
     let (scheme, host, port) = split_address(url_base, 80).unwrap();
     let pinned_ip = host.parse::<IpAddr>().ok();
-    PeerTarget { scheme, host, port, pinned_ip, newly_pinned: None }
+    PeerTarget { scheme, host, port, pinned_ip, newly_pinned: None, node_id: None }
 }
 
 #[cfg(test)]
@@ -349,10 +355,12 @@ mod tests {
         let p = provider();
         let t = peer_target("studio", &entry("100.64.0.2", Some("nSTUDIO")), None, 8765, true, &p).unwrap();
         assert_eq!(t.pinned_ip, Some("100.64.0.2".parse().unwrap()));
+        assert_eq!(t.node_id.as_deref(), Some("nSTUDIO"), "the verified node rides with the target");
         assert!(peer_target("studio", &entry("192.168.1.9", None), None, 8765, true, &p).is_err(), "a LAN address is refused");
         assert!(peer_target("studio", &entry("100.64.0.2", Some("nOTHER")), None, 8765, true, &p).is_err(), "a different node is refused");
         let lo = peer_target("studio", &entry("127.0.0.1:18765", None), None, 8765, true, &p).unwrap();
         assert_eq!(lo.pinned_ip, None);
+        assert_eq!(lo.node_id, None, "no node stands behind an unverified loopback target");
         let me = peer_target("studio", &entry("100.64.0.2", None), Some("127.0.0.1:8765"), 8765, true, &p).unwrap();
         assert_eq!(me.base(), "http://127.0.0.1:8765");
         assert_eq!(me.pinned_ip, None, "loopback: no pin, so no token");
@@ -414,6 +422,7 @@ mod tests {
                 port,
                 pinned_ip: pinned.then(|| "127.0.0.1".parse().unwrap()),
                 newly_pinned: None,
+                node_id: None,
             };
             let _ = fleet_get(&t, "/x", Duration::from_secs(5), &[]);
             rx.recv_timeout(Duration::from_secs(5)).unwrap().to_ascii_lowercase()
@@ -440,6 +449,7 @@ mod tests {
             port,
             pinned_ip: Some("127.0.0.1".parse().unwrap()),
             newly_pinned: None,
+            node_id: None,
         };
         let r = fleet_post_json(&t, "/fleet/work", "{}", Duration::from_secs(5));
         assert!(r.is_ok(), "{r:?}");
@@ -467,6 +477,7 @@ mod tests {
             port,
             pinned_ip: Some("127.0.0.1".parse().unwrap()),
             newly_pinned: None,
+            node_id: None,
         };
         let body = fleet_get(&t, "/x", Duration::from_secs(5), &[]).unwrap().into_string().unwrap();
         assert_eq!(body, "ok");

@@ -101,6 +101,10 @@ pub enum ReplyStatus {
     Error,
     /// The job was not run; `reason` says why.
     Refused,
+    /// A status a newer darkmux sends that this one does not know. It is
+    /// never read as any known status: not as a success, not as a refusal.
+    #[serde(other)]
+    Unknown,
 }
 
 /// The reply, for every outcome.
@@ -349,28 +353,24 @@ pub struct Admitted {
     pub workspace: bool,
 }
 
-/// Token + network identity + allow-list. Checked in that order, and the
-/// order is deliberate: the token comparison is constant-time and free,
-/// while the identity lookup runs the provider's tool, so a caller without
-/// the token never makes this machine spawn anything.
+/// Who is calling: the token, then the network identity, then "not this
+/// machine". This is the whole of what a READ needs (a card): a caller that
+/// holds the fleet token from a node the overlay names is a verified fleet
+/// peer whether or not this machine lets it run anything. Checked in that
+/// order, and the order is deliberate: the token comparison is constant-time
+/// and free, while the identity lookup runs the provider's tool, so a caller
+/// without the token never makes this machine spawn anything.
 ///
 /// `identity` is the provider's answer for the connecting address:
 /// `Ok(Some)` a node, `Ok(None)` no node holds it, `Err(detail)` the
-/// provider could not answer. The last two refuse (fail closed). An entry
-/// without a `node_id` never matches.
-///
-/// `allow` reads the allow-list, and is called only AFTER the identity
-/// lookup (which runs the provider's tool, up to its 3 s bound), so an
-/// `untrust` that lands while the provider answers is still seen. An
-/// allow-list that cannot be read refuses everything.
-pub fn admit(
+/// provider could not answer. The last two refuse (fail closed).
+pub fn authenticate(
     token: TokenCheck,
     identity: impl FnOnce() -> std::result::Result<Option<NodeIdentity>, String>,
     provider: &str,
     peer_addr: IpAddr,
     local_node_id: Option<&str>,
-    allow: impl FnOnce() -> std::result::Result<BTreeMap<String, AcceptWorkEntry>, String>,
-) -> std::result::Result<Admitted, Refusal> {
+) -> std::result::Result<NodeIdentity, Refusal> {
     match token {
         TokenCheck::Match => {}
         TokenCheck::Mismatch => return Err(Refusal::Token),
@@ -389,10 +389,37 @@ pub fn admit(
     if local_node_id.is_some_and(|me| !me.is_empty() && me == node.node_id) {
         return Err(Refusal::FromSelf);
     }
+    Ok(node)
+}
+
+/// What an authenticated node may do here: its entry on the allow-list
+/// (`fleet.accept_work`). Work needs it; a card read reports it as data.
+///
+/// `allow` reads the allow-list, and is called only when this runs, which is
+/// AFTER the identity lookup (which runs the provider's tool, up to its 3 s
+/// bound), so an `untrust` that lands while the provider answers is still
+/// seen. An allow-list that cannot be read refuses everything.
+pub fn authorize(
+    node: &NodeIdentity,
+    allow: impl FnOnce() -> std::result::Result<BTreeMap<String, AcceptWorkEntry>, String>,
+) -> std::result::Result<Admitted, Refusal> {
     let allow = allow().map_err(|e| {
         Refusal::BadRequest(format!("this machine's allow-list cannot be read ({e}); refusing everything"))
     })?;
     match_entry(&node.node_id, &node.name, &allow)
+}
+
+/// [`authenticate`], then [`authorize`]: the one admission path for work.
+pub fn admit(
+    token: TokenCheck,
+    identity: impl FnOnce() -> std::result::Result<Option<NodeIdentity>, String>,
+    provider: &str,
+    peer_addr: IpAddr,
+    local_node_id: Option<&str>,
+    allow: impl FnOnce() -> std::result::Result<BTreeMap<String, AcceptWorkEntry>, String>,
+) -> std::result::Result<Admitted, Refusal> {
+    let node = authenticate(token, identity, provider, peer_addr, local_node_id)?;
+    authorize(&node, allow)
 }
 
 /// The allow-list entry for the node `node_id` (named `node_name` on the
@@ -672,6 +699,12 @@ pub(crate) fn read_reply_lines(
             continue;
         }
         let reply: SubmissionReply = serde_json::from_str(line).map_err(|_| unreadable_line(where_, line, &not_a_listener))?;
+        // A status this darkmux does not know parses as `Unknown`; the line
+        // still names it, and the job may be running, so it reports the same
+        // way an unparseable status does.
+        if reply.status == ReplyStatus::Unknown {
+            return Err(unreadable_line(where_, line, &not_a_listener));
+        }
         // Only a `queued` line may be followed by another.
         if last.take().is_some_and(|prev| prev.status != ReplyStatus::Queued) {
             return Err(not_a_listener(line));
@@ -977,6 +1010,10 @@ pub fn submit_work(job: WorkJob, wait: bool) -> Result<SubmissionReply> {
             "{target} accepted the job but the dispatch failed: {}",
             sanitize_remote_text(reply.reason.as_deref().unwrap_or("no reason given"))
         )),
+        ReplyStatus::Unknown => Err(anyhow!(
+            "{target} answered with a status this darkmux does not recognize (is it on a newer darkmux? \
+             run the same version on both machines)"
+        )),
         ReplyStatus::Refused => Err(anyhow!(
             "{}",
             reply
@@ -1055,7 +1092,7 @@ mod tests {
     }
 
     /// The whole decision: admit, then scope.
-    fn authorize(token: TokenCheck, node: Node, prof: Prof) -> std::result::Result<String, Refusal> {
+    fn decide(token: TokenCheck, node: Node, prof: Prof) -> std::result::Result<String, Refusal> {
         let peer: IpAddr = "100.64.0.7".parse().unwrap();
         let identity = move || match node {
             Node::Allowed => Ok(Some(test_node("nLAPTOP", "macbook-pro", "100.64.0.7"))),
@@ -1084,7 +1121,7 @@ mod tests {
         for t in tokens {
             for n in nodes {
                 for p in profs {
-                    let got = authorize(t, n, p);
+                    let got = decide(t, n, p);
                     let want: std::result::Result<String, fn(&Refusal) -> bool> = match (t, n, p) {
                         (TokenCheck::Mismatch, _, _) => Err(|r| matches!(r, Refusal::Token)),
                         (TokenCheck::NotConfigured, _, _) => Err(|r| matches!(r, Refusal::NoTokenConfigured)),
@@ -1107,6 +1144,47 @@ mod tests {
             }
         }
         assert_eq!(ran, 1, "exactly one cell may run work");
+    }
+
+    /// The promise: a caller is AUTHENTICATED without being authorized. A node
+    /// that holds the token and that the network names is a verified fleet
+    /// peer, and the allow-list is not read to say so (a card read needs no
+    /// grant); authorizing it is a separate step that reads the allow-list.
+    #[test]
+    fn authenticating_needs_no_allow_list_and_authorizing_is_a_separate_step() {
+        let peer: IpAddr = "100.64.0.7".parse().unwrap();
+        let stranger = test_node("nPHONE", "phone", "100.64.0.7");
+        let node = authenticate(TokenCheck::Match, || Ok(Some(stranger.clone())), "tailscale", peer, Some("nSTUDIO"))
+            .expect("a node the network names, holding the token, is authenticated");
+        assert_eq!(node.node_id, "nPHONE");
+        assert!(matches!(authorize(&node, || Ok(allow())), Err(Refusal::NotAllowed { node_name }) if node_name == "phone"));
+        let listed = test_node("nLAPTOP", "macbook-pro", "100.64.0.7");
+        assert_eq!(authorize(&listed, || Ok(allow())).unwrap().peer_name, "macbook-pro");
+        let unreadable = authorize(&listed, || Err("no such file".into()));
+        assert!(matches!(unreadable, Err(Refusal::BadRequest(_))), "an unreadable allow-list refuses: {unreadable:?}");
+    }
+
+    /// Authentication still refuses this machine's own node, a node the
+    /// network does not name, and a provider that cannot answer.
+    #[test]
+    fn authenticate_refuses_self_unplaced_and_unanswered_callers() {
+        let peer: IpAddr = "100.64.0.7".parse().unwrap();
+        let me = test_node("nSTUDIO", "studio", "100.64.0.7");
+        assert!(matches!(authenticate(TokenCheck::Match, || Ok(Some(me)), "t", peer, Some("nSTUDIO")), Err(Refusal::FromSelf)));
+        assert!(matches!(authenticate(TokenCheck::Match, || Ok(None), "t", peer, None), Err(Refusal::NotOnOverlay { .. })));
+        assert!(matches!(
+            authenticate(TokenCheck::Match, || Err("down".into()), "t", peer, None),
+            Err(Refusal::IdentityUnavailable { .. })
+        ));
+    }
+
+    /// A reply status a newer darkmux sends reads as `unknown`, not as a parse
+    /// failure that discards the reply.
+    #[test]
+    fn a_reply_status_this_darkmux_does_not_know_reads_as_unknown() {
+        let r: SubmissionReply = serde_json::from_str(r#"{"status": "paused", "machine": "studio"}"#).unwrap();
+        assert_eq!(r.status, ReplyStatus::Unknown);
+        assert_eq!(r.machine.as_deref(), Some("studio"));
     }
 
     /// The token is checked before the identity lookup runs, so a caller
