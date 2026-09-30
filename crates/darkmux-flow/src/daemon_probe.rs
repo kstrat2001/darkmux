@@ -33,24 +33,23 @@ pub const DEFAULT_DAEMON_ADDR: &str = "127.0.0.1:8765";
 /// resolution.
 pub const DEFAULT_DAEMON_PORT: u16 = 8765;
 
-/// (#2765) The resolved `host:port` a client on this machine should probe to
-/// reach the local daemon — `env(DARKMUX_SERVE_BIND/_PORT) > config.serve.*
-/// > the built-in defaults above`, with a wildcard bind probed on loopback.
+/// The resolved `host:port` a client on this machine should probe to reach
+/// the local daemon: the running daemon's own record, else
+/// `env(DARKMUX_SERVE_BIND/_PORT) > config.serve.* > the built-in defaults
+/// above`, with a wildcard bind probed on loopback.
 ///
 /// Thin by design: the resolution itself lives in ONE place
-/// (`darkmux_types::config_access::serve_client_addr`), the same place
-/// `darkmux serve` itself reads its listen address from. Re-exported here
+/// (`darkmux_types::config_access::serve_client_endpoint`). Re-exported here
 /// so the client-side probe callers that already depend on this module do
 /// not each grow their own config read.
 pub fn daemon_addr() -> String {
     darkmux_types::config_access::serve_client_addr()
 }
 
-/// (#2765) The resolved daemon port — `env(DARKMUX_SERVE_PORT) >
-/// config.serve.port > 8765`. For callers that need the port alone (a
+/// The resolved daemon port, the port of [`daemon_addr`]. For callers that need the port alone (a
 /// portless peer address getting a default appended, a viewer URL).
 pub fn daemon_port() -> u16 {
-    darkmux_types::config_access::serve_port()
+    darkmux_types::config_access::serve_client_port()
 }
 
 /// Probe-budget timeout for the every-dispatch reachability check.

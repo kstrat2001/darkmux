@@ -2889,7 +2889,7 @@ fn check_live_channel() -> Check {
     let state = socket.as_deref().map(darkmux_flow::live::probe_socket);
     let addr = darkmux_types::config_access::serve_client_addr();
     let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or("127.0.0.1").to_string();
-    let port = darkmux_types::config_access::serve_port();
+    let port = darkmux_types::config_access::serve_client_port();
     let daemon = loopback_http_body(&host, port, "/health")
         .as_deref()
         .and_then(parse_daemon_live_socket);
@@ -5215,10 +5215,14 @@ fn check_daemon_reachable() -> Check {
     // `serve_client_addr` resolves a wildcard bind to loopback for us, so a
     // daemon bound to every interface is probed somewhere it is actually
     // listening rather than at the unroutable `0.0.0.0`.
-    let addr = darkmux_types::config_access::serve_client_addr();
-    let port = darkmux_types::config_access::serve_port();
-    let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or("127.0.0.1");
-    check_daemon_reachable_impl(host, port)
+    //
+    // The resolver prefers the running daemon's own record, so a daemon
+    // started with `--port N` is found; the row names which source it used.
+    let endpoint = darkmux_types::config_access::serve_client_endpoint();
+    let host = endpoint.addr.rsplit_once(':').map(|(h, _)| h).unwrap_or("127.0.0.1");
+    let mut check = check_daemon_reachable_impl(host, endpoint.port);
+    check.message = format!("{} · address {}", check.message, endpoint.source.describe());
+    check
 }
 
 /// (#1665) Whether a raw HTTP response's body parses as JSON carrying a
@@ -5622,7 +5626,7 @@ fn check_daemon_freshness() -> Check {
     // became invisible to all of them at once.
     let addr = darkmux_types::config_access::serve_client_addr();
     let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or("127.0.0.1").to_string();
-    let running = loopback_http_body(&host, darkmux_types::config_access::serve_port(), "/health")
+    let running = loopback_http_body(&host, darkmux_types::config_access::serve_client_port(), "/health")
         .as_deref()
         .and_then(parse_daemon_build);
     classify_daemon_freshness(

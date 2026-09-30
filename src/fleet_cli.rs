@@ -826,11 +826,11 @@ fn daemon_token_set() -> Option<bool> {
 
 /// The local daemon's `/health`, when it answers within 500 ms.
 fn daemon_health() -> Option<serde_json::Value> {
-    let port = darkmux_types::config_access::serve_port();
+    let addr = darkmux_types::config_access::serve_client_addr();
     ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_millis(500))
         .build()
-        .get(&format!("http://127.0.0.1:{port}/health"))
+        .get(&format!("http://{addr}/health"))
         .call()
         .ok()?
         .into_string()

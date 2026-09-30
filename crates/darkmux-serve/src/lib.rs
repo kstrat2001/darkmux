@@ -1468,6 +1468,13 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
                 )
             })?;
         record_bound_addr(listener.local_addr().ok());
+        // Tell every client on this machine where this daemon actually bound
+        // (a `--port` on the command line is invisible to config). The guard
+        // removes the record when this block ends, on clean shutdown.
+        let _daemon_record = listener
+            .local_addr()
+            .ok()
+            .map(|a| darkmux_types::daemon_record::publish(&a.ip().to_string(), a.port()));
 
         // Banner: print after bind succeeds so we don't claim "listening"
         // before we actually are.

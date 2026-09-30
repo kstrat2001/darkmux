@@ -759,7 +759,76 @@ pub fn serve_bind_with_source() -> (String, Source) {
 ///
 /// IPv6 literals are bracketed so the result parses as a `SocketAddr`.
 pub fn serve_client_addr() -> String {
-    format_client_addr(&serve_bind(), serve_port())
+    serve_client_endpoint().addr
+}
+
+/// The port of [`serve_client_addr`]: the one a CLIENT on this machine
+/// connects to. Server-side code that decides what to BIND keeps
+/// [`serve_port`].
+pub fn serve_client_port() -> u16 {
+    serve_client_endpoint().port
+}
+
+/// Where a client on this machine found the daemon's address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientAddrSource {
+    /// The running daemon's own record (`daemon_record`), which knows a
+    /// `--port` / `--bind` given on its command line.
+    RunningDaemon { pid: u32 },
+    Env,
+    Config,
+    BuiltIn,
+}
+
+impl ClientAddrSource {
+    /// The provenance text `darkmux doctor` prints beside the address.
+    pub fn describe(&self) -> String {
+        match self {
+            ClientAddrSource::RunningDaemon { pid } => format!("from the running daemon's record, pid {pid}"),
+            ClientAddrSource::Env => "from DARKMUX_SERVE_* env".into(),
+            ClientAddrSource::Config => "from config.json".into(),
+            ClientAddrSource::BuiltIn => "built-in default".into(),
+        }
+    }
+}
+
+/// Where a client on this machine should reach the daemon, and which tier
+/// said so.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientEndpoint {
+    /// `<host>:<port>`, a wildcard bind collapsed to loopback.
+    pub addr: String,
+    pub port: u16,
+    pub source: ClientAddrSource,
+}
+
+/// THE client-side resolver: a live daemon record, else
+/// `env(DARKMUX_SERVE_BIND/_PORT) > config.serve.* > built-in`.
+///
+/// The record comes first because the running daemon is the only authority on
+/// where it bound: `darkmux serve --port N` is invisible to config, and every
+/// client that resolved from config alone reported it unreachable.
+pub fn serve_client_endpoint() -> ClientEndpoint {
+    match crate::daemon_record::live() {
+        Some(rec) => ClientEndpoint {
+            addr: format_client_addr(&rec.host, rec.port),
+            port: rec.port,
+            source: ClientAddrSource::RunningDaemon { pid: rec.pid },
+        },
+        None => configured_client_endpoint(),
+    }
+}
+
+/// The env > config > built-in tiers alone, ignoring any daemon record.
+fn configured_client_endpoint() -> ClientEndpoint {
+    let (port, port_src) = serve_port_with_source();
+    let (bind, bind_src) = serve_bind_with_source();
+    let source = match (port_src, bind_src) {
+        (Source::Env, _) | (_, Source::Env) => ClientAddrSource::Env,
+        (Source::Config, _) | (_, Source::Config) => ClientAddrSource::Config,
+        (Source::BuiltIn, Source::BuiltIn) => ClientAddrSource::BuiltIn,
+    };
+    ClientEndpoint { addr: format_client_addr(&bind, port), port, source }
 }
 
 /// The address the daemon LISTENS on — `<bind>:<port>`, verbatim, with a
@@ -4924,6 +4993,80 @@ mod tests {
         }
         // An empty bind is "nothing useful named", not a reason to build `:8765`.
         assert_eq!(format_listen_addr("  ", 8765), "127.0.0.1:8765");
+    }
+
+    /// Runs `f` with DARKMUX_HOME pointing at a fresh temp home and the serve
+    /// env cleared, restoring both after.
+    fn with_isolated_home<R>(f: impl FnOnce(&std::path::Path) -> R) -> R {
+        let tmp = tempfile::tempdir().unwrap();
+        let keys = ["DARKMUX_HOME", "DARKMUX_SERVE_PORT", "DARKMUX_SERVE_BIND"];
+        let prev: Vec<_> = keys.iter().map(|k| std::env::var(k).ok()).collect();
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", tmp.path());
+            std::env::remove_var("DARKMUX_SERVE_PORT");
+            std::env::remove_var("DARKMUX_SERVE_BIND");
+        }
+        let r = f(tmp.path());
+        for (k, v) in keys.iter().zip(prev) {
+            unsafe {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        r
+    }
+
+    fn write_daemon_record(home: &std::path::Path, pid: u32, port: u16) {
+        std::fs::create_dir_all(home.join("run")).unwrap();
+        std::fs::write(
+            home.join("run/daemon.json"),
+            format!(r#"{{"pid":{pid},"host":"127.0.0.1","port":{port}}}"#),
+        )
+        .unwrap();
+    }
+
+    /// The promise: a daemon started with `--port N` is found by every client.
+    #[serial_test::serial]
+    #[test]
+    fn a_live_daemon_record_beats_env_and_the_default() {
+        with_isolated_home(|home| {
+            write_daemon_record(home, std::process::id(), 8766);
+            unsafe { std::env::set_var("DARKMUX_SERVE_PORT", "8799"); }
+            let ep = serve_client_endpoint();
+            assert_eq!(ep.addr, "127.0.0.1:8766");
+            assert_eq!(ep.port, 8766);
+            assert_eq!(ep.source, ClientAddrSource::RunningDaemon { pid: std::process::id() });
+            assert_eq!(serve_client_addr(), "127.0.0.1:8766");
+            assert_eq!(serve_client_port(), 8766);
+            assert_eq!(serve_port(), 8799, "the server-side accessor never reads the record");
+        });
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn a_stale_daemon_record_is_ignored() {
+        with_isolated_home(|home| {
+            let mut child = std::process::Command::new("true").spawn().unwrap();
+            let dead = child.id();
+            child.wait().unwrap();
+            write_daemon_record(home, dead, 8766);
+            let ep = serve_client_endpoint();
+            assert_eq!(ep.addr, "127.0.0.1:8765");
+            assert_eq!(ep.source, ClientAddrSource::BuiltIn);
+        });
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn without_a_record_env_then_default_resolve_as_before() {
+        with_isolated_home(|_| {
+            assert_eq!(serve_client_endpoint().source, ClientAddrSource::BuiltIn);
+            unsafe { std::env::set_var("DARKMUX_SERVE_PORT", "8799"); }
+            let ep = serve_client_endpoint();
+            assert_eq!((ep.addr.as_str(), ep.source), ("127.0.0.1:8799", ClientAddrSource::Env));
+        });
     }
 
     /// The whole point of #2765: the address a CLIENT probes and the port
