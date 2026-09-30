@@ -120,6 +120,14 @@ impl RunId {
     }
 }
 
+/// The most relay levels [`SessionId::parse`] accepts. A fleet relay is one
+/// hop today (a job names a registry profile on its receiver, and a receiver
+/// does not re-relay), so 8 leaves generous headroom plus margin while keeping
+/// the recursive derives on [`SessionId`] safe on any parsed value. No shorter
+/// bound on the wire string exists in this crate: the job's own length limit
+/// lives in `darkmux-fleet`.
+pub const MAX_RELAY_DEPTH: usize = 8;
+
 impl fmt::Display for RunId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.id)
@@ -253,6 +261,10 @@ impl SessionId {
     /// Read a wire string back: the exact inverse of [`SessionId::wire`].
     /// Strict: anything [`SessionId::wire`] would not have written is an
     /// error.
+    ///
+    /// Relay nesting is capped at [`MAX_RELAY_DEPTH`], so no value this returns
+    /// is deep enough to overflow the stack in a derived `Clone`, `PartialEq`,
+    /// `Hash` or `Debug`.
     pub fn parse(wire: &str) -> Result<Self, IdError> {
         let bad = |why: &str| IdError(format!("session id {wire:?}: {why}"));
         // Peel `relay.<peer>.` layers in a loop (a relay's tail is the sender's
@@ -270,6 +282,9 @@ impl SessionId {
                     let (peer, tail) =
                         fields.split_first().filter(|(_, t)| !t.is_empty()).ok_or_else(|| bad("a relay names no sender"))?;
                     let peer = unescape(peer).ok_or_else(|| bad("a field is not escaped as written"))?;
+                    if layers.len() == MAX_RELAY_DEPTH {
+                        return Err(bad("a relay nests deeper than a fleet ever relays"));
+                    }
                     layers.push((run, peer));
                     at = comps.len() - tail.len();
                 }
@@ -665,36 +680,47 @@ mod tests {
         assert_eq!(SessionId::parse(&again.wire()).unwrap(), again);
     }
 
-    /// A crafted relay id nests one level per `relay.<peer>.` prefix and
-    /// arrives from a job body, a peer's reply or a presence beat. Parsing,
-    /// re-writing and dropping it must be linear and stack-flat.
+    fn deep_relay_wire(depth: usize) -> String {
+        let mut wire = String::from("m.solo.run");
+        for _ in 0..depth {
+            wire = format!("m.solo.relay.p.{wire}");
+        }
+        wire
+    }
+
+    /// A relay nested to the cap reads back exactly.
     #[test]
-    fn a_very_deep_relay_parses_in_linear_time_on_a_small_stack() {
-        const DEPTH: usize = 50_000;
+    fn a_relay_at_the_depth_cap_round_trips() {
+        let wire = deep_relay_wire(MAX_RELAY_DEPTH);
+        let parsed = SessionId::parse(&wire).unwrap();
+        assert_eq!(parsed.wire(), wire);
+        assert_eq!(parsed.clone(), parsed);
+    }
+
+    /// One level past the cap is refused with the typed error.
+    #[test]
+    fn a_relay_past_the_depth_cap_is_refused() {
+        let err = SessionId::parse(&deep_relay_wire(MAX_RELAY_DEPTH + 1)).unwrap_err();
+        assert!(err.0.contains("nests deeper"), "{err:?}");
+    }
+
+    /// A crafted relay id arrives from a job body, a peer's reply or a
+    /// presence beat. A 50,000-level one is refused quickly, on a small
+    /// stack, before any recursive derive can see it.
+    #[test]
+    fn a_hostile_deep_relay_is_refused_fast_on_a_small_stack() {
         let handle = std::thread::Builder::new()
             .stack_size(2 * 1024 * 1024)
             .spawn(|| {
-                let mut wire = String::from("m.solo.run");
-                for _ in 0..DEPTH {
-                    wire = format!("m.solo.relay.p.{wire}");
-                }
+                let wire = deep_relay_wire(50_000);
                 let started = std::time::Instant::now();
-                let parsed = SessionId::parse(&wire).expect("a deep relay is still the grammar");
-                let elapsed = started.elapsed();
-                assert_eq!(parsed.wire(), wire, "the deep relay reads back exactly");
-                let mut depth = 0;
-                let mut cur = &parsed;
-                while let SessionKind::Relay { sender, .. } = cur.kind() {
-                    depth += 1;
-                    cur = sender;
-                }
-                assert_eq!(depth, DEPTH);
-                drop(parsed);
-                elapsed
+                let refused = SessionId::parse(&wire).is_err();
+                (refused, started.elapsed())
             })
             .unwrap();
-        let elapsed = handle.join().expect("no stack overflow");
-        assert!(elapsed < std::time::Duration::from_secs(5), "parse took {elapsed:?}: not linear");
+        let (refused, elapsed) = handle.join().expect("no stack overflow");
+        assert!(refused);
+        assert!(elapsed < std::time::Duration::from_secs(1), "refusal took {elapsed:?}");
     }
 
     #[test]
