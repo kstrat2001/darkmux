@@ -15,7 +15,7 @@
  */
 
 import { fmtC, memBytes } from "../../lib/format";
-import { uidOf } from "../../lib/flow";
+import { sameUid, uidOf } from "../../lib/machineIdentity";
 import { utilityJobWord, utilityStrip, utilityUsageByJob, type UtilityStrip } from "../../lib/utilityJobs";
 import type { ModelRow } from "../../types/generated/ModelRow";
 import type { MachineSpecsResponse } from "../../types/generated/MachineSpecsResponse";
@@ -69,7 +69,7 @@ export function utilitySectionView(args: {
           : "no utility model registered";
   const job = strip.job;
   const liveLine = noSignal ? "no signal" : job ? (job.stalled ? `${job.word} · stalled` : `${job.word} · ${Math.max(0, Math.floor((args.nowMs - job.sinceMs) / 1000))}s`) : "idle";
-  const mine = recordsAsOf(args.data, args.nowMs).filter((r) => uidOf(r) === args.uid);
+  const mine = recordsAsOf(args.data, args.nowMs).filter((r) => sameUid(uidOf(r), args.uid));
   // (#2915 review, C7) A FIXED set of rows, so the section is one size
   // whatever ran: one per known job, then ONE "other" row folding every job
   // this build does not know and every utility record that names none (a

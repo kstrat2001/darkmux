@@ -34,7 +34,7 @@
  * is all that survives of it, and why.
  */
 
-import { isUnnamedMachineLabel } from "../../lib/flow";
+import { isUnnamedMachineLabel } from "../../lib/machineIdentity";
 import { memBytes } from "../../lib/format";
 import { MACHINE_MEM_POLL_MS } from "../../lib/queryKeys";
 import type { MachineResourcesResponse } from "../../types/generated/MachineResourcesResponse";

@@ -16,6 +16,7 @@ import type { Liveness } from "../../types/generated/Liveness";
 import type { MachineSpecsResponse } from "../../types/generated/MachineSpecsResponse";
 import type { UnavailableWhy } from "../../types/generated/UnavailableWhy";
 import type { UnreachableReason } from "../../types/generated/UnreachableReason";
+import { findUid } from "../../lib/machineIdentity";
 
 /** Whether a machine is up, as the card should say it. `unknown` is a real
  * third answer: presence could not say, and nothing else did either. */
@@ -173,23 +174,6 @@ export interface RowFacts {
   isSelf: boolean;
 }
 
-/** The flow uid each machine NAME belongs to, for the names one uid alone
- * holds. Machine names are ASCII case-insensitive (`same_machine` in
- * `darkmux-fleet`), so keys are lowercased; a name two uids share decides
- * nothing and is left out. `namesOf` gives every name a uid was seen under. */
-export function flowUidByName(uids: readonly string[], namesOf: (uid: string) => Iterable<string>): Map<string, string> {
-  const byName = new Map<string, string>();
-  const shared = new Set<string>();
-  for (const uid of uids) {
-    for (const name of new Set([...namesOf(uid)].map((n) => n.toLowerCase()))) {
-      if (byName.has(name) && byName.get(name) !== uid) shared.add(name);
-      byName.set(name, uid);
-    }
-  }
-  for (const name of shared) byName.delete(name);
-  return byName;
-}
-
 /** The uid a card is keyed by. This machine's own row, when the daemon
  * reports no hardware uid, takes `selfUid`: the flow uid the page recognizes
  * as this machine. A machine the page already knows by its
@@ -200,13 +184,15 @@ export function rowUid(
   row: FleetMachine,
   knownUids: ReadonlySet<string>,
   selfUid: string | null,
-  flowUids: ReadonlyMap<string, string> = new Map(),
+  flowUidOfName: (name: string) => string | null = () => null,
 ): string {
-  // A row whose card was not read has no uid of its own; the flow machine
-  // that goes by its roster id is the same machine (`flowUidByName`).
-  const named = row.entry ? flowUids.get(row.entry.id.toLowerCase()) : undefined;
+  // A row whose card was not read has no uid of its own; the one flow machine
+  // that goes by its roster id is the same machine (`uidForName`).
+  const named = row.entry ? flowUidOfName(row.entry.id) : null;
   const uid = row.machine_uid ?? (row.is_this_machine ? selfUid : null) ?? named ?? null;
-  if (uid && knownUids.has(uid)) return uid;
+  // A uid the page already knows, in the form the page spells it.
+  const known = findUid(knownUids, uid);
+  if (known !== null) return known;
   return row.entry?.id ?? uid ?? "unknown";
 }
 
@@ -214,13 +200,13 @@ export function rowFacts(
   row: FleetMachine,
   knownUids: ReadonlySet<string>,
   selfUid: string | null,
-  flowUids: ReadonlyMap<string, string> = new Map(),
+  flowUidOfName: (name: string) => string | null = () => null,
 ): RowFacts {
   const specs = rowSpecs(row);
-  const uid = rowUid(row, knownUids, selfUid, flowUids);
+  const uid = rowUid(row, knownUids, selfUid, flowUidOfName);
   return {
     uid,
-    known: knownUids.has(uid),
+    known: findUid(knownUids, uid) !== null,
     name: row.entry?.id ?? specs?.machine_id ?? null,
     spec: specs ? specsLine(specs) : "",
     note: outcomeLine(row.card),

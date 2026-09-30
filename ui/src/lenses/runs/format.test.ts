@@ -8,9 +8,12 @@ import {
   runsMultiMachine,
   runsFiltered,
   runsForMachine,
+  runMachineLabels,
   runDestination,
 } from "./format";
 import type { Run } from "../../types/generated/Run";
+import { machineMatch } from "../../lib/machineIdentity";
+import { FLEET_UID as U, fleetRun, lower, machineFleet } from "../../testing/machineFleet";
 
 function run(over: Partial<Run> & Pick<Run, "id" | "kind" | "status" | "tracked">): Run {
   return over;
@@ -63,18 +66,18 @@ describe("runSubtitle", () => {
       model: "darkmux:qwen3.6-35b-a3b",
       machine: "MacBook-Pro",
     });
-    expect(runSubtitle(r, true)).toBe("code-reviewer · qwen3.6-35b-a3b · MacBook-Pro");
+    expect(runSubtitle(r, "MacBook-Pro")).toBe("code-reviewer · qwen3.6-35b-a3b · MacBook-Pro");
   });
-  it("hides the machine when showMachine is false", () => {
+  it("hides the machine when no machine label is passed", () => {
     const r = run({ id: "a", kind: "dispatch", status: "complete", tracked: true, role: "x", machine: "MacBook-Pro" });
-    expect(runSubtitle(r, false)).toBe("x");
+    expect(runSubtitle(r, null)).toBe("x");
   });
   it("prefixes route with 'via '", () => {
     const r = run({ id: "a", kind: "mission", status: "complete", tracked: true, model: "gpt-4o", route: "azure:host/dep" });
-    expect(runSubtitle(r, false)).toBe("gpt-4o · via azure:host/dep");
+    expect(runSubtitle(r, null)).toBe("gpt-4o · via azure:host/dep");
   });
   it("is empty when nothing applies", () => {
-    expect(runSubtitle(run({ id: "a", kind: "mission", status: "complete", tracked: true }), false)).toBe("");
+    expect(runSubtitle(run({ id: "a", kind: "mission", status: "complete", tracked: true }), null)).toBe("");
   });
 
   // (#2494) A lab run that dispatched fine and failed its tests says so on its
@@ -83,18 +86,18 @@ describe("runSubtitle", () => {
     const lab = (extra: Partial<Run>) =>
       run({ id: "l", kind: "lab", status: "complete", tracked: true, model: "darkmux:qwen3.6-35b-a3b", ...extra });
     it("shows workload then verify FAIL / pass / — before the model", () => {
-      expect(runSubtitle(lab({ workload: "quick-coding", verify_passed: false }), false)).toBe(
+      expect(runSubtitle(lab({ workload: "quick-coding", verify_passed: false }), null)).toBe(
         "quick-coding · verify FAIL · qwen3.6-35b-a3b",
       );
-      expect(runSubtitle(lab({ workload: "quick-coding", verify_passed: true }), false)).toBe(
+      expect(runSubtitle(lab({ workload: "quick-coding", verify_passed: true }), null)).toBe(
         "quick-coding · verify pass · qwen3.6-35b-a3b",
       );
-      expect(runSubtitle(lab({ workload: "quick-coding" }), false)).toBe("quick-coding · verify — · qwen3.6-35b-a3b");
+      expect(runSubtitle(lab({ workload: "quick-coding" }), null)).toBe("quick-coding · verify — · qwen3.6-35b-a3b");
     });
     it("says nothing about verify for a run with no manifest yet, or for a non-lab row", () => {
-      expect(runSubtitle(lab({}), false)).toBe("qwen3.6-35b-a3b");
+      expect(runSubtitle(lab({}), null)).toBe("qwen3.6-35b-a3b");
       expect(
-        runSubtitle(run({ id: "m", kind: "mission", status: "complete", tracked: true, verify_passed: false }), false),
+        runSubtitle(run({ id: "m", kind: "mission", status: "complete", tracked: true, verify_passed: false }), null),
       ).toBe("");
     });
   });
@@ -135,6 +138,28 @@ describe("runsMultiMachine", () => {
     ];
     expect(runsMultiMachine(runs)).toBe(true);
   });
+  it("one machine under two spellings and two uid cases is still one machine", () => {
+    const runs = [fleetRun("a", "MacBook-Pro", U.mbp), fleetRun("b", "MacBook-Pro.local", lower(U.mbp)), fleetRun("c", "macbook-pro")];
+    expect(runsMultiMachine(runs)).toBe(false);
+  });
+  it("two machines that share a display name are two machines", () => {
+    expect(runsMultiMachine([fleetRun("a", "Mac", U.macA), fleetRun("b", "Mac", U.macB)])).toBe(true);
+  });
+});
+
+describe("runMachineLabels", () => {
+  it("names one machine once, by its most recently active run, whatever the spellings", () => {
+    const older = { ...fleetRun("a", "MacBook-Pro", U.mbp), updated_ts: 1 };
+    const newer = { ...fleetRun("b", "MacBook-Pro.local", lower(U.mbp)), updated_ts: 9 };
+    const labels = runMachineLabels([older, newer]);
+    expect(labels.get("a")).toBe("MacBook-Pro.local");
+    expect(labels.get("b")).toBe("MacBook-Pro.local");
+  });
+  it("tells two machines with one display name apart by ordinal, never by uid", () => {
+    const labels = runMachineLabels([{ ...fleetRun("a", "Mac", U.macA), updated_ts: 2 }, { ...fleetRun("b", "Mac", U.macB), updated_ts: 1 }]);
+    expect(labels.get("a")).toBe("Mac");
+    expect(labels.get("b")).toBe("Mac 2");
+  });
 });
 
 describe("runsFiltered", () => {
@@ -151,44 +176,60 @@ describe("runsFiltered", () => {
   });
 });
 
-// (#1809, #1508 step 4) `runsForMachine` — the runs lens's machine pin.
+// (#1809, #1508 step 4) `runsForMachine` — the runs lens's machine pin. A
+// run belongs to a machine by uid; a run with no uid falls back to a name
+// only that machine answers to.
 describe("runsForMachine", () => {
-  it("keeps only rows whose machine name is in the alias set", () => {
-    const a = run({ id: "a", kind: "dispatch", status: "complete", tracked: true, machine: "MacBook-Pro" });
-    const b = run({ id: "b", kind: "dispatch", status: "complete", tracked: true, machine: "studio" });
-    expect(runsForMachine([a, b], new Set(["MacBook-Pro"]))).toEqual([a]);
+  const fleet = machineFleet();
+  const matchOf = (id: string, f = fleet) => machineMatch(f.data, f.liveMachines, f.specs, f.roster, id);
+
+  it("keeps the rows whose uid is the machine's, in either case", () => {
+    const a = fleetRun("a", "MacBook-Pro", U.mbp);
+    const b = fleetRun("b", "m1-max-32gb-studio", U.studio);
+    const c = fleetRun("c", "anything", lower(U.mbp));
+    expect(runsForMachine([a, b, c], matchOf(U.mbp))).toEqual([a, c]);
   });
 
-  // The regression this function exists to prevent: matching against a
-  // SINGLE resolved label (e.g. `nameOf(uid)`) instead of the full alias
-  // set returns ZERO rows for a machine whose window carries records under
-  // more than one name — measured on the live daemon (see this function's
-  // own doc). The alias set is the fix; assert it actually behaves like
-  // one, not just like a singleton set that happens to work in the easy
-  // case above.
-  it("matches a row filed under ANY alias in the set — the multi-alias regression this function exists to fix", () => {
-    const legacyAlias = run({ id: "a", kind: "mission", status: "complete", tracked: true, machine: "MacBook-Pro" });
-    const currentAlias = run({ id: "b", kind: "mission", status: "complete", tracked: true, machine: "MacBook-Pro.local" });
-    const names = new Set(["MacBook-Pro", "MacBook-Pro.local"]);
-    expect(runsForMachine([legacyAlias, currentAlias], names)).toEqual([legacyAlias, currentAlias]);
+  it("a row filed under ANY alias of the machine, with no uid, still belongs to it", () => {
+    const bare = fleetRun("a", "MacBook-Pro");
+    const local = fleetRun("b", "MacBook-Pro.local");
+    const recased = fleetRun("c", "MACBOOK-PRO");
+    expect(runsForMachine([bare, local, recased], matchOf(U.mbp))).toEqual([bare, local, recased]);
   });
 
-  // Inverted case: a single-alias set must NOT accidentally match the
-  // other alias — proves the match is a real Set.has, not a substring/
-  // prefix check that would silently widen the filter.
-  it("does NOT match a different alias not in the set", () => {
-    const other = run({ id: "a", kind: "mission", status: "complete", tracked: true, machine: "MacBook-Pro.local" });
-    expect(runsForMachine([other], new Set(["MacBook-Pro"]))).toEqual([]);
+  it("does NOT match another machine's alias", () => {
+    expect(runsForMachine([fleetRun("a", "m1-max-32gb-studio")], matchOf(U.mbp))).toEqual([]);
   });
 
-  it("excludes a run with no machine at all — real tracked work with an unrecorded attribution, not this machine's", () => {
-    const unattributed = run({ id: "a", kind: "mission", status: "complete", tracked: true });
-    expect(runsForMachine([unattributed], new Set(["MacBook-Pro"]))).toEqual([]);
+  it("two machines that share a display name each keep only their own uid's runs", () => {
+    const f = machineFleet({ twinMacs: true });
+    const a = fleetRun("a", "Mac", U.macA);
+    const b = fleetRun("b", "Mac", U.macB);
+    expect(runsForMachine([a, b], matchOf(U.macA, f))).toEqual([a]);
+    expect(runsForMachine([a, b], matchOf(U.macB, f))).toEqual([b]);
   });
 
-  it("returns nothing for an empty alias set (an unresolvable/stale pin) rather than throwing", () => {
-    const a = run({ id: "a", kind: "dispatch", status: "complete", tracked: true, machine: "MacBook-Pro" });
-    expect(runsForMachine([a], new Set())).toEqual([]);
+  it("a shared name with no uid is attributed to neither machine", () => {
+    const f = machineFleet({ twinMacs: true });
+    const loose = fleetRun("x", "Mac");
+    expect(runsForMachine([loose], matchOf(U.macA, f))).toEqual([]);
+    expect(runsForMachine([loose], matchOf(U.macB, f))).toEqual([]);
+  });
+
+  it("a roster-only peer's pin shows the runs carrying its uid or its roster name", () => {
+    const f = machineFleet({ streamsHere: false });
+    const byUid = fleetRun("a", "Darkbook", U.darkbook);
+    const byName = fleetRun("b", "darkbook");
+    const other = fleetRun("c", "m1-max-32gb-studio", U.studio);
+    expect(runsForMachine([byUid, byName, other], matchOf("darkbook", f))).toEqual([byUid, byName]);
+  });
+
+  it("excludes a run with no machine at all: real tracked work with an unrecorded attribution, not this machine's", () => {
+    expect(runsForMachine([fleetRun("a", undefined)], matchOf(U.mbp))).toEqual([]);
+  });
+
+  it("returns nothing for a match with no uid and no names (an unresolvable pin) rather than throwing", () => {
+    expect(runsForMachine([fleetRun("a", "MacBook-Pro")], { uid: null, names: new Set() })).toEqual([]);
   });
 });
 

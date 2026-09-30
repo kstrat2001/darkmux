@@ -18,7 +18,8 @@ import { cardOrderKey, orderCards } from "./cardOrder";
 import { useCardOrderGate } from "./cardOrderGate";
 import { getSource, runsSrc, runsReachable } from "../../lib/source";
 import { useLiveSessionIds } from "../../hooks/useLiveSessionIds";
-import { machineUids, machPresent, machineNames, isSelfMachine, LIVE_WINDOW_MS } from "../../lib/flow";
+import { machPresent, LIVE_WINDOW_MS } from "../../lib/flow";
+import { isSelfMachine, machineMatch, machineUids, uidForName } from "../../lib/machineIdentity";
 import type { FleetMachinesLiveResponse } from "../../types/generated/FleetMachinesLiveResponse";
 import type { FleetDispatchesLiveResponse } from "../../types/generated/FleetDispatchesLiveResponse";
 import type { RunsResponse } from "../../types/generated/RunsResponse";
@@ -35,7 +36,7 @@ import { tokensOffMeter } from "./savings";
 import { buildFleetCardBase, withLiveReadings, busiestExecution, isStrictlyBusier, specDimLabel, specLine, cardFace, NO_SIGNAL_STAT, type CardSourcesAnswered, type FleetCard } from "./cards";
 import { useLatch } from "../../hooks/useLatch";
 import { buildActivityTimeline, ACTIVITY_WINDOW_PRESETS, DEFAULT_ACTIVITY_WINDOW_MIN } from "./timeline";
-import { flowUidByName, rowFacts, rowSpecs } from "./viewRows";
+import { rowFacts, rowSpecs } from "./viewRows";
 import { runsForMachine } from "../runs/format";
 import { recordsAsOf, type NormRecord } from "../../lib/ingest";
 import { dispatchHash } from "../../lib/route";
@@ -842,10 +843,13 @@ export function FleetLens({
   const viewCards = useMemo(() => {
     const known = new Set(uids);
     const selfUid = specs ? (uids.find((u) => isSelfMachine(flowWindow.data, liveMachines, specs, u)) ?? null) : null;
-    const flowUids = flowUidByName(uids, (u) => machineNames(flowWindow.data, liveMachines, u));
-    return (viewRows ?? []).map((row) => ({ row, facts: rowFacts(row, known, selfUid, flowUids) }));
+    const flowUidOfName = (name: string) => uidForName(flowWindow.data, liveMachines, name);
+    return (viewRows ?? []).map((row) => ({ row, facts: rowFacts(row, known, selfUid, flowUidOfName) }));
   }, [viewRows, uids, specs, flowWindow.data, liveMachines]);
   const flowOnlyUids = useMemo(() => {
+    // `facts.uid` is already in the flow window's spelling of the uid
+    // (`rowUid`), so a view row that spells it differently covers that
+    // machine's flow card instead of adding a second one.
     const covered = new Set(viewCards.flatMap(({ row, facts }) => [facts.uid, row.machine_uid ?? facts.uid]));
     return uids.filter((m) => !covered.has(m));
   }, [viewCards, uids]);
@@ -876,10 +880,10 @@ export function FleetLens({
         liveMode,
         playheadT,
         facts,
-        // (#1923) `Run.machine` carries only a display NAME
-        // (`runsForMachine`'s own doc): the machine's aliases, plus the
-        // name the view gives it.
-        runsForMachine(runs, new Set([...machineNames(flowWindow.data, liveMachines, facts.uid), ...(facts.name ? [facts.name] : [])])),
+        // (#1923) A run belongs to the card's machine by uid
+        // (`runsForMachine`'s own doc); the name the view gives the machine
+        // is one more spelling it answers to.
+        runsForMachine(runs, machineMatch(flowWindow.data, liveMachines, specs, roster, facts.uid, facts.name ? [facts.name] : [])),
         roster,
         policy,
       ),
@@ -896,7 +900,7 @@ export function FleetLens({
         liveMode,
         playheadT,
         null,
-        runsForMachine(runs, machineNames(flowWindow.data, liveMachines, m)),
+        runsForMachine(runs, machineMatch(flowWindow.data, liveMachines, specs, roster, m)),
         roster,
         policy,
       ),

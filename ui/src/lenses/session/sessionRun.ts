@@ -68,6 +68,7 @@ import type { RunStatus } from "../../types/generated/RunStatus";
 import type { DispatchStartPayload } from "../../types/generated/DispatchStartPayload";
 import { ACTION, CATEGORY, SOURCE, byTime, endPayloadOf, payloadOf, isBookendTerminal, isDispatchTerminal, latestByTime, recordsAsOf, type NormRecord, type NormSource } from "../../lib/ingest";
 import { maxOf } from "../../lib/numbers";
+import { sameUid } from "../../lib/machineIdentity";
 
 /** SYSTEM's WALL CLOCK hover text, for a unit with no model section (the MODEL
  *  section's ACTIVE TIME has its own, below: it shows wall minus rest). */
@@ -702,7 +703,7 @@ function hostSamplesOf(visible: readonly NormRecord[], ctx: RunContext): NormRec
   const runMachineUid = ctx.d?.machine_uid ?? ctx.firstSessRec?.machine_uid ?? null;
   const inWindow = (t: number) => t >= ctx.startTs && (ctx.closeTs == null || t <= ctx.closeTs);
   return visible.filter(
-    (r) => r.action === ACTION.MachineTelemetry && (runMachineUid == null || r.machine_uid === runMachineUid) && (r.tMs === null || inWindow(r.tMs)),
+    (r) => r.action === ACTION.MachineTelemetry && (runMachineUid == null || sameUid(r.machine_uid, runMachineUid)) && (r.tMs === null || inWindow(r.tMs)),
   );
 }
 

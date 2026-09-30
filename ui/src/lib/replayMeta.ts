@@ -23,7 +23,8 @@
  * disagreeing about what day the page was showing.
  */
 
-import { computeTMax, computeTMin, uidOf } from "./flow";
+import { computeTMax, computeTMin } from "./flow";
+import { uidOf } from "./machineIdentity";
 import { clk, clkrange, lday } from "./format";
 import type { NormRecord } from "./ingest";
 

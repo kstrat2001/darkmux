@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
 import { queryKeys } from "../../lib/queryKeys";
-import type { SelfIdentity } from "../../lib/flow";
+import type { SelfIdentity } from "../../lib/machineIdentity";
 import type { MachineSpecsResponse } from "../../types/generated/MachineSpecsResponse";
 
 /** How long the cards wait for the fleet view before laying out in key order

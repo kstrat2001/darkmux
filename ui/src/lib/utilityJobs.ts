@@ -20,7 +20,7 @@
  */
 
 import type { UtilityJobKind } from "../types/generated/UtilityJobKind";
-import { uidOf } from "./flow";
+import { canonUid, uidOf } from "./machineIdentity";
 import { runIndex } from "./runRef";
 import { CALL_KIND, PURPOSE, isUsageRecord, usagePurpose, type UsagePayload } from "./usageRecords";
 import { mergeLive } from "./liveChannel";
@@ -308,14 +308,14 @@ function machineUtilityRecords(data: readonly NormRecord[], uid: string): NormRe
     index = new Map();
     for (const r of data) {
       if (!r || !(isUtilityStart(r) || isUtilityEnd(r))) continue;
-      const k = uidOf(r);
+      const k = canonUid(uidOf(r));
       const list = index.get(k);
       if (list) list.push(r);
       else index.set(k, [r]);
     }
     machineIndexCache.set(data, index);
   }
-  return index.get(uid) ?? [];
+  return index.get(canonUid(uid)) ?? [];
 }
 
 /** (#2915) A fleet card's utility strip: the machine's utility model, whether

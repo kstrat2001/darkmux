@@ -25,6 +25,7 @@
 import type { Run } from "../../types/generated/Run";
 import { shortModel } from "../lab/labSeries";
 import { dispatchHash } from "../../lib/route";
+import { canonUid, machineRefKey, matchesMachine, nameKey, type MachineMatch, type MachineRef } from "../../lib/machineIdentity";
 
 export { shortModel };
 
@@ -71,8 +72,9 @@ export function runStatusLabel(r: Run): string {
   return r.abandoned_reason === "aborted" ? "aborted" : "no ending recorded";
 }
 
-/** viewer.html: `function runSubtitle(r, showMachine)`. */
-export function runSubtitle(r: Run, showMachine: boolean): string {
+/** viewer.html: `function runSubtitle(r, showMachine)`. `machine` is the
+ * machine's display label (`runMachineLabels`), or `null` to leave it out. */
+export function runSubtitle(r: Run, machine: string | null): string {
   const bits: string[] = [];
   if (r.workload) bits.push(r.workload);
   const verify = verifyLabel(r);
@@ -80,7 +82,7 @@ export function runSubtitle(r: Run, showMachine: boolean): string {
   if (r.role) bits.push(r.role);
   if (r.model) bits.push(shortModel(r.model));
   if (r.route) bits.push(`via ${r.route}`);
-  if (showMachine && r.machine) bits.push(r.machine);
+  if (machine) bits.push(machine);
   return bits.join(" · ");
 }
 
@@ -95,10 +97,64 @@ function verifyLabel(r: Run): string | null {
   return r.workload ? "verify \u2014" : null;
 }
 
+/** The machine a run names: its uid when the row carries one, else its name. */
+function runMachineRef(r: Run): MachineRef {
+  return { uid: r.machine_uid, name: r.machine };
+}
+
+/** The machine key of each run in `runs`: its uid when the row carries one; a
+ * row with only a name takes the uid that one name belongs to among these rows
+ * (a name two uids share resolves to neither), so a machine seen under a uid
+ * on one row and a bare spelling on another is still one machine. */
+function machineKeyOfRuns(runs: Run[]): (r: Run) => string | null {
+  const uidsByName = new Map<string, Set<string>>();
+  for (const r of runs) {
+    if (!r.machine_uid || !r.machine) continue;
+    const k = nameKey(r.machine);
+    uidsByName.set(k, (uidsByName.get(k) ?? new Set()).add(canonUid(r.machine_uid)));
+  }
+  return (r) => {
+    const own = machineRefKey(runMachineRef(r));
+    if (r.machine_uid || !r.machine) return own;
+    const uids = uidsByName.get(nameKey(r.machine));
+    return uids?.size === 1 ? `uid:${[...uids][0]}` : own;
+  };
+}
+
 /** viewer.html: `function runsMultiMachine()`, generalized to take the runs
- * array as a parameter (legacy reads the module-global `RUNS`). */
+ * array as a parameter (legacy reads the module-global `RUNS`). Counts
+ * MACHINES, not spellings: one machine under two names is one, two machines
+ * under one name are two. */
 export function runsMultiMachine(runs: Run[]): boolean {
-  return new Set(runs.map((r) => r.machine).filter((m): m is string => Boolean(m))).size > 1;
+  const keyOf = machineKeyOfRuns(runs);
+  return new Set(runs.map(keyOf).filter((k): k is string => k !== null)).size > 1;
+}
+
+/** The label to print for each run's machine, by run id: the name on the
+ * machine's most recently active run, with machines that would read alike
+ * told apart by an ordinal ("Mac", "Mac 2"). */
+export function runMachineLabels(runs: Run[]): Map<string, string> {
+  const keyOf = machineKeyOfRuns(runs);
+  const newestFirst = [...runs].sort((a, b) => runActivity(b) - runActivity(a));
+  const named = new Map<string, string>();
+  for (const r of newestFirst) {
+    const key = keyOf(r);
+    if (key !== null && r.machine && !named.has(key)) named.set(key, r.machine);
+  }
+  const seen = new Map<string, number>();
+  const labelOfKey = new Map<string, string>();
+  for (const [key, name] of named) {
+    const n = (seen.get(nameKey(name)) ?? 0) + 1;
+    seen.set(nameKey(name), n);
+    labelOfKey.set(key, n === 1 ? name : `${name} ${n}`);
+  }
+  const labels = new Map<string, string>();
+  for (const r of runs) {
+    const key = keyOf(r);
+    const label = key === null ? undefined : labelOfKey.get(key);
+    if (label) labels.set(r.id, label);
+  }
+  return labels;
 }
 
 /** viewer.html: `function runsFiltered()`, parameterized over `runs`/`kind`
@@ -116,23 +172,18 @@ export function runsFiltered(runs: Run[], kind: string): Run[] {
  * other export in this file (see the module doc's opening paragraph), this
  * one has no `viewer.html` namesake; it is new.
  *
- * `Run.machine` (`crates/darkmux-serve/src/runs.rs::build_runs`) is a
- * `machine_id` NAME, not a uid — and one machine can carry SEVERAL names
- * over its lifetime (a laptop logging as both `MacBook-Pro` and
- * `MacBook-Pro.local` — see `lib/flow.ts::machineNames`'s own doc for why).
- * Matching the route's pinned uid against `Run.machine` by resolving ONE
- * label (`nameOf`) and comparing strings would silently drop every row
- * filed under an older alias: measured against the live daemon's real
- * `/runs` (380 rows), that approach returned ZERO rows for the very machine
- * the page was pinned to, because every row said `MacBook-Pro` while
- * `nameOf` resolved the uid to `MacBook-Pro.local`. `names` must be the
- * FULL alias set (`machineNames(...)`), never a single resolved label.
+ * A run belongs to a machine by UID (`Run.machine_uid`, stamped from the
+ * records that produced the row), compared case-normalized: one machine under
+ * a renamed or `.local` spelling stays one machine, and two machines that
+ * share a display name stay two (`lib/machineIdentity.ts::matchesMachine`).
+ * Only a run whose record carried no uid falls back to its name, and then
+ * only to a name no other machine also answers to.
  *
- * A run with NO `machine` at all is excluded from every pin. That set is
- * missions and dispatches only — every lab run carries a machine, because
- * `lab_summary_to_run` takes the daemon's own `machine_id` directly instead
- * of deriving it — and every one of them is `tracked: true`, so this is not
- * ghost noise. The mechanism, rather than a count that rots: `/runs`
+ * A run with NO `machine` and no uid at all is excluded from every pin. That
+ * set is missions and dispatches only — every lab run carries a machine,
+ * because `lab_summary_to_run` takes the daemon's own `machine_id` directly
+ * instead of deriving it — and every one of them is `tracked: true`, so this
+ * is not ghost noise. The mechanism, rather than a count that rots: `/runs`
  * resolves a mission's machine from the WINDOWED flow session index
  * (`RUNS_FLOW_SCAN_WINDOW_DAYS`, 14 days), and the durable `mission.json`
  * has no machine field to fall back on, so any tracked run older than that
@@ -140,25 +191,10 @@ export function runsFiltered(runs: Run[], kind: string): Run[] {
  * disk. Filed as #1810.
  *
  * Excluding them is the honest call — claiming an unattributed row as "this
- * machine" would be the worse lie — but it is worth naming so nobody
- * re-derives "where did the missing rows go" from scratch. It is a
- * meaningful fraction: at the time of writing, 82 of 380.
- *
- * KNOWN LIMIT, not a defect of this function: `Run` carries no
- * `machine_uid`, only the name, so two uids that have EVER logged the same
- * `machine_id` are indistinguishable here — two Macs on Apple's default
- * hostname, or a rename that hands a name from one host to another. Both
- * alias sets would contain the shared name and both pins would return the
- * union, under a chip naming one of them. Disjoint on any fleet where
- * machine names are distinct (verified on the operator's: `{MacBook-Pro,
- * MacBook-Pro.local}` vs `{m1-max-32gb-studio}`). The real fix is a
- * `machine_uid` on `Run`, an #1810 sibling — this is the first surface that
- * claims per-machine scoping over name-keyed data, so the collision is
- * named here rather than discovered later.
+ * machine" would be the worse lie.
  */
-export function runsForMachine(runs: Run[], names: Set<string>): Run[] {
-  if (names.size === 0) return [];
-  return runs.filter((r) => r.machine != null && names.has(r.machine));
+export function runsForMachine(runs: Run[], machine: MachineMatch): Run[] {
+  return runs.filter((r) => matchesMachine(runMachineRef(r), machine));
 }
 
 /**

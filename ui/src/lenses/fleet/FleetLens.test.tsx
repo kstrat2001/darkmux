@@ -21,6 +21,7 @@ import type { FleetMachine } from "../../types/generated/FleetMachine";
 import type { FleetView } from "../../types/generated/FleetView";
 import type { MachineSpecsResponse } from "../../types/generated/MachineSpecsResponse";
 import { norm, normAll, type RawRecord } from "../../testing/records";
+import { FLEET_UID, lower } from "../../testing/machineFleet";
 
 /** The TokenScope props a probe serialized, as far as these tests read them. */
 type ScopeProbe = Record<string, unknown> & { clock: { kind: string; tMs: number }; restEndMs: number; centerUnit?: string };
@@ -3296,5 +3297,52 @@ describe("FleetLens — card order is stable", () => {
     await waitFor(() => expect(cardNames()).toHaveLength(3));
     expect([...document.querySelectorAll(".mach")].every((c) => c.hasAttribute("data-flip-key"))).toBe(true);
     expect(document.querySelectorAll(".lane[data-flip-key]").length).toBeGreaterThan(0);
+  });
+});
+
+// A machine is identified by its uid, compared case-normalized. Flow records
+// carry the uid UPPERCASE while the roster and the fleet view may spell it
+// differently; a name is only what a card is titled with.
+describe("FleetLens: cards belong to machines by uid", () => {
+  const today = () => todayUTC();
+  const flowRec = (uid: string, name: string, session: string) => ({
+    ts: `${today()}T10:00:00.000Z`,
+    machine_uid: uid,
+    machine_id: name,
+    session_id: session,
+    action: "dispatch.start",
+    handle: "coder",
+  });
+  const cards = () => [...document.querySelectorAll(".mach")];
+
+  it("a view row that spells the uid in lower case is the same card as its flow machine, not a second one", async () => {
+    mockFleetFetch({
+      flowToday: [flowRec(FLEET_UID.mbp, "MacBook-Pro", "s-mbp"), flowRec(FLEET_UID.darkbook, "darkbook", "s-db")],
+      view: [unreachableRow("darkbook", "listener_off", { machine_uid: lower(FLEET_UID.darkbook) })],
+      runs: [],
+    });
+    renderFleetLens();
+    await waitFor(() => expect(cards().length).toBeGreaterThan(0));
+    await waitFor(() => expect(cards().map((c) => c.querySelector(".mach-name")?.textContent).sort()).toEqual(["MacBook-Pro", "darkbook"]));
+  });
+
+  it("a lab run goes to the card of its uid; a second machine with the same display name does not claim it", async () => {
+    mockFleetFetch({
+      flowToday: [flowRec(FLEET_UID.macA, "Mac", "s-a"), flowRec(FLEET_UID.macB, "Mac", "s-b")].map((r) => ({ ...r, action: "dispatch.complete" })),
+      runs: [{ id: "lab-a", kind: "lab", status: "running", tracked: true, machine: "Mac", machine_uid: FLEET_UID.macA }],
+    });
+    renderFleetLens();
+    await waitFor(() => expect(cards()).toHaveLength(2));
+    await waitFor(() => expect(cards().filter((c) => c.textContent?.includes("1 running"))).toHaveLength(1));
+  });
+
+  it("a roster-only peer's card shows its running lab run", async () => {
+    mockFleetFetch({
+      view: [unreachableRow("darkbook", "listener_off", { machine_uid: lower(FLEET_UID.darkbook) })],
+      runs: [{ id: "lab-d", kind: "lab", status: "running", tracked: true, machine: "Darkbook", machine_uid: FLEET_UID.darkbook }],
+    });
+    renderFleetLens();
+    await waitFor(() => expect(cards()).toHaveLength(1));
+    await waitFor(() => expect(cards()[0].textContent).toContain("1 running"));
   });
 });
