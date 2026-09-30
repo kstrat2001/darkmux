@@ -793,6 +793,7 @@ pub(crate) fn fleet_submission_doctor_checks() -> Vec<crate::doctor::Check> {
         retired_streams: retired.0,
         queue_consumers: retired.1,
         daemon_token_set: daemon_token_set(),
+        daemon_hub_link: daemon_hub_link(),
         daemon_listener_state: if listener_enabled && listener_bound != Some(true) {
             daemon_listener_state()
         } else {
@@ -822,6 +823,12 @@ fn daemon_listener_state() -> Option<String> {
 /// (`/health`'s `fleet_token_set`), when it answers within 500 ms.
 fn daemon_token_set() -> Option<bool> {
     daemon_health()?.get("fleet_token_set")?.as_bool()
+}
+
+/// The local daemon's link to the fleet hub (`/health`'s `hub_link`), when it
+/// answers within 500 ms and a hub is configured.
+fn daemon_hub_link() -> Option<darkmux_flow::HubLink> {
+    serde_json::from_value(daemon_health()?.get("hub_link")?.clone()).ok()
 }
 
 /// The local daemon's `/health`, when it answers within 500 ms.
