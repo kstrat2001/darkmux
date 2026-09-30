@@ -351,8 +351,10 @@ pub struct HostWindow {
 /// A role execution ended: the payload of `dispatch.complete` and `dispatch.error`. One type for
 /// every producer of the two: the container path (full run accounting), the hosted and local
 /// single-shot paths, a step kind's per-call bookend, and the guard that writes an error when a
-/// dispatch ends before completing. A field a producer has no reading for is absent.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+/// dispatch ends before completing. A field a producer has no reading for is absent, except the
+/// turn count: every producer states it (`new` takes it, and there is deliberately no `Default`),
+/// so no path leaves a run's turns for a reader to guess at.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct DispatchEndPayload {
@@ -399,6 +401,11 @@ pub struct DispatchEndPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub error: Option<String>,
+    /// The model turns the execution took: a direct single-shot call or a map item is 1, a
+    /// container loop its fold's count, an execution that ended before any call 0. Every
+    /// producer states it: `new` takes it and there is no `Default`, so a struct built without
+    /// it must spell out every field. `Option` only so an archived terminal written before that
+    /// reads back as absent, not as a fabricated 0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(type = "number", optional))]
     pub total_turns: Option<u64>,
@@ -1095,6 +1102,44 @@ impl BriefRefKind {
 }
 
 impl DispatchEndPayload {
+    /// A terminal that states its turn count and nothing else: the one constructor, so a
+    /// producer cannot leave `total_turns` out. Fill the rest with struct update.
+    pub fn new(total_turns: u64) -> Self {
+        Self {
+            wall_ms: None,
+            rest_ms: None,
+            rests: None,
+            paced_rest_ms: None,
+            turn_delay_effective_ms: None,
+            stdout_chars: None,
+            stderr_chars: None,
+            stderr_excerpt: None,
+            exit_code: None,
+            result_class: None,
+            error: None,
+            total_turns: Some(total_turns),
+            total_tools: None,
+            tool_calls_failed: None,
+            tool_calls_invalid_name: None,
+            tool_calls_ungranted: None,
+            total_compactions: None,
+            live: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            total_tokens: None,
+            reasoning_tokens: None,
+            cached_tokens: None,
+            endpoint: None,
+            host_window: None,
+            resumed_from: None,
+            kind: None,
+            item_index: None,
+            remote_tokens: None,
+            step_id: None,
+            context: None,
+        }
+    }
+
     /// The terminal a bookend guard writes when a dispatch ends before it
     /// completed (an early return or a panic), so its `dispatch.start` is never
     /// left orphaned.
@@ -1103,7 +1148,7 @@ impl DispatchEndPayload {
             result_class: Some(ResultClass::Error),
             error: Some("dispatch terminated before completion (early return or panic)".to_string()),
             endpoint,
-            ..Self::default()
+            ..Self::new(0)
         }
     }
 }
