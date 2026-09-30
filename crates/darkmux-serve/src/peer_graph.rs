@@ -472,15 +472,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         listener.set_nonblocking(true).unwrap();
         // A non-loopback address of this machine (its outbound one).
-        let Some(ip) = std::net::UdpSocket::bind("0.0.0.0:0")
-            .and_then(|s| s.connect("192.0.2.1:9").map(|_| s))
-            .and_then(|s| s.local_addr())
-            .ok()
-            .map(|a| a.ip())
-            .filter(|ip| !ip.to_canonical().is_loopback() && !ip.is_unspecified())
-        else {
-            return;
-        };
+        let ip = require_outbound_ip();
         let roster = roster_with("studio", &format!("{ip}:{port}"));
         assert_eq!(try_peer_graph_with("m", "studio", None, &roster, &live(&["studio"]), &no_provider()), None);
         std::thread::sleep(Duration::from_millis(100));
@@ -495,6 +487,19 @@ mod tests {
             .ok()
             .map(|a| a.ip())
             .filter(|ip| !ip.to_canonical().is_loopback() && !ip.is_unspecified())
+    }
+
+    /// This machine's non-loopback address, which these tests need (a loopback
+    /// peer is exempt from verification, so it cannot exercise the pin). A
+    /// machine without one FAILS the test with the reason: a green run that
+    /// asserted nothing would be worse than a red one.
+    fn require_outbound_ip() -> std::net::IpAddr {
+        outbound_ip().unwrap_or_else(|| {
+            panic!(
+                "this test needs a non-loopback local address and this machine has none; a loopback peer is \
+                 exempt from verification, so it cannot exercise the pin. Run it on a machine with a network interface."
+            )
+        })
     }
 
     /// A provider naming `studio` as the node at `ip`.
@@ -560,7 +565,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn a_first_contact_peer_is_pinned_and_then_sent_the_token() {
-        let Some(ip) = outbound_ip() else { return };
+        let ip = require_outbound_ip();
         let (port, auth, hit) = auth_recording_graph_server();
         let roster = roster_with("studio", &format!("{ip}:{port}"));
         let dir = tempfile::tempdir().unwrap();
@@ -589,7 +594,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn an_unwritable_roster_means_the_peer_is_not_sent_the_token() {
-        let Some(ip) = outbound_ip() else { return };
+        let ip = require_outbound_ip();
         let (port, auth, hit) = auth_recording_graph_server();
         let roster = roster_with("studio", &format!("{ip}:{port}"));
         let dir = tempfile::tempdir().unwrap();
