@@ -23,7 +23,7 @@ const STATES = [
 ];
 
 for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
-  test(`machine lens battery meter: glyph and row height hold in every charge state (${vpName})`, async ({ browser }) => {
+  test(`machine lens battery meter: glyph is scaled to its container and holds one size in every charge state (${vpName})`, async ({ browser }) => {
     const rows = [];
     for (const state of STATES) {
       const ctx = await browser.newContext({ deviceScaleFactor: process.env.DARKMUX_BATTERY_SHOTS ? 4 : 1, viewport, timezoneId: "UTC", locale: "en-US" });
@@ -39,7 +39,12 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
       await expect(page.locator(".battery-bar-hold"), state.id).toHaveCount(state.held ? 1 : 0);
       await page.waitForTimeout(1600); // the count-up and the fill's ease finish
       const m = await measure(page, SIZED);
-      rows.push({ state: state.id, glyph: m.glyph[0], rowH: m.row[0].h, rowW: m.row[0].w });
+      if (state.id === "held" && vpName === "phone" && process.env.DARKMUX_BATTERY_SHOTS) {
+        fs.mkdirSync(process.env.DARKMUX_BATTERY_SHOTS, { recursive: true });
+        await page.screenshot({ path: path.join(process.env.DARKMUX_BATTERY_SHOTS, "machine-phone-full.png"), fullPage: true });
+      }
+      const blockW = (await measure(page, { b: ".battery-block" })).b[0].w;
+      rows.push({ state: state.id, blockW, glyph: m.glyph[0], rowH: m.row[0].h, rowW: m.row[0].w });
       if (process.env.DARKMUX_BATTERY_SHOTS) {
         fs.mkdirSync(process.env.DARKMUX_BATTERY_SHOTS, { recursive: true });
         await page.locator(".battery-block").screenshot({ path: path.join(process.env.DARKMUX_BATTERY_SHOTS, `${state.id}-${vpName}.png`) });
@@ -71,6 +76,17 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
       await ctx.close();
     }
     console.log(`${vpName}: ${JSON.stringify(rows)}`);
+    // The graphic scales with the block's width (`--bat-w` in styles.css): 44% of it on a phone,
+    // 15% beside the info rows on a desktop, clamped to 84-180px and 84-140px. Pinned here, with
+    // the old 84px width as the floor the operator asked to beat.
+    const share = vpName === "phone" ? 0.44 : 0.15;
+    const cap = vpName === "phone" ? 180 : 140;
+    for (const r of rows) {
+      const w = Math.min(cap, Math.max(84, r.blockW * share));
+      expect(r.glyph.w, `glyph width (${vpName}, ${r.state})`).toBeCloseTo(w, 0);
+      expect(r.glyph.h, `glyph keeps its 64:28 shape (${vpName}, ${r.state})`).toBeCloseTo((w * 28) / 64, 0);
+      expect(r.glyph.w, `bigger than the old 84px (${vpName})`).toBeGreaterThan(84 * 1.4);
+    }
     expect(new Set(rows.map((r) => JSON.stringify(r.glyph))).size, `the glyph changed size (${vpName}): ${JSON.stringify(rows)}`).toBe(1);
     expect(new Set(rows.map((r) => r.rowH)).size, `the row changed height (${vpName}): ${JSON.stringify(rows)}`).toBe(1);
   });
