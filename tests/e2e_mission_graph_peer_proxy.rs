@@ -93,7 +93,7 @@ fn attribute_mission_locally(reader: &FleetNode, mission_id: &str, owner_machine
 }
 
 /// Register `peer` in `reader`'s roster via the real `machine add` CLI —
-/// same helper shape as `e2e_fleet_status_deep.rs::populate_roster_via_cli`.
+/// same helper shape as `e2e_machine_list.rs::populate_roster_via_cli`.
 fn register_peer(reader: &FleetNode, peer: &FleetNode) {
     let out = reader
         .cmd()

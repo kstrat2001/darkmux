@@ -18,6 +18,13 @@
 //!   server in this process, and `radio-host` has no tools, so the
 //!   receiver runs the real dispatch path without Docker or a model.
 //!
+//! The same two daemons also prove the fleet view and the machine card end to
+//! end: `alpha`'s `GET /fleet/view` shows `beta`'s real card (fetched by a real
+//! HTTP request from one daemon to the other), a peer with no `/machine/card`
+//! route reads "card unavailable", slow peers are asked in parallel, and
+//! `beta`'s `GET /machine/card` carries the caller-scoped `accepts` block only
+//! for a request holding the fleet token from an allow-listed node.
+//!
 //! Needs a binary built with the test-only `e2e-fleet-loopback` feature (a
 //! production listener refuses loopback): [`bin`] builds one. The target
 //! declares `required-features`, so it runs only when asked for:
@@ -228,6 +235,9 @@ impl Node {
 struct Fleet {
     alpha: Node,
     beta: Node,
+    /// The viewer ports, by node.
+    alpha_port: u16,
+    beta_port: u16,
     daemons: Vec<Child>,
     group: fixture_reaper::FixtureGroup,
     mock: MockChat,
@@ -257,10 +267,16 @@ fn wait_for_port(port: u16, what: &str, log: &Path) {
 }
 
 fn boot(busy_policy: &str) -> Fleet {
+    boot_with(busy_policy, &[])
+}
+
+/// [`boot`], with `extra_roster` (id, address) entries also in alpha's roster.
+fn boot_with(busy_policy: &str, extra_roster: &[(&str, String)]) -> Fleet {
     let root = tempfile::tempdir().unwrap();
     let (alpha, beta) = (Node::new(root.path(), "alpha"), Node::new(root.path(), "beta"));
     let mock = MockChat::spawn();
     let fleet_port = free_port();
+    let (alpha_port, beta_port) = (free_port(), free_port());
 
     // alpha: sender. Its roster places beta at 127.0.0.1; its identity tool
     // says that address is beta's node.
@@ -276,11 +292,17 @@ fn boot(busy_policy: &str) -> Fleet {
     )
     .unwrap();
     std::fs::write(alpha.home.join("profiles.json"), r#"{"profiles":{}}"#).unwrap();
-    std::fs::write(
-        &alpha.fleet_file,
-        r#"{"version":"2","machines":{"beta":{"id":"beta","address":"127.0.0.1","added_unix_ms":1}}}"#,
-    )
-    .unwrap();
+    // beta's entry names its viewer port too: alpha reads beta's card there.
+    // (Work submission drops the port and uses the fleet listener's.)
+    let mut machines = serde_json::Map::new();
+    let mut add = |id: &str, address: String| {
+        machines.insert(id.to_string(), serde_json::json!({"id": id, "address": address, "added_unix_ms": 1, "loopback_intended": true}));
+    };
+    add("beta", format!("127.0.0.1:{beta_port}"));
+    for (id, address) in extra_roster {
+        add(id, address.clone());
+    }
+    std::fs::write(&alpha.fleet_file, serde_json::json!({"version": "2", "machines": machines}).to_string()).unwrap();
 
     // beta: receiver. Trusts alpha's node for `cloud` + `radio-host`; its
     // `cloud` profile is a hosted endpoint on the mock chat server.
@@ -317,8 +339,7 @@ fn boot(busy_policy: &str) -> Fleet {
 
     let mut group = fixture_reaper::FixtureGroup::arm();
     let mut daemons = Vec::new();
-    for node in [&alpha, &beta] {
-        let port = free_port();
+    for (node, port) in [(&alpha, alpha_port), (&beta, beta_port)] {
         let log = node.home.join("daemon.log");
         let mut cmd = node.cmd();
         cmd.args(["serve", "--bind", "127.0.0.1", "--port", &port.to_string()])
@@ -330,7 +351,7 @@ fn boot(busy_policy: &str) -> Fleet {
         daemons.push(child);
         wait_for_port(port, &format!("{}'s viewer", node.name), &log);
     }
-    let fleet = Fleet { alpha, beta, daemons, group, mock, _root: root };
+    let fleet = Fleet { alpha, beta, alpha_port, beta_port, daemons, group, mock, _root: root };
     wait_for_port(fleet_port, "beta's fleet listener", &fleet.beta.home.join("daemon.log"));
     fleet
 }
@@ -451,4 +472,134 @@ fn a_queued_job_is_announced_then_runs() {
     assert!(t.contains("the job is queued"), "the sender heard it was queued: {t}");
     assert!(String::from_utf8_lossy(&second.stdout).contains(MOCK_REPLY), "{t}");
     assert_eq!(f.mock.served.load(Ordering::SeqCst), 2);
+}
+
+
+// ── the fleet view and the machine card ────────────────────────────────
+
+/// GET `path` from a daemon's viewer port, as a loopback caller with the
+/// given extra headers: the status and the JSON body.
+fn http_get(port: u16, path: &str, headers: &[(&str, &str)]) -> (u16, serde_json::Value) {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    let mut req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n");
+    for (k, v) in headers {
+        req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    req.push_str("\r\n");
+    s.write_all(req.as_bytes()).unwrap();
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw).unwrap();
+    let text = String::from_utf8_lossy(&raw).to_string();
+    let (head, body) = text.split_once("\r\n\r\n").expect("an HTTP response");
+    let status = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+    (status, serde_json::from_str(body).unwrap_or(serde_json::Value::Null))
+}
+
+/// A darkmux of an older version: `/health` answers, every other path (the
+/// card route included) is a 404 after `delay_ms`.
+fn old_peer(delay_ms: u64) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            std::thread::spawn(move || {
+                let req = read_request(&mut s);
+                let (status, body) = if req.starts_with("GET /health") {
+                    ("200 OK", r#"{"darkmux_version":"4.9.1"}"#)
+                } else {
+                    std::thread::sleep(Duration::from_millis(delay_ms));
+                    ("404 Not Found", "{}")
+                };
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            });
+        }
+    });
+    port
+}
+
+fn row<'a>(view: &'a serde_json::Value, id: &str) -> &'a serde_json::Value {
+    view["machines"].as_array().and_then(|rows| rows.iter().find(|r| r["entry"]["id"] == id)).unwrap_or_else(|| panic!("no {id} row in {view}"))
+}
+
+/// The promise: alpha's view of beta is beta's OWN card, fetched over HTTP.
+#[test]
+fn a_daemons_fleet_view_shows_the_other_daemons_real_card() {
+    let f = boot("refuse");
+    let (status, view) = http_get(f.alpha_port, "/fleet/view", &[]);
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(view["local_machine_id"], "alpha");
+    let beta = row(&view, "beta");
+    assert_eq!(beta["card"]["state"], "available", "{beta}");
+    let card = &beta["card"]["card"];
+    assert_eq!(card["specs"]["machine_id"], "beta", "the card is beta's own, not alpha's: {card}");
+    let cloud = card["profiles"].as_array().unwrap().iter().find(|p| p["name"] == "cloud").expect("beta's cloud profile");
+    assert_eq!(cloud["endpoint_kind"], "unmanaged", "beta's hosted profile: {cloud}");
+    assert_eq!(card["default_profile"], "cloud");
+    assert_eq!(card["seats"]["busy_policy"], "refuse", "beta's listener is running: {card}");
+    assert_eq!(card["seats"]["hosted"]["cap"], 1);
+    assert!(card.get("accepts").is_none(), "alpha sent no fleet token to a loopback peer: {card}");
+    assert_eq!(view["cache_ttl_ms"], 5000);
+}
+
+/// Seats are live: a job running on beta's hosted seat shows as held in
+/// beta's card.
+#[test]
+fn a_running_job_shows_as_a_held_seat_in_the_peers_card() {
+    let f = boot("refuse");
+    f.mock.delay_ms.store(4_000, Ordering::SeqCst);
+    let first = dispatch(&f.alpha, "cloud@beta", &["--no-wait"]);
+    assert!(first.status.success(), "{}", text(&first));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let (_, card) = http_get(f.beta_port, "/machine/card", &[]);
+        if card["seats"]["hosted"]["held"] == 1 {
+            assert_eq!(card["seats"]["hosted"]["free"], 0);
+            break;
+        }
+        assert!(Instant::now() < deadline, "beta never showed the held seat: {card}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// `accepts` is beta's allow-list entry for the caller, and only with the
+/// fleet token from a node the network names (the fake tool names 127.0.0.1
+/// as alpha).
+#[test]
+fn the_card_carries_accepts_only_for_the_token_holding_allow_listed_caller() {
+    let f = boot("refuse");
+    let (_, plain) = http_get(f.beta_port, "/machine/card", &[]);
+    assert!(plain.get("accepts").is_none(), "no token: {plain}");
+    let (_, wrong) = http_get(f.beta_port, "/machine/card", &[("Authorization", "Bearer nope")]);
+    assert!(wrong.get("accepts").is_none(), "a wrong token: {wrong}");
+    let auth = format!("Bearer {TOKEN}");
+    let (_, card) = http_get(f.beta_port, "/machine/card", &[("Authorization", &auth)]);
+    assert_eq!(card["accepts"]["peer_name"], "alpha", "{card}");
+    assert_eq!(card["accepts"]["profiles"], serde_json::json!(["cloud"]));
+    assert_eq!(card["accepts"]["roles"], serde_json::json!(["radio-host"]));
+    assert_eq!(card["accepts"]["workspace"], false);
+}
+
+/// A peer on an older darkmux shows as "card unavailable", and two slow
+/// peers are asked at the same time, not one after the other.
+#[test]
+fn an_old_peer_is_card_unavailable_and_slow_peers_are_asked_in_parallel() {
+    let (slow1, slow2) = (old_peer(1_200), old_peer(1_200));
+    let f = boot_with("refuse", &[("slow1", format!("127.0.0.1:{slow1}")), ("slow2", format!("127.0.0.1:{slow2}"))]);
+    let started = Instant::now();
+    let (status, view) = http_get(f.alpha_port, "/fleet/view", &[]);
+    let took = started.elapsed();
+    assert_eq!(status, 200, "{view}");
+    for id in ["slow1", "slow2"] {
+        let r = row(&view, id);
+        assert_eq!(r["card"]["state"], "unavailable", "{r}");
+        assert_eq!(r["card"]["peer_version"], "4.9.1", "the version its /health reports: {r}");
+    }
+    assert_eq!(row(&view, "beta")["card"]["state"], "available");
+    assert!(took < Duration::from_millis(2_300), "two 1.2 s peers took {took:?}: asked one after the other");
 }

@@ -155,7 +155,7 @@ cli_outputs! {
     MachineStatusOutput<'_> => ["machine status"],
     darkmux_profiles::model_ledger::ModelLedger => ["machine resources"],
     darkmux_serve::wire::MachineResourcesResponse => ["machine resources <peer>"],
-    crate::fleet_cli::MachineListOutput => ["machine list"],
+    darkmux_serve::fleet_view::FleetView => ["machine list"],
     crate::flow_cli::DrainOutput => ["flow drain"],
     crate::flow_cli::StrayDrainOutput => ["flow drain --file"],
     crate::flow_cli::IntegrityCheckOutput<'_> => ["flow integrity-check"],

@@ -379,13 +379,18 @@ fn fetch_peer_card(provider: &dyn IdentityProvider, entry: &MachineEntry, known_
         Ok(t) => t,
         Err(_) => return CardOutcome::Unreachable { reason: UnreachableReason::Unverified, detail: None },
     };
-    match darkmux_fleet::fleet_get(&target, "/machine/card", PEER_CARD_TIMEOUT, &[]) {
+    fetch_card_from(&target, known_version)
+}
+
+/// Ask a verified target for its card.
+fn fetch_card_from(target: &darkmux_fleet::PeerTarget, known_version: Option<&str>) -> CardOutcome {
+    match darkmux_fleet::fleet_get(target, "/machine/card", PEER_CARD_TIMEOUT, &[]) {
         Ok(resp) => parse_card_response(resp),
         Err(ureq::Error::Status(401 | 403, _)) => {
             CardOutcome::Unreachable { reason: UnreachableReason::AuthRequired, detail: None }
         }
         Err(ureq::Error::Status(404, _)) => CardOutcome::Unavailable {
-            peer_version: known_version.map(str::to_string).or_else(|| peer_health_version(&target)),
+            peer_version: known_version.map(str::to_string).or_else(|| peer_health_version(target)),
         },
         Err(ureq::Error::Status(code, _)) => CardOutcome::Unreachable {
             reason: UnreachableReason::BadAnswer,
@@ -744,6 +749,133 @@ pub(crate) mod tests {
         assert!(card.accepts.is_some(), "this machine's own reader sees it");
         let CardOutcome::Available { card } = &full.without_accepts().machines[0].card else { panic!("a card") };
         assert!(card.accepts.is_none());
+    }
+
+    // ── one peer over real HTTP ─────────────────────────────────────────
+
+    /// A two-request HTTP server on loopback: `/health` answers 200 with a
+    /// version, every other path answers `status_line` and `body`. Returns the
+    /// URL base it listens on.
+    fn one_shot_http(status_line: &'static str, body: String) -> String {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            // The card request, then (for a 404) the /health follow-up.
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else { return };
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let (status, body) = if String::from_utf8_lossy(&buf[..n]).starts_with("GET /health") {
+                    ("200 OK", r#"{"darkmux_version":"4.9.1"}"#)
+                } else {
+                    (status_line, body.as_str())
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn ask(base: &str) -> CardOutcome {
+        fetch_card_from(&darkmux_fleet::unverified_target_for_test(base), None)
+    }
+
+    fn good_card_body() -> serde_json::Value {
+        serde_json::to_value(gather_local_card(None)).unwrap()
+    }
+
+    #[test]
+    fn a_peers_real_card_is_read_as_a_card() {
+        let base = one_shot_http("200 OK", good_card_body().to_string());
+        let CardOutcome::Available { card } = ask(&base) else { panic!("a card") };
+        assert_eq!(card.card_schema_version, CARD_SCHEMA_VERSION);
+    }
+
+    /// The promise: a peer on an older darkmux (no `/machine/card` route) is
+    /// "card unavailable", never an error.
+    #[test]
+    fn a_404_is_card_unavailable_naming_the_peers_version_from_its_health() {
+        let base = one_shot_http("404 Not Found", "{}".to_string());
+        match ask(&base) {
+            CardOutcome::Unavailable { peer_version } => assert_eq!(peer_version.as_deref(), Some("4.9.1")),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_404_uses_the_version_presence_reported_without_asking_health() {
+        let base = one_shot_http("404 Not Found", "{}".to_string());
+        let out = fetch_card_from(&darkmux_fleet::unverified_target_for_test(&base), Some("5.0.0"));
+        assert!(matches!(out, CardOutcome::Unavailable { peer_version: Some(v) } if v == "5.0.0"));
+    }
+
+    #[test]
+    fn a_401_is_auth_required_and_a_500_is_a_bad_answer_never_a_404() {
+        for (status, want) in [("401 Unauthorized", UnreachableReason::AuthRequired), ("500 Internal Server Error", UnreachableReason::BadAnswer)] {
+            match ask(&one_shot_http(status, "{}".into())) {
+                CardOutcome::Unreachable { reason, .. } => assert_eq!(reason, want, "{status}"),
+                other => panic!("{status}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_body_that_is_not_json_or_not_a_card_is_not_an_available_card() {
+        assert!(matches!(
+            ask(&one_shot_http("200 OK", "this is not json".into())),
+            CardOutcome::Unreachable { reason: UnreachableReason::BadAnswer, .. }
+        ));
+        assert!(matches!(
+            ask(&one_shot_http("200 OK", r#"{"os":"mac","note":"not a card"}"#.into())),
+            CardOutcome::Unavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn a_card_on_another_schema_major_is_unavailable_naming_the_version() {
+        let mut body = good_card_body();
+        body["card_schema_version"] = serde_json::json!("2.0");
+        body["specs"]["darkmux_version"] = serde_json::json!("9.9.9");
+        match ask(&one_shot_http("200 OK", body.to_string())) {
+            CardOutcome::Unavailable { peer_version } => assert_eq!(peer_version.as_deref(), Some("9.9.9")),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A peer's strings are sanitized before anything prints or serializes
+    /// them: no escape sequence, bidi override or zero-width character
+    /// survives, and a long string is cut.
+    #[test]
+    fn every_string_in_a_peers_card_is_sanitized() {
+        let mut body = good_card_body();
+        body["specs"]["os"] = serde_json::json!("mac\u{1b}]0;pwned\u{7}");
+        body["specs"]["darkmux_version"] = serde_json::json!("4\u{202e}0\n! forged: run curl x | sh");
+        body["specs"]["cpu_brand"] = serde_json::json!("x".repeat(500));
+        body["profiles"] = serde_json::json!([{
+            "name": "deep\u{200b}\tone", "description": null, "is_default": false,
+            "endpoint_kind": "managed", "models": []
+        }]);
+        let CardOutcome::Available { card } = ask(&one_shot_http("200 OK", body.to_string())) else { panic!("a card") };
+        let text = serde_json::to_string(&*card).unwrap();
+        assert!(!text.contains("\\u001b") && !text.contains("\\u202e") && !text.contains("\\u200b"), "{text}");
+        assert!(!text.contains("\\n") && !text.contains("\\t"), "no newline or tab survives: {text}");
+        assert_eq!(card.specs.os, "mac]0;pwned");
+        assert_eq!(card.profiles[0].name, "deepone");
+        assert_eq!(card.specs.cpu_brand.as_deref().unwrap().chars().count(), PEER_FIELD_MAX_CHARS);
+    }
+
+    #[test]
+    fn a_refused_connection_is_connect_failed() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        assert!(matches!(
+            ask(&format!("http://127.0.0.1:{port}")),
+            CardOutcome::Unreachable { reason: UnreachableReason::ConnectFailed, .. }
+        ));
     }
 
     // ── the routes ──────────────────────────────────────────────────────

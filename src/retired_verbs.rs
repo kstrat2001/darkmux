@@ -168,6 +168,12 @@ const RETIRED: &[RetiredVerb] = &[
                  use `darkmux lab tune <workload> --repeat N` (`-n N` still works).",
     },
     RetiredVerb {
+        words: &["machine", "list"],
+        flag: Some("--deep"),
+        remedy: "`darkmux machine list` prints each machine's card by default (hardware, loaded \
+                 models, profiles, seats, thermal state), so there is nothing to ask for: drop the flag.",
+    },
+    RetiredVerb {
         words: &["mission", "status"],
         flag: Some("--missions"),
         remedy: "The flag hides machine-minted runs and shows the missions you named: use \
@@ -267,7 +273,8 @@ mod tests {
         (&["lab", "eval", "--dialectic"], "darkmux lab eval --dialectic", "--mode dialectic"),  // drift-guard:allow retired flag: asserts the refusal names it
         (&["lab", "run", "quick-q", "--runs", "3"], "darkmux lab run --runs", "--repeat"),  // drift-guard:allow retired flag: asserts the refusal names it
         (&["lab", "tune", "quick-q", "--runs=3"], "darkmux lab tune --runs", "--repeat"),  // drift-guard:allow retired flag: asserts the refusal names it
-        (&["mission", "status", "--missions"], "darkmux mission status --missions", "--named"),  // drift-guard:allow retired flag: asserts the refusal names it
+        (&["mission", "status", "--missions"], "darkmux mission status --missions", "--named"),
+        (&["machine", "list", "--deep"], "darkmux machine list --deep", "by default"),  // drift-guard:allow retired flag: asserts the refusal names it  // drift-guard:allow retired flag: asserts the refusal names it
     ];
 
     #[test]

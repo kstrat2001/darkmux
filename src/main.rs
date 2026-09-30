@@ -45,6 +45,7 @@ mod finding_cli;
 mod mod_cli;
 // `darkmux machine` roster-facing handlers — split out of main.rs alongside cli/lab_cli.
 mod fleet_cli;
+mod machine_list;
 // #463 workspace split — flow extracted to the darkmux-flow crate. The
 // re-export keeps all existing `crate::flow::*` paths resolving unchanged.
 pub use darkmux_flow as flow;
@@ -1281,7 +1282,7 @@ fn cmd_machine(sub: Option<MachineCmd>) -> Result<i32> {
         }) => cmd_machine_status(id.as_deref(), profiles.as_deref(), json),
         Some(MachineCmd::Resources { id, json }) => cmd_machine_resources(id.as_deref(), json),
         Some(MachineCmd::Eject { dry_run }) => cmd_model_eject(dry_run),
-        Some(MachineCmd::List { json, deep }) => fleet_cli::cmd_machine_list(json, deep),
+        Some(MachineCmd::List { json }) => fleet_cli::cmd_machine_list(json),
         Some(MachineCmd::Add {
             id,
             address,

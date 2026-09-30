@@ -3355,7 +3355,7 @@ mod tests {
         let bundle =
             assemble_grounding("how do I see what is loaded?", &[], &shelf, Path::new("/tmp"), GroundingScope::Full, RadioSurface::Panel);
         assert!(bundle.contains("darkmux machine status"), "{bundle}");
-        assert!(bundle.contains("darkmux machine list [") && bundle.contains("--deep"), "{bundle}");
+        assert!(bundle.contains("darkmux machine list [") && bundle.contains("--json"), "{bundle}");
         assert!(bundle.contains("darkmux mission launch"), "{bundle}");
         assert!(!bundle.contains("Top-level darkmux --help"), "the old block is gone: {bundle}");
     }

@@ -1994,16 +1994,15 @@ fn machine_add_refuses_a_loopback_address_unless_allowed() {
     assert!(roster.contains("127.0.0.1:8765"), "{roster}");
 }
 
-/// (#2924 MF-3) `machine list` probes this machine's own entry at the local
-/// daemon, not at its roster address. The roster address is the peer-facing
-/// DNS name, which in the hub guide's default topology (daemon on loopback
-/// behind `tailscale serve --https=443`) answers nothing at :8765, so the
-/// hub's own row used to read unreachable. Runs the real verb: the probe
-/// target here is an unresolvable name, and only the local listener answers.
+/// (#2924 MF-3) `machine list` builds this machine's own row from a local
+/// card, never by dialing its roster address. The roster address is the
+/// peer-facing DNS name, which in the hub guide's default topology (daemon on
+/// loopback behind `tailscale serve --https=443`) answers nothing at :8765,
+/// so the hub's own row used to read unreachable. Runs the real verb: the
+/// roster address here is an unresolvable name, and the row still carries a
+/// card.
 #[test]
-fn machine_list_probes_this_machines_entry_at_the_local_daemon() {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
+fn machine_list_builds_this_machines_row_from_a_local_card_and_never_dials_its_address() {
     let tmp = TempDir::new().unwrap();
     let fleet_file = tmp.path().join("fleet.json");
     std::fs::write(
@@ -2014,19 +2013,30 @@ fn machine_list_probes_this_machines_entry_at_the_local_daemon() {
     let out = darkmux_cmd()
         .env("DARKMUX_FLEET_FILE", &fleet_file)
         .env("DARKMUX_MACHINE_ID", "self-host")
-        .env("DARKMUX_SERVE_BIND", "127.0.0.1")
-        .env("DARKMUX_SERVE_PORT", port.to_string())
+        .env_remove("DARKMUX_REDIS_URL")
+        .env("DARKMUX_LMSTUDIO_URL", "http://127.0.0.1:9")
+        .env("DARKMUX_LMS_BIN", "/nonexistent/lms")
         .args(["machine", "list", "--json"])
         .output()
         .unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let row = &v["machines"][0];
-    assert_eq!(row["address"], "self-host.invalid", "the roster keeps the peer-facing name");
-    assert_eq!(row["dialed_address"], format!("127.0.0.1:{port}"));
+    assert_eq!(row["entry"]["address"], "self-host.invalid", "the roster keeps the peer-facing name");
     assert_eq!(row["is_this_machine"], true);
-    assert_eq!(row["reachable"], true, "{row}");
-    drop(listener);
+    assert_eq!(row["liveness"], "live");
+    assert_eq!(row["card"]["state"], "available", "{row}");
+    assert_eq!(row["card"]["card"]["card_schema_version"], "1.0");
+    assert_eq!(v["cache_ttl_ms"], 0, "the CLI's gather is not cached");
+}
+
+/// `--deep` is retired: the card is the default content.
+#[test]
+fn machine_list_deep_is_refused_naming_the_default() {
+    let out = darkmux_cmd().args(["machine", "list", "--deep"]).output().unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("`darkmux machine list --deep` was removed") && err.contains("by default"), "{err}");
 }
 
 /// (#2924) `darkmux doctor` actually appends the fleet-roster rows. The

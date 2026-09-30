@@ -10,7 +10,7 @@ flow integrity-check  IntegrityCheckOutput
 flow status  FlowStatus
 lab loop  LoopReport
 lab loop --ab  LoopAbReport
-machine list  MachineListOutput
+machine list  FleetView
 machine resources  ModelLedger
 machine resources <peer>  MachineResourcesResponse
 machine status  MachineStatusOutput
@@ -94,7 +94,47 @@ BoundRef
   value: uint64 | null
   source: string | null
 BudgetPolicy = "off" | "warn" | "wait"
+BusyPolicy = "refuse" | "queue"
 CapabilityProfile = { [key: string]: number }
+CardAccepts
+  peer_name: string
+  profiles: string[]
+  roles: string[]
+  images: string[]
+  workspace: boolean
+CardBatteryGate
+  floor_pct: uint8
+  refuse_start_below_min: boolean
+  pause_running_below_min: boolean
+  refusing_start: boolean
+CardEndpointKind = "managed" | "unmanaged" | "mixed" | "unresolved"
+CardGovernor
+  thermal: ThermalNow | null
+  battery: BatteryCharge | null
+  battery_gate: CardBatteryGate
+CardHostedSeats
+  held: uint32
+  cap: uint32 | null
+  free: uint32 | null
+CardLocalSeats
+  held_models: string[]
+  free_models: string[]
+CardModel
+  id: string
+  n_ctx: uint32 | null
+  endpoint_kind: CardEndpointKind
+CardOutcome = { card: MachineCard; state: "available" } | { peer_version: string | null; state: "unavailable" } | { reason: UnreachableReason; detail: string | null; state: "unreachable" }
+CardProfile
+  name: string
+  description: string | null
+  is_default: boolean
+  endpoint_kind: CardEndpointKind
+  models: CardModel[]
+CardSeats
+  busy_policy: BusyPolicy
+  local: CardLocalSeats
+  hosted: CardHostedSeats
+  waiting: uint32
 CheckpointGate
   observations: uint
   degenerate_turns: uint64[]
@@ -296,6 +336,20 @@ FindingRecord
 FindingsSummary
   count: uint
   path: string
+FleetMachine
+  entry: RosterMachineEntry
+  is_this_machine: boolean
+  liveness: Liveness
+  last_beat_ms: uint64 | null
+  card: CardOutcome
+FleetView
+  local_machine_id: string | null
+  presence: SourceState
+  roster_error: string | null
+  fetched_at_ms: uint64
+  cache_ttl_ms: uint64
+  gather_ms: uint64
+  machines: FleetMachine[]
 FlowScan
   files_total: uint
   files_skipped: uint
@@ -452,6 +506,7 @@ LessonsExport
   schema_version: int32
   lessons: Lesson[]
 LimitSource = "budget" | "physical_pool" | "unknown"
+Liveness = "live" | "gone" | "unknown"
 LoadWindow
   samples: uint32
   span_ms: uint64
@@ -488,28 +543,18 @@ LoopReport
   duration_ms: uint128
   loop_config: string[]
   notes: string[]
-MachineListOutput
-  roster_path: string
-  roster_version: string
-  local_machine_id: string | null
-  machines: MachineListRow[]
-MachineListRow
-  id: string
-  address: string
-  dialed_address: string
-  is_this_machine: boolean
-  description: string | null
-  added_unix_ms: uint64
-  machine_uid: string | null
-  reachable: boolean
-  resolved_address: string
-  probe_ms: uint64
-  probe_error: string | null
-  specs: MachineSpecsResponse | null
-  specs_auth_required: boolean
-  specs_route_missing: boolean
-  specs_unverified: boolean
-  specs_unreadable_peer_version: string | null
+MachineCard
+  card_schema_version: string
+  work_job_schema_version: string
+  specs: MachineSpecsResponse
+  profiles: CardProfile[]
+  default_profile: string | null
+  profiles_error: string | null
+  accepts?: CardAccepts | null
+  seats?: CardSeats | null
+  governor: CardGovernor
+  generated_at_ms: uint64
+  gather_ms: uint64
 MachineLoad
   battery_health: BatteryHealthNow | null
   now: HostSampleNow
@@ -798,6 +843,13 @@ RoleShow
   tool_palette: ToolPalette
   escalation: EscalationKind
   escalation_target: string | null
+RosterMachineEntry
+  id: string
+  address: string
+  description?: string | null
+  added_unix_ms: uint64
+  machine_uid?: string | null
+  loopback_intended?: boolean | null
 Run
   id: string
   kind: RunKind
@@ -1056,6 +1108,7 @@ Tier2Config
 ToolPalette
   allow: string[]
   deny: string[]
+UnreachableReason = "presence_gone" | "unverified" | "auth_required" | "connect_failed" | "bad_answer"
 UsageGroup
   endpoint?: string | null
   requested_model?: string | null
