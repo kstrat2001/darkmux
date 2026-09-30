@@ -89,6 +89,10 @@ enum WireSourceState {
     Stale { age_ms: u64, detail: String },
     Unavailable { detail: String },
     Off,
+    /// A state a newer darkmux states. It reads as `unavailable`, the cautious
+    /// reading: never as `ok` or `off`, which would say the response is whole.
+    #[serde(other)]
+    Unrecognized,
 }
 
 impl<'de> serde::Deserialize<'de> for SourceState {
@@ -98,6 +102,7 @@ impl<'de> serde::Deserialize<'de> for SourceState {
             WireSourceState::Stale { age_ms, detail } => SourceState::Stale { age_ms, detail: known_detail(&detail) },
             WireSourceState::Unavailable { detail } => SourceState::Unavailable { detail: known_detail(&detail) },
             WireSourceState::Off => SourceState::Off,
+            WireSourceState::Unrecognized => SourceState::Unavailable { detail: UNRECOGNIZED_DETAIL },
         })
     }
 }
@@ -153,6 +158,15 @@ mod tests {
             read(serde_json::json!({"state": "unavailable", "detail": "\u{1b}[31m free text from a peer"})),
             SourceState::Unavailable { detail: UNRECOGNIZED_DETAIL }
         );
+    }
+
+    /// A state a newer darkmux invented reads as unavailable, never as a state
+    /// that says the response is complete.
+    #[test]
+    fn a_state_from_a_newer_darkmux_reads_as_unavailable_not_as_ok() {
+        let read = serde_json::from_value::<SourceState>(serde_json::json!({"state": "delegated", "to": "a hub"})).unwrap();
+        assert_eq!(read, SourceState::Unavailable { detail: UNRECOGNIZED_DETAIL });
+        assert!(!read.is_complete());
     }
 
     #[test]

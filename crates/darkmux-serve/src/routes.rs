@@ -100,7 +100,6 @@ pub(crate) fn table() -> Vec<Route> {
         json!(MachineStatusResponse, "/machine/status", machine_status_handler),
         json!(MachineSpecsResponse, "/machine/specs", machine_specs_handler),
         json!(MachineResourcesResponse, "/machine/resources", machine_resources_handler),
-        json!(machine_card::MachineCard, "/machine/card", fleet_view::machine_card_handler),
         json!(MissionsResponse, "/missions", missions_handler),
         json!(RunsResponse, "/runs", runs_handler),
         json!(PanelResponse, "/panel/:id", panel::panel_handler),
@@ -147,7 +146,7 @@ pub(crate) fn render_table() -> String {
         darkmux_fleet::SUBMISSION_PATH
     ));
     out.push_str(&format!(
-        "GET {}  json ListenerCard (fleet listener, not the viewer daemon; the caller's own allow-list entry rides with the card)\n",
+        "GET {}  json ListenerCard (fleet listener, not the viewer daemon; the caller's own grant rides with the card)\n",
         darkmux_fleet::CARD_PATH
     ));
     out

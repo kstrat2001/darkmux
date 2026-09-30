@@ -49,7 +49,7 @@ mod fleet_listener;
 /// The fleet view: one row per roster machine, each with its own card.
 pub mod fleet_view;
 mod host_sampler;
-/// The machine card served at `GET /machine/card`.
+/// The machine card, served by the fleet listener at `GET /fleet/card` and read from each machine's own row of `GET /fleet/view`.
 pub mod machine_card;
 mod panel;
 /// (#1466) Best-effort peer-mission-graph fetch — see the module's own doc
@@ -830,32 +830,6 @@ const PRESENCE_READ_FAILED: &str = "could not read presence beats from Redis";
 /// still goes to stderr, where the operator already looks for it.
 const ROSTER_READ_FAILED: &str = "the fleet roster file exists but could not be parsed";
 
-/// GET /fleet/roster (#1855) — the operator's DECLARED fleet topology
-/// (`darkmux machine add`'s `fleet.json`), independent of whether any of it
-/// is beating right now.
-///
-/// This is what closes the "rostered-but-silent machine vanishes entirely"
-/// half of #1855: `/fleet/machines/live` only ever reports a machine that is
-/// currently publishing a presence beat, so a machine the operator
-/// deliberately added and which is down, unreachable, or has simply never
-/// started its daemon produced no card, no offline row, nothing — it read
-/// as though it had never been added. Roster membership is a SEPARATE
-/// question from liveness, and the viewer needs both to tell "not on my
-/// fleet" from "on my fleet, not answering right now".
-///
-/// Deliberately does NOT probe reachability — that is `darkmux machine list
-/// --deep`'s job, run explicitly by the operator against real network
-/// addresses. This route only reads a local JSON file and reports what is
-/// declared in it, per "darkmux describes, never adjudicates": it says what
-/// the operator's roster claims, not what darkmux verified about a peer's
-/// network reachability.
-///
-/// Never 500s. A missing file is an empty roster (`load_roster`'s own
-/// fresh-install contract, not an error); a PRESENT but corrupt file
-/// reports the parse failure in `error` (a fixed literal — see
-/// [`ROSTER_READ_FAILED`]'s own doc on why, not the underlying error text)
-/// rather than silently discarding the roster and answering as if nothing
-/// were ever added.
 /// (#2796) Resolve each roster entry's `machine_uid` from the daemon's OWN
 /// flow history when the entry does not declare one.
 ///
@@ -889,17 +863,21 @@ const ROSTER_READ_FAILED: &str = "the fleet roster file exists but could not be 
 /// DERIVED, NOT PERSISTED: `fleet.json` is operator state and is not rewritten
 /// here. An entry that already declares a uid is left exactly as it is — the
 /// operator's own declaration always wins over anything inferred.
+///
+/// Returns the ids of the entries whose uid this filled in, so a reader can say
+/// where a uid came from.
 fn backfill_roster_machine_uids(
     machines: &mut [darkmux_fleet::MachineEntry],
     flows_dir: &std::path::Path,
-) {
+) -> std::collections::BTreeSet<String> {
     use std::io::BufRead;
+    let mut filled = std::collections::BTreeSet::new();
     if machines.iter().all(|m| m.machine_uid.is_some()) {
-        return;
+        return filled;
     }
     let mut by_id: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let Ok(entries) = std::fs::read_dir(flows_dir) else {
-        return;
+        return filled;
     };
     for entry in entries.flatten() {
         if !entry.file_name().to_string_lossy().ends_with(".jsonl") {
@@ -925,28 +903,69 @@ fn backfill_roster_machine_uids(
         if m.machine_uid.is_none() {
             if let Some(uid) = by_id.get(&m.id) {
                 m.machine_uid = Some(uid.clone());
+                filled.insert(m.id.clone());
             }
         }
     }
+    filled
 }
 
+/// The roster as this machine reads it, for every route and gather that shows
+/// it: the entries in id order with each `machine_uid` the entry does not
+/// declare filled from flow history ([`backfill_roster_machine_uids`]), and
+/// the ids whose uid came from there. `/fleet/roster` and the fleet view read
+/// it through [`resolved_roster`], so one roster entry has one uid on every
+/// surface.
+pub(crate) struct ResolvedRoster {
+    pub machines: Vec<darkmux_fleet::MachineEntry>,
+    /// Ids whose `machine_uid` was derived from flow history, not declared.
+    pub uid_from_history: std::collections::BTreeSet<String>,
+}
+
+/// The roster file, resolved ([`ResolvedRoster`]); the fixed sentence for a
+/// file that exists and does not parse. Blocking (file reads).
+pub(crate) fn resolved_roster(flows_dir: &std::path::Path) -> Result<ResolvedRoster, &'static str> {
+    let roster = darkmux_fleet::load_roster().map_err(|e| {
+        eprintln!("darkmux serve: reading the fleet roster failed ({e:#})");
+        ROSTER_READ_FAILED
+    })?;
+    let mut machines = roster.machines.into_values().collect::<Vec<_>>();
+    // (#2796) Fill in uids the entry itself does not declare, so the viewer's
+    // uid-based consolidation has something to consolidate on.
+    let uid_from_history = backfill_roster_machine_uids(&mut machines, flows_dir);
+    Ok(ResolvedRoster { machines, uid_from_history })
+}
+
+/// GET /fleet/roster (#1855) — the operator's DECLARED fleet topology
+/// (`darkmux machine add`'s `fleet.json`), independent of whether any of it
+/// is beating right now.
+///
+/// This is what closes the "rostered-but-silent machine vanishes entirely"
+/// half of #1855: `/fleet/machines/live` only ever reports a machine that is
+/// currently publishing a presence beat, so a machine the operator
+/// deliberately added and which is down, unreachable, or has simply never
+/// started its daemon produced no card, no offline row, nothing — it read
+/// as though it had never been added. Roster membership is a SEPARATE
+/// question from liveness, and the viewer needs both to tell "not on my
+/// fleet" from "on my fleet, not answering right now".
+///
+/// Deliberately does NOT probe reachability: the fleet view
+/// (`GET /fleet/view`, `darkmux machine list`) dials the peers. This route
+/// only reads a local JSON file and reports what is declared in it, per
+/// "darkmux describes, never adjudicates": it says what the operator's roster
+/// claims, not what darkmux verified about a peer's network reachability.
+///
+/// Never 500s. A missing file is an empty roster (`load_roster`'s own
+/// fresh-install contract, not an error); a PRESENT but corrupt file
+/// reports the parse failure in `error` (a fixed literal — see
+/// [`ROSTER_READ_FAILED`]'s own doc on why, not the underlying error text)
+/// rather than silently discarding the roster and answering as if nothing
+/// were ever added.
 async fn fleet_roster_handler() -> axum::Json<wire::FleetRosterResponse> {
-    let result = tokio::task::spawn_blocking(darkmux_fleet::load_roster).await;
+    let result = tokio::task::spawn_blocking(|| resolved_roster(&darkmux_types::config_access::flows_dir())).await;
     let (machines, error) = match result {
-        Ok(Ok(roster)) => {
-            let mut machines = roster.machines.into_values().collect::<Vec<_>>();
-            // (#2796) Fill in uids the entry itself does not declare, so the
-            // viewer's uid-based consolidation has something to consolidate on.
-            backfill_roster_machine_uids(
-                &mut machines,
-                &darkmux_types::config_access::flows_dir(),
-            );
-            (machines, None)
-        }
-        Ok(Err(e)) => {
-            eprintln!("darkmux serve: GET /fleet/roster — reading the roster failed ({e:#})");
-            (Vec::new(), Some(ROSTER_READ_FAILED.to_string()))
-        }
+        Ok(Ok(roster)) => (roster.machines, None),
+        Ok(Err(sentence)) => (Vec::new(), Some(sentence.to_string())),
         Err(e) => {
             eprintln!("darkmux serve: GET /fleet/roster task failed ({e})");
             (Vec::new(), Some("internal error reading the fleet roster".to_string()))

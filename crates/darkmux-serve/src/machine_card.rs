@@ -1,6 +1,8 @@
-//! The machine card: what one machine says about itself, served at
-//! `GET /machine/card` and gathered by every other daemon's fleet view
-//! ([`crate::fleet_view`]).
+//! The machine card: what one machine says about itself, served by its fleet
+//! listener at `GET /fleet/card` and gathered by every other daemon's fleet
+//! view ([`crate::fleet_view`]). The listener is the one channel a card
+//! travels between machines; a machine reads its OWN card from its own row of
+//! `GET /fleet/view`.
 //!
 //! A card states facts and never infers them. Each block is read from the
 //! thing that owns the fact:
@@ -10,18 +12,27 @@
 //! - profiles and their endpoint kind: the profile registry, through
 //!   `ProfileModel::endpoint_kind`, the classification every dispatch,
 //!   residency and doctor path reads;
-//! - what this machine accepts from the CALLER: the allow-list entry the
-//!   fleet listener's gate verified, and only that entry (the listener's
-//!   [`ListenerCard`]; the daemon's card never carries it);
-//! - seats: the running fleet listener's `SeatBook`;
+//! - what this machine accepts from the CALLER: the caller's own allow-list
+//!   entry and no other ([`CardGrant`], beside the card in [`ListenerCard`];
+//!   the card itself never carries it);
+//! - seats: the running fleet listener's `SeatBook`, which counts only jobs
+//!   OTHER machines submitted (`counts_own_work` says so, and no field says
+//!   "free");
 //! - governor: the host sampler's own reading, plus the battery policy the
 //!   operator wrote.
 //!
-//! **Trust.** The daemon's card states no grant. `accepts` exists in one
-//! place only: the answer of the fleet listener's `GET /fleet/card`, which
-//! sits behind the listener's gate (fleet token, the connecting node as the
-//! overlay network names it, the allow-list). A card is never read from
-//! Redis: presence says who is alive, and the peer itself says what it is.
+//! **Trust.** A card read is AUTHENTICATED, not authorized: the caller holds
+//! the fleet token and comes from a node the overlay network names
+//! ([`darkmux_fleet::authenticate`]). Whether this machine also LETS that
+//! node run work is reported as data in the grant, so a machine that grants
+//! nothing is still visible. A card is never read from Redis: presence says
+//! who is alive, and the peer itself says what it is.
+//!
+//! **Forward compatibility.** Every enum a peer's card carries has an
+//! `unknown` arm, so a newer machine's card still reads on an older one
+//! (`Unknown` is never read as any known value). The shape is tied to
+//! [`CARD_SCHEMA_VERSION`] by a golden hash: a shape change without a version
+//! bump fails a test.
 
 use crate::wire::MachineSpecsResponse;
 use darkmux_crew::power_policy::{self, PowerPolicyConfig, StartDecision};
@@ -30,7 +41,8 @@ use darkmux_flow::payload::{BatteryCharge, HostSampleNow, ThermalNow};
 use darkmux_types::config::BusyPolicy;
 use darkmux_types::{EndpointKind, ProfileRegistry};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
+use std::time::Duration;
 
 /// The card's own shape version. Minor for an added field a reader can
 /// ignore, major for a rename or retype. A peer whose card is on another
@@ -53,6 +65,10 @@ pub enum CardEndpointKind {
     /// The endpoint cannot be classified (it names an id no `endpoints`
     /// entry defines), or a profile declares no model.
     Unresolved,
+    /// A kind a newer darkmux states that this one does not know. Never read
+    /// as managed or unmanaged.
+    #[serde(other)]
+    Unknown,
 }
 
 /// One model a profile declares.
@@ -110,63 +126,117 @@ impl From<&Admitted> for CardAccepts {
     }
 }
 
-/// `GET /fleet/card` on the fleet listener: this machine's card and what this
-/// machine lets the verified caller do. The two travel together because the
-/// gate that admitted the caller is the listener's, so the grant is stated
-/// where it was checked.
+/// What the answering machine lets the CALLER do, as the machine's own
+/// allow-list says. It rides beside the card, never inside it, so a card
+/// stays the same document whoever asks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum CardGrant {
+    /// The caller's node has an entry: this is that entry, and no other.
+    Listed { accepts: CardAccepts },
+    /// The caller is a verified fleet node with no entry: this machine takes
+    /// no work from it. The card is still served.
+    NotListed,
+    /// This machine could not say (its allow-list could not be read, or names
+    /// the caller twice), or a state this darkmux does not know. Never read as
+    /// listed or as not listed.
+    #[serde(other)]
+    Unknown,
+}
+
+/// `GET /fleet/card` on the fleet listener: this machine's card and what it
+/// lets the authenticated caller do. The two travel together because the
+/// listener that authenticated the caller is where the grant is read.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct ListenerCard {
     pub card: MachineCard,
-    pub accepts: CardAccepts,
+    pub grant: CardGrant,
 }
 
-/// Seats a submitted job holds on local models: one per model.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-#[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
-pub struct CardLocalSeats {
-    /// Local models a submitted job holds right now.
-    pub held_models: Vec<String>,
-    /// Managed models in this machine's profiles that no submitted job holds.
-    pub free_models: Vec<String>,
+impl CardGrant {
+    /// The grant an authorization result states: an entry, no entry, or "could
+    /// not say". A refusal that is not about the allow-list is not a grant
+    /// decision, so it is `Unknown`, never `NotListed`.
+    pub fn from_authorization(result: &Result<Admitted, darkmux_fleet::Refusal>) -> Self {
+        match result {
+            Ok(admitted) => CardGrant::Listed { accepts: CardAccepts::from(admitted) },
+            Err(darkmux_fleet::Refusal::NotAllowed { .. }) => CardGrant::NotListed,
+            Err(_) => CardGrant::Unknown,
+        }
+    }
 }
 
-/// Seats a submitted job holds on hosted endpoints: up to a cap.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-#[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
-pub struct CardHostedSeats {
-    pub held: u32,
-    /// `remote.concurrent_cap`; `null` is unbounded.
-    pub cap: Option<u32>,
-    /// `cap - held`; `null` when unbounded.
-    pub free: Option<u32>,
-}
-
-/// The seat book of this machine's fleet listener: what OTHER machines'
-/// submitted jobs hold. This machine's own dispatches do not register here.
+/// What a job another machine submitted does to this machine's seats.
+///
+/// **Only those jobs are counted.** This machine's own dispatches do not pass
+/// through the fleet listener, so `counts_own_work` is `false` and NOTHING in
+/// this block means "free": a model with `held_by_peer_job: false` may be
+/// running this machine's own coder turn, and a hosted count under its cap may
+/// not be under it once own work counts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct CardSeats {
     /// What a job does when its seat is busy (`fleet.busy_policy`).
-    #[serde(deserialize_with = "busy_policy_from_token")]
-    pub busy_policy: BusyPolicy,
-    pub local: CardLocalSeats,
+    pub busy_policy: CardBusyPolicy,
+    /// Whether this machine's own dispatches are counted in the seats below.
+    /// `false` today.
+    pub counts_own_work: bool,
+    /// The local models a peer's job could seat, or does: each managed model
+    /// in a work profile, and each model a peer job holds.
+    pub local: Vec<CardLocalSeat>,
     pub hosted: CardHostedSeats,
     /// Submitted jobs waiting for a seat.
     pub waiting: u32,
 }
 
-/// A config enum is deliberately not `Deserialize` (a bad value in
-/// `config.json` must not discard the whole config), so a card read from a
-/// peer parses the token through the enum's own table instead.
-fn busy_policy_from_token<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BusyPolicy, D::Error> {
-    use darkmux_types::config_enum::ConfigEnum;
-    let raw = String::deserialize(d)?;
-    BusyPolicy::parse(&raw).ok_or_else(|| serde::de::Error::custom(format!("unknown busy policy `{raw}`")))
+/// What `fleet.busy_policy` says a card reader may rely on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
+#[serde(rename_all = "snake_case")]
+pub enum CardBusyPolicy {
+    /// A job whose seat is busy is refused at once.
+    Refuse,
+    /// A job whose seat is busy waits for it.
+    Queue,
+    /// A policy a newer darkmux has that this one does not know.
+    #[serde(other)]
+    Unknown,
+}
+
+impl From<BusyPolicy> for CardBusyPolicy {
+    fn from(p: BusyPolicy) -> Self {
+        match p {
+            BusyPolicy::Refuse => CardBusyPolicy::Refuse,
+            BusyPolicy::Queue => CardBusyPolicy::Queue,
+        }
+    }
+}
+
+/// One local model a peer's job could seat.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
+pub struct CardLocalSeat {
+    pub model: String,
+    /// A job another machine submitted holds this model now.
+    pub held_by_peer_job: bool,
+}
+
+/// Seats peers' jobs hold on hosted endpoints: up to a cap.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
+pub struct CardHostedSeats {
+    /// Hosted jobs other machines submitted that run now.
+    pub held_by_peer_jobs: u32,
+    /// `remote.concurrent_cap`; `null` is unbounded.
+    pub cap: Option<u32>,
 }
 
 /// The battery policy the operator wrote, and whether it refuses a start now.
@@ -201,7 +271,8 @@ pub struct CardGovernor {
     pub battery_gate: CardBatteryGate,
 }
 
-/// `GET /machine/card`.
+/// One machine's card: what it says about itself. Served inside a
+/// [`ListenerCard`] by the fleet listener.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
@@ -230,6 +301,11 @@ pub struct MachineCard {
     /// own cost).
     #[cfg_attr(test, ts(type = "number"))]
     pub gather_ms: u64,
+    /// How long the serving machine keeps a gathered card before gathering
+    /// again: this card may be that much older than `generated_at_ms` says
+    /// when it was read. `0` for a card built for one reader.
+    #[cfg_attr(test, ts(type = "number"))]
+    pub cache_ttl_ms: u64,
 }
 
 /// The literal a card carries when the profile registry could not be read.
@@ -292,30 +368,29 @@ fn is_utility_only(profile: &CardProfile, utility: Option<&str>) -> bool {
 
 /// The seat block from the listener's book and the profiles it can run.
 /// `utility` is the registry's utility model id: a profile of only that model
-/// is not one a peer can seat, so its model is not listed as free.
+/// is not one a peer can seat, so its model is not listed unless a peer job
+/// holds it or a work profile also names it.
 pub(crate) fn card_seats(
     policy: BusyPolicy,
     seats: &SeatSnapshot,
     profiles: &[CardProfile],
     utility: Option<&str>,
 ) -> CardSeats {
-    let managed: BTreeSet<&str> = profiles
+    let mut local: BTreeMap<&str, bool> = profiles
         .iter()
         .filter(|p| !is_utility_only(p, utility))
         .flat_map(|p| p.models.iter())
         .filter(|m| m.endpoint_kind == CardEndpointKind::Managed)
-        .map(|m| m.id.as_str())
+        .map(|m| (m.id.as_str(), false))
         .collect();
-    let held: BTreeSet<&str> = seats.local_held.iter().map(String::as_str).collect();
-    let held_hosted = seats.hosted_held as u32;
-    let cap = seats.hosted_cap.map(|c| c as u32);
+    for held in &seats.local_held {
+        local.insert(held.as_str(), true);
+    }
     CardSeats {
-        busy_policy: policy,
-        local: CardLocalSeats {
-            held_models: seats.local_held.clone(),
-            free_models: managed.difference(&held).map(|m| (*m).to_string()).collect(),
-        },
-        hosted: CardHostedSeats { held: held_hosted, cap, free: cap.map(|c| c.saturating_sub(held_hosted)) },
+        busy_policy: policy.into(),
+        counts_own_work: false,
+        local: local.into_iter().map(|(model, held)| CardLocalSeat { model: model.to_string(), held_by_peer_job: held }).collect(),
+        hosted: CardHostedSeats { held_by_peer_jobs: seats.hosted_held as u32, cap: seats.hosted_cap.map(|c| c as u32) },
         waiting: seats.waiting as u32,
     }
 }
@@ -382,11 +457,55 @@ pub(crate) fn gather_local_card() -> MachineCard {
         governor,
         generated_at_ms: crate::current_millis(),
         gather_ms: started.elapsed().as_millis() as u64,
+        cache_ttl_ms: 0,
     }
 }
 
+/// How long a serving machine keeps its gathered card. Recorded on the card
+/// (`cache_ttl_ms`), never adaptive.
+pub(crate) const CARD_CACHE_TTL: Duration = Duration::from_secs(2);
+
+/// The gathered card, kept for a TTL. A card read costs a specs gather (a
+/// `lms ps` spawn) on the observed machine, and every peer's view reads it
+/// about every five seconds, so serving from a cache keeps the observer from
+/// joining the observed. Single-flight: the lock is held across the gather,
+/// so a burst on a cold cache costs one. Wall-clock time, so a daemon that
+/// slept does not serve a pre-sleep card as fresh.
+pub(crate) struct CardCache {
+    ttl: Duration,
+    slot: std::sync::Mutex<Option<(std::time::SystemTime, MachineCard)>>,
+}
+
+impl CardCache {
+    pub(crate) fn new(ttl: Duration) -> Self {
+        Self { ttl, slot: std::sync::Mutex::new(None) }
+    }
+
+    /// The cached card, or the result of `gather` stamped with this cache's
+    /// TTL. Blocking.
+    pub(crate) fn get(&self, gather: impl FnOnce() -> MachineCard) -> MachineCard {
+        let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((at, card)) = slot.as_ref() {
+            if crate::wall_clock_cache_is_fresh(*at, std::time::SystemTime::now(), self.ttl) {
+                return card.clone();
+            }
+        }
+        let mut card = gather();
+        card.cache_ttl_ms = self.ttl.as_millis() as u64;
+        *slot = Some((std::time::SystemTime::now(), card.clone()));
+        card
+    }
+}
+
+/// The one card cache of a daemon process: the fleet listener serves from it
+/// and this machine's own row of the fleet view reads it.
+pub(crate) fn process_card_cache() -> std::sync::Arc<CardCache> {
+    static CACHE: std::sync::OnceLock<std::sync::Arc<CardCache>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Arc::new(CardCache::new(CARD_CACHE_TTL))).clone()
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use darkmux_types::{Profile, ProfileModel};
 
@@ -470,32 +589,56 @@ mod tests {
         SeatSnapshot { local_held: local.iter().map(|s| s.to_string()).collect(), hosted_held: hosted, hosted_cap: cap, waiting }
     }
 
+    fn seat_of<'a>(seats: &'a CardSeats, model: &str) -> &'a CardLocalSeat {
+        seats.local.iter().find(|s| s.model == model).unwrap_or_else(|| panic!("no seat for {model} in {seats:?}"))
+    }
+
+    /// The promise: the seat block states what peers' jobs hold and NOTHING
+    /// that reads as "free". A model no peer job holds is `held_by_peer_job:
+    /// false`, and the block says it does not count this machine's own work.
     #[test]
-    fn seats_report_held_and_free_per_class_and_the_busy_policy() {
+    fn seats_state_what_peer_jobs_hold_and_say_they_do_not_count_own_work() {
         let cards = card_profiles(&mixed_registry());
         let seats = card_seats(BusyPolicy::Queue, &snap(&["qwen-35b"], 1, Some(3), 2), &cards, None);
-        assert_eq!(seats.busy_policy, BusyPolicy::Queue);
-        assert_eq!(seats.local.held_models, vec!["qwen-35b".to_string()]);
-        assert_eq!(seats.local.free_models, vec!["qwen-4b".to_string()], "the managed model nobody holds");
-        assert_eq!(seats.hosted, CardHostedSeats { held: 1, cap: Some(3), free: Some(2) });
+        assert_eq!(seats.busy_policy, CardBusyPolicy::Queue);
+        assert!(!seats.counts_own_work, "the listener never sees this machine's own dispatches");
+        assert!(seat_of(&seats, "qwen-35b").held_by_peer_job);
+        assert!(!seat_of(&seats, "qwen-4b").held_by_peer_job, "the managed model nobody holds");
+        assert_eq!(seats.local.len(), 2);
+        assert_eq!(seats.hosted, CardHostedSeats { held_by_peer_jobs: 1, cap: Some(3) });
         assert_eq!(seats.waiting, 2);
+        let wire = serde_json::to_string(&seats).unwrap();
+        assert!(!wire.contains("free"), "no seat field may read as free: {wire}");
     }
 
     /// A profile of only the utility model is refused by the listener, so its
-    /// model is not a free seat; the same model inside a work profile still is.
+    /// model is not a seat; the same model inside a work profile still is.
     #[test]
-    fn the_utility_model_is_not_a_free_seat() {
+    fn the_utility_model_is_not_a_seat() {
         let cards = card_profiles(&mixed_registry());
-        let free = |utility| card_seats(BusyPolicy::Refuse, &snap(&[], 0, None, 0), &cards, utility).local.free_models;
-        assert_eq!(free(None), vec!["qwen-35b".to_string(), "qwen-4b".to_string()]);
-        assert_eq!(free(Some("qwen-4b")), vec!["qwen-35b".to_string(), "qwen-4b".to_string()], "qwen-4b is also in `both`, a work profile");
-        assert_eq!(free(Some("qwen-35b")), vec!["qwen-4b".to_string()], "`local` holds only the utility model");
+        let models = |utility| {
+            card_seats(BusyPolicy::Refuse, &snap(&[], 0, None, 0), &cards, utility)
+                .local
+                .into_iter()
+                .map(|s| s.model)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(models(None), vec!["qwen-35b".to_string(), "qwen-4b".to_string()]);
+        assert_eq!(models(Some("qwen-4b")), vec!["qwen-35b".to_string(), "qwen-4b".to_string()], "qwen-4b is also in `both`, a work profile");
+        assert_eq!(models(Some("qwen-35b")), vec!["qwen-4b".to_string()], "`local` holds only the utility model");
+    }
+
+    /// A model a peer job holds is listed even when no work profile names it.
+    #[test]
+    fn a_held_model_is_listed_whatever_the_profiles_say() {
+        let seats = card_seats(BusyPolicy::Refuse, &snap(&["orphan"], 0, None, 0), &[], None);
+        assert_eq!(seats.local, vec![CardLocalSeat { model: "orphan".into(), held_by_peer_job: true }]);
     }
 
     #[test]
-    fn an_unbounded_hosted_cap_has_no_free_count() {
+    fn an_unbounded_hosted_cap_is_null_and_held_jobs_still_count() {
         let seats = card_seats(BusyPolicy::Refuse, &snap(&[], 4, None, 0), &[], None);
-        assert_eq!(seats.hosted, CardHostedSeats { held: 4, cap: None, free: None });
+        assert_eq!(seats.hosted, CardHostedSeats { held_by_peer_jobs: 4, cap: None });
     }
 
     fn now(thermal: Option<&str>, battery: Option<BatteryCharge>) -> HostSampleNow {
@@ -573,15 +716,248 @@ mod tests {
         assert_eq!(by_name(&cards, "baddialect").endpoint_kind, CardEndpointKind::Unresolved);
     }
 
-    /// The daemon's card states no grant: `accepts` exists only in the
-    /// listener's answer.
+    /// The card states no grant itself: the grant rides beside it in the
+    /// listener's answer, so a card is the same document whoever asks.
     #[test]
-    fn the_cards_own_shape_has_no_accepts_and_the_listeners_answer_carries_it() {
-        let card = gather_local_card();
-        assert!(serde_json::to_value(&card).unwrap().get("accepts").is_none());
+    fn the_cards_own_shape_has_no_grant_and_the_listeners_answer_carries_it() {
+        let card = sample_card();
+        assert!(serde_json::to_value(&card).unwrap().get("grant").is_none());
         let accepts = CardAccepts { peer_name: "laptop".into(), profiles: vec!["deep".into()], roles: vec![], images: vec![], workspace: false };
-        let json = serde_json::to_value(ListenerCard { card, accepts }).unwrap();
-        assert_eq!(json["accepts"]["peer_name"], "laptop");
-        assert!(json["card"].get("accepts").is_none());
+        let json = serde_json::to_value(ListenerCard { card, grant: CardGrant::Listed { accepts } }).unwrap();
+        assert_eq!(json["grant"]["state"], "listed");
+        assert_eq!(json["grant"]["accepts"]["peer_name"], "laptop");
+        assert!(json["card"].get("grant").is_none() && json["card"].get("accepts").is_none());
+    }
+
+    fn admitted() -> Admitted {
+        Admitted { peer_name: "laptop".into(), node_id: "nLAPTOP".into(), profiles: vec!["deep".into()], roles: vec![], images: vec![], workspace: false }
+    }
+
+    /// The grant is what the allow-list said: an entry, no entry, or "could
+    /// not say". A refusal that is not about the allow-list is never "not
+    /// listed".
+    #[test]
+    fn a_grant_is_listed_not_listed_or_unknown_and_never_guessed() {
+        use darkmux_fleet::Refusal;
+        assert!(matches!(CardGrant::from_authorization(&Ok(admitted())), CardGrant::Listed { accepts } if accepts.peer_name == "laptop"));
+        assert_eq!(CardGrant::from_authorization(&Err(Refusal::NotAllowed { node_name: "phone".into() })), CardGrant::NotListed);
+        for other in [
+            Refusal::AmbiguousEntry { names: vec!["a".into(), "b".into()] },
+            Refusal::BadRequest("the allow-list cannot be read".into()),
+        ] {
+            assert_eq!(CardGrant::from_authorization(&Err(other.clone())), CardGrant::Unknown, "{other:?}");
+        }
+    }
+
+    // ── forward compatibility ──────────────────────────────────────────
+
+    /// A card carrying enum values a newer darkmux invented still parses, and
+    /// the rest of the card is intact: each unknown value reads as `Unknown`.
+    #[test]
+    fn a_card_with_values_from_a_newer_darkmux_still_parses() {
+        let mut v = serde_json::to_value(sample_card()).unwrap();
+        v["profiles"][0]["endpoint_kind"] = serde_json::json!("fleet");
+        v["profiles"][0]["models"][0]["endpoint_kind"] = serde_json::json!("fleet");
+        v["seats"]["busy_policy"] = serde_json::json!("preempt");
+        let card: MachineCard = serde_json::from_value(v).expect("an unknown enum value must not discard the card");
+        assert_eq!(card.profiles[0].endpoint_kind, CardEndpointKind::Unknown);
+        assert_eq!(card.profiles[0].models[0].endpoint_kind, CardEndpointKind::Unknown);
+        assert_eq!(card.seats.as_ref().unwrap().busy_policy, CardBusyPolicy::Unknown);
+        assert_eq!(card.profiles[0].name, "deep", "the rest of the card is intact");
+        assert_eq!(card.specs.machine_id.as_deref(), Some("studio"));
+        let grant: CardGrant = serde_json::from_value(serde_json::json!({"state": "delegated", "to": "x"})).unwrap();
+        assert_eq!(grant, CardGrant::Unknown);
+    }
+
+    // ── the card cache ─────────────────────────────────────────────────
+
+    /// The promise: a burst of reads inside the TTL costs one gather; a read
+    /// after it gathers again; the TTL is recorded on the card.
+    #[test]
+    fn a_card_is_gathered_once_per_ttl_and_says_so() {
+        let gathers = std::sync::atomic::AtomicUsize::new(0);
+        let gather = || {
+            gathers.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            sample_card()
+        };
+        let cache = CardCache::new(Duration::from_secs(60));
+        let first = cache.get(gather);
+        let second = cache.get(gather);
+        assert_eq!(gathers.load(std::sync::atomic::Ordering::SeqCst), 1, "the second read came from the cache");
+        assert_eq!((first.cache_ttl_ms, second.cache_ttl_ms), (60_000, 60_000));
+        let expired = CardCache::new(Duration::ZERO);
+        expired.get(gather);
+        expired.get(gather);
+        assert_eq!(gathers.load(std::sync::atomic::Ordering::SeqCst), 3, "a zero TTL never serves a cached card");
+    }
+
+    // ── the frozen shape ───────────────────────────────────────────────
+
+    /// A deterministic card built by hand, so a fixture of it is the
+    /// writer's own output and does not move with the machine running the test.
+    pub(crate) fn sample_card() -> MachineCard {
+        MachineCard {
+            card_schema_version: CARD_SCHEMA_VERSION.to_string(),
+            work_job_schema_version: darkmux_fleet::WORK_JOB_SCHEMA_VERSION.to_string(),
+            specs: MachineSpecsResponse {
+                darkmux_version: "5.0.0".into(),
+                flow_schema_version: "2.0.0".into(),
+                machine_id: Some("studio".into()),
+                machine_uid: Some("STUDIO-UID".into()),
+                os: "macos aarch64".into(),
+                ram_total_bytes: Some(128 * 1024 * 1024 * 1024),
+                ram_free_for_ai_bytes: Some(64 * 1024 * 1024 * 1024),
+                cpu_brand: Some("Apple M5 Max".into()),
+                loaded_models: vec![darkmux_types::LoadedModel {
+                    identifier: "darkmux:qwen".into(),
+                    model: "qwen".into(),
+                    status: "idle".into(),
+                    size: "20 GB".into(),
+                    context: 65536,
+                    queued: Some(0),
+                }],
+                lms_unreachable: false,
+                utility_model: None,
+                redis_url_redacted: None,
+                generated_at_ms: 1_000,
+            },
+            profiles: vec![
+                CardProfile {
+                    name: "deep".into(),
+                    description: Some("the big local model".into()),
+                    is_default: true,
+                    endpoint_kind: CardEndpointKind::Managed,
+                    models: vec![CardModel { id: "qwen".into(), n_ctx: Some(65536), endpoint_kind: CardEndpointKind::Managed }],
+                },
+                CardProfile {
+                    name: "cloud".into(),
+                    description: None,
+                    is_default: false,
+                    endpoint_kind: CardEndpointKind::Unmanaged,
+                    models: vec![CardModel { id: "gpt".into(), n_ctx: None, endpoint_kind: CardEndpointKind::Unmanaged }],
+                },
+            ],
+            default_profile: Some("deep".into()),
+            profiles_error: None,
+            seats: Some(CardSeats {
+                busy_policy: CardBusyPolicy::Queue,
+                counts_own_work: false,
+                local: vec![CardLocalSeat { model: "qwen".into(), held_by_peer_job: true }],
+                hosted: CardHostedSeats { held_by_peer_jobs: 1, cap: Some(3) },
+                waiting: 0,
+            }),
+            governor: CardGovernor {
+                thermal: Some(ThermalNow { state: "nominal".into(), cpu_speed_limit_pct: 100 }),
+                battery: None,
+                battery_gate: CardBatteryGate {
+                    floor_pct: 20,
+                    refuse_start_below_min: false,
+                    pause_running_below_min: false,
+                    refusing_start: Some(false),
+                },
+            },
+            generated_at_ms: 2_000,
+            gather_ms: 3,
+            cache_ttl_ms: 2_000,
+        }
+    }
+
+    fn fixtures_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+    }
+
+    /// Write-or-assert a fixture: the writer's output for [`sample_card`] and
+    /// its listener wrapper is committed, so a card of schema 1.0 keeps
+    /// reading for as long as the major holds.
+    fn fixture(name: &str, value: &impl Serialize) -> serde_json::Value {
+        let path = fixtures_dir().join(name);
+        let written = serde_json::to_value(value).unwrap();
+        if std::env::var_os("DARKMUX_REGENERATE_FIXTURES").is_some() {
+            std::fs::create_dir_all(fixtures_dir()).unwrap();
+            std::fs::write(&path, format!("{}\n", serde_json::to_string_pretty(value).unwrap())).unwrap();
+            return written;
+        }
+        let on_disk: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!("missing fixture {name} ({e}): regenerate with DARKMUX_REGENERATE_FIXTURES=1 cargo nextest run -p darkmux-serve machine_card")
+        }))
+        .unwrap();
+        assert_eq!(
+            on_disk, written,
+            "the card's writer no longer produces the committed {name}. A change to what a card says is a change to \
+             CARD_SCHEMA_VERSION: bump it (minor for an added field a reader can ignore, major for a rename or \
+             retype), then regenerate with DARKMUX_REGENERATE_FIXTURES=1"
+        );
+        on_disk
+    }
+
+    /// The 1.0 fixtures parse as themselves, through the parser peers use.
+    #[test]
+    fn the_1_0_card_fixtures_still_parse() {
+        let card = fixture("machine-card-1.0.json", &sample_card());
+        let card: MachineCard = serde_json::from_value(card).expect("the 1.0 card fixture parses");
+        assert_eq!(card.card_schema_version, "1.0");
+        let listed = ListenerCard { card: sample_card(), grant: CardGrant::Listed { accepts: CardAccepts::from(&admitted()) } };
+        let listener = fixture("listener-card-1.0.json", &listed);
+        let listener: ListenerCard = serde_json::from_value(listener).expect("the 1.0 listener fixture parses");
+        assert!(matches!(listener.grant, CardGrant::Listed { .. }));
+        assert_eq!(listener.card.profiles.len(), 2);
+    }
+
+    /// A schema with its object keys sorted, so its hash does not move with
+    /// map ordering.
+    fn canonical(v: &mut serde_json::Value) {
+        match v {
+            serde_json::Value::Object(map) => {
+                let mut entries: Vec<_> = std::mem::take(map).into_iter().collect();
+                entries.sort_by(|a, b| a.0.cmp(&b.0));
+                for (_, child) in &mut entries {
+                    canonical(child);
+                }
+                map.extend(entries);
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(canonical),
+            _ => {}
+        }
+    }
+
+    /// The hash of the listener card's JSON Schema: the card and everything a
+    /// reader can meet in it.
+    fn shape_hash() -> String {
+        let mut schema = serde_json::to_value(schemars::schema_for!(ListenerCard)).unwrap();
+        canonical(&mut schema);
+        blake3::hash(schema.to_string().as_bytes()).to_hex().to_string()
+    }
+
+    /// The promise: the card's shape and [`CARD_SCHEMA_VERSION`] move
+    /// together. `tests/fixtures/card-shape.golden` holds one `<version>
+    /// <hash>` line per released version; the line for the current version
+    /// must match the shape. Change the shape without bumping the version
+    /// and the hash disagrees; bump the version and the line is missing.
+    #[test]
+    fn the_cards_shape_is_tied_to_its_schema_version() {
+        let path = fixtures_dir().join("card-shape.golden");
+        let line = format!("{CARD_SCHEMA_VERSION} {}", shape_hash());
+        if std::env::var_os("DARKMUX_REGENERATE_FIXTURES").is_some() {
+            let mut lines: Vec<String> = std::fs::read_to_string(&path)
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| !l.starts_with(&format!("{CARD_SCHEMA_VERSION} ")))
+                .map(str::to_string)
+                .collect();
+            lines.push(line);
+            std::fs::create_dir_all(fixtures_dir()).unwrap();
+            std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+            return;
+        }
+        let golden = std::fs::read_to_string(&path).expect("card-shape.golden is missing");
+        let recorded = golden.lines().find(|l| l.starts_with(&format!("{CARD_SCHEMA_VERSION} ")));
+        assert_eq!(
+            recorded,
+            Some(line.as_str()),
+            "the card's shape and CARD_SCHEMA_VERSION ({CARD_SCHEMA_VERSION}) disagree. If the shape changed, bump \
+             CARD_SCHEMA_VERSION (minor for an added field a reader can ignore, major for a rename or retype) and \
+             regenerate with DARKMUX_REGENERATE_FIXTURES=1; a line already committed for a released version is never \
+             edited."
+        );
     }
 }

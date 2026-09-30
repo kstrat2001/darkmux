@@ -1,21 +1,24 @@
 //! `darkmux machine list`: the fleet view, printed.
 //!
 //! The verb gathers the same view every daemon serves at `GET /fleet/view`
-//! (`darkmux_serve::fleet_view`): one row per roster machine, each with the
-//! card that machine states about itself, fetched in parallel over the
-//! verified peer path. Under `--json` it prints the `FleetView` itself.
+//! (`darkmux_serve::fleet_view`): one row per machine, each with the card
+//! that machine states about itself, fetched in parallel from its fleet
+//! listener over the verified peer path, and this machine's own row always.
+//! Under `--json` it prints the `FleetView` itself.
 //!
 //! When this machine's own daemon answers, the verb prints the view THAT
 //! daemon gathered, so this machine's row has its seats and governor readings
 //! like on any other machine. When none answers, the view is gathered here and
 //! this machine's row has none: the text and `--json` (`gathered_by`) say they
 //! are not observed, not that they are absent.
+//!
+//! Every enum's `unknown` arm prints as "unknown", never as a known value.
 
 use darkmux_serve::fleet_view::{
-    AcceptsState, AcceptsUnknown, CardOutcome, CardSource, FleetMachine, FleetView, GatheredBy, Liveness,
-    UnreachableReason,
+    AcceptsState, CardOutcome, FleetMachine, FleetView, GatheredBy, Liveness, UnavailableWhy, UnreachableReason,
+    VersionSource,
 };
-use darkmux_serve::machine_card::{CardEndpointKind, CardSeats, MachineCard};
+use darkmux_serve::machine_card::{CardBusyPolicy, CardEndpointKind, CardSeats, MachineCard};
 use darkmux_types::style;
 
 /// A peer's strings are cut to their column so padding cannot push text into
@@ -30,7 +33,7 @@ fn human_gb(bytes: u64) -> String {
 fn liveness_cell(l: Liveness) -> &'static str {
     match l {
         Liveness::Live => "live",
-        Liveness::Gone => "gone",
+        Liveness::NoBeat => "none",
         Liveness::Unknown => "?",
     }
 }
@@ -41,25 +44,55 @@ fn kind_word(k: CardEndpointKind) -> &'static str {
         CardEndpointKind::Unmanaged => "unmanaged",
         CardEndpointKind::Mixed => "mixed",
         CardEndpointKind::Unresolved => "unresolved",
+        CardEndpointKind::Unknown => "unknown",
+    }
+}
+
+fn policy_word(p: CardBusyPolicy) -> &'static str {
+    match p {
+        CardBusyPolicy::Refuse => "refuse",
+        CardBusyPolicy::Queue => "queue",
+        CardBusyPolicy::Unknown => "unknown",
     }
 }
 
 fn unreachable_phrase(reason: UnreachableReason, detail: Option<&str>) -> String {
     let base = match reason {
-        UnreachableReason::PresenceGone => "presence reports it gone; not asked",
         UnreachableReason::BadAddress => "roster address is not a usable address; nothing sent",
         UnreachableReason::DnsFailed => "roster address did not resolve; nothing sent",
         UnreachableReason::IdentityUnavailable => "the network identity tool could not verify it; nothing sent",
         UnreachableReason::NotOnOverlay => "address is not a node on the network; nothing sent",
         UnreachableReason::PinMismatch => "address is not its pinned node; nothing sent",
+        UnreachableReason::ListenerOff => "its fleet listener did not answer",
         UnreachableReason::AuthRequired => "needs a fleet token this machine is not sending",
-        UnreachableReason::ConnectFailed => "could not connect",
+        UnreachableReason::RefusedByPeer => "its fleet listener refused this machine",
+        UnreachableReason::ListenerUnavailable => "its fleet listener cannot serve a card now",
         UnreachableReason::BadAnswer => "answered with something that is not a card",
+        UnreachableReason::Unknown => "a reason this darkmux does not know",
     };
     match detail {
         Some(d) => format!("unreachable: {base} ({d})"),
         None => format!("unreachable: {base}"),
     }
+}
+
+/// "peer 5.0.0" or "peer 5.0.0, from presence", or "peer version unknown".
+fn peer_words(version: Option<&str>, source: Option<VersionSource>) -> String {
+    match (version, source) {
+        (Some(v), Some(VersionSource::Presence)) => format!("peer {v}, from presence"),
+        (Some(v), _) => format!("peer {v}"),
+        (None, _) => "peer version unknown".to_string(),
+    }
+}
+
+fn unavailable_phrase(why: UnavailableWhy, peer: &str) -> String {
+    let what = match why {
+        UnavailableWhy::NoCardRoute => "no card route",
+        UnavailableWhy::OtherSchemaMajor => "unreadable card schema",
+        UnavailableWhy::Unparseable => "its card did not parse",
+        UnavailableWhy::Unknown => "a reason this darkmux does not know",
+    };
+    format!("card unavailable ({peer}; {what})")
 }
 
 /// The table cells of one machine: headroom, OS, version, and the last
@@ -77,11 +110,11 @@ fn cells(m: &FleetMachine) -> [String; 4] {
                 if models.is_empty() { dash() } else { models },
             ]
         }
-        CardOutcome::Unavailable { peer_version } => [
+        CardOutcome::Unavailable { why, peer_version, peer_version_source } => [
             dash(),
             dash(),
             peer_version.clone().unwrap_or_else(dash),
-            format!("card unavailable (peer {})", peer_version.as_deref().unwrap_or("version unknown")),
+            unavailable_phrase(*why, &peer_words(peer_version.as_deref(), *peer_version_source)),
         ],
         CardOutcome::Mismatch { answered_as } => [
             dash(),
@@ -92,38 +125,22 @@ fn cells(m: &FleetMachine) -> [String; 4] {
         CardOutcome::Unreachable { reason, detail } => {
             [dash(), dash(), dash(), unreachable_phrase(*reason, detail.as_deref())]
         }
+        CardOutcome::Unknown => [dash(), dash(), dash(), "an answer this darkmux does not know".to_string()],
     }
 }
 
 /// What a peer lets this machine do, in a line's words.
-fn accepts_phrase(source: CardSource, accepts: &AcceptsState) -> Option<String> {
+fn accepts_phrase(accepts: &AcceptsState) -> Option<String> {
     Some(match accepts {
         AcceptsState::Granted { accepts } => format!(
             "accepts from this machine: profiles {}; roles {}",
             list_or_none(&accepts.profiles),
             list_or_none(&accepts.roles)
         ),
-        AcceptsState::Refused { reason } => format!("refuses this machine: {reason}"),
-        AcceptsState::Unknown { why: AcceptsUnknown::ThisMachine | AcceptsUnknown::Withheld, .. } => return None,
-        AcceptsState::Unknown { why: AcceptsUnknown::ListenerOff, .. } => {
-            format!("accepts from this machine: unknown (its fleet listener did not answer; card from its {})", source_word(source))
-        }
-        AcceptsState::Unknown { why: AcceptsUnknown::ListenerUnavailable, detail } => format!(
-            "accepts from this machine: unknown ({})",
-            detail.as_deref().unwrap_or("its fleet listener gave no answer")
-        ),
-        AcceptsState::Unknown { why: AcceptsUnknown::NotDialed, .. } => {
-            "accepts from this machine: unknown (no verified node behind its address)".to_string()
-        }
+        AcceptsState::NotListed => "does not list this machine: it takes no work from it".to_string(),
+        AcceptsState::ThisMachine | AcceptsState::Withheld => return None,
+        AcceptsState::Unknown => "accepts from this machine: unknown".to_string(),
     })
-}
-
-fn source_word(source: CardSource) -> &'static str {
-    match source {
-        CardSource::Local => "own process",
-        CardSource::Listener => "fleet listener",
-        CardSource::Daemon => "daemon",
-    }
 }
 
 fn list_or_none(items: &[String]) -> String {
@@ -146,24 +163,28 @@ fn profiles_line(card: &MachineCard) -> String {
     format!("profiles: {}", each.join(", "))
 }
 
+/// The seat line. It states what jobs from OTHER machines hold, and says so:
+/// the seat block never counts this machine's own work, so it never says
+/// "free".
 fn seats_line(seats: &CardSeats) -> String {
     let hosted = match seats.hosted.cap {
-        Some(cap) => format!("{}/{cap}", seats.hosted.held),
-        None => format!("{}/unbounded", seats.hosted.held),
+        Some(cap) => format!("{}/{cap}", seats.hosted.held_by_peer_jobs),
+        None => format!("{}/unbounded", seats.hosted.held_by_peer_jobs),
     };
+    let held = seats.local.iter().filter(|s| s.held_by_peer_job).count();
+    let scope = if seats.counts_own_work { "" } else { " (jobs from other machines only)" };
     format!(
-        "seats: {} held, hosted {hosted}, {} waiting, busy policy {}",
-        seats.local.held_models.len(),
+        "seats{scope}: {held} local held, hosted {hosted}, {} waiting, busy policy {}",
         seats.waiting,
-        darkmux_types::config_enum::ConfigEnum::token(seats.busy_policy)
+        policy_word(seats.busy_policy)
     )
 }
 
 /// The dim lines under a machine whose card was read: profiles, seats,
 /// thermal, and what it lets this machine do.
-fn detail_lines(card: &MachineCard, source: CardSource, accepts: &AcceptsState) -> Vec<String> {
+fn detail_lines(card: &MachineCard, accepts: &AcceptsState) -> Vec<String> {
     let mut lines = vec![detail_line(card)];
-    if let Some(phrase) = accepts_phrase(source, accepts) {
+    if let Some(phrase) = accepts_phrase(accepts) {
         lines.push(format!("  {phrase}"));
     }
     lines
@@ -181,19 +202,24 @@ fn detail_line(card: &MachineCard) -> String {
     format!("  {}", parts.join("; "))
 }
 
+/// The name a row is listed under: its roster id, or this machine's own name
+/// when the roster has no entry for it.
+fn row_name(view: &FleetView, m: &FleetMachine) -> String {
+    match &m.entry {
+        Some(e) => e.id.clone(),
+        None => view.local_machine_id.clone().unwrap_or_else(|| "<this machine>".to_string()),
+    }
+}
+
 fn remedies(view: &FleetView) -> Vec<String> {
-    let ids = |want: fn(&CardOutcome) -> bool| -> Vec<&str> {
-        view.machines.iter().filter(|m| want(&m.card)).map(|m| m.entry.id.as_str()).collect()
+    let names = |want: &dyn Fn(&CardOutcome) -> bool| -> Vec<String> {
+        view.machines.iter().filter(|m| want(&m.card)).map(|m| row_name(view, m)).collect()
     };
-    let reason = |r: UnreachableReason| -> Vec<&str> {
-        view.machines
-            .iter()
-            .filter(|m| matches!(&m.card, CardOutcome::Unreachable { reason, .. } if *reason == r))
-            .map(|m| m.entry.id.as_str())
-            .collect()
+    let reason = |r: UnreachableReason| -> Vec<String> {
+        names(&|c| matches!(c, CardOutcome::Unreachable { reason, .. } if *reason == r))
     };
     let mut out = Vec::new();
-    let mut note = |names: Vec<&str>, what: &str, fix: &str| {
+    let mut note = |names: Vec<String>, what: &str, fix: &str| {
         if !names.is_empty() {
             out.push(format!("! {} machine(s) {what} ({}): {fix}", names.len(), names.join(", ")));
         }
@@ -224,17 +250,27 @@ fn remedies(view: &FleetView) -> Vec<String> {
         "the roster address is not a usable address. Re-add each with `darkmux machine add <id> --address <dns-name>`.",
     );
     note(
+        reason(UnreachableReason::ListenerOff),
+        "did not answer on their fleet listener",
+        "the listener is off or not reachable from here. A machine is visible to the fleet only while its listener runs: enable `fleet.listener` on each (`darkmux doctor` there says why it is not up).",
+    );
+    note(
         reason(UnreachableReason::AuthRequired),
         "require a fleet token this machine isn't sending",
         "set DARKMUX_SERVE_TOKEN (or the darkmux-serve-token Keychain item) to the shared fleet token.",
     );
     note(
-        ids(|c| matches!(c, CardOutcome::Mismatch { .. })),
+        reason(UnreachableReason::RefusedByPeer),
+        "refused this machine at their fleet listener",
+        "the detail above is each one's own sentence: it could not place this machine's address on its network, or the request came from its own node.",
+    );
+    note(
+        names(&|c| matches!(c, CardOutcome::Mismatch { .. })),
         "answered with another machine's card",
         "another machine holds that address, or the roster entry names the wrong one. Its card was not used; re-add the entry with its own tailnet DNS name.",
     );
     note(
-        ids(|c| matches!(c, CardOutcome::Unavailable { .. })),
+        names(&|c| matches!(c, CardOutcome::Unavailable { why: UnavailableWhy::NoCardRoute, .. })),
         "answered with no readable card",
         "they may run an older darkmux. Upgrade darkmux there to see their profiles, seats and state.",
     );
@@ -260,11 +296,6 @@ pub(crate) fn render_text(view: &FleetView, roster_path: &str) -> String {
         ));
     }
     out.push('\n');
-    if view.machines.is_empty() {
-        out.push_str("(no peers in roster: single-machine fleet)\n\n");
-        out.push_str("Add a peer: darkmux machine add <id> --address <dns-name>\n");
-        return out;
-    }
     out.push_str(&format!(
         "{}\n",
         style::dim(&format!("{:<14} {:<5} {:<11} {:<13} {:<12} LOADED", "MACHINE", "LIVE", "AI-HEADROOM", "OS", "VERSION"))
@@ -273,7 +304,7 @@ pub(crate) fn render_text(view: &FleetView, roster_path: &str) -> String {
         let [ram, os, version, last] = cells(m);
         let row = format!(
             "{:<14} {:<5} {:<11} {:<13} {:<12} {}",
-            darkmux_fleet::truncate_chars(&m.entry.id, 14),
+            darkmux_fleet::truncate_chars(&row_name(view, m), 14),
             liveness_cell(m.liveness),
             darkmux_fleet::truncate_chars(&ram, 11),
             darkmux_fleet::truncate_chars(&os, 13),
@@ -282,11 +313,15 @@ pub(crate) fn render_text(view: &FleetView, roster_path: &str) -> String {
         );
         let reachable = matches!(m.card, CardOutcome::Available { .. } | CardOutcome::Unavailable { .. });
         out.push_str(&format!("{}\n", if reachable { row } else { style::dim(&row) }));
-        if let CardOutcome::Available { card, source, accepts } = &m.card {
-            for line in detail_lines(card, *source, accepts) {
+        if let CardOutcome::Available { card, .. } = &m.card {
+            for line in detail_lines(card, &m.accepts) {
                 out.push_str(&format!("{}\n", style::dim(&line)));
             }
         }
+    }
+    if view.machines.iter().all(|m| m.is_this_machine) {
+        out.push_str("\n(no peers in roster: single-machine fleet)\n");
+        out.push_str("Add a peer: darkmux machine add <id> --address <dns-name>\n");
     }
     for line in remedies(view) {
         out.push_str(&format!("{}\n", style::warn(&format!("  {line}"))));
@@ -297,6 +332,7 @@ pub(crate) fn render_text(view: &FleetView, roster_path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use darkmux_serve::fleet_view::CardSource;
 
     fn card_json(version: &str) -> serde_json::Value {
         serde_json::json!({
@@ -316,12 +352,13 @@ mod tests {
                  "models": [{"id": "gpt", "n_ctx": null, "endpoint_kind": "unmanaged"}]}
             ],
             "default_profile": "deep", "profiles_error": null,
-            "seats": {"busy_policy": "queue", "local": {"held_models": ["qwen"], "free_models": []},
-                      "hosted": {"held": 1, "cap": 3, "free": 2}, "waiting": 0},
+            "seats": {"busy_policy": "queue", "counts_own_work": false,
+                      "local": [{"model": "qwen", "held_by_peer_job": true}, {"model": "small", "held_by_peer_job": false}],
+                      "hosted": {"held_by_peer_jobs": 1, "cap": 3}, "waiting": 0},
             "governor": {"thermal": {"state": "nominal", "cpu_speed_limit_pct": 100}, "battery": null,
                          "battery_gate": {"floor_pct": 50, "refuse_start_below_min": true,
                                           "pause_running_below_min": true, "refusing_start": false}},
-            "generated_at_ms": 1, "gather_ms": 2
+            "generated_at_ms": 1, "gather_ms": 2, "cache_ttl_ms": 2000
         })
     }
 
@@ -329,25 +366,39 @@ mod tests {
         Box::new(serde_json::from_value(card_json(version)).expect("a card of this build's shape"))
     }
 
-    fn read(card: Box<MachineCard>, source: CardSource, accepts: AcceptsState) -> CardOutcome {
-        CardOutcome::Available { card, source, accepts }
+    fn read(card: Box<MachineCard>) -> CardOutcome {
+        CardOutcome::Available { card, source: CardSource::Listener }
     }
 
     fn machine(id: &str, liveness: Liveness, outcome: CardOutcome) -> FleetMachine {
         FleetMachine {
-            entry: darkmux_serve::wire::RosterMachineEntry {
+            entry: Some(darkmux_serve::wire::RosterMachineEntry {
                 id: id.to_string(),
                 address: format!("{id}.example.invalid"),
                 description: None,
                 added_unix_ms: 1,
                 machine_uid: None,
                 loopback_intended: None,
-            },
+            }),
             is_this_machine: false,
+            machine_uid: None,
+            uid_source: None,
             liveness,
             last_beat_ms: None,
+            received_at_ms: None,
+            fetch_ms: Some(1),
             card: outcome,
+            accepts: AcceptsState::Unknown,
         }
+    }
+
+    fn with_accepts(mut m: FleetMachine, accepts: AcceptsState) -> FleetMachine {
+        m.accepts = accepts;
+        m
+    }
+
+    fn unreachable(id: &str, reason: UnreachableReason, detail: Option<&str>) -> FleetMachine {
+        machine(id, Liveness::Unknown, CardOutcome::Unreachable { reason, detail: detail.map(str::to_string) })
     }
 
     fn view(machines: Vec<FleetMachine>) -> FleetView {
@@ -368,10 +419,16 @@ mod tests {
         render_text(v, "/roster.json")
     }
 
+    fn own_row() -> FleetMachine {
+        let mut m = with_accepts(machine("x", Liveness::Live, CardOutcome::Available { card: card("5.0.0"), source: CardSource::Local }), AcceptsState::ThisMachine);
+        m.entry = None;
+        m.is_this_machine = true;
+        m
+    }
+
     #[test]
     fn a_read_card_fills_the_row_and_the_detail_line() {
-        let unknown = AcceptsState::Unknown { why: AcceptsUnknown::ThisMachine, detail: None };
-        let out = text(&view(vec![machine("studio", Liveness::Live, read(card("5.0.0"), CardSource::Local, unknown))]));
+        let out = text(&view(vec![machine("studio", Liveness::Live, read(card("5.0.0")))]));
         let row = out.lines().find(|l| l.starts_with("studio")).unwrap();
         for want in ["live", "64 GB", "macos aarch64", "5.0.0", "darkmux:qwen"] {
             assert!(row.contains(want), "{want} missing: {row}");
@@ -380,34 +437,72 @@ mod tests {
         assert!(out.contains("hosted 1/3") && out.contains("busy policy queue") && out.contains("thermal: nominal"), "{out}");
     }
 
-    /// The promise: an older peer is "card unavailable (peer <version>)", not
-    /// an error and not a blank.
+    /// The seat line says whose jobs it counts, and never says "free": the
+    /// card does not know this machine's own work.
     #[test]
-    fn a_peer_with_no_card_reads_card_unavailable_naming_its_version() {
+    fn the_seat_line_counts_peer_jobs_only_and_never_says_free() {
+        let out = text(&view(vec![machine("studio", Liveness::Live, read(card("5.0.0")))]));
+        assert!(out.contains("seats (jobs from other machines only): 1 local held"), "{out}");
+        assert!(!out.contains("free"), "{out}");
+    }
+
+    /// This machine's own row is listed under its own name when the roster has
+    /// no entry for it.
+    #[test]
+    fn an_entryless_own_row_is_listed_under_the_local_machine_name() {
+        let out = text(&view(vec![own_row()]));
+        assert!(out.lines().any(|l| l.starts_with("laptop ")), "{out}");
+        assert!(out.contains("single-machine fleet") && out.contains("darkmux machine add"), "{out}");
+    }
+
+    /// The promise: an older peer is "card unavailable", not an error and not
+    /// a blank; each reason reads differently; a version from presence says so.
+    #[test]
+    fn a_peer_with_no_card_reads_card_unavailable_with_its_reason_and_whose_version() {
+        let un = |why, v: Option<&str>, src| CardOutcome::Unavailable {
+            why,
+            peer_version: v.map(str::to_string),
+            peer_version_source: src,
+        };
         let out = text(&view(vec![
-            machine("old", Liveness::Live, CardOutcome::Unavailable { peer_version: Some("4.9.1".into()) }),
-            machine("older", Liveness::Unknown, CardOutcome::Unavailable { peer_version: None }),
+            machine("old", Liveness::Live, un(UnavailableWhy::NoCardRoute, Some("4.9.1"), Some(VersionSource::Presence))),
+            machine("older", Liveness::Unknown, un(UnavailableWhy::NoCardRoute, None, None)),
+            machine("newer", Liveness::Live, un(UnavailableWhy::OtherSchemaMajor, Some("9.9.9"), Some(VersionSource::Peer))),
+            machine("broken", Liveness::Live, un(UnavailableWhy::Unparseable, Some("5.0.0"), Some(VersionSource::Peer))),
         ]));
-        assert!(out.contains("card unavailable (peer 4.9.1)"), "{out}");
-        assert!(out.contains("card unavailable (peer version unknown)"), "{out}");
+        assert!(out.contains("card unavailable (peer 4.9.1, from presence; no card route)"), "{out}");
+        assert!(out.contains("card unavailable (peer version unknown; no card route)"), "{out}");
+        assert!(out.contains("card unavailable (peer 9.9.9; unreadable card schema)"), "{out}");
+        assert!(out.contains("card unavailable (peer 5.0.0; its card did not parse)"), "{out}");
         assert!(!out.contains("unreachable"), "an old peer is not unreachable: {out}");
-        assert!(out.contains("older darkmux"), "the row is followed by the remedy: {out}");
+        assert!(out.contains("older darkmux"), "the no-route rows are followed by the remedy: {out}");
+    }
+
+    /// No beat is a display column, not a verdict: the machine was asked and
+    /// its card is shown.
+    #[test]
+    fn a_machine_with_no_beat_is_shown_with_its_card_and_is_not_called_gone() {
+        let out = text(&view(vec![machine("studio", Liveness::NoBeat, read(card("5.0.0")))]));
+        let row = out.lines().find(|l| l.starts_with("studio")).unwrap();
+        assert!(row.contains("none") && row.contains("darkmux:qwen"), "{row}");
+        assert!(!out.contains("gone") && !out.contains("not asked"), "{out}");
     }
 
     #[test]
-    fn an_unreachable_machine_says_why_and_a_gone_one_says_it_was_not_asked() {
+    fn an_unreachable_machine_says_why_with_the_peers_own_words() {
         let out = text(&view(vec![
-            machine("gone", Liveness::Gone, CardOutcome::Unreachable { reason: UnreachableReason::PresenceGone, detail: None }),
-            machine(
-                "down",
-                Liveness::Unknown,
-                CardOutcome::Unreachable { reason: UnreachableReason::ConnectFailed, detail: Some("ConnectionFailed".into()) },
-            ),
-            machine("auth", Liveness::Live, CardOutcome::Unreachable { reason: UnreachableReason::AuthRequired, detail: None }),
-            machine("odd", Liveness::Live, CardOutcome::Unreachable { reason: UnreachableReason::PinMismatch, detail: None }),
+            unreachable("down", UnreachableReason::ListenerOff, Some("ConnectionFailed")),
+            unreachable("auth", UnreachableReason::AuthRequired, None),
+            unreachable("odd", UnreachableReason::PinMismatch, None),
+            unreachable("noplace", UnreachableReason::RefusedByPeer, Some("studio cannot place you")),
+            unreachable("busy", UnreachableReason::ListenerUnavailable, None),
+            unreachable("weird", UnreachableReason::Unknown, None),
         ]));
-        assert!(out.contains("presence reports it gone; not asked"), "{out}");
-        assert!(out.contains("could not connect (ConnectionFailed)"), "{out}");
+        assert!(out.contains("its fleet listener did not answer (Connection"), "{out}");
+        assert!(out.contains("its fleet listener refused this machine (studi"), "{out}");
+        assert!(out.contains("its fleet listener cannot serve a card now"), "{out}");
+        assert!(out.contains("a reason this darkmux does not know"), "{out}");
+        assert!(out.contains("enable `fleet.listener`"), "the listener-off fix is named: {out}");
         assert!(out.contains("DARKMUX_SERVE_TOKEN") && out.contains("pinned tailnet node"), "the fixes are named: {out}");
     }
 
@@ -423,7 +518,7 @@ mod tests {
             (UnreachableReason::PinMismatch, "not their pinned tailnet node"),
         ];
         for (reason, want) in cases {
-            let out = text(&view(vec![machine("m", Liveness::Unknown, CardOutcome::Unreachable { reason, detail: None })]));
+            let out = text(&view(vec![unreachable("m", reason, None)]));
             assert!(out.contains(want), "{reason:?}: {out}");
             for (other, other_want) in cases.iter().filter(|(r, _)| *r != reason) {
                 assert!(!out.contains(other_want), "{reason:?} printed {other:?}'s remedy: {out}");
@@ -450,30 +545,29 @@ mod tests {
             images: vec![],
             workspace: false,
         };
-        let row = |accepts| view(vec![machine("studio", Liveness::Live, read(card("5.0.0"), CardSource::Listener, accepts))]);
+        let row = |accepts| view(vec![with_accepts(machine("studio", Liveness::Live, read(card("5.0.0"))), accepts)]);
         let yes = text(&row(AcceptsState::Granted { accepts: grant }));
         assert!(yes.contains("accepts from this machine: profiles deep; roles radio-host"), "{yes}");
-        let no = text(&row(AcceptsState::Refused { reason: "studio does not accept work from laptop".into() }));
-        assert!(no.contains("refuses this machine: studio does not accept work from laptop"), "{no}");
-        let off = text(&row(AcceptsState::Unknown { why: AcceptsUnknown::ListenerOff, detail: None }));
-        assert!(off.contains("accepts from this machine: unknown (its fleet listener did not answer"), "{off}");
-        assert!(!off.contains("refuses"), "a listener that is off is not a refusal: {off}");
+        let no = text(&row(AcceptsState::NotListed));
+        assert!(no.contains("does not list this machine: it takes no work from it"), "{no}");
+        assert!(no.contains("profiles: deep"), "a machine that lists nobody is still shown: {no}");
+        let unknown = text(&row(AcceptsState::Unknown));
+        assert!(unknown.contains("accepts from this machine: unknown"), "{unknown}");
+        assert!(!unknown.contains("does not list"), "unknown is not 'not listed': {unknown}");
     }
 
     /// A view a CLI gathered itself says what it did not observe.
     #[test]
     fn a_view_gathered_without_a_daemon_says_this_machines_readings_are_not_observed() {
-        let mut v = view(vec![machine("studio", Liveness::Live, CardOutcome::Unavailable { peer_version: None })]);
+        let mut v = view(vec![machine("studio", Liveness::Live, CardOutcome::Unavailable {
+            why: UnavailableWhy::NoCardRoute,
+            peer_version: None,
+            peer_version_source: None,
+        })]);
         assert!(!text(&v).contains("not observed"));
         v.gathered_by = GatheredBy::CliProcess;
         let out = text(&v);
         assert!(out.contains("not observed: no daemon running"), "{out}");
         assert!(out.contains("seats, thermal state and battery"), "{out}");
-    }
-
-    #[test]
-    fn an_empty_roster_says_it_is_a_single_machine_fleet() {
-        let out = text(&view(vec![]));
-        assert!(out.contains("single-machine fleet") && out.contains("darkmux machine add"), "{out}");
     }
 }

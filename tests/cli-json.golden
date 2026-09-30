@@ -39,8 +39,7 @@ flow tail  one flow record per line, verbatim; the record is pinned by FLOW_SCHE
 
 # types
 AbandonReason = "aborted" | "noterminal"
-AcceptsState = { accepts: CardAccepts; state: "granted" } | { reason: string; state: "refused" } | { why: AcceptsUnknown; detail: string | null; state: "unknown" }
-AcceptsUnknown = "this_machine" | "listener_off" | "listener_unavailable" | "not_dialed" | "withheld"
+AcceptsState = { accepts: CardAccepts; state: "granted" } | { state: "not_listed" } | { state: "this_machine" } | { state: "withheld" } | { state: "unknown" }
 ActiveWait
   scope: string
   subject: string
@@ -96,7 +95,6 @@ BoundRef
   value: uint64 | null
   source: string | null
 BudgetPolicy = "off" | "warn" | "wait"
-BusyPolicy = "refuse" | "queue"
 CapabilityProfile = { [key: string]: number }
 CardAccepts
   peer_name: string
@@ -109,23 +107,23 @@ CardBatteryGate
   refuse_start_below_min: boolean
   pause_running_below_min: boolean
   refusing_start: boolean | null
-CardEndpointKind = "managed" | "unmanaged" | "mixed" | "unresolved"
+CardBusyPolicy = "refuse" | "queue" | "unknown"
+CardEndpointKind = "managed" | "unmanaged" | "mixed" | "unresolved" | "unknown"
 CardGovernor
   thermal: ThermalNow | null
   battery: BatteryCharge | null
   battery_gate: CardBatteryGate
 CardHostedSeats
-  held: uint32
+  held_by_peer_jobs: uint32
   cap: uint32 | null
-  free: uint32 | null
-CardLocalSeats
-  held_models: string[]
-  free_models: string[]
+CardLocalSeat
+  model: string
+  held_by_peer_job: boolean
 CardModel
   id: string
   n_ctx: uint32 | null
   endpoint_kind: CardEndpointKind
-CardOutcome = { card: MachineCard; source: CardSource; accepts: AcceptsState; state: "available" } | { peer_version: string | null; state: "unavailable" } | { answered_as: string | null; state: "mismatch" } | { reason: UnreachableReason; detail: string | null; state: "unreachable" }
+CardOutcome = { card: MachineCard; source: CardSource; state: "available" } | { why: UnavailableWhy; peer_version: string | null; peer_version_source: VersionSource | null; state: "unavailable" } | { answered_as: string | null; state: "mismatch" } | { reason: UnreachableReason; detail: string | null; state: "unreachable" } | { state: "unknown" }
 CardProfile
   name: string
   description: string | null
@@ -133,11 +131,12 @@ CardProfile
   endpoint_kind: CardEndpointKind
   models: CardModel[]
 CardSeats
-  busy_policy: BusyPolicy
-  local: CardLocalSeats
+  busy_policy: CardBusyPolicy
+  counts_own_work: boolean
+  local: CardLocalSeat[]
   hosted: CardHostedSeats
   waiting: uint32
-CardSource = "local" | "listener" | "daemon"
+CardSource = "local" | "listener" | "unknown"
 CheckpointGate
   observations: uint
   degenerate_turns: uint64[]
@@ -340,11 +339,16 @@ FindingsSummary
   count: uint
   path: string
 FleetMachine
-  entry: RosterMachineEntry
+  entry: RosterMachineEntry | null
   is_this_machine: boolean
+  machine_uid: string | null
+  uid_source: UidSource | null
   liveness: Liveness
   last_beat_ms: uint64 | null
+  received_at_ms: uint64 | null
+  fetch_ms: uint64 | null
   card: CardOutcome
+  accepts: AcceptsState
 FleetView
   gathered_by: GatheredBy
   local_machine_id: string | null
@@ -388,7 +392,7 @@ GateOutcome
 Gates
   stream: StreamGate
   checkpoint: CheckpointGate
-GatheredBy = "daemon" | "cli_process"
+GatheredBy = "daemon" | "cli_process" | "unknown"
 GhVerbJson
   verb: string
   allowed: boolean
@@ -511,7 +515,7 @@ LessonsExport
   schema_version: int32
   lessons: Lesson[]
 LimitSource = "budget" | "physical_pool" | "unknown"
-Liveness = "live" | "gone" | "unknown"
+Liveness = "live" | "no_beat" | "unknown"
 LoadWindow
   samples: uint32
   span_ms: uint64
@@ -559,6 +563,7 @@ MachineCard
   governor: CardGovernor
   generated_at_ms: uint64
   gather_ms: uint64
+  cache_ttl_ms: uint64
 MachineLoad
   battery_health: BatteryHealthNow | null
   now: HostSampleNow
@@ -1112,7 +1117,9 @@ Tier2Config
 ToolPalette
   allow: string[]
   deny: string[]
-UnreachableReason = "presence_gone" | "bad_address" | "dns_failed" | "identity_unavailable" | "not_on_overlay" | "pin_mismatch" | "auth_required" | "connect_failed" | "bad_answer"
+UidSource = "card" | "declared" | "flow_history" | "unknown"
+UnavailableWhy = "no_card_route" | "other_schema_major" | "unparseable" | "unknown"
+UnreachableReason = "bad_address" | "dns_failed" | "identity_unavailable" | "not_on_overlay" | "pin_mismatch" | "listener_off" | "auth_required" | "refused_by_peer" | "listener_unavailable" | "bad_answer" | "unknown"
 UsageGroup
   endpoint?: string | null
   requested_model?: string | null
@@ -1158,6 +1165,7 @@ UtilityModel
   n_ctx: uint32 | null
 Verdict = "productive" | "struggled" | "inert-false-pass" | "failed"
 VerdictShift = "improved" | "regressed" | "no-change"
+VersionSource = "peer" | "presence" | "unknown"
 
 # untyped: fields (or types) that hold free-form JSON, each explained in DESIGN.md
 FindingRecord.context

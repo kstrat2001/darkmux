@@ -8,29 +8,34 @@
 //! arrive as 127.0.0.1 and could not be told apart.
 //!
 //! Two routes, `POST /fleet/work` (a job) and `GET /fleet/card` (this
-//! machine's card, with the caller's own allow-list entry: the one place a
-//! peer learns what this machine accepts from it), and every request on this
-//! listener (any path) passes the gate first: the fleet token, then the connecting node
-//! (the provider's answer for the socket's peer address), then the
-//! allow-list. The gate is [`darkmux_fleet::admit`]; the scope check after
-//! parsing is [`darkmux_fleet::check_scope`]. Both are pure and table-tested
-//! in `darkmux-fleet`; this module is the wiring, tested over real HTTP with
-//! a fake provider.
+//! machine's card, and what this machine lets the caller do), and every
+//! request on this listener (any path) is AUTHENTICATED first
+//! ([`darkmux_fleet::authenticate`]): the fleet token, then the connecting
+//! node (the provider's answer for the socket's peer address), then "not this
+//! machine". That is all a card read needs: a machine is visible to every
+//! fleet node that authenticates, whether or not it lets that node run work,
+//! and the grant is reported as data ([`crate::machine_card::CardGrant`]).
+//! A job is then AUTHORIZED ([`darkmux_fleet::authorize`], the allow-list) by
+//! the submission handler; the scope check after parsing is
+//! [`darkmux_fleet::check_scope`]. All are pure and table-tested in
+//! `darkmux-fleet`; this module is the wiring, tested over real HTTP with a
+//! fake provider.
 //!
-//! **Cost (#2916 self-QA).** The identity lookup runs the provider's tool
-//! once per request that carries the right token (~25 ms measured on the
-//! laptop, 2026-09-27), with no cache: a submitted job occupies the machine
-//! for minutes, so the lookup is noise next to it, and without a cache an
-//! `untrust` or a node leaving the network takes effect on the very next
-//! request. The allow-list is likewise read from `config.json` on every
-//! request (a few KB), so `machine trust` / `untrust` need no daemon
-//! restart. A caller without the token costs one constant-time compare and
-//! never makes this machine spawn anything. A card read costs the same
-//! lookup, and a peer's fleet view asks for one about every five seconds
-//! (its cache TTL): a caller that is not allow-listed is refused each time,
-//! and those refusal log lines are throttled per address ([`RefusalLog`]:
-//! five a minute, the rest counted), so a stale roster entry on another
-//! machine cannot grow this machine's log.
+//! **Cost (#2916 self-QA, #3004).** The identity lookup runs the provider's
+//! tool (~25 ms measured on the laptop, 2026-09-27). For a JOB it runs on
+//! every request, uncached: a submitted job occupies the machine for minutes,
+//! and without a cache a node leaving the network takes effect on the very
+//! next request. For a CARD read, which every peer's fleet view repeats about
+//! every five seconds, the answer is kept per address for
+//! [`IdentityCache::TTL`], and the card itself is served from a
+//! [`crate::machine_card::CardCache`], so a card read costs neither a
+//! provider call nor a specs gather while the caches are warm. The allow-list
+//! is read from `config.json` on every authorization (a few KB), so `machine
+//! trust` / `untrust` need no daemon restart. A caller without the token costs
+//! one constant-time compare and never makes this machine spawn anything.
+//! Refusal log lines are throttled per address ([`RefusalLog`]: five a minute,
+//! the rest counted), so a caller with the wrong token cannot grow this
+//! machine's log.
 
 use axum::{
     body::Bytes,
@@ -42,8 +47,8 @@ use axum::{
 };
 use darkmux_crew::dispatch::DispatchResult;
 use darkmux_fleet::{
-    Admitted, IdentityProvider, ProfileResolution, Refusal, ReplyStatus, ScopedJob, SeatBook, SeatGuard,
-    SubmissionReply, TokenCheck, Waited, WorkJob, WorkSubmission,
+    Admitted, IdentityProvider, NodeIdentity, ProfileResolution, Refusal, ReplyStatus, ScopedJob, SeatBook,
+    SeatGuard, SubmissionReply, TokenCheck, Waited, WorkJob, WorkSubmission,
 };
 use darkmux_types::config::{AcceptWorkEntry, BusyPolicy};
 use std::collections::BTreeMap;
@@ -99,6 +104,12 @@ pub(crate) struct FleetListenerState {
     /// submission before the job is accepted. `Err` carries the refusal
     /// text. Production: `darkmux_crew::user_files::preflight(Scope::Dispatch)`.
     pub config_preflight: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
+    /// (#3004) This machine's gathered card, kept for its TTL so a burst of
+    /// card reads costs one gather.
+    pub card_cache: Arc<crate::machine_card::CardCache>,
+    /// (#3004) Identity lookups for card reads, kept per address for a few
+    /// seconds. A job's admission never reads it.
+    pub identity_cache: Arc<IdentityCache>,
 }
 
 /// (#2947) The production config preflight a submission runs.
@@ -115,6 +126,7 @@ impl FleetListenerState {
             local_node_id: Arc::new(move || local.clone()),
             token: self.token.clone(),
             allow_list: self.allow_list.clone(),
+            identity_cache: self.identity_cache.clone(),
         }
     }
 
@@ -147,6 +159,8 @@ impl FleetListenerState {
             node_slots: Arc::new(KeySlots::new(NODE_CAP)),
             card_slots: Arc::new(KeySlots::new(CARD_NODE_CAP)),
             config_preflight: Arc::new(dispatch_config_preflight),
+            card_cache: crate::machine_card::process_card_cache(),
+            identity_cache: Arc::new(IdentityCache::new()),
         }
     }
 }
@@ -320,10 +334,55 @@ fn check_token(headers: &axum::http::HeaderMap, expected: Option<String>) -> Tok
     }
 }
 
-/// The three checks that make a caller a verified fleet peer: the fleet
-/// token, the connecting node as the overlay network names it, and the
-/// allow-list: [`darkmux_fleet::admit`] wired to its inputs. The listener's
-/// gate is the ONE place a caller is admitted, for a job and for a card read.
+/// Why a request is being admitted: a card read may be served from a recent
+/// identity lookup, a job may not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Purpose {
+    Card,
+    Work,
+}
+
+/// Identity lookups kept per peer address, for card reads only. Only a lookup
+/// that named a node is kept: an outage or an unplaced address is asked again
+/// the next time, so a recovered provider is seen at once.
+pub(crate) struct IdentityCache {
+    slots: Mutex<std::collections::HashMap<std::net::IpAddr, (std::time::Instant, NodeIdentity)>>,
+}
+
+impl IdentityCache {
+    /// How long a lookup is served to card reads. A card read states a card
+    /// and a grant to a caller that already holds the fleet token; a job never
+    /// reads this cache.
+    pub(crate) const TTL: std::time::Duration = std::time::Duration::from_secs(10);
+    /// The most addresses kept: a full table stops caching, it does not evict.
+    const MAX: usize = 256;
+
+    pub(crate) fn new() -> Self {
+        Self { slots: Mutex::new(Default::default()) }
+    }
+
+    fn get(&self, ip: std::net::IpAddr, now: std::time::Instant) -> Option<NodeIdentity> {
+        let slots = self.slots.lock().unwrap_or_else(|p| p.into_inner());
+        slots.get(&ip).filter(|(at, _)| now.duration_since(*at) < Self::TTL).map(|(_, n)| n.clone())
+    }
+
+    fn put(&self, ip: std::net::IpAddr, node: NodeIdentity, now: std::time::Instant) {
+        let mut slots = self.slots.lock().unwrap_or_else(|p| p.into_inner());
+        if slots.len() >= Self::MAX && !slots.contains_key(&ip) {
+            slots.retain(|_, (at, _)| now.duration_since(*at) < Self::TTL);
+            if slots.len() >= Self::MAX {
+                return;
+            }
+        }
+        slots.insert(ip, (now, node));
+    }
+}
+
+/// The two steps that make a caller a fleet peer this machine works for:
+/// [`Admission::authenticate`] (the fleet token, the connecting node as the
+/// overlay network names it, not this machine) and [`Admission::authorize`]
+/// (the allow-list). The gate runs the first for every request; a job runs the
+/// second as well, and a card read reports its result as data.
 #[derive(Clone)]
 pub(crate) struct Admission {
     pub provider: Arc<dyn IdentityProvider>,
@@ -334,19 +393,37 @@ pub(crate) struct Admission {
     pub token: Arc<dyn Fn() -> Option<String> + Send + Sync>,
     /// The allow-list, read per request. An error refuses everything.
     pub allow_list: Arc<dyn Fn() -> Result<AllowList, String> + Send + Sync>,
+    pub identity_cache: Arc<IdentityCache>,
 }
 
 impl Admission {
-    /// Token, then the connecting node, then the allow-list, in that order.
-    /// A caller without the token is answered before this machine reads its
-    /// allow-list or runs the provider's tool. On success the fingerprint of
-    /// the token in force comes back with the peer, so a queued job can be
-    /// checked against it again later.
-    pub(crate) async fn admit(
+    /// The identity lookup for `peer`: the provider's answer, or for a card
+    /// read a recent one.
+    fn identify(&self, peer: std::net::IpAddr, purpose: Purpose) -> Result<Option<NodeIdentity>, String> {
+        let now = std::time::Instant::now();
+        if purpose == Purpose::Card {
+            if let Some(node) = self.identity_cache.get(peer, now) {
+                return Ok(Some(node));
+            }
+        }
+        let answer = self.provider.identify(peer).map_err(|e| format!("{e:#}"));
+        if let (Purpose::Card, Ok(Some(node))) = (purpose, &answer) {
+            self.identity_cache.put(peer, node.clone(), now);
+        }
+        answer
+    }
+
+    /// Token, then the connecting node, then "not this machine", in that
+    /// order. A caller without the token is answered before this machine runs
+    /// the provider's tool. On success the fingerprint of the token in force
+    /// comes back with the node, so a queued job can be checked against it
+    /// again later.
+    pub(crate) async fn authenticate(
         &self,
         peer: std::net::IpAddr,
         headers: &axum::http::HeaderMap,
-    ) -> Result<(Admitted, TokenFingerprint), Refusal> {
+        purpose: Purpose,
+    ) -> Result<(NodeIdentity, TokenFingerprint), Refusal> {
         let expected = (self.token)();
         let token = check_token(headers, expected.clone());
         let fingerprint = match (token, expected.as_deref()) {
@@ -355,25 +432,18 @@ impl Admission {
             (TokenCheck::Match, None) | (TokenCheck::NotConfigured, _) => return Err(Refusal::NoTokenConfigured),
         };
         // The identity lookup is blocking (a subprocess) and runs only after
-        // the token matched: `admit` calls this closure after its own token
-        // check, and reads the allow-list after the lookup.
+        // the token matched: `authenticate` calls this closure after its own
+        // token check.
         let this = self.clone();
         let provider_name = self.provider.provider_name().to_string();
         let decision = tokio::task::spawn_blocking(move || {
             let local_id = (this.local_node_id)();
             let name = this.provider.provider_name().to_string();
-            darkmux_fleet::admit(
-                token,
-                || this.provider.identify(peer).map_err(|e| format!("{e:#}")),
-                &name,
-                peer,
-                local_id.as_deref(),
-                || (this.allow_list)(),
-            )
+            darkmux_fleet::authenticate(token, || this.identify(peer, purpose), &name, peer, local_id.as_deref())
         })
         .await;
         match decision {
-            Ok(Ok(admitted)) => Ok((admitted, fingerprint)),
+            Ok(Ok(node)) => Ok((node, fingerprint)),
             Ok(Err(refusal)) => Err(refusal),
             Err(e) => Err(Refusal::IdentityUnavailable {
                 provider: provider_name,
@@ -381,6 +451,23 @@ impl Admission {
             }),
         }
     }
+
+    /// What an authenticated node may do here: its allow-list entry. Read
+    /// after the identity lookup, so an `untrust` during it is seen.
+    pub(crate) async fn authorize(&self, node: NodeIdentity) -> Result<Admitted, Refusal> {
+        let allow = self.allow_list.clone();
+        match tokio::task::spawn_blocking(move || darkmux_fleet::authorize(&node, || allow())).await {
+            Ok(result) => result,
+            Err(e) => Err(Refusal::BadRequest(format!("the allow-list check did not finish: {e}"))),
+        }
+    }
+}
+
+/// A caller that passed [`Admission::authenticate`]: the node the overlay
+/// network named. It carries no grant; a handler that needs one authorizes.
+#[derive(Clone)]
+pub(crate) struct Authenticated {
+    pub node: NodeIdentity,
 }
 
 /// Which slot table a request counts against once its caller is admitted.
@@ -392,9 +479,11 @@ fn slots_for<'a>(state: &'a FleetListenerState, req: &Request) -> &'a Arc<KeySlo
     }
 }
 
-/// The gate on EVERY request: token, network identity, allow-list
-/// ([`Admission::admit`]). A request with no peer address (no `ConnectInfo`)
-/// is refused: absence of evidence is not a peer.
+/// The gate on EVERY request: token, network identity, not this machine
+/// ([`Admission::authenticate`]). The allow-list is not the gate's: a job
+/// authorizes in its handler, a card read reports the grant. A request with no
+/// peer address (no `ConnectInfo`) is refused: absence of evidence is not a
+/// peer.
 async fn gate(State(state): State<FleetListenerState>, mut req: Request, next: Next) -> Response {
     let Some(peer) = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip()) else {
         return refuse(
@@ -406,16 +495,18 @@ async fn gate(State(state): State<FleetListenerState>, mut req: Request, next: N
             },
         );
     };
-    match state.admission().admit(peer, req.headers()).await {
-        Ok((admitted, fingerprint)) => {
-            let Some(_node_slot) = slots_for(&state, &req).try_take(admitted.peer_name.clone()) else {
-                return refuse(&state, Some(peer), &Refusal::TooManyAtOnce { peer: admitted.peer_name.clone() });
+    let is_card = req.method() == axum::http::Method::GET && req.uri().path() == darkmux_fleet::CARD_PATH;
+    let purpose = if is_card { Purpose::Card } else { Purpose::Work };
+    match state.admission().authenticate(peer, req.headers(), purpose).await {
+        Ok((node, fingerprint)) => {
+            let Some(_node_slot) = slots_for(&state, &req).try_take(node.node_id.clone()) else {
+                return refuse(&state, Some(peer), &Refusal::TooManyAtOnce { peer: node.name.clone() });
             };
             // (#2916 stage 2 review F1) Which token was in force, so a job
             // queued now can be checked against the token in force when its
             // seat frees. A fingerprint, never the token.
             req.extensions_mut().insert(fingerprint);
-            req.extensions_mut().insert(admitted);
+            req.extensions_mut().insert(Authenticated { node });
             next.run(req).await
         }
         Err(refusal) => refuse(&state, Some(peer), &refusal),
@@ -695,14 +786,18 @@ impl Worker {
     }
 }
 
-/// `GET /fleet/card`: this machine's card and the caller's own allow-list
-/// entry. The gate has admitted the caller by the time this runs (token, the
-/// node the socket's address belongs to, the allow-list); the entry it read
-/// is the one stated, and no other. Blocking gather, off the async threads.
-async fn card_handler(Extension(admitted): Extension<Admitted>) -> Response {
-    let accepts = crate::machine_card::CardAccepts::from(&admitted);
-    match tokio::task::spawn_blocking(crate::machine_card::gather_local_card).await {
-        Ok(card) => Json(crate::machine_card::ListenerCard { card, accepts }).into_response(),
+/// `GET /fleet/card`: this machine's card and what it lets the caller do.
+/// The gate has authenticated the caller (token, the node the socket's
+/// address belongs to, not this machine); the allow-list is read here and its
+/// answer is stated as the grant: the caller's own entry and no other, or "not
+/// listed", or "could not say". A caller with no entry still gets the card:
+/// visibility is not an execution grant. The card comes from the card cache;
+/// a gather runs off the async threads.
+async fn card_handler(State(state): State<FleetListenerState>, Extension(auth): Extension<Authenticated>) -> Response {
+    let grant = crate::machine_card::CardGrant::from_authorization(&state.admission().authorize(auth.node).await);
+    let cache = state.card_cache.clone();
+    match tokio::task::spawn_blocking(move || cache.get(crate::machine_card::gather_local_card)).await {
+        Ok(card) => Json(crate::machine_card::ListenerCard { card, grant }).into_response(),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "darkmux serve: machine card gather panicked\n").into_response(),
     }
 }
@@ -710,10 +805,15 @@ async fn card_handler(Extension(admitted): Extension<Admitted>) -> Response {
 async fn submit_handler(
     State(state): State<FleetListenerState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
-    Extension(admitted): Extension<Admitted>,
+    Extension(auth): Extension<Authenticated>,
     Extension(token): Extension<TokenFingerprint>,
     body: Bytes,
 ) -> Response {
+    // A job needs the allow-list entry the gate did not require.
+    let admitted = match state.admission().authorize(auth.node).await {
+        Ok(a) => a,
+        Err(r) => return refuse(&state, Some(peer_addr.ip()), &r),
+    };
     // (#2947 review M1) A job this machine would refuse at its dispatch
     // preflight (a bad enum config value) is refused HERE, synchronously,
     // before a seat is taken or the job is accepted: otherwise the sender
@@ -919,7 +1019,7 @@ pub(crate) struct ConnLimits {
 impl ConnLimits {
     pub(crate) const PRODUCTION: ConnLimits = ConnLimits {
         max_conns: 32,
-        per_ip: 3,
+        per_ip: PER_IP_CONNECTIONS,
         header_read_timeout: std::time::Duration::from_secs(3),
         conn_deadline: std::time::Duration::from_secs(60 * 60 + 300),
     };
@@ -928,6 +1028,14 @@ impl ConnLimits {
 /// Requests one admitted node may have in flight at once (#2916 round 3 C5),
 /// and (#2916 stage 2) jobs it may have queued at once.
 pub(crate) const NODE_CAP: usize = 4;
+
+/// Connections one peer address may hold at once: every job it may have in
+/// flight AND every card read it may make, so a peer whose jobs hold
+/// [`NODE_CAP`] connections for the whole job (a waited job holds its
+/// connection until it finishes) can still read this machine's card. The cap
+/// is enforced at accept, before the router knows the path, so it is the sum
+/// of the two per-node caps, not either one.
+pub(crate) const PER_IP_CONNECTIONS: usize = NODE_CAP + CARD_NODE_CAP;
 
 /// Card reads one admitted node may have in flight at once. A card is one
 /// gather (a few subprocess reads), so a couple at a time is generous for
@@ -1151,6 +1259,9 @@ mod tests {
 
     const TOKEN: &str = "fleet-test-token";
 
+    /// The harness's card cache TTL: long, so two reads in one test are one gather.
+    const CARD_TTL: Duration = Duration::from_secs(600);
+
     fn allow() -> AllowList {
         let mut m = AllowList::new();
         m.insert(
@@ -1202,7 +1313,7 @@ mod tests {
 
     /// An identity provider a test can change mid-run: a node leaving the
     /// network, the provider going down, another node taking the address.
-    struct Switchable(Mutex<StaticIdentityProvider>, Mutex<Duration>);
+    struct Switchable(Mutex<StaticIdentityProvider>, Mutex<Duration>, std::sync::atomic::AtomicUsize);
 
     impl Switchable {
         /// Make every later `identify` take `d` (a slow provider tool).
@@ -1222,6 +1333,7 @@ mod tests {
             "static"
         }
         fn identify(&self, peer: std::net::IpAddr) -> anyhow::Result<Option<darkmux_fleet::NodeIdentity>> {
+            self.2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let delay = *self.1.lock().unwrap();
             std::thread::sleep(delay);
             self.0.lock().unwrap().identify(peer)
@@ -1288,6 +1400,7 @@ mod tests {
                 down: down.then(|| "daemon not running".to_string()),
             }),
             Mutex::new(Duration::ZERO),
+            Default::default(),
         ));
         let token_now = Arc::new(Mutex::new(Some(TOKEN.to_string())));
         let token_read = token_now.clone();
@@ -1334,6 +1447,8 @@ mod tests {
             refusal_log: refusal_log.clone(),
             node_slots: Arc::new(KeySlots::new(NODE_CAP)),
             card_slots: Arc::new(KeySlots::new(CARD_NODE_CAP)),
+            card_cache: Arc::new(crate::machine_card::CardCache::new(CARD_TTL)),
+            identity_cache: Arc::new(IdentityCache::new()),
             config_preflight,
         };
         let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1487,7 +1602,7 @@ mod tests {
     }
 
     /// The promise: the listener's card read states the verified caller's own
-    /// allow-list entry and no other sender's.
+    /// grant and no other sender's.
     #[test]
     fn a_card_read_states_the_verified_callers_entry_and_no_ones_elses() {
         let h = start(Some(laptop()), false, 0);
@@ -1504,45 +1619,145 @@ mod tests {
         );
         let (code, body) = get_card(&card_url(&h), TOKEN);
         assert_eq!(code, 200, "{body}");
-        assert_eq!(body["accepts"]["peer_name"], "macbook-pro");
-        assert_eq!(body["accepts"]["profiles"], serde_json::json!(["host", "small", "cloud"]));
-        assert_eq!(body["accepts"]["roles"], serde_json::json!(["radio-host"]));
-        assert_eq!(body["accepts"]["workspace"], false);
+        assert_eq!(body["grant"]["state"], "listed");
+        assert_eq!(body["grant"]["accepts"]["peer_name"], "macbook-pro");
+        assert_eq!(body["grant"]["accepts"]["profiles"], serde_json::json!(["host", "small", "cloud"]));
+        assert_eq!(body["grant"]["accepts"]["roles"], serde_json::json!(["radio-host"]));
+        assert_eq!(body["grant"]["accepts"]["workspace"], false);
         assert_eq!(body["card"]["card_schema_version"], crate::machine_card::CARD_SCHEMA_VERSION);
-        assert!(body["card"].get("accepts").is_none(), "the card itself states no grant: {body}");
+        assert!(body["card"].get("grant").is_none() && body["card"].get("accepts").is_none(), "the card itself states no grant: {body}");
         let text = body.to_string();
         assert!(!text.contains("mini-1") && !text.contains("secret-profile"), "another sender's grant leaked: {text}");
     }
 
-    /// The card read is behind the same gate as a job: token, node, allow-list.
-    /// A refusal is the listener's own sentence, so the asker can tell a
-    /// refused machine from one with the listener off.
+    /// The promise of symmetric visibility: a card read is AUTHENTICATED, not
+    /// authorized. A node the network names, holding the token, gets this
+    /// machine's card whether or not the allow-list has an entry for it; the
+    /// grant says which. A job from the same node is still refused by name.
     #[test]
-    fn a_card_read_is_refused_at_the_gate_with_the_listeners_sentence() {
+    fn a_verified_node_with_no_allow_list_entry_still_gets_the_card_and_the_grant_says_not_listed() {
+        let h = start(Some(test_node("nPHONE", "phone", "127.0.0.1")), false, 0);
+        let (code, body) = get_card(&card_url(&h), TOKEN);
+        assert_eq!(code, 200, "a machine that grants nothing is still visible: {body}");
+        assert_eq!(body["grant"], serde_json::json!({"state": "not_listed"}));
+        assert_eq!(body["card"]["card_schema_version"], crate::machine_card::CARD_SCHEMA_VERSION);
+        assert_eq!(h.refusal_log.written.load(std::sync::atomic::Ordering::SeqCst), 0, "a read is not a refusal");
+        let (code, reply) = post(&h, TOKEN, job("s-phone", None), true);
+        assert_eq!(code, 403, "{reply:?}");
+        assert!(reply.reason.unwrap().starts_with("studio does not accept work from phone"));
+    }
+
+    /// An allow-list this machine cannot read, or one that names the caller
+    /// twice, is "unknown", never "not listed": the card is still served.
+    #[test]
+    fn an_allow_list_that_cannot_say_states_an_unknown_grant_and_still_serves_the_card() {
+        let h = start(Some(laptop()), false, 0);
+        h.allow.lock().unwrap().insert(
+            "macbook-pro-again".into(),
+            AcceptWorkEntry {
+                node_id: Some("nLAPTOP".into()),
+                profiles: Some(vec!["host".into()]),
+                roles: None,
+                images: None,
+                workspace: None,
+                extras: Default::default(),
+            },
+        );
+        let (code, body) = get_card(&card_url(&h), TOKEN);
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(body["grant"], serde_json::json!({"state": "unknown"}));
+        assert!(body["card"]["profiles"].is_array(), "the card is intact: {body}");
+    }
+
+    /// The gate on a card read is authentication: a wrong token, a node the
+    /// network does not place, and a provider that cannot answer are refused
+    /// with the listener's own sentence, so the asker can tell a refused
+    /// machine from one with the listener off.
+    #[test]
+    fn a_card_read_is_refused_at_the_gate_when_the_caller_cannot_be_authenticated() {
         let h = start(Some(laptop()), false, 0);
         let (code, body) = get_card(&card_url(&h), "wrong-token");
         assert_eq!(code, 401, "{body}");
         assert!(body["reason"].as_str().unwrap().contains("fleet token is missing or does not match"), "{body}");
-        let h = start(Some(test_node("nPHONE", "phone", "127.0.0.1")), false, 0);
-        let (code, body) = get_card(&card_url(&h), TOKEN);
-        assert_eq!(code, 403, "{body}");
-        assert!(body["reason"].as_str().unwrap().starts_with("studio does not accept work from phone"), "{body}");
-        assert!(body.get("card").is_none() && body.get("accepts").is_none());
         let h = start(None, false, 0);
         let (code, body) = get_card(&card_url(&h), TOKEN);
         assert_eq!(code, 403, "{body}");
         assert!(body["reason"].as_str().unwrap().contains("did not come from a node"), "{body}");
+        assert!(body.get("card").is_none() && body.get("grant").is_none());
+        let h = start(Some(laptop()), true, 0);
+        let (code, body) = get_card(&card_url(&h), TOKEN);
+        assert_eq!(code, 503, "{body}");
+        assert!(body["reason"].as_str().unwrap().contains("cannot tell which machine sent this request"), "{body}");
     }
 
-    /// A poller that is not allow-listed asks every few seconds; its refusals
+    /// A poller that cannot be placed asks every few seconds; its refusals
     /// share the per-address log budget, so the log stays bounded.
     #[test]
     fn refused_card_reads_share_the_per_address_log_budget() {
-        let h = start(Some(test_node("nPHONE", "phone", "127.0.0.1")), false, 0);
+        let h = start(None, false, 0);
         for _ in 0..30 {
             assert_eq!(get_card(&card_url(&h), TOKEN).0, 403);
         }
         assert_eq!(h.refusal_log.written.load(std::sync::atomic::Ordering::SeqCst), u64::from(RefusalLog::PER_WINDOW));
+    }
+
+    /// The promise: a burst of card reads costs one gather. The second read
+    /// is the first's card (same `generated_at_ms`), and the card records the
+    /// TTL it is served under.
+    #[test]
+    fn card_reads_are_served_from_the_card_cache_and_the_card_says_so() {
+        let h = start(Some(laptop()), false, 0);
+        let (_, first) = get_card(&card_url(&h), TOKEN);
+        std::thread::sleep(Duration::from_millis(30));
+        let (_, second) = get_card(&card_url(&h), TOKEN);
+        assert_eq!(first["card"]["generated_at_ms"], second["card"]["generated_at_ms"], "the second read gathered again");
+        assert_eq!(second["card"]["cache_ttl_ms"], CARD_TTL.as_millis() as u64);
+    }
+
+    /// The promise: a card read may reuse a recent identity lookup for its
+    /// address, and a job never does. Two card reads run the provider once;
+    /// two jobs run it twice.
+    #[test]
+    fn card_reads_reuse_an_identity_lookup_and_jobs_never_do() {
+        let lookups = |h: &Harness| h.network.2.load(std::sync::atomic::Ordering::SeqCst);
+        let h = start(Some(laptop()), false, 0);
+        assert_eq!(get_card(&card_url(&h), TOKEN).0, 200);
+        assert_eq!(get_card(&card_url(&h), TOKEN).0, 200);
+        assert_eq!(lookups(&h), 1, "the second card read reused the first's lookup");
+        let h = start(Some(laptop()), false, 0);
+        assert_eq!(post(&h, TOKEN, job("s-a", None), true).0, 200);
+        assert_eq!(post(&h, TOKEN, job("s-b", None), true).0, 200);
+        assert_eq!(lookups(&h), 2, "every job is placed by the provider, so untrust and a node leaving take effect at once");
+    }
+
+    /// A failed lookup is not kept: the provider coming back is seen by the
+    /// next read, not one TTL later.
+    #[test]
+    fn a_failed_identity_lookup_is_not_cached() {
+        let h = start(Some(laptop()), true, 0);
+        assert_eq!(get_card(&card_url(&h), TOKEN).0, 503);
+        h.network.set(vec![laptop()], None);
+        assert_eq!(get_card(&card_url(&h), TOKEN).0, 200, "the recovered provider is asked at once");
+    }
+
+    /// (#3004 A2) Connections are capped per address at accept, before the
+    /// router knows the path. A peer whose waited jobs hold every connection
+    /// it may use for jobs still gets its card: the cap leaves room for reads.
+    #[test]
+    fn a_peer_whose_jobs_hold_every_job_connection_can_still_read_the_card() {
+        use std::io::Write;
+        const { assert!(PER_IP_CONNECTIONS >= NODE_CAP + CARD_NODE_CAP) };
+        let h = start(Some(laptop()), false, 0);
+        let addr = h.url.trim_start_matches("http://").split('/').next().unwrap().to_string();
+        let mut held = Vec::new();
+        for _ in 0..NODE_CAP {
+            let mut s = std::net::TcpStream::connect(&addr).unwrap();
+            s.write_all(b"POST /fleet/work HTTP/1.1\r\nHost: x\r\n").unwrap();
+            held.push(s);
+        }
+        std::thread::sleep(Duration::from_millis(150));
+        let (code, body) = get_card(&card_url(&h), TOKEN);
+        assert_eq!(code, 200, "{NODE_CAP} connections held for jobs starved the card read: {body}");
     }
 
     /// (#2947 review M1) A receiver whose own config would refuse the
@@ -2096,6 +2311,8 @@ mod tests {
             refusal_log: Arc::new(RefusalLog::new()),
             node_slots: Arc::new(KeySlots::new(NODE_CAP)),
             card_slots: Arc::new(KeySlots::new(CARD_NODE_CAP)),
+            card_cache: Arc::new(crate::machine_card::CardCache::new(Duration::ZERO)),
+            identity_cache: Arc::new(IdentityCache::new()),
             config_preflight: Arc::new(|| Ok(())),
         }
     }
@@ -2170,6 +2387,8 @@ mod tests {
             refusal_log: Arc::new(RefusalLog::new()),
             node_slots: Arc::new(KeySlots::new(NODE_CAP)),
             card_slots: Arc::new(KeySlots::new(CARD_NODE_CAP)),
+            card_cache: Arc::new(crate::machine_card::CardCache::new(Duration::ZERO)),
+            identity_cache: Arc::new(IdentityCache::new()),
             config_preflight: Arc::new(|| Ok(())),
         };
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -2368,6 +2587,8 @@ mod tests {
             refusal_log: Arc::new(RefusalLog::new()),
             node_slots: Arc::new(KeySlots::new(NODE_CAP)),
             card_slots: Arc::new(KeySlots::new(CARD_NODE_CAP)),
+            card_cache: Arc::new(crate::machine_card::CardCache::new(Duration::ZERO)),
+            identity_cache: Arc::new(IdentityCache::new()),
             config_preflight: Arc::new(|| Ok(())),
         };
         let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2426,6 +2647,8 @@ mod tests {
             refusal_log: Arc::new(RefusalLog::new()),
             node_slots: Arc::new(KeySlots::new(1)),
             card_slots: Arc::new(KeySlots::new(CARD_NODE_CAP)),
+            card_cache: Arc::new(crate::machine_card::CardCache::new(Duration::ZERO)),
+            identity_cache: Arc::new(IdentityCache::new()),
             config_preflight: Arc::new(|| Ok(())),
         };
         let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2472,7 +2695,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(300));
         let (code, body) = get_card(&format!("{base}{}", darkmux_fleet::CARD_PATH), TOKEN);
         assert_eq!(code, 200, "the job holds the node's only request slot: {body}");
-        assert_eq!(body["accepts"]["peer_name"], "macbook-pro");
+        assert_eq!(body["grant"]["accepts"]["peer_name"], "macbook-pro");
         assert_eq!(running.join().unwrap().0, 200);
     }
 

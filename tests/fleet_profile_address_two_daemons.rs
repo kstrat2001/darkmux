@@ -19,14 +19,16 @@
 //!   receiver runs the real dispatch path without Docker or a model.
 //!
 //! The same two daemons also prove the fleet view and the machine card end to
-//! end, over the path a real fleet uses: `alpha`'s `GET /fleet/view` gets
+//! end, over the one channel a fleet has: `alpha`'s `GET /fleet/view` gets
 //! `beta`'s card from `beta`'s fleet LISTENER (a real, token-bearing request
 //! from one daemon to the other's overlay address), with `accepts` granted for
-//! `alpha`. With `beta`'s listener off, the row falls back to `beta`'s daemon
-//! and `accepts` is unknown; with `alpha` not on `beta`'s allow-list, `accepts`
-//! is refused with `beta`'s own sentence. A peer with no `/machine/card` route
-//! reads "card unavailable", slow peers are asked in parallel, and `beta`'s
-//! daemon card never carries `accepts`.
+//! `alpha`. A peer that does not list `alpha` still gives its card, with
+//! `accepts` not listed (visibility is not an execution grant). With `beta`'s
+//! listener off, the row is unreachable with a typed reason: there is no
+//! second channel. A listener with no card route reads "card unavailable", slow
+//! peers are asked in parallel, a card carrying enum values from a newer
+//! darkmux still shows the rest of the card, and every view has a row for the
+//! machine that gathered it, whether or not its roster names it.
 //!
 //! Needs a binary built with the test-only `e2e-fleet-loopback` feature (a
 //! production listener refuses loopback): [`bin`] builds one. The target
@@ -325,7 +327,7 @@ fn boot_with(busy_policy: &str, profiles: Option<&[&str]>, models: BetaModels, e
         models,
         extra_roster,
         beta_listener: true,
-        alpha_dials_dead_listener_port: false,
+        alpha_dials_port: None,
     })
 }
 
@@ -339,13 +341,14 @@ struct Setup<'a> {
     extra_roster: &'a [(&'a str, String)],
     /// Whether beta runs its fleet listener.
     beta_listener: bool,
-    /// Whether alpha's config names a fleet listener port nothing holds, so
-    /// a roster peer other than beta answers only on its daemon.
-    alpha_dials_dead_listener_port: bool,
+    /// The fleet listener port alpha's config names, when not beta's own: every
+    /// roster peer is dialed there (the fake identity tool puts them all at
+    /// 127.0.0.1), so it stands in for a peer whose listener is something else.
+    alpha_dials_port: Option<u16>,
 }
 
 fn boot_setup(setup: &Setup) -> Fleet {
-    let Setup { busy_policy, profiles, models, extra_roster, beta_listener, alpha_dials_dead_listener_port } = *setup;
+    let Setup { busy_policy, profiles, models, extra_roster, beta_listener, alpha_dials_port } = *setup;
     let accept_work = match profiles {
         Some(profiles) => serde_json::json!({"alpha": {"node_id": "nALPHA", "profiles": profiles, "roles": ["radio-host"], "workspace": false}}),
         None => serde_json::json!({}),
@@ -354,7 +357,7 @@ fn boot_setup(setup: &Setup) -> Fleet {
     let (alpha, beta) = (Node::new(root.path(), "alpha"), Node::new(root.path(), "beta"));
     let mock = MockChat::spawn();
     let fleet_port = free_port();
-    let alpha_listener_port = if alpha_dials_dead_listener_port { free_port() } else { fleet_port };
+    let alpha_listener_port = alpha_dials_port.unwrap_or(fleet_port);
     let (alpha_port, beta_port) = (free_port(), free_port());
 
     // alpha: sender. Its roster places beta at 127.0.0.1; its identity tool
@@ -371,9 +374,8 @@ fn boot_setup(setup: &Setup) -> Fleet {
     )
     .unwrap();
     std::fs::write(alpha.home.join("profiles.json"), r#"{"profiles":{}}"#).unwrap();
-    // beta's entry names its viewer port too: it is where alpha falls back to
-    // for beta's card when beta's listener is off. (Work submission and the
-    // card's first ask drop the port and use the fleet listener's.)
+    // beta's entry names its viewer port too; work submission and the card
+    // read drop it and use the fleet listener's.
     let mut machines = serde_json::Map::new();
     let mut add = |id: &str, address: String| {
         machines.insert(id.to_string(), serde_json::json!({"id": id, "address": address, "added_unix_ms": 1, "loopback_intended": true}));
@@ -587,25 +589,38 @@ fn http_get(port: u16, path: &str, headers: &[(&str, &str)]) -> (u16, serde_json
     (status, serde_json::from_str(body).unwrap_or(serde_json::Value::Null))
 }
 
-/// A darkmux of an older version: `/health` answers, every other path (the
-/// card route included) is a 404 after `delay_ms`.
-fn old_peer(delay_ms: u64) -> u16 {
+/// A darkmux listener of an older version: it answers every path (a card
+/// read included) with a 404 after `delay_ms`.
+fn old_listener(delay_ms: u64) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut s) = stream else { continue };
             std::thread::spawn(move || {
-                let req = read_request(&mut s);
-                let (status, body) = if req.starts_with("GET /health") {
-                    ("200 OK", r#"{"darkmux_version":"4.9.1"}"#)
-                } else {
-                    std::thread::sleep(Duration::from_millis(delay_ms));
-                    ("404 Not Found", "{}")
-                };
+                let _ = read_request(&mut s);
+                std::thread::sleep(Duration::from_millis(delay_ms));
+                let _ = write!(s, "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}");
+            });
+        }
+    });
+    port
+}
+
+/// A listener that answers every request with `body`, as a peer on a newer
+/// darkmux might.
+fn fixed_listener(body: String) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let body = body.clone();
+            std::thread::spawn(move || {
+                let _ = read_request(&mut s);
                 let _ = write!(
                     s,
-                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
             });
@@ -618,9 +633,16 @@ fn row<'a>(view: &'a serde_json::Value, id: &str) -> &'a serde_json::Value {
     view["machines"].as_array().and_then(|rows| rows.iter().find(|r| r["entry"]["id"] == id)).unwrap_or_else(|| panic!("no {id} row in {view}"))
 }
 
+/// The row a view has for the machine that gathered it.
+fn own_row(view: &serde_json::Value) -> &serde_json::Value {
+    let rows: Vec<_> = view["machines"].as_array().unwrap().iter().filter(|r| r["is_this_machine"] == true).collect();
+    assert_eq!(rows.len(), 1, "exactly one row is this machine: {view}");
+    rows[0]
+}
+
 /// The promise: alpha's view of beta is beta's OWN card, fetched over HTTP
 /// from beta's fleet listener with the fleet token, and it states what beta
-/// accepts from alpha.
+/// accepts from alpha, beside the card.
 #[test]
 fn a_daemons_fleet_view_shows_the_other_daemons_card_from_its_listener_with_accepts_granted() {
     let f = boot("refuse");
@@ -631,10 +653,13 @@ fn a_daemons_fleet_view_shows_the_other_daemons_card_from_its_listener_with_acce
     let beta = row(&view, "beta");
     assert_eq!(beta["card"]["state"], "available", "{beta}");
     assert_eq!(beta["card"]["source"], "listener", "the card came from beta's listener: {beta}");
-    assert_eq!(beta["card"]["accepts"]["state"], "granted", "{beta}");
-    assert_eq!(beta["card"]["accepts"]["accepts"]["peer_name"], "alpha");
-    assert_eq!(beta["card"]["accepts"]["accepts"]["profiles"], serde_json::json!(["cloud"]));
-    assert_eq!(beta["card"]["accepts"]["accepts"]["roles"], serde_json::json!(["radio-host"]));
+    assert_eq!(beta["accepts"]["state"], "granted", "{beta}");
+    assert_eq!(beta["accepts"]["accepts"]["peer_name"], "alpha");
+    assert_eq!(beta["accepts"]["accepts"]["profiles"], serde_json::json!(["cloud"]));
+    assert_eq!(beta["accepts"]["accepts"]["roles"], serde_json::json!(["radio-host"]));
+    assert_eq!(beta["is_this_machine"], false);
+    assert_eq!(beta["uid_source"], "card", "the row's uid is the verified card's: {beta}");
+    assert!(beta["received_at_ms"].is_number() && beta["fetch_ms"].is_number(), "{beta}");
     let card = &beta["card"]["card"];
     assert_eq!(card["specs"]["machine_id"], "beta", "the card is beta's own, not alpha's: {card}");
     let cloud = card["profiles"].as_array().unwrap().iter().find(|p| p["name"] == "cloud").expect("beta's cloud profile");
@@ -642,119 +667,201 @@ fn a_daemons_fleet_view_shows_the_other_daemons_card_from_its_listener_with_acce
     assert_eq!(card["default_profile"], "cloud");
     assert_eq!(card["seats"]["busy_policy"], "refuse", "beta's listener is running: {card}");
     assert_eq!(card["seats"]["hosted"]["cap"], 1);
-    assert!(card.get("accepts").is_none(), "a card states no grant itself: {card}");
+    assert_eq!(card["seats"]["counts_own_work"], false, "the seat block says it does not count beta's own work: {card}");
+    assert!(card["seats"]["hosted"].get("free").is_none(), "no field reads as free: {card}");
+    assert!(card.get("accepts").is_none() && card.get("grant").is_none(), "a card states no grant itself: {card}");
+    assert_eq!(card["cache_ttl_ms"], 2000, "beta serves its card from a cache and says so");
     assert_eq!(view["cache_ttl_ms"], 5000);
 }
 
-/// With beta's listener off, nothing answers on its listener port: the card
-/// comes from beta's daemon and `accepts` is UNKNOWN, not refused.
+/// This machine's card is its own row of `/fleet/view`, present whether or not
+/// the roster names it: alpha's roster has beta only, and beta's has nothing.
 #[test]
-fn with_the_peers_listener_off_the_row_falls_back_to_its_daemon_and_accepts_is_unknown() {
+fn every_daemons_view_has_a_row_for_itself_even_when_its_roster_lacks_it() {
+    let f = boot("refuse");
+    for (name, port) in [("alpha", f.alpha_port), ("beta", f.beta_port)] {
+        let (status, view) = http_get(port, "/fleet/view", &[]);
+        assert_eq!(status, 200, "{view}");
+        let me = own_row(&view);
+        assert_eq!(me["entry"], serde_json::Value::Null, "{name}'s roster has no entry for {name}: {me}");
+        assert_eq!(me["card"]["state"], "available", "{me}");
+        assert_eq!(me["card"]["source"], "local", "{me}");
+        assert_eq!(me["card"]["card"]["specs"]["machine_id"], name, "{me}");
+        assert_eq!(me["accepts"]["state"], "this_machine");
+        assert_eq!(me["liveness"], "live");
+    }
+    // The daemon's card route is gone: this row is the way to read it.
+    let (status, _) = http_get(f.beta_port, "/machine/card", &[]);
+    assert_eq!(status, 404, "a daemon serves no machine card of its own");
+}
+
+/// A roster entry that is another name for a machine that answers is
+/// attributed to no one: beta's card arriving on `alias`'s row is a mismatch,
+/// and its contents are not shown there.
+#[test]
+fn a_roster_entry_naming_the_wrong_machine_reads_mismatch() {
+    let f = boot_with("refuse", Some(&["cloud"]), BetaModels::Hosted, &[("alias", format!("127.0.0.1:{}", free_port()))]);
+    let (_, view) = http_get(f.alpha_port, "/fleet/view", &[]);
+    let alias = row(&view, "alias");
+    assert_eq!(alias["card"]["state"], "mismatch", "{alias}");
+    assert_eq!(alias["card"]["answered_as"], "beta", "{alias}");
+    assert_eq!(alias["accepts"]["state"], "unknown", "a grant said by another machine is not the alias's: {alias}");
+    assert_eq!(row(&view, "beta")["card"]["state"], "available");
+}
+
+/// With beta's listener off, nothing answers on its listener port: the row is
+/// unreachable with a TYPED reason. There is no second channel to fall back to.
+#[test]
+fn with_the_peers_listener_off_the_row_is_unreachable_with_a_typed_reason() {
     let f = boot_setup(&Setup {
         busy_policy: "refuse",
         profiles: Some(&["cloud"]),
         models: BetaModels::Hosted,
         extra_roster: &[],
         beta_listener: false,
-        alpha_dials_dead_listener_port: false,
+        alpha_dials_port: None,
     });
     let (status, view) = http_get(f.alpha_port, "/fleet/view", &[]);
     assert_eq!(status, 200, "{view}");
     let beta = row(&view, "beta");
-    assert_eq!(beta["card"]["state"], "available", "{beta}");
-    assert_eq!(beta["card"]["source"], "daemon", "{beta}");
-    assert_eq!(beta["card"]["accepts"]["state"], "unknown", "{beta}");
-    assert_eq!(beta["card"]["accepts"]["why"], "listener_off", "{beta}");
-    assert_eq!(beta["card"]["card"]["specs"]["machine_id"], "beta");
-    assert!(beta["card"]["card"].get("seats").is_none(), "no listener, no seats: {beta}");
+    assert_eq!(beta["card"]["state"], "unreachable", "{beta}");
+    assert_eq!(beta["card"]["reason"], "listener_off", "{beta}");
+    assert_eq!(beta["accepts"]["state"], "unknown", "{beta}");
+    assert_eq!(beta["liveness"], "unknown", "no Redis here: presence says nothing, and the peer was still asked");
+    let (status, _) = http_get(f.beta_port, "/machine/card", &[]);
+    assert_eq!(status, 404, "beta's daemon is not a fallback: it serves no card");
 }
 
-/// With alpha not on beta's allow-list the listener REFUSES it, in its own
-/// words, and the card still comes (from the daemon).
+/// The promise of symmetric visibility: with alpha NOT on beta's allow-list,
+/// beta still gives alpha its card, and says it does not list alpha. A machine
+/// that grants nothing is still visible to every fleet node.
 #[test]
-fn a_peer_that_does_not_trust_this_machine_refuses_it_in_its_own_words() {
+fn a_peer_that_does_not_list_this_machine_still_gives_its_card_with_accepts_not_listed() {
     let f = boot_trusting("refuse", None);
     let (status, view) = http_get(f.alpha_port, "/fleet/view", &[]);
     assert_eq!(status, 200, "{view}");
     let beta = row(&view, "beta");
     assert_eq!(beta["card"]["state"], "available", "{beta}");
-    assert_eq!(beta["card"]["source"], "daemon", "{beta}");
-    assert_eq!(beta["card"]["accepts"]["state"], "refused", "{beta}");
-    let reason = beta["card"]["accepts"]["reason"].as_str().unwrap();
-    assert!(reason.contains("does not accept work from"), "the listener's sentence: {reason}");
+    assert_eq!(beta["card"]["source"], "listener", "{beta}");
+    assert_eq!(beta["accepts"]["state"], "not_listed", "{beta}");
+    assert_eq!(beta["card"]["card"]["specs"]["machine_id"], "beta");
+    // The same on the wire: the listener's own answer, beside the card.
+    let auth = format!("Bearer {TOKEN}");
+    let (code, answer) = http_get(f.fleet_port, darkmux_fleet::CARD_PATH, &[("Authorization", &auth)]);
+    assert_eq!(code, 200, "{answer}");
+    assert_eq!(answer["grant"], serde_json::json!({"state": "not_listed"}));
+    // Work is still refused by name: visibility is not an execution grant.
+    let out = dispatch(&f.alpha, "cloud@beta", &[]);
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("does not accept work from"), "{}", text(&out));
 }
 
-/// Seats are live: a job running on beta's hosted seat shows as held in
-/// beta's card.
+/// Seats are live: a job running on beta's hosted seat shows as held by a peer
+/// job in beta's card, as the listener serves it.
 #[test]
-fn a_running_job_shows_as_a_held_seat_in_the_peers_card() {
+fn a_running_job_shows_as_a_seat_held_by_a_peer_job_in_the_peers_card() {
     let f = boot("refuse");
-    f.mock.delay_ms.store(4_000, Ordering::SeqCst);
+    f.mock.delay_ms.store(8_000, Ordering::SeqCst);
     let first = dispatch(&f.alpha, "cloud@beta", &["--no-wait"]);
     assert!(first.status.success(), "{}", text(&first));
+    let auth = format!("Bearer {TOKEN}");
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let (_, card) = http_get(f.beta_port, "/machine/card", &[]);
-        if card["seats"]["hosted"]["held"] == 1 {
-            assert_eq!(card["seats"]["hosted"]["free"], 0);
+        let (_, answer) = http_get(f.fleet_port, darkmux_fleet::CARD_PATH, &[("Authorization", &auth)]);
+        if answer["card"]["seats"]["hosted"]["held_by_peer_jobs"] == 1 {
+            assert_eq!(answer["card"]["seats"]["counts_own_work"], false);
             break;
         }
-        assert!(Instant::now() < deadline, "beta never showed the held seat: {card}");
-        std::thread::sleep(Duration::from_millis(200));
+        assert!(Instant::now() < deadline, "beta never showed the held seat: {answer}");
+        std::thread::sleep(Duration::from_millis(300));
     }
 }
 
-/// The daemon's card states no grant, whoever asks. The listener's card read
-/// states the caller's own allow-list entry, and only with the fleet token from
-/// a node the network names (the fake tool names 127.0.0.1 as alpha).
+/// The listener's card read states the caller's own grant beside the card,
+/// and only with the fleet token from a node the network names (the fake
+/// tool names 127.0.0.1 as alpha).
 #[test]
-fn the_daemons_card_states_no_grant_and_the_listeners_states_the_callers_own() {
+fn the_listeners_card_states_the_callers_own_grant_beside_the_card() {
     let f = boot("refuse");
     let auth = format!("Bearer {TOKEN}");
-    let (_, daemon_card) = http_get(f.beta_port, "/machine/card", &[("Authorization", &auth)]);
-    assert!(daemon_card.get("accepts").is_none(), "the daemon states no grant: {daemon_card}");
-
     let (code, _) = http_get(f.fleet_port, darkmux_fleet::CARD_PATH, &[]);
     assert_eq!(code, 401, "no token");
     let (code, wrong) = http_get(f.fleet_port, darkmux_fleet::CARD_PATH, &[("Authorization", "Bearer nope")]);
     assert_eq!(code, 401, "a wrong token: {wrong}");
-    let (code, card) = http_get(f.fleet_port, darkmux_fleet::CARD_PATH, &[("Authorization", &auth)]);
-    assert_eq!(code, 200, "{card}");
-    assert_eq!(card["accepts"]["peer_name"], "alpha", "{card}");
-    assert_eq!(card["accepts"]["profiles"], serde_json::json!(["cloud"]));
-    assert_eq!(card["accepts"]["roles"], serde_json::json!(["radio-host"]));
-    assert_eq!(card["accepts"]["workspace"], false);
-    assert_eq!(card["card"]["specs"]["machine_id"], "beta");
+    let (code, answer) = http_get(f.fleet_port, darkmux_fleet::CARD_PATH, &[("Authorization", &auth)]);
+    assert_eq!(code, 200, "{answer}");
+    assert_eq!(answer["grant"]["state"], "listed", "{answer}");
+    assert_eq!(answer["grant"]["accepts"]["peer_name"], "alpha", "{answer}");
+    assert_eq!(answer["grant"]["accepts"]["profiles"], serde_json::json!(["cloud"]));
+    assert_eq!(answer["grant"]["accepts"]["roles"], serde_json::json!(["radio-host"]));
+    assert_eq!(answer["grant"]["accepts"]["workspace"], false);
+    assert_eq!(answer["card"]["specs"]["machine_id"], "beta");
+    assert!(answer["card"].get("grant").is_none(), "the card itself carries no grant: {answer}");
 }
 
-/// A peer on an older darkmux shows as "card unavailable", and two slow
-/// peers are asked at the same time, not one after the other.
+/// A listener on an older darkmux (no card route) shows as "card unavailable"
+/// and three peers behind slow listeners are asked at the same time, not one
+/// after the other.
 #[test]
-fn an_old_peer_is_card_unavailable_and_slow_peers_are_asked_in_parallel() {
-    let (slow1, slow2) = (old_peer(1_200), old_peer(1_200));
-    // Alpha's listener client dials a port nothing holds, so the two old
-    // peers (which the fake identity tool also places at 127.0.0.1) answer
-    // only on their daemons, as a peer with its listener off does.
-    let roster = [("slow1", format!("127.0.0.1:{slow1}")), ("slow2", format!("127.0.0.1:{slow2}"))];
+fn a_listener_with_no_card_route_is_card_unavailable_and_slow_peers_are_asked_in_parallel() {
+    let old = old_listener(1_200);
+    // Alpha's config names `old` as the fleet listener port, and the fake
+    // identity tool puts every roster peer at 127.0.0.1, so beta and both
+    // extra entries are all asked there.
+    let roster = [("slow1", format!("127.0.0.1:{}", free_port())), ("slow2", format!("127.0.0.1:{}", free_port()))];
     let f = boot_setup(&Setup {
         busy_policy: "refuse",
         profiles: Some(&["cloud"]),
         models: BetaModels::Hosted,
         extra_roster: &roster,
         beta_listener: true,
-        alpha_dials_dead_listener_port: true,
+        alpha_dials_port: Some(old),
     });
     let started = Instant::now();
     let (status, view) = http_get(f.alpha_port, "/fleet/view", &[]);
     let took = started.elapsed();
     assert_eq!(status, 200, "{view}");
-    for id in ["slow1", "slow2"] {
+    for id in ["beta", "slow1", "slow2"] {
         let r = row(&view, id);
         assert_eq!(r["card"]["state"], "unavailable", "{r}");
-        assert_eq!(r["card"]["peer_version"], "4.9.1", "the version its /health reports: {r}");
+        assert_eq!(r["card"]["why"], "no_card_route", "{r}");
+        assert_eq!(r["card"]["peer_version"], serde_json::Value::Null, "no presence here, so no version is known: {r}");
     }
-    assert_eq!(row(&view, "beta")["card"]["state"], "available");
-    assert!(took < Duration::from_millis(2_300), "two 1.2 s peers took {took:?}: asked one after the other");
+    assert!(took < Duration::from_millis(2_600), "three 1.2 s peers took {took:?}: asked one after the other");
+}
+
+/// The promise of forward compatibility, over a real listener: a card whose
+/// enum values a newer darkmux invented (an endpoint kind, a busy policy, a
+/// grant state) still shows the rest of the card, and each unknown reads as
+/// `unknown`, never as a known value.
+#[test]
+fn a_card_carrying_values_from_a_newer_darkmux_still_shows_the_rest_of_the_card() {
+    let f = boot("refuse");
+    // beta's real listener answer, with future values swapped in.
+    let auth = format!("Bearer {TOKEN}");
+    let (_, mut answer) = http_get(f.fleet_port, darkmux_fleet::CARD_PATH, &[("Authorization", &auth)]);
+    answer["card"]["profiles"][0]["endpoint_kind"] = serde_json::json!("fleet");
+    answer["card"]["seats"]["busy_policy"] = serde_json::json!("preempt");
+    answer["grant"] = serde_json::json!({"state": "delegated", "to": "a hub"});
+    let newer = fixed_listener(answer.to_string());
+    let g = boot_setup(&Setup {
+        busy_policy: "refuse",
+        profiles: Some(&["cloud"]),
+        models: BetaModels::Hosted,
+        extra_roster: &[],
+        beta_listener: false,
+        alpha_dials_port: Some(newer),
+    });
+    let (status, view) = http_get(g.alpha_port, "/fleet/view", &[]);
+    assert_eq!(status, 200, "{view}");
+    let beta = row(&view, "beta");
+    assert_eq!(beta["card"]["state"], "available", "an unknown enum value must not hide the card: {beta}");
+    let card = &beta["card"]["card"];
+    assert_eq!(card["profiles"][0]["endpoint_kind"], "unknown", "{card}");
+    assert_eq!(card["seats"]["busy_policy"], "unknown", "{card}");
+    assert_eq!(beta["accepts"]["state"], "unknown", "an unknown grant is not listed and not refused: {beta}");
+    assert_eq!(card["specs"]["machine_id"], "beta", "the rest of the card is intact");
+    assert!(card["profiles"].as_array().unwrap().iter().any(|p| p["name"] == "cloud"));
 }
 
 /// The humor and per-call budget alpha's config sets: what a peer's answering
