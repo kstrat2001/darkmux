@@ -92,6 +92,7 @@ pub fn execute_job_with(
             .context("workdir validation failed")?;
         job.workdir = Some(canonical.to_string_lossy().into_owned());
     }
+    assert_boundary_still_holds(&job, &profile)?;
     let single_shot = job.single_shot;
     let mut opts = job.into_dispatch_opts();
     opts.profile_name = Some(profile);
@@ -107,6 +108,34 @@ pub fn execute_job_with(
         Ok(r) => r,
         Err(_) => Err(anyhow::anyhow!("the dispatch panicked; the listener survived it")),
     }
+}
+
+/// The job's boundary against what execution resolves NOW. The scope check
+/// approved the job against the profile as it read then; dispatch resolves
+/// the profile by name again, so a registry edited in between could point it
+/// at a hosted endpoint the boundary forbids. This asks the resolution
+/// dispatch itself routes on (`dispatch_resolves_remote`, which fails closed)
+/// and refuses before anything is reconciled, loaded or sent.
+///
+/// Known residual: dispatch reads the registry once more after this check, a
+/// window of a few milliseconds in which a further edit still wins. The full
+/// fix is to carry the resolved target in `DispatchOpts` so dispatch never
+/// resolves it again; that field would touch every `DispatchOpts` literal.
+fn assert_boundary_still_holds(job: &WorkJob, profile: &str) -> Result<()> {
+    let holds = match job.boundary {
+        None => true,
+        Some(crate::Boundary::ManagedOnly) => {
+            !darkmux_crew::dispatch::dispatch_resolves_remote(&job.role_id, Some(profile), None)
+        }
+        Some(crate::Boundary::Unknown) => false,
+    };
+    if holds {
+        return Ok(());
+    }
+    Err(anyhow::anyhow!(
+        "the job's boundary no longer holds: profile {profile} no longer resolves to a managed endpoint here \
+         (or the boundary is one this darkmux does not know); nothing was sent"
+    ))
 }
 
 /// Give a `single_shot` job's dispatch what the sender's local seat would
@@ -219,6 +248,8 @@ mod tests {
             published_at_unix_ms: 1,
             published_by_machine: None,
             single_shot: None,
+            boundary: None,
+            mode: crate::SubmissionMode::Run,
         }
     }
 
@@ -266,6 +297,59 @@ mod tests {
         });
         assert!(r.is_ok());
         assert_eq!(seen, Some((Some("resolved-host".into()), Some("laptop".into()), None)));
+    }
+
+    /// Run `f` with `DARKMUX_PROFILES` naming a registry file holding `json`.
+    fn with_profiles<T>(json: &str, f: impl FnOnce() -> T) -> T {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("profiles.json");
+        std::fs::write(&file, json).unwrap();
+        let prev = std::env::var("DARKMUX_PROFILES").ok();
+        unsafe { std::env::set_var("DARKMUX_PROFILES", &file) };
+        let out = f();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_PROFILES", v),
+                None => std::env::remove_var("DARKMUX_PROFILES"),
+            }
+        }
+        out
+    }
+
+    const MANAGED_HOST: &str = r#"{"profiles":{"host":{"models":[{"id":"m","n_ctx":8000}]}}}"#;
+    const HOSTED_HOST: &str = r#"{"profiles":{"host":{"models":[{"id":"h","n_ctx":8000,"endpoint":"az"}]}},
+        "endpoints":{"az":{"url":"https://example.invalid/v1"}}}"#;
+
+    /// The scope check resolved `host` as a managed seat and approved a
+    /// `managed_only` job; the operator (or anything that writes the
+    /// registry) then edited `host` to point at a hosted endpoint before the
+    /// job ran. Execution resolves the profile again, so the boundary is
+    /// asserted against what it resolves NOW: the job is refused and never
+    /// dispatched.
+    #[test]
+    #[serial_test::serial]
+    fn a_managed_only_job_is_refused_when_its_profile_was_repointed_at_a_hosted_endpoint() {
+        let mut j = job();
+        j.role_id = "radio-host".into();
+        j.boundary = Some(crate::Boundary::ManagedOnly);
+        j.image = None;
+        let dispatched = std::cell::Cell::new(false);
+        let run = |registry: &str, j: &WorkJob| {
+            with_profiles(registry, || {
+                execute_job_with(j.clone(), "host".into(), "laptop".into(), |_| {
+                    dispatched.set(true);
+                    ok_result()
+                })
+            })
+        };
+        assert!(run(MANAGED_HOST, &j).is_ok(), "the profile as it was checked still runs");
+        assert!(dispatched.replace(false));
+        let err = run(HOSTED_HOST, &j).unwrap_err();
+        assert!(format!("{err:#}").contains("no longer resolves to a managed endpoint"), "{err:#}");
+        assert!(!dispatched.get(), "a hosted endpoint never saw the job");
+        // A job with no boundary is the sender's own choice: it still runs.
+        j.boundary = None;
+        assert!(run(HOSTED_HOST, &j).is_ok());
     }
 
     fn ok_result() -> Result<DispatchResult> {

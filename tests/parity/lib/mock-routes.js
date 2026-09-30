@@ -13,6 +13,7 @@ const { readFileSync } = require("fs");
 const path = require("path");
 const { CORPUS_DIR, META_JSON } = require("./paths.js");
 const { GRAPH_FIXTURE_MISSION_ID } = require("./graph-fixture.js");
+const { viewRow } = require("./layout-fixture.js");
 
 function loadMeta() {
   return JSON.parse(readFileSync(META_JSON, "utf8"));
@@ -20,6 +21,38 @@ function loadMeta() {
 
 function fixture(file) {
   return readFileSync(path.join(CORPUS_DIR, file), "utf8");
+}
+
+/**
+ * `GET /fleet/view` for the corpus fleet: one row per machine the corpus's
+ * presence fixture names. The machine serving the page (the one whose
+ * `machine-specs.json` the corpus holds) reads itself; every other machine is
+ * a declared peer whose card the daemon read and which reports no hardware.
+ * Built from the same rows the layout suites use (`viewRow`), so the two
+ * harnesses draw a fleet card from one shape.
+ */
+function corpusFleetView() {
+  const own = JSON.parse(fixture("machine-specs.json"));
+  const live = JSON.parse(fixture("fleet-machines-live.json"));
+  const rows = live.machines.map((m) => {
+    if (m.display_name === own.machine_id) {
+      return viewRow({ ...own, machine_uid: m.machine_uid }, { is_this_machine: true, accepts: { state: "this_machine" } });
+    }
+    return viewRow(
+      { machine_id: m.display_name, machine_uid: m.machine_uid, cpu_brand: null, ram_total_bytes: null },
+      { entry: { id: m.display_name, address: "corpus-peer.internal:8765", added_unix_ms: 1 } },
+    );
+  });
+  return {
+    gathered_by: "daemon",
+    local_machine_id: own.machine_id,
+    presence: { state: "off" },
+    roster_error: null,
+    fetched_at_ms: 0,
+    cache_ttl_ms: 0,
+    gather_ms: 0,
+    machines: rows,
+  };
 }
 
 /**
@@ -72,6 +105,7 @@ function installCorpusRoutes(page, meta) {
     // same fleet would answer no differently for the goldens this corpus
     // feeds.
     if (p === "/fleet/roster") return json("fleet-roster.json");
+    if (p === "/fleet/view") return jsonInline(corpusFleetView());
     if (p === "/machine/resources") return json("machine-resources.json");
     if (p === "/machine/specs") return json("machine-specs.json");
     // `/health`'s `lifecycle_policy`: the numbers the viewer judges a run by
@@ -201,6 +235,7 @@ function installBlankRoutes(page) {
       "/fleet/machines/live",
       "/fleet/dispatches/live",
       "/fleet/roster",
+      "/fleet/view",
       "/machine/resources",
       "/machine/specs",
     ];

@@ -445,7 +445,67 @@ const MACHINE_SPECS = {
   generated_at_ms: 0,
 };
 
-async function installLayoutRoutes(page, { blockStream = false, machineSpecs = false, holdRuns = false, roster = false, holdPresence = false, presence } = {}) {
+/** `GET /fleet/view` (`FleetView`) for a suite that asks (`fleetView`): the
+ *  rows the daemon gathered, each with its card outcome, liveness and grant.
+ *  Without it the route stays a 404, so every other page draws its cards from
+ *  the flow window alone, as before. */
+function fleetViewOf(rows) {
+  return {
+    gathered_by: "daemon",
+    local_machine_id: MACHINE.machine_id,
+    presence: { state: "off" },
+    roster_error: null,
+    fetched_at_ms: 0,
+    cache_ttl_ms: 0,
+    gather_ms: 0,
+    machines: rows,
+  };
+}
+
+/** One row of the view: a machine whose card the daemon read. `specs`
+ *  overrides the card's `specs`; `over` overrides the row itself. */
+function viewRow(specs, over = {}) {
+  return {
+    entry: null,
+    is_this_machine: false,
+    machine_uid: specs.machine_uid ?? null,
+    uid_source: null,
+    liveness: "live",
+    last_beat_ms: null,
+    received_at_ms: null,
+    fetch_ms: 12,
+    card: { state: "available", source: "listener", card: { specs: { ...MACHINE_SPECS, utility_model: null, ...specs } } },
+    accepts: { state: "unknown" },
+    ...over,
+  };
+}
+
+/** The fixture machine as the daemon serving the page reports itself. */
+const SELF_ROW = viewRow(MACHINE, { is_this_machine: true, accepts: { state: "this_machine" } });
+
+/** A declared peer the daemon read a card from, that sends no presence beat
+ *  (its Redis is off) and lets this machine run a profile and a role. */
+const PEER_ROW = viewRow(
+  { machine_id: "layout-peer", machine_uid: null, cpu_brand: "Apple M1 Max", ram_total_bytes: 34359738368 },
+  {
+    entry: { id: "layout-peer", address: "100.64.0.8:8765", added_unix_ms: 1 },
+    liveness: "no_beat",
+    accepts: { state: "granted", accepts: { peer_name: MACHINE.machine_id, profiles: ["diff-review"], roles: ["radio-host"], images: [], workspace: false } },
+  },
+);
+
+/** A declared peer the daemon could not read a card from and hears no beat
+ *  from: the "offline" card. */
+const OFFLINE_ROW = viewRow(
+  { machine_id: "layout-offline", machine_uid: null },
+  {
+    entry: { id: "layout-offline", address: "100.64.0.9:8765", added_unix_ms: 1 },
+    liveness: "no_beat",
+    card: { state: "unreachable", reason: "listener_off", detail: null },
+  },
+);
+
+async function installLayoutRoutes(page, { blockStream = false, machineSpecs = false, holdRuns = false, roster = false, holdPresence = false, presence, fleetView } = {}) {
   await page.route("**/*", async (route) => {
     const url = new URL(route.request().url());
     const p = url.pathname;
@@ -455,12 +515,15 @@ async function installLayoutRoutes(page, { blockStream = false, machineSpecs = f
     if (holdRuns && p === "/runs") return new Promise(() => {});
     // (#2958 review M1) `holdPresence`: `/fleet/machines/live` never
     // answers, so "offline" cannot be claimed yet. `roster`: one declared
-    // machine that is never seen, which renders as an offline card.
+    // machine the view cannot read and never hears, which renders as an
+    // offline card beside this machine's own.
     if (holdPresence && p === "/fleet/machines/live") return new Promise(() => {});
     // (#2902 step 5) Redis session presence for a state that has it: the
     // sessions the daemon reports as beating right now.
     if (presence && p === "/fleet/dispatches/live") return json({ dispatches: presence, meta: { sources: { fleet: { state: "ok" } }, complete: true } });
     if (roster && p === "/fleet/roster") return json({ machines: [{ id: "layout-offline", address: "100.64.0.9:8765", added_unix_ms: 1 }], error: null });
+    const viewRows = fleetView ?? (roster ? [SELF_ROW, OFFLINE_ROW] : null);
+    if (viewRows && p === "/fleet/view") return json(fleetViewOf(viewRows));
     if (/^\/flow\/\d{4}-\d{2}-\d{2}\/stream$/.test(p)) {
       if (blockStream) return route.fulfill({ status: 503, contentType: "text/plain", body: "layout harness: stream refused\n" });
       return route.continue();
@@ -505,4 +568,4 @@ const VIEWPORTS = {
   phone: { width: 390, height: 844 },
 };
 
-module.exports = { STATES, HEROES, MULTI, ALL, PLAYBACK_NOW, VIEWPORTS, installLayoutRoutes, measure };
+module.exports = { STATES, HEROES, MULTI, ALL, PLAYBACK_NOW, VIEWPORTS, SELF_ROW, PEER_ROW, OFFLINE_ROW, viewRow, installLayoutRoutes, measure };

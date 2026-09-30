@@ -115,6 +115,7 @@ pub(crate) fn table() -> Vec<Route> {
         json!(FleetDispatchesLiveResponse, "/fleet/dispatches/live", fleet_dispatches_live_handler),
         json!(FleetMachinesLiveResponse, "/fleet/machines/live", fleet_machines_live_handler),
         json!(FleetRosterResponse, "/fleet/roster", fleet_roster_handler),
+        json!(fleet_view::FleetView, "/fleet/view", fleet_view::fleet_view_handler),
         json!(LabRunsResponse, "/lab/runs", lab_runs_handler),
         json!(LabRunDetailResponse, "/lab/run/detail", lab_run_detail_handler),
         json!(LabRunEventsResponse, "/lab/run/events", lab_run_events_handler),
@@ -136,13 +137,17 @@ pub(crate) fn router() -> Router<AppState> {
 }
 
 /// The table as the golden renders it: one `GET <path>  <reply>` line per route,
-/// in table order, then the fleet listener's route.
+/// in table order, then the fleet listener's routes.
 #[cfg(test)]
 pub(crate) fn render_table() -> String {
     let mut out: String = table().iter().map(|r| format!("GET {}  {}\n", r.path, r.reply.render())).collect();
     out.push_str(&format!(
         "POST {}  ndjson (darkmux_fleet submission; fleet listener, not the viewer daemon)\n",
         darkmux_fleet::SUBMISSION_PATH
+    ));
+    out.push_str(&format!(
+        "GET {}  json ListenerCard (fleet listener, not the viewer daemon; the caller's own grant rides with the card)\n",
+        darkmux_fleet::CARD_PATH
     ));
     out
 }
@@ -204,10 +209,14 @@ mod tests {
         }
     }
 
-    /// The fleet listener's own route is the one the golden names.
+    /// The fleet listener's own routes are the ones the golden names, and its
+    /// router answers exactly those (the gate's refusal, not a 404, for a
+    /// caller with no token).
     #[test]
-    fn the_fleet_listener_serves_the_submission_path_the_golden_names() {
-        assert!(render_table().contains(&format!("POST {}", darkmux_fleet::SUBMISSION_PATH)));
+    fn the_fleet_listener_serves_the_paths_the_golden_names() {
+        let table = render_table();
+        assert!(table.contains(&format!("POST {}", darkmux_fleet::SUBMISSION_PATH)));
+        assert!(table.contains(&format!("GET {}", darkmux_fleet::CARD_PATH)));
     }
 
     /// The router answers every table path (a routed handler may answer 400 or

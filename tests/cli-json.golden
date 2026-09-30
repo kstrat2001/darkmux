@@ -10,7 +10,7 @@ flow integrity-check  IntegrityCheckOutput
 flow status  FlowStatus
 lab loop  LoopReport
 lab loop --ab  LoopAbReport
-machine list  MachineListOutput
+machine list  FleetView
 machine resources  ModelLedger
 machine resources <peer>  MachineResourcesResponse
 machine status  MachineStatusOutput
@@ -39,6 +39,7 @@ flow tail  one flow record per line, verbatim; the record is pinned by FLOW_SCHE
 
 # types
 AbandonReason = "aborted" | "noterminal"
+AcceptsState = { accepts: CardAccepts; state: "granted" } | { state: "not_listed" } | { state: "this_machine" } | { state: "withheld" } | { state: "unknown" }
 ActiveWait
   scope: string
   subject: string
@@ -95,6 +96,47 @@ BoundRef
   source: string | null
 BudgetPolicy = "off" | "warn" | "wait"
 CapabilityProfile = { [key: string]: number }
+CardAccepts
+  peer_name: string
+  profiles: string[]
+  roles: string[]
+  images: string[]
+  workspace: boolean
+CardBatteryGate
+  floor_pct: uint8
+  refuse_start_below_min: boolean
+  pause_running_below_min: boolean
+  refusing_start: boolean | null
+CardBusyPolicy = "refuse" | "queue" | "unknown"
+CardEndpointKind = "managed" | "unmanaged" | "mixed" | "unresolved" | "unknown"
+CardGovernor
+  thermal: ThermalNow | null
+  battery: BatteryCharge | null
+  battery_gate: CardBatteryGate
+CardHostedSeats
+  held_by_peer_jobs: uint32
+  cap: uint32 | null
+CardLocalSeat
+  model: string
+  held_by_peer_job: boolean
+CardModel
+  id: string
+  n_ctx: uint32 | null
+  endpoint_kind: CardEndpointKind
+CardOutcome = { card: MachineCard; source: CardSource; state: "available" } | { why: UnavailableWhy; peer_version: string | null; peer_version_source: VersionSource | null; state: "unavailable" } | { answered_as: string | null; state: "mismatch" } | { reason: UnreachableReason; detail: string | null; state: "unreachable" } | { state: "unknown" }
+CardProfile
+  name: string
+  description: string | null
+  is_default: boolean
+  endpoint_kind: CardEndpointKind
+  models: CardModel[]
+CardSeats
+  busy_policy: CardBusyPolicy
+  counts_own_work: boolean
+  local: CardLocalSeat[]
+  hosted: CardHostedSeats
+  waiting: uint32
+CardSource = "local" | "listener" | "unknown"
 ChargeState = "charging" | "held" | "discharging" | "full" | "unknown"
 CheckpointGate
   observations: uint
@@ -297,6 +339,26 @@ FindingRecord
 FindingsSummary
   count: uint
   path: string
+FleetMachine
+  entry: RosterMachineEntry | null
+  is_this_machine: boolean
+  machine_uid: string | null
+  uid_source: UidSource | null
+  liveness: Liveness
+  last_beat_ms: uint64 | null
+  received_at_ms: uint64 | null
+  fetch_ms: uint64 | null
+  card: CardOutcome
+  accepts: AcceptsState
+FleetView
+  gathered_by: GatheredBy
+  local_machine_id: string | null
+  presence: SourceState
+  roster_error: string | null
+  fetched_at_ms: uint64
+  cache_ttl_ms: uint64
+  gather_ms: uint64
+  machines: FleetMachine[]
 FlowScan
   files_total: uint
   files_skipped: uint
@@ -331,6 +393,7 @@ GateOutcome
 Gates
   stream: StreamGate
   checkpoint: CheckpointGate
+GatheredBy = "daemon" | "cli_process" | "unknown"
 GhVerbJson
   verb: string
   allowed: boolean
@@ -453,6 +516,7 @@ LessonsExport
   schema_version: int32
   lessons: Lesson[]
 LimitSource = "budget" | "physical_pool" | "unknown"
+Liveness = "live" | "no_beat" | "unknown"
 LoadWindow
   samples: uint32
   span_ms: uint64
@@ -489,28 +553,18 @@ LoopReport
   duration_ms: uint128
   loop_config: string[]
   notes: string[]
-MachineListOutput
-  roster_path: string
-  roster_version: string
-  local_machine_id: string | null
-  machines: MachineListRow[]
-MachineListRow
-  id: string
-  address: string
-  dialed_address: string
-  is_this_machine: boolean
-  description: string | null
-  added_unix_ms: uint64
-  machine_uid: string | null
-  reachable: boolean
-  resolved_address: string
-  probe_ms: uint64
-  probe_error: string | null
-  specs: MachineSpecsResponse | null
-  specs_auth_required: boolean
-  specs_route_missing: boolean
-  specs_unverified: boolean
-  specs_unreadable_peer_version: string | null
+MachineCard
+  card_schema_version: string
+  work_job_schema_version: string
+  specs: MachineSpecsResponse
+  profiles: CardProfile[]
+  default_profile: string | null
+  profiles_error: string | null
+  seats?: CardSeats | null
+  governor: CardGovernor
+  generated_at_ms: uint64
+  gather_ms: uint64
+  cache_ttl_ms: uint64
 MachineLoad
   battery_health: BatteryHealthNow | null
   now: HostSampleNow
@@ -799,6 +853,13 @@ RoleShow
   tool_palette: ToolPalette
   escalation: EscalationKind
   escalation_target: string | null
+RosterMachineEntry
+  id: string
+  address: string
+  description?: string | null
+  added_unix_ms: uint64
+  machine_uid?: string | null
+  loopback_intended?: boolean | null
 Run
   id: string
   kind: RunKind
@@ -1057,6 +1118,9 @@ Tier2Config
 ToolPalette
   allow: string[]
   deny: string[]
+UidSource = "card" | "declared" | "flow_history" | "unknown"
+UnavailableWhy = "no_card_route" | "other_schema_major" | "unparseable" | "unknown"
+UnreachableReason = "bad_address" | "dns_failed" | "identity_unavailable" | "not_on_overlay" | "pin_mismatch" | "pin_not_saved" | "listener_off" | "auth_required" | "refused_by_peer" | "listener_unavailable" | "bad_answer" | "unknown"
 UsageGroup
   endpoint?: string | null
   requested_model?: string | null
@@ -1102,6 +1166,7 @@ UtilityModel
   n_ctx: uint32 | null
 Verdict = "productive" | "struggled" | "inert-false-pass" | "failed"
 VerdictShift = "improved" | "regressed" | "no-change"
+VersionSource = "peer" | "presence" | "unknown"
 
 # untyped: fields (or types) that hold free-form JSON, each explained in DESIGN.md
 FindingRecord.context

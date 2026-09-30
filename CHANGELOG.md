@@ -62,11 +62,14 @@ darkmux release.
     this release dropped both. A body this darkmux does not read (a newer peer's
     unknown variant) is refused under `--json` with the peer's version named, and
     in text mode prints a note naming it, exit 0. It was printed as raw JSON.
-  - `machine list --deep`: a peer's `specs` is the `/machine/specs` document as
-    this darkmux reads it (a field a newer peer adds is not carried), or `null`.
-    A body that names a `darkmux_version` but does not parse sets the new
-    `specs_unreadable_peer_version` to that version, and the table shows
-    `unreadable (peer <version>)`; any other body reads as unavailable.
+  - `machine list`: prints the fleet view (`FleetView`), one row per roster
+    machine with the card it states about itself. It is no longer the reachability
+    probe plus `--deep` specs: `probe_ms`, `resolved_address`, `dialed_address`,
+    `reachable`, `specs` and the four `specs_*` flags are gone, and each row is
+    `{entry, is_this_machine, machine_uid, uid_source, liveness, last_beat_ms,
+    received_at_ms, fetch_ms, card, accepts}`, with a row for this machine always
+    present (`entry` is `null` when the roster has none). See "Fleet awareness"
+    under Added.
   - `dispatch` (`--json`): the runtime's keys print in the order `result`,
     `final_assistant`, `trajectory_path`, `failed_tool_invocations`,
     `resumed_from` (they were alphabetical), and a key the runtime does not
@@ -728,6 +731,11 @@ darkmux release.
 
 ### Removed (breaking, 4.0)
 
+- **`darkmux machine list --deep` is retired.** The card is the default content
+  of `machine list`, so there is nothing to ask for; the flag is refused, naming
+  that. **Migration:** drop the flag. A script that read `--json`'s `specs`,
+  `reachable` or `probe_ms` reads `card.card.specs` and `card.state` instead.
+
 - **The daemon HTTP API is a semver contract, and its aliases are gone** (C1,
   A3, C2, C3). From this release the daemon's routes and response shapes change
   only on purpose: every JSON body is a serialized Rust type in
@@ -1141,6 +1149,25 @@ darkmux release.
 
 ### Fixed (4.0)
 
+- **A daemon started with `--port N` is found by every client on the machine (#3007).** `darkmux serve` now records where it actually bound (`<darkmux home>/run/daemon.json`: pid, host, port) and removes the record on clean shutdown. Doctor, the dispatch nudge, `machine list` and the viewer links resolve the daemon's address from a live record first, then env, config and the built-in 8765, and the `daemon reachable` row names which source it used. A record whose pid is gone is ignored. Before, a daemon on `--port 8766` read as "not reachable at 127.0.0.1:8765" and the `fleet token` row failed against it.
+- **Doctor's `fleet token` row no longer fails for a shell without the token when the daemon has it.** `/health` now carries `fleet_token_set` (a boolean, this machine only, never the value); when the shell cannot resolve a token but the local daemon reports one, the row passes and says the token is set in the daemon's environment only.
+- **Dispatching to a peer whose listener is off names the listener.** The error was `no answer from http://<host>:8766/fleet/work: ... Connection refused (os error 61)`. It now reads `the fleet listener at <url> is not accepting connections (off, or the daemon is down); nothing was sent`, the same sentence `/fleet/view` gives as the detail of its `listener_off` outcome (one classifier, `is_listener_off`).
+- **A switched-off fleet listener says so.** `/health` reported `fleet_listener: null` when `fleet.listener.enabled` is false; it now reports `off` (`off (fleet.listener.enabled is false)` to this machine), and the startup banner says the listener is off instead of describing the token as if it were serving work.
+- **A relayed run's id is greppable on the receiver.** The receiver's session id was `radio.solo.relay.<peer>.radio_2Esolo_2Eadhoc_...`, the sender's id with every dot escaped. A relay now ends with the sender's wire string verbatim (`radio.solo.relay.<peer>.radio.solo.adhoc....`), so the id the sender printed is a substring of the receiver's. Session ids written by an earlier 4.0 build no longer parse.
+- **A dispatch running inside the daemon no longer probes for a daemon.** Relayed fleet work ran in-process under `darkmux serve --port 8766` and printed "darkmux serve isn't reachable on 127.0.0.1:8765". The nudge is now silent inside the daemon, and it suggests `brew services start darkmux` only for a Homebrew binary (otherwise `darkmux serve`). Doctor's `daemon reachable` row already follows `DARKMUX_SERVE_PORT` / `serve.port`; a `--port` flag exists only in the daemon's own process, so set one of those for doctor to find a non-default port.
+
+- **The fleet lens reads `GET /fleet/view` for its machine list, hardware and
+  liveness.** A peer with Redis off has no presence beat, and the lens drew it as
+  "offline, hardware unknown" even when the daemon had read its card. Each card
+  now comes from the view's row: a machine whose card was read is never shown
+  offline, and one the daemon could not reach shows the typed reason on its
+  subtitle line ("listener off"), never an address or a uid. A peer shows what it
+  lets this machine do ("runs diff-review · radio-host here") beside its
+  hardware, except on a phone. The static demo reads a committed snapshot of the
+  view. Machines outside the view (an unverified source, one nobody rostered) are
+  still drawn from flow and presence, and a replay draws every machine that way.
+  The lens no longer calls `GET /machine/specs`.
+
 - **`darkmux doctor`'s `crew/` merge script and its flat-mission check now
   agree.** The script moved pre-#148 flat mission files into `missions/`, where
   the `mission state files` check then refused them and told you to run a
@@ -1161,6 +1188,127 @@ darkmux release.
   say it did not load, with the cause, instead of "no profile registry".
 
 ### Added (4.0)
+
+- **The fleet work wire is `major.minor` and grows by minors from here; the
+  receiver enforces a data boundary; a check asks "would this route work"; every
+  refusal carries a typed code** (`WORK_JOB_SCHEMA_VERSION` is `"8.0"`, the
+  version this wire freezes at). A receiver takes the same major with a minor at
+  or below its own, and refuses a newer minor, another major, or a schema that is
+  not `major.minor` (a bare `"8"` included) naming both versions; unknown fields
+  are still refused within a minor, so a new optional field ships as a minor and
+  the sender leaves it out for a peer whose card says an older minor. New on the
+  wire, all optional: the job's `boundary` (`managed_only`: the message may go
+  only to a model the receiver serves itself) and `mode` (`run`, the default, or
+  `check`); the reply's `refusal` (`token`, `identity`, `not_listed`,
+  `role_not_allowed`, `profile_not_allowed`, `image_not_allowed`,
+  `workspace_not_allowed`, `profile_undefined`, `boundary`, `busy`,
+  `seat_changed`, `version`, `misaddressed`, `self`, `bad_config`,
+  `bad_request`, or `unknown` for a code a newer darkmux sends), `check` and the
+  `checked` status. The receiver checks `managed_only` against the profile the
+  job resolves to, when it arrives and again when a queued job gets its seat, so
+  a profile repointed at a hosted endpoint is never sent a private message
+  because a card was stale. A `check` runs every gate a run meets (token,
+  network identity, allow-list, role and profile scope, boundary, seat, version)
+  and answers `checked` (with the profile, whether its model is `managed`, and
+  whether the seat is `free` or the job `would_queue`) or the refusal a run
+  would get, without running anything, taking a seat or a queue slot, or writing
+  dispatch records. `darkmux_fleet::check_route` is its sender side. Radio's
+  peer answering seat sends full grounding under `managed_only`; when the
+  receiver's check says its profile is hosted, radio asks once more with the
+  hosted-safe grounding and says so on stderr. **Migration:** run the same darkmux major on
+  both machines; a 4.0 release candidate that still speaks `"8"` is refused
+  with the version remedy. `tests/fixtures` in `crates/darkmux-fleet` pin the
+  8.0 wire: a shape change without a version change fails a test.
+
+- **Fleet awareness: one view every machine reads** (#3004). A machine's card, one
+  typed `MachineCard`, travels between machines on ONE channel: its fleet listener,
+  `GET /fleet/card`, the only surface that can say who is calling. It describes the
+  machine truthfully: its identity and specs (the `/machine/specs` document), its
+  profiles with each endpoint's kind (`managed`, `unmanaged`, `mixed` or
+  `unresolved`, from the same target resolution dispatch uses) and models, its
+  seats when its fleet listener runs, and its governor state (the OS thermal word,
+  the battery reading and the battery gate the operator wrote; the gate's decision
+  is `null` when no sampler ran). Every daemon serves `GET /fleet/view`, a
+  `FleetView` with a row per roster machine and always a row for this machine,
+  gathered in parallel, single-flight, cached 5 s (`cache_ttl_ms`), from each
+  peer's listener over the verified peer path and never from Redis. A machine is
+  visible to every fleet node that authenticates, whether or not it lets that node
+  run work. `darkmux machine list` prints the view (this machine's own daemon's
+  when one runs, else one gathered in process and marked `gathered_by:
+  cli_process`, with this machine's seats, thermal state and battery not
+  observed); `--json` prints the `FleetView`. The contracts, one line each:
+  - `GET /machine/card` is retired: the daemon serves no card, and a machine reads
+    its own card from its own row of `GET /fleet/view`. There is no daemon
+    fallback: a peer whose listener is off is `unreachable` with reason
+    `listener_off`.
+  - `GET /fleet/card` authenticates (the fleet token, the sender's node, not this
+    machine) and does not require an allow-list entry; it answers
+    `ListenerCard { card, grant }` with `grant` one of `listed` (with the caller's
+    own entry and no other), `not_listed` or `unknown`. A job still authorizes:
+    `darkmux_fleet::admit` is `authenticate` then `authorize`.
+  - A row carries `accepts` (`granted` with the entry, `not_listed`,
+    `this_machine`, `withheld` or `unknown`) beside `card`, no longer inside it.
+    `accepts` goes only to a reader on this machine (the fleet token is shared
+    fleet-wide, so it does not open it); any other reader gets `withheld`. Each
+    card's seat block goes to this machine or a token holder (the doctor panel's
+    audience); any other reader gets no seats.
+  - A row carries a resolved `machine_uid` and its `uid_source` (`card`,
+    `declared` or `flow_history`), `received_at_ms` (this machine's clock) and
+    `fetch_ms`. This machine is recognized by the verified node behind an entry's
+    address, else by uid, else by name, so a roster alias folds into its row and
+    is not dialed; `GET /fleet/roster` and the view read one roster.
+  - Every roster peer is dialed: presence is display only, `liveness` is `live`,
+    `no_beat` or `unknown` (`gone` and the `presence_gone` reason are removed).
+  - `machine list` words each unverified-address remedy from the fleet crate's one
+    `TargetFault::remedy`, the same text a refused send prints, and a 401 row says the
+    peer did not accept this machine's token (missing or wrong), not that none was sent.
+  - Gathering the view pins each peer's node in the roster on first contact, as a
+    work submission does, before the fleet token is sent to it; a node that does
+    not match its pin is never sent the token.
+  - A card that cannot be read says why: `unavailable` carries `why`
+    (`no_card_route`, `other_schema_major` or `unparseable`) and the peer's version
+    with its source (`peer` or `presence`, the peer's own answer preferred).
+    Unreachable reasons are `bad_address`, `dns_failed`, `identity_unavailable`,
+    `not_on_overlay`, `pin_mismatch`, `pin_not_saved`, `listener_off`, `auth_required`,
+    `refused_by_peer`, `listener_unavailable` and `bad_answer` (`connect_failed` is
+    now `listener_off`).
+  - Seats state facts only: `seats.local` is `[{model, held_by_peer_job}]`,
+    `seats.hosted` is `{held_by_peer_jobs, cap}`, and `seats.counts_own_work` is
+    `false`; `free_models` and `hosted.free` are removed, since the listener does
+    not see this machine's own dispatches. `seats.busy_policy` is the wire enum
+    `CardBusyPolicy` (`refuse`, `queue`, `unknown`).
+  - Every enum on a card or a view, and `ReplyStatus` on the work wire, has an
+    `unknown` arm: a value a newer darkmux invents reads as `unknown` and the rest
+    of the card is shown, and `unknown` is never read as a known value. A card
+    carries `cache_ttl_ms`, and its shape is tied to `CARD_SCHEMA_VERSION` (1.0) by
+    a golden hash and committed 1.0 fixtures.
+  - Cost: the serving machine caches its card 2 s and its identity lookups for
+    card reads 10 s (a job never reads that cache), the per-address connection cap
+    is 6 (was 3) so waited jobs cannot starve card reads, and the flow-history uid
+    scan runs at most every 5 minutes.
+  Both routes are in `route-table.golden`, and their types have generated twins.
+  Work submission and card reads dial the listener over plain http whatever
+  scheme the roster address wrote.
+- **Radio and doctor check a fleet route before using it.** For a `<profile>@<machine>`
+  answering seat, radio asks the receiver first (`darkmux_fleet::check_route`) and
+  submits the job only when the receiver says it would run it, so a job the
+  receiver would refuse is never sent. A refused or unreachable seat prints "the
+  answering seat was unavailable" with the receiver's own reason, on the CLI and in
+  the panel, and no longer prints the router's refusal text or the command
+  catalog (a reply radio rejects keeps the old fallback). Radio's grounding gains
+  a "fleet" section from the same `FleetView` `machine list` and
+  `GET /fleet/view` give (machine, liveness, card outcome, loaded models, profiles
+  with their endpoint kind, what this machine may run there; never a uid, node
+  name, address or token), so "what is loaded on studio?" is answerable from any
+  machine; a hosted seat does not get it. `darkmux doctor` gains a `fleet routes`
+  row that runs the same check for `radio.answerer_profile` and every
+  `role_profiles` address naming a peer: ok, or the receiver's typed refusal, and a
+  warn (never a fail) when the peer cannot be asked.
+- **A refused sender's `machine trust` remedy names an entry that works.** It named
+  the sender's network host, so following it wrote a second allow-list key. It now
+  names the receiver's roster entry for the verified node, else the machine id the
+  job claims with `--node <host>`, and shows the role the job asked for.
+  `WorkJob::for_peer` is removed (the receiver's version gate is the authority).
 
 - **The machine lens battery shows when macOS is holding the charge.** A battery reading now
   carries a typed `state` (`charging`, `held`, `discharging`, `full`, `unknown`) that REPLACES the
@@ -1295,12 +1443,12 @@ darkmux release.
   in): grant it only to a machine you would give a shell.
 - **Every request that carries the fleet token checks where it is going**
   (#2916): a `profile@machine` dispatch, `machine status`/`resources <id>`,
-  `machine list --deep` and the daemon's peer mission-graph proxy all go
+  `machine list` and the daemon's peer mission-graph proxy all go
   through one helper that resolves the roster address, requires the node
   there to be the tailnet node pinned for that entry (pinned by `machine
   add` or first contact), and connects to that verified address; only this
   machine's own daemon and loopback entries skip it. A peer that fails the
-  check is shown as `unverified` in `machine list --deep`. Everything a
+  check is shown as `unreachable` with the reason `unverified` in `machine list`. Everything a
   peer sends back is printed with control characters, bidirectional
   overrides and zero-width characters removed; a field shown in a table
   or on one line also loses newlines and tabs and is cut to its column,

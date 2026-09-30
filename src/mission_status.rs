@@ -215,7 +215,7 @@ fn panel_all_link(link_base: &str, unlimited: bool) -> Option<String> {
 /// and short-circuits without spawning `tailscale` when no link will be
 /// emitted.
 pub(crate) fn board_link_base() -> String {
-    darkmux_doctor::viewer_link_base(darkmux_types::config_access::serve_port())
+    darkmux_doctor::viewer_link_base(darkmux_types::config_access::serve_client_port())
 }
 
 /// (#1612) What the row CALLS a mission.

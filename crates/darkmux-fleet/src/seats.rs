@@ -80,6 +80,20 @@ pub struct SeatBook {
     freed: Condvar,
 }
 
+/// What the book holds right now, for a machine card: the seats taken and how
+/// many jobs wait, and nothing about who holds them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeatSnapshot {
+    /// The local models a submitted job holds, sorted.
+    pub local_held: Vec<String>,
+    /// Hosted jobs running.
+    pub hosted_held: usize,
+    /// Hosted jobs allowed at once; `None` is unbounded.
+    pub hosted_cap: Option<usize>,
+    /// Jobs waiting for a seat.
+    pub waiting: usize,
+}
+
 /// Holds a seat; dropping it frees the seat and wakes the waiters.
 pub struct SeatGuard {
     owner: Arc<SeatBook>,
@@ -140,18 +154,34 @@ impl SeatBook {
         SeatGuard { owner: Arc::clone(self), seat: seat.clone(), session: session.to_string() }
     }
 
-    /// Take `seat` now, or say what holds it. A job already waiting for the
-    /// same seat counts as holding it: a newcomer never overtakes the queue.
+    /// Why a newcomer for `seat` cannot take it now: the seat is held, or an
+    /// earlier job is waiting for the same seat (a newcomer never overtakes
+    /// the queue). `None` when it can.
+    fn blocker(&self, b: &Book, seat: &WorkSeat) -> Option<Occupied> {
+        self.occupied(b, seat).or_else(|| {
+            let key = seat.key();
+            b.waiting
+                .iter()
+                .any(|(k, _)| *k == key)
+                .then(|| Occupied { what: "earlier jobs are waiting for the same seat".into() })
+        })
+    }
+
+    /// Take `seat` now, or say what holds it.
     pub fn try_claim(self: &Arc<Self>, seat: &WorkSeat, session: &str) -> Result<SeatGuard, Occupied> {
         let mut b = self.book.lock().unwrap_or_else(|p| p.into_inner());
-        let key = seat.key();
-        if let Some(o) = self.occupied(&b, seat) {
-            return Err(o);
+        match self.blocker(&b, seat) {
+            Some(o) => Err(o),
+            None => Ok(self.take(&mut b, seat, session)),
         }
-        if b.waiting.iter().any(|(k, _)| *k == key) {
-            return Err(Occupied { what: "earlier jobs are waiting for the same seat".into() });
-        }
-        Ok(self.take(&mut b, seat, session))
+    }
+
+    /// What [`try_claim`](Self::try_claim) would answer right now, without
+    /// taking the seat: `None` when it is free. For a check, which must not
+    /// hold a seat a real job could be refused for.
+    pub fn peek(&self, seat: &WorkSeat) -> Option<Occupied> {
+        let b = self.book.lock().unwrap_or_else(|p| p.into_inner());
+        self.blocker(&b, seat)
     }
 
     /// Wait for `seat`, first come first served, then take it.
@@ -220,6 +250,17 @@ impl SeatBook {
         self.freed.notify_all();
     }
 
+    /// The seats taken and the jobs waiting, at this moment.
+    pub fn snapshot(&self) -> SeatSnapshot {
+        let b = self.book.lock().unwrap_or_else(|p| p.into_inner());
+        SeatSnapshot {
+            local_held: b.local.keys().cloned().collect(),
+            hosted_held: b.hosted.len(),
+            hosted_cap: (self.hosted_cap != usize::MAX).then_some(self.hosted_cap),
+            waiting: b.waiting.len(),
+        }
+    }
+
     /// Sessions running now (for tests and logs).
     pub fn running(&self) -> Vec<String> {
         let b = self.book.lock().unwrap_or_else(|p| p.into_inner());
@@ -252,6 +293,22 @@ mod tests {
             Waited::Cancelled => panic!("cancelled"),
             Waited::TimedOut(o) => panic!("timed out behind {o:?}"),
         }
+    }
+
+    #[test]
+    fn the_snapshot_names_held_seats_and_the_cap_and_no_sessions() {
+        let book = Arc::new(SeatBook::new(2));
+        let empty = book.snapshot();
+        assert_eq!(empty, SeatSnapshot { local_held: vec![], hosted_held: 0, hosted_cap: Some(2), waiting: 0 });
+        let _a = book.try_claim(&local("qwen-35b"), "s1").expect("free");
+        let _h = book.try_claim(&hosted(), "s2").expect("free");
+        let snap = book.snapshot();
+        assert_eq!(snap.local_held, vec!["qwen-35b".to_string()]);
+        assert_eq!(snap.hosted_held, 1);
+        assert!(!format!("{snap:?}").contains("s1"), "a session id must not reach the snapshot");
+        drop(_a);
+        assert!(book.snapshot().local_held.is_empty(), "a freed seat leaves the snapshot");
+        assert_eq!(SeatBook::new(0).snapshot().hosted_cap, None, "0 means unbounded");
     }
 
     #[test]
@@ -317,6 +374,23 @@ mod tests {
         let err = book.try_claim(&local("m"), "s-new").err().expect("the waiter holds its place");
         assert!(err.what.contains("waiting"), "{err:?}");
         assert!(book.try_claim(&local("other"), "s-other").is_ok(), "another seat's queue is not this one's");
+    }
+
+    /// A peek answers what a claim would, and never holds the seat: after
+    /// it, a real claim still succeeds.
+    #[test]
+    fn a_peek_reports_a_claims_answer_without_taking_the_seat() {
+        let book = Arc::new(SeatBook::new(1));
+        assert_eq!(book.peek(&local("m")), None);
+        assert!(book.try_claim(&local("m"), "s-real").is_ok(), "the peek held nothing");
+        let held = book.try_claim(&local("n"), "s-held").unwrap();
+        assert_eq!(book.peek(&local("n")), book.try_claim(&local("n"), "s-2").err(), "the same answer a claim gets");
+        assert!(book.peek(&local("n")).is_some());
+        drop(held);
+        assert_eq!(book.peek(&local("n")), None);
+        // A waiter ahead counts, as it does for a claim.
+        book.book.lock().unwrap().waiting.push_back((local("w").key(), 0));
+        assert!(book.peek(&local("w")).is_some());
     }
 
     /// A waiter takes a free seat only when it is first in line for it.

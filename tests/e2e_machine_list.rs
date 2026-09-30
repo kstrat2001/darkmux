@@ -1,15 +1,15 @@
-//! TDD coverage for #275 PR-B — `darkmux machine list --deep` fans
-//! out to each reachable peer's `GET /machine/specs` endpoint
-//! (shipped in PR-A) and aggregates into one enriched table.
+//! `darkmux machine list` reads the fleet view: one row per machine, this
+//! machine's own row always among them, and each peer's card from its fleet
+//! listener over the verified peer path. (Before 5.0 this was `machine list
+//! --deep`, a sequential pull of each peer's `/machine/specs`; the flag is
+//! retired.)
 //!
-//! Pre-fix: `machine list` only reports reachability columns (id,
-//! tier, address, probe_ms). `--deep` flag doesn't exist; passing it
-//! is rejected by clap.
-//!
-//! Post-fix: `--deep` adds an HTTP fetch per reachable machine, and
-//! the rendered output gains a ram-free + models-loaded summary per
-//! row. Unreachable peers degrade gracefully — row prints with "specs
-//! unavailable" rather than failing the whole command.
+//! These daemons run no fleet listener and no network identity tool, so no
+//! peer can be verified: this file proves the parts that need no overlay. This
+//! machine's own row carries its card, and a machine that cannot be asked
+//! degrades to its own row with a typed reason and never fails the whole
+//! command. The card crossing between two daemons, over a verified listener, is
+//! `tests/fleet_profile_address_two_daemons.rs`.
 
 #![cfg(unix)]
 
@@ -83,7 +83,7 @@ fn populate_roster_via_cli(viewer: &e2e::harness::FleetNode, peers: &[&e2e::harn
 }
 
 #[test]
-fn fleet_status_deep_aggregates_specs_from_reachable_peers() {
+fn machine_list_shows_this_machines_card_and_says_why_a_peer_is_not_asked() {
     if !redis_available() {
         eprintln!("skipping: redis-server not on PATH");
         return;
@@ -91,11 +91,11 @@ fn fleet_status_deep_aggregates_specs_from_reachable_peers() {
 
     // (#2727) Shares this binary's one redis-server (see harness.rs's
     // `boot_sharing_redis` doc for why this file is a safe candidate:
-    // pure roster + `--deep` HTTP fetch, no presence, no dispatch
+    // pure roster + card fetch, no dispatch
     // fan-out).
     let harness = FleetHarness::boot_sharing_redis(
         vec![NodeSpec::new("node-a"), NodeSpec::new("node-b")],
-        "fleet_status_deep_aggregates_specs_from_reachable_peers",
+        "machine_list_shows_this_machines_card_and_says_why_a_peer_is_not_asked",
     )
     .expect("FleetHarness::boot_sharing_redis");
 
@@ -107,64 +107,58 @@ fn fleet_status_deep_aggregates_specs_from_reachable_peers() {
 
     let out = node_a
         .cmd()
-        .args(["machine", "list", "--deep"])
+        .args(["machine", "list"])
         .output()
-        .expect("running `darkmux machine list --deep`");
+        .expect("running `darkmux machine list`");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         out.status.success(),
-        "machine list --deep should succeed; stdout={stdout}\nstderr={stderr}"
+        "machine list should succeed; stdout={stdout}\nstderr={stderr}"
     );
 
-    // Both machine_ids should appear in the rendered table.
-    assert!(
-        stdout.contains("node-a"),
-        "expected node-a in --deep output: {stdout}"
-    );
-    assert!(
-        stdout.contains("node-b"),
-        "expected node-b in --deep output: {stdout}"
-    );
-
-    // The --deep flag must surface AT LEAST one spec dimension we didn't
-    // previously have. Two reliable signals: a "ram-free" / "ram_free"
-    // column header or the darkmux version (which the specs endpoint
-    // returns). Either is sufficient — the test just needs to verify
-    // that --deep is actually fetching the specs payload.
-    let has_ram_signal =
-        stdout.contains("AI-HEADROOM") || stdout.contains("ai_headroom") || stdout.contains("ram_free");
-    let has_version_signal = stdout.contains(env!("CARGO_PKG_VERSION"));
-    assert!(
-        has_ram_signal || has_version_signal,
-        "--deep must surface a spec dimension (ram or version); got:\n{stdout}"
-    );
-    // (#2924) EACH node reachable, not just "some spec showed up": node-b
-    // alone satisfied the checks above while node-a, the CLI's own entry,
-    // was being dialed at the built-in 8765 instead of its loopback port.
-    assert_reachable(node_a, &["node-a", "node-b"]);
+    // Both machine_ids appear in the rendered table, with the card's columns.
+    for id in ["node-a", "node-b"] {
+        assert!(stdout.contains(id), "expected {id} in the output: {stdout}");
+    }
+    assert!(stdout.contains("AI-HEADROOM"), "the card's columns are the default: {stdout}");
+    // This machine's row carries its own card: node-a is the CLI's own entry.
+    let view = list_json(node_a);
+    let a = row(&view, "node-a");
+    assert_eq!(a["is_this_machine"], true, "the entry that is this machine is flagged: {a}");
+    assert_eq!(a["card"]["state"], "available", "node-a must state its card: {a}");
+    assert_eq!(a["card"]["source"], "local", "{a}");
+    assert_eq!(a["card"]["card"]["specs"]["darkmux_version"], env!("CARGO_PKG_VERSION"));
+    // node-b cannot be verified (no overlay here): it was not asked, and its
+    // row says why in a typed reason, never a blank or a guess.
+    let b = row(&view, "node-b");
+    assert_eq!(b["card"]["state"], "unreachable", "{b}");
+    let reason = b["card"]["reason"].as_str().unwrap();
+    assert!(["identity_unavailable", "not_on_overlay"].contains(&reason), "a typed not-verified reason, got {reason}: {b}");
+    assert_eq!(b["accepts"]["state"], "unknown", "nothing answered, so no grant is known: {b}");
 }
 
-/// Every named roster row in `viewer`'s `machine list --json` is reachable.
-fn assert_reachable(viewer: &e2e::harness::FleetNode, ids: &[&str]) {
+/// `viewer`'s `machine list --json`.
+fn list_json(viewer: &e2e::harness::FleetNode) -> serde_json::Value {
     let out = viewer
         .cmd()
         .args(["machine", "list", "--json"])
         .output()
         .expect("running `darkmux machine list --json`");
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("machine list --json");
-    for id in ids {
-        let row = v["machines"]
-            .as_array()
-            .and_then(|rows| rows.iter().find(|r| r["id"] == *id))
-            .unwrap_or_else(|| panic!("{id} row missing: {v}"));
-        assert_eq!(row["reachable"], true, "{id} must be reachable: {row}");
-    }
+    serde_json::from_slice(&out.stdout).expect("machine list --json")
+}
+
+/// The row for roster entry `id`.
+fn row<'a>(view: &'a serde_json::Value, id: &str) -> &'a serde_json::Value {
+    view["machines"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|r| r["entry"]["id"] == id))
+        .unwrap_or_else(|| panic!("{id} row missing: {view}"))
 }
 
 #[test]
-fn fleet_status_deep_degrades_gracefully_for_unreachable_peers() {
+fn machine_list_degrades_gracefully_for_a_machine_it_cannot_ask() {
     if !redis_available() {
         eprintln!("skipping: redis-server not on PATH");
         return;
@@ -174,7 +168,7 @@ fn fleet_status_deep_degrades_gracefully_for_unreachable_peers() {
     // this file shares its redis.
     let harness = FleetHarness::boot_sharing_redis(
         vec![NodeSpec::new("node-a")],
-        "fleet_status_deep_degrades_gracefully_for_unreachable_peers",
+        "machine_list_degrades_gracefully_for_a_machine_it_cannot_ask",
     )
     .expect("FleetHarness::boot_sharing_redis");
     let node_a = harness.node("node-a").expect("node-a");
@@ -199,59 +193,24 @@ fn fleet_status_deep_degrades_gracefully_for_unreachable_peers() {
 
     let out = node_a
         .cmd()
-        .args(["machine", "list", "--deep"])
-        .output()
-        .expect("running `darkmux machine list --deep`");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-
-    // The whole command MUST succeed even when one peer is unreachable.
-    assert!(
-        out.status.success(),
-        "machine list --deep should not fail on an unreachable peer; stdout={stdout}\nstderr={}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    // node-a's specs should be present (it's local + reachable).
-    assert!(stdout.contains("node-a"), "node-a row missing: {stdout}");
-    assert_reachable(node_a, &["node-a"]);
-    // ghost-machine should appear, with some indication it's unreachable
-    // (the existing `machine list` already prints unreachability; --deep
-    // must not regress that).
-    assert!(
-        stdout.contains("ghost-machine"),
-        "ghost-machine row missing: {stdout}"
-    );
-}
-
-#[test]
-fn fleet_status_default_unchanged_without_deep_flag() {
-    if !redis_available() {
-        eprintln!("skipping: redis-server not on PATH");
-        return;
-    }
-
-    // (#2727) See the aggregates-from-reachable-peers test above for why
-    // this file shares its redis.
-    let harness = FleetHarness::boot_sharing_redis(
-        vec![NodeSpec::new("node-a")],
-        "fleet_status_default_unchanged_without_deep_flag",
-    )
-    .expect("FleetHarness::boot_sharing_redis");
-    let node_a = harness.node("node-a").expect("node-a");
-    populate_roster_via_cli(node_a, &[node_a]);
-
-    let out = node_a
-        .cmd()
         .args(["machine", "list"])
         .output()
         .expect("running `darkmux machine list`");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success());
 
-    // Without --deep, the output MUST NOT include the spec dimensions
-    // (no HTTP fetch happened; we just have reachability columns).
-    let leaked_version = stdout.contains(env!("CARGO_PKG_VERSION"));
+    // The whole command MUST succeed even when one machine cannot be asked.
     assert!(
-        !leaked_version,
-        "non-deep machine list leaked spec data (version visible): {stdout}"
+        out.status.success(),
+        "machine list should not fail on a machine it cannot ask; stdout={stdout}\nstderr={}",
+        String::from_utf8_lossy(&out.stderr)
     );
+    // node-a's card is present (it is this machine).
+    assert!(stdout.contains("node-a"), "node-a row missing: {stdout}");
+    let view = list_json(node_a);
+    assert_eq!(row(&view, "node-a")["card"]["state"], "available");
+    // ghost-machine appears with its reason: no node stands behind its
+    // address, so it is not asked and nothing is sent to it.
+    assert!(stdout.contains("ghost-machine"), "ghost-machine row missing: {stdout}");
+    assert!(stdout.contains("unreachable"), "ghost-machine says why: {stdout}");
+    assert_eq!(row(&view, "ghost-machine")["card"]["state"], "unreachable");
 }

@@ -654,7 +654,7 @@ fn residency_dir() -> PathBuf {
 /// caught separately, by comparing start times ([`process_start_stamp`]),
 /// because a reused pid can read as alive indefinitely (module doc).
 #[cfg(unix)]
-fn process_alive(pid: u32) -> bool {
+pub(crate) fn process_alive(pid: u32) -> bool {
     let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
     if ret == 0 {
         return true;
@@ -737,7 +737,7 @@ pub fn process_start_stamp(_pid: u32) -> Option<u64> {
 /// by assuming alive — a lease is never wrongfully reclaimed on an
 /// unsupported platform, only possibly held a little longer than ideal.
 #[cfg(not(unix))]
-fn process_alive(_pid: u32) -> bool {
+pub(crate) fn process_alive(_pid: u32) -> bool {
     true
 }
 

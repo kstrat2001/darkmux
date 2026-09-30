@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 /// the sender's own claim, kept for logs; WHO sent the job is answered by
 /// the network (the identity provider) and the fleet token, never by a field
 /// the sender writes.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkJob {
     /// The machine the sender addressed (its `machine_id`, #2924). The
@@ -84,6 +84,55 @@ pub struct WorkJob {
     /// ordinary dispatch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub single_shot: Option<SingleShotJob>,
+
+    /// A statement about what `message` carries that the RECEIVER enforces
+    /// (never the sender's cached view of the receiver). `None` = no
+    /// restriction. See [`Boundary`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boundary: Option<Boundary>,
+
+    /// `Run` (the default) executes the job; `Check` answers whether a `Run`
+    /// of it would be taken, without running anything. See [`SubmissionMode`].
+    #[serde(default, skip_serializing_if = "SubmissionMode::is_run")]
+    pub mode: SubmissionMode,
+}
+
+/// What a job's message may be sent to. The sender states it; the receiver
+/// checks it against the profile the job RESOLVES to, when the job arrives
+/// and again when a queued job gets its seat, so the decision never rests on
+/// a card the sender read earlier.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Boundary {
+    /// The message may go only to a model this receiver serves itself (a
+    /// managed endpoint), never to a hosted one.
+    ManagedOnly,
+    /// A boundary a newer darkmux writes that this one cannot enforce. The
+    /// receiver refuses the job: it never runs one whose boundary it cannot
+    /// check.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Whether a submission is executed or only asked about.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SubmissionMode {
+    /// Run the job.
+    #[default]
+    Run,
+    /// Run every check a `Run` would face (the token, the node, the
+    /// allow-list, role and profile scope, the boundary, the seat, the
+    /// version) and answer `checked` with what was found, or the refusal a
+    /// `Run` would get. Nothing runs, no seat is taken, and no dispatch
+    /// records are written.
+    Check,
+}
+
+impl SubmissionMode {
+    pub(crate) fn is_run(&self) -> bool {
+        *self == SubmissionMode::Run
+    }
 }
 
 /// The execution mode of a tool-less single exchange, the radio answering
@@ -99,7 +148,7 @@ pub struct WorkJob {
 /// sender uses for a local seat (no container, no agent loop, no autonomous
 /// dispatch preamble), so the answer does not depend on which machine
 /// served it.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SingleShotJob {
     /// The persona's `{{humor}}` value (0..=100).
@@ -129,7 +178,53 @@ pub struct SingleShotJob {
 /// phase verbs; a v7 job that still carries it is refused with the version
 /// remedy. "8" also gained the optional `single_shot` mode (unreleased, so
 /// it rides the version): a sender that does not write it is unchanged.
-pub const WORK_JOB_SCHEMA_VERSION: &str = "8";
+///
+/// The version is `major.minor` ([`WorkVersion`]) from "8.0", the release
+/// this wire freezes at. A receiver takes the same major with a minor at or
+/// below its own. Unknown fields are still refused within a minor
+/// (a sender cannot smuggle fields a receiver might start interpreting), so
+/// the minor is what lets the wire grow: a new optional field ships as a
+/// minor bump, and an older receiver refuses a newer minor by naming both
+/// versions. A shape change that is not additive is a major bump. "8.0" added
+/// `boundary`, `mode`, and the reply's `refusal` code and `check` report.
+pub const WORK_JOB_SCHEMA_VERSION: &str = "8.0";
+
+/// A work wire version, `major.minor` (see [`WORK_JOB_SCHEMA_VERSION`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct WorkVersion {
+    pub major: u32,
+    pub minor: u32,
+}
+
+impl WorkVersion {
+    /// Parse `"<major>.<minor>"`: exactly two unsigned decimal numbers. Any
+    /// other spelling (a bare `"8"`, `"8.0.1"`, `"v8.0"`) is `None`.
+    pub fn parse(s: &str) -> Option<Self> {
+        let (major, minor) = s.split_once('.')?;
+        let digits = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
+        if !digits(major) || !digits(minor) {
+            return None;
+        }
+        Some(Self { major: major.parse().ok()?, minor: minor.parse().ok()? })
+    }
+
+    /// The version this darkmux speaks.
+    pub fn current() -> Self {
+        Self::parse(WORK_JOB_SCHEMA_VERSION).expect("WORK_JOB_SCHEMA_VERSION is major.minor")
+    }
+
+    /// Whether a receiver at `self` takes a submission written at `sender`:
+    /// the same major, and a minor at or below the receiver's own.
+    pub fn takes(&self, sender: &WorkVersion) -> bool {
+        self.major == sender.major && sender.minor <= self.minor
+    }
+}
+
+impl std::fmt::Display for WorkVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.major, self.minor)
+    }
+}
 
 /// Max byte size of a `WorkJob.message`. 256 KiB matches the
 /// reasoning-text cap in `dispatch_internal.rs` (#231 / S6). (#246 PR-C.2)
@@ -337,7 +432,7 @@ fn validate_session_id(value: &SessionId) -> Result<()> {
 /// Wraps `validate_identifier` with the `"WorkJob.{field}"` label
 /// prefix used throughout `WorkJob::validate`. Kept as a thin shim so
 /// the existing internal call-sites read tightly.
-fn validate_work_identifier(field: &str, value: &str) -> Result<()> {
+pub(crate) fn validate_work_identifier(field: &str, value: &str) -> Result<()> {
     validate_identifier(&format!("WorkJob.{field}"), value)
 }
 
@@ -402,6 +497,8 @@ mod tests {
             published_at_unix_ms: 1_700_000_000_000,
             published_by_machine: None,
             single_shot: None,
+            boundary: None,
+            mode: SubmissionMode::Run,
         }
     }
 
@@ -516,7 +613,7 @@ mod tests {
     /// it parses.
     #[test]
     fn a_job_carrying_a_phase_id_is_refused_at_v8() {
-        assert_eq!(WORK_JOB_SCHEMA_VERSION, "8");
+        assert_eq!(WORK_JOB_SCHEMA_VERSION, "8.0");
         let mut v = serde_json::to_value(make_valid_job()).unwrap();
         assert!(v.get("phase_id").is_none(), "v8 never writes phase_id");
         assert!(serde_json::from_value::<WorkJob>(v.clone()).is_ok());
@@ -532,6 +629,48 @@ mod tests {
             crate::WorkSubmission::parse(&serde_json::to_vec(&sub).unwrap()).unwrap_err(),
             crate::Refusal::SchemaMismatch { got: "7".into() }
         );
+    }
+
+    /// `major.minor` is exactly two decimal numbers; a receiver takes the
+    /// same major with a minor at or below its own, and nothing else.
+    #[test]
+    fn a_receiver_takes_the_same_major_at_or_below_its_own_minor() {
+        let v = |s: &str| WorkVersion::parse(s).unwrap_or_else(|| panic!("{s} parses"));
+        assert_eq!(WorkVersion::current(), v(WORK_JOB_SCHEMA_VERSION));
+        assert_eq!(v("8.12").to_string(), "8.12");
+        let receiver = v("8.3");
+        for taken in ["8.0", "8.2", "8.3"] {
+            assert!(receiver.takes(&v(taken)), "{taken}");
+        }
+        for refused in ["8.4", "9.0", "7.3", "0.0"] {
+            assert!(!receiver.takes(&v(refused)), "{refused}");
+        }
+        for not_a_version in ["8", "", "8.", ".0", "8.0.1", "v8.0", "8.-1", "8.x", " 8.0"] {
+            assert_eq!(WorkVersion::parse(not_a_version), None, "{not_a_version:?}");
+        }
+    }
+
+    /// `boundary` and `mode` are additive: a job that sets neither writes
+    /// neither, and a job that sets them round-trips. A boundary this darkmux
+    /// does not know reads as `Unknown` (the receiver refuses it); a mode it
+    /// does not know is a malformed job.
+    #[test]
+    fn boundary_and_mode_ride_the_wire_and_default_to_absent() {
+        let plain = serde_json::to_value(make_valid_job()).unwrap();
+        assert!(plain.get("boundary").is_none() && plain.get("mode").is_none(), "{plain}");
+        let mut job = make_valid_job();
+        job.boundary = Some(Boundary::ManagedOnly);
+        job.mode = SubmissionMode::Check;
+        let v = serde_json::to_value(&job).unwrap();
+        assert_eq!((v["boundary"].as_str(), v["mode"].as_str()), (Some("managed_only"), Some("check")));
+        assert_eq!(serde_json::from_value::<WorkJob>(v).unwrap(), job);
+
+        let mut future = plain.clone();
+        future["boundary"] = serde_json::json!("hosted_ok_with_audit");
+        assert_eq!(serde_json::from_value::<WorkJob>(future).unwrap().boundary, Some(Boundary::Unknown));
+        let mut odd_mode = plain;
+        odd_mode["mode"] = serde_json::json!("simulate");
+        assert!(serde_json::from_value::<WorkJob>(odd_mode).is_err(), "an unknown mode is never read as `run`");
     }
 
     /// (#2916) A session id is a join key and part of file names on the

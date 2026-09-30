@@ -200,7 +200,7 @@ curl -s http://127.0.0.1:8765/health
       </tr>
       <tr>
         <td><code>GET /machine/specs</code></td>
-        <td>Version, machine id, RAM, CPU brand, OS and loaded models. Backs <code>darkmux machine list --deep</code> (<code>MachineSpecsResponse</code>).</td>
+        <td>Version, machine id, RAM, CPU brand, OS and loaded models (<code>MachineSpecsResponse</code>). The machine card, which travels on the fleet listener, embeds it.</td>
       </tr>
       <tr>
         <td><code>GET /machine/resources</code></td>
@@ -209,6 +209,10 @@ curl -s http://127.0.0.1:8765/health
       <tr>
         <td><code>GET /fleet/machines/live, GET /fleet/dispatches/live, GET /fleet/roster</code></td>
         <td>The machines beating right now, the dispatches with a live heartbeat (renamed from <code>/fleet/sessions/live</code>), and the declared roster.</td>
+      </tr>
+      <tr>
+        <td><code>GET /fleet/view</code></td>
+        <td>One row per roster machine, and always a row for this machine: presence as a display column, the machine's own card (this machine&rsquo;s built locally, a peer&rsquo;s fetched from its fleet listener over the verified peer path, in parallel and cached for 5 seconds), its resolved hardware uid, and what the machine accepts from this one (<code>FleetView</code>). <code>accepts</code> is shown only to this machine, and seats only to this machine or a token holder. Backs <code>darkmux machine list</code>. A machine&rsquo;s card is served to its peers by its fleet listener at <code>GET /fleet/card</code>, not by the daemon.</td>
       </tr>
       <tr>
         <td><code>GET /lab/runs, GET /lab/run/detail, GET /lab/run/events</code></td>

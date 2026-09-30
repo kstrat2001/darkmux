@@ -46,7 +46,11 @@ pub mod mission_graph;
 /// (#2107, #1833) The daemon-side continuous host sampler feeding the
 /// machine stats drawer's live `load` block — see the module's own doc.
 mod fleet_listener;
+/// The fleet view: one row per roster machine, each with its own card.
+pub mod fleet_view;
 mod host_sampler;
+/// The machine card, served by the fleet listener at `GET /fleet/card` and read from each machine's own row of `GET /fleet/view`.
+pub mod machine_card;
 mod panel;
 /// (#1466) Best-effort peer-mission-graph fetch — see the module's own doc
 /// for the full attribution → roster → presence → fetch decision chain.
@@ -97,6 +101,8 @@ pub(crate) struct AppState {
     sse_open: Arc<AtomicUsize>,
     /// (#1569 packet B) Panel cache + single-flight locks — see `panel.rs`.
     panels: panel::PanelState,
+    /// The fleet routes' inputs: gather sources and the view cache.
+    fleet: fleet_view::FleetContext,
     /// (#1585, was #1247 Part 3) The lab-run scan root — `--lab-dir` >
     /// `DARKMUX_LAB_DIR` > `config.dirs.lab` > `~/.darkmux/lab`.
     ///
@@ -330,7 +336,7 @@ async fn play_html(Path(date): Path<String>, headers: axum::http::HeaderMap) -> 
 /// (`lab_dir: None`); tests that need `/lab/*` go through `build_router_full`.
 #[cfg(test)]
 pub(crate) fn build_router(flows_dir: PathBuf) -> Router {
-    build_router_full(flows_dir, None, None)
+    build_router_full(flows_dir, None, None, fleet_view::FleetContext::hermetic())
 }
 
 /// Full router builder — flows dir + the lab observer's
@@ -359,12 +365,14 @@ pub(crate) fn build_router_full(
     flows_dir: PathBuf,
     lab_dir: Option<PathBuf>,
     live_ingest: Option<Arc<live_hub::IngestState>>,
+    fleet: fleet_view::FleetContext,
 ) -> Router {
     let state = AppState {
         flows_dir,
         sse_open: Arc::new(AtomicUsize::new(0)),
         lab_dir,
         panels: panel::PanelState::default(),
+        fleet,
         live_ingest,
     };
     let read_auth = darkmux_types::config_access::serve_read_auth();
@@ -445,7 +453,7 @@ pub(crate) fn build_router_full_local(
     flows_dir: PathBuf,
     lab_dir: Option<PathBuf>,
 ) -> Router {
-    build_router_full(flows_dir, lab_dir, None).layer(from_fn(assume_loopback_peer))
+    build_router_full(flows_dir, lab_dir, None, fleet_view::FleetContext::hermetic()).layer(from_fn(assume_loopback_peer))
 }
 
 /// (#881) Build a `401 Unauthorized` with a `WWW-Authenticate: Bearer` hint.
@@ -711,14 +719,16 @@ fn host_names_this_daemon(headers: &axum::http::HeaderMap, bound: Option<SocketA
 /// (#881, #2988) The startup banner's two auth lines: the read posture and
 /// the execution posture. `serve_auth_preflight` has already refused a
 /// posture reads could not be answered in, so these only describe.
-fn auth_banner_lines(auth: ServeAuth) -> [String; 2] {
+fn auth_banner_lines(auth: ServeAuth, listener_enabled: bool) -> [String; 2] {
     let reads = if auth.read_auth {
         "  reads:          token required unless from this machine (serve.read_auth on; proxied requests included)"
     } else {
         "  reads:          open to whatever reaches this daemon (serve.read_auth off)"
     };
-    let exec = if auth.token_present {
+    let exec = if auth.token_present && listener_enabled {
         "  fleet work:     token set; the fleet listener requires it plus a verified sender".to_string()
+    } else if auth.token_present {
+        "  fleet work:     token set; the fleet listener is off (fleet.listener.enabled is false), so this machine takes no fleet work".to_string()
     } else {
         format!("  fleet work:     {}", darkmux_types::style::dim("no serve token; this machine takes and sends no fleet work"))
     };
@@ -822,32 +832,6 @@ const PRESENCE_READ_FAILED: &str = "could not read presence beats from Redis";
 /// still goes to stderr, where the operator already looks for it.
 const ROSTER_READ_FAILED: &str = "the fleet roster file exists but could not be parsed";
 
-/// GET /fleet/roster (#1855) — the operator's DECLARED fleet topology
-/// (`darkmux machine add`'s `fleet.json`), independent of whether any of it
-/// is beating right now.
-///
-/// This is what closes the "rostered-but-silent machine vanishes entirely"
-/// half of #1855: `/fleet/machines/live` only ever reports a machine that is
-/// currently publishing a presence beat, so a machine the operator
-/// deliberately added and which is down, unreachable, or has simply never
-/// started its daemon produced no card, no offline row, nothing — it read
-/// as though it had never been added. Roster membership is a SEPARATE
-/// question from liveness, and the viewer needs both to tell "not on my
-/// fleet" from "on my fleet, not answering right now".
-///
-/// Deliberately does NOT probe reachability — that is `darkmux machine list
-/// --deep`'s job, run explicitly by the operator against real network
-/// addresses. This route only reads a local JSON file and reports what is
-/// declared in it, per "darkmux describes, never adjudicates": it says what
-/// the operator's roster claims, not what darkmux verified about a peer's
-/// network reachability.
-///
-/// Never 500s. A missing file is an empty roster (`load_roster`'s own
-/// fresh-install contract, not an error); a PRESENT but corrupt file
-/// reports the parse failure in `error` (a fixed literal — see
-/// [`ROSTER_READ_FAILED`]'s own doc on why, not the underlying error text)
-/// rather than silently discarding the roster and answering as if nothing
-/// were ever added.
 /// (#2796) Resolve each roster entry's `machine_uid` from the daemon's OWN
 /// flow history when the entry does not declare one.
 ///
@@ -881,17 +865,51 @@ const ROSTER_READ_FAILED: &str = "the fleet roster file exists but could not be 
 /// DERIVED, NOT PERSISTED: `fleet.json` is operator state and is not rewritten
 /// here. An entry that already declares a uid is left exactly as it is — the
 /// operator's own declaration always wins over anything inferred.
+///
+/// Returns the ids of the entries whose uid this filled in, so a reader can say
+/// where a uid came from.
 fn backfill_roster_machine_uids(
     machines: &mut [darkmux_fleet::MachineEntry],
     flows_dir: &std::path::Path,
-) {
-    use std::io::BufRead;
-    if machines.iter().all(|m| m.machine_uid.is_some()) {
-        return;
+) -> std::collections::BTreeSet<String> {
+    backfill_with_ttl(machines, flows_dir, UID_HISTORY_TTL)
+}
+
+/// How long the id -> uid pairings read from flow history are kept. The
+/// pairing of a machine name with its hardware uid does not change while the
+/// machine exists, and reading it is a scan of every flow file: measured
+/// 2026-09-30 at 10.2 s (debug build) over 306 MB of real history, on a path
+/// that `/fleet/roster` and every fleet-view gather (about every 5 s while
+/// anything watches) both take. A scan per TTL bounds the observer's cost.
+const UID_HISTORY_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The id -> uid pairings from `flows_dir`, scanned at most once per `ttl`.
+/// Single-flight: the lock is held across the scan, so concurrent callers
+/// wait for one scan instead of each running their own. The one slot is
+/// keyed by directory.
+fn history_uids(
+    flows_dir: &std::path::Path,
+    ttl: std::time::Duration,
+) -> std::sync::Arc<std::collections::HashMap<String, String>> {
+    type Slot = Option<(std::path::PathBuf, std::time::Instant, std::sync::Arc<std::collections::HashMap<String, String>>)>;
+    static CACHE: std::sync::Mutex<Slot> = std::sync::Mutex::new(None);
+    let mut slot = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((dir, at, map)) = slot.as_ref() {
+        if dir == flows_dir && at.elapsed() < ttl {
+            return map.clone();
+        }
     }
+    let map = std::sync::Arc::new(scan_history_uids(flows_dir));
+    *slot = Some((flows_dir.to_path_buf(), std::time::Instant::now(), map.clone()));
+    map
+}
+
+/// Every id -> uid pairing in `flows_dir`'s day files, first seen wins.
+fn scan_history_uids(flows_dir: &std::path::Path) -> std::collections::HashMap<String, String> {
+    use std::io::BufRead;
     let mut by_id: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let Ok(entries) = std::fs::read_dir(flows_dir) else {
-        return;
+        return by_id;
     };
     for entry in entries.flatten() {
         if !entry.file_name().to_string_lossy().ends_with(".jsonl") {
@@ -913,32 +931,86 @@ fn backfill_roster_machine_uids(
             by_id.entry(id.to_string()).or_insert_with(|| uid.to_string());
         }
     }
+    by_id
+}
+
+fn backfill_with_ttl(
+    machines: &mut [darkmux_fleet::MachineEntry],
+    flows_dir: &std::path::Path,
+    ttl: std::time::Duration,
+) -> std::collections::BTreeSet<String> {
+    let mut filled = std::collections::BTreeSet::new();
+    if machines.iter().all(|m| m.machine_uid.is_some()) {
+        return filled;
+    }
+    let by_id = history_uids(flows_dir, ttl);
     for m in machines.iter_mut() {
         if m.machine_uid.is_none() {
             if let Some(uid) = by_id.get(&m.id) {
                 m.machine_uid = Some(uid.clone());
+                filled.insert(m.id.clone());
             }
         }
     }
+    filled
 }
 
+/// The roster as this machine reads it, for every route and gather that shows
+/// it: the entries in id order with each `machine_uid` the entry does not
+/// declare filled from flow history ([`backfill_roster_machine_uids`]), and
+/// the ids whose uid came from there. `/fleet/roster` and the fleet view read
+/// it through [`resolved_roster`], so one roster entry has one uid on every
+/// surface.
+pub(crate) struct ResolvedRoster {
+    pub machines: Vec<darkmux_fleet::MachineEntry>,
+    /// Ids whose `machine_uid` was derived from flow history, not declared.
+    pub uid_from_history: std::collections::BTreeSet<String>,
+}
+
+/// The roster file, resolved ([`ResolvedRoster`]); the fixed sentence for a
+/// file that exists and does not parse. Blocking (file reads).
+pub(crate) fn resolved_roster(flows_dir: &std::path::Path) -> Result<ResolvedRoster, &'static str> {
+    let roster = darkmux_fleet::load_roster().map_err(|e| {
+        eprintln!("darkmux serve: reading the fleet roster failed ({e:#})");
+        ROSTER_READ_FAILED
+    })?;
+    let mut machines = roster.machines.into_values().collect::<Vec<_>>();
+    // (#2796) Fill in uids the entry itself does not declare, so the viewer's
+    // uid-based consolidation has something to consolidate on.
+    let uid_from_history = backfill_roster_machine_uids(&mut machines, flows_dir);
+    Ok(ResolvedRoster { machines, uid_from_history })
+}
+
+/// GET /fleet/roster (#1855): the operator's DECLARED fleet topology
+/// (`darkmux machine add`'s `fleet.json`), independent of whether any of it
+/// is beating right now.
+///
+/// This is what closes the "rostered-but-silent machine vanishes entirely"
+/// half of #1855: `/fleet/machines/live` only ever reports a machine that is
+/// currently publishing a presence beat, so a machine the operator
+/// deliberately added and which is down, unreachable, or has simply never
+/// started its daemon produced no card, no offline row, nothing: it read
+/// as though it had never been added. Roster membership is a SEPARATE
+/// question from liveness, and the viewer needs both to tell "not on my
+/// fleet" from "on my fleet, not answering right now".
+///
+/// Deliberately does NOT probe reachability: the fleet view
+/// (`GET /fleet/view`, `darkmux machine list`) dials the peers. This route
+/// only reads a local JSON file and reports what is declared in it, per
+/// "darkmux describes, never adjudicates": it says what the operator's roster
+/// claims, not what darkmux verified about a peer's network reachability.
+///
+/// Never 500s. A missing file is an empty roster (`load_roster`'s own
+/// fresh-install contract, not an error); a PRESENT but corrupt file
+/// reports the parse failure in `error` (a fixed literal, see
+/// [`ROSTER_READ_FAILED`]'s own doc on why, not the underlying error text)
+/// rather than silently discarding the roster and answering as if nothing
+/// were ever added.
 async fn fleet_roster_handler() -> axum::Json<wire::FleetRosterResponse> {
-    let result = tokio::task::spawn_blocking(darkmux_fleet::load_roster).await;
+    let result = tokio::task::spawn_blocking(|| resolved_roster(&darkmux_types::config_access::flows_dir())).await;
     let (machines, error) = match result {
-        Ok(Ok(roster)) => {
-            let mut machines = roster.machines.into_values().collect::<Vec<_>>();
-            // (#2796) Fill in uids the entry itself does not declare, so the
-            // viewer's uid-based consolidation has something to consolidate on.
-            backfill_roster_machine_uids(
-                &mut machines,
-                &darkmux_types::config_access::flows_dir(),
-            );
-            (machines, None)
-        }
-        Ok(Err(e)) => {
-            eprintln!("darkmux serve: GET /fleet/roster — reading the roster failed ({e:#})");
-            (Vec::new(), Some(ROSTER_READ_FAILED.to_string()))
-        }
+        Ok(Ok(roster)) => (roster.machines, None),
+        Ok(Err(sentence)) => (Vec::new(), Some(sentence.to_string())),
         Err(e) => {
             eprintln!("darkmux serve: GET /fleet/roster task failed ({e})");
             (Vec::new(), Some("internal error reading the fleet roster".to_string()))
@@ -1242,7 +1314,7 @@ fn build_startup_banner(
 
     // (#881, #2988) Both auth postures, so the operator sees at a glance
     // what reads need and what execution needs.
-    lines.extend(auth_banner_lines(ServeAuth::resolve()));
+    lines.extend(auth_banner_lines(ServeAuth::resolve(), darkmux_types::config_access::fleet_listener_enabled()));
 
     if !flows_dir_exists {
         lines.push(darkmux_types::style::warn(
@@ -1359,6 +1431,8 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
     // would return the mtime of the new binary and report a stale daemon as
     // fresh — the exact false negative this check exists to prevent.
     let _ = STARTUP_EXE_MTIME.set(current_exe_mtime());
+    // Relayed work runs in this process: its dispatches must not probe for a daemon.
+    darkmux_flow::daemon_probe::mark_running_inside_daemon();
     // (#2916 review M1) 10240 is macOS's per-process ceiling (OPEN_MAX).
     let _ = raise_open_file_limit(10_240);
 
@@ -1394,6 +1468,13 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
                 )
             })?;
         record_bound_addr(listener.local_addr().ok());
+        // Tell every client on this machine where this daemon actually bound
+        // (a `--port` on the command line is invisible to config). The guard
+        // removes the record when this block ends, on clean shutdown.
+        let _daemon_record = listener
+            .local_addr()
+            .ok()
+            .map(|a| darkmux_types::daemon_record::publish(&a.ip().to_string(), a.port()));
 
         // Banner: print after bind succeeds so we don't claim "listening"
         // before we actually are.
@@ -1468,6 +1549,7 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
             flows_dir.clone(),
             lab_dir.clone(),
             live_ingest.clone(),
+            fleet_view::FleetContext::production(),
         );
 
         // (#647) Presence edge-recording for playback. Self-emit this machine's
@@ -1648,6 +1730,9 @@ async fn health(
         // (#2916 stage 2 review C5) The busy policy and hosted-job bound the
         // running listener uses, for this machine only.
         fleet_busy: fleet_listener::listener_busy(loopback_caller),
+        // Whether THIS process resolved a token, for `darkmux doctor` run from
+        // a shell that may not have the one the daemon was started with.
+        fleet_token_set: loopback_caller.then(darkmux_flow::serve_token_present),
         // (#2916 re-review C3) The open-file soft limit this daemon runs
         // with (raised at start), for this machine only.
         open_file_limit: if loopback_caller { current_open_file_limit() } else { None },
@@ -2834,27 +2919,45 @@ async fn machine_resources_handler(
 /// --deep` relies on — degraded state is a visible cell, not a failed
 /// command. (#275 PR-A)
 async fn machine_specs_handler() -> axum::Json<wire::MachineSpecsResponse> {
-    // Shell-out probes run in spawn_blocking so the async runtime stays
-    // responsive. Each result is independent — one failure doesn't
-    // cascade.
-    let lms_result = tokio::task::spawn_blocking(darkmux_profiles::lms::list_loaded).await;
-    let (loaded_models, lms_unreachable) = match lms_result {
-        Ok(Ok(m)) => (m, false),
-        _ => (Vec::new(), true),
-    };
-    let ram_total = tokio::task::spawn_blocking(read_ram_total_bytes)
+    // Shell-out probes run off the async runtime.
+    let specs = tokio::task::spawn_blocking(gather_specs)
         .await
-        .ok()
-        .flatten();
-    let ram_free = tokio::task::spawn_blocking(read_ram_free_for_ai_bytes)
-        .await
-        .ok()
-        .flatten();
-    let cpu_brand = tokio::task::spawn_blocking(read_cpu_brand)
-        .await
-        .ok()
-        .flatten();
+        .unwrap_or_else(|_| degraded_specs());
+    axum::Json(specs)
+}
 
+/// What `/machine/specs` answers when its gather task panicked: identity and
+/// versions only, every probed field `null` / empty, so the caller sees the
+/// degraded state instead of a 500 (the contract `machine list` relies on).
+fn degraded_specs() -> wire::MachineSpecsResponse {
+    wire::MachineSpecsResponse {
+        darkmux_version: env!("CARGO_PKG_VERSION").to_string(),
+        flow_schema_version: darkmux_flow::FLOW_SCHEMA_VERSION.to_string(),
+        machine_id: darkmux_flow::resolve_machine_id(),
+        machine_uid: None,
+        os: format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
+        ram_total_bytes: None,
+        ram_free_for_ai_bytes: None,
+        cpu_brand: None,
+        loaded_models: Vec::new(),
+        lms_unreachable: true,
+        utility_model: None,
+        redis_url_redacted: None,
+        generated_at_ms: current_millis(),
+    }
+}
+
+/// The spec sheet `/machine/specs` serves and the machine card embeds: the
+/// ONE gather. Blocking (it shells out); each probe is independent, so one
+/// failure never cascades.
+pub(crate) fn gather_specs() -> wire::MachineSpecsResponse {
+    let (loaded_models, lms_unreachable) = match darkmux_profiles::lms::list_loaded() {
+        Ok(m) => (m, false),
+        Err(_) => (Vec::new(), true),
+    };
+    let ram_total = read_ram_total_bytes();
+    let ram_free = read_ram_free_for_ai_bytes();
+    let cpu_brand = read_cpu_brand();
     let machine_id = darkmux_flow::resolve_machine_id();
     // (#2814) The stable HARDWARE identity beside the NAME. `machine_id` is a
     // label — it defaults to the hostname, macOS reports both the short and
@@ -2888,19 +2991,14 @@ async fn machine_specs_handler() -> axum::Json<wire::MachineSpecsResponse> {
     // failure just yields `None`.
     // (#2915) With the binding's declared window (`n_ctx`, `null` when
     // none is declared), which the machine page's Utility section shows.
-    let utility_model = tokio::task::spawn_blocking(|| {
-        darkmux_profiles::profiles::load_registry(None).ok().and_then(|lr| {
-            lr.registry
-                .utility_model_id()
-                .map(|id| (id.to_string(), lr.registry.utility_model_n_ctx()))
+    let utility_model = darkmux_profiles::profiles::load_registry(None)
+        .ok()
+        .and_then(|lr| {
+            lr.registry.utility_model_id().map(|id| (id.to_string(), lr.registry.utility_model_n_ctx()))
         })
-    })
-    .await
-    .ok()
-    .flatten()
-    .map(|(id, n_ctx)| utility_model(&id, n_ctx, &loaded_models));
+        .map(|(id, n_ctx)| utility_model(&id, n_ctx, &loaded_models));
 
-    axum::Json(wire::MachineSpecsResponse {
+    wire::MachineSpecsResponse {
         darkmux_version: env!("CARGO_PKG_VERSION").to_string(),
         flow_schema_version: darkmux_flow::FLOW_SCHEMA_VERSION.to_string(),
         machine_id,
@@ -2914,7 +3012,7 @@ async fn machine_specs_handler() -> axum::Json<wire::MachineSpecsResponse> {
         utility_model,
         redis_url_redacted,
         generated_at_ms: current_millis(),
-    })
+    }
 }
 
 fn utility_model(id: &str, n_ctx: Option<u32>, loaded_models: &[darkmux_types::LoadedModel]) -> wire::UtilityModel {

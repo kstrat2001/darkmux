@@ -8,7 +8,7 @@
 //!    token. That keeps out something on an allowed machine that cannot
 //!    read it (an agent container, which reaches overlay addresses but not
 //!    the Keychain); any process running as the operator's user can read it
-//!    (`security find-generic-password`), and `machine list --deep` sends it
+//!    (`security find-generic-password`), and `machine list` sends it
 //!    to every roster peer.
 //! 2. the connection comes from a **node on the receiver's allow-list**
 //!    (`fleet.accept_work`), as the overlay network itself reports it
@@ -31,8 +31,9 @@
 //! say who wrote an entry, and every peer could write it (#2916). Redis stays
 //! the shared observability stream.
 
-use crate::job::{WorkJob, WORK_JOB_SCHEMA_VERSION};
-use crate::identity::NodeIdentity;
+use crate::job::{Boundary, SubmissionMode, WorkJob, WorkVersion, WORK_JOB_SCHEMA_VERSION};
+use crate::identity::{IdentityProvider, NodeIdentity};
+use crate::peer::TargetError;
 use anyhow::{anyhow, Context, Result};
 use darkmux_types::config::AcceptWorkEntry;
 use darkmux_types::session_id::SessionId;
@@ -41,13 +42,17 @@ use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::time::Duration;
 
-/// The listener's one route.
+/// The listener's work route.
 pub const SUBMISSION_PATH: &str = "/fleet/work";
+
+/// The listener's card route: this machine's card, with what it accepts from
+/// the verified caller.
+pub const CARD_PATH: &str = "/fleet/card";
 
 /// The request body: the wire version, whether the sender waits for the
 /// result, and the job. `schema` is read first, so a sender on another
 /// version is told so by name.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkSubmission {
     pub schema: String,
@@ -64,14 +69,21 @@ impl WorkSubmission {
 
     /// Parse a request body, checking the version before the job's shape.
     pub fn parse(body: &[u8]) -> std::result::Result<Self, Refusal> {
+        Self::parse_for(body, WorkVersion::current())
+    }
+
+    /// [`parse`](Self::parse) for a receiver speaking `receiver`.
+    fn parse_for(body: &[u8], receiver: WorkVersion) -> std::result::Result<Self, Refusal> {
         let v: serde_json::Value = serde_json::from_slice(body)
             .map_err(|e| Refusal::BadRequest(format!("the body is not JSON: {e}")))?;
-        match v.get("schema").and_then(|s| s.as_str()) {
-            Some(s) if s == WORK_JOB_SCHEMA_VERSION => {}
-            Some(other) => {
-                return Err(Refusal::SchemaMismatch { got: other.to_string() });
-            }
-            None => return Err(Refusal::BadRequest("the body has no `schema`".into())),
+        let Some(schema) = v.get("schema").and_then(|s| s.as_str()) else {
+            return Err(Refusal::BadRequest("the body has no `schema`".into()));
+        };
+        // The same major, and a minor at or below this receiver's own: an
+        // older minor is taken, a newer one (or another major, or a spelling
+        // that is not `major.minor`) is refused, naming both versions.
+        if !WorkVersion::parse(schema).is_some_and(|sent| receiver.takes(&sent)) {
+            return Err(Refusal::SchemaMismatch { got: schema.to_string() });
         }
         let sub: WorkSubmission = serde_json::from_value(v)
             .map_err(|e| Refusal::BadRequest(format!("the job is malformed: {e}")))?;
@@ -82,7 +94,7 @@ impl WorkSubmission {
 
 /// What a reply says happened. Parsed once, at the wire (serde); every
 /// consumer matches on it.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ReplyStatus {
     /// The job ran; the reply carries its exit code and output.
@@ -94,8 +106,16 @@ pub enum ReplyStatus {
     Queued,
     /// The job was accepted but the dispatch itself failed.
     Error,
-    /// The job was not run; `reason` says why.
+    /// The job was not run; `reason` says why, and `refusal` names the
+    /// kind.
     Refused,
+    /// A `check` submission ([`SubmissionMode::Check`]): a run of the job
+    /// would be taken, and `check` says what it would meet. Nothing ran.
+    Checked,
+    /// A status a newer darkmux sends that this one does not know. It is
+    /// never read as any known status: not as a success, not as a refusal.
+    #[serde(other)]
+    Unknown,
 }
 
 /// The reply, for every outcome.
@@ -104,7 +124,7 @@ pub enum ReplyStatus {
 /// line for every answer except a job the sender waits on that was queued:
 /// that body carries a `queued` line when it is queued (again at every
 /// heartbeat while it waits), then the final line.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct SubmissionReply {
     pub status: ReplyStatus,
     /// The machine that answered.
@@ -128,6 +148,96 @@ pub struct SubmissionReply {
     /// Why, for `refused` and `error` (and what a `queued` job waits for).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// For `refused`: the kind of refusal, for consumers to act on. The
+    /// `reason` is the sentence for a person and is never parsed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<RefusalCode>,
+    /// For `checked`: what a run of the job would meet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<CheckReport>,
+}
+
+/// Why a job was refused, as a kind a consumer can match on. Every
+/// [`Refusal`] maps to exactly one ([`Refusal::code`]).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RefusalCode {
+    /// The fleet token is missing or wrong, or the receiver has none.
+    Token,
+    /// The receiver cannot place the caller on the overlay network, or its
+    /// identity provider cannot answer.
+    Identity,
+    /// The caller is not on the receiver's allow-list.
+    NotListed,
+    /// The role is outside the caller's entry.
+    RoleNotAllowed,
+    /// The profile is outside the caller's entry, or is the utility model.
+    ProfileNotAllowed,
+    /// The image is outside the caller's entry.
+    ImageNotAllowed,
+    /// The caller may not name a working directory.
+    WorkspaceNotAllowed,
+    /// No work profile resolves on the receiver (undefined, quarantined, or
+    /// no binding).
+    ProfileUndefined,
+    /// The job's boundary is not met by the profile it resolves to, or names
+    /// a boundary the receiver cannot enforce.
+    Boundary,
+    /// The seat is busy, the queue is full, or the caller has too many
+    /// requests in flight.
+    Busy,
+    /// A queued job's profile moved to another seat while it waited.
+    SeatChanged,
+    /// The wire version is not one the receiver takes.
+    Version,
+    /// The job is addressed to another machine name.
+    Misaddressed,
+    /// The request came from the receiver's own node.
+    #[serde(rename = "self")]
+    FromSelf,
+    /// The receiver's own config must be fixed first.
+    BadConfig,
+    /// A malformed request.
+    BadRequest,
+    /// A code a newer darkmux sends that this one does not know. Never read
+    /// as any known kind.
+    #[serde(other)]
+    Unknown,
+}
+
+/// What a `check` found: the answer to "would a run of this job be taken, and
+/// what would it meet". The resolved profile rides in the reply's `profile`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+pub struct CheckReport {
+    /// What the resolved profile's model is, as the boundary sees it.
+    pub endpoint: EndpointClass,
+    /// What a run would meet at its seat.
+    pub seat: SeatOutlook,
+}
+
+/// Whether the resolved profile's model is served by the receiver itself.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EndpointClass {
+    /// A managed endpoint: a model this machine loads and serves.
+    Managed,
+    /// A hosted endpoint this machine only sends requests to.
+    Unmanaged,
+    #[serde(other)]
+    Unknown,
+}
+
+/// What a run would meet at its seat right now (a fact of this moment: the
+/// seat can be taken before the real job arrives).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SeatOutlook {
+    /// The seat is free: a run starts at once.
+    Free,
+    /// The seat is busy and the receiver queues: a run waits its turn.
+    WouldQueue,
+    #[serde(other)]
+    Unknown,
 }
 
 /// A reply's `session_id`, kept only when it parses in the session grammar.
@@ -148,6 +258,8 @@ impl SubmissionReply {
             stdout: None,
             stderr: None,
             reason: None,
+            refusal: None,
+            check: None,
         }
     }
 }
@@ -172,18 +284,17 @@ pub enum Refusal {
     IdentityUnavailable { provider: String, detail: String },
     /// No node on the overlay holds the connecting address.
     NotOnOverlay { provider: String, addr: String },
-    /// A node, but not one on the allow-list.
-    NotAllowed { node_name: String },
+    /// A node, but not one on the allow-list. `ask` says which
+    /// `darkmux machine trust` command admits it.
+    NotAllowed { node_name: String, ask: TrustAsk },
     /// The allow-list names the same node under several machine names.
     AmbiguousEntry { names: Vec<String> },
     /// Addressed to another machine name.
     Misaddressed { target: String },
-    WorkspaceOutOfScope { peer: String },
-    RoleOutOfScope { peer: String, role: String, allowed: Vec<String> },
-    ImageOutOfScope { peer: String, image: String },
+    /// Part of the job is outside the peer's allow-list entry.
+    OutOfScope { peer: String, item: OutOfScope },
     /// The connection came from THIS machine's own node.
     FromSelf,
-    ProfileOutOfScope { peer: String, profile: String, allowed: Vec<String> },
     UtilityProfile { profile: String },
     NoWorkProfile { role: String, detail: String },
     SchemaMismatch { got: String },
@@ -198,6 +309,11 @@ pub enum Refusal {
     /// resolved to changed to one on a different seat than the one it
     /// waited for.
     SeatChanged { profile: String },
+    /// The job's boundary is `managed_only` and the profile it resolves to
+    /// runs on a hosted endpoint.
+    BoundaryUnmanaged { profile: String },
+    /// The job names a boundary this receiver cannot enforce.
+    BoundaryUnknown,
     /// (#2916 round 3 C5) One node already has its cap of requests in flight.
     TooManyAtOnce { peer: String },
     /// (#2947) This machine's own config has an unregistered value in an
@@ -208,7 +324,107 @@ pub enum Refusal {
     BadConfig { detail: String },
 }
 
+/// What of a job is outside a peer's allow-list entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutOfScope {
+    Role { role: String, allowed: Vec<String> },
+    Image { image: String },
+    Workspace,
+    Profile { profile: String, allowed: Vec<String> },
+}
+
+impl OutOfScope {
+    fn code(&self) -> RefusalCode {
+        match self {
+            OutOfScope::Role { .. } => RefusalCode::RoleNotAllowed,
+            OutOfScope::Image { .. } => RefusalCode::ImageNotAllowed,
+            OutOfScope::Workspace => RefusalCode::WorkspaceNotAllowed,
+            OutOfScope::Profile { .. } => RefusalCode::ProfileNotAllowed,
+        }
+    }
+
+    /// The sentence, for `peer` on `receiver`.
+    fn reason(&self, receiver: &str, peer: &str) -> String {
+        match self {
+            OutOfScope::Role { role, allowed } => format!(
+                "not in the allow-list scope: role {role} ({receiver} lets {peer} run roles: {})",
+                if allowed.is_empty() { "none".to_string() } else { allowed.join(", ") }
+            ),
+            OutOfScope::Image { image } => format!(
+                "not in the allow-list scope: image {image} ({receiver} lets {peer} use only darkmux's own \
+                 runtime image unless the entry lists others)"
+            ),
+            OutOfScope::Workspace => format!(
+                "not in the allow-list scope: {receiver} does not let {peer} name a working \
+                 directory (workspace: false)"
+            ),
+            OutOfScope::Profile { profile, allowed } => format!(
+                "not in the allow-list scope: profile {profile} ({receiver} lets {peer} run: {})",
+                if allowed.is_empty() { "nothing".to_string() } else { allowed.join(", ") }
+            ),
+        }
+    }
+}
+
+/// What the receiver's `darkmux machine trust` needs to admit a sender that
+/// is on no allow-list entry. Resolved once by [`TrustAsk::for_sender`] and
+/// printed by [`TrustAsk::command`], so the sentence names an entry the
+/// receiver's own tools resolve.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrustAsk {
+    /// The NAME argument: the receiver's roster id for the verified node,
+    /// or the machine id the sender claimed. `None` names the node itself.
+    pub name: Option<String>,
+    /// `--node`: needed when NAME is not the roster entry of the node
+    /// (a claimed id), because the lookup then has no roster address to use.
+    pub node: Option<String>,
+    /// The role the job asked for.
+    pub role: Option<String>,
+}
+
+impl TrustAsk {
+    /// The ask for `node`, refused with `body` (the job it posted, read
+    /// loosely: only its role and claimed machine id, each kept only when
+    /// well formed). When the receiver's `roster` has an entry for the node,
+    /// that entry's id is NAME and the roster address finds the node. Else
+    /// the sender's claimed id is NAME, with `--node` naming the node.
+    pub fn for_sender(node: &NodeIdentity, roster: &crate::roster::FleetRoster, body: &[u8]) -> Self {
+        let job = serde_json::from_slice::<serde_json::Value>(body).ok().and_then(|v| v.get("job").cloned());
+        let text = |field: &str| job.as_ref().and_then(|j| j.get(field)).and_then(|f| f.as_str()).map(str::to_string);
+        let role = text("role_id").filter(|r| crate::job::validate_work_identifier("role_id", r).is_ok());
+        let on_roster = roster.machines.values().find(|m| {
+            node.answers_to(&m.id) || crate::roster::address_host(&m.address).is_some_and(|h| node.answers_to(&h))
+        });
+        if let Some(entry) = on_roster {
+            return Self { name: Some(entry.id.clone()), node: None, role };
+        }
+        let claimed = text("published_by_machine")
+            .filter(|c| darkmux_types::profile_address::machine_name_problem(c).is_none());
+        match claimed {
+            Some(c) => Self { name: Some(c), node: Some(node.name.clone()), role },
+            None => Self { name: None, node: None, role },
+        }
+    }
+
+    /// The command, for a node the network calls `node_name`.
+    fn command(&self, node_name: &str) -> String {
+        let name = self.name.as_deref().unwrap_or(node_name);
+        let node = self.node.as_ref().map(|n| format!(" --node {n}")).unwrap_or_default();
+        let role = self.role.as_deref().unwrap_or("<role>");
+        format!("darkmux machine trust {name}{node} --profiles <profile> --roles {role}")
+    }
+}
+
 impl Refusal {
+    /// This refusal with `ask` as the trust command, when it is a
+    /// [`Refusal::NotAllowed`]; any other refusal is returned unchanged.
+    pub fn with_trust_ask(self, ask: TrustAsk) -> Self {
+        match self {
+            Refusal::NotAllowed { node_name, .. } => Refusal::NotAllowed { node_name, ask },
+            other => other,
+        }
+    }
+
     /// HTTP status for the reply.
     pub fn http_status(&self) -> u16 {
         match self {
@@ -223,7 +439,35 @@ impl Refusal {
             | Refusal::NoTokenConfigured
             | Refusal::IdentityUnavailable { .. }
             | Refusal::BadConfig { .. } => 503,
-            _ => 403,
+            Refusal::NotOnOverlay { .. }
+            | Refusal::NotAllowed { .. }
+            | Refusal::AmbiguousEntry { .. }
+            | Refusal::OutOfScope { .. }
+            | Refusal::FromSelf
+            | Refusal::UtilityProfile { .. }
+            | Refusal::BoundaryUnmanaged { .. }
+            | Refusal::BoundaryUnknown => 403,
+        }
+    }
+
+    /// The kind of this refusal, for the reply's `refusal` field. The one
+    /// place a refusal is classified.
+    pub fn code(&self) -> RefusalCode {
+        match self {
+            Refusal::NoTokenConfigured | Refusal::Token => RefusalCode::Token,
+            Refusal::IdentityUnavailable { .. } | Refusal::NotOnOverlay { .. } => RefusalCode::Identity,
+            Refusal::NotAllowed { .. } => RefusalCode::NotListed,
+            Refusal::AmbiguousEntry { .. } | Refusal::BadConfig { .. } => RefusalCode::BadConfig,
+            Refusal::Misaddressed { .. } => RefusalCode::Misaddressed,
+            Refusal::OutOfScope { item, .. } => item.code(),
+            Refusal::FromSelf => RefusalCode::FromSelf,
+            Refusal::UtilityProfile { .. } => RefusalCode::ProfileNotAllowed,
+            Refusal::NoWorkProfile { .. } => RefusalCode::ProfileUndefined,
+            Refusal::SchemaMismatch { .. } => RefusalCode::Version,
+            Refusal::BadRequest(_) => RefusalCode::BadRequest,
+            Refusal::Busy { .. } | Refusal::QueueFull { .. } | Refusal::TooManyAtOnce { .. } => RefusalCode::Busy,
+            Refusal::SeatChanged { .. } => RefusalCode::SeatChanged,
+            Refusal::BoundaryUnmanaged { .. } | Refusal::BoundaryUnknown => RefusalCode::Boundary,
         }
     }
 
@@ -250,10 +494,9 @@ impl Refusal {
                 "{receiver} does not accept work from {addr}: the connection did not come from a \
                  node on the {provider} network (a LAN or public address is never accepted)"
             ),
-            Refusal::NotAllowed { node_name } => format!(
-                "{receiver} does not accept work from {node_name} (on {receiver}: `darkmux machine \
-                 trust {node_name} --profiles <profile>`)"
-            ),
+            Refusal::NotAllowed { node_name, ask } => {
+                format!("{receiver} does not accept work from {node_name} (on {receiver}: `{}`)", ask.command(node_name))
+            }
             Refusal::AmbiguousEntry { names } => format!(
                 "{receiver}'s allow-list names the sending machine more than once ({}); \
                  remove all but one with `darkmux machine untrust <name>` on {receiver}",
@@ -264,25 +507,10 @@ impl Refusal {
                  {receiver}. On the sender, `darkmux machine list` shows the entry; point {target} at \
                  {target}'s own tailnet DNS name, or send the job to {receiver} by that name"
             ),
-            Refusal::RoleOutOfScope { peer, role, allowed } => format!(
-                "not in the allow-list scope: role {role} ({receiver} lets {peer} run roles: {})",
-                if allowed.is_empty() { "none".to_string() } else { allowed.join(", ") }
-            ),
-            Refusal::ImageOutOfScope { peer, image } => format!(
-                "not in the allow-list scope: image {image} ({receiver} lets {peer} use only darkmux's own \
-                 runtime image unless the entry lists others)"
-            ),
+            Refusal::OutOfScope { peer, item } => item.reason(receiver, peer),
             Refusal::FromSelf => format!(
                 "{receiver} does not take fleet work from itself; run it locally (address the \
                  profile without `@{receiver}`)"
-            ),
-            Refusal::WorkspaceOutOfScope { peer } => format!(
-                "not in the allow-list scope: {receiver} does not let {peer} name a working \
-                 directory (workspace: false)"
-            ),
-            Refusal::ProfileOutOfScope { peer, profile, allowed } => format!(
-                "not in the allow-list scope: profile {profile} ({receiver} lets {peer} run: {})",
-                if allowed.is_empty() { "nothing".to_string() } else { allowed.join(", ") }
             ),
             Refusal::UtilityProfile { profile } => format!(
                 "profile {profile} resolves only to {receiver}'s utility model; utility work is never \
@@ -292,8 +520,9 @@ impl Refusal {
                 "{receiver} cannot resolve a work profile for role {role}: {detail}"
             ),
             Refusal::SchemaMismatch { got } => format!(
-                "{receiver} speaks work-submission schema v{WORK_JOB_SCHEMA_VERSION}, the sender sent \
-                 v{got}; run the same darkmux version on both machines"
+                "{receiver} speaks work-submission schema v{WORK_JOB_SCHEMA_VERSION} (it takes the same major \
+                 version with a minor up to its own), the sender sent v{got}; run a darkmux with the same \
+                 major version on both machines, and the newer minor on the receiver"
             ),
             Refusal::BadRequest(detail) => format!("{receiver} refused a malformed request: {detail}"),
             Refusal::TooManyAtOnce { peer } => format!(
@@ -312,6 +541,14 @@ impl Refusal {
                 "busy: {receiver} is running other work on that seat ({what}), and {peer} already \
                  has as many jobs queued on {receiver} as it may. Retry when one finishes"
             ),
+            Refusal::BoundaryUnmanaged { profile } => format!(
+                "{receiver}'s profile {profile} runs on a hosted endpoint, and this job may go only to \
+                 a model {receiver} serves itself (boundary managed_only)"
+            ),
+            Refusal::BoundaryUnknown => format!(
+                "{receiver} does not know the boundary this job carries, so it cannot enforce it and \
+                 does not run the job; run the same darkmux version on both machines"
+            ),
             Refusal::BadConfig { detail } => format!(
                 "{receiver} cannot run work until its own config is fixed (on {receiver}: \
                  `darkmux doctor`, then restart `darkmux serve`, which reads config once at \
@@ -324,6 +561,7 @@ impl Refusal {
         SubmissionReply {
             machine: Some(receiver.to_string()),
             reason: Some(self.reason(receiver)),
+            refusal: Some(self.code()),
             ..SubmissionReply::of(ReplyStatus::Refused)
         }
     }
@@ -344,28 +582,31 @@ pub struct Admitted {
     pub workspace: bool,
 }
 
-/// Token + network identity + allow-list. Checked in that order, and the
-/// order is deliberate: the token comparison is constant-time and free,
-/// while the identity lookup runs the provider's tool, so a caller without
-/// the token never makes this machine spawn anything.
+impl Admitted {
+    /// The refusal for something in a job outside this peer's entry.
+    fn out_of_scope(&self, item: OutOfScope) -> Refusal {
+        Refusal::OutOfScope { peer: self.peer_name.clone(), item }
+    }
+}
+
+/// Who is calling: the token, then the network identity, then "not this
+/// machine". This is the whole of what a READ needs (a card): a caller that
+/// holds the fleet token from a node the overlay names is a verified fleet
+/// peer whether or not this machine lets it run anything. Checked in that
+/// order, and the order is deliberate: the token comparison is constant-time
+/// and free, while the identity lookup runs the provider's tool, so a caller
+/// without the token never makes this machine spawn anything.
 ///
 /// `identity` is the provider's answer for the connecting address:
 /// `Ok(Some)` a node, `Ok(None)` no node holds it, `Err(detail)` the
-/// provider could not answer. The last two refuse (fail closed). An entry
-/// without a `node_id` never matches.
-///
-/// `allow` reads the allow-list, and is called only AFTER the identity
-/// lookup (which runs the provider's tool, up to its 3 s bound), so an
-/// `untrust` that lands while the provider answers is still seen. An
-/// allow-list that cannot be read refuses everything.
-pub fn admit(
+/// provider could not answer. The last two refuse (fail closed).
+pub fn authenticate(
     token: TokenCheck,
     identity: impl FnOnce() -> std::result::Result<Option<NodeIdentity>, String>,
     provider: &str,
     peer_addr: IpAddr,
     local_node_id: Option<&str>,
-    allow: impl FnOnce() -> std::result::Result<BTreeMap<String, AcceptWorkEntry>, String>,
-) -> std::result::Result<Admitted, Refusal> {
+) -> std::result::Result<NodeIdentity, Refusal> {
     match token {
         TokenCheck::Match => {}
         TokenCheck::Mismatch => return Err(Refusal::Token),
@@ -384,10 +625,37 @@ pub fn admit(
     if local_node_id.is_some_and(|me| !me.is_empty() && me == node.node_id) {
         return Err(Refusal::FromSelf);
     }
+    Ok(node)
+}
+
+/// What an authenticated node may do here: its entry on the allow-list
+/// (`fleet.accept_work`). Work needs it; a card read reports it as data.
+///
+/// `allow` reads the allow-list, and is called only when this runs, which is
+/// AFTER the identity lookup (which runs the provider's tool, up to its 3 s
+/// bound), so an `untrust` that lands while the provider answers is still
+/// seen. An allow-list that cannot be read refuses everything.
+pub fn authorize(
+    node: &NodeIdentity,
+    allow: impl FnOnce() -> std::result::Result<BTreeMap<String, AcceptWorkEntry>, String>,
+) -> std::result::Result<Admitted, Refusal> {
     let allow = allow().map_err(|e| {
         Refusal::BadRequest(format!("this machine's allow-list cannot be read ({e}); refusing everything"))
     })?;
     match_entry(&node.node_id, &node.name, &allow)
+}
+
+/// [`authenticate`], then [`authorize`]: the one admission path for work.
+pub fn admit(
+    token: TokenCheck,
+    identity: impl FnOnce() -> std::result::Result<Option<NodeIdentity>, String>,
+    provider: &str,
+    peer_addr: IpAddr,
+    local_node_id: Option<&str>,
+    allow: impl FnOnce() -> std::result::Result<BTreeMap<String, AcceptWorkEntry>, String>,
+) -> std::result::Result<Admitted, Refusal> {
+    let node = authenticate(token, identity, provider, peer_addr, local_node_id)?;
+    authorize(&node, allow)
 }
 
 /// The allow-list entry for the node `node_id` (named `node_name` on the
@@ -403,7 +671,7 @@ fn match_entry(
         .filter(|(_, e)| e.node_id.as_deref().is_some_and(|id| !id.is_empty() && id == node_id))
         .collect();
     match matches.as_slice() {
-        [] => Err(Refusal::NotAllowed { node_name: node_name.to_string() }),
+        [] => Err(Refusal::NotAllowed { node_name: node_name.to_string(), ask: TrustAsk::default() }),
         [(name, entry)] => Ok(Admitted {
             peer_name: (*name).clone(),
             node_id: node_id.to_string(),
@@ -457,7 +725,8 @@ pub struct ScopedJob {
     pub seat: crate::seats::WorkSeat,
 }
 
-/// The job against the admitted peer's scope.
+/// The job against the admitted peer's scope, then its boundary
+/// ([`check_boundary`]).
 pub fn check_scope(
     receiver: &str,
     admitted: &Admitted,
@@ -468,19 +737,15 @@ pub fn check_scope(
         return Err(Refusal::Misaddressed { target: job.target_machine.clone() });
     }
     if !admitted.roles.iter().any(|r| r == &job.role_id) {
-        return Err(Refusal::RoleOutOfScope {
-            peer: admitted.peer_name.clone(),
-            role: job.role_id.clone(),
-            allowed: admitted.roles.clone(),
-        });
+        return Err(admitted.out_of_scope(OutOfScope::Role { role: job.role_id.clone(), allowed: admitted.roles.clone() }));
     }
     if let Some(image) = &job.image {
         if !admitted.images.iter().any(|i| i == image) {
-            return Err(Refusal::ImageOutOfScope { peer: admitted.peer_name.clone(), image: image.clone() });
+            return Err(admitted.out_of_scope(OutOfScope::Image { image: image.clone() }));
         }
     }
     if job.workdir.is_some() && !admitted.workspace {
-        return Err(Refusal::WorkspaceOutOfScope { peer: admitted.peer_name.clone() });
+        return Err(admitted.out_of_scope(OutOfScope::Workspace));
     }
     let (profile, seat) = match resolution {
         ProfileResolution::Work { profile, seat } => (profile, seat),
@@ -490,13 +755,27 @@ pub fn check_scope(
         }
     };
     if !admitted.profiles.iter().any(|p| p == &profile) {
-        return Err(Refusal::ProfileOutOfScope {
-            peer: admitted.peer_name.clone(),
-            profile,
-            allowed: admitted.profiles.clone(),
-        });
+        return Err(admitted.out_of_scope(OutOfScope::Profile { profile, allowed: admitted.profiles.clone() }));
     }
-    Ok(ScopedJob { profile, seat })
+    let scoped = ScopedJob { profile, seat };
+    check_boundary(job, &scoped)?;
+    Ok(scoped)
+}
+
+/// The job's boundary against the seat its profile RESOLVED to: the one
+/// enforcement, run by [`check_scope`] when a job arrives and again when a
+/// queued job gets its seat. The seat's kind comes from the same resolution
+/// every dispatch uses (`darkmux_crew::target::target_for`, through
+/// [`classify_profile`]), the resolution the machine card reports as a
+/// model's `endpoint_kind`.
+fn check_boundary(job: &WorkJob, scoped: &ScopedJob) -> std::result::Result<(), Refusal> {
+    match (job.boundary, &scoped.seat) {
+        (None, _) | (Some(Boundary::ManagedOnly), crate::seats::WorkSeat::Local { .. }) => Ok(()),
+        (Some(Boundary::ManagedOnly), crate::seats::WorkSeat::Hosted { .. }) => {
+            Err(Refusal::BoundaryUnmanaged { profile: scoped.profile.clone() })
+        }
+        (Some(Boundary::Unknown), _) => Err(Refusal::BoundaryUnknown),
+    }
 }
 
 /// Resolve the profile a job would run on, against an already-loaded
@@ -630,12 +909,27 @@ fn unreadable_line(where_: &str, line: &str, not_a_listener: &dyn Fn(&str) -> an
     }
 }
 
+/// Whether a transport failure means the peer's listener never accepted the
+/// connection (off, or its daemon is down): the ONE classifier for that case,
+/// used by the submission error below and by `/fleet/view`'s `listener_off`.
+pub fn is_listener_off(t: &ureq::Transport) -> bool {
+    t.kind() == ureq::ErrorKind::ConnectionFailed
+}
+
+/// The one sentence for [`is_listener_off`], naming where it was dialed.
+pub fn listener_off_sentence(where_: &str) -> String {
+    format!("the fleet listener at {where_} is not accepting connections (off, or the daemon is down); nothing was sent")
+}
+
 /// A transport failure: nothing was sent when the connection never opened;
 /// otherwise the answer was lost and the job may be running ([`AnswerLost`]).
 fn transport_failure(where_: &str, t: &ureq::Transport) -> anyhow::Error {
     use ureq::ErrorKind;
+    if is_listener_off(t) {
+        return anyhow!("{}", listener_off_sentence(where_));
+    }
     match t.kind() {
-        ErrorKind::Dns | ErrorKind::ConnectionFailed | ErrorKind::InvalidUrl | ErrorKind::UnknownScheme => {
+        ErrorKind::Dns | ErrorKind::InvalidUrl | ErrorKind::UnknownScheme => {
             anyhow!("no answer from {where_}: {t}; nothing was sent")
         }
         _ => AnswerLost { detail: format!("no answer from {where_}: {t}") }.into(),
@@ -667,6 +961,12 @@ pub(crate) fn read_reply_lines(
             continue;
         }
         let reply: SubmissionReply = serde_json::from_str(line).map_err(|_| unreadable_line(where_, line, &not_a_listener))?;
+        // A status this darkmux does not know parses as `Unknown`; the line
+        // still names it, and the job may be running, so it reports the same
+        // way an unparseable status does.
+        if reply.status == ReplyStatus::Unknown {
+            return Err(unreadable_line(where_, line, &not_a_listener));
+        }
         // Only a `queued` line may be followed by another.
         if last.take().is_some_and(|prev| prev.status != ReplyStatus::Queued) {
             return Err(not_a_listener(line));
@@ -852,10 +1152,10 @@ pub fn verify_target(
     target: &str,
     entry: &crate::MachineEntry,
     provider: &dyn crate::identity::IdentityProvider,
-) -> Result<VerifiedTarget> {
+) -> std::result::Result<VerifiedTarget, TargetError> {
     let mut ips = crate::roster::resolve_host_addrs(&entry.address);
     if ips.is_empty() {
-        return Err(anyhow!("the roster address for {target} (`{}`) does not resolve; nothing was sent", entry.address));
+        return Err(TargetError::DoesNotResolve { target: target.to_string(), address: entry.address.clone() });
     }
     // (#2916 round 3) Try the answers IPv4 first: a fleet listener binds the
     // node's IPv4 overlay address, so an IPv6-first resolver answer must not
@@ -877,39 +1177,81 @@ pub fn verify_target(
     let (ip, node) = match (found, last_err) {
         (Some(x), _) => x,
         (None, Some(e)) => {
-            return Err(anyhow!(
-                "cannot verify {target}'s address with {} ({e:#}); nothing was sent",
-                provider.provider_name()
-            ))
+            return Err(TargetError::IdentityUnavailable {
+                target: target.to_string(),
+                provider: provider.provider_name().to_string(),
+                detail: format!("{e:#}"),
+            })
         }
         (None, None) => {
-            return Err(anyhow!(
-                "the roster address for {target} (`{}`) is not a node on the {} network, so nothing \
-                 was sent to it (not the fleet token, not the request). Point the entry at {target}'s \
-                 tailnet DNS name: `darkmux machine add {target} --address <its tailnet DNS name>`",
-                entry.address,
-                provider.provider_name()
-            ))
+            return Err(TargetError::NotOnOverlay {
+                target: target.to_string(),
+                address: entry.address.clone(),
+                provider: provider.provider_name().to_string(),
+            })
         }
     };
     match entry.node_id.as_deref().filter(|p| !p.is_empty()) {
-        Some(pinned) if pinned != node.node_id => Err(anyhow!(
-            "the node at {target}'s address (`{}`) is not the one this roster pinned for {target}; \
-             nothing was sent. If {target} really was replaced, re-pin it with `darkmux machine add \
-             {target} --address <its tailnet DNS name>`",
-            node.name
-        )),
+        Some(pinned) if pinned != node.node_id => {
+            Err(TargetError::PinMismatch { target: target.to_string(), node_name: node.name })
+        }
         Some(_) => Ok(VerifiedTarget { ip, node, newly_pinned: false }),
         None => Ok(VerifiedTarget { ip, node, newly_pinned: true }),
     }
 }
 
-/// Submit `job` to the machine it is addressed to: look the machine up in
-/// this machine's roster (case-insensitively), verify the node at its
-/// address ([`verify_target`]), then dial that verified address's fleet
-/// listener with the fleet token. A refusal comes back as `Err` carrying
-/// the receiver's reason (control characters removed).
-pub fn submit_work(job: WorkJob, wait: bool) -> Result<SubmissionReply> {
+/// Whether [`send_job`] may write a first-contact pin into the roster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PinPolicy {
+    /// Pin the verified node on first contact (a send that is about to submit).
+    PinOnFirstContact,
+    /// Never write the roster: an unpinned target is not contacted at all.
+    RequirePinned,
+}
+
+/// The target's node is not pinned in the roster yet, so a read-only send
+/// stopped before contacting it.
+#[derive(Debug)]
+struct NotPinned {
+    machine: String,
+}
+
+impl std::fmt::Display for NotPinned {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} has no pinned node in the roster yet", self.machine)
+    }
+}
+
+impl std::error::Error for NotPinned {}
+
+/// First contact with a verified node: pin it in the roster, or, for a
+/// read-only caller, stop before anything is sent to it.
+fn settle_pin(peer: &crate::peer::PeerTarget, id: &str, target: &str, pins: PinPolicy, provider: &str) -> Result<()> {
+    if peer.newly_pinned.is_none() {
+        return Ok(());
+    }
+    if pins == PinPolicy::RequirePinned {
+        return Err(NotPinned { machine: target.to_string() }.into());
+    }
+    crate::peer::persist_pin(id, peer).context("pinning the target's node in the roster")?;
+    eprintln!("darkmux: pinned {target} to its {provider} node (first contact); later contacts check it");
+    Ok(())
+}
+
+/// Pin a freshly verified peer's node in the roster before the fleet token is
+/// sent to it, exactly as a work submission does ([`send_job`]): the ONE
+/// first-contact pin. A no-op for a peer already pinned.
+pub fn pin_on_first_contact(peer: &crate::peer::PeerTarget, id: &str, provider: &dyn IdentityProvider) -> Result<()> {
+    settle_pin(peer, id, id, PinPolicy::PinOnFirstContact, provider.provider_name())
+}
+
+/// Send `job` to the machine it is addressed to and return the receiver's
+/// final reply, whatever it says: look the machine up in this machine's
+/// roster (case-insensitively), verify the node at its address
+/// ([`verify_target`]), then dial that verified address's fleet listener with
+/// the fleet token. `Err` only when no answer came (or the target could not
+/// be verified, so nothing was sent).
+fn send_job(job: WorkJob, wait: bool, pins: PinPolicy) -> Result<(u16, SubmissionReply)> {
     job.validate().context("validating the job before it leaves")?;
     let target = job.target_machine.clone();
     let roster = crate::load_roster().context("reading the fleet roster")?;
@@ -931,14 +1273,8 @@ pub fn submit_work(job: WorkJob, wait: bool) -> Result<SubmissionReply> {
     let port = darkmux_types::config_access::fleet_listener_port();
     // Every address is verified for work, loopback included (the listener
     // never binds loopback, so a real provider refuses it).
-    let peer = crate::peer::peer_target(&target, &entry, None, Some(port), port, false, provider.as_ref())?;
-    if peer.newly_pinned.is_some() {
-        crate::peer::persist_pin(&entry.id, &peer).context("pinning the target's node in the roster")?;
-        eprintln!(
-            "darkmux dispatch: pinned {target} to its {} node (first contact); later sends check it",
-            provider.provider_name()
-        );
-    }
+    let peer = crate::peer::peer_target(&target, &entry, None, port, false, provider.as_ref())?.at_listener(port);
+    settle_pin(&peer, &entry.id, &target, pins, provider.provider_name())?;
     let read_timeout = if wait {
         Duration::from_secs(u64::from(job.timeout_seconds).saturating_add(120))
     } else {
@@ -956,34 +1292,191 @@ pub fn submit_work(job: WorkJob, wait: bool) -> Result<SubmissionReply> {
             }
         }
     };
-    let (code, reply) =
-        send_submission(&peer, &submission, read_timeout, &mut on_progress).map_err(|e| match e.downcast::<AnswerLost>() {
-            Ok(lost) => {
-                // The receiver names the run after the allow-list entry it
-                // trusts this machine under, normally this machine_id.
-                let me = darkmux_flow::resolve_machine_id().unwrap_or_else(|| "<this machine>".into());
-                let theirs = SessionId::relay(session_id.clone(), me);
-                anyhow!(
-                    "{lost}. The job may still be running on {target} (session {theirs}); follow it \
-                     there in its viewer or with `darkmux flow tail`"
-                )
-            }
-            Err(other) => other,
-        })?;
+    send_submission(&peer, &submission, read_timeout, &mut on_progress).map_err(|e| match e.downcast::<AnswerLost>() {
+        Ok(lost) => {
+            // The receiver names the run after the allow-list entry it
+            // trusts this machine under, normally this machine_id.
+            let me = darkmux_flow::resolve_machine_id().unwrap_or_else(|| "<this machine>".into());
+            let theirs = SessionId::relay(session_id.clone(), me);
+            anyhow!(
+                "{lost}. The job may still be running on {target} (session {theirs}); follow it \
+                 there in its viewer or with `darkmux flow tail`"
+            )
+        }
+        Err(other) => other,
+    })
+}
+
+/// Submit `job` to the machine it is addressed to ([`send_job`]). A refusal
+/// comes back as `Err` carrying a [`SubmitRefused`] (the receiver's reason,
+/// control characters removed, and its typed code).
+pub fn submit_work(job: WorkJob, wait: bool) -> Result<SubmissionReply> {
+    let target = job.target_machine.clone();
+    let (code, reply) = send_job(job, wait, PinPolicy::PinOnFirstContact)?;
+    reply_outcome(&target, code, reply)
+}
+
+/// A receiver refused a job. Carried by [`submit_work`]'s `Err` so a caller
+/// reads the [`RefusalCode`], not the sentence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmitRefused {
+    pub code: RefusalCode,
+    /// The receiver's sentence, control characters removed. For a person.
+    pub reason: String,
+}
+
+impl std::fmt::Display for SubmitRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for SubmitRefused {}
+
+/// What a receiver's final reply means to the sender: the reply for a job it
+/// took, an error for one it did not, ran badly, or answered in a status this
+/// darkmux does not know (never read as taken).
+fn reply_outcome(target: &str, code: u16, reply: SubmissionReply) -> Result<SubmissionReply> {
     match reply.status {
         ReplyStatus::Completed | ReplyStatus::Accepted | ReplyStatus::Queued => Ok(reply),
         ReplyStatus::Error => Err(anyhow!(
             "{target} accepted the job but the dispatch failed: {}",
             sanitize_remote_text(reply.reason.as_deref().unwrap_or("no reason given"))
         )),
-        ReplyStatus::Refused => Err(anyhow!(
-            "{}",
-            reply
+        ReplyStatus::Unknown => Err(anyhow!(
+            "{target} answered with a status this darkmux does not recognize (is it on a newer darkmux? \
+             run the same version on both machines)"
+        )),
+        ReplyStatus::Checked => Err(anyhow!(
+            "{target} answered a job with `checked`, which answers only a check: it ran nothing"
+        )),
+        ReplyStatus::Refused => Err(SubmitRefused {
+            code: reply.refusal.unwrap_or(RefusalCode::Unknown),
+            reason: reply
                 .reason
                 .as_deref()
                 .map(sanitize_remote_text)
-                .unwrap_or_else(|| format!("{target} refused the job (HTTP {code})"))
-        )),
+                .unwrap_or_else(|| format!("{target} refused the job (HTTP {code})")),
+        }
+        .into()),
+    }
+}
+
+/// What asking a peer "would this route work" found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckOutcome {
+    /// A run would be taken: the profile it would run on, and what it meets.
+    Routable { profile: String, report: CheckReport },
+    /// A run would be refused, with the receiver's typed code and sentence.
+    Refused { code: RefusalCode, reason: String },
+    /// No usable answer: the peer could not be reached or verified, or
+    /// answered something that is not a check's answer. `detail` says which.
+    Unanswered { detail: String },
+}
+
+/// The one authoritative "would this route work": ask the machine in
+/// `profile_address` (`profile@machine`) whether it would take a job for
+/// `role` on that profile under `boundary`, by submitting a check
+/// ([`SubmissionMode::Check`]). The receiver runs every gate a real job
+/// meets (its token, the network identity, the allow-list, role and profile
+/// scope, the boundary, the seat, the version) and answers without running
+/// anything, so the answer cannot drift from the decision a run would get.
+/// Radio calls this (its submit follows, so pinning on first contact is fine);
+/// doctor calls [`check_route_read_only`]. Neither re-derives it from
+/// allow-lists or cards.
+pub fn check_route(profile_address: &str, role: &str, boundary: Option<Boundary>) -> CheckOutcome {
+    run_check(profile_address, role, boundary, PinPolicy::PinOnFirstContact)
+        .unwrap_or_else(|e| CheckOutcome::Unanswered { detail: format!("{e:#}") })
+}
+
+/// What a read-only route check found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadOnlyCheck {
+    /// The machine's node is not pinned in the roster, so nothing was sent
+    /// (no token crossed) and the roster was not written. The first real
+    /// send to it pins the node.
+    NotPinned { machine: String },
+    /// The target was pinned and was asked.
+    Asked(CheckOutcome),
+}
+
+/// [`check_route`] for a caller that must not mutate state (doctor): the same
+/// check, except that a target whose node is not pinned yet is not contacted
+/// and the roster is never written.
+pub fn check_route_read_only(profile_address: &str, role: &str, boundary: Option<Boundary>) -> ReadOnlyCheck {
+    match run_check(profile_address, role, boundary, PinPolicy::RequirePinned) {
+        Err(e) => match e.downcast::<NotPinned>() {
+            Ok(n) => ReadOnlyCheck::NotPinned { machine: n.machine },
+            Err(other) => ReadOnlyCheck::Asked(CheckOutcome::Unanswered { detail: format!("{other:#}") }),
+        },
+        Ok(outcome) => ReadOnlyCheck::Asked(outcome),
+    }
+}
+
+fn run_check(
+    profile_address: &str,
+    role: &str,
+    boundary: Option<Boundary>,
+    pins: PinPolicy,
+) -> Result<CheckOutcome> {
+    let job = check_job(profile_address, role, boundary)?;
+    let target = job.target_machine.clone();
+    let (code, reply) = send_job(job, false, pins)?;
+    Ok(check_outcome(&target, code, reply))
+}
+
+/// The job a check submits: the route's role, profile and boundary, an empty
+/// message (a check sends no prompt text), and a session of its own.
+fn check_job(profile_address: &str, role: &str, boundary: Option<Boundary>) -> Result<WorkJob> {
+    let address = darkmux_types::profile_address::ProfileAddress::parse(profile_address)
+        .map_err(|e| anyhow!("profile address `{profile_address}`: {e}"))?;
+    let machine = address
+        .machine
+        .ok_or_else(|| anyhow!("profile address `{profile_address}` names no machine, so there is no route to check"))?;
+    let run = darkmux_types::session_id::RunId::standalone("fleet-check").expect("a literal run id is never empty");
+    let session = SessionId::adhoc(run, role, darkmux_crew::dispatch::fresh_nonce());
+    let mut job = crate::build_work_job(
+        machine,
+        role.to_string(),
+        String::new(),
+        session,
+        Some(address.profile),
+        None,
+        None,
+        CHECK_TIMEOUT_SECONDS,
+        darkmux_flow::resolve_machine_id(),
+    );
+    job.boundary = boundary;
+    job.mode = SubmissionMode::Check;
+    Ok(job)
+}
+
+/// A check's `timeout_seconds`: it bounds nothing (nothing runs) and only has
+/// to pass the job's shape check.
+const CHECK_TIMEOUT_SECONDS: u32 = 60;
+
+/// A check's final reply, read into a [`CheckOutcome`].
+fn check_outcome(target: &str, code: u16, reply: SubmissionReply) -> CheckOutcome {
+    let unanswered = |detail: String| CheckOutcome::Unanswered { detail };
+    match reply.status {
+        ReplyStatus::Checked => match (reply.profile, reply.check) {
+            (Some(profile), Some(report)) => CheckOutcome::Routable { profile, report },
+            _ => unanswered(format!("{target} answered a check without saying what it found")),
+        },
+        ReplyStatus::Refused => CheckOutcome::Refused {
+            code: reply.refusal.unwrap_or(RefusalCode::Unknown),
+            reason: reply
+                .reason
+                .as_deref()
+                .map(sanitize_remote_text)
+                .unwrap_or_else(|| format!("{target} refused the check (HTTP {code})")),
+        },
+        ReplyStatus::Completed | ReplyStatus::Accepted | ReplyStatus::Queued | ReplyStatus::Error | ReplyStatus::Unknown => {
+            unanswered(format!(
+                "{target} answered a check with `{}`, which is not a check's answer (is it on a different darkmux version?)",
+                serde_json::to_value(reply.status).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default()
+            ))
+        }
     }
 }
 
@@ -1035,6 +1528,8 @@ mod tests {
             published_at_unix_ms: 1,
             published_by_machine: Some("macbook-pro".into()),
             single_shot: None,
+            boundary: None,
+            mode: SubmissionMode::Run,
         }
     }
 
@@ -1054,7 +1549,7 @@ mod tests {
     }
 
     /// The whole decision: admit, then scope.
-    fn authorize(token: TokenCheck, node: Node, prof: Prof) -> std::result::Result<String, Refusal> {
+    fn decide(token: TokenCheck, node: Node, prof: Prof) -> std::result::Result<String, Refusal> {
         let peer: IpAddr = "100.64.0.7".parse().unwrap();
         let identity = move || match node {
             Node::Allowed => Ok(Some(test_node("nLAPTOP", "macbook-pro", "100.64.0.7"))),
@@ -1083,15 +1578,15 @@ mod tests {
         for t in tokens {
             for n in nodes {
                 for p in profs {
-                    let got = authorize(t, n, p);
+                    let got = decide(t, n, p);
                     let want: std::result::Result<String, fn(&Refusal) -> bool> = match (t, n, p) {
                         (TokenCheck::Mismatch, _, _) => Err(|r| matches!(r, Refusal::Token)),
                         (TokenCheck::NotConfigured, _, _) => Err(|r| matches!(r, Refusal::NoTokenConfigured)),
-                        (_, Node::Unknown, _) => Err(|r| matches!(r, Refusal::NotAllowed { node_name } if node_name == "phone")),
+                        (_, Node::Unknown, _) => Err(|r| matches!(r, Refusal::NotAllowed { node_name, .. } if node_name == "phone")),
                         (_, Node::NotOnOverlay, _) => Err(|r| matches!(r, Refusal::NotOnOverlay { .. })),
                         (_, Node::Unresolvable, _) => Err(|r| matches!(r, Refusal::IdentityUnavailable { .. })),
                         (_, Node::Allowed, Prof::InScope) => Ok("host".to_string()),
-                        (_, Node::Allowed, Prof::OutOfScope) => Err(|r| matches!(r, Refusal::ProfileOutOfScope { profile, .. } if profile == "coder-big")),
+                        (_, Node::Allowed, Prof::OutOfScope) => Err(|r| matches!(r, Refusal::OutOfScope { item: OutOfScope::Profile { profile, .. }, .. } if profile == "coder-big")),
                         (_, Node::Allowed, Prof::Utility) => Err(|r| matches!(r, Refusal::UtilityProfile { .. })),
                     };
                     match (&got, want) {
@@ -1106,6 +1601,57 @@ mod tests {
             }
         }
         assert_eq!(ran, 1, "exactly one cell may run work");
+    }
+
+    /// The promise: a caller is AUTHENTICATED without being authorized. A node
+    /// that holds the token and that the network names is a verified fleet
+    /// peer, and the allow-list is not read to say so (a card read needs no
+    /// grant); authorizing it is a separate step that reads the allow-list.
+    #[test]
+    fn authenticating_needs_no_allow_list_and_authorizing_is_a_separate_step() {
+        let peer: IpAddr = "100.64.0.7".parse().unwrap();
+        let stranger = test_node("nPHONE", "phone", "100.64.0.7");
+        let node = authenticate(TokenCheck::Match, || Ok(Some(stranger.clone())), "tailscale", peer, Some("nSTUDIO"))
+            .expect("a node the network names, holding the token, is authenticated");
+        assert_eq!(node.node_id, "nPHONE");
+        assert!(matches!(authorize(&node, || Ok(allow())), Err(Refusal::NotAllowed { node_name, .. }) if node_name == "phone"));
+        let listed = test_node("nLAPTOP", "macbook-pro", "100.64.0.7");
+        assert_eq!(authorize(&listed, || Ok(allow())).unwrap().peer_name, "macbook-pro");
+        let unreadable = authorize(&listed, || Err("no such file".into()));
+        assert!(matches!(unreadable, Err(Refusal::BadRequest(_))), "an unreadable allow-list refuses: {unreadable:?}");
+    }
+
+    /// Authentication still refuses this machine's own node, a node the
+    /// network does not name, and a provider that cannot answer.
+    #[test]
+    fn authenticate_refuses_self_unplaced_and_unanswered_callers() {
+        let peer: IpAddr = "100.64.0.7".parse().unwrap();
+        let me = test_node("nSTUDIO", "studio", "100.64.0.7");
+        assert!(matches!(authenticate(TokenCheck::Match, || Ok(Some(me)), "t", peer, Some("nSTUDIO")), Err(Refusal::FromSelf)));
+        assert!(matches!(authenticate(TokenCheck::Match, || Ok(None), "t", peer, None), Err(Refusal::NotOnOverlay { .. })));
+        assert!(matches!(
+            authenticate(TokenCheck::Match, || Err("down".into()), "t", peer, None),
+            Err(Refusal::IdentityUnavailable { .. })
+        ));
+    }
+
+    /// A status this darkmux does not know is an error to the sender, whatever
+    /// else the reply carries: never a job that was taken.
+    #[test]
+    fn an_unrecognized_final_status_is_an_error_not_a_taken_job() {
+        let reply = SubmissionReply { exit_code: Some(0), ..SubmissionReply::of(ReplyStatus::Unknown) };
+        let err = reply_outcome("studio", 200, reply).unwrap_err().to_string();
+        assert!(err.contains("does not recognize"), "{err}");
+        assert!(reply_outcome("studio", 200, SubmissionReply::of(ReplyStatus::Completed)).is_ok());
+    }
+
+    /// A reply status a newer darkmux sends reads as `unknown`, not as a parse
+    /// failure that discards the reply.
+    #[test]
+    fn a_reply_status_this_darkmux_does_not_know_reads_as_unknown() {
+        let r: SubmissionReply = serde_json::from_str(r#"{"status": "paused", "machine": "studio"}"#).unwrap();
+        assert_eq!(r.status, ReplyStatus::Unknown);
+        assert_eq!(r.machine.as_deref(), Some("studio"));
     }
 
     /// The token is checked before the identity lookup runs, so a caller
@@ -1165,12 +1711,12 @@ mod tests {
         let work = || work("host");
         let mut j = job(None);
         j.role_id = "coder".into();
-        assert!(matches!(check_scope("studio", &admitted, &j, work()), Err(Refusal::RoleOutOfScope { ref role, .. }) if role == "coder"));
+        assert!(matches!(check_scope("studio", &admitted, &j, work()), Err(Refusal::OutOfScope { item: OutOfScope::Role { ref role, .. }, .. }) if role == "coder"));
         let no_roles = Admitted { roles: vec![], ..admitted.clone() };
-        assert!(matches!(check_scope("studio", &no_roles, &job(None), work()), Err(Refusal::RoleOutOfScope { .. })), "absent roles = none");
+        assert!(matches!(check_scope("studio", &no_roles, &job(None), work()), Err(Refusal::OutOfScope { item: OutOfScope::Role { .. }, .. })), "absent roles = none");
         let mut j = job(None);
         j.image = Some("evil.example/x:latest".into());
-        assert!(matches!(check_scope("studio", &admitted, &j, work()), Err(Refusal::ImageOutOfScope { .. })));
+        assert!(matches!(check_scope("studio", &admitted, &j, work()), Err(Refusal::OutOfScope { item: OutOfScope::Image { .. }, .. })));
         j.image = Some("rust:slim".into());
         assert_eq!(check_scope("studio", &admitted, &j, work()).unwrap().profile, "host");
         let mut j = job(None);
@@ -1198,7 +1744,7 @@ mod tests {
         j.workdir = Some("/tmp/x".into());
         assert!(matches!(
             check_scope("studio", &admitted, &j, work("host")),
-            Err(Refusal::WorkspaceOutOfScope { .. })
+            Err(Refusal::OutOfScope { item: OutOfScope::Workspace, .. })
         ));
         let with_ws = Admitted { workspace: true, ..admitted.clone() };
         assert_eq!(check_scope("studio", &with_ws, &j, work("host")).unwrap().profile, "host");
@@ -1208,13 +1754,67 @@ mod tests {
         ));
     }
 
+    fn roster_with(entries: &[(&str, &str)]) -> crate::roster::FleetRoster {
+        let machines: serde_json::Map<String, serde_json::Value> = entries
+            .iter()
+            .map(|(id, address)| (id.to_string(), serde_json::json!({ "id": id, "address": address, "added_unix_ms": 1 })))
+            .collect();
+        serde_json::from_value(serde_json::json!({ "machines": machines })).expect("a roster")
+    }
+
+    fn body(role: &str, claimed: Option<&str>) -> Vec<u8> {
+        let mut j = serde_json::to_value(job(None)).unwrap();
+        j["role_id"] = role.into();
+        match claimed {
+            Some(c) => j["published_by_machine"] = c.into(),
+            None => {
+                j.as_object_mut().unwrap().remove("published_by_machine");
+            }
+        }
+        serde_json::to_vec(&serde_json::json!({ "job": j })).unwrap()
+    }
+
+    /// The remedy names the receiver's roster entry for the verified node
+    /// (its id, not the network name) and the role that was asked for.
+    #[test]
+    fn the_trust_remedy_names_the_roster_entry_for_the_node() {
+        let node = test_node("nLAPTOP", "laptop", "100.64.0.2");
+        let roster = roster_with(&[("Laptop-Mac", "laptop.tailnet-example.ts.net:8765"), ("mini", "mini:8765")]);
+        let ask = TrustAsk::for_sender(&node, &roster, &body("radio-host", Some("workbook")));
+        let said = Refusal::NotAllowed { node_name: "laptop".into(), ask }.reason("studio");
+        assert!(
+            said.contains("`darkmux machine trust Laptop-Mac --profiles <profile> --roles radio-host`"),
+            "{said}"
+        );
+        assert!(!said.contains("--node"), "the roster address already finds the node: {said}");
+    }
+
+    /// No roster entry: the sender's claimed machine id is NAME, and `--node`
+    /// names the node. A claim that is not a machine name is ignored.
+    #[test]
+    fn the_trust_remedy_falls_back_to_the_claimed_id_then_the_node() {
+        let node = test_node("nLAPTOP", "laptop", "100.64.0.2");
+        let empty = crate::roster::FleetRoster::default();
+        let said = |claimed: Option<&str>| {
+            let ask = TrustAsk::for_sender(&node, &empty, &body("radio-host", claimed));
+            Refusal::NotAllowed { node_name: "laptop".into(), ask }.reason("studio")
+        };
+        assert!(said(Some("Laptop-Mac")).contains("`darkmux machine trust Laptop-Mac --node laptop --profiles <profile> --roles radio-host`"), "{}", said(Some("Laptop-Mac")));
+        for hostile in [None, Some("a b; rm -rf"), Some("")] {
+            let s = said(hostile);
+            assert!(s.contains("`darkmux machine trust laptop --profiles <profile> --roles radio-host`"), "{s}");
+        }
+        let junk_role = TrustAsk::for_sender(&node, &empty, &body("no spaces allowed", None));
+        assert_eq!(junk_role.role, None);
+    }
+
     /// The replies say what the operator needs, and never carry a node id.
     #[test]
     fn refusal_replies_name_the_reason() {
-        let r = Refusal::NotAllowed { node_name: "macbook-pro".into() };
+        let r = Refusal::NotAllowed { node_name: "macbook-pro".into(), ask: TrustAsk::default() };
         assert!(r.reason("studio").starts_with("studio does not accept work from macbook-pro"), "{}", r.reason("studio"));
         assert_eq!(r.http_status(), 403);
-        let r = Refusal::ProfileOutOfScope { peer: "macbook-pro".into(), profile: "x".into(), allowed: vec!["host".into()] };
+        let r = Refusal::OutOfScope { peer: "macbook-pro".into(), item: OutOfScope::Profile { profile: "x".into(), allowed: vec!["host".into()] } };
         assert!(r.reason("studio").starts_with("not in the allow-list scope: profile x"), "{}", r.reason("studio"));
         assert_eq!(Refusal::Token.http_status(), 401);
         assert_eq!(Refusal::Busy { what: "s".into() }.http_status(), 503);
@@ -1259,6 +1859,191 @@ mod tests {
         let mut v: serde_json::Value = serde_json::from_slice(&good).unwrap();
         v["job"]["role_id"] = "../etc".into();
         assert!(matches!(WorkSubmission::parse(&serde_json::to_vec(&v).unwrap()), Err(Refusal::BadRequest(_))));
+    }
+
+    fn body_at(schema: &str) -> Vec<u8> {
+        let mut v: serde_json::Value = serde_json::to_value(WorkSubmission::new(job(Some("host")), true)).unwrap();
+        v["schema"] = schema.into();
+        serde_json::to_vec(&v).unwrap()
+    }
+
+    /// The version rule: the same major with a minor at or below the
+    /// receiver's own is taken; a newer minor and another major are refused
+    /// naming both versions, and so is a schema that is not `major.minor`.
+    #[test]
+    fn the_receiver_takes_an_older_minor_and_refuses_a_newer_one_or_another_major() {
+        let receiver = WorkVersion { major: 8, minor: 2 };
+        for taken in ["8.0", "8.1", "8.2"] {
+            assert!(WorkSubmission::parse_for(&body_at(taken), receiver).is_ok(), "{taken}");
+        }
+        for refused in ["8.3", "9.0", "7.2", "8", "v8.0", "8.0.0"] {
+            assert_eq!(
+                WorkSubmission::parse_for(&body_at(refused), receiver).unwrap_err(),
+                Refusal::SchemaMismatch { got: refused.into() },
+                "{refused}"
+            );
+        }
+        // The current version parses through the public entry point.
+        assert!(WorkSubmission::parse(&body_at(WORK_JOB_SCHEMA_VERSION)).is_ok());
+        let newer = Refusal::SchemaMismatch { got: "8.1".into() }.reason("studio");
+        assert!(newer.contains(&format!("v{WORK_JOB_SCHEMA_VERSION}")) && newer.contains("v8.1"), "both versions named: {newer}");
+    }
+
+    /// Every refusal maps to exactly one code, and its reply carries it.
+    #[test]
+    fn every_refusal_carries_its_code_on_the_wire() {
+        let s = || "x".to_string();
+        let all: Vec<(Refusal, RefusalCode)> = vec![
+            (Refusal::NoTokenConfigured, RefusalCode::Token),
+            (Refusal::Token, RefusalCode::Token),
+            (Refusal::IdentityUnavailable { provider: s(), detail: s() }, RefusalCode::Identity),
+            (Refusal::NotOnOverlay { provider: s(), addr: s() }, RefusalCode::Identity),
+            (Refusal::NotAllowed { node_name: s(), ask: TrustAsk::default() }, RefusalCode::NotListed),
+            (Refusal::AmbiguousEntry { names: vec![s()] }, RefusalCode::BadConfig),
+            (Refusal::Misaddressed { target: s() }, RefusalCode::Misaddressed),
+            (Refusal::OutOfScope { peer: s(), item: OutOfScope::Workspace }, RefusalCode::WorkspaceNotAllowed),
+            (Refusal::OutOfScope { peer: s(), item: OutOfScope::Role { role: s(), allowed: vec![] } }, RefusalCode::RoleNotAllowed),
+            (Refusal::OutOfScope { peer: s(), item: OutOfScope::Image { image: s() } }, RefusalCode::ImageNotAllowed),
+            (Refusal::FromSelf, RefusalCode::FromSelf),
+            (Refusal::OutOfScope { peer: s(), item: OutOfScope::Profile { profile: s(), allowed: vec![] } }, RefusalCode::ProfileNotAllowed),
+            (Refusal::UtilityProfile { profile: s() }, RefusalCode::ProfileNotAllowed),
+            (Refusal::NoWorkProfile { role: s(), detail: s() }, RefusalCode::ProfileUndefined),
+            (Refusal::SchemaMismatch { got: s() }, RefusalCode::Version),
+            (Refusal::BadRequest(s()), RefusalCode::BadRequest),
+            (Refusal::Busy { what: s() }, RefusalCode::Busy),
+            (Refusal::QueueFull { peer: s(), what: s() }, RefusalCode::Busy),
+            (Refusal::SeatChanged { profile: s() }, RefusalCode::SeatChanged),
+            (Refusal::TooManyAtOnce { peer: s() }, RefusalCode::Busy),
+            (Refusal::BoundaryUnmanaged { profile: s() }, RefusalCode::Boundary),
+            (Refusal::BoundaryUnknown, RefusalCode::Boundary),
+            (Refusal::BadConfig { detail: s() }, RefusalCode::BadConfig),
+        ];
+        for (refusal, code) in all {
+            assert_eq!(refusal.code(), code, "{refusal:?}");
+            let line = serde_json::to_string(&refusal.reply("studio")).unwrap();
+            let back: SubmissionReply = serde_json::from_str(&line).unwrap();
+            assert_eq!((back.status, back.refusal), (ReplyStatus::Refused, Some(code)), "{line}");
+        }
+    }
+
+    /// The wire spellings consumers match on, and a code from a newer darkmux
+    /// reads as `unknown`, never as a known kind.
+    #[test]
+    fn refusal_codes_are_snake_case_and_a_newer_code_is_unknown() {
+        let spelled = |c: RefusalCode| serde_json::to_value(c).unwrap();
+        assert_eq!(spelled(RefusalCode::FromSelf), "self");
+        assert_eq!(spelled(RefusalCode::NotListed), "not_listed");
+        assert_eq!(spelled(RefusalCode::ProfileUndefined), "profile_undefined");
+        assert_eq!(spelled(RefusalCode::Boundary), "boundary");
+        let newer: SubmissionReply = serde_json::from_str(r#"{"status":"refused","refusal":"quota_exceeded"}"#).unwrap();
+        assert_eq!(newer.refusal, Some(RefusalCode::Unknown));
+        let plain: SubmissionReply = serde_json::from_str(r#"{"status":"refused"}"#).unwrap();
+        assert_eq!(plain.refusal, None);
+    }
+
+    fn admitted_for_boundary() -> Admitted {
+        Admitted {
+            node_id: "nLAPTOP".into(),
+            peer_name: "macbook-pro".into(),
+            profiles: vec!["host".into(), "cloud".into()],
+            roles: vec!["radio-host".into()],
+            images: vec![],
+            workspace: false,
+        }
+    }
+
+    fn hosted(profile: &str) -> ProfileResolution {
+        ProfileResolution::Work { profile: profile.into(), seat: crate::seats::WorkSeat::Hosted { model: "gpt".into() } }
+    }
+
+    /// The boundary is checked against the profile the job RESOLVES to:
+    /// `managed_only` is met by a local model and refused on a hosted one; a
+    /// job with no boundary is unrestricted; a boundary this receiver cannot
+    /// enforce is refused whatever the profile is.
+    #[test]
+    fn scope_enforces_the_boundary_against_the_resolved_profile() {
+        let admitted = admitted_for_boundary();
+        let with = |boundary| WorkJob { boundary, ..job(None) };
+        let managed = Some(Boundary::ManagedOnly);
+        assert_eq!(check_scope("studio", &admitted, &with(managed), work("host")).unwrap().profile, "host");
+        assert_eq!(
+            check_scope("studio", &admitted, &with(managed), hosted("cloud")).unwrap_err(),
+            Refusal::BoundaryUnmanaged { profile: "cloud".into() }
+        );
+        assert_eq!(check_scope("studio", &admitted, &with(None), hosted("cloud")).unwrap().profile, "cloud");
+        for resolution in [work("host"), hosted("cloud")] {
+            assert_eq!(
+                check_scope("studio", &admitted, &with(Some(Boundary::Unknown)), resolution).unwrap_err(),
+                Refusal::BoundaryUnknown
+            );
+        }
+        // An out-of-scope profile is refused as such before its kind is told.
+        let narrow = Admitted { profiles: vec!["host".into()], ..admitted };
+        assert!(matches!(
+            check_scope("studio", &narrow, &with(managed), hosted("cloud")),
+            Err(Refusal::OutOfScope { item: OutOfScope::Profile { .. }, .. })
+        ));
+    }
+
+    /// The `managed`/`unmanaged` decision comes from the resolution every
+    /// dispatch uses: a registry's endpoint kinds decide the seat the
+    /// boundary reads, and the machine card's `endpoint_kind` reads the same
+    /// `target_for` kind.
+    #[test]
+    fn the_boundary_reads_the_kind_target_for_resolves() {
+        let reg = registry(
+            r#"{"profiles":{"local":{"models":[{"id":"m","n_ctx":8000}]},"cloud":{"models":[{"id":"h","n_ctx":8000,"endpoint":"az"}]}},
+                "endpoints":{"az":{"url":"https://example.invalid/v1"}}}"#,
+        );
+        let role = darkmux_crew::loader::load_roles().unwrap().into_iter().find(|r| r.id == "radio-host").unwrap();
+        let admitted = Admitted { profiles: vec!["local".into(), "cloud".into()], ..admitted_for_boundary() };
+        let job = |profile: &str| WorkJob { profile: Some(profile.into()), boundary: Some(Boundary::ManagedOnly), ..job(None) };
+        let scoped = |profile: &str| {
+            check_scope("studio", &admitted, &job(profile), classify_profile(&reg, &role, Some(profile), None, "studio"))
+        };
+        assert_eq!(scoped("local").unwrap().profile, "local");
+        assert_eq!(scoped("cloud").unwrap_err(), Refusal::BoundaryUnmanaged { profile: "cloud".into() });
+    }
+
+    /// A check's reply reads into a typed outcome; anything that is not a
+    /// check's answer is unanswered, never routable.
+    #[test]
+    fn a_checks_reply_reads_into_a_typed_outcome() {
+        let checked = SubmissionReply {
+            profile: Some("deep".into()),
+            check: Some(CheckReport { endpoint: EndpointClass::Managed, seat: SeatOutlook::Free }),
+            ..SubmissionReply::of(ReplyStatus::Checked)
+        };
+        assert_eq!(
+            check_outcome("studio", 200, checked.clone()),
+            CheckOutcome::Routable { profile: "deep".into(), report: CheckReport { endpoint: EndpointClass::Managed, seat: SeatOutlook::Free } }
+        );
+        assert!(matches!(
+            check_outcome("studio", 200, SubmissionReply { check: None, ..checked }),
+            CheckOutcome::Unanswered { .. }
+        ));
+        let refused = Refusal::BoundaryUnmanaged { profile: "cloud".into() }.reply("studio");
+        assert!(matches!(
+            check_outcome("studio", 403, refused),
+            CheckOutcome::Refused { code: RefusalCode::Boundary, .. }
+        ));
+        for status in [ReplyStatus::Completed, ReplyStatus::Accepted, ReplyStatus::Queued, ReplyStatus::Error, ReplyStatus::Unknown] {
+            assert!(matches!(check_outcome("studio", 200, SubmissionReply::of(status)), CheckOutcome::Unanswered { .. }), "{status:?}");
+        }
+    }
+
+    /// A refused job's sender gets the code, not just the sentence; a
+    /// `checked` answer to a job is an error, never a success.
+    #[test]
+    fn a_refusal_reaches_the_sender_as_a_typed_error() {
+        let err = reply_outcome("studio", 403, Refusal::BoundaryUnmanaged { profile: "cloud".into() }.reply("studio")).unwrap_err();
+        let refused = err.downcast_ref::<SubmitRefused>().expect("a typed refusal");
+        assert_eq!(refused.code, RefusalCode::Boundary);
+        assert!(refused.reason.contains("managed_only"), "{}", refused.reason);
+        let old_receiver = SubmissionReply { reason: Some("no code".into()), ..SubmissionReply::of(ReplyStatus::Refused) };
+        let err = reply_outcome("studio", 403, old_receiver).unwrap_err();
+        assert_eq!(err.downcast_ref::<SubmitRefused>().unwrap().code, RefusalCode::Unknown);
+        assert!(reply_outcome("studio", 200, SubmissionReply::of(ReplyStatus::Checked)).is_err());
     }
 
     fn roster_entry(address: &str, node_id: Option<&str>) -> crate::MachineEntry {

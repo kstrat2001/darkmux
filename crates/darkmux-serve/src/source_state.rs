@@ -67,6 +67,46 @@ pub enum SourceState {
     Off,
 }
 
+/// What a reader shows for a `detail` sentence it does not carry a literal
+/// for (another darkmux version's): the doctrine that `detail` is never free
+/// text holds on the read side too.
+const UNRECOGNIZED_DETAIL: &str = "the source reported a problem this darkmux does not recognize";
+
+/// The literal a wire `detail` stands for: one of this build's own sentences
+/// that can ride a [`SourceState`] a daemon serves, else [`UNRECOGNIZED_DETAIL`].
+fn known_detail(wire: &str) -> &'static str {
+    [crate::PRESENCE_READ_FAILED, crate::FLEET_READ_ERROR_DETAIL]
+        .into_iter()
+        .find(|known| *known == wire)
+        .unwrap_or(UNRECOGNIZED_DETAIL)
+}
+
+/// The wire shape, read before `detail` is mapped back to a literal.
+#[derive(serde::Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum WireSourceState {
+    Ok,
+    Stale { age_ms: u64, detail: String },
+    Unavailable { detail: String },
+    Off,
+    /// A state a newer darkmux states. It reads as `unavailable`, the cautious
+    /// reading: never as `ok` or `off`, which would say the response is whole.
+    #[serde(other)]
+    Unrecognized,
+}
+
+impl<'de> serde::Deserialize<'de> for SourceState {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(match WireSourceState::deserialize(d)? {
+            WireSourceState::Ok => SourceState::Ok,
+            WireSourceState::Stale { age_ms, detail } => SourceState::Stale { age_ms, detail: known_detail(&detail) },
+            WireSourceState::Unavailable { detail } => SourceState::Unavailable { detail: known_detail(&detail) },
+            WireSourceState::Off => SourceState::Off,
+            WireSourceState::Unrecognized => SourceState::Unavailable { detail: UNRECOGNIZED_DETAIL },
+        })
+    }
+}
+
 impl SourceState {
     /// Whether this response covers the source completely — true for both
     /// `Ok` and `Off`, since an unconfigured source has nothing to omit.
@@ -102,6 +142,32 @@ pub(crate) fn coverage_meta(fleet: &SourceState) -> CoverageMeta {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A state read back from a daemon keeps its shape; a sentence this
+    /// build does not carry reads as the fixed one, never as the peer's text.
+    #[test]
+    fn a_state_read_from_the_wire_keeps_its_shape_and_never_a_foreign_sentence() {
+        let read = |v: serde_json::Value| serde_json::from_value::<SourceState>(v).unwrap();
+        assert_eq!(read(serde_json::json!({"state": "off"})), SourceState::Off);
+        let known = crate::PRESENCE_READ_FAILED;
+        assert_eq!(
+            read(serde_json::json!({"state": "stale", "age_ms": 7, "detail": known})),
+            SourceState::Stale { age_ms: 7, detail: known }
+        );
+        assert_eq!(
+            read(serde_json::json!({"state": "unavailable", "detail": "\u{1b}[31m free text from a peer"})),
+            SourceState::Unavailable { detail: UNRECOGNIZED_DETAIL }
+        );
+    }
+
+    /// A state a newer darkmux invented reads as unavailable, never as a state
+    /// that says the response is complete.
+    #[test]
+    fn a_state_from_a_newer_darkmux_reads_as_unavailable_not_as_ok() {
+        let read = serde_json::from_value::<SourceState>(serde_json::json!({"state": "delegated", "to": "a hub"})).unwrap();
+        assert_eq!(read, SourceState::Unavailable { detail: UNRECOGNIZED_DETAIL });
+        assert!(!read.is_complete());
+    }
 
     #[test]
     fn ok_and_off_are_complete_stale_and_unavailable_are_not() {

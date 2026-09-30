@@ -1029,7 +1029,7 @@ pub(crate) enum MachineCmd {
     /// with no sub-verb.)
     ///
     /// With a roster `[id]`, fetches THAT peer's residents over its serve
-    /// daemon (same shared-token mechanism as `machine list --deep`); the
+    /// daemon (the same verified peer path as `machine list`); the
     /// profile-match column is local-only (it reads THIS host's registry).
     /// No id = this host.
     Status {
@@ -1073,21 +1073,17 @@ pub(crate) enum MachineCmd {
         #[arg(long, short = 'n')]
         dry_run: bool,
     },
-    /// List the fleet roster + per-machine reachability (#1426 — absorbs the
-    /// retired `fleet status`). Each machine gets a TCP-probe to its daemon
-    /// port (300ms budget per probe). `--deep` additionally fetches each
-    /// reachable peer's spec sheet (RAM, CPU, loaded models, darkmux
-    /// version) via the daemon's `/machine/specs` endpoint (#275). `--json`
-    /// for scripting; default is a table for operator eyes.
+    /// List the fleet: one row per roster machine with the card it states
+    /// about itself (hardware headroom, loaded models, profiles and whether
+    /// darkmux manages their endpoint, seats, thermal state), fetched in
+    /// parallel from each peer over the verified peer path. A machine whose
+    /// darkmux has no card yet shows `card unavailable (peer <version>)`.
+    /// `--json` prints the same fleet view the daemon serves at
+    /// `GET /fleet/view`.
     List {
         /// Emit JSON instead of the human-readable table.
         #[arg(long)]
         json: bool,
-        /// Aggregate `/machine/specs` from each reachable peer in
-        /// addition to the reachability probe. Adds one HTTP GET per
-        /// peer (~hundreds of ms over a tailnet).
-        #[arg(long)]
-        deep: bool,
     },
     /// Register a machine in the fleet roster (#1426 — absorbs the retired
     /// `fleet add`). Idempotent — calling again with the same `<id>` updates

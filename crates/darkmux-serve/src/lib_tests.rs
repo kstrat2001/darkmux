@@ -4,6 +4,16 @@
     /// declared window, `null` when undeclared, beside the residency match
     /// (by namespaced identifier or bare key).
     #[test]
+    fn the_startup_banner_says_the_listener_is_off_when_it_is() {
+        let auth = ServeAuth { read_auth: false, token_present: true };
+        let on = auth_banner_lines(auth, true);
+        assert!(on[1].contains("requires it plus a verified sender"), "{}", on[1]);
+        let off = auth_banner_lines(auth, false);
+        assert!(off[1].contains("listener is off"), "{}", off[1]);
+        assert!(!off[1].contains("requires it"), "{}", off[1]);
+    }
+
+    #[test]
     fn utility_model_carries_the_declared_window() {
         let lm = |identifier: &str, model: &str| darkmux_types::LoadedModel {
             identifier: identifier.into(),
@@ -2025,6 +2035,29 @@
         let resp = app.oneshot(req).await.unwrap();
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// `/health` tells this machine whether the DAEMON resolved a fleet token
+    /// (never its value), and a peer, or a proxied request, learns nothing.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn health_reports_token_presence_to_this_machine_only() {
+        let k = "DARKMUX_SERVE_TOKEN";
+        let prev = std::env::var(k).ok();
+        unsafe { std::env::set_var(k, "not-a-real-token") };
+        let set = loopback_health(&[]).await;
+        let proxied = loopback_health(&[("X-Forwarded-For", "100.64.0.7")]).await;
+        unsafe { std::env::remove_var(k) };
+        let unset = loopback_health(&[]).await;
+        unsafe {
+            if let Some(v) = prev {
+                std::env::set_var(k, v)
+            }
+        }
+        assert_eq!(set["fleet_token_set"], true, "{set}");
+        assert!(proxied["fleet_token_set"].is_null(), "{proxied}");
+        assert_eq!(unset["fleet_token_set"], false, "{unset}");
+        assert!(!set.to_string().contains("not-a-real-token"), "the value never appears");
     }
 
     /// (#2916 stage 2 review C5) The `/health` fields for this machine only
@@ -7750,5 +7783,37 @@ mod fleet_cache_wall_clock {
         assert_eq!(backfill("dispatch start"), Some("00000000-0000-4000-8000-000000000001".to_string()));
         assert_eq!(backfill("dispatch start"), backfill("dispatch.start"));
         // flow-action-guard:allow-end
+    }
+
+    /// The promise: the flow-history scan runs once per TTL, not once per
+    /// caller. A pairing that appears in history after a scan is not seen
+    /// until the TTL passes; a zero TTL always rescans.
+    #[test]
+    fn the_uid_history_is_scanned_once_per_ttl() {
+        let tmp = TempDir::new().unwrap();
+        let day = tmp.path().join("2026-09-30.jsonl");
+        let pair = |id: &str, uid: &str| format!("{{\"action\":\"dispatch.start\",\"machine_id\":\"{id}\",\"machine_uid\":\"{uid}\"}}\n");
+        let entry = |id: &str| darkmux_fleet::MachineEntry {
+            id: id.into(),
+            address: format!("{id}:8765"),
+            description: None,
+            added_unix_ms: 1,
+            machine_uid: None,
+            loopback_intended: false,
+            node_id: None,
+            extras: Default::default(),
+        };
+        let uid_of = |id: &str, ttl: std::time::Duration| {
+            let mut m = vec![entry(id)];
+            let filled = super::backfill_with_ttl(&mut m, tmp.path(), ttl);
+            (m[0].machine_uid.clone(), filled.contains(id))
+        };
+        let long = std::time::Duration::from_secs(600);
+        fs::write(&day, pair("laptop", "UID-L")).unwrap();
+        assert_eq!(uid_of("laptop", long), (Some("UID-L".into()), true), "a filled uid says so");
+        // A new machine appears in history; the cached scan does not see it.
+        fs::write(&day, format!("{}{}", pair("laptop", "UID-L"), pair("studio", "UID-S"))).unwrap();
+        assert_eq!(uid_of("studio", long), (None, false), "served from the scan a TTL ago");
+        assert_eq!(uid_of("studio", std::time::Duration::ZERO), (Some("UID-S".into()), true), "an expired scan reads history again");
     }
 }

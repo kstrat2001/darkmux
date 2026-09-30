@@ -15,7 +15,7 @@
 // Each state first asserts the words it must show, so a fixture that slid
 // into another state fails here rather than measuring one state N times.
 const { test, expect } = require("@playwright/test");
-const { STATES, MULTI, PLAYBACK_NOW, VIEWPORTS, installLayoutRoutes, measure } = require("./lib/layout-fixture.js");
+const { STATES, MULTI, PLAYBACK_NOW, VIEWPORTS, SELF_ROW, PEER_ROW, OFFLINE_ROW, installLayoutRoutes, measure } = require("./lib/layout-fixture.js");
 
 const RUN = {
   modelbox: ".session-run .modelbox",
@@ -330,6 +330,40 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
       }
     });
   }
+}
+
+// The fleet view's rows draw the same card: a peer the daemon read (hardware
+// and what it lets this machine do, on the subtitle line) and one it could
+// not read (a typed status on that line) are the size of this machine's own
+// card, in every state.
+for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
+  test(`fleet card: a peer the view read, and one it could not, keep this machine's card size (${vpName})`, async ({ browser }) => {
+    const finished = STATES.find((s) => s.id === "finished");
+    const heights = [];
+    for (const [label, rows, peerSpec] of [
+      ["self alone", [SELF_ROW], null],
+      ["peer read, with a grant, no beat", [SELF_ROW, PEER_ROW], "Apple M1 Max · 32 GB · runs diff-review · radio-host here"],
+      ["peer unreachable, listener off", [SELF_ROW, OFFLINE_ROW], "listener off"],
+    ]) {
+      const ctx = await browser.newContext({ viewport, timezoneId: "UTC", locale: "en-US" });
+      const page = await ctx.newPage();
+      await page.clock.setFixedTime(finished.nowMs);
+      await installLayoutRoutes(page, { fleetView: rows });
+      await page.goto("/index.html#lens=fleet");
+      await expect(page.locator(CARD.card)).toHaveCount(rows.length);
+      await expect(page.locator(".mach .stat").first()).toHaveText("idle");
+      if (peerSpec) {
+        await expect(page.locator(".mach .spec").nth(1), `${label}: the peer's subtitle`).toHaveText(peerSpec);
+        await expect(page.locator(".mach .stat").nth(1), `${label}: the peer's status`).toHaveText(peerSpec === "listener off" ? "offline" : "idle");
+      }
+      await page.waitForTimeout(400);
+      const m = await measure(page, { card: CARD.card, cardScope: CARD.cardScope });
+      heights.push(`${label}: ${m.card.map((b) => `${b.w}x${b.h}`).join(", ")}`);
+      await ctx.close();
+    }
+    const distinct = new Set(heights.flatMap((h) => h.split(": ")[1].split(", ").map((wh) => wh.split("x")[1])));
+    expect(distinct.size, `card heights differ across states (${vpName}):\n  ${heights.join("\n  ")}`).toBe(1);
+  });
 }
 
 // (#2950, found while adding the thermal REST states) With the thermal

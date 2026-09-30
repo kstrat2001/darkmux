@@ -18,12 +18,15 @@
 //! kind     = "run"                         (no field)
 //!          | "phase" | "task" | "step"     (the phase, task or step id)
 //!          | "adhoc"                       (role, nonce)
-//!          | "relay"                       (peer, the sender's wire)
+//!          | "relay"                       (peer, then the sender's wire, verbatim)
 //! ```
 //!
-//! Every component is escaped: `[A-Za-z0-9-]` is kept, any other byte is
+//! Every component is escaped, except a relay's LAST one: `[A-Za-z0-9-]` is kept, any other byte is
 //! written `_XX` (two uppercase hex digits), so a component never contains
-//! the `.` separator. Ids with no `_` or `.` read as written:
+//! the `.` separator. A relay ends with the sender's own wire string,
+//! unescaped: it is last and the peer before it is escaped, so the split is
+//! still unambiguous, and an id the sender printed is a plain substring of
+//! the receiver's. Ids with no `_` or `.` read as written:
 //! `review-1790000000-ab12cd.task.probe`.
 //!
 //! Archives written before 4.0 carry the old free-form strings
@@ -117,6 +120,14 @@ impl RunId {
     }
 }
 
+/// The most relay levels [`SessionId::parse`] accepts. A fleet relay is one
+/// hop today (a job names a registry profile on its receiver, and a receiver
+/// does not re-relay), so 8 leaves generous headroom plus margin while keeping
+/// the recursive derives on [`SessionId`] safe on any parsed value. No shorter
+/// bound on the wire string exists in this crate: the job's own length limit
+/// lives in `darkmux-fleet`.
+pub const MAX_RELAY_DEPTH: usize = 8;
+
 impl fmt::Display for RunId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.id)
@@ -188,6 +199,11 @@ impl SessionId {
         SessionId { kind: SessionKind::Relay { sender: Box::new(sender), peer: peer.into() }, run }
     }
 
+    /// A placeholder that owns nothing, for [`Drop`] to swap in.
+    fn hollow() -> Self {
+        SessionId { kind: SessionKind::Run, run: RunId { kind: RunIdKind::Mission, id: String::new() } }
+    }
+
     pub fn kind(&self) -> &SessionKind {
         &self.kind
     }
@@ -217,19 +233,27 @@ impl SessionId {
     /// The wire string: the only way from a session to a string. See the
     /// module doc for the grammar.
     pub fn wire(&self) -> String {
-        let mut parts = vec![escape(&self.run.id)];
-        if let Some(tag) = self.run.kind.tag() {
-            parts.push(tag.to_string());
-        }
-        match &self.kind {
-            SessionKind::Run => parts.push("run".to_string()),
-            SessionKind::Phase { phase } => parts.extend(["phase".to_string(), escape(phase)]),
-            SessionKind::Task { task } => parts.extend(["task".to_string(), escape(task)]),
-            SessionKind::Step { step } => parts.extend(["step".to_string(), escape(step)]),
-            SessionKind::Adhoc { role, nonce } => parts.extend(["adhoc".to_string(), escape(role), escape(nonce)]),
-            SessionKind::Relay { sender, peer } => {
-                parts.extend(["relay".to_string(), escape(peer), escape(&sender.wire())])
+        // Iterative: a relay nests its sender, and a crafted id can nest deeply.
+        let mut parts: Vec<String> = Vec::new();
+        let mut cur = self;
+        loop {
+            parts.push(escape(&cur.run.id));
+            if let Some(tag) = cur.run.kind.tag() {
+                parts.push(tag.to_string());
             }
+            match &cur.kind {
+                SessionKind::Run => parts.push("run".to_string()),
+                SessionKind::Phase { phase } => parts.extend(["phase".to_string(), escape(phase)]),
+                SessionKind::Task { task } => parts.extend(["task".to_string(), escape(task)]),
+                SessionKind::Step { step } => parts.extend(["step".to_string(), escape(step)]),
+                SessionKind::Adhoc { role, nonce } => parts.extend(["adhoc".to_string(), escape(role), escape(nonce)]),
+                SessionKind::Relay { sender, peer } => {
+                    parts.extend(["relay".to_string(), escape(peer)]);
+                    cur = sender;
+                    continue;
+                }
+            }
+            break;
         }
         parts.join(".")
     }
@@ -237,12 +261,44 @@ impl SessionId {
     /// Read a wire string back: the exact inverse of [`SessionId::wire`].
     /// Strict: anything [`SessionId::wire`] would not have written is an
     /// error.
+    ///
+    /// Relay nesting is capped at [`MAX_RELAY_DEPTH`], so no value this returns
+    /// is deep enough to overflow the stack in a derived `Clone`, `PartialEq`,
+    /// `Hash` or `Debug`.
     pub fn parse(wire: &str) -> Result<Self, IdError> {
         let bad = |why: &str| IdError(format!("session id {wire:?}: {why}"));
-        let comps: Vec<&str> = wire.split('.').collect();
-        let (run, rest) = Self::parse_run(&comps, &bad)?;
-        let (tag, fields) = rest.split_first().ok_or_else(|| bad("it names no session kind"))?;
-        Self::parse_kind(run, tag, fields, &bad)
+        // Peel `relay.<peer>.` layers in a loop (a relay's tail is the sender's
+        // whole wire), parse the innermost non-relay once, then wrap outward.
+        // Linear in the string, no recursion: a crafted id can nest arbitrarily.
+        let mut layers: Vec<(RunId, String)> = Vec::new();
+        let mut comps: Vec<&str> = wire.split('.').collect();
+        let mut at = 0;
+        let mut inner = loop {
+            let (run, rest) = Self::parse_run(&comps[at..], &bad)?;
+            let (tag, fields) = rest.split_first().ok_or_else(|| bad("it names no session kind"))?;
+            match WireKind::parse(tag).ok_or_else(|| bad("unknown session kind"))? {
+                WireKind::Fixed(kind) => break Self::parse_fixed(run, kind, fields, &bad)?,
+                WireKind::Relay => {
+                    let (peer, tail) =
+                        fields.split_first().filter(|(_, t)| !t.is_empty()).ok_or_else(|| bad("a relay names no sender"))?;
+                    let peer = unescape(peer).ok_or_else(|| bad("a field is not escaped as written"))?;
+                    if layers.len() == MAX_RELAY_DEPTH {
+                        return Err(bad("a relay nests deeper than a fleet ever relays"));
+                    }
+                    layers.push((run, peer));
+                    at = comps.len() - tail.len();
+                }
+            }
+        };
+        comps.clear();
+        while let Some((run, peer)) = layers.pop() {
+            let relay = SessionId::relay(inner, peer);
+            if relay.run != run {
+                return Err(bad("a relay's run is not its sender's, standalone"));
+            }
+            inner = relay;
+        }
+        Ok(inner)
     }
 
     /// The run a wire string begins with, and the components after it.
@@ -260,11 +316,9 @@ impl SessionId {
         Ok((run, rest))
     }
 
-    /// The session within `run` that a kind `tag` and its escaped `fields`
-    /// name.
-    fn parse_kind(run: RunId, tag: &str, fields: &[&str], bad: &dyn Fn(&str) -> IdError) -> Result<Self, IdError> {
-        let tag = WireKind::parse(tag).ok_or_else(|| bad("unknown session kind"))?;
-        if fields.len() != tag.arity() {
+    /// A kind with a fixed number of escaped fields.
+    fn parse_fixed(run: RunId, kind: FixedKind, fields: &[&str], bad: &dyn Fn(&str) -> IdError) -> Result<Self, IdError> {
+        if fields.len() != kind.arity() {
             return Err(bad("wrong number of fields"));
         }
         let f: Vec<String> = fields
@@ -272,21 +326,13 @@ impl SessionId {
             .map(|f| unescape(f))
             .collect::<Option<_>>()
             .ok_or_else(|| bad("a field is not escaped as written"))?;
-        let id = match tag {
-            WireKind::Run => SessionId::run(run),
-            WireKind::Phase => SessionId::phase(run, &f[0]),
-            WireKind::Task => SessionId::task(run, &f[0]),
-            WireKind::Step => SessionId::step(run, &f[0]),
-            WireKind::Adhoc => SessionId::adhoc(run, &f[0], &f[1]),
-            WireKind::Relay => {
-                let relay = SessionId::relay(SessionId::parse(&f[1])?, &f[0]);
-                if relay.run != run {
-                    return Err(bad("a relay's run is not its sender's, standalone"));
-                }
-                relay
-            }
-        };
-        Ok(id)
+        Ok(match kind {
+            FixedKind::Run => SessionId::run(run),
+            FixedKind::Phase => SessionId::phase(run, &f[0]),
+            FixedKind::Task => SessionId::task(run, &f[0]),
+            FixedKind::Step => SessionId::step(run, &f[0]),
+            FixedKind::Adhoc => SessionId::adhoc(run, &f[0], &f[1]),
+        })
     }
 
     /// Read a session id from a record of ANY age, for attribution: a
@@ -326,37 +372,59 @@ impl SessionId {
     }
 }
 
+impl Drop for SessionId {
+    /// Unwind a relay chain in a loop: the derived drop recurses once per
+    /// nesting level, and a crafted id can nest deeply.
+    fn drop(&mut self) {
+        let SessionKind::Relay { sender, .. } = &mut self.kind else { return };
+        let mut next = std::mem::replace(sender, Box::new(SessionId::hollow()));
+        while let SessionKind::Relay { sender, .. } = &mut next.kind {
+            let inner = std::mem::replace(sender, Box::new(SessionId::hollow()));
+            next = inner;
+        }
+    }
+}
+
 /// A session kind's tag in the wire grammar (see the module doc), read once
 /// by [`SessionId::parse`].
 #[derive(Debug, Clone, Copy)]
 enum WireKind {
+    Fixed(FixedKind),
+    /// A relay's tail is the sender's wire and has no fixed field count.
+    Relay,
+}
+
+/// A kind whose escaped fields have a fixed count.
+#[derive(Debug, Clone, Copy)]
+enum FixedKind {
     Run,
     Phase,
     Task,
     Step,
     Adhoc,
-    Relay,
 }
 
 impl WireKind {
     fn parse(tag: &str) -> Option<Self> {
         match tag {
-            "run" => Some(WireKind::Run),
-            "phase" => Some(WireKind::Phase),
-            "task" => Some(WireKind::Task),
-            "step" => Some(WireKind::Step),
-            "adhoc" => Some(WireKind::Adhoc),
+            "run" => Some(WireKind::Fixed(FixedKind::Run)),
+            "phase" => Some(WireKind::Fixed(FixedKind::Phase)),
+            "task" => Some(WireKind::Fixed(FixedKind::Task)),
+            "step" => Some(WireKind::Fixed(FixedKind::Step)),
+            "adhoc" => Some(WireKind::Fixed(FixedKind::Adhoc)),
             "relay" => Some(WireKind::Relay),
             _ => None,
         }
     }
+}
 
+impl FixedKind {
     /// How many escaped fields follow the tag.
     fn arity(self) -> usize {
         match self {
-            WireKind::Run => 0,
-            WireKind::Phase | WireKind::Task | WireKind::Step => 1,
-            WireKind::Adhoc | WireKind::Relay => 2,
+            FixedKind::Run => 0,
+            FixedKind::Phase | FixedKind::Task | FixedKind::Step => 1,
+            FixedKind::Adhoc => 2,
         }
     }
 }
@@ -592,6 +660,73 @@ mod tests {
             }
         }
         assert!(seen.len() > 5_000, "the generator must actually vary: {}", seen.len());
+    }
+
+    /// The sender's wire survives on the receiver verbatim (as a suffix), so
+    /// an id the sender printed can be grepped on the receiver.
+    #[test]
+    fn a_relay_carries_the_senders_wire_verbatim() {
+        let sender = SessionId::adhoc(RunId::standalone("radio").unwrap(), "radio-host", "1790747737017533-1");
+        let relay = SessionId::relay(sender.clone(), "MacBook-Pro");
+        assert_eq!(sender.wire(), "radio.solo.adhoc.radio-host.1790747737017533-1");
+        assert_eq!(
+            relay.wire(),
+            "radio.solo.relay.MacBook-Pro.radio.solo.adhoc.radio-host.1790747737017533-1"
+        );
+        assert_eq!(SessionId::parse(&relay.wire()).unwrap(), relay);
+        // A relay of a relay nests the same way and still reads back.
+        let again = SessionId::relay(relay.clone(), "studio");
+        assert!(again.wire().ends_with(&relay.wire()));
+        assert_eq!(SessionId::parse(&again.wire()).unwrap(), again);
+    }
+
+    fn deep_relay_wire(depth: usize) -> String {
+        let mut wire = String::from("m.solo.run");
+        for _ in 0..depth {
+            wire = format!("m.solo.relay.p.{wire}");
+        }
+        wire
+    }
+
+    /// A relay nested to the cap reads back exactly.
+    #[test]
+    fn a_relay_at_the_depth_cap_round_trips() {
+        let wire = deep_relay_wire(MAX_RELAY_DEPTH);
+        let parsed = SessionId::parse(&wire).unwrap();
+        assert_eq!(parsed.wire(), wire);
+        assert_eq!(parsed.clone(), parsed);
+    }
+
+    /// One level past the cap is refused with the typed error.
+    #[test]
+    fn a_relay_past_the_depth_cap_is_refused() {
+        let err = SessionId::parse(&deep_relay_wire(MAX_RELAY_DEPTH + 1)).unwrap_err();
+        assert!(err.0.contains("nests deeper"), "{err:?}");
+    }
+
+    /// A crafted relay id arrives from a job body, a peer's reply or a
+    /// presence beat. A 50,000-level one is refused quickly, on a small
+    /// stack, before any recursive derive can see it.
+    #[test]
+    fn a_hostile_deep_relay_is_refused_fast_on_a_small_stack() {
+        let handle = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                let wire = deep_relay_wire(50_000);
+                let started = std::time::Instant::now();
+                let refused = SessionId::parse(&wire).is_err();
+                (refused, started.elapsed())
+            })
+            .unwrap();
+        let (refused, elapsed) = handle.join().expect("no stack overflow");
+        assert!(refused);
+        assert!(elapsed < std::time::Duration::from_secs(1), "refusal took {elapsed:?}");
+    }
+
+    #[test]
+    fn a_relay_whose_tail_is_not_a_session_is_refused() {
+        assert!(SessionId::parse("m.solo.relay.peer.not.a.session").is_err());
+        assert!(SessionId::parse("m.solo.relay.peer").is_err());
     }
 
     #[test]

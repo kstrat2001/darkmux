@@ -54,6 +54,8 @@ pub fn build_work_job(
         published_at_unix_ms,
         published_by_machine,
         single_shot: None,
+        boundary: None,
+        mode: crate::SubmissionMode::Run,
     }
 }
 
@@ -67,7 +69,7 @@ pub fn build_work_job(
 // `runner::execute_job`, which never re-routes.
 // ─────────────────────────────────────────────────────────────────────────
 
-use crate::job::SingleShotJob;
+use crate::job::{Boundary, SingleShotJob};
 use darkmux_crew::dispatch::{self, DispatchOpts, DispatchResult, RoutingDecision};
 
 /// Route a dispatch local-vs-remote, then run it locally via the raw
@@ -131,7 +133,7 @@ pub fn dispatch_routed_via(
     opts: DispatchOpts,
     local_dispatch: impl FnOnce(DispatchOpts) -> Result<DispatchResult>,
 ) -> Result<DispatchResult> {
-    dispatch_routed_single_shot(opts, None, local_dispatch)
+    dispatch_routed_single_shot(opts, None, None, local_dispatch)
 }
 
 /// [`dispatch_routed_via`] for a caller whose exchange is ONE tool-less
@@ -139,10 +141,13 @@ pub fn dispatch_routed_via(
 /// travels with a job submitted to a peer, which then builds the persona
 /// itself and runs the exchange through the single-shot primitive
 /// ([`SingleShotJob`]); a dispatch that stays here ignores it, because the
-/// caller's `local_dispatch` is already that primitive.
+/// caller's `local_dispatch` is already that primitive. `boundary` travels the
+/// same way and is enforced by the receiver against the profile it resolves
+/// ([`Boundary`]); a dispatch that stays here has nothing to enforce it on.
 pub fn dispatch_routed_single_shot(
     mut opts: DispatchOpts,
     single_shot: Option<SingleShotJob>,
+    boundary: Option<Boundary>,
     local_dispatch: impl FnOnce(DispatchOpts) -> Result<DispatchResult>,
 ) -> Result<DispatchResult> {
     apply_profile_address(&mut opts)?;
@@ -201,7 +206,7 @@ pub fn dispatch_routed_single_shot(
                 // #290 — the pinned route record, so the audit trail and
                 // topology UI see the operator-pinned routing decision.
                 dispatch::emit_route_record(&opts, Some(&target));
-                return dispatch_via_submission(opts, &target, single_shot);
+                return dispatch_via_submission(opts, &target, single_shot, boundary);
             }
             RoutingDecision::Remote {
                 target,
@@ -223,7 +228,7 @@ pub fn dispatch_routed_single_shot(
                     ));
                 }
                 dispatch::emit_route_record(&opts, Some(&target));
-                return dispatch_via_submission(opts, &target, single_shot);
+                return dispatch_via_submission(opts, &target, single_shot, boundary);
             }
             RoutingDecision::Local {
                 matches_was_explicit: false,
@@ -251,7 +256,12 @@ pub fn dispatch_routed_single_shot(
 /// system prompt). What does not: `--timeout`'s inactivity override,
 /// `--max-completion-tokens` (outside `single_shot`), compaction flags,
 /// `--json` (the receiver's human output is returned as stdout).
-fn dispatch_via_submission(opts: DispatchOpts, target: &str, single_shot: Option<SingleShotJob>) -> Result<DispatchResult> {
+fn dispatch_via_submission(
+    opts: DispatchOpts,
+    target: &str,
+    single_shot: Option<SingleShotJob>,
+    boundary: Option<Boundary>,
+) -> Result<DispatchResult> {
     let session_id = opts.session.clone();
     let mut job = build_work_job(
         target.to_string(),
@@ -265,6 +275,7 @@ fn dispatch_via_submission(opts: DispatchOpts, target: &str, single_shot: Option
         darkmux_flow::resolve_machine_id(),
     );
     job.single_shot = single_shot;
+    job.boundary = boundary;
     eprintln!(
         "darkmux dispatch: submitting to {target} (run={}{})…",
         session_id.wire(),
@@ -293,8 +304,23 @@ pub(crate) fn reply_to_dispatch_result(
             crate::sanitize_remote_text(reply.reason.as_deref().unwrap_or("its seat is busy"))
         ),
         ReplyStatus::Accepted => format!("submitted to {target}; not waiting (run={run}). {follow}\n"),
+        // A status this darkmux does not know is never read as success: it
+        // fails, whatever exit code the reply carried.
+        ReplyStatus::Unknown => {
+            return DispatchResult {
+                exit_code: 1,
+                stdout: String::new(),
+                stderr: format!(
+                    "{target} answered with a status this darkmux does not recognize (is it on a newer darkmux?)\n"
+                ),
+                session_id,
+                execution: None,
+                out_dir: None,
+                trajectory: None,
+            }
+        }
         // (#2916 review C1) Remote output never reaches the terminal raw.
-        ReplyStatus::Completed | ReplyStatus::Error | ReplyStatus::Refused => {
+        ReplyStatus::Completed | ReplyStatus::Error | ReplyStatus::Refused | ReplyStatus::Checked => {
             return DispatchResult {
                 exit_code: reply.exit_code.unwrap_or(1),
                 stdout: crate::sanitize_remote_text(&reply.stdout.unwrap_or_default()),
@@ -370,6 +396,20 @@ mod tests {
         let r = reply_to_dispatch_result(queued, &local, "studio");
         assert!(r.stdout.contains(&format!("queued on studio; not waiting (run={})", local.wire())), "{}", r.stdout);
         assert!(!r.stdout.contains("session"), "{}", r.stdout);
+    }
+
+    /// A status this darkmux does not know fails the dispatch, even when the
+    /// reply carries an exit code of 0: an unrecognized status is never read
+    /// as a success.
+    #[test]
+    fn an_unrecognized_reply_status_is_never_read_as_success() {
+        let reply: crate::SubmissionReply =
+            serde_json::from_str(r#"{"status": "paused", "exit_code": 0, "stdout": "done"}"#).unwrap();
+        assert_eq!(reply.status, crate::ReplyStatus::Unknown);
+        let r = reply_to_dispatch_result(reply, &crate::test_session("s-local"), "studio");
+        assert_eq!(r.exit_code, 1);
+        assert!(r.stderr.contains("does not recognize"), "{}", r.stderr);
+        assert!(r.stdout.is_empty(), "the unknown reply's output is not passed through: {}", r.stdout);
     }
 
     // (#1509) `dispatch_routed_via`'s local-dispatch injection seam. No
@@ -708,9 +748,108 @@ mod tests {
             peer_b_is_verified();
             let mut opts = local_opts("radio-host");
             opts.profile_name = Some("host@Peer-B".to_string());
-            dispatch_routed_single_shot(opts, mode, |_| panic!("never local")).unwrap();
+            dispatch_routed_single_shot(opts, mode, None, |_| panic!("never local")).unwrap();
             let sent: serde_json::Value = serde_json::from_str(&rx.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap();
             assert_eq!(sent["job"]["single_shot"], expected, "{sent}");
+        }
+    }
+
+    /// The boundary crosses with the job, and a refusal at it reaches the
+    /// sender as a typed code: the sender's caller reads the code, never the
+    /// sentence.
+    #[test]
+    #[serial]
+    fn a_boundary_crosses_and_a_boundary_refusal_reaches_the_caller_typed() {
+        let refused = format!("{}\n", serde_json::to_string(&crate::Refusal::BoundaryUnmanaged { profile: "cloud".into() }.reply("peer-b")).unwrap());
+        let (port, rx) = spawn_scripted_peer(Box::leak(refused.into_boxed_str()));
+        let _env = PeerEnv::new(port);
+        peer_b_is_verified();
+        let mut opts = local_opts("radio-host");
+        opts.profile_name = Some("cloud@Peer-B".to_string());
+        let err = dispatch_routed_single_shot(opts, None, Some(Boundary::ManagedOnly), |_| panic!("never local")).unwrap_err();
+        let sent: serde_json::Value = serde_json::from_str(&rx.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap();
+        assert_eq!(sent["job"]["boundary"], "managed_only", "{sent}");
+        assert!(sent["job"].get("mode").is_none(), "a run writes no mode: {sent}");
+        assert_eq!(err.downcast_ref::<crate::SubmitRefused>().map(|r| r.code), Some(crate::RefusalCode::Boundary), "{err:#}");
+    }
+
+    /// `check_route` submits a check: no prompt text, the route's role,
+    /// profile and boundary, and the receiver's answer comes back typed.
+    #[test]
+    #[serial]
+    fn check_route_submits_a_check_and_reads_the_answer() {
+        let checked = "{\"status\":\"checked\",\"profile\":\"deep\",\"check\":{\"endpoint\":\"managed\",\"seat\":\"would_queue\"}}\n";
+        let (port, rx) = spawn_scripted_peer(checked);
+        let _env = PeerEnv::new(port);
+        peer_b_is_verified();
+        let outcome = crate::check_route("deep@Peer-B", "radio-host", Some(Boundary::ManagedOnly));
+        assert_eq!(
+            outcome,
+            crate::CheckOutcome::Routable {
+                profile: "deep".into(),
+                report: crate::CheckReport { endpoint: crate::EndpointClass::Managed, seat: crate::SeatOutlook::WouldQueue },
+            }
+        );
+        let sent: serde_json::Value = serde_json::from_str(&rx.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap();
+        assert_eq!(sent["job"]["mode"], "check", "{sent}");
+        assert_eq!(sent["job"]["message"], "", "a check sends no prompt text: {sent}");
+        assert_eq!(
+            (sent["job"]["role_id"].as_str(), sent["job"]["profile"].as_str(), sent["job"]["boundary"].as_str()),
+            (Some("radio-host"), Some("deep"), Some("managed_only")),
+            "{sent}"
+        );
+        assert_eq!(sent["schema"], crate::WORK_JOB_SCHEMA_VERSION);
+    }
+
+    /// The doctor's check never writes the roster and never contacts a node
+    /// nothing has pinned: an unpinned entry is reported as such, the roster
+    /// file is byte-identical, and the peer sees no connection (so no token).
+    #[test]
+    #[serial]
+    fn a_read_only_check_of_an_unpinned_peer_writes_nothing_and_sends_nothing() {
+        let checked = "{\"status\":\"checked\",\"profile\":\"deep\",\"check\":{\"endpoint\":\"managed\",\"seat\":\"free\"}}\n";
+        let (port, rx) = spawn_scripted_peer(checked);
+        let _env = PeerEnv::new(port);
+        peer_b_is_verified();
+        let roster = std::env::var("DARKMUX_FLEET_FILE").unwrap();
+        let before = std::fs::read(&roster).unwrap();
+        let outcome = crate::check_route_read_only("deep@Peer-B", "radio-host", None);
+        assert_eq!(outcome, crate::ReadOnlyCheck::NotPinned { machine: "Peer-B".into() });
+        assert_eq!(std::fs::read(&roster).unwrap(), before, "the roster must be untouched");
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "nothing may reach an unpinned node");
+    }
+
+    /// The inverse: a pinned entry is still checked by the read-only path.
+    #[test]
+    #[serial]
+    fn a_read_only_check_of_a_pinned_peer_asks_it() {
+        let checked = "{\"status\":\"checked\",\"profile\":\"deep\",\"check\":{\"endpoint\":\"managed\",\"seat\":\"free\"}}\n";
+        let (port, rx) = spawn_scripted_peer(checked);
+        let _env = PeerEnv::new(port);
+        peer_b_is_verified();
+        let roster = std::env::var("DARKMUX_FLEET_FILE").unwrap();
+        std::fs::write(
+            &roster,
+            r#"{"version":"2","machines":{"peer-b":{"id":"peer-b","address":"127.0.0.1","added_unix_ms":1,"node_id":"nPEERB"}}}"#,
+        )
+        .unwrap();
+        let before = std::fs::read(&roster).unwrap();
+        let outcome = crate::check_route_read_only("deep@Peer-B", "radio-host", None);
+        assert!(matches!(outcome, crate::ReadOnlyCheck::Asked(crate::CheckOutcome::Routable { .. })), "{outcome:?}");
+        assert_eq!(std::fs::read(&roster).unwrap(), before);
+        assert!(rx.recv_timeout(Duration::from_secs(5)).is_ok(), "a pinned peer is asked");
+    }
+
+    /// A check with nothing to check (no machine in the address, no peer to
+    /// reach) is unanswered with the reason, and sends nothing.
+    #[test]
+    #[serial]
+    fn check_route_without_a_route_is_unanswered() {
+        for address in ["deep", "a@b@c"] {
+            assert!(
+                matches!(crate::check_route(address, "radio-host", None), crate::CheckOutcome::Unanswered { .. }),
+                "{address}"
+            );
         }
     }
 
@@ -772,6 +911,9 @@ mod tests {
         opts.profile_name = Some("host@peer-b".to_string());
         let msg = format!("{:#}", dispatch_routed_via(opts, |_| panic!("never local")).unwrap_err());
         assert!(msg.contains("nothing was sent") && !msg.contains("may still be running"), "{msg}");
+        // The refused connection names the listener, not a raw errno.
+        assert!(msg.contains("fleet listener") && msg.contains("not accepting connections"), "{msg}");
+        assert!(!msg.contains("os error"), "{msg}");
     }
 
     /// (#2916 stage 2) Queued without `--wait`: the answer is the
@@ -780,7 +922,7 @@ mod tests {
     #[serial]
     fn a_queued_answer_without_wait_is_reported_verbatim() {
         let (port, _rx) = spawn_scripted_peer(
-            "{\"status\":\"queued\",\"session_id\":\"m-1.solo.relay.local-a.m-1_2Eadhoc_2Ecoder_2En\",\"reason\":\"peer-b is busy (x is running on big); the job is queued and runs when its seat frees\"}\n",
+            "{\"status\":\"queued\",\"session_id\":\"m-1.solo.relay.local-a.m-1.adhoc.coder.n\",\"reason\":\"peer-b is busy (x is running on big); the job is queued and runs when its seat frees\"}\n",
         );
         let _env = PeerEnv::new(port);
         peer_b_is_verified();

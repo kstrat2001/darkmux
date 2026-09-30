@@ -1994,16 +1994,15 @@ fn machine_add_refuses_a_loopback_address_unless_allowed() {
     assert!(roster.contains("127.0.0.1:8765"), "{roster}");
 }
 
-/// (#2924 MF-3) `machine list` probes this machine's own entry at the local
-/// daemon, not at its roster address. The roster address is the peer-facing
-/// DNS name, which in the hub guide's default topology (daemon on loopback
-/// behind `tailscale serve --https=443`) answers nothing at :8765, so the
-/// hub's own row used to read unreachable. Runs the real verb: the probe
-/// target here is an unresolvable name, and only the local listener answers.
+/// (#2924 MF-3) `machine list` builds this machine's own row from a local
+/// card, never by dialing its roster address. The roster address is the
+/// peer-facing DNS name, which in the hub guide's default topology (daemon on
+/// loopback behind `tailscale serve --https=443`) answers nothing at :8765,
+/// so the hub's own row used to read unreachable. Runs the real verb: the
+/// roster address here is an unresolvable name, and the row still carries a
+/// card.
 #[test]
-fn machine_list_probes_this_machines_entry_at_the_local_daemon() {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
+fn machine_list_builds_this_machines_row_from_a_local_card_and_never_dials_its_address() {
     let tmp = TempDir::new().unwrap();
     let fleet_file = tmp.path().join("fleet.json");
     std::fs::write(
@@ -2014,19 +2013,30 @@ fn machine_list_probes_this_machines_entry_at_the_local_daemon() {
     let out = darkmux_cmd()
         .env("DARKMUX_FLEET_FILE", &fleet_file)
         .env("DARKMUX_MACHINE_ID", "self-host")
-        .env("DARKMUX_SERVE_BIND", "127.0.0.1")
-        .env("DARKMUX_SERVE_PORT", port.to_string())
+        .env_remove("DARKMUX_REDIS_URL")
+        .env("DARKMUX_LMSTUDIO_URL", "http://127.0.0.1:9")
+        .env("DARKMUX_LMS_BIN", "/nonexistent/lms")
         .args(["machine", "list", "--json"])
         .output()
         .unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let row = &v["machines"][0];
-    assert_eq!(row["address"], "self-host.invalid", "the roster keeps the peer-facing name");
-    assert_eq!(row["dialed_address"], format!("127.0.0.1:{port}"));
+    assert_eq!(row["entry"]["address"], "self-host.invalid", "the roster keeps the peer-facing name");
     assert_eq!(row["is_this_machine"], true);
-    assert_eq!(row["reachable"], true, "{row}");
-    drop(listener);
+    assert_eq!(row["liveness"], "live");
+    assert_eq!(row["card"]["state"], "available", "{row}");
+    assert_eq!(row["card"]["card"]["card_schema_version"], "1.0");
+    assert_eq!(v["cache_ttl_ms"], 0, "the CLI's gather is not cached");
+}
+
+/// `--deep` is retired: the card is the default content.
+#[test]
+fn machine_list_deep_is_refused_naming_the_default() {
+    let out = darkmux_cmd().args(["machine", "list", "--deep"]).output().unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("`darkmux machine list --deep` was removed") && err.contains("by default"), "{err}");
 }
 
 /// (#2924) `darkmux doctor` actually appends the fleet-roster rows. The
@@ -4565,6 +4575,63 @@ fn serve_raises_its_open_file_soft_limit_at_start() {
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     let soft = v["open_file_limit"].as_u64().expect("the daemon reports its open-file limit to loopback");
     assert!(soft >= 1024, "the daemon's soft open-file limit stayed at {soft}");
+}
+
+/// (#3007) A daemon started with `--port N` (a port config never heard of) is found
+/// by every client on the machine: doctor's `daemon reachable` row names the
+/// record as its source, the `fleet token` row asks THAT daemon (token set in
+/// its environment only) and passes, and a clean shutdown removes the record.
+#[test]
+fn a_daemon_started_with_a_port_flag_is_found_by_doctor_and_unrecorded_on_exit() {
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    assert_ne!(port, 8765, "the test needs a port the built-in default does not name");
+    let mut cmd = darkmux_std_cmd();
+    let env_of = |cmd: &std::process::Command, key: &str| {
+        cmd.get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new(key))
+            .and_then(|(_, v)| v.map(std::ffi::OsStr::to_os_string))
+            .unwrap_or_else(|| panic!("{key} is set on the spawn"))
+    };
+    let (home, darkmux_home) = (env_of(&cmd, "HOME"), env_of(&cmd, "DARKMUX_HOME"));
+    cmd.env("DARKMUX_HOST_SAMPLER_INTERVAL_MS", "0")
+        .env("DARKMUX_SERVE_TOKEN", "test-only-fleet-token")
+        .args(["serve", "--bind", "127.0.0.1", "--port", &port.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut child = DirectChildGuard(cmd.spawn().expect("spawning darkmux serve"));
+    wait_for_serve_health(port, std::time::Duration::from_secs(15));
+    let record = std::path::Path::new(&darkmux_home).join("run/daemon.json");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !record.exists() {
+        assert!(std::time::Instant::now() < deadline, "the daemon never recorded where it bound");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    let out = darkmux_std_cmd()
+        .env("HOME", &home)
+        .env("DARKMUX_HOME", &darkmux_home)
+        .env("DARKMUX_LMSTUDIO_URL", "http://127.0.0.1:9")
+        .env("DARKMUX_LMS_BIN", "/nonexistent/lms")
+        .env_remove("DARKMUX_SERVE_TOKEN")
+        // The `fleet token` row prints only on a machine that takes or sends
+        // fleet work; the daemon above was not told, doctor is.
+        .env("DARKMUX_FLEET_LISTENER_ENABLED", "true")
+        .args(["doctor", "--verbose"])
+        .output()
+        .unwrap();
+    // Doctor wraps long rows: compare on single-spaced text.
+    let stdout = String::from_utf8_lossy(&out.stdout).split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(stdout.contains(&format!("daemon reachable reachable · viewer http://127.0.0.1:{port}/")), "{stdout}");
+    assert!(stdout.contains("address from the running daemon's record"), "{stdout}");
+    assert!(stdout.contains("fleet token set in the running daemon's environment only"), "{stdout}");
+
+    // SAFETY: SIGTERM to our own child.
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    let _ = child.wait();
+    assert!(!record.exists(), "a clean shutdown removes the record");
 }
 
 /// (#2916 review M1) A tokenless peer flooding the fleet listener with

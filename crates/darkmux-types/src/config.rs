@@ -1291,10 +1291,10 @@ pub struct PowerConfig {
 /// **declares** `mode`; detection (a machine running Redis + the always-on
 /// daemon looks like a hub) is only a `darkmux doctor` cross-check that flags
 /// declared ≠ observed — never the source of truth (operator sovereignty).
-/// Downstream work keys on it: the turnkey hub supervises its own Redis when
-/// `mode: hub` (#936); `doctor --fleet` uses it for two-hub split-brain
-/// detection (#935). `darkmux init` writes `mode: "standalone"` visible, so the
-/// fleet surface is discoverable and one edit from `hub`/`peer`.
+/// The mode changes only which address a viewer link names (see
+/// [`FleetMode`]); it gates no fleet feature. `darkmux init` writes
+/// `mode: "standalone"` visible, so the fleet surface is discoverable and one
+/// edit from `hub`/`peer`.
 ///
 /// `mode` is stored as a **string, not a typed enum**, deliberately: the
 /// lenient-read doctrine says a typo'd value must never fail the whole-config
@@ -1906,9 +1906,12 @@ impl HookMatch {
     }
 }
 
-/// A machine's declared fleet position. `Standalone` (default) = a
-/// single-machine install with no fleet; `Hub` = the always-on coordinator
-/// (and, per #936, supervises its own Redis); `Peer` = points at a hub.
+/// A machine's declared fleet position. Its one consumer is
+/// `darkmux_doctor::viewer_link_base`: `Standalone` (default) makes viewer
+/// links name this machine's own address; `Hub` and `Peer` make them prefer
+/// the tailnet address when `tailscale serve` proxies to this daemon. It
+/// gates no fleet feature: the fleet listener, the roster and dispatch to
+/// peers are separate settings and work in any mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FleetMode {
     #[default]
@@ -1929,9 +1932,9 @@ impl FleetMode {
 // an unrecognized token is refused at `config_access::fleet_mode`, never
 // read as `standalone`.
 crate::config_enum!(FleetMode, "fleet position", [
-    Standalone = "standalone" => "a single machine that coordinates nothing",
-    Hub = "hub" => "the always-on coordinator",
-    Peer = "peer" => "a machine that points at a hub",
+    Standalone = "standalone" => "viewer links name this machine's own address (the fleet listener and roster are separate settings, unaffected)",
+    Hub = "hub" => "viewer links prefer the tailnet address when `tailscale serve` proxies to this daemon (the fleet listener and roster are separate settings, unaffected)",
+    Peer = "peer" => "viewer links prefer the tailnet address when `tailscale serve` proxies to this daemon (the fleet listener and roster are separate settings, unaffected)",
 ]);
 
 /// (#2947) An OS thermal state, as `runtime.thermal.pause_at` / `resume_at`
@@ -1982,7 +1985,7 @@ crate::config_enum!(IdentityProvider, "identity provider", [
 /// holds that model for its whole run (one request at a time per instance);
 /// a job on a HOSTED endpoint runs beside others up to this machine's
 /// `remote.concurrent_cap`. Past either limit, this policy decides.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "lowercase")]

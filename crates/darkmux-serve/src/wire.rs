@@ -38,12 +38,16 @@ pub struct HealthResponse {
     #[cfg_attr(test, ts(type = "number | null"))]
     pub binary_mtime: Option<u64>,
     pub flow_schema_version: String,
-    /// What the fleet listener is doing (`null` when it is off): the detail for a
-    /// caller on this machine, a coarse state for anyone else.
+    /// What the fleet listener is doing (`off` when `fleet.listener.enabled` is
+    /// false): the detail for a caller on this machine, a coarse state for
+    /// anyone else.
     pub fleet_listener: Option<String>,
     /// The busy policy and hosted-job bound the running listener uses; this
     /// machine only.
     pub fleet_busy: Option<FleetBusy>,
+    /// Whether this daemon resolved a fleet token (the serve token) in its own
+    /// environment; never the value. This machine only.
+    pub fleet_token_set: Option<bool>,
     /// The open-file soft limit this daemon runs with; this machine only.
     #[cfg_attr(test, ts(type = "number | null"))]
     pub open_file_limit: Option<u64>,
@@ -354,25 +358,25 @@ pub struct FleetDispatchesLiveResponse {
 }
 
 /// One machine in the operator's DECLARED roster (`fleet.json`).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize, schemars::JsonSchema)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct RosterMachineEntry {
     pub id: String,
     pub address: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub description: Option<String>,
     #[cfg_attr(test, ts(type = "number"))]
     pub added_unix_ms: u64,
     /// The machine's hardware identity: declared, or derived from the flow
     /// history when the entry declares none. Absent means unknown identity.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub machine_uid: Option<String>,
     /// Added with `machine add --allow-loopback`: the loopback address is
     /// intentional. Omitted when false.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub loopback_intended: Option<bool>,
 }

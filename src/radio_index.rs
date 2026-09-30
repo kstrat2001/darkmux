@@ -207,7 +207,7 @@ mod tests {
         assert!(status.summary.starts_with("Show models currently loaded"), "{}", status.summary);
         assert!(!status.summary.contains("#1426"), "archaeology stripped: {}", status.summary);
         let list = by_path("machine list").expect("machine list");
-        assert!(list.options.iter().any(|o| o == "--deep"), "{:?}", list.options);
+        assert!(list.options.iter().any(|o| o == "--json"), "{:?}", list.options);
         let eval = by_path("lab eval").expect("lab eval");
         assert!(eval.options.len() <= MAX_OPTIONS_SHOWN + 1 && eval.options.last().map(String::as_str) == Some("..."), "{:?}", eval.options);
         assert!(by_path("radio").is_some(), "top-level leaf verbs are entries too");

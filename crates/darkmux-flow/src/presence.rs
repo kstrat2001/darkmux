@@ -86,7 +86,7 @@ pub struct PresenceBeat {
     /// (#1580) The darkmux version this daemon's binary is. `None` from a peer
     /// running a build that predates this field.
     ///
-    /// It lives HERE, on the heartbeat, and not only on `machine list --deep`,
+    /// It lives HERE, on the heartbeat, and not only on `machine list`,
     /// because presence needs no HTTP reachability — it travels the shared
     /// Redis. The failure that motivated #1580 is exactly the case where the
     /// deep probe cannot answer: a peer whose daemon is up and heartbeating

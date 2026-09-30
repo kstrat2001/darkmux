@@ -33,24 +33,23 @@ pub const DEFAULT_DAEMON_ADDR: &str = "127.0.0.1:8765";
 /// resolution.
 pub const DEFAULT_DAEMON_PORT: u16 = 8765;
 
-/// (#2765) The resolved `host:port` a client on this machine should probe to
-/// reach the local daemon — `env(DARKMUX_SERVE_BIND/_PORT) > config.serve.*
-/// > the built-in defaults above`, with a wildcard bind probed on loopback.
+/// The resolved `host:port` a client on this machine should probe to reach
+/// the local daemon: the running daemon's own record, else
+/// `env(DARKMUX_SERVE_BIND/_PORT) > config.serve.* > the built-in defaults
+/// above`, with a wildcard bind probed on loopback.
 ///
 /// Thin by design: the resolution itself lives in ONE place
-/// (`darkmux_types::config_access::serve_client_addr`), the same place
-/// `darkmux serve` itself reads its listen address from. Re-exported here
+/// (`darkmux_types::config_access::serve_client_endpoint`). Re-exported here
 /// so the client-side probe callers that already depend on this module do
 /// not each grow their own config read.
 pub fn daemon_addr() -> String {
     darkmux_types::config_access::serve_client_addr()
 }
 
-/// (#2765) The resolved daemon port — `env(DARKMUX_SERVE_PORT) >
-/// config.serve.port > 8765`. For callers that need the port alone (a
+/// The resolved daemon port, the port of [`daemon_addr`]. For callers that need the port alone (a
 /// portless peer address getting a default appended, a viewer URL).
 pub fn daemon_port() -> u16 {
-    darkmux_types::config_access::serve_port()
+    darkmux_types::config_access::serve_client_port()
 }
 
 /// Probe-budget timeout for the every-dispatch reachability check.
@@ -88,31 +87,76 @@ fn is_addr_reachable(addr: std::net::SocketAddr, timeout: std::time::Duration) -
     std::net::TcpStream::connect_timeout(&addr, timeout).is_ok()
 }
 
+static RUNNING_INSIDE_DAEMON: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Record that this process IS the `darkmux serve` daemon. A dispatch that
+/// runs in-process inside the daemon (relayed fleet work) is already live by
+/// construction, and the daemon may be bound to a `--port` the resolved
+/// config never heard of, so the reachability nudge must not run there.
+pub fn mark_running_inside_daemon() {
+    RUNNING_INSIDE_DAEMON.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn running_inside_daemon() -> bool {
+    RUNNING_INSIDE_DAEMON.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// How to start the daemon, for the binary that is actually running: the
+/// Homebrew service only when this binary lives under a Homebrew prefix,
+/// otherwise the binary itself.
+fn start_advice(exe: Option<&std::path::Path>) -> &'static str {
+    let brewed = exe
+        .map(|p| {
+            let p = p.to_string_lossy();
+            p.contains("/Cellar/") || p.starts_with("/opt/homebrew/") || p.starts_with("/usr/local/opt/")
+        })
+        .unwrap_or(false);
+    if brewed {
+        "start the daemon: `brew services start darkmux`."
+    } else {
+        "start the daemon: `darkmux serve`."
+    }
+}
+
+/// The nudge text, or `None` when there is nothing to say: this process is
+/// the daemon, or the daemon answered.
+fn nudge_message(
+    verb_hint: &str,
+    addr: &str,
+    reachable: bool,
+    inside_daemon: bool,
+    exe: Option<&std::path::Path>,
+) -> Option<String> {
+    if inside_daemon || reachable {
+        return None;
+    }
+    Some(format!(
+        "[!] darkmux serve isn't reachable on {addr}. `{verb_hint}` will write flow records to disk \
+         but you won't see them live. To enable live viewing, {}",
+        start_advice(exe)
+    ))
+}
+
 /// Print the one-line stderr nudge if the daemon isn't reachable.
 /// Non-blocking: the dispatch always proceeds; this is purely
 /// situational awareness so an operator who closed the daemon tab
 /// last week doesn't lose visibility into a multi-minute dispatch
-/// before realizing it.
+/// before realizing it. Silent inside the daemon itself.
 ///
 /// `verb_hint` is the verb the operator just ran (e.g. "dispatch"
 /// or "phase review"); used in the nudge to make the message
 /// context-specific.
 pub fn nudge_if_daemon_unreachable(verb_hint: &str) {
     // (#2765) Resolve ONCE and use the same string for the probe and the
-    // message. The bug this closes was the two disagreeing: the operator
-    // read "isn't reachable on 127.0.0.1:8765" while their daemon was
-    // healthy on the port their config named, and the live view went dark
-    // with no error anywhere.
+    // message, so the message can never name a port other than the one tried.
     let addr = daemon_addr();
-    if is_daemon_reachable_at(&addr) {
-        return;
+    let inside = running_inside_daemon();
+    let reachable = inside || is_daemon_reachable_at(&addr);
+    let exe = std::env::current_exe().ok();
+    if let Some(msg) = nudge_message(verb_hint, &addr, reachable, inside, exe.as_deref()) {
+        eprintln!("{msg}");
     }
-    eprintln!(
-        "[!] darkmux serve isn't reachable on {}. `{}` will write flow records to disk \
-         but you won't see them live. To enable live viewing, start the daemon: \
-         `brew services start darkmux` (or `darkmux serve` from source).",
-        addr, verb_hint
-    );
 }
 
 #[cfg(test)]
@@ -265,5 +309,32 @@ mod tests {
                 None => std::env::remove_var(k),
             }
         }
+    }
+
+    #[test]
+    fn no_nudge_inside_the_daemon_even_when_the_probe_would_fail() {
+        assert_eq!(nudge_message("dispatch", "127.0.0.1:8765", false, true, None), None);
+    }
+
+    #[test]
+    fn nudge_names_the_address_when_outside_and_unreachable() {
+        let m = nudge_message("dispatch", "127.0.0.1:8765", false, false, None).unwrap();
+        assert!(m.contains("127.0.0.1:8765"), "{m}");
+        assert_eq!(nudge_message("dispatch", "127.0.0.1:8765", true, false, None), None);
+    }
+
+    #[test]
+    fn brew_advice_only_for_a_brewed_binary() {
+        let brewed = std::path::Path::new("/opt/homebrew/Cellar/darkmux/5.0/bin/darkmux");
+        let cargo = std::path::Path::new("/Users/x/.cargo/bin/darkmux");
+        assert!(start_advice(Some(brewed)).contains("brew services"));
+        assert!(!start_advice(Some(cargo)).contains("brew"));
+        assert!(!start_advice(None).contains("brew"));
+    }
+
+    #[test]
+    fn marking_the_daemon_is_process_wide() {
+        mark_running_inside_daemon();
+        assert!(running_inside_daemon());
     }
 }

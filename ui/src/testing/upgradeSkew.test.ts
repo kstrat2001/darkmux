@@ -2,11 +2,9 @@ import { describe, it, expect } from "vitest";
 import {
   buildScenario,
   UPGRADE_SKEW,
-  UPGRADE_SKEW_ALIAS_EXPIRED,
   UPGRADE_IN_PROGRESS,
 } from "./fleetScenario";
 import { machineUids, nameOf, machineNames } from "../lib/flow";
-import { rosterOnlyEntries } from "../lenses/fleet/cards";
 
 /**
  * (#2818) THE UPGRADE, AS A TEST.
@@ -28,10 +26,6 @@ describe("(#2818) a fleet mid-upgrade, on two versions", () => {
 
     const uids = machineUids(s.data, s.liveMachines);
     expect(uids.length, "one uid per physical machine, whatever version it runs").toBe(2);
-
-    // And the stale roster row folds rather than becoming a third card.
-    const phantom = rosterOnlyEntries(s.data, s.liveMachines, s.roster);
-    expect(phantom.map((e) => e.id)).toEqual([]);
   });
 
   it("names each machine by what it calls itself NOW, not by an older alias", () => {
@@ -49,20 +43,5 @@ describe("(#2818) a fleet mid-upgrade, on two versions", () => {
     // absent during its own upgrade must not remove it from the fleet.
     const s = buildScenario(UPGRADE_IN_PROGRESS);
     expect(machineUids(s.data, s.liveMachines).length).toBe(2);
-  });
-
-  it("KNOWN GAP (#2796): once the alias ages out, the stale row becomes a phantom", () => {
-    // Nothing is corrupt here. One machine, one uid, a roster row written
-    // before uids were recorded, and a retention window that finally rolled
-    // past the rename. This is the state the live fleet drifts into on its
-    // own, months after the cause.
-    const s = buildScenario(UPGRADE_SKEW_ALIAS_EXPIRED);
-
-    const phantom = rosterOnlyEntries(s.data, s.liveMachines, s.roster);
-    expect(
-      phantom.map((e) => e.id),
-      "documenting the open defect rather than asserting today's accident as correct — \
-#2814's persisted last-known record is what closes it",
-    ).toEqual(["laptop"]);
   });
 });

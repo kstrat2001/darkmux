@@ -1,0 +1,20 @@
+{
+  "schema": "8.0",
+  "wait": true,
+  "job": {
+    "target_machine": "studio",
+    "role_id": "radio-host",
+    "message": "what is running?",
+    "session_id": "radio.solo.adhoc.radio-host.n1",
+    "profile": "deep",
+    "timeout_seconds": 300,
+    "published_at_unix_ms": 1700000000000,
+    "published_by_machine": "laptop",
+    "single_shot": {
+      "humor": 50,
+      "surface": "panel",
+      "max_completion_tokens": 3000
+    },
+    "boundary": "managed_only"
+  }
+}
