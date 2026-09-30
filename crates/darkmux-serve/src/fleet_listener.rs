@@ -3054,6 +3054,24 @@ mod tests {
         *LISTENER_STATE.lock().unwrap() = None;
     }
 
+    /// Only the `Bearer` scheme carries the token: the same value under any
+    /// other scheme, or with no scheme, is a mismatch. The scheme name is
+    /// case-insensitive.
+    #[test]
+    fn only_the_bearer_scheme_carries_the_token() {
+        let check = |value: &str| {
+            let mut h = axum::http::HeaderMap::new();
+            h.insert(axum::http::header::AUTHORIZATION, value.parse().unwrap());
+            check_token(&h, Some("s3cret".to_string()))
+        };
+        assert!(matches!(check("Bearer s3cret"), TokenCheck::Match));
+        assert!(matches!(check("bEaReR s3cret"), TokenCheck::Match), "the scheme is case-insensitive");
+        assert!(matches!(check("Basic s3cret"), TokenCheck::Mismatch), "the token under another scheme");
+        assert!(matches!(check("Token s3cret"), TokenCheck::Mismatch));
+        assert!(matches!(check("s3cret"), TokenCheck::Mismatch), "no scheme at all");
+        assert!(matches!(check("Bearer wrong"), TokenCheck::Mismatch));
+    }
+
     #[test]
     fn a_peer_sees_only_the_coarse_listener_state() {
         set_state("listening", "listening on 100.64.0.2:8766");
