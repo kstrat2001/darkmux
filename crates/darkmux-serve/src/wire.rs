@@ -354,25 +354,25 @@ pub struct FleetDispatchesLiveResponse {
 }
 
 /// One machine in the operator's DECLARED roster (`fleet.json`).
-#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize, schemars::JsonSchema)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct RosterMachineEntry {
     pub id: String,
     pub address: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub description: Option<String>,
     #[cfg_attr(test, ts(type = "number"))]
     pub added_unix_ms: u64,
     /// The machine's hardware identity: declared, or derived from the flow
     /// history when the entry declares none. Absent means unknown identity.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub machine_uid: Option<String>,
     /// Added with `machine add --allow-loopback`: the loopback address is
     /// intentional. Omitted when false.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub loopback_intended: Option<bool>,
 }

@@ -33,6 +33,7 @@
 
 use crate::job::{WorkJob, WORK_JOB_SCHEMA_VERSION};
 use crate::identity::NodeIdentity;
+use crate::peer::TargetError;
 use anyhow::{anyhow, Context, Result};
 use darkmux_types::config::AcceptWorkEntry;
 use darkmux_types::session_id::SessionId;
@@ -41,8 +42,12 @@ use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::time::Duration;
 
-/// The listener's one route.
+/// The listener's work route.
 pub const SUBMISSION_PATH: &str = "/fleet/work";
+
+/// The listener's card route: this machine's card, with what it accepts from
+/// the verified caller.
+pub const CARD_PATH: &str = "/fleet/card";
 
 /// The request body: the wire version, whether the sender waits for the
 /// result, and the job. `schema` is read first, so a sender on another
@@ -852,10 +857,10 @@ pub fn verify_target(
     target: &str,
     entry: &crate::MachineEntry,
     provider: &dyn crate::identity::IdentityProvider,
-) -> Result<VerifiedTarget> {
+) -> std::result::Result<VerifiedTarget, TargetError> {
     let mut ips = crate::roster::resolve_host_addrs(&entry.address);
     if ips.is_empty() {
-        return Err(anyhow!("the roster address for {target} (`{}`) does not resolve; nothing was sent", entry.address));
+        return Err(TargetError::DoesNotResolve { target: target.to_string(), address: entry.address.clone() });
     }
     // (#2916 round 3) Try the answers IPv4 first: a fleet listener binds the
     // node's IPv4 overlay address, so an IPv6-first resolver answer must not
@@ -877,28 +882,24 @@ pub fn verify_target(
     let (ip, node) = match (found, last_err) {
         (Some(x), _) => x,
         (None, Some(e)) => {
-            return Err(anyhow!(
-                "cannot verify {target}'s address with {} ({e:#}); nothing was sent",
-                provider.provider_name()
-            ))
+            return Err(TargetError::IdentityUnavailable {
+                target: target.to_string(),
+                provider: provider.provider_name().to_string(),
+                detail: format!("{e:#}"),
+            })
         }
         (None, None) => {
-            return Err(anyhow!(
-                "the roster address for {target} (`{}`) is not a node on the {} network, so nothing \
-                 was sent to it (not the fleet token, not the request). Point the entry at {target}'s \
-                 tailnet DNS name: `darkmux machine add {target} --address <its tailnet DNS name>`",
-                entry.address,
-                provider.provider_name()
-            ))
+            return Err(TargetError::NotOnOverlay {
+                target: target.to_string(),
+                address: entry.address.clone(),
+                provider: provider.provider_name().to_string(),
+            })
         }
     };
     match entry.node_id.as_deref().filter(|p| !p.is_empty()) {
-        Some(pinned) if pinned != node.node_id => Err(anyhow!(
-            "the node at {target}'s address (`{}`) is not the one this roster pinned for {target}; \
-             nothing was sent. If {target} really was replaced, re-pin it with `darkmux machine add \
-             {target} --address <its tailnet DNS name>`",
-            node.name
-        )),
+        Some(pinned) if pinned != node.node_id => {
+            Err(TargetError::PinMismatch { target: target.to_string(), node_name: node.name })
+        }
         Some(_) => Ok(VerifiedTarget { ip, node, newly_pinned: false }),
         None => Ok(VerifiedTarget { ip, node, newly_pinned: true }),
     }
@@ -931,7 +932,7 @@ pub fn submit_work(job: WorkJob, wait: bool) -> Result<SubmissionReply> {
     let port = darkmux_types::config_access::fleet_listener_port();
     // Every address is verified for work, loopback included (the listener
     // never binds loopback, so a real provider refuses it).
-    let peer = crate::peer::peer_target(&target, &entry, None, Some(port), port, false, provider.as_ref())?;
+    let peer = crate::peer::peer_target(&target, &entry, None, port, false, provider.as_ref())?.at_listener(port);
     if peer.newly_pinned.is_some() {
         crate::peer::persist_pin(&entry.id, &peer).context("pinning the target's node in the roster")?;
         eprintln!(

@@ -19,11 +19,14 @@
 //!   receiver runs the real dispatch path without Docker or a model.
 //!
 //! The same two daemons also prove the fleet view and the machine card end to
-//! end: `alpha`'s `GET /fleet/view` shows `beta`'s real card (fetched by a real
-//! HTTP request from one daemon to the other), a peer with no `/machine/card`
-//! route reads "card unavailable", slow peers are asked in parallel, and
-//! `beta`'s `GET /machine/card` carries the caller-scoped `accepts` block only
-//! for a request holding the fleet token from an allow-listed node.
+//! end, over the path a real fleet uses: `alpha`'s `GET /fleet/view` gets
+//! `beta`'s card from `beta`'s fleet LISTENER (a real, token-bearing request
+//! from one daemon to the other's overlay address), with `accepts` granted for
+//! `alpha`. With `beta`'s listener off, the row falls back to `beta`'s daemon
+//! and `accepts` is unknown; with `alpha` not on `beta`'s allow-list, `accepts`
+//! is refused with `beta`'s own sentence. A peer with no `/machine/card` route
+//! reads "card unavailable", slow peers are asked in parallel, and `beta`'s
+//! daemon card never carries `accepts`.
 //!
 //! Needs a binary built with the test-only `e2e-fleet-loopback` feature (a
 //! production listener refuses loopback): [`bin`] builds one. The target
@@ -262,6 +265,8 @@ struct Fleet {
     /// The viewer ports, by node.
     alpha_port: u16,
     beta_port: u16,
+    /// Beta's fleet listener port (held only when beta's listener is on).
+    fleet_port: u16,
     daemons: Vec<Child>,
     group: fixture_reaper::FixtureGroup,
     mock: MockChat,
@@ -314,6 +319,33 @@ enum BetaModels {
 
 /// The full fixture: `extra_roster` (id, address) entries are also in alpha's roster.
 fn boot_with(busy_policy: &str, profiles: Option<&[&str]>, models: BetaModels, extra_roster: &[(&str, String)]) -> Fleet {
+    boot_setup(&Setup {
+        busy_policy,
+        profiles,
+        models,
+        extra_roster,
+        beta_listener: true,
+        alpha_dials_dead_listener_port: false,
+    })
+}
+
+/// Everything a fixture can vary.
+struct Setup<'a> {
+    busy_policy: &'a str,
+    /// Beta's allow-list entry for alpha, or `None` for no entry.
+    profiles: Option<&'a [&'a str]>,
+    models: BetaModels,
+    /// (id, address) entries also in alpha's roster.
+    extra_roster: &'a [(&'a str, String)],
+    /// Whether beta runs its fleet listener.
+    beta_listener: bool,
+    /// Whether alpha's config names a fleet listener port nothing holds, so
+    /// a roster peer other than beta answers only on its daemon.
+    alpha_dials_dead_listener_port: bool,
+}
+
+fn boot_setup(setup: &Setup) -> Fleet {
+    let Setup { busy_policy, profiles, models, extra_roster, beta_listener, alpha_dials_dead_listener_port } = *setup;
     let accept_work = match profiles {
         Some(profiles) => serde_json::json!({"alpha": {"node_id": "nALPHA", "profiles": profiles, "roles": ["radio-host"], "workspace": false}}),
         None => serde_json::json!({}),
@@ -322,6 +354,7 @@ fn boot_with(busy_policy: &str, profiles: Option<&[&str]>, models: BetaModels, e
     let (alpha, beta) = (Node::new(root.path(), "alpha"), Node::new(root.path(), "beta"));
     let mock = MockChat::spawn();
     let fleet_port = free_port();
+    let alpha_listener_port = if alpha_dials_dead_listener_port { free_port() } else { fleet_port };
     let (alpha_port, beta_port) = (free_port(), free_port());
 
     // alpha: sender. Its roster places beta at 127.0.0.1; its identity tool
@@ -332,14 +365,15 @@ fn boot_with(busy_policy: &str, profiles: Option<&[&str]>, models: BetaModels, e
         serde_json::json!({
             "schema_version": darkmux_types::config::CONFIG_SCHEMA_VERSION,
             "machine_id": "alpha",
-            "fleet": {"identity": {"provider": "tailscale", "bin": alpha_tool}, "listener": {"enabled": false, "port": fleet_port}}
+            "fleet": {"identity": {"provider": "tailscale", "bin": alpha_tool}, "listener": {"enabled": false, "port": alpha_listener_port}}
         })
         .to_string(),
     )
     .unwrap();
     std::fs::write(alpha.home.join("profiles.json"), r#"{"profiles":{}}"#).unwrap();
-    // beta's entry names its viewer port too: alpha reads beta's card there.
-    // (Work submission drops the port and uses the fleet listener's.)
+    // beta's entry names its viewer port too: it is where alpha falls back to
+    // for beta's card when beta's listener is off. (Work submission and the
+    // card's first ask drop the port and use the fleet listener's.)
     let mut machines = serde_json::Map::new();
     let mut add = |id: &str, address: String| {
         machines.insert(id.to_string(), serde_json::json!({"id": id, "address": address, "added_unix_ms": 1, "loopback_intended": true}));
@@ -360,7 +394,7 @@ fn boot_with(busy_policy: &str, profiles: Option<&[&str]>, models: BetaModels, e
             "machine_id": "beta",
             "fleet": {
                 "identity": {"provider": "tailscale", "bin": beta_tool},
-                "listener": {"enabled": true, "port": fleet_port},
+                "listener": {"enabled": beta_listener, "port": fleet_port},
                 "accept_work": accept_work,
                 "busy_policy": busy_policy
             },
@@ -406,8 +440,10 @@ fn boot_with(busy_policy: &str, profiles: Option<&[&str]>, models: BetaModels, e
         daemons.push(child);
         wait_for_port(port, &format!("{}'s viewer", node.name), &log);
     }
-    let fleet = Fleet { alpha, beta, alpha_port, beta_port, daemons, group, mock, _root: root };
-    wait_for_port(fleet_port, "beta's fleet listener", &fleet.beta.home.join("daemon.log"));
+    let fleet = Fleet { alpha, beta, alpha_port, beta_port, fleet_port, daemons, group, mock, _root: root };
+    if beta_listener {
+        wait_for_port(fleet_port, "beta's fleet listener", &fleet.beta.home.join("daemon.log"));
+    }
     fleet
 }
 
@@ -582,15 +618,23 @@ fn row<'a>(view: &'a serde_json::Value, id: &str) -> &'a serde_json::Value {
     view["machines"].as_array().and_then(|rows| rows.iter().find(|r| r["entry"]["id"] == id)).unwrap_or_else(|| panic!("no {id} row in {view}"))
 }
 
-/// The promise: alpha's view of beta is beta's OWN card, fetched over HTTP.
+/// The promise: alpha's view of beta is beta's OWN card, fetched over HTTP
+/// from beta's fleet listener with the fleet token, and it states what beta
+/// accepts from alpha.
 #[test]
-fn a_daemons_fleet_view_shows_the_other_daemons_real_card() {
+fn a_daemons_fleet_view_shows_the_other_daemons_card_from_its_listener_with_accepts_granted() {
     let f = boot("refuse");
     let (status, view) = http_get(f.alpha_port, "/fleet/view", &[]);
     assert_eq!(status, 200, "{view}");
     assert_eq!(view["local_machine_id"], "alpha");
+    assert_eq!(view["gathered_by"], "daemon");
     let beta = row(&view, "beta");
     assert_eq!(beta["card"]["state"], "available", "{beta}");
+    assert_eq!(beta["card"]["source"], "listener", "the card came from beta's listener: {beta}");
+    assert_eq!(beta["card"]["accepts"]["state"], "granted", "{beta}");
+    assert_eq!(beta["card"]["accepts"]["accepts"]["peer_name"], "alpha");
+    assert_eq!(beta["card"]["accepts"]["accepts"]["profiles"], serde_json::json!(["cloud"]));
+    assert_eq!(beta["card"]["accepts"]["accepts"]["roles"], serde_json::json!(["radio-host"]));
     let card = &beta["card"]["card"];
     assert_eq!(card["specs"]["machine_id"], "beta", "the card is beta's own, not alpha's: {card}");
     let cloud = card["profiles"].as_array().unwrap().iter().find(|p| p["name"] == "cloud").expect("beta's cloud profile");
@@ -598,8 +642,46 @@ fn a_daemons_fleet_view_shows_the_other_daemons_real_card() {
     assert_eq!(card["default_profile"], "cloud");
     assert_eq!(card["seats"]["busy_policy"], "refuse", "beta's listener is running: {card}");
     assert_eq!(card["seats"]["hosted"]["cap"], 1);
-    assert!(card.get("accepts").is_none(), "alpha sent no fleet token to a loopback peer: {card}");
+    assert!(card.get("accepts").is_none(), "a card states no grant itself: {card}");
     assert_eq!(view["cache_ttl_ms"], 5000);
+}
+
+/// With beta's listener off, nothing answers on its listener port: the card
+/// comes from beta's daemon and `accepts` is UNKNOWN, not refused.
+#[test]
+fn with_the_peers_listener_off_the_row_falls_back_to_its_daemon_and_accepts_is_unknown() {
+    let f = boot_setup(&Setup {
+        busy_policy: "refuse",
+        profiles: Some(&["cloud"]),
+        models: BetaModels::Hosted,
+        extra_roster: &[],
+        beta_listener: false,
+        alpha_dials_dead_listener_port: false,
+    });
+    let (status, view) = http_get(f.alpha_port, "/fleet/view", &[]);
+    assert_eq!(status, 200, "{view}");
+    let beta = row(&view, "beta");
+    assert_eq!(beta["card"]["state"], "available", "{beta}");
+    assert_eq!(beta["card"]["source"], "daemon", "{beta}");
+    assert_eq!(beta["card"]["accepts"]["state"], "unknown", "{beta}");
+    assert_eq!(beta["card"]["accepts"]["why"], "listener_off", "{beta}");
+    assert_eq!(beta["card"]["card"]["specs"]["machine_id"], "beta");
+    assert!(beta["card"]["card"].get("seats").is_none(), "no listener, no seats: {beta}");
+}
+
+/// With alpha not on beta's allow-list the listener REFUSES it, in its own
+/// words, and the card still comes (from the daemon).
+#[test]
+fn a_peer_that_does_not_trust_this_machine_refuses_it_in_its_own_words() {
+    let f = boot_trusting("refuse", None);
+    let (status, view) = http_get(f.alpha_port, "/fleet/view", &[]);
+    assert_eq!(status, 200, "{view}");
+    let beta = row(&view, "beta");
+    assert_eq!(beta["card"]["state"], "available", "{beta}");
+    assert_eq!(beta["card"]["source"], "daemon", "{beta}");
+    assert_eq!(beta["card"]["accepts"]["state"], "refused", "{beta}");
+    let reason = beta["card"]["accepts"]["reason"].as_str().unwrap();
+    assert!(reason.contains("does not accept work from"), "the listener's sentence: {reason}");
 }
 
 /// Seats are live: a job running on beta's hosted seat shows as held in
@@ -622,22 +704,27 @@ fn a_running_job_shows_as_a_held_seat_in_the_peers_card() {
     }
 }
 
-/// `accepts` is beta's allow-list entry for the caller, and only with the
-/// fleet token from a node the network names (the fake tool names 127.0.0.1
-/// as alpha).
+/// The daemon's card states no grant, whoever asks. The listener's card read
+/// states the caller's own allow-list entry, and only with the fleet token from
+/// a node the network names (the fake tool names 127.0.0.1 as alpha).
 #[test]
-fn the_card_carries_accepts_only_for_the_token_holding_allow_listed_caller() {
+fn the_daemons_card_states_no_grant_and_the_listeners_states_the_callers_own() {
     let f = boot("refuse");
-    let (_, plain) = http_get(f.beta_port, "/machine/card", &[]);
-    assert!(plain.get("accepts").is_none(), "no token: {plain}");
-    let (_, wrong) = http_get(f.beta_port, "/machine/card", &[("Authorization", "Bearer nope")]);
-    assert!(wrong.get("accepts").is_none(), "a wrong token: {wrong}");
     let auth = format!("Bearer {TOKEN}");
-    let (_, card) = http_get(f.beta_port, "/machine/card", &[("Authorization", &auth)]);
+    let (_, daemon_card) = http_get(f.beta_port, "/machine/card", &[("Authorization", &auth)]);
+    assert!(daemon_card.get("accepts").is_none(), "the daemon states no grant: {daemon_card}");
+
+    let (code, _) = http_get(f.fleet_port, darkmux_fleet::CARD_PATH, &[]);
+    assert_eq!(code, 401, "no token");
+    let (code, wrong) = http_get(f.fleet_port, darkmux_fleet::CARD_PATH, &[("Authorization", "Bearer nope")]);
+    assert_eq!(code, 401, "a wrong token: {wrong}");
+    let (code, card) = http_get(f.fleet_port, darkmux_fleet::CARD_PATH, &[("Authorization", &auth)]);
+    assert_eq!(code, 200, "{card}");
     assert_eq!(card["accepts"]["peer_name"], "alpha", "{card}");
     assert_eq!(card["accepts"]["profiles"], serde_json::json!(["cloud"]));
     assert_eq!(card["accepts"]["roles"], serde_json::json!(["radio-host"]));
     assert_eq!(card["accepts"]["workspace"], false);
+    assert_eq!(card["card"]["specs"]["machine_id"], "beta");
 }
 
 /// A peer on an older darkmux shows as "card unavailable", and two slow
@@ -645,7 +732,18 @@ fn the_card_carries_accepts_only_for_the_token_holding_allow_listed_caller() {
 #[test]
 fn an_old_peer_is_card_unavailable_and_slow_peers_are_asked_in_parallel() {
     let (slow1, slow2) = (old_peer(1_200), old_peer(1_200));
-    let f = boot_with("refuse", Some(&["cloud"]), BetaModels::Hosted, &[("slow1", format!("127.0.0.1:{slow1}")), ("slow2", format!("127.0.0.1:{slow2}"))]);
+    // Alpha's listener client dials a port nothing holds, so the two old
+    // peers (which the fake identity tool also places at 127.0.0.1) answer
+    // only on their daemons, as a peer with its listener off does.
+    let roster = [("slow1", format!("127.0.0.1:{slow1}")), ("slow2", format!("127.0.0.1:{slow2}"))];
+    let f = boot_setup(&Setup {
+        busy_policy: "refuse",
+        profiles: Some(&["cloud"]),
+        models: BetaModels::Hosted,
+        extra_roster: &roster,
+        beta_listener: true,
+        alpha_dials_dead_listener_port: true,
+    });
     let started = Instant::now();
     let (status, view) = http_get(f.alpha_port, "/fleet/view", &[]);
     let took = started.elapsed();

@@ -101,7 +101,7 @@ pub(crate) struct AppState {
     sse_open: Arc<AtomicUsize>,
     /// (#1569 packet B) Panel cache + single-flight locks — see `panel.rs`.
     panels: panel::PanelState,
-    /// The fleet routes' inputs: admission, gather sources, view cache.
+    /// The fleet routes' inputs: gather sources and the view cache.
     fleet: fleet_view::FleetContext,
     /// (#1585, was #1247 Part 3) The lab-run scan root — `--lab-dir` >
     /// `DARKMUX_LAB_DIR` > `config.dirs.lab` > `~/.darkmux/lab`.

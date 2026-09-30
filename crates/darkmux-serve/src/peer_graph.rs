@@ -223,7 +223,6 @@ fn try_peer_graph_with(
         &machine,
         &entry,
         None,
-        None,
         darkmux_flow::daemon_probe::DEFAULT_DAEMON_PORT,
         true,
         provider,

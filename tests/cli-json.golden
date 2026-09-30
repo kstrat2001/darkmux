@@ -39,6 +39,8 @@ flow tail  one flow record per line, verbatim; the record is pinned by FLOW_SCHE
 
 # types
 AbandonReason = "aborted" | "noterminal"
+AcceptsState = { accepts: CardAccepts; state: "granted" } | { reason: string; state: "refused" } | { why: AcceptsUnknown; detail: string | null; state: "unknown" }
+AcceptsUnknown = "this_machine" | "listener_off" | "listener_unavailable" | "not_dialed" | "withheld"
 ActiveWait
   scope: string
   subject: string
@@ -106,7 +108,7 @@ CardBatteryGate
   floor_pct: uint8
   refuse_start_below_min: boolean
   pause_running_below_min: boolean
-  refusing_start: boolean
+  refusing_start: boolean | null
 CardEndpointKind = "managed" | "unmanaged" | "mixed" | "unresolved"
 CardGovernor
   thermal: ThermalNow | null
@@ -123,7 +125,7 @@ CardModel
   id: string
   n_ctx: uint32 | null
   endpoint_kind: CardEndpointKind
-CardOutcome = { card: MachineCard; state: "available" } | { peer_version: string | null; state: "unavailable" } | { reason: UnreachableReason; detail: string | null; state: "unreachable" }
+CardOutcome = { card: MachineCard; source: CardSource; accepts: AcceptsState; state: "available" } | { peer_version: string | null; state: "unavailable" } | { answered_as: string | null; state: "mismatch" } | { reason: UnreachableReason; detail: string | null; state: "unreachable" }
 CardProfile
   name: string
   description: string | null
@@ -135,6 +137,7 @@ CardSeats
   local: CardLocalSeats
   hosted: CardHostedSeats
   waiting: uint32
+CardSource = "local" | "listener" | "daemon"
 CheckpointGate
   observations: uint
   degenerate_turns: uint64[]
@@ -343,6 +346,7 @@ FleetMachine
   last_beat_ms: uint64 | null
   card: CardOutcome
 FleetView
+  gathered_by: GatheredBy
   local_machine_id: string | null
   presence: SourceState
   roster_error: string | null
@@ -384,6 +388,7 @@ GateOutcome
 Gates
   stream: StreamGate
   checkpoint: CheckpointGate
+GatheredBy = "daemon" | "cli_process"
 GhVerbJson
   verb: string
   allowed: boolean
@@ -550,7 +555,6 @@ MachineCard
   profiles: CardProfile[]
   default_profile: string | null
   profiles_error: string | null
-  accepts?: CardAccepts | null
   seats?: CardSeats | null
   governor: CardGovernor
   generated_at_ms: uint64
@@ -1108,7 +1112,7 @@ Tier2Config
 ToolPalette
   allow: string[]
   deny: string[]
-UnreachableReason = "presence_gone" | "unverified" | "auth_required" | "connect_failed" | "bad_answer"
+UnreachableReason = "presence_gone" | "bad_address" | "dns_failed" | "identity_unavailable" | "not_on_overlay" | "pin_mismatch" | "auth_required" | "connect_failed" | "bad_answer"
 UsageGroup
   endpoint?: string | null
   requested_model?: string | null

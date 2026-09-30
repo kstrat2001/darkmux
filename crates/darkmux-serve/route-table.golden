@@ -31,3 +31,4 @@ GET /lab/runs  json LabRunsResponse
 GET /lab/run/detail  json LabRunDetailResponse
 GET /lab/run/events  json LabRunEventsResponse
 POST /fleet/work  ndjson (darkmux_fleet submission; fleet listener, not the viewer daemon)
+GET /fleet/card  json ListenerCard (fleet listener, not the viewer daemon; the caller's own allow-list entry rides with the card)

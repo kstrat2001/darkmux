@@ -10,19 +10,19 @@
 //! - profiles and their endpoint kind: the profile registry, through
 //!   `ProfileModel::endpoint_kind`, the classification every dispatch,
 //!   residency and doctor path reads;
-//! - what this machine accepts from the CALLER: the allow-list entry
-//!   [`crate::fleet_listener::Admission`] verified, and only that entry;
+//! - what this machine accepts from the CALLER: the allow-list entry the
+//!   fleet listener's gate verified, and only that entry (the listener's
+//!   [`ListenerCard`]; the daemon's card never carries it);
 //! - seats: the running fleet listener's `SeatBook`;
 //! - governor: the host sampler's own reading, plus the battery policy the
 //!   operator wrote.
 //!
-//! **Trust.** `accepts` is present only when the request carried the fleet
-//! token from a node the overlay network names and the allow-list lists
-//! ([`accepts_for`]). Any other reader gets the card without it. A card is
-//! never read from Redis: presence says who is alive, and the peer itself
-//! says what it is.
+//! **Trust.** The daemon's card states no grant. `accepts` exists in one
+//! place only: the answer of the fleet listener's `GET /fleet/card`, which
+//! sits behind the listener's gate (fleet token, the connecting node as the
+//! overlay network names it, the allow-list). A card is never read from
+//! Redis: presence says who is alive, and the peer itself says what it is.
 
-use crate::fleet_listener::Admission;
 use crate::wire::MachineSpecsResponse;
 use darkmux_crew::power_policy::{self, PowerPolicyConfig, StartDecision};
 use darkmux_fleet::{Admitted, SeatSnapshot};
@@ -110,6 +110,18 @@ impl From<&Admitted> for CardAccepts {
     }
 }
 
+/// `GET /fleet/card` on the fleet listener: this machine's card and what this
+/// machine lets the verified caller do. The two travel together because the
+/// gate that admitted the caller is the listener's, so the grant is stated
+/// where it was checked.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
+pub struct ListenerCard {
+    pub card: MachineCard,
+    pub accepts: CardAccepts,
+}
+
 /// Seats a submitted job holds on local models: one per model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(test, derive(ts_rs::TS))]
@@ -169,8 +181,10 @@ pub struct CardBatteryGate {
     /// `power.pause_running_below_min`.
     pub pause_running_below_min: bool,
     /// The start decision at the current reading: `true` when a new run would
-    /// be refused. `false` with no battery reading.
-    pub refusing_start: bool,
+    /// be refused, `false` when it would not (including a machine with no
+    /// battery). `null` when nothing was observed: no host sampler ran in
+    /// the process that built the card, so no decision was made.
+    pub refusing_start: Option<bool>,
 }
 
 /// What the host reports and the battery policy in force. The thermal state
@@ -204,11 +218,6 @@ pub struct MachineCard {
     /// otherwise. A fixed sentence, never the underlying error (it carries a
     /// path).
     pub profiles_error: Option<String>,
-    /// What this machine accepts from the caller, present only for a request
-    /// that carried the fleet token from a verified, allow-listed node.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(test, ts(optional))]
-    pub accepts: Option<CardAccepts>,
     /// The listener's seats. Absent when this process serves no fleet work:
     /// the listener is off, or the card was built by the CLI, not the daemon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -223,22 +232,19 @@ pub struct MachineCard {
     pub gather_ms: u64,
 }
 
-impl MachineCard {
-    /// The same card without the caller-scoped block: what a reader other
-    /// than the verified caller may see.
-    pub fn without_accepts(mut self) -> Self {
-        self.accepts = None;
-        self
-    }
-}
-
 /// The literal a card carries when the profile registry could not be read.
 const REGISTRY_UNREADABLE: &str = "this machine's profile registry could not be read";
 
-fn kind_of(model: &darkmux_types::ProfileModel) -> CardEndpointKind {
-    match model.endpoint_kind() {
-        Ok(EndpointKind::Managed(_)) => CardEndpointKind::Managed,
-        Ok(EndpointKind::Unmanaged) => CardEndpointKind::Unmanaged,
+/// A model's endpoint kind, resolved the way every dispatch resolves its
+/// target ([`darkmux_crew::target::target_for`]): a target that cannot be
+/// built (an undefined endpoint id, a bad URL, an unknown dialect) is
+/// `Unresolved`, never a guess at managed or unmanaged.
+fn kind_of(profile_name: &str, profile: &darkmux_types::Profile, model: &darkmux_types::ProfileModel) -> CardEndpointKind {
+    match darkmux_crew::target::target_for(profile_name.to_string(), profile.clone(), model.clone()) {
+        Ok(target) => match target.kind {
+            EndpointKind::Managed(_) => CardEndpointKind::Managed,
+            EndpointKind::Unmanaged => CardEndpointKind::Unmanaged,
+        },
         Err(_) => CardEndpointKind::Unresolved,
     }
 }
@@ -265,7 +271,7 @@ pub(crate) fn card_profiles(registry: &ProfileRegistry) -> Vec<CardProfile> {
             let models: Vec<CardModel> = profile
                 .models
                 .iter()
-                .map(|m| CardModel { id: m.id.clone(), n_ctx: m.n_ctx, endpoint_kind: kind_of(m) })
+                .map(|m| CardModel { id: m.id.clone(), n_ctx: m.n_ctx, endpoint_kind: kind_of(name, profile, m) })
                 .collect();
             CardProfile {
                 name: name.clone(),
@@ -278,10 +284,24 @@ pub(crate) fn card_profiles(registry: &ProfileRegistry) -> Vec<CardProfile> {
         .collect()
 }
 
+/// A profile whose every model is the utility model: the listener refuses it
+/// (utility work is never taken from another machine), so it seats nothing.
+fn is_utility_only(profile: &CardProfile, utility: Option<&str>) -> bool {
+    utility.is_some() && !profile.models.is_empty() && profile.models.iter().all(|m| Some(m.id.as_str()) == utility)
+}
+
 /// The seat block from the listener's book and the profiles it can run.
-pub(crate) fn card_seats(policy: BusyPolicy, seats: &SeatSnapshot, profiles: &[CardProfile]) -> CardSeats {
+/// `utility` is the registry's utility model id: a profile of only that model
+/// is not one a peer can seat, so its model is not listed as free.
+pub(crate) fn card_seats(
+    policy: BusyPolicy,
+    seats: &SeatSnapshot,
+    profiles: &[CardProfile],
+    utility: Option<&str>,
+) -> CardSeats {
     let managed: BTreeSet<&str> = profiles
         .iter()
+        .filter(|p| !is_utility_only(p, utility))
         .flat_map(|p| p.models.iter())
         .filter(|m| m.endpoint_kind == CardEndpointKind::Managed)
         .map(|m| m.id.as_str())
@@ -311,7 +331,8 @@ pub(crate) fn card_governor(now: Option<&HostSampleNow>, cfg: &PowerPolicyConfig
         charging: b.charging,
         minutes_to_empty: b.minutes_to_empty,
     });
-    let refusing_start = matches!(power_policy::start_decision(sample.as_ref(), cfg), StartDecision::Refuse(_));
+    let refusing_start =
+        now.map(|_| matches!(power_policy::start_decision(sample.as_ref(), cfg), StartDecision::Refuse(_)));
     CardGovernor {
         thermal: now.and_then(|n| n.thermal.clone()),
         battery,
@@ -324,13 +345,11 @@ pub(crate) fn card_governor(now: Option<&HostSampleNow>, cfg: &PowerPolicyConfig
     }
 }
 
-/// This machine's card. Blocking: the specs gather shells out. `accepts` is
-/// what the caller verified as (see [`accepts_for`]); `None` builds the card
-/// every unverified reader gets.
-pub(crate) fn gather_local_card(accepts: Option<CardAccepts>) -> MachineCard {
+/// This machine's card. Blocking: the specs gather shells out.
+pub(crate) fn gather_local_card() -> MachineCard {
     let started = std::time::Instant::now();
     let specs = crate::gather_specs();
-    let (profiles, default_profile, profiles_error) = match darkmux_profiles::profiles::load_registry(None) {
+    let (profiles, default_profile, utility, profiles_error) = match darkmux_profiles::profiles::load_registry(None) {
         Ok(loaded) => {
             let profiles = card_profiles(&loaded.registry);
             let default = loaded
@@ -338,14 +357,16 @@ pub(crate) fn gather_local_card(accepts: Option<CardAccepts>) -> MachineCard {
                 .default_profile
                 .clone()
                 .filter(|d| profiles.iter().any(|p| &p.name == d));
-            (profiles, default, None)
+            let utility = loaded.registry.utility_model_id().map(str::to_string);
+            (profiles, default, utility, None)
         }
         Err(e) => {
             eprintln!("darkmux serve: machine card: reading the profile registry failed ({e:#})");
-            (Vec::new(), None, Some(REGISTRY_UNREADABLE.to_string()))
+            (Vec::new(), None, None, Some(REGISTRY_UNREADABLE.to_string()))
         }
     };
-    let seats = crate::fleet_listener::listener_seats().map(|(policy, snap)| card_seats(policy, &snap, &profiles));
+    let seats = crate::fleet_listener::listener_seats()
+        .map(|(policy, snap)| card_seats(policy, &snap, &profiles, utility.as_deref()));
     let governor = card_governor(
         crate::host_sampler::ring().snapshot().map(|l| l.now).as_ref(),
         &PowerPolicyConfig::from_env(),
@@ -357,35 +378,11 @@ pub(crate) fn gather_local_card(accepts: Option<CardAccepts>) -> MachineCard {
         profiles,
         default_profile,
         profiles_error,
-        accepts,
         seats,
         governor,
         generated_at_ms: crate::current_millis(),
         gather_ms: started.elapsed().as_millis() as u64,
     }
-}
-
-/// The allow-list entry of the caller, when the request is from a verified
-/// fleet node: the fleet token, then the connecting node as the overlay
-/// network names it, then the allow-list, all through [`Admission::admit`],
-/// the listener's own admission path. Any refusal is "no `accepts`", and says
-/// nothing about why.
-///
-/// The peer address is the socket's, never a header: a proxy's
-/// `X-Forwarded-For` is not evidence. A loopback caller is this machine, or a
-/// proxy in front of it; neither is a node, so the provider is not even asked
-/// (the test-only `e2e-fleet-loopback` build is the one place a loopback
-/// address stands for a node).
-pub(crate) async fn accepts_for(
-    admission: &Admission,
-    peer: Option<std::net::IpAddr>,
-    headers: &axum::http::HeaderMap,
-) -> Option<CardAccepts> {
-    let peer = peer?;
-    if peer.to_canonical().is_loopback() && !crate::fleet_listener::LOOPBACK_FOR_E2E {
-        return None;
-    }
-    admission.admit(peer, headers).await.ok().map(|(admitted, _)| CardAccepts::from(&admitted))
 }
 
 #[cfg(test)]
@@ -476,7 +473,7 @@ mod tests {
     #[test]
     fn seats_report_held_and_free_per_class_and_the_busy_policy() {
         let cards = card_profiles(&mixed_registry());
-        let seats = card_seats(BusyPolicy::Queue, &snap(&["qwen-35b"], 1, Some(3), 2), &cards);
+        let seats = card_seats(BusyPolicy::Queue, &snap(&["qwen-35b"], 1, Some(3), 2), &cards, None);
         assert_eq!(seats.busy_policy, BusyPolicy::Queue);
         assert_eq!(seats.local.held_models, vec!["qwen-35b".to_string()]);
         assert_eq!(seats.local.free_models, vec!["qwen-4b".to_string()], "the managed model nobody holds");
@@ -484,9 +481,20 @@ mod tests {
         assert_eq!(seats.waiting, 2);
     }
 
+    /// A profile of only the utility model is refused by the listener, so its
+    /// model is not a free seat; the same model inside a work profile still is.
+    #[test]
+    fn the_utility_model_is_not_a_free_seat() {
+        let cards = card_profiles(&mixed_registry());
+        let free = |utility| card_seats(BusyPolicy::Refuse, &snap(&[], 0, None, 0), &cards, utility).local.free_models;
+        assert_eq!(free(None), vec!["qwen-35b".to_string(), "qwen-4b".to_string()]);
+        assert_eq!(free(Some("qwen-4b")), vec!["qwen-35b".to_string(), "qwen-4b".to_string()], "qwen-4b is also in `both`, a work profile");
+        assert_eq!(free(Some("qwen-35b")), vec!["qwen-4b".to_string()], "`local` holds only the utility model");
+    }
+
     #[test]
     fn an_unbounded_hosted_cap_has_no_free_count() {
-        let seats = card_seats(BusyPolicy::Refuse, &snap(&[], 4, None, 0), &[]);
+        let seats = card_seats(BusyPolicy::Refuse, &snap(&[], 4, None, 0), &[], None);
         assert_eq!(seats.hosted, CardHostedSeats { held: 4, cap: None, free: None });
     }
 
@@ -519,35 +527,61 @@ mod tests {
         let low = card_governor(Some(&now(Some("serious"), Some(charge(30)))), &cfg(true));
         assert_eq!(low.thermal.as_ref().unwrap().state, "serious");
         assert_eq!(low.battery.as_ref().unwrap().charge_pct, 30);
-        assert!(low.battery_gate.refusing_start, "30% is under a 50% floor the operator turned on");
+        assert_eq!(low.battery_gate.refusing_start, Some(true), "30% is under a 50% floor the operator turned on");
         assert_eq!((low.battery_gate.floor_pct, low.battery_gate.pause_running_below_min), (50, true));
 
-        assert!(!card_governor(Some(&now(None, Some(charge(30)))), &cfg(false)).battery_gate.refusing_start, "the policy is off");
-        assert!(!card_governor(Some(&now(None, Some(charge(50)))), &cfg(true)).battery_gate.refusing_start, "at the floor starts");
+        assert_eq!(card_governor(Some(&now(None, Some(charge(30)))), &cfg(false)).battery_gate.refusing_start, Some(false), "the policy is off");
+        assert_eq!(card_governor(Some(&now(None, Some(charge(50)))), &cfg(true)).battery_gate.refusing_start, Some(false), "at the floor starts");
     }
 
+    /// A machine with a sample but no battery has nothing to refuse (a
+    /// decision: `false`); a process that never sampled made no decision
+    /// (`null`), and the card must not say `false` for it.
     #[test]
-    fn a_machine_with_no_battery_or_no_reading_is_never_gated() {
-        assert!(!card_governor(Some(&now(Some("nominal"), None)), &cfg(true)).battery_gate.refusing_start);
+    fn a_gate_nobody_measured_is_not_observed_rather_than_false() {
+        assert_eq!(card_governor(Some(&now(Some("nominal"), None)), &cfg(true)).battery_gate.refusing_start, Some(false));
         let nothing = card_governor(None, &cfg(true));
         assert!(nothing.thermal.is_none() && nothing.battery.is_none());
-        assert!(!nothing.battery_gate.refusing_start);
+        assert_eq!(nothing.battery_gate.refusing_start, None);
+        assert!(serde_json::to_value(&nothing).unwrap()["battery_gate"]["refusing_start"].is_null());
     }
 
+    /// A profile whose dispatch target cannot be built is `unresolved`, by the
+    /// same resolution every dispatch runs: an unknown dialect, not only an
+    /// undefined endpoint id.
     #[test]
-    fn without_accepts_drops_only_the_caller_scoped_block() {
-        let card = gather_local_card(Some(CardAccepts {
-            peer_name: "laptop".into(),
-            profiles: vec!["deep".into()],
-            roles: vec![],
-            images: vec![],
-            workspace: false,
+    fn a_target_that_cannot_be_built_is_unresolved_whatever_the_reason() {
+        let reg = registry(serde_json::json!({
+            "profiles": {
+                "baddialect": {"models": [{"id": "b", "endpoint": "odd"}]},
+                "fine": {"models": [{"id": "c", "endpoint": "ok"}]}
+            },
+            "endpoints": {
+                "odd": {"url": "https://example.invalid/v1", "dialect": "no-such-dialect"},
+                "ok": {"url": "https://example.invalid/v1"}
+            }
         }));
-        assert!(card.accepts.is_some());
-        let plain = card.clone().without_accepts();
-        assert!(plain.accepts.is_none());
-        assert_eq!(plain.card_schema_version, card.card_schema_version);
-        let json = serde_json::to_value(&plain).unwrap();
-        assert!(json.get("accepts").is_none(), "absent, not null: {json}");
+        let cards = card_profiles(&reg);
+        for (name, profile) in &reg.profiles {
+            for model in &profile.models {
+                let built = darkmux_crew::target::target_for(name.clone(), profile.clone(), model.clone()).is_ok();
+                let kind = by_name(&cards, name).models[0].endpoint_kind;
+                assert_eq!(kind == CardEndpointKind::Unresolved, !built, "{name}: the card and target_for must agree");
+            }
+        }
+        assert_eq!(by_name(&cards, "fine").endpoint_kind, CardEndpointKind::Unmanaged);
+        assert_eq!(by_name(&cards, "baddialect").endpoint_kind, CardEndpointKind::Unresolved);
+    }
+
+    /// The daemon's card states no grant: `accepts` exists only in the
+    /// listener's answer.
+    #[test]
+    fn the_cards_own_shape_has_no_accepts_and_the_listeners_answer_carries_it() {
+        let card = gather_local_card();
+        assert!(serde_json::to_value(&card).unwrap().get("accepts").is_none());
+        let accepts = CardAccepts { peer_name: "laptop".into(), profiles: vec!["deep".into()], roles: vec![], images: vec![], workspace: false };
+        let json = serde_json::to_value(ListenerCard { card, accepts }).unwrap();
+        assert_eq!(json["accepts"]["peer_name"], "laptop");
+        assert!(json["card"].get("accepts").is_none());
     }
 }

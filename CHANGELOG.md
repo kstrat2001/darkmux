@@ -1166,22 +1166,37 @@ darkmux release.
 - **Fleet awareness: one view every machine reads** (#3004, part 1). Every daemon
   serves `GET /machine/card`, one typed `MachineCard` describing that machine
   truthfully: its identity and specs (the `/machine/specs` document), its
-  profiles with each endpoint's kind (`managed` or `unmanaged`, from the same
-  registry resolution dispatch uses) and models, its seats (held and free per
-  class, and the busy policy) when its fleet listener runs, and its governor
-  state (the OS thermal word, the battery reading and the battery gate the
-  operator wrote). A request that carries the fleet token from a node the
-  overlay network names and the allow-list lists also gets an `accepts` block:
-  that caller's own allow-list entry, and no other. Every daemon also serves
-  `GET /fleet/view`, a `FleetView` with a row per roster machine: liveness from
-  presence, and the card fetched from the peer itself over the verified peer path
-  (in parallel, single-flight, cached 5 s, recorded as `cache_ttl_ms`), or
-  `unreachable` with a typed reason. A peer presence reports gone is not dialed,
-  and a peer on an older darkmux (no card route) shows as `card unavailable
-  (peer <version>)`. Cards never come from Redis. `darkmux machine list` prints
-  this view; `--json` prints the `FleetView`. Both routes are in
-  `route-table.golden`, and their types have generated twins.
-
+  profiles with each endpoint's kind (`managed`, `unmanaged`, `mixed` or
+  `unresolved`, from the same target resolution dispatch uses) and models, its
+  seats (held and free per class, and the busy policy) when its fleet listener
+  runs, and its governor state (the OS thermal word, the battery reading and
+  the battery gate the operator wrote; the gate's decision is `null` when no
+  sampler ran). The fleet listener also serves `GET /fleet/card`, behind its
+  gate: the same card plus `accepts`, the calling machine's own allow-list
+  entry and no other. That is the only place a grant is stated, so the daemon's
+  card has no `accepts`. Every daemon also serves `GET /fleet/view`, a
+  `FleetView` with a row per roster machine: liveness from presence, and the
+  card fetched from the peer itself over the verified peer path (its listener
+  first, then its daemon; in parallel, single-flight, cached 5 s, recorded as
+  `cache_ttl_ms`). Each row says which endpoint answered (`source`) and what
+  the peer accepts from this machine (`accepts`: `granted` with the entry,
+  `refused` with the peer's own reason, or `unknown` with why: its listener is
+  off, it could not answer, or no node was verified). A card that is another
+  machine's is a `mismatch` and is not attributed to the row. An unreachable
+  peer says why (`bad_address`, `dns_failed`, `identity_unavailable`,
+  `not_on_overlay`, `pin_mismatch`, `auth_required`, `connect_failed`,
+  `bad_answer`), a peer on an older darkmux shows `card unavailable (peer
+  <version>)`, and a peer presence reports gone is not dialed. Cards never come
+  from Redis. `darkmux machine list` prints this view (this machine's own
+  daemon's when one runs, else one gathered in process and marked `gathered_by:
+  cli_process`, with this machine's seats, thermal state and battery not
+  observed); `--json` prints the `FleetView`. A machine's card is visible to
+  its peers with `accepts` only while its fleet listener is enabled. Both
+  daemon routes and the listener route are in `route-table.golden`, and their
+  types have generated twins. The card listener route takes a per-node slot of
+  its own, so a sender whose jobs fill its request slots still gets its card.
+  Work submission and card reads now dial the listener over plain http whatever
+  scheme the roster address wrote.
 - **Radio's answering seat can run on a fleet peer.** Set `radio.answerer_profile`
   (or `role_profiles.radio-host`) to `<profile>@<machine>` and the seat's dispatch
   is submitted to that machine, which runs it on its own profile; the peer must

@@ -45,7 +45,69 @@ pub struct PeerTarget {
     pub newly_pinned: Option<String>,
 }
 
+/// Why a roster entry is not a target this machine may send to. Typed so a
+/// reader can name the remedy for each: a DNS failure, a network tool that is
+/// down and an address that is not a node call for different fixes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TargetError {
+    /// The address names no host, or has a bad port.
+    BadAddress { detail: String },
+    /// The address did not resolve to any IP.
+    DoesNotResolve { target: String, address: String },
+    /// The identity provider could not answer for the address.
+    IdentityUnavailable { target: String, provider: String, detail: String },
+    /// The address is not a node on the provider's network.
+    NotOnOverlay { target: String, address: String, provider: String },
+    /// The node at the address is not the one the roster pinned.
+    PinMismatch { target: String, node_name: String },
+    /// This machine's own daemon address is neither loopback nor one of its
+    /// own overlay addresses.
+    OwnAddress { address: String },
+}
+
+impl std::fmt::Display for TargetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TargetError::BadAddress { detail } => f.write_str(detail),
+            TargetError::DoesNotResolve { target, address } => {
+                write!(f, "the roster address for {target} (`{address}`) does not resolve; nothing was sent")
+            }
+            TargetError::IdentityUnavailable { target, provider, detail } => {
+                write!(f, "cannot verify {target}'s address with {provider} ({detail}); nothing was sent")
+            }
+            TargetError::NotOnOverlay { target, address, provider } => write!(
+                f,
+                "the roster address for {target} (`{address}`) is not a node on the {provider} network, so nothing \
+                 was sent to it (not the fleet token, not the request). Point the entry at {target}'s \
+                 tailnet DNS name: `darkmux machine add {target} --address <its tailnet DNS name>`"
+            ),
+            TargetError::PinMismatch { target, node_name } => write!(
+                f,
+                "the node at {target}'s address (`{node_name}`) is not the one this roster pinned for {target}; \
+                 nothing was sent. If {target} really was replaced, re-pin it with `darkmux machine add \
+                 {target} --address <its tailnet DNS name>`"
+            ),
+            TargetError::OwnAddress { address } => write!(
+                f,
+                "this machine's own daemon address `{address}` is neither loopback nor one of this \
+                 machine's tailnet addresses (check `serve.bind`)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TargetError {}
+
 impl PeerTarget {
+    /// The same verified node, dialed at its fleet listener: `port` is the
+    /// listener's, and the scheme is plain `http` whatever the roster
+    /// address wrote (the address names the viewer daemon, which may sit
+    /// behind `tailscale serve` on https; the listener speaks plain http on
+    /// the overlay address).
+    pub fn at_listener(&self, port: u16) -> PeerTarget {
+        PeerTarget { scheme: "http".to_string(), port, ..self.clone() }
+    }
+
     /// The base URL (`scheme://host:port`).
     pub fn base(&self) -> String {
         let host = if self.host.contains(':') { format!("[{}]", self.host) } else { self.host.clone() };
@@ -78,6 +140,31 @@ pub fn split_address(address: &str, default_port: u16) -> Result<(String, String
     Ok((scheme, host, port))
 }
 
+fn split_bad(address: &str, default_port: u16) -> std::result::Result<(String, String, u16), TargetError> {
+    split_address(address, default_port).map_err(|e| TargetError::BadAddress { detail: format!("{e:#}") })
+}
+
+/// Where THIS machine's own daemon is: a loopback address needs no
+/// verification (and gets no token); a non-loopback one (a daemon bound to
+/// its tailnet address) must be one of this node's own overlay addresses as
+/// the provider reports them, and is pinned to it.
+pub fn local_daemon_target(
+    addr: &str,
+    default_port: u16,
+    provider: &dyn IdentityProvider,
+) -> std::result::Result<PeerTarget, TargetError> {
+    let (scheme, host, port) = split_bad(addr, default_port)?;
+    let ip = host.parse::<IpAddr>().ok().map(|i| i.to_canonical());
+    if ip.is_some_and(|ip| ip.is_loopback()) || host == "localhost" {
+        return Ok(PeerTarget { scheme, host, port, pinned_ip: None, newly_pinned: None });
+    }
+    let own = provider.local_node().map(|n| n.addresses).unwrap_or_default();
+    match ip.filter(|ip| own.contains(ip)) {
+        Some(ip) => Ok(PeerTarget { scheme, host, port, pinned_ip: Some(ip), newly_pinned: None }),
+        None => Err(TargetError::OwnAddress { address: addr.to_string() }),
+    }
+}
+
 /// Resolve where a token-bearing request for roster entry `name` may go.
 ///
 /// - `local_addr: Some(addr)`: the entry is THIS machine; dial its own
@@ -89,41 +176,29 @@ pub fn split_address(address: &str, default_port: u16) -> Result<(String, String
 ///   written, since it can only reach this machine, when `loopback_ok`.
 ///   Work submission passes `false`: it verifies every address.
 /// - Anything else must pass [`crate::verify_target`] with `provider`, and
-///   is dialed at the verified IP. `port` overrides the address's own port
-///   (work submission uses the fleet listener's port).
+///   is dialed at the verified IP. The port is the address's own, else
+///   `default_port`; [`PeerTarget::at_listener`] re-aims the same verified
+///   node at the fleet listener.
 pub fn peer_target(
     name: &str,
     entry: &MachineEntry,
     local_addr: Option<&str>,
-    port: Option<u16>,
     default_port: u16,
     loopback_ok: bool,
     provider: &dyn IdentityProvider,
-) -> Result<PeerTarget> {
+) -> std::result::Result<PeerTarget, TargetError> {
     if let Some(addr) = local_addr {
-        let (scheme, host, p) = split_address(addr, default_port)?;
-        let ip = host.parse::<IpAddr>().ok().map(|i| i.to_canonical());
-        if ip.is_some_and(|ip| ip.is_loopback()) || host == "localhost" {
-            return Ok(PeerTarget { scheme, host, port: port.unwrap_or(p), pinned_ip: None, newly_pinned: None });
-        }
-        let own = provider.local_node().map(|n| n.addresses).unwrap_or_default();
-        return match ip.filter(|ip| own.contains(ip)) {
-            Some(ip) => Ok(PeerTarget { scheme, host, port: port.unwrap_or(p), pinned_ip: Some(ip), newly_pinned: None }),
-            None => Err(anyhow!(
-                "this machine's own daemon address `{addr}` is neither loopback nor one of this \
-                 machine's tailnet addresses (check `serve.bind`)"
-            )),
-        };
+        return local_daemon_target(addr, default_port, provider);
     }
-    let (scheme, host, p) = split_address(&entry.address, default_port)?;
+    let (scheme, host, port) = split_bad(&entry.address, default_port)?;
     if loopback_ok && crate::roster::address_host_is_loopback(&entry.address) {
-        return Ok(PeerTarget { scheme, host, port: port.unwrap_or(p), pinned_ip: None, newly_pinned: None });
+        return Ok(PeerTarget { scheme, host, port, pinned_ip: None, newly_pinned: None });
     }
     let v = crate::submission::verify_target(name, entry, provider)?;
     Ok(PeerTarget {
         scheme,
         host,
-        port: port.unwrap_or(p),
+        port,
         pinned_ip: Some(v.ip),
         newly_pinned: v.newly_pinned.then(|| v.node.node_id.clone()),
     })
@@ -142,20 +217,17 @@ pub fn persist_pin(id: &str, target: &PeerTarget) -> Result<()> {
 
 /// The ONE agent builder for token-bearing requests (#2916 round 3 C3):
 /// redirects never followed, and a pinned target's every connection goes to
-/// its verified address whatever DNS says now.
-fn build_agent(target: &PeerTarget, connect: Duration, read: Duration, write: Duration) -> ureq::Agent {
-    let mut b = ureq::AgentBuilder::new()
-        .timeout_connect(connect)
-        .timeout_read(read)
-        .timeout_write(write)
-        .redirects(0);
+/// its verified address whatever DNS says now. The caller sets the time
+/// bounds.
+fn base_agent(target: &PeerTarget) -> ureq::AgentBuilder {
+    let mut b = ureq::AgentBuilder::new().redirects(0);
     if let Some(ip) = target.pinned_ip {
         b = b.resolver(move |netloc: &str| -> std::io::Result<Vec<SocketAddr>> {
             let port = netloc.rsplit_once(':').and_then(|(_, p)| p.parse::<u16>().ok()).unwrap_or(80);
             Ok(vec![SocketAddr::new(ip, port)])
         });
     }
-    b.build()
+    b
 }
 
 /// The fleet token, attached HERE and nowhere else, and only to a target
@@ -168,7 +240,8 @@ fn with_fleet_token(req: ureq::Request, target: &PeerTarget, token: Option<&str>
 }
 
 /// GET `path` from a verified target with the fleet token (when this
-/// machine has one) and `headers`.
+/// machine has one) and `headers`. `timeout` is ONE bound on the whole
+/// request (connect, sending and reading the answer), not a per-read wait.
 pub fn fleet_get(
     target: &PeerTarget,
     path: &str,
@@ -176,7 +249,7 @@ pub fn fleet_get(
     headers: &[(&str, &str)],
 ) -> std::result::Result<ureq::Response, ureq::Error> {
     let token = darkmux_flow::serve_token();
-    let mut req = build_agent(target, timeout, timeout, timeout).get(&format!("{}{path}", target.base()));
+    let mut req = base_agent(target).build().get(&format!("{}{path}", target.base())).timeout(timeout);
     for (k, v) in headers {
         req = req.set(k, v);
     }
@@ -201,7 +274,11 @@ fn post_json_with(
     read_timeout: Duration,
     token: Option<&str>,
 ) -> std::result::Result<ureq::Response, ureq::Error> {
-    let agent = build_agent(target, Duration::from_secs(5), read_timeout, Duration::from_secs(30));
+    let agent = base_agent(target)
+        .timeout_connect(Duration::from_secs(5))
+        .timeout_read(read_timeout)
+        .timeout_write(Duration::from_secs(30))
+        .build();
     let req = agent
         .post(&format!("{}{path}", target.base()))
         .set("Content-Type", "application/json");
@@ -270,20 +347,20 @@ mod tests {
     #[test]
     fn only_verified_or_loopback_targets_get_the_token() {
         let p = provider();
-        let t = peer_target("studio", &entry("100.64.0.2", Some("nSTUDIO")), None, None, 8765, true, &p).unwrap();
+        let t = peer_target("studio", &entry("100.64.0.2", Some("nSTUDIO")), None, 8765, true, &p).unwrap();
         assert_eq!(t.pinned_ip, Some("100.64.0.2".parse().unwrap()));
-        assert!(peer_target("studio", &entry("192.168.1.9", None), None, None, 8765, true, &p).is_err(), "a LAN address is refused");
-        assert!(peer_target("studio", &entry("100.64.0.2", Some("nOTHER")), None, None, 8765, true, &p).is_err(), "a different node is refused");
-        let lo = peer_target("studio", &entry("127.0.0.1:18765", None), None, None, 8765, true, &p).unwrap();
+        assert!(peer_target("studio", &entry("192.168.1.9", None), None, 8765, true, &p).is_err(), "a LAN address is refused");
+        assert!(peer_target("studio", &entry("100.64.0.2", Some("nOTHER")), None, 8765, true, &p).is_err(), "a different node is refused");
+        let lo = peer_target("studio", &entry("127.0.0.1:18765", None), None, 8765, true, &p).unwrap();
         assert_eq!(lo.pinned_ip, None);
-        let me = peer_target("studio", &entry("100.64.0.2", None), Some("127.0.0.1:8765"), None, 8765, true, &p).unwrap();
+        let me = peer_target("studio", &entry("100.64.0.2", None), Some("127.0.0.1:8765"), 8765, true, &p).unwrap();
         assert_eq!(me.base(), "http://127.0.0.1:8765");
         assert_eq!(me.pinned_ip, None, "loopback: no pin, so no token");
         // (#2916 round 3 C2) A daemon bound to this node's own tailnet
         // address is this machine, pinned to that address.
-        let me_ts = peer_target("laptop", &entry("x", None), Some("100.64.0.7:8765"), None, 8765, true, &p).unwrap();
+        let me_ts = peer_target("laptop", &entry("x", None), Some("100.64.0.7:8765"), 8765, true, &p).unwrap();
         assert_eq!(me_ts.pinned_ip, Some("100.64.0.7".parse().unwrap()));
-        assert!(peer_target("studio", &entry("x", None), Some("100.64.0.9:8765"), None, 8765, true, &p).is_err());
+        assert!(peer_target("studio", &entry("x", None), Some("100.64.0.9:8765"), 8765, true, &p).is_err());
     }
 
     /// A one-shot HTTP fixture that records the request it received.

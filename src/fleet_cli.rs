@@ -369,7 +369,6 @@ fn peer_target_for(entry: &fleet::MachineEntry, local_id: Option<&str>) -> Resul
         &entry.id,
         entry,
         local_addr.as_deref(),
-        None,
         crate::serve::DEFAULT_DAEMON_PORT,
         true,
         provider.as_ref(),
@@ -433,10 +432,13 @@ fn route_missing_message(id: &str, path: &str, address: &str) -> String {
     }
 }
 
-/// `darkmux machine list`: gather the fleet view and print it (the daemon
-/// serves the same gather at `GET /fleet/view`).
+/// `darkmux machine list`: print the fleet view. This machine's own daemon
+/// serves it at `GET /fleet/view` with this machine's seats and governor
+/// readings; with no daemon running, the view is gathered here and says so
+/// (`gathered_by`).
 pub(crate) fn cmd_machine_list(emit_json: bool) -> Result<i32> {
-    let view = darkmux_serve::fleet_view::gather_fleet_view_now();
+    let view = darkmux_serve::fleet_view::fetch_local_daemon_view(&darkmux_types::config_access::serve_client_addr())
+        .unwrap_or_else(darkmux_serve::fleet_view::gather_fleet_view_now);
     if emit_json {
         // (#776) Machine-readable output stays byte-clean: force color off so
         // any accidental downstream style call can't leak ANSI into the JSON.

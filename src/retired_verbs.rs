@@ -274,7 +274,7 @@ mod tests {
         (&["lab", "run", "quick-q", "--runs", "3"], "darkmux lab run --runs", "--repeat"),  // drift-guard:allow retired flag: asserts the refusal names it
         (&["lab", "tune", "quick-q", "--runs=3"], "darkmux lab tune --runs", "--repeat"),  // drift-guard:allow retired flag: asserts the refusal names it
         (&["mission", "status", "--missions"], "darkmux mission status --missions", "--named"),
-        (&["machine", "list", "--deep"], "darkmux machine list --deep", "by default"),  // drift-guard:allow retired flag: asserts the refusal names it  // drift-guard:allow retired flag: asserts the refusal names it
+        (&["machine", "list", "--deep"], "darkmux machine list --deep", "by default"),  // drift-guard:allow retired flag: asserts the refusal names it
     ];
 
     #[test]

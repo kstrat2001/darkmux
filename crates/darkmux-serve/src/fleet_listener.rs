@@ -7,8 +7,10 @@
 //! `tailscale serve`: that front proxies to loopback, so every peer would
 //! arrive as 127.0.0.1 and could not be told apart.
 //!
-//! One route, `POST /fleet/work`, and every request on this listener (any
-//! path) passes the gate first: the fleet token, then the connecting node
+//! Two routes, `POST /fleet/work` (a job) and `GET /fleet/card` (this
+//! machine's card, with the caller's own allow-list entry: the one place a
+//! peer learns what this machine accepts from it), and every request on this
+//! listener (any path) passes the gate first: the fleet token, then the connecting node
 //! (the provider's answer for the socket's peer address), then the
 //! allow-list. The gate is [`darkmux_fleet::admit`]; the scope check after
 //! parsing is [`darkmux_fleet::check_scope`]. Both are pure and table-tested
@@ -23,7 +25,12 @@
 //! request. The allow-list is likewise read from `config.json` on every
 //! request (a few KB), so `machine trust` / `untrust` need no daemon
 //! restart. A caller without the token costs one constant-time compare and
-//! never makes this machine spawn anything.
+//! never makes this machine spawn anything. A card read costs the same
+//! lookup, and a peer's fleet view asks for one about every five seconds
+//! (its cache TTL): a caller that is not allow-listed is refused each time,
+//! and those refusal log lines are throttled per address ([`RefusalLog`]:
+//! five a minute, the rest counted), so a stale roster entry on another
+//! machine cannot grow this machine's log.
 
 use axum::{
     body::Bytes,
@@ -83,6 +90,11 @@ pub(crate) struct FleetListenerState {
     /// that spreads connections over several addresses (a subnet router)
     /// is still capped once it is identified.
     pub node_slots: Arc<KeySlots<String>>,
+    /// Card reads in flight per admitted NODE ([`CARD_NODE_CAP`]). A card read
+    /// is not a job: it takes a slot of its own, so a sender whose jobs fill
+    /// its [`node_slots`](Self::node_slots) still gets its card, and a poller
+    /// still cannot ask for more than a few at a time.
+    pub card_slots: Arc<KeySlots<String>>,
     /// (#2947) This machine's dispatch-scope config preflight, run per
     /// submission before the job is accepted. `Err` carries the refusal
     /// text. Production: `darkmux_crew::user_files::preflight(Scope::Dispatch)`.
@@ -133,15 +145,18 @@ impl FleetListenerState {
             queue_limits: QueueLimits::PRODUCTION,
             refusal_log: Arc::new(RefusalLog::new()),
             node_slots: Arc::new(KeySlots::new(NODE_CAP)),
+            card_slots: Arc::new(KeySlots::new(CARD_NODE_CAP)),
             config_preflight: Arc::new(dispatch_config_preflight),
         }
     }
 }
 
-/// The listener's router: the one route, behind the gate.
+/// The listener's router: work submission and the card read, both behind the
+/// gate.
 pub(crate) fn router(state: FleetListenerState) -> Router {
     Router::new()
         .route(darkmux_fleet::SUBMISSION_PATH, axum::routing::post(submit_handler))
+        .route(darkmux_fleet::CARD_PATH, axum::routing::get(card_handler))
         .layer(axum::middleware::from_fn_with_state(state.clone(), gate))
         .with_state(state)
 }
@@ -307,9 +322,8 @@ fn check_token(headers: &axum::http::HeaderMap, expected: Option<String>) -> Tok
 
 /// The three checks that make a caller a verified fleet peer: the fleet
 /// token, the connecting node as the overlay network names it, and the
-/// allow-list. ONE admission path: the listener's gate and the machine
-/// card's caller-scoped `accepts` block both run [`Admission::admit`], which
-/// is [`darkmux_fleet::admit`] wired to its inputs.
+/// allow-list: [`darkmux_fleet::admit`] wired to its inputs. The listener's
+/// gate is the ONE place a caller is admitted, for a job and for a card read.
 #[derive(Clone)]
 pub(crate) struct Admission {
     pub provider: Arc<dyn IdentityProvider>,
@@ -323,31 +337,6 @@ pub(crate) struct Admission {
 }
 
 impl Admission {
-    /// Production wiring: the configured provider (or its fail-closed
-    /// stand-in), the serve token, the allow-list from `config.json`.
-    pub(crate) fn production() -> Self {
-        let provider: Arc<dyn IdentityProvider> = Arc::from(darkmux_fleet::configured_provider_or_unavailable());
-        let for_local = provider.clone();
-        Self {
-            provider,
-            local_node_id: Arc::new(move || for_local.local_node().ok().map(|n| n.node_id)),
-            token: Arc::new(|| darkmux_flow::serve_token().map(|t| t.expose_for_compare().to_string())),
-            allow_list: Arc::new(darkmux_fleet::read_user_allow_list),
-        }
-    }
-
-    /// An admission that refuses everyone (no fleet token, no provider). For
-    /// tests that are not about admission.
-    #[cfg(test)]
-    pub(crate) fn refusing() -> Self {
-        Self {
-            provider: Arc::new(darkmux_fleet::UnavailableProvider("test".into())),
-            local_node_id: Arc::new(|| None),
-            token: Arc::new(|| None),
-            allow_list: Arc::new(|| Ok(AllowList::new())),
-        }
-    }
-
     /// Token, then the connecting node, then the allow-list, in that order.
     /// A caller without the token is answered before this machine reads its
     /// allow-list or runs the provider's tool. On success the fingerprint of
@@ -394,6 +383,15 @@ impl Admission {
     }
 }
 
+/// Which slot table a request counts against once its caller is admitted.
+fn slots_for<'a>(state: &'a FleetListenerState, req: &Request) -> &'a Arc<KeySlots<String>> {
+    if req.method() == axum::http::Method::GET && req.uri().path() == darkmux_fleet::CARD_PATH {
+        &state.card_slots
+    } else {
+        &state.node_slots
+    }
+}
+
 /// The gate on EVERY request: token, network identity, allow-list
 /// ([`Admission::admit`]). A request with no peer address (no `ConnectInfo`)
 /// is refused: absence of evidence is not a peer.
@@ -410,7 +408,7 @@ async fn gate(State(state): State<FleetListenerState>, mut req: Request, next: N
     };
     match state.admission().admit(peer, req.headers()).await {
         Ok((admitted, fingerprint)) => {
-            let Some(_node_slot) = state.node_slots.try_take(admitted.peer_name.clone()) else {
+            let Some(_node_slot) = slots_for(&state, &req).try_take(admitted.peer_name.clone()) else {
                 return refuse(&state, Some(peer), &Refusal::TooManyAtOnce { peer: admitted.peer_name.clone() });
             };
             // (#2916 stage 2 review F1) Which token was in force, so a job
@@ -697,6 +695,18 @@ impl Worker {
     }
 }
 
+/// `GET /fleet/card`: this machine's card and the caller's own allow-list
+/// entry. The gate has admitted the caller by the time this runs (token, the
+/// node the socket's address belongs to, the allow-list); the entry it read
+/// is the one stated, and no other. Blocking gather, off the async threads.
+async fn card_handler(Extension(admitted): Extension<Admitted>) -> Response {
+    let accepts = crate::machine_card::CardAccepts::from(&admitted);
+    match tokio::task::spawn_blocking(crate::machine_card::gather_local_card).await {
+        Ok(card) => Json(crate::machine_card::ListenerCard { card, accepts }).into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "darkmux serve: machine card gather panicked\n").into_response(),
+    }
+}
+
 async fn submit_handler(
     State(state): State<FleetListenerState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
@@ -918,6 +928,11 @@ impl ConnLimits {
 /// Requests one admitted node may have in flight at once (#2916 round 3 C5),
 /// and (#2916 stage 2) jobs it may have queued at once.
 pub(crate) const NODE_CAP: usize = 4;
+
+/// Card reads one admitted node may have in flight at once. A card is one
+/// gather (a few subprocess reads), so a couple at a time is generous for
+/// one poller.
+pub(crate) const CARD_NODE_CAP: usize = 2;
 
 /// (#2916 stage 2) How often a sender waiting on a queued job hears that it
 /// is still queued: well inside the shortest read deadline a sender uses
@@ -1318,6 +1333,7 @@ mod tests {
             queue_limits,
             refusal_log: refusal_log.clone(),
             node_slots: Arc::new(KeySlots::new(NODE_CAP)),
+            card_slots: Arc::new(KeySlots::new(CARD_NODE_CAP)),
             config_preflight,
         };
         let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1452,6 +1468,81 @@ mod tests {
             Err(ureq::Error::Status(code, _)) => assert_eq!(code, 403),
             other => panic!("an ungated path answered: {other:?}"),
         }
+    }
+
+    /// GET the card at `url` with `token`; the status and the body (a
+    /// refusal's reply, or the card).
+    fn get_card(url: &str, token: &str) -> (u16, serde_json::Value) {
+        let resp = ureq::get(url).set("Authorization", &format!("Bearer {token}")).call();
+        let (code, resp) = match resp {
+            Ok(r) => (r.status(), r),
+            Err(ureq::Error::Status(code, r)) => (code, r),
+            Err(e) => panic!("no answer: {e}"),
+        };
+        (code, serde_json::from_reader(resp.into_reader()).unwrap_or(serde_json::Value::Null))
+    }
+
+    fn card_url(h: &Harness) -> String {
+        h.url.replace(darkmux_fleet::SUBMISSION_PATH, darkmux_fleet::CARD_PATH)
+    }
+
+    /// The promise: the listener's card read states the verified caller's own
+    /// allow-list entry and no other sender's.
+    #[test]
+    fn a_card_read_states_the_verified_callers_entry_and_no_ones_elses() {
+        let h = start(Some(laptop()), false, 0);
+        h.allow.lock().unwrap().insert(
+            "mini-1".into(),
+            AcceptWorkEntry {
+                node_id: Some("nMINI".into()),
+                profiles: Some(vec!["secret-profile".into()]),
+                roles: Some(vec!["radio-host".into()]),
+                images: None,
+                workspace: Some(true),
+                extras: Default::default(),
+            },
+        );
+        let (code, body) = get_card(&card_url(&h), TOKEN);
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(body["accepts"]["peer_name"], "macbook-pro");
+        assert_eq!(body["accepts"]["profiles"], serde_json::json!(["host", "small", "cloud"]));
+        assert_eq!(body["accepts"]["roles"], serde_json::json!(["radio-host"]));
+        assert_eq!(body["accepts"]["workspace"], false);
+        assert_eq!(body["card"]["card_schema_version"], crate::machine_card::CARD_SCHEMA_VERSION);
+        assert!(body["card"].get("accepts").is_none(), "the card itself states no grant: {body}");
+        let text = body.to_string();
+        assert!(!text.contains("mini-1") && !text.contains("secret-profile"), "another sender's grant leaked: {text}");
+    }
+
+    /// The card read is behind the same gate as a job: token, node, allow-list.
+    /// A refusal is the listener's own sentence, so the asker can tell a
+    /// refused machine from one with the listener off.
+    #[test]
+    fn a_card_read_is_refused_at_the_gate_with_the_listeners_sentence() {
+        let h = start(Some(laptop()), false, 0);
+        let (code, body) = get_card(&card_url(&h), "wrong-token");
+        assert_eq!(code, 401, "{body}");
+        assert!(body["reason"].as_str().unwrap().contains("fleet token is missing or does not match"), "{body}");
+        let h = start(Some(test_node("nPHONE", "phone", "127.0.0.1")), false, 0);
+        let (code, body) = get_card(&card_url(&h), TOKEN);
+        assert_eq!(code, 403, "{body}");
+        assert!(body["reason"].as_str().unwrap().starts_with("studio does not accept work from phone"), "{body}");
+        assert!(body.get("card").is_none() && body.get("accepts").is_none());
+        let h = start(None, false, 0);
+        let (code, body) = get_card(&card_url(&h), TOKEN);
+        assert_eq!(code, 403, "{body}");
+        assert!(body["reason"].as_str().unwrap().contains("did not come from a node"), "{body}");
+    }
+
+    /// A poller that is not allow-listed asks every few seconds; its refusals
+    /// share the per-address log budget, so the log stays bounded.
+    #[test]
+    fn refused_card_reads_share_the_per_address_log_budget() {
+        let h = start(Some(test_node("nPHONE", "phone", "127.0.0.1")), false, 0);
+        for _ in 0..30 {
+            assert_eq!(get_card(&card_url(&h), TOKEN).0, 403);
+        }
+        assert_eq!(h.refusal_log.written.load(std::sync::atomic::Ordering::SeqCst), u64::from(RefusalLog::PER_WINDOW));
     }
 
     /// (#2947 review M1) A receiver whose own config would refuse the
@@ -2004,6 +2095,7 @@ mod tests {
             queue_limits: QueueLimits::PRODUCTION,
             refusal_log: Arc::new(RefusalLog::new()),
             node_slots: Arc::new(KeySlots::new(NODE_CAP)),
+            card_slots: Arc::new(KeySlots::new(CARD_NODE_CAP)),
             config_preflight: Arc::new(|| Ok(())),
         }
     }
@@ -2077,6 +2169,7 @@ mod tests {
             queue_limits: QueueLimits::PRODUCTION,
             refusal_log: Arc::new(RefusalLog::new()),
             node_slots: Arc::new(KeySlots::new(NODE_CAP)),
+            card_slots: Arc::new(KeySlots::new(CARD_NODE_CAP)),
             config_preflight: Arc::new(|| Ok(())),
         };
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -2274,6 +2367,7 @@ mod tests {
             queue_limits: QueueLimits::PRODUCTION,
             refusal_log: Arc::new(RefusalLog::new()),
             node_slots: Arc::new(KeySlots::new(NODE_CAP)),
+            card_slots: Arc::new(KeySlots::new(CARD_NODE_CAP)),
             config_preflight: Arc::new(|| Ok(())),
         };
         let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2303,10 +2397,10 @@ mod tests {
         assert!((1..=ConnLimits::PRODUCTION.per_ip).contains(&max), "concurrent lookups from one address: {max}");
     }
 
-    /// (#2916 round 3 C5) Once identified, one node has at most its cap of
-    /// requests in flight, whatever addresses they came from.
-    #[test]
-    fn one_node_has_at_most_its_cap_of_requests_in_flight() {
+    /// A listener whose node cap is ONE request and whose profile resolution
+    /// takes `resolve_ms`, so a job holds the node's only slot for that long.
+    /// Returns its base URL.
+    fn spawn_one_slot_listener(resolve_ms: u64) -> String {
         let state = FleetListenerState {
             receiver: "studio".into(),
             local_node_id: Some("nSTUDIO".into()),
@@ -2317,8 +2411,8 @@ mod tests {
             }),
             token: Arc::new(|| Some(TOKEN.to_string())),
             allow_list: Arc::new(|| Ok(allow())),
-            resolve_profile: Arc::new(|_, _| {
-                std::thread::sleep(Duration::from_millis(600));
+            resolve_profile: Arc::new(move |_, _| {
+                std::thread::sleep(Duration::from_millis(resolve_ms));
                 test_resolution(None)
             }),
             execute: Arc::new(|j: WorkJob, _, _| {
@@ -2331,6 +2425,7 @@ mod tests {
             queue_limits: QueueLimits::PRODUCTION,
             refusal_log: Arc::new(RefusalLog::new()),
             node_slots: Arc::new(KeySlots::new(1)),
+            card_slots: Arc::new(KeySlots::new(CARD_NODE_CAP)),
             config_preflight: Arc::new(|| Ok(())),
         };
         let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2344,7 +2439,14 @@ mod tests {
                 serve_bounded(l, router(state), ConnLimits::PRODUCTION, rx).await;
             });
         });
-        let url = format!("http://127.0.0.1:{port}{}", darkmux_fleet::SUBMISSION_PATH);
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// (#2916 round 3 C5) Once identified, one node has at most its cap of
+    /// requests in flight, whatever addresses they came from.
+    #[test]
+    fn one_node_has_at_most_its_cap_of_requests_in_flight() {
+        let url = format!("{}{}", spawn_one_slot_listener(600), darkmux_fleet::SUBMISSION_PATH);
         let u2 = url.clone();
         let first = std::thread::spawn(move || {
             darkmux_fleet::post_submission(&u2, TOKEN, &WorkSubmission::new(job("s1", None), true), Duration::from_secs(10)).unwrap()
@@ -2355,6 +2457,23 @@ mod tests {
         assert_eq!(code, 503, "{reply:?}");
         assert!(reply.reason.unwrap().contains("as many requests from macbook-pro as it takes at once"));
         assert_eq!(first.join().unwrap().0, 200);
+    }
+
+    /// A card read takes a slot of its own: a sender whose job holds every
+    /// request slot it has still gets its card, and a sender's card reads are
+    /// still capped (a poller cannot ask for more than a few at a time).
+    #[test]
+    fn a_sender_whose_job_slots_are_full_still_gets_its_card() {
+        let base = spawn_one_slot_listener(1_500);
+        let work = format!("{base}{}", darkmux_fleet::SUBMISSION_PATH);
+        let running = std::thread::spawn(move || {
+            darkmux_fleet::post_submission(&work, TOKEN, &WorkSubmission::new(job("s1", None), true), Duration::from_secs(10)).unwrap()
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        let (code, body) = get_card(&format!("{base}{}", darkmux_fleet::CARD_PATH), TOKEN);
+        assert_eq!(code, 200, "the job holds the node's only request slot: {body}");
+        assert_eq!(body["accepts"]["peer_name"], "macbook-pro");
+        assert_eq!(running.join().unwrap().0, 200);
     }
 
     /// (#2916 round 3 C6) Suppressed counts are flushed on a timer, and

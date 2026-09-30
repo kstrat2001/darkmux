@@ -18,6 +18,8 @@ refuse_start_below_min: boolean,
 pause_running_below_min: boolean, 
 /**
  * The start decision at the current reading: `true` when a new run would
- * be refused. `false` with no battery reading.
+ * be refused, `false` when it would not (including a machine with no
+ * battery). `null` when nothing was observed: no host sampler ran in
+ * the process that built the card, so no decision was made.
  */
-refusing_start: boolean, };
+refusing_start: boolean | null, };
