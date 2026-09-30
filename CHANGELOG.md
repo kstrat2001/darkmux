@@ -1147,6 +1147,15 @@ darkmux release.
 
 ### Added (4.0)
 
+- **Radio's answering seat can run on a fleet peer.** Set `radio.answerer_profile`
+  (or `role_profiles.radio-host`) to `<profile>@<machine>` and the seat's dispatch
+  is submitted to that machine, which runs it on its own profile; the peer must
+  trust the sender for the profile and the `radio-host` role (`darkmux machine
+  trust <sender> --profiles <profile> --roles radio-host`). A peer seat is not
+  read as a hosted endpoint (grounding is not withheld), its busy check is the
+  peer's, and every refusal names the address. `config set` refuses a malformed
+  address for either key, and `doctor` no longer reports a `radio-host` address
+  binding as an undefined profile.
 - **`darkmux mission show <id>`** and the panel's `/mission show <id>`: one
   mission in full, from one derivation. The config it was launched from and
   its declared inputs, every phase, task and step with status, tokens, turns

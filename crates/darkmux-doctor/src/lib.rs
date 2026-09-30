@@ -1874,6 +1874,14 @@ fn check_role_profiles() -> Check {
     }
 }
 
+/// A `radio-host` binding written as a well-formed `<profile>@<machine>`
+/// address: radio's answering seat runs on that fleet peer, whose registry
+/// (not this one) defines the profile.
+fn is_peer_binding(role: &str, profile: &str) -> bool {
+    role == "radio-host"
+        && darkmux_types::profile_address::ProfileAddress::parse(profile).is_ok_and(|a| a.machine.is_some())
+}
+
 /// Pure decision for `check_role_profiles`, split out so every arm is
 /// unit-testable without a real config.json / registry. `known_profiles` is the
 /// registry's DEFINED profiles; `quarantined` is the set of profile names whose
@@ -1919,8 +1927,8 @@ fn role_profiles_status(
             unknown_role_pairs.push((role, profile));
             continue;
         }
-        if known_profiles.contains_key(profile.as_str()) {
-            continue; // both halves defined + healthy
+        if known_profiles.contains_key(profile.as_str()) || is_peer_binding(role, profile) {
+            continue; // both halves defined + healthy, or the profile lives on a fleet peer
         }
         if quarantined.contains(profile.as_str()) {
             quarantined_pairs.push((role, profile));
@@ -13215,6 +13223,20 @@ mod tests {
         assert_eq!(c.status, Status::Pass);
         assert!(c.message.contains("3 role->profile bindings"), "got: {}", c.message);
         assert!(c.message.contains("all name a real role and a defined profile"), "got: {}", c.message);
+    }
+
+    #[test]
+    fn role_profiles_a_radio_host_peer_address_is_not_dangling() {
+        let roles = roles(&["radio-host", "analyst"]);
+        let ok = bindings(&[("radio-host", "deep@studio")]);
+        let c = super::role_profiles_status(&ok, &known(&["qwen35b"]), &quarantined(&[]), &roles);
+        assert_eq!(c.status, Status::Pass, "the profile lives on the peer: {}", c.message);
+        // Only the answering seat runs on a peer; another role's address, and a
+        // malformed one, still cannot resolve here.
+        let other = bindings(&[("analyst", "deep@studio")]);
+        assert_eq!(super::role_profiles_status(&other, &known(&[]), &quarantined(&[]), &roles).status, Status::Warn);
+        let bad = bindings(&[("radio-host", "a@b@c")]);
+        assert_eq!(super::role_profiles_status(&bad, &known(&[]), &quarantined(&[]), &roles).status, Status::Warn);
     }
 
     #[test]

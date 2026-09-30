@@ -94,6 +94,11 @@ struct MockChat {
 
 impl MockChat {
     fn spawn() -> Self {
+        Self::spawn_replying(MOCK_REPLY)
+    }
+
+    /// A chat server whose every completion carries `reply`.
+    fn spawn_replying(reply: &'static str) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let delay_ms = Arc::new(AtomicU64::new(0));
@@ -108,7 +113,7 @@ impl MockChat {
                     std::thread::sleep(Duration::from_millis(d.load(Ordering::SeqCst)));
                     let body = serde_json::json!({
                         "id": "mock-1", "object": "chat.completion", "created": 0, "model": "mock-model",
-                        "choices": [{"index": 0, "message": {"role": "assistant", "content": MOCK_REPLY}, "finish_reason": "stop"}],
+                        "choices": [{"index": 0, "message": {"role": "assistant", "content": reply}, "finish_reason": "stop"}],
                         "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
                     })
                     .to_string();
@@ -257,6 +262,16 @@ fn wait_for_port(port: u16, what: &str, log: &Path) {
 }
 
 fn boot(busy_policy: &str) -> Fleet {
+    boot_trusting(busy_policy, Some(&["cloud"]))
+}
+
+/// [`boot`] with beta's allow-list entry for alpha granting `profiles`, or,
+/// with `None`, no entry for alpha at all.
+fn boot_trusting(busy_policy: &str, profiles: Option<&[&str]>) -> Fleet {
+    let accept_work = match profiles {
+        Some(profiles) => serde_json::json!({"alpha": {"node_id": "nALPHA", "profiles": profiles, "roles": ["radio-host"], "workspace": false}}),
+        None => serde_json::json!({}),
+    };
     let root = tempfile::tempdir().unwrap();
     let (alpha, beta) = (Node::new(root.path(), "alpha"), Node::new(root.path(), "beta"));
     let mock = MockChat::spawn();
@@ -293,7 +308,7 @@ fn boot(busy_policy: &str) -> Fleet {
             "fleet": {
                 "identity": {"provider": "tailscale", "bin": beta_tool},
                 "listener": {"enabled": true, "port": fleet_port},
-                "accept_work": {"alpha": {"node_id": "nALPHA", "profiles": ["cloud"], "roles": ["radio-host"], "workspace": false}},
+                "accept_work": accept_work,
                 "busy_policy": busy_policy
             },
             "remote": {"concurrent_cap": 1},
@@ -451,4 +466,96 @@ fn a_queued_job_is_announced_then_runs() {
     assert!(t.contains("the job is queued"), "the sender heard it was queued: {t}");
     assert!(String::from_utf8_lossy(&second.stdout).contains(MOCK_REPLY), "{t}");
     assert_eq!(f.mock.served.load(Ordering::SeqCst), 2);
+}
+
+/// The refusal decision radio's routing seat returns, so the exchange
+/// reaches the answering seat.
+const ROUTER_REFUSES: &str = "{\"refuse\": \"no command fits this question\"}";
+
+/// How alpha's config names the answering seat.
+#[derive(Clone, Copy)]
+enum SeatConfig {
+    AnswererProfile(&'static str),
+    RadioHostBinding(&'static str),
+}
+
+/// The routing seat's model, on alpha: a local utility binding served by a
+/// stub that always refuses to route, so `darkmux radio` reaches its
+/// answering seat. Returns the stub (its request count is the routing
+/// seat's call count) and the extra env for the `radio` process.
+fn arm_alpha_radio(f: &Fleet, seat: SeatConfig) -> (MockChat, Vec<(&'static str, String)>) {
+    let router = MockChat::spawn_replying(ROUTER_REFUSES);
+    let cfg_path = f.alpha.home.join("config.json");
+    let mut cfg: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+    match seat {
+        SeatConfig::AnswererProfile(p) => cfg["radio"] = serde_json::json!({"answerer_profile": p}),
+        SeatConfig::RadioHostBinding(p) => cfg["role_profiles"] = serde_json::json!({"radio-host": p}),
+    }
+    std::fs::write(&cfg_path, cfg.to_string()).unwrap();
+    std::fs::write(
+        f.alpha.home.join("profiles.json"),
+        r#"{"profiles":{"work":{"models":[{"id":"stub-worker","n_ctx":8000}]}},"default_profile":"work","internal":{"utility":{"id":"stub-util","n_ctx":8000}}}"#,
+    )
+    .unwrap();
+    let env = vec![
+        ("DARKMUX_LMSTUDIO_URL", format!("http://127.0.0.1:{}", router.port)),
+        ("DARKMUX_LMS_BIN", "/usr/bin/true".to_string()),
+    ];
+    (router, env)
+}
+
+fn radio(from: &Node, env: &[(&'static str, String)]) -> Output {
+    let mut cmd = from.cmd();
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.args(["radio", "what is running?"]).stdin(Stdio::null());
+    cmd.output().expect("running darkmux radio")
+}
+
+/// The promise: with the answering seat written as `<p>@<peer>` (either
+/// `radio.answerer_profile` or a `role_profiles.radio-host` binding), radio
+/// sends the answering seat's dispatch to the peer, which runs it on ITS
+/// profile, and the answer comes back and is printed. The peer is not read
+/// as a hosted endpoint: grounding is not withheld.
+#[test]
+fn radio_answers_on_a_peer_when_the_seat_is_written_as_an_address() {
+    for seat in [SeatConfig::AnswererProfile("cloud@beta"), SeatConfig::RadioHostBinding("cloud@beta")] {
+        let f = boot("refuse");
+        let (router, env) = arm_alpha_radio(&f, seat);
+
+        let out = radio(&f.alpha, &env);
+        let t = text(&out);
+        assert!(out.status.success(), "{t}");
+        assert!(String::from_utf8_lossy(&out.stdout).contains(MOCK_REPLY), "beta's answer was printed: {t}");
+        assert_eq!(router.served.load(Ordering::SeqCst), 1, "alpha's router seat ran once and only once: {t}");
+        assert_eq!(f.mock.served.load(Ordering::SeqCst), 1, "beta's model answered: {t}");
+        assert_eq!(beta_dispatch_starts(&f), 1, "beta ran the answering seat's dispatch: {t}");
+        assert!(!t.contains("resolves to a REMOTE endpoint"), "a fleet peer is not a hosted endpoint: {t}");
+        assert!(!t.contains("answering seat failed"), "{t}");
+    }
+}
+
+/// Refusals from the peer reach the user as a readable radio refusal that
+/// names the address, and nothing falls back to a model on this machine.
+#[test]
+fn radio_names_the_address_when_the_peer_refuses_and_never_answers_locally() {
+    // (allow-list for alpha, alpha's seat, what the refusal must say)
+    let cases: [(Option<&[&str]>, &str, &str); 2] = [
+        (Some(&["cloud"]), "deep@beta", "profile deep is not defined on beta"),
+        (None, "cloud@beta", "does not accept work from alpha"),
+    ];
+    for (trust, address, why) in cases {
+        let f = boot_trusting("refuse", trust);
+        let (router, env) = arm_alpha_radio(&f, SeatConfig::AnswererProfile(address));
+
+        let out = radio(&f.alpha, &env);
+        let t = text(&out);
+        assert!(!out.status.success(), "an unanswered question exits non-zero: {t}");
+        assert!(t.contains(address), "the refusal names the address `{address}`: {t}");
+        assert!(t.contains(why), "the refusal carries the receiver's reason `{why}`: {t}");
+        assert!(!String::from_utf8_lossy(&out.stdout).contains(MOCK_REPLY), "{t}");
+        assert_eq!(f.mock.served.load(Ordering::SeqCst), 0, "nothing ran on beta: {t}");
+        assert_eq!(router.served.load(Ordering::SeqCst), 1, "no local fallback dispatched a second call: {t}");
+    }
 }
