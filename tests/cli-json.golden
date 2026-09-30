@@ -927,6 +927,7 @@ RunStats
   content_chars: uint64
   completion_tokens: uint64
   reasoning_tokens: uint64
+  calls_unreported: uint
   suspect_turns: SuspectTurn[]
   tool_calls: { [key: string]: uint }
   tool_calls_total: uint

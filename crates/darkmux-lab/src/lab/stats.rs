@@ -62,7 +62,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// Data-shape semver for [`RunStats`], per the repo's additive-minor rule.
-pub const RUN_STATS_SCHEMA_VERSION: &str = "2.0.0";
+pub const RUN_STATS_SCHEMA_VERSION: &str = "2.1.0";
 
 use darkmux_trajectory::DEGENERATE_TAIL_RATIO;
 
@@ -265,6 +265,13 @@ pub struct RunStats {
     pub content_chars: u64,
     pub completion_tokens: u64,
     pub reasoning_tokens: u64,
+    /// Model calls that reported no completion count (a cut or gated stream
+    /// is never billed, and a provider may omit usage). Each contributes 0
+    /// to every token figure here, so above zero `completion_tokens` and
+    /// `reasoning_tokens` are a lower bound, not the run's spend. Counted per
+    /// call, so it holds when calls and streams do not pair 1:1 (where
+    /// `streams_unbilled` cannot name them).
+    pub calls_unreported: usize,
     pub suspect_turns: Vec<SuspectTurn>,
     pub tool_calls: BTreeMap<String, usize>,
     pub tool_calls_total: usize,
@@ -345,6 +352,9 @@ impl RunStats {
         }
         if !c.all_streams_billed {
             out.push("tok/s and energy per token cover only the billed streams");
+        }
+        if self.calls_unreported > 0 {
+            out.push("some model calls reported no usage; the token totals are a lower bound");
         }
         if !c.frames_match_streams {
             out.push("usage frames and streams did not pair 1:1");
@@ -843,6 +853,7 @@ pub(crate) fn derive_stats(
         content_chars,
         completion_tokens,
         reasoning_tokens: fold.tokens.reasoning.unwrap_or(0),
+        calls_unreported: fold.frames.iter().filter(|f| f.is_none()).count(),
         suspect_turns: suspect_turns(fold),
         tool_calls,
         tool_calls_total: fold.tools.len(),

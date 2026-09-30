@@ -1149,6 +1149,8 @@ darkmux release.
 
 ### Fixed (4.0)
 
+- **A `dispatch.map` step whose every item failed is an errored step, and one with some failed items reads degraded.** The step used to complete regardless, so a mission where every item errored could finish Clean with exit 0. Now all items failing fails the step with the first item's error. Some items failing keeps the step `complete` (its output still reaches later steps) but marks the mission envelope `degraded`, with a warning naming the step and how many items failed. No shipped mission config uses `dispatch.map` today, so this affects your own configs.
+
 - **A daemon started with `--port N` is found by every client on the machine (#3007).** `darkmux serve` now records where it actually bound (`<darkmux home>/run/daemon.json`: pid, host, port) and removes the record on clean shutdown. Doctor, the dispatch nudge, `machine list` and the viewer links resolve the daemon's address from a live record first, then env, config and the built-in 8765, and the `daemon reachable` row names which source it used. A record whose pid is gone is ignored. Before, a daemon on `--port 8766` read as "not reachable at 127.0.0.1:8765" and the `fleet token` row failed against it.
 - **Doctor's `fleet token` row no longer fails for a shell without the token when the daemon has it.** `/health` now carries `fleet_token_set` (a boolean, this machine only, never the value); when the shell cannot resolve a token but the local daemon reports one, the row passes and says the token is set in the daemon's environment only.
 - **Dispatching to a peer whose listener is off names the listener.** The error was `no answer from http://<host>:8766/fleet/work: ... Connection refused (os error 61)`. It now reads `the fleet listener at <url> is not accepting connections (off, or the daemon is down); nothing was sent`, the same sentence `/fleet/view` gives as the detail of its `listener_off` outcome (one classifier, `is_listener_off`).
@@ -1188,6 +1190,8 @@ darkmux release.
   say it did not load, with the cause, instead of "no profile registry".
 
 ### Added (4.0)
+
+- **`run stats` counts the model calls that reported no usage** (`calls_unreported`, RunStats 2.1.0, `--json` too). A call that reports no usage adds 0 to the token figures, so a partly reported run read as a smaller run. Above zero, `completion_tokens` and `reasoning_tokens` are a lower bound, and the run's unreconciled list says so.
 
 - **The fleet work wire is `major.minor` and grows by minors from here; the
   receiver enforces a data boundary; a check asks "would this route work"; every

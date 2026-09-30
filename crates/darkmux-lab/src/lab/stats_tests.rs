@@ -85,6 +85,51 @@ fn usage_frames_accumulate_within_one_turn_and_are_not_assigned() {
 }
 
 
+/// A call that reported no usage adds 0 to the token totals, and the run
+/// says how many did, so a partly-reported total reads as a lower bound
+/// instead of the run's spend. A fully reported run says none and is quiet.
+#[test]
+fn calls_that_reported_no_usage_are_counted_so_the_totals_read_as_a_lower_bound() {
+    let partly = format!(
+        "{}{}{}{}",
+        stream(1, 0, Some(10_000)),
+        completed(1, Some(500), 0),
+        stream(2, 10_000, Some(20_000)),
+        completed(2, None, 0),
+    );
+    let s = stats(&partly, 20_000);
+    assert_eq!(s.completion_tokens, 500, "the unreported call adds nothing");
+    assert_eq!(s.calls_unreported, 1);
+    assert!(s.unreconciled().contains(&"some model calls reported no usage; the token totals are a lower bound"));
+
+    let whole = format!("{}{}", stream(1, 0, Some(10_000)), completed(1, Some(500), 0));
+    let s = stats(&whole, 10_000);
+    assert_eq!(s.calls_unreported, 0);
+    assert!(!s.unreconciled().iter().any(|r| r.contains("lower bound")));
+}
+
+// ---------------------------------------------------------------------------
+// Tool calls
+// ---------------------------------------------------------------------------
+
+/// A failed tool call counts in `tool_calls_failed` and still counts in the
+/// total; a call that reports no `ok` predates the field and succeeded.
+#[test]
+fn a_failed_tool_call_is_counted_apart_from_the_total() {
+    let call = |seq: u64, name: &str, ok: Option<bool>| {
+        let mut v = serde_json::json!({"type": "tool.completed", "seq": seq, "tool_name": name});
+        if let Some(ok) = ok {
+            v["ok"] = serde_json::json!(ok);
+        }
+        line(v)
+    };
+    let traj = format!("{}{}{}", call(1, "read", Some(true)), call(1, "bash", Some(false)), call(2, "read", None));
+    let s = stats(&traj, 1_000);
+    assert_eq!((s.tool_calls_total, s.tool_calls_failed), (3, 1));
+    assert_eq!(s.tool_calls.get("read"), Some(&2));
+    assert_eq!(s.tool_calls.get("bash"), Some(&1));
+}
+
 // ---------------------------------------------------------------------------
 // Billing
 // ---------------------------------------------------------------------------
