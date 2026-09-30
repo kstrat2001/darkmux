@@ -2053,9 +2053,21 @@ fn refusal_word(code: darkmux_fleet::RefusalCode) -> String {
 }
 
 /// What one route's check found, in a clause.
-fn route_finding(route: &FleetRoute, outcome: &darkmux_fleet::CheckOutcome) -> (bool, String) {
-    use darkmux_fleet::{CheckOutcome, EndpointClass, SeatOutlook};
+fn route_finding(route: &FleetRoute, check: &darkmux_fleet::ReadOnlyCheck) -> (bool, String) {
+    use darkmux_fleet::{CheckOutcome, EndpointClass, ReadOnlyCheck, SeatOutlook};
     let head = format!("{} = `{}`", route.source, route.address);
+    let outcome = match check {
+        ReadOnlyCheck::NotPinned { machine } => {
+            return (
+                false,
+                format!(
+                    "{head}: not pinned yet: the first `dispatch` or radio answer to {machine} pins its node \
+                     (doctor does not pin, and sent nothing to it)"
+                ),
+            )
+        }
+        ReadOnlyCheck::Asked(outcome) => outcome,
+    };
     match outcome {
         CheckOutcome::Routable { profile, report } => {
             let endpoint = match report.endpoint {
@@ -2081,7 +2093,7 @@ fn route_finding(route: &FleetRoute, outcome: &darkmux_fleet::CheckOutcome) -> (
 /// that could not be asked (an unreachable peer), is a Warn that says which
 /// and why, never a Fail: doctor reports the route, it does not depend on the
 /// peer being up.
-fn fleet_routes_status(results: &[(FleetRoute, darkmux_fleet::CheckOutcome)]) -> Check {
+fn fleet_routes_status(results: &[(FleetRoute, darkmux_fleet::ReadOnlyCheck)]) -> Check {
     let name = "fleet routes".to_string();
     if results.is_empty() {
         return Check {
@@ -2111,7 +2123,8 @@ fn fleet_routes_status(results: &[(FleetRoute, darkmux_fleet::CheckOutcome)]) ->
 }
 
 /// The check behind [`fleet_routes_status`]: asks each peer route's receiver
-/// whether it would take the job ([`darkmux_fleet::check_route`]), all at
+/// whether it would take the job ([`darkmux_fleet::check_route_read_only`],
+/// which never pins a node or writes the roster), all at
 /// once, each bounded by the fleet client's own timeout.
 fn check_fleet_routes() -> Check {
     let routes = fleet_routes(
@@ -2119,12 +2132,12 @@ fn check_fleet_routes() -> Check {
         &darkmux_types::config_access::role_profiles(),
         darkmux_flow::resolve_machine_id().as_deref(),
     );
-    let results: Vec<(FleetRoute, darkmux_fleet::CheckOutcome)> = std::thread::scope(|s| {
+    let results: Vec<(FleetRoute, darkmux_fleet::ReadOnlyCheck)> = std::thread::scope(|s| {
         let asked: Vec<_> = routes
             .into_iter()
             .map(|r| {
                 s.spawn(move || {
-                    let outcome = darkmux_fleet::check_route(&r.address, &r.role, None);
+                    let outcome = darkmux_fleet::check_route_read_only(&r.address, &r.role, None);
                     (r, outcome)
                 })
             })
@@ -13579,14 +13592,18 @@ mod tests {
         super::FleetRoute { source: source.into(), role: role.into(), address: address.into() }
     }
 
-    fn routable() -> darkmux_fleet::CheckOutcome {
-        darkmux_fleet::CheckOutcome::Routable {
+    fn asked(outcome: darkmux_fleet::CheckOutcome) -> darkmux_fleet::ReadOnlyCheck {
+        darkmux_fleet::ReadOnlyCheck::Asked(outcome)
+    }
+
+    fn routable() -> darkmux_fleet::ReadOnlyCheck {
+        asked(darkmux_fleet::CheckOutcome::Routable {
             profile: "deep".into(),
             report: darkmux_fleet::CheckReport {
                 endpoint: darkmux_fleet::EndpointClass::Managed,
                 seat: darkmux_fleet::SeatOutlook::Free,
             },
-        }
+        })
     }
 
     /// Only a well-formed address naming ANOTHER machine is a route to check:
@@ -13627,18 +13644,28 @@ mod tests {
         assert!(c.message.contains("would run role radio-host on deep (managed; seat free)"), "{}", c.message);
 
         let refused = CheckOutcome::Refused { code: RefusalCode::RoleNotAllowed, reason: "studio lets laptop run roles: none".into() };
-        let c = super::fleet_routes_status(&[(r.clone(), refused)]);
+        let c = super::fleet_routes_status(&[(r.clone(), asked(refused))]);
         assert_eq!(c.status, Status::Warn);
         assert!(c.message.contains("refused by the receiver (role_not_allowed): studio lets laptop run roles: none"), "{}", c.message);
 
         let down = CheckOutcome::Unanswered { detail: "studio did not answer".into() };
-        let c = super::fleet_routes_status(&[(r.clone(), down)]);
+        let c = super::fleet_routes_status(&[(r.clone(), asked(down))]);
         assert_eq!(c.status, Status::Warn, "an unreachable peer warns");
         assert!(c.message.contains("could not be asked: studio did not answer"), "{}", c.message);
 
-        let c = super::fleet_routes_status(&[(r.clone(), routable()), (route("role_profiles.coder", "coder", "big@mini"), CheckOutcome::Unanswered { detail: "x".into() })]);
+        let c = super::fleet_routes_status(&[(r.clone(), routable()), (route("role_profiles.coder", "coder", "big@mini"), asked(CheckOutcome::Unanswered { detail: "x".into() }))]);
         assert_eq!(c.status, Status::Warn);
         assert_eq!(super::fleet_routes_status(&[]).status, Status::Pass);
+    }
+
+    /// A peer whose node is not pinned yet is a Warn that names the fix, never
+    /// a Fail, and never claims the route works.
+    #[test]
+    fn an_unpinned_peer_warns_and_says_doctor_pinned_nothing() {
+        let r = route("radio.answerer_profile", "radio-host", "deep@studio");
+        let c = super::fleet_routes_status(&[(r, darkmux_fleet::ReadOnlyCheck::NotPinned { machine: "studio".into() })]);
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.message.contains("not pinned yet: the first `dispatch` or radio answer to studio pins its node"), "{}", c.message);
     }
 
     fn seats(pairs: &[(&str, &str)]) -> Vec<(String, String)> {

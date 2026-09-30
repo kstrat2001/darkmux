@@ -801,6 +801,45 @@ mod tests {
         assert_eq!(sent["schema"], crate::WORK_JOB_SCHEMA_VERSION);
     }
 
+    /// The doctor's check never writes the roster and never contacts a node
+    /// nothing has pinned: an unpinned entry is reported as such, the roster
+    /// file is byte-identical, and the peer sees no connection (so no token).
+    #[test]
+    #[serial]
+    fn a_read_only_check_of_an_unpinned_peer_writes_nothing_and_sends_nothing() {
+        let checked = "{\"status\":\"checked\",\"profile\":\"deep\",\"check\":{\"endpoint\":\"managed\",\"seat\":\"free\"}}\n";
+        let (port, rx) = spawn_scripted_peer(checked);
+        let _env = PeerEnv::new(port);
+        peer_b_is_verified();
+        let roster = std::env::var("DARKMUX_FLEET_FILE").unwrap();
+        let before = std::fs::read(&roster).unwrap();
+        let outcome = crate::check_route_read_only("deep@Peer-B", "radio-host", None);
+        assert_eq!(outcome, crate::ReadOnlyCheck::NotPinned { machine: "Peer-B".into() });
+        assert_eq!(std::fs::read(&roster).unwrap(), before, "the roster must be untouched");
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "nothing may reach an unpinned node");
+    }
+
+    /// The inverse: a pinned entry is still checked by the read-only path.
+    #[test]
+    #[serial]
+    fn a_read_only_check_of_a_pinned_peer_asks_it() {
+        let checked = "{\"status\":\"checked\",\"profile\":\"deep\",\"check\":{\"endpoint\":\"managed\",\"seat\":\"free\"}}\n";
+        let (port, rx) = spawn_scripted_peer(checked);
+        let _env = PeerEnv::new(port);
+        peer_b_is_verified();
+        let roster = std::env::var("DARKMUX_FLEET_FILE").unwrap();
+        std::fs::write(
+            &roster,
+            r#"{"version":"2","machines":{"peer-b":{"id":"peer-b","address":"127.0.0.1","added_unix_ms":1,"node_id":"nPEERB"}}}"#,
+        )
+        .unwrap();
+        let before = std::fs::read(&roster).unwrap();
+        let outcome = crate::check_route_read_only("deep@Peer-B", "radio-host", None);
+        assert!(matches!(outcome, crate::ReadOnlyCheck::Asked(crate::CheckOutcome::Routable { .. })), "{outcome:?}");
+        assert_eq!(std::fs::read(&roster).unwrap(), before);
+        assert!(rx.recv_timeout(Duration::from_secs(5)).is_ok(), "a pinned peer is asked");
+    }
+
     /// A check with nothing to check (no machine in the address, no peer to
     /// reach) is unanswered with the reason, and sends nothing.
     #[test]

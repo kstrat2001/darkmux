@@ -1200,13 +1200,51 @@ pub fn verify_target(
     }
 }
 
+/// Whether [`send_job`] may write a first-contact pin into the roster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PinPolicy {
+    /// Pin the verified node on first contact (a send that is about to submit).
+    PinOnFirstContact,
+    /// Never write the roster: an unpinned target is not contacted at all.
+    RequirePinned,
+}
+
+/// The target's node is not pinned in the roster yet, so a read-only send
+/// stopped before contacting it.
+#[derive(Debug)]
+struct NotPinned {
+    machine: String,
+}
+
+impl std::fmt::Display for NotPinned {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} has no pinned node in the roster yet", self.machine)
+    }
+}
+
+impl std::error::Error for NotPinned {}
+
+/// First contact with a verified node: pin it in the roster, or, for a
+/// read-only caller, stop before anything is sent to it.
+fn settle_pin(peer: &crate::peer::PeerTarget, id: &str, target: &str, pins: PinPolicy, provider: &str) -> Result<()> {
+    if peer.newly_pinned.is_none() {
+        return Ok(());
+    }
+    if pins == PinPolicy::RequirePinned {
+        return Err(NotPinned { machine: target.to_string() }.into());
+    }
+    crate::peer::persist_pin(id, peer).context("pinning the target's node in the roster")?;
+    eprintln!("darkmux dispatch: pinned {target} to its {provider} node (first contact); later sends check it");
+    Ok(())
+}
+
 /// Send `job` to the machine it is addressed to and return the receiver's
 /// final reply, whatever it says: look the machine up in this machine's
 /// roster (case-insensitively), verify the node at its address
 /// ([`verify_target`]), then dial that verified address's fleet listener with
 /// the fleet token. `Err` only when no answer came (or the target could not
 /// be verified, so nothing was sent).
-fn send_job(job: WorkJob, wait: bool) -> Result<(u16, SubmissionReply)> {
+fn send_job(job: WorkJob, wait: bool, pins: PinPolicy) -> Result<(u16, SubmissionReply)> {
     job.validate().context("validating the job before it leaves")?;
     let target = job.target_machine.clone();
     let roster = crate::load_roster().context("reading the fleet roster")?;
@@ -1229,13 +1267,7 @@ fn send_job(job: WorkJob, wait: bool) -> Result<(u16, SubmissionReply)> {
     // Every address is verified for work, loopback included (the listener
     // never binds loopback, so a real provider refuses it).
     let peer = crate::peer::peer_target(&target, &entry, None, port, false, provider.as_ref())?.at_listener(port);
-    if peer.newly_pinned.is_some() {
-        crate::peer::persist_pin(&entry.id, &peer).context("pinning the target's node in the roster")?;
-        eprintln!(
-            "darkmux dispatch: pinned {target} to its {} node (first contact); later sends check it",
-            provider.provider_name()
-        );
-    }
+    settle_pin(&peer, &entry.id, &target, pins, provider.provider_name())?;
     let read_timeout = if wait {
         Duration::from_secs(u64::from(job.timeout_seconds).saturating_add(120))
     } else {
@@ -1273,7 +1305,7 @@ fn send_job(job: WorkJob, wait: bool) -> Result<(u16, SubmissionReply)> {
 /// control characters removed, and its typed code).
 pub fn submit_work(job: WorkJob, wait: bool) -> Result<SubmissionReply> {
     let target = job.target_machine.clone();
-    let (code, reply) = send_job(job, wait)?;
+    let (code, reply) = send_job(job, wait, PinPolicy::PinOnFirstContact)?;
     reply_outcome(&target, code, reply)
 }
 
@@ -1342,19 +1374,48 @@ pub enum CheckOutcome {
 /// meets (its token, the network identity, the allow-list, role and profile
 /// scope, the boundary, the seat, the version) and answers without running
 /// anything, so the answer cannot drift from the decision a run would get.
-/// Doctor and radio call this; neither re-derives it from allow-lists or
-/// cards.
+/// Radio calls this (its submit follows, so pinning on first contact is fine);
+/// doctor calls [`check_route_read_only`]. Neither re-derives it from
+/// allow-lists or cards.
 pub fn check_route(profile_address: &str, role: &str, boundary: Option<Boundary>) -> CheckOutcome {
-    let unanswered = |detail: String| CheckOutcome::Unanswered { detail };
-    let job = match check_job(profile_address, role, boundary) {
-        Ok(j) => j,
-        Err(e) => return unanswered(format!("{e:#}")),
-    };
-    let target = job.target_machine.clone();
-    match send_job(job, false) {
-        Ok((code, reply)) => check_outcome(&target, code, reply),
-        Err(e) => unanswered(format!("{e:#}")),
+    run_check(profile_address, role, boundary, PinPolicy::PinOnFirstContact)
+        .unwrap_or_else(|e| CheckOutcome::Unanswered { detail: format!("{e:#}") })
+}
+
+/// What a read-only route check found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadOnlyCheck {
+    /// The machine's node is not pinned in the roster, so nothing was sent
+    /// (no token crossed) and the roster was not written. The first real
+    /// send to it pins the node.
+    NotPinned { machine: String },
+    /// The target was pinned and was asked.
+    Asked(CheckOutcome),
+}
+
+/// [`check_route`] for a caller that must not mutate state (doctor): the same
+/// check, except that a target whose node is not pinned yet is not contacted
+/// and the roster is never written.
+pub fn check_route_read_only(profile_address: &str, role: &str, boundary: Option<Boundary>) -> ReadOnlyCheck {
+    match run_check(profile_address, role, boundary, PinPolicy::RequirePinned) {
+        Err(e) => match e.downcast::<NotPinned>() {
+            Ok(n) => ReadOnlyCheck::NotPinned { machine: n.machine },
+            Err(other) => ReadOnlyCheck::Asked(CheckOutcome::Unanswered { detail: format!("{other:#}") }),
+        },
+        Ok(outcome) => ReadOnlyCheck::Asked(outcome),
     }
+}
+
+fn run_check(
+    profile_address: &str,
+    role: &str,
+    boundary: Option<Boundary>,
+    pins: PinPolicy,
+) -> Result<CheckOutcome> {
+    let job = check_job(profile_address, role, boundary)?;
+    let target = job.target_machine.clone();
+    let (code, reply) = send_job(job, false, pins)?;
+    Ok(check_outcome(&target, code, reply))
 }
 
 /// The job a check submits: the route's role, profile and boundary, an empty
