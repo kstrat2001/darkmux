@@ -1,0 +1,10 @@
+{
+  "status": "checked",
+  "machine": "studio",
+  "profile": "deep",
+  "reason": "studio would take this job on profile deep; its seat is free",
+  "check": {
+    "endpoint": "managed",
+    "seat": "free"
+  }
+}

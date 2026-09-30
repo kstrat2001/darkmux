@@ -16,6 +16,8 @@ darkmux-crew = { path = "../darkmux-crew" }
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json.workspace = true
+# The wire shapes derive a JSON Schema, hashed by the freeze test (tests/work_wire_fixtures.rs).
+schemars = "1.2"
 # (#2916) The profile registry, for resolving a submitted job's profile
 # against this machine's own registry before the scope check.
 darkmux-profiles = { path = "../darkmux-profiles" }
@@ -30,6 +32,7 @@ ureq = { version = "2.10", default-features = false }
 test-support = []
 
 [dev-dependencies]
+blake3 = "1.5"
 tempfile = "3.10"
 serial_test = "3.1"
 # (#811) Empty the config tier by construction in this crate's TEST build so

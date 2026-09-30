@@ -219,6 +219,8 @@ mod tests {
             published_at_unix_ms: 1,
             published_by_machine: None,
             single_shot: None,
+            boundary: None,
+            mode: crate::SubmissionMode::Run,
         }
     }
 

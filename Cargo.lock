@@ -786,10 +786,12 @@ name = "darkmux-fleet"
 version = "4.0.0-rc.1"
 dependencies = [
  "anyhow",
+ "blake3",
  "darkmux-crew",
  "darkmux-flow",
  "darkmux-profiles",
  "darkmux-types",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "serial_test",

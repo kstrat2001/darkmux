@@ -1,0 +1,9 @@
+{
+  "status": "completed",
+  "machine": "studio",
+  "session_id": "radio.solo.relay.laptop.radio_2Esolo_2Eadhoc_2Eradio-host_2En1",
+  "profile": "deep",
+  "exit_code": 0,
+  "stdout": "the answer",
+  "stderr": ""
+}
