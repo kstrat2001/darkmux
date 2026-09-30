@@ -191,6 +191,11 @@ impl SessionId {
         SessionId { kind: SessionKind::Relay { sender: Box::new(sender), peer: peer.into() }, run }
     }
 
+    /// A placeholder that owns nothing, for [`Drop`] to swap in.
+    fn hollow() -> Self {
+        SessionId { kind: SessionKind::Run, run: RunId { kind: RunIdKind::Mission, id: String::new() } }
+    }
+
     pub fn kind(&self) -> &SessionKind {
         &self.kind
     }
@@ -220,19 +225,27 @@ impl SessionId {
     /// The wire string: the only way from a session to a string. See the
     /// module doc for the grammar.
     pub fn wire(&self) -> String {
-        let mut parts = vec![escape(&self.run.id)];
-        if let Some(tag) = self.run.kind.tag() {
-            parts.push(tag.to_string());
-        }
-        match &self.kind {
-            SessionKind::Run => parts.push("run".to_string()),
-            SessionKind::Phase { phase } => parts.extend(["phase".to_string(), escape(phase)]),
-            SessionKind::Task { task } => parts.extend(["task".to_string(), escape(task)]),
-            SessionKind::Step { step } => parts.extend(["step".to_string(), escape(step)]),
-            SessionKind::Adhoc { role, nonce } => parts.extend(["adhoc".to_string(), escape(role), escape(nonce)]),
-            SessionKind::Relay { sender, peer } => {
-                parts.extend(["relay".to_string(), escape(peer), sender.wire()])
+        // Iterative: a relay nests its sender, and a crafted id can nest deeply.
+        let mut parts: Vec<String> = Vec::new();
+        let mut cur = self;
+        loop {
+            parts.push(escape(&cur.run.id));
+            if let Some(tag) = cur.run.kind.tag() {
+                parts.push(tag.to_string());
             }
+            match &cur.kind {
+                SessionKind::Run => parts.push("run".to_string()),
+                SessionKind::Phase { phase } => parts.extend(["phase".to_string(), escape(phase)]),
+                SessionKind::Task { task } => parts.extend(["task".to_string(), escape(task)]),
+                SessionKind::Step { step } => parts.extend(["step".to_string(), escape(step)]),
+                SessionKind::Adhoc { role, nonce } => parts.extend(["adhoc".to_string(), escape(role), escape(nonce)]),
+                SessionKind::Relay { sender, peer } => {
+                    parts.extend(["relay".to_string(), escape(peer)]);
+                    cur = sender;
+                    continue;
+                }
+            }
+            break;
         }
         parts.join(".")
     }
@@ -242,10 +255,35 @@ impl SessionId {
     /// error.
     pub fn parse(wire: &str) -> Result<Self, IdError> {
         let bad = |why: &str| IdError(format!("session id {wire:?}: {why}"));
-        let comps: Vec<&str> = wire.split('.').collect();
-        let (run, rest) = Self::parse_run(&comps, &bad)?;
-        let (tag, fields) = rest.split_first().ok_or_else(|| bad("it names no session kind"))?;
-        Self::parse_kind(run, tag, fields, &bad)
+        // Peel `relay.<peer>.` layers in a loop (a relay's tail is the sender's
+        // whole wire), parse the innermost non-relay once, then wrap outward.
+        // Linear in the string, no recursion: a crafted id can nest arbitrarily.
+        let mut layers: Vec<(RunId, String)> = Vec::new();
+        let mut comps: Vec<&str> = wire.split('.').collect();
+        let mut at = 0;
+        let mut inner = loop {
+            let (run, rest) = Self::parse_run(&comps[at..], &bad)?;
+            let (tag, fields) = rest.split_first().ok_or_else(|| bad("it names no session kind"))?;
+            match WireKind::parse(tag).ok_or_else(|| bad("unknown session kind"))? {
+                WireKind::Fixed(kind) => break Self::parse_fixed(run, kind, fields, &bad)?,
+                WireKind::Relay => {
+                    let (peer, tail) =
+                        fields.split_first().filter(|(_, t)| !t.is_empty()).ok_or_else(|| bad("a relay names no sender"))?;
+                    let peer = unescape(peer).ok_or_else(|| bad("a field is not escaped as written"))?;
+                    layers.push((run, peer));
+                    at = comps.len() - tail.len();
+                }
+            }
+        };
+        comps.clear();
+        while let Some((run, peer)) = layers.pop() {
+            let relay = SessionId::relay(inner, peer);
+            if relay.run != run {
+                return Err(bad("a relay's run is not its sender's, standalone"));
+            }
+            inner = relay;
+        }
+        Ok(inner)
     }
 
     /// The run a wire string begins with, and the components after it.
@@ -261,15 +299,6 @@ impl SessionId {
         };
         let run = RunId::new(run_kind, run_id).map_err(|e| bad(&e.0))?;
         Ok((run, rest))
-    }
-
-    /// The session within `run` that a kind `tag` and its escaped `fields`
-    /// name.
-    fn parse_kind(run: RunId, tag: &str, fields: &[&str], bad: &dyn Fn(&str) -> IdError) -> Result<Self, IdError> {
-        match WireKind::parse(tag).ok_or_else(|| bad("unknown session kind"))? {
-            WireKind::Relay => Self::parse_relay(run, fields, bad),
-            WireKind::Fixed(kind) => Self::parse_fixed(run, kind, fields, bad),
-        }
     }
 
     /// A kind with a fixed number of escaped fields.
@@ -289,18 +318,6 @@ impl SessionId {
             FixedKind::Step => SessionId::step(run, &f[0]),
             FixedKind::Adhoc => SessionId::adhoc(run, &f[0], &f[1]),
         })
-    }
-
-    /// A relay's fields: the escaped peer, then the sender's wire string,
-    /// which is everything after it (its own dots included).
-    fn parse_relay(run: RunId, fields: &[&str], bad: &dyn Fn(&str) -> IdError) -> Result<Self, IdError> {
-        let (peer, tail) = fields.split_first().filter(|(_, t)| !t.is_empty()).ok_or_else(|| bad("a relay names no sender"))?;
-        let peer = unescape(peer).ok_or_else(|| bad("a field is not escaped as written"))?;
-        let relay = SessionId::relay(SessionId::parse(&tail.join("."))?, peer);
-        if relay.run != run {
-            return Err(bad("a relay's run is not its sender's, standalone"));
-        }
-        Ok(relay)
     }
 
     /// Read a session id from a record of ANY age, for attribution: a
@@ -337,6 +354,19 @@ impl SessionId {
             return Some(SessionId::step(run, unscoped(step)));
         }
         Some(SessionId::adhoc(run, "", wire))
+    }
+}
+
+impl Drop for SessionId {
+    /// Unwind a relay chain in a loop: the derived drop recurses once per
+    /// nesting level, and a crafted id can nest deeply.
+    fn drop(&mut self) {
+        let SessionKind::Relay { sender, .. } = &mut self.kind else { return };
+        let mut next = std::mem::replace(sender, Box::new(SessionId::hollow()));
+        while let SessionKind::Relay { sender, .. } = &mut next.kind {
+            let inner = std::mem::replace(sender, Box::new(SessionId::hollow()));
+            next = inner;
+        }
     }
 }
 
@@ -633,6 +663,38 @@ mod tests {
         let again = SessionId::relay(relay.clone(), "studio");
         assert!(again.wire().ends_with(&relay.wire()));
         assert_eq!(SessionId::parse(&again.wire()).unwrap(), again);
+    }
+
+    /// A crafted relay id nests one level per `relay.<peer>.` prefix and
+    /// arrives from a job body, a peer's reply or a presence beat. Parsing,
+    /// re-writing and dropping it must be linear and stack-flat.
+    #[test]
+    fn a_very_deep_relay_parses_in_linear_time_on_a_small_stack() {
+        const DEPTH: usize = 50_000;
+        let handle = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                let mut wire = String::from("m.solo.run");
+                for _ in 0..DEPTH {
+                    wire = format!("m.solo.relay.p.{wire}");
+                }
+                let started = std::time::Instant::now();
+                let parsed = SessionId::parse(&wire).expect("a deep relay is still the grammar");
+                let elapsed = started.elapsed();
+                assert_eq!(parsed.wire(), wire, "the deep relay reads back exactly");
+                let mut depth = 0;
+                let mut cur = &parsed;
+                while let SessionKind::Relay { sender, .. } = cur.kind() {
+                    depth += 1;
+                    cur = sender;
+                }
+                assert_eq!(depth, DEPTH);
+                drop(parsed);
+                elapsed
+            })
+            .unwrap();
+        let elapsed = handle.join().expect("no stack overflow");
+        assert!(elapsed < std::time::Duration::from_secs(5), "parse took {elapsed:?}: not linear");
     }
 
     #[test]
