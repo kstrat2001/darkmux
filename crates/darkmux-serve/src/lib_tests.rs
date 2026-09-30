@@ -4,6 +4,16 @@
     /// declared window, `null` when undeclared, beside the residency match
     /// (by namespaced identifier or bare key).
     #[test]
+    fn the_startup_banner_says_the_listener_is_off_when_it_is() {
+        let auth = ServeAuth { read_auth: false, token_present: true };
+        let on = auth_banner_lines(auth, true);
+        assert!(on[1].contains("requires it plus a verified sender"), "{}", on[1]);
+        let off = auth_banner_lines(auth, false);
+        assert!(off[1].contains("listener is off"), "{}", off[1]);
+        assert!(!off[1].contains("requires it"), "{}", off[1]);
+    }
+
+    #[test]
     fn utility_model_carries_the_declared_window() {
         let lm = |identifier: &str, model: &str| darkmux_types::LoadedModel {
             identifier: identifier.into(),

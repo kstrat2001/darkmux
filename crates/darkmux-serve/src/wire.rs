@@ -38,8 +38,9 @@ pub struct HealthResponse {
     #[cfg_attr(test, ts(type = "number | null"))]
     pub binary_mtime: Option<u64>,
     pub flow_schema_version: String,
-    /// What the fleet listener is doing (`null` when it is off): the detail for a
-    /// caller on this machine, a coarse state for anyone else.
+    /// What the fleet listener is doing (`off` when `fleet.listener.enabled` is
+    /// false): the detail for a caller on this machine, a coarse state for
+    /// anyone else.
     pub fleet_listener: Option<String>,
     /// The busy policy and hosted-job bound the running listener uses; this
     /// machine only.

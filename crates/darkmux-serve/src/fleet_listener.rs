@@ -1078,7 +1078,7 @@ pub(crate) fn listener_busy(local: bool) -> Option<crate::wire::FleetBusy> {
     Some(crate::wire::FleetBusy { policy, hosted_cap })
 }
 
-/// `coarse` is one of `starting` / `waiting` / `listening` / `not started`;
+/// `coarse` is one of `off` / `starting` / `waiting` / `listening` / `not started`;
 /// `detail` may name the address and the reason.
 fn set_state(coarse: &'static str, detail: impl Into<String>) {
     if let Ok(mut g) = LISTENER_STATE.lock() {
@@ -1271,6 +1271,7 @@ pub(crate) async fn serve_bounded(
 /// start after the daemon at boot), retrying every 30 s.
 pub(crate) fn spawn_if_enabled(shutdown: tokio::sync::watch::Receiver<bool>) {
     if !darkmux_types::config_access::fleet_listener_enabled() {
+        set_state("off", "off (fleet.listener.enabled is false)");
         return;
     }
     set_state("starting", "starting");
@@ -2997,6 +2998,21 @@ mod tests {
         assert_eq!(full.decide("100.64.9.9".parse().unwrap(), t0), LogDecision::Suppress);
         let lines = full.flush(t0);
         assert!(lines.iter().any(|l| l.contains("suppressed 1") && l.contains("beyond")), "{lines:?}");
+    }
+
+    /// A listener that is switched off says so on `/health`, to a peer and to
+    /// this machine, instead of reporting `null`.
+    #[serial_test::serial]
+    #[test]
+    fn an_off_listener_reports_off_not_null() {
+        *LISTENER_STATE.lock().unwrap() = None;
+        unsafe { std::env::set_var("DARKMUX_FLEET_LISTENER_ENABLED", "false") };
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        spawn_if_enabled(rx);
+        unsafe { std::env::remove_var("DARKMUX_FLEET_LISTENER_ENABLED") };
+        assert_eq!(listener_state(false).as_deref(), Some("off"));
+        assert_eq!(listener_state(true).as_deref(), Some("off (fleet.listener.enabled is false)"));
+        *LISTENER_STATE.lock().unwrap() = None;
     }
 
     #[test]

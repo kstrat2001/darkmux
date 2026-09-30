@@ -719,14 +719,16 @@ fn host_names_this_daemon(headers: &axum::http::HeaderMap, bound: Option<SocketA
 /// (#881, #2988) The startup banner's two auth lines: the read posture and
 /// the execution posture. `serve_auth_preflight` has already refused a
 /// posture reads could not be answered in, so these only describe.
-fn auth_banner_lines(auth: ServeAuth) -> [String; 2] {
+fn auth_banner_lines(auth: ServeAuth, listener_enabled: bool) -> [String; 2] {
     let reads = if auth.read_auth {
         "  reads:          token required unless from this machine (serve.read_auth on; proxied requests included)"
     } else {
         "  reads:          open to whatever reaches this daemon (serve.read_auth off)"
     };
-    let exec = if auth.token_present {
+    let exec = if auth.token_present && listener_enabled {
         "  fleet work:     token set; the fleet listener requires it plus a verified sender".to_string()
+    } else if auth.token_present {
+        "  fleet work:     token set; the fleet listener is off (fleet.listener.enabled is false), so this machine takes no fleet work".to_string()
     } else {
         format!("  fleet work:     {}", darkmux_types::style::dim("no serve token; this machine takes and sends no fleet work"))
     };
@@ -1312,7 +1314,7 @@ fn build_startup_banner(
 
     // (#881, #2988) Both auth postures, so the operator sees at a glance
     // what reads need and what execution needs.
-    lines.extend(auth_banner_lines(ServeAuth::resolve()));
+    lines.extend(auth_banner_lines(ServeAuth::resolve(), darkmux_types::config_access::fleet_listener_enabled()));
 
     if !flows_dir_exists {
         lines.push(darkmux_types::style::warn(

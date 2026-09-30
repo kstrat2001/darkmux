@@ -17,8 +17,9 @@ build: string,
  */
 binary_mtime: number | null, flow_schema_version: string, 
 /**
- * What the fleet listener is doing (`null` when it is off): the detail for a
- * caller on this machine, a coarse state for anyone else.
+ * What the fleet listener is doing (`off` when `fleet.listener.enabled` is
+ * false): the detail for a caller on this machine, a coarse state for
+ * anyone else.
  */
 fleet_listener: string | null, 
 /**
