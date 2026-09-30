@@ -171,7 +171,7 @@ impl FleetListenerState {
 /// gate.
 pub(crate) fn router(state: FleetListenerState) -> Router {
     Router::new()
-        .route(darkmux_fleet::SUBMISSION_PATH, axum::routing::post(submit_handler))
+        .route(darkmux_fleet::SUBMISSION_PATH, axum::routing::post(submit_route))
         .route(darkmux_fleet::CARD_PATH, axum::routing::get(card_handler))
         .layer(axum::middleware::from_fn_with_state(state.clone(), gate))
         .with_state(state)
@@ -892,19 +892,16 @@ impl axum::extract::FromRequestParts<FleetListenerState> for Authorization {
 }
 
 impl Authorization {
-    /// The admitted caller, or the response that refuses it. An unlisted
-    /// caller's refusal carries the `machine trust` command that admits it,
-    /// resolved against this machine's roster and the job in `body`.
-    fn admitted(self, state: &FleetListenerState, peer: std::net::IpAddr, body: &[u8]) -> Result<Admitted, Response> {
-        self.result.map_err(|r| {
-            let r = match r {
-                Refusal::NotAllowed { .. } => {
-                    let roster = darkmux_fleet::load_roster().unwrap_or_default();
-                    r.with_trust_ask(darkmux_fleet::TrustAsk::for_sender(&self.node, &roster, body))
-                }
-                other => other,
-            };
-            refuse(state, Some(peer), &r)
+    /// The admitted caller, or the refusal. An unlisted caller's refusal
+    /// carries the `machine trust` command that admits it, resolved against
+    /// this machine's roster and the job in `body`.
+    fn admitted(self, body: &[u8]) -> Result<Admitted, Refusal> {
+        self.result.map_err(|r| match r {
+            Refusal::NotAllowed { .. } => {
+                let roster = darkmux_fleet::load_roster().unwrap_or_default();
+                r.with_trust_ask(darkmux_fleet::TrustAsk::for_sender(&self.node, &roster, body))
+            }
+            other => other,
         })
     }
 }
@@ -929,17 +926,28 @@ async fn scope_submission(
     Ok((sub, scoped))
 }
 
-async fn submit_handler(
+/// `POST` a job or a check: refuses a caller the allow-list does not list,
+/// with the remedy for the job it posted, else hands the admitted job on.
+async fn submit_route(
     State(state): State<FleetListenerState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     authorization: Authorization,
     Extension(token): Extension<TokenFingerprint>,
     body: Bytes,
 ) -> Response {
-    let admitted = match authorization.admitted(&state, peer_addr.ip(), &body) {
-        Ok(a) => a,
-        Err(refused) => return refused,
-    };
+    match authorization.admitted(&body) {
+        Ok(admitted) => submit_handler(state, peer_addr, admitted, token, body).await,
+        Err(refusal) => refuse(&state, Some(peer_addr.ip()), &refusal),
+    }
+}
+
+async fn submit_handler(
+    state: FleetListenerState,
+    peer_addr: SocketAddr,
+    admitted: Admitted,
+    token: TokenFingerprint,
+    body: Bytes,
+) -> Response {
     // (#2947 review M1) A job this machine would refuse at its dispatch
     // preflight (a bad enum config value) is refused HERE, synchronously,
     // before a seat is taken or the job is accepted: otherwise the sender

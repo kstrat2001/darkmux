@@ -105,10 +105,9 @@ pub fn run(text: &str, dry_run: bool) -> Result<i32> {
         // LAST RESORT, printed only when the answering dispatch itself
         // fails (e.g. no model loaded) — never silently swallowed.
         RouteDecision::Refuse { reason } => {
-            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             let shelf = crate::radio_answer::ArtifactShelf::default();
             let overrides = crate::radio_answer::AnswererOverrides::default();
-            match crate::radio_answer::answer_live(text, &catalog, &shelf, &cwd, &overrides, radio::RadioSurface::Cli) {
+            match crate::radio_answer::answer_live(text, &catalog, &shelf, &overrides, radio::RadioSurface::Cli) {
                 Ok(crate::radio_answer::LiveAnswer::Answered(outcome)) => {
                     println!("radio: {}", outcome.rendered);
                     Ok(0)
@@ -124,14 +123,7 @@ pub fn run(text: &str, dry_run: bool) -> Result<i32> {
                 }
                 // The model was reached for routing but not for answering: the
                 // user got a degraded reply, and a script must be able to tell.
-                Err(e) => {
-                    let fallback = answer_failure_output(&e, &reason, &catalog);
-                    if let Some(diagnostic) = fallback.diagnostic {
-                        eprintln!("{diagnostic}");
-                    }
-                    println!("{}", fallback.answer);
-                    Ok(1)
-                }
+                Err(e) => Ok(print_answer_failure(&answer_failure_output(&e, &reason, &catalog))),
             }
         }
         // The routing seat never ran. Nothing downstream can do better with
@@ -163,6 +155,17 @@ pub fn run(text: &str, dry_run: bool) -> Result<i32> {
 struct AnswerFailureOutput {
     answer: String,
     diagnostic: Option<String>,
+}
+
+/// Print `out` (the diagnostic to stderr, the answer to stdout) and return the
+/// exit code: 1, because the question was not answered and a script must be
+/// able to tell that from an answer.
+fn print_answer_failure(out: &AnswerFailureOutput) -> i32 {
+    if let Some(diagnostic) = &out.diagnostic {
+        eprintln!("{diagnostic}");
+    }
+    println!("{}", out.answer);
+    1
 }
 
 /// The output for a failed answering step. A seat that could not answer says
@@ -615,7 +618,7 @@ mod tests {
             reason: "studio does not accept work from laptop".into(),
         })
         .context("the answering seat `host@studio`");
-        let err = crate::radio_answer::answer("what is a profile?", &catalog(), &crate::radio_answer::ArtifactShelf::default(), std::path::Path::new("/tmp"), None, crate::radio_answer::GroundingScope::Full, radio::RadioSurface::Cli, &mut |_: &str, _| Err(anyhow::anyhow!("{seat:#}")))
+        let err = crate::radio_answer::answer("what is a profile?", &catalog(), &crate::radio_answer::ArtifactShelf::default(), None, crate::radio_answer::GroundingScope::Full, radio::RadioSurface::Cli, &mut |_: &str, _| Err(anyhow::anyhow!("{seat:#}")))
             .unwrap_err();
         let out = answer_failure_output(&err, "Darkmux does not define profiles", &catalog());
         assert!(out.answer.contains("the answering seat was unavailable"), "{}", out.answer);
@@ -653,7 +656,7 @@ mod tests {
     fn the_cli_entry_point_answers_on_the_cli_surface() {
         let src = production_source();
         assert!(
-            src.contains("answer_live(text, &catalog, &shelf, &cwd, &overrides, radio::RadioSurface::Cli)"),
+            src.contains("answer_live(text, &catalog, &shelf, &overrides, radio::RadioSurface::Cli)"),
             "the CLI answering call must pass the CLI surface"
         );
         assert!(

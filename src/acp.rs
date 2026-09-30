@@ -1740,7 +1740,7 @@ async fn run_no_slash_route(
         // answering dispatch itself fails — see `answer_no_slash_refusal`'s
         // own doc.
         crate::radio::RouteDecision::Refuse { reason } => {
-            answer_no_slash_refusal(session_id, text, &reason, cwd, cx, seat, sessions).await
+            answer_no_slash_refusal(session_id, text, &reason, cx, seat, sessions).await
         }
         // Not a refusal: the routing seat could not run at all. The answering
         // seat would fail the same way, so say it once and stop.
@@ -1874,7 +1874,6 @@ async fn answer_no_slash_refusal(
     session_id: &SessionId,
     text: &str,
     refusal_reason: &str,
-    cwd: &Path,
     cx: &ConnectionTo<Client>,
     seat: SeatCalls,
     sessions: &Sessions,
@@ -1907,7 +1906,6 @@ async fn answer_no_slash_refusal(
         );
     }
     let text_owned = text.to_string();
-    let cwd_owned = cwd.to_path_buf();
     let fleet_call = seat.fleet.clone();
     let outcome = tokio::task::spawn_blocking(move || {
         // The fleet view dials peers, so it is read here on the blocking
@@ -1920,7 +1918,6 @@ async fn answer_no_slash_refusal(
             &text_owned,
             &catalog,
             &shelf,
-            &cwd_owned,
             fleet.as_deref(),
             scope,
             crate::radio::RadioSurface::Panel,
