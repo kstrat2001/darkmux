@@ -116,9 +116,10 @@ pub enum UnreachableReason {
     /// address on its network, or the request came from its own node.
     /// `detail` carries its sentence.
     RefusedByPeer,
-    /// The peer's listener answered that it cannot serve now (503 or 429): it
-    /// has no fleet token, cannot identify its callers, or is at capacity.
-    /// `detail` carries its sentence.
+    /// The peer's listener cannot serve now: it answered 503 or 429 (no fleet
+    /// token, cannot identify its callers, or at capacity), or it accepted the
+    /// connection and did not answer (a timeout, a reset). `detail` carries
+    /// its sentence, or the transport's word.
     ListenerUnavailable,
     /// The peer answered, with something that is not a card or a status this
     /// darkmux knows what to do with.
@@ -781,12 +782,11 @@ fn fetch_listener_card(target: &PeerTarget, entry: &MachineEntry, known_version:
         Ok(resp) => parse_listener_card(resp, entry, known_version),
         Err(ureq::Error::Status(code, resp)) => refusal_outcome(code, resp, known_version),
         Err(ureq::Error::Transport(t)) => {
-            let detail = if darkmux_fleet::is_listener_off(&t) {
-                darkmux_fleet::listener_off_sentence(&target.base())
+            if darkmux_fleet::is_listener_off(&t) {
+                unreachable(UnreachableReason::ListenerOff, Some(darkmux_fleet::listener_off_sentence(&target.base())))
             } else {
-                format!("{:?}", t.kind())
-            };
-            unreachable(UnreachableReason::ListenerOff, Some(detail))
+                unreachable(UnreachableReason::ListenerUnavailable, Some(format!("{:?}", t.kind())))
+            }
         }
     }
 }
@@ -1819,6 +1819,29 @@ pub(crate) mod tests {
         assert_eq!(reason(down, entry("studio"), "192.0.2.5"), UnreachableReason::IdentityUnavailable);
     }
 
+    /// A listener that accepts the connection and drops it before answering
+    /// is not off: something is there, and it cannot serve now. `listener_off`
+    /// (with its "not accepting connections" sentence) is for a connection
+    /// that never opened.
+    #[test]
+    #[serial_test::serial]
+    fn a_listener_that_drops_the_connection_is_unavailable_not_off() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                drop(stream);
+            }
+        });
+        let f = with_fleet_token(|| {
+            let target = listener_target(&provider(true), &studio(), port).map_err(|e| format!("{e:?}")).unwrap();
+            fetch_listener_card(&target, &studio(), None)
+        });
+        assert_eq!(reason_of(&f), UnreachableReason::ListenerUnavailable);
+        let CardOutcome::Unreachable { detail, .. } = &f.outcome else { unreachable!() };
+        assert!(!detail.as_deref().unwrap_or("").contains("not accepting connections"), "{detail:?}");
+    }
+
     /// The bound is on the whole request, not on each read: a peer that
     /// trickles its answer byte by byte, each byte inside any per-read
     /// timeout, is still cut off at `PEER_CARD_TIMEOUT`.
@@ -1846,7 +1869,7 @@ pub(crate) mod tests {
             fetch_listener_card(&target, &studio(), None)
         });
         let took = started.elapsed();
-        assert!(matches!(f.outcome, CardOutcome::Unreachable { .. }), "{:?}", f.outcome);
+        assert_eq!(reason_of(&f), UnreachableReason::BadAnswer, "a 200 whose body never finished is a bad answer");
         assert!(took < PEER_CARD_TIMEOUT + Duration::from_millis(1500), "a trickling peer held the fetch for {took:?}");
     }
 
