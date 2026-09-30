@@ -913,6 +913,7 @@ mod tests {
             kind,
             status,
             machine: None,
+            machine_uid: None,
             route: None,
             role: None,
             model: None,

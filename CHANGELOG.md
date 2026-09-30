@@ -1219,6 +1219,8 @@ darkmux release.
 
 ### Added (4.0)
 
+- **A run row carries `machine_uid` beside its display `machine`** (`/runs`, `run list --json`, additive and optional). It is the hardware uid of the machine whose records produced the row; a tracked mission or lab row reports this daemon's own uid. The viewer decides which machine a run belongs to by this uid, so a renamed machine, a `.local` alias or two machines sharing one display name no longer merge, split or misattribute runs. A record that carried no uid leaves the field absent.
+
 - **`run stats` counts the model calls that reported no usage** (`calls_unreported`, RunStats 2.1.0, `--json` too). A call that reports no usage adds 0 to the token figures, so a partly reported run read as a smaller run. Above zero, `completion_tokens` and `reasoning_tokens` are a lower bound, and the run's unreconciled list says so.
 
 - **The fleet work wire is `major.minor` and grows by minors from here; the
