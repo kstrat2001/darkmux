@@ -212,7 +212,7 @@ curl -s http://127.0.0.1:8765/health
       </tr>
       <tr>
         <td><code>GET /fleet/view</code></td>
-        <td>One row per roster machine, and always a row for this machine: presence as a display column, the machine's own card (this machine&rsquo;s built locally, a peer&rsquo;s fetched from its fleet listener over the verified peer path, in parallel and cached for 5 seconds), its resolved hardware uid, and what the machine accepts from this one (<code>FleetView</code>). <code>accepts</code> and seats are shown only to this machine or a token holder. Backs <code>darkmux machine list</code>. A machine&rsquo;s card is served to its peers by its fleet listener at <code>GET /fleet/card</code>, not by the daemon.</td>
+        <td>One row per roster machine, and always a row for this machine: presence as a display column, the machine's own card (this machine&rsquo;s built locally, a peer&rsquo;s fetched from its fleet listener over the verified peer path, in parallel and cached for 5 seconds), its resolved hardware uid, and what the machine accepts from this one (<code>FleetView</code>). <code>accepts</code> is shown only to this machine, and seats only to this machine or a token holder. Backs <code>darkmux machine list</code>. A machine&rsquo;s card is served to its peers by its fleet listener at <code>GET /fleet/card</code>, not by the daemon.</td>
       </tr>
       <tr>
         <td><code>GET /lab/runs, GET /lab/run/detail, GET /lab/run/events</code></td>

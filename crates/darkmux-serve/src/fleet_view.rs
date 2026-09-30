@@ -159,8 +159,8 @@ pub enum AcceptsState {
     NotListed,
     /// The row is this machine: it does not send work to itself.
     ThisMachine,
-    /// A reader that is neither on this machine nor holding the fleet token
-    /// is not shown what this machine's peers let it do.
+    /// A reader that is not on this machine is not shown what this machine's
+    /// peers let it do: the fleet token does not make a reader this machine.
     Withheld,
     /// No answer: no card came back, the peer could not say, or a state a
     /// newer darkmux states. Never read as granted or as not listed.
@@ -343,17 +343,26 @@ pub struct FleetView {
 }
 
 impl FleetView {
-    /// The view as a reader outside this machine's operator side may see it:
-    /// without what each peer lets this machine run (those entries state what
-    /// each peer trusts this machine with) and without any card's seat block
-    /// (`/health` withholds the same fact from the same readers).
-    pub fn for_outside_reader(mut self) -> Self {
+    /// The view as a reader that holds no token may see it: without any
+    /// card's seat block (`/health` withholds the same fact from the same
+    /// readers).
+    pub fn without_seats(mut self) -> Self {
+        for m in &mut self.machines {
+            if let CardOutcome::Available { card, .. } = &mut m.card {
+                card.seats = None;
+            }
+        }
+        self
+    }
+
+    /// The view as a reader that is not on this machine may see it: without
+    /// what each peer lets this machine run. Those entries state what each
+    /// peer trusts THIS machine with, and the fleet token is shared
+    /// fleet-wide, so holding it does not make a reader this machine.
+    pub fn without_grants(mut self) -> Self {
         for m in &mut self.machines {
             if !m.is_this_machine {
                 m.accepts = AcceptsState::Withheld;
-            }
-            if let CardOutcome::Available { card, .. } = &mut m.card {
-                card.seats = None;
             }
         }
         self
@@ -898,10 +907,11 @@ impl FleetContext {
     }
 }
 
-/// `GET /fleet/view`. What peers let THIS machine do, and every card's seats,
-/// go to a reader on this machine or one holding the fleet token: the
-/// audience of the doctor panel and of every other read of the execution
-/// surface ([`crate::caller_is_local_or_holds_token`]).
+/// `GET /fleet/view`. Every card's seats go to a reader on this machine or one
+/// holding the fleet token: the audience of the doctor panel and of every
+/// other read of the execution surface
+/// ([`crate::caller_is_local_or_holds_token`]). What peers let THIS machine
+/// do goes to a reader on this machine alone ([`crate::is_local_request`]).
 pub(crate) async fn fleet_view_handler(
     axum::extract::State(state): axum::extract::State<crate::AppState>,
     peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
@@ -914,8 +924,9 @@ pub(crate) async fn fleet_view_handler(
         .get(move || gather_view(sources.as_ref(), FLEET_VIEW_CACHE_TTL))
         .await
         .map_err(|_| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "darkmux serve: fleet view gather panicked\n"))?;
-    let insider = crate::caller_is_local_or_holds_token(peer.map(|c| c.0), &headers);
-    Ok(axum::Json(if insider { view } else { view.for_outside_reader() }))
+    let peer = peer.map(|c| c.0);
+    let view = if crate::caller_is_local_or_holds_token(peer, &headers) { view } else { view.without_seats() };
+    Ok(axum::Json(if crate::is_local_request(peer, &headers) { view } else { view.without_grants() }))
 }
 
 #[cfg(test)]
@@ -1313,7 +1324,7 @@ pub(crate) mod tests {
         CardOutcome::Available { card: Box::new(card_of(id)), source: CardSource::Listener }
     }
 
-    /// A reader outside this machine's operator side is shown neither what
+    /// A reader that is neither local nor a token holder is shown neither what
     /// peers let this machine do nor any seat block.
     #[test]
     fn a_view_for_an_outside_reader_withholds_grants_and_seats() {
@@ -1326,7 +1337,7 @@ pub(crate) mod tests {
             other => panic!("{other:?}"),
         };
         assert!(seats(&full, "studio"));
-        let outside = full.for_outside_reader();
+        let outside = full.without_grants().without_seats();
         assert_eq!(row(&outside, "studio").accepts, AcceptsState::Withheld);
         assert!(!seats(&outside, "studio"), "a peer's seats are not for an outside reader");
         let me = outside.machines.iter().find(|m| m.is_this_machine).unwrap();
@@ -1905,11 +1916,12 @@ pub(crate) mod tests {
         assert!(studio(&outsider)["card"]["card"].get("seats").is_none(), "{outsider}");
     }
 
-    /// A reader from another machine that presents the fleet token is on the
-    /// operator side: the same predicate the doctor panel uses.
+    /// The fleet token is shared fleet-wide, so holding it says nothing about
+    /// who a peer trusts with what: a token holder from another machine sees
+    /// the card (seats included) but never the grants.
     #[tokio::test]
     #[serial_test::serial]
-    async fn a_token_holding_reader_from_another_machine_sees_grants() {
+    async fn a_token_holding_reader_from_another_machine_sees_no_grants() {
         let prev = std::env::var("DARKMUX_SERVE_TOKEN").ok();
         unsafe { std::env::set_var("DARKMUX_SERVE_TOKEN", FLEET_TOKEN) };
         let s = scripted(identity("laptop", None, None), vec![entry("studio")]);
@@ -1924,7 +1936,8 @@ pub(crate) mod tests {
             }
         }
         let studio = view["machines"].as_array().unwrap().iter().find(|m| m["entry"]["id"] == "studio").cloned().unwrap();
-        assert_eq!(studio["accepts"]["state"], "granted", "{view}");
+        assert_eq!(studio["accepts"]["state"], "withheld", "{view}");
+        assert!(studio["card"]["card"]["seats"].is_object(), "the token still opens the seats: {view}");
     }
 
     /// What a CLI reads back from a daemon is the same view.

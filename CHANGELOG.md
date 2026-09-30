@@ -1243,8 +1243,10 @@ darkmux release.
     `darkmux_fleet::admit` is `authenticate` then `authorize`.
   - A row carries `accepts` (`granted` with the entry, `not_listed`,
     `this_machine`, `withheld` or `unknown`) beside `card`, no longer inside it.
-    `accepts` and each card's seat block go only to this machine or a token holder
-    (the doctor panel's audience); any other reader gets `withheld` and no seats.
+    `accepts` goes only to a reader on this machine (the fleet token is shared
+    fleet-wide, so it does not open it); any other reader gets `withheld`. Each
+    card's seat block goes to this machine or a token holder (the doctor panel's
+    audience); any other reader gets no seats.
   - A row carries a resolved `machine_uid` and its `uid_source` (`card`,
     `declared` or `flow_history`), `received_at_ms` (this machine's clock) and
     `fetch_ms`. This machine is recognized by the verified node behind an entry's
