@@ -26,7 +26,7 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
   test(`machine lens battery meter: glyph and row height hold in every charge state (${vpName})`, async ({ browser }) => {
     const rows = [];
     for (const state of STATES) {
-      const ctx = await browser.newContext({ viewport, timezoneId: "UTC", locale: "en-US" });
+      const ctx = await browser.newContext({ deviceScaleFactor: process.env.DARKMUX_BATTERY_SHOTS ? 4 : 1, viewport, timezoneId: "UTC", locale: "en-US" });
       const page = await ctx.newPage();
       await installLayoutRoutes(page, { machineSpecs: true });
       const body = { ...RESOURCES, load: { ...RESOURCES.load, now: { ...RESOURCES.load.now, battery: state.battery } } };
@@ -43,6 +43,12 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
       if (process.env.DARKMUX_BATTERY_SHOTS) {
         fs.mkdirSync(process.env.DARKMUX_BATTERY_SHOTS, { recursive: true });
         await page.locator(".battery-block").screenshot({ path: path.join(process.env.DARKMUX_BATTERY_SHOTS, `${state.id}-${vpName}.png`) });
+      }
+      if (state.held && process.env.DARKMUX_BATTERY_SHOTS) {
+        const zoom = page.locator(".battery-bar-row");
+        await zoom.screenshot({ path: path.join(process.env.DARKMUX_BATTERY_SHOTS, `zoom-held-i-${vpName}.png`), scale: "device" });
+        const hint = page.locator(".mm-hint .mm-odo-i");
+        if (await hint.count()) await hint.first().locator("xpath=..").screenshot({ path: path.join(process.env.DARKMUX_BATTERY_SHOTS, `health-i-${vpName}.png`) });
       }
       if (state.held) {
         // Opening the explanation must not move the row either: it floats over the page.

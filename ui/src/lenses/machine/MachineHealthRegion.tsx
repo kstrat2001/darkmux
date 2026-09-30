@@ -1,4 +1,5 @@
 import { useRef } from "react";
+import { InfoGlyph } from "../../components/InfoGlyph";
 import { Shimmer } from "../../components/Placeholder";
 import {
   computeGaugeGeometry,
@@ -918,7 +919,7 @@ export function MachineHealthRegion({
         <div className="mm-hint">
           ↳ {estimateLine}{" "}
           <button type="button" className="mm-odo-i" aria-label="how this was measured" onClick={openAbout}>
-            i
+            <InfoGlyph />
           </button>
         </div>
       )}

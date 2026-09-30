@@ -5095,20 +5095,31 @@ body {
    point 12px outside the glyph resolved to whatever sat behind it. The
    padding never did any touch work; the `::after` below does. */
 .mm-odo-i {
+  box-sizing: border-box;
   display: inline-flex;
+  flex: none;
   align-items: center;
   justify-content: center;
-  width: 14px;
-  height: 14px;
+  align-self: center;
+  width: 16px;
+  height: 16px;
   margin-left: 2px;
   padding: 0;
-  font: 600 calc(9px * var(--fs-scale))/1 var(--font-mono);
   color: var(--dim);
   background: transparent;
   border: 1px solid var(--border);
   border-radius: 50%;
   cursor: pointer;
   vertical-align: middle;
+}
+.mm-odo-i__glyph {
+  width: 10px;
+  height: 10px;
+  display: block;
+}
+.mm-odo-i:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent);
 }
 /* (U1-1) The shared 44px hit-area pattern — the both-axes form `.scrub
    button::after` already uses (a 14px glyph needs the WIDTH extended too,
@@ -8051,6 +8062,10 @@ body {
   color: var(--info);
   text-transform: uppercase;
   letter-spacing: 0.04em;
+}
+.battery-held-info {
+  display: inline-flex;
+  align-items: center;
 }
 .battery-held-tip {
   position: absolute;

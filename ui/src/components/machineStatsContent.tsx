@@ -35,6 +35,7 @@
  * renders its OWN top-level element would force an extra wrapper div into
  * both call sites for no reason.
  */
+import { InfoGlyph } from "./InfoGlyph";
 import { useEffect, useId, useMemo, useState, type ReactNode } from "react";
 import {
   Meter,
@@ -515,7 +516,7 @@ function HeldInfo({ text }: { text: string }) {
           if (e.key === "Escape") setOpen(false);
         }}
       >
-        i
+        <InfoGlyph />
       </button>
       {open && (
         <span id={id} role="tooltip" className="battery-held-tip">
