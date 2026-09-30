@@ -15,6 +15,17 @@ function reducedMotion(): boolean {
   return typeof window !== "undefined" && typeof window.matchMedia === "function" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 }
 
+/** Where `el` sits INSIDE `container`. `offsetLeft`/`offsetTop` are relative to
+ *  the nearest positioned ancestor, which is usually far above the container,
+ *  so the container's own offset is taken out: when something above the
+ *  container changes height (a hero settling, the cards appearing above the
+ *  lanes) every item's offset changes together, and that is not a move of the
+ *  item, so it must not animate. */
+function spotIn(container: HTMLElement, el: HTMLElement): Spot {
+  if (el.offsetParent === container) return { left: el.offsetLeft, top: el.offsetTop };
+  return { left: el.offsetLeft - container.offsetLeft, top: el.offsetTop - container.offsetTop };
+}
+
 /**
  * FLIP (first, last, invert, play) for a list of items that can change order:
  * every element under `containerRef` carrying `data-flip-key` is measured
@@ -23,7 +34,7 @@ function reducedMotion(): boolean {
  * item whose key is new fades in instead of popping. Items are identified by
  * their `data-flip-key` (the machine's stable identity), never by position.
  *
- * Positions are `offsetLeft`/`offsetTop`, which ignore transforms, so an
+ * Positions are `offsetLeft`/`offsetTop` inside the container (`spotIn`), which ignore transforms, so an
  * animation already running does not read as a move and is not cut short by
  * the next render (live samples re-render the fleet lens several times a
  * second). The animation is the Web Animations API's, which removes its own
@@ -41,7 +52,7 @@ export function useFlip(containerRef: RefObject<HTMLElement | null>): void {
     }
     const items = [...container.querySelectorAll<HTMLElement>("[data-flip-key]")];
     const spots = new Map<string, Spot>();
-    for (const el of items) spots.set(el.dataset.flipKey as string, { left: el.offsetLeft, top: el.offsetTop });
+    for (const el of items) spots.set(el.dataset.flipKey as string, spotIn(container, el));
     const width = container.offsetWidth;
     const before = seen.current;
     seen.current = { spots, width };

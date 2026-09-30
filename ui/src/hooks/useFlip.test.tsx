@@ -11,7 +11,7 @@ function Grid({ keys }: { keys: string[] }) {
   const ref = useRef<HTMLDivElement | null>(null);
   useFlip(ref);
   return (
-    <div ref={ref}>
+    <div ref={ref} data-container>
       {keys.map((k) => (
         <div key={k} data-flip-key={k} />
       ))}
@@ -26,8 +26,8 @@ function mockMotion(reduced: boolean) {
 beforeEach(() => {
   places = {};
   animate.mockReset();
-  Object.defineProperty(HTMLElement.prototype, "offsetLeft", { configurable: true, get() { return places[(this as HTMLElement).dataset.flipKey ?? ""]?.[0] ?? 0; } });
-  Object.defineProperty(HTMLElement.prototype, "offsetTop", { configurable: true, get() { return places[(this as HTMLElement).dataset.flipKey ?? ""]?.[1] ?? 0; } });
+  Object.defineProperty(HTMLElement.prototype, "offsetLeft", { configurable: true, get() { const d = (this as HTMLElement).dataset; return places[d.flipKey ?? (d.container !== undefined ? "__c" : "")]?.[0] ?? 0; } });
+  Object.defineProperty(HTMLElement.prototype, "offsetTop", { configurable: true, get() { const d = (this as HTMLElement).dataset; return places[d.flipKey ?? (d.container !== undefined ? "__c" : "")]?.[1] ?? 0; } });
   Object.defineProperty(HTMLElement.prototype, "offsetWidth", { configurable: true, get() { return 1000; } });
   (HTMLElement.prototype as unknown as { animate: unknown }).animate = animate;
   mockMotion(false);
@@ -54,6 +54,15 @@ describe("useFlip", () => {
   it("does not animate an item that did not move", () => {
     places = { a: [0, 0], b: [300, 0] };
     const { rerender } = render(<Grid keys={["a", "b"]} />);
+    rerender(<Grid keys={["a", "b"]} />);
+    expect(animate).not.toHaveBeenCalled();
+  });
+
+  it("does not animate items when the whole container moves under them (something above changed height)", () => {
+    places = { __c: [0, 300], a: [0, 300], b: [300, 300] };
+    const { rerender } = render(<Grid keys={["a", "b"]} />);
+    // The container and both items sit 317 px lower; relative to the container nothing moved.
+    places = { __c: [0, 617], a: [0, 617], b: [300, 617] };
     rerender(<Grid keys={["a", "b"]} />);
     expect(animate).not.toHaveBeenCalled();
   });
