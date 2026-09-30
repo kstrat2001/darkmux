@@ -266,11 +266,15 @@ impl SessionId {
     /// The session within `run` that a kind `tag` and its escaped `fields`
     /// name.
     fn parse_kind(run: RunId, tag: &str, fields: &[&str], bad: &dyn Fn(&str) -> IdError) -> Result<Self, IdError> {
-        let tag = WireKind::parse(tag).ok_or_else(|| bad("unknown session kind"))?;
-        let Some(arity) = tag.arity() else {
-            return Self::parse_relay(run, fields, bad);
-        };
-        if fields.len() != arity {
+        match WireKind::parse(tag).ok_or_else(|| bad("unknown session kind"))? {
+            WireKind::Relay => Self::parse_relay(run, fields, bad),
+            WireKind::Fixed(kind) => Self::parse_fixed(run, kind, fields, bad),
+        }
+    }
+
+    /// A kind with a fixed number of escaped fields.
+    fn parse_fixed(run: RunId, kind: FixedKind, fields: &[&str], bad: &dyn Fn(&str) -> IdError) -> Result<Self, IdError> {
+        if fields.len() != kind.arity() {
             return Err(bad("wrong number of fields"));
         }
         let f: Vec<String> = fields
@@ -278,15 +282,13 @@ impl SessionId {
             .map(|f| unescape(f))
             .collect::<Option<_>>()
             .ok_or_else(|| bad("a field is not escaped as written"))?;
-        let id = match tag {
-            WireKind::Run => SessionId::run(run),
-            WireKind::Phase => SessionId::phase(run, &f[0]),
-            WireKind::Task => SessionId::task(run, &f[0]),
-            WireKind::Step => SessionId::step(run, &f[0]),
-            WireKind::Adhoc => SessionId::adhoc(run, &f[0], &f[1]),
-            WireKind::Relay => unreachable!("a relay is read by parse_relay"),
-        };
-        Ok(id)
+        Ok(match kind {
+            FixedKind::Run => SessionId::run(run),
+            FixedKind::Phase => SessionId::phase(run, &f[0]),
+            FixedKind::Task => SessionId::task(run, &f[0]),
+            FixedKind::Step => SessionId::step(run, &f[0]),
+            FixedKind::Adhoc => SessionId::adhoc(run, &f[0], &f[1]),
+        })
     }
 
     /// A relay's fields: the escaped peer, then the sender's wire string,
@@ -342,35 +344,42 @@ impl SessionId {
 /// by [`SessionId::parse`].
 #[derive(Debug, Clone, Copy)]
 enum WireKind {
+    Fixed(FixedKind),
+    /// A relay's tail is the sender's wire and has no fixed field count.
+    Relay,
+}
+
+/// A kind whose escaped fields have a fixed count.
+#[derive(Debug, Clone, Copy)]
+enum FixedKind {
     Run,
     Phase,
     Task,
     Step,
     Adhoc,
-    Relay,
 }
 
 impl WireKind {
     fn parse(tag: &str) -> Option<Self> {
         match tag {
-            "run" => Some(WireKind::Run),
-            "phase" => Some(WireKind::Phase),
-            "task" => Some(WireKind::Task),
-            "step" => Some(WireKind::Step),
-            "adhoc" => Some(WireKind::Adhoc),
+            "run" => Some(WireKind::Fixed(FixedKind::Run)),
+            "phase" => Some(WireKind::Fixed(FixedKind::Phase)),
+            "task" => Some(WireKind::Fixed(FixedKind::Task)),
+            "step" => Some(WireKind::Fixed(FixedKind::Step)),
+            "adhoc" => Some(WireKind::Fixed(FixedKind::Adhoc)),
             "relay" => Some(WireKind::Relay),
             _ => None,
         }
     }
+}
 
-    /// How many escaped fields follow the tag; `None` for a relay, whose
-    /// tail is the sender's wire and has no fixed count.
-    fn arity(self) -> Option<usize> {
+impl FixedKind {
+    /// How many escaped fields follow the tag.
+    fn arity(self) -> usize {
         match self {
-            WireKind::Run => Some(0),
-            WireKind::Phase | WireKind::Task | WireKind::Step => Some(1),
-            WireKind::Adhoc => Some(2),
-            WireKind::Relay => None,
+            FixedKind::Run => 0,
+            FixedKind::Phase | FixedKind::Task | FixedKind::Step => 1,
+            FixedKind::Adhoc => 2,
         }
     }
 }
