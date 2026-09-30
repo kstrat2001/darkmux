@@ -3250,4 +3250,51 @@ describe("FleetLens — card order is stable", () => {
     });
     expect(cardNames()).toEqual(before);
   });
+
+  const fleetOrder = () => document.querySelector(".fleet")?.getAttribute("data-order");
+
+  it("with the view pending the cards are not laid out yet, and the order is final when it lands", async () => {
+    const view = gate();
+    mockFleetFetch({ flowToday: flowRecords(), specs: selfSpecs, hold: { "/fleet/view": view.promise } });
+    renderFleetLens();
+    await waitFor(() => expect(cardNames()).toHaveLength(2));
+    expect(fleetOrder()).toBe("pending");
+    await act(async () => {
+      view.open();
+    });
+    await waitFor(() => expect(cardNames()).toHaveLength(3));
+    expect(fleetOrder()).toBe("final");
+    expect(cardNames()[0]).toBe("Mac-Self");
+  });
+
+  it("a view slower than the bounded wait no longer holds the cards back", async () => {
+    const view = gate();
+    mockFleetFetch({ flowToday: flowRecords(), specs: selfSpecs, hold: { "/fleet/view": view.promise } });
+    renderFleetLens();
+    await waitFor(() => expect(cardNames()).toHaveLength(2));
+    expect(fleetOrder()).toBe("pending");
+    await waitFor(() => expect(fleetOrder()).toBe("final"), { timeout: 2000 });
+    view.open();
+  });
+
+  it("this machine is first from the first paint when the shell's specs already name it", async () => {
+    const view = gate();
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    queryClient.setQueryData(queryKeys.machineSpecs(), { ok: true, data: { ...selfSpecs, os: "macos" } });
+    // Flow holds this machine too, listed last: the order must not wait for the view.
+    mockFleetFetch({ flowToday: [...flowRecords(), { ts: `${todayUTC()}T10:00:02.000Z`, machine_uid: "UUID-M", machine_id: "Mac-Self", session_id: "s3", action: "dispatch.start", handle: "coder" }], hold: { "/fleet/view": view.promise } });
+    renderFleetLens({}, queryClient);
+    await waitFor(() => expect(cardNames()).toHaveLength(3));
+    expect(fleetOrder()).toBe("final");
+    expect(cardNames()[0]).toBe("Mac-Self");
+    view.open();
+  });
+
+  it("every card and lane carries its machine as the motion key", async () => {
+    mockFleetFetch({ flowToday: flowRecords(), specs: selfSpecs });
+    renderFleetLens();
+    await waitFor(() => expect(cardNames()).toHaveLength(3));
+    expect([...document.querySelectorAll(".mach")].every((c) => c.hasAttribute("data-flip-key"))).toBe(true);
+    expect(document.querySelectorAll(".lane[data-flip-key]").length).toBeGreaterThan(0);
+  });
 });
