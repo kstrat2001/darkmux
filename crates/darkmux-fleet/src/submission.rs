@@ -851,12 +851,27 @@ fn unreadable_line(where_: &str, line: &str, not_a_listener: &dyn Fn(&str) -> an
     }
 }
 
+/// Whether a transport failure means the peer's listener never accepted the
+/// connection (off, or its daemon is down): the ONE classifier for that case,
+/// used by the submission error below and by `/fleet/view`'s `listener_off`.
+pub fn is_listener_off(t: &ureq::Transport) -> bool {
+    t.kind() == ureq::ErrorKind::ConnectionFailed
+}
+
+/// The one sentence for [`is_listener_off`], naming where it was dialed.
+pub fn listener_off_sentence(where_: &str) -> String {
+    format!("the fleet listener at {where_} is not accepting connections (off, or the daemon is down); nothing was sent")
+}
+
 /// A transport failure: nothing was sent when the connection never opened;
 /// otherwise the answer was lost and the job may be running ([`AnswerLost`]).
 fn transport_failure(where_: &str, t: &ureq::Transport) -> anyhow::Error {
     use ureq::ErrorKind;
+    if is_listener_off(t) {
+        return anyhow!("{}", listener_off_sentence(where_));
+    }
     match t.kind() {
-        ErrorKind::Dns | ErrorKind::ConnectionFailed | ErrorKind::InvalidUrl | ErrorKind::UnknownScheme => {
+        ErrorKind::Dns | ErrorKind::InvalidUrl | ErrorKind::UnknownScheme => {
             anyhow!("no answer from {where_}: {t}; nothing was sent")
         }
         _ => AnswerLost { detail: format!("no answer from {where_}: {t}") }.into(),

@@ -872,6 +872,9 @@ mod tests {
         opts.profile_name = Some("host@peer-b".to_string());
         let msg = format!("{:#}", dispatch_routed_via(opts, |_| panic!("never local")).unwrap_err());
         assert!(msg.contains("nothing was sent") && !msg.contains("may still be running"), "{msg}");
+        // The refused connection names the listener, not a raw errno.
+        assert!(msg.contains("fleet listener") && msg.contains("not accepting connections"), "{msg}");
+        assert!(!msg.contains("os error"), "{msg}");
     }
 
     /// (#2916 stage 2) Queued without `--wait`: the answer is the
