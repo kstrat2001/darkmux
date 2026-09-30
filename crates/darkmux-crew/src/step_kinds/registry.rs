@@ -162,6 +162,7 @@ mod tests {
             Ok(StepOutcome {
                 output: "stub".to_string(),
                 flow_records: Vec::new(),
+                degraded: None,
             })
         }
     }

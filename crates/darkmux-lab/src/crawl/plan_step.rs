@@ -167,6 +167,7 @@ impl StepKind for CrawlPlanStepKind {
         Ok(StepOutcome {
             output: darkmux_crew::step_output::ref_output_string(&out_path),
             flow_records: Vec::new(),
+            degraded: None,
         })
     }
 }

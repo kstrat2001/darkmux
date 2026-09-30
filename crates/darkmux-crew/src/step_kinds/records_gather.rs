@@ -290,7 +290,7 @@ impl StepKind for RecordsGatherStepKind {
             out,
             crate::step_output::Producer::of(&mission_id, &task.id, &step.id),
         );
-        Ok(StepOutcome { output: wrapped.to_output_string()?, flow_records: Vec::new() })
+        Ok(StepOutcome { output: wrapped.to_output_string()?, flow_records: Vec::new(), degraded: None })
     }
 }
 

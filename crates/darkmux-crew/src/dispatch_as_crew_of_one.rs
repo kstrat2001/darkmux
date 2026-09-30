@@ -757,7 +757,7 @@ mod tests {
                 out_dir: None,
             };
             let output = serde_json::to_string(&payload).unwrap();
-            Ok(StepOutcome { output, flow_records: Vec::new() })
+            Ok(StepOutcome { output, flow_records: Vec::new(), degraded: None })
         }
 
         /// (#2394) A LOCAL model seat, said explicitly — this fixture

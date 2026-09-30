@@ -1373,6 +1373,9 @@ pub fn launch(
     // every independent task concurrently exactly as before.
     let mut graph_result: Result<crew::scheduler::SchedulerReport> =
         Ok(crew::scheduler::SchedulerReport::default());
+    // Steps that completed with part of their own work failed, across every
+    // phase's scheduler pass: the run's verdict must not read Clean over them.
+    let mut degraded_steps: Vec<crew::scheduler::DegradedStep> = Vec::new();
     for phase in &config.phases {
         let Some(real_phase_id) = real_phase_ids.get(&phase.id).cloned() else {
             continue;
@@ -1626,6 +1629,9 @@ pub fn launch(
         None,
         &seed_artifacts,
         );
+        if let Ok(report) = &graph_result {
+            degraded_steps.extend(report.degraded.iter().cloned());
+        }
         if graph_result.is_err() {
             break;
         }
@@ -1789,7 +1795,7 @@ pub fn launch(
     // Gate-less generic graph (Tier-1-only kinds) — the standard
     // MissionEnvelope finalization applies: every run reaches a terminal
     // phase/mission status (Packet 2's own doctrine for gate-free work).
-    let mut envelope = build_envelope(&mission_id, config, &real_phase_ids, &tasks, &steps);
+    let mut envelope = build_envelope(&mission_id, config, &real_phase_ids, &tasks, &steps, &degraded_steps);
     // (#2678) Stamp the run's own wall-clock before finalization, so the
     // number that decides whether a CI job's `timeout-minutes` needs raising
     // rides the run's artifact instead of being inferred from workflow logs
@@ -4212,12 +4218,13 @@ fn build_envelope(
     real_phase_ids: &BTreeMap<String, String>,
     tasks: &[crew::types::Task],
     steps: &BTreeMap<String, crew::types::Step>,
+    degraded: &[crew::scheduler::DegradedStep],
 ) -> crew::envelope::MissionEnvelope {
     use crew::envelope::{MissionEnvelope, MissionOutcomeStatus};
 
     let (completed, errored, never_ran) = partition_step_outcomes(steps);
 
-    let status = if errored.is_empty() && never_ran.is_empty() {
+    let status = if errored.is_empty() && never_ran.is_empty() && degraded.is_empty() {
         MissionOutcomeStatus::Clean
     } else if completed.is_empty() && !errored.is_empty() {
         // Nothing completed AND something failed — the run is an Error,
@@ -4257,9 +4264,10 @@ fn build_envelope(
     // old guard also required a completed step, so a run that errored
     // everything carried no warning at all. (F2) Only the non-zero halves
     // are named; see `launch_outcome_warning`.
-    if let Some(warning) = launch_outcome_warning(errored.len(), never_ran.len(), steps.len()) {
-        envelope.warnings = vec![warning];
-    }
+    envelope.warnings.extend(launch_outcome_warning(errored.len(), never_ran.len(), steps.len()));
+    // A degraded step is `Complete`, so the counts above never see it; each
+    // names its own reason, so the envelope says which step lost what.
+    envelope.warnings.extend(degraded.iter().map(|d| format!("step `{}` completed degraded: {}", d.step_id, d.reason)));
     envelope.payload = serde_json::json!({
         "completed_steps": completed,
         "errored_steps": errored,
@@ -8078,7 +8086,7 @@ mod tests {
         steps.insert("p2-step".to_string(), scripted_step("p2-step", NodeStatus::Error));
         steps.insert("p3-step".to_string(), scripted_step("p3-step", NodeStatus::Planned));
 
-        let env = build_envelope(mid, &config, &real, &tasks, &steps);
+        let env = build_envelope(mid, &config, &real, &tasks, &steps, &[]);
         use crew::envelope::{MissionOutcomeStatus, PhaseOutcomeKind};
         assert_eq!(env.status, MissionOutcomeStatus::Degraded, "some complete + some errored → Degraded");
         // (#1877 item 4 — deferred, pinned) The generic scheduler graph
@@ -8110,11 +8118,41 @@ mod tests {
         for sid in ["p1-step", "p2-step", "p3-step"] {
             steps.insert(sid.to_string(), scripted_step(sid, NodeStatus::Complete));
         }
-        let env = build_envelope(mid, &config, &real, &tasks, &steps);
+        let env = build_envelope(mid, &config, &real, &tasks, &steps, &[]);
         use crew::envelope::{MissionOutcomeStatus, PhaseOutcomeKind};
         assert_eq!(env.status, MissionOutcomeStatus::Clean);
         assert_eq!(env.phases.len(), 3);
         assert!(env.phases.iter().all(|p| p.outcome == PhaseOutcomeKind::Complete), "every phase completes on a clean run");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn build_envelope_reads_degraded_when_a_completed_step_reports_partial_failure() {
+        // A `dispatch.map` where some items failed completes (downstream reads
+        // its output) but is not a Clean run: every step Complete plus one
+        // degraded reason is Degraded, with the reason in the warnings.
+        let config: MissionConfig = serde_json::from_str(GEN3_CONFIG).unwrap();
+        let mid = "gen3degraded";
+        let real = derive_phase_ids(mid, &config);
+        let (rp1, rp2, rp3) = (real["p1"].clone(), real["p2"].clone(), real["p3"].clone());
+        let tasks =
+            vec![task_with_step(&rp1, "p1-step"), task_with_step(&rp2, "p2-step"), task_with_step(&rp3, "p3-step")];
+        let mut steps = BTreeMap::new();
+        for sid in ["p1-step", "p2-step", "p3-step"] {
+            steps.insert(sid.to_string(), scripted_step(sid, NodeStatus::Complete));
+        }
+        let degraded = [crew::scheduler::DegradedStep {
+            step_id: "p2-step".to_string(),
+            reason: "dispatch.map step `p2-step`: 1 of 3 item(s) failed".to_string(),
+        }];
+        let env = build_envelope(mid, &config, &real, &tasks, &steps, &degraded);
+        use crew::envelope::MissionOutcomeStatus;
+        assert_eq!(env.status, MissionOutcomeStatus::Degraded);
+        assert_eq!(env.warnings, vec!["step `p2-step` completed degraded: dispatch.map step `p2-step`: 1 of 3 item(s) failed"]);
+
+        let clean = build_envelope(mid, &config, &real, &tasks, &steps, &[]);
+        assert_eq!(clean.status, MissionOutcomeStatus::Clean, "the same steps with no degraded report stay Clean");
+        assert!(clean.warnings.is_empty());
     }
 
     #[test]
@@ -8446,7 +8484,7 @@ mod tests {
         let mut steps = BTreeMap::new();
         steps.insert("p1-s1".to_string(), scripted_step("p1-s1", NodeStatus::Complete));
 
-        let env = build_envelope(mid, &config, &real, &tasks, &steps);
+        let env = build_envelope(mid, &config, &real, &tasks, &steps, &[]);
         use crew::envelope::MissionOutcomeStatus;
         assert_eq!(env.status, MissionOutcomeStatus::Clean, "the one executed step completed → Clean");
         assert!(env.phases.iter().any(|p| p.phase_id == rp1), "executed phase p1 is finalized");
@@ -8525,7 +8563,7 @@ mod tests {
         steps.insert("p2-step".to_string(), scripted_step("p2-step", NodeStatus::Error));
         steps.insert("p3-step".to_string(), scripted_step("p3-step", NodeStatus::Planned));
 
-        let env = build_envelope(mid, &config, &real, &tasks, &steps);
+        let env = build_envelope(mid, &config, &real, &tasks, &steps, &[]);
         crew::envelope::finalize_mission(&env);
 
         assert_eq!(phase_status_on_disk(mid, &rp1), PhaseStatus::Complete);

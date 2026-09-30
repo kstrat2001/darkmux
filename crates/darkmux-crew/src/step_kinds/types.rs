@@ -339,6 +339,9 @@ pub enum WaveSignal {
         wall_ms: u64,
         result: std::result::Result<String, String>,
         flow_records: Vec<FlowRecord>,
+        /// The step's [`StepOutcome::degraded`] reason (always `None` on an
+        /// `Err` result).
+        degraded: Option<String>,
     },
 }
 
@@ -453,6 +456,13 @@ impl StepRunCtx {
 pub struct StepOutcome {
     pub output: String,
     pub flow_records: Vec<FlowRecord>,
+    /// `Some(reason)` when the step ran to completion but part of its own work
+    /// failed (a `dispatch.map` where some, not all, items errored). The step
+    /// is still `Complete`, since downstream steps read its output, but the
+    /// scheduler records it in [`crate::scheduler::SchedulerReport::degraded`]
+    /// so a run's verdict cannot read Clean over it. `None` for a step whose
+    /// work fully succeeded.
+    pub degraded: Option<String>,
 }
 
 /// (#2394) What ONE step consumes — the exhaustive classification
