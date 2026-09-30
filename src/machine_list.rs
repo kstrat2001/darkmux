@@ -18,7 +18,7 @@ use darkmux_serve::fleet_view::{
     AcceptsState, CardOutcome, FleetMachine, FleetView, GatheredBy, Liveness, UnavailableWhy, UnreachableReason,
     VersionSource,
 };
-use darkmux_serve::machine_card::{CardBusyPolicy, CardEndpointKind, CardSeats, MachineCard};
+use darkmux_serve::machine_card::{CardBusyPolicy, CardEndpointKind, CardProfile, CardSeats, MachineCard};
 use darkmux_types::style;
 
 /// A peer's strings are cut to their column so padding cannot push text into
@@ -129,17 +129,40 @@ fn cells(m: &FleetMachine) -> [String; 4] {
     }
 }
 
-/// What a peer lets this machine do, in a line's words.
-fn accepts_phrase(accepts: &AcceptsState) -> Option<String> {
+/// Who is reading a line. The CLI's reader is on the machine that ran the
+/// verb, so "this machine" is exact. Radio's grounding goes to a model that
+/// may run on ANOTHER machine, where "this machine" would name the wrong one:
+/// it says "the user's machine" (where the question was asked) instead, and
+/// says which model each profile runs, because a small model reads a profile
+/// name as a loaded model.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Voice {
+    Cli,
+    Grounding,
+}
+
+impl Voice {
+    /// The machine the request comes from, in this reader's words.
+    fn requester(self) -> &'static str {
+        match self {
+            Voice::Cli => "this machine",
+            Voice::Grounding => "the user's machine",
+        }
+    }
+}
+
+/// What a peer lets the requesting machine do, in a line's words.
+fn accepts_phrase(accepts: &AcceptsState, voice: Voice) -> Option<String> {
+    let who = voice.requester();
     Some(match accepts {
         AcceptsState::Granted { accepts } => format!(
-            "accepts from this machine: profiles {}; roles {}",
+            "accepts from {who}: profiles {}; roles {}",
             list_or_none(&accepts.profiles),
             list_or_none(&accepts.roles)
         ),
-        AcceptsState::NotListed => "does not list this machine: it takes no work from it".to_string(),
+        AcceptsState::NotListed => format!("does not list {who}: it takes no work from it"),
         AcceptsState::ThisMachine | AcceptsState::Withheld => return None,
-        AcceptsState::Unknown => "accepts from this machine: unknown".to_string(),
+        AcceptsState::Unknown => format!("accepts from {who}: unknown"),
     })
 }
 
@@ -151,7 +174,7 @@ fn list_or_none(items: &[String]) -> String {
     }
 }
 
-fn profiles_line(card: &MachineCard) -> String {
+fn profiles_line(card: &MachineCard, voice: Voice) -> String {
     let profiles = &card.profiles;
     if let Some(why) = &card.profiles_error {
         return format!("profiles: unreadable ({why})");
@@ -159,8 +182,19 @@ fn profiles_line(card: &MachineCard) -> String {
     if profiles.is_empty() {
         return "profiles: none".to_string();
     }
-    let each: Vec<String> = profiles.iter().map(|p| format!("{} ({})", p.name, kind_word(p.endpoint_kind))).collect();
+    let each: Vec<String> = profiles.iter().map(|p| profile_phrase(p, voice)).collect();
     format!("profiles: {}", each.join(", "))
+}
+
+/// One profile: `name (kind)`, and in the grounding voice `name (kind: model,
+/// model)` so the model ids the profile runs sit beside its name.
+fn profile_phrase(p: &CardProfile, voice: Voice) -> String {
+    let kind = kind_word(p.endpoint_kind);
+    if voice == Voice::Cli || p.models.is_empty() {
+        return format!("{} ({kind})", p.name);
+    }
+    let ids: Vec<String> = p.models.iter().map(|m| m.id.clone()).collect();
+    format!("{} ({kind}: {})", p.name, capped_list(&ids))
 }
 
 /// The seat line. It states what jobs from OTHER machines hold, and says so:
@@ -184,7 +218,7 @@ fn seats_line(seats: &CardSeats) -> String {
 /// thermal, and what it lets this machine do.
 fn detail_lines(card: &MachineCard, accepts: &AcceptsState) -> Vec<String> {
     let mut lines = vec![detail_line(card)];
-    if let Some(phrase) = accepts_phrase(accepts) {
+    if let Some(phrase) = accepts_phrase(accepts, Voice::Cli) {
         lines.push(format!("  {phrase}"));
     }
     lines
@@ -192,7 +226,7 @@ fn detail_lines(card: &MachineCard, accepts: &AcceptsState) -> Vec<String> {
 
 /// The first dim line: profiles, seats, thermal.
 fn detail_line(card: &MachineCard) -> String {
-    let mut parts = vec![profiles_line(card)];
+    let mut parts = vec![profiles_line(card, Voice::Cli)];
     if let Some(seats) = &card.seats {
         parts.push(seats_line(seats));
     }
@@ -326,14 +360,14 @@ fn card_words(outcome: &CardOutcome) -> String {
 /// can act on.
 fn grounding_lines(view: &FleetView, m: &FleetMachine) -> Vec<String> {
     let name = row_name(view, m);
-    let here = if m.is_this_machine { " (this machine)" } else { "" };
+    let here = if m.is_this_machine { " (the user's machine, where the question was asked)" } else { "" };
     let mut lines = vec![format!("- {name}{here}: liveness {}; {}", liveness_words(m.liveness), card_words(&m.card))];
     if let CardOutcome::Available { card, .. } = &m.card {
         let loaded: Vec<String> = card.specs.loaded_models.iter().map(|x| x.identifier.clone()).collect();
         lines.push(format!("  loaded models: {}", capped_list(&loaded)));
-        lines.push(format!("  {}", profiles_line(card)));
+        lines.push(format!("  {}", profiles_line(card, Voice::Grounding)));
     }
-    if let Some(phrase) = accepts_phrase(&m.accepts) {
+    if let Some(phrase) = accepts_phrase(&m.accepts, Voice::Grounding) {
         lines.push(format!("  {phrase}"));
     }
     lines
@@ -348,8 +382,10 @@ pub(crate) fn render_grounding(view: &FleetView) -> String {
          from the card that machine states about itself. \"liveness\" is whether the machine sent a recent \
          presence beat (\"no beat seen\" is not proof it is down). A profile is a named model setup; \
          \"managed\" means the machine loads and serves the model itself, \"unmanaged\" means it only sends \
-         requests to a hosted endpoint. \"accepts from this machine\" is what that machine lets the user's \
-         work started here run on it.\n",
+         requests to a hosted endpoint; the model ids after the colon are the models that profile runs. A profile is not a \
+         loaded model: \"loaded models\" is what a machine has loaded right now. \"the user's machine\" is the \
+         machine where the user asked the question; \"accepts from the user's machine\" is what that machine lets \
+         the user's work started there run on it.\n",
     );
     for m in &view.machines {
         for line in grounding_lines(view, m) {
@@ -529,14 +565,18 @@ mod tests {
         for want in [
             "- studio: liveness live; card read",
             "loaded models: darkmux:qwen",
-            "profiles: deep (managed), cloud (unmanaged)",
-            "accepts from this machine: profiles deep; roles diff-review",
+            "profiles: deep (managed: qwen), cloud (unmanaged: gpt)",
+            "accepts from the user's machine: profiles deep; roles diff-review",
             "- mini: liveness unknown; unreachable: its fleet listener did not answer",
-            "(this machine)",
+            "(the user's machine, where the question was asked)",
             "\"managed\" means the machine loads and serves the model itself",
+            "A profile is not a loaded model",
         ] {
             assert!(out.contains(want), "{want} missing:\n{out}");
         }
+        // The answering model may run on another machine: "this machine" is
+        // ambiguous there, so the grounding never uses it.
+        assert!(!out.contains("this machine"), "ambiguous wording in the grounding:\n{out}");
         for banned in ["ABCDEF000001", "example.invalid", "100.64.0.9", "8765", "token", "Bearer"] {
             assert!(!out.contains(banned), "{banned} leaked:\n{out}");
         }
@@ -550,6 +590,7 @@ mod tests {
             assert!(row.contains(want), "{want} missing: {row}");
         }
         assert!(out.contains("profiles: deep (managed), cloud (unmanaged)"), "{out}");
+        assert!(!out.contains("managed: qwen"), "the text table keeps its profile line: {out}");
         assert!(out.contains("hosted 1/3") && out.contains("busy policy queue") && out.contains("thermal: nominal"), "{out}");
     }
 
