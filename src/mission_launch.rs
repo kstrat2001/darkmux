@@ -1629,9 +1629,7 @@ pub fn launch(
         None,
         &seed_artifacts,
         );
-        if let Ok(report) = &graph_result {
-            degraded_steps.extend(report.degraded.iter().cloned());
-        }
+        collect_degraded(&graph_result, &mut degraded_steps);
         if graph_result.is_err() {
             break;
         }
@@ -4209,6 +4207,16 @@ fn launch_outcome_warning(errored: usize, never_ran: usize, total: usize) -> Opt
         (e, n) => Some(format!(
             "{e} of {total} step(s) errored and {n} never ran (abandoned) during launch execution"
         )),
+    }
+}
+
+/// Append the steps a scheduler pass reported as completed-but-degraded.
+fn collect_degraded(
+    result: &Result<crew::scheduler::SchedulerReport>,
+    into: &mut Vec<crew::scheduler::DegradedStep>,
+) {
+    if let Ok(report) = result {
+        into.extend(report.degraded.iter().cloned());
     }
 }
 
