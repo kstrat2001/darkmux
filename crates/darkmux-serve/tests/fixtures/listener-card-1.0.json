@@ -84,6 +84,14 @@
         "refusing_start": false
       }
     },
+    "fleet_mode": "hub",
+    "hosts_fleet_redis": true,
+    "fleet_defaults": {
+      "version": 1,
+      "radio": {
+        "answerer_profile": "deep@studio"
+      }
+    },
     "generated_at_ms": 2000,
     "gather_ms": 3,
     "cache_ttl_ms": 2000

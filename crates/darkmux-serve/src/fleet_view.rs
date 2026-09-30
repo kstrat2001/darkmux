@@ -40,6 +40,7 @@
 //! falls to for a value a newer darkmux invented. `Unknown` is never read as
 //! any known value.
 
+use darkmux_types::config::DeclaredFleetMode;
 use crate::machine_card::{gather_local_card, CardAccepts, CardGrant, ListenerCard, MachineCard, CARD_SCHEMA_VERSION};
 use crate::source_state::SourceState;
 use crate::wire::RosterMachineEntry;
@@ -392,6 +393,42 @@ impl FleetView {
             }
         }
         self
+    }
+}
+
+impl FleetMachine {
+    /// The fleet position this machine's own card declares; `None` when no
+    /// card of it was read (a machine that did not answer states nothing).
+    pub fn declared_mode(&self) -> Option<DeclaredFleetMode> {
+        match &self.card {
+            CardOutcome::Available { card, .. } => Some(card.fleet_mode),
+            _ => None,
+        }
+    }
+}
+
+/// Which machines of a view declare `hub`. The one place that counts them:
+/// the viewer's HUB badge, `darkmux doctor` and the fleet-defaults
+/// resolution all read the hub from here, so they cannot disagree.
+#[derive(Debug)]
+pub enum DeclaredHubs<'a> {
+    /// No machine whose card was read declares `hub`.
+    None,
+    One(&'a FleetMachine),
+    /// More than one declares it: none of them is taken as the hub.
+    Several(Vec<&'a FleetMachine>),
+}
+
+impl FleetView {
+    /// The machines whose cards declare `hub`.
+    pub fn declared_hubs(&self) -> DeclaredHubs<'_> {
+        let mut hubs: Vec<&FleetMachine> =
+            self.machines.iter().filter(|m| m.declared_mode() == Some(DeclaredFleetMode::Hub)).collect();
+        match hubs.len() {
+            0 => DeclaredHubs::None,
+            1 => DeclaredHubs::One(hubs.remove(0)),
+            _ => DeclaredHubs::Several(hubs),
+        }
     }
 }
 
@@ -1031,6 +1068,7 @@ pub(crate) mod tests {
             beat_ts_ms: 1234,
             specs: None,
             darkmux_version: version.map(str::to_string),
+            fleet_mode: None,
         }
     }
 
@@ -1343,6 +1381,54 @@ pub(crate) mod tests {
         let s = Scripted::default();
         assert_eq!(gather_view(&s, FLEET_VIEW_CACHE_TTL).cache_ttl_ms, 5000);
         assert_eq!(gather_view(&s, Duration::ZERO).cache_ttl_ms, 0);
+    }
+
+    // ── the declared hub (#3022) ────────────────────────────────────────
+
+    fn declaring(id: &str, mode: DeclaredFleetMode) -> CardOutcome {
+        let mut card = card_of(id);
+        card.fleet_mode = mode;
+        CardOutcome::Available { card: Box::new(card), source: CardSource::Listener }
+    }
+
+    /// The view names the hub from the cards alone: one declaring machine is
+    /// the hub; none, or several, is not, and a machine whose card was not
+    /// read declares nothing.
+    #[test]
+    fn the_view_names_a_hub_only_when_exactly_one_card_declares_it() {
+        let view_of = |modes: &[(&str, Option<DeclaredFleetMode>)]| {
+            let s = scripted(identity("laptop", None, None), modes.iter().map(|(id, _)| entry(id)).collect());
+            for (id, mode) in modes {
+                let outcome = match mode {
+                    Some(m) => declaring(id, *m),
+                    None => old("4.0.0"),
+                };
+                peer_says(&s, id, 0, outcome, AcceptsState::Unknown);
+            }
+            let mut view = gather_view(&s, FLEET_VIEW_CACHE_TTL);
+            // This machine's own row is not under test: make it a peer.
+            if let CardOutcome::Available { card, .. } = &mut view.machines[0].card {
+                card.fleet_mode = DeclaredFleetMode::Peer;
+            }
+            view
+        };
+        let name = |m: &FleetMachine| m.entry.as_ref().unwrap().id.clone();
+        match view_of(&[("studio", Some(DeclaredFleetMode::Hub)), ("mini", Some(DeclaredFleetMode::Peer))]).declared_hubs() {
+            DeclaredHubs::One(m) => assert_eq!(name(m), "studio"),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            view_of(&[("studio", Some(DeclaredFleetMode::Peer)), ("mini", None)]).declared_hubs(),
+            DeclaredHubs::None
+        ));
+        assert!(matches!(
+            view_of(&[("studio", None), ("mini", Some(DeclaredFleetMode::Unknown))]).declared_hubs(),
+            DeclaredHubs::None
+        ), "an unread card and an unknown mode are not hubs");
+        match view_of(&[("studio", Some(DeclaredFleetMode::Hub)), ("mini", Some(DeclaredFleetMode::Hub))]).declared_hubs() {
+            DeclaredHubs::Several(hubs) => assert_eq!(hubs.len(), 2),
+            other => panic!("two hubs are not one: {other:?}"),
+        }
     }
 
     // ── who sees what ───────────────────────────────────────────────────
