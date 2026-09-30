@@ -430,6 +430,11 @@ fn ignored_project_status(state: Option<darkmux_types::paths::IgnoredProjectStat
     }
 }
 
+const MISSION_STATE_CHECK_NAME: &str = "mission state files";
+const CREW_LAYOUT_CHECK_NAME: &str = "beat-33 crew/ layout";
+const LAB_DIR_CHECK_NAME: &str = "lab runs location";
+const RETIRED_ENV_CHECK_NAME: &str = "retired env vars (4.0)";
+
 /// (4.0) Mission state 4.0 no longer reads, so a leftover is state the
 /// operator would otherwise lose silently. Fail, naming every file. Two
 /// kinds: pre-#148 flat files (`<root>/missions/<id>.json`,
@@ -440,37 +445,29 @@ fn ignored_project_status(state: Option<darkmux_types::paths::IgnoredProjectStat
 /// logic here.
 fn check_mission_state_files() -> Check {
     let root = darkmux_crew::loader::user_state_root();
-    let mut flat: Vec<String> = Vec::new();
-    for sub in ["missions", "phases"] {
-        let Ok(entries) = std::fs::read_dir(root.join(sub)) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_file() && path.extension().is_some_and(|e| e == "json") {
-                flat.push(path.display().to_string());
-            }
-        }
-    }
-    flat.sort();
+    let flat: Vec<String> = ["missions", "phases"]
+        .iter()
+        .flat_map(|sub| darkmux_crew::retired_state::json_files(&root.join(sub)))
+        .map(|f| f.display().to_string())
+        .collect();
     let retired = darkmux_crew::retired_state::scan(&darkmux_crew::loader::missions_dir());
     if flat.is_empty() && retired.is_empty() {
         return Check {
-            name: "mission state files".into(),
+            name: MISSION_STATE_CHECK_NAME.into(),
             status: Status::Pass,
             message: "no flat or retired-spelling mission files".into(),
             hint: None,
         };
     }
     let mut messages = Vec::new();
-    let mut hints = Vec::new();
+    let mut hints: Vec<String> = Vec::new();
     if !flat.is_empty() {
         messages.push(format!(
             "{} pre-#148 flat mission file(s) that 4.0 no longer reads: {}",
             flat.len(),
             flat.join(", ")
         ));
-        hints.push("run `darkmux mission migrate --apply` on 3.x before upgrading, or delete the flat files");
+        hints.push(flat_mission_remedy(&root, &flat));
     }
     if !retired.is_empty() {
         let each: Vec<String> = retired.iter().map(|p| format!("{}: {}", p.path.display(), p.fix)).collect();
@@ -479,14 +476,28 @@ fn check_mission_state_files() -> Check {
             retired.len(),
             each.join(" | ")
         ));
-        hints.push("apply the one-line fix named for each file; darkmux refuses a file until it does");
+        hints.push("apply the one-line fix named for each file; darkmux refuses a file until it does".to_string());
     }
     Check {
-        name: "mission state files".into(),
+        name: MISSION_STATE_CHECK_NAME.into(),
         status: Status::Fail,
         message: messages.join("; "),
         hint: Some(hints.join("; ")),
     }
+}
+
+/// The remedy for pre-#148 flat mission files: move them into the archive the
+/// crew merge script also uses (kept, never overwritten). The command line is
+/// explicit paths, so it runs the same in bash and zsh.
+fn flat_mission_remedy(root: &std::path::Path, flat: &[String]) -> String {
+    let archive = pre_148_archive_dir(root).display().to_string();
+    let files: Vec<String> = flat.iter().map(|f| format!("\"{f}\"")).collect();
+    format!(
+        "4.0 cannot migrate these, so keep them in the archive: run the command below \
+         (`mv -n` never overwrites), or delete the files if you do not need them\n\n\
+         mkdir -p \"{archive}\" && mv -n {} \"{archive}/\"",
+        files.join(" ")
+    )
 }
 
 /// (4.0) Lab runs used to live in `<root>/runs`; contract 8 makes "run" the
@@ -500,7 +511,7 @@ fn check_lab_dir_location() -> Check {
 
 fn lab_dir_location_check(state: &darkmux_types::config_access::LabDirState) -> Check {
     use darkmux_types::config_access::LabDirState;
-    let name = "lab runs location".to_string();
+    let name = LAB_DIR_CHECK_NAME.to_string();
     let (status, message) = match state {
         LabDirState::Current => {
             return Check {
@@ -547,7 +558,7 @@ fn check_beat33_legacy_crew_dir() -> Check {
     let legacy_dir = root.join("crew");
     if !legacy_dir.is_dir() {
         return Check {
-            name: "beat-33 crew/ layout".into(),
+            name: CREW_LAYOUT_CHECK_NAME.into(),
             status: Status::Pass,
             message: "user state already on the flattened layout".into(),
             hint: None,
@@ -571,6 +582,9 @@ fn check_beat33_legacy_crew_dir() -> Check {
     if legacy_dir.join(preamble_file).is_file() {
         present_subdirs.push(preamble_file);
     }
+    if legacy_dir.join(PRE_148_SPRINTS_DIR).is_dir() {
+        present_subdirs.push(PRE_148_SPRINTS_DIR);
+    }
     let pins_present = legacy_dir.join(pins_file).is_file();
     present_subdirs.sort();
     let pins_note = format!(
@@ -580,7 +594,7 @@ fn check_beat33_legacy_crew_dir() -> Check {
 
     if present_subdirs.is_empty() && pins_present {
         return Check {
-            name: "beat-33 crew/ layout".into(),
+            name: CREW_LAYOUT_CHECK_NAME.into(),
             status: Status::Warn,
             message: format!("{}/{pins_file} is a retired file darkmux never reads", legacy_dir.display()),
             hint: Some(pins_note),
@@ -591,7 +605,7 @@ fn check_beat33_legacy_crew_dir() -> Check {
         // <root>/crew/ exists but is empty / has no promoted content.
         // Likely a directory the operator created themselves — leave alone.
         return Check {
-            name: "beat-33 crew/ layout".into(),
+            name: CREW_LAYOUT_CHECK_NAME.into(),
             status: Status::Pass,
             message: format!(
                 "{} exists but holds no promoted subdirs — leaving alone",
@@ -630,47 +644,13 @@ fn check_beat33_legacy_crew_dir() -> Check {
     //   exists at the destination and exits 0, so the only evidence a
     //   collision was left behind is the source directory still being
     //   non-empty — `2>/dev/null || true` swallowed exactly that.
-    let mut script_lines: Vec<String> = Vec::new();
-    for subdir in &present_subdirs {
-        let dest = root.join(subdir);
-        let legacy = legacy_dir.display();
-        let root_disp = root.display();
-        if legacy_dir.join(subdir).is_file() {
-            script_lines.push(format!("# {subdir}: the autonomous-dispatch preamble override now lives at the root"));
-            script_lines.push(format!("mv -n \"{legacy}/{subdir}\" \"{root_disp}/{subdir}\""));
-        } else if dest.is_dir() {
-            script_lines.push(format!(
-                "# {subdir}: destination directory already exists — merging entries, not \
-                 moving the directory (a plain `mv` would nest it)"
-            ));
-            script_lines.push(format!(
-                "for e in \"{legacy}/{subdir}\"/* \"{legacy}/{subdir}\"/.[!.]* \
-                 \"{legacy}/{subdir}\"/..?*; do [ -e \"$e\" ] || continue; mv -n \"$e\" \
-                 \"{root_disp}/{subdir}/\"; done"
-            ));
-            script_lines.push(format!(
-                "rmdir \"{legacy}/{subdir}\" || echo \"LEFTOVERS in {legacy}/{subdir} — those \
-                 names already exist under {root_disp}/{subdir} and were NOT overwritten; \
-                 compare and merge them by hand\""
-            ));
-        } else {
-            script_lines.push(format!("# {subdir}: destination absent — plain move"));
-            script_lines.push(format!(
-                "mv -n \"{legacy}/{subdir}\" \"{root_disp}/{subdir}\""
-            ));
-        }
-    }
-    script_lines.push(format!(
-        "rmdir \"{legacy}\" || echo \"note: {legacy} is not empty — whatever remains is either \
-         operator-authored (darkmux never proposes moving that) or a LEFTOVERS line above\"",
-        legacy = legacy_dir.display()
-    ));
+    let script_lines = crew_merge_script_lines(&root, &legacy_dir, &present_subdirs);
 
     let listed_str = present_subdirs.join(", ");
     let pins_hint = if pins_present { format!("\n\nAlso: {pins_note}") } else { String::new() };
 
     Check {
-        name: "beat-33 crew/ layout".into(),
+        name: CREW_LAYOUT_CHECK_NAME.into(),
         status: Status::Fail,
         message: format!(
             "operator state still under {}/ (found: {listed_str}); darkmux does not read it",
@@ -681,15 +661,106 @@ fn check_beat33_legacy_crew_dir() -> Check {
              is invisible until it moves. Copy-paste this; each line is state-checked \
              against your actual destination (a plain `mv -n` for an absent destination, a \
              per-entry merge for one that already exists, never a directory nested into \
-             another):\n\n{script}\n\n\
+             another). It runs under bash whichever shell you paste it into:\n\n\
+             bash <<'DARKMUX_CREW_MERGE'\n{script}\nDARKMUX_CREW_MERGE\n\n\
+             Pre-#148 flat mission files and `crew/sprints` are archived, not merged: \
+             they go to `{archive}`, kept and never overwritten, because 4.0 reads neither.\n\n\
              Nothing is overwritten: every move is `mv -n`, so a file whose name ALREADY \
              exists at the flattened destination is left where it is and the script prints a \
              `LEFTOVERS in ...` line naming the directory it stayed in — compare those two \
              copies yourself and delete the stale one. A clean run prints nothing.\n\n\
              Note: the paths above are computed from the darkmux root (`DARKMUX_HOME` when \
              set, else `~/.darkmux`).{pins_hint}",
-            script = script_lines.join("\n")
+            script = script_lines.join("\n"),
+            archive = pre_148_archive_dir(&root).display()
         )),
+    }
+}
+
+/// Directory under `crew/` holding pre-#148 phase files, kept by name so the
+/// crew merge can archive it.
+const PRE_148_SPRINTS_DIR: &str = "sprints";
+
+/// Where pre-#148 flat mission files and `crew/sprints` are kept once 4.0
+/// stops reading them. The crew merge script and the mission-state check's
+/// remedy both name this one directory.
+fn pre_148_archive_dir(root: &std::path::Path) -> std::path::PathBuf {
+    root.join("archive").join("pre-148-missions")
+}
+
+/// The shell lines that flatten `<root>/crew/` (see
+/// [`check_beat33_legacy_crew_dir`] for what each guard is for). Flat mission
+/// files under `crew/{missions,phases}` and `crew/sprints` go to
+/// [`pre_148_archive_dir`], never to the flattened directories, where the
+/// mission-state check would refuse them. Every other subdirectory moves when
+/// its destination is absent and merges entry by entry when it exists.
+fn crew_merge_script_lines(
+    root: &std::path::Path,
+    legacy_dir: &std::path::Path,
+    present_subdirs: &[&str],
+) -> Vec<String> {
+    let legacy = legacy_dir.display();
+    let archive = pre_148_archive_dir(root);
+    let mut lines: Vec<String> = Vec::new();
+
+    let flat: Vec<String> = ["missions", "phases"]
+        .iter()
+        .flat_map(|sub| darkmux_crew::retired_state::json_files(&legacy_dir.join(sub)))
+        .map(|f| f.display().to_string())
+        .collect();
+    let sprints_present = present_subdirs.contains(&PRE_148_SPRINTS_DIR);
+    if !flat.is_empty() || sprints_present {
+        lines.push("# pre-#148 layout: kept in the archive, since 4.0 reads none of it".to_string());
+        lines.push(format!("mkdir -p \"{}\"", archive.display()));
+    }
+    for file in &flat {
+        lines.push(format!("mv -n \"{file}\" \"{}/\"", archive.display()));
+    }
+    for subdir in present_subdirs {
+        let (src, dest) = if *subdir == PRE_148_SPRINTS_DIR {
+            (legacy_dir.join(subdir), archive.join(subdir))
+        } else {
+            (legacy_dir.join(subdir), root.join(subdir))
+        };
+        push_move_or_merge(&mut lines, subdir, &src, &dest, src.is_file());
+    }
+    lines.push(format!(
+        "rmdir \"{legacy}\" || echo \"note: {legacy} is not empty — whatever remains is either \
+         operator-authored (darkmux never proposes moving that) or a LEFTOVERS line above\""
+    ));
+    lines
+}
+
+/// Emit the lines that bring `src` to `dest`: the autonomous-dispatch
+/// preamble is a file (plain move), an absent destination takes a plain move,
+/// and an existing destination directory is merged per entry so nothing nests.
+fn push_move_or_merge(
+    lines: &mut Vec<String>,
+    label: &str,
+    src: &std::path::Path,
+    dest: &std::path::Path,
+    src_is_file: bool,
+) {
+    let dest_is_dir = dest.is_dir();
+    let (src, dest) = (src.display(), dest.display());
+    if src_is_file {
+        lines.push(format!("# {label}: the autonomous-dispatch preamble override now lives at the root"));
+        lines.push(format!("mv -n \"{src}\" \"{dest}\""));
+    } else if dest_is_dir {
+        lines.push(format!(
+            "# {label}: destination directory already exists — merging entries, not \
+             moving the directory (a plain `mv` would nest it)"
+        ));
+        lines.push(format!(
+            "for e in \"{src}\"/* \"{src}\"/.[!.]* \"{src}\"/..?*; do [ -e \"$e\" ] || continue; mv -n \"$e\" \"{dest}/\"; done"
+        ));
+        lines.push(format!(
+            "rmdir \"{src}\" || echo \"LEFTOVERS in {src} — those names already exist under {dest} \
+             and were NOT overwritten; compare and merge them by hand\""
+        ));
+    } else {
+        lines.push(format!("# {label}: destination absent — plain move"));
+        lines.push(format!("mv -n \"{src}\" \"{dest}\""));
     }
 }
 
@@ -2355,7 +2426,7 @@ fn check_renamed_budget_settings() -> Check {
 
 /// Pure decision for [`check_renamed_budget_settings`].
 fn renamed_settings_status(env: &dyn Fn(&str) -> Option<String>) -> Check {
-    let name = "retired env vars (4.0)";
+    let name = RETIRED_ENV_CHECK_NAME;
     let leftovers = darkmux_types::config::retired_env_leftovers(env);
     if leftovers.is_empty() {
         return Check { name: name.into(), status: Status::Pass, message: "none present".into(), hint: None };
@@ -7428,21 +7499,45 @@ fn render_check_block(c: &Check, width: usize) -> Vec<String> {
     }
 
     if let Some(hint) = c.hint.as_ref() {
-        // "        → " — 8 spaces, the arrow, a space.
-        const HINT_HEAD: usize = 10;
-        for raw in hint.lines() {
-            let wrapped = wrap_hanging(raw, width.saturating_sub(HINT_HEAD).max(20), 0);
-            lines.push(format!("        → {}", darkmux_types::style::dim(&wrapped[0])));
-            for cont in &wrapped[1..] {
-                lines.push(format!(
-                    "{}{}",
-                    " ".repeat(HINT_HEAD),
-                    darkmux_types::style::dim(cont)
-                ));
-            }
-        }
+        push_hint_lines(&mut lines, hint, width);
     }
     lines
+}
+
+/// The line that opens a paste block in a hint: a `bash` heredoc whose
+/// terminator is the delimiter it names. The block is a script the user pastes
+/// out of the terminal, so it renders verbatim.
+const PASTE_BLOCK_OPEN: &str = "bash <<'";
+
+/// Render `hint` under its check: word-wrapped behind the `→` gutter, except a
+/// paste block (from a line opening with [`PASTE_BLOCK_OPEN`] through its
+/// terminator), which is emitted verbatim at column zero. Wrapping would split
+/// a long quoted path across lines, and the gutter would put the terminator off
+/// column zero: either breaks the paste.
+fn push_hint_lines(lines: &mut Vec<String>, hint: &str, width: usize) {
+    // "        → " — 8 spaces, the arrow, a space.
+    const HINT_HEAD: usize = 10;
+    let mut terminator: Option<String> = None;
+    for raw in hint.lines() {
+        if let Some(end) = terminator.as_deref() {
+            let done = raw == end;
+            lines.push(raw.to_string());
+            if done {
+                terminator = None;
+            }
+            continue;
+        }
+        if let Some(rest) = raw.strip_prefix(PASTE_BLOCK_OPEN) {
+            terminator = rest.split('\'').next().map(str::to_string);
+            lines.push(raw.to_string());
+            continue;
+        }
+        let wrapped = wrap_hanging(raw, width.saturating_sub(HINT_HEAD).max(20), 0);
+        lines.push(format!("        → {}", darkmux_types::style::dim(&wrapped[0])));
+        for cont in &wrapped[1..] {
+            lines.push(format!("{}{}", " ".repeat(HINT_HEAD), darkmux_types::style::dim(cont)));
+        }
+    }
 }
 
 /// Print one check line + its hint lines. Shared by the verbose and
@@ -7513,6 +7608,26 @@ fn verdict_banner_at(r: &DoctorReport, width: usize) -> String {
             headline(Status::Fail).unwrap_or_else(|| "see the failures below".into())
         ))),
     }
+}
+
+/// Where the one-time `darkmux-upgrade` skill lives.
+const UPGRADE_SKILL_URL: &str = "https://github.com/kstrat2001/darkmux/blob/main/docs/upgrade/darkmux-upgrade/SKILL.md";
+
+/// The line doctor prints under its summary when any retired-state row is
+/// not passing; `None` when every such row passes.
+fn upgrade_skill_pointer(r: &DoctorReport) -> Option<String> {
+    let found = r.checks.iter().any(|c| {
+        c.status != Status::Pass
+            && (c.name.starts_with(USER_FILE_KEYS_CHECK_NAME)
+                || [RETIRED_ENV_CHECK_NAME, CREW_LAYOUT_CHECK_NAME, MISSION_STATE_CHECK_NAME, LAB_DIR_CHECK_NAME]
+                    .contains(&c.name.as_str()))
+    });
+    found.then(|| {
+        format!(
+            "retired 3.x keys, spellings or paths found: an agent can apply the fixes by following the optional, \
+             one-time upgrade skill at {UPGRADE_SKILL_URL}"
+        )
+    })
 }
 
 /// Render the doctor report.
@@ -7587,6 +7702,9 @@ pub fn print_report(r: &DoctorReport, verbose: bool) -> Result<()> {
         )),
     };
     println!("{summary}");
+    if let Some(pointer) = upgrade_skill_pointer(r) {
+        println!("{pointer}");
+    }
     Ok(())
 }
 
@@ -13827,8 +13945,58 @@ mod tests {
         assert!(check.message.contains("phases/s1.json"), "{}", check.message);
         assert!(check.message.contains("4.0 no longer reads"), "{}", check.message);
         let hint = check.hint.expect("names the fix");
-        assert!(hint.contains("darkmux mission migrate --apply"), "{hint}");
-        assert!(hint.contains("delete the flat files"), "{hint}");
+        // `mission migrate` is gone on 4.0, so the remedy cannot ask for it:
+        // it moves the files into the archive the crew/ merge script uses.
+        assert!(!hint.contains("mission migrate"), "{hint}");
+        let archive = guard.path().join("archive").join("pre-148-missions");
+        assert!(hint.contains(&archive.display().to_string()), "{hint}");
+        assert!(hint.contains("mv -n"), "{hint}");
+        assert!(hint.contains("missions/alpha.json") && hint.contains("phases/s1.json"), "{hint}");
+    }
+
+    /// The flat-file remedy is copy-pasted and run, so run it: it moves the
+    /// flat files into the archive (kept, never overwritten) and the check
+    /// then passes.
+    #[serial_test::serial]
+    #[test]
+    fn the_flat_mission_file_remedy_archives_the_files_and_the_check_recovers() {
+        let guard = CrewRootGuard::new_at_subdir("my darkmux");
+        std::fs::create_dir_all(guard.path().join("missions")).unwrap();
+        std::fs::write(guard.path().join("missions").join("alpha.json"), "{\"k\":1}").unwrap();
+        let hint = check_mission_state_files().hint.expect("names the fix");
+        let command = hint.lines().find(|l| l.starts_with("mkdir -p")).expect("a runnable command line");
+        let out = std::process::Command::new("bash").arg("-c").arg(command).output().expect("bash");
+        assert!(out.status.success(), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        let kept = guard.path().join("archive").join("pre-148-missions").join("alpha.json");
+        assert_eq!(std::fs::read_to_string(kept).unwrap(), "{\"k\":1}");
+        assert_eq!(check_mission_state_files().status, Status::Pass);
+    }
+
+    fn report_of(checks: Vec<Check>) -> DoctorReport {
+        DoctorReport { checks }
+    }
+
+    fn state_row(name: &str, status: Status) -> Check {
+        Check { name: name.into(), status, message: "m".into(), hint: None }
+    }
+
+    /// Doctor names the `darkmux-upgrade` skill once, when a retired-state
+    /// row is failing; a clean report and an unrelated failure do not.
+    #[test]
+    fn doctor_points_at_the_upgrade_skill_only_when_retired_state_is_found() {
+        for name in [
+            RETIRED_ENV_CHECK_NAME,
+            CREW_LAYOUT_CHECK_NAME,
+            MISSION_STATE_CHECK_NAME,
+            LAB_DIR_CHECK_NAME,
+            "user file keys: profiles.json",
+        ] {
+            let r = report_of(vec![state_row("unrelated", Status::Pass), state_row(name, Status::Fail)]);
+            let pointer = upgrade_skill_pointer(&r).unwrap_or_else(|| panic!("{name} must point at the skill"));
+            assert!(pointer.contains("upgrade skill") && pointer.contains(UPGRADE_SKILL_URL), "{pointer}");
+        }
+        let clean = report_of(vec![state_row(CREW_LAYOUT_CHECK_NAME, Status::Pass), state_row("unrelated", Status::Fail)]);
+        assert!(upgrade_skill_pointer(&clean).is_none(), "an unrelated failure is not an upgrade finding");
     }
 
     #[serial_test::serial]
@@ -14040,22 +14208,109 @@ mod tests {
         );
     }
 
-    /// Pull the runnable lines back out of the remedy hint, which wraps the
-    /// script in prose. Keyed on the shell verbs the builder emits, so a
-    /// prose edit can't silently make this extract nothing (the caller
-    /// asserts the extraction is non-empty and that the script actually
-    /// does work).
+    /// The paste block the remedy hint carries: the `bash <<'...'` line through
+    /// its terminator. This is what a user pastes into their shell, whichever
+    /// shell that is.
+    fn beat33_paste_block_from_hint(hint: &str) -> String {
+        let lines: Vec<&str> = hint.lines().collect();
+        let open = lines.iter().position(|l| l.starts_with("bash <<'")).expect("the hint carries a bash heredoc");
+        let close = lines[open + 1..]
+            .iter()
+            .position(|l| l.trim() == "DARKMUX_CREW_MERGE")
+            .expect("the heredoc is terminated");
+        lines[open..=open + 1 + close].join("\n")
+    }
+
+    /// The script inside the paste block, without the `bash` wrapper.
     fn beat33_script_from_hint(hint: &str) -> String {
-        hint.lines()
-            .filter(|l| {
-                let t = l.trim_start();
-                t.starts_with('#')
-                    || t.starts_with("for ")
-                    || t.starts_with("mv ")
-                    || t.starts_with("rmdir ")
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+        let block = beat33_paste_block_from_hint(hint);
+        let inner: Vec<&str> = block.lines().collect();
+        inner[1..inner.len() - 1].join("\n")
+    }
+
+    /// Run `script` in `shell` (`bash -c` / `zsh -c`), returning combined output.
+    fn run_in_shell(shell: &str, script: &str) -> Option<String> {
+        let out = std::process::Command::new(shell).arg("-c").arg(script).output().ok()?;
+        Some(format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
+    }
+
+    /// The pre-#148 leftovers under `crew/`: a flat mission file, a flat phase
+    /// file, a per-mission directory, and the `sprints/` phase files.
+    fn seed_pre_148_crew_layout(root: &std::path::Path) {
+        let crew = root.join("crew");
+        std::fs::create_dir_all(crew.join("missions").join("m-new")).unwrap();
+        std::fs::write(crew.join("missions").join("m-new").join("mission.json"), "{}").unwrap();
+        std::fs::write(crew.join("missions").join("flat-old.json"), r#"{"flat":true}"#).unwrap();
+        std::fs::create_dir_all(crew.join("sprints")).unwrap();
+        std::fs::write(crew.join("sprints").join("s1.json"), r#"{"s":1}"#).unwrap();
+    }
+
+    /// The crew/ merge and the flat-file check must agree: the merge routes
+    /// flat mission files and `crew/sprints` into the archive (kept, never
+    /// overwritten) instead of into `missions/`, where the mission-state check
+    /// would refuse them; per-mission directories flatten as before. The
+    /// script is run under bash, and the whole paste block under zsh, where an
+    /// unmatched glob aborts the command unless bash runs the script.
+    #[serial_test::serial]
+    #[test]
+    fn the_crew_merge_archives_flat_mission_files_and_sprints_under_bash_and_zsh() {
+        for shell in ["bash", "zsh"] {
+            if std::process::Command::new(shell).arg("-c").arg("true").output().is_err() {
+                continue;
+            }
+            let guard = CrewRootGuard::new_at_subdir("my darkmux");
+            let root = guard.path().to_path_buf();
+            seed_pre_148_crew_layout(&root);
+            let hint = check_beat33_legacy_crew_dir().hint.expect("a merge script");
+            let pasted = beat33_paste_block_from_hint(&hint);
+            let output = run_in_shell(shell, &pasted).expect("shell runs");
+            let archive = root.join("archive").join("pre-148-missions");
+            let ctx = format!("--- shell {shell} ---\n{pasted}\n--- output ---\n{output}");
+            assert_eq!(std::fs::read_to_string(archive.join("flat-old.json")).unwrap(), r#"{"flat":true}"#, "{ctx}");
+            assert!(archive.join("sprints").join("s1.json").is_file(), "{ctx}");
+            assert!(root.join("missions").join("m-new").join("mission.json").is_file(), "{ctx}");
+            assert!(!root.join("missions").join("flat-old.json").exists(), "a flat file reached missions/\n{ctx}");
+            assert!(!root.join("crew").exists(), "{ctx}");
+            assert!(output.trim().is_empty(), "a clean run prints nothing\n{ctx}");
+            assert_eq!(check_mission_state_files().status, Status::Pass, "the two checks agree\n{ctx}");
+        }
+    }
+
+    /// The block is pasted from the TERMINAL, not from the hint string, so it
+    /// is tested as rendered: at a narrow width the report word-wraps its
+    /// hints, which would split a long quoted path across lines. The paste
+    /// block must come out verbatim, at column zero, and run.
+    #[serial_test::serial]
+    #[test]
+    fn the_rendered_crew_merge_block_survives_a_narrow_terminal_and_runs() {
+        let guard = CrewRootGuard::new_at_subdir("my darkmux");
+        let root = guard.path().to_path_buf();
+        seed_pre_148_crew_layout(&root);
+        let hint = check_beat33_legacy_crew_dir().hint.expect("a merge script");
+        let expected = beat33_paste_block_from_hint(&hint);
+        let rendered: Vec<String> =
+            render_check_block(&check_beat33_legacy_crew_dir(), 60).iter().map(|l| strip_ansi(l)).collect();
+        let open = rendered.iter().position(|l| l.starts_with("bash <<'")).expect("the block is rendered at column 0");
+        let close = rendered.iter().position(|l| l == "DARKMUX_CREW_MERGE").expect("terminator at column 0");
+        let pasted = rendered[open..=close].join("\n");
+        assert_eq!(pasted, expected, "the rendered block is the script, unwrapped");
+        run_in_shell("bash", &pasted).expect("bash");
+        assert!(root.join("archive").join("pre-148-missions").join("flat-old.json").is_file());
+    }
+
+    /// Inverse: with no flat files and no `sprints/`, nothing is archived and
+    /// no archive directory appears.
+    #[serial_test::serial]
+    #[test]
+    fn the_crew_merge_creates_no_archive_when_nothing_is_pre_148() {
+        let guard = CrewRootGuard::new();
+        let missions = guard.path().join("crew").join("missions").join("m-new");
+        std::fs::create_dir_all(&missions).unwrap();
+        std::fs::write(missions.join("mission.json"), "{}").unwrap();
+        let script = beat33_script_from_hint(&check_beat33_legacy_crew_dir().hint.unwrap());
+        run_in_shell("bash", &script).unwrap();
+        assert!(!guard.path().join("archive").exists());
+        assert!(guard.path().join("missions").join("m-new").join("mission.json").is_file());
     }
 
     /// (#1715 review) The remedy is copy-pasted and RUN, so it is tested by
@@ -14084,14 +14339,14 @@ mod tests {
         let root = guard.path().to_path_buf();
         let legacy = root.join("crew").join("missions");
         std::fs::create_dir_all(&legacy).unwrap();
-        std::fs::write(legacy.join("m1.json"), r#"{"from":"legacy"}"#).unwrap();
-        std::fs::write(legacy.join("collide.json"), r#"{"from":"legacy"}"#).unwrap();
+        std::fs::write(legacy.join("m1-entry"), r#"{"from":"legacy"}"#).unwrap();
+        std::fs::write(legacy.join("collide-entry"), r#"{"from":"legacy"}"#).unwrap();
         std::fs::write(legacy.join(".DS_Store"), "finder").unwrap();
         // The flattened destination already exists and already holds a file
         // by the same name — the partially-migrated state this remedy is for.
         let dest = root.join("missions");
         std::fs::create_dir_all(&dest).unwrap();
-        std::fs::write(dest.join("collide.json"), r#"{"from":"already-flattened"}"#).unwrap();
+        std::fs::write(dest.join("collide-entry"), r#"{"from":"already-flattened"}"#).unwrap();
 
         let check = check_beat33_legacy_crew_dir();
         assert_eq!(check.status, Status::Fail, "{}", check.message);
@@ -14115,7 +14370,7 @@ mod tests {
         let ctx = format!("--- script ---\n{script}\n--- output ---\n{combined}");
 
         // (1) The loop actually ran despite the space in the root.
-        assert!(dest.join("m1.json").is_file(), "ordinary entry never moved\n{ctx}");
+        assert!(dest.join("m1-entry").is_file(), "ordinary entry never moved\n{ctx}");
         // (2) The dotfile came with it.
         assert!(
             dest.join(".DS_Store").is_file(),
@@ -14123,7 +14378,7 @@ mod tests {
         );
         // (3a) `mv -n` correctly refused to clobber the destination's copy.
         assert_eq!(
-            std::fs::read_to_string(dest.join("collide.json")).unwrap(),
+            std::fs::read_to_string(dest.join("collide-entry")).unwrap(),
             r#"{"from":"already-flattened"}"#,
             "the already-flattened copy must never be overwritten\n{ctx}"
         );
@@ -14136,7 +14391,7 @@ mod tests {
              it\n{ctx}"
         );
         assert!(
-            legacy.join("collide.json").is_file(),
+            legacy.join("collide-entry").is_file(),
             "the skipped entry is still where it was — that is why it must be named\n{ctx}"
         );
         // Nothing nested (the original #1715 corruption).
@@ -14159,7 +14414,7 @@ mod tests {
         let root = guard.path().to_path_buf();
         let legacy = root.join("crew").join("missions");
         std::fs::create_dir_all(&legacy).unwrap();
-        std::fs::write(legacy.join("m1.json"), r#"{"from":"legacy"}"#).unwrap();
+        std::fs::write(legacy.join("m1-entry"), r#"{"from":"legacy"}"#).unwrap();
         std::fs::write(legacy.join(".DS_Store"), "finder").unwrap();
         // Destination exists (so the per-entry merge branch is the one under
         // test) but holds nothing that collides.
@@ -14182,7 +14437,7 @@ mod tests {
         );
         let ctx = format!("--- script ---\n{script}\n--- output ---\n{combined}");
 
-        assert!(dest.join("m1.json").is_file(), "{ctx}");
+        assert!(dest.join("m1-entry").is_file(), "{ctx}");
         assert!(dest.join(".DS_Store").is_file(), "{ctx}");
         assert!(dest.join("already-here.json").is_file(), "pre-existing entry disturbed\n{ctx}");
         assert!(!legacy.exists(), "the emptied legacy subdir should be gone\n{ctx}");

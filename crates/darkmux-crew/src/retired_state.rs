@@ -92,7 +92,8 @@ fn file_problems(kind: StateKind, path: &Path) -> Option<StateProblem> {
     (!retired.is_empty()).then(|| StateProblem { path: path.to_path_buf(), fix: retired.join("; ") })
 }
 
-fn json_files(dir: &Path) -> Vec<PathBuf> {
+/// The `.json` files directly in `dir`, sorted by path.
+pub fn json_files(dir: &Path) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
         .into_iter()
         .flatten()

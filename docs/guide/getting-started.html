@@ -204,6 +204,13 @@ darkmux-runtime: trajectory → /darkmux-out/.darkmux-runtime/trajectory.jsonl</
   </div>
 </section>
 
+<section>
+  <div class="wrap">
+    <h2>Upgrading from 3.x</h2>
+    <p>5.0 refuses retired config keys, env vars, and file shapes instead of guessing what they meant, so a 3.x home usually needs a few edits before darkmux starts. <code>darkmux doctor</code> runs on such a home and names every refusal with its fix. When it finds retired state, its last line links an optional, one-time skill an agent (Claude Code, for one) can follow to apply those fixes safely: it backs up the home first, moves with <code>mv -n</code>, never overwrites a key, keeps your own notes, and asks before any judgment call such as the utility model's context window. It is not installed by <code>darkmux init</code>; hand your agent the file, or drop it into its skills directory: <a href="https://github.com/kstrat2001/darkmux/blob/main/docs/upgrade/darkmux-upgrade/SKILL.md">darkmux-upgrade/SKILL.md</a>.</p>
+  </div>
+</section>
+
 <nav class="page-nav wrap">
   <a href="index.html" class="prev">
     <span class="dir">‹ Guide home</span>
