@@ -16,6 +16,11 @@ darkmux release.
 
 ### Changed (breaking, 4.0)
 
+- **The registered utility model stays loaded across dispatches.** A dispatch
+  that does not name it no longer unloads it, and neither do the budget and
+  pool-pressure evictions; a load that would fit only by evicting it is
+  refused with a reason naming the utility model. `darkmux machine eject` is
+  how to release it.
 - **CLI `--json` output is a contract** (C4). Every verb's `--json` output is now
   one serialized, named type (`src/cli_json.rs`), pinned by
   `tests/cli-json.golden`, which lists each verb and the fields and types of

@@ -784,7 +784,10 @@ pub fn run_ephemeral(
 
     let tasks: BTreeMap<String, Task> = ordered_tasks.iter().map(|t| (t.id.clone(), t.clone())).collect();
     let registry = StepKindRegistry::with_builtins();
-    let facts = Facts::default();
+    let facts = Facts {
+        utility_binding: crate::crew::concurrent_dispatch::standing_utility_binding(None),
+        ..Facts::default()
+    };
     let est = FixedEstimator::default();
 
     // (#1684 QA finding — MUST-FIX 4) A per-INVOCATION run, the one every
