@@ -1982,7 +1982,7 @@ crate::config_enum!(IdentityProvider, "identity provider", [
 /// holds that model for its whole run (one request at a time per instance);
 /// a job on a HOSTED endpoint runs beside others up to this machine's
 /// `remote.concurrent_cap`. Past either limit, this policy decides.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "lowercase")]

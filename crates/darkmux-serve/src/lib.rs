@@ -46,7 +46,11 @@ pub mod mission_graph;
 /// (#2107, #1833) The daemon-side continuous host sampler feeding the
 /// machine stats drawer's live `load` block — see the module's own doc.
 mod fleet_listener;
+/// The fleet view: one row per roster machine, each with its own card.
+pub mod fleet_view;
 mod host_sampler;
+/// The machine card served at `GET /machine/card`.
+pub mod machine_card;
 mod panel;
 /// (#1466) Best-effort peer-mission-graph fetch — see the module's own doc
 /// for the full attribution → roster → presence → fetch decision chain.
@@ -97,6 +101,8 @@ pub(crate) struct AppState {
     sse_open: Arc<AtomicUsize>,
     /// (#1569 packet B) Panel cache + single-flight locks — see `panel.rs`.
     panels: panel::PanelState,
+    /// The fleet routes' inputs: admission, gather sources, view cache.
+    fleet: fleet_view::FleetContext,
     /// (#1585, was #1247 Part 3) The lab-run scan root — `--lab-dir` >
     /// `DARKMUX_LAB_DIR` > `config.dirs.lab` > `~/.darkmux/lab`.
     ///
@@ -330,7 +336,7 @@ async fn play_html(Path(date): Path<String>, headers: axum::http::HeaderMap) -> 
 /// (`lab_dir: None`); tests that need `/lab/*` go through `build_router_full`.
 #[cfg(test)]
 pub(crate) fn build_router(flows_dir: PathBuf) -> Router {
-    build_router_full(flows_dir, None, None)
+    build_router_full(flows_dir, None, None, fleet_view::FleetContext::hermetic())
 }
 
 /// Full router builder — flows dir + the lab observer's
@@ -359,12 +365,14 @@ pub(crate) fn build_router_full(
     flows_dir: PathBuf,
     lab_dir: Option<PathBuf>,
     live_ingest: Option<Arc<live_hub::IngestState>>,
+    fleet: fleet_view::FleetContext,
 ) -> Router {
     let state = AppState {
         flows_dir,
         sse_open: Arc::new(AtomicUsize::new(0)),
         lab_dir,
         panels: panel::PanelState::default(),
+        fleet,
         live_ingest,
     };
     let read_auth = darkmux_types::config_access::serve_read_auth();
@@ -445,7 +453,7 @@ pub(crate) fn build_router_full_local(
     flows_dir: PathBuf,
     lab_dir: Option<PathBuf>,
 ) -> Router {
-    build_router_full(flows_dir, lab_dir, None).layer(from_fn(assume_loopback_peer))
+    build_router_full(flows_dir, lab_dir, None, fleet_view::FleetContext::hermetic()).layer(from_fn(assume_loopback_peer))
 }
 
 /// (#881) Build a `401 Unauthorized` with a `WWW-Authenticate: Bearer` hint.
@@ -1468,6 +1476,7 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
             flows_dir.clone(),
             lab_dir.clone(),
             live_ingest.clone(),
+            fleet_view::FleetContext::production(),
         );
 
         // (#647) Presence edge-recording for playback. Self-emit this machine's
@@ -2834,27 +2843,45 @@ async fn machine_resources_handler(
 /// --deep` relies on — degraded state is a visible cell, not a failed
 /// command. (#275 PR-A)
 async fn machine_specs_handler() -> axum::Json<wire::MachineSpecsResponse> {
-    // Shell-out probes run in spawn_blocking so the async runtime stays
-    // responsive. Each result is independent — one failure doesn't
-    // cascade.
-    let lms_result = tokio::task::spawn_blocking(darkmux_profiles::lms::list_loaded).await;
-    let (loaded_models, lms_unreachable) = match lms_result {
-        Ok(Ok(m)) => (m, false),
-        _ => (Vec::new(), true),
-    };
-    let ram_total = tokio::task::spawn_blocking(read_ram_total_bytes)
+    // Shell-out probes run off the async runtime.
+    let specs = tokio::task::spawn_blocking(gather_specs)
         .await
-        .ok()
-        .flatten();
-    let ram_free = tokio::task::spawn_blocking(read_ram_free_for_ai_bytes)
-        .await
-        .ok()
-        .flatten();
-    let cpu_brand = tokio::task::spawn_blocking(read_cpu_brand)
-        .await
-        .ok()
-        .flatten();
+        .unwrap_or_else(|_| degraded_specs());
+    axum::Json(specs)
+}
 
+/// What `/machine/specs` answers when its gather task panicked: identity and
+/// versions only, every probed field `null` / empty, so the caller sees the
+/// degraded state instead of a 500 (the contract `machine list` relies on).
+fn degraded_specs() -> wire::MachineSpecsResponse {
+    wire::MachineSpecsResponse {
+        darkmux_version: env!("CARGO_PKG_VERSION").to_string(),
+        flow_schema_version: darkmux_flow::FLOW_SCHEMA_VERSION.to_string(),
+        machine_id: darkmux_flow::resolve_machine_id(),
+        machine_uid: None,
+        os: format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
+        ram_total_bytes: None,
+        ram_free_for_ai_bytes: None,
+        cpu_brand: None,
+        loaded_models: Vec::new(),
+        lms_unreachable: true,
+        utility_model: None,
+        redis_url_redacted: None,
+        generated_at_ms: current_millis(),
+    }
+}
+
+/// The spec sheet `/machine/specs` serves and the machine card embeds: the
+/// ONE gather. Blocking (it shells out); each probe is independent, so one
+/// failure never cascades.
+pub(crate) fn gather_specs() -> wire::MachineSpecsResponse {
+    let (loaded_models, lms_unreachable) = match darkmux_profiles::lms::list_loaded() {
+        Ok(m) => (m, false),
+        Err(_) => (Vec::new(), true),
+    };
+    let ram_total = read_ram_total_bytes();
+    let ram_free = read_ram_free_for_ai_bytes();
+    let cpu_brand = read_cpu_brand();
     let machine_id = darkmux_flow::resolve_machine_id();
     // (#2814) The stable HARDWARE identity beside the NAME. `machine_id` is a
     // label — it defaults to the hostname, macOS reports both the short and
@@ -2888,19 +2915,14 @@ async fn machine_specs_handler() -> axum::Json<wire::MachineSpecsResponse> {
     // failure just yields `None`.
     // (#2915) With the binding's declared window (`n_ctx`, `null` when
     // none is declared), which the machine page's Utility section shows.
-    let utility_model = tokio::task::spawn_blocking(|| {
-        darkmux_profiles::profiles::load_registry(None).ok().and_then(|lr| {
-            lr.registry
-                .utility_model_id()
-                .map(|id| (id.to_string(), lr.registry.utility_model_n_ctx()))
+    let utility_model = darkmux_profiles::profiles::load_registry(None)
+        .ok()
+        .and_then(|lr| {
+            lr.registry.utility_model_id().map(|id| (id.to_string(), lr.registry.utility_model_n_ctx()))
         })
-    })
-    .await
-    .ok()
-    .flatten()
-    .map(|(id, n_ctx)| utility_model(&id, n_ctx, &loaded_models));
+        .map(|(id, n_ctx)| utility_model(&id, n_ctx, &loaded_models));
 
-    axum::Json(wire::MachineSpecsResponse {
+    wire::MachineSpecsResponse {
         darkmux_version: env!("CARGO_PKG_VERSION").to_string(),
         flow_schema_version: darkmux_flow::FLOW_SCHEMA_VERSION.to_string(),
         machine_id,
@@ -2914,7 +2936,7 @@ async fn machine_specs_handler() -> axum::Json<wire::MachineSpecsResponse> {
         utility_model,
         redis_url_redacted,
         generated_at_ms: current_millis(),
-    })
+    }
 }
 
 fn utility_model(id: &str, n_ctx: Option<u32>, loaded_models: &[darkmux_types::LoadedModel]) -> wire::UtilityModel {

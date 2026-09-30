@@ -95,6 +95,17 @@ pub(crate) fn dispatch_config_preflight() -> Result<(), String> {
 }
 
 impl FleetListenerState {
+    /// The listener's admission inputs, as [`Admission`] takes them.
+    pub(crate) fn admission(&self) -> Admission {
+        let local = self.local_node_id.clone();
+        Admission {
+            provider: self.provider.clone(),
+            local_node_id: Arc::new(move || local.clone()),
+            token: self.token.clone(),
+            allow_list: self.allow_list.clone(),
+        }
+    }
+
     /// Production wiring: the configured provider, the serve token, the
     /// allow-list from `config.json`, this machine's registry, and
     /// `darkmux_fleet::execute_job`.
@@ -294,9 +305,98 @@ fn check_token(headers: &axum::http::HeaderMap, expected: Option<String>) -> Tok
     }
 }
 
-/// The gate on EVERY request: token, network identity, allow-list. A request
-/// with no peer address (no `ConnectInfo`) is refused: absence of evidence
-/// is not a peer.
+/// The three checks that make a caller a verified fleet peer: the fleet
+/// token, the connecting node as the overlay network names it, and the
+/// allow-list. ONE admission path: the listener's gate and the machine
+/// card's caller-scoped `accepts` block both run [`Admission::admit`], which
+/// is [`darkmux_fleet::admit`] wired to its inputs.
+#[derive(Clone)]
+pub(crate) struct Admission {
+    pub provider: Arc<dyn IdentityProvider>,
+    /// This machine's own node id, read per request: a request from it is
+    /// refused.
+    pub local_node_id: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+    /// The expected fleet token, read per request (`None` = not configured).
+    pub token: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+    /// The allow-list, read per request. An error refuses everything.
+    pub allow_list: Arc<dyn Fn() -> Result<AllowList, String> + Send + Sync>,
+}
+
+impl Admission {
+    /// Production wiring: the configured provider (or its fail-closed
+    /// stand-in), the serve token, the allow-list from `config.json`.
+    pub(crate) fn production() -> Self {
+        let provider: Arc<dyn IdentityProvider> = Arc::from(darkmux_fleet::configured_provider_or_unavailable());
+        let for_local = provider.clone();
+        Self {
+            provider,
+            local_node_id: Arc::new(move || for_local.local_node().ok().map(|n| n.node_id)),
+            token: Arc::new(|| darkmux_flow::serve_token().map(|t| t.expose_for_compare().to_string())),
+            allow_list: Arc::new(darkmux_fleet::read_user_allow_list),
+        }
+    }
+
+    /// An admission that refuses everyone (no fleet token, no provider). For
+    /// tests that are not about admission.
+    #[cfg(test)]
+    pub(crate) fn refusing() -> Self {
+        Self {
+            provider: Arc::new(darkmux_fleet::UnavailableProvider("test".into())),
+            local_node_id: Arc::new(|| None),
+            token: Arc::new(|| None),
+            allow_list: Arc::new(|| Ok(AllowList::new())),
+        }
+    }
+
+    /// Token, then the connecting node, then the allow-list, in that order.
+    /// A caller without the token is answered before this machine reads its
+    /// allow-list or runs the provider's tool. On success the fingerprint of
+    /// the token in force comes back with the peer, so a queued job can be
+    /// checked against it again later.
+    pub(crate) async fn admit(
+        &self,
+        peer: std::net::IpAddr,
+        headers: &axum::http::HeaderMap,
+    ) -> Result<(Admitted, TokenFingerprint), Refusal> {
+        let expected = (self.token)();
+        let token = check_token(headers, expected.clone());
+        let fingerprint = match (token, expected.as_deref()) {
+            (TokenCheck::Match, Some(t)) => TokenFingerprint::of(t),
+            (TokenCheck::Mismatch, _) => return Err(Refusal::Token),
+            (TokenCheck::Match, None) | (TokenCheck::NotConfigured, _) => return Err(Refusal::NoTokenConfigured),
+        };
+        // The identity lookup is blocking (a subprocess) and runs only after
+        // the token matched: `admit` calls this closure after its own token
+        // check, and reads the allow-list after the lookup.
+        let this = self.clone();
+        let provider_name = self.provider.provider_name().to_string();
+        let decision = tokio::task::spawn_blocking(move || {
+            let local_id = (this.local_node_id)();
+            let name = this.provider.provider_name().to_string();
+            darkmux_fleet::admit(
+                token,
+                || this.provider.identify(peer).map_err(|e| format!("{e:#}")),
+                &name,
+                peer,
+                local_id.as_deref(),
+                || (this.allow_list)(),
+            )
+        })
+        .await;
+        match decision {
+            Ok(Ok(admitted)) => Ok((admitted, fingerprint)),
+            Ok(Err(refusal)) => Err(refusal),
+            Err(e) => Err(Refusal::IdentityUnavailable {
+                provider: provider_name,
+                detail: format!("the identity check did not finish: {e}"),
+            }),
+        }
+    }
+}
+
+/// The gate on EVERY request: token, network identity, allow-list
+/// ([`Admission::admit`]). A request with no peer address (no `ConnectInfo`)
+/// is refused: absence of evidence is not a peer.
 async fn gate(State(state): State<FleetListenerState>, mut req: Request, next: Next) -> Response {
     let Some(peer) = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip()) else {
         return refuse(
@@ -308,57 +408,19 @@ async fn gate(State(state): State<FleetListenerState>, mut req: Request, next: N
             },
         );
     };
-    let expected = (state.token)();
-    let token = check_token(req.headers(), expected.clone());
-    // A caller without the token is answered before this machine reads its
-    // allow-list or runs the provider's tool (`admit` checks it again).
-    match token {
-        TokenCheck::Match => {
-            // (#2916 stage 2 review F1) Which token was in force, so a job
-            // queued now can be checked against the token in force when its
-            // seat frees. A fingerprint, never the token.
-            if let Some(t) = expected.as_deref() {
-                req.extensions_mut().insert(TokenFingerprint::of(t));
-            }
-        }
-        TokenCheck::Mismatch => return refuse(&state, Some(peer), &Refusal::Token),
-        TokenCheck::NotConfigured => return refuse(&state, Some(peer), &Refusal::NoTokenConfigured),
-    }
-    // The identity lookup is blocking (a subprocess) and runs only after the
-    // token matched: `admit` calls this closure after its token check, and
-    // reads the allow-list after the lookup.
-    let provider = state.provider.clone();
-    let provider_name = provider.provider_name().to_string();
-    let local_id = state.local_node_id.clone();
-    let allow_list = state.allow_list.clone();
-    let decision = tokio::task::spawn_blocking(move || {
-        darkmux_fleet::admit(
-            token,
-            || provider.identify(peer).map_err(|e| format!("{e:#}")),
-            &provider_name,
-            peer,
-            local_id.as_deref(),
-            || allow_list(),
-        )
-    })
-    .await;
-    match decision {
-        Ok(Ok(admitted)) => {
+    match state.admission().admit(peer, req.headers()).await {
+        Ok((admitted, fingerprint)) => {
             let Some(_node_slot) = state.node_slots.try_take(admitted.peer_name.clone()) else {
                 return refuse(&state, Some(peer), &Refusal::TooManyAtOnce { peer: admitted.peer_name.clone() });
             };
+            // (#2916 stage 2 review F1) Which token was in force, so a job
+            // queued now can be checked against the token in force when its
+            // seat frees. A fingerprint, never the token.
+            req.extensions_mut().insert(fingerprint);
             req.extensions_mut().insert(admitted);
             next.run(req).await
         }
-        Ok(Err(refusal)) => refuse(&state, Some(peer), &refusal),
-        Err(e) => refuse(
-            &state,
-            Some(peer),
-            &Refusal::IdentityUnavailable {
-                provider: state.provider.provider_name().to_string(),
-                detail: format!("the identity check did not finish: {e}"),
-            },
-        ),
+        Err(refusal) => refuse(&state, Some(peer), &refusal),
     }
 }
 
@@ -786,6 +848,18 @@ static LISTENER_STATE: std::sync::Mutex<Option<(&'static str, String)>> = std::s
 /// doctor` can report what is in force rather than what the file says now.
 pub(crate) static LISTENER_BUSY: std::sync::Mutex<Option<(BusyPolicy, u32)>> = std::sync::Mutex::new(None);
 
+/// The running listener's seat book, for the machine card. `None` until the
+/// listener has started (this machine takes no fleet work).
+pub(crate) static LISTENER_SEATS: std::sync::Mutex<Option<Arc<SeatBook>>> = std::sync::Mutex::new(None);
+
+/// The running listener's busy policy and seats, for the machine card;
+/// `None` when the listener has not started.
+pub(crate) fn listener_seats() -> Option<(BusyPolicy, darkmux_fleet::SeatSnapshot)> {
+    let (policy, _) = (*LISTENER_BUSY.lock().ok()?)?;
+    let book = LISTENER_SEATS.lock().ok()?.clone()?;
+    Some((policy, book.snapshot()))
+}
+
 /// [`LISTENER_BUSY`] for `/health`, for this machine only (`local` is
 /// `is_local_request`'s answer); `None` when the listener has not started.
 pub(crate) fn listener_busy(local: bool) -> Option<crate::wire::FleetBusy> {
@@ -1032,6 +1106,9 @@ async fn run(mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<(), Str
     let state = FleetListenerState::production(receiver, provider, Some(local_id), busy_policy);
     if let Ok(mut g) = LISTENER_BUSY.lock() {
         *g = Some((busy_policy, darkmux_types::config_access::remote_concurrent_cap()));
+    }
+    if let Ok(mut g) = LISTENER_SEATS.lock() {
+        *g = Some(state.seats.clone());
     }
     // (#2916 round 3 C6) Suppressed refusal counts are reported every minute,
     // not only when the next refusal arrives.

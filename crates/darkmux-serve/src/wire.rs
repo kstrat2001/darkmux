@@ -354,7 +354,7 @@ pub struct FleetDispatchesLiveResponse {
 }
 
 /// One machine in the operator's DECLARED roster (`fleet.json`).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct RosterMachineEntry {

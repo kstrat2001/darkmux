@@ -80,6 +80,20 @@ pub struct SeatBook {
     freed: Condvar,
 }
 
+/// What the book holds right now, for a machine card: the seats taken and how
+/// many jobs wait, and nothing about who holds them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeatSnapshot {
+    /// The local models a submitted job holds, sorted.
+    pub local_held: Vec<String>,
+    /// Hosted jobs running.
+    pub hosted_held: usize,
+    /// Hosted jobs allowed at once; `None` is unbounded.
+    pub hosted_cap: Option<usize>,
+    /// Jobs waiting for a seat.
+    pub waiting: usize,
+}
+
 /// Holds a seat; dropping it frees the seat and wakes the waiters.
 pub struct SeatGuard {
     owner: Arc<SeatBook>,
@@ -220,6 +234,17 @@ impl SeatBook {
         self.freed.notify_all();
     }
 
+    /// The seats taken and the jobs waiting, at this moment.
+    pub fn snapshot(&self) -> SeatSnapshot {
+        let b = self.book.lock().unwrap_or_else(|p| p.into_inner());
+        SeatSnapshot {
+            local_held: b.local.keys().cloned().collect(),
+            hosted_held: b.hosted.len(),
+            hosted_cap: (self.hosted_cap != usize::MAX).then_some(self.hosted_cap),
+            waiting: b.waiting.len(),
+        }
+    }
+
     /// Sessions running now (for tests and logs).
     pub fn running(&self) -> Vec<String> {
         let b = self.book.lock().unwrap_or_else(|p| p.into_inner());
@@ -252,6 +277,22 @@ mod tests {
             Waited::Cancelled => panic!("cancelled"),
             Waited::TimedOut(o) => panic!("timed out behind {o:?}"),
         }
+    }
+
+    #[test]
+    fn the_snapshot_names_held_seats_and_the_cap_and_no_sessions() {
+        let book = Arc::new(SeatBook::new(2));
+        let empty = book.snapshot();
+        assert_eq!(empty, SeatSnapshot { local_held: vec![], hosted_held: 0, hosted_cap: Some(2), waiting: 0 });
+        let _a = book.try_claim(&local("qwen-35b"), "s1").expect("free");
+        let _h = book.try_claim(&hosted(), "s2").expect("free");
+        let snap = book.snapshot();
+        assert_eq!(snap.local_held, vec!["qwen-35b".to_string()]);
+        assert_eq!(snap.hosted_held, 1);
+        assert!(!format!("{snap:?}").contains("s1"), "a session id must not reach the snapshot");
+        drop(_a);
+        assert!(book.snapshot().local_held.is_empty(), "a freed seat leaves the snapshot");
+        assert_eq!(SeatBook::new(0).snapshot().hosted_cap, None, "0 means unbounded");
     }
 
     #[test]
