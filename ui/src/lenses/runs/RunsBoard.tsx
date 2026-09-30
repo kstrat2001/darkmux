@@ -11,7 +11,7 @@ import { useDay } from "../../hooks/useDay";
 import { RUNS_KINDS, type RunsKind } from "../../lib/route";
 import { useFlowWindow } from "../../hooks/useFlowWindow";
 import { useDecodedMachineKey, useMachineKeyContext } from "../../hooks/useMachineKey";
-import { MACHINE_NOT_FOUND_LABEL, machineLabel } from "../../lib/machineKey";
+import { MACHINE_NOT_FOUND_LABEL, machineLabel, type MachineKeyContext } from "../../lib/machineKey";
 import { machineMatch } from "../../lib/machineIdentity";
 import { LabRunDetail } from "./LabRunDetail";
 import type { RunsResponse } from "../../types/generated/RunsResponse";
@@ -571,12 +571,7 @@ export function RunsBoard({
   // machine's fleet card is named from, so the pin and the card agree.
   const pinNotFound = machineKey != null && pinUid == null;
   const pinnedMachineName = machineKey == null ? null : pinUid == null ? MACHINE_NOT_FOUND_LABEL : machineLabel(pinKey.ctx, pinUid);
-  const scopedRuns =
-    machineKey == null
-      ? runs
-      : pinUid == null
-        ? []
-        : runsForMachine(runs, machineMatch(pinRecords, pinKey.ctx.liveMachines, pinKey.ctx.specs, pinKey.ctx.roster, pinUid));
+  const scopedRuns = machineKey == null ? runs : runsOfPin(runs, pinKey.ctx, pinUid);
 
   function selectKind(k: RunsKind) {
     setKind(k);
@@ -757,6 +752,13 @@ function onActivateKeyDown(onActivate: () => void) {
       onActivate();
     }
   };
+}
+
+/** The runs of the pinned machine `pinUid`; none when the pin resolved to no
+ *  machine. */
+function runsOfPin(runs: Run[], ctx: MachineKeyContext, pinUid: string | null): Run[] {
+  if (pinUid == null) return [];
+  return runsForMachine(runs, machineMatch(ctx.data, ctx.liveMachines, ctx.specs, ctx.roster, pinUid));
 }
 
 /** No machine column: one machine on the board needs no label per row. */

@@ -69,7 +69,7 @@ const HASH_MIN = 6;
  *  prefix of it. Not cryptographic: it only has to be distinct among the
  *  machines one page knows, and not be the uid. */
 export function machineKeyHash(uid: string): string {
-  const str = uid.toLowerCase();
+  const str = canonUid(uid);
   let h1 = 0xdeadbeef;
   let h2 = 0x41c6ce57;
   for (let i = 0; i < str.length; i++) {

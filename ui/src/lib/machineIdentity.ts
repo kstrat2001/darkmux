@@ -134,7 +134,7 @@ export function nameOf(data: NormRecord[], liveMachines: Map<string, PresenceBea
 
 /** The presence beat of the machine `uid` names, however the beat's key is
  *  cased. */
-export function beatOf(liveMachines: Map<string, PresenceBeat>, uid: string): PresenceBeat | undefined {
+function beatOf(liveMachines: Map<string, PresenceBeat>, uid: string): PresenceBeat | undefined {
   const exact = liveMachines.get(uid);
   if (exact) return exact;
   const key = findUid(liveMachines.keys(), uid);
@@ -446,22 +446,47 @@ export function machineMatch(
   id: string,
   extraNames: Iterable<string> = [],
 ): MachineMatch {
-  const dir = directory(data, liveMachines);
-  const seen = findUid(dir.uids, id);
+  const seen = findUid(directory(data, liveMachines).uids, id);
   const entry = seen === null ? roster.find((e) => e.id === id || sameUid(e.machine_uid, id)) : undefined;
   const uid = seen ?? entry?.machine_uid ?? id;
-  const own = new Set<string>([...(seen === null ? [] : machineNames(data, liveMachines, seen)), ...extraNames]);
+  const own = new Set<string>(extraNames);
   if (entry) own.add(entry.id);
-  for (const e of roster) if (sameUid(e.machine_uid, uid)) own.add(e.id);
-  if (specs?.machine_id && seen !== null && isSelfMachine(data, liveMachines, specs, seen)) own.add(specs.machine_id);
+  for (const n of ownAliases(data, liveMachines, specs, roster, seen, uid)) own.add(n);
+  const others = namesOfOthers(data, liveMachines, roster, uid);
+  return { uid: seen ?? entry?.machine_uid ?? null, names: new Set([...own].map(nameKey).filter((k) => !others.has(k))) };
+}
+
+/** The names `uid` answers to on its own account: what the window recorded
+ *  (when it is seen), the roster ids declared for it, and this daemon's own
+ *  name when it is this machine. */
+function ownAliases(
+  data: NormRecord[],
+  liveMachines: Map<string, PresenceBeat>,
+  specs: SelfIdentity | null,
+  roster: readonly RosterName[],
+  seen: string | null,
+  uid: string,
+): string[] {
+  const names = seen === null ? [] : [...machineNames(data, liveMachines, seen)];
+  for (const e of roster) if (sameUid(e.machine_uid, uid)) names.push(e.id);
+  if (specs?.machine_id && seen !== null && isSelfMachine(data, liveMachines, specs, seen)) names.push(specs.machine_id);
+  return names;
+}
+
+/** The `nameKey`s some machine other than `uid` answers to. */
+function namesOfOthers(
+  data: NormRecord[],
+  liveMachines: Map<string, PresenceBeat>,
+  roster: readonly RosterName[],
+  uid: string,
+): Set<string> {
   const others = new Set<string>();
-  for (const u of dir.uids) {
+  for (const u of directory(data, liveMachines).uids) {
     if (sameUid(u, uid)) continue;
     for (const n of machineNames(data, liveMachines, u)) others.add(nameKey(n));
   }
   for (const e of roster) if (e.machine_uid && !sameUid(e.machine_uid, uid)) others.add(nameKey(e.id));
-  const names = new Set([...own].map(nameKey).filter((k) => !others.has(k)));
-  return { uid: seen ?? entry?.machine_uid ?? null, names };
+  return others;
 }
 
 /** The display label of each of `uids`, with machines that would read alike

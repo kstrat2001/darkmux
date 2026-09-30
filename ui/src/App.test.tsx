@@ -1969,6 +1969,8 @@ describe("(#2921) machine route chrome names a uid-only machine", () => {
           return Promise.resolve(new Response(JSON.stringify([{ ts: new Date(Date.now() - 60_000).toISOString(), action: "dispatch.turn", machine_uid: FAKE_UID }]), { status: 200 }));
         }
         if (path === "/fleet/roster") return Promise.resolve(new Response(JSON.stringify({ machines: roster, error: null }), { status: 200 }));
+        // `/runs` answers its wire shape; a bare array is not a `RunsResponse`.
+        if (path === "/runs") return Promise.resolve(new Response(JSON.stringify({ runs: [], generated_at_ms: 1 }), { status: 200 }));
         return Promise.resolve(new Response("[]", { status: 200 }));
       }),
     );

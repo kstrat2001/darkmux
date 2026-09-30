@@ -680,8 +680,17 @@ export function EventLogColumn({
     // sub-execution inside this session, never who ran the session.
     const handles = new Set(records.filter(handleNamesExecution).map((r) => r.handle).filter(Boolean) as string[]);
     const one = (set: Set<string>) => (set.size === 1 ? [...set][0] : null);
+    // One machine, and it has a name to say: the header names it once. One
+    // machine nothing has named says nothing (there is nothing to tell apart);
+    // several machines are named on each row.
     const machineKey = one(machineKeys);
-    return { machine: machineKey === null ? null : (machines.label.get(machineKey) ?? null), session: one(sessions), handle: one(handles) };
+    const named = machineKey !== null && machines.aliases.has(machineKey);
+    return {
+      machine: named ? (machines.label.get(machineKey) ?? null) : null,
+      severalMachines: machineKeys.size > 1,
+      session: one(sessions),
+      handle: one(handles),
+    };
   }, [records, machines]);
 
   // (#2068) The followed record is throttled: at playback speed the newest
@@ -1501,7 +1510,7 @@ export function EventLogColumn({
                       <span className="eventlog__ractivity">{activityOf(r)}</span>
                     </>
                   )}
-                  {!shared.machine && machineLabelOf(machines.label, r) ? <span className="eventlog__recmachine"> · {machineLabelOf(machines.label, r)}</span> : null}
+                  {shared.severalMachines && machineLabelOf(machines.label, r) ? <span className="eventlog__recmachine"> · {machineLabelOf(machines.label, r)}</span> : null}
                   {r.session_id && !shared.session ? <span className="eventlog__recsession"> · {r.session_id}</span> : null}
                   {obj.text ? (
                     <span className={`eventlog__recobj${obj.mono ? " eventlog__recobj--mono" : ""}${obj.kind === "think" ? " eventlog__recobj--dim" : ""}`}>
