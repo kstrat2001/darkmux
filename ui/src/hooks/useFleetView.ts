@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useMemo, useRef } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../lib/queryKeys";
@@ -38,10 +38,17 @@ export function useFleetView(enabled: boolean): FleetViewResult {
     refetchInterval: isDaemon ? PRESENCE_POLL_MS : false,
     staleTime: isDaemon ? 0 : Infinity,
   });
+  // `fetchJson` reports a failed read as DATA (`ok: false`), so a refetch that
+  // fails (a tab waking from sleep, a blip) replaces the rows with nothing and
+  // the cards fall back to the flow-only path. The last good rows are kept
+  // until a read succeeds again, so one failed poll does not redraw the fleet.
+  const lastGood = useRef<readonly FleetMachine[] | null>(null);
   return useMemo(() => {
     // `?? null`: `ok: true` only proves the body parsed as JSON, not that it
     // matches `FleetView`.
-    const rows = query.data?.ok ? (query.data.data.machines ?? null) : null;
-    return { rows, answered: !active || query.status !== "pending" };
+    const fresh = query.data?.ok ? (query.data.data.machines ?? null) : null;
+    if (!active) lastGood.current = null;
+    else if (fresh) lastGood.current = fresh;
+    return { rows: fresh ?? lastGood.current, answered: !active || query.status !== "pending" };
   }, [active, query.data, query.status]);
 }

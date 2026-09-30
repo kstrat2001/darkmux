@@ -13,6 +13,7 @@ import { REPLAY_GRANULARITY_NOTE, useLiveOverlay } from "../../lib/liveChannel";
 import { useCountUp } from "../../hooks/useCountUp";
 import { useFleetRoster, useLiveMachines } from "../../hooks/useLiveMachines";
 import { useFleetView } from "../../hooks/useFleetView";
+import { cardOrderKey, orderCards } from "./cardOrder";
 import { getSource, runsSrc, runsReachable } from "../../lib/source";
 import { useLiveSessionIds } from "../../hooks/useLiveSessionIds";
 import { machineUids, machPresent, machineNames, isSelfMachine, LIVE_WINDOW_MS } from "../../lib/flow";
@@ -857,47 +858,50 @@ export function FleetLens({
   // state, pages, utility strip) are then derived per render from the base,
   // touching only the running sessions, so a live sample never rescans the
   // window. A replay keys the base on the playhead itself.
-  const baseCards = useMemo(
-    () => [
-      ...viewCards.map(({ facts }) =>
-        buildFleetCardBase(
-          flowWindow.data,
-          liveMachines,
-          specs,
-          presence,
-          false,
-          facts.uid,
-          liveMode,
-          playheadT,
-          facts,
-          // (#1923) `Run.machine` carries only a display NAME
-          // (`runsForMachine`'s own doc): the machine's aliases, plus the
-          // name the view gives it.
-          runsForMachine(runs, new Set([...machineNames(flowWindow.data, liveMachines, facts.uid), ...(facts.name ? [facts.name] : [])])),
-          roster,
-          policy,
-        ),
+  const baseCards = useMemo(() => {
+    const viewBases = viewCards.map(({ row, facts }) => ({
+      order: { self: row.is_this_machine, key: cardOrderKey(row.machine_uid, facts.uid) },
+      base: buildFleetCardBase(
+        flowWindow.data,
+        liveMachines,
+        specs,
+        presence,
+        false,
+        facts.uid,
+        liveMode,
+        playheadT,
+        facts,
+        // (#1923) `Run.machine` carries only a display NAME
+        // (`runsForMachine`'s own doc): the machine's aliases, plus the
+        // name the view gives it.
+        runsForMachine(runs, new Set([...machineNames(flowWindow.data, liveMachines, facts.uid), ...(facts.name ? [facts.name] : [])])),
+        roster,
+        policy,
       ),
-      ...flowOnlyUids.map((m) =>
-        buildFleetCardBase(
-          flowWindow.data,
-          liveMachines,
-          specs,
-          presence,
-          machPresent(flowWindow.data, liveMachines, playheadT, m) === false,
-          m,
-          liveMode,
-          playheadT,
-          null,
-          runsForMachine(runs, machineNames(flowWindow.data, liveMachines, m)),
-          roster,
-          policy,
-        ),
+    }));
+    const flowBases = flowOnlyUids.map((m) => ({
+      order: { self: isSelfMachine(flowWindow.data, liveMachines, specs, m), key: cardOrderKey(m, m) },
+      base: buildFleetCardBase(
+        flowWindow.data,
+        liveMachines,
+        specs,
+        presence,
+        machPresent(flowWindow.data, liveMachines, playheadT, m) === false,
+        m,
+        liveMode,
+        playheadT,
+        null,
+        runsForMachine(runs, machineNames(flowWindow.data, liveMachines, m)),
+        roster,
+        policy,
       ),
-    ],
+    }));
+    // The ONE place the card order is decided (`cardOrder.ts`): neither the
+    // view's order nor the flow window's, so which source answered first
+    // never moves a card.
+    return orderCards([...viewBases, ...flowBases], (b) => b.order).map((b) => b.base);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- `playheadT` is read through `liveEdgeClock` on purpose (#2928, above).
-    [viewCards, flowOnlyUids, flowWindow.data, liveEdgeClock, liveMachines, specs, presence, liveMode, runs, roster, policy],
-  );
+  }, [viewCards, flowOnlyUids, flowWindow.data, liveEdgeClock, liveMachines, specs, presence, liveMode, runs, roster, policy]);
   const cards = useMemo(
     () => baseCards.map((b) => withLiveReadings(b, playheadT, connected, lastContactMs, liveOverlay)),
     [baseCards, playheadT, connected, lastContactMs, liveOverlay],
@@ -918,12 +922,18 @@ export function FleetLens({
   const ticking = livePolling && playhead == null && cards.some((c) => c.liveTokRate !== null);
   useNowMs(ticking);
 
+  // The activity lanes follow the cards' order (`cardOrder.ts`), not the flow
+  // window's, so the two lists cannot disagree or reshuffle as records land.
+  const laneUids = useMemo(
+    () => orderCards(uids, (m) => ({ self: isSelfMachine(flowWindow.data, liveMachines, specs, m), key: cardOrderKey(m, m) })),
+    [uids, flowWindow.data, liveMachines, specs],
+  );
   const timeline = useMemo(
     () =>
       buildActivityTimeline(
         flowWindow.data,
         liveMachines,
-        uids,
+        laneUids,
         presence,
         // The FIXED axis ceiling — never the playhead. See timeline.ts's own
         // doc + this component's `playhead` prop doc for why the two must
@@ -940,7 +950,7 @@ export function FleetLens({
         policy,
       ),
     // eslint-disable-next-line react-hooks/exhaustive-deps -- `playheadT` is read through `liveEdgeClock` on purpose (#2928, above).
-    [flowWindow.data, liveMachines, uids, presence, flowWindow.tMax, windowMinutesNum, liveMode, tMin, liveEdgeClock, fixedRange?.[0], fixedRange?.[1], specs, roster, policy],
+    [flowWindow.data, liveMachines, laneUids, presence, flowWindow.tMax, windowMinutesNum, liveMode, tMin, liveEdgeClock, fixedRange?.[0], fixedRange?.[1], specs, roster, policy],
   );
 
   return (

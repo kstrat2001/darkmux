@@ -3192,3 +3192,62 @@ describe("(#2928) the live overlay on the rendered fleet card", () => {
     store.reset();
   });
 });
+
+// A machine's card position is stable across loading, refetch and source
+// changes: this machine first, then every other machine by its stable key
+// (its uid, or the roster id of a machine only the roster knows), never by the
+// display name a source happens to give it.
+describe("FleetLens — card order is stable", () => {
+  const cardNames = () => [...document.querySelectorAll(".mach-name")].map((n) => n.textContent);
+  const flowRecords = () => {
+    const today = todayUTC();
+    // Flow lists uuid-z first; its name sorts BEFORE uuid-a's, so a name sort
+    // and a uid sort disagree with each other and with the flow order.
+    return [
+      { ts: `${today}T10:00:00.000Z`, machine_uid: "UUID-Z", machine_id: "Apple", session_id: "s1", action: "dispatch.start", handle: "coder" },
+      { ts: `${today}T10:00:01.000Z`, machine_uid: "UUID-A", machine_id: "Zebra", session_id: "s2", action: "dispatch.start", handle: "coder" },
+    ];
+  };
+  const selfSpecs = { machine_uid: "UUID-M", machine_id: "Mac-Self", cpu_brand: "Apple M5" };
+
+  it("flow-only cards order by uid, not by flow order or name", async () => {
+    mockFleetFetch({ flowToday: flowRecords() });
+    renderFleetLens();
+    await waitFor(() => expect(cardNames()).toHaveLength(2));
+    expect(cardNames()).toEqual(["Zebra", "Apple"]);
+  });
+
+  it("this machine is first when the view answers, then the peers by uid, whatever name the view gives a peer", async () => {
+    mockFleetFetch({
+      flowToday: flowRecords(),
+      specs: selfSpecs,
+      view: [viewRow({ machine_uid: "UUID-Z", machine_id: "Apple" }, { entry: { id: "roster-z", address: "100.64.1.2:8765", added_unix_ms: 1 } }), viewRow({ machine_uid: "UUID-A", machine_id: "Zebra" }, { entry: { id: "roster-a", address: "100.64.1.3:8765", added_unix_ms: 1 } })],
+    });
+    renderFleetLens();
+    await waitFor(() => expect(cardNames()).toHaveLength(3));
+    expect(cardNames()[0]).toBe("Mac-Self");
+    expect(cardNames().slice(1)).toEqual(["Zebra", "Apple"]);
+    // The activity lanes follow the same order.
+    expect([...document.querySelectorAll(".lname")].map((n) => n.textContent)).toEqual(cardNames());
+  });
+
+  it("a view read that fails after it answered keeps the cards where they were", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const args = { flowToday: flowRecords(), specs: selfSpecs };
+    mockFleetFetch(args);
+    renderFleetLens({}, queryClient);
+    await waitFor(() => expect(cardNames()).toHaveLength(3));
+    const before = cardNames();
+    expect(before[0]).toBe("Mac-Self");
+    mockFleetFetch({ ...args, fail: { "/fleet/view": 500 } });
+    await act(async () => {
+      await queryClient.refetchQueries({ queryKey: queryKeys.fleetView("/fleet/view") });
+    });
+    // The failed read is what the cache now holds (the test is vacuous if not).
+    expect((queryClient.getQueryData(queryKeys.fleetView("/fleet/view")) as { ok: boolean }).ok).toBe(false);
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 50));
+    });
+    expect(cardNames()).toEqual(before);
+  });
+});
