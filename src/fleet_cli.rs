@@ -382,7 +382,7 @@ fn peer_target_with(
         true,
         provider,
     )?;
-    fleet::pin_on_first_contact(target, &entry.id, provider)
+    fleet::pin_on_first_contact(target, entry, provider)
 }
 
 /// (#2924 MF-3) The address to dial for a roster entry. This machine's own
@@ -1693,20 +1693,26 @@ mod tests {
         assert!(out.is_err(), "an unpinnable peer must not become a target");
     }
 
-    /// Recovery: an entry the roster already pins needs no write, so a
-    /// read-only roster still reads it.
+    /// Recovery and inverse: a peer the saved roster already pins needs no
+    /// write and is confirmed from the saved entry; one the saved roster no
+    /// longer holds is refused, whatever the caller's snapshot said.
     #[test]
     #[serial_test::serial]
-    fn an_already_pinned_peer_needs_no_roster_write() {
-        let tmp = tempfile::tempdir().unwrap();
-        let blocker = tmp.path().join("blocker");
-        std::fs::write(&blocker, "a file, not a directory").unwrap();
-        unsafe { std::env::set_var("DARKMUX_FLEET_FILE", blocker.join("fleet.json")) };
+    fn an_already_pinned_peer_is_confirmed_from_the_saved_roster() {
+        let tmp = isolated_add_env("laptop");
         let mut e = studio_entry();
         e.node_id = Some("nSTUDIO".into());
-        let out = peer_target_with(&e, Some("laptop"), &overlay_provider());
+        let absent = peer_target_with(&e, Some("laptop"), &overlay_provider()).map_err(|e| format!("{e:#}"));
+        fleet::mutate_roster(|r| {
+            r.machines.insert("studio".into(), e.clone());
+            Ok(())
+        })
+        .unwrap();
+        let present = peer_target_with(&e, Some("laptop"), &overlay_provider()).map_err(|e| format!("{e:#}"));
         clear_add_env();
-        assert_eq!(out.map_err(|e| format!("{e:#}")).unwrap().node_id(), Some("nSTUDIO"));
+        drop(tmp);
+        assert!(absent.is_err(), "a snapshot cannot vouch for an entry the roster no longer holds");
+        assert_eq!(present.unwrap().node_id(), Some("nSTUDIO"));
     }
 
 }

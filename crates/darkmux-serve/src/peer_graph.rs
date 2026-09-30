@@ -249,7 +249,7 @@ fn settled_peer_target(
     )
     .inspect_err(|e| refused(e))
     .ok()?;
-    darkmux_fleet::pin_on_first_contact(target, machine, provider).inspect_err(|e| refused(&format!("{e:#}"))).ok()
+    darkmux_fleet::pin_on_first_contact(target, entry, provider).inspect_err(|e| refused(&format!("{e:#}"))).ok()
 }
 
 /// Which machines currently hold a live presence beat, by the SAME

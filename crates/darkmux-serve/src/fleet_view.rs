@@ -795,7 +795,7 @@ fn pinned_listener_target(
     listener_port: u16,
 ) -> Result<SettledTarget, UnreachableReason> {
     let target = listener_target(provider, entry, listener_port)?;
-    darkmux_fleet::pin_on_first_contact(target, &entry.id, provider).map_err(|e| {
+    darkmux_fleet::pin_on_first_contact(target, entry, provider).map_err(|e| {
         eprintln!("darkmux serve: could not pin {} in the roster: {e:#}", entry.id);
         UnreachableReason::PinNotSaved
     })
