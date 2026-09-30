@@ -658,10 +658,22 @@ fn a_daemons_fleet_view_shows_the_other_daemons_card_from_its_listener_with_acce
     assert_eq!(beta["accepts"]["accepts"]["profiles"], serde_json::json!(["cloud"]));
     assert_eq!(beta["accepts"]["accepts"]["roles"], serde_json::json!(["radio-host"]));
     assert_eq!(beta["is_this_machine"], false);
-    assert_eq!(beta["uid_source"], "card", "the row's uid is the verified card's: {beta}");
     assert!(beta["received_at_ms"].is_number() && beta["fetch_ms"].is_number(), "{beta}");
     let card = &beta["card"]["card"];
     assert_eq!(card["specs"]["machine_id"], "beta", "the card is beta's own, not alpha's: {card}");
+    // The hardware uid is a macOS probe (`darkmux_hardware::machine_uid`), so the
+    // promise is conditional: the row's uid is the card's exactly when the card
+    // states one, and there is no source when it does not.
+    match card["specs"]["machine_uid"].as_str() {
+        Some(uid) => {
+            assert_eq!(beta["uid_source"], "card", "the row's uid is the verified card's: {beta}");
+            assert_eq!(beta["machine_uid"], uid, "{beta}");
+        }
+        None => {
+            assert!(beta["uid_source"].is_null(), "no card uid, so no uid source: {beta}");
+            assert!(beta["machine_uid"].is_null(), "{beta}");
+        }
+    }
     let cloud = card["profiles"].as_array().unwrap().iter().find(|p| p["name"] == "cloud").expect("beta's cloud profile");
     assert_eq!(cloud["endpoint_kind"], "unmanaged", "beta's hosted profile: {cloud}");
     assert_eq!(card["default_profile"], "cloud");
