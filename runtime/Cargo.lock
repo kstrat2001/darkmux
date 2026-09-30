@@ -384,6 +384,7 @@ dependencies = [
  "blake3",
  "darkmux-trajectory",
  "httpmock",
+ "libc",
  "serde",
  "serde_json",
  "serial_test",
