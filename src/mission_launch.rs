@@ -1283,10 +1283,7 @@ pub fn launch(
     // inherited `depends_on`/`reads` at the boundary.
     let grow_real_ids = mission_config::interpret::real_task_ids(config, &params);
     let mut grown_events: Vec<crew::mission_config::grow::Grown> = Vec::new();
-    let facts = crew::step_kinds::Facts {
-        utility_binding: crew::concurrent_dispatch::standing_utility_binding(None),
-        ..Default::default()
-    };
+    let facts = crew::concurrent_dispatch::standing_facts(None);
     let est = crew::step_kinds::FixedEstimator::default();
     // (#1400) Tracks which phases this dispatch has already lazy-started —
     // see `lazy_start_phase_for_step`'s doc.

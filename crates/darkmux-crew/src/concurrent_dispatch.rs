@@ -126,6 +126,14 @@ pub fn standing_utility_binding(config_path: Option<&str>) -> Option<String> {
     Some(crate::dispatch_internal::compactor_wire_model_id(id))
 }
 
+/// The [`Facts`] every production launcher hands its scheduler: the standing
+/// utility binding and nothing else. The single builder, so a launcher cannot
+/// forget the binding (a bare `Facts::default()` forfeits the utility hold);
+/// `tests/facts_conformance.rs` pins that each launcher goes through it.
+pub fn standing_facts(config_path: Option<&str>) -> Facts {
+    Facts { utility_binding: standing_utility_binding(config_path), ..Facts::default() }
+}
+
 /// One job's completed outcome: its own value plus every flow record it
 /// produced (see the module doc's "Flow-record ordering" section).
 pub type JobOutcome<T> = Result<(T, Vec<FlowRecord>)>;
