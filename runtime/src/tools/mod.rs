@@ -114,6 +114,22 @@ impl Tool {
         }
     }
 
+    /// Whether this tool only LOOKS at the workspace: it changes nothing and
+    /// its result is what it read. A repeat of these after a compaction is a
+    /// re-read; a repeat of anything else may be progress. Exhaustive, so a
+    /// new tool decides.
+    pub fn inspects_only(self) -> bool {
+        match self {
+            Tool::Read | Tool::Search => true,
+            Tool::Echo
+            | Tool::Bash
+            | Tool::Write
+            | Tool::Edit
+            | Tool::CreateFinding
+            | Tool::CreateMod => false,
+        }
+    }
+
     pub fn description(self) -> &'static str {
         match self {
             Tool::Echo => {

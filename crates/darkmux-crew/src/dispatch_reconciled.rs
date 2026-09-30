@@ -540,6 +540,55 @@ mod tests {
         );
     }
 
+    /// The utility binding at this entry point's own seam: the registry's
+    /// standing utility resident survives a reconcile that would otherwise
+    /// evict it as an orphan; with no utility registered it is evicted.
+    #[serial_test::serial]
+    #[test]
+    fn dispatch_reconciled_holds_the_registrys_standing_utility_resident() {
+        let _env = LeaseTestEnv::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut evictions = Vec::new();
+        for (name, internal) in [
+            ("with", r#","internal":{"utility":{"id":"util-4b","n_ctx":32000}}"#),
+            ("without", ""),
+        ] {
+            let pf = dir.path().join(format!("{name}.json"));
+            std::fs::write(&pf, format!(r#"{{"profiles":{{"p":{{"models":[{{"id":"m","n_ctx":4096}}]}}}}{internal}}}"#)).unwrap();
+            let host = Arc::new(Mutex::new(
+                MockHost::new().resident("darkmux:util-4b", "util-4b", 32_000, Some(1_000)).cataloged("m", 1_000),
+            ));
+            let factory = host_factory_over(host.clone());
+            let mut opts = test_opts("coder");
+            opts.config_path = Some(pf.to_string_lossy().to_string());
+            dispatch_reconciled_with(
+                opts,
+                SeatClaim::LocalModel(placement("m", 8_000)),
+                |_| {
+                    Ok(DispatchResult {
+                        exit_code: 0,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        session_id: crate::test_session("n"),
+                        execution: None,
+                        out_dir: None,
+                        trajectory: None,
+                    })
+                },
+                factory.as_ref(),
+            )
+            .unwrap();
+            let evicted = host
+                .lock()
+                .unwrap()
+                .ops
+                .iter()
+                .any(|op| matches!(op, HostOp::Unload { identifier } if identifier == "darkmux:util-4b"));
+            evictions.push((name, evicted));
+        }
+        assert_eq!(evictions, vec![("with", false), ("without", true)]);
+    }
+
     /// **RED-PROVE inverted case (mandatory): a non-namespaced (user-owned)
     /// resident must NEVER be unloaded**, whatever this dispatch's own
     /// desired set is. `foreign-model` here carries no `darkmux:` prefix

@@ -143,7 +143,8 @@ pub fn dispatch_routed_via(
 /// ([`SingleShotJob`]); a dispatch that stays here ignores it, because the
 /// caller's `local_dispatch` is already that primitive. `boundary` travels the
 /// same way and is enforced by the receiver against the profile it resolves
-/// ([`Boundary`]); a dispatch that stays here has nothing to enforce it on.
+/// ([`Boundary`]); a dispatch that stays here is checked by
+/// [`enforce_local_boundary`] against the profile it resolves on this machine.
 pub fn dispatch_routed_single_shot(
     mut opts: DispatchOpts,
     single_shot: Option<SingleShotJob>,
@@ -164,6 +165,7 @@ pub fn dispatch_routed_single_shot(
                 // The address is spent: the local path resolves the bare
                 // profile name against this machine's own registry.
                 opts.machine = None;
+                enforce_local_boundary(&opts, boundary)?;
             }
             RoutingDecision::Remote {
                 target,
@@ -240,7 +242,28 @@ pub fn dispatch_routed_single_shot(
     }
 
     // Local fall-through — no address naming another machine means run here.
+    enforce_local_boundary(&opts, boundary)?;
     local_dispatch(opts)
+}
+
+/// The data boundary for a dispatch that stays on this machine, enforced the
+/// way a receiver enforces it: the profile the dispatch resolves here
+/// (`dispatch_resolves_remote`, which fails closed) must not be a hosted
+/// endpoint under `managed_only`. Refused with the typed boundary refusal a
+/// peer's refusal carries, so a caller that re-asks with hosted-safe data on
+/// [`RefusalCode::Boundary`] does the same for a seat here.
+fn enforce_local_boundary(opts: &DispatchOpts, boundary: Option<Boundary>) -> Result<()> {
+    let refusal = match boundary {
+        None => return Ok(()),
+        Some(Boundary::ManagedOnly) => {
+            if !dispatch::dispatch_resolves_remote(&opts.role_id, opts.profile_name.as_deref(), None) {
+                return Ok(());
+            }
+            crate::Refusal::BoundaryUnmanaged { profile: opts.profile_name.clone().unwrap_or_else(|| "(default)".into()) }
+        }
+        Some(Boundary::Unknown) => crate::Refusal::BoundaryUnknown,
+    };
+    Err(anyhow::Error::new(crate::SubmitRefused { code: refusal.code(), reason: refusal.reason("this machine") }))
 }
 
 /// Submit a dispatch to `target`'s fleet listener instead of running it
@@ -752,6 +775,81 @@ mod tests {
             let sent: serde_json::Value = serde_json::from_str(&rx.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap();
             assert_eq!(sent["job"]["single_shot"], expected, "{sent}");
         }
+    }
+
+    /// A registry with one local and one hosted profile, for the boundary
+    /// checks of a dispatch that stays here. Restores the env on drop.
+    struct Registry {
+        _dir: tempfile::TempDir,
+        prev: Option<String>,
+    }
+
+    impl Registry {
+        fn new() -> Self {
+            let dir = tempfile::TempDir::new().unwrap();
+            let file = dir.path().join("profiles.json");
+            std::fs::write(
+                &file,
+                r#"{"profiles":{"cloud":{"models":[{"id":"hosted-model","n_ctx":32000,"endpoint":"mock"}]},
+                                "deep":{"models":[{"id":"local-deep","n_ctx":8000}]}},
+                    "endpoints":{"mock":{"url":"http://127.0.0.1:9/v1"}},
+                    "default_profile":"deep"}"#,
+            )
+            .unwrap();
+            let prev = std::env::var("DARKMUX_PROFILES").ok();
+            unsafe { std::env::set_var("DARKMUX_PROFILES", &file) };
+            Self { _dir: dir, prev }
+        }
+    }
+
+    impl Drop for Registry {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var("DARKMUX_PROFILES", v),
+                    None => std::env::remove_var("DARKMUX_PROFILES"),
+                }
+            }
+        }
+    }
+
+    fn local_result() -> Result<DispatchResult> {
+        Ok(DispatchResult { exit_code: 0, stdout: "here".into(), stderr: String::new(), session_id: crate::test_session("s"), execution: None, out_dir: None, trajectory: None })
+    }
+
+    /// A profile address naming THIS machine runs here: the address is spent,
+    /// nothing crosses the wire, and under `managed_only` a local profile runs
+    /// while a hosted one is refused with the typed boundary refusal BEFORE the
+    /// local dispatch is called (the routing layer no longer relies on the
+    /// caller's own grounding choice alone).
+    #[test]
+    #[serial]
+    fn an_address_naming_this_machine_enforces_the_boundary_on_the_local_seat() {
+        let (port, rx) = spawn_scripted_peer("{\"status\":\"completed\",\"exit_code\":0,\"stdout\":\"done\"}\n");
+        let _env = PeerEnv::new(port);
+        let _registry = Registry::new();
+
+        let mut opts = local_opts("radio-host");
+        opts.profile_name = Some("deep@local-a".to_string());
+        let mut seen = None;
+        let r = dispatch_routed_single_shot(opts, None, Some(Boundary::ManagedOnly), |o| {
+            seen = Some((o.machine.clone(), o.profile_name.clone()));
+            local_result()
+        });
+        assert_eq!(r.unwrap().stdout, "here");
+        assert_eq!(seen, Some((None, Some("deep".to_string()))), "the address is spent before the local dispatch");
+
+        for profile in ["cloud@local-a", "cloud"] {
+            let mut opts = local_opts("radio-host");
+            opts.profile_name = Some(profile.to_string());
+            let err = dispatch_routed_single_shot(opts, None, Some(Boundary::ManagedOnly), |_| panic!("a hosted seat never runs under managed_only")).unwrap_err();
+            assert_eq!(err.downcast_ref::<crate::SubmitRefused>().map(|r| r.code), Some(crate::RefusalCode::Boundary), "{profile}: {err:#}");
+        }
+
+        let mut opts = local_opts("radio-host");
+        opts.profile_name = Some("cloud@local-a".to_string());
+        assert!(dispatch_routed_single_shot(opts, None, None, |_| local_result()).is_ok(), "no boundary, no check");
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "nothing was submitted to a peer");
     }
 
     /// The boundary crosses with the job, and a refusal at it reaches the

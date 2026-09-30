@@ -290,6 +290,13 @@ const STALE_PROMPT_TOKENS_TURNS: u32 = 3;
 /// compactions across 50 turns.
 const UNPRODUCTIVE_COMPACTION_TURNS: u32 = 5;
 
+/// (#3013) Consecutive compactions whose next turn re-reads what the turn
+/// before it read, before the run escalates. The same five as
+/// [`UNPRODUCTIVE_COMPACTION_TURNS`], for the same reason: one or two repeats
+/// are ordinary (the model needs a file it just lost from context); five in a
+/// row is a shape.
+const COMPACTION_REREAD_TURNS: u32 = 5;
+
 /// (#2792) Smallest tool-result body the LAST-RESORT pre-send trim will touch.
 ///
 /// Deliberately far below the soft path's 4,000-byte threshold. That constant
@@ -402,6 +409,14 @@ pub enum EscalationReason {
     /// is busy. This is the one that does not need the operator to have
     /// predicted the failure in advance.
     CompactionUnproductive,
+    /// (#3013) Every compaction succeeds, and the turn after each one
+    /// inspects exactly what the turn before it did: the model re-reads the
+    /// files the summary told it not to. Distinct from
+    /// [`CompactionUnproductive`], which needs the thread to stay above the
+    /// trigger; here each compaction is productive and the loop is in the
+    /// WORK, so no occupancy counter ever grows. Fires after
+    /// [`COMPACTION_REREAD_TURNS`] consecutive repeats.
+    CompactionRereadLoop,
     /// (#414 PR A) Intra-turn stall recovery budget
     /// ([`MAX_STALL_RECOVERIES`], operator-overridable via
     /// `runtime.max_stall_recoveries` — #2190) exhausted. Fires when the
@@ -470,6 +485,7 @@ pub fn escalation_reason_str(reason: EscalationReason) -> &'static str {
     match reason {
         EscalationReason::CompactionLimitReached => "escalation_compaction_limit_reached",
         EscalationReason::CompactionUnproductive => "escalation_compaction_unproductive",
+        EscalationReason::CompactionRereadLoop => "escalation_compaction_reread_loop",
         EscalationReason::CumulativeTokensExceeded => "escalation_cumulative_tokens_exceeded",
         EscalationReason::IntraTurnStallExhausted => "escalation_intra_turn_stall_exhausted",
         // (#2190) Deliberately NOT `..._exhausted` — the issue's own spec
@@ -584,6 +600,42 @@ fn resolve_turn_delay_ms(configured_ms: u64, budget_secs: u64) -> (u64, Option<S
 /// A reported token count as the loop's `u32` counters hold it.
 fn saturating_u32(n: u64) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+/// (#3013) Announce the re-read loop escalation: the operator-visible line
+/// and the `EscalationTriggered` trajectory record. The caller returns the
+/// `LoopOutcome`, carrying every banked turn out as the other compaction
+/// bounds do.
+fn announce_reread_loop(
+    trajectory: &mut Trajectory,
+    turns: u32,
+    repeats: u32,
+    model: &str,
+    latest_prompt_tokens: u32,
+) {
+    eprintln!(
+        "darkmux-runtime: {repeats} compactions in a row were followed by a turn that \
+         re-read exactly what the turn before the compaction read. Each compaction \
+         succeeds and each re-read refills the context, so the run cannot converge. \
+         ESCALATING to the frontier rather than repeating the loop. (#3013)"
+    );
+    trajectory.append_escalation_triggered(
+        turns,
+        escalation_reason_str(EscalationReason::CompactionRereadLoop),
+        model,
+        latest_prompt_tokens,
+    );
+}
+
+/// How the per-call-budget line names a turn's completion tokens: the
+/// endpoint's count, else the runtime's estimate marked as one, else the
+/// plain statement that the server reported none.
+fn completion_tokens_label(reported: Option<u32>, estimate: Option<u32>) -> String {
+    match (reported, estimate) {
+        (Some(n), _) => format!("{n} completion tokens"),
+        (None, Some(n)) => format!("~{n} completion tokens (the runtime's estimate; the server reported none)"),
+        (None, None) => "an unknown number of completion tokens (not reported by the server)".to_string(),
+    }
 }
 
 fn extend_deadline_by_rest(deadline: std::time::Instant, rest_ms: u64) -> std::time::Instant {
@@ -1768,6 +1820,28 @@ fn run_with_sleeper(
     // retrying gcc inside sandbox where it doesn't exist). Sibling to the cycle
     // detector; same MVP shape (warn-only).
     let mut failure_rate_detector = FailureRateDetector::new();
+    // DETECTOR STATE DOES NOT SURVIVE A RESUME, ON PURPOSE. The detectors
+    // above and below (cycle, failure rate, reasoning loop, malformed turns,
+    // the unproductive-compaction and re-read counters) start empty on every
+    // process, including one that resumes a checkpoint. Two facts make that
+    // correct rather than a gap:
+    //
+    // 1. A host pause (the thermal governor's `pace.json`) does NOT end the
+    //    process: the loop rests in bounded increments inside it (see
+    //    `pace`), so a paused run keeps every detector's window. Only a
+    //    kill followed by `--resume` restarts them, and that is an explicit
+    //    act by the host or the operator, not a runaway.
+    // 2. The bounds that stop a runaway are NOT detector state and DO carry
+    //    across the resume: the turn count, the cumulative completion
+    //    tokens (`max_cumulative_tokens`) and the compaction count
+    //    (`bail_after_compactions`) are all restored from the checkpoint. A
+    //    run killed and resumed every few turns still hits those.
+    //
+    // What a fresh window loses is the warn-only history of the last few
+    // tool calls, which a checkpoint does not record. The alternative,
+    // persisting the windows, would put a detector's schema in the
+    // checkpoint's compatibility contract for a heuristic whose failure mode
+    // is one extra warning.
     // (#799) Accumulate bash invocations that FAILED TO RUN (never executed) —
     // stamped onto the outcome/envelope as the verifier-fabrication backstop.
     let mut failed_to_run: Vec<FailedExec> = Vec::new();
@@ -1867,7 +1941,8 @@ fn run_with_sleeper(
     // (#2793) Consecutive compactions that installed and still left occupancy
     // above the trigger. (#2805) No latch — reaching the bound escalates and
     // returns, so the episode cannot repeat within a dispatch.
-    let mut consecutive_unproductive_compactions: u32 = 0;
+    let mut unproductive_compactions = crate::unproductive_compactions::UnproductiveCompactions::new();
+    let mut compaction_repeat = crate::compaction_repeat::CompactionRepeat::new();
 
     // (#2114) Reads + parses `pace.json` on demand (not once at startup
     // like `turn_delay_ms` below — the pace file is meant to change
@@ -2766,7 +2841,7 @@ fn run_with_sleeper(
         // one. Read-only from here down.
         let opened_a_new_turn = !resuming_after_checkpoint;
         let next_seq = if resuming_after_checkpoint { turns } else { turns + 1 };
-        let (mut response, runtime_cut) = if streaming {
+        let (mut response, runtime_cut, cut_estimate) = if streaming {
             let outcome = run_streaming_turn(
                 client,
                 &request,
@@ -2780,13 +2855,13 @@ fn run_with_sleeper(
                     tick: STREAM_TICK,
                 },
             )?;
-            (outcome.response, outcome.cut)
+            (outcome.response, outcome.cut, outcome.estimated_completion_tokens)
         } else {
             // (#2836) Nothing to observe on a non-streamed call: the whole
             // response arrives at once, so the runtime never has the chance
             // to end it early. The server is the only possible cutter here,
             // and it stays that way through Stage 1.
-            (client.chat(&request)?, CutSource::None)
+            (client.chat(&request)?, CutSource::None, None)
         };
         // (#1221) A checkpoint continuation is the SAME logical turn resuming,
         // so it must not consume a turn. It is a new API CALL, which is why
@@ -2909,7 +2984,13 @@ fn run_with_sleeper(
         // distinction matters.
         let usage = response.usage.as_ref();
         let this_turn_completion_tokens: Option<u32> = usage.and_then(|u| u.completion).map(saturating_u32);
-        total_completion_tokens = total_completion_tokens.saturating_add(this_turn_completion_tokens.unwrap_or(0));
+        // (B1) A turn the runtime cut has no endpoint count, but its tokens
+        // were spent: the run's total and the cumulative cap take the
+        // runtime's own estimate. The trajectory keeps the two apart
+        // (`usage: null` plus `completion_estimate`), so nothing downstream
+        // reads the estimate as a reported figure.
+        total_completion_tokens = total_completion_tokens
+            .saturating_add(this_turn_completion_tokens.or(cut_estimate).unwrap_or(0));
         // The prompt count is the ground truth everything below calibrates
         // against, so all of it needs one the endpoint actually reported.
         if let Some(prompt_tokens) = usage.and_then(|u| u.prompt).map(saturating_u32) {
@@ -3013,7 +3094,10 @@ fn run_with_sleeper(
         trajectory.append_model_completed(
             turns,
             &trajectory_finish_reason,
-            response.usage.as_ref(),
+            crate::trajectory::CallTokens {
+                reported: response.usage.as_ref(),
+                estimate: cut_estimate.map(u64::from),
+            },
             trajectory_tool_calls.as_deref(),
             Some(&call_runs),
             response.served_model(),
@@ -3629,6 +3713,7 @@ fn run_with_sleeper(
                 // after it and stamp that onto a checkpoint — see the
                 // write at the bottom of this loop body.
                 let calls_snapshot = calls.clone();
+                compaction_repeat.record_turn(crate::compaction_repeat::inspected_set(&calls_snapshot));
                 for (tool_seq, call) in calls.into_iter().enumerate() {
                     // (#418) Record the call into the cycle detector
                     // BEFORE dispatch so the suspicion event lands
@@ -4131,12 +4216,8 @@ fn run_with_sleeper(
                         // successful, which is exactly why this is invisible
                         // from the compaction records alone.
                         let trigger = compaction_cfg.effective_trigger_tokens();
-                        if tokens_after >= trigger {
-                            consecutive_unproductive_compactions =
-                                consecutive_unproductive_compactions.saturating_add(1);
-                        } else {
-                            consecutive_unproductive_compactions = 0;
-                        }
+                        let consecutive_unproductive_compactions =
+                            unproductive_compactions.record(tokens_after, trigger);
                         // (#2805) No "fire once" latch any more: this block
                         // RETURNS, so the condition cannot recur within a
                         // dispatch. #2793 needed the latch because it reported
@@ -4196,6 +4277,30 @@ fn run_with_sleeper(
                                 final_answer: None,
                                 terminal_reason: TerminalReason::EscalationTriggered(
                                     EscalationReason::CompactionUnproductive,
+                                ),
+                                messages,
+                                turn_delay_effective_ms: turn_delay_ms,
+                                failed_to_run: failed_to_run.clone(),
+                            });
+                        }
+
+                        // (#3013) A compaction that succeeded is still a loop
+                        // when the turn after each one re-reads the turn
+                        // before it. The counter is fed at the top of every
+                        // tool turn; this is the only place it is read.
+                        compaction_repeat.compacted();
+                        if compaction_repeat.consecutive() >= COMPACTION_REREAD_TURNS {
+                            announce_reread_loop(
+                                trajectory,
+                                turns,
+                                compaction_repeat.consecutive(),
+                                model,
+                                latest_prompt_tokens,
+                            );
+                            return Ok(LoopOutcome {
+                                final_answer: None,
+                                terminal_reason: TerminalReason::EscalationTriggered(
+                                    EscalationReason::CompactionRereadLoop,
                                 ),
                                 messages,
                                 turn_delay_effective_ms: turn_delay_ms,
@@ -4269,7 +4374,7 @@ fn run_with_sleeper(
                     // needed none means the thread came back under the line
                     // on its own. Without this the count would carry across a
                     // resolved episode and fire early on the next one.
-                    consecutive_unproductive_compactions = 0;
+                    unproductive_compactions.end_episode();
                 }
 
                 // Loop back and call chat() again.
@@ -4861,9 +4966,7 @@ fn run_with_sleeper(
                     messages.pop();
                     turn.hand_back(&mut messages);
                 }
-                let tokens_str = this_turn_completion_tokens
-                    .map(|n| n.to_string())
-                    .unwrap_or_else(|| "<unknown>".to_string());
+                let tokens_str = completion_tokens_label(this_turn_completion_tokens, cut_estimate);
                 let shape = if is_useless_stall {
                     "reasoning-only up to the cap"
                 } else {
@@ -4874,7 +4977,7 @@ fn run_with_sleeper(
                 // one-per-hit summary the operator scans for.
                 eprintln!(
                     "darkmux-runtime: ⏸ per-call budget reached — turn {turns} \
-                     emitted {tokens_str} completion tokens ({shape}); the turn's \
+                     emitted {tokens_str} ({shape}); the turn's \
                      reasoning was NOT discarded. Recovery budget \
                      {stall_recoveries_used}/{stall_recovery_budget}. (#1221)"
                 );
@@ -5131,6 +5234,7 @@ fn run_streaming_turn(
     }
     let partial_count = accumulator.partial_count();
     let total_content = accumulator.content_bytes();
+    let generated_bytes = accumulator.generated_bytes();
     let reasoning_content = accumulator.take_reasoning_content();
     let mut response = accumulator.into_response();
     let tool_calls_count = response
@@ -5154,6 +5258,11 @@ fn run_streaming_turn(
         }
         response.usage = None;
     }
+    // (B1) The only count a cut call has: what the runtime itself saw
+    // stream past before it ended the call. Marked as an estimate all the
+    // way to the trajectory; never folded in as a reported figure.
+    let estimated_completion_tokens = matches!(cut, CutSource::RuntimeAbort(_))
+        .then(|| saturating_u32(generated_bytes.div_ceil(crate::stream_gate::CHARS_PER_TOKEN) as u64));
     // (#2836) Stamped ONLY on a call that emitted no tool calls, and the
     // restriction is the whole point rather than a nicety.
     //
@@ -5201,7 +5310,7 @@ fn run_streaming_turn(
     // itself, so the runtime is never the cutter here. Stage 1 feeds each
     // chunk to a `StreamGate` and reports `RuntimeAbort` when it
     // intervenes; the caller already routes on this field.
-    Ok(StreamOutcome { response, cut })
+    Ok(StreamOutcome { response, cut, estimated_completion_tokens })
 }
 
 /// Measure per-turn context size: returns `(system_chars, prompt_chars)`.
@@ -8849,6 +8958,68 @@ mod tests {
             .expect("the stream gate itself must have aborted the call");
         assert_eq!(abort["policy"], "conclude", "got {abort}");
         assert_eq!(abort["acted"], true, "got {abort}");
+    }
+
+    /// (B1) Promise: every model call's tokens reach the run's totals and
+    /// its caps, including a turn the RUNTIME ended. The cut call never gets
+    /// the endpoint's `usage`, so the runtime counts what streamed past. The
+    /// trajectory keeps that apart from a reported figure (`usage` stays
+    /// null, `completion_estimate` carries the number), and the cumulative
+    /// cap sees it: without it a run cut every turn escapes the cap.
+    #[test]
+    #[serial_test::serial]
+    fn a_runtime_cut_turn_counts_toward_the_cumulative_cap_and_is_marked_an_estimate() {
+        let looped: String = "the same thing over and over ".repeat(400);
+        let server = crate::test_support::GuardedMockServer::start();
+        let mut pieces: Vec<&str> = vec!["<think>"];
+        pieces.extend(looped.split_inclusive(' '));
+        let body = sse(&pieces, "stop", 2_000);
+        server.mock(move |when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).header("content-type", "text/event-stream").body(body.clone());
+        });
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("cut-accounting").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let cfg = compaction::CompactionConfig::never_compact();
+        let outcome = run_with_sleeper(
+            &client, &client, "m",
+            vec![Message::system("s"), Message::user("go")],
+            &[Tool::Read], &mut traj, true, &cfg,
+            Some(5), Some(100), Some(9_000), Some(1_000), Some(1_000),
+            None, std::collections::BTreeMap::new(), None,
+            tmp.path(), "test-role", None, &RealSleeper,
+        )
+        .expect("a cut turn must never be fatal to the dispatch");
+        assert_eq!(
+            outcome.terminal_reason,
+            TerminalReason::EscalationTriggered(EscalationReason::CumulativeTokensExceeded),
+            "the cut turn's tokens must reach the cumulative cap"
+        );
+        let text = std::fs::read_to_string(tmp.path().join(".darkmux-runtime").join("trajectory.jsonl")).unwrap();
+        let completed = text
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["type"] == "model.completed")
+            .expect("a model.completed record for the cut turn");
+        assert!(completed["usage"].is_null(), "the cut call has no reported usage; got {completed}");
+        assert!(
+            completed["completion_estimate"].as_u64().unwrap_or(0) > 100,
+            "the runtime's estimate is recorded apart from usage; got {completed}"
+        );
+    }
+
+    /// (B1) The per-call-budget line never says a bare `<unknown>`: it names
+    /// the count, the runtime's estimate as an estimate, or that the server
+    /// reported none.
+    #[test]
+    fn the_per_call_budget_line_names_what_it_knows_about_a_turns_tokens() {
+        assert_eq!(completion_tokens_label(Some(7), None), "7 completion tokens");
+        assert_eq!(completion_tokens_label(Some(7), Some(9)), "7 completion tokens");
+        assert!(completion_tokens_label(None, Some(9)).contains("~9"));
+        assert!(completion_tokens_label(None, Some(9)).contains("estimate"));
+        assert!(completion_tokens_label(None, None).contains("not reported by the server"));
+        assert!(!completion_tokens_label(None, None).contains("<unknown>"));
     }
 
     /// (#2846) `record` (was `observe`) measures and records without acting.
@@ -14740,9 +14911,12 @@ mod tests {
                 Some(serde_json::json!([{
                     "id": "call_1",
                     "type": "function",
+                    // `echo`, not `read`: a run that re-reads the same files
+                    // after every compaction is bounded on purpose (#3013),
+                    // and this test is about the compaction COUNT bound only.
                     "function": {
-                        "name": "read",
-                        "arguments": "{\"path\":\"/workspace/x.txt\",\"offset\":1,\"limit\":0}",
+                        "name": "echo",
+                        "arguments": "{\"text\":\"still working\"}",
                     },
                 }])),
                 "tool_calls",
@@ -14786,7 +14960,7 @@ mod tests {
             initial.push(Message::user(format!("padding user {i}: {pad}")));
             initial.push(Message::assistant(format!("padding assistant {i}: {pad}")));
         }
-        let tools = [Tool::Read];
+        let tools = [Tool::Echo];
 
         // Loop hits MAX_TURNS (mock loops forever). The key
         // assertion: terminal_reason must be MaxTurns, NOT
@@ -14803,6 +14977,342 @@ mod tests {
             crate::trajectory::recorded(tmp.path()).compactions() >= 1,
             "compaction still fires; bail just doesn't kick in"
         );
+    }
+
+    /// The config both #3013 tests use: every compaction is PRODUCTIVE (a
+    /// short summary leaves the thread far under the trigger), so the
+    /// unproductive-compaction counter never grows.
+    fn productive_compaction_cfg() -> compaction::CompactionConfig {
+        compaction::CompactionConfig {
+            compactor_context_window: None,
+            threshold_tokens: 5_000,
+            compactor_model: Some("test-compactor".to_string()),
+            threshold_ratio: None,
+            context_window: None,
+            strategy: compaction::CompactionStrategy::Narrative,
+            bail_after_compactions: None,
+            custom_instructions: None,
+        }
+    }
+
+    /// Over the 200-char floor a compaction summary must clear to install,
+    /// and far under the trigger once installed.
+    const SHORT_SUMMARY: &str = "Summary of prior work: the four implementation files were read and understood. Their contents are captured in the plan above. Do not read them again; make the edits the plan calls for and run the tests to finish the task.";
+
+    fn read_call_json(path: &str) -> serde_json::Value {
+        serde_json::json!([{
+            "id": "call_1",
+            "type": "function",
+            "function": {
+                "name": "read",
+                "arguments": format!("{{\"path\":\"{path}\",\"offset\":1,\"limit\":0}}"),
+            },
+        }])
+    }
+
+    fn seeded_thread() -> Vec<Message> {
+        let filler = "seed content ".repeat(80);
+        (0..10)
+            .map(|i| {
+                if i == 0 {
+                    Message::system("test system")
+                } else {
+                    Message::user(format!("turn {i}: {filler}"))
+                }
+            })
+            .collect()
+    }
+
+    /// (#3013) Promise: a run whose post-compaction turns repeat the
+    /// pre-compaction work is bounded and escalated. The live shape: read the
+    /// same files, compact (productively, so #2807 never counts it), read the
+    /// same files again, forever. `max_turns` is 40; only the re-read
+    /// detector can end this run before it.
+    #[test]
+    #[serial_test::serial]
+    fn a_run_that_rereads_the_same_files_after_every_productive_compaction_escalates() {
+        let server = crate::test_support::GuardedMockServer::start();
+        let four_reads = serde_json::json!(["a", "b", "c", "d"].map(|f| serde_json::json!({
+            "id": format!("call_{f}"),
+            "type": "function",
+            "function": {"name": "read", "arguments": format!("{{\"path\":\"/workspace/{f}.txt\",\"offset\":1,\"limit\":0}}")},
+        })));
+        let _primary = server.mock(move |when, then| {
+            when.method(POST).path("/v1/chat/completions").body_contains("\"model\":\"test-primary\"");
+            then.status(200).json_body(chat_response_json(None, Some(four_reads.clone()), "tool_calls", 9_000, 50));
+        });
+        let compactor = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").body_contains("\"model\":\"test-compactor\"");
+            then.status(200).json_body(chat_response_json(Some(SHORT_SUMMARY), None, "stop", 500, 30));
+        });
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("reread-loop").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let outcome = run(
+            &client, &client, "test-primary", seeded_thread(), &[Tool::Read], &mut traj, false,
+            &productive_compaction_cfg(), Some(40), None, None, None, std::collections::BTreeMap::new(), None,
+        )
+        .expect("escalation is a graceful terminal, not an error");
+        assert_eq!(
+            outcome.terminal_reason,
+            TerminalReason::EscalationTriggered(EscalationReason::CompactionRereadLoop),
+        );
+        let recorded = crate::trajectory::recorded(tmp.path());
+        assert!(recorded.turns() <= 8, "bounded near the threshold, not max_turns: turns={}", recorded.turns());
+        assert!(compactor.hits() >= 5, "every compaction ran: {}", compactor.hits());
+        assert!(recorded.compactions() >= 5, "and INSTALLED: {}", recorded.compactions());
+        let raw = std::fs::read_to_string(tmp.path().join(".darkmux-runtime").join("trajectory.jsonl")).unwrap();
+        assert!(raw.contains("escalation_compaction_reread_loop"), "the reason is on the record");
+        assert!(!raw.contains("compaction.unproductive"), "each compaction was productive");
+    }
+
+    /// (#3013) The inverse: a run that compacts every turn but reads a NEW
+    /// file each time is making progress, and must not be escalated.
+    #[test]
+    #[serial_test::serial]
+    fn a_run_that_reads_new_files_after_each_compaction_is_not_escalated() {
+        let server = crate::test_support::GuardedMockServer::start();
+        // Turn i's request carries turn i-1's call in the preserved tail, so
+        // "mentions file i" picks the next file. Registered highest first:
+        // a body naming several files matches the newest one.
+        const FILES: usize = 9;
+        let mut mocks = Vec::new();
+        for i in (0..FILES).rev() {
+            let (needle, reply) = if i == 0 {
+                (String::new(), read_call_json("/workspace/f0.txt"))
+            } else {
+                (format!("/workspace/f{}.txt", i - 1), read_call_json(&format!("/workspace/f{i}.txt")))
+            };
+            let last = i == FILES - 1;
+            mocks.push(server.mock(move |when, then| {
+                let w = when.method(POST).path("/v1/chat/completions").body_contains("\"model\":\"test-primary\"");
+                if !needle.is_empty() {
+                    w.body_contains(&needle);
+                }
+                if last {
+                    then.status(200).json_body(chat_response_json(Some("done"), None, "stop", 9_000, 5));
+                } else {
+                    then.status(200).json_body(chat_response_json(None, Some(reply.clone()), "tool_calls", 9_000, 50));
+                }
+            }));
+        }
+        let compactor = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").body_contains("\"model\":\"test-compactor\"");
+            then.status(200).json_body(chat_response_json(Some(SHORT_SUMMARY), None, "stop", 500, 30));
+        });
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("reread-inverse").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let outcome = run(
+            &client, &client, "test-primary", seeded_thread(), &[Tool::Read], &mut traj, false,
+            &productive_compaction_cfg(), Some(40), None, None, None, std::collections::BTreeMap::new(), None,
+        )
+        .expect("the run completes");
+        let installed = crate::trajectory::recorded(tmp.path()).compactions();
+        assert!(installed >= 6, "the scenario must INSTALL compactions repeatedly: {installed} (compactor hits {})", compactor.hits());
+        assert_ne!(
+            outcome.terminal_reason,
+            TerminalReason::EscalationTriggered(EscalationReason::CompactionRereadLoop),
+            "new files after each compaction are progress"
+        );
+    }
+
+    // ---- (B4) loop-level pins for the model-facing nudges, the silent arm and the episode reset ----
+    //
+    // Each of these was proven by mutation to leave the whole suite green when
+    // its production line was deleted: the detectors' trajectory events were
+    // asserted, but nothing checked that the nudge reached the NEXT REQUEST,
+    // which is the point of the signal.
+
+    /// Serve a mock that answers `done` (a clean stop) to any request whose
+    /// body carries `nudge`, and registers the looping `then` reply after it.
+    /// Registered first, so it wins whenever the nudge is present: the run
+    /// only ends `Stop` if the nudge reached a request.
+    fn stop_when_request_carries(server: &crate::test_support::GuardedMockServer, nudge: &'static str, looping: serde_json::Value) {
+        let _nudge_mock = server.mock(move |when, then| {
+            when.method(POST).path("/v1/chat/completions").body_contains("\"model\":\"test-primary\"").body_contains(nudge);
+            then.status(200).json_body(chat_response_json(Some("done"), None, "stop", 100, 5));
+        });
+        let _looping_mock = server.mock(move |when, then| {
+            when.method(POST).path("/v1/chat/completions").body_contains("\"model\":\"test-primary\"");
+            then.status(200).json_body(looping.clone());
+        });
+    }
+
+    fn assert_nudge_reached_the_request(outcome: &LoopOutcome, kind: &str, tmp: &std::path::Path) {
+        assert_eq!(
+            outcome.terminal_reason,
+            TerminalReason::Stop,
+            "the run ends only if a request carried the nudge; MaxTurns means it never did"
+        );
+        let raw = std::fs::read_to_string(tmp.join(".darkmux-runtime").join("trajectory.jsonl")).unwrap();
+        assert!(
+            raw.lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .filter(|v| v["type"] == "dispatch.feedback.injected")
+                .any(|v| v["signal_kinds"].as_array().is_some_and(|k| k.iter().any(|x| x == kind))),
+            "and the injection is recorded under `{kind}`"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_tool_failure_cascade_nudge_reaches_the_next_request() {
+        std::env::remove_var("DARKMUX_FEEDBACK_INJECTION");
+        let server = crate::test_support::GuardedMockServer::start();
+        stop_when_request_carries(
+            &server,
+            "the tool or its environment failing",
+            chat_response_json(None, Some(read_call_json("/workspace/no-such-file.txt")), "tool_calls", 100, 10),
+        );
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("nudge-cascade").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let outcome = run(
+            &client, &client, "test-primary", vec![Message::system("s"), Message::user("go")], &[Tool::Read], &mut traj,
+            false, &compaction::CompactionConfig::never_compact(), Some(12), None, None, None, std::collections::BTreeMap::new(), None,
+        )
+        .expect("the run completes");
+        assert_nudge_reached_the_request(&outcome, "tool_failure_cascade", tmp.path());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_reasoning_loop_nudge_reaches_the_next_request() {
+        std::env::remove_var("DARKMUX_FEEDBACK_INJECTION");
+        let server = crate::test_support::GuardedMockServer::start();
+        let same_thought = "<think>I should read the file again to be sure what it says before I do anything else at all here.</think>";
+        stop_when_request_carries(
+            &server,
+            "revisited the same line of reasoning",
+            chat_response_json(
+                Some(same_thought),
+                Some(serde_json::json!([{
+                    "id": "call_r", "type": "function",
+                    "function": {"name": "echo", "arguments": "{\"text\":\"again\"}"},
+                }])),
+                "tool_calls",
+                100,
+                10,
+            ),
+        );
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("nudge-reasoning").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let outcome = run(
+            &client, &client, "test-primary", vec![Message::system("s"), Message::user("go")], &[Tool::Echo], &mut traj,
+            false, &compaction::CompactionConfig::never_compact(), Some(12), None, None, None, std::collections::BTreeMap::new(), None,
+        )
+        .expect("the run completes");
+        assert_nudge_reached_the_request(&outcome, "reasoning_loop", tmp.path());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_post_compaction_nudge_reaches_the_next_request() {
+        std::env::remove_var("DARKMUX_FEEDBACK_INJECTION");
+        let server = crate::test_support::GuardedMockServer::start();
+        let _compactor = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").body_contains("\"model\":\"test-compactor\"");
+            then.status(200).json_body(chat_response_json(Some(SHORT_SUMMARY), None, "stop", 500, 30));
+        });
+        // `echo`, not `read`: a re-read after every compaction is bounded on
+        // purpose (#3013) and would end the run first.
+        stop_when_request_carries(
+            &server,
+            "Working memory was just compressed",
+            chat_response_json(
+                None,
+                Some(serde_json::json!([{
+                    "id": "call_e", "type": "function",
+                    "function": {"name": "echo", "arguments": "{\"text\":\"working\"}"},
+                }])),
+                "tool_calls",
+                9_000,
+                50,
+            ),
+        );
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("nudge-compaction").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let outcome = run(
+            &client, &client, "test-primary", seeded_thread(), &[Tool::Echo], &mut traj,
+            false, &productive_compaction_cfg(), Some(12), None, None, None, std::collections::BTreeMap::new(), None,
+        )
+        .expect("the run completes");
+        assert_nudge_reached_the_request(&outcome, "post_compaction", tmp.path());
+    }
+
+    /// A hand-rolled SSE server: the FIRST connection sends one chunk then
+    /// goes silent past the client's read timeout; every later connection
+    /// answers with a clean `done`. httpmock cannot express "bytes stop".
+    fn silent_then_clean_server() -> String {
+        use std::io::{BufRead, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for (n, conn) in listener.incoming().enumerate() {
+                let Ok(mut sock) = conn else { return };
+                std::thread::spawn(move || {
+                    let mut head = std::io::BufReader::new(sock.try_clone().unwrap());
+                    let mut content_length = 0usize;
+                    loop {
+                        let mut line = String::new();
+                        if head.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                            break;
+                        }
+                        if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                            content_length = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    let mut body = vec![0u8; content_length];
+                    let _ = head.read_exact(&mut body);
+                    let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n");
+                    let frame = |sock: &mut std::net::TcpStream, payload: String| {
+                        let _ = sock.write_all(format!("{:x}\r\n{payload}\r\n", payload.len()).as_bytes());
+                        let _ = sock.flush();
+                    };
+                    if n == 0 {
+                        frame(&mut sock, "data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"<think>working through the problem step by step\"}}]}\n\n".to_string());
+                        std::thread::sleep(std::time::Duration::from_secs(4));
+                    } else {
+                        frame(&mut sock, "data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":12}}\n\n".to_string());
+                        frame(&mut sock, "data: [DONE]\n\n".to_string());
+                        let _ = sock.write_all(b"0\r\n\r\n");
+                    }
+                });
+            }
+        });
+        format!("http://{addr}/v1")
+    }
+
+    /// (B4) An endpoint that goes silent mid-stream ends THAT CALL, not the
+    /// dispatch: everything it produced is handed back and the run continues.
+    /// Deleting the silent arm makes this an `Err` (and loses every banked
+    /// checkpoint of a long turn).
+    #[test]
+    #[serial_test::serial]
+    fn a_silent_stream_hands_back_what_it_produced_instead_of_failing_the_dispatch() {
+        let url = silent_then_clean_server();
+        let client = LmStudioClient::with_base_url_and_read_timeout(url, std::time::Duration::from_millis(400));
+        let tmp = tempfile::Builder::new().prefix("silent-arm").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let outcome = run_with_sleeper(
+            &client, &client, "m", vec![Message::system("s"), Message::user("go")], &[Tool::Read], &mut traj, true,
+            &compaction::CompactionConfig::never_compact(), Some(6), None, Some(9_000), Some(1_000), Some(1_000),
+            None, std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &RealSleeper,
+        )
+        .expect("a silent endpoint must not fail the dispatch");
+        assert_eq!(outcome.terminal_reason, TerminalReason::Stop, "the run carried on after the silent call");
+        let raw = std::fs::read_to_string(tmp.path().join(".darkmux-runtime").join("trajectory.jsonl")).unwrap();
+        let first_completed = raw
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["type"] == "model.completed")
+            .expect("the silent call is recorded");
+        assert_eq!(first_completed["finish_reason"], "length", "a cut call closes as length");
+        assert!(first_completed["usage"].is_null(), "no usage arrived: {first_completed}");
+        assert!(first_completed["completion_estimate"].as_u64().unwrap_or(0) > 0, "its tokens are still counted: {first_completed}");
     }
 
     /// (#2114 finding 1) Resume-compaction parity: a checkpoint whose

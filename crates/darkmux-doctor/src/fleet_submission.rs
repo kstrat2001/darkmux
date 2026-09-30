@@ -85,6 +85,9 @@ pub struct FleetSubmissionFacts {
     /// (`/health`'s `fleet_token_set`), when it answered. The shell doctor
     /// runs in may not have the one the daemon was started with.
     pub daemon_token_set: Option<bool>,
+    /// Whether the running daemon can publish to the fleet hub's flow stream
+    /// (`/health`'s `hub_link`), when the daemon answered and a hub is configured.
+    pub daemon_hub_link: Option<darkmux_flow::HubLink>,
     /// (#2916 stage 2) How the listener answers a busy seat.
     pub busy: BusyFacts,
     /// (#2916 stage 2) This machine's resolved `machine_id`: the name a
@@ -113,6 +116,7 @@ pub fn fleet_submission_checks(f: &FleetSubmissionFacts) -> Vec<Check> {
         rows.push(listener_row(f));
         rows.push(trust_row(f));
     }
+    rows.extend(f.daemon_hub_link.as_ref().map(hub_link_row));
     if !f.retired_streams.is_empty() {
         let live: Vec<String> = f
             .queue_consumers
@@ -149,6 +153,32 @@ pub fn fleet_submission_checks(f: &FleetSubmissionFacts) -> Vec<Check> {
         rows.push(check("retired work queue", status, message, Some(hint)));
     }
     rows
+}
+
+/// The daemon's link to the hub's flow stream. While it is down the daemon
+/// keeps writing its local day files and re-sends them when the hub answers, so
+/// the row says what is owed, not that anything is lost.
+fn hub_link_row(link: &darkmux_flow::HubLink) -> Check {
+    use darkmux_flow::HubLink;
+    match link {
+        HubLink::Connected => check("flow hub link", Status::Pass, "publishing to the hub's flow stream".into(), None),
+        HubLink::Unverified => {
+            check("flow hub link", Status::Pass, "no write has been attempted yet".into(), None)
+        }
+        HubLink::Unreachable { since, reason } => check(
+            "flow hub link",
+            Status::Warn,
+            format!(
+                "the hub's flow stream has been unreachable since {since} ({reason}); this daemon \
+                 keeps its records in its local day files and re-sends them when the hub answers"
+            ),
+            Some(
+                "Check that the hub's Redis is up and reachable from this machine. The daemon \
+                 probes on its own, so nothing needs a restart."
+                    .into(),
+            ),
+        ),
+    }
 }
 
 fn token_row(f: &FleetSubmissionFacts) -> Check {
@@ -410,6 +440,7 @@ mod tests {
             queue_consumers: vec![],
             daemon_listener_state: None,
             daemon_token_set: None,
+            daemon_hub_link: None,
             busy: BusyFacts { running: Some(refuse(1)), configured: Some(refuse(1)) },
             local_machine: Some("studio".into()),
         }
@@ -417,6 +448,26 @@ mod tests {
 
     fn row<'a>(rows: &'a [Check], name: &str) -> &'a Check {
         rows.iter().find(|c| c.name == name).unwrap_or_else(|| panic!("no `{name}` row in {rows:?}"))
+    }
+
+    #[test]
+    fn the_hub_link_row_warns_while_unreachable_and_passes_once_connected() {
+        use darkmux_flow::HubLink;
+        let absent = fleet_submission_checks(&facts());
+        assert!(absent.iter().all(|c| c.name != "flow hub link"), "no hub configured: no row");
+        let down = FleetSubmissionFacts {
+            daemon_hub_link: Some(HubLink::Unreachable {
+                since: "2026-10-01T03:04:05Z".into(),
+                reason: "Connection refused".into(),
+            }),
+            ..facts()
+        };
+        let rows = fleet_submission_checks(&down);
+        let r = row(&rows, "flow hub link");
+        assert_eq!(r.status, Status::Warn);
+        assert!(r.message.contains("2026-10-01T03:04:05Z") && r.message.contains("Connection refused"), "{r:?}");
+        let up = FleetSubmissionFacts { daemon_hub_link: Some(HubLink::Connected), ..facts() };
+        assert_eq!(row(&fleet_submission_checks(&up), "flow hub link").status, Status::Pass);
     }
 
     #[test]

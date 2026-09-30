@@ -71,13 +71,22 @@ fn the_archive_holds_the_spaced_bookends_and_the_upgraded_twin_holds_none() {
 #[test]
 fn the_typed_read_agrees_with_the_json_read_on_every_record() {
     let archive = golden("2026-08-20.jsonl");
+    let (mut compared, mut headers) = (0, 0);
     for line in archive.lines() {
-        let Some(typed) = reader::parse_record(line) else { continue };
         let json = reader::parse_value(line).unwrap();
+        if json.get("_type").and_then(Value::as_str) == Some("schema") {
+            // The header is the one line that is not a record.
+            assert!(reader::parse_record(line).is_none(), "the schema header is not a record: {line}");
+            headers += 1;
+            continue;
+        }
+        let typed = reader::parse_record(line).unwrap_or_else(|| panic!("a record line failed the typed read: {line}"));
         assert_eq!(json["action"], typed.action.as_str(), "{line}");
         let typed_json = typed.payload.as_ref().map(|p| serde_json::to_value(p).unwrap());
         assert!(payload_agrees(json.get("payload"), typed_json.as_ref()), "{line}");
+        compared += 1;
     }
+    assert_eq!((headers, compared), (1, 47), "the golden is one header plus 47 records, every one compared");
 }
 
 /// The typed payload agrees with the JSON one: every key it carries has the
@@ -102,3 +111,4 @@ fn value_agrees(json: &serde_json::Value, typed: &serde_json::Value) -> bool {
         (j, t) => j == t,
     }
 }
+

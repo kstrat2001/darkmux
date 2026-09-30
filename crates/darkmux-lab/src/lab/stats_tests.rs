@@ -85,6 +85,51 @@ fn usage_frames_accumulate_within_one_turn_and_are_not_assigned() {
 }
 
 
+/// A call that reported no usage adds 0 to the token totals, and the run
+/// says how many did, so a partly-reported total reads as a lower bound
+/// instead of the run's spend. A fully reported run says none and is quiet.
+#[test]
+fn calls_that_reported_no_usage_are_counted_so_the_totals_read_as_a_lower_bound() {
+    let partly = format!(
+        "{}{}{}{}",
+        stream(1, 0, Some(10_000)),
+        completed(1, Some(500), 0),
+        stream(2, 10_000, Some(20_000)),
+        completed(2, None, 0),
+    );
+    let s = stats(&partly, 20_000);
+    assert_eq!(s.completion_tokens, 500, "the unreported call adds nothing");
+    assert_eq!(s.calls_unreported, 1);
+    assert!(s.unreconciled().contains(&"some model calls reported no usage; the token totals are a lower bound"));
+
+    let whole = format!("{}{}", stream(1, 0, Some(10_000)), completed(1, Some(500), 0));
+    let s = stats(&whole, 10_000);
+    assert_eq!(s.calls_unreported, 0);
+    assert!(!s.unreconciled().iter().any(|r| r.contains("lower bound")));
+}
+
+// ---------------------------------------------------------------------------
+// Tool calls
+// ---------------------------------------------------------------------------
+
+/// A failed tool call counts in `tool_calls_failed` and still counts in the
+/// total; a call that reports no `ok` predates the field and succeeded.
+#[test]
+fn a_failed_tool_call_is_counted_apart_from_the_total() {
+    let call = |seq: u64, name: &str, ok: Option<bool>| {
+        let mut v = serde_json::json!({"type": "tool.completed", "seq": seq, "tool_name": name});
+        if let Some(ok) = ok {
+            v["ok"] = serde_json::json!(ok);
+        }
+        line(v)
+    };
+    let traj = format!("{}{}{}", call(1, "read", Some(true)), call(1, "bash", Some(false)), call(2, "read", None));
+    let s = stats(&traj, 1_000);
+    assert_eq!((s.tool_calls_total, s.tool_calls_failed), (3, 1));
+    assert_eq!(s.tool_calls.get("read"), Some(&2));
+    assert_eq!(s.tool_calls.get("bash"), Some(&1));
+}
+
 // ---------------------------------------------------------------------------
 // Billing
 // ---------------------------------------------------------------------------
@@ -1239,4 +1284,46 @@ fn a_pre_gate_run_on_an_unbaselined_fixture_is_not_flagged_ungated() {
     .unwrap();
     let s = compute_from_dir(run.path(), flows.path()).unwrap();
     assert!(!s.verify_ungated);
+}
+
+// ---------------------------------------------------------------------------
+// An interrupted run (#3014)
+// ---------------------------------------------------------------------------
+
+/// Promise: `run stats` on an interrupted run reports what completed plus an
+/// interrupted marker, not "no trajectory events". The run dir holds what the
+/// interrupt path preserved: the events so far and a terminal `interrupted`.
+#[test]
+fn an_interrupted_run_reports_what_completed_and_says_it_was_interrupted() {
+    let run = tempfile::TempDir::new().unwrap();
+    let flows = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        run.path().join("trajectory.jsonl"),
+        format!(
+            "{}{}{}",
+            line(serde_json::json!({"type": "dispatch.start", "ts": 1_000_000u64, "model": "test-model"})),
+            line(serde_json::json!({"type": "model.completed", "seq": 1, "ts": 1_004_000u64,
+                "usage": {"prompt_tokens": 100, "completion_tokens": 40, "total_tokens": 140}})),
+            line(serde_json::json!({"type": "dispatch.complete", "ts": 1_005_000u64,
+                "result": darkmux_trajectory::RESULT_INTERRUPTED, "wall_ms": 5_000})),
+        ),
+    )
+    .unwrap();
+    let s = compute_from_dir(run.path(), flows.path()).unwrap();
+    assert_eq!(s.result.as_deref(), Some("interrupted"));
+    assert_eq!(s.turns, 1, "what completed is reported");
+    assert!(
+        s.unreconciled().iter().any(|r| r.contains("interrupted")),
+        "the caveat prints with the figures: {:?}",
+        s.unreconciled()
+    );
+    assert!(crate::lab::stats_set::flags(&s).contains(&"INTERRUPTED"), "and the table flags it");
+}
+
+/// The inverse: a run that ended on its own carries no interrupted caveat.
+#[test]
+fn a_run_that_ended_on_its_own_is_not_flagged_interrupted() {
+    let s = compute_from_dir(run_at(1_000_000, 5_000).path(), tempfile::TempDir::new().unwrap().path()).unwrap();
+    assert!(!s.unreconciled().iter().any(|r| r.contains("interrupted")));
+    assert!(!crate::lab::stats_set::flags(&s).contains(&"INTERRUPTED"));
 }

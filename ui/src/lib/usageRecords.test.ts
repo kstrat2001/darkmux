@@ -24,7 +24,9 @@ import {
   isCompactionUsage,
   isTurnUsage,
   legacyCompleteCounts,
+  isUsageRecord,
   sumUsage,
+  usageContribution,
   usagePurpose,
 } from "./usageRecords";
 import { ACTION } from "./ingest";
@@ -155,6 +157,53 @@ function usage(sid: string, handle: string, payload: Record<string, unknown>, mi
 }
 const complete = (sid: string, payload: Record<string, unknown>, mission?: string) =>
   r({ action: "dispatch.complete", session_id: sid, handle: "x", mission_id: mission, payload });
+
+describe("usageContribution is sumUsage's per-record half (one arithmetic)", () => {
+  const usageOnly = golden.filter(isUsageRecord);
+
+  /** Fold records one at a time the way the mission graph does. */
+  function fold(records: NormRecord[], exclude?: typeof PURPOSE.utility) {
+    const out = { total: 0, prompt: 0, completion: 0, cached: null as number | null, utility: 0 };
+    for (const rec of records) {
+      const a = usageContribution(rec, exclude ? { exclude } : {});
+      if (!a) continue;
+      out.total += a.total;
+      out.prompt += a.prompt;
+      out.completion += a.completion;
+      if (a.cached !== null) out.cached = (out.cached ?? 0) + a.cached;
+      if (a.purpose === PURPOSE.utility) out.utility += a.total;
+    }
+    return out;
+  }
+
+  it("folding every golden usage record equals sumUsage over them, cached and utility included", () => {
+    const s = sumUsage(usageOnly);
+    expect(fold(usageOnly)).toEqual({ total: s.total, prompt: s.prompt, completion: s.completion, cached: s.cached, utility: s.utility });
+    const w = sumUsage(usageOnly, { exclude: PURPOSE.utility });
+    expect(fold(usageOnly, PURPOSE.utility)).toEqual({ total: w.total, prompt: w.prompt, completion: w.completion, cached: w.cached, utility: 0 });
+  });
+
+  it("the provider total wins; a split with no total falls back to prompt + completion, then remote_tokens", () => {
+    clock = 0;
+    const amount = (payload: Record<string, unknown>) => usageContribution(usage("s", "h", payload))!;
+    expect(amount({ prompt_tokens: 7, completion_tokens: 3, total_tokens: 12 }).total).toBe(12);
+    expect(amount({ prompt_tokens: 7, completion_tokens: 3 }).total).toBe(10);
+    expect(amount({ remote_tokens: 5 }).total).toBe(5);
+  });
+
+  it("cached is null when the record does not report it, and a reported zero stays 0", () => {
+    clock = 0;
+    const amount = (payload: Record<string, unknown>) => usageContribution(usage("s", "h", payload))!;
+    expect(amount({ total_tokens: 4 }).cached).toBeNull();
+    expect(amount({ total_tokens: 4, cached_tokens: 0 }).cached).toBe(0);
+    expect(amount({ total_tokens: 4, cached_tokens: 2 }).cached).toBe(2);
+  });
+
+  it("a record that is not a usage record contributes nothing", () => {
+    clock = 0;
+    expect(usageContribution(complete("s", { total_tokens: 9 }))).toBeNull();
+  });
+});
 
 describe("the legacy fallback (a run with no usage records counts its complete)", () => {
   it("a run with ZERO usage records counts each token-bearing complete once", () => {

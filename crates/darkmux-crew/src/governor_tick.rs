@@ -81,4 +81,18 @@ impl GovernorPair {
         let battery = self.battery.on_sample(reading.battery.as_ref(), elapsed_ms, host_out, thermal_pausing);
         TickEvents { thermal, battery }
     }
+
+    /// What these two governors hold on the pace file right now, for the
+    /// budget pacer to yield to (`BudgetPacer::on_tick`): a genuine pause from
+    /// either one (`is_pacing` for the battery, whose only pacing state IS a
+    /// pause; `is_pausing` for the thermal, whose duty cycle is not a pause),
+    /// and the thermal duty cycle's instruction when one is in force. The one
+    /// place this is derived, so the live sampler and the scenario tests read
+    /// the same answer.
+    pub fn other_pacing(&self) -> crate::budget::OtherPacing {
+        crate::budget::OtherPacing {
+            pausing: self.thermal.is_pausing() || self.battery.is_pacing(),
+            duty_cycle: self.thermal.duty_cycle(),
+        }
+    }
 }

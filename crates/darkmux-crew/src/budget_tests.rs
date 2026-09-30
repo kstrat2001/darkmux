@@ -22,10 +22,10 @@ fn caller_in(session: SessionId) -> BudgetCaller<'static> {
     BudgetCaller { session: Box::leak(Box::new(session)), execution: Box::leak(Box::new(ExecutionId::mint())), role_id: None, model: None, phase_id: None, profiles_file: None }
 }
 
-const T0: i64 = 1_790_000_000; // a fixed epoch second, the frozen "now"
+pub(crate) const T0: i64 = 1_790_000_000; // a fixed epoch second, the frozen "now"
 const DAY: i64 = 86_400;
 
-fn budget(policy: BudgetPolicy, tokens: Option<u64>, calls: Option<u64>, warn_at: Option<f64>) -> EndpointBudget {
+pub(crate) fn budget(policy: BudgetPolicy, tokens: Option<u64>, calls: Option<u64>, warn_at: Option<f64>) -> EndpointBudget {
     EndpointBudget {
         endpoint_id: "azure".into(),
         policy,
@@ -80,6 +80,10 @@ impl FakeEnv {
             said: RefCell::new(Vec::new()),
             levels: RefCell::new(HashMap::new()),
         }
+    }
+    /// Move the frozen clock to `t` (epoch seconds), so a record ages out.
+    pub(crate) fn at(&self, t: i64) {
+        self.now.set(t);
     }
     /// A window already over any small budget.
     pub(crate) fn full_window() -> Self {

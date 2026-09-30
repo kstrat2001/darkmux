@@ -361,20 +361,28 @@ const PEER_FIELD_MAX_CHARS: usize = 80;
 /// `entry` may go: this machine's own daemon (loopback) for its own entry,
 /// a loopback entry as written, else the verified, pinned tailnet node.
 /// A first-contact pin is persisted.
-fn peer_target_for(entry: &fleet::MachineEntry, local_id: Option<&str>) -> Result<fleet::PeerTarget> {
+fn peer_target_for(entry: &fleet::MachineEntry, local_id: Option<&str>) -> Result<fleet::SettledTarget> {
+    let provider = fleet::configured_provider_or_unavailable();
+    peer_target_with(entry, local_id, provider.as_ref())
+}
+
+/// [`peer_target_for`] with the identity provider supplied by the caller.
+fn peer_target_with(
+    entry: &fleet::MachineEntry,
+    local_id: Option<&str>,
+    provider: &dyn fleet::IdentityProvider,
+) -> Result<fleet::SettledTarget> {
     let is_self = local_id.is_some_and(|l| fleet::same_machine(l, &entry.id)) && !fleet::address_host_is_loopback(&entry.address);
     let local_addr = is_self.then(darkmux_types::config_access::serve_client_addr);
-    let provider = fleet::configured_provider_or_unavailable();
     let target = fleet::peer_target(
         &entry.id,
         entry,
         local_addr.as_deref(),
         crate::serve::DEFAULT_DAEMON_PORT,
         true,
-        provider.as_ref(),
+        provider,
     )?;
-    fleet::persist_pin(&entry.id, &target)?;
-    Ok(target)
+    fleet::pin_on_first_contact(target, entry, provider)
 }
 
 /// (#2924 MF-3) The address to dial for a roster entry. This machine's own
@@ -793,6 +801,7 @@ pub(crate) fn fleet_submission_doctor_checks() -> Vec<crate::doctor::Check> {
         retired_streams: retired.0,
         queue_consumers: retired.1,
         daemon_token_set: daemon_token_set(),
+        daemon_hub_link: daemon_hub_link(),
         daemon_listener_state: if listener_enabled && listener_bound != Some(true) {
             daemon_listener_state()
         } else {
@@ -822,6 +831,12 @@ fn daemon_listener_state() -> Option<String> {
 /// (`/health`'s `fleet_token_set`), when it answers within 500 ms.
 fn daemon_token_set() -> Option<bool> {
     daemon_health()?.get("fleet_token_set")?.as_bool()
+}
+
+/// The local daemon's link to the fleet hub (`/health`'s `hub_link`), when it
+/// answers within 500 ms and a hub is configured.
+fn daemon_hub_link() -> Option<darkmux_flow::HubLink> {
+    serde_json::from_value(daemon_health()?.get("hub_link")?.clone()).ok()
 }
 
 /// The local daemon's `/health`, when it answers within 500 ms.
@@ -1629,6 +1644,82 @@ mod tests {
         let msg = route_missing_message("peer1", "/machine/resources", "studio.tailnet:8765");
         assert!(msg.contains("older"), "{msg}");
         assert!(!msg.contains("tailscale serve"), "{msg}");
+    }
+
+    fn studio_entry() -> fleet::MachineEntry {
+        fleet::MachineEntry {
+            id: "studio".into(),
+            address: "100.64.0.2".into(),
+            description: None,
+            added_unix_ms: 1,
+            machine_uid: None,
+            loopback_intended: false,
+            node_id: None,
+            extras: Default::default(),
+        }
+    }
+
+    fn overlay_provider() -> fleet::StaticIdentityProvider {
+        fleet::StaticIdentityProvider {
+            local: fleet::test_node("nLAPTOP", "laptop", "100.64.0.7"),
+            peers: vec![fleet::test_node("nSTUDIO", "studio", "100.64.0.2")],
+            down: None,
+        }
+    }
+
+    /// The promise: `machine status <id>` / `resources <id>` send the token
+    /// only after the peer's first-contact pin is in the roster.
+    #[test]
+    #[serial_test::serial]
+    fn a_first_contact_read_pins_the_peer_in_the_roster() {
+        let tmp = isolated_add_env("laptop");
+        fleet::mutate_roster(|r| {
+            r.machines.insert("studio".into(), studio_entry());
+            Ok(())
+        })
+        .unwrap();
+        let target = peer_target_with(&studio_entry(), Some("laptop"), &overlay_provider()).map_err(|e| format!("{e:#}"));
+        let pinned = fleet::load_roster().unwrap().machines["studio"].node_id.clone();
+        clear_add_env();
+        drop(tmp);
+        assert_eq!(target.unwrap().node_id(), Some("nSTUDIO"));
+        assert_eq!(pinned.as_deref(), Some("nSTUDIO"), "the pin was written before the target was handed out");
+    }
+
+    /// Fail closed: a roster that cannot be written yields no target, so no
+    /// token can be attached.
+    #[test]
+    #[serial_test::serial]
+    fn an_unwritable_roster_yields_no_token_bearing_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, "a file, not a directory").unwrap();
+        unsafe { std::env::set_var("DARKMUX_FLEET_FILE", blocker.join("fleet.json")) };
+        let out = peer_target_with(&studio_entry(), Some("laptop"), &overlay_provider());
+        clear_add_env();
+        assert!(out.is_err(), "an unpinnable peer must not become a target");
+    }
+
+    /// Recovery and inverse: a peer the saved roster already pins needs no
+    /// write and is confirmed from the saved entry; one the saved roster no
+    /// longer holds is refused, whatever the caller's snapshot said.
+    #[test]
+    #[serial_test::serial]
+    fn an_already_pinned_peer_is_confirmed_from_the_saved_roster() {
+        let tmp = isolated_add_env("laptop");
+        let mut e = studio_entry();
+        e.node_id = Some("nSTUDIO".into());
+        let absent = peer_target_with(&e, Some("laptop"), &overlay_provider()).map_err(|e| format!("{e:#}"));
+        fleet::mutate_roster(|r| {
+            r.machines.insert("studio".into(), e.clone());
+            Ok(())
+        })
+        .unwrap();
+        let present = peer_target_with(&e, Some("laptop"), &overlay_provider()).map_err(|e| format!("{e:#}"));
+        clear_add_env();
+        drop(tmp);
+        assert!(absent.is_err(), "a snapshot cannot vouch for an entry the roster no longer holds");
+        assert_eq!(present.unwrap().node_id(), Some("nSTUDIO"));
     }
 
 }

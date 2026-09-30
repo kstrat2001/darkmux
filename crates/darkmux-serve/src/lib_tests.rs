@@ -2060,6 +2060,33 @@
         assert!(!set.to_string().contains("not-a-real-token"), "the value never appears");
     }
 
+    /// `/health` tells this machine whether the daemon can publish to the
+    /// fleet hub: unreachable (since when, and why), then connected once the
+    /// hub answers. A proxied loopback request, which is a peer, learns nothing.
+    /// Drives the real handler; the sink's own transitions are tested against a
+    /// real Redis in `darkmux-flow`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn health_reports_the_hub_link_to_this_machine_only() {
+        use darkmux_flow::HubLink;
+        darkmux_flow::set_hub_link_for_tests(Some(HubLink::Unreachable {
+            since: "2026-10-01T03:04:05Z".into(),
+            reason: "Connection refused (os error 61)".into(),
+        }));
+        let down = loopback_health(&[]).await;
+        let down_proxied = loopback_health(&[("X-Forwarded-For", "100.64.0.7")]).await;
+        darkmux_flow::set_hub_link_for_tests(Some(HubLink::Connected));
+        let up = loopback_health(&[]).await;
+        darkmux_flow::set_hub_link_for_tests(None);
+        let none = loopback_health(&[]).await;
+        assert_eq!(down["hub_link"]["state"], "unreachable", "{down}");
+        assert_eq!(down["hub_link"]["since"], "2026-10-01T03:04:05Z", "{down}");
+        assert_eq!(down["hub_link"]["reason"], "Connection refused (os error 61)", "{down}");
+        assert!(down_proxied["hub_link"].is_null(), "a peer is not told: {down_proxied}");
+        assert_eq!(up["hub_link"]["state"], "connected", "{up}");
+        assert!(none["hub_link"].is_null(), "no hub configured: {none}");
+    }
+
     /// (#2916 stage 2 review C5) The `/health` fields for this machine only
     /// are withheld from a loopback request that came through a reverse
     /// proxy (`tailscale serve` puts every tailnet peer on loopback), and
@@ -2083,6 +2110,59 @@
         }
         // Process-global: leave it as the process started.
         *crate::fleet_listener::LISTENER_BUSY.lock().unwrap() = None;
+    }
+
+    /// The listener's detail (its address and why it is up or down) and the
+    /// open-file limit are this machine's business: a peer's `/health` shows
+    /// the coarse word and no limit, and this machine's shows both.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn health_gives_a_non_local_caller_only_the_coarse_listener_word_and_no_file_limit() {
+        *crate::fleet_listener::LISTENER_STATE.lock().unwrap() =
+            Some(("listening", "listening on 100.64.0.2:8766".to_string()));
+        let local = loopback_health(&[]).await;
+        let proxied = loopback_health(&[("X-Forwarded-For", "100.64.0.7")]).await;
+        *crate::fleet_listener::LISTENER_STATE.lock().unwrap() = None;
+        assert_eq!(local["fleet_listener"], "listening on 100.64.0.2:8766", "{local}");
+        assert!(local["open_file_limit"].is_number(), "{local}");
+        assert_eq!(proxied["fleet_listener"], "listening", "a peer learns the word, not the address: {proxied}");
+        assert!(!proxied.to_string().contains("100.64.0.2"), "{proxied}");
+        assert!(proxied["open_file_limit"].is_null(), "{proxied}");
+    }
+
+    /// Every header a reverse proxy adds is, ALONE, enough to make a loopback
+    /// request "not this machine". The list here is written out on purpose: a
+    /// test that iterates `PROXY_HEADERS` stays green when an entry is deleted.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn each_proxy_header_alone_makes_a_loopback_request_non_local() {
+        const EXPECTED: [&str; 15] = [
+            "x-forwarded-for",
+            "x-forwarded-host",
+            "x-forwarded-proto",
+            "x-forwarded-port",
+            "x-forwarded-server",
+            "x-real-ip",
+            "forwarded",
+            "via",
+            "cf-connecting-ip",
+            "true-client-ip",
+            "tailscale-user-login",
+            "tailscale-user-name",
+            "tailscale-headers-info",
+            "tailscale-funnel-request",
+            "tailscale-app-capabilities",
+        ];
+        assert_eq!(PROXY_HEADERS.len(), EXPECTED.len(), "a header was added or removed: update this list on purpose");
+        let lo: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let bound: SocketAddr = "127.0.0.1:8765".parse().unwrap();
+        assert!(is_local_at(Some(lo), &headers_with(&[("Host", "localhost:8765")]), Some(bound)), "the inverse: no proxy header is local");
+        for h in EXPECTED {
+            let hm = headers_with(&[("Host", "localhost:8765"), (h, "x")]);
+            assert!(!is_local_at(Some(lo), &hm, Some(bound)), "{h} alone must make the request non-local");
+            let v = loopback_health(&[("Host", "localhost:8765"), (h, "x")]).await;
+            assert!(v["open_file_limit"].is_null(), "/health shows this machine's limit behind {h}: {v}");
+        }
     }
 
     fn headers_with(pairs: &[(&str, &str)]) -> axum::http::HeaderMap {

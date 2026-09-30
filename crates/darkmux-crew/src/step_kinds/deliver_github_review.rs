@@ -1744,7 +1744,7 @@ impl StepKind for DeliverGithubReviewStepKind {
             "dropped_non_findings": outcome.dropped_non_findings,
         }))
         .context("serializing the deliver step output")?;
-        Ok(StepOutcome { output, flow_records: Vec::new() })
+        Ok(StepOutcome { output, flow_records: Vec::new(), degraded: None })
     }
 }
 

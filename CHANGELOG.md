@@ -1149,6 +1149,36 @@ darkmux release.
 
 ### Fixed (4.0)
 
+- **A daemon resumes publishing to the fleet hub on its own after an outage (#3023).** The Redis flow sink used to disable itself after three failures "for the rest of the process", so a hub restart left a long-lived `darkmux serve` silent until someone restarted it, and the other machines never saw what it did meanwhile. `darkmux serve` now probes the hub on a capped backoff (2s doubling to 60s, each probe bounded by the 500 ms connect timeout), re-enables when it answers, and re-sends its own records from the local day files (current and previous UTC day, in `ts` order, from the first record that failed) as stream entries marked `late`; readers already de-duplicate by record identity. CLI invocations keep the old behavior. `/health` carries `hub_link` (`connected`, or `unreachable` with since and reason; this machine only) and `darkmux doctor` has a `flow hub link` row.
+- **A `dispatch.map` step whose every item failed is an errored step, and one with some failed items reads degraded.** The step used to complete regardless, so a mission where every item errored could finish Clean with exit 0. Now all items failing fails the step with the first item's error. Some items failing keeps the step `complete` (its output still reaches later steps) but marks the mission envelope `degraded`, with a warning naming the step and how many items failed. No shipped mission config uses `dispatch.map` today, so this affects your own configs.
+
+- **The daemon's peer mission-graph proxy no longer sends the fleet token to a peer whose pin is not saved.** On first contact it verified the peer's node but never pinned it, and attached the token anyway. `fleet_get` and `fleet_post_json` now take only a `SettledTarget`, which exists only after the first-contact pin was written to the roster (or the target needed none: loopback, this machine, already pinned). The proxy pins on first contact like a work submission, and with an unwritable roster it sends nothing. The pin is written compare-and-set under the roster lock: a removed entry, an edited address, or a different node pinned meanwhile refuses instead of pinning the wrong node. `machine status <id>` and `machine resources <id>` go through the same single pin helper. A dispatch that stays on this machine under a `managed_only` boundary is now refused when its profile resolves to a hosted endpoint.
+- **An interrupted lab run keeps its trajectory (#3014).** A run stopped with
+  Ctrl-C or SIGTERM left its trajectory only in a temp directory, so
+  `darkmux run stats` said "no trajectory events" for an hour of evidence. The
+  lab harness now names the dispatch's out directory up front and copies the
+  trajectory and findings into the run directory on every exit path, and the
+  runtime catches SIGTERM and SIGINT and closes the trajectory with a
+  `dispatch.complete` whose `result` is `interrupted` (a SIGKILLed run gets the
+  same record from the host). `run stats` reports what completed, prints an
+  interrupted caveat with the figures, and flags the run `INTERRUPTED`.
+- **A compaction loop that never stops is now bounded (#3013).** When every
+  compaction succeeds but the turn after each one re-reads exactly what the
+  turn before it read, no occupancy counter grew and the run went on until
+  `max_turns` (uncapped by default). After five such compactions in a row the
+  run now escalates with `result: "escalation_compaction_reread_loop"`, the
+  same graceful hand-off as `escalation_compaction_unproductive`. Only
+  read-only tools count, and any turn that reads something else, edits, or
+  runs a command ends the run of repeats.
+- **A turn the runtime ended now counts toward the run's tokens and its cap.**
+  A call cut by the degeneracy gate or a silent stream never receives the
+  endpoint's usage, so its tokens were dropped from the totals and the
+  cumulative cap never saw them, and the per-call budget line printed
+  `<unknown>`. The runtime now counts what streamed past, records it as
+  `completion_estimate` beside a null `usage` (an estimate, never a reported
+  figure), and adds it to the cumulative cap. `run stats` and the dispatch
+  envelope report `unreported_calls` and `estimated_completion_tokens`, so a
+  total read beside them is known to be a floor.
 - **A daemon started with `--port N` is found by every client on the machine (#3007).** `darkmux serve` now records where it actually bound (`<darkmux home>/run/daemon.json`: pid, host, port) and removes the record on clean shutdown. Doctor, the dispatch nudge, `machine list` and the viewer links resolve the daemon's address from a live record first, then env, config and the built-in 8765, and the `daemon reachable` row names which source it used. A record whose pid is gone is ignored. Before, a daemon on `--port 8766` read as "not reachable at 127.0.0.1:8765" and the `fleet token` row failed against it.
 - **Doctor's `fleet token` row no longer fails for a shell without the token when the daemon has it.** `/health` now carries `fleet_token_set` (a boolean, this machine only, never the value); when the shell cannot resolve a token but the local daemon reports one, the row passes and says the token is set in the daemon's environment only.
 - **Dispatching to a peer whose listener is off names the listener.** The error was `no answer from http://<host>:8766/fleet/work: ... Connection refused (os error 61)`. It now reads `the fleet listener at <url> is not accepting connections (off, or the daemon is down); nothing was sent`, the same sentence `/fleet/view` gives as the detail of its `listener_off` outcome (one classifier, `is_listener_off`).
@@ -1188,6 +1218,8 @@ darkmux release.
   say it did not load, with the cause, instead of "no profile registry".
 
 ### Added (4.0)
+
+- **`run stats` counts the model calls that reported no usage** (`calls_unreported`, RunStats 2.1.0, `--json` too). A call that reports no usage adds 0 to the token figures, so a partly reported run read as a smaller run. Above zero, `completion_tokens` and `reasoning_tokens` are a lower bound, and the run's unreconciled list says so.
 
 - **The fleet work wire is `major.minor` and grows by minors from here; the
   receiver enforces a data boundary; a check asks "would this route work"; every

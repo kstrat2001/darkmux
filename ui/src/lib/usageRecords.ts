@@ -217,22 +217,19 @@ export interface UsageSum {
 
 /** THE sum. Every usage record in `records` (minus `opts.exclude`), plus the
  *  legacy fallback's completes (`isLegacyFallbackComplete`). Linear in
- *  `records`, allocation-free per record: the hero recomputes it on every
- *  playback scrub. */
+ *  `records`, one small `amountOf` object per record: the hero recomputes it
+ *  on every playback scrub. The per-record arithmetic lives in `amountOf`
+ *  alone; this only adds its results up. */
 export function sumUsage(records: readonly NormRecord[], opts: SumOptions = {}): UsageSum {
   const out: UsageSum = { total: 0, prompt: 0, completion: 0, cached: null, utility: 0, usageRecords: 0, reported: 0, legacyCompletes: 0 };
-  const exclude = opts.exclude;
   const add = (p: UsagePayload): boolean => {
-    const purpose = usagePurpose(p);
-    if (exclude === purpose) return false;
-    const prompt = num(p.prompt_tokens);
-    const completion = num(p.completion_tokens);
-    const total = num(p.total_tokens) || prompt + completion || num(p.remote_tokens);
-    out.total += total;
-    out.prompt += prompt;
-    out.completion += completion;
-    if (isFiniteNumber(p.cached_tokens)) out.cached = (out.cached ?? 0) + num(p.cached_tokens);
-    if (purpose === PURPOSE.utility) out.utility += total;
+    const amount = amountOf(p, opts);
+    if (!amount) return false;
+    out.total += amount.total;
+    out.prompt += amount.prompt;
+    out.completion += amount.completion;
+    if (amount.cached !== null) out.cached = (out.cached ?? 0) + amount.cached;
+    if (amount.purpose === PURPOSE.utility) out.utility += amount.total;
     if (hasAnyTokenCounts(p)) out.reported++;
     return true;
   };
