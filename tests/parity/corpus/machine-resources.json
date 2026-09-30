@@ -132,7 +132,7 @@
       "battery": {
         "charge_pct": 100,
         "on_ac": true,
-        "charging": false,
+        "state": "full",
         "minutes_to_empty": null
       },
       "power_mw": {

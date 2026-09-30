@@ -3345,6 +3345,7 @@ mod tests {
             charge_pct: 9,
             on_ac: false,
             charging: false,
+            state: crate::host_probe::ChargeState::Discharging,
             minutes_to_empty: None,
         };
         let mut battery = BatteryGovernor::new(PowerPolicyConfig {

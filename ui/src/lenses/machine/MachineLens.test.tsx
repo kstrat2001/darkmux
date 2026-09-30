@@ -1,3 +1,4 @@
+import type { BatteryCharge } from "../../types/generated/BatteryCharge";
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { render, screen, waitFor, cleanup, act } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -714,7 +715,7 @@ const LOAD_WITH_EXTRAS = {
     gpu_mem_bytes: null,
     thermal: { state: "fair", cpu_speed_limit_pct: 87 },
     power_mw: null,
-    battery: { charge_pct: 78, on_ac: false, charging: false, minutes_to_empty: 130 },
+    battery: { charge_pct: 78, on_ac: false, state: "discharging", minutes_to_empty: 130 },
   },
   window: {
     samples: 3,
@@ -823,12 +824,20 @@ describe("MachineLens — battery surfaces (#2821, lens only)", () => {
   //    the reversed ramp (red empty -> green full) carries that
   //    continuously, state-invariant (same on AC or discharging). ───────
 
-  function machineWithBattery(battery: { charge_pct: number; on_ac: boolean; charging: boolean; minutes_to_empty?: number | null }) {
+  function machineWithBattery(battery: {
+    charge_pct: number;
+    on_ac: boolean;
+    /** Test shorthand only: `true` means state "charging". Never sent on the wire. */
+    charging?: boolean;
+    state?: BatteryCharge["state"];
+    minutes_to_empty?: number | null;
+  }) {
+    const { charging, ...wire } = battery;
     return {
       specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max" },
       resources: {
         ...RESOURCES,
-        load: { ...LOAD_WITH_EXTRAS, now: { ...LOAD_WITH_EXTRAS.now, battery: { minutes_to_empty: null, ...battery } } },
+        load: { ...LOAD_WITH_EXTRAS, now: { ...LOAD_WITH_EXTRAS.now, battery: { state: charging ? "charging" : "unknown", minutes_to_empty: null, ...wire } } },
       },
     };
   }
@@ -884,7 +893,8 @@ describe("MachineLens — battery surfaces (#2821, lens only)", () => {
     await waitFor(() => expect(screen.getByText("80%")).toBeInTheDocument());
     const icon = container.querySelector(".battery-bar-icon")!;
     expect(icon).not.toBeNull();
-    expect(icon.textContent).toContain("⚡");
+    expect(icon.getAttribute("data-kind")).toBe("bolt");
+    expect(container.querySelector(".battery-bar text")).toBeNull(); // a drawn path, never an emoji
   });
 
   it("plug icon when on AC but not charging (topped off) — never a bolt", async () => {
@@ -893,7 +903,54 @@ describe("MachineLens — battery surfaces (#2821, lens only)", () => {
     await waitFor(() => expect(screen.getByText("100%")).toBeInTheDocument());
     const icon = container.querySelector(".battery-bar-icon")!;
     expect(icon).not.toBeNull();
-    expect(icon.textContent).toContain("🔌");
+    expect(icon.getAttribute("data-kind")).toBe("plug");
+    expect(container.querySelector(".battery-bar text")).toBeNull();
+  });
+
+  it("held: a marker at the held level and a labeled tooltip; the other states draw neither", async () => {
+    mockMachineFetch(machineWithBattery({ charge_pct: 80, on_ac: true, state: "held" }));
+    const { container } = renderMachine(null);
+    await waitFor(() => expect(screen.getByText("80%")).toBeInTheDocument());
+    const mark = container.querySelector(".battery-bar-hold")!;
+    expect(mark).not.toBeNull();
+    // BATTERY_FILL_X (5) + 80% of the 44-unit fill width.
+    expect(Number(mark.getAttribute("x1"))).toBeCloseTo(5 + 0.8 * 44, 5);
+    const label = container.querySelector(".battery-bar-held")!;
+    expect(label.textContent).toBe("held");
+    expect(label.getAttribute("title")).toBe("Held at 80% by macOS (charge limit): plugged in, not charging");
+    cleanup();
+
+    for (const state of ["charging", "discharging", "full", "unknown"] as const) {
+      mockMachineFetch(machineWithBattery({ charge_pct: 80, on_ac: true, state }));
+      const r = renderMachine(null);
+      await waitFor(() => expect(screen.getByText("80%")).toBeInTheDocument());
+      expect(r.container.querySelector(".battery-bar-hold"), state).toBeNull();
+      expect(r.container.querySelector(".battery-bar-held"), state).toBeNull();
+      cleanup();
+    }
+  });
+
+  it("held: an (i) button after the label explains the hold on focus, and is absent in other states", async () => {
+    mockMachineFetch(machineWithBattery({ charge_pct: 80, on_ac: true, state: "held" }));
+    const { container } = renderMachine(null);
+    await waitFor(() => expect(screen.getByText("80%")).toBeInTheDocument());
+    const btn = screen.getByRole("button", { name: "what held means" });
+    expect(container.querySelector(".battery-bar-held")!.nextElementSibling).toBe(btn.parentElement);
+    expect(screen.queryByRole("tooltip")).toBeNull();
+    act(() => btn.focus());
+    const tip = await screen.findByRole("tooltip");
+    expect(tip.textContent).toContain("Held at 80% by macOS's charge limit");
+    expect(tip.textContent).toContain("not charging on purpose");
+    expect(tip.textContent).toContain("not draining");
+    expect(btn.getAttribute("aria-describedby")).toBe(tip.id);
+    act(() => btn.blur());
+    expect(screen.queryByRole("tooltip")).toBeNull();
+    cleanup();
+
+    mockMachineFetch(machineWithBattery({ charge_pct: 80, on_ac: true, charging: false, state: "full" }));
+    renderMachine(null);
+    await waitFor(() => expect(screen.getByText("80%")).toBeInTheDocument());
+    expect(screen.queryByRole("button", { name: "what held means" })).toBeNull();
   });
 
   it("no icon while discharging", async () => {

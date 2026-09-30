@@ -292,7 +292,7 @@ mod tests {
     }
 
     fn battery_at(pct: u8) -> BatterySample {
-        BatterySample { charge_pct: pct, on_ac: false, charging: false, minutes_to_empty: Some(90) }
+        BatterySample { charge_pct: pct, on_ac: false, charging: false, state: darkmux_crew::host_probe::ChargeState::Discharging, minutes_to_empty: Some(90) }
     }
 
     #[test]

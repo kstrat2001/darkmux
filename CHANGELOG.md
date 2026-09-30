@@ -1295,6 +1295,15 @@ darkmux release.
   names the receiver's roster entry for the verified node, else the machine id the
   job claims with `--node <host>`, and shows the role the job asked for.
   `WorkJob::for_peer` is removed (the receiver's version gate is the authority).
+
+- **The machine lens battery shows when macOS is holding the charge.** A battery reading now
+  carries a typed `state` (`charging`, `held`, `discharging`, `full`, `unknown`) that REPLACES the
+  old `charging` boolean on the `machine.telemetry` and `machine.battery` payloads and on
+  `load.now.battery` of `/machine/resources`. This is a break: readers use `state == "charging"`.
+  `held` means observed: on AC, not charging, not full, current about zero. The configured limit
+  percent is not readable, so none is reported. The lens marks the held level with an (i) that
+  explains it. The graphic is larger and scales with its panel, and the power glyph is a line icon.
+
 - **Radio's answering seat can run on a fleet peer.** Set `radio.answerer_profile`
   (or `role_profiles.radio-host`) to `<profile>@<machine>` and the seat's dispatch
   is submitted to that machine, which runs it on its own profile; the peer must

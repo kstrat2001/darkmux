@@ -1410,7 +1410,7 @@ describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", ()
       ...FULL_LOAD,
       load: {
         ...FULL_LOAD.load,
-        now: { ...FULL_LOAD.load.now, battery: { charge_pct: 78, on_ac: false, charging: false, minutes_to_empty: 130 } },
+        now: { ...FULL_LOAD.load.now, battery: { charge_pct: 78, on_ac: false, state: "discharging", minutes_to_empty: 130 } },
         battery_health: {
           cycle_count: 28,
           design_capacity_mah: 6249,

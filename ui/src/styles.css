@@ -5103,20 +5103,31 @@ body {
    point 12px outside the glyph resolved to whatever sat behind it. The
    padding never did any touch work; the `::after` below does. */
 .mm-odo-i {
+  box-sizing: border-box;
   display: inline-flex;
+  flex: none;
   align-items: center;
   justify-content: center;
-  width: 14px;
-  height: 14px;
+  align-self: center;
+  width: 16px;
+  height: 16px;
   margin-left: 2px;
   padding: 0;
-  font: 600 calc(9px * var(--fs-scale))/1 var(--font-mono);
   color: var(--dim);
   background: transparent;
   border: 1px solid var(--border);
   border-radius: 50%;
   cursor: pointer;
   vertical-align: middle;
+}
+.mm-odo-i__glyph {
+  width: 10px;
+  height: 10px;
+  display: block;
+}
+.mm-odo-i:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent);
 }
 /* (U1-1) The shared 44px hit-area pattern — the both-axes form `.scrub
    button::after` already uses (a 14px glyph needs the WIDTH extended too,
@@ -7986,12 +7997,13 @@ body {
 /* The battery-shaped bar's own layout: the glyph, then the percent beside
    it. */
 .battery-bar-row {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 10px;
 }
 .battery-bar {
-  width: 84px;
+  width: var(--bat-w);
   height: auto;
   display: block;
 }
@@ -8040,14 +8052,51 @@ body {
    knockout glyph rather than disappearing into whichever fill color is
    under it at the moment. */
 .battery-bar-icon {
-  font-size: 13px;
-  fill: var(--bg);
-  paint-order: stroke;
+  fill: none;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.battery-bar-icon__halo {
+  stroke: var(--bg);
+  stroke-width: 3.6px;
+}
+.battery-bar-icon__line {
   stroke: var(--fg);
-  stroke-width: 0.6px;
+  stroke-width: 2px;
+}
+/* A `held` reading: a thin marker at the level macOS is holding the charge at. Drawn over the
+   fill in the page's own foreground so it reads against any point on the ramp. */
+.battery-bar-hold {
+  stroke: var(--fg);
+  stroke-width: 2px;
+  stroke-linecap: round;
+}
+.battery-bar-held {
+  font: 600 calc(clamp(11px, var(--bat-w) * 0.075, 16px) * var(--fs-scale))/1.2 var(--font-mono);
+  color: var(--info);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.battery-held-info {
+  display: inline-flex;
+  align-items: center;
+}
+.battery-held-tip {
+  position: absolute;
+  z-index: 5;
+  top: calc(100% + 4px);
+  left: 0;
+  width: max-content;
+  max-width: min(260px, 80vw);
+  padding: 8px 10px;
+  font: calc(11px * var(--fs-scale))/1.4 var(--font-mono);
+  color: var(--fg);
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
 }
 .battery-bar-pct {
-  font: 700 calc(15px * var(--fs-scale))/1.2 var(--font-mono);
+  font: 700 calc(clamp(15px, var(--bat-w) * 0.11, 24px) * var(--fs-scale))/1.2 var(--font-mono);
   color: var(--fg);
   font-variant-numeric: tabular-nums;
 }
@@ -8068,7 +8117,15 @@ body {
   flex-direction: column;
   gap: 14px;
 }
+/* (operator, 2026-09-30: "plenty of room to make the battery graphics bigger/wider") The
+   graphic scales with the lens's own width: the block is the size container, and `--bat-w` is
+   the glyph's width (about 1.9x the old 84px on a phone; beside the info rows on a desktop it takes 17% of
+   the block up to 260px). The percent and the HELD label scale off the same variable. */
+.battery-block {
+  container-type: inline-size;
+}
 .battery-meter {
+  --bat-w: clamp(84px, 44cqw, 180px);
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -8091,6 +8148,7 @@ body {
     gap: 48px;
   }
   .battery-meter {
+    --bat-w: clamp(140px, 17cqw, 260px);
     flex: 0 0 auto;
   }
   .battery-info {

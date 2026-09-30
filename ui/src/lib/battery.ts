@@ -39,7 +39,7 @@ function fmtHm(totalMinutes: number): string {
 export type BatteryIconKind = "bolt" | "plug" | null;
 
 export function batteryIcon(b: BatteryCharge): BatteryIconKind {
-  if (b.charging) return "bolt";
+  if (b.state === "charging") return "bolt";
   if (b.on_ac) return "plug";
   return null;
 }
@@ -52,10 +52,25 @@ export function batteryIcon(b: BatteryCharge): BatteryIconKind {
  * rule already governs `minutes_to_empty` on the wire; this just states
  * what arrives, in words. */
 export function batteryStateText(b: BatteryCharge): string {
-  if (b.charging) return "charging";
+  if (b.state === "charging") return "charging";
+  if (b.state === "held") return `held at ${b.charge_pct}% by macOS, on AC, not charging`;
   if (b.on_ac) return "on AC, not charging";
   const time = b.minutes_to_empty != null ? `, ${fmtHm(b.minutes_to_empty)} left` : "";
   return `on battery${time}`;
+}
+
+/** The explanation the held (i) button opens, or `null` in every other state. */
+export function batteryHeldExplanation(b: BatteryCharge): string | null {
+  if (b.state !== "held") return null;
+  return `Held at ${b.charge_pct}% by macOS's charge limit. It is plugged in and not charging on purpose, which protects the battery. It is not draining.`;
+}
+
+/** The hover text for the `held` marker, or `null` in every other state. "Held" is the probe's
+ * observation (on AC, not charging, not full, current about zero); the configured limit percent
+ * is not readable, so the text names the level the pack is sitting at and nothing else. */
+export function batteryHeldTitle(b: BatteryCharge): string | null {
+  if (b.state !== "held") return null;
+  return `Held at ${b.charge_pct}% by macOS (charge limit): plugged in, not charging`;
 }
 
 /** The ONLY visible text the battery meter still carries for its power
@@ -97,6 +112,11 @@ export function batteryFillWidth(chargePct: number | null, maxWidth: number): nu
   return (clamped / 100) * maxWidth;
 }
 
+/** (operator, 2026-09-30: "reddish for too long... fully green by about 50%") The fraction of
+ * the bar at which the ramp reaches its green end. Below it the palette runs red to green
+ * (amber at a quarter); above it the ramp stays green. */
+const BATTERY_GREEN_AT = 0.5;
+
 /** The gradient id the battery bar's own `<linearGradient>` uses — a
  * separate constant from `COMPACT_RAMP_ID` (Meter.tsx) even though only
  * one `BatteryBar` ever renders per page (so reuse-safety across multiple
@@ -114,7 +134,9 @@ export const BATTERY_RAMP_ID = "mm-battery-ramp";
  * every "high is bad" CPU/GPU/MEM dial, matching the battery's own
  * `lowIsBad` semantics from a discrete-threshold era of this same file
  * without needing a discrete threshold: the fill simply reveals less of
- * the ramp's green end the lower the charge.
+ * the ramp's green end the lower the charge. The ramp reaches green at
+ * `BATTERY_GREEN_AT` (half the bar) and stays green above it, so red is
+ * confined to the low end.
  *
  * Linear, not cosine-spaced: `gaugeRampStops` (Meter.tsx) cosine-warps its
  * offsets because a horizontal gradient has to track a SEMICIRCULAR arc's
@@ -124,7 +146,7 @@ export const BATTERY_RAMP_ID = "mm-battery-ramp";
 export function batteryRampStops(segments = 12): Array<{ offset: string; color: string }> {
   return Array.from({ length: segments + 1 }, (_, i) => {
     const t = i / segments; // 0 = empty edge, 1 = full edge
-    return { offset: `${(t * 100).toFixed(4)}%`, color: gaugeFillColor((1 - t) * 100) };
+    return { offset: `${(t * 100).toFixed(4)}%`, color: gaugeFillColor((1 - Math.min(1, t / BATTERY_GREEN_AT)) * 100) };
   });
 }
 
