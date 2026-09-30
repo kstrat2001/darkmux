@@ -4,8 +4,8 @@ import type { GatheredBy } from "./GatheredBy";
 import type { SourceState } from "./SourceState";
 
 /**
- * `GET /fleet/view`: every roster machine and its card, as this daemon
- * gathered them.
+ * `GET /fleet/view`: every machine and its card, as this daemon gathered
+ * them.
  */
 export type FleetView = { 
 /**
@@ -18,8 +18,8 @@ gathered_by: GatheredBy, local_machine_id: string | null,
  */
 presence: SourceState, 
 /**
- * Why `machines` is empty when the roster file exists and could not be
- * parsed; `null` otherwise. A fixed sentence.
+ * Why the roster contributed no entries when its file exists and could
+ * not be parsed; `null` otherwise. A fixed sentence.
  */
 roster_error: string | null, fetched_at_ms: number, 
 /**
@@ -30,4 +30,8 @@ cache_ttl_ms: number,
 /**
  * What gathering the view cost, in milliseconds.
  */
-gather_ms: number, machines: Array<FleetMachine>, };
+gather_ms: number, 
+/**
+ * Every roster machine, and this machine's own row (always present).
+ */
+machines: Array<FleetMachine>, };

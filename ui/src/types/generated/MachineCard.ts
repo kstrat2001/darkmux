@@ -5,7 +5,8 @@ import type { CardSeats } from "./CardSeats";
 import type { MachineSpecsResponse } from "./MachineSpecsResponse";
 
 /**
- * `GET /machine/card`.
+ * One machine's card: what it says about itself. Served inside a
+ * [`ListenerCard`] by the fleet listener.
  */
 export type MachineCard = { card_schema_version: string, work_job_schema_version: string, 
 /**
@@ -32,4 +33,10 @@ seats?: CardSeats, governor: CardGovernor, generated_at_ms: number,
  * What building this card cost, in milliseconds (the observer stamps its
  * own cost).
  */
-gather_ms: number, };
+gather_ms: number, 
+/**
+ * How long the serving machine keeps a gathered card before gathering
+ * again: this card may be that much older than `generated_at_ms` says
+ * when it was read. `0` for a card built for one reader.
+ */
+cache_ttl_ms: number, };

@@ -7751,4 +7751,36 @@ mod fleet_cache_wall_clock {
         assert_eq!(backfill("dispatch start"), backfill("dispatch.start"));
         // flow-action-guard:allow-end
     }
+
+    /// The promise: the flow-history scan runs once per TTL, not once per
+    /// caller. A pairing that appears in history after a scan is not seen
+    /// until the TTL passes; a zero TTL always rescans.
+    #[test]
+    fn the_uid_history_is_scanned_once_per_ttl() {
+        let tmp = TempDir::new().unwrap();
+        let day = tmp.path().join("2026-09-30.jsonl");
+        let pair = |id: &str, uid: &str| format!("{{\"action\":\"dispatch.start\",\"machine_id\":\"{id}\",\"machine_uid\":\"{uid}\"}}\n");
+        let entry = |id: &str| darkmux_fleet::MachineEntry {
+            id: id.into(),
+            address: format!("{id}:8765"),
+            description: None,
+            added_unix_ms: 1,
+            machine_uid: None,
+            loopback_intended: false,
+            node_id: None,
+            extras: Default::default(),
+        };
+        let uid_of = |id: &str, ttl: std::time::Duration| {
+            let mut m = vec![entry(id)];
+            let filled = super::backfill_with_ttl(&mut m, tmp.path(), ttl);
+            (m[0].machine_uid.clone(), filled.contains(id))
+        };
+        let long = std::time::Duration::from_secs(600);
+        fs::write(&day, pair("laptop", "UID-L")).unwrap();
+        assert_eq!(uid_of("laptop", long), (Some("UID-L".into()), true), "a filled uid says so");
+        // A new machine appears in history; the cached scan does not see it.
+        fs::write(&day, format!("{}{}", pair("laptop", "UID-L"), pair("studio", "UID-S"))).unwrap();
+        assert_eq!(uid_of("studio", long), (None, false), "served from the scan a TTL ago");
+        assert_eq!(uid_of("studio", std::time::Duration::ZERO), (Some("UID-S".into()), true), "an expired scan reads history again");
+    }
 }

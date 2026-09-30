@@ -4,4 +4,4 @@
  * Why a card could not be read from a machine that may be up. Each reason
  * has its own remedy, so none stands for another.
  */
-export type UnreachableReason = "presence_gone" | "bad_address" | "dns_failed" | "identity_unavailable" | "not_on_overlay" | "pin_mismatch" | "auth_required" | "connect_failed" | "bad_answer";
+export type UnreachableReason = "bad_address" | "dns_failed" | "identity_unavailable" | "not_on_overlay" | "pin_mismatch" | "listener_off" | "auth_required" | "refused_by_peer" | "listener_unavailable" | "bad_answer" | "unknown";

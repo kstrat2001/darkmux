@@ -4,4 +4,4 @@
  * What darkmux does at an endpoint (darkmux's own action, never a location
  * or a cost), for a model, and for a profile as the sum of its models.
  */
-export type CardEndpointKind = "managed" | "unmanaged" | "mixed" | "unresolved";
+export type CardEndpointKind = "managed" | "unmanaged" | "mixed" | "unresolved" | "unknown";

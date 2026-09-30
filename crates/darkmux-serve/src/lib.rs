@@ -870,14 +870,44 @@ fn backfill_roster_machine_uids(
     machines: &mut [darkmux_fleet::MachineEntry],
     flows_dir: &std::path::Path,
 ) -> std::collections::BTreeSet<String> {
-    use std::io::BufRead;
-    let mut filled = std::collections::BTreeSet::new();
-    if machines.iter().all(|m| m.machine_uid.is_some()) {
-        return filled;
+    backfill_with_ttl(machines, flows_dir, UID_HISTORY_TTL)
+}
+
+/// How long the id -> uid pairings read from flow history are kept. The
+/// pairing of a machine name with its hardware uid does not change while the
+/// machine exists, and reading it is a scan of every flow file: measured
+/// 2026-09-30 at 10.2 s (debug build) over 306 MB of real history, on a path
+/// that `/fleet/roster` and every fleet-view gather (about every 5 s while
+/// anything watches) both take. A scan per TTL bounds the observer's cost.
+const UID_HISTORY_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The id -> uid pairings from `flows_dir`, scanned at most once per `ttl`.
+/// Single-flight: the lock is held across the scan, so concurrent callers
+/// wait for one scan instead of each running their own. The one slot is
+/// keyed by directory.
+fn history_uids(
+    flows_dir: &std::path::Path,
+    ttl: std::time::Duration,
+) -> std::sync::Arc<std::collections::HashMap<String, String>> {
+    type Slot = Option<(std::path::PathBuf, std::time::Instant, std::sync::Arc<std::collections::HashMap<String, String>>)>;
+    static CACHE: std::sync::Mutex<Slot> = std::sync::Mutex::new(None);
+    let mut slot = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((dir, at, map)) = slot.as_ref() {
+        if dir == flows_dir && at.elapsed() < ttl {
+            return map.clone();
+        }
     }
+    let map = std::sync::Arc::new(scan_history_uids(flows_dir));
+    *slot = Some((flows_dir.to_path_buf(), std::time::Instant::now(), map.clone()));
+    map
+}
+
+/// Every id -> uid pairing in `flows_dir`'s day files, first seen wins.
+fn scan_history_uids(flows_dir: &std::path::Path) -> std::collections::HashMap<String, String> {
+    use std::io::BufRead;
     let mut by_id: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let Ok(entries) = std::fs::read_dir(flows_dir) else {
-        return filled;
+        return by_id;
     };
     for entry in entries.flatten() {
         if !entry.file_name().to_string_lossy().ends_with(".jsonl") {
@@ -899,6 +929,19 @@ fn backfill_roster_machine_uids(
             by_id.entry(id.to_string()).or_insert_with(|| uid.to_string());
         }
     }
+    by_id
+}
+
+fn backfill_with_ttl(
+    machines: &mut [darkmux_fleet::MachineEntry],
+    flows_dir: &std::path::Path,
+    ttl: std::time::Duration,
+) -> std::collections::BTreeSet<String> {
+    let mut filled = std::collections::BTreeSet::new();
+    if machines.iter().all(|m| m.machine_uid.is_some()) {
+        return filled;
+    }
+    let by_id = history_uids(flows_dir, ttl);
     for m in machines.iter_mut() {
         if m.machine_uid.is_none() {
             if let Some(uid) = by_id.get(&m.id) {

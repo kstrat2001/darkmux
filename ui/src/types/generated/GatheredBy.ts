@@ -5,4 +5,4 @@
  * say: only a running daemon has seats, a host sampler's thermal state and a
  * battery reading.
  */
-export type GatheredBy = "daemon" | "cli_process";
+export type GatheredBy = "daemon" | "cli_process" | "unknown";

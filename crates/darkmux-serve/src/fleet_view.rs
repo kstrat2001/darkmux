@@ -1244,6 +1244,38 @@ pub(crate) mod tests {
         assert!(row(&view, "down").fetch_ms.is_some());
     }
 
+    /// The promise: `/fleet/roster` and the fleet view read ONE roster, with the
+    /// same flow-history uid for an entry that declares none, and the view's
+    /// source says which uids were derived.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_roster_route_and_the_view_share_one_roster_reader() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roster = tmp.path().join("fleet.json");
+        std::fs::write(&roster, r#"{"version":"2","machines":{"studio":{"id":"studio","address":"studio.example.invalid","added_unix_ms":1}}}"#).unwrap();
+        let flows = tmp.path().join("flows");
+        std::fs::create_dir_all(&flows).unwrap();
+        std::fs::write(flows.join("2026-09-30.jsonl"), "{\"machine_id\":\"studio\",\"machine_uid\":\"UID-STUDIO-HISTORY\"}\n").unwrap();
+        let set = |k: &str, v: Option<&std::ffi::OsStr>| unsafe {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        };
+        let prev = (std::env::var_os("DARKMUX_FLEET_FILE"), std::env::var_os("DARKMUX_FLOWS_DIR"));
+        set("DARKMUX_FLEET_FILE", Some(roster.as_os_str()));
+        set("DARKMUX_FLOWS_DIR", Some(flows.as_os_str()));
+        let provider: Arc<dyn IdentityProvider> = Arc::new(provider(false));
+        let from_view = ProcessSources::new(provider, GatheredBy::Daemon, None).roster().map_err(|e| e.to_string());
+        let route = get(FleetContext::hermetic(), "/fleet/roster", "127.0.0.1:5555", &[]).await;
+        set("DARKMUX_FLEET_FILE", prev.0.as_deref());
+        set("DARKMUX_FLOWS_DIR", prev.1.as_deref());
+        let from_view = from_view.expect("the roster reads");
+        assert_eq!(from_view.machines[0].machine_uid.as_deref(), Some("UID-STUDIO-HISTORY"));
+        assert!(from_view.uid_from_history.contains("studio"), "the view's source says the uid was derived");
+        assert_eq!(route["machines"][0]["machine_uid"], "UID-STUDIO-HISTORY", "the route shows the same uid: {route}");
+    }
+
     #[test]
     fn the_view_records_the_ttl_it_was_gathered_under() {
         let s = Scripted::default();

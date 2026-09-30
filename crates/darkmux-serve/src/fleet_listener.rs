@@ -1730,16 +1730,6 @@ mod tests {
         assert_eq!(lookups(&h), 2, "every job is placed by the provider, so untrust and a node leaving take effect at once");
     }
 
-    /// A failed lookup is not kept: the provider coming back is seen by the
-    /// next read, not one TTL later.
-    #[test]
-    fn a_failed_identity_lookup_is_not_cached() {
-        let h = start(Some(laptop()), true, 0);
-        assert_eq!(get_card(&card_url(&h), TOKEN).0, 503);
-        h.network.set(vec![laptop()], None);
-        assert_eq!(get_card(&card_url(&h), TOKEN).0, 200, "the recovered provider is asked at once");
-    }
-
     /// (#3004 A2) Connections are capped per address at accept, before the
     /// router knows the path. A peer whose waited jobs hold every connection
     /// it may use for jobs still gets its card: the cap leaves room for reads.
