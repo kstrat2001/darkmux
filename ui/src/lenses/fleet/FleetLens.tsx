@@ -13,6 +13,9 @@ import { REPLAY_GRANULARITY_NOTE, useLiveOverlay } from "../../lib/liveChannel";
 import { useCountUp } from "../../hooks/useCountUp";
 import { useFleetRoster, useLiveMachines } from "../../hooks/useLiveMachines";
 import { useFleetView } from "../../hooks/useFleetView";
+import { useFlip } from "../../hooks/useFlip";
+import { cardOrderKey, orderCards } from "./cardOrder";
+import { useCardOrderGate } from "./cardOrderGate";
 import { getSource, runsSrc, runsReachable } from "../../lib/source";
 import { useLiveSessionIds } from "../../hooks/useLiveSessionIds";
 import { machineUids, machPresent, machineNames, isSelfMachine, LIVE_WINDOW_MS } from "../../lib/flow";
@@ -383,7 +386,7 @@ const TimelineLanes = memo(function TimelineLanes({ timeline }: { timeline: Retu
   return (
     <>
       {timeline.lanes.map((lane) => (
-        <div className="lane" key={lane.uid}>
+        <div className="lane" key={lane.uid} data-flip-key={lane.uid}>
           <div className="lname" title={lane.name}>
             {lane.name}
           </div>
@@ -591,6 +594,9 @@ export function FleetLens({
   // after every render, since a rate or a pager changes the text, and on
   // every resize of the card grid.
   const fleetRef = useRef<HTMLDivElement | null>(null);
+  const tlRef = useRef<HTMLDivElement | null>(null);
+  useFlip(fleetRef);
+  useFlip(tlRef);
   // (#2928 re-review, C-1) A tube's size reads only its card's width, so it
   // is refitted when the set of scope-bearing cards (or their pagers)
   // changes, and on resize below: not on every render, where each call
@@ -672,7 +678,6 @@ export function FleetLens({
     const self = viewRows?.find((r) => r.is_this_machine);
     return self ? rowSpecs(self) : null;
   }, [viewRows]);
-
   // (#1923) `GET /runs` — already fleet-aware, already unions lab + flow
   // sources server-side (`build_runs`) — read here ONLY to fill the gap
   // flow presence structurally cannot: a lab run in flight, which
@@ -749,6 +754,7 @@ export function FleetLens({
   // The view says who is up for every machine it holds, so "offline" waits on
   // it as well as on presence.
   const viewAnswered = useLatch(fleetView.answered);
+  const { orderSelf, orderState } = useCardOrderGate(liveMode, specs, viewAnswered);
   // (#2965) A failed flow read settles the window with no records, which
   // is what a quiet window looks like: the flow source has not answered
   // while its read is failing, so the claims it backs hold "no signal".
@@ -857,47 +863,50 @@ export function FleetLens({
   // state, pages, utility strip) are then derived per render from the base,
   // touching only the running sessions, so a live sample never rescans the
   // window. A replay keys the base on the playhead itself.
-  const baseCards = useMemo(
-    () => [
-      ...viewCards.map(({ facts }) =>
-        buildFleetCardBase(
-          flowWindow.data,
-          liveMachines,
-          specs,
-          presence,
-          false,
-          facts.uid,
-          liveMode,
-          playheadT,
-          facts,
-          // (#1923) `Run.machine` carries only a display NAME
-          // (`runsForMachine`'s own doc): the machine's aliases, plus the
-          // name the view gives it.
-          runsForMachine(runs, new Set([...machineNames(flowWindow.data, liveMachines, facts.uid), ...(facts.name ? [facts.name] : [])])),
-          roster,
-          policy,
-        ),
+  const baseCards = useMemo(() => {
+    const viewBases = viewCards.map(({ row, facts }) => ({
+      order: { self: row.is_this_machine, key: cardOrderKey(row.machine_uid, facts.uid) },
+      base: buildFleetCardBase(
+        flowWindow.data,
+        liveMachines,
+        specs,
+        presence,
+        false,
+        facts.uid,
+        liveMode,
+        playheadT,
+        facts,
+        // (#1923) `Run.machine` carries only a display NAME
+        // (`runsForMachine`'s own doc): the machine's aliases, plus the
+        // name the view gives it.
+        runsForMachine(runs, new Set([...machineNames(flowWindow.data, liveMachines, facts.uid), ...(facts.name ? [facts.name] : [])])),
+        roster,
+        policy,
       ),
-      ...flowOnlyUids.map((m) =>
-        buildFleetCardBase(
-          flowWindow.data,
-          liveMachines,
-          specs,
-          presence,
-          machPresent(flowWindow.data, liveMachines, playheadT, m) === false,
-          m,
-          liveMode,
-          playheadT,
-          null,
-          runsForMachine(runs, machineNames(flowWindow.data, liveMachines, m)),
-          roster,
-          policy,
-        ),
+    }));
+    const flowBases = flowOnlyUids.map((m) => ({
+      order: { self: isSelfMachine(flowWindow.data, liveMachines, orderSelf, m), key: cardOrderKey(m, m) },
+      base: buildFleetCardBase(
+        flowWindow.data,
+        liveMachines,
+        specs,
+        presence,
+        machPresent(flowWindow.data, liveMachines, playheadT, m) === false,
+        m,
+        liveMode,
+        playheadT,
+        null,
+        runsForMachine(runs, machineNames(flowWindow.data, liveMachines, m)),
+        roster,
+        policy,
       ),
-    ],
+    }));
+    // The ONE place the card order is decided (`cardOrder.ts`): neither the
+    // view's order nor the flow window's, so which source answered first
+    // never moves a card.
+    return orderCards([...viewBases, ...flowBases], (b) => b.order).map((b) => b.base);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- `playheadT` is read through `liveEdgeClock` on purpose (#2928, above).
-    [viewCards, flowOnlyUids, flowWindow.data, liveEdgeClock, liveMachines, specs, presence, liveMode, runs, roster, policy],
-  );
+  }, [viewCards, flowOnlyUids, flowWindow.data, liveEdgeClock, liveMachines, specs, orderSelf, presence, liveMode, runs, roster, policy]);
   const cards = useMemo(
     () => baseCards.map((b) => withLiveReadings(b, playheadT, connected, lastContactMs, liveOverlay)),
     [baseCards, playheadT, connected, lastContactMs, liveOverlay],
@@ -918,12 +927,18 @@ export function FleetLens({
   const ticking = livePolling && playhead == null && cards.some((c) => c.liveTokRate !== null);
   useNowMs(ticking);
 
+  // The activity lanes follow the cards' order (`cardOrder.ts`), not the flow
+  // window's, so the two lists cannot disagree or reshuffle as records land.
+  const laneUids = useMemo(
+    () => orderCards(uids, (m) => ({ self: isSelfMachine(flowWindow.data, liveMachines, orderSelf, m), key: cardOrderKey(m, m) })),
+    [uids, flowWindow.data, liveMachines, orderSelf],
+  );
   const timeline = useMemo(
     () =>
       buildActivityTimeline(
         flowWindow.data,
         liveMachines,
-        uids,
+        laneUids,
         presence,
         // The FIXED axis ceiling — never the playhead. See timeline.ts's own
         // doc + this component's `playhead` prop doc for why the two must
@@ -940,7 +955,7 @@ export function FleetLens({
         policy,
       ),
     // eslint-disable-next-line react-hooks/exhaustive-deps -- `playheadT` is read through `liveEdgeClock` on purpose (#2928, above).
-    [flowWindow.data, liveMachines, uids, presence, flowWindow.tMax, windowMinutesNum, liveMode, tMin, liveEdgeClock, fixedRange?.[0], fixedRange?.[1], specs, roster, policy],
+    [flowWindow.data, liveMachines, laneUids, presence, flowWindow.tMax, windowMinutesNum, liveMode, tMin, liveEdgeClock, fixedRange?.[0], fixedRange?.[1], specs, roster, policy],
   );
 
   return (
@@ -954,7 +969,7 @@ export function FleetLens({
       />
       <RunsUnreadableNotice unreadable={runsUnreadable} message={runsErrorMessage} />
       <RosterUnreadableNotice error={rosterError} />
-      <div className="fleet" ref={fleetRef}>
+      <div className="fleet" ref={fleetRef} data-order={orderState}>
         {cards.map((card) => {
           // (#2881) Pager selection for this card. `execs` is already
           // sorted by session id (`cards.ts::buildFleetCard`'s own doc) —
@@ -1043,6 +1058,7 @@ export function FleetLens({
           // for one machine made the same gesture mean two different things.
           <div
             key={card.uid}
+            data-flip-key={card.uid}
             // (#2958) `face`, not the card's raw flags: "offline" waits on
             // the sources that could contradict it. `nosignal` gives the dot
             // the absent dot's no-reading gray, without dimming the card.
@@ -1437,7 +1453,7 @@ export function FleetLens({
         })}
       </div>
       {uids.length ? (
-        <div className="fleettl" style={{ "--lname-w": `${timeline.labelWidthPx}px` } as CSSProperties}>
+        <div className="fleettl" ref={tlRef} style={{ "--lname-w": `${timeline.labelWidthPx}px` } as CSSProperties}>
           <div className="tlhdr">
             <span>{timeline.headerText}</span>
             {/* (Playback parity, Change A, finding #8) Shown in BOTH modes

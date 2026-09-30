@@ -4,7 +4,8 @@
 //! Every token-bearing request to another machine (work submission,
 //! `machine status`/`resources <id>`, `machine list`, the daemon's
 //! peer mission-graph proxy) goes through [`peer_target`] + [`fleet_get`] /
-//! [`fleet_post_json`]. A target is either this machine's own daemon (a
+//! [`fleet_post_json`], which take only a [`SettledTarget`]: one whose first-contact
+//! pin is already saved in the roster. A target is either this machine's own daemon (a
 //! loopback address: the token is already on this machine) or a roster
 //! entry VERIFIED by the identity provider ([`crate::verify_target`]): its
 //! address resolves to an overlay node, and that node is the one pinned for
@@ -21,17 +22,17 @@
 
 use crate::identity::IdentityProvider;
 use crate::roster::MachineEntry;
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 /// Where a token-bearing request may go.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerTarget {
-    pub scheme: String,
+    pub(crate) scheme: String,
     /// The host name used in the URL and the Host header.
-    pub host: String,
-    pub port: u16,
+    pub(crate) host: String,
+    pub(crate) port: u16,
     /// The verified address every connection is made to. `None` only for a
     /// loopback target (this machine), and a target without one NEVER gets
     /// the fleet token (#2916 round 3 C1): a port squatter on 127.0.0.1 (a
@@ -39,15 +40,15 @@ pub struct PeerTarget {
     /// tunnel) must not collect it, and this machine's own daemon exempts
     /// loopback callers anyway. Reaching a peer through a loopback tunnel
     /// with the token would need an explicit opt-in; there is none.
-    pub pinned_ip: Option<IpAddr>,
+    pub(crate) pinned_ip: Option<IpAddr>,
     /// The node id pinned by THIS lookup (first contact), for the caller to
     /// persist; `None` when the entry was already pinned or is loopback.
-    pub newly_pinned: Option<String>,
+    pub(crate) newly_pinned: Option<String>,
     /// The node the identity provider named at `pinned_ip` and that passed
     /// the roster's pin; `None` for a target no node was verified behind (a
     /// loopback one). A reader that asks "is this machine's own node behind
     /// this target" compares it to the provider's own node.
-    pub node_id: Option<String>,
+    pub(crate) node_id: Option<String>,
 }
 
 /// Why a roster entry is not a target this machine may send to. Typed so a
@@ -171,7 +172,107 @@ impl std::fmt::Display for TargetError {
 
 impl std::error::Error for TargetError {}
 
+/// A target the fleet token may go to: this machine's own daemon, a
+/// loopback entry (which never gets the token), or a verified node whose pin
+/// is already persisted in the roster. It exists only after
+/// [`pin_on_first_contact`](crate::pin_on_first_contact) succeeded or
+/// [`PeerTarget::already_settled`] found no roster entry behind it, so
+/// [`fleet_get`] and [`fleet_post_json`] cannot be handed a target whose
+/// first-contact pin is unsaved. The field is private and no constructor
+/// takes a bare [`PeerTarget`] with a pending pin.
+///
+/// The positive twin: the same call with a settled target compiles, so a
+/// rename of `fleet_get`, `PeerTarget` or `SettledTarget` breaks THIS test
+/// loudly instead of quietly making the failing ones below vacuous.
+///
+/// ```
+/// use darkmux_fleet::{fleet_get, PeerTarget, SettledTarget};
+/// fn send(settled: &SettledTarget) {
+///     let _ = fleet_get(settled, "/x", std::time::Duration::from_secs(1), &[]);
+/// }
+/// fn settle(t: PeerTarget) -> Result<SettledTarget, PeerTarget> {
+///     t.already_settled()
+/// }
+/// ```
+///
+/// A merely-verified target cannot be sent to (type mismatch):
+///
+/// ```compile_fail,E0308
+/// use darkmux_fleet::{fleet_get, PeerTarget};
+/// fn unsafe_send(verified_but_unpinned: &PeerTarget) {
+///     let _ = fleet_get(verified_but_unpinned, "/x", std::time::Duration::from_secs(1), &[]);
+/// }
+/// ```
+///
+/// Nor can one be built from outside this crate (private constructor):
+///
+/// ```compile_fail
+/// use darkmux_fleet::{PeerTarget, SettledTarget};
+/// fn forge(t: PeerTarget) -> SettledTarget {
+///     SettledTarget::new(t)
+/// }
+/// ```
+///
+/// Nor with the tuple constructor (private field):
+///
+/// ```compile_fail
+/// use darkmux_fleet::{PeerTarget, SettledTarget};
+/// fn forge(t: PeerTarget) -> SettledTarget {
+///     SettledTarget(t)
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettledTarget(PeerTarget);
+
+impl SettledTarget {
+    /// Only the pin settlers build one ([`crate::pin_on_first_contact`] and the
+    /// sender's own read-only variant).
+    pub(crate) fn new(target: PeerTarget) -> Self {
+        SettledTarget(target)
+    }
+
+    /// The base URL (`scheme://host:port`).
+    pub fn base(&self) -> String {
+        self.0.base()
+    }
+
+    /// The node the identity provider named behind this target, when one was
+    /// verified (see [`PeerTarget::node_id`]).
+    pub fn node_id(&self) -> Option<&str> {
+        self.0.node_id.as_deref()
+    }
+
+    /// Tests only: name the node behind a fixture target.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_node_id_for_test(mut self, node: &str) -> Self {
+        self.0.node_id = Some(node.to_string());
+        self
+    }
+}
+
 impl PeerTarget {
+    /// The node id behind this target; see the field's own doc.
+    pub fn node_id(&self) -> Option<&str> {
+        self.node_id.as_deref()
+    }
+
+    /// The verified address every connection is made to; see the field's doc.
+    pub fn pinned_ip(&self) -> Option<IpAddr> {
+        self.pinned_ip
+    }
+
+    /// This target as one the token may go to, for a target no roster entry
+    /// stands behind: a loopback one or this machine's own daemon. `Err` hands
+    /// the target back when a node was verified for a roster entry (pinned or
+    /// not): [`crate::pin_on_first_contact`] settles it against the SAVED
+    /// entry, so a stale snapshot cannot vouch for it.
+    pub fn already_settled(self) -> std::result::Result<SettledTarget, PeerTarget> {
+        if self.newly_pinned.is_some() || self.node_id.is_some() {
+            return Err(self);
+        }
+        Ok(SettledTarget(self))
+    }
+
     /// The same verified node, dialed at its fleet listener: `port` is the
     /// listener's, and the scheme is plain `http` whatever the roster
     /// address wrote (the address names the viewer daemon, which may sit
@@ -278,15 +379,59 @@ pub fn peer_target(
     })
 }
 
-/// Persist a first-contact pin for roster entry `id`.
-pub fn persist_pin(id: &str, target: &PeerTarget) -> Result<()> {
-    let Some(node_id) = target.newly_pinned.clone() else { return Ok(()) };
+/// What the saved roster must still say for `target`'s verified node to be the
+/// one `snapshot` (the entry the caller verified against) means: the entry
+/// exists under its own id, still has the address that was verified, and pins
+/// no other node. With `require_pinned` the pin must also be present and equal
+/// (a target verified against an already-pinned entry).
+fn check_saved_entry(
+    saved: Option<&MachineEntry>,
+    snapshot: &MachineEntry,
+    node: &str,
+    require_pinned: bool,
+) -> Result<()> {
+    let changed = |why: String| {
+        anyhow!("the roster entry for {} changed while contacting it ({why}); nothing was sent, retry", snapshot.id)
+    };
+    let Some(saved) = saved else {
+        return Err(changed(format!(
+            "no entry is keyed `{}`: it was removed, or its key differs from its id",
+            snapshot.id
+        )));
+    };
+    if saved.address != snapshot.address {
+        return Err(changed("its address was edited".to_string()));
+    }
+    match saved.node_id.as_deref().filter(|p| !p.is_empty()) {
+        Some(pinned) if pinned != node => Err(changed("another node was pinned".to_string())),
+        None if require_pinned => Err(changed("its pin was cleared".to_string())),
+        _ => Ok(()),
+    }
+}
+
+/// Persist a first-contact pin for the roster entry `snapshot` was read from,
+/// compare-and-set under the roster lock: the saved entry must still be the
+/// one that was verified (see [`check_saved_entry`]). Returns the node id the
+/// saved entry now pins.
+pub(crate) fn persist_pin(snapshot: &MachineEntry, target: &PeerTarget) -> Result<String> {
+    let Some(node_id) = target.newly_pinned.clone() else { return confirm_pin(snapshot, target) };
     crate::mutate_roster(|r| {
-        if let Some(e) = r.machines.get_mut(id) {
-            e.node_id = Some(node_id);
+        let saved = r.machines.get_mut(&snapshot.id);
+        check_saved_entry(saved.as_deref(), snapshot, &node_id, false)?;
+        if let Some(e) = saved {
+            e.node_id = Some(node_id.clone());
         }
-        Ok(())
+        Ok(node_id)
     })
+}
+
+/// Re-read the saved roster and confirm `target`'s verified node is still the
+/// one `snapshot`'s entry pins (no write). Returns the pinned node id.
+pub(crate) fn confirm_pin(snapshot: &MachineEntry, target: &PeerTarget) -> Result<String> {
+    let node = target.node_id.clone().ok_or_else(|| anyhow!("no verified node to confirm for {}", snapshot.id))?;
+    let roster = crate::load_roster().context("re-reading the fleet roster")?;
+    check_saved_entry(roster.machines.get(&snapshot.id), snapshot, &node, true)?;
+    Ok(node)
 }
 
 /// The ONE agent builder for token-bearing requests (#2916 round 3 C3):
@@ -304,10 +449,11 @@ fn base_agent(target: &PeerTarget) -> ureq::AgentBuilder {
     b
 }
 
-/// The fleet token, attached HERE and nowhere else, and only to a target
-/// pinned to a verified address (see [`PeerTarget::pinned_ip`]).
-fn with_fleet_token(req: ureq::Request, target: &PeerTarget, token: Option<&str>) -> ureq::Request {
-    match (token, target.pinned_ip) {
+/// The fleet token, attached HERE and nowhere else, and only to a settled
+/// target (see [`SettledTarget`]) pinned to a verified address (see
+/// [`PeerTarget::pinned_ip`]).
+fn with_fleet_token(req: ureq::Request, target: &SettledTarget, token: Option<&str>) -> ureq::Request {
+    match (token, target.0.pinned_ip) {
         (Some(t), Some(_)) => req.set("Authorization", &format!("Bearer {t}")),
         _ => req,
     }
@@ -317,13 +463,13 @@ fn with_fleet_token(req: ureq::Request, target: &PeerTarget, token: Option<&str>
 /// machine has one) and `headers`. `timeout` is ONE bound on the whole
 /// request (connect, sending and reading the answer), not a per-read wait.
 pub fn fleet_get(
-    target: &PeerTarget,
+    target: &SettledTarget,
     path: &str,
     timeout: Duration,
     headers: &[(&str, &str)],
 ) -> std::result::Result<ureq::Response, ureq::Error> {
     let token = darkmux_flow::serve_token();
-    let mut req = base_agent(target).build().get(&format!("{}{path}", target.base())).timeout(timeout);
+    let mut req = base_agent(&target.0).build().get(&format!("{}{path}", target.base())).timeout(timeout);
     for (k, v) in headers {
         req = req.set(k, v);
     }
@@ -332,7 +478,7 @@ pub fn fleet_get(
 
 /// POST a JSON body to a verified target with the fleet token.
 pub fn fleet_post_json(
-    target: &PeerTarget,
+    target: &SettledTarget,
     path: &str,
     body: &str,
     read_timeout: Duration,
@@ -342,13 +488,13 @@ pub fn fleet_post_json(
 }
 
 fn post_json_with(
-    target: &PeerTarget,
+    target: &SettledTarget,
     path: &str,
     body: &str,
     read_timeout: Duration,
     token: Option<&str>,
 ) -> std::result::Result<ureq::Response, ureq::Error> {
-    let agent = base_agent(target)
+    let agent = base_agent(&target.0)
         .timeout_connect(Duration::from_secs(5))
         .timeout_read(read_timeout)
         .timeout_write(Duration::from_secs(30))
@@ -362,7 +508,7 @@ fn post_json_with(
 /// Tests only: POST with an explicit token to an unverified target.
 #[cfg(any(test, feature = "test-support"))]
 pub fn post_json_with_token_for_test(
-    target: &PeerTarget,
+    target: &SettledTarget,
     path: &str,
     body: &str,
     read_timeout: Duration,
@@ -375,10 +521,10 @@ pub fn post_json_with_token_for_test(
 /// any provider, pinned to its host when that is an IP literal (so a test
 /// talking to its own fixture listener still exercises the pinned path).
 #[cfg(any(test, feature = "test-support"))]
-pub fn unverified_target_for_test(url_base: &str) -> PeerTarget {
+pub fn unverified_target_for_test(url_base: &str) -> SettledTarget {
     let (scheme, host, port) = split_address(url_base, 80).unwrap();
     let pinned_ip = host.parse::<IpAddr>().ok();
-    PeerTarget { scheme, host, port, pinned_ip, newly_pinned: None, node_id: None }
+    SettledTarget(PeerTarget { scheme, host, port, pinned_ip, newly_pinned: None, node_id: None })
 }
 
 #[cfg(test)]
@@ -454,6 +600,136 @@ mod tests {
         assert!(peer_target("studio", &entry("x", None), Some("100.64.0.9:8765"), 8765, true, &p).is_err());
     }
 
+    /// The promise: a target whose first-contact pin is unsaved cannot become
+    /// a token-bearing one. `already_settled` refuses it; a pinned entry, a
+    /// loopback one and this machine's own daemon pass.
+    #[test]
+    fn a_first_contact_target_is_not_settled_until_its_pin_is_saved() {
+        let p = provider();
+        let first = peer_target("studio", &entry("100.64.0.2", None), None, 8765, true, &p).unwrap();
+        assert_eq!(first.newly_pinned.as_deref(), Some("nSTUDIO"));
+        let back = first.already_settled().expect_err("a pending pin is not settled");
+        assert_eq!(back.newly_pinned.as_deref(), Some("nSTUDIO"), "the target comes back for pin_on_first_contact");
+        let pinned = peer_target("studio", &entry("100.64.0.2", Some("nSTUDIO")), None, 8765, true, &p).unwrap();
+        assert!(pinned.already_settled().is_err(), "a verified peer is settled against the saved entry, not a snapshot");
+        let lo = peer_target("studio", &entry("127.0.0.1:18765", None), None, 8765, true, &p).unwrap();
+        assert!(lo.already_settled().is_ok());
+        let own = peer_target("laptop", &entry("x", None), Some("100.64.0.7:8765"), 8765, true, &p).unwrap();
+        assert!(own.already_settled().is_ok());
+    }
+
+    /// Run `f` against a roster file at `path`, restoring the environment.
+    fn with_roster_file<T>(path: &std::path::Path, f: impl FnOnce() -> T) -> T {
+        let prev = std::env::var("DARKMUX_FLEET_FILE").ok();
+        unsafe { std::env::set_var("DARKMUX_FLEET_FILE", path) };
+        let out = f();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLEET_FILE", v),
+                None => std::env::remove_var("DARKMUX_FLEET_FILE"),
+            }
+        }
+        out
+    }
+
+    /// Pinning settles a first-contact target only when the roster write
+    /// succeeded; an unwritable roster yields no settled target at all.
+    #[test]
+    #[serial_test::serial]
+    fn pin_on_first_contact_settles_only_when_the_roster_is_written() {
+        let p = provider();
+        let first = || peer_target("studio", &entry("100.64.0.2", None), None, 8765, true, &p).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("fleet.json");
+        let pinned = with_roster_file(&file, || {
+            crate::mutate_roster(|r| {
+                r.machines.insert("studio".into(), entry("100.64.0.2", None));
+                Ok(())
+            })
+            .unwrap();
+            crate::pin_on_first_contact(first(), &entry("100.64.0.2", None), &p).expect("settled after the write");
+            crate::load_roster().unwrap().machines["studio"].node_id.clone()
+        });
+        assert_eq!(pinned.as_deref(), Some("nSTUDIO"));
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, "a file, not a directory").unwrap();
+        let refused = with_roster_file(&blocker.join("fleet.json"), || crate::pin_on_first_contact(first(), &entry("100.64.0.2", None), &p));
+        assert!(refused.is_err(), "an unwritable roster never yields a settled target");
+    }
+
+    /// The roster as saved when `pin_on_first_contact` runs, against the
+    /// snapshot `entry("100.64.0.2", None)` a caller verified: returns the
+    /// outcome and the node the saved `key` entry pins afterward.
+    fn pin_against_saved(
+        saved: Option<(&str, MachineEntry)>,
+        snapshot: MachineEntry,
+        target_of: impl FnOnce(&StaticIdentityProvider) -> PeerTarget,
+    ) -> (Result<SettledTarget>, Option<String>) {
+        let p = provider();
+        let dir = tempfile::tempdir().unwrap();
+        with_roster_file(&dir.path().join("fleet.json"), || {
+            crate::mutate_roster(|r| {
+                if let Some((key, e)) = saved.clone() {
+                    r.machines.insert(key.to_string(), e);
+                }
+                Ok(())
+            })
+            .unwrap();
+            let out = crate::pin_on_first_contact(target_of(&p), &snapshot, &p);
+            let pinned = crate::load_roster().unwrap().machines.values().find_map(|e| e.node_id.clone());
+            (out, pinned)
+        })
+    }
+
+    fn first_contact(p: &StaticIdentityProvider) -> PeerTarget {
+        peer_target("studio", &entry("100.64.0.2", None), None, 8765, true, p).unwrap()
+    }
+
+    /// The pin write is compare-and-set: an entry that is not there, or is not
+    /// the one that was verified, yields no settled target and writes nothing.
+    #[test]
+    #[serial_test::serial]
+    fn a_pin_is_saved_only_against_the_entry_that_was_verified() {
+        let snap = entry("100.64.0.2", None);
+        let (ok, pinned) = pin_against_saved(Some(("studio", snap.clone())), snap.clone(), first_contact);
+        assert!(ok.is_ok());
+        assert_eq!(pinned.as_deref(), Some("nSTUDIO"));
+
+        let (removed, _) = pin_against_saved(None, snap.clone(), first_contact);
+        let msg = format!("{:#}", removed.unwrap_err());
+        assert!(msg.contains("removed, or its key differs"), "{msg}");
+
+        let (keyed_apart, pinned) = pin_against_saved(Some(("Studio", snap.clone())), snap.clone(), first_contact);
+        assert!(keyed_apart.is_err(), "a key that differs from the id has no entry to pin");
+        assert_eq!(pinned, None, "nothing was written");
+
+        let (moved, pinned) = pin_against_saved(Some(("studio", entry("100.64.0.9", None))), snap.clone(), first_contact);
+        assert!(format!("{:#}", moved.unwrap_err()).contains("address was edited"));
+        assert_eq!(pinned, None, "the verified node never lands on a different address");
+
+        let (raced, pinned) = pin_against_saved(Some(("studio", entry("100.64.0.2", Some("nOTHER")))), snap.clone(), first_contact);
+        assert!(format!("{:#}", raced.unwrap_err()).contains("another node was pinned"));
+        assert_eq!(pinned.as_deref(), Some("nOTHER"), "a concurrent pin is not overwritten");
+
+        let (same, _) = pin_against_saved(Some(("studio", entry("100.64.0.2", Some("nSTUDIO")))), snap, first_contact);
+        assert!(same.is_ok(), "the same node pinned concurrently is fine");
+    }
+
+    /// A peer verified against an already-pinned entry is re-checked against
+    /// the saved roster: a pin cleared or changed since the snapshot refuses.
+    #[test]
+    #[serial_test::serial]
+    fn an_already_pinned_peer_is_reconfirmed_against_the_saved_entry() {
+        let pinned_snap = entry("100.64.0.2", Some("nSTUDIO"));
+        let target = |p: &StaticIdentityProvider| peer_target("studio", &pinned_snap, None, 8765, true, p).unwrap();
+        let (ok, _) = pin_against_saved(Some(("studio", pinned_snap.clone())), pinned_snap.clone(), target);
+        assert!(ok.is_ok());
+        let (cleared, _) = pin_against_saved(Some(("studio", entry("100.64.0.2", None))), pinned_snap.clone(), target);
+        assert!(format!("{:#}", cleared.unwrap_err()).contains("pin was cleared"));
+        let (readdressed, _) = pin_against_saved(Some(("studio", entry("100.64.0.9", Some("nSTUDIO")))), pinned_snap.clone(), target);
+        assert!(readdressed.is_err());
+    }
+
     /// A one-shot HTTP fixture that records the request it received.
     fn recording_fixture() -> (u16, std::sync::mpsc::Receiver<String>) {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -507,6 +783,7 @@ mod tests {
                 newly_pinned: None,
                 node_id: None,
             };
+            let t = t.already_settled().unwrap();
             let _ = fleet_get(&t, "/x", Duration::from_secs(5), &[]);
             rx.recv_timeout(Duration::from_secs(5)).unwrap().to_ascii_lowercase()
         };
@@ -534,6 +811,7 @@ mod tests {
             newly_pinned: None,
             node_id: None,
         };
+        let t = t.already_settled().unwrap();
         let r = fleet_post_json(&t, "/fleet/work", "{}", Duration::from_secs(5));
         assert!(r.is_ok(), "{r:?}");
         assert!(rx.recv_timeout(Duration::from_secs(5)).unwrap().starts_with("POST /fleet/work"));
@@ -562,6 +840,7 @@ mod tests {
             newly_pinned: None,
             node_id: None,
         };
+        let t = t.already_settled().unwrap();
         let body = fleet_get(&t, "/x", Duration::from_secs(5), &[]).unwrap().into_string().unwrap();
         assert_eq!(body, "ok");
     }

@@ -1084,7 +1084,7 @@ compile_error!("the `e2e-fleet-loopback` feature is for the debug-build two-daem
 /// (#2916 review C8): a daemon started by launchd can fail where a shell
 /// succeeds, and the reason used to live only in the daemon's log. Coarse
 /// phrases only: no provider output, no ids.
-static LISTENER_STATE: std::sync::Mutex<Option<(&'static str, String)>> = std::sync::Mutex::new(None);
+pub(crate) static LISTENER_STATE: std::sync::Mutex<Option<(&'static str, String)>> = std::sync::Mutex::new(None);
 
 /// (#2916 stage 2 review C5) The busy policy and hosted-job bound the
 /// running listener was started with (it reads config once), so `darkmux
@@ -3052,6 +3052,24 @@ mod tests {
         assert_eq!(listener_state(false).as_deref(), Some("off"));
         assert_eq!(listener_state(true).as_deref(), Some("off (fleet.listener.enabled is false)"));
         *LISTENER_STATE.lock().unwrap() = None;
+    }
+
+    /// Only the `Bearer` scheme carries the token: the same value under any
+    /// other scheme, or with no scheme, is a mismatch. The scheme name is
+    /// case-insensitive.
+    #[test]
+    fn only_the_bearer_scheme_carries_the_token() {
+        let check = |value: &str| {
+            let mut h = axum::http::HeaderMap::new();
+            h.insert(axum::http::header::AUTHORIZATION, value.parse().unwrap());
+            check_token(&h, Some("s3cret".to_string()))
+        };
+        assert!(matches!(check("Bearer s3cret"), TokenCheck::Match));
+        assert!(matches!(check("bEaReR s3cret"), TokenCheck::Match), "the scheme is case-insensitive");
+        assert!(matches!(check("Basic s3cret"), TokenCheck::Mismatch), "the token under another scheme");
+        assert!(matches!(check("Token s3cret"), TokenCheck::Mismatch));
+        assert!(matches!(check("s3cret"), TokenCheck::Mismatch), "no scheme at all");
+        assert!(matches!(check("Bearer wrong"), TokenCheck::Mismatch));
     }
 
     #[test]
