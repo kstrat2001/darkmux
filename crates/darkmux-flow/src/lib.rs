@@ -20,6 +20,7 @@ pub mod reader;
 pub mod session_presence;
 
 mod bookend;
+mod hub_link;
 mod integrity;
 mod schema;
 mod status;
@@ -27,6 +28,7 @@ mod status;
 pub use action::{Bookend, Edge, FlowAction, FlowScope, Grain, UnknownAction};
 pub use payload::{OpenPayload, Payload, UnreadPayload};
 pub use bookend::*;
+pub use hub_link::{HubLink, SinkPolicy};
 pub use integrity::*;
 pub use schema::*;
 pub use status::*;
@@ -49,8 +51,9 @@ use std::sync::{Arc, OnceLock};
 // (write to multiple sinks during migration). See [#162] for the full arc.
 //
 // Per-process default sink: `default_sink()` returns the singleton sink the
-// public `record()` dispatches through. Tests can override via
-// `set_default_sink_for_tests`.
+// public `record()` dispatches through. A process declares its kind once, before
+// its first record, with `set_sink_policy` (`darkmux serve` is `LongLived`;
+// everything else stays `OneShot`).
 
 /// Structured snapshot of a sink's identity + config for diagnostics
 /// (`darkmux flow status`, `darkmux doctor` flow-sink-health). The
@@ -100,6 +103,13 @@ pub trait FlowSink: Send + Sync {
     /// and the doctor's `flow-sink-health` check can describe the active
     /// sink graph without per-sink-type knowledge.
     fn info(&self) -> SinkInfo;
+
+    /// Whether this sink can currently publish to the fleet hub. `None` for a
+    /// sink with no hub behind it; a composed sink reports its first child that
+    /// has one.
+    fn hub_link(&self) -> Option<HubLink> {
+        None
+    }
 }
 
 /// A record that passed the write check: its action is one darkmux writes
@@ -1017,7 +1027,8 @@ pub struct RedisSink {
     max_len: Option<usize>,
     /// (#388) Consecutive write-failure counter. Reset to 0 on any
     /// successful write. When it reaches `REDIS_DISABLE_THRESHOLD` the
-    /// sink disables itself for the rest of the process.
+    /// sink disables itself (for the rest of the process under `OneShot`,
+    /// until the hub answers again under `LongLived`).
     consecutive_failures: AtomicU32,
     /// (#388) Once the failure counter trips the threshold, the sink is
     /// disabled: subsequent writes skip silently (no connection attempt,
@@ -1025,6 +1036,14 @@ pub struct RedisSink {
     /// `DARKMUX_REDIS_URL` "just in case" from a 500ms-timeout-plus-log
     /// on every `darkmux` invocation when the peer is offline.
     disabled: AtomicBool,
+    /// Whether a disabled sink stays off (`OneShot`) or keeps probing (`LongLived`).
+    policy: SinkPolicy,
+    probe_backoff: hub_link::ProbeBackoff,
+    /// Where the outage's records are re-read from; `None` = the live local
+    /// flows directory (`local_sink_dir()`).
+    backfill_dir: Option<PathBuf>,
+    /// The link state and the probe schedule, behind one lock.
+    link: std::sync::Mutex<hub_link::LinkState>,
 }
 
 /// (#388) Consecutive write failures before a `RedisSink` disables
@@ -1032,6 +1051,12 @@ pub struct RedisSink {
 /// against "stop spamming a 500ms timeout + log line per write when the
 /// peer is genuinely offline."
 const REDIS_DISABLE_THRESHOLD: u32 = 3;
+
+/// The stream-entry field a backfilled record carries (value `1`).
+const LATE_FIELD: &str = "late";
+
+/// Commands per backfill pipeline: bounds one round trip's payload.
+const BACKFILL_PIPELINE_CHUNK: usize = 500;
 
 /// Hard cap on the wall-clock spent connecting + handshaking to Redis
 /// from any `RedisSink` or sink-diagnostic probe (#278). The OS default
@@ -1381,46 +1406,87 @@ impl RedisSink {
             max_len,
             consecutive_failures: AtomicU32::new(0),
             disabled: AtomicBool::new(false),
+            policy: SinkPolicy::OneShot,
+            probe_backoff: hub_link::ProbeBackoff::default(),
+            backfill_dir: None,
+            link: std::sync::Mutex::new(hub_link::LinkState::new()),
         })
     }
 
+    /// Set what this sink does once it has disabled itself (default `OneShot`).
+    pub fn with_policy(mut self, policy: SinkPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// Re-read the outage's records from `dir` instead of the live local flows
+    /// directory, and probe on `min..=max` instead of the default 2s..=60s.
+    #[cfg(test)]
+    fn with_test_recovery(mut self, dir: PathBuf, min: std::time::Duration, max: std::time::Duration) -> Self {
+        self.backfill_dir = Some(dir);
+        self.probe_backoff = hub_link::ProbeBackoff { min, max };
+        self
+    }
+
     /// (#388) Whether the sink has disabled itself after repeated
-    /// failures. Disabled writes skip silently.
+    /// failures. Disabled writes skip silently (`OneShot`) or wait for the
+    /// next probe (`LongLived`).
     pub fn is_disabled(&self) -> bool {
         self.disabled.load(Ordering::Acquire)
     }
 
-    /// (#388) Account one write failure. Disables the sink (and logs a
-    /// single one-time warning) when the consecutive-failure counter
-    /// first reaches `REDIS_DISABLE_THRESHOLD`. Returns true iff this
+    fn link_state(&self) -> std::sync::MutexGuard<'_, hub_link::LinkState> {
+        self.link.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// (#388) Account one write failure for the record stamped `record_ts`.
+    /// Disables the sink (and logs a single one-time warning) when the
+    /// consecutive-failure counter first reaches `REDIS_DISABLE_THRESHOLD`;
+    /// a `LongLived` sink then schedules its next probe. Returns true iff this
     /// call is the one that flipped the sink to disabled.
-    fn note_failure(&self, err: &anyhow::Error) -> bool {
+    fn note_failure(&self, err: &anyhow::Error, record_ts: &str) -> bool {
         let n = self.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
-        if n >= REDIS_DISABLE_THRESHOLD && !self.disabled.swap(true, Ordering::AcqRel) {
+        let mut link = self.link_state();
+        link.record_failure(record_ts, err.root_cause().to_string());
+        let flipped = n >= REDIS_DISABLE_THRESHOLD && !self.disabled.swap(true, Ordering::AcqRel);
+        if flipped {
+            let outlook = match self.policy {
+                SinkPolicy::OneShot => "disabling Redis flow sink for this process",
+                SinkPolicy::LongLived => "disabling Redis flow sink until the peer answers again",
+            };
             eprintln!(
                 "flow::RedisSink: {} unreachable after {n} consecutive write failures \
-                 ({err:#}); disabling Redis flow sink for this process. \
-                 LocalFileSink is unaffected; re-run after the peer is reachable to re-enable.",
+                 ({err:#}); {outlook}. LocalFileSink is unaffected.",
                 self.url
             );
-            true
-        } else {
-            false
+        }
+        let probing = self.policy == SinkPolicy::LongLived && self.is_disabled();
+        if probing && (flipped || link.probe_due(std::time::Instant::now())) {
+            link.schedule_probe(std::time::Instant::now(), self.probe_backoff);
+        }
+        flipped
+    }
+
+    /// (#388) Account one successful write: clear the failure streak, mark the
+    /// link connected, and (a `LongLived` sink only ever gets here through a
+    /// probe) re-enable the sink.
+    fn note_success(&self) {
+        self.consecutive_failures.store(0, Ordering::Release);
+        self.link_state().record_success();
+        if self.disabled.swap(false, Ordering::AcqRel) {
+            eprintln!("flow::RedisSink: {} answered again; Redis flow sink re-enabled.", self.url);
         }
     }
 
-    /// (#388) Account one successful write — clears the failure streak so
-    /// a transient blip never counts toward the disable threshold.
-    fn note_success(&self) {
-        // A single success clears the streak. The load-then-store isn't
-        // one atomic op, but that's benign: a racing failure between the
-        // load and the store at worst delays a disable by one write — it
-        // can never cause a spurious disable, and a disabled sink never
-        // reaches here (write() returns early when disabled). The
-        // Acquire/Release pair orders the reset against note_failure's
-        // fetch_add so the cleared counter is visible to the next writer.
-        if self.consecutive_failures.load(Ordering::Acquire) != 0 {
-            self.consecutive_failures.store(0, Ordering::Release);
+    /// Whether this write should touch the network: always while enabled; once
+    /// disabled, only a `LongLived` sink whose probe interval has elapsed.
+    fn should_attempt(&self) -> bool {
+        if !self.is_disabled() {
+            return true;
+        }
+        match self.policy {
+            SinkPolicy::OneShot => false,
+            SinkPolicy::LongLived => self.link_state().probe_due(std::time::Instant::now()),
         }
     }
 
@@ -1451,39 +1517,40 @@ impl RedisSink {
 impl FlowSink for RedisSink {
     fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
         let record = record.get();
-        // (#388) Once disabled, skip silently — no connection attempt
-        // (so no 500ms timeout) and no log. Returning Ok keeps this
+        // (#388) A sink that is not due to try skips silently: no connection
+        // attempt (so no 500ms timeout) and no log. Returning Ok keeps this
         // best-effort coordination sink from masking the durable
         // LocalFileSink's own result in the TeeSink.
-        if self.is_disabled() {
+        if !self.should_attempt() {
             return Ok(());
         }
-        match self.try_write(record) {
-            Ok(()) => {
-                self.note_success();
-                Ok(())
-            }
+        match self.deliver(record) {
+            Ok(()) => self.note_success(),
+            // Swallow: log a single one-time warning at the disable
+            // threshold (note_failure), but never propagate to the
+            // TeeSink. Redis is the coordination substrate, not the
+            // durable record.
             Err(e) => {
-                // Swallow: log a single one-time warning at the disable
-                // threshold (note_failure), but never propagate to the
-                // TeeSink — that's what produced the per-write spam this
-                // fixes. Redis is the coordination substrate, not the
-                // durable record.
-                self.note_failure(&e);
-                Ok(())
+                self.note_failure(&e, &record.ts);
             }
         }
+        Ok(())
     }
 
     fn info(&self) -> SinkInfo {
         self.sink_info()
     }
+
+    fn hub_link(&self) -> Option<HubLink> {
+        Some(self.link_state().link())
+    }
 }
 
 impl RedisSink {
-    /// The actual XADD write — fallible. `write` (the trait method) wraps
-    /// this with the #388 disable accounting.
-    fn try_write(&self, record: &FlowRecord) -> Result<()> {
+    /// One delivery attempt, fallible: connect, first re-send what the local
+    /// day files hold from an outage (`LongLived` only), then XADD `record`.
+    /// The caller wraps it with the #388 accounting.
+    fn deliver(&self, record: &FlowRecord) -> Result<()> {
         let mut conn = open_redis_connection_bounded(&self.client, REDIS_CONNECT_TIMEOUT)
             .context("getting Redis connection")?;
         // (#2227) The connect above is bounded; the XADD below was not. An
@@ -1493,28 +1560,63 @@ impl RedisSink {
         bound_redis_response(&conn);
         let payload = serde_json::to_string(record)
             .context("serializing FlowRecord for Redis")?;
-        // Two-field encoding: `schema` carries the version (so downstream
-        // consumers across darkmux versions can handle skew explicitly),
-        // `record` carries the JSON-serialized FlowRecord. Single XADD
-        // call per write; small payload (~1 KB typical) so MAXLEN trim
-        // can run synchronously without affecting latency.
-        let fields: &[(&str, &str)] = &[
-            ("schema", FLOW_SCHEMA_VERSION),
-            ("record", &payload),
-        ];
-        // XADD <stream> [MAXLEN ~ N] * field value [field value ...]
+        if self.policy == SinkPolicy::LongLived {
+            self.backfill(&mut conn, &payload)?;
+        }
+        self.xadd(&payload, false).query::<String>(&mut conn)
+            .with_context(|| format!("XADD to Redis stream `{}`", self.stream))?;
+        Ok(())
+    }
+
+    /// The XADD for one record. Two-field encoding: `schema` carries the
+    /// version (so downstream consumers across darkmux versions can handle skew
+    /// explicitly), `record` carries the JSON-serialized FlowRecord. A
+    /// backfilled entry adds `late=1`: it was written while the hub was
+    /// unreachable and is being re-sent, so a stream reader can tell it from
+    /// a live write. Readers select fields by name and ignore the marker.
+    fn xadd(&self, payload: &str, late: bool) -> redis::Cmd {
         let mut cmd = redis::cmd("XADD");
         cmd.arg(&self.stream);
         if let Some(n) = self.max_len {
             cmd.arg("MAXLEN").arg("~").arg(n);
         }
         cmd.arg("*"); // auto-generated ID
-        for (k, v) in fields {
-            cmd.arg(*k).arg(*v);
+        cmd.arg("schema").arg(FLOW_SCHEMA_VERSION);
+        cmd.arg("record").arg(payload);
+        if late {
+            cmd.arg(LATE_FIELD).arg("1");
         }
-        let _: String = cmd
-            .query(&mut conn)
-            .with_context(|| format!("XADD to Redis stream `{}`", self.stream))?;
+        cmd
+    }
+
+    /// Re-send, oldest first in one pipeline, the records the local day files
+    /// hold from the start of the current outage, ahead of the record in `payload`
+    /// (which the caller publishes right after, so it is left out here). Reader-side de-duplication by
+    /// record identity absorbs any record the hub already holds.
+    fn backfill(&self, conn: &mut redis::Connection, payload: &str) -> Result<()> {
+        let Some(since) = self.link_state().outage_since().map(str::to_string) else {
+            return Ok(());
+        };
+        let skip = reader::parse_value(payload).map(|v| flow_record_identity(&v)).unwrap_or_default();
+        let dir = self.backfill_dir.clone().unwrap_or_else(local_sink_dir);
+        let uid = darkmux_hardware::machine_uid();
+        let lines = hub_link::Backfill {
+            dir: &dir,
+            now_secs: current_epoch_secs(),
+            since: &since,
+            own_uid: uid,
+            skip_identity: &skip,
+            cap: self.max_len,
+        }
+        .lines();
+        for chunk in lines.chunks(BACKFILL_PIPELINE_CHUNK) {
+            let mut pipe = redis::pipe();
+            for line in chunk {
+                pipe.add_command(self.xadd(line, true)).ignore();
+            }
+            pipe.query::<()>(conn)
+                .with_context(|| format!("backfilling {} record(s) to Redis stream `{}`", lines.len(), self.stream))?;
+        }
         Ok(())
     }
 
@@ -1543,6 +1645,7 @@ impl RedisSink {
         // scenario, which makes it an operator-sovereignty gap now:
         // "the operator never has to wonder where a decision came from."
         config.insert("disabled".to_string(), self.is_disabled().to_string());
+        config.insert("policy".to_string(), self.policy.as_str().to_string());
         SinkInfo {
             kind: "Redis".to_string(),
             config,
@@ -1654,6 +1757,10 @@ impl FlowSink for TeeSink {
             raw_url: None,
         }
     }
+
+    fn hub_link(&self) -> Option<HubLink> {
+        self.sinks.iter().find_map(|s| s.hub_link())
+    }
 }
 
 // ─── Default-sink selection (#162 Phase 3) ────────────────────────────
@@ -1726,6 +1833,7 @@ fn build_default_sink() -> Arc<dyn FlowSink> {
 
         match RedisSink::new(raw_url.expose_for_probe(), &stream, max_len) {
             Ok(redis_sink) => {
+                let redis_sink = redis_sink.with_policy(sink_policy());
                 // (#1955) The URL is deliberately NOT printed.
                 //
                 // `RawRedisUrl`'s redaction covers the PASSWORD (#213/#229)
@@ -1820,6 +1928,77 @@ fn default_sink() -> Arc<dyn FlowSink> {
 
     static SINK: OnceLock<Arc<dyn FlowSink>> = OnceLock::new();
     SINK.get_or_init(build_default_sink).clone()
+}
+
+static SINK_POLICY: OnceLock<SinkPolicy> = OnceLock::new();
+
+/// The policy the default sink is built under: the one `set_sink_policy`
+/// stored, else `OneShot`. Reading it freezes it, so it is read exactly when the
+/// singleton is built.
+fn sink_policy() -> SinkPolicy {
+    *SINK_POLICY.get_or_init(|| SinkPolicy::OneShot)
+}
+
+/// Declare what kind of process this is, before its first flow record is
+/// written: `darkmux serve` calls it with `LongLived`; every other entry point
+/// keeps the `OneShot` default. Errs when the default sink was already built
+/// under a different policy, because the sink cannot be changed afterward.
+pub fn set_sink_policy(policy: SinkPolicy) -> Result<()> {
+    match SINK_POLICY.set(policy) {
+        Ok(()) => Ok(()),
+        Err(_) if sink_policy() == policy => Ok(()),
+        Err(_) => anyhow::bail!(
+            "the flow sink was already built as {}; set the policy before the first flow record",
+            sink_policy().as_str()
+        ),
+    }
+}
+
+/// This process's link to the fleet hub's flow stream, read from the default
+/// sink. `None` when no Redis sink is configured.
+pub fn hub_link() -> Option<HubLink> {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(link) = hub_link_override().clone() {
+        return Some(link);
+    }
+    default_sink().hub_link()
+}
+
+/// Test builds only: a stand-in for the default sink's link, so a downstream
+/// crate can drive what it does with each state without a live hub (the real
+/// sink's transitions are tested here against a real Redis).
+#[cfg(any(test, feature = "test-support"))]
+fn hub_link_override() -> std::sync::MutexGuard<'static, Option<HubLink>> {
+    static OVERRIDE: std::sync::Mutex<Option<HubLink>> = std::sync::Mutex::new(None);
+    OVERRIDE.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Test builds only: make [`hub_link`] report `link` (`None` restores the real sink).
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_hub_link_for_tests(link: Option<HubLink>) {
+    *hub_link_override() = link;
+}
+
+/// The de-duplication key for one flow record, used wherever the fleet stream
+/// and the local day files are merged, and by the backfill to leave out the
+/// record it is about to publish itself. One definition: two that disagreed
+/// about "the same record" would double-count this machine's own work, which
+/// lands in both sinks. The payload is part of the identity because two
+/// records can otherwise share every scalar field.
+pub fn flow_record_identity(r: &serde_json::Value) -> String {
+    let f = |k: &str| r.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    [
+        f("ts"),
+        f("machine_uid"),
+        f("session_id"),
+        f("action"),
+        f("source"),
+        f("handle"),
+        f("level"),
+        f("stage"),
+        r.get("payload").map(|p| p.to_string()).unwrap_or_default(),
+    ]
+    .join("\u{1f}")
 }
 
 /// Introspect the process-wide default sink for diagnostics. Stable
@@ -1966,6 +2145,9 @@ pub(crate) fn record_at(record: &FlowRecord, path: &Path) -> Result<()> {
         Err(e) => Err(e).with_context(|| format!("creating flow log {}", path.display())),
     }
 }
+
+#[cfg(test)]
+mod hub_link_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2197,6 +2379,8 @@ mod tests {
 
     // Lazy client — never connects until a write, so we can exercise the
     // failure-accounting directly without a live Redis.
+    const TS: &str = "2025-01-15T12:34:56Z";
+
     fn unreachable_sink() -> RedisSink {
         RedisSink::new("redis://127.0.0.1:6390", "darkmux:test", None).unwrap()
     }
@@ -2206,48 +2390,65 @@ mod tests {
         let sink = unreachable_sink();
         let e = anyhow::anyhow!("synthetic connect failure");
         // Below threshold: accumulates, stays enabled.
-        assert!(!sink.note_failure(&e));
+        assert!(!sink.note_failure(&e, TS));
         assert!(!sink.is_disabled());
-        assert!(!sink.note_failure(&e));
+        assert!(!sink.note_failure(&e, TS));
         assert!(!sink.is_disabled());
         // Threshold (3rd) flips it — note_failure returns true exactly once.
-        assert!(sink.note_failure(&e), "3rd failure should flip to disabled");
+        assert!(sink.note_failure(&e, TS), "3rd failure should flip to disabled");
         assert!(sink.is_disabled());
         // Already disabled: further failures don't re-flip (no repeat log).
-        assert!(!sink.note_failure(&e));
+        assert!(!sink.note_failure(&e, TS));
     }
 
     #[test]
     fn redis_sink_success_resets_failure_streak() {
         let sink = unreachable_sink();
         let e = anyhow::anyhow!("x");
-        sink.note_failure(&e);
-        sink.note_failure(&e);
+        sink.note_failure(&e, TS);
+        sink.note_failure(&e, TS);
         sink.note_success(); // a single success clears the streak
-        sink.note_failure(&e);
-        sink.note_failure(&e);
+        sink.note_failure(&e, TS);
+        sink.note_failure(&e, TS);
         assert!(!sink.is_disabled(), "2 failures after a reset must not disable");
-        assert!(sink.note_failure(&e), "3 consecutive post-reset failures disable");
+        assert!(sink.note_failure(&e, TS), "3 consecutive post-reset failures disable");
         assert!(sink.is_disabled());
     }
 
     #[test]
-    fn redis_sink_disable_is_permanent_for_process() {
-        // Disable is a one-way latch for the process: once tripped, a
-        // later success does NOT re-enable the sink (a disabled sink
-        // never even reaches note_success via write(), but assert the
-        // contract directly), and further failures neither re-flip nor
-        // re-log (note_failure returns false).
+    fn one_shot_sink_disable_is_permanent_for_process() {
+        // `OneShot` (every CLI invocation): once tripped, the sink stays off
+        // for the process. A success never re-enables it through the write
+        // path (`should_attempt` is false, so no write is tried), and further
+        // failures neither re-flip nor re-log (note_failure returns false).
         let sink = unreachable_sink();
         let e = anyhow::anyhow!("x");
-        sink.note_failure(&e);
-        sink.note_failure(&e);
-        assert!(sink.note_failure(&e));
+        sink.note_failure(&e, TS);
+        sink.note_failure(&e, TS);
+        assert!(sink.note_failure(&e, TS));
         assert!(sink.is_disabled());
+        assert!(!sink.should_attempt(), "a OneShot sink never probes again");
+        assert!(!sink.note_failure(&e, TS), "no re-flip / re-log after disable");
+        assert!(sink.is_disabled());
+    }
+
+    #[test]
+    fn long_lived_sink_disables_then_probes_and_a_success_re_enables() {
+        let sink = unreachable_sink().with_policy(SinkPolicy::LongLived);
+        let e = anyhow::anyhow!("x");
+        sink.note_failure(&e, TS);
+        sink.note_failure(&e, TS);
+        assert!(sink.note_failure(&e, TS));
+        assert!(sink.is_disabled());
+        assert!(!sink.should_attempt(), "the first probe waits out the minimum backoff");
+        sink.link_state().schedule_probe(
+            std::time::Instant::now() - std::time::Duration::from_secs(3600),
+            hub_link::ProbeBackoff::default(),
+        );
+        assert!(sink.should_attempt(), "a LongLived sink probes once the interval has elapsed");
         sink.note_success();
-        assert!(sink.is_disabled(), "success must not re-enable a disabled sink");
-        assert!(!sink.note_failure(&e), "no re-flip / re-log after disable");
-        assert!(sink.is_disabled());
+        assert!(!sink.is_disabled(), "a success re-enables a LongLived sink");
+        assert_eq!(sink.hub_link(), Some(HubLink::Connected));
     }
 
     #[test]
@@ -2255,9 +2456,9 @@ mod tests {
         let sink = unreachable_sink();
         let e = anyhow::anyhow!("x");
         // Trip the threshold.
-        sink.note_failure(&e);
-        sink.note_failure(&e);
-        sink.note_failure(&e);
+        sink.note_failure(&e, TS);
+        sink.note_failure(&e, TS);
+        sink.note_failure(&e, TS);
         assert!(sink.is_disabled());
         // A write while disabled returns Ok WITHOUT attempting a
         // connection — proven by the absence of the ~500ms connect
@@ -4763,7 +4964,7 @@ mod tests {
         // (1) The fallible inner write must SURFACE the stall as an `Err`.
         // A silent skip here is what let the disable machinery starve.
         let start = std::time::Instant::now();
-        let inner = sink.try_write(&rec);
+        let inner = sink.deliver(&rec);
         let inner_elapsed = start.elapsed();
         let inner_err = inner.expect_err(
             "try_write against a handshake-completing, command-silent peer must \

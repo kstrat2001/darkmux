@@ -48,6 +48,10 @@ pub struct HealthResponse {
     /// Whether this daemon resolved a fleet token (the serve token) in its own
     /// environment; never the value. This machine only.
     pub fleet_token_set: Option<bool>,
+    /// Whether this daemon can publish to the fleet hub's flow stream, and
+    /// since when it could not; `null` when no hub is configured. This machine
+    /// only.
+    pub hub_link: Option<darkmux_flow::HubLink>,
     /// The open-file soft limit this daemon runs with; this machine only.
     #[cfg_attr(test, ts(type = "number | null"))]
     pub open_file_limit: Option<u64>,

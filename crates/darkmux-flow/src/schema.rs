@@ -44,6 +44,14 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
 //           darkmux reads the dotted spellings; darkmux's own readers
 //           upgrade old archives.
 //
+//           Also (4.0, #3023): a stream entry may carry a `late` field
+//           (value `1`) beside `schema` and `record`. It marks a record the
+//           daemon re-sent after the hub returned, having written it to its
+//           local day file while the stream was unreachable. The record
+//           itself is unchanged, so its identity matches the copy a reader
+//           may already hold. Readers select entry fields by name and
+//           ignore the marker.
+//
 //           Also (4.0): the session grammar. `session_id` is the wire
 //           string of a typed `darkmux_types::session_id::SessionId`, one
 //           session within one run, `.`-separated and begun by its run:

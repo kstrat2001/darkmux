@@ -1433,6 +1433,10 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
     let _ = STARTUP_EXE_MTIME.set(current_exe_mtime());
     // Relayed work runs in this process: its dispatches must not probe for a daemon.
     darkmux_flow::daemon_probe::mark_running_inside_daemon();
+    // A daemon outlives any hub outage: its Redis sink keeps probing and
+    // re-sends what it wrote locally while the hub was away. Declared before
+    // anything writes a flow record, because the sink is built on the first one.
+    darkmux_flow::set_sink_policy(darkmux_flow::SinkPolicy::LongLived)?;
     // (#2916 review M1) 10240 is macOS's per-process ceiling (OPEN_MAX).
     let _ = raise_open_file_limit(10_240);
 
@@ -1733,6 +1737,10 @@ async fn health(
         // Whether THIS process resolved a token, for `darkmux doctor` run from
         // a shell that may not have the one the daemon was started with.
         fleet_token_set: loopback_caller.then(darkmux_flow::serve_token_present),
+        // Whether this daemon can publish to the fleet hub's flow stream
+        // (`null` when no hub is configured), for this machine only: an
+        // outage's reason is operator detail, not something a peer needs.
+        hub_link: if loopback_caller { darkmux_flow::hub_link() } else { None },
         // (#2916 re-review C3) The open-file soft limit this daemon runs
         // with (raised at start), for this machine only.
         open_file_limit: if loopback_caller { current_open_file_limit() } else { None },
@@ -4039,30 +4047,7 @@ fn union_flow_records(
     out
 }
 
-/// The de-duplication key for one flow record, used wherever the fleet
-/// stream and the local day-files are merged.
-///
-/// `pub(crate)` since #1705: the fleet-wide aggregations (`/flow-missions`,
-/// `runs::build_runs`) merge the same two sources `union_flow_records`
-/// does, but stream the local side from disk instead of materializing it,
-/// so they need the KEY without the Vec-shaped union. One definition —
-/// two sources disagreeing about what "the same record" means would
-/// double-count this machine's own work, which lands in BOTH sinks.
-pub(crate) fn flow_record_identity(r: &serde_json::Value) -> String {
-    let f = |k: &str| r.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string();
-    [
-        f("ts"),
-        f("machine_uid"),
-        f("session_id"),
-        f("action"),
-        f("source"),
-        f("handle"),
-        f("level"),
-        f("stage"),
-        r.get("payload").map(|p| p.to_string()).unwrap_or_default(),
-    ]
-    .join("\u{1f}")
-}
+pub(crate) use darkmux_flow::flow_record_identity;
 
 /// Every record the FLEET stream currently holds (#1705) — the peers' work
 /// this machine can see but never wrote to its own `flows/` directory.

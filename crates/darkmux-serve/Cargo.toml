@@ -92,7 +92,7 @@ darkmux-types = { path = "../darkmux-types", features = ["test-support", "ts-exp
 darkmux-crew = { path = "../darkmux-crew", features = ["ts-export", "test-support"] }
 # The wire types embed flow records, presence beats and the memory ledger, so
 # their TypeScript is generated here too (`ts-export` on each crate).
-darkmux-flow = { path = "../darkmux-flow", features = ["ts-export"] }
+darkmux-flow = { path = "../darkmux-flow", features = ["ts-export", "test-support"] }
 darkmux-profiles = { path = "../darkmux-profiles", features = ["ts-export"] }
 darkmux-lab = { path = "../darkmux-lab", features = ["ts-export"] }
 # (#2916) The fake identity provider the fleet listener's HTTP tests use.

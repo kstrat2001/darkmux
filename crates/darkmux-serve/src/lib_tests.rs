@@ -2060,6 +2060,33 @@
         assert!(!set.to_string().contains("not-a-real-token"), "the value never appears");
     }
 
+    /// `/health` tells this machine whether the daemon can publish to the
+    /// fleet hub: unreachable (since when, and why), then connected once the
+    /// hub answers. A proxied loopback request, which is a peer, learns nothing.
+    /// Drives the real handler; the sink's own transitions are tested against a
+    /// real Redis in `darkmux-flow`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn health_reports_the_hub_link_to_this_machine_only() {
+        use darkmux_flow::HubLink;
+        darkmux_flow::set_hub_link_for_tests(Some(HubLink::Unreachable {
+            since: "2026-10-01T03:04:05Z".into(),
+            reason: "Connection refused (os error 61)".into(),
+        }));
+        let down = loopback_health(&[]).await;
+        let down_proxied = loopback_health(&[("X-Forwarded-For", "100.64.0.7")]).await;
+        darkmux_flow::set_hub_link_for_tests(Some(HubLink::Connected));
+        let up = loopback_health(&[]).await;
+        darkmux_flow::set_hub_link_for_tests(None);
+        let none = loopback_health(&[]).await;
+        assert_eq!(down["hub_link"]["state"], "unreachable", "{down}");
+        assert_eq!(down["hub_link"]["since"], "2026-10-01T03:04:05Z", "{down}");
+        assert_eq!(down["hub_link"]["reason"], "Connection refused (os error 61)", "{down}");
+        assert!(down_proxied["hub_link"].is_null(), "a peer is not told: {down_proxied}");
+        assert_eq!(up["hub_link"]["state"], "connected", "{up}");
+        assert!(none["hub_link"].is_null(), "no hub configured: {none}");
+    }
+
     /// (#2916 stage 2 review C5) The `/health` fields for this machine only
     /// are withheld from a loopback request that came through a reverse
     /// proxy (`tailscale serve` puts every tailnet peer on loopback), and
