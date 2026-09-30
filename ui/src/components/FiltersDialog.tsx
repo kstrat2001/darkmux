@@ -1,12 +1,14 @@
 import { useEffect, useRef } from "react";
 import type { Facets, FilterState } from "../lib/eventFilters";
 import { DEFAULT_ACTIVITIES, groupActivitiesBySections } from "../lib/eventFilters";
+import { UNNAMED_MACHINE } from "../lib/machineIdentity";
 import { Dialog } from "./Dialog";
 
 const OTHER_GROUPS: { title: string; key: keyof Facets }[] = [
   { title: "category", key: "cat" },
   { title: "tier", key: "tier" },
   { title: "telemetry source", key: "src" },
+  { title: "from machine", key: "mach" },
 ];
 
 /**
@@ -43,12 +45,15 @@ const OTHER_GROUPS: { title: string; key: keyof Facets }[] = [
 export function FiltersDialog({
   facets,
   filters,
+  machineLabels,
   onToggle,
   onToggleMany,
   onSetQuery,
 }: {
   facets: Facets;
   filters: FilterState;
+  /** The label to show each `facets.mach` value by (a value is a machine key, never text to print). */
+  machineLabels: ReadonlyMap<string, string>;
   onToggle: (key: keyof Facets, value: string) => void;
   onToggleMany: (key: keyof Facets, values: string[], on: boolean) => void;
   onSetQuery: (q: string) => void;
@@ -61,7 +66,7 @@ export function FiltersDialog({
     // ONLY this dialog to `min(90vw, 720px)`; About and Machine info,
     // which share the plain `.dialog` class, are untouched.
     <Dialog id="modalbg" titleId="filters-title" title="filter events" className="dialog--filters">
-      <FiltersBody facets={facets} filters={filters} onToggle={onToggle} onToggleMany={onToggleMany} onSetQuery={onSetQuery} />
+      <FiltersBody facets={facets} filters={filters} machineLabels={machineLabels} onToggle={onToggle} onToggleMany={onToggleMany} onSetQuery={onSetQuery} />
     </Dialog>
   );
 }
@@ -122,12 +127,14 @@ function SectionHeader({
 export function FiltersBody({
   facets,
   filters,
+  machineLabels,
   onToggle,
   onToggleMany,
   onSetQuery,
 }: {
   facets: Facets;
   filters: FilterState;
+  machineLabels: ReadonlyMap<string, string>;
   onToggle: (key: keyof Facets, value: string) => void;
   onToggleMany: (key: keyof Facets, values: string[], on: boolean) => void;
   onSetQuery: (q: string) => void;
@@ -170,7 +177,7 @@ export function FiltersBody({
               {facets[key].map((value) => (
                 <label key={value}>
                   <input type="checkbox" checked={filters[key].has(value)} onChange={() => onToggle(key, value)} />
-                  {value}
+                  {key === "mach" ? (machineLabels.get(value) ?? UNNAMED_MACHINE) : value}
                 </label>
               ))}
             </div>

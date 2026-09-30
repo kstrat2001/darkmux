@@ -485,3 +485,44 @@ export function machineLabels(
   }
   return labels;
 }
+
+/** The machine a record names, as a key equal across records of one machine:
+ *  its canonical uid, else (a record from before uids were stamped) its name
+ *  spelling. `null` for a record that names no machine. */
+export const recordMachineKey = (r: NormRecord): string | null => machineRefKey({ uid: r.machine_uid, name: r.machine_id });
+
+const NO_BEATS: Map<string, PresenceBeat> = new Map();
+
+/** The machines a slice of records names: one per `recordMachineKey`, in
+ *  first-seen order, each with the label to show it by and every name it
+ *  has appeared under. */
+export interface RecordMachines {
+  keys: string[];
+  /** Machines that would read alike are told apart by an ordinal. */
+  label: Map<string, string>;
+  /** Every `machine_id` spelling seen under the key. */
+  aliases: Map<string, Set<string>>;
+}
+
+/** Built from the slice alone (no presence, no roster), so a label here can
+ *  be an "unnamed machine" where a fleet card would know more. */
+export function recordMachines(records: readonly NormRecord[]): RecordMachines {
+  const first = new Map<string, NormRecord>();
+  const aliases = new Map<string, Set<string>>();
+  for (const r of records) {
+    const key = recordMachineKey(r);
+    if (key === null) continue;
+    if (!first.has(key)) first.set(key, r);
+    if (r.machine_id) aliases.set(key, (aliases.get(key) ?? new Set()).add(r.machine_id));
+  }
+  const slice = records as NormRecord[];
+  const seen = new Map<string, number>();
+  const label = new Map<string, string>();
+  for (const [key, r] of first) {
+    const name = r.machine_uid ? displayNameOf(slice, NO_BEATS, null, r.machine_uid) : (r.machine_id as string);
+    const n = (seen.get(nameKey(name)) ?? 0) + 1;
+    seen.set(nameKey(name), n);
+    label.set(key, n === 1 ? name : `${name} ${n}`);
+  }
+  return { keys: [...first.keys()], label, aliases };
+}
