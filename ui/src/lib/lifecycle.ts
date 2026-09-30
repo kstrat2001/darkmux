@@ -477,6 +477,18 @@ export function recordedWallMs(close: Close | null): number | null {
   return typeof w === "number" && Number.isFinite(w) ? w : null;
 }
 
+/** The run's ACTIVE time: `recordedWallMs` minus the `rest_ms` the same terminal
+ *  carries (every inter-turn rest; none recorded reads as none), floored at 0.
+ *  The one meaning of "active" on every surface: `darkmux run stats` derives
+ *  `active_ms = wall_ms - rest_ms` from the same two fields. `null` when there is
+ *  no recorded wall. */
+export function recordedActiveMs(close: Close | null): number | null {
+  const wall = recordedWallMs(close);
+  if (wall === null) return null;
+  const rest = endPayloadOf(close?.record)?.rest_ms;
+  return Math.max(0, wall - (typeof rest === "number" && Number.isFinite(rest) ? rest : 0));
+}
+
 /** A run's span over every attempt it had: the first attempt's start to the
  *  last one's close (`null` while it has none). What playback's focus range
  *  covers. */
