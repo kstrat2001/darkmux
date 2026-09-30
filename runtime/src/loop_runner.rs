@@ -1820,6 +1820,28 @@ fn run_with_sleeper(
     // retrying gcc inside sandbox where it doesn't exist). Sibling to the cycle
     // detector; same MVP shape (warn-only).
     let mut failure_rate_detector = FailureRateDetector::new();
+    // DETECTOR STATE DOES NOT SURVIVE A RESUME, ON PURPOSE. The detectors
+    // above and below (cycle, failure rate, reasoning loop, malformed turns,
+    // the unproductive-compaction and re-read counters) start empty on every
+    // process, including one that resumes a checkpoint. Two facts make that
+    // correct rather than a gap:
+    //
+    // 1. A host pause (the thermal governor's `pace.json`) does NOT end the
+    //    process: the loop rests in bounded increments inside it (see
+    //    `pace`), so a paused run keeps every detector's window. Only a
+    //    kill followed by `--resume` restarts them, and that is an explicit
+    //    act by the host or the operator, not a runaway.
+    // 2. The bounds that stop a runaway are NOT detector state and DO carry
+    //    across the resume: the turn count, the cumulative completion
+    //    tokens (`max_cumulative_tokens`) and the compaction count
+    //    (`bail_after_compactions`) are all restored from the checkpoint. A
+    //    run killed and resumed every few turns still hits those.
+    //
+    // What a fresh window loses is the warn-only history of the last few
+    // tool calls, which a checkpoint does not record. The alternative,
+    // persisting the windows, would put a detector's schema in the
+    // checkpoint's compatibility contract for a heuristic whose failure mode
+    // is one extra warning.
     // (#799) Accumulate bash invocations that FAILED TO RUN (never executed) —
     // stamped onto the outcome/envelope as the verifier-fabrication backstop.
     let mut failed_to_run: Vec<FailedExec> = Vec::new();
