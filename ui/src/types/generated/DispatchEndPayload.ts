@@ -7,7 +7,9 @@ import type { ResultClass } from "./ResultClass";
  * A role execution ended: the payload of `dispatch.complete` and `dispatch.error`. One type for
  * every producer of the two: the container path (full run accounting), the hosted and local
  * single-shot paths, a step kind's per-call bookend, and the guard that writes an error when a
- * dispatch ends before completing. A field a producer has no reading for is absent.
+ * dispatch ends before completing. A field a producer has no reading for is absent, except the
+ * turn count: every producer states it (`new` takes it, and there is deliberately no `Default`),
+ * so no path leaves a run's turns for a reader to guess at.
  */
 export type DispatchEndPayload = { 
 /**
@@ -40,7 +42,15 @@ stderr_excerpt?: string, exit_code?: number, result_class?: ResultClass,
 /**
  * Why a dispatch that ended without a result did.
  */
-error?: string, total_turns?: number, total_tools?: number, 
+error?: string, 
+/**
+ * The model turns the execution took: a direct single-shot call or a map item is 1, a
+ * container loop its fold's count, an execution that ended before any call 0. Every
+ * producer states it: `new` takes it and there is no `Default`, so a struct built without
+ * it must spell out every field. `Option` only so an archived terminal written before that
+ * reads back as absent, not as a fabricated 0.
+ */
+total_turns?: number, total_tools?: number, 
 /**
  * Dispatched calls that came back `ok: false`.
  */

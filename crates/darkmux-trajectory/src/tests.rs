@@ -87,6 +87,7 @@ fn a_written_event_reads_back_equal() {
         tool_calls: Some(vec![ToolCallEntry { id: "a".into(), name: "read".into(), arguments_chars: 5, path: Some("f".into()), runs: Some(false) }]),
         reported_model: None,
         calls_planned: true,
+        completion_estimate: Some(7),
     });
     let line = serde_json::to_string(&e).unwrap();
     assert_eq!(parse_line(&line), Some(e));
@@ -101,6 +102,22 @@ fn a_written_event_reads_back_equal() {
 
 fn fold(lines: &[&str]) -> TrajectoryFold {
     TrajectoryFold::from_lines(&lines.join("\n"))
+}
+
+/// (B1) A call the runtime cut has no usage. Its estimate is kept apart from
+/// the reported sum, and the call is counted as unreported so a total read
+/// beside it is known to be a floor.
+#[test]
+fn a_cut_call_is_counted_unreported_with_its_estimate_kept_out_of_the_reported_sum() {
+    let f = fold(&[
+        r#"{"type":"model.completed","seq":1,"finish_reason":"tool_calls","usage":{"prompt_tokens":100,"completion_tokens":10,"total_tokens":110}}"#,
+        r#"{"type":"model.completed","seq":2,"finish_reason":"length","usage":null,"completion_estimate":900}"#,
+    ]);
+    assert_eq!(f.unreported_calls, 1);
+    assert_eq!(f.estimated_completion_tokens, 900);
+    assert_eq!(f.tokens.completion, 10, "the estimate is never folded into the reported sum");
+    let clean = fold(&[r#"{"type":"model.completed","seq":1,"finish_reason":"stop","usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#]);
+    assert_eq!((clean.unreported_calls, clean.estimated_completion_tokens), (0, 0));
 }
 
 #[test]
@@ -377,4 +394,37 @@ fn a_partial_envelope_prints_no_empty_string_for_what_it_lacked() {
     let v = serde_json::to_value(&partial).unwrap();
     assert!(v.get("result").is_none() && v.get("trajectory_path").is_none(), "{v}");
     assert_eq!(v["final_assistant"], "hi");
+}
+
+/// (#3014) A killed execution's copy gets a terminal `interrupted` record;
+/// one that already ended, or has nothing in it, is left alone.
+#[test]
+fn an_unterminated_trajectory_is_closed_as_interrupted_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("trajectory.jsonl");
+    // A kill mid-write leaves a partial last line.
+    std::fs::write(
+        &path,
+        concat!(
+            r#"{"type":"dispatch.start","ts":1000,"model":"m"}"#, "\n",
+            r#"{"type":"model.completed","seq":1,"ts":4000,"finish_reason":"stop","usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}"#, "\n",
+            r#"{"type":"tool.comple"#,
+        ),
+    )
+    .unwrap();
+    assert!(close_if_unterminated(&path).unwrap());
+    let f = TrajectoryFold::from_path(&path);
+    let done = f.complete.expect("a terminal record now exists");
+    assert_eq!(done.result, RESULT_INTERRUPTED);
+    assert_eq!(done.wall_ms, 3000, "the wall time the events cover");
+    assert_eq!(f.tokens.completion, 2, "what completed is kept");
+    assert!(!close_if_unterminated(&path).unwrap(), "a closed trajectory is left alone");
+
+    let empty = dir.path().join("empty.jsonl");
+    std::fs::write(&empty, "").unwrap();
+    assert!(!close_if_unterminated(&empty).unwrap(), "no events: nothing to close");
+    let ended = dir.path().join("ended.jsonl");
+    std::fs::write(&ended, "{\"type\":\"dispatch.start\",\"ts\":1}\n{\"type\":\"dispatch.complete\",\"ts\":2,\"result\":\"stop\",\"wall_ms\":1}\n").unwrap();
+    assert!(!close_if_unterminated(&ended).unwrap(), "the runtime's own terminal record stands");
+    assert_eq!(TrajectoryFold::from_path(&ended).complete.unwrap().result, "stop");
 }

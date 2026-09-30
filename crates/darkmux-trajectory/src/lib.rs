@@ -45,5 +45,37 @@ pub fn trajectory_path(out_dir: &std::path::Path) -> std::path::PathBuf {
     out_dir.join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE)
 }
 
+/// Close a trajectory whose execution ended without recording its own end:
+/// append a `dispatch.complete` with `result: "interrupted"`
+/// ([`RESULT_INTERRUPTED`]), clocked at the last event and carrying the wall
+/// time the events cover. For a copy the host preserved after the execution
+/// was killed (SIGKILL cannot be caught, so the runtime wrote no terminal
+/// record). Returns `Ok(true)` when it appended, `Ok(false)` when there is
+/// nothing to close (no events, or a terminal record already present). A
+/// final line cut short by the kill is left in place, ended, and ignored by
+/// every reader.
+pub fn close_if_unterminated(path: &std::path::Path) -> std::io::Result<bool> {
+    use std::io::Write;
+    let raw = std::fs::read_to_string(path)?;
+    let fold = TrajectoryFold::from_lines(&raw);
+    if fold.events == 0 || fold.complete.is_some() {
+        return Ok(false);
+    }
+    let event = TrajectoryEvent::DispatchComplete(DispatchComplete {
+        ts: fold.last_ts.unwrap_or(0),
+        result: RESULT_INTERRUPTED.to_string(),
+        wall_ms: fold.wall_ms().unwrap_or(0),
+        turn_delay_effective_ms: None,
+    });
+    let mut line = String::new();
+    if !raw.ends_with('\n') {
+        line.push('\n');
+    }
+    line.push_str(&serde_json::to_string(&event).map_err(std::io::Error::other)?);
+    line.push('\n');
+    std::fs::OpenOptions::new().append(true).open(path)?.write_all(line.as_bytes())?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests;
