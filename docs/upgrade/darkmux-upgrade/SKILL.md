@@ -76,7 +76,9 @@ A retired env var is refused at start. `DARKMUX_NOTEBOOK_DIR` (retired in 4.0, #
 
 Drop `dirs` if it becomes empty. Other retired keys have their fix in doctor's message: apply exactly what it names. Two of them are moves rather than deletions:
 
+<!-- flow-action-guard:allow-start: retired config keys, not flow actions -->
 - `gh` becomes `cmd` (`gh.enabled` and `gh.allowed` move to `cmd.enabled` and `cmd.allowed`, #2003).
+<!-- flow-action-guard:allow-end -->
 - `runtime.daemon_auth_enabled` is replaced by `serve.token_keychain` (#2988). Move the user's value there. Setting `serve.read_auth` to true is the user's decision: ask.
 
 ## Step 4: `profiles.json`
