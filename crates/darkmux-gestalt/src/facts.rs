@@ -108,10 +108,11 @@ pub struct Facts {
     pub budget: Budget,
     /// The registry's standing utility-model binding (`internal.utility`),
     /// resolved by the caller to its namespaced identifier; `None` when
-    /// unconfigured. Exclusive-scope planning uses it for the #1280 guard:
-    /// a pass-1 unload that would evict this identifier additionally emits
-    /// [`crate::plan::Warning::UtilityBindingEvicted`], so a swap-shaped
-    /// caller that forgot to include the utility seat cannot silently evict
-    /// the compactor.
+    /// unconfigured. Planning holds it resident by policy: no arm (pass 1,
+    /// the budget arm, the pool arm, release) ever unloads it, and a load
+    /// the #1243 budget refuses only because of it Blocks with
+    /// [`crate::plan::Reason::UtilityHeldResident`]. Only the operator's
+    /// explicit `darkmux machine eject` releases it. A caller that leaves
+    /// this `None` forfeits the protection.
     pub utility_binding: Option<String>,
 }

@@ -10,6 +10,14 @@
 //! primary, utility, probe, judge — goes through the SAME path (#1280: no
 //! seat is exempt).
 //!
+//! The registry's standing utility binding ([`Facts::utility_binding`]) is
+//! held resident by policy: no arm (pass 1, the budget arm, the pool arm,
+//! release) unloads it. The budget arm Blocks a load the utility alone keeps
+//! from fitting with [`Reason::UtilityHeldResident`]; the advisory pool arm
+//! never Blocks on its account. Only `darkmux machine eject` releases it.
+//! A reconcile of the binding to the context its own seat needs is a reload,
+//! not a release, and still runs.
+//!
 //! # Cutover behavior changes (absolute ownership — operator, 2026-07-10, #1274)
 //!
 //! Named divergences from the two production paths this crate absorbs; each
@@ -373,17 +381,43 @@ impl<'a> Acquisition<'a> {
                 }
                 continue;
             }
-            if self.is_wanted(&r.identifier) {
+            // The standing utility binding is held resident by policy: a
+            // dispatch that does not name it leaves it loaded (only
+            // `darkmux machine eject` releases it).
+            if self.is_wanted(&r.identifier) || self.holds_utility(&r.identifier) {
                 continue;
             }
-            // (#1280 guard) Evicting the standing utility binding is legal
-            // but never silent — a swap-shaped caller that forgot the
-            // utility seat would otherwise evict the compactor quietly.
-            warn_if_utility_binding(&mut self.warnings, self.facts, &r.identifier);
             self.unloads.push((idx, unload_owned(r, Reason::NoLongerDesired)));
             self.removed.insert(idx);
         }
         respected
+    }
+
+    /// The registry's standing utility binding: never an eviction
+    /// candidate on any arm. It leaves residency only through the
+    /// operator's explicit `darkmux machine eject` (or a user unloading it
+    /// outside darkmux). A reconcile of the binding to the ctx its own seat
+    /// needs is a reload, not a release, and runs through the per-desired
+    /// arm, which never consults this.
+    fn holds_utility(&self, identifier: &str) -> bool {
+        self.facts.utility_binding.as_deref() == Some(identifier) && is_darkmux_owned(identifier)
+    }
+
+    /// The held utility resident and its footprint, when it is resident,
+    /// staying, sized, and NOT itself wanted: exactly the bytes an eviction
+    /// arm would have taken had the policy not held them. `None` when
+    /// holding it costs the plan nothing.
+    fn held_utility_bytes(&self) -> Option<(String, u64)> {
+        let (idx, r) = self
+            .facts
+            .residents
+            .iter()
+            .enumerate()
+            .find(|(_, r)| self.holds_utility(&r.identifier))?;
+        if self.removed.contains(&idx) || self.is_wanted(&r.identifier) {
+            return None;
+        }
+        Some((r.identifier.clone(), r.est_bytes?))
     }
 
     /// Desired, or already targeted by a decision (or pinned).
@@ -465,7 +499,8 @@ impl<'a> Acquisition<'a> {
 
     /// Auto never breaches (#1243): evict idle darkmux-owned residents,
     /// then refuse any load that cannot fit even alone after every
-    /// eviction.
+    /// eviction, or that fits only if the held utility binding were
+    /// released (naming that resident).
     fn budget_fit_auto(&mut self, budget: u64, base: u64, need: u64) {
         let freed = self.evict_idle(base + need - budget, |freeing| Reason::BudgetEvict {
             freeing_bytes: freeing,
@@ -477,26 +512,49 @@ impl<'a> Acquisition<'a> {
         if base + need <= budget {
             return;
         }
+        // A load that cannot fit even alone is refused (the plain budget
+        // refusal). Loads that each fit alone both survive, except when the
+        // held utility is what makes the running total not fit: counted in
+        // plan order atop the base and the loads already kept, that load
+        // Blocks naming the utility.
+        let held = self.held_utility_bytes();
+        let mut running = base;
         for pend in &self.pendings {
             if !is_load_like(&self.decisions[pend.decision_idx].action) {
                 continue;
             }
             let e = pend.est.unwrap_or(0);
-            if base + e > budget {
-                self.decisions[pend.decision_idx] = block(
-                    &pend.model_key,
-                    None,
-                    Reason::BudgetRefuse { est_bytes: e, budget_bytes: budget },
-                );
+            let fixed_by_release = held.as_ref().filter(|(_, h)| running - h + e <= budget);
+            let refuse = base + e > budget || (running + e > budget && fixed_by_release.is_some());
+            if !refuse {
+                running += e;
+                continue;
             }
+            let (resident, reason) = match fixed_by_release {
+                Some((identifier, held_bytes)) => (
+                    Some(identifier.clone()),
+                    Reason::UtilityHeldResident {
+                        identifier: identifier.clone(),
+                        held_bytes: *held_bytes,
+                        est_bytes: e,
+                        over_bytes: (running + e).saturating_sub(budget),
+                        budget_bytes: budget,
+                    },
+                ),
+                None => (None, Reason::BudgetRefuse { est_bytes: e, budget_bytes: budget }),
+            };
+            self.decisions[pend.decision_idx] = block(&pend.model_key, resident, reason);
         }
     }
 
     /// #1140 pool-headroom arm (Auto only; single-pool v1 rule). Pool facts
     /// are advisory headroom, not an operator contract: the arm evicts to
-    /// make room, and refuses ONLY a
+    /// make room (never taking the held utility binding), and refuses ONLY a
     /// load-alongside behind a foreign duplicate (whose bytes darkmux may
     /// not free — the one shortfall with a nameable, un-evictable cause).
+    /// The held utility is never a reason to refuse here: the free-pages
+    /// snapshot is pessimistic, so a shortfall it leaves is the executor's
+    /// call, not a Block.
     /// Every other shortfall falls through to the executor's #1139
     /// insufficient-resources fast-fail backstop. With zero or multiple
     /// pools the arm is skipped (a placement→pool mapping fact arrives with
@@ -568,7 +626,6 @@ impl<'a> Acquisition<'a> {
                 break;
             }
             let Some(freeing) = self.evictable_bytes(idx, r) else { continue };
-            warn_if_utility_binding(&mut self.warnings, self.facts, &r.identifier);
             self.unloads.push((idx, unload_owned(r, reason(freeing))));
             self.removed.insert(idx);
             freed += freeing;
@@ -577,10 +634,14 @@ impl<'a> Acquisition<'a> {
     }
 
     /// The bytes evicting resident `idx` would free, or `None` when it is
-    /// not an eviction candidate: already leaving, user state, wanted, or
-    /// of unknown size.
+    /// not an eviction candidate: already leaving, user state, wanted, the
+    /// held utility binding, or of unknown size.
     fn evictable_bytes(&self, idx: usize, r: &ResidentFact) -> Option<u64> {
-        if self.removed.contains(&idx) || !is_darkmux_owned(&r.identifier) || self.is_wanted(&r.identifier) {
+        let excluded = self.removed.contains(&idx)
+            || !is_darkmux_owned(&r.identifier)
+            || self.is_wanted(&r.identifier)
+            || self.holds_utility(&r.identifier);
+        if excluded {
             return None;
         }
         r.est_bytes
@@ -718,6 +779,9 @@ pub fn plan_release(releasing: &[Placement], still_active: &[Placement], facts: 
         if !is_darkmux_owned(&r.identifier) {
             continue; // alias-release asymmetry — see fn docs
         }
+        if facts.utility_binding.as_deref() == Some(r.identifier.as_str()) {
+            continue; // the utility binding is held resident by policy
+        }
         if !emitted.insert(r.identifier.as_str()) {
             continue; // duplicate resident rows collapse to one unload
         }
@@ -748,16 +812,6 @@ fn push_reuse(
         reason: Reason::SufficientCtxResident,
         precondition: Precondition::None,
     });
-}
-
-/// (#1280 guard, all eviction paths) Evicting the standing utility binding
-/// is legal but never silent — pass-1, the #1243 budget arm, and the pool-
-/// pressure arm all attach the utility-specific warning, so the compactor
-/// never leaves residency quietly whichever arm chose it.
-fn warn_if_utility_binding(warnings: &mut Vec<Warning>, facts: &Facts, identifier: &str) {
-    if facts.utility_binding.as_deref() == Some(identifier) {
-        warnings.push(Warning::UtilityBindingEvicted { identifier: identifier.to_string() });
-    }
 }
 
 fn is_load_like(action: &Action) -> bool {
@@ -1428,14 +1482,45 @@ mod tests {
         assert_eq!(plan.actions, vec![load_action("new", 8_000)]);
     }
 
+    fn util_facts(residents: Vec<ResidentFact>) -> Facts {
+        Facts { residents, utility_binding: Some("darkmux:util-4b".into()), ..Default::default() }
+    }
+
+    fn unloaded_ids(plan: &Plan) -> Vec<String> {
+        plan.actions
+            .iter()
+            .filter_map(|a| match &a.action {
+                Action::Unload { target } => Some(target.identifier().to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
-    fn exclusive_evicting_utility_binding_warns() {
-        // (#1280 guard, other direction) A swap-shaped caller that forgot
-        // to include the utility seat cannot silently evict the compactor:
-        // the pass-1 unload still happens, loudly.
+    fn exclusive_dispatch_not_naming_the_utility_keeps_it() {
+        // The live report: a dispatch staffing only its own model must not
+        // unload the standing utility binding in pass 1, while a sibling
+        // darkmux resident the dispatch does not name still goes.
+        let f = util_facts(vec![
+            resident("darkmux:util-4b", "util-4b", 68_000, None),
+            resident("darkmux:old", "old", 8_000, None),
+        ]);
+        let plan = plan_acquire(
+            &[placement("new", 8_000)],
+            &f,
+            opts(CallerIntent::OperatorExplicit, AcquireScope::Exclusive),
+            &no_est(),
+        );
+        assert_eq!(unloaded_ids(&plan), vec!["darkmux:old".to_string()]);
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+    }
+
+    #[test]
+    fn exclusive_unbound_utility_is_still_unloaded() {
+        // Inverse: the hold is the binding's, not a name pattern. Without
+        // the binding the same resident is ordinary pass-1 fodder.
         let f = Facts {
             residents: vec![resident("darkmux:util-4b", "util-4b", 68_000, None)],
-            utility_binding: Some("darkmux:util-4b".into()),
             ..Default::default()
         };
         let plan = plan_acquire(
@@ -1444,62 +1529,154 @@ mod tests {
             opts(CallerIntent::OperatorExplicit, AcquireScope::Exclusive),
             &no_est(),
         );
-        assert_eq!(
-            plan.warnings,
-            vec![Warning::UtilityBindingEvicted { identifier: "darkmux:util-4b".into() }]
-        );
-        assert!(matches!(
-            &plan.actions[0],
-            PlannedAction { reason: Reason::NoLongerDesired, .. }
-        ));
+        assert_eq!(unloaded_ids(&plan), vec!["darkmux:util-4b".to_string()]);
     }
 
     #[test]
-    fn budget_eviction_of_utility_binding_warns() {
-        // (#1280 guard, budget arm) The #1243 eviction path attaches the
-        // utility-specific warning too — the compactor never leaves
-        // residency quietly, whichever arm evicts it.
+    fn budget_arm_never_evicts_the_utility_and_names_it_when_that_blocks_a_load() {
+        // 20 GB utility resident + 15 GB load under a 30 GB cap: the load
+        // fits only by evicting the utility, so it Blocks naming it.
         let f = Facts {
-            residents: vec![resident("darkmux:util-4b", "util-4b", 68_000, Some(20 * GB))],
             budget: Budget { max_darkmux_bytes: Some(30 * GB) },
-            utility_binding: Some("darkmux:util-4b".into()),
-            ..Default::default()
+            ..util_facts(vec![resident("darkmux:util-4b", "util-4b", 68_000, Some(20 * GB))])
         };
         let plan =
             plan_acquire(&[placement("m", 8_000)], &f, additive_auto(), &est_map(&[("m", 15 * GB)]));
-        assert_eq!(
-            plan.warnings,
-            vec![Warning::UtilityBindingEvicted { identifier: "darkmux:util-4b".into() }]
-        );
+        assert!(unloaded_ids(&plan).is_empty(), "{:?}", plan.actions);
         assert!(matches!(
-            &plan.actions[0],
-            PlannedAction { reason: Reason::BudgetEvict { .. }, .. }
-        ));
+            plan.actions.as_slice(),
+            [PlannedAction {
+                action: Action::Block { resident_identifier: Some(blocking), .. },
+                reason: Reason::UtilityHeldResident { identifier, held_bytes, over_bytes, .. },
+                ..
+            }] if identifier == "darkmux:util-4b" && blocking == identifier && *held_bytes == 20 * GB && *over_bytes == 5 * GB
+        ), "{:?}", plan.actions);
+        let text = plan.actions[0].reason.to_string();
+        assert!(text.contains("darkmux:util-4b") && text.contains("exceeds"), "{text}");
+        assert!(text.contains("smaller `internal.utility`") && text.contains("only until"), "{text}");
     }
 
     #[test]
-    fn pool_eviction_of_utility_binding_warns() {
-        // (#1280 guard, pool arm) Same guard on the #1140 headroom path.
-        let pools: Pools = BTreeMap::from([(
+    fn budget_arm_still_refuses_plainly_when_the_utility_is_not_the_cause() {
+        // The load exceeds the whole budget alone: releasing the utility
+        // could never help, so the refusal stays the budget's.
+        let f = Facts {
+            budget: Budget { max_darkmux_bytes: Some(10 * GB) },
+            ..util_facts(vec![resident("darkmux:util-4b", "util-4b", 68_000, Some(2 * GB))])
+        };
+        let plan =
+            plan_acquire(&[placement("m", 8_000)], &f, additive_auto(), &est_map(&[("m", 15 * GB)]));
+        assert!(matches!(
+            plan.actions.as_slice(),
+            [PlannedAction { reason: Reason::BudgetRefuse { .. }, .. }]
+        ), "{:?}", plan.actions);
+    }
+
+    #[test]
+    fn budget_arm_evicts_a_sibling_but_not_the_utility() {
+        // Both idle and owned; only the non-utility resident is a
+        // candidate, and its bytes are enough.
+        let f = Facts {
+            budget: Budget { max_darkmux_bytes: Some(30 * GB) },
+            ..util_facts(vec![
+                resident("darkmux:util-4b", "util-4b", 68_000, Some(5 * GB)),
+                resident("darkmux:idle", "idle", 8_000, Some(20 * GB)),
+            ])
+        };
+        let plan =
+            plan_acquire(&[placement("m", 8_000)], &f, additive_auto(), &est_map(&[("m", 15 * GB)]));
+        assert_eq!(unloaded_ids(&plan), vec!["darkmux:idle".to_string()]);
+    }
+
+    #[test]
+    fn budget_arm_counts_loads_cumulatively_and_blames_the_utility() {
+        // 30 GB budget, 10 GB held utility, two 15 GB loads: each fits with
+        // the utility (25 GB), together they do not (40 GB). The first
+        // loads; the second Blocks naming the utility, which alone is why.
+        let f = Facts {
+            budget: Budget { max_darkmux_bytes: Some(30 * GB) },
+            ..util_facts(vec![resident("darkmux:util-4b", "util-4b", 68_000, Some(10 * GB))])
+        };
+        let plan = plan_acquire(
+            &[placement("a", 8_000), placement("b", 8_000)],
+            &f,
+            additive_auto(),
+            &est_map(&[("a", 15 * GB), ("b", 15 * GB)]),
+        );
+        assert!(unloaded_ids(&plan).is_empty(), "{:?}", plan.actions);
+        assert!(matches!(
+            plan.actions.as_slice(),
+            [
+                PlannedAction { action: Action::Block { model_key, .. }, reason: Reason::UtilityHeldResident { .. }, .. },
+                PlannedAction { action: Action::Load { .. }, .. },
+            ] if model_key == "b"
+        ), "{:?}", plan.actions);
+    }
+
+    fn pool_10gb() -> Pools {
+        BTreeMap::from([(
             PoolId("unified".into()),
             PoolFact { capacity_bytes: 32 * GB, available_bytes: 10 * GB },
-        )]);
+        )])
+    }
+
+    #[test]
+    fn pool_arm_never_evicts_the_utility_and_never_blocks_on_its_account() {
+        // The pool fact is free pages only (pessimistic). A small load the
+        // utility's bytes would have closed the gap for falls through to the
+        // executor like any other shortfall, with the utility kept.
         let f = Facts {
-            residents: vec![resident("darkmux:util-4b", "util-4b", 68_000, Some(12 * GB))],
-            pools,
-            utility_binding: Some("darkmux:util-4b".into()),
-            ..Default::default()
+            pools: pool_10gb(),
+            ..util_facts(vec![resident("darkmux:util-4b", "util-4b", 68_000, Some(12 * GB))])
         };
         let plan =
             plan_acquire(&[placement("m", 8_000)], &f, additive_auto(), &est_map(&[("m", 15 * GB)]));
-        assert_eq!(
-            plan.warnings,
-            vec![Warning::UtilityBindingEvicted { identifier: "darkmux:util-4b".into() }]
+        assert_eq!(plan.actions, vec![load_action("m", 8_000)]);
+    }
+
+    #[test]
+    fn pool_arm_leaves_a_shortfall_the_utility_would_not_close_to_the_executor() {
+        // 30 GB load, 10 GB free, a 12 GB utility: even released it would
+        // not fit, so the plan does not blame the utility (the #1139
+        // fast-fail owns this shortfall) and still does not evict it.
+        let f = Facts {
+            pools: pool_10gb(),
+            ..util_facts(vec![resident("darkmux:util-4b", "util-4b", 68_000, Some(12 * GB))])
+        };
+        let plan =
+            plan_acquire(&[placement("m", 8_000)], &f, additive_auto(), &est_map(&[("m", 30 * GB)]));
+        assert_eq!(plan.actions, vec![load_action("m", 8_000)]);
+    }
+
+    #[test]
+    fn utility_wrong_ctx_reconcile_still_reloads_under_the_hold() {
+        // Reconcile is a reload, not a release: the held binding at the
+        // jit-default ctx is still unloaded and reloaded at the seat's ctx.
+        let f = util_facts(vec![resident("darkmux:util-4b", "util-4b", 4_096, None)]);
+        let plan = plan_acquire(
+            &[placement_seat("util-4b", 68_000, "utility")],
+            &f,
+            opts(CallerIntent::Auto, AcquireScope::Exclusive),
+            &no_est(),
         );
-        assert!(matches!(
-            &plan.actions[0],
-            PlannedAction { reason: Reason::BudgetEvict { .. }, .. }
-        ));
+        assert_eq!(
+            plan.actions,
+            vec![
+                reconcile_unload_action("darkmux:util-4b", 4_096),
+                reconcile_load_action("util-4b", 68_000),
+            ]
+        );
+    }
+
+    #[test]
+    fn release_of_the_utility_seat_keeps_the_utility() {
+        let f = util_facts(vec![
+            resident("darkmux:util-4b", "util-4b", 68_000, None),
+            resident("darkmux:other", "other", 8_000, None),
+        ]);
+        let releasing = [placement_seat("util-4b", 68_000, "utility"), placement_seat("other", 8_000, "other")];
+        let plan = plan_release(&releasing, &[], &f);
+        assert_eq!(unloaded_ids(&plan), vec!["darkmux:other".to_string()]);
     }
 
     // ── #1487 pinned-externals rows ─────────────────────────────────────
@@ -2783,7 +2960,10 @@ mod tests {
                     for cat in [None, catalog.clone()] {
                         for budget in [None, Some(15 * GB), Some(40 * GB)] {
                             for pool in [Pools::new(), pools(5 * GB), pools(12 * GB)] {
-                                for pinned in [&[][..], &["darkmux:a"], &["darkmux:idle"], &["user-x"]] {
+                                let pins: [&[&str]; 4] = [&[], &["darkmux:a"], &["darkmux:idle"], &["user-x"]];
+                                for (pinned, utility) in
+                                    pins.into_iter().flat_map(|p| [None, Some("darkmux:idle")].map(move |u| (p, u)))
+                                {
                                     for intent in [CallerIntent::Auto, CallerIntent::OperatorExplicit] {
                                         for scope in [AcquireScope::Exclusive, AcquireScope::Additive] {
                                             let facts = Facts {
@@ -2791,7 +2971,7 @@ mod tests {
                                                 catalog: cat.clone(),
                                                 pools: pool.clone(),
                                                 budget: Budget { max_darkmux_bytes: budget },
-                                                utility_binding: Some("darkmux:idle".into()),
+                                                utility_binding: utility.map(str::to_string),
                                             };
                                             let opts = opts_pinned(intent, scope, pinned);
                                             let plan = plan_acquire(desired, &facts, opts.clone(), &est);
@@ -2823,6 +3003,7 @@ mod tests {
             Reason::BudgetRefuse { .. } => "BudgetRefuse",
             Reason::ClaimedResidentInsufficientCtx { clearable: true, .. } => "ClaimedClearable",
             Reason::ClaimedResidentInsufficientCtx { clearable: false, .. } => "ClaimedSamePlan",
+            Reason::UtilityHeldResident { .. } => "UtilityHeldResident",
         }
     }
 
@@ -2831,7 +3012,6 @@ mod tests {
             Warning::BudgetExceededOperatorOverride { .. } => "BudgetExceededOperatorOverride",
             Warning::ResidentBytesUnknown { .. } => "ResidentBytesUnknown",
             Warning::CtxDivergence { .. } => "CtxDivergence",
-            Warning::UtilityBindingEvicted { .. } => "UtilityBindingEvicted",
             Warning::ForeignDuplicateResident { .. } => "ForeignDuplicateResident",
             Warning::LoadEstimateUnknown { .. } => "LoadEstimateUnknown",
         }
@@ -2877,6 +3057,12 @@ mod tests {
                         assert!(resident_ids.contains(id), "phantom unload {id}\n{}", ctx());
                         assert!(!live_pins.contains(id), "unloads a live pin {id}\n{}", ctx());
                         assert!(first_load.is_none_or(|l| i < l), "an Unload follows a Load\n{}", ctx());
+                        let held = facts.utility_binding.as_deref() == Some(id);
+                        assert!(
+                            !held || pa.reason == Reason::InsufficientCtx,
+                            "releases the held utility binding {id} (only a ctx reconcile may unload it)\n{}",
+                            ctx()
+                        );
                         if let Reason::BudgetEvict { .. } = pa.reason {
                             if facts.budget.max_darkmux_bytes.is_some() { budget_evict = true } else { pool_evict = true }
                         }
@@ -2919,7 +3105,7 @@ mod tests {
         }
         for want in [
             "BudgetExceededOperatorOverride", "ResidentBytesUnknown", "CtxDivergence",
-            "UtilityBindingEvicted", "ForeignDuplicateResident", "LoadEstimateUnknown",
+            "ForeignDuplicateResident", "LoadEstimateUnknown",
         ] {
             assert!(warnings.contains(want), "sweep never produced {want}: {warnings:?}");
         }

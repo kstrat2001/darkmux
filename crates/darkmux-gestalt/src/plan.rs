@@ -199,6 +199,11 @@ pub enum Reason {
     /// Block on every retry. Callers use this to gate whether a bounded
     /// retry-hold is worth attempting at all (see `ensure_wave_loaded`).
     ClaimedResidentInsufficientCtx { identifier: String, resident_ctx: u64, min_ctx: u32, clearable: bool },
+    /// Block (budget arm): the load pushes darkmux-owned residency over the
+    /// #1243 budget by `over_bytes`, and would fit if the registry's
+    /// standing utility binding (`held_bytes`) were released. No arm evicts
+    /// it, so the plan names it instead.
+    UtilityHeldResident { identifier: String, held_bytes: u64, est_bytes: u64, over_bytes: u64, budget_bytes: u64 },
 }
 
 /// Display-only GB rendering for the operator-facing suggestion strings
@@ -253,6 +258,14 @@ impl fmt::Display for Reason {
             Reason::ClaimedResidentInsufficientCtx { identifier, resident_ctx, min_ctx, clearable } => {
                 fmt_claimed_resident(f, identifier, *resident_ctx, *min_ctx, *clearable)
             }
+            Reason::UtilityHeldResident { identifier, held_bytes, est_bytes, over_bytes, budget_bytes } => write!(
+                f,
+                "an estimated {} load exceeds the {} AI RAM budget by {}; it would fit if the utility model \"{identifier}\" ({}, held resident by policy) were released. Lasting remedies: a smaller `internal.utility` model or context, or a larger budget (`darkmux machine eject` releases it only until the next dispatch's compactor preflight reloads it)",
+                gb(*est_bytes),
+                gb(*budget_bytes),
+                gb(*over_bytes),
+                gb(*held_bytes)
+            ),
         }
     }
 }
@@ -357,11 +370,6 @@ pub enum Warning {
     /// Budget accounting degraded: a darkmux-owned resident has unknown
     /// bytes (counted as 0 against the cap — visible, never silent).
     ResidentBytesUnknown { identifier: String },
-    /// An Exclusive-scope pass-1 unload is about to evict the registry's
-    /// standing utility binding (#1280 guard): the caller either forgot to
-    /// include the utility seat in the desired set, or genuinely means to
-    /// evict the compactor — either way, loudly.
-    UtilityBindingEvicted { identifier: String },
     /// A user-loaded duplicate of a desired model is resident (absolute
     /// ownership, #1274): respected as pool consumption, never reused —
     /// darkmux plans its own namespaced copy alongside. Names the duplicate

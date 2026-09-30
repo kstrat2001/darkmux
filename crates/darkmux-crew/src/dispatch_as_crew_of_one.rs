@@ -191,7 +191,10 @@ pub(crate) fn dispatch_as_crew_of_one_with(
     let mut tasks: BTreeMap<String, Task> = BTreeMap::new();
     tasks.insert(task_id, task);
 
-    let facts = Facts::default();
+    let facts = Facts {
+        utility_binding: crate::concurrent_dispatch::standing_utility_binding(opts.config_path.as_deref()),
+        ..Facts::default()
+    };
     let est = FixedEstimator::default();
 
     let graph_result = crate::scheduler::run_step_graph(
