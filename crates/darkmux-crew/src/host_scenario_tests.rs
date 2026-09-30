@@ -570,6 +570,87 @@ fn a_live_battery_pause_survives_a_thermal_duty_cycle() {
     );
 }
 
+// ── the budget pacer beside the two governors ────────────────────────────
+
+/// A `wait` budget whose window is full at `T0` and free a day later.
+fn full_then_free_window() -> (crate::budget::BudgetPacer, crate::budget::tests::FakeEnv) {
+    use crate::budget::tests::{budget, FakeEnv, T0};
+    let env = FakeEnv::new(vec![(T0 - 10, 1_000_000)]);
+    let pacer = crate::budget::BudgetPacer::new(budget(darkmux_types::BudgetPolicy::Wait, Some(1_000), None, None), None);
+    (pacer, env)
+}
+
+fn pace_on_disk(dir: &Path) -> serde_json::Value {
+    serde_json::from_str(&std::fs::read_to_string(crate::pace_file::path(dir)).unwrap()).unwrap()
+}
+
+/// The pacer yields to a live BATTERY pause: it neither writes over it while
+/// its own window is full nor releases it when its window frees. Reading the
+/// battery's state as "not pausing" here is the run resuming on a critical
+/// battery, so the pause in force must still be the battery's at every step.
+#[test]
+fn the_budget_pacer_yields_to_a_live_battery_pause() {
+    use crate::budget::tests::{solo_caller, T0};
+    let out = out_dir();
+    let pair = GovernorPair::new(
+        ThermalGovernor::new(shipped_defaults()),
+        BatteryGovernor::new(PowerPolicyConfig {
+            min_battery_pct: 50,
+            refuse_start_below_min: true,
+            pause_running_below_min: true,
+        })
+        .with_restamp_interval_ms(20_000),
+    );
+    let mut d = ScenarioDriver::new(source(library::BATTERY_CRITICAL_THEN_FAIR), pair, out.path());
+    d.run_for(30_000);
+    assert_eq!(d.pace().expect("battery pause written")["reason"], crate::power_policy::PACE_REASON);
+    assert!(d.pair().other_pacing().pausing, "the battery pause must read as a pause the pacer yields to");
+
+    let (mut pacer, env) = full_then_free_window();
+    let caller = solo_caller();
+    let ev = pacer.on_tick(0, out.path(), &d.pair().other_pacing(), &caller, &env);
+    assert!(matches!(ev, Some(crate::budget::PacerEvent::Paused { .. })), "{ev:?}");
+    assert_eq!(pace_on_disk(out.path())["reason"], crate::power_policy::PACE_REASON, "a full window wrote over the battery pause");
+
+    env.at(T0 + 86_400 + 1);
+    let ev = pacer.on_tick(2_000, out.path(), &d.pair().other_pacing(), &caller, &env);
+    assert!(matches!(ev, Some(crate::budget::PacerEvent::Resumed { .. })), "{ev:?}");
+    let after = pace_on_disk(out.path());
+    assert_eq!(
+        (after["pause"].as_bool(), after["reason"].as_str()),
+        (Some(true), Some(crate::power_policy::PACE_REASON)),
+        "releasing the budget hold resumed a run that is still below the battery floor: {after}"
+    );
+}
+
+/// The pacer's release during a thermal duty cycle restores the duty cycle's
+/// turn delay rather than dropping it to a bare `pause: false`.
+#[test]
+fn the_budget_pacer_release_restores_the_thermal_duty_cycle() {
+    use crate::budget::tests::{solo_caller, T0};
+    let out = out_dir();
+    let mut d = ScenarioDriver::new(source(library::SUSTAINED_FAIR), thermal_only(shipped_defaults()), out.path());
+    d.run_for(100_000);
+    let duty = d.pair().other_pacing();
+    assert_eq!(duty.duty_cycle.as_ref().map(|(ms, _)| *ms), Some(15_000), "the duty cycle must be in force: {duty:?}");
+    assert!(!duty.pausing, "a duty cycle is not a pause");
+
+    let (mut pacer, env) = full_then_free_window();
+    let caller = solo_caller();
+    let ev = pacer.on_tick(0, out.path(), &duty, &caller, &env);
+    assert!(matches!(ev, Some(crate::budget::PacerEvent::Paused { .. })), "{ev:?}");
+    assert_eq!(pace_on_disk(out.path())["pause"], true, "the pacer's own hold takes the file");
+
+    env.at(T0 + 86_400 + 1);
+    pacer.on_tick(2_000, out.path(), &duty, &caller, &env);
+    let after = pace_on_disk(out.path());
+    assert_eq!(
+        (after["pause"].as_bool(), after["turn_delay_ms"].as_u64(), after["reason"].as_str()),
+        (Some(false), Some(15_000), Some("thermal-duty-cycle")),
+        "releasing dropped the thermal duty cycle's instruction: {after}"
+    );
+}
+
 // ── scenario 8: degenerate threshold pairs ───────────────────────────────
 
 #[test]

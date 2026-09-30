@@ -345,6 +345,22 @@
         assert!(beat < endpoint_gate, "the heartbeat runs through a budget wait");
     }
 
+    /// The live sampler hands the budget pacer what the governor pair holds
+    /// (`GovernorPair::other_pacing`, scenario-tested beside the pacer), never
+    /// a hand-built `OtherPacing` that could drop the battery or duty-cycle
+    /// half.
+    #[test]
+    fn the_sampler_derives_the_pacers_view_of_the_governors_from_the_pair() {
+        let src: String = include_str!("dispatch_internal.rs")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(src.contains("pacer.on_tick(thermal_elapsed_ms, &host_out, &others, &caller, env)"), "the pacer tick");
+        assert!(src.contains("let others = governors.other_pacing();"), "derived from the pair");
+        assert!(!src.contains("OtherPacing {"), "no second derivation of what the governors hold");
+    }
+
     /// (3rd review #4) The agentic pre-start gate holds a start behind a
     /// heartbeat, so the held run is live on the fleet's presence.
     #[test]

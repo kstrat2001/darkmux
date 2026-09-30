@@ -8488,10 +8488,7 @@ fn run_telemetry_sampler(
         // that already holds it. Decided AFTER both governors, so it reads
         // their post-decision state; reported as `dispatch.rest` like theirs.
         if let Some(pacer) = budget_pacer.as_mut() {
-            let others = crate::budget::OtherPacing {
-                pausing: governors.thermal.is_pausing() || governors.battery.is_pacing(),
-                duty_cycle: governors.thermal.duty_cycle(),
-            };
+            let others = governors.other_pacing();
             let caller = crate::budget::BudgetCaller {
                 role_id: Some(&role_id),
                 session: &session,
