@@ -1066,6 +1066,8 @@ mod tests {
             ("SessionKind", "a session's kind within its run (`session_id`), never a setting"),
             ("SessionScope", "what a step kind declares about its sessions (`session_id`), never a setting"),
             ("WireKind", "a session kind's tag in the session id wire grammar (`session_id`), never a setting"),
+            ("ClientAddrSource", "where a client on this machine found the daemon's address (`config_access`), runtime-only provenance, never a setting"),
+            ("FixedKind", "a session kind whose wire fields have a fixed count (`session_id`), never a setting"),
             ("EndpointKind", "derived from `managed` + `url`, never written"),
             ("Lenient", "the lenient-read wrapper itself"),
             ("LabDirState", "where the lab-run root stands relative to the pre-4.0 one (doctor and lab verbs), never a setting"),
