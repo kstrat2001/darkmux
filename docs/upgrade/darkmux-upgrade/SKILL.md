@@ -26,18 +26,18 @@ Do not use it on a fresh install, or to change settings that are not refused.
 4. **Apply exactly what `darkmux doctor` names.** Do not tidy anything else. Re-run `darkmux doctor` after every step and read the new output before going on.
 5. **Stop and ask on a judgment call.** The window size of the utility model, the id for an endpoint, which of two copies of a file is current, and whether to delete anything ambiguous are the user's decisions. Propose, then wait.
 6. **Never print a secret.** Do not show an endpoint's `auth` value, any Keychain item, a machine uid, or a tailnet host name (`*.ts.net`) in your output or in a summary. When you show a JSON edit, redact those fields.
-7. **The `darkmux` you run is the new one.** Do not run a 3.x binary against the home once you start editing it.
+7. **The `darkmux` you run is the new one, called by path.** A 3.x install (brew) may be first on `PATH`, so a bare `darkmux` can be the old binary. Set `NEW` to the new binary's full path and run `$NEW` everywhere this skill says `darkmux`. Never run a 3.x binary against the home once you start editing it.
 
 ## Step 0: See what doctor says
 
 ```bash
-darkmux --version
-darkmux doctor
+$NEW --version    # must report the new major; if not, you have the wrong binary
+$NEW doctor
 ```
 
 `doctor` and `config` are the only commands that run while a retired env var is set; every other command refuses. Doctor's failures are the work list. The steps below are in the order that worked, but doctor is the authority on what applies to this home.
 
-The loader stops at the first problem in a file, so `doctor` may show only one `profiles.json` problem until that one is fixed. The row `user file keys: profiles.json` lists every refused key at once, but only once the file loads. Expect to run doctor several times.
+The row `user file keys: profiles.json` lists every refused key in that file at once, so read the whole row before editing. Still expect to run doctor several times: fixing one file can reveal the next.
 
 ## Step 1: Back up
 
@@ -53,15 +53,22 @@ On another filesystem use `cp -a "$ROOT" "$ROOT.backup-$(date +%Y%m%d)"`.
 Verify the backup before going on:
 
 - Compare per-top-level-folder file counts between `$ROOT` and the backup with `find`. `liveness/` may differ by a few files, because live processes write there; that is expected.
+- A copy of a live home also copies its lock files. If you later run doctor against a copy while 3.x is still running, its `host sampler` row warns `stale lock: pid <n>` naming the live 3.x process. That is expected and clears once that daemon stops.
 - Run `cmp` on every file you are about to edit (`config.json`, `profiles.json`) against its backup copy.
 
 If a check fails, stop and tell the user.
+
+## Optional: run side by side with a live 3.x
+
+If 3.x must keep running, upgrade a copy instead of the live home. Copy it (as in step 1), point `DARKMUX_HOME` at the copy for the new binary, and start the new daemon on another port.
+
+**Trap: a copied home keeps absolute paths into the original.** `audit.dir` and any other path under `dirs` or elsewhere in the copy's `config.json` still point at the original home, so the new version would write into 3.x's audit chain. Search the copy's `config.json` for the original root and repoint each hit at the copy, then confirm with `$NEW doctor` that nothing resolves outside `$DARKMUX_HOME`. Set the copy's `redis.enabled` to false unless the new version should share the stream with 3.x.
 
 ## Step 2: The shell rc and open shells
 
 A retired env var is refused at start. `DARKMUX_NOTEBOOK_DIR` (retired in 4.0, #2913) is the common one; `DARKMUX_CREW_DIR` and `DARKMUX_RADIO_ROUTER_PROFILE` are refused the same way. Doctor's row `retired env vars (4.0)` names each one it finds.
 
-1. Find the `export` line in the user's shell rc (`~/.zshrc`, `~/.bashrc`, or a file it sources) and remove it with the Edit tool. It is the user's file: show the line you removed. If they use the same name for something outside darkmux, say so and let them decide.
+1. Find the `export` line in the user's shell rc (`~/.zshrc`, `~/.bashrc`, or a file it sources) and remove it with the Edit tool. It is the user's file: show the line you removed. If they use the same name for something outside darkmux, say so and let them decide. **If 3.x keeps running on this machine, leave the export in place** (3.x still reads it) and prefix each new-binary command with `env -u DARKMUX_NOTEBOOK_DIR` instead.
 2. **Trap: an already-open shell keeps the old value.** The new binary refuses to start in that shell even after the rc is fixed. Open a new terminal, run `unset DARKMUX_NOTEBOOK_DIR` in the current one, or prefix commands with `env -u DARKMUX_NOTEBOOK_DIR`. Re-sourcing `.zshrc` may print harmless `compdef` noise.
 
 ## Step 3: `config.json`
@@ -74,18 +81,21 @@ A retired env var is refused at start. `DARKMUX_NOTEBOOK_DIR` (retired in 4.0, #
 | `orchestrator` | Removed in #1766; `init` wrote it before 1.8. |
 | `role_profiles.radio-router` | No effect since 4.0 (#2914); radio routing runs on `internal.utility`. |
 
-Drop `dirs` if it becomes empty. Other retired keys have their fix in doctor's message: apply exactly what it names. Two of them are moves rather than deletions:
+Drop `dirs` if it becomes empty. Other retired keys have their fix in doctor's message: apply exactly what it names. Three of them are moves or respellings rather than deletions:
 
 <!-- flow-action-guard:allow-start: retired config keys, not flow actions -->
 - `gh` becomes `cmd` (`gh.enabled` and `gh.allowed` move to `cmd.enabled` and `cmd.allowed`, #2003).
 <!-- flow-action-guard:allow-end -->
 - `runtime.daemon_auth_enabled` is replaced by `serve.token_keychain` (#2988). Move the user's value there. Setting `serve.read_auth` to true is the user's decision: ask.
+<!-- flow-action-guard:allow-start: retired hook action spellings, not emitted actions -->
+- Hook rules that match on a retired action spelling are failed by doctor, which names each rule. Respell them: `step *` becomes `step.*` and `mission *` becomes `mission.*`. The dotted glob can match more than the old spelling did (it also matches actions the spaced glob never covered), so tell the user before changing a rule that acts on the match.
+<!-- flow-action-guard:allow-end -->
 
 ## Step 4: `profiles.json`
 
 Write JSON edits with `jq` to a `.new` file, check it with `jq -e .`, then move it over the original (the backup from step 1 is what makes this safe). Show the user what changed, with any `auth` value redacted.
 
-### 4a. A bare-string `internal.utility` (every 3.13 user)
+### 4a. A bare-string or missing `internal.utility`
 
 ```json
 "internal": { "utility": "qwen/qwen3-4b-instruct-2507" }
@@ -97,10 +107,14 @@ becomes
 "internal": { "utility": { "id": "qwen/qwen3-4b-instruct-2507", "n_ctx": 68000 } }
 ```
 
+**A home may have no `internal.utility` at all.** Then this step is registering one, and both the model and the window are the user's call. One home chose `qwen/qwen3-4b-2507` at `32768`. The model must be downloaded and loadable in LM Studio (`lms ls` lists it); doctor's `utility model` row warns when the registered model is not loaded.
+
 **Judgment: ask for `n_ctx`.** It is the window the utility model loads at. A good default is the window most of the user's profiles already load that model at; `lms ps` shows what it is loaded at right now. Until this is fixed, compaction is off on every dispatch and radio cannot route.
 
 ```bash
 jq --argjson n 68000 '.internal.utility |= (if type == "string" then {id: ., n_ctx: $n} else . end)' profiles.json > profiles.json.new
+# no internal.utility yet: register one
+jq --arg id "MODEL-ID" --argjson n 32768 '.internal.utility //= {id: $id, n_ctx: $n}' profiles.json > profiles.json.new
 ```
 
 ### 4b. An inline `endpoint` object on a model
@@ -145,11 +159,11 @@ jq 'del(.hooks, .crews) | del(.profiles[].models[].role)' profiles.json > profil
 
 Any other key doctor names as unknown: it prints the closest valid key. Rename or delete exactly as it says.
 
-After this step, `darkmux doctor` should load `profiles.json`. If a row still fails, read it: the loader stops at the first problem, so repeat 4a to 4c for what it now names.
+After this step, `darkmux doctor` should load `profiles.json`. If a row still fails, read it and repeat 4a to 4c for what it now names.
 
 ## Step 5: Lab runs
 
-Doctor's row `lab runs location` fails when `<root>/runs` still holds runs; 4.0 reads `<root>/lab`. Run the exact `mv` it prints, which is `mv -n <root>/runs <root>/lab` and only correct when `lab` does not exist. When runs are on both sides, doctor warns and prints a merge command instead; use that.
+Doctor's row `lab runs location` fails when `<root>/runs` still holds runs; 4.0 reads `<root>/lab`. Run the exact command it prints: `mv -n <root>/runs <root>/lab`, or `rmdir <root>/lab && mv -n <root>/runs <root>/lab` when an empty `lab` already exists. When runs are on both sides, doctor warns and prints a merge command instead; use that.
 
 ## Step 6: The old `crew/` layout
 
@@ -212,8 +226,8 @@ darkmux doctor
 The retired-state failures should be gone. What remains falls into two groups; report both and leave them to the user:
 
 - **Not an upgrade blocker, the user's call:** temp-directory residue, stale skills (`darkmux init` refreshes them), the roster's loopback address or identity, state-file permissions, legacy audit files, stray hook outboxes, a Redis password.
-- **Clears when another machine upgrades:** the row `retired work queue` fails while a 3.x peer daemon is still consuming the retired Redis queue. Nothing on this machine fixes it.
+- **A 3.x daemon still consuming the retired queue:** the row `retired work queue` fails while one is. The consumer can be another machine, or this machine's own 3.x daemon: check the consumer names in the row, and stopping this machine's 3.x `darkmux serve` is then the fix. Setting `redis.enabled` to false hides the row while the hole is still open, so do not use it to make the row go away.
 
 End with a short report: the backup path, each file changed, the judgments the user made (window size, endpoint ids), anything left as `LEFTOVERS`, and the `darkmux doctor` summary line. Do not paste any credential, machine uid, or tailnet name into it.
 
-To undo everything, restore from the backup: `mv "$ROOT" "$ROOT.failed"` then `cp -c -R "$ROOT.backup-<date>" "$ROOT"`. The user decides when the backup is deleted.
+To undo everything, restore from the backup: `mv -n "$ROOT" "$ROOT.failed"` then `cp -c -R "$ROOT.backup-<date>" "$ROOT"`. The user decides when the backup is deleted.

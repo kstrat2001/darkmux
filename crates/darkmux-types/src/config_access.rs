@@ -2262,10 +2262,10 @@ impl LabDirState {
         match self {
             LabDirState::Current => None,
             LabDirState::MovePending { from, to, onto_empty_dir: false } => {
-                Some(format!("mv {} {}", q(from), q(to)))
+                Some(format!("mv -n {} {}", q(from), q(to)))
             }
             LabDirState::MovePending { from, to, onto_empty_dir: true } => {
-                Some(format!("rmdir {} && mv {} {}", q(to), q(from), q(to)))
+                Some(format!("rmdir {} && mv -n {} {}", q(to), q(from), q(to)))
             }
             // Entry by entry, `-n` so a run id present on both sides is
             // skipped rather than overwritten; `rmdir` then fails loudly on
@@ -3581,7 +3581,7 @@ mod tests {
         let state = lab_dir_state_in(&lab, &lab);
         assert_eq!(state, LabDirState::MovePending { from: root.join("runs"), to: lab.clone(), onto_empty_dir: false });
         let want = format!(
-            "mv {} {}",
+            "mv -n {} {}",
             crate::shell::quote(&root.join("runs").display().to_string()),
             crate::shell::quote(&lab.display().to_string())
         );
@@ -3699,7 +3699,7 @@ mod tests {
         std::fs::create_dir_all(&lab).unwrap();
         let state = lab_dir_state_in(&lab, &lab);
         let q = |p: &std::path::Path| crate::shell::quote(&p.display().to_string());
-        let want = format!("rmdir {} && mv {} {}", q(&lab), q(&from), q(&lab));
+        let want = format!("rmdir {} && mv -n {} {}", q(&lab), q(&from), q(&lab));
         assert_eq!(state.command().as_deref(), Some(want.as_str()));
         assert!(require_state_current(&state).is_err(), "the lab verbs refuse until it has run");
         // Recovery: running the printed command settles it.

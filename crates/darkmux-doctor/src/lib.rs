@@ -14294,7 +14294,7 @@ mod tests {
         let check = lab_dir_location_check(&state);
         assert_eq!(check.status, Status::Fail, "{}", check.message);
         assert!(check.message.contains("/r/runs") && check.message.contains("/r/lab"), "{}", check.message);
-        assert_eq!(check.hint.as_deref(), Some("mv /r/runs /r/lab"));
+        assert_eq!(check.hint.as_deref(), Some("mv -n /r/runs /r/lab"));
     }
 
     #[test]
@@ -14307,7 +14307,7 @@ mod tests {
         };
         let check = lab_dir_location_check(&state);
         assert_eq!(check.status, Status::Fail, "{}", check.message);
-        assert_eq!(check.hint.as_deref(), Some("rmdir /r/lab && mv /r/runs /r/lab"));
+        assert_eq!(check.hint.as_deref(), Some("rmdir /r/lab && mv -n /r/runs /r/lab"));
     }
 
     #[test]
