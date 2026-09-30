@@ -793,7 +793,7 @@ pub(crate) fn fleet_submission_doctor_checks() -> Vec<crate::doctor::Check> {
         trusted,
         retired_streams: retired.0,
         queue_consumers: retired.1,
-        daemon_token_set: daemon_health().and_then(|h| h.get("fleet_token_set")?.as_bool()),
+        daemon_token_set: daemon_token_set(),
         daemon_listener_state: if listener_enabled && listener_bound != Some(true) {
             daemon_listener_state()
         } else {
@@ -817,6 +817,12 @@ pub(crate) fn fleet_submission_doctor_checks() -> Vec<crate::doctor::Check> {
 /// (`/health`'s `fleet_listener`), when it answers within 500 ms.
 fn daemon_listener_state() -> Option<String> {
     daemon_health()?.get("fleet_listener").and_then(|s| s.as_str()).map(str::to_string)
+}
+
+/// Whether the local daemon reports a fleet token in its own environment
+/// (`/health`'s `fleet_token_set`), when it answers within 500 ms.
+fn daemon_token_set() -> Option<bool> {
+    daemon_health()?.get("fleet_token_set")?.as_bool()
 }
 
 /// The local daemon's `/health`, when it answers within 500 ms.
