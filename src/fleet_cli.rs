@@ -1639,6 +1639,76 @@ mod tests {
         assert!(!msg.contains("tailscale serve"), "{msg}");
     }
 
+    fn studio_entry() -> fleet::MachineEntry {
+        fleet::MachineEntry {
+            id: "studio".into(),
+            address: "100.64.0.2".into(),
+            description: None,
+            added_unix_ms: 1,
+            machine_uid: None,
+            loopback_intended: false,
+            node_id: None,
+            extras: Default::default(),
+        }
+    }
+
+    fn overlay_provider() -> fleet::StaticIdentityProvider {
+        fleet::StaticIdentityProvider {
+            local: fleet::test_node("nLAPTOP", "laptop", "100.64.0.7"),
+            peers: vec![fleet::test_node("nSTUDIO", "studio", "100.64.0.2")],
+            down: None,
+        }
+    }
+
+    /// The promise: `machine status <id>` / `resources <id>` send the token
+    /// only after the peer's first-contact pin is in the roster.
+    #[test]
+    #[serial_test::serial]
+    fn a_first_contact_read_pins_the_peer_in_the_roster() {
+        let tmp = isolated_add_env("laptop");
+        fleet::mutate_roster(|r| {
+            r.machines.insert("studio".into(), studio_entry());
+            Ok(())
+        })
+        .unwrap();
+        let target = peer_target_with(&studio_entry(), Some("laptop"), &overlay_provider()).map_err(|e| format!("{e:#}"));
+        let pinned = fleet::load_roster().unwrap().machines["studio"].node_id.clone();
+        clear_add_env();
+        drop(tmp);
+        assert_eq!(target.unwrap().node_id(), Some("nSTUDIO"));
+        assert_eq!(pinned.as_deref(), Some("nSTUDIO"), "the pin was written before the target was handed out");
+    }
+
+    /// Fail closed: a roster that cannot be written yields no target, so no
+    /// token can be attached.
+    #[test]
+    #[serial_test::serial]
+    fn an_unwritable_roster_yields_no_token_bearing_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, "a file, not a directory").unwrap();
+        unsafe { std::env::set_var("DARKMUX_FLEET_FILE", blocker.join("fleet.json")) };
+        let out = peer_target_with(&studio_entry(), Some("laptop"), &overlay_provider());
+        clear_add_env();
+        assert!(out.is_err(), "an unpinnable peer must not become a target");
+    }
+
+    /// Recovery: an entry the roster already pins needs no write, so a
+    /// read-only roster still reads it.
+    #[test]
+    #[serial_test::serial]
+    fn an_already_pinned_peer_needs_no_roster_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, "a file, not a directory").unwrap();
+        unsafe { std::env::set_var("DARKMUX_FLEET_FILE", blocker.join("fleet.json")) };
+        let mut e = studio_entry();
+        e.node_id = Some("nSTUDIO".into());
+        let out = peer_target_with(&e, Some("laptop"), &overlay_provider());
+        clear_add_env();
+        assert_eq!(out.map_err(|e| format!("{e:#}")).unwrap().node_id(), Some("nSTUDIO"));
+    }
+
 }
 
 #[cfg(test)]
