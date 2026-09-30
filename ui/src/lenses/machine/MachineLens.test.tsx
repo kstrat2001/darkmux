@@ -1,3 +1,4 @@
+import type { BatteryCharge } from "../../types/generated/BatteryCharge";
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { render, screen, waitFor, cleanup, act } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -714,7 +715,7 @@ const LOAD_WITH_EXTRAS = {
     gpu_mem_bytes: null,
     thermal: { state: "fair", cpu_speed_limit_pct: 87 },
     power_mw: null,
-    battery: { charge_pct: 78, on_ac: false, charging: false, minutes_to_empty: 130 },
+    battery: { charge_pct: 78, on_ac: false, charging: false, state: "discharging", minutes_to_empty: 130 },
   },
   window: {
     samples: 3,
@@ -823,12 +824,18 @@ describe("MachineLens — battery surfaces (#2821, lens only)", () => {
   //    the reversed ramp (red empty -> green full) carries that
   //    continuously, state-invariant (same on AC or discharging). ───────
 
-  function machineWithBattery(battery: { charge_pct: number; on_ac: boolean; charging: boolean; minutes_to_empty?: number | null }) {
+  function machineWithBattery(battery: {
+    charge_pct: number;
+    on_ac: boolean;
+    charging: boolean;
+    state?: BatteryCharge["state"];
+    minutes_to_empty?: number | null;
+  }) {
     return {
       specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max" },
       resources: {
         ...RESOURCES,
-        load: { ...LOAD_WITH_EXTRAS, now: { ...LOAD_WITH_EXTRAS.now, battery: { minutes_to_empty: null, ...battery } } },
+        load: { ...LOAD_WITH_EXTRAS, now: { ...LOAD_WITH_EXTRAS.now, battery: { state: "unknown", minutes_to_empty: null, ...battery } } },
       },
     };
   }
@@ -894,6 +901,29 @@ describe("MachineLens — battery surfaces (#2821, lens only)", () => {
     const icon = container.querySelector(".battery-bar-icon")!;
     expect(icon).not.toBeNull();
     expect(icon.textContent).toContain("🔌");
+  });
+
+  it("held: a marker at the held level and a labeled tooltip; the other states draw neither", async () => {
+    mockMachineFetch(machineWithBattery({ charge_pct: 80, on_ac: true, charging: false, state: "held" }));
+    const { container } = renderMachine(null);
+    await waitFor(() => expect(screen.getByText("80%")).toBeInTheDocument());
+    const mark = container.querySelector(".battery-bar-hold")!;
+    expect(mark).not.toBeNull();
+    // BATTERY_FILL_X (5) + 80% of the 44-unit fill width.
+    expect(Number(mark.getAttribute("x1"))).toBeCloseTo(5 + 0.8 * 44, 5);
+    const label = container.querySelector(".battery-bar-held")!;
+    expect(label.textContent).toBe("held");
+    expect(label.getAttribute("title")).toBe("Held at 80% by macOS (charge limit): plugged in, not charging");
+    cleanup();
+
+    for (const state of ["charging", "discharging", "full", "unknown"] as const) {
+      mockMachineFetch(machineWithBattery({ charge_pct: 80, on_ac: true, charging: state === "charging", state }));
+      const r = renderMachine(null);
+      await waitFor(() => expect(screen.getByText("80%")).toBeInTheDocument());
+      expect(r.container.querySelector(".battery-bar-hold"), state).toBeNull();
+      expect(r.container.querySelector(".battery-bar-held"), state).toBeNull();
+      cleanup();
+    }
   });
 
   it("no icon while discharging", async () => {

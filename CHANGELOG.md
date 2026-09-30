@@ -1157,6 +1157,13 @@ darkmux release.
 
 ### Added (4.0)
 
+- **The machine lens battery shows when macOS is holding the charge.** A battery reading now
+  carries a typed `state` (`charging`, `held`, `discharging`, `full`, `unknown`) beside `on_ac` and
+  `charging`, on the `machine.telemetry` and `machine.battery` payloads and the `load.now.battery` block
+  of `/machine/resources`. `held` means observed: on AC, not charging, not full, current about zero.
+  The configured limit percent is not readable, so none is reported. The graphic marks the held level
+  and labels it "held"; its size does not change.
+
 - **Radio's answering seat can run on a fleet peer.** Set `radio.answerer_profile`
   (or `role_profiles.radio-host`) to `<profile>@<machine>` and the seat's dispatch
   is submitted to that machine, which runs it on its own profile; the peer must

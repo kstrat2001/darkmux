@@ -57,6 +57,26 @@ pub struct PowerNow {
     pub total: i64,
 }
 
+/// What a battery is doing right now, from observed facts only.
+///
+/// `Held` is on AC, not charging, not full, with current about zero: macOS is holding the level
+/// (Optimized Battery Charging or a charge limit). It is a description of what was observed. The
+/// configured limit percent is not readable, so none is stated; the level being held is the
+/// reading's own `charge_pct`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
+#[serde(rename_all = "snake_case")]
+pub enum ChargeState {
+    Charging,
+    Held,
+    Discharging,
+    Full,
+    /// Facts missing or contradictory; also what a newer producer's unrecognized state reads as.
+    #[serde(other)]
+    Unknown,
+}
+
 /// One battery CHARGE reading. The whole object is `null` on a machine with no
 /// battery. `minutes_to_empty` is `null` on AC, while charging, and whenever
 /// the OS declines to estimate; never a synthesized zero.
@@ -67,6 +87,8 @@ pub struct BatteryCharge {
     pub charge_pct: u8,
     pub on_ac: bool,
     pub charging: bool,
+    /// What the pack is doing, derived once by the probe from the facts it observed.
+    pub state: ChargeState,
     pub minutes_to_empty: Option<u32>,
 }
 
@@ -386,5 +408,22 @@ pub struct MachineRollupPayload {
 impl Attribution for MachineRollupPayload {
     fn host_source_slot(&mut self) -> Option<&mut Option<String>> {
         Some(&mut self.simulated_host_source)
+    }
+}
+
+#[cfg(test)]
+mod charge_state_tests {
+    use super::ChargeState;
+
+    #[test]
+    fn charge_state_spells_snake_case_on_the_wire() {
+        assert_eq!(serde_json::to_string(&ChargeState::Held).unwrap(), "\"held\"");
+        assert_eq!(serde_json::to_string(&ChargeState::Discharging).unwrap(), "\"discharging\"");
+    }
+
+    #[test]
+    fn an_unrecognized_state_reads_as_unknown_not_an_error() {
+        let s: ChargeState = serde_json::from_str("\"trickle\"").unwrap();
+        assert_eq!(s, ChargeState::Unknown);
     }
 }

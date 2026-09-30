@@ -1237,6 +1237,7 @@ pub(crate) fn spawn(
 mod tests {
     use super::*;
     use darkmux_crew::host_probe::battery::HOUR_MS;
+    use darkmux_crew::host_probe::ChargeState;
     use darkmux_crew::host_probe::{CpuCluster, PowerSample, ThermalSample};
     use std::time::Instant;
     use tempfile::TempDir;
@@ -1264,7 +1265,13 @@ mod tests {
     // ── #2705: battery charge transitions + the hourly health cadence ──
 
     fn battery_at(pct: u8, on_ac: bool) -> BatterySample {
-        BatterySample { charge_pct: pct, on_ac, charging: on_ac, minutes_to_empty: None }
+        BatterySample {
+            charge_pct: pct,
+            on_ac,
+            charging: on_ac,
+            state: if on_ac { ChargeState::Charging } else { ChargeState::Discharging },
+            minutes_to_empty: None,
+        }
     }
 
     fn sample_with_battery(b: Option<BatterySample>) -> HostSampleFull {
@@ -1577,6 +1584,7 @@ mod tests {
                 charge_pct: 42,
                 on_ac: false,
                 charging: false,
+                state: ChargeState::Discharging,
                 minutes_to_empty: None,
             })),
         });
@@ -1676,7 +1684,8 @@ mod tests {
                     charge_pct: 73,
                     on_ac: false,
                     charging: false,
-                    minutes_to_empty: Some(184),
+                    state: ChargeState::Discharging,
+                minutes_to_empty: Some(184),
                 }),
             },
         };

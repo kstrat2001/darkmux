@@ -65,7 +65,7 @@ impl From<&PowerSample> for PowerNow {
 
 impl From<&BatterySample> for BatteryCharge {
     fn from(b: &BatterySample) -> Self {
-        Self { charge_pct: b.charge_pct, on_ac: b.on_ac, charging: b.charging, minutes_to_empty: b.minutes_to_empty }
+        Self { charge_pct: b.charge_pct, on_ac: b.on_ac, charging: b.charging, state: b.state, minutes_to_empty: b.minutes_to_empty }
     }
 }
 

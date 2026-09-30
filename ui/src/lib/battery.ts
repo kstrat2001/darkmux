@@ -53,9 +53,18 @@ export function batteryIcon(b: BatteryCharge): BatteryIconKind {
  * what arrives, in words. */
 export function batteryStateText(b: BatteryCharge): string {
   if (b.charging) return "charging";
+  if (b.state === "held") return `held at ${b.charge_pct}% by macOS, on AC, not charging`;
   if (b.on_ac) return "on AC, not charging";
   const time = b.minutes_to_empty != null ? `, ${fmtHm(b.minutes_to_empty)} left` : "";
   return `on battery${time}`;
+}
+
+/** The hover text for the `held` marker, or `null` in every other state. "Held" is the probe's
+ * observation (on AC, not charging, not full, current about zero); the configured limit percent
+ * is not readable, so the text names the level the pack is sitting at and nothing else. */
+export function batteryHeldTitle(b: BatteryCharge): string | null {
+  if (b.state !== "held") return null;
+  return `Held at ${b.charge_pct}% by macOS (charge limit): plugged in, not charging`;
 }
 
 /** The ONLY visible text the battery meter still carries for its power

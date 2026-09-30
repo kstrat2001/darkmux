@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   batteryAriaLabel,
   batteryFillWidth,
+  batteryHeldTitle,
   batteryIcon,
   batteryRampStops,
   batteryStateText,
@@ -15,7 +16,7 @@ import type { BatteryHealthNow } from "../types/generated/BatteryHealthNow";
 import type { BatteryCharge } from "../types/generated/BatteryCharge";
 
 function sample(over: Partial<BatteryCharge> = {}): BatteryCharge {
-  return { charge_pct: 78, on_ac: false, charging: false, minutes_to_empty: 130, ...over };
+  return { charge_pct: 78, on_ac: false, charging: false, state: "discharging", minutes_to_empty: 130, ...over };
 }
 
 function health(over: Partial<BatteryHealthNow> = {}): BatteryHealthNow {
@@ -51,6 +52,26 @@ describe("batteryIcon", () => {
   });
   it("no icon while discharging", () => {
     expect(batteryIcon(sample({ on_ac: false, charging: false }))).toBeNull();
+  });
+});
+
+describe("held state (macOS holding the charge level)", () => {
+  const held = sample({ charge_pct: 80, on_ac: true, charging: false, state: "held", minutes_to_empty: null });
+
+  it("names the held level in the tooltip, and never states a limit it did not observe", () => {
+    expect(batteryHeldTitle(held)).toBe("Held at 80% by macOS (charge limit): plugged in, not charging");
+  });
+  it("is null for every other state, so nothing claims a hold it did not see", () => {
+    for (const state of ["charging", "discharging", "full", "unknown"] as const) {
+      expect(batteryHeldTitle(sample({ on_ac: true, state }))).toBeNull();
+    }
+  });
+  it("the accessible name says held, and keeps the plug icon", () => {
+    expect(batteryAriaLabel(held)).toBe("battery 80%, held at 80% by macOS, on AC, not charging");
+    expect(batteryIcon(held)).toBe("plug");
+  });
+  it("an on-AC reading that is not held keeps the old wording", () => {
+    expect(batteryStateText(sample({ on_ac: true, state: "unknown" }))).toBe("on AC, not charging");
   });
 });
 

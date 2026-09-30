@@ -66,6 +66,7 @@ import type { PresenceBeat } from "../types/generated/PresenceBeat";
 import {
   batteryAriaLabel,
   batteryFillWidth,
+  batteryHeldTitle,
   batteryIcon,
   batteryRampStops,
   batteryTimeLeftText,
@@ -485,10 +486,18 @@ const BATTERY_ICON_CY = BATTERY_BODY_Y + BATTERY_BODY_H / 2 + 4;
  *    against any color the gradient happens to show underneath it, and a
  *    `<title>` for mouse hover; the outer `<svg>`'s `aria-label`
  *    (`batteryAriaLabel`) states the same fact in words for a screen
- *    reader, which never sees the decorative (`aria-hidden`) glyph. */
+ *    reader, which never sees the decorative (`aria-hidden`) glyph.
+ * 5. (operator, 2026-09-30: "the charge limit could be shown on the
+ *    battery graphic") A `held` reading (macOS holding the level: on AC,
+ *    not charging, not full) also draws a thin marker at the fill's end
+ *    (`.battery-bar-hold`) and a short "held" label after the percent.
+ *    Both sit inside the existing rows: the glyph's viewBox and the row's
+ *    height are unchanged. */
 function BatteryBar({ sample }: { sample: BatteryCharge }) {
   const fillW = batteryFillWidth(sample.charge_pct, BATTERY_FILL_MAX_W);
   const icon = batteryIcon(sample);
+  const heldTitle = batteryHeldTitle(sample);
+  const holdX = BATTERY_FILL_X + (fillW ?? 0);
   return (
     <div className="battery-bar-row">
       <svg
@@ -524,6 +533,11 @@ function BatteryBar({ sample }: { sample: BatteryCharge }) {
             rx={BATTERY_FILL_RX}
           />
         )}
+        {heldTitle && fillW != null && (
+          <line className="battery-bar-hold" x1={holdX} x2={holdX} y1={BATTERY_BODY_Y + 2} y2={BATTERY_BODY_Y + BATTERY_BODY_H - 2}>
+            <title>{heldTitle}</title>
+          </line>
+        )}
         {icon && (
           <text className="battery-bar-icon" x={BATTERY_ICON_CX} y={BATTERY_ICON_CY} textAnchor="middle" aria-hidden="true">
             <title>{icon === "bolt" ? "charging" : "on AC"}</title>
@@ -536,6 +550,11 @@ function BatteryBar({ sample }: { sample: BatteryCharge }) {
           page uses, formatted with the SAME `fmtPct` this span always
           used. */}
       <span className="battery-bar-pct">{useCountUp(sample.charge_pct, fmtPct)}</span>
+      {heldTitle && (
+        <span className="battery-bar-held" title={heldTitle}>
+          held
+        </span>
+      )}
     </div>
   );
 }

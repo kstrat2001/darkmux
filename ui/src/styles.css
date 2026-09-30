@@ -8038,6 +8038,19 @@ body {
   stroke: var(--fg);
   stroke-width: 0.6px;
 }
+/* A `held` reading: a thin marker at the level macOS is holding the charge at. Drawn over the
+   fill in the page's own foreground so it reads against any point on the ramp. */
+.battery-bar-hold {
+  stroke: var(--fg);
+  stroke-width: 2px;
+  stroke-linecap: round;
+}
+.battery-bar-held {
+  font: 600 calc(11px * var(--fs-scale))/1.2 var(--font-mono);
+  color: var(--info);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
 .battery-bar-pct {
   font: 700 calc(15px * var(--fs-scale))/1.2 var(--font-mono);
   color: var(--fg);
