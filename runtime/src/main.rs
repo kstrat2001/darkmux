@@ -25,6 +25,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 mod compaction;
+mod compaction_repeat;
 mod cycle_detector;
 mod detection;
 mod failure_rate;

@@ -1149,6 +1149,14 @@ darkmux release.
 
 ### Fixed (4.0)
 
+- **A compaction loop that never stops is now bounded (#3013).** When every
+  compaction succeeds but the turn after each one re-reads exactly what the
+  turn before it read, no occupancy counter grew and the run went on until
+  `max_turns` (uncapped by default). After five such compactions in a row the
+  run now escalates with `result: "escalation_compaction_reread_loop"`, the
+  same graceful hand-off as `escalation_compaction_unproductive`. Only
+  read-only tools count, and any turn that reads something else, edits, or
+  runs a command ends the run of repeats.
 - **A turn the runtime ended now counts toward the run's tokens and its cap.**
   A call cut by the degeneracy gate or a silent stream never receives the
   endpoint's usage, so its tokens were dropped from the totals and the

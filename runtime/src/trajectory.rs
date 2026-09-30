@@ -23,6 +23,15 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use crate::lmstudio::ToolCall;
 use darkmux_trajectory::UsageCounts;
 
+/// What one model call's tokens are known as: the endpoint's own count, and
+/// the runtime's estimate for a call it cut (which never receives a count).
+/// The two are never merged: an estimate is not a reported figure.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CallTokens<'a> {
+    pub reported: Option<&'a UsageCounts>,
+    pub estimate: Option<u64>,
+}
+
 /// Container mount point for darkmux's OWN bookkeeping — SEPARATE from
 /// /workspace so the runtime never writes its logs into the tree it's
 /// operating on. dispatch_internal mounts a host tempdir here. An
@@ -178,7 +187,7 @@ impl Trajectory {
         &mut self,
         seq: u32,
         finish_reason: &str,
-        usage: Option<&UsageCounts>,
+        tokens: CallTokens<'_>,
         tool_calls: Option<&[ToolCall]>,
         // (#2963) Aligned with `tool_calls`: whether each call will run
         // (`loop_runner::plan_tool_calls`). A call that will not is marked
@@ -186,9 +195,6 @@ impl Trajectory {
         // marks (a caller with no plan).
         runs: Option<&[bool]>,
         reported_model: Option<&str>,
-        // (B1) The runtime's own estimate of a call it cut, which has no
-        // endpoint `usage`. Never a reported count.
-        completion_estimate: Option<u64>,
     ) {
         let tool_calls = tool_calls.map(|calls| {
             calls
@@ -208,7 +214,7 @@ impl Trajectory {
             seq: u64::from(seq),
             ts: unix_ms(),
             finish_reason: finish_reason.to_string(),
-            usage: usage.map(dt::Usage::from),
+            usage: tokens.reported.map(dt::Usage::from),
             tool_calls,
             // (#2902 step 1b) The model the server says answered this turn,
             // so the host's per-turn usage record can carry
@@ -216,7 +222,7 @@ impl Trajectory {
             reported_model: reported_model.map(str::to_string),
             // (#2963) The calls carry their `runs` marks: the host lists them.
             calls_planned: runs.is_some(),
-            completion_estimate,
+            completion_estimate: tokens.estimate,
         }));
     }
 
@@ -1438,7 +1444,7 @@ mod tests {
         let ws = tempfile::Builder::new().prefix("traj-test-2").tempdir().unwrap();
         let mut t = Trajectory::open(ws.path());
         t.append_dispatch_start("test-model", 100, 50, &["read", "search"]);
-        t.append_model_completed(1, "stop", None, None, None, None, None);
+        t.append_model_completed(1, "stop", CallTokens::default(), None, None, None);
         drop(t);
 
         let traj_file = ws
@@ -1486,7 +1492,7 @@ mod tests {
         ];
         let ws = tempfile::Builder::new().prefix("traj-paths").tempdir().unwrap();
         let mut t = Trajectory::open(ws.path());
-        t.append_model_completed(1, "tool_calls", None, Some(&calls), None, None, None);
+        t.append_model_completed(1, "tool_calls", CallTokens::default(), Some(&calls), None, None);
         drop(t);
 
         let body = fs::read_to_string(ws.path().join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE)).unwrap();
@@ -1524,8 +1530,8 @@ mod tests {
         }];
         let ws = tempfile::Builder::new().prefix("traj-planned").tempdir().unwrap();
         let mut t = Trajectory::open(ws.path());
-        t.append_model_completed(1, "tool_calls", None, Some(&calls), Some(&[false]), None, None);
-        t.append_model_completed(2, "tool_calls", None, Some(&calls), None, None, None);
+        t.append_model_completed(1, "tool_calls", CallTokens::default(), Some(&calls), Some(&[false]), None);
+        t.append_model_completed(2, "tool_calls", CallTokens::default(), Some(&calls), None, None);
         drop(t);
         let body = fs::read_to_string(ws.path().join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE)).unwrap();
         let lines: Vec<serde_json::Value> = body.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
@@ -1552,12 +1558,12 @@ mod tests {
             reasoning: Some(500),
             cached: Some(20),
         };
-        t.append_model_completed(1, "stop", Some(&usage), None, None, None, None);
+        t.append_model_completed(1, "stop", CallTokens { reported: Some(&usage), estimate: None }, None, None, None);
 
         // A second turn whose provider reported NO details object at all —
         // both keys must be JSON `null`, never a fabricated `0`.
         let bare = UsageCounts { prompt: Some(10), completion: Some(2), total: Some(12), ..Default::default() };
-        t.append_model_completed(2, "stop", Some(&bare), None, None, None, None);
+        t.append_model_completed(2, "stop", CallTokens { reported: Some(&bare), estimate: None }, None, None, None);
         drop(t);
 
         let body =
@@ -1848,8 +1854,8 @@ mod tests {
     fn model_completed_carries_the_reported_model_only_when_known() {
         let ws = tempfile::Builder::new().prefix("traj-reported").tempdir().unwrap();
         let mut t = Trajectory::open(ws.path());
-        t.append_model_completed(1, "stop", None, None, None, Some("served-a"), None);
-        t.append_model_completed(2, "stop", None, None, None, None, None);
+        t.append_model_completed(1, "stop", CallTokens::default(), None, None, Some("served-a"));
+        t.append_model_completed(2, "stop", CallTokens::default(), None, None, None);
         drop(t);
         let body =
             fs::read_to_string(ws.path().join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE)).unwrap();

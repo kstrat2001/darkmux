@@ -290,6 +290,13 @@ const STALE_PROMPT_TOKENS_TURNS: u32 = 3;
 /// compactions across 50 turns.
 const UNPRODUCTIVE_COMPACTION_TURNS: u32 = 5;
 
+/// (#3013) Consecutive compactions whose next turn re-reads what the turn
+/// before it read, before the run escalates. The same five as
+/// [`UNPRODUCTIVE_COMPACTION_TURNS`], for the same reason: one or two repeats
+/// are ordinary (the model needs a file it just lost from context); five in a
+/// row is a shape.
+const COMPACTION_REREAD_TURNS: u32 = 5;
+
 /// (#2792) Smallest tool-result body the LAST-RESORT pre-send trim will touch.
 ///
 /// Deliberately far below the soft path's 4,000-byte threshold. That constant
@@ -402,6 +409,14 @@ pub enum EscalationReason {
     /// is busy. This is the one that does not need the operator to have
     /// predicted the failure in advance.
     CompactionUnproductive,
+    /// (#3013) Every compaction succeeds, and the turn after each one
+    /// inspects exactly what the turn before it did: the model re-reads the
+    /// files the summary told it not to. Distinct from
+    /// [`CompactionUnproductive`], which needs the thread to stay above the
+    /// trigger; here each compaction is productive and the loop is in the
+    /// WORK, so no occupancy counter ever grows. Fires after
+    /// [`COMPACTION_REREAD_TURNS`] consecutive repeats.
+    CompactionRereadLoop,
     /// (#414 PR A) Intra-turn stall recovery budget
     /// ([`MAX_STALL_RECOVERIES`], operator-overridable via
     /// `runtime.max_stall_recoveries` — #2190) exhausted. Fires when the
@@ -470,6 +485,7 @@ pub fn escalation_reason_str(reason: EscalationReason) -> &'static str {
     match reason {
         EscalationReason::CompactionLimitReached => "escalation_compaction_limit_reached",
         EscalationReason::CompactionUnproductive => "escalation_compaction_unproductive",
+        EscalationReason::CompactionRereadLoop => "escalation_compaction_reread_loop",
         EscalationReason::CumulativeTokensExceeded => "escalation_cumulative_tokens_exceeded",
         EscalationReason::IntraTurnStallExhausted => "escalation_intra_turn_stall_exhausted",
         // (#2190) Deliberately NOT `..._exhausted` — the issue's own spec
@@ -584,6 +600,31 @@ fn resolve_turn_delay_ms(configured_ms: u64, budget_secs: u64) -> (u64, Option<S
 /// A reported token count as the loop's `u32` counters hold it.
 fn saturating_u32(n: u64) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+/// (#3013) Announce the re-read loop escalation: the operator-visible line
+/// and the `EscalationTriggered` trajectory record. The caller returns the
+/// `LoopOutcome`, carrying every banked turn out as the other compaction
+/// bounds do.
+fn announce_reread_loop(
+    trajectory: &mut Trajectory,
+    turns: u32,
+    repeats: u32,
+    model: &str,
+    latest_prompt_tokens: u32,
+) {
+    eprintln!(
+        "darkmux-runtime: {repeats} compactions in a row were followed by a turn that \
+         re-read exactly what the turn before the compaction read. Each compaction \
+         succeeds and each re-read refills the context, so the run cannot converge. \
+         ESCALATING to the frontier rather than repeating the loop. (#3013)"
+    );
+    trajectory.append_escalation_triggered(
+        turns,
+        escalation_reason_str(EscalationReason::CompactionRereadLoop),
+        model,
+        latest_prompt_tokens,
+    );
 }
 
 /// How the per-call-budget line names a turn's completion tokens: the
@@ -1879,6 +1920,7 @@ fn run_with_sleeper(
     // above the trigger. (#2805) No latch — reaching the bound escalates and
     // returns, so the episode cannot repeat within a dispatch.
     let mut consecutive_unproductive_compactions: u32 = 0;
+    let mut compaction_repeat = crate::compaction_repeat::CompactionRepeat::new();
 
     // (#2114) Reads + parses `pace.json` on demand (not once at startup
     // like `turn_delay_ms` below — the pace file is meant to change
@@ -3030,11 +3072,13 @@ fn run_with_sleeper(
         trajectory.append_model_completed(
             turns,
             &trajectory_finish_reason,
-            response.usage.as_ref(),
+            crate::trajectory::CallTokens {
+                reported: response.usage.as_ref(),
+                estimate: cut_estimate.map(u64::from),
+            },
             trajectory_tool_calls.as_deref(),
             Some(&call_runs),
             response.served_model(),
-            cut_estimate.map(u64::from),
         );
 
         // Take the first choice — LMStudio's OpenAI-compatible endpoint
@@ -3647,6 +3691,7 @@ fn run_with_sleeper(
                 // after it and stamp that onto a checkpoint — see the
                 // write at the bottom of this loop body.
                 let calls_snapshot = calls.clone();
+                compaction_repeat.record_turn(crate::compaction_repeat::inspected_set(&calls_snapshot));
                 for (tool_seq, call) in calls.into_iter().enumerate() {
                     // (#418) Record the call into the cycle detector
                     // BEFORE dispatch so the suspicion event lands
@@ -4214,6 +4259,30 @@ fn run_with_sleeper(
                                 final_answer: None,
                                 terminal_reason: TerminalReason::EscalationTriggered(
                                     EscalationReason::CompactionUnproductive,
+                                ),
+                                messages,
+                                turn_delay_effective_ms: turn_delay_ms,
+                                failed_to_run: failed_to_run.clone(),
+                            });
+                        }
+
+                        // (#3013) A compaction that succeeded is still a loop
+                        // when the turn after each one re-reads the turn
+                        // before it. The counter is fed at the top of every
+                        // tool turn; this is the only place it is read.
+                        compaction_repeat.compacted();
+                        if compaction_repeat.consecutive() >= COMPACTION_REREAD_TURNS {
+                            announce_reread_loop(
+                                trajectory,
+                                turns,
+                                compaction_repeat.consecutive(),
+                                model,
+                                latest_prompt_tokens,
+                            );
+                            return Ok(LoopOutcome {
+                                final_answer: None,
+                                terminal_reason: TerminalReason::EscalationTriggered(
+                                    EscalationReason::CompactionRereadLoop,
                                 ),
                                 messages,
                                 turn_delay_effective_ms: turn_delay_ms,
@@ -14824,9 +14893,12 @@ mod tests {
                 Some(serde_json::json!([{
                     "id": "call_1",
                     "type": "function",
+                    // `echo`, not `read`: a run that re-reads the same files
+                    // after every compaction is bounded on purpose (#3013),
+                    // and this test is about the compaction COUNT bound only.
                     "function": {
-                        "name": "read",
-                        "arguments": "{\"path\":\"/workspace/x.txt\",\"offset\":1,\"limit\":0}",
+                        "name": "echo",
+                        "arguments": "{\"text\":\"still working\"}",
                     },
                 }])),
                 "tool_calls",
@@ -14870,7 +14942,7 @@ mod tests {
             initial.push(Message::user(format!("padding user {i}: {pad}")));
             initial.push(Message::assistant(format!("padding assistant {i}: {pad}")));
         }
-        let tools = [Tool::Read];
+        let tools = [Tool::Echo];
 
         // Loop hits MAX_TURNS (mock loops forever). The key
         // assertion: terminal_reason must be MaxTurns, NOT
@@ -14886,6 +14958,144 @@ mod tests {
         assert!(
             crate::trajectory::recorded(tmp.path()).compactions() >= 1,
             "compaction still fires; bail just doesn't kick in"
+        );
+    }
+
+    /// The config both #3013 tests use: every compaction is PRODUCTIVE (a
+    /// short summary leaves the thread far under the trigger), so the
+    /// unproductive-compaction counter never grows.
+    fn productive_compaction_cfg() -> compaction::CompactionConfig {
+        compaction::CompactionConfig {
+            compactor_context_window: None,
+            threshold_tokens: 5_000,
+            compactor_model: Some("test-compactor".to_string()),
+            threshold_ratio: None,
+            context_window: None,
+            strategy: compaction::CompactionStrategy::Narrative,
+            bail_after_compactions: None,
+            custom_instructions: None,
+        }
+    }
+
+    /// Over the 200-char floor a compaction summary must clear to install,
+    /// and far under the trigger once installed.
+    const SHORT_SUMMARY: &str = "Summary of prior work: the four implementation files were read and understood. Their contents are captured in the plan above. Do not read them again; make the edits the plan calls for and run the tests to finish the task.";
+
+    fn read_call_json(path: &str) -> serde_json::Value {
+        serde_json::json!([{
+            "id": "call_1",
+            "type": "function",
+            "function": {
+                "name": "read",
+                "arguments": format!("{{\"path\":\"{path}\",\"offset\":1,\"limit\":0}}"),
+            },
+        }])
+    }
+
+    fn seeded_thread() -> Vec<Message> {
+        let filler = "seed content ".repeat(80);
+        (0..10)
+            .map(|i| {
+                if i == 0 {
+                    Message::system("test system")
+                } else {
+                    Message::user(format!("turn {i}: {filler}"))
+                }
+            })
+            .collect()
+    }
+
+    /// (#3013) Promise: a run whose post-compaction turns repeat the
+    /// pre-compaction work is bounded and escalated. The live shape: read the
+    /// same files, compact (productively, so #2807 never counts it), read the
+    /// same files again, forever. `max_turns` is 40; only the re-read
+    /// detector can end this run before it.
+    #[test]
+    #[serial_test::serial]
+    fn a_run_that_rereads_the_same_files_after_every_productive_compaction_escalates() {
+        let server = crate::test_support::GuardedMockServer::start();
+        let four_reads = serde_json::json!(["a", "b", "c", "d"].map(|f| serde_json::json!({
+            "id": format!("call_{f}"),
+            "type": "function",
+            "function": {"name": "read", "arguments": format!("{{\"path\":\"/workspace/{f}.txt\",\"offset\":1,\"limit\":0}}")},
+        })));
+        let _primary = server.mock(move |when, then| {
+            when.method(POST).path("/v1/chat/completions").body_contains("\"model\":\"test-primary\"");
+            then.status(200).json_body(chat_response_json(None, Some(four_reads.clone()), "tool_calls", 9_000, 50));
+        });
+        let compactor = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").body_contains("\"model\":\"test-compactor\"");
+            then.status(200).json_body(chat_response_json(Some(SHORT_SUMMARY), None, "stop", 500, 30));
+        });
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("reread-loop").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let outcome = run(
+            &client, &client, "test-primary", seeded_thread(), &[Tool::Read], &mut traj, false,
+            &productive_compaction_cfg(), Some(40), None, None, None, std::collections::BTreeMap::new(), None,
+        )
+        .expect("escalation is a graceful terminal, not an error");
+        assert_eq!(
+            outcome.terminal_reason,
+            TerminalReason::EscalationTriggered(EscalationReason::CompactionRereadLoop),
+        );
+        let recorded = crate::trajectory::recorded(tmp.path());
+        assert!(recorded.turns() <= 8, "bounded near the threshold, not max_turns: turns={}", recorded.turns());
+        assert!(compactor.hits() >= 5, "every compaction ran: {}", compactor.hits());
+        assert!(recorded.compactions() >= 5, "and INSTALLED: {}", recorded.compactions());
+        let raw = std::fs::read_to_string(tmp.path().join(".darkmux-runtime").join("trajectory.jsonl")).unwrap();
+        assert!(raw.contains("escalation_compaction_reread_loop"), "the reason is on the record");
+        assert!(!raw.contains("compaction.unproductive"), "each compaction was productive");
+    }
+
+    /// (#3013) The inverse: a run that compacts every turn but reads a NEW
+    /// file each time is making progress, and must not be escalated.
+    #[test]
+    #[serial_test::serial]
+    fn a_run_that_reads_new_files_after_each_compaction_is_not_escalated() {
+        let server = crate::test_support::GuardedMockServer::start();
+        // Turn i's request carries turn i-1's call in the preserved tail, so
+        // "mentions file i" picks the next file. Registered highest first:
+        // a body naming several files matches the newest one.
+        const FILES: usize = 9;
+        let mut mocks = Vec::new();
+        for i in (0..FILES).rev() {
+            let (needle, reply) = if i == 0 {
+                (String::new(), read_call_json("/workspace/f0.txt"))
+            } else {
+                (format!("/workspace/f{}.txt", i - 1), read_call_json(&format!("/workspace/f{i}.txt")))
+            };
+            let last = i == FILES - 1;
+            mocks.push(server.mock(move |when, then| {
+                let w = when.method(POST).path("/v1/chat/completions").body_contains("\"model\":\"test-primary\"");
+                if !needle.is_empty() {
+                    w.body_contains(&needle);
+                }
+                if last {
+                    then.status(200).json_body(chat_response_json(Some("done"), None, "stop", 9_000, 5));
+                } else {
+                    then.status(200).json_body(chat_response_json(None, Some(reply.clone()), "tool_calls", 9_000, 50));
+                }
+            }));
+        }
+        let compactor = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").body_contains("\"model\":\"test-compactor\"");
+            then.status(200).json_body(chat_response_json(Some(SHORT_SUMMARY), None, "stop", 500, 30));
+        });
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("reread-inverse").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let outcome = run(
+            &client, &client, "test-primary", seeded_thread(), &[Tool::Read], &mut traj, false,
+            &productive_compaction_cfg(), Some(40), None, None, None, std::collections::BTreeMap::new(), None,
+        )
+        .expect("the run completes");
+        let installed = crate::trajectory::recorded(tmp.path()).compactions();
+        assert!(installed >= 6, "the scenario must INSTALL compactions repeatedly: {installed} (compactor hits {})", compactor.hits());
+        assert_ne!(
+            outcome.terminal_reason,
+            TerminalReason::EscalationTriggered(EscalationReason::CompactionRereadLoop),
+            "new files after each compaction are progress"
         );
     }
 
