@@ -1,5 +1,5 @@
 import type { PresenceBeat } from "../types/generated/PresenceBeat";
-import type { NormRecord } from "./ingest";
+import { recordsAsOf, type NormRecord } from "./ingest";
 
 /**
  * THE machine identity module. Every viewer surface that decides WHICH
@@ -90,14 +90,16 @@ function recordsOfMachine(records: readonly NormRecord[], uid: string | null): N
 
 /** A machine page's records: the drilled machine's (`drilledKey` names one,
  *  `drilledUid` is what it resolved to, `null` while unresolved), else this
- *  machine's. */
+ *  machine's (`selfUid`), scoped to the playhead (`null`: the whole set). */
 export function machinePageRecords(
   records: readonly NormRecord[],
   drilledKey: string | null,
   drilledUid: string | null,
-  localUid: string | null,
+  selfUid: string | null,
+  playhead: number | null,
 ): NormRecord[] {
-  return recordsOfMachine(records, drilledKey != null ? drilledUid : localUid);
+  const own = recordsOfMachine(records, drilledKey != null ? drilledUid : selfUid);
+  return playhead === null ? own : recordsAsOf(own, playhead);
 }
 
 /** The uid this daemon reports for itself, once `/machine/specs` has answered. */

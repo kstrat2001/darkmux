@@ -1151,6 +1151,44 @@ describe("App", () => {
     }
   });
 
+  // (5.0 R2) A static build has no daemon specs and an empty live window, so the
+  // machine page's "self" is the machine fixture's own machine, found in the
+  // committed day.
+  it("(5.0 R2) a static build's machine page lists the fixture machine's records, not none and not everyone's", async () => {
+    const metas = [
+      ["darkmux-flow-src", "./demo-flow.jsonl"],
+      ["darkmux-machine-src", "./demo-machine.json"],
+    ].map(([name, content]) => {
+      const meta = document.createElement("meta");
+      meta.name = name;
+      meta.content = content;
+      document.head.appendChild(meta);
+      return meta;
+    });
+    window.location.hash = "#lens=machine&r2static";
+    const rec = (uid: string, name: string, sid: string) => ({ ts: "2026-08-26T10:00:00.000Z", machine_uid: uid, machine_id: name, session_id: sid, action: "dispatch.start", handle: "coder" });
+    const jsonl = [rec("UID-W", "Workstation", "s-w"), rec("UID-S", "Studio", "s-s1"), rec("UID-S", "Studio", "s-s2")].map((r) => JSON.stringify(r)).join("\n");
+    const machine = { specs: { machine_id: "Workstation", machine_uid: null }, resources: {} };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        const path = String(url);
+        if (path === "./demo-flow.jsonl") return Promise.resolve(new Response(jsonl, { status: 200 }));
+        if (path === "./demo-machine.json") return Promise.resolve(new Response(JSON.stringify(machine), { status: 200 }));
+        return Promise.resolve(new Response(JSON.stringify({ runs: [] }), { status: 200 }));
+      }),
+    );
+    try {
+      renderApp();
+      await waitFor(() => expect(document.querySelectorAll(".eventlog__rec").length).toBeGreaterThan(0));
+      expect(document.querySelectorAll(".eventlog__rec")).toHaveLength(1);
+      expect(document.getElementById("logbody")!.textContent).not.toContain("Studio");
+    } finally {
+      for (const m of metas) m.remove();
+      window.location.hash = "";
+    }
+  });
+
   it("(#2072) a static build never says 'waiting for a machine' — there is no daemon to wait for", async () => {
     const meta = document.createElement("meta");
     meta.name = "darkmux-flow-src";

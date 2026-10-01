@@ -8,6 +8,7 @@ import {
   machineLabels,
   machineMatch,
   machineNames,
+  machinePageRecords,
   machineUids,
   matchesMachine,
   nameKey,
@@ -375,5 +376,29 @@ describe("machineLabels tells machines that read alike apart", () => {
     expect(labels.get(U.macB)).toBe("Mac 2");
     expect(labels.get(U.studio)).toBe("m1-max-32gb-studio");
     expect(displayNameOf(f.data, f.liveMachines, f.specs, U.mbp)).toBe("MacBook-Pro.local");
+  });
+});
+
+describe("machinePageRecords: one machine's records, scoped to the playhead", () => {
+  const at = (uid: string, ts: string, sid: string) => norm({ ts, machine_uid: uid, machine_id: uid, session_id: sid, action: "dispatch.start" });
+  const log = [
+    at("UID-A", "2026-08-26T10:00:00.000Z", "a1"),
+    at("UID-B", "2026-08-26T10:30:00.000Z", "b1"),
+    at("UID-A", "2026-08-26T11:00:00.000Z", "a2"),
+  ];
+
+  it("keeps only the machine's own records, whatever the case of its uid", () => {
+    const sids = machinePageRecords(log, null, null, "uid-a", null).map((r) => r.session_id);
+    expect(sids).toEqual(["a1", "a2"]);
+  });
+
+  it("scopes the machine's records to a scrubbed playhead", () => {
+    const t = Date.parse("2026-08-26T10:45:00.000Z");
+    const sids = machinePageRecords(log, null, null, "UID-A", t).map((r) => r.session_id);
+    expect(sids).toEqual(["a1"]);
+  });
+
+  it("a drilled machine that resolves to nothing has no records, never this machine's", () => {
+    expect(machinePageRecords(log, "ghost", null, "UID-A", null)).toEqual([]);
   });
 });

@@ -41,6 +41,7 @@ import { dispatchHash, isLiveRoute, showsEventLog, tokRateConnectionEvidence } f
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "./lib/fetcher";
 import { queryKeys } from "./lib/queryKeys";
+import type { PresenceBeat } from "./types/generated/PresenceBeat";
 import type { MachineSpecsResponse } from "./types/generated/MachineSpecsResponse";
 import type { Route } from "./lib/route";
 import { ingest, recordsAsOf, stepIdOf, type NormRecord } from "./lib/ingest";
@@ -136,6 +137,9 @@ function terminalWallMs(records: NormRecord[], sessionId: string): number | null
   const run = sessionRun(records, sessionId, Infinity);
   return run ? recordedWallMs(lifecycleAt(run, Infinity, DEFAULT_POLICY).close) : null;
 }
+
+/** A static build has no presence beats. */
+const NO_LIVE_MACHINES: Map<string, PresenceBeat> = new Map();
 
 export function App() {
   const route = useHashRoute();
@@ -500,6 +504,27 @@ export function App() {
     return machineLabel({ data: flowWindow.data, liveMachines, specs, roster }, drilledUid);
   }, [drilledKey, drilledUid, flowWindow.data, flowWindow.settled, flowWindow.failure, liveMachines, specs, roster]);
   const targetMachineName = route.kind === "machine" ? (drilledKey != null ? drilledName : localName) : null;
+  // A static build's runs/machine/console routes have no slice of their own
+  // (the live window is empty there); the day's log, scoped to the playhead,
+  // is what the transport is scrubbing. Playback and dispatch routes keep
+  // their own slice, scoped the same way.
+  const ownSlice = route.kind === "playback" || route.kind === "dispatch" || source.kind === "daemon";
+  const logBase = ownSlice ? routeRecords.records : (dayRecords ?? EMPTY_FLOW_RECORDS);
+  // (5.0 R2) A static build has no daemon specs, so "this machine" is the
+  // machine fixture's own, found in the committed day (the same fixture and
+  // query key `MachineLens` reads, so no second request).
+  const staticMachineSrc = source.machine;
+  const staticMachineQuery = useQuery({
+    queryKey: queryKeys.staticMachine(staticMachineSrc ?? ""),
+    queryFn: () => fetchJson<{ specs: MachineSpecsResponse }>(staticMachineSrc as string),
+    enabled: source.kind === "static" && staticMachineSrc !== null && route.kind === "machine",
+    staleTime: Infinity,
+  });
+  const staticSpecs = staticMachineQuery.data?.ok ? staticMachineQuery.data.data.specs : null;
+  const pageSelfUid = useMemo(
+    () => localUid ?? localMachineUid(dayRecords ?? EMPTY_FLOW_RECORDS, NO_LIVE_MACHINES, staticSpecs?.machine_id ?? null, staticSpecs?.machine_uid ?? null),
+    [localUid, dayRecords, staticSpecs],
+  );
   const eventLogRecords = useMemo(() => {
     // Mission has no playhead concept (`transportShown` already excludes
     // it below) — its own fold is always the full, historical record set,
@@ -513,18 +538,13 @@ export function App() {
       // column — see #2189's own issue text).
       return route.stepId ? all.filter((r) => stepIdOf(r) === route.stepId) : all;
     }
-    // (5.0 R2) A machine page lists that machine's records, not the fleet's.
-    // An unresolved machine has none to list.
-    if (route.kind === "machine") return machinePageRecords(routeRecords.records, drilledKey, drilledUid, localUid);
+    // (5.0 R2) A machine page lists that machine's records, not the fleet's,
+    // scoped to the playhead like every other route. An unresolved machine
+    // has none to list.
+    if (route.kind === "machine") return machinePageRecords(logBase, drilledKey, drilledUid, pageSelfUid, playhead);
     if (playhead === null) return routeRecords.records;
-    // A static build's runs/machine/console routes have no slice of their
-    // own (the live window is empty there); the day's log, scoped to the
-    // playhead, is what the transport is scrubbing. Playback and dispatch
-    // routes keep their own slice, scoped the same way.
-    const own = route.kind === "playback" || route.kind === "dispatch" || source.kind === "daemon";
-    const base = own ? routeRecords.records : (dayRecords ?? []);
-    return recordsAsOf(base, playhead);
-  }, [route.kind, selectedMissionStepId, missionEvents, playhead, routeRecords.records, source.kind, dayRecords, drilledKey, drilledUid, localUid]);
+    return recordsAsOf(logBase, playhead);
+  }, [route.kind, selectedMissionStepId, missionEvents, playhead, routeRecords.records, logBase, drilledKey, drilledUid, pageSelfUid]);
 
   // (#1800) `#meta` takes legacy's REPLAY branch on a replay. Until now it
   // computed from `flowWindow` (the live rolling window) on every route, so a
