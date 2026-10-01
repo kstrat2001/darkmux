@@ -21,6 +21,8 @@ import { CLEAN_DETECTORS, runRegions } from "./sessionRun";
 import { flowToRenderModel as shapeSession } from "../../lib/flow";
 import { normAll, type RawRecord, norm } from "../../testing/records";
 import { ACTION, recordsAsOf, type NormRecord } from "../../lib/ingest";
+import { DEFAULT_POLICY, NO_PRESENCE } from "../../lib/lifecycle";
+import { localMachineUid } from "../../lib/machineIdentity";
 
 /** Fixture records through the app's boundary, then the session shaping. */
 const flowToRenderModel = (records: readonly (RawRecord | NormRecord)[]) => shapeSession(normAll(records as readonly RawRecord[]));
@@ -120,7 +122,11 @@ describe("runRegions — byte parity against the real recorded legacy golden", (
   it("matches goldens/session-task-list.txt's #stage section for the real flow-dispatch-task-list.json corpus", () => {
     const records = readCorpus("flow-dispatch-task-list.json");
     const data = flowToRenderModel(records);
-    const view = runRegions(data, "task-list");
+    // Viewed as the browser parity run views it: from MacBook-Pro, the machine
+    // the corpus ran on, with the viewer's uid derived as `App.tsx` derives it.
+    // The golden is shared with that run, so both must see the same viewer.
+    const viewerUid = localMachineUid(data, new Map(), "MacBook-Pro", null);
+    const view = runRegions(data, "task-list", undefined, true, null, null, NO_PRESENCE, DEFAULT_POLICY, viewerUid);
 
     const golden = readFileSync(path.join(REPO_ROOT, "tests/parity/goldens/session-task-list.txt"), "utf8");
     const expected = stageSectionOf(golden);
@@ -2480,6 +2486,7 @@ describe("runRegions: turns and tokens sum over the same executions", () => {
 // The route line names the machine the run executed on, from the run's own records,
 // and says "this machine" only for the viewer's own.
 describe("runRegions: the route line names where the run ran", () => {
+  // flow-action-guard:allow — a relayed session id, not a flow action
   const RELAY = "radio.solo.relay.darkbook.radio.solo.macbook-1";
   const records = (sid: string, machine: { machine_id: string; machine_uid: string }): RawRecord[] =>
     [
