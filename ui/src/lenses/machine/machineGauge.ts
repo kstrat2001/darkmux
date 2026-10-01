@@ -1,9 +1,9 @@
 /**
- * Pure builders for the Stage 2/3 machine-lens redesign (docs/design/machine-lens/proposal.md in the
+ * Pure builders for the Stage 2/3 machine-lens redesign (the machine-lens proposal (deleted in 5.0) in the
  * design packet; §3 "level 3 — the works" is the chosen treatment). Nothing
  * here touches the DOM — every function is a straight number-in/shape-out
  * transform, tested without rendering (`machineGauge.test.ts`), which is
- * also where docs/design/machine-lens/provenance.md's honesty rules get pinned at the unit level:
+ * also where the machine-lens provenance key (deleted in 5.0) honesty rules get pinned at the unit level:
  * absence vs zero, unknown-is-real, color-never-alone, redline keys on
  * exactly one server field.
  *
@@ -15,7 +15,7 @@
  * - **Detail layer** (per-model kv lines, the machine k/v row, the odometer
  *   tiles, the footer) keeps `memBytes()`'s existing two-decimal form — nothing
  *   about Stage 2/3 asked for that to change, and it stays the one place
- *   every figure on the page still matches docs/design/machine-lens/provenance.md's traced values.
+ *   every figure on the page still matches the machine-lens provenance key (deleted in 5.0) traced values.
  */
 
 import { GIB, KIB, MIB, memBytes, memPct, memStateCls } from "../../lib/format";
@@ -175,7 +175,7 @@ export function isSevenSegDot(ch: string): boolean {
 
 /** The scale's own end-label word — `LIMIT`, or `BUDGET` once a #1243
  * budget is configured (`limit_source === "budget"`). Never a bare number;
- * docs/design/machine-lens/proposal.md §3's whole argument for moving the denominator off the face
+ * the machine-lens proposal (deleted in 5.0) §3's whole argument for moving the denominator off the face
  * was that the max tick had to carry its OWN meaning. */
 export function gaugeScaleWord(limitSource: string | null | undefined): "LIMIT" | "BUDGET" {
   return limitSource === "budget" ? "BUDGET" : "LIMIT";
@@ -184,7 +184,7 @@ export function gaugeScaleWord(limitSource: string | null | undefined): "LIMIT" 
 /** The gauge's scale — deliberately NOT the old flat-meter's `machineScale()`
  * (limit ∨ pool ∨ potential ∨ current, whichever is largest). That auto-
  * expanding scale was right for a linear track that had to fit everything
- * without clipping; the semicircle's whole argument (docs/design/machine-lens/proposal.md §"The
+ * without clipping; the semicircle's whole argument (the machine-lens proposal (deleted in 5.0) §"The
  * denominator, argued") is the opposite — the scale end IS the allowance
  * (`limit_bytes`, or the #1243 budget), full stop, so an overcommitted
  * potential CLAMPS to the line and turns amber rather than silently
@@ -358,14 +358,14 @@ export function rowStateDiffers(rowState: string | null | undefined, machineStat
 }
 
 /** The redline's lit state keys on exactly ONE server field —
- * `machine.state === "red"` — zero client arithmetic (docs/design/machine-lens/proposal.md §"The
+ * `machine.state === "red"` — zero client arithmetic (the machine-lens proposal (deleted in 5.0) §"The
  * redline"). Whatever put the machine in Red (pressure, or the over-limit
  * disjunct) is a `stateWordSuffix()` question, never this one's. */
 export function redlineLit(state: string | null | undefined): boolean {
   return state === "red";
 }
 
-/** The one piece of client arithmetic docs/design/machine-lens/proposal.md explicitly sanctions: `cur
+/** The one piece of client arithmetic the machine-lens proposal (deleted in 5.0) explicitly sanctions: `cur
  * >= limit` is the server's OWN published over-limit rule
  * (`model_ledger.rs`'s cascade arm 2) applied to two server-supplied
  * numbers — the exact comparison that already clamps the needle at 100%,
@@ -430,7 +430,7 @@ export interface LampInputs {
   residencyChanged: boolean;
 }
 
-/** Every lamp keys on exactly ONE named CONDITION (docs/design/machine-lens/provenance.md row ⑨) —
+/** Every lamp keys on exactly ONE named CONDITION (the machine-lens provenance key (deleted in 5.0) row ⑨) —
  listed here in the mockup's own
  * order.
  *
@@ -524,7 +524,7 @@ export function digitCells(s: string): string[] {
  * order. Memory free is NOT a high-water mark (it can rise as well as
  * fall — it is the sole pressure TRIGGER); swap/compressor are, and their
  * note says so (`reports, never alarms` — the row-colored-by-its-own-
- * condition lesson carried into copy, docs/design/machine-lens/proposal.md §2). Reuses `memBytes()`
+ * condition lesson carried into copy, the machine-lens proposal (deleted in 5.0) §2). Reuses `memBytes()`
  * (the detail-layer's two-decimal convention) rather than the gauge's own
  * one-decimal `gaugeValueParts` — these are k/v figures, not the glance
  * layer. */
@@ -579,7 +579,7 @@ export function odometerTiles(pressure: MachineResourcesResponse["pressure"]): O
 // ── Model rows: the scaling rule + residency diffing ────────────────────
 
 type RowStatus = "live" | "new" | "ghost";
-// `"expected"` is a RESERVED, not-yet-buildable fourth status — docs/design/machine-lens/proposal.md
+// `"expected"` is a RESERVED, not-yet-buildable fourth status — the machine-lens proposal (deleted in 5.0)
 // §8 names the `EXPECTED · not yet resident` row explicitly as blocked on a
 // server-side `expected[]` set (staffing-derived) that does not exist today.
 // The slot is named here so a future packet extends this union instead of
@@ -617,7 +617,7 @@ function rowIdentifier(m: ModelRow): string {
 }
 
 /**
- * Advances the residency state machine by one poll (docs/design/machine-lens/proposal.md §8,
+ * Advances the residency state machine by one poll (the machine-lens proposal (deleted in 5.0) §8,
  * Scenario 2 — "a swap mid-glance"). Pure and total: same inputs, same
  * outputs, no timers, no DOM — `MachineLens.tsx` holds the returned `state`
  * in a ref and calls this again on the NEXT successful poll (never on an
@@ -689,10 +689,10 @@ export function residencyChangedThisPoll(rows: ResidencyRowView[]): boolean {
   return rows.some((r) => r.status !== "live");
 }
 
-/** The scaling rule (docs/design/machine-lens/proposal.md §8): darkmux-owned rows first, then
+/** The scaling rule (the machine-lens proposal (deleted in 5.0) §8): darkmux-owned rows first, then
  * alphabetical by identifier WITHIN each group — never by a live figure.
  * `owner` here is the same namespace test the server already computed
- * (docs/design/machine-lens/provenance.md row ⑭ — `owner==="darkmux"` IS the `darkmux:` prefix
+ * (the machine-lens provenance key (deleted in 5.0) row ⑭ — `owner==="darkmux"` IS the `darkmux:` prefix
  * test), so this never re-derives ownership from the identifier string. */
 export function sortResidencyRows(rows: ResidencyRowView[]): ResidencyRowView[] {
   return [...rows].sort((a, b) => {
@@ -715,7 +715,7 @@ export interface RowGroup {
  * `1 RESIDENT (+1 EXPECTED)` / `2 RESIDENT (+1 DEPARTED)` phrasing, minus
  * the EXPECTED half this packet doesn't build). A group with zero rows is
  * omitted entirely — headers render only when there's something under
- * them, matching docs/design/machine-lens/proposal.md §8's "today's common case adds no chrome". */
+ * them, matching the machine-lens proposal (deleted in 5.0) §8's "today's common case adds no chrome". */
 export function groupResidencyRows(rows: ResidencyRowView[]): RowGroup[] {
   const sorted = sortResidencyRows(rows);
   const darkmux = sorted.filter((r) => r.owner === "darkmux");
@@ -753,7 +753,7 @@ export function isEstimatedRow(m: Pick<ModelRow, "potential_source">): boolean {
 /** The per-model detail line — `ctx · weights · kv@ctx · potential ·
  * current`, the same shape the retired `modelLines()` produced as its
  * fourth element, kept verbatim because it is a well-tested, genuinely good
- * string (docs/design/machine-lens/provenance.md row ⑮'s traced identities all read off this exact
+ * string (the machine-lens provenance key (deleted in 5.0) row ⑮'s traced identities all read off this exact
  * text). Detail-layer precision (`memBytes()`, two decimals) — this is a
  * k/v row, not the glance layer. */
 export function modelKvLine(m: ModelRow): string {

@@ -6,8 +6,6 @@
 //! User files at `~/.darkmux/<entity-type>/` take precedence over bundled templates.
 //! Bundled templates are starting points, never the source-of-truth.
 
-#![allow(dead_code)]
-
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 

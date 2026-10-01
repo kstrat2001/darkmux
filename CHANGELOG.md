@@ -752,6 +752,31 @@ darkmux release.
 
 ### Removed (breaking, 4.0)
 
+- **The persona roles and the acknowledgment gate are gone** (#3036). The
+  built-in roles `fitness-coach`, `health-research`, `legal-research`,
+  `trip-researcher`, `logistics-coordinator`, `voice-editor` and `lab-manager`
+  no longer ship, nor do the skills only they used (`documenting`, `writing`,
+  `voice-editing`). A dispatch to one of those ids fails with the ordinary
+  `role not found` error. The licensed-adjacent acknowledgment gate (the
+  `ACKNOWLEDGE` prompt and `<role>.ack` files) is deleted, and so are
+  `dirs.ack` and `DARKMUX_ACK_DIR`: `darkmux doctor` names a leftover key or
+  env var and a harmless env var warns. The disclaimer's section about those
+  role prompts is removed with them. **Migration:** keep a role you still want
+  as your own file under `<darkmux root>/roles/`; delete `dirs.ack`.
+- **`darkmux lab eval` is removed whole** (#3036). The verb with all its flags
+  (`--mode`, `--workdirs`, `--prosecutor-profile`, `--defender-profile`,
+  `--judge-profile`, `--cases-dir`, `--scores-out`), the `dialectic-*` and
+  `pr-reviewer-agentic`/`-freeform` roles, and the `pr-review-bench` fixture are
+  gone. It is refused by name, pointing at `darkmux lab run <workload>` and
+  `darkmux mission launch review`. The runs board no longer prints a
+  `try it yourself` line naming the removed verb. `pr-reviewer` stays.
+- **Stale docs and an unused plugin are deleted** (#3036). `ROADMAP.md`,
+  `docs/roadmap/`, `docs/463-workspace-split-plan.md`, `docs/design/`,
+  `docs/architecture/observability-unification-plan.md`, the `/topology` and
+  `/viewer` redirect stubs under `docs/`, the repo-root `AGENTS.md` and
+  `plugins/darkmux-bundler-edge` are removed. `darkmux init`'s AGENTS.md
+  integration for your own project is unchanged.
+
 - **`darkmux machine list --deep` is retired.** The card is the default content
   of `machine list`, so there is nothing to ask for; the flag is refused, naming
   that. **Migration:** drop the flag. A script that read `--json`'s `specs`,

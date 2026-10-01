@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { K_TO_M, MISSING, clkrange, compactDuration, compactThousands, fmtC, fmtElapsed, memBytes, memPct, memStateCls, reclaimableNote } from "./format";
+import { K_TO_M, MISSING, clkrange, compactDuration, compactThousands, fmtC, fmtElapsed, memBytes, memPct, memStateCls, reclaimableNote, shortModel } from "./format";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -55,7 +55,7 @@ describe("memPct", () => {
   });
 
   // The inverted case this function exists to serve: `part == null` (the
-  // unpriced-model case, docs/design/machine-lens/provenance.md) returns 0 rather than NaN — but
+  // unpriced-model case, the machine-lens provenance key (deleted in 5.0)) returns 0 rather than NaN — but
   // callers gate on `pot != null`/`cur != null` before rendering the layer
   // at all, so this value is a safety net, not something a real unpriced
   // bar ever paints.
@@ -379,5 +379,21 @@ describe("compactDuration (#2902 step 5)", () => {
     expect(compactDuration(59)).toBe("59s");
     expect(compactDuration(1)).toBe("1s");
     expect(compactDuration(0)).toBe("0s");
+  });
+});
+
+describe("shortModel", () => {
+  it("strips the darkmux namespace prefix", () => {
+    expect(shortModel("darkmux:qwen3.6-35b-a3b")).toBe("qwen3.6-35b-a3b");
+  });
+  it("leaves a non-namespaced id alone", () => {
+    expect(shortModel("qwen3.6-35b-a3b")).toBe("qwen3.6-35b-a3b");
+  });
+  it("strips only a LEADING prefix, not an embedded one", () => {
+    expect(shortModel("vendor/darkmux:x")).toBe("vendor/darkmux:x");
+  });
+  it("renders an absent model as the empty string, never 'null'/'undefined'", () => {
+    expect(shortModel(null)).toBe("");
+    expect(shortModel(undefined)).toBe("");
   });
 });

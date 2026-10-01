@@ -12,18 +12,17 @@
  * live in `../../lib/route.ts` already (the scaffold's hash-grammar port);
  * imported from there rather than redeclared.
  *
- * `shortModel` used to be one of a "lab-series six" hand-duplicated here
- * before `../lab/labSeries.ts` (the lab lens's own dedicated pure-logic
- * module) existed; re-exported from there instead of maintained twice. The
- * other five (`labFieldVal`/`labTaskKey`/`groupLabRunsByTask`/
- * `labKnobSummary`/`labKnobDiff`) and this file's own `labCounts` backed the
- * `◧ series` knob-diff sub-view, removed in the #2860 follow-up (see
- * `RunsBoard.tsx`'s own module doc for why) — `shortModel` survives because
- * `runSubtitle` below still uses it for every run kind, not just lab.
+ * `shortModel` lives in `../../lib/format.ts` and is re-exported from here.
+ * The "lab-series six" it once belonged to (`labFieldVal`/`labTaskKey`/
+ * `groupLabRunsByTask`/`labKnobSummary`/`labKnobDiff`) and this file's own
+ * `labCounts` backed the `◧ series` knob-diff sub-view, removed in the
+ * #2860 follow-up (see `RunsBoard.tsx`'s own module doc for why);
+ * `shortModel` survives because `runSubtitle` below uses it for every run
+ * kind, not just lab.
  */
 
 import type { Run } from "../../types/generated/Run";
-import { shortModel } from "../lab/labSeries";
+import { shortModel } from "../../lib/format";
 import { dispatchHash } from "../../lib/route";
 import { canonUid, machineRefKey, matchesMachine, nameKey, type MachineMatch, type MachineRef } from "../../lib/machineIdentity";
 

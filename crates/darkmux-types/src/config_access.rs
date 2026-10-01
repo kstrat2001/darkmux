@@ -3810,22 +3810,18 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn override_only_dir_accessors_env_then_none() {
-        type Acc = fn() -> Option<std::path::PathBuf>;
-        for (key, accessor) in [
-            ("DARKMUX_IDENTITY_PATH", identity_path_override as Acc),
-        ] {
-            let prev = std::env::var(key).ok();
-            unsafe { std::env::set_var(key, "/custom/x"); }
-            assert_eq!(accessor(), Some(std::path::PathBuf::from("/custom/x")), "{key} env override");
-            // unset → None; each caller then applies its own default (the no-HOME
-            // handling differs per dir, which is why these are override-only).
-            unsafe { std::env::remove_var(key); }
-            assert_eq!(accessor(), None, "{key} unset → None");
-            unsafe {
-                match prev {
-                    Some(v) => std::env::set_var(key, v),
-                    None => std::env::remove_var(key),
-                }
+        let key = "DARKMUX_IDENTITY_PATH";
+        let prev = std::env::var(key).ok();
+        unsafe { std::env::set_var(key, "/custom/x"); }
+        assert_eq!(identity_path_override(), Some(std::path::PathBuf::from("/custom/x")), "{key} env override");
+        // unset → None; the caller then applies its own default (the no-HOME
+        // handling differs per dir, which is why these are override-only).
+        unsafe { std::env::remove_var(key); }
+        assert_eq!(identity_path_override(), None, "{key} unset → None");
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
             }
         }
     }

@@ -5097,10 +5097,9 @@ fn synthetic_stream_error_record(stream_name: &str, attempts: u32, reason: &str)
     // because the daemon process emitting this IS a local-tier
     // observation; `stage: "scope"` because the event is about the
     // stream's lifecycle (not a dispatch / review / ship). Note:
-    // the topology viewer's EDGE_STYLES filter at
-    // docs/topology/index.html doesn't currently render
-    // `stage: scope` records as edges — separate follow-up to add
-    // a stream-error pill / toast in the viewer surface.
+    // the viewer doesn't currently render `stage: scope` records as
+    // edges — separate follow-up to add a stream-error pill / toast in
+    // the viewer surface.
     let record = darkmux_flow::FlowRecord {
         ts: darkmux_flow::ts_utc_now(),
         level: darkmux_flow::Level::Warn,

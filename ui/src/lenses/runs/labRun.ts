@@ -18,9 +18,8 @@
  */
 
 import { RUNNING_WORD } from "../../components/WorkStatus";
-import { shortModel } from "../lab/labSeries";
+import { shortModel } from "../../lib/format";
 import type { LabReviewSummary } from "../../types/generated/LabReviewSummary";
-import type { LabScoresSummary } from "../../types/generated/LabScoresSummary";
 import { ACTION, CATEGORY, SOURCE, type NormRecord } from "../../lib/ingest";
 
 /** `computeLabPipeline()` — viewer.html:4756-4774. Folds the event feed

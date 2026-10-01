@@ -131,7 +131,7 @@ For the **conceptual model** the code implements (role families, the mission/pha
 
 ## Releases
 
-darkmux follows semver as of v1.0.0 (see ROADMAP.md and README.md). The manual release flow:
+darkmux follows semver as of v1.0.0 (see README.md). The manual release flow:
 
 ```bash
 # bump the version in every workspace Cargo.toml + refresh the lockfile

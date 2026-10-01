@@ -213,7 +213,6 @@ const KEYS: &[(&str, Ty)] = &[
     ("dirs.audit", Ty::Str),
     ("dirs.skills", Ty::Str),
     ("dirs.templates", Ty::Str),
-    ("dirs.ack", Ty::Str),
     ("dirs.identity", Ty::Str),
     ("dirs.fleet_file", Ty::Str),
     // (#1585) The drift guard `every_with_defaults_key_is_settable` cannot

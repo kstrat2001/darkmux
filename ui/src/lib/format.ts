@@ -301,3 +301,8 @@ export function compactDuration(secs: number): string {
   const m = mins % 60;
   return h > 0 ? `${h}h ${m}m` : `${m}m`;
 }
+
+/** Strip a LEADING `darkmux:` namespace prefix; absent model renders as "". */
+export function shortModel(m: string | null | undefined): string {
+  return String(m || "").replace(/^darkmux:/, "");
+}

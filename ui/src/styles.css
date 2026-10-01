@@ -5287,7 +5287,7 @@ body {
   margin: 14px 0 6px;
 }
 
-/* Model rows — the scaling rule's repeating element (docs/design/machine-lens/proposal.md §8):
+/* Model rows — the scaling rule's repeating element (the machine-lens proposal (deleted in 5.0) §8):
    constant height at any N, grouped darkmux-first, alphabetical within
    group. Ghost/NEW are the ONLY two state modifiers — a live row carries
    neither. */

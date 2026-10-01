@@ -2,8 +2,6 @@
 //!
 //! Search order: user dir → binary-embedded built-ins.
 
-#![allow(dead_code)]
-
 use crate::retired_state::{self, parse_state, StateKind};
 use crate::types::*;
 use darkmux_types::paths::{resolve, ResolveScope};
@@ -414,6 +412,7 @@ fn read_all_json<T: serde::de::DeserializeOwned>(dir: &std::path::Path) -> Resul
 /// review). `Ok(None)` when `id` is not a builtin; `Err` carries the serde
 /// message when its JSON does not parse, so a broken embedded manifest names
 /// itself instead of reading as "not a builtin".
+#[cfg(test)]
 pub(crate) fn builtin_role(id: &str) -> Result<Option<Role>> {
     BUILTIN_ROLES
         .iter()

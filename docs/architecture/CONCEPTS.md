@@ -404,8 +404,7 @@ Everything below is **issue-tracked and not in the current binary**, except the
 darkmux.com demo, which is a website playback fixture, not a binary
 feature (the daemon serves no `/demo` route). Do not document these as current
 behavior. The observability items are the
-[#556](https://github.com/kstrat2001/darkmux/issues/556) epic, designed in
-[`docs/architecture/observability-unification-plan.md`](./observability-unification-plan.md).
+[#556](https://github.com/kstrat2001/darkmux/issues/556) epic.
 
 | Planned | Status | Tracking |
 |---|---|---|
@@ -445,5 +444,3 @@ Two principles thread through every concept above; both are spelled out in full 
 - [`DESIGN.md`](../../DESIGN.md): implementation reasoning and version history.
 - [`CLAUDE.md`](../../CLAUDE.md): agent doctrine, environment variables, the
   authoritative "Where things live" module map, and the schema-versioning rules.
-- [`observability-unification-plan.md`](./observability-unification-plan.md): the
-  *why* behind the #556 observability arc.

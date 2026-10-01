@@ -12,7 +12,7 @@ import { maxOf, minOf } from "../../lib/numbers";
 // `tests/parity/next-parity.spec.ts` (the narrowed byte-exact comparison —
 // see that file's own doc for what still corresponds and what was
 // deliberately retired). These tests pin the two honesty rules
-// docs/design/machine-lens/provenance.md names as load-bearing, with BOTH sides of each inverted
+// the machine-lens provenance key (deleted in 5.0) names as load-bearing, with BOTH sides of each inverted
 // case in one file so a future edit can't quietly satisfy one and break
 // the other.
 
@@ -93,7 +93,7 @@ function renderRegion(resources: MachineResourcesResponse | null, extra: Partial
   );
 }
 
-describe("MachineHealthRegion — absence vs zero (docs/design/machine-lens/provenance.md's central honesty rule)", () => {
+describe("MachineHealthRegion — absence vs zero (the machine-lens provenance key (deleted in 5.0)'s central honesty rule)", () => {
   it("draws NO .mm-row-pot layer at all for an unpriced model — absence, not a zero-width bar", () => {
     const { container } = renderRegion(BASE);
     const unpricedRow = [...container.querySelectorAll(".mm-row")].find((c) => c.textContent?.includes("unpriced-model"))!;
@@ -557,7 +557,7 @@ describe("MachineHealthRegion — structure the e2e/parity suites also check", (
   });
 });
 
-describe("MachineHealthRegion — ghost/NEW residency rows (docs/design/machine-lens/proposal.md §8)", () => {
+describe("MachineHealthRegion — ghost/NEW residency rows (the machine-lens proposal (deleted in 5.0) §8)", () => {
   it("a departed model renders a dimmed DEPARTED row with its last observed figure", () => {
     const first = advanceResidency(null, BASE.models, 1000);
     const second = advanceResidency(first.state, [BASE.models[0]], 2000); // the unpriced model departs
