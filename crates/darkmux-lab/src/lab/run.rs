@@ -66,6 +66,18 @@ impl RunOutcome {
         self.provider_error.is_none()
     }
 
+    /// How this run's dispatch ended, for the surfaces that must tell an
+    /// escalation from an error (F2). Every lab surface reads this instead of
+    /// `ok`, which is false for both.
+    pub fn end(&self) -> crate::lab::dispatch_end::DispatchEnd {
+        use crate::lab::dispatch_end::DispatchEnd;
+        match (&self.escalation, self.ok) {
+            (Some(reason), _) => DispatchEnd::Escalated { reason: reason.clone() },
+            (None, true) => DispatchEnd::Completed,
+            (None, false) => DispatchEnd::Failed,
+        }
+    }
+
     /// The workload's verify ran and failed. A verify nothing declared
     /// (`None`) is not a failure.
     pub fn verify_failed(&self) -> bool {
