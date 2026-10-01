@@ -206,7 +206,7 @@ DebriefPhase
   description: string
   status: DebriefPhaseStatus
   reason: string | null
-DebriefPhaseStatus = "planned" | "running" | "complete" | "degraded" | "abandoned"
+DebriefPhaseStatus = "planned" | "running" | "complete" | "degraded" | "abandoned" | "unknown"
 DebriefReport
   mission: DebriefMission
   phases: DebriefPhase[]
@@ -661,7 +661,7 @@ MissionShow
   runs: Run[]
   tokens?: uint64 | null
   link: string
-MissionStatus = "active" | "finalized" | "aborted"
+MissionStatus = "active" | "finalized" | "aborted" | "unknown"
 ModContext
   findings: ForFinding[]
 ModCreated
@@ -727,7 +727,7 @@ ModelRow
   over_price_bytes?: uint64 | null
   shrink_hint?: string | null
 NodeKind = "phase" | "task"
-NodeStatus = "planned" | "running" | "complete" | "abandoned" | "error"
+NodeStatus = "planned" | "running" | "complete" | "abandoned" | "error" | "unknown"
 Owner = "darkmux" | "user"
 PhaseDisplayStatus = "planned" | "running" | "complete" | "error" | "abandoned" | "waiting" | "degraded"
 PhaseJson
