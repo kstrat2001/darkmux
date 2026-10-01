@@ -15854,6 +15854,26 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         );
     }
 
+    /// (#3022) A `machine.telemetry` record states the fleet position this
+    /// machine declares, read from the same accessor the card and the
+    /// presence beat read, so an archive says which machine was the hub.
+    #[serial_test::serial]
+    #[test]
+    fn machine_scoped_telemetry_states_the_declared_fleet_mode() {
+        use crate::host_probe::{build_machine_scoped_telemetry_record_with, HostSampleFull};
+        use crate::host_source::Provenance;
+        let cfg = darkmux_types::config::DarkmuxConfig {
+            fleet: Some(darkmux_types::config::FleetConfig {
+                mode: Some("hub".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let _g = darkmux_types::config_access::set_config_for_test(cfg);
+        let rec = build_machine_scoped_telemetry_record_with(&HostSampleFull::default(), 1, 5000, &Provenance::Real);
+        assert_eq!(rec.payload_json()["fleet_mode"], "hub");
+    }
+
     // ─── (#2779) the tailer's dispatch.rest carries the marker ───────────
 
     /// The record reporting the rest the run ACTUALLY took — the pace

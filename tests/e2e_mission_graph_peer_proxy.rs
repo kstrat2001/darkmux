@@ -132,6 +132,7 @@ fn publish_live_presence(redis_url: &str, machine_id: &str) {
         beat_ts_ms: darkmux_flow::presence::now_ms(),
         specs: None,
         darkmux_version: None,
+        fleet_mode: None,
     };
     darkmux_flow::presence::write_beat(&client, &beat, 60).expect("write presence beat");
 }

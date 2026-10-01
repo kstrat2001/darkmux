@@ -1,0 +1,111 @@
+{
+  "card": {
+    "card_schema_version": "1.1",
+    "work_job_schema_version": "8.0",
+    "specs": {
+      "darkmux_version": "5.0.0",
+      "flow_schema_version": "2.0.0",
+      "machine_id": "studio",
+      "machine_uid": "STUDIO-UID",
+      "os": "macos aarch64",
+      "ram_total_bytes": 137438953472,
+      "ram_free_for_ai_bytes": 68719476736,
+      "cpu_brand": "Apple M5 Max",
+      "loaded_models": [
+        {
+          "identifier": "darkmux:qwen",
+          "model": "qwen",
+          "status": "idle",
+          "size": "20 GB",
+          "context": 65536,
+          "queued": 0
+        }
+      ],
+      "lms_unreachable": false,
+      "utility_model": null,
+      "redis_url_redacted": null,
+      "generated_at_ms": 1000
+    },
+    "profiles": [
+      {
+        "name": "deep",
+        "description": "the big local model",
+        "is_default": true,
+        "endpoint_kind": "managed",
+        "models": [
+          {
+            "id": "qwen",
+            "n_ctx": 65536,
+            "endpoint_kind": "managed"
+          }
+        ]
+      },
+      {
+        "name": "cloud",
+        "description": null,
+        "is_default": false,
+        "endpoint_kind": "unmanaged",
+        "models": [
+          {
+            "id": "gpt",
+            "n_ctx": null,
+            "endpoint_kind": "unmanaged"
+          }
+        ]
+      }
+    ],
+    "default_profile": "deep",
+    "profiles_error": null,
+    "seats": {
+      "busy_policy": "queue",
+      "counts_own_work": false,
+      "local": [
+        {
+          "model": "qwen",
+          "held_by_peer_job": true
+        }
+      ],
+      "hosted": {
+        "held_by_peer_jobs": 1,
+        "cap": 3
+      },
+      "waiting": 0
+    },
+    "governor": {
+      "thermal": {
+        "state": "nominal",
+        "cpu_speed_limit_pct": 100
+      },
+      "battery": null,
+      "battery_gate": {
+        "floor_pct": 20,
+        "refuse_start_below_min": false,
+        "pause_running_below_min": false,
+        "refusing_start": false
+      }
+    },
+    "fleet_mode": "hub",
+    "hosts_fleet_redis": true,
+    "fleet_defaults": {
+      "version": 1,
+      "radio": {
+        "answerer_profile": "deep@studio"
+      }
+    },
+    "generated_at_ms": 2000,
+    "gather_ms": 3,
+    "cache_ttl_ms": 2000
+  },
+  "grant": {
+    "state": "listed",
+    "accepts": {
+      "peer_name": "laptop",
+      "profiles": [
+        "deep"
+      ],
+      "roles": [],
+      "images": [],
+      "workspace": false
+    }
+  }
+}

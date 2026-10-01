@@ -1584,19 +1584,154 @@ fn answering_seat_from(explicit: Option<&str>, binding: Option<&str>) -> Result<
     })
 }
 
-/// The seat under `overrides`: the session picker wins over
-/// `radio.answerer_profile`, which wins over `role_profiles.radio-host`.
+/// Where the answering seat's reference came from, for the line radio prints
+/// and the `fleet defaults` doctor row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SeatSource {
+    /// The session's "radio host" picker.
+    Session,
+    /// This machine's own setting: `radio.answerer_profile`, or its
+    /// `role_profiles.radio-host` binding.
+    OwnSetting,
+    /// The fleet default the hub's card states.
+    HubDefault(crate::fleet_defaults::HubDefaultSeen),
+    /// Nothing is set anywhere: dispatch resolves `default_profile`.
+    BuiltIn,
+}
+
+/// What each tier of the seat's precedence holds.
+struct SeatInputs<'a> {
+    picker: Option<&'a str>,
+    own: Option<&'a str>,
+    binding: Option<&'a str>,
+}
+
+/// The references [`answering_seat_from`] reads, and where they came from.
+struct SeatReference {
+    explicit: Option<String>,
+    binding: Option<String>,
+    source: SeatSource,
+}
+
+/// The precedence of the seat: the session picker, then this machine's own
+/// `radio.answerer_profile`, then its own `role_profiles.radio-host` binding,
+/// then the hub's fleet default, then the built-in (`default_profile`). The
+/// hub is asked only when nothing on this machine names a seat.
+fn seat_reference(
+    inputs: &SeatInputs<'_>,
+    hub: impl FnOnce() -> Option<crate::fleet_defaults::HubDefaultSeen>,
+) -> SeatReference {
+    let explicit = |reference: &str, source: SeatSource| SeatReference {
+        explicit: Some(reference.to_string()),
+        binding: None,
+        source,
+    };
+    if let Some(picker) = inputs.picker {
+        return explicit(picker, SeatSource::Session);
+    }
+    if let Some(own) = inputs.own {
+        return explicit(own, SeatSource::OwnSetting);
+    }
+    if let Some(binding) = inputs.binding {
+        return SeatReference { explicit: None, binding: Some(binding.to_string()), source: SeatSource::OwnSetting };
+    }
+    match hub() {
+        Some(seen) => match seen.answerer_profile().map(str::to_string) {
+            Some(reference) => explicit(&reference, SeatSource::HubDefault(seen)),
+            None => SeatReference { explicit: None, binding: None, source: SeatSource::BuiltIn },
+        },
+        None => SeatReference { explicit: None, binding: None, source: SeatSource::BuiltIn },
+    }
+}
+
+/// The seat under `overrides` with where it came from ([`seat_reference`]).
 /// Factored so [`dispatch_answerer_call_with`], [`grounding_scope_for`] and
 /// [`answering_seat_target`] all decide about the SAME seat: two copies of
 /// this precedence would be a data-boundary bug waiting to happen (the gate
 /// deciding about one profile while the dispatch went to another).
-fn resolved_answering_seat(overrides: &AnswererOverrides) -> Result<AnsweringSeat, String> {
-    let explicit = overrides
-        .profile_name
-        .clone()
-        .or_else(darkmux_types::config_access::radio_answerer_profile);
+///
+/// A hub default is read from another machine, so it must be a
+/// `<profile>@<machine>` address: a bare name would be this machine's own
+/// profile of that name, which the hub never meant.
+fn resolve_answering(
+    overrides: &AnswererOverrides,
+    hub: impl FnOnce() -> Option<crate::fleet_defaults::HubDefaultSeen>,
+) -> Result<(AnsweringSeat, SeatSource), String> {
+    let own = darkmux_types::config_access::radio_answerer_profile();
     let binding = darkmux_types::config_access::role_profile("radio-host");
-    answering_seat_from(explicit.as_deref(), binding.as_deref()).map(local_when_naming_this_machine)
+    let reference = seat_reference(
+        &SeatInputs { picker: overrides.profile_name.as_deref(), own: own.as_deref(), binding: binding.as_deref() },
+        hub,
+    );
+    let seat = answering_seat_from(reference.explicit.as_deref(), reference.binding.as_deref())
+        .and_then(|seat| match (&reference.source, &seat) {
+            (SeatSource::HubDefault(seen), AnsweringSeat::Here { .. }) if !names_a_machine(seen.answerer_profile()) => {
+                Err(format!(
+                    "the fleet default from the hub, `{}`, names no machine: it must be `<profile>@<machine>`",
+                    seen.answerer_profile().unwrap_or_default()
+                ))
+            }
+            _ => Ok(seat),
+        })
+        .map_err(|e| match &reference.source {
+            SeatSource::HubDefault(_) => format!("the fleet default from the hub is unusable: {e}"),
+            _ => e,
+        })?;
+    Ok((local_when_naming_this_machine(seat), reference.source))
+}
+
+/// Whether `reference` is a well-formed address that names a machine.
+fn names_a_machine(reference: Option<&str>) -> bool {
+    reference
+        .and_then(|r| darkmux_types::profile_address::ProfileAddress::parse(r).ok())
+        .is_some_and(|a| a.machine.is_some())
+}
+
+fn resolved_answering_seat(overrides: &AnswererOverrides) -> Result<AnsweringSeat, String> {
+    resolve_answering(overrides, crate::fleet_defaults::hub_default).map(|(seat, _)| seat)
+}
+
+/// The answering seat as the user is told about it: which seat, and whose
+/// word it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SeatProvenance {
+    seat: String,
+    source: SeatSource,
+}
+
+impl SeatProvenance {
+    fn of(seat: &AnsweringSeat, source: SeatSource) -> Self {
+        let seat = match seat {
+            AnsweringSeat::Here { explicit: Some(profile) } => profile.clone(),
+            AnsweringSeat::Here { explicit: None } => "this machine's default profile".to_string(),
+            AnsweringSeat::Peer { profile, machine } => format!("{profile}@{machine}"),
+        };
+        Self { seat, source }
+    }
+
+    /// `deep@studio, fleet default from the hub, last seen 3m ago`.
+    pub(crate) fn describe(&self, now_ms: u64) -> String {
+        use crate::fleet_defaults::HubDefaultOrigin;
+        let seat = &self.seat;
+        match &self.source {
+            SeatSource::Session => format!("{seat}, chosen for this session"),
+            SeatSource::OwnSetting => format!("{seat}, this machine's setting"),
+            SeatSource::BuiltIn => format!("{seat}, built-in"),
+            SeatSource::HubDefault(seen) => {
+                let unreachable = match seen.origin {
+                    HubDefaultOrigin::Live => "",
+                    HubDefaultOrigin::LastKnown => " (the hub could not be reached; this is the copy saved here)",
+                };
+                format!("{seat}, fleet default from the hub, last seen {} ago{unreachable}", seen.age_words(now_ms))
+            }
+        }
+    }
+}
+
+/// [`resolve_answering`] for display: the same resolution radio dispatches
+/// on, with where it came from.
+pub(crate) fn answering_seat_provenance(overrides: &AnswererOverrides) -> Result<SeatProvenance, String> {
+    resolve_answering(overrides, crate::fleet_defaults::hub_default).map(|(seat, source)| SeatProvenance::of(&seat, source))
 }
 
 /// An address naming THIS machine is a local seat. `dispatch_routed_via`
@@ -1681,7 +1816,9 @@ pub fn dispatch_answerer_call_with(
     boundary: Option<crate::fleet::Boundary>,
 ) -> Result<String> {
     let humor = overrides.humor.unwrap_or_else(darkmux_types::config_access::radio_humor);
-    let seat = resolved_answering_seat(overrides).map_err(|e| anyhow::anyhow!("radio answering seat: {e}"))?;
+    let (seat, source) = resolve_answering(overrides, crate::fleet_defaults::hub_default)
+        .map_err(|e| anyhow::anyhow!("radio answering seat: {e}"))?;
+    eprintln!("radio: answering seat: {}", SeatProvenance::of(&seat, source).describe(darkmux_flow::presence::now_ms()));
     let cap = answer_token_cap();
     let (profile_name, machine, system_prompt_override, single_shot, seat_label) = match &seat {
         AnsweringSeat::Here { explicit } => {
@@ -1902,6 +2039,84 @@ mod tests {
             answering_seat_from(None, Some("deep@studio")),
             Ok(AnsweringSeat::Peer { profile: "deep".into(), machine: "studio".into() })
         );
+    }
+
+    // ── the seat's precedence and its provenance line (#3022) ──
+
+    fn hub_says(profile: Option<&str>) -> Option<crate::fleet_defaults::HubDefaultSeen> {
+        use crate::fleet_defaults::{HubDefaultOrigin, HubDefaultSeen};
+        use darkmux_serve::machine_card::{CardFleetDefaults, CardRadioDefaults, FLEET_DEFAULTS_VERSION};
+        Some(HubDefaultSeen {
+            hub: "studio".into(),
+            seen_at_ms: 1_000,
+            origin: HubDefaultOrigin::Live,
+            defaults: CardFleetDefaults {
+                version: FLEET_DEFAULTS_VERSION,
+                radio: CardRadioDefaults { answerer_profile: profile.map(str::to_string) },
+            },
+        })
+    }
+
+    fn reference(picker: Option<&str>, own: Option<&str>, binding: Option<&str>, hub: Option<&str>) -> SeatReference {
+        seat_reference(&SeatInputs { picker, own, binding }, || hub_says(hub))
+    }
+
+    /// The promise: this machine's own setting beats the hub's default, which
+    /// beats the built-in; and the hub is not even asked when this machine
+    /// names a seat.
+    #[test]
+    fn the_seat_is_own_then_hub_then_built_in() {
+        let r = reference(None, Some("mine"), None, Some("deep@studio"));
+        assert_eq!((r.explicit.as_deref(), r.source), (Some("mine"), SeatSource::OwnSetting));
+        let r = reference(Some("picked"), Some("mine"), None, Some("deep@studio"));
+        assert_eq!((r.explicit.as_deref(), r.source), (Some("picked"), SeatSource::Session));
+        let r = reference(None, None, Some("bound"), Some("deep@studio"));
+        assert_eq!((r.binding.as_deref(), r.explicit, r.source), (Some("bound"), None, SeatSource::OwnSetting));
+        let r = reference(None, None, None, Some("deep@studio"));
+        assert_eq!(r.explicit.as_deref(), Some("deep@studio"));
+        assert!(matches!(r.source, SeatSource::HubDefault(_)));
+        let r = reference(None, None, None, None);
+        assert_eq!((r.explicit, r.binding, r.source), (None, None, SeatSource::BuiltIn));
+        let r = reference(None, None, None, None);
+        assert_eq!(r.source, SeatSource::BuiltIn, "a hub that states no default leaves the built-in");
+        for set in [(Some("p"), None, None), (None, Some("o"), None), (None, None, Some("b"))] {
+            seat_reference(&SeatInputs { picker: set.0, own: set.1, binding: set.2 }, || panic!("the hub was asked"));
+        }
+    }
+
+    /// The line radio prints names the seat and whose word it is.
+    #[test]
+    fn the_provenance_line_says_whose_word_the_seat_is() {
+        let peer = AnsweringSeat::Peer { profile: "deep".into(), machine: "studio".into() };
+        let line = |source| SeatProvenance::of(&peer, source).describe(181_000);
+        assert_eq!(line(SeatSource::OwnSetting), "deep@studio, this machine's setting");
+        assert_eq!(line(SeatSource::Session), "deep@studio, chosen for this session");
+        assert_eq!(
+            line(SeatSource::HubDefault(hub_says(Some("deep@studio")).unwrap())),
+            "deep@studio, fleet default from the hub, last seen 3m ago"
+        );
+        let mut saved = hub_says(Some("deep@studio")).unwrap();
+        saved.origin = crate::fleet_defaults::HubDefaultOrigin::LastKnown;
+        let l = line(SeatSource::HubDefault(saved));
+        assert!(l.starts_with("deep@studio, fleet default from the hub, last seen 3m ago") && l.contains("could not be reached"), "{l}");
+        let built_in = SeatProvenance::of(&AnsweringSeat::Here { explicit: None }, SeatSource::BuiltIn);
+        assert_eq!(built_in.describe(0), "this machine's default profile, built-in");
+    }
+
+    /// A hub default that names no machine is refused, loudly: it would
+    /// otherwise be this machine's own profile of that name.
+    #[serial_test::serial]
+    #[test]
+    fn a_hub_default_that_names_no_machine_is_refused() {
+        let _g = darkmux_types::config_access::set_config_for_test(Default::default());
+        let o = AnswererOverrides::default();
+        let err = resolve_answering(&o, || hub_says(Some("deep"))).unwrap_err();
+        assert!(err.contains("fleet default from the hub") && err.contains("<profile>@<machine>"), "{err}");
+        let err = resolve_answering(&o, || hub_says(Some("a@b@c"))).unwrap_err();
+        assert!(err.contains("fleet default from the hub"), "{err}");
+        let (seat, source) = resolve_answering(&o, || hub_says(Some("deep@studio"))).unwrap();
+        assert_eq!(seat, AnsweringSeat::Peer { profile: "deep".into(), machine: "studio".into() });
+        assert!(matches!(source, SeatSource::HubDefault(_)));
     }
 
     #[test]

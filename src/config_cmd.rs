@@ -184,6 +184,9 @@ const KEYS: &[(&str, Ty)] = &[
     ("fleet.identity.bin", Ty::Str),
     ("fleet.listener.enabled", Ty::Bool),
     ("fleet.listener.port", Ty::Uint),
+    // (#3022) What a fleet hub hands to machines with no setting of their
+    // own; meaningful on the hub only.
+    ("fleet.defaults.radio.answerer_profile", Ty::Str),
     // (#1260, #2902 step 5) A per-step cap on hosted tokens; `dispatch.map`
     // steps naming the same `bucket_group` share one allowance. Tokens,
     // never currency. (Renamed from `remote.max_tokens_per_execution` in
@@ -429,10 +432,7 @@ fn set_at(path: &Path, key: &str, value: &str) -> Result<String> {
     // top context), so the operator always sees the specific hint —
     // "invalid value for `fleet.mode`: invalid fleet.mode `hubb` — valid: …".
     let parsed = parse_value(ty, value).map_err(|e| anyhow!("invalid value for `{key}`: {e}"))?;
-    if names_the_answering_seat(key) {
-        darkmux_types::profile_address::ProfileAddress::parse(value)
-            .map_err(|e| anyhow!("invalid value for `{key}`: {e}"))?;
-    }
+    check_answering_seat(key, value)?;
 
     let mut root = load_object(path)?;
     set_path(&mut root, key, parsed.clone());
@@ -464,13 +464,34 @@ fn set_at(path: &Path, key: &str, value: &str) -> Result<String> {
     ))
 }
 
-/// The two keys that staff radio's answering seat. Their value may be a
+/// The keys that staff radio's answering seat. Their value may be a
 /// `<profile>@<machine>` address (the seat then runs on that fleet peer), so
 /// it is parsed where it is written: a malformed address is refused here, not
 /// found when the seat is first used.
 fn names_the_answering_seat(key: &str) -> bool {
-    key == "radio.answerer_profile" || key == "role_profiles.radio-host"
+    key == "radio.answerer_profile" || key == "role_profiles.radio-host" || key == FLEET_DEFAULT_SEAT_KEY
 }
+
+/// The address check for the answering-seat keys ([`names_the_answering_seat`]);
+/// any other key passes.
+fn check_answering_seat(key: &str, value: &str) -> Result<()> {
+    if !names_the_answering_seat(key) {
+        return Ok(());
+    }
+    let address = darkmux_types::profile_address::ProfileAddress::parse(value)
+        .map_err(|e| anyhow!("invalid value for `{key}`: {e}"))?;
+    if key == FLEET_DEFAULT_SEAT_KEY && address.machine.is_none() {
+        bail!(
+            "invalid value for `{key}`: `{value}` names no machine. A fleet default is read on machines \
+             whose registries differ from this one's, so it must be `<profile>@<machine>`"
+        );
+    }
+    Ok(())
+}
+
+/// The hub's fleet default for the answering seat (#3022). Unlike the
+/// machine's own seat, it must carry a machine: it is read on other machines.
+const FLEET_DEFAULT_SEAT_KEY: &str = "fleet.defaults.radio.answerer_profile";
 
 /// (#2782 C6) Appended to EVERY `config set` confirmation.
 ///
@@ -930,6 +951,22 @@ mod tests {
         assert!(err.contains("~/.darkmux/config.json") && err.contains("by hand"), "says how to remove it: {err}");
         // The answering seat is still ordinary work, still a profile binding.
         set_at(p, "role_profiles.radio-host", "deep").unwrap();
+        set_at(p, "radio.answerer_profile", "deep").unwrap();
+    }
+
+    /// (#3022) The hub's fleet default is read on machines whose registries
+    /// differ from the hub's, so a bare profile name is refused where it is
+    /// written; the machine's own seat still takes one.
+    #[test]
+    fn the_fleet_default_seat_must_name_a_machine() {
+        let f = tmp();
+        let p = f.path();
+        let key = "fleet.defaults.radio.answerer_profile";
+        let err = set_at(p, key, "deep").unwrap_err().to_string();
+        assert!(err.contains(key) && err.contains("<profile>@<machine>"), "names the form: {err}");
+        assert!(get_at(p, key).unwrap().contains("not set") || !get_at(p, key).unwrap().contains("deep"));
+        set_at(p, key, "deep@studio").unwrap();
+        assert!(get_at(p, key).unwrap().contains("deep@studio"));
         set_at(p, "radio.answerer_profile", "deep").unwrap();
     }
 

@@ -87,6 +87,8 @@ function mockMachineFetch(opts: {
   staticMachine?: unknown;
   /** (#2921 follow-up) `GET /fleet/roster` entries. */
   roster?: unknown[];
+  /** (#3022) `GET /fleet/view` rows. */
+  fleetView?: unknown[];
   /** (#2958) The flow window never answers (`true`), or answers once the
    *  promise resolves. */
   holdFlow?: boolean | Promise<void>;
@@ -142,6 +144,9 @@ function mockMachineFetch(opts: {
     if (path === "/fleet/dispatches/live") {
       return Promise.resolve(new Response(JSON.stringify({ dispatches: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }));
     }
+    if (path === "/fleet/view" && opts.fleetView) {
+      return Promise.resolve(new Response(JSON.stringify({ machines: opts.fleetView }), { status: 200 }));
+    }
     if (path === "/fleet/roster" && opts.roster) {
       return Promise.resolve(new Response(JSON.stringify({ machines: opts.roster, error: null }), { status: 200 }));
     }
@@ -176,6 +181,44 @@ describe("MachineLens", () => {
     renderMachine(FAKE_UID);
     await waitFor(() => expect(screen.getByText(/darkmux config set machine_id <name>/)).toBeInTheDocument());
     expect(UUID_RE.test(document.body.textContent ?? "")).toBe(false);
+  });
+
+  // (#3022) The header says HUB on the page of a machine whose card declares
+  // it, and only there.
+  describe("the HUB badge", () => {
+    const row = (mode: "hub" | "peer", over: Record<string, unknown> = {}) => ({
+      entry: null,
+      is_this_machine: false,
+      machine_uid: "u-mini",
+      card: { state: "available", card: { specs: { machine_uid: "u-mini" }, fleet_mode: mode }, source: "listener" },
+      ...over,
+    });
+
+    it("shows on a drilled machine that declares hub", async () => {
+      mockMachineFetch({ specs: { machine_id: "MacBook-Pro", machine_uid: "u-self" }, fleetView: [row("hub")] });
+      renderMachine("u-mini");
+      await waitFor(() => expect(document.querySelector('.machine-lens__hdr [data-testid="hub-badge"]')).not.toBeNull());
+    });
+
+    it("shows on this machine's own page when its own row declares hub", async () => {
+      mockMachineFetch({
+        specs: { machine_id: "MacBook-Pro", machine_uid: "u-self" },
+        fleetView: [row("hub", { is_this_machine: true, machine_uid: "u-self" })],
+      });
+      renderMachine(null);
+      await waitFor(() => expect(document.querySelector('.machine-lens__hdr [data-testid="hub-badge"]')).not.toBeNull());
+    });
+
+    it("never shows on a peer's page, nor on the page of a machine other than the hub", async () => {
+      mockMachineFetch({ specs: { machine_id: "MacBook-Pro", machine_uid: "u-self" }, fleetView: [row("hub")] });
+      renderMachine("u-studio");
+      await waitFor(() => expect(document.querySelector(".machine-lens__hdr")).not.toBeNull());
+      // The view was asked and answered before the absence is asserted.
+      const asked = () => (fetch as unknown as { mock: { calls: string[][] } }).mock.calls.some((c) => c[0] === "/fleet/view");
+      await waitFor(() => expect(asked()).toBe(true));
+      await new Promise((r) => setTimeout(r, 50));
+      expect(document.querySelector('[data-testid="hub-badge"]')).toBeNull();
+    });
   });
 
   it("uid: null (nav-tab/deep-link) is always the local machine — resources loads with real figures", async () => {

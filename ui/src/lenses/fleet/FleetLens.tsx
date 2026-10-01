@@ -13,6 +13,8 @@ import { REPLAY_GRANULARITY_NOTE, useLiveOverlay } from "../../lib/liveChannel";
 import { useCountUp } from "../../hooks/useCountUp";
 import { useFleetRoster, useLiveMachines } from "../../hooks/useLiveMachines";
 import { useFleetView } from "../../hooks/useFleetView";
+import { HubBadge } from "../../components/HubBadge";
+import { RadioSeatIcon } from "../../components/RadioSeatIcon";
 import { useFlip } from "../../hooks/useFlip";
 import { cardOrderKey, orderCards } from "./cardOrder";
 import { useCardOrderGate } from "./cardOrderGate";
@@ -116,6 +118,33 @@ function machineRunsHash(machineKey: string, runningSessionIds: string[]): strin
   return machineDrillHash(machineKey);
 }
 
+/** The card's name row: the machine icon, its name, what its own card
+ * declares (HUB), the radio seat it grants this machine, and the utility
+ * strip. One row, so a badge never changes the card's height. */
+function CardNameRow({ card, utilityQuietKnown }: { card: FleetCard; utilityQuietKnown: boolean }) {
+  return (
+    <div className="name">
+      <span className="mico">
+        <MachineIcon />
+      </span>
+      {/* (#2890) Its own box, so a long name ellipsizes beside the tube (a
+          flex row's bare text cannot); the full name is the tooltip. */}
+      <span className="mach-name" title={card.name}>
+        {card.name}
+      </span>
+      {/* (#3022) What the machine's own card declares. */}
+      <HubBadge declared={card.hub} />
+      {/* The radio seat this peer grants: an icon in the name row, where a
+          narrow card's ellipsis cannot cut it. */}
+      {card.grant?.radio ? <RadioSeatIcon /> : null}
+      {/* (#2915) The utility strip: a fixed box at the end of the name row,
+          always present, so a job starting or ending never changes the
+          card's layout. See `UtilityGlyph`. */}
+      <UtilityGlyph strip={card.utility} noSignal={!utilityQuietKnown} />
+    </div>
+  );
+}
+
 /** The card's subtitle line: the hardware, then (on a desktop) what the peer
  * lets this machine do; when the view could not read the machine, its typed
  * status in the dim style. One line, so the card keeps its height. */
@@ -125,7 +154,7 @@ function CardSpec({ card }: { card: FleetCard }) {
       {card.spec ? (
         <>
           {card.spec}
-          {card.grant ? <span className="spec__grant"> · {card.grant}</span> : null}
+          {card.grant?.text ? <span className="spec__grant"> · {card.grant.text}</span> : null}
         </>
       ) : (
         <span className="specdim">{specDimLabel(card)}</span>
@@ -1099,21 +1128,7 @@ export function FleetLens({
               }
             }}
           >
-            <div className="name">
-              <span className="mico">
-                <MachineIcon />
-              </span>
-              {/* (#2890) Its own box, so a long name ellipsizes beside the
-                  tube (a flex row's bare text cannot); the full name is the
-                  tooltip. */}
-              <span className="mach-name" title={card.name}>
-                {card.name}
-              </span>
-              {/* (#2915) The utility strip: a fixed box at the end of the
-                  name row, always present, so a job starting or ending never
-                  changes the card's layout. See `UtilityGlyph`. */}
-              <UtilityGlyph strip={card.utility} noSignal={!face.utilityQuietKnown} />
-            </div>
+            <CardNameRow card={card} utilityQuietKnown={face.utilityQuietKnown} />
             {/* (#1855) The dim fallback says WHICH kind of unknown this is —
                 a machine that beat and carried no hardware, vs one nothing
                 has ever been received from (a rostered-but-silent peer, the

@@ -280,6 +280,13 @@ pub struct MachineTelemetryPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub simulated_host_source: Option<String>,
+    /// (#3022) The fleet position this machine declares (`fleet.mode`) when
+    /// the record was written, so an archive and every consumer of the fleet
+    /// stream can tell which machine was the hub without asking it. Absent on
+    /// a record written before it was stamped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub fleet_mode: Option<darkmux_types::config::DeclaredFleetMode>,
 }
 
 impl Attribution for MachineTelemetryPayload {
