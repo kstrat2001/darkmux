@@ -53,13 +53,57 @@ pub struct StepErrorPayload {
     pub cause: String,
 }
 
+/// Query keys whose values are credentials, compared case-insensitively.
+const SECRET_QUERY_KEYS: [&str; 9] =
+    ["token", "access_token", "api_key", "apikey", "key", "sig", "signature", "secret", "password"];
+
+/// `text` with URL userinfo (`https://user:token@host`) dropped and the value
+/// of any token-looking query parameter replaced by `<redacted>`. An ssh-style
+/// `git@host:path` has no `://` and is left alone. The one place a step
+/// error's cause is cleaned; the flow's existing `redact_url_creds` keeps the
+/// username, which for `https://token@host` is the secret.
+fn redact_credentials(text: &str) -> String {
+    text.split(' ').map(redact_word).collect::<Vec<_>>().join(" ")
+}
+
+fn redact_word(word: &str) -> String {
+    let word = match word.split_once("://") {
+        Some((scheme, rest)) => {
+            let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+            let (authority, tail) = rest.split_at(end);
+            format!("{scheme}://{}{tail}", authority.rsplit('@').next().unwrap_or(authority))
+        }
+        None => word.to_string(),
+    };
+    let mut out = String::with_capacity(word.len());
+    let mut at_key = true;
+    let mut rest = word.as_str();
+    while !rest.is_empty() {
+        let end = rest.find(['?', '&', '#']).map_or(rest.len(), |i| i + 1);
+        let (piece, next) = rest.split_at(end);
+        let body = piece.trim_end_matches(['?', '&', '#']);
+        let delimiter = &piece[body.len()..];
+        match body.split_once('=') {
+            Some((key, _)) if at_key && SECRET_QUERY_KEYS.contains(&key.trim_start_matches('?').to_ascii_lowercase().as_str()) => {
+                out.push_str(key);
+                out.push_str("=<redacted>");
+            }
+            _ => out.push_str(body),
+        }
+        out.push_str(delimiter);
+        at_key = !delimiter.is_empty();
+        rest = next;
+    }
+    out
+}
+
 impl StepErrorPayload {
     /// The payload for a step that errored with `message`.
     pub fn from_message(message: &str) -> Self {
         // Line breaks and tabs become spaces first: the sanitizer drops control
         // characters outright, which would glue the words either side together.
         let spaced: String = message.chars().map(|c| if c.is_whitespace() { ' ' } else { c }).collect();
-        let cause = crate::hooks::sanitize_reason_text(&spaced);
+        let cause = crate::hooks::sanitize_reason_text(&redact_credentials(&spaced));
         Self { cause: crate::hooks::bound_reason_width(&cause, STEP_ERROR_CAUSE_COLUMNS) }
     }
 }
@@ -710,6 +754,21 @@ impl Attribution for BudgetPayload {
 #[cfg(test)]
 mod step_error_tests {
     use super::*;
+
+    /// (F9) A cause never records a URL's userinfo or a token-looking query
+    /// value: these records ride the fleet's shared stream.
+    #[test]
+    fn step_error_cause_redacts_url_credentials() {
+        let p = StepErrorPayload::from_message(
+            "clone failed: https://bob:s3cret@github.com/x.git and GET https://h/v1?api_key=abc&x=1 (also git@github.com:o/r.git, ?Access_Token=zzz)",
+        );
+        for secret in ["bob", "s3cret", "abc", "zzz"] {
+            assert!(!p.cause.contains(secret), "{secret} leaked: {}", p.cause);
+        }
+        assert!(p.cause.contains("https://github.com/x.git"), "{}", p.cause);
+        assert!(p.cause.contains("api_key=<redacted>&x=1"), "{}", p.cause);
+        assert!(p.cause.contains("git@github.com:o/r.git"), "ssh form untouched: {}", p.cause);
+    }
 
     /// (F9) The cause is one line with invisible and control characters gone,
     /// and a long message is cut to the column bound.

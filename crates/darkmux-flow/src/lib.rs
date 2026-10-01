@@ -3666,8 +3666,7 @@ mod tests {
         //            `FlowRecord.work_id` / `attempt`; `source` is closed
         //            (`FlowSource`), `tier` names who acted, and payload
         //            time keys use `*_ms` / `*_at_ms`. See schema.rs.
-        //   2.1.0 — (5.0 dogfood) additive: `step.error` carries `{cause}`.
-        assert_eq!(FLOW_SCHEMA_VERSION, "2.1.0");
+        assert_eq!(FLOW_SCHEMA_VERSION, "2.0.0");
     }
 
     #[test]
