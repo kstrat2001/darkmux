@@ -71,6 +71,28 @@ impl DispatchEnd {
     }
 }
 
+/// The raw facts a finished lab dispatch hands its provider. A provider
+/// derives how the dispatch ended from these (never from a value passed
+/// beside them), so what it records can only be what the dispatch reported.
+pub(crate) struct Dispatched {
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+impl Dispatched {
+    /// How this dispatch ended.
+    pub(crate) fn end(&self) -> DispatchEnd {
+        DispatchEnd::from_dispatch(self.exit_code, &self.stdout)
+    }
+
+    /// The `RunResult.error` for this dispatch: set only for a real failure.
+    /// An escalation is not an error (F2).
+    pub(crate) fn error(&self) -> Option<String> {
+        (self.end() == DispatchEnd::Failed).then(|| format!("runtime exit: {}", self.stderr))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
