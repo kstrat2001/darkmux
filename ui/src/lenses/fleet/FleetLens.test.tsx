@@ -3091,7 +3091,7 @@ describe("(#2915) fleet card: utility work is visible", () => {
     renderAt([...pepperRecords({ extra }), routeStart("radio_routing")], before);
     const el = await strip();
     expect(el.getAttribute("data-visual")).toBe("radio");
-    expect(el.querySelectorAll(".mach-util__arc")).toHaveLength(2);
+    expect(el.querySelector(".mach-util__antenna")).toBeTruthy();
     expect(latestTokenScopeProps().utility).toBeUndefined();
   });
 
@@ -3099,14 +3099,13 @@ describe("(#2915) fleet card: utility work is visible", () => {
     renderAt([...pepperRecords({ extra }), routeStart("radio_routing"), routeEnd], pepperAt("10:52:15"));
     const el = await strip();
     expect(el.getAttribute("data-visual")).toBe("quiet");
-    expect(el.querySelectorAll(".mach-util__arc")).toHaveLength(0);
   });
 
   it("a job this build has no visual for gets the generic indicator", async () => {
     renderAt([...pepperRecords({ extra }), routeStart("dream_job")], pepperAt("10:52:13"));
     const el = await strip();
     expect(el.getAttribute("data-visual")).toBe("generic");
-    expect(el.querySelector(".mach-util__ping")).toBeTruthy();
+    expect(el.querySelector(".mach-util__eye")).toBeTruthy();
     expect(el.getAttribute("aria-label")).toContain("dream job");
   });
 

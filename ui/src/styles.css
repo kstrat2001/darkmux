@@ -3584,62 +3584,55 @@ body {
   display: block;
   overflow: visible;
 }
-.mach-util__dot {
-  fill: currentColor;
-  stroke: currentColor;
-  stroke-width: 1;
-  opacity: 0.55;
-}
-.mach-util[data-dot="hollow"] .mach-util__dot {
-  fill: none;
-}
-.mach-util[data-dot="unknown"] .mach-util__dot {
-  fill: none;
-  stroke-dasharray: 1.4 1.4;
-}
-.mach-util:not([data-visual="quiet"]) .mach-util__dot {
-  opacity: 1;
-}
-.mach-util__arc,
-.mach-util__chev,
-.mach-util__ping {
+/* The robot (Lucide `bot`): its state is the dot's old state. */
+.mach-util__bot {
   fill: none;
   stroke: currentColor;
-  stroke-width: 1.4;
+  stroke-width: 2;
   stroke-linecap: round;
   stroke-linejoin: round;
+  opacity: 0.75;
 }
-/* Radio routing: the arcs radiate outward, inner then outer. */
-.mach-util__arc {
+.mach-util[data-dot="hollow"] .mach-util__bot {
+  opacity: 0.4;
+}
+.mach-util[data-dot="unknown"] .mach-util__bot {
+  stroke-dasharray: 2 2;
+  opacity: 0.6;
+}
+.mach-util:not([data-visual="quiet"]) .mach-util__bot {
+  opacity: 1;
+}
+.mach-util__antenna,
+.mach-util__body,
+.mach-util__eye {
+  transform-box: fill-box;
+  transform-origin: center;
+}
+/* Radio routing: the antenna blinks. */
+.mach-util[data-visual="radio"] .mach-util__antenna {
   animation: mach-util-radiate 1.2s ease-out infinite;
-}
-.mach-util__arc--2 {
-  animation-delay: 0.3s;
 }
 @keyframes mach-util-radiate {
   0% { opacity: 0.15; }
   35% { opacity: 1; }
   100% { opacity: 0.15; }
 }
-/* Compacting: the chevrons squeeze toward the dot. */
-.mach-util__chev--l { animation: mach-util-squeeze-l 1s ease-in-out infinite; }
-.mach-util__chev--r { animation: mach-util-squeeze-r 1s ease-in-out infinite; }
-@keyframes mach-util-squeeze-l {
-  0%, 100% { transform: translateX(0); }
-  50% { transform: translateX(2px); }
+/* Compacting: the body squeezes. */
+.mach-util[data-visual="compacting"] .mach-util__body {
+  animation: mach-util-squeeze 1s ease-in-out infinite;
 }
-@keyframes mach-util-squeeze-r {
-  0%, 100% { transform: translateX(0); }
-  50% { transform: translateX(-2px); }
+@keyframes mach-util-squeeze {
+  0%, 100% { transform: scaleX(1); }
+  50% { transform: scaleX(0.8); }
 }
-/* Any other job: a ring pulsing out of the dot. */
-.mach-util__ping {
-  transform-origin: 9px 8px;
-  animation: mach-util-ping 1.4s ease-out infinite;
+/* Any other job: the eyes pulse. */
+.mach-util[data-visual="generic"] .mach-util__eye {
+  animation: mach-util-ping 1.4s ease-in-out infinite;
 }
 @keyframes mach-util-ping {
-  0% { transform: scale(0.35); opacity: 1; }
-  100% { transform: scale(1); opacity: 0; }
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.2; }
 }
 .mach-util[data-stalled="true"] {
   color: var(--lamp-stall);
