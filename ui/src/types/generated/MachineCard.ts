@@ -34,15 +34,18 @@ seats?: CardSeats, governor: CardGovernor,
 /**
  * The fleet position this machine declares (`fleet.mode`). `unknown` is a
  * machine whose own setting is not a registered value, or a value a
- * newer darkmux states.
+ * newer darkmux states. Absent on a card from a darkmux that predates the
+ * field (card schema 1.0): that machine states no role, and none is
+ * guessed for it.
  */
-fleet_mode: DeclaredFleetMode, 
+fleet_mode?: DeclaredFleetMode, 
 /**
  * Whether this machine's own `redis.host` reaches this machine (loopback,
  * or its own overlay node): it runs the Redis its records and presence
- * go to. `false` when Redis is off here or points at another machine.
+ * go to. `false` when Redis is off here or points at another machine;
+ * absent on a card that predates the field.
  */
-hosts_fleet_redis: boolean, 
+hosts_fleet_redis?: boolean, 
 /**
  * The fleet defaults this machine hands out. Absent unless `fleet_mode`
  * is `hub`; read only through [`MachineCard::hub_defaults`].

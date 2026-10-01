@@ -1,5 +1,5 @@
 {
-  "card_schema_version": "1.0",
+  "card_schema_version": "1.1",
   "work_job_schema_version": "8.0",
   "specs": {
     "darkmux_version": "5.0.0",
@@ -81,6 +81,14 @@
       "refuse_start_below_min": false,
       "pause_running_below_min": false,
       "refusing_start": false
+    }
+  },
+  "fleet_mode": "hub",
+  "hosts_fleet_redis": true,
+  "fleet_defaults": {
+    "version": 1,
+    "radio": {
+      "answerer_profile": "deep@studio"
     }
   },
   "generated_at_ms": 2000,

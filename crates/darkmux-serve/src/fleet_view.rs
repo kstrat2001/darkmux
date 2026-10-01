@@ -398,10 +398,11 @@ impl FleetView {
 
 impl FleetMachine {
     /// The fleet position this machine's own card declares; `None` when no
-    /// card of it was read (a machine that did not answer states nothing).
+    /// card of it was read (a machine that did not answer states nothing), or
+    /// its card predates the field.
     pub fn declared_mode(&self) -> Option<DeclaredFleetMode> {
         match &self.card {
-            CardOutcome::Available { card, .. } => Some(card.fleet_mode),
+            CardOutcome::Available { card, .. } => card.fleet_mode,
             _ => None,
         }
     }
@@ -1387,7 +1388,7 @@ pub(crate) mod tests {
 
     fn declaring(id: &str, mode: DeclaredFleetMode) -> CardOutcome {
         let mut card = card_of(id);
-        card.fleet_mode = mode;
+        card.fleet_mode = Some(mode);
         CardOutcome::Available { card: Box::new(card), source: CardSource::Listener }
     }
 
@@ -1408,7 +1409,7 @@ pub(crate) mod tests {
             let mut view = gather_view(&s, FLEET_VIEW_CACHE_TTL);
             // This machine's own row is not under test: make it a peer.
             if let CardOutcome::Available { card, .. } = &mut view.machines[0].card {
-                card.fleet_mode = DeclaredFleetMode::Peer;
+                card.fleet_mode = Some(DeclaredFleetMode::Peer);
             }
             view
         };

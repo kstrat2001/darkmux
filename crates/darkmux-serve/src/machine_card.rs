@@ -51,7 +51,7 @@ use std::time::Duration;
 /// The card's own shape version. Minor for an added field a reader can
 /// ignore, major for a rename or retype. A peer whose card is on another
 /// major is shown as "card unavailable", never guessed at.
-pub const CARD_SCHEMA_VERSION: &str = "1.0";
+pub const CARD_SCHEMA_VERSION: &str = "1.1";
 
 /// What darkmux does at an endpoint (darkmux's own action, never a location
 /// or a cost), for a model, and for a profile as the sum of its models.
@@ -327,12 +327,19 @@ pub struct MachineCard {
     pub governor: CardGovernor,
     /// The fleet position this machine declares (`fleet.mode`). `unknown` is a
     /// machine whose own setting is not a registered value, or a value a
-    /// newer darkmux states.
-    pub fleet_mode: DeclaredFleetMode,
+    /// newer darkmux states. Absent on a card from a darkmux that predates the
+    /// field (card schema 1.0): that machine states no role, and none is
+    /// guessed for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub fleet_mode: Option<DeclaredFleetMode>,
     /// Whether this machine's own `redis.host` reaches this machine (loopback,
     /// or its own overlay node): it runs the Redis its records and presence
-    /// go to. `false` when Redis is off here or points at another machine.
-    pub hosts_fleet_redis: bool,
+    /// go to. `false` when Redis is off here or points at another machine;
+    /// absent on a card that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub hosts_fleet_redis: Option<bool>,
     /// The fleet defaults this machine hands out. Absent unless `fleet_mode`
     /// is `hub`; read only through [`MachineCard::hub_defaults`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -357,7 +364,7 @@ impl MachineCard {
     /// that decides it, so a card that is not the hub's never sets a default
     /// on any machine, whatever else it carries.
     pub fn hub_defaults(&self) -> Option<&CardFleetDefaults> {
-        (self.fleet_mode == DeclaredFleetMode::Hub)
+        (self.fleet_mode == Some(DeclaredFleetMode::Hub))
             .then_some(self.fleet_defaults.as_ref())
             .flatten()
             .filter(|d| d.version == FLEET_DEFAULTS_VERSION)
@@ -532,12 +539,12 @@ pub(crate) fn gather_local_card() -> MachineCard {
         profiles_error,
         seats,
         governor,
-        fleet_mode,
-        hosts_fleet_redis: hosts_fleet_redis(
+        fleet_mode: Some(fleet_mode),
+        hosts_fleet_redis: Some(hosts_fleet_redis(
             darkmux_types::config_access::redis_enabled(),
             darkmux_types::config_access::redis_host().as_deref(),
             || darkmux_fleet::configured_provider().ok().and_then(|p| p.local_node().ok()),
-        ),
+        )),
         fleet_defaults: card_fleet_defaults(fleet_mode),
         generated_at_ms: crate::current_millis(),
         gather_ms: started.elapsed().as_millis() as u64,
@@ -878,7 +885,7 @@ pub(crate) mod tests {
     // ── the declared role (#3022) ──────────────────────────────────────
 
     fn card_declaring(mode: DeclaredFleetMode, defaults: Option<CardFleetDefaults>) -> MachineCard {
-        MachineCard { fleet_mode: mode, fleet_defaults: defaults, ..sample_card() }
+        MachineCard { fleet_mode: Some(mode), fleet_defaults: defaults, ..sample_card() }
     }
 
     fn defaults_with(version: u32, profile: Option<&str>) -> CardFleetDefaults {
@@ -909,7 +916,7 @@ pub(crate) mod tests {
         let mut v = serde_json::to_value(sample_card()).unwrap();
         v["fleet_mode"] = serde_json::json!("regional_hub");
         let card: MachineCard = serde_json::from_value(v).unwrap();
-        assert_eq!(card.fleet_mode, DeclaredFleetMode::Unknown);
+        assert_eq!(card.fleet_mode, Some(DeclaredFleetMode::Unknown));
         assert!(card.hub_defaults().is_none());
     }
 
@@ -1019,8 +1026,8 @@ pub(crate) mod tests {
                     refusing_start: Some(false),
                 },
             },
-            fleet_mode: DeclaredFleetMode::Hub,
-            hosts_fleet_redis: true,
+            fleet_mode: Some(DeclaredFleetMode::Hub),
+            hosts_fleet_redis: Some(true),
             fleet_defaults: Some(CardFleetDefaults {
                 version: FLEET_DEFAULTS_VERSION,
                 radio: CardRadioDefaults { answerer_profile: Some("deep@studio".into()) },
@@ -1059,17 +1066,36 @@ pub(crate) mod tests {
         on_disk
     }
 
-    /// The 1.0 fixtures parse as themselves, through the parser peers use.
+    /// The current version's fixtures parse as themselves, through the parser
+    /// peers use.
     #[test]
-    fn the_1_0_card_fixtures_still_parse() {
-        let card = fixture("machine-card-1.0.json", &sample_card());
-        let card: MachineCard = serde_json::from_value(card).expect("the 1.0 card fixture parses");
-        assert_eq!(card.card_schema_version, "1.0");
+    fn the_current_card_fixtures_still_parse() {
+        let card = fixture(&format!("machine-card-{CARD_SCHEMA_VERSION}.json"), &sample_card());
+        let card: MachineCard = serde_json::from_value(card).expect("the current card fixture parses");
+        assert_eq!(card.card_schema_version, CARD_SCHEMA_VERSION);
         let listed = ListenerCard { card: sample_card(), grant: CardGrant::Listed { accepts: CardAccepts::from(&admitted()) } };
-        let listener = fixture("listener-card-1.0.json", &listed);
-        let listener: ListenerCard = serde_json::from_value(listener).expect("the 1.0 listener fixture parses");
+        let listener = fixture(&format!("listener-card-{CARD_SCHEMA_VERSION}.json"), &listed);
+        let listener: ListenerCard = serde_json::from_value(listener).expect("the current listener fixture parses");
         assert!(matches!(listener.grant, CardGrant::Listed { .. }));
         assert_eq!(listener.card.profiles.len(), 2);
+    }
+
+    /// A card from a peer on an older build. The 1.0 fixtures are what such a
+    /// peer sends, so they are frozen: never regenerated, only read. They parse
+    /// through today's parser, and a card that predates the fleet-role fields
+    /// states no role rather than a guessed one. (Live, 2026-10-01: with these
+    /// fields required, every peer still on the previous build read as
+    /// "unavailable / unparseable" on the fleet tab.)
+    #[test]
+    fn a_1_0_card_from_an_older_peer_still_parses() {
+        let read = |name: &str| std::fs::read_to_string(fixtures_dir().join(name)).unwrap();
+        let card: MachineCard = serde_json::from_str(&read("machine-card-1.0.json")).expect("a 1.0 card parses");
+        assert_eq!(card.card_schema_version, "1.0");
+        assert_eq!(card.fleet_mode, None, "a 1.0 card states no role");
+        assert_eq!(card.hosts_fleet_redis, None, "nor whether it hosts Redis");
+        assert!(card.hub_defaults().is_none());
+        let listener: ListenerCard = serde_json::from_str(&read("listener-card-1.0.json")).expect("a 1.0 listener card parses");
+        assert!(matches!(listener.grant, CardGrant::Listed { .. }));
     }
 
     /// A schema with its object keys sorted, so its hash does not move with

@@ -240,7 +240,7 @@ fn hub_row(
     const NAME: &str = "fleet hub";
     let hub_name = machine_name(view, hub);
     let hosts = match &hub.card {
-        CardOutcome::Available { card, .. } => card.hosts_fleet_redis,
+        CardOutcome::Available { card, .. } => card.hosts_fleet_redis == Some(true),
         _ => false,
     };
     if !hosts {
@@ -317,8 +317,8 @@ mod tests {
     fn card(mode: DeclaredFleetMode, hosts_redis: bool, profile: Option<&str>) -> MachineCard {
         let mut card: MachineCard =
             serde_json::from_str(include_str!("../crates/darkmux-serve/tests/fixtures/machine-card-1.0.json")).unwrap();
-        card.fleet_mode = mode;
-        card.hosts_fleet_redis = hosts_redis;
+        card.fleet_mode = Some(mode);
+        card.hosts_fleet_redis = Some(hosts_redis);
         card.fleet_defaults = Some(defaults(profile));
         card
     }
