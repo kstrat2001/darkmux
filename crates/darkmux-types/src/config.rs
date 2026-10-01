@@ -462,10 +462,16 @@ pub const RETIRED_SETTINGS: &[RetiredSetting] = &[
     },
     RetiredSetting {
         key: "machine_rollup",
-        env: Some("DARKMUX_MACHINE_ROLLUP_ENABLED"),
-        env_policy: LeftoverPolicy::Warn,
+        env: None,
+        env_policy: LeftoverPolicy::Refuse,
         line: "removed in 5.0 (#3036): the periodic `machine.rollup` flow record is gone; the machine lens reads \
                `GET /machine/resources`. Delete the block",
+    },
+    RetiredSetting {
+        key: "machine_rollup.enabled",
+        env: Some("DARKMUX_MACHINE_ROLLUP_ENABLED"),
+        env_policy: LeftoverPolicy::Warn,
+        line: "removed in 5.0 (#3036) with the rest of `machine_rollup`. Delete it",
     },
     RetiredSetting {
         key: "machine_rollup.period_seconds",
@@ -1949,9 +1955,9 @@ impl FleetMode {
 // an unrecognized token is refused at `config_access::fleet_mode`, never
 // read as `standalone`.
 crate::config_enum!(FleetMode, "fleet position", [
-    Standalone = "standalone" => "viewer links name this machine's own address (the fleet listener and roster are separate settings, unaffected)",
-    Hub = "hub" => "viewer links prefer the tailnet address when `tailscale serve` proxies to this daemon (the fleet listener and roster are separate settings, unaffected)",
-    Peer = "peer" => "viewer links prefer the tailnet address when `tailscale serve` proxies to this daemon (the fleet listener and roster are separate settings, unaffected)",
+    Standalone = "standalone" => "stated on the card, presence and telemetry; viewer links name this machine's own address (the fleet listener and roster are separate settings, unaffected)",
+    Hub = "hub" => "stated on the card, presence and telemetry, which gives the Fleet lens its HUB badge and lets the card hand out `fleet.defaults`; viewer links prefer the tailnet address when `tailscale serve` proxies to this daemon (the fleet listener and roster are separate settings, unaffected)",
+    Peer = "peer" => "stated on the card, presence and telemetry; viewer links prefer the tailnet address when `tailscale serve` proxies to this daemon (the fleet listener and roster are separate settings, unaffected)",
 ]);
 
 /// A machine's declared fleet position as it travels on the wire: in its card,

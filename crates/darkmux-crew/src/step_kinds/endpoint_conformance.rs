@@ -60,7 +60,10 @@ const FORBIDDEN: &[Idiom] = &[
     Idiom { pattern: "insert(\"max_tokens\"", route: "single_shot::chat_body" },
     Idiom { pattern: "\"max_completion_tokens\":", route: "single_shot::chat_body" },
     Idiom { pattern: "select_model(", route: "target::resolve_in / target::select_in_profile" },
-    Idiom { pattern: "ManagedBackend::Lmstudio", route: "EndpointKind::is_managed (\"is this endpoint managed\" means ANY managed backend); name LM Studio only where the code is genuinely LM Studio's" },
+    Idiom { pattern: "Lmstudio", route: "EndpointKind::is_managed (\"is this endpoint managed\" means ANY managed backend); name LM Studio only where the code is genuinely LM Studio's. Catches `ManagedBackend::Lmstudio` and a bare `Lmstudio` after a `use`" },
+    Idiom { pattern: "ManagedBackend::*", route: "EndpointKind::is_managed; a glob import of the backend enum hides which backend a match names" },
+    Idiom { pattern: "ManagedBackend::{", route: "EndpointKind::is_managed; a brace import of the backend enum hides which backend a match names" },
+    Idiom { pattern: "\"lmstudio\"", route: "EndpointKind::is_managed; do not compare the backend's wire name as a string" },
 ];
 
 /// The homes: `(workspace-relative file, pattern, count, why)`.
@@ -72,9 +75,12 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
     ("crates/darkmux-doctor/src/lib.rs", ".key_env", 1, "a message naming the field `endpoint.auth.key_env`"),
     ("crates/darkmux-crew/src/single_shot.rs", "insert(\"max_completion_tokens\"", 1, "THE body builder, chat-completions dialect"),
     ("crates/darkmux-crew/src/single_shot.rs", "insert(\"max_tokens\"", 1, "THE body builder, chat-completions-max-tokens dialect"),
-    ("crates/darkmux-types/src/endpoint.rs", "ManagedBackend::Lmstudio", 3, "the backend's own facts: its default dialect, the `managed: lmstudio` constructor, and its chat URL (the configured LM Studio address)"),
-    ("crates/darkmux-types/src/lib.rs", "ManagedBackend::Lmstudio", 1, "a model that names no endpoint is on the one managed backend darkmux has"),
-    ("crates/darkmux-doctor/src/lib.rs", "ManagedBackend::Lmstudio", 1, "the endpoints row's label names the backend (display only)"),
+    ("crates/darkmux-types/src/endpoint.rs", "Lmstudio", 5, "the backend's own facts: the enum variant and its config_enum entry, its default dialect, the `managed: lmstudio` constructor, and its chat URL (the configured LM Studio address)"),
+    ("crates/darkmux-types/src/endpoint.rs", "\"lmstudio\"", 1, "the backend's serde/config spelling (the config_enum token)"),
+    ("crates/darkmux-types/src/lib.rs", "Lmstudio", 1, "a model that names no endpoint is on the one managed backend darkmux has"),
+    ("crates/darkmux-types/src/lib.rs", "\"lmstudio\"", 1, "the fallback endpoint-key label for a host-less (managed) endpoint, a name not a test"),
+    ("crates/darkmux-doctor/src/lib.rs", "Lmstudio", 1, "the endpoints row's label names the backend (display only)"),
+    ("crates/darkmux-lab/src/lab/scores.rs", "\"lmstudio\"", 1, "the engine label stamped on a score when the engine version is known (a recorded fact)"),
     ("crates/darkmux-crew/src/target.rs", "select_model(", 1, "THE resolver's selection (select_in_profile)"),
     ("crates/darkmux-types/src/endpoint.rs", ".keychain", 3, "THE credential order (credential_source), and validate()'s source check with its message"),
     ("crates/darkmux-crew/src/dispatch_internal.rs", ".keychain", 2, "resolve_endpoint_secret: the env var vanished between credential_source and the read, fall to the same declared item; and a message naming the field"),
@@ -204,4 +210,25 @@ fn the_sweep_counts_production_idioms_and_skips_test_modules() {
     let more = production_text("fn e(b: &str) -> String { format!(\"{b}/{}\", \"chat/completions\") }\nfn f(pm: &P) -> bool { pm.endpoint.is_some() }\n");
     assert_eq!(more.matches("chat/completions").count(), 1);
     assert_eq!(more.matches(".endpoint.is_some()").count(), 1);
+}
+
+/// (#3035 review) The LM Studio guard is a SPELLING tripwire: it catches the
+/// idioms below and nothing cleverer (an alias, a macro, a value built at
+/// run time slips past it). Each known bypass of the qualified spelling is a
+/// FORBIDDEN pattern, and each is counted here in planted production source.
+#[test]
+fn the_lmstudio_guard_catches_each_known_bypass_of_the_qualified_spelling() {
+    let bypasses = [
+        ("use darkmux_types::ManagedBackend::*;\nfn a(k: K) -> bool { matches!(k, Managed(Lmstudio)) }\n", "ManagedBackend::*"),
+        ("use darkmux_types::ManagedBackend::{Lmstudio};\n", "ManagedBackend::{"),
+        ("use darkmux_types::ManagedBackend::Lmstudio;\nfn a(k: K) -> bool { k == Managed(Lmstudio) }\n", "Lmstudio"),
+        ("fn a(b: &str) -> bool { b == \"lmstudio\" }\n", "\"lmstudio\""),
+    ];
+    for (src, pattern) in bypasses {
+        let text = production_text(src);
+        assert!(FORBIDDEN.iter().any(|i| i.pattern == pattern), "{pattern} is not a FORBIDDEN idiom");
+        assert!(text.matches(pattern).count() >= 1, "{pattern} not seen in {text}");
+    }
+    // A test module naming it is not production.
+    assert_eq!(production_text("#[cfg(test)]\nmod tests {\n    fn t() { let _ = \"lmstudio\"; }\n}\n").matches("lmstudio").count(), 0);
 }

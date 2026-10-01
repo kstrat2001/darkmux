@@ -10653,7 +10653,7 @@ mod tests {
     /// a fleet listener and have peers in its roster.
     #[test]
     #[serial_test::serial]
-    fn the_fleet_mode_row_says_it_controls_viewer_links_only() {
+    fn the_fleet_mode_row_says_what_the_mode_drives() {
         let prev = std::env::var("DARKMUX_FLEET_MODE").ok();
         unsafe { std::env::remove_var("DARKMUX_FLEET_MODE") };
         let rows = check_enum_settings();
@@ -10664,6 +10664,7 @@ mod tests {
         }
         let row = rows.iter().find(|c| c.name == "fleet.mode").expect("the fleet.mode row");
         assert!(row.message.contains("viewer links"), "{}", row.message);
+        assert!(row.message.contains("card") && row.message.contains("presence"), "{}", row.message);
         assert!(!row.message.contains("coordinates nothing"), "{}", row.message);
     }
 

@@ -780,14 +780,19 @@ darkmux release.
   integration for your own project is unchanged.
 - **`runtime.log_level` and `DARKMUX_LOG` are gone** (CONFIG 2.2). The setting
   switched on one debug line on the tool-less hosted dispatch path and nothing
-  else read it. A leftover `runtime.log_level` in `config.json` is named by
-  `darkmux doctor`; a leftover `DARKMUX_LOG` warns and is ignored.
+  else read it. A leftover `runtime.log_level` in `config.json` makes every entry
+  point refuse at preflight until you delete it, and `darkmux doctor` fails it;
+  a leftover `DARKMUX_LOG` warns and is ignored. **Upgraders:** `darkmux init`
+  wrote `runtime.log_level` into every config before this release, so delete it.
 - **The `machine_rollup` block, its two env vars and the `machine.rollup` flow
   record are gone** (CONFIG 2.2, FLOW 2.0.0). Nothing replaced the periodic
   whole-machine heartbeat: the machine lens reads `GET /machine/resources`.
-  `darkmux doctor` loses its `machine_rollup` row, names a leftover
-  `machine_rollup` block, and an archived `machine.rollup` record reads as an
-  unknown action. The two `DARKMUX_MACHINE_ROLLUP_*` vars warn and are ignored.
+  `darkmux doctor` loses its `machine_rollup` row, and an archived
+  `machine.rollup` record reads as an unknown action. A leftover `machine_rollup`
+  block makes every entry point refuse at preflight until you delete it, and
+  doctor fails it; the two `DARKMUX_MACHINE_ROLLUP_*` vars warn and are ignored.
+  **Upgraders:** `init` wrote the block into every config before this release,
+  so delete it (and `runtime.log_level`).
 - **`fleet.accept_work.<name>.workspace` is a receiver path grant and nothing
   more** (CONFIG 2.2). It never authorizes a fetch, a checkout or a push; git
   handoff (#755) gets its own grant, and its checkouts live outside the

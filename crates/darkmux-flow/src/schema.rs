@@ -147,7 +147,7 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
 //           `wait_seconds` / ISO `resume_at` are `wait_ms` / `resume_at_ms`,
 //           `utility.start`'s `stall_after_seconds` is `stall_after_ms`,
 //           `machine.rollup`'s `period_seconds` is `period_ms` (that action
-//           is gone since 5.0, see the note below),
+//           is gone since 5.0, see the note above),
 //           `dispatch.complete`'s `live.sampler_us` / `forward_us` are
 //           `sampler_ms` / `forward_ms`, `machine.battery_health`'s
 //           `total_operating_time_hours` / `time_at_soc_hours` are

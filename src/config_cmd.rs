@@ -1314,6 +1314,20 @@ mod tests {
         assert!(set_at(&path, "serve.read_auth", "maybe").is_err());
     }
 
+    /// (#3036) The removed `machine_rollup` keys are named as removed, never
+    /// answered with a near-miss like `audit.enabled`.
+    #[test]
+    fn config_set_names_the_removed_machine_rollup_keys() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, "{}").unwrap();
+        for key in ["machine_rollup.enabled", "machine_rollup.period_seconds", "runtime.log_level"] {
+            let err = set_at(&path, key, "true").unwrap_err().to_string();
+            assert!(err.contains("removed in 5.0") && !err.contains("audit.enabled"), "{key}: {err}");
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}", "nothing was written");
+    }
+
     /// `config set` refuses a retired key, naming what replaced it, and writes
     /// nothing.
     #[test]
