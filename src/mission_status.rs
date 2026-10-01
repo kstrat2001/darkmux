@@ -524,6 +524,7 @@ fn peer_status_word(status: RunStatus, reason: Option<AbandonReason>) -> &'stati
     match (status, reason) {
         (RunStatus::Running, _) => "running",
         (RunStatus::Complete, _) => "complete",
+        (RunStatus::Degraded, _) => "degraded",
         (RunStatus::Abandoned, Some(AbandonReason::Aborted)) => "aborted",
         // No terminal record and not currently live — silent, not a verdict.
         (RunStatus::Abandoned, _) => "silent (no terminal record seen)",
@@ -5193,6 +5194,7 @@ mod tests {
         // teardown.
         assert_eq!(peer_status_word(RunStatus::Running, None), "running");
         assert_eq!(peer_status_word(RunStatus::Complete, None), "complete");
+        assert_eq!(peer_status_word(RunStatus::Degraded, None), "degraded");
         assert_eq!(
             peer_status_word(RunStatus::Abandoned, Some(AbandonReason::Aborted)),
             "aborted",

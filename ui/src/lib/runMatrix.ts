@@ -23,7 +23,8 @@ import type { Run } from "../types/generated/Run";
  * (`crates/darkmux-serve/src/runs.rs`):
  *
  * - `mission_run_status` — missions, and dispatches, which are a SHAPE of
- *   mission (`classify_mission`) and therefore share its mapper. All but `escalated`.
+ *   mission (`classify_mission`) and therefore share its mapper. All but `escalated`
+ *   (`degraded` is the mission envelope's own status, so only these two kinds reach it).
  * - `lab_run_status` — lab runs. No `planned` (a lab run exists because it
  *   was dispatched) and no `unparseable` (that verdict comes from a mission
  *   envelope a lab run does not have). The only mapper that reaches
@@ -39,6 +40,7 @@ export const REACHABLE: Record<RunKind, Record<RunStatus, boolean>> = {
     planned: true,
     running: true,
     complete: true,
+    degraded: true,
     error: true,
     escalated: false,
     abandoned: true,
@@ -48,6 +50,7 @@ export const REACHABLE: Record<RunKind, Record<RunStatus, boolean>> = {
     planned: true,
     running: true,
     complete: true,
+    degraded: true,
     error: true,
     escalated: false,
     abandoned: true,
@@ -57,6 +60,7 @@ export const REACHABLE: Record<RunKind, Record<RunStatus, boolean>> = {
     planned: false,
     running: true,
     complete: true,
+    degraded: false,
     error: true,
     escalated: true,
     abandoned: true,
@@ -91,6 +95,7 @@ export const REACHABLE_UNTRACKED: Record<RunKind, Record<RunStatus, boolean>> = 
     planned: false,
     running: true,
     complete: true,
+    degraded: false,
     error: false,
     escalated: false,
     abandoned: true,
@@ -100,6 +105,7 @@ export const REACHABLE_UNTRACKED: Record<RunKind, Record<RunStatus, boolean>> = 
     planned: false,
     running: true,
     complete: true,
+    degraded: false,
     error: true,
     escalated: false,
     abandoned: true,
@@ -109,6 +115,7 @@ export const REACHABLE_UNTRACKED: Record<RunKind, Record<RunStatus, boolean>> = 
     planned: false,
     running: false,
     complete: false,
+    degraded: false,
     error: false,
     escalated: false,
     abandoned: false,

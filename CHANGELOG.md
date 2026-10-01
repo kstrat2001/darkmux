@@ -16,6 +16,12 @@ darkmux release.
 
 ### Changed (breaking, 4.0)
 
+- **`RunStatus` gains `degraded` and `escalated`** (`/runs`, `run list`, `run list --json`).
+  A run whose envelope says `degraded` (a unit cut at its bound, a step that
+  completed with partial work, the wall-clock bound) now reads `degraded` instead
+  of `complete`, and a lab run whose dispatch escalated on purpose reads
+  `escalated` instead of `error`. A run's status is decided in one place
+  (`MissionOutcomeStatus::decide`) and its exit code is derived from it.
 - **The registered utility model stays loaded across dispatches.** A dispatch
   that does not name it no longer unloads it, and neither do the budget and
   pool-pressure evictions; a load that would fit only by evicting it is

@@ -974,7 +974,7 @@ RunStats
   flow_records_in_window: uint
   flow_scan: FlowScan
   checks: RunChecks
-RunStatus = "planned" | "running" | "complete" | "error" | "abandoned" | "escalated" | "unparseable"
+RunStatus = "planned" | "running" | "complete" | "error" | "abandoned" | "degraded" | "escalated" | "unparseable"
 RuntimeBounds
   max_tokens_per_call: Knob
   inactivity_timeout_seconds: Knob

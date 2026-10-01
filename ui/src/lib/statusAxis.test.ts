@@ -27,6 +27,7 @@ const ALL_STATUSES: RunStatus[] = [
   "planned",
   "running",
   "complete",
+  "degraded",
   "error",
   "escalated",
   "abandoned",

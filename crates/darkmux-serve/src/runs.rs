@@ -91,6 +91,12 @@ pub enum RunStatus {
     Planned,
     Running,
     Complete,
+    /// (F10/F11) The run finished and produced real output, but part of its
+    /// work was lost or cut at a bound (a unit hit its turn cap, a step
+    /// completed with partial work, the wall-clock bound fired). The mission
+    /// envelope's `degraded` status, shown as its own word instead of
+    /// `complete` so a cut-off run never reads as a clean one.
+    Degraded,
     Error,
     /// (F2) The run's dispatch stopped on purpose and handed the work to a
     /// higher tier (a lab run's manifest names the runtime's `escalation_*`
@@ -1518,35 +1524,23 @@ fn mission_finalized_status(mission: &Mission) -> RunStatus {
             }
             Ok(Some(envelope)) => {
                 // (#1877 item 4 — stated decision) `envelope.outcome`'s typed
-                // `RunOutcome::Partial` is NOT read here. `RunStatus` has no
-                // partial-coverage value among its states
-                // (`Planned`/`Running`/`Complete`/`Abandoned`/`Error`/
-                // `Unparseable`), and `status` already collapses
-                // `Partial` into `Degraded` before this match ever runs
-                // (`MissionOutcomeStatus::from_outcome`), so a Partial review's
-                // `Degraded` status falls into the `Clean | Degraded => Complete`
-                // arm below — same as it did before #1877, when Degraded was
-                // purely convention. Widening `RunStatus` to distinguish
-                // "complete" from "complete but constrained" is a real,
-                // separate feature (a dashboard-visible partial badge) this
-                // PR does not add.
+                // `RunOutcome::Partial` is NOT read here: `status` already
+                // collapses `Partial` into `Degraded`
+                // (`MissionOutcomeStatus::from_outcome`), and `Degraded` has
+                // its own `RunStatus` (F10/F11), so a cut-off or partial run
+                // never reads `Complete`.
                 //
-                // (#1881) `outcome`'s own leniency (`RunOutcome::Unknown`,
-                // `run_outcome.rs`) is likewise not read here — unaffected
-                // by this fix, same reasoning as the paragraph above. What
-                // #1881 DOES change: `envelope.status` itself can now be
+                // (#1881) `envelope.status` itself can be
                 // `MissionOutcomeStatus::Unknown` (a status value this
                 // binary doesn't recognize, degraded via `#[serde(other)]`
-                // rather than failing the whole parse) — and unlike
-                // `outcome`, `status` IS what this match reads. An unknown
-                // status is exactly the "this binary cannot tell you what
-                // happened" case `Unparseable` exists for, so it gets its
-                // own arm rather than falling into the `Clean | Degraded`
-                // wildcard the way a genuinely-known Degraded/Clean does.
+                // rather than failing the whole parse). That is exactly the
+                // "this binary cannot tell you what happened" case
+                // `Unparseable` exists for, so it gets its own arm.
                 match envelope.status {
                     MissionOutcomeStatus::Error | MissionOutcomeStatus::Degenerate => RunStatus::Error,
                     MissionOutcomeStatus::Unknown => RunStatus::Unparseable,
-                    MissionOutcomeStatus::Clean | MissionOutcomeStatus::Degraded => RunStatus::Complete,
+                    MissionOutcomeStatus::Degraded => RunStatus::Degraded,
+                    MissionOutcomeStatus::Clean => RunStatus::Complete,
                 }
             }
         }
@@ -3253,15 +3247,13 @@ mod tests {
         assert_eq!(mission_run_status(&m, &[], now_unix() * 1_000), RunStatus::Error);
     }
 
-    /// (#1877 item 4 — stated decision, pinned) A `RunOutcome::Partial`
-    /// envelope collapses into `RunStatus::Complete` here, same as a plain
-    /// `Degraded` one — `RunStatus` has no partial-coverage state and this
-    /// site deliberately does not read `envelope.outcome` to invent one. If
-    /// this test ever needs to change, that is the moment `RunStatus` grows
-    /// a real partial state, not an accidental regression.
-    #[test]
+    /// (#1877 item 4 — stated decision, pinned; F10/F11) A `RunOutcome::Partial`
+    /// envelope collapses into `Degraded` and reads `RunStatus::Degraded`,
+    /// never `Complete`: a cut-off or partial run is not a clean one, and this
+    /// site deliberately does not read `envelope.outcome` to invent a finer state.
+        #[test]
     #[serial_test::serial]
-    fn mission_run_status_finalized_partial_outcome_envelope_reads_complete_not_a_new_state() {
+    fn mission_run_status_finalized_degraded_envelope_reads_degraded_never_complete() {
         let _g = CrewGuard::new();
         darkmux_crew::lifecycle::save_mission(&minimal_mission("m8", vec![], None)).unwrap();
         let mut m = minimal_mission("m8", vec![], None);
@@ -3276,7 +3268,7 @@ mod tests {
         );
         assert_eq!(partial_env.status, MissionOutcomeStatus::Degraded);
         darkmux_crew::envelope::finalize_mission(&partial_env);
-        assert_eq!(mission_run_status(&m, &[], now_unix() * 1_000), RunStatus::Complete);
+        assert_eq!(mission_run_status(&m, &[], now_unix() * 1_000), RunStatus::Degraded);
     }
 
     /// (#1892) `MissionStatus` has exactly four variants; no wildcard, so a
@@ -3450,7 +3442,7 @@ mod tests {
         let status = mission_run_status(&m, &[], now_unix() * 1_000);
         assert_eq!(
             status,
-            RunStatus::Complete,
+            RunStatus::Degraded,
             "outcome is supplementary and never read for RunStatus — a known status must still be trusted even when outcome's own detail is unrecognized"
         );
     }
@@ -7631,6 +7623,9 @@ mod tests {
             (RunKind::Mission | RunKind::Dispatch, RunStatus::Planned) => true,
             (RunKind::Mission | RunKind::Dispatch, RunStatus::Running) => true,
             (RunKind::Mission | RunKind::Dispatch, RunStatus::Complete) => true,
+            // (F10/F11) The mission envelope's `degraded` status; a dispatch
+            // is a crew-of-one mission, whose non-zero exit finalizes degraded.
+            (RunKind::Mission | RunKind::Dispatch, RunStatus::Degraded) => true,
             (RunKind::Mission | RunKind::Dispatch, RunStatus::Error) => true,
             (RunKind::Mission | RunKind::Dispatch, RunStatus::Abandoned) => true,
             (RunKind::Mission | RunKind::Dispatch, RunStatus::Unparseable) => true,
@@ -7640,6 +7635,8 @@ mod tests {
             (RunKind::Lab, RunStatus::Planned) => false,
             (RunKind::Lab, RunStatus::Running) => true,
             (RunKind::Lab, RunStatus::Complete) => true,
+            // A lab run has no mission envelope; its manifest says ok or not.
+            (RunKind::Lab, RunStatus::Degraded) => false,
             (RunKind::Lab, RunStatus::Error) => true,
             (RunKind::Lab, RunStatus::Abandoned) => true,
             (RunKind::Lab, RunStatus::Unparseable) => false,
@@ -7665,7 +7662,10 @@ mod tests {
             (RunKind::Dispatch, RunStatus::Complete) => true,
             (RunKind::Dispatch, RunStatus::Error) => true,
             (RunKind::Dispatch, RunStatus::Abandoned) => true,
-            (RunKind::Dispatch, RunStatus::Planned | RunStatus::Unparseable | RunStatus::Escalated) => false,
+            (
+                RunKind::Dispatch,
+                RunStatus::Planned | RunStatus::Degraded | RunStatus::Unparseable | RunStatus::Escalated,
+            ) => false,
             // `flow_mission_to_run`: a peer's mission, judged only by its
             // own terminal record and its sessions' liveness. It has no
             // envelope to read here, so no Error and no Unparseable.
@@ -7674,17 +7674,22 @@ mod tests {
             (RunKind::Mission, RunStatus::Abandoned) => true,
             (
                 RunKind::Mission,
-                RunStatus::Planned | RunStatus::Error | RunStatus::Unparseable | RunStatus::Escalated,
+                RunStatus::Planned
+                | RunStatus::Degraded
+                | RunStatus::Error
+                | RunStatus::Unparseable
+                | RunStatus::Escalated,
             ) => false,
             (RunKind::Lab, _) => false,
         }
     }
 
     const ALL_KINDS: [RunKind; 3] = [RunKind::Mission, RunKind::Dispatch, RunKind::Lab];
-    const ALL_STATUSES: [RunStatus; 7] = [
+    const ALL_STATUSES: [RunStatus; 8] = [
         RunStatus::Planned,
         RunStatus::Running,
         RunStatus::Complete,
+        RunStatus::Degraded,
         RunStatus::Error,
         RunStatus::Escalated,
         RunStatus::Abandoned,
@@ -7708,7 +7713,7 @@ mod tests {
             .flat_map(|k| ALL_STATUSES.iter().map(move |s| (*k, *s)))
             .filter(|(k, s)| untracked_cell_is_reachable(*k, *s))
             .count();
-        assert_eq!(tracked, 17, "tracked cells: mission 6 + dispatch 6 + lab 5");
+        assert_eq!(tracked, 19, "tracked cells: mission 7 + dispatch 7 + lab 5");
         assert_eq!(untracked, 7, "untracked cells: ghost dispatch 4 + peer mission 3");
     }
 

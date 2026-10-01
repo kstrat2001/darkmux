@@ -120,7 +120,7 @@ describe("runStatusLabel", () => {
     expect(runStatusLabel(r)).toBe("no ending recorded");
   });
   it("leaves every other status unchanged", () => {
-    for (const status of ["planned", "running", "complete", "error", "unparseable"] as const) {
+    for (const status of ["planned", "running", "complete", "degraded", "error", "unparseable"] as const) {
       expect(runStatusLabel(run({ id: "a", kind: "mission", status, tracked: true }))).toBe(status);
     }
   });
