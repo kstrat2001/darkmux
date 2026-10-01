@@ -233,6 +233,10 @@ impl WorkJob {
 
 #[cfg(test)]
 mod tests {
+    // Every test that runs a job is `#[serial_test::serial]`: the in-flight
+    // count (`dispatch_in_flight`) is process-wide, and `cargo test` runs
+    // tests on parallel threads (the coverage job does), so another test's
+    // job could be in flight while one asserts the count is zero.
     use super::*;
 
     fn job() -> WorkJob {
@@ -270,6 +274,7 @@ mod tests {
 
     /// A job that fails its shape check never reaches dispatch.
     #[test]
+    #[serial_test::serial]
     fn execute_job_refuses_a_malformed_job_before_dispatch() {
         let mut j = job();
         j.role_id = "../x".into();
@@ -281,6 +286,7 @@ mod tests {
     /// The last guard before execution: a boundary this darkmux does not
     /// know fails closed, and the dispatch closure never runs.
     #[test]
+    #[serial_test::serial]
     fn execute_job_refuses_an_unknown_boundary() {
         let mut j = job();
         j.boundary = Some(crate::Boundary::Unknown);
@@ -291,6 +297,7 @@ mod tests {
 
     /// A workdir outside the worktrees base is refused before dispatch.
     #[test]
+    #[serial_test::serial]
     fn execute_job_refuses_a_workdir_outside_the_worktrees_base() {
         let mut j = job();
         j.workdir = Some("/etc".into());
@@ -301,6 +308,7 @@ mod tests {
     /// (#2916 review C3/M2) What reaches dispatch: the RESOLVED profile
     /// (not the job's own request), the remote origin, never a forward.
     #[test]
+    #[serial_test::serial]
     fn execute_job_hands_dispatch_the_resolved_profile_and_the_origin() {
         let mut seen = None;
         let r = execute_job_with(job(), "resolved-host".into(), "laptop".into(), |o| {
@@ -386,6 +394,7 @@ mod tests {
     /// surface the sender named, no autonomous-dispatch preamble, and the
     /// budget the sender asked for (under this machine's cap).
     #[test]
+    #[serial_test::serial]
     fn a_single_shot_job_gets_the_receivers_own_persona_and_the_requested_budget() {
         let mut seen = None;
         execute_job_with(answering_job(5_000), "deep".into(), "laptop".into(), |o| {
@@ -405,6 +414,7 @@ mod tests {
     /// The machine that runs the model owns its limit: a sender asking for
     /// more than this machine's cap runs under the cap.
     #[test]
+    #[serial_test::serial]
     fn a_single_shot_budget_is_bounded_by_the_receivers_own_cap() {
         let mut seen = None;
         execute_job_with(answering_job(u32::MAX), "deep".into(), "laptop".into(), |o| {
@@ -417,6 +427,7 @@ mod tests {
 
     /// An ordinary job is untouched: no override, no budget.
     #[test]
+    #[serial_test::serial]
     fn an_ordinary_job_carries_no_persona_and_no_budget() {
         let mut seen = None;
         execute_job_with(job(), "host".into(), "laptop".into(), |o| {
@@ -429,6 +440,7 @@ mod tests {
 
     /// `single_shot` on another role never reaches dispatch.
     #[test]
+    #[serial_test::serial]
     fn a_single_shot_job_for_another_role_is_refused_before_dispatch() {
         let mut j = answering_job(1_000);
         j.role_id = "coder".into();
@@ -439,6 +451,7 @@ mod tests {
     /// (#2916 stage 2) Several jobs may run at once: in-flight stays true
     /// until the LAST one ends, so the daemon's shutdown still waits for it.
     #[test]
+    #[serial_test::serial]
     fn in_flight_counts_every_running_job() {
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
@@ -463,6 +476,7 @@ mod tests {
 
     /// A panicking dispatch is caught, reported, and the in-flight flag clears.
     #[test]
+    #[serial_test::serial]
     fn execute_job_survives_a_panicking_dispatch() {
         let err = execute_job_with(job(), "host".into(), "laptop".into(), |_| panic!("boom")).unwrap_err();
         assert!(format!("{err:#}").contains("panicked"));
