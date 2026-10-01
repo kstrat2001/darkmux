@@ -212,6 +212,7 @@ mod tests {
         let mut esc = outcome("e", false, Some(false), 1);
         esc.escalation = Some("escalation_compaction_reread_loop".into());
         let text = render_report(&report(vec![esc.clone()]));
+        // flow-action-guard:allow: report prose this test asserts is absent, not a flow action
         assert!(!text.contains('✗') && !text.contains("dispatch failed"), "{text}");
         assert!(text.contains("  ↑ e — 1s\n"), "{text}");
         let v = verdict(&[esc.clone()]).unwrap();
