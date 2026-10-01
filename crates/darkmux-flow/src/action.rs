@@ -278,7 +278,6 @@ flow_actions! {
     MachineThermal => Machine, "machine.thermal";
     MachineBattery => Machine, "machine.battery";
     MachineBatteryHealth => Machine, "machine.battery_health";
-    MachineRollup => Machine, "machine.rollup";
     MissionStart => Mission, "mission.start";
     MissionClose => Mission, "mission.close";
     MissionAbort => Mission, "mission.abort";

@@ -178,9 +178,6 @@ pub fn run() -> DoctorReport {
         check_max_stall_recoveries(),
         check_host_sampler_interval(),
         check_live_channel(),
-        // (#2775) Immediately after the sampler cadence it depends on — the
-        // one combination worth reporting is "rollup on, sampler off".
-        check_machine_rollup(),
         check_host_sampler(),
         check_liveness_retention(),
         check_generation_checkpoint_interval(),
@@ -3251,111 +3248,6 @@ fn check_host_sampler_interval() -> Check {
         message: format!(
             "{ms}ms ({provenance}) — darkmux serve's daemon-side host sampler cadence for the \
              machine stats drawer"
-        ),
-        hint: None,
-    }
-}
-
-/// (#2775) The periodic `machine.rollup` heartbeat — the machine-lens
-/// aggregate (thermal, cpu/gpu/memory, power, battery, residency) emitted
-/// into the flow stream so darkmux is usable as a machine-observability
-/// module by a harness that never opens the viewer.
-///
-/// The row exists mainly for ONE state that is otherwise invisible:
-/// `machine_rollup.enabled: true` while `runtime.host_sampler_interval_ms`
-/// is `0`. The emitter rides the daemon's sampler thread, and a `0` there
-/// means that thread is never spawned — so the feature reads as ON in the
-/// config and emits nothing, forever, with no error anywhere. An operator
-/// discovering that by the absence of records is the same "healthy and
-/// silent" failure shape #2765 was filed about, and the fix is the same:
-/// say so in one line rather than leave it to be inferred.
-///
-/// Warn, not Fail: nothing is broken, and darkmux does not adjudicate the
-/// operator's intent. It reports the combination and names both knobs.
-///
-/// **The row says "takes effect on daemon restart", and that clause is
-/// load-bearing.** This check runs in a FRESH process, so it reads the
-/// config file as it is now; the daemon read its own copy once at start
-/// (`config_access::config` is a process-wide `OnceLock` with no
-/// invalidation path). Without the clause the row confirms the wrong
-/// thing — an operator flips the knob, sees `✓ machine_rollup on`, and
-/// gets silence forever, which is the same healthy-and-silent shape the
-/// row exists to prevent, one feature over. Proven live 2026-09-17: knob
-/// flipped, this row read "on", and the running daemon emitted 0 rollups
-/// over 40s; 4 in the 12s after a restart.
-fn check_machine_rollup() -> Check {
-    use darkmux_types::config_access::Source;
-    let name = "machine_rollup";
-    let (enabled, enabled_src) = darkmux_types::config_access::machine_rollup_enabled_with_source();
-    let (period, period_src) =
-        darkmux_types::config_access::machine_rollup_period_seconds_with_source();
-    let label = |s: Source| match s {
-        Source::Env => "env",
-        Source::Config => "config.json",
-        Source::BuiltIn => "default",
-    };
-    if !enabled {
-        return Check {
-            name: name.into(),
-            status: Status::Pass,
-            message: format!(
-                "off ({}) — no periodic machine.rollup records. Enable with \
-                 `darkmux config set machine_rollup.enabled true` (takes effect \
-                 on daemon restart)",
-                label(enabled_src)
-            ),
-            hint: None,
-        };
-    }
-    let sampler_ms = darkmux_types::config_access::host_sampler_interval_ms();
-    if sampler_ms == 0 {
-        return Check {
-            name: name.into(),
-            status: Status::Warn,
-            message: format!(
-                "on ({}), period {period}s ({}) — but runtime.host_sampler_interval_ms is 0, \
-                 which disables the daemon sampler thread the emitter runs on, so no \
-                 machine.rollup record is ever written",
-                label(enabled_src),
-                label(period_src)
-            ),
-            hint: Some(
-                "set a non-zero cadence (`darkmux config set \
-                 runtime.host_sampler_interval_ms 5000`), or turn the rollup off \
-                 (`darkmux config set machine_rollup.enabled false`) so the config says \
-                 what is actually happening."
-                    .into(),
-            ),
-        };
-    }
-    if period == 0 {
-        return Check {
-            name: name.into(),
-            status: Status::Warn,
-            message: format!(
-                "on ({}), but period_seconds is 0 ({}) — 0 means OFF here (the same \
-                 convention as runtime.host_sampler_interval_ms / redis.maxlen), so no \
-                 record is ever emitted",
-                label(enabled_src),
-                label(period_src)
-            ),
-            hint: Some(
-                "set a real period (`darkmux config set machine_rollup.period_seconds 60`), \
-                 or turn the block off so the two fields agree."
-                    .into(),
-            ),
-        };
-    }
-    Check {
-        name: name.into(),
-        status: Status::Pass,
-        message: format!(
-            "on ({}) · every {period}s ({}) — machine.rollup carries the machine-lens \
-             aggregate into the flow stream. This row reads the config FILE, not the \
-             running daemon — a daemon reads its config once at start, so a change \
-             here takes effect on daemon restart",
-            label(enabled_src),
-            label(period_src)
         ),
         hint: None,
     }
@@ -9476,159 +9368,6 @@ mod tests {
         );
     }
 
-    // ─── (#2775) check_machine_rollup ─────────────────────────────────────
-
-    #[serial_test::serial]
-    #[test]
-    fn check_machine_rollup_reports_off_by_default() {
-        let prev = std::env::var("DARKMUX_MACHINE_ROLLUP_ENABLED").ok();
-        unsafe { std::env::remove_var("DARKMUX_MACHINE_ROLLUP_ENABLED") };
-        let check = check_machine_rollup();
-        assert_eq!(check.status, Status::Pass);
-        assert!(check.message.starts_with("off"), "{}", check.message);
-        assert!(
-            check.message.contains("machine_rollup.enabled"),
-            "an off feature should say how to turn it on: {}",
-            check.message
-        );
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_MACHINE_ROLLUP_ENABLED", v),
-                None => std::env::remove_var("DARKMUX_MACHINE_ROLLUP_ENABLED"),
-            }
-        }
-    }
-
-    /// The one state worth a row: enabled, and silent forever, because the
-    /// sampler thread the emitter rides is disabled. Discovering that by
-    /// the absence of records is the same "healthy and silent" shape #2765
-    /// was filed about.
-    #[serial_test::serial]
-    #[test]
-    fn check_machine_rollup_warns_when_enabled_but_the_sampler_is_off() {
-        let prev_enabled = std::env::var("DARKMUX_MACHINE_ROLLUP_ENABLED").ok();
-        let prev_sampler = std::env::var("DARKMUX_HOST_SAMPLER_INTERVAL_MS").ok();
-        unsafe {
-            std::env::set_var("DARKMUX_MACHINE_ROLLUP_ENABLED", "true");
-            std::env::set_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS", "0");
-        }
-        let check = check_machine_rollup();
-        assert_eq!(check.status, Status::Warn, "{}", check.message);
-        assert!(
-            check.message.contains("runtime.host_sampler_interval_ms"),
-            "must name the OTHER knob, or the operator cannot act on it: {}",
-            check.message
-        );
-        unsafe {
-            match prev_enabled {
-                Some(v) => std::env::set_var("DARKMUX_MACHINE_ROLLUP_ENABLED", v),
-                None => std::env::remove_var("DARKMUX_MACHINE_ROLLUP_ENABLED"),
-            }
-            match prev_sampler {
-                Some(v) => std::env::set_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS", v),
-                None => std::env::remove_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS"),
-            }
-        }
-    }
-
-    /// `period_seconds: 0` means OFF here, so "enabled with a 0 period" is
-    /// a config that contradicts itself — reported, not silently coerced to
-    /// the default, because coercing would make the file say something it
-    /// does not mean.
-    #[serial_test::serial]
-    #[test]
-    fn check_machine_rollup_warns_when_enabled_with_a_zero_period() {
-        let prev_enabled = std::env::var("DARKMUX_MACHINE_ROLLUP_ENABLED").ok();
-        let prev_period = std::env::var("DARKMUX_MACHINE_ROLLUP_PERIOD_SECONDS").ok();
-        let prev_sampler = std::env::var("DARKMUX_HOST_SAMPLER_INTERVAL_MS").ok();
-        unsafe {
-            std::env::set_var("DARKMUX_MACHINE_ROLLUP_ENABLED", "1");
-            std::env::set_var("DARKMUX_MACHINE_ROLLUP_PERIOD_SECONDS", "0");
-            std::env::set_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS", "5000");
-        }
-        let check = check_machine_rollup();
-        assert_eq!(check.status, Status::Warn, "{}", check.message);
-        assert!(check.message.contains("period_seconds is 0"), "{}", check.message);
-
-        // …and a healthy combination passes, naming both resolved values.
-        unsafe { std::env::set_var("DARKMUX_MACHINE_ROLLUP_PERIOD_SECONDS", "60") };
-        let check = check_machine_rollup();
-        assert_eq!(check.status, Status::Pass, "{}", check.message);
-        assert!(check.message.contains("every 60s"), "{}", check.message);
-
-        unsafe {
-            match prev_enabled {
-                Some(v) => std::env::set_var("DARKMUX_MACHINE_ROLLUP_ENABLED", v),
-                None => std::env::remove_var("DARKMUX_MACHINE_ROLLUP_ENABLED"),
-            }
-            match prev_period {
-                Some(v) => std::env::set_var("DARKMUX_MACHINE_ROLLUP_PERIOD_SECONDS", v),
-                None => std::env::remove_var("DARKMUX_MACHINE_ROLLUP_PERIOD_SECONDS"),
-            }
-            match prev_sampler {
-                Some(v) => std::env::set_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS", v),
-                None => std::env::remove_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS"),
-            }
-        }
-    }
-
-    /// (#2782 MF1) The row must say the change needs a daemon RESTART, in
-    /// BOTH the on and the off state.
-    ///
-    /// Without that clause this row confirms the wrong thing. `config()` is
-    /// a process-wide `OnceLock` with no invalidation path, so a
-    /// config-tier write is invisible to an already-running daemon — but
-    /// this check runs in a fresh process and reads the new file. Proven
-    /// live 2026-09-17: knob flipped, row read `✓ machine_rollup on
-    /// (config.json) · every 2s`, daemon emitted 0 rollups in 40s; 4 in the
-    /// 12s after a restart. The operator's next move after reading this row
-    /// is the whole point of the row.
-    #[serial_test::serial]
-    #[test]
-    fn check_machine_rollup_says_a_change_needs_a_daemon_restart() {
-        let prev_enabled = std::env::var("DARKMUX_MACHINE_ROLLUP_ENABLED").ok();
-        let prev_period = std::env::var("DARKMUX_MACHINE_ROLLUP_PERIOD_SECONDS").ok();
-        let prev_sampler = std::env::var("DARKMUX_HOST_SAMPLER_INTERVAL_MS").ok();
-
-        unsafe { std::env::remove_var("DARKMUX_MACHINE_ROLLUP_ENABLED") };
-        let off = check_machine_rollup();
-        assert!(
-            off.message.contains("daemon restart"),
-            "the OFF row tells the operator how to turn it on, so it must also \
-             tell them that doing so needs a restart: {}",
-            off.message
-        );
-
-        unsafe {
-            std::env::set_var("DARKMUX_MACHINE_ROLLUP_ENABLED", "true");
-            std::env::set_var("DARKMUX_MACHINE_ROLLUP_PERIOD_SECONDS", "60");
-            std::env::set_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS", "5000");
-        }
-        let on = check_machine_rollup();
-        assert_eq!(on.status, Status::Pass, "{}", on.message);
-        assert!(
-            on.message.contains("daemon restart"),
-            "the ON row is the one that reproduced the defect — it read as \
-             healthy while the running daemon emitted nothing: {}",
-            on.message
-        );
-
-        unsafe {
-            match prev_enabled {
-                Some(v) => std::env::set_var("DARKMUX_MACHINE_ROLLUP_ENABLED", v),
-                None => std::env::remove_var("DARKMUX_MACHINE_ROLLUP_ENABLED"),
-            }
-            match prev_period {
-                Some(v) => std::env::set_var("DARKMUX_MACHINE_ROLLUP_PERIOD_SECONDS", v),
-                None => std::env::remove_var("DARKMUX_MACHINE_ROLLUP_PERIOD_SECONDS"),
-            }
-            match prev_sampler {
-                Some(v) => std::env::set_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS", v),
-                None => std::env::remove_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS"),
-            }
-        }
-    }
-
     // ─── (#2653) check_liveness_retention ───
 
     #[serial_test::serial]
@@ -12203,8 +11942,11 @@ mod tests {
         // role-profiles row.
         //
         // (fleet route check) 70: `check_fleet_routes` joined beside it.
+        //
+        // (5.0, #3036) 69: `check_machine_rollup` left with the `machine_rollup`
+        // block.
         let expected =
-            70 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
+            69 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

@@ -778,6 +778,22 @@ darkmux release.
   `/viewer` redirect stubs under `docs/`, the repo-root `AGENTS.md` and
   `plugins/darkmux-bundler-edge` are removed. `darkmux init`'s AGENTS.md
   integration for your own project is unchanged.
+- **`runtime.log_level` and `DARKMUX_LOG` are gone** (CONFIG 2.2). The setting
+  switched on one debug line on the tool-less hosted dispatch path and nothing
+  else read it. A leftover `runtime.log_level` in `config.json` is named by
+  `darkmux doctor`; a leftover `DARKMUX_LOG` warns and is ignored.
+- **The `machine_rollup` block, its two env vars and the `machine.rollup` flow
+  record are gone** (CONFIG 2.2, FLOW 2.0.0). Nothing replaced the periodic
+  whole-machine heartbeat: the machine lens reads `GET /machine/resources`.
+  `darkmux doctor` loses its `machine_rollup` row, names a leftover
+  `machine_rollup` block, and an archived `machine.rollup` record reads as an
+  unknown action. The two `DARKMUX_MACHINE_ROLLUP_*` vars warn and are ignored.
+- **`fleet.accept_work.<name>.workspace` is a receiver path grant and nothing
+  more** (CONFIG 2.2). It never authorizes a fetch, a checkout or a push; git
+  handoff (#755) gets its own grant, and its checkouts live outside the
+  worktrees base this grant covers. The entry gains an optional `repos` list,
+  reserved for that handoff and read by nothing yet, so it changes no admission
+  decision.
 
 - **`darkmux machine list --deep` is retired.** The card is the default content
   of `machine list`, so there is nothing to ask for; the flag is refused, naming

@@ -138,7 +138,6 @@ const KEYS: &[(&str, Ty)] = &[
     // runtime knob being forgotten here.
     ("runtime.max_stall_recoveries", Ty::Uint),
     ("runtime.strict_selection", Ty::Bool),
-    ("runtime.log_level", Ty::Str),
     ("runtime.feedback_injection", Ty::Bool),
     ("runtime.default_role", Ty::Str),
     ("runtime.check_updates", Ty::Bool),
@@ -254,9 +253,6 @@ const KEYS: &[(&str, Ty)] = &[
     ("serve.bind", Ty::Str),
     ("serve.token_keychain", Ty::Bool),
     ("serve.read_auth", Ty::Bool),
-    // (#2775) The periodic machine-lens aggregate heartbeat.
-    ("machine_rollup.enabled", Ty::Bool),
-    ("machine_rollup.period_seconds", Ty::Uint),
 ];
 
 /// Keys that are deliberately NOT config — a secret that lives in the macOS
@@ -500,10 +496,8 @@ const FLEET_DEFAULT_SEAT_KEY: &str = "fleet.defaults.radio.answerer_profile";
 /// refresh. Only the env tier is read live, and an env var cannot change
 /// inside a running process either.
 ///
-/// **General rather than a per-key list, on purpose.** #2782 MF1 put this
-/// clause on `machine_rollup`'s three surfaces because that is where the
-/// wrong claim was; but the OnceLock is not a `machine_rollup` property, it
-/// is how every key resolves. A key list here would have to be maintained
+/// **General rather than a per-key list, on purpose.** The OnceLock is not
+/// one key's property, it is how every key resolves. A key list here would have to be maintained
 /// against "which long-lived process reads what", would be wrong the first
 /// time a knob gained a second consumer, and is exactly the hand-picked-
 /// subset shape that produced #2782's own C7 and MF1. The mechanism is one
@@ -786,33 +780,17 @@ mod tests {
         );
     }
 
-    /// (#2775) The rollup's two knobs.
-    #[test]
-    fn machine_rollup_knobs_are_settable() {
-        let f = tmp();
-        let p = f.path();
-        set_at(p, "machine_rollup.enabled", "true").unwrap();
-        set_at(p, "machine_rollup.period_seconds", "300").unwrap();
-        let v: Value = serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
-        assert_eq!(v["machine_rollup"]["enabled"], Value::Bool(true));
-        assert_eq!(v["machine_rollup"]["period_seconds"], serde_json::json!(300));
-    }
-
     /// (#2782 C6) `config set` is the surface the operator actually types,
-    /// and it was the one place the OnceLock restart clause did NOT appear —
-    /// #2782 MF1 put it on `MachineRollupConfig`'s doc, both ENVIRONMENT.md
-    /// rows, and both doctor messages, all of which an operator reaches only
-    /// by going looking.
+    /// and it was the one place the OnceLock restart clause did NOT appear.
     ///
     /// Pinned as GENERAL: the assertion runs over keys from unrelated
-    /// families, so re-narrowing this to a `machine_rollup`-shaped special
-    /// case fails here rather than in review.
+    /// families, so re-narrowing this to one key's special case fails here
+    /// rather than in review.
     #[test]
     fn every_set_confirmation_carries_the_restart_clause() {
         let f = tmp();
         let p = f.path();
         for (key, value) in [
-            ("machine_rollup.enabled", "true"),
             ("serve.port", "8799"),
             ("redis.host", "192.0.2.10"),
             ("fleet.mode", "hub"),

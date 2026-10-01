@@ -1,12 +1,12 @@
 //! Payloads of the machine-scoped records the host samplers write
 //! (`machine.telemetry`, `machine.thermal`, `machine.battery`,
-//! `machine.battery_health`, `machine.rollup`), and the host-reading shapes they
+//! `machine.battery_health`), and the host-reading shapes they
 //! share with `GET /machine/resources`.
 //!
-//! Three surfaces carry a host reading: the `load` block of `/machine/resources`,
-//! the periodic `machine.telemetry` payload, and the `machine.rollup` window.
-//! Each was built by hand with `json!`; here they are one `Serialize` type, and
-//! the TypeScript twin is generated from it.
+//! Two surfaces carry a host reading: the `load` block of `/machine/resources`
+//! and the periodic `machine.telemetry` payload. Each was built by hand with
+//! `json!`; here they are one `Serialize` type, and the TypeScript twin is
+//! generated from it.
 //!
 //! A field the probe could not read serializes as JSON `null`, never as a zero:
 //! "not measured" and "measured, and idle" are different claims and the viewer
@@ -373,49 +373,6 @@ pub struct MachineBatteryHealthPayload {
 }
 
 impl Attribution for MachineBatteryHealthPayload {}
-
-/// The periodic machine picture in one record: the payload of `machine.rollup`. Thermal,
-/// cpu/gpu/memory, power, battery and residency ride one payload, so a subscriber need not
-/// correlate separate feeds. The load block is spliced in at the top level, so a hook predicate
-/// says `payload.window.thermal`, not `payload.load.window.thermal`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
-pub struct MachineRollupPayload {
-    /// The CONFIGURED cadence.
-    #[cfg_attr(feature = "ts-export", ts(type = "number"))]
-    pub period_ms: u64,
-    /// The MEASURED gap since the previous emission.
-    #[cfg_attr(feature = "ts-export", ts(type = "number"))]
-    pub emitted_interval_ms: u64,
-    /// This rollup's own total cost, the ledger gather included.
-    #[cfg_attr(feature = "ts-export", ts(type = "number"))]
-    pub gather_ms: u64,
-    #[cfg_attr(feature = "ts-export", ts(type = "number"))]
-    pub sampled_at_ms: u64,
-    /// The state the machine was in before the current one; `null` before any transition was
-    /// observed, which is a different claim from "it came from nominal".
-    pub previous_thermal_state: Option<String>,
-    /// What is loaded and how much unified memory is left for AI: the model ledger, as `GET
-    /// /machine/resources` serves it, or `null` when it could not be gathered.
-    #[cfg_attr(feature = "ts-export", ts(type = "import(\"./ModelLedger\").ModelLedger | null"))]
-    pub residency: Option<serde_json::Value>,
-    /// The machine lens's picture.
-    #[serde(flatten)]
-    #[cfg_attr(feature = "ts-export", ts(flatten))]
-    pub load: MachineLoad,
-    /// The scenario file behind a record made on scripted readings; absent on a real run, so its
-    /// presence alone answers "were these readings real".
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "ts-export", ts(optional))]
-    pub simulated_host_source: Option<String>,
-}
-
-impl Attribution for MachineRollupPayload {
-    fn host_source_slot(&mut self) -> Option<&mut Option<String>> {
-        Some(&mut self.simulated_host_source)
-    }
-}
 
 #[cfg(test)]
 mod charge_state_tests {

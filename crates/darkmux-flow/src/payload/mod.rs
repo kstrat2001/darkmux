@@ -53,7 +53,7 @@ pub use lifecycle::{
 };
 pub use machine::{
     BatteryCharge, BatteryHealthNow, ChargeState, BatteryTransition, CpuClusterNow, HostSampleNow, LoadWindow, MachineBatteryHealthPayload,
-    MachineBatteryPayload, MachineLoad, MachineRollupPayload, MachineTelemetryPayload, MachineThermalPayload, MetricWindow,
+    MachineBatteryPayload, MachineLoad, MachineTelemetryPayload, MachineThermalPayload, MetricWindow,
     PowerNow, PowerWindowWire, ThermalNow, ThermalWindowWire,
 };
 pub use telemetry::{
@@ -286,7 +286,6 @@ flow_payloads! {
     MachineThermal => MachineThermalPayload;
     MachineBattery => MachineBatteryPayload;
     MachineBatteryHealth => MachineBatteryHealthPayload;
-    MachineRollup => MachineRollupPayload;
     MissionStart => OpenPayload;
     MissionClose => OpenPayload;
     MissionAbort => OpenPayload;

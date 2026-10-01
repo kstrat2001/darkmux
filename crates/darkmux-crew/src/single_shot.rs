@@ -319,23 +319,8 @@ pub fn single_shot_chat_hosted(req: &HostedSingleShotRequest) -> Result<SingleSh
     let url = req.endpoint.chat_url()?;
     let auth = remote_auth_header(req.endpoint)?;
     let body = req.body()?;
-    let start = std::time::Instant::now();
     let resp = remote_chat_completion(&url, auth.as_ref(), &body, req.timeout_seconds)?;
     let reply = extract_reply(&resp);
-    // (#1311) `DARKMUX_LOG=debug` per-call detail — host + model + token budget +
-    // returned tokens + wall_ms, so "where did the wall-clock go" is answerable
-    // from the host without a live watch. HARD RULE: HOST only (never the full
-    // URL — it carries `?api-version=`), never the auth header, never content.
-    if darkmux_types::config_access::debug_logging() {
-        let host = req.endpoint.host().unwrap_or_else(|| "remote".to_string());
-        eprintln!(
-            "[darkmux-debug] hosted-call host={host} model={} max_tokens={} returned_tokens={:?} wall_ms={}",
-            req.model,
-            req.max_tokens,
-            reply.counts.total_tokens(),
-            start.elapsed().as_millis()
-        );
-    }
     Ok(reply)
 }
 

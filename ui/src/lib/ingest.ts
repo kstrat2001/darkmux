@@ -183,7 +183,6 @@ const ACTION_WIRE = {
   MachineThermal: "machine.thermal",
   MachineBattery: "machine.battery",
   MachineBatteryHealth: "machine.battery_health",
-  MachineRollup: "machine.rollup",
   MissionStart: "mission.start",
   MissionClose: "mission.close",
   MissionAbort: "mission.abort",

@@ -1173,7 +1173,10 @@ pub(crate) enum MachineCmd {
         /// machine's own git and test commands later run in. That is, in
         /// effect, letting the peer run code on this machine: grant it only
         /// to a machine you would give a shell. Default false; given again,
-        /// it replaces the setting. (#755 builds the workspace handoff on it.)
+        /// it replaces the setting. `workspace` grants a receiver PATH only.
+        /// It never authorizes a fetch, a checkout or a push. Git handoff
+        /// (#755) gets its own grant, and its checkouts live outside the
+        /// worktrees base, so this grant cannot reach them.
         #[arg(long, value_name = "true|false")]
         workspace: Option<bool>,
     },

@@ -21,7 +21,6 @@ import type { HookDryRunPayload } from "./HookDryRunPayload";
 import type { HookFailedPayload } from "./HookFailedPayload";
 import type { MachineBatteryHealthPayload } from "./MachineBatteryHealthPayload";
 import type { MachineBatteryPayload } from "./MachineBatteryPayload";
-import type { MachineRollupPayload } from "./MachineRollupPayload";
 import type { MachineTelemetryPayload } from "./MachineTelemetryPayload";
 import type { MachineThermalPayload } from "./MachineThermalPayload";
 import type { MissionGrowPayload } from "./MissionGrowPayload";
@@ -80,7 +79,6 @@ export type FlowPayloads = {
   "machine.thermal": MachineThermalPayload,
   "machine.battery": MachineBatteryPayload,
   "machine.battery_health": MachineBatteryHealthPayload,
-  "machine.rollup": MachineRollupPayload,
   "mission.start": OpenPayload,
   "mission.close": OpenPayload,
   "mission.abort": OpenPayload,

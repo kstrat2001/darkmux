@@ -1416,6 +1416,7 @@ mod tests {
                 roles: Some(vec!["radio-host".into()]),
                 images: None,
                 workspace: Some(false),
+                repos: None,
                 extras: Default::default(),
             },
         );
@@ -1788,6 +1789,7 @@ mod tests {
                 roles: Some(vec!["radio-host".into()]),
                 images: None,
                 workspace: Some(true),
+                repos: None,
                 extras: Default::default(),
             },
         );
@@ -1834,6 +1836,7 @@ mod tests {
                 roles: None,
                 images: None,
                 workspace: None,
+                repos: None,
                 extras: Default::default(),
             },
         );
@@ -2215,6 +2218,7 @@ mod tests {
                     roles: Some(vec!["radio-host".into()]),
                     images: None,
                     workspace: Some(false),
+                    repos: None,
                     extras: Default::default(),
                 },
             );

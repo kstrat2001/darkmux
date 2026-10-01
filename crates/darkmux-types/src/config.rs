@@ -274,7 +274,7 @@ use std::path::Path;
 //           accept_work{}` is the receiver's allow-list, keyed by machine
 //           name, each entry carrying the `node_id` `darkmux machine trust`
 //           resolved (never typed), the `profiles` that machine may run here,
-//           and `workspace` (reserved for the workspace handoff, #755).
+//           and `workspace` (a receiver path grant, see 2.2).
 //           `init` writes `identity` and `listener` visibly (`enabled:
 //           false`) and `accept_work` empty. Lenient-on-read as always: an
 //           older binary ignores all three into `fleet.extras`.
@@ -381,7 +381,19 @@ use std::path::Path;
 //           machine card, and a card that does not declare `hub` has it
 //           refused by every reader. `init` writes it visibly, empty (empty
 //           means no default). An older binary refuses the unknown key.
-pub const CONFIG_SCHEMA_VERSION: &str = "2.1";
+//   2.2 (#3035, #3036, #755, darkmux 5.0): REMOVED `runtime.log_level` (and
+//           `DARKMUX_LOG`; it only switched on one debug line on the hosted
+//           single-shot path) and the whole `machine_rollup{}` block (and its
+//           two env vars; the `machine.rollup` flow record is gone). Both are
+//           `RETIRED_SETTINGS` entries: an env var warns, a leftover config
+//           key is named by the unknown-key gate. Additive
+//           `fleet.accept_work.<name>.repos`, the names of repos in the
+//           receiver's future registry that the peer may hand work off
+//           against; absent or empty means none. Reserved for git workspace
+//           handoff (#755) and read by nothing in this darkmux, so it changes
+//           no admission decision. `workspace` stays a receiver PATH grant
+//           only.
+pub const CONFIG_SCHEMA_VERSION: &str = "2.2";
 
 /// (#2902 step 5) A setting RENAMED in 4.0, with no alias. `config set`
 /// refuses the old key naming the new one; a leftover old key in
@@ -440,6 +452,26 @@ pub const RETIRED_SETTINGS: &[RetiredSetting] = &[
         env_policy: LeftoverPolicy::Warn,
         line: "removed in 5.0 (#3036): the licensed-adjacent acknowledgment gate and its roles retired, so \
                nothing writes or reads an acknowledgment file. Delete it",
+    },
+    RetiredSetting {
+        key: "runtime.log_level",
+        env: Some("DARKMUX_LOG"),
+        env_policy: LeftoverPolicy::Warn,
+        line: "removed in 5.0 (#3035): it only ever switched on one debug line on the tool-less hosted dispatch \
+               path and nothing else read it. Delete it",
+    },
+    RetiredSetting {
+        key: "machine_rollup",
+        env: Some("DARKMUX_MACHINE_ROLLUP_ENABLED"),
+        env_policy: LeftoverPolicy::Warn,
+        line: "removed in 5.0 (#3036): the periodic `machine.rollup` flow record is gone; the machine lens reads \
+               `GET /machine/resources`. Delete the block",
+    },
+    RetiredSetting {
+        key: "machine_rollup.period_seconds",
+        env: Some("DARKMUX_MACHINE_ROLLUP_PERIOD_SECONDS"),
+        env_policy: LeftoverPolicy::Warn,
+        line: "removed in 5.0 (#3036) with the rest of `machine_rollup`. Delete it",
     },
     RetiredSetting {
         key: "dirs.notebook",
@@ -639,10 +671,6 @@ pub struct DarkmuxConfig {
     /// [`ServeConfig`]'s own doc.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub serve: Option<ServeConfig>,
-    /// (#2775) The periodic machine-lens aggregate flow record — see
-    /// [`MachineRollupConfig`]'s own doc.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub machine_rollup: Option<MachineRollupConfig>,
 
     /// (#1475 packet 1) The machine-local **role → profile** map — the binding
     /// that welds an abstract role id (e.g. `judge`, `probe-high`) to a
@@ -851,20 +879,6 @@ pub struct RuntimeBehaviorConfig {
     /// 2 with no operator override available.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub max_stall_recoveries: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub strict_selection: Option<bool>,
-    // (#1311) Diagnostic verbosity. NEVER carries a secret at any level.
-    // Resolved via `config_access::log_level` (`env(DARKMUX_LOG) > this >
-    // "info"`).
-    //
-    // (#1665 review CONSIDER 7) Scope, stated honestly — see
-    // `config_access::log_level`'s own doc for the full explanation: the
-    // ONLY reader anywhere in this tree is `config_access::debug_logging`,
-    // whose ONLY caller is the tool-less remote `single_shot` dispatch
-    // path. It is NOT surfaced by `darkmux doctor` (no reader there), and
-    // an `"info"` value has no `"info"`-specific behavior of its own — it
-    // is just the absence of `"debug"`'s. The internal-runtime Docker
-    // container path (`dispatch`/`mission launch`/`lab run`) never reads
-    // this field at all.
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub log_level: Option<String>,
     /// (#1548) Whether the runtime injects feedback (nudge) messages into a
     /// struggling dispatch's next turn. Resolved via
     /// `config_access::feedback_injection()` — env, then this field, then
@@ -1358,10 +1372,14 @@ pub struct FleetConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub identity: Option<FleetIdentityConfig>,
     /// (#2916) The work-submission listener. See [`FleetListenerConfig`].
     #[serde(default, skip_serializing_if = "Option::is_none")] pub listener: Option<FleetListenerConfig>,
-    /// (#2916) The receiver's allow-list, keyed by machine name (the peer's
-    /// `machine_id`). Written by `darkmux machine trust` / `untrust`, never
-    /// by `config set`: its `node_id` is resolved through the identity
-    /// provider, never typed. An absent or empty map accepts no work.
+    /// (#2916) The receiver's allow-list. The map key is a LABEL: `machine
+    /// trust` writes the peer's `machine_id` there, but a connection is
+    /// matched to an entry by the entry's `node_id` alone, so renaming a
+    /// machine never breaks its trust (the key is only what a refusal or a
+    /// record calls the peer). Written by `darkmux machine trust` /
+    /// `untrust`, never by `config set`: its `node_id` is resolved through
+    /// the identity provider, never typed. An absent or empty map accepts no
+    /// work.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub accept_work: Option<BTreeMap<String, AcceptWorkEntry>>,
     /// (#2916 stage 2) What this machine's fleet listener does with a job
     /// whose seat is busy: `refuse` or `queue`. See [`BusyPolicy`]. A
@@ -1452,8 +1470,16 @@ pub struct AcceptWorkEntry {
     /// `true` lets a job mount any directory under this machine's darkmux
     /// worktrees base READ-WRITE as its workspace (symlinks resolved; nothing
     /// outside the base). `false` or absent: a job carrying a `workdir` is
-    /// refused. The workspace handoff (#755) builds on this.
+    /// refused. `workspace` grants a receiver PATH only. It never authorizes
+    /// a fetch, a checkout or a push. Git handoff (#755) gets its own grant,
+    /// and its checkouts live outside the worktrees base, so this grant
+    /// cannot reach them.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub workspace: Option<bool>,
+    /// The names of repos in this machine's future repo registry that the
+    /// peer may hand work off against. Absent or empty means none.
+    /// Reserved for git workspace handoff (#755); read by nothing in this
+    /// darkmux.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub repos: Option<Vec<String>>,
     #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -1569,88 +1595,6 @@ pub struct ServeConfig {
     /// `darkmux serve` refuses to start unless a token resolves. A
     /// non-loopback bind requires it. Never governs execution (#2988).
     #[serde(default, skip_serializing_if = "Option::is_none")] pub read_auth: Option<bool>,
-    #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
-}
-
-/// (#2775) The periodic `machine.rollup` flow record — ONE heartbeat
-/// carrying the whole machine-lens aggregate (thermal, cpu/gpu/memory,
-/// power, battery, residency), so darkmux is usable as a machine-
-/// observability module by a harness that never opens the viewer.
-///
-/// "The whole aggregate" is literal for the residency half since #2782:
-/// `payload.residency` is the model ledger serialized exactly as `GET
-/// /machine/resources` serializes it, so the record and the lens cannot
-/// drift apart as `ModelLedger` grows fields.
-///
-/// **A periodic RECORD, deliberately not a "timed hook".** A hook rule
-/// answers exactly one question — does this record match? — and
-/// `hook_match` is a pure function of a `FlowRecord`. A rule that fired on
-/// a schedule would have no record to match against and would have to go
-/// PULL state, inverting the direction the pipeline flows and putting a
-/// second execution model into one config surface. Emitting a record
-/// instead keeps that boundary intact and pays three ways: the rollup is
-/// DURABLE (the viewer can render it, a later comparison can read it, and
-/// a consumer who configured no hook still benefits), it follows an
-/// established shape here (`machine.telemetry` already streams on an
-/// interval), and the hook layer needs NO change at all — `action:
-/// "machine.*"` already matches and dotted `payload.*` predicates already
-/// work.
-///
-/// **`enabled` defaults to `false`** — the redis/audit/hooks convention.
-/// This adds steady-state volume to the flow stream for every operator,
-/// most of whom will never subscribe, so `init` writes the whole block
-/// visibly with the gate off and the sub-defaults populated: discoverable,
-/// and one flip from on.
-///
-/// **Period and window are independent.** `period_seconds` is how often the
-/// heartbeat fires; the WINDOW it rolls up over is the daemon host
-/// sampler's own ring span, and the record stamps that span
-/// (`window.span_ms`, `window.samples`) so a consumer is never guessing
-/// what an "avg" averaged over.
-///
-/// **What it costs, measured rather than asserted.** One emission on an
-/// M5 Max, 2026-09-17: `gather_ms` 481, of which `residency.gather_ms` was
-/// 480 — so essentially the whole cost is the model-ledger gather's `lms`
-/// shell-out, and the ring read underneath `now`/`window` is free (it is a
-/// mutex lock plus arithmetic on samples already taken). At the default
-/// 60-second period that is under 1% of one core; at a 1-second period it
-/// would be roughly half of one, which is why the figure is stamped into
-/// every record rather than left to be assumed. An operator tightening
-/// `period_seconds` for a debug session can read the real cost out of the
-/// artifact (#1286 constraint 3) instead of inferring it.
-///
-/// **It rides the daemon's host sampler, so it needs two things running.**
-/// The emitter lives in `darkmux serve`'s sampler thread — the one place
-/// that already holds the machine-lens ring — so the record is emitted only
-/// while the daemon is up, and only while
-/// `runtime.host_sampler_interval_ms` is non-zero (a `0` there disables the
-/// sampler thread entirely, and takes this with it). `darkmux doctor`
-/// reports that combination rather than leaving an enabled-but-silent
-/// feature to be discovered by its absence.
-///
-/// **Both fields take effect on the next daemon RESTART.** The config tier
-/// is a process-wide `OnceLock` read from disk once per process
-/// ([`crate::config_access`]'s `config()`), with no invalidation path — so
-/// `darkmux config set machine_rollup.enabled true` changes the file and
-/// the already-running daemon keeps the value it booted with. Restart it
-/// (`brew services restart darkmux`, reload the plist, or re-run `darkmux
-/// serve`) after flipping either knob. Stated in three places on purpose —
-/// here, `docs/ENVIRONMENT.md`, and `darkmux doctor`'s `machine_rollup`
-/// row — because the failure it prevents is silent: `doctor` is a FRESH
-/// process, so it reads the new file and reports the feature on while the
-/// daemon that will never see it emits nothing.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct MachineRollupConfig {
-    /// The gate: `true` → the daemon's host sampler emits a
-    /// `machine.rollup` record every `period_seconds`; `false`/absent →
-    /// nothing is emitted and nothing is gathered. Declared first so it
-    /// reads at the top of the block, same as `redis`/`audit`/`hooks`.
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub enabled: Option<bool>,
-    /// Seconds between emissions. Built-in default `60`. `0` means OFF —
-    /// this codebase's zero-means-unbounded/off convention
-    /// (`runtime.host_sampler_interval_ms`, `redis.maxlen`), never
-    /// "emit continuously", which is what a naive `>=` would give it.
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub period_seconds: Option<u64>,
     #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -2174,7 +2118,6 @@ impl DarkmuxConfig {
                 generation_checkpoint_interval_tokens: None,
                 max_stall_recoveries: None,
                 strict_selection: Some(false),
-                log_level: Some("info".to_string()),
                 // (#1548) Now wired end-to-end (config_access accessor +
                 // docker-spawn forwarding) — a visible `true` default, same
                 // treatment as strict_selection/check_updates above.
@@ -2338,16 +2281,6 @@ impl DarkmuxConfig {
                 read_auth: Some(false),
                 extras: Default::default(),
             }),
-            // (#2775) Written visible with `enabled: false` and the
-            // default period populated — the `enabled`-gated feature-block
-            // convention (`redis`/`audit`/`hooks`). Nobody pays stream
-            // volume for a heartbeat they have not asked for, and the
-            // surface is one flip from on.
-            machine_rollup: Some(MachineRollupConfig {
-                enabled: Some(false),
-                period_seconds: Some(crate::config_access::MACHINE_ROLLUP_PERIOD_SECONDS_DEFAULT),
-                extras: Default::default(),
-            }),
             extras: Default::default(),
         }
     }
@@ -2503,6 +2436,16 @@ mod tests {
         assert_eq!(back.remote.as_ref().unwrap().concurrent_cap, Some(1));
     }
 
+    /// The retired env vars nothing reads and whose loss changes nothing.
+    const RETIRED_WARN_VARS: [&str; 6] = [
+        "DARKMUX_ACK_DIR",
+        "DARKMUX_NOTEBOOK_DIR",
+        "DARKMUX_RADIO_ROUTER_PROFILE",
+        "DARKMUX_LOG",
+        "DARKMUX_MACHINE_ROLLUP_ENABLED",
+        "DARKMUX_MACHINE_ROLLUP_PERIOD_SECONDS",
+    ];
+
     /// (#2902 step 5) A leftover renamed env var is found and named with its
     /// new name and the advice. A leftover old `config.json` key is not a
     /// leftover here: it is an unknown key, which `user_files` refuses with
@@ -2521,7 +2464,7 @@ mod tests {
         let found = retired_env_leftovers(&crew);
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(found[0].line.contains("DARKMUX_CREW_DIR") && found[0].line.contains("DARKMUX_HOME"), "{found:?}");
-        for var in ["DARKMUX_NOTEBOOK_DIR", "DARKMUX_RADIO_ROUTER_PROFILE", "DARKMUX_ACK_DIR"] {
+        for var in RETIRED_WARN_VARS {
             let one = |k: &str| (k == var).then(|| "/x".to_string());
             let found = retired_env_leftovers(&one);
             assert_eq!(found.len(), 1, "{var} is a retired env var: {found:?}");
@@ -2547,7 +2490,7 @@ mod tests {
             assert_eq!(policy, LeftoverPolicy::Refuse, "{var}");
             assert!(line.contains("is refused"), "{line}");
         }
-        for var in ["DARKMUX_NOTEBOOK_DIR", "DARKMUX_RADIO_ROUTER_PROFILE", "DARKMUX_ACK_DIR"] {
+        for var in RETIRED_WARN_VARS {
             let (policy, line) = policy_of(var);
             assert_eq!(policy, LeftoverPolicy::Warn, "{var}");
             assert!(line.contains("is ignored"), "{line}");
