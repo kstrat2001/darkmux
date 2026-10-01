@@ -151,14 +151,18 @@ fn main() -> Result<()> {
     std::process::exit(code);
 }
 
-/// The ONE refusal of a retired or renamed setting's env var. Every command
-/// but `doctor` (which reports it) and `config` (which fixes it) refuses to
-/// start while one is set; `--help` / `--version` never reach `run`.
+/// The ONE check of a retired or renamed setting's env var. Every command but
+/// `doctor` (which reports it) and `config` (which fixes it) refuses to start
+/// while one whose loss would change behavior is set, and warns once about
+/// one that nothing reads; `--help` / `--version` never reach `run`.
 fn refuse_retired_env(cmd: &Cmd) -> Result<()> {
-    match cmd {
-        Cmd::Doctor { .. } | Cmd::Config { .. } => Ok(()),
-        _ => Ok(darkmux_types::config_access::refuse_retired_env()?),
+    if matches!(cmd, Cmd::Doctor { .. } | Cmd::Config { .. }) {
+        return Ok(());
     }
+    for leftover in darkmux_types::config_access::check_retired_env()? {
+        eprintln!("warning: {}", leftover.line);
+    }
+    Ok(())
 }
 
 fn run(cmd: Cmd) -> Result<i32> {

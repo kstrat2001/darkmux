@@ -2645,8 +2645,10 @@ fn resolved_config_path() -> std::path::PathBuf {
 /// Settings RENAMED or RETIRED in 4.0 with no alias
 /// (`darkmux_types::config::RENAMED_SETTINGS` / `RETIRED_SETTINGS`: the
 /// per-step cap's `remote.max_tokens_per_execution`, `DARKMUX_CREW_DIR`). A
-/// leftover env var is read by nothing and every command but `doctor` and `config` refuses it, so this
-/// row fails, naming the replacement. A leftover old `config.json` key is an
+/// leftover env var is read by nothing; one whose loss would change behavior
+/// is refused by every command but `doctor` and `config` and fails this row,
+/// and one whose loss changes nothing is ignored with a warning and warns
+/// here, each naming the replacement. A leftover old `config.json` key is an
 /// unknown key, which the user-file keys row fails.
 fn check_renamed_budget_settings() -> Check {
     renamed_settings_status(&|k| std::env::var(k).ok())
@@ -2659,11 +2661,21 @@ fn renamed_settings_status(env: &dyn Fn(&str) -> Option<String>) -> Check {
     if leftovers.is_empty() {
         return Check { name: name.into(), status: Status::Pass, message: "none present".into(), hint: None };
     }
+    // Fail only for a leftover darkmux refuses to start with; one it ignores
+    // (nothing reads it, nothing is lost) is a warning, as at CLI entry.
+    let refuses = leftovers.iter().any(|l| l.policy == darkmux_types::config::LeftoverPolicy::Refuse);
     Check {
         name: name.into(),
-        status: Status::Fail,
+        status: if refuses { Status::Fail } else { Status::Warn },
         message: leftovers.iter().map(|l| l.line.clone()).collect::<Vec<_>>().join("; "),
-        hint: Some("Nothing reads the old names and darkmux refuses to start with them set; remove the export from your shell rc.".into()),
+        hint: Some(
+            if refuses {
+                "darkmux refuses to start with these set; remove the export from your shell rc."
+            } else {
+                "Nothing reads these any more and darkmux runs with them set; remove the export from your shell rc to quiet the warning."
+            }
+            .into(),
+        ),
     }
 }
 
@@ -11962,6 +11974,18 @@ mod tests {
         let c = renamed_settings_status(&env);
         assert_eq!(c.status, Status::Fail, "{}", c.message);
         assert!(c.message.contains("DARKMUX_CREW_DIR") && c.message.contains("DARKMUX_HOME"), "{}", c.message);
+    }
+
+    /// (operator, 2026-10-01) A leftover darkmux only ignores warns here, as
+    /// at CLI entry; mixed with one it refuses, the row still fails.
+    #[test]
+    fn an_ignored_leftover_warns_and_a_refused_one_still_fails() {
+        let notebook = |k: &str| (k == "DARKMUX_NOTEBOOK_DIR").then(|| "/n".to_string());
+        let c = renamed_settings_status(&notebook);
+        assert_eq!(c.status, Status::Warn, "{}", c.message);
+        assert!(c.message.contains("env var DARKMUX_NOTEBOOK_DIR (/n) is ignored"), "{}", c.message);
+        let both = |k: &str| matches!(k, "DARKMUX_NOTEBOOK_DIR" | "DARKMUX_CREW_DIR").then(|| "/x".to_string());
+        assert_eq!(renamed_settings_status(&both).status, Status::Fail);
     }
 
     fn no_spend(_: &darkmux_crew::budget::EndpointBudget) -> darkmux_crew::budget::WindowEntries {

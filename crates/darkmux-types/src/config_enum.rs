@@ -1100,6 +1100,7 @@ mod tests {
             ("Others", "how a schema treats keys it does not name, internal to the gate"),
             ("Depth", "how strictly the user-file gate judges a value, internal to the gate"),
             ("Reach", "which files a user-file check reaches (doctor vs preflight), not a setting"),
+            ("LeftoverPolicy", "whether a retired env var still set is refused or only warned about, fixed per retired setting, not a setting"),
         ];
         const PROFILE_ENUMS: &[&str] = &["ManagedBackend", "Dialect", "BudgetPolicy"];
         const LITERAL_ARMS_ALLOWED: &[(&str, &str)] = &[(

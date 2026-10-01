@@ -419,9 +419,12 @@ pub const RENAMED_SETTINGS: &[RenamedSetting] = &[
 pub struct RetiredSetting {
     /// The dotted key; a block (`review`) covers every key inside it.
     pub key: &'static str,
-    /// The env var that set it, when it had one: a set one is refused like the
-    /// key ([`retired_env_leftovers`]).
+    /// The env var that set it, when it had one ([`retired_env_leftovers`]).
     pub env: Option<&'static str>,
+    /// What a still-set `env` does at CLI entry. `Refuse` when ignoring it
+    /// would quietly change behavior; `Warn` when nothing reads it and nothing
+    /// is lost. Meaningless without an `env`.
+    pub env_policy: LeftoverPolicy,
     /// What replaced it, or that nothing did, and what to do.
     pub line: &'static str,
 }
@@ -431,6 +434,7 @@ pub const RETIRED_SETTINGS: &[RetiredSetting] = &[
     RetiredSetting {
         key: "dirs.notebook",
         env: Some("DARKMUX_NOTEBOOK_DIR"),
+        env_policy: LeftoverPolicy::Warn,
         line: "removed in 4.0 (#2913): the notebook verbs retired; the bundled `darkmux-lab-notebook` skill writes \
                an entry wherever your own instructions say. Delete it",
     },
@@ -438,45 +442,53 @@ pub const RETIRED_SETTINGS: &[RetiredSetting] = &[
         // flow-action-guard:allow — a retired config key, refused by name
         key: "radio.router_profile",
         env: Some("DARKMUX_RADIO_ROUTER_PROFILE"),
+        env_policy: LeftoverPolicy::Warn,
         line: "removed in CONFIG 1.28: radio routing runs on the machine's utility model, `internal.utility` in \
                profiles.json. Delete it",
     },
     RetiredSetting {
         key: "dirs.openclaw_config",
         env: None,
+        env_policy: LeftoverPolicy::Refuse,
         line: "removed with the openclaw runtime (#1405): nothing reads it. Delete it",
     },
     RetiredSetting {
         key: "dirs.runtime_agents",
         env: None,
+        env_policy: LeftoverPolicy::Refuse,
         line: "removed with the openclaw runtime (#1405): nothing reads it. Delete it",
     },
     RetiredSetting {
         key: "gh",
         env: None,
+        env_policy: LeftoverPolicy::Refuse,
         line: "renamed to `cmd` (#2003): move `gh.enabled` / `gh.allowed` to `cmd.enabled` / `cmd.allowed`",
     },
     RetiredSetting {
         key: "orchestrator",
         env: None,
+        env_policy: LeftoverPolicy::Refuse,
         line: "removed in #1766 (`init` wrote it from #663): flow records no longer carry an orchestrator. \
                Delete it",
     },
     RetiredSetting {
         key: "remote.stage_budget_policy",
         env: None,
+        env_policy: LeftoverPolicy::Refuse,
         line: "renamed to `remote.step_budget_policy` in 4.0 (#2902), which takes `off` or `warn` (`wait` is an \
                endpoint budget's policy only)",
     },
     RetiredSetting {
         key: "review",
         env: None,
+        env_policy: LeftoverPolicy::Refuse,
         line: "removed with the review funnel (#2310): `review` runs as a mission config now, and its judge knobs \
                went with the funnel. Delete the block",
     },
     RetiredSetting {
         key: "runtime.daemon_auth_enabled",
         env: None,
+        env_policy: LeftoverPolicy::Refuse,
         line: "replaced in 4.0 (#2988) by `serve.token_keychain` (read the serve token from the Keychain; the \
                fleet's execution credential) and `serve.read_auth` (whether reads from off this machine need \
                it, default off). Move your value to `serve.token_keychain`, and set `serve.read_auth true` if \
@@ -485,12 +497,14 @@ pub const RETIRED_SETTINGS: &[RetiredSetting] = &[
     RetiredSetting {
         key: "runtime.telemetry_record_every_samples",
         env: None,
+        env_policy: LeftoverPolicy::Refuse,
         line: "removed in #2413: one machine-scoped host sampler replaced the per-dispatch curve; its cadence is \
                `runtime.host_sampler_interval_ms`. Delete it",
     },
     RetiredSetting {
         key: "dirs.crew",
         env: Some("DARKMUX_CREW_DIR"),
+        env_policy: LeftoverPolicy::Refuse,
         line: "removed in 4.0: \"crew\" is a retired concept. `DARKMUX_HOME` (or `~/.darkmux`) is the one root, and \
                roles, missions, phases, crews and skills live directly under it. Unset it, and to relocate \
                darkmux set `DARKMUX_HOME`; the autonomous-dispatch preamble override is \
@@ -498,10 +512,22 @@ pub const RETIRED_SETTINGS: &[RetiredSetting] = &[
     },
 ];
 
+/// What a leftover env var does at CLI entry (operator, 2026-10-01): a
+/// leftover whose silent loss would change behavior (a renamed cap, a
+/// state-location dir) refuses every command but `doctor` and `config`; one
+/// that nothing reads and whose loss changes nothing is ignored with one
+/// warning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeftoverPolicy {
+    Refuse,
+    Warn,
+}
+
 /// A retired or renamed setting whose env var is still set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetiredLeftover {
     pub setting_old_key: &'static str,
+    pub policy: LeftoverPolicy,
     /// `env var ...`.
     pub found_in: String,
     /// The operator line: what is refused, what replaced it, and what to do.
@@ -511,23 +537,29 @@ pub struct RetiredLeftover {
 /// Every renamed or retired setting whose env var is still set. (A leftover
 /// `config.json` key is an unknown key, which `user_files` refuses.)
 pub fn retired_env_leftovers(env: &dyn Fn(&str) -> Option<String>) -> Vec<RetiredLeftover> {
+    // A renamed setting always refuses: ignoring it would quietly drop what
+    // the operator set (a token cap) under its new name.
     let renamed = RENAMED_SETTINGS.iter().map(|r| {
         let what = format!("renamed to `{}` (env {}) in 4.0 (#2902); {}", r.new_key, r.new_env, r.advice);
-        (r.old_key, r.old_env, what)
+        (r.old_key, r.old_env, LeftoverPolicy::Refuse, what)
     });
-    let retired = RETIRED_SETTINGS.iter().filter_map(|r| Some((r.key, r.env?, r.line.to_string())));
+    let retired = RETIRED_SETTINGS.iter().filter_map(|r| Some((r.key, r.env?, r.env_policy, r.line.to_string())));
     renamed
         .chain(retired)
-        .filter_map(|(key, var, what)| {
+        .filter_map(|(key, var, policy, what)| {
             let v = env(var).filter(|v| !v.trim().is_empty())?;
             let found_in = format!("env var {var} ({v})");
-            Some(RetiredLeftover { setting_old_key: key, line: format!("{found_in} is refused: {what}"), found_in })
+            let verdict = match policy {
+                LeftoverPolicy::Refuse => "is refused",
+                LeftoverPolicy::Warn => "is ignored",
+            };
+            Some(RetiredLeftover { setting_old_key: key, policy, line: format!("{found_in} {verdict}: {what}"), found_in })
         })
         .collect()
 }
 
-/// What the CLI-entry check refuses with: every retired or renamed setting
-/// whose env var is still set, one operator line each. Its `Display` is the
+/// What the CLI-entry check refuses with: every leftover env var whose policy
+/// is [`LeftoverPolicy::Refuse`], one operator line each. Its `Display` is the
 /// whole message; `doctor` and `config` are the only commands that run past it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetiredEnvRefusal(pub Vec<RetiredLeftover>);
@@ -2483,8 +2515,33 @@ mod tests {
         for var in ["DARKMUX_NOTEBOOK_DIR", "DARKMUX_RADIO_ROUTER_PROFILE"] {
             let one = |k: &str| (k == var).then(|| "/x".to_string());
             let found = retired_env_leftovers(&one);
-            assert_eq!(found.len(), 1, "{var} is a retired env var, refused with the rest: {found:?}");
+            assert_eq!(found.len(), 1, "{var} is a retired env var: {found:?}");
             assert!(found[0].line.contains(var), "{found:?}");
+        }
+    }
+
+    /// (operator, 2026-10-01) Each leftover's policy is decided by whether
+    /// ignoring it is safe: a renamed cap and the state-location
+    /// `DARKMUX_CREW_DIR` refuse (silently ignoring them changes behavior);
+    /// `DARKMUX_NOTEBOOK_DIR` and `DARKMUX_RADIO_ROUTER_PROFILE` warn
+    /// (nothing reads them and nothing is lost).
+    #[test]
+    fn each_leftover_refuses_or_warns_by_whether_ignoring_it_is_safe() {
+        let policy_of = |var: &str| {
+            let one = |k: &str| (k == var).then(|| "/x".to_string());
+            let found = retired_env_leftovers(&one);
+            assert_eq!(found.len(), 1, "{var}: {found:?}");
+            (found[0].policy, found[0].line.clone())
+        };
+        for var in ["DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION", "DARKMUX_CREW_DIR"] {
+            let (policy, line) = policy_of(var);
+            assert_eq!(policy, LeftoverPolicy::Refuse, "{var}");
+            assert!(line.contains("is refused"), "{line}");
+        }
+        for var in ["DARKMUX_NOTEBOOK_DIR", "DARKMUX_RADIO_ROUTER_PROFILE"] {
+            let (policy, line) = policy_of(var);
+            assert_eq!(policy, LeftoverPolicy::Warn, "{var}");
+            assert!(line.contains("is ignored"), "{line}");
         }
     }
 

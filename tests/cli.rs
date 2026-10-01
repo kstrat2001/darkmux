@@ -12798,6 +12798,24 @@ fn a_leftover_retired_env_var_is_refused_at_preflight_naming_the_replacement() {
     }
 }
 
+/// (operator, 2026-10-01) A retired env var that nothing reads and whose
+/// absence loses nothing (`DARKMUX_NOTEBOOK_DIR`, `DARKMUX_RADIO_ROUTER_PROFILE`)
+/// is a warning, not a refusal: the command runs and says once, on stderr,
+/// that the variable is ignored and what to do. A leftover whose silent loss
+/// would change behavior (a renamed cap, the state-location `DARKMUX_CREW_DIR`)
+/// still refuses (the tests above and below).
+#[test]
+fn a_harmless_retired_env_var_warns_and_the_command_runs() {
+    for var in ["DARKMUX_NOTEBOOK_DIR", "DARKMUX_RADIO_ROUTER_PROFILE"] {
+        let out = darkmux_std_cmd().env(var, "/x").args(["role", "list"]).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{var} must not refuse: {stderr}");
+        assert!(!stderr.contains("refusing to start"), "{var}: {stderr}");
+        assert!(stderr.contains(&format!("warning: env var {var} (/x) is ignored")), "{var}: {stderr}");
+        assert_eq!(stderr.matches(&format!("env var {var}")).count(), 1, "warned once: {stderr}");
+    }
+}
+
 /// A retired setting's env var is refused by EVERY command, through the one
 /// check at CLI entry: a read-only verb (`mission status`, `role list`, a
 /// lesson read) that uses the darkmux root refuses as loudly as a dispatch.
