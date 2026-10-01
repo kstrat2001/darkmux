@@ -763,17 +763,17 @@ edit loop detected on src/widget.rs in an earlier dispatch
             tmp.path().join("2026-06-21.jsonl"),
             concat!(
                 // mission `auth`, phase s1 — an adjudication correction
-                r#"{"ts":"2026-06-21T10:00:00Z","action":"note","source":"adjudication","session_id":"mission-run-auth-s1","handle":"Do not rename the field."}"#, "\n",
+                r#"{"ts":"2026-06-21T10:00:00Z","action":"operator.note","source":"adjudication","session_id":"mission-run-auth-s1","handle":"Do not rename the field."}"#, "\n",
                 // `auth`, a LATER phase — same family, must be carried forward
-                r#"{"ts":"2026-06-21T11:00:00Z","action":"note","source":"adjudication","session_id":"mission-run-auth-s2","handle":"Use cargo test -p foo."}"#, "\n",
+                r#"{"ts":"2026-06-21T11:00:00Z","action":"operator.note","source":"adjudication","session_id":"mission-run-auth-s2","handle":"Use cargo test -p foo."}"#, "\n",
                 // exact duplicate of the first — must not repeat
-                r#"{"ts":"2026-06-21T11:30:00Z","action":"note","source":"adjudication","session_id":"mission-run-auth-s1","handle":"Do not rename the field."}"#, "\n",
+                r#"{"ts":"2026-06-21T11:30:00Z","action":"operator.note","source":"adjudication","session_id":"mission-run-auth-s1","handle":"Do not rename the field."}"#, "\n",
                 // SIBLING mission `auth-v2` (id is a hyphen-extension of `auth`)
                 // — a prefix match would bleed this in; the exact-set match must
                 // NOT (the #849 QA regression).
-                r#"{"ts":"2026-06-21T11:45:00Z","action":"note","source":"adjudication","session_id":"mission-run-auth-v2-s1","handle":"Belongs to auth-v2 ONLY."}"#, "\n",
+                r#"{"ts":"2026-06-21T11:45:00Z","action":"operator.note","source":"adjudication","session_id":"mission-run-auth-v2-s1","handle":"Belongs to auth-v2 ONLY."}"#, "\n",
                 // an ORCHESTRATOR (dashboard) note for `auth` — wrong source, skip
-                r#"{"ts":"2026-06-21T12:00:00Z","action":"note","source":"orchestrator","session_id":"mission-run-auth-s1","handle":"crew shipped it!"}"#, "\n",
+                r#"{"ts":"2026-06-21T12:00:00Z","action":"operator.note","source":"orchestrator","session_id":"mission-run-auth-s1","handle":"crew shipped it!"}"#, "\n",
             ),
         )
         .unwrap();
@@ -844,7 +844,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
             flows.path().join("2026-06-22.jsonl"),
             concat!(
                 r#"{"ts":"2026-06-22T10:00:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"mission-run-m-debrief-s1","handle":"coder","payload":{"kind":"cycle","severity":"warn","detail":"edit called 3x","area":{"files":["src/index.rs"]}}}"#, "\n",
-                r#"{"ts":"2026-06-22T10:30:00Z","action":"note","source":"adjudication","session_id":"mission-run-m-debrief-s1","handle":"overrode SIGNOFF — verify never ran"}"#, "\n",
+                r#"{"ts":"2026-06-22T10:30:00Z","action":"operator.note","source":"adjudication","session_id":"mission-run-m-debrief-s1","handle":"overrode SIGNOFF — verify never ran"}"#, "\n",
                 // SIBLING mission session must NOT bleed in.
                 r#"{"ts":"2026-06-22T10:45:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"mission-run-m-debrief-v2-s1","handle":"coder","payload":{"kind":"cycle","severity":"warn","detail":"belongs to a sibling"}}"#, "\n",
             ),
@@ -1718,7 +1718,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
             flows_dir.join("2026-07-26.jsonl"),
             format!(
                 concat!(
-                    r#"{{"ts":"2026-07-26T10:00:00Z","action":"note","source":"adjudication","session_id":"{sid}","handle":"Do not rename the widget config field."}}"#, "\n",
+                    r#"{{"ts":"2026-07-26T10:00:00Z","action":"operator.note","source":"adjudication","session_id":"{sid}","handle":"Do not rename the widget config field."}}"#, "\n",
                     r#"{{"ts":"2026-07-26T10:05:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"{sid}","payload":{{"kind":"cycle","severity":"warn","detail":"`edit` called 3×","area":{{"files":["widget.rs"],"code_hash":"{hash}"}}}}}}"#, "\n",
                 ),
                 sid = session_id,

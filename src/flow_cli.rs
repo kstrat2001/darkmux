@@ -655,12 +655,10 @@ fn print_integrity_check(
 ///
 /// Returns `Some(string)` when the line should be printed, `None` otherwise.
 /// When `execution` is `Some(id)`, only records whose `execution_id` equals
-/// `id` are returned. When `json` is true, the line is returned as the flow
-/// reader forwards it (verbatim, unless its action is a retired spelling);
+/// `id` are returned. When `json` is true, the line is returned verbatim;
 /// otherwise a concise one-line summary is built from available fields.
 fn tail_match(line: &str, execution: Option<&ExecutionId>, json: bool) -> Option<String> {
-    let forwarded = flow::reader::upgrade_line(line)?;
-    let parsed: serde_json::Value = serde_json::from_str(&forwarded).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(line).ok().filter(serde_json::Value::is_object)?;
 
     if let Some(id) = execution {
         if parsed.get("execution_id").and_then(|v| v.as_str()) != Some(id.as_str()) {
@@ -669,7 +667,7 @@ fn tail_match(line: &str, execution: Option<&ExecutionId>, json: bool) -> Option
     }
 
     if json {
-        Some(forwarded.into_owned())
+        Some(line.to_string())
     } else {
         use darkmux_types::style;
         let ts = parsed.get("ts").and_then(|v| v.as_str()).unwrap_or("");
@@ -1450,12 +1448,14 @@ mod tests {
         assert_eq!(tail_match(line, None, true), Some(line.to_string()));
     }
 
-    /// A pre-4.0 line tails with its current spelling, in both modes.
+    /// (#3036) A pre-4.0 line tails as written, in both modes: nothing is
+    /// upgraded, and a line that is not a JSON object is dropped.
     #[test]
-    fn tail_match_upgrades_a_retired_spelling() {
+    fn tail_match_prints_a_retired_spelling_as_written() {
+        // flow-action-guard:allow — a retired spelling is this test's input
         let line = r#"{"ts":"2025-01-01T00:00:00Z","action":"note","session_id":"abc"}"#;
-        let json: serde_json::Value = serde_json::from_str(&tail_match(line, None, true).unwrap()).unwrap();
-        assert_eq!(json["action"], "operator.note");
-        assert!(tail_match(line, None, false).unwrap().contains("operator.note"));
+        assert_eq!(tail_match(line, None, true).as_deref(), Some(line));
+        assert!(tail_match(line, None, false).unwrap().contains("note"));
+        assert_eq!(tail_match("[1]", None, true), None);
     }
 }

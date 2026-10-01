@@ -7,21 +7,13 @@ import type { Payload } from "./Payload";
 import type { Stage } from "./Stage";
 import type { Tier } from "./Tier";
 
-export type FlowRecord = { ts: string, level: Level, category: Category, tier: Tier, stage: Stage, action: FlowAction, handle: string, 
-/**
- * Sprint→Phase rename read-compat: historical flow records on disk
- * (append-only JSONL, never rewritten) carry this under the pre-
- * rename wire key `sprint_id`. `alias` lets readers accept either
- * key so historical records don't silently lose the field; every
- * newly-written record emits the canonical `phase_id` key.
- */
-phase_id?: string, session_id?: string, 
+export type FlowRecord = { ts: string, level: Level, category: Category, tier: Tier, stage: Stage, action: FlowAction, handle: string, phase_id?: string, session_id?: string, 
 /**
  * The role execution this record is about: set on every record whose
  * action is execution-grain (`FlowAction::grain`), never on any other.
  * A session names the run; this names which execution inside it (a
  * task session holds one per `dispatch.map` item). Schema 2.0 addition.
- * A pre-4.0 record carries none; `crate::reader` synthesizes one.
+ * A pre-4.0 record carries none, and the reader gives it none.
  */
 execution_id?: string, source?: FlowSource, 
 /**

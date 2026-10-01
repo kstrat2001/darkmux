@@ -167,10 +167,10 @@ fn every_historical_archive_shape_reads_typed() {
     assert!(unread.is_empty(), "shapes that read as Unread: {unread:?}");
 }
 
-/// The old `compactor` role is the utility seat (the `schema.rs` contract), not an
-/// unknown word; a word no build names reads as `Unknown` and keeps its record.
+/// A word no build names reads as `Unknown` and keeps its record: the old `compactor`
+/// role included (#3036), which is no longer read as the utility seat.
 #[test]
-fn the_compactor_role_is_the_utility_seat_and_an_unknown_word_is_unknown() {
+fn the_old_compactor_role_and_an_unknown_word_are_unknown() {
     use darkmux_flow::payload::{DetectorKind, LmsRole, ResultClass, SeatClass};
     use darkmux_flow::Payload;
     let path = format!("{}/tests/fixtures/archive_shapes.jsonl", env!("CARGO_MANIFEST_DIR"));
@@ -182,7 +182,7 @@ fn the_compactor_role_is_the_utility_seat_and_an_unknown_word_is_unknown() {
         let payload = darkmux_flow::reader::parse_record(line).unwrap().payload.unwrap();
         match (shape, payload) {
             ("telemetry.lms with the compactor role", Payload::TelemetryLms(p)) => {
-                assert_eq!(p.role, Some(LmsRole::Utility));
+                assert_eq!(p.role, Some(LmsRole::Unknown));
                 seen += 1;
             }
             ("dispatch.complete with an unknown result_class", Payload::DispatchComplete(p)) => {

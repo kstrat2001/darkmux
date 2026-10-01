@@ -395,27 +395,28 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    `<scope>.<event>[.<detail>]` (lowercase, two or three dot-separated segments), and the
    wire string lives in exactly one place: `crates/darkmux-flow/src/action.rs`. Producers
    build the enum; no constructor, builder or helper takes an action as a string, and
-   `FlowAction`'s public deserializer refuses an unknown or retired action. Consumers match
+   `FlowAction`'s public deserializer refuses an unknown action. Consumers match
    on the enum, never on a string.
-   <!-- flow-action-guard:allow-start — names the old spellings to say where they live -->
-   The pre-4.0 spellings (`dispatch start`, `step result`,
-   `mission close`, `note`, `verdict: <v>`, `sprint *`, ...) live only in
-   `darkmux_flow::legacy`, and every reader goes through `darkmux_flow::reader`, which
-   upgrades them on read; archives are append-only and are never rewritten. An action
-   darkmux retired with no current equivalent (`telemetry.process`, `funnel.*`, ...) reads as
-   `FlowAction::Retired`; one this build does not know reads as `FlowAction::Other` and is
-   counted by `darkmux doctor`.
+   <!-- flow-action-guard:allow-start — names the old spellings to say what they now read as -->
+   Nothing in the build knows a retired spelling (5.0, #3036): the pre-4.0 spellings
+   (`dispatch start`, `step result`, `mission close`, `note`, `verdict: <v>`, `sprint *`,
+   ...) and the actions darkmux retired with no current equivalent (`telemetry.process`,
+   `funnel.*`, ...) read, through `darkmux_flow::reader` like every other record, as
+   `FlowAction::Other`, an action this build does not know, kept verbatim and counted by
+   `darkmux doctor`. Nothing is rewritten on read and nothing is synthesized for a record
+   (no upgraded spelling, no renamed payload key, no invented execution id). Archives are
+   append-only and are never rewritten.
    <!-- flow-action-guard:allow-end -->
-   Neither can be written: every sink write goes through
-   `FlowSinkWrite::write`, which refuses both before any sink sees the record.
+   It cannot be written: every sink write goes through
+   `FlowSinkWrite::write`, which refuses it before any sink sees the record.
    `scripts/flow-action-guard.py` (CI) fails on a flow action written by hand in production
    Rust (a literal, a format string, a prefix test, `concat!`, or JSON inside a string), and,
    in test code, the viewer, docs, skills, templates and fixtures, on any string that looks
-   like an action and is not a current one (an old spelling, or a made-up
-   `<scope>.<event>`); recorded archives are exempt.
-   A hook rule that names a retired action spelling, an exact one or a spaced glob, is refused
-   (`darkmux_flow::hooks::retired_rule_actions`): the hook sink does not load and doctor fails
-   the rule, naming the spelling to write. What entry 8
+   like an action and is not a current one (a retired spelling, which the script lists in
+   `RETIRED_SPELLINGS`, or a made-up `<scope>.<event>`); recorded archives are exempt.
+   A hook rule that names a retired action spelling is no special case: it matches no
+   action darkmux writes, so the hook sink warns at load and `darkmux doctor` warns
+   `CANNOT MATCH`. What entry 8
    fixes is the WORD used in code, docs, UI and on the wire, where `dispatch` had come to
    mean both ends of the ladder at once; the run grain now has its own bookends (below).
    Both contracts stand: contract 2 says liveness must be visible, contract 8 says which
@@ -464,9 +465,10 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    a specialist change mints a new one. Consumers key on it: the token sum's legacy
    fallback, the DISPATCHES chip, `records_emitted`'s pairing, both lifecycle executors'
    attempts, and the finding store (`<execution_id>/<seq>`). A record from before 4.0
-   names none, and `darkmux_flow::legacy::execution_of` (the reader) and `ingest.ts` (the
-   viewer) give it `legacy:<session>:<mission>`: the ONLY place the old
-   `(session, mission)` grouping survives; no file is rewritten.
+   names none, and none is invented for it (#3036): the reader and the viewer's `ingest.ts`
+   stamp nothing, and only the token and run counts key such a record by `(session,
+   mission)` (`usage_sum::execution_key` and `executionOf`), the one place that grouping
+   survives.
 
    **The run grain has its own bookends (4.0).** A `mission launch` and an ACP panel run
    open `run.start` on the run's own session and close it with `run.complete` or
@@ -483,9 +485,9 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    representative is the run session its `run.start` opened, the fleet card collapses a
    mission onto its run-grain group, and the status line's last-dispatch counts role
    executions only. A pre-4.0 archive's whole-run pair (`dispatch.*` with `source`
-   `mission`, or the retired review launcher's `review`) reads as `run.*` through
-   `darkmux_flow::legacy::run_grain_of`; no file is rewritten and no consumer reads
-   `source` to tell the grains apart.
+   `mission`, or the retired review launcher's `review`) is no longer read as `run.*`
+   (#3036): it reads as the execution bookends it was spelled as, or as an unknown action
+   when spelled the old way; no file is rewritten.
 
    **"step" is a known-imperfect name, deliberately not being changed (operator, 2026-08-26.)**
    It implies plurality, so it reads badly for a single-step dispatch — but a task genuinely

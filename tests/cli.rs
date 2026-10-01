@@ -8519,7 +8519,7 @@ fn write_finding_day_file(flows: &std::path::Path) {
         serde_json::json!({
             "ts": ts, "level": "info", "category": "work", "tier": "local",
             "stage": "dispatch", "action": "dispatch.tool", "handle": "crawler",
-            "session_id": sess, "model": "darkmux:qwen3.6", "machine_id": "test-machine",
+            "session_id": sess, "execution_id": sess, "model": "darkmux:qwen3.6", "machine_id": "test-machine",
             "mission_id": mission, "phase_id": format!("{mission}-crawl"),
             "payload": payload,
         })

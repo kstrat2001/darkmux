@@ -5,7 +5,7 @@ import { cleanToolPath, toolCallPath } from "./recordDetail";
 import { compactDuration } from "./format";
 import { UTILITY_JOB, UTILITY_JOB_DEFAULT_STALL_MS, isUtilityEnd, isUtilityStart, utilityJobOf } from "./utilityJobs";
 import type { DispatchHeartbeatPayload } from "../types/generated/DispatchHeartbeatPayload";
-import { ACTION, byTime, isExecutionAction, isLegacyExecution, payloadOf, recordsAsOf, type NormRecord } from "./ingest";
+import { ACTION, byTime, isExecutionAction, payloadOf, recordsAsOf, type NormRecord } from "./ingest";
 
 /** (#2877) Live token-rate scope — pure derivation from flow records
  * already fetched for a session; zero model work, matches CLAUDE.md's "the
@@ -868,14 +868,13 @@ export function liveExecutions(
 /** A record set as one set per execution it holds. Each keeps the records
  *  that close a session rather than an execution (`session.end`, a step's
  *  terminal): those end every execution under them. Records of a pre-4.0
- *  session stay together: their identity is a session and mission, not an
- *  execution. A session holds several executions when a map ran its items
+ *  session name no execution and stay together. A session holds several executions when a map ran its items
  *  under one task session; a rate, a state and a role are one execution's,
  *  so its closed siblings' beats must not reach them. A set of one
  *  execution (or none) is returned as it came. */
 function byExecution(recs: NormRecord[]): NormRecord[][] {
   const minted = (r: NormRecord): string | undefined =>
-    isExecutionAction(r.action) && r.execution_id !== undefined && !isLegacyExecution(r.execution_id) ? r.execution_id : undefined;
+    isExecutionAction(r.action) ? r.execution_id : undefined;
   const executions = new Set<string>();
   for (const r of recs) {
     const id = minted(r);

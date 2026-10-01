@@ -1,6 +1,3 @@
-import { readFileSync } from "node:fs";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import { QueryClient } from "@tanstack/react-query";
 import type { FlowRecord } from "../types/generated/FlowRecord";
@@ -24,6 +21,7 @@ import {
   recKey,
   tagText,
   earliestByTime,
+  executionOf,
   unknownActionCount,
   wireOf,
   type NormRecord,
@@ -182,7 +180,7 @@ describe("vocabulary skew is loud", () => {
     expect(unknownActionCount(recs)).toBe(2);
   });
 
-  it("a retired action is known: not counted, not warned, still read by its other fields", () => {
+  it("a retired action is unknown: counted, warned, still read by its other fields", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
       const recs = ingest([
@@ -192,9 +190,9 @@ describe("vocabulary skew is loud", () => {
         raw("mission reopen", 2),
         // flow-action-guard:allow-end
       ]);
-      expect(recs.every((r) => isKnownAction(r.action))).toBe(true);
-      expect(unknownActionCount(recs)).toBe(0);
-      expect(warn).not.toHaveBeenCalled();
+      expect(recs.some((r) => isKnownAction(r.action))).toBe(false);
+      expect(unknownActionCount(recs)).toBe(3);
+      expect(warn).toHaveBeenCalledTimes(3);
       expect(recs.some((r) => r.action === ACTION.MachineTelemetry)).toBe(false);
       expect(isHostSampleRecord(recs[0])).toBe(true);
     } finally {
@@ -330,18 +328,14 @@ describe("the bad-timestamp policy", () => {
 describe("ingest: the execution a record is of", () => {
   const exec = (r: NormRecord | undefined) => r?.execution_id;
 
-  it("gives a record of an execution that names none its legacy identity, per arm", () => {
+  it("never invents an execution for a record that names none (#3036)", () => {
     const cases: [string, Record<string, unknown>, string | undefined][] = [
-      ["dispatch.start", { session_id: "task-t", mission_id: "m1" }, "legacy:task-t:m1"],
-      ["dispatch.complete", { session_id: "task-t", mission_id: "m1" }, "legacy:task-t:m1"],
-      ["telemetry.tokens", { session_id: "task-t", mission_id: "m1" }, "legacy:task-t:m1"],
-      ["budget.wait", { session_id: "task-t", mission_id: "m1" }, "legacy:task-t:m1"],
-      ["dispatch.turn", { session_id: "task-t", mission_id: undefined }, "legacy:task-t:"],
-      ["telemetry.tokens", { session_id: undefined, mission_id: undefined, ts: "2026-08-20T01:00:00Z", handle: "radio-router", machine_uid: "u1" }, "legacy:::2026-08-20T01:00:00Z:radio-router:u1"],
+      ["dispatch.start", { session_id: "task-t", mission_id: "m1" }, undefined],
+      ["dispatch.complete", { session_id: "task-t", mission_id: "m1" }, undefined],
+      ["telemetry.tokens", { session_id: "task-t", mission_id: "m1" }, undefined],
+      ["dispatch.turn", { session_id: undefined, mission_id: undefined }, undefined],
       ["dispatch.turn", { session_id: "s", execution_id: "exec-1" }, "exec-1"],
       ["step.start", { session_id: "task-t", mission_id: "m1" }, undefined],
-      ["run.start", { session_id: "task-t", mission_id: "m1" }, undefined],
-      ["dispatch.route", { session_id: "task-t", mission_id: "m1" }, undefined],
     ];
     for (const [action, extra, want] of cases) {
       const [r] = ingest([{ ...raw(action, 0), ...extra }]);
@@ -349,21 +343,15 @@ describe("ingest: the execution a record is of", () => {
     }
   });
 
-  it("agrees, record for record, with the reader on the shared archive golden", () => {
-    const dir = path.join(path.dirname(fileURLToPath(import.meta.url)), "../../../tests/flow-archive-golden");
-    const twin = readFileSync(path.join(dir, "2026-08-20.upgraded.jsonl"), "utf8")
-      .split("\n")
-      .filter((l) => l.trim() !== "")
-      .map((l) => JSON.parse(l) as Record<string, unknown>);
-    let checked = 0;
-    for (const want of twin) {
-      const { execution_id: named, ...rest } = want;
-      const [got] = ingest([rest]);
-      if (!got) continue;
-      expect(got.execution_id, JSON.stringify(rest)).toBe(named);
-      checked += named === undefined ? 0 : 1;
-    }
-    expect(checked, "the golden holds execution records").toBeGreaterThan(5);
+  it("keys a record that names no execution by its session and mission, for the counts only", () => {
+    const [named, bare, other, sessionless] = ingest([
+      { ...raw("dispatch.turn", 0), session_id: "s", execution_id: "exec-1" },
+      { ...raw("dispatch.turn", 1), session_id: "s", mission_id: "m1" },
+      { ...raw("dispatch.turn", 2), session_id: "s", mission_id: "m2" },
+      { ...raw("dispatch.turn", 3), session_id: undefined, mission_id: undefined, handle: "h" },
+    ]);
+    expect([named, bare, other, sessionless].map(executionOf)).toEqual(["exec-1", "unnamed:s:m1", "unnamed:s:m2", expect.stringMatching(/^unnamed::/)]);
+    expect(bare.execution_id, "nothing is stamped on the record").toBeUndefined();
   });
 
   it("names exactly the actions Rust declares execution-grain", () => {

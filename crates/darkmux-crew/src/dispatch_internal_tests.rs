@@ -5197,9 +5197,9 @@
         let pre_4_0 = TempDir::new().unwrap();
         std::fs::write(pre_4_0.path().join(RESUME_ORIGIN_FILENAME), r#"{"workspace":"/w","workspace_read_only":false}"#).unwrap();
         let fresh = execution_for(Some(pre_4_0.path()));
-        assert!(!fresh.is_legacy() && fresh != recorded, "no recorded id: a new execution");
+        assert!(fresh != recorded, "no recorded id: a new execution");
         let no_origin = TempDir::new().unwrap();
-        assert!(!execution_for(Some(no_origin.path())).is_legacy());
+        assert_ne!(execution_for(Some(no_origin.path())), recorded);
     }
 
     /// The recorded id is read from a file the model can write, so only the

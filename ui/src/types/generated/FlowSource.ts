@@ -4,6 +4,5 @@
  * The component that wrote a record: one spelling each, `snake_case`. The
  * set is closed; a spelling this build does not know reads as
  * [`FlowSource::Unknown`] (see [`Level::Unknown`]) and is never written.
- * Pre-4.0 spellings map on read (`crate::legacy::OLD_SOURCES`).
  */
 export type FlowSource = "crew_dispatch" | "scheduler" | "phase_lifecycle" | "mission_lifecycle" | "phase_review" | "mission_debrief" | "host_sampler" | "presence_reconciler" | "cmd_gate_audit" | "hook" | "host" | "detector" | "runtime" | "tokens" | "context" | "compaction" | "lms" | "thermal" | "battery" | "budget" | "utility" | "orchestrator" | "adjudication" | "manual" | "frontier" | "unknown";

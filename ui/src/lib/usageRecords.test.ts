@@ -231,7 +231,7 @@ describe("the legacy fallback (a run with no usage records counts its complete)"
     expect(legacyCompleteCounts(recs).map((x) => x.execution_id)).toEqual(["exec-b"]);
   });
 
-  it("keys a pre-4.0 record on its session and mission, the identity the reader gives it", () => {
+  it("keys a record that names no execution on its session and mission", () => {
     // Mission A has usage records; mission B under the same deterministic
     // session id has only a legacy complete. Both count.
     const recs = [

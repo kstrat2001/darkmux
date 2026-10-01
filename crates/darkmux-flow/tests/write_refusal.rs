@@ -26,7 +26,7 @@ fn no_sink_writes_an_action_the_reader_could_not_name() {
             r#"{{"ts":"t","level":"info","category":"work","tier":"local","stage":"dispatch","action":"{action}","handle":"h"}}"#
         );
         let record = reader::parse_record(&line).expect("the lenient reader reads it");
-        assert!(matches!(record.action, FlowAction::Other(_) | FlowAction::Retired(_)));
+        assert!(matches!(record.action, FlowAction::Other(_)));
         assert!(LocalFileSink::new().write(&record).is_err(), "{action} must be refused");
     }
     assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0, "nothing reached the day file");

@@ -8,16 +8,16 @@ use super::*;
 /// family, an exact duplicate, a SIBLING mission whose id is a hyphen-extension
 /// (the #849 prefix-bleed regression), and a wrong-source note.
 const DAY: &str = concat!(
-    r#"{"ts":"2026-06-21T10:00:00Z","action":"note","source":"adjudication","session_id":"mission-run-auth-s1","handle":"Do not rename the field."}"#, "\n",
-    r#"{"ts":"2026-06-21T11:00:00Z","action":"note","source":"adjudication","session_id":"mission-run-auth-s2","handle":"Use cargo test -p foo."}"#, "\n",
-    r#"{"ts":"2026-06-21T11:30:00Z","action":"note","source":"adjudication","session_id":"mission-run-auth-s1","handle":"Do not rename the field."}"#, "\n",
-    r#"{"ts":"2026-06-21T11:45:00Z","action":"note","source":"adjudication","session_id":"mission-run-auth-v2-s1","handle":"Belongs to auth-v2 ONLY."}"#, "\n",
-    r#"{"ts":"2026-06-21T12:00:00Z","action":"note","source":"orchestrator","session_id":"mission-run-auth-s1","handle":"crew shipped it!"}"#, "\n",
+    r#"{"ts":"2026-06-21T10:00:00Z","action":"operator.note","source":"adjudication","session_id":"mission-run-auth-s1","handle":"Do not rename the field."}"#, "\n",
+    r#"{"ts":"2026-06-21T11:00:00Z","action":"operator.note","source":"adjudication","session_id":"mission-run-auth-s2","handle":"Use cargo test -p foo."}"#, "\n",
+    r#"{"ts":"2026-06-21T11:30:00Z","action":"operator.note","source":"adjudication","session_id":"mission-run-auth-s1","handle":"Do not rename the field."}"#, "\n",
+    r#"{"ts":"2026-06-21T11:45:00Z","action":"operator.note","source":"adjudication","session_id":"mission-run-auth-v2-s1","handle":"Belongs to auth-v2 ONLY."}"#, "\n",
+    r#"{"ts":"2026-06-21T12:00:00Z","action":"operator.note","source":"orchestrator","session_id":"mission-run-auth-s1","handle":"crew shipped it!"}"#, "\n",
     // An adjudication note with empty text — never a correction.
-    r#"{"ts":"2026-06-21T12:30:00Z","action":"note","source":"adjudication","session_id":"mission-run-auth-s1","handle":"   "}"#, "\n",
+    r#"{"ts":"2026-06-21T12:30:00Z","action":"operator.note","source":"adjudication","session_id":"mission-run-auth-s1","handle":"   "}"#, "\n",
     // The 4.0 grammar: this mission's phase `s2`, and the sibling's `s1`.
-    r#"{"ts":"2026-06-21T12:40:00Z","action":"note","source":"adjudication","session_id":"auth.phase.s2","handle":"The current grammar reads too."}"#, "\n",
-    r#"{"ts":"2026-06-21T12:50:00Z","action":"note","source":"adjudication","session_id":"auth-v2.phase.s1","handle":"Also auth-v2 ONLY."}"#, "\n",
+    r#"{"ts":"2026-06-21T12:40:00Z","action":"operator.note","source":"adjudication","session_id":"auth.phase.s2","handle":"The current grammar reads too."}"#, "\n",
+    r#"{"ts":"2026-06-21T12:50:00Z","action":"operator.note","source":"adjudication","session_id":"auth-v2.phase.s1","handle":"Also auth-v2 ONLY."}"#, "\n",
     // Unparsable line — skipped, must not poison the rest of the file.
     "{not json at all", "\n",
 );
@@ -119,12 +119,12 @@ fn scan_day_window_bounds_the_read() {
     let tmp = tempfile::TempDir::new().unwrap();
     std::fs::write(
         tmp.path().join("2026-06-20.jsonl"),
-        concat!(r#"{"ts":"2026-06-20T10:00:00Z","action":"note","source":"adjudication","session_id":"s-old","handle":"older day"}"#, "\n"),
+        concat!(r#"{"ts":"2026-06-20T10:00:00Z","action":"operator.note","source":"adjudication","session_id":"s-old","handle":"older day"}"#, "\n"),
     )
     .unwrap();
     std::fs::write(
         tmp.path().join("2026-06-21.jsonl"),
-        concat!(r#"{"ts":"2026-06-21T10:00:00Z","action":"note","source":"adjudication","session_id":"s-new","handle":"newer day"}"#, "\n"),
+        concat!(r#"{"ts":"2026-06-21T10:00:00Z","action":"operator.note","source":"adjudication","session_id":"s-new","handle":"newer day"}"#, "\n"),
     )
     .unwrap();
     let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
@@ -177,9 +177,9 @@ fn scan_execution_scope_matches_the_execution_and_not_its_session() {
 }
 
 /// A correction names the role execution it is about, never the session it
-/// ran under. A record with no execution of its own (a pre-4.0 note reads
-/// with a synthesized `legacy:` id) names none, so the session cannot leak
-/// back out through the synthesized spelling.
+/// ran under. A record with no execution of its own (a pre-4.0 note), or one
+/// whose id is not a minted one, names none, so the session cannot leak back
+/// out through either.
 #[test]
 #[serial_test::serial]
 fn a_correction_names_its_execution_and_an_old_one_names_none() {
@@ -189,15 +189,15 @@ fn a_correction_names_its_execution_and_an_old_one_names_none() {
         "session_id": "run-a.phase.p1", "execution_id": mine.as_str(), "handle": "new",
     });
     let old = serde_json::json!({
-        "ts": "2026-06-21T11:00:00Z", "action": "note", "source": "adjudication",
+        "ts": "2026-06-21T11:00:00Z", "action": "operator.note", "source": "adjudication",
         "session_id": "mission-run-auth-s1", "handle": "old",
     });
-    let synthesized = serde_json::json!({
+    let foreign = serde_json::json!({
         "ts": "2026-06-21T12:00:00Z", "action": "operator.note", "source": "adjudication",
-        "session_id": "mission-run-auth-s1", "execution_id": "legacy:mission-run-auth-s1:auth", "handle": "synth",
+        "session_id": "mission-run-auth-s1", "execution_id": "someone-elses", "handle": "foreign",
     });
     let tmp = tempfile::TempDir::new().unwrap();
-    std::fs::write(tmp.path().join("2026-06-21.jsonl"), format!("{with_exec}\n{old}\n{synthesized}\n")).unwrap();
+    std::fs::write(tmp.path().join("2026-06-21.jsonl"), format!("{with_exec}\n{old}\n{foreign}\n")).unwrap();
     let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
     // SAFETY: serialized via #[serial]; restored below.
     unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path()) };
@@ -211,7 +211,7 @@ fn a_correction_names_its_execution_and_an_old_one_names_none() {
     assert_eq!(got.len(), 3, "{got:?}");
     assert_eq!(got[0].execution_id.as_ref(), Some(&mine));
     assert_eq!(got[1].execution_id, None, "an old record has no execution to name");
-    assert_eq!(got[2].execution_id, None, "a synthesized id is not shown");
+    assert_eq!(got[2].execution_id, None, "an id that is not a minted one is not shown");
     let json = serde_json::to_string(&got).unwrap();
     assert!(!json.contains("session"), "no session in the serialized shape: {json}");
     assert!(json.contains(mine.as_str()), "{json}");

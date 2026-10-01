@@ -1096,6 +1096,35 @@ darkmux release.
   like any retired key. **Migration:** delete `escalation_posture` from your
   role manifests (`darkmux doctor`'s `user file keys` row names each file).
 
+- **darkmux no longer reads the formats it retired** (#3036). Old data still
+  loads and never panics; it reads as unknown.
+  - **Flow archives.** A record spelled the pre-4.0 way (`dispatch start`,
+    `step result`, `mission close`, `note`, `verdict: <v>`, `sprint *`, ...) or
+    carrying an action darkmux retired outright (`telemetry.process`, `funnel.*`,
+    `mission.run.*`, `crawl.*`, ...) reads as an unknown action, kept verbatim and
+    counted by `darkmux doctor`'s unknown-action check. Nothing is rewritten on
+    read: a retired `source` reads as `unknown`, a retired payload key keeps its
+    old name, the pre-`sprint_id` field is not read, and a record of an execution
+    that names none gets none (no `legacy:` id). A 3.x archive therefore still
+    lists, but most of its records are unknown actions and the viewer shows little
+    of it. The reader's `Retired` class, `darkmux_flow::legacy` and the golden
+    archive pair are deleted. A stored finding record's old `dispatch` field and
+    an old `compactor` seat in `telemetry.lms` also read as absent and unknown.
+    **Migration:** none for new data; keep a 3.x archive only to look at it with a
+    3.x or 4.x build.
+  - **Hook rules.** A rule written in a retired action spelling is no longer
+    refused: it matches no action darkmux writes, so the hook sink loads, warns,
+    and `darkmux doctor` warns `CANNOT MATCH`. **Migration:** write the dotted
+    spelling (`dispatch.complete`, `phase.*`).
+  - **Openclaw trajectories.** A run directory from the retired openclaw runtime
+    loads and reads as zero turns, compactions and tokens. `darkmux run inspect`
+    loses `--summary`, which only dumped that runtime's compaction summaries, and
+    no longer prints a `tokensBefore` line.
+  - **`mission.pause` and `mission.resume` are retired forever,** with the mission
+    fields `paused` and `paused_ts`: the names are never reused, so an archive's
+    no-op pauses cannot be mistaken for a real one. A future operator pause is a
+    separate `hold` field with `mission.hold` / `mission.release` (#2996).
+
 ### The flow record's leftover fields (breaking, 4.0, FLOW 2.0.0)
 
 - **`payload.runtime` is gone from every record.** It named the dispatch

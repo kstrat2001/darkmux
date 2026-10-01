@@ -106,8 +106,7 @@ impl Scope<'_> {
 
 /// The execution a note record names: only a minted id counts. A note
 /// writes its execution through the same grammar, so anything else (a
-/// synthesized `legacy:` spelling, which is built from a session and not for
-/// showing) names none.
+/// session-shaped value, say) names none.
 fn execution_of(record: &serde_json::Value) -> Option<ExecutionId> {
     ExecutionId::parse_minted(record.get("execution_id")?.as_str()?).ok()
 }

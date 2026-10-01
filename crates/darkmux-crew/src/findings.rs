@@ -84,10 +84,10 @@ pub struct FindingRecord {
     /// `<execution>/<seq>` — the address every other surface uses.
     pub key: String,
     /// The role execution that recorded it: the key's first half. A record
-    /// written before 4.0 names the dispatch's session id here instead (its
-    /// old field was `dispatch`, read through the alias, and its key is
-    /// unchanged): the store's addresses are never rewritten.
-    #[serde(alias = "dispatch")]
+    /// written before 4.0 has a `dispatch` field instead, which is no longer
+    /// read: this is empty for it, and its key is unchanged (the store's
+    /// addresses are never rewritten).
+    #[serde(default)]
     pub execution: String,
     /// The accepted call's `emit_seq` within that execution.
     pub seq: u64,
@@ -451,16 +451,11 @@ fn str_field(v: &serde_json::Value, field: &str) -> Option<String> {
 }
 
 /// The first half of the store key a flow record's finding is filed under:
-/// its execution's id. A record written before 4.0 names none (the reader
-/// gives it a synthesized one), and its finding was filed under the
-/// dispatch's session id, so that is where a replay files it again: an
-/// old finding is found at the address it always had, never twice.
+/// its execution's id. A record written before 4.0 names none and has no
+/// address to replay it at (#3036); a finding the old tailer already stored
+/// stays where it was filed.
 fn store_address_of(rec: &serde_json::Value) -> Option<String> {
-    let execution = str_field(rec, "execution_id")?;
-    match darkmux_types::execution_id::ExecutionId::parse(&execution).ok()?.is_legacy() {
-        true => str_field(rec, "session_id"),
-        false => Some(execution),
-    }
+    str_field(rec, "execution_id")
 }
 
 /// What one `finding sync` pass did.
@@ -898,7 +893,7 @@ mod tests {
         }
         serde_json::json!({
             "ts": "2026-09-03T01:00:00Z", "action": "dispatch.tool",
-            "handle": "crawler", "session_id": sess, "model": "m",
+            "handle": "crawler", "session_id": sess, "execution_id": sess, "model": "m",
             "mission_id": "crawl-1", "payload": payload,
         })
         .to_string()
@@ -976,31 +971,33 @@ mod tests {
         assert_eq!(load_at(&store, "exec-b", 1).unwrap().unwrap().key, "exec-b/1");
     }
 
-    /// A pre-4.0 flow record names no execution, and its finding was filed
-    /// under the session: a replay files it at that same address, so an old
-    /// finding is found where it always was and never stored twice.
+    /// (#3036) A pre-4.0 flow record names no execution, and the reader no
+    /// longer synthesizes one: a replay counts it as unaddressable and files
+    /// nothing, while a finding the old tailer already stored stays where it
+    /// is.
     #[test]
-    fn a_legacy_record_is_replayed_at_its_sessions_address() {
+    fn a_record_naming_no_execution_is_not_replayed() {
         let tmp = TempDir::new().unwrap();
         let (flows, store) = (tmp.path().join("flows"), tmp.path().join("findings"));
-        write_day(&flows, "2026-09-03.jsonl", &[flow_line("sess-old", "create_finding", true, Some(serde_json::json!({"file": "a.ts"})), Some(3))]);
-        // The store already holds the finding, filed by the pre-4.0 tailer.
+        let mut nameless: serde_json::Value =
+            serde_json::from_str(&flow_line("sess-old", "create_finding", true, Some(serde_json::json!({"file": "a.ts"})), Some(3))).unwrap();
+        nameless.as_object_mut().unwrap().remove("execution_id");
+        write_day(&flows, "2026-09-03.jsonl", &[nameless.to_string()]);
         materialize(&store, &rec_at("sess-old", 3, "2026-09-03T01:00:00Z")).unwrap();
         let r = sync_at(&flows, &store, None).unwrap();
-        assert_eq!((r.created, r.present), (0, 1), "the replay finds the old address: {r:?}");
+        assert_eq!((r.created, r.present, r.skipped_no_emission), (0, 0, 1), "{r:?}");
+        assert_eq!(load_at(&store, "sess-old", 3).unwrap().unwrap().key, "sess-old/3", "the stored finding is untouched");
     }
 
-    /// A record written before 4.0 has a `dispatch` field where a current one
-    /// has `execution`; both read, and the key is what it always was.
+    /// (#3036) A finding record written before 4.0 has a `dispatch` field where
+    /// a current one has `execution`: it still reads, the key is what it
+    /// always was, and the execution reads as empty.
     #[test]
     fn a_pre_4_0_finding_record_still_reads() {
         let old = r#"{"key":"sess-x/2","dispatch":"sess-x","seq":2,"ts":"t","tool_name":"create_finding",
             "proposer":{"handle":"h","model":"m"},"context":null,"emitted":{},"schema_version":"1"}"#;
         let rec: FindingRecord = serde_json::from_str(old).unwrap();
-        assert_eq!((rec.execution.as_str(), rec.key.as_str()), ("sess-x", "sess-x/2"));
-        let round = serde_json::to_value(&rec).unwrap();
-        assert_eq!(round["execution"], "sess-x");
-        assert!(round.get("dispatch").is_none(), "written under its current name");
+        assert_eq!((rec.execution.as_str(), rec.key.as_str()), ("", "sess-x/2"));
     }
 
     #[test]

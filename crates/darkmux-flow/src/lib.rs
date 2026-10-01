@@ -11,7 +11,6 @@ pub mod daemon_probe;
 pub(crate) mod hmac_sha256;
 pub mod hook_transform;
 pub mod hooks;
-pub mod legacy;
 pub mod live;
 pub mod payload;
 pub mod presence;
@@ -113,7 +112,7 @@ pub trait FlowSink: Send + Sync {
 }
 
 /// A record that passed the write check: its action is one darkmux writes
-/// today, never [`FlowAction::Other`] (unknown) or [`FlowAction::Retired`],
+/// today, never [`FlowAction::Other`] (unknown, a retired spelling included),
 /// and a record of a role execution names it.
 /// Its field is private, so the only way to hand one to a sink is
 /// [`FlowSinkWrite::write`], the one chokepoint every sink's write goes
@@ -126,9 +125,6 @@ impl<'a> CheckedRecord<'a> {
         match &record.action {
             FlowAction::Other(unknown) => {
                 anyhow::bail!("refusing to write a flow record whose action `{}` is not one darkmux knows", unknown.as_str())
-            }
-            FlowAction::Retired(retired) => {
-                anyhow::bail!("refusing to write a flow record with the retired action `{}`", retired.as_str())
             }
             known if known.grain() == Some(Grain::Execution) && record.execution_id.is_none() => {
                 anyhow::bail!("refusing to write a `{}` record with no execution id: it is a record of a role execution", known.as_str())
@@ -2278,13 +2274,13 @@ mod tests {
         }
         let sink = Counting(Default::default());
         let mut unknown = minimal_record();
-        unknown.action = crate::legacy::read_action("future.thing");
+        unknown.action = FlowAction::from_wire("future.thing");
         assert!(record_via(&sink, &unknown).is_err());
         assert!(record_to(&sink, unknown).is_err());
         let mut retired = minimal_record();
         // flow-action-guard:allow — a retired action the sink must refuse
-        retired.action = crate::legacy::read_action("telemetry.process");
-        assert!(matches!(retired.action, FlowAction::Retired(_)));
+        retired.action = FlowAction::from_wire("telemetry.process");
+        assert!(matches!(retired.action, FlowAction::Other(_)));
         assert!(record_via(&sink, &retired).is_err());
         assert!(record_to(&sink, retired).is_err());
         assert_eq!(sink.0.load(std::sync::atomic::Ordering::Relaxed), 0, "no sink saw the unknown or retired action");
@@ -2325,7 +2321,7 @@ mod tests {
     }
 
     /// The verbs behind `mission.pause`, `mission.resume` and `phase.added`
-    /// are gone (#2954), so each spelling reads as retired and no write path
+    /// are gone (#2954), so each spelling reads as unknown and no write path
     /// can name one: it is not a current action, and both entry points
     /// refuse a record that carries it.
     #[test]
@@ -2345,8 +2341,8 @@ mod tests {
         for wire in ["mission.pause", "mission pause", "mission.resume", "mission resume", "phase.added", "phase added", "sprint added"] {
             assert!(!FlowAction::KNOWN_WIRE.contains(&wire), "{wire} is still a current action");
             let mut r = minimal_record();
-            r.action = crate::legacy::read_action(wire);
-            assert!(matches!(r.action, FlowAction::Retired(_)), "{wire} must read as retired");
+            r.action = FlowAction::from_wire(wire);
+            assert!(matches!(r.action, FlowAction::Other(_)), "{wire} must read as unknown");
             assert!(record_via(&Never, &r).is_err(), "{wire}");
             assert!(record_to(&Never, r).is_err(), "{wire}");
         }
