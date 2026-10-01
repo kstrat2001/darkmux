@@ -8,7 +8,8 @@ import { queryKeys, MACHINE_MEM_POLL_MS } from "../../lib/queryKeys";
 import { useFlowWindow } from "../../hooks/useFlowWindow";
 import { useLatch } from "../../hooks/useLatch";
 import { useFleetRoster, useLiveMachines } from "../../hooks/useLiveMachines";
-import { localMachineUid, displayNameOf, sameUid } from "../../lib/machineIdentity";
+import { localMachineUid, displayNameOf, sameUid, windowHoldsMachine } from "../../lib/machineIdentity";
+import { machineAvailability, NOT_REPORTED, type MachineAvailability } from "../../lib/machineAvailability";
 import { relAgoFrom } from "../../lib/format";
 import { specOf } from "../fleet/cards";
 import { machineIsHub } from "../fleet/viewRows";
@@ -291,6 +292,12 @@ export function MachineLens({
   // is false by default, not by reading, so the page makes no remote claim
   // ("another machine", a remote idle line) and shows its pending form.
   const identityKnown = specsAnswered && (machineIsLocal || flowAnswered);
+  // (5.0 R3) What this viewer can see of the page's machine. Judged only once
+  // the window has answered and the page knows whose machine it is.
+  const availability: MachineAvailability =
+    identityKnown && flowAnswered && targetUid != null
+      ? machineAvailability({ self: isLocalMach, seen: windowHoldsMachine(flowWindow.data, liveMachines, targetUid), standing: "unknown" })
+      : "known";
 
   // (#2108, operator design rule — "the lens must be a strict SUPERSET of
   // the sheet") The SAME shared hook `MachineDrawer.tsx`'s desktop dialog
@@ -511,6 +518,7 @@ export function MachineLens({
             isLocal: isLocalMach,
             settled: flowAnswered,
             identityKnown,
+            availability,
             residentRow: residencyRows.find((r) => r.status !== "ghost" && isUtilityTierRow(r.model.identifier, r.model.model_key, utilityModelId(specs, isLocalSpecs)))?.model ?? null,
           })}
         />
@@ -537,7 +545,7 @@ export function MachineLens({
                 the page has no samples because it has read nothing yet.
                 Before the page knows whose machine it is, this may not be
                 the remote branch at all. */}
-            <div className="machine-drawer__idle-line">{flowAnswered && identityKnown ? "idle · no samples in the last 10 min" : "no signal"}</div>
+            <div className="machine-drawer__idle-line">{availability !== "known" ? `${NOT_REPORTED} · no records from this machine reach this viewer` : flowAnswered && identityKnown ? "idle · no samples in the last 10 min" : "no signal"}</div>
             {liveLastKnown && (
               <div className="machine-drawer__lastknown">
                 {`last sample ${relAgoFrom(nowMs, liveLastKnown.ts)} — CPU ${fmtPct(liveLastKnown.point.cpu ?? null)} · GPU ${fmtPct(liveLastKnown.point.gpu ?? null)} · MEM ${fmtPct(liveLastKnown.point.mem ?? null)}`}

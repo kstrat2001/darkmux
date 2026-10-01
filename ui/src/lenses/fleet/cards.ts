@@ -48,6 +48,7 @@ import { mergeLive, type LiveOverlay } from "../../lib/liveChannel";
 import { recordsAsOf, type NormRecord } from "../../lib/ingest";
 import { DEFAULT_POLICY, isRunning, lifecycleAt, type LifecyclePolicy, type Presence } from "../../lib/lifecycle";
 import { currentRun, runIndex, type RunGroup } from "../../lib/runRef";
+import { machineAvailability, type MachineAvailability } from "../../lib/machineAvailability";
 
 /** A machine's runs in flight as of `t`: its run- and execution-grain runs
  *  (`runRef.ts`) whose lifecycle (`lifecycle.ts`) is open or waiting. One
@@ -288,6 +289,9 @@ export interface FleetCard {
    *  is proof of life), or, for a machine the view does not hold, the flow
    *  window's online/offline edges. */
   standing: Standing;
+  /** (5.0 R3, #3012) Whether this viewer can see this machine's activity at
+   *  all. Anything but `known` means a quiet card proves nothing. */
+  availability: MachineAvailability;
   active: boolean;
   absent: boolean;
   stat: string;
@@ -491,6 +495,7 @@ function cardIdentity(
       grant: null,
       hub: false,
       standing: machAbsent ? ("offline" as const) : ("online" as const),
+      availability: "known" as const,
       self: false,
     };
   }
@@ -505,6 +510,7 @@ function cardIdentity(
     grant: row.grant,
     hub: row.hub,
     standing: row.standing,
+    availability: machineAvailability({ self: row.isSelf, seen: row.known, standing: row.standing }),
     // (#2915) The view says which row is this machine; a peer's model is
     // read off its own utility records and its residency is unknown.
     self: row.isSelf,
@@ -629,6 +635,7 @@ export function buildFleetCardBase(
     grant: id.grant,
     hub: id.hub,
     standing,
+    availability: id.availability,
     active,
     absent: standing === "offline",
     stat,
@@ -718,7 +725,7 @@ export interface CardFace {
  *  execution's line says when the page loses the daemon (#2886), in the
  *  same boxes. */
 export function cardFace(
-  card: { absent: boolean; active: boolean; runsCount: number; standing: Standing },
+  card: { absent: boolean; active: boolean; runsCount: number; standing: Standing; availability: MachineAvailability },
   hasReading: boolean,
   answered: CardSourcesAnswered,
 ): CardFace {
@@ -726,7 +733,10 @@ export function cardFace(
   const offlineKnown = answered.flow && answered.presence;
   const absent = card.absent && offlineKnown;
   const active = card.active && !absent;
-  const idleKnown = all && card.standing === "online";
+  // (5.0 R3) A machine whose records never reach this viewer proves nothing by
+  // being quiet: only a `known` one may read idle, 0 running or a quiet strip.
+  const seen = card.availability === "known";
+  const idleKnown = all && seen && card.standing === "online";
   const stat = absent ? "offline" : card.active ? "dispatch in flight" : idleKnown ? "idle" : NO_SIGNAL_STAT;
   // Offline wins: a machine said to be gone draws the powered-off screen,
   // even over a reading its last records left behind.
@@ -737,8 +747,8 @@ export function cardFace(
     active,
     noSignal: stat === NO_SIGNAL_STAT,
     tube,
-    countShown: card.runsCount > 0 || all,
-    utilityQuietKnown: answered.flow,
+    countShown: card.runsCount > 0 || (all && seen),
+    utilityQuietKnown: answered.flow && seen,
   };
 }
 

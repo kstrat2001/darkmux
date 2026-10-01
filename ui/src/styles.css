@@ -711,12 +711,14 @@ body {
 }
 /* The HUB badge (`components/HubBadge.tsx`): never shrinks below its word, so
    a long machine name ellipsizes beside it instead. */
-.hub-badge {
+.hub-badge,
+.avail-warn {
   flex: 0 0 auto;
   vertical-align: middle;
   margin-left: 8px;
 }
-.mach .name .hub-badge {
+.mach .name .hub-badge,
+.mach .name .avail-warn {
   margin-left: 0;
 }
 @media (max-width: 768px) {

@@ -177,6 +177,13 @@ function directory(data: NormRecord[], liveMachines: Map<string, PresenceBeat>):
   return dir;
 }
 
+/** Whether this window holds a record or a presence beat from the machine
+ *  `uid` names. `false` means the viewer receives nothing from it, which is
+ *  not the same as it being idle (5.0 R3, `lib/machineAvailability.ts`). */
+export function windowHoldsMachine(data: NormRecord[], liveMachines: Map<string, PresenceBeat>, uid: string): boolean {
+  return findUid(directory(data, liveMachines).uids, uid) !== null;
+}
+
 /** EVERY name a uid has appeared under — across the window's records and its
  * presence beat, not just the one `nameOf` happens to pick.
  *

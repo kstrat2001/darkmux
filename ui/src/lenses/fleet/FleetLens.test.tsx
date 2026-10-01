@@ -1647,9 +1647,11 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
     await waitFor(() => expect(document.querySelectorAll(".mach")).toHaveLength(2));
     await waitFor(() => expect(document.querySelector('.savings[data-settled="true"]')).not.toBeNull());
     const studio = [...document.querySelectorAll(".mach")].find((c) => c.querySelector(".mach-name")!.textContent === "studio")!;
-    await waitFor(() => expect(studio.querySelector(".stat")!.textContent).toBe("idle"));
+    // (5.0 R3) Up, but nothing it writes reaches this viewer: never "idle".
+    await waitFor(() => expect(studio.querySelector(".stat")!.textContent).toBe("no signal"));
     expect(studio.className).not.toContain("absent");
     expect(studio.textContent).not.toContain("offline");
+    expect(studio.querySelector('[data-testid="availability-warning"]')!.getAttribute("title")).toMatch(/do not reach this viewer/);
     // The radio seat is an icon in the name row whose tooltip says what it
     // means; the rest of the grant stays words, and the whole grant stays in
     // the hardware line's tooltip.

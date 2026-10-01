@@ -20,6 +20,7 @@ import { utilityJobWord, utilityStrip, utilityUsageByJob, type UtilityStrip } fr
 import type { ModelRow } from "../../types/generated/ModelRow";
 import type { MachineSpecsResponse } from "../../types/generated/MachineSpecsResponse";
 import { recordsAsOf, type NormRecord } from "../../lib/ingest";
+import { NOT_REPORTED, type MachineAvailability } from "../../lib/machineAvailability";
 
 export interface UtilitySectionView {
   strip: UtilityStrip;
@@ -52,8 +53,14 @@ export function utilitySectionView(args: {
    *  seen", "no utility model registered" and "another machine" are all
    *  claims specs could contradict. Omitted: true. */
   identityKnown?: boolean;
+  /** (5.0 R3) What this viewer can see of the machine. Anything but `known`
+   *  reads "not reported" instead of idle, 0 calls or "no utility model
+   *  seen": the records those would count never reach this viewer. Omitted:
+   *  known. */
+  availability?: MachineAvailability;
 }): UtilitySectionView {
   const noSignal = args.settled === false;
+  const unseen = (args.availability ?? "known") !== "known";
   const identityKnown = args.identityKnown !== false;
   const binding = args.isLocal ? (args.specs?.utility_model ?? null) : null;
   const strip = utilityStrip(args.data, args.uid, args.nowMs, binding);
@@ -68,7 +75,7 @@ export function utilitySectionView(args: {
           ? "not loaded"
           : "no utility model registered";
   const job = strip.job;
-  const liveLine = noSignal ? "no signal" : job ? (job.stalled ? `${job.word} · stalled` : `${job.word} · ${Math.max(0, Math.floor((args.nowMs - job.sinceMs) / 1000))}s`) : "idle";
+  const liveLine = noSignal ? "no signal" : unseen ? NOT_REPORTED : job ? (job.stalled ? `${job.word} · stalled` : `${job.word} · ${Math.max(0, Math.floor((args.nowMs - job.sinceMs) / 1000))}s`) : "idle";
   const mine = recordsAsOf(args.data, args.nowMs).filter((r) => sameUid(uidOf(r), args.uid));
   // (#2915 review, C7) A FIXED set of rows, so the section is one size
   // whatever ran: one per known job, then ONE "other" row folding every job
@@ -80,8 +87,8 @@ export function utilitySectionView(args: {
   // "—" holds the cell until then.
   const row = (word: string, calls: number, tokens: number, known: boolean) => ({
     word,
-    calls: noSignal ? "—" : `${calls.toLocaleString("en-US")} ${calls === 1 ? "call" : "calls"}`,
-    tokens: noSignal ? "—" : `${fmtC(tokens)} tokens`,
+    calls: noSignal || unseen ? "—" : `${calls.toLocaleString("en-US")} ${calls === 1 ? "call" : "calls"}`,
+    tokens: noSignal || unseen ? "—" : `${fmtC(tokens)} tokens`,
     known,
   });
   const jobs = [...usage.filter((u) => u.known).map((u) => row(utilityJobWord(u.job), u.calls, u.tokens, true)), row("other", other.calls, other.tokens, false)];
@@ -89,10 +96,10 @@ export function utilitySectionView(args: {
     strip,
     // (#2958) "no utility model seen" is a claim about the records; a model
     // named by `/machine/specs` is a reading and shows at once.
-    modelLine: strip.model ?? (noSignal || !identityKnown ? "—" : "no utility model seen"),
+    modelLine: strip.model ?? (noSignal || !identityKnown ? "—" : unseen ? NOT_REPORTED : "no utility model seen"),
     factsLine: `${win} · ${residency}`,
     liveLine,
-    noSignal,
+    noSignal: noSignal || unseen,
     jobs,
   };
 }

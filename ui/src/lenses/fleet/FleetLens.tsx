@@ -13,6 +13,7 @@ import { REPLAY_GRANULARITY_NOTE, useLiveOverlay } from "../../lib/liveChannel";
 import { useCountUp } from "../../hooks/useCountUp";
 import { useFleetRoster, useLiveMachines } from "../../hooks/useLiveMachines";
 import { useFleetView } from "../../hooks/useFleetView";
+import { AvailabilityWarning } from "../../components/AvailabilityWarning";
 import { HubBadge } from "../../components/HubBadge";
 import { RadioSeatIcon } from "../../components/RadioSeatIcon";
 import { useFlip } from "../../hooks/useFlip";
@@ -134,6 +135,8 @@ function CardNameRow({ card, utilityQuietKnown }: { card: FleetCard; utilityQuie
       </span>
       {/* (#3022) What the machine's own card declares. */}
       <HubBadge declared={card.hub} />
+      {/* (#3012) A machine whose activity this viewer cannot see. */}
+      <AvailabilityWarning availability={card.availability} />
       {/* The radio seat this peer grants: an icon in the name row, where a
           narrow card's ellipsis cannot cut it. */}
       {card.grant?.radio ? <RadioSeatIcon /> : null}

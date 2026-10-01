@@ -613,6 +613,23 @@ describe("MachineLens — the utility tier is a row badge, not a card", () => {
     expect(section.querySelector(".mm-utility__id")?.textContent).toBe("no utility model seen");
   });
 
+  // (5.0 R3) A peer nothing reaches this viewer from (no record, no beat) is
+  // not "idle with 0 calls": the page says its data is not reported.
+  it("(5.0 R3) a peer with no records and no beat reads not reported, never idle or 0 calls", async () => {
+    mockMachineFetch({
+      specs: { machine_id: "MacBook-Pro", machine_uid: "u-self" },
+      roster: [{ id: "darkbook", address: "100.64.0.9:8765", added_unix_ms: 1, machine_uid: "u-quiet" }],
+      flowToday: [{ ts: new Date().toISOString(), machine_uid: "U-SELF", machine_id: "MacBook-Pro", action: "dispatch.start", session_id: "s1" }],
+    });
+    const { container } = renderMachine("u-quiet");
+    await waitFor(() => expect(container.querySelector(".machine-drawer__idle-line")!.textContent).toMatch(/not reported/));
+    const section = container.querySelector('[data-testid="machine-utility"]')!;
+    expect(section.querySelector(".mm-utility__id")?.textContent).toBe("not reported");
+    expect(section.querySelector(".mm-utility__live")?.textContent).toBe("not reported");
+    expect([...section.querySelectorAll(".mm-utility__job")].map((r) => r.textContent)).toEqual(["compacting——", "radio routing——", "other——"]);
+    expect(container.textContent).not.toMatch(/0 calls|idle/);
+  });
+
   // (#2965) A failed flow read settles the window, but it is not an answer
   // that nothing happened: the page's "idle" lines are negative claims about
   // exactly the records that are missing. They hold "no signal", as on the
