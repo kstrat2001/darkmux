@@ -226,6 +226,7 @@ fn roster_checks(
         .map(|m| crate::doctor::RosterEntryView {
             id: m.id.clone(),
             machine_uid: m.machine_uid.clone(),
+            current_name: m.current_name.clone(),
             address: m.address.clone(),
             address_is_loopback: fleet::address_host_is_loopback(&m.address),
             loopback_intended: m.loopback_intended,

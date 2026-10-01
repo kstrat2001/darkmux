@@ -276,17 +276,15 @@ impl WorkJob {
     /// leaves and by the receiver before anything runs. Charset and size
     /// only; who may run what is `submission.rs`'s job.
     ///
-    /// - `target_machine`, `role_id`: `[a-z0-9_-]{1,64}`.
+    /// - `target_machine`, `role_id`: `[a-z0-9_-]{1,64}`;
+    ///   `target_machine_uid`: 1..=64 letters, digits or `-`.
     /// - `profile`: 1..=64 printable ASCII, no whitespace (profile names
     ///   are the operator's own and may carry dots or capitals; the value
     ///   is only ever compared against names, never used as a path).
     /// - `message` ≤ 256 KiB, `workdir` ≤ 4 KiB, `timeout_seconds` in
     ///   1..=3600, `image` a conservative image reference.
     pub fn validate(&self) -> Result<()> {
-        validate_machine_name("WorkJob.target_machine", &self.target_machine)?;
-        if let Some(uid) = &self.target_machine_uid {
-            validate_machine_uid(uid)?;
-        }
+        self.validate_target()?;
         validate_work_identifier("role_id", &self.role_id)?;
         validate_session_id(&self.session_id)?;
         if let Some(p) = &self.profile {
@@ -316,6 +314,12 @@ impl WorkJob {
             self.validate_single_shot(single_shot)?;
         }
         Ok(())
+    }
+
+    /// The machine the job is addressed to: its name, and its uid when given.
+    fn validate_target(&self) -> Result<()> {
+        validate_machine_name("WorkJob.target_machine", &self.target_machine)?;
+        self.target_machine_uid.as_deref().map_or(Ok(()), validate_machine_uid)
     }
 
     /// A `single_shot` job is one tool-less exchange under the radio
@@ -651,6 +655,17 @@ mod tests {
             let parser_ok = darkmux_types::profile_address::machine_name_problem(name).is_none();
             let wire_ok = validate_machine_name("m", name).is_ok();
             assert_eq!(parser_ok, wire_ok, "{name:?}: parser {parser_ok}, wire {wire_ok}");
+        }
+    }
+
+    /// (#3028) The uid on the wire is a bounded token, never free text.
+    #[test]
+    fn target_machine_uid_is_a_bounded_token() {
+        let with = |uid: &str| WorkJob { target_machine_uid: Some(uid.into()), ..make_valid_job() };
+        assert!(with("00000000-0000-4000-8000-ABCDEF000001").validate().is_ok());
+        for bad in ["", "has space", "a/b", "uid\n", &"A".repeat(65)] {
+            let err = with(bad).validate().unwrap_err().to_string();
+            assert!(err.contains("target_machine_uid"), "{bad:?}: {err}");
         }
     }
 
