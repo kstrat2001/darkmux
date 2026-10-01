@@ -503,6 +503,12 @@ fn card_fleet_defaults(mode: DeclaredFleetMode) -> Option<CardFleetDefaults> {
     })
 }
 
+/// The work wire version a card states: the one this build speaks (#3028).
+/// The gathered card and the fixture builder both take it from here.
+pub(crate) fn stated_work_version() -> String {
+    darkmux_fleet::WORK_JOB_SCHEMA_VERSION.to_string()
+}
+
 /// This machine's card. Blocking: the specs gather shells out.
 pub(crate) fn gather_local_card() -> MachineCard {
     let started = std::time::Instant::now();
@@ -532,7 +538,7 @@ pub(crate) fn gather_local_card() -> MachineCard {
     let fleet_mode = darkmux_types::config_access::declared_fleet_mode();
     MachineCard {
         card_schema_version: CARD_SCHEMA_VERSION.to_string(),
-        work_job_schema_version: darkmux_fleet::WORK_JOB_SCHEMA_VERSION.to_string(),
+        work_job_schema_version: stated_work_version(),
         specs,
         profiles,
         default_profile,
@@ -968,10 +974,7 @@ pub(crate) mod tests {
     pub(crate) fn sample_card() -> MachineCard {
         MachineCard {
             card_schema_version: CARD_SCHEMA_VERSION.to_string(),
-            // A hand-built value, not the live constant: the card's committed
-            // fixtures are of the card's shape, which a work-wire minor bump
-            // (8.1, #3028) does not change, and they are never regenerated.
-            work_job_schema_version: "8.0".to_string(),
+            work_job_schema_version: stated_work_version(),
             specs: MachineSpecsResponse {
                 darkmux_version: "5.0.0".into(),
                 flow_schema_version: "2.0.0".into(),
@@ -1067,6 +1070,14 @@ pub(crate) mod tests {
              retype), then regenerate with DARKMUX_REGENERATE_FIXTURES=1"
         );
         on_disk
+    }
+
+    /// (#3028) The card states the work wire version this build speaks, which
+    /// is what a sender reads to know what a peer takes.
+    #[test]
+    fn a_card_states_the_work_wire_version_this_build_speaks() {
+        assert_eq!(stated_work_version(), darkmux_fleet::WORK_JOB_SCHEMA_VERSION);
+        assert_eq!(sample_card().work_job_schema_version, darkmux_fleet::WORK_JOB_SCHEMA_VERSION);
     }
 
     /// The current version's fixtures parse as themselves, through the parser

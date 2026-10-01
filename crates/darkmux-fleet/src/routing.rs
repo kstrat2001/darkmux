@@ -750,7 +750,7 @@ mod tests {
         let sent: serde_json::Value = serde_json::from_str(&rx.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap();
         assert_eq!(sent["job"]["profile"], "host", "the owner's own profile name crosses: {sent}");
         assert_eq!(sent["job"]["target_machine"], "Peer-B");
-        assert_eq!(sent["schema"], crate::WORK_JOB_SCHEMA_VERSION);
+        assert_eq!(sent["schema"], "8.0", "a job with no target uid is written at the lowest version");
     }
 
     /// (#3028) The headline: peer-b renamed itself `studio-now` and this
@@ -938,7 +938,7 @@ mod tests {
             (Some("radio-host"), Some("deep"), Some("managed_only")),
             "{sent}"
         );
-        assert_eq!(sent["schema"], crate::WORK_JOB_SCHEMA_VERSION);
+        assert_eq!(sent["schema"], "8.0", "a job with no target uid is written at the lowest version");
     }
 
     /// The doctor's check never writes the roster and never contacts a node

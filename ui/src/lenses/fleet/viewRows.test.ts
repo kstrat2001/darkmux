@@ -187,6 +187,13 @@ describe("rowFacts", () => {
     expect(rowFacts(row({ entry: null }), new Set(), null).name).toBe("studio");
   });
 
+  it("a renamed machine answers to both its roster id and its card's name, so runs under either match (#3028)", () => {
+    const renamed = row({ entry: { id: "m1-max-32gb-studio", address: "100.64.0.9:8765", added_unix_ms: 1 } });
+    expect(rowFacts(renamed, new Set(), null).names).toEqual(["studio", "m1-max-32gb-studio"]);
+    expect(rowFacts(row(), new Set(), null).names).toEqual(["studio"]);
+    expect(rowFacts(row({ entry: null }), new Set(), null).names).toEqual(["studio"]);
+  });
+
   it("a card with no chip named has no hardware line", () => {
     const noChip = { specs: { ...SPECS, cpu_brand: null } } as unknown as MachineCard;
     expect(rowFacts(row({ card: { state: "available", card: noChip, source: "listener" } }), new Set(), null).spec).toBe("");

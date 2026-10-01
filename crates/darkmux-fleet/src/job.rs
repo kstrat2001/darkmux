@@ -199,7 +199,9 @@ pub struct SingleShotJob {
 /// minor bump, and an older receiver refuses a newer minor by naming both
 /// versions. A shape change that is not additive is a major bump. "8.0" added
 /// `boundary`, `mode`, and the reply's `refusal` code and `check` report.
-/// "8.1" (#3028) added the job's optional `target_machine_uid`.
+/// "8.1" (#3028) added the job's optional `target_machine_uid`; a submission
+/// is written at the lowest version that can say its job ([`WorkJob::wire_version`]),
+/// and this constant is the highest a receiver takes.
 pub const WORK_JOB_SCHEMA_VERSION: &str = "8.1";
 
 /// A work wire version, `major.minor` (see [`WORK_JOB_SCHEMA_VERSION`]).
@@ -270,6 +272,14 @@ impl WorkJob {
             (Some(want), Some(mine)) => want.eq_ignore_ascii_case(mine),
             _ => same_machine(&self.target_machine, receiver),
         }
+    }
+
+    /// (#3028) The lowest wire version that can say this job: 8.0, or 8.1
+    /// when it carries `target_machine_uid`. A submission is written at this
+    /// version, so a sender that has learned no uid still reaches an 8.0
+    /// receiver.
+    pub fn wire_version(&self) -> WorkVersion {
+        WorkVersion { major: 8, minor: u32::from(self.target_machine_uid.is_some()) }
     }
 
     /// Validate a job's SHAPE — called by the sender before the request

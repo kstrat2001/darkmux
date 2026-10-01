@@ -64,7 +64,7 @@ pub struct WorkSubmission {
 
 impl WorkSubmission {
     pub fn new(job: WorkJob, wait: bool) -> Self {
-        Self { schema: WORK_JOB_SCHEMA_VERSION.to_string(), wait, job }
+        Self { schema: job.wire_version().to_string(), wait, job }
     }
 
     /// Parse a request body, checking the version before the job's shape.
@@ -1748,6 +1748,27 @@ mod tests {
         let mut j = job(None);
         j.target_machine = "Studio".into();
         assert_eq!(check_scope("studio", None, &admitted, &j, work()).unwrap().profile, "host", "case-insensitive");
+    }
+
+    /// (#3028) A submission is written at the lowest version that can say it:
+    /// a job with no target uid is an 8.0 submission an 8.0 receiver takes,
+    /// one carrying the uid is 8.1 and an 8.0 receiver refuses it by version.
+    #[test]
+    fn a_submission_is_written_at_the_lowest_version_that_expresses_it() {
+        let plain = WorkSubmission::new(job(None), true);
+        assert_eq!(plain.schema, "8.0");
+        let mut with_uid = job(None);
+        with_uid.target_machine_uid = Some("UID-S".into());
+        let with_uid = WorkSubmission::new(with_uid, true);
+        assert_eq!(with_uid.schema, "8.1");
+        let eight_oh = WorkVersion::parse("8.0").unwrap();
+        let body = |s: &WorkSubmission| serde_json::to_vec(s).unwrap();
+        assert!(WorkSubmission::parse_for(&body(&plain), eight_oh).is_ok(), "an 8.0 receiver takes the uid-less job");
+        assert_eq!(
+            WorkSubmission::parse_for(&body(&with_uid), eight_oh).unwrap_err(),
+            Refusal::SchemaMismatch { got: "8.1".into() }
+        );
+        assert!(WorkSubmission::parse(&body(&plain)).is_ok() && WorkSubmission::parse(&body(&with_uid)).is_ok());
     }
 
     fn laptop_admitted() -> Admitted {
