@@ -5,7 +5,7 @@
  * "radio-host here", which crowded the hardware line; the tooltip (and the
  * accessible name) says what it means, and the hardware line's own tooltip
  * still spells the whole grant out. */
-export const RADIO_SEAT_TITLE = "accepts radio: this machine will answer radio questions sent from here (radio-host)";
+const RADIO_SEAT_TITLE = "accepts radio: this machine will answer radio questions sent from here (radio-host)";
 
 export function RadioSeatIcon() {
   return (
