@@ -485,6 +485,7 @@
     #[test]
     #[serial]
     fn the_sampler_pacer_ends_a_stopped_run_it_holds() {
+        let _state = darkmux_types::test_isolation::IsolatedState::new(); // pins HOME/DARKMUX_HOME: the sampler's `machine.telemetry` goes to the real flow sink otherwise
         darkmux_types::interrupt::reset_for_test();
         let out = TempDir::new().unwrap();
         let mut ep: darkmux_types::ModelEndpoint = serde_json::from_str(

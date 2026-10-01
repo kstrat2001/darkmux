@@ -4640,7 +4640,9 @@ mod tests {
     /// the item is ok. (Pre-4.0 this item was skipped with a named reason,
     /// and a nearly-spent bucket clamped the cap.)
     #[test]
+    #[serial_test::serial] // IsolatedState mutates process-global env
     fn a_spent_step_cap_under_warn_never_skips_or_clamps_an_item() {
+        let _state = darkmux_types::test_isolation::IsolatedState::new(); // pins HOME/DARKMUX_HOME: the step budget's `budget.warn` goes to the real flow sink otherwise
         let bucket = Arc::new(Mutex::new(RemoteBudget::new(Some(1_000), darkmux_types::config::StepBudgetPolicy::Warn)));
         {
             let mut b = bucket.lock().unwrap();
@@ -5737,6 +5739,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn dispatch_map_a_step_cap_reached_mid_collection_keeps_going_under_warn() {
+        let _state = darkmux_types::test_isolation::IsolatedState::new(); // pins HOME/DARKMUX_HOME: the step budget's `budget.warn` goes to the real flow sink otherwise
         clear_hosted_override();
         install_hosted_override(|_req| Ok(hosted_reply(Some(100))));
         let s = map_step(json!({
