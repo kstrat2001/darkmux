@@ -1097,7 +1097,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     // of it, not the server join itself (covered in darkmux-serve's Rust
     // tests).
     const data: RawRecord[] = [
-      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder", machine_uid: "m-1" } as RawRecord,
       {
         ts: "2026-01-01T00:00:30Z",
         action: "machine.telemetry",
@@ -2528,5 +2528,71 @@ describe("runRegions: the route line names where the run ran", () => {
 
   it("a machine named by its name alone (no uid) is matched by name", () => {
     expect(routeOf(run(records("s1", { machine_id: "macbook", machine_uid: "" }), "s1", "macbook"))).toBe("LMStudio · local · this machine");
+  });
+});
+
+const T0 = "2026-01-01T00:00:00Z";
+// (5.0 R2/R3) A run's host figures are ITS machine's, or they are not shown.
+describe("runRegions: host samples belong to the run's own machine (5.0 R2, R3)", () => {
+  const sample = (uid: string, name: string): RawRecord =>
+    ({ ts: "2026-01-01T00:00:30Z", action: "machine.telemetry", machine_uid: uid, machine_id: name, category: "machinery", source: "host", payload: { cpu_pct: 90, mem_pct: 50, gpu_pct: 5 } }) as unknown as RawRecord;
+  const peerRun = (start: Record<string, unknown>): RawRecord[] => [
+    { ts: T0, session_id: "s1", action: "dispatch.start", handle: "coder", ...start } as RawRecord,
+    { ts: "2026-01-01T00:01:00Z", session_id: "s1", action: "dispatch.complete", ...start, payload: {} } as RawRecord,
+  ];
+  const labelsOf = (v: ReturnType<typeof runRegions>) => v.metricScope.system.map((i) => v.metrics[i].label);
+  const view = (data: RawRecord[], viewerUid: string | null = null) =>
+    runRegions(flowToRenderModel(data), "s1", undefined, true, null, null, undefined, undefined, viewerUid);
+
+  it("a run whose records carry no machine uid never shows another machine's CPU, RAM and GPU", () => {
+    const v = view([...peerRun({ machine_id: "darkbook" }), sample("UID-MAC", "MacBook-Pro")]);
+    expect(labelsOf(v)).not.toContain("CPU");
+    expect(labelsOf(v)).toContain("HOST");
+  });
+
+  it("a uid-less run still joins samples that share its machine name", () => {
+    const v = view([...peerRun({ machine_id: "darkbook" }), sample("UID-DARK", "darkbook")]);
+    expect(labelsOf(v)).toContain("CPU");
+  });
+
+  it("a peer's run with no samples says they are not streamed to this viewer, not that none exist", () => {
+    const v = view(peerRun({ machine_id: "darkbook", machine_uid: "UID-DARK" }), "UID-MAC");
+    const host = v.metrics.find((m) => m.label === "HOST")!;
+    expect(host.sub).toBe("host samples not streamed to this viewer");
+  });
+
+  it("this machine's own run with no samples keeps the plain no-samples line", () => {
+    const v = view(peerRun({ machine_id: "macbook", machine_uid: "UID-MAC" }), "UID-MAC");
+    expect(v.metrics.find((m) => m.label === "HOST")!.sub).toBe("no host samples for this run");
+  });
+});
+
+describe("runRegions: the route line asserts only what the records state (5.0 R3)", () => {
+  const routeRows = (v: ReturnType<typeof runRegions>) => v.briefLines.map((e) => e.text);
+  it("a partial peer run with only a usage record has no route row", () => {
+    const data = [
+      { ts: T0, session_id: "s1", category: "telemetry", source: "tokens", action: "telemetry.tokens", machine_id: "darkbook", machine_uid: "UID-DARK", payload: { call_kind: "single_shot", purpose: "work", token_source: "provider", prompt_tokens: 5, completion_tokens: 2 } },
+    ] as RawRecord[];
+    expect(routeRows(runRegions(flowToRenderModel(data), "s1"))).not.toContain("route");
+  });
+
+  it("a mission-level session, which makes no model call, has no route row", () => {
+    const data = [
+      { ts: T0, session_id: "s1", action: "run.start", machine_id: "macbook", machine_uid: "UID-MAC" },
+      { ts: "2026-01-01T00:00:09Z", session_id: "s1", action: "run.complete", machine_id: "macbook", machine_uid: "UID-MAC" },
+    ] as RawRecord[];
+    expect(routeRows(runRegions(flowToRenderModel(data), "s1"))).not.toContain("route");
+  });
+});
+
+describe("runRegions: turns of a running relayed single-shot (5.0 R3)", () => {
+  it("count the calls made so far while no terminal has landed", () => {
+    const m = { machine_id: "darkbook", machine_uid: "UID-DARK" };
+    const data = [
+      { ts: T0, session_id: "s1", action: "dispatch.start", handle: "radio", ...m, payload: { prompt_chars: 10 } },
+      { ts: "2026-01-01T00:00:05Z", session_id: "s1", category: "telemetry", source: "tokens", action: "telemetry.tokens", ...m, payload: { call_kind: "single_shot", purpose: "work", token_source: "provider", prompt_tokens: 50, completion_tokens: 20 } },
+    ] as RawRecord[];
+    const v = runRegions(flowToRenderModel(data), "s1");
+    expect(v.metrics.find((x) => x.label === "TURNS")?.value).toBe("1");
   });
 });

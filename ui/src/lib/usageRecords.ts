@@ -116,6 +116,13 @@ export function isTurnUsage(p: UsagePayload | null | undefined): boolean {
   return p.call_kind === undefined || p.call_kind === CALL_KIND.turn;
 }
 
+/** True for a usage record of ONE single-shot WORK call (a relayed or
+ *  one-shot dispatch, which has no per-turn records). */
+export function isSingleShotWorkUsage(r: NormRecord): boolean {
+  const p = payloadOf(r);
+  return isUsageRecord(r) && p.call_kind === CALL_KIND.single_shot && usagePurpose(p) === PURPOSE.work;
+}
+
 /** One record's contribution to a sum. `cached` is `null` when the record
  *  does not report `cached_tokens` (never assumed zero). */
 export interface UsageAmount {
