@@ -158,7 +158,11 @@ pub fn graph_report_path(mission_id: &str) -> PathBuf {
 }
 
 pub fn save_graph_report(mission_id: &str, report: &crate::mission_config::prune::PruneReport) -> Result<()> {
-    save_json(&graph_report_path(mission_id), report)
+    let path = graph_report_path(mission_id);
+    // (#3035) Stamped with its data-shape version on every save.
+    let mut doc = serde_json::to_value(report).with_context(|| format!("serializing to {}", path.display()))?;
+    darkmux_types::data_version::stamp(&mut doc, darkmux_types::data_version::GRAPH_REPORT_SCHEMA_VERSION);
+    save_value(&path, &doc)
 }
 
 /// `Ok(None)` when the run predates the report or was minted by a path
@@ -169,7 +173,12 @@ pub fn load_graph_report(mission_id: &str) -> Result<Option<crate::mission_confi
         return Ok(None);
     }
     let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let report = serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    let doc: serde_json::Value = serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    let known = darkmux_types::data_version::GRAPH_REPORT_SCHEMA_VERSION;
+    if let Some(v) = darkmux_types::data_version::newer(&doc, known) {
+        bail!("{}: {}", path.display(), darkmux_types::data_version::newer_refusal("graph report", &v, known));
+    }
+    let report = serde_json::from_value(doc).with_context(|| format!("parsing {}", path.display()))?;
     Ok(Some(report))
 }
 
@@ -767,13 +776,28 @@ fn reconcile_mission_phases_terminal(mission_id: &str) {
     };
     for phase in phases.iter().filter(|p| p.mission_id == mission_id) {
         if !matches!(phase.status, PhaseStatus::Complete | PhaseStatus::Abandoned) {
-            eprintln!(
-                "warning: mission `{mission_id}` phase `{}` was still {:?} while the mission reached \
-                 Finalized — reconciled to Abandoned (#1504 defensive backstop)",
-                phase.id, phase.status
-            );
-            let _ = phase_abandon(&phase.id);
+            let outcome = phase_abandon(&phase.id);
+            eprintln!("{}", reconcile_phase_warning(mission_id, phase, outcome.as_ref().err()));
         }
+    }
+}
+
+/// The warning for a phase found live while its mission reached a terminal
+/// state. It says what happened to the phase: "reconciled" only when the
+/// abandon went through; a phase the abandon refused (a status a newer
+/// darkmux wrote, #3035) is said to be left as it is, with the refusal.
+fn reconcile_phase_warning(mission_id: &str, phase: &Phase, refused: Option<&anyhow::Error>) -> String {
+    match refused {
+        None => format!(
+            "warning: mission `{mission_id}` phase `{}` was still {:?} while the mission reached \
+             Finalized — reconciled to Abandoned (#1504 defensive backstop)",
+            phase.id, phase.status
+        ),
+        Some(e) => format!(
+            "warning: mission `{mission_id}` phase `{}` was still {:?} while the mission reached \
+             Finalized — NOT reconciled, left as it is: {e:#}",
+            phase.id, phase.status
+        ),
     }
 }
 
@@ -2149,5 +2173,46 @@ mod task_step_storage_tests {
             assert!(e.contains("status this darkmux does not know") && e.contains("Upgrade darkmux."), "{e}");
         }
         assert_eq!(load_mission("m-unk").unwrap().status, MissionStatus::Unknown, "nothing was rewritten");
+    }
+
+    /// (#3035) The graph report is stamped on save, and a newer one is refused.
+    #[test]
+    #[serial]
+    fn the_graph_report_is_stamped_and_a_newer_one_is_refused() {
+        let _g = CrewGuard::new();
+        save_graph_report("m-gr", &Default::default()).unwrap();
+        let path = graph_report_path("m-gr");
+        let mut doc = on_disk(&path);
+        assert_eq!(doc["schema_version"], darkmux_types::data_version::GRAPH_REPORT_SCHEMA_VERSION);
+        assert!(load_graph_report("m-gr").unwrap().is_some());
+        doc["schema_version"] = serde_json::json!("999.0");
+        std::fs::write(&path, doc.to_string()).unwrap();
+        let err = load_graph_report("m-gr").unwrap_err().to_string();
+        assert!(err.contains("written by a newer darkmux (graph report `999.0`"), "{err}");
+    }
+
+    /// (#3035) The reconcile warning is true: an Unknown phase that
+    /// `phase_abandon` refuses is reported as left alone, not "reconciled to
+    /// Abandoned".
+    #[test]
+    #[serial]
+    fn the_reconcile_warning_does_not_claim_a_reconcile_that_was_refused() {
+        let _g = CrewGuard::new();
+        let m: Mission = serde_json::from_value(serde_json::json!({"id": "m-rw", "description": "d", "created_ts": 1})).unwrap();
+        save_mission(&m).unwrap();
+        let p: Phase = serde_json::from_value(
+            serde_json::json!({"id": "p-rw", "mission_id": "m-rw", "description": "d", "status": "blocked", "created_ts": 1}),
+        )
+        .unwrap();
+        save_phase(&p).unwrap();
+        let refused = phase_abandon("p-rw").unwrap_err();
+        let said = reconcile_phase_warning("m-rw", &p, Some(&refused));
+        assert!(said.contains("NOT reconciled") && !said.contains("reconciled to Abandoned"), "{said}");
+        assert_eq!(load_phase_by_id("p-rw").unwrap().status, PhaseStatus::Unknown, "left as it is");
+        let live: Phase = serde_json::from_value(
+            serde_json::json!({"id": "p-live", "mission_id": "m-rw", "description": "d", "status": "running", "created_ts": 1}),
+        )
+        .unwrap();
+        assert!(reconcile_phase_warning("m-rw", &live, None).contains("reconciled to Abandoned"));
     }
 }

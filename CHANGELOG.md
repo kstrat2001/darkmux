@@ -31,17 +31,23 @@ darkmux release.
 
 ### Changed (5.0)
 
-- **Additive-only schema changes are enforced, not hoped for** (#3035). Every
-  authored and persisted shape carries a `schema_version` (role, skill, crew,
+- **Additive-only schema changes are enforced, not hoped for** (#3035). These
+  authored and persisted shapes carry a `schema_version` (role, skill, crew,
   rule, workload and lab-fixture manifests; `mission.json` and each phase, task
-  and step file; `resume_origin`; the lab run `manifest.json` as
-  `manifest_schema_version`; the trajectory as a first-line `trajectory.header`
-  event), written on every save and read leniently (absent means written before
-  the marker). A file whose marker is newer than the binary's is refused with
+  and step file; `graph-report.json`; `lab-registry.json`; `resume_origin`; the
+  lab run `manifest.json` as `manifest_schema_version`; the trajectory as a
+  first-line `trajectory.header` event), written on every save and read
+  leniently (absent means written before the marker). `config.json`,
+  `profiles.json`, mission configs, the workspace spec, `envelope.json` and a
+  mission's config snapshot already carried their own; `fleet.json` keeps its
+  advisory `version`, which nothing enforces. A file whose marker is newer than the binary's is refused with
   `this file was written by a newer darkmux (...). Upgrade darkmux.` and its keys
   are not reported as typos; at the same or an older version an unknown key is
   still a typo. `lessons.db` refuses a newer `user_version` instead of
-  re-stamping it down, and runs ordered migrations on an older one.
+  re-stamping it down (`memory lesson list`, `export` and `recall` refuse it
+  rather than read it as empty), and runs ordered migrations on an older one.
+  `run stats`, `lab loop` and `lab inspect` refuse a trajectory whose header is
+  newer.
 - **A status or enum value from a newer darkmux reads as `unknown`, not as an
   error.** `MissionStatus`, `PhaseStatus` and `NodeStatus` gain `unknown`
   (`mission status` lists such missions in their own section, the runs board

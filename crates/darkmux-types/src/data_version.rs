@@ -55,6 +55,11 @@ pub const RESUME_ORIGIN_SCHEMA_VERSION: &str = "1.0";
 pub const RUN_MANIFEST_SCHEMA_VERSION: &str = "1.0";
 /// The key the lab run manifest's shared marker lives under.
 pub const RUN_MANIFEST_KEY: &str = "manifest_schema_version";
+/// A mission's `graph-report.json`.
+pub const GRAPH_REPORT_SCHEMA_VERSION: &str = "1.0";
+/// The lab fixture registry (`lab-registry.json`).
+pub const LAB_REGISTRY_SCHEMA_VERSION: &str = "1.0";
+
 /// The workspace spec (`WorkspaceSpec::schema_version`).
 pub const WORKSPACE_SPEC_SCHEMA_VERSION: &str = "1.0";
 

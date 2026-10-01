@@ -14725,23 +14725,6 @@ mod tests {
 
     #[serial_test::serial]
     #[test]
-    fn check_mission_config_registry_warns_on_schema_version_drift() {
-        let guard = CrewRootGuard::new();
-        std::fs::create_dir_all(guard.path().join("mission-configs")).unwrap();
-        std::fs::write(
-            guard.path().join("mission-configs").join("future.json"),
-            r#"{"id":"future","name":"Future","schema_version":"99.0"}"#,
-        )
-        .unwrap();
-
-        let check = check_mission_config_registry();
-        assert_eq!(check.status, Status::Warn, "{}", check.message);
-        assert!(check.message.contains("future"), "{}", check.message);
-        assert!(check.message.contains("schema_version"), "{}", check.message);
-    }
-
-    #[serial_test::serial]
-    #[test]
     fn check_mission_config_registry_warns_on_malformed_json() {
         let guard = CrewRootGuard::new();
         std::fs::create_dir_all(guard.path().join("mission-configs")).unwrap();

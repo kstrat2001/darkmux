@@ -223,17 +223,7 @@ impl TrajectoryFold {
                 ok: t.ok,
                 args: t.args.clone(),
             }),
-            E::MalformedToolNames(m) => {
-                let n = u32::try_from(m.count).unwrap_or(u32::MAX);
-                let bucket = match m.reason {
-                    MalformedReason::NotATool => &mut self.tool_calls_invalid_name,
-                    // (#3035) A reason a newer runtime named: its own bucket,
-                    // never one whose cause this build would be asserting.
-                    MalformedReason::Unknown => &mut self.tool_calls_unclassified,
-                    MalformedReason::RealToolNotGranted => &mut self.tool_calls_ungranted,
-                };
-                *bucket = bucket.saturating_add(n);
-            }
+            E::MalformedToolNames(m) => self.malformed_names(m),
             E::Compaction(_) => self.compaction_events = self.compaction_events.saturating_add(1),
             E::Rest(r) => self.rests.push(RestTaken {
                 ms: r.ms,
@@ -279,6 +269,18 @@ impl TrajectoryFold {
             | E::Header(_)
             | E::Unknown => {}
         }
+    }
+
+    fn malformed_names(&mut self, m: &crate::event::MalformedToolNames) {
+        let n = u32::try_from(m.count).unwrap_or(u32::MAX);
+        let bucket = match m.reason {
+            MalformedReason::NotATool => &mut self.tool_calls_invalid_name,
+            MalformedReason::RealToolNotGranted => &mut self.tool_calls_ungranted,
+            // (#3035) A reason a newer runtime named: its own bucket, never
+            // one whose cause this build would be asserting.
+            MalformedReason::Unknown => &mut self.tool_calls_unclassified,
+        };
+        *bucket = bucket.saturating_add(n);
     }
 
     /// One more event, and the latest clock any event carried.

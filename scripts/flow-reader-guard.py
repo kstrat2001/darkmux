@@ -9,16 +9,25 @@
 # `from_reader`) skips all of that, so the same archive reads one way there and
 # another through the daemon.
 #
+# This is a SPELLING TRIPWIRE, not a proof that the reader is the only door.
+# It flags the spellings below and nothing else; a determined bypass (a type
+# alias to a wrapper, a generic helper, a call whose type is only inferred
+# through a function's return type) passes it, and review is what catches
+# those.
+#
 # Flagged, in production Rust (every crate, `src/`, `runtime/`, `plugins/`;
 # test code excluded: `tests/` directories, `*_tests.rs`, `tests.rs`, and each
 # `#[cfg(test)] mod x { ... }` block):
 #   * a `serde_json::from_*` call whose turbofish names `FlowRecord`
 #     (`from_str::<FlowRecord>`, `from_value::<Vec<FlowRecord>>`);
-#   * a binding annotated with a type naming `FlowRecord` and initialized from
-#     one of those calls (`let r: FlowRecord = serde_json::from_str(..)`).
-# A call whose target type is only inferred (a function returning `FlowRecord`)
-# is not seen: this guard bounds the spelling, it does not prove the reader is
-# the only door.
+#   * a stream deserializer turbofish: `.into_iter::<FlowRecord>()`;
+#   * `FlowRecord::deserialize(..)`;
+#   * a binding annotated with a type naming `FlowRecord` whose statement
+#     calls `serde_json::from_*` (`let r: FlowRecord = serde_json::from_str(..)`,
+#     `let r: FlowRecord = match serde_json::from_str(..) { .. }`);
+#   * a `type X = FlowRecord;` alias (the usual way round a turbofish);
+#   * `use serde_json::from_str` (any `from_*`, plain or in a brace list) in a
+#     file that names `FlowRecord`, since the call then has no `serde_json::`.
 #
 # Not scanned: comments, and the reader itself (`crates/darkmux-flow/src/reader.rs`).
 # A deliberate exception takes a marker on its line or the line above; one
@@ -40,7 +49,12 @@ RUST_ROOTS = ("crates/", "src/", "runtime/", "plugins/")
 ALLOW = "flow-reader-guard:allow"
 CALL = r"serde_json\s*::\s*from_(?:str|value|slice|reader)"
 TURBOFISH = re.compile(CALL + r"\s*::\s*<[^;{}]*?\bFlowRecord\b")
-ANNOTATED = re.compile(r"\bFlowRecord\b[^=;{}]*=\s*" + CALL + r"\b")
+STREAM = re.compile(r"\binto_iter\s*::\s*<[^;{}]*?\bFlowRecord\b")
+TRAIT_CALL = re.compile(r"\bFlowRecord\s*::\s*deserialize\b")
+ANNOTATED = re.compile(r"\bFlowRecord\b[^=;{}]*=[^;]*?" + CALL + r"\b")
+ALIAS = re.compile(r"\btype\s+\w+\s*=\s*(?:\w+\s*::\s*)*FlowRecord\s*;")
+IMPORT = re.compile(r"\buse\s+serde_json\s*::\s*(?:\{[^}]*)?\bfrom_(?:str|value|slice|reader)\b")
+NAMES_RECORD = re.compile(r"\bFlowRecord\b")
 
 
 def mask_comments(text):
@@ -58,9 +72,16 @@ def scan_text(text, rel):
     lines = text.split("\n")
     in_tests = test_lines(text)
     hits = []
-    for pattern, why in ((TURBOFISH, "a turbofish reads FlowRecord straight from serde"),
-                         (ANNOTATED, "a FlowRecord binding is read straight from serde")):
-        for m in pattern.finditer(mask_comments(text)):
+    masked = mask_comments(text)
+    shapes = [(TURBOFISH, "a turbofish reads FlowRecord straight from serde"),
+              (STREAM, "a stream deserializer reads FlowRecord straight from serde"),
+              (TRAIT_CALL, "FlowRecord::deserialize reads it straight from serde"),
+              (ANNOTATED, "a FlowRecord binding is read straight from serde"),
+              (ALIAS, "an alias of FlowRecord is the way round a turbofish")]
+    if NAMES_RECORD.search(masked):
+        shapes.append((IMPORT, "a bare serde_json::from_* import in a file that names FlowRecord"))
+    for pattern, why in shapes:
+        for m in pattern.finditer(masked):
             line = text.count("\n", 0, m.start())
             if line in in_tests:
                 continue
@@ -99,6 +120,13 @@ def self_test():
         "annotated let": 'fn f(l: &str) { let r: FlowRecord = serde_json::from_str(l).unwrap(); }',
         "annotated option": 'fn f(l: &str) { let r: Option<FlowRecord> = serde_json::from_str(l).ok(); }',
         "multi-line turbofish": 'fn f(l: &str) {\n    serde_json::from_str::<\n        FlowRecord,\n    >(l);\n}',
+        "stream into_iter": 'fn f(l: &str) { Deserializer::from_str(l).into_iter::<FlowRecord>(); }',
+        "trait call": 'fn f(v: Value) { FlowRecord::deserialize(v); }',
+        "match binding": 'fn f(l: &str) { let r: FlowRecord = match serde_json::from_str(l) { Ok(r) => r, Err(_) => return }; }',
+        "type alias": 'type Rec = FlowRecord;\nfn f() {}',
+        "type alias qualified": 'type Rec = darkmux_flow::FlowRecord;',
+        "bare import": 'use serde_json::from_str;\nfn f(l: &str) -> Option<FlowRecord> { from_str(l).ok() }',
+        "brace import": 'use serde_json::{from_value, Value};\nfn f(v: Value) -> Option<FlowRecord> { from_value(v).ok() }',
         "after a test module": '#[cfg(test)]\nmod t {\n    fn a() {}\n}\nfn f(l: &str) { serde_json::from_str::<FlowRecord>(l); }',
     }
     ok = {
@@ -108,6 +136,7 @@ def self_test():
         "a cfg(test) mod": (prod, '#[cfg(test)]\nmod t {\n    fn a(l: &str) { serde_json::from_str::<FlowRecord>(l); }\n}'),
         "a comment": (prod, '// serde_json::from_str::<FlowRecord>(l) is what not to do\nfn f() {}'),
         "the reader's door": (prod, 'fn f(l: &str) { darkmux_flow::reader::parse_record(l); }'),
+        "import without FlowRecord": (prod, 'use serde_json::from_str;\nfn f(l: &str) -> Option<Foo> { from_str(l).ok() }'),
         "another type": (prod, 'fn f(l: &str) { serde_json::from_str::<FlowStatus>(l); let r: Foo = serde_json::from_str(l).unwrap(); }'),
         "an allowed hit": (prod, '// flow-reader-guard:allow — reads the hub wire, which is not an archive\nfn f(l: &str) { serde_json::from_str::<FlowRecord>(l); }'),
     }
