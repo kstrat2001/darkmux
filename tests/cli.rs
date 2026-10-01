@@ -13763,3 +13763,22 @@ fn a_bad_workspace_spec_is_refused_before_the_launch_mints() {
     written.retain(|p| p != &spec && !p.components().any(|c| c.as_os_str() == "liveness"));
     assert!(written.is_empty(), "wrote state before refusing: {written:?}");
 }
+
+/// (F7) A resume refusal carries ONE `darkmux dispatch:` prefix, not the
+/// flag's and the step's context stacked in front of it.
+#[test]
+fn resume_refusal_carries_one_clear_prefix() {
+    let home = TempDir::new().unwrap();
+    let out_dir = TempDir::new().unwrap(); // no checkpoint.json
+    let out = darkmux_cmd()
+        .env("DARKMUX_HOME", home.path())
+        .args(["dispatch", "coder", "--resume-from"])
+        .arg(out_dir.path())
+        .output()
+        .expect("darkmux runs");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("RESUME CHECKPOINT NOT FOUND"), "{stderr}");
+    assert_eq!(stderr.matches("darkmux dispatch").count(), 1, "one prefix only: {stderr}");
+    assert!(!stderr.contains("--resume-from: darkmux dispatch"), "{stderr}");
+}

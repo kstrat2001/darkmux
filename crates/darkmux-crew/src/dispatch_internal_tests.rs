@@ -18206,3 +18206,14 @@ fn a_partial_runtime_envelope_prints_no_empty_result_or_path() {
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert!(v.get("result").is_none() && v.get("trajectory_path").is_none(), "{out}");
 }
+
+/// (F7) A resume refusal keeps its own single prefix; any other error still
+/// gains the step's name.
+#[test]
+fn with_step_context_leaves_a_resume_refusal_bare_and_wraps_the_rest() {
+    let refusal = resume_refusal!("darkmux dispatch: RESUME WORKSPACE MISMATCH");
+    let bare = with_step_context(refusal, || "step `s` dispatch.internal".to_string());
+    assert_eq!(format!("{bare:#}"), "darkmux dispatch: RESUME WORKSPACE MISMATCH");
+    let other = with_step_context(anyhow::anyhow!("boom"), || "step `s` dispatch.internal".to_string());
+    assert_eq!(format!("{other:#}"), "step `s` dispatch.internal: boom");
+}
