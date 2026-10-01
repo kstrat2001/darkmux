@@ -56,6 +56,16 @@ hosts_fleet_redis?: boolean,
  */
 serves_radio?: boolean, 
 /**
+ * How many distinct profiles this machine serves to peers: the profiles
+ * in its registry that its `fleet.accept_work` grants to at least one
+ * peer, leaving out a profile that runs only the utility model (admission
+ * refuses it). A fact about this machine alone, so it reads the same from
+ * every machine that views this card; it never names a profile's grantee.
+ * Absent on a card that predates the field (schema 1.1), or when the
+ * allow-list or the registry could not be read: not stated, never 0.
+ */
+serves_profiles?: number, 
+/**
  * The fleet defaults this machine hands out. Absent unless `fleet_mode`
  * is `hub`; read only through [`MachineCard::hub_defaults`].
  */

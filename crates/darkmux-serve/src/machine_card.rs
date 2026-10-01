@@ -349,6 +349,16 @@ pub struct MachineCard {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub serves_radio: Option<bool>,
+    /// How many distinct profiles this machine serves to peers: the profiles
+    /// in its registry that its `fleet.accept_work` grants to at least one
+    /// peer, leaving out a profile that runs only the utility model (admission
+    /// refuses it). A fact about this machine alone, so it reads the same from
+    /// every machine that views this card; it never names a profile's grantee.
+    /// Absent on a card that predates the field (schema 1.1), or when the
+    /// allow-list or the registry could not be read: not stated, never 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub serves_profiles: Option<u32>,
     /// The fleet defaults this machine hands out. Absent unless `fleet_mode`
     /// is `hub`; read only through [`MachineCard::hub_defaults`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -501,6 +511,20 @@ fn serves_radio(list: &std::collections::BTreeMap<String, darkmux_types::config:
     list.values().any(|e| e.roles.as_ref().is_some_and(|r| r.iter().any(|role| role == RADIO_HOST_ROLE)))
 }
 
+/// How many distinct profiles of `registry` the allow-list grants to at least
+/// one peer. A name the registry does not define, and a profile that runs only
+/// the utility model (admission refuses both), do not count.
+fn serves_profiles(
+    list: &std::collections::BTreeMap<String, darkmux_types::config::AcceptWorkEntry>,
+    registry: &[CardProfile],
+    utility: Option<&str>,
+) -> u32 {
+    let granted: std::collections::BTreeSet<&str> =
+        list.values().flat_map(|e| e.profiles.iter().flatten()).map(String::as_str).collect();
+    let n = registry.iter().filter(|p| granted.contains(p.name.as_str()) && !is_utility_only(p, utility)).count();
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
 /// Whether the Redis this machine is configured to use is on this machine:
 /// Redis is on here, and its host is loopback or this machine's own node.
 /// Pure over its inputs so the decision is testable without a provider.
@@ -553,6 +577,11 @@ pub(crate) fn gather_local_card() -> MachineCard {
         &PowerPolicyConfig::from_env(),
     );
     let fleet_mode = darkmux_types::config_access::declared_fleet_mode();
+    let allow_list = darkmux_fleet::read_user_allow_list().ok();
+    let serves_profiles = allow_list
+        .as_ref()
+        .filter(|_| profiles_error.is_none())
+        .map(|list| serves_profiles(list, &profiles, utility.as_deref()));
     MachineCard {
         card_schema_version: CARD_SCHEMA_VERSION.to_string(),
         work_job_schema_version: stated_work_version(),
@@ -568,7 +597,8 @@ pub(crate) fn gather_local_card() -> MachineCard {
             darkmux_types::config_access::redis_host().as_deref(),
             || darkmux_fleet::configured_provider().ok().and_then(|p| p.local_node().ok()),
         )),
-        serves_radio: darkmux_fleet::read_user_allow_list().ok().map(|list| serves_radio(&list)),
+        serves_radio: allow_list.as_ref().map(serves_radio),
+        serves_profiles,
         fleet_defaults: card_fleet_defaults(fleet_mode),
         generated_at_ms: crate::current_millis(),
         gather_ms: started.elapsed().as_millis() as u64,
@@ -1053,6 +1083,7 @@ pub(crate) mod tests {
             fleet_mode: Some(DeclaredFleetMode::Hub),
             hosts_fleet_redis: Some(true),
             serves_radio: Some(true),
+            serves_profiles: Some(2),
             fleet_defaults: Some(CardFleetDefaults {
                 version: FLEET_DEFAULTS_VERSION,
                 radio: CardRadioDefaults { answerer_profile: Some("deep@studio".into()) },
@@ -1161,6 +1192,52 @@ pub(crate) mod tests {
         assert!(absent.get("serves_radio").is_none(), "not stated is absent, not false");
     }
 
+    // ── serves_profiles (card schema 1.2) ─────────────────────────────
+
+    fn granting(profiles: Vec<&str>) -> darkmux_types::config::AcceptWorkEntry {
+        darkmux_types::config::AcceptWorkEntry {
+            profiles: Some(profiles.into_iter().map(String::from).collect()),
+            ..Default::default()
+        }
+    }
+
+    fn registry_of(models: &[(&str, &str)]) -> Vec<CardProfile> {
+        models
+            .iter()
+            .map(|(name, model)| CardProfile {
+                name: name.to_string(),
+                description: None,
+                is_default: false,
+                endpoint_kind: CardEndpointKind::Managed,
+                models: vec![CardModel { id: model.to_string(), n_ctx: None, endpoint_kind: CardEndpointKind::Managed }],
+            })
+            .collect()
+    }
+
+    #[test]
+    fn serves_profiles_counts_distinct_granted_work_class_profiles() {
+        let registry = registry_of(&[("fast", "qwen-4b"), ("deep", "qwen-35b"), ("tiny", "util"), ("unused", "qwen-35b")]);
+        let mut list = std::collections::BTreeMap::new();
+        assert_eq!(serves_profiles(&list, &registry, Some("util")), 0, "an empty allow-list serves none");
+        list.insert("a".to_string(), granting(vec!["fast", "deep"]));
+        list.insert("b".to_string(), granting(vec!["fast", "ghost", "tiny"]));
+        list.insert("c".to_string(), entry(None));
+        assert_eq!(
+            serves_profiles(&list, &registry, Some("util")),
+            2,
+            "fast is granted twice but counts once; ghost is not in the registry; tiny runs only the utility model"
+        );
+        assert_eq!(serves_profiles(&list, &registry, None), 3, "with no utility model, tiny is ordinary work");
+    }
+
+    #[test]
+    fn serves_profiles_is_absent_when_not_stated_and_names_nobody() {
+        let absent = serde_json::to_value(MachineCard { serves_profiles: None, ..sample_card() }).unwrap();
+        assert!(absent.get("serves_profiles").is_none(), "not stated is absent, never 0");
+        let json = serde_json::to_value(MachineCard { serves_profiles: Some(3), ..sample_card() }).unwrap();
+        assert_eq!(json["serves_profiles"], serde_json::json!(3));
+    }
+
     /// A 1.1 card from a peer on the previous build states nothing about radio.
     #[test]
     fn a_1_1_card_still_parses_and_states_no_radio() {
@@ -1168,6 +1245,7 @@ pub(crate) mod tests {
         let card: MachineCard = serde_json::from_str(&raw).expect("a 1.1 card parses");
         assert_eq!(card.card_schema_version, "1.1");
         assert_eq!(card.serves_radio, None);
+        assert_eq!(card.serves_profiles, None, "a 1.1 card states no profile count");
         let listener = std::fs::read_to_string(fixtures_dir().join("listener-card-1.1.json")).unwrap();
         serde_json::from_str::<ListenerCard>(&listener).expect("a 1.1 listener card parses");
     }

@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import type { AcceptsState } from "../../types/generated/AcceptsState";
-import { machineIsHub, rowServesRadio, outcomeLine, rowFacts, rowIsHub, rowStanding, rowUid } from "./viewRows";
+import { machineIsHub, rowServesProfiles, rowServesRadio, outcomeLine, rowFacts, rowIsHub, rowStanding, rowUid } from "./viewRows";
 import type { CardOutcome } from "../../types/generated/CardOutcome";
 import type { FleetMachine } from "../../types/generated/FleetMachine";
 import type { MachineCard } from "../../types/generated/MachineCard";
@@ -250,5 +250,16 @@ describe("rowServesRadio: only the row's own card says it", () => {
   });
   it("false for a card that was not read", () => {
     expect(rowServesRadio(row({ card: { state: "unreachable", reason: "listener_off", detail: null } }))).toBe(false);
+  });
+});
+
+describe("rowServesProfiles: only the row's own card says it", () => {
+  it("the count the card states; 0 when absent, 0, or the card was not read", () => {
+    const r = row({});
+    if (r.card.state !== "available") throw new Error("read");
+    expect(rowServesProfiles(r)).toBe(0);
+    expect(rowServesProfiles({ ...r, card: { ...r.card, card: { ...r.card.card, serves_profiles: 4 } } })).toBe(4);
+    expect(rowServesProfiles({ ...r, card: { ...r.card, card: { ...r.card.card, serves_profiles: 0 } } })).toBe(0);
+    expect(rowServesProfiles(row({ card: { state: "unreachable", reason: "listener_off", detail: null } }))).toBe(0);
   });
 });

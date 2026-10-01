@@ -86,6 +86,7 @@
   "fleet_mode": "hub",
   "hosts_fleet_redis": true,
   "serves_radio": true,
+  "serves_profiles": 2,
   "fleet_defaults": {
     "version": 1,
     "radio": {

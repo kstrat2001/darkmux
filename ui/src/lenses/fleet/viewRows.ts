@@ -141,6 +141,13 @@ export function rowServesRadio(row: FleetMachine): boolean {
   return row.card.state === "available" && row.card.card.serves_radio === true;
 }
 
+/** How many profiles the row's own card says its machine serves to peers
+ * (`serves_profiles`). 0 for a card that was not read, one from an older darkmux,
+ * and one that states none: nothing to show. */
+export function rowServesProfiles(row: FleetMachine): number {
+  return row.card.state === "available" ? (row.card.card.serves_profiles ?? 0) : 0;
+}
+
 /** Whether the machine a page shows is one the view's rows say declares
  * `hub`. `isLocal`: the page shows THIS machine, whose row is the view's own.
  * Any other machine is found by the hardware uid its card carries or by its
@@ -180,6 +187,8 @@ export interface RowFacts {
   /** The row's card says its machine serves radio (a fact about that machine
    *  alone, never about the machine serving this viewer). */
   servesRadio: boolean;
+  /** How many profiles the row's card says its machine serves (0: none shown). */
+  servesProfiles: number;
 }
 
 /** Whether this viewer is receiving the row's machine. A view whose presence
@@ -234,5 +243,6 @@ export function rowFacts(
     isSelf: row.is_this_machine,
     hub: rowIsHub(row),
     servesRadio: rowServesRadio(row),
+    servesProfiles: rowServesProfiles(row),
   };
 }

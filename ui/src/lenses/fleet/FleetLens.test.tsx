@@ -149,10 +149,11 @@ function viewRow(specs: Partial<MachineSpecsResponse> = {}, over: Partial<FleetM
   };
 }
 
-/** `row`'s card, stating that its machine serves radio (`serves_radio`). */
-function servingRadio(row: FleetMachine): FleetMachine {
+/** `row`'s card, stating that its machine serves radio (`serves_radio`) and
+ * `profiles` profiles (`serves_profiles`). */
+function servingRadio(row: FleetMachine, profiles = 3): FleetMachine {
   if (row.card.state !== "available") throw new Error("a card that was read");
-  return { ...row, card: { ...row.card, card: { ...row.card.card, serves_radio: true } } };
+  return { ...row, card: { ...row.card, card: { ...row.card.card, serves_radio: true, serves_profiles: profiles } } };
 }
 
 /** This daemon's own row: the machine serving the page. */
@@ -1676,8 +1677,14 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
     const radio = studio.querySelector('.name [data-testid="radio-seat"]')!;
     expect(radio.getAttribute("title")).toBe("studio serves radio: it answers radio questions for peers it allows.");
     expect(radio.getAttribute("aria-label")).toBe(radio.getAttribute("title"));
+    const served = studio.querySelector('.name [data-testid="profiles-served"]')!;
+    expect(served.getAttribute("title")).toBe("studio serves 3 profiles to peers it allows.");
+    expect(served.textContent).toBe("3");
+    // Left of the radio icon.
+    expect(served.compareDocumentPosition(radio) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     const selfCard = [...document.querySelectorAll(".mach")].find((c) => c !== studio)!;
     expect(selfCard.querySelector('[data-testid="radio-seat"]')).toBeNull();
+    expect(selfCard.querySelector('[data-testid="profiles-served"]')).toBeNull();
     const self = [...document.querySelectorAll(".mach")].find((c) => c !== studio)!;
     expect(self.querySelector(".spec")!.textContent).toBe("Apple M5 Max · 128 GB");
     expect(self.querySelector('[data-testid="radio-seat"]')).toBeNull();
@@ -1707,6 +1714,7 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
     await waitFor(() => expect(document.querySelectorAll(".mach")).toHaveLength(2));
     const studio = [...document.querySelectorAll(".mach")].find((c) => c.querySelector(".mach-name")!.textContent === "studio")!;
     expect(studio.querySelector('.name [data-testid="radio-seat"]')).not.toBeNull();
+    expect(studio.querySelector('.name [data-testid="profiles-served"]')!.textContent).toBe("3");
     expect(studio.querySelector(".spec")!.textContent).toBe("Apple M1 Max · 32 GB");
     expect(studio.textContent).not.toMatch(/runs |accepts nothing|radio-host/);
   });
@@ -1728,6 +1736,24 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
     renderFleetLens();
     await waitFor(() => expect(document.querySelectorAll(".mach")).toHaveLength(2));
     expect(document.querySelector('[data-testid="radio-seat"]')).toBeNull();
+    expect(document.querySelector('[data-testid="profiles-served"]')).toBeNull();
+  });
+
+  it("one profile reads in the singular, and a card stating 0 shows no profiles icon", async () => {
+    mockFleetFetch({
+      specs: { machine_id: "MacBook-Pro", machine_uid: "u-self", cpu_brand: "Apple M5 Max", ram_total_bytes: 137438953472 },
+      view: [
+        servingRadio(viewRow({ machine_id: "studio", machine_uid: "u-studio" }, { entry: { id: "studio", address: "100.64.1.2:8765", added_unix_ms: 1000 } }), 1),
+        servingRadio(viewRow({ machine_id: "mini", machine_uid: "u-mini" }, { entry: { id: "mini", address: "100.64.1.3:8765", added_unix_ms: 1000 } }), 0),
+      ],
+      runs: [],
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelectorAll(".mach")).toHaveLength(3));
+    const byName = (n: string) => [...document.querySelectorAll(".mach")].find((c) => c.querySelector(".mach-name")!.textContent === n)!;
+    expect(byName("studio").querySelector('[data-testid="profiles-served"]')!.getAttribute("title")).toBe("studio serves 1 profile to peers it allows.");
+    expect(byName("mini").querySelector('[data-testid="profiles-served"]')).toBeNull();
+    expect(byName("mini").querySelector('[data-testid="radio-seat"]')).not.toBeNull();
   });
 
   // The inverse: with the same row unreachable and presence silent, the

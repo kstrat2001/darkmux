@@ -312,6 +312,8 @@ export interface FleetCard {
   hub: boolean;
   /** The machine's own card says it serves radio. */
   servesRadio: boolean;
+  /** How many profiles the machine's own card says it serves; 0 shows nothing. */
+  servesProfiles: number;
   /** Whether the machine is up: the view's own `liveness` (a card it read
    *  is proof of life), or, for a machine the view does not hold, the flow
    *  window's online/offline edges. */
@@ -521,6 +523,7 @@ function cardIdentity(
       note: null,
       hub: false,
       servesRadio: false,
+      servesProfiles: 0,
       standing: machAbsent ? ("offline" as const) : ("online" as const),
       availability: "known" as const,
       self: false,
@@ -538,6 +541,7 @@ function cardIdentity(
     note: row.note,
     hub: row.hub,
     servesRadio: row.servesRadio,
+    servesProfiles: row.servesProfiles,
     standing: row.standing,
     availability: machineAvailability({ self: row.isSelf, seen: rowSeen(row), standing: row.standing }),
     // (#2915) The view says which row is this machine; a peer's model is
@@ -663,6 +667,7 @@ export function buildFleetCardBase(
     note: id.note,
     hub: id.hub,
     servesRadio: id.servesRadio,
+    servesProfiles: id.servesProfiles,
     standing,
     availability: id.availability,
     active,

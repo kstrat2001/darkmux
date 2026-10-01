@@ -15,7 +15,7 @@
 // Each state first asserts the words it must show, so a fixture that slid
 // into another state fails here rather than measuring one state N times.
 const { test, expect } = require("@playwright/test");
-const { STATES, MULTI, PLAYBACK_NOW, VIEWPORTS, SELF_ROW, PEER_ROW, OFFLINE_ROW, installLayoutRoutes, measure } = require("./lib/layout-fixture.js");
+const { STATES, MULTI, PLAYBACK_NOW, VIEWPORTS, SELF_ROW, PEER_ROW, ONE_ICON_ROW, NO_ICON_ROW, OFFLINE_ROW, installLayoutRoutes, measure } = require("./lib/layout-fixture.js");
 
 const RUN = {
   modelbox: ".session-run .modelbox",
@@ -369,6 +369,36 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
     }
     const distinct = new Set(heights.flatMap((h) => h.split(": ")[1].split(", ").map((wh) => wh.split("x")[1])));
     expect(distinct.size, `card heights differ across states (${vpName}):\n  ${heights.join("\n  ")}`).toBe(1);
+  });
+}
+
+// The name row's icons (profiles served, radio) change no card's size: a card
+// with both, one with one, one with neither, and one unreadable are the same
+// size, on a desktop (icons shown) and on a phone (hidden, as the radio icon is).
+for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
+  test(`fleet card: both name-row icons, one, and none keep the same card size (${vpName})`, async ({ browser }) => {
+    const finished = STATES.find((s) => s.id === "finished");
+    const ctx = await browser.newContext({ viewport, timezoneId: "UTC", locale: "en-US" });
+    const page = await ctx.newPage();
+    await page.clock.setFixedTime(finished.nowMs);
+    const rows = [SELF_ROW, PEER_ROW, ONE_ICON_ROW, NO_ICON_ROW, OFFLINE_ROW];
+    await installLayoutRoutes(page, { fleetView: rows });
+    await page.goto("/index.html#lens=fleet");
+    await expect(page.locator(CARD.card)).toHaveCount(rows.length);
+    const card = (name) => page.locator(".mach").filter({ has: page.locator(".mach-name", { hasText: new RegExp(`^${name}$`) }) });
+    const icons = (name) => card(name).locator(".name .profiles-served, .name .radio-seat");
+    await expect(icons("layout-peer"), "both icons").toHaveCount(2);
+    await expect(icons("layout-one-icon"), "one icon").toHaveCount(1);
+    await expect(icons("layout-no-icon"), "no icon").toHaveCount(0);
+    if (viewport.width > 560) {
+      await expect(card("layout-peer").locator(".name .profiles-served")).toBeVisible();
+      await expect(card("layout-peer").locator(".name .profiles-served")).toHaveText("12");
+    }
+    await page.waitForTimeout(400);
+    const m = await measure(page, { card: CARD.card });
+    const sizes = new Set(m.card.map((b) => `${b.w}x${b.h}`));
+    expect(sizes.size, `card sizes differ (${vpName}): ${m.card.map((b) => `${b.w}x${b.h}`).join(", ")}`).toBe(1);
+    await ctx.close();
   });
 }
 

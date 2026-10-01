@@ -494,6 +494,19 @@ const PEER_ROW = viewRow(
   },
 );
 PEER_ROW.card.card.serves_radio = true; // the card's own statement: the icon never reads `accepts`
+PEER_ROW.card.card.serves_profiles = 12; // two digits: the widest count a name row is likely to carry
+
+/** A read peer whose card states one icon (profiles served), and one that states
+ *  neither: with PEER_ROW (both), the three name-row icon states. */
+const ONE_ICON_ROW = viewRow(
+  { machine_id: "layout-one-icon", machine_uid: null, cpu_brand: "Apple M1 Max", ram_total_bytes: 34359738368 },
+  { entry: { id: "layout-one-icon", address: "100.64.0.9:8765", added_unix_ms: 1 }, liveness: "no_beat" },
+);
+ONE_ICON_ROW.card.card.serves_profiles = 1;
+const NO_ICON_ROW = viewRow(
+  { machine_id: "layout-no-icon", machine_uid: null, cpu_brand: "Apple M1 Max", ram_total_bytes: 34359738368 },
+  { entry: { id: "layout-no-icon", address: "100.64.0.10:8765", added_unix_ms: 1 }, liveness: "no_beat" },
+);
 
 /** A declared peer the daemon could not read a card from and hears no beat
  *  from: the "offline" card. */
@@ -572,4 +585,4 @@ const VIEWPORTS = {
   phone: { width: 390, height: 844 },
 };
 
-module.exports = { STATES, HEROES, MULTI, ALL, PLAYBACK_NOW, VIEWPORTS, SELF_ROW, PEER_ROW, OFFLINE_ROW, viewRow, installLayoutRoutes, measure };
+module.exports = { STATES, HEROES, MULTI, ALL, PLAYBACK_NOW, VIEWPORTS, SELF_ROW, PEER_ROW, ONE_ICON_ROW, NO_ICON_ROW, OFFLINE_ROW, viewRow, installLayoutRoutes, measure };

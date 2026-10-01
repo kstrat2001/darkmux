@@ -573,6 +573,8 @@ MachineCard
   governor: CardGovernor
   fleet_mode?: DeclaredFleetMode | null
   hosts_fleet_redis?: boolean | null
+  serves_radio?: boolean | null
+  serves_profiles?: uint32 | null
   fleet_defaults?: CardFleetDefaults | null
   generated_at_ms: uint64
   gather_ms: uint64

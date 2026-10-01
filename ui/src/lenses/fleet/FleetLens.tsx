@@ -34,6 +34,7 @@ import { UtilityGlyph } from "../../components/UtilityGlyph";
 import { scopeStateOf } from "../../lib/scopeMorph";
 import { liveStateLabel, reasonForLine } from "../../lib/tokenRate";
 import { tokensOffMeter } from "./savings";
+import { ProfilesServedIcon } from "../../components/ProfilesServedIcon";
 import { RadioSeatIcon } from "../../components/RadioSeatIcon";
 import { buildFleetCardBase, withLiveReadings, busiestExecution, isStrictlyBusier, specDimLabel, statusReason, cardFace, notStreamedNames, DISCONNECTED_STAT, type CardSourcesAnswered, type FleetCard } from "./cards";
 import { useLatch } from "../../hooks/useLatch";
@@ -119,7 +120,7 @@ function machineRunsHash(machineKey: string, runningSessionIds: string[]): strin
 }
 
 /** The card's name row: the machine icon, its name, what its own card
- * declares (HUB), whether it serves radio, and the utility strip. One row, so a badge never changes
+ * declares (HUB), what it serves (profiles, radio), and the utility strip. One row, so a badge never changes
  * the card's height.
  *
  * A fleet card shows only facts about its own machine. A relationship with
@@ -139,6 +140,10 @@ function CardNameRow({ card, utilityQuietKnown }: { card: FleetCard; utilityQuie
       </span>
       {/* (#3022) What the machine's own card declares. */}
       <HubBadge declared={card.hub} />
+      {/* What the machine's own card says it serves: profiles, then radio
+          (`serves_profiles`, `serves_radio`). Names nobody, so it reads the same
+          from any server. */}
+      {card.servesProfiles > 0 ? <ProfilesServedIcon machine={card.name} count={card.servesProfiles} /> : null}
       {/* What the machine's own card says: it serves radio (`serves_radio`).
           Never read from `accepts`, which is relative to the serving machine. */}
       {card.servesRadio ? <RadioSeatIcon machine={card.name} /> : null}
