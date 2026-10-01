@@ -13359,17 +13359,10 @@ fn lab_run_inspect_list_and_compare_render_recorded_runs() {
         assert!(stdout.contains("\nturns:       1\ncompactions: 0\nverify:      "), "{stdout}");
         assert!(stdout.contains(verify), "{w}: {stdout}");
         assert!(!stdout.contains("rest:"), "{stdout}");
-        assert!(!stdout.contains("tokensBefore:"), "{stdout}");
         assert!(!stdout.contains("mode:"), "{stdout}");
         assert!(stdout.contains("\nnotes:\n  - "), "{stdout}");
-        assert!(!stdout.contains("compaction summaries"), "{stdout}");
     }
-    let out = lab.cmd().args(["run", "inspect", &id_of("labchar"), "--summary"]).output().unwrap();
-    let (stdout, _) = out_text(&out);
-    assert!(
-        stdout.ends_with("\n\ncompaction summaries: (none — no trajectory.jsonl recorded)\n"),
-        "{stdout}"
-    );
+    lab.cmd().args(["run", "inspect", &id_of("labchar"), "--summary"]).assert().failure();
     lab.cmd().args(["run", "inspect", "no-such-run"]).assert().failure();
 
     let out = lab.cmd().args(["run", "list", "--kind", "lab", "--all"]).output().unwrap();

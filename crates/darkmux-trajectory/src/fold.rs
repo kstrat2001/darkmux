@@ -14,7 +14,6 @@ use crate::event::{
     Checkpoint, DispatchComplete, DispatchStart, MalformedReason, RestReason, TrajectoryEvent,
     Verdict,
 };
-use crate::legacy::LegacyFold;
 use crate::usage::{TokenSum, UsageCounts};
 
 /// One model stream, from `model.streaming.start` to `model.streaming.end`.
@@ -151,7 +150,6 @@ pub struct TrajectoryFold {
     pub checkpoint_policy: Option<String>,
     pub gate: StreamGateFold,
     pub detectors: DetectorCounts,
-    pub legacy: LegacyFold,
 }
 
 impl TrajectoryFold {
@@ -254,9 +252,6 @@ impl TrajectoryFold {
             E::ToolCallPromoted(p) => {
                 bump(&mut self.detectors.promoted_calls, u32::try_from(p.promoted_call_count).unwrap_or(u32::MAX))
             }
-            E::Legacy(crate::legacy::LegacyEvent::PromptSubmitted(p)) => self.legacy.apply(p),
-            E::Legacy(crate::legacy::LegacyEvent::ModelCompleted(counts)) => self.tokens.add(counts),
-            E::Legacy(crate::legacy::LegacyEvent::Other) => {}
             E::ToolCallWriting(_)
             | E::PromotionSuppressed(_)
             | E::CompactionStart(_)
@@ -309,21 +304,15 @@ impl TrajectoryFold {
         });
     }
 
-    /// Logical turns, from ONE source per format: an openclaw run's prompts
-    /// ([`crate::legacy`]), else the distinct `seq` among the
-    /// `model.completed` events (a checkpoint continuation resumes its turn
-    /// under the same `seq`).
+    /// Logical turns: the distinct `seq` among the `model.completed` events
+    /// (a checkpoint continuation resumes its turn under the same `seq`).
     pub fn turns(&self) -> u32 {
-        match self.legacy.turns {
-            0 => u32::try_from(self.turn_seqs.len()).unwrap_or(u32::MAX),
-            prompts => prompts,
-        }
+        u32::try_from(self.turn_seqs.len()).unwrap_or(u32::MAX)
     }
 
-    /// Installed compactions, plus an openclaw run's distinct ones.
+    /// Installed compactions.
     pub fn compactions(&self) -> u32 {
-        let legacy = u32::try_from(self.legacy.compactions.len()).unwrap_or(u32::MAX);
-        self.compaction_events.saturating_add(legacy)
+        self.compaction_events
     }
 
     pub fn tool_calls(&self) -> u32 {

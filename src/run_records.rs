@@ -18,16 +18,16 @@ pub(crate) fn cmd_run(sub: RunFamilyCmd) -> Result<i32> {
         RunFamilyCmd::List { kind, limit, all, usage, since, json } => {
             crate::run_list::run(kind, limit, all, json.json, usage, since.as_deref())
         }
-        RunFamilyCmd::Inspect { run, summary } => cmd_inspect(&run, summary),
+        RunFamilyCmd::Inspect { run } => cmd_inspect(&run),
         RunFamilyCmd::Stats { runs, baseline, json } => cmd_stats(&runs, &baseline, json.json),
         RunFamilyCmd::Compare { run_a, run_b } => cmd_compare(&run_a, &run_b),
     }
 }
 
-/// `run inspect <run> [--summary]`.
-fn cmd_inspect(run: &str, summary: bool) -> Result<i32> {
+/// `run inspect <run>`.
+fn cmd_inspect(run: &str) -> Result<i32> {
     lab_records_only("inspect", &[run])?;
-    inspect_run(run, summary)
+    inspect_run(run)
 }
 
 /// `run stats <run>... [--baseline <run>...]`.
@@ -88,13 +88,9 @@ fn refusal_for(verb: &str, id: &str, kind: RunKind) -> Option<String> {
     ))
 }
 
-fn inspect_run(run: &str, summary: bool) -> Result<i32> {
+fn inspect_run(run: &str) -> Result<i32> {
     let report = lab::inspect::lab_inspect(run)?;
     print_inspection(&report);
-    if summary {
-        let run_dir = lab::inspect::resolve_run_path(run);
-        print_compaction_summaries(&lab::inspect::read_compaction_summaries(&run_dir));
-    }
     Ok(0)
 }
 
@@ -112,10 +108,6 @@ fn print_inspection(report: &workloads::types::InspectionReport) {
     println!("turns:       {}", report.turns);
     println!("compactions: {}", report.compactions);
     println!("verify:      {}", verify_line(report.verify.as_ref()));
-    if !report.tokens_before.is_empty() {
-        let listed: Vec<String> = report.tokens_before.iter().map(|n| n.to_string()).collect();
-        println!("tokensBefore: {}", listed.join(", "));
-    }
     if let Some(m) = report.mode {
         println!(
             "mode:        {}",
@@ -139,27 +131,6 @@ fn verify_line(verify: Option<&workloads::types::VerifyReport>) -> String {
         Some(v) if v.details.is_empty() => "FAILED".to_string(),
         Some(v) => format!("FAILED — {}", v.details),
         None => "not checked".to_string(),
-    }
-}
-
-fn print_compaction_summaries(summaries: &[darkmux_trajectory::legacy::LegacyCompaction]) {
-    println!();
-    if summaries.is_empty() {
-        println!("compaction summaries: (none — no trajectory.jsonl recorded)");
-        return;
-    }
-    println!("compaction summaries: {}", summaries.len());
-    for (i, s) in summaries.iter().enumerate() {
-        println!();
-        println!(
-            "─── summary {} of {} (turn {}, tokensBefore={}, {} chars) ───",
-            i + 1,
-            summaries.len(),
-            s.turn,
-            s.tokens_before,
-            s.summary_chars()
-        );
-        println!("{}", s.summary);
     }
 }
 

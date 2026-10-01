@@ -435,9 +435,7 @@ impl WorkloadProvider for CodingTaskProvider {
             serde_json::Value::Null
         };
         // Every count is the fold of the run's trajectory: the one reading
-        // `run stats` and the live tailer use too. An openclaw-era run's
-        // turns and compactions are its `prompt.submitted` events and the
-        // distinct compaction summaries in them (`darkmux_trajectory::legacy`).
+        // `run stats` and the live tailer use too.
         let fold = crate::lab::inspect::run_trajectory(run_dir);
         let turns = fold.turns();
         let compactions = fold.compactions();
@@ -513,7 +511,6 @@ impl WorkloadProvider for CodingTaskProvider {
             // (#2094 finding 7) Same variable the classification above and
             // the notes line use — can't drift from either.
             rest_ms,
-            tokens_before: fold.legacy.compactions.iter().map(|c| c.tokens_before).collect(),
             mode,
             verify,
             notes,
@@ -2228,18 +2225,19 @@ mod tests {
             r#"{"session_id":"sess","duration_ms":300000}"#,
         )
         .unwrap();
-        // Three prompt.submitted events; two of them carry a unique compactionSummary.
-        let trajectory = r#"{"type":"prompt.submitted","data":{"messages":[]}}
-{"type":"prompt.submitted","data":{"messages":[{"role":"compactionSummary","summary":"alpha summary","tokensBefore":48000}]}}
-{"type":"prompt.submitted","data":{"messages":[{"role":"compactionSummary","summary":"alpha summary","tokensBefore":48000}]}}
-{"type":"prompt.submitted","data":{"messages":[{"role":"compactionSummary","summary":"beta summary text","tokensBefore":50000}]}}
+        // Four model turns and two installed compactions.
+        let trajectory = r#"{"type":"model.completed","seq":1}
+{"type":"model.completed","seq":2}
+{"type":"compaction","generation":1}
+{"type":"model.completed","seq":3}
+{"type":"compaction","generation":2}
+{"type":"model.completed","seq":4}
 "#;
         fs::write(run_dir.join("trajectory.jsonl"), trajectory).unwrap();
         let loaded = make_loaded(basic_spec(), tmp.path().to_path_buf());
         let report = CodingTaskProvider.inspect(&loaded, &run_dir).unwrap();
         assert_eq!(report.turns, 4);
-        assert_eq!(report.compactions, 2); // dedup by 80-char prefix
-        assert_eq!(report.tokens_before, vec![48000, 50000]);
+        assert_eq!(report.compactions, 2);
     }
 
     /// (#1947) Five `model.completed` events all stamped `seq: 1` are ONE
@@ -2441,8 +2439,9 @@ mod tests {
         .unwrap();
         // Garbage instead of valid JSON.
         fs::write(runtime_dir.join("metrics.json"), "not valid json {{ <}}").unwrap();
-        let trajectory = r#"{"type":"prompt.submitted","data":{"messages":[]}}
-{"type":"prompt.submitted","data":{"messages":[{"role":"compactionSummary","summary":"a summary","tokensBefore":42000}]}}
+        let trajectory = r#"{"type":"model.completed","seq":1}
+{"type":"model.completed","seq":2}
+{"type":"compaction","generation":1}
 "#;
         fs::write(run_dir.join("trajectory.jsonl"), trajectory).unwrap();
         let loaded = make_loaded(basic_spec(), tmp.path().to_path_buf());
@@ -2453,10 +2452,10 @@ mod tests {
         assert_eq!(report.compactions, 1);
     }
 
-    /// An openclaw-era run (its turns are `prompt.submitted` events) whose
-    /// manifest names a sandbox with no runtime dir reads its own trajectory.
+    /// A run whose manifest names a sandbox with no runtime dir reads its own
+    /// trajectory.
     #[test]
-    fn inspect_reads_an_openclaw_run_dir_trajectory() {
+    fn inspect_reads_the_run_dir_trajectory() {
         let tmp = TempDir::new().unwrap();
         let run_dir = tmp.path().join("run");
         let sandbox = tmp.path().join("sandbox");
@@ -2470,8 +2469,9 @@ mod tests {
             ),
         )
         .unwrap();
-        let trajectory = r#"{"type":"prompt.submitted","data":{"messages":[]}}
-{"type":"prompt.submitted","data":{"messages":[{"role":"compactionSummary","summary":"a summary","tokensBefore":42000}]}}
+        let trajectory = r#"{"type":"model.completed","seq":1}
+{"type":"model.completed","seq":2}
+{"type":"compaction","generation":1}
 "#;
         fs::write(run_dir.join("trajectory.jsonl"), trajectory).unwrap();
         let loaded = make_loaded(basic_spec(), tmp.path().to_path_buf());

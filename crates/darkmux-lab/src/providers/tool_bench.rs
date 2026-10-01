@@ -1357,7 +1357,6 @@ impl WorkloadProvider for ToolBenchProvider {
             compactions: 0,
             // (#2094) tool_bench scores do not read rests.
             rest_ms: 0,
-            tokens_before: vec![],
             mode: None,
             verify: None,
             notes,

@@ -908,12 +908,6 @@ pub(crate) enum RunFamilyCmd {
     /// leaves no manifest, so its id is refused with where to look instead.
     Inspect {
         run: String,
-        /// Also dump the full compaction summary text(s) the compactor model
-        /// wrote during this run (read from trajectory.jsonl). Useful for
-        /// methodology validation — confirming the compactor is producing
-        /// substantive summaries rather than degenerate / empty output.
-        #[arg(long)]
-        summary: bool,
     },
     /// (#2855) Derived metrics for a recorded lab run — active time,
     /// throughput over the streams that were actually billed, both

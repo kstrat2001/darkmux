@@ -12,7 +12,6 @@
 pub mod envelope;
 pub mod event;
 pub mod fold;
-pub mod legacy;
 pub mod usage;
 
 pub use envelope::{FailedExec, ResumedFrom, RuntimeEnvelope};
