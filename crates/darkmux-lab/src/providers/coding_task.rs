@@ -299,7 +299,7 @@ impl WorkloadProvider for CodingTaskProvider {
 
         fs::write(run_dir.join("qa-reply.json"), stdout)?;
         if !stderr.is_empty() {
-            fs::write(run_dir.join("qa-reply.err"), &stderr)?;
+            fs::write(run_dir.join("qa-reply.err"), stderr)?;
         }
 
         // (#364) Per-run preservation of the runtime's trajectory. The
@@ -355,7 +355,7 @@ impl WorkloadProvider for CodingTaskProvider {
         // completion that verify contradicts. Augments qa-reply.json
         // with `claim_verify_mismatch` so downstream automation can
         // dispatch on the signal without re-parsing verify-output.txt.
-        let final_assistant_text = extract_reply_text(&stdout);
+        let final_assistant_text = extract_reply_text(stdout);
         if let Some(mismatch) = detect_claim_verify_mismatch(
             &final_assistant_text,
             verify_outcome.as_ref(),

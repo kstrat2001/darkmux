@@ -8971,7 +8971,7 @@ mod tests {
         let config: MissionConfig = serde_json::from_str(GEN3_CONFIG).unwrap();
         let real = derive_phase_ids("gen3lossrec", &config);
         let (rp1, rp2) = (real["p1"].clone(), real["p2"].clone());
-        let tasks = vec![task_with_step(&rp1, "p1-step"), task_with_step(&rp2, "p2-step")];
+        let tasks = [task_with_step(&rp1, "p1-step"), task_with_step(&rp2, "p2-step")];
         let build = |mid: &str, loss: RunLoss| {
             let real = derive_phase_ids(mid, &config);
             seed_mission_with_phases(mid, &[(&real["p1"], PhaseStatus::Running), (&real["p2"], PhaseStatus::Running)]);
