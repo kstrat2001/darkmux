@@ -489,12 +489,17 @@ pub fn interpret_dispatch_result(unit_id: &str, res: &DispatchResult) -> UnitDis
         );
     }
     let timed_out = watchdog_timeout_fired(&res.stderr);
-    let result_label = match envelope.as_ref().and_then(|e| e.get("result")).and_then(Value::as_str) {
-        Some("stop") => "stop".to_string(),
+    let reported = envelope
+        .as_ref()
+        .and_then(|e| e.get("result"))
+        .and_then(Value::as_str)
+        .map(darkmux_trajectory::TerminalResult::parse);
+    let result_label = match reported {
+        Some(darkmux_trajectory::TerminalResult::Stop) => "stop".to_string(),
         // Checked BEFORE the `timed_out` arm: a watchdog kill AFTER the
         // turn cap was already hit is still, first and foremost, a budget
         // exhaustion.
-        Some("max_turns") => UNIT_BUDGET_EXHAUSTED.to_string(),
+        Some(darkmux_trajectory::TerminalResult::MaxTurns) => UNIT_BUDGET_EXHAUSTED.to_string(),
         Some(_) if timed_out => "timeout".to_string(),
         Some(_) => "error".to_string(),
         None if timed_out => "timeout".to_string(),
@@ -1291,6 +1296,9 @@ impl StepKind for CrawlUnitStepKind {
         // not tell them apart. See `dedup_across_draws`.
         let mut all_finding_refs: Vec<(usize, FindingRef)> = Vec::new();
         let mut last_result = String::new();
+        // (F11) Set when ANY draw was cut at its bound: the unit's recorded
+        // result reads the worst draw, never just the last one.
+        let mut any_draw_cut = false;
         let mut last_model: Option<String> = None;
         let mut last_detections = None;
         let mut last_rest_ms = 0u64;
@@ -1466,6 +1474,7 @@ impl StepKind for CrawlUnitStepKind {
             total_rejected += exclusions as u64;
             all_finding_refs.extend(finding_refs.into_iter().map(|r| (draw, r)));
             last_result = result.clone();
+            any_draw_cut |= result == UNIT_BUDGET_EXHAUSTED;
             last_model = model.clone();
             last_detections = detections;
             last_rest_ms = rest_ms;
@@ -1527,7 +1536,7 @@ impl StepKind for CrawlUnitStepKind {
             unit: ctx.unit_id.clone(),
             rule: single_rule_id(&ctx.rule_ids),
             source: ctx.source.clone(),
-            result: last_result,
+            result: if any_draw_cut { UNIT_BUDGET_EXHAUSTED.to_string() } else { last_result },
             findings: total_findings,
             findings_rejected: total_rejected,
             wall_ms: total_wall_ms,
