@@ -1,6 +1,6 @@
 //! `darkmux run compare <run-A> <run-B>` — diff two runs.
 
-use crate::lab::inspect::lab_inspect;
+use crate::lab::inspect::{lab_inspect, resolve_run_path};
 use crate::workloads::types::InspectionReport;
 use anyhow::Result;
 
@@ -30,8 +30,12 @@ pub fn lab_compare(run_a: &str, run_b: &str) -> Result<CompareResult> {
     } else {
         0.0
     };
-    let mut notes = vec![
-        format!("{} → {}", a.run_id, b.run_id),
+    let mut notes = vec![format!("{} → {}", a.run_id, b.run_id)];
+    notes.extend(differences(
+        (&a.workload_id, &b.workload_id),
+        (run_profile(run_a).as_deref(), run_profile(run_b).as_deref()),
+    ));
+    notes.extend([
         format!(
             "wall: {}s → {}s ({}{}s, {}{:.1}%)",
             a.walltime_ms / 1000,
@@ -43,7 +47,7 @@ pub fn lab_compare(run_a: &str, run_b: &str) -> Result<CompareResult> {
         ),
         format!("turns: {} → {}", a.turns, b.turns),
         format!("compactions: {} → {}", a.compactions, b.compactions),
-    ];
+    ]);
     if a.mode.is_some() || b.mode.is_some() {
         notes.push(format!(
             "mode: {:?} → {:?}",
@@ -61,10 +65,53 @@ pub fn lab_compare(run_a: &str, run_b: &str) -> Result<CompareResult> {
     })
 }
 
+/// (F3) The profile a run's manifest records as requested, when it records one.
+fn run_profile(run: &str) -> Option<String> {
+    let raw = std::fs::read_to_string(resolve_run_path(run).join("manifest.json")).ok()?;
+    let meta: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    meta.get("profile").and_then(|v| v.as_str()).map(str::to_string)
+}
+
+/// (F3) What differs between the two runs besides the thing under test: a
+/// delta across different workloads or profiles is not a like-for-like
+/// comparison, and the reader is told before the numbers. A profile missing
+/// from either manifest is unknown, not a difference.
+fn differences(workloads: (&str, &str), profiles: (Option<&str>, Option<&str>)) -> Vec<String> {
+    let mut out = Vec::new();
+    if workloads.0 != workloads.1 {
+        out.push(format!(
+            "note: different workloads ({} vs {}), so the deltas below are not like-for-like",
+            workloads.0, workloads.1
+        ));
+    }
+    if let (Some(a), Some(b)) = profiles {
+        if a != b {
+            out.push(format!(
+                "note: different profiles ({a} vs {b}), so the deltas below mix the profile's effect with the run's"
+            ));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn differences_names_a_workload_and_a_profile_change() {
+        let d = differences(("refresh-rotation", "pepper-grinder"), (Some("deep"), Some("small")));
+        assert_eq!(d.len(), 2, "{d:?}");
+        assert!(d[0].contains("refresh-rotation vs pepper-grinder"), "{}", d[0]);
+        assert!(d[1].contains("deep vs small"), "{}", d[1]);
+    }
+
+    #[test]
+    fn differences_is_quiet_for_like_for_like_and_for_an_unrecorded_profile() {
+        assert!(differences(("w", "w"), (Some("p"), Some("p"))).is_empty());
+        assert!(differences(("w", "w"), (None, Some("p"))).is_empty());
+    }
 
     #[test]
     fn compare_errors_when_run_dirs_missing() {
