@@ -5636,7 +5636,9 @@ fn plan_tool_calls(
             } else {
                 match classify_invalid_tool_call(&call.function.name) {
                     MalformedReason::RealToolNotGranted => CallFate::NotGranted,
-                    MalformedReason::NotATool => CallFate::NotATool,
+                    // `Unknown` is a reader's value (#3035); this classifier
+                    // never returns it.
+                    MalformedReason::NotATool | MalformedReason::Unknown => CallFate::NotATool,
                 }
             }
         })
@@ -5688,7 +5690,7 @@ fn handle_invalid_tool_calls(
     let tools_str = tool_names.join(", ");
 
     match reason {
-        MalformedReason::NotATool => {
+        MalformedReason::NotATool | MalformedReason::Unknown => {
             feedback_injector.queue_malformed_tool_names(count as usize, &tools_str);
         }
         MalformedReason::RealToolNotGranted => {

@@ -178,10 +178,7 @@ impl TrajectoryFold {
             self.schema_version.get_or_insert_with(|| h.schema_version.clone());
             return;
         }
-        self.events = self.events.saturating_add(1);
-        if let Some(ts) = e.ts() {
-            self.last_ts = Some(self.last_ts.map_or(ts, |t| t.max(ts)));
-        }
+        self.count(e);
         match e {
             E::DispatchStart(s) => {
                 if self.start.is_none() {
@@ -277,6 +274,14 @@ impl TrajectoryFold {
             | E::EscalationTriggered(_)
             | E::Header(_)
             | E::Unknown => {}
+        }
+    }
+
+    /// One more event, and the latest clock any event carried.
+    fn count(&mut self, e: &TrajectoryEvent) {
+        self.events = self.events.saturating_add(1);
+        if let Some(ts) = e.ts() {
+            self.last_ts = Some(self.last_ts.map_or(ts, |t| t.max(ts)));
         }
     }
 

@@ -9500,12 +9500,7 @@ impl TailerState {
             E::Reasoning(r) => self.on_reasoning(r),
             E::FeedbackInjected(f) => self.on_feedback_injected(f),
             E::StreamingStart(s) => self.on_stream_start(s),
-            E::StreamingEnd(_) => {
-                // (#2928) The stream ended: the live sampler stops refreshing.
-                if let Some(live) = self.live.as_mut() {
-                    live.gate.end_stream();
-                }
-            }
+            E::StreamingEnd(_) => self.on_stream_end(),
             E::Partial(p) => self.on_stream_tick(Chunk::of_partial(p)),
             E::ToolCallWriting(w) => self.on_stream_tick(Chunk::of_writing(w)),
             E::GateObservation(g) => {
@@ -9792,6 +9787,13 @@ impl TailerState {
         self.emit(darkmux_flow::Level::Info, darkmux_flow::Payload::DispatchCheckpoint(payload));
         if let Some(w) = checkpoint_degeneracy_warning(c) {
             self.surface_degeneracy_warning(w);
+        }
+    }
+
+    /// (#2928) The stream ended: the live sampler stops refreshing.
+    fn on_stream_end(&mut self) {
+        if let Some(live) = self.live.as_mut() {
+            live.gate.end_stream();
         }
     }
 

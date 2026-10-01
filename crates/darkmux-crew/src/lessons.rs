@@ -326,7 +326,9 @@ pub fn export_json(conn: &Connection) -> Result<String> {
 /// to the file Just Works). Import never deletes — use [`remove`] for that.
 /// Timestamps from the file are preserved when positive; `0`/absent stamps now,
 /// and a missing `source` defaults to `"operator"` (matching [`add`]).
-pub fn import_json(conn: &mut Connection, data: &str) -> Result<ImportStats> {
+/// (#3035) Parse an export. One a newer darkmux wrote may carry a shape this
+/// one cannot place: refused rather than half-imported.
+fn parse_export(data: &str) -> Result<LessonsExport> {
     let env: LessonsExport = serde_json::from_str(data).context("parsing lessons export")?;
     if env.schema_version > LESSONS_SCHEMA_VERSION {
         anyhow::bail!(
@@ -334,6 +336,11 @@ pub fn import_json(conn: &mut Connection, data: &str) -> Result<ImportStats> {
             env.schema_version
         );
     }
+    Ok(env)
+}
+
+pub fn import_json(conn: &mut Connection, data: &str) -> Result<ImportStats> {
+    let env = parse_export(data)?;
     let now = now_unix();
     let mut stats = ImportStats::default();
     let tx = conn.transaction().context("opening import transaction")?;

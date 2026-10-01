@@ -562,8 +562,8 @@ fn a_newer_file_gets_the_upgrade_message_and_no_key_errors() {
     let p = Path::new("/x/coder.json");
     // Carries a key this binary does not know AND a newer marker: the key is
     // not judged, the file is refused for its version.
-    let text = format!(r#"{{"schema_version": "99.0", "future_key": 1}}"#);
-    let fp = check_text::<Probe>(UserFileKind::Role, p, &text, &no_retired).unwrap();
+    let text = r#"{"schema_version": "99.0", "future_key": 1}"#;
+    let fp = check_text::<Probe>(UserFileKind::Role, p, text, &no_retired).unwrap();
     let known = UserFileKind::Role.schema_version();
     assert_eq!(fp.problem, Problem::Newer { file_version: "99.0".into(), known: known.into() });
     let msg = fp.to_string();

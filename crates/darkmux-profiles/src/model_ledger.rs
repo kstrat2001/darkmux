@@ -1938,6 +1938,23 @@ fn truncate_ident(s: &str, max: usize) -> String {
     }
 }
 
+fn owner_word(owner: Owner) -> &'static str {
+    match owner {
+        Owner::Darkmux => "darkmux",
+        Owner::User => "user",
+        Owner::Unknown => "unknown",
+    }
+}
+
+fn severity_word(severity: Severity) -> &'static str {
+    match severity {
+        Severity::Info => "info",
+        Severity::Warn => "warning",
+        Severity::Error => "error",
+        Severity::Unknown => "note",
+    }
+}
+
 /// The `darkmux machine resources` table + machine rows + gather-cost line.
 pub fn render_human(ledger: &ModelLedger) -> String {
     let mut out = String::new();
@@ -1966,11 +1983,7 @@ pub fn render_human(ledger: &ModelLedger) -> String {
         out.push_str(&format!(
             "{:<46} {:<8} {:>8} {:>10} {:>10} {:>10} {:>10}  {}\n",
             ident,
-            match m.owner {
-                Owner::Darkmux => "darkmux",
-                Owner::User => "user",
-                Owner::Unknown => "unknown",
-            },
+            owner_word(m.owner),
             m.loaded_ctx,
             fmt_opt(m.weights_bytes),
             fmt_opt(m.kv_bytes_at_ctx),
@@ -2061,13 +2074,7 @@ pub fn render_human(ledger: &ModelLedger) -> String {
         ledger.gather_ms
     ));
     for m in &ledger.messages {
-        let tag = match m.severity {
-            Severity::Info => "info",
-            Severity::Warn => "warning",
-            Severity::Error => "error",
-            Severity::Unknown => "note",
-        };
-        out.push_str(&format!("{tag}: {}\n", m.text));
+        out.push_str(&format!("{}: {}\n", severity_word(m.severity), m.text));
     }
     out
 }
