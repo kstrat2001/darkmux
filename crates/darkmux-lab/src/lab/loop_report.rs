@@ -28,6 +28,7 @@
 //!   - `Failed` — the dispatch errored, the model did nothing and could not be
 //!     confirmed to have passed, or it engaged but verify contradicts it.
 
+use crate::lab::dispatch_end::DispatchEnd;
 use anyhow::Result;
 use darkmux_trajectory::DetectorCounts;
 use serde::Serialize;
@@ -117,6 +118,9 @@ pub enum Verdict {
     Struggled,
     InertFalsePass,
     Failed,
+    /// (F2) The dispatch stopped on purpose and handed the work to a higher
+    /// tier: unfinished by design, so neither a failure nor an achievement.
+    Escalated,
 }
 
 impl Verdict {
@@ -126,6 +130,7 @@ impl Verdict {
             Verdict::Struggled => "struggled",
             Verdict::InertFalsePass => "inert-false-pass",
             Verdict::Failed => "failed",
+            Verdict::Escalated => "escalated",
         }
     }
 
@@ -136,6 +141,7 @@ impl Verdict {
             Verdict::Struggled => "⚠",
             Verdict::InertFalsePass => "🫥",
             Verdict::Failed => "❌",
+            Verdict::Escalated => "↑",
         }
     }
 }
@@ -198,6 +204,10 @@ pub struct LoopReport {
     pub verdict: Verdict,
     /// Did the runtime exit cleanly with a reply payload?
     pub dispatch_ok: bool,
+    /// (F2) The runtime's `escalation_*` reason when the dispatch escalated;
+    /// absent otherwise. `dispatch_ok` is false then, but it is not an error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub escalation: Option<String>,
     /// Verify outcome (`None` when the workload defines no verify command).
     pub verify_passed: Option<bool>,
     /// `final_hash != baseline_hash` — whether the agent left the sandbox in
@@ -229,22 +239,24 @@ pub struct LoopReport {
 pub fn analyze_run(
     run_dir: &Path,
     run_id: &str,
-    dispatch_ok: bool,
+    end: &DispatchEnd,
     verify_passed: Option<bool>,
     duration_ms: u128,
     loop_config: Vec<String>,
 ) -> Result<LoopReport> {
+    let dispatch_ok = end.ok();
     let fold = crate::lab::inspect::run_trajectory(run_dir);
     let (detectors, tool_calls) = (fold.detectors, fold.tool_calls());
     let (turns, compactions) = (fold.turns(), fold.compactions());
     let sandbox_changed = read_sandbox_changed(&run_dir.join("manifest.json"));
 
-    let verdict = classify(
-        dispatch_ok,
-        verify_passed,
-        tool_calls,
-        struggle_signal(&detectors),
-    );
+    // An escalation exits non-zero but is not a failure: it gets its own
+    // verdict before the exit-code-shaped `classify` could call it `Failed`.
+    let verdict = if end.escalation().is_some() {
+        Verdict::Escalated
+    } else {
+        classify(dispatch_ok, verify_passed, tool_calls, struggle_signal(&detectors))
+    };
 
     let notes = build_notes(
         verdict,
@@ -259,6 +271,7 @@ pub fn analyze_run(
         run_id: run_id.to_string(),
         verdict,
         dispatch_ok,
+        escalation: end.escalation().map(str::to_string),
         verify_passed,
         sandbox_changed,
         tool_calls,
@@ -269,6 +282,18 @@ pub fn analyze_run(
         loop_config,
         notes,
     })
+}
+
+/// Why a `Failed` verdict failed, most fundamental cause first.
+fn failed_note(dispatch_ok: bool, verify: Option<bool>, tool_calls: u32) -> String {
+    match (dispatch_ok, tool_calls, verify) {
+        (false, _, _) => "dispatch did not exit cleanly — runtime error or non-zero exit".into(),
+        (true, 0, None) => {
+            "model made 0 tool calls (inert), and the workload declares no verify to confirm success".into()
+        }
+        (true, 0, Some(_)) => "model made 0 tool calls (inert) and verify did not confirm success".into(),
+        (true, _, _) => "model engaged but verify contradicts the result (verify failed)".into(),
+    }
 }
 
 /// Build the operator-facing "why this verdict" notes.
@@ -282,23 +307,7 @@ fn build_notes(
 ) -> Vec<String> {
     let mut notes = Vec::new();
     match verdict {
-        Verdict::Failed if !dispatch_ok => {
-            notes.push("dispatch did not exit cleanly — runtime error or non-zero exit".into());
-        }
-        Verdict::Failed if tool_calls == 0 && verify.is_none() => {
-            notes.push(
-                "model made 0 tool calls (inert), and the workload declares no verify to confirm success"
-                    .into(),
-            );
-        }
-        Verdict::Failed if tool_calls == 0 => {
-            notes.push(
-                "model made 0 tool calls (inert) and verify did not confirm success".into(),
-            );
-        }
-        Verdict::Failed => {
-            notes.push("model engaged but verify contradicts the result (verify failed)".into());
-        }
+        Verdict::Failed => notes.push(failed_note(dispatch_ok, verify, tool_calls)),
         Verdict::InertFalsePass => {
             notes.push(
                 "FALSE PASS: model made 0 tool calls (changed nothing) yet verify reports pass — \
@@ -314,6 +323,13 @@ fn build_notes(
         }
         Verdict::Productive => {
             notes.push("engaged, achieved the task, no pathological loop signals".into());
+        }
+        Verdict::Escalated => {
+            notes.push(
+                "dispatch escalated: the runtime stopped on purpose and handed the work to a \
+                 higher tier (not a runtime error); the task is unfinished"
+                    .into(),
+            );
         }
     }
     if detectors.feedback_injected > 0 {
@@ -364,7 +380,11 @@ pub fn print_report(report: &LoopReport) {
     }
     println!(
         "  dispatch:     {}",
-        if report.dispatch_ok { "ok" } else { "error" }
+        match (&report.escalation, report.dispatch_ok) {
+            (Some(reason), _) => format!("escalated ({reason})"),
+            (None, true) => "ok".to_string(),
+            (None, false) => "error".to_string(),
+        }
     );
     println!(
         "  verify:       {}",
@@ -421,6 +441,22 @@ mod tests {
     }
 
     // ─── classify: the four verdicts ────────────────────────────────
+
+    /// (F2) An escalated dispatch exits non-zero but is its own verdict: not
+    /// `Failed`, not "runtime error" in the notes, and the reason is carried.
+    #[test]
+    fn an_escalated_dispatch_is_its_own_verdict_not_failed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let end = DispatchEnd::Escalated { reason: "escalation_compaction_reread_loop".into() };
+        let r = analyze_run(tmp.path(), "esc-run", &end, Some(false), 1_000, vec![]).unwrap();
+        assert_eq!(r.verdict, Verdict::Escalated);
+        assert_eq!(r.escalation.as_deref(), Some("escalation_compaction_reread_loop"));
+        assert!(!r.dispatch_ok);
+        assert!(r.notes.iter().all(|n| !n.contains("did not exit cleanly")), "{:?}", r.notes);
+        let failed = analyze_run(tmp.path(), "f-run", &DispatchEnd::Failed, None, 1_000, vec![]).unwrap();
+        assert_eq!(failed.verdict, Verdict::Failed);
+        assert_eq!(failed.escalation, None);
+    }
 
     #[test]
     fn classify_productive_clean_run() {
@@ -576,7 +612,7 @@ mod tests {
         )
         .unwrap();
         let report =
-            analyze_run(run, "phi4-run", true, Some(true), 37_000, vec!["profile=loop-phi4".into()])
+            analyze_run(run, "phi4-run", &DispatchEnd::Completed, Some(true), 37_000, vec!["profile=loop-phi4".into()])
                 .unwrap();
         assert_eq!(report.verdict, Verdict::InertFalsePass);
         assert_eq!(report.tool_calls, 0);
@@ -614,7 +650,7 @@ mod tests {
         // A stale metrics.json with other numbers: never read.
         fs::write(run.join("metrics.json"), r#"{"turns":18,"compactions":9}"#).unwrap();
 
-        let report = analyze_run(run, "struggle-run", true, Some(true), 240_000, vec![]).unwrap();
+        let report = analyze_run(run, "struggle-run", &DispatchEnd::Completed, Some(true), 240_000, vec![]).unwrap();
         assert_eq!(report.verdict, Verdict::Struggled);
         assert_eq!(report.tool_calls, 2);
         assert_eq!(report.detectors.cycle, 1);
@@ -643,7 +679,7 @@ mod tests {
             r#"{"final_hash":"blake3:after","fixture":{"baseline_hash":"blake3:before"}}"#,
         )
         .unwrap();
-        let report = analyze_run(run, "clean-run", true, Some(true), 60_000, vec![]).unwrap();
+        let report = analyze_run(run, "clean-run", &DispatchEnd::Completed, Some(true), 60_000, vec![]).unwrap();
         assert_eq!(report.verdict, Verdict::Productive);
         assert_eq!(report.tool_calls, 3);
         assert!(fired_summary(&report.detectors).is_empty());
@@ -656,7 +692,7 @@ mod tests {
         // zeroed counts rather than an error.
         let tmp = TempDir::new().unwrap();
         let run = tmp.path();
-        let report = analyze_run(run, "dead-run", false, None, 1_000, vec![]).unwrap();
+        let report = analyze_run(run, "dead-run", &DispatchEnd::Failed, None, 1_000, vec![]).unwrap();
         assert_eq!(report.verdict, Verdict::Failed);
         assert_eq!(report.tool_calls, 0);
         assert_eq!(report.turns, 0);
@@ -676,7 +712,7 @@ mod tests {
                 r#"{"type":"dispatch.cycle.susp"#, // truncated — invalid JSON
             ],
         );
-        let report = analyze_run(run, "partial-run", true, None, 5_000, vec![]).unwrap();
+        let report = analyze_run(run, "partial-run", &DispatchEnd::Completed, None, 5_000, vec![]).unwrap();
         assert_eq!(report.tool_calls, 1);
         assert_eq!(report.detectors.cycle, 0); // truncated line not counted
     }

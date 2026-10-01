@@ -240,7 +240,9 @@ pub(crate) fn status_label(status: RunStatus) -> &'static str {
         RunStatus::Planned => "planned",
         RunStatus::Running => "running",
         RunStatus::Complete => "complete",
+        RunStatus::Degraded => "degraded",
         RunStatus::Error => "error",
+        RunStatus::Escalated => "escalated",
         RunStatus::Abandoned => "abandoned",
         RunStatus::Unparseable => "unparseable",
     }
@@ -1283,6 +1285,13 @@ mod tests {
         }
     }
 
+    /// (F10/F11) A degraded run is listed as `degraded`, never `complete`.
+    #[test]
+    fn a_degraded_run_is_labeled_degraded_not_complete() {
+        assert_eq!(status_label(RunStatus::Degraded), "degraded");
+        assert_ne!(status_label(RunStatus::Degraded), status_label(RunStatus::Complete));
+    }
+
     /// Every label a column can emit must FIT that column, because
     /// `{:<w$}` is a minimum width and never truncates: one label over
     /// budget silently widens every row carrying it. `unparseable` (11)
@@ -1293,7 +1302,9 @@ mod tests {
             RunStatus::Planned,
             RunStatus::Running,
             RunStatus::Complete,
+            RunStatus::Degraded,
             RunStatus::Error,
+            RunStatus::Escalated,
             RunStatus::Abandoned,
             RunStatus::Unparseable,
         ] {

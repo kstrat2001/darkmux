@@ -91,7 +91,18 @@ pub enum RunStatus {
     Planned,
     Running,
     Complete,
+    /// (F10/F11) The run finished and produced real output, but part of its
+    /// work was lost or cut at a bound (a unit hit its turn cap, a step
+    /// completed with partial work, the wall-clock bound fired). The mission
+    /// envelope's `degraded` status, shown as its own word instead of
+    /// `complete` so a cut-off run never reads as a clean one.
+    Degraded,
     Error,
+    /// (F2) The run's dispatch stopped on purpose and handed the work to a
+    /// higher tier (a lab run's manifest names the runtime's `escalation_*`
+    /// reason). Not a success and not an error: the work is unfinished by
+    /// design, and a reader acts on it differently from a failure.
+    Escalated,
     Abandoned,
     /// (#1881) This binary could not determine the run's real outcome —
     /// either its `envelope.json` failed to deserialize at all (a newer
@@ -1513,35 +1524,23 @@ fn mission_finalized_status(mission: &Mission) -> RunStatus {
             }
             Ok(Some(envelope)) => {
                 // (#1877 item 4 — stated decision) `envelope.outcome`'s typed
-                // `RunOutcome::Partial` is NOT read here. `RunStatus` has no
-                // partial-coverage value among its states
-                // (`Planned`/`Running`/`Complete`/`Abandoned`/`Error`/
-                // `Unparseable`), and `status` already collapses
-                // `Partial` into `Degraded` before this match ever runs
-                // (`MissionOutcomeStatus::from_outcome`), so a Partial review's
-                // `Degraded` status falls into the `Clean | Degraded => Complete`
-                // arm below — same as it did before #1877, when Degraded was
-                // purely convention. Widening `RunStatus` to distinguish
-                // "complete" from "complete but constrained" is a real,
-                // separate feature (a dashboard-visible partial badge) this
-                // PR does not add.
+                // `RunOutcome::Partial` is NOT read here: `status` already
+                // collapses `Partial` into `Degraded`
+                // (`MissionOutcomeStatus::from_outcome`), and `Degraded` has
+                // its own `RunStatus` (F10/F11), so a cut-off or partial run
+                // never reads `Complete`.
                 //
-                // (#1881) `outcome`'s own leniency (`RunOutcome::Unknown`,
-                // `run_outcome.rs`) is likewise not read here — unaffected
-                // by this fix, same reasoning as the paragraph above. What
-                // #1881 DOES change: `envelope.status` itself can now be
+                // (#1881) `envelope.status` itself can be
                 // `MissionOutcomeStatus::Unknown` (a status value this
                 // binary doesn't recognize, degraded via `#[serde(other)]`
-                // rather than failing the whole parse) — and unlike
-                // `outcome`, `status` IS what this match reads. An unknown
-                // status is exactly the "this binary cannot tell you what
-                // happened" case `Unparseable` exists for, so it gets its
-                // own arm rather than falling into the `Clean | Degraded`
-                // wildcard the way a genuinely-known Degraded/Clean does.
+                // rather than failing the whole parse). That is exactly the
+                // "this binary cannot tell you what happened" case
+                // `Unparseable` exists for, so it gets its own arm.
                 match envelope.status {
                     MissionOutcomeStatus::Error | MissionOutcomeStatus::Degenerate => RunStatus::Error,
                     MissionOutcomeStatus::Unknown => RunStatus::Unparseable,
-                    MissionOutcomeStatus::Clean | MissionOutcomeStatus::Degraded => RunStatus::Complete,
+                    MissionOutcomeStatus::Degraded => RunStatus::Degraded,
+                    MissionOutcomeStatus::Clean => RunStatus::Complete,
                 }
             }
         }
@@ -1768,20 +1767,13 @@ fn lab_run_status(summary: &LabRunSummary, now_ms: u64, session_live: Option<boo
         // dispatch did; `run_ok` (the manifest's `ok`) is that. A run whose
         // dispatch errored was listed complete while its own detail view
         // said errored. Every other run kind already reports its outcome.
-        Some(Lc::Complete) => {
-            let failed = summary.degenerate || summary.run_ok == Some(false);
-            return if failed { RunStatus::Error } else { RunStatus::Complete };
-        }
+        Some(Lc::Complete) => return settled_lab_status(summary),
         Some(Lc::Error) => return RunStatus::Error,
         Some(Lc::Interrupted) => return RunStatus::Abandoned,
         // (#2860) No lifecycle verdict (a run from before the record existed):
         // a manifest is written only when the run ends, so its `ok` is a
         // terminal record too, and outranks the staleness guess below.
-        None => {
-            if let Some(ok) = summary.run_ok {
-                return if !ok || summary.degenerate { RunStatus::Error } else { RunStatus::Complete };
-            }
-        }
+        None if summary.run_ok.is_some() => return settled_lab_status(summary),
         _ => {}
     }
     if summary.finished {
@@ -1821,6 +1813,20 @@ fn lab_run_status(summary: &LabRunSummary, now_ms: u64, session_live: Option<boo
         return RunStatus::Abandoned;
     }
     RunStatus::Running
+}
+
+/// (#2860, F2) The status of a lab run that ENDED and wrote a manifest: an
+/// escalation first (the runtime exits non-zero after one, so `ok: false`
+/// would otherwise read as an error), then the dispatch result, then the
+/// degenerate flag.
+fn settled_lab_status(summary: &LabRunSummary) -> RunStatus {
+    if summary.escalation.is_some() {
+        RunStatus::Escalated
+    } else if summary.degenerate || summary.run_ok == Some(false) {
+        RunStatus::Error
+    } else {
+        RunStatus::Complete
+    }
 }
 
 /// (#1621) How long a lab run's newest artifact may age before the run stops
@@ -3241,15 +3247,13 @@ mod tests {
         assert_eq!(mission_run_status(&m, &[], now_unix() * 1_000), RunStatus::Error);
     }
 
-    /// (#1877 item 4 — stated decision, pinned) A `RunOutcome::Partial`
-    /// envelope collapses into `RunStatus::Complete` here, same as a plain
-    /// `Degraded` one — `RunStatus` has no partial-coverage state and this
-    /// site deliberately does not read `envelope.outcome` to invent one. If
-    /// this test ever needs to change, that is the moment `RunStatus` grows
-    /// a real partial state, not an accidental regression.
-    #[test]
+    /// (#1877 item 4 — stated decision, pinned; F10/F11) A `RunOutcome::Partial`
+    /// envelope collapses into `Degraded` and reads `RunStatus::Degraded`,
+    /// never `Complete`: a cut-off or partial run is not a clean one, and this
+    /// site deliberately does not read `envelope.outcome` to invent a finer state.
+        #[test]
     #[serial_test::serial]
-    fn mission_run_status_finalized_partial_outcome_envelope_reads_complete_not_a_new_state() {
+    fn mission_run_status_finalized_degraded_envelope_reads_degraded_never_complete() {
         let _g = CrewGuard::new();
         darkmux_crew::lifecycle::save_mission(&minimal_mission("m8", vec![], None)).unwrap();
         let mut m = minimal_mission("m8", vec![], None);
@@ -3264,7 +3268,7 @@ mod tests {
         );
         assert_eq!(partial_env.status, MissionOutcomeStatus::Degraded);
         darkmux_crew::envelope::finalize_mission(&partial_env);
-        assert_eq!(mission_run_status(&m, &[], now_unix() * 1_000), RunStatus::Complete);
+        assert_eq!(mission_run_status(&m, &[], now_unix() * 1_000), RunStatus::Degraded);
     }
 
     /// (#1892) `MissionStatus` has exactly four variants; no wildcard, so a
@@ -3438,7 +3442,7 @@ mod tests {
         let status = mission_run_status(&m, &[], now_unix() * 1_000);
         assert_eq!(
             status,
-            RunStatus::Complete,
+            RunStatus::Degraded,
             "outcome is supplementary and never read for RunStatus — a known status must still be trusted even when outcome's own detail is unrecognized"
         );
     }
@@ -3869,6 +3873,7 @@ mod tests {
             has_events: true,
             session_id: None,
             run_ok: None,
+            escalation: None,
             workload: None,
             verify_passed: None,
         }
@@ -3892,6 +3897,105 @@ mod tests {
         assert_eq!(lab_run_status(&with_ok(Some(true)), now, None), RunStatus::Complete);
         // No manifest (a provider that writes none) is not evidence of failure.
         assert_eq!(lab_run_status(&with_ok(None), now, None), RunStatus::Complete);
+    }
+
+    /// (F2, 5.0 dogfood) A run whose dispatch escalated on purpose (the
+    /// manifest's `ok` is false, since the runtime exits non-zero) is its own
+    /// status: it is neither a pass nor a transport error, and `run list` and
+    /// the runs board must say so. It outranks the `ok: false` reading
+    /// whichever way the lifecycle record ended.
+    #[test]
+    fn a_lab_run_that_escalated_reads_escalated_never_error() {
+        use darkmux_lab::lab::lifecycle::LifecycleStatus as Lc;
+        let now = 1_700_000_000_000u64;
+        let escalated = |lc: Option<Lc>| LabRunSummary {
+            run_ok: Some(false),
+            escalation: Some("escalation_compaction_reread_loop".into()),
+            ..lab_summary_with_lifecycle("d", false, false, lc)
+        };
+        assert_eq!(lab_run_status(&escalated(Some(Lc::Complete)), now, None), RunStatus::Escalated);
+        // A run from before the lifecycle record existed still reads from its manifest.
+        assert_eq!(lab_run_status(&escalated(None), now, None), RunStatus::Escalated);
+        // A harness error is still an error: only a COMPLETED harness can escalate.
+        assert_eq!(lab_run_status(&escalated(Some(Lc::Error)), now, None), RunStatus::Error);
+    }
+
+    /// (F2) The whole chain for a REAL provider's manifest: each provider's own
+    /// manifest writer, given a dispatch that escalated, produces a
+    /// `manifest.json` that `scan_lab_runs` reads and `run list` shows as
+    /// `escalated`. Deleting the escalation stamp from either provider's writer
+    /// leaves every hand-made-manifest test green; only this reads what the
+    /// providers actually write.
+    #[test]
+    fn a_provider_written_manifest_of_an_escalated_dispatch_reads_escalated_on_the_runs_board() {
+        use darkmux_lab::lab::dispatch_end::DispatchEnd;
+        use darkmux_lab::providers::{coding_task, prompt};
+        use darkmux_lab::workloads::types::VerifyReport;
+        let escalated = DispatchEnd::from_dispatch(
+            1,
+            r#"{"result":"escalation_compaction_reread_loop","final_assistant":"x"}"#,
+        );
+        let verify = VerifyReport { passed: false, details: "dispatch escalated".into() };
+        let session = darkmux_types::session_id::SessionId::adhoc(
+            darkmux_types::session_id::RunId::lab("w-p-1-1").unwrap(),
+            "coder",
+            "w",
+        );
+        let now = 1_700_000_000_000u64;
+        for provider in ["prompt", "coding-task"] {
+            for (end, want) in [(&escalated, RunStatus::Escalated), (&DispatchEnd::Failed, RunStatus::Error)] {
+                let tmp = TempDir::new().unwrap();
+                let run_dir = tmp.path().join("run1");
+                std::fs::create_dir_all(&run_dir).unwrap();
+                std::fs::write(
+                    run_dir.join(darkmux_lab::lab::lifecycle::LIFECYCLE_FILE),
+                    serde_json::json!({
+                        "schema_version": "1.1", "run_id": "run1", "kind": "lab", "workload": "w",
+                        "profile": "p", "started_at_ms": 1_700_000_000_000u64, "status": "complete",
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+                if provider == "prompt" {
+                    prompt::write_manifest(
+                        &run_dir,
+                        &prompt::ManifestInputs {
+                            workload_id: "w",
+                            profile_name: "p",
+                            profile_description: "",
+                            duration_ms: 1,
+                            session_id: &session,
+                            verify: Some(&verify),
+                            end,
+                        },
+                    )
+                } else {
+                    coding_task::write_manifest(
+                        &run_dir,
+                        &coding_task::ManifestInputs {
+                            workload_id: "w",
+                            profile_name: "p",
+                            profile_description: "",
+                            duration_ms: 1,
+                            session_id: &session,
+                            verify: Some(&verify),
+                            sandbox_dir: tmp.path(),
+                            final_hash: None,
+                            refused_artifacts: &[],
+                            end,
+                        },
+                    )
+                }
+                .unwrap();
+                let runs = crate::scan_lab_runs(tmp.path());
+                assert_eq!(runs.len(), 1, "{provider}: {runs:?}");
+                assert_eq!(
+                    lab_run_status(&runs[0], now, None),
+                    want,
+                    "{provider} with {end:?}: a provider's own manifest must read as the dispatch ended"
+                );
+            }
+        }
     }
 
     /// (#2494) The verify outcome rides the row and NEVER changes `status`:
@@ -7519,6 +7623,9 @@ mod tests {
             (RunKind::Mission | RunKind::Dispatch, RunStatus::Planned) => true,
             (RunKind::Mission | RunKind::Dispatch, RunStatus::Running) => true,
             (RunKind::Mission | RunKind::Dispatch, RunStatus::Complete) => true,
+            // (F10/F11) The mission envelope's `degraded` status; a dispatch
+            // is a crew-of-one mission, whose non-zero exit finalizes degraded.
+            (RunKind::Mission | RunKind::Dispatch, RunStatus::Degraded) => true,
             (RunKind::Mission | RunKind::Dispatch, RunStatus::Error) => true,
             (RunKind::Mission | RunKind::Dispatch, RunStatus::Abandoned) => true,
             (RunKind::Mission | RunKind::Dispatch, RunStatus::Unparseable) => true,
@@ -7528,9 +7635,15 @@ mod tests {
             (RunKind::Lab, RunStatus::Planned) => false,
             (RunKind::Lab, RunStatus::Running) => true,
             (RunKind::Lab, RunStatus::Complete) => true,
+            // A lab run has no mission envelope; its manifest says ok or not.
+            (RunKind::Lab, RunStatus::Degraded) => false,
             (RunKind::Lab, RunStatus::Error) => true,
             (RunKind::Lab, RunStatus::Abandoned) => true,
             (RunKind::Lab, RunStatus::Unparseable) => false,
+            // (F2) A lab run's manifest names its escalation; no mission
+            // envelope or flow terminal carries one today.
+            (RunKind::Lab, RunStatus::Escalated) => true,
+            (RunKind::Mission | RunKind::Dispatch, RunStatus::Escalated) => false,
         }
     }
 
@@ -7549,26 +7662,36 @@ mod tests {
             (RunKind::Dispatch, RunStatus::Complete) => true,
             (RunKind::Dispatch, RunStatus::Error) => true,
             (RunKind::Dispatch, RunStatus::Abandoned) => true,
-            (RunKind::Dispatch, RunStatus::Planned | RunStatus::Unparseable) => false,
+            (
+                RunKind::Dispatch,
+                RunStatus::Planned | RunStatus::Degraded | RunStatus::Unparseable | RunStatus::Escalated,
+            ) => false,
             // `flow_mission_to_run`: a peer's mission, judged only by its
             // own terminal record and its sessions' liveness. It has no
             // envelope to read here, so no Error and no Unparseable.
             (RunKind::Mission, RunStatus::Running) => true,
             (RunKind::Mission, RunStatus::Complete) => true,
             (RunKind::Mission, RunStatus::Abandoned) => true,
-            (RunKind::Mission, RunStatus::Planned | RunStatus::Error | RunStatus::Unparseable) => {
-                false
-            }
+            (
+                RunKind::Mission,
+                RunStatus::Planned
+                | RunStatus::Degraded
+                | RunStatus::Error
+                | RunStatus::Unparseable
+                | RunStatus::Escalated,
+            ) => false,
             (RunKind::Lab, _) => false,
         }
     }
 
     const ALL_KINDS: [RunKind; 3] = [RunKind::Mission, RunKind::Dispatch, RunKind::Lab];
-    const ALL_STATUSES: [RunStatus; 6] = [
+    const ALL_STATUSES: [RunStatus; 8] = [
         RunStatus::Planned,
         RunStatus::Running,
         RunStatus::Complete,
+        RunStatus::Degraded,
         RunStatus::Error,
+        RunStatus::Escalated,
         RunStatus::Abandoned,
         RunStatus::Unparseable,
     ];
@@ -7590,7 +7713,7 @@ mod tests {
             .flat_map(|k| ALL_STATUSES.iter().map(move |s| (*k, *s)))
             .filter(|(k, s)| untracked_cell_is_reachable(*k, *s))
             .count();
-        assert_eq!(tracked, 16, "tracked cells: mission 6 + dispatch 6 + lab 4");
+        assert_eq!(tracked, 19, "tracked cells: mission 7 + dispatch 7 + lab 5");
         assert_eq!(untracked, 7, "untracked cells: ghost dispatch 4 + peer mission 3");
     }
 

@@ -24,6 +24,8 @@ describe("workStatusKind — every raw status the app has maps into six kinds", 
     ["aborted", "stopped"],
     ["abandoned", "stopped"],
     ["interrupted", "stopped"],
+    // (F2) A deliberate escalation is a caution, never the error color.
+    ["escalated", "stopped"],
     ["planned", "idle"],
     ["unparseable", "idle"],
     [undefined, "idle"],

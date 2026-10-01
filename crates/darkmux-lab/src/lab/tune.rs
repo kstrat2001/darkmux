@@ -11,6 +11,7 @@
 //! See `~/.openclaw/PERFORMANCE.md` §1.4.3 (or LAB_NOTEBOOK.md §1960) for
 //! the empirical motivation behind the bimodal model.
 
+use crate::lab::dispatch_end::DispatchEnd;
 use crate::lab::run::{lab_run, RunOpts, RunOutcome};
 use anyhow::Result;
 
@@ -248,13 +249,24 @@ fn render_errored(out: &mut String, outcomes: &[RunOutcome]) {
 
 /// Failures among the `n` runs that completed.
 fn render_failures(out: &mut String, outcomes: &[RunOutcome], n: usize) {
-    let dispatch_failures = outcomes.iter().filter(|o| o.completed() && !o.ok).count();
-    let verify_failures = outcomes.iter().filter(|o| o.verify_failed()).count();
+    let dispatch_failures =
+        outcomes.iter().filter(|o| o.completed() && o.end() == DispatchEnd::Failed).count();
+    let escalations = outcomes.iter().filter(|o| o.escalation.is_some()).count();
+    // An escalated run's verify fails because the work never finished, not
+    // because the output missed: the escalation line below names it.
+    let verify_failures = outcomes.iter().filter(|o| o.verify_failed() && o.escalation.is_none()).count();
     if dispatch_failures > 0 {
         p!(
             out,
             "⚠ {dispatch_failures} of {n} dispatches failed (runtime non-zero exit) — check \
              `darkmux doctor` and individual run dirs for the trace"
+        );
+    }
+    if escalations > 0 {
+        p!(
+            out,
+            "↑ {escalations} of {n} dispatches escalated (the runtime handed the work to a higher tier; \
+             not an error)"
         );
     }
     if verify_failures > 0 {
@@ -276,12 +288,33 @@ mod tests {
             duration_ms: (secs as u128) * 1000,
             notes: vec![],
             provider_error: None,
+            escalation: None,
         }
     }
 
     fn tune_report(outcomes: Vec<RunOutcome>) -> TuneReport {
         let stats = compute_stats(&outcomes);
         TuneReport { workload: "w".into(), profile: None, outcomes, stats }
+    }
+
+    /// (F2) An escalated dispatch is not "runtime non-zero exit": it is counted
+    /// on its own line as an escalation, and only a real failure reads failed.
+    #[test]
+    fn an_escalated_run_is_not_counted_as_a_failed_dispatch() {
+        let mut esc = outcome(8);
+        esc.ok = false;
+        esc.verify_passed = Some(false);
+        esc.escalation = Some("escalation_compaction_reread_loop".into());
+        let mut out = String::new();
+        render_failures(&mut out, &[esc.clone(), outcome(9)], 2);
+        assert!(!out.contains("failed") && !out.contains("non-zero"), "{out}");
+        assert!(out.contains("1 of 2 dispatches escalated"), "{out}");
+        let mut failed = outcome(7);
+        failed.ok = false;
+        let mut both = String::new();
+        render_failures(&mut both, &[esc, failed], 2);
+        assert!(both.contains("1 of 2 dispatches failed (runtime non-zero exit)"), "{both}");
+        assert!(both.contains("1 of 2 dispatches escalated"), "{both}");
     }
 
     /// The whole report for a tight two-run set, byte for byte.

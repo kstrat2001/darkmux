@@ -162,6 +162,16 @@ describe("RunsBoard", () => {
     expect(badge).toHaveClass("wstatus", "is-idle", "s-unparseable");
   });
 
+  /** (F10/F11) A cut-off or partial run is `degraded`, never `complete`: its
+   *  badge says so, in the same caution color `stopped` and `escalated` use. */
+  it("renders the degraded status badge in the caution color, with its own word", async () => {
+    mockFetch(true, true, {}, [{ id: "m-cut", kind: "mission", status: "degraded", tracked: true, updated_ts: 400 }]);
+    renderBoard();
+    await waitFor(() => expect(screen.getByText("m-cut")).toBeInTheDocument());
+    const badge = screen.getByText("degraded");
+    expect(badge).toHaveClass("wstatus", "is-degraded", "s-degraded");
+  });
+
   /** (#1907) The badge's CLASS stays keyed on `run.status` (so the dim
    *  `.labbadge.abandoned` styling is unchanged) but its TEXT now reads
    *  `abandoned_reason` — a deliberate `mission abort` renders "aborted";

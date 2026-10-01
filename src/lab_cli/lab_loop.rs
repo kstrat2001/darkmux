@@ -182,22 +182,30 @@ fn run_arm(args: &LabLoopArgs, plan: &LoopPlan, inject: Option<String>) -> Resul
         .into_iter()
         .next()
         .ok_or_else(|| anyhow::anyhow!("loop lab produced no run outcome"))?;
+    analyze_outcome(&outcome, plan.loop_config.clone())
+}
+
+/// The loop report for one finished lab run. How its dispatch ended comes from
+/// [`RunOutcome::end`], so an escalation reads as one (F2), never as the
+/// `Failed` that `ok == false` alone would give it.
+fn analyze_outcome(outcome: &darkmux_lab::lab::run::RunOutcome, loop_config: Vec<String>) -> Result<LoopReport> {
     loop_report::analyze_run(
         &outcome.run_dir,
         &outcome.run_id,
-        outcome.ok,
+        &outcome.end(),
         outcome.verify_passed,
         outcome.duration_ms,
-        plan.loop_config.clone(),
+        loop_config,
     )
 }
 
 /// Exit 0 when the loop achieved the task (productive or struggled through);
-/// 1 when it failed or, critically, falsely passed while inert.
+/// 1 when it did not: it failed, falsely passed while inert, or escalated (an
+/// escalation is not an error, but the task is unfinished, so it is no pass).
 fn verdict_exit(v: Verdict) -> i32 {
     match v {
         Verdict::Productive | Verdict::Struggled => 0,
-        Verdict::InertFalsePass | Verdict::Failed => 1,
+        Verdict::InertFalsePass | Verdict::Failed | Verdict::Escalated => 1,
     }
 }
 
@@ -288,7 +296,7 @@ fn verdict_rank(v: Verdict) -> u8 {
         Verdict::Productive => 3,
         Verdict::Struggled => 2,
         Verdict::InertFalsePass => 1,
-        Verdict::Failed => 0,
+        Verdict::Failed | Verdict::Escalated => 0,
     }
 }
 
@@ -483,6 +491,7 @@ mod tests {
         assert_eq!(verdict_exit(Verdict::Struggled), 0);
         assert_eq!(verdict_exit(Verdict::InertFalsePass), 1);
         assert_eq!(verdict_exit(Verdict::Failed), 1);
+        assert_eq!(verdict_exit(Verdict::Escalated), 1);
     }
 
     #[test]
@@ -490,6 +499,25 @@ mod tests {
         let (failed, productive) = (report("a", Verdict::Failed), report("b", Verdict::Productive));
         assert_eq!(ab_exit(&failed, &productive), 0, "Failed -> Productive ships a passing config");
         assert_eq!(ab_exit(&productive, &failed), 1, "Productive -> Failed ships a failing one");
+    }
+
+    /// (F2) A lab run whose dispatch escalated reaches the loop report as an
+    /// escalation, through the function `run_arm` calls.
+    #[test]
+    fn an_escalated_lab_run_reports_escalated_not_failed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outcome = darkmux_lab::lab::run::RunOutcome {
+            run_id: "r".into(),
+            run_dir: tmp.path().to_path_buf(),
+            ok: false,
+            verify_passed: Some(false),
+            duration_ms: 1,
+            notes: vec![],
+            provider_error: None,
+            escalation: Some("escalation_compaction_reread_loop".into()),
+        };
+        let report = analyze_outcome(&outcome, vec![]).unwrap();
+        assert_eq!(report.verdict, Verdict::Escalated);
     }
 
     #[test]
@@ -513,6 +541,7 @@ mod tests {
             run_id: run_id.to_string(),
             verdict,
             dispatch_ok: true,
+            escalation: None,
             verify_passed: None,
             sandbox_changed: None,
             tool_calls: 0,

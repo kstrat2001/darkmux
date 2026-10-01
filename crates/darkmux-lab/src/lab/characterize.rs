@@ -9,6 +9,7 @@
 //! distribution. For now this is a thin polish layer over a single dispatch
 //! so a fresh user can answer *"does my Mac handle this?"* with one command.
 
+use crate::lab::dispatch_end::DispatchEnd;
 use crate::lab::run::{lab_run, RunOpts, RunOutcome};
 use anyhow::Result;
 
@@ -56,7 +57,11 @@ pub(crate) fn render_report(r: &CharacterizeReport) -> String {
     p!(out, "darkmux characterize — workload `{}`", r.workload);
     p!(out);
     for o in &r.outcomes {
-        let status = if o.ok { "✓" } else { "✗" };
+        let status = match o.end() {
+            DispatchEnd::Completed => "✓",
+            DispatchEnd::Escalated { .. } => "↑",
+            DispatchEnd::Failed => "✗",
+        };
         p!(out, "  {} {} — {}", status, o.run_id, format_seconds(o.duration_ms));
         for note in &o.notes {
             p!(out, "      {note}");
@@ -80,17 +85,25 @@ pub(crate) fn render_report(r: &CharacterizeReport) -> String {
     out
 }
 
-/// The one-line verdict: a failed or errored dispatch dominates a failed
+/// The one-line verdict: a failed or errored dispatch dominates an escalated
+/// one, which dominates a failed
 /// verify, which dominates the wall-clock read of the runs that completed.
 /// `None` when there were no runs.
 fn verdict(outcomes: &[RunOutcome]) -> Option<String> {
     if outcomes.is_empty() {
         return None;
     }
-    if outcomes.iter().any(|o| !o.ok) {
+    if outcomes.iter().any(|o| o.end() == DispatchEnd::Failed) {
         return Some(
             "at least one dispatch failed — inspect `darkmux run inspect <run-id>` \
              and check `darkmux doctor` for setup problems"
+                .to_string(),
+        );
+    }
+    if outcomes.iter().any(|o| o.escalation.is_some()) {
+        return Some(
+            "at least one dispatch escalated: the runtime stopped on purpose and handed the work \
+             to a higher tier. Not an error; `darkmux run inspect <run-id>` names the reason"
                 .to_string(),
         );
     }
@@ -156,6 +169,7 @@ mod tests {
             duration_ms: secs * 1000,
             notes: vec!["provider=stub".into()],
             provider_error: None,
+            escalation: None,
         }
     }
 
@@ -188,6 +202,24 @@ mod tests {
         assert!(verify.contains("BUT the workload's verify check failed"), "{verify}");
         assert!(v(vec![outcome("a", true, None, 20)]).starts_with("ok — "));
         assert_eq!(verdict(&[]), None);
+    }
+
+    /// (F2) A deliberate escalation is not a failure: not marked failed, and
+    /// the verdict says the runtime handed the work up, never "dispatch failed".
+    /// A real failure beside it still dominates the verdict.
+    #[test]
+    fn an_escalated_run_is_not_marked_failed_and_the_verdict_says_escalated() {
+        let mut esc = outcome("e", false, Some(false), 1);
+        esc.escalation = Some("escalation_compaction_reread_loop".into());
+        let text = render_report(&report(vec![esc.clone()]));
+        // flow-action-guard:allow: report prose this test asserts is absent, not a flow action
+        assert!(!text.contains('✗') && !text.contains("dispatch failed"), "{text}");
+        assert!(text.contains("  ↑ e — 1s\n"), "{text}");
+        let v = verdict(&[esc.clone()]).unwrap();
+        assert!(v.starts_with("at least one dispatch escalated"), "{v}");
+        assert!(!v.contains("failed"), "{v}");
+        let both = verdict(&[esc, outcome("f", false, None, 1)]).unwrap();
+        assert!(both.starts_with("at least one dispatch failed"), "{both}");
     }
 
     /// Several runs: a failed dispatch is marked, and there is no re-run

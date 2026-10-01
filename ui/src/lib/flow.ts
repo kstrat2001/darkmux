@@ -264,8 +264,12 @@ export function statusLabel(state: RunState): string {
       return "running";
     case "complete":
       return "complete";
+    case "degraded":
+      return "degraded";
     case "error":
       return state.killed ? "killed" : "errored";
+    case "escalated":
+      return "escalated";
     case "abandoned":
       return state.abandonReason === "aborted" ? "aborted" : "no ending recorded";
     case "unparseable":

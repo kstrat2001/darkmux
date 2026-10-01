@@ -47,6 +47,13 @@ lifecycle_status?: LifecycleStatus,
  */
 run_ok?: boolean, 
 /**
+ * (F2) `manifest.json`'s `escalation`: the runtime's `escalation_*`
+ * result when the dispatch stopped on purpose and handed the work to a
+ * higher tier. `run_ok` is false then; this is what tells an escalation
+ * from an error. `None` when the run did not escalate.
+ */
+escalation?: string, 
+/**
  * `manifest.json`'s `workload`: what the run dispatched.
  */
 workload?: string, 

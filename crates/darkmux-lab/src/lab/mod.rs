@@ -18,6 +18,7 @@ pub mod bundle;
 pub mod characterize;
 pub mod compare;
 pub mod cow_clone;
+pub mod dispatch_end;
 // (#1222) Dialectic (adversarial) review orchestration — review-bench's
 // prosecutor → defender → judge mode.
 pub mod dialectic;

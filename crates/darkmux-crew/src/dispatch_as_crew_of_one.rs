@@ -50,7 +50,7 @@
 
 use crate::dispatch::{DispatchOpts, DispatchResult};
 use darkmux_types::session_id::{RunId, SessionId};
-use crate::envelope::{MissionEnvelope, MissionOutcomeStatus};
+use crate::envelope::{MissionEnvelope, MissionOutcomeStatus, RunTally};
 use crate::lifecycle;
 use crate::step_kinds::{FixedEstimator, RawDispatchOutcome, StepKindRegistry};
 use crate::types::{Mission, MissionSpec, MissionStatus, NodeStatus, Phase, PhaseStatus, Step, Task};
@@ -245,8 +245,11 @@ pub(crate) fn dispatch_as_crew_of_one_with(
             // same as `Clean`. `Error` is reserved for the two arms below,
             // where the step itself never produced a `RawDispatchOutcome` at
             // all.
-            let status =
-                if result.exit_code == 0 { MissionOutcomeStatus::Clean } else { MissionOutcomeStatus::Degraded };
+            let status = MissionOutcomeStatus::decide(&RunTally {
+                completed: 1,
+                degraded: usize::from(result.exit_code != 0),
+                ..Default::default()
+            });
             finalize(&mission_id, &phase_id, status, step_result_reason(result.exit_code));
             Ok(result)
         }

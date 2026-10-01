@@ -2201,6 +2201,13 @@ pub struct LabRunSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub(crate) run_ok: Option<bool>,
+    /// (F2) `manifest.json`'s `escalation`: the runtime's `escalation_*`
+    /// result when the dispatch stopped on purpose and handed the work to a
+    /// higher tier. `run_ok` is false then; this is what tells an escalation
+    /// from an error. `None` when the run did not escalate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub(crate) escalation: Option<String>,
     /// `manifest.json`'s `workload`: what the run dispatched.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
@@ -2622,6 +2629,10 @@ fn build_lab_run_summary(
         has_events,
         session_id,
         run_ok,
+        escalation: manifest
+            .as_ref()
+            .and_then(|v| v.get(darkmux_lab::lab::dispatch_end::MANIFEST_ESCALATION_KEY))
+            .and_then(|e| e.as_str().map(str::to_string)),
         workload: manifest
             .as_ref()
             .and_then(|v| v.get("workload").and_then(|w| w.as_str()).map(str::to_string)),

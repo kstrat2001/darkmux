@@ -552,6 +552,7 @@ LoopReport
   run_id: string
   verdict: Verdict
   dispatch_ok: boolean
+  escalation?: string | null
   verify_passed: boolean | null
   sandbox_changed: boolean | null
   tool_calls: uint32
@@ -974,7 +975,7 @@ RunStats
   flow_records_in_window: uint
   flow_scan: FlowScan
   checks: RunChecks
-RunStatus = "planned" | "running" | "complete" | "error" | "abandoned" | "unparseable"
+RunStatus = "planned" | "running" | "complete" | "error" | "abandoned" | "degraded" | "escalated" | "unparseable"
 RuntimeBounds
   max_tokens_per_call: Knob
   inactivity_timeout_seconds: Knob
@@ -1178,7 +1179,7 @@ UtilityModel
   id: string
   loaded: boolean
   n_ctx: uint32 | null
-Verdict = "productive" | "struggled" | "inert-false-pass" | "failed"
+Verdict = "productive" | "struggled" | "inert-false-pass" | "failed" | "escalated"
 VerdictShift = "improved" | "regressed" | "no-change"
 VersionSource = "peer" | "presence" | "unknown"
 

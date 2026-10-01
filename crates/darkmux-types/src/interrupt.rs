@@ -154,6 +154,12 @@ pub fn install_hup() {
     }
 }
 
+/// The phrase every dispatch error carries when an operator signal (or the
+/// wall-clock bound, which raises the same flag) killed it mid-flight. A step
+/// whose error contains it ended BECAUSE of the interrupt, not for a reason of
+/// its own; `mission_launch` reads it to tell the two apart.
+pub const INTERRUPTED_BY_SIGNAL: &str = "interrupted by an operator signal";
+
 /// Whether SIGINT, SIGTERM, or SIGHUP has been received since [`install`]/
 /// [`install_term`]/[`install_hup`] was called. Never resets — see the
 /// module doc.

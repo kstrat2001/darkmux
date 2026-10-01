@@ -4,8 +4,9 @@
 //! Dispatches via darkmux's in-house internal runtime.
 
 use darkmux_types::Profile;
+use crate::lab::dispatch_end::{DispatchEnd, Dispatched};
 use crate::workloads::types::{
-    InspectionReport, LoadedWorkload, RunResult, VerifyOutcome, WorkloadProvider,
+    InspectionReport, LoadedWorkload, RunResult, VerifyOutcome, VerifyReport, WorkloadProvider,
 };
 use anyhow::{anyhow, Context, Result};
 use darkmux_types::session_id::{RunId, SessionId};
@@ -59,7 +60,7 @@ impl WorkloadProvider for PromptProvider {
         on_session_id(&session_id);
 
         let started = std::time::Instant::now();
-        let (stdout, stderr, ok) = dispatch_via_internal(
+        let dispatched = dispatch_via_internal(
             &role,
             &prompt,
             &session_id,
@@ -67,59 +68,17 @@ impl WorkloadProvider for PromptProvider {
             config_path,
             profile_name,
         )?;
-        let duration_ms = started.elapsed().as_millis();
-
-        fs::write(run_dir.join("qa-reply.json"), &stdout)?;
-        if !stderr.is_empty() {
-            fs::write(run_dir.join("qa-reply.err"), &stderr)?;
-        }
-
-        let reply = extract_reply_text(&stdout);
-        let verify = run_verify(loaded, &reply);
-
-        let run_id = run_dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("")
-            .to_string();
-        let manifest_json = serde_json::json!({
-            // v2 added: run_id, profile (now the profile NAME), profile_description.
-            // v1 had: session_id, profile (was the description text), workload, provider, duration_ms, ok.
-            // v5 added: verify, the same field and version as the coding-task
-            // manifest (#2494). `null` is "not checked": the workload declares
-            // no verify. `darkmux run list` and `/runs` read `verify.passed`
-            // from here to show a failed verify beside a good dispatch.
-            "schema_version": 5,
-            "run_id": run_id,
-            "workload": loaded.manifest.workload.id,
-            "provider": self.id(),
-            "profile": profile_name,
-            "profile_description": profile.description.clone().unwrap_or_default(),
-            "duration_ms": duration_ms,
-            "ok": ok,
-            "session_id": session_id,
-            "verify": verify.as_ref().map(|v| serde_json::json!({
-                "passed": v.passed,
-                "details": v.details,
-            })),
-        });
-        fs::write(
-            run_dir.join("manifest.json"),
-            serde_json::to_string_pretty(&manifest_json)?,
-        )?;
-
-        Ok(RunResult {
-            ok,
-            duration_ms,
-            payload_text: Some(reply),
-            trajectory_path: None,
-            verify,
-            error: if ok {
-                None
-            } else {
-                Some(format!("runtime exit: {stderr}"))
+        finish_run(
+            &FinishInputs {
+                loaded,
+                run_dir,
+                profile,
+                profile_name,
+                session_id: &session_id,
+                duration_ms: started.elapsed().as_millis(),
             },
-        })
+            &dispatched,
+        )
     }
 
     fn inspect(&self, loaded: &LoadedWorkload, run_dir: &Path) -> Result<InspectionReport> {
@@ -165,9 +124,104 @@ impl WorkloadProvider for PromptProvider {
                 passed: v.passed,
                 details: v.details.clone(),
             }),
-            notes: vec![format!("provider={}", self.id()), verify_note(verify_outcome.as_ref())],
+            notes: [format!("provider={}", self.id()), verify_note(verify_outcome.as_ref())]
+                .into_iter()
+                .chain(DispatchEnd::inspect_note(&meta))
+                .collect(),
         })
     }
+}
+
+/// What `finish_run` needs besides the dispatch itself.
+pub(crate) struct FinishInputs<'a> {
+    pub loaded: &'a LoadedWorkload,
+    pub run_dir: &'a Path,
+    pub profile: &'a Profile,
+    pub profile_name: &'a str,
+    pub session_id: &'a SessionId,
+    pub duration_ms: u128,
+}
+
+/// Everything after the dispatch: persist its output, verify the reply, write
+/// the manifest and build the result. How the dispatch ended is derived HERE
+/// from the raw dispatch (never passed in), so an escalation reaches the
+/// manifest and the result, and a test can drive this without a runtime.
+pub(crate) fn finish_run(f: &FinishInputs<'_>, d: &Dispatched) -> Result<RunResult> {
+    let end = d.end();
+    fs::write(f.run_dir.join("qa-reply.json"), &d.stdout)?;
+    if !d.stderr.is_empty() {
+        fs::write(f.run_dir.join("qa-reply.err"), &d.stderr)?;
+    }
+    let reply = extract_reply_text(&d.stdout);
+    let verify = run_verify(f.loaded, &reply);
+    let recorded_verify =
+        verify.as_ref().map(|v| VerifyReport { passed: v.passed, details: v.details.clone() });
+    write_manifest(
+        f.run_dir,
+        &ManifestInputs {
+            workload_id: &f.loaded.manifest.workload.id,
+            profile_name: f.profile_name,
+            profile_description: f.profile.description.as_deref().unwrap_or_default(),
+            duration_ms: f.duration_ms,
+            session_id: f.session_id,
+            verify: recorded_verify.as_ref(),
+            end: &end,
+        },
+    )?;
+    Ok(RunResult {
+        escalation: end.escalation().map(str::to_string),
+        ok: end.ok(),
+        duration_ms: f.duration_ms,
+        payload_text: Some(reply),
+        trajectory_path: None,
+        verify,
+        error: d.error(),
+    })
+}
+
+/// What a prompt run's `manifest.json` records, gathered after the dispatch so
+/// the manifest can be built and written without one (F2).
+pub struct ManifestInputs<'a> {
+    pub workload_id: &'a str,
+    pub profile_name: &'a str,
+    pub profile_description: &'a str,
+    pub duration_ms: u128,
+    pub session_id: &'a SessionId,
+    pub verify: Option<&'a VerifyReport>,
+    /// How the dispatch ended; stamped onto the manifest so an escalation
+    /// reads as one on every surface that reads `manifest.json`.
+    pub end: &'a DispatchEnd,
+}
+
+/// Build and write this run's `manifest.json`: the one place the prompt
+/// provider records a run, including the dispatch's escalation.
+pub fn write_manifest(run_dir: &Path, m: &ManifestInputs<'_>) -> Result<()> {
+    let run_id = run_dir.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+    let mut manifest_json = serde_json::json!({
+        // v2 added: run_id, profile (now the profile NAME), profile_description.
+        // v1 had: session_id, profile (was the description text), workload, provider, duration_ms, ok.
+        // v5 added: verify, the same field and version as the coding-task
+        // manifest (#2494). `null` is "not checked": the workload declares
+        // no verify. `darkmux run list` and `/runs` read `verify.passed`
+        // from here to show a failed verify beside a good dispatch.
+        // v6 (F2) may carry `escalation`, as in the coding-task manifest.
+        "schema_version": 6,
+        "run_id": run_id,
+        "workload": m.workload_id,
+        "provider": PromptProvider.id(),
+        "profile": m.profile_name,
+        "profile_description": m.profile_description,
+        "duration_ms": m.duration_ms,
+        "ok": m.end.ok(),
+        "session_id": m.session_id,
+        "verify": m.verify.map(|v| serde_json::json!({
+            "passed": v.passed,
+            "details": v.details,
+        })),
+    });
+    m.end.record_in(&mut manifest_json);
+    fs::write(run_dir.join("manifest.json"), serde_json::to_string_pretty(&manifest_json)?)?;
+    Ok(())
 }
 
 /// Dispatch via darkmux's internal Docker-bounded runtime through the
@@ -181,7 +235,7 @@ fn dispatch_via_internal(
     image: Option<&str>,
     config_path: Option<&str>,
     profile_name: &str,
-) -> Result<(String, String, bool)> {
+) -> Result<Dispatched> {
     use darkmux_crew::dispatch::{dispatch, DispatchOpts};
     let opts = DispatchOpts {
         // (#2914) The lab benchmarks candidate utility models.
@@ -230,7 +284,7 @@ fn dispatch_via_internal(
         system_prompt_override: None,
     };
     let result = dispatch(opts).context("internal-runtime dispatch via lab harness")?;
-    Ok((result.stdout, result.stderr, result.exit_code == 0))
+    Ok(Dispatched { exit_code: result.exit_code, stdout: result.stdout, stderr: result.stderr })
 }
 
 fn resolve_prompt(loaded: &LoadedWorkload) -> Result<String> {
@@ -425,6 +479,71 @@ mod tests {
             chain_depths: None,
             seed: None,
             extras: BTreeMap::new(),
+        }
+    }
+
+    /// (F2) `run inspect` names an escalation the provider's own manifest
+    /// recorded, and says nothing for a run that did not escalate: the
+    /// provider's `inspect` must read the key its own writer stamps.
+    /// (F2) The value a provider records comes from the dispatch itself: an
+    /// escalated dispatch (non-zero exit, escalation envelope) reaches both the
+    /// result and `manifest.json`, and is not an error; a plain failure is one.
+    #[test]
+    fn finish_run_records_how_the_dispatch_ended_from_the_dispatch_itself() {
+        let tmp = TempDir::new().unwrap();
+        let loaded = make_loaded(spec_with_prompt("hi"), tmp.path().to_path_buf());
+        let profile = darkmux_types::Profile::default();
+        let session = SessionId::adhoc(RunId::lab("run1").unwrap(), "coder", "w");
+        let cases = [
+            (1, r#"{"result":"escalation_compaction_reread_loop"}"#, false, Some("escalation_compaction_reread_loop"), false),
+            (1, r#"{"result":"error"}"#, false, None, true),
+            (0, r#"{"result":"stop"}"#, true, None, false),
+        ];
+        for (i, (exit_code, stdout, ok, escalation, errored)) in cases.into_iter().enumerate() {
+            let run_dir = tmp.path().join(format!("run{i}"));
+            fs::create_dir_all(&run_dir).unwrap();
+            let d = Dispatched { exit_code, stdout: stdout.into(), stderr: "boom".into() };
+            let r = finish_run(&FinishInputs { loaded: &loaded, run_dir: &run_dir, profile: &profile, profile_name: "p", session_id: &session, duration_ms: 1 }, &d).unwrap();
+            assert_eq!(r.ok, ok, "case {i}");
+            assert_eq!(r.escalation.as_deref(), escalation, "case {i}");
+            assert_eq!(r.error.is_some(), errored, "case {i}: an escalation is not an error");
+            let manifest: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(run_dir.join("manifest.json")).unwrap()).unwrap();
+            assert_eq!(manifest["ok"], ok, "case {i}");
+            assert_eq!(manifest.get("escalation").and_then(|e| e.as_str()), escalation, "case {i}");
+        }
+    }
+
+    #[test]
+    fn inspect_names_the_escalation_the_providers_own_manifest_recorded() {
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run1");
+        fs::create_dir_all(&run_dir).unwrap();
+        let loaded = make_loaded(spec_with_prompt("hi"), tmp.path().to_path_buf());
+        let session = SessionId::adhoc(RunId::lab("run1").unwrap(), "coder", "w");
+        for (end, want) in [
+            (
+                DispatchEnd::Escalated { reason: "escalation_compaction_reread_loop".into() },
+                Some("outcome=escalated (escalation_compaction_reread_loop)"),
+            ),
+            (DispatchEnd::Failed, None),
+        ] {
+            write_manifest(
+                &run_dir,
+                &ManifestInputs {
+                    workload_id: "w",
+                    profile_name: "p",
+                    profile_description: "",
+                    duration_ms: 1,
+                    session_id: &session,
+                    verify: None,
+                    end: &end,
+                },
+            )
+            .unwrap();
+            let notes = PromptProvider.inspect(&loaded, &run_dir).unwrap().notes;
+            let found = notes.iter().find(|n| n.starts_with("outcome=")).map(String::as_str);
+            assert_eq!(found, want, "{notes:?}");
         }
     }
 

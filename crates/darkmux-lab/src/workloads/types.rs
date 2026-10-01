@@ -270,6 +270,23 @@ pub(crate) struct RunResult {
     pub trajectory_path: Option<std::path::PathBuf>,
     pub verify: Option<VerifyOutcome>,
     pub error: Option<String>,
+    /// (F2) The runtime's own `escalation_*` result when the dispatch stopped
+    /// on purpose to hand the work to a higher tier. `ok` is false then, but
+    /// `error` stays `None`: an escalation is not an error.
+    pub escalation: Option<String>,
+}
+
+impl RunResult {
+    /// How this run's dispatch ended, for the surfaces that must tell an
+    /// escalation from an error.
+    pub(crate) fn end(&self) -> crate::lab::dispatch_end::DispatchEnd {
+        use crate::lab::dispatch_end::DispatchEnd;
+        match (&self.escalation, self.ok) {
+            (Some(reason), _) => DispatchEnd::Escalated { reason: reason.clone() },
+            (None, true) => DispatchEnd::Completed,
+            (None, false) => DispatchEnd::Failed,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]

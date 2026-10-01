@@ -104,11 +104,12 @@ pub struct SetSummary {
 
 /// The flag for the runtime's own terminal result, if it names one.
 fn result_flag(result: Option<&str>) -> Option<&'static str> {
-    match result {
-        Some("error") => Some("RUNTIME-ERROR"),
-        Some(darkmux_trajectory::RESULT_INTERRUPTED) => Some("INTERRUPTED"),
-        Some(r) if r.starts_with("escalation") => Some("ESCALATED"),
-        _ => None,
+    use darkmux_trajectory::TerminalResult;
+    match TerminalResult::parse(result?) {
+        TerminalResult::Error => Some("RUNTIME-ERROR"),
+        TerminalResult::Interrupted => Some("INTERRUPTED"),
+        TerminalResult::Escalated => Some("ESCALATED"),
+        TerminalResult::Stop | TerminalResult::MaxTurns | TerminalResult::Other => None,
     }
 }
 

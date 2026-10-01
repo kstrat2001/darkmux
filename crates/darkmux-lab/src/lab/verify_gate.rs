@@ -47,6 +47,7 @@
 use crate::lab::fixture::FixtureManifest;
 use anyhow::{anyhow, Context, Result};
 use serde_json::json;
+use crate::lab::dispatch_end::DispatchEnd;
 use std::fs;
 use std::path::Path;
 
@@ -54,10 +55,10 @@ use std::path::Path;
 /// no path or file-format knowledge lives in [`evaluate`].
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct WorkGateInput {
-    /// Did the dispatch itself complete without a runtime/transport error?
-    /// (`RunOutcome::ok` / the provider's `RunResult::ok` — the same flag
-    /// the #2833 issue's headline example recorded as `false`.)
-    pub dispatch_ok: bool,
+    /// How the dispatch itself ended (F2): completed, escalated on purpose,
+    /// or failed with a runtime/transport error. `Completed` is the flag the
+    /// #2833 issue's headline example recorded as `ok: false` when it failed.
+    pub dispatch: DispatchEnd,
     /// `final_hash != baseline_hash`. `None` when either hash is
     /// unavailable — treated as "cannot confirm", which fails the gate
     /// rather than assuming either direction.
@@ -117,9 +118,37 @@ fn fail(details: impl Into<String>) -> WorkGateResult {
     }
 }
 
+/// Why the gate fails before any test count is read, or `None` when every
+/// precondition holds: how the dispatch ended (an escalation is named, never
+/// a transport error), a tampered verify command, and whether the sandbox
+/// changed at all.
+fn precondition_failure(input: &WorkGateInput) -> Option<String> {
+    let reason = match (&input.dispatch, &input.command_tampered, input.sandbox_changed) {
+        // (F2) A deliberate hand-off, not a transport error: the work is
+        // unfinished, so the gate does not credit it, but it says why.
+        (DispatchEnd::Escalated { reason }, _, _) => format!(
+            "dispatch escalated ({reason}) before finishing the work — the work gate does \
+             not credit unfinished work"
+        ),
+        (DispatchEnd::Failed, _, _) => "dispatch did not complete cleanly (runtime/transport \
+             error) — cannot confirm any work was done"
+            .to_string(),
+        (DispatchEnd::Completed, Some(reason), _) => format!("verify command altered: {reason}"),
+        (DispatchEnd::Completed, None, Some(false)) => "no work: the sandbox is unchanged from \
+             the fixture's baseline (a no-op run cannot pass)"
+            .to_string(),
+        (DispatchEnd::Completed, None, None) => "no baseline/final sandbox hash recorded — \
+             cannot confirm whether the sandbox changed"
+            .to_string(),
+        (DispatchEnd::Completed, None, Some(true)) => return None,
+    };
+    Some(reason)
+}
+
 /// The pure decision. Order matters — earlier branches dominate, same
 /// discipline as `crate::lab::loop_report::classify`:
-///   1. `!dispatch_ok` -> fail (nothing else is trustworthy).
+///   1. the dispatch did not complete -> fail (nothing else is trustworthy);
+///      an escalation says so rather than claiming a transport error.
 ///   2. `command_tampered.is_some()` -> fail (the verify command itself was
 ///      edited; every downstream signal is now untrustworthy).
 ///   3. `sandbox_changed != Some(true)` -> fail ("no work" — covers both the
@@ -131,31 +160,8 @@ fn fail(details: impl Into<String>) -> WorkGateResult {
 ///   7. a declared coverage threshold not met (or unmeasurable) -> fail.
 ///   8. otherwise -> pass.
 pub fn evaluate(input: &WorkGateInput) -> WorkGateResult {
-    if !input.dispatch_ok {
-        return fail(
-            "dispatch did not complete cleanly (runtime/transport error) — \
-             cannot confirm any work was done",
-        );
-    }
-
-    if let Some(reason) = &input.command_tampered {
-        return fail(format!("verify command altered: {reason}"));
-    }
-
-    match input.sandbox_changed {
-        Some(true) => {}
-        Some(false) => {
-            return fail(
-                "no work: the sandbox is unchanged from the fixture's baseline \
-                 (a no-op run cannot pass)",
-            )
-        }
-        None => {
-            return fail(
-                "no baseline/final sandbox hash recorded — cannot confirm whether \
-                 the sandbox changed",
-            )
-        }
+    if let Some(reason) = precondition_failure(input) {
+        return fail(reason);
     }
 
     let Some(passed_now) = input.tests_passed else {
@@ -575,7 +581,7 @@ fn run_full_gate(
     run_dir: &Path,
     source_sandbox_dir: &Path,
     per_run_sandbox_dir: &Path,
-    dispatch_ok: bool,
+    dispatch: DispatchEnd,
     baseline_test_count: u64,
     coverage_min_pct: Option<f32>,
 ) -> Result<Option<WorkGateResult>> {
@@ -622,7 +628,7 @@ fn run_full_gate(
     let command_tampered = detect_command_tampering(source_sandbox_dir, per_run_sandbox_dir);
 
     let input = WorkGateInput {
-        dispatch_ok,
+        dispatch,
         sandbox_changed,
         baseline_test_count,
         tests_passed: summary.map(|s| s.pass),
@@ -711,7 +717,7 @@ pub fn apply(
     run_dir: &Path,
     source_sandbox_dir: &Path,
     per_run_sandbox_dir: &Path,
-    dispatch_ok: bool,
+    dispatch: DispatchEnd,
     coverage_min_pct: Option<f32>,
 ) -> Result<Option<WorkGateResult>> {
     match fixture_baseline_declaration(source_sandbox_dir) {
@@ -736,7 +742,7 @@ pub fn apply(
             run_dir,
             source_sandbox_dir,
             per_run_sandbox_dir,
-            dispatch_ok,
+            dispatch,
             baseline_test_count,
             coverage_min_pct,
         ),
@@ -750,7 +756,7 @@ mod tests {
 
     fn base_input() -> WorkGateInput {
         WorkGateInput {
-            dispatch_ok: true,
+            dispatch: DispatchEnd::Completed,
             sandbox_changed: Some(true),
             baseline_test_count: 14,
             tests_passed: Some(22),
@@ -847,7 +853,7 @@ mod tests {
         // The #2833 issue's own headline example: `ok: false`, hashes
         // identical, verify's raw exit code still 0.
         let input = WorkGateInput {
-            dispatch_ok: false,
+            dispatch: DispatchEnd::Failed,
             sandbox_changed: Some(false),
             tests_passed: Some(14),
             tests_total: Some(14),
@@ -861,6 +867,21 @@ mod tests {
             "got: {}",
             r.details
         );
+    }
+
+    /// (F2, 5.0 dogfood) An escalation exits non-zero, which this gate used to
+    /// call a runtime/transport error. It fails (the work is unfinished) but
+    /// names the escalation and its reason.
+    #[test]
+    fn an_escalated_dispatch_fails_as_an_escalation_never_a_transport_error() {
+        let input = WorkGateInput {
+            dispatch: DispatchEnd::Escalated { reason: "escalation_compaction_reread_loop".into() },
+            ..base_input()
+        };
+        let r = evaluate(&input);
+        assert!(!r.passed);
+        assert!(r.details.contains("escalated") && r.details.contains("escalation_compaction_reread_loop"), "{}", r.details);
+        assert!(!r.details.contains("transport"), "{}", r.details);
     }
 
     #[test]
@@ -1281,7 +1302,7 @@ mod tests {
             run.path(),
             r#"{"schema_version":5,"verify":{"passed":true,"details":"verify command exited 0"}}"#,
         );
-        apply(run.path(), fixture.path(), sandbox.path(), true, None).unwrap();
+        apply(run.path(), fixture.path(), sandbox.path(), DispatchEnd::Completed, None).unwrap();
         let raw = fs::read_to_string(run.path().join("manifest.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         // Untouched: still the raw provider-written shape, no work_gate.
@@ -1299,7 +1320,7 @@ mod tests {
             run.path(),
             r#"{"schema_version":5,"verify":{"passed":true,"details":"verify command exited 0"}}"#,
         );
-        apply(run.path(), fixture.path(), sandbox.path(), true, Some(90.0)).unwrap();
+        apply(run.path(), fixture.path(), sandbox.path(), DispatchEnd::Completed, Some(90.0)).unwrap();
         let raw = fs::read_to_string(run.path().join("manifest.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         // `passed` unchanged (not gated)...
@@ -1332,7 +1353,7 @@ mod tests {
             SPEC_REPORTER_OUTPUT.replace("22", "14"),
         )
         .unwrap();
-        apply(run.path(), fixture.path(), fixture.path(), true, None).unwrap();
+        apply(run.path(), fixture.path(), fixture.path(), DispatchEnd::Completed, None).unwrap();
         let raw = fs::read_to_string(run.path().join("manifest.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(v["verify"]["passed"], false);
@@ -1353,7 +1374,7 @@ mod tests {
                "verify":{"passed":true,"details":"verify command exited 0"}}"#,
         );
         fs::write(run.path().join("verify-output.txt"), SPEC_REPORTER_OUTPUT).unwrap();
-        apply(run.path(), fixture.path(), fixture.path(), true, None).unwrap();
+        apply(run.path(), fixture.path(), fixture.path(), DispatchEnd::Completed, None).unwrap();
         let raw = fs::read_to_string(run.path().join("manifest.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(v["verify"]["passed"], true);
@@ -1387,7 +1408,7 @@ mod tests {
 ℹ duration_ms 40.0
 ";
         fs::write(run.path().join("verify-output.txt"), output).unwrap();
-        apply(run.path(), fixture.path(), fixture.path(), true, None).unwrap();
+        apply(run.path(), fixture.path(), fixture.path(), DispatchEnd::Completed, None).unwrap();
         let raw = fs::read_to_string(run.path().join("manifest.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(v["verify"]["passed"], false, "16 total is NOT 16 passing");
@@ -1403,7 +1424,7 @@ mod tests {
         let fixture = TempDir::new().unwrap();
         write_fixture(fixture.path(), 14);
         write_manifest(run.path(), r#"{"schema_version":5,"verify":null}"#);
-        apply(run.path(), fixture.path(), fixture.path(), true, None).unwrap();
+        apply(run.path(), fixture.path(), fixture.path(), DispatchEnd::Completed, None).unwrap();
         let raw = fs::read_to_string(run.path().join("manifest.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert!(v["verify"].is_null());
@@ -1423,7 +1444,7 @@ mod tests {
             run.path(),
             r#"{"schema_version":5,"verify":{"passed":true,"details":"verify command exited 0"}}"#,
         );
-        apply(run.path(), fixture.path(), fixture.path(), true, None).unwrap();
+        apply(run.path(), fixture.path(), fixture.path(), DispatchEnd::Completed, None).unwrap();
         let raw = fs::read_to_string(run.path().join("manifest.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(v["verify"]["passed"], false);
@@ -1453,7 +1474,7 @@ mod tests {
                "verify":{"passed":true,"details":"verify command exited 0"}}"#,
         );
         fs::write(run.path().join("verify-output.txt"), SPEC_REPORTER_OUTPUT).unwrap();
-        apply(run.path(), fixture.path(), sandbox.path(), true, None).unwrap();
+        apply(run.path(), fixture.path(), sandbox.path(), DispatchEnd::Completed, None).unwrap();
         let raw = fs::read_to_string(run.path().join("manifest.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(v["verify"]["passed"], false);
@@ -1478,7 +1499,7 @@ mod tests {
                "verify":{"details":"no passed key at all"}}"#,
         );
         fs::write(run.path().join("verify-output.txt"), SPEC_REPORTER_OUTPUT).unwrap();
-        apply(run.path(), fixture.path(), fixture.path(), true, None).unwrap();
+        apply(run.path(), fixture.path(), fixture.path(), DispatchEnd::Completed, None).unwrap();
         let raw = fs::read_to_string(run.path().join("manifest.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(v["verify"]["passed"], false);
@@ -1511,7 +1532,7 @@ mod tests {
             run.path(),
             r#"{"schema_version":5,"verify":"not-an-object"}"#,
         );
-        let err = apply(run.path(), fixture.path(), fixture.path(), true, None).unwrap_err();
+        let err = apply(run.path(), fixture.path(), fixture.path(), DispatchEnd::Completed, None).unwrap_err();
         assert!(err.to_string().contains("not a JSON object"), "got: {err}");
         // The manifest itself is untouched — critically, NOT left saying
         // `"verify": "not-an-object"` was somehow a pass.

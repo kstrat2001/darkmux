@@ -53,6 +53,10 @@ pub struct RunOutcome {
     /// or not its dispatch succeeded. An errored run is a failed run: `ok`
     /// is false.
     pub provider_error: Option<String>,
+    /// (F2) The runtime's `escalation_*` result when the dispatch stopped on
+    /// purpose and handed the work to a higher tier. `ok` is false then, but
+    /// the run did not error: the lab summary counts it in its own bucket.
+    pub escalation: Option<String>,
 }
 
 impl RunOutcome {
@@ -60,6 +64,22 @@ impl RunOutcome {
     /// run's timing and verify are real measurements.
     pub fn completed(&self) -> bool {
         self.provider_error.is_none()
+    }
+
+    /// How this run's dispatch ended, for the surfaces that must tell an
+    /// escalation from an error (F2). Every lab surface that LABELS a run
+    /// (`characterize`, `tune`, `lab loop`, the per-run notes, the batch
+    /// summary) reads this instead of `ok`, which is false for both. The only
+    /// remaining `ok` readers are [`Self::passed`] (so the exit code) and the
+    /// serve scan of the manifest's `ok`, which reads the manifest's
+    /// `escalation` first.
+    pub fn end(&self) -> crate::lab::dispatch_end::DispatchEnd {
+        use crate::lab::dispatch_end::DispatchEnd;
+        match (&self.escalation, self.ok) {
+            (Some(reason), _) => DispatchEnd::Escalated { reason: reason.clone() },
+            (None, true) => DispatchEnd::Completed,
+            (None, false) => DispatchEnd::Failed,
+        }
     }
 
     /// The workload's verify ran and failed. A verify nothing declared
@@ -79,8 +99,13 @@ impl RunOutcome {
 /// errored run is counted as errored, never as complete.
 pub fn batch_summary(outcomes: &[RunOutcome]) -> String {
     let completed = outcomes.iter().filter(|o| o.completed()).count();
+    // (F2) An escalation completed its run (the provider returned) and did
+    // not error; it gets its own clause, only when there is one, so the line
+    // never says "0 errored" over a run that printed an error.
+    let escalated = outcomes.iter().filter(|o| o.escalation.is_some()).count();
+    let escalated = if escalated > 0 { format!(", {escalated} escalated") } else { String::new() };
     format!(
-        "{} run(s): {completed} completed, {} errored",
+        "{} run(s): {completed} completed, {} errored{escalated}",
         outcomes.len(),
         outcomes.len() - completed
     )
@@ -88,7 +113,8 @@ pub fn batch_summary(outcomes: &[RunOutcome]) -> String {
 
 /// (#2494, #2982) The process exit code for every lab verb that runs
 /// workloads (`lab run`, `lab characterize`, `lab tune`): 0 when every run
-/// passed, 1 otherwise.
+/// passed, 1 otherwise. An escalated run did not pass (its work is unfinished),
+/// so it exits 1 as well, but it is labeled an escalation, never an error.
 pub fn exit_code(outcomes: &[RunOutcome]) -> i32 {
     if outcomes.iter().all(RunOutcome::passed) {
         0
@@ -236,6 +262,7 @@ impl OneRun<'_> {
             duration_ms: result.duration_ms,
             notes,
             provider_error: None,
+            escalation: result.escalation.clone(),
         })
     }
 
@@ -262,7 +289,7 @@ impl OneRun<'_> {
             run_dir,
             source,
             sandbox,
-            result.ok,
+            result.end(),
             coverage_min_pct,
         );
         if let Some(w) = settle_verify(result.verify.as_mut(), gate) {
@@ -354,6 +381,7 @@ fn errored_outcome(
         verify_passed: None,
         duration_ms: elapsed.as_millis(),
         provider_error: Some(error),
+        escalation: None,
     }
 }
 
@@ -449,10 +477,10 @@ fn run_notes(provider_id: &str, result: &crate::workloads::types::RunResult) -> 
     let mut notes = vec![
         format!("provider={provider_id}"),
         format!("wall={}s", result.duration_ms / 1000),
-        if result.ok {
-            "ok".to_string()
-        } else {
-            format!("error: {}", result.error.as_deref().unwrap_or("unknown"))
+        match (&result.escalation, result.ok) {
+            (Some(reason), _) => format!("escalated: {reason}"),
+            (None, true) => "ok".to_string(),
+            (None, false) => format!("error: {}", result.error.as_deref().unwrap_or("unknown")),
         },
     ];
     if let Some(v) = &result.verify {
@@ -1864,6 +1892,7 @@ mod tests {
                 // report, THEN would dispatch. No real dispatch here.
                 on_session_id(&darkmux_types::session_id::SessionId::adhoc(run.clone(), "stub", "darkmux-stub-2511-session-join-test"));
                 Ok(RunResult {
+                    escalation: None,
                     ok: true,
                     duration_ms: 1,
                     payload_text: Some("stub".into()),
@@ -1993,6 +2022,7 @@ mod tests {
                     cvar.wait_timeout_while(released, Duration::from_secs(5), |r| !*r).unwrap();
                 assert!(!timeout.timed_out(), "test thread never released the ordering gate");
                 Ok(RunResult {
+                    escalation: None,
                     ok: true,
                     duration_ms: 1,
                     payload_text: Some("stub".into()),

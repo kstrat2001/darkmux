@@ -100,6 +100,7 @@ mod tests {
             _: &mut dyn FnMut(&darkmux_types::session_id::SessionId),
         ) -> Result<RunResult> {
             Ok(RunResult {
+                escalation: None,
                 ok: true,
                 duration_ms: 1,
                 payload_text: Some("stub".into()),

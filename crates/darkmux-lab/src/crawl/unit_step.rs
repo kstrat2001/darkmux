@@ -489,12 +489,17 @@ pub fn interpret_dispatch_result(unit_id: &str, res: &DispatchResult) -> UnitDis
         );
     }
     let timed_out = watchdog_timeout_fired(&res.stderr);
-    let result_label = match envelope.as_ref().and_then(|e| e.get("result")).and_then(Value::as_str) {
-        Some("stop") => "stop".to_string(),
+    let reported = envelope
+        .as_ref()
+        .and_then(|e| e.get("result"))
+        .and_then(Value::as_str)
+        .map(darkmux_trajectory::TerminalResult::parse);
+    let result_label = match reported {
+        Some(darkmux_trajectory::TerminalResult::Stop) => "stop".to_string(),
         // Checked BEFORE the `timed_out` arm: a watchdog kill AFTER the
         // turn cap was already hit is still, first and foremost, a budget
         // exhaustion.
-        Some("max_turns") => UNIT_BUDGET_EXHAUSTED.to_string(),
+        Some(darkmux_trajectory::TerminalResult::MaxTurns) => UNIT_BUDGET_EXHAUSTED.to_string(),
         Some(_) if timed_out => "timeout".to_string(),
         Some(_) => "error".to_string(),
         None if timed_out => "timeout".to_string(),
@@ -1291,6 +1296,9 @@ impl StepKind for CrawlUnitStepKind {
         // not tell them apart. See `dedup_across_draws`.
         let mut all_finding_refs: Vec<(usize, FindingRef)> = Vec::new();
         let mut last_result = String::new();
+        // (F11) Set when ANY draw was cut at its bound: the unit's recorded
+        // result reads the worst draw, never just the last one.
+        let mut any_draw_cut = false;
         let mut last_model: Option<String> = None;
         let mut last_detections = None;
         let mut last_rest_ms = 0u64;
@@ -1418,18 +1426,7 @@ impl StepKind for CrawlUnitStepKind {
             let outcome = (self.dispatch)(opts);
             let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
             let (mut result, wall_ms, prompt_tokens, completion_tokens, model, detections, rest_ms, host) =
-                match &outcome {
-                    // (#2593) Checked HERE, at the moment THIS draw's
-                    // dispatch failed — not deferred to the summary — so an
-                    // ordinary failure that happened before any interrupt
-                    // keeps reading `error` regardless of what the mission
-                    // does afterward. See `INTERRUPTED_RESULT`'s own doc.
-                    Err(_) if darkmux_types::interrupt::is_set() => {
-                        (INTERRUPTED_RESULT.to_string(), elapsed_ms, 0, 0, None, None, 0, None)
-                    }
-                    Err(_) => ("error".to_string(), elapsed_ms, 0, 0, None, None, 0, None),
-                    Ok(res) => interpret_dispatch_result(&ctx.unit_id, res),
-                };
+                draw_outcome(&ctx.unit_id, &outcome, elapsed_ms);
 
             // (#2193) No-progress bound — only over a dispatch that actually
             // ran and reported a clean `"stop"`. Never overrides an already-
@@ -1466,6 +1463,7 @@ impl StepKind for CrawlUnitStepKind {
             total_rejected += exclusions as u64;
             all_finding_refs.extend(finding_refs.into_iter().map(|r| (draw, r)));
             last_result = result.clone();
+            any_draw_cut |= result == UNIT_BUDGET_EXHAUSTED;
             last_model = model.clone();
             last_detections = detections;
             last_rest_ms = rest_ms;
@@ -1527,7 +1525,7 @@ impl StepKind for CrawlUnitStepKind {
             unit: ctx.unit_id.clone(),
             rule: single_rule_id(&ctx.rule_ids),
             source: ctx.source.clone(),
-            result: last_result,
+            result: unit_result(any_draw_cut, last_result),
             findings: total_findings,
             findings_rejected: total_rejected,
             wall_ms: total_wall_ms,
@@ -1550,6 +1548,11 @@ impl StepKind for CrawlUnitStepKind {
             finding_refs,
         };
 
+        // (F11) The unit's own typed result decides the step's degraded
+        // reason, so the run's outcome reads it from the one place every
+        // step reports a partial result.
+        let degraded = unit_degraded_reason(&outcome_record.unit, &outcome_record.result);
+
         Ok(StepOutcome {
             output: darkmux_crew::step_output::Output::wrap(
                 UNIT_OUTCOME_KIND,
@@ -1558,9 +1561,41 @@ impl StepKind for CrawlUnitStepKind {
             )
             .to_output_string()?,
             flow_records: Vec::new(),
-            degraded: None,
+            degraded,
         })
     }
+}
+
+/// One draw's numbers: the envelope's own when the dispatch ran, else a
+/// zeroed row labeled by how it failed.
+fn draw_outcome(unit_id: &str, outcome: &Result<DispatchResult>, elapsed_ms: u64) -> UnitDispatchOutcome {
+    match outcome {
+        // (#2593) Checked HERE, at the moment THIS draw's dispatch failed,
+        // not deferred to the summary, so an ordinary failure that happened
+        // before any interrupt keeps reading `error` regardless of what the
+        // mission does afterward. See `INTERRUPTED_RESULT`'s own doc.
+        Err(_) if darkmux_types::interrupt::is_set() => {
+            (INTERRUPTED_RESULT.to_string(), elapsed_ms, 0, 0, None, None, 0, None)
+        }
+        Err(_) => ("error".to_string(), elapsed_ms, 0, 0, None, None, 0, None),
+        Ok(res) => interpret_dispatch_result(unit_id, res),
+    }
+}
+
+/// (F11) The unit's recorded result: `unit_budget_exhausted` when ANY draw
+/// was cut at its bound, else the last draw's own result.
+fn unit_result(any_draw_cut: bool, last_result: String) -> String {
+    if any_draw_cut { UNIT_BUDGET_EXHAUSTED.to_string() } else { last_result }
+}
+
+/// (F11) Why a unit that completed did NOT finish its work, or `None` when it
+/// did. A unit cut at its turn or no-progress bound is a BOUND, not a failure
+/// (its step stays `Complete`, its findings are kept), but it did none of the
+/// work it was planned for, so the run it belongs to must not read clean: the
+/// scheduler records this reason and the run's outcome becomes `Degraded`.
+fn unit_degraded_reason(unit: &str, result: &str) -> Option<String> {
+    (result == UNIT_BUDGET_EXHAUSTED)
+        .then(|| format!("unit `{unit}` hit its budget (turn or no-progress bound) before finishing its work"))
 }
 
 /// (#2310 P4c-2b) Dedup [`FindingRef`]s across a unit's draws — DESIGN.md
