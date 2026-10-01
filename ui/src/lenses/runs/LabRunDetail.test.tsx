@@ -99,8 +99,7 @@ describe("LabRunDetail", () => {
     await waitFor(() => expect(screen.getByText("pipeline")).toBeInTheDocument());
     expect(screen.getByText("not started")).toBeInTheDocument();
     expect(screen.getByText("running")).toBeInTheDocument();
-    expect(screen.getByText(/try it yourself/i)).toBeInTheDocument();
-    expect(screen.getByText("darkmux lab eval <role> --cases-dir <cases-dir>")).toBeInTheDocument();
+    expect(screen.queryByText(/try it yourself/i)).not.toBeInTheDocument();
     expect(screen.getByText(/no events yet/i)).toBeInTheDocument();
   });
 
@@ -109,9 +108,6 @@ describe("LabRunDetail", () => {
     renderDetail("d1");
     await waitFor(() => expect(screen.getByText("finished")).toBeInTheDocument());
     expect(screen.getByText(/confirmed 2 · needs_check 1 · archived 0/)).toBeInTheDocument();
-    // (4.0) The hint reads scores.json, not the funnel envelope; with no
-    // scores it is placeholders, never the removed funnel flags.
-    expect(screen.getByText("darkmux lab eval <role> --cases-dir <cases-dir>")).toBeInTheDocument();
   });
 
   it("renders pipeline stages and the event feed from a real events poll", async () => {

@@ -4999,7 +4999,7 @@
         let reviews = json["reviews"].as_array().unwrap();
         assert_eq!(reviews.len(), 1);
         assert_eq!(reviews[0]["case_id"], "demo-case-a");
-        assert_eq!(json["scores"]["profile"], "demo-profile");
+        assert!(json["scores"].is_object(), "a readable scores.json is reported: {json}");
         assert!(json.get("funnels").is_none(), "the retired field name must not be served: {json}");
     }
 

@@ -292,7 +292,7 @@ fn a_prompt_workload_reports_verify_none_without_a_spec_and_the_verdict_with_one
     let port = ack_endpoint();
     let prompt = |id: &str, verify: serde_json::Value| {
         let mut w = serde_json::json!({
-            "id": id, "provider": "prompt", "role": "dialectic-judge", "prompt": "say ack"
+            "id": id, "provider": "prompt", "role": "pr-reviewer", "prompt": "say ack"
         });
         if !verify.is_null() {
             w["verify"] = verify;

@@ -103,7 +103,7 @@ pub const TEST_ISOLATED_DIR_NAME: &str = "darkmux-test-isolated";
 /// shared one directory — and the name `darkmux-test-isolated` invited
 /// reading it as though it did more than it does. Measured on one laptop:
 /// 260 liveness entries and 1.9 MB of residue, across TEN separate shared
-/// subtrees (liveness, acks, audit, hooks, flows, findings, mods, runs,
+/// subtrees (liveness, audit, hooks, flows, findings, mods, runs,
 /// runtime, cache) declared independently in four crates. A forgotten
 /// `DARKMUX_HOME` shared not just heartbeats but flow records, findings,
 /// mods, run artifacts and the audit chain with every concurrent test
@@ -164,7 +164,7 @@ pub fn test_isolated_root() -> PathBuf {
 }
 
 /// (#2777) [`test_isolated_root`] with one named subdirectory — the form
-/// every call site actually wants (`…/flows`, `…/acks`, `…/audit`).
+/// every call site actually wants (`…/flows`, `…/audit`).
 #[cfg(any(test, feature = "test-support"))]
 pub fn test_isolated_dir(name: &str) -> PathBuf {
     test_isolated_root().join(name)
@@ -551,8 +551,8 @@ mod tests {
     /// The property #2653 did NOT have and the name implied: separation
     /// between test PROCESSES. The old fallback was one fixed
     /// machine-global path, so every un-isolated process shared flow
-    /// records, findings, mods, run artifacts, the audit chain and dispatch
-    /// acks with every other one.
+    /// records, findings, mods, run artifacts, the audit chain with every other
+    /// one.
     #[test]
     fn the_scratch_root_is_scoped_to_this_process() {
         let root = test_isolated_root();
@@ -609,7 +609,7 @@ mod tests {
     #[test]
     fn every_named_subtree_hangs_off_the_one_root() {
         let root = test_isolated_root();
-        for name in ["hooks", "flows", "findings", "mods", "lab", "runtime", "cache", "acks", "audit"] {
+        for name in ["hooks", "flows", "findings", "mods", "lab", "runtime", "cache", "audit"] {
             let d = test_isolated_dir(name);
             assert_eq!(d.parent(), Some(root.as_path()), "{name} must hang off the shared root");
             assert_eq!(d.file_name().and_then(|s| s.to_str()), Some(name));

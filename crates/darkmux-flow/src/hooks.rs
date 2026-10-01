@@ -5424,7 +5424,7 @@ mod tests {
     // The structural fix, rather than adding `#[serial]` to ~30 readers
     // (which would serialize a meaningful slice of this file's suite for
     // no reason those tests care about signing at all): give THIS test's
-    // signed rule an index nothing else in the file's non-`#[ignore]`d
+    // signed rule an index nothing else in the file's
     // tests ever occupies. Index 1 alone wasn't enough — a re-run of the
     // env-audit sweep after that first attempt caught
     // `resolve_rules_paths_are_stable_across_reordering` below, which
@@ -5434,8 +5434,7 @@ mod tests {
     // push the real, signed rule to index 2 instead, so the env key this
     // test mutates is `DARKMUX_HOOK_SECRET_2` — checked against every
     // OTHER rules-vec literal in this file (including that reordering
-    // test and the one `#[ignore]`d 3-rule cost-check, which the default
-    // suite never runs) before picking it.
+    // test) before picking it.
     fn delivery_carries_a_signature_the_receiver_can_recompute_when_signed() {
         let tmp = tempfile::TempDir::new().unwrap();
         let receiver = HookReceiver::start();
@@ -7344,72 +7343,6 @@ mod tests {
         );
     }
 
-    /// (#2093 Self-QA gate — cost check) `write()` latency with hooks
-    /// enabled (3 rules, one matching) vs disabled, 10k records each.
-    /// `#[ignore]`d — a throwaway timing measurement, not a correctness
-    /// assertion; run explicitly with `--ignored --nocapture`.
-    #[test]
-    #[ignore]
-    fn cost_check_write_latency_hooks_enabled_vs_disabled() {
-        let n = 10_000;
-
-        // Disabled: a bare NullSink, no hooks in the chain at all.
-        let disabled: Arc<dyn FlowSink> = Arc::new(NullSink);
-        let start = Instant::now();
-        for i in 0..n {
-            disabled.write(&marked(&format!("item.{i}"))).unwrap();
-        }
-        let disabled_elapsed = start.elapsed();
-
-        // Enabled: 3 rules, one of which matches every record written below.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let rules = vec![
-            HookRule {
-                r#match: Some(HookMatch { action: Some("work.*".to_string()), ..Default::default() }),
-                http: Some("http://127.0.0.1:1/a".to_string()),
-                signing_secret_keychain_item: None,
-                file: None,
-                transform: None,
-                headers: None,
-                attribution_headers: None,
-                extras: Default::default(),
-            },
-            HookRule {
-                r#match: Some(HookMatch { action: Some("mission.*".to_string()), ..Default::default() }),
-                http: Some("http://127.0.0.1:1/b".to_string()),
-                signing_secret_keychain_item: None,
-                file: None,
-                transform: None,
-                headers: None,
-                attribution_headers: None,
-                extras: Default::default(),
-            },
-            HookRule {
-                r#match: Some(HookMatch { mission_id: Some("no-such-mission".to_string()), ..Default::default() }),
-                http: Some("http://127.0.0.1:1/c".to_string()),
-                signing_secret_keychain_item: None,
-                file: None,
-                transform: None,
-                headers: None,
-                attribution_headers: None,
-                extras: Default::default(),
-            },
-        ];
-        let report: Arc<dyn FlowSink> = Arc::new(NullSink);
-        let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
-        let start = Instant::now();
-        for i in 0..n {
-            sink.write(&marked(&format!("item.{i}"))).unwrap();
-        }
-        let enabled_elapsed = start.elapsed();
-
-        println!(
-            "cost check: {n} writes — disabled: {disabled_elapsed:?} ({:.2}us/write) — \
-             hooks enabled (3 rules, 1 matching): {enabled_elapsed:?} ({:.2}us/write)",
-            disabled_elapsed.as_micros() as f64 / n as f64,
-            enabled_elapsed.as_micros() as f64 / n as f64,
-        );
-    }
     // (#1959 live loop) A receiver that answers 200 but rejects records
     // per-record inside the body (`{"rejected": N}`) must not read as a clean
     // delivery: `hook.fired` carries `receiver_rejected` so the rejection is

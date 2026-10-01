@@ -339,16 +339,6 @@ The case for darkmux: **once you accept that static configs leave performance on
 - ✅ Observability daemon (`darkmux serve`) + `/flow` + `/lab` web viewers
 - ✅ Doctor: 30+ pre-flight checks with actionable hints
 
-**On the roadmap (active):**
-
-- 🚧 Topology view in the web viewer (live + replay diagram of fleet activity; #169)
-- 🚧 Fleet primitives (`darkmux machine add`/`darkmux machine list`) and cross-machine coordination (Phase 5 of #162)
-- 🚧 Event-sourced mission state (Phase 8 of #162)
-- 🚧 Sibling bootstrap skill: `/darkmux-enable-redis` (#178). (`/darkmux-add-machine` and `/darkmux-enable-audit` shipped, in the skills bundle above.)
-- 🚧 Audit log management: `flow export`, `flow archive`, OS-level append-only flags for audit files
-- 🚧 Multi-frontier orchestrator support (Gemini / Codex / Copilot bootstrap paths; #179)
-
 **Aspirational (later):**
 
 - 🚧 Plugin system for community-contributed providers, workloads, role manifests
-- 🚧 Per-role bake-offs for non-SWE roles (trip-researcher, health-research, legal-research, …)

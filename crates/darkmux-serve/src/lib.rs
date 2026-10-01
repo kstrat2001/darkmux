@@ -2044,8 +2044,8 @@ fn current_millis() -> u64 {
 // never touch the flow stream, Redis, or any other machine's data. Machine-local by construction;
 // no federation, ever. A "run" is any directory directly containing
 // `funnels.json`, `funnel-events.jsonl`, or `scores.json` (the artifacts
-// `review-bench --funnel` writes per-run-local, #1247 Parts 1-2, plus
-// `scores.json` from any other bench mode). The scan is depth-bounded, and a
+// the lab writes per-run-local, #1247 Parts 1-2; `scores.json` comes from
+// the bench providers). The scan is depth-bounded, and a
 // matched run's own `cases/`/`worktrees/` subtrees (full repo checkouts) are
 // never walked into (`LAB_SCAN_SKIP_DIRS` below) — but a match does NOT stop
 // the scan from continuing into a matched dir's OTHER subdirectories, so a
@@ -2688,7 +2688,7 @@ async fn lab_run_detail_handler(
             .collect();
         let scores = darkmux_lab::lab::scores::read_scores(&run_dir.join("scores.json"))
             .ok()
-            .map(|doc| wire::LabScoresSummary::from(&doc));
+            .map(|_doc| wire::LabScoresSummary {});
         (reviews, scores)
     })
     .await
@@ -5097,10 +5097,9 @@ fn synthetic_stream_error_record(stream_name: &str, attempts: u32, reason: &str)
     // because the daemon process emitting this IS a local-tier
     // observation; `stage: "scope"` because the event is about the
     // stream's lifecycle (not a dispatch / review / ship). Note:
-    // the topology viewer's EDGE_STYLES filter at
-    // docs/topology/index.html doesn't currently render
-    // `stage: scope` records as edges — separate follow-up to add
-    // a stream-error pill / toast in the viewer surface.
+    // the viewer doesn't currently render `stage: scope` records as
+    // edges — separate follow-up to add a stream-error pill / toast in
+    // the viewer surface.
     let record = darkmux_flow::FlowRecord {
         ts: darkmux_flow::ts_utc_now(),
         level: darkmux_flow::Level::Warn,

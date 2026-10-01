@@ -91,38 +91,12 @@ pub(crate) fn dispatch_as_crew_of_one_with(
     // (#2902 step 5 review C-d) Against the registry THIS dispatch uses
     // (`--profiles-file`), so a bad budget there refuses before minting.
     crate::user_files::preflight_with(darkmux_types::config_enum::Scope::Dispatch, opts.config_path.as_deref())?;
-    // (#1509 — found live, tests/cli.rs's ack-gate integration tests) The
-    // licensed-adjacent operator-consent gate MUST run before any model
-    // residency action, never after. Inside `dispatch_internal::dispatch`
-    // (the pre-#1509 raw path) it's the very first substantive check — but
-    // `run_step_graph`'s `ensure_wave_loaded` now LOADS the step's
-    // residency-classified model BEFORE the step's own `run()` (and
-    // therefore before `dispatch_internal::dispatch`'s own copy of this
-    // exact check) ever executes. Left unreplicated here, a licensed-
-    // adjacent role dispatch would try to load a model into RAM — real
-    // resource cost, no consent — before the operator ever sees the
-    // disclaimer, or would fail with a confusing LMStudio load error
-    // instead of the consent prompt when no profile/model is configured.
-    // Calling the SAME idempotent check here (it's a no-op once the ack
-    // file exists — see its own doc) restores the pre-#1509 ordering
-    // exactly; `dispatch_internal::dispatch`'s own call later is unchanged
-    // and becomes a harmless second no-op read of the same ack file.
-    crate::dispatch::require_licensed_adjacent_ack(&opts.role_id)
-        .context("licensed-adjacent role dispatch requires acknowledgment")?;
-
-    // (#2585 / #2614 review) `--resume-from` checkpoint validation used to
-    // ALSO be hoisted here, mirroring the ack gate immediately above — but
-    // unlike that gate (which prompts, and so must keep a copy on this
-    // interactive CLI path no matter what), the checkpoint gate is purely
-    // deterministic. #2614's review found #2585's hoist covered only THIS
-    // entry point: a mission config or the panel staffing a
-    // `dispatch.internal` step with `resume_from` in its config went
-    // through neither this function nor its hoist, so it still paid the
-    // full residency cost before its own in-body checkpoint check ever
-    // fired. The fix generalized the gate to `StepKind::resume_precheck`,
-    // consulted by `scheduler::run_step_graph` for every ready step of
-    // every graph — the CLI's own one-step graph included — strictly
-    // before `plan_waves`/`ensure_wave_loaded` can make anything resident.
+    // (#2585 / #2614 review) `--resume-from` checkpoint validation lives in
+    // `StepKind::resume_precheck`, consulted by `scheduler::run_step_graph`
+    // for every ready step of every graph (a mission config's or the
+    // panel's `dispatch.internal` step with `resume_from` included, not just
+    // this CLI path) strictly before `plan_waves`/`ensure_wave_loaded` can
+    // make anything resident.
     // That covers this call's own `run_step_graph` invocation below, so
     // duplicating the check here would be pure drift risk (two call sites
     // that could disagree) for a check that gains nothing by running
@@ -683,24 +657,6 @@ mod tests {
     impl crate::step_kinds::StepKind for FakeDispatchKind {
         fn id(&self) -> &'static str {
             "dispatch.internal"
-        }
-
-        /// (#1511) Stands in for a real `dispatch.internal`, so it sources
-        /// its role the same way — `task.role_id`, falling back to
-        /// `config.role_id`. The crew-of-one path's OWN consent check runs
-        /// before `run_step_graph` is entered (see
-        /// `dispatch_as_crew_of_one_with`), and the scheduler's runs again
-        /// on this answer; both must agree on which role this is.
-        fn dispatch_role(
-            &self,
-            step: &crate::types::Step,
-            task: &crate::types::Task,
-            _input: &BTreeMap<String, String>,
-            _ctx: &crate::step_kinds::StepRunCtx,
-        ) -> Option<String> {
-            task.role_id.clone().or_else(|| {
-                step.config.get("role_id").and_then(|v| v.as_str()).map(String::from)
-            })
         }
 
         fn run(
@@ -1608,11 +1564,7 @@ mod tests {
         // mission/phase/task/step quadruple already exists on disk. The
         // refusal is therefore VISIBLE — a real mission, Abandoned, naming
         // the checkpoint failure — the same shape a mission config's own
-        // dispatch.internal step gets when the licensed-adjacent consent
-        // gate (already scheduler-hosted) refuses it. Consistency with
-        // that established, already-shipped behavior is the reason this
-        // is the right tradeoff, not an unexamined side effect of where
-        // the check happens to run.
+        // dispatch.internal step gets when this precheck refuses it.
         let missions_dir = crate::loader::missions_dir();
         let entries: Vec<_> = std::fs::read_dir(&missions_dir)
             .map(|rd| rd.collect::<Result<Vec<_>, _>>().unwrap())

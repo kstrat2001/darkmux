@@ -2540,15 +2540,6 @@ pub fn identity_path_override() -> Option<std::path::PathBuf> {
     )
 }
 
-/// Acknowledgment-files dir override (`env(DARKMUX_ACK_DIR) > config.dirs.ack`).
-/// Caller defaults to `~/.darkmux/acks`.
-pub fn ack_dir_override() -> Option<std::path::PathBuf> {
-    pick_dir_override(
-        env_str("DARKMUX_ACK_DIR"),
-        config().dirs.as_ref().and_then(|d| d.ack.as_deref()),
-    )
-}
-
 /// The operator-override candidates for a **search-path** dir (templates,
 /// skills) — `env` first, then the config tier, each highest-priority entries a
 /// search caller prepends to its built-in candidate list (~/.darkmux/…,
@@ -3404,8 +3395,8 @@ mod tests {
     // races an unguarded reader. It reproduced live on the first
     // instrumented run of this suite (#2632's audit): the two
     // `liveness_dir()` calls below observed two DIFFERENT roots within the
-    // same test. This one can't take the structural fix `dialectic_seats_
-    // contract` (crew) took — its whole point IS the env resolution
+    // same test. This one can't take the structural fix the crew loader
+    // tests took — its whole point IS the env resolution
     // behavior — so instead it scopes `DARKMUX_HOME` explicitly (serial +
     // save/clear/restore) rather than depending on whatever the ambient
     // value happens to be.
@@ -3819,23 +3810,18 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn override_only_dir_accessors_env_then_none() {
-        type Acc = fn() -> Option<std::path::PathBuf>;
-        for (key, accessor) in [
-            ("DARKMUX_IDENTITY_PATH", identity_path_override as Acc),
-            ("DARKMUX_ACK_DIR", ack_dir_override),
-        ] {
-            let prev = std::env::var(key).ok();
-            unsafe { std::env::set_var(key, "/custom/x"); }
-            assert_eq!(accessor(), Some(std::path::PathBuf::from("/custom/x")), "{key} env override");
-            // unset → None; each caller then applies its own default (the no-HOME
-            // handling differs per dir, which is why these are override-only).
-            unsafe { std::env::remove_var(key); }
-            assert_eq!(accessor(), None, "{key} unset → None");
-            unsafe {
-                match prev {
-                    Some(v) => std::env::set_var(key, v),
-                    None => std::env::remove_var(key),
-                }
+        let key = "DARKMUX_IDENTITY_PATH";
+        let prev = std::env::var(key).ok();
+        unsafe { std::env::set_var(key, "/custom/x"); }
+        assert_eq!(identity_path_override(), Some(std::path::PathBuf::from("/custom/x")), "{key} env override");
+        // unset → None; the caller then applies its own default (the no-HOME
+        // handling differs per dir, which is why these are override-only).
+        unsafe { std::env::remove_var(key); }
+        assert_eq!(identity_path_override(), None, "{key} unset → None");
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
             }
         }
     }

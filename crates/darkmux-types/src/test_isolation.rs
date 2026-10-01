@@ -116,7 +116,6 @@ pub const PINNED_STATE_VARS: &[(&str, &str)] = &[
     ("DARKMUX_FINDINGS_DIR", "findings"),
     ("DARKMUX_MODS_DIR", "mods"),
     ("DARKMUX_LAB_DIR", "lab"),
-    ("DARKMUX_ACK_DIR", "acks"),
     ("DARKMUX_FLEET_FILE", "fleet.json"),
     // `.md`, not `.json`: `crew::dispatch::identity_path()`'s default is
     // `<root>/identity.md` (documented at
@@ -180,6 +179,7 @@ pub const CLEARED_STATE_VARS: &[&str] = &[
     // keeps this in step with `config::RETIRED_SETTINGS` / `RENAMED_SETTINGS`.
     "DARKMUX_CREW_DIR",
     "DARKMUX_NOTEBOOK_DIR",
+    "DARKMUX_ACK_DIR",
     "DARKMUX_RADIO_ROUTER_PROFILE",
     "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION",
     "DARKMUX_AUDIT_DIR",

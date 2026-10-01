@@ -56,8 +56,6 @@
 //! NOT covered here: CRUD CLI for each entity, audit-log / outcomes /
 //! allocator population. Those land in follow-up PRs.
 
-#![allow(dead_code)]
-
 use crate::loader;
 use crate::types::*;
 use darkmux_types::paths::{resolve, ResolveScope};

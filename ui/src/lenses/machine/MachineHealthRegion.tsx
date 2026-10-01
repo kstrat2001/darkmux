@@ -34,7 +34,7 @@ import type { MachineResourcesResponse } from "../../types/generated/MachineReso
 import type { ModelRow } from "../../types/generated/ModelRow";
 
 /**
- * (#1806 Stage 2/3 — the machine-lens redesign, `docs/design/machine-lens/proposal.md` in the design
+ * (#1806 Stage 2/3 — the machine-lens redesign, the machine-lens proposal (deleted in 5.0) in the design
  * packet at the top of this repo's scratch workspace) The health region's
  * hierarchy + level-3 treatment: a bezel-less semicircle hero (the machine
  * gauge, `<Gauge>`), a tell-tale lamp row (`<LampRow>`), odometer digit
@@ -60,7 +60,7 @@ import type { ModelRow } from "../../types/generated/ModelRow";
  *   it ever reaches a `className` — never landed raw.
  * - **The redline keys on one server field.** `redlineLit()` /
  *   `gaugeFaceCaption()` read `machine.state` only; `isOverLimit()` is the
- *   one piece of client arithmetic docs/design/machine-lens/proposal.md sanctions (the server's own
+ *   one piece of client arithmetic the machine-lens proposal (deleted in 5.0) sanctions (the server's own
  *   over-limit rule applied to two server numbers) and never substitutes
  *   for the server's verdict.
  * - **Stale keeps the last good reading, visibly marked.** `resourcesErrored`

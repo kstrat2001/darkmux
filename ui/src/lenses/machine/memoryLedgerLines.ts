@@ -8,7 +8,7 @@
  * string array with granular per-fragment exports so `MachineHealthRegion.tsx`
  * could slot legacy's own `.memcard`/`.membar` structure around unchanged
  * text. Stage 2/3 (the gauge/lamp/odometer/row redesign, `MachineHealthRegion.tsx`,
- * docs/design/machine-lens/proposal.md in the design packet) replaced that flat-ledger RENDERING
+ * the machine-lens proposal (deleted in 5.0) in the design packet) replaced that flat-ledger RENDERING
  * entirely, and with it the fragments that existed only to feed it:
  * `machineTotalText()` and `modelLines()` (the old card's meta-line/header
  * text) and `pressureText()` (superseded by `machineGauge.ts`'s

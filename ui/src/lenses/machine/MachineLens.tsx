@@ -358,7 +358,7 @@ export function MachineLens({
   const resources = lastGoodResources;
 
 
-  // The residency state machine (docs/design/machine-lens/proposal.md §8 — ghost/NEW rows) advances
+  // The residency state machine (the machine-lens proposal (deleted in 5.0) §8 — ghost/NEW rows) advances
   // on the SAME successful-poll cadence as the payload above: a failed poll
   // carries no model list to diff against, so it must neither advance a
   // ghost's retirement clock nor manufacture a spurious departure. Held in

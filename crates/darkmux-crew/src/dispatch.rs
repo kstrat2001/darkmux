@@ -3,7 +3,7 @@
 //! This is the operator-facing entry point that ties the crew schema
 //! (`templates/builtin/roles/<id>.{json,md}`) to the in-house container-
 //! bounded runtime (`dispatch_internal`). This module owns the pieces that
-//! are runtime-neutral: the licensed-adjacent acknowledgment gate, session
+//! are runtime-neutral: session
 //! id generation, cross-phase message/output threading, flow-record
 //! builders, and fleet routing decisions. The actual dispatch execution
 //! (Docker container spawn, agent loop, trajectory) lives in
@@ -12,230 +12,13 @@
 //! (2.0: the `openclaw` shell-out runtime and `darkmux crew sync` were
 //! removed — see #1405. The in-house runtime is the only dispatch path.)
 
-use anyhow::{bail, Context, Result};
+use anyhow::Result;
 use std::fs;
-use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use darkmux_types::execution_id::ExecutionId;
 use darkmux_types::session_id::SessionId;
 use std::time::{SystemTime, UNIX_EPOCH};
-
-/// Roles whose prompts operate in domains regulated by professional
-/// licensure (health, law, athletics-as-RD-adjacent). Each prompt opens
-/// with a "You are NOT a physician / attorney / trainer" framing, but the
-/// operator never sees that text unless they go read the .md file. The
-/// CLI-side acknowledgment gate (`require_licensed_adjacent_ack`) makes
-/// the same disclaimer visible to the operator before first dispatch,
-/// and records the timestamped ack at
-/// `~/.darkmux/acks/<role>.ack`. The ack is operator-sovereign:
-/// the operator can pre-create the file (`touch ~/.darkmux/acks/<role>.ack`)
-/// to skip the prompt in scripted contexts, or delete it to re-trigger.
-const LICENSED_ADJACENT_ROLES: &[&str] = &["health-research", "legal-research", "fitness-coach"];
-
-/// Resolve the directory where licensed-adjacent acknowledgment files
-/// live. Defaults to `<darkmux root>/acks/`. The `DARKMUX_ACK_DIR` env var
-/// overrides — used by tests, also available for operators who want to
-/// keep the acks in a different location.
-///
-/// (#2450) The fallback default is derived from the SAME root resolution
-/// every other darkmux directory resolves through —
-/// `darkmux_types::paths::resolve`, which honors `DARKMUX_HOME` before
-/// `~/.darkmux` — mirroring
-/// `config_access::fleet_file_default`/`flows_dir_default`. Before this fix,
-/// this went straight to `dirs::home_dir()`, so a `DARKMUX_HOME`-scoped
-/// install with no `DARKMUX_ACK_DIR` override still wrote licensed-adjacent
-/// acknowledgment files into the operator's REAL `~/.darkmux/acks`, the same
-/// bug class fixed elsewhere for #1585, #2093, #2363, and `fleet_file`
-/// (#2450) itself. Probed and confirmed broken (not assumed from shape)
-/// before this fix.
-fn ack_dir() -> Result<PathBuf> {
-    // env(DARKMUX_ACK_DIR) > config.dirs.ack > <darkmux root>/acks (#661 Slice 3).
-    if let Some(p) = darkmux_types::config_access::ack_dir_override() {
-        return Ok(p);
-    }
-    Ok(ack_dir_default())
-}
-
-/// Test builds must never default onto the operator's real
-/// `~/.darkmux/acks` — same isolation discipline as
-/// `config_access::lab_dir_default`'s own test-build variant (#994). This
-/// accessor genuinely WRITES operator-visible files (the ack marker), unlike
-/// `cache_dir`/`runtime_cache_dir` (read-mostly internal caches deliberately
-/// left without this guard, see their doc). A test that DID isolate itself
-/// (a `DARKMUX_HOME` tempdir, or a project-local `./.darkmux`) is honored
-/// verbatim, because a test that isolated itself means it.
-#[cfg(any(test, feature = "test-support"))]
-fn ack_dir_default() -> PathBuf {
-    let resolved = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser);
-    let real_user_root = dirs::home_dir().map(|h| h.join(".darkmux"));
-    if real_user_root.as_ref() == Some(&resolved.root) {
-        return darkmux_types::paths::test_isolated_dir("acks");
-    }
-    resolved.root.join("acks")
-}
-
-#[cfg(not(any(test, feature = "test-support")))]
-fn ack_dir_default() -> PathBuf {
-    darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).root.join("acks")
-}
-
-fn ack_file_for(role_id: &str) -> Result<PathBuf> {
-    Ok(ack_dir()?.join(format!("{role_id}.ack")))
-}
-
-/// Print the licensed-adjacent disclosure banner to stderr. Separated so
-/// tests can verify the gate's behavior without coupling to terminal IO.
-fn print_licensed_adjacent_banner(role_id: &str) {
-    eprintln!();
-    eprintln!("=== licensed-adjacent role: {role_id} ===");
-    eprintln!("This role operates in a domain regulated by professional licensure.");
-    eprintln!("It is a research / organization assistant — NOT a substitute for a");
-    eprintln!("licensed professional. The role's full doctrine is in the .md prompt");
-    eprintln!("at templates/builtin/roles/{role_id}.md in the darkmux source");
-    eprintln!("(or your override at ~/.darkmux/roles/{role_id}.md if set).");
-    eprintln!();
-    eprintln!("By acknowledging, you confirm you understand:");
-    eprintln!("  - The local LLM may deviate from its system prompt under adversarial");
-    eprintln!("    or persistent prompting. The prompt IS the only runtime boundary.");
-    eprintln!("  - You are solely responsible for following jurisdiction-specific");
-    eprintln!("    licensure rules (UPL / UPM / scope-of-practice).");
-    eprintln!("  - Time-sensitive situations (medical emergency, served lawsuit,");
-    eprintln!("    acute pain) go to professionals, not this tool.");
-    eprintln!();
-}
-
-/// The operator-facing refusal text shared by BOTH gate variants — the
-/// prompting one's non-TTY bail and [`licensed_adjacent_ack_status`]'s
-/// unconditional one. One string, so the remediation an operator reads is
-/// the same wording whichever path refused, and so a future edit cannot
-/// improve one and leave the other behind.
-fn unacked_error(role_id: &str, dir: &std::path::Path, ack_path: &std::path::Path) -> String {
-    format!(
-        "licensed-adjacent role `{role_id}` requires operator acknowledgment, \
-         and none has been recorded. To acknowledge, run `darkmux dispatch {role_id} \
-         \"<your message>\"` from an interactive terminal and type ACKNOWLEDGE at the \
-         prompt, or pre-acknowledge without the prompt:\n\
-         \n  mkdir -p {} && touch {}\n\
-         \nThen re-run.",
-        dir.display(),
-        ack_path.display()
-    )
-}
-
-/// (#1511) The CHECK-ONLY licensed-adjacent gate: same decision as
-/// [`require_licensed_adjacent_ack`], with the interactive prompt removed.
-/// A role outside the list passes; a role with a recorded ack passes;
-/// anything else prints the disclosure banner and refuses with the same
-/// remediation text the prompting variant's non-TTY arm uses.
-///
-/// **Why a second variant exists.** `require_licensed_adjacent_ack` calls
-/// `stdin.lock().read_line(…)` with no timeout whenever stdin is a TTY, and
-/// the scheduler's consent filter (`scheduler::run_step_graph`) runs on the
-/// scheduler's MAIN thread, sequentially, over EVERY ready step of EVERY
-/// wave, before any of that wave's jobs are built.
-///
-/// Note what the argument is NOT: "blocking the main thread here would
-/// stall the wave" does not by itself distinguish this path, because the
-/// operator sign-off gate (`crate::gate::resolve_gate`) already blocks on
-/// that same thread, in the loop immediately above this one, and its own
-/// comment says so. The distinction that actually holds is WHO OPTS IN.
-/// `resolve_gate` returns immediately unless the step declares
-/// `gate: Some(…)` — a per-step opt-in the operator wrote into the mission
-/// config, so a launch that blocks is a launch that asked to. A consent
-/// prompt has no such opt-in: it would sit on the path of every ready step
-/// of every wave, in every graph, including a mission launched detached
-/// with an inherited TTY, which would then hang forever while eating
-/// keystrokes from the parent shell. So the scheduler refuses instead of
-/// asking.
-///
-/// The place to ACQUIRE an ack is unchanged and still interactive: the
-/// `dispatch` CLI verb's pre-flight (`dispatch_as_crew_of_one_with`), which
-/// runs before `run_step_graph` is ever entered.
-pub(crate) fn licensed_adjacent_ack_status(role_id: &str) -> Result<()> {
-    if !LICENSED_ADJACENT_ROLES.contains(&role_id) {
-        return Ok(());
-    }
-    let ack_path = ack_file_for(role_id)?;
-    if ack_path.exists() {
-        return Ok(());
-    }
-    print_licensed_adjacent_banner(role_id);
-    bail!(unacked_error(role_id, &ack_dir()?, &ack_path));
-}
-
-/// Licensed-adjacent ACK gate. For roles whose prompts operate in
-/// regulated domains, require an operator acknowledgment on first
-/// dispatch. The ack persists at `~/.darkmux/acks/<role>.ack` (or
-/// `$DARKMUX_ACK_DIR/<role>.ack` if set).
-///
-/// **Operator-sovereign escape hatches:**
-/// - Pre-create the file (`mkdir -p ~/.darkmux/acks && touch
-///   ~/.darkmux/acks/<role>.ack`) to skip the prompt in scripted use.
-/// - Delete the file to re-trigger the prompt on next dispatch.
-///
-/// **Non-interactive without prior ack:** bails with a clear error and
-/// the operator-facing instruction for how to pre-acknowledge.
-///
-/// **No-op for non-licensed-adjacent roles.**
-///
-/// **This variant PROMPTS, and a prompt can block forever.** It reads
-/// `stdin` with no timeout, so it belongs only on a path that owns the
-/// terminal and has nothing waiting behind it — the `dispatch` CLI verb's
-/// pre-flight (`dispatch_as_crew_of_one_with`, which runs before any graph
-/// starts) and `dispatch_internal`'s own per-dispatch check (already on the
-/// dispatching worker thread). Anything running on the scheduler's MAIN
-/// thread must use [`licensed_adjacent_ack_status`] instead — see that
-/// function's doc for why (#1511).
-pub(crate) fn require_licensed_adjacent_ack(role_id: &str) -> Result<()> {
-    if !LICENSED_ADJACENT_ROLES.contains(&role_id) {
-        return Ok(());
-    }
-    let ack_path = ack_file_for(role_id)?;
-    if ack_path.exists() {
-        return Ok(());
-    }
-
-    print_licensed_adjacent_banner(role_id);
-
-    // Non-interactive (stdin not a TTY) → bail with operator-facing
-    // remediation. The contract is that the ack is operator-explicit;
-    // we don't auto-acknowledge for scripted callers.
-    if !std::io::stdin().is_terminal() {
-        bail!(unacked_error(role_id, &ack_dir()?, &ack_path));
-    }
-
-    // Interactive: prompt for the ACKNOWLEDGE token. Anything else aborts.
-    eprint!("Type ACKNOWLEDGE to continue (or Ctrl-C to abort): ");
-    std::io::stderr().flush().ok();
-    let mut input = String::new();
-    let stdin = std::io::stdin();
-    stdin
-        .lock()
-        .read_line(&mut input)
-        .context("reading acknowledgment from stdin")?;
-    if input.trim() != "ACKNOWLEDGE" {
-        bail!(
-            "acknowledgment not given (got `{}`); dispatch aborted",
-            input.trim()
-        );
-    }
-
-    let dir = ack_dir()?;
-    fs::create_dir_all(&dir)
-        .with_context(|| format!("creating ack directory at {}", dir.display()))?;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let stamp = format!("acknowledged_at_unix_seconds={now}\n");
-    fs::write(&ack_path, stamp)
-        .with_context(|| format!("writing ack file at {}", ack_path.display()))?;
-    eprintln!();
-    eprintln!("Acknowledged. Recorded at {}.", ack_path.display());
-    eprintln!();
-    Ok(())
-}
 
 #[derive(Debug)]
 pub struct DispatchOpts {
@@ -475,9 +258,8 @@ pub struct DispatchOpts {
     /// runs before model selection and before the workspace/host-out dirs
     /// exist, so a refused resume costs no model load, no eviction, no
     /// directory materialization and no `dispatch.start` flow record
-    /// (NOT "before anything else": the licensed-adjacent ack gate, the
-    /// remote-endpoint early return, and the Docker preflight still run
-    /// ahead of it) — then, once this dispatch's own fresh host out dir
+    /// (NOT "before anything else": the remote-endpoint early return and
+    /// the Docker preflight still run ahead of it) — then, once this dispatch's own fresh host out dir
     /// exists, WRITES the already-validated checkpoint bytes into it — the
     /// old dir is left untouched as evidence, this dispatch gets its own
     /// trajectory/run record — then sets
@@ -510,8 +292,7 @@ pub struct DispatchOpts {
     /// `StepKind::resume_precheck` is the general form: `scheduler::
     /// run_step_graph` consults it for every ready step, on the main
     /// thread, strictly before `plan_waves`/`ensure_wave_loaded` — the
-    /// SAME hoist point the licensed-adjacent ack gate already uses (see
-    /// `dispatch_role`'s doc) — and it covers all three callers with one
+    /// hoist point — and it covers all three callers with one
     /// change, so the crew-of-one wrapper's own pre-mint hoist was deleted
     /// rather than kept alongside it. It calls `dispatch_internal::
     /// validate_resume_checkpoint_content` — the workdir-INDEPENDENT half
@@ -615,7 +396,7 @@ pub struct DispatchOpts {
 ///
 /// (Third review round) Not every constructor reads the profile. The bare
 /// `darkmux dispatch` CLI path (`src/main.rs`) and a few other callers
-/// (`lab`'s `prompt` provider, `review_bench.rs`, `crawl/unit_step.rs`)
+/// (`lab`'s `prompt` provider, `crawl/unit_step.rs`)
 /// build a `default()` — every field `None`, including `threshold_tokens` —
 /// and `dispatch()` patches in only `context_window`: the SELECTED model's
 /// `n_ctx` (`dispatch_internal::ensure_context_window`; #2902 — every
@@ -1559,45 +1340,6 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn licensed_adjacent_ack_passes_when_ack_file_exists() {
-        let tmp = TempDir::new().unwrap();
-        let prev = std::env::var("DARKMUX_ACK_DIR").ok();
-        // Safety: tests mutate process env; the serial attribute keeps them
-        // from racing each other.
-        unsafe {
-            std::env::set_var("DARKMUX_ACK_DIR", tmp.path());
-        }
-        std::fs::create_dir_all(tmp.path()).unwrap();
-        std::fs::write(tmp.path().join("health-research.ack"), "test").unwrap();
-
-        // ACK file present → returns Ok without prompting.
-        require_licensed_adjacent_ack("health-research").unwrap();
-
-        // Restore env.
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_ACK_DIR", v),
-                None => std::env::remove_var("DARKMUX_ACK_DIR"),
-            }
-        }
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn licensed_adjacent_ack_is_noop_for_other_roles() {
-        // No DARKMUX_ACK_DIR set, no ack file, no TTY input — but for
-        // a non-licensed-adjacent role, the gate is a no-op and returns Ok.
-        // `serial_test::serial` is defensive: the function's current
-        // implementation short-circuits before reading any env, but if a
-        // future refactor moves env reads earlier this test must not race
-        // the other two serialized tests that mutate DARKMUX_ACK_DIR.
-        require_licensed_adjacent_ack("coder").unwrap();
-        require_licensed_adjacent_ack("analyst").unwrap();
-        require_licensed_adjacent_ack("crawler").unwrap();
-    }
-
-    #[test]
-    #[serial_test::serial]
     fn augment_prompt_with_identity_passes_through_when_file_absent() {
         let tmp = TempDir::new().unwrap();
         let prev = std::env::var("DARKMUX_IDENTITY_PATH").ok();
@@ -1682,106 +1424,6 @@ mod tests {
                 None => std::env::remove_var("DARKMUX_IDENTITY_PATH"),
             }
         }
-    }
-
-    /// (#1511) The CHECK-ONLY variant the scheduler uses. It refuses
-    /// without a recorded ack and passes with one, and — the property that
-    /// matters — it reaches neither branch of the prompting variant's TTY
-    /// test, so it can never block on `stdin`. The scheduler runs this
-    /// sequentially on its main thread ahead of every job in a wave; a
-    /// prompt there would stop the whole wave, and a mission launched
-    /// detached with an inherited TTY would hang indefinitely.
-    #[test]
-    #[serial_test::serial]
-    fn the_check_only_gate_refuses_without_an_ack_and_passes_with_one() {
-        let tmp = TempDir::new().unwrap();
-        let prev = std::env::var("DARKMUX_ACK_DIR").ok();
-        // Safety: serialized.
-        unsafe {
-            std::env::set_var("DARKMUX_ACK_DIR", tmp.path());
-        }
-
-        // Unlisted role: no-op, same as the prompting variant.
-        licensed_adjacent_ack_status("coder").unwrap();
-
-        // Listed, unacked: refuses, with the operator-facing remediation.
-        let err = licensed_adjacent_ack_status("health-research").unwrap_err();
-        let s = format!("{err:#}");
-        assert!(s.contains("requires operator acknowledgment"), "got: {s}");
-        assert!(s.contains("mkdir -p"), "got: {s}");
-
-        // The ack file's mere presence is the consent record (the
-        // operator-sovereign escape hatch), and it lets the role through.
-        fs::write(tmp.path().join("health-research.ack"), "acknowledged_at_unix_seconds=1\n").unwrap();
-        licensed_adjacent_ack_status("health-research").unwrap();
-
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_ACK_DIR", v),
-                None => std::env::remove_var("DARKMUX_ACK_DIR"),
-            }
-        }
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn licensed_adjacent_ack_bails_when_no_tty_and_no_ack_file() {
-        let tmp = TempDir::new().unwrap();
-        let prev = std::env::var("DARKMUX_ACK_DIR").ok();
-        // Safety: serialized.
-        unsafe {
-            std::env::set_var("DARKMUX_ACK_DIR", tmp.path());
-        }
-
-        // Stdin in tests is not a TTY → the gate should bail with a
-        // clear remediation message rather than block on read.
-        let err = require_licensed_adjacent_ack("legal-research").unwrap_err();
-        let s = format!("{err:#}");
-        assert!(s.contains("requires operator acknowledgment"), "got: {s}");
-        assert!(s.contains("mkdir -p"), "got: {s}");
-
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_ACK_DIR", v),
-                None => std::env::remove_var("DARKMUX_ACK_DIR"),
-            }
-        }
-    }
-
-    /// (#2450) `ack_dir()`'s built-in default must scope under `DARKMUX_HOME`,
-    /// the same bug class already fixed for `fleet_file`/`flows_dir`/
-    /// `hooks_outbox_dir`/`lab_dir` in `darkmux-types::config_access`. Probed
-    /// directly (not assumed from shape) before this fix: with no
-    /// `DARKMUX_ACK_DIR` set and `DARKMUX_HOME` pointed at a throwaway root,
-    /// `ack_dir()` still resolved to the operator's REAL
-    /// `~/.darkmux/acks` — confirmed via a temporary probe test, since
-    /// `ack_dir()` writes real acknowledgment files on the operator's behalf.
-    #[test]
-    #[serial_test::serial]
-    fn ack_dir_honors_darkmux_home() {
-        let tmp = TempDir::new().unwrap();
-        let prev_home = std::env::var("DARKMUX_HOME").ok();
-        let prev_ack = std::env::var("DARKMUX_ACK_DIR").ok();
-        unsafe {
-            std::env::remove_var("DARKMUX_ACK_DIR");
-            std::env::set_var("DARKMUX_HOME", tmp.path());
-        }
-        let dir = ack_dir().unwrap();
-        unsafe {
-            match prev_home {
-                Some(v) => std::env::set_var("DARKMUX_HOME", v),
-                None => std::env::remove_var("DARKMUX_HOME"),
-            }
-            match prev_ack {
-                Some(v) => std::env::set_var("DARKMUX_ACK_DIR", v),
-                None => std::env::remove_var("DARKMUX_ACK_DIR"),
-            }
-        }
-        assert_eq!(
-            dir,
-            tmp.path().join("acks"),
-            "must scope under DARKMUX_HOME, not the real user home"
-        );
     }
 
     /// (#2450) `identity_path()`'s built-in default must scope under

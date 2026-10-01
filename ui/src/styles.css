@@ -5287,7 +5287,7 @@ body {
   margin: 14px 0 6px;
 }
 
-/* Model rows — the scaling rule's repeating element (docs/design/machine-lens/proposal.md §8):
+/* Model rows — the scaling rule's repeating element (the machine-lens proposal (deleted in 5.0) §8):
    constant height at any N, grouped darkmux-first, alphabetical within
    group. Ghost/NEW are the ONLY two state modifiers — a live row carries
    neither. */
@@ -5507,7 +5507,7 @@ body {
 
 /* ── Lab-run detail (drill-in packet) ────────────────────────────────────
    `LabRunDetail.tsx` — reached from a `kind==="lab"` row in the runs
-   board. Legacy's own `.labpipe`/`.labstage`/`.labcli`/`.labfeed*` classes
+   board. Legacy's own `.labpipe`/`.labstage`/`.labfeed*` classes
    (viewer.html) assume flex-row markup this port doesn't reproduce
    verbatim (see the machine-lens block's own note on why "line arrays,
    not legacy's structured markup" is this port's convention) — reused
@@ -5536,28 +5536,6 @@ body {
   color: var(--dim);
   font-size: calc(11px * var(--fs-scale));
   margin-top: 2px;
-}
-
-.labcli {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  padding: 10px 12px;
-  border: 1px dashed var(--border);
-  border-radius: 6px;
-  background: rgba(255, 255, 255, 0.02);
-  margin-bottom: 14px;
-  overflow-wrap: anywhere;
-}
-.labclilbl {
-  font-size: calc(10px * var(--fs-scale));
-  font-weight: 600;
-  letter-spacing: 0.06em;
-  color: var(--dim);
-}
-.labcli code {
-  font: calc(11px * var(--fs-scale)) var(--font-mono);
-  color: var(--fg);
 }
 
 .labfeedhdr {

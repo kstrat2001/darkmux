@@ -285,6 +285,9 @@ use std::path::Path;
 //           unknown key; `dirs` has no overflow map), has no effect, and
 //           `darkmux doctor` names it with the fix, alongside
 //           `DARKMUX_NOTEBOOK_DIR`.
+//           Likewise REMOVED in 5.0 with no bump of its own: `dirs.ack`
+//           (#3036, with the licensed-adjacent acknowledgment gate); doctor
+//           names it with the fix, alongside `DARKMUX_ACK_DIR`.
 //   1.30 (#2928, darkmux 4.0): additive `runtime.live_sample_ms` — the cadence of the
 //           LIVE channel: model state sampled from a running execution and
 //           pushed to the local daemon's viewers, never written to the flow
@@ -431,6 +434,13 @@ pub struct RetiredSetting {
 
 /// Every retired `config.json` key that is not a [`RENAMED_SETTINGS`] entry.
 pub const RETIRED_SETTINGS: &[RetiredSetting] = &[
+    RetiredSetting {
+        key: "dirs.ack",
+        env: Some("DARKMUX_ACK_DIR"),
+        env_policy: LeftoverPolicy::Warn,
+        line: "removed in 5.0 (#3036): the licensed-adjacent acknowledgment gate and its roles retired, so \
+               nothing writes or reads an acknowledgment file. Delete it",
+    },
     RetiredSetting {
         key: "dirs.notebook",
         env: Some("DARKMUX_NOTEBOOK_DIR"),
@@ -667,7 +677,6 @@ pub struct DirsConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub audit: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub skills: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub templates: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub ack: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub identity: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub fleet_file: Option<String>,
     /// (#1585) Where lab-run artifacts live — the scan root behind `/lab/runs`
@@ -2512,7 +2521,7 @@ mod tests {
         let found = retired_env_leftovers(&crew);
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(found[0].line.contains("DARKMUX_CREW_DIR") && found[0].line.contains("DARKMUX_HOME"), "{found:?}");
-        for var in ["DARKMUX_NOTEBOOK_DIR", "DARKMUX_RADIO_ROUTER_PROFILE"] {
+        for var in ["DARKMUX_NOTEBOOK_DIR", "DARKMUX_RADIO_ROUTER_PROFILE", "DARKMUX_ACK_DIR"] {
             let one = |k: &str| (k == var).then(|| "/x".to_string());
             let found = retired_env_leftovers(&one);
             assert_eq!(found.len(), 1, "{var} is a retired env var: {found:?}");
@@ -2523,8 +2532,8 @@ mod tests {
     /// (operator, 2026-10-01) Each leftover's policy is decided by whether
     /// ignoring it is safe: a renamed cap and the state-location
     /// `DARKMUX_CREW_DIR` refuse (silently ignoring them changes behavior);
-    /// `DARKMUX_NOTEBOOK_DIR` and `DARKMUX_RADIO_ROUTER_PROFILE` warn
-    /// (nothing reads them and nothing is lost).
+    /// `DARKMUX_NOTEBOOK_DIR`, `DARKMUX_RADIO_ROUTER_PROFILE` and
+    /// `DARKMUX_ACK_DIR` warn (nothing reads them and nothing is lost).
     #[test]
     fn each_leftover_refuses_or_warns_by_whether_ignoring_it_is_safe() {
         let policy_of = |var: &str| {
@@ -2538,7 +2547,7 @@ mod tests {
             assert_eq!(policy, LeftoverPolicy::Refuse, "{var}");
             assert!(line.contains("is refused"), "{line}");
         }
-        for var in ["DARKMUX_NOTEBOOK_DIR", "DARKMUX_RADIO_ROUTER_PROFILE"] {
+        for var in ["DARKMUX_NOTEBOOK_DIR", "DARKMUX_RADIO_ROUTER_PROFILE", "DARKMUX_ACK_DIR"] {
             let (policy, line) = policy_of(var);
             assert_eq!(policy, LeftoverPolicy::Warn, "{var}");
             assert!(line.contains("is ignored"), "{line}");

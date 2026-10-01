@@ -105,8 +105,8 @@ pub struct ResolvedSeatStaffing {
     /// task by `k` — one role is one task is one dispatch; recall breadth
     /// is a `review.json` edit (declare another probe role), never a
     /// per-run draw multiplier. The field survives for
-    /// back-compat (envelope staffing snapshots, `review-bench --k`
-    /// reporting) and is always `1` for every seat this module resolves.
+    /// back-compat (envelope staffing snapshots) and is always `1` for every
+    /// seat this module resolves.
     /// Ignored by the judge/verify seats regardless.
     pub k: u32,
     /// Judge-seat consensus DEPTH (agreement across independent judgments —

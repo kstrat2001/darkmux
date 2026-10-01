@@ -844,197 +844,41 @@ pub fn run_step_graph(
             approved
         };
 
-        // (#1511) Licensed-adjacent operator-consent gate, hoisted to run
-        // HERE — for every gate-approved ready step, on this main thread,
-        // strictly BEFORE `jobs` is built below (the structure
-        // `plan_waves`/`ensure_wave_loaded` draw their placements from).
-        // See `crate::dispatch::licensed_adjacent_ack_status`'s own doc for
-        // what "licensed-adjacent" means and the ack's operator-sovereign
-        // escape hatches.
-        //
-        // Before this, the SAME check lived only inside
-        // `dispatch_internal::dispatch` — a step's own `run`/`run_streaming`
-        // body — which `ensure_wave_loaded` (inside `run_bounded`, called
-        // further down) already runs BEFORE any step body ever executes.
-        // So a mission config staffing an unacked licensed-adjacent role
-        // pulled the model into RAM — real resource cost — before the
-        // operator ever saw the disclaimer (#1511). #1510 fixed only the
-        // `dispatch` CLI verb's own crew-of-one path
-        // (`dispatch_as_crew_of_one_with`, which calls the PROMPTING check
-        // before `run_step_graph` even starts, i.e. before ANY step in its
-        // one-step graph reaches this loop) — general mission configs
-        // (`mission launch <config>`, multi-task graphs) still routed
-        // every step through this scheduler and never got that fix.
-        //
-        // THE ROLE COMES FROM THE KIND, never from a field read here.
-        // `StepKind::dispatch_role` is asked, and it is the same method
-        // the kind's own `seat()` resolves its placement from — see that
-        // trait method's doc. An earlier version of this filter read
-        // `task.role_id.or(step.config.role_id)` directly, which is a
-        // PARALLEL GUESS: `mission.coder` takes its role off the run's
-        // `ArtifactBus` and never reads `task.role_id` at all, and
-        // `crawl.unit` defaults to `"crawler"` when the task names none —
-        // so with the gate fully in place, a task naming a benign role (or
-        // naming none) still loaded the forbidden model, because the guess
-        // and the loader were reading different sources. Both mutations
-        // were proven, not suspected; see the tests at the bottom of this
-        // module.
-        //
-        // `None` here means the KIND DECLARED it dispatches no role — a
-        // `procedural.*` step, a bare-model `dispatch.single_shot`/
-        // `dispatch.map` (including an empty map, which loads nothing), or
-        // a kind whose local seat would not resolve at all (for which the
-        // wave loader performs no load either). It is not the scheduler
-        // failing to guess. That distinction is what makes `Ok(())` safe
-        // here, and the registry conformance tests assert the implication
-        // that backs it: a kind whose seat claims a real model or endpoint
-        // must name a role.
-        //
-        // Filtering here, before `jobs` is built, means an unacked step's
-        // placement is never handed to `plan_waves` at all — there is
-        // nothing to "half-load": the step is dropped from THIS wave
-        // exactly like a declined operator gate above (`apply_step_terminal`,
-        // identical terminal shape), and every OTHER ready step in the
-        // same wave — including a sibling actually bound for a real load —
-        // is unaffected. A whole-wave refusal was considered and rejected:
-        // consent is a per-ROLE decision, not a per-wave one, so failing
-        // only the offending step (loud, via its own terminal error) keeps
-        // an unrelated sibling's dispatch from being held hostage by a
-        // DIFFERENT role's missing acknowledgment — the same "fail the one
-        // step, not the batch" precedent the gate-decline filter above and
-        // `ensure_wave_loaded`'s own per-placement refusal both already
-        // establish.
-        //
-        // And it NEVER PROMPTS. `licensed_adjacent_ack_status` is the
-        // check-only variant on purpose — but NOT merely because this loop
-        // is on the main thread: `resolve_gate` above blocks on that same
-        // thread and says so in its own comment. The difference is opt-in.
-        // A gate blocks only for a step the operator marked `gate:
-        // "operator"` in the mission config; a consent prompt would sit on
-        // the path of EVERY ready step of EVERY wave in EVERY graph,
-        // including a mission launched detached with an inherited TTY,
-        // which would hang indefinitely while eating the parent shell's
-        // keystrokes. The interactive prompt stays where it already was, on
-        // the CLI verb's pre-`run_step_graph` path. See
-        // `licensed_adjacent_ack_status`'s own doc.
-        // (#2614 review, "Also fix" — merged) This used to be TWO separate
-        // loops back to back over the same `ready_ids` — the licensed-
-        // adjacent consent gate (#1511, doc below) and the `--resume-from`
-        // checkpoint gate (#2614, doc below) — each independently cloning
-        // the same `step`/`task` snapshot and calling the same
-        // `gather_inputs` (which clones every satisfied dependency's whole
-        // output; on a fan-out wave that cost is siblings × upstream
-        // bytes) for every step that reached it. `resume_precheck` reads
-        // `input` at all only inside `dispatch.internal`'s own resume-
-        // gated branch — every OTHER kind (i.e. the overwhelming majority
-        // of dispatches, and every dispatch that isn't a `--resume-from`
-        // one) ignored it entirely, so the second loop's whole `input`
-        // computation was pure waste layered on top of the first loop's
-        // identical, already-wasted-per-kind computation. One pass, one
-        // snapshot, one `gather_inputs`, one `ctx` — both gates still run
-        // in the SAME order (ack before resume) with the SAME "fail the
-        // one step, not the batch" shape, so a step that fails the ack
-        // gate is refused there and never reaches the resume check, byte-
-        // for-byte matching what two sequential loops produced.
-        //
-        // (#1511) Licensed-adjacent operator-consent gate — for every
+        // (#2614) The `--resume-from` checkpoint gate: for every
         // gate-approved ready step, on this main thread, strictly BEFORE
         // `jobs` is built below (the structure `plan_waves`/
-        // `ensure_wave_loaded` draw their placements from). See
-        // `crate::dispatch::licensed_adjacent_ack_status`'s own doc for
-        // what "licensed-adjacent" means and the ack's operator-sovereign
-        // escape hatches.
+        // `ensure_wave_loaded` draw their placements from).
         //
-        // Before this, the SAME check lived only inside
-        // `dispatch_internal::dispatch` — a step's own `run`/`run_streaming`
-        // body — which `ensure_wave_loaded` (inside `run_bounded`, called
-        // further down) already runs BEFORE any step body ever executes.
-        // So a mission config staffing an unacked licensed-adjacent role
-        // pulled the model into RAM — real resource cost — before the
-        // operator ever saw the disclaimer (#1511). #1510 fixed only the
-        // `dispatch` CLI verb's own crew-of-one path
-        // (`dispatch_as_crew_of_one_with`, which calls the PROMPTING check
-        // before `run_step_graph` even starts, i.e. before ANY step in its
-        // one-step graph reaches this loop) — general mission configs
-        // (`mission launch <config>`, multi-task graphs) still routed
-        // every step through this scheduler and never got that fix.
-        //
-        // THE ROLE COMES FROM THE KIND, never from a field read here.
-        // `StepKind::dispatch_role` is asked, and it is the same method
-        // the kind's own `seat()` resolves its placement from — see that
-        // trait method's doc. An earlier version of this filter read
-        // `task.role_id.or(step.config.role_id)` directly, which is a
-        // PARALLEL GUESS: `mission.coder` takes its role off the run's
-        // `ArtifactBus` and never reads `task.role_id` at all, and
-        // `crawl.unit` defaults to `"crawler"` when the task names none —
-        // so with the gate fully in place, a task naming a benign role (or
-        // naming none) still loaded the forbidden model, because the guess
-        // and the loader were reading different sources. Both mutations
-        // were proven, not suspected; see the tests at the bottom of this
-        // module.
-        //
-        // `None` here means the KIND DECLARED it dispatches no role — a
-        // `procedural.*` step, a bare-model `dispatch.single_shot`/
-        // `dispatch.map` (including an empty map, which loads nothing), or
-        // a kind whose local seat would not resolve at all (for which the
-        // wave loader performs no load either). It is not the scheduler
-        // failing to guess. That distinction is what makes `Ok(())` safe
-        // here, and the registry conformance tests assert the implication
-        // that backs it: a kind whose seat claims a real model or endpoint
-        // must name a role.
-        //
-        // And it NEVER PROMPTS. `licensed_adjacent_ack_status` is the
-        // check-only variant on purpose — but NOT merely because this loop
-        // is on the main thread: `resolve_gate` above blocks on that same
-        // thread and says so in its own comment. The difference is opt-in.
-        // A gate blocks only for a step the operator marked `gate:
-        // "operator"` in the mission config; a consent prompt would sit on
-        // the path of EVERY ready step of EVERY wave in EVERY graph,
-        // including a mission launched detached with an inherited TTY,
-        // which would hang indefinitely while eating the parent shell's
-        // keystrokes. The interactive prompt stays where it already was, on
-        // the CLI verb's pre-`run_step_graph` path. See
-        // `licensed_adjacent_ack_status`'s own doc.
-        //
-        // (#2614) The `--resume-from` checkpoint gate, run second — for
-        // the identical reason the ack gate above is hoisted here:
         // `dispatch.internal`'s own in-body copy
         // (`dispatch_internal::dispatch`'s `validate_resume_checkpoint`
         // call) sits behind `run()`, which `ensure_wave_loaded` (inside
         // `run_bounded`, further down) already runs BEFORE any step body
         // executes. #2585 fixed this ONLY on `darkmux dispatch`'s own
-        // crew-of-one path — a mission config or the panel staffing a
-        // `dispatch.internal` step with `resume_from` in its config went
-        // through neither hoist, so a bad checkpoint on those paths still
+        // crew-of-one path, so a mission config or the panel staffing a
+        // `dispatch.internal` step with `resume_from` in its config still
         // paid the full residency cost (evict + load tens of gigabytes)
-        // before ever being refused, and the error named a model load
-        // rather than the checkpoint that caused it. `kind.resume_precheck`
-        // — never a parallel guess at what `dispatch.internal` reads off
-        // `step.config` — see that method's own doc for why it is asked of
-        // the kind rather than re-derived here, and for why it
-        // deliberately does NOT validate the working directory itself
-        // (only `dispatch_internal::validate_resume_checkpoint_content`,
-        // the workdir-independent half of the gate): a mission graph's
-        // workdir can legitimately be a path a still-earlier step in the
-        // same run materializes, so a scheduler-side existence check would
-        // refuse work that is only valid once the wave actually runs.
-        // Defaults to `Ok(())` for every kind that never reads
-        // `resume_from` — every kind except `dispatch.internal` today.
+        // before being refused, and the error named a model load rather
+        // than the checkpoint that caused it. `kind.resume_precheck` is
+        // asked of the kind, never a parallel guess at what
+        // `dispatch.internal` reads off `step.config`; see that method's own
+        // doc for why it deliberately does NOT validate the working
+        // directory itself (only
+        // `dispatch_internal::validate_resume_checkpoint_content`, the
+        // workdir-independent half): a mission graph's workdir can
+        // legitimately be a path a still-earlier step in the same run
+        // materializes. Defaults to `Ok(())` for every kind that never reads
+        // `resume_from`, every kind except `dispatch.internal` today.
         //
-        // Filtering here, before `jobs` is built, means a refused/unacked
-        // step's placement is never handed to `plan_waves` at all — there
-        // is nothing to "half-load": the step is dropped from THIS wave
-        // exactly like a declined operator gate above (`apply_step_terminal`,
-        // identical terminal shape), and every OTHER ready step in the
-        // same wave — including a sibling actually bound for a real load —
-        // is unaffected. A whole-wave refusal was considered and rejected
-        // for both gates: consent/resume validity is a per-STEP decision,
-        // not a per-wave one, so failing only the offending step (loud,
-        // via its own terminal error) keeps an unrelated sibling's
-        // dispatch from being held hostage — the same "fail the one step,
-        // not the batch" precedent the gate-decline filter above and
-        // `ensure_wave_loaded`'s own per-placement refusal both already
-        // establish.
+        // Filtering here, before `jobs` is built, means a refused step's
+        // placement is never handed to `plan_waves` at all: the step is
+        // dropped from THIS wave exactly like a declined operator gate above
+        // (`apply_step_terminal`, identical terminal shape), and every OTHER
+        // ready step in the same wave is unaffected. Resume validity is a
+        // per-STEP decision, so failing only the offending step (loud, via
+        // its own terminal error) keeps an unrelated sibling from being held
+        // hostage, the same "fail the one step, not the batch" precedent the
+        // gate-decline filter above and `ensure_wave_loaded`'s own
+        // per-placement refusal both establish.
         let ready_ids: Vec<String> = {
             let mut approved: Vec<String> = Vec::with_capacity(ready_ids.len());
             for id in ready_ids {
@@ -1053,9 +897,6 @@ pub fn run_step_graph(
                     approved.push(id);
                     continue;
                 };
-                // Computed ONCE, shared by both gates below — see this
-                // block's own doc for why a second, identical computation
-                // per step was pure waste.
                 let input = gather_inputs(&step_snapshot, &task_snapshot, tasks, steps);
                 // The same run-scoped `ArtifactBus` `seat()` and
                 // `run_streaming` read below — `mission.coder` resolves its
@@ -1070,31 +911,6 @@ pub fn run_step_graph(
                     dispatch_override.clone(),
                     bus.clone(),
                 );
-
-                let ack_result = match kind.dispatch_role(&step_snapshot, &task_snapshot, &input, &ctx) {
-                    Some(role_id) => crate::dispatch::licensed_adjacent_ack_status(&role_id),
-                    None => Ok(()),
-                };
-                if let Err(e) = ack_result {
-                    apply_step_terminal(
-                        run,
-                        steps,
-                        tasks,
-                        &mut report,
-                        &mut *emit,
-                        &mut *persist,
-                        &id,
-                        now_unix(),
-                        // Refused before any dispatch attempt — nothing
-                        // to time, so no `StepRecord`, same as a
-                        // declined gate above.
-                        None,
-                        Err(format!("{e:#}")),
-                        Vec::new(),
-                        None,
-                    );
-                    continue;
-                }
 
                 match kind.resume_precheck(&step_snapshot, &task_snapshot, &input, &ctx) {
                     Ok(()) => approved.push(id),
@@ -1120,9 +936,8 @@ pub fn run_step_graph(
         };
 
         if ready_ids.is_empty() {
-            // Every step ready this wave was gate-declined, refused the
-            // licensed-adjacent consent gate, or refused its own
-            // `resume_precheck` (#2614) — nothing left to run THIS wave,
+            // Every step ready this wave was gate-declined or refused its
+            // own `resume_precheck` (#2614) — nothing left to run THIS wave,
             // but a later wave may still have work (a sibling task the
             // decline/refusal didn't touch). Loop back to `step_is_ready`
             // rather than falling through the empty-wave machinery below
@@ -3375,16 +3190,6 @@ mod tests {
 
         struct PanicKind;
         impl StepKind for PanicKind {
-            /// (#1511) A test fixture that dispatches no role. Its seat is model-free, so the consent gate has nothing to check.
-            fn dispatch_role(
-                &self,
-                _step: &Step,
-                _task: &Task,
-                _input: &BTreeMap<String, String>,
-                _ctx: &StepRunCtx,
-            ) -> Option<String> {
-                None
-            }
             /// (#2394) This fixture runs no model.
             fn seat(
                 &self,
@@ -3864,16 +3669,6 @@ mod tests {
         log: Arc<Mutex<Vec<(String, bool, bool)>>>,
     }
     impl StepKind for BucketProbeKind {
-        /// (#1511) A test fixture that dispatches no role. Its seat is model-free, so the consent gate has nothing to check.
-        fn dispatch_role(
-            &self,
-            _step: &Step,
-            _task: &Task,
-            _input: &BTreeMap<String, String>,
-            _ctx: &StepRunCtx,
-        ) -> Option<String> {
-            None
-        }
         /// (#2394) This fixture runs no model.
         fn seat(
             &self,
@@ -3999,9 +3794,6 @@ mod tests {
     /// for a `dispatch.map` where some items failed.
     struct DegradedKind;
     impl StepKind for DegradedKind {
-        fn dispatch_role(&self, _s: &Step, _t: &Task, _i: &BTreeMap<String, String>, _c: &StepRunCtx) -> Option<String> {
-            None
-        }
         fn seat(&self, _s: &Step, _t: &Task, _i: &BTreeMap<String, String>, _c: &StepRunCtx) -> SeatClaim {
             SeatClaim::NoModel
         }
@@ -4056,16 +3848,6 @@ mod tests {
     /// before the wave loop starts.
     struct ArtifactWriterKind;
     impl StepKind for ArtifactWriterKind {
-        /// (#1511) A test fixture that dispatches no role. Its seat is model-free, so the consent gate has nothing to check.
-        fn dispatch_role(
-            &self,
-            _step: &Step,
-            _task: &Task,
-            _input: &BTreeMap<String, String>,
-            _ctx: &StepRunCtx,
-        ) -> Option<String> {
-            None
-        }
         /// (#2394) This fixture runs no model.
         fn seat(
             &self,
@@ -4108,16 +3890,6 @@ mod tests {
     /// completed step's persisted output.
     struct ArtifactReaderKind;
     impl StepKind for ArtifactReaderKind {
-        /// (#1511) A test fixture that dispatches no role. Its seat is model-free, so the consent gate has nothing to check.
-        fn dispatch_role(
-            &self,
-            _step: &Step,
-            _task: &Task,
-            _input: &BTreeMap<String, String>,
-            _ctx: &StepRunCtx,
-        ) -> Option<String> {
-            None
-        }
         /// (#2394) This fixture runs no model.
         fn seat(
             &self,
@@ -4195,16 +3967,6 @@ mod tests {
     /// observable.
     struct SleepKind;
     impl StepKind for SleepKind {
-        /// (#1511) A test fixture that dispatches no role. Its seat is model-free, so the consent gate has nothing to check.
-        fn dispatch_role(
-            &self,
-            _step: &Step,
-            _task: &Task,
-            _input: &BTreeMap<String, String>,
-            _ctx: &StepRunCtx,
-        ) -> Option<String> {
-            None
-        }
         /// (#2394) Declares a HOSTED seat explicitly, so the tests built on it keep
     /// exercising what they were written to exercise: `remote_cap`
     /// serializing genuinely remote dispatches. Before #2394 this kind
@@ -4681,16 +4443,6 @@ mod tests {
     /// dispatch behavior.
     struct DeclaredSeatKind(fn() -> SeatClaim);
     impl StepKind for DeclaredSeatKind {
-        /// (#1511) A test fixture that dispatches no role. The role, not the seat, is what the consent gate reads; this fixture names none.
-        fn dispatch_role(
-            &self,
-            _step: &Step,
-            _task: &Task,
-            _input: &BTreeMap<String, String>,
-            _ctx: &StepRunCtx,
-        ) -> Option<String> {
-            None
-        }
         fn id(&self) -> &'static str {
             "test.declared-seat"
         }
@@ -4905,16 +4657,6 @@ mod tests {
     fn errored_step_that_actually_ran_still_gets_a_record_with_real_duration() {
         struct FailingSleepKind;
         impl StepKind for FailingSleepKind {
-            /// (#1511) A test fixture that dispatches no role. Its seat is model-free, so the consent gate has nothing to check.
-            fn dispatch_role(
-                &self,
-                _step: &Step,
-                _task: &Task,
-                _input: &BTreeMap<String, String>,
-                _ctx: &StepRunCtx,
-            ) -> Option<String> {
-                None
-            }
             /// (#2394) Declares a HOSTED seat explicitly, so the tests built on it keep
     /// exercising what they were written to exercise: `remote_cap`
     /// serializing genuinely remote dispatches. Before #2394 this kind
@@ -5033,16 +4775,6 @@ mod tests {
         /// depending on `dispatch.map`'s own collection-shaped residency.
         struct LocalModelKind;
         impl StepKind for LocalModelKind {
-            /// (#1511) A test fixture that dispatches no role. The role, not the seat, is what the consent gate reads; this fixture names none.
-            fn dispatch_role(
-                &self,
-                _step: &Step,
-                _task: &Task,
-                _input: &BTreeMap<String, String>,
-                _ctx: &StepRunCtx,
-            ) -> Option<String> {
-                None
-            }
             fn id(&self) -> &'static str {
                 "test.local-model"
             }
@@ -5128,42 +4860,19 @@ mod tests {
         assert_eq!(steps["needs-model-step"].status, NodeStatus::Error);
     }
 
-    // ─── #1511: the licensed-adjacent consent gate runs before the loader ───
+    // ─── #2614: the resume-checkpoint gate runs before the loader ───
     //
-    // Five tests share the three fixtures below. What they pin, together:
-    //
-    // - the gate runs BEFORE `ensure_wave_loaded`, not inside the step body
-    //   after it (the ordering bug #1511 closes);
-    // - the role it checks is the role THE KIND WILL DISPATCH — asked via
-    //   `StepKind::dispatch_role`, from the same source the kind's `seat()`
-    //   resolves its placement from — not a field read the scheduler
-    //   performs on the kind's behalf;
-    // - the `StepRunCtx` the gate hands that kind carries the RUN-SCOPED
-    //   `ArtifactBus` (the seam `mission.coder` — the kind that motivated
-    //   this fix — resolves its role through; see
-    //   `the_gates_ctx_carries_the_run_scoped_bus_the_kind_reads_its_role_from`);
-    // - a refusal drops only the offending step, never its siblings;
-    // - and an ACKED licensed-adjacent role loads and runs normally, so the
-    //   gate is a consent check and not a ban.
+    // What the fixtures below pin: the gate runs BEFORE `ensure_wave_loaded`
+    // for a generic mission-graph step, and a refusal drops only the
+    // offending step, never its siblings.
 
-    /// A kind that dispatches a ROLE and takes a local model seat, with the
-    /// two decoupled exactly the way the shipping kinds decouple them: the
-    /// model comes from `config.model_key`, and the ROLE comes from
-    /// `config.seat_role` FIRST, falling back to `task.role_id`.
-    ///
-    /// That fallback order is not decoration — it is the whole shape of the
-    /// bug this fixture exists to catch. `mission.coder` resolves its
-    /// dispatch role off the run's `ArtifactBus` and never reads
-    /// `task.role_id`; `crawl.unit` falls back to a hardcoded `"crawler"`
-    /// when the task names nothing. In both, the role the scheduler could
-    /// see on the Task and the role the kind actually dispatches are
-    /// DIFFERENT VALUES. `config.seat_role` stands in for "wherever this
-    /// kind really gets its role", and `task.role_id` for "what a field
-    /// read in the scheduler would have guessed".
+    /// A kind that takes a local model seat (the model comes from
+    /// `config.model_key`) and resolves a role from `config.seat_role`,
+    /// falling back to `task.role_id`, for `resume_precheck` to validate a
+    /// checkpoint against.
     struct RoleLocalModelKind;
     impl RoleLocalModelKind {
-        /// The single role source — read by `dispatch_role` below, and the
-        /// value the dispatch would really use.
+        /// The role a resume is validated against.
         fn role_of(step: &Step, task: &Task) -> Option<String> {
             step.config
                 .get("seat_role")
@@ -5196,19 +4905,6 @@ mod tests {
                 seat: format!("step:{}", step.id),
             })
         }
-        /// (#1511) The role this kind would really dispatch — the ONE source
-        /// the consent gate reads. Mutating this to `task.role_id.clone()`
-        /// (the parallel guess the first fix used) is what red-proves the
-        /// two divergence tests below.
-        fn dispatch_role(
-            &self,
-            step: &Step,
-            task: &Task,
-            _input: &BTreeMap<String, String>,
-            _ctx: &StepRunCtx,
-        ) -> Option<String> {
-            Self::role_of(step, task)
-        }
         fn run(&self, _step: &Step, _task: &Task, _input: &BTreeMap<String, String>, _ctx: &StepRunCtx) -> Result<StepOutcome> {
             Ok(StepOutcome { output: "ok".to_string(), flow_records: vec![], degraded: None })
         }
@@ -5240,100 +4936,11 @@ mod tests {
         }
     }
 
-    /// The artifact name `BusRoleLocalModelKind` below reads its dispatch
-    /// role from — standing in for `mission.coder`'s
-    /// `coder_phase::CODER_CONTEXT_ARTIFACT`.
-    const CONSENT_ROLE_ARTIFACT: &str = "test.consent-role";
-
-    /// (#1511, re-review blocker) The `mission.coder` shape at the SEAM:
-    /// a kind whose dispatch role lives ONLY on the run-scoped
-    /// `ArtifactBus` — not on the Task, not in `step.config`.
-    ///
-    /// `RoleLocalModelKind` above proves the gate asks the KIND; it cannot
-    /// prove the gate hands that kind a usable `StepRunCtx`, because it
-    /// ignores `ctx` entirely. The registry conformance tests in
-    /// `mission_launch` call `dispatch_role` directly and never enter
-    /// `run_step_graph`, so they cannot prove it either. This fixture
-    /// closes the join, and it is the join that matters most: `mission.coder`
-    /// is the kind the whole rewrite hinges on, and it reads NOTHING but
-    /// the bus.
-    ///
-    /// Red-prove: in `run_step_graph`'s consent filter, build the gate's
-    /// `StepRunCtx` with a fresh `Arc::new(ArtifactBus::new())` instead of
-    /// `bus.clone()`. `dispatch_role` then returns `None`, the gate's
-    /// `None => Ok(())` arm approves the step, and the job loop's own
-    /// `seat()` — which reads the REAL bus — resolves `forbidden-model`
-    /// and the host panics. That is #1511 verbatim, with every other test
-    /// in this crate still green.
-    struct BusRoleLocalModelKind;
-    impl BusRoleLocalModelKind {
-        /// The single role source — the run-scoped bus, and nothing else.
-        fn role_of(ctx: &StepRunCtx) -> Option<String> {
-            ctx.artifact::<String>(CONSENT_ROLE_ARTIFACT).map(|r| (*r).clone())
-        }
-    }
-    impl StepKind for BusRoleLocalModelKind {
-        fn id(&self) -> &'static str {
-            "test.bus-role-local-model"
-        }
-        /// Declared like `mission.coder`'s, so the graph's composition
-        /// check demands the caller actually seed it.
-        fn requires(&self) -> &'static [crate::step_kinds::Port] {
-            const PORTS: [crate::step_kinds::Port; 1] =
-                [crate::step_kinds::Port::artifact(CONSENT_ROLE_ARTIFACT, || {
-                    std::sync::Arc::new(String::new()) as std::sync::Arc<dyn std::any::Any + Send + Sync>
-                })];
-            &PORTS
-        }
-        /// Placement is gated on the SAME bus read `dispatch_role` makes —
-        /// `mission.coder`'s shape (`resolve_local_seat(&ctx.role, …)`).
-        /// With no role on the bus there is nothing to place, so the seat
-        /// is unresolved and the wave loader performs no load, exactly as
-        /// `mission.coder` behaves with no `coder.context`.
-        fn seat(
-            &self,
-            step: &Step,
-            _task: &Task,
-            _input: &BTreeMap<String, String>,
-            ctx: &StepRunCtx,
-        ) -> SeatClaim {
-            if Self::role_of(ctx).is_none() {
-                return SeatClaim::LocalModelUnresolved {
-                    reason: format!("no `{CONSENT_ROLE_ARTIFACT}` artifact on the run's bus"),
-                };
-            }
-            let model_key = step
-                .config
-                .get("model_key")
-                .and_then(|v| v.as_str())
-                .expect("test fixture always sets model_key")
-                .to_string();
-            SeatClaim::LocalModel(darkmux_gestalt::Placement {
-                identifier: format!("darkmux:{model_key}"),
-                model_key,
-                min_ctx: 8_000,
-                seat: format!("step:{}", step.id),
-            })
-        }
-        fn dispatch_role(
-            &self,
-            _step: &Step,
-            _task: &Task,
-            _input: &BTreeMap<String, String>,
-            ctx: &StepRunCtx,
-        ) -> Option<String> {
-            Self::role_of(ctx)
-        }
-        fn run(&self, _step: &Step, _task: &Task, _input: &BTreeMap<String, String>, _ctx: &StepRunCtx) -> Result<StepOutcome> {
-            Ok(StepOutcome { output: "ok".to_string(), flow_records: vec![], degraded: None })
-        }
-    }
-
     /// Wraps a real `MockHost` but PANICS if `load` is ever called for
     /// `forbidden`. This is the mutation-provable half of every proof
     /// below: not an assertion checked after the fact, a hard failure the
     /// instant the pre-fix ordering (or a gate reading the wrong role)
-    /// would reach the loader. A test that only checked the licensed step's
+    /// would reach the loader. A test that only checked the refused step's
     /// `Err` could pass even if the load happened first; this cannot.
     struct PanicOnForbiddenLoadHost {
         forbidden: &'static str,
@@ -5355,9 +4962,9 @@ mod tests {
         ) -> std::result::Result<darkmux_gestalt::LoadReport, darkmux_gestalt::HostError> {
             assert_ne!(
                 model_key, self.forbidden,
-                "darkmux: the licensed-adjacent consent gate must run BEFORE \
-                 ensure_wave_loaded, on the role the kind will actually dispatch — \
-                 this host must never be asked to load the unacked role's model (#1511)"
+                "darkmux: the resume-checkpoint gate must run BEFORE \
+                 ensure_wave_loaded — this host must never be asked to load \
+                 the refused step's model (#2614)"
             );
             self.inner.load(model_key, identifier, min_ctx, deadline)
         }
@@ -5371,35 +4978,11 @@ mod tests {
     }
 
     /// Run a `RoleLocalModelKind` graph against a host that panics on
-    /// `forbidden-model`, with `DARKMUX_ACK_DIR` pointed at `ack_dir` for
-    /// the duration. Every caller is `#[serial_test::serial]` — the env var
-    /// is process-global.
-    fn run_consent_graph(
-        ack_dir: &std::path::Path,
-        entries: Vec<(Task, Step)>,
-    ) -> (BTreeMap<String, Step>, SchedulerReport) {
-        run_consent_graph_seeded(ack_dir, entries, &[])
-    }
-
-    /// `run_consent_graph` with the CALLER-SEED path onto the run-scoped
-    /// `ArtifactBus` exercised — how the coder-phase launcher supplies
-    /// `mission.coder`'s context, and the only way `BusRoleLocalModelKind`
-    /// above can resolve a role at all.
-    fn run_consent_graph_seeded(
-        ack_dir: &std::path::Path,
-        entries: Vec<(Task, Step)>,
-        seed: &[(&'static str, std::sync::Arc<dyn std::any::Any + Send + Sync>)],
-    ) -> (BTreeMap<String, Step>, SchedulerReport) {
-        let prev = std::env::var("DARKMUX_ACK_DIR").ok();
-        // Safety: every caller is serialized.
-        unsafe {
-            std::env::set_var("DARKMUX_ACK_DIR", ack_dir);
-        }
-
+    /// `forbidden-model`.
+    fn run_resume_graph(entries: Vec<(Task, Step)>) -> (BTreeMap<String, Step>, SchedulerReport) {
         let (tasks, mut steps) = graph(entries);
         let kinds = StepKindRegistry::new();
         kinds.register(Arc::new(RoleLocalModelKind)).unwrap();
-        kinds.register(Arc::new(BusRoleLocalModelKind)).unwrap();
         let facts = Facts {
             budget: darkmux_gestalt::Budget { max_darkmux_bytes: Some(20_000_000_000) },
             ..Default::default()
@@ -5415,95 +4998,26 @@ mod tests {
         let report = run_step_graph(
             &crate::test_run(),
             &mut steps, &tasks, &kinds, &facts, &est, 8, &factory,
-            &mut |_r| {}, &mut |_s| {}, None, None, seed,
+            &mut |_r| {}, &mut |_s| {}, None, None, &[],
         )
         .unwrap();
-
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_ACK_DIR", v),
-                None => std::env::remove_var("DARKMUX_ACK_DIR"),
-            }
-        }
         (steps, report)
     }
 
-    /// Assert the step was refused by the consent gate — loud, naming the
-    /// requirement, never a load error and never a silent drop.
-    fn assert_refused_for_consent(steps: &BTreeMap<String, Step>, report: &SchedulerReport, step_id: &str) {
-        assert_eq!(steps[step_id].status, NodeStatus::Error);
-        let message = steps[step_id].output.clone().unwrap_or_default();
-        assert!(
-            message.contains("requires operator acknowledgment"),
-            "expected the licensed-adjacent ack error for `{step_id}`, got: {message}"
-        );
-        assert!(report.errored.contains(&step_id.to_string()));
-    }
-
-    /// (#1511) The consent-gate ordering bug this fix closes: a mission
-    /// config staffing an UNACKED licensed-adjacent role must never reach
-    /// `ensure_wave_loaded` for that role's model — the gate has to run
-    /// BEFORE the load, not inside the step body after it. Two ready
-    /// steps land in the SAME wave (no deps between them): one bound to
-    /// `health-research` (licensed-adjacent, no prior ack) wanting
-    /// `forbidden-model`, one bound to an ordinary role wanting
-    /// `normal-model`. This proves ORDER, not mere presence, two ways:
-    ///
-    /// 1. The host's `load` PANICS if ever asked to load `forbidden-model`
-    ///    — see `PanicOnForbiddenLoadHost`.
-    /// 2. The sibling step's model DOES load and DOES run to completion —
-    ///    proving the fix drops only the offending step, not the whole
-    ///    wave (an unrelated role's consent gap must not hold a sibling's
-    ///    dispatch hostage).
-    ///
-    /// This is the TASK-sourced shape (`dispatch.internal`'s): the kind's
-    /// `dispatch_role` falls through to `task.role_id`. The two tests below
-    /// cover the shapes where it does not.
+    /// (#2614 review, MUST FIX) `--resume-from` on a GENERIC mission-graph
+    /// step, with no crew-of-one wrapper anywhere in the call path: the
+    /// exact shape a `mission launch <config>` step or the panel runs
+    /// through, which #2585's wrapper-local hoist never reached at all. Two
+    /// ready steps land in the SAME wave (no deps): one carries a
+    /// `resume_from` pointing at a directory with NO `checkpoint.json` and
+    /// wants `forbidden-model`; the other carries no `resume_from` at all
+    /// and wants `normal-model`. Proves ORDER, not mere presence: the host
+    /// PANICS if ever asked to load `forbidden-model` (so the refusal must
+    /// fire before `ensure_wave_loaded`), and the sibling still loads its
+    /// own model and runs to completion (a bad resume on one step must not
+    /// hold an unrelated sibling's dispatch hostage).
     #[test]
-    #[serial_test::serial]
-    fn licensed_adjacent_role_never_reaches_the_wave_loader() {
-        let ack_dir = tempfile::TempDir::new().unwrap(); // empty — "health-research" has no prior ack
-
-        let (mut licensed_task, licensed_step) =
-            kinded_step("licensed", "test.role-local-model", json!({"model_key": "forbidden-model"}), &[]);
-        licensed_task.role_id = Some("health-research".to_string());
-
-        let (mut ok_task, ok_step) =
-            kinded_step("ok", "test.role-local-model", json!({"model_key": "normal-model"}), &[]);
-        ok_task.role_id = Some("coder".to_string());
-
-        let (steps, report) =
-            run_consent_graph(ack_dir.path(), vec![(licensed_task, licensed_step), (ok_task, ok_step)]);
-
-        assert_refused_for_consent(&steps, &report, "licensed-step");
-
-        // The sibling in the SAME wave is unaffected — the wave does not
-        // half-load because ONE of its placements was unacked.
-        assert_eq!(steps["ok-step"].status, NodeStatus::Complete);
-        assert_eq!(steps["ok-step"].output.as_deref(), Some("ok"));
-        assert!(report.completed.contains(&"ok-step".to_string()));
-    }
-
-    /// (#2614 review, MUST FIX) The gap the ack-gate test above does NOT
-    /// cover: `--resume-from` on a GENERIC mission-graph step, with no
-    /// crew-of-one wrapper anywhere in the call path — the exact shape a
-    /// `mission launch <config>` step or the panel runs through, which
-    /// #2585's wrapper-local hoist never reached at all. Two ready steps
-    /// land in the SAME wave (no deps, both an ordinary `"coder"` role so
-    /// the licensed-adjacent gate has nothing to say about either): one
-    /// carries a `resume_from` pointing at a directory with NO
-    /// `checkpoint.json` and wants `forbidden-model`; the other carries no
-    /// `resume_from` at all and wants `normal-model`. Proves ORDER, not
-    /// mere presence, the same two ways `licensed_adjacent_role_never_
-    /// reaches_the_wave_loader` does: the host PANICS if ever asked to
-    /// load `forbidden-model` (so the refusal must fire before
-    /// `ensure_wave_loaded`), and the sibling still loads its own model
-    /// and runs to completion (a bad resume on one step must not hold an
-    /// unrelated sibling's dispatch hostage).
-    #[test]
-    #[serial_test::serial]
     fn resume_precheck_never_reaches_the_wave_loader_for_a_generic_mission_graph_step() {
-        let ack_dir = tempfile::TempDir::new().unwrap(); // "coder" isn't licensed-adjacent; unused
         let resume_from = tempfile::TempDir::new().unwrap(); // no checkpoint.json written
 
         let (mut resume_task, resume_step) = kinded_step(
@@ -5522,7 +5036,7 @@ mod tests {
         ok_task.role_id = Some("coder".to_string());
 
         let (steps, report) =
-            run_consent_graph(ack_dir.path(), vec![(resume_task, resume_step), (ok_task, ok_step)]);
+            run_resume_graph(vec![(resume_task, resume_step), (ok_task, ok_step)]);
 
         assert_eq!(steps["resume-step"].status, NodeStatus::Error);
         let message = steps["resume-step"].output.clone().unwrap_or_default();
@@ -5533,214 +5047,6 @@ mod tests {
         assert_eq!(steps["ok-step"].status, NodeStatus::Complete);
         assert_eq!(steps["ok-step"].output.as_deref(), Some("ok"));
         assert!(report.completed.contains(&"ok-step".to_string()));
-    }
-
-    /// (#2614 review, Also-fix 1) Pins the ORDER the two hoisted gates run
-    /// in for a single step that fails BOTH — something neither test above
-    /// can do. `licensed_adjacent_role_never_reaches_the_wave_loader`'s
-    /// step carries no `resume_from` at all, and `resume_precheck_never_
-    /// reaches_the_wave_loader_for_a_generic_mission_graph_step`'s step is
-    /// bound to an ordinary, non-licensed-adjacent role — neither step in
-    /// either test could ever fail the OTHER gate, so neither test can
-    /// tell "ack ran first" apart from "resume ran first". This one can:
-    /// the step is bound to `health-research` (licensed-adjacent, no prior
-    /// ack — fails the ack gate) AND carries a `resume_from` pointing at a
-    /// directory with no `checkpoint.json` (would ALSO fail
-    /// `resume_precheck` if it ever ran). `RoleLocalModelKind::
-    /// resume_precheck` resolves its role the same way `dispatch_role`
-    /// does — falls through to `task.role_id`, here `"health-research"` —
-    /// so if the resume check ran FIRST it would produce its own,
-    /// distinct "RESUME CHECKPOINT NOT FOUND" message instead of the ack
-    /// gate's "requires operator acknowledgment" one: a real, observable
-    /// difference, not a coincidence of shared wording.
-    ///
-    /// Today's merged loop (`run_step_graph`'s single filter pass: ack
-    /// check, `continue` on failure BEFORE `resume_precheck` is ever
-    /// called) reports the ack message. If that ordering ever flips, this
-    /// test starts reporting the resume message instead and fails loud,
-    /// naming the mismatch — an unacknowledged role's checkpoint must
-    /// never be read off disk before the consent gate has had its say.
-    #[test]
-    #[serial_test::serial]
-    fn licensed_adjacent_ack_gate_precedes_resume_precheck_for_a_step_that_fails_both() {
-        let ack_dir = tempfile::TempDir::new().unwrap(); // empty — "health-research" has no prior ack
-        let resume_from = tempfile::TempDir::new().unwrap(); // no checkpoint.json written
-
-        let (mut doubly_failing_task, doubly_failing_step) = kinded_step(
-            "doubly-failing",
-            "test.role-local-model",
-            json!({
-                "model_key": "forbidden-model",
-                "resume_from": resume_from.path().to_str().unwrap(),
-            }),
-            &[],
-        );
-        doubly_failing_task.role_id = Some("health-research".to_string());
-
-        let (steps, report) =
-            run_consent_graph(ack_dir.path(), vec![(doubly_failing_task, doubly_failing_step)]);
-
-        assert_eq!(steps["doubly-failing-step"].status, NodeStatus::Error);
-        let message = steps["doubly-failing-step"].output.clone().unwrap_or_default();
-        assert!(
-            message.contains("requires operator acknowledgment"),
-            "the ack gate must run FIRST and its refusal must be the one reported for a step \
-             that fails both gates — got: {message}"
-        );
-        assert!(
-            !message.contains("RESUME CHECKPOINT NOT FOUND"),
-            "resume_precheck must never even run for a step the ack gate already refused — \
-             got: {message}"
-        );
-        assert!(report.errored.contains(&"doubly-failing-step".to_string()));
-    }
-
-    /// (#1511, review mutation 1) The `mission.coder` shape: the TASK names
-    /// a benign role, and the kind dispatches a DIFFERENT, licensed-adjacent
-    /// one. The first version of this fix read
-    /// `task.role_id.or(step.config.role_id)` in the scheduler — a parallel
-    /// guess — so it saw `"coder"`, passed the step, and the wave loader
-    /// pulled `forbidden-model` into RAM with the gate fully in place. This
-    /// was proven against that version, not suspected.
-    ///
-    /// Now the gate asks `StepKind::dispatch_role`, which reads the same
-    /// source the kind's own dispatch does, so the divergence is not
-    /// expressible. Red-prove by changing `RoleLocalModelKind::dispatch_role`
-    /// to `task.role_id.clone()` (restoring the guess): the host panics on
-    /// the forbidden load.
-    #[test]
-    #[serial_test::serial]
-    fn the_gate_reads_the_kinds_role_not_the_tasks_when_they_disagree() {
-        let ack_dir = tempfile::TempDir::new().unwrap();
-
-        let (mut licensed_task, licensed_step) = kinded_step(
-            "licensed",
-            "test.role-local-model",
-            json!({"model_key": "forbidden-model", "seat_role": "health-research"}),
-            &[],
-        );
-        // What a field read in the scheduler would have seen — benign, and
-        // NOT what this step dispatches.
-        licensed_task.role_id = Some("coder".to_string());
-
-        let (steps, report) = run_consent_graph(ack_dir.path(), vec![(licensed_task, licensed_step)]);
-        assert_refused_for_consent(&steps, &report, "licensed-step");
-    }
-
-    /// (#1511, review mutation 2) The `crawl.unit` shape: the task names NO
-    /// role at all, and the kind supplies its own. Against the first version
-    /// of this fix the scheduler's guess was `None`, whose arm was
-    /// `Ok(())` — a fail-open on a consent gate — and the forbidden model
-    /// loaded. `None` is still `Ok(())`, but it now means "the KIND declared
-    /// it dispatches no role", which a kind holding a real model seat cannot
-    /// say (see the registry conformance tests).
-    #[test]
-    #[serial_test::serial]
-    fn the_gate_reads_the_kinds_role_when_the_task_names_none() {
-        let ack_dir = tempfile::TempDir::new().unwrap();
-
-        let (mut licensed_task, licensed_step) = kinded_step(
-            "licensed",
-            "test.role-local-model",
-            json!({"model_key": "forbidden-model", "seat_role": "health-research"}),
-            &[],
-        );
-        licensed_task.role_id = None;
-
-        let (steps, report) = run_consent_graph(ack_dir.path(), vec![(licensed_task, licensed_step)]);
-        assert_refused_for_consent(&steps, &report, "licensed-step");
-    }
-
-    /// (#1511) The other half of the gate, which nothing pinned before: an
-    /// ACKED licensed-adjacent role must reach the loader and RUN. Without
-    /// this, a gate that refused `health-research` unconditionally would
-    /// pass every other test in this cluster — they all assert refusal, and
-    /// the one sibling that runs uses `"coder"`, which exercises the
-    /// UNLISTED-role arm, not the acked one.
-    ///
-    /// The ack file is the operator-sovereign escape hatch documented on
-    /// `require_licensed_adjacent_ack`: its mere presence is the consent
-    /// record. Note the host here is still the panic-on-`forbidden-model`
-    /// one, so this test also proves the model genuinely loaded rather than
-    /// the step completing some other way — it asserts the load did NOT
-    /// panic AND the step completed.
-    #[test]
-    #[serial_test::serial]
-    fn an_acked_licensed_adjacent_role_reaches_the_loader_and_runs() {
-        let ack_dir = tempfile::TempDir::new().unwrap();
-        std::fs::write(ack_dir.path().join("health-research.ack"), "acknowledged_at_unix_seconds=1\n")
-            .unwrap();
-
-        let (mut licensed_task, licensed_step) = kinded_step(
-            "licensed",
-            "test.role-local-model",
-            // `normal-model`, not `forbidden-model`: the point of this test
-            // is that the load HAPPENS, and the host's forbidden name is
-            // reserved for the refusal tests above.
-            json!({"model_key": "normal-model", "seat_role": "health-research"}),
-            &[],
-        );
-        licensed_task.role_id = None;
-
-        let (steps, report) = run_consent_graph(ack_dir.path(), vec![(licensed_task, licensed_step)]);
-
-        assert_eq!(
-            steps["licensed-step"].status,
-            NodeStatus::Complete,
-            "an acked licensed-adjacent role must run: {:?}",
-            steps["licensed-step"].output
-        );
-        assert_eq!(steps["licensed-step"].output.as_deref(), Some("ok"));
-        assert!(report.completed.contains(&"licensed-step".to_string()));
-        assert!(report.errored.is_empty());
-    }
-
-    /// (#1511, re-review blocker) THE SEAM. The gate builds its own
-    /// `StepRunCtx` before handing it to `dispatch_role`, and what it puts
-    /// on that ctx is the whole fix: a kind that resolves its role from the
-    /// run-scoped `ArtifactBus` — which is what `mission.coder`, the kind
-    /// that motivated this rewrite, does and the ONLY thing it does — sees
-    /// nothing at all if the gate's ctx carries an empty bus.
-    ///
-    /// Nothing covered that join before. The scheduler's other consent
-    /// tests use `RoleLocalModelKind`, which ignores `ctx` entirely; the
-    /// registry conformance tests in `mission_launch` call `dispatch_role`
-    /// directly with a bus they build themselves and never enter
-    /// `run_step_graph`. Each half was covered; the join was not.
-    ///
-    /// The shape is #1511 verbatim: the Task names a BENIGN role, the run's
-    /// context names the licensed-adjacent one, and the step's placement
-    /// resolves from that same context. Under the fix the gate reads
-    /// `health-research` off the bus and refuses before any placement
-    /// reaches `plan_waves`.
-    ///
-    /// Red-proved by replacing the gate's `bus.clone()` with a fresh
-    /// `Arc::new(ArtifactBus::new())`: `dispatch_role` returns `None`, the
-    /// `None => Ok(())` arm approves, the job loop's `seat()` reads the
-    /// REAL bus, and `PanicOnForbiddenLoadHost` panics on the load the gate
-    /// was supposed to prevent. This test also subsumes the ordering claim
-    /// — the panic fires at load time, not at assertion time.
-    #[test]
-    #[serial_test::serial]
-    fn the_gates_ctx_carries_the_run_scoped_bus_the_kind_reads_its_role_from() {
-        let ack_dir = tempfile::TempDir::new().unwrap(); // empty — no ack for "health-research"
-
-        let (mut licensed_task, licensed_step) = kinded_step(
-            "licensed",
-            "test.bus-role-local-model",
-            json!({"model_key": "forbidden-model"}),
-            &[],
-        );
-        // What a field read in the scheduler would have seen — benign, and
-        // NOT what this kind dispatches. This kind never reads it.
-        licensed_task.role_id = Some("coder".to_string());
-
-        let seed: Vec<(&'static str, std::sync::Arc<dyn std::any::Any + Send + Sync>)> =
-            vec![(CONSENT_ROLE_ARTIFACT, std::sync::Arc::new(String::from("health-research")))];
-
-        let (steps, report) =
-            run_consent_graph_seeded(ack_dir.path(), vec![(licensed_task, licensed_step)], &seed);
-        assert_refused_for_consent(&steps, &report, "licensed-step");
     }
 
     /// (#1877 item 3) A mission that never reads `SchedulerReport::
@@ -5791,16 +5097,6 @@ mod tests {
         report_ms_override: Option<u64>,
     }
     impl StepKind for SelfTimedKind {
-        /// (#1511) A test fixture that dispatches no role. Its seat is model-free, so the consent gate has nothing to check.
-        fn dispatch_role(
-            &self,
-            _step: &Step,
-            _task: &Task,
-            _input: &BTreeMap<String, String>,
-            _ctx: &StepRunCtx,
-        ) -> Option<String> {
-            None
-        }
         /// (#2394) This fixture runs no model.
         fn seat(
             &self,
@@ -5978,16 +5274,6 @@ mod tests {
         n: usize,
     }
     impl StepKind for StreamingKind {
-        /// (#1511) A test fixture that dispatches no role. Its seat is model-free, so the consent gate has nothing to check.
-        fn dispatch_role(
-            &self,
-            _step: &Step,
-            _task: &Task,
-            _input: &BTreeMap<String, String>,
-            _ctx: &StepRunCtx,
-        ) -> Option<String> {
-            None
-        }
         /// (#2394) This fixture runs no model.
         fn seat(
             &self,
@@ -6062,16 +5348,6 @@ mod tests {
     /// as its single dependency input).
     struct EmitCollectionKind;
     impl StepKind for EmitCollectionKind {
-        /// (#1511) A test fixture that dispatches no role. Its seat is model-free, so the consent gate has nothing to check.
-        fn dispatch_role(
-            &self,
-            _step: &Step,
-            _task: &Task,
-            _input: &BTreeMap<String, String>,
-            _ctx: &StepRunCtx,
-        ) -> Option<String> {
-            None
-        }
         /// (#2394) This fixture runs no model.
         fn seat(
             &self,
@@ -6236,16 +5512,6 @@ mod tests {
     /// an ordinary thing an operator does.
     struct NeedsArtifactKind;
     impl StepKind for NeedsArtifactKind {
-        /// (#1511) A test fixture that dispatches no role. Its seat is model-free, so the consent gate has nothing to check.
-        fn dispatch_role(
-            &self,
-            _step: &Step,
-            _task: &Task,
-            _input: &BTreeMap<String, String>,
-            _ctx: &StepRunCtx,
-        ) -> Option<String> {
-            None
-        }
         /// (#2394) This fixture runs no model.
         fn seat(
             &self,

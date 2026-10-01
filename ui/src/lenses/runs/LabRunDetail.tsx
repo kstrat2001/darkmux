@@ -7,7 +7,6 @@ import { queryKeys, LAB_POLL_STEADY_MS, LAB_POLL_BACKFILL_MS, LAB_POLL_FAILURE_T
 import {
   computeLabPipeline,
   labPipelineLines,
-  labCliHint,
   labFeedLines,
   labFeedCountText,
   labFeedStatusSuffix,
@@ -233,7 +232,6 @@ export function LabRunDetail({
   // run that just completed doesn't wait for a full remount to say so).
   const isFinished = !!env || scores != null || finished;
   const pipelineLines = labPipelineLines(pipe, env);
-  const cliHint = labCliHint(scores);
   const feedLines = labFeedLines(events);
 
   return (
@@ -253,11 +251,6 @@ export function LabRunDetail({
             <div className="labstagemeta">{meta}</div>
           </div>
         ))}
-      </div>
-
-      <div className="labcli">
-        <span className="labclilbl">try it yourself</span>
-        <code>{cliHint}</code>
       </div>
 
       <div className="labfeedwrap">

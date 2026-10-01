@@ -102,7 +102,7 @@ pub enum FlowCmd {
         #[arg(long)]
         reasoning: String,
         /// Optional role chosen (when `decision=dispatch`). E.g., `coder`,
-        /// `trip-researcher`. Captured in the `handle` field.
+        /// `analyst`. Captured in the `handle` field.
         #[arg(long = "role-chosen")]
         role_chosen: Option<String>,
         /// Optional phase identifier this decision is scoped to.

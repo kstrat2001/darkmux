@@ -18,7 +18,6 @@ fn touches_lab_dir(sub: &LabCmd) -> bool {
     match sub {
         LabCmd::Workload { .. } | LabCmd::Fixture { .. } | LabCmd::Doctor => false,
         LabCmd::Run { .. }
-        | LabCmd::Eval { .. }
         | LabCmd::Loop { .. }
         | LabCmd::Characterize { .. }
         | LabCmd::Tune { .. } => true,
@@ -38,31 +37,6 @@ pub(crate) fn cmd_lab(sub: LabCmd) -> Result<i32> {
             profiles: ProfilesFileArg { profiles },
             quiet,
         } => cmd_lab_run_dispatch(workload, profile, repeat, profiles, quiet),
-        LabCmd::Eval {
-            role,
-            cases_dir,
-            profile,
-            profiles,
-            timeout,
-            scores_out,
-            mode,
-            workdirs,
-            prosecutor_profile,
-            defender_profile,
-            judge_profile,
-        } => cmd_lab_eval(lab::review_bench::ReviewBenchOpts {
-            role,
-            cases_dir: std::path::PathBuf::from(cases_dir),
-            profile_name: profile,
-            config_path: profiles,
-            timeout_seconds: timeout,
-            scores_out,
-            mode,
-            workdirs,
-            prosecutor_profile,
-            defender_profile,
-            judge_profile,
-        }),
         LabCmd::Loop {
             workload,
             profile,
@@ -119,8 +93,7 @@ pub(crate) fn cmd_lab(sub: LabCmd) -> Result<i32> {
     }
 }
 
-/// Run a lab verb that dispatches through `lab_run` (or `dispatch`, for
-/// `lab eval`) under signal handling: the one exit path every such verb
+/// Run a lab verb that dispatches through `lab_run` under signal handling: the one exit path every such verb
 /// shares.
 ///
 /// Installs the SIGTERM/SIGINT/SIGHUP handlers and the reap watchdog for the
@@ -187,40 +160,6 @@ fn cmd_lab_run_dispatch(
     Ok(lab::run::exit_code(&outcomes))
 }
 
-/// The per-seat profile overrides belong to the dialectic pipeline. Given
-/// under any other `--mode` they would do nothing, so they are refused
-/// rather than silently ignored: the usage error to print, when there is one.
-fn refuse_seat_profiles_outside_dialectic(
-    mode: lab::review_bench::BenchMode,
-    seats: [(&str, &Option<String>); 3],
-) -> Option<String> {
-    if mode == lab::review_bench::BenchMode::Dialectic {
-        return None;
-    }
-    let (flag, _) = seats.iter().find(|(_, profile)| profile.is_some())?;
-    Some(format!("`--{flag}` applies only to `--mode dialectic`"))
-}
-
-/// `lab eval`: one dispatch per labeled case. A run killed mid-corpus loses
-/// only the cases not yet scored; `scores.json` is written when the loop
-/// completes.
-fn cmd_lab_eval(opts: lab::review_bench::ReviewBenchOpts) -> Result<i32> {
-    if let Some(usage) = refuse_seat_profiles_outside_dialectic(
-        opts.mode,
-        [
-            ("prosecutor-profile", &opts.prosecutor_profile),
-            ("defender-profile", &opts.defender_profile),
-            ("judge-profile", &opts.judge_profile),
-        ],
-    ) {
-        // A usage error exits 2, as a clap-rejected argument does.
-        eprintln!("error: {usage}");
-        return Ok(2);
-    }
-    signal_aware(|| lab::review_bench::run_review_bench(opts))?;
-    Ok(0)
-}
-
 /// `lab characterize`: a single `lab_run`, reported.
 fn cmd_lab_characterize(opts: lab::characterize::CharacterizeOpts) -> Result<i32> {
     let report = signal_aware(|| lab::characterize::characterize(&opts))?;
@@ -275,7 +214,6 @@ fn cmd_lab_doctor() -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lab::review_bench::BenchMode;
 
     /// `lab doctor` is the fixture-registry health check and never touches
     /// the lab dir, so a pending move must not make it refuse.
@@ -307,45 +245,5 @@ mod tests {
         };
         assert!(touches_lab_dir(&characterize), "a dispatching verb writes run records");
         assert!(!touches_lab_dir(&LabCmd::Doctor), "fixture health check never touches the lab dir");
-    }
-
-    fn parse_eval(extra: &[&str]) -> Result<LabCmd, clap::Error> {
-        use clap::Parser;
-        let mut argv = vec!["darkmux", "lab", "eval"];
-        argv.extend_from_slice(extra);
-        match crate::cli::Cli::try_parse_from(argv)?.command {
-            crate::cli::Cmd::Lab { sub } => Ok(sub),
-            _ => unreachable!("`lab eval` parses to a lab command"),
-        }
-    }
-
-    #[test]
-    fn eval_mode_defaults_to_strict_and_parses_each_condition() {
-        for (arg, want) in [
-            (None, BenchMode::Strict),
-            (Some("strict"), BenchMode::Strict),
-            (Some("freeform"), BenchMode::FreeForm),
-            (Some("agentic"), BenchMode::Agentic),
-            (Some("dialectic"), BenchMode::Dialectic),
-        ] {
-            let extra: Vec<&str> = arg.map(|m| vec!["--mode", m]).unwrap_or_default();
-            let Ok(LabCmd::Eval { mode, .. }) = parse_eval(&extra) else { panic!("{extra:?} did not parse") };
-            assert_eq!(mode, want, "{extra:?}");
-        }
-        assert!(parse_eval(&["--mode", "bogus"]).is_err());
-    }
-
-    #[test]
-    fn seat_profiles_are_refused_outside_dialectic_mode() {
-        let none = None;
-        let judge = Some("p".to_string());
-        let seats = [("prosecutor-profile", &none), ("defender-profile", &none), ("judge-profile", &judge)];
-        for mode in [BenchMode::Strict, BenchMode::FreeForm, BenchMode::Agentic] {
-            let usage = refuse_seat_profiles_outside_dialectic(mode, seats);
-            assert_eq!(usage.as_deref(), Some("`--judge-profile` applies only to `--mode dialectic`"));
-        }
-        assert_eq!(refuse_seat_profiles_outside_dialectic(BenchMode::Dialectic, seats), None);
-        let unset = [("prosecutor-profile", &none), ("defender-profile", &none), ("judge-profile", &none)];
-        assert_eq!(refuse_seat_profiles_outside_dialectic(BenchMode::Strict, unset), None);
     }
 }

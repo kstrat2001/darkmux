@@ -218,8 +218,6 @@ fn dispatch_panic_mid_run_leaves_no_tailer_sampler_watchdog_thread() {
     fs::create_dir_all(&home_dir).unwrap();
     let flows_dir = tmp.path().join("flows");
     fs::create_dir_all(&flows_dir).unwrap();
-    let ack_dir = tmp.path().join("ack");
-    fs::create_dir_all(&ack_dir).unwrap();
     let fake_bin_dir = tmp.path().join("fake-bin");
     fs::create_dir_all(&fake_bin_dir).unwrap();
 
@@ -231,7 +229,6 @@ fn dispatch_panic_mid_run_leaves_no_tailer_sampler_watchdog_thread() {
     // Pin DARKMUX_HOME: it is what `user_state_root()` resolves against.
     let _home_guard = EnvVarGuard::set("DARKMUX_HOME", &home_dir);
     let _flows_guard = EnvVarGuard::set("DARKMUX_FLOWS_DIR", &flows_dir);
-    let _ack_guard = EnvVarGuard::set("DARKMUX_ACK_DIR", &ack_dir);
     // No real LMStudio, ever (standing guardrail) — the always-on
     // telemetry sampler shells out to `lms ps --json` on its own
     // background thread regardless of this dispatch's profile, so this is

@@ -234,6 +234,18 @@ fn config_retired_keys_name_their_replacement() {
     assert!(msgs.iter().any(|m| m.contains("`dirs.notebook`: removed in 4.0")), "{msgs:?}");
 }
 
+/// (#3036) `dirs.ack` went with the licensed-adjacent acknowledgment gate:
+/// a config still carrying it is an unknown key that names the removal (and
+/// the release), never a near-miss guess.
+#[test]
+fn config_dirs_ack_is_named_as_retired() {
+    let keys = config_keys(json!({"dirs": {"ack": "/x"}}));
+    assert_eq!(keys.len(), 1, "{keys:#?}");
+    assert!(matches!(keys[0].issue, Issue::Retired(_)), "{keys:#?}");
+    let msg = keys[0].to_string();
+    assert!(msg.contains("`dirs.ack`: removed in 5.0"), "{msg}");
+}
+
 #[test]
 fn config_hook_match_payload_keys_and_role_profiles_are_free() {
     let doc = json!({

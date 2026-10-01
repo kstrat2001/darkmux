@@ -52,8 +52,7 @@ import {
  * that wasn't itself a from-scratch stats view. Removed rather than
  * patched: `darkmux run stats --baseline` already covers run-over-run
  * comparison from real counters, and the flat list (with #2861's honest
- * status) covers browsing. See `format.ts`'s own former `labSeries`
- * re-exports for what else this removal touched.
+ * status) covers browsing.
  *
  * Data: `GET /runs` (the flat cross-source view-model, every kind) and
  * `GET /lab/runs` (the lab-only staffing/bundle extras), fetched TOGETHER on

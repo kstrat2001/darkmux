@@ -9,7 +9,6 @@ import {
   labFeedLines,
   labFeedCountText,
   labFeedStatusSuffix,
-  labCliHint,
   labBadgeText,
   LAB_FEED_CAP,
 } from "./labRun";
@@ -192,37 +191,6 @@ describe("labFeedStatusSuffix", () => {
 
   it("names the daemon-unreachable state when not finished and the poll has failed repeatedly", () => {
     expect(labFeedStatusSuffix(false, true)).toBe(" — daemon unreachable, retrying");
-  });
-});
-
-describe("labCliHint", () => {
-  // (4.0) The hint used to print `--funnel --roster-profile … --exec-mode …`,
-  // flags `lab eval` no longer has (clap rejects them). It is rebuilt from
-  // what `scores.json` actually records: `role`, `mode`, and the profile.
-  it("a strict run names its role, cases dir, and profile", () => {
-    expect(labCliHint({ role: "coder", mode: "strict", profile: "fast" })).toBe(
-      "darkmux lab eval coder --cases-dir <cases-dir> --profile fast",
-    );
-  });
-
-  it("an experimental mode keeps the default role and adds its own flags", () => {
-    expect(labCliHint({ role: "pr-reviewer", mode: "agentic" })).toBe(
-      "darkmux lab eval --cases-dir <cases-dir> --mode agentic --workdirs <workdirs-root>",
-    );
-    expect(labCliHint({ role: "pr-reviewer", mode: "dialectic" })).toBe(
-      "darkmux lab eval --cases-dir <cases-dir> --mode dialectic --workdirs <workdirs-root>",
-    );
-    expect(labCliHint({ role: "pr-reviewer", mode: "freeform" })).toBe(
-      "darkmux lab eval --cases-dir <cases-dir> --mode freeform",
-    );
-  });
-
-  it("with no scores yet, placeholders only — and never a removed flag", () => {
-    const hint = labCliHint(null);
-    expect(hint).toBe("darkmux lab eval <role> --cases-dir <cases-dir>");
-    for (const gone of ["--funnel", "--roster-profile", "--exec-mode", "--k", "--bundler"]) {
-      expect(hint).not.toContain(gone);
-    }
   });
 });
 

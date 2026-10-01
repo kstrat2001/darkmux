@@ -1098,44 +1098,6 @@ mod tests {
         assert_eq!(fs::read_to_string(&dst).unwrap(), "KEEP", "an over-cap copy removed the existing dst");
     }
 
-    /// Timing: the fd-walk copy against the pre-#2869 std walk. Not a
-    /// gate; run with `--run-ignored only --no-capture` to print numbers.
-    #[test]
-    #[ignore]
-    fn bench_tree_copy_35k_files() {
-        fn std_copy(src: &Path, dst: &Path) {
-            fs::create_dir_all(dst).unwrap();
-            for e in fs::read_dir(src).unwrap() {
-                let e = e.unwrap();
-                let ft = e.file_type().unwrap();
-                if ft.is_dir() {
-                    std_copy(&e.path(), &dst.join(e.file_name()));
-                } else if ft.is_file() {
-                    fs::copy(e.path(), dst.join(e.file_name())).unwrap();
-                }
-            }
-        }
-        let t = TempDir::new().unwrap();
-        let src = t.path().join("src");
-        for d in 0..350 {
-            let dir = src.join(format!("d{}/e{}", d / 20, d));
-            fs::create_dir_all(&dir).unwrap();
-            for f in 0..100 {
-                fs::write(dir.join(format!("f{f}.rs")), format!("// file {d}/{f}\n{}", "x".repeat(200))).unwrap();
-            }
-        }
-        for round in 0..3 {
-            let a = std::time::Instant::now();
-            std_copy(&src, &t.path().join(format!("std{round}")));
-            let std_ms = a.elapsed().as_millis();
-            let b = std::time::Instant::now();
-            let r = copy_tree_nofollow(&src, &t.path().join(format!("fd{round}"))).unwrap();
-            let fd_ms = b.elapsed().as_millis();
-            assert_eq!(r.files, 35_000);
-            eprintln!("round {round}: std fs::copy walk {std_ms} ms, copy_tree_nofollow {fd_ms} ms");
-        }
-    }
-
     /// Swap `src/<name>` for `with` between the walk's type check and its
     /// open, run the copy, and return the report.
     fn copy_with_swap_before_open(

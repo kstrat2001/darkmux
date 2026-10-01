@@ -48,6 +48,6 @@ mod live_channel_conformance {
                 assert!(!text.contains("live_channel: true"), "{path:?} opts in");
             }
         }
-        assert!(builders >= 4, "the scan sees the lab's dispatches ({builders})");
+        assert!(builders >= 3, "the scan sees the lab's dispatches ({builders})");
     }
 }

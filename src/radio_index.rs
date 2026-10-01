@@ -208,8 +208,8 @@ mod tests {
         assert!(!status.summary.contains("#1426"), "archaeology stripped: {}", status.summary);
         let list = by_path("machine list").expect("machine list");
         assert!(list.options.iter().any(|o| o == "--json"), "{:?}", list.options);
-        let eval = by_path("lab eval").expect("lab eval");
-        assert!(eval.options.len() <= MAX_OPTIONS_SHOWN + 1 && eval.options.last().map(String::as_str) == Some("..."), "{:?}", eval.options);
+        let loop_verb = by_path("lab loop").expect("lab loop");
+        assert!(loop_verb.options.len() <= MAX_OPTIONS_SHOWN + 1 && loop_verb.options.last().map(String::as_str) == Some("..."), "{:?}", loop_verb.options);
         assert!(by_path("radio").is_some(), "top-level leaf verbs are entries too");
         assert!(by_path("machine").is_none(), "a verb that only holds subverbs is not runnable");
         assert!(entries.iter().all(|e| !e.path.split(' ').any(|w| w == "help")), "clap's help verb is not a darkmux verb");
