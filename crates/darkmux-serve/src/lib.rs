@@ -4509,8 +4509,8 @@ fn records_from_xrevrange(raw: redis::Value, date: Option<&str>) -> Result<Vec<s
 /// snapshot path wasn't).
 ///
 /// (#2409) The cap applies to the supplementary-vocabulary ring only. The
-/// bookends, `run.*` and `dispatch.*` (a pre-4.0 spelling reads as its
-/// current action through `darkmux_flow::reader`), are ALWAYS kept
+/// bookends, `run.*` and `dispatch.*` (a pre-4.0 spelling reads as an
+/// unknown action, so it is not one), are ALWAYS kept
 /// regardless of this count: cross-system contract 2 (liveness) requires
 /// that liveness surfaces key on these bookends, and
 /// that supplementary vocabularies (here, high-cadence `telemetry.process`

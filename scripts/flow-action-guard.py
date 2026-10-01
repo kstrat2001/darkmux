@@ -173,6 +173,8 @@ def vocabulary(root):
     scopes = set(re.findall(r'^\s+\w+ => "([a-z]+)";', act, re.M))
     if len(current) < 20 or len(scopes) < 10:
         sys.exit(f"flow-action-guard: vocabulary parse is broken ({len(current)}/{len(scopes)})")
+    if len(RETIRED_SPELLINGS) < 55 or "dispatch start" not in RETIRED_SPELLINGS:
+        sys.exit(f"flow-action-guard: RETIRED_SPELLINGS shrank to {len(RETIRED_SPELLINGS)} (floor 55)")
     stale = RETIRED_SPELLINGS & current
     if stale:
         sys.exit(f"flow-action-guard: RETIRED_SPELLINGS names current actions: {sorted(stale)}")
@@ -510,6 +512,9 @@ FIXTURE_CASES = [
 
 
 def self_test():
+    assert len(RETIRED_SPELLINGS) >= 55 and "dispatch start" in RETIRED_SPELLINGS, "RETIRED_SPELLINGS is hollowed out"
+    real = Vocab({"dispatch.start"}, RETIRED_SPELLINGS, {"dispatch"}, set())
+    assert rust_violations('let a = "dispatch start";', real), "a real retired spelling must fail in production Rust"
     v = SELF_TEST_VOCAB
     suites = [
         (RUST_CASES, lambda s: rust_violations(s, v)),

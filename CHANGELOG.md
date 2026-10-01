@@ -1111,7 +1111,7 @@ darkmux release.
     archive pair are deleted. A stored finding record's old `dispatch` field and
     an old `compactor` seat in `telemetry.lms` also read as absent and unknown.
     **Migration:** none for new data; keep a 3.x archive only to look at it with a
-    3.x or 4.x build.
+    3.x build.
   - **Hook rules.** A rule written in a retired action spelling is no longer
     refused: it matches no action darkmux writes, so the hook sink loads, warns,
     and `darkmux doctor` warns `CANNOT MATCH`. **Migration:** write the dotted

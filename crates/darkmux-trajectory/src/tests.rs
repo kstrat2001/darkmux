@@ -257,6 +257,8 @@ fn an_openclaw_run_reads_as_zero_turns() {
         r#"{"traceSchema":"openclaw-trajectory","type":"session.started","ts":"2026-05-18T13:43:00.000Z","seq":1}"#,
         r#"{"traceSchema":"openclaw-trajectory","type":"prompt.submitted","ts":"2026-05-18T13:43:11.589Z","seq":4,"data":{"messages":[{"role":"user","summary":null},{"role":"compactionSummary","summary":"s","tokensBefore":900}]}}"#,
         r#"{"traceSchema":"openclaw-trajectory","type":"model.completed","ts":"2026-05-18T13:43:11.589Z","seq":5,"data":{"usage":{"input":294041,"output":5684,"total":299725}}}"#,
+        // A numeric clock reads as a current `model.completed` unless the schema tag is honored.
+        r#"{"traceSchema":"openclaw-trajectory","type":"model.completed","ts":1779111791000,"seq":6,"data":{"usage":{"input":100,"output":10}}}"#,
     ]
     .join("\n");
     let f = TrajectoryFold::from_lines(&raw);
