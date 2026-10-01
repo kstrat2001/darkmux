@@ -142,6 +142,10 @@ pub enum HealthState {
     Ok,
     Warn,
     Fail,
+    /// (#3035) A value a newer darkmux wrote that this build does not know.
+    /// Never written by this build; read, never treated as any known value.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Build a status snapshot. Cheap: ~10ms when Redis is reachable, sub-ms
@@ -563,6 +567,7 @@ pub fn format_status_human(status: &FlowStatus) -> String {
         HealthState::Ok => "✓ ok",
         HealthState::Warn => "⚠ warn",
         HealthState::Fail => "✗ fail",
+        HealthState::Unknown => "? unknown",
     };
     let _ = writeln!(out, "darkmux flow status — {state_marker}");
     let _ = writeln!(out, "  schema:       {}", status.schema_version);

@@ -38,7 +38,7 @@ run stats <several runs, or --baseline>  RunSetStats
 flow tail  one flow record per line, verbatim; the record is pinned by FLOW_SCHEMA_VERSION, not by this file
 
 # types
-AbandonReason = "aborted" | "noterminal"
+AbandonReason = "aborted" | "noterminal" | "unknown"
 AcceptsState = { accepts: CardAccepts; state: "granted" } | { state: "not_listed" } | { state: "this_machine" } | { state: "unknown" }
 ActiveWait
   scope: string
@@ -48,7 +48,7 @@ ActiveWait
   resume_at: string | null
   resumes_in_secs: uint64 | null
   message: string
-Attribution = "per_process" | "estimated" | "unavailable"
+Attribution = "per_process" | "estimated" | "unavailable" | "unknown"
 BatteryCharge
   charge_pct: uint8
   on_ac: boolean
@@ -430,7 +430,7 @@ Grown
   source: string
   items: uint
   minted: string[]
-HealthState = "ok" | "warn" | "fail"
+HealthState = "ok" | "warn" | "fail" | "unknown"
 HookRuleStatus
   index: uint
   match_desc: string
@@ -728,7 +728,7 @@ ModelRow
   shrink_hint?: string | null
 NodeKind = "phase" | "task"
 NodeStatus = "planned" | "running" | "complete" | "abandoned" | "error" | "unknown"
-Owner = "darkmux" | "user"
+Owner = "darkmux" | "user" | "unknown"
 PhaseDisplayStatus = "planned" | "running" | "complete" | "error" | "abandoned" | "waiting" | "degraded"
 PhaseJson
   id: string
@@ -740,7 +740,7 @@ PoolSnapshot
   used_bytes: uint64 | null
   available_bytes: uint64 | null
   free_bytes: uint64 | null
-PotentialSource = "arch" | "estimated"
+PotentialSource = "arch" | "estimated" | "unknown"
 PowerNow
   cpu: int64
   gpu: int64
@@ -1030,7 +1030,7 @@ SetView
   summary: SetSummary
   errors: SetError[]
   duplicates: string[]
-Severity = "info" | "warn" | "error"
+Severity = "info" | "warn" | "error" | "unknown"
 ShownConfig
   id: string
   name: string

@@ -441,3 +441,21 @@ fn terminal_result_types_every_runtime_result_and_every_escalation_reason() {
     }
     assert_eq!(TerminalResult::parse("something_new"), TerminalResult::Other);
 }
+
+/// (#3035) An enum value a newer runtime wrote reads as `Unknown`, so the one
+/// event still parses and every count it feeds survives.
+#[test]
+fn an_enum_value_from_a_newer_runtime_reads_as_unknown_not_a_dropped_event() {
+    use TrajectoryEvent as E;
+    let t = parse_line(r#"{"type":"tool.completed","seq":1,"ok":true,"outcome":"from_the_future"}"#);
+    assert!(matches!(t, Some(E::ToolCompleted(ref t)) if t.outcome == Some(ToolOutcomeKind::Unknown)), "{t:?}");
+    let m = parse_line(r#"{"type":"dispatch.tool.malformed_names","count":2,"reason":"from_the_future"}"#);
+    assert!(matches!(m, Some(E::MalformedToolNames(ref m)) if m.reason == MalformedReason::Unknown), "{m:?}");
+    let c = parse_line(r#"{"type":"dispatch.checkpoint","seq":1,"verdict":"from_the_future"}"#);
+    assert!(matches!(c, Some(E::Checkpoint(ref c)) if c.verdict == Verdict::Unknown), "{c:?}");
+    let w = parse_line(r#"{"type":"model.tool_call.writing","seq":1,"phase":"from_the_future"}"#);
+    assert!(matches!(w, Some(E::ToolCallWriting(ref w)) if w.phase == StreamPhase::Unknown), "{w:?}");
+    // The malformed calls still count, in the unattributed bucket.
+    let fold = TrajectoryFold::from_lines(r#"{"type":"dispatch.tool.malformed_names","count":2,"reason":"from_the_future"}"#);
+    assert_eq!((fold.tool_calls_invalid_name, fold.tool_calls_ungranted), (2, 0));
+}

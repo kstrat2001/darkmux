@@ -48,6 +48,10 @@ pub enum HubLink {
     /// Writes have been failing since the record stamped `since` (RFC 3339 UTC).
     /// `reason` is the root cause of the most recent failure.
     Unreachable { since: String, reason: String },
+    /// (#3035) A value a newer darkmux wrote that this build does not know.
+    /// Never written by this build; read, never treated as any known value.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Bounds on how often a disabled `LongLived` sink pays a connect attempt.
@@ -89,7 +93,7 @@ impl LinkState {
     pub(crate) fn outage_since(&self) -> Option<&str> {
         match &self.link {
             HubLink::Unreachable { since, .. } => Some(since),
-            HubLink::Unverified | HubLink::Connected => None,
+            HubLink::Unverified | HubLink::Connected | HubLink::Unknown => None,
         }
     }
 

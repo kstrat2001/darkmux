@@ -3,4 +3,4 @@
 /**
  * Whether this process can currently publish to the hub's flow stream.
  */
-export type HubLink = { "state": "unverified" } | { "state": "connected" } | { "state": "unreachable", since: string, reason: string, };
+export type HubLink = { "state": "unverified" } | { "state": "connected" } | { "state": "unreachable", since: string, reason: string, } | { "state": "unknown" };

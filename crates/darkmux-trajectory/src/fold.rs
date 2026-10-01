@@ -224,7 +224,11 @@ impl TrajectoryFold {
             E::MalformedToolNames(m) => {
                 let n = u32::try_from(m.count).unwrap_or(u32::MAX);
                 let bucket = match m.reason {
-                    MalformedReason::NotATool => &mut self.tool_calls_invalid_name,
+                    // (#3035) A reason a newer runtime named: the calls were
+                    // malformed all the same, and only the cause is unknown,
+                    // so they count with the unattributed bucket, never as
+                    // "a real tool the role was not granted".
+                    MalformedReason::NotATool | MalformedReason::Unknown => &mut self.tool_calls_invalid_name,
                     MalformedReason::RealToolNotGranted => &mut self.tool_calls_ungranted,
                 };
                 *bucket = bucket.saturating_add(n);

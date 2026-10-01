@@ -12,4 +12,4 @@
  * term two meanings inside the same product (the same collision class as
  * compactor/compressor).
  */
-export type Severity = "info" | "warn" | "error";
+export type Severity = "info" | "warn" | "error" | "unknown";

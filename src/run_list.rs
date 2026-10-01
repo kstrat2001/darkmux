@@ -421,6 +421,7 @@ fn subtitle_for(r: &Run) -> String {
             match reason {
                 AbandonReason::Aborted => "aborted",
                 AbandonReason::NoTerminal => "no ending recorded",
+                AbandonReason::Unknown => "reason not recognized",
             }
             .to_string(),
         );

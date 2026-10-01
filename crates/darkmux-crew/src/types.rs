@@ -548,6 +548,10 @@ pub enum MissionSpecOrigin {
     UserConfig,
     /// Launched from a shipped built-in config.
     Builtin,
+    /// (#3035) A value a newer darkmux wrote that this build does not know.
+    /// Never written by this build; read, never treated as any known value.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Status of a phase.
@@ -1472,5 +1476,15 @@ mod tests {
         // A whole mission file naming one still loads.
         let doc = r#"{"id":"m","description":"d","status":"suspended","created_ts":1}"#;
         assert_eq!(serde_json::from_str::<Mission>(doc).unwrap().status, MissionStatus::Unknown);
+    }
+
+    /// (#3035) A value a newer darkmux wrote reads as `Unknown`, not as an
+    /// error that loses the whole record.
+    #[test]
+    fn an_enum_value_from_a_newer_darkmux_reads_as_unknown() {
+        fn read<T: serde::de::DeserializeOwned>() -> T {
+            serde_json::from_str("\"from_the_future\"").unwrap()
+        }
+        assert_eq!(read::<MissionSpecOrigin>(), MissionSpecOrigin::Unknown);
     }
 }

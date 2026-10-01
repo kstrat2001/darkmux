@@ -255,6 +255,10 @@ pub enum StreamPhase {
     /// A tool call has been named and its arguments are being written. The
     /// viewer matches this spelling (`ui/src/lib/tokenRate.ts`).
     WritingToolCall,
+    /// (#3035) A value a newer darkmux wrote that this build does not know.
+    /// Never written by this build; read, never treated as any known value.
+    #[serde(other)]
+    Unknown,
 }
 
 /// `model.partial`: one streamed chunk. Stats only, never the chunk text.
@@ -396,6 +400,10 @@ pub enum ToolOutcomeKind {
     Reported,
     /// Did not run, or could not complete.
     Failed,
+    /// (#3035) A value a newer darkmux wrote that this build does not know.
+    /// Never written by this build; read, never treated as any known value.
+    #[serde(other)]
+    Unknown,
 }
 
 /// `tool.completed`: one executed tool call, with its arguments preview and
@@ -643,6 +651,10 @@ pub enum Verdict {
     Continue,
     /// Close the thought and ask for the answer.
     Conclude,
+    /// (#3035) A value a newer darkmux wrote that this build does not know.
+    /// Never written by this build; read, never treated as any known value.
+    #[serde(other)]
+    Unknown,
 }
 
 /// `dispatch.checkpoint`: the harness checked in on a turn at the reasoning
@@ -816,6 +828,10 @@ pub enum MalformedReason {
     NotATool,
     /// A real darkmux tool this execution's role was not granted.
     RealToolNotGranted,
+    /// (#3035) A value a newer darkmux wrote that this build does not know.
+    /// Never written by this build; read, never treated as any known value.
+    #[serde(other)]
+    Unknown,
 }
 
 /// `dispatch.tool.malformed_names`: one turn's calls whose names the

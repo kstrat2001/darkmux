@@ -8,4 +8,4 @@
  * `ghost_runs`) for how each is decided. Only meaningful when `status ==
  * RunStatus::Abandoned`; every other status leaves this `None`.
  */
-export type AbandonReason = "aborted" | "noterminal";
+export type AbandonReason = "aborted" | "noterminal" | "unknown";

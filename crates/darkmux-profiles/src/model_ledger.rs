@@ -280,6 +280,7 @@ pub enum LedgerState {
     Red,
     /// Not decidable from this snapshot (unpriceable model, no limit, …) —
     /// surfaced honestly instead of defaulting to green.
+    #[serde(other)]
     Unknown,
 }
 
@@ -303,6 +304,10 @@ pub enum Owner {
     Darkmux,
     /// Everything else — user state (the namespace contract).
     User,
+    /// (#3035) A value a newer darkmux wrote that this build does not know.
+    /// Never written by this build; read, never treated as any known value.
+    #[serde(other)]
+    Unknown,
 }
 
 /// How CURRENT bytes were attributed to models — a first-class field so a
@@ -321,6 +326,10 @@ pub enum Attribution {
     Estimated,
     /// Worker enumeration failed or found nothing — current is unknown.
     Unavailable,
+    /// (#3035) A value a newer darkmux wrote that this build does not know.
+    /// Never written by this build; read, never treated as any known value.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Logger-style severity for a [`LedgerMessage`] (#1821) — the channel the
@@ -349,6 +358,10 @@ pub enum Severity {
     /// failure (gather failed, LMStudio unreachable, worker enumeration
     /// came back empty for reasons other than "no workers").
     Error,
+    /// (#3035) A value a newer darkmux wrote that this build does not know.
+    /// Never written by this build; read, never treated as any known value.
+    #[serde(other)]
+    Unknown,
 }
 
 /// One entry in [`ModelLedger::messages`] (#1821) — replaces the old
@@ -387,6 +400,7 @@ pub enum LimitSource {
     /// module docs).
     PhysicalPool,
     /// No budget and no readable pool — no limit to color against.
+    #[serde(other)]
     Unknown,
 }
 
@@ -414,6 +428,10 @@ pub enum PotentialSource {
     /// one — see [`V1_FALLBACK_KV_BYTES_PER_CTX_TOKEN`] for the assumption
     /// this carries.
     Estimated,
+    /// (#3035) A value a newer darkmux wrote that this build does not know.
+    /// Never written by this build; read, never treated as any known value.
+    #[serde(other)]
+    Unknown,
 }
 
 /// A single machine-wide memory decomposition, all three figures read from
@@ -1951,6 +1969,7 @@ pub fn render_human(ledger: &ModelLedger) -> String {
             match m.owner {
                 Owner::Darkmux => "darkmux",
                 Owner::User => "user",
+                Owner::Unknown => "unknown",
             },
             m.loaded_ctx,
             fmt_opt(m.weights_bytes),
@@ -2046,6 +2065,7 @@ pub fn render_human(ledger: &ModelLedger) -> String {
             Severity::Info => "info",
             Severity::Warn => "warning",
             Severity::Error => "error",
+            Severity::Unknown => "note",
         };
         out.push_str(&format!("{tag}: {}\n", m.text));
     }
@@ -3953,4 +3973,19 @@ mod tests {
         assert_eq!(totals.estimated_models, 0, "absent field defaults to zero, never an error");
     }
 
+    /// (#3035) A value a newer peer wrote in any ledger enum reads as
+    /// `Unknown`, so the peer's whole ledger still parses.
+    #[test]
+    fn a_ledger_enum_value_from_a_newer_peer_reads_as_unknown() {
+        fn read<T: serde::de::DeserializeOwned>() -> T {
+            serde_json::from_str("\"from_the_future\"").unwrap()
+        }
+        assert_eq!(read::<Owner>(), Owner::Unknown);
+        assert_eq!(read::<Attribution>(), Attribution::Unknown);
+        assert_eq!(read::<Severity>(), Severity::Unknown);
+        assert_eq!(read::<LimitSource>(), LimitSource::Unknown);
+        assert_eq!(read::<PotentialSource>(), PotentialSource::Unknown);
+        assert_eq!(read::<LedgerState>(), LedgerState::Unknown);
+        assert_eq!(serde_json::from_str::<Owner>("\"darkmux\"").unwrap(), Owner::Darkmux, "known values still read");
+    }
 }

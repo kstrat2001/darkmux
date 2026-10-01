@@ -4647,6 +4647,13 @@ fn check_flow_sink_health() -> Check {
             ),
             hint: None,
         },
+        // (#3035) A state a newer darkmux wrote: neither a pass nor a failure.
+        darkmux_flow::HealthState::Unknown => Check {
+            name: "flow sink health".into(),
+            status: Status::Warn,
+            message: format!("{composition} · the sink health state is one this darkmux does not know"),
+            hint: Some("Upgrade darkmux, then run `darkmux flow status` for full detail.".into()),
+        },
         darkmux_flow::HealthState::Warn => {
             let reasons = if status.warn_reasons.is_empty() {
                 "(no specific warn reasons captured)".to_string()

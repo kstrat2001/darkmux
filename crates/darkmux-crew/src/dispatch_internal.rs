@@ -9640,7 +9640,7 @@ impl TailerState {
             ok: Some(t.ok),
             // (#2008) The three-way outcome, forwarded as classified, so the
             // viewer can render "exit 1" rather than a bare cross.
-            outcome: t.outcome.map(tool_outcome),
+            outcome: t.outcome.and_then(tool_outcome),
             exit_code: t.exit_code,
             failure_reason: t.failure_reason.as_deref().map(|r| cap_str(r, MAX_TRAJ_FIELD_BYTES)),
             step_id: None,
@@ -9778,7 +9778,9 @@ impl TailerState {
             slice_tokens: c.slice_tokens,
             tail_ratio: c.tail_ratio,
             verdict: match c.verdict {
-                darkmux_trajectory::Verdict::Continue => CheckpointVerdict::Continue,
+                // (#3035) A verdict a newer runtime named is not a conclusion
+                // this host can report: the run reads as continuing.
+                darkmux_trajectory::Verdict::Continue | darkmux_trajectory::Verdict::Unknown => CheckpointVerdict::Continue,
                 darkmux_trajectory::Verdict::Conclude => CheckpointVerdict::Conclude,
             },
             bound: c.bound.as_ref().map(bound_ref),
@@ -10275,8 +10277,10 @@ fn heartbeat_payload(c: &Chunk<'_>) -> DispatchHeartbeatPayload {
         sampled_at_ms: Some(c.ts),
         generated_chars: c.generated_chars,
         prompt_chars: None,
-        phase: c.phase.map(|phase| match phase {
-            darkmux_trajectory::StreamPhase::WritingToolCall => StreamPhase::WritingToolCall,
+        // (#3035) A phase a newer runtime named has no word here: absent.
+        phase: c.phase.and_then(|phase| match phase {
+            darkmux_trajectory::StreamPhase::WritingToolCall => Some(StreamPhase::WritingToolCall),
+            darkmux_trajectory::StreamPhase::Unknown => None,
         }),
         tool_name: c.tool_name.map(|name| cap_str(name, MAX_TRAJ_FIELD_BYTES)),
         step_id: None,
@@ -10549,7 +10553,7 @@ fn malformed_detail(e: &darkmux_trajectory::MalformedToolNames) -> String {
              (model={model}, sample=\"{sample}\") — never dispatched, coalesced into one feedback \
              message (#2169)"
         ),
-        darkmux_trajectory::MalformedReason::NotATool => format!(
+        darkmux_trajectory::MalformedReason::NotATool | darkmux_trajectory::MalformedReason::Unknown => format!(
             "{count} tool call(s) this turn carried a `name` that is not a real tool \
              (model={model}, sample=\"{sample}\") — never dispatched, coalesced into one feedback \
              message (#2169)"
@@ -10785,12 +10789,15 @@ fn turn_usage(u: &darkmux_trajectory::Usage) -> TurnUsage {
     }
 }
 
-/// How a tool call ended, as the payload carries it.
-fn tool_outcome(o: darkmux_trajectory::ToolOutcomeKind) -> ToolOutcome {
+/// How a tool call ended, as the payload carries it. `None` for an outcome a
+/// newer runtime named (#3035): the payload has no word for it, and absent is
+/// what a record from before the field reads as.
+fn tool_outcome(o: darkmux_trajectory::ToolOutcomeKind) -> Option<ToolOutcome> {
     match o {
-        darkmux_trajectory::ToolOutcomeKind::Ok => ToolOutcome::Ok,
-        darkmux_trajectory::ToolOutcomeKind::Reported => ToolOutcome::Reported,
-        darkmux_trajectory::ToolOutcomeKind::Failed => ToolOutcome::Failed,
+        darkmux_trajectory::ToolOutcomeKind::Ok => Some(ToolOutcome::Ok),
+        darkmux_trajectory::ToolOutcomeKind::Reported => Some(ToolOutcome::Reported),
+        darkmux_trajectory::ToolOutcomeKind::Failed => Some(ToolOutcome::Failed),
+        darkmux_trajectory::ToolOutcomeKind::Unknown => None,
     }
 }
 

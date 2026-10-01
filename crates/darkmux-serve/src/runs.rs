@@ -141,6 +141,10 @@ pub enum AbandonReason {
     /// is the honest "no ending recorded" case, never a claim that the run
     /// gave up on purpose.
     NoTerminal,
+    /// (#3035) A value a newer darkmux wrote that this build does not know.
+    /// Never written by this build; read, never treated as any known value.
+    #[serde(other)]
+    Unknown,
 }
 
 /// (#2682 fix-pass) Which of THREE genuinely different situations produced
@@ -8039,5 +8043,16 @@ mod tests {
         assert_eq!(summary.lifecycle_started_at_ms, None, "this test's own premise");
         let run = lab_summary_to_run(&summary, None, FIXTURE_NOW_MS, None);
         assert_eq!(run.started_ts, None, "no record, no claim");
+    }
+
+
+    /// (#3035) A value a newer darkmux wrote reads as `Unknown`, not as an
+    /// error that loses the whole record.
+    #[test]
+    fn an_enum_value_from_a_newer_darkmux_reads_as_unknown() {
+        fn read<T: serde::de::DeserializeOwned>() -> T {
+            serde_json::from_str("\"from_the_future\"").unwrap()
+        }
+        assert_eq!(read::<AbandonReason>(), AbandonReason::Unknown);
     }
 }

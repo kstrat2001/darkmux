@@ -208,6 +208,10 @@ pub enum SkipReason {
     /// this module's own `build_bundles` (the bundler plugin itself is not
     /// workspace-spec-aware — this is a post-filter on its output).
     ExcludedByWorkspaceSpec,
+    /// (#3035) A value a newer darkmux wrote that this build does not know.
+    /// Never written by this build; read, never treated as any known value.
+    #[serde(other)]
+    Unknown,
 }
 
 /// One file the diff touched that ended up contributing zero bundles, with
