@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { machActive, specOf, buildFleetCard, busiestExecution, isStrictlyBusier, specUnknownLabel, specLine, cardFace, notStreamedNames } from "./cards";
+import { machActive, specOf, buildFleetCard, busiestExecution, isStrictlyBusier, specUnknownLabel, specLine, cardFace, notStreamedNames, statusReason } from "./cards";
 import type { RowFacts } from "./viewRows";
 import type { MachineSpecsResponse } from "../../types/generated/MachineSpecsResponse";
 import type { PresenceBeat } from "../../types/generated/PresenceBeat";
@@ -1109,6 +1109,29 @@ describe("card availability when the view's liveness says the stream stopped (5.
     const c = buildFleetCard([], new Map(), null, new Set(), false, "darkbook", true, T, row);
     expect(c.availability).toBe("not_reporting");
     expect(notStreamedNames([c])).toEqual([]);
+  });
+});
+describe("the status line's word and reason follow the availability (5.0 R3)", () => {
+  const answered = { flow: true, presence: true, sessions: true, runs: true };
+  const face = (availability: "known" | "not_streamed" | "not_reporting", standing: "online" | "offline") =>
+    cardFace({ absent: standing === "offline", active: false, runsCount: 0, standing, availability }, false, answered);
+
+  it("not_streamed reads no signal, with the stream reason", () => {
+    const f = face("not_streamed", "online");
+    expect(f.stat).toBe("no signal");
+    expect(statusReason({ availability: "not_streamed", note: null }, f)).toBe("no signal: the card was read, but this machine's flow stream doesn't reach this hub");
+    expect(statusReason({ availability: "not_streamed", note: "not listening" }, f)).toBe("no signal: nothing from this machine's flow stream reaches this hub");
+  });
+
+  it("not_reporting reads offline, with the card's reason when it has one", () => {
+    const f = face("not_reporting", "offline");
+    expect(f.stat).toBe("offline");
+    expect(statusReason({ availability: "not_reporting", note: "not listening" }, f)).toBe("offline: not listening");
+    expect(statusReason({ availability: "not_reporting", note: null }, f)).toBe("offline: its presence beat stopped");
+  });
+
+  it("a known, quiet machine has no reason to give", () => {
+    expect(statusReason({ availability: "known", note: null }, face("known", "online"))).toBeUndefined();
   });
 });
 describe("cardFace (#2958)", () => {

@@ -37,7 +37,7 @@ function unreachableLine(reason: UnreachableReason): string {
     case "pin_mismatch":
       return "identity mismatch";
     case "listener_off":
-      return "listener off";
+      return "not listening";
     case "auth_required":
       return "auth required";
     case "refused_by_peer":

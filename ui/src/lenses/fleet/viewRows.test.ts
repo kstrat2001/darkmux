@@ -52,7 +52,7 @@ const UNREACHABLE: Record<UnreachableReason, string> = {
   not_on_overlay: "not on the overlay network",
   pin_mismatch: "identity mismatch",
   pin_not_saved: "pin not saved",
-  listener_off: "listener off",
+  listener_off: "not listening",
   auth_required: "auth required",
   refused_by_peer: "refused by peer",
   listener_unavailable: "listener unavailable",
@@ -168,9 +168,9 @@ describe("rowFacts", () => {
     expect(facts.isSelf).toBe(true);
   });
 
-  it("a peer the view could not reach shows the typed reason in place of hardware", () => {
+  it("a peer the view could not reach carries the typed reason, with no hardware line", () => {
     const facts = rowFacts(row({ card: { state: "unreachable", reason: "listener_off", detail: null }, liveness: "no_beat" }), new Set(), null);
-    expect(facts).toMatchObject({ spec: "", note: "listener off", standing: "offline", grant: null });
+    expect(facts).toMatchObject({ spec: "", note: "not listening", standing: "offline", grant: null });
   });
 
   it("a card read from the machine is labeled with the machine's own current name, not the roster id (#3028)", () => {

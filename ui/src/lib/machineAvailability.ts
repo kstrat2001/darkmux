@@ -38,22 +38,6 @@ export function machineAvailability(f: AvailabilityFacts): MachineAvailability {
   return f.seen ? "known" : "not_streamed";
 }
 
-/** The tooltip a warning mark carries; `null` for `known`, which warns of nothing. */
-export function availabilityWarning(a: MachineAvailability): string | null {
-  switch (a) {
-    case "known":
-      return null;
-    case "not_streamed":
-      return "This machine's records do not reach this viewer, so its activity cannot show here. Check that its flow stream points at this fleet's hub.";
-    case "not_reporting":
-      return "This machine stopped reporting. What is shown is its last known state.";
-    default: {
-      const unhandled: never = a;
-      return unhandled;
-    }
-  }
-}
-
 /** The one word a per-machine surface shows in place of a figure or an
  *  "idle" it cannot back. */
 export const NOT_REPORTED = "not reported";

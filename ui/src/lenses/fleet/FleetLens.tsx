@@ -13,7 +13,6 @@ import { REPLAY_GRANULARITY_NOTE, useLiveOverlay } from "../../lib/liveChannel";
 import { useCountUp } from "../../hooks/useCountUp";
 import { useFleetRoster, useLiveMachines } from "../../hooks/useLiveMachines";
 import { useFleetView } from "../../hooks/useFleetView";
-import { AvailabilityWarning } from "../../components/AvailabilityWarning";
 import { HubBadge } from "../../components/HubBadge";
 import { RadioSeatIcon } from "../../components/RadioSeatIcon";
 import { useFlip } from "../../hooks/useFlip";
@@ -36,7 +35,7 @@ import { UtilityGlyph } from "../../components/UtilityGlyph";
 import { scopeStateOf } from "../../lib/scopeMorph";
 import { liveStateLabel, reasonForLine } from "../../lib/tokenRate";
 import { tokensOffMeter } from "./savings";
-import { buildFleetCardBase, withLiveReadings, busiestExecution, isStrictlyBusier, specDimLabel, specLine, cardFace, notStreamedNames, NO_SIGNAL_STAT, type CardSourcesAnswered, type FleetCard } from "./cards";
+import { buildFleetCardBase, withLiveReadings, busiestExecution, isStrictlyBusier, specDimLabel, specLine, statusReason, cardFace, notStreamedNames, NO_SIGNAL_STAT, type CardSourcesAnswered, type FleetCard } from "./cards";
 import { useLatch } from "../../hooks/useLatch";
 import { buildActivityTimeline, ACTIVITY_WINDOW_PRESETS, DEFAULT_ACTIVITY_WINDOW_MIN } from "./timeline";
 import { rowFacts, rowSpecs } from "./viewRows";
@@ -135,8 +134,6 @@ function CardNameRow({ card, utilityQuietKnown }: { card: FleetCard; utilityQuie
       </span>
       {/* (#3022) What the machine's own card declares. */}
       <HubBadge declared={card.hub} />
-      {/* (#3012) A machine whose activity this viewer cannot see. */}
-      <AvailabilityWarning availability={card.availability} />
       {/* The radio seat this peer grants: an icon in the name row, where a
           narrow card's ellipsis cannot cut it. */}
       {card.grant?.radio ? <RadioSeatIcon /> : null}
@@ -149,8 +146,8 @@ function CardNameRow({ card, utilityQuietKnown }: { card: FleetCard; utilityQuie
 }
 
 /** The card's subtitle line: the hardware, then (on a desktop) what the peer
- * lets this machine do; when the view could not read the machine, its typed
- * status in the dim style. One line, so the card keeps its height. */
+ * lets this machine do; when no hardware is known, "hardware not reported" in
+ * the dim style. Never a status. One line, so the card keeps its height. */
 function CardSpec({ card }: { card: FleetCard }) {
   return (
     <div className="spec" title={specLine(card) || undefined}>
@@ -1271,7 +1268,7 @@ export function FleetLens({
                           })}
                 </div>
               ) : (
-                <div className="stat">
+                <div className="stat" title={statusReason(card, face)}>
                   <span className="dot" />
                   {/* (#2958) "idle" before its sources answer is a default,
                       not a reading: see `cardFace`. */}

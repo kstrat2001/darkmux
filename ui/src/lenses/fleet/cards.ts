@@ -103,10 +103,27 @@ export function specOf(
   return beat?.specs || "";
 }
 
-/** The dim line shown in place of the hardware: the view's typed status for
- * a machine it could not read, else why no hardware is known. */
-export function specDimLabel(card: { note: string | null; specUnknown: SpecUnknownReason | null }): string {
-  return card.note ?? specUnknownLabel(card.specUnknown ?? "not-reported");
+/** The dim line shown in place of the hardware: only ever about the hardware,
+ * never why the machine is down (that is the status line's tooltip). */
+export function specDimLabel(card: { specUnknown: SpecUnknownReason | null }): string {
+  return specUnknownLabel(card.specUnknown ?? "not-reported");
+}
+
+/** The status line's tooltip: why it says `offline` or `no signal`, from the
+ * availability the face was derived from. `undefined` when the word needs no
+ * reason (idle, running, a state still loading). `note` is the view's typed
+ * reason for a card it could not read; `null` means the card was read. */
+export function statusReason(
+  card: { availability: MachineAvailability; note: string | null },
+  face: { absent: boolean; noSignal: boolean },
+): string | undefined {
+  if (face.absent) return `offline: ${card.note ?? "its presence beat stopped"}`;
+  if (face.noSignal && card.availability === "not_streamed") {
+    return card.note === null
+      ? "no signal: the card was read, but this machine's flow stream doesn't reach this hub"
+      : "no signal: nothing from this machine's flow stream reaches this hub";
+  }
+  return undefined;
 }
 
 /** The card's subtitle: the hardware line, then what the peer lets this
@@ -276,9 +293,9 @@ export interface FleetCard {
   spec: string;
   /** (#1855) `null` iff `spec` is non-empty. See `SpecUnknownReason`. */
   specUnknown: SpecUnknownReason | null;
-  /** The view's typed status line for a machine whose card it could not
-   *  read ("listener off"); shown in place of the hardware line. `null` for
-   *  a machine the view read, and for one the view does not hold. */
+  /** The view's typed reason for a machine whose card it could not read
+   *  ("not listening"); the status line's tooltip carries it. `null` for a
+   *  machine the view read, and for one the view does not hold. */
   note: string | null;
   /** What this peer lets this machine do (`viewRows.Grant`); `null` for
    *  this machine's own card and for any peer without a grant to show. */
@@ -499,13 +516,15 @@ function cardIdentity(
       self: false,
     };
   }
+  const spec = row.spec || specOf(data, liveMachines, specs, m);
   return {
     // (#2814) `nameOf` plus the self-identity floor: see `displayNameOf`. A
     // machine only the view knows is named by its own card's name when the
     // view read one, else its roster id (`rowFacts`).
     name: row.known ? displayNameOf(data, liveMachines, specs, m, roster) : (row.name ?? m),
-    spec: row.spec,
-    specUnknown: row.spec ? null : ("not-reported" as const),
+    // The last hardware known: the card the view read, else the presence beat.
+    spec,
+    specUnknown: spec ? null : ("not-reported" as const),
     note: row.note,
     grant: row.grant,
     hub: row.hub,

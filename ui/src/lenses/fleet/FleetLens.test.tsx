@@ -1592,14 +1592,16 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
   // "hardware not reported" reads as a fact about the machine — it answered
   // and withheld its hardware — and nothing has been received from this one
   // at all.
-  it("a peer the view could not reach shows the view's typed reason, not a hardware claim", async () => {
+  it("a peer the view could not reach keeps a hardware subtitle and puts the reason on the status line", async () => {
     mockFleetFetch({ view: [unreachableRow("studio", "listener_off")] });
     renderFleetLens();
     await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
     const card = document.querySelector(".mach")!;
-    expect(card.querySelector(".spec")!.textContent).toBe("listener off");
-    expect(card.textContent).not.toContain("hardware unknown");
-    expect(card.textContent).not.toContain("hardware not reported");
+    expect(card.querySelector(".spec")!.textContent).toBe("hardware not reported");
+    expect(card.querySelector(".spec")!.textContent).not.toContain("listening");
+    await waitFor(() => expect(card.querySelector(".stat")!.getAttribute("title")).toBe("offline: not listening"));
+    expect(card.querySelector(".stat")!.textContent).toBe("offline");
+    expect(card.querySelector('[data-testid="availability-warning"]')).toBeNull();
   });
 
   // (#3022) The badge is the card's own declaration, read from the view: only
@@ -1651,7 +1653,9 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
     await waitFor(() => expect(studio.querySelector(".stat")!.textContent).toBe("no signal"));
     expect(studio.className).not.toContain("absent");
     expect(studio.textContent).not.toContain("offline");
-    expect(studio.querySelector('[data-testid="availability-warning"]')!.getAttribute("title")).toMatch(/do not reach this viewer/);
+    expect(studio.querySelector(".stat")!.getAttribute("title")).toBe("no signal: the card was read, but this machine's flow stream doesn't reach this hub");
+    expect(studio.querySelector('[data-testid="availability-warning"]')).toBeNull();
+    expect(studio.textContent).not.toContain("⚠");
     // (5.0 R3) The hero counts only what reaches this viewer, and says so.
     const lbl = document.querySelector(".savlbl")!;
     expect(lbl.textContent).toBe("tokens seen · last 24h");
@@ -1684,7 +1688,8 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
     const studio = [...document.querySelectorAll(".mach")].find((c) => c.querySelector(".mach-name")!.textContent === "studio")!;
     await waitFor(() => expect(studio.querySelector(".stat")!.textContent).toBe("offline"));
     expect(studio.className).toContain("absent");
-    expect(studio.querySelector(".spec")!.textContent).toBe("listener off");
+    expect(studio.querySelector(".spec")!.textContent).toBe("hardware not reported");
+    expect(studio.querySelector(".stat")!.getAttribute("title")).toBe("offline: not listening");
   });
 
   // (fleet review C2) A view row that carries no uid (its card was not read)

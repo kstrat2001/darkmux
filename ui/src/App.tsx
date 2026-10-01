@@ -8,7 +8,6 @@ import { SeekSignalContext } from "./lib/seekSignal";
 import { PlaybackClockContext, playbackClockOf } from "./lib/pageClockRate";
 import { Scrubber } from "./lenses/catalog/Scrubber";
 import { useSyncHash, writeHash, canonicalHash } from "./lib/hashSync";
-import { MACHINE_NOT_FOUND_LABEL, drilledUidOf, machineLabel } from "./lib/machineKey";
 import { FleetLens } from "./lenses/fleet/FleetLens";
 import { LensPlaceholder } from "./components/LensPlaceholder";
 import { NavChrome } from "./components/NavChrome";
@@ -27,7 +26,7 @@ import { SessionReplay } from "./lenses/catalog/SessionReplay";
 import { PlaybackLens } from "./lenses/catalog/PlaybackLens";
 import { useFlowWindow } from "./hooks/useFlowWindow";
 import { useRouteRecords } from "./hooks/useRouteRecords";
-import { useFleetRoster, useLiveMachines } from "./hooks/useLiveMachines";
+import { useLiveMachines } from "./hooks/useLiveMachines";
 import { useLiveTail } from "./hooks/useLiveTail";
 import type { LiveTailStatus } from "./hooks/useLiveTail";
 import { computeMetaLines, readyParts } from "./lib/metaLine";
@@ -36,15 +35,16 @@ import { ReadyHeadline } from "./components/ReadyHeadline";
 import { FleetCoverageNotice, useDegradedFleetSource } from "./components/FleetCoverageNotice";
 import { FlowReadNotice } from "./components/FlowReadNotice";
 import { earliestRecordDate, firstRecordDate, missionReplayDate, todayUTC } from "./lib/flow";
-import { displayNameOf, localMachineUid, machinePageRecords, selfUidOf } from "./lib/machineIdentity";
+import { displayNameOf, localMachineUid, selfUidOf } from "./lib/machineIdentity";
 import { dispatchHash, isLiveRoute, showsEventLog, tokRateConnectionEvidence } from "./lib/route";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "./lib/fetcher";
 import { queryKeys } from "./lib/queryKeys";
-import type { PresenceBeat } from "./types/generated/PresenceBeat";
+import { useDrilledMachine } from "./hooks/useDrilledMachine";
+import { useEventLogRecords } from "./hooks/useEventLogRecords";
 import type { MachineSpecsResponse } from "./types/generated/MachineSpecsResponse";
 import type { Route } from "./lib/route";
-import { ingest, recordsAsOf, stepIdOf, type NormRecord } from "./lib/ingest";
+import { ingest, type NormRecord } from "./lib/ingest";
 import { DEFAULT_POLICY, lifecycleAt, recordedWallMs } from "./lib/lifecycle";
 import { sessionRun } from "./lib/runRef";
 import type { FlowRecordsResponse } from "./types/generated/FlowRecordsResponse";
@@ -137,9 +137,6 @@ function terminalWallMs(records: NormRecord[], sessionId: string): number | null
   const run = sessionRun(records, sessionId, Infinity);
   return run ? recordedWallMs(lifecycleAt(run, Infinity, DEFAULT_POLICY).close) : null;
 }
-
-/** A static build has no presence beats. */
-const NO_LIVE_MACHINES: Map<string, PresenceBeat> = new Map();
 
 export function App() {
   const route = useHashRoute();
@@ -477,74 +474,22 @@ export function App() {
   // `nameOf` echoes a uid it has never seen named, so the crumb would read
   // `<uid head>-…` where it used to read `MacBook-Pro`.
   const localName = localUid != null ? displayNameOf(flowWindow.data, liveMachines, specs, localUid) : null;
-  // (drill-in packet) The MACHINE route's own target — the local machine
-  // for `uid: null`, or the drilled uid's own name otherwise. `nameOf` is
-  // uid-generic (works for a remote uid too, via its presence beat or flow
-  // records — see `lib/flow.ts`), so this is the same lookup `MachineLens`
-  // itself does for its header, not a second implementation.
-  // (#2921 follow-up) The roster names a drilled machine nothing else does,
-  // exactly as it names that machine's fleet card. Read once, no poller.
-  const drilledKey = route.kind === "machine" ? route.machine : null;
-  const { machines: roster } = useFleetRoster(isLiveRoute(route) && drilledKey != null, false);
-  // (#2929) The route carries a machine KEY, not the uid; resolve it the way
-  // `MachineLens` does (an unresolved key names no machine, and labels as
-  // one nothing knows — the same not-found title an unknown uid got).
-  // The drilled key's machine, resolved once for the label and the event log.
-  const drilledUid = useMemo(
-    () => drilledUidOf({ data: flowWindow.data, liveMachines, specs, roster }, drilledKey),
-    [drilledKey, flowWindow.data, liveMachines, specs, roster],
-  );
-  const drilledName = useMemo(() => {
-    if (drilledKey == null) return null;
-    // A key naming no machine says so once the window has landed, rather
-    // than inventing a label no card shows; blank while it is still loading.
-    // (#2965) Not while a flow read is failing: a machine known only from
-    // flow records is indistinguishable from an unknown key until it reads.
-    if (drilledUid == null) return flowWindow.settled && flowWindow.failure === null ? MACHINE_NOT_FOUND_LABEL : "";
-    return machineLabel({ data: flowWindow.data, liveMachines, specs, roster }, drilledUid);
-  }, [drilledKey, drilledUid, flowWindow.data, flowWindow.settled, flowWindow.failure, liveMachines, specs, roster]);
+  // (drill-in packet) The MACHINE route's own target: the local machine for
+  // `uid: null`, or the drilled machine otherwise (the same lookup
+  // `MachineLens` does for its header, not a second implementation).
+  const { drilledKey, drilledUid, drilledName } = useDrilledMachine(route, flowWindow, liveMachines, specs);
   const targetMachineName = route.kind === "machine" ? (drilledKey != null ? drilledName : localName) : null;
-  // A static build's runs/machine/console routes have no slice of their own
-  // (the live window is empty there); the day's log, scoped to the playhead,
-  // is what the transport is scrubbing. Playback and dispatch routes keep
-  // their own slice, scoped the same way.
-  const ownSlice = route.kind === "playback" || route.kind === "dispatch" || source.kind === "daemon";
-  const logBase = ownSlice ? routeRecords.records : (dayRecords ?? EMPTY_FLOW_RECORDS);
-  // (5.0 R2) A static build has no daemon specs, so "this machine" is the
-  // machine fixture's own, found in the committed day (the same fixture and
-  // query key `MachineLens` reads, so no second request).
-  const staticMachineSrc = source.machine;
-  const staticMachineQuery = useQuery({
-    queryKey: queryKeys.staticMachine(staticMachineSrc ?? ""),
-    queryFn: () => fetchJson<{ specs: MachineSpecsResponse }>(staticMachineSrc as string),
-    enabled: source.kind === "static" && staticMachineSrc !== null && route.kind === "machine",
-    staleTime: Infinity,
+  const eventLogRecords = useEventLogRecords({
+    route,
+    source,
+    routeRecords: routeRecords.records,
+    dayRecords,
+    missionRecords: missionEvents?.records ?? null,
+    playhead,
+    drilledKey,
+    drilledUid,
+    localUid,
   });
-  const staticSpecs = staticMachineQuery.data?.ok ? staticMachineQuery.data.data.specs : null;
-  const pageSelfUid = useMemo(
-    () => localUid ?? localMachineUid(dayRecords ?? EMPTY_FLOW_RECORDS, NO_LIVE_MACHINES, staticSpecs?.machine_id ?? null, staticSpecs?.machine_uid ?? null),
-    [localUid, dayRecords, staticSpecs],
-  );
-  const eventLogRecords = useMemo(() => {
-    // Mission has no playhead concept (`transportShown` already excludes
-    // it below) — its own fold is always the full, historical record set,
-    // never scoped to a scrubbed time.
-    if (route.kind === "mission") {
-      const all = missionEvents?.records ?? [];
-      // (#2189) `step_id` EQUALITY, same rule `buildStepHeaderFields`'s own
-      // doc names — the mainstay column scopes to exactly this step's own
-      // records when one is selected, never a re-fetch (one source of
-      // records, filtered here, at the point they're handed to the
-      // column — see #2189's own issue text).
-      return route.stepId ? all.filter((r) => stepIdOf(r) === route.stepId) : all;
-    }
-    // (5.0 R2) A machine page lists that machine's records, not the fleet's,
-    // scoped to the playhead like every other route. An unresolved machine
-    // has none to list.
-    if (route.kind === "machine") return machinePageRecords(logBase, drilledKey, drilledUid, pageSelfUid, playhead);
-    if (playhead === null) return routeRecords.records;
-    return recordsAsOf(logBase, playhead);
-  }, [route.kind, selectedMissionStepId, missionEvents, playhead, routeRecords.records, logBase, drilledKey, drilledUid, pageSelfUid]);
 
   // (#1800) `#meta` takes legacy's REPLAY branch on a replay. Until now it
   // computed from `flowWindow` (the live rolling window) on every route, so a

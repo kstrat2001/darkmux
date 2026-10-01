@@ -344,7 +344,7 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
       ["self alone", [SELF_ROW], null],
       // The radio seat in the grant is an icon, not words, and adds no height.
       ["peer read, with a grant, no beat", [SELF_ROW, PEER_ROW], "Apple M1 Max · 32 GB · runs diff-review"],
-      ["peer unreachable, listener off", [SELF_ROW, OFFLINE_ROW], "listener off"],
+      ["peer unreachable, not listening", [SELF_ROW, OFFLINE_ROW], "hardware not reported"],
     ]) {
       const ctx = await browser.newContext({ viewport, timezoneId: "UTC", locale: "en-US" });
       const page = await ctx.newPage();
@@ -355,10 +355,10 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
       await expect(page.locator(".mach .stat").first()).toHaveText("idle");
       if (peerSpec) {
         await expect(page.locator(".mach .spec").nth(1), `${label}: the peer's subtitle`).toHaveText(peerSpec);
-        await expect(page.locator(".mach .stat").nth(1), `${label}: the peer's status`).toHaveText(peerSpec === "listener off" ? "offline" : "no signal");
-        await expect(page.locator(".mach").nth(1).locator(".name .radio-seat"), `${label}: the radio seat icon`).toHaveCount(peerSpec === "listener off" ? 0 : 1);
+        await expect(page.locator(".mach .stat").nth(1), `${label}: the peer's status`).toHaveText(peerSpec === "hardware not reported" ? "offline" : "no signal");
+        await expect(page.locator(".mach").nth(1).locator(".name .radio-seat"), `${label}: the radio seat icon`).toHaveCount(peerSpec === "hardware not reported" ? 0 : 1);
         // Shown on a desktop; on a phone it gives the name its room (no tooltip on touch).
-        if (peerSpec !== "listener off") await expect(page.locator(".mach").nth(1).locator(".name .radio-seat")).toBeVisible({ visible: viewport.width > 560 });
+        if (peerSpec !== "hardware not reported") await expect(page.locator(".mach").nth(1).locator(".name .radio-seat")).toBeVisible({ visible: viewport.width > 560 });
       }
       await page.waitForTimeout(400);
       const m = await measure(page, { card: CARD.card, cardScope: CARD.cardScope });

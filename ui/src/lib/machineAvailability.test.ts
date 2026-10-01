@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { availabilityWarning, machineAvailability } from "./machineAvailability";
+import { machineAvailability } from "./machineAvailability";
 
 describe("machineAvailability (#3012)", () => {
   it("self is always known, even with nothing in the window", () => {
@@ -17,10 +17,5 @@ describe("machineAvailability (#3012)", () => {
   it("a peer seen and up or unsure is known", () => {
     expect(machineAvailability({ self: false, seen: true, standing: "online" })).toBe("known");
     expect(machineAvailability({ self: false, seen: true, standing: "unknown" })).toBe("known");
-  });
-  it("only the unknown states warn", () => {
-    expect(availabilityWarning("known")).toBeNull();
-    expect(availabilityWarning("not_streamed")).toMatch(/do not reach this viewer/);
-    expect(availabilityWarning("not_reporting")).toMatch(/stopped reporting/);
   });
 });
