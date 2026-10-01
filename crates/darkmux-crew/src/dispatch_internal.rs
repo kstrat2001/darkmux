@@ -3207,8 +3207,9 @@ fn remote_chat_attempt(
     // to stop.
     if darkmux_types::interrupt::is_set() && !out.status.success() {
         return Err(HostedCallError::Other(anyhow!(
-            "hosted dispatch interrupted by an operator signal (SIGINT/SIGTERM/SIGHUP) — \
-             the request to {url} was killed mid-flight"
+            "hosted dispatch {} (SIGINT/SIGTERM/SIGHUP) — \
+             the request to {url} was killed mid-flight",
+            darkmux_types::interrupt::INTERRUPTED_BY_SIGNAL
         )));
     }
     if !out.status.success() {
@@ -6267,8 +6268,9 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         // explicitly in the `Ok` arm above (the child is dead either
         // way; there is nothing left to deregister here).
         return Err(anyhow!(
-            "darkmux-runtime container dispatch interrupted by an operator signal \
-             (SIGINT/SIGTERM/SIGHUP) — the container `{container_name}` was killed mid-run"
+            "darkmux-runtime container dispatch {} \
+             (SIGINT/SIGTERM/SIGHUP) — the container `{container_name}` was killed mid-run",
+            darkmux_types::interrupt::INTERRUPTED_BY_SIGNAL
         ));
     }
 

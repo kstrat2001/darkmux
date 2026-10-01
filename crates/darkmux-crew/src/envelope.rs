@@ -265,6 +265,19 @@ pub struct RunTally {
     /// The run's own wall-clock bound fired (an honest, bounded partial
     /// result): never cleaner than `Degraded`, but any real `Error` still wins.
     pub wall_clock_bound: bool,
+    /// How many of the `errored` steps ended BECAUSE of that interrupt (their
+    /// error is the interrupt's own), as opposed to for a reason of their own.
+    /// Only counted when the bound fired.
+    pub interrupted: usize,
+}
+
+impl RunTally {
+    /// The wall-clock bound explains every error this run has: it fired, and
+    /// every errored step was cut off by its interrupt. A step that errored for
+    /// a real reason before the bound fired makes this `false`.
+    pub fn bound_explains_every_error(&self) -> bool {
+        self.wall_clock_bound && self.interrupted == self.errored
+    }
 }
 
 impl MissionOutcomeStatus {
@@ -298,7 +311,7 @@ impl MissionOutcomeStatus {
     ///
     /// - nothing errored, never ran or degraded, no bound fired -> `Clean`.
     /// - the delivering task failed, nothing completed (unless the wall-clock
-    ///   bound fired, whose interrupt is what left nothing complete), or growth
+    ///   bound fired and its interrupt explains every error), or growth
     ///   planned nothing because every producer errored (so no unit was ever
     ///   reviewed or crawled) -> `Error`: the run did none of its work, however
     ///   many bookkeeping steps (deliver, summarize) completed around the hole.
@@ -307,8 +320,9 @@ impl MissionOutcomeStatus {
     pub fn decide(t: &RunTally) -> Self {
         let lost = t.errored > 0 || t.never_ran > 0 || t.degraded > 0;
         // Under the bound, "nothing completed" is the interrupt's own doing
-        // (the in-flight step is killed and reports an error), not a lost run.
-        let nothing_completed = t.completed == 0 && t.errored > 0 && !t.wall_clock_bound;
+        // (the in-flight step is killed and reports an error), not a lost run
+        // (but only when the interrupt explains EVERY error).
+        let nothing_completed = t.completed == 0 && t.errored > 0 && !t.bound_explains_every_error();
         let did_none_of_its_work = nothing_completed
             || t.delivery_failed
             || t.growth.planned_nothing_after_errors();
@@ -909,7 +923,13 @@ mod tests {
         // An interrupt that left nothing complete is the bound's doing: Degraded.
         let mut none = tally(0, 1, 0, 0);
         none.wall_clock_bound = true;
+        none.interrupted = 1;
         assert_eq!(MissionOutcomeStatus::decide(&none), Degraded);
+        // A step that errored for a real reason before the bound fired keeps Error.
+        let mut real = tally(0, 2, 0, 0);
+        real.wall_clock_bound = true;
+        real.interrupted = 1;
+        assert_eq!(MissionOutcomeStatus::decide(&real), Error);
         // But a run whose planning errored and grew nothing is a real Error
         // (F10), and the bound must not downgrade it.
         none.growth = GrowthTally { copies_grown: 0, producers_total: 2, producers_errored: 2 };
