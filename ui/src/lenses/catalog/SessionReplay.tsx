@@ -480,7 +480,7 @@ export function SessionReplay({
   playhead = null,
   connected = true,
   lastContactMs = null,
-  viewerUid = null,
+  viewerUid,
 }: {
   sessionId: string;
   /** The mission whose run on this session the page shows, when the route
@@ -507,7 +507,8 @@ export function SessionReplay({
    *  entirely — see `runRegions`'s own doc. */
   lastContactMs?: number | null;
   /** The page's own machine identity (`App.tsx`'s `localUid`): the route line says
-   *  "this machine" only for a run that ran on it. `null` when not known. */
+   *  "this machine" only for a run that ran on it. Absent or `null` when not
+   *  known (`runRegions` defaults it). */
   viewerUid?: string | null;
 }) {
   // (#1972) POLLS while the session is live. Without this the page fetched
