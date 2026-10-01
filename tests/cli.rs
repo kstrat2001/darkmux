@@ -10780,6 +10780,16 @@ fn fail_probe_errored_delivery_task_exits_non_zero() {
         Some(1),
         "a run whose delivery task errored must exit 1\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
+    // The status has ONE owner (`MissionOutcomeStatus::decide`): the exit code
+    // is derived from it, so the envelope (which `run list` and the runs board
+    // read) must agree and say `error`, never `degraded` over an exit 1.
+    let envelope: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(one_mission_dir(&home).join("envelope.json")).unwrap()).unwrap();
+    assert_eq!(
+        envelope["status"],
+        serde_json::json!("error"),
+        "a failed delivery is an error in the envelope too: {envelope}"
+    );
 }
 
 /// (#2310 fix-loop C1 / S4-2) The review / crawl shape specifically: a

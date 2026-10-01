@@ -183,15 +183,13 @@ pub(crate) fn all_step_kinds() -> Result<crew::step_kinds::StepKindRegistry> {
 ///         (gate banner printed, phase left Running for `mission finalize`);
 ///         or a gate-less generic graph finished Clean/Degraded.
 ///   `1` — coder dispatch error (phase stays Running, worktree kept for
-///         inspection); or a gate-less generic graph ended Error; or
-///         (#2310 fix-loop C5) a gate-less generic graph whose config
-///         declares `outcome_from` and whose named DELIVERY task itself
-///         ended `Error`/`Abandoned` — a run that delivered nothing is not
-///         a success, however much upstream work completed, so this
-///         overrides the `Degraded` -> `0` row above. See
-///         [`delivery_failed`] for why the per-step aggregate cannot see
-///         this on its own, and `crew::envelope`'s module doc for the same
-///         rule stated next to the status it overrides.
+///         inspection); or a gate-less generic graph ended Error. That
+///         includes (#2310 fix-loop C5) a graph whose config declares
+///         `outcome_from` and whose named DELIVERY task itself ended
+///         `Error`/`Abandoned`: a run that delivered nothing is not a
+///         success, however much upstream work completed. The exit code is
+///         derived from the decided status alone; [`delivery_failed`] is an
+///         input to `MissionOutcomeStatus::decide`, not a second owner.
 ///   `2` — QA found blocker(s) — resolve before shipping (phase Running).
 ///   `3` — QA could not run — manual review required (phase Running).
 ///   `4` — instance minted but NOT executed: the graph references step
@@ -1406,6 +1404,7 @@ pub fn launch(
             Ok(grown) => {
                 for (event, grown_tasks, grown_steps, producer_error) in grown {
                     growth.copies_grown += event.minted.len();
+                    growth.producers_total += 1;
                     if let Some(pe) = &producer_error {
                         phase_producer_errored = true;
                         growth.producers_errored += 1;
@@ -1807,17 +1806,6 @@ pub fn launch(
     // coder-phase branch returns above with the mission still `Active` at an
     // operator sign-off gate, where a duration would name nothing.
     envelope.wall_ms = Some(run_started.elapsed().as_millis() as u64);
-    // (#2678) A wall-clock-bound interrupt kills the in-flight dispatch the
-    // SAME way a real SIGTERM does (see `launch_guard::
-    // spawn_wall_clock_watchdog`'s doc) — which means the MOST COMMON case
-    // (one or a handful of steps in flight) reaches this ordinary happy
-    // path with a per-step "interrupted by an operator signal" error,
-    // never the Drop-path abort writer at all. `build_envelope` alone has
-    // no way to know the interruption was self-inflicted and honest rather
-    // than a real failure, so the override runs HERE too — not only in
-    // `finalize_reconciled_mission` — to cover the run shape that
-    // actually reaches this branch.
-    apply_wall_clock_bound_outcome(&mut envelope);
     let status = envelope.status;
     // (#2301) A run's own numbers ride the `mission close` payload — the
     // home the retired crawl launcher used, kept for every generic graph
@@ -1833,44 +1821,10 @@ pub fn launch(
     print_run_summary(&mission_id, &steps, status, degraded_steps.len());
 
     use crew::envelope::MissionOutcomeStatus;
-    // (#1877 item 4 — deliberately deferred, corrected) `build_envelope`
-    // (above, only reached for a gate-less generic Tier-1-only graph — a
-    // coder-phase config's `coder_handles` branch above `return`s before
-    // this point, either into `reconcile_and_finalize_on_error` on a
-    // pre-gate failure or by stopping at the operator gate with no
-    // finalize at all) still constructs `status` directly, never a
-    // `RunOutcome`. An earlier version of this note reasoned that per-step
-    // aggregation is "a different shape" from review's per-flag docket —
-    // that reasoning was wrong: `build_envelope`'s all-errored arm
-    // (`completed.is_empty()` → `MissionOutcomeStatus::Error`) already IS
-    // a docket-style verdict (no step produced usable output), which is
-    // semantically `RunOutcome::Empty`, not `Error`.
-    //
-    // The REAL blocker is `MissionOutcomeStatus::from_outcome`
-    // (`crates/darkmux-crew/src/envelope.rs`): it maps `Complete`/
-    // `Partial`/`Empty` and has no route to `Error` at all. Adopting
-    // `RunOutcome` here would silently change the all-errored arm's status
-    // from `Error` to `Degenerate` (`Empty` mapped through `from_outcome`)
-    // — a real status/exit-code change for that input shape, not a pure
-    // refactor. So this match only ever sees `status` directly, never
-    // `outcome`, and stays that way until `from_outcome` grows a fourth
-    // arm (or this site gets a documented reason to keep constructing
-    // `Error` by hand). What's unaffected regardless: `from_outcome`
-    // already collapses a future `RunOutcome::Partial` into `Degraded`,
-    // which already exits 0 here — a mission driver that adopts
-    // `RunOutcome` for its Partial case inherits this exit code for free,
-    // with no match arm to add.
-    // (#2310 fix-loop C5 / S4-C1) The delivery override, applied on top of
-    // the status mapping below: a `Degraded` run whose DELIVERING task (the
-    // one `outcome_from` names, else the positional last) itself ended
-    // `Error`/`Abandoned` delivered nothing, and exits 1. `Clean` can never
-    // reach this (no errored steps at all, so the delivering task cannot be
-    // dead), and every failing status already exits 1 — so this only ever
-    // flips the one case the per-step aggregate genuinely cannot see. See
-    // `delivery_failed`'s own doc for why the aggregate cannot.
-    let delivery_failed = delivery_failed(config, &real_phase_ids, &tasks, &steps);
+    // The exit code is derived from `status` ALONE: `build_envelope` already
+    // folded the delivering task's failure and the wall-clock bound into
+    // `MissionOutcomeStatus::decide`, so there is no second owner here.
     let exit_code = match status {
-        _ if delivery_failed => 1,
         MissionOutcomeStatus::Clean | MissionOutcomeStatus::Degraded => 0,
         // (#1881) `status` here is `build_envelope`'s OWN freshly-computed
         // value, never a deserialized one, so `Unknown` (a
@@ -4248,9 +4202,13 @@ fn build_envelope(
         never_ran: never_ran.len(),
         degraded: degraded.len(),
         growth,
+        delivery_failed: delivery_failed(config, real_phase_ids, tasks, steps),
+        wall_clock_bound: crate::launch_guard::wall_clock_exceeded(),
     });
 
-    let reason = if errored.is_empty() {
+    let reason = if let Some(bound) = wall_clock_bound_reason(status) {
+        Some(bound)
+    } else if errored.is_empty() {
         None
     } else {
         Some(
@@ -4292,31 +4250,28 @@ fn build_envelope(
     envelope
 }
 
-/// (#2678) Applied at every terminal-writing point in `launch` that can be
-/// reached by an interrupted run: if THIS run's own wall-clock bound
-/// actually fired (`launch_guard::wall_clock_exceeded`), the real outcome
-/// is a genuine, honest partial result the operator opted into (or left
-/// at its unbounded default) — never a failure. Overrides `status` to
-/// `Degraded` and `reason` to name the bound, replacing whatever verdict
-/// the interrupted dispatch's own per-step error text would otherwise
-/// produce (typically `Error`, since a killed dispatch reports
-/// "interrupted by an operator signal" — the wall-clock watchdog
-/// deliberately triggers via the SAME `darkmux_types::interrupt` flag a
-/// real SIGTERM does, see `launch_guard::spawn_wall_clock_watchdog`'s own
-/// doc, so it is indistinguishable at that layer). darkmux describes,
-/// never adjudicates: this never asserts WHY the run was slow, only that
-/// the bound was reached. A no-op when the bound never fired (the common
-/// case, and every in-time run).
-fn apply_wall_clock_bound_outcome(envelope: &mut crew::envelope::MissionEnvelope) {
-    if !crate::launch_guard::wall_clock_exceeded() {
-        return;
+/// (#2678) The reason a run's own wall-clock bound gives for a `Degraded`
+/// verdict, or `None` when the bound never fired (the common case, and every
+/// in-time run) or the run's decided status is not `Degraded`. The bound is an
+/// INPUT to [`crew::envelope::MissionOutcomeStatus::decide`] (a real `Error`
+/// still wins over it), never a post-hoc override of the verdict.
+///
+/// A wall-clock-bound interrupt kills the in-flight dispatch the SAME way a
+/// real SIGTERM does (see `launch_guard::spawn_wall_clock_watchdog`'s doc), so
+/// the interrupted step carries "interrupted by an operator signal" error text
+/// that would otherwise be the reason. When the bound is what decided a
+/// `Degraded` run, this names it instead: darkmux describes, never
+/// adjudicates, so it never asserts WHY the run was slow, only that the bound
+/// was reached.
+fn wall_clock_bound_reason(status: crew::envelope::MissionOutcomeStatus) -> Option<String> {
+    if status != crew::envelope::MissionOutcomeStatus::Degraded || !crate::launch_guard::wall_clock_exceeded() {
+        return None;
     }
     let bound_seconds = darkmux_types::config_access::mission_wall_clock_timeout_seconds();
-    envelope.status = crew::envelope::MissionOutcomeStatus::Degraded;
-    envelope.reason = Some(format!(
+    Some(format!(
         "mission wall-clock bound of {bound_seconds}s reached before the run finished — \
          rendering the findings that had already materialized rather than discarding them"
-    ));
+    ))
 }
 
 /// (#1406, F4) Error-path reconcile. A scheduler-level `Err` mid-run (a step
@@ -4341,12 +4296,14 @@ fn apply_wall_clock_bound_outcome(envelope: &mut crew::envelope::MissionEnvelope
 /// mission-board VIEW.
 ///
 /// (#1877 item 4) THIS is the site that actually owns a coder-phase
-/// `launch`'s Error-status envelope on a pre-gate failure — hand-
-/// constructs `MissionOutcomeStatus::Error` directly, same as
-/// [`build_envelope`] and `coder_phase.rs`'s `finalize_mission_if_complete`.
-/// Same deferred blocker as both: `MissionOutcomeStatus::from_outcome` has
-/// no route to `Error`, so adopting `RunOutcome` here is a status change,
-/// not a pure refactor — see `build_envelope`'s doc.
+/// `launch`'s Error-status envelope on a pre-gate failure: the caller hands
+/// it an explicit `Error`, since a mission-level `Err` has no step tally to
+/// decide from. (Only a fired wall-clock bound re-decides it through
+/// `MissionOutcomeStatus::decide`, see [`finalize_reconciled_mission`].)
+/// `coder_phase.rs`'s `finalize_mission_if_complete` decides from the QA gate
+/// verdict instead. `MissionOutcomeStatus::from_outcome` has no route to
+/// `Error`, so adopting `RunOutcome` here would be a status change, not a
+/// pure refactor.
 fn reconcile_and_finalize_on_error(
     mission_id: &str,
     config: &MissionConfig,
@@ -4476,15 +4433,28 @@ fn finalize_reconciled_mission(
         }
     }
 
+    // (#2678) A run interrupted by its own wall-clock bound is decided by the
+    // SAME `decide` the happy path uses (`build_envelope`), whichever of this
+    // function's THREE callers (the Drop-path abort writer, the scheduler-error
+    // path, the coder-phase pre-gate-failure path) caught it: the bound reads
+    // `Degraded` unless the steps' own tally says `Error`. Any other caller
+    // keeps the explicit status it was handed.
+    let (completed, errored, never_ran) = partition_step_outcomes(steps);
+    let status = if crate::launch_guard::wall_clock_exceeded() {
+        crew::envelope::MissionOutcomeStatus::decide(&crew::envelope::RunTally {
+            completed: completed.len(),
+            errored: errored.len(),
+            never_ran: never_ran.len(),
+            delivery_failed: delivery_failed(config, real_phase_ids, tasks, steps),
+            wall_clock_bound: true,
+            ..Default::default()
+        })
+    } else {
+        status
+    };
     let mut envelope = MissionEnvelope::new(mission_id, status, &[]);
     envelope.phases = derive_phase_outcomes(config, real_phase_ids, tasks, steps);
-    envelope.reason = Some(reason);
-    // (#2678) Shared with the happy path (`build_envelope`'s own call site
-    // in `launch`) — a run interrupted by its own wall-clock bound gets
-    // the SAME honest override regardless of which of this function's
-    // THREE callers (the Drop-path abort writer, the scheduler-error
-    // path, the coder-phase pre-gate-failure path) happened to catch it.
-    apply_wall_clock_bound_outcome(&mut envelope);
+    envelope.reason = Some(wall_clock_bound_reason(status).unwrap_or(reason));
     if reconciled > 0 {
         envelope.warnings =
             vec![format!("{reconciled} running step(s) reconciled to error on the failure path")];
@@ -4496,7 +4466,6 @@ fn finalize_reconciled_mission(
     // exactly where it carries the most. Everything the failure did not
     // interrupt and never reached is here, named, rather than dropped
     // from the tally.
-    let (completed, errored, never_ran) = partition_step_outcomes(steps);
     // (F3, from #2379's review) ...and the same one-line WARNING the happy
     // path emits, so an operator reading `warnings` learns about the steps
     // that never ran on the path where that is most common — not only a
@@ -8200,11 +8169,11 @@ mod tests {
         steps.insert("plan-step".to_string(), scripted_step("plan-step", NodeStatus::Error));
         steps.insert("other-plan-step".to_string(), scripted_step("other-plan-step", NodeStatus::Error));
         steps.insert("deliver".to_string(), scripted_step("deliver", NodeStatus::Complete));
-        let nothing_grown = crew::envelope::GrowthTally { copies_grown: 0, producers_errored: 2 };
+        let nothing_grown = crew::envelope::GrowthTally { copies_grown: 0, producers_total: 2, producers_errored: 2 };
         let env = build_envelope(mid, &config, &real, &tasks, &steps, &[], nothing_grown);
         assert_eq!(env.status, crew::envelope::MissionOutcomeStatus::Error);
 
-        let partial = crew::envelope::GrowthTally { copies_grown: 3, producers_errored: 1 };
+        let partial = crew::envelope::GrowthTally { copies_grown: 3, producers_total: 2, producers_errored: 1 };
         let env = build_envelope(mid, &config, &real, &tasks, &steps, &[], partial);
         assert_eq!(env.status, crew::envelope::MissionOutcomeStatus::Degraded, "some work grew: partial, not error");
     }

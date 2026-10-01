@@ -225,25 +225,32 @@ pub enum MissionOutcomeStatus {
 }
 
 /// What a mission's grow templates did across the whole run (F10, 5.0
-/// dogfood): how many copies were minted, and how many templates grew zero
-/// because their producer step ended non-`Complete`.
+/// dogfood): how many templates grew, how many copies were minted, and how
+/// many templates grew zero because their producer step ended non-`Complete`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GrowthTally {
     pub copies_grown: usize,
+    pub producers_total: usize,
     pub producers_errored: usize,
 }
 
 impl GrowthTally {
-    /// Some template's producer errored and no template grew a single copy:
-    /// the run never got to its real work.
+    /// EVERY template's producer errored and no template grew a single copy:
+    /// the run never got to its real work. One producer erroring while the
+    /// others legitimately planned zero is a lost slice, not a lost run
+    /// (#2658's over-reach follow-up).
     pub fn planned_nothing_after_errors(&self) -> bool {
-        self.producers_errored > 0 && self.copies_grown == 0
+        self.producers_errored > 0
+            && self.producers_errored == self.producers_total
+            && self.copies_grown == 0
     }
 }
 
 /// The typed facts a run's status is decided from: step buckets (see
 /// `partition_step_outcomes` in `mission_launch.rs`), the steps that completed
-/// reporting partial work, and what growth did.
+/// reporting partial work, what growth did, whether the config's declared
+/// delivering task itself failed, and whether the run's own wall-clock bound
+/// fired.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RunTally {
     pub completed: usize,
@@ -251,6 +258,13 @@ pub struct RunTally {
     pub never_ran: usize,
     pub degraded: usize,
     pub growth: GrowthTally,
+    /// The task a config names as what the run delivers (`outcome_from`) ended
+    /// `Error`/`Abandoned`: a run that delivered nothing is not a success,
+    /// however much upstream work completed.
+    pub delivery_failed: bool,
+    /// The run's own wall-clock bound fired (an honest, bounded partial
+    /// result): never cleaner than `Degraded`, but any real `Error` still wins.
+    pub wall_clock_bound: bool,
 }
 
 impl MissionOutcomeStatus {
@@ -267,22 +281,39 @@ impl MissionOutcomeStatus {
     }
 
     /// The ONE place a gate-less generic run's status is decided from its
-    /// typed results (F10/F11, 5.0 dogfood). Every surface reads this: the
-    /// envelope, the exit code, `run list` and the runs board.
+    /// typed results (F10/F11, 5.0 dogfood). The envelope, the exit code
+    /// (derived from this status alone), `run list` and the runs board all
+    /// read it.
     ///
-    /// - nothing errored, never ran or degraded -> `Clean`.
-    /// - nothing completed, or growth planned nothing because its producers
-    ///   errored (so no unit was ever reviewed or crawled) -> `Error`: the run
-    ///   did none of its work, however many bookkeeping steps (deliver,
-    ///   summarize) completed around the hole.
-    /// - otherwise (some work done, some lost) -> `Degraded`.
+    /// Scope, stated exactly: this owns the status of a gate-less generic
+    /// graph launched by `mission launch` (`build_envelope`) and of its
+    /// error-path reconcile when the wall-clock bound fired. The coder-phase
+    /// pipeline (`coder_phase.rs`) and the crew-of-one dispatch envelope
+    /// (`dispatch_as_crew_of_one.rs`) decide from a QA gate verdict and a
+    /// single role execution's `RunOutcome`, neither of which is a step tally.
+    ///
+    /// - nothing errored, never ran or degraded, no bound fired -> `Clean`.
+    /// - the delivering task failed, nothing completed (unless the wall-clock
+    ///   bound fired, whose interrupt is what left nothing complete), or growth
+    ///   planned nothing because every producer errored (so no unit was ever
+    ///   reviewed or crawled) -> `Error`: the run did none of its work, however
+    ///   many bookkeeping steps (deliver, summarize) completed around the hole.
+    /// - otherwise (some work done, some lost, or the wall-clock bound fired)
+    ///   -> `Degraded`.
     pub fn decide(t: &RunTally) -> Self {
-        if t.errored == 0 && t.never_ran == 0 && t.degraded == 0 {
-            MissionOutcomeStatus::Clean
-        } else if (t.completed == 0 && t.errored > 0) || t.growth.planned_nothing_after_errors() {
+        let lost = t.errored > 0 || t.never_ran > 0 || t.degraded > 0;
+        // Under the bound, "nothing completed" is the interrupt's own doing
+        // (the in-flight step is killed and reports an error), not a lost run.
+        let nothing_completed = t.completed == 0 && t.errored > 0 && !t.wall_clock_bound;
+        let did_none_of_its_work = nothing_completed
+            || t.delivery_failed
+            || t.growth.planned_nothing_after_errors();
+        if lost && did_none_of_its_work {
             MissionOutcomeStatus::Error
-        } else {
+        } else if lost || t.wall_clock_bound {
             MissionOutcomeStatus::Degraded
+        } else {
+            MissionOutcomeStatus::Clean
         }
     }
 
@@ -810,11 +841,13 @@ pub fn finalize_mission_with_payload(envelope: &MissionEnvelope, payload: Option
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::types::{Mission, MissionStatus, Phase, PhaseStatus};
 
     // ── (F10/F11) the one status decision ────────────────────────────
 
     fn tally(completed: usize, errored: usize, never_ran: usize, degraded: usize) -> RunTally {
-        RunTally { completed, errored, never_ran, degraded, growth: GrowthTally::default() }
+        RunTally { completed, errored, never_ran, degraded, ..Default::default() }
     }
 
     #[test]
@@ -834,18 +867,50 @@ mod tests {
     #[test]
     fn decide_is_error_when_growth_planned_nothing_because_producers_errored() {
         let mut t = tally(8, 7, 0, 0);
-        t.growth = GrowthTally { copies_grown: 0, producers_errored: 7 };
+        t.growth = GrowthTally { copies_grown: 0, producers_total: 7, producers_errored: 7 };
         assert_eq!(MissionOutcomeStatus::decide(&t), MissionOutcomeStatus::Error);
         // Some producers errored but others grew real work: partial, so degraded.
-        t.growth = GrowthTally { copies_grown: 5, producers_errored: 2 };
+        t.growth = GrowthTally { copies_grown: 5, producers_total: 7, producers_errored: 2 };
         assert_eq!(MissionOutcomeStatus::decide(&t), MissionOutcomeStatus::Degraded);
         // A plan that legitimately found nothing (no producer errored) is not an error.
         t = tally(8, 0, 0, 0);
-        t.growth = GrowthTally { copies_grown: 0, producers_errored: 0 };
+        t.growth = GrowthTally { copies_grown: 0, producers_total: 3, producers_errored: 0 };
         assert_eq!(MissionOutcomeStatus::decide(&t), MissionOutcomeStatus::Clean);
     }
-    use super::*;
-    use crate::types::{Mission, MissionStatus, Phase, PhaseStatus};
+
+    /// F10 over-reach: one rule's plan errored while the others legitimately
+    /// planned zero. Some producers worked, so this is a lost slice, never a
+    /// lost run.
+    #[test]
+    fn decide_is_degraded_when_only_some_producers_errored_and_the_rest_planned_zero() {
+        let mut t = tally(8, 1, 0, 0);
+        t.growth = GrowthTally { copies_grown: 0, producers_total: 3, producers_errored: 1 };
+        assert_eq!(MissionOutcomeStatus::decide(&t), MissionOutcomeStatus::Degraded);
+    }
+
+    /// A failed delivering task is an `Error` however much upstream completed,
+    /// and an `Error` is never downgraded by the wall-clock bound.
+    #[test]
+    fn decide_a_failed_delivery_is_error_and_the_wall_clock_bound_never_downgrades_an_error() {
+        use MissionOutcomeStatus::*;
+        let mut t = tally(5, 1, 0, 0);
+        t.delivery_failed = true;
+        assert_eq!(MissionOutcomeStatus::decide(&t), Error);
+        t.wall_clock_bound = true;
+        assert_eq!(MissionOutcomeStatus::decide(&t), Error, "the bound must not downgrade an Error");
+        // The bound alone, over a run that lost nothing else, reads Degraded.
+        let mut bound = tally(3, 0, 0, 0);
+        bound.wall_clock_bound = true;
+        assert_eq!(MissionOutcomeStatus::decide(&bound), Degraded);
+        // An interrupt that left nothing complete is the bound's doing: Degraded.
+        let mut none = tally(0, 1, 0, 0);
+        none.wall_clock_bound = true;
+        assert_eq!(MissionOutcomeStatus::decide(&none), Degraded);
+        // But a run whose planning errored and grew nothing is a real Error
+        // (F10), and the bound must not downgrade it.
+        none.growth = GrowthTally { copies_grown: 0, producers_total: 2, producers_errored: 2 };
+        assert_eq!(MissionOutcomeStatus::decide(&none), Error);
+    }
 
     // ── Finalize refusal classifier (#1406/#1433) — pure, no I/O ──────────
 
