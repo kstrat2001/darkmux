@@ -461,7 +461,7 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    compactor's sub-execution records carry the PARENT's id (its usage record is `purpose:
    utility`, so a sum can split it out); a host-side utility job (radio routing) mints its own
    for its usage record and its markers carry none; a resumed dispatch continues its execution (the id
-   rides in the out-dir's `resume_origin.json`, beside the checkpoint the runtime writes);
+   rides in the host-only origin record beside the out-dir, `<out-dir>.resume_origin.json`, which the container never mounts);
    a specialist change mints a new one. Consumers key on it: the token sum's legacy
    fallback, the DISPATCHES chip, `records_emitted`'s pairing, both lifecycle executors'
    attempts, and the finding store (`<execution_id>/<seq>`). A record from before 4.0

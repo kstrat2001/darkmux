@@ -5055,7 +5055,7 @@
     const FIXTURE_WORKSPACE: &str = "/tmp/darkmux-test-ws";
 
     /// (Security audit, #2114 resume follow-up) Writes the
-    /// `RESUME_ORIGIN_FILENAME` provenance file `write_resume_origin_meta`
+    /// host-only origin record `write_resume_origin_meta`
     /// writes in production, so tests exercising the happy path (or the
     /// workspace gate specifically) don't have to hand-roll the JSON.
     fn write_origin(dir: &std::path::Path, workspace: &str, read_only: bool) {
@@ -5195,7 +5195,7 @@
         assert_ne!(execution_for(None), execution_for(None), "each is its own");
 
         let pre_4_0 = TempDir::new().unwrap();
-        std::fs::write(pre_4_0.path().join(RESUME_ORIGIN_FILENAME), r#"{"workspace":"/w","workspace_read_only":false}"#).unwrap();
+        std::fs::write(resume_origin_path(pre_4_0.path()), r#"{"workspace":"/w","workspace_read_only":false}"#).unwrap();
         let fresh = execution_for(Some(pre_4_0.path()));
         assert!(fresh != recorded, "no recorded id: a new execution");
         let no_origin = TempDir::new().unwrap();
@@ -5210,7 +5210,7 @@
         for planted in ["legacy:sess-1:m1", "exec-1-2-3\u{1b}[31m", "exec-1/../../x", "exec-zz-1-2", "someone-elses"] {
             let dir = TempDir::new().unwrap();
             let origin = serde_json::json!({"workspace": "/w", "workspace_read_only": false, "execution_id": planted});
-            std::fs::write(dir.path().join(RESUME_ORIGIN_FILENAME), origin.to_string()).unwrap();
+            std::fs::write(resume_origin_path(dir.path()), origin.to_string()).unwrap();
             let got = execution_for(Some(dir.path()));
             assert_ne!(got.as_str(), planted, "planted id {planted:?} must not be kept");
             assert!(ExecutionId::parse_minted(got.as_str()).is_ok(), "a fresh minted id replaces {planted:?}");
@@ -5330,7 +5330,7 @@
         let prior = TempDir::new().unwrap();
         write_resume_origin_meta(prior.path(), &ws, false, None, &darkmux_types::execution_id::ExecutionId::mint());
         let body: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(prior.path().join(RESUME_ORIGIN_FILENAME)).unwrap(),
+            &std::fs::read_to_string(resume_origin_path(prior.path())).unwrap(),
         )
         .unwrap();
         assert_eq!(
@@ -5429,7 +5429,7 @@
     /// printing a command that cannot work.
     #[test]
     fn the_hint_says_so_plainly_when_no_resume_is_possible() {
-        let prior = TempDir::new().unwrap(); // no resume_origin.json
+        let prior = TempDir::new().unwrap(); // no host-only origin record
         let hint = resume_hint_from_origin(prior.path(), "coder");
         assert!(!hint.contains("darkmux dispatch"), "must not print an unusable command: {hint}");
         assert!(hint.contains("RESUME ORIGIN UNKNOWN"), "{hint}");
@@ -5647,7 +5647,7 @@
     #[test]
     fn stage_resume_checkpoint_refuses_with_no_origin_record_at_all() {
         // A checkpoint dir from BEFORE this fix (write_resume_origin_meta
-        // didn't exist yet) has no resume_origin.json — refuse, never guess.
+        // didn't exist yet) has no host-only origin record — refuse, never guess.
         let prior = TempDir::new().unwrap();
         std::fs::write(
             prior.path().join(CHECKPOINT_FILENAME),
@@ -17901,14 +17901,79 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         assert!(format!("{err:#}").contains("symlink"), "{err:#}");
     }
 
+    /// (#2972, B6) The review's proof as a regression test. A model owns the
+    /// out-dir (mounted read-write at `/darkmux-out`), so it can write a
+    /// `resume_origin.json` there claiming `workspace_read_only:false` for a
+    /// run that was `:ro`. The gate must never read that file: the genuine,
+    /// host-only record (beside the out-dir) still says read-only, so the
+    /// read-write resume is refused as an escalation.
+    #[test]
+    fn a_forged_in_out_dir_origin_is_never_read() {
+        let tmp = TempDir::new().unwrap();
+        let out = tmp.path().join("prior-out");
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(&out).unwrap();
+        fs::create_dir_all(&ws).unwrap();
+        let ws_canon = ws.canonicalize().unwrap();
+        fs::write(out.join(CHECKPOINT_FILENAME), sample_checkpoint_json_for_role("coder")).unwrap();
+        write_resume_origin_meta(&out, &ws_canon, true, None, &darkmux_types::execution_id::ExecutionId::mint());
+        // The model's forgery, in the place it can write.
+        fs::write(
+            out.join("resume_origin.json"),
+            serde_json::json!({ "workspace": ws_canon.display().to_string(), "workspace_read_only": false })
+                .to_string(),
+        )
+        .unwrap();
+        let err = validate_resume_checkpoint(&out, "coder", &ws_canon, false)
+            .expect_err("a forged read-write origin must not unlock a read-write resume of a :ro run");
+        assert!(format!("{err:#}").contains("MOUNT ESCALATION"), "{err:#}");
+        // And the operator-facing hint is built from the real record too.
+        assert!(resume_hint_from_origin(&out, "coder").contains("--workspace-read-only"));
+    }
+
+    /// (#2972) A checkpoint whose ONLY origin record is the old in-out-dir
+    /// file is refused with a clear "start fresh" message, and the hint
+    /// builder prints no command.
+    #[test]
+    fn an_old_in_out_dir_origin_alone_is_refused_with_a_start_fresh_message() {
+        let tmp = TempDir::new().unwrap();
+        let out = tmp.path().join("prior-out");
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(&out).unwrap();
+        fs::create_dir_all(&ws).unwrap();
+        let ws_canon = ws.canonicalize().unwrap();
+        fs::write(out.join(CHECKPOINT_FILENAME), sample_checkpoint_json_for_role("coder")).unwrap();
+        fs::write(
+            out.join("resume_origin.json"),
+            serde_json::json!({ "workspace": ws_canon.display().to_string(), "workspace_read_only": false })
+                .to_string(),
+        )
+        .unwrap();
+        let err = validate_resume_checkpoint(&out, "coder", &ws_canon, false).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("RESUME ORIGIN UNKNOWN") && msg.contains("Start the dispatch fresh"), "{msg}");
+        assert!(!resume_hint_from_origin(&out, "coder").contains("darkmux dispatch"));
+    }
+
+    /// The host-only record is never inside the out-dir the container mounts.
+    #[test]
+    fn the_origin_record_lives_beside_the_out_dir_not_in_it() {
+        let tmp = TempDir::new().unwrap();
+        let out = tmp.path().join("out");
+        fs::create_dir_all(&out).unwrap();
+        write_resume_origin_meta(&out, tmp.path(), false, None, &darkmux_types::execution_id::ExecutionId::mint());
+        let p = resume_origin_path(&out);
+        assert!(p.is_file(), "{}", p.display());
+        assert!(!p.starts_with(&out), "{}", p.display());
+        assert_eq!(fs::read_dir(&out).unwrap().count(), 0, "nothing written inside the mounted out-dir");
+    }
+
     #[test]
     fn resume_checkpoint_refuses_a_symlinked_origin_file() {
-        // What this pins is narrow: the origin file is read no-follow, so a
-        // symlink planted at it is refused rather than read. It does NOT
-        // make the origin file trustworthy — it sits in the same mounted,
-        // model-writable out-dir, so a model can write a forged REGULAR
-        // origin file directly, which this test does not (and cannot)
-        // catch. That gap is tracked separately.
+        // The origin record is read no-follow, so a symlink planted at its
+        // host-only location is refused rather than read. (A forged record
+        // INSIDE the out-dir is ignored outright: see
+        // `a_forged_in_out_dir_origin_is_never_read`.)
         let tmp = TempDir::new().unwrap();
         let resume_from = tmp.path().join("prior-out");
         let ws = tmp.path().join("ws");
@@ -17927,7 +17992,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
                 .to_string(),
         )
         .unwrap();
-        std::os::unix::fs::symlink(&forged, resume_from.join(RESUME_ORIGIN_FILENAME)).unwrap();
+        std::os::unix::fs::symlink(&forged, resume_origin_path(&resume_from)).unwrap();
         let err = validate_resume_checkpoint(&resume_from, "coder", &ws_canon, false)
             .expect_err("a symlinked origin file must be refused, not followed");
         assert!(format!("{err:#}").contains("symlink"), "{err:#}");
@@ -18010,7 +18075,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         assert!(read_out_dir_text_with(&out, ".darkmux-runtime/findings.jsonl", &sink).is_none());
         assert_eq!(lines.borrow().len(), 1, "{:?}", lines.borrow());
         assert!(lines.borrow()[0].contains("findings.jsonl"), "{:?}", lines.borrow());
-        assert!(read_out_dir_text_with(&out, RESUME_ORIGIN_FILENAME, &sink).is_none());
+        assert!(read_out_dir_text_with(&out, "absent.jsonl", &sink).is_none());
         assert_eq!(lines.borrow().len(), 1, "absence stays silent: {:?}", lines.borrow());
     }
 
@@ -18144,7 +18209,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         let ws_canon = ws.canonicalize().unwrap();
         let pad = "x".repeat(5 * 1024 * 1024);
         fs::write(
-            resume_from.join(RESUME_ORIGIN_FILENAME),
+            resume_origin_path(&resume_from),
             serde_json::json!({ "workspace": ws_canon.display().to_string(), "workspace_read_only": false, "pad": pad })
                 .to_string(),
         )
