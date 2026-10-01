@@ -1,3 +1,4 @@
+import { FLEET_UID, lower } from "../../testing/machineFleet";
 import { machineKeyHash } from "../../lib/machineKey";
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { render, screen, waitFor, fireEvent, act } from "@testing-library/react";
@@ -795,6 +796,65 @@ describe("RunsBoard — the machine pin (#1809)", () => {
     renderBoard("all", null, FAKE_UID);
     await waitFor(() => expect(screen.getByText(/machine: studio/)).toBeInTheDocument());
     expect(document.body.textContent).not.toMatch(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+  });
+
+  // A pin shows the runs of ONE machine, decided by uid (`Run.machine_uid`):
+  // a renamed or `.local` spelling neither hides a run nor splits the
+  // machine, and two machines sharing a display name never share a pin.
+  describe("by uid (machine identity)", () => {
+    const at = (h: number) => `${todayUTC()}T0${h}:00:00Z`;
+    const run = (id: string, machine: string, machine_uid?: string) => ({ id, kind: "dispatch", status: "complete", tracked: false, updated_ts: 100, machine, machine_uid });
+
+    it("this machine's pin shows its runs filed under another spelling of its name, and its uid in the other case", async () => {
+      mockPinnedFetch({
+        flowToday: [{ ts: at(0), machine_uid: FLEET_UID.mbp, machine_id: "MacBook-Pro.local" }],
+        specs: { machine_id: "MacBook-Pro", machine_uid: lower(FLEET_UID.mbp) },
+        runs: [run("by-uid", "MacBook-Pro", lower(FLEET_UID.mbp)), run("by-name", "MacBook-Pro"), run("other", "studio", FLEET_UID.studio)],
+      });
+      renderBoard("all", null, "MacBook-Pro.local");
+      await waitFor(() => expect(screen.getByText("by-uid")).toBeInTheDocument());
+      expect(screen.getByText("by-name")).toBeInTheDocument();
+      expect(screen.queryByText("other")).not.toBeInTheDocument();
+    });
+
+    it("a roster-only peer's pin shows its runs", async () => {
+      mockPinnedFetch({
+        flowToday: [{ ts: at(0), machine_uid: FLEET_UID.mbp, machine_id: "MacBook-Pro" }],
+        roster: [{ id: "darkbook", address: "100.64.1.2:8765", added_unix_ms: 1, machine_uid: lower(FLEET_UID.darkbook) }],
+        runs: [run("db-run", "Darkbook", FLEET_UID.darkbook), run("mbp-run", "MacBook-Pro", FLEET_UID.mbp)],
+      });
+      renderBoard("all", null, "darkbook");
+      await waitFor(() => expect(screen.getByText("db-run")).toBeInTheDocument());
+      expect(screen.queryByText("mbp-run")).not.toBeInTheDocument();
+    });
+
+    it("two machines with one display name each pin only their own runs", async () => {
+      mockPinnedFetch({
+        flowToday: [
+          { ts: at(0), machine_uid: FLEET_UID.macA, machine_id: "Mac" },
+          { ts: at(1), machine_uid: FLEET_UID.macB, machine_id: "Mac" },
+        ],
+        runs: [run("run-a", "Mac", FLEET_UID.macA), run("run-b", "Mac", FLEET_UID.macB)],
+      });
+      renderBoard("all", null, `Mac_${machineKeyHash(FLEET_UID.macB).slice(0, 6)}`);
+      await waitFor(() => expect(screen.getByText("run-b")).toBeInTheDocument());
+      expect(screen.queryByText("run-a")).not.toBeInTheDocument();
+    });
+
+    it("one machine under two spellings adds no machine column to the unpinned board", async () => {
+      mockPinnedFetch({ runs: [run("x1", "MacBook-Pro", FLEET_UID.mbp), run("x2", "MacBook-Pro.local", lower(FLEET_UID.mbp))] });
+      renderBoard("all", null, null);
+      await waitFor(() => expect(screen.getByText("x1")).toBeInTheDocument());
+      expect(document.body.textContent).not.toContain("MacBook-Pro.local");
+    });
+
+    it("two machines with one display name are told apart on the unpinned board", async () => {
+      mockPinnedFetch({ runs: [{ ...run("y1", "Mac", FLEET_UID.macA), updated_ts: 9 }, { ...run("y2", "Mac", FLEET_UID.macB), updated_ts: 8 }] });
+      renderBoard("all", null, null);
+      await waitFor(() => expect(screen.getByText("y1")).toBeInTheDocument());
+      const metas = [...document.querySelectorAll(".labrunmeta")].map((e) => e.textContent);
+      expect(metas.sort()).toEqual(["Mac", "Mac 2"]);
+    });
   });
 
   // (#2929) The pin rides in the address bar as a machine KEY, never the uid.

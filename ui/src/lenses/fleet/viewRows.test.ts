@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { flowUidByName, grantOf, grantWords, machineIsHub, outcomeLine, rowFacts, rowIsHub, rowStanding, rowUid } from "./viewRows";
+import { grantOf, grantWords, machineIsHub, outcomeLine, rowFacts, rowIsHub, rowStanding, rowUid } from "./viewRows";
 import type { AcceptsState } from "../../types/generated/AcceptsState";
 import type { CardOutcome } from "../../types/generated/CardOutcome";
 import type { FleetMachine } from "../../types/generated/FleetMachine";
@@ -179,23 +179,35 @@ describe("rowFacts", () => {
   });
 });
 
-describe("flowUidByName: a flow machine that goes by a roster id", () => {
-  const names: Record<string, string[]> = { u1: ["studio", "Mac-Studio"], u2: ["mini"], u3: ["MINI"] };
-  const byName = flowUidByName(["u1", "u2", "u3"], (u) => names[u]);
+describe("rowUid: a flow machine that goes by a roster id", () => {
+  // What `lib/machineIdentity.ts::uidForName` answers: the ONE flow uid that
+  // answers to the name, in any case or `.local` spelling.
+  const byName = (name: string): string | null => ({ studio: "u1", "mac-studio": "u1" })[name.toLowerCase().replace(/\.local$/, "")] ?? null;
 
-  it("matches a name case-insensitively, whichever of the uid's names it is", () => {
-    expect(byName.get("studio")).toBe("u1");
-    expect(byName.get("mac-studio")).toBe("u1");
-  });
-
-  it("decides nothing for a name two uids share", () => {
-    expect(byName.has("mini")).toBe(false);
-  });
-
-  it("re-keys a row with no uid of its own, and never a row that has one", () => {
+  it("re-keys a row with no uid of its own to the flow machine that goes by its roster id", () => {
     expect(rowUid(row({ machine_uid: null }), new Set(["u1"]), null, byName)).toBe("u1");
+  });
+
+  it("never re-keys a row that carries a uid of its own", () => {
     expect(rowUid(row({ machine_uid: "OTHER" }), new Set(["u1"]), null, byName)).toBe("studio");
+  });
+
+  it("keys a row whose name no flow machine answers to by its roster id", () => {
     expect(rowUid(row({ machine_uid: null, entry: { id: "nobody", address: "a", added_unix_ms: 1 } }), new Set(["u1"]), null, byName)).toBe("nobody");
+  });
+});
+
+describe("rowUid: a uid compares case-normalized", () => {
+  it("returns the flow's spelling when the view spells the same uid in lower case", () => {
+    expect(rowUid(row({ machine_uid: "uid-studio" }), new Set(["UID-STUDIO"]), null)).toBe("UID-STUDIO");
+  });
+
+  it("reports the machine as known to the page in either case", () => {
+    expect(rowFacts(row({ machine_uid: "uid-studio" }), new Set(["UID-STUDIO"]), null).known).toBe(true);
+  });
+
+  it("does not merge two different uids", () => {
+    expect(rowUid(row({ machine_uid: "UID-OTHER" }), new Set(["UID-STUDIO"]), null)).toBe("studio");
   });
 });
 
@@ -238,6 +250,10 @@ describe("the declared hub (#3022)", () => {
     expect(machineIsHub([hub], "UID-STUDIO", false)).toBe(true);
     expect(machineIsHub([declaring("hub", { machine_uid: null })], "studio", false)).toBe(true);
     expect(machineIsHub([hub], "UID-OTHER", false)).toBe(false);
+    // One identity rule (`lib/machineIdentity`): a uid in another case and a
+    // roster name spelled with `.local` are the same machine.
+    expect(machineIsHub([hub], "uid-studio", false)).toBe(true);
+    expect(machineIsHub([declaring("hub", { machine_uid: null })], "Studio.local", false)).toBe(true);
     expect(machineIsHub([declaring("peer")], "UID-STUDIO", false)).toBe(false);
     expect(machineIsHub([declaring("hub", { is_this_machine: true })], null, true)).toBe(true);
     expect(machineIsHub([declaring("hub", { is_this_machine: true })], "UID-STUDIO", false)).toBe(false);

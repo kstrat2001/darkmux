@@ -26,6 +26,15 @@ export type Run = { id: string, kind: RunKind, status: RunStatus,
  */
 machine?: string, 
 /**
+ * The hardware uid of the machine `machine` names: the canonical
+ * identity, where `machine` is only a display name (one machine has
+ * several names, and two machines can share one). Taken from the same
+ * records that produced `machine` (a tracked mission or a lab row: this
+ * daemon's own uid). Absent when no record carried one; a reader then
+ * falls back to the name, and only then.
+ */
+machine_uid?: string, 
+/**
  * Endpoint label (e.g. `"azure:host/gpt-4o"`) when any of the run's
  * dispatches used a hosted endpoint; `None` = local LMStudio (or no
  * flow session found at all). See the module doc's join-key section

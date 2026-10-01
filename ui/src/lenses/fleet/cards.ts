@@ -40,8 +40,8 @@ import type { PresenceBeat } from "../../types/generated/PresenceBeat";
 // machine lens and the app shell need the identical self-identity rule and a
 // second copy of it is how the two surfaces disagree about which machine
 // they are on.
-import { displayNameOf, isSelfMachine, uidOf } from "../../lib/flow";
-import type { RosterName } from "../../lib/flow";
+import { displayNameOf, isSelfMachine, uidOf } from "../../lib/machineIdentity";
+import type { RosterName } from "../../lib/machineIdentity";
 import type { Run } from "../../types/generated/Run";
 import { utilityStrip, type UtilityStrip } from "../../lib/utilityJobs";
 import { mergeLive, type LiveOverlay } from "../../lib/liveChannel";

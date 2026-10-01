@@ -13,6 +13,7 @@
  * it needs — didn't exist yet).
  */
 import { isPlainObject } from "./guards";
+import { recordMachineKey, type RecordMachines } from "./machineIdentity";
 import { ACTION, CATEGORY, SOURCE, tagText, wireOf, type NormAction, type NormRecord } from "./ingest";
 
 /** `activityOf()` — viewer.html:1014-1042, the FULL mapping (every branch,
@@ -299,6 +300,8 @@ export interface Facets {
   cat: string[];
   tier: string[];
   src: string[];
+  /** The machines in the slice, by `recordMachineKey` (a uid, never a name). */
+  mach: string[];
 }
 
 /** (operator, 2026-09-06) The five groupings the activity facet's header
@@ -506,11 +509,12 @@ export function computeFacets(records: NormRecord[]): Facets {
   const cat = [...new Set(records.flatMap((r) => (r.category == null ? [] : [tagText(r.category)])))];
   const tier = [...new Set(records.flatMap((r) => (r.tier == null ? [] : [tagText(r.tier)])))];
   const src = [...new Set(records.flatMap((r) => (r.source == null ? [] : [tagText(r.source)])))];
+  const mach = [...new Set(records.flatMap((r) => recordMachineKey(r) ?? []))];
   const acts = new Set(records.map(activityOf));
   const act = ACT_ORDER.filter((a) => acts.has(a)).concat(
     sortUnmappedActivities([...acts].filter((a) => !ACT_ORDER.includes(a))),
   );
-  return { act, cat, tier, src };
+  return { act, cat, tier, src, mach };
 }
 
 export interface FilterState {
@@ -518,10 +522,11 @@ export interface FilterState {
   cat: Set<string>;
   tier: Set<string>;
   src: Set<string>;
+  mach: Set<string>;
   q: string;
 }
 
-const FACET_KEYS = ["act", "cat", "tier", "src"] as const;
+const FACET_KEYS = ["act", "cat", "tier", "src", "mach"] as const;
 
 /** (#2416) The default filter state over a set of facets, absent any
  * operator override.
@@ -561,6 +566,7 @@ export function defaultFilterState(facets: Facets): FilterState {
     cat: new Set(facets.cat.filter((v) => isDefaultOn("cat", v))),
     tier: new Set(facets.tier.filter((v) => isDefaultOn("tier", v))),
     src: new Set(facets.src.filter((v) => isDefaultOn("src", v))),
+    mach: new Set(facets.mach.filter((v) => isDefaultOn("mach", v))),
     q: "",
   };
 }
@@ -620,6 +626,7 @@ export interface StoredPicks {
   cat: FacetPicks;
   tier: FacetPicks;
   src: FacetPicks;
+  mach: FacetPicks;
   q: string;
 }
 
@@ -629,6 +636,7 @@ export function createStoredPicks(): StoredPicks {
     cat: { include: new Set(), exclude: new Set() },
     tier: { include: new Set(), exclude: new Set() },
     src: { include: new Set(), exclude: new Set() },
+    mach: { include: new Set(), exclude: new Set() },
     q: "",
   };
 }
@@ -643,17 +651,18 @@ export interface FacetSeen {
   cat: Set<string>;
   tier: Set<string>;
   src: Set<string>;
+  mach: Set<string>;
 }
 
 export function createFacetSeen(): FacetSeen {
-  return { act: new Set(), cat: new Set(), tier: new Set(), src: new Set() };
+  return { act: new Set(), cat: new Set(), tier: new Set(), src: new Set(), mach: new Set() };
 }
 
 /** An independent copy of a seen ledger, so a caller can hand
  *  `absorbNewFacetValues` (which marks values seen as it goes) a ledger it
  *  may mutate without touching the original. */
 export function cloneFacetSeen(seen: FacetSeen): FacetSeen {
-  return { act: new Set(seen.act), cat: new Set(seen.cat), tier: new Set(seen.tier), src: new Set(seen.src) };
+  return { act: new Set(seen.act), cat: new Set(seen.cat), tier: new Set(seen.tier), src: new Set(seen.src), mach: new Set(seen.mach) };
 }
 
 /** `absorbNewFilterValues()` — viewer.html:3451-3457, called after every
@@ -728,6 +737,17 @@ export function absorbNewFacetValues(
   return changed ? next : filters;
 }
 
+/** The lower-cased text a search is matched against: the record's own wire
+ * form, plus every name its machine has been recorded under (so a machine is
+ * found by the name its card shows, not only by the `machine_id` this one
+ * record happens to carry). */
+function searchText(r: NormRecord, machines: RecordMachines | undefined): string {
+  const key = recordMachineKey(r);
+  const names = key === null ? undefined : machines?.aliases.get(key);
+  const own = JSON.stringify(wireOf(r));
+  return (names ? `${own} ${[...names].join(" ")}` : own).toLowerCase();
+}
+
 /** `render()`'s per-record filter predicate, folding together the four
  * facet checks (viewer.html's `state.filters.act.has(activityOf(r))` etc.,
  * inferred from `renderFilters()`/`toggleFilter()`'s data model — the
@@ -737,14 +757,16 @@ export function absorbNewFacetValues(
  * A record whose cat/tier/src is simply ABSENT (no checkbox represents it)
  * is never excluded on that facet — only a PRESENT value that got
  * unchecked filters the record out. */
-export function matchesFilters(r: NormRecord, filters: FilterState): boolean {
+export function matchesFilters(r: NormRecord, filters: FilterState, machines?: RecordMachines): boolean {
   if (!filters.act.has(activityOf(r))) return false;
+  const machine = recordMachineKey(r);
+  if (machine !== null && !filters.mach.has(machine)) return false;
   if (r.category != null && !filters.cat.has(tagText(r.category))) return false;
   if (r.tier != null && !filters.tier.has(tagText(r.tier))) return false;
   if (r.source != null && !filters.src.has(tagText(r.source))) return false;
   if (filters.q) {
     const q = filters.q.trim().toLowerCase();
-    if (q && !JSON.stringify(wireOf(r)).toLowerCase().includes(q)) return false;
+    if (q && !searchText(r, machines).includes(q)) return false;
   }
   return true;
 }
@@ -755,6 +777,7 @@ const FACET_LABELS: Record<(typeof FACET_KEYS)[number], string> = {
   cat: "category",
   tier: "tier",
   src: "source",
+  mach: "machine",
 };
 
 /** (#2770) Names the control responsible for a nonzero hidden count, so
@@ -833,6 +856,7 @@ interface StoredPicksJSON {
   cat: { include: string[]; exclude: string[] };
   tier: { include: string[]; exclude: string[] };
   src: { include: string[]; exclude: string[] };
+  mach: { include: string[]; exclude: string[] };
   q: string;
 }
 
@@ -901,7 +925,7 @@ export function storedFilterPicks(
  * `createStoredPicks()`'s empty include/exclude sets, so `act` is routed
  * through `resolveActivitySet` here too, not just in `defaultFilterState`. */
 export function applyStoredPicks(picks: StoredPicks, facets: Facets): FilterState {
-  const out: FilterState = { act: new Set(), cat: new Set(), tier: new Set(), src: new Set(), q: picks.q };
+  const out: FilterState = { act: new Set(), cat: new Set(), tier: new Set(), src: new Set(), mach: new Set(), q: picks.q };
   out.act = resolveActivitySet(facets.act, picks.act);
   for (const k of FACET_KEYS) {
     if (k === "act") continue;
@@ -989,6 +1013,7 @@ export function persistFilterState(
       cat: { include: [...next.cat.include], exclude: [...next.cat.exclude] },
       tier: { include: [...next.tier.include], exclude: [...next.tier.exclude] },
       src: { include: [...next.src.include], exclude: [...next.src.exclude] },
+      mach: { include: [...next.mach.include], exclude: [...next.mach.exclude] },
       q: next.q,
     };
     storage.setItem(key, JSON.stringify(payload));

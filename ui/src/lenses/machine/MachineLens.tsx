@@ -8,7 +8,7 @@ import { queryKeys, MACHINE_MEM_POLL_MS } from "../../lib/queryKeys";
 import { useFlowWindow } from "../../hooks/useFlowWindow";
 import { useLatch } from "../../hooks/useLatch";
 import { useFleetRoster, useLiveMachines } from "../../hooks/useLiveMachines";
-import { localMachineUid, displayNameOf } from "../../lib/flow";
+import { localMachineUid, displayNameOf, sameUid } from "../../lib/machineIdentity";
 import { relAgoFrom } from "../../lib/format";
 import { specOf } from "../fleet/cards";
 import { machineIsHub } from "../fleet/viewRows";
@@ -278,7 +278,7 @@ export function MachineLens({
   // `localMachineUid` now resolves specs' name through every alias a uid has
   // used (`lib/flow.ts::machineNames`), so both sides of this are uids and the
   // comparison means what it says.
-  const isLocalSpecs = targetUid != null && localUid != null && targetUid === localUid;
+  const isLocalSpecs = sameUid(targetUid, localUid);
   // `state.machineIsLocal` — the explicit nav-tab/deep-link intent
   // (`goMachine` always passes `local=true`; a fleet-card drill always
   // passes `local=false`, even when it happens to BE the local machine —

@@ -876,6 +876,7 @@ Run
   kind: RunKind
   status: RunStatus
   machine?: string | null
+  machine_uid?: string | null
   route?: string | null
   role?: string | null
   model?: string | null

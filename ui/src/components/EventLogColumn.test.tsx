@@ -9,6 +9,7 @@ import { ingest, type NormRecord } from "../lib/ingest";
 import { norm, type RawRecord } from "../testing/records";
 import { closeOpenModal } from "../lib/dialogManager";
 import { PageJudgementContext } from "../hooks/useJudgement";
+import { FLEET_UID as U, lower } from "../testing/machineFleet";
 
 /** The part of the persisted filter state these tests read back. */
 type StoredFilters = { q: string; act: { include: string[]; exclude: string[] } };
@@ -1476,5 +1477,61 @@ describe("EventLogColumn — synthesized header identity (#2863 review round 2)"
     expect(errRow).toBeTruthy();
     fireEvent.click(errRow!);
     expect(heads[0]).not.toHaveClass("sel");
+  });
+});
+
+// The log decides which machine a row belongs to by uid; a name is what it
+// prints, and one machine can carry several.
+describe("EventLogColumn: machines by uid", () => {
+  const at = (minute: number) => `2026-10-01T10:0${minute}:00.000Z`;
+  const mrec = (uid: string | undefined, name: string | undefined, minute: number, over: RawRecord = {}) =>
+    rec({ ts: at(minute), machine_uid: uid, machine_id: name, session_id: `s-${minute}`, ...over });
+  const chips = () => [...document.querySelectorAll(".eventlog__recmachine")].map((e) => e.textContent?.replace(/^\s*·\s*/, ""));
+
+  it("two machines with the same display name are two machines: no shared header, rows told apart", () => {
+    render(<EventLogColumn scopeLabel="fleet" records={[mrec(U.macA, "Mac", 1), mrec(U.macB, "Mac", 2)]} visible />);
+    expect(document.querySelector(".eventlog__shared")).toBeNull();
+    expect(chips().sort()).toEqual(["Mac", "Mac 2"]);
+  });
+
+  it("one machine under two spellings and two uid cases is one machine: the header names it once", () => {
+    const records = [
+      mrec(U.mbp, "MacBook-Pro", 1, { session_id: "one", handle: "coder" }),
+      mrec(lower(U.mbp), "MacBook-Pro.local", 2, { session_id: "one", handle: "coder" }),
+    ];
+    render(<EventLogColumn scopeLabel="runs" records={records} visible />);
+    expect(chips()).toEqual([]);
+    expect(document.querySelector(".eventlog__sharedwho")!.textContent).toBe("coder on MacBook-Pro.local");
+  });
+
+  it("a record that carries only a uid is not credited to the machine whose records carry a name", () => {
+    const records = [mrec(U.mbp, "MacBook-Pro", 1), mrec(U.darkbook, undefined, 2)];
+    render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
+    expect(document.querySelector(".eventlog__shared")).toBeNull();
+    expect(chips().sort()).toEqual(["MacBook-Pro", "unnamed machine"]);
+  });
+
+  it("the filters dialog offers a machine facet, and unchecking a machine hides its rows, same-named twin kept", () => {
+    const records = [mrec(U.macA, "Mac", 1, { session_id: "from-a" }), mrec(U.macB, "Mac", 2, { session_id: "from-b" })];
+    render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
+    fireEvent.click(document.getElementById("fbtn")!);
+    fireEvent.click(screen.getByLabelText("Mac 2"));
+    const rows = document.querySelectorAll('[data-act="rec"]');
+    expect(rows).toHaveLength(1);
+    expect(rows[0].textContent).toContain("from-a");
+  });
+
+  it("search finds a machine by any name it has used", () => {
+    const records = [
+      mrec(U.mbp, "MacBook-Pro", 1, { session_id: "from-mbp" }),
+      mrec(U.mbp, "MacBook-Pro.local", 2, { session_id: "also-mbp" }),
+      mrec(U.studio, "m1-max-32gb-studio", 3, { session_id: "from-studio" }),
+    ];
+    render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
+    fireEvent.change(screen.getByPlaceholderText("filter events…"), { target: { value: "macbook-pro.local" } });
+    const rows = [...document.querySelectorAll('[data-act="rec"]')].map((r) => r.textContent);
+    expect(rows).toHaveLength(2);
+    expect(rows.join(" ")).toContain("from-mbp");
+    expect(rows.join(" ")).not.toContain("from-studio");
   });
 });

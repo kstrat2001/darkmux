@@ -8,6 +8,8 @@
  * key that reads the same for a machine whichever source it came from.
  */
 
+import { canonUid } from "../../lib/machineIdentity";
+
 /** What decides a card's position. */
 export interface CardOrder {
   /** Whether this is the machine serving the page. */
@@ -27,7 +29,7 @@ export interface CardOrder {
  * flow and a roster id is not, so no source's casing can reorder a machine.
  */
 export function cardOrderKey(machineUid: string | null | undefined, fallbackId: string): string {
-  return (machineUid || fallbackId).toLowerCase();
+  return canonUid(machineUid || fallbackId);
 }
 
 /** This machine first, then every other machine by `key`. */

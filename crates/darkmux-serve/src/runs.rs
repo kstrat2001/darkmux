@@ -192,6 +192,15 @@ pub struct Run {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub machine: Option<String>,
+    /// The hardware uid of the machine `machine` names: the canonical
+    /// identity, where `machine` is only a display name (one machine has
+    /// several names, and two machines can share one). Taken from the same
+    /// records that produced `machine` (a tracked mission or a lab row: this
+    /// daemon's own uid). Absent when no record carried one; a reader then
+    /// falls back to the name, and only then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub machine_uid: Option<String>,
     /// Endpoint label (e.g. `"azure:host/gpt-4o"`) when any of the run's
     /// dispatches used a hosted endpoint; `None` = local LMStudio (or no
     /// flow session found at all). See the module doc's join-key section
@@ -658,6 +667,9 @@ pub(crate) fn mission_owner_machine(
 #[derive(Debug, Default, Clone)]
 struct FlowMissionAgg {
     machine: Option<String>,
+    /// The `machine_uid` of the first record that named this mission's
+    /// `machine` (same record rule as `machine`).
+    machine_uid: Option<String>,
     first_ts: Option<String>,
     last_ts: Option<String>,
     /// The terminal mission-lifecycle record, if one was seen: its stamp and
@@ -719,6 +731,7 @@ fn build_flow_mission_index_in(
             if let Some(m) = v.get("machine_id").and_then(|m| m.as_str()) {
                 if !m.is_empty() {
                     agg.machine = Some(m.to_string());
+                    agg.machine_uid = record_machine_uid(v);
                 }
             }
         }
@@ -831,6 +844,7 @@ fn flow_mission_to_run(
         kind: RunKind::Mission,
         status,
         machine: agg.machine.clone(),
+        machine_uid: agg.machine_uid.clone(),
         route,
         role: None,
         model,
@@ -942,6 +956,18 @@ fn mission_candidate_sessions<'a>(
         .flatten()
         .filter_map(|sid| flow_index.get(sid).map(|agg| (sid.as_str(), agg)))
         .collect()
+}
+
+/// The uid that goes with a tracked mission's `machine`. A durable
+/// `Mission.machine` names the MINT host, and a mission with a durable record
+/// on this daemon's disk was minted here, so its uid is this daemon's own;
+/// without one, `machine` came from the representative session's records and
+/// the uid comes from that same session.
+fn mission_machine_uid(mission: &Mission, representative: Option<&SessionAgg>) -> Option<String> {
+    if mission.machine.is_some() {
+        return darkmux_hardware::machine_uid().map(str::to_string);
+    }
+    representative.and_then(|s| s.machine_uid.clone())
 }
 
 /// Normalize one loaded `Mission` into a [`Run`]. Joins to its flow
@@ -1106,6 +1132,7 @@ fn mission_to_run(
         .machine
         .clone()
         .or_else(|| representative.and_then(|(_, s)| s.machine.clone()));
+    let machine_uid = mission_machine_uid(mission, representative.map(|(_, s)| s));
     let route = remote.and_then(|(_, s)| s.endpoint.clone());
     let start_ts_str = representative.and_then(|(_, s)| s.start_ts.clone());
     // (#2487) Filtered too — and this one is the load-bearing half of the
@@ -1172,6 +1199,7 @@ fn mission_to_run(
         kind,
         status,
         machine,
+        machine_uid,
         route,
         role,
         model,
@@ -1625,6 +1653,8 @@ fn lab_summary_to_run(
         kind: RunKind::Lab,
         status,
         machine,
+        // Lab runs are machine-local by construction: this daemon's own uid.
+        machine_uid: darkmux_hardware::machine_uid().map(str::to_string),
         route,
         role,
         model,
@@ -2027,6 +2057,11 @@ impl ScanWindow {
     }
 }
 
+/// A record's `machine_uid`, when it carries a non-empty one.
+fn record_machine_uid(v: &serde_json::Value) -> Option<String> {
+    v.get("machine_uid").and_then(|u| u.as_str()).filter(|u| !u.is_empty()).map(str::to_string)
+}
+
 /// Per-session_id rollup built by ONE pass over the flow stream
 /// ([`build_flow_session_index`]) — the shared substrate both the
 /// tracked-run route/role/model resolution (above) and the untracked-ghost
@@ -2059,6 +2094,8 @@ struct SessionAgg {
     role: Option<String>,
     model: Option<String>,
     machine: Option<String>,
+    /// The hardware uid stamped on the record that named `machine`.
+    machine_uid: Option<String>,
     /// The session holds a run bookend (`run.*`): it is a run's own session,
     /// whose `handle` is the launched config id, not a role.
     /// [`mission_to_run`]'s role fallback skips it for a real execution's.
@@ -2263,6 +2300,7 @@ fn fold_session_record(idx: &mut HashMap<String, SessionAgg>, v: &serde_json::Va
         if let Some(mach) = v.get("machine_id").and_then(|m| m.as_str()) {
             if !mach.is_empty() {
                 agg.machine = Some(mach.to_string());
+                agg.machine_uid = record_machine_uid(v);
             }
         }
     }
@@ -2391,6 +2429,7 @@ fn ghost_runs(
             kind: RunKind::Dispatch,
             status,
             machine: agg.machine.clone(),
+            machine_uid: agg.machine_uid.clone(),
             route: agg.endpoint.clone(),
             role: agg.role.clone(),
             model: agg.model.clone(),
@@ -7004,6 +7043,61 @@ mod tests {
             !runs.iter().any(|r| r.id == "peer-session-1"),
             "the peer's session is represented by its mission row, not duplicated as a ghost"
         );
+    }
+
+    /// Two machines that share a display name are still two machines: the
+    /// run row carries the uid of the machine whose records produced it, so a
+    /// reader never has to tell them apart by the name.
+    #[test]
+    #[serial_test::serial]
+    fn a_peers_mission_row_carries_the_uid_of_the_machine_that_ran_it() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let fleet = vec![
+            peer_record("dispatch.start", &darkmux_flow::ts_utc_now()),
+            peer_record("dispatch.complete", &darkmux_flow::ts_utc_now()),
+        ];
+        let runs = build_runs(flows.path(), None, &fleet);
+        let row = runs.iter().find(|r| r.id == "review-on-the-hub").expect("the peer's mission row");
+        assert_eq!(row.machine_uid.as_deref(), Some("PEER-UID-1"));
+    }
+
+    /// An untracked dispatch row takes the uid from its own session's
+    /// records; a record with no uid leaves the row with none (never a guess
+    /// from the name).
+    #[test]
+    fn ghost_runs_carry_the_sessions_machine_uid_or_none() {
+        let mut idx = HashMap::new();
+        let base = SessionAgg {
+            has_start: true,
+            start_ts: Some("2026-07-24T10:00:00Z".to_string()),
+            last_activity_ts: Some("2026-07-24T10:00:00Z".to_string()),
+            machine: Some("Mac".to_string()),
+            ..Default::default()
+        };
+        idx.insert("with-uid".to_string(), SessionAgg { machine_uid: Some("UID-A".to_string()), ..base.clone() });
+        idx.insert("no-uid".to_string(), base);
+        let now_ms = parse_flow_ts("2026-07-24T10:00:00Z").unwrap() * 1_000;
+        let ghosts = ghost_runs(&idx, &HashSet::new(), &HashSet::new(), &HashSet::new(), now_ms);
+        let uid_of = |id: &str| ghosts.iter().find(|g| g.id == id).unwrap().machine_uid.clone();
+        assert_eq!(uid_of("with-uid").as_deref(), Some("UID-A"));
+        assert_eq!(uid_of("no-uid"), None);
+    }
+
+    /// The session index folds `machine_uid` from the records, beside
+    /// `machine_id`.
+    #[test]
+    fn the_session_index_folds_machine_uid_from_records() {
+        let flows = TempDir::new().unwrap();
+        let fleet = vec![
+            serde_json::json!({"ts": darkmux_flow::ts_utc_now(), "action": "dispatch.start", "session_id": "s-uid",
+                "handle": "coder", "machine_id": "Mac", "machine_uid": "UID-B"}),
+            serde_json::json!({"ts": darkmux_flow::ts_utc_now(), "action": "dispatch.start", "session_id": "s-nouid",
+                "handle": "coder", "machine_id": "Mac"}),
+        ];
+        let idx = build_flow_session_index(flows.path(), &fleet, RUNS_FLOW_SCAN_WINDOW_DAYS);
+        assert_eq!(idx["s-uid"].machine_uid.as_deref(), Some("UID-B"));
+        assert_eq!(idx["s-nouid"].machine_uid, None);
     }
 
     /// (#1915) The defect this whole issue is about: an untracked mission

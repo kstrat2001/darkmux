@@ -23,7 +23,8 @@
  * disagreeing about what day the page was showing.
  */
 
-import { computeTMax, computeTMin, uidOf } from "./flow";
+import { computeTMax, computeTMin } from "./flow";
+import { machineUids } from "./machineIdentity";
 import { clk, clkrange, lday } from "./format";
 import type { NormRecord } from "./ingest";
 
@@ -96,7 +97,7 @@ export interface ReplayMetaParts {
 export function replayMetaParts(data: NormRecord[], date: string): ReplayMetaParts {
   const tMin = computeTMin(data);
   const tMax = computeTMax(data);
-  const machineCount = new Set(data.map(uidOf)).size;
+  const machineCount = machineUids(data, new Map()).length;
   return {
     head: `◆ ${replayMissionLabel(data)}`,
     source: replayDataSource(date),
@@ -182,7 +183,7 @@ export function resolvedMissionLabel(data: NormRecord[], id: string): string | n
 export function replayPlaybackKvValue(data: NormRecord[], date: string): string {
   const tMin = computeTMin(data);
   const tMax = computeTMax(data);
-  const machineCount = new Set(data.map(uidOf)).size;
+  const machineCount = machineUids(data, new Map()).length;
   const mission = primaryReplayMission(data);
   const reviewed = mission ? data.find((r) => r.mission_id === mission && r.mission_reviewed)?.mission_reviewed : null;
   return (

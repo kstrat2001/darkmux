@@ -1219,6 +1219,8 @@ darkmux release.
 
 ### Added (4.0)
 
+- **A run row carries `machine_uid` beside its display `machine`** (`/runs`, `run list --json`, additive and optional). It is the hardware uid of the machine whose records produced the row; a tracked mission or lab row reports this daemon's own uid. The viewer decides which machine a run belongs to by this uid, so a renamed machine, a `.local` alias or two machines sharing one display name no longer merge, split or misattribute runs. A record that carried no uid leaves the field absent.
+
 - **A machine states its fleet role, and the hub hands out fleet defaults (#3022,
   CONFIG 2.1).** The machine card carries `fleet_mode` (`standalone`, `hub`,
   `peer`, from `fleet.mode`) and `hosts_fleet_redis` (whether the machine's own
