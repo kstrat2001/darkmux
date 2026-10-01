@@ -3,4 +3,4 @@
 /**
  * Status of a mission.
  */
-export type MissionStatus = "active" | "finalized" | "aborted";
+export type MissionStatus = "active" | "finalized" | "aborted" | "unknown";
