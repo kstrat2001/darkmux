@@ -1214,13 +1214,15 @@ pub fn retired_env_leftovers() -> Vec<crate::config::RetiredLeftover> {
     crate::config::retired_env_leftovers(&env_str)
 }
 
-/// `Err` when any retired or renamed setting's env var is set. Called once at
-/// the top of the CLI's command dispatch for every command but `doctor` and
-/// `config`, so no entry point (a read-only verb, `serve`, the fleet
-/// listener it hosts) starts under a setting that nothing reads any more.
-pub fn refuse_retired_env() -> Result<(), crate::config::RetiredEnvRefusal> {
-    let left = retired_env_leftovers();
-    if left.is_empty() { Ok(()) } else { Err(crate::config::RetiredEnvRefusal(left)) }
+/// `Err` when any leftover env var's policy is to refuse (its silent loss
+/// would change behavior); otherwise `Ok` with the leftovers to warn about.
+/// Called once at the top of the CLI's command dispatch for every command but
+/// `doctor` and `config`, so no entry point starts under a setting whose loss
+/// it would hide.
+pub fn check_retired_env() -> Result<Vec<crate::config::RetiredLeftover>, crate::config::RetiredEnvRefusal> {
+    let (refuse, warn): (Vec<_>, Vec<_>) =
+        retired_env_leftovers().into_iter().partition(|l| l.policy == crate::config::LeftoverPolicy::Refuse);
+    if refuse.is_empty() { Ok(warn) } else { Err(crate::config::RetiredEnvRefusal(refuse)) }
 }
 
 /// (#1230 Packet 1) Max CONCURRENT remote dispatches

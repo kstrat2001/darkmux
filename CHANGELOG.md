@@ -242,15 +242,18 @@ darkmux release.
   doctor`'s `project-local .darkmux` row warns when the working directory
   holds anything besides those per-repo files, naming what is stranded.
 
-- **A retired setting's env var is refused by every command.**
-  `DARKMUX_CREW_DIR`, `DARKMUX_NOTEBOOK_DIR`, `DARKMUX_RADIO_ROUTER_PROFILE`
-  and the renamed `DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION` used to be
-  refused only by the dispatch, mission-launch, lab and fleet entry points
-  (or, for the notebook and radio-router ones, only warned about). One check
-  at CLI entry now refuses to start while any is set, for every command
-  except `doctor` and `config` (and `--help` / `--version`). **Migration:**
-  remove the export from your shell rc; `darkmux doctor` lists each one with
-  what replaced it.
+- **A retired setting's env var is checked once, at CLI entry, by whether
+  ignoring it is safe.** A leftover whose silent loss would change behavior
+  is refused by every command except `doctor` and `config` (and `--help` /
+  `--version`): the renamed `DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION` (a
+  token cap that would quietly vanish) and `DARKMUX_CREW_DIR` (a state
+  location that would quietly move). A leftover that nothing reads and whose
+  loss changes nothing, `DARKMUX_NOTEBOOK_DIR` and
+  `DARKMUX_RADIO_ROUTER_PROFILE`, is ignored with one warning on stderr, and
+  the command runs. These used to be refused only by the dispatch,
+  mission-launch, lab and fleet entry points. **Migration:** remove the
+  export from your shell rc; `darkmux doctor` lists each one, failing for a
+  refused one and warning for an ignored one, with the exact change to make.
 
 - **An unknown key in a user file is refused (CONFIG 2.0).** `config.json`,
   `profiles.json`, role, skill and crew manifests, mission configs, rule
