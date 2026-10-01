@@ -1,14 +1,14 @@
-//! (#2301) `crawl.unit` + `crawl.summary` — the crawl's DISPATCH half as
+//! (#2301) `dispatch.unit` + `dispatch.summary` — the crawl's DISPATCH half as
 //! step kinds, so `crawl.json` is the whole crawl and the literal-routed
 //! launcher (`src/crawl_launch.rs`, retired here) has no job left.
 //!
-//! `crawl.unit` wraps exactly one unit dispatch: look the unit up in the
+//! `dispatch.unit` wraps exactly one unit dispatch: look the unit up in the
 //! plan its `crawl.plan` producer wrote, build the model-facing message,
 //! dispatch the `crawler` role against the materialized tree mounted
 //! read-only, classify what came back, and hand a small per-unit outcome
 //! JSON downstream as the step's `output`.
 //!
-//! `crawl.summary` is the fan-in: it reads every `crawl.unit` step this
+//! `dispatch.summary` is the fan-in: it reads every `dispatch.unit` step this
 //! mission ran and writes the run's totals — the SAME keys the retired
 //! launcher's `mission close` payload carried, so a reader keyed on
 //! `units_completed`/`findings`/`stopped_by`/`tokens_per_hour` keeps
@@ -25,16 +25,16 @@
 //! reasoning `plan_step.rs` records for `crawl.plan`.
 //!
 //! **Every cross-kind output is a TYPED struct, and the read IS the
-//! check.** `crawl.unit`'s `output` is [`UnitOutcome`] serialized — a
+//! check.** `dispatch.unit`'s `output` is [`UnitOutcome`] serialized — a
 //! `schema_version`, required fields plain, optional fields
-//! `#[serde(default)]` — never a free-form blob. `crawl.summary`
+//! `#[serde(default)]` — never a free-form blob. `dispatch.summary`
 //! deserializes every unit output THROUGH that struct and fails by field
 //! name at the read; the plan is read through [`Plan`], already the same
 //! rule. No content names on ports: a port stays a label.
 //!
-//! **Testing (no model, no container).** [`CrawlUnitStepKind`] holds its
+//! **Testing (no model, no container).** [`DispatchUnitStepKind`] holds its
 //! dispatch function — production is `darkmux_crew::dispatch::dispatch`
-//! ([`CrawlUnitStepKind::production`]); a test constructs the kind with a
+//! ([`DispatchUnitStepKind::production`]); a test constructs the kind with a
 //! closure returning a scripted [`DispatchResult`] pointing at a tempdir
 //! seeded with `.darkmux-runtime/findings.jsonl`. Same injection
 //! discipline the retired launcher used, moved onto the kind because a
@@ -44,7 +44,7 @@ use crate::crawl::plan::{Plan, ReadFileEntry, Site, Unit};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use darkmux_crew::dispatch::{CompactionDispatchArgs, DispatchOpts, DispatchResult};
 use darkmux_crew::rules::{self, Rule};
-use darkmux_crew::step_config::{crawl_identity, load_checked, non_blank, ConfigKind, CrawlUnitConfig};
+use darkmux_crew::step_config::{crawl_identity, load_checked, non_blank, ConfigKind, DispatchUnitConfig};
 use darkmux_crew::step_kinds::{CwdPolicy, Port, SeatClaim, StepKind, StepKindRegistry, StepOutcome, StepRunCtx};
 use darkmux_crew::thermal_governor;
 use darkmux_crew::types::{Step, Task};
@@ -54,14 +54,13 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-pub const CRAWL_UNIT_KIND: &str = ConfigKind::CrawlUnit.id();
-pub const CRAWL_SUMMARY_KIND: &str = ConfigKind::CrawlSummary.id();
+pub const DISPATCH_UNIT_KIND: &str = ConfigKind::DispatchUnit.id();
+pub const DISPATCH_SUMMARY_KIND: &str = ConfigKind::DispatchSummary.id();
 
-/// (#2301) CONTENT ids — what a step PRODUCES, checked by whoever reads it.
-/// Separate from the step-kind ids above on purpose: a kind is a thing that
-/// runs, a content id is a thing that is read.
-pub const UNIT_OUTCOME_KIND: &str = "crawl.unit-outcome";
-pub const CRAWL_SUMMARY_OUTPUT_KIND: &str = "crawl.summary";
+// (#2301, #2430) CONTENT ids — what a step PRODUCES, checked by whoever reads
+// it — live in `darkmux_crew::step_output::labels`, apart from the step-kind
+// ids above on purpose: a kind is a thing that runs, a content id is a thing
+// that is read.
 
 /// The one `create_finding` field this module rewrites — the container
 /// path is stripped off `file`; every other field is copied verbatim.
@@ -170,13 +169,13 @@ pub struct FindingRef {
     /// The ONE rule id this finding was recorded under.
     pub rule: String,
     /// The materialized workspace root the unit was dispatched against —
-    /// the same directory `crawl.unit` mounts, so a create-mods step can
+    /// the same directory `dispatch.unit` mounts, so a create-mods step can
     /// name it as its `workdir` and see the very tree the finding cites.
     pub tree_root: String,
 }
 
-/// (#2301) What ONE `crawl.unit` step produces, and the ONLY thing
-/// `crawl.summary` reads. A typed struct, not a JSON blob: the consumer
+/// (#2301) What ONE `dispatch.unit` step produces, and the ONLY thing
+/// `dispatch.summary` reads. A typed struct, not a JSON blob: the consumer
 /// deserializes through it, so a producer that drifts fails at the read
 /// naming the field rather than summarizing zeros.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -396,7 +395,7 @@ const REPORT_FINDING_INSTRUCTIONS: &str = "\nFor each match, call `create_findin
 pub fn build_message(rules_by_id: &BTreeMap<String, Rule>, unit: &Unit, intent: Option<&str>) -> Result<String> {
     let missing = |rule: &str| {
         anyhow!(
-            "crawl.unit: no rule resolved for id `{rule}` — the plan names a rule the current \
+            "dispatch.unit: no rule resolved for id `{rule}` — the plan names a rule the current \
              rule set no longer declares; re-plan this rule"
         )
     };
@@ -483,7 +482,7 @@ pub fn interpret_dispatch_result(unit_id: &str, res: &DispatchResult) -> UnitDis
         eprintln!(
             "{}",
             darkmux_types::style::warn(&format!(
-                "crawl.unit: unit `{unit_id}` produced non-JSON stdout (expected a `--json` \
+                "dispatch.unit: unit `{unit_id}` produced non-JSON stdout (expected a `--json` \
                  envelope) — first 120 chars: {excerpt:?}"
             ))
         );
@@ -611,7 +610,7 @@ pub struct CrawlerSeat {
     pub profile_name: Option<String>,
 }
 
-/// (#2310 P4c) `role` is the Task's own `role_id` — see `CrawlUnitStepKind::
+/// (#2310 P4c) `role` is the Task's own `role_id` — see `DispatchUnitStepKind::
 /// run`'s doc for why the dispatch itself now reads `task.role_id` rather
 /// than a hardcoded `"crawler"`; this resolver generalizes the same way so
 /// a reviewer-role unit's provenance stamp names `role_profiles.reviewer`,
@@ -758,25 +757,25 @@ fn readback_findings(
         if let Err(e) = std::fs::write(into, buf) {
             eprintln!(
                 "{}",
-                darkmux_types::style::warn(&format!("crawl.unit: writing {} — {e:#}", into.display()))
+                darkmux_types::style::warn(&format!("dispatch.unit: writing {} — {e:#}", into.display()))
             );
         }
     }
     (found, refs)
 }
 
-// ── the `crawl.unit` step kind ───────────────────────────────────────────
+// ── the `dispatch.unit` step kind ───────────────────────────────────────────
 
 /// The dispatch seam. Production is [`darkmux_crew::dispatch::dispatch`];
 /// a test injects a closure. `Send + Sync` because the scheduler runs a
 /// step on a worker thread.
 pub type UnitDispatchFn = Arc<dyn Fn(DispatchOpts) -> Result<DispatchResult> + Send + Sync>;
 
-pub struct CrawlUnitStepKind {
+pub struct DispatchUnitStepKind {
     dispatch: UnitDispatchFn,
 }
 
-impl CrawlUnitStepKind {
+impl DispatchUnitStepKind {
     /// The registered kind — dispatches for real.
     pub fn production() -> Self {
         Self { dispatch: Arc::new(darkmux_crew::dispatch::dispatch) }
@@ -829,7 +828,7 @@ pub struct UnitStepConfig {
 
 impl UnitStepConfig {
     pub fn from_step(step: &Step) -> Result<Self> {
-        let cfg: CrawlUnitConfig = load_checked(step, ConfigKind::CrawlUnit)?;
+        let cfg: DispatchUnitConfig = load_checked(step, ConfigKind::DispatchUnit)?;
         let plan = cfg.plan;
         let unit = cfg.unit;
         let no_progress_turns = match cfg.no_progress_turns {
@@ -839,7 +838,7 @@ impl UnitStepConfig {
         // A `--param timeout_seconds=45` reaches step config as text, which
         // `BlankableCount` reads; a blank one (a `{{unit_timeout}}` no param
         // supplied) reads as ABSENT, matching `plan` and `intent_file`. `0`
-        // was refused when the config loaded (`CrawlUnitConfig`'s rules).
+        // was refused when the config loaded (`DispatchUnitConfig`'s rules).
         let timeout_seconds = cfg.timeout_seconds.and_then(|t| t.0).map(|n| n.saturating_u32());
         // Empty-string filtered (matches `plan`'s convention above): an
         // unresolved `{{intent_file}}` template on a launch with no
@@ -889,7 +888,7 @@ fn unit_context(the_plan: &Plan, unit: &Unit, run: &RunId, role_id: &str, rule_s
     };
     let ps = the_plan.sources.iter().find(|s| s.id == source).ok_or_else(|| {
         anyhow!(
-            "`{CRAWL_UNIT_KIND}`: unit `{}` names source `{source}`, which the plan's `sources` \
+            "`{DISPATCH_UNIT_KIND}`: unit `{}` names source `{source}`, which the plan's `sources` \
              list does not declare — re-plan this rule",
             unit.id()
         )
@@ -899,14 +898,14 @@ fn unit_context(the_plan: &Plan, unit: &Unit, run: &RunId, role_id: &str, rule_s
     // `sha: ""` would silently produce unversioned findings.
     if ps.sha.trim().is_empty() {
         bail!(
-            "`{CRAWL_UNIT_KIND}`: unit `{}` names source `{source}`, whose plan entry records an \
+            "`{DISPATCH_UNIT_KIND}`: unit `{}` names source `{source}`, whose plan entry records an \
              empty sha — a finding stamped with no sha is unversioned; re-plan this rule",
             unit.id()
         );
     }
     let tree_root = ps.tree.parent().map(Path::to_path_buf).ok_or_else(|| {
         anyhow!(
-            "`{CRAWL_UNIT_KIND}`: unit `{}` names source `{source}`, whose recorded tree `{}` has \
+            "`{DISPATCH_UNIT_KIND}`: unit `{}` names source `{source}`, whose recorded tree `{}` has \
              no parent to mount as the workspace root",
             unit.id(),
             ps.tree.display()
@@ -1000,10 +999,10 @@ fn unit_rule_dir(declared: Option<&str>, rule_ids: &[String]) -> Result<String> 
     let dir = declared.map(str::to_string).or_else(|| single_rule_id(rule_ids)).unwrap_or_else(|| rule_ids.join("+"));
     ensure!(
         !dir.is_empty(),
-        "`{CRAWL_UNIT_KIND}`: could not resolve a rule for this unit's on-disk path - `config.rule` is unset and the plan unit names no rule id; refusing rather than reverting to the pre-#2360 colliding `units/<unit_id>` layout"
+        "`{DISPATCH_UNIT_KIND}`: could not resolve a rule for this unit's on-disk path - `config.rule` is unset and the plan unit names no rule id; refusing rather than reverting to the pre-#2360 colliding `units/<unit_id>` layout"
     );
     if let Some(part) = rules::first_unsafe_rule_part(&dir) {
-        bail!("`{CRAWL_UNIT_KIND}`: rule id `{part}` (from `{dir}`) is not a safe path component: {}", rules::SAFE_RULE_ID_SHAPE);
+        bail!("`{DISPATCH_UNIT_KIND}`: rule id `{part}` (from `{dir}`) is not a safe path component: {}", rules::SAFE_RULE_ID_SHAPE);
     }
     Ok(dir)
 }
@@ -1030,9 +1029,9 @@ fn single_confirm(rules_by_id: &BTreeMap<String, Rule>, rule_ids: &[String]) -> 
     }
 }
 
-impl StepKind for CrawlUnitStepKind {
+impl StepKind for DispatchUnitStepKind {
     fn id(&self) -> &'static str {
-        CRAWL_UNIT_KIND
+        DISPATCH_UNIT_KIND
     }
 
     fn display_name(&self) -> &'static str {
@@ -1042,12 +1041,12 @@ impl StepKind for CrawlUnitStepKind {
     /// (#2301) Port labels ARE the wrapper kinds — see
     /// `plan_step::CrawlPlanStepKind::provides`.
     fn requires(&self) -> &'static [Port] {
-        const PORTS: [Port; 1] = [Port::data(crate::crawl::plan_step::CRAWL_PLAN_OUTPUT_KIND)];
+        const PORTS: [Port; 1] = [Port::data(darkmux_crew::step_output::labels::PLAN)];
         &PORTS
     }
 
     fn provides(&self) -> &'static [Port] {
-        const PORTS: [Port; 1] = [Port::data(UNIT_OUTCOME_KIND)];
+        const PORTS: [Port; 1] = [Port::data(darkmux_crew::step_output::labels::UNIT_OUTCOME)];
         &PORTS
     }
 
@@ -1116,13 +1115,13 @@ impl StepKind for CrawlUnitStepKind {
         // body, and the body is read through `Plan`.
         let the_plan = darkmux_crew::step_output::Output::<Plan>::read(
             &cfg.plan,
-            crate::crawl::plan_step::CRAWL_PLAN_OUTPUT_KIND,
+            darkmux_crew::step_output::labels::PLAN,
         )
-        .with_context(|| format!("`{CRAWL_UNIT_KIND}`: step `{}` reading its plan", step.id))?
+        .with_context(|| format!("`{DISPATCH_UNIT_KIND}`: step `{}` reading its plan", step.id))?
         .body;
         let unit = the_plan.units.iter().find(|u| u.id() == cfg.unit).ok_or_else(|| {
             anyhow!(
-                "`{CRAWL_UNIT_KIND}`: the plan has no unit `{}` (it holds {} unit(s)) — the step's \
+                "`{DISPATCH_UNIT_KIND}`: the plan has no unit `{}` (it holds {} unit(s)) — the step's \
                  `unit` must name one the plan it points at actually planned",
                 cfg.unit,
                 the_plan.units.len()
@@ -1195,7 +1194,7 @@ impl StepKind for CrawlUnitStepKind {
                 eprintln!(
                     "{}",
                     darkmux_types::style::warn(&format!(
-                        "`{CRAWL_UNIT_KIND}`: unit `{}` skipped — {what}, and its STOP file is \
+                        "`{DISPATCH_UNIT_KIND}`: unit `{}` skipped — {what}, and its STOP file is \
                          present at {}; this unit was never dispatched. {remedy}",
                         ctx.unit_id,
                         stop_path.display()
@@ -1228,7 +1227,7 @@ impl StepKind for CrawlUnitStepKind {
                 };
                 return Ok(StepOutcome {
                     output: darkmux_crew::step_output::Output::wrap(
-                        UNIT_OUTCOME_KIND,
+                        darkmux_crew::step_output::labels::UNIT_OUTCOME,
                         outcome_record,
                         darkmux_crew::step_output::Producer::of(mission_id, &task.id, &step.id),
                     )
@@ -1245,7 +1244,7 @@ impl StepKind for CrawlUnitStepKind {
         if let Some(declared) = &cfg.rule {
             if !ctx.rule_ids.iter().any(|r| r == declared) {
                 bail!(
-                    "`{CRAWL_UNIT_KIND}`: step config names rule `{declared}`, but plan unit `{}` \
+                    "`{DISPATCH_UNIT_KIND}`: step config names rule `{declared}`, but plan unit `{}` \
                      names {:?} — the step and the plan disagree about what this unit is for",
                     ctx.unit_id,
                     ctx.rule_ids
@@ -1255,7 +1254,7 @@ impl StepKind for CrawlUnitStepKind {
 
         let (rules_vec, warnings) = rules::resolve_default(&ctx.rule_ids)?;
         for w in warnings.iter().filter(|w| ctx.rule_ids.iter().any(|r| w.contains(r.as_str()))) {
-            eprintln!("{}", darkmux_types::style::warn(&format!("crawl.unit: {w}")));
+            eprintln!("{}", darkmux_types::style::warn(&format!("dispatch.unit: {w}")));
         }
         let rules_by_id: BTreeMap<String, Rule> = rules_vec.into_iter().map(|r| (r.id.clone(), r)).collect();
         // (#2310 P4c review round 2, item (e)) A read failure (missing
@@ -1267,7 +1266,7 @@ impl StepKind for CrawlUnitStepKind {
             Err(e) => {
                 eprintln!(
                     "{}",
-                    darkmux_types::style::warn(&format!("crawl.unit: reading intent_file {}: {e}", p.display()))
+                    darkmux_types::style::warn(&format!("dispatch.unit: reading intent_file {}: {e}", p.display()))
                 );
                 None
             }
@@ -1517,7 +1516,7 @@ impl StepKind for CrawlUnitStepKind {
                     finding_refs: dedup_across_draws(cfg.draws, all_finding_refs),
                 };
                 return Err(anyhow!(
-                    "`{CRAWL_UNIT_KIND}`: unit `{}` ended `{result}` on draw {} of {} — {detail} (outcome: {})",
+                    "`{DISPATCH_UNIT_KIND}`: unit `{}` ended `{result}` on draw {} of {} — {detail} (outcome: {})",
                     ctx.unit_id,
                     draw + 1,
                     cfg.draws,
@@ -1528,7 +1527,7 @@ impl StepKind for CrawlUnitStepKind {
 
         // (#2310 P4c-2b) Dedup ACROSS draws before this becomes the
         // step's own output — a create-mods phase grows one coder task
-        // PER `finding_refs` entry (`crawl.summary`'s own `finding_refs`
+        // PER `finding_refs` entry (`dispatch.summary`'s own `finding_refs`
         // union), so an undeduped multi-draw unit would dispatch a coder
         // twice at the "same" finding two draws independently observed.
         let finding_refs = dedup_across_draws(cfg.draws, all_finding_refs);
@@ -1568,7 +1567,7 @@ impl StepKind for CrawlUnitStepKind {
 
         Ok(StepOutcome {
             output: darkmux_crew::step_output::Output::wrap(
-                UNIT_OUTCOME_KIND,
+                darkmux_crew::step_output::labels::UNIT_OUTCOME,
                 outcome_record,
                 darkmux_crew::step_output::Producer::of(mission_id, &task.id, &step.id),
             )
@@ -1671,11 +1670,11 @@ fn dedup_across_draws(draws: usize, refs: Vec<(usize, FindingRef)>) -> Vec<Findi
     out
 }
 
-// ── the `crawl.summary` step kind ────────────────────────────────────────
+// ── the `dispatch.summary` step kind ────────────────────────────────────────
 
-pub struct CrawlSummaryStepKind;
+pub struct DispatchSummaryStepKind;
 
-impl StepKind for CrawlSummaryStepKind {
+impl StepKind for DispatchSummaryStepKind {
     /// (#2394) Folds the units' outcomes into the run summary. No model.
     fn seat(
         &self,
@@ -1688,20 +1687,20 @@ impl StepKind for CrawlSummaryStepKind {
     }
 
     fn id(&self) -> &'static str {
-        CRAWL_SUMMARY_KIND
+        DISPATCH_SUMMARY_KIND
     }
 
     fn display_name(&self) -> &'static str {
         "Crawl summary"
     }
 
-    fn requires(&self) -> &'static [Port] {
-        const PORTS: [Port; 1] = [Port::data(UNIT_OUTCOME_KIND)];
-        &PORTS
-    }
-
+    /// Requires NO wired port (#2312): this kind folds the unit outcomes it
+    /// finds in the mission's own step records (`summarize_mission`), because
+    /// the units are grown at run time and a task cannot name a grow template
+    /// in `depends_on`. Declaring `UNIT_OUTCOME` here would be a requirement
+    /// no config can wire.
     fn provides(&self) -> &'static [Port] {
-        const PORTS: [Port; 1] = [Port::data(CRAWL_SUMMARY_OUTPUT_KIND)];
+        const PORTS: [Port; 1] = [Port::data(darkmux_crew::step_output::labels::SUMMARY)];
         &PORTS
     }
 
@@ -1710,14 +1709,14 @@ impl StepKind for CrawlSummaryStepKind {
     /// dispatches no model at all ([`SeatClaim::NoModel`] above): it folds
     /// unit outcomes already on disk, read through resolved paths, never a
     /// `Command`. Absent from the #2577 roster entirely until this review
-    /// — same reason as `CrawlUnitStepKind` just above: a crawl-crate
+    /// — same reason as `DispatchUnitStepKind` just above: a crawl-crate
     /// kind with no shared registry the Tier-1 conformance test can see.
     /// Audited by hand.
     fn cwd_policy(&self) -> CwdPolicy {
         CwdPolicy::NoAmbientDependency
     }
 
-    /// Fan-in over every `crawl.unit` step this MISSION ran.
+    /// Fan-in over every `dispatch.unit` step this MISSION ran.
     ///
     /// Deliberately NOT `gather_inputs`: a unit task is GROWN from the
     /// plan at the phase boundary (#2300), so its id does not exist when
@@ -1730,7 +1729,7 @@ impl StepKind for CrawlSummaryStepKind {
         let summary = summarize_mission(mission_id)?;
         Ok(StepOutcome {
             output: darkmux_crew::step_output::Output::wrap(
-                CRAWL_SUMMARY_OUTPUT_KIND,
+                darkmux_crew::step_output::labels::SUMMARY,
                 summary,
                 darkmux_crew::step_output::Producer::of(mission_id, &task.id, &step.id),
             )
@@ -1741,7 +1740,7 @@ impl StepKind for CrawlSummaryStepKind {
     }
 }
 
-/// (#2301) The typed crawl run summary — `crawl.summary`'s body, and the
+/// (#2301) The typed crawl run summary — `dispatch.summary`'s body, and the
 /// mission's `mission close` payload.
 ///
 /// Every key the retired launcher's close payload carried is here under the
@@ -1821,7 +1820,7 @@ pub struct PlanSourceRef {
 /// [`CrawlSummary`]'s own schema version.
 pub const CRAWL_SUMMARY_SCHEMA_VERSION: &str = "1.2";
 
-/// Build the crawl's run totals from what this mission's `crawl.unit`
+/// Build the crawl's run totals from what this mission's `dispatch.unit`
 /// steps recorded, plus what its `plan/` directory planned.
 ///
 /// Every unit output is read through [`UnitOutcome`], inside the
@@ -1853,7 +1852,7 @@ pub fn summarize_mission(mission_id: &str) -> Result<CrawlSummary> {
                 plans_errored.push(rule);
             }
         }
-        for step in steps.iter().filter(|s| s.kind == CRAWL_UNIT_KIND) {
+        for step in steps.iter().filter(|s| s.kind == DISPATCH_UNIT_KIND) {
             // (#2301 review, MUST FIX) Branch on STATUS, not on whether an
             // output is present. The scheduler writes a failing kind's own
             // ERROR TEXT into `step.output` (`scheduler.rs`'s `Err` arm),
@@ -1871,11 +1870,11 @@ pub fn summarize_mission(mission_id: &str) -> Result<CrawlSummary> {
             let raw = step.output.as_deref().map(str::trim).filter(|o| !o.is_empty());
             match raw {
                 Some(raw) => {
-                    let parsed = darkmux_crew::step_output::Output::<UnitOutcome>::read(raw, UNIT_OUTCOME_KIND)
+                    let parsed = darkmux_crew::step_output::Output::<UnitOutcome>::read(raw, darkmux_crew::step_output::labels::UNIT_OUTCOME)
                         .with_context(|| {
                             format!(
-                                "`{CRAWL_SUMMARY_KIND}`: step `{}` completed but recorded an output \
-                                 that is not a `UnitOutcome` — every `{CRAWL_UNIT_KIND}` output is \
+                                "`{DISPATCH_SUMMARY_KIND}`: step `{}` completed but recorded an output \
+                                 that is not a `UnitOutcome` — every `{DISPATCH_UNIT_KIND}` output is \
                                  read through that struct, so a producer that drifted is refused \
                                  here rather than summarized as zeros",
                                 step.id
@@ -2025,7 +2024,7 @@ pub fn summarize_mission(mission_id: &str) -> Result<CrawlSummary> {
         },
         est_tokens,
         model: rows.iter().find_map(|r| r.model.clone()),
-        // (#2310 P4c) `crawl.summary` is not reused by review (its own
+        // (#2310 P4c) `dispatch.summary` is not reused by review (its own
         // phase declares no summary task) — hardcoded "crawler" here is
         // unchanged behavior, not a gap.
         profile: resolve_crawler_seat("crawler").profile_name,
@@ -2155,7 +2154,7 @@ fn plan_totals(plan_dir: &Path) -> (usize, u64, Vec<PlanSourceRef>, String) {
     for path in paths.iter().filter(|p| p.extension().is_some_and(|e| e == "json")) {
         let Ok(p) = darkmux_crew::step_output::Output::<Plan>::read_path(
             path,
-            crate::crawl::plan_step::CRAWL_PLAN_OUTPUT_KIND,
+            darkmux_crew::step_output::labels::PLAN,
         )
         .map(|o| o.body) else {
             continue;
@@ -2188,8 +2187,8 @@ fn mission_of(run_ctx: &StepRunCtx) -> Result<&str> {
 /// Register the crawl's dispatch-side step kinds. Called from
 /// [`crate::crawl::plan_step::register_crawl_kinds`].
 pub fn register(registry: &StepKindRegistry) -> Result<()> {
-    registry.register(Arc::new(CrawlUnitStepKind::production())).context("registering crawl.unit")?;
-    registry.register(Arc::new(CrawlSummaryStepKind)).context("registering crawl.summary")?;
+    registry.register(Arc::new(DispatchUnitStepKind::production())).context("registering dispatch.unit")?;
+    registry.register(Arc::new(DispatchSummaryStepKind)).context("registering dispatch.summary")?;
     Ok(())
 }
 

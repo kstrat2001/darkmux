@@ -36,7 +36,7 @@ params: PlanParamsRecord | null,
  * and `plan.sites`'s own `"source": "tree"` both still call), so a
  * reader cannot distinguish "planned by the tree strategy" from "this
  * plan predates the field" — which is fine, because nothing needs to
- * today: `crawl.unit` reads a `Plan` the same way regardless of what
+ * today: `dispatch.unit` reads a `Plan` the same way regardless of what
  * planned it. A future consumer that DOES need to tell tree from
  * pre-field-tree apart is the moment this earns its own real minor
  * bump, together with a deliberate golden update.

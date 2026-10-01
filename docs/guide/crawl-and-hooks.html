@@ -69,10 +69,10 @@ graph:
       step plan-swallowed-error-step [crawl.plan]
   phase Crawl (1 task(s))
     task Crawl: Swallowed errors role=crawler depends_on=["plan-swallowed-error"]
-      step unit-swallowed-error-step [crawl.unit]
+      step unit-swallowed-error-step [dispatch.unit]
   phase Summarize (1 task(s))
     task Summary
-      step summary-step [crawl.summary]</code></pre>
+      step summary-step [dispatch.summary]</code></pre>
     <p>The Crawl phase declares one <em>template</em> per rule, grown into one task per planned unit at run time. A <strong>unit</strong> is one bounded dispatch's worth of work; the plan carries each one's token estimate.</p>
     <div class="callout">
       <strong><code>workspace=</code> takes a file path, not inline JSON.</strong>
@@ -142,8 +142,8 @@ mission.close            <span class="comment"># units_completed/errored/skipped
  "payload":{"ms":2000,"turn":1,"rest_ms":2000,"rests":1,
             "context":{"workspace":"darkmux-self","rule":"swallowed-error","unit":"u-0001"}}}
 
-<span class="comment"># a unit step's own output — a typed `crawl.unit-outcome`, hashed and stamped</span>
-{"kind":"crawl.unit-outcome","hash":"9f2c...","producer":{"mission":"crawl-1787979698-b5961a"},
+<span class="comment"># a unit step's own output — a typed `dispatch.unit`, hashed and stamped</span>
+{"kind":"dispatch.unit","hash":"9f2c...","producer":{"mission":"crawl-1787979698-b5961a"},
  "body":{"unit":"u-0001","rule":"swallowed-error","result":"stop",
          "findings":2,"findings_rejected":2,"prompt_tokens":657998,"completion_tokens":11719,
          "wall_ms":265649,"rest_ms":34000}}
@@ -157,7 +157,7 @@ mission.close            <span class="comment"># units_completed/errored/skipped
  "payload":{"units_in_plan":2,"units_selected":2,"units_not_run":0,
             "units_completed":2,"units_errored":0,"findings":2,
             "wall_ms":349707,"tokens_per_hour":7875514,"stopped_by":"done"}}</code></pre>
-    <p><code>wall_ms</code> includes rest time; subtract <code>rest_ms</code> for model-only time. The close payload IS the run's own <code>crawl.summary</code> step output. <code>--param rules=</code> narrows the PLAN itself, not just which units dispatch, so <code>units_in_plan</code>/<code>units_selected</code> reflect the narrowed scope here rather than the full rule registry's unit count &mdash; and <code>units_not_run</code> is <code>0</code> for a run that reached every unit it planned.</p>
+    <p><code>wall_ms</code> includes rest time; subtract <code>rest_ms</code> for model-only time. The close payload IS the run's own <code>dispatch.summary</code> step output. <code>--param rules=</code> narrows the PLAN itself, not just which units dispatch, so <code>units_in_plan</code>/<code>units_selected</code> reflect the narrowed scope here rather than the full rule registry's unit count &mdash; and <code>units_not_run</code> is <code>0</code> for a run that reached every unit it planned.</p>
   </div>
 </section>
 

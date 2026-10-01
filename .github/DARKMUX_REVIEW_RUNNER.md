@@ -29,7 +29,7 @@ below), not a per-run flag.
 reads the PR **diff** plus its **title and description** via the GitHub API —
 all data, never checked out or executed — and dispatches them to `darkmux
 mission launch review`, which plans each enabled rule against the diff
-(`plan.sites`) and dispatches one `crawl.unit` reviewer task per planned site,
+(`plan.sites`) and dispatches one `dispatch.unit` reviewer task per planned site,
 then gates and delivers any findings (`create-mods`/`deliver`) in the
 sandboxed, network-isolated internal runtime. The pipeline's
 own GitHub file source (used when a `reviewer` dispatch wants to see more of a
@@ -136,7 +136,7 @@ lms get mistralai/devstral-small-2507
 had a `sequential` / `parallel` / `auto` residency split across its
 probe/judge staffing; #2310 P4d deleted that pipeline and its bespoke
 launcher. The shipped `review.json` pipeline runs each planned unit as a
-`crawl.unit` dispatch under the generic scheduler, which owns dispatch
+`dispatch.unit` dispatch under the generic scheduler, which owns dispatch
 ordering directly — there is nothing to set here. Staffing (which model the
 `reviewer` role resolves to) lives entirely on the runner's own
 `~/.darkmux/config.json` `role_profiles` map, per (b) above.

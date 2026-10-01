@@ -94,19 +94,25 @@ fn task_issues(path: &str, task: &Value, out: &mut Vec<KeyIssue>) {
 }
 
 /// The kind a step names, or the issue that it names none darkmux ships. A
-/// step with no `kind` string is the document walk's to report.
+/// step with no `kind` string is the document walk's to report. A RETIRED
+/// kind id (#2430) is refused naming the id that replaced it.
 fn step_kind(step: &Value, step_path: &str, out: &mut Vec<KeyIssue>) -> Option<ConfigKind> {
     let kind = step.get("kind")?;
-    match kind.as_str().and_then(ConfigKind::from_id) {
-        Some(known) => Some(known),
-        None => {
-            out.extend(key_issues::<ConfigKind>(kind, &|_| None).into_iter().map(|mut i| {
-                i.path = format!("{step_path}.kind");
-                i
-            }));
-            None
-        }
+    let id = kind.as_str();
+    if let Some(known) = id.and_then(ConfigKind::from_id) {
+        return Some(known);
     }
+    let path = format!("{step_path}.kind");
+    if let Some((old, new)) = id.zip(id.and_then(ConfigKind::replacing)) {
+        let line = format!("step kind `{old}` was renamed to `{}` (#2430) and is not accepted under its old name", new.id());
+        out.push(KeyIssue { path, issue: Issue::Removed(line) });
+        return None;
+    }
+    out.extend(key_issues::<ConfigKind>(kind, &|_| None).into_iter().map(|mut i| {
+        i.path = path.clone();
+        i
+    }));
+    None
 }
 
 /// One step's issues: its `config` overlaid with the grow keys its kind

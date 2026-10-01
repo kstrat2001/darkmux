@@ -765,6 +765,9 @@ pub struct Step {
     pub task_id: String,
     /// step-kind registry id, e.g. `"dispatch.internal"` |
     /// `"dispatch.single_shot"` | `"procedural.shell"` | `"procedural.noop"`.
+    /// A record an older run wrote with a retired id reads as its
+    /// replacement (#2430, `step_config::current_kind_id`).
+    #[serde(deserialize_with = "crate::step_config::deserialize_kind_id")]
     pub kind: String,
     /// (#1684 Packet 2, mission-config schema 2.2) The operator sign-off
     /// gate — mirrors [`mission_config::StepConfig::gate`](
@@ -952,6 +955,19 @@ pub struct Task {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (#2430) A step record an older run left on disk names a retired kind
+    /// id. It reads as the id that replaced it, and a current id is untouched.
+    #[test]
+    fn an_archived_step_with_a_retired_kind_id_reads_as_its_replacement() {
+        let read = |kind: &str| -> Step {
+            serde_json::from_value(serde_json::json!({"id": "s", "task_id": "t", "kind": kind})).unwrap()
+        };
+        assert_eq!(read("crawl.unit").kind, "dispatch.unit");
+        assert_eq!(read("crawl.summary").kind, "dispatch.summary");
+        assert_eq!(read("crawl.plan").kind, "crawl.plan", "crawl.plan is still a live kind");
+        assert_eq!(read("dispatch.unit").kind, "dispatch.unit");
+    }
 
     fn skill_with(id: &str, caps: &[(Capability, f32)]) -> Skill {
         Skill {

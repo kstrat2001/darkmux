@@ -343,7 +343,7 @@ fn every_roster_path_calls_the_writer() {
 /// and for the agentic container the pacer's own tests in `budget_tests`).
 ///
 /// The entry points above these primitives need no row of their own: radio's
-/// answering seat, `darkmux acp`, `crawl.unit`, the lab providers, the fleet
+/// answering seat, `darkmux acp`, `dispatch.unit`, the lab providers, the fleet
 /// runner and every mission `dispatch.internal` step reach a hosted endpoint
 /// only through `dispatch::dispatch` (-> `dispatch_remote`, or the container
 /// path below) or through the `dispatch.single_shot` / `dispatch.map` kinds.

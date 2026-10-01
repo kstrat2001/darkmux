@@ -85,6 +85,24 @@ darkmux release.
   the umbrella, not the kind it opens (CLAUDE.md contract 8). There is no alias: an old
   `run=` link lands on the runs board. **Migration:** rewrite bookmarks to `lab=`.
 
+- **The shared step kinds `crawl.unit` and `crawl.summary` are now `dispatch.unit` and
+  `dispatch.summary`** (#2430). Both the `crawl` and `review` configs use them, and the new
+  names describe the procedure: one bounded dispatch per planned site, and a fold over unit
+  outcomes. `plan.sites` and `crawl.plan` keep their names. There is no alias: a mission
+  config naming an old id is refused when it loads, with a message naming the new id. The
+  output labels moved with them (`crawl.unit-outcome` is `dispatch.unit`,
+  `crawl.summary` is `dispatch.summary`, and a plan is `plan.sites`). Missions and step files
+  already on disk still read: old ids map to the new ones on read, and nothing writes an old
+  id back. The viewer's mission graph now treats `dispatch.unit` as a model-dispatching step
+  (it shows the token and turn meter) and `dispatch.summary` as a procedural one.
+- **A mission config whose wiring cannot work is refused before anything is minted** (#2312).
+  Each step kind declares the outputs it `requires` and `provides`; for every task, the first
+  step's requirements must be met by the last step of a task named in `depends_on`, `reads`
+  or `grow.from`. A miss is an error naming both tasks and both kinds (a `dispatch.unit`
+  grown from a `procedural.shell` task, for instance, which used to mint and then fail every
+  unit reading its plan). `mission launch`, `mission config show` and `darkmux doctor` all
+  run the check. `procedural.shell` and `dispatch.internal` provide untyped `text`;
+  `mission.verify` no longer declares a `worktree` data port it could never receive.
 - **`RunStatus` gains `degraded` and `escalated`** (`/runs`, `run list`, `run list --json`).
   A run whose envelope says `degraded` (a unit cut at its bound, a step that
   completed with partial work, the wall-clock bound) now reads `degraded` instead

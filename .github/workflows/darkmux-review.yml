@@ -4,8 +4,8 @@
 # darkmux dogfooding itself: a PR diff is dispatched to the **review pipeline**
 # (`templates/builtin/mission-configs/review.json`, #2310 P4d — built on the
 # shared mission building blocks, no bespoke funnel launcher) — a `plan.sites`
-# task per rule plans the diff's own hunks, one `crawl.unit` task per rule
-# GROWS a dispatch per planned site under `role_id: "reviewer"`, `crawl.summary`
+# task per rule plans the diff's own hunks, one `dispatch.unit` task per rule
+# GROWS a dispatch per planned site under `role_id: "reviewer"`, `dispatch.summary`
 # folds each unit's findings, `create-mods` waits (bounded) for a mod and gates
 # it, and `deliver.github_review` gathers this run's finding/mod stores and
 # renders the GitHub review payload. Staffing is resolved on the runner from
@@ -220,7 +220,7 @@ jobs:
         run: |
           set -euo pipefail
           # Staffing lives on the MACHINE, not in this public workflow
-          # (#1475, #1513): the review config's `crawl.unit` task dispatches
+          # (#1475, #1513): the review config's `dispatch.unit` task dispatches
           # under `role_id: "reviewer"`, which resolves via the runner's own
           # `role_profiles` map in `~/.darkmux/config.json` (falling back to
           # `default_profile`). This workflow names no model and no profile

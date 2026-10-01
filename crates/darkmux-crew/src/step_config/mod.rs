@@ -56,11 +56,29 @@ pub enum ConfigKind {
     DeliverGithubReview,
     CrawlPlan,
     PlanSites,
-    CrawlUnit,
-    CrawlSummary,
+    DispatchUnit,
+    DispatchSummary,
     MissionWorktree,
     MissionCoder,
     MissionVerify,
+}
+
+/// A step kind id as this build spells it: a retired id (see
+/// [`ConfigKind::replacing`]) maps to its replacement, any other id is
+/// returned unchanged. Applied where a step record is READ from disk, so an
+/// archived mission still opens; nothing writes the old id back.
+pub fn current_kind_id(id: &str) -> &str {
+    match ConfigKind::replacing(id) {
+        Some(kind) => kind.id(),
+        None => id,
+    }
+}
+
+/// serde `deserialize_with` for a persisted step's `kind`: [`current_kind_id`]
+/// applied on read.
+pub fn deserialize_kind_id<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    let id = String::deserialize(d)?;
+    Ok(current_kind_id(&id).to_string())
 }
 
 /// A value a step kind refuses although its type is right: the key (dotted,
@@ -111,9 +129,9 @@ macro_rules! with_config_type {
             ConfigKind::DeliverGithubReview => { type $t = DeliverGithubReviewConfig; $body }
             ConfigKind::CrawlPlan => { type $t = CrawlPlanConfig; $body }
             ConfigKind::PlanSites => { type $t = PlanSitesConfig; $body }
-            ConfigKind::CrawlUnit => { type $t = CrawlUnitConfig; $body }
+            ConfigKind::DispatchUnit => { type $t = DispatchUnitConfig; $body }
             ConfigKind::MissionCoder => { type $t = MissionCoderConfig; $body }
-            ConfigKind::CrawlSummary | ConfigKind::MissionWorktree | ConfigKind::MissionVerify => {
+            ConfigKind::DispatchSummary | ConfigKind::MissionWorktree | ConfigKind::MissionVerify => {
                 type $t = NoConfig;
                 $body
             }
@@ -133,8 +151,8 @@ impl ConfigKind {
         Self::DeliverGithubReview,
         Self::CrawlPlan,
         Self::PlanSites,
-        Self::CrawlUnit,
-        Self::CrawlSummary,
+        Self::DispatchUnit,
+        Self::DispatchSummary,
         Self::MissionWorktree,
         Self::MissionCoder,
         Self::MissionVerify,
@@ -159,8 +177,8 @@ impl ConfigKind {
         "deliver.github_review",
         "crawl.plan",
         "plan.sites",
-        "crawl.unit",
-        "crawl.summary",
+        "dispatch.unit",
+        "dispatch.summary",
         "mission.worktree",
         "mission.coder",
         "mission.verify",
@@ -169,6 +187,20 @@ impl ConfigKind {
     /// The kind a registry id names, parsed once here.
     pub fn from_id(id: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|k| k.id() == id)
+    }
+
+    /// The kind that replaced a retired registry id (#2430: `crawl.unit` and
+    /// `crawl.summary` became `dispatch.unit` and `dispatch.summary`), or
+    /// `None` for an id that was never retired. The ONE place the old
+    /// spellings live. A config naming one is refused, naming the new id
+    /// (`MissionConfig::validate_with`); a record an old run left on disk is
+    /// read through [`current_kind_id`] and never written back.
+    pub fn replacing(retired_id: &str) -> Option<Self> {
+        match retired_id {
+            "crawl.unit" => Some(Self::DispatchUnit),
+            "crawl.summary" => Some(Self::DispatchSummary),
+            _ => None,
+        }
     }
 
     /// Every schema issue in `config` (`Null` reads as an empty object)
@@ -377,10 +409,10 @@ pub struct CrawlIdentity {
     pub unit: Option<String>,
 }
 
-/// The rule and unit a `crawl.plan` / `plan.sites` / `crawl.unit` step names.
+/// The rule and unit a `crawl.plan` / `plan.sites` / `dispatch.unit` step names.
 pub fn crawl_identity(kind: &str, config: &Value) -> CrawlIdentity {
     match ConfigKind::from_id(kind) {
-        Some(ConfigKind::CrawlPlan | ConfigKind::PlanSites | ConfigKind::CrawlUnit) => {
+        Some(ConfigKind::CrawlPlan | ConfigKind::PlanSites | ConfigKind::DispatchUnit) => {
             CrawlIdentity::deserialize(config).unwrap_or_default()
         }
         _ => CrawlIdentity::default(),

@@ -12,7 +12,7 @@
 //! version of it (`AbsenceBackstopNote`, `apply_absence_backstop`) shipped
 //! against the bespoke review funnel and was deleted along with that
 //! funnel in #2310 P4d — this is a from-scratch reimplementation against
-//! the funnel's replacement, the `plan.sites` + `crawl.unit` +
+//! the funnel's replacement, the `plan.sites` + `dispatch.unit` +
 //! `records.gather` + `deliver.github_review` mission-config pipeline.
 //!
 //! **What this is: a text-search LINT, not a registry walk.** State this
@@ -1068,7 +1068,7 @@ mod tests {
         let plan_dir = crate::loader::missions_dir().join(mission_id).join("plan");
         std::fs::create_dir_all(&plan_dir).unwrap();
         let body = serde_json::json!({
-            "kind": "crawl.plan",
+            "kind": "plan.sites",
             "schema_version": "1",
             "body": {
                 "schema_version": "1.1",

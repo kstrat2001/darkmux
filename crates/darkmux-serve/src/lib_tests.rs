@@ -6419,7 +6419,7 @@
             .flat_map(|n| n["steps"].as_array().cloned().unwrap_or_default())
             .filter_map(|row| row["label"].as_str().map(String::from))
             .collect();
-        for expected in ["plan.sites", "crawl.summary", "records.gather", "deliver.github_review"] {
+        for expected in ["plan.sites", "dispatch.summary", "records.gather", "deliver.github_review"] {
             assert!(
                 all_labels.iter().any(|l| l == expected),
                 "expected a \"{expected}\" row label among {all_labels:?}"

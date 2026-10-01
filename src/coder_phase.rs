@@ -1002,14 +1002,15 @@ impl StepKind for MissionVerifyStepKind {
         "Verify (QA)"
     }
 
-    /// (#1530 Packets 2/3b-1) Consumes the worktree the `mission.worktree`
-    /// step creates and the `mission.coder` step's output (annotation only
-    /// — see `MissionWorktreeStepKind::provides`'s doc), and reads
-    /// `CODER_CONTEXT_ARTIFACT` which that same step's `provides()`
-    /// declares — so it does not need to declare it again here.
+    /// (#1530 Packets 2/3b-1) Consumes the `mission.coder` step's output
+    /// (annotation only — see `MissionWorktreeStepKind::provides`'s doc), and
+    /// reads `CODER_CONTEXT_ARTIFACT` which `mission.worktree`'s `provides()`
+    /// declares — so it does not need to declare it again here. It declares
+    /// no `worktree` DATA port (#2312): the worktree reaches it through that
+    /// artifact, and the task wired directly upstream is the coder's, so a
+    /// `worktree` requirement could never be met by `depends_on`.
     fn requires(&self) -> &'static [Port] {
-        const PORTS: [Port; 3] = [
-            Port::data("worktree"),
+        const PORTS: [Port; 2] = [
             Port::data("coder-output"),
             Port::artifact(CODER_CONTEXT_ARTIFACT, make_coder_context_artifact),
         ];

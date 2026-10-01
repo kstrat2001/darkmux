@@ -743,7 +743,7 @@ pub fn finalize_mission(envelope: &MissionEnvelope) {
 /// (#2301) [`finalize_mission`] with a `mission close` PAYLOAD.
 ///
 /// A generic graph's last phase can produce a run summary (the crawl's
-/// `crawl.summary` step is the first one that does), and the operator-
+/// `dispatch.summary` step is the first one that does), and the operator-
 /// facing home for a run's own numbers has always been the `mission close`
 /// record's payload — that is where the retired crawl launcher wrote them.
 /// Rather than give one mission kind a private close path, the generic

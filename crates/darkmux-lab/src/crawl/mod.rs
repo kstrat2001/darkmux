@@ -1,7 +1,7 @@
 //! The agentic bug crawler (#1959) — the mechanical `plan` pass that
 //! turns a resolved (materialized) workspace into a token-estimated
 //! work-unit plan. NO model dispatch lives here — the dispatch half is
-//! `unit_step.rs`'s `crawl.unit` step kind (#2301), and the whole crawl
+//! `unit_step.rs`'s `dispatch.unit` step kind (#2301), and the whole crawl
 //! runs as `darkmux mission launch crawl` over `crawl.json`.
 //!
 //! Rules moved to `darkmux_crew::rules` (#1959 refactor) — a rule is a
@@ -26,7 +26,7 @@ pub mod plan_step;
 /// split and why `crawl.plan` (`plan_step.rs`) is untouched.
 pub mod plan_sites_step;
 
-/// (#2301) The crawl's DISPATCH half — `crawl.unit` + `crawl.summary`.
+/// (#2301) The crawl's DISPATCH half — `dispatch.unit` + `dispatch.summary`.
 /// With these, `crawl.json` IS the crawl: the literal-routed launcher
 /// (`src/crawl_launch.rs`, deleted in #2301) is retired.
 pub mod unit_step;

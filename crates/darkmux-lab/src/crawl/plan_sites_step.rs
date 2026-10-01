@@ -77,7 +77,7 @@
 //! once `plan_step.rs`/`plan_sites_step.rs` actually merge, P4d's call).
 
 use crate::crawl::plan::{self, Plan, PlanParams};
-use crate::crawl::plan_step::{self, CRAWL_PLAN_OUTPUT_KIND};
+use crate::crawl::plan_step;
 use anyhow::{anyhow, Context, Result};
 use darkmux_crew::rules;
 use darkmux_crew::step_config::{github_repo, load_checked, non_blank, ConfigKind, PlanSitesConfig, SitesSource};
@@ -134,12 +134,11 @@ impl StepKind for PlanSitesStepKind {
     }
 
     /// (#2301 precedent) The port label is the SAME wrapper kind
-    /// `crawl.plan` provides — `CRAWL_PLAN_OUTPUT_KIND`, not a new
-    /// `"plan.sites"` content id — so `crawl.unit`'s `requires()` (which
+    /// `crawl.plan` provides, `darkmux_crew::step_output::labels::PLAN`, so `dispatch.unit`'s `requires()` (which
     /// names that one port) reads a plan from EITHER planner with no
     /// modification. Two producers, one content shape.
     fn provides(&self) -> &'static [Port] {
-        const PORTS: [Port; 1] = [Port::data(CRAWL_PLAN_OUTPUT_KIND)];
+        const PORTS: [Port; 1] = [Port::data(darkmux_crew::step_output::labels::PLAN)];
         &PORTS
     }
 
@@ -154,7 +153,7 @@ impl StepKind for PlanSitesStepKind {
             SitesSource::Diff => plan_diff(&cfg)?,
         };
         let wrapped = darkmux_crew::step_output::Output::wrap(
-            CRAWL_PLAN_OUTPUT_KIND,
+            darkmux_crew::step_output::labels::PLAN,
             the_plan,
             darkmux_crew::step_output::Producer::of(&plan_step::mission_id_of(task), &task.id, &step.id),
         );
@@ -351,7 +350,7 @@ fn plan_diff(cfg: &SitesStepConfig) -> Result<Plan> {
     })
 }
 
-/// Register `plan.sites` beside `crawl.plan`/`crawl.unit`/`crawl.summary` —
+/// Register `plan.sites` beside `crawl.plan`/`dispatch.unit`/`dispatch.summary` —
 /// called from `plan_step::register_crawl_kinds` so one call still gives a
 /// launcher every kind either config declares.
 pub fn register(registry: &StepKindRegistry) -> Result<()> {

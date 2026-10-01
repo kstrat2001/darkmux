@@ -1023,7 +1023,7 @@ pub struct RuntimeBehaviorConfig {
 /// `pause: true, reason: "thermal-critical"` — the in-flight unit pauses
 /// with its checkpoint persisted (#2114), never killed — and, for a crawl
 /// mission, also drops the crawl's `STOP` file. **Read side (#2454):**
-/// `crawl.unit`'s own step kind checks that file (via
+/// `dispatch.unit`'s own step kind checks that file (via
 /// `thermal_governor::stop_file_path_from_record_context`, never a raw
 /// re-join) before preparing each unit's dispatch, so a unit that has not
 /// started yet is skipped rather than dispatched — reported in the crawl's

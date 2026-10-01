@@ -162,7 +162,7 @@ describe("computeLayout sizes task cards to their content (#2104)", () => {
   const withSteps: GraphNode = {
     ...TASK_A,
     id: "wide",
-    steps: Array.from({ length: 3 }, (_, i) => ({ id: `w${i}`, label: "crawl.unit", kind: "dispatch.internal", status: "complete" as const })),
+    steps: Array.from({ length: 3 }, (_, i) => ({ id: `w${i}`, label: "dispatch.unit", kind: "dispatch.internal", status: "complete" as const })),
   };
   const bare: GraphNode = { ...TASK_A, id: "bare", steps: [] };
 
@@ -458,6 +458,9 @@ describe("isAiKind", () => {
     expect(isAiKind("mission.coder")).toBe(true);
   });
   it("procedural kinds are not", () => {
+    expect(isAiKind("dispatch.unit")).toBe(true);
+    // (#2430) The summary folds step records; it dispatches no model.
+    expect(isAiKind("dispatch.summary")).toBe(false);
     expect(isAiKind("procedural.shell")).toBe(false);
     expect(isAiKind("review.bundle")).toBe(false);
   });
@@ -966,7 +969,7 @@ describe("stepDispatchSessions (#2223) — the step drill-in's route to the disp
 
 describe("buildStepHeaderFields reads the newest record first", () => {
   it("an untimed record's value is used only when no timed record carries one", () => {
-    const step = { id: "s", label: "s", kind: "crawl.unit", status: "running" as const };
+    const step = { id: "s", label: "s", kind: "dispatch.unit", status: "running" as const };
     const recs = [
       rec({ ts: "2026-08-19T00:00:01Z", payload: { rule: "OLD" } }),
       rec({ ts: "not-a-time", payload: { rule: "BAD" } }),

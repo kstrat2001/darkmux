@@ -85,6 +85,21 @@ impl StepKindRegistry {
         keys
     }
 
+    /// Every registered kind's id and DATA ports, for
+    /// `MissionConfig::validate_with` (#2312). Artifact ports are run-scoped
+    /// shared state, not hand-offs between tasks, so they are left out.
+    pub fn catalog(&self) -> crate::mission_config::KindCatalog {
+        let map = self.kinds.lock().expect("step-kind registry poisoned");
+        let data = |ports: &[super::Port]| -> Vec<String> {
+            ports.iter().filter(|p| matches!(p.kind, super::PortKind::Data)).map(|p| p.name.to_string()).collect()
+        };
+        let mut catalog = crate::mission_config::KindCatalog::default();
+        for (id, kind) in map.iter() {
+            catalog.insert(id, crate::mission_config::KindPorts { requires: data(kind.requires()), provides: data(kind.provides()) });
+        }
+        catalog
+    }
+
     /// Look up a step kind by id, returning an owned `Arc` clone —
     /// `'static` and `Send`, so the caller can move it into a
     /// `run_bounded` worker closure without holding the registry's
@@ -330,14 +345,14 @@ mod tests {
         // the original #2577 sweep undercounted at 19; the reproducible
         // count is FIFTEEN) finds ten such kinds: `mods.gate`, the two
         // crawl planners (`crawl.plan`, `plan.sites`), the two crawl unit
-        // kinds (`crawl.unit`, `crawl.summary`), the three `mission.*`
+        // kinds (`dispatch.unit`, `dispatch.summary`), the three `mission.*`
         // kinds (`mission.worktree`, `mission.coder`, `mission.verify`),
         // `deliver.github_review`, and `records.gather`. Every one of
         // them now carries its OWN explicit `cwd_policy()` override (a
         // review finding: three of them — `mission.coder`,
         // `deliver.github_review`, `records.gather` — previously carried
         // none at all, silently inheriting the trait default with no row
-        // recording that as a checked audit; `crawl.unit`/`crawl.summary`
+        // recording that as a checked audit; `dispatch.unit`/`dispatch.summary`
         // were absent from this comment's roster entirely). See each
         // kind's own `cwd_policy` doc for its audit.
         //

@@ -718,7 +718,7 @@ pub(crate) enum MissionCmd {
     /// not a launcher of its own — #2310 P4d deleted the bespoke launcher
     /// and its ten Tier-3 `review.*` step kinds. A `plan-<rule>` task
     /// mints one `plan.sites` task per enabled rule; a `unit-<rule>` task
-    /// GROWS one `crawl.unit` dispatch per planned site onto a single
+    /// GROWS one `dispatch.unit` dispatch per planned site onto a single
     /// `reviewer` seat; `summarize` totals the run; `create-mods` waits
     /// (bounded) for a frontier-written mod per finding; `deliver` renders
     /// the GitHub review payload. No operator sign-off gate — its
@@ -745,7 +745,7 @@ pub(crate) enum MissionCmd {
     /// code), propagating a hard failure for anything that fails before an
     /// envelope was ever produced. (#2301) `crawl` has no exit codes of
     /// its own any more: it is an ordinary generic graph
-    /// (`crawl.plan` → grown `crawl.unit` tasks → `crawl.summary`), so it
+    /// (`crawl.plan` → grown `dispatch.unit` tasks → `dispatch.summary`), so it
     /// exits `0` when the graph completes Clean/Degraded and `1` otherwise,
     /// exactly like every other config. The retired launcher's bespoke
     /// `3` (kill file) and its between-units skip loop are gone with it;
@@ -956,8 +956,8 @@ pub(crate) enum MissionConfigCmd {
     ///
     /// (#2301) `crawl` lists like any other config, and its counts are
     /// real: `templates/builtin/mission-configs/crawl.json` declares the
-    /// whole crawl (a `crawl.plan` task per rule, a `crawl.unit` GROW
-    /// template per rule, one `crawl.summary`), and editing it changes what
+    /// whole crawl (a `crawl.plan` task per rule, a `dispatch.unit` GROW
+    /// template per rule, one `dispatch.summary`), and editing it changes what
     /// a crawl launch does. The literal `config_id == "crawl"` routing to
     /// a bespoke launcher is gone. The per-unit tasks a real run executes
     /// are GROWN from each plan's output at the phase boundary (#2300), so

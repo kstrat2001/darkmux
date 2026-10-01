@@ -6,7 +6,7 @@
 //! Tier-3 step kinds that ran it) was DELETED in #2310 P4d: `review` is now
 //! a mission config on the crawl's shared building blocks
 //! (`templates/builtin/mission-configs/review.json` — `plan.sites` +
-//! `crawl.unit` + `records.gather` + `deliver.github_review`), launched by
+//! `dispatch.unit` + `records.gather` + `deliver.github_review`), launched by
 //! the generic launcher with no bespoke launcher of its own.
 //!
 //! What survives here is the DATA: [`ReviewEnvelope`] and the types it

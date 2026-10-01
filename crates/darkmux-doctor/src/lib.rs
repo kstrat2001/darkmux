@@ -6382,9 +6382,9 @@ fn schema_drift_notes(older_major: &[(String, u32)], minor_drift: &[(String, Str
 ///   `records.gather`/`deliver.github_review`/`mods.gate` on top of the
 ///   Tier 1 set), which this document-level check has no way to see. The
 ///   three shipped configs mint a mix: `coder-phase.json` is pure `mission.*`;
-///   `crawl.json` mints `crawl.plan`/`crawl.summary`/`crawl.unit` alongside
+///   `crawl.json` mints `crawl.plan`/`dispatch.summary`/`dispatch.unit` alongside
 ///   Tier 1 `dispatch.internal`; `review.json` mints `plan.sites`,
-///   `crawl.unit`, `crawl.summary`, `mods.gate`, `records.gather`, and
+///   `dispatch.unit`, `dispatch.summary`, `mods.gate`, `records.gather`, and
 ///   `deliver.github_review` alongside Tier 1 `procedural.shell` and
 ///   `dispatch.internal`. So an "unknown kind" hit on the non-Tier-1 ones
 ///   is the EXPECTED steady state, not a sign anything is broken —
@@ -6406,8 +6406,7 @@ fn check_mission_config_registry() -> Check {
         };
     }
 
-    let known_kinds = StepKindRegistry::with_builtins().ids();
-    let known_kind_refs: Vec<&str> = known_kinds.iter().map(String::as_str).collect();
+    let catalog = StepKindRegistry::with_builtins().catalog();
 
     let mut summary_lines: Vec<String> = Vec::new();
     // (#2003) (id, explanation) pairs, so identical explanations can be
@@ -6426,7 +6425,7 @@ fn check_mission_config_registry() -> Check {
     for id in &ids {
         match mission_config::load(id) {
             Ok(loaded) => {
-                let findings = loaded.config.validate(&known_kind_refs);
+                let findings = loaded.config.validate_with(&catalog);
                 let errors: Vec<_> =
                     findings.iter().filter(|f| f.severity == FindingSeverity::Error).collect();
                 // (#3035) A schema NEWER than this binary reads is refused by the

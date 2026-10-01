@@ -384,7 +384,7 @@ impl ConfigRules for PlanSitesConfig {
     }
 }
 
-/// The largest `draws` a `crawl.unit` config may name.
+/// The largest `draws` a `dispatch.unit` config may name.
 ///
 /// A draw is a WHOLE extra dispatch of the same unit: its own container, its
 /// own turn budget, its own tokens. So `draws` multiplies a run's cost
@@ -398,9 +398,9 @@ impl ConfigRules for PlanSitesConfig {
 /// k-draw recall) never measured past a handful of draws.
 pub const MAX_UNIT_DRAWS: usize = 8;
 
-/// `crawl.unit`: dispatch one planned unit.
+/// `dispatch.unit`: dispatch one planned unit.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct CrawlUnitConfig {
+pub struct DispatchUnitConfig {
     /// The plan file the unit is in.
     pub plan: String,
     pub unit: String,
@@ -412,7 +412,7 @@ pub struct CrawlUnitConfig {
     pub draws: Option<Count>,
 }
 
-impl ConfigRules for CrawlUnitConfig {
+impl ConfigRules for DispatchUnitConfig {
     fn check(&self) -> Result<(), RuleViolation> {
         require_text("plan", &self.plan)?;
         require_text("unit", &self.unit)?;
@@ -445,7 +445,7 @@ impl ConfigRules for CrawlUnitConfig {
     }
 }
 
-/// `crawl.summary`, `mission.worktree` and `mission.verify` read no config.
+/// `dispatch.summary`, `mission.worktree` and `mission.verify` read no config.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NoConfig {}
