@@ -851,6 +851,15 @@ jobs:
         run: |
           python3 scripts/flow-action-guard.py --self-test
           python3 scripts/flow-action-guard.py
+      - name: Flow records are read through the one reader (5.0)
+        # `darkmux_flow::reader` upgrades a retired spelling and keeps an
+        # action it does not know as `FlowAction::Other`, so a record a newer
+        # darkmux wrote still reads. Production code that deserializes a
+        # `FlowRecord` itself skips that. The guard self-tests before it scans;
+        # test code and the reader itself are exempt.
+        run: |
+          python3 scripts/flow-reader-guard.py --self-test
+          python3 scripts/flow-reader-guard.py
       # (4.0) No dependency a crate declares and never uses. cargo-machete
       # reads sources, not the build, so it runs on stable in seconds and
       # covers every manifest under the repo: the workspace, runtime/ and
