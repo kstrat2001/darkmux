@@ -939,7 +939,10 @@ fn execution_flags_refuse_a_session_shaped_value() {
             .args(args)
             .assert()
             .code(2)
-            .stderr(predicate::str::contains("is not a role execution id"));
+            .stderr(
+                predicate::str::contains("is not a role execution id")
+                    .and(predicate::str::contains("pass the `exec-...` id that `darkmux dispatch` prints")),
+            );
     }
 }
 

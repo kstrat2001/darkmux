@@ -245,7 +245,7 @@ pub fn run(cmd: FlowCmd) -> Result<()> {
 /// so no verb takes one for the other.
 pub(crate) fn parse_execution_arg(wire: &str) -> std::result::Result<ExecutionId, String> {
     ExecutionId::parse_minted(wire).map_err(|e| {
-        format!("`{wire}` is not a role execution id: {e}; it is the id `darkmux dispatch` prints")
+        format!("`{wire}` is not a role execution id: {e}; pass the `exec-...` id that `darkmux dispatch` prints")
     })
 }
 
