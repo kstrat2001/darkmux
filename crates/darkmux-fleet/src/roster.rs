@@ -174,6 +174,13 @@ pub struct FleetRoster {
     /// ordering across edits (operator diffs cleanly).
     #[serde(default)]
     pub machines: BTreeMap<String, MachineEntry>,
+
+    /// (#3035) Top-level fields this binary does not know (a newer binary's,
+    /// or an operator's note), preserved verbatim on every rewrite, as
+    /// `MachineEntry::extras` does one level down. Without it an older binary
+    /// saving the roster dropped what a newer one added.
+    #[serde(flatten)]
+    pub extras: BTreeMap<String, serde_json::Value>,
 }
 
 impl Default for FleetRoster {
@@ -184,6 +191,7 @@ impl Default for FleetRoster {
         Self {
             version: default_roster_version(),
             machines: BTreeMap::new(),
+            extras: BTreeMap::new(),
         }
     }
 }

@@ -938,6 +938,39 @@ mod tests {
         entry("100.64.0.2", Some("nSTUDIO"))
     }
 
+    /// (#3035) A top-level roster field this binary does not know (a newer
+    /// binary's, or a hand-added note) survives every path that rewrites the
+    /// roster: `machine add`, a first-contact pin, an identity learned from a
+    /// card, and `machine remove`.
+    #[test]
+    #[serial_test::serial]
+    fn an_unknown_top_level_roster_field_survives_every_rewrite_path() {
+        let p = provider();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("fleet.json");
+        std::fs::write(
+            &file,
+            r#"{"version":"2","from_the_future":{"x":1},"machines":{"studio":{"id":"studio","address":"100.64.0.2","added_unix_ms":1}}}"#,
+        )
+        .unwrap();
+        let future = |what: &str| {
+            let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+            assert_eq!(raw["from_the_future"]["x"], 1, "lost across {what}: {raw}");
+        };
+        with_roster_file(&file, || {
+            crate::mutate_roster(|r| crate::add_machine(r, "mini", "100.64.0.3", None, None)).unwrap();
+            future("machine add");
+            let snapshot = entry("100.64.0.2", None);
+            persist_pin(&snapshot, &first_contact(&p)).unwrap();
+            future("a first-contact pin");
+            let target = SettledTarget::new(first_contact(&p));
+            learn_identity(&pinned_entry(), &target, Some("UID-S"), Some("studio")).unwrap();
+            future("an identity learned from a card");
+            crate::mutate_roster(|r| Ok(crate::remove_machine(r, "mini"))).unwrap();
+            future("machine remove");
+        });
+    }
+
     /// (#3028) The pinned peer's card teaches the entry its uid and its
     /// current name; the key the operator wrote is not touched.
     #[test]
