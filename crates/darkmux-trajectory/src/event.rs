@@ -19,6 +19,12 @@ use crate::usage::Usage;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum TrajectoryEvent {
+    /// The first line of a trajectory (#3035): the file's data-shape
+    /// version. Not an execution event: the fold records the version and
+    /// counts nothing for it, so an otherwise empty trajectory still folds
+    /// empty.
+    #[serde(rename = "trajectory.header")]
+    Header(Header),
     #[serde(rename = "dispatch.start")]
     DispatchStart(DispatchStart),
     #[serde(rename = "dispatch.complete")]
@@ -156,7 +162,14 @@ fn parse_tolerant(line: &str) -> Option<TrajectoryEvent> {
     serde_json::from_value(serde_json::Value::Object(kept)).ok()
 }
 
-/// `dispatch.start`: the first event.
+/// `trajectory.header`: the version of the shape the rest of the file is in.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Header {
+    pub schema_version: String,
+}
+
+/// `dispatch.start`: the first execution event.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DispatchStart {
@@ -883,7 +896,8 @@ impl TrajectoryEvent {
             | E::CompactionSkipped(_)
             | E::CompactionUnproductive(_)
             | E::PreSendBound(_)
-            | E::Unknown => None,
+            | E::Header(_)
+                        | E::Unknown => None,
         }
     }
 
@@ -925,7 +939,7 @@ impl TrajectoryEvent {
             E::MalformedToolNames(e) => Some(e.ts),
             E::EscalationTriggered(e) => Some(e.ts),
             E::FeedbackInjected(e) => Some(e.ts),
-            E::Unknown => None,
+            E::Header(_) | E::Unknown => None,
         }
     }
 }

@@ -7011,6 +7011,21 @@ pub fn read_out_dir_text(out_dir: &Path, rel: &str) -> Option<String> {
     read_out_dir_text_with(out_dir, rel, &stderr_warning_sink)
 }
 
+/// (#3035) A trajectory header naming a newer data shape than this binary
+/// reads: the run keeps going (its events are read leniently, and an
+/// unknown one is skipped), but the operator is told the counts may be
+/// partial. `lab inspect` refuses such a file outright.
+fn warn_on_newer_trajectory(file_version: &str) {
+    let version = serde_json::Value::String(file_version.to_string());
+    let known = darkmux_trajectory::TRAJECTORY_SCHEMA_VERSION;
+    if darkmux_types::data_version::is_newer(&version, known) {
+        eprintln!(
+            "darkmux dispatch: ⚠ {}",
+            darkmux_types::data_version::newer_refusal("trajectory", file_version, known)
+        );
+    }
+}
+
 /// A trajectory still in a model-writable out-dir, folded, through
 /// [`read_out_dir_text`] so a planted symlink or FIFO is refused, not
 /// followed. A missing or refused file folds empty. A live dispatch never
@@ -9522,6 +9537,7 @@ impl TailerState {
                 }));
             }
             E::Rest(r) => self.on_rest(r),
+            E::Header(h) => warn_on_newer_trajectory(&h.schema_version),
             // The runtime's own bookends (the host emits the canonical
             // dispatch bookends) and the events with no flow consumer are
             // counted by the fold above and forwarded nowhere.
@@ -10512,7 +10528,8 @@ fn detector_finding(event: &darkmux_trajectory::TrajectoryEvent) -> Option<Telem
         | E::Checkpoint(_)
         | E::ReasoningBoundNotApplied(_)
         | E::FeedbackInjected(_)
-        | E::Unknown => None,
+        | E::Header(_)
+                | E::Unknown => None,
     }
 }
 

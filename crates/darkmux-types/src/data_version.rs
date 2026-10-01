@@ -15,7 +15,9 @@
 //! unknown-key gate (`crate::user_files`, via `UserFileKind::schema_version`);
 //! mission state goes through `darkmux_crew::retired_state::parse_state`;
 //! `lessons.db` through its `user_version` pragma; the lab run manifest, the
-//! trajectory and `resume_origin` through their own loaders.
+//! trajectory (`darkmux_trajectory::TRAJECTORY_SCHEMA_VERSION`, a leaf crate
+//! that cannot depend on this one) and `resume_origin` through their own
+//! loaders.
 //!
 //! Bump discipline, the same for every constant here: additive field or
 //! variant is a minor bump, a rename / retype / removal is major.
@@ -53,10 +55,6 @@ pub const RESUME_ORIGIN_SCHEMA_VERSION: &str = "1.0";
 pub const RUN_MANIFEST_SCHEMA_VERSION: &str = "1.0";
 /// The key the lab run manifest's shared marker lives under.
 pub const RUN_MANIFEST_KEY: &str = "manifest_schema_version";
-/// The runtime trajectory JSONL: the `schema_version` of its first-line
-/// `trajectory.header` event.
-pub const TRAJECTORY_SCHEMA_VERSION: &str = "1.0";
-
 /// The workspace spec (`WorkspaceSpec::schema_version`).
 pub const WORKSPACE_SPEC_SCHEMA_VERSION: &str = "1.0";
 

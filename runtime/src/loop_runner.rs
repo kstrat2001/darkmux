@@ -6813,7 +6813,8 @@ mod tests {
 
         let traj_file = tmp.path().join(".darkmux-runtime").join("trajectory.jsonl");
         let body = std::fs::read_to_string(&traj_file).unwrap();
-        let event: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+        let event: serde_json::Value =
+            serde_json::from_str(body.lines().find(|l| !l.contains("trajectory.header")).unwrap()).unwrap();
         assert_eq!(event["reason"], "thermal-duty-cycle");
         assert_eq!(event["state"], "fair");
         assert_eq!(event["seq"], 7);

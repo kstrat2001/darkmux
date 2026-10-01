@@ -115,6 +115,9 @@ pub struct TrajectoryFold {
     /// Parseable events applied, any type: zero means the trajectory said
     /// nothing at all.
     pub events: u64,
+    /// The `schema_version` of the `trajectory.header` line, when the file
+    /// has one (#3035). `None` is a trajectory written before the marker.
+    pub schema_version: Option<String>,
     pub start: Option<DispatchStart>,
     pub complete: Option<DispatchComplete>,
     /// The latest clock any event carried.
@@ -171,6 +174,10 @@ impl TrajectoryFold {
     /// Take one event into the fold.
     pub fn apply(&mut self, e: &TrajectoryEvent) {
         use TrajectoryEvent as E;
+        if let E::Header(h) = e {
+            self.schema_version.get_or_insert_with(|| h.schema_version.clone());
+            return;
+        }
         self.events = self.events.saturating_add(1);
         if let Some(ts) = e.ts() {
             self.last_ts = Some(self.last_ts.map_or(ts, |t| t.max(ts)));
@@ -264,6 +271,7 @@ impl TrajectoryFold {
             | E::ReasoningBoundNotApplied(_)
             | E::ToolCallDiscarded(_)
             | E::EscalationTriggered(_)
+            | E::Header(_)
             | E::Unknown => {}
         }
     }

@@ -38,6 +38,21 @@ fn every_archive_line_parses_to_its_own_variant() {
     assert!(events.iter().all(|e| !matches!(e, E::Unknown)), "every archive type is known: {events:?}");
 }
 
+/// (#3035) The header names the file's shape; the fold records the version
+/// and counts nothing for it, so a trajectory with only a header is still
+/// the empty one and the wall clock is the events'.
+#[test]
+fn the_header_is_recorded_by_the_fold_and_never_counted() {
+    let header = format!(r#"{{"type":"trajectory.header","schema_version":"{TRAJECTORY_SCHEMA_VERSION}"}}"#);
+    assert!(matches!(parse_line(&header), Some(TrajectoryEvent::Header(h)) if h.schema_version == TRAJECTORY_SCHEMA_VERSION));
+    let only = TrajectoryFold::from_lines(&header);
+    assert_eq!(only.events, 0, "a header-only file said nothing about an execution");
+    assert_eq!(only.schema_version.as_deref(), Some(TRAJECTORY_SCHEMA_VERSION));
+    let both = TrajectoryFold::from_lines(&format!("{header}\n{{\"type\":\"dispatch.start\",\"ts\":5}}\n"));
+    assert_eq!((both.events, both.last_ts), (1, Some(5)));
+    assert_eq!(TrajectoryFold::from_lines(r#"{"type":"dispatch.start","ts":5}"#).schema_version, None, "pre-marker");
+}
+
 #[test]
 fn an_unknown_type_reads_as_unknown_and_a_broken_line_is_skipped() {
     assert_eq!(parse_line(r#"{"type":"from.the.future","x":1}"#), Some(TrajectoryEvent::Unknown));
@@ -63,7 +78,7 @@ fn the_wire_names_are_fixed() {
         "dispatch.intra_turn_stall.recovered", "dispatch.empty_tool_calls.recovered",
         "dispatch.per_turn_cap.salvaged", "dispatch.tool_call.discarded",
         "dispatch.tool.malformed_names", "dispatch.escalation.triggered",
-        "dispatch.feedback.injected",
+        "dispatch.feedback.injected", "trajectory.header",
     ];
     for name in names {
         let e = parse_line(&format!(r#"{{"type":"{name}"}}"#)).unwrap_or_else(|| panic!("{name} does not parse"));
