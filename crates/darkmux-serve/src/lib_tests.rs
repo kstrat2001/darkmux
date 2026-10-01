@@ -4739,6 +4739,23 @@
         }
     }
 
+    /// (F2) The manifest's `escalation` (written by the lab provider) is read
+    /// into the summary: a wrong key or a dropped field would pass a status
+    /// test built on a hand-made summary.
+    #[test]
+    fn scan_lab_runs_reads_the_manifests_escalation() {
+        for (manifest, want) in [
+            (r#"{"session_id":"s","ok":false,"escalation":"escalation_compaction_reread_loop"}"#, Some("escalation_compaction_reread_loop")),
+            (r#"{"session_id":"s","ok":false}"#, None),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            write_lab_run_with_lifecycle_session_id(&tmp.path().join("run1"), "run1", None, Some(manifest));
+            let runs = scan_lab_runs(tmp.path());
+            assert_eq!(runs.len(), 1, "{runs:?}");
+            assert_eq!(runs[0].escalation.as_deref(), want, "manifest {manifest}");
+        }
+    }
+
     /// (#2494) A run that dispatched fine but failed its tests is only
     /// visible if the scan carries `verify.passed` and the workload beside
     /// `ok`. Three states: passed, failed, not checked (`verify: null` or

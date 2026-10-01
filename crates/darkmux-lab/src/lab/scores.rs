@@ -492,6 +492,13 @@ fn parse_envelope(stdout: &str) -> Option<serde_json::Value> {
         .filter(serde_json::Value::is_object)
 }
 
+/// The envelope's own terminal `result` string, when an envelope was
+/// recovered. The one place a lab surface reads it (see
+/// `lab::dispatch_end::DispatchEnd`).
+pub(crate) fn envelope_result(stdout: &str) -> Option<String> {
+    parse_envelope(stdout)?.get("result")?.as_str().map(str::to_string)
+}
+
 /// Parse the dispatch envelope (the last stdout line starting with `{` —
 /// tolerant of pull-progress noise ahead of it, unlike `extract_reply_text`
 /// which parses the whole stdout as one JSON value) for `metrics.model` +

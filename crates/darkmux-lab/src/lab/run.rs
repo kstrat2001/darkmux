@@ -53,6 +53,10 @@ pub struct RunOutcome {
     /// or not its dispatch succeeded. An errored run is a failed run: `ok`
     /// is false.
     pub provider_error: Option<String>,
+    /// (F2) The runtime's `escalation_*` result when the dispatch stopped on
+    /// purpose and handed the work to a higher tier. `ok` is false then, but
+    /// the run did not error: the lab summary counts it in its own bucket.
+    pub escalation: Option<String>,
 }
 
 impl RunOutcome {
@@ -79,8 +83,13 @@ impl RunOutcome {
 /// errored run is counted as errored, never as complete.
 pub fn batch_summary(outcomes: &[RunOutcome]) -> String {
     let completed = outcomes.iter().filter(|o| o.completed()).count();
+    // (F2) An escalation completed its run (the provider returned) and did
+    // not error; it gets its own clause, only when there is one, so the line
+    // never says "0 errored" over a run that printed an error.
+    let escalated = outcomes.iter().filter(|o| o.escalation.is_some()).count();
+    let escalated = if escalated > 0 { format!(", {escalated} escalated") } else { String::new() };
     format!(
-        "{} run(s): {completed} completed, {} errored",
+        "{} run(s): {completed} completed, {} errored{escalated}",
         outcomes.len(),
         outcomes.len() - completed
     )
@@ -236,6 +245,7 @@ impl OneRun<'_> {
             duration_ms: result.duration_ms,
             notes,
             provider_error: None,
+            escalation: result.escalation.clone(),
         })
     }
 
@@ -262,7 +272,7 @@ impl OneRun<'_> {
             run_dir,
             source,
             sandbox,
-            result.ok,
+            result.end(),
             coverage_min_pct,
         );
         if let Some(w) = settle_verify(result.verify.as_mut(), gate) {
@@ -354,6 +364,7 @@ fn errored_outcome(
         verify_passed: None,
         duration_ms: elapsed.as_millis(),
         provider_error: Some(error),
+        escalation: None,
     }
 }
 
@@ -449,10 +460,10 @@ fn run_notes(provider_id: &str, result: &crate::workloads::types::RunResult) -> 
     let mut notes = vec![
         format!("provider={provider_id}"),
         format!("wall={}s", result.duration_ms / 1000),
-        if result.ok {
-            "ok".to_string()
-        } else {
-            format!("error: {}", result.error.as_deref().unwrap_or("unknown"))
+        match (&result.escalation, result.ok) {
+            (Some(reason), _) => format!("escalated: {reason}"),
+            (None, true) => "ok".to_string(),
+            (None, false) => format!("error: {}", result.error.as_deref().unwrap_or("unknown")),
         },
     ];
     if let Some(v) = &result.verify {
@@ -1864,6 +1875,7 @@ mod tests {
                 // report, THEN would dispatch. No real dispatch here.
                 on_session_id(&darkmux_types::session_id::SessionId::adhoc(run.clone(), "stub", "darkmux-stub-2511-session-join-test"));
                 Ok(RunResult {
+                    escalation: None,
                     ok: true,
                     duration_ms: 1,
                     payload_text: Some("stub".into()),
@@ -1993,6 +2005,7 @@ mod tests {
                     cvar.wait_timeout_while(released, Duration::from_secs(5), |r| !*r).unwrap();
                 assert!(!timeout.timed_out(), "test thread never released the ordering gate");
                 Ok(RunResult {
+                    escalation: None,
                     ok: true,
                     duration_ms: 1,
                     payload_text: Some("stub".into()),

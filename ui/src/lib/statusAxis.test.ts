@@ -28,6 +28,7 @@ const ALL_STATUSES: RunStatus[] = [
   "running",
   "complete",
   "error",
+  "escalated",
   "abandoned",
   "unparseable",
 ];

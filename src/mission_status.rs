@@ -528,6 +528,7 @@ fn peer_status_word(status: RunStatus, reason: Option<AbandonReason>) -> &'stati
         // No terminal record and not currently live — silent, not a verdict.
         (RunStatus::Abandoned, _) => "silent (no terminal record seen)",
         (RunStatus::Error, _) => "error",
+        (RunStatus::Escalated, _) => "escalated",
         (RunStatus::Planned, _) => "planned",
         (RunStatus::Unparseable, _) => "unparseable",
     }

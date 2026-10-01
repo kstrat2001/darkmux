@@ -5,6 +5,7 @@
 //! Run: dispatch via the active runtime, capture trajectory + reply.
 //! Inspect: parse trajectory, identify compactions, classify mode.
 
+use crate::lab::dispatch_end::DispatchEnd;
 use crate::providers::prompt::{extract_reply_text, run_verify, verify_note};
 use darkmux_types::Profile;
 use crate::workloads::types::{
@@ -282,7 +283,7 @@ impl WorkloadProvider for CodingTaskProvider {
         let mut preserve = TrajectoryPreserver::new(out_dir.clone(), run_dir.to_path_buf());
         // Pass sandbox_dir as --workdir so the runtime mounts it at
         // /workspace, matching the placeholder substitution above (#337 fix).
-        let (stdout, stderr, ok, dispatch_out_dir) = dispatch_via_internal(
+        let (stdout, stderr, end, dispatch_out_dir) = dispatch_via_internal(
             &role,
             &prompt,
             &session_id,
@@ -294,6 +295,7 @@ impl WorkloadProvider for CodingTaskProvider {
             out_dir,
         )?;
         let duration_ms = started.elapsed().as_millis();
+        let ok = end.ok();
 
         fs::write(run_dir.join("qa-reply.json"), &stdout)?;
         if !stderr.is_empty() {
@@ -430,11 +432,14 @@ impl WorkloadProvider for CodingTaskProvider {
             // from pass and fail: the workload declared no verify command,
             // so nothing was checked.
             // v6 is minted by the work gate (`verify_gate`), never here.
+            // v8 (F2) may carry `escalation`: the runtime's `escalation_*`
+            // result when the dispatch stopped on purpose. It is absent
+            // otherwise, so a manifest without it never escalated.
             // v7 (4.0) is written here: the run directory carries no
             // `metrics.json`; every count is in `trajectory.jsonl`, read
             // through `lab::inspect::run_trajectory`. The enrichers only ever
             // RAISE the version, so a v7 run stays v7.
-            "schema_version": 7,
+            "schema_version": 8,
             "run_id": run_id,
             "workload": loaded.manifest.workload.id,
             "provider": self.id(),
@@ -465,6 +470,7 @@ impl WorkloadProvider for CodingTaskProvider {
             "final_hash": final_hash,
         });
         let mut manifest_json = manifest_json;
+        end.record_in(&mut manifest_json);
         record_refused_artifacts(&mut manifest_json, &refused_artifacts);
         fs::write(
             run_dir.join("manifest.json"),
@@ -472,6 +478,7 @@ impl WorkloadProvider for CodingTaskProvider {
         )?;
 
         Ok(RunResult {
+            escalation: end.escalation().map(str::to_string),
             ok,
             duration_ms,
             payload_text: Some(extract_reply_text(&stdout)),
@@ -536,6 +543,7 @@ impl WorkloadProvider for CodingTaskProvider {
             ),
         );
         notes.push(verify_note(keyword_verify.as_ref()));
+        notes.extend(DispatchEnd::inspect_note(&meta));
 
         let run_id = meta
             .get("run_id")
@@ -765,7 +773,7 @@ fn dispatch_via_internal(
     image: Option<&str>,
     config_path: Option<&str>,
     host_out: PathBuf,
-) -> Result<(String, String, bool, Option<PathBuf>)> {
+) -> Result<(String, String, DispatchEnd, Option<PathBuf>)> {
     use darkmux_crew::dispatch::{dispatch, DispatchOpts};
     let opts = DispatchOpts {
         // (#2914) The lab benchmarks candidate utility models.
@@ -814,12 +822,8 @@ fn dispatch_via_internal(
     // `.darkmux-runtime/` bookkeeping (trajectory, findings). Threaded
     // back to the copy-into-run_dir site. `None` pre-image-rebuild ⇒
     // caller falls back to the legacy sandbox_dir location.
-    Ok((
-        result.stdout,
-        result.stderr,
-        result.exit_code == 0,
-        result.out_dir,
-    ))
+    let end = DispatchEnd::from_dispatch(result.exit_code, &result.stdout);
+    Ok((result.stdout, result.stderr, end, result.out_dir))
 }
 
 /// The out dir a lab dispatch is given, named in the shape a dispatch names

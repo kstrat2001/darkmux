@@ -428,3 +428,21 @@ fn an_unterminated_trajectory_is_closed_as_interrupted_once() {
     assert!(!close_if_unterminated(&ended).unwrap(), "the runtime's own terminal record stands");
     assert_eq!(TrajectoryFold::from_path(&ended).complete.unwrap().result, "stop");
 }
+
+/// (F2) One typed parse of a terminal `result`: every runtime escalation
+/// reason reads as `Escalated`, never as an error.
+#[test]
+fn terminal_result_types_every_runtime_result_and_every_escalation_reason() {
+    assert_eq!(TerminalResult::parse("stop"), TerminalResult::Stop);
+    assert_eq!(TerminalResult::parse("max_turns"), TerminalResult::MaxTurns);
+    assert_eq!(TerminalResult::parse(RESULT_INTERRUPTED), TerminalResult::Interrupted);
+    assert_eq!(TerminalResult::parse("error"), TerminalResult::Error);
+    for reason in [
+        "escalation_compaction_limit_reached",
+        "escalation_compaction_unproductive",
+        "escalation_compaction_reread_loop",
+    ] {
+        assert_eq!(TerminalResult::parse(reason), TerminalResult::Escalated, "{reason}");
+    }
+    assert_eq!(TerminalResult::parse("something_new"), TerminalResult::Other);
+}

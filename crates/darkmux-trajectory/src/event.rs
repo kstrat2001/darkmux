@@ -171,6 +171,38 @@ pub struct DispatchStart {
 /// after the execution died). Never a reason the loop chose.
 pub const RESULT_INTERRUPTED: &str = "interrupted";
 
+/// The prefix every runtime escalation reason carries (`escalation_*`).
+const ESCALATION_PREFIX: &str = "escalation";
+
+/// A `dispatch.complete` / envelope `result`, typed (F2). The one parse of
+/// that string, so no surface compares `result` text itself and a deliberate
+/// escalation can never be read as an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalResult {
+    Stop,
+    MaxTurns,
+    /// The runtime stopped on purpose, at an operator-configured bound or a
+    /// detected loop, and handed the work to a higher tier. Not a failure.
+    Escalated,
+    Interrupted,
+    Error,
+    /// A result this reader does not know (a newer runtime).
+    Other,
+}
+
+impl TerminalResult {
+    pub fn parse(result: &str) -> Self {
+        match result {
+            "stop" => Self::Stop,
+            "max_turns" => Self::MaxTurns,
+            RESULT_INTERRUPTED => Self::Interrupted,
+            "error" => Self::Error,
+            r if r.starts_with(ESCALATION_PREFIX) => Self::Escalated,
+            _ => Self::Other,
+        }
+    }
+}
+
 /// `dispatch.complete`: the last event, written on every exit the runtime
 /// reaches. A SIGTERM or SIGINT writes it with `result: "interrupted"`
 /// ([`RESULT_INTERRUPTED`]); SIGKILL is uncatchable and writes none.

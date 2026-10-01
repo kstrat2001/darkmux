@@ -276,6 +276,7 @@ mod tests {
             duration_ms: (secs as u128) * 1000,
             notes: vec![],
             provider_error: None,
+            escalation: None,
         }
     }
 

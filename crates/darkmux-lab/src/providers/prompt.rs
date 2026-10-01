@@ -4,6 +4,7 @@
 //! Dispatches via darkmux's in-house internal runtime.
 
 use darkmux_types::Profile;
+use crate::lab::dispatch_end::DispatchEnd;
 use crate::workloads::types::{
     InspectionReport, LoadedWorkload, RunResult, VerifyOutcome, WorkloadProvider,
 };
@@ -59,7 +60,7 @@ impl WorkloadProvider for PromptProvider {
         on_session_id(&session_id);
 
         let started = std::time::Instant::now();
-        let (stdout, stderr, ok) = dispatch_via_internal(
+        let (stdout, stderr, end) = dispatch_via_internal(
             &role,
             &prompt,
             &session_id,
@@ -68,6 +69,7 @@ impl WorkloadProvider for PromptProvider {
             profile_name,
         )?;
         let duration_ms = started.elapsed().as_millis();
+        let ok = end.ok();
 
         fs::write(run_dir.join("qa-reply.json"), &stdout)?;
         if !stderr.is_empty() {
@@ -82,14 +84,15 @@ impl WorkloadProvider for PromptProvider {
             .and_then(|n| n.to_str())
             .unwrap_or("")
             .to_string();
-        let manifest_json = serde_json::json!({
+        let mut manifest_json = serde_json::json!({
             // v2 added: run_id, profile (now the profile NAME), profile_description.
             // v1 had: session_id, profile (was the description text), workload, provider, duration_ms, ok.
             // v5 added: verify, the same field and version as the coding-task
             // manifest (#2494). `null` is "not checked": the workload declares
             // no verify. `darkmux run list` and `/runs` read `verify.passed`
             // from here to show a failed verify beside a good dispatch.
-            "schema_version": 5,
+            // v6 (F2) may carry `escalation`, as in the coding-task manifest.
+            "schema_version": 6,
             "run_id": run_id,
             "workload": loaded.manifest.workload.id,
             "provider": self.id(),
@@ -103,12 +106,14 @@ impl WorkloadProvider for PromptProvider {
                 "details": v.details,
             })),
         });
+        end.record_in(&mut manifest_json);
         fs::write(
             run_dir.join("manifest.json"),
             serde_json::to_string_pretty(&manifest_json)?,
         )?;
 
         Ok(RunResult {
+            escalation: end.escalation().map(str::to_string),
             ok,
             duration_ms,
             payload_text: Some(reply),
@@ -165,7 +170,10 @@ impl WorkloadProvider for PromptProvider {
                 passed: v.passed,
                 details: v.details.clone(),
             }),
-            notes: vec![format!("provider={}", self.id()), verify_note(verify_outcome.as_ref())],
+            notes: [format!("provider={}", self.id()), verify_note(verify_outcome.as_ref())]
+                .into_iter()
+                .chain(DispatchEnd::inspect_note(&meta))
+                .collect(),
         })
     }
 }
@@ -181,7 +189,7 @@ fn dispatch_via_internal(
     image: Option<&str>,
     config_path: Option<&str>,
     profile_name: &str,
-) -> Result<(String, String, bool)> {
+) -> Result<(String, String, DispatchEnd)> {
     use darkmux_crew::dispatch::{dispatch, DispatchOpts};
     let opts = DispatchOpts {
         // (#2914) The lab benchmarks candidate utility models.
@@ -230,7 +238,8 @@ fn dispatch_via_internal(
         system_prompt_override: None,
     };
     let result = dispatch(opts).context("internal-runtime dispatch via lab harness")?;
-    Ok((result.stdout, result.stderr, result.exit_code == 0))
+    let end = DispatchEnd::from_dispatch(result.exit_code, &result.stdout);
+    Ok((result.stdout, result.stderr, end))
 }
 
 fn resolve_prompt(loaded: &LoadedWorkload) -> Result<String> {

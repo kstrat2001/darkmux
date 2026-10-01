@@ -92,6 +92,11 @@ pub enum RunStatus {
     Running,
     Complete,
     Error,
+    /// (F2) The run's dispatch stopped on purpose and handed the work to a
+    /// higher tier (a lab run's manifest names the runtime's `escalation_*`
+    /// reason). Not a success and not an error: the work is unfinished by
+    /// design, and a reader acts on it differently from a failure.
+    Escalated,
     Abandoned,
     /// (#1881) This binary could not determine the run's real outcome —
     /// either its `envelope.json` failed to deserialize at all (a newer
@@ -1768,18 +1773,15 @@ fn lab_run_status(summary: &LabRunSummary, now_ms: u64, session_live: Option<boo
         // dispatch did; `run_ok` (the manifest's `ok`) is that. A run whose
         // dispatch errored was listed complete while its own detail view
         // said errored. Every other run kind already reports its outcome.
-        Some(Lc::Complete) => {
-            let failed = summary.degenerate || summary.run_ok == Some(false);
-            return if failed { RunStatus::Error } else { RunStatus::Complete };
-        }
+        Some(Lc::Complete) => return settled_lab_status(summary),
         Some(Lc::Error) => return RunStatus::Error,
         Some(Lc::Interrupted) => return RunStatus::Abandoned,
         // (#2860) No lifecycle verdict (a run from before the record existed):
         // a manifest is written only when the run ends, so its `ok` is a
         // terminal record too, and outranks the staleness guess below.
         None => {
-            if let Some(ok) = summary.run_ok {
-                return if !ok || summary.degenerate { RunStatus::Error } else { RunStatus::Complete };
+            if summary.run_ok.is_some() {
+                return settled_lab_status(summary);
             }
         }
         _ => {}
@@ -1821,6 +1823,20 @@ fn lab_run_status(summary: &LabRunSummary, now_ms: u64, session_live: Option<boo
         return RunStatus::Abandoned;
     }
     RunStatus::Running
+}
+
+/// (#2860, F2) The status of a lab run that ENDED and wrote a manifest: an
+/// escalation first (the runtime exits non-zero after one, so `ok: false`
+/// would otherwise read as an error), then the dispatch result, then the
+/// degenerate flag.
+fn settled_lab_status(summary: &LabRunSummary) -> RunStatus {
+    if summary.escalation.is_some() {
+        RunStatus::Escalated
+    } else if summary.degenerate || summary.run_ok == Some(false) {
+        RunStatus::Error
+    } else {
+        RunStatus::Complete
+    }
 }
 
 /// (#1621) How long a lab run's newest artifact may age before the run stops
@@ -3869,6 +3885,7 @@ mod tests {
             has_events: true,
             session_id: None,
             run_ok: None,
+            escalation: None,
             workload: None,
             verify_passed: None,
         }
@@ -3892,6 +3909,27 @@ mod tests {
         assert_eq!(lab_run_status(&with_ok(Some(true)), now, None), RunStatus::Complete);
         // No manifest (a provider that writes none) is not evidence of failure.
         assert_eq!(lab_run_status(&with_ok(None), now, None), RunStatus::Complete);
+    }
+
+    /// (F2, 5.0 dogfood) A run whose dispatch escalated on purpose (the
+    /// manifest's `ok` is false, since the runtime exits non-zero) is its own
+    /// status: it is neither a pass nor a transport error, and `run list` and
+    /// the runs board must say so. It outranks the `ok: false` reading
+    /// whichever way the lifecycle record ended.
+    #[test]
+    fn a_lab_run_that_escalated_reads_escalated_never_error() {
+        use darkmux_lab::lab::lifecycle::LifecycleStatus as Lc;
+        let now = 1_700_000_000_000u64;
+        let escalated = |lc: Option<Lc>| LabRunSummary {
+            run_ok: Some(false),
+            escalation: Some("escalation_compaction_reread_loop".into()),
+            ..lab_summary_with_lifecycle("d", false, false, lc)
+        };
+        assert_eq!(lab_run_status(&escalated(Some(Lc::Complete)), now, None), RunStatus::Escalated);
+        // A run from before the lifecycle record existed still reads from its manifest.
+        assert_eq!(lab_run_status(&escalated(None), now, None), RunStatus::Escalated);
+        // A harness error is still an error: only a COMPLETED harness can escalate.
+        assert_eq!(lab_run_status(&escalated(Some(Lc::Error)), now, None), RunStatus::Error);
     }
 
     /// (#2494) The verify outcome rides the row and NEVER changes `status`:
@@ -7531,6 +7569,10 @@ mod tests {
             (RunKind::Lab, RunStatus::Error) => true,
             (RunKind::Lab, RunStatus::Abandoned) => true,
             (RunKind::Lab, RunStatus::Unparseable) => false,
+            // (F2) A lab run's manifest names its escalation; no mission
+            // envelope or flow terminal carries one today.
+            (RunKind::Lab, RunStatus::Escalated) => true,
+            (RunKind::Mission | RunKind::Dispatch, RunStatus::Escalated) => false,
         }
     }
 
@@ -7549,26 +7591,28 @@ mod tests {
             (RunKind::Dispatch, RunStatus::Complete) => true,
             (RunKind::Dispatch, RunStatus::Error) => true,
             (RunKind::Dispatch, RunStatus::Abandoned) => true,
-            (RunKind::Dispatch, RunStatus::Planned | RunStatus::Unparseable) => false,
+            (RunKind::Dispatch, RunStatus::Planned | RunStatus::Unparseable | RunStatus::Escalated) => false,
             // `flow_mission_to_run`: a peer's mission, judged only by its
             // own terminal record and its sessions' liveness. It has no
             // envelope to read here, so no Error and no Unparseable.
             (RunKind::Mission, RunStatus::Running) => true,
             (RunKind::Mission, RunStatus::Complete) => true,
             (RunKind::Mission, RunStatus::Abandoned) => true,
-            (RunKind::Mission, RunStatus::Planned | RunStatus::Error | RunStatus::Unparseable) => {
-                false
-            }
+            (
+                RunKind::Mission,
+                RunStatus::Planned | RunStatus::Error | RunStatus::Unparseable | RunStatus::Escalated,
+            ) => false,
             (RunKind::Lab, _) => false,
         }
     }
 
     const ALL_KINDS: [RunKind; 3] = [RunKind::Mission, RunKind::Dispatch, RunKind::Lab];
-    const ALL_STATUSES: [RunStatus; 6] = [
+    const ALL_STATUSES: [RunStatus; 7] = [
         RunStatus::Planned,
         RunStatus::Running,
         RunStatus::Complete,
         RunStatus::Error,
+        RunStatus::Escalated,
         RunStatus::Abandoned,
         RunStatus::Unparseable,
     ];
@@ -7590,7 +7634,7 @@ mod tests {
             .flat_map(|k| ALL_STATUSES.iter().map(move |s| (*k, *s)))
             .filter(|(k, s)| untracked_cell_is_reachable(*k, *s))
             .count();
-        assert_eq!(tracked, 16, "tracked cells: mission 6 + dispatch 6 + lab 4");
+        assert_eq!(tracked, 17, "tracked cells: mission 6 + dispatch 6 + lab 5");
         assert_eq!(untracked, 7, "untracked cells: ghost dispatch 4 + peer mission 3");
     }
 

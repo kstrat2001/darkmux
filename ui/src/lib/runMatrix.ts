@@ -23,10 +23,11 @@ import type { Run } from "../types/generated/Run";
  * (`crates/darkmux-serve/src/runs.rs`):
  *
  * - `mission_run_status` — missions, and dispatches, which are a SHAPE of
- *   mission (`classify_mission`) and therefore share its mapper. All six.
+ *   mission (`classify_mission`) and therefore share its mapper. All but `escalated`.
  * - `lab_run_status` — lab runs. No `planned` (a lab run exists because it
  *   was dispatched) and no `unparseable` (that verdict comes from a mission
- *   envelope a lab run does not have).
+ *   envelope a lab run does not have). The only mapper that reaches
+ *   `escalated`: a lab manifest names the runtime's escalation reason.
  * - `ghost_runs` — untracked, flow-only sessions. Only what the flow stream
  *   alone can prove.
  *
@@ -39,6 +40,7 @@ export const REACHABLE: Record<RunKind, Record<RunStatus, boolean>> = {
     running: true,
     complete: true,
     error: true,
+    escalated: false,
     abandoned: true,
     unparseable: true,
   },
@@ -47,6 +49,7 @@ export const REACHABLE: Record<RunKind, Record<RunStatus, boolean>> = {
     running: true,
     complete: true,
     error: true,
+    escalated: false,
     abandoned: true,
     unparseable: true,
   },
@@ -55,6 +58,7 @@ export const REACHABLE: Record<RunKind, Record<RunStatus, boolean>> = {
     running: true,
     complete: true,
     error: true,
+    escalated: true,
     abandoned: true,
     unparseable: false,
   },
@@ -88,6 +92,7 @@ export const REACHABLE_UNTRACKED: Record<RunKind, Record<RunStatus, boolean>> = 
     running: true,
     complete: true,
     error: false,
+    escalated: false,
     abandoned: true,
     unparseable: false,
   },
@@ -96,6 +101,7 @@ export const REACHABLE_UNTRACKED: Record<RunKind, Record<RunStatus, boolean>> = 
     running: true,
     complete: true,
     error: true,
+    escalated: false,
     abandoned: true,
     unparseable: false,
   },
@@ -104,6 +110,7 @@ export const REACHABLE_UNTRACKED: Record<RunKind, Record<RunStatus, boolean>> = 
     running: false,
     complete: false,
     error: false,
+    escalated: false,
     abandoned: false,
     unparseable: false,
   },

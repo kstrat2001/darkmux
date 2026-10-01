@@ -241,6 +241,7 @@ pub(crate) fn status_label(status: RunStatus) -> &'static str {
         RunStatus::Running => "running",
         RunStatus::Complete => "complete",
         RunStatus::Error => "error",
+        RunStatus::Escalated => "escalated",
         RunStatus::Abandoned => "abandoned",
         RunStatus::Unparseable => "unparseable",
     }
@@ -1294,6 +1295,7 @@ mod tests {
             RunStatus::Running,
             RunStatus::Complete,
             RunStatus::Error,
+            RunStatus::Escalated,
             RunStatus::Abandoned,
             RunStatus::Unparseable,
         ] {

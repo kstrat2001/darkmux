@@ -88,6 +88,7 @@ impl WorkloadProvider for ScriptedProvider {
             fs::write(run_dir.join("manifest.json"), m.to_string())?;
         }
         Ok(RunResult {
+            escalation: None,
             ok: s.ok,
             duration_ms: 2_000,
             payload_text: None,
@@ -343,6 +344,7 @@ fn the_exit_gate_fails_on_a_failed_dispatch_or_a_failed_verify_only() {
         duration_ms: 0,
         notes: vec![],
         provider_error: None,
+        escalation: None,
     };
     assert_eq!(exit_code(&[]), 0);
     assert_eq!(exit_code(&[o(true, None)]), 0);
@@ -609,6 +611,7 @@ fn settle_verify_takes_the_gates_verdict_and_fails_closed_on_error() {
 #[test]
 fn run_notes_name_an_unexplained_failure() {
     let r = RunResult {
+        escalation: None,
         ok: false,
         duration_ms: 61_999,
         payload_text: None,
@@ -661,6 +664,41 @@ fn inspect_shows_an_errored_runs_recorded_error() {
     assert!(crate::lab::inspect::lab_inspect("wx-bare").is_err());
 }
 
+/// (F2, 5.0 dogfood) An escalated run read "1 completed, 0 errored" over a
+/// line that said `error: runtime exit: ...`. It is counted in its own bucket,
+/// and the per-run line names the escalation, never an error.
+#[test]
+fn an_escalated_run_is_counted_and_labeled_as_an_escalation_not_an_error() {
+    let outcome = |escalation: Option<&str>| RunOutcome {
+        run_id: "r".into(),
+        run_dir: std::path::PathBuf::new(),
+        ok: escalation.is_none(),
+        verify_passed: None,
+        duration_ms: 0,
+        notes: vec![],
+        provider_error: None,
+        escalation: escalation.map(str::to_string),
+    };
+    assert_eq!(
+        batch_summary(&[outcome(Some("escalation_compaction_reread_loop"))]),
+        "1 run(s): 1 completed, 0 errored, 1 escalated"
+    );
+    let r = RunResult {
+        escalation: Some("escalation_compaction_reread_loop".into()),
+        ok: false,
+        duration_ms: 232_000,
+        payload_text: None,
+        trajectory_path: None,
+        verify: None,
+        error: Some("runtime exit: dispatching to model".into()),
+    };
+    let notes = run_notes("p", &r);
+    assert_eq!(notes[2], "escalated: escalation_compaction_reread_loop");
+    assert!(!notes.iter().any(|n| n.contains("error")), "{notes:?}");
+    // An escalation did not finish its work, so the exit gate still fails it.
+    assert_eq!(exit_code(&[outcome(Some("escalation_compaction_reread_loop"))]), 1);
+}
+
 /// (review of #2986) The `lab run` summary never calls an errored run
 /// complete: it counts the batch, the runs that completed, and those that
 /// errored.
@@ -674,6 +712,7 @@ fn the_batch_summary_counts_completed_and_errored_runs() {
         duration_ms: 0,
         notes: vec![],
         provider_error: provider_error.map(str::to_string),
+        escalation: None,
     };
     assert_eq!(batch_summary(&[o(None), o(Some("boom")), o(None)]), "3 run(s): 2 completed, 1 errored");
     assert_eq!(batch_summary(&[o(None)]), "1 run(s): 1 completed, 0 errored");

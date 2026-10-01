@@ -1278,6 +1278,7 @@ impl WorkloadProvider for ToolBenchProvider {
         let infra = trial_refs.iter().filter(|t| t.score.infra_fail).count();
         let passes = trial_refs.iter().filter(|t| t.score.passed).count();
         Ok(RunResult {
+            escalation: None,
             ok: true,
             duration_ms,
             payload_text: Some(summary),

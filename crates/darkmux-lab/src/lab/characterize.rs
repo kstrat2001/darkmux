@@ -156,6 +156,7 @@ mod tests {
             duration_ms: secs * 1000,
             notes: vec!["provider=stub".into()],
             provider_error: None,
+            escalation: None,
         }
     }
 
