@@ -968,7 +968,10 @@ pub(crate) mod tests {
     pub(crate) fn sample_card() -> MachineCard {
         MachineCard {
             card_schema_version: CARD_SCHEMA_VERSION.to_string(),
-            work_job_schema_version: darkmux_fleet::WORK_JOB_SCHEMA_VERSION.to_string(),
+            // A hand-built value, not the live constant: the card's committed
+            // fixtures are of the card's shape, which a work-wire minor bump
+            // (8.1, #3028) does not change, and they are never regenerated.
+            work_job_schema_version: "8.0".to_string(),
             specs: MachineSpecsResponse {
                 darkmux_version: "5.0.0".into(),
                 flow_schema_version: "2.0.0".into(),
