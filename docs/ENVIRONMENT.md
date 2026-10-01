@@ -199,7 +199,7 @@ A rejected citation (a wrong line number, an unresolvable path, a budget already
 | `DARKMUX_FINDINGS_DIR` | `dirs.findings` |
 | `DARKMUX_MODS_DIR` | `dirs.mods` |
 | `DARKMUX_AUDIT_DIR` | `audit.dir` (gated by `audit.enabled`) |
-| `DARKMUX_LAB_DIR` / `DARKMUX_TEMPLATES_DIR` / `DARKMUX_ACK_DIR` / `DARKMUX_IDENTITY_PATH` | `dirs.lab` / `dirs.templates` / `dirs.ack` / `dirs.identity` |
+| `DARKMUX_LAB_DIR` / `DARKMUX_TEMPLATES_DIR` / `DARKMUX_IDENTITY_PATH` | `dirs.lab` / `dirs.templates` / `dirs.identity` |
 | `DARKMUX_REDIS_URL` (verbatim, password inline) | `redis.{enabled,host,port,db}` + Keychain password (assembled) |
 | `DARKMUX_REDIS_STREAM` / `DARKMUX_REDIS_MAXLEN` | `redis.stream` / `redis.maxlen` |
 | `DARKMUX_INACTIVITY_TIMEOUT_SECONDS` | `runtime.inactivity_timeout_seconds` |
@@ -245,9 +245,7 @@ A rejected citation (a wrong line number, an unresolvable path, a budget already
 | `DARKMUX_EXPECT_IOREPORT` (#2108 — test-only; gates the live `host_probe` tests' strict "IOReport resolved" assertions) | — (not read by any runtime code path; test-only) |
 | `DARKMUX_EXPECT_TIGHT_HOST_BUDGET` (#2631 — test-only; gates which ceiling the live `host_probe` cost-budget assertion enforces) | — (not read by any runtime code path; test-only) |
 
-(Historical: `DARKMUX_NOTEBOOK_DIR` and `dirs.notebook` were removed in 4.0 along with the `lab notebook` verbs (#2913); the bundled `darkmux-lab-notebook` skill writes entries wherever your own instructions say, so no darkmux setting names the location any more. `darkmux doctor` warns if either is still set and names the change to make.)
-
-(Historical: `DARKMUX_ACK_DIR` and `dirs.ack` were removed in 5.0 (#3036) along with the licensed-adjacent acknowledgment gate and the roles it guarded. `darkmux doctor` warns if either is still set and names the change to make.)
+(Historical: `DARKMUX_NOTEBOOK_DIR` and `dirs.notebook` were removed in 4.0 along with the `lab notebook` verbs (#2913); the bundled `darkmux-lab-notebook` skill writes entries wherever your own instructions say, so no darkmux setting names the location any more. `DARKMUX_ACK_DIR` and `dirs.ack` were removed in 5.0 (#3036) along with the licensed-adjacent acknowledgment gate and the roles it guarded. A leftover env var of either only warns. A leftover `dirs.notebook` or `dirs.ack` key in `config.json` is refused at preflight by dispatch, mission launch, lab run, fleet work submission and serve until you remove it, and `darkmux doctor` fails it, naming the key and the fix.)
 
 ### Endpoint budgets (`profiles.json`, not env) (#2902 step 5)
 

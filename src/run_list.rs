@@ -369,7 +369,7 @@ fn ellipsize(s: &str, max: usize) -> String {
 }
 
 /// Strip the `darkmux:` residency namespace off a model id for display —
-/// the Rust twin of `ui/src/lenses/lab/labSeries.ts::shortModel`, which
+/// the Rust twin of `ui/src/lib/format.ts::shortModel`, which
 /// `runSubtitle` applies before pushing the model.
 ///
 /// Not cosmetic. The namespace convention states the prefix is "invisible

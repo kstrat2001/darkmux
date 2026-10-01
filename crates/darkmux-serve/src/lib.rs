@@ -2688,7 +2688,7 @@ async fn lab_run_detail_handler(
             .collect();
         let scores = darkmux_lab::lab::scores::read_scores(&run_dir.join("scores.json"))
             .ok()
-            .map(|doc| wire::LabScoresSummary::from(&doc));
+            .map(|_doc| wire::LabScoresSummary {});
         (reviews, scores)
     })
     .await

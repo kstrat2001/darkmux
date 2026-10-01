@@ -759,8 +759,10 @@ darkmux release.
   `voice-editing`). A dispatch to one of those ids fails with the ordinary
   `role not found` error. The licensed-adjacent acknowledgment gate (the
   `ACKNOWLEDGE` prompt and `<role>.ack` files) is deleted, and so are
-  `dirs.ack` and `DARKMUX_ACK_DIR`: `darkmux doctor` names a leftover key or
-  env var and a harmless env var warns. The disclaimer's section about those
+  `dirs.ack` and `DARKMUX_ACK_DIR`: a leftover `DARKMUX_ACK_DIR` only warns,
+  while a leftover `dirs.ack` key in `config.json` is refused at preflight
+  (dispatch, mission launch, lab run, fleet work submission, serve) and failed
+  by `darkmux doctor` until you delete it. The disclaimer's section about those
   role prompts is removed with them. **Migration:** keep a role you still want
   as your own file under `<darkmux root>/roles/`; delete `dirs.ack`.
 - **`darkmux lab eval` is removed whole** (#3036). The verb with all its flags
@@ -1052,7 +1054,7 @@ darkmux release.
   `darkmux-lab-notebook` skill, which drafts an entry from `lab run stats
   --json` (and the run's `manifest.json` when needed) and writes it
   wherever your own instructions say your notebook lives. Delete
-  `dirs.notebook` from `config.json` and unset `DARKMUX_NOTEBOOK_DIR`;
+  `dirs.notebook` from `config.json` (it is refused at preflight and failed by `darkmux doctor` until you do) and unset `DARKMUX_NOTEBOOK_DIR` (it only warns);
   neither is read any more, and `darkmux doctor` warns naming whichever
   is still set with the exact change to make. `darkmux config set
   dirs.notebook ...` now rejects the key. Existing entries on disk are

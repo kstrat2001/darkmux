@@ -306,8 +306,7 @@ pub struct FleetNode {
     /// `DARKMUX_HOME` is not on its own sufficient: several paths resolve
     /// through `dirs::home_dir()` and never consult it —
     /// `config_access::fleet_file`, `config_access::cache_dir`,
-    /// `crew::dispatch::ack_dir` (`~/.darkmux/acks`, WRITTEN on every
-    /// dispatch ack) and `crew::dispatch`'s `identity.md`, plus the
+    /// `crew::dispatch`'s `identity.md`, plus the
     /// profile/mission-config/workload/skill search paths that include
     /// `~/.darkmux/...` as a candidate. Measured 2026-09-07 against a
     /// plain `cargo build` binary: with `DARKMUX_HOME` set to a tempdir,
@@ -486,8 +485,8 @@ mod darkmux_home_isolation_tests {
         let darkmux_home = env_var("DARKMUX_HOME");
 
         // (#2184) The other half. `DARKMUX_HOME` is not sufficient on its
-        // own: `config_access::fleet_file`, `config_access::cache_dir` and
-        // `crew::dispatch::ack_dir` all resolve through `dirs::home_dir()`
+        // own: `config_access::fleet_file` and `config_access::cache_dir`
+        // both resolve through `dirs::home_dir()`
         // and never read it. Measured 2026-09-07 against a plain `cargo
         // build` binary: with `DARKMUX_HOME` set to a tempdir, `darkmux
         // machine add` still wrote `$HOME/.darkmux/fleet.json`.

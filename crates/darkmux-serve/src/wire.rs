@@ -467,21 +467,12 @@ pub struct LabReviewSummary {
     pub archived: usize,
 }
 
-/// The identity a bench's scores document records.
+/// Marks that the run wrote a readable `scores.json`; it carries no fields
+/// (its `role`/`mode`/`profile` were set only by the removed `lab eval`, #3036).
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
-pub struct LabScoresSummary {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(test, ts(optional))]
-    pub role: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(test, ts(optional))]
-    pub mode: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(test, ts(optional))]
-    pub profile: Option<String>,
-}
+pub struct LabScoresSummary {}
 
 /// `GET /lab/run/detail?dir=`. `reviews` is `[]` (never an error) when the run
 /// has no archived review envelopes.
@@ -565,9 +556,3 @@ impl From<&darkmux_lab::lab::review::ReviewEnvelope> for LabReviewSummary {
     }
 }
 
-impl From<&darkmux_lab::lab::scores::ScoresDoc> for LabScoresSummary {
-    fn from(doc: &darkmux_lab::lab::scores::ScoresDoc) -> Self {
-        let extra = |key: &str| doc.extras.get(key).and_then(|v| v.as_str()).map(str::to_string);
-        Self { role: extra("role"), mode: extra("mode"), profile: doc.provenance.profile.clone() }
-    }
-}
