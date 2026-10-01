@@ -2454,12 +2454,22 @@ body {
   margin-top: 10px;
   overflow-wrap: anywhere;
 }
+/* (#2925) The kind tabs are one row that scrolls sideways on a narrow screen,
+   like the filter bar under them, so a tab never drops to a line of its own. */
 .runsbar {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  scrollbar-width: none;
   align-items: center;
   gap: 6px;
   margin: 10px 0 4px;
+}
+.runsbar::-webkit-scrollbar {
+  display: none;
+}
+.runsbar .runchip {
+  flex: 0 0 auto;
 }
 .runchip {
   font: 600 calc(11px * var(--fs-scale))/1 var(--font-mono);

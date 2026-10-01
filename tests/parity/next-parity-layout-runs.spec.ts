@@ -122,3 +122,27 @@ test("on a phone the popover is a bottom sheet", async ({ browser }) => {
   expect(Math.round(box.y + box.height)).toBe(VIEWPORTS.phone.height);
   await ctx.close();
 });
+
+// (#2925) The kind tabs are one row like the filter bar: on a screen too narrow
+// for all four, the row scrolls sideways instead of dropping a tab to a line of
+// its own (operator, 2026-10-01: the lab tab took a whole line).
+test("on a narrow phone the kind tabs stay on one line and scroll", async ({ browser }) => {
+  const { ctx, page } = await open(browser, { width: 320, height: VIEWPORTS.phone.height });
+  const layout = await page.evaluate(() => {
+    const bar = document.querySelector(".runsbar");
+    const chips = [...bar.querySelectorAll(".runchip")].map((c) => c.getBoundingClientRect());
+    return {
+      tops: [...new Set(chips.map((r) => Math.round(r.top)))],
+      barHeight: Math.round(bar.getBoundingClientRect().height),
+      chipHeight: Math.round(chips[0].height),
+      scrolls: bar.scrollWidth > bar.clientWidth,
+      barRight: Math.round(bar.getBoundingClientRect().right),
+      viewport: window.innerWidth,
+    };
+  });
+  expect(layout.tops).toHaveLength(1);
+  expect(layout.barHeight).toBe(layout.chipHeight);
+  expect(layout.scrolls).toBe(true);
+  expect(layout.barRight).toBeLessThanOrEqual(layout.viewport);
+  await ctx.close();
+});
