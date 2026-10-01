@@ -830,7 +830,7 @@ fn unreachable(reason: UnreachableReason, detail: Option<String>) -> Fetched {
 /// Ask a verified peer's fleet listener for its card.
 fn fetch_listener_card(target: &SettledTarget, entry: &MachineEntry, known_version: Option<&str>) -> Fetched {
     match darkmux_fleet::fleet_get(target, darkmux_fleet::CARD_PATH, PEER_CARD_TIMEOUT, &[]) {
-        Ok(resp) => parse_listener_card(resp, entry, known_version),
+        Ok(resp) => parse_listener_card(resp, target, entry, known_version),
         Err(ureq::Error::Status(code, resp)) => refusal_outcome(code, resp, known_version),
         Err(ureq::Error::Transport(t)) => {
             if darkmux_fleet::is_listener_off(&t) {
@@ -891,7 +891,12 @@ fn unavailable(why: UnavailableWhy, peer: Option<&str>, presence: Option<&str>) 
 /// A listener's 200 answer, sanitized and typed. A body that is not JSON is a
 /// bad answer; a card of another schema major, or of this major and not
 /// parseable, is "unavailable" with its own reason.
-fn parse_listener_card(resp: ureq::Response, entry: &MachineEntry, known_version: Option<&str>) -> Fetched {
+fn parse_listener_card(
+    resp: ureq::Response,
+    target: &SettledTarget,
+    entry: &MachineEntry,
+    known_version: Option<&str>,
+) -> Fetched {
     let Some(mut v) = read_json(resp) else {
         return unreachable(UnreachableReason::BadAnswer, Some("not a JSON document".to_string()));
     };
@@ -901,7 +906,15 @@ fn parse_listener_card(resp: ureq::Response, entry: &MachineEntry, known_version
         return unavailable(UnavailableWhy::OtherSchemaMajor, peer_version.as_deref(), known_version);
     }
     match serde_json::from_value::<ListenerCard>(v) {
-        Ok(ListenerCard { card, grant }) => attribute(entry, card, CardSource::Listener, grant),
+        Ok(ListenerCard { card, grant }) => {
+            let ids = (card.specs.machine_uid.clone(), card.specs.machine_id.clone());
+            let fetched = attribute(entry, card, CardSource::Listener, grant);
+            // Only a card that passed attribution teaches the roster.
+            if matches!(fetched.outcome, CardOutcome::Available { .. }) {
+                learn_from_card(target, entry, ids);
+            }
+            fetched
+        }
         Err(_) => unavailable(UnavailableWhy::Unparseable, peer_version.as_deref(), known_version),
     }
 }
@@ -926,6 +939,17 @@ fn card_is_of(entry: &MachineEntry, card: &MachineCard) -> bool {
     match (entry.machine_uid.as_deref(), card.specs.machine_uid.as_deref()) {
         (Some(want), Some(got)) => want.eq_ignore_ascii_case(got),
         _ => card.specs.machine_id.as_deref().is_some_and(|id| darkmux_fleet::same_machine(id, &entry.id)),
+    }
+}
+
+/// (#3028) Record what the card of the verified, pinned node behind `target`
+/// said about itself (its uid and current name) on the roster entry, beside
+/// the pin. Called only for a card attribution accepted as the entry's; no
+/// further network call. A roster that cannot be written is reported and the
+/// card is still shown.
+fn learn_from_card(target: &SettledTarget, entry: &MachineEntry, (uid, name): (Option<String>, Option<String>)) {
+    if let Err(e) = darkmux_fleet::learn_identity(entry, target, uid.as_deref(), name.as_deref()) {
+        eprintln!("darkmux serve: could not record {}'s identity in the roster: {e:#}", entry.id);
     }
 }
 
@@ -1038,6 +1062,7 @@ pub(crate) mod tests {
             machine_uid: None,
             loopback_intended: false,
             node_id: None,
+            current_name: None,
             extras: Default::default(),
         }
     }
@@ -1650,6 +1675,21 @@ pub(crate) mod tests {
         })
     }
 
+    /// [`fetch_pinned`] for a roster entry other than the bare `studio()`:
+    /// also returns that entry as the roster holds it afterward.
+    fn fetch_with_entry(listener: &FakePeer, entry: &MachineEntry) -> (Fetched, MachineEntry) {
+        let (out, _) = with_roster_holding(entry, || {
+            with_fleet_token(|| {
+                let target = pinned_listener_target(&provider(true), entry, listener.port)
+                    .map_err(|e| format!("{e:?}"))
+                    .unwrap();
+                let fetched = fetch_listener_card(&target, entry, None);
+                (fetched, darkmux_fleet::load_roster().unwrap().machines[&entry.id].clone())
+            })
+        });
+        out
+    }
+
     fn fetch(listener: &FakePeer, known_version: Option<&str>) -> Fetched {
         fetch_pinned(listener, known_version).0
     }
@@ -1857,6 +1897,75 @@ pub(crate) mod tests {
         let f = fetch(&serve_card("200 OK", body.to_string()), None);
         assert!(matches!(f.outcome, CardOutcome::Mismatch { answered_as: Some(id) } if id == "mini"));
         assert_eq!(f.accepts, AcceptsState::Unknown);
+    }
+
+    /// (#3028) A mismatch row teaches the roster nothing: the entry is
+    /// byte-for-byte what it was, not even the other machine's name.
+    #[test]
+    #[serial_test::serial]
+    fn a_mismatch_row_teaches_the_roster_nothing() {
+        let mut body: serde_json::Value = serde_json::from_str(&listener_body()).unwrap();
+        body["card"]["specs"]["machine_id"] = serde_json::json!("mini");
+        let (f, saved) = fetch_with_entry(&serve_card("200 OK", body.to_string()), &studio());
+        assert!(matches!(f.outcome, CardOutcome::Mismatch { .. }));
+        assert_eq!(saved, MachineEntry { node_id: Some("nSTUDIO".into()), ..studio() }, "only the pin was written");
+    }
+
+    /// (#3028) The probe: a first contact whose entry is pointed at another
+    /// machine (card says `darkbook`, entry `studio` knows no uid) stays a
+    /// mismatch and writes nothing, so `@studio` never runs on darkbook.
+    #[test]
+    #[serial_test::serial]
+    fn a_mis_pointed_first_contact_stays_a_mismatch_and_writes_nothing() {
+        let mut body: serde_json::Value = serde_json::from_str(&listener_body()).unwrap();
+        body["card"]["specs"]["machine_id"] = serde_json::json!("darkbook");
+        body["card"]["specs"]["machine_uid"] = serde_json::json!("UID-DB");
+        let (f, saved) = fetch_with_entry(&serve_card("200 OK", body.to_string()), &studio());
+        assert!(matches!(f.outcome, CardOutcome::Mismatch { answered_as: Some(id) } if id == "darkbook"));
+        assert_eq!((saved.machine_uid, saved.current_name), (None, None));
+    }
+
+    /// (#3028) A card stating a different uid than the entry holds is a
+    /// mismatch, and neither its uid nor its name is written.
+    #[test]
+    #[serial_test::serial]
+    fn a_card_with_another_uid_is_a_mismatch_and_never_overwrites() {
+        let mut body: serde_json::Value = serde_json::from_str(&listener_body()).unwrap();
+        body["card"]["specs"]["machine_id"] = serde_json::json!("mini");
+        body["card"]["specs"]["machine_uid"] = serde_json::json!("UID-MINI");
+        let known = MachineEntry { machine_uid: Some("UID-STUDIO".into()), ..studio() };
+        let (f, saved) = fetch_with_entry(&serve_card("200 OK", body.to_string()), &known);
+        assert!(matches!(f.outcome, CardOutcome::Mismatch { .. }));
+        assert_eq!((saved.machine_uid.as_deref(), saved.current_name), (Some("UID-STUDIO"), None));
+    }
+
+    /// (#3028) The entry's machine renamed itself. The entry already holds
+    /// its uid and the pinned node's card states the same one, so it is that
+    /// machine under a new name: the name is written (the key the operator
+    /// wrote stays) and the card is attributed.
+    #[test]
+    #[serial_test::serial]
+    fn a_renamed_pinned_peers_card_teaches_the_roster_and_is_attributed() {
+        let mut body: serde_json::Value = serde_json::from_str(&listener_body()).unwrap();
+        body["card"]["specs"]["machine_id"] = serde_json::json!("studio-now");
+        body["card"]["specs"]["machine_uid"] = serde_json::json!("uid-studio");
+        let known = MachineEntry { machine_uid: Some("UID-STUDIO".into()), ..studio() };
+        let (f, saved) = fetch_with_entry(&serve_card("200 OK", body.to_string()), &known);
+        assert!(matches!(f.outcome, CardOutcome::Available { .. }), "{:?}", f.outcome);
+        assert_eq!(saved.id, "studio");
+        assert_eq!(saved.current_name.as_deref(), Some("studio-now"));
+        assert_eq!(saved.node_id.as_deref(), Some("nSTUDIO"));
+    }
+
+    /// (#3028) First contact under the entry's own name teaches the uid.
+    #[test]
+    #[serial_test::serial]
+    fn a_first_contact_under_the_entrys_name_teaches_the_uid() {
+        let mut body: serde_json::Value = serde_json::from_str(&listener_body()).unwrap();
+        body["card"]["specs"]["machine_uid"] = serde_json::json!("UID-STUDIO");
+        let (f, saved) = fetch_with_entry(&serve_card("200 OK", body.to_string()), &studio());
+        assert!(matches!(f.outcome, CardOutcome::Available { .. }));
+        assert_eq!(saved.machine_uid.as_deref(), Some("UID-STUDIO"));
     }
 
     /// A body that is not JSON is a bad answer.

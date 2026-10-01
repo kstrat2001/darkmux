@@ -1143,13 +1143,19 @@ fn a_check_gives_the_answer_a_run_would_and_runs_nothing() {
 #[test]
 fn a_newer_minor_and_another_major_are_refused_naming_both_versions() {
     let f = boot("refuse");
-    for other in ["8.1", "9.0", "7.0", "8"] {
+    // Derived from the receiver's own version, so a minor bump on the wire
+    // (8.0 to 8.1, #3028) cannot turn "a newer minor" into the current one.
+    let own = darkmux_fleet::WORK_JOB_SCHEMA_VERSION;
+    let (major, minor) = own.split_once('.').expect("major.minor");
+    let (major, minor): (u32, u32) = (major.parse().unwrap(), minor.parse().unwrap());
+    let others = [format!("{major}.{}", minor + 1), format!("{}.0", major + 1), format!("{}.0", major - 1), major.to_string()];
+    for other in &others {
         let mut sub = WorkSubmission::new(answering_job("cloud", "v1"), true);
-        sub.schema = other.into();
+        sub.schema = other.clone();
         let (code, reply) = post_to_beta(&f, &sub);
         assert_eq!((code, reply.refusal), (400, Some(RefusalCode::Version)), "{other}: {reply:?}");
         let reason = reply.reason.unwrap();
-        assert!(reason.contains(&format!("v{other}")) && reason.contains("v8.0"), "{other}: both versions named: {reason}");
+        assert!(reason.contains(&format!("v{other}")) && reason.contains(&format!("v{own}")), "{other}: both versions named: {reason}");
     }
     assert_eq!(f.mock.served.load(Ordering::SeqCst), 0);
 }

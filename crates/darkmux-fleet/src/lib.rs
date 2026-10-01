@@ -77,6 +77,67 @@ mod tests {
         assert!(find_machine_key(&r, "MACBOOK-PRO").is_err(), "two case-variants are ambiguous");
     }
 
+    fn learned(r: &mut FleetRoster, id: &str, name: &str) {
+        r.machines.get_mut(id).unwrap().current_name = Some(name.to_string());
+    }
+
+    /// (#3028) The machine renamed itself and this roster learned it from the
+    /// peer's card: the address works under the roster's key and under the
+    /// machine's own current name, case-insensitively, and finds one entry.
+    #[test]
+    fn a_name_resolves_by_the_entrys_id_or_its_learned_current_name() {
+        let mut r = FleetRoster::default();
+        add_machine(&mut r, "m1-max-32gb-studio", "studio.example", None, None).unwrap();
+        add_machine(&mut r, "laptop", "laptop.example", None, None).unwrap();
+        learned(&mut r, "m1-max-32gb-studio", "studio");
+        for name in ["m1-max-32gb-studio", "studio", "STUDIO", "M1-Max-32GB-Studio"] {
+            assert_eq!(find_machine(&r, name).unwrap().unwrap().address, "studio.example", "{name}");
+        }
+        assert_eq!(find_machine(&r, "laptop").unwrap().unwrap().address, "laptop.example");
+        assert!(find_machine(&r, "mini").unwrap().is_none());
+    }
+
+    /// (#3028) A roster written before the name was learned behaves exactly as
+    /// it did: an id resolves, a name nobody learned does not.
+    #[test]
+    fn an_entry_that_has_learned_no_name_resolves_by_id_alone() {
+        let mut r = FleetRoster::default();
+        add_machine(&mut r, "m1-max-32gb-studio", "studio.example", None, None).unwrap();
+        assert!(find_machine(&r, "m1-max-32gb-studio").unwrap().is_some());
+        assert!(find_machine(&r, "studio").unwrap().is_none());
+    }
+
+    /// (#3028) Two entries answering to one name are an error naming both,
+    /// never a pick; and `machine add`'s own key lookup ignores learned
+    /// names (adding `studio` must not overwrite the entry that merely goes
+    /// by it now).
+    #[test]
+    fn two_entries_answering_to_one_name_are_ambiguous_and_add_keys_ignore_learned_names() {
+        let mut r = FleetRoster::default();
+        add_machine(&mut r, "old-studio", "a.example", None, None).unwrap();
+        add_machine(&mut r, "studio", "b.example", None, None).unwrap();
+        learned(&mut r, "old-studio", "studio");
+        let err = find_machine(&r, "studio").unwrap_err().to_string();
+        assert!(err.contains("old-studio") && err.contains("studio"), "names both: {err}");
+        assert_eq!(find_machine_key(&r, "studio").unwrap().as_deref(), Some("studio"), "id keys are id-only");
+        assert_eq!(find_machine_key(&r, "other").unwrap(), None);
+    }
+
+    /// (#3028) The learned uid and name belong to the address they were read
+    /// at: repointing the entry forgets them, like the node pin.
+    #[test]
+    fn repointing_an_entry_forgets_what_its_old_address_taught() {
+        let mut r = FleetRoster::default();
+        add_machine(&mut r, "studio", "a.example", None, Some("UID-A")).unwrap();
+        learned(&mut r, "studio", "studio-now");
+        add_machine(&mut r, "studio", "a.example", Some("note"), None).unwrap();
+        let e = r.machines.get("studio").unwrap();
+        assert_eq!((e.machine_uid.as_deref(), e.current_name.as_deref()), (Some("UID-A"), Some("studio-now")));
+        add_machine(&mut r, "studio", "b.example", None, None).unwrap();
+        let e = r.machines.get("studio").unwrap();
+        assert_eq!((e.machine_uid.as_deref(), e.current_name.as_deref()), (None, None));
+    }
+
     #[test]
     #[serial]
     fn load_missing_returns_empty_roster() {

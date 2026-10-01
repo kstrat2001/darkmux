@@ -23,7 +23,7 @@ function beat(overrides: Partial<PresenceBeat>): PresenceBeat {
 
 /** A fleet-view row's facts, as `viewRows.ts::rowFacts` would hand them to a card. */
 function rowFactsFor(overrides: Partial<RowFacts> = {}): RowFacts {
-  return { uid: "u1", known: true, name: null, spec: "", note: null, grant: null, standing: "online", isSelf: false, hub: false, ...overrides };
+  return { uid: "u1", known: true, name: null, names: [], spec: "", note: null, grant: null, standing: "online", isSelf: false, hub: false, ...overrides };
 }
 
 function machineSpecs(overrides: Partial<MachineSpecsResponse> & Pick<MachineSpecsResponse, "machine_id">): MachineSpecsResponse {

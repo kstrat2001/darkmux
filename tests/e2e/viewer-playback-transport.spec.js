@@ -56,9 +56,12 @@ test('pressing play on the static build actually advances the playhead', async (
     const range = document.querySelector('.scrub input[type="range"]');
     const btn = document.querySelector('.scrub button.primary');
     window.__transport = [];
-    const sample = () => {
+    window.__transportSample = () => {
       const state = `${range.value}|${btn.title}`;
       if (state !== window.__transport[window.__transport.length - 1]) window.__transport.push(state);
+    };
+    const sample = () => {
+      window.__transportSample();
       window.__transportRaf = requestAnimationFrame(sample);
     };
     sample();
@@ -83,8 +86,12 @@ test('pressing play on the static build actually advances the playhead', async (
   // against the transitions record below for the REWOUND state in between.
   await expect(range).toHaveValue('100', { timeout: 5_000 });
   await expect(playBtn).toHaveAttribute('title', 'play');
+  // The sampler records on the next animation frame, so the button can
+  // already read "play" before the log has a frame to record it in. Take
+  // one last sample before reading, or the final state races the frame.
   const transitions = await page.evaluate(() => {
     cancelAnimationFrame(window.__transportRaf);
+    window.__transportSample();
     return window.__transport;
   });
   const rewound = transitions.find((st) => st === '0|pause');

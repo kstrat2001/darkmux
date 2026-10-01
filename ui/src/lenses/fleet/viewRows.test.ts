@@ -173,6 +173,27 @@ describe("rowFacts", () => {
     expect(facts).toMatchObject({ spec: "", note: "listener off", standing: "offline", grant: null });
   });
 
+  it("a card read from the machine is labeled with the machine's own current name, not the roster id (#3028)", () => {
+    const renamed = row({ entry: { id: "m1-max-32gb-studio", address: "100.64.0.9:8765", added_unix_ms: 1 } });
+    expect(rowFacts(renamed, new Set(), null).name).toBe("studio");
+  });
+
+  it("a row whose card was not read is labeled with its roster id (#3028)", () => {
+    const unread = row({ entry: { id: "m1-max-32gb-studio", address: "100.64.0.9:8765", added_unix_ms: 1 }, card: { state: "unreachable", reason: "listener_off", detail: null } });
+    expect(rowFacts(unread, new Set(), null).name).toBe("m1-max-32gb-studio");
+  });
+
+  it("a machine that is only a card still has its own name (#3028)", () => {
+    expect(rowFacts(row({ entry: null }), new Set(), null).name).toBe("studio");
+  });
+
+  it("a renamed machine answers to both its roster id and its card's name, so runs under either match (#3028)", () => {
+    const renamed = row({ entry: { id: "m1-max-32gb-studio", address: "100.64.0.9:8765", added_unix_ms: 1 } });
+    expect(rowFacts(renamed, new Set(), null).names).toEqual(["studio", "m1-max-32gb-studio"]);
+    expect(rowFacts(row(), new Set(), null).names).toEqual(["studio"]);
+    expect(rowFacts(row({ entry: null }), new Set(), null).names).toEqual(["studio"]);
+  });
+
   it("a card with no chip named has no hardware line", () => {
     const noChip = { specs: { ...SPECS, cpu_brand: null } } as unknown as MachineCard;
     expect(rowFacts(row({ card: { state: "available", card: noChip, source: "listener" } }), new Set(), null).spec).toBe("");

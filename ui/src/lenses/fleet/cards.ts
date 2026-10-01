@@ -496,7 +496,8 @@ function cardIdentity(
   }
   return {
     // (#2814) `nameOf` plus the self-identity floor: see `displayNameOf`. A
-    // machine only the view knows is named by its roster id.
+    // machine only the view knows is named by its own card's name when the
+    // view read one, else its roster id (`rowFacts`).
     name: row.known ? displayNameOf(data, liveMachines, specs, m, roster) : (row.name ?? m),
     spec: row.spec,
     specUnknown: row.spec ? null : ("not-reported" as const),

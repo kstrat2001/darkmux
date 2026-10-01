@@ -912,7 +912,7 @@ export function FleetLens({
         // (#1923) A run belongs to the card's machine by uid
         // (`runsForMachine`'s own doc); the name the view gives the machine
         // is one more spelling it answers to.
-        runsForMachine(runs, machineMatch(flowWindow.data, liveMachines, specs, roster, facts.uid, facts.name ? [facts.name] : [])),
+        runsForMachine(runs, machineMatch(flowWindow.data, liveMachines, specs, roster, facts.uid, facts.names)),
         roster,
         policy,
       ),

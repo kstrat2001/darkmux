@@ -35,6 +35,18 @@ pub struct WorkJob {
     /// any runner claim any job; it is now a check.)
     pub target_machine: String,
 
+    /// (#3028, wire 8.1) The hardware identity of the machine the sender
+    /// means, when its roster has learned it from that machine's own card.
+    /// A name is a label a machine can change; this is what the receiver
+    /// compares to its own hardware uid, and when it is present it decides:
+    /// a receiver that now goes by another name still takes the job, and a
+    /// different machine answering to the same name does not. Absent (a
+    /// sender that has not learned it yet, or any 8.0 sender), the receiver
+    /// compares `target_machine` to its name as before. Never printed in a
+    /// refusal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_machine_uid: Option<String>,
+
     /// Role to dispatch against — resolved to a role manifest on the
     /// receiver.
     pub role_id: String,
@@ -187,7 +199,10 @@ pub struct SingleShotJob {
 /// minor bump, and an older receiver refuses a newer minor by naming both
 /// versions. A shape change that is not additive is a major bump. "8.0" added
 /// `boundary`, `mode`, and the reply's `refusal` code and `check` report.
-pub const WORK_JOB_SCHEMA_VERSION: &str = "8.0";
+/// "8.1" (#3028) added the job's optional `target_machine_uid`; a submission
+/// is written at the lowest version that can say its job ([`WorkJob::wire_version`]),
+/// and this constant is the highest a receiver takes.
+pub const WORK_JOB_SCHEMA_VERSION: &str = "8.1";
 
 /// A work wire version, `major.minor` (see [`WORK_JOB_SCHEMA_VERSION`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -245,18 +260,41 @@ pub(crate) const MAX_WORK_TIMEOUT_SECONDS: u32 = 60 * 60;
 pub(crate) const MAX_WORK_IMAGE_BYTES: usize = 256;
 
 impl WorkJob {
+    /// (#3028) Whether this job is addressed to the receiver named
+    /// `receiver` whose own hardware uid is `receiver_uid`: the ONE
+    /// comparison every receiving path makes (a run and a `check` alike).
+    /// When both the job and the receiver have a uid, the uid decides and
+    /// the name is not looked at (a renamed machine still answers to the
+    /// address its sender learned; another machine under the same name does
+    /// not). Otherwise the name decides, as it did before wire 8.1.
+    pub fn is_addressed_to(&self, receiver: &str, receiver_uid: Option<&str>) -> bool {
+        match (self.target_machine_uid.as_deref(), receiver_uid) {
+            (Some(want), Some(mine)) => want.eq_ignore_ascii_case(mine),
+            _ => same_machine(&self.target_machine, receiver),
+        }
+    }
+
+    /// (#3028) The lowest wire version that can say this job: 8.0, or 8.1
+    /// when it carries `target_machine_uid`. A submission is written at this
+    /// version, so a sender that has learned no uid still reaches an 8.0
+    /// receiver.
+    pub fn wire_version(&self) -> WorkVersion {
+        WorkVersion { major: 8, minor: u32::from(self.target_machine_uid.is_some()) }
+    }
+
     /// Validate a job's SHAPE — called by the sender before the request
     /// leaves and by the receiver before anything runs. Charset and size
     /// only; who may run what is `submission.rs`'s job.
     ///
-    /// - `target_machine`, `role_id`: `[a-z0-9_-]{1,64}`.
+    /// - `target_machine`, `role_id`: `[a-z0-9_-]{1,64}`;
+    ///   `target_machine_uid`: 1..=64 letters, digits or `-`.
     /// - `profile`: 1..=64 printable ASCII, no whitespace (profile names
     ///   are the operator's own and may carry dots or capitals; the value
     ///   is only ever compared against names, never used as a path).
     /// - `message` ≤ 256 KiB, `workdir` ≤ 4 KiB, `timeout_seconds` in
     ///   1..=3600, `image` a conservative image reference.
     pub fn validate(&self) -> Result<()> {
-        validate_machine_name("WorkJob.target_machine", &self.target_machine)?;
+        self.validate_target()?;
         validate_work_identifier("role_id", &self.role_id)?;
         validate_session_id(&self.session_id)?;
         if let Some(p) = &self.profile {
@@ -286,6 +324,12 @@ impl WorkJob {
             self.validate_single_shot(single_shot)?;
         }
         Ok(())
+    }
+
+    /// The machine the job is addressed to: its name, and its uid when given.
+    fn validate_target(&self) -> Result<()> {
+        validate_machine_name("WorkJob.target_machine", &self.target_machine)?;
+        self.target_machine_uid.as_deref().map_or(Ok(()), validate_machine_uid)
     }
 
     /// A `single_shot` job is one tool-less exchange under the radio
@@ -404,6 +448,23 @@ pub fn validate_machine_name(label: &str, value: &str) -> Result<()> {
     }
 }
 
+/// Max length of `WorkJob.target_machine_uid`; a hardware UUID is 36.
+const MAX_MACHINE_UID_LEN: usize = 64;
+
+/// (#3028) A machine's hardware uid on the wire: letters, digits and `-`,
+/// 1..=64. The receiver only compares it to its own uid, never uses it as a
+/// path or a name.
+pub fn validate_machine_uid(value: &str) -> Result<()> {
+    let ok = !value.is_empty()
+        && value.len() <= MAX_MACHINE_UID_LEN
+        && value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    if ok {
+        Ok(())
+    } else {
+        Err(anyhow!("WorkJob.target_machine_uid: must be 1..={MAX_MACHINE_UID_LEN} letters, digits or `-`"))
+    }
+}
+
 /// (#2916) Whether two machine names name the same machine.
 pub fn same_machine(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
@@ -487,6 +548,7 @@ mod tests {
     fn make_valid_job() -> WorkJob {
         WorkJob {
             target_machine: "studio".to_string(),
+            target_machine_uid: None,
             role_id: "test-role".to_string(),
             message: "hello".to_string(),
             session_id: SessionId::adhoc(darkmux_types::session_id::RunId::mission("m-1").unwrap(), "test-role", "sess-1"),
@@ -606,6 +668,17 @@ mod tests {
         }
     }
 
+    /// (#3028) The uid on the wire is a bounded token, never free text.
+    #[test]
+    fn target_machine_uid_is_a_bounded_token() {
+        let with = |uid: &str| WorkJob { target_machine_uid: Some(uid.into()), ..make_valid_job() };
+        assert!(with("00000000-0000-4000-8000-ABCDEF000001").validate().is_ok());
+        for bad in ["", "has space", "a/b", "uid\n", &"A".repeat(65)] {
+            let err = with(bad).validate().unwrap_err().to_string();
+            assert!(err.contains("target_machine_uid"), "{bad:?}: {err}");
+        }
+    }
+
     /// (#2954) v8 dropped `phase_id`: a job still carrying one is a field
     /// the receiver does not know, refused whole, and the wire version says
     /// so: a v7 submission carrying one gets the version remedy through
@@ -613,7 +686,7 @@ mod tests {
     /// it parses.
     #[test]
     fn a_job_carrying_a_phase_id_is_refused_at_v8() {
-        assert_eq!(WORK_JOB_SCHEMA_VERSION, "8.0");
+        assert_eq!(WORK_JOB_SCHEMA_VERSION, "8.1");
         let mut v = serde_json::to_value(make_valid_job()).unwrap();
         assert!(v.get("phase_id").is_none(), "v8 never writes phase_id");
         assert!(serde_json::from_value::<WorkJob>(v.clone()).is_ok());
