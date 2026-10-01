@@ -2426,7 +2426,7 @@ fn is_stripped_for_display(c: char) -> bool {
 /// this module's sixteen stderr rows). Those are closed at their render
 /// sites instead, by [`rejection_reason_display_lines`] and its two
 /// wrappers — see [`MAX_REJECTION_REASON_DISPLAY_WIDTH`]'s doc.
-fn sanitize_reason_text(s: &str) -> String {
+pub(crate) fn sanitize_reason_text(s: &str) -> String {
     let filtered: String = s.chars().filter(|c| !is_stripped_for_display(*c)).collect();
     strip_leading_zero_width(&collapse_whitespace_and_trim(&filtered))
 }
@@ -2574,7 +2574,7 @@ pub fn display_columns(s: &str) -> usize {
 /// the panic class a raw byte-offset slice invites (#2196 fix-round MUST
 /// FIX 2: a naive `&s[..N]` on a byte offset that lands mid-character
 /// panics with "byte index N is not a char boundary").
-fn bound_reason_width(s: &str, budget: usize) -> String {
+pub(crate) fn bound_reason_width(s: &str, budget: usize) -> String {
     // (#2196 fix-round 3, MUST FIX F) Both budgets are enforced: columns
     // AND characters. A width-only bound does not bound anything a
     // receiver cares about — see [`REJECTION_REASON_CHARS_PER_COLUMN`].

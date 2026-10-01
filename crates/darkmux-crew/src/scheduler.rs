@@ -1568,7 +1568,7 @@ fn apply_step_terminal(
             step.status = NodeStatus::Error;
             step.completed_ts = Some(at);
             step.output = Some(message.clone());
-            emit(step_lifecycle_record(run, step, darkmux_flow::FlowAction::StepError));
+            emit(step_error_record(run, step, &message));
             persist(step);
             report.errored.push(id.to_string());
             errored = Some((id.to_string(), message));
@@ -1978,7 +1978,7 @@ pub const STEP_LIFECYCLE_ACTIONS: [darkmux_flow::FlowAction; 3] = [
 ];
 
 /// One `FlowRecord` for a step-lifecycle transition (`"step start"` /
-/// `"step complete"` / `"step error"`). Mirrors `lifecycle.rs`'s
+/// `"step complete"`; an error is [`step_error_record`]). Mirrors `lifecycle.rs`'s
 /// `emit_phase_transition_record` shape (`Category::Work`,
 /// `Tier::Darkmux` since these are scheduler-driven, not operator-explicit
 /// like a Phase transition; `Stage::Dispatch` since a Step is
@@ -1990,10 +1990,9 @@ pub const STEP_LIFECYCLE_ACTIONS: [darkmux_flow::FlowAction; 3] = [
 /// config never share a session id, and the record names its mission
 /// without a launcher backfill.
 fn step_lifecycle_record(run: &RunId, step: &Step, action: darkmux_flow::FlowAction) -> FlowRecord {
-    let level = if action == darkmux_flow::FlowAction::StepError { Level::Warn } else { Level::Info };
     FlowRecord {
         source: Some(darkmux_flow::FlowSource::Scheduler),
-        ..FlowRecord::for_session(&SessionId::task(run.clone(), &step.task_id), level, Category::Work, Stage::Dispatch, action, step.id.clone())
+        ..FlowRecord::for_session(&SessionId::task(run.clone(), &step.task_id), Level::Info, Category::Work, Stage::Dispatch, action, step.id.clone())
     }
 }
 
@@ -2024,6 +2023,22 @@ fn seat_unresolved_record(run: &RunId, step: &Step, reason: &str) -> FlowRecord 
                 reason: reason.to_string(),
                 lost: "wave load + #1487 residency lease".to_string(),
             }),
+            step.id.clone(),
+        )
+    }
+}
+
+/// (F9) The `step.error` record: the lifecycle record plus the cause, so the
+/// stream says why a step failed (the full message stays in the step file).
+fn step_error_record(run: &RunId, step: &Step, message: &str) -> FlowRecord {
+    FlowRecord {
+        source: Some(darkmux_flow::FlowSource::Scheduler),
+        ..FlowRecord::for_session_with(
+            &SessionId::task(run.clone(), &step.task_id),
+            Level::Warn,
+            Category::Work,
+            Stage::Dispatch,
+            darkmux_flow::Payload::StepError(darkmux_flow::payload::StepErrorPayload::from_message(message)),
             step.id.clone(),
         )
     }
@@ -3080,6 +3095,49 @@ mod tests {
         assert_eq!(steps["a-step"].status, NodeStatus::Complete, "an approved gated step must still run");
         assert_eq!(report.completed, vec!["a-step".to_string()]);
         assert!(steps["a-step"].started_ts.is_some(), "an approved step actually ran (started_ts set)");
+    }
+
+    /// (F9) A step that errors says why on its `step.error` record: the cause
+    /// is single-line and bounded, never the raw multi-line message.
+    #[test]
+    fn a_step_error_record_carries_a_bounded_single_line_cause() {
+        let (mut task_a, mut step_a) = task_and_step("a", &[]);
+        step_a.gate = Some(crate::gate::GATE_KIND_OPERATOR.to_string());
+        task_a.description = "gated task".to_string();
+        let (tasks, mut steps) = graph(vec![(task_a, step_a)]);
+        let kinds = StepKindRegistry::with_builtins();
+        let facts = Facts::default();
+        let est = FixedEstimator::default();
+        let mut emitted: Vec<FlowRecord> = Vec::new();
+        let long = format!("reading workspace spec /x: Is a directory (os error 21)\n{}", "y".repeat(5000));
+        let mut handler =
+            |_s: &Step, _f: &BTreeMap<String, String>| crate::gate::GateDecision::Declined { reason: long.clone() };
+        run_step_graph(
+            &crate::test_run(),
+            &mut steps,
+            &tasks,
+            &kinds,
+            &facts,
+            &est,
+            8,
+            &mock_host_factory,
+            &mut |r| emitted.push(r),
+            &mut |_s| {},
+            Some(&mut handler),
+            None,
+            &[],
+        )
+        .unwrap();
+        let record = emitted
+            .iter()
+            .find(|r| r.action == darkmux_flow::FlowAction::StepError && r.handle == "a-step")
+            .expect("the errored step emits step.error");
+        let Some(darkmux_flow::Payload::StepError(p)) = &record.payload else {
+            panic!("step.error carries a StepErrorPayload: {:?}", record.payload);
+        };
+        assert!(p.cause.starts_with("reading workspace spec /x: Is a directory"), "{}", p.cause);
+        assert!(!p.cause.contains('\n'), "single line: {:?}", p.cause);
+        assert!(p.cause.chars().count() <= 500, "bounded: {}", p.cause.chars().count());
     }
 
     #[test]

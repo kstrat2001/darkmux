@@ -73,4 +73,11 @@ tokensFinal?: number, turnsFinal?: number,
  * every such case (operator sovereignty #44: show provenance where it
  * exists, never fabricate it).
  */
-model?: string, };
+model?: string, 
+/**
+ * (F9) Why an errored step errored: its error message, bounded to one
+ * line exactly as its `step.error` flow record carries it
+ * (`StepErrorPayload::from_message`, the one owner of that bound).
+ * Absent for a step that did not error.
+ */
+error?: string, };

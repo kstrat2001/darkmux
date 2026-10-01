@@ -11,8 +11,15 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
+pub const FLOW_SCHEMA_VERSION: &str = "2.1.0";
 // Version history:
+//   2.1.0 (5.0 dogfood): additive, one payload. `step.error` carries a
+//           typed payload `{cause}`: why the step errored, on one line,
+//           control and invisible characters dropped, bounded to 400
+//           rendered columns. The full message stays in the mission's step
+//           file and envelope. A `step.error` written before this has no
+//           payload and reads as before; a reader ignores what it does not
+//           know.
 //   2.0.0 (4.0): MAJOR, the action vocabulary is closed and has one spelling
 //           per event. Every action is a `FlowAction` variant (`action.rs`),
 //           spelled `<scope>.<event>[.<detail>]`: lowercase, two or three

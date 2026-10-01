@@ -1062,6 +1062,7 @@ StepRow
   tokensFinal?: uint64 | null
   turnsFinal?: uint64 | null
   model?: string | null
+  error?: string | null
 StrayDrainOutput
   file: string
   to: string

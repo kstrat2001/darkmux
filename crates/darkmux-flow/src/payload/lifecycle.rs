@@ -39,6 +39,33 @@ pub struct StepStartPayload {
 
 impl Attribution for StepStartPayload {}
 
+/// The widest cause a `step.error` record carries, in rendered columns.
+const STEP_ERROR_CAUSE_COLUMNS: usize = 400;
+
+/// A step errored: the payload of `step.error`. The full message stays in the
+/// mission's step file and envelope; the record carries enough to say why.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
+pub struct StepErrorPayload {
+    /// Why the step errored: the error's message on one line, control and
+    /// invisible characters dropped, bounded to a few hundred columns.
+    pub cause: String,
+}
+
+impl StepErrorPayload {
+    /// The payload for a step that errored with `message`.
+    pub fn from_message(message: &str) -> Self {
+        // Line breaks and tabs become spaces first: the sanitizer drops control
+        // characters outright, which would glue the words either side together.
+        let spaced: String = message.chars().map(|c| if c.is_whitespace() { ' ' } else { c }).collect();
+        let cause = crate::hooks::sanitize_reason_text(&spaced);
+        Self { cause: crate::hooks::bound_reason_width(&cause, STEP_ERROR_CAUSE_COLUMNS) }
+    }
+}
+
+impl Attribution for StepErrorPayload {}
+
 /// A local seat whose placement could not be resolved: the payload of `step.seat_unresolved`.
 /// `Warn`, because it names a real lost guarantee: the dispatch meant to run a local model and has
 /// no residency lease.
@@ -677,5 +704,21 @@ impl Attribution for BudgetPayload {
     }
     fn context_slot(&mut self) -> Option<&mut Option<serde_json::Map<String, serde_json::Value>>> {
         Some(&mut self.context)
+    }
+}
+
+#[cfg(test)]
+mod step_error_tests {
+    use super::*;
+
+    /// (F9) The cause is one line with invisible and control characters gone,
+    /// and a long message is cut to the column bound.
+    #[test]
+    fn step_error_cause_is_one_clean_bounded_line() {
+        let p = StepErrorPayload::from_message("bad\u{202e}\nspec\t\u{1b}[31m  here");
+        assert!(!p.cause.contains(['\n', '\t', '\u{202e}', '\u{1b}']), "{:?}", p.cause);
+        assert_eq!(p.cause, "bad spec [31m here");
+        let long = StepErrorPayload::from_message(&"x".repeat(10_000));
+        assert!(long.cause.chars().count() <= STEP_ERROR_CAUSE_COLUMNS + 10, "{}", long.cause.chars().count());
     }
 }
