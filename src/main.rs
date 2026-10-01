@@ -886,7 +886,7 @@ fn cmd_mod(sub: cli::ModCmd) -> Result<i32> {
 fn cmd_finding(sub: cli::FindingCmd) -> Result<i32> {
     match sub {
         cli::FindingCmd::List { mission, execution, rule, json: cli::JsonFlag { json } } => {
-            finding_cli::list(mission.as_deref(), execution.as_deref(), rule.as_deref(), json)
+            finding_cli::list(mission.as_deref(), execution.as_ref(), rule.as_deref(), json)
         }
         cli::FindingCmd::Show { key, json: cli::JsonFlag { json } } => {
             finding_cli::show(&key, json)

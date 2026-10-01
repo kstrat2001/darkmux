@@ -928,8 +928,9 @@ fn a_seat_profile_outside_dialectic_mode_exits_2() {
 #[test]
 fn execution_flags_refuse_a_session_shaped_value() {
     let session = "run-a.adhoc.coder.x";
-    let cases: [&[&str]; 4] = [
+    let cases: [&[&str]; 5] = [
         &["flow", "tail", "--execution", session],
+        &["finding", "list", "--execution", session],
         &["flow", "note", "--text", "t", "--execution", session],
         &["memory", "correction", "list", "--execution", session],
         &["flow", "tier-decision", "--decision", "direct", "--reasoning", "r", "--execution", session],
@@ -8583,6 +8584,52 @@ fn write_finding_day_file(flows: &std::path::Path) {
     fs::write(flows.join("2026-09-03.jsonl"), lines.join("\n") + "\n").unwrap();
 }
 
+/// (F4) `finding list --execution` takes the minted `exec-...` id and narrows
+/// to that execution's findings. Unpinned, the filter could be
+/// `.filter(|_| true)` and nothing would notice.
+#[test]
+fn finding_list_execution_narrows_to_one_minted_execution() {
+    let home = TempDir::new().unwrap();
+    let flows = home.path().join("flows");
+    fs::create_dir_all(&flows).unwrap();
+    let (exec_a, exec_b) = ("exec-65c8243026c00-1a2b-0", "exec-65c8243026c01-1a2b-0");
+    let rec = |exec: &str, seq: u64| {
+        serde_json::json!({
+            "ts": "2026-09-03T01:00:00Z", "level": "info", "category": "work", "tier": "local",
+            "stage": "dispatch", "action": "dispatch.tool", "handle": "crawler",
+            "session_id": "sess-x", "execution_id": exec, "model": "darkmux:qwen3.6",
+            "machine_id": "test-machine", "mission_id": "crawl-1",
+            "payload": {
+                "tool_seq": 1, "tool_calls_so_far": 1, "tool_name": "create_finding", "ok": true,
+                "args": "{}", "args_chars": 2, "result_chars": 0, "result": "",
+                "context": {"unit": "u1", "rule": "unnamed-predicate", "source": "acme"},
+                "emitted": {"file": "a.ts", "line": 4}, "emit_seq": seq,
+            },
+        })
+        .to_string()
+    };
+    fs::write(flows.join("2026-09-03.jsonl"), [rec(exec_a, 1), rec(exec_b, 2)].join("\n") + "\n").unwrap();
+    let dm = |args: &[&str]| {
+        let out = darkmux_cmd()
+            .env("DARKMUX_HOME", home.path())
+            .env("DARKMUX_FLOWS_DIR", &flows)
+            .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+            .args(args)
+            .output()
+            .expect("darkmux runs");
+        assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    dm(&["finding", "sync"]);
+    let keys = |exec: &str| -> Vec<String> {
+        let v: serde_json::Value =
+            serde_json::from_str(&dm(&["finding", "list", "--execution", exec, "--json"])).unwrap();
+        v["findings"].as_array().unwrap().iter().map(|f| f["key"].as_str().unwrap().to_string()).collect()
+    };
+    assert_eq!(keys(exec_b), vec![format!("{exec_b}/2")]);
+    assert!(keys("exec-65c8243026c02-1a2b-0").is_empty(), "an unknown execution returns none");
+}
+
 #[test]
 fn finding_sync_materializes_then_is_idempotent_and_list_show_read_the_store() {
     let home = TempDir::new().unwrap();
@@ -8680,22 +8727,10 @@ fn finding_sync_materializes_then_is_idempotent_and_list_show_read_the_store() {
         "an unknown mission returns none"
     );
 
-    // `--dispatch` narrows to one dispatch. Unpinned, the filter could be
-    // `.filter(|_| true)` and nothing would notice.
-    assert_eq!(
-        mission_ids(&["finding", "list", "--execution", "sess-b", "--json"]),
-        vec!["sess-b/2".to_string()],
-        "--dispatch must return exactly that dispatch's findings"
-    );
-    assert!(
-        mission_ids(&["finding", "list", "--execution", "sess-nope", "--json"]).is_empty(),
-        "an unknown dispatch returns none"
-    );
     // …and the three filters compose rather than replacing each other.
     assert!(
-        mission_ids(&["finding", "list", "--mission", "crawl-1", "--execution", "sess-b", "--json"])
-            .is_empty(),
-        "filters compose: sess-b is not in crawl-1"
+        mission_ids(&["finding", "list", "--mission", "crawl-1", "--rule", "no-such-rule", "--json"]).is_empty(),
+        "filters compose: crawl-1 has no finding under that rule"
     );
 
     // A filter that matches nothing must not read like an EMPTY STORE — the

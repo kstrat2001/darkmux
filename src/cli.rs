@@ -560,9 +560,10 @@ pub(crate) enum FindingCmd {
         /// Only findings whose recorded context names this mission.
         #[arg(long)]
         mission: Option<String>,
-        /// Only findings from this role execution (the key's first half).
-        #[arg(long)]
-        execution: Option<String>,
+        /// Only findings from this role execution (the `exec-...` id
+        /// `darkmux dispatch` prints; the key's first half).
+        #[arg(long, value_parser = crate::flow_cli::parse_execution_arg)]
+        execution: Option<darkmux_types::execution_id::ExecutionId>,
         /// Only findings whose recorded context names this rule.
         #[arg(long)]
         rule: Option<String>,
