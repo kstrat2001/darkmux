@@ -2555,10 +2555,10 @@ describe("runRegions: host samples belong to the run's own machine (5.0 R2, R3)"
     expect(labelsOf(v)).toContain("CPU");
   });
 
-  it("a peer's run with no samples says they are not streamed to this viewer, not that none exist", () => {
+  it("a peer's run, whose own records are on screen, says no host samples for this run, never that they are not streamed", () => {
     const v = view(peerRun({ machine_id: "darkbook", machine_uid: "UID-DARK" }), "UID-MAC");
     const host = v.metrics.find((m) => m.label === "HOST")!;
-    expect(host.sub).toBe("host samples not streamed to this viewer");
+    expect(host.sub).toBe("no host samples for this run");
   });
 
   it("this machine's own run with no samples keeps the plain no-samples line", () => {

@@ -759,13 +759,6 @@ function ranHere(on: { name: string; uid: string }, viewerUid: string | null): b
   return viewerUid !== null && ((on.uid !== "" && sameUid(on.uid, viewerUid)) || (on.name !== "" && sameUid(on.name, viewerUid)));
 }
 
-/** (5.0 R3) Whether the run is known to have executed on some OTHER machine
- *  than the viewer's: both sides identified, and different. What a peer's run
- *  has no samples for is unknown to this viewer, not absent. */
-function ranElsewhere(on: { name: string; uid: string }, viewerUid: string | null): boolean {
-  return viewerUid !== null && (on.uid !== "" || on.name !== "") && !ranHere(on, viewerUid);
-}
-
 /** (#2834) The route line: the dialect and address the dispatch record
  *  names, read as facts. `openai:` names the request FORMAT, not a vendor,
  *  so a local server speaking it is labelled by its address, never as
@@ -1063,13 +1056,16 @@ function avgHighTile(label: string, m: { avg: number | null; high: number | null
 /** The CPU / RAM / GPU tiles for whichever figures were sampled. (#2413 M4)
  *  A model-work run whose host join came up empty says so ("no host
  *  samples", the machine drawer's words) rather than silently dropping the
- *  tiles; a run with no model work has nothing to sample. */
-function hostTiles(agg: ReturnType<typeof hostAggregate>, hasModelWork: boolean, peerRun: boolean): Tile[] {
+ *  tiles; a run with no model work has nothing to sample. The run's own
+ *  records are on screen, so its machine streams here: `machine.telemetry`
+ *  rides the same flow stream, and a missing sample means the sampler did
+ *  not cover the run. */
+function hostTiles(agg: ReturnType<typeof hostAggregate>, hasModelWork: boolean): Tile[] {
   const tiles: Tile[] = [];
   if (agg.cpu.high != null) tiles.push(avgHighTile("CPU", agg.cpu));
   if (agg.mem.high != null) tiles.push(avgHighTile("RAM", agg.mem));
   if (agg.gpu.high != null) tiles.push(avgHighTile("GPU", agg.gpu));
-  if (hasModelWork && tiles.length === 0) tiles.push({ value: "—", label: "HOST", sub: peerRun ? "host samples not streamed to this viewer" : "no host samples for this run" });
+  if (hasModelWork && tiles.length === 0) tiles.push({ value: "—", label: "HOST", sub: "no host samples for this run" });
   return tiles;
 }
 
@@ -1726,7 +1722,7 @@ export function runRegions(
   if (hasModelWork) push(systemIdx, { value: String(comps.length), label: "COMPACTIONS" });
   // (#2890) Thermal rest rides under ACTIVE TIME when that cell exists.
   for (const t of restTiles(rests, armed, activeInModel)) push(systemIdx, t);
-  for (const t of hostTiles(hostAgg, hasModelWork, ranElsewhere(ranOn(d, firstSessRec), viewerUid))) push(systemIdx, t);
+  for (const t of hostTiles(hostAgg, hasModelWork)) push(systemIdx, t);
 
   // (#1973) Indices into `metrics`, not a second copy — one ordered list, one
   // grouping over it, so the two cannot drift apart. TURNS/TOKENS/CTX/
