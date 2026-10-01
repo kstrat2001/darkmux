@@ -1086,6 +1086,32 @@ fn max_turns_is_a_bound_not_a_failure_and_the_step_still_completes() {
     assert_eq!(parsed.result, "unit_budget_exhausted", "a BOUND, never `error`");
 }
 
+/// (F11, 5.0 dogfood) A unit cut at its turn cap did none of its work, so its
+/// step must complete DEGRADED: the run's outcome reads the step's own
+/// degraded reason, and a clean `stop` carries none.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn a_budget_exhausted_unit_completes_degraded_and_a_stop_does_not() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    let ws = TempDir::new().unwrap();
+    let plan = write_plan(ws.path(), "unnamed-predicate", "u-0001", &"e".repeat(40));
+    for (result, want_degraded) in [("max_turns", true), ("stop", false)] {
+        let out = seeded_out_dir(ws.path(), 0);
+        let kind = CrawlUnitStepKind::with_dispatch(Arc::new(move |_| ok_result(envelope(result, 10, 5, 900), out.clone())));
+        let step = unit_step(serde_json::json!({ "plan": plan.to_string_lossy(), "unit": "u-0001" }));
+        let outcome = kind
+            .run(&step, &unit_task(), &BTreeMap::new(), &darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission(MISSION).unwrap()))
+            .unwrap();
+        assert_eq!(outcome.degraded.is_some(), want_degraded, "result={result}: {:?}", outcome.degraded);
+        if want_degraded {
+            let reason = outcome.degraded.unwrap();
+            assert!(reason.contains("u-0001") && reason.contains("budget"), "{reason}");
+        }
+    }
+}
+
 #[test]
 #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
 fn a_no_progress_tail_ends_a_clean_stop_as_budget_exhausted() {

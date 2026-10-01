@@ -224,7 +224,68 @@ pub enum MissionOutcomeStatus {
     Unknown,
 }
 
+/// What a mission's grow templates did across the whole run (F10, 5.0
+/// dogfood): how many copies were minted, and how many templates grew zero
+/// because their producer step ended non-`Complete`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GrowthTally {
+    pub copies_grown: usize,
+    pub producers_errored: usize,
+}
+
+impl GrowthTally {
+    /// Some template's producer errored and no template grew a single copy:
+    /// the run never got to its real work.
+    pub fn planned_nothing_after_errors(&self) -> bool {
+        self.producers_errored > 0 && self.copies_grown == 0
+    }
+}
+
+/// The typed facts a run's status is decided from: step buckets (see
+/// `partition_step_outcomes` in `mission_launch.rs`), the steps that completed
+/// reporting partial work, and what growth did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunTally {
+    pub completed: usize,
+    pub errored: usize,
+    pub never_ran: usize,
+    pub degraded: usize,
+    pub growth: GrowthTally,
+}
+
 impl MissionOutcomeStatus {
+    /// The lowercase word every operator surface prints for this status (the
+    /// same spelling the envelope serializes), so no surface re-derives it.
+    pub fn word(self) -> &'static str {
+        match self {
+            MissionOutcomeStatus::Clean => "clean",
+            MissionOutcomeStatus::Degraded => "degraded",
+            MissionOutcomeStatus::Degenerate => "degenerate",
+            MissionOutcomeStatus::Error => "error",
+            MissionOutcomeStatus::Unknown => "unknown",
+        }
+    }
+
+    /// The ONE place a gate-less generic run's status is decided from its
+    /// typed results (F10/F11, 5.0 dogfood). Every surface reads this: the
+    /// envelope, the exit code, `run list` and the runs board.
+    ///
+    /// - nothing errored, never ran or degraded -> `Clean`.
+    /// - nothing completed, or growth planned nothing because its producers
+    ///   errored (so no unit was ever reviewed or crawled) -> `Error`: the run
+    ///   did none of its work, however many bookkeeping steps (deliver,
+    ///   summarize) completed around the hole.
+    /// - otherwise (some work done, some lost) -> `Degraded`.
+    pub fn decide(t: &RunTally) -> Self {
+        if t.errored == 0 && t.never_ran == 0 && t.degraded == 0 {
+            MissionOutcomeStatus::Clean
+        } else if (t.completed == 0 && t.errored > 0) || t.growth.planned_nothing_after_errors() {
+            MissionOutcomeStatus::Error
+        } else {
+            MissionOutcomeStatus::Degraded
+        }
+    }
+
     /// Derive a `status` from a [`RunOutcome`] — the ONE place a driver's
     /// typed outcome becomes the untyped four-value status every existing
     /// consumer reads. See the module doc's "`outcome` — the typed source"
@@ -749,6 +810,40 @@ pub fn finalize_mission_with_payload(envelope: &MissionEnvelope, payload: Option
 
 #[cfg(test)]
 mod tests {
+
+    // ── (F10/F11) the one status decision ────────────────────────────
+
+    fn tally(completed: usize, errored: usize, never_ran: usize, degraded: usize) -> RunTally {
+        RunTally { completed, errored, never_ran, degraded, growth: GrowthTally::default() }
+    }
+
+    #[test]
+    fn decide_reads_every_typed_result_in_one_place() {
+        use MissionOutcomeStatus::*;
+        assert_eq!(MissionOutcomeStatus::decide(&tally(3, 0, 0, 0)), Clean);
+        // F11: a step that completed but reported partial work is never clean.
+        assert_eq!(MissionOutcomeStatus::decide(&tally(3, 0, 0, 1)), Degraded);
+        assert_eq!(MissionOutcomeStatus::decide(&tally(2, 1, 0, 0)), Degraded);
+        assert_eq!(MissionOutcomeStatus::decide(&tally(2, 0, 1, 0)), Degraded);
+        assert_eq!(MissionOutcomeStatus::decide(&tally(0, 2, 0, 0)), Error);
+    }
+
+    /// F10: every planning step errored, so no unit grew and nothing was
+    /// reviewed. The delivery steps around the hole still completed, which the
+    /// old rule read as `Degraded`; a run that did none of its work is `Error`.
+    #[test]
+    fn decide_is_error_when_growth_planned_nothing_because_producers_errored() {
+        let mut t = tally(8, 7, 0, 0);
+        t.growth = GrowthTally { copies_grown: 0, producers_errored: 7 };
+        assert_eq!(MissionOutcomeStatus::decide(&t), MissionOutcomeStatus::Error);
+        // Some producers errored but others grew real work: partial, so degraded.
+        t.growth = GrowthTally { copies_grown: 5, producers_errored: 2 };
+        assert_eq!(MissionOutcomeStatus::decide(&t), MissionOutcomeStatus::Degraded);
+        // A plan that legitimately found nothing (no producer errored) is not an error.
+        t = tally(8, 0, 0, 0);
+        t.growth = GrowthTally { copies_grown: 0, producers_errored: 0 };
+        assert_eq!(MissionOutcomeStatus::decide(&t), MissionOutcomeStatus::Clean);
+    }
     use super::*;
     use crate::types::{Mission, MissionStatus, Phase, PhaseStatus};
 

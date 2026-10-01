@@ -1376,6 +1376,9 @@ pub fn launch(
     // Steps that completed with part of their own work failed, across every
     // phase's scheduler pass: the run's verdict must not read Clean over them.
     let mut degraded_steps: Vec<crew::scheduler::DegradedStep> = Vec::new();
+    // What growth did across every phase (F10): `decide` reads it so a run
+    // whose planning steps all errored never reads as a partial success.
+    let mut growth = crew::envelope::GrowthTally::default();
     for phase in &config.phases {
         let Some(real_phase_id) = real_phase_ids.get(&phase.id).cloned() else {
             continue;
@@ -1402,8 +1405,10 @@ pub fn launch(
         ) {
             Ok(grown) => {
                 for (event, grown_tasks, grown_steps, producer_error) in grown {
+                    growth.copies_grown += event.minted.len();
                     if let Some(pe) = &producer_error {
                         phase_producer_errored = true;
+                        growth.producers_errored += 1;
                         println!(
                             "  {}",
                             style::warn(&format!(
@@ -1793,7 +1798,7 @@ pub fn launch(
     // Gate-less generic graph (Tier-1-only kinds) — the standard
     // MissionEnvelope finalization applies: every run reaches a terminal
     // phase/mission status (Packet 2's own doctrine for gate-free work).
-    let mut envelope = build_envelope(&mission_id, config, &real_phase_ids, &tasks, &steps, &degraded_steps);
+    let mut envelope = build_envelope(&mission_id, config, &real_phase_ids, &tasks, &steps, &degraded_steps, growth);
     // (#2678) Stamp the run's own wall-clock before finalization, so the
     // number that decides whether a CI job's `timeout-minutes` needs raising
     // rides the run's artifact instead of being inferred from workflow logs
@@ -1825,7 +1830,7 @@ pub fn launch(
     // (#2131) Disarms `guard` — the third and last known terminal point.
     guard.close(|| crew::envelope::finalize_mission_with_payload(&envelope, close_payload));
 
-    print_run_summary(&mission_id, &steps);
+    print_run_summary(&mission_id, &steps, status, degraded_steps.len());
 
     use crew::envelope::MissionOutcomeStatus;
     // (#1877 item 4 — deliberately deferred, corrected) `build_envelope`
@@ -4227,23 +4232,23 @@ fn build_envelope(
     tasks: &[crew::types::Task],
     steps: &BTreeMap<String, crew::types::Step>,
     degraded: &[crew::scheduler::DegradedStep],
+    growth: crew::envelope::GrowthTally,
 ) -> crew::envelope::MissionEnvelope {
-    use crew::envelope::{MissionEnvelope, MissionOutcomeStatus};
+    use crew::envelope::{MissionEnvelope, MissionOutcomeStatus, RunTally};
 
     let (completed, errored, never_ran) = partition_step_outcomes(steps);
 
-    let status = if errored.is_empty() && never_ran.is_empty() && degraded.is_empty() {
-        MissionOutcomeStatus::Clean
-    } else if completed.is_empty() && !errored.is_empty() {
-        // Nothing completed AND something failed — the run is an Error,
-        // the pre-existing row. A run with no error whose work simply
-        // never happened is Degraded rather than Error on purpose:
-        // nothing failed, so `Error` would name a failure that has no
-        // step to point at.
-        MissionOutcomeStatus::Error
-    } else {
-        MissionOutcomeStatus::Degraded
-    };
+    // The ONE decision (F10/F11): see `MissionOutcomeStatus::decide`. A run
+    // with no error whose work simply never happened stays Degraded rather
+    // than Error: nothing failed, so `Error` would name a failure with no
+    // step to point at.
+    let status = MissionOutcomeStatus::decide(&RunTally {
+        completed: completed.len(),
+        errored: errored.len(),
+        never_ran: never_ran.len(),
+        degraded: degraded.len(),
+        growth,
+    });
 
     let reason = if errored.is_empty() {
         None
@@ -4507,21 +4512,37 @@ fn finalize_reconciled_mission(
     crew::envelope::finalize_mission(&envelope);
 }
 
-fn print_run_summary(mission_id: &str, steps: &BTreeMap<String, crew::types::Step>) {
-    // (#2310 swarm F) The summary counts what NEVER RAN too — a run whose
-    // declared steps were abandoned used to print "N complete, 0 errored"
-    // and read as a clean run on the operator's own terminal. (F3) Off the
+fn print_run_summary(
+    mission_id: &str,
+    steps: &BTreeMap<String, crew::types::Step>,
+    status: crew::envelope::MissionOutcomeStatus,
+    degraded: usize,
+) {
+    println!("\n{}", style::header(&run_summary_line(mission_id, steps, status, degraded)));
+    println!("  {}", style::dim(&format!("darkmux mission status   (or) darkmux mission debrief {mission_id}")));
+}
+
+/// The terminal line, reading the run's ONE decided status (F11) beside the
+/// step counts, so "0 errored" can never stand alone over a run that did not
+/// finish its work. Pure so the wording is testable.
+fn run_summary_line(
+    mission_id: &str,
+    steps: &BTreeMap<String, crew::types::Step>,
+    status: crew::envelope::MissionOutcomeStatus,
+    degraded: usize,
+) -> String {
+    // (#2310 swarm F) The summary counts what NEVER RAN too. (F3) Off the
     // same exhaustive partition the envelope uses, so the terminal line and
     // the envelope cannot classify a status differently.
     let (completed, errored, never_ran) = partition_step_outcomes(steps);
-    let (complete, errored, abandoned) = (completed.len(), errored.len(), never_ran.len());
-    println!(
-        "\n{}",
-        style::header(&format!(
-            "▶ mission `{mission_id}` finished — {complete} step(s) complete, {errored} errored, {abandoned} never ran"
-        ))
-    );
-    println!("  {}", style::dim(&format!("darkmux mission status   (or) darkmux mission debrief {mission_id}")));
+    let partial = if degraded > 0 { format!(" ({degraded} degraded)") } else { String::new() };
+    format!(
+        "▶ mission `{mission_id}` finished {} — {} step(s) complete{partial}, {} errored, {} never ran",
+        status.word(),
+        completed.len(),
+        errored.len(),
+        never_ran.len()
+    )
 }
 
 // (#2310 P4d) Test-only since the bespoke review launcher — its last
@@ -8094,7 +8115,7 @@ mod tests {
         steps.insert("p2-step".to_string(), scripted_step("p2-step", NodeStatus::Error));
         steps.insert("p3-step".to_string(), scripted_step("p3-step", NodeStatus::Planned));
 
-        let env = build_envelope(mid, &config, &real, &tasks, &steps, &[]);
+        let env = build_envelope(mid, &config, &real, &tasks, &steps, &[], Default::default());
         use crew::envelope::{MissionOutcomeStatus, PhaseOutcomeKind};
         assert_eq!(env.status, MissionOutcomeStatus::Degraded, "some complete + some errored → Degraded");
         // (#1877 item 4 — deferred, pinned) The generic scheduler graph
@@ -8126,7 +8147,7 @@ mod tests {
         for sid in ["p1-step", "p2-step", "p3-step"] {
             steps.insert(sid.to_string(), scripted_step(sid, NodeStatus::Complete));
         }
-        let env = build_envelope(mid, &config, &real, &tasks, &steps, &[]);
+        let env = build_envelope(mid, &config, &real, &tasks, &steps, &[], Default::default());
         use crew::envelope::{MissionOutcomeStatus, PhaseOutcomeKind};
         assert_eq!(env.status, MissionOutcomeStatus::Clean);
         assert_eq!(env.phases.len(), 3);
@@ -8153,14 +8174,53 @@ mod tests {
             step_id: "p2-step".to_string(),
             reason: "dispatch.map step `p2-step`: 1 of 3 item(s) failed".to_string(),
         }];
-        let env = build_envelope(mid, &config, &real, &tasks, &steps, &degraded);
+        let env = build_envelope(mid, &config, &real, &tasks, &steps, &degraded, Default::default());
         use crew::envelope::MissionOutcomeStatus;
         assert_eq!(env.status, MissionOutcomeStatus::Degraded);
         assert_eq!(env.warnings, vec!["step `p2-step` completed degraded: dispatch.map step `p2-step`: 1 of 3 item(s) failed"]);
 
-        let clean = build_envelope(mid, &config, &real, &tasks, &steps, &[]);
+        let clean = build_envelope(mid, &config, &real, &tasks, &steps, &[], Default::default());
         assert_eq!(clean.status, MissionOutcomeStatus::Clean, "the same steps with no degraded report stay Clean");
         assert!(clean.warnings.is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn build_envelope_is_error_when_every_planning_step_errored_even_though_deliver_completed() {
+        // (F10, 5.0 dogfood) A review whose planning steps all errored grew no
+        // unit, so nothing was reviewed; the deliver step still rendered an
+        // (empty) review and completed. That read `degraded` and exited 0.
+        let config: MissionConfig = serde_json::from_str(GEN3_CONFIG).unwrap();
+        let mid = "gen3nothingplanned";
+        let real = derive_phase_ids(mid, &config);
+        let (rp1, rp2, rp3) = (real["p1"].clone(), real["p2"].clone(), real["p3"].clone());
+        let tasks =
+            vec![task_with_step(&rp1, "plan-step"), task_with_step(&rp2, "other-plan-step"), task_with_step(&rp3, "deliver")];
+        let mut steps = BTreeMap::new();
+        steps.insert("plan-step".to_string(), scripted_step("plan-step", NodeStatus::Error));
+        steps.insert("other-plan-step".to_string(), scripted_step("other-plan-step", NodeStatus::Error));
+        steps.insert("deliver".to_string(), scripted_step("deliver", NodeStatus::Complete));
+        let nothing_grown = crew::envelope::GrowthTally { copies_grown: 0, producers_errored: 2 };
+        let env = build_envelope(mid, &config, &real, &tasks, &steps, &[], nothing_grown);
+        assert_eq!(env.status, crew::envelope::MissionOutcomeStatus::Error);
+
+        let partial = crew::envelope::GrowthTally { copies_grown: 3, producers_errored: 1 };
+        let env = build_envelope(mid, &config, &real, &tasks, &steps, &[], partial);
+        assert_eq!(env.status, crew::envelope::MissionOutcomeStatus::Degraded, "some work grew: partial, not error");
+    }
+
+    #[test]
+    fn the_terminal_summary_names_the_decided_status_not_just_zero_errored() {
+        // (F11, 5.0 dogfood) "3 step(s) complete, 0 errored" over a cut-off
+        // crawl read as a clean run on the operator's own terminal.
+        let mut steps = BTreeMap::new();
+        for sid in ["a", "b", "c"] {
+            steps.insert(sid.to_string(), scripted_step(sid, NodeStatus::Complete));
+        }
+        let line = run_summary_line("m-1", &steps, crew::envelope::MissionOutcomeStatus::Degraded, 1);
+        assert!(line.contains("finished degraded") && line.contains("(1 degraded)"), "{line}");
+        let clean = run_summary_line("m-1", &steps, crew::envelope::MissionOutcomeStatus::Clean, 0);
+        assert!(clean.contains("finished clean") && !clean.contains("degraded)"), "{clean}");
     }
 
     #[test]
@@ -8492,7 +8552,7 @@ mod tests {
         let mut steps = BTreeMap::new();
         steps.insert("p1-s1".to_string(), scripted_step("p1-s1", NodeStatus::Complete));
 
-        let env = build_envelope(mid, &config, &real, &tasks, &steps, &[]);
+        let env = build_envelope(mid, &config, &real, &tasks, &steps, &[], Default::default());
         use crew::envelope::MissionOutcomeStatus;
         assert_eq!(env.status, MissionOutcomeStatus::Clean, "the one executed step completed → Clean");
         assert!(env.phases.iter().any(|p| p.phase_id == rp1), "executed phase p1 is finalized");
@@ -8571,7 +8631,7 @@ mod tests {
         steps.insert("p2-step".to_string(), scripted_step("p2-step", NodeStatus::Error));
         steps.insert("p3-step".to_string(), scripted_step("p3-step", NodeStatus::Planned));
 
-        let env = build_envelope(mid, &config, &real, &tasks, &steps, &[]);
+        let env = build_envelope(mid, &config, &real, &tasks, &steps, &[], Default::default());
         crew::envelope::finalize_mission(&env);
 
         assert_eq!(phase_status_on_disk(mid, &rp1), PhaseStatus::Complete);

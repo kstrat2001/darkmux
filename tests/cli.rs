@@ -10118,6 +10118,57 @@ fn mission_launch_fails_loudly_when_the_producer_output_is_not_a_json_path() {
     );
 }
 
+/// (F10, 5.0 dogfood) Every planning step errored, so no unit grew and nothing
+/// was done, yet a later `deliver` step still completed. That ended `degraded`
+/// with exit 0; a run that did none of its work is an error.
+#[test]
+fn a_run_whose_planning_errored_and_grew_nothing_is_an_error_not_degraded() {
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let config_dir = home.path().join("mission-configs");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("plan-fails.json"),
+        r#"{
+        "id": "plan-fails",
+        "name": "Plan Fails",
+        "schema_version": "3.2",
+        "outcome_from": "deliver",
+        "phases": [
+          { "id": "plan", "tasks": [{ "id": "plan-task", "steps": [
+              { "id": "plan-step", "kind": "procedural.shell", "config": { "command": "exit 3" } }]}]},
+          { "id": "units", "tasks": [{ "id": "unit-task", "depends_on": ["plan-task"],
+              "grow": { "from": "plan-task", "items": "units", "id": "{{item.id}}", "config": {} },
+              "steps": [{ "id": "unit-step", "kind": "procedural.noop", "config": {} }]}]},
+          { "id": "report", "tasks": [{ "id": "deliver", "steps": [
+              { "id": "deliver-step", "kind": "procedural.noop", "config": {} }]}]}
+        ]
+    }"#,
+    )
+    .unwrap();
+    let out = darkmux_cmd()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args(["mission", "launch", "plan-fails"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let dir = one_mission_dir(&home);
+    let steps = probe_steps(&dir);
+    // Step ids carry the minted mission id as a prefix.
+    let status_of = |suffix: &str| {
+        steps.iter().find(|(id, _)| id.ends_with(suffix)).map(|(_, v)| v.0.clone()).unwrap_or_default()
+    };
+    assert_eq!(status_of("plan-step"), "error", "precondition: {steps:#?}\n{stdout}");
+    assert_eq!(status_of("deliver-step"), "complete", "precondition: delivery still ran: {steps:#?}\n{stdout}");
+    let envelope: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.join("envelope.json")).unwrap()).unwrap();
+    assert_eq!(envelope["status"], serde_json::json!("error"), "nothing was done: {envelope}");
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert!(stdout.contains("finished error"), "the summary names the decided status:\n{stdout}");
+}
+
 // ── (#2310 fix-loop packet C) scheduler semantics under failure ─────────
 //
 // The probe config the #2310 backend review (findings S4-1/S4-2/S4-3,
@@ -10854,7 +10905,7 @@ fn forward_dep_task_runs_in_the_later_phases_pass() {
     }
     assert_eq!(steps.len(), 3, "steps: {steps:#?}");
     assert!(
-        stdout.contains("3 step(s) complete, 0 errored"),
+        stdout.contains("finished clean — 3 step(s) complete, 0 errored"),
         "the summary must count all three\n{stdout}"
     );
     assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");

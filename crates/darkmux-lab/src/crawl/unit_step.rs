@@ -1550,6 +1550,11 @@ impl StepKind for CrawlUnitStepKind {
             finding_refs,
         };
 
+        // (F11) The unit's own typed result decides the step's degraded
+        // reason, so the run's outcome reads it from the one place every
+        // step reports a partial result.
+        let degraded = unit_degraded_reason(&outcome_record.unit, &outcome_record.result);
+
         Ok(StepOutcome {
             output: darkmux_crew::step_output::Output::wrap(
                 UNIT_OUTCOME_KIND,
@@ -1558,9 +1563,19 @@ impl StepKind for CrawlUnitStepKind {
             )
             .to_output_string()?,
             flow_records: Vec::new(),
-            degraded: None,
+            degraded,
         })
     }
+}
+
+/// (F11) Why a unit that completed did NOT finish its work, or `None` when it
+/// did. A unit cut at its turn or no-progress bound is a BOUND, not a failure
+/// (its step stays `Complete`, its findings are kept), but it did none of the
+/// work it was planned for, so the run it belongs to must not read clean: the
+/// scheduler records this reason and the run's outcome becomes `Degraded`.
+fn unit_degraded_reason(unit: &str, result: &str) -> Option<String> {
+    (result == UNIT_BUDGET_EXHAUSTED)
+        .then(|| format!("unit `{unit}` hit its budget (turn or no-progress bound) before finishing its work"))
 }
 
 /// (#2310 P4c-2b) Dedup [`FindingRef`]s across a unit's draws — DESIGN.md
