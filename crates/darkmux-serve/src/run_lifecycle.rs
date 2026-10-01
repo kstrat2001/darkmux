@@ -340,6 +340,25 @@ mod tests {
         assert!(f.latest().is_some_and(|a| a.close.is_some()), "a seal reads every record");
     }
 
+    /// (#2101) A peer's run stays live through tool and turn records alone:
+    /// the fleet stream no longer carries heartbeats, and the run's newest
+    /// activity is its last timed record of any kind.
+    #[test]
+    fn a_run_stays_live_through_tool_and_turn_records_without_heartbeats() {
+        let mut f = RunFold::default();
+        fold(&mut f, FlowAction::DispatchStart, "a", "2026-09-27T10:00:00Z");
+        fold(&mut f, FlowAction::DispatchTurn, "a", "2026-09-27T10:01:00Z");
+        fold(&mut f, FlowAction::DispatchTool, "a", "2026-09-27T10:02:00Z");
+        f.seal();
+        let latest = f.latest().expect("an attempt");
+        assert!(latest.close.is_none(), "still open");
+        assert_eq!(latest.last_activity_ts.as_deref(), Some("2026-09-27T10:02:00Z"));
+        let at = |ts: &str| crate::runs::parse_flow_ts(ts).unwrap() * 1_000;
+        let stale = 1_200_000;
+        assert!(quiet_clock_live(latest.last_activity_ts.as_deref(), None, at("2026-09-27T10:12:00Z"), stale));
+        assert!(!quiet_clock_live(latest.last_activity_ts.as_deref(), None, at("2026-09-27T10:23:00Z"), stale));
+    }
+
     /// A copy of a sealed fold shares its records and attempts.
     #[test]
     fn a_copy_shares_records_and_attempts() {

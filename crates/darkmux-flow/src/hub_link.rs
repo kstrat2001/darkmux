@@ -163,7 +163,11 @@ impl Backfill<'_> {
         let ts = v.get("ts")?.as_str()?;
         let uid = v.get("machine_uid").and_then(|u| u.as_str());
         let ours = uid.is_none() || uid == self.own_uid;
-        let wanted = ts >= self.since && ours && crate::flow_record_identity(&v) != self.skip_identity;
+        let publishable = crate::reader::action_of(&v).as_ref().is_none_or(crate::reaches_fleet_stream);
+        let wanted = ts >= self.since
+            && ours
+            && publishable
+            && crate::flow_record_identity(&v) != self.skip_identity;
         wanted.then(|| (ts.to_string(), v.to_string()))
     }
 }

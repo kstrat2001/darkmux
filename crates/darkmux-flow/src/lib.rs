@@ -1469,9 +1469,23 @@ impl RedisSink {
     pub fn max_len(&self) -> Option<usize> { self.max_len }
 }
 
+/// Whether a record rides the shared fleet stream (#2101). Heartbeats are
+/// local-only liveness detail: the local file sink keeps every one, but at a
+/// 2 s cadence they were most of a long mission's records and flushed other
+/// machines' work out of the capped stream. The fleet stream carries work
+/// records and machine telemetry; presence is a separate TTL key, and any
+/// other timed record (`dispatch.tool`, `dispatch.turn`) keeps a peer's run
+/// live. Used by the live write AND the outage backfill.
+pub(crate) fn reaches_fleet_stream(action: &FlowAction) -> bool {
+    *action != FlowAction::DispatchTurnHeartbeat
+}
+
 impl FlowSink for RedisSink {
     fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
         let record = record.get();
+        if !reaches_fleet_stream(&record.action) {
+            return Ok(());
+        }
         // (#388) A sink that is not due to try skips silently: no connection
         // attempt (so no 500ms timeout) and no log. Returning Ok keeps this
         // best-effort coordination sink from masking the durable
@@ -2354,6 +2368,38 @@ mod tests {
         assert!(sink.is_disabled());
         // Already disabled: further failures don't re-flip (no repeat log).
         assert!(!sink.note_failure(&e, TS));
+    }
+
+    /// (#2101) A heartbeat never reaches the fleet stream; any other record
+    /// does. Observed through the sink's own failure accounting against an
+    /// unreachable hub: a record that is attempted fails (and counts toward
+    /// the disable threshold), one that is skipped never touches the hub.
+    #[test]
+    fn a_heartbeat_is_not_xadded_but_a_tool_record_is() {
+        let record = |action: FlowAction| {
+            let mut r = minimal_record();
+            r.action = action;
+            r.execution_id = Some(darkmux_types::execution_id::ExecutionId::mint());
+            r.session_id = Some("sess-2101".to_string());
+            r
+        };
+        let beat = unreachable_sink();
+        for _ in 0..3 {
+            let r = record(FlowAction::DispatchTurnHeartbeat);
+            let checked = CheckedRecord::check(&r).expect("a heartbeat is a valid record");
+            beat.persist(checked).unwrap();
+        }
+        assert!(!beat.is_disabled(), "skipped heartbeats must never attempt (or fail against) the hub");
+
+        let tool = unreachable_sink();
+        for _ in 0..3 {
+            let r = record(FlowAction::DispatchTool);
+            let checked = CheckedRecord::check(&r).expect("a tool record is valid");
+            tool.persist(checked).unwrap();
+        }
+        assert!(tool.is_disabled(), "a tool record is attempted, and 3 failures trip the sink");
+        assert!(!reaches_fleet_stream(&FlowAction::DispatchTurnHeartbeat));
+        assert!(reaches_fleet_stream(&FlowAction::MachineTelemetry));
     }
 
     #[test]
