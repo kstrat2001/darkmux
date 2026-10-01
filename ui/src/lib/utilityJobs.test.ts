@@ -7,6 +7,7 @@ import {
   isKnownUtilityJob,
   machineUtilityJob,
   openUtilityJobs,
+  utilityStrip,
   utilityJobVisual,
   utilityUsageByJob,
 } from "./utilityJobs";
@@ -227,5 +228,20 @@ describe("a utility record with no usable time (the bad-timestamp policy)", () =
 
   test("an untimed end still closes its job", () => {
     expect(openUtilityJobs([start("2026-09-27T09:59:00Z"), end("garbage")], NOW)).toEqual([]);
+  });
+});
+
+describe("utilityStrip: another machine's records never close this machine's job (5.0 R2)", () => {
+  const SID = "relay-sid-1";
+  test("a receiver-side turn on a peer, in the same session, leaves the sender's open compaction open", () => {
+    const own = start(1, UTILITY_JOB.compaction, { session_id: SID });
+    const peerTurn = norm({ ts: at(5), action: ACTION.DispatchTurn, machine_uid: "mach-b", session_id: SID });
+    const strip = utilityStrip([own, peerTurn], M, ms(6), null);
+    expect(strip.job?.job).toBe(UTILITY_JOB.compaction);
+  });
+  test("this machine's own later turn in that session still closes it", () => {
+    const own = start(1, UTILITY_JOB.compaction, { session_id: SID });
+    const ownTurn = norm({ ts: at(5), action: ACTION.DispatchTurn, machine_uid: M, session_id: SID });
+    expect(utilityStrip([own, ownTurn], M, ms(6), null).job).toBeNull();
   });
 });

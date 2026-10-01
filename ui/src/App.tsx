@@ -36,7 +36,7 @@ import { ReadyHeadline } from "./components/ReadyHeadline";
 import { FleetCoverageNotice, useDegradedFleetSource } from "./components/FleetCoverageNotice";
 import { FlowReadNotice } from "./components/FlowReadNotice";
 import { earliestRecordDate, firstRecordDate, missionReplayDate, todayUTC } from "./lib/flow";
-import { displayNameOf, localMachineUid } from "./lib/machineIdentity";
+import { displayNameOf, localMachineUid, recordsOfMachine } from "./lib/machineIdentity";
 import { dispatchHash, isLiveRoute, showsEventLog, tokRateConnectionEvidence } from "./lib/route";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "./lib/fetcher";
@@ -385,28 +385,6 @@ export function App() {
     selectedMissionStepId && stepHeaderFields && route.kind === "mission" ? (
       <StepHeaderBlock missionId={route.missionId} fields={stepHeaderFields} onBack={() => onSelectStep(null)} />
     ) : null;
-  const eventLogRecords = useMemo(() => {
-    // Mission has no playhead concept (`transportShown` already excludes
-    // it below) — its own fold is always the full, historical record set,
-    // never scoped to a scrubbed time.
-    if (route.kind === "mission") {
-      const all = missionEvents?.records ?? [];
-      // (#2189) `step_id` EQUALITY, same rule `buildStepHeaderFields`'s own
-      // doc names — the mainstay column scopes to exactly this step's own
-      // records when one is selected, never a re-fetch (one source of
-      // records, filtered here, at the point they're handed to the
-      // column — see #2189's own issue text).
-      return route.stepId ? all.filter((r) => stepIdOf(r) === route.stepId) : all;
-    }
-    if (playhead === null) return routeRecords.records;
-    // A static build's runs/machine/console routes have no slice of their
-    // own (the live window is empty there); the day's log, scoped to the
-    // playhead, is what the transport is scrubbing. Playback and dispatch
-    // routes keep their own slice, scoped the same way.
-    const own = route.kind === "playback" || route.kind === "dispatch" || source.kind === "daemon";
-    const base = own ? routeRecords.records : (dayRecords ?? []);
-    return recordsAsOf(base, playhead);
-  }, [route.kind, selectedMissionStepId, missionEvents, playhead, routeRecords.records, source.kind, dayRecords]);
   // (#2071) The sticky block's measured height feeds `--chrome-h`, the
   // offset the event log column sticks under on desktop. It used to be a
   // 97px constant that assumed the masthead + one chrome row.
@@ -507,18 +485,46 @@ export function App() {
   // (#2929) The route carries a machine KEY, not the uid; resolve it the way
   // `MachineLens` does (an unresolved key names no machine, and labels as
   // one nothing knows — the same not-found title an unknown uid got).
+  // The drilled key's machine, resolved once for the label and the event log.
+  const drilledUid = useMemo(
+    () => (drilledKey == null ? null : decodeMachineKey({ data: flowWindow.data, liveMachines, specs, roster }, drilledKey).uid),
+    [drilledKey, flowWindow.data, liveMachines, specs, roster],
+  );
   const drilledName = useMemo(() => {
     if (drilledKey == null) return null;
-    const keyCtx = { data: flowWindow.data, liveMachines, specs, roster };
-    const uid = decodeMachineKey(keyCtx, drilledKey).uid;
     // A key naming no machine says so once the window has landed, rather
     // than inventing a label no card shows; blank while it is still loading.
     // (#2965) Not while a flow read is failing: a machine known only from
     // flow records is indistinguishable from an unknown key until it reads.
-    if (uid == null) return flowWindow.settled && flowWindow.failure === null ? MACHINE_NOT_FOUND_LABEL : "";
-    return machineLabel(keyCtx, uid);
-  }, [drilledKey, flowWindow.data, flowWindow.settled, flowWindow.failure, liveMachines, specs, roster]);
+    if (drilledUid == null) return flowWindow.settled && flowWindow.failure === null ? MACHINE_NOT_FOUND_LABEL : "";
+    return machineLabel({ data: flowWindow.data, liveMachines, specs, roster }, drilledUid);
+  }, [drilledKey, drilledUid, flowWindow.data, flowWindow.settled, flowWindow.failure, liveMachines, specs, roster]);
   const targetMachineName = route.kind === "machine" ? (drilledKey != null ? drilledName : localName) : null;
+  const eventLogRecords = useMemo(() => {
+    // Mission has no playhead concept (`transportShown` already excludes
+    // it below) — its own fold is always the full, historical record set,
+    // never scoped to a scrubbed time.
+    if (route.kind === "mission") {
+      const all = missionEvents?.records ?? [];
+      // (#2189) `step_id` EQUALITY, same rule `buildStepHeaderFields`'s own
+      // doc names — the mainstay column scopes to exactly this step's own
+      // records when one is selected, never a re-fetch (one source of
+      // records, filtered here, at the point they're handed to the
+      // column — see #2189's own issue text).
+      return route.stepId ? all.filter((r) => stepIdOf(r) === route.stepId) : all;
+    }
+    // (5.0 R2) A machine page lists that machine's records, not the fleet's.
+    // An unresolved machine has none to list.
+    if (route.kind === "machine") return recordsOfMachine(routeRecords.records, drilledKey != null ? drilledUid : localUid);
+    if (playhead === null) return routeRecords.records;
+    // A static build's runs/machine/console routes have no slice of their
+    // own (the live window is empty there); the day's log, scoped to the
+    // playhead, is what the transport is scrubbing. Playback and dispatch
+    // routes keep their own slice, scoped the same way.
+    const own = route.kind === "playback" || route.kind === "dispatch" || source.kind === "daemon";
+    const base = own ? routeRecords.records : (dayRecords ?? []);
+    return recordsAsOf(base, playhead);
+  }, [route.kind, selectedMissionStepId, missionEvents, playhead, routeRecords.records, source.kind, dayRecords, drilledKey, drilledUid, localUid]);
 
   // (#1800) `#meta` takes legacy's REPLAY branch on a replay. Until now it
   // computed from `flowWindow` (the live rolling window) on every route, so a

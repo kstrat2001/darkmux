@@ -20,7 +20,7 @@
  */
 
 import type { UtilityJobKind } from "../types/generated/UtilityJobKind";
-import { canonUid, uidOf } from "./machineIdentity";
+import { canonUid, sameUid, uidOf } from "./machineIdentity";
 import { runIndex } from "./runRef";
 import { CALL_KIND, PURPOSE, isUsageRecord, usagePurpose, type UsagePayload } from "./usageRecords";
 import { mergeLive } from "./liveChannel";
@@ -352,7 +352,9 @@ export function utilityStrip(
     const seen = new Set<NormRecord>(own);
     const extra: NormRecord[] = [];
     const ix = runIndex(data);
-    for (const sid of served) for (const g of ix.groupsOfSession(sid)) for (const r of g.records) if (!seen.has(r)) extra.push(r);
+    // (5.0 R2) Only THIS machine's records: a relayed session spans machines,
+    // and the peer's turn is not proof that this machine's job ended.
+    for (const sid of served) for (const g of ix.groupsOfSession(sid)) for (const r of g.records) if (!seen.has(r) && sameUid(uidOf(r), uid)) extra.push(r);
     recs = [...own, ...extra];
   }
   const live = machineUtilityJob(recs, t);

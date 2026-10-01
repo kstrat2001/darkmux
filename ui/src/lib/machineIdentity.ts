@@ -82,6 +82,12 @@ export function matchesMachine(ref: MachineRef, machine: MachineMatch): boolean 
   return !!ref.name && machine.names.has(nameKey(ref.name));
 }
 
+/** The records of the machine `uid` names. A machine nothing is known about
+ *  (`null`) has none: a per-machine surface shows nothing, never everyone's. */
+export function recordsOfMachine(records: readonly NormRecord[], uid: string | null): NormRecord[] {
+  return uid === null ? [] : records.filter((r) => sameUid(r.machine_uid, uid));
+}
+
 /** `uidOf()` — viewer.html:1107. */
 export const uidOf = (r: NormRecord): string => r.machine_uid || "unknown";
 

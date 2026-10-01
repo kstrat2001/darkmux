@@ -557,6 +557,33 @@ describe("App", () => {
     expect(document.querySelector(".eventlog")?.className).not.toMatch(/eventlog--hidden/);
   });
 
+  // (5.0 R2) A machine page's event log is that machine's records, never the
+  // whole fleet's under that machine's name.
+  it("(5.0 R2) the machine page's event log lists only that machine's records", async () => {
+    window.location.hash = "#lens=machine";
+    const now = Date.now();
+    const rec = (uid: string, name: string, sid: string) => ({ ts: new Date(now - 60_000).toISOString(), machine_uid: uid, machine_id: name, session_id: sid, action: "dispatch.start", handle: "coder" });
+    const flow = [rec("UID-MAC", "MacBook-Pro", "s-mac"), rec("UID-DARK", "darkbook", "s-dark"), rec("UID-DARK", "darkbook", "s-dark2")];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        const path = String(url);
+        if (path === "/machine/specs") return Promise.resolve(new Response(JSON.stringify({ machine_id: "MacBook-Pro", machine_uid: "uid-mac" }), { status: 200 }));
+        if (path.startsWith("/flow/")) return Promise.resolve(new Response(JSON.stringify(flow), { status: 200 }));
+        return mockFleetLikeFetch()(url);
+      }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <App />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(document.querySelectorAll(".eventlog__rec").length).toBeGreaterThan(0));
+    expect(document.querySelectorAll(".eventlog__rec")).toHaveLength(1);
+    expect(document.getElementById("logbody")!.textContent).not.toContain("darkbook");
+  });
+
   it("keeps the event-log column VISIBLE on the console lens (#1066)", async () => {
     window.location.hash = "#lens=console";
     vi.stubGlobal(
