@@ -307,13 +307,15 @@ fn lessons_list(json: bool) -> Result<i32> {
     use darkmux_crew::lessons;
         let repo_path = lessons::repo_db_path();
         let global_path = lessons::global_db_path();
-        let repo = lessons::load_entries_best_effort(&repo_path);
+        // Strict: a store this build cannot read (one a newer darkmux wrote)
+        // is an error here, never "no lessons recorded yet".
+        let repo = lessons::load_entries(&repo_path)?;
         // When `$DARKMUX_HOME` collapses both tiers to one root the paths are
         // identical — read once, don't double-display the same entries.
         let global = if global_path == repo_path {
             Vec::new()
         } else {
-            lessons::load_entries_best_effort(&global_path)
+            lessons::load_entries(&global_path)?
         };
 
         if json {
@@ -416,7 +418,7 @@ fn lessons_export(global: bool) -> Result<i32> {
         // `import_json` — the two can't drift.
         let env = lessons::LessonsExport {
             schema_version: lessons::LESSONS_SCHEMA_VERSION,
-            lessons: lessons::load_entries_best_effort(&path),
+            lessons: lessons::load_entries(&path)?,
         };
         cli_json::emit(&env)?;
         Ok(0)
@@ -453,19 +455,17 @@ fn lessons_recall(term: Option<&str>, file: Option<&str>, json: bool) -> Result<
     use darkmux_crew::lessons;
         let repo_path = lessons::repo_db_path();
         let global_path = lessons::global_db_path();
-        let recall_tier = |path: &std::path::Path| -> Vec<lessons::Lesson> {
+        let recall_tier = |path: &std::path::Path| -> Result<Vec<lessons::Lesson>> {
             if !path.exists() {
-                return Vec::new();
+                return Ok(Vec::new());
             }
-            lessons::open_at(path)
-                .and_then(|conn| lessons::recall(&conn, term, file))
-                .unwrap_or_default()
+            lessons::recall(&lessons::open_at(path)?, term, file)
         };
-        let repo = recall_tier(&repo_path);
+        let repo = recall_tier(&repo_path)?;
         let global = if global_path == repo_path {
             Vec::new()
         } else {
-            recall_tier(&global_path)
+            recall_tier(&global_path)?
         };
         if json {
             cli_json::emit(&cli_json::LessonTiers { repo, global })?;

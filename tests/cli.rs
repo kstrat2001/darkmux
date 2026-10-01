@@ -13781,3 +13781,25 @@ fn resume_refusal_carries_one_clear_prefix() {
     assert_eq!(stderr.matches("darkmux dispatch").count(), 1, "one prefix only: {stderr}");
     assert!(!stderr.contains("--resume-from: darkmux dispatch"), "{stderr}");
 }
+
+/// (#3035) A lessons store a newer darkmux wrote is refused by `list`, `export`
+/// and `recall` with the upgrade message. It must never read as "no lessons
+/// recorded yet" (and `export` must never write an empty envelope over it).
+#[test]
+fn a_lessons_store_from_a_newer_darkmux_is_refused_not_read_as_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".darkmux")).unwrap();
+    darkmux_cmd_in_project(dir.path())
+        .args(["memory", "lesson", "add", "--title", "keep me", "--body", "b"])
+        .assert()
+        .success();
+    let db = dir.path().join(".darkmux").join("lessons.db");
+    rusqlite::Connection::open(&db).unwrap().execute_batch("PRAGMA user_version = 99;").unwrap();
+    for args in [vec!["list"], vec!["list", "--json"], vec!["export"], vec!["recall", "--term", "keep"]] {
+        let out = darkmux_cmd_in_project(dir.path()).args(["memory", "lesson"]).args(&args).output().unwrap();
+        let (so, se) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(!out.status.success(), "{args:?} must refuse: {so}{se}");
+        assert!(se.contains("written by a newer darkmux") && se.contains("Upgrade darkmux."), "{args:?}: {se}");
+        assert!(!so.contains("no lessons recorded yet") && !so.contains("\"lessons\": []"), "{args:?}: {so}");
+    }
+}

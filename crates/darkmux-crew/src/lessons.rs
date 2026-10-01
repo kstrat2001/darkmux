@@ -406,6 +406,18 @@ pub fn import_json(conn: &mut Connection, data: &str) -> Result<ImportStats> {
     Ok(stats)
 }
 
+/// Read a lessons db for `list`, `export` and `recall`: a MISSING db is an
+/// empty list (and is not created, so a read never writes), but a db that
+/// cannot be opened or read is an error, never an empty list. In particular a
+/// db a newer darkmux wrote is refused (#3035): reading it as "no lessons"
+/// would let `export` write an empty file over the operator's store.
+pub fn load_entries(path: &Path) -> Result<Vec<Lesson>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    list(&open_at(path)?)
+}
+
 /// Read lessons for the per-dispatch inject — best-effort: a MISSING db is an
 /// empty list (and is NOT created, so a read never writes), and any open/query
 /// error also degrades to empty rather than erroring the dispatch (mirrors the
@@ -415,8 +427,10 @@ pub fn load_entries_best_effort(path: &Path) -> Vec<Lesson> {
     if !path.exists() {
         return Vec::new();
     }
-    open_at(path).and_then(|conn| list(&conn)).unwrap_or_else(|e| {
-        eprintln!("darkmux: lessons are unavailable this dispatch: {e:#}");
+    load_entries(path).unwrap_or_else(|e| {
+        // The error names the cause (a store a newer darkmux wrote says so):
+        // the dispatch goes on without lessons, and says why.
+        eprintln!("darkmux: lessons are not injected this dispatch: {e:#}");
         Vec::new()
     })
 }
@@ -456,10 +470,12 @@ mod tests {
         let v: i32 = Connection::open(&path).unwrap().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(v, newer, "the refusal must not stamp the version down");
         assert!(load_entries_best_effort(&path).is_empty(), "the inject read degrades, with a warning");
+        let err = load_entries(&path).unwrap_err().to_string();
+        assert!(err.contains("written by a newer darkmux"), "list/export/recall refuse, not read empty: {err}");
+        assert!(load_entries(&tmp.path().join("absent.db")).unwrap().is_empty(), "a missing db is empty");
     }
 
-    /// (#3035) An older db runs the migrations past its version in order, then
-    /// is stamped; one already at a migration's version does not re-run it.
+    /// (#3035) An export a newer darkmux wrote is refused, not half-imported.
     #[test]
     fn a_lessons_export_from_a_newer_darkmux_is_refused() {
         let tmp = TempDir::new().unwrap();
@@ -470,6 +486,8 @@ mod tests {
         assert!(list(&conn).unwrap().is_empty(), "nothing was imported");
     }
 
+    /// (#3035) An older db runs the migrations past its version in order, then
+    /// is stamped; one already at a migration's version does not re-run it.
     #[test]
     fn an_older_db_runs_ordered_migrations_then_stamps() {
         let conn = Connection::open_in_memory().unwrap();
