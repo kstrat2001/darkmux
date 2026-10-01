@@ -251,10 +251,10 @@ test.describe("nav chrome (Packet 1.5)", () => {
     await page.click(".runmore");
     await expect(page.locator(".runmore")).toHaveCount(0);
 
-    const headerBefore = await page.locator(".stagehdr").innerText();
+    const headerBefore = await page.locator(".fcount").innerText();
     expect(
       headerBefore,
-      "the expanded list's own header must no longer say 'newest N of M' before we can prove it survives",
+      "the expanded list's count line must no longer say 'newest N of M' before we can prove it survives",
     ).not.toMatch(/newest/);
 
     // Touch nothing. Wait long enough for the 5s presence poll to fire at
@@ -263,7 +263,7 @@ test.describe("nav chrome (Packet 1.5)", () => {
 
     expect(pollCount, "the presence-poll override must have actually fired at least once, or this test proves nothing").toBeGreaterThan(0);
 
-    const headerAfter = await page.locator(".stagehdr").innerText();
+    const headerAfter = await page.locator(".fcount").innerText();
     expect(
       headerAfter,
       `the runs board must NOT revert out of the expanded list just because an unrelated poll re-rendered the app (got: "${headerAfter}")`,

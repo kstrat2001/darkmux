@@ -177,3 +177,15 @@ export function selectionText(facet: FacetView): string | null {
   const [only] = facet.selected;
   return facet.choices.find((c) => c.value === only)?.label ?? only;
 }
+
+/** (#2925) The runs board's one count line. `rendered` is the rows on screen
+ * (the newest page unless expanded), `matching` the rows the kind tab and
+ * filters keep, `total` every run under the kind tab. Each part is said only
+ * when it differs from the next, so an unfiltered, uncapped board reads
+ * "Showing 12 runs". */
+export function runsCountText({ rendered, matching, total }: { rendered: number; matching: number; total: number }): string {
+  const runs = (n: number) => `${n} run${n === 1 ? "" : "s"}`;
+  const capped = rendered < matching;
+  if (matching === total) return capped ? `Showing newest ${rendered} of ${runs(total)}` : `Showing ${runs(total)}`;
+  return capped ? `Showing newest ${rendered} of ${matching} matching (${runs(total)})` : `Showing ${matching} of ${runs(total)}`;
+}

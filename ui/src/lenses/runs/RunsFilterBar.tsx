@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { createPortal } from "react-dom";
 import { FILTER_DIMS, type FilterDim } from "../../lib/runsFilterQuery";
 import { MACHINE_NOT_FOUND_LABEL } from "../../lib/machineKey";
-import { DIM_LABEL, selectionText, type FacetView } from "./runFilters";
+import { DIM_LABEL, runsCountText, selectionText, type FacetView } from "./runFilters";
 
 /** (#2925) The runs board's filter bar: one pill per dimension, a popover
  * checklist per pill, and the summary row (count, one chip per active value,
@@ -28,12 +28,15 @@ function onActivate(fn: () => void) {
 
 export function FilterBar({
   facets,
+  rendered,
   shown,
   total,
   onChange,
   onClearAll,
 }: {
   facets: FacetView[];
+  /** Rows on screen (the newest page unless the list is expanded). */
+  rendered: number;
   /** Runs the filters keep, and the runs before any dimension filter. */
   shown: number;
   total: number;
@@ -71,7 +74,7 @@ export function FilterBar({
           onClose={close}
         />
       )}
-      <FilterSummary facets={facets} shown={shown} total={total} onChange={onChange} onClearAll={onClearAll} />
+      <FilterSummary facets={facets} rendered={rendered} shown={shown} total={total} onChange={onChange} onClearAll={onClearAll} />
     </div>
   );
 }
@@ -171,7 +174,7 @@ function chipText(f: FacetView, value: string): string {
   return label === MACHINE_NOT_FOUND_LABEL ? label : `${DIM_LABEL[f.dim]} ${label}`;
 }
 
-function FilterSummary({ facets, shown, total, onChange, onClearAll }: { facets: FacetView[]; shown: number; total: number; onChange: (dim: FilterDim, values: string[]) => void; onClearAll: () => void }) {
+function FilterSummary({ facets, rendered, shown, total, onChange, onClearAll }: { facets: FacetView[]; rendered: number; shown: number; total: number; onChange: (dim: FilterDim, values: string[]) => void; onClearAll: () => void }) {
   const active = FILTER_DIMS.flatMap((dim) => {
     const f = facets.find((x) => x.dim === dim);
     return f ? f.selected.map((value) => ({ f, value })) : [];
@@ -179,7 +182,7 @@ function FilterSummary({ facets, shown, total, onChange, onClearAll }: { facets:
   return (
     <div className="fsummary">
       <span className="fcount">
-        Showing {shown} of {total} runs
+        {runsCountText({ rendered, matching: shown, total })}
       </span>
       {active.map(({ f, value }) => (
         <span

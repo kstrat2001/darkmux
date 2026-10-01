@@ -633,16 +633,15 @@ export function RunsBoard({
   const shown = showAll ? rows : rows.slice(0, RUNS_CAP);
   const more = rows.length - shown.length;
   const scope = kind === "all" ? "" : ` · ${kind}`;
-  const count = showAll || more <= 0 ? `${rows.length} run${rows.length === 1 ? "" : "s"}` : `newest ${shown.length} of ${rows.length}`;
   const filtering = !isFilterSelEmpty(sel);
 
   return (
     <div data-state="data">
       <div className="stagehdr">
-        runs{scope} · {count}
+        runs{scope}
       </div>
       {bar}
-      <FilterBar facets={facets} shown={rows.length} total={kindRows.length} onChange={changeFilter} onClearAll={clearFilters} />
+      <FilterBar facets={facets} rendered={shown.length} shown={rows.length} total={kindRows.length} onChange={changeFilter} onClearAll={clearFilters} />
       {rowClickNotice && (
         <div className="labnotice" role="status">
           {rowClickNotice}

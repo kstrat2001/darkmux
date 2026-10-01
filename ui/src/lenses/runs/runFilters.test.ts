@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import type { Run } from "../../types/generated/Run";
 import { machineKeyOfRuns } from "./format";
-import { NOT_SET, applyFilters, canNarrow, facetChoices, facetTotal, kindCounts, valueOf, type FilterEnv } from "./runFilters";
+import { NOT_SET, applyFilters, canNarrow, facetChoices, facetTotal, kindCounts, runsCountText, valueOf, type FilterEnv } from "./runFilters";
 import { emptyFilterSel, filterSelPairs, parseFilterSel, type FilterSel } from "../../lib/runsFilterQuery";
 import { canonicalHash } from "../../lib/hashSync";
 
@@ -133,5 +133,23 @@ describe("hash round-trip", () => {
 
   it("a bare machine pin still writes machine=", () => {
     expect(canonicalHash({ kind: "runs", runsKind: "all", run: null, machine: "studio" })).toBe("lens=runs&machine=studio");
+  });
+});
+
+/** (#2925) The runs board has ONE count line: what is on screen, out of what
+ * matches, out of everything, saying only the parts that differ. */
+describe("runsCountText", () => {
+  it("says only the total when nothing is filtered or capped", () => {
+    expect(runsCountText({ rendered: 12, matching: 12, total: 12 })).toBe("Showing 12 runs");
+    expect(runsCountText({ rendered: 1, matching: 1, total: 1 })).toBe("Showing 1 run");
+  });
+  it("says newest when the list is capped and nothing is filtered", () => {
+    expect(runsCountText({ rendered: 25, matching: 858, total: 858 })).toBe("Showing newest 25 of 858 runs");
+  });
+  it("says matching of total when filtered and not capped", () => {
+    expect(runsCountText({ rendered: 7, matching: 7, total: 858 })).toBe("Showing 7 of 858 runs");
+  });
+  it("says all three when filtered and capped", () => {
+    expect(runsCountText({ rendered: 25, matching: 120, total: 858 })).toBe("Showing newest 25 of 120 matching (858 runs)");
   });
 });
