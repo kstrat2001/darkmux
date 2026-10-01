@@ -44,6 +44,7 @@ pub fn build_work_job(
         });
     WorkJob {
         target_machine,
+        target_machine_uid: None,
         role_id,
         message,
         session_id,
@@ -749,7 +750,48 @@ mod tests {
         let sent: serde_json::Value = serde_json::from_str(&rx.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap();
         assert_eq!(sent["job"]["profile"], "host", "the owner's own profile name crosses: {sent}");
         assert_eq!(sent["job"]["target_machine"], "Peer-B");
-        assert_eq!(sent["schema"], crate::WORK_JOB_SCHEMA_VERSION);
+        assert_eq!(sent["schema"], "8.0", "a job with no target uid is written at the lowest version");
+    }
+
+    /// (#3028) The headline: peer-b renamed itself `studio-now` and this
+    /// roster learned that from its card. Both addresses reach the one entry
+    /// with no edit, and the job carries the uid the entry learned, so the
+    /// receiver can accept it under either name.
+    #[test]
+    #[serial]
+    fn both_the_old_and_the_new_name_reach_the_renamed_peer_carrying_its_uid() {
+        for address in ["host@peer-b", "host@Studio-Now"] {
+            let (port, rx) = spawn_scripted_peer("{\"status\":\"completed\",\"exit_code\":0,\"stdout\":\"done\"}\n");
+            let _env = PeerEnv::new(port);
+            peer_b_is_verified();
+            std::fs::write(
+                std::env::var("DARKMUX_FLEET_FILE").unwrap(),
+                r#"{"version":"2","machines":{"peer-b":{"id":"peer-b","address":"127.0.0.1","added_unix_ms":1,
+                    "machine_uid":"UID-PEER-B","current_name":"studio-now"}}}"#,
+            )
+            .unwrap();
+            let mut opts = local_opts("radio-host");
+            opts.profile_name = Some(address.to_string());
+            let r = dispatch_routed_via(opts, |_| panic!("never local")).unwrap();
+            assert_eq!(r.exit_code, 0, "{address}");
+            let sent: serde_json::Value = serde_json::from_str(&rx.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap();
+            assert_eq!(sent["job"]["target_machine_uid"], "UID-PEER-B", "{address}: {sent}");
+        }
+    }
+
+    /// (#3028) An entry that has learned no uid sends none: the receiver then
+    /// checks the name, as it did before wire 8.1.
+    #[test]
+    #[serial]
+    fn an_entry_with_no_learned_uid_sends_no_uid() {
+        let (port, rx) = spawn_scripted_peer("{\"status\":\"completed\",\"exit_code\":0,\"stdout\":\"done\"}\n");
+        let _env = PeerEnv::new(port);
+        peer_b_is_verified();
+        let mut opts = local_opts("radio-host");
+        opts.profile_name = Some("host@peer-b".to_string());
+        dispatch_routed_via(opts, |_| panic!("never local")).unwrap();
+        let sent: serde_json::Value = serde_json::from_str(&rx.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap();
+        assert!(sent["job"].get("target_machine_uid").is_none(), "{sent}");
     }
 
     /// The answering seat's single-shot mode rides the job to the peer as
@@ -896,7 +938,7 @@ mod tests {
             (Some("radio-host"), Some("deep"), Some("managed_only")),
             "{sent}"
         );
-        assert_eq!(sent["schema"], crate::WORK_JOB_SCHEMA_VERSION);
+        assert_eq!(sent["schema"], "8.0", "a job with no target uid is written at the lowest version");
     }
 
     /// The doctor's check never writes the roster and never contacts a node

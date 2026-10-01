@@ -1598,6 +1598,29 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
     expect(card.textContent).not.toContain("hardware not reported");
   });
 
+  // (#3022) The badge is the card's own declaration, read from the view: only
+  // the machine whose card says `hub` carries it, never the others, and never
+  // a machine whose card could not be read.
+  it("the HUB badge renders on the machine whose card declares hub and on no other", async () => {
+    const declaring = (id: string, uid: string, mode: "hub" | "peer") =>
+      viewRow(
+        { machine_id: id, machine_uid: uid, cpu_brand: "Apple M1 Max" },
+        {
+          entry: { id, address: `${id}.example:8765`, added_unix_ms: 1000 },
+          card: { state: "available", card: { specs: { machine_id: id, machine_uid: uid, cpu_brand: "Apple M1 Max" }, fleet_mode: mode } as never, source: "listener" },
+        },
+      );
+    mockFleetFetch({
+      specs: { machine_id: "MacBook-Pro", machine_uid: "u-self", cpu_brand: "Apple M5 Max" },
+      view: [declaring("mini", "u-mini", "hub"), declaring("studio", "u-studio", "peer"), unreachableRow("ghost", "listener_off")],
+      runs: [],
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelectorAll(".mach")).toHaveLength(4));
+    const badged = [...document.querySelectorAll(".mach")].filter((c) => c.querySelector('[data-testid="hub-badge"]') !== null);
+    expect(badged.map((c) => c.querySelector(".mach-name")!.textContent)).toEqual(["mini"]);
+  });
+
   // THE REPORTED CASE: a peer whose Redis is off has no presence beat and no
   // flow here, yet the daemon read its card. The view says it is available,
   // so the lens must not call it offline or its hardware unknown.
@@ -1623,10 +1646,19 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
     await waitFor(() => expect(studio.querySelector(".stat")!.textContent).toBe("idle"));
     expect(studio.className).not.toContain("absent");
     expect(studio.textContent).not.toContain("offline");
-    expect(studio.querySelector(".spec")!.textContent).toBe("Apple M1 Max · 32 GB · runs diff-review · radio-host here");
+    // The radio seat is an icon in the name row whose tooltip says what it
+    // means; the rest of the grant stays words, and the whole grant stays in
+    // the hardware line's tooltip.
+    const spec = studio.querySelector(".spec")!;
+    expect(spec.textContent).toBe("Apple M1 Max · 32 GB · runs diff-review");
+    expect(spec.getAttribute("title")).toBe("Apple M1 Max · 32 GB · runs diff-review · radio-host here");
+    const radio = studio.querySelector('.name [data-testid="radio-seat"]')!;
+    expect(radio.getAttribute("title")).toBe("accepts radio: this machine will answer radio questions sent from here (radio-host)");
+    expect(radio.getAttribute("aria-label")).toBe(radio.getAttribute("title"));
     // This machine's own card shows no grant.
     const self = [...document.querySelectorAll(".mach")].find((c) => c !== studio)!;
     expect(self.querySelector(".spec")!.textContent).toBe("Apple M5 Max · 128 GB");
+    expect(self.querySelector('[data-testid="radio-seat"]')).toBeNull();
   });
 
   // The inverse: with the same row unreachable and presence silent, the

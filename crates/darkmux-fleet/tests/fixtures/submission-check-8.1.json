@@ -1,0 +1,17 @@
+{
+  "schema": "8.1",
+  "wait": false,
+  "job": {
+    "target_machine": "studio",
+    "target_machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
+    "role_id": "radio-host",
+    "message": "",
+    "session_id": "radio.solo.adhoc.radio-host.n1",
+    "profile": "deep",
+    "timeout_seconds": 300,
+    "published_at_unix_ms": 1700000000000,
+    "published_by_machine": "laptop",
+    "boundary": "managed_only",
+    "mode": "check"
+  }
+}

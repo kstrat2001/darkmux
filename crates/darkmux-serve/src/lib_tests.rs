@@ -7789,6 +7789,7 @@ mod fleet_cache_wall_clock {
                 machine_uid: None,
                 loopback_intended: false,
                 node_id: None,
+                current_name: None,
                 extras: Default::default(),
             },
             darkmux_fleet::MachineEntry {
@@ -7800,6 +7801,7 @@ mod fleet_cache_wall_clock {
                 machine_uid: Some("DECLARED-WINS".into()),
                 loopback_intended: false,
                 node_id: None,
+                current_name: None,
                 extras: Default::default(),
             },
             darkmux_fleet::MachineEntry {
@@ -7810,6 +7812,7 @@ mod fleet_cache_wall_clock {
                 machine_uid: None,
                 loopback_intended: false,
                 node_id: None,
+                current_name: None,
                 extras: Default::default(),
             },
         ];
@@ -7854,6 +7857,7 @@ mod fleet_cache_wall_clock {
                 machine_uid: None,
                 loopback_intended: false,
                 node_id: None,
+                current_name: None,
                 extras: Default::default(),
             }];
             super::backfill_roster_machine_uids(&mut machines, tmp.path());
@@ -7881,6 +7885,7 @@ mod fleet_cache_wall_clock {
             machine_uid: None,
             loopback_intended: false,
             node_id: None,
+            current_name: None,
             extras: Default::default(),
         };
         let uid_of = |id: &str, ttl: std::time::Duration| {

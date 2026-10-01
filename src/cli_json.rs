@@ -607,6 +607,7 @@ mod tests {
         ("src/config_cmd.rs", 2, "writes config.json"),
         ("src/init.rs", 2, "writes config.json"),
         ("src/fleet_cli.rs", 2, "writes the roster's config file"),
+        ("src/fleet_defaults.rs", 1, "writes the last-known copy of the hub's fleet defaults"),
         ("src/acp_panel.rs", 1, "writes the launch spec file"),
         ("src/mission_launch.rs", 2, "a spec fingerprint, and JSON quoted inside a prompt"),
         ("src/finding_cli.rs", 2, "`finding show` text mode: two free-form fields as lines of a text view"),

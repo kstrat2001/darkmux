@@ -96,6 +96,13 @@ pub struct PresenceBeat {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub darkmux_version: Option<String>,
+    /// (#3022) The fleet position this machine declares (`fleet.mode`),
+    /// stated on every beat so a reader learns which machine is the hub
+    /// without asking it. `None` from a peer running a build that predates
+    /// this field: not stated, never read as `standalone`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub fleet_mode: Option<darkmux_types::config::DeclaredFleetMode>,
 }
 
 /// The Redis key for a machine's presence beat (keyed on the stable uid).
@@ -180,7 +187,13 @@ pub fn read_live(client: &redis::Client) -> Result<Vec<PresenceBeat>> {
 /// independent of both. `spec_summary` is the caller's already-computed
 /// enrichment value (see `spawn_emitter_thread`'s own comment on why it's
 /// computed once, outside the loop, rather than re-probed every beat).
-fn build_beat(machine_uid: &str, display_name: &str, schema_version: &str, spec_summary: Option<String>) -> PresenceBeat {
+fn build_beat(
+    machine_uid: &str,
+    display_name: &str,
+    schema_version: &str,
+    spec_summary: Option<String>,
+    fleet_mode: darkmux_types::config::DeclaredFleetMode,
+) -> PresenceBeat {
     PresenceBeat {
         machine_uid: machine_uid.to_string(),
         display_name: display_name.to_string(),
@@ -188,6 +201,7 @@ fn build_beat(machine_uid: &str, display_name: &str, schema_version: &str, spec_
         beat_ts_ms: now_ms(),
         specs: spec_summary,
         darkmux_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        fleet_mode: Some(fleet_mode),
     }
 }
 
@@ -260,7 +274,13 @@ pub fn spawn_emitter_thread() -> Option<std::thread::JoinHandle<()>> {
             // daemon log every cadence tick.
             let mut healthy: Option<bool> = None;
             loop {
-                let beat = build_beat(&machine_uid, &display_name, &schema_version, spec_summary.clone());
+                let beat = build_beat(
+                    &machine_uid,
+                    &display_name,
+                    &schema_version,
+                    spec_summary.clone(),
+                    darkmux_types::config_access::declared_fleet_mode(),
+                );
                 match write_beat(&client, &beat, DEFAULT_TTL_SECS) {
                     Ok(()) => {
                         if healthy != Some(true) {
@@ -300,6 +320,7 @@ pub fn spawn_emitter_thread() -> Option<std::thread::JoinHandle<()>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use darkmux_types::config::DeclaredFleetMode;
 
     /// (#2227) Per-site bounds for the machine-presence pair. Both run on the
     /// daemon's presence thread, which the reconcile loop depends on — an
@@ -351,6 +372,7 @@ mod tests {
             beat_ts_ms: 1_780_000_000_000,
             specs: Some("Apple Silicon · 128 GB".into()),
             darkmux_version: Some("2.8.0".into()),
+            fleet_mode: Some(DeclaredFleetMode::Hub),
         }
     }
 
@@ -388,6 +410,20 @@ mod tests {
         assert!(!json.contains("darkmux_version"), "must be omitted, not null: {json}");
     }
 
+    /// (#3022) Every beat states the declared mode, so a machine that
+    /// declares `hub` is known to be the hub from presence alone; a beat from
+    /// an older peer says nothing, which is not `standalone`.
+    #[test]
+    fn a_beat_states_the_declared_fleet_mode_and_an_older_beat_states_none() {
+        let beat = build_beat("UID-3", "mini", "2.0.0", None, DeclaredFleetMode::Hub);
+        let json = serde_json::to_string(&beat).unwrap();
+        assert!(json.contains(r#""fleet_mode":"hub""#), "{json}");
+        let back: PresenceBeat = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.fleet_mode, Some(DeclaredFleetMode::Hub));
+        let old = r#"{"machine_uid":"U","display_name":"studio","schema_version":"1.19.0","beat_ts_ms":1}"#;
+        assert_eq!(serde_json::from_str::<PresenceBeat>(old).unwrap().fleet_mode, None);
+    }
+
     /// (#2083, #1855) The regression: every emitted beat used to hardcode
     /// `specs: None` regardless of what the local hardware probe found, so a
     /// remote fleet card could never show hardware no matter how long the
@@ -396,7 +432,7 @@ mod tests {
     /// silently dropped again.
     #[test]
     fn build_beat_carries_the_computed_spec_summary() {
-        let beat = build_beat("UID-1", "laptop", "1.10.0", Some("Apple M5 Max · 128 GB".into()));
+        let beat = build_beat("UID-1", "laptop", "1.10.0", Some("Apple M5 Max · 128 GB".into()), DeclaredFleetMode::Standalone);
         assert_eq!(beat.specs.as_deref(), Some("Apple M5 Max · 128 GB"));
         assert_eq!(beat.machine_uid, "UID-1");
         assert_eq!(beat.display_name, "laptop");
@@ -406,7 +442,7 @@ mod tests {
     /// valid beat with `specs` genuinely absent, not a fabricated fallback.
     #[test]
     fn build_beat_omits_specs_when_the_probe_failed() {
-        let beat = build_beat("UID-2", "studio", "1.10.0", None);
+        let beat = build_beat("UID-2", "studio", "1.10.0", None, DeclaredFleetMode::Standalone);
         assert_eq!(beat.specs, None);
     }
 
@@ -435,6 +471,7 @@ mod tests {
             beat_ts_ms: 1,
             specs: None,
             darkmux_version: None,
+            fleet_mode: None,
         };
         let json = serde_json::to_string(&beat).unwrap();
         assert!(!json.contains("specs"), "None specs should be omitted: {json}");
@@ -478,6 +515,7 @@ mod tests {
             beat_ts_ms: now_ms(),
             specs: None,
             darkmux_version: None,
+            fleet_mode: None,
         };
         write_beat(&client, &beat, DEFAULT_TTL_SECS).expect("write_beat");
         let live = read_live(&client).expect("read_live");

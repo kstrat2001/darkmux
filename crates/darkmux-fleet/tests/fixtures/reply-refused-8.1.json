@@ -1,0 +1,7 @@
+{
+  "status": "refused",
+  "machine": "studio",
+  "profile": "deep",
+  "reason": "studio's profile cloud runs on a hosted endpoint",
+  "refusal": "boundary"
+}

@@ -16228,6 +16228,10 @@ pub struct RosterEntryView {
     /// records one only for this machine's own entry, so an ordinary peer
     /// entry has none.
     pub machine_uid: Option<String>,
+    /// (#3028) The `machine_id` the peer's own card last stated, when this
+    /// roster has read it. `@name` addresses resolve against it as well as
+    /// the id, so a differing value is a note on the label, not a break.
+    pub current_name: Option<String>,
     /// The address as written in the roster.
     pub address: String,
     /// True when `address` reaches only the machine that reads it (a
@@ -16342,6 +16346,44 @@ fn roster_name_issue(
     Some(RosterNameIssue::Unknown)
 }
 
+/// (#3028) The name an entry's machine goes by now, when its own card said so
+/// and it differs from the roster id (any case): `Some(that name)`.
+fn learned_name(e: &RosterEntryView) -> Option<&str> {
+    e.current_name.as_deref().filter(|n| !n.eq_ignore_ascii_case(&e.id))
+}
+
+/// (#3028) The warnings and repair hints for entries whose machine went by
+/// another name when this roster last read its card. Both names address the
+/// one entry, so this is a note on the label: unless another entry already
+/// holds the machine's name, when `@name` would be ambiguous and the stale
+/// entry is to be removed.
+fn relabeled_findings(
+    entries: &[&RosterEntryView],
+    roster_ids: &std::collections::BTreeSet<&str>,
+) -> (Vec<String>, Vec<String>) {
+    let mut warns = Vec::new();
+    let mut hints = Vec::new();
+    for e in entries {
+        let (id, current) = (e.id.as_str(), learned_name(e).unwrap_or_default());
+        if roster_ids.iter().any(|r| r.eq_ignore_ascii_case(current)) {
+            warns.push(format!(
+                "`{id}` is the machine that now goes by `{current}`, which already has its own roster entry, \
+                 so `@{current}` is ambiguous"
+            ));
+            hints.push(format!("For `{id}`: it is a second entry for `{current}`; remove it with `darkmux machine remove {id}`."));
+            continue;
+        }
+        let addr = if e.address_is_loopback { "<tailnet-dns-name>" } else { e.address.as_str() };
+        warns.push(format!("`{id}` is a machine whose own card now says it goes by `{current}`"));
+        hints.push(format!(
+            "For `{id}`: addresses using either name work (`host@{id}` and `host@{current}` reach the same \
+             machine), so nothing needs changing. To make the roster say the machine's own name: `darkmux \
+             machine remove {id}` then `darkmux machine add {current} --address {addr}`."
+        ));
+    }
+    (warns, hints)
+}
+
 /// (#2796, #2924) Find roster entries whose name is not the machine_id of
 /// the machine they describe, and say which name to use.
 ///
@@ -16374,10 +16416,11 @@ pub fn check_roster_identity(
     known: &FleetIdentityKnowledge,
 ) -> Check {
     let roster_ids: std::collections::BTreeSet<&str> = entries.iter().map(|e| e.id.as_str()).collect();
-    let mut warn_msg: Vec<String> = Vec::new();
+    let (relabeled, entries): (Vec<&RosterEntryView>, Vec<&RosterEntryView>) =
+        entries.iter().partition(|e| learned_name(e).is_some());
+    let (mut warn_msg, mut hint) = relabeled_findings(&relabeled, &roster_ids);
     let mut note_msg: Vec<String> = Vec::new();
-    let mut hint: Vec<String> = Vec::new();
-    for e in entries {
+    for e in entries.iter().copied() {
         let id = e.id.as_str();
         let addr = if e.address_is_loopback { "<tailnet-dns-name>" } else { e.address.as_str() };
         match roster_name_issue(e, known, &roster_ids) {
@@ -16615,6 +16658,7 @@ mod roster_identity_tests {
         RosterEntryView {
             id: id.into(),
             machine_uid: uid.map(str::to_string),
+            current_name: None,
             address: format!("{id}.tailnet.example:8765"),
             address_is_loopback: false,
             loopback_intended: false,
@@ -16625,6 +16669,42 @@ mod roster_identity_tests {
         e.address = "127.0.0.1:8765".into();
         e.address_is_loopback = true;
         e
+    }
+
+    /// (#3028) The peer's own card told this roster the name it goes by now:
+    /// the entry's id is a label that differs. A warning that names both and
+    /// says addresses using either name work, never a failure.
+    #[test]
+    fn an_entry_whose_machine_goes_by_a_learned_name_warns_and_says_either_name_works() {
+        let mut e = entry("m1-max-32gb-studio", Some("UID-S"));
+        e.current_name = Some("studio".into());
+        let check = check_roster_identity(&[e], &known(&[], &[], &[]));
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("`m1-max-32gb-studio`") && check.message.contains("`studio`"), "{}", check.message);
+        let hint = check.hint.unwrap();
+        assert!(hint.contains("either name") && hint.contains("host@m1-max-32gb-studio") && hint.contains("host@studio"), "{hint}");
+        assert!(hint.contains("darkmux machine remove m1-max-32gb-studio"), "the optional tidy-up is offered: {hint}");
+    }
+
+    /// (#3028) A learned name equal to the id (any case) is no difference; an
+    /// entry that learned none is judged as before.
+    #[test]
+    fn a_learned_name_equal_to_the_id_is_not_a_warning() {
+        let mut e = entry("Studio", Some("UID-S"));
+        e.current_name = Some("studio".into());
+        let check = check_roster_identity(&[e, entry("mini", None)], &known(&[], &[], &["mini"]));
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+    }
+
+    /// (#3028) Another entry already goes by that name: the address would be
+    /// ambiguous, so it is the duplicate repair, not the either-name note.
+    #[test]
+    fn a_learned_name_another_entry_already_holds_is_a_duplicate() {
+        let mut old = entry("old-studio", Some("UID-S"));
+        old.current_name = Some("studio".into());
+        let check = check_roster_identity(&[old, entry("studio", Some("UID-S"))], &known(&[], &[], &[]));
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.hint.unwrap().contains("darkmux machine remove old-studio"));
     }
 
     /// Strong evidence: the entry's own uid now goes by another name. Both

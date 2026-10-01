@@ -143,6 +143,12 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
 //           `unmetered_calls`, the calls in the window whose full spend is
 //           unknown; `budget.warn`'s `level` is `null` when that is its only
 //           news.
+//
+//           Also (4.0, #3022): `machine.telemetry`'s payload gains
+//           `fleet_mode` (`standalone` | `hub` | `peer` | `unknown`), the
+//           fleet position the machine declares (`fleet.mode`). Absent on a
+//           record written before it was stamped; `unknown` is a machine
+//           whose own `fleet.mode` is not a registered value.
 //   1.65.0 (#2902 step 5, budgets): additive, four actions and one usage
 //           field.
 //

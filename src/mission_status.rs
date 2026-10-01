@@ -566,7 +566,7 @@ fn fleet_scope_note(state: &SourceState) -> Option<String> {
 /// `relative_age` above and `run_list.rs::format_span` — kept local rather
 /// than shared (four lines, and the two callers format for different
 /// renderers; see that module's own precedent for the same call).
-fn format_age_span(secs: u64) -> String {
+pub(crate) fn format_age_span(secs: u64) -> String {
     match secs {
         0..=59 => format!("{secs}s"),
         60..=3_599 => format!("{}m", secs / 60),

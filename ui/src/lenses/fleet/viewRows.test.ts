@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { grantLine, outcomeLine, rowFacts, rowStanding, rowUid } from "./viewRows";
+import { grantOf, grantWords, machineIsHub, outcomeLine, rowFacts, rowIsHub, rowStanding, rowUid } from "./viewRows";
 import type { AcceptsState } from "../../types/generated/AcceptsState";
 import type { CardOutcome } from "../../types/generated/CardOutcome";
 import type { FleetMachine } from "../../types/generated/FleetMachine";
@@ -96,24 +96,37 @@ describe("outcomeLine: one fixed phrase per outcome", () => {
   });
 });
 
-describe("grantLine: what a peer lets this machine do", () => {
+describe("grantOf: what a peer lets this machine do", () => {
   const accepts = (over: Partial<Extract<AcceptsState, { state: "granted" }>["accepts"]>): AcceptsState => ({
     state: "granted",
     accepts: { peer_name: "laptop", profiles: [], roles: [], images: [], workspace: false, ...over },
   });
 
-  it("names the profiles it runs and the roles it takes here", () => {
-    expect(grantLine(accepts({ profiles: ["diff-review"], roles: ["radio-host"] }))).toBe("runs diff-review · radio-host here");
+  it("names the profiles it runs and the roles it takes here, the radio seat as a flag", () => {
+    expect(grantOf(accepts({ profiles: ["diff-review"], roles: ["radio-host", "reviewer"] }))).toEqual({
+      text: "runs diff-review · reviewer here",
+      radio: true,
+    });
+  });
+
+  it("a grant of only the radio seat has no text, just the flag", () => {
+    expect(grantOf(accepts({ roles: ["radio-host"] }))).toEqual({ text: null, radio: true });
   });
 
   it("an empty grant says so rather than showing nothing", () => {
-    expect(grantLine(accepts({}))).toBe("accepts nothing");
+    expect(grantOf(accepts({}))).toEqual({ text: "accepts nothing", radio: false });
   });
 
   it("every other state shows no grant", () => {
-    for (const state of ["not_listed", "this_machine", "withheld", "unknown"] as const) {
-      expect(grantLine({ state }), state).toBeNull();
+    for (const state of ["not_listed", "this_machine", "unknown"] as const) {
+      expect(grantOf({ state }), state).toBeNull();
     }
+  });
+
+  it("the full line spells the radio seat out in words, for the tooltip", () => {
+    expect(grantWords({ text: "runs diff-review", radio: true })).toBe("runs diff-review · radio-host here");
+    expect(grantWords({ text: null, radio: true })).toBe("radio-host here");
+    expect(grantWords({ text: "accepts nothing", radio: false })).toBe("accepts nothing");
   });
 });
 
@@ -142,7 +155,7 @@ describe("rowFacts", () => {
       new Set(),
       null,
     );
-    expect(facts).toMatchObject({ spec: "Apple M1 Max · 32 GB", note: null, grant: "runs diff-review", standing: "online", isSelf: false });
+    expect(facts).toMatchObject({ spec: "Apple M1 Max · 32 GB", note: null, grant: { text: "runs diff-review", radio: false }, standing: "online", isSelf: false });
   });
 
   it("this machine's own row shows no grant", () => {
@@ -158,6 +171,27 @@ describe("rowFacts", () => {
   it("a peer the view could not reach shows the typed reason in place of hardware", () => {
     const facts = rowFacts(row({ card: { state: "unreachable", reason: "listener_off", detail: null }, liveness: "no_beat" }), new Set(), null);
     expect(facts).toMatchObject({ spec: "", note: "listener off", standing: "offline", grant: null });
+  });
+
+  it("a card read from the machine is labeled with the machine's own current name, not the roster id (#3028)", () => {
+    const renamed = row({ entry: { id: "m1-max-32gb-studio", address: "100.64.0.9:8765", added_unix_ms: 1 } });
+    expect(rowFacts(renamed, new Set(), null).name).toBe("studio");
+  });
+
+  it("a row whose card was not read is labeled with its roster id (#3028)", () => {
+    const unread = row({ entry: { id: "m1-max-32gb-studio", address: "100.64.0.9:8765", added_unix_ms: 1 }, card: { state: "unreachable", reason: "listener_off", detail: null } });
+    expect(rowFacts(unread, new Set(), null).name).toBe("m1-max-32gb-studio");
+  });
+
+  it("a machine that is only a card still has its own name (#3028)", () => {
+    expect(rowFacts(row({ entry: null }), new Set(), null).name).toBe("studio");
+  });
+
+  it("a renamed machine answers to both its roster id and its card's name, so runs under either match (#3028)", () => {
+    const renamed = row({ entry: { id: "m1-max-32gb-studio", address: "100.64.0.9:8765", added_unix_ms: 1 } });
+    expect(rowFacts(renamed, new Set(), null).names).toEqual(["studio", "m1-max-32gb-studio"]);
+    expect(rowFacts(row(), new Set(), null).names).toEqual(["studio"]);
+    expect(rowFacts(row({ entry: null }), new Set(), null).names).toEqual(["studio"]);
   });
 
   it("a card with no chip named has no hardware line", () => {
@@ -217,5 +251,33 @@ describe("rowUid: keyed the way the rest of the page knows the machine", () => {
     expect(rowUid(self, new Set(["u1"]), "u1")).toBe("u1");
     // A peer never borrows it.
     expect(rowUid(row({ entry: null, machine_uid: null }), new Set(["u1"]), "u1")).toBe("unknown");
+  });
+});
+
+describe("the declared hub (#3022)", () => {
+  const declaring = (mode: "hub" | "peer" | "standalone" | "unknown", over: Partial<FleetMachine> = {}) =>
+    row({ card: { state: "available", card: { ...CARD, fleet_mode: mode } as MachineCard, source: "listener" }, ...over });
+
+  it("only a card that declares hub is the hub", () => {
+    expect(rowIsHub(declaring("hub"))).toBe(true);
+    for (const mode of ["peer", "standalone", "unknown"] as const) expect(rowIsHub(declaring(mode))).toBe(false);
+    expect(rowIsHub(row({ card: { state: "unreachable", reason: "listener_off", detail: null } }))).toBe(false);
+    expect(rowFacts(declaring("hub"), new Set(), null).hub).toBe(true);
+    expect(rowFacts(declaring("peer"), new Set(), null).hub).toBe(false);
+  });
+
+  it("a machine page is the hub when its row is found by uid, roster id, or as this machine", () => {
+    const hub = declaring("hub");
+    expect(machineIsHub([hub], "UID-STUDIO", false)).toBe(true);
+    expect(machineIsHub([declaring("hub", { machine_uid: null })], "studio", false)).toBe(true);
+    expect(machineIsHub([hub], "UID-OTHER", false)).toBe(false);
+    // One identity rule (`lib/machineIdentity`): a uid in another case and a
+    // roster name spelled with `.local` are the same machine.
+    expect(machineIsHub([hub], "uid-studio", false)).toBe(true);
+    expect(machineIsHub([declaring("hub", { machine_uid: null })], "Studio.local", false)).toBe(true);
+    expect(machineIsHub([declaring("peer")], "UID-STUDIO", false)).toBe(false);
+    expect(machineIsHub([declaring("hub", { is_this_machine: true })], null, true)).toBe(true);
+    expect(machineIsHub([declaring("hub", { is_this_machine: true })], "UID-STUDIO", false)).toBe(false);
+    expect(machineIsHub(null, "UID-STUDIO", false)).toBe(false);
   });
 });

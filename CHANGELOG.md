@@ -1149,6 +1149,7 @@ darkmux release.
 
 ### Fixed (4.0)
 
+- **A machine that renames itself keeps receiving work, with no edit on the machines that address it (#3028).** A roster entry now learns its peer's hardware uid and current `machine_id` from the peer's own card (the read `machine list` and the daemon already make, over the verified, pinned path), and `<profile>@<name>` resolves against an entry's id or that learned name. The work wire is 8.1: a job carries the target's optional `target_machine_uid`, and the receiver compares it to its own uid and accepts under any name, refusing a different uid as misaddressed without printing either. A sender that has not learned a uid, and any 8.0 sender, are checked by name as before. `roster identity` warns that an entry's id differs from its machine's own name and that addresses with either name work, and the fleet card is labeled with the machine's own current name. An 8.0 receiver refuses an 8.1 submission by naming both versions.
 - **A daemon resumes publishing to the fleet hub on its own after an outage (#3023).** The Redis flow sink used to disable itself after three failures "for the rest of the process", so a hub restart left a long-lived `darkmux serve` silent until someone restarted it, and the other machines never saw what it did meanwhile. `darkmux serve` now probes the hub on a capped backoff (2s doubling to 60s, each probe bounded by the 500 ms connect timeout), re-enables when it answers, and re-sends its own records from the local day files (current and previous UTC day, in `ts` order, from the first record that failed) as stream entries marked `late`; readers already de-duplicate by record identity. CLI invocations keep the old behavior. `/health` carries `hub_link` (`connected`, or `unreachable` with since and reason; this machine only) and `darkmux doctor` has a `flow hub link` row.
 - **A `dispatch.map` step whose every item failed is an errored step, and one with some failed items reads degraded.** The step used to complete regardless, so a mission where every item errored could finish Clean with exit 0. Now all items failing fails the step with the first item's error. Some items failing keeps the step `complete` (its output still reaches later steps) but marks the mission envelope `degraded`, with a warning naming the step and how many items failed. No shipped mission config uses `dispatch.map` today, so this affects your own configs.
 
@@ -1220,6 +1221,24 @@ darkmux release.
 ### Added (4.0)
 
 - **A run row carries `machine_uid` beside its display `machine`** (`/runs`, `run list --json`, additive and optional). It is the hardware uid of the machine whose records produced the row; a tracked mission or lab row reports this daemon's own uid. The viewer decides which machine a run belongs to by this uid, so a renamed machine, a `.local` alias or two machines sharing one display name no longer merge, split or misattribute runs. A record that carried no uid leaves the field absent.
+
+- **A machine states its fleet role, and the hub hands out fleet defaults (#3022,
+  CONFIG 2.1).** The machine card carries `fleet_mode` (`standalone`, `hub`,
+  `peer`, from `fleet.mode`) and `hosts_fleet_redis` (whether the machine's own
+  `redis.host` is loopback or itself); presence beats and `machine.telemetry`
+  records carry `fleet_mode` too, so nobody has to ask a machine which one is
+  the hub. The fleet card and the machine page show a HUB badge for it. The new
+  `fleet.defaults` block, meaningful on the hub only, holds the first default,
+  `fleet.defaults.radio.answerer_profile` (`<profile>@<machine>`; `config set`
+  refuses a bare profile name). The hub serves it only in its machine card,
+  never through Redis, and a card that does not declare `hub` has its defaults
+  refused. Radio's answering seat resolves this machine's own setting first, then
+  the hub's default, then the built-in, keeps the last copy it read under the
+  darkmux home (used when the hub cannot be asked), and prints which one it used
+  on every answer. `darkmux doctor` gains a `fleet hub` row (exactly one machine
+  declares `hub`, and it hosts the Redis this machine points at) and a `fleet
+  defaults` row (the resolved seat and its source). Machine card schema 1.0 and
+  FLOW 2.0.0 are unreleased and were edited in place.
 
 - **`run stats` counts the model calls that reported no usage** (`calls_unreported`, RunStats 2.1.0, `--json` too). A call that reports no usage adds 0 to the token figures, so a partly reported run read as a smaller run. Above zero, `completion_tokens` and `reasoning_tokens` are a lower bound, and the run's unreconciled list says so.
 

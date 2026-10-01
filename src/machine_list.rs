@@ -162,7 +162,7 @@ fn accepts_phrase(accepts: &AcceptsState, voice: Voice) -> Option<String> {
             list_or_none(&accepts.roles)
         ),
         AcceptsState::NotListed => format!("does not list {who}: it takes no work from it"),
-        AcceptsState::ThisMachine | AcceptsState::Withheld => return None,
+        AcceptsState::ThisMachine => return None,
         AcceptsState::Unknown => format!("accepts from {who}: unknown"),
     })
 }
@@ -239,7 +239,7 @@ fn detail_line(card: &MachineCard) -> String {
 
 /// The name a row is listed under: its roster id, or this machine's own name
 /// when the roster has no entry for it.
-fn row_name(view: &FleetView, m: &FleetMachine) -> String {
+pub(crate) fn row_name(view: &FleetView, m: &FleetMachine) -> String {
     match &m.entry {
         Some(e) => e.id.clone(),
         None => view.local_machine_id.clone().unwrap_or_else(|| "<this machine>".to_string()),
@@ -536,6 +536,7 @@ mod tests {
             "governor": {"thermal": {"state": "nominal", "cpu_speed_limit_pct": 100}, "battery": null,
                          "battery_gate": {"floor_pct": 50, "refuse_start_below_min": true,
                                           "pause_running_below_min": true, "refusing_start": false}},
+            "fleet_mode": "peer", "hosts_fleet_redis": false,
             "generated_at_ms": 1, "gather_ms": 2, "cache_ttl_ms": 2000
         })
     }

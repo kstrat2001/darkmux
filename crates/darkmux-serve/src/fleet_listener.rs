@@ -67,6 +67,9 @@ type ExecuteJob = dyn Fn(WorkJob, String, String) -> anyhow::Result<DispatchResu
 pub(crate) struct FleetListenerState {
     /// This machine's name (its `machine_id`).
     pub receiver: String,
+    /// This machine's hardware uid, when it has one (#3028): a job that
+    /// carries its target's uid is checked against this, not the name.
+    pub receiver_uid: Option<String>,
     pub provider: Arc<dyn IdentityProvider>,
     /// This machine's own node id: a request from it is refused.
     pub local_node_id: Option<String>,
@@ -144,6 +147,7 @@ impl FleetListenerState {
         let resolve_receiver = receiver.clone();
         Self {
             receiver,
+            receiver_uid: darkmux_hardware::machine_uid().map(str::to_string),
             provider,
             local_node_id,
             token: Arc::new(|| darkmux_flow::serve_token().map(|t| t.expose_for_compare().to_string())),
@@ -773,7 +777,7 @@ impl Worker {
         }
         (state.config_preflight)().map_err(|detail| Refusal::BadConfig { detail })?;
         let resolution = (state.resolve_profile)(&self.job.role_id, self.job.profile.as_deref());
-        let now = darkmux_fleet::check_scope(&state.receiver, &admitted, &self.job, resolution)?;
+        let now = darkmux_fleet::check_scope(&state.receiver, state.receiver_uid.as_deref(), &admitted, &self.job, resolution)?;
         if now.seat != self.scoped.seat {
             return Err(Refusal::SeatChanged { profile: now.profile });
         }
@@ -922,7 +926,7 @@ async fn scope_submission(
         Ok(r) => r,
         Err(e) => ProfileResolution::Unresolved(format!("profile resolution did not finish: {e}")),
     };
-    let scoped = darkmux_fleet::check_scope(&state.receiver, admitted, &sub.job, resolution)?;
+    let scoped = darkmux_fleet::check_scope(&state.receiver, state.receiver_uid.as_deref(), admitted, &sub.job, resolution)?;
     Ok((sub, scoped))
 }
 
@@ -1529,6 +1533,21 @@ mod tests {
         remote_cap: u32,
         queue_limits: QueueLimits,
     ) -> Harness {
+        start_full_as(peer, down, job_ms, config_preflight, busy_policy, remote_cap, queue_limits, None)
+    }
+
+    /// [`start_full`] for a receiver that knows its own hardware uid.
+    #[allow(clippy::too_many_arguments)]
+    fn start_full_as(
+        peer: Option<darkmux_fleet::NodeIdentity>,
+        down: bool,
+        job_ms: u64,
+        config_preflight: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
+        busy_policy: BusyPolicy,
+        remote_cap: u32,
+        queue_limits: QueueLimits,
+        receiver_uid: Option<&str>,
+    ) -> Harness {
         let allow_now = Arc::new(Mutex::new(allow()));
         let allow_read = allow_now.clone();
         let queue_slots = Arc::new(KeySlots::new(NODE_CAP));
@@ -1556,6 +1575,7 @@ mod tests {
         let refusal_log = Arc::new(RefusalLog::new());
         let state = FleetListenerState {
             receiver: "studio".into(),
+            receiver_uid: receiver_uid.map(str::to_string),
             provider: network.clone(),
             local_node_id: Some("nSTUDIO".into()),
             token: Arc::new(move || token_read.lock().unwrap().clone()),
@@ -2371,6 +2391,29 @@ mod tests {
         assert!(h.ran.lock().unwrap().is_empty());
     }
 
+    /// (#3028) The receiver's own hardware uid reaches both places the
+    /// listener checks a job's address (a run, and a `check`): a job
+    /// addressed to the machine's former name, carrying its uid, is taken; the
+    /// same name with another machine's uid is `misaddressed`.
+    #[test]
+    fn a_job_for_the_former_name_with_the_receivers_uid_is_taken_over_http() {
+        let h = start_full_as(Some(laptop()), false, 0, Arc::new(|| Ok(())), BusyPolicy::Refuse, 1, WIDE, Some("UID-STUDIO"));
+        let mut former = job("s-old", None);
+        former.target_machine = "m1-max-32gb-studio".into();
+        former.target_machine_uid = Some("uid-studio".into());
+        let (code, reply) = post(&h, TOKEN, former.clone(), true);
+        assert_eq!((code, reply.status), (200, ReplyStatus::Completed), "{reply:?}");
+        let mut check = former;
+        check.mode = darkmux_fleet::SubmissionMode::Check;
+        check.session_id = sender("s-old-check");
+        let (_, reply) = post(&h, TOKEN, check, false);
+        assert_eq!(reply.status, ReplyStatus::Checked, "{reply:?}");
+        let mut other = job("s-other", None);
+        other.target_machine_uid = Some("UID-ELSEWHERE".into());
+        let (code, reply) = post(&h, TOKEN, other, true);
+        assert_eq!((code, reply.refusal), (421, Some(darkmux_fleet::RefusalCode::Misaddressed)), "{reply:?}");
+    }
+
     /// The typed code reaches the sender for each refusal, beside the
     /// sentence, over real HTTP.
     #[test]
@@ -2606,6 +2649,7 @@ mod tests {
     fn gate_only_state(reads: Arc<std::sync::atomic::AtomicUsize>) -> FleetListenerState {
         FleetListenerState {
             receiver: "studio".into(),
+            receiver_uid: None,
             provider: Arc::new(StaticIdentityProvider {
                 local: test_node("nSTUDIO", "studio", "100.64.0.2"),
                 peers: vec![laptop()],
@@ -2685,6 +2729,7 @@ mod tests {
     fn a_request_without_a_peer_address_is_refused() {
         let h_state = FleetListenerState {
             receiver: "studio".into(),
+            receiver_uid: None,
             local_node_id: Some("nSTUDIO".into()),
             provider: Arc::new(StaticIdentityProvider {
                 local: test_node("nSTUDIO", "studio", "100.64.0.2"),
@@ -2889,6 +2934,7 @@ mod tests {
         });
         let state = FleetListenerState {
             receiver: "studio".into(),
+            receiver_uid: None,
             local_node_id: Some("nSTUDIO".into()),
             provider: slow.clone(),
             token: Arc::new(|| Some(TOKEN.to_string())),
@@ -2940,6 +2986,7 @@ mod tests {
     fn spawn_one_slot_listener(resolve_ms: u64) -> String {
         let state = FleetListenerState {
             receiver: "studio".into(),
+            receiver_uid: None,
             local_node_id: Some("nSTUDIO".into()),
             provider: Arc::new(StaticIdentityProvider {
                 local: test_node("nSTUDIO", "studio", "100.64.0.2"),

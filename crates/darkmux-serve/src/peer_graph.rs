@@ -144,7 +144,9 @@ enum PeerLookup {
 }
 
 fn classify_peer(owner: &str, roster: &FleetRoster, live_machines: &HashSet<String>) -> PeerLookup {
-    let Some(entry) = roster.machines.get(owner) else {
+    // (#3028) The one resolver every machine name goes through; a name two
+    // entries answer to is not a peer to send a token to.
+    let Ok(Some(entry)) = darkmux_fleet::find_machine(roster, owner) else {
         return PeerLookup::Unrostered { machine: owner.to_string() };
     };
     if !live_machines.contains(owner) {
@@ -622,6 +624,7 @@ mod tests {
                 machine_uid: None,
                 loopback_intended: false,
                 node_id: None,
+                current_name: None,
                 extras: Default::default(),
             },
         );
@@ -701,6 +704,19 @@ mod tests {
         assert_eq!(
             classify_peer("studio", &roster, &live(&["studio"])),
             PeerLookup::Live { machine: "studio".into(), entry: Box::new(roster.machines["studio"].clone()) }
+        );
+    }
+
+    /// (#3028) Flow records name the machine as it is called now, and the
+    /// roster entry is keyed by what the operator wrote: the owner resolves
+    /// through the same resolver an address does (learned name, any case).
+    #[test]
+    fn classify_peer_finds_a_renamed_owner_by_its_learned_name() {
+        let mut roster = roster_with("old-studio", "127.0.0.1:9000");
+        roster.machines.get_mut("old-studio").unwrap().current_name = Some("studio".into());
+        assert_eq!(
+            classify_peer("Studio", &roster, &live(&["Studio"])),
+            PeerLookup::Live { machine: "Studio".into(), entry: Box::new(roster.machines["old-studio"].clone()) }
         );
     }
 
@@ -1087,6 +1103,7 @@ mod tests {
             beat_ts_ms: darkmux_flow::presence::now_ms(),
             specs: None,
             darkmux_version: None,
+            fleet_mode: None,
         };
         darkmux_flow::presence::write_beat(&redis_client, &beat, 60).unwrap();
 
