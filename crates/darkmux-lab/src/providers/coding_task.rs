@@ -9,7 +9,7 @@ use crate::lab::dispatch_end::DispatchEnd;
 use crate::providers::prompt::{extract_reply_text, run_verify, verify_note};
 use darkmux_types::Profile;
 use crate::workloads::types::{
-    InspectionReport, LoadedWorkload, RunMode, RunResult, WorkloadProvider,
+    InspectionReport, LoadedWorkload, RunMode, RunResult, VerifyReport, WorkloadProvider,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use darkmux_types::session_id::{RunId, SessionId};
@@ -393,11 +393,6 @@ impl WorkloadProvider for CodingTaskProvider {
             }
         }
 
-        let run_id = run_dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("")
-            .to_string();
         // (#488) Phase 1 — record final_hash of the per-run sandbox so
         // post-hoc analysis can verify "what state did the model leave
         // the sandbox in." Phase 2 will add baseline_hash (the source
@@ -414,67 +409,23 @@ impl WorkloadProvider for CodingTaskProvider {
                 None
             }
         };
-        let manifest_json = serde_json::json!({
-            // v2 added: run_id, profile (now the profile NAME), profile_description.
-            // v3 (#488) added: final_hash (Phase 1). baseline_hash added in Phase 2.
-            // v4 (#489 Phase 2) is minted by `enrich_manifest_with_fixture_info`,
-            // NOT here: it means "has a `fixture` block". 57 manifests in the
-            // operator's own run store are v4 with no `verify`, so v4 cannot
-            // also mean "has verify" without destroying the version's ability
-            // to tell "not checked" from "predates the feature".
-            // v5 (#2494) added: verify. `ok` above is the DISPATCH path's
-            // result (did the runtime complete), which is a different
-            // question from whether the workload's own verify command
-            // passed — a run can dispatch cleanly and still fail verify.
-            // Recording only `ok` left the smoke's real result in
-            // scrollback, so `run inspect` could read green on a run
-            // whose tests failed. `null` here is a THIRD state, distinct
-            // from pass and fail: the workload declared no verify command,
-            // so nothing was checked.
-            // v6 is minted by the work gate (`verify_gate`), never here.
-            // v8 (F2) may carry `escalation`: the runtime's `escalation_*`
-            // result when the dispatch stopped on purpose. It is absent
-            // otherwise, so a manifest without it never escalated.
-            // v7 (4.0) is written here: the run directory carries no
-            // `metrics.json`; every count is in `trajectory.jsonl`, read
-            // through `lab::inspect::run_trajectory`. The enrichers only ever
-            // RAISE the version, so a v7 run stays v7.
-            "schema_version": 8,
-            "run_id": run_id,
-            "workload": loaded.manifest.workload.id,
-            "provider": self.id(),
-            "profile": profile_name,
-            "profile_description": profile.description.clone().unwrap_or_default(),
-            "duration_ms": duration_ms,
-            "ok": ok,
-            "verify": verify_outcome.as_ref().map(|v| serde_json::json!({
-                "passed": v.passed,
-                "details": v.details,
-            })),
-            "session_id": session_id,
-            // Always store the sandbox path as absolute in the
-            // manifest. Prior to #359 (QA finding), this stored a
-            // relative path when sandbox_dir was under cwd — making
-            // the manifest non-portable: `darkmux lab inspect`
-            // resolving the path against ITS cwd (different from the
-            // dispatch cwd) silently failed to find the runtime's
-            // trajectory. Always-absolute makes the manifest
-            // cwd-independent.
-            // (#906 INFO) Best-effort canonicalization: if the sandbox dir
-            // can't be canonicalized (rare — e.g. a component vanished mid-run)
-            // we fall back to the non-canonical path so the manifest still
-            // records *a* path rather than aborting. Degraded provenance in
-            // that rare case is acceptable; the absolute-path goal above holds
-            // for the normal case.
-            "sandbox": sandbox_dir.canonicalize().unwrap_or_else(|_| sandbox_dir.to_path_buf()).display().to_string(),
-            "final_hash": final_hash,
-        });
-        let mut manifest_json = manifest_json;
-        end.record_in(&mut manifest_json);
-        record_refused_artifacts(&mut manifest_json, &refused_artifacts);
-        fs::write(
-            run_dir.join("manifest.json"),
-            serde_json::to_string_pretty(&manifest_json)?,
+        let recorded_verify = verify_outcome
+            .as_ref()
+            .map(|v| VerifyReport { passed: v.passed, details: v.details.clone() });
+        write_manifest(
+            run_dir,
+            &ManifestInputs {
+                workload_id: &loaded.manifest.workload.id,
+                profile_name,
+                profile_description: profile.description.as_deref().unwrap_or_default(),
+                duration_ms,
+                session_id: &session_id,
+                verify: recorded_verify.as_ref(),
+                sandbox_dir,
+                final_hash: final_hash.as_deref(),
+                refused_artifacts: &refused_artifacts,
+                end: &end,
+            },
         )?;
 
         Ok(RunResult {
@@ -1205,9 +1156,91 @@ fn classify_mode(walltime_ms: u128, loaded: &LoadedWorkload) -> Option<RunMode> 
 /// (`refused_artifacts`) as well as warned on stderr, so a refusal is never
 /// a silent gap in the run artifact.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RefusedArtifact {
+pub struct RefusedArtifact {
     pub file: String,
     pub reason: String,
+}
+
+/// What a coding-task run's `manifest.json` records, gathered after the
+/// dispatch so the manifest can be built and written without one (F2).
+pub struct ManifestInputs<'a> {
+    pub workload_id: &'a str,
+    pub profile_name: &'a str,
+    pub profile_description: &'a str,
+    pub duration_ms: u128,
+    pub session_id: &'a SessionId,
+    pub verify: Option<&'a VerifyReport>,
+    pub sandbox_dir: &'a Path,
+    pub final_hash: Option<&'a str>,
+    pub refused_artifacts: &'a [RefusedArtifact],
+    /// How the dispatch ended; stamped onto the manifest so an escalation
+    /// reads as one on every surface that reads `manifest.json`.
+    pub end: &'a DispatchEnd,
+}
+
+/// Build and write this run's `manifest.json`: the one place the coding-task
+/// provider records a run, including the dispatch's escalation.
+pub fn write_manifest(run_dir: &Path, m: &ManifestInputs<'_>) -> Result<()> {
+    let run_id = run_dir.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+    let mut manifest_json = serde_json::json!({
+        // v2 added: run_id, profile (now the profile NAME), profile_description.
+        // v3 (#488) added: final_hash (Phase 1). baseline_hash added in Phase 2.
+        // v4 (#489 Phase 2) is minted by `enrich_manifest_with_fixture_info`,
+        // NOT here: it means "has a `fixture` block". 57 manifests in the
+        // operator's own run store are v4 with no `verify`, so v4 cannot
+        // also mean "has verify" without destroying the version's ability
+        // to tell "not checked" from "predates the feature".
+        // v5 (#2494) added: verify. `ok` above is the DISPATCH path's
+        // result (did the runtime complete), which is a different
+        // question from whether the workload's own verify command
+        // passed — a run can dispatch cleanly and still fail verify.
+        // Recording only `ok` left the smoke's real result in
+        // scrollback, so `run inspect` could read green on a run
+        // whose tests failed. `null` here is a THIRD state, distinct
+        // from pass and fail: the workload declared no verify command,
+        // so nothing was checked.
+        // v6 is minted by the work gate (`verify_gate`), never here.
+        // v8 (F2) may carry `escalation`: the runtime's `escalation_*`
+        // result when the dispatch stopped on purpose. It is absent
+        // otherwise, so a manifest without it never escalated.
+        // v7 (4.0) is written here: the run directory carries no
+        // `metrics.json`; every count is in `trajectory.jsonl`, read
+        // through `lab::inspect::run_trajectory`. The enrichers only ever
+        // RAISE the version, so a v7 run stays v7.
+        "schema_version": 8,
+        "run_id": run_id,
+        "workload": m.workload_id,
+        "provider": CodingTaskProvider.id(),
+        "profile": m.profile_name,
+        "profile_description": m.profile_description,
+        "duration_ms": m.duration_ms,
+        "ok": m.end.ok(),
+        "verify": m.verify.map(|v| serde_json::json!({
+            "passed": v.passed,
+            "details": v.details,
+        })),
+        "session_id": m.session_id,
+        // Always store the sandbox path as absolute in the
+        // manifest. Prior to #359 (QA finding), this stored a
+        // relative path when sandbox_dir was under cwd — making
+        // the manifest non-portable: `darkmux lab inspect`
+        // resolving the path against ITS cwd (different from the
+        // dispatch cwd) silently failed to find the runtime's
+        // trajectory. Always-absolute makes the manifest
+        // cwd-independent.
+        // (#906 INFO) Best-effort canonicalization: if the sandbox dir
+        // can't be canonicalized (rare — e.g. a component vanished mid-run)
+        // we fall back to the non-canonical path so the manifest still
+        // records *a* path rather than aborting. Degraded provenance in
+        // that rare case is acceptable; the absolute-path goal above holds
+        // for the normal case.
+        "sandbox": m.sandbox_dir.canonicalize().unwrap_or_else(|_| m.sandbox_dir.to_path_buf()).display().to_string(),
+        "final_hash": m.final_hash,
+    });
+    m.end.record_in(&mut manifest_json);
+    record_refused_artifacts(&mut manifest_json, m.refused_artifacts);
+    fs::write(run_dir.join("manifest.json"), serde_json::to_string_pretty(&manifest_json)?)?;
+    Ok(())
 }
 
 /// (#2869) Write `refused` into a run manifest as `refused_artifacts`.
@@ -1348,6 +1381,45 @@ mod tests {
             chain_depths: None,
             seed: None,
             extras: BTreeMap::new(),
+        }
+    }
+
+    /// (F2) `run inspect` names an escalation the provider's own manifest
+    /// recorded, and says nothing for a run that did not escalate: the
+    /// provider's `inspect` must read the key its own writer stamps.
+    #[test]
+    fn inspect_names_the_escalation_the_providers_own_manifest_recorded() {
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run1");
+        fs::create_dir_all(&run_dir).unwrap();
+        let loaded = make_loaded(basic_spec(), tmp.path().to_path_buf());
+        let session = SessionId::adhoc(RunId::lab("run1").unwrap(), "coder", "w");
+        for (end, want) in [
+            (
+                DispatchEnd::Escalated { reason: "escalation_compaction_reread_loop".into() },
+                Some("outcome=escalated (escalation_compaction_reread_loop)"),
+            ),
+            (DispatchEnd::Failed, None),
+        ] {
+            write_manifest(
+                &run_dir,
+                &ManifestInputs {
+                    workload_id: "w",
+                    profile_name: "p",
+                    profile_description: "",
+                    duration_ms: 1,
+                    session_id: &session,
+                    verify: None,
+                    sandbox_dir: tmp.path(),
+                    final_hash: None,
+                    refused_artifacts: &[],
+                    end: &end,
+                },
+            )
+            .unwrap();
+            let notes = CodingTaskProvider.inspect(&loaded, &run_dir).unwrap().notes;
+            let found = notes.iter().find(|n| n.starts_with("outcome=")).map(String::as_str);
+            assert_eq!(found, want, "{notes:?}");
         }
     }
 

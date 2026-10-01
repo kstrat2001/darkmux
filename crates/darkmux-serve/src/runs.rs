@@ -3928,6 +3928,84 @@ mod tests {
         assert_eq!(lab_run_status(&escalated(Some(Lc::Error)), now, None), RunStatus::Error);
     }
 
+    /// (F2) The whole chain for a REAL provider's manifest: each provider's own
+    /// manifest writer, given a dispatch that escalated, produces a
+    /// `manifest.json` that `scan_lab_runs` reads and `run list` shows as
+    /// `escalated`. Deleting the escalation stamp from either provider's writer
+    /// leaves every hand-made-manifest test green; only this reads what the
+    /// providers actually write.
+    #[test]
+    fn a_provider_written_manifest_of_an_escalated_dispatch_reads_escalated_on_the_runs_board() {
+        use darkmux_lab::lab::dispatch_end::DispatchEnd;
+        use darkmux_lab::providers::{coding_task, prompt};
+        use darkmux_lab::workloads::types::VerifyReport;
+        let escalated = DispatchEnd::from_dispatch(
+            1,
+            r#"{"result":"escalation_compaction_reread_loop","final_assistant":"x"}"#,
+        );
+        let verify = VerifyReport { passed: false, details: "dispatch escalated".into() };
+        let session = darkmux_types::session_id::SessionId::adhoc(
+            darkmux_types::session_id::RunId::lab("w-p-1-1").unwrap(),
+            "coder",
+            "w",
+        );
+        let now = 1_700_000_000_000u64;
+        for provider in ["prompt", "coding-task"] {
+            for (end, want) in [(&escalated, RunStatus::Escalated), (&DispatchEnd::Failed, RunStatus::Error)] {
+                let tmp = TempDir::new().unwrap();
+                let run_dir = tmp.path().join("run1");
+                std::fs::create_dir_all(&run_dir).unwrap();
+                std::fs::write(
+                    run_dir.join(darkmux_lab::lab::lifecycle::LIFECYCLE_FILE),
+                    serde_json::json!({
+                        "schema_version": "1.1", "run_id": "run1", "kind": "lab", "workload": "w",
+                        "profile": "p", "started_at_ms": 1_700_000_000_000u64, "status": "complete",
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+                if provider == "prompt" {
+                    prompt::write_manifest(
+                        &run_dir,
+                        &prompt::ManifestInputs {
+                            workload_id: "w",
+                            profile_name: "p",
+                            profile_description: "",
+                            duration_ms: 1,
+                            session_id: &session,
+                            verify: Some(&verify),
+                            end,
+                        },
+                    )
+                } else {
+                    coding_task::write_manifest(
+                        &run_dir,
+                        &coding_task::ManifestInputs {
+                            workload_id: "w",
+                            profile_name: "p",
+                            profile_description: "",
+                            duration_ms: 1,
+                            session_id: &session,
+                            verify: Some(&verify),
+                            sandbox_dir: tmp.path(),
+                            final_hash: None,
+                            refused_artifacts: &[],
+                            end,
+                        },
+                    )
+                }
+                .unwrap();
+                let runs = crate::scan_lab_runs(tmp.path());
+                assert_eq!(runs.len(), 1, "{provider}: {runs:?}");
+                assert_eq!(
+                    lab_run_status(&runs[0], now, None),
+                    want,
+                    "{provider} with {end:?}: a provider's own manifest must read as the dispatch ended"
+                );
+            }
+        }
+    }
+
     /// (#2494) The verify outcome rides the row and NEVER changes `status`:
     /// a run that dispatched fine and failed its tests stays `complete`, with
     /// `verify_passed: Some(false)` beside it for the list to show.
