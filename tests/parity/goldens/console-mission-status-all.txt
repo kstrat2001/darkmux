@@ -86,9 +86,9 @@ FINALIZED (93)
   ◆ Sanity: review-shaped 1-probe/1-judge                                           17d    3/3  ▓▓▓▓
   • Sanity: parallel fan-out + fan-in                                               17d    1/1  ▓▓▓▓
   • code-reviewer                                                                   18d    1/1  ▓▓▓▓
-  • analyst                                                                         18d    1/1  ▓▓▓▓
-  • analyst                                                                         18d    1/1  ▓▓▓▓
-  • analyst                                                                         18d    1/1  ▓▓▓▓
+  • analyst                                                                 18d    1/1  ▓▓▓▓
+  • analyst                                                                 18d    1/1  ▓▓▓▓
+  • analyst                                                                 18d    1/1  ▓▓▓▓
   ◆ PR review — zawmpk-352-vejagb-crdoil (c…ep+diff-review+probe-4b+probe-gptoss`)  21d    3/3  ▓▓▓▓
   ◆ PR review — kstrat2001/darkmux@5ad35641…ep+diff-review+probe-4b+probe-gptoss`)  21d    0/3  ░░░░
   ◆ PR review — kstrat2001/darkmux@f8dda892…ep+diff-review+probe-4b+probe-gptoss`)  21d    3/3  ▓▓▓▓
