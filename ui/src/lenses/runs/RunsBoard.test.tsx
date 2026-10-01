@@ -823,12 +823,12 @@ describe("RunsBoard — the machine pin (#1809)", () => {
   it("(#2921) a uid-only pinned machine that is THIS daemon reads its specs name", async () => {
     mockPinnedFetch({ flowToday: uidOnlyToday(), specs: { machine_id: "scratch-box", machine_uid: FAKE_UID } });
     renderBoard("all", null, FAKE_UID);
-    await waitFor(() => expect(screen.getByText(/machine: scratch-box/)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/Machine scratch-box/)).toBeInTheDocument());
   });
   it("(#2921) a uid-only pinned remote machine reads its roster id", async () => {
     mockPinnedFetch({ flowToday: uidOnlyToday(), roster: [{ id: "studio", address: "100.64.1.2:8765", added_unix_ms: 1, machine_uid: FAKE_UID }] });
     renderBoard("all", null, FAKE_UID);
-    await waitFor(() => expect(screen.getByText(/machine: studio/)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/Machine studio/)).toBeInTheDocument());
     expect(document.body.textContent).not.toMatch(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
   });
 
@@ -898,7 +898,7 @@ describe("RunsBoard — the machine pin (#1809)", () => {
     window.location.hash = `#lens=runs&machine=${FAKE_UID.toLowerCase()}`;
     const before = window.history.length;
     renderBoard("all", null, FAKE_UID.toLowerCase());
-    await waitFor(() => expect(screen.getByText(/machine: scratch-box/)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/Machine scratch-box/)).toBeInTheDocument());
     await waitFor(() => expect(window.location.hash).toBe("#lens=runs&machine=scratch-box"));
     expect(UUID_RE.test(window.location.hash)).toBe(false);
     expect(window.history.length).toBe(before);
@@ -929,12 +929,12 @@ describe("RunsBoard — the machine pin (#1809)", () => {
     );
     window.location.hash = `#lens=runs&machine=${FAKE_UID}`;
     renderBoard("all", null, FAKE_UID);
-    await waitFor(() => expect(screen.getByText(/machine: unnamed machine/)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/Machine unnamed machine/)).toBeInTheDocument());
     await new Promise((r) => setTimeout(r, 200));
     expect(window.location.hash, "held until the roster settles").toBe(`#lens=runs&machine=${FAKE_UID}`);
     releaseRoster();
     await waitFor(() => expect(window.location.hash).toBe("#lens=runs&machine=studio"));
-    expect(screen.getByText(/machine: studio/)).toBeInTheDocument();
+    expect(screen.getByText(/Machine studio/)).toBeInTheDocument();
   });
 
   it("(#2929) a link shared with the earlier `~` separator opens its machine and is rewritten to the `_` form", async () => {
@@ -949,14 +949,14 @@ describe("RunsBoard — the machine pin (#1809)", () => {
     window.location.hash = `#lens=runs&machine=MacBook-Pro%7E${hx}`;
     renderBoard("all", null, `MacBook-Pro~${hx}`);
     await waitFor(() => expect(window.location.hash).toBe(`#lens=runs&machine=MacBook-Pro_${hx}`));
-    expect(screen.getByText(/machine: MacBook-Pro/)).toBeInTheDocument();
+    expect(screen.getByText(/Machine MacBook-Pro/)).toBeInTheDocument();
   });
 
   it("(#2929) a name key pins the machine it names", async () => {
     mockPinnedFetch();
     renderBoard("all", null, "MacBook-Pro");
     await waitFor(() => expect(screen.getByText("m1")).toBeInTheDocument());
-    expect(screen.getByText(/machine: MacBook-Pro/)).toBeInTheDocument();
+    expect(screen.getByText(/Machine MacBook-Pro/)).toBeInTheDocument();
     expect(screen.queryByText("m2")).not.toBeInTheDocument();
     // A key link is already canonical: nothing rewrites it.
     fireEvent.click(document.querySelector('[data-arg="mission"]')!);
@@ -972,14 +972,14 @@ describe("RunsBoard — the machine pin (#1809)", () => {
       ],
     });
     renderBoard("all", null, `unnamed-${machineKeyHash(OTHER).slice(0, 6)}`);
-    await waitFor(() => expect(screen.getByText(/machine: unnamed machine 2/)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/Machine unnamed machine 2/)).toBeInTheDocument());
     expect(window.location.hash).not.toMatch(UUID_RE);
   });
 
   it("(#2929) a key nothing resolves says 'machine not found' in the chip's slot, with no rows", async () => {
     mockPinnedFetch();
     const { container } = renderBoard("all", null, "no-such-machine");
-    await waitFor(() => expect(screen.getByText(/runs recorded yet/)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/no runs match these filters/)).toBeInTheDocument());
     const chip = container.querySelector('[data-act="clearmachine"]');
     expect(chip?.textContent).toBe("machine not found ✕");
     expect(container.textContent).not.toMatch(/unnamed machine/);
@@ -1005,7 +1005,7 @@ describe("RunsBoard — the machine pin (#1809)", () => {
     const { container } = renderBoard("all", null, DECLARED);
     await waitFor(() => expect(window.location.hash).toBe("#lens=runs&machine=garage-mac"));
     // (C3) A roster-only card is labeled with its roster id.
-    await waitFor(() => expect(container.querySelector('[data-act="clearmachine"]')?.textContent).toBe("machine: garage-mac ✕"));
+    await waitFor(() => expect(container.querySelector('[data-act="clearmachine"]')?.textContent).toBe("Machine garage-mac ✕"));
   });
 
   it("(#2929 C5) while the inputs are still landing, an unresolved key shows the loading rows, not 'machine not found'", async () => {
@@ -1033,7 +1033,7 @@ describe("RunsBoard — the machine pin (#1809)", () => {
     expect(container.querySelector('[data-state="pending"]')).not.toBeNull();
     expect(container.textContent).not.toMatch(/not found/);
     releaseRoster();
-    await waitFor(() => expect(container.querySelector('[data-act="clearmachine"]')?.textContent).toBe("machine: studio ✕"));
+    await waitFor(() => expect(container.querySelector('[data-act="clearmachine"]')?.textContent).toBe("Machine studio ✕"));
   });
 
   it("filters the flat row list to the pinned machine's alias set", async () => {
@@ -1060,7 +1060,7 @@ describe("RunsBoard — the machine pin (#1809)", () => {
     mockPinnedFetch();
     renderBoard("all", null, "u1");
     await waitFor(() => expect(screen.getByText("m1")).toBeInTheDocument());
-    expect(screen.getByText(/machine: MacBook-Pro/)).toBeInTheDocument();
+    expect(screen.getByText(/Machine MacBook-Pro/)).toBeInTheDocument();
   });
 
   it("clicking the chip clears the pin — back to every machine, via a real hash write", async () => {
@@ -1072,7 +1072,7 @@ describe("RunsBoard — the machine pin (#1809)", () => {
     fireEvent.click(container.querySelector('[data-act="clearmachine"]')!);
 
     await waitFor(() => expect(screen.getByText("m2")).toBeInTheDocument());
-    expect(screen.queryByText(/machine: MacBook-Pro/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Machine MacBook-Pro/)).not.toBeInTheDocument();
     expect(window.location.hash).toBe("#lens=runs");
   });
 
@@ -1338,7 +1338,7 @@ describe("RunsBoard — the machine pin on a static build (#2063)", () => {
     expect(screen.getByText("d1")).toBeInTheDocument();
     expect(screen.queryByText("m2")).not.toBeInTheDocument();
     // The chip names the machine, not the raw uid.
-    expect(screen.getByText(/m5-ultra-256gb/)).toBeInTheDocument();
+    expect(screen.getAllByText(/m5-ultra-256gb/).length).toBeGreaterThan(0);
     expect(seen.filter((p) => p.startsWith("/flow/") || p === "/fleet/machines/live")).toEqual([]);
   });
 

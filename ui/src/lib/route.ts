@@ -37,6 +37,7 @@
 import { injectedPlaybackDate } from "./injectedMeta";
 import { getSource } from "./source";
 import { sanitizeOptParams } from "../lenses/console/panels";
+import { FILTER_DIMS, parseFilterSel, type FilterSel } from "./runsFilterQuery";
 
 export const RUNS_KINDS = ["all", "mission", "dispatch", "lab"] as const;
 export type RunsKind = (typeof RUNS_KINDS)[number];
@@ -92,7 +93,16 @@ export type Route =
    * name, or `<name>~<hash>` / `unnamed-<hash>`), never the hardware uid — a uid in the address
    * bar identifies the physical machine to anyone shown a screenshot or a
    * link. */
-  | { kind: "runs"; runsKind: RunsKind; lab: string | null; machine: string | null }
+  | {
+      kind: "runs";
+      runsKind: RunsKind;
+      lab: string | null;
+      machine: string | null;
+      /** The dimension filters (`lib/runsFilterQuery.ts`), present only when they
+       * say more than the `machine` pin alone: `filters.machine` then holds EVERY
+       * selected machine key, and `machine` above is the first of them. */
+      filters?: FilterSel;
+    }
   /** `machine` (named `uid` before #2929) — widened in the drill-in packet
    * to carry a SPECIFIC machine: `null` for the nav-tab/deep-link entry
    * (`goMachine` in legacy — always "the local machine"), a machine key for
@@ -354,6 +364,24 @@ function retiredLink(lens: string, get: (name: string) => string): Route | null 
   return null;
 }
 
+/** The `lens=runs` route: kind, the drilled lab run, and the dimension filters. */
+function parseRunsRoute(get: (name: string) => string, search: URLSearchParams, hash: URLSearchParams): Route {
+  const rawKind = (get("kind") || "all").toLowerCase();
+  const runsKind = (RUNS_KINDS as readonly string[]).includes(rawKind) ? (rawKind as RunsKind) : "all";
+  // (#1974) `lab=<dir>` opens a lab run, named for the run kind it opens
+  // (CLAUDE.md contract 8). The pre-5.0 `run=` spelling has no alias: it is an
+  // ordinary unknown param, so an old link lands on the runs board.
+  const lab = search.has("lab") ? search.get("lab") : hash.has("lab") ? hash.get("lab") : null;
+  const filters = parseFilterSel((name) => {
+    const own = search.getAll(name);
+    return own.length ? own : hash.getAll(name);
+  });
+  const machine = filters.machine[0] ?? null;
+  // `filters` rides only when it says more than the bare `machine` pin does.
+  const beyondPin = FILTER_DIMS.some((d) => (d === "machine" ? filters.machine.length > 1 : filters[d].length > 0));
+  return { kind: "runs", runsKind, lab: lab === null ? null : lab.trim(), machine, ...(beyondPin ? { filters } : {}) };
+}
+
 /** Parse the CURRENT `location.hash` into a [[Route]]. Pure function of
  * `location.hash` (and, matching the legacy grammar, `location.search` as a
  * fallback source for the same param names) — call it fresh on every
@@ -391,18 +419,7 @@ export function parseRoute(): Route {
     return { kind: "fleet" };
   }
 
-  if (lens === "runs") {
-    const rawKind = (get("kind") || "all").toLowerCase();
-    const runsKind = (RUNS_KINDS as readonly string[]).includes(rawKind)
-      ? (rawKind as RunsKind)
-      : "all";
-    // (#1974) `lab=<dir>` opens a lab run, named for the run kind it opens
-    // (CLAUDE.md contract 8). The pre-5.0 `run=` spelling has no alias: it is
-    // an ordinary unknown param, so an old link lands on the runs board.
-    const lab = search.has("lab") ? search.get("lab") : hash.has("lab") ? hash.get("lab") : null;
-    const machine = get("machine");
-    return { kind: "runs", runsKind, lab: lab === null ? null : lab.trim(), machine: machine ? machine : null };
-  }
+  if (lens === "runs") return parseRunsRoute(get, search, hash);
 
   if (lens === "machine") {
     const machine = get("machine");

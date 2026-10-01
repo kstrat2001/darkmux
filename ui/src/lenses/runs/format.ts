@@ -107,6 +107,14 @@ export function runSubtitle(r: Run, machine: string | null): string {
     .join(" · ");
 }
 
+/** (#2925) The verify word a lab run reads as (`pass`, `FAIL`, or the dash for
+ * no result recorded); `null` for a row that is not a lab run. */
+export function runVerifyWord(r: Run): string | null {
+  if (r.kind !== "lab") return null;
+  if (r.verify_passed === true) return VERIFY_WORD.pass;
+  return r.verify_passed === false ? VERIFY_WORD.fail : VERIFY_WORD.none;
+}
+
 /** A lab run with no manifest yet names no workload, and says nothing about
  * verify; a non-lab row never does. */
 function verifyOutcome(r: Run): VerifyOutcome | null {
@@ -125,7 +133,7 @@ function runMachineRef(r: Run): MachineRef {
  * row with only a name takes the uid that one name belongs to among these rows
  * (a name two uids share resolves to neither), so a machine seen under a uid
  * on one row and a bare spelling on another is still one machine. */
-function machineKeyOfRuns(runs: Run[]): (r: Run) => string | null {
+export function machineKeyOfRuns(runs: Run[]): (r: Run) => string | null {
   const uidsByName = new Map<string, Set<string>>();
   for (const r of runs) {
     if (!r.machine_uid || !r.machine) continue;

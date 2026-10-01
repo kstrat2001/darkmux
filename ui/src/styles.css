@@ -2488,6 +2488,193 @@ body {
   opacity: 0.7;
   font-weight: 400;
 }
+/* (#2925) The runs board's dimension filters. The bar is ONE row at a fixed
+   height that scrolls sideways inside itself on a narrow screen, and the
+   summary row under it is one line with its own scroll, so choosing a value
+   never moves a pill or grows either row. */
+.fbarwrap {
+  margin: 6px 0 8px;
+}
+.fbar {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 6px;
+  overflow-x: auto;
+  height: 34px;
+  align-items: center;
+  scrollbar-width: none;
+}
+.fbar::-webkit-scrollbar {
+  display: none;
+}
+.fpill {
+  flex: 0 0 auto;
+  font: 600 calc(11px * var(--fs-scale)) / 1 var(--font-mono);
+  padding: 6px 10px;
+  border-radius: 14px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--dim);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.fpill:hover {
+  border-color: var(--accent);
+  color: var(--fg);
+}
+.fpill:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.fpill.on {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--panel-3);
+}
+.fpill.idle {
+  border-style: dashed;
+  opacity: 0.6;
+}
+.fpillv {
+  margin-left: 6px;
+  color: var(--fg);
+  font-weight: 400;
+}
+.fsummary {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 6px;
+  overflow-x: auto;
+  height: 32px;
+  scrollbar-width: none;
+  font: calc(11px * var(--fs-scale)) var(--font-mono);
+  color: var(--dim);
+}
+.fsummary::-webkit-scrollbar {
+  display: none;
+}
+.fcount,
+.fchip,
+.fclear {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+.fclear {
+  font: inherit;
+  background: none;
+  border: 0;
+  color: var(--accent);
+  cursor: pointer;
+  padding: 4px 6px;
+}
+.fscrim {
+  position: fixed;
+  inset: 0;
+  /* Above the phone drawer (z-index 80), so its handle cannot sit on the sheet. */
+  z-index: 90;
+}
+.fpop {
+  position: fixed;
+  z-index: 91;
+  width: 270px;
+  max-height: min(70vh, 420px);
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px;
+  gap: 6px;
+  font: calc(12px * var(--fs-scale)) var(--font-mono);
+  color: var(--fg);
+}
+.fpoptitle {
+  color: var(--dim);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  font-size: calc(10px * var(--fs-scale));
+}
+.fsearch {
+  font: inherit;
+  font-size: 16px;
+  padding: 6px 8px;
+  background: var(--panel-2);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.flist {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  flex: 1 1 auto;
+}
+.flist li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.fopt {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 2px;
+  cursor: pointer;
+  min-width: 0;
+}
+.fopt.zero {
+  opacity: 0.5;
+}
+.foptl {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.foptn {
+  color: var(--dim);
+}
+.fonly,
+.fbtn {
+  font: inherit;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--dim);
+  padding: 2px 8px;
+  cursor: pointer;
+}
+.fonly {
+  border: 0;
+  color: var(--accent);
+}
+.fbtn.primary {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.ffoot {
+  display: flex;
+  justify-content: space-between;
+}
+@media (max-width: 560px) {
+  /* A bottom sheet on a phone: the inline top/left a desktop popover is placed
+     with must not win. */
+  .fpop {
+    top: auto !important;
+    left: 0 !important;
+    right: 0;
+    bottom: 0;
+    width: auto;
+    max-height: 70vh;
+    border-radius: 12px 12px 0 0;
+  }
+  .fopt {
+    padding: 9px 2px;
+  }
+}
 .runkind {
   display: inline-block;
   font: 600 calc(10px * var(--fs-scale))/1 var(--font-mono);

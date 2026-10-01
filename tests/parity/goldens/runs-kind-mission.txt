@@ -23,6 +23,16 @@ all 308
 mission 108
 dispatch 67
 lab 133
+Time
+Status
+Machine
+Model
+Role
+Workload
+Verify
+Route
+Tracked
+Showing 108 of 108 runs
 NO ENDING RECORDED
 MISSION
 acp-ephemeral-pr-ship-1786152707367180000-5

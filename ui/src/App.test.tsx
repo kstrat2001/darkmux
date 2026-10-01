@@ -2034,7 +2034,7 @@ describe("(#2921) machine route chrome names a uid-only machine", () => {
     mount([{ id: "studio", address: "a:1", added_unix_ms: 1, machine_uid: FAKE_UID }]);
     window.location.hash = `#lens=runs&machine=${FAKE_UID}`;
     await waitFor(() => expect(window.location.hash).toBe("#lens=runs&machine=studio"));
-    await waitFor(() => expect(screen.getByText(/machine: studio/)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/Machine studio/)).toBeInTheDocument());
     expect(UUID_RE.test(document.body.textContent ?? "")).toBe(false);
   });
 });
