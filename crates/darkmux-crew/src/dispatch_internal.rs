@@ -11842,7 +11842,7 @@ fn ensure_model_resident_from(
         .iter()
         .find(|m| is_reloadable_target(&m.model, &m.identifier, model_key, want_identifier))
     {
-        Some(m) if m.context >= u64::from(n_ctx) => return Ok(()),
+        Some(m) if darkmux_gestalt::ctx_sufficient(m.context, n_ctx) => return Ok(()),
         Some(m) => {
             eprintln!(
                 "darkmux dispatch: `{}` is resident at context {} but n_ctx={} is wanted \
