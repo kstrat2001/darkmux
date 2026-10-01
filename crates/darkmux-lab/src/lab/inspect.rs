@@ -86,6 +86,13 @@ pub fn lab_inspect(run_path: &str) -> Result<InspectionReport> {
         .with_context(|| format!("reading {}", manifest_path.display()))?;
     let meta: serde_json::Value = serde_json::from_str(&raw)
         .with_context(|| format!("parsing {}", manifest_path.display()))?;
+    // (#3035) A run recorded by a newer darkmux may carry fields this binary
+    // cannot place: refuse it rather than inspect a partial reading.
+    let known = darkmux_types::data_version::RUN_MANIFEST_SCHEMA_VERSION;
+    if let Some(file_version) = darkmux_types::data_version::newer_under(&meta, darkmux_types::data_version::RUN_MANIFEST_KEY, known) {
+        let why = darkmux_types::data_version::newer_refusal("run manifest", &file_version, known);
+        return Err(anyhow::anyhow!("{}: {why}", manifest_path.display()));
+    }
     let workload_id = meta
         .get("workload")
         .and_then(|v| v.as_str())
@@ -232,6 +239,20 @@ mod tests {
              inspecting a run — the user tier is forced home (#2590); \
              got: {err}"
         );
+    }
+
+    /// (#3035) A manifest naming a newer shared marker is refused with the
+    /// upgrade message; the same or an absent marker inspects as before.
+    #[test]
+    fn lab_inspect_refuses_a_run_manifest_from_a_newer_darkmux() {
+        let run_dir = TempDir::new().unwrap();
+        std::fs::write(
+            run_dir.path().join("manifest.json"),
+            r#"{"manifest_schema_version":"999.0","workload":"w","provider":"prompt"}"#,
+        )
+        .unwrap();
+        let err = lab_inspect(run_dir.path().to_str().unwrap()).unwrap_err().to_string();
+        assert!(err.contains("written by a newer darkmux (run manifest `999.0`") && err.contains("Upgrade darkmux."), "{err}");
     }
 
     #[test]

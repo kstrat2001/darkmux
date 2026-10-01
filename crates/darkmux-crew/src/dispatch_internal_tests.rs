@@ -5202,6 +5202,24 @@
         assert_ne!(execution_for(Some(no_origin.path())), recorded);
     }
 
+    /// (#3035) The origin is stamped with its data-shape version, and a
+    /// resume from a dir whose origin names a newer one is refused with the
+    /// upgrade message instead of being read as if its shape were known.
+    #[test]
+    fn the_resume_origin_carries_its_schema_version_and_a_newer_one_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let ws = TempDir::new().unwrap();
+        write_resume_origin_meta(dir.path(), ws.path(), false, None, &ExecutionId::mint());
+        let raw = std::fs::read_to_string(dir.path().join(RESUME_ORIGIN_FILENAME)).unwrap();
+        let mut origin: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(origin["schema_version"], RESUME_ORIGIN_SCHEMA_VERSION);
+        origin["schema_version"] = serde_json::json!("999.0");
+        std::fs::write(dir.path().join(RESUME_ORIGIN_FILENAME), origin.to_string()).unwrap();
+        std::fs::write(dir.path().join(CHECKPOINT_FILENAME), sample_checkpoint_json()).unwrap();
+        let err = validate_resume_checkpoint(dir.path(), "coder", ws.path(), false).unwrap_err().to_string();
+        assert!(err.contains("RESUME ORIGIN NEWER") && err.contains("Upgrade darkmux."), "{err}");
+    }
+
     /// The recorded id is read from a file the model can write, so only the
     /// minted grammar is believed: a planted `legacy:` id, one with control
     /// characters and one with a slash each get a fresh execution.

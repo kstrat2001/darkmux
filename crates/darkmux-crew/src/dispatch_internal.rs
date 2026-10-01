@@ -937,6 +937,13 @@ pub(crate) fn validate_resume_checkpoint(
             origin_path.display()
         )
     })?;
+    if let Some(file_version) = darkmux_types::data_version::newer(&origin, RESUME_ORIGIN_SCHEMA_VERSION) {
+        bail_resume!(
+            "darkmux dispatch: RESUME ORIGIN NEWER — {}: {}",
+            origin_path.display(),
+            darkmux_types::data_version::newer_refusal("resume origin", &file_version, RESUME_ORIGIN_SCHEMA_VERSION)
+        );
+    }
     let origin_workspace = origin.get("workspace").and_then(|v| v.as_str());
     let origin_read_only = origin.get("workspace_read_only").and_then(|v| v.as_bool());
     let (Some(origin_workspace), Some(origin_read_only)) = (origin_workspace, origin_read_only)
@@ -1122,6 +1129,10 @@ fn origin_record_exposed_by(out_dir: &Path, mounts: &[(&str, &Path)]) -> Result<
     Ok(())
 }
 
+/// (#3035) The data-shape version `write_resume_origin_meta` stamps and
+/// `validate_resume_checkpoint` reads: a file naming a newer one is refused.
+use darkmux_types::data_version::RESUME_ORIGIN_SCHEMA_VERSION;
+
 /// (Security audit, #2114 resume follow-up) Stamp this dispatch's
 /// workspace path + read-only mode into its own `host_out`, unconditionally
 /// — every dispatch writes this, not just ones that might later be resumed,
@@ -1169,6 +1180,7 @@ pub(crate) fn write_resume_origin_meta(
     let recorded_workspace =
         workspace.canonicalize().unwrap_or_else(|_| workspace.to_path_buf());
     let body = serde_json::json!({
+        "schema_version": RESUME_ORIGIN_SCHEMA_VERSION,
         "workspace": recorded_workspace.display().to_string(),
         "workspace_read_only": workspace_read_only,
         "image": image,

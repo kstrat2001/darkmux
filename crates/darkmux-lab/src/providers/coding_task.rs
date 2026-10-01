@@ -1238,6 +1238,7 @@ pub fn write_manifest(run_dir: &Path, m: &ManifestInputs<'_>) -> Result<()> {
         // through `lab::inspect::run_trajectory`. The enrichers only ever
         // RAISE the version, so a v7 run stays v7.
         "schema_version": 8,
+        "manifest_schema_version": darkmux_types::data_version::RUN_MANIFEST_SCHEMA_VERSION,
         "run_id": run_id,
         "workload": m.workload_id,
         "provider": CodingTaskProvider.id(),
@@ -1442,6 +1443,7 @@ mod tests {
             let manifest: serde_json::Value =
                 serde_json::from_str(&fs::read_to_string(run_dir.join("manifest.json")).unwrap()).unwrap();
             assert_eq!(manifest["ok"], ok, "case {i}");
+            assert_eq!(manifest["manifest_schema_version"], darkmux_types::data_version::RUN_MANIFEST_SCHEMA_VERSION, "case {i}");
             assert_eq!(manifest.get("escalation").and_then(|e| e.as_str()), escalation, "case {i}");
         }
     }
