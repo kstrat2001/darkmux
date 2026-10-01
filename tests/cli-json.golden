@@ -39,7 +39,7 @@ flow tail  one flow record per line, verbatim; the record is pinned by FLOW_SCHE
 
 # types
 AbandonReason = "aborted" | "noterminal"
-AcceptsState = { accepts: CardAccepts; state: "granted" } | { state: "not_listed" } | { state: "this_machine" } | { state: "withheld" } | { state: "unknown" }
+AcceptsState = { accepts: CardAccepts; state: "granted" } | { state: "not_listed" } | { state: "this_machine" } | { state: "unknown" }
 ActiveWait
   scope: string
   subject: string
@@ -570,8 +570,8 @@ MachineCard
   profiles_error: string | null
   seats?: CardSeats | null
   governor: CardGovernor
-  fleet_mode: DeclaredFleetMode
-  hosts_fleet_redis: boolean
+  fleet_mode?: DeclaredFleetMode | null
+  hosts_fleet_redis?: boolean | null
   fleet_defaults?: CardFleetDefaults | null
   generated_at_ms: uint64
   gather_ms: uint64

@@ -118,7 +118,7 @@ describe("grantOf: what a peer lets this machine do", () => {
   });
 
   it("every other state shows no grant", () => {
-    for (const state of ["not_listed", "this_machine", "withheld", "unknown"] as const) {
+    for (const state of ["not_listed", "this_machine", "unknown"] as const) {
       expect(grantOf({ state }), state).toBeNull();
     }
   });

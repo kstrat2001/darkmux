@@ -6,4 +6,4 @@ import type { CardAccepts } from "./CardAccepts";
  * (with the entry), no entry, or not known. It is a fact about the row's
  * machine, beside its card.
  */
-export type AcceptsState = { "state": "granted", accepts: CardAccepts, } | { "state": "not_listed" } | { "state": "this_machine" } | { "state": "withheld" } | { "state": "unknown" };
+export type AcceptsState = { "state": "granted", accepts: CardAccepts, } | { "state": "not_listed" } | { "state": "this_machine" } | { "state": "unknown" };

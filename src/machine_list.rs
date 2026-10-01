@@ -162,7 +162,7 @@ fn accepts_phrase(accepts: &AcceptsState, voice: Voice) -> Option<String> {
             list_or_none(&accepts.roles)
         ),
         AcceptsState::NotListed => format!("does not list {who}: it takes no work from it"),
-        AcceptsState::ThisMachine | AcceptsState::Withheld => return None,
+        AcceptsState::ThisMachine => return None,
         AcceptsState::Unknown => format!("accepts from {who}: unknown"),
     })
 }

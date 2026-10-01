@@ -104,14 +104,13 @@ export interface Grant {
 }
 
 /** The grant the view holds for a peer; `null` when there is none to show
- * (this machine's own row, no entry, withheld, unknown). */
+ * (this machine's own row, no entry, unknown). */
 export function grantOf(accepts: AcceptsState): Grant | null {
   switch (accepts.state) {
     case "granted":
       return grantFrom(accepts.accepts);
     case "not_listed":
     case "this_machine":
-    case "withheld":
     case "unknown":
       return null;
     default: {
