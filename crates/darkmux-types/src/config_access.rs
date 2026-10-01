@@ -3434,6 +3434,49 @@ mod tests {
         );
     }
 
+    /// (#2101) The root scopes EVERY `dirs.*` default, not just the ones that
+    /// happened to be fixed one bug at a time: under a scratch `DARKMUX_HOME`
+    /// with no env or config override, each dir accessor lands under it.
+    #[serial_test::serial]
+    #[test]
+    fn every_dir_default_is_scoped_by_darkmux_home() {
+        const OVERRIDES: &[&str] = &[
+            "DARKMUX_FLOWS_DIR", "DARKMUX_FINDINGS_DIR", "DARKMUX_MODS_DIR", "DARKMUX_LAB_DIR",
+            "DARKMUX_FLEET_FILE", "DARKMUX_AUDIT_DIR",
+        ];
+        let tmp = tempfile::TempDir::new().unwrap();
+        let saved: Vec<_> = OVERRIDES.iter().chain(&["DARKMUX_HOME"]).map(|k| (*k, std::env::var(k).ok())).collect();
+        unsafe {
+            for k in OVERRIDES {
+                std::env::remove_var(k);
+            }
+            std::env::set_var("DARKMUX_HOME", tmp.path());
+        }
+        let got = [
+            ("flows", flows_dir()),
+            ("findings", findings_dir()),
+            ("mods", mods_dir()),
+            ("lab", lab_dir()),
+            ("hooks outbox", hooks_outbox_dir()),
+            ("hooks adapters", hooks_adapters_dir()),
+            ("liveness", liveness_dir()),
+            ("runtime cache", runtime_cache_dir()),
+            ("cache", cache_dir()),
+            ("fleet file", fleet_file()),
+        ];
+        unsafe {
+            for (k, v) in saved {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        for (name, path) in got {
+            assert!(path.starts_with(tmp.path()), "{name} default {} escapes DARKMUX_HOME {}", path.display(), tmp.path().display());
+        }
+    }
+
     /// (#2265) `dirs.findings` resolves through the same three tiers as every
     /// sibling dir: `env(DARKMUX_FINDINGS_DIR) > config.dirs.findings >
     /// <root>/findings`. The config tier is exercised through `pick_dir`
