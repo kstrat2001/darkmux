@@ -729,11 +729,12 @@ pub struct ScopedJob {
 /// ([`check_boundary`]).
 pub fn check_scope(
     receiver: &str,
+    receiver_uid: Option<&str>,
     admitted: &Admitted,
     job: &WorkJob,
     resolution: ProfileResolution,
 ) -> std::result::Result<ScopedJob, Refusal> {
-    if !crate::job::same_machine(&job.target_machine, receiver) {
+    if !job.is_addressed_to(receiver, receiver_uid) {
         return Err(Refusal::Misaddressed { target: job.target_machine.clone() });
     }
     if !admitted.roles.iter().any(|r| r == &job.role_id) {
@@ -1269,7 +1270,7 @@ pub fn pin_on_first_contact(
 /// ([`verify_target`]), then dial that verified address's fleet listener with
 /// the fleet token. `Err` only when no answer came (or the target could not
 /// be verified, so nothing was sent).
-fn send_job(job: WorkJob, wait: bool, pins: PinPolicy) -> Result<(u16, SubmissionReply)> {
+fn send_job(mut job: WorkJob, wait: bool, pins: PinPolicy) -> Result<(u16, SubmissionReply)> {
     job.validate().context("validating the job before it leaves")?;
     let target = job.target_machine.clone();
     let roster = crate::load_roster().context("reading the fleet roster")?;
@@ -1280,6 +1281,12 @@ fn send_job(job: WorkJob, wait: bool, pins: PinPolicy) -> Result<(u16, Submissio
             crate::roster_path().display()
         )
     })?;
+    // (#3028) The job names the machine by the identity this roster learned
+    // from its card, so the receiver accepts it under whatever name the
+    // machine goes by now. An entry that has learned none (or holds a value
+    // that is not a uid) sends none, and the receiver checks the name.
+    job.target_machine_uid =
+        entry.machine_uid.clone().filter(|u| crate::job::validate_machine_uid(u).is_ok());
     if !darkmux_flow::serve_token_present() {
         return Err(anyhow!(
             "no fleet token on this machine: submitting work to {target} needs the serve token \
@@ -1536,6 +1543,7 @@ mod tests {
     fn job(profile: Option<&str>) -> WorkJob {
         WorkJob {
             target_machine: "studio".into(),
+            target_machine_uid: None,
             role_id: "radio-host".into(),
             message: "hi".into(),
             session_id: crate::test_session("s-1"),
@@ -1581,7 +1589,7 @@ mod tests {
             Prof::OutOfScope => work("coder-big"),
             Prof::Utility => ProfileResolution::UtilityOnly("utility".into()),
         };
-        check_scope("studio", &admitted, &job(None), resolution).map(|s| s.profile)
+        check_scope("studio", None, &admitted, &job(None), resolution).map(|s| s.profile)
     }
 
     /// The auth matrix: token yes/no × node allowed/unknown/not-on-overlay/
@@ -1729,17 +1737,71 @@ mod tests {
         let work = || work("host");
         let mut j = job(None);
         j.role_id = "coder".into();
-        assert!(matches!(check_scope("studio", &admitted, &j, work()), Err(Refusal::OutOfScope { item: OutOfScope::Role { ref role, .. }, .. }) if role == "coder"));
+        assert!(matches!(check_scope("studio", None, &admitted, &j, work()), Err(Refusal::OutOfScope { item: OutOfScope::Role { ref role, .. }, .. }) if role == "coder"));
         let no_roles = Admitted { roles: vec![], ..admitted.clone() };
-        assert!(matches!(check_scope("studio", &no_roles, &job(None), work()), Err(Refusal::OutOfScope { item: OutOfScope::Role { .. }, .. })), "absent roles = none");
+        assert!(matches!(check_scope("studio", None, &no_roles, &job(None), work()), Err(Refusal::OutOfScope { item: OutOfScope::Role { .. }, .. })), "absent roles = none");
         let mut j = job(None);
         j.image = Some("evil.example/x:latest".into());
-        assert!(matches!(check_scope("studio", &admitted, &j, work()), Err(Refusal::OutOfScope { item: OutOfScope::Image { .. }, .. })));
+        assert!(matches!(check_scope("studio", None, &admitted, &j, work()), Err(Refusal::OutOfScope { item: OutOfScope::Image { .. }, .. })));
         j.image = Some("rust:slim".into());
-        assert_eq!(check_scope("studio", &admitted, &j, work()).unwrap().profile, "host");
+        assert_eq!(check_scope("studio", None, &admitted, &j, work()).unwrap().profile, "host");
         let mut j = job(None);
         j.target_machine = "Studio".into();
-        assert_eq!(check_scope("studio", &admitted, &j, work()).unwrap().profile, "host", "case-insensitive");
+        assert_eq!(check_scope("studio", None, &admitted, &j, work()).unwrap().profile, "host", "case-insensitive");
+    }
+
+    fn laptop_admitted() -> Admitted {
+        Admitted {
+            node_id: "nLAPTOP".into(),
+            peer_name: "macbook-pro".into(),
+            profiles: vec!["host".into()],
+            roles: vec!["radio-host".into()],
+            images: vec![],
+            workspace: false,
+        }
+    }
+
+    /// (#3028) The headline: the receiver renamed itself `studio`; a job
+    /// addressed to its old name carries its uid and is taken.
+    #[test]
+    fn a_job_naming_the_receivers_uid_is_taken_under_any_name() {
+        let mut j = job(None);
+        j.target_machine = "m1-max-32gb-studio".into();
+        j.target_machine_uid = Some("abcd-1234".into());
+        let scoped = check_scope("studio", Some("ABCD-1234"), &laptop_admitted(), &j, work("host"));
+        assert_eq!(scoped.unwrap().profile, "host", "the uid decides, case-insensitively, whatever the name");
+    }
+
+    /// (#3028) A different machine answering to the receiver's name is not
+    /// the machine the sender meant.
+    #[test]
+    fn a_job_naming_another_machines_uid_is_misaddressed_even_under_the_receivers_name() {
+        let mut j = job(None);
+        j.target_machine_uid = Some("OTHER-UID".into());
+        let refusal = check_scope("studio", Some("MY-UID"), &laptop_admitted(), &j, work("host")).unwrap_err();
+        assert!(matches!(refusal, Refusal::Misaddressed { .. }), "{refusal:?}");
+        let sentence = refusal.reason("studio");
+        assert!(!sentence.contains("OTHER-UID") && !sentence.contains("MY-UID"), "no uid is printed: {sentence}");
+    }
+
+    /// (#3028) No uid on the job (an 8.0 sender, or one that has not learned
+    /// it), or none on the receiver (it cannot read its own): the name check
+    /// is what it was.
+    #[test]
+    fn without_a_uid_on_either_side_the_name_decides() {
+        let mut j = job(None);
+        j.target_machine = "m1-max-32gb-studio".into();
+        assert!(matches!(
+            check_scope("studio", Some("MY-UID"), &laptop_admitted(), &j, work("host")),
+            Err(Refusal::Misaddressed { .. })
+        ));
+        j.target_machine_uid = Some("SOME-UID".into());
+        assert!(
+            matches!(check_scope("studio", None, &laptop_admitted(), &j, work("host")), Err(Refusal::Misaddressed { .. })),
+            "a receiver that cannot name its own uid cannot confirm one"
+        );
+        j.target_machine = "studio".into();
+        assert!(check_scope("studio", None, &laptop_admitted(), &j, work("host")).is_ok());
     }
 
     #[test]
@@ -1755,19 +1817,19 @@ mod tests {
         let mut j = job(None);
         j.target_machine = "mini".into();
         assert!(matches!(
-            check_scope("studio", &admitted, &j, work("host")),
+            check_scope("studio", None, &admitted, &j, work("host")),
             Err(Refusal::Misaddressed { .. })
         ));
         let mut j = job(None);
         j.workdir = Some("/tmp/x".into());
         assert!(matches!(
-            check_scope("studio", &admitted, &j, work("host")),
+            check_scope("studio", None, &admitted, &j, work("host")),
             Err(Refusal::OutOfScope { item: OutOfScope::Workspace, .. })
         ));
         let with_ws = Admitted { workspace: true, ..admitted.clone() };
-        assert_eq!(check_scope("studio", &with_ws, &j, work("host")).unwrap().profile, "host");
+        assert_eq!(check_scope("studio", None, &with_ws, &j, work("host")).unwrap().profile, "host");
         assert!(matches!(
-            check_scope("studio", &admitted, &job(None), ProfileResolution::Unresolved("x".into())),
+            check_scope("studio", None, &admitted, &job(None), ProfileResolution::Unresolved("x".into())),
             Err(Refusal::NoWorkProfile { .. })
         ));
     }
@@ -1903,8 +1965,8 @@ mod tests {
         }
         // The current version parses through the public entry point.
         assert!(WorkSubmission::parse(&body_at(WORK_JOB_SCHEMA_VERSION)).is_ok());
-        let newer = Refusal::SchemaMismatch { got: "8.1".into() }.reason("studio");
-        assert!(newer.contains(&format!("v{WORK_JOB_SCHEMA_VERSION}")) && newer.contains("v8.1"), "both versions named: {newer}");
+        let newer = Refusal::SchemaMismatch { got: "8.9".into() }.reason("studio");
+        assert!(newer.contains(&format!("v{WORK_JOB_SCHEMA_VERSION}")) && newer.contains("v8.9"), "both versions named: {newer}");
     }
 
     /// Every refusal maps to exactly one code, and its reply carries it.
@@ -1983,22 +2045,22 @@ mod tests {
         let admitted = admitted_for_boundary();
         let with = |boundary| WorkJob { boundary, ..job(None) };
         let managed = Some(Boundary::ManagedOnly);
-        assert_eq!(check_scope("studio", &admitted, &with(managed), work("host")).unwrap().profile, "host");
+        assert_eq!(check_scope("studio", None, &admitted, &with(managed), work("host")).unwrap().profile, "host");
         assert_eq!(
-            check_scope("studio", &admitted, &with(managed), hosted("cloud")).unwrap_err(),
+            check_scope("studio", None, &admitted, &with(managed), hosted("cloud")).unwrap_err(),
             Refusal::BoundaryUnmanaged { profile: "cloud".into() }
         );
-        assert_eq!(check_scope("studio", &admitted, &with(None), hosted("cloud")).unwrap().profile, "cloud");
+        assert_eq!(check_scope("studio", None, &admitted, &with(None), hosted("cloud")).unwrap().profile, "cloud");
         for resolution in [work("host"), hosted("cloud")] {
             assert_eq!(
-                check_scope("studio", &admitted, &with(Some(Boundary::Unknown)), resolution).unwrap_err(),
+                check_scope("studio", None, &admitted, &with(Some(Boundary::Unknown)), resolution).unwrap_err(),
                 Refusal::BoundaryUnknown
             );
         }
         // An out-of-scope profile is refused as such before its kind is told.
         let narrow = Admitted { profiles: vec!["host".into()], ..admitted };
         assert!(matches!(
-            check_scope("studio", &narrow, &with(managed), hosted("cloud")),
+            check_scope("studio", None, &narrow, &with(managed), hosted("cloud")),
             Err(Refusal::OutOfScope { item: OutOfScope::Profile { .. }, .. })
         ));
     }
@@ -2017,7 +2079,7 @@ mod tests {
         let admitted = Admitted { profiles: vec!["local".into(), "cloud".into()], ..admitted_for_boundary() };
         let job = |profile: &str| WorkJob { profile: Some(profile.into()), boundary: Some(Boundary::ManagedOnly), ..job(None) };
         let scoped = |profile: &str| {
-            check_scope("studio", &admitted, &job(profile), classify_profile(&reg, &role, Some(profile), None, "studio"))
+            check_scope("studio", None, &admitted, &job(profile), classify_profile(&reg, &role, Some(profile), None, "studio"))
         };
         assert_eq!(scoped("local").unwrap().profile, "local");
         assert_eq!(scoped("cloud").unwrap_err(), Refusal::BoundaryUnmanaged { profile: "cloud".into() });
@@ -2073,6 +2135,7 @@ mod tests {
             machine_uid: None,
             loopback_intended: false,
             node_id: node_id.map(str::to_string),
+            current_name: None,
             extras: Default::default(),
         }
     }

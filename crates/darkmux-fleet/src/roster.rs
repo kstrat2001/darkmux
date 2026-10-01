@@ -130,6 +130,16 @@ pub struct MachineEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_id: Option<String>,
 
+    /// (#3028) The `machine_id` the peer's own card stated the last time it
+    /// was read over the verified path (the read that pins `node_id`). A
+    /// machine can rename itself; this is what it goes by now, kept beside
+    /// `id` (the key the operator wrote, never rewritten). `@<name>`
+    /// addresses resolve against either (`resolve_machine`). `None` until a
+    /// card has been read; absent on every entry written before #3028 and
+    /// then behaving exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_name: Option<String>,
+
     /// Fields this binary does not know, preserved verbatim on rewrite.
     #[serde(flatten)]
     pub extras: BTreeMap<String, serde_json::Value>,
@@ -413,10 +423,13 @@ pub fn add_machine(
         });
     let existing = roster.machines.get(id);
     let existing_added_at = existing.map(|m| m.added_unix_ms);
-    let existing_uid = existing.and_then(|m| m.machine_uid.clone());
+    // (#3028) The uid and current name a card taught belong to the address it
+    // was read at, like the pin: repointing the entry forgets them.
+    let same_address = existing.filter(|m| m.address == address);
+    let existing_uid = same_address.and_then(|m| m.machine_uid.clone());
     let existing_extras = existing.map(|m| m.extras.clone()).unwrap_or_default();
     // A pin belongs to the address it was made for.
-    let existing_node = existing.filter(|m| m.address == address).and_then(|m| m.node_id.clone());
+    let existing_node = same_address.and_then(|m| m.node_id.clone());
     let entry = MachineEntry {
         id: id.to_string(),
         address: address.to_string(),
@@ -425,16 +438,19 @@ pub fn add_machine(
         machine_uid: uid.map(String::from).or(existing_uid),
         loopback_intended: false,
         node_id: existing_node,
+        current_name: same_address.and_then(|m| m.current_name.clone()),
         extras: existing_extras,
     };
     roster.machines.insert(id.to_string(), entry);
     Ok(())
 }
 
-/// (#2916) The roster KEY naming `name`: machine names are ASCII
+/// (#2916) The roster KEY whose id is `name`: machine names are ASCII
 /// case-insensitive, so an exact key wins, else the one key equal ignoring
 /// case. Two keys differing only in case (a roster written before this
 /// rule) are ambiguous: an error naming both, never a pick by map order.
+/// Ids only: `machine add`/`remove` edit the key the operator wrote, so a
+/// name a peer learned to go by is not a key here (see [`find_machine`]).
 pub fn find_machine_key(roster: &FleetRoster, name: &str) -> Result<Option<String>> {
     if roster.machines.contains_key(name) {
         return Ok(Some(name.to_string()));
@@ -451,10 +467,39 @@ pub fn find_machine_key(roster: &FleetRoster, name: &str) -> Result<Option<Strin
     }
 }
 
-/// (#2916) The roster entry for `name`, case-insensitively (see
-/// [`find_machine_key`]).
+/// (#3028) The roster entry a `@name` address means: the ONE resolver every
+/// address goes through (a dispatch, the radio's answering seat, `check`,
+/// doctor's route probes, `machine status`). A name matches an entry's id or
+/// the current name its peer's card last stated, ASCII case-insensitively.
+/// An entry whose id is exactly `name` wins over case variants of other ids
+/// (the #2916 rule), but two entries that answer to one name any other way
+/// are an error naming both, never a guess.
 pub fn find_machine<'a>(roster: &'a FleetRoster, name: &str) -> Result<Option<&'a MachineEntry>> {
-    Ok(find_machine_key(roster, name)?.and_then(|k| roster.machines.get(&k)))
+    let by_id = find_machine_key(roster, name)?;
+    let by_name: Vec<&String> = roster
+        .machines
+        .iter()
+        .filter(|(k, e)| {
+            Some(*k) != by_id.as_ref()
+                && e.current_name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(name))
+        })
+        .map(|(k, _)| k)
+        .collect();
+    match (by_id, by_name.as_slice()) {
+        (None, []) => Ok(None),
+        (Some(id), []) => Ok(roster.machines.get(&id)),
+        (None, [one]) => Ok(roster.machines.get(*one)),
+        (id, others) => {
+            let mut names: Vec<&str> = id.iter().map(String::as_str).collect();
+            names.extend(others.iter().map(|k| k.as_str()));
+            Err(anyhow!(
+                "the roster has several entries that answer to `{name}` ({}); machine names are \
+                 case-insensitive and an entry also answers to the name its machine goes by now, so \
+                 remove the stale one with `darkmux machine remove <exact name>`",
+                names.join(", ")
+            ))
+        }
+    }
 }
 
 /// (#2916 review C1) Resolve a roster address's host to its IP addresses,

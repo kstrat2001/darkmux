@@ -425,6 +425,59 @@ pub(crate) fn persist_pin(snapshot: &MachineEntry, target: &PeerTarget) -> Resul
     })
 }
 
+/// (#3028) The entry as it stands once a card's `uid` and `name` are taken
+/// in, or `None` when the card adds nothing or contradicts the entry. A uid
+/// the entry already holds is never replaced by a different one: that is a
+/// card from another machine, which `learn_identity`'s caller reports as a
+/// mismatch, and its name is not taken either. A uid or name that is not
+/// well formed on the wire is ignored.
+fn taught_by_card(e: &MachineEntry, uid: Option<&str>, name: Option<&str>) -> Option<MachineEntry> {
+    let uid = uid.filter(|u| crate::job::validate_machine_uid(u).is_ok());
+    let name = name.filter(|n| darkmux_types::profile_address::machine_name_problem(n).is_none());
+    if let (Some(known), Some(card)) = (e.machine_uid.as_deref(), uid) {
+        if !known.eq_ignore_ascii_case(card) {
+            return None;
+        }
+    }
+    let mut next = e.clone();
+    if e.machine_uid.is_none() {
+        next.machine_uid = uid.map(str::to_string);
+    }
+    if name.is_some() {
+        next.current_name = name.map(str::to_string);
+    }
+    (next != *e).then_some(next)
+}
+
+/// (#3028) Write what the peer's own card said about itself (its hardware
+/// uid and the `machine_id` it goes by now) onto the roster entry `snapshot`
+/// was read from, and return the entry as it then stands. Written only when
+/// `target` carries a verified node, the same node the pin names: the card
+/// is the pinned node's, so it is the entry's machine speaking. Like the pin,
+/// compare-and-set under the roster lock ([`check_saved_entry`]); an entry
+/// the card adds nothing to is not rewritten. The entry's id, the key the
+/// operator wrote, is never touched.
+pub fn learn_identity(
+    snapshot: &MachineEntry,
+    target: &SettledTarget,
+    uid: Option<&str>,
+    name: Option<&str>,
+) -> Result<MachineEntry> {
+    let Some(node) = target.node_id() else { return Ok(snapshot.clone()) };
+    if taught_by_card(snapshot, uid, name).is_none() {
+        return Ok(snapshot.clone());
+    }
+    crate::mutate_roster(|r| {
+        let saved = r.machines.get_mut(&snapshot.id);
+        check_saved_entry(saved.as_deref(), snapshot, node, true)?;
+        let saved = saved.ok_or_else(|| anyhow!("no entry is keyed `{}`", snapshot.id))?;
+        if let Some(next) = taught_by_card(saved, uid, name) {
+            *saved = next;
+        }
+        Ok(saved.clone())
+    })
+}
+
 /// Re-read the saved roster and confirm `target`'s verified node is still the
 /// one `snapshot`'s entry pins (no write). Returns the pinned node id.
 pub(crate) fn confirm_pin(snapshot: &MachineEntry, target: &PeerTarget) -> Result<String> {
@@ -556,6 +609,7 @@ mod tests {
             machine_uid: None,
             loopback_intended: false,
             node_id: node.map(str::to_string),
+            current_name: None,
             extras: Default::default(),
         }
     }
@@ -843,5 +897,104 @@ mod tests {
         let t = t.already_settled().unwrap();
         let body = fleet_get(&t, "/x", Duration::from_secs(5), &[]).unwrap().into_string().unwrap();
         assert_eq!(body, "ok");
+    }
+
+    /// `learn_identity` against a roster that holds `saved` under `studio`,
+    /// for a target pinned to `nSTUDIO`: the entry it returns and the entry
+    /// as saved afterward.
+    fn learn_against_saved(
+        saved: MachineEntry,
+        snapshot: MachineEntry,
+        uid: Option<&str>,
+        name: Option<&str>,
+    ) -> (Result<MachineEntry>, MachineEntry) {
+        let p = provider();
+        let dir = tempfile::tempdir().unwrap();
+        with_roster_file(&dir.path().join("fleet.json"), || {
+            crate::mutate_roster(|r| {
+                r.machines.insert("studio".into(), saved);
+                Ok(())
+            })
+            .unwrap();
+            let target = SettledTarget::new(first_contact(&p));
+            let out = learn_identity(&snapshot, &target, uid, name);
+            (out, crate::load_roster().unwrap().machines["studio"].clone())
+        })
+    }
+
+    fn pinned_entry() -> MachineEntry {
+        entry("100.64.0.2", Some("nSTUDIO"))
+    }
+
+    /// (#3028) The pinned peer's card teaches the entry its uid and its
+    /// current name; the key the operator wrote is not touched.
+    #[test]
+    #[serial_test::serial]
+    fn a_pinned_peers_card_teaches_its_uid_and_current_name() {
+        let (out, saved) = learn_against_saved(pinned_entry(), pinned_entry(), Some("UID-S"), Some("studio-now"));
+        let out = out.unwrap();
+        for e in [&out, &saved] {
+            assert_eq!(e.machine_uid.as_deref(), Some("UID-S"));
+            assert_eq!(e.current_name.as_deref(), Some("studio-now"));
+            assert_eq!(e.id, "studio");
+        }
+    }
+
+    /// (#3028) A card stating a DIFFERENT uid than the one the entry holds is
+    /// never written over it, and its name is not taken either: the entry
+    /// keeps what it knew and the view's mismatch handling says so.
+    #[test]
+    #[serial_test::serial]
+    fn a_different_uid_is_never_written_over_a_known_one() {
+        let known = MachineEntry { machine_uid: Some("UID-S".into()), current_name: Some("studio".into()), ..pinned_entry() };
+        let (out, saved) = learn_against_saved(known.clone(), known.clone(), Some("UID-OTHER"), Some("impostor"));
+        assert_eq!(out.unwrap(), known, "the entry as it stands is returned");
+        assert_eq!(saved, known, "nothing was written");
+    }
+
+    /// (#3028) The same uid under a new name updates the name alone, and the
+    /// uid compares case-insensitively.
+    #[test]
+    #[serial_test::serial]
+    fn the_same_uid_under_a_new_name_updates_the_name() {
+        let known = MachineEntry { machine_uid: Some("uid-s".into()), current_name: Some("studio".into()), ..pinned_entry() };
+        let (out, saved) = learn_against_saved(known.clone(), known, Some("UID-S"), Some("studio-2"));
+        out.unwrap();
+        assert_eq!((saved.machine_uid.as_deref(), saved.current_name.as_deref()), (Some("uid-s"), Some("studio-2")));
+    }
+
+    /// (#3028) Compare-and-set, like the pin: an entry edited since the card
+    /// was fetched is not written, and a target with no verified node (a
+    /// loopback entry) teaches nothing.
+    #[test]
+    #[serial_test::serial]
+    fn learning_is_saved_only_against_the_entry_that_was_verified() {
+        let moved = MachineEntry { address: "100.64.0.9".into(), ..pinned_entry() };
+        let (out, saved) = learn_against_saved(moved.clone(), pinned_entry(), Some("UID-S"), Some("studio-now"));
+        assert!(format!("{:#}", out.unwrap_err()).contains("address was edited"));
+        assert_eq!(saved, moved, "nothing was written");
+
+        let p = provider();
+        let dir = tempfile::tempdir().unwrap();
+        let unverified = with_roster_file(&dir.path().join("fleet.json"), || {
+            crate::mutate_roster(|r| {
+                r.machines.insert("studio".into(), pinned_entry());
+                Ok(())
+            })
+            .unwrap();
+            let lo = peer_target("lo", &entry("127.0.0.1", None), None, 8765, true, &p).unwrap().already_settled().unwrap();
+            assert_eq!(lo.node_id(), None);
+            learn_identity(&pinned_entry(), &lo, Some("UID-S"), Some("studio-now")).unwrap()
+        });
+        assert_eq!((unverified.machine_uid, unverified.current_name), (None, None));
+    }
+
+    /// (#3028) A name that is not a valid machine name is not stored.
+    #[test]
+    #[serial_test::serial]
+    fn a_card_name_that_is_not_a_machine_name_is_not_stored() {
+        let (out, saved) = learn_against_saved(pinned_entry(), pinned_entry(), Some("UID-S"), Some("not a name!"));
+        out.unwrap();
+        assert_eq!((saved.machine_uid.as_deref(), saved.current_name.as_deref()), (Some("UID-S"), None));
     }
 }

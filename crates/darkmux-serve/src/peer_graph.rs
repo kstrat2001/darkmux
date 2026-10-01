@@ -622,6 +622,7 @@ mod tests {
                 machine_uid: None,
                 loopback_intended: false,
                 node_id: None,
+                current_name: None,
                 extras: Default::default(),
             },
         );

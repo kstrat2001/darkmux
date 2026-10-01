@@ -238,6 +238,7 @@ mod tests {
     fn job() -> WorkJob {
         WorkJob {
             target_machine: "studio".into(),
+            target_machine_uid: None,
             role_id: "coder".into(),
             message: "m".into(),
             session_id: crate::test_session("s"),

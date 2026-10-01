@@ -27,6 +27,7 @@ fn regenerating() -> bool {
 fn full_job() -> WorkJob {
     WorkJob {
         target_machine: "studio".into(),
+        target_machine_uid: Some("00000000-0000-4000-8000-ABCDEF000001".into()),
         role_id: "radio-host".into(),
         message: "what is running?".into(),
         session_id: SessionId::adhoc(RunId::standalone("radio").unwrap(), "radio-host", "n1"),
@@ -74,10 +75,10 @@ fn writers() -> Vec<(&'static str, serde_json::Value)> {
         serde_json::to_value(x).unwrap()
     }
     vec![
-        ("submission-run-8.0.json", v(&WorkSubmission::new(full_job(), true))),
-        ("submission-check-8.0.json", v(&WorkSubmission::new(check_job(), false))),
+        ("submission-run-8.1.json", v(&WorkSubmission::new(full_job(), true))),
+        ("submission-check-8.1.json", v(&WorkSubmission::new(check_job(), false))),
         (
-            "reply-completed-8.0.json",
+            "reply-completed-8.1.json",
             v(&SubmissionReply {
                 exit_code: Some(0),
                 stdout: Some("the answer".into()),
@@ -86,7 +87,7 @@ fn writers() -> Vec<(&'static str, serde_json::Value)> {
             }),
         ),
         (
-            "reply-refused-8.0.json",
+            "reply-refused-8.1.json",
             v(&SubmissionReply {
                 reason: Some("studio's profile cloud runs on a hosted endpoint".into()),
                 refusal: Some(RefusalCode::Boundary),
@@ -95,7 +96,7 @@ fn writers() -> Vec<(&'static str, serde_json::Value)> {
             }),
         ),
         (
-            "reply-checked-8.0.json",
+            "reply-checked-8.1.json",
             v(&SubmissionReply {
                 reason: Some("studio would take this job on profile deep; its seat is free".into()),
                 check: Some(CheckReport { endpoint: EndpointClass::Managed, seat: SeatOutlook::Free }),
@@ -104,7 +105,7 @@ fn writers() -> Vec<(&'static str, serde_json::Value)> {
             }),
         ),
         (
-            "reply-queued-8.0.json",
+            "reply-queued-8.1.json",
             v(&SubmissionReply { reason: Some("studio is busy; the job is queued".into()), ..base_reply(ReplyStatus::Queued) }),
         ),
     ]
@@ -119,7 +120,7 @@ fn committed(name: &str) -> serde_json::Value {
 /// The promise: this build's writer still produces the committed fixtures. A
 /// change to what the wire says is a change to `WORK_JOB_SCHEMA_VERSION`.
 #[test]
-fn the_writer_produces_the_committed_8_0_fixtures() {
+fn the_writer_produces_the_committed_8_1_fixtures() {
     for (name, written) in writers() {
         if regenerating() {
             std::fs::create_dir_all(fixtures_dir()).unwrap();
@@ -140,14 +141,34 @@ fn the_writer_produces_the_committed_8_0_fixtures() {
 /// receiver's own parse (version, shape, validation), the replies through the
 /// sender's reader.
 #[test]
-fn the_committed_8_0_fixtures_still_parse() {
+fn the_committed_8_1_fixtures_still_parse() {
+    for name in ["submission-run-8.1.json", "submission-check-8.1.json"] {
+        let body = std::fs::read(fixtures_dir().join(name)).unwrap();
+        let sub = WorkSubmission::parse(&body).unwrap_or_else(|r| panic!("{name}: {r:?}"));
+        assert_eq!(sub.schema, "8.1");
+    }
+    let run = WorkSubmission::parse(&std::fs::read(fixtures_dir().join("submission-run-8.1.json")).unwrap()).unwrap();
+    assert_eq!(run.job, full_job());
+    for name in ["reply-completed-8.1.json", "reply-refused-8.1.json", "reply-checked-8.1.json", "reply-queued-8.1.json"] {
+        let reply: SubmissionReply = serde_json::from_value(committed(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_ne!(reply.status, ReplyStatus::Unknown, "{name}");
+    }
+}
+
+/// (#3028) The 8.0 fixtures are frozen, written by the 8.0 release's writer
+/// and never regenerated: an 8.1 receiver still takes what an 8.0 sender
+/// posted (a job with no `target_machine_uid`), and still reads the 8.0
+/// replies.
+#[test]
+fn the_frozen_8_0_fixtures_are_still_accepted_by_an_8_1_receiver() {
     for name in ["submission-run-8.0.json", "submission-check-8.0.json"] {
         let body = std::fs::read(fixtures_dir().join(name)).unwrap();
         let sub = WorkSubmission::parse(&body).unwrap_or_else(|r| panic!("{name}: {r:?}"));
         assert_eq!(sub.schema, "8.0");
+        assert_eq!(sub.job.target_machine_uid, None, "{name}: an 8.0 sender writes no uid");
     }
     let run = WorkSubmission::parse(&std::fs::read(fixtures_dir().join("submission-run-8.0.json")).unwrap()).unwrap();
-    assert_eq!(run.job, full_job());
+    assert_eq!(run.job, WorkJob { target_machine_uid: None, ..full_job() });
     for name in ["reply-completed-8.0.json", "reply-refused-8.0.json", "reply-checked-8.0.json", "reply-queued-8.0.json"] {
         let reply: SubmissionReply = serde_json::from_value(committed(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
         assert_ne!(reply.status, ReplyStatus::Unknown, "{name}");

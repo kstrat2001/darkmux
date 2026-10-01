@@ -67,6 +67,9 @@ type ExecuteJob = dyn Fn(WorkJob, String, String) -> anyhow::Result<DispatchResu
 pub(crate) struct FleetListenerState {
     /// This machine's name (its `machine_id`).
     pub receiver: String,
+    /// This machine's hardware uid, when it has one (#3028): a job that
+    /// carries its target's uid is checked against this, not the name.
+    pub receiver_uid: Option<String>,
     pub provider: Arc<dyn IdentityProvider>,
     /// This machine's own node id: a request from it is refused.
     pub local_node_id: Option<String>,
@@ -144,6 +147,7 @@ impl FleetListenerState {
         let resolve_receiver = receiver.clone();
         Self {
             receiver,
+            receiver_uid: darkmux_hardware::machine_uid().map(str::to_string),
             provider,
             local_node_id,
             token: Arc::new(|| darkmux_flow::serve_token().map(|t| t.expose_for_compare().to_string())),
@@ -773,7 +777,7 @@ impl Worker {
         }
         (state.config_preflight)().map_err(|detail| Refusal::BadConfig { detail })?;
         let resolution = (state.resolve_profile)(&self.job.role_id, self.job.profile.as_deref());
-        let now = darkmux_fleet::check_scope(&state.receiver, &admitted, &self.job, resolution)?;
+        let now = darkmux_fleet::check_scope(&state.receiver, state.receiver_uid.as_deref(), &admitted, &self.job, resolution)?;
         if now.seat != self.scoped.seat {
             return Err(Refusal::SeatChanged { profile: now.profile });
         }
@@ -922,7 +926,7 @@ async fn scope_submission(
         Ok(r) => r,
         Err(e) => ProfileResolution::Unresolved(format!("profile resolution did not finish: {e}")),
     };
-    let scoped = darkmux_fleet::check_scope(&state.receiver, admitted, &sub.job, resolution)?;
+    let scoped = darkmux_fleet::check_scope(&state.receiver, state.receiver_uid.as_deref(), admitted, &sub.job, resolution)?;
     Ok((sub, scoped))
 }
 
@@ -1556,6 +1560,7 @@ mod tests {
         let refusal_log = Arc::new(RefusalLog::new());
         let state = FleetListenerState {
             receiver: "studio".into(),
+            receiver_uid: None,
             provider: network.clone(),
             local_node_id: Some("nSTUDIO".into()),
             token: Arc::new(move || token_read.lock().unwrap().clone()),
@@ -2606,6 +2611,7 @@ mod tests {
     fn gate_only_state(reads: Arc<std::sync::atomic::AtomicUsize>) -> FleetListenerState {
         FleetListenerState {
             receiver: "studio".into(),
+            receiver_uid: None,
             provider: Arc::new(StaticIdentityProvider {
                 local: test_node("nSTUDIO", "studio", "100.64.0.2"),
                 peers: vec![laptop()],
@@ -2685,6 +2691,7 @@ mod tests {
     fn a_request_without_a_peer_address_is_refused() {
         let h_state = FleetListenerState {
             receiver: "studio".into(),
+            receiver_uid: None,
             local_node_id: Some("nSTUDIO".into()),
             provider: Arc::new(StaticIdentityProvider {
                 local: test_node("nSTUDIO", "studio", "100.64.0.2"),
@@ -2889,6 +2896,7 @@ mod tests {
         });
         let state = FleetListenerState {
             receiver: "studio".into(),
+            receiver_uid: None,
             local_node_id: Some("nSTUDIO".into()),
             provider: slow.clone(),
             token: Arc::new(|| Some(TOKEN.to_string())),
@@ -2940,6 +2948,7 @@ mod tests {
     fn spawn_one_slot_listener(resolve_ms: u64) -> String {
         let state = FleetListenerState {
             receiver: "studio".into(),
+            receiver_uid: None,
             local_node_id: Some("nSTUDIO".into()),
             provider: Arc::new(StaticIdentityProvider {
                 local: test_node("nSTUDIO", "studio", "100.64.0.2"),
