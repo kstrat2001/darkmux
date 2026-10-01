@@ -1779,11 +1779,7 @@ fn lab_run_status(summary: &LabRunSummary, now_ms: u64, session_live: Option<boo
         // (#2860) No lifecycle verdict (a run from before the record existed):
         // a manifest is written only when the run ends, so its `ok` is a
         // terminal record too, and outranks the staleness guess below.
-        None => {
-            if summary.run_ok.is_some() {
-                return settled_lab_status(summary);
-            }
-        }
+        None if summary.run_ok.is_some() => return settled_lab_status(summary),
         _ => {}
     }
     if summary.finished {
