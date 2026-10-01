@@ -22,6 +22,8 @@ pub(crate) struct Script {
     pub(crate) manifest_verify: Option<serde_json::Value>,
     /// Fail `run` on this call (1-based, counted from `script`) only.
     pub(crate) run_err_on_call: Option<u32>,
+    /// The runtime's `escalation_*` result the scripted dispatch ends with.
+    pub(crate) escalation: Option<String>,
 }
 
 static SCRIPT: Mutex<Option<Script>> = Mutex::new(None);
@@ -88,7 +90,7 @@ impl WorkloadProvider for ScriptedProvider {
             fs::write(run_dir.join("manifest.json"), m.to_string())?;
         }
         Ok(RunResult {
-            escalation: None,
+            escalation: s.escalation.clone(),
             ok: s.ok,
             duration_ms: 2_000,
             payload_text: None,
@@ -524,6 +526,33 @@ fn the_work_gate_overrides_the_raw_verify_and_fails_closed() {
     let o = lab.run("wg", 1).unwrap().remove(0);
     assert_eq!(o.verify_passed, Some(false), "{:?}", o.notes);
     assert!(o.notes[3].starts_with("verify=fail (verify gate could not be applied: "), "{:?}", o.notes);
+}
+
+/// (F2, 5.0 dogfood) The whole lab path for an escalated dispatch: the gate
+/// names the escalation (not a transport error), the per-run line says
+/// `escalated:`, and the outcome carries the reason for the batch summary.
+#[test]
+#[serial_test::serial]
+fn an_escalated_run_reads_as_an_escalation_on_every_lab_surface() {
+    let lab = Lab::scripted(&["we"]);
+    let src = lab.source_sandbox("we");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join(".fixture.json"), r#"{"name":"we","baseline":{"test_count":14}}"#).unwrap();
+    script(Script {
+        ok: false,
+        escalation: Some("escalation_compaction_reread_loop".into()),
+        verify: Some(true),
+        write_manifest: true,
+        manifest_verify: Some(serde_json::json!({ "passed": true, "details": "raw" })),
+        ..Default::default()
+    });
+    let o = lab.run("we", 1).unwrap().remove(0);
+    assert_eq!(o.escalation.as_deref(), Some("escalation_compaction_reread_loop"));
+    assert_eq!(o.verify_passed, Some(false), "unfinished work is not credited: {:?}", o.notes);
+    let joined = o.notes.join(" | ");
+    assert!(joined.contains("escalated: escalation_compaction_reread_loop"), "{joined}");
+    assert!(joined.contains("verify=fail (dispatch escalated"), "{joined}");
+    assert!(!joined.contains("transport") && !joined.contains("error:"), "{joined}");
 }
 
 /// (#1004) The injected context reaches the workload the provider runs.
