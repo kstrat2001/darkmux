@@ -951,11 +951,20 @@ struct DispatchInvocation {
     resume_from: Option<std::path::PathBuf>,
 }
 
-/// (F6) The message a `--resume-from` dispatch carries when none is given. A
-/// resume continues the checkpointed conversation: the runtime seeds its
-/// history from the checkpoint, which already holds the original prompt, so
-/// this text only fills the host's required prompt file.
+/// (F6) The placeholder a `--resume-from` dispatch carries when no message is
+/// given. The runtime replaces its `messages` with the checkpoint history on
+/// resume, so no message ever reaches the model, explicit or default; this text
+/// only fills the host's required prompt file and keeps the dispatch from
+/// reading stdin.
 const RESUME_DEFAULT_MESSAGE: &str = "Continue the interrupted dispatch from its checkpoint.";
+
+/// The stderr note for a message given alongside `--resume-from`: a resume
+/// continues from the checkpoint, so the message is dropped, not delivered.
+fn resume_message_note(resuming: bool, message_given: bool) -> Option<&'static str> {
+    (resuming && message_given).then_some(
+        "darkmux dispatch: the message is ignored on --resume-from; the dispatch continues from the checkpoint.",
+    )
+}
 
 /// The dispatch message in precedence order. `message` and `message_from_file`
 /// arrive as clap parsed them (mutually exclusive), so `role` is only for the
@@ -1060,6 +1069,9 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
         .transpose()
         .map_err(|e| anyhow::anyhow!("darkmux dispatch: {e}"))?
         .and_then(|a| a.machine);
+    if let Some(note) = resume_message_note(resume_from.is_some(), message.is_some() || message_from_file.is_some()) {
+        eprintln!("{note}");
+    }
     let message = resolve_dispatch_message(&role, message, message_from_file, resume_from.is_some())?;
     // (#2295) `--finding <key>` and `--mod <key>` (both repeatable): each
     // named record's stored content is appended to the brief VERBATIM, after
@@ -1956,6 +1968,13 @@ mod tests {
 
     /// (F6) A resume with no message continues the checkpoint instead of
     /// reading an empty stdin; an explicit message still wins.
+    #[test]
+    fn a_message_given_with_a_resume_is_reported_as_ignored() {
+        assert!(resume_message_note(true, true).is_some_and(|n| n.contains("ignored")));
+        assert_eq!(resume_message_note(true, false), None);
+        assert_eq!(resume_message_note(false, true), None);
+    }
+
     #[test]
     fn a_resume_without_a_message_defaults_it_and_an_explicit_message_wins() {
         let defaulted = resolve_dispatch_message("coder", None, None, true).unwrap();
