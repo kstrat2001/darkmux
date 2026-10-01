@@ -212,6 +212,23 @@ pub struct RecordsMeta {
     pub days_scanned: usize,
     #[cfg_attr(test, ts(type = "number"))]
     pub records_scanned: usize,
+    /// Which sources' reads were cut short of the whole answer. Only `GET
+    /// /flow/:date` reports it; `truncated` on the response is true when any
+    /// source here is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub cut: Option<CutSources>,
+}
+
+/// Per source, whether a day read was cut: the local day file hit its record
+/// cap, or Redis's newest-`COUNT` read ended inside the date (or the stream
+/// starts after the date does, so the head was trimmed).
+#[derive(Debug, Clone, Copy, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
+pub struct CutSources {
+    pub local: bool,
+    pub fleet: bool,
 }
 
 // ─── /runs, /missions, /phases ─────────────────────────────────────────────

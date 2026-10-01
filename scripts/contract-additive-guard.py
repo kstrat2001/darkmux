@@ -65,8 +65,34 @@ def show(root, ref, path):
 
 
 def line_members(text):
-    """(line number, line) for each non-blank line."""
-    return [(i, ln) for i, ln in enumerate(text.splitlines(), 1) if ln.strip()]
+    """(line number, member) for a golden file.
+
+    An indented line is a field of the unindented header above it, and its
+    member names that header, so a field moved to another type is a removal
+    from the first. A header of the form `Name = A | B` is a union: each
+    variant is its own member, an object variant `{ tag; field; ... }` is
+    keyed by its first field, so adding a variant (or a field to one) is an
+    addition and removing one is not. Any other line is one member.
+    """
+    out, header = [], ""
+    for i, ln in enumerate(text.splitlines(), 1):
+        if not ln.strip():
+            continue
+        if ln[0].isspace():
+            out.append((i, f"{header} :: {norm(ln)}"))
+            continue
+        header = ln.split(" = ")[0].strip()
+        if " = " not in ln:
+            out.append((i, norm(ln)))
+            continue
+        for variant, _ in split_top(ln.split(" = ", 1)[1], "|"):
+            v = variant.strip()
+            if v.startswith("{") and v.endswith("}") and len(split_top(v, "|")) == 1 and ";" in v:
+                fields = [norm(f) for f, _ in split_top(v[1:-1], ";") if f.strip()]
+                out.extend((i, f"{header} | {fields[0]} :: {f}") for f in fields)
+            else:
+                out.append((i, f"{header} | {norm(v)}"))
+    return out
 
 
 def blank_comments(src):
@@ -102,7 +128,7 @@ def norm(s):
 def ts_members(src):
     """{member: line number} for one generated .ts file."""
     text = blank_comments(src)
-    m = re.search(r"export type (\w+)\s*=", text)
+    m = re.search(r"export type (\w+)\s*(?:<[^=]*>)?\s*=", text)
     if not m:
         return {}
     name = m.group(1)
@@ -172,7 +198,7 @@ def violations(root, base):
             if remaining.get(ln, 0) > 0:
                 remaining[ln] -= 1
             else:
-                found.append(f"{path}:{num}: removed or changed: {ln.strip()}")
+                found.append(f"{path}:{num}: removed or changed: {ln}")
     for path in ts_files(root, base):
         old = ts_members(show(root, base, path))
         new_src = head_text(root, path)
@@ -227,12 +253,16 @@ def run(root, base, labels, force):
 # ---- self-test -------------------------------------------------------------
 
 BASE_FILES = {
-    "tests/cli-json.golden": "# verbs\nflow status  FlowStatus\nmachine list  FleetView\n",
+    "tests/cli-json.golden": (
+        "# verbs\nflow status  FlowStatus\nmachine list  FleetView\n\n# types\n"
+        'Mode = "a" | "b"\nTypeA\n  f: string\nTypeB\n  g: string\n'
+    ),
     "crates/darkmux-serve/route-table.golden": "GET /health  json HealthResponse\n\n# response types\nHealthResponse.build: string\n",
     f"{TS_DIR}/HealthResponse.ts": (
         "// generated\nimport type { A } from \"./A\";\n/** doc */\n"
         "export type HealthResponse = { build: string, \n/** why */\nn: number | null, };\n"
     ),
+    f"{TS_DIR}/Generic.ts": "export type Generic<T> = { a: T, b: string };\n",
     f"{TS_DIR}/Kind.ts": 'export type Kind = { "k": "a", x: number } | { "k": "b" };\n',
 }
 
@@ -274,6 +304,16 @@ def self_test():
         ("a removed route-golden line fails", {
             "crates/darkmux-serve/route-table.golden": "GET /health  json HealthResponse\n\n# response types\n",
         }, [], 1),
+        ("a field moved from one cli-json type to another fails", {
+            "tests/cli-json.golden": BASE_FILES["tests/cli-json.golden"].replace("TypeA\n  f: string\nTypeB\n  g: string\n", "TypeA\nTypeB\n  g: string\n  f: string\n"),
+        }, [], 1),
+        ("an added cli-json enum variant passes", {
+            "tests/cli-json.golden": BASE_FILES["tests/cli-json.golden"].replace('"a" | "b"', '"a" | "b" | "c"'),
+        }, [], 0),
+        ("a removed cli-json enum variant fails", {
+            "tests/cli-json.golden": BASE_FILES["tests/cli-json.golden"].replace('"a" | "b"', '"a"'),
+        }, [], 1),
+        ("a removed field of a generic type fails", {f"{TS_DIR}/Generic.ts": "export type Generic<T> = { b: string };\n"}, [], 1),
         ("a retyped cli-json line fails", {
             "tests/cli-json.golden": BASE_FILES["tests/cli-json.golden"].replace("FlowStatus", "FlowStatusV2"),
         }, [], 1),

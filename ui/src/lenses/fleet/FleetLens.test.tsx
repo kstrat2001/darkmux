@@ -63,6 +63,10 @@ vi.mock("./savings", async (importOriginal) => {
   return { ...real, tokensOffMeter: vi.fn(real.tokensOffMeter) };
 });
 
+/** `GET /flow/<date>` answers the `FlowRecordsResponse` envelope (D5, #3035). */
+const flowDay = (records: unknown[]): string =>
+  JSON.stringify({ records, count: records.length, truncated: false, generated_at_ms: 1 });
+
 function latestTokenScopeProps(): Record<string, unknown> {
   const nodes = document.querySelectorAll('[data-testid="token-scope-probe"]');
   const last = nodes[nodes.length - 1];
@@ -244,11 +248,11 @@ function mockFleetFetch(opts: {
       opts.failOnce!.splice(once, 1);
       return Promise.resolve(new Response("boom", { status: 500, statusText: "Internal Server Error" }));
     }
-    if (opts.emptyDays?.some((d) => path === `/flow/${d}`)) return Promise.resolve(new Response("[]", { status: 200 }));
+    if (opts.emptyDays?.some((d) => path === `/flow/${d}`)) return Promise.resolve(new Response(flowDay([]), { status: 200 }));
     const failed = opts.fail?.[path];
     if (failed) return Promise.resolve(new Response("boom", { status: failed, statusText: "Internal Server Error" }));
-    if (path === `/flow/${today}`) return Promise.resolve(new Response(JSON.stringify(opts.flowToday ?? []), { status: 200 }));
-    if (path === `/flow/${yesterday}`) return Promise.resolve(new Response(JSON.stringify(opts.flowYesterday ?? []), { status: 200 }));
+    if (path === `/flow/${today}`) return Promise.resolve(new Response(flowDay(opts.flowToday ?? []), { status: 200 }));
+    if (path === `/flow/${yesterday}`) return Promise.resolve(new Response(flowDay(opts.flowYesterday ?? []), { status: 200 }));
     if (path === "/fleet/machines/live") {
       return Promise.resolve(
         new Response(

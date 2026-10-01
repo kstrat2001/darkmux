@@ -3017,6 +3017,107 @@
         assert_eq!(m1["dispatches"], 1, "{json}");
     }
 
+    /// `/flow/:date`'s Redis backfill (`records_from_xrevrange`) answers the
+    /// `XREVRANGE` entries oldest first.
+    #[test]
+    fn redis_backfill_serves_records_oldest_first() {
+        let entry = |id: &str, json: &str| {
+            redis::Value::Array(vec![
+                redis::Value::BulkString(id.as_bytes().to_vec()),
+                redis::Value::Array(vec![
+                    redis::Value::BulkString(b"record".to_vec()),
+                    redis::Value::BulkString(json.as_bytes().to_vec()),
+                ]),
+            ])
+        };
+        let raw = redis::Value::Array(vec![
+            entry("2-0", r#"{"ts":"2026-05-14T09:00:05Z","action":"dispatch.complete"}"#),
+            entry("1-0", r#"{"ts":"2026-05-14T09:00:00Z","action":"dispatch.start"}"#),
+        ]);
+        let records = super::records_from_xrevrange(raw, Some("2026-05-14")).unwrap().records;
+        assert_eq!(actions_of(&serde_json::Value::Array(records)), vec!["dispatch.start", "dispatch.complete"]);
+    }
+
+    fn xentry(ms: u64, ts: &str) -> redis::Value {
+        redis::Value::Array(vec![
+            redis::Value::BulkString(format!("{ms}-0").into_bytes()),
+            redis::Value::Array(vec![
+                redis::Value::BulkString(b"record".to_vec()),
+                redis::Value::BulkString(format!(r#"{{"ts":"{ts}","action":"operator.note"}}"#).into_bytes()),
+            ]),
+        ])
+    }
+
+    /// 2026-05-14T00:00:00Z in epoch milliseconds.
+    const DAY_START_MS: u64 = 1_778_716_800_000;
+
+    #[test]
+    fn day_start_ms_is_the_utc_midnight() {
+        assert_eq!(super::day_start_ms("2026-05-14"), Some(DAY_START_MS));
+        assert_eq!(super::day_start_ms("1970-01-02"), Some(86_400_000));
+        assert_eq!(super::day_start_ms("nope"), None);
+    }
+
+    /// (D5 review) A Redis read that returned a full COUNT whose oldest entry is
+    /// still inside the date was cut; one that reached back before the date was not.
+    #[test]
+    fn redis_day_read_is_cut_when_a_full_read_ends_inside_the_date() {
+        let full = |oldest_ms: u64| {
+            let mut v: Vec<redis::Value> =
+                (0..super::MAX_FLOW_FILE_RECORDS as u64).map(|i| xentry(oldest_ms + (super::MAX_FLOW_FILE_RECORDS as u64 - i), "2026-05-14T09:00:00Z")).collect();
+            v.pop();
+            v.push(xentry(oldest_ms, "2026-05-14T09:00:00Z"));
+            redis::Value::Array(v)
+        };
+        let inside = super::records_from_xrevrange(full(DAY_START_MS + 1000), Some("2026-05-14")).unwrap();
+        assert!(inside.cut, "a full COUNT whose oldest entry is inside the date is cut");
+        let before = super::records_from_xrevrange(full(DAY_START_MS - 1000), Some("2026-05-14")).unwrap();
+        assert!(!before.cut, "a full COUNT that reached back before the date holds all of it");
+    }
+
+    /// A short read is the whole stream: the date is cut only if the stream's
+    /// first entry is newer than the date's start (the head was trimmed).
+    #[test]
+    fn redis_day_read_is_cut_when_the_stream_starts_after_the_date_does() {
+        let one = |ms| redis::Value::Array(vec![xentry(ms, "2026-05-14T09:00:00Z")]);
+        assert!(super::records_from_xrevrange(one(DAY_START_MS + 5000), Some("2026-05-14")).unwrap().cut);
+        assert!(!super::records_from_xrevrange(one(DAY_START_MS - 5000), Some("2026-05-14")).unwrap().cut);
+        assert!(!super::records_from_xrevrange(redis::Value::Array(vec![]), Some("2026-05-14")).unwrap().cut);
+    }
+
+    /// The reverse lie: bookends kept outside the ring, and a union of two
+    /// sources, do not make an uncut day read truncated.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn flow_date_is_not_truncated_for_an_uncut_day_with_many_bookends() {
+        unsafe { std::env::remove_var("DARKMUX_REDIS_URL"); }
+        let tmp = TempDir::new().unwrap();
+        // A full ring (exactly the cap, nothing evicted) plus 40 bookends kept
+        // outside it: more records than the cap, yet nothing was cut.
+        let mut body = "{\"ts\":\"2026-05-14T08:00:00Z\",\"action\":\"operator.note\"}\n".repeat(super::MAX_FLOW_FILE_RECORDS);
+        for i in 0..40 {
+            body.push_str(&format!("{{\"ts\":\"2026-05-14T09:00:{:02}Z\",\"action\":\"dispatch.start\",\"session_id\":\"S{i}\"}}\n", i % 60));
+        }
+        fs::write(tmp.path().join("2026-05-14.jsonl"), body).unwrap();
+        let json = get_json(&tmp, "/flow/2026-05-14").await;
+        assert_eq!(json["count"], super::MAX_FLOW_FILE_RECORDS + 40);
+        assert_eq!(json["truncated"], false, "{json}");
+        assert_eq!(json["meta"]["cut"], serde_json::json!({"local": false, "fleet": false}));
+    }
+
+    /// A local day read that hit its cap says so, in `truncated` and in `meta.cut.local`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn flow_date_is_truncated_when_the_local_read_hit_its_cap() {
+        unsafe { std::env::remove_var("DARKMUX_REDIS_URL"); }
+        let tmp = TempDir::new().unwrap();
+        let line = "{\"ts\":\"2026-05-14T09:00:00Z\",\"action\":\"operator.note\"}\n";
+        fs::write(tmp.path().join("2026-05-14.jsonl"), line.repeat(super::MAX_FLOW_FILE_RECORDS + 5)).unwrap();
+        let json = get_json(&tmp, "/flow/2026-05-14").await;
+        assert_eq!(json["truncated"], true, "truncated must be true when a source was cut");
+        assert_eq!(json["meta"]["cut"], serde_json::json!({"local": true, "fleet": false}));
+    }
+
     #[tokio::test]
     async fn tail_stream_starts_from_current_eof_not_replay() {
         let tmp = TempDir::new().unwrap();
@@ -3717,7 +3818,7 @@
             }
             fs::write(tmp.path().join(format!("{today}.jsonl")), buf).unwrap();
 
-            let records = read_flow_records_from_file(&today, tmp.path()).await;
+            let records = read_flow_records_from_file(&today, tmp.path()).await.records;
             assert_eq!(records.len(), MAX_FLOW_FILE_RECORDS, "must cap at the max");
             // Oldest dropped, newest kept, chronological order preserved.
             assert_eq!(
@@ -3745,7 +3846,7 @@
             )
             .unwrap();
 
-            let records = read_flow_records_from_file(&today, tmp.path()).await;
+            let records = read_flow_records_from_file(&today, tmp.path()).await.records;
             assert_eq!(records.len(), 1, "the schema header must not count as a record: {records:?}");
             assert_eq!(records[0]["action"], "dispatch.start");
         }
@@ -3774,7 +3875,7 @@
             }
             fs::write(tmp.path().join(format!("{today}.jsonl")), buf).unwrap();
 
-            let records = read_flow_records_from_file(&today, tmp.path()).await;
+            let records = read_flow_records_from_file(&today, tmp.path()).await.records;
 
             assert_eq!(records.len(), MAX_FLOW_FILE_RECORDS, "bookends alone must respect the cap");
             assert_eq!(
@@ -3809,7 +3910,7 @@
             buf.push('\n');
             fs::write(tmp.path().join(format!("{today}.jsonl")), buf).unwrap();
 
-            let records = read_flow_records_from_file(&today, tmp.path()).await;
+            let records = read_flow_records_from_file(&today, tmp.path()).await.records;
 
             assert_eq!(
                 records.len(),
@@ -3868,7 +3969,7 @@
             buf.push('\n');
             fs::write(tmp.path().join(format!("{today}.jsonl")), buf).unwrap();
 
-            let records = read_flow_records_from_file(&today, tmp.path()).await;
+            let records = read_flow_records_from_file(&today, tmp.path()).await.records;
 
             assert_eq!(records.len(), 52, "under the cap: nothing dropped, nothing duplicated");
             assert_eq!(records.first().unwrap()["action"].as_str(), Some("dispatch.start"));
@@ -3898,7 +3999,7 @@
             buf.push('\n');
             fs::write(tmp.path().join(format!("{today}.jsonl")), buf).unwrap();
 
-            let records = read_flow_records_from_file(&today, tmp.path()).await;
+            let records = read_flow_records_from_file(&today, tmp.path()).await.records;
             assert_eq!(records.len(), 2, "oversize/empty/non-JSON lines skipped, valid kept");
             assert_eq!(records[0]["n"].as_u64().unwrap(), 1);
             assert_eq!(records[1]["n"].as_u64().unwrap(), 2);

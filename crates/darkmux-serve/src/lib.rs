@@ -3256,11 +3256,13 @@ async fn flow_handler(
         return (StatusCode::BAD_REQUEST, "bad date format").into_response();
     };
     let scan_start = std::time::Instant::now();
-    let (mut records, fleet_state) = aggregate_flow_records_for_date(date, &state.flows_dir).await;
+    let DayRead { mut records, fleet_state, cut } =
+        aggregate_flow_records_for_date(date, &state.flows_dir).await;
     let records_scanned = records.len();
-    // The day read keeps the newest `MAX_FLOW_FILE_RECORDS` of everything but
-    // the liveness bookends, so a response at the cap may have been cut short.
-    let truncated = records_scanned >= MAX_FLOW_FILE_RECORDS;
+    // Each source reports its own cut (the local file hit its cap, Redis's
+    // newest-`COUNT` read ended inside the date or the stream starts after
+    // it); the response is truncated when any source was.
+    let truncated = cut.local || cut.fleet;
     // (#1173) Optional `?since=<iso-ts>` incremental filter. The live viewer's
     // 20s reconcile backstop passes the newest ts it already holds, so the
     // response is just the recent tail rather than the whole (multi-MB) day —
@@ -3285,6 +3287,7 @@ async fn flow_handler(
             scan_ms: scan_start.elapsed().as_millis() as u64,
             days_scanned: 1,
             records_scanned,
+            cut: Some(cut),
         },
     })
     .into_response()
@@ -3786,6 +3789,7 @@ async fn catalog_records_response(
             scan_ms,
             days_scanned,
             records_scanned,
+            cut: None,
         },
     })
     .into_response()
@@ -3991,15 +3995,34 @@ fn join_host_samples_into_session_records(
 ///
 /// Missing-file is not an error here: empty array is the correct response
 /// for a date the local machine has no record of.
+/// What one source (the local day file, or Redis) returned for a day, and
+/// whether its read was cut short of the whole day.
+struct SourceRead {
+    records: Vec<serde_json::Value>,
+    cut: bool,
+}
+
+/// The merged answer for `GET /flow/:date`.
+struct DayRead {
+    records: Vec<serde_json::Value>,
+    fleet_state: source_state::SourceState,
+    cut: wire::CutSources,
+}
+
 async fn aggregate_flow_records_for_date(
     date: &str,
     flows_dir: &std::path::Path,
-) -> (Vec<serde_json::Value>, source_state::SourceState) {
+) -> DayRead {
     // env(DARKMUX_REDIS_URL) > config-assembled (#661 Slice 5).
     let redis_url = darkmux_flow::redis_url();
 
     let Some(url) = redis_url else {
-        return (read_flow_records_from_file(date, flows_dir).await, source_state::SourceState::Off);
+        let local = read_flow_records_from_file(date, flows_dir).await;
+        return DayRead {
+            records: local.records,
+            fleet_state: source_state::SourceState::Off,
+            cut: wire::CutSources { local: local.cut, fleet: false },
+        };
     };
 
     // (#1570) LOCAL-FIRST, Redis as a bounded enhancement — run both
@@ -4019,20 +4042,32 @@ async fn aggregate_flow_records_for_date(
     let (redis_result, local_records) = tokio::join!(redis_task, read_flow_records_from_file(date, flows_dir));
 
     match redis_result {
-        Ok(Ok(records)) => (union_flow_records(records, local_records), source_state::SourceState::Ok),
+        Ok(Ok(redis)) => DayRead {
+            records: union_flow_records(redis.records, local_records.records),
+            fleet_state: source_state::SourceState::Ok,
+            cut: wire::CutSources { local: local_records.cut, fleet: redis.cut },
+        },
         Ok(Err(e)) => {
             eprintln!(
                 "darkmux serve: GET /flow/{date} Redis aggregation failed ({e}); \
                  serving local file only"
             );
-            (local_records, source_state::SourceState::Unavailable { detail: FLEET_READ_ERROR_DETAIL })
+            DayRead {
+                records: local_records.records,
+                fleet_state: source_state::SourceState::Unavailable { detail: FLEET_READ_ERROR_DETAIL },
+                cut: wire::CutSources { local: local_records.cut, fleet: false },
+            }
         }
         Err(e) => {
             eprintln!(
                 "darkmux serve: GET /flow/{date} blocking task join error ({e}); \
                  serving local file only"
             );
-            (local_records, source_state::SourceState::Unavailable { detail: FLEET_READ_ERROR_DETAIL })
+            DayRead {
+                records: local_records.records,
+                fleet_state: source_state::SourceState::Unavailable { detail: FLEET_READ_ERROR_DETAIL },
+                cut: wire::CutSources { local: local_records.cut, fleet: false },
+            }
         }
     }
 }
@@ -4340,7 +4375,7 @@ pub(crate) fn fleet_flow_records() -> FleetRead {
         // substrate by design, and warning about it would be the bug.
         return FleetRead { records: Vec::new(), state: source_state::SourceState::Off };
     };
-    match read_flow_records_from_redis(url.expose_for_probe(), None) {
+    match read_flow_records_from_redis(url.expose_for_probe(), None).map(|r| r.records) {
         Ok(records) => {
             if let Ok(mut guard) = cache.lock() {
                 *guard = Some((std::time::SystemTime::now(), records.clone()));
@@ -4423,7 +4458,7 @@ fn bound_redis_response(conn: &redis::Connection) {
 fn read_flow_records_from_redis(
     url: &str,
     date: Option<&str>,
-) -> Result<Vec<serde_json::Value>, anyhow::Error> {
+) -> Result<SourceRead, anyhow::Error> {
     use anyhow::Context;
     // `None` = the WHOLE capped stream, no date filter (#1705): the
     // fleet-wide aggregations (`/flow-missions`, `/runs`) are not
@@ -4484,7 +4519,13 @@ fn read_flow_records_from_redis(
 /// The records an `XREVRANGE` reply holds, read through the flow reader
 /// (so a pre-4.0 spelling comes back current), filtered to `date` when one
 /// is given, in chronological order.
-fn records_from_xrevrange(raw: redis::Value, date: Option<&str>) -> Result<Vec<serde_json::Value>> {
+///
+/// The read is cut (D5) when it may not hold the whole date: it returned a full
+/// `COUNT` or the stream's first entry is newer than the date's start, and in
+/// both cases its oldest entry is at or after the start of the date, so older
+/// records of that date are past the cap or were trimmed by `maxlen`. A read
+/// with no date asks for the whole stream and is never "cut" in this sense.
+fn records_from_xrevrange(raw: redis::Value, date: Option<&str>) -> Result<SourceRead> {
     let entries = match raw {
         redis::Value::Array(v) => v,
         other => {
@@ -4493,6 +4534,9 @@ fn records_from_xrevrange(raw: redis::Value, date: Option<&str>) -> Result<Vec<s
             ));
         }
     };
+    let cut = date.and_then(day_start_ms).is_some_and(|start| {
+        entries.last().and_then(entry_id_ms).is_some_and(|oldest| oldest >= start)
+    });
     // (#1715 review) The last bare `10000` on this path — the same cap the
     // XREVRANGE above already single-sources, so it follows that constant
     // rather than sitting beside it as a third copy.
@@ -4521,7 +4565,30 @@ fn records_from_xrevrange(raw: redis::Value, date: Option<&str>) -> Result<Vec<s
     // XREVRANGE yields newest-first; restore chronological order so the
     // response matches the local-file path's ordering (#809).
     records.reverse();
-    Ok(records)
+    Ok(SourceRead { records, cut })
+}
+
+/// The millisecond part of a stream entry's `<ms>-<seq>` id.
+fn entry_id_ms(entry: &redis::Value) -> Option<u64> {
+    let redis::Value::Array(pair) = entry else { return None };
+    redis_value_as_str(pair.first()?)?.split('-').next()?.parse().ok()
+}
+
+/// The epoch milliseconds of 00:00:00 UTC on a `YYYY-MM-DD` date.
+fn day_start_ms(date: &str) -> Option<u64> {
+    let mut parts = date.split('-').map(|p| p.parse::<i64>().ok());
+    let (y, m, d) = (parts.next()??, parts.next()??, parts.next()??);
+    if parts.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    // Days since 1970-01-01 (the proleptic Gregorian civil-date algorithm).
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days * 86_400_000).ok()
 }
 
 /// The most records `GET /flow/:date` returns from the local day-file —
@@ -4582,12 +4649,12 @@ const MAX_FLOW_FILE_RECORDS: usize = darkmux_flow::FLOW_READ_CAP_RECORDS;
 async fn read_flow_records_from_file(
     date: &str,
     flows_dir: &std::path::Path,
-) -> Vec<serde_json::Value> {
+) -> SourceRead {
     use tokio::io::AsyncReadExt;
     let path = flows_dir.join(format!("{date}.jsonl"));
     let file = match tokio::fs::File::open(&path).await {
         Ok(f) => f,
-        Err(_) => return Vec::new(), // missing file = empty (not an error)
+        Err(_) => return SourceRead { records: Vec::new(), cut: false }, // missing file = empty (not an error)
     };
     let mut reader = tokio::io::BufReader::new(file);
     let mut ring: std::collections::VecDeque<(u64, serde_json::Value)> =
@@ -4607,6 +4674,8 @@ async fn read_flow_records_from_file(
     // construction — can be merged back into one file-order sequence
     // without a second pass over the raw lines.
     let mut next_index: u64 = 0;
+    // Set when either ring evicts a record: the day held more than the cap.
+    let mut cut = false;
 
     // (#925) Bounded line read: accumulate bytes up to MAX_FLOW_LINE_BYTES; a
     // line that exceeds the cap (a corrupt/adversarial no-newline flows file)
@@ -4624,7 +4693,7 @@ async fn read_flow_records_from_file(
         for &b in &chunk[..n] {
             if b == b'\n' {
                 if !over_cap {
-                    push_flow_line(&line, &mut ring, &mut bookends, &mut next_index);
+                    push_flow_line(&line, &mut ring, &mut bookends, &mut next_index, &mut cut);
                 }
                 line.clear();
                 over_cap = false;
@@ -4645,9 +4714,9 @@ async fn read_flow_records_from_file(
     }
     // A final line with no trailing newline.
     if !over_cap && !line.is_empty() {
-        push_flow_line(&line, &mut ring, &mut bookends, &mut next_index);
+        push_flow_line(&line, &mut ring, &mut bookends, &mut next_index, &mut cut);
     }
-    merge_ring_and_bookends(ring, bookends)
+    SourceRead { records: merge_ring_and_bookends(ring, bookends), cut }
 }
 
 /// (#925, #2409) Parse one flow-record line and route it either into the
@@ -4666,6 +4735,7 @@ fn push_flow_line(
     ring: &mut std::collections::VecDeque<(u64, serde_json::Value)>,
     bookends: &mut std::collections::VecDeque<(u64, serde_json::Value)>,
     next_index: &mut u64,
+    cut: &mut bool,
 ) {
     let s = match std::str::from_utf8(line) {
         Ok(s) => s.trim(),
@@ -4690,6 +4760,7 @@ fn push_flow_line(
     if darkmux_flow::reader::action_of(&v).and_then(|a| a.bookend()).is_some() {
         if bookends.len() >= MAX_FLOW_FILE_RECORDS {
             bookends.pop_front();
+            *cut = true;
         }
         bookends.push_back((index, v));
         return;
@@ -4697,6 +4768,7 @@ fn push_flow_line(
 
     if ring.len() == MAX_FLOW_FILE_RECORDS {
         ring.pop_front();
+        *cut = true;
     }
     ring.push_back((index, v));
 }

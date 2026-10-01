@@ -35,7 +35,7 @@ darkmux release.
   bare `FlowRecord[]`; it now returns `{records, count, truncated, generated_at_ms, meta}`,
   the shape `/flow-mission/:id` and `/flow-dispatch/:id` already had (`truncated` is
   true when the day read hit its record cap; `meta.sources.fleet` is `ok`, `off` or
-  `unavailable` for the Redis half). The SSE stream `/flow/:date/stream` still sends
+  `unavailable` for the Redis half; `meta.cut` says per source, `local` and `fleet`, whether its read was cut short, and `truncated` is true when either was). The SSE stream `/flow/:date/stream` still sends
   one record per event. **Migration:** read `.records` where you read the array
   (`curl .../flow/$(date +%F) | jq .records`).
 - **A lab run's deep link is `#lens=runs&lab=<dir>`.** It was `run=<dir>`, which named
