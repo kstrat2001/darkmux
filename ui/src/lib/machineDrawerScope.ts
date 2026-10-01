@@ -136,9 +136,8 @@ export interface DrawerScope {
  * always wants "this machine, last 10 min" regardless of which app route
  * is current, since IT is what the route names. */
 export function rollingWindowSamples(records: NormRecord[], uid: string | null, nowMs: number): ProcSamplePoint[] {
-  // (5.0 R2) An unresolved machine has no samples: "unfiltered" averaged
-  // every machine's load into a gauge labeled as one.
-  if (uid == null) return [];
+  // (5.0 R2) An unresolved machine (`uid` null) matches no sample: it used to
+  // mean "unfiltered", which averaged every machine's load into one gauge.
   const cutoff = nowMs - DRAWER_ROLLING_WINDOW_MS;
   return recordsSince(recordsAsOf(records, nowMs), cutoff)
     .filter((r) => isHostSampleRecord(r) && sameUid(uidOf(r), uid))
@@ -154,7 +153,6 @@ export function rollingWindowSamples(records: NormRecord[], uid: string | null, 
  * measured at all". Bounded by `LAST_KNOWN_LOOKBACK_MS` so a genuinely
  * stale record doesn't get reported as if it just happened. */
 export function findLastKnownSample(records: NormRecord[], uid: string | null, nowMs: number): LastKnownSample | null {
-  if (uid == null) return null;
   let best: { r: NormRecord; ts: number } | null = null;
   for (const r of records) {
     if (!isHostSampleRecord(r)) continue;
