@@ -12,6 +12,15 @@
 //! anything, and doctor reports it as Fail. Both name the file, the key's
 //! dotted path, and the closest valid key.
 //!
+//! **A file written by a newer darkmux is refused for its version, not its
+//! keys** (#3035). Each kind has a data-shape version
+//! ([`UserFileKind::schema_version`], the constants in
+//! [`crate::data_version`]); a document whose `schema_version` is newer is
+//! [`Problem::Newer`] ("written by a newer darkmux ... Upgrade darkmux.") and
+//! none of its keys are judged, since a newer darkmux may have added them. At
+//! the same or an older version an unknown key is still a typo, and an absent
+//! marker means the file predates it.
+//!
 //! **A value of the wrong type is refused the same way** ([`Issue::WrongType`]):
 //! one such value fails the whole typed load, which for `config.json` means
 //! every setting falls back to its default, and for a user role, skill or
