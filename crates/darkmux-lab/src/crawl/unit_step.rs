@@ -2077,8 +2077,12 @@ fn errored_row(step: &Step) -> UnitOutcome {
             // `units_errored` leftover in `summarize_mission`, same as
             // pre-#2573.
             darkmux_crew::types::NodeStatus::Complete => "empty".to_string(),
-            // Planned/Running at summary time: the step never settled.
-            darkmux_crew::types::NodeStatus::Planned | darkmux_crew::types::NodeStatus::Running => {
+            // Planned/Running at summary time: the step never settled. An
+            // `Unknown` status (a newer darkmux's, #3035) is not a verdict
+            // either: it reads as a step that did not run.
+            darkmux_crew::types::NodeStatus::Planned
+            | darkmux_crew::types::NodeStatus::Running
+            | darkmux_crew::types::NodeStatus::Unknown => {
                 "not_run".to_string()
             }
         },

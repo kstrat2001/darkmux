@@ -394,6 +394,7 @@ fn mission_status_str(s: MissionStatus) -> &'static str {
         MissionStatus::Active => "active",
         MissionStatus::Finalized => "finalized",
         MissionStatus::Aborted => "aborted",
+        MissionStatus::Unknown => "unknown",
     }
 }
 
@@ -403,6 +404,7 @@ fn phase_status_str(s: PhaseStatus) -> &'static str {
         PhaseStatus::Running => "running",
         PhaseStatus::Complete => "complete",
         PhaseStatus::Abandoned => "abandoned",
+        PhaseStatus::Unknown => "unknown",
     }
 }
 

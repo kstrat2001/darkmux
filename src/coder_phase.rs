@@ -2403,6 +2403,7 @@ fn phase_label_with_outcome(
         P::Running => DebriefPhaseStatus::Running,
         P::Complete => DebriefPhaseStatus::Complete,
         P::Abandoned => DebriefPhaseStatus::Abandoned,
+        P::Unknown => DebriefPhaseStatus::Unknown,
     }
 }
 
@@ -2417,6 +2418,8 @@ pub(crate) enum DebriefPhaseStatus {
     Complete,
     Degraded,
     Abandoned,
+    /// (#3035) A status a newer darkmux wrote that this build does not know.
+    Unknown,
 }
 
 impl DebriefPhaseStatus {
@@ -2427,6 +2430,7 @@ impl DebriefPhaseStatus {
             DebriefPhaseStatus::Complete => "complete",
             DebriefPhaseStatus::Degraded => "degraded",
             DebriefPhaseStatus::Abandoned => "abandoned",
+            DebriefPhaseStatus::Unknown => "unknown",
         }
     }
 }

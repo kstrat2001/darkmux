@@ -898,6 +898,7 @@ fn phase_start_impl(id: &str, refuse_terminal_mission: bool) -> Result<Phase> {
         PhaseStatus::Planned | PhaseStatus::Abandoned => {}
         PhaseStatus::Running => bail!("phase `{id}` is already Running"),
         PhaseStatus::Complete => bail!("phase `{id}` is Complete (terminal) — create a new phase instead"),
+        PhaseStatus::Unknown => return Err(unknown_status("phase", id)),
     }
     if refuse_terminal_mission {
         if let Ok(mission) = load_mission_by_id(&phase.mission_id) {
@@ -909,13 +910,14 @@ fn phase_start_impl(id: &str, refuse_terminal_mission: bool) -> Result<Phase> {
                     mission.status
                 ),
                 MissionStatus::Active => {}
+                MissionStatus::Unknown => return Err(unknown_status("mission", &phase.mission_id)),
             }
         }
     }
     phase.status = PhaseStatus::Running;
     phase.started_ts = Some(now_unix());
     phase.abandoned_ts = None; // restart clears the prior abandonment
-    save_json(&phase_path(&phase.mission_id, id), &phase)?;
+    save_phase(&phase)?;
     emit_phase_transition_record(id, &phase.mission_id, darkmux_flow::FlowAction::PhaseStart);
     Ok(phase)
 }
@@ -933,6 +935,7 @@ pub fn phase_complete(id: &str) -> Result<Phase> {
         PhaseStatus::Planned => bail!("phase `{id}` is Planned — it must be Running before it can complete (#1463)"),
         PhaseStatus::Abandoned => bail!("phase `{id}` is Abandoned — restart it to Running before completing (#1463)"),
         PhaseStatus::Complete => bail!("phase `{id}` is already Complete"),
+        PhaseStatus::Unknown => return Err(unknown_status("phase", id)),
     }
     // (#1504) Reconcile the phase's own Steps BEFORE writing its terminal
     // status — a crash between the two writes then leaves disk in the LEGAL
@@ -943,7 +946,7 @@ pub fn phase_complete(id: &str) -> Result<Phase> {
     reconcile_phase_steps_terminal(&phase.mission_id, id);
     phase.status = PhaseStatus::Complete;
     phase.completed_ts = Some(now_unix());
-    save_json(&phase_path(&phase.mission_id, id), &phase)?;
+    save_phase(&phase)?;
     emit_phase_transition_record(id, &phase.mission_id, darkmux_flow::FlowAction::PhaseComplete);
     Ok(phase)
 }
@@ -961,6 +964,7 @@ pub fn phase_abandon(id: &str) -> Result<Phase> {
         PhaseStatus::Planned | PhaseStatus::Running => {}
         PhaseStatus::Abandoned => bail!("phase `{id}` is already Abandoned"),
         PhaseStatus::Complete => bail!("phase `{id}` is Complete — can't abandon a finished phase"),
+        PhaseStatus::Unknown => return Err(unknown_status("phase", id)),
     }
     // (#1504) Reconcile BEFORE writing the phase's own terminal status — see
     // `phase_complete`'s matching comment for why (a crash mid-write leaves
@@ -968,9 +972,16 @@ pub fn phase_abandon(id: &str) -> Result<Phase> {
     reconcile_phase_steps_terminal(&phase.mission_id, id);
     phase.status = PhaseStatus::Abandoned;
     phase.abandoned_ts = Some(now_unix());
-    save_json(&phase_path(&phase.mission_id, id), &phase)?;
+    save_phase(&phase)?;
     emit_phase_transition_record(id, &phase.mission_id, darkmux_flow::FlowAction::PhaseAbandon);
     Ok(phase)
+}
+
+/// (#3035) The refusal for a mission or phase whose status a newer darkmux
+/// wrote and this build cannot place: no verb moves it, since a transition
+/// from a state this build does not know cannot be checked.
+fn unknown_status(what: &str, id: &str) -> anyhow::Error {
+    anyhow::anyhow!("{what} `{id}` has a status this darkmux does not know (written by a newer darkmux). Upgrade darkmux.")
 }
 
 // ─── Mission transitions ───────────────────────────────────────────────
@@ -999,11 +1010,12 @@ pub fn mission_start_with_reasoning_and_payload(
         MissionStatus::Finalized | MissionStatus::Aborted => {
             bail!("mission `{id}` is terminal ({:?}) — create a new mission instead", mission.status)
         }
+        MissionStatus::Unknown => return Err(unknown_status("mission", id)),
         MissionStatus::Active => {}
     }
     mission.status = MissionStatus::Active;
     mission.started_ts = Some(now_unix());
-    save_json(&mission_path(id), &mission)?;
+    save_mission(&mission)?;
     emit_mission_transition_record_with_reasoning_and_payload(id, darkmux_flow::FlowAction::MissionStart, reasoning, payload);
     Ok(mission)
 }
@@ -1055,6 +1067,7 @@ pub fn mission_terminal_with_reasoning_and_payload(
         MissionStatus::Active => {}
         MissionStatus::Finalized => bail!("mission `{id}` is already Finalized"),
         MissionStatus::Aborted => bail!("mission `{id}` is already Aborted"),
+        MissionStatus::Unknown => return Err(unknown_status("mission", id)),
     }
     reconcile_mission_phases_terminal(id);
     mission.status = terminal;
@@ -1062,7 +1075,7 @@ pub fn mission_terminal_with_reasoning_and_payload(
     // the split and stays, because "when did this mission end" is the same
     // question either way. `status` is what says HOW it ended.
     mission.finalized_ts = Some(now_unix());
-    save_json(&mission_path(id), &mission)?;
+    save_mission(&mission)?;
     let action = if matches!(terminal, MissionStatus::Aborted) {
         darkmux_flow::FlowAction::MissionAbort
     } else {
@@ -1123,7 +1136,7 @@ mod tests {
             abandoned_ts: None,
             task_ids: Vec::new(),
         };
-        save_json(&phase_path("test-mission", id), &s).unwrap();
+        save_phase(&s).unwrap();
         s
     }
 
@@ -1141,7 +1154,7 @@ mod tests {
             spec: None,
             machine: None,
         };
-        save_json(&mission_path(id), &m).unwrap();
+        save_mission(&m).unwrap();
         m
     }
 
@@ -1185,7 +1198,7 @@ mod tests {
         let _g = CrewGuard::new();
         let mut s = seed_phase("s4", PhaseStatus::Abandoned);
         s.abandoned_ts = Some(1_700_000_500);
-        save_json(&phase_path("test-mission", "s4"), &s).unwrap();
+        save_phase(&s).unwrap();
 
         let updated = phase_start("s4").unwrap();
         assert_eq!(updated.status, PhaseStatus::Running);
@@ -1253,7 +1266,7 @@ mod tests {
         let _g = CrewGuard::new();
         let mut s = seed_phase("s5", PhaseStatus::Running);
         s.started_ts = Some(1_700_000_100);
-        save_json(&phase_path("test-mission", "s5"), &s).unwrap();
+        save_phase(&s).unwrap();
 
         let updated = phase_complete("s5").unwrap();
         assert_eq!(updated.status, PhaseStatus::Complete);
@@ -2105,5 +2118,36 @@ mod task_step_storage_tests {
         let err = load_step("m-new", "p-new", "st-new").unwrap_err().to_string();
         assert!(err.contains("written by a newer darkmux (step `999.0`"), "{err}");
         assert!(load_tasks_for_phase("m-new", "p-new").is_err());
+    }
+
+    /// (#3035) No verb moves a mission or phase whose status a newer darkmux
+    /// wrote: the transition cannot be checked, so it is refused with the
+    /// upgrade message and the file is left as it was.
+    #[test]
+    #[serial]
+    fn a_mission_or_phase_with_an_unknown_status_is_refused_by_every_transition() {
+        let _g = CrewGuard::new();
+        let m: Mission = serde_json::from_value(
+            serde_json::json!({"id": "m-unk", "description": "d", "status": "suspended", "created_ts": 1}),
+        )
+        .unwrap();
+        save_mission(&m).unwrap();
+        let p: Phase = serde_json::from_value(
+            serde_json::json!({"id": "p-unk", "mission_id": "m-unk", "description": "d", "status": "blocked", "created_ts": 1}),
+        )
+        .unwrap();
+        save_phase(&p).unwrap();
+        let errs = [
+            mission_start_with_reasoning("m-unk", None).unwrap_err(),
+            mission_terminal_with_reasoning("m-unk", MissionStatus::Finalized, None).unwrap_err(),
+            phase_start("p-unk").unwrap_err(),
+            phase_complete("p-unk").unwrap_err(),
+            phase_abandon("p-unk").unwrap_err(),
+        ];
+        for e in errs {
+            let e = e.to_string();
+            assert!(e.contains("status this darkmux does not know") && e.contains("Upgrade darkmux."), "{e}");
+        }
+        assert_eq!(load_mission("m-unk").unwrap().status, MissionStatus::Unknown, "nothing was rewritten");
     }
 }

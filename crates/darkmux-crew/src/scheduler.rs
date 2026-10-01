@@ -193,6 +193,11 @@ fn task_status(task: &Task, steps: &BTreeMap<String, Step>) -> NodeStatus {
         NodeStatus::Error
     } else if statuses.contains(&NodeStatus::Abandoned) {
         NodeStatus::Abandoned
+    } else if statuses.contains(&NodeStatus::Unknown) {
+        // (#3035) A step status this build does not know: the task is neither
+        // complete (the all-Complete test below is never reached) nor
+        // runnable, and no dependent counts it as satisfied.
+        NodeStatus::Unknown
     } else if !statuses.is_empty() && statuses.iter().all(|s| *s == NodeStatus::Complete) {
         NodeStatus::Complete
     } else if statuses.contains(&NodeStatus::Running) {
@@ -269,7 +274,8 @@ fn dependency_satisfies_run_on(dep_status: NodeStatus, run_on: &[String]) -> boo
     match dep_status {
         NodeStatus::Complete => run_on.iter().any(|s| s == "complete"),
         NodeStatus::Error | NodeStatus::Abandoned => run_on.iter().any(|s| s == "error"),
-        NodeStatus::Planned | NodeStatus::Running => false,
+        // (#3035) A status this build does not know satisfies nothing.
+        NodeStatus::Planned | NodeStatus::Running | NodeStatus::Unknown => false,
     }
 }
 
@@ -305,7 +311,7 @@ fn terminal_source_step<'a>(
             .or_else(|| {
                 task.step_ids.iter().filter_map(of).find(|s| s.status == NodeStatus::Abandoned)
             }),
-        NodeStatus::Planned | NodeStatus::Running => None,
+        NodeStatus::Planned | NodeStatus::Running | NodeStatus::Unknown => None,
     }
 }
 
@@ -2402,6 +2408,26 @@ mod tests {
             !step_is_ready(&step_b, &task_b, &tasks, &steps),
             "an errored dependency must not satisfy a task whose run_on is the default [\"complete\"]"
         );
+    }
+
+    /// (#3035) A step status this build does not know is neither runnable nor
+    /// a satisfied dependency, whatever the dependent's `run_on` accepts, and
+    /// it never makes its task read `Complete`.
+    #[test]
+    fn an_unknown_step_status_never_runs_and_never_satisfies_a_dependent() {
+        let (task_a, step_a) = step_with_status("a", &[], NodeStatus::Unknown);
+        let (mut task_b, step_b) = task_and_step("b", &["a"]);
+        task_b.run_on = vec!["complete".into(), "error".into()];
+        let (tasks, steps) = graph(vec![(task_a.clone(), step_a.clone()), (task_b.clone(), step_b.clone())]);
+        assert!(!step_is_ready(&step_a, &task_a, &tasks, &steps), "an unknown step is not Planned, so not runnable");
+        assert!(!step_is_ready(&step_b, &task_b, &tasks, &steps), "it satisfies no run_on");
+        assert_eq!(task_status(&task_a, &steps), NodeStatus::Unknown);
+        let (done, mut other) = task_and_step("c", &[]);
+        other.status = NodeStatus::Complete;
+        let (mut mixed, extra) = (done, step_with_status("c2", &[], NodeStatus::Unknown).1);
+        mixed.step_ids.push(extra.id.clone());
+        let by_id: BTreeMap<String, Step> = [(other.id.clone(), other), (extra.id.clone(), extra)].into_iter().collect();
+        assert_eq!(task_status(&mixed, &by_id), NodeStatus::Unknown, "one unknown step keeps the task from Complete");
     }
 
     #[test]
