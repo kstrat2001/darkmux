@@ -702,7 +702,12 @@ body {
 .chip--sm {
   font-size: calc(10px * var(--fs-scale));
   letter-spacing: 0.08em;
-  padding: 2px 6px;
+  /* Centered on the letters, not the line box. Caps sit high in a monospace
+     line box (measured 2 device px high at 2x), so one pixel moves from the
+     bottom padding to the top. The last letter's tracking pads the word's
+     right side, so half of it moves from the right padding to the left. The
+     chip keeps its size either way. */
+  padding: 3px calc(6px - 0.04em) 1px calc(6px + 0.04em);
 }
 /* The HUB badge (`components/HubBadge.tsx`): never shrinks below its word, so
    a long machine name ellipsizes beside it instead. */
@@ -3686,11 +3691,28 @@ body {
   opacity: 0.5;
   font-style: italic;
 }
+/* The radio seat a peer grants (`components/RadioSeatIcon.tsx`), beside the
+   HUB badge in the card's name row: never shrinks, and under the row's own
+   height so it changes no box's size. */
+.radio-seat {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  color: var(--accent);
+}
+.radio-seat svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
 /* What the peer lets this machine do rides the hardware line. Beside the
    phone's tube there is no room for it (it would clip to "·…"), so it is
-   dropped there; the full line stays in the tooltip. */
+   dropped there; the full line stays in the tooltip. The radio seat icon
+   goes with it: in the name row it cut the machine's name to a few letters,
+   and a touch screen shows no tooltip to explain it. */
 @media (max-width: 560px) {
-  .mach .spec__grant {
+  .mach .spec__grant,
+  .mach .name .radio-seat {
     display: none;
   }
 }

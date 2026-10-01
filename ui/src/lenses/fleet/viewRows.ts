@@ -92,13 +92,23 @@ export function outcomeLine(outcome: CardOutcome): string | null {
   }
 }
 
-/** What a peer lets this machine do, as one compact line; `null` when the
- * view holds no grant to show (this machine's own row, no entry, withheld,
- * unknown). */
-export function grantLine(accepts: AcceptsState): string | null {
+/** The role a peer grants when it answers this machine's radio questions. */
+const RADIO_HOST_ROLE = "radio-host";
+
+/** What a peer lets this machine do: its profiles and roles as one compact
+ * line, with the radio seat pulled out as a flag so the card draws it as an
+ * icon. `text` is `null` when the radio seat is the whole grant. */
+export interface Grant {
+  text: string | null;
+  radio: boolean;
+}
+
+/** The grant the view holds for a peer; `null` when there is none to show
+ * (this machine's own row, no entry, withheld, unknown). */
+export function grantOf(accepts: AcceptsState): Grant | null {
   switch (accepts.state) {
     case "granted":
-      return acceptsLine(accepts.accepts);
+      return grantFrom(accepts.accepts);
     case "not_listed":
     case "this_machine":
     case "withheld":
@@ -111,11 +121,19 @@ export function grantLine(accepts: AcceptsState): string | null {
   }
 }
 
-function acceptsLine(a: CardAccepts): string {
+function grantFrom(a: CardAccepts): Grant {
+  const radio = a.roles.includes(RADIO_HOST_ROLE);
   const parts: string[] = [];
   if (a.profiles.length > 0) parts.push(`runs ${a.profiles.join(", ")}`);
-  for (const role of a.roles) parts.push(`${role} here`);
-  return parts.length > 0 ? parts.join(" · ") : "accepts nothing";
+  for (const role of a.roles) if (role !== RADIO_HOST_ROLE) parts.push(`${role} here`);
+  if (parts.length > 0) return { text: parts.join(" · "), radio };
+  return { text: radio ? null : "accepts nothing", radio };
+}
+
+/** The grant in words, the radio seat spelled out: the line's tooltip. */
+export function grantWords(g: Grant): string {
+  const radio = g.radio ? `${RADIO_HOST_ROLE} here` : null;
+  return [g.text, radio].filter((p): p is string => p !== null).join(" · ");
 }
 
 function livenessStanding(liveness: Liveness): Standing {
@@ -186,7 +204,7 @@ export interface RowFacts {
    * card was read. */
   note: string | null;
   /** What the peer lets this machine do; `null` for this machine's own row. */
-  grant: string | null;
+  grant: Grant | null;
   standing: Standing;
   isSelf: boolean;
   /** The row's card declares `fleet.mode hub`. */
@@ -244,7 +262,7 @@ export function rowFacts(
     name: row.entry?.id ?? specs?.machine_id ?? null,
     spec: specs ? specsLine(specs) : "",
     note: outcomeLine(row.card),
-    grant: row.is_this_machine ? null : grantLine(row.accepts),
+    grant: row.is_this_machine ? null : grantOf(row.accepts),
     standing: rowStanding(row),
     isSelf: row.is_this_machine,
     hub: rowIsHub(row),

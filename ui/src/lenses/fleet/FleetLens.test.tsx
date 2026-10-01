@@ -1645,10 +1645,19 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
     await waitFor(() => expect(studio.querySelector(".stat")!.textContent).toBe("idle"));
     expect(studio.className).not.toContain("absent");
     expect(studio.textContent).not.toContain("offline");
-    expect(studio.querySelector(".spec")!.textContent).toBe("Apple M1 Max · 32 GB · runs diff-review · radio-host here");
+    // The radio seat is an icon in the name row whose tooltip says what it
+    // means; the rest of the grant stays words, and the whole grant stays in
+    // the hardware line's tooltip.
+    const spec = studio.querySelector(".spec")!;
+    expect(spec.textContent).toBe("Apple M1 Max · 32 GB · runs diff-review");
+    expect(spec.getAttribute("title")).toBe("Apple M1 Max · 32 GB · runs diff-review · radio-host here");
+    const radio = studio.querySelector('.name [data-testid="radio-seat"]')!;
+    expect(radio.getAttribute("title")).toBe("radio-host here: this machine answers radio questions you send it");
+    expect(radio.getAttribute("aria-label")).toBe(radio.getAttribute("title"));
     // This machine's own card shows no grant.
     const self = [...document.querySelectorAll(".mach")].find((c) => c !== studio)!;
     expect(self.querySelector(".spec")!.textContent).toBe("Apple M5 Max · 128 GB");
+    expect(self.querySelector('[data-testid="radio-seat"]')).toBeNull();
   });
 
   // The inverse: with the same row unreachable and presence silent, the

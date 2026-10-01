@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { flowUidByName, grantLine, machineIsHub, outcomeLine, rowFacts, rowIsHub, rowStanding, rowUid } from "./viewRows";
+import { flowUidByName, grantOf, grantWords, machineIsHub, outcomeLine, rowFacts, rowIsHub, rowStanding, rowUid } from "./viewRows";
 import type { AcceptsState } from "../../types/generated/AcceptsState";
 import type { CardOutcome } from "../../types/generated/CardOutcome";
 import type { FleetMachine } from "../../types/generated/FleetMachine";
@@ -96,24 +96,37 @@ describe("outcomeLine: one fixed phrase per outcome", () => {
   });
 });
 
-describe("grantLine: what a peer lets this machine do", () => {
+describe("grantOf: what a peer lets this machine do", () => {
   const accepts = (over: Partial<Extract<AcceptsState, { state: "granted" }>["accepts"]>): AcceptsState => ({
     state: "granted",
     accepts: { peer_name: "laptop", profiles: [], roles: [], images: [], workspace: false, ...over },
   });
 
-  it("names the profiles it runs and the roles it takes here", () => {
-    expect(grantLine(accepts({ profiles: ["diff-review"], roles: ["radio-host"] }))).toBe("runs diff-review · radio-host here");
+  it("names the profiles it runs and the roles it takes here, the radio seat as a flag", () => {
+    expect(grantOf(accepts({ profiles: ["diff-review"], roles: ["radio-host", "reviewer"] }))).toEqual({
+      text: "runs diff-review · reviewer here",
+      radio: true,
+    });
+  });
+
+  it("a grant of only the radio seat has no text, just the flag", () => {
+    expect(grantOf(accepts({ roles: ["radio-host"] }))).toEqual({ text: null, radio: true });
   });
 
   it("an empty grant says so rather than showing nothing", () => {
-    expect(grantLine(accepts({}))).toBe("accepts nothing");
+    expect(grantOf(accepts({}))).toEqual({ text: "accepts nothing", radio: false });
   });
 
   it("every other state shows no grant", () => {
     for (const state of ["not_listed", "this_machine", "withheld", "unknown"] as const) {
-      expect(grantLine({ state }), state).toBeNull();
+      expect(grantOf({ state }), state).toBeNull();
     }
+  });
+
+  it("the full line spells the radio seat out in words, for the tooltip", () => {
+    expect(grantWords({ text: "runs diff-review", radio: true })).toBe("runs diff-review · radio-host here");
+    expect(grantWords({ text: null, radio: true })).toBe("radio-host here");
+    expect(grantWords({ text: "accepts nothing", radio: false })).toBe("accepts nothing");
   });
 });
 
@@ -142,7 +155,7 @@ describe("rowFacts", () => {
       new Set(),
       null,
     );
-    expect(facts).toMatchObject({ spec: "Apple M1 Max · 32 GB", note: null, grant: "runs diff-review", standing: "online", isSelf: false });
+    expect(facts).toMatchObject({ spec: "Apple M1 Max · 32 GB", note: null, grant: { text: "runs diff-review", radio: false }, standing: "online", isSelf: false });
   });
 
   it("this machine's own row shows no grant", () => {
