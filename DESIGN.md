@@ -1131,11 +1131,11 @@ Known gaps: declaring `hub` starts nothing (darkmux does not run or supervise Re
 
 A person reads and writes machine names: `phi4-review@studio` in config is legible, and a uid there could not be mapped by eye. So names stay the handle in config. What changes is what a name does behind it.
 
-**Today the name is the identity,** in three places. The roster is keyed by name, and a peer's entry carries the network node and the address but no `machine_uid`. A `<profile>@<machine>` address resolves through that name. And the receiver checks the name: after a rename, a job addressed to the right node under the former name is refused as misaddressed. The trust list (`fleet.accept_work`) is keyed by the peer's name the same way. Renaming one machine therefore means editing the roster and every address that names it on every other machine, and routing to it fails until that is done (found live, 2026-10-01: radio was down until the MacBook's roster and `radio.answerer_profile` were edited by hand).
+**Today the name is the identity,** in three places. The roster is keyed by name, and a peer's entry carries the network node and the address but no `machine_uid`. A `<profile>@<machine>` address resolves through that name. And the receiver checks the name: after a rename, a job addressed to the right node under the former name is refused as misaddressed. (The trust list is not affected: `fleet.accept_work` is keyed by a name, but an entry matches the sender by its network node id, `match_entry`, so the key is only a label.) Renaming one machine therefore means editing the roster and every address that names it on every other machine, and routing to it fails until that is done (found live, 2026-10-01: radio was down until the MacBook's roster and `radio.answerer_profile` were edited by hand).
 
 **Decided (#3028, with the viewer's one machine identity, #3026):**
 
-- **Roster and trust entries are keyed by the machine's uid.** Its current name is a field, alongside the names it has had, all learned from the peer's own card, which carries both.
+- **A roster entry knows its machine's uid.** Its current name and the names it has had are learned from the peer's own card, which carries both.
 - **`@name` resolves at use**, from name to entry to uid to address. A former name keeps resolving as an alias, and doctor warns with the exact edit; it is not a failure.
 - **The receiver checks identity, not the name.** It already pins the sender's network node.
 - **A rename is one command, on the renamed machine.** The others pick up the new name from its card, and nothing breaks in between.
