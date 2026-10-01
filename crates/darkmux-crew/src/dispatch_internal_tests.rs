@@ -18217,3 +18217,83 @@ fn with_step_context_leaves_a_resume_refusal_bare_and_wraps_the_rest() {
     let other = with_step_context(anyhow::anyhow!("boom"), || "step `s` dispatch.internal".to_string());
     assert_eq!(format!("{other:#}"), "step `s` dispatch.internal: boom");
 }
+
+fn resident(identifier: &str, model: &str, context: u64) -> darkmux_types::LoadedModel {
+    darkmux_types::LoadedModel {
+        identifier: identifier.to_string(),
+        model: model.to_string(),
+        status: "idle".to_string(),
+        size: "1.00 GB".to_string(),
+        context,
+        queued: None,
+    }
+}
+
+/// (#2985) The preflight's decision, the single rule the lab's pre-run
+/// warning also reports: exact identifier only, bare key, ctx 0 insufficient.
+#[test]
+fn decide_preflight_reuses_the_exact_identifier_at_sufficient_ctx() {
+    let l = [resident("darkmux:qwen", "qwen", 262144)];
+    assert_eq!(
+        decide_preflight("qwen", None, 32768, &l),
+        PreflightDecision::Reuse { identifier: "darkmux:qwen".into(), resident_ctx: 262144 }
+    );
+}
+
+#[test]
+fn decide_preflight_reloads_an_undersized_or_unreported_ctx() {
+    for ctx in [1000_u64, 0] {
+        let l = [resident("darkmux:qwen", "qwen", ctx)];
+        assert_eq!(
+            decide_preflight("qwen", None, 32768, &l),
+            PreflightDecision::Reload { stale_identifier: "darkmux:qwen".into(), stale_ctx: ctx }
+        );
+    }
+}
+
+#[test]
+fn decide_preflight_never_reuses_a_foreign_copy() {
+    let l = [resident("qwen", "qwen", 262144)];
+    assert_eq!(
+        decide_preflight("qwen", None, 32768, &l),
+        PreflightDecision::LoadFresh { foreign_identifier: Some("qwen".into()) }
+    );
+}
+
+#[test]
+fn decide_preflight_absent_model_loads_fresh_with_no_foreign() {
+    let l = [resident("darkmux:other", "other", 32768)];
+    assert_eq!(decide_preflight("qwen", None, 32768, &l), PreflightDecision::LoadFresh { foreign_identifier: None });
+}
+
+#[test]
+fn decide_preflight_opt_out_identifier_is_matched_exactly() {
+    let l = [resident("darkmux:qwen", "qwen", 262144)];
+    assert!(matches!(
+        decide_preflight("qwen", Some("my-qwen"), 32768, &l),
+        PreflightDecision::LoadFresh { foreign_identifier: Some(_) }
+    ));
+    let l = [resident("my-qwen", "qwen", 262144)];
+    assert!(matches!(
+        decide_preflight("qwen", Some("my-qwen"), 32768, &l),
+        PreflightDecision::Reuse { .. }
+    ));
+}
+
+#[test]
+fn decide_preflight_a_different_darkmux_instance_cannot_answer() {
+    let l = [resident("darkmux:qwen-alt", "qwen", 262144)];
+    assert!(matches!(
+        decide_preflight("qwen", None, 32768, &l),
+        PreflightDecision::LoadFresh { foreign_identifier: Some(_) }
+    ));
+}
+
+#[test]
+fn decide_preflight_normalizes_a_namespaced_profile_id() {
+    let l = [resident("darkmux:qwen", "qwen", 32768)];
+    assert!(matches!(
+        decide_preflight("darkmux:qwen", None, 32768, &l),
+        PreflightDecision::Reuse { .. }
+    ));
+}

@@ -11681,6 +11681,54 @@ pub(crate) fn is_reloadable_target(
         && resident_identifier == darkmux_gestalt::namespaced_identifier(want, want_identifier)
 }
 
+/// What the dispatch residency preflight does about the resident set for one
+/// profile model. The single owner of that rule: [`ensure_model_resident_from`]
+/// acts on it and the lab's pre-run warning reports it, so the two cannot
+/// disagree (#2985 tracks unifying it with the gestalt planner's rule).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreflightDecision {
+    /// The identifier this profile would mint is resident with enough context.
+    Reuse { identifier: String, resident_ctx: u64 },
+    /// That identifier is resident but its context is insufficient (an
+    /// unreported context of 0 included): unload it, then load.
+    Reload { stale_identifier: String, stale_ctx: u64 },
+    /// Nothing darkmux may reuse is resident: load a new instance. Carries the
+    /// identifier of a foreign (not darkmux-loaded) copy of the same weights
+    /// when one is resident, which darkmux loads beside and never touches.
+    LoadFresh { foreign_identifier: Option<String> },
+}
+
+/// Decide what the preflight does for `model_id` (a key or a `darkmux:`
+/// identifier, normalized per #1615) wanting `n_ctx`, given `loaded`.
+/// Only the exact identifier [`is_reloadable_target`] recognizes is ever reused
+/// or reloaded, because the wire `model` is that identifier (#2240).
+pub fn decide_preflight(
+    model_id: &str,
+    want_identifier: Option<&str>,
+    n_ctx: u32,
+    loaded: &[darkmux_types::LoadedModel],
+) -> PreflightDecision {
+    let model_key = bare_model_key(model_id);
+    match loaded
+        .iter()
+        .find(|m| is_reloadable_target(&m.model, &m.identifier, model_key, want_identifier))
+    {
+        Some(m) if darkmux_gestalt::ctx_sufficient(m.context, n_ctx) => {
+            PreflightDecision::Reuse { identifier: m.identifier.clone(), resident_ctx: m.context }
+        }
+        Some(m) => PreflightDecision::Reload {
+            stale_identifier: m.identifier.clone(),
+            stale_ctx: m.context,
+        },
+        None => PreflightDecision::LoadFresh {
+            foreign_identifier: loaded
+                .iter()
+                .find(|m| m.model == model_key)
+                .map(|m| m.identifier.clone()),
+        },
+    }
+}
+
 // The loadable model key is `darkmux_gestalt::bare_model_key` (#1615): the
 // namespace is a load-time decoration, never part of the key. One definition.
 use darkmux_gestalt::bare_model_key;
@@ -11838,38 +11886,35 @@ fn ensure_model_resident_from(
     // that structurally through `OwnedTarget`; this legacy path reached past it
     // to the raw `lms::unload`, so the guarantee has to be restated here until
     // the raw call is retired in favor of the `ModelHost` seam.
-    match loaded
-        .iter()
-        .find(|m| is_reloadable_target(&m.model, &m.identifier, model_key, want_identifier))
-    {
-        Some(m) if darkmux_gestalt::ctx_sufficient(m.context, n_ctx) => return Ok(()),
-        Some(m) => {
+    match decide_preflight(&pm.id, want_identifier, n_ctx, &loaded) {
+        PreflightDecision::Reuse { .. } => return Ok(()),
+        PreflightDecision::Reload { stale_identifier, stale_ctx } => {
             eprintln!(
                 "darkmux dispatch: `{}` is resident at context {} but n_ctx={} is wanted \
                  ({}); reloading at {} so the dispatch gets that context. (#1135)",
                 model_key,
-                m.context,
+                stale_ctx,
                 n_ctx,
                 source.describe(),
                 n_ctx
             );
-            unload(&m.identifier).with_context(|| {
-                format!("unloading `{}` to reload at n_ctx={}", m.identifier, n_ctx)
+            unload(&stale_identifier).with_context(|| {
+                format!("unloading `{stale_identifier}` to reload at n_ctx={n_ctx}")
             })?;
         }
-        None => {
+        PreflightDecision::LoadFresh { foreign_identifier } => {
             // (#1609) A foreign resident of the same model is NOT an error and
             // NOT ours to remove — the contract is "surface a reason naming the
             // blocking instance and suggest; never touch". darkmux loads its
             // own namespaced copy alongside it, exactly as the gestalt planner
             // already decides for a ForeignDuplicate.
-            if let Some(foreign) = loaded.iter().find(|m| m.model == model_key) {
+            if let Some(foreign) = foreign_identifier {
                 eprintln!(
                     "darkmux dispatch: `{}` is already resident as `{}`, which darkmux \
                      does not own and will not unload; loading darkmux's own copy at \
                      n_ctx={} alongside it. Free the RAM yourself with `lms unload {}` \
                      if that is not what you want. (#1609)",
-                    model_key, foreign.identifier, n_ctx, foreign.identifier
+                    model_key, foreign, n_ctx, foreign
                 );
             } else {
                 eprintln!("{}", loading_message(model_key, n_ctx, source));
@@ -11885,25 +11930,20 @@ fn ensure_model_resident_from(
         // satisfies the declared context — the namespace contract says a
         // resident `darkmux:<id>` at the right context IS the thing to reuse.
         Err(e) if identifier_already_resident(&format!("{e:#}")) => {
-            match list()
-                .into_iter()
-                .find(|m| is_reloadable_target(&m.model, &m.identifier, model_key, want_identifier))
-            {
-                Some(m) if m.context >= u64::from(n_ctx) => {
+            match decide_preflight(&pm.id, want_identifier, n_ctx, &list()) {
+                PreflightDecision::Reuse { resident_ctx, .. } => {
                     eprintln!(
-                        "darkmux dispatch: `{identifier}` was already resident at context {} \
+                        "darkmux dispatch: `{identifier}` was already resident at context {resident_ctx} \
                          when this load ran (another dispatch loaded it first); reusing it \
-                         rather than failing. (#2318)",
-                        m.context
+                         rather than failing. (#2318)"
                     );
                     Ok(())
                 }
-                Some(m) => bail!(
-                    "darkmux: `{identifier}` is already resident at context {} but this \
+                PreflightDecision::Reload { stale_ctx, .. } => bail!(
+                    "darkmux: `{identifier}` is already resident at context {stale_ctx} but this \
                      dispatch declares n_ctx={n_ctx}, and the load that would have fixed \
                      that was refused because the identifier is taken. Evict it with \
-                     `darkmux machine eject`, then retry. (#2318)",
-                    m.context
+                     `darkmux machine eject`, then retry. (#2318)"
                 ),
                 // Say only what is known. LMStudio refused the load as
                 // already-resident, and the follow-up `lms ps` probe did not
@@ -11913,7 +11953,7 @@ fn ensure_model_resident_from(
                 // the latter would name a cause this path cannot distinguish;
                 // #2318 is cited as where this was first seen, not as a
                 // diagnosis.
-                None => bail!(
+                PreflightDecision::LoadFresh { .. } => bail!(
                     "darkmux: loading `{model_key}` at n_ctx={n_ctx} was refused because \
                      `{identifier}` is already taken, but the follow-up `lms ps` probe \
                      listed no resident under that identifier — so either the probe failed \
