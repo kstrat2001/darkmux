@@ -731,6 +731,9 @@ impl std::fmt::Display for ValidationFinding {
 pub struct KindPorts {
     pub requires: Vec<String>,
     pub provides: Vec<String>,
+    /// `(required label, config key)`: a literal at that key in the step's own
+    /// `config` meets the requirement without a producer task.
+    pub config_supplies: Vec<(String, String)>,
 }
 
 /// What [`MissionConfig::validate_with`] knows about the registered kinds: their
@@ -792,10 +795,11 @@ impl MissionConfig {
                     path: format!("tasks[{}].steps[{}].kind", task.id, step.id),
                     message: format!(
                         "step \"{}\" names step kind \"{}\", which was renamed to \"{}\" (#2430) \
-                         and is not accepted under its old name — change the `kind`",
+                         and is not accepted under its old name; in this file {}",
                         step.id,
                         step.kind,
-                        new.id()
+                        new.id(),
+                        crate::step_config::ConfigKind::retired_fix()
                     ),
                 })
             })
@@ -813,7 +817,7 @@ impl MissionConfig {
                 task.depends_on.iter().chain(&task.reads).chain(task.grow.iter().map(|g| &g.from)).collect();
             let producers: Vec<&TaskConfig> =
                 wired.into_iter().filter_map(|id| tasks.get(id.as_str()).copied()).collect();
-            for label in wanted {
+            for label in wanted.iter().filter(|l| !config_supplies(catalog, first, l)) {
                 if let Some(f) = unmet_requirement(task, first, label, &producers, catalog) {
                     findings.push(f);
                 }
@@ -821,6 +825,19 @@ impl MissionConfig {
         }
         findings
     }
+}
+
+/// Whether the step's own `config` carries a literal at the key its kind says
+/// can supply `label` (a blank string or null is not a value).
+fn config_supplies(catalog: &KindCatalog, step: &StepConfig, label: &str) -> bool {
+    let Some(ports) = catalog.ports(&step.kind) else { return false };
+    ports.config_supplies.iter().filter(|(l, _)| l == label).any(|(_, key)| {
+        match step.config.get(key) {
+            None | Some(serde_json::Value::Null) => false,
+            Some(serde_json::Value::String(s)) => !s.trim().is_empty(),
+            Some(_) => true,
+        }
+    })
 }
 
 /// The finding for `label` if no producer's LAST step provides it; `None` when
@@ -2490,12 +2507,16 @@ mod tests {
         let ports = |requires: &[&str], provides: &[&str]| KindPorts {
             requires: requires.iter().map(|s| s.to_string()).collect(),
             provides: provides.iter().map(|s| s.to_string()).collect(),
+            ..KindPorts::default()
         };
         let mut c = KindCatalog::default();
         c.insert("needs", ports(&["plan"], &[]));
         c.insert("makes", ports(&[], &["plan"]));
         c.insert("other", ports(&[], &["text"]));
         c.insert("free", ports(&[], &[]));
+        let mut literal = ports(&["plan"], &[]);
+        literal.config_supplies = vec![("plan".into(), "plan_file".into())];
+        c.insert("needs-or-literal", literal);
         c
     }
 
@@ -2561,6 +2582,24 @@ mod tests {
         // A kind that requires nothing passes with no producers.
         let cfg = doc(vec![phase_of("a", vec![task_of("loner", "free")])]);
         assert!(errors_of(&cfg, &catalog).is_empty());
+    }
+
+    /// (#2312) A literal at the config key a kind names meets its requirement
+    /// without a producer task; an absent, null or blank value does not.
+    #[test]
+    fn a_literal_config_value_meets_a_requirement_without_a_producer() {
+        let catalog = wiring_catalog();
+        let with_config = |config: serde_json::Value| {
+            let mut t = task_of("consumer", "needs-or-literal");
+            t.steps[0].config = config;
+            doc(vec![phase_of("a", vec![t])])
+        };
+        assert!(errors_of(&with_config(serde_json::json!({"plan_file": "/p.json"})), &catalog).is_empty());
+        for unset in [serde_json::json!({}), serde_json::json!({"plan_file": null}), serde_json::json!({"plan_file": " "})] {
+            assert_eq!(errors_of(&with_config(unset.clone()), &catalog).len(), 1, "{unset} supplies nothing");
+        }
+        // A key the kind does not name supplies nothing.
+        assert_eq!(errors_of(&with_config(serde_json::json!({"other": "x"})), &catalog).len(), 1);
     }
 
     /// A task's input is read by its FIRST step, so only that step's

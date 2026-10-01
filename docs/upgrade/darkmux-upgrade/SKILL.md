@@ -212,6 +212,13 @@ Doctor lists each file under `user file keys: <file>`. The fixes it names:
   - Delete the top-level `panel` key. Every launchable config runs from the editor panel as `/mission launch <id>`.
   - Delete `role_id` on a task whose step is `mission.verify`; it had no effect (#2953).
   - `gh_verb` is renamed `cmd`, with `schema_version` set to `"3.0"`. A task's `expand` key was removed: declaring the expanded tasks explicitly is a judgment, so ask.
+  - **Renamed step kinds (#2430).** `crawl.unit` is now `dispatch.unit` and `crawl.summary` is now `dispatch.summary`. A config that still names either is refused, and **one such file blocks every `mission launch`, the built-in `crawl` and `review` included**, so fix these first. Doctor names the file. Rewrite only those two ids, in only the files doctor names (the quotes keep it from touching any other id):
+
+    ```bash
+    sed -i.bak -e 's/"crawl\.unit"/"dispatch.unit"/g' -e 's/"crawl\.summary"/"dispatch.summary"/g' "$ROOT/mission-configs/<file>.json"
+    ```
+
+    Show the diff against the `.bak` before moving on, then delete the `.bak`. (`crawl.plan` and `plan.sites` keep their names.) Missions already run keep reading as they were; nothing under `missions/` needs editing.
   - An older `schema_version` major only warns. Leave it, or bump it after the file passes.
   - A task's `notes` in a mission config is refused as an unknown key (doctor names it, e.g. `phases[0].tasks[1].notes`). It is the user's own text, so fold it into that task's `description` (if it is a list of lines, join them), then delete `notes`. Never delete it alone.
 - **Workloads** (`<root>/workloads/*.json`): delete `workload.expected.test_count_baseline` (#2833; a coding workload's baseline lives in its fixture's `baseline.test_count`). Rename `workload.agent` to `role` (#328).

@@ -95,7 +95,11 @@ impl StepKindRegistry {
         };
         let mut catalog = crate::mission_config::KindCatalog::default();
         for (id, kind) in map.iter() {
-            catalog.insert(id, crate::mission_config::KindPorts { requires: data(kind.requires()), provides: data(kind.provides()) });
+            catalog.insert(id, crate::mission_config::KindPorts {
+                    requires: data(kind.requires()),
+                    provides: data(kind.provides()),
+                    config_supplies: kind.config_supplies().iter().map(|(l, k)| (l.to_string(), k.to_string())).collect(),
+                });
         }
         catalog
     }

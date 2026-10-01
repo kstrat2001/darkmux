@@ -765,7 +765,7 @@ pub fn run_ephemeral(
     // carve-out in `validate` means the just-injected args task never
     // trips a false dangling-reference finding here.
     let errors: Vec<_> = config
-        .validate_with(&StepKindRegistry::with_builtins().catalog())
+        .validate_with(&crate::mission_launch::kind_catalog()?)
         .into_iter()
         .filter(|f| f.severity == mission_config::FindingSeverity::Error)
         .collect();

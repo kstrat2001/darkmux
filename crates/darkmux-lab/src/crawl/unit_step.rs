@@ -1045,6 +1045,12 @@ impl StepKind for DispatchUnitStepKind {
         &PORTS
     }
 
+    /// A literal `config.plan` (a path or inline plan) stands in for a
+    /// producer task: `Output::read` takes a bare path (#2312).
+    fn config_supplies(&self) -> &'static [(&'static str, &'static str)] {
+        &[(darkmux_crew::step_output::labels::PLAN, "plan")]
+    }
+
     fn provides(&self) -> &'static [Port] {
         const PORTS: [Port; 1] = [Port::data(darkmux_crew::step_output::labels::UNIT_OUTCOME)];
         &PORTS
@@ -1844,15 +1850,15 @@ pub fn summarize_mission(mission_id: &str) -> Result<CrawlSummary> {
     for phase in phases.iter().filter(|p| p.mission_id == mission_id) {
         let Ok(steps) = darkmux_crew::lifecycle::load_steps_for_phase(mission_id, &phase.id) else { continue };
         for step in steps.iter().filter(|s| {
-            s.kind == crate::crawl::plan_step::CRAWL_PLAN_KIND
-                || s.kind == crate::crawl::plan_sites_step::PLAN_SITES_KIND
+            s.kind_id() == crate::crawl::plan_step::CRAWL_PLAN_KIND
+                || s.kind_id() == crate::crawl::plan_sites_step::PLAN_SITES_KIND
         }) {
             if step.status != darkmux_crew::types::NodeStatus::Complete {
                 let rule = crawl_identity(&step.kind, &step.config).rule.unwrap_or_else(|| step.id.clone());
                 plans_errored.push(rule);
             }
         }
-        for step in steps.iter().filter(|s| s.kind == DISPATCH_UNIT_KIND) {
+        for step in steps.iter().filter(|s| s.kind_id() == DISPATCH_UNIT_KIND) {
             // (#2301 review, MUST FIX) Branch on STATUS, not on whether an
             // output is present. The scheduler writes a failing kind's own
             // ERROR TEXT into `step.output` (`scheduler.rs`'s `Err` arm),

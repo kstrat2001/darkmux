@@ -7268,6 +7268,12 @@ fn a_config_naming_a_retired_step_kind_is_refused_naming_the_new_one() {
         stderr.contains("crawl.unit") && stderr.contains("dispatch.unit") && stderr.contains("renamed"),
         "the refusal names the old id and the new one: {stderr}"
     );
+    // The upgrade path is explicit: the file to edit, and BOTH replacements.
+    assert!(stderr.contains("retired-kind-test.json"), "names the file: {stderr}");
+    assert!(
+        stderr.contains("rename `crawl.unit` to `dispatch.unit` and `crawl.summary` to `dispatch.summary`"),
+        "names both replacements: {stderr}"
+    );
     assert!(!home.path().join("missions").exists(), "a refused launch mints nothing");
 }
 
@@ -7283,11 +7289,16 @@ fn a_task_wired_to_a_producer_of_the_wrong_kind_is_refused_before_minting() {
         config_dir.join("wiring-test.json"),
         serde_json::json!({
             "id": "wiring-test", "name": "wiring", "schema_version": "4.0",
-            "phases": [{"id": "p", "tasks": [
-                {"id": "producer", "steps": [{"id": "ps", "kind": "procedural.shell", "config": {"command": "echo hi"}}]},
-                {"id": "consumer", "depends_on": ["producer"],
-                 "steps": [{"id": "cs", "kind": "dispatch.unit", "config": {"plan": "p.json", "unit": "u1"}}]}
-            ]}]
+            "phases": [
+                {"id": "p1", "tasks": [
+                    {"id": "producer", "steps": [{"id": "ps", "kind": "procedural.shell", "config": {"command": "echo hi"}}]}
+                ]},
+                {"id": "p2", "tasks": [
+                    {"id": "consumer", "grow": {"from": "producer", "items": "units", "id": "{{item.id}}",
+                        "config": {"plan": "{{from.output}}", "unit": "{{item.id}}"}},
+                     "steps": [{"id": "cs", "kind": "dispatch.unit", "config": {}}]}
+                ]}
+            ]
         })
         .to_string(),
     )

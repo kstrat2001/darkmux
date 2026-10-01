@@ -317,7 +317,7 @@ fn declared_rules(mission_id: &str) -> std::collections::BTreeMap<String, String
     let Ok(Some(config)) = crate::lifecycle::load_config_snapshot(mission_id) else { return out };
     for phase in &config.phases {
         for task in &phase.tasks {
-            if let Some(rule) = task.steps.iter().find_map(|s| crawl_identity(&s.kind, &s.config).rule) {
+            if let Some(rule) = task.steps.iter().find_map(|s| crawl_identity(crate::step_config::current_kind_id(&s.kind), &s.config).rule) {
                 out.insert(task.id.clone(), rule);
             }
         }
@@ -557,7 +557,7 @@ fn scan_unit_and_plan_steps(mission_id: &str, exclude_task_id: &str) -> StepScan
             if step.task_id == exclude_task_id {
                 continue;
             }
-            match step.kind.as_str() {
+            match step.kind_id() {
                 SCANNED_DISPATCH_UNIT_KIND => {
                     if step.status != crate::types::NodeStatus::Complete {
                         scan.errored.push(format!("unit `{}` ({:?})", step.id, step.status));
@@ -614,7 +614,7 @@ fn scan_unit_and_plan_steps(mission_id: &str, exclude_task_id: &str) -> StepScan
                     // `DeliverScope` field, its render and its goldens —
                     // worth doing, deliberately not folded into this fix.
                     if !never_dispatched {
-                        let identity = crawl_identity(&step.kind, &step.config);
+                        let identity = crawl_identity(step.kind_id(), &step.config);
                         if let (Some(rule), Some(unit)) = (identity.rule, identity.unit) {
                             scan.completed_units.insert((rule, unit));
                         }
@@ -632,7 +632,7 @@ fn scan_unit_and_plan_steps(mission_id: &str, exclude_task_id: &str) -> StepScan
                     if step.status == crate::types::NodeStatus::Complete {
                         continue;
                     }
-                    let rule = crawl_identity(&step.kind, &step.config).rule.unwrap_or_else(|| step.id.clone());
+                    let rule = crawl_identity(step.kind_id(), &step.config).rule.unwrap_or_else(|| step.id.clone());
                     scan.not_attempted.push(rule);
                     scan.errored.push(format!("plan `{}` ({:?})", step.id, step.status));
                 }

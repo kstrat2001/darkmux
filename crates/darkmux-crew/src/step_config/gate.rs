@@ -104,7 +104,11 @@ fn step_kind(step: &Value, step_path: &str, out: &mut Vec<KeyIssue>) -> Option<C
     }
     let path = format!("{step_path}.kind");
     if let Some((old, new)) = id.zip(id.and_then(ConfigKind::replacing)) {
-        let line = format!("step kind `{old}` was renamed to `{}` (#2430) and is not accepted under its old name", new.id());
+        let line = format!(
+            "step kind `{old}` was renamed to `{}` (#2430) and is not accepted under its old name. Fix this file: {}",
+            new.id(),
+            ConfigKind::retired_fix()
+        );
         out.push(KeyIssue { path, issue: Issue::Removed(line) });
         return None;
     }

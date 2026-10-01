@@ -95,6 +95,12 @@ darkmux release.
   already on disk still read: old ids map to the new ones on read, and nothing writes an old
   id back. The viewer's mission graph now treats `dispatch.unit` as a model-dispatching step
   (it shows the token and turn meter) and `dispatch.summary` as a procedural one.
+- **Upgrading a config that names `crawl.unit` or `crawl.summary`** (#2430). One such file in
+  your `mission-configs/` directory blocks every `mission launch`, the built-in configs
+  included, because the registry-wide preflight refuses it. The refusal and `darkmux doctor`
+  name the file and the fix: rename `crawl.unit` to `dispatch.unit` and `crawl.summary` to
+  `dispatch.summary`. The upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`, step 8) has
+  a `sed` one-liner that touches only those two ids. Mission history on disk is not rewritten.
 - **A mission config whose wiring cannot work is refused before anything is minted** (#2312).
   Each step kind declares the outputs it `requires` and `provides`; for every task, the first
   step's requirements must be met by the last step of a task named in `depends_on`, `reads`

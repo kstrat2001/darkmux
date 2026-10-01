@@ -74,13 +74,6 @@ pub fn current_kind_id(id: &str) -> &str {
     }
 }
 
-/// serde `deserialize_with` for a persisted step's `kind`: [`current_kind_id`]
-/// applied on read.
-pub fn deserialize_kind_id<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
-    let id = String::deserialize(d)?;
-    Ok(current_kind_id(&id).to_string())
-}
-
 /// A value a step kind refuses although its type is right: the key (dotted,
 /// under `config`) and the rule it breaks.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -196,11 +189,18 @@ impl ConfigKind {
     /// (`MissionConfig::validate_with`); a record an old run left on disk is
     /// read through [`current_kind_id`] and never written back.
     pub fn replacing(retired_id: &str) -> Option<Self> {
-        match retired_id {
-            "crawl.unit" => Some(Self::DispatchUnit),
-            "crawl.summary" => Some(Self::DispatchSummary),
-            _ => None,
-        }
+        Self::RETIRED.iter().find(|(old, _)| *old == retired_id).map(|(_, new)| *new)
+    }
+
+    /// Every retired registry id and the kind that replaced it (#2430).
+    pub const RETIRED: [(&'static str, ConfigKind); 2] =
+        [("crawl.unit", Self::DispatchUnit), ("crawl.summary", Self::DispatchSummary)];
+
+    /// The exact edit that upgrades a config file naming retired ids, for a
+    /// refusal or a doctor row to print: every old id and its replacement.
+    pub fn retired_fix() -> String {
+        let pairs: Vec<String> = Self::RETIRED.iter().map(|(old, new)| format!("`{old}` to `{}`", new.id())).collect();
+        format!("rename {}", pairs.join(" and "))
     }
 
     /// Every schema issue in `config` (`Null` reads as an empty object)

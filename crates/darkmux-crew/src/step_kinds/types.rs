@@ -823,6 +823,14 @@ pub trait StepKind: Send + Sync {
         &[]
     }
 
+    /// (#2312) For a required data port, the `config` key whose literal value
+    /// can supply it in place of a producer task: `(port name, config key)`.
+    /// The wiring check skips a requirement when the step's own `config` sets
+    /// that key (a path or inline value an operator wrote). Defaults to none.
+    fn config_supplies(&self) -> &'static [(&'static str, &'static str)] {
+        &[]
+    }
+
     /// (#1530 Packet 2) Declares whether this kind is a SIGN-OFF GATE — a
     /// step whose completion should hold the owning Task/Phase/Mission at a
     /// human/frontier-reviewable checkpoint rather than letting the graph's

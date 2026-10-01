@@ -176,6 +176,14 @@ pub(crate) fn all_step_kinds() -> Result<crew::step_kinds::StepKindRegistry> {
     Ok(registry)
 }
 
+/// What every config-validating surface checks a document against: the ids and
+/// declared ports of [`all_step_kinds`]. `mission launch`, `mission config show`,
+/// `darkmux doctor` and the panel runner all build it here, so none can
+/// validate against a narrower kind set than launch resolves (#2312).
+pub(crate) fn kind_catalog() -> Result<darkmux_crew::mission_config::KindCatalog> {
+    Ok(all_step_kinds()?.catalog())
+}
+
 /// `darkmux mission launch <config-id>` entry point. Returns the process
 /// exit code — the coder-phase rows mirror `coder_phase::run`'s own exit
 /// map exactly (#1284 review round 1, must-fix 1):
@@ -1959,7 +1967,7 @@ fn stamp_unit_timeout(steps: &mut BTreeMap<String, crew::types::Step>, timeout_s
         return;
     };
     for step in steps.values_mut() {
-        if step.kind != darkmux_lab::crawl::unit_step::DISPATCH_UNIT_KIND {
+        if step.kind_id() != darkmux_lab::crawl::unit_step::DISPATCH_UNIT_KIND {
             continue;
         }
         // An explicit --timeout wins OUTRIGHT — overwrite even a
@@ -6148,10 +6156,7 @@ mod tests {
             {"name": "draws", "description": "draws per unit", "default": "2"}
         ],
         "phases": [
-            {"id": "p0", "tasks": [{"id": "plan", "steps": [
-                {"id": "plan-step", "kind": "plan.sites", "config": {"rule": "r", "workspace": "w"}}
-            ]}]},
-            {"id": "p1", "tasks": [{"id": "t1", "depends_on": ["plan"], "steps": [
+            {"id": "p1", "tasks": [{"id": "t1", "steps": [
                 {"id": "unit", "kind": "dispatch.unit", "config": {"plan": "p", "unit": "u", "draws": "{{draws}}"}}
             ]}]}
         ]
@@ -7430,6 +7435,22 @@ mod tests {
             let errors = wiring_errors(&value);
             assert!(errors.is_empty(), "built-in `{id}` must validate clean: {errors:?}");
         }
+    }
+
+    /// (#2312) The static shape: a `dispatch.unit` whose own `config.plan` names
+    /// the plan has no producer task and validates clean; with no `config.plan`
+    /// and no producer it is refused.
+    #[test]
+    fn a_unit_with_a_literal_plan_needs_no_producer_task() {
+        let cfg = |config: serde_json::Value| {
+            serde_json::json!({"id": "static-unit", "name": "static", "schema_version": "4.0", "phases": [{"id": "p", "tasks": [
+                {"id": "t", "steps": [{"id": "s", "kind": "dispatch.unit", "config": config}]}
+            ]}]})
+        };
+        assert!(wiring_errors(&cfg(serde_json::json!({"plan": "/p.json", "unit": "u1"}))).is_empty());
+        let errors = wiring_errors(&cfg(serde_json::json!({"unit": "u1"})));
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("dispatch.unit") && errors[0].contains("plan.sites"), "{}", errors[0]);
     }
 
     /// (#2312) Rewire `crawl`'s growth to a `procedural.shell` producer: the

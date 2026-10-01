@@ -948,7 +948,7 @@ fn kind_from_config_snapshot(mission_id: &str, real_task_id: &str, real_step_id:
                 let candidate_step_id =
                     substitute_id_placeholder_prefix(&step_cfg.id, &phase.id, &real_phase_id);
                 if candidate_step_id == real_step_id {
-                    return Some(step_cfg.kind.clone());
+                    return Some(darkmux_crew::step_config::current_kind_id(&step_cfg.kind).to_string());
                 }
             }
         }
@@ -1480,8 +1480,8 @@ pub fn build_mission_graph(
                     match steps.get(step_id) {
                         Some(step) => StepRow {
                             id: step.id.clone(),
-                            label: resolve_step_label(&step.kind, &step.id),
-                            kind: step.kind.clone(),
+                            label: resolve_step_label(step.kind_id(), &step.id),
+                            kind: step.kind_id().to_string(),
                             status: step.status,
                             started_ts: step.started_ts,
                             completed_ts: step.completed_ts,
