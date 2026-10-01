@@ -20,7 +20,9 @@ darkmux release.
   A run whose envelope says `degraded` (a unit cut at its bound, a step that
   completed with partial work, the wall-clock bound) now reads `degraded` instead
   of `complete`, and a lab run whose dispatch escalated on purpose reads
-  `escalated` instead of `error`. A run's status is decided in one place
+  `escalated` instead of `error`. `lab loop` gains an `escalated` verdict and an `escalation` field on its
+  `--json` report for the same reason; `lab run`, `characterize` and `tune` still
+  exit 1 on an escalation (unfinished work is no pass), but label it an escalation. A run's status is decided in one place
   (`MissionOutcomeStatus::decide`) and its exit code is derived from it.
 - **The registered utility model stays loaded across dispatches.** A dispatch
   that does not name it no longer unloads it, and neither do the budget and

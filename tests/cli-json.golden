@@ -552,6 +552,7 @@ LoopReport
   run_id: string
   verdict: Verdict
   dispatch_ok: boolean
+  escalation?: string | null
   verify_passed: boolean | null
   sandbox_changed: boolean | null
   tool_calls: uint32
@@ -1177,7 +1178,7 @@ UtilityModel
   id: string
   loaded: boolean
   n_ctx: uint32 | null
-Verdict = "productive" | "struggled" | "inert-false-pass" | "failed"
+Verdict = "productive" | "struggled" | "inert-false-pass" | "failed" | "escalated"
 VerdictShift = "improved" | "regressed" | "no-change"
 VersionSource = "peer" | "presence" | "unknown"
 

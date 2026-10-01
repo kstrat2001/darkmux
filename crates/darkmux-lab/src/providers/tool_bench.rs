@@ -1299,9 +1299,10 @@ impl WorkloadProvider for ToolBenchProvider {
                 //
                 // It reaches `RunOutcome::verify_passed` (`lab/run.rs`),
                 // NOT `RunOutcome::ok` — this provider sets `RunResult.ok`
-                // unconditionally true, and `lab_cli`'s `lab run` exit
-                // status reads `o.ok`, so `darkmux lab run tool-bench` does
-                // NOT start exiting non-zero. The consumers that DO change:
+                // unconditionally true. `lab run`'s exit status reads
+                // `RunOutcome::passed` (`ok` and no failed verify), so a
+                // failed verify here DOES exit non-zero. The consumers that
+                // also change:
                 // `lab characterize` prints its "verify check failed"
                 // verdict instead of the clean one, `lab tune` counts the
                 // run among its verify failures, and `lab loop` folds

@@ -67,8 +67,12 @@ impl RunOutcome {
     }
 
     /// How this run's dispatch ended, for the surfaces that must tell an
-    /// escalation from an error (F2). Every lab surface reads this instead of
-    /// `ok`, which is false for both.
+    /// escalation from an error (F2). Every lab surface that LABELS a run
+    /// (`characterize`, `tune`, `lab loop`, the per-run notes, the batch
+    /// summary) reads this instead of `ok`, which is false for both. The only
+    /// remaining `ok` readers are [`Self::passed`] (so the exit code) and the
+    /// serve scan of the manifest's `ok`, which reads the manifest's
+    /// `escalation` first.
     pub fn end(&self) -> crate::lab::dispatch_end::DispatchEnd {
         use crate::lab::dispatch_end::DispatchEnd;
         match (&self.escalation, self.ok) {
@@ -109,7 +113,8 @@ pub fn batch_summary(outcomes: &[RunOutcome]) -> String {
 
 /// (#2494, #2982) The process exit code for every lab verb that runs
 /// workloads (`lab run`, `lab characterize`, `lab tune`): 0 when every run
-/// passed, 1 otherwise.
+/// passed, 1 otherwise. An escalated run did not pass (its work is unfinished),
+/// so it exits 1 as well, but it is labeled an escalation, never an error.
 pub fn exit_code(outcomes: &[RunOutcome]) -> i32 {
     if outcomes.iter().all(RunOutcome::passed) {
         0
