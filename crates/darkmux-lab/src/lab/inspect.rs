@@ -93,11 +93,7 @@ pub fn lab_inspect(run_path: &str) -> Result<InspectionReport> {
         let why = darkmux_types::data_version::newer_refusal("run manifest", &file_version, known);
         return Err(anyhow::anyhow!("{}: {why}", manifest_path.display()));
     }
-    if let Some(file_version) = newer_trajectory_version(&run_dir) {
-        let known = darkmux_trajectory::TRAJECTORY_SCHEMA_VERSION;
-        let why = darkmux_types::data_version::newer_refusal("trajectory", &file_version, known);
-        return Err(anyhow::anyhow!("{}: {why}", run_dir.join(darkmux_trajectory::TRAJECTORY_FILE).display()));
-    }
+    checked_run_trajectory(&run_dir)?;
     let workload_id = meta
         .get("workload")
         .and_then(|v| v.as_str())
@@ -116,18 +112,21 @@ pub fn lab_inspect(run_path: &str) -> Result<InspectionReport> {
     Ok(report)
 }
 
-/// (#3035) The `schema_version` of the run's own trajectory header, when the
-/// header names a version newer than this binary reads. Only the first line
-/// is read: the header is always first, and a trajectory can be large.
-fn newer_trajectory_version(run_dir: &Path) -> Option<String> {
-    use std::io::BufRead;
-    let file = fs::File::open(run_dir.join(darkmux_trajectory::TRAJECTORY_FILE)).ok()?;
-    let mut first = String::new();
-    std::io::BufReader::new(file).read_line(&mut first).ok()?;
-    let darkmux_trajectory::TrajectoryEvent::Header(header) = darkmux_trajectory::parse_line(&first)? else { return None };
-    let version = serde_json::Value::String(header.schema_version);
-    darkmux_types::data_version::is_newer(&version, darkmux_trajectory::TRAJECTORY_SCHEMA_VERSION)
-        .then(|| version.as_str().unwrap_or_default().to_string())
+/// (#3035) [`run_trajectory`], refused when the trajectory's header names a
+/// data shape newer than this binary reads: its counts could silently omit
+/// what the newer shape added. THE one check every strict trajectory reader
+/// (`lab inspect`, `run stats`, the loop report) goes through.
+pub fn checked_run_trajectory(run_dir: &Path) -> Result<darkmux_trajectory::TrajectoryFold> {
+    let fold = run_trajectory(run_dir);
+    let known = darkmux_trajectory::TRAJECTORY_SCHEMA_VERSION;
+    if let Some(file_version) = &fold.schema_version {
+        let version = serde_json::Value::String(file_version.clone());
+        if darkmux_types::data_version::is_newer(&version, known) {
+            let why = darkmux_types::data_version::newer_refusal("trajectory", file_version, known);
+            return Err(anyhow::anyhow!("{}: {why}", run_dir.join(darkmux_trajectory::TRAJECTORY_FILE).display()));
+        }
+    }
+    Ok(fold)
 }
 
 /// A run named by a path (it contains a `/`) is that path; a bare id is a run

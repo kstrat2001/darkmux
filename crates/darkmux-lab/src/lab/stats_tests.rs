@@ -623,6 +623,22 @@ fn a_run_without_a_trajectory_is_an_error_not_a_page_of_zeros() {
     assert!(err.to_string().contains("no trajectory events"), "got: {err}");
 }
 
+/// (#3035) `run stats` refuses a trajectory a newer darkmux wrote, as
+/// `run inspect` does: its counts could silently omit what the newer shape
+/// added. One check (`inspect::checked_run_trajectory`) serves both.
+#[test]
+fn stats_refuses_a_trajectory_from_a_newer_darkmux() {
+    let run = tempfile::TempDir::new().unwrap();
+    let flows = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        run.path().join(darkmux_trajectory::TRAJECTORY_FILE),
+        "{\"type\":\"trajectory.header\",\"schema_version\":\"1.1\"}\n{\"type\":\"dispatch.start\",\"ts\":1}\n",
+    )
+    .unwrap();
+    let err = compute_from_dir(run.path(), flows.path()).unwrap_err().to_string();
+    assert!(err.contains("written by a newer darkmux (trajectory `1.1`") && err.contains("Upgrade darkmux."), "{err}");
+}
+
 /// A missing flow directory is not an error — it means no power arm.
 #[test]
 fn a_missing_flow_directory_is_not_an_error() {

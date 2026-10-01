@@ -245,7 +245,7 @@ pub fn analyze_run(
     loop_config: Vec<String>,
 ) -> Result<LoopReport> {
     let dispatch_ok = end.ok();
-    let fold = crate::lab::inspect::run_trajectory(run_dir);
+    let fold = crate::lab::inspect::checked_run_trajectory(run_dir)?;
     let (detectors, tool_calls) = (fold.detectors, fold.tool_calls());
     let (turns, compactions) = (fold.turns(), fold.compactions());
     let sandbox_changed = read_sandbox_changed(&run_dir.join("manifest.json"));

@@ -436,7 +436,7 @@ impl WorkloadProvider for CodingTaskProvider {
         };
         // Every count is the fold of the run's trajectory: the one reading
         // `run stats` and the live tailer use too.
-        let fold = crate::lab::inspect::run_trajectory(run_dir);
+        let fold = crate::lab::inspect::checked_run_trajectory(run_dir)?;
         let turns = fold.turns();
         let compactions = fold.compactions();
         let rest_ms = fold.rest_ms();
