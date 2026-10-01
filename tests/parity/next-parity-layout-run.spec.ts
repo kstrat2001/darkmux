@@ -355,7 +355,7 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
       await expect(page.locator(".mach .stat").first()).toHaveText("idle");
       if (peerSpec) {
         await expect(page.locator(".mach .spec").nth(1), `${label}: the peer's subtitle`).toHaveText(peerSpec);
-        await expect(page.locator(".mach .stat").nth(1), `${label}: the peer's status`).toHaveText(peerSpec === "hardware not reported" ? "offline" : "no signal");
+        await expect(page.locator(".mach .stat").nth(1), `${label}: the peer's status`).toHaveText(peerSpec === "hardware not reported" ? "offline" : "online · not streaming");
         await expect(page.locator(".mach").nth(1).locator(".name .radio-seat"), `${label}: the radio seat icon`).toHaveCount(peerSpec === "hardware not reported" ? 0 : 1);
         // Shown on a desktop; on a phone it gives the name its room (no tooltip on touch).
         if (peerSpec !== "hardware not reported") await expect(page.locator(".mach").nth(1).locator(".name .radio-seat")).toBeVisible({ visible: viewport.width > 560 });

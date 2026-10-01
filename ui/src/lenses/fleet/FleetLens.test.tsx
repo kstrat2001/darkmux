@@ -1650,10 +1650,10 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
     await waitFor(() => expect(document.querySelector('.savings[data-settled="true"]')).not.toBeNull());
     const studio = [...document.querySelectorAll(".mach")].find((c) => c.querySelector(".mach-name")!.textContent === "studio")!;
     // (5.0 R3) Up, but nothing it writes reaches this viewer: never "idle".
-    await waitFor(() => expect(studio.querySelector(".stat")!.textContent).toBe("no signal"));
+    await waitFor(() => expect(studio.querySelector(".stat")!.textContent).toBe("online · not streaming"));
     expect(studio.className).not.toContain("absent");
     expect(studio.textContent).not.toContain("offline");
-    expect(studio.querySelector(".stat")!.getAttribute("title")).toBe("no signal: the card was read, but this machine's flow stream doesn't reach this hub");
+    expect(studio.querySelector(".stat")!.getAttribute("title")).toBe("online · not streaming: its flow stream doesn't reach this hub, so its activity can't be shown here.");
     expect(studio.querySelector('[data-testid="availability-warning"]')).toBeNull();
     expect(studio.textContent).not.toContain("⚠");
     // (5.0 R3) The hero counts only what reaches this viewer, and says so.
@@ -1728,13 +1728,13 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
     await waitFor(() => expect(document.querySelectorAll(".mach")).toHaveLength(3));
   });
 
-  it("an unreachable peer whose liveness the view cannot decide says no signal, never idle", async () => {
+  it("an unreachable peer whose liveness the view cannot decide says not streaming, never idle or online", async () => {
     mockFleetFetch({ view: [unreachableRow("studio", "listener_off", { liveness: "unknown" })], runs: [] });
     renderFleetLens();
     await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
     await waitFor(() => expect(document.querySelector('.savings[data-settled="true"]')).not.toBeNull());
     const card = document.querySelector(".mach")!;
-    expect(card.querySelector(".stat")!.textContent).toBe("no signal");
+    expect(card.querySelector(".stat")!.textContent).toBe("not streaming");
     expect(card.textContent).not.toContain("idle");
     expect(card.className).not.toContain("absent");
   });
