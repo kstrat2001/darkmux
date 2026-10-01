@@ -230,6 +230,7 @@
     #[test]
     fn roles_round_trip() {
         let role = Role {
+            schema_version: None,
             output_schema: None,
             id: "test".into(),
             description: "A test role".into(),
@@ -251,6 +252,7 @@
     #[test]
     fn skills_round_trip() {
         let cap = Skill {
+            schema_version: None,
             id: "coding".into(),
             description: "Writes code".into(),
             keywords: vec![KeywordWeight { keyword: "implement".into(), weight: 1.0 }],

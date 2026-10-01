@@ -190,6 +190,11 @@ pub(crate) struct WorkloadSpec {
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub(crate) struct WorkloadManifest {
+    /// (#3035) Data-shape version of this file (`darkmux_types::data_version::WORKLOAD_SCHEMA_VERSION`).
+    /// Absent means written before the marker existed, which is accepted; a
+    /// newer value is refused by the unknown-key gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<String>,
     pub workload: WorkloadSpec,
 }
 

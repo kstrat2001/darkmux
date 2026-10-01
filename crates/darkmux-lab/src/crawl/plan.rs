@@ -1806,6 +1806,7 @@ mod tests {
 
     fn site_rule() -> Rule {
         Rule {
+            schema_version: None,
             id: "swallowed-error".to_string(),
             kind: RuleKind::Site,
             title: None,
@@ -1833,6 +1834,7 @@ mod tests {
 
     fn read_rule() -> Rule {
         Rule {
+            schema_version: None,
             id: "doc-contradicts-code".to_string(),
             kind: RuleKind::Read,
             title: None,
@@ -1860,6 +1862,7 @@ mod tests {
 
     fn edge_rule() -> Rule {
         Rule {
+            schema_version: None,
             id: "stale-consumer".to_string(),
             kind: RuleKind::Edge,
             title: None,

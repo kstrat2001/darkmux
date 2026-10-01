@@ -451,7 +451,7 @@ mod tests {
 
     fn make_loaded(spec: WorkloadSpec, base_dir: PathBuf) -> LoadedWorkload {
         LoadedWorkload {
-            manifest: WorkloadManifest { workload: spec },
+            manifest: WorkloadManifest { schema_version: None, workload: spec },
             manifest_path: base_dir.join("workload.json"),
             base_dir,
             source: WorkloadSource::OnDisk,

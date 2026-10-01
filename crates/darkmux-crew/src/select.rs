@@ -205,6 +205,7 @@ mod tests {
 
     fn make_role(id: &str, skill_ids: &[&str]) -> Role {
         Role {
+            schema_version: None,
             output_schema: None,
             id: id.into(),
             description: format!("test role {id}"),
@@ -240,6 +241,7 @@ mod tests {
 
     fn skill_with(id: &str, caps: &[(Capability, f32)]) -> Skill {
         Skill {
+            schema_version: None,
             id: id.into(),
             description: format!("test skill {id}"),
             keywords: vec![],

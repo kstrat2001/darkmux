@@ -1,4 +1,5 @@
 {
+  "schema_version": "1.0",
   "_comment": "Phase 5 (#492) quickstart workload — exercises the full lab pipeline end-to-end against the built-in `demo-tiny-py` fixture. Operator does: `scripts/lab-init.sh` (registers built-in fixtures) → `darkmux lab run demo-quickstart` → verify the COW-clone + per-run sandbox + verify-command + manifest-with-baseline_hash all land correctly. No external setup required beyond `python3` being on PATH.",
   "workload": {
     "id": "demo-quickstart",

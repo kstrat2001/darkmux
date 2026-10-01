@@ -27,6 +27,11 @@ pub use darkmux_types::{Capability, CapabilityProfile};
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Skill {
     pub id: String,
+    /// (#3035) Data-shape version of this file (`darkmux_types::data_version::SKILL_SCHEMA_VERSION`).
+    /// Absent means written before the marker existed, which is accepted; a
+    /// newer value is refused by the unknown-key gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<String>,
     pub description: String,
     #[serde(default)]
     pub keywords: Vec<KeywordWeight>,
@@ -108,6 +113,11 @@ impl EscalationKind {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Role {
     pub id: String,
+    /// (#3035) Data-shape version of this file (`darkmux_types::data_version::ROLE_SCHEMA_VERSION`).
+    /// Absent means written before the marker existed, which is accepted; a
+    /// newer value is refused by the unknown-key gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<String>,
     pub description: String,
     #[serde(default)]
     pub skills: Vec<String>, // skill ids
@@ -267,6 +277,11 @@ pub struct CrewMember {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Crew {
     pub id: String,
+    /// (#3035) Data-shape version of this file (`darkmux_types::data_version::CREW_SCHEMA_VERSION`).
+    /// Absent means written before the marker existed, which is accepted; a
+    /// newer value is refused by the unknown-key gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<String>,
     pub description: String,
     #[serde(default)]
     pub members: Vec<CrewMember>,
@@ -918,6 +933,7 @@ mod tests {
 
     fn skill_with(id: &str, caps: &[(Capability, f32)]) -> Skill {
         Skill {
+            schema_version: None,
             id: id.into(),
             description: format!("test skill {id}"),
             keywords: vec![],
@@ -927,6 +943,7 @@ mod tests {
 
     fn make_role(id: &str, skill_ids: &[&str]) -> Role {
         Role {
+            schema_version: None,
             output_schema: None,
             id: id.into(),
             description: format!("test role {id}"),
@@ -1139,6 +1156,7 @@ mod tests {
     #[test]
     fn role_capabilities_skips_nan_infinity_and_negative_weights() {
         let bad_skill = Skill {
+            schema_version: None,
             id: "bad".into(),
             description: "test".into(),
             keywords: vec![],

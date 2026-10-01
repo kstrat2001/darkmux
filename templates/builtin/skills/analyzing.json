@@ -1,4 +1,5 @@
 {
+  "schema_version": "1.0",
   "id": "analyzing",
   "description": "Analyzes data, logs, run outputs, system behavior. Identifies patterns, anomalies, root causes.",
   "keywords": [

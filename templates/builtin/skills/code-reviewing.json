@@ -1,4 +1,5 @@
 {
+  "schema_version": "1.0",
   "id": "code-reviewing",
   "description": "Reviews code for correctness, idioms, security gaps, missing tests. Reads PR diffs; leaves substantive comments.",
   "keywords": [

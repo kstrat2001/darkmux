@@ -1,4 +1,5 @@
 {
+  "schema_version": "1.0",
   "_comment": "The public long-agentic workload. Binds the published pepper-grinder fixture by contract (node-pepper-grinder-js@2.0): clone github.com/kstrat2001/pepper-grinder, `darkmux lab fixture register <path>`, then `darkmux lab run pepper-grinder -p <profile>`. No dependencies; `npm test` runs the 14-test baseline in well under a second, so running the tests is the agent's feedback loop. Passing is a weak bar by design (the untouched suite passes); count tests added.",
   "workload": {
     "id": "pepper-grinder",

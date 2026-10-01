@@ -1,4 +1,5 @@
 {
+  "schema_version": "1.0",
   "name": "demo-tiny-py",
   "version": "1.0",
   "satisfies": "tiny-python-suite@1.0",

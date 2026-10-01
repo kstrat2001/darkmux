@@ -25,6 +25,30 @@ pub enum StateKind {
     Step,
 }
 
+impl StateKind {
+    /// The data-shape version this binary reads and writes for the file
+    /// ([`darkmux_types::data_version`]).
+    pub fn schema_version(self) -> &'static str {
+        use darkmux_types::data_version as v;
+        match self {
+            StateKind::Mission => v::MISSION_SCHEMA_VERSION,
+            StateKind::Phase => v::PHASE_SCHEMA_VERSION,
+            StateKind::Task => v::TASK_SCHEMA_VERSION,
+            StateKind::Step => v::STEP_SCHEMA_VERSION,
+        }
+    }
+
+    /// How a message names the file.
+    fn label(self) -> &'static str {
+        match self {
+            StateKind::Mission => "mission",
+            StateKind::Phase => "phase",
+            StateKind::Task => "task",
+            StateKind::Step => "step",
+        }
+    }
+}
+
 /// A retired top-level key and the key that replaced it.
 struct RetiredKey {
     kind: StateKind,
@@ -56,10 +80,16 @@ pub fn retired_spellings(kind: StateKind, doc: &Value) -> Vec<String> {
     found
 }
 
-/// Parse a state file, refusing one that uses a retired spelling. `path` only
-/// names the file in the refusal.
+/// Parse a state file, refusing one that uses a retired spelling or was
+/// written by a newer darkmux (#3035: its marker is newer than
+/// [`StateKind::schema_version`]). A file with no marker predates it and is
+/// read. `path` only names the file in the refusal.
 pub fn parse_state<T: DeserializeOwned>(kind: StateKind, path: &Path, text: &str) -> Result<T> {
     let doc: Value = serde_json::from_str(text).with_context(|| format!("parsing {}", path.display()))?;
+    if let Some(file_version) = darkmux_types::data_version::newer(&doc, kind.schema_version()) {
+        let why = darkmux_types::data_version::newer_refusal(kind.label(), &file_version, kind.schema_version());
+        bail!("{}: {why}", path.display());
+    }
     let retired = retired_spellings(kind, &doc);
     if !retired.is_empty() {
         bail!("{} uses a retired spelling. {}", path.display(), retired.join("; "));
@@ -187,6 +217,21 @@ mod tests {
         let m: Mission = parse_state(StateKind::Mission, path, &fixed.to_string()).unwrap();
         assert_eq!(m.phase_ids, ["s1", "s2"]);
         assert_eq!(m.status, MissionStatus::Active);
+    }
+
+    /// (#3035) A marker newer than the binary's is refused for every kind,
+    /// before a retired spelling or a field is judged; the same or older loads.
+    #[test]
+    fn a_newer_marker_is_refused_for_every_state_kind() {
+        let path = Path::new("/x/f.json");
+        for kind in [StateKind::Mission, StateKind::Phase, StateKind::Task, StateKind::Step] {
+            let doc = json!({"schema_version": "999.0", "sprint_id": "p"});
+            let err = parse_state::<Value>(kind, path, &doc.to_string()).unwrap_err().to_string();
+            assert!(err.contains(&format!("newer darkmux ({} `999.0`", kind.label())) && err.contains("Upgrade darkmux."), "{err}");
+            assert!(!err.contains("retired"), "the version, not a spelling, is the refusal: {err}");
+            let same = json!({"schema_version": kind.schema_version()});
+            assert!(parse_state::<Value>(kind, path, &same.to_string()).is_ok(), "{kind:?}");
+        }
     }
 
     #[test]

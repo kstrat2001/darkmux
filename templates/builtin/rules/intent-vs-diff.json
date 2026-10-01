@@ -1,4 +1,5 @@
 {
+  "schema_version": "1.0",
   "_comment": "(#2310 P4c) Diff-only rule: no prefilter (every hunk line is a candidate — DESIGN.md \"Hunks are natural windows\"), no `applies_to` (any file type the diff touches). Delivered as a question: the diff carries its own intent (a PR body or intent file), and this rule asks whether the hunk plainly does what that intent says.",
   "id": "intent-vs-diff",
   "kind": "site",

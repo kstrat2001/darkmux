@@ -2901,6 +2901,7 @@ fn residency_resolves_the_tasks_own_role_not_a_hardcoded_crawler() {
 /// (#2310 P4c) `pattern_block`'s confirm-form appendix, all three shapes.
 fn base_rule(id: &str, confirm: darkmux_crew::rules::ConfirmForm) -> darkmux_crew::rules::Rule {
     darkmux_crew::rules::Rule {
+        schema_version: None,
         id: id.to_string(),
         kind: darkmux_crew::rules::RuleKind::Site,
         title: None,

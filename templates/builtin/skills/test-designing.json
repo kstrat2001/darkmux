@@ -1,4 +1,5 @@
 {
+  "schema_version": "1.0",
   "id": "test-designing",
   "description": "Designs tests for new behavior. Chooses assertions, picks edge cases, and writes fixtures.",
   "keywords": [

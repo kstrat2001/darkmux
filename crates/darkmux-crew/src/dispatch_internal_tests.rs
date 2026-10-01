@@ -5999,6 +5999,7 @@
     fn role_wants_agentic_remote_true_for_nonempty_allow() {
         use crate::types::{EscalationContract, Role, ToolPalette};
         let role = Role {
+            schema_version: None,
             output_schema: None,
             id: "code-reviewer".into(),
             description: "test".into(),
@@ -6020,6 +6021,7 @@
     fn role_wants_agentic_remote_false_for_empty_allow() {
         use crate::types::{EscalationContract, Role, ToolPalette};
         let role = Role {
+            schema_version: None,
             output_schema: None,
             id: "pr-reviewer".into(),
             description: "test".into(),
@@ -6531,6 +6533,7 @@
             ..Default::default()
         };
         let role = Role {
+            schema_version: None,
             output_schema: None,
             id: "coder".into(),
             description: "test".into(),
@@ -6560,6 +6563,7 @@
             ..Default::default()
         };
         let role = Role {
+            schema_version: None,
             output_schema: None,
             id: "coder".into(),
             description: "test".into(),

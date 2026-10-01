@@ -195,13 +195,13 @@ pub fn load_config_snapshot(mission_id: &str) -> Result<Option<crate::mission_co
 /// gets the same crash-safety every subsequent lifecycle transition already
 /// has.
 pub fn save_mission(mission: &Mission) -> Result<()> {
-    save_json(&mission_path(&mission.id), mission)
+    save_state(StateKind::Mission, &mission_path(&mission.id), mission)
 }
 
 /// Persist a freshly-minted [`Phase`] (or overwrite an existing one) — see
 /// [`save_mission`]'s doc.
 pub fn save_phase(phase: &Phase) -> Result<()> {
-    save_json(&phase_path(&phase.mission_id, &phase.id), phase)
+    save_state(StateKind::Phase, &phase_path(&phase.mission_id, &phase.id), phase)
 }
 
 /// Directory holding the mission's phase JSONs. Only `phases/` is read: a
@@ -265,7 +265,7 @@ pub fn step_path(mission_id: &str, phase_id: &str, step_id: &str) -> PathBuf {
 /// Persist a Task via the same atomic-rename `save_json` every other
 /// entity uses.
 pub fn save_task(mission_id: &str, task: &crate::types::Task) -> Result<()> {
-    save_json(&task_path(mission_id, &task.phase_id, &task.id), task)
+    save_state(StateKind::Task, &task_path(mission_id, &task.phase_id, &task.id), task)
 }
 
 /// Load a single Task by its fully-qualified (mission, phase, task)
@@ -292,7 +292,7 @@ pub fn load_tasks_for_phase(mission_id: &str, phase_id: &str) -> Result<Vec<crat
 /// belongs to) since `step_path` is scoped by phase, mirroring
 /// `task_path`.
 pub fn save_step(mission_id: &str, phase_id: &str, step: &crate::types::Step) -> Result<()> {
-    save_json(&step_path(mission_id, phase_id, &step.id), step)
+    save_state(StateKind::Step, &step_path(mission_id, phase_id, &step.id), step)
 }
 
 /// Load a single Step by its fully-qualified (mission, phase, step)
@@ -301,7 +301,7 @@ pub fn load_step(mission_id: &str, phase_id: &str, step_id: &str) -> Result<crat
     let path = step_path(mission_id, phase_id, step_id);
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("reading {}", path.display()))?;
-    serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+    parse_state(StateKind::Step, &path, &text)
 }
 
 /// Load every Step under a phase (across all of that phase's Tasks —
@@ -355,6 +355,19 @@ fn now_unix() -> u64 {
 /// failure; without them a crash between rename(2) and the next
 /// dirty-page flush could leave the directory entry inconsistent.
 fn save_json<T: serde::Serialize>(path: &std::path::Path, value: &T) -> Result<()> {
+    let doc = serde_json::to_value(value).with_context(|| format!("serializing to {}", path.display()))?;
+    save_value(path, &doc)
+}
+
+/// [`save_json`] for a state file, stamped with its data-shape marker
+/// (#3035) on every save, so the file always names the binary that wrote it.
+fn save_state<T: serde::Serialize>(kind: StateKind, path: &std::path::Path, value: &T) -> Result<()> {
+    let mut doc = serde_json::to_value(value).with_context(|| format!("serializing to {}", path.display()))?;
+    darkmux_types::data_version::stamp(&mut doc, kind.schema_version());
+    save_value(path, &doc)
+}
+
+fn save_value(path: &std::path::Path, value: &serde_json::Value) -> Result<()> {
     let parent = path.parent().map(|p| p.to_path_buf());
     if let Some(parent) = parent.as_ref() {
         fs::create_dir_all(parent)
@@ -2038,5 +2051,59 @@ mod task_step_storage_tests {
         save_step("m1", "s1", &s).unwrap();
         let tmp_path = step_path("m1", "s1", "st1").with_extension("json.tmp");
         assert!(!tmp_path.exists());
+    }
+
+    // ─── Data-shape markers (#3035) ────────────────────────────────────
+
+    fn on_disk(path: &std::path::Path) -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    /// Every save of a state file writes the marker for its own kind.
+    #[test]
+    #[serial]
+    fn every_state_save_writes_its_schema_version() {
+        use darkmux_types::data_version as v;
+        let _g = CrewGuard::new();
+        let m: Mission = serde_json::from_value(serde_json::json!({"id": "m-ver", "description": "d", "created_ts": 1})).unwrap();
+        save_mission(&m).unwrap();
+        assert_eq!(on_disk(&mission_path("m-ver"))["schema_version"], v::MISSION_SCHEMA_VERSION);
+        let p: Phase =
+            serde_json::from_value(serde_json::json!({"id": "p-ver", "mission_id": "m-ver", "description": "d", "created_ts": 1})).unwrap();
+        save_phase(&p).unwrap();
+        assert_eq!(on_disk(&phase_path(&p.mission_id, &p.id))["schema_version"], v::PHASE_SCHEMA_VERSION);
+        save_task("m-ver", &task("t-ver", "p-ver")).unwrap();
+        assert_eq!(on_disk(&task_path("m-ver", "p-ver", "t-ver"))["schema_version"], v::TASK_SCHEMA_VERSION);
+        save_step("m-ver", "p-ver", &step("st-ver", "t-ver")).unwrap();
+        assert_eq!(on_disk(&step_path("m-ver", "p-ver", "st-ver"))["schema_version"], v::STEP_SCHEMA_VERSION);
+    }
+
+    /// A file with no marker predates it and loads; one written by a newer
+    /// darkmux is refused, for every state kind a loader reads.
+    #[test]
+    #[serial]
+    fn a_state_file_from_a_newer_darkmux_is_refused_and_an_unmarked_one_loads() {
+        let _g = CrewGuard::new();
+        save_task("m-new", &task("t-new", "p-new")).unwrap();
+        save_step("m-new", "p-new", &step("st-new", "t-new")).unwrap();
+        let (tp, sp) = (task_path("m-new", "p-new", "t-new"), step_path("m-new", "p-new", "st-new"));
+        for path in [&tp, &sp] {
+            let mut doc = on_disk(path);
+            doc.as_object_mut().unwrap().remove("schema_version");
+            std::fs::write(path, doc.to_string()).unwrap();
+        }
+        assert!(load_task("m-new", "p-new", "t-new").is_ok(), "pre-marker task loads");
+        assert!(load_step("m-new", "p-new", "st-new").is_ok(), "pre-marker step loads");
+        for path in [&tp, &sp] {
+            let mut doc = on_disk(path);
+            doc["schema_version"] = serde_json::json!("999.0");
+            doc["a_field_from_the_future"] = serde_json::json!(true);
+            std::fs::write(path, doc.to_string()).unwrap();
+        }
+        let err = load_task("m-new", "p-new", "t-new").unwrap_err().to_string();
+        assert!(err.contains("written by a newer darkmux (task `999.0`") && err.contains("Upgrade darkmux."), "{err}");
+        let err = load_step("m-new", "p-new", "st-new").unwrap_err().to_string();
+        assert!(err.contains("written by a newer darkmux (step `999.0`"), "{err}");
+        assert!(load_tasks_for_phase("m-new", "p-new").is_err());
     }
 }

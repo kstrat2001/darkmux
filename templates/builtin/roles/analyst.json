@@ -1,4 +1,5 @@
 {
+  "schema_version": "1.0",
   "id": "analyst",
   "role_family": "specialist",
   "description": "Data/system analyst who reads run outputs, logs, metrics, and writes findings reports. Reads broadly; writes reports but doesn't edit production code.",

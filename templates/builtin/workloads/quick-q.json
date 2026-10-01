@@ -1,4 +1,5 @@
 {
+  "schema_version": "1.0",
   "workload": {
     "id": "quick-q",
     "provider": "prompt",

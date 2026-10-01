@@ -1138,6 +1138,7 @@ mod tests {
         let paths = paths::DarkmuxPaths::under_root(tmp.path().to_path_buf());
         let loaded = LoadedWorkload {
             manifest: WorkloadManifest {
+                schema_version: None,
                 workload: WorkloadSpec {
                     id: "demo".into(),
                     provider: "prompt".into(),
@@ -1179,6 +1180,7 @@ mod tests {
         let paths = paths::DarkmuxPaths::under_root(tmp.path().to_path_buf());
         let loaded = LoadedWorkload {
             manifest: WorkloadManifest {
+                schema_version: None,
                 workload: WorkloadSpec {
                     id: "demo".into(),
                     provider: "prompt".into(),
@@ -1253,6 +1255,7 @@ mod tests {
         // Workload declares the matching requires_fixture.
         let loaded = LoadedWorkload {
             manifest: WorkloadManifest {
+                schema_version: None,
                 workload: WorkloadSpec {
                     id: "demo".into(),
                     provider: "coding-task".into(),
@@ -1317,6 +1320,7 @@ mod tests {
         // lands, this test flips intentionally.
         let loaded = LoadedWorkload {
             manifest: WorkloadManifest {
+                schema_version: None,
                 workload: WorkloadSpec {
                     id: "demo".into(),
                     provider: "coding-task".into(),
@@ -1367,6 +1371,7 @@ mod tests {
         let paths = paths::DarkmuxPaths::under_root(tmp.path().to_path_buf());
         let loaded = LoadedWorkload {
             manifest: WorkloadManifest {
+                schema_version: None,
                 workload: WorkloadSpec {
                     id: "demo".into(),
                     provider: "coding-task".into(),
@@ -1432,6 +1437,7 @@ mod tests {
 
         let loaded = LoadedWorkload {
             manifest: WorkloadManifest {
+                schema_version: None,
                 workload: WorkloadSpec {
                     id: "demo".into(),
                     provider: "coding-task".into(),
@@ -1520,6 +1526,7 @@ mod tests {
 
         let loaded = LoadedWorkload {
             manifest: WorkloadManifest {
+                schema_version: None,
                 workload: WorkloadSpec {
                     id: "demo".into(),
                     provider: "coding-task".into(),
@@ -1578,6 +1585,7 @@ mod tests {
 
         let loaded = LoadedWorkload {
             manifest: WorkloadManifest {
+                schema_version: None,
                 workload: WorkloadSpec {
                     id: "demo".into(),
                     provider: "coding-task".into(),
@@ -2126,6 +2134,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mk = || LoadedWorkload {
             manifest: WorkloadManifest {
+                schema_version: None,
                 workload: WorkloadSpec {
                     id: "demo".into(),
                     provider: "prompt".into(),

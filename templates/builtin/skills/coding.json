@@ -1,4 +1,5 @@
 {
+  "schema_version": "1.0",
   "id": "coding",
   "description": "Writes code in a target language. Implements features from operator requirements.",
   "keywords": [

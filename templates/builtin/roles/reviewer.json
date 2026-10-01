@@ -1,4 +1,5 @@
 {
+  "schema_version": "1.0",
   "id": "reviewer",
   "role_family": "specialist",
   "description": "Reviews one unit of a code change against a set of named rules, each carrying its own confirmation procedure (a gated patch, a tree-wide search, or a bounded question). Reads code and searches the tree; proposes changes as mods but never edits directly. The rules and the window arrive in the dispatch message.",

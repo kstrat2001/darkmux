@@ -1,4 +1,5 @@
 {
+  "schema_version": "1.0",
   "id": "coder",
   "role_family": "specialist",
   "description": "Implements features described by the user. Reads existing code first; follows patterns; runs tests before reporting done.",

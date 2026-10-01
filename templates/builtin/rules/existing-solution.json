@@ -1,4 +1,5 @@
 {
+  "schema_version": "1.0",
   "_comment": "(#2310 P4c) DESIGN.md \"Rule seed: existing solutions\" — the classic catch: the author re-implemented something that already exists. `detect` is a concrete shape (a new fn/type whose name or body matches a utility class); `search` is the mechanical recipe the unit runs verbatim over the whole tree; `compare` is the one bounded inference; delivered as a QUESTION with candidates attached, never a claim. Per-repo tribal knowledge (a curated known-solutions list, operator-maintained) is the future data source for the well-known-package half of this rule; today the model's own training knowledge stands in for it, named explicitly as unconfirmed in the question.",
   "id": "existing-solution",
   "kind": "site",
