@@ -2423,6 +2423,14 @@ body {
   gap: 14px;
   margin-top: 10px;
 }
+/* A lab row's verify word carries its outcome (operator, 2026-10-01): pass
+   green, FAIL red. The dash for "no verify result" keeps the row's dim. */
+.verify-word[data-verify="pass"] {
+  color: var(--good);
+}
+.verify-word[data-verify="fail"] {
+  color: var(--bad);
+}
 /* `.stagehdr` doubles as a TEST HOOK — `tests/e2e/` waits on it to know a
    stage region actually mounted, which is why `MachineLens` carries it
    alongside its own `.machine-lens__hdr`. Those two currently declare the

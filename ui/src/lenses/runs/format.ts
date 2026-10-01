@@ -72,29 +72,49 @@ export function runStatusLabel(r: Run): string {
   return r.abandoned_reason === "aborted" ? "aborted" : "no ending recorded";
 }
 
-/** viewer.html: `function runSubtitle(r, showMachine)`. `machine` is the
- * machine's display label (`runMachineLabels`), or `null` to leave it out. */
-export function runSubtitle(r: Run, machine: string | null): string {
-  const bits: string[] = [];
-  if (r.workload) bits.push(r.workload);
-  const verify = verifyLabel(r);
-  if (verify) bits.push(verify);
-  if (r.role) bits.push(r.role);
-  if (r.model) bits.push(shortModel(r.model));
-  if (r.route) bits.push(`via ${r.route}`);
-  if (machine) bits.push(machine);
-  return bits.join(" · ");
-}
-
 /** A lab row's verify outcome, in three states (#2494): what the workload's
  * own tests said is a different fact from how the dispatch ended (`status`).
- * The twin of `src/run_list.rs::verify_label`. A lab run with no manifest yet
- * names no workload, and says nothing about verify. */
-function verifyLabel(r: Run): string | null {
+ * `none` is a lab run naming a workload with no verify result recorded. */
+type VerifyOutcome = "pass" | "fail" | "none";
+
+/** The word each outcome reads as. The twin of `src/run_list.rs::verify_label`. */
+const VERIFY_WORD: Record<VerifyOutcome, string> = { pass: "pass", fail: "FAIL", none: "\u2014" };
+
+/** One `·`-separated piece of a row's subtitle. A verify piece carries its
+ * outcome, so the board can color the word without re-reading the text. */
+export interface SubtitlePart {
+  text: string;
+  verify?: { outcome: VerifyOutcome; word: string };
+}
+
+/** viewer.html: `function runSubtitle(r, showMachine)`, as parts. `machine` is
+ * the machine's display label (`runMachineLabels`), or `null` to leave it out. */
+export function runSubtitleParts(r: Run, machine: string | null): SubtitlePart[] {
+  const parts: SubtitlePart[] = [];
+  if (r.workload) parts.push({ text: r.workload });
+  const outcome = verifyOutcome(r);
+  if (outcome) parts.push({ text: `verify ${VERIFY_WORD[outcome]}`, verify: { outcome, word: VERIFY_WORD[outcome] } });
+  if (r.role) parts.push({ text: r.role });
+  if (r.model) parts.push({ text: shortModel(r.model) });
+  if (r.route) parts.push({ text: `via ${r.route}` });
+  if (machine) parts.push({ text: machine });
+  return parts;
+}
+
+/** The subtitle as one line of text: the parts, `·`-separated. */
+export function runSubtitle(r: Run, machine: string | null): string {
+  return runSubtitleParts(r, machine)
+    .map((p) => p.text)
+    .join(" · ");
+}
+
+/** A lab run with no manifest yet names no workload, and says nothing about
+ * verify; a non-lab row never does. */
+function verifyOutcome(r: Run): VerifyOutcome | null {
   if (r.kind !== "lab") return null;
-  if (r.verify_passed === true) return "verify pass";
-  if (r.verify_passed === false) return "verify FAIL";
-  return r.workload ? "verify \u2014" : null;
+  if (r.verify_passed === true) return "pass";
+  if (r.verify_passed === false) return "fail";
+  return r.workload ? "none" : null;
 }
 
 /** The machine a run names: its uid when the row carries one, else its name. */

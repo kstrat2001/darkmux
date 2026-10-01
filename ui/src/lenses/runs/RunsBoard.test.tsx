@@ -117,6 +117,30 @@ describe("RunsBoard", () => {
     expect(row).toHaveAttribute("data-nav", "1");
   });
 
+  // (operator, 2026-10-01) A lab row's verify word carries its outcome's
+  // color: "pass" green, "FAIL" red. "—" (no verify result was recorded) is
+  // neither good nor bad news and stays dim. The row's text is unchanged, so
+  // the parity goldens, which read text, do not move.
+  it("colors a lab row's verify word: pass green, FAIL red, the dash left dim", async () => {
+    mockFetch(true, true, {}, [
+      { id: "lab-pass", kind: "lab", status: "complete", tracked: true, updated_ts: 403, workload: "pepper-grinder", verify_passed: true },
+      { id: "lab-fail", kind: "lab", status: "error", tracked: true, updated_ts: 402, workload: "pepper-grinder", verify_passed: false },
+      { id: "lab-none", kind: "lab", status: "abandoned", tracked: true, updated_ts: 401, workload: "pepper-grinder" },
+    ]);
+    renderBoard();
+    await waitFor(() => expect(screen.getByText("lab-none")).toBeInTheDocument());
+    const rowOf = (id: string) => screen.getByText(id).closest(".labrunrow")!;
+    const word = (id: string) => rowOf(id).querySelector("[data-verify]");
+    expect(word("lab-pass")).toHaveAttribute("data-verify", "pass");
+    expect(word("lab-pass")).toHaveTextContent(/^pass$/);
+    expect(word("lab-fail")).toHaveAttribute("data-verify", "fail");
+    expect(word("lab-fail")).toHaveTextContent(/^FAIL$/);
+    expect(word("lab-none")).toBeNull();
+    expect(rowOf("lab-fail").textContent).toContain("pepper-grinder · verify FAIL");
+    expect(rowOf("lab-pass").textContent).toContain("pepper-grinder · verify pass");
+    expect(rowOf("lab-none").textContent).toContain("pepper-grinder · verify \u2014");
+  });
+
   it("a row with NO destination renders no chevron and stays inert", async () => {
     // Untracked mission with no dispatch_id, `runDestination` -> "none".
     mockFetch(true, true, {}, [
