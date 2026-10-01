@@ -1404,6 +1404,17 @@ darkmux release.
 
 ### Added (4.0)
 
+- **A fleet card shows only facts about its own machine; the console names the
+  machine it runs on.** The grant line ("runs fast") is gone from the fleet
+  cards: what a peer lets the serving machine do is a relationship, not a card
+  fact, and the same fleet must read the same from any server. The radio icon
+  stays, now meaning "serves radio": the machine card (schema 1.2) carries
+  `serves_radio`, true when the machine's `fleet.accept_work` grants `radio-host`
+  to at least one peer (never naming who); a 1.1 card states nothing and draws no
+  icon. `/fleet/view`'s `accepts` is unchanged, for `machine list` and
+  `profile list`. The console's command line now reads `<machine> $ darkmux ...`,
+  naming the machine the daemon runs the command on.
+
 - **`darkmux profile list --machine <peer>` and `--remote` list the profiles a
   peer lets this machine use.** `--machine <peer>` prints each profile the
   peer's allow-list grants this machine, with the models it runs and its

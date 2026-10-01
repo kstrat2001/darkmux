@@ -120,6 +120,17 @@ describe("ConsolePanel", () => {
     expect(screen.getByRole("switch", { name: /--remote/ })).toHaveAttribute("aria-checked", "false");
   });
 
+  // A panel runs on the machine serving the viewer; the command line says
+  // which, so a relationship command's subject ("this machine") is explicit.
+  it("the command line names the machine the daemon runs it on, and falls back to a bare $", async () => {
+    const fetchMock = vi.fn((url: string) =>
+      Promise.resolve(url.startsWith("/machine/specs") ? jsonResponse({ machine_id: "MacBook-Pro" }) : jsonResponse(RUN_LIST_DEFAULT_BODY)),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    renderPanel("");
+    await waitFor(() => expect(screen.getByText(/MacBook-Pro \$ darkmux run list/)).toBeInTheDocument());
+  });
+
   it("selecting doctor (manual-only) does NOT auto-fetch — shows the not-yet-run placeholder", async () => {
     const fetchMock = vi.fn((url: string) => Promise.resolve(url.startsWith("/runs") ? runsJson() : jsonResponse(MISSION_STATUS_BODY)));
     vi.stubGlobal("fetch", fetchMock);
@@ -198,12 +209,13 @@ describe("ConsolePanel", () => {
     // Three CLI panels have now been fetched once each (run-list on the
     // default landing, role-list, mission-status) — this is the baseline
     // every further tab switch should reuse rather than add to.
-    const callsAfterAllVisited = fetchMock.mock.calls.length;
+    const panelCalls = () => fetchMock.mock.calls.filter(([u]) => String(u).startsWith("/panel/")).length;
+    const callsAfterAllVisited = panelCalls();
 
     fireEvent.click(screen.getByText("role list"));
     await waitFor(() => expect(screen.getByText("roles here")).toBeInTheDocument());
 
-    expect(fetchMock.mock.calls.length).toBe(callsAfterAllVisited);
+    expect(panelCalls()).toBe(callsAfterAllVisited);
   });
 
   it("mission-status stays selectable and unaffected by the default's change", async () => {

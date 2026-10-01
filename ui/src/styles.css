@@ -3906,7 +3906,7 @@ body {
   opacity: 0.5;
   font-style: italic;
 }
-/* The radio seat a peer grants (`components/RadioSeatIcon.tsx`), beside the
+/* The radio seat a machine serves (`components/RadioSeatIcon.tsx`), beside the
    HUB badge in the card's name row: never shrinks, and under the row's own
    height so it changes no box's size. */
 .radio-seat {
@@ -3920,13 +3920,9 @@ body {
   width: 100%;
   height: 100%;
 }
-/* What the peer lets this machine do rides the hardware line. Beside the
-   phone's tube there is no room for it (it would clip to "·…"), so it is
-   dropped there; the full line stays in the tooltip. The radio seat icon
-   goes with it: in the name row it cut the machine's name to a few letters,
-   and a touch screen shows no tooltip to explain it. */
+/* Beside the phone's tube the icon cut the machine's name to a few letters,
+   and a touch screen shows no tooltip to explain it, so it is dropped there. */
 @media (max-width: 560px) {
-  .mach .spec__grant,
   .mach .name .radio-seat {
     display: none;
   }

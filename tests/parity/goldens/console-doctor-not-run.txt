@@ -27,7 +27,7 @@ role list
 config list
 lab fixture list
 doctor
-$ darkmux doctor
+MacBook-Pro $ darkmux doctor
 run
 not run yet — this panel probes the machine, so it runs only when you ask.
 

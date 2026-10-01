@@ -51,7 +51,7 @@ use std::time::Duration;
 /// The card's own shape version. Minor for an added field a reader can
 /// ignore, major for a rename or retype. A peer whose card is on another
 /// major is shown as "card unavailable", never guessed at.
-pub const CARD_SCHEMA_VERSION: &str = "1.1";
+pub const CARD_SCHEMA_VERSION: &str = "1.2";
 
 /// What darkmux does at an endpoint (darkmux's own action, never a location
 /// or a cost), for a model, and for a profile as the sum of its models.
@@ -340,6 +340,15 @@ pub struct MachineCard {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub hosts_fleet_redis: Option<bool>,
+    /// Whether this machine serves radio: its `fleet.accept_work` grants the
+    /// `radio-host` role to at least one peer. A fact about this machine alone,
+    /// so it reads the same from every machine that views this card; it never
+    /// names who is granted (that is a relationship, which the card does not
+    /// carry). Absent on a card that predates the field (schema 1.1), or when
+    /// the allow-list could not be read: not stated, never guessed `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub serves_radio: Option<bool>,
     /// The fleet defaults this machine hands out. Absent unless `fleet_mode`
     /// is `hub`; read only through [`MachineCard::hub_defaults`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -484,6 +493,14 @@ pub(crate) fn card_governor(now: Option<&HostSampleNow>, cfg: &PowerPolicyConfig
     }
 }
 
+/// The role a peer is granted to have this machine answer its radio questions.
+const RADIO_HOST_ROLE: &str = "radio-host";
+
+/// Whether any peer in the allow-list may dispatch the `radio-host` role here.
+fn serves_radio(list: &std::collections::BTreeMap<String, darkmux_types::config::AcceptWorkEntry>) -> bool {
+    list.values().any(|e| e.roles.as_ref().is_some_and(|r| r.iter().any(|role| role == RADIO_HOST_ROLE)))
+}
+
 /// Whether the Redis this machine is configured to use is on this machine:
 /// Redis is on here, and its host is loopback or this machine's own node.
 /// Pure over its inputs so the decision is testable without a provider.
@@ -551,6 +568,7 @@ pub(crate) fn gather_local_card() -> MachineCard {
             darkmux_types::config_access::redis_host().as_deref(),
             || darkmux_fleet::configured_provider().ok().and_then(|p| p.local_node().ok()),
         )),
+        serves_radio: darkmux_fleet::read_user_allow_list().ok().map(|list| serves_radio(&list)),
         fleet_defaults: card_fleet_defaults(fleet_mode),
         generated_at_ms: crate::current_millis(),
         gather_ms: started.elapsed().as_millis() as u64,
@@ -1034,6 +1052,7 @@ pub(crate) mod tests {
             },
             fleet_mode: Some(DeclaredFleetMode::Hub),
             hosts_fleet_redis: Some(true),
+            serves_radio: Some(true),
             fleet_defaults: Some(CardFleetDefaults {
                 version: FLEET_DEFAULTS_VERSION,
                 radio: CardRadioDefaults { answerer_profile: Some("deep@studio".into()) },
@@ -1110,6 +1129,47 @@ pub(crate) mod tests {
         assert!(card.hub_defaults().is_none());
         let listener: ListenerCard = serde_json::from_str(&read("listener-card-1.0.json")).expect("a 1.0 listener card parses");
         assert!(matches!(listener.grant, CardGrant::Listed { .. }));
+    }
+
+    // ── serves_radio (card schema 1.2) ────────────────────────────────
+
+    fn entry(roles: Option<Vec<&str>>) -> darkmux_types::config::AcceptWorkEntry {
+        darkmux_types::config::AcceptWorkEntry {
+            roles: roles.map(|r| r.into_iter().map(String::from).collect()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_machine_serves_radio_when_any_peer_may_dispatch_radio_host() {
+        let mut list = std::collections::BTreeMap::new();
+        assert!(!serves_radio(&list), "an empty allow-list serves no radio");
+        list.insert("a".to_string(), entry(None));
+        list.insert("b".to_string(), entry(Some(vec!["coder"])));
+        assert!(!serves_radio(&list), "other roles and no roles do not count");
+        list.insert("c".to_string(), entry(Some(vec!["coder", "radio-host"])));
+        assert!(serves_radio(&list), "one peer granted radio-host is enough");
+    }
+
+    /// The card says THAT the machine serves radio, never to whom.
+    #[test]
+    fn the_card_carries_the_flag_and_no_peer_names() {
+        let card = MachineCard { serves_radio: Some(true), ..sample_card() };
+        let json = serde_json::to_value(&card).unwrap();
+        assert_eq!(json["serves_radio"], serde_json::json!(true));
+        let absent = serde_json::to_value(MachineCard { serves_radio: None, ..sample_card() }).unwrap();
+        assert!(absent.get("serves_radio").is_none(), "not stated is absent, not false");
+    }
+
+    /// A 1.1 card from a peer on the previous build states nothing about radio.
+    #[test]
+    fn a_1_1_card_still_parses_and_states_no_radio() {
+        let raw = std::fs::read_to_string(fixtures_dir().join("machine-card-1.1.json")).unwrap();
+        let card: MachineCard = serde_json::from_str(&raw).expect("a 1.1 card parses");
+        assert_eq!(card.card_schema_version, "1.1");
+        assert_eq!(card.serves_radio, None);
+        let listener = std::fs::read_to_string(fixtures_dir().join("listener-card-1.1.json")).unwrap();
+        serde_json::from_str::<ListenerCard>(&listener).expect("a 1.1 listener card parses");
     }
 
     /// A schema with its object keys sorted, so its hash does not move with

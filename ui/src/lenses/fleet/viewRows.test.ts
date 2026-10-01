@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { grantOf, grantWords, machineIsHub, outcomeLine, rowFacts, rowIsHub, rowStanding, rowUid } from "./viewRows";
 import type { AcceptsState } from "../../types/generated/AcceptsState";
+import { machineIsHub, rowServesRadio, outcomeLine, rowFacts, rowIsHub, rowStanding, rowUid } from "./viewRows";
 import type { CardOutcome } from "../../types/generated/CardOutcome";
 import type { FleetMachine } from "../../types/generated/FleetMachine";
 import type { MachineCard } from "../../types/generated/MachineCard";
@@ -96,40 +96,6 @@ describe("outcomeLine: one fixed phrase per outcome", () => {
   });
 });
 
-describe("grantOf: what a peer lets this machine do", () => {
-  const accepts = (over: Partial<Extract<AcceptsState, { state: "granted" }>["accepts"]>): AcceptsState => ({
-    state: "granted",
-    accepts: { peer_name: "laptop", profiles: [], roles: [], images: [], workspace: false, ...over },
-  });
-
-  it("names the profiles it runs and the roles it takes here, the radio seat as a flag", () => {
-    expect(grantOf(accepts({ profiles: ["diff-review"], roles: ["radio-host", "reviewer"] }))).toEqual({
-      text: "runs diff-review · reviewer here",
-      radio: true,
-    });
-  });
-
-  it("a grant of only the radio seat has no text, just the flag", () => {
-    expect(grantOf(accepts({ roles: ["radio-host"] }))).toEqual({ text: null, radio: true });
-  });
-
-  it("an empty grant says so rather than showing nothing", () => {
-    expect(grantOf(accepts({}))).toEqual({ text: "accepts nothing", radio: false });
-  });
-
-  it("every other state shows no grant", () => {
-    for (const state of ["not_listed", "this_machine", "unknown"] as const) {
-      expect(grantOf({ state }), state).toBeNull();
-    }
-  });
-
-  it("the full line spells the radio seat out in words, for the tooltip", () => {
-    expect(grantWords({ text: "runs diff-review", radio: true })).toBe("runs diff-review · radio-host here");
-    expect(grantWords({ text: null, radio: true })).toBe("radio-host here");
-    expect(grantWords({ text: "accepts nothing", radio: false })).toBe("accepts nothing");
-  });
-});
-
 describe("rowStanding: the view's liveness, and a card it read is proof of life", () => {
   it("the reported case: an available card with no beat is online, not offline", () => {
     expect(rowStanding(row({ liveness: "no_beat" }))).toBe("online");
@@ -149,28 +115,19 @@ describe("rowStanding: the view's liveness, and a card it read is proof of life"
 });
 
 describe("rowFacts", () => {
-  it("an available peer shows its hardware and its grant, with no status note", () => {
+  it("an available peer shows its hardware, with no status note and no grant: a card states only its own machine", () => {
     const facts = rowFacts(
-      row({ accepts: { state: "granted", accepts: { peer_name: "laptop", profiles: ["diff-review"], roles: [], images: [], workspace: false } } }),
+      row({ accepts: { state: "granted", accepts: { peer_name: "laptop", profiles: ["diff-review"], roles: ["radio-host"], images: [], workspace: false } } }),
       new Set(),
       null,
     );
-    expect(facts).toMatchObject({ spec: "Apple M1 Max · 32 GB", note: null, grant: { text: "runs diff-review", radio: false }, standing: "online", isSelf: false });
-  });
-
-  it("this machine's own row shows no grant", () => {
-    const facts = rowFacts(
-      row({ is_this_machine: true, accepts: { state: "granted", accepts: { peer_name: "x", profiles: ["p"], roles: [], images: [], workspace: false } } }),
-      new Set(),
-      null,
-    );
-    expect(facts.grant).toBeNull();
-    expect(facts.isSelf).toBe(true);
+    expect(facts).toMatchObject({ spec: "Apple M1 Max · 32 GB", note: null, standing: "online", isSelf: false });
+    expect(facts).not.toHaveProperty("grant");
   });
 
   it("a peer the view could not reach carries the typed reason, with no hardware line", () => {
     const facts = rowFacts(row({ card: { state: "unreachable", reason: "listener_off", detail: null }, liveness: "no_beat" }), new Set(), null);
-    expect(facts).toMatchObject({ spec: "", note: "not listening", standing: "offline", grant: null });
+    expect(facts).toMatchObject({ spec: "", note: "not listening", standing: "offline" });
   });
 
   it("a card read from the machine is labeled with the machine's own current name, not the roster id (#3028)", () => {
@@ -279,5 +236,19 @@ describe("the declared hub (#3022)", () => {
     expect(machineIsHub([declaring("hub", { is_this_machine: true })], null, true)).toBe(true);
     expect(machineIsHub([declaring("hub", { is_this_machine: true })], "UID-STUDIO", false)).toBe(false);
     expect(machineIsHub(null, "UID-STUDIO", false)).toBe(false);
+  });
+});
+
+describe("rowServesRadio: only the row's own card says it", () => {
+  const granted: AcceptsState = { state: "granted", accepts: { peer_name: "laptop", profiles: [], roles: ["radio-host"], images: [], workspace: false } };
+  it("true only when the card states serves_radio", () => {
+    const r = row({ accepts: granted });
+    expect(rowServesRadio(r)).toBe(false);
+    if (r.card.state !== "available") throw new Error("read");
+    expect(rowServesRadio({ ...r, accepts: { state: "unknown" }, card: { ...r.card, card: { ...r.card.card, serves_radio: true } } })).toBe(true);
+    expect(rowServesRadio({ ...r, card: { ...r.card, card: { ...r.card.card, serves_radio: false } } })).toBe(false);
+  });
+  it("false for a card that was not read", () => {
+    expect(rowServesRadio(row({ card: { state: "unreachable", reason: "listener_off", detail: null } }))).toBe(false);
   });
 });

@@ -1,15 +1,13 @@
 /**
  * The fleet lens's reading of `GET /fleet/view`: one machine row in, the
  * facts a card shows out. Every closed set the view sends (card outcome,
- * unreachable reason, unavailable reason, liveness, grant) is matched
+ * unreachable reason, unavailable reason, liveness) is matched
  * exhaustively here, once, so a card never guesses what a row means.
  *
  * Nothing in this file renders a node address, a machine uid, a token or the
  * peer's own `detail` sentence: an outcome line is a fixed phrase per variant.
  */
 
-import type { AcceptsState } from "../../types/generated/AcceptsState";
-import type { CardAccepts } from "../../types/generated/CardAccepts";
 import type { CardOutcome } from "../../types/generated/CardOutcome";
 import type { FleetMachine } from "../../types/generated/FleetMachine";
 import type { Liveness } from "../../types/generated/Liveness";
@@ -93,49 +91,6 @@ export function outcomeLine(outcome: CardOutcome): string | null {
   }
 }
 
-/** The role a peer grants when it answers this machine's radio questions. */
-const RADIO_HOST_ROLE = "radio-host";
-
-/** What a peer lets this machine do: its profiles and roles as one compact
- * line, with the radio seat pulled out as a flag so the card draws it as an
- * icon. `text` is `null` when the radio seat is the whole grant. */
-export interface Grant {
-  text: string | null;
-  radio: boolean;
-}
-
-/** The grant the view holds for a peer; `null` when there is none to show
- * (this machine's own row, no entry, unknown). */
-export function grantOf(accepts: AcceptsState): Grant | null {
-  switch (accepts.state) {
-    case "granted":
-      return grantFrom(accepts.accepts);
-    case "not_listed":
-    case "this_machine":
-    case "unknown":
-      return null;
-    default: {
-      const unhandled: never = accepts;
-      return unhandled;
-    }
-  }
-}
-
-function grantFrom(a: CardAccepts): Grant {
-  const radio = a.roles.includes(RADIO_HOST_ROLE);
-  const parts: string[] = [];
-  if (a.profiles.length > 0) parts.push(`runs ${a.profiles.join(", ")}`);
-  for (const role of a.roles) if (role !== RADIO_HOST_ROLE) parts.push(`${role} here`);
-  if (parts.length > 0) return { text: parts.join(" · "), radio };
-  return { text: radio ? null : "accepts nothing", radio };
-}
-
-/** The grant in words, the radio seat spelled out: the line's tooltip. */
-export function grantWords(g: Grant): string {
-  const radio = g.radio ? `${RADIO_HOST_ROLE} here` : null;
-  return [g.text, radio].filter((p): p is string => p !== null).join(" · ");
-}
-
 function livenessStanding(liveness: Liveness): Standing {
   switch (liveness) {
     case "live":
@@ -179,6 +134,13 @@ export function rowIsHub(row: FleetMachine): boolean {
   return row.card.state === "available" && row.card.card.fleet_mode === "hub";
 }
 
+/** Whether the row's own card says its machine serves radio (`serves_radio`:
+ * its allow-list grants `radio-host` to a peer). Absent on a card from an older
+ * darkmux, and on a card that was not read: nothing is stated, so no icon. */
+export function rowServesRadio(row: FleetMachine): boolean {
+  return row.card.state === "available" && row.card.card.serves_radio === true;
+}
+
 /** Whether the machine a page shows is one the view's rows say declares
  * `hub`. `isLocal`: the page shows THIS machine, whose row is the view's own.
  * Any other machine is found by the hardware uid its card carries or by its
@@ -209,14 +171,15 @@ export interface RowFacts {
   /** Why there is no hardware line, as the outcome line; `null` when the
    * card was read. */
   note: string | null;
-  /** What the peer lets this machine do; `null` for this machine's own row. */
-  grant: Grant | null;
   standing: Standing;
   /** The view's own answer on whether the machine's presence beat is live. */
   liveness: Liveness;
   isSelf: boolean;
   /** The row's card declares `fleet.mode hub`. */
   hub: boolean;
+  /** The row's card says its machine serves radio (a fact about that machine
+   *  alone, never about the machine serving this viewer). */
+  servesRadio: boolean;
 }
 
 /** Whether this viewer is receiving the row's machine. A view whose presence
@@ -266,10 +229,10 @@ export function rowFacts(
     names: [...new Set([specs?.machine_id, row.entry?.id].filter((n): n is string => !!n))],
     spec: specs ? specsLine(specs) : "",
     note: outcomeLine(row.card),
-    grant: row.is_this_machine ? null : grantOf(row.accepts),
     standing: rowStanding(row),
     liveness: row.liveness,
     isSelf: row.is_this_machine,
     hub: rowIsHub(row),
+    servesRadio: rowServesRadio(row),
   };
 }

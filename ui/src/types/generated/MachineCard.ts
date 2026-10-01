@@ -47,6 +47,15 @@ fleet_mode?: DeclaredFleetMode,
  */
 hosts_fleet_redis?: boolean, 
 /**
+ * Whether this machine serves radio: its `fleet.accept_work` grants the
+ * `radio-host` role to at least one peer. A fact about this machine alone,
+ * so it reads the same from every machine that views this card; it never
+ * names who is granted (that is a relationship, which the card does not
+ * carry). Absent on a card that predates the field (schema 1.1), or when
+ * the allow-list could not be read: not stated, never guessed `false`.
+ */
+serves_radio?: boolean, 
+/**
  * The fleet defaults this machine hands out. Absent unless `fleet_mode`
  * is `hub`; read only through [`MachineCard::hub_defaults`].
  */

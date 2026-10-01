@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { machActive, specOf, buildFleetCard, busiestExecution, isStrictlyBusier, specUnknownLabel, specLine, cardFace, notStreamedNames, statusReason } from "./cards";
+import { machActive, specOf, buildFleetCard, busiestExecution, isStrictlyBusier, specUnknownLabel, cardFace, notStreamedNames, statusReason } from "./cards";
 import type { RowFacts } from "./viewRows";
 import type { MachineSpecsResponse } from "../../types/generated/MachineSpecsResponse";
 import type { PresenceBeat } from "../../types/generated/PresenceBeat";
@@ -23,7 +23,7 @@ function beat(overrides: Partial<PresenceBeat>): PresenceBeat {
 
 /** A fleet-view row's facts, as `viewRows.ts::rowFacts` would hand them to a card. */
 function rowFactsFor(overrides: Partial<RowFacts> = {}): RowFacts {
-  return { uid: "u1", known: true, name: null, names: [], spec: "", note: null, grant: null, standing: "online", liveness: "live", isSelf: false, hub: false, ...overrides };
+  return { uid: "u1", known: true, name: null, names: [], spec: "", note: null, standing: "online", liveness: "live", isSelf: false, hub: false, servesRadio: false, ...overrides };
 }
 
 function machineSpecs(overrides: Partial<MachineSpecsResponse> & Pick<MachineSpecsResponse, "machine_id">): MachineSpecsResponse {
@@ -1202,13 +1202,12 @@ describe("cardFace (#2958)", () => {
 });
 
 describe("buildFleetCard: a machine the fleet view holds", () => {
-  it("reads its hardware line, grant and standing from its row, not from presence", () => {
+  it("reads its hardware line and standing from its row, not from presence", () => {
     // No beat, no records: the reported case. Presence says nothing about
     // this peer; the view read its card.
-    const row = rowFactsFor({ uid: "studio", known: false, name: "studio", spec: "Apple M1 Max · 32 GB", grant: { text: "runs diff-review", radio: false }, standing: "online" });
+    const row = rowFactsFor({ uid: "studio", known: false, name: "studio", spec: "Apple M1 Max · 32 GB", standing: "online" });
     const card = buildFleetCard([], new Map(), null, new Set(), false, "studio", true, T_MAX, row);
-    expect(card).toMatchObject({ name: "studio", spec: "Apple M1 Max · 32 GB", grant: { text: "runs diff-review", radio: false }, standing: "online", absent: false, stat: "idle" });
-    expect(specLine(card)).toBe("Apple M1 Max · 32 GB · runs diff-review");
+    expect(card).toMatchObject({ name: "studio", spec: "Apple M1 Max · 32 GB", standing: "online", absent: false, stat: "idle" });
   });
 
   it("an unreachable peer carries the view's status note and no hardware", () => {

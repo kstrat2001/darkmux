@@ -27,7 +27,7 @@ role list
 config list
 lab fixture list
 doctor
-$ darkmux config list
+MacBook-Pro $ darkmux config list
 captured 20:54:23
 · 3ms
 re-run

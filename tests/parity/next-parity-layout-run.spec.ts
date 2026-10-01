@@ -333,17 +333,17 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
 }
 
 // The fleet view's rows draw the same card: a peer the daemon read (hardware
-// and what it lets this machine do, on the subtitle line) and one it could
-// not read (a typed status on that line) are the size of this machine's own
-// card, in every state.
+// on the subtitle line) and one it could not read (a typed status on that
+// line) are the size of this machine's own card, in every state. The peer
+// row carries a grant for the serving machine, which the card must not show; it
+// states `serves_radio` itself, which draws the radio icon.
 for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
   test(`fleet card: a peer the view read, and one it could not, keep this machine's card size (${vpName})`, async ({ browser }) => {
     const finished = STATES.find((s) => s.id === "finished");
     const heights = [];
     for (const [label, rows, peerSpec] of [
       ["self alone", [SELF_ROW], null],
-      // The radio seat in the grant is an icon, not words, and adds no height.
-      ["peer read, with a grant, no beat", [SELF_ROW, PEER_ROW], "Apple M1 Max · 32 GB · runs diff-review"],
+      ["peer read, with a grant, no beat", [SELF_ROW, PEER_ROW], "Apple M1 Max · 32 GB"],
       ["peer unreachable, not listening", [SELF_ROW, OFFLINE_ROW], "hardware not reported"],
     ]) {
       const ctx = await browser.newContext({ viewport, timezoneId: "UTC", locale: "en-US" });
@@ -356,7 +356,7 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
       if (peerSpec) {
         await expect(page.locator(".mach .spec").nth(1), `${label}: the peer's subtitle`).toHaveText(peerSpec);
         await expect(page.locator(".mach .stat").nth(1), `${label}: the peer's status`).toHaveText(peerSpec === "hardware not reported" ? "offline" : "online");
-        await expect(page.locator(".mach").nth(1).locator(".name .radio-seat"), `${label}: the radio seat icon`).toHaveCount(peerSpec === "hardware not reported" ? 0 : 1);
+        await expect(page.locator(".mach").nth(1).locator(".name .radio-seat"), `${label}: the radio icon`).toHaveCount(peerSpec === "hardware not reported" ? 0 : 1);
         // The count line below the status says why (the read card's variant).
         if (peerSpec !== "hardware not reported") await expect(page.locator(".mach .runs").nth(1), `${label}: the peer's second line`).toHaveText("not streaming");
         // Shown on a desktop; on a phone it gives the name its room (no tooltip on touch).

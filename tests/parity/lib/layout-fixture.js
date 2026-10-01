@@ -446,7 +446,7 @@ const MACHINE_SPECS = {
 };
 
 /** `GET /fleet/view` (`FleetView`) for a suite that asks (`fleetView`): the
- *  rows the daemon gathered, each with its card outcome, liveness and grant.
+ *  rows the daemon gathered, each with its card outcome and liveness.
  *  Without it the route stays a 404, so every other page draws its cards from
  *  the flow window alone, as before. */
 function fleetViewOf(rows) {
@@ -493,6 +493,7 @@ const PEER_ROW = viewRow(
     accepts: { state: "granted", accepts: { peer_name: MACHINE.machine_id, profiles: ["diff-review"], roles: ["radio-host"], images: [], workspace: false } },
   },
 );
+PEER_ROW.card.card.serves_radio = true; // the card's own statement: the icon never reads `accepts`
 
 /** A declared peer the daemon could not read a card from and hears no beat
  *  from: the "offline" card. */

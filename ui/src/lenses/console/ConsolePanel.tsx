@@ -5,6 +5,8 @@ import type { PanelId } from "../../lib/route";
 import { PANELS, DEFAULT_PANEL_ID, isManualPanel, panelCols, panelArgv, panelOptGroups, composeArgv, canonicalOptPairs, rosterOptName, machineOpt, reconcileOpts, LOCAL_MACHINE, type PanelOpt } from "./panels";
 import { useFleetView } from "../../hooks/useFleetView";
 import { fetchPanel } from "./fetchPanel";
+import { fetchJson } from "../../lib/fetcher";
+import type { MachineSpecsResponse } from "../../types/generated/MachineSpecsResponse";
 import { canonicalHash, writeHash } from "../../lib/hashSync";
 import { panelAgeLabel } from "./format";
 import { useIsMobile } from "../../hooks/useIsMobile";
@@ -491,12 +493,13 @@ function ChromeCommandLine({
 }) {
   const groups = panelOptGroups(id);
   const pendingArgv = composeArgv(id, opts);
+  const prompt = useServingPrompt();
   const drift = loadedBody != null && !stale && !arraysEqual(loadedBody.argv, pendingArgv);
 
   if (drift) {
     return (
       <>
-        <span className="pc-cmd">$ darkmux {loadedBody!.argv.join(" ")}</span>
+        <span className="pc-cmd">{prompt} darkmux {loadedBody!.argv.join(" ")}</span>
         <span className="pc-drift" title="the composed request did not match what the server actually ran">
           ⚠ argv mismatch — showing what actually ran
         </span>
@@ -510,7 +513,7 @@ function ChromeCommandLine({
   return (
     <>
       <span className="pc-cmd">
-        $ darkmux {panelArgv(id).join(" ")}
+        {prompt} darkmux {panelArgv(id).join(" ")}
         {groups.map((opt) => (
           <span key={opt.name}>
             {" "}
@@ -532,6 +535,21 @@ function ChromeCommandLine({
       )}
     </>
   );
+}
+
+/** The command line's prompt: the name of the machine the daemon runs the
+ * command on, then `$`. A panel runs on the machine serving the viewer, so a
+ * command about a relationship (`profile list --remote`: what the peers let
+ * THIS machine use) must say which machine "this" is. The name comes from the
+ * daemon's own `/machine/specs` (the query the machine pages already share);
+ * until it answers, or on a static build, the prompt is the bare `$`. */
+function useServingPrompt(): string {
+  const specs = useQuery({
+    queryKey: queryKeys.machineSpecs(),
+    queryFn: () => fetchJson<MachineSpecsResponse>("/machine/specs"),
+  });
+  const name = specs.data?.ok ? specs.data.data.machine_id : "";
+  return name ? `${name} $` : "$";
 }
 
 /** The roster-valued token (`--machine studio ▾`): an enum token whose values

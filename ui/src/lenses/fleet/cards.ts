@@ -33,7 +33,7 @@ import {
 } from "../../lib/tokenRate";
 import type { ExecutionTokenReading, LiveState } from "../../lib/tokenRate";
 import type { MachineSpecsResponse } from "../../types/generated/MachineSpecsResponse";
-import { grantWords, specsLine, rowSeen, type Grant, type RowFacts, type Standing } from "./viewRows";
+import { specsLine, rowSeen, type RowFacts, type Standing } from "./viewRows";
 import type { PresenceBeat } from "../../types/generated/PresenceBeat";
 // (#2814) `isSelfMachine`/`displayNameOf` live in `lib/flow.ts` beside
 // `nameOf`/`machineNames`/`localMachineUid` rather than here, because the
@@ -141,12 +141,6 @@ export function statusReason(
 ): string | undefined {
   if (face.absent) return `offline: ${card.note ?? "its presence beat stopped"}`;
   return face.notStreaming ? notStreamingStatus(card.note === null).reason : undefined;
-}
-
-/** The card's subtitle: the hardware line, then what the peer lets this
- * machine do. One line, so the card keeps its height. */
-export function specLine(card: { spec: string; grant: Grant | null }): string {
-  return card.grant ? `${card.spec} · ${grantWords(card.grant)}` : card.spec;
 }
 
 /** (#2060) Collapse a machine's running runs down to TOP-LEVEL runs: a
@@ -314,11 +308,10 @@ export interface FleetCard {
    *  ("not listening"); the status line's tooltip carries it. `null` for a
    *  machine the view read, and for one the view does not hold. */
   note: string | null;
-  /** What this peer lets this machine do (`viewRows.Grant`); `null` for
-   *  this machine's own card and for any peer without a grant to show. */
-  grant: Grant | null;
   /** The machine's own card declares `fleet.mode hub`. */
   hub: boolean;
+  /** The machine's own card says it serves radio. */
+  servesRadio: boolean;
   /** Whether the machine is up: the view's own `liveness` (a card it read
    *  is proof of life), or, for a machine the view does not hold, the flow
    *  window's online/offline edges. */
@@ -455,7 +448,7 @@ export function buildFleetCard(
    * route). Every run's lifecycle is read as of it. */
   t: number,
   /** The fleet view's row for this machine, when the view holds one: its
-   * hardware line, status note, grant and standing replace the flow-derived
+   * hardware line, status note and standing replace the flow-derived
    * ones. */
   row: RowFacts | null = null,
   /** (#1923) This machine's rows from `GET /runs` — see `runningLabRunCount`'s
@@ -506,7 +499,7 @@ export function buildFleetCard(
 }
 
 /** What a card says about WHO the machine is and whether it is up. A machine
- * the view holds reads its hardware line, status note, grant and standing
+ * the view holds reads its hardware line, status note and standing
  * from its row; any other (an unverified source, a beating machine nobody
  * rostered, a replay) reads presence and the flow window. */
 function cardIdentity(
@@ -526,8 +519,8 @@ function cardIdentity(
       // (#1855) `specUnknown` says whether a beat existed to carry hardware.
       specUnknown: spec ? null : liveMachines.has(m) ? ("not-reported" as const) : ("not-seen" as const),
       note: null,
-      grant: null,
       hub: false,
+      servesRadio: false,
       standing: machAbsent ? ("offline" as const) : ("online" as const),
       availability: "known" as const,
       self: false,
@@ -543,8 +536,8 @@ function cardIdentity(
     spec,
     specUnknown: spec ? null : ("not-reported" as const),
     note: row.note,
-    grant: row.grant,
     hub: row.hub,
+    servesRadio: row.servesRadio,
     standing: row.standing,
     availability: machineAvailability({ self: row.isSelf, seen: rowSeen(row), standing: row.standing }),
     // (#2915) The view says which row is this machine; a peer's model is
@@ -668,8 +661,8 @@ export function buildFleetCardBase(
     spec: id.spec,
     specUnknown: id.specUnknown,
     note: id.note,
-    grant: id.grant,
     hub: id.hub,
+    servesRadio: id.servesRadio,
     standing,
     availability: id.availability,
     active,

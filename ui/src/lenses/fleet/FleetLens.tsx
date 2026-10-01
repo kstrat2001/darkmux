@@ -14,7 +14,6 @@ import { useCountUp } from "../../hooks/useCountUp";
 import { useFleetRoster, useLiveMachines } from "../../hooks/useLiveMachines";
 import { useFleetView } from "../../hooks/useFleetView";
 import { HubBadge } from "../../components/HubBadge";
-import { RadioSeatIcon } from "../../components/RadioSeatIcon";
 import { useFlip } from "../../hooks/useFlip";
 import { cardOrderKey, orderCards } from "./cardOrder";
 import { useCardOrderGate } from "./cardOrderGate";
@@ -35,7 +34,8 @@ import { UtilityGlyph } from "../../components/UtilityGlyph";
 import { scopeStateOf } from "../../lib/scopeMorph";
 import { liveStateLabel, reasonForLine } from "../../lib/tokenRate";
 import { tokensOffMeter } from "./savings";
-import { buildFleetCardBase, withLiveReadings, busiestExecution, isStrictlyBusier, specDimLabel, specLine, statusReason, cardFace, notStreamedNames, DISCONNECTED_STAT, type CardSourcesAnswered, type FleetCard } from "./cards";
+import { RadioSeatIcon } from "../../components/RadioSeatIcon";
+import { buildFleetCardBase, withLiveReadings, busiestExecution, isStrictlyBusier, specDimLabel, statusReason, cardFace, notStreamedNames, DISCONNECTED_STAT, type CardSourcesAnswered, type FleetCard } from "./cards";
 import { useLatch } from "../../hooks/useLatch";
 import { buildActivityTimeline, ACTIVITY_WINDOW_PRESETS, DEFAULT_ACTIVITY_WINDOW_MIN } from "./timeline";
 import { rowFacts, rowSpecs } from "./viewRows";
@@ -119,8 +119,13 @@ function machineRunsHash(machineKey: string, runningSessionIds: string[]): strin
 }
 
 /** The card's name row: the machine icon, its name, what its own card
- * declares (HUB), the radio seat it grants this machine, and the utility
- * strip. One row, so a badge never changes the card's height. */
+ * declares (HUB), whether it serves radio, and the utility strip. One row, so a badge never changes
+ * the card's height.
+ *
+ * A fleet card shows only facts about its own machine. A relationship with
+ * the machine serving the viewer (a grant, a radio permission) is not a card
+ * fact: the same fleet must read the same from any server. Relationships live
+ * in the console, which runs commands on the serving machine. */
 function CardNameRow({ card, utilityQuietKnown }: { card: FleetCard; utilityQuietKnown: boolean }) {
   return (
     <div className="name">
@@ -134,9 +139,9 @@ function CardNameRow({ card, utilityQuietKnown }: { card: FleetCard; utilityQuie
       </span>
       {/* (#3022) What the machine's own card declares. */}
       <HubBadge declared={card.hub} />
-      {/* The radio seat this peer grants: an icon in the name row, where a
-          narrow card's ellipsis cannot cut it. */}
-      {card.grant?.radio ? <RadioSeatIcon /> : null}
+      {/* What the machine's own card says: it serves radio (`serves_radio`).
+          Never read from `accepts`, which is relative to the serving machine. */}
+      {card.servesRadio ? <RadioSeatIcon machine={card.name} /> : null}
       {/* (#2915) The utility strip: a fixed box at the end of the name row,
           always present, so a job starting or ending never changes the
           card's layout. See `UtilityGlyph`. */}
@@ -145,17 +150,14 @@ function CardNameRow({ card, utilityQuietKnown }: { card: FleetCard; utilityQuie
   );
 }
 
-/** The card's subtitle line: the hardware, then (on a desktop) what the peer
- * lets this machine do; when no hardware is known, "hardware not reported" in
- * the dim style. Never a status. One line, so the card keeps its height. */
+/** The card's subtitle line: the hardware; when no hardware is known,
+ * "hardware not reported" in the dim style. Never a status. One line, so the
+ * card keeps its height. */
 function CardSpec({ card }: { card: FleetCard }) {
   return (
-    <div className="spec" title={specLine(card) || undefined}>
+    <div className="spec" title={card.spec || undefined}>
       {card.spec ? (
-        <>
-          {card.spec}
-          {card.grant?.text ? <span className="spec__grant"> · {card.grant.text}</span> : null}
-        </>
+        card.spec
       ) : (
         <span className="specdim">{specDimLabel(card)}</span>
       )}

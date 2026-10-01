@@ -27,7 +27,7 @@ role list
 config list
 lab fixture list
 doctor
-$ darkmux flow status
+MacBook-Pro $ darkmux flow status
 captured 20:54:23
 · 216ms
 re-run

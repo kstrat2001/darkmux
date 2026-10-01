@@ -149,6 +149,12 @@ function viewRow(specs: Partial<MachineSpecsResponse> = {}, over: Partial<FleetM
   };
 }
 
+/** `row`'s card, stating that its machine serves radio (`serves_radio`). */
+function servingRadio(row: FleetMachine): FleetMachine {
+  if (row.card.state !== "available") throw new Error("a card that was read");
+  return { ...row, card: { ...row.card, card: { ...row.card.card, serves_radio: true } } };
+}
+
 /** This daemon's own row: the machine serving the page. */
 function selfRow(specs: Partial<MachineSpecsResponse>): FleetMachine {
   return viewRow(specs, { is_this_machine: true, accepts: { state: "this_machine" } });
@@ -1634,14 +1640,14 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
     mockFleetFetch({
       specs: { machine_id: "MacBook-Pro", machine_uid: "u-self", cpu_brand: "Apple M5 Max", ram_total_bytes: 137438953472 },
       view: [
-        viewRow(
+        servingRadio(viewRow(
           { machine_id: "studio", machine_uid: "u-studio", cpu_brand: "Apple M1 Max", ram_total_bytes: 34359738368 },
           {
             entry: { id: "studio", address: "100.64.1.2:8765", added_unix_ms: 1000 },
             liveness: "no_beat",
             accepts: { state: "granted", accepts: { peer_name: "laptop", profiles: ["diff-review"], roles: ["radio-host"], images: [], workspace: false } },
           },
-        ),
+        )),
       ],
       runs: [],
     });
@@ -1661,19 +1667,67 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
     const lbl = document.querySelector(".savlbl")!;
     expect(lbl.textContent).toBe("tokens seen · last 24h");
     expect(lbl.getAttribute("title")).toBe("Counts only machines whose records reach this viewer. Not streaming here: studio.");
-    // The radio seat is an icon in the name row whose tooltip says what it
-    // means; the rest of the grant stays words, and the whole grant stays in
-    // the hardware line's tooltip.
+    // A card states only its own machine. The icon comes from the peer's own
+    // `serves_radio`; the grant it holds for the serving machine (profiles, the
+    // radio seat in `accepts`) is on no card.
     const spec = studio.querySelector(".spec")!;
-    expect(spec.textContent).toBe("Apple M1 Max · 32 GB · runs diff-review");
-    expect(spec.getAttribute("title")).toBe("Apple M1 Max · 32 GB · runs diff-review · radio-host here");
+    expect(spec.textContent).toBe("Apple M1 Max · 32 GB");
+    expect(spec.getAttribute("title")).toBe("Apple M1 Max · 32 GB");
     const radio = studio.querySelector('.name [data-testid="radio-seat"]')!;
-    expect(radio.getAttribute("title")).toBe("accepts radio: this machine will answer radio questions sent from here (radio-host)");
+    expect(radio.getAttribute("title")).toBe("studio serves radio: it answers radio questions for peers it allows.");
     expect(radio.getAttribute("aria-label")).toBe(radio.getAttribute("title"));
-    // This machine's own card shows no grant.
+    const selfCard = [...document.querySelectorAll(".mach")].find((c) => c !== studio)!;
+    expect(selfCard.querySelector('[data-testid="radio-seat"]')).toBeNull();
     const self = [...document.querySelectorAll(".mach")].find((c) => c !== studio)!;
     expect(self.querySelector(".spec")!.textContent).toBe("Apple M5 Max · 128 GB");
     expect(self.querySelector('[data-testid="radio-seat"]')).toBeNull();
+  });
+
+  // The fleet must read the same from any server: two different serving
+  // machines hold different `accepts` for the SAME peer (a grant, none, or no
+  // answer), and its card is identical. The icon follows the peer's own card.
+  it.each([
+    ["granted to the serving machine", { state: "granted", accepts: { peer_name: "laptop", profiles: ["p"], roles: ["radio-host"], images: [], workspace: false } }],
+    ["not listed by the peer", { state: "not_listed" }],
+    ["unknown to the serving machine", { state: "unknown" }],
+  ] as const)("a peer's card is the same whichever machine serves the view (%s)", async (_label, accepts) => {
+    mockFleetFetch({
+      specs: { machine_id: "MacBook-Pro", machine_uid: "u-self", cpu_brand: "Apple M5 Max", ram_total_bytes: 137438953472 },
+      view: [
+        servingRadio(
+          viewRow(
+            { machine_id: "studio", machine_uid: "u-studio", cpu_brand: "Apple M1 Max", ram_total_bytes: 34359738368 },
+            { entry: { id: "studio", address: "100.64.1.2:8765", added_unix_ms: 1000 }, liveness: "no_beat", accepts: accepts as never },
+          ),
+        ),
+      ],
+      runs: [],
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelectorAll(".mach")).toHaveLength(2));
+    const studio = [...document.querySelectorAll(".mach")].find((c) => c.querySelector(".mach-name")!.textContent === "studio")!;
+    expect(studio.querySelector('.name [data-testid="radio-seat"]')).not.toBeNull();
+    expect(studio.querySelector(".spec")!.textContent).toBe("Apple M1 Max · 32 GB");
+    expect(studio.textContent).not.toMatch(/runs |accepts nothing|radio-host/);
+  });
+
+  it("a peer whose card does not state serves_radio shows no icon, whatever the serving machine's grant says", async () => {
+    mockFleetFetch({
+      specs: { machine_id: "MacBook-Pro", machine_uid: "u-self", cpu_brand: "Apple M5 Max", ram_total_bytes: 137438953472 },
+      view: [
+        viewRow(
+          { machine_id: "studio", machine_uid: "u-studio", cpu_brand: "Apple M1 Max", ram_total_bytes: 34359738368 },
+          {
+            entry: { id: "studio", address: "100.64.1.2:8765", added_unix_ms: 1000 },
+            accepts: { state: "granted", accepts: { peer_name: "laptop", profiles: [], roles: ["radio-host"], images: [], workspace: false } },
+          },
+        ),
+      ],
+      runs: [],
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelectorAll(".mach")).toHaveLength(2));
+    expect(document.querySelector('[data-testid="radio-seat"]')).toBeNull();
   });
 
   // The inverse: with the same row unreachable and presence silent, the

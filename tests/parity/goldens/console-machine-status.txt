@@ -27,7 +27,7 @@ role list
 config list
 lab fixture list
 doctor
-$ darkmux machine status
+MacBook-Pro $ darkmux machine status
 captured 20:54:23
 · 144ms
 re-run
