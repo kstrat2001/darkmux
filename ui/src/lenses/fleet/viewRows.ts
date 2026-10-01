@@ -199,7 +199,8 @@ export interface RowFacts {
   /** Whether the page already knows this uid from flow, presence or itself,
    * so its name comes from the same alias rules every other surface uses. */
   known: boolean;
-  /** The machine's own name for itself when the view has one. */
+  /** The machine's own current name when the view read its card, else the
+   * roster id. */
   name: string | null;
   spec: string;
   /** Why there is no hardware line, as the outcome line; `null` when the
@@ -246,7 +247,9 @@ export function rowFacts(
   return {
     uid,
     known: findUid(knownUids, uid) !== null,
-    name: row.entry?.id ?? specs?.machine_id ?? null,
+    // (#3028) A machine renames itself; the roster id is the label its
+    // operator wrote. The card the view read is the machine speaking.
+    name: specs?.machine_id ?? row.entry?.id ?? null,
     spec: specs ? specsLine(specs) : "",
     note: outcomeLine(row.card),
     grant: row.is_this_machine ? null : grantOf(row.accepts),
