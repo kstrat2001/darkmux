@@ -2776,6 +2776,25 @@ fn resolve_target(
     Ok(Some(resolution.require(&role.id, profile_override, &loaded.path)?))
 }
 
+/// (#2265) The profile name this dispatch resolved to, for the `proposer` on
+/// a mod it records: the remote target's own when the brain is endpoint-
+/// staffed, else the same role-aware resolution the model selection used. An
+/// unresolvable registry yields `None` (the dispatch's own model selection
+/// raises the loud error); this is provenance, never a gate.
+fn resolved_profile_name(
+    role: &crate::types::Role,
+    opts: &DispatchOpts,
+    remote: Option<&crate::target::Target>,
+) -> Option<String> {
+    if let Some(t) = remote {
+        return Some(t.profile_name.clone());
+    }
+    resolve_target(role, opts.profile_name.as_deref(), opts.config_path.as_deref(), opts.allow_utility_model)
+        .ok()
+        .flatten()
+        .map(|t| t.profile_name)
+}
+
 /// (#1187) True when a role's tool palette grants at least one tool — the
 /// dividing line between the light single-shot remote path and the
 /// agentic-remote container path. A tool-less role (empty `allow`) has no
@@ -6123,6 +6142,9 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         execution.clone(),
         opts.role_id.clone(),
         model.clone(),
+        // (#2265) The profile this dispatch resolved to, so a mod it proposes
+        // names it in `proposer`.
+        resolved_profile_name(role, &opts, agentic_pm.as_ref()),
         phase_id.clone(),
         step_id.clone(),
         Arc::clone(&inactivity_deadline),
@@ -7352,6 +7374,7 @@ fn spawn_guarded_tailer(
     execution: ExecutionId,
     role_id: String,
     model: String,
+    profile: Option<String>,
     phase_id: Option<String>,
     step_id: Option<String>,
     inactivity_deadline: Arc<Mutex<Instant>>,
@@ -7378,6 +7401,7 @@ fn spawn_guarded_tailer(
             execution,
             role_id,
             model,
+            profile,
             phase_id,
             step_id,
             stop,
@@ -7426,6 +7450,7 @@ fn run_tailer(
     execution: ExecutionId,
     role_id: String,
     model: String,
+    profile: Option<String>,
     phase_id: Option<String>,
     step_id: Option<String>,
     stop_flag: Arc<AtomicBool>,
@@ -7453,6 +7478,7 @@ fn run_tailer(
     )
     .with_phase(phase_id)
     .with_step(step_id)
+    .with_profile(profile)
     .with_compaction_threshold(compaction_threshold)
     .with_compactor_model(compactor_model)
     .with_endpoint(endpoint)
@@ -8955,6 +8981,9 @@ struct TailerState {
     execution: ExecutionId,
     role_id: String,
     model: String,
+    /// (#2265) The profile this dispatch resolved to, when one did. Names the
+    /// proposer on a mod this execution's `create_mod` call records.
+    profile: Option<String>,
     /// (#714) Mission/phase this dispatch belongs to (when phase-bound),
     /// stamped onto every per-event flow record so they group under the
     /// mission in the observability view. `None` for a one-off dispatch.
@@ -9146,6 +9175,7 @@ impl TailerState {
             execution,
             role_id,
             model,
+            profile: None,
             phase_id: None,
             step_id: None,
             last_heartbeat_at: None,
@@ -9173,6 +9203,12 @@ impl TailerState {
     /// only production `run_tailer` opts in.
     fn with_endpoint(mut self, endpoint: Option<String>) -> Self {
         self.endpoint = endpoint;
+        self
+    }
+
+    /// (#2265) The resolved profile name; see the field.
+    fn with_profile(mut self, profile: Option<String>) -> Self {
+        self.profile = profile;
         self
     }
 
@@ -9374,6 +9410,7 @@ impl TailerState {
             execution: ExecutionId::mint(),
             role_id,
             model,
+            profile: None,
             phase_id: None,
             step_id: None,
             last_heartbeat_at: None,
@@ -10155,6 +10192,11 @@ impl TailerState {
             // source checkout, whose paths are repo-relative. A dispatch
             // whose launcher named no source is not mapped at all.
             crate::findings::source_id_of(self.record_context.as_ref()).as_deref(),
+            Some(crate::mods::ModProposer {
+                role: self.role_id.clone(),
+                profile: self.profile.clone(),
+                model: self.model.clone(),
+            }),
             warnings,
         ) {
             eprintln!("[darkmux] warning: could not write mod: {e:#}");

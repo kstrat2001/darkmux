@@ -8836,10 +8836,15 @@ fn mod_create_mints_per_call_copies_attachments_and_finding_show_lists_the_mods(
         "`mod show $(darkmux mod create …)` must work: {}",
         String::from_utf8_lossy(&out_show.stderr)
     );
+    let shown = String::from_utf8_lossy(&out_show.stdout).into_owned();
+    assert!(shown.contains("change    chg-"), "`mod show` names the change key: {shown}");
     let rec: serde_json::Value = serde_json::from_str(
         &fs::read_to_string(home.path().join("mods").join(&key_a).join("mod.json")).unwrap(),
     )
     .expect("the record is on disk where the key says");
+    assert_eq!(rec["schema_version"], "2.1");
+    assert!(rec["change_key"].as_str().is_some_and(|k| k.starts_with("chg-") && k.len() == 68), "{rec}");
+    assert!(rec.get("proposer").is_none(), "a CLI mod names no darkmux role");
     assert_eq!(rec["by"], "sonnet");
     assert_eq!(rec["for"], serde_json::json!(["sess-a/1"]));
     // The kit is kept VERBATIM — prose stays the prose that was written.

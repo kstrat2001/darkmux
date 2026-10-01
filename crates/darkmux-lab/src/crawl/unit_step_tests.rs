@@ -276,6 +276,9 @@ fn a_clean_unit_dispatch_produces_a_typed_outcome_and_counts_its_findings() {
     assert_eq!(ctx["source"], serde_json::json!("app"));
     assert_eq!(ctx["sha"], serde_json::json!("a".repeat(40)));
     assert_eq!(ctx["rule"], serde_json::json!("unnamed-predicate"));
+    // (#2265, 5.0) The planned spans ride the context, so a finding (and so a
+    // mod) can name the site it sat in.
+    assert_eq!(ctx["sites"], serde_json::json!([{"file": "src/a.ts", "start": 1, "end": 5}]));
 
     // The findings the crawl stamps land beside the run, rule-namespaced
     // (#2360) — `<rule>.<unit>.findings.jsonl`, not `<unit>.findings.jsonl`.

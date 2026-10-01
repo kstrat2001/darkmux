@@ -865,6 +865,10 @@ struct UnitContext {
     source: String,
     sha: String,
     rule_ids: Vec<String>,
+    /// (#2265, 5.0) The unit's planned line spans, stamped into
+    /// `record_context` so a finding, and a mod answering it, can name the
+    /// site it sat in.
+    sites: Value,
     session_id: SessionId,
     /// The materialized workspace tree ROOT — the parent of this unit's
     /// own source tree, so the container's `/workspace/<source>/…` paths
@@ -914,9 +918,31 @@ fn unit_context(the_plan: &Plan, unit: &Unit, run: &RunId, role_id: &str, rule_s
         source,
         sha: ps.sha.clone(),
         rule_ids: unit_rules(unit),
+        sites: planned_sites(unit),
         session_id: SessionId::adhoc(run.clone(), role_id, format!("{rule_segment}-{}", unit.id())),
         tree_root,
     })
+}
+
+/// (#2265, 5.0) The line spans a unit was planned over, as `[{file, start,
+/// end}]`: a site or edge unit's sites, a read unit's line-range entries. A
+/// whole-file read entry has no span and contributes none.
+fn planned_sites(u: &Unit) -> Value {
+    let span = |file: &str, start: usize, end: usize| json!({"file": file, "start": start, "end": end});
+    match u {
+        Unit::Site { sites, .. } | Unit::Edge { sites, .. } => {
+            Value::Array(sites.iter().map(|s| span(&s.file, s.start, s.end)).collect())
+        }
+        Unit::Read { files, .. } => Value::Array(
+            files
+                .iter()
+                .filter_map(|f| match f {
+                    ReadFileEntry::Range { file, start, end } => Some(span(file, *start, *end)),
+                    ReadFileEntry::Whole(_) => None,
+                })
+                .collect(),
+        ),
+    }
 }
 
 /// The rule ids one unit names, in the plan's own order.
@@ -1384,6 +1410,7 @@ impl StepKind for CrawlUnitStepKind {
                     "sha": ctx.sha,
                     "rule": single_rule(&ctx.rule_ids),
                     "rules": ctx.rule_ids,
+                    "sites": ctx.sites,
                     // (#2310 P4c review round 2, item (g) — stated precisely
                     // for the PR: `crawl.json`'s DISPATCHED MESSAGE
                     // (`build_message`'s own output) is byte-identical to

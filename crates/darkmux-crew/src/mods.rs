@@ -19,6 +19,12 @@
 //! conflict or compose. A finding-derived key would have made the second
 //! overwrite the first, so the record keeps both and judges neither.
 //!
+//! **`change_key` is the convergence handle, and the only one.** A mod is one
+//! proposal, write-once; whether two proposals are one change is the
+//! consumer's call. darkmux hashes what a proposal IS ([`change_key`]) so
+//! byte-identical proposals share a handle, and never decides two different
+//! diffs are the same change.
+//!
 //! `for` is the only stored link between the two records: zero or more
 //! finding keys, living on the thing created later. The view from a finding to
 //! its mods is DERIVED by scanning mods — nothing is written back onto the
@@ -81,7 +87,11 @@ use std::path::{Path, PathBuf};
 /// `gate_skipped_reason: None`, which is exactly what those absences mean
 /// ("no hint", "already in repo coordinates", "not gated"). Pinned by
 /// `a_schema_version_1_record_still_reads_with_every_added_field_absent`.
-pub const MOD_SCHEMA_VERSION: &str = "2";
+///
+/// **`"2"` → `"2.1"` (#2265, 5.0).** Three additive fields: `change_key`,
+/// `proposer`, `site`. A `"2"` record reads with all three absent, pinned by
+/// `a_schema_2_record_loads_with_the_new_fields_absent`.
+pub const MOD_SCHEMA_VERSION: &str = "2.1";
 
 /// The runtime tool whose accepted calls become mods. Its finding sibling
 /// needs a LIST (the pre-2026-09-03 `report_finding` is in the append-only
@@ -117,6 +127,125 @@ pub fn is_safe_basename(name: &str) -> bool {
         && !name.contains('/')
         && !name.contains('\\')
         && !name.contains('\0')
+}
+
+/// Domain label hashed first, so a `change_key` can never equal some other
+/// blake3 digest darkmux computes over the same bytes. Bump the trailing
+/// version only with a schema change: stored keys are never recomputed.
+const CHANGE_KEY_DOMAIN: &[u8] = b"darkmux.mod.change_key/1";
+
+/// Feed one variable-length field: its byte length as a little-endian `u64`,
+/// then the bytes. Length prefixes (never separators) are what stop two
+/// different inputs from hashing the same bytes by concatenation.
+fn put_field(h: &mut blake3::Hasher, bytes: &[u8]) {
+    h.update(&(bytes.len() as u64).to_le_bytes());
+    h.update(bytes);
+}
+
+/// (#2265, 5.0) The convergence handle for a proposal: `chg-<64 hex blake3>`
+/// over a canonical encoding of what the proposal IS. Byte-identical
+/// proposals share it whoever proposed them; any differing byte of the kit,
+/// kit kind, `for` set or an attachment gives a different key. darkmux never
+/// decides two different diffs are the same change.
+///
+/// **The encoding, in this order** (every integer a little-endian `u64`; every
+/// `field` is `len(bytes) || bytes`):
+///
+/// 1. `field(CHANGE_KEY_DOMAIN)`.
+/// 2. The `for` keys sorted and deduplicated: `count`, then `field(key)` each.
+/// 3. `field(kit_kind)`, empty when absent.
+/// 4. The kit: one byte `0` when there is no kit, or one byte `1` followed by
+///    `field(kit)`. So no kit and an empty kit differ, as on the record.
+/// 5. The attachments sorted by name: `count`, then per attachment
+///    `field(name)` and the 32-byte blake3 digest of its bytes.
+pub fn change_key(
+    for_keys: &[String],
+    kit_kind: Option<&str>,
+    kit: Option<&str>,
+    attachments: &[(&str, &[u8])],
+) -> String {
+    let digests: Vec<(String, [u8; 32])> = attachments
+        .iter()
+        .map(|(name, bytes)| (name.to_string(), *blake3::hash(bytes).as_bytes()))
+        .collect();
+    change_key_from_digests(for_keys, kit_kind, kit, &digests)
+}
+
+/// [`change_key`] over attachments already reduced to their digests, so the
+/// CLI producer can hash a file by streaming it rather than loading it.
+fn change_key_from_digests(
+    for_keys: &[String],
+    kit_kind: Option<&str>,
+    kit: Option<&str>,
+    attachments: &[(String, [u8; 32])],
+) -> String {
+    let mut h = blake3::Hasher::new();
+    put_field(&mut h, CHANGE_KEY_DOMAIN);
+    let mut sorted: Vec<&String> = for_keys.iter().collect();
+    sorted.sort();
+    sorted.dedup();
+    h.update(&(sorted.len() as u64).to_le_bytes());
+    for k in sorted {
+        put_field(&mut h, k.as_bytes());
+    }
+    put_field(&mut h, kit_kind.unwrap_or("").as_bytes());
+    match kit {
+        None => {
+            h.update(&[0]);
+        }
+        Some(k) => {
+            h.update(&[1]);
+            put_field(&mut h, k.as_bytes());
+        }
+    }
+    let mut sorted: Vec<&(String, [u8; 32])> = attachments.iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    h.update(&(sorted.len() as u64).to_le_bytes());
+    for (name, digest) in sorted {
+        put_field(&mut h, name.as_bytes());
+        h.update(digest);
+    }
+    format!("chg-{}", h.finalize().to_hex())
+}
+
+/// The blake3 digest of one file, streamed.
+fn hash_file(path: &Path) -> Result<[u8; 32]> {
+    let mut f = std::fs::File::open(path).with_context(|| format!("opening attachment {}", path.display()))?;
+    let mut h = blake3::Hasher::new();
+    std::io::copy(&mut f, &mut h).with_context(|| format!("hashing attachment {}", path.display()))?;
+    Ok(*h.finalize().as_bytes())
+}
+
+/// (#2265, 5.0) The planned site a mod came from, traced through the findings
+/// it names: a crawl or review unit stamps its planned `sites` (plus `source`
+/// and `sha`) into the dispatch's `record_context`, which every finding the
+/// dispatch records copies as its `context`. The first `for` finding whose
+/// emitted `file` and `line` fall inside one of those sites names the mod's
+/// site. `None` when no plan produced it: never guessed from a bare file.
+fn site_of(context: &ModContext) -> Option<ModSite> {
+    context.findings.iter().find_map(site_of_finding)
+}
+
+fn site_of_finding(f: &ForFinding) -> Option<ModSite> {
+    let ctx = f.context.as_ref()?;
+    let emitted = f.emitted.as_ref()?;
+    let (file, line) = (emitted.get("file")?.as_str()?, emitted.get("line")?.as_u64()?);
+    let (source, sha) = (ctx.get("source")?.as_str()?, ctx.get("sha")?.as_str()?);
+    let (start, end) = ctx.get("sites")?.as_array()?.iter().find_map(|s| span_around(s, file, line))?;
+    Some(ModSite {
+        source: source.to_string(),
+        sha: sha.to_string(),
+        file: file.to_string(),
+        start_line: start,
+        end_line: end,
+    })
+}
+
+/// One planned `{file, start, end}` span, as `(start, end)` when it is in
+/// `file` and holds `line`.
+fn span_around(site: &serde_json::Value, file: &str, line: u64) -> Option<(u64, u64)> {
+    let (start, end) = (site.get("start")?.as_u64()?, site.get("end")?.as_u64()?);
+    (site.get("file")?.as_str()? == file && (start..=end).contains(&line)).then_some((start, end))
 }
 
 /// Mint a key for one mod: `mod-<unix-secs>-<6 hex>`.
@@ -216,9 +345,39 @@ pub struct GateOutcome {
     pub reason: Option<String>,
 }
 
+/// (#2265, 5.0) Which darkmux role proposed a mod, structured: the dispatch
+/// that ran `create_mod`. `by` stays the free actor string (it also names
+/// external actors like `sonnet` or `kain`); this is filled only when a
+/// darkmux role proposed the mod, and is `None` for `mod create`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+pub struct ModProposer {
+    /// The role id the dispatch ran as.
+    pub role: String,
+    /// The profile the dispatch resolved to. `None` when none resolved.
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// The model the dispatch ran, as the dispatch names it.
+    pub model: String,
+}
+
+/// (#2265, 5.0) The planned site a mod came from: the work unit's span in a
+/// crawl or review plan that contained the finding the mod answers. Present
+/// only when a plan produced it; never guessed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+pub struct ModSite {
+    /// The workspace source id.
+    pub source: String,
+    /// The source's commit sha the plan was made at.
+    pub sha: String,
+    /// The file, repo-relative.
+    pub file: String,
+    pub start_line: u64,
+    pub end_line: u64,
+}
+
 /// One mod, as stored at `<mods dir>/<key>/mod.json`.
 ///
-/// **The stored shape, at [`MOD_SCHEMA_VERSION`] `"2"`** (#2310 swarm F /
+/// **The stored shape, at [`MOD_SCHEMA_VERSION`] `"2.1"`** (#2310 swarm F /
 /// S2-2b — the doc used to stop at the `"1"` set, so three surfaces gained
 /// fields nothing here named):
 ///
@@ -236,8 +395,12 @@ pub struct GateOutcome {
 ///   gate's outcome, or why none ran. Mutually exclusive; `record_gate`
 ///   refuses to set both.
 ///
+/// - `change_key` / `proposer` / `site` (#2265, `"2.1"`) — the proposal's
+///   content handle, the darkmux role that proposed it, and the planned site
+///   it came from. Each is absent when it does not apply.
+///
 /// Every one of those is `Option`/`default` on read, which is what makes a
-/// `"1"` record still parse.
+/// `"1"` or `"2"` record still parse.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ModRecord {
     /// The minted key — the address every other surface uses.
@@ -343,6 +506,20 @@ pub struct ModRecord {
     /// exclusive; [`record_gate`] refuses to set both.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_skipped_reason: Option<String>,
+    /// (#2265, 5.0) `chg-<hex blake3>` over a canonical encoding of the
+    /// proposal's content (see [`change_key`]). Byte-identical proposals share
+    /// it, whoever proposed them: it is the handle a consumer converges on.
+    /// darkmux never treats two different diffs as the same change. Absent on
+    /// a schema-2 record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_key: Option<String>,
+    /// (#2265, 5.0) Structured provenance when a darkmux role proposed this
+    /// mod. See [`ModProposer`]. Additive to `by`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposer: Option<ModProposer>,
+    /// (#2265, 5.0) The planned site this mod came from. See [`ModSite`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site: Option<ModSite>,
     pub schema_version: String,
     /// Lenient-on-read overflow, so a newer writer's fields survive a round
     /// trip through an older reader.
@@ -820,6 +997,12 @@ pub fn create(
     }
 
     let key = mint_key();
+    let digests = attachments
+        .iter()
+        .zip(&names)
+        .map(|(path, name)| Ok((name.clone(), hash_file(path)?)))
+        .collect::<Result<Vec<_>>>()?;
+    let context = finding_context(findings_root, &for_keys)?;
     let record = ModRecord {
         key: key.clone(),
         ts: darkmux_flow::ts_utc_now(),
@@ -830,7 +1013,8 @@ pub fn create(
         kit_looks_json: kit.is_some_and(kit_looks_json),
         kit_kind: kit_kind.map(str::to_string),
         attachments: names.clone(),
-        context: finding_context(findings_root, &for_keys)?,
+        site: site_of(&context),
+        context,
         warnings: Vec::new(),
         // `mod create` is the EXTERNAL producer: the change was made outside
         // darkmux, so there is no dispatch and no mission to name.
@@ -844,6 +1028,11 @@ pub fn create(
         // any create-mods gate loop — never gated at create time.
         gate: None,
         gate_skipped_reason: None,
+        // (#2265, 5.0) The proposal's content handle, computed here once, where
+        // the record is built. `site` is set above with `context`.
+        change_key: Some(change_key_from_digests(&for_keys, kit_kind, kit, &digests)),
+        // `mod create` is an external actor: no darkmux role proposed it.
+        proposer: None,
         schema_version: MOD_SCHEMA_VERSION.to_string(),
         extras: serde_json::Map::new(),
     };
@@ -1150,6 +1339,8 @@ pub fn create_from_emission(
     // `record_context` named, when it named one — the prefix mapped off
     // this kit's headers. `None` leaves the kit byte-identical.
     source: Option<&str>,
+    // (#2265, 5.0) The dispatch that ran `create_mod`, when a darkmux role did.
+    proposer: Option<ModProposer>,
     warnings: Vec<String>,
 ) -> Result<ModRecord> {
     anyhow::ensure!(!by.trim().is_empty(), "a mod needs a proposer");
@@ -1226,6 +1417,7 @@ pub fn create_from_emission(
     }
 
     let key = mint_key();
+    let context = finding_context(findings_root, &for_keys)?;
     // (#2310 P4c, widened by the post-#2431 fix loop) `looks_like_unified_diff`
     // only tells this producer WHETHER the kit is diff-shaped; when it isn't,
     // the mod is silently stuck rendering as a fenced body block forever (see
@@ -1241,6 +1433,14 @@ pub fn create_from_emission(
              render as a fenced block in the review body, never a one-click suggestion"
         ));
     }
+    // (#2265, 5.0) Same handle `create` computes, over the kit as STORED (after
+    // the source-prefix mapping) and the attachment bytes.
+    let ck = change_key(
+        &for_keys,
+        kit_kind.as_deref(),
+        Some(&kit),
+        &attachments.iter().map(|a| (a.name.as_str(), a.bytes.as_slice())).collect::<Vec<_>>(),
+    );
     let record = ModRecord {
         key: key.clone(),
         ts: darkmux_flow::ts_utc_now(),
@@ -1261,7 +1461,8 @@ pub fn create_from_emission(
         // without this, no matter how diff-shaped the kit actually is.
         kit_kind,
         attachments: names.clone(),
-        context: finding_context(findings_root, &for_keys)?,
+        site: site_of(&context),
+        context,
         warnings,
         mission_id: scope.mission_id,
         phase_id: scope.phase_id,
@@ -1272,6 +1473,8 @@ pub fn create_from_emission(
         // yet).
         gate: None,
         gate_skipped_reason: None,
+        change_key: Some(ck),
+        proposer,
         schema_version: MOD_SCHEMA_VERSION.to_string(),
         extras: serde_json::Map::new(),
     };
@@ -1422,6 +1625,7 @@ mod tests {
                 step_id: Some("step-3".into()),
             },
             None,
+            None,
             vec!["a part the host could not keep".to_string()],
         )
         .unwrap();
@@ -1532,6 +1736,7 @@ mod tests {
             &[],
             findings::Scope::default(),
             None,
+            None,
             Vec::new(),
         )
         .unwrap();
@@ -1552,6 +1757,7 @@ mod tests {
             "did you consider using the existing helper at src/util.rs instead?",
             &[],
             findings::Scope::default(),
+            None,
             None,
             Vec::new(),
         )
@@ -1592,6 +1798,7 @@ mod tests {
                 kit,
                 &attachments,
                 findings::Scope::default(),
+                None,
                 None,
                 Vec::new(),
             )
@@ -1793,6 +2000,7 @@ mod tests {
             &[],
             findings::Scope::default(),
             Some("app"),
+            None,
             Vec::new(),
         )
         .unwrap();
@@ -1982,6 +2190,7 @@ mod tests {
             "the whole change",
             &[],
             crate::findings::Scope::default(),
+            None,
             None,
             Vec::new(),
         )
@@ -2297,6 +2506,9 @@ mod tests {
             source: None,
             gate: None,
             gate_skipped_reason: None,
+            change_key: None,
+            proposer: None,
+            site: None,
             schema_version: MOD_SCHEMA_VERSION.into(),
             extras: serde_json::Map::new(),
         };
@@ -2330,6 +2542,9 @@ mod tests {
             source: None,
             gate: None,
             gate_skipped_reason: None,
+            change_key: None,
+            proposer: None,
+            site: None,
             schema_version: MOD_SCHEMA_VERSION.into(),
             extras: serde_json::Map::new(),
         }
@@ -2437,6 +2652,9 @@ mod tests {
             source: None,
             gate: None,
             gate_skipped_reason: None,
+            change_key: None,
+            proposer: None,
+            site: None,
             schema_version: MOD_SCHEMA_VERSION.into(),
             extras: serde_json::Map::new(),
         };
@@ -2518,6 +2736,7 @@ mod tests {
                 step_id: Some("step-3".into()),
             },
             None,
+            None,
             Vec::new(),
         )
         .unwrap();
@@ -2542,5 +2761,302 @@ mod tests {
         let rec = create(&mods, &finds, "kain", &["sess-a/1".into()], Some("p"), &[], None, false).unwrap();
         assert!(rec.mission_id.is_none(), "the fixture's premise: an external actor stamps no mission");
         assert!(names_mission(&rec, "crawl-1"), "the copied finding provenance still answers");
+    }
+    // ── (#2265, 5.0) change_key / proposer / site ────────────────────────
+
+    fn keys(ks: &[&str]) -> Vec<String> {
+        ks.iter().map(|k| k.to_string()).collect()
+    }
+
+    #[test]
+    fn change_key_is_chg_plus_64_hex_and_deterministic() {
+        let a = change_key(&keys(&["s/1"]), Some("unified-diff"), Some("k"), &[("a.txt", b"x")]);
+        let b = change_key(&keys(&["s/1"]), Some("unified-diff"), Some("k"), &[("a.txt", b"x")]);
+        assert_eq!(a, b, "same inputs, same key");
+        let hex = a.strip_prefix("chg-").expect("chg- prefix");
+        assert_eq!(hex.len(), 64);
+        assert!(hex.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)), "{a}");
+    }
+
+    /// Pins the canonical encoding itself. If this literal changes, every
+    /// stored `change_key` stops matching a recomputation: that is a schema
+    /// change, not a refactor.
+    #[test]
+    fn change_key_encoding_is_pinned_by_a_golden_vector() {
+        let k = change_key(&keys(&["s/2", "s/1"]), Some("unified-diff"), Some("kit"), &[("b", b"2"), ("a", b"1")]);
+        assert_eq!(k, "chg-96417409b3bd8d61dd5cf58a3835a9109d935658bf92d7c553524ae065152082");
+    }
+
+    /// The doc comment's byte layout, built by hand and hashed in one shot:
+    /// the streaming implementation must produce exactly these bytes.
+    #[test]
+    fn change_key_matches_the_documented_byte_layout() {
+        fn f(out: &mut Vec<u8>, b: &[u8]) {
+            out.extend_from_slice(&(b.len() as u64).to_le_bytes());
+            out.extend_from_slice(b);
+        }
+        let mut buf = Vec::new();
+        f(&mut buf, b"darkmux.mod.change_key/1");
+        buf.extend_from_slice(&2u64.to_le_bytes());
+        f(&mut buf, b"s/1");
+        f(&mut buf, b"s/2");
+        f(&mut buf, b"unified-diff");
+        buf.push(1);
+        f(&mut buf, b"kit");
+        buf.extend_from_slice(&2u64.to_le_bytes());
+        f(&mut buf, b"a");
+        buf.extend_from_slice(blake3::hash(b"1").as_bytes());
+        f(&mut buf, b"b");
+        buf.extend_from_slice(blake3::hash(b"2").as_bytes());
+        let expect = format!("chg-{}", blake3::hash(&buf).to_hex());
+        let got = change_key(&keys(&["s/2", "s/1", "s/1"]), Some("unified-diff"), Some("kit"), &[("b", b"2"), ("a", b"1")]);
+        assert_eq!(got, expect);
+    }
+
+    #[test]
+    fn change_key_ignores_for_order_and_duplicates() {
+        let a = change_key(&keys(&["s/1", "s/2"]), None, Some("k"), &[]);
+        let b = change_key(&keys(&["s/2", "s/1", "s/2"]), None, Some("k"), &[]);
+        assert_eq!(a, b);
+        let c = change_key(&keys(&["s/1"]), None, Some("k"), &[]);
+        assert_ne!(a, c, "a different `for` set is a different change");
+    }
+
+    #[test]
+    fn change_key_ignores_attachment_order_but_not_names_or_bytes() {
+        let base = change_key(&[], None, None, &[("a", b"1"), ("b", b"2")]);
+        assert_eq!(base, change_key(&[], None, None, &[("b", b"2"), ("a", b"1")]));
+        assert_ne!(base, change_key(&[], None, None, &[("a", b"1"), ("c", b"2")]), "name");
+        assert_ne!(base, change_key(&[], None, None, &[("a", b"1"), ("b", b"3")]), "bytes");
+    }
+
+    #[test]
+    fn a_different_kit_or_kit_kind_is_a_different_change() {
+        let base = change_key(&keys(&["s/1"]), Some("unified-diff"), Some("one"), &[]);
+        assert_ne!(base, change_key(&keys(&["s/1"]), Some("unified-diff"), Some("two"), &[]));
+        assert_ne!(base, change_key(&keys(&["s/1"]), None, Some("one"), &[]));
+    }
+
+    #[test]
+    fn no_kit_and_an_empty_kit_are_different_changes() {
+        let none = change_key(&[], None, None, &[("a", b"1")]);
+        let empty = change_key(&[], None, Some(""), &[("a", b"1")]);
+        assert_ne!(none, empty);
+    }
+
+    /// Length prefixes, not separators: input pairs that concatenate to the
+    /// same bytes must still hash apart.
+    #[test]
+    fn concatenation_cannot_collide_two_different_changes() {
+        // kit_kind / kit boundary.
+        assert_ne!(
+            change_key(&[], Some("ab"), Some("c"), &[]),
+            change_key(&[], Some("a"), Some("bc"), &[])
+        );
+        // kit / attachment-name boundary.
+        assert_ne!(
+            change_key(&[], None, Some("x"), &[("y", b"")]),
+            change_key(&[], None, Some("xy"), &[("", b"")])
+        );
+        // `for` keys: one key versus two that concatenate to it.
+        assert_ne!(change_key(&keys(&["s/12"]), None, Some("k"), &[]), change_key(&keys(&["s/1", "2"]), None, Some("k"), &[]));
+        // attachment name / bytes boundary.
+        assert_ne!(
+            change_key(&[], None, None, &[("ab", b"c")]),
+            change_key(&[], None, None, &[("a", b"bc")])
+        );
+        // `for` keys that concatenate to the same bytes (same count).
+        assert_ne!(
+            change_key(&keys(&["ab", "c"]), None, Some("k"), &[]),
+            change_key(&keys(&["a", "bc"]), None, Some("k"), &[])
+        );
+        // a `for` key that looks like the next field.
+        assert_ne!(
+            change_key(&keys(&["s/1"]), None, Some("k"), &[]),
+            change_key(&[], Some("s/1"), Some("k"), &[])
+        );
+    }
+
+    /// Both producers stamp the same key for the same proposal, whoever
+    /// proposed it: the convergence handle.
+    #[test]
+    fn byte_identical_proposals_from_both_producers_share_a_change_key() {
+        let tmp = TempDir::new().unwrap();
+        let mods = tmp.path().join("mods");
+        let finds = tmp.path().join("findings");
+        store_finding(&finds, "sess-a", 1, None);
+        let kit = "--- a/f\n+++ b/f\n@@ -1,1 +1,1 @@\n-a\n+b\n";
+        let att = tmp.path().join("note.txt");
+        std::fs::write(&att, b"hello").unwrap();
+
+        let cli = create(&mods, &finds, "kain", &["sess-a/1".into()], Some(kit), &[att], Some("unified-diff"), false).unwrap();
+        let rt = create_from_emission(
+            &mods,
+            &finds,
+            "coder (m)",
+            &["sess-a/1".to_string()],
+            kit,
+            &[InlineAttachment { name: "note.txt".into(), bytes: b"hello".to_vec() }],
+            findings::Scope::default(),
+            None,
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+        assert_ne!(cli.key, rt.key, "still two proposals, two minted keys");
+        assert!(cli.change_key.is_some());
+        assert_eq!(cli.change_key, rt.change_key);
+        assert_eq!(cli.schema_version, "2.1");
+        let stored = load_at(&mods, &rt.key).unwrap().unwrap();
+        assert_eq!(stored.change_key, rt.change_key, "persisted, not only returned");
+    }
+
+    #[test]
+    fn a_different_diff_for_the_same_finding_is_a_different_change_key() {
+        let tmp = TempDir::new().unwrap();
+        let mods = tmp.path().join("mods");
+        let finds = tmp.path().join("findings");
+        store_finding(&finds, "sess-a", 1, None);
+        let a = create(&mods, &finds, "x", &["sess-a/1".into()], Some("one"), &[], None, false).unwrap();
+        let b = create(&mods, &finds, "y", &["sess-a/1".into()], Some("two"), &[], None, false).unwrap();
+        assert_ne!(a.change_key, b.change_key);
+    }
+
+    #[test]
+    fn an_emission_from_a_role_fills_proposer_and_the_cli_does_not() {
+        let tmp = TempDir::new().unwrap();
+        let mods = tmp.path().join("mods");
+        let finds = tmp.path().join("findings");
+        store_finding(&finds, "sess-a", 1, None);
+        let proposer = ModProposer { role: "coder".into(), profile: Some("coder-qwen38".into()), model: "darkmux:qwen3.6".into() };
+        let rec = create_from_emission(
+            &mods,
+            &finds,
+            "coder (darkmux:qwen3.6)",
+            &["sess-a/1".to_string()],
+            "k",
+            &[],
+            findings::Scope::default(),
+            None,
+            Some(proposer.clone()),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(rec.proposer, Some(proposer.clone()));
+        assert_eq!(rec.by, "coder (darkmux:qwen3.6)", "`by` is unchanged");
+        assert_eq!(load_at(&mods, &rec.key).unwrap().unwrap().proposer, Some(proposer));
+        let cli = create(&mods, &finds, "kain", &["sess-a/1".into()], Some("k"), &[], None, false).unwrap();
+        assert_eq!(cli.proposer, None);
+    }
+
+    fn store_finding_at(root: &Path, dispatch: &str, ctx: serde_json::Value, emitted: serde_json::Value) {
+        let rec = findings::build_record(
+            dispatch,
+            1,
+            "2026-09-03T01:00:00Z".to_string(),
+            "create_finding",
+            findings::Proposer { handle: "crawler".into(), model: "m".into(), machine_id: None },
+            findings::Scope::default(),
+            Some(ctx),
+            emitted,
+        );
+        findings::materialize(root, &rec).unwrap();
+    }
+
+    fn site_ctx() -> serde_json::Value {
+        serde_json::json!({
+            "source": "app", "sha": "abc123", "unit": "u-0001",
+            "sites": [
+                {"file": "src/a.ts", "start": 1, "end": 20},
+                {"file": "src/b.ts", "start": 30, "end": 60}
+            ]
+        })
+    }
+
+    fn mod_for(tmp: &TempDir, finding_emitted: serde_json::Value, ctx: serde_json::Value) -> ModRecord {
+        let mods = tmp.path().join("mods");
+        let finds = tmp.path().join("findings");
+        store_finding_at(&finds, "sess-s", ctx, finding_emitted);
+        create_from_emission(
+            &mods,
+            &finds,
+            "coder (m)",
+            &["sess-s/1".to_string()],
+            "k",
+            &[],
+            findings::Scope::default(),
+            None,
+            None,
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_mod_from_a_planned_site_fills_site() {
+        let tmp = TempDir::new().unwrap();
+        let rec = mod_for(&tmp, serde_json::json!({"file": "src/b.ts", "line": 42}), site_ctx());
+        assert_eq!(
+            rec.site,
+            Some(ModSite {
+                source: "app".into(),
+                sha: "abc123".into(),
+                file: "src/b.ts".into(),
+                start_line: 30,
+                end_line: 60
+            })
+        );
+    }
+
+    /// The CLI producer traces the site the same way: an orchestrator that
+    /// records a mod against a crawl finding gets the finding's site too.
+    #[test]
+    fn a_cli_mod_for_a_planned_finding_fills_site_too() {
+        let tmp = TempDir::new().unwrap();
+        let finds = tmp.path().join("findings");
+        store_finding_at(&finds, "sess-s", site_ctx(), serde_json::json!({"file": "src/a.ts", "line": 3}));
+        let rec = create(&tmp.path().join("mods"), &finds, "sonnet", &["sess-s/1".into()], Some("k"), &[], None, false).unwrap();
+        assert_eq!(rec.site.as_ref().map(|s| (s.file.as_str(), s.start_line, s.end_line)), Some(("src/a.ts", 1, 20)));
+        assert_eq!(rec.proposer, None);
+    }
+
+    #[test]
+    fn site_stays_absent_when_nothing_planned_it() {
+        // No sites in the context at all.
+        let tmp = TempDir::new().unwrap();
+        let rec = mod_for(&tmp, serde_json::json!({"file": "src/b.ts", "line": 42}), serde_json::json!({"source": "app", "sha": "x"}));
+        assert_eq!(rec.site, None);
+        // Sites present, but the finding's line is outside every one.
+        let tmp = TempDir::new().unwrap();
+        let rec = mod_for(&tmp, serde_json::json!({"file": "src/b.ts", "line": 99}), site_ctx());
+        assert_eq!(rec.site, None, "a site the finding is not inside is not its site");
+        // Right line, wrong file: another file's span is not this finding's site.
+        let tmp = TempDir::new().unwrap();
+        let rec = mod_for(&tmp, serde_json::json!({"file": "src/c.ts", "line": 42}), site_ctx());
+        assert_eq!(rec.site, None, "the file has to match, not only the line");
+        // The CLI path with a context-less finding.
+        let tmp = TempDir::new().unwrap();
+        let finds = tmp.path().join("findings");
+        store_finding(&finds, "sess-a", 1, None);
+        let cli = create(&tmp.path().join("mods"), &finds, "kain", &["sess-a/1".into()], Some("k"), &[], None, false).unwrap();
+        assert_eq!(cli.site, None);
+    }
+
+    #[test]
+    fn a_schema_2_record_loads_with_the_new_fields_absent() {
+        let tmp = TempDir::new().unwrap();
+        let mods = tmp.path().join("mods");
+        std::fs::create_dir_all(mods.join("mod-old-2")).unwrap();
+        std::fs::write(
+            mods.join("mod-old-2").join("mod.json"),
+            r#"{"key":"mod-old-2","ts":"2026-09-01T00:00:00Z","by":"coder (m)","for":["s/1"],"kit":"k",
+                "kit_looks_json":false,"kit_kind":"unified-diff","attachments":[],"context":{"findings":[]},
+                "mission_id":"m-1","gate":null,"schema_version":"2"}"#,
+        )
+        .unwrap();
+        let back = load_at(&mods, "mod-old-2").unwrap().expect("loads");
+        assert_eq!(back.schema_version, "2");
+        assert!(back.change_key.is_none() && back.proposer.is_none() && back.site.is_none());
+        assert!(back.extras.is_empty(), "the new fields are known to this reader, not extras");
     }
 }

@@ -1762,6 +1762,30 @@
         .unwrap()
     }
 
+    /// (#2265, 5.0) The profile a mod's `proposer` names is the one the
+    /// dispatch resolved to: `--profile` when it names a defined profile, else
+    /// the role-aware default.
+    #[test]
+    #[serial]
+    fn the_proposer_profile_is_the_one_the_dispatch_resolved() {
+        let state = darkmux_types::test_isolation::IsolatedState::new();
+        let pf = state.join("profiles-2265-proposer.json");
+        std::fs::write(
+            &pf,
+            r#"{"profiles":{
+                "main":{"default_model":"m","models":[{"id":"m","n_ctx":32000,"capabilities":{"code":1.0}}]},
+                "alt":{"default_model":"m","models":[{"id":"m","n_ctx":32000,"capabilities":{"code":1.0}}]}},
+                "default_profile":"main"}"#,
+        )
+        .unwrap();
+        let role = windows_role(&["coding"]);
+        let mut opts = dispatch_preflight_probe_opts();
+        opts.config_path = Some(pf.to_str().unwrap().to_string());
+        assert_eq!(resolved_profile_name(&role, &opts, None).as_deref(), Some("main"));
+        opts.profile_name = Some("alt".to_string());
+        assert_eq!(resolved_profile_name(&role, &opts, None).as_deref(), Some("alt"));
+    }
+
     /// (#2902 step 3) The defect the one resolver closes: with several
     /// models in a profile, the compaction window came from the profile's
     /// DEFAULT model even when `select_model` picked another. Here the
@@ -7355,6 +7379,7 @@
                 crate::test_session("sess-real-watchdog"), darkmux_types::execution_id::ExecutionId::mint(),
                 "coder".into(),
                 "darkmux:qwen3.6".into(),
+                None, // (#2265) profile
                 None,
                 None,
                 tailer_stop,
@@ -8343,6 +8368,61 @@
                 }
             }
         }
+    }
+
+    /// (#2265, 5.0) The dispatch that ran `create_mod` names itself on the mod:
+    /// role, resolved profile and model, and the planned site the finding it
+    /// answers sat in (traced through the finding's copied `record_context`).
+    #[test]
+    #[serial]
+    fn a_mod_from_a_dispatch_records_its_proposer_and_planned_site() {
+        let tmp = TempDir::new().unwrap();
+        let mods_store = tmp.path().join("mods");
+        let findings_store = tmp.path().join("findings");
+        let prev = mod_test_env(tmp.path(), &mods_store, &findings_store);
+        let frec = crate::findings::build_record(
+            "sess-p",
+            1,
+            "2026-09-05T01:00:00Z".to_string(),
+            "create_finding",
+            crate::findings::Proposer { handle: "reviewer".into(), model: "m".into(), machine_id: None },
+            crate::findings::Scope::default(),
+            Some(serde_json::json!({
+                "source": "app", "sha": "abc",
+                "sites": [{"file": "src/a.ts", "start": 3, "end": 9}]
+            })),
+            serde_json::json!({"file": "src/a.ts", "line": 4}),
+        );
+        crate::findings::materialize(&findings_store, &frec).unwrap();
+
+        let mut state = TailerState::new_for_test(
+            tmp.path().join("trajectory.jsonl"),
+            crate::test_session("sess-prop"),
+            "coder".into(),
+            "darkmux:qwen3.6".into(),
+        )
+        .with_profile(Some("coder-qwen38".into()));
+        state.handle_event(
+            &serde_json::json!({
+                "type": "tool.completed", "seq": 1, "tool_seq": 0, "tool_name": "create_mod",
+                "args": "{}", "result": "Recorded mod 1.", "ok": true,
+                "emitted": {"kit": "a kit", "for": ["sess-p/1"], "attach": []}, "emit_seq": 1,
+            })
+            .to_string(),
+        );
+        let all = crate::mods::load_all_at(&mods_store).unwrap();
+        restore_env(prev);
+        assert_eq!(all.len(), 1, "{all:?}");
+        assert_eq!(
+            all[0].proposer,
+            Some(crate::mods::ModProposer {
+                role: "coder".into(),
+                profile: Some("coder-qwen38".into()),
+                model: "darkmux:qwen3.6".into()
+            })
+        );
+        let site = all[0].site.as_ref().expect("the finding sat inside a planned site");
+        assert_eq!((site.file.as_str(), site.start_line, site.end_line), ("src/a.ts", 3, 9));
     }
 
     /// (#2265 review, CRITICAL 1) The host reads the SAME wire shape the
@@ -14446,6 +14526,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             crate::test_session("test-session"), darkmux_types::execution_id::ExecutionId::mint(),
             "coder".to_string(),
             "test-model".to_string(),
+            None, // (#2265) profile
             None,
             None,
             // stop_flag — deliberately never set. Only the interrupt
@@ -14814,6 +14895,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
                 crate::test_session("test-session"), darkmux_types::execution_id::ExecutionId::mint(),
                 "test-role".to_string(),
                 "test-model".to_string(),
+                None, // (#2265) profile
                 None,
                 None,
                 inactivity_deadline_for_closure,
@@ -18253,6 +18335,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
             crate::test_session("sess-2869-drain"), darkmux_types::execution_id::ExecutionId::mint(),
             "coder".into(),
             "darkmux:m".into(),
+            None, // (#2265) profile
             None,
             None,
             stop,

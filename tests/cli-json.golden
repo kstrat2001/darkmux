@@ -669,6 +669,10 @@ ModCreated
   path: string
 ModList
   mods: ModRecord[]
+ModProposer
+  role: string
+  profile: string | null
+  model: string
 ModRecord
   key: string
   ts: string
@@ -686,7 +690,16 @@ ModRecord
   source?: string | null
   gate?: GateOutcome | null
   gate_skipped_reason?: string | null
+  change_key?: string | null
+  proposer?: ModProposer | null
+  site?: ModSite | null
   schema_version: string
+ModSite
+  source: string
+  sha: string
+  file: string
+  start_line: uint64
+  end_line: uint64
 ModelEndpoint
   url?: string | null
   api_version?: string | null

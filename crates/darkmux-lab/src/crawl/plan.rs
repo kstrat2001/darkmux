@@ -3844,6 +3844,7 @@ line two
                     step_id: None,
                 },
                 Some("app"),
+                None,
                 Vec::new(),
             )
             .unwrap();
