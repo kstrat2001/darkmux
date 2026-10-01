@@ -1,5 +1,5 @@
 {
-  "schema_version": "2.0",
+  "schema_version": "2.1",
   "machine_id": "my-machine",
   "lms_bin": "lms",
   "lmstudio_url": "http://localhost:1234",
@@ -59,7 +59,12 @@
       "port": 8766
     },
     "accept_work": {},
-    "busy_policy": "refuse"
+    "busy_policy": "refuse",
+    "defaults": {
+      "radio": {
+        "answerer_profile": ""
+      }
+    }
   },
   "remote": {
     "max_tokens_per_step": null,

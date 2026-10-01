@@ -233,6 +233,7 @@ pub fn build_machine_scoped_telemetry_record_with(
         liveness_probe_ms: None,
         prev_record_write_ms: None,
         simulated_host_source: None,
+        fleet_mode: Some(darkmux_types::config_access::declared_fleet_mode()),
     });
     crate::host_source::stamp_with(provenance, &mut payload);
     let display_name = darkmux_flow::resolve_machine_id().unwrap_or_else(|| "unknown".to_string());

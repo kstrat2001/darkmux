@@ -46,6 +46,7 @@ mod mod_cli;
 // `darkmux machine` roster-facing handlers — split out of main.rs alongside cli/lab_cli.
 mod fleet_cli;
 mod machine_list;
+mod fleet_defaults;
 // #463 workspace split — flow extracted to the darkmux-flow crate. The
 // re-export keeps all existing `crate::flow::*` paths resolving unchanged.
 pub use darkmux_flow as flow;
@@ -629,6 +630,9 @@ fn cmd_doctor(verbose: bool, probe: bool) -> Result<i32> {
     // (#2916) Fleet work submission: token, identity provider, listener,
     // allow-list, and the retired Redis queue if it is still there.
     report.checks.extend(fleet_cli::fleet_submission_doctor_checks());
+    // (#3022) The fleet hub and the defaults it hands out, read from the same
+    // fleet view `machine list` prints.
+    report.checks.extend(fleet_defaults::doctor_checks());
 
     // (#1177) Opt-in live endpoint probes append to the same report so they
     // share the verdict/exit-code path — a failed probe exits 1 like any

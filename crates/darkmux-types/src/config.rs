@@ -370,7 +370,15 @@ use std::path::Path;
 //           replaced by `serve.token_keychain` (the same Keychain gate) and
 //           the new `serve.read_auth` (reads need the token, default off),
 //           both written visibly by `init` as `false`.
-pub const CONFIG_SCHEMA_VERSION: &str = "2.0";
+//   2.1 (#3022, darkmux 4.0): additive `fleet.defaults{}`, what a fleet hub
+//           hands to machines with no setting of their own. First key:
+//           `fleet.defaults.radio.answerer_profile`, a `<profile>@<machine>`
+//           address (`config set` refuses a bare profile name). Meaningful
+//           only where `fleet.mode` is `hub`; the hub serves it in its
+//           machine card, and a card that does not declare `hub` has it
+//           refused by every reader. `init` writes it visibly, empty (empty
+//           means no default). An older binary refuses the unknown key.
+pub const CONFIG_SCHEMA_VERSION: &str = "2.1";
 
 /// (#2902 step 5) A setting RENAMED in 4.0, with no alias. `config set`
 /// refuses the old key naming the new one; a leftover old key in
@@ -1318,6 +1326,30 @@ pub struct FleetConfig {
     /// whose seat is busy: `refuse` or `queue`. See [`BusyPolicy`]. A
     /// string, read leniently and refused where it is consumed (#2947).
     #[serde(default, skip_serializing_if = "Option::is_none")] pub busy_policy: Option<String>,
+    /// (#3022) Fleet defaults, meaningful only on the machine that declares
+    /// `fleet.mode` `hub`. See [`FleetDefaultsConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub defaults: Option<FleetDefaultsConfig>,
+    #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
+}
+
+/// (#3022) The defaults a fleet hub hands to the machines that have no
+/// setting of their own. Meaningful only where `fleet.mode` is `hub`: a
+/// machine that is not the hub carries no defaults on its card, and a card
+/// that is not the hub's has its defaults refused by every reader. They
+/// travel in the hub's machine card only, never through Redis.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct FleetDefaultsConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub radio: Option<FleetDefaultsRadioConfig>,
+    #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
+}
+
+/// (#3022) The fleet default for radio. `answerer_profile` is a
+/// `<profile>@<machine>` address: a bare profile name would be read against
+/// each receiving machine's own registry, where it means something else.
+/// Empty or absent means the hub states no default.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct FleetDefaultsRadioConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub answerer_profile: Option<String>,
     #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -1937,6 +1969,36 @@ crate::config_enum!(FleetMode, "fleet position", [
     Peer = "peer" => "viewer links prefer the tailnet address when `tailscale serve` proxies to this daemon (the fleet listener and roster are separate settings, unaffected)",
 ]);
 
+/// A machine's declared fleet position as it travels on the wire: in its card,
+/// its presence beat and its `machine.telemetry` records. [`FleetMode`] is the
+/// config value and refuses an unregistered token; this is what a READER of
+/// another machine's record meets, so it also has `Unknown` for a value a
+/// newer darkmux states (never read as any known mode), and it is the
+/// declared mode of a machine whose own `fleet.mode` is bad config: that
+/// machine cannot say which mode it declares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
+#[serde(rename_all = "snake_case")]
+pub enum DeclaredFleetMode {
+    #[default]
+    Standalone,
+    Hub,
+    Peer,
+    #[serde(other)]
+    Unknown,
+}
+
+impl From<FleetMode> for DeclaredFleetMode {
+    fn from(mode: FleetMode) -> Self {
+        match mode {
+            FleetMode::Standalone => Self::Standalone,
+            FleetMode::Hub => Self::Hub,
+            FleetMode::Peer => Self::Peer,
+        }
+    }
+}
+
 /// (#2947) An OS thermal state, as `runtime.thermal.pause_at` / `resume_at`
 /// name one. Declared in severity order, mildest first: the governor ranks a
 /// state by its position (`darkmux_crew::host_probe::thermal::THERMAL_STATES`
@@ -2142,6 +2204,14 @@ impl DarkmuxConfig {
                 accept_work: Some(BTreeMap::new()),
                 // (#2916 stage 2) Visible, so the busy answer is discoverable.
                 busy_policy: Some(crate::config_access::FLEET_BUSY_POLICY_DEFAULT.to_string()),
+                // (#3022) Visible and empty: only a hub's values are served.
+                defaults: Some(FleetDefaultsConfig {
+                    radio: Some(FleetDefaultsRadioConfig {
+                        answerer_profile: Some(String::new()),
+                        extras: Default::default(),
+                    }),
+                    extras: Default::default(),
+                }),
                 extras: Default::default(),
             }),
             remote: Some(RemoteConfig {

@@ -78,6 +78,24 @@ impl NodeIdentity {
     }
 }
 
+impl NodeIdentity {
+    /// Whether `host` (a hostname or address as written in a config or a
+    /// roster) is this node: its network name, or one of its overlay
+    /// addresses.
+    pub fn is_host(&self, host: &str) -> bool {
+        self.answers_to(host) || host.trim().parse::<IpAddr>().is_ok_and(|ip| self.addresses.contains(&ip))
+    }
+}
+
+/// Whether `host`, a `redis.host` as written, reaches THIS machine: a loopback
+/// address, or this machine's own overlay node by name or address. The
+/// machine's node is asked for only when the host is not loopback (a
+/// provider call costs a process spawn), and a provider that cannot answer
+/// is "no": this says a machine hosts it only on evidence.
+pub fn host_reaches_this_machine(host: &str, local_node: impl FnOnce() -> Option<NodeIdentity>) -> bool {
+    crate::roster::address_host_is_loopback(host) || local_node().is_some_and(|node| node.is_host(host))
+}
+
 /// The source of network identity. See the module doc for the three-valued
 /// answer [`IdentityProvider::identify`] gives.
 pub trait IdentityProvider: Send + Sync {
@@ -442,6 +460,22 @@ pub fn test_node(node_id: &str, name: &str, addr: &str) -> NodeIdentity {
 
 #[cfg(test)]
 mod tests {
+    /// (#3022) A machine hosts the fleet's Redis when its own `redis.host`
+    /// is loopback or names its own node; a host that is another node's
+    /// name or address, or a node that cannot be identified, is not it.
+    #[test]
+    fn a_redis_host_reaches_this_machine_only_on_evidence() {
+        let me = || Some(test_node("n1", "hub", "100.64.0.1"));
+        for own in ["127.0.0.1", "localhost", "::1", "hub", "HUB.tailnet-example.ts.net", "100.64.0.1"] {
+            assert!(host_reaches_this_machine(own, me), "{own} reaches this machine");
+        }
+        for other in ["100.64.0.2", "studio", "studio.tailnet-example.ts.net", "hubby"] {
+            assert!(!host_reaches_this_machine(other, me), "{other} is not this machine");
+        }
+        assert!(!host_reaches_this_machine("hub", || None), "an unidentifiable node is not evidence");
+        assert!(host_reaches_this_machine("127.0.0.1", || panic!("loopback never asks the provider")));
+    }
+
     /// (#2947) The fleet-submission preflight: a hand-edited unknown
     /// `fleet.identity.provider` is refused when either side builds its
     /// provider, with the registry's message (value, where it was set,

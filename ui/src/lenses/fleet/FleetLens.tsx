@@ -13,6 +13,8 @@ import { REPLAY_GRANULARITY_NOTE, useLiveOverlay } from "../../lib/liveChannel";
 import { useCountUp } from "../../hooks/useCountUp";
 import { useFleetRoster, useLiveMachines } from "../../hooks/useLiveMachines";
 import { useFleetView } from "../../hooks/useFleetView";
+import { HubBadge } from "../../components/HubBadge";
+import { RadioSeatIcon } from "../../components/RadioSeatIcon";
 import { useFlip } from "../../hooks/useFlip";
 import { cardOrderKey, orderCards } from "./cardOrder";
 import { useCardOrderGate } from "./cardOrderGate";
@@ -125,7 +127,7 @@ function CardSpec({ card }: { card: FleetCard }) {
       {card.spec ? (
         <>
           {card.spec}
-          {card.grant ? <span className="spec__grant"> · {card.grant}</span> : null}
+          {card.grant?.text ? <span className="spec__grant"> · {card.grant.text}</span> : null}
         </>
       ) : (
         <span className="specdim">{specDimLabel(card)}</span>
@@ -1109,6 +1111,11 @@ export function FleetLens({
               <span className="mach-name" title={card.name}>
                 {card.name}
               </span>
+              {/* (#3022) What the machine's own card declares. */}
+              <HubBadge declared={card.hub} />
+              {/* The radio seat this peer grants: an icon in the name row,
+                  where a narrow card's ellipsis cannot cut it. */}
+              {card.grant?.radio ? <RadioSeatIcon /> : null}
               {/* (#2915) The utility strip: a fixed box at the end of the
                   name row, always present, so a job starting or ending never
                   changes the card's layout. See `UtilityGlyph`. */}

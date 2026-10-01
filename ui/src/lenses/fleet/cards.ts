@@ -33,7 +33,7 @@ import {
 } from "../../lib/tokenRate";
 import type { ExecutionTokenReading, LiveState } from "../../lib/tokenRate";
 import type { MachineSpecsResponse } from "../../types/generated/MachineSpecsResponse";
-import { specsLine, type RowFacts, type Standing } from "./viewRows";
+import { grantWords, specsLine, type Grant, type RowFacts, type Standing } from "./viewRows";
 import type { PresenceBeat } from "../../types/generated/PresenceBeat";
 // (#2814) `isSelfMachine`/`displayNameOf` live in `lib/flow.ts` beside
 // `nameOf`/`machineNames`/`localMachineUid` rather than here, because the
@@ -110,8 +110,8 @@ export function specDimLabel(card: { note: string | null; specUnknown: SpecUnkno
 
 /** The card's subtitle: the hardware line, then what the peer lets this
  * machine do. One line, so the card keeps its height. */
-export function specLine(card: { spec: string; grant: string | null }): string {
-  return card.grant ? `${card.spec} · ${card.grant}` : card.spec;
+export function specLine(card: { spec: string; grant: Grant | null }): string {
+  return card.grant ? `${card.spec} · ${grantWords(card.grant)}` : card.spec;
 }
 
 /** (#2060) Collapse a machine's running runs down to TOP-LEVEL runs: a
@@ -279,9 +279,11 @@ export interface FleetCard {
    *  read ("listener off"); shown in place of the hardware line. `null` for
    *  a machine the view read, and for one the view does not hold. */
   note: string | null;
-  /** What this peer lets this machine do, as one compact line; `null` for
+  /** What this peer lets this machine do (`viewRows.Grant`); `null` for
    *  this machine's own card and for any peer without a grant to show. */
-  grant: string | null;
+  grant: Grant | null;
+  /** The machine's own card declares `fleet.mode hub`. */
+  hub: boolean;
   /** Whether the machine is up: the view's own `liveness` (a card it read
    *  is proof of life), or, for a machine the view does not hold, the flow
    *  window's online/offline edges. */
@@ -487,6 +489,7 @@ function cardIdentity(
       specUnknown: spec ? null : liveMachines.has(m) ? ("not-reported" as const) : ("not-seen" as const),
       note: null,
       grant: null,
+      hub: false,
       standing: machAbsent ? ("offline" as const) : ("online" as const),
       self: false,
     };
@@ -499,6 +502,7 @@ function cardIdentity(
     specUnknown: row.spec ? null : ("not-reported" as const),
     note: row.note,
     grant: row.grant,
+    hub: row.hub,
     standing: row.standing,
     // (#2915) The view says which row is this machine; a peer's model is
     // read off its own utility records and its residency is unknown.
@@ -622,6 +626,7 @@ export function buildFleetCardBase(
     specUnknown: id.specUnknown,
     note: id.note,
     grant: id.grant,
+    hub: id.hub,
     standing,
     active,
     absent: standing === "offline",

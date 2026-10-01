@@ -289,10 +289,15 @@ def fleet_view_for(world, hero, ledgers, now_ms, version, schema):
         "m1-max-32gb-studio": {"profiles": ["reviewer"], "roles": ["radio-host"]},
         "mac-mini-m4-16gb": {"profiles": [], "roles": ["radio-host"]},
     }
+    # The always-on machine declares the hub role (`fleet.mode hub`): its card
+    # says so, and carries the fleet defaults it hands out. Every other machine
+    # declares `peer`.
+    hub_id = "mac-mini-m4-16gb"
     rows = []
     for m in world["machines"]:
         specs = specs_for(m, world, ledgers[m["id"]], now_ms, version, schema)
         is_hero = m["id"] == hero["id"]
+        is_hub = m["id"] == hub_id
         grant = grants.get(m["id"])
         rows.append({
             "entry": None if is_hero else {"id": disp(m), "address": "demo-peer.internal:8765",
@@ -311,6 +316,8 @@ def fleet_view_for(world, hero, ledgers, now_ms, version, schema):
                              "battery_gate": {"floor_pct": 20, "refuse_start_below_min": False,
                                               "pause_running_below_min": False,
                                               "refusing_start": None}},
+                "fleet_mode": "hub" if is_hub else "peer", "hosts_fleet_redis": is_hub,
+                **({"fleet_defaults": {"version": 1, "radio": {"answerer_profile": None}}} if is_hub else {}),
                 "generated_at_ms": now_ms, "gather_ms": 0, "cache_ttl_ms": 0}},
             "accepts": ({"state": "this_machine"} if is_hero else
                         {"state": "granted", "accepts": {

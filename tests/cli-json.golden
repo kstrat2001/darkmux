@@ -39,7 +39,7 @@ flow tail  one flow record per line, verbatim; the record is pinned by FLOW_SCHE
 
 # types
 AbandonReason = "aborted" | "noterminal"
-AcceptsState = { accepts: CardAccepts; state: "granted" } | { state: "not_listed" } | { state: "this_machine" } | { state: "withheld" } | { state: "unknown" }
+AcceptsState = { accepts: CardAccepts; state: "granted" } | { state: "not_listed" } | { state: "this_machine" } | { state: "unknown" }
 ActiveWait
   scope: string
   subject: string
@@ -109,6 +109,9 @@ CardBatteryGate
   refusing_start: boolean | null
 CardBusyPolicy = "refuse" | "queue" | "unknown"
 CardEndpointKind = "managed" | "unmanaged" | "mixed" | "unresolved" | "unknown"
+CardFleetDefaults
+  version: uint32
+  radio: CardRadioDefaults
 CardGovernor
   thermal: ThermalNow | null
   battery: BatteryCharge | null
@@ -130,6 +133,8 @@ CardProfile
   is_default: boolean
   endpoint_kind: CardEndpointKind
   models: CardModel[]
+CardRadioDefaults
+  answerer_profile: string | null
 CardSeats
   busy_policy: CardBusyPolicy
   counts_own_work: boolean
@@ -208,6 +213,7 @@ DebriefReport
   cautions: string[]
   corrections: string[]
   records_emitted: RecordsEmitted | null
+DeclaredFleetMode = "standalone" | "hub" | "peer" | "unknown"
 DestinationProblem = "both_http_and_file" | "no_destination"
 DetectorArea
   files: string[]
@@ -564,6 +570,9 @@ MachineCard
   profiles_error: string | null
   seats?: CardSeats | null
   governor: CardGovernor
+  fleet_mode?: DeclaredFleetMode | null
+  hosts_fleet_redis?: boolean | null
+  fleet_defaults?: CardFleetDefaults | null
   generated_at_ms: uint64
   gather_ms: uint64
   cache_ttl_ms: uint64

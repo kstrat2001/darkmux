@@ -1087,6 +1087,7 @@ mod tests {
             beat_ts_ms: darkmux_flow::presence::now_ms(),
             specs: None,
             darkmux_version: None,
+            fleet_mode: None,
         };
         darkmux_flow::presence::write_beat(&redis_client, &beat, 60).unwrap();
 

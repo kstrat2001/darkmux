@@ -14,6 +14,7 @@
           "cache_ttl_ms": 0,
           "card_schema_version": "1.0.0",
           "default_profile": null,
+          "fleet_mode": "peer",
           "gather_ms": 0,
           "generated_at_ms": 1790328465947,
           "governor": {
@@ -26,6 +27,7 @@
             },
             "thermal": null
           },
+          "hosts_fleet_redis": false,
           "profiles": [],
           "profiles_error": null,
           "specs": {
@@ -108,6 +110,7 @@
           "cache_ttl_ms": 0,
           "card_schema_version": "1.0.0",
           "default_profile": null,
+          "fleet_mode": "peer",
           "gather_ms": 0,
           "generated_at_ms": 1790328465947,
           "governor": {
@@ -120,6 +123,7 @@
             },
             "thermal": null
           },
+          "hosts_fleet_redis": false,
           "profiles": [],
           "profiles_error": null,
           "specs": {
@@ -184,6 +188,13 @@
           "cache_ttl_ms": 0,
           "card_schema_version": "1.0.0",
           "default_profile": null,
+          "fleet_defaults": {
+            "radio": {
+              "answerer_profile": null
+            },
+            "version": 1
+          },
+          "fleet_mode": "hub",
           "gather_ms": 0,
           "generated_at_ms": 1790328465947,
           "governor": {
@@ -196,6 +207,7 @@
             },
             "thermal": null
           },
+          "hosts_fleet_redis": true,
           "profiles": [],
           "profiles_error": null,
           "specs": {

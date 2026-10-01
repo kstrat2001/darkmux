@@ -375,6 +375,31 @@ pub fn fleet_mode_with_source(
     resolve_enum("fleet.mode")
 }
 
+/// The declared fleet position as it is stated on the wire (card, presence
+/// beat, `machine.telemetry`): [`fleet_mode`], with a bad `fleet.mode` value
+/// stated as `Unknown` instead of an error. The one place the three wire
+/// surfaces read the declared mode from.
+pub fn declared_fleet_mode() -> crate::config::DeclaredFleetMode {
+    fleet_mode().map_or(crate::config::DeclaredFleetMode::Unknown, Into::into)
+}
+
+/// (#3022) `fleet.defaults.radio.answerer_profile`: the `<profile>@<machine>`
+/// the fleet hub hands to machines with no answering seat of their own.
+/// Config only (there is no env tier: the value is what this machine's card
+/// states to the fleet). `None` when unset or empty. Read this only when
+/// this machine declares `hub`; the card carries it only then.
+pub fn fleet_defaults_radio_answerer_profile() -> Option<String> {
+    config()
+        .fleet
+        .as_ref()
+        .and_then(|f| f.defaults.as_ref())
+        .and_then(|d| d.radio.as_ref())
+        .and_then(|r| r.answerer_profile.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 // ── Fleet work submission (#2916) ──
 /// The identity provider `init` writes and an absent `fleet.identity.provider`
 /// resolves to.
@@ -2701,6 +2726,23 @@ mod tests {
         let err = fleet_mode().unwrap_err();
         assert_eq!(err.raw, "hubb");
         assert_eq!(err.set_in, crate::config_enum::SetIn::Env("DARKMUX_FLEET_MODE"));
+        unsafe { std::env::remove_var(k); }
+    }
+
+    // ── declared_fleet_mode (#3022): what the wire states ──
+    /// A registered value is stated as itself; a bad `fleet.mode` is stated as
+    /// `unknown`, never as `standalone` or any mode the operator did not write.
+    #[serial_test::serial]
+    #[test]
+    fn declared_fleet_mode_states_the_value_and_unknown_for_a_bad_one() {
+        use crate::config::DeclaredFleetMode;
+        let k = "DARKMUX_FLEET_MODE";
+        unsafe { std::env::remove_var(k); }
+        assert_eq!(declared_fleet_mode(), DeclaredFleetMode::Standalone);
+        for (set, want) in [("hub", DeclaredFleetMode::Hub), ("PEER", DeclaredFleetMode::Peer), ("hubb", DeclaredFleetMode::Unknown)] {
+            unsafe { std::env::set_var(k, set); }
+            assert_eq!(declared_fleet_mode(), want, "{set}");
+        }
         unsafe { std::env::remove_var(k); }
     }
 

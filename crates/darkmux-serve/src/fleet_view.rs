@@ -40,6 +40,7 @@
 //! falls to for a value a newer darkmux invented. `Unknown` is never read as
 //! any known value.
 
+use darkmux_types::config::DeclaredFleetMode;
 use crate::machine_card::{gather_local_card, CardAccepts, CardGrant, ListenerCard, MachineCard, CARD_SCHEMA_VERSION};
 use crate::source_state::SourceState;
 use crate::wire::RosterMachineEntry;
@@ -185,9 +186,6 @@ pub enum AcceptsState {
     NotListed,
     /// The row is this machine: it does not send work to itself.
     ThisMachine,
-    /// A reader that is not on this machine is not shown what this machine's
-    /// peers let it do: the fleet token does not make a reader this machine.
-    Withheld,
     /// No answer: no card came back, the peer could not say, or a state a
     /// newer darkmux states. Never read as granted or as not listed.
     #[serde(other)]
@@ -380,18 +378,42 @@ impl FleetView {
         }
         self
     }
+}
 
-    /// The view as a reader that is not on this machine may see it: without
-    /// what each peer lets this machine run. Those entries state what each
-    /// peer trusts THIS machine with, and the fleet token is shared
-    /// fleet-wide, so holding it does not make a reader this machine.
-    pub fn without_grants(mut self) -> Self {
-        for m in &mut self.machines {
-            if !m.is_this_machine {
-                m.accepts = AcceptsState::Withheld;
-            }
+impl FleetMachine {
+    /// The fleet position this machine's own card declares; `None` when no
+    /// card of it was read (a machine that did not answer states nothing), or
+    /// its card predates the field.
+    pub fn declared_mode(&self) -> Option<DeclaredFleetMode> {
+        match &self.card {
+            CardOutcome::Available { card, .. } => card.fleet_mode,
+            _ => None,
         }
-        self
+    }
+}
+
+/// Which machines of a view declare `hub`. The one place that counts them:
+/// the viewer's HUB badge, `darkmux doctor` and the fleet-defaults
+/// resolution all read the hub from here, so they cannot disagree.
+#[derive(Debug)]
+pub enum DeclaredHubs<'a> {
+    /// No machine whose card was read declares `hub`.
+    None,
+    One(&'a FleetMachine),
+    /// More than one declares it: none of them is taken as the hub.
+    Several(Vec<&'a FleetMachine>),
+}
+
+impl FleetView {
+    /// The machines whose cards declare `hub`.
+    pub fn declared_hubs(&self) -> DeclaredHubs<'_> {
+        let mut hubs: Vec<&FleetMachine> =
+            self.machines.iter().filter(|m| m.declared_mode() == Some(DeclaredFleetMode::Hub)).collect();
+        match hubs.len() {
+            0 => DeclaredHubs::None,
+            1 => DeclaredHubs::One(hubs.remove(0)),
+            _ => DeclaredHubs::Several(hubs),
+        }
     }
 }
 
@@ -971,8 +993,9 @@ pub(crate) async fn fleet_view_handler(
         .await
         .map_err(|_| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "darkmux serve: fleet view gather panicked\n"))?;
     let peer = peer.map(|c| c.0);
-    let view = if crate::caller_is_local_or_holds_token(peer, &headers) { view } else { view.without_seats() };
-    Ok(axum::Json(if crate::is_local_request(peer, &headers) { view } else { view.without_grants() }))
+    // Grants go to every reader: reads stay tailnet-open, and a grant is a
+    // read (operator, 2026-10-01).
+    Ok(axum::Json(if crate::caller_is_local_or_holds_token(peer, &headers) { view } else { view.without_seats() }))
 }
 
 #[cfg(test)]
@@ -1031,6 +1054,7 @@ pub(crate) mod tests {
             beat_ts_ms: 1234,
             specs: None,
             darkmux_version: version.map(str::to_string),
+            fleet_mode: None,
         }
     }
 
@@ -1345,6 +1369,54 @@ pub(crate) mod tests {
         assert_eq!(gather_view(&s, Duration::ZERO).cache_ttl_ms, 0);
     }
 
+    // ── the declared hub (#3022) ────────────────────────────────────────
+
+    fn declaring(id: &str, mode: DeclaredFleetMode) -> CardOutcome {
+        let mut card = card_of(id);
+        card.fleet_mode = Some(mode);
+        CardOutcome::Available { card: Box::new(card), source: CardSource::Listener }
+    }
+
+    /// The view names the hub from the cards alone: one declaring machine is
+    /// the hub; none, or several, is not, and a machine whose card was not
+    /// read declares nothing.
+    #[test]
+    fn the_view_names_a_hub_only_when_exactly_one_card_declares_it() {
+        let view_of = |modes: &[(&str, Option<DeclaredFleetMode>)]| {
+            let s = scripted(identity("laptop", None, None), modes.iter().map(|(id, _)| entry(id)).collect());
+            for (id, mode) in modes {
+                let outcome = match mode {
+                    Some(m) => declaring(id, *m),
+                    None => old("4.0.0"),
+                };
+                peer_says(&s, id, 0, outcome, AcceptsState::Unknown);
+            }
+            let mut view = gather_view(&s, FLEET_VIEW_CACHE_TTL);
+            // This machine's own row is not under test: make it a peer.
+            if let CardOutcome::Available { card, .. } = &mut view.machines[0].card {
+                card.fleet_mode = Some(DeclaredFleetMode::Peer);
+            }
+            view
+        };
+        let name = |m: &FleetMachine| m.entry.as_ref().unwrap().id.clone();
+        match view_of(&[("studio", Some(DeclaredFleetMode::Hub)), ("mini", Some(DeclaredFleetMode::Peer))]).declared_hubs() {
+            DeclaredHubs::One(m) => assert_eq!(name(m), "studio"),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            view_of(&[("studio", Some(DeclaredFleetMode::Peer)), ("mini", None)]).declared_hubs(),
+            DeclaredHubs::None
+        ));
+        assert!(matches!(
+            view_of(&[("studio", None), ("mini", Some(DeclaredFleetMode::Unknown))]).declared_hubs(),
+            DeclaredHubs::None
+        ), "an unread card and an unknown mode are not hubs");
+        match view_of(&[("studio", Some(DeclaredFleetMode::Hub)), ("mini", Some(DeclaredFleetMode::Hub))]).declared_hubs() {
+            DeclaredHubs::Several(hubs) => assert_eq!(hubs.len(), 2),
+            other => panic!("two hubs are not one: {other:?}"),
+        }
+    }
+
     // ── who sees what ───────────────────────────────────────────────────
 
     fn grant() -> CardAccepts {
@@ -1368,10 +1440,11 @@ pub(crate) mod tests {
         CardOutcome::Available { card: Box::new(card_of(id)), source: CardSource::Listener }
     }
 
-    /// A reader that is neither local nor a token holder is shown neither what
-    /// peers let this machine do nor any seat block.
+    /// A reader that is neither local nor a token holder is shown no seat
+    /// block, and is shown what peers let this machine do: reads stay
+    /// tailnet-open (operator, 2026-10-01), and a grant is a read.
     #[test]
-    fn a_view_for_an_outside_reader_withholds_grants_and_seats() {
+    fn a_view_for_an_outside_reader_withholds_seats_and_shows_grants() {
         let s = scripted(identity("laptop", None, None), vec![entry("studio")]);
         peer_says(&s, "studio", 0, available("studio"), AcceptsState::Granted { accepts: grant() });
         let full = gather_view(&s, FLEET_VIEW_CACHE_TTL);
@@ -1381,11 +1454,11 @@ pub(crate) mod tests {
             other => panic!("{other:?}"),
         };
         assert!(seats(&full, "studio"));
-        let outside = full.without_grants().without_seats();
-        assert_eq!(row(&outside, "studio").accepts, AcceptsState::Withheld);
+        let outside = full.without_seats();
+        assert_eq!(row(&outside, "studio").accepts, AcceptsState::Granted { accepts: grant() });
         assert!(!seats(&outside, "studio"), "a peer's seats are not for an outside reader");
         let me = outside.machines.iter().find(|m| m.is_this_machine).unwrap();
-        assert_eq!(me.accepts, AcceptsState::ThisMachine, "this machine's own row states no grant to hide");
+        assert_eq!(me.accepts, AcceptsState::ThisMachine, "this machine's own row states no grant");
         assert!(matches!(&me.card, CardOutcome::Available { card, .. } if card.seats.is_none()));
     }
 
@@ -2044,11 +2117,13 @@ pub(crate) mod tests {
         assert_eq!(me["accepts"]["state"], "this_machine");
     }
 
-    /// The audience of `accepts` and seats is the doctor panel's: this machine
-    /// or a holder of the fleet token. A caller that is neither gets neither.
+    /// Seats go to this machine or a holder of the fleet token; grants go to
+    /// every reader. (Live, 2026-10-01: the operator's bookmarked viewer reaches
+    /// the daemon through `tailscale serve`, so it is never "this machine", and
+    /// it showed no grant at all.)
     #[tokio::test]
     #[serial_test::serial]
-    async fn the_fleet_view_route_shows_grants_to_local_or_token_readers_only() {
+    async fn the_fleet_view_route_shows_grants_to_every_reader_and_seats_to_local_or_token_readers() {
         let s = scripted(identity("laptop", None, None), vec![entry("studio")]);
         peer_says(&s, "studio", 0, available("studio"), AcceptsState::Granted { accepts: grant() });
         let ctx = FleetContext::with_sources(Arc::new(s));
@@ -2058,16 +2133,15 @@ pub(crate) mod tests {
         assert_eq!(studio(&local)["accepts"]["state"], "granted", "this machine's own reader: {local}");
         assert!(studio(&local)["card"]["card"]["seats"].is_object());
         let outsider = get(ctx.clone(), "/fleet/view", "10.0.0.9:5555", &[]).await;
-        assert_eq!(studio(&outsider)["accepts"]["state"], "withheld", "{outsider}");
+        assert_eq!(studio(&outsider)["accepts"]["state"], "granted", "{outsider}");
         assert!(studio(&outsider)["card"]["card"].get("seats").is_none(), "{outsider}");
     }
 
-    /// The fleet token is shared fleet-wide, so holding it says nothing about
-    /// who a peer trusts with what: a token holder from another machine sees
-    /// the card (seats included) but never the grants.
+    /// A token holder from another machine sees the card, seats included, and
+    /// the grants every reader sees.
     #[tokio::test]
     #[serial_test::serial]
-    async fn a_token_holding_reader_from_another_machine_sees_no_grants() {
+    async fn a_token_holding_reader_from_another_machine_sees_grants_and_seats() {
         let prev = std::env::var("DARKMUX_SERVE_TOKEN").ok();
         unsafe { std::env::set_var("DARKMUX_SERVE_TOKEN", FLEET_TOKEN) };
         let s = scripted(identity("laptop", None, None), vec![entry("studio")]);
@@ -2082,7 +2156,7 @@ pub(crate) mod tests {
             }
         }
         let studio = view["machines"].as_array().unwrap().iter().find(|m| m["entry"]["id"] == "studio").cloned().unwrap();
-        assert_eq!(studio["accepts"]["state"], "withheld", "{view}");
+        assert_eq!(studio["accepts"]["state"], "granted", "{view}");
         assert!(studio["card"]["card"]["seats"].is_object(), "the token still opens the seats: {view}");
     }
 
