@@ -155,17 +155,36 @@ pub fn open_at(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// Ordered migrations past the baseline: `(to_version, sql)`, ascending.
+/// `lessons` is a SOURCE table (never dropped), so each is an additive
+/// `ALTER`. Empty while [`LESSONS_SCHEMA_VERSION`] is the baseline `1`.
+const LESSONS_MIGRATIONS: &[(i32, &str)] = &[];
+
 fn init_schema(conn: &Connection) -> Result<()> {
+    init_schema_with(conn, LESSONS_SCHEMA_VERSION, LESSONS_MIGRATIONS)
+}
+
+/// (#3035) Bring the db to `target`. A db stamped NEWER than `target` was
+/// written by a newer darkmux whose shape this binary cannot place: refused,
+/// never re-stamped down (which would let this binary write over a shape it
+/// does not know). An older or unstamped one gets the baseline schema, then
+/// every migration past its version in order, then the stamp.
+fn init_schema_with(conn: &Connection, target: i32, migrations: &[(i32, &str)]) -> Result<()> {
     let current: i32 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap_or(0);
+    if current > target {
+        anyhow::bail!(
+            "lessons.db was written by a newer darkmux (v{current}; this binary reads v{target}). Upgrade darkmux."
+        );
+    }
     conn.execute_batch(LESSONS_SCHEMA_SQL)
         .context("applying lessons schema")?;
-    // Future migrations: `if current < N { conn.execute_batch("ALTER TABLE …") }`
-    // before the version stamp. `lessons` is a SOURCE table (never dropped),
-    // so migrations are additive ALTERs, not the index's drop+recreate.
-    if current != LESSONS_SCHEMA_VERSION {
-        conn.execute_batch(&format!("PRAGMA user_version = {LESSONS_SCHEMA_VERSION};"))
+    for (to, sql) in migrations.iter().filter(|(to, _)| *to > current) {
+        conn.execute_batch(sql).with_context(|| format!("migrating lessons db to v{to}"))?;
+    }
+    if current != target {
+        conn.execute_batch(&format!("PRAGMA user_version = {target};"))
             .context("stamping lessons schema version")?;
     }
     Ok(())
@@ -309,6 +328,12 @@ pub fn export_json(conn: &Connection) -> Result<String> {
 /// and a missing `source` defaults to `"operator"` (matching [`add`]).
 pub fn import_json(conn: &mut Connection, data: &str) -> Result<ImportStats> {
     let env: LessonsExport = serde_json::from_str(data).context("parsing lessons export")?;
+    if env.schema_version > LESSONS_SCHEMA_VERSION {
+        anyhow::bail!(
+            "this lessons export was written by a newer darkmux (v{}; this binary reads v{LESSONS_SCHEMA_VERSION}). Upgrade darkmux.",
+            env.schema_version
+        );
+    }
     let now = now_unix();
     let mut stats = ImportStats::default();
     let tx = conn.transaction().context("opening import transaction")?;
@@ -383,9 +408,10 @@ pub fn load_entries_best_effort(path: &Path) -> Vec<Lesson> {
     if !path.exists() {
         return Vec::new();
     }
-    open_at(path)
-        .and_then(|conn| list(&conn))
-        .unwrap_or_default()
+    open_at(path).and_then(|conn| list(&conn)).unwrap_or_else(|e| {
+        eprintln!("darkmux: lessons are unavailable this dispatch: {e:#}");
+        Vec::new()
+    })
 }
 
 #[cfg(test)]
@@ -402,6 +428,62 @@ mod tests {
         // Idempotent re-open is fine.
         let conn2 = open_at(&tmp.path().join("lessons.db")).unwrap();
         assert!(list(&conn2).unwrap().is_empty());
+    }
+
+    /// (#3035) A db a newer darkmux stamped is refused, not re-stamped down,
+    /// and its rows are left alone.
+    #[test]
+    fn a_newer_db_is_refused_and_keeps_its_version() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("lessons.db");
+        drop(open_at(&path).unwrap());
+        let newer = LESSONS_SCHEMA_VERSION + 1;
+        Connection::open(&path).unwrap().execute_batch(&format!("PRAGMA user_version = {newer};")).unwrap();
+        let err = open_at(&path).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            format!(
+                "lessons.db was written by a newer darkmux (v{newer}; this binary reads v{LESSONS_SCHEMA_VERSION}). Upgrade darkmux."
+            )
+        );
+        let v: i32 = Connection::open(&path).unwrap().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, newer, "the refusal must not stamp the version down");
+        assert!(load_entries_best_effort(&path).is_empty(), "the inject read degrades, with a warning");
+    }
+
+    /// (#3035) An older db runs the migrations past its version in order, then
+    /// is stamped; one already at a migration's version does not re-run it.
+    #[test]
+    fn a_lessons_export_from_a_newer_darkmux_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let mut conn = open_at(&tmp.path().join("lessons.db")).unwrap();
+        let json = format!(r#"{{"schema_version":{},"lessons":[{{"title":"t","body":"b"}}]}}"#, LESSONS_SCHEMA_VERSION + 1);
+        let err = import_json(&mut conn, &json).unwrap_err().to_string();
+        assert!(err.contains("written by a newer darkmux") && err.contains("Upgrade darkmux."), "{err}");
+        assert!(list(&conn).unwrap().is_empty(), "nothing was imported");
+    }
+
+    #[test]
+    fn an_older_db_runs_ordered_migrations_then_stamps() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema_with(&conn, 1, &[]).unwrap();
+        let migrations = [
+            (2, "ALTER TABLE lessons ADD COLUMN m2 TEXT;"),
+            (3, "ALTER TABLE lessons ADD COLUMN m3 TEXT; UPDATE lessons SET m3 = 'x';"),
+        ];
+        init_schema_with(&conn, 3, &migrations).unwrap();
+        let cols: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('lessons')")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(cols.contains(&"m2".to_string()) && cols.contains(&"m3".to_string()), "{cols:?}");
+        let v: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 3);
+        // Re-running at the same version is a no-op (an ALTER twice would fail).
+        init_schema_with(&conn, 3, &migrations).unwrap();
     }
 
     #[test]
