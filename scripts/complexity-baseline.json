@@ -14,7 +14,6 @@
   "crates/darkmux-crew/src/dispatch_internal.rs::build_docker_run_argv": 16,
   "crates/darkmux-crew/src/dispatch_internal.rs::dispatch": 89,
   "crates/darkmux-crew/src/dispatch_internal.rs::dispatch_local_single_shot": 20,
-  "crates/darkmux-crew/src/dispatch_internal.rs::ensure_model_resident_from": 16,
   "crates/darkmux-crew/src/dispatch_internal.rs::ensure_runtime_binary_cached_at": 16,
   "crates/darkmux-crew/src/dispatch_internal.rs::kill_container_persistently": 19,
   "crates/darkmux-crew/src/dispatch_internal.rs::resolve_dispatch_model_with_hosts": 16,

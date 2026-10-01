@@ -49,7 +49,7 @@ pub use dispatch::{
 pub use lifecycle::{
     BreachLevel, BudgetMetric, BudgetPayload, BudgetPolicyKind, BudgetScope, GhVerbExecutedPayload, GrowReason,
     MissionGrowPayload, MissionRunTerminalPayload, PhaseReviewVerdictPayload, RadioDecision, RadioRoutePayload, RadioSurface,
-    ReviewVerdict, RunPayload, SeatClass, StepResultPayload, StepSeatUnresolvedPayload, StepStartPayload, StepTimingPayload,
+    ReviewVerdict, RunPayload, SeatClass, StepErrorPayload, StepResultPayload, StepSeatUnresolvedPayload, StepStartPayload, StepTimingPayload,
 };
 pub use machine::{
     BatteryCharge, BatteryHealthNow, ChargeState, BatteryTransition, CpuClusterNow, HostSampleNow, LoadWindow, MachineBatteryHealthPayload,
@@ -299,6 +299,7 @@ flow_payloads! {
     RunComplete => RunPayload;
     RunError => RunPayload;
     StepStart => StepStartPayload;
+    StepError => StepErrorPayload;
     StepResult => StepResultPayload;
     StepTiming => StepTimingPayload;
     StepSeatUnresolved => StepSeatUnresolvedPayload;

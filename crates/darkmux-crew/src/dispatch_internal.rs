@@ -574,6 +574,45 @@ const PROMPT_FILE_CONTAINER_PATH: &str = "/darkmux-out/.prompt.txt";
 /// this must change too.
 const RESUME_CHECKPOINT_CONTAINER_PATH: &str = "/darkmux-out/checkpoint.json";
 
+/// (F7) A resume refusal, already prefixed `darkmux dispatch: RESUME ...` and
+/// naming what to do. Wrapping it in more context (a step's name, a flag's)
+/// stacks internal prefixes in front of the one clear one, so
+/// [`with_step_context`] leaves it bare.
+#[derive(Debug)]
+pub(crate) struct ResumeRefusal(pub(crate) String);
+
+impl std::fmt::Display for ResumeRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ResumeRefusal {}
+
+/// A [`ResumeRefusal`] as an `anyhow::Error` (the `anyhow!` form).
+macro_rules! resume_refusal {
+    ($($arg:tt)*) => {
+        anyhow::Error::new(ResumeRefusal(format!($($arg)*)))
+    };
+}
+
+/// A [`ResumeRefusal`] returned from the enclosing fn (the `bail!` form).
+macro_rules! bail_resume {
+    ($($arg:tt)*) => {
+        return Err(resume_refusal!($($arg)*))
+    };
+}
+
+/// Add a step's name to an error, except to a [`ResumeRefusal`], which
+/// already says everything the operator needs and reads worse with a prefix.
+pub(crate) fn with_step_context(e: anyhow::Error, context: impl FnOnce() -> String) -> anyhow::Error {
+    if e.chain().any(|c| c.is::<ResumeRefusal>()) {
+        e
+    } else {
+        e.context(context())
+    }
+}
+
 /// (#2114 follow-up) Checkpoint filename `runtime/src/checkpoint.rs` writes
 /// under a dispatch's `host_out` (see `RESUME_CHECKPOINT_CONTAINER_PATH`'s
 /// own doc for the container-side mount path). Named once here so
@@ -680,7 +719,7 @@ pub(crate) fn validate_resume_checkpoint_content(
         crate::contained_file::DEFAULT_MAX_BYTES,
     );
     if let Err(e @ crate::contained_file::ContainedFileError::Refused(_)) = &read {
-        bail!(
+        bail_resume!(
             "darkmux dispatch: RESUME CHECKPOINT REFUSED — {} was {e}; darkmux reads a \
              checkpoint only as a regular file inside --resume-from {}",
             src.display(),
@@ -688,7 +727,7 @@ pub(crate) fn validate_resume_checkpoint_content(
         );
     }
     if matches!(read, Err(crate::contained_file::ContainedFileError::NotFound)) {
-        bail!(
+        bail_resume!(
             "darkmux dispatch: RESUME CHECKPOINT NOT FOUND — expected {} to \
              exist (no checkpoint.json under --resume-from {}); this \
              dispatch cannot resume. darkmux never silently starts a \
@@ -702,7 +741,7 @@ pub(crate) fn validate_resume_checkpoint_content(
     let contents = read
         .with_context(|| format!("reading resume checkpoint at {}", src.display()))?;
     let value: serde_json::Value = serde_json::from_str(&contents).map_err(|e| {
-        anyhow!(
+        resume_refusal!(
             "darkmux dispatch: RESUME CHECKPOINT INVALID — {} is not valid \
              JSON ({e}); refusing to resume from a file that isn't a real \
              checkpoint",
@@ -710,7 +749,7 @@ pub(crate) fn validate_resume_checkpoint_content(
         )
     })?;
     let obj = value.as_object().ok_or_else(|| {
-        anyhow!(
+        resume_refusal!(
             "darkmux dispatch: RESUME CHECKPOINT INVALID — {} does not \
              parse as a darkmux checkpoint (top level is not a JSON \
              object)",
@@ -719,7 +758,7 @@ pub(crate) fn validate_resume_checkpoint_content(
     })?;
     let schema_version = obj.get("schema_version").and_then(|v| v.as_u64());
     if schema_version.is_none() {
-        bail!(
+        bail_resume!(
             "darkmux dispatch: RESUME CHECKPOINT INVALID — {} does not \
              parse as a darkmux checkpoint (missing or non-numeric \
              `schema_version`)",
@@ -732,7 +771,7 @@ pub(crate) fn validate_resume_checkpoint_content(
     // misreport it as `role_id: "<missing>"` — an honest version gap is not
     // a role mismatch.
     if schema_version.is_some_and(|v| v < 3) {
-        bail!(
+        bail_resume!(
             "darkmux dispatch: RESUME CHECKPOINT STALE SCHEMA — {} has \
              schema_version={} (this darkmux build writes/expects >= 3); \
              it predates the role_id field this resume gate needs and \
@@ -742,7 +781,7 @@ pub(crate) fn validate_resume_checkpoint_content(
         );
     }
     if !obj.get("messages").is_some_and(|v| v.is_array()) {
-        bail!(
+        bail_resume!(
             "darkmux dispatch: RESUME CHECKPOINT INVALID — {} does not \
              parse as a darkmux checkpoint (missing or non-array \
              `messages`)",
@@ -759,7 +798,7 @@ pub(crate) fn validate_resume_checkpoint_content(
     // write_checkpoint call at all.
     let checkpoint_role_id = obj.get("role_id").and_then(|v| v.as_str());
     if checkpoint_role_id != Some(expected_role_id) {
-        bail!(
+        bail_resume!(
             "darkmux dispatch: RESUME CHECKPOINT ROLE MISMATCH — {} was written for role `{}`, \
              but this dispatch is running as role `{expected_role_id}`; refusing to resume a \
              checkpoint under a different role (it may be more permissive than the one it was \
@@ -889,7 +928,7 @@ pub(crate) fn validate_resume_checkpoint(
         crate::contained_file::SMALL_FILE_MAX_BYTES,
     )
     .map_err(|e| {
-        anyhow!(
+        resume_refusal!(
             "darkmux dispatch: RESUME ORIGIN UNKNOWN — could not read {} ({e}); this host has \
              no record of the workspace mount mode/path the checkpoint at {} was written \
              under, and darkmux refuses to guess — resume only from a dir this host itself \
@@ -899,7 +938,7 @@ pub(crate) fn validate_resume_checkpoint(
         )
     })?;
     let origin: serde_json::Value = serde_json::from_str(&origin_contents).map_err(|e| {
-        anyhow!(
+        resume_refusal!(
             "darkmux dispatch: RESUME ORIGIN UNKNOWN — {} is not valid JSON ({e}); refusing to \
              resume without a trustworthy record of the original workspace mount",
             origin_path.display()
@@ -909,7 +948,7 @@ pub(crate) fn validate_resume_checkpoint(
     let origin_read_only = origin.get("workspace_read_only").and_then(|v| v.as_bool());
     let (Some(origin_workspace), Some(origin_read_only)) = (origin_workspace, origin_read_only)
     else {
-        bail!(
+        bail_resume!(
             "darkmux dispatch: RESUME ORIGIN UNKNOWN — {} is missing `workspace` or \
              `workspace_read_only`; refusing to resume without a trustworthy record of the \
              original mount",
@@ -918,7 +957,7 @@ pub(crate) fn validate_resume_checkpoint(
     };
     let expected_workspace_str = expected_workspace.display().to_string();
     if origin_workspace != expected_workspace_str {
-        bail!(
+        bail_resume!(
             "darkmux dispatch: RESUME WORKSPACE MISMATCH — the checkpoint at {} was written \
              against workspace `{origin_workspace}`, but this dispatch's workspace is \
              `{expected_workspace_str}`; refusing to resume against a different tree",
@@ -926,7 +965,7 @@ pub(crate) fn validate_resume_checkpoint(
         );
     }
     if origin_read_only && !expected_workspace_read_only {
-        bail!(
+        bail_resume!(
             "darkmux dispatch: RESUME WORKSPACE MOUNT ESCALATION — the checkpoint at {} was \
              written with a READ-ONLY workspace mount, but this dispatch would mount \
              `{expected_workspace_str}` READ-WRITE; refusing to grant a resumed dispatch write \
@@ -11642,6 +11681,54 @@ pub(crate) fn is_reloadable_target(
         && resident_identifier == darkmux_gestalt::namespaced_identifier(want, want_identifier)
 }
 
+/// What the dispatch residency preflight does about the resident set for one
+/// profile model. The single owner of that rule: [`ensure_model_resident_from`]
+/// acts on it and the lab's pre-run warning reports it, so the two cannot
+/// disagree (#2985 tracks unifying it with the gestalt planner's rule).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreflightDecision {
+    /// The identifier this profile would mint is resident with enough context.
+    Reuse { identifier: String, resident_ctx: u64 },
+    /// That identifier is resident but its context is insufficient (an
+    /// unreported context of 0 included): unload it, then load.
+    Reload { stale_identifier: String, stale_ctx: u64 },
+    /// Nothing darkmux may reuse is resident: load a new instance. Carries the
+    /// identifier of a foreign (not darkmux-loaded) copy of the same weights
+    /// when one is resident, which darkmux loads beside and never touches.
+    LoadFresh { foreign_identifier: Option<String> },
+}
+
+/// Decide what the preflight does for `model_id` (a key or a `darkmux:`
+/// identifier, normalized per #1615) wanting `n_ctx`, given `loaded`.
+/// Only the exact identifier [`is_reloadable_target`] recognizes is ever reused
+/// or reloaded, because the wire `model` is that identifier (#2240).
+pub fn decide_preflight(
+    model_id: &str,
+    want_identifier: Option<&str>,
+    n_ctx: u32,
+    loaded: &[darkmux_types::LoadedModel],
+) -> PreflightDecision {
+    let model_key = bare_model_key(model_id);
+    match loaded
+        .iter()
+        .find(|m| is_reloadable_target(&m.model, &m.identifier, model_key, want_identifier))
+    {
+        Some(m) if darkmux_gestalt::ctx_sufficient(m.context, n_ctx) => {
+            PreflightDecision::Reuse { identifier: m.identifier.clone(), resident_ctx: m.context }
+        }
+        Some(m) => PreflightDecision::Reload {
+            stale_identifier: m.identifier.clone(),
+            stale_ctx: m.context,
+        },
+        None => PreflightDecision::LoadFresh {
+            foreign_identifier: loaded
+                .iter()
+                .find(|m| m.model == model_key)
+                .map(|m| m.identifier.clone()),
+        },
+    }
+}
+
 // The loadable model key is `darkmux_gestalt::bare_model_key` (#1615): the
 // namespace is a load-time decoration, never part of the key. One definition.
 use darkmux_gestalt::bare_model_key;
@@ -11799,38 +11886,35 @@ fn ensure_model_resident_from(
     // that structurally through `OwnedTarget`; this legacy path reached past it
     // to the raw `lms::unload`, so the guarantee has to be restated here until
     // the raw call is retired in favor of the `ModelHost` seam.
-    match loaded
-        .iter()
-        .find(|m| is_reloadable_target(&m.model, &m.identifier, model_key, want_identifier))
-    {
-        Some(m) if m.context >= u64::from(n_ctx) => return Ok(()),
-        Some(m) => {
+    match decide_preflight(&pm.id, want_identifier, n_ctx, &loaded) {
+        PreflightDecision::Reuse { .. } => return Ok(()),
+        PreflightDecision::Reload { stale_identifier, stale_ctx } => {
             eprintln!(
                 "darkmux dispatch: `{}` is resident at context {} but n_ctx={} is wanted \
                  ({}); reloading at {} so the dispatch gets that context. (#1135)",
                 model_key,
-                m.context,
+                stale_ctx,
                 n_ctx,
                 source.describe(),
                 n_ctx
             );
-            unload(&m.identifier).with_context(|| {
-                format!("unloading `{}` to reload at n_ctx={}", m.identifier, n_ctx)
+            unload(&stale_identifier).with_context(|| {
+                format!("unloading `{stale_identifier}` to reload at n_ctx={n_ctx}")
             })?;
         }
-        None => {
+        PreflightDecision::LoadFresh { foreign_identifier } => {
             // (#1609) A foreign resident of the same model is NOT an error and
             // NOT ours to remove — the contract is "surface a reason naming the
             // blocking instance and suggest; never touch". darkmux loads its
             // own namespaced copy alongside it, exactly as the gestalt planner
             // already decides for a ForeignDuplicate.
-            if let Some(foreign) = loaded.iter().find(|m| m.model == model_key) {
+            if let Some(foreign) = foreign_identifier {
                 eprintln!(
                     "darkmux dispatch: `{}` is already resident as `{}`, which darkmux \
                      does not own and will not unload; loading darkmux's own copy at \
                      n_ctx={} alongside it. Free the RAM yourself with `lms unload {}` \
                      if that is not what you want. (#1609)",
-                    model_key, foreign.identifier, n_ctx, foreign.identifier
+                    model_key, foreign, n_ctx, foreign
                 );
             } else {
                 eprintln!("{}", loading_message(model_key, n_ctx, source));
@@ -11846,25 +11930,20 @@ fn ensure_model_resident_from(
         // satisfies the declared context — the namespace contract says a
         // resident `darkmux:<id>` at the right context IS the thing to reuse.
         Err(e) if identifier_already_resident(&format!("{e:#}")) => {
-            match list()
-                .into_iter()
-                .find(|m| is_reloadable_target(&m.model, &m.identifier, model_key, want_identifier))
-            {
-                Some(m) if m.context >= u64::from(n_ctx) => {
+            match decide_preflight(&pm.id, want_identifier, n_ctx, &list()) {
+                PreflightDecision::Reuse { resident_ctx, .. } => {
                     eprintln!(
-                        "darkmux dispatch: `{identifier}` was already resident at context {} \
+                        "darkmux dispatch: `{identifier}` was already resident at context {resident_ctx} \
                          when this load ran (another dispatch loaded it first); reusing it \
-                         rather than failing. (#2318)",
-                        m.context
+                         rather than failing. (#2318)"
                     );
                     Ok(())
                 }
-                Some(m) => bail!(
-                    "darkmux: `{identifier}` is already resident at context {} but this \
+                PreflightDecision::Reload { stale_ctx, .. } => bail!(
+                    "darkmux: `{identifier}` is already resident at context {stale_ctx} but this \
                      dispatch declares n_ctx={n_ctx}, and the load that would have fixed \
                      that was refused because the identifier is taken. Evict it with \
-                     `darkmux machine eject`, then retry. (#2318)",
-                    m.context
+                     `darkmux machine eject`, then retry. (#2318)"
                 ),
                 // Say only what is known. LMStudio refused the load as
                 // already-resident, and the follow-up `lms ps` probe did not
@@ -11874,7 +11953,7 @@ fn ensure_model_resident_from(
                 // the latter would name a cause this path cannot distinguish;
                 // #2318 is cited as where this was first seen, not as a
                 // diagnosis.
-                None => bail!(
+                PreflightDecision::LoadFresh { .. } => bail!(
                     "darkmux: loading `{model_key}` at n_ctx={n_ctx} was refused because \
                      `{identifier}` is already taken, but the follow-up `lms ps` probe \
                      listed no resident under that identifier — so either the probe failed \

@@ -39,6 +39,108 @@ pub struct StepStartPayload {
 
 impl Attribution for StepStartPayload {}
 
+/// The widest cause a `step.error` record carries, in rendered columns.
+const STEP_ERROR_CAUSE_COLUMNS: usize = 400;
+
+/// A step errored: the payload of `step.error`. The full message stays in the
+/// mission's step file and envelope; the record carries enough to say why.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
+pub struct StepErrorPayload {
+    /// Why the step errored: the error's message on one line, control and
+    /// invisible characters dropped, bounded to a few hundred columns.
+    pub cause: String,
+}
+
+/// Query keys whose values are credentials, compared case-insensitively after
+/// [`normalize_query_key`] (so `api-key` and `x-api-key` are the entries below).
+const SECRET_QUERY_KEYS: [&str; 10] = [
+    "token", "access_token", "api_key", "x_api_key", "apikey", "key", "sig", "signature", "secret", "password",
+];
+
+/// A query key lowercased, with the percent-encoded `_` and `-` decoded and
+/// `-` folded to `_`, so the spellings of one key compare equal.
+fn normalize_query_key(key: &str) -> String {
+    key.trim_start_matches('?')
+        .to_ascii_lowercase()
+        .replace("%5f", "_")
+        .replace("%2d", "_")
+        .replace('-', "_")
+}
+
+/// `text` with URL userinfo (`https://user:token@host`) dropped and the value
+/// of any token-looking query parameter replaced by `<redacted>`. An ssh-style
+/// `git@host:path` has no `://` and is left alone. The one place a step
+/// error's cause is cleaned; the flow's existing `redact_url_creds` keeps the
+/// username, which for `https://token@host` is the secret.
+fn redact_credentials(text: &str) -> String {
+    let mut out = Vec::new();
+    let mut redact_next = false;
+    for word in text.split(' ') {
+        let lower = word.to_ascii_lowercase();
+        let is_scheme = matches!(lower.as_str(), "bearer" | "basic");
+        if redact_next && !word.is_empty() && is_scheme {
+            // `Authorization: Bearer <token>`: the scheme is kept, its value is not.
+            out.push(word.to_string());
+        } else if redact_next && !word.is_empty() {
+            redact_next = false;
+            out.push("<redacted>".to_string());
+        } else {
+            redact_next = redact_next || lower == "bearer" || lower == "authorization:";
+            out.push(redact_word(word));
+        }
+    }
+    out.join(" ")
+}
+
+fn redact_word(word: &str) -> String {
+    let word = match word.split_once("://") {
+        Some((scheme, rest)) => {
+            let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+            let (authority, tail) = rest.split_at(end);
+            format!("{scheme}://{}{tail}", authority.rsplit('@').next().unwrap_or(authority))
+        }
+        None => word.to_string(),
+    };
+    let mut out = String::with_capacity(word.len());
+    let mut at_key = true;
+    let mut rest = word.as_str();
+    while !rest.is_empty() {
+        let end = rest.find(['?', '&', '#']).map_or(rest.len(), |i| i + 1);
+        let (piece, next) = rest.split_at(end);
+        let body = piece.trim_end_matches(['?', '&', '#']);
+        let delimiter = &piece[body.len()..];
+        match body.split_once('=') {
+            Some((key, _)) if at_key && SECRET_QUERY_KEYS.contains(&normalize_query_key(key).as_str()) => {
+                out.push_str(key);
+                out.push_str("=<redacted>");
+            }
+            _ => out.push_str(body),
+        }
+        out.push_str(delimiter);
+        at_key = !delimiter.is_empty();
+        rest = next;
+    }
+    out
+}
+
+impl StepErrorPayload {
+    /// The payload for a step that errored with `message`.
+    pub fn from_message(message: &str) -> Self {
+        // Line breaks and tabs become spaces first: the sanitizer drops control
+        // characters outright, which would glue the words either side together.
+        let spaced: String = message.chars().map(|c| if c.is_whitespace() { ' ' } else { c }).collect();
+        // Sanitize BEFORE redacting: a zero-width character inside `to\u{200b}ken=`
+        // would otherwise survive the redactor and be stripped afterward,
+        // rejoining the secret's key.
+        let cause = redact_credentials(&crate::hooks::sanitize_reason_text(&spaced));
+        Self { cause: crate::hooks::bound_reason_width(&cause, STEP_ERROR_CAUSE_COLUMNS) }
+    }
+}
+
+impl Attribution for StepErrorPayload {}
+
 /// A local seat whose placement could not be resolved: the payload of `step.seat_unresolved`.
 /// `Warn`, because it names a real lost guarantee: the dispatch meant to run a local model and has
 /// no residency lease.
@@ -677,5 +779,70 @@ impl Attribution for BudgetPayload {
     }
     fn context_slot(&mut self) -> Option<&mut Option<serde_json::Map<String, serde_json::Value>>> {
         Some(&mut self.context)
+    }
+}
+
+#[cfg(test)]
+mod step_error_tests {
+    use super::*;
+
+    /// (F9) A cause never records a URL's userinfo or a token-looking query
+    /// value: these records ride the fleet's shared stream.
+    #[test]
+    fn step_error_cause_redacts_url_credentials() {
+        let p = StepErrorPayload::from_message(
+            "clone failed: https://bob:s3cret@github.com/x.git and GET https://h/v1?api_key=abc&x=1 (also git@github.com:o/r.git, ?Access_Token=zzz)",
+        );
+        for secret in ["bob", "s3cret", "abc", "zzz"] {
+            assert!(!p.cause.contains(secret), "{secret} leaked: {}", p.cause);
+        }
+        assert!(p.cause.contains("https://github.com/x.git"), "{}", p.cause);
+        assert!(p.cause.contains("api_key=<redacted>&x=1"), "{}", p.cause);
+        assert!(p.cause.contains("git@github.com:o/r.git"), "ssh form untouched: {}", p.cause);
+    }
+
+    /// (F9) The cause is one line with invisible and control characters gone,
+    /// and a long message is cut to the column bound.
+    #[test]
+    fn step_error_cause_is_one_clean_bounded_line() {
+        let p = StepErrorPayload::from_message("bad\u{202e}\nspec\t\u{1b}[31m  here");
+        assert!(!p.cause.contains(['\n', '\t', '\u{202e}', '\u{1b}']), "{:?}", p.cause);
+        assert_eq!(p.cause, "bad spec [31m here");
+        let long = StepErrorPayload::from_message(&"x".repeat(10_000));
+        assert!(long.cause.chars().count() <= STEP_ERROR_CAUSE_COLUMNS + 10, "{}", long.cause.chars().count());
+    }
+
+    /// (F9) A zero-width character inside a key must not defeat redaction by
+    /// being stripped afterward, which would rejoin the secret's key.
+    #[test]
+    fn step_error_cause_redacts_a_key_split_by_a_zero_width_char() {
+        let p = StepErrorPayload::from_message("GET https://h/v1?to\u{200b}ken=SECRET&x=1");
+        assert!(!p.cause.contains("SECRET"), "{}", p.cause);
+        assert!(p.cause.contains("token=<redacted>&x=1"), "{}", p.cause);
+    }
+
+    /// (F9) Hyphenated and percent-encoded spellings of a secret key.
+    #[test]
+    fn step_error_cause_redacts_hyphenated_and_encoded_keys() {
+        let p = StepErrorPayload::from_message(
+            "https://h/?api-key=A1&x=1 https://h/?x-api-key=B2 https://h/?api%5Fkey=C3 https://h/?API%2dKEY=D4 https://h/?x=ok",
+        );
+        for secret in ["A1", "B2", "C3", "D4"] {
+            assert!(!p.cause.contains(secret), "{secret} leaked: {}", p.cause);
+        }
+        assert!(p.cause.contains("x=ok"), "{}", p.cause);
+    }
+
+    /// (F9) A bearer token or Authorization header value is not recorded.
+    #[test]
+    fn step_error_cause_redacts_bearer_and_authorization_values() {
+        let p = StepErrorPayload::from_message(
+            "401 with Authorization: Bearer tok123 then BEARER tok456 and Authorization: Basic dXNlcjpwdw== and Authorization: raw789 done",
+        );
+        for secret in ["tok123", "tok456", "dXNlcjpwdw==", "raw789"] {
+            assert!(!p.cause.contains(secret), "{secret} leaked: {}", p.cause);
+        }
+        assert!(p.cause.contains("done"), "{}", p.cause);
+        assert!(p.cause.contains("401 with"), "{}", p.cause);
     }
 }

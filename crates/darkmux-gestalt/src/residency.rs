@@ -9,10 +9,11 @@
 //! foreign resident sharing the weights is a
 //! [`ResidencyDecision::ForeignDuplicate`] fact — respected as pool
 //! consumption, never a reuse candidate — and the planner decides
-//! load-alongside vs Block-on-capacity. One residency decision still lives
-//! outside the planner: the dispatch preflight in
-//! `darkmux_crew::dispatch_internal` (`ensure_model_resident_from`) makes its
-//! own reuse/reload call. The tests below carry the ported fixtures.
+//! load-alongside vs Block-on-capacity. The dispatch preflight in
+//! `darkmux_crew::dispatch_internal` (`decide_preflight`, shared with the lab's
+//! pre-run warning) has its own exact-identifier reuse rule over the same
+//! [`ctx_sufficient`] check; unifying it with this planner is #2985. The tests
+//! below carry the ported fixtures.
 
 use crate::desired::Placement;
 use crate::facts::ResidentFact;

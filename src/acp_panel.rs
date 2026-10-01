@@ -1727,6 +1727,23 @@ pub(crate) mod tests {
         assert!(!status.contains("#2918"), "{status}");
     }
 
+    /// (F13) The router matches a rule-shaped goal ("look for swallowed errors
+    /// in the ui code") to a config only if the summary line it reads names the
+    /// rules, in words a user would use. The cap must not clip the line.
+    #[test]
+    fn crawl_and_review_summaries_name_their_rules_in_plain_words() {
+        let crawl = config_summary(&mission_config::load("crawl").unwrap().config).to_ascii_lowercase();
+        for word in ["swallowed error", "unnamed", "contradict", "stale"] {
+            assert!(crawl.contains(word), "crawl summary must name `{word}`: {crawl}");
+        }
+        let review = config_summary(&embedded_review()).to_ascii_lowercase();
+        for word in ["swallowed error", "test", "duplicate", "caller", "intent"] {
+            assert!(review.contains(word), "review summary must name `{word}`: {review}");
+        }
+        assert!(!crawl.ends_with("..."), "{crawl}");
+        assert!(!review.ends_with("..."), "{review}");
+    }
+
     // ── prepare_launch: diff synthesis keyed on declared inputs ─────────
 
     fn ready(prepared: Prepared) -> PreparedLaunch {

@@ -14,6 +14,16 @@ darkmux release.
 
 ## [Unreleased]
 
+### Added
+
+- **`step.error` says why** (FLOW 2.0.0, additive). A step's error
+  record carries `{cause}`: the message on one line, control and invisible
+  characters dropped, URL userinfo and token-looking query values redacted,
+  bounded to 400 columns. `mission show` prints the cause
+  under an errored step, and `mission show --json` carries it as the step row's
+  `error` (additive, absent for a step that did not error;
+  `tests/cli-json.golden` regenerated for the new field).
+
 ### Changed (breaking, 4.0)
 
 - **The registered utility model stays loaded across dispatches.** A dispatch

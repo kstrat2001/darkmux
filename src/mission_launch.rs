@@ -2415,11 +2415,30 @@ fn workspace_spec_inputs(config: &MissionConfig) -> std::collections::BTreeSet<S
         .collect()
 }
 
-/// (review C5) The launch preflight's check of the workspace spec a launch
-/// input names: the same unknown-key/wrong-type gate as every user file
-/// (`darkmux_types::user_files`), refused before anything is minted. A
-/// value that is not a file (unset, or a spec the plan derives) is left to
-/// the plan step.
+/// (F8) Why the value of a workspace-spec input cannot be a spec file, when
+/// it cannot: a plan step would fail on it only after the mission is minted
+/// (`reading workspace spec ...: Is a directory`), so the launch, a dry run
+/// included, names the input and what it wants. A blank value is left alone:
+/// the plan step treats it as "no spec" and derives one from `github` +
+/// `head_sha`.
+fn workspace_spec_input_problem(name: &str, path: &std::path::Path) -> Option<String> {
+    if path.as_os_str().to_string_lossy().trim().is_empty() || path.is_file() {
+        return None;
+    }
+    let found = if path.is_dir() { "a directory" } else { "not an existing file" };
+    Some(format!(
+        "input `{name}` is {found} ({}), but it takes a workspace SPEC file (a JSON document naming \
+         the sources to review), not a checkout or a missing path",
+        path.display()
+    ))
+}
+
+/// (review C5, F8) The launch preflight's check of the workspace spec a
+/// launch input names: it must be a spec file (see
+/// [`workspace_spec_input_problem`]), and that file passes the same
+/// unknown-key/wrong-type gate as every user file
+/// (`darkmux_types::user_files`), refused before anything is minted. An input
+/// that is unset is left to the plan step, which derives a spec.
 fn refuse_bad_workspace_specs(config: &MissionConfig, collected: &BTreeMap<String, serde_json::Value>) -> Result<()> {
     use darkmux_types::user_files::{check_path, no_retired, UserFileKind};
     let mut refusal =
@@ -2428,6 +2447,9 @@ fn refuse_bad_workspace_specs(config: &MissionConfig, collected: &BTreeMap<Strin
         let Some(path) = collected.get(&name).and_then(serde_json::Value::as_str).map(std::path::PathBuf::from) else {
             continue;
         };
+        if let Some(problem) = workspace_spec_input_problem(&name, &path) {
+            bail!("mission config \"{}\": {problem}", config.id);
+        }
         if path.is_file() {
             refusal.files.extend(check_path::<darkmux_crew::workspace_spec::WorkspaceSpec>(
                 UserFileKind::WorkspaceSpec,
@@ -6249,6 +6271,21 @@ mod tests {
         let _ = guard;
     }
 
+    /// (F8) A workspace-spec input naming a directory (or nothing) is refused
+    /// before the mint and before `--dry-run` returns, naming the input.
+    #[test]
+    fn a_workspace_input_that_is_not_a_spec_file_is_refused_in_a_dry_run() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let spec = dir.path().join("spec.json");
+        std::fs::write(&spec, "{}").unwrap();
+        let problem = |p: &std::path::Path| workspace_spec_input_problem("workspace", p);
+        assert!(problem(dir.path()).unwrap().contains("a directory"));
+        assert!(problem(dir.path()).unwrap().contains("workspace SPEC file"));
+        assert!(problem(&dir.path().join("missing.json")).unwrap().contains("not an existing file"));
+        assert!(problem(&spec).is_none());
+        assert!(problem(std::path::Path::new("  ")).is_none(), "blank means derive");
+    }
+
     #[test]
     #[serial_test::serial]
     fn dry_run_mints_nothing_for_the_generic_step_graph_path() {
@@ -6272,6 +6309,32 @@ mod tests {
         .expect("a dry run must succeed even though workdir was never touched");
         assert_eq!(exit, 0);
         assert!(all_mission_ids().is_empty(), "a dry run must mint no mission");
+        let _ = guard;
+    }
+
+    /// (F8) The live shape: `review --dry-run` with `workspace=<a directory>`
+    /// is refused, naming the param, and mints nothing.
+    #[test]
+    #[serial_test::serial]
+    fn review_dry_run_refuses_a_workspace_that_is_a_directory() {
+        let guard = LaunchTestGuard::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let diff = dir.path().join("d.diff");
+        std::fs::write(&diff, "").unwrap();
+        let err = launch(
+            "review",
+            None,
+            &[
+                format!("workspace={}", dir.path().display()),
+                format!("diff_file={}", diff.display()),
+                "dry_run=true".to_string(),
+            ],
+            None,
+        )
+        .expect_err("a directory is not a workspace spec");
+        let msg = err.to_string();
+        assert!(msg.contains("input `workspace` is a directory"), "{msg}");
+        assert!(all_mission_ids().is_empty());
         let _ = guard;
     }
 

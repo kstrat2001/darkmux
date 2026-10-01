@@ -275,7 +275,10 @@ pub(crate) enum Cmd {
         /// (if the original was read-only) at least as read-only a mount —
         /// darkmux refuses to run (never silently starts fresh) on any
         /// mismatch. The prior dir is left untouched; this dispatch gets
-        /// its own fresh out dir and its own run record.
+        /// its own fresh out dir and its own run record. MESSAGE is not needed
+        /// on a resume: the conversation continues from the checkpoint,
+        /// which already holds the original prompt, and any message given
+        /// is ignored (darkmux says so on stderr).
         ///
         /// IMPORTANT (operator sovereignty — know this before resuming): a
         /// resume replays the checkpoint's recorded tool calls VERBATIM,
@@ -560,9 +563,10 @@ pub(crate) enum FindingCmd {
         /// Only findings whose recorded context names this mission.
         #[arg(long)]
         mission: Option<String>,
-        /// Only findings from this role execution (the key's first half).
-        #[arg(long)]
-        execution: Option<String>,
+        /// Only findings from this role execution (the `exec-...` id
+        /// `darkmux dispatch` prints; the key's first half).
+        #[arg(long, value_parser = crate::flow_cli::parse_execution_arg)]
+        execution: Option<darkmux_types::execution_id::ExecutionId>,
         /// Only findings whose recorded context names this rule.
         #[arg(long)]
         rule: Option<String>,

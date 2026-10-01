@@ -44,6 +44,14 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
 //           darkmux reads the dotted spellings; darkmux's own readers
 //           upgrade old archives.
 //
+//           Also (4.0, 5.0 dogfood): `step.error` carries a typed payload
+//           `{cause}`: why the step errored, on one line, control and
+//           invisible characters dropped, URL userinfo and token-looking
+//           query values (`token`, `access_token`, `api_key`, `key`, `sig`
+//           and the like) replaced by `<redacted>`, bounded to 400 rendered
+//           columns. The full message stays in the mission's step file and
+//           envelope. A `step.error` written earlier has no payload.
+//
 //           Also (4.0, #3023): a stream entry may carry a `late` field
 //           (value `1`) beside `schema` and `record`. It marks a record the
 //           daemon re-sent after the hub returned, having written it to its

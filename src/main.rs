@@ -890,7 +890,7 @@ fn cmd_mod(sub: cli::ModCmd) -> Result<i32> {
 fn cmd_finding(sub: cli::FindingCmd) -> Result<i32> {
     match sub {
         cli::FindingCmd::List { mission, execution, rule, json: cli::JsonFlag { json } } => {
-            finding_cli::list(mission.as_deref(), execution.as_deref(), rule.as_deref(), json)
+            finding_cli::list(mission.as_deref(), execution.as_ref(), rule.as_deref(), json)
         }
         cli::FindingCmd::Show { key, json: cli::JsonFlag { json } } => {
             finding_cli::show(&key, json)
@@ -955,13 +955,30 @@ struct DispatchInvocation {
     resume_from: Option<std::path::PathBuf>,
 }
 
+/// (F6) The placeholder a `--resume-from` dispatch carries when no message is
+/// given. The runtime replaces its `messages` with the checkpoint history on
+/// resume, so no message ever reaches the model, explicit or default; this text
+/// only fills the host's required prompt file and keeps the dispatch from
+/// reading stdin.
+const RESUME_DEFAULT_MESSAGE: &str = "Continue the interrupted dispatch from its checkpoint.";
+
+/// The stderr note for a message given alongside `--resume-from`: a resume
+/// continues from the checkpoint, so the message is dropped, not delivered.
+fn resume_message_note(resuming: bool, message_given: bool) -> Option<&'static str> {
+    (resuming && message_given).then_some(
+        "darkmux dispatch: the message is ignored on --resume-from; the dispatch continues from the checkpoint.",
+    )
+}
+
 /// The dispatch message in precedence order. `message` and `message_from_file`
 /// arrive as clap parsed them (mutually exclusive), so `role` is only for the
-/// usage guidance.
+/// usage guidance. A `resuming` dispatch with no message of its own takes
+/// [`RESUME_DEFAULT_MESSAGE`] instead of reading stdin.
 fn resolve_dispatch_message(
     role: &str,
     message: Option<String>,
     message_from_file: Option<std::path::PathBuf>,
+    resuming: bool,
 ) -> Result<String> {
     // (#1426) Resolve the message in precedence order: positional MESSAGE >
     // `--message-from-file` > stdin. clap makes the positional and the file
@@ -989,6 +1006,7 @@ fn resolve_dispatch_message(
             }
             m
         }
+        (None, None) if resuming => RESUME_DEFAULT_MESSAGE.to_string(),
         (None, None) => {
             use std::io::{IsTerminal, Read};
             if std::io::stdin().is_terminal() {
@@ -1014,6 +1032,67 @@ fn resolve_dispatch_message(
             buf
         }
     })
+}
+
+/// The `--finding` / `--mod` refs of a dispatch, each checked against its
+/// store, refused when the dispatch routes to another machine (#2295).
+fn checked_brief_refs(
+    finding: &[String],
+    mod_key: &[String],
+    machine: Option<&str>,
+) -> Result<Vec<darkmux_crew::brief_refs::BriefRef>> {
+    // (#2295) `--finding <key>` and `--mod <key>` (both repeatable): each
+    // named record's stored content is appended to the brief VERBATIM, after
+    // the operator's own message. A key that addresses no stored record is
+    // refused BEFORE any dispatch setup — dispatching with a silently missing
+    // block would send the role to work on a record it never saw.
+    //
+    // Findings first, then mods, each in the order given: clap collects the
+    // two flags into two lists, so their interleaving is not recoverable, and
+    // an order that is stated is better than one that looks meaningful and
+    // is not. A caller that needs a different order sets `brief_refs` on the
+    // step config directly — that, not the flags, is the list's home.
+    let brief_refs: Vec<darkmux_crew::brief_refs::BriefRef> = finding
+        .iter()
+        .map(darkmux_crew::brief_refs::BriefRef::finding)
+        .chain(mod_key.iter().map(darkmux_crew::brief_refs::BriefRef::mod_))
+        .collect();
+    //
+    // (#2295 review, CRITICAL 1) The CLI CHECKS but does not append. The block
+    // is rendered once, in `DispatchInternalStepKind` — the point every
+    // producer of a `brief_refs` step config goes through, so a mission graph
+    // that sets the field gets the same brief this verb does. Checking here
+    // anyway is what keeps a typo cheap: it refuses before the ack gate and
+    // before any routing or container work, which the step kind (one layer
+    // down) could not do as early.
+    let brief_refs = darkmux_crew::brief_refs::check_all(
+        &brief_refs,
+        &darkmux_crew::brief_refs::StoreDirs::resolved(),
+    )?;
+    // (#2295 review, CRITICAL 1) A cross-machine dispatch is published as a
+    // `WorkJob`, which has no field for these refs, and the peer's store is
+    // its own — so the remote step kind would resolve nothing and dispatch a
+    // brief with no block. Refuse instead: before this change the CLI appended
+    // the text into `message`, which made the gap invisible. Adding the field
+    // to `WorkJob` is a coordinated wire break (see the FLOW 1.36.0 entry) and
+    // is the real fix.
+    if !brief_refs.is_empty() {
+        if let Some(target) = machine {
+            let local = darkmux_flow::resolve_machine_id();
+            if matches!(
+                crew::dispatch::routing_decision(Some(target), local.as_deref()),
+                crew::dispatch::RoutingDecision::Remote { .. }
+            ) {
+                anyhow::bail!(
+                    "--finding / --mod cannot be routed to another machine yet: a submitted \
+                     job carries no record refs, and {target}'s own finding / \
+                     mod stores are its own. Run it on this machine (a profile without \
+                     `@{target}`), or paste the record's content into the message."
+                );
+            }
+        }
+    }
+    Ok(brief_refs)
 }
 
 /// (#1426) `darkmux dispatch <role> [MESSAGE]` — the task-grain execution
@@ -1055,58 +1134,11 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
         .transpose()
         .map_err(|e| anyhow::anyhow!("darkmux dispatch: {e}"))?
         .and_then(|a| a.machine);
-    let message = resolve_dispatch_message(&role, message, message_from_file)?;
-    // (#2295) `--finding <key>` and `--mod <key>` (both repeatable): each
-    // named record's stored content is appended to the brief VERBATIM, after
-    // the operator's own message. A key that addresses no stored record is
-    // refused BEFORE any dispatch setup — dispatching with a silently missing
-    // block would send the role to work on a record it never saw.
-    //
-    // Findings first, then mods, each in the order given: clap collects the
-    // two flags into two lists, so their interleaving is not recoverable, and
-    // an order that is stated is better than one that looks meaningful and
-    // is not. A caller that needs a different order sets `brief_refs` on the
-    // step config directly — that, not the flags, is the list's home.
-    let brief_refs: Vec<darkmux_crew::brief_refs::BriefRef> = finding
-        .iter()
-        .map(darkmux_crew::brief_refs::BriefRef::finding)
-        .chain(mod_key.iter().map(darkmux_crew::brief_refs::BriefRef::mod_))
-        .collect();
-    //
-    // (#2295 review, CRITICAL 1) The CLI CHECKS but does not append. The block
-    // is rendered once, in `DispatchInternalStepKind` — the point every
-    // producer of a `brief_refs` step config goes through, so a mission graph
-    // that sets the field gets the same brief this verb does. Checking here
-    // anyway is what keeps a typo cheap: it refuses before the ack gate and
-    // before any routing or container work, which the step kind (one layer
-    // down) could not do as early.
-    let brief_refs = darkmux_crew::brief_refs::check_all(
-        &brief_refs,
-        &darkmux_crew::brief_refs::StoreDirs::resolved(),
-    )?;
-    // (#2295 review, CRITICAL 1) A cross-machine dispatch is published as a
-    // `WorkJob`, which has no field for these refs, and the peer's store is
-    // its own — so the remote step kind would resolve nothing and dispatch a
-    // brief with no block. Refuse instead: before this change the CLI appended
-    // the text into `message`, which made the gap invisible. Adding the field
-    // to `WorkJob` is a coordinated wire break (see the FLOW 1.36.0 entry) and
-    // is the real fix.
-    if !brief_refs.is_empty() {
-        if let Some(target) = machine.as_deref() {
-            let local = darkmux_flow::resolve_machine_id();
-            if matches!(
-                crew::dispatch::routing_decision(Some(target), local.as_deref()),
-                crew::dispatch::RoutingDecision::Remote { .. }
-            ) {
-                anyhow::bail!(
-                    "--finding / --mod cannot be routed to another machine yet: a submitted \
-                     job carries no record refs, and {target}'s own finding / \
-                     mod stores are its own. Run it on this machine (a profile without \
-                     `@{target}`), or paste the record's content into the message."
-                );
-            }
-        }
+    if let Some(note) = resume_message_note(resume_from.is_some(), message.is_some() || message_from_file.is_some()) {
+        eprintln!("{note}");
     }
+    let message = resolve_dispatch_message(&role, message, message_from_file, resume_from.is_some())?;
+    let brief_refs = checked_brief_refs(&finding, &mod_key, machine.as_deref())?;
     let opts = crew::dispatch::DispatchOpts {
         // (#2914) Work never runs on the utility model.
         allow_utility_model: false,
@@ -1947,6 +1979,23 @@ mod tests {
         let correction = |execution_id| crew::corrections::Correction { ts: "t".into(), execution_id, text: "x".into() };
         assert_eq!(correction_origin(&correction(Some(id.clone()))), id.as_str());
         assert_eq!(correction_origin(&correction(None)), "no execution recorded");
+    }
+
+    /// (F6) A resume with no message continues the checkpoint instead of
+    /// reading an empty stdin; an explicit message still wins.
+    #[test]
+    fn a_message_given_with_a_resume_is_reported_as_ignored() {
+        assert!(resume_message_note(true, true).is_some_and(|n| n.contains("ignored")));
+        assert_eq!(resume_message_note(true, false), None);
+        assert_eq!(resume_message_note(false, true), None);
+    }
+
+    #[test]
+    fn a_resume_without_a_message_defaults_it_and_an_explicit_message_wins() {
+        let defaulted = resolve_dispatch_message("coder", None, None, true).unwrap();
+        assert_eq!(defaulted, RESUME_DEFAULT_MESSAGE);
+        let given = resolve_dispatch_message("coder", Some("do x".into()), None, true).unwrap();
+        assert_eq!(given, "do x");
     }
 
     /// The id `dispatch` prints is the execution's, not its session's, and

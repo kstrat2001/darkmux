@@ -504,8 +504,9 @@ impl StepKind for DispatchInternalStepKind {
         // so a field can no longer be dropped on this hop while the suite
         // stays green. Everything below is post-dispatch handling.
         let opts = dispatch_opts_for(step, task, input, ctx)?;
-        let result =
-            dispatch(opts).with_context(|| format!("step `{}` dispatch.internal", step.id))?;
+        let result = dispatch(opts).map_err(|e| {
+            crate::dispatch_internal::with_step_context(e, || format!("step `{}` dispatch.internal", step.id))
+        })?;
 
         // (#1509) `preserve_dispatch_result` callers (the CLI dispatch verb's
         // crew-of-one graph) want the exact `DispatchResult` back, including a
@@ -651,10 +652,8 @@ impl StepKind for DispatchInternalStepKind {
         let Some(resume_from) = opts.resume_from.clone() else {
             return Ok(());
         };
-        crate::dispatch_internal::refuse_resume_on_bare_hosted_path(&opts)
-            .context("darkmux dispatch --resume-from")?;
-        crate::dispatch_internal::validate_resume_checkpoint_content(&resume_from, &opts.role_id)
-            .context("darkmux dispatch --resume-from")?;
+        crate::dispatch_internal::refuse_resume_on_bare_hosted_path(&opts)?;
+        crate::dispatch_internal::validate_resume_checkpoint_content(&resume_from, &opts.role_id)?;
         Ok(())
     }
 }
@@ -3116,7 +3115,7 @@ mod tests {
             .expect_err("a --resume-from with no checkpoint must refuse");
         let msg = format!("{err:#}");
         assert!(msg.contains("RESUME CHECKPOINT NOT FOUND"), "{msg}");
-        assert!(msg.contains("darkmux dispatch --resume-from"), "{msg}");
+        assert!(msg.starts_with("darkmux dispatch: RESUME CHECKPOINT NOT FOUND"), "one clear prefix: {msg}");
     }
 
     #[test]

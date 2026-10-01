@@ -16,6 +16,7 @@
 use anyhow::Result;
 use darkmux_crew::findings::{self, FindingRecord};
 use darkmux_types::config_access;
+use darkmux_types::execution_id::ExecutionId;
 use serde::Serialize;
 
 use crate::cli_json;
@@ -33,7 +34,7 @@ const PREVIEW_CHARS: usize = 100;
 /// `finding list` — every record in the store, ts-ascending.
 pub fn list(
     mission: Option<&str>,
-    execution: Option<&str>,
+    execution: Option<&ExecutionId>,
     rule: Option<&str>,
     json: bool,
 ) -> Result<i32> {
@@ -41,7 +42,7 @@ pub fn list(
     let all = findings::load_all_at(&root)?;
     let rows: Vec<&FindingRecord> = all
         .iter()
-        .filter(|r| execution.is_none_or(|e| r.execution == e))
+        .filter(|r| execution.is_none_or(|e| r.execution == e.as_str()))
         // The mission is the RECORD's own field, not something inside the
         // launcher's `context` blob (which carries workspace / source / sha /
         // rule / unit and no mission at all). Reading it from `context` was

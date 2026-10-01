@@ -261,6 +261,7 @@ mod tests {
                             tokens_final: Some(5_000),
                             turns_final: Some(1),
                             model: Some("gpt-oss-120b".to_string()),
+                            error: None,
                         },
                         StepRow {
                             id: "judge-local".to_string(),
@@ -272,6 +273,7 @@ mod tests {
                             tokens_final: Some(3_000),
                             turns_final: Some(1),
                             model: Some("qwen3.6-35b-a3b".to_string()),
+                            error: None,
                         },
                         StepRow {
                             // Neither flag: an errored hosted seat is
@@ -286,6 +288,7 @@ mod tests {
                             tokens_final: Some(7_000),
                             turns_final: None,
                             model: None,
+                            error: None,
                         },
                         StepRow {
                             // Never started: no tokens, no clock (#1481).
@@ -298,6 +301,7 @@ mod tests {
                             tokens_final: None,
                             turns_final: None,
                             model: None,
+                            error: None,
                         },
                     ]),
                     status_note: None,

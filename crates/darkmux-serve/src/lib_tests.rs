@@ -5519,6 +5519,7 @@
             tokens_final: None,
             turns_final: None,
             model: None,
+            error: None,
         };
         let v = serde_json::to_value(&row).unwrap();
         assert_eq!(v["kind"], "dispatch.internal");
@@ -5551,6 +5552,7 @@
             tokens_final: None,
             turns_final: None,
             model: Some("darkmux:qwen/qwen3.6-27b".to_string()),
+            error: None,
         };
         let v = serde_json::to_value(&row).unwrap();
         assert_eq!(v["model"], "darkmux:qwen/qwen3.6-27b");

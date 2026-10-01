@@ -231,6 +231,13 @@ pub struct StepRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub model: Option<String>,
+    /// (F9) Why an errored step errored: its error message, bounded to one
+    /// line exactly as its `step.error` flow record carries it
+    /// (`StepErrorPayload::from_message`, the one owner of that bound).
+    /// Absent for a step that did not error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub error: Option<String>,
 }
 
 /// One edge in the rendered graph. Same `camelCase` wire contract as
@@ -1480,6 +1487,7 @@ pub fn build_mission_graph(
                             // stamps one (dispatch.map seats do; procedural /
                             // Tier 3 kinds don't).
                             model: step_model_from_config(&step.config),
+                            error: step_error_cause(step),
                         },
                         None => {
                             // A synthesized (not-yet-persisted) step is by
@@ -1503,6 +1511,7 @@ pub fn build_mission_graph(
                                 // isn't recoverable from the null template
                                 // config; omit cleanly.
                                 model: None,
+                                error: None,
                             }
                         }
                     }
@@ -1614,6 +1623,16 @@ pub fn build_mission_graph(
         note,
         generated_at_ms: current_millis(),
     }))
+}
+
+/// (F9) Why `step` errored, as its `step.error` record states it: the
+/// persisted step's `output` (an errored step stores its error message
+/// there), bounded and put on one line by the flow payload's own constructor.
+/// `None` for a step that did not error, or errored with no message.
+fn step_error_cause(step: &Step) -> Option<String> {
+    let message = step.output.as_deref().filter(|_| step.status == NodeStatus::Error)?;
+    let cause = darkmux_flow::payload::StepErrorPayload::from_message(message).cause;
+    (!cause.is_empty()).then_some(cause)
 }
 
 #[cfg(test)]
@@ -2685,6 +2704,27 @@ mod tests {
     fn resolve_step_label_tier1_kind_resolves_via_the_registry() {
         assert_eq!(resolve_step_label("dispatch.internal", "s1"), "Dispatch");
         assert_eq!(resolve_step_label("procedural.noop", "s1"), "No-op");
+    }
+
+    #[test]
+    fn step_error_cause_is_the_bounded_message_of_an_errored_step_only() {
+        let step = |status, output: Option<&str>| Step {
+            id: "s".into(),
+            task_id: "t".into(),
+            gate: None,
+            kind: "plan.sites".into(),
+            status,
+            config: serde_json::Value::Null,
+            started_ts: None,
+            completed_ts: None,
+            output: output.map(String::from),
+        };
+        let long = format!("reading workspace spec /x: Is a directory\n{}", "y".repeat(5000));
+        let cause = step_error_cause(&step(NodeStatus::Error, Some(&long))).unwrap();
+        assert!(cause.starts_with("reading workspace spec /x: Is a directory"), "{cause}");
+        assert!(!cause.contains('\n') && cause.chars().count() <= 500, "bounded, one line");
+        assert_eq!(step_error_cause(&step(NodeStatus::Complete, Some("{\"ok\":true}"))), None);
+        assert_eq!(step_error_cause(&step(NodeStatus::Error, None)), None);
     }
 
     #[test]

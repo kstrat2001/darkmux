@@ -8,10 +8,11 @@
 //! and window the run measures are the profile's, whatever else is
 //! resident.
 //!
-//! What this check still reports is whether that load happens INSIDE the
-//! run: when the declared model is not resident, or is resident at a
-//! different window, the run's wall-clock includes a model load and is not
-//! comparable to a warm run. That matters to reproducibility (a notebook
+//! What this check reports is what the dispatch's residency preflight
+//! (`darkmux_crew::dispatch_internal::decide_preflight`, the one owner of the
+//! rule) will do: load a new instance (the run's wall-clock includes a model load and is not
+//! comparable to a warm run), or reuse a larger darkmux-owned resident (no
+//! load, but the run measures that larger window). That matters to reproducibility (a notebook
 //! comparing two runs should know one of them paid for a load).
 //!
 //! Per the operator-sovereignty doctrine: **warn, don't block**. We compare
@@ -19,7 +20,8 @@
 //! the dispatch and emit operator-facing notes; the dispatch proceeds
 //! either way.
 
-use darkmux_profiles::envelope::{ctx_diverges, loaded_matches};
+use darkmux_crew::dispatch_internal::{decide_preflight, PreflightDecision};
+use darkmux_profiles::envelope::ctx_diverges;
 use darkmux_types::{LoadedModel, Profile};
 
 /// Compare the requested profile's declared model envelope against what
@@ -28,10 +30,9 @@ use darkmux_types::{LoadedModel, Profile};
 /// can't tell). Pure: the caller owns the best-effort `lms ps` query and
 /// the printing.
 ///
-/// Two findings, both meaning "this run starts with a model load":
-///   1. The profile's **default** model isn't in the loaded set at all.
-///   2. A declared model **is** loaded but at a materially different
-///      context window than the profile declares.
+/// One line per preflight outcome worth knowing: a load inside the run (default
+/// model absent, resident undersized, or only a foreign copy resident), or a
+/// reuse of a materially larger darkmux-owned resident.
 pub(crate) fn envelope_warnings(
     profile: &Profile,
     profile_name: &str,
@@ -53,39 +54,48 @@ pub(crate) fn envelope_warnings(
         if !pm.is_managed() {
             continue;
         }
-        match loaded.iter().find(|lm| loaded_matches(lm, pm)) {
-            None => {
-                // A missing non-default model is common and not worth the noise.
-                if Some(pm.id.as_str()) == default_id {
-                    let declared = pm
-                        .n_ctx
-                        .map(|v| v.to_string())
-                        .unwrap_or_else(|| "unset".to_string());
-                    out.push(format!(
-                        "requested profile `{profile_name}` declares default model `{}` (ctx {declared}) \
-                         but it is not among the currently loaded models — the dispatch loads it \
-                         first, so this run's wall-clock includes a model load and is not comparable \
-                         to a warm run.",
+        // (F1, 5.0 dogfood) The dispatch preflight's own decision function
+        // owns the reuse/reload/load rule; this check reports it (#2985).
+        let declared = pm.n_ctx.map(u64::from);
+        let note = match decide_preflight(&pm.id, pm.identifier.as_deref(), pm.n_ctx.unwrap_or(0), loaded) {
+            // A missing non-default model is common and not worth the noise.
+            PreflightDecision::LoadFresh { foreign_identifier: None } if Some(pm.id.as_str()) == default_id => Some(format!(
+                "declares default model `{}` (ctx {}) but it is not among the currently loaded \
+                 models — the dispatch loads a new instance, so this run's wall-clock includes a \
+                 model load and is not comparable to a warm run.",
+                pm.id,
+                declared.map_or_else(|| "unset".to_string(), |v| v.to_string()),
+            )),
+            // A missing non-default model is common and not worth the noise.
+            PreflightDecision::LoadFresh { foreign_identifier: None } => None,
+            PreflightDecision::Reuse { resident_ctx, .. } => declared
+                .filter(|d| ctx_diverges(*d, resident_ctx))
+                .map(|d| {
+                    format!(
+                        "declares model `{}` at {d} ctx; the dispatch reuses the resident instance \
+                         at {resident_ctx} (larger than the declared {d}), so the run measures the \
+                         larger window and pays no model load.",
                         pm.id,
-                    ));
-                }
-            }
-            Some(lm) => {
-                // (#1282) No declared window (an Option now) ⇒ nothing to
-                // compare — divergence is only meaningful against a declared
-                // value.
-                if let Some(declared) = pm.n_ctx {
-                    if ctx_diverges(declared as u64, lm.context) {
-                        out.push(format!(
-                            "requested profile `{profile_name}` declares model `{}` at {} ctx but the \
-                             loaded instance is at {} ctx — the dispatch loads darkmux's own instance at \
-                             the declared window, so this run's wall-clock includes a model load.",
-                            pm.id, declared, lm.context,
-                        ));
-                    }
-                }
-            }
-        }
+                    )
+                }),
+            // Without a declared window there is nothing to compare; an
+            // unreported resident ctx (0) is insufficient, so it reloads.
+            PreflightDecision::Reload { stale_ctx, .. } => declared.map(|d| {
+                format!(
+                    "declares model `{}` at {d} ctx but the resident instance is at {stale_ctx} \
+                     — the dispatch unloads it and loads a new instance at the declared window, \
+                     so this run's wall-clock includes a model load.",
+                    pm.id,
+                )
+            }),
+            PreflightDecision::LoadFresh { foreign_identifier: Some(foreign_identifier) } => Some(format!(
+                "model `{}` is resident only as `{foreign_identifier}`, which darkmux never reuses \
+                 — the dispatch loads a new instance beside it, so this run's wall-clock includes \
+                 a model load.",
+                pm.id,
+            )),
+        };
+        out.extend(note.map(|n| format!("requested profile `{profile_name}` {n}")));
     }
     out
 }
@@ -150,6 +160,41 @@ mod tests {
         assert!(w[0].contains("deep"));
     }
 
+    /// (F1, 5.0 dogfood) A darkmux-owned resident LARGER than the declared
+    /// window is reused by the residency planner, not reloaded: the warning
+    /// must say so instead of claiming a model load.
+    #[test]
+    fn larger_resident_is_reported_as_reuse_not_a_load() {
+        let p = profile(vec![pm("qwen-35b", 32768)]);
+        let loaded = vec![lm("darkmux:qwen-35b", "qwen-35b", 262144)];
+        let w = envelope_warnings(&p, "small", &loaded);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("reuses the resident instance at 262144"), "{}", w[0]);
+        assert!(w[0].contains("larger than the declared 32768"), "{}", w[0]);
+        assert!(!w[0].contains("includes a model load"), "{}", w[0]);
+    }
+
+    /// An undersized darkmux-owned resident is reloaded (the planner's
+    /// Reconcile arm), and the message says a new instance loads.
+    #[test]
+    fn undersized_resident_is_reported_as_a_load() {
+        let p = profile(vec![pm("qwen-35b", 262000)]);
+        let loaded = vec![lm("darkmux:qwen-35b", "qwen-35b", 101000)];
+        let w = envelope_warnings(&p, "deep", &loaded);
+        assert!(w[0].contains("loads a new instance"), "{}", w[0]);
+    }
+
+    /// A user-loaded copy is never reused (#1274), so darkmux loads its own
+    /// beside it, and that is a load inside the run.
+    #[test]
+    fn foreign_resident_is_never_reused() {
+        let p = profile(vec![pm("qwen-35b", 32768)]);
+        let loaded = vec![lm("qwen-35b", "qwen-35b", 262144)];
+        let w = envelope_warnings(&p, "small", &loaded);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("loads a new instance"), "{}", w[0]);
+    }
+
     #[test]
     fn warns_when_primary_not_loaded() {
         let p = profile(vec![pm("qwen-35b", 262000)]);
@@ -180,11 +225,47 @@ mod tests {
         assert!(envelope_warnings(&p, "deep", &loaded).is_empty());
     }
 
+    /// (#2985) A resident that reports no context (0) is insufficient to the
+    /// dispatch preflight, which reloads it, so the warning says a load happens.
     #[test]
-    fn unknown_loaded_context_does_not_warn() {
-        // lms ps didn't report a context (0) — can't tell, stay quiet.
+    fn unreported_loaded_context_is_reported_as_a_reload() {
         let p = profile(vec![pm("qwen-35b", 262000)]);
         let loaded = vec![lm("darkmux:qwen-35b", "qwen-35b", 0)];
+        let w = envelope_warnings(&p, "deep", &loaded);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("loads a new instance"), "{}", w[0]);
+    }
+
+    /// (#2985) The warning is the preflight's decision, not a second rule: an
+    /// operator `identifier` opt-out is reused only under that exact string.
+    #[test]
+    fn identifier_opt_out_with_default_namespaced_resident_is_a_load() {
+        let mut m = pm("qwen-35b", 32768);
+        m.identifier = Some("my-qwen".into());
+        let p = profile(vec![m]);
+        let loaded = vec![lm("darkmux:qwen-35b", "qwen-35b", 262144)];
+        let w = envelope_warnings(&p, "small", &loaded);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("loads a new instance"), "{}", w[0]);
+    }
+
+    /// (#2985) A different `darkmux:*` instance of the same weights cannot
+    /// answer the wire `model` (#2240), so the preflight loads its own.
+    #[test]
+    fn differently_named_darkmux_instance_is_a_load() {
+        let p = profile(vec![pm("qwen-35b", 32768)]);
+        let loaded = vec![lm("darkmux:qwen-35b-alt", "qwen-35b", 262144)];
+        let w = envelope_warnings(&p, "small", &loaded);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("loads a new instance"), "{}", w[0]);
+    }
+
+    /// (#2985) A profile model id spelled with the namespace prefix is
+    /// normalized to its bare key by the preflight, so the resident is found.
+    #[test]
+    fn namespaced_profile_id_finds_its_resident() {
+        let p = profile(vec![pm("darkmux:qwen-35b", 262000)]);
+        let loaded = vec![lm("darkmux:qwen-35b", "qwen-35b", 262000)];
         assert!(envelope_warnings(&p, "deep", &loaded).is_empty());
     }
 

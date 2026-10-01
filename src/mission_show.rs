@@ -174,6 +174,9 @@ fn step_line(step: &StepRow) -> String {
     if let Some(model) = &step.model {
         line.push_str(&format!(" · {model}"));
     }
+    if let Some(error) = &step.error {
+        line.push_str(&format!("\n        error: {error}"));
+    }
     line
 }
 
@@ -326,6 +329,35 @@ mod tests {
         for needle in ["Mission show-m1 (active)", "Config: machine-status (Machine status", "The phase running", "Runs:", "Viewer: "] {
             assert!(text.contains(needle), "`{needle}` missing from:\n{text}");
         }
+    }
+
+    /// (F9) An errored step's cause shows under its row, in text; `--json`
+    /// carries it as the row's `error`. A step that did not error shows none.
+    #[test]
+    fn an_errored_step_shows_its_cause_in_text_and_json() {
+        let row = |status, error: Option<&str>| StepRow {
+            id: "plan-step".into(),
+            label: "Plan".into(),
+            kind: "plan.sites".into(),
+            status,
+            started_ts: None,
+            completed_ts: None,
+            tokens_final: None,
+            turns_final: None,
+            model: None,
+            error: error.map(String::from),
+        };
+        let failed = row(darkmux_crew::types::NodeStatus::Error, Some("reading workspace spec /x: Is a directory (os error 21)"));
+        let line = step_line(&failed);
+        assert!(line.contains("plan-step [plan.sites] error"), "{line}");
+        assert!(line.contains("error: reading workspace spec /x: Is a directory (os error 21)"), "{line}");
+        assert_eq!(
+            serde_json::to_value(&failed).unwrap()["error"],
+            "reading workspace spec /x: Is a directory (os error 21)"
+        );
+        let fine = row(darkmux_crew::types::NodeStatus::Complete, None);
+        assert!(!step_line(&fine).contains("error:"));
+        assert!(serde_json::to_value(&fine).unwrap().get("error").is_none());
     }
 
     /// A mission with no resolvable config still shows: `config` is absent,
