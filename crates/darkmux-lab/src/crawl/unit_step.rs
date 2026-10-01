@@ -1426,18 +1426,7 @@ impl StepKind for CrawlUnitStepKind {
             let outcome = (self.dispatch)(opts);
             let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
             let (mut result, wall_ms, prompt_tokens, completion_tokens, model, detections, rest_ms, host) =
-                match &outcome {
-                    // (#2593) Checked HERE, at the moment THIS draw's
-                    // dispatch failed — not deferred to the summary — so an
-                    // ordinary failure that happened before any interrupt
-                    // keeps reading `error` regardless of what the mission
-                    // does afterward. See `INTERRUPTED_RESULT`'s own doc.
-                    Err(_) if darkmux_types::interrupt::is_set() => {
-                        (INTERRUPTED_RESULT.to_string(), elapsed_ms, 0, 0, None, None, 0, None)
-                    }
-                    Err(_) => ("error".to_string(), elapsed_ms, 0, 0, None, None, 0, None),
-                    Ok(res) => interpret_dispatch_result(&ctx.unit_id, res),
-                };
+                draw_outcome(&ctx.unit_id, &outcome, elapsed_ms);
 
             // (#2193) No-progress bound — only over a dispatch that actually
             // ran and reported a clean `"stop"`. Never overrides an already-
@@ -1536,7 +1525,7 @@ impl StepKind for CrawlUnitStepKind {
             unit: ctx.unit_id.clone(),
             rule: single_rule_id(&ctx.rule_ids),
             source: ctx.source.clone(),
-            result: if any_draw_cut { UNIT_BUDGET_EXHAUSTED.to_string() } else { last_result },
+            result: unit_result(any_draw_cut, last_result),
             findings: total_findings,
             findings_rejected: total_rejected,
             wall_ms: total_wall_ms,
@@ -1575,6 +1564,28 @@ impl StepKind for CrawlUnitStepKind {
             degraded,
         })
     }
+}
+
+/// One draw's numbers: the envelope's own when the dispatch ran, else a
+/// zeroed row labeled by how it failed.
+fn draw_outcome(unit_id: &str, outcome: &Result<DispatchResult>, elapsed_ms: u64) -> UnitDispatchOutcome {
+    match outcome {
+        // (#2593) Checked HERE, at the moment THIS draw's dispatch failed,
+        // not deferred to the summary, so an ordinary failure that happened
+        // before any interrupt keeps reading `error` regardless of what the
+        // mission does afterward. See `INTERRUPTED_RESULT`'s own doc.
+        Err(_) if darkmux_types::interrupt::is_set() => {
+            (INTERRUPTED_RESULT.to_string(), elapsed_ms, 0, 0, None, None, 0, None)
+        }
+        Err(_) => ("error".to_string(), elapsed_ms, 0, 0, None, None, 0, None),
+        Ok(res) => interpret_dispatch_result(unit_id, res),
+    }
+}
+
+/// (F11) The unit's recorded result: `unit_budget_exhausted` when ANY draw
+/// was cut at its bound, else the last draw's own result.
+fn unit_result(any_draw_cut: bool, last_result: String) -> String {
+    if any_draw_cut { UNIT_BUDGET_EXHAUSTED.to_string() } else { last_result }
 }
 
 /// (F11) Why a unit that completed did NOT finish its work, or `None` when it

@@ -118,6 +118,33 @@ fn fail(details: impl Into<String>) -> WorkGateResult {
     }
 }
 
+/// Why the gate fails before any test count is read, or `None` when every
+/// precondition holds: how the dispatch ended (an escalation is named, never
+/// a transport error), a tampered verify command, and whether the sandbox
+/// changed at all.
+fn precondition_failure(input: &WorkGateInput) -> Option<String> {
+    let reason = match (&input.dispatch, &input.command_tampered, input.sandbox_changed) {
+        // (F2) A deliberate hand-off, not a transport error: the work is
+        // unfinished, so the gate does not credit it, but it says why.
+        (DispatchEnd::Escalated { reason }, _, _) => format!(
+            "dispatch escalated ({reason}) before finishing the work — the work gate does \
+             not credit unfinished work"
+        ),
+        (DispatchEnd::Failed, _, _) => "dispatch did not complete cleanly (runtime/transport \
+             error) — cannot confirm any work was done"
+            .to_string(),
+        (DispatchEnd::Completed, Some(reason), _) => format!("verify command altered: {reason}"),
+        (DispatchEnd::Completed, None, Some(false)) => "no work: the sandbox is unchanged from \
+             the fixture's baseline (a no-op run cannot pass)"
+            .to_string(),
+        (DispatchEnd::Completed, None, None) => "no baseline/final sandbox hash recorded — \
+             cannot confirm whether the sandbox changed"
+            .to_string(),
+        (DispatchEnd::Completed, None, Some(true)) => return None,
+    };
+    Some(reason)
+}
+
 /// The pure decision. Order matters — earlier branches dominate, same
 /// discipline as `crate::lab::loop_report::classify`:
 ///   1. the dispatch did not complete -> fail (nothing else is trustworthy);
@@ -133,42 +160,8 @@ fn fail(details: impl Into<String>) -> WorkGateResult {
 ///   7. a declared coverage threshold not met (or unmeasurable) -> fail.
 ///   8. otherwise -> pass.
 pub fn evaluate(input: &WorkGateInput) -> WorkGateResult {
-    match &input.dispatch {
-        DispatchEnd::Completed => {}
-        // (F2) A deliberate hand-off, not a transport error: the work is
-        // unfinished, so the gate does not credit it, but it says why.
-        DispatchEnd::Escalated { reason } => {
-            return fail(format!(
-                "dispatch escalated ({reason}) before finishing the work — the work gate does \
-                 not credit unfinished work"
-            ))
-        }
-        DispatchEnd::Failed => {
-            return fail(
-                "dispatch did not complete cleanly (runtime/transport error) — \
-                 cannot confirm any work was done",
-            )
-        }
-    }
-
-    if let Some(reason) = &input.command_tampered {
-        return fail(format!("verify command altered: {reason}"));
-    }
-
-    match input.sandbox_changed {
-        Some(true) => {}
-        Some(false) => {
-            return fail(
-                "no work: the sandbox is unchanged from the fixture's baseline \
-                 (a no-op run cannot pass)",
-            )
-        }
-        None => {
-            return fail(
-                "no baseline/final sandbox hash recorded — cannot confirm whether \
-                 the sandbox changed",
-            )
-        }
+    if let Some(reason) = precondition_failure(input) {
+        return fail(reason);
     }
 
     let Some(passed_now) = input.tests_passed else {
