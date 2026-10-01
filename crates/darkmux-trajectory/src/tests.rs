@@ -455,7 +455,8 @@ fn an_enum_value_from_a_newer_runtime_reads_as_unknown_not_a_dropped_event() {
     assert!(matches!(c, Some(E::Checkpoint(ref c)) if c.verdict == Verdict::Unknown), "{c:?}");
     let w = parse_line(r#"{"type":"model.tool_call.writing","seq":1,"phase":"from_the_future"}"#);
     assert!(matches!(w, Some(E::ToolCallWriting(ref w)) if w.phase == StreamPhase::Unknown), "{w:?}");
-    // The malformed calls still count, in the unattributed bucket.
+    // The malformed calls still count, in a bucket of their own: neither
+    // "invalid name" nor "not granted" is claimed for a cause nobody read.
     let fold = TrajectoryFold::from_lines(r#"{"type":"dispatch.tool.malformed_names","count":2,"reason":"from_the_future"}"#);
-    assert_eq!((fold.tool_calls_invalid_name, fold.tool_calls_ungranted), (2, 0));
+    assert_eq!((fold.tool_calls_invalid_name, fold.tool_calls_ungranted, fold.tool_calls_unclassified), (0, 0, 2));
 }

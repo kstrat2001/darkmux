@@ -7011,6 +7011,29 @@ pub fn read_out_dir_text(out_dir: &Path, rel: &str) -> Option<String> {
     read_out_dir_text_with(out_dir, rel, &stderr_warning_sink)
 }
 
+/// The flow payload for a checkpoint event, `None` when its verdict is one
+/// this build does not know (#3035): the payload's verdict is `continue` or
+/// `conclude`, and neither may be claimed for a verdict nobody read.
+fn checkpoint_payload(c: &darkmux_trajectory::Checkpoint) -> Option<DispatchCheckpointPayload> {
+    let verdict = match c.verdict {
+        darkmux_trajectory::Verdict::Continue => CheckpointVerdict::Continue,
+        darkmux_trajectory::Verdict::Conclude => CheckpointVerdict::Conclude,
+        darkmux_trajectory::Verdict::Unknown => return None,
+    };
+    Some(DispatchCheckpointPayload {
+        turn_seq: c.seq,
+        checkpoint: c.checkpoint,
+        slice_tokens: c.slice_tokens,
+        tail_ratio: c.tail_ratio,
+        verdict,
+        bound: c.bound.as_ref().map(bound_ref),
+        policy: c.policy.clone(),
+        would_conclude: c.would_conclude,
+        step_id: None,
+        context: None,
+    })
+}
+
 /// (#3035) A trajectory header naming a newer data shape than this binary
 /// reads: the run keeps going (its events are read leniently, and an
 /// unknown one is skipped), but the operator is told the counts may be
@@ -9767,24 +9790,18 @@ impl TailerState {
     /// verbatim (#2165, #2887) so the surfaces can tell an enforced
     /// conclusion from a recorded finding.
     fn on_checkpoint(&mut self, c: &darkmux_trajectory::Checkpoint) {
-        let payload = DispatchCheckpointPayload {
-            turn_seq: c.seq,
-            checkpoint: c.checkpoint,
-            slice_tokens: c.slice_tokens,
-            tail_ratio: c.tail_ratio,
-            verdict: match c.verdict {
-                // (#3035) A verdict a newer runtime named is not a conclusion
-                // this host can report: the run reads as continuing.
-                darkmux_trajectory::Verdict::Continue | darkmux_trajectory::Verdict::Unknown => CheckpointVerdict::Continue,
-                darkmux_trajectory::Verdict::Conclude => CheckpointVerdict::Conclude,
-            },
-            bound: c.bound.as_ref().map(bound_ref),
-            policy: c.policy.clone(),
-            would_conclude: c.would_conclude,
-            step_id: None,
-            context: None,
-        };
-        self.emit(darkmux_flow::Level::Info, darkmux_flow::Payload::DispatchCheckpoint(payload));
+        match checkpoint_payload(c) {
+            Some(payload) => {
+                self.emit(darkmux_flow::Level::Info, darkmux_flow::Payload::DispatchCheckpoint(payload))
+            }
+            // (#3035) A verdict a newer runtime named has no word in the flow
+            // vocabulary, and reporting it as `continue` would be a claim
+            // nobody observed: the record is left out, and said so.
+            None => eprintln!(
+                "darkmux dispatch: ⚠ a checkpoint carried a verdict this darkmux does not know (a newer \
+                 runtime wrote it); no checkpoint record is written for it"
+            ),
+        }
         if let Some(w) = checkpoint_degeneracy_warning(c) {
             self.surface_degeneracy_warning(w);
         }
@@ -10555,7 +10572,13 @@ fn malformed_detail(e: &darkmux_trajectory::MalformedToolNames) -> String {
              (model={model}, sample=\"{sample}\") — never dispatched, coalesced into one feedback \
              message (#2169)"
         ),
-        darkmux_trajectory::MalformedReason::NotATool | darkmux_trajectory::MalformedReason::Unknown => format!(
+        // (#3035) A reason a newer runtime named: say only what is known, that
+        // the calls never ran. Never "not a real tool", which is a claim.
+        darkmux_trajectory::MalformedReason::Unknown => format!(
+            "{count} tool call(s) this turn were malformed for a reason this darkmux does not know \
+             (model={model}, sample=\"{sample}\") — never dispatched (#2169)"
+        ),
+        darkmux_trajectory::MalformedReason::NotATool => format!(
             "{count} tool call(s) this turn carried a `name` that is not a real tool \
              (model={model}, sample=\"{sample}\") — never dispatched, coalesced into one feedback \
              message (#2169)"

@@ -9662,6 +9662,34 @@
         );
     }
 
+    /// (#3035) A verdict or malformed reason a newer runtime named is carried
+    /// as unknown: never reported as `continue`, never worded as "not a real
+    /// tool".
+    #[test]
+    fn an_unknown_verdict_or_reason_is_never_reported_as_a_known_value() {
+        let known = |v: &str| {
+            let c = match darkmux_trajectory::parse_line(&format!(r#"{{"type":"dispatch.checkpoint","seq":1,"verdict":"{v}"}}"#)) {
+                Some(darkmux_trajectory::TrajectoryEvent::Checkpoint(c)) => c,
+                other => panic!("{other:?}"),
+            };
+            checkpoint_payload(&c)
+        };
+        assert!(matches!(known("conclude").map(|p| p.verdict), Some(CheckpointVerdict::Conclude)));
+        assert!(matches!(known("continue").map(|p| p.verdict), Some(CheckpointVerdict::Continue)));
+        assert!(known("from_the_future").is_none(), "no checkpoint record claims a verdict nobody read");
+
+        let m = |r: &str| {
+            match darkmux_trajectory::parse_line(&format!(r#"{{"type":"dispatch.tool.malformed_names","count":2,"reason":"{r}"}}"#)) {
+                Some(darkmux_trajectory::TrajectoryEvent::MalformedToolNames(m)) => malformed_detail(&m),
+                other => panic!("{other:?}"),
+            }
+        };
+        let unknown = m("from_the_future");
+        assert!(unknown.contains("reason this darkmux does not know"), "{unknown}");
+        assert!(!unknown.contains("not a real tool") && !unknown.contains("REAL tool"), "{unknown}");
+        assert!(m("not_a_tool").contains("not a real tool"));
+    }
+
     /// (#2190) The NEW `dispatch.empty_tool_calls.recovered` event type must
     /// route to its own `kind: "empty_tool_calls"` and name the real shape
     /// in `detail` — not the runaway-reasoning wording its sibling event

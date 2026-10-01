@@ -148,6 +148,11 @@ pub struct TrajectoryFold {
     pub tool_calls_invalid_name: u32,
     /// Structured calls that named a tool the role was not granted.
     pub tool_calls_ungranted: u32,
+    /// (#3035) Calls a newer runtime reported malformed for a reason this
+    /// build does not know. Counted in neither bucket above (that would claim
+    /// a cause nobody read) and not forwarded to the flow payload, which has
+    /// no field for them.
+    pub tool_calls_unclassified: u32,
     pub checkpoints: Vec<CheckpointRuling>,
     /// The degeneracy policy the latest checkpoint recorded.
     pub checkpoint_policy: Option<String>,
@@ -221,11 +226,10 @@ impl TrajectoryFold {
             E::MalformedToolNames(m) => {
                 let n = u32::try_from(m.count).unwrap_or(u32::MAX);
                 let bucket = match m.reason {
-                    // (#3035) A reason a newer runtime named: the calls were
-                    // malformed all the same, and only the cause is unknown,
-                    // so they count with the unattributed bucket, never as
-                    // "a real tool the role was not granted".
-                    MalformedReason::NotATool | MalformedReason::Unknown => &mut self.tool_calls_invalid_name,
+                    MalformedReason::NotATool => &mut self.tool_calls_invalid_name,
+                    // (#3035) A reason a newer runtime named: its own bucket,
+                    // never one whose cause this build would be asserting.
+                    MalformedReason::Unknown => &mut self.tool_calls_unclassified,
                     MalformedReason::RealToolNotGranted => &mut self.tool_calls_ungranted,
                 };
                 *bucket = bucket.saturating_add(n);
