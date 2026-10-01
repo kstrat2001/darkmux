@@ -30,6 +30,18 @@ pub(crate) enum Target<'a> {
     EveryPeer,
 }
 
+impl<'a> Target<'a> {
+    /// The target the two flags name; `None` for neither (the local list).
+    /// clap refuses both together.
+    pub(crate) fn from_flags(machine: Option<&'a str>, remote: bool) -> Option<Self> {
+        match (machine, remote) {
+            (Some(name), _) => Some(Target::Machine(name)),
+            (None, true) => Some(Target::EveryPeer),
+            (None, false) => None,
+        }
+    }
+}
+
 /// What a target resolves to.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Resolved {

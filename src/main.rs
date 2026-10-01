@@ -1619,13 +1619,9 @@ fn cmd_profile(sub: ProfileCmd) -> Result<i32> {
             machine,
             remote,
         } => {
-            let target = match (machine.as_deref(), remote) {
-                (Some(name), _) => Some(profile_remote::Target::Machine(name)),
-                (None, true) => Some(profile_remote::Target::EveryPeer),
-                (None, false) => None,
-            };
             // (None from `run`: the named machine is this one, so the plain
             // local list answers.)
+            let target = profile_remote::Target::from_flags(machine.as_deref(), remote);
             match target.map(|t| profile_remote::run(t, json)).transpose()?.flatten() {
                 Some(code) => Ok(code),
                 None => cmd_profiles(profiles.as_deref(), json),

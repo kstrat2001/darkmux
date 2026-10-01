@@ -1404,6 +1404,22 @@ darkmux release.
 
 ### Added (4.0)
 
+- **`darkmux profile list --machine <peer>` and `--remote` list the profiles a
+  peer lets this machine use.** `--machine <peer>` prints each profile the
+  peer's allow-list grants this machine, with the models it runs and its
+  dispatch address (`<profile>@<peer>`, the form `--profile` takes); `--remote`
+  does the same for every roster peer, grouped by peer. Both read the peer's
+  machine card, the one `machine list` shows. A peer whose card cannot be read
+  says why and the verb exits 1: an unreadable peer is never reported as 0
+  profiles. `--machine <this machine>` is the plain local list. With `--json`
+  the verb prints a `peers` list whose entries are `listed` (with `profiles`) or
+  `unreadable` (with `reason`); the shape is pinned in `tests/cli-json.golden`.
+  The console gains a ninth panel, `profile-list`, for the same view, with a
+  `--remote` toggle and a `--machine` token that offers the roster's names; a
+  link such as `#lens=console&panel=profile-list&opt.machine=<peer>` opens it
+  and runs it. Its `machine` option is the one panel option whose legal values
+  are the roster's own names, checked by the daemon against the roster.
+
 - **A run row carries `machine_uid` beside its display `machine`** (`/runs`, `run list --json`, additive and optional). It is the hardware uid of the machine whose records produced the row; a tracked mission or lab row reports this daemon's own uid. The viewer decides which machine a run belongs to by this uid, so a renamed machine, a `.local` alias or two machines sharing one display name no longer merge, split or misattribute runs. A record that carried no uid leaves the field absent.
 
 - **A machine states its fleet role, and the hub hands out fleet defaults (#3022,

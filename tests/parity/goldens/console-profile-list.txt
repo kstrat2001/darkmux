@@ -27,9 +27,11 @@ role list
 config list
 lab fixture list
 doctor
-$ darkmux run list --kind all ▾ [--all] [--usage]
+$ darkmux profile list [--remote] --machine darkbook ▾
 captured 20:54:23
-· 4ms
+· 6ms
 re-run
-no recorded run activity yet
+darkbook: 2 profiles available to this machine
+  fast@darkbook                qwen3-4b-instruct
+  review@darkbook              devstral-small
 

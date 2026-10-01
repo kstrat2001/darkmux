@@ -103,7 +103,29 @@ const RUN_LIST_USAGE_OPT: PanelOpt = {
 export interface PanelOptsEntry {
   readonly argv: readonly string[];
   readonly opts: readonly PanelOpt[];
+  /** The name of this panel's roster-valued opt, when it has one: the client
+   * twin of `panel.rs`'s `PanelSpec::roster_opt`. Its value is a roster
+   * machine name, driving `--machine <name>`; see [[machineOpt]]. */
+  readonly rosterOpt?: string;
 }
+
+/** `profile list`'s `--remote` toggle: every peer's profiles this machine may
+ * use. The client twin of `panel.rs`'s `PROFILE_LIST_REMOTE_OPT`. */
+const PROFILE_LIST_REMOTE_OPT: PanelOpt = {
+  name: "remote",
+  values: [
+    { value: "off", argv: [] },
+    { value: "on", argv: ["--remote"] },
+  ],
+};
+
+/** The flag a roster-valued opt drives: the twin of `panel.rs`'s
+ * `ROSTER_MACHINE_FLAG`, pinned by `panels.test.ts`. */
+const ROSTER_MACHINE_FLAG = "--machine";
+
+/** The roster opt's default value: this machine's own list, no flag. A
+ * label rather than a name, so it cannot be mistaken for a roster id. */
+export const LOCAL_MACHINE = "(this machine)";
 
 /** The client twin of `panel.rs`'s `panel_spec` match — one entry per BASE
  * verb (#1911: this table counts base verbs, not variants; a verb's
@@ -119,6 +141,9 @@ export const PANEL_OPTS: Record<PanelId, PanelOptsEntry> = {
   // (#1911) The CLI twin of the RUNS lens's union — see `src/run_list.rs`'s
   // own module doc.
   "run-list": { argv: ["run", "list"], opts: [RUN_LIST_KIND_OPT, ALL_OPT, RUN_LIST_USAGE_OPT] },
+  // The profiles THIS machine may use: its own, one roster peer's (`machine`),
+  // or every peer's (`remote`). See `src/profile_remote.rs`.
+  "profile-list": { argv: ["profile", "list"], opts: [PROFILE_LIST_REMOTE_OPT], rosterOpt: "machine" },
   doctor: { argv: ["doctor"], opts: [] },
 };
 
@@ -128,6 +153,57 @@ export function panelArgv(id: PanelId): readonly string[] {
 
 export function panelOptGroups(id: PanelId): readonly PanelOpt[] {
   return PANEL_OPTS[id].opts;
+}
+
+/** The panel's roster-valued opt name, or `null` for a panel with none. */
+export function rosterOptName(id: PanelId): string | null {
+  return PANEL_OPTS[id].rosterOpt ?? null;
+}
+
+/** Whether `v` can be a roster machine name: the SHAPE only. The roster is
+ * the server's to read, so membership is checked there (a stranger is a 400
+ * the console shows verbatim); this just keeps a hash from carrying a value no
+ * roster id could be. */
+function isMachineNameShape(v: string): boolean {
+  // eslint-disable-next-line no-control-regex
+  return v.length > 0 && v.length <= 128 && v !== LOCAL_MACHINE && !/[\u0000-\u001f\u007f]/.test(v);
+}
+
+/** The roster opt as a [[PanelOpt]] for the menu: this machine first (the
+ * default, no flag), then each roster name. A name the roster does not have
+ * but the link carries stays in the list, so the token reads what will be
+ * asked and the server's 400 says why it fails. */
+export function machineOpt(roster: readonly string[], current: string | undefined): PanelOpt {
+  const names = [...roster];
+  if (current !== undefined && current !== LOCAL_MACHINE && !names.includes(current)) names.push(current);
+  return {
+    name: "machine",
+    values: [{ value: LOCAL_MACHINE, argv: [] }, ...names.map((n) => ({ value: n, argv: [ROSTER_MACHINE_FLAG, n] }))],
+  };
+}
+
+/** The roster machine a selection names, or `null` for none (absent, or the
+ * default "this machine"). */
+function chosenMachine(id: PanelId, requested: Readonly<Record<string, string>> | undefined): string | null {
+  const name = rosterOptName(id);
+  const v = name === null ? undefined : requested?.[name];
+  return v === undefined || v === LOCAL_MACHINE || v === "" ? null : v;
+}
+
+/** `next` after the opt `name` was set to `value`, with the one rule that
+ * ties opts together: a machine and `--remote` are the same conflict the CLI
+ * refuses, so choosing one clears the other. */
+export function reconcileOpts(
+  id: PanelId,
+  current: Readonly<Record<string, string>>,
+  name: string,
+  value: string,
+): Record<string, string> {
+  const next = { ...current, [name]: value };
+  if (rosterOptName(id) === null) return next;
+  if (name === rosterOptName(id) && value !== LOCAL_MACHINE) delete next.remote;
+  if (name === "remote" && value === "on") delete next[rosterOptName(id) as string];
+  return next;
 }
 
 /** One resolved `(name, value)` opt selection, in the panel's own
@@ -164,6 +240,8 @@ export function resolveOpts(id: PanelId, requested?: Readonly<Record<string, str
 export function composeArgv(id: PanelId, requested?: Readonly<Record<string, string>>): string[] {
   const out = [...panelArgv(id)];
   for (const r of resolveOpts(id, requested)) out.push(...r.argv);
+  const machine = chosenMachine(id, requested);
+  if (machine !== null) out.push(ROSTER_MACHINE_FLAG, machine);
   return out;
 }
 
@@ -177,6 +255,8 @@ export function canonicalOptPairs(id: PanelId, requested?: Readonly<Record<strin
   const pairs = resolveOpts(id, requested)
     .filter((r) => !r.isDefault)
     .map((r): [string, string] => [r.name, r.value]);
+  const machine = chosenMachine(id, requested);
+  if (machine !== null) pairs.push([rosterOptName(id) as string, machine]);
   pairs.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
   return pairs;
 }
@@ -196,6 +276,12 @@ export function sanitizeOptParams(id: PanelId, raw: Readonly<Record<string, stri
     const v = raw[opt.name];
     if (v !== undefined && opt.values.some((pv) => pv.value === v)) out[opt.name] = v;
   }
+  const rosterName = rosterOptName(id);
+  const machine = rosterName === null ? undefined : raw[rosterName];
+  if (rosterName !== null && machine !== undefined && isMachineNameShape(machine)) {
+    out[rosterName] = machine;
+    delete out.remote;
+  }
   return out;
 }
 
@@ -214,8 +300,8 @@ export function variantKey(id: PanelId, requested?: Readonly<Record<string, stri
  * These are exactly the CLI-backed panels — the drift guard in
  * `panels.test.ts` pins `PANELS.map(p => p.id)` to `PANEL_IDS` from
  * `lib/route.ts`, which is itself the twin of the Rust-side allowlist
- * (`crates/darkmux-serve/src/panel.rs::PANEL_IDS`, hard-capped at 8 by its
- * own doctrine assertion). Eight pills, full stop — every tab the console
+ * (`crates/darkmux-serve/src/panel.rs::PANEL_IDS`, hard-capped at 9 by its
+ * own doctrine assertion). Nine pills, full stop — every tab the console
  * renders is one of these, addressable by its own explicit `panel=<id>`.
  *
  * (#1911) `all missions` is gone (folded into `mission-status`'s own `all`
@@ -251,7 +337,7 @@ export const PANELS: PanelDef[] = (
   // guard in `panels.test.ts` sorts both sides before comparing, so this
   // array is presentation only and `PANEL_IDS` stays a closed SET whose
   // own order carries no meaning.
-  ["run-list", "mission-status", "machine-status", "flow-status", "role-list", "config-list", "lab-fixture-list", "doctor"] as const
+  ["run-list", "mission-status", "machine-status", "profile-list", "flow-status", "role-list", "config-list", "lab-fixture-list", "doctor"] as const
 ).map((id) => ({ id, label: panelArgv(id).join(" ") }));
 
 /** (#1905 step 3) The console's landing panel when `panelId === ""` — no

@@ -17,6 +17,11 @@ import {
   composeArgv,
   canonicalOptPairs,
   variantKey,
+  sanitizeOptParams,
+  rosterOptName,
+  machineOpt,
+  reconcileOpts,
+  LOCAL_MACHINE,
 } from "./panels";
 
 describe("PANELS", () => {
@@ -38,9 +43,9 @@ describe("PANELS", () => {
   // (#1905 step 3) exactly eight pills — the operator's own rejection of a
   // ten-pill render ("can't allow main to have this") is the reason a
   // ninth/tenth client-only entry can never come back silently.
-  it("(#1905 step 3) is exactly eight pills, matching panel.rs's own doctrine cap — no client-only entries", () => {
-    expect(PANELS).toHaveLength(8);
-    expect(PANEL_IDS).toHaveLength(8);
+  it("is exactly nine pills (profile-list is the ninth), matching panel.rs's own doctrine cap — no client-only entries", () => {
+    expect(PANELS).toHaveLength(9);
+    expect(PANEL_IDS).toHaveLength(9);
   });
 
   it("(#1905 step 3) DEFAULT_PANEL_ID is run-list, and is itself one of the eight allowlisted panels", () => {
@@ -176,7 +181,7 @@ describe("panelOptGroups", () => {
     ]);
   });
 
-  it("six of eight panels declare no options at all", () => {
+  it("six of nine panels declare no options at all", () => {
     const noOpts = PANEL_IDS.filter((id) => panelOptGroups(id).length === 0);
     expect(noOpts.sort()).toEqual(["config-list", "doctor", "flow-status", "lab-fixture-list", "machine-status", "role-list"].sort());
   });
@@ -238,5 +243,59 @@ describe("PANEL_OPTS pinned against crates/darkmux-serve/src/panel.rs (#1911)", 
       expect(allOpt!.values[1].argv).toEqual(["--all"]);
     }
     expect(rustSrc).toContain("const ALL_OPT: PanelOpt");
+  });
+});
+
+// ── profile-list: the roster-valued `machine` opt (5.0) ────────────────
+//
+// Its legal values are the roster's machine names, which the client cannot
+// know when it parses a hash: parse checks the SHAPE of the value, the server
+// checks membership against its roster and 400s on a stranger.
+describe("profile-list's roster-valued machine opt", () => {
+  it("is the one panel with a roster opt, and the server twin declares it too", () => {
+    expect(PANEL_IDS.filter((id) => rosterOptName(id) !== null)).toEqual(["profile-list"]);
+    expect(rosterOptName("profile-list")).toBe("machine");
+    const rustSrc = readFileSync(path.join(__dirname, "../../../../crates/darkmux-serve/src/panel.rs"), "utf8");
+    expect(rustSrc).toContain('const ROSTER_MACHINE_OPT: &str = "machine"');
+    expect(rustSrc).toContain('const ROSTER_MACHINE_FLAG: &str = "--machine"');
+    expect(panelArgv("profile-list")).toEqual(["profile", "list"]);
+  });
+
+  it("a deep link's machine survives sanitizing; a stranger panel's does not", () => {
+    expect(sanitizeOptParams("profile-list", { machine: "darkbook" })).toEqual({ machine: "darkbook" });
+    expect(sanitizeOptParams("run-list", { machine: "darkbook" })).toEqual({});
+  });
+
+  it("drops a machine that cannot be a roster name (empty, huge, control characters, the local sentinel)", () => {
+    for (const bad of ["", "x".repeat(200), "a\nb", "a\u0000b", LOCAL_MACHINE]) {
+      expect(sanitizeOptParams("profile-list", { machine: bad }), JSON.stringify(bad)).toEqual({});
+    }
+  });
+
+  it("machine and remote together keep the machine, which is the narrower ask", () => {
+    expect(sanitizeOptParams("profile-list", { machine: "darkbook", remote: "on" })).toEqual({ machine: "darkbook" });
+    expect(sanitizeOptParams("profile-list", { remote: "on" })).toEqual({ remote: "on" });
+  });
+
+  it("composes --machine after the static opts, and keys the cache on it", () => {
+    expect(composeArgv("profile-list", { machine: "darkbook" })).toEqual(["profile", "list", "--machine", "darkbook"]);
+    expect(composeArgv("profile-list", { remote: "on" })).toEqual(["profile", "list", "--remote"]);
+    expect(composeArgv("profile-list", {})).toEqual(["profile", "list"]);
+    expect(variantKey("profile-list", { machine: "darkbook" })).toBe("profile-list?machine=darkbook");
+    expect(variantKey("profile-list", { remote: "on", machine: "x" })).toBe("profile-list?machine=x&remote=on");
+    expect(canonicalOptPairs("profile-list", { machine: LOCAL_MACHINE })).toEqual([]);
+  });
+
+  it("the menu offers this machine first, then the roster, and keeps a linked name the roster lacks", () => {
+    expect(machineOpt(["studio", "mini"], undefined).values.map((v) => v.value)).toEqual([LOCAL_MACHINE, "studio", "mini"]);
+    expect(machineOpt(["studio"], "ghost").values.map((v) => v.value)).toEqual([LOCAL_MACHINE, "studio", "ghost"]);
+    expect(machineOpt(["studio"], "studio").values[0].argv).toEqual([]);
+  });
+
+  it("picking a machine turns remote off and turning remote on forgets the machine", () => {
+    expect(reconcileOpts("profile-list", { remote: "on" }, "machine", "studio")).toEqual({ machine: "studio" });
+    expect(reconcileOpts("profile-list", { machine: "studio" }, "remote", "on")).toEqual({ remote: "on" });
+    expect(reconcileOpts("profile-list", { machine: "studio" }, "machine", LOCAL_MACHINE)).toEqual({ machine: LOCAL_MACHINE });
+    expect(reconcileOpts("run-list", { kind: "lab" }, "all", "all")).toEqual({ kind: "lab", all: "all" });
   });
 });

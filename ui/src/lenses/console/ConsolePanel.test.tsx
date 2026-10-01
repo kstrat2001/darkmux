@@ -75,6 +75,51 @@ describe("ConsolePanel", () => {
     expect(screen.getByText("mission status", { selector: ".runchip" })).not.toHaveClass("on");
   });
 
+  // A deep link `#lens=console&panel=profile-list&opt.machine=darkbook` opens the
+  // panel AND runs it for that machine: the request carries `opt.machine`, and
+  // the command line reads the command that was run.
+  it("a profile-list deep link runs for its machine and shows the command it ran", async () => {
+    const body = {
+      ...MISSION_STATUS_BODY,
+      panel: "profile-list",
+      argv: ["profile", "list", "--machine", "darkbook"],
+      opts: { remote: "off", machine: "darkbook" },
+      ansi_text: "darkbook: 2 profiles available to this machine",
+    };
+    const fetchMock = vi.fn((url: string) =>
+      Promise.resolve(url.startsWith("/panel/profile-list") ? jsonResponse(body) : jsonResponse({ machines: [] }, 404)),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    renderPanel("profile-list", { machine: "darkbook" });
+    await waitFor(() => expect(screen.getByText(/darkbook: 2 profiles available/)).toBeInTheDocument());
+    const panelCall = fetchMock.mock.calls.map(([u]) => String(u)).find((u) => u.startsWith("/panel/profile-list"));
+    expect(panelCall).toContain("opt.machine=darkbook");
+    expect(screen.getByText("profile list", { selector: ".runchip" })).toHaveClass("on");
+    expect(screen.getByText(/--machine darkbook/)).toBeInTheDocument();
+  });
+
+  // The roster names come from /fleet/view; picking one clears `--remote`,
+  // because a machine and every peer are different asks.
+  it("picking a machine from the roster token turns --remote off and asks for that machine", async () => {
+    const body = { ...MISSION_STATUS_BODY, panel: "profile-list", argv: ["profile", "list", "--remote"], ansi_text: "all peers" };
+    const fetchMock = vi.fn((url: string) => {
+      if (url.startsWith("/panel/profile-list")) return Promise.resolve(jsonResponse(body));
+      if (url.startsWith("/fleet/view")) return Promise.resolve(jsonResponse({ machines: [{ entry: { id: "studio" } }, { entry: { id: "darkbook" } }] }));
+      return Promise.resolve(jsonResponse({}, 404));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderPanel("profile-list", { remote: "on" });
+    await waitFor(() => expect(screen.getByText(/all peers/)).toBeInTheDocument());
+    expect(screen.getByRole("switch", { name: /--remote/ })).toHaveAttribute("aria-checked", "true");
+    fireEvent.click(screen.getByText(/--machine \(this machine\)/));
+    await waitFor(() => expect(screen.getByRole("option", { name: "studio" })).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("option", { name: "studio" }));
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.map(([u]) => String(u)).some((u) => u.includes("opt.machine=studio") && !u.includes("opt.remote"))).toBe(true),
+    );
+    expect(screen.getByRole("switch", { name: /--remote/ })).toHaveAttribute("aria-checked", "false");
+  });
+
   it("selecting doctor (manual-only) does NOT auto-fetch — shows the not-yet-run placeholder", async () => {
     const fetchMock = vi.fn((url: string) => Promise.resolve(url.startsWith("/runs") ? runsJson() : jsonResponse(MISSION_STATUS_BODY)));
     vi.stubGlobal("fetch", fetchMock);

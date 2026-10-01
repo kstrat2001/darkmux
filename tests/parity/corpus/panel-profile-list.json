@@ -1,0 +1,22 @@
+{
+  "panel": "profile-list",
+  "argv": [
+    "profile",
+    "list",
+    "--machine",
+    "darkbook"
+  ],
+  "opts": {
+    "remote": "off",
+    "machine": "darkbook"
+  },
+  "captured_ts_ms": 1786222463561,
+  "gather_ms": 6,
+  "exit_code": 0,
+  "ansi_text": "darkbook: 2 profiles available to this machine\n  fast@darkbook                qwen3-4b-instruct\n  review@darkbook              devstral-small\n",
+  "stderr_tail": "",
+  "cols": 100,
+  "cache_ttl_ms": 3000,
+  "age_ms": 0,
+  "auto_refresh": true
+}

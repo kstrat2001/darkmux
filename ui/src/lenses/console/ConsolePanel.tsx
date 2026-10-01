@@ -2,7 +2,8 @@ import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent }
 import { useQuery, keepPreviousData } from "@tanstack/react-query";
 import { queryKeys, PANEL_CACHE_MS } from "../../lib/queryKeys";
 import type { PanelId } from "../../lib/route";
-import { PANELS, DEFAULT_PANEL_ID, isManualPanel, panelCols, panelArgv, panelOptGroups, composeArgv, canonicalOptPairs, type PanelOpt } from "./panels";
+import { PANELS, DEFAULT_PANEL_ID, isManualPanel, panelCols, panelArgv, panelOptGroups, composeArgv, canonicalOptPairs, rosterOptName, machineOpt, reconcileOpts, LOCAL_MACHINE, type PanelOpt } from "./panels";
+import { useFleetView } from "../../hooks/useFleetView";
 import { fetchPanel } from "./fetchPanel";
 import { canonicalHash, writeHash } from "../../lib/hashSync";
 import { panelAgeLabel } from "./format";
@@ -143,7 +144,7 @@ export function ConsolePanel({
 
   const activeSelection: Readonly<Record<string, string>> = selections.get(panelId) ?? {};
   const setOpt = (name: string, value: string) => {
-    const next = { ...activeSelection, [name]: value };
+    const next = reconcileOpts(panelId, activeSelection, name, value);
     setSelections((prev) => {
       const m = new Map(prev);
       m.set(panelId, next);
@@ -433,7 +434,7 @@ function arraysEqual(a: readonly string[], b: readonly string[]): boolean {
  *   `role="switch"` button reading just the flag, dim when off, accented
  *   when on.
  *
- * Six of eight panels declare no options at all (`panelOptGroups(id)` is
+ * Six of nine panels declare no options at all (`panelOptGroups(id)` is
  * empty) — for those, this renders the EXACT SAME markup as before this
  * whole opts feature existed: one plain `<span className="pc-cmd">$
  * darkmux {argv}</span>`, no tokens, no interactivity, no layout change.
@@ -520,6 +521,7 @@ function ChromeCommandLine({
             )}
           </span>
         ))}
+        {rosterOptName(id) !== null && <MachineToken id={id} opts={opts} manual={manual} onChange={(v) => onOptChange(rosterOptName(id) as string, v)} />}
       </span>
       {loadedBody && (
         <>
@@ -529,6 +531,34 @@ function ChromeCommandLine({
         </>
       )}
     </>
+  );
+}
+
+/** The roster-valued token (`--machine studio ▾`): an enum token whose values
+ * are this machine plus the roster's machine names, read from the same
+ * `/fleet/view` the fleet lens draws. Only a panel with a roster opt mounts
+ * it, so the view is read nowhere else. A name that arrived on a link but is
+ * not in the roster stays in the list (see `machineOpt`); the server's 400
+ * says why it does not run. */
+function MachineToken({
+  id,
+  opts,
+  manual,
+  onChange,
+}: {
+  id: PanelId;
+  opts: Readonly<Record<string, string>>;
+  manual: boolean;
+  onChange: (value: string) => void;
+}) {
+  const { rows } = useFleetView(true);
+  const name = rosterOptName(id) as string;
+  const roster = (rows ?? []).flatMap((r) => (r.entry ? [r.entry.id] : []));
+  return (
+    <span>
+      {" "}
+      <EnumToken opt={machineOpt(roster, opts[name])} value={opts[name] ?? LOCAL_MACHINE} manual={manual} onChange={onChange} />
+    </span>
   );
 }
 
