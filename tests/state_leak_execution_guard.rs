@@ -368,35 +368,20 @@ fn enumerate_units() -> Vec<Unit> {
     units
 }
 
-/// The one unit that still leaks, with its count measured on this branch
-/// and the reason the fix is not a per-test guard. Tracked as #2732.
+/// Units that still leak, each with its count measured and the reason the fix
+/// is not a per-test guard. EMPTY today: the one entry this list held
+/// (`cargo test -p darkmux --bins`, `mission_launch::launch()`'s `process-start`
+/// liveness marker, #2732) measured NOTHING when this check first ran to
+/// completion again, both on macos-latest CI and locally, so the guard's own
+/// rule applied and the entry was deleted. #2732 is left for its owner to close.
 ///
-/// This is an EXEMPTION list, which is the shape this target exists to
-/// argue against — so it is bounded three ways. The entry names a measured
-/// COUNT, not a spelling. The assertion is `0 < files <= cap`, so growth
-/// fails AND a unit that has been fixed also fails until its entry is
-/// deleted. And the entry has to name a unit this check actually runs, so
-/// it cannot outlive the thing it describes.
-///
-/// `mission_launch::launch()` emits the dependency-free liveness floor's
-/// first marker (`process-start`) before anything else, and about
-/// twenty-four tests in `src/mission_launch.rs` call it. Giving each one
-/// `IsolatedState` requires `#[serial_test::serial]`, because that guard
-/// mutates process-global environment — and those tests are not serial
-/// today. Serializing two dozen of them is a real throughput change to the
-/// suite and wants its own measurement.
-///
-/// Measured with `DARKMUX_HOME` UNSET — the ordinary developer machine —
-/// the test-build default sends it to the per-pid test-isolated root
-/// instead, so the operator's real tree is untouched. The exposure is an
-/// operator who exports `DARKMUX_HOME`, and the artifact is a prunable
-/// heartbeat file rather than a chained record.
-const KNOWN_UNISOLATED_UNITS: &[(&str, usize, &str)] = &[(
-    "test -p darkmux --bins",
-    1,
-    "mission_launch::launch()'s `process-start` liveness marker, from ~24 non-serial \
-     tests; #2732",
-)];
+/// The mechanism stays, because this is an EXEMPTION list, the shape this
+/// target exists to argue against, so it is bounded three ways. An entry names
+/// a measured COUNT, not a spelling. The assertion is `0 < files <= cap`, so
+/// growth fails AND a unit that has been fixed also fails until its entry is
+/// deleted. And an entry has to name a unit this check actually runs, so it
+/// cannot outlive the thing it describes.
+const KNOWN_UNISOLATED_UNITS: &[(&str, usize, &str)] = &[];
 
 /// The free half: the enumeration itself, asserted on every `cargo test`.
 ///
