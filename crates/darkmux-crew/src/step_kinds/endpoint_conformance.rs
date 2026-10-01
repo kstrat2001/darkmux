@@ -60,6 +60,7 @@ const FORBIDDEN: &[Idiom] = &[
     Idiom { pattern: "insert(\"max_tokens\"", route: "single_shot::chat_body" },
     Idiom { pattern: "\"max_completion_tokens\":", route: "single_shot::chat_body" },
     Idiom { pattern: "select_model(", route: "target::resolve_in / target::select_in_profile" },
+    Idiom { pattern: "ManagedBackend::Lmstudio", route: "EndpointKind::is_managed (\"is this endpoint managed\" means ANY managed backend); name LM Studio only where the code is genuinely LM Studio's" },
 ];
 
 /// The homes: `(workspace-relative file, pattern, count, why)`.
@@ -71,6 +72,9 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
     ("crates/darkmux-doctor/src/lib.rs", ".key_env", 1, "a message naming the field `endpoint.auth.key_env`"),
     ("crates/darkmux-crew/src/single_shot.rs", "insert(\"max_completion_tokens\"", 1, "THE body builder, chat-completions dialect"),
     ("crates/darkmux-crew/src/single_shot.rs", "insert(\"max_tokens\"", 1, "THE body builder, chat-completions-max-tokens dialect"),
+    ("crates/darkmux-types/src/endpoint.rs", "ManagedBackend::Lmstudio", 3, "the backend's own facts: its default dialect, the `managed: lmstudio` constructor, and its chat URL (the configured LM Studio address)"),
+    ("crates/darkmux-types/src/lib.rs", "ManagedBackend::Lmstudio", 1, "a model that names no endpoint is on the one managed backend darkmux has"),
+    ("crates/darkmux-doctor/src/lib.rs", "ManagedBackend::Lmstudio", 1, "the endpoints row's label names the backend (display only)"),
     ("crates/darkmux-crew/src/target.rs", "select_model(", 1, "THE resolver's selection (select_in_profile)"),
     ("crates/darkmux-types/src/endpoint.rs", ".keychain", 3, "THE credential order (credential_source), and validate()'s source check with its message"),
     ("crates/darkmux-crew/src/dispatch_internal.rs", ".keychain", 2, "resolve_endpoint_secret: the env var vanished between credential_source and the read, fall to the same declared item; and a message naming the field"),
