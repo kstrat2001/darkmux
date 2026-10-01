@@ -343,7 +343,7 @@ impl WorkspaceSpec {
     /// uniqueness, a source naming neither (or both) of `git`/`path`, and
     /// an edge naming an unknown source — the same checks
     /// `CorpusManifest::validate` ran, moved here as the one definition.
-    /// Returns non-fatal warnings (a `schema_version` major mismatch) on
+    /// Returns non-fatal warnings (an older `schema_version` major) on
     /// success.
     pub fn validate(&self) -> Result<Vec<String>> {
         let mut warnings = Vec::new();
@@ -395,7 +395,7 @@ impl WorkspaceSpec {
             {
                 if got != want {
                     warnings.push(format!(
-                        "workspace spec '{name}': schema_version '{sv}' is a different major version than this binary's spec schema ('{WORKSPACE_SPEC_SCHEMA_VERSION}') — fields may not resolve as expected"
+                        "workspace spec '{name}': schema_version '{sv}' is an older major version than this binary's spec schema ('{WORKSPACE_SPEC_SCHEMA_VERSION}') — fields may not resolve as expected"
                     ));
                 }
             }
@@ -778,15 +778,28 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_major_mismatch_warns_not_fails() {
+    fn an_older_schema_major_warns_not_fails() {
         let mut json = minimal_spec_json();
-        json["schema_version"] = serde_json::json!("2.0");
+        json["schema_version"] = serde_json::json!("0.9");
         let dir = TempDir::new().unwrap();
         let path = write(&dir, "workspace.json", &json.to_string());
         let (s, warnings) = WorkspaceSpec::load(&path).unwrap();
         assert_eq!(s.name.as_deref(), Some("example"));
         assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings[0].contains("2.0"), "{warnings:?}");
+        assert!(warnings[0].contains("0.9"), "{warnings:?}");
+    }
+
+    /// (#3035) A spec a newer darkmux wrote is refused by the user-file gate
+    /// (the same refusal as every other user file), where it used to load
+    /// with a warning.
+    #[test]
+    fn a_newer_schema_is_refused_by_the_gate() {
+        let mut json = minimal_spec_json();
+        json["schema_version"] = serde_json::json!("2.0");
+        let dir = TempDir::new().unwrap();
+        let path = write(&dir, "workspace.json", &json.to_string());
+        let err = WorkspaceSpec::load(&path).unwrap_err().to_string();
+        assert!(err.contains("written by a newer darkmux") && err.contains("Upgrade darkmux."), "{err}");
     }
 
     /// (#1959) Moved from the retired `crawl::manifest`'s own test of the
