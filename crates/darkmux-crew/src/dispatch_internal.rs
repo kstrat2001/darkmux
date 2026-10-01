@@ -982,47 +982,144 @@ pub(crate) fn write_staged_resume_checkpoint(contents: &str, new_host_out: &Path
         .with_context(|| format!("writing staged resume checkpoint to {}", dest.display()))
 }
 
-/// Suffix of the host-only resume-origin record. The record lives BESIDE the
-/// out-dir (`<out-dir>.resume_origin.json`, in the out-dir's parent), never
-/// inside it: the out-dir is bind-mounted read-write at `/darkmux-out`, so a
-/// record inside it is model-writable and a model could flip
-/// `workspace_read_only` to talk the resume gate (and the operator-facing
-/// resume hint) into a read-write mount (#2972). Nothing reads the old
-/// in-out-dir `resume_origin.json`: a checkpoint with no sibling record is
-/// refused for resume. The ONE place the path is derived is
-/// [`resume_origin_path`]; the writer and every reader go through it.
-const RESUME_ORIGIN_SUFFIX: &str = ".resume_origin.json";
-
-/// The host-only resume-origin record for `out_dir` (see
-/// [`RESUME_ORIGIN_SUFFIX`]). `None` when `out_dir` has no parent or name.
-fn resume_origin_location(out_dir: &Path) -> Option<(&Path, String)> {
-    let parent = out_dir.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    let name = out_dir.file_name()?.to_str()?;
-    Some((parent, format!("{name}{RESUME_ORIGIN_SUFFIX}")))
-}
-
-/// Full path of the host-only resume-origin record for `out_dir`.
+/// Full path of the host-only resume-origin record for `out_dir`: BESIDE the
+/// out-dir (`<out-dir>.resume_origin.json`, in its parent), never inside it.
+/// The out-dir is bind-mounted read-write at `/darkmux-out`, so a record
+/// inside it is model-writable and a model could flip `workspace_read_only`
+/// to talk the resume gate (and the operator-facing resume hint) into a
+/// read-write mount (#2972). Nothing reads the old in-out-dir
+/// `resume_origin.json`: a checkpoint with no sibling record is refused for
+/// resume. The ONE place the path is derived is
+/// `darkmux_types::paths::resume_origin_record_path`; the writer and every
+/// reader go through this wrapper.
 pub(crate) fn resume_origin_path(out_dir: &Path) -> PathBuf {
-    match resume_origin_location(out_dir) {
-        Some((parent, name)) => parent.join(name),
-        None => out_dir.join(RESUME_ORIGIN_SUFFIX),
-    }
+    darkmux_types::paths::resume_origin_record_path(out_dir)
+        .unwrap_or_else(|| out_dir.join(darkmux_types::paths::RESUME_ORIGIN_SUFFIX))
 }
 
-/// Read the host-only resume-origin record, no-follow and size-capped (the
-/// parent may be a shared temp dir, so a planted symlink is refused).
+/// Read the host-only resume-origin record: no-follow, size-capped, and
+/// refused unless the current user owns it (the parent may be a shared temp
+/// dir another local user can write to).
 fn read_resume_origin(out_dir: &Path) -> std::result::Result<String, crate::contained_file::ContainedFileError> {
-    let Some((parent, name)) = resume_origin_location(out_dir) else {
-        return Err(crate::contained_file::ContainedFileError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "out-dir has no name",
-        )));
+    read_resume_origin_owned_by(out_dir, current_euid())
+}
+
+#[cfg(unix)]
+fn current_euid() -> Option<u32> {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    Some(unsafe { libc::geteuid() })
+}
+
+#[cfg(not(unix))]
+fn current_euid() -> Option<u32> {
+    None
+}
+
+/// [`read_resume_origin`] with the expected owner injected (tests cannot
+/// chown a file to another uid without privilege). `None` skips the check.
+fn read_resume_origin_owned_by(
+    out_dir: &Path,
+    owner: Option<u32>,
+) -> std::result::Result<String, crate::contained_file::ContainedFileError> {
+    use crate::contained_file::ContainedFileError;
+    use std::io::Read;
+    let path = resume_origin_path(out_dir);
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(ContainedFileError::NotFound);
     };
-    crate::contained_file::read_contained_to_string(
-        parent,
-        Path::new(&name),
-        crate::contained_file::SMALL_FILE_MAX_BYTES,
-    )
+    let mut file = crate::contained_file::open_contained(parent, Path::new(name))?;
+    #[cfg(unix)]
+    if let Some(want) = owner {
+        use std::os::unix::fs::MetadataExt;
+        let have = file.metadata()?.uid();
+        if have != want {
+            return Err(ContainedFileError::Refused(format!(
+                "`{}` is owned by uid {have}, not uid {want}; not a record this user wrote",
+                path.display()
+            )));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = owner;
+    let cap = crate::contained_file::SMALL_FILE_MAX_BYTES;
+    if file.metadata()?.len() > cap {
+        return Err(ContainedFileError::Refused(format!("`{}` exceeds the {cap}-byte read cap", path.display())));
+    }
+    let mut body = String::new();
+    (&mut file)
+        .take(cap + 1)
+        .read_to_string(&mut body)
+        .map_err(ContainedFileError::Io)?;
+    if body.len() as u64 > cap {
+        return Err(ContainedFileError::Refused(format!("`{}` exceeds the {cap}-byte read cap", path.display())));
+    }
+    Ok(body)
+}
+
+/// Write `bytes` at `path` without following a symlink planted there: an
+/// exclusive (`O_EXCL`, mode 0600) temp file beside it, then a rename, which
+/// replaces whatever is at `path` (a stale record or a planted symlink)
+/// rather than writing through it.
+fn write_private_no_follow(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let result = opts.open(&tmp).and_then(|mut f| f.write_all(bytes)).and_then(|()| fs::rename(&tmp, path));
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Refusals decided from the assembled container config, before docker runs:
+/// the image reference, and (#2972) that no mount can reach the host-only
+/// resume record.
+fn preflight_docker_config(config: &DockerRunConfig) -> Result<()> {
+    validate_image_ref(&config.image)?;
+    refuse_origin_record_in_mounts(config)
+}
+
+/// (#2972) The structural guarantee: the host-only record must not sit
+/// inside anything the container mounts (workspace, out-dir, mod attachments,
+/// cache, injected runtime binary), or the record is model-writable again.
+/// `Err` names the record and the mount that would expose it.
+pub(crate) fn refuse_origin_record_in_mounts(config: &DockerRunConfig) -> Result<()> {
+    let mut mounts: Vec<(&str, &Path)> = vec![("workspace", &config.workspace), ("out-dir", &config.host_out)];
+    mounts.extend(config.mod_attachment_mounts.iter().map(|(p, _)| ("mod attachment", p.as_path())));
+    if let Some(cache) = &config.cache_dir {
+        mounts.push(("cache", cache));
+    }
+    if let (true, Some(bin)) = (config.inject, &config.runtime_binary) {
+        mounts.push(("injected runtime binary", bin));
+    }
+    origin_record_exposed_by(&config.host_out, &mounts)
+}
+
+fn origin_record_exposed_by(out_dir: &Path, mounts: &[(&str, &Path)]) -> Result<()> {
+    let record = resume_origin_path(out_dir);
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let record_canon = match (record.parent(), record.file_name()) {
+        (Some(parent), Some(name)) => canon(parent).join(name),
+        _ => record.clone(),
+    };
+    for (label, mount) in mounts {
+        if record_canon.starts_with(canon(mount)) {
+            bail!(
+                "darkmux dispatch: the host-only resume record {} would sit inside the {label} mount {}, \
+                 which the container can write; refusing to dispatch. Choose a --workdir (and out-dir) \
+                 that does not contain the out-dir's parent directory",
+                record.display(),
+                mount.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// (Security audit, #2114 resume follow-up) Stamp this dispatch's
@@ -1080,7 +1177,7 @@ pub(crate) fn write_resume_origin_meta(
     let path = resume_origin_path(host_out);
     match serde_json::to_vec_pretty(&body) {
         Ok(bytes) => {
-            if let Err(e) = fs::write(&path, bytes) {
+            if let Err(e) = write_private_no_follow(&path, &bytes) {
                 eprintln!(
                     "darkmux dispatch: ⚠ failed to write resume-origin metadata at {}: {e} \
                      (a future --resume-from this dir will refuse rather than guess)",
@@ -5856,7 +5953,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // arg. The `--` fence in build_docker_run_argv already prevents flag
     // interpretation; this rejects malformed refs (leading `-`, whitespace,
     // control chars) so the contract is explicit, not just fence-dependent.
-    validate_image_ref(&argv_config.image)?;
+    preflight_docker_config(&argv_config)?;
     let argv = build_docker_run_argv(&argv_config);
 
     // `build_docker_run_argv` returns a FULL command — the program (`docker`)

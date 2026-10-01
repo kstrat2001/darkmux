@@ -757,7 +757,7 @@ extern "C" fn remove_registered_scratch_dirs() {
         return;
     };
     for dir in dirs.values() {
-        let _ = std::fs::remove_dir_all(dir);
+        let _ = crate::paths::remove_out_dir(dir);
     }
 }
 
@@ -837,7 +837,7 @@ fn sweep_dead_siblings(prefix: &str) {
         if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
         }
-        let _ = std::fs::remove_dir_all(entry.path());
+        let _ = crate::paths::remove_out_dir(&entry.path());
     }
 }
 
@@ -902,7 +902,7 @@ pub fn process_scratch_dir(prefix: &str) -> PathBuf {
     sweep_dead_siblings(prefix);
 
     let dir = std::env::temp_dir().join(format!("{prefix}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = crate::paths::remove_out_dir(&dir);
     let _ = std::fs::create_dir_all(&dir);
     registry.insert(prefix.to_string(), dir.clone());
     dir

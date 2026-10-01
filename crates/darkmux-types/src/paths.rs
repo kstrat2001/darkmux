@@ -170,6 +170,37 @@ pub fn test_isolated_dir(name: &str) -> PathBuf {
     test_isolated_root().join(name)
 }
 
+/// Suffix of a dispatch out-dir's host-only resume-origin record (#2972). The
+/// record lives BESIDE the out-dir (`<out-dir>.resume_origin.json`, in its
+/// parent), never inside the directory the container mounts read-write.
+pub const RESUME_ORIGIN_SUFFIX: &str = ".resume_origin.json";
+
+/// The host-only resume-origin record for `out_dir`: the one place the path is
+/// derived. `None` when `out_dir` has no name to derive from.
+pub fn resume_origin_record_path(out_dir: &Path) -> Option<PathBuf> {
+    let parent = out_dir.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let name = out_dir.file_name()?.to_str()?;
+    Some(parent.join(format!("{name}{RESUME_ORIGIN_SUFFIX}")))
+}
+
+/// Remove an out-dir AND its sibling resume-origin record, so no orphaned
+/// record outlives its directory. Every darkmux path that removes a dispatch
+/// out-dir goes through here. A missing record is fine.
+pub fn remove_out_dir(dir: &Path) -> std::io::Result<()> {
+    let result = std::fs::remove_dir_all(dir);
+    if let Some(record) = resume_origin_record_path(dir) {
+        let _ = std::fs::remove_file(record);
+    }
+    result
+}
+
+/// Whether `name` (a directory-entry name) is a resume-origin record whose
+/// out-dir no longer exists in `parent`: an orphan `darkmux doctor` counts.
+pub fn is_orphaned_resume_origin(parent: &Path, name: &str) -> bool {
+    name.strip_suffix(RESUME_ORIGIN_SUFFIX)
+        .is_some_and(|stem| !stem.is_empty() && !parent.join(stem).is_dir())
+}
+
 /// What a `<repo>/.darkmux/` directory legitimately holds: the files darkmux
 /// still reads from a repo (the per-repo lessons database with its SQLite
 /// side files, and `conventions.json`). Everything else in it is stranded.
@@ -621,5 +652,33 @@ mod tests {
     #[test]
     fn the_scratch_root_is_stable_within_one_process() {
         assert_eq!(test_isolated_root(), test_isolated_root());
+    }
+}
+
+#[cfg(test)]
+mod origin_record_tests {
+    use super::*;
+
+    /// (#2972) Removing an out-dir through the cleanup path leaves no record.
+    #[test]
+    fn remove_out_dir_removes_the_sibling_record_too() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("darkmux-out-coder-1");
+        fs::create_dir_all(&dir).unwrap();
+        let record = resume_origin_record_path(&dir).unwrap();
+        fs::write(&record, "{}").unwrap();
+        remove_out_dir(&dir).unwrap();
+        assert!(!dir.exists() && !record.exists(), "no orphaned record may outlive its dir");
+    }
+
+    #[test]
+    fn a_record_is_orphaned_only_when_its_dir_is_gone() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("darkmux-out-coder-2");
+        let name = format!("darkmux-out-coder-2{RESUME_ORIGIN_SUFFIX}");
+        assert!(is_orphaned_resume_origin(tmp.path(), &name));
+        fs::create_dir_all(&dir).unwrap();
+        assert!(!is_orphaned_resume_origin(tmp.path(), &name));
+        assert!(!is_orphaned_resume_origin(tmp.path(), "darkmux-out-coder-2.json"));
     }
 }

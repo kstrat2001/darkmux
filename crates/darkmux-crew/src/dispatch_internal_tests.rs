@@ -17968,6 +17968,58 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         assert_eq!(fs::read_dir(&out).unwrap().count(), 0, "nothing written inside the mounted out-dir");
     }
 
+    /// (#2972) The record sits in a shared parent now, so the writer must not
+    /// write THROUGH a symlink planted at its path, and the record is 0600.
+    #[cfg(unix)]
+    #[test]
+    fn the_origin_writer_replaces_a_planted_symlink_instead_of_following_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let out = tmp.path().join("out");
+        fs::create_dir_all(&out).unwrap();
+        let victim = tmp.path().join("victim.txt");
+        fs::write(&victim, "keep me").unwrap();
+        std::os::unix::fs::symlink(&victim, resume_origin_path(&out)).unwrap();
+        write_resume_origin_meta(&out, tmp.path(), false, None, &darkmux_types::execution_id::ExecutionId::mint());
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "keep me", "the symlink target must be untouched");
+        let meta = fs::symlink_metadata(resume_origin_path(&out)).unwrap();
+        assert!(meta.file_type().is_file(), "the record is a regular file, not the symlink");
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    }
+
+    /// A record owned by another uid is refused. The owner is injected: a
+    /// test cannot chown a file to another user without privilege, so the
+    /// check is exercised through `read_resume_origin_owned_by`'s seam.
+    #[cfg(unix)]
+    #[test]
+    fn a_record_owned_by_another_uid_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let out = tmp.path().join("out");
+        fs::create_dir_all(&out).unwrap();
+        write_resume_origin_meta(&out, tmp.path(), false, None, &darkmux_types::execution_id::ExecutionId::mint());
+        let me = current_euid().unwrap();
+        assert!(read_resume_origin_owned_by(&out, Some(me)).is_ok());
+        let err = read_resume_origin_owned_by(&out, Some(me.wrapping_add(1))).unwrap_err();
+        assert!(format!("{err}").contains("owned by uid"), "{err}");
+    }
+
+    /// (#2972) The structural guarantee: refuse when the record would sit
+    /// inside a mounted directory, naming the record and the mount.
+    #[test]
+    fn a_dispatch_whose_origin_record_sits_inside_a_mount_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let out = tmp.path().join("out");
+        fs::create_dir_all(&out).unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        origin_record_exposed_by(&out, &[("workspace", elsewhere.path()), ("out-dir", &out)])
+            .expect("no mount contains the sibling record");
+        let err = origin_record_exposed_by(&out, &[("workspace", tmp.path())]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("workspace mount") && msg.contains("resume_origin.json"), "{msg}");
+        // The cache and a mod attachment are checked the same way.
+        assert!(origin_record_exposed_by(&out, &[("cache", tmp.path())]).is_err());
+    }
+
     #[test]
     fn resume_checkpoint_refuses_a_symlinked_origin_file() {
         // The origin record is read no-follow, so a symlink planted at its
