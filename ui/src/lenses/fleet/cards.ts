@@ -33,7 +33,7 @@ import {
 } from "../../lib/tokenRate";
 import type { ExecutionTokenReading, LiveState } from "../../lib/tokenRate";
 import type { MachineSpecsResponse } from "../../types/generated/MachineSpecsResponse";
-import { grantWords, specsLine, type Grant, type RowFacts, type Standing } from "./viewRows";
+import { grantWords, specsLine, rowSeen, type Grant, type RowFacts, type Standing } from "./viewRows";
 import type { PresenceBeat } from "../../types/generated/PresenceBeat";
 // (#2814) `isSelfMachine`/`displayNameOf` live in `lib/flow.ts` beside
 // `nameOf`/`machineNames`/`localMachineUid` rather than here, because the
@@ -510,7 +510,7 @@ function cardIdentity(
     grant: row.grant,
     hub: row.hub,
     standing: row.standing,
-    availability: machineAvailability({ self: row.isSelf, seen: row.known, standing: row.standing }),
+    availability: machineAvailability({ self: row.isSelf, seen: rowSeen(row), standing: row.standing }),
     // (#2915) The view says which row is this machine; a peer's model is
     // read off its own utility records and its residency is unknown.
     self: row.isSelf,

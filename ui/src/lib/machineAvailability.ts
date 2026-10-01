@@ -8,8 +8,8 @@
  * - `not_streamed`: the machine is on the roster or readable over its
  *   listener, yet nothing it writes reaches this viewer (its Redis sink is
  *   off, or it points at another hub). Quiet here proves nothing.
- * - `not_reporting`: records from it once arrived and it is now down or
- *   silent. Its last readings are history.
+ * - `not_reporting`: it is down or silent (records from it may once have
+ *   arrived). Its last readings are history.
  *
  * Unknown is never shown as a confident fact: a surface that gets anything
  * but `known` shows an explicit "not reported" state, never "idle", "0" or
@@ -32,8 +32,10 @@ export interface AvailabilityFacts {
 
 export function machineAvailability(f: AvailabilityFacts): MachineAvailability {
   if (f.self) return "known";
-  if (!f.seen) return "not_streamed";
-  return f.standing === "offline" ? "not_reporting" : "known";
+  // A machine that is down is not misconfigured: its status already says so,
+  // so it never gets the "check its flow stream" warning, seen or not.
+  if (f.standing === "offline") return "not_reporting";
+  return f.seen ? "known" : "not_streamed";
 }
 
 /** The tooltip a warning mark carries; `null` for `known`, which warns of nothing. */

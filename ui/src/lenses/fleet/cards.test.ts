@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { machActive, specOf, buildFleetCard, busiestExecution, isStrictlyBusier, specUnknownLabel, specLine, cardFace } from "./cards";
+import { machActive, specOf, buildFleetCard, busiestExecution, isStrictlyBusier, specUnknownLabel, specLine, cardFace, notStreamedNames } from "./cards";
 import type { RowFacts } from "./viewRows";
 import type { MachineSpecsResponse } from "../../types/generated/MachineSpecsResponse";
 import type { PresenceBeat } from "../../types/generated/PresenceBeat";
@@ -23,7 +23,7 @@ function beat(overrides: Partial<PresenceBeat>): PresenceBeat {
 
 /** A fleet-view row's facts, as `viewRows.ts::rowFacts` would hand them to a card. */
 function rowFactsFor(overrides: Partial<RowFacts> = {}): RowFacts {
-  return { uid: "u1", known: true, name: null, names: [], spec: "", note: null, grant: null, standing: "online", isSelf: false, hub: false, ...overrides };
+  return { uid: "u1", known: true, name: null, names: [], spec: "", note: null, grant: null, standing: "online", liveness: "live", isSelf: false, hub: false, ...overrides };
 }
 
 function machineSpecs(overrides: Partial<MachineSpecsResponse> & Pick<MachineSpecsResponse, "machine_id">): MachineSpecsResponse {
@@ -1082,6 +1082,35 @@ describe("(#2928) buildFleetCard with the live overlay", () => {
 
 // (#2958) Positive readings at once; negative claims once every source that
 // could contradict them has answered.
+describe("card availability when the view's liveness says the stream stopped (5.0 R3)", () => {
+  const T = Date.parse("2026-08-09T00:00:00.000Z");
+  const DAY_AGO = new Date(T - 23 * 3_600_000).toISOString();
+  const stale = [{ ts: DAY_AGO, machine_uid: "darkbook", machine_id: "darkbook", session_id: "s1", action: "dispatch.complete" }].map((r) => norm(r));
+
+  it("a peer whose card was read but whose beat stopped is not_streamed, though the window holds a day-old record", () => {
+    const row = rowFactsFor({ uid: "darkbook", known: true, standing: "online", liveness: "no_beat" });
+    const c = buildFleetCard(stale, new Map(), null, new Set(), false, "darkbook", true, T, row);
+    expect(c.availability).toBe("not_streamed");
+    expect(cardFace({ absent: false, active: false, runsCount: 0, standing: c.standing, availability: c.availability }, false, { flow: true, presence: true, sessions: true, runs: true })).toMatchObject({ stat: "no signal", noSignal: true });
+  });
+
+  it("an unknown liveness falls back to what the window holds", () => {
+    const build = (known: boolean) => buildFleetCard([], new Map(), null, new Set(), false, "darkbook", true, T, rowFactsFor({ uid: "darkbook", known, liveness: "unknown" })).availability;
+    expect(build(true)).toBe("known");
+    expect(build(false)).toBe("not_streamed");
+  });
+
+  it("a live beat is known", () => {
+    expect(buildFleetCard(stale, new Map(), null, new Set(), false, "darkbook", true, T, rowFactsFor({ uid: "darkbook", known: true, liveness: "live" })).availability).toBe("known");
+  });
+
+  it("a powered-off machine nothing was seen from is not_reporting, and the hero does not list it as not streaming", () => {
+    const row = rowFactsFor({ uid: "darkbook", known: false, standing: "offline", liveness: "no_beat" });
+    const c = buildFleetCard([], new Map(), null, new Set(), false, "darkbook", true, T, row);
+    expect(c.availability).toBe("not_reporting");
+    expect(notStreamedNames([c])).toEqual([]);
+  });
+});
 describe("cardFace (#2958)", () => {
   const none = { flow: false, presence: false, sessions: false, runs: false };
   const all = { flow: true, presence: true, sessions: true, runs: true };

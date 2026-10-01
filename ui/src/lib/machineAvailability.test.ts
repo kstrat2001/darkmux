@@ -8,6 +8,9 @@ describe("machineAvailability (#3012)", () => {
   it("a peer nothing reaches this viewer from is not streamed, whatever its card says", () => {
     expect(machineAvailability({ self: false, seen: false, standing: "online" })).toBe("not_streamed");
   });
+  it("a peer that is offline is not reporting, never not streamed, seen or not", () => {
+    expect(machineAvailability({ self: false, seen: false, standing: "offline" })).toBe("not_reporting");
+  });
   it("a peer seen and now offline is not reporting", () => {
     expect(machineAvailability({ self: false, seen: true, standing: "offline" })).toBe("not_reporting");
   });
