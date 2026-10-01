@@ -24,8 +24,10 @@ darkmux release.
 - **A mod names its change, its proposer and its site** (MOD schema `2` to
   `2.1`, additive; `mod list --json` and `mod show --json` gain three optional
   fields, `tests/cli-json.golden` regenerated). `change_key` is `chg-<blake3>`
-  over the sorted `for` keys, the kit kind, the kit bytes and the attachment
-  hashes, so byte-identical proposals share it and any different diff does not;
+  over the sorted `for` keys, the kit bytes (with a kind derived from them,
+  never the `--kit-kind` label) and the attachment hashes, taken from the
+  bytes as they are stored, so byte-identical proposals share it and any
+  different diff does not;
   `proposer` is `{role, profile, model}` when a darkmux role proposed the mod
   (`by` is unchanged); `site` is `{source, sha, file, start_line, end_line}`
   when the finding it answers sat in a planned crawl or review site. `mod show`

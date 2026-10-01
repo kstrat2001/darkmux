@@ -437,6 +437,7 @@ pub(crate) fn dispatch_opts_for(
     .with_context(|| format!("step `{}`: resolving the brief's records", step.id))?;
 
     let opts = DispatchOpts {
+        finding_sites: None,
         // (#2914) Work never runs on the utility model.
         allow_utility_model: false,
         remote_origin: None,

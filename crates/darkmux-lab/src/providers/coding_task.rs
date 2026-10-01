@@ -708,6 +708,7 @@ fn dispatch_via_internal(
 ) -> Result<(Dispatched, Option<PathBuf>)> {
     use darkmux_crew::dispatch::{dispatch, DispatchOpts};
     let opts = DispatchOpts {
+        finding_sites: None,
         // (#2914) The lab benchmarks candidate utility models.
         allow_utility_model: true,
         remote_origin: None,

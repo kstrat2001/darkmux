@@ -157,6 +157,7 @@ impl WorkJob {
     pub fn into_dispatch_opts(self) -> darkmux_crew::dispatch::DispatchOpts {
         use darkmux_crew::dispatch::DispatchOpts;
         DispatchOpts {
+            finding_sites: None,
             // (#2914) Work never runs on the utility model.
             allow_utility_model: false,
             remote_origin: None,

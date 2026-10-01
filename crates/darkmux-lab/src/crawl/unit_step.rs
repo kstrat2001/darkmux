@@ -865,8 +865,8 @@ struct UnitContext {
     source: String,
     sha: String,
     rule_ids: Vec<String>,
-    /// (#2265, 5.0) The unit's planned line spans, stamped into
-    /// `record_context` so a finding, and a mod answering it, can name the
+    /// (#2265, 5.0) The unit's planned line spans, handed to the dispatch as
+    /// `finding_sites` so a finding, and a mod answering it, can name the
     /// site it sat in.
     sites: Value,
     session_id: SessionId,
@@ -1328,6 +1328,10 @@ impl StepKind for CrawlUnitStepKind {
             };
             let started = std::time::Instant::now();
             let opts = DispatchOpts {
+                // (#2265, 5.0) The unit's planned spans go to the tailer for
+                // the FINDINGS only. In `record_context` they would ride
+                // every flow record of the dispatch.
+                finding_sites: Some(ctx.sites.clone()),
                 // (#2914) Work never runs on the utility model.
                 allow_utility_model: false,
                 remote_origin: None,
@@ -1410,7 +1414,6 @@ impl StepKind for CrawlUnitStepKind {
                     "sha": ctx.sha,
                     "rule": single_rule(&ctx.rule_ids),
                     "rules": ctx.rule_ids,
-                    "sites": ctx.sites,
                     // (#2310 P4c review round 2, item (g) — stated precisely
                     // for the PR: `crawl.json`'s DISPATCHED MESSAGE
                     // (`build_message`'s own output) is byte-identical to

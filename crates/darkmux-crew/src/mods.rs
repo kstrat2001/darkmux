@@ -145,40 +145,37 @@ fn put_field(h: &mut blake3::Hasher, bytes: &[u8]) {
 /// (#2265, 5.0) The convergence handle for a proposal: `chg-<64 hex blake3>`
 /// over a canonical encoding of what the proposal IS. Byte-identical
 /// proposals share it whoever proposed them; any differing byte of the kit,
-/// kit kind, `for` set or an attachment gives a different key. darkmux never
-/// decides two different diffs are the same change.
+/// `for` set or an attachment gives a different key. darkmux never decides
+/// two different diffs are the same change.
 ///
 /// **The encoding, in this order** (every integer a little-endian `u64`; every
 /// `field` is `len(bytes) || bytes`):
 ///
 /// 1. `field(CHANGE_KEY_DOMAIN)`.
 /// 2. The `for` keys sorted and deduplicated: `count`, then `field(key)` each.
-/// 3. `field(kit_kind)`, empty when absent.
+/// 3. `field(kind)`, where `kind` is DERIVED from the kit bytes:
+///    `unified-diff` when [`looks_like_unified_diff`] says so, else empty
+///    (also empty when there is no kit). The caller's own `--kit-kind` label
+///    is a hint on the record and is never hashed, so both producers agree.
 /// 4. The kit: one byte `0` when there is no kit, or one byte `1` followed by
 ///    `field(kit)`. So no kit and an empty kit differ, as on the record.
 /// 5. The attachments sorted by name: `count`, then per attachment
 ///    `field(name)` and the 32-byte blake3 digest of its bytes.
-pub fn change_key(
-    for_keys: &[String],
-    kit_kind: Option<&str>,
-    kit: Option<&str>,
-    attachments: &[(&str, &[u8])],
-) -> String {
-    let digests: Vec<(String, [u8; 32])> = attachments
+pub fn change_key(for_keys: &[String], kit: Option<&str>, attachments: &[(&str, &[u8])]) -> String {
+    let digests: Vec<AttachmentDigest> = attachments
         .iter()
         .map(|(name, bytes)| (name.to_string(), *blake3::hash(bytes).as_bytes()))
         .collect();
-    change_key_from_digests(for_keys, kit_kind, kit, &digests)
+    change_key_from_digests(for_keys, kit, &digests)
 }
 
-/// [`change_key`] over attachments already reduced to their digests, so the
-/// CLI producer can hash a file by streaming it rather than loading it.
-fn change_key_from_digests(
-    for_keys: &[String],
-    kit_kind: Option<&str>,
-    kit: Option<&str>,
-    attachments: &[(String, [u8; 32])],
-) -> String {
+/// One attachment reduced to `(name, blake3 of its bytes)`.
+type AttachmentDigest = (String, [u8; 32]);
+
+/// [`change_key`] over attachments already reduced to their digests: the
+/// producers hash each attachment while staging it ([`stage_attachment`]), so
+/// the key describes exactly the bytes the store holds.
+fn change_key_from_digests(for_keys: &[String], kit: Option<&str>, attachments: &[AttachmentDigest]) -> String {
     let mut h = blake3::Hasher::new();
     put_field(&mut h, CHANGE_KEY_DOMAIN);
     let mut sorted: Vec<&String> = for_keys.iter().collect();
@@ -188,7 +185,8 @@ fn change_key_from_digests(
     for k in sorted {
         put_field(&mut h, k.as_bytes());
     }
-    put_field(&mut h, kit_kind.unwrap_or("").as_bytes());
+    let kind = if kit.is_some_and(looks_like_unified_diff) { "unified-diff" } else { "" };
+    put_field(&mut h, kind.as_bytes());
     match kit {
         None => {
             h.update(&[0]);
@@ -198,7 +196,7 @@ fn change_key_from_digests(
             put_field(&mut h, k.as_bytes());
         }
     }
-    let mut sorted: Vec<&(String, [u8; 32])> = attachments.iter().collect();
+    let mut sorted: Vec<&AttachmentDigest> = attachments.iter().collect();
     sorted.sort_by(|a, b| a.0.cmp(&b.0));
     h.update(&(sorted.len() as u64).to_le_bytes());
     for (name, digest) in sorted {
@@ -208,44 +206,52 @@ fn change_key_from_digests(
     format!("chg-{}", h.finalize().to_hex())
 }
 
-/// The blake3 digest of one file, streamed.
-fn hash_file(path: &Path) -> Result<[u8; 32]> {
-    let mut f = std::fs::File::open(path).with_context(|| format!("opening attachment {}", path.display()))?;
-    let mut h = blake3::Hasher::new();
-    std::io::copy(&mut f, &mut h).with_context(|| format!("hashing attachment {}", path.display()))?;
-    Ok(*h.finalize().as_bytes())
+/// A writer that feeds every byte it writes to a blake3 hasher, so an
+/// attachment is hashed in the same pass that stores it.
+struct HashingWriter<W: std::io::Write> {
+    inner: W,
+    hasher: blake3::Hasher,
+}
+
+impl<W: std::io::Write> std::io::Write for HashingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Stream `src` into a new owner-only attachment file at `dest`, hashing the
+/// bytes as they are written; returns the digest of what was stored.
+fn stage_attachment(dest: &Path, src: &mut dyn std::io::Read) -> Result<[u8; 32]> {
+    let mut out = HashingWriter { inner: create_attachment_file(dest)?, hasher: blake3::Hasher::new() };
+    std::io::copy(src, &mut out).with_context(|| format!("writing attachment {}", dest.display()))?;
+    Ok(*out.hasher.finalize().as_bytes())
 }
 
 /// (#2265, 5.0) The planned site a mod came from, traced through the findings
-/// it names: a crawl or review unit stamps its planned `sites` (plus `source`
-/// and `sha`) into the dispatch's `record_context`, which every finding the
-/// dispatch records copies as its `context`. The first `for` finding whose
-/// emitted `file` and `line` fall inside one of those sites names the mod's
-/// site. `None` when no plan produced it: never guessed from a bare file.
+/// it names: when the host tailer records a finding from a planned unit it
+/// stamps the span holding the finding onto the finding's `context.site`
+/// ([`crate::findings::stamp_site`]), beside the `source` and `sha` the unit's
+/// `record_context` already gives. The first `for` finding carrying a site
+/// names the mod's site. `None` when no plan produced it: never guessed.
 fn site_of(context: &ModContext) -> Option<ModSite> {
     context.findings.iter().find_map(site_of_finding)
 }
 
 fn site_of_finding(f: &ForFinding) -> Option<ModSite> {
     let ctx = f.context.as_ref()?;
-    let emitted = f.emitted.as_ref()?;
-    let (file, line) = (emitted.get("file")?.as_str()?, emitted.get("line")?.as_u64()?);
-    let (source, sha) = (ctx.get("source")?.as_str()?, ctx.get("sha")?.as_str()?);
-    let (start, end) = ctx.get("sites")?.as_array()?.iter().find_map(|s| span_around(s, file, line))?;
+    let site = ctx.get("site")?;
     Some(ModSite {
-        source: source.to_string(),
-        sha: sha.to_string(),
-        file: file.to_string(),
-        start_line: start,
-        end_line: end,
+        source: ctx.get("source")?.as_str()?.to_string(),
+        sha: ctx.get("sha")?.as_str()?.to_string(),
+        file: site.get("file")?.as_str()?.to_string(),
+        start_line: site.get("start")?.as_u64()?,
+        end_line: site.get("end")?.as_u64()?,
     })
-}
-
-/// One planned `{file, start, end}` span, as `(start, end)` when it is in
-/// `file` and holds `line`.
-fn span_around(site: &serde_json::Value, file: &str, line: u64) -> Option<(u64, u64)> {
-    let (start, end) = (site.get("start")?.as_u64()?, site.get("end")?.as_u64()?);
-    (site.get("file")?.as_str()? == file && (start..=end).contains(&line)).then_some((start, end))
 }
 
 /// Mint a key for one mod: `mod-<unix-secs>-<6 hex>`.
@@ -997,13 +1003,8 @@ pub fn create(
     }
 
     let key = mint_key();
-    let digests = attachments
-        .iter()
-        .zip(&names)
-        .map(|(path, name)| Ok((name.clone(), hash_file(path)?)))
-        .collect::<Result<Vec<_>>>()?;
     let context = finding_context(findings_root, &for_keys)?;
-    let record = ModRecord {
+    let mut record = ModRecord {
         key: key.clone(),
         ts: darkmux_flow::ts_utc_now(),
         by: by.to_string(),
@@ -1028,16 +1029,16 @@ pub fn create(
         // any create-mods gate loop — never gated at create time.
         gate: None,
         gate_skipped_reason: None,
-        // (#2265, 5.0) The proposal's content handle, computed here once, where
-        // the record is built. `site` is set above with `context`.
-        change_key: Some(change_key_from_digests(&for_keys, kit_kind, kit, &digests)),
+        // (#2265, 5.0) Set by `stage_and_commit` from the staged bytes.
+        change_key: None,
         // `mod create` is an external actor: no darkmux role proposed it.
         proposer: None,
         schema_version: MOD_SCHEMA_VERSION.to_string(),
         extras: serde_json::Map::new(),
     };
 
-    stage_and_commit(root, &record, &|dest| {
+    stage_and_commit(root, &mut record, &|dest| {
+        let mut digests = Vec::new();
         for (path, name) in attachments.iter().zip(&names) {
             // (#2451) NOT `std::fs::copy`: on Unix it carries the SOURCE
             // file's permission bits onto the copy, so an ordinary 0o644
@@ -1048,11 +1049,9 @@ pub fn create(
             // copy-then-`chmod` would leave open.
             let mut src = std::fs::File::open(path)
                 .with_context(|| format!("opening attachment {}", path.display()))?;
-            let mut out = create_attachment_file(&dest.join(name))?;
-            std::io::copy(&mut src, &mut out)
-                .with_context(|| format!("copying attachment {}", path.display()))?;
+            digests.push((name.clone(), stage_attachment(&dest.join(name), &mut src)?));
         }
-        Ok(())
+        Ok(digests)
     })?;
     Ok(record)
 }
@@ -1109,27 +1108,32 @@ fn create_attachment_file(path: &Path) -> Result<std::fs::File> {
 /// writes bytes that rode out of a container, where no host path exists.
 fn stage_and_commit(
     root: &Path,
-    record: &ModRecord,
-    write_attachments: &dyn Fn(&Path) -> Result<()>,
+    record: &mut ModRecord,
+    write_attachments: &dyn Fn(&Path) -> Result<Vec<AttachmentDigest>>,
 ) -> Result<()> {
-    let key = &record.key;
+    let key = record.key.clone();
+    let key = &key;
     let staging_root = root.join(STAGING_DIR);
     let staging = staging_root.join(key);
     let staged = (|| -> Result<()> {
         // Attachments FIRST, then the record that names them, so the last
         // thing written inside the staging dir is the thing that makes it a
         // record at all.
+        let mut digests = Vec::new();
         if !record.attachments.is_empty() {
             let dest = staging.join("attachments");
             std::fs::create_dir_all(&dest)
                 .with_context(|| format!("creating attachments dir {}", dest.display()))?;
-            write_attachments(&dest)?;
+            digests = write_attachments(&dest)?;
         }
+        // (#2265, 5.0) The change key comes from the STAGED bytes, after they
+        // are written and before the record that carries it.
+        record.change_key = Some(change_key_from_digests(&record.r#for, record.kit.as_deref(), &digests));
         // A minted key never collides, so anything but `Created` means
         // something else already owns that address — an error, not a shrug,
         // because the alternative is attaching these files to another mod.
         anyhow::ensure!(
-            materialize(&staging_root, record)? == Materialized::Created,
+            materialize(&staging_root, &*record)? == Materialized::Created,
             "a mod already exists at the minted key {key} — refusing to write over it"
         );
         let final_dir = record_dir_at(root, key);
@@ -1433,15 +1437,7 @@ pub fn create_from_emission(
              render as a fenced block in the review body, never a one-click suggestion"
         ));
     }
-    // (#2265, 5.0) Same handle `create` computes, over the kit as STORED (after
-    // the source-prefix mapping) and the attachment bytes.
-    let ck = change_key(
-        &for_keys,
-        kit_kind.as_deref(),
-        Some(&kit),
-        &attachments.iter().map(|a| (a.name.as_str(), a.bytes.as_slice())).collect::<Vec<_>>(),
-    );
-    let record = ModRecord {
+    let mut record = ModRecord {
         key: key.clone(),
         ts: darkmux_flow::ts_utc_now(),
         by: by.to_string(),
@@ -1473,23 +1469,22 @@ pub fn create_from_emission(
         // yet).
         gate: None,
         gate_skipped_reason: None,
-        change_key: Some(ck),
+        // (#2265, 5.0) Set by `stage_and_commit` from the staged bytes.
+        change_key: None,
         proposer,
         schema_version: MOD_SCHEMA_VERSION.to_string(),
         extras: serde_json::Map::new(),
     };
 
-    stage_and_commit(root, &record, &|dest| {
+    stage_and_commit(root, &mut record, &|dest| {
+        let mut digests = Vec::new();
         for a in attachments {
-            use std::io::Write as _;
             // (#2451) Owner-only at creation, same reason as `create`'s
             // copy above — a bare `std::fs::write` landed these bytes at
             // the umask default (typically 0o644, world-readable).
-            let mut out = create_attachment_file(&dest.join(&a.name))?;
-            out.write_all(&a.bytes)
-                .with_context(|| format!("writing attachment {:?}", a.name))?;
+            digests.push((a.name.clone(), stage_attachment(&dest.join(&a.name), &mut a.bytes.as_slice())?));
         }
-        Ok(())
+        Ok(digests)
     })?;
     Ok(record)
 }
@@ -2764,14 +2759,17 @@ mod tests {
     }
     // ── (#2265, 5.0) change_key / proposer / site ────────────────────────
 
+    /// Diff-shaped, so the derived kind in the pinned vectors is `unified-diff`.
+    const PINNED_KIT: &str = "--- a/f\n+++ b/f\n@@ -1,1 +1,1 @@\n-a\n+b\n";
+
     fn keys(ks: &[&str]) -> Vec<String> {
         ks.iter().map(|k| k.to_string()).collect()
     }
 
     #[test]
     fn change_key_is_chg_plus_64_hex_and_deterministic() {
-        let a = change_key(&keys(&["s/1"]), Some("unified-diff"), Some("k"), &[("a.txt", b"x")]);
-        let b = change_key(&keys(&["s/1"]), Some("unified-diff"), Some("k"), &[("a.txt", b"x")]);
+        let a = change_key(&keys(&["s/1"]), Some("k"), &[("a.txt", b"x")]);
+        let b = change_key(&keys(&["s/1"]), Some("k"), &[("a.txt", b"x")]);
         assert_eq!(a, b, "same inputs, same key");
         let hex = a.strip_prefix("chg-").expect("chg- prefix");
         assert_eq!(hex.len(), 64);
@@ -2783,8 +2781,8 @@ mod tests {
     /// change, not a refactor.
     #[test]
     fn change_key_encoding_is_pinned_by_a_golden_vector() {
-        let k = change_key(&keys(&["s/2", "s/1"]), Some("unified-diff"), Some("kit"), &[("b", b"2"), ("a", b"1")]);
-        assert_eq!(k, "chg-96417409b3bd8d61dd5cf58a3835a9109d935658bf92d7c553524ae065152082");
+        let k = change_key(&keys(&["s/2", "s/1"]), Some(PINNED_KIT), &[("b", b"2"), ("a", b"1")]);
+        assert_eq!(k, "chg-0c169355a344d119e44afd8efa7dc81ce5d6603506d6c3ab144113be679769df");
     }
 
     /// The doc comment's byte layout, built by hand and hashed in one shot:
@@ -2802,45 +2800,45 @@ mod tests {
         f(&mut buf, b"s/2");
         f(&mut buf, b"unified-diff");
         buf.push(1);
-        f(&mut buf, b"kit");
+        f(&mut buf, PINNED_KIT.as_bytes());
         buf.extend_from_slice(&2u64.to_le_bytes());
         f(&mut buf, b"a");
         buf.extend_from_slice(blake3::hash(b"1").as_bytes());
         f(&mut buf, b"b");
         buf.extend_from_slice(blake3::hash(b"2").as_bytes());
         let expect = format!("chg-{}", blake3::hash(&buf).to_hex());
-        let got = change_key(&keys(&["s/2", "s/1", "s/1"]), Some("unified-diff"), Some("kit"), &[("b", b"2"), ("a", b"1")]);
+        let got = change_key(&keys(&["s/2", "s/1", "s/1"]), Some(PINNED_KIT), &[("b", b"2"), ("a", b"1")]);
         assert_eq!(got, expect);
     }
 
     #[test]
     fn change_key_ignores_for_order_and_duplicates() {
-        let a = change_key(&keys(&["s/1", "s/2"]), None, Some("k"), &[]);
-        let b = change_key(&keys(&["s/2", "s/1", "s/2"]), None, Some("k"), &[]);
+        let a = change_key(&keys(&["s/1", "s/2"]), Some("k"), &[]);
+        let b = change_key(&keys(&["s/2", "s/1", "s/2"]), Some("k"), &[]);
         assert_eq!(a, b);
-        let c = change_key(&keys(&["s/1"]), None, Some("k"), &[]);
+        let c = change_key(&keys(&["s/1"]), Some("k"), &[]);
         assert_ne!(a, c, "a different `for` set is a different change");
     }
 
     #[test]
     fn change_key_ignores_attachment_order_but_not_names_or_bytes() {
-        let base = change_key(&[], None, None, &[("a", b"1"), ("b", b"2")]);
-        assert_eq!(base, change_key(&[], None, None, &[("b", b"2"), ("a", b"1")]));
-        assert_ne!(base, change_key(&[], None, None, &[("a", b"1"), ("c", b"2")]), "name");
-        assert_ne!(base, change_key(&[], None, None, &[("a", b"1"), ("b", b"3")]), "bytes");
+        let base = change_key(&[], None, &[("a", b"1"), ("b", b"2")]);
+        assert_eq!(base, change_key(&[], None, &[("b", b"2"), ("a", b"1")]));
+        assert_ne!(base, change_key(&[], None, &[("a", b"1"), ("c", b"2")]), "name");
+        assert_ne!(base, change_key(&[], None, &[("a", b"1"), ("b", b"3")]), "bytes");
     }
 
     #[test]
-    fn a_different_kit_or_kit_kind_is_a_different_change() {
-        let base = change_key(&keys(&["s/1"]), Some("unified-diff"), Some("one"), &[]);
-        assert_ne!(base, change_key(&keys(&["s/1"]), Some("unified-diff"), Some("two"), &[]));
-        assert_ne!(base, change_key(&keys(&["s/1"]), None, Some("one"), &[]));
+    fn a_different_kit_is_a_different_change() {
+        let base = change_key(&keys(&["s/1"]), Some("one"), &[]);
+        assert_ne!(base, change_key(&keys(&["s/1"]), Some("two"), &[]));
+        assert_ne!(base, change_key(&keys(&["s/1"]), None, &[]));
     }
 
     #[test]
     fn no_kit_and_an_empty_kit_are_different_changes() {
-        let none = change_key(&[], None, None, &[("a", b"1")]);
-        let empty = change_key(&[], None, Some(""), &[("a", b"1")]);
+        let none = change_key(&[], None, &[("a", b"1")]);
+        let empty = change_key(&[], Some(""), &[("a", b"1")]);
         assert_ne!(none, empty);
     }
 
@@ -2848,32 +2846,27 @@ mod tests {
     /// same bytes must still hash apart.
     #[test]
     fn concatenation_cannot_collide_two_different_changes() {
-        // kit_kind / kit boundary.
-        assert_ne!(
-            change_key(&[], Some("ab"), Some("c"), &[]),
-            change_key(&[], Some("a"), Some("bc"), &[])
-        );
         // kit / attachment-name boundary.
         assert_ne!(
-            change_key(&[], None, Some("x"), &[("y", b"")]),
-            change_key(&[], None, Some("xy"), &[("", b"")])
+            change_key(&[], Some("x"), &[("y", b"")]),
+            change_key(&[], Some("xy"), &[("", b"")])
         );
         // `for` keys: one key versus two that concatenate to it.
-        assert_ne!(change_key(&keys(&["s/12"]), None, Some("k"), &[]), change_key(&keys(&["s/1", "2"]), None, Some("k"), &[]));
+        assert_ne!(change_key(&keys(&["s/12"]), Some("k"), &[]), change_key(&keys(&["s/1", "2"]), Some("k"), &[]));
         // attachment name / bytes boundary.
         assert_ne!(
-            change_key(&[], None, None, &[("ab", b"c")]),
-            change_key(&[], None, None, &[("a", b"bc")])
+            change_key(&[], None, &[("ab", b"c")]),
+            change_key(&[], None, &[("a", b"bc")])
         );
         // `for` keys that concatenate to the same bytes (same count).
         assert_ne!(
-            change_key(&keys(&["ab", "c"]), None, Some("k"), &[]),
-            change_key(&keys(&["a", "bc"]), None, Some("k"), &[])
+            change_key(&keys(&["ab", "c"]), Some("k"), &[]),
+            change_key(&keys(&["a", "bc"]), Some("k"), &[])
         );
         // a `for` key that looks like the next field.
         assert_ne!(
-            change_key(&keys(&["s/1"]), None, Some("k"), &[]),
-            change_key(&[], Some("s/1"), Some("k"), &[])
+            change_key(&keys(&["s/1"]), Some("k"), &[]),
+            change_key(&[], Some("s/1"), &[])
         );
     }
 
@@ -2889,7 +2882,7 @@ mod tests {
         let att = tmp.path().join("note.txt");
         std::fs::write(&att, b"hello").unwrap();
 
-        let cli = create(&mods, &finds, "kain", &["sess-a/1".into()], Some(kit), &[att], Some("unified-diff"), false).unwrap();
+        let cli = create(&mods, &finds, "kain", &["sess-a/1".into()], Some(kit), &[att], None, false).unwrap();
         let rt = create_from_emission(
             &mods,
             &finds,
@@ -2909,6 +2902,56 @@ mod tests {
         assert_eq!(cli.schema_version, "2.1");
         let stored = load_at(&mods, &rt.key).unwrap().unwrap();
         assert_eq!(stored.change_key, rt.change_key, "persisted, not only returned");
+    }
+
+    /// The caller's `--kit-kind` is a hint on the record, never part of the
+    /// hash: the runtime derives its kind from the kit, so a CLI proposal of
+    /// the same bytes must converge with it whatever label was (or was not)
+    /// given.
+    #[test]
+    fn the_cli_kit_kind_label_never_changes_the_change_key() {
+        let tmp = TempDir::new().unwrap();
+        let mods = tmp.path().join("mods");
+        let finds = tmp.path().join("findings");
+        store_finding(&finds, "sess-a", 1, None);
+        let diff = "--- a/f\n+++ b/f\n@@ -1,1 +1,1 @@\n-a\n+b\n";
+        let rt = create_from_emission(
+            &mods, &finds, "coder (m)", &["sess-a/1".to_string()], diff, &[],
+            findings::Scope::default(), None, None, Vec::new(),
+        )
+        .unwrap();
+        for label in [None, Some("unified-diff"), Some("diff"), Some("whatever")] {
+            let cli = create(&mods, &finds, "kain", &["sess-a/1".into()], Some(diff), &[], label, false).unwrap();
+            assert_eq!(cli.change_key, rt.change_key, "label {label:?}");
+            assert_eq!(cli.kit_kind.as_deref(), label, "the label is still recorded as given");
+        }
+        // And a prose kit labeled as a diff is still just prose to the hash.
+        let prose_rt = create_from_emission(
+            &mods, &finds, "coder (m)", &["sess-a/1".to_string()], "just words", &[],
+            findings::Scope::default(), None, None, Vec::new(),
+        )
+        .unwrap();
+        let prose_cli = create(&mods, &finds, "kain", &["sess-a/1".into()], Some("just words"), &[], Some("unified-diff"), false).unwrap();
+        assert_eq!(prose_cli.change_key, prose_rt.change_key);
+    }
+
+    /// The key is computed from the bytes that were STAGED, in the same pass
+    /// that writes them, so it cannot disagree with what the store holds.
+    #[test]
+    fn the_change_key_matches_the_stored_attachment_bytes() {
+        let tmp = TempDir::new().unwrap();
+        let mods = tmp.path().join("mods");
+        let finds = tmp.path().join("findings");
+        store_finding(&finds, "sess-a", 1, None);
+        let src = tmp.path().join("big.bin");
+        let bytes: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&src, &bytes).unwrap();
+        let rec = create(&mods, &finds, "kain", &["sess-a/1".into()], Some("k"), &[src], None, false).unwrap();
+        let stored = std::fs::read(attachments_dir_at(&mods, &rec.key).join("big.bin")).unwrap();
+        assert_eq!(stored, bytes);
+        assert_eq!(rec.change_key, Some(change_key(&rec.r#for, Some("k"), &[("big.bin", stored.as_slice())])));
+        let on_disk = load_at(&mods, &rec.key).unwrap().unwrap();
+        assert_eq!(on_disk.change_key, rec.change_key, "the written record carries the staged key");
     }
 
     #[test]
@@ -2966,10 +3009,7 @@ mod tests {
     fn site_ctx() -> serde_json::Value {
         serde_json::json!({
             "source": "app", "sha": "abc123", "unit": "u-0001",
-            "sites": [
-                {"file": "src/a.ts", "start": 1, "end": 20},
-                {"file": "src/b.ts", "start": 30, "end": 60}
-            ]
+            "site": {"file": "src/b.ts", "start": 30, "end": 60}
         })
     }
 
@@ -3014,26 +3054,18 @@ mod tests {
     fn a_cli_mod_for_a_planned_finding_fills_site_too() {
         let tmp = TempDir::new().unwrap();
         let finds = tmp.path().join("findings");
-        store_finding_at(&finds, "sess-s", site_ctx(), serde_json::json!({"file": "src/a.ts", "line": 3}));
+        store_finding_at(&finds, "sess-s", site_ctx(), serde_json::json!({"file": "src/b.ts", "line": 31}));
         let rec = create(&tmp.path().join("mods"), &finds, "sonnet", &["sess-s/1".into()], Some("k"), &[], None, false).unwrap();
-        assert_eq!(rec.site.as_ref().map(|s| (s.file.as_str(), s.start_line, s.end_line)), Some(("src/a.ts", 1, 20)));
+        assert_eq!(rec.site.as_ref().map(|s| (s.file.as_str(), s.start_line, s.end_line)), Some(("src/b.ts", 30, 60)));
         assert_eq!(rec.proposer, None);
     }
 
     #[test]
     fn site_stays_absent_when_nothing_planned_it() {
-        // No sites in the context at all.
+        // A finding whose context carries no stamped site.
         let tmp = TempDir::new().unwrap();
         let rec = mod_for(&tmp, serde_json::json!({"file": "src/b.ts", "line": 42}), serde_json::json!({"source": "app", "sha": "x"}));
         assert_eq!(rec.site, None);
-        // Sites present, but the finding's line is outside every one.
-        let tmp = TempDir::new().unwrap();
-        let rec = mod_for(&tmp, serde_json::json!({"file": "src/b.ts", "line": 99}), site_ctx());
-        assert_eq!(rec.site, None, "a site the finding is not inside is not its site");
-        // Right line, wrong file: another file's span is not this finding's site.
-        let tmp = TempDir::new().unwrap();
-        let rec = mod_for(&tmp, serde_json::json!({"file": "src/c.ts", "line": 42}), site_ctx());
-        assert_eq!(rec.site, None, "the file has to match, not only the line");
         // The CLI path with a context-less finding.
         let tmp = TempDir::new().unwrap();
         let finds = tmp.path().join("findings");

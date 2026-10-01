@@ -40,6 +40,7 @@ use std::time::Duration;
 /// duplicated here rather than widened for one caller.
 fn opts_for(role_id: &str) -> DispatchOpts {
     DispatchOpts {
+        finding_sites: None,
         // (#2914) Work never runs on the utility model.
         allow_utility_model: false,
         remote_origin: None,

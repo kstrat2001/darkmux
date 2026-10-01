@@ -1140,6 +1140,7 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
     let message = resolve_dispatch_message(&role, message, message_from_file, resume_from.is_some())?;
     let brief_refs = checked_brief_refs(&finding, &mod_key, machine.as_deref())?;
     let opts = crew::dispatch::DispatchOpts {
+        finding_sites: None,
         // (#2914) Work never runs on the utility model.
         allow_utility_model: false,
         remote_origin: None,
