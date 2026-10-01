@@ -40,6 +40,7 @@ empty, so a wholesale deletion cannot ship silently — but it cannot detect a
 | `LICENSE-react-dom` | react-dom | 18.3.1 |
 | `LICENSE-tanstack-react-query` | @tanstack/react-query | 5.101.4 |
 | `LICENSE-reactflow` | reactflow | 11.11.4 |
+| `LICENSE-lucide` | lucide (ISC; not a dependency: the `bot` icon's SVG paths are inlined in `ui/src/components/UtilityGlyph.tsx`) | `icons/bot.svg` and `LICENSE` from lucide-icons/lucide `main`, 2026-10-01 |
 
 The React 18 pin is deliberate — it matches the version the (pre-#1868)
 standalone mission-graph page's own separate vendored bundle used, the same

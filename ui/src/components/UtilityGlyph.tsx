@@ -11,15 +11,19 @@ import type { UtilityStrip } from "../lib/utilityJobs";
  * the tooltip and the accessible name, and the page's text (the parity
  * goldens) is unchanged.
  *
- * - quiet: a small dot in the identity gray, filled when the utility model is
- *   resident, hollow when it is not loaded, dashed when the viewer cannot
+ * It is drawn as a robot (Lucide's `bot` icon, ISC, notice in
+ * ui/vendor-licenses), because a bare dot was not readable as "the utility
+ * model" (operator, 2026-10-01). Everything happens inside the robot, so
+ * nothing spills into the name row:
+ * - quiet: the robot in the identity gray, solid when the utility model is
+ *   resident, faded when it is not loaded, dashed when the viewer cannot
  *   tell (a fleet peer) or no utility model is known;
- * - radio routing: the dot radiates arcs (a radio signal);
- * - compacting: two chevrons squeeze toward the dot;
- * - any job this build has no visual for: the generic indicator, a ring
- *   pulsing out of the dot, so a new job is never silent;
- * - stalled (a start with no end past its own bound): the job's glyph, still,
- *   in the STALL lamp's color.
+ * - radio routing: its antenna blinks (a radio signal);
+ * - compacting: its body squeezes;
+ * - any job this build has no visual for: its eyes pulse, so a new job is
+ *   never silent;
+ * - stalled (a start with no end past its own bound): the job's motion
+ *   stopped, in the STALL lamp's color.
  *
  * Fast transitions are shown as they happen: the glyph is a function of the
  * reading at this instant, with no hold or smoothing.
@@ -46,7 +50,8 @@ export function UtilityGlyph({
           ? "not loaded"
           : "residency unknown";
   const doing = job ? (job.stalled ? `${job.word}, stalled` : job.word) : noSignal ? "no signal" : "idle";
-  const label = strip.model != null ? `utility model ${strip.model} · ${residency} · ${doing}` : `${residency} · ${doing}`;
+  const label =
+    strip.model != null ? `Utility model: ${strip.model}\n${residency} · ${doing}` : `Utility model: unknown\n${doing}`;
   const dot = strip.resident === true ? "filled" : strip.resident === false ? "hollow" : "unknown";
   return (
     <span
@@ -60,21 +65,15 @@ export function UtilityGlyph({
       aria-label={label}
       title={label}
     >
-      <svg viewBox="0 0 18 16" aria-hidden="true">
-        <circle className="mach-util__dot" cx="9" cy="8" r="2.2" />
-        {visual === "radio" && (
-          <g className="mach-util__radio">
-            <path className="mach-util__arc mach-util__arc--1" d="M6.2 5.2 A4 4 0 0 0 6.2 10.8 M11.8 5.2 A4 4 0 0 1 11.8 10.8" />
-            <path className="mach-util__arc mach-util__arc--2" d="M3.6 2.8 A7.4 7.4 0 0 0 3.6 13.2 M14.4 2.8 A7.4 7.4 0 0 1 14.4 13.2" />
-          </g>
-        )}
-        {visual === "compacting" && (
-          <g className="mach-util__squeeze">
-            <path className="mach-util__chev mach-util__chev--l" d="M1.5 4.5 L5 8 L1.5 11.5" />
-            <path className="mach-util__chev mach-util__chev--r" d="M16.5 4.5 L13 8 L16.5 11.5" />
-          </g>
-        )}
-        {visual === "generic" && <circle className="mach-util__ping" cx="9" cy="8" r="6" />}
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <g className="mach-util__bot">
+          <path className="mach-util__antenna" d="M12 8V4H8" />
+          <rect className="mach-util__body" width="16" height="12" x="4" y="8" rx="2" />
+          <path d="M2 14h2" />
+          <path d="M20 14h2" />
+          <path className="mach-util__eye" d="M15 13v2" />
+          <path className="mach-util__eye" d="M9 13v2" />
+        </g>
       </svg>
     </span>
   );
