@@ -111,6 +111,10 @@ export interface LastKnownSample {
 }
 
 export interface DrawerScope {
+  /** (5.0 R2) The ONE machine this scope's readings belong to: the machine
+   *  that ran a dispatch (a relayed run ran elsewhere), else this machine.
+   *  `null` when nothing names it. */
+  machineUid: string | null;
   scopeLabel: string;
   samples: ProcSamplePoint[];
   /** (#2107 phone feedback) Set only when `samples` is empty on the
@@ -132,9 +136,12 @@ export interface DrawerScope {
  * always wants "this machine, last 10 min" regardless of which app route
  * is current, since IT is what the route names. */
 export function rollingWindowSamples(records: NormRecord[], uid: string | null, nowMs: number): ProcSamplePoint[] {
+  // (5.0 R2) An unresolved machine has no samples: "unfiltered" averaged
+  // every machine's load into a gauge labeled as one.
+  if (uid == null) return [];
   const cutoff = nowMs - DRAWER_ROLLING_WINDOW_MS;
   return recordsSince(recordsAsOf(records, nowMs), cutoff)
-    .filter((r) => isHostSampleRecord(r) && (uid == null || sameUid(uidOf(r), uid)))
+    .filter((r) => isHostSampleRecord(r) && sameUid(uidOf(r), uid))
     .sort(byTime)
     .map(toPoint);
 }
@@ -147,10 +154,11 @@ export function rollingWindowSamples(records: NormRecord[], uid: string | null, 
  * measured at all". Bounded by `LAST_KNOWN_LOOKBACK_MS` so a genuinely
  * stale record doesn't get reported as if it just happened. */
 export function findLastKnownSample(records: NormRecord[], uid: string | null, nowMs: number): LastKnownSample | null {
+  if (uid == null) return null;
   let best: { r: NormRecord; ts: number } | null = null;
   for (const r of records) {
     if (!isHostSampleRecord(r)) continue;
-    if (uid != null && !sameUid(uidOf(r), uid)) continue;
+    if (!sameUid(uidOf(r), uid)) continue;
     const ts = r.tMs;
     // The result states when it was measured, so an untimed sample cannot be it.
     if (ts === null || ts > nowMs) continue;
@@ -176,8 +184,14 @@ export function resolveDrawerScope(
   // with no id/time/machine bound would just be the same unscoped window
   // wearing a "this mission" label.
   if (route.kind === "dispatch") {
-    const scoped = routeRecords.filter(isHostSampleRecord).sort(byTime);
+    // (5.0 R2) The machine that ran the dispatch, from its own start record
+    // (else its first record naming one). Its samples only: another machine's
+    // never join, whatever the route's records hold.
+    const ran = routeRecords.find((r) => r.action === ACTION.DispatchStart && r.machine_uid) ?? routeRecords.find((r) => !isHostSampleRecord(r) && r.machine_uid);
+    const machineUid = ran?.machine_uid ?? localUid;
+    const scoped = routeRecords.filter((r) => isHostSampleRecord(r) && (ran == null || sameUid(r.machine_uid, ran.machine_uid))).sort(byTime);
     return {
+      machineUid,
       scopeLabel: "this dispatch",
       samples: scoped.map(toPoint),
       lastKnown: null,
@@ -185,6 +199,7 @@ export function resolveDrawerScope(
   }
   const samples = rollingWindowSamples(rollingWindow, localUid, nowMs);
   return {
+    machineUid: localUid,
     scopeLabel: DRAWER_ROLLING_SCOPE_LABEL,
     samples,
     lastKnown: samples.length === 0 ? findLastKnownSample(rollingWindow, localUid, nowMs) : null,
