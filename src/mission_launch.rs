@@ -1075,12 +1075,13 @@ pub fn launch(
     // (#2678) This writer always builds an `Error`-status/generic-"aborted"
     // record — the SAME verdict every earlier revision reported for a
     // Drop-path exit. `reconcile_and_finalize_on_abort` -> `finalize_
-    // reconciled_mission` applies the ONE wall-clock override
-    // (`apply_wall_clock_bound_outcome`, shared with the happy path below)
-    // uniformly, so this closure does not need its own branch on
-    // `wall_clock_exceeded()` — a real signal/panic/unexpected-early-return
-    // keeps this `Error` status unchanged; only a bound that actually fired
-    // upgrades it to `Degraded` with an honest reason naming the bound.
+    // reconciled_mission` re-decides the status through
+    // `MissionOutcomeStatus::decide` when the wall-clock bound fired (the
+    // same input the happy path's `build_envelope` feeds it), so this closure
+    // does not need its own branch on `wall_clock_exceeded()` — a real
+    // signal/panic/unexpected-early-return keeps this `Error` status
+    // unchanged; a bound that actually fired reads `Degraded` with a reason
+    // naming it, unless the steps' own tally says `Error`.
     let abort_mission_id = mission_id.clone();
     let abort_config = config_owned.clone();
     let abort_phase_ids = real_phase_ids.clone();
@@ -4344,10 +4345,10 @@ fn reconcile_and_finalize_on_error(
 /// writer always passes `Error` with a generic "aborted" reason — the SAME
 /// verdict every earlier revision of this guard reported (unchanged by
 /// this fix; only the DATA changed, not the verdict) — and relies on
-/// [`finalize_reconciled_mission`]'s call to `apply_wall_clock_bound_
-/// outcome` to upgrade that to `Degraded` with an honest bound-naming
-/// reason when the run's own wall-clock bound is what actually caused the
-/// interruption. A future caller with its own known reason may still pass
+/// [`finalize_reconciled_mission`] to re-decide it through
+/// `MissionOutcomeStatus::decide` (`Degraded` with an honest bound-naming
+/// reason, unless the steps' own tally says `Error`) when the run's own
+/// wall-clock bound is what actually caused the interruption. A future caller with its own known reason may still pass
 /// something else here directly.
 ///
 /// A load failure for one phase is best-effort and non-fatal, matching
