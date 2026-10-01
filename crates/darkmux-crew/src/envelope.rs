@@ -286,11 +286,15 @@ impl MissionOutcomeStatus {
     /// read it.
     ///
     /// Scope, stated exactly: this owns the status of a gate-less generic
-    /// graph launched by `mission launch` (`build_envelope`) and of its
-    /// error-path reconcile when the wall-clock bound fired. The coder-phase
-    /// pipeline (`coder_phase.rs`) and the crew-of-one dispatch envelope
-    /// (`dispatch_as_crew_of_one.rs`) decide from a QA gate verdict and a
-    /// single role execution's `RunOutcome`, neither of which is a step tally.
+    /// graph launched by `mission launch` (`build_envelope`), of its
+    /// error-path reconcile when the wall-clock bound fired, and of a
+    /// crew-of-one dispatch whose step completed (`dispatch_as_crew_of_one.rs`).
+    /// It does NOT own `coder_phase.rs`'s `finalize_mission_if_complete`: that
+    /// decides from PHASE outcomes, and reads an all-abandoned mission as
+    /// `Degraded` where `decide` over the same counts would say `Error`, so
+    /// routing it here would change that surface's verdict (a behavior change,
+    /// not a refactor). The error arms of the crew-of-one dispatch and the
+    /// explicit-`Error` reconcile on a mission-level `Err` have no step tally.
     ///
     /// - nothing errored, never ran or degraded, no bound fired -> `Clean`.
     /// - the delivering task failed, nothing completed (unless the wall-clock

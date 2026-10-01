@@ -1255,7 +1255,9 @@ fn finalize_mission_if_complete(mission_id: &str) {
         MissionOutcomeStatus::Clean
     } else {
         // A mix (or all abandoned) — real work happened but not every phase
-        // completed cleanly; Degraded reads honestly on the board.
+        // completed cleanly; Degraded reads honestly on the board. Not routed
+        // through `MissionOutcomeStatus::decide`: over phase counts it would
+        // read an all-abandoned mission as `Error`, a verdict change here.
         MissionOutcomeStatus::Degraded
     };
     let mut envelope = MissionEnvelope::new(mission_id, status, &[]);
