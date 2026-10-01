@@ -20,7 +20,7 @@ import { utilityJobWord, utilityStrip, utilityUsageByJob, type UtilityStrip } fr
 import type { ModelRow } from "../../types/generated/ModelRow";
 import type { MachineSpecsResponse } from "../../types/generated/MachineSpecsResponse";
 import { recordsAsOf, type NormRecord } from "../../lib/ingest";
-import { NOT_REPORTED, type MachineAvailability } from "../../lib/machineAvailability";
+import { NOT_REPORTED, isUnseen, type MachineAvailability } from "../../lib/machineAvailability";
 
 export interface UtilitySectionView {
   strip: UtilityStrip;
@@ -60,7 +60,8 @@ export function utilitySectionView(args: {
   availability?: MachineAvailability;
 }): UtilitySectionView {
   const noSignal = args.settled === false;
-  const unseen = (args.availability ?? "known") !== "known";
+  const unseen = isUnseen(args.availability);
+  const held = noSignal || unseen;
   const identityKnown = args.identityKnown !== false;
   const binding = args.isLocal ? (args.specs?.utility_model ?? null) : null;
   const strip = utilityStrip(args.data, args.uid, args.nowMs, binding);
@@ -74,8 +75,7 @@ export function utilitySectionView(args: {
         : strip.resident === false
           ? "not loaded"
           : "no utility model registered";
-  const job = strip.job;
-  const liveLine = noSignal ? "no signal" : unseen ? NOT_REPORTED : job ? (job.stalled ? `${job.word} · stalled` : `${job.word} · ${Math.max(0, Math.floor((args.nowMs - job.sinceMs) / 1000))}s`) : "idle";
+  const liveLine = liveLineOf(strip.job, noSignal ? "no signal" : unseen ? NOT_REPORTED : null, args.nowMs);
   const mine = recordsAsOf(args.data, args.nowMs).filter((r) => sameUid(uidOf(r), args.uid));
   // (#2915 review, C7) A FIXED set of rows, so the section is one size
   // whatever ran: one per known job, then ONE "other" row folding every job
@@ -87,8 +87,8 @@ export function utilitySectionView(args: {
   // "—" holds the cell until then.
   const row = (word: string, calls: number, tokens: number, known: boolean) => ({
     word,
-    calls: noSignal || unseen ? "—" : `${calls.toLocaleString("en-US")} ${calls === 1 ? "call" : "calls"}`,
-    tokens: noSignal || unseen ? "—" : `${fmtC(tokens)} tokens`,
+    calls: held ? "—" : `${calls.toLocaleString("en-US")} ${calls === 1 ? "call" : "calls"}`,
+    tokens: held ? "—" : `${fmtC(tokens)} tokens`,
     known,
   });
   const jobs = [...usage.filter((u) => u.known).map((u) => row(utilityJobWord(u.job), u.calls, u.tokens, true)), row("other", other.calls, other.tokens, false)];
@@ -96,10 +96,25 @@ export function utilitySectionView(args: {
     strip,
     // (#2958) "no utility model seen" is a claim about the records; a model
     // named by `/machine/specs` is a reading and shows at once.
-    modelLine: strip.model ?? (noSignal || !identityKnown ? "—" : unseen ? NOT_REPORTED : "no utility model seen"),
+    modelLine: strip.model ?? absentModelLine(noSignal || !identityKnown, unseen),
     factsLine: `${win} · ${residency}`,
     liveLine,
-    noSignal: noSignal || unseen,
+    noSignal: held,
     jobs,
   };
+}
+
+/** The live line: the held word when the page cannot say (no signal, not
+ *  reported), else the open job and its age, else idle. */
+function liveLineOf(job: UtilityStrip["job"], held: string | null, nowMs: number): string {
+  if (held !== null) return held;
+  if (!job) return "idle";
+  return job.stalled ? `${job.word} · stalled` : `${job.word} · ${Math.max(0, Math.floor((nowMs - job.sinceMs) / 1000))}s`;
+}
+
+/** The model line when no model is named: "—" while the page cannot say yet,
+ *  "not reported" for a machine it cannot see, else the claim about records. */
+function absentModelLine(pending: boolean, unseen: boolean): string {
+  if (pending) return "—";
+  return unseen ? NOT_REPORTED : "no utility model seen";
 }

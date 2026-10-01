@@ -8,7 +8,7 @@ import { SeekSignalContext } from "./lib/seekSignal";
 import { PlaybackClockContext, playbackClockOf } from "./lib/pageClockRate";
 import { Scrubber } from "./lenses/catalog/Scrubber";
 import { useSyncHash, writeHash, canonicalHash } from "./lib/hashSync";
-import { MACHINE_NOT_FOUND_LABEL, decodeMachineKey, machineLabel } from "./lib/machineKey";
+import { MACHINE_NOT_FOUND_LABEL, drilledUidOf, machineLabel } from "./lib/machineKey";
 import { FleetLens } from "./lenses/fleet/FleetLens";
 import { LensPlaceholder } from "./components/LensPlaceholder";
 import { NavChrome } from "./components/NavChrome";
@@ -36,7 +36,7 @@ import { ReadyHeadline } from "./components/ReadyHeadline";
 import { FleetCoverageNotice, useDegradedFleetSource } from "./components/FleetCoverageNotice";
 import { FlowReadNotice } from "./components/FlowReadNotice";
 import { earliestRecordDate, firstRecordDate, missionReplayDate, todayUTC } from "./lib/flow";
-import { displayNameOf, localMachineUid, recordsOfMachine } from "./lib/machineIdentity";
+import { displayNameOf, localMachineUid, machinePageRecords, selfUidOf } from "./lib/machineIdentity";
 import { dispatchHash, isLiveRoute, showsEventLog, tokRateConnectionEvidence } from "./lib/route";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "./lib/fetcher";
@@ -487,7 +487,7 @@ export function App() {
   // one nothing knows — the same not-found title an unknown uid got).
   // The drilled key's machine, resolved once for the label and the event log.
   const drilledUid = useMemo(
-    () => (drilledKey == null ? null : decodeMachineKey({ data: flowWindow.data, liveMachines, specs, roster }, drilledKey).uid),
+    () => drilledUidOf({ data: flowWindow.data, liveMachines, specs, roster }, drilledKey),
     [drilledKey, flowWindow.data, liveMachines, specs, roster],
   );
   const drilledName = useMemo(() => {
@@ -515,7 +515,7 @@ export function App() {
     }
     // (5.0 R2) A machine page lists that machine's records, not the fleet's.
     // An unresolved machine has none to list.
-    if (route.kind === "machine") return recordsOfMachine(routeRecords.records, drilledKey != null ? drilledUid : localUid);
+    if (route.kind === "machine") return machinePageRecords(routeRecords.records, drilledKey, drilledUid, localUid);
     if (playhead === null) return routeRecords.records;
     // A static build's runs/machine/console routes have no slice of their
     // own (the live window is empty there); the day's log, scoped to the
@@ -537,7 +537,7 @@ export function App() {
   // having — a second fetch could drift; one source cannot.
   const replayMeta = route.kind === "playback" ? routeRecords.records : null;
   // (5.0 R3) This machine counts itself once the daemon has named itself.
-  const selfUid = specs?.machine_uid ?? null;
+  const selfUid = selfUidOf(specs);
   const ready = useMemo(
     () => (replayMeta ? null : readyParts(flowWindow.data, liveMachines, nowMs, selfUid)),
     [replayMeta, flowWindow.data, liveMachines, nowMs, selfUid],

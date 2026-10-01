@@ -155,7 +155,7 @@
   "ui/src/lenses/machine/MachineHealthRegion.tsx::MachineHealthRegion": 19,
   "ui/src/lenses/machine/MachineHealthRegion.tsx::ModelRow": 39,
   "ui/src/lenses/machine/MachineLens.tsx::MachineLens": 52,
-  "ui/src/lenses/machine/utilitySectionView.ts::utilitySectionView": 18,
+  "ui/src/lenses/machine/utilitySectionView.ts::utilitySectionView": 17,
   "ui/src/lenses/mission/MissionGraphLens.tsx::MissionGraphLens": 43,
   "ui/src/lenses/mission/graph.ts::applyRecordToMetrics": 29,
   "ui/src/lenses/mission/graph.ts::buildStepHeaderFields": 26,

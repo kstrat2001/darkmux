@@ -51,10 +51,10 @@ import {
 } from "./Meter";
 import { COMPACT_METER_WIDTH, COMPACT_METER_HEIGHT } from "./Meter";
 import { aggregateHostSamples, type HostAggregate } from "../lib/hostStats";
-import { resolveDrawerScope } from "../lib/machineDrawerScope";
+import { resolveDrawerScope, scopeIsPeer, specsForScope, wantsDaemonLoad } from "../lib/machineDrawerScope";
 import { injectedMeta } from "../lib/injectedMeta";
 import { firstRecordDate, todayUTC } from "../lib/flow";
-import { displayNameOf, sameUid } from "../lib/machineIdentity";
+import { displayNameOf } from "../lib/machineIdentity";
 import { relAgoFrom } from "../lib/format";
 import { replayPlaybackKvValue } from "../lib/replayMeta";
 import { isLiveRoute, type Route } from "../lib/route";
@@ -833,8 +833,8 @@ export function useMachineStatsContent({
   // (5.0 R2) This panel describes `scope.machineUid`. When that is another
   // machine (a relayed dispatch), this daemon's own load, hardware and
   // specs are not its readings: they are neither polled nor shown.
-  const isPeer = scope.machineUid != null && localUid != null && !sameUid(scope.machineUid, localUid);
-  const daemonLoad = useDaemonLoad(isOpen && !isPeer && route.kind !== "playback");
+  const isPeer = scopeIsPeer(scope, localUid);
+  const daemonLoad = useDaemonLoad(wantsDaemonLoad(isOpen, isPeer, route));
   const agg = useMemo(
     () => effectiveHostAggregate(isDispatch, dispatchAgg, daemonLoad),
     [isDispatch, dispatchAgg, daemonLoad],
@@ -848,9 +848,9 @@ export function useMachineStatsContent({
     ? scope.samples.length === 0
     : scope.samples.length === 0 && daemonLoad == null;
 
+  const hostSpecs = specsForScope(isPeer, specs);
   const machineName =
-    scope.machineUid != null ? displayNameOf(flowWindow, liveMachines, isPeer ? null : specs, scope.machineUid) : null;
-  const hostSpecs = isPeer ? null : specs;
+    scope.machineUid != null ? displayNameOf(flowWindow, liveMachines, hostSpecs, scope.machineUid) : null;
   const verMeta = injectedMeta("darkmux-version");
   const schemaMeta = injectedMeta("darkmux-flow-schema");
 

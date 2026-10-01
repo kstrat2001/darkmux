@@ -205,3 +205,21 @@ export function resolveDrawerScope(
     lastKnown: samples.length === 0 ? findLastKnownSample(rollingWindow, localUid, nowMs) : null,
   };
 }
+
+/** (5.0 R2) Whether the scope's readings belong to a machine other than the
+ *  one this daemon runs on (a relayed dispatch ran elsewhere). Its specs and
+ *  this daemon's own load are then not that machine's. */
+export function scopeIsPeer(scope: DrawerScope, localUid: string | null): boolean {
+  return scope.machineUid != null && localUid != null && !sameUid(scope.machineUid, localUid);
+}
+
+/** Whether to poll this daemon's live load: while the surface is open, for
+ *  this machine, and not on a replay (a recorded day is not NOW). */
+export function wantsDaemonLoad(isOpen: boolean, isPeer: boolean, route: Route): boolean {
+  return isOpen && !isPeer && route.kind !== "playback";
+}
+
+/** This daemon's specs, only when the scope describes this machine. */
+export function specsForScope<T>(isPeer: boolean, specs: T | null): T | null {
+  return isPeer ? null : specs;
+}

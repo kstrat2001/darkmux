@@ -84,9 +84,24 @@ export function matchesMachine(ref: MachineRef, machine: MachineMatch): boolean 
 
 /** The records of the machine `uid` names. A machine nothing is known about
  *  (`null`) has none: a per-machine surface shows nothing, never everyone's. */
-export function recordsOfMachine(records: readonly NormRecord[], uid: string | null): NormRecord[] {
+function recordsOfMachine(records: readonly NormRecord[], uid: string | null): NormRecord[] {
   return uid === null ? [] : records.filter((r) => sameUid(r.machine_uid, uid));
 }
+
+/** A machine page's records: the drilled machine's (`drilledKey` names one,
+ *  `drilledUid` is what it resolved to, `null` while unresolved), else this
+ *  machine's. */
+export function machinePageRecords(
+  records: readonly NormRecord[],
+  drilledKey: string | null,
+  drilledUid: string | null,
+  localUid: string | null,
+): NormRecord[] {
+  return recordsOfMachine(records, drilledKey != null ? drilledUid : localUid);
+}
+
+/** The uid this daemon reports for itself, once `/machine/specs` has answered. */
+export const selfUidOf = (specs: SelfIdentity | null): string | null => specs?.machine_uid ?? null;
 
 /** `uidOf()` — viewer.html:1107. */
 export const uidOf = (r: NormRecord): string => r.machine_uid || "unknown";

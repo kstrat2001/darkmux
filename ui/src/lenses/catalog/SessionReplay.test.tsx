@@ -891,9 +891,14 @@ describe("SessionReplay", () => {
   });
 
   it("the route line says this machine when the page's own identity is the run's machine", async () => {
-    const raw: unknown = JSON.parse(readFileSync(path.join(REPO_ROOT, "tests/parity/corpus/flow-dispatch-task-list.json"), "utf8"));
-    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify(raw), { status: 200 }))));
-    renderReplay("task-list", "00000000-0000-4000-8000-ABFCA7779F06");
+    const uid = "00000000-0000-4000-8000-ABFCA7779F06";
+    const own = { machine_uid: uid, machine_id: "MacBook-Pro", session_id: "s-route" };
+    const raw = [
+      { ts: "2026-01-01T00:00:00Z", action: "dispatch.start", handle: "coder", ...own, payload: {} },
+      { ts: "2026-01-01T00:00:05Z", action: "dispatch.complete", ...own, payload: { total_turns: 1, wall_ms: 5000 } },
+    ];
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records: raw, count: raw.length, truncated: false, generated_at_ms: 0 }), { status: 200 }))));
+    renderReplay("s-route", uid);
     await waitFor(() => expect(screen.getByText("LMStudio · local · this machine")).toBeInTheDocument());
   });
 
@@ -908,7 +913,8 @@ describe("SessionReplay", () => {
     await waitFor(() => expect(document.querySelector(".session-run__header .pill")?.textContent?.toLowerCase()).toContain("complete"));
     expect(screen.getByText(/LIST-STEP/)).toBeInTheDocument();
     expect(screen.getByText(/task-list on/)).toBeInTheDocument();
-    expect(screen.getByText("LMStudio · local · MacBook-Pro")).toBeInTheDocument();
+    // (5.0 R3) A step that made no model call asserts no route.
+    expect(screen.queryByText(/LMStudio/)).toBeNull();
     expect(screen.getByText(/^\d\d:28:40 → \d\d:28:42 \(0:02\)$/)).toBeInTheDocument();
     expect(screen.getByText("0:02")).toBeInTheDocument();
     // Same reason as the track below: this corpus did no model work, so the

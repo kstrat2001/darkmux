@@ -36,7 +36,7 @@ import { UtilityGlyph } from "../../components/UtilityGlyph";
 import { scopeStateOf } from "../../lib/scopeMorph";
 import { liveStateLabel, reasonForLine } from "../../lib/tokenRate";
 import { tokensOffMeter } from "./savings";
-import { buildFleetCardBase, withLiveReadings, busiestExecution, isStrictlyBusier, specDimLabel, specLine, cardFace, NO_SIGNAL_STAT, type CardSourcesAnswered, type FleetCard } from "./cards";
+import { buildFleetCardBase, withLiveReadings, busiestExecution, isStrictlyBusier, specDimLabel, specLine, cardFace, notStreamedNames, NO_SIGNAL_STAT, type CardSourcesAnswered, type FleetCard } from "./cards";
 import { useLatch } from "../../hooks/useLatch";
 import { buildActivityTimeline, ACTIVITY_WINDOW_PRESETS, DEFAULT_ACTIVITY_WINDOW_MIN } from "./timeline";
 import { rowFacts, rowSpecs } from "./viewRows";
@@ -1006,8 +1006,9 @@ export function FleetLens({
   );
 
   // (5.0 R3) Names, not a count: the hero's tooltip says WHICH machines its
-  // total leaves out. Memoized so the hero (a `memo`) keeps its identity.
-  const notStreamingKey = cards.filter((c) => c.availability === "not_streamed").map((c) => c.name).join("\u0000");
+  // total leaves out. Keyed by the joined names so the memoized hero keeps its
+  // identity across renders that change nothing.
+  const notStreamingKey = notStreamedNames(cards).join("\u0000");
   const notStreaming = useMemo(() => (notStreamingKey ? notStreamingKey.split("\u0000") : []), [notStreamingKey]);
 
   return (

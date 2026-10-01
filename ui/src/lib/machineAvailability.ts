@@ -15,6 +15,10 @@
  * but `known` shows an explicit "not reported" state, never "idle", "0" or
  * a quiet strip.
  */
+import type { PresenceBeat } from "../types/generated/PresenceBeat";
+import type { NormRecord } from "./ingest";
+import { windowHoldsMachine } from "./machineIdentity";
+
 export type MachineAvailability = "known" | "not_streamed" | "not_reporting";
 
 export interface AvailabilityFacts {
@@ -51,3 +55,28 @@ export function availabilityWarning(a: MachineAvailability): string | null {
 /** The one word a per-machine surface shows in place of a figure or an
  *  "idle" it cannot back. */
 export const NOT_REPORTED = "not reported";
+
+/** Whether a surface must hold back its idle / zero / quiet claims. */
+export const isUnseen = (a: MachineAvailability | undefined): boolean => a !== undefined && a !== "known";
+
+/** What a page about `uid` can see of it, judged only once the flow window has
+ *  answered and the page knows whose machine it is (until then `known`: the
+ *  pending forms already say "no signal"). `self`: the page is about the
+ *  machine serving it. */
+export function windowAvailability(
+  data: NormRecord[],
+  liveMachines: Map<string, PresenceBeat>,
+  uid: string | null,
+  opts: { self: boolean; answered: boolean },
+): MachineAvailability {
+  if (!opts.answered || uid === null) return "known";
+  return machineAvailability({ self: opts.self, seen: windowHoldsMachine(data, liveMachines, uid), standing: "unknown" });
+}
+
+/** A remote machine's live-load line when it has no samples: the page says
+ *  what it cannot see before it says "idle". `answered`: the window and the
+ *  page's identity are both settled. */
+export function remoteIdleLine(a: MachineAvailability, answered: boolean): string {
+  if (isUnseen(a)) return `${NOT_REPORTED} · no records from this machine reach this viewer`;
+  return answered ? "idle · no samples in the last 10 min" : "no signal";
+}

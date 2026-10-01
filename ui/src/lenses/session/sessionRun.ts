@@ -785,6 +785,13 @@ function routeLabel(ep: string | undefined, on: { name: string; uid: string }, v
   return `${label} · ${rest}`;
 }
 
+/** (5.0 R3) The route row: stated by a dispatch start or a terminal naming the
+ *  endpoint. Without either (a partial peer feed, a mission-level session that
+ *  makes no model call) there is nothing to assert. */
+function briefRoute(d: NormRecord | null, ep: string | undefined, first: NormRecord | null | undefined, viewerUid: string | null): string | null {
+  return d?.action === ACTION.DispatchStart || ep ? routeLabel(ep, ranOn(d, first), viewerUid) : null;
+}
+
 function briefRowsOf(sp: DispatchStartPayload, model: string | null, d: NormRecord | null, route: string | null, timing: string): BriefEntry[] {
   const rows: BriefEntry[] = [];
   pushKv(rows, "route", route);
@@ -1602,11 +1609,7 @@ export function runRegions(
   // CLOCK stamps stay record-derived: they are timestamps, not a duration.
   const briefTiming = `${clk(startTs)}${done ? ` → ${clkAt(endTs)} (${fmtElapsed(runWallMs)})` : " · running"}`;
   const ep = remoteEp;
-  // (5.0 R3) A route is stated by a dispatch start or a terminal naming the
-  // endpoint. Without either (a partial peer feed, a mission-level session
-  // that makes no model call) there is nothing to assert.
-  const route = d?.action === ACTION.DispatchStart || ep ? routeLabel(ep, ranOn(d, firstSessRec), viewerUid) : null;
-  const briefRows = briefRowsOf(sp, model, d, route, briefTiming);
+  const briefRows = briefRowsOf(sp, model, d, briefRoute(d, ep, firstSessRec, viewerUid), briefTiming);
   const { promptLines, disclosures } = promptOf(sp);
 
   // No "run" heading inside the block: the region's own `<h2>` directly above

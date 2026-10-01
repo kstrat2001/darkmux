@@ -701,6 +701,8 @@ export interface CardFace {
   utilityQuietKnown: boolean;
 }
 
+const everySourceAnswered = (a: CardSourcesAnswered): boolean => a.flow && a.presence && a.sessions && a.runs;
+
 /** (#2958) A POSITIVE reading shows as soon as the source that produced it
  *  has it; a NEGATIVE claim waits until every source that could contradict
  *  it has answered. The operator watched every card say "idle" for the
@@ -729,14 +731,14 @@ export function cardFace(
   hasReading: boolean,
   answered: CardSourcesAnswered,
 ): CardFace {
-  const all = answered.flow && answered.presence && answered.sessions && answered.runs;
-  const offlineKnown = answered.flow && answered.presence;
-  const absent = card.absent && offlineKnown;
-  const active = card.active && !absent;
   // (5.0 R3) A machine whose records never reach this viewer proves nothing by
   // being quiet: only a `known` one may read idle, 0 running or a quiet strip.
   const seen = card.availability === "known";
-  const idleKnown = all && seen && card.standing === "online";
+  const all = seen && everySourceAnswered(answered);
+  const offlineKnown = answered.flow && answered.presence;
+  const absent = card.absent && offlineKnown;
+  const active = card.active && !absent;
+  const idleKnown = all && card.standing === "online";
   const stat = absent ? "offline" : card.active ? "dispatch in flight" : idleKnown ? "idle" : NO_SIGNAL_STAT;
   // Offline wins: a machine said to be gone draws the powered-off screen,
   // even over a reading its last records left behind.
@@ -747,7 +749,7 @@ export function cardFace(
     active,
     noSignal: stat === NO_SIGNAL_STAT,
     tube,
-    countShown: card.runsCount > 0 || (all && seen),
+    countShown: card.runsCount > 0 || all,
     utilityQuietKnown: answered.flow && seen,
   };
 }
@@ -869,4 +871,9 @@ export function withLiveReadings(
     defaultExecutionSessionId,
     utility,
   };
+}
+
+/** (5.0 R3) The names of the machines whose records never reach this viewer. */
+export function notStreamedNames(cards: readonly Pick<FleetCard, "name" | "availability">[]): string[] {
+  return cards.flatMap((c) => (c.availability === "not_streamed" ? [c.name] : []));
 }
