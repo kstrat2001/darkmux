@@ -19,6 +19,7 @@
 
 import { relAgoFrom } from "./format";
 import type { PresenceBeat } from "../types/generated/PresenceBeat";
+import { canonUid } from "./machineIdentity";
 import { ACTION, latestByTime, type NormRecord } from "./ingest";
 
 /** How long ago the newest dispatch STARTED, as of `nowMs` ("" when none
@@ -31,9 +32,20 @@ function lastDispatchAgo(data: NormRecord[], nowMs: number): string {
   return known ? relAgoFrom(nowMs, last as number) : "";
 }
 
+/** How many machines are up: those presence names, plus this one. SELF IS
+ *  NEVER UNKNOWN (`lib/machineIdentity.isSelfMachine`): the daemon serving the
+ *  page is a machine whether or not presence (off with Redis, empty on a
+ *  fresh install) lists it, so an empty map is not "waiting for a machine".
+ *  `selfUid` is `null` until the daemon has named itself. */
+function machineCount(liveMachines: Map<string, PresenceBeat>, selfUid: string | null): number {
+  const uids = new Set([...liveMachines.keys()].map(canonUid));
+  if (selfUid) uids.add(canonUid(selfUid));
+  return uids.size;
+}
+
 /** `idleStatus()` — viewer.html:1258-1276. */
-function idleHeadline(data: NormRecord[], liveMachines: Map<string, PresenceBeat>, nowMs: number): string {
-  const n = liveMachines.size;
+function idleHeadline(data: NormRecord[], liveMachines: Map<string, PresenceBeat>, nowMs: number, selfUid: string | null): string {
+  const n = machineCount(liveMachines, selfUid);
   if (!n) return "○ waiting for a machine";
   const ago = lastDispatchAgo(data, nowMs);
   // Trailing space after `n` and the leading space on the `ago` suffix are
@@ -51,8 +63,8 @@ function idleHeadline(data: NormRecord[], liveMachines: Map<string, PresenceBeat
  *  dot's colour AND the icon while keeping the text identical, which is
  *  exactly why the goldens never noticed. */
 export interface ReadyParts { kind: "ready"; n: number; ago: string }
-export function readyParts(data: NormRecord[], liveMachines: Map<string, PresenceBeat>, nowMs: number): ReadyParts | null {
-  const n = liveMachines.size;
+export function readyParts(data: NormRecord[], liveMachines: Map<string, PresenceBeat>, nowMs: number, selfUid: string | null = null): ReadyParts | null {
+  const n = machineCount(liveMachines, selfUid);
   if (!n) return null;
   // LAST DISPATCH, measured at its START.
   //
@@ -67,9 +79,9 @@ export function readyParts(data: NormRecord[], liveMachines: Map<string, Presenc
 }
 
 /** The two `#meta` lines (joined by `<br>` in legacy — two lines here). */
-export function computeMetaLines(data: NormRecord[], liveMachines: Map<string, PresenceBeat>, nowMs: number): string[] {
+export function computeMetaLines(data: NormRecord[], liveMachines: Map<string, PresenceBeat>, nowMs: number, selfUid: string | null = null): string[] {
   // (operator) One line. The record count lives in the event pane now, next
   // to the records — stating it here too cost the status bar a second line
   // for something the pane already says. See EventLogColumn's counter chip.
-  return [idleHeadline(data, liveMachines, nowMs)];
+  return [idleHeadline(data, liveMachines, nowMs, selfUid)];
 }

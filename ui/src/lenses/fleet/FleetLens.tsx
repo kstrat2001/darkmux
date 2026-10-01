@@ -210,9 +210,14 @@ const SavingsHero = memo(function SavingsHero({
   tokens: t,
   liveMode,
   settled,
+  notStreaming,
 }: {
   tokens: ReturnType<typeof tokensOffMeter>;
   liveMode: boolean;
+  /** (5.0 R3) The names of machines whose records never reach this viewer.
+   *  The total cannot include their tokens, so it says it counts what is
+   *  seen rather than "all". */
+  notStreaming: readonly string[];
   /** (#2817) False while the flow window is still loading. A zero is a
    *  MEASUREMENT — "darkmux dispatched no tokens in this window" — and
    *  rendering one before the window has arrived states a fact nobody has
@@ -298,7 +303,13 @@ const SavingsHero = memo(function SavingsHero({
               figure on a phone (`.savlblwrap` in `styles.css`), so the hero
               is the same height with or without it. */}
           <div className="savlblwrap">
-            <div className="savlbl">all tokens{liveMode ? ` · last ${hours}h` : ""}</div>
+            <div
+              className="savlbl"
+              title={notStreaming.length > 0 ? `Counts only machines whose records reach this viewer. Not streaming here: ${notStreaming.join(", ")}.` : undefined}
+            >
+              {notStreaming.length > 0 ? "tokens seen" : "all tokens"}
+              {liveMode ? ` · last ${hours}h` : ""}
+            </div>
             {t.utility && settled ? <div className="savpart"><span className="savpartv">{fmtC(t.utility)}</span> utility</div> : null}
           </div>
         </div>
@@ -994,6 +1005,11 @@ export function FleetLens({
     [flowWindow.data, liveMachines, laneUids, presence, flowWindow.tMax, windowMinutesNum, liveMode, tMin, liveEdgeClock, fixedRange?.[0], fixedRange?.[1], specs, roster, policy],
   );
 
+  // (5.0 R3) Names, not a count: the hero's tooltip says WHICH machines its
+  // total leaves out. Memoized so the hero (a `memo`) keeps its identity.
+  const notStreamingKey = cards.filter((c) => c.availability === "not_streamed").map((c) => c.name).join("\u0000");
+  const notStreaming = useMemo(() => (notStreamingKey ? notStreamingKey.split("\u0000") : []), [notStreamingKey]);
+
   return (
     <div className="fleet-lens" data-state={flowWindow.settled ? "loaded" : "loading"}>
       <SavingsHero
@@ -1002,6 +1018,7 @@ export function FleetLens({
         // (#2965) Its zeros are a negative claim off the same read: a failed
         // one keeps the loading silhouette rather than counting up to "0".
         settled={flowWindow.settled && flowWindow.failure === null}
+        notStreaming={notStreaming}
       />
       <RunsUnreadableNotice unreadable={runsUnreadable} message={runsErrorMessage} />
       <RosterUnreadableNotice error={rosterError} />

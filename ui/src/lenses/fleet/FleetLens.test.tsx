@@ -1652,6 +1652,10 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
     expect(studio.className).not.toContain("absent");
     expect(studio.textContent).not.toContain("offline");
     expect(studio.querySelector('[data-testid="availability-warning"]')!.getAttribute("title")).toMatch(/do not reach this viewer/);
+    // (5.0 R3) The hero counts only what reaches this viewer, and says so.
+    const lbl = document.querySelector(".savlbl")!;
+    expect(lbl.textContent).toBe("tokens seen · last 24h");
+    expect(lbl.getAttribute("title")).toBe("Counts only machines whose records reach this viewer. Not streaming here: studio.");
     // The radio seat is an icon in the name row whose tooltip says what it
     // means; the rest of the grant stays words, and the whole grant stays in
     // the hardware line's tooltip.

@@ -536,9 +536,11 @@ export function App() {
   // replay line reads the same set the stage does. That is the property worth
   // having — a second fetch could drift; one source cannot.
   const replayMeta = route.kind === "playback" ? routeRecords.records : null;
+  // (5.0 R3) This machine counts itself once the daemon has named itself.
+  const selfUid = specs?.machine_uid ?? null;
   const ready = useMemo(
-    () => (replayMeta ? null : readyParts(flowWindow.data, liveMachines, nowMs)),
-    [replayMeta, flowWindow.data, liveMachines, nowMs],
+    () => (replayMeta ? null : readyParts(flowWindow.data, liveMachines, nowMs, selfUid)),
+    [replayMeta, flowWindow.data, liveMachines, nowMs, selfUid],
   );
   // (#2072) `computeMetaLines` describes a DAEMON's idle state ("waiting for
   // a machine", "N machines · last dispatch …"); a static build has no
@@ -594,8 +596,8 @@ export function App() {
         ? replayMetaLines(replayMeta, displayRoute.kind === "playback" ? (displayRoute.date ?? "") : "")
         : staticIdle || (!ready && fleetCoverage)
           ? []
-          : computeMetaLines(flowWindow.data, liveMachines, nowMs),
-    [replayMeta, displayRoute, flowWindow.data, liveMachines, nowMs, staticIdle, ready, fleetCoverage],
+          : computeMetaLines(flowWindow.data, liveMachines, nowMs, selfUid),
+    [replayMeta, displayRoute, flowWindow.data, liveMachines, nowMs, selfUid, staticIdle, ready, fleetCoverage],
   );
 
   // `logscope` is no longer SHOWN — the outer UI owns context (see
