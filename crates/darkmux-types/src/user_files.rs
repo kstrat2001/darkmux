@@ -97,6 +97,25 @@ impl UserFileKind {
         }
     }
 
+    /// The data-shape version this binary reads for the kind
+    /// ([`crate::data_version`]): a file whose `schema_version` is newer is
+    /// refused as [`Problem::Newer`] before any key is judged.
+    pub fn schema_version(self) -> &'static str {
+        use crate::data_version as v;
+        match self {
+            UserFileKind::Config => crate::config::CONFIG_SCHEMA_VERSION,
+            UserFileKind::Profiles => crate::PROFILES_SCHEMA_VERSION,
+            UserFileKind::Role => v::ROLE_SCHEMA_VERSION,
+            UserFileKind::Skill => v::SKILL_SCHEMA_VERSION,
+            UserFileKind::Crew => v::CREW_SCHEMA_VERSION,
+            UserFileKind::MissionConfig => v::MISSION_CONFIG_SCHEMA,
+            UserFileKind::Rule => v::RULE_SCHEMA_VERSION,
+            UserFileKind::Workload => v::WORKLOAD_SCHEMA_VERSION,
+            UserFileKind::LabFixture => v::LAB_FIXTURE_SCHEMA_VERSION,
+            UserFileKind::WorkspaceSpec => v::WORKSPACE_SPEC_SCHEMA_VERSION,
+        }
+    }
+
     /// The entry points whose preflight checks this kind. A dispatch reads
     /// the config, the registry and the role library (skills route roles);
     /// a mission launch adds mission configs and rules; a lab run adds
@@ -764,6 +783,9 @@ pub enum Problem {
     NotJson(String),
     /// Keys the file's schema does not accept.
     Keys(Vec<KeyIssue>),
+    /// The file's `schema_version` is newer than this binary reads (#3035):
+    /// it may carry keys this binary cannot place, so none are judged.
+    Newer { file_version: String, known: String },
 }
 
 /// Which files of a kind a check reaches.
@@ -800,6 +822,9 @@ impl fmt::Display for FileProblem {
             Problem::Keys(keys) => {
                 let lines: Vec<String> = keys.iter().map(ToString::to_string).collect();
                 write!(f, "{}", lines.join("; "))
+            }
+            Problem::Newer { file_version, known } => {
+                write!(f, "{}", crate::data_version::newer_refusal(self.kind.label(), &escape_text(file_version), known))
             }
         }?;
         match &self.note {
@@ -867,16 +892,21 @@ pub fn check_text_and<T: JsonSchema + 'static>(
 ) -> Option<FileProblem> {
     let problem = match serde_json::from_str::<Value>(text) {
         Err(e) => Problem::NotJson(e.to_string()),
-        Ok(doc) => {
-            let mut keys = key_issues::<T>(&doc, retired);
-            keys.extend(extra(&doc));
-            if keys.is_empty() {
-                return None;
-            }
-            Problem::Keys(keys)
-        }
+        Ok(doc) => doc_problem::<T>(kind, &doc, retired, extra)?,
     };
     Some(FileProblem { kind, path: path.to_path_buf(), problem, note: None })
+}
+
+/// What is wrong with a parsed document, `None` when it is clean. A marker
+/// newer than the binary's ends the check: its keys are not judged.
+fn doc_problem<T: JsonSchema + 'static>(kind: UserFileKind, doc: &Value, retired: RetiredLookup<'_>, extra: ExtraIssues<'_>) -> Option<Problem> {
+    let known = kind.schema_version();
+    if let Some(file_version) = crate::data_version::newer(doc, known) {
+        return Some(Problem::Newer { file_version, known: known.to_string() });
+    }
+    let mut keys = key_issues::<T>(doc, retired);
+    keys.extend(extra(doc));
+    (!keys.is_empty()).then_some(Problem::Keys(keys))
 }
 
 /// The largest user file the gate reads (and the crew loader parses): 1 MiB,

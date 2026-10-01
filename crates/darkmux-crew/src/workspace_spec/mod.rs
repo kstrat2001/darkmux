@@ -46,7 +46,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const WORKSPACE_SPEC_SCHEMA_VERSION: &str = "1.0";
+pub use darkmux_types::data_version::WORKSPACE_SPEC_SCHEMA_VERSION;
 
 /// Noise directories excluded by default when a spec names no `exclude`
 /// of its own — the "defaults: everything, minus the well-known noise

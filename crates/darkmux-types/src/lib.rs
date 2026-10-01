@@ -11,6 +11,7 @@ pub mod config;
 pub mod config_access;
 pub mod config_enum;
 pub mod daemon_record;
+pub mod data_version;
 pub mod dispatch_liveness;
 pub mod endpoint;
 #[cfg(any(test, feature = "test-support"))]

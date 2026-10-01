@@ -2393,6 +2393,7 @@ fn user_file_hint(p: &darkmux_types::user_files::FileProblem) -> String {
     match &p.problem {
         Problem::Unreadable(_) => format!("make it readable (and under the size cap); until then {unloaded}"),
         Problem::NotJson(_) => format!("fix the JSON syntax; until then {unloaded}"),
+        Problem::Newer { .. } => format!("upgrade darkmux to the version that wrote it; until then {unloaded}"),
         Problem::Keys(keys) if keys.iter().any(|k| matches!(k.issue, Issue::WrongType { .. } | Issue::Missing { .. })) => {
             format!("fix each value named and add each missing key; until then {unloaded}")
         }
