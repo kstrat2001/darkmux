@@ -160,7 +160,7 @@ curl -s http://127.0.0.1:8765/health
       </tr>
       <tr>
         <td><code>GET /flow/&lt;YYYY-MM-DD&gt;</code></td>
-        <td>That day's flow records as a JSON array (<code>FlowRecord[]</code>); <code>?since=&lt;iso-ts&gt;</code> narrows it.</td>
+        <td>That day's flow records in a <code>FlowRecordsResponse</code> envelope (the same one <code>/flow-mission/:id</code> returns); <code>?since=&lt;iso-ts&gt;</code> narrows it.</td>
       </tr>
       <tr>
         <td><code>GET /flow/&lt;YYYY-MM-DD&gt;/stream</code></td>

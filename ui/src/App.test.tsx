@@ -18,6 +18,10 @@ import { ACT_ORDER } from "./lib/eventFilters";
 // bare module-level `let`) because `vi.mock` factories are hoisted above
 // every import, including this file's own — a plain `let` referenced from
 // inside the factory would be read before its own initializer ran.
+/** `GET /flow/<date>` answers the `FlowRecordsResponse` envelope (D5, #3035). */
+const flowDay = (records: unknown[]): string =>
+  JSON.stringify({ records, count: records.length, truncated: false, generated_at_ms: 1 });
+
 const fleetLensProbe = vi.hoisted(() => ({ enabled: false }));
 vi.mock("./lenses/fleet/FleetLens", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./lenses/fleet/FleetLens")>();
@@ -631,7 +635,7 @@ describe("App", () => {
       if (path === "/flow/2026-08-07") {
         return Promise.resolve(
           new Response(
-            JSON.stringify([
+            flowDay([
               { ts: "2026-08-07T02:09:42.000Z", machine_uid: "m1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start" },
               { ts: "2026-08-07T18:28:15.000Z", machine_uid: "m1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.complete" },
             ]),
@@ -692,7 +696,7 @@ describe("App", () => {
         if (String(url) === "/flow/2026-08-07") {
           return Promise.resolve(
             new Response(
-              JSON.stringify([
+              flowDay([
                 // The flow file's leading schema header. It has no
                 // `machine_uid`, so an unshaped read renders it as a phantom
                 // "unknown" machine card and a third timeline lane.
@@ -773,7 +777,7 @@ describe("App", () => {
         if (String(url) === "/flow/2026-08-07") {
           return Promise.resolve(
             new Response(
-              JSON.stringify([
+              flowDay([
                 { _type: "schema", darkmux_version: "2.6.0" },
                 { ts: "2026-08-07T02:09:42.000Z", machine_uid: "m1", machine_id: "MacBook-Pro", mission_id: "review-1", session_id: "s1", action: "dispatch.start" },
                 { ts: "2026-08-07T18:28:15.000Z", machine_uid: "m1", machine_id: "MacBook-Pro", mission_id: "review-2", session_id: "s1", action: "dispatch.complete" },
@@ -843,7 +847,7 @@ describe("App", () => {
         if (String(url) === "/flow/2026-08-07") {
           return Promise.resolve(
             new Response(
-              JSON.stringify([
+              flowDay([
                 { ts: "2026-08-07T02:09:42.000Z", category: "dispatch", action: "dispatch.start", machine_uid: "m1", machine_id: "MacBook-Pro", session_id: "s1" },
                 { ts: "2026-08-07T10:00:00.000Z", category: "dispatch", action: "dispatch.reasoning", machine_uid: "m1", machine_id: "MacBook-Pro", session_id: "s1" },
                 { ts: "2026-08-07T18:28:15.000Z", category: "dispatch", action: "dispatch.complete", machine_uid: "m1", machine_id: "MacBook-Pro", session_id: "s1" },
@@ -947,7 +951,7 @@ describe("App", () => {
         const path = String(url);
         if (path === "/mission/m1/graph.json") return Promise.resolve(new Response(JSON.stringify(graph), { status: 200 }));
         if (path === "/flow-mission/m1") return Promise.resolve(new Response(JSON.stringify({ records: recs, count: recs.length, truncated: false, generated_at_ms: 1 }), { status: 200 }));
-        if (path.startsWith("/flow/")) return Promise.resolve(new Response("[]", { status: 200 }));
+        if (path.startsWith("/flow/")) return Promise.resolve(new Response(flowDay([]), { status: 200 }));
         return Promise.resolve(new Response("not found", { status: 404 }));
       }),
     );
@@ -1009,7 +1013,7 @@ describe("App", () => {
         const path = String(url);
         if (path === "/mission/m1/graph.json") return Promise.resolve(new Response(JSON.stringify(graph), { status: 200 }));
         if (path === "/flow-mission/m1") return Promise.resolve(new Response(JSON.stringify({ records: recs, count: recs.length, truncated: false, generated_at_ms: 1 }), { status: 200 }));
-        if (path.startsWith("/flow/")) return Promise.resolve(new Response("[]", { status: 200 }));
+        if (path.startsWith("/flow/")) return Promise.resolve(new Response(flowDay([]), { status: 200 }));
         return Promise.resolve(new Response("not found", { status: 404 }));
       }),
     );
@@ -1192,8 +1196,8 @@ describe("App", () => {
         ];
         if (path === "/flow-dispatch/s1") return Promise.resolve(new Response(JSON.stringify({ records: recs, count: 2, truncated: false, generated_at_ms: 1 }), { status: 200 }));
         if (path === "/flow-mission/m-one") return Promise.resolve(new Response(JSON.stringify({ records: recs, count: 2, truncated: false, generated_at_ms: 1 }), { status: 200 }));
-        if (path === "/flow/2026-08-07") return Promise.resolve(new Response(JSON.stringify(recs), { status: 200 }));
-        if (path.startsWith("/flow/")) return Promise.resolve(new Response("[]", { status: 200 }));
+        if (path === "/flow/2026-08-07") return Promise.resolve(new Response(flowDay(recs), { status: 200 }));
+        if (path.startsWith("/flow/")) return Promise.resolve(new Response(flowDay([]), { status: 200 }));
         if (path === "/fleet/dispatches/live") return Promise.resolve(new Response(JSON.stringify({ dispatches: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }));
         if (path === "/fleet/machines/live") return Promise.resolve(new Response(JSON.stringify({ machines: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }));
         // Anything else (the mission graph, runs, specs) is absent: the lenses
@@ -1231,7 +1235,7 @@ describe("App", () => {
         const path = String(url);
         if (path === "/flow-dispatch/s-mid") return Promise.resolve(new Response(JSON.stringify({ records: session, count: 3, truncated: false, generated_at_ms: 1 }), { status: 200 }));
         // The daemon's day file holds only Aug 7: the run's last record is on Aug 8.
-        if (path === "/flow/2026-08-07") return Promise.resolve(new Response(JSON.stringify(session.slice(0, 2)), { status: 200 }));
+        if (path === "/flow/2026-08-07") return Promise.resolve(new Response(flowDay(session.slice(0, 2)), { status: 200 }));
         if (path === "/fleet/dispatches/live") return Promise.resolve(new Response(JSON.stringify({ dispatches: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }));
         if (path === "/fleet/machines/live") return Promise.resolve(new Response(JSON.stringify({ machines: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }));
         return Promise.resolve(new Response("not found", { status: 404 }));
@@ -1269,7 +1273,7 @@ describe("App", () => {
       vi.fn((url: string) => {
         const path = String(url);
         if (path === "/flow-dispatch/s-shared") return Promise.resolve(new Response(JSON.stringify({ records: session, count: 5, truncated: false, generated_at_ms: 1 }), { status: 200 }));
-        if (path.startsWith("/flow/")) return Promise.resolve(new Response(JSON.stringify(session), { status: 200 }));
+        if (path.startsWith("/flow/")) return Promise.resolve(new Response(flowDay(session), { status: 200 }));
         if (path === "/fleet/dispatches/live") return Promise.resolve(new Response(JSON.stringify({ dispatches: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }));
         if (path === "/fleet/machines/live") return Promise.resolve(new Response(JSON.stringify({ machines: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }));
         return Promise.resolve(new Response("not found", { status: 404 }));
@@ -1291,7 +1295,7 @@ describe("App", () => {
         if (path === "/flow-dispatch/s-live") return Promise.resolve(new Response(JSON.stringify({ records: recs, count: 1, truncated: false, generated_at_ms: 1 }), { status: 200 }));
         if (path === "/fleet/dispatches/live") return Promise.resolve(new Response(JSON.stringify({ dispatches: [{ session_id: "s-live", machine_uid: "m1", beat_ts_ms: Date.now() }], meta: { sources: { fleet: { state: "ok" } }, complete: true } }), { status: 200 }));
         if (path === "/fleet/machines/live") return Promise.resolve(new Response(JSON.stringify({ machines: [], meta: { sources: { fleet: { state: "ok" } }, complete: true } }), { status: 200 }));
-        if (path.startsWith("/flow/")) return Promise.resolve(new Response(JSON.stringify(recs), { status: 200 }));
+        if (path.startsWith("/flow/")) return Promise.resolve(new Response(flowDay(recs), { status: 200 }));
         return Promise.resolve(new Response("not found", { status: 404 }));
       }),
     );
@@ -1608,7 +1612,7 @@ describe("App", () => {
         if (path === "/flow-dispatch/s-narrow") {
           return Promise.resolve(new Response(JSON.stringify({ records: runRecords, count: runRecords.length, truncated: false, generated_at_ms: 1 }), { status: 200 }));
         }
-        if (path === "/flow/2026-09-04") return Promise.resolve(new Response(JSON.stringify(dayWindow), { status: 200 }));
+        if (path === "/flow/2026-09-04") return Promise.resolve(new Response(flowDay(dayWindow), { status: 200 }));
         if (path === "/fleet/dispatches/live") return Promise.resolve(new Response(JSON.stringify({ dispatches: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }));
         if (path === "/fleet/machines/live") return Promise.resolve(new Response(JSON.stringify({ machines: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }));
         return Promise.resolve(new Response("not found", { status: 404 }));
@@ -1966,7 +1970,7 @@ describe("(#2921) machine route chrome names a uid-only machine", () => {
       vi.fn((url: string) => {
         const path = String(url);
         if (path === `/flow/${today}`) {
-          return Promise.resolve(new Response(JSON.stringify([{ ts: new Date(Date.now() - 60_000).toISOString(), action: "dispatch.turn", machine_uid: FAKE_UID }]), { status: 200 }));
+          return Promise.resolve(new Response(flowDay([{ ts: new Date(Date.now() - 60_000).toISOString(), action: "dispatch.turn", machine_uid: FAKE_UID }]), { status: 200 }));
         }
         if (path === "/fleet/roster") return Promise.resolve(new Response(JSON.stringify({ machines: roster, error: null }), { status: 200 }));
         // `/runs` answers its wire shape; a bare array is not a `RunsResponse`.

@@ -387,9 +387,9 @@ function assignTyped(out: Record<string, unknown>, key: string, v: unknown): voi
  *  gets the same array, which the per-window caches downstream key on. */
 const bodyCache = new WeakMap<object, NormRecord[]>();
 
-/** A response body as records. Accepts the three shapes the daemon's record
- *  routes answer with (a bare array, `{records}` or `{flow}`); anything else
- *  is no records. Order is kept. The same body object always yields the same
+/** A response body as records. Accepts the daemon's `{records}` envelope, a
+ *  bare array (a static file's lines) or the legacy `{flow}` wrapper; anything
+ *  else is no records. Order is kept. The same body object always yields the same
  *  array, so a caller must not mutate it. */
 export function ingest(body: unknown): NormRecord[] {
   if (typeof body !== "object" || body === null) return [];

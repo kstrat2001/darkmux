@@ -1137,8 +1137,11 @@
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        let bytes = to_bytes(response.into_body(), 1024).await.unwrap();
-        assert_eq!(bytes.as_ref(), b"[]");
+        let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["records"], serde_json::json!([]));
+        assert_eq!(body["count"], 0);
+        assert_eq!(body["truncated"], false);
     }
 
     #[tokio::test]
@@ -1168,7 +1171,8 @@
 
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
-        let recs: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let recs = body["records"].as_array().expect("the envelope's records").clone();
         let actions: Vec<&str> = recs.iter().filter_map(|r| r["action"].as_str()).collect();
         assert_eq!(actions, vec!["b", "c"], "since is inclusive; the earlier record drops");
     }
@@ -1196,8 +1200,10 @@
             .unwrap();
 
         let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
-        let recs: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let recs = body["records"].as_array().expect("the envelope's records");
         assert_eq!(recs.len(), 2, "no since → all records returned");
+        assert_eq!(body["count"], 2, "count is the records length, as /flow-mission/:id has it");
     }
 
     #[tokio::test]
@@ -1584,7 +1590,8 @@
         assert!(ct.starts_with("application/json"), "content-type was `{ct}`");
 
         let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
-        let arr: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let arr = body["records"].clone();
         // (found live 2026-09-06) The day file's `{"_type":"schema",…}`
         // header line is NOT a flow record — `push_flow_line` now skips it,
         // same as `for_each_flow_record_across_days` always has, so it no
@@ -2916,6 +2923,25 @@
         assert_eq!(got.as_deref(), Some(written), "expected appended line verbatim");
     }
 
+    /// (D5, #3035) `GET /flow/:date` answers the same envelope `/flow-mission/:id`
+    /// and `/flow-dispatch/:id` do: records, count, truncated, generated_at_ms,
+    /// and a coverage `meta` (no Redis configured reads as `off`, complete).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn flow_date_route_answers_the_records_envelope() {
+        unsafe { std::env::remove_var("DARKMUX_REDIS_URL"); }
+        let flows = archive();
+        let json = get_json(&flows, "/flow/2026-05-14").await;
+        assert!(json.is_object(), "the route answers an envelope, not a bare array: {json}");
+        assert_eq!(json["count"], 2);
+        assert_eq!(json["truncated"], false);
+        assert!(json["generated_at_ms"].as_u64().is_some_and(|n| n > 0), "{json}");
+        assert_eq!(json["meta"]["complete"], true, "{json}");
+        assert_eq!(json["meta"]["sources"]["fleet"]["state"], "off", "{json}");
+        assert_eq!(json["meta"]["days_scanned"], 1);
+        assert_eq!(json["meta"]["records_scanned"], 2);
+    }
+
     // ─── routes that serve records serve them as written ────────────────────
     //
     // Nothing is upgraded on read (#3036): a record carries the spelling it
@@ -2947,9 +2973,9 @@
     async fn flow_date_route_serves_the_day_as_written() {
         let flows = archive();
         let json = get_json(&flows, "/flow/2026-05-14").await;
-        assert_eq!(actions_of(&json), vec!["dispatch.start", "dispatch.complete"]);
+        assert_eq!(actions_of(&json["records"]), vec!["dispatch.start", "dispatch.complete"]);
         let since = get_json(&flows, "/flow/2026-05-14?since=2026-05-14T09:00:05Z").await;
-        assert_eq!(actions_of(&since), vec!["dispatch.complete"]);
+        assert_eq!(actions_of(&since["records"]), vec!["dispatch.complete"]);
     }
 
     /// (#3036) A pre-5.0 day file is served with its retired spelling and no
@@ -2961,9 +2987,9 @@
         let old = "{\"ts\":\"2026-05-14T09:00:00Z\",\"action\":\"dispatch start\",\"session_id\":\"S1\",\"mission_id\":\"m1\"}\n";
         fs::write(tmp.path().join("2026-05-14.jsonl"), old).unwrap();
         let json = get_json(&tmp, "/flow/2026-05-14").await;
-        assert_eq!(json[0]["action"], "dispatch start");
+        assert_eq!(json["records"][0]["action"], "dispatch start");
         // flow-action-guard:allow-end
-        assert!(json[0].get("execution_id").is_none(), "{json}");
+        assert!(json["records"][0].get("execution_id").is_none(), "{json}");
     }
 
     #[tokio::test]
@@ -3387,7 +3413,7 @@
                 .expect("body bytes");
             let body: serde_json::Value = serde_json::from_slice(&bytes)
                 .expect("body parses as JSON");
-            body.as_array().expect("body is JSON array").clone()
+            body["records"].as_array().expect("the envelope's records array").clone()
         }
 
         /// New behavior: GET /flow/<date> (no `.jsonl`) returns a JSON
@@ -4181,9 +4207,7 @@
         // skip.
     }
 
-    // ─── #1387: worktree-summary endpoint tests (shared session-resolution
-    // infra below predates it — kept from #756, still exercised by the
-    // current handler) ──────────────────────────────────────────────────
+    // ─── path_is_within (the lab-run path guard) ───────────────────────────
 
     #[test]
     fn path_is_within_accepts_path_under_base() {

@@ -112,7 +112,14 @@ describe("ingest: the typed fields", () => {
 });
 
 describe("ingest: one test per entry point", () => {
-  it("a /flow/<date> body: a bare array, parsed once per body object", () => {
+  it("a /flow/<date> body: the {records} envelope, parsed once per body object", () => {
+    const envelope = { records: [raw("dispatch.start", 0)], count: 1, truncated: false, generated_at_ms: 1 };
+    const got = ingest(envelope);
+    expect(got).toHaveLength(1);
+    expect(ingest(envelope)).toBe(got);
+  });
+
+  it("a bare array (the static flow file's lines), parsed once per body object", () => {
     const body = [raw("dispatch.start", 0)];
     const first = ingest(body);
     expect(first).toHaveLength(1);
@@ -120,7 +127,7 @@ describe("ingest: one test per entry point", () => {
     expect(ingest([...body])).not.toBe(first);
   });
 
-  it("a /flow-dispatch or /flow-mission body: {records}", () => {
+  it("a /flow-dispatch or /flow-mission body: the same {records} envelope", () => {
     expect(ingest({ records: [raw("dispatch.start", 0)], count: 1, truncated: false })[0].action).toBe(ACTION.DispatchStart);
   });
 

@@ -3230,15 +3230,20 @@ async fn flow_stream_handler(
 
 /// GET /flow/:date — returns flow records for a UTC day.
 ///
-/// `GET /flow/<date>` → JSON array (`application/json`) of the day's flow
-/// records. When `DARKMUX_REDIS_URL` is set + reachable, the array is
-/// aggregated from Redis (`darkmux:flow` stream, filtered by date) — the
-/// **fleet-wide** view across every machine writing to the same stream. When
-/// Redis is unconfigured OR unreachable, the array comes from the local
-/// `<date>.jsonl` file (#270). The viewer's playback + backfill consume this.
+/// `GET /flow/<date>` → a `FlowRecordsResponse` envelope (`application/json`,
+/// the shape `/flow-mission/:id` and `/flow-dispatch/:id` answer, D5 #3035)
+/// whose `records` are the day's flow records. When `DARKMUX_REDIS_URL` is set
+/// and reachable, they are aggregated from Redis (`darkmux:flow` stream,
+/// filtered by date) — the **fleet-wide** view across every machine writing to
+/// the same stream. When Redis is unconfigured OR unreachable, they come from
+/// the local `<date>.jsonl` file (#270). The viewer's playback + backfill
+/// consume this. `meta.sources.fleet` says which: `ok` (Redis answered),
+/// `off` (not configured) or `unavailable` (configured but failed, so the
+/// response is local only). `truncated` is true when the day read hit its
+/// record cap, so the day may hold more than it returned.
 ///
 /// `<date>` must be a bare `YYYY-MM-DD` (no extension). A missing day is an
-/// empty array (200), not a 404 — "the flow records for date X" is an empty
+/// empty `records` list (200), not a 404 — "the flow records for date X" is an empty
 /// collection, not an absent resource. (The pre-#270 `<date>.jsonl` ndjson
 /// shape was retired in #701 — nothing fetched it once the `/flow` page
 /// became a redirect stub.)
@@ -3250,7 +3255,12 @@ async fn flow_handler(
     let Some(date) = is_valid_date(&segment) else {
         return (StatusCode::BAD_REQUEST, "bad date format").into_response();
     };
-    let mut records = aggregate_flow_records_for_date(date, &state.flows_dir).await;
+    let scan_start = std::time::Instant::now();
+    let (mut records, fleet_state) = aggregate_flow_records_for_date(date, &state.flows_dir).await;
+    let records_scanned = records.len();
+    // The day read keeps the newest `MAX_FLOW_FILE_RECORDS` of everything but
+    // the liveness bookends, so a response at the cap may have been cut short.
+    let truncated = records_scanned >= MAX_FLOW_FILE_RECORDS;
     // (#1173) Optional `?since=<iso-ts>` incremental filter. The live viewer's
     // 20s reconcile backstop passes the newest ts it already holds, so the
     // response is just the recent tail rather than the whole (multi-MB) day —
@@ -3263,7 +3273,21 @@ async fn flow_handler(
             None => true,
         });
     }
-    axum::Json(records).into_response()
+    // (D5, #3035) The same envelope `/flow-mission/:id` and `/flow-dispatch/:id`
+    // answer, so every records route has one shape.
+    axum::Json(wire::FlowRecordsResponse {
+        count: records.len(),
+        records,
+        truncated,
+        generated_at_ms: current_millis(),
+        meta: wire::RecordsMeta {
+            coverage: source_state::coverage_meta(&fleet_state),
+            scan_ms: scan_start.elapsed().as_millis() as u64,
+            days_scanned: 1,
+            records_scanned,
+        },
+    })
+    .into_response()
 }
 
 /// Query params for `GET /flow/:date`. `?since=<iso-ts>` bounds the response to
@@ -3970,12 +3994,12 @@ fn join_host_samples_into_session_records(
 async fn aggregate_flow_records_for_date(
     date: &str,
     flows_dir: &std::path::Path,
-) -> Vec<serde_json::Value> {
+) -> (Vec<serde_json::Value>, source_state::SourceState) {
     // env(DARKMUX_REDIS_URL) > config-assembled (#661 Slice 5).
     let redis_url = darkmux_flow::redis_url();
 
     let Some(url) = redis_url else {
-        return read_flow_records_from_file(date, flows_dir).await;
+        return (read_flow_records_from_file(date, flows_dir).await, source_state::SourceState::Off);
     };
 
     // (#1570) LOCAL-FIRST, Redis as a bounded enhancement — run both
@@ -3995,20 +4019,20 @@ async fn aggregate_flow_records_for_date(
     let (redis_result, local_records) = tokio::join!(redis_task, read_flow_records_from_file(date, flows_dir));
 
     match redis_result {
-        Ok(Ok(records)) => union_flow_records(records, local_records),
+        Ok(Ok(records)) => (union_flow_records(records, local_records), source_state::SourceState::Ok),
         Ok(Err(e)) => {
             eprintln!(
                 "darkmux serve: GET /flow/{date} Redis aggregation failed ({e}); \
                  serving local file only"
             );
-            local_records
+            (local_records, source_state::SourceState::Unavailable { detail: FLEET_READ_ERROR_DETAIL })
         }
         Err(e) => {
             eprintln!(
                 "darkmux serve: GET /flow/{date} blocking task join error ({e}); \
                  serving local file only"
             );
-            local_records
+            (local_records, source_state::SourceState::Unavailable { detail: FLEET_READ_ERROR_DETAIL })
         }
     }
 }

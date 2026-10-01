@@ -1,7 +1,7 @@
 GET /  html
 GET /play/:date  html
 GET /health  json HealthResponse
-GET /flow/:date  json FlowRecord[]
+GET /flow/:date  json FlowRecordsResponse
 GET /flow/:date/stream  sse FlowRecord
 GET /flow-days  json FlowDaysResponse
 GET /flow-missions  json FlowMissionsResponse
@@ -31,3 +31,108 @@ GET /lab/run/detail  json LabRunDetailResponse
 GET /lab/run/events  json LabRunEventsResponse
 POST /fleet/work  ndjson (darkmux_fleet submission; fleet listener, not the viewer daemon)
 GET /fleet/card  json ListenerCard (fleet listener, not the viewer daemon; the caller's own grant rides with the card)
+
+# response types: Type.field: type, from the generated TypeScript twins
+HealthResponse.darkmux_version: string
+HealthResponse.build: string
+HealthResponse.binary_mtime: number | null
+HealthResponse.flow_schema_version: string
+HealthResponse.fleet_listener: string | null
+HealthResponse.fleet_busy: FleetBusy | null
+HealthResponse.fleet_token_set: boolean | null
+HealthResponse.hub_link: HubLink | null
+HealthResponse.open_file_limit: number | null
+HealthResponse.lifecycle_policy: RunsPolicy
+HealthResponse.live: HealthLive
+FlowRecordsResponse.records: Array<ArchiveFlowRecord>
+FlowRecordsResponse.count: number
+FlowRecordsResponse.truncated: boolean
+FlowRecordsResponse.generated_at_ms: number
+FlowRecordsResponse.meta: RecordsMeta
+FlowDaysResponse.days: Array<FlowDay>
+FlowDaysResponse.generated_at_ms: number
+FlowMissionsResponse.missions: Array<FlowMissionSummary>
+FlowMissionsResponse.generated_at_ms: number
+FlowMissionsResponse.meta: CoverageMeta
+MachineStatusResponse.models: Array<LoadedModel>
+MachineStatusResponse.lms_unreachable: boolean
+MachineStatusResponse.generated_at_ms: number
+MachineSpecsResponse.darkmux_version: string
+MachineSpecsResponse.flow_schema_version: string
+MachineSpecsResponse.machine_id: string | null
+MachineSpecsResponse.machine_uid: string | null
+MachineSpecsResponse.os: string
+MachineSpecsResponse.ram_total_bytes: number | null
+MachineSpecsResponse.ram_free_for_ai_bytes: number | null
+MachineSpecsResponse.cpu_brand: string | null
+MachineSpecsResponse.loaded_models: Array<LoadedModel>
+MachineSpecsResponse.lms_unreachable: boolean
+MachineSpecsResponse.utility_model: UtilityModel | null
+MachineSpecsResponse.redis_url_redacted: string | null
+MachineSpecsResponse.generated_at_ms: number
+MachineResourcesResponse.cache_ttl_ms: number
+MachineResourcesResponse.load?: MachineLoad
+MachineResourcesResponse.schema_version: string
+MachineResourcesResponse.generated_at_ms: number
+MachineResourcesResponse.gather_ms: number
+MachineResourcesResponse.limit_bytes: number | null
+MachineResourcesResponse.limit_source: LimitSource
+MachineResourcesResponse.pool: PoolSnapshot | null
+MachineResourcesResponse.pressure: PressureSnapshot
+MachineResourcesResponse.models: Array<ModelRow>
+MachineResourcesResponse.machine: MachineTotals
+MachineResourcesResponse.attribution: Attribution
+MachineResourcesResponse.attribution_note: string
+MachineResourcesResponse.messages: Array<LedgerMessage>
+MissionsResponse.missions: Array<Mission>
+MissionsResponse.generated_at_ms: number
+RunsResponse.runs: Array<Run>
+RunsResponse.generated_at_ms: number
+RunsResponse.meta: CoverageMeta
+RunsResponse.policy: RunsPolicy
+PanelResponse.panel: string
+PanelResponse.argv: Array<string>
+PanelResponse.opts: { [key in string]?: string }
+PanelResponse.captured_ts_ms: number
+PanelResponse.gather_ms: number
+PanelResponse.exit_code: number | null
+PanelResponse.ansi_text: string
+PanelResponse.stderr_tail: string
+PanelResponse.cols: number
+PanelResponse.cache_ttl_ms: number
+PanelResponse.age_ms: number
+PanelResponse.auto_refresh: boolean
+PhasesResponse.phases: Array<Phase>
+PhasesResponse.generated_at_ms: number
+MissionGraph.mission_id: string
+MissionGraph.mission_status: MissionStatus
+MissionGraph.nodes: Array<GraphNode>
+MissionGraph.edges: Array<GraphEdge>
+MissionGraph.legacy: boolean
+MissionGraph.note?: string
+MissionGraph.generated_at_ms: number
+FleetDispatchesLiveResponse.dispatches: Array<SessionBeat>
+FleetDispatchesLiveResponse.meta: CoverageMeta
+FleetMachinesLiveResponse.machines: Array<PresenceBeat>
+FleetMachinesLiveResponse.meta: CoverageMeta
+FleetRosterResponse.machines: Array<RosterMachineEntry>
+FleetRosterResponse.error: string | null
+FleetView.gathered_by: GatheredBy
+FleetView.local_machine_id: string | null
+FleetView.presence: SourceState
+FleetView.roster_error: string | null
+FleetView.fetched_at_ms: number
+FleetView.cache_ttl_ms: number
+FleetView.gather_ms: number
+FleetView.machines: Array<FleetMachine>
+LabRunsResponse.configured: boolean
+LabRunsResponse.dir: string | null
+LabRunsResponse.exists: boolean
+LabRunsResponse.runs: Array<LabRunSummary>
+LabRunsResponse.pending_move?: PendingMove
+LabRunDetailResponse.dir: string
+LabRunDetailResponse.reviews: Array<LabReviewSummary>
+LabRunDetailResponse.scores: LabScoresSummary | null
+LabRunEventsResponse.lines: Array<ArchiveFlowRecord>
+LabRunEventsResponse.next_offset: number
+LabRunEventsResponse.finished: boolean

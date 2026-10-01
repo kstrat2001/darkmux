@@ -204,7 +204,6 @@ function installCorpusRoutes(page, meta) {
     if (p.startsWith("/panel/")) return notFound('unknown panel "' + p.slice("/panel/".length) + '" — panels are a fixed allowlist, not arbitrary commands\n');
 
     if (p.startsWith("/lab/run/")) return notFound("lab-run drill-down not recorded in this corpus\n");
-    if (p.startsWith("/worktree-summary/")) return notFound("not recorded in this corpus\n");
 
     // Static asset / favicon / manifest noise the browser requests on its
     // own — let the static file server answer (404s harmlessly, same as a
@@ -250,7 +249,6 @@ function installBlankRoutes(page) {
     if (p.startsWith("/flow-mission/")) return route.fulfill({ status: 404, contentType: "text/plain", body: "blank harness\n" });
     if (p.startsWith("/panel/")) return route.fulfill({ status: 404, contentType: "text/plain", body: "blank harness\n" });
     if (p.startsWith("/lab/run/")) return route.fulfill({ status: 404, contentType: "text/plain", body: "blank harness\n" });
-    if (p.startsWith("/worktree-summary/")) return route.fulfill({ status: 404, contentType: "text/plain", body: "blank harness\n" });
     return route.continue();
   });
 }

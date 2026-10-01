@@ -5,7 +5,7 @@ import { DATE_ROLLOVER_CHECK_MS, RECONCILE_BACKSTOP_MS, queryKeys } from "../lib
 import { buildFlowWindow, computeTMax, prevDateUTC, todayUTC } from "../lib/flow";
 import { getSource } from "../lib/source";
 import { ingest, type NormRecord } from "../lib/ingest";
-import type { FlowRecord } from "../types/generated/FlowRecord";
+import type { FlowRecordsResponse } from "../types/generated/FlowRecordsResponse";
 
 export interface FlowWindowResult {
   /** True once BOTH day-fetches have settled (success or failure) — mirrors
@@ -129,13 +129,13 @@ export function useFlowWindow(nowMs: number): FlowWindowResult {
     queries: [
       {
         queryKey: queryKeys.flowDate(yesterday),
-        queryFn: () => fetchJson<FlowRecord[]>(`/flow/${yesterday}`),
+        queryFn: () => fetchJson<FlowRecordsResponse>(`/flow/${yesterday}`),
         enabled: daemonBacked,
         refetchInterval: retryFailed,
       },
       {
         queryKey: queryKeys.flowDate(today),
-        queryFn: () => fetchJson<FlowRecord[]>(`/flow/${today}`),
+        queryFn: () => fetchJson<FlowRecordsResponse>(`/flow/${today}`),
         enabled: daemonBacked,
         refetchInterval: retryFailed,
       },

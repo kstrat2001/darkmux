@@ -7,8 +7,8 @@
 //! renaming a route fails a test until the golden is regenerated on purpose
 //! (`DARKMUX_REGENERATE_FIXTURES=1 cargo test -p darkmux-serve routes`).
 //!
-//! A JSON route names its response type through the `json!` / `json_list!`
-//! macros, which check at compile time that the type exists; that type is one of
+//! A JSON route names its response type through the `json!`
+//! macro, which checks at compile time that the type exists; that type is one of
 //! [`crate::wire`]'s (or lives beside the thing it describes), and its
 //! TypeScript twin is generated, which `every_json_response_type_has_a_generated_twin`
 //! checks.
@@ -24,8 +24,6 @@ use crate::AppState;
 pub(crate) enum Reply {
     /// A JSON body that is one serialized value of the named type.
     Json(&'static str),
-    /// A JSON body that is an array of the named type.
-    JsonList(&'static str),
     /// The viewer document.
     Html,
     /// A static image the standalone shell uses.
@@ -47,7 +45,6 @@ impl Reply {
     fn render(self) -> String {
         match self {
             Reply::Json(t) => format!("json {}", bare(t)),
-            Reply::JsonList(t) => format!("json {}[]", bare(t)),
             Reply::Html => "html".to_string(),
             Reply::Png => "png".to_string(),
             Reply::Manifest => "manifest".to_string(),
@@ -71,14 +68,6 @@ macro_rules! json {
     }};
 }
 
-/// A JSON route answering with an array of a type.
-macro_rules! json_list {
-    ($ty:ty, $path:literal, $handler:expr) => {{
-        let _: Option<$ty> = None;
-        Route { path: $path, reply: Reply::JsonList(stringify!($ty)), handler: get($handler) }
-    }};
-}
-
 fn plain(path: &'static str, reply: Reply, handler: MethodRouter<AppState>) -> Route {
     Route { path, reply, handler }
 }
@@ -91,7 +80,7 @@ pub(crate) fn table() -> Vec<Route> {
         plain("/", Reply::Html, get(root_html)),
         plain("/play/:date", Reply::Html, get(play_html)),
         json!(HealthResponse, "/health", health),
-        json_list!(darkmux_flow::FlowRecord, "/flow/:date", flow_handler),
+        json!(FlowRecordsResponse, "/flow/:date", flow_handler),
         plain("/flow/:date/stream", Reply::EventStream, get(flow_stream_handler)),
         json!(FlowDaysResponse, "/flow-days", flow_days_handler),
         json!(FlowMissionsResponse, "/flow-missions", flow_missions_handler),
@@ -136,8 +125,51 @@ pub(crate) fn router() -> Router<AppState> {
     timed.merge(streaming)
 }
 
+/// The fields of a generated TypeScript type, one `name: type` string per
+/// top-level member (a union's members instead, for a type that is not an
+/// object). The generated twin is the repo's own record of a response type's
+/// shape, so the golden reads it instead of a second hand-kept description.
+/// Doc comments are dropped and whitespace is collapsed, so an edited comment
+/// never reads as a changed field.
+#[cfg(test)]
+fn ts_members(src: &str) -> Vec<String> {
+    let mut text = String::new();
+    let mut rest = src;
+    while let Some(i) = rest.find("/*") {
+        text.push_str(&rest[..i]);
+        rest = rest[i..].find("*/").map_or("", |j| &rest[i + j + 2..]);
+    }
+    text.push_str(rest);
+    let body = text.split_once("export type ").and_then(|(_, t)| t.split_once('=')).map_or("", |(_, b)| b.trim());
+    let body = body.trim_end().trim_end_matches(';').trim();
+    let (inner, sep) = match body.strip_prefix('{').and_then(|b| b.strip_suffix('}')) {
+        Some(inner) => (inner, ','),
+        None => (body, '|'),
+    };
+    let (mut parts, mut depth, mut quote, mut cur) = (Vec::new(), 0i32, None::<char>, String::new());
+    for c in inner.chars() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (None, '"' | '\'') => quote = Some(c),
+            (None, '{' | '(' | '[' | '<') => depth += 1,
+            (None, '}' | ')' | ']' | '>') => depth -= 1,
+            (None, c) if c == sep && depth == 0 => {
+                parts.push(std::mem::take(&mut cur));
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(c);
+    }
+    parts.push(cur);
+    parts.iter().map(|p| p.split_whitespace().collect::<Vec<_>>().join(" ")).filter(|p| !p.is_empty()).collect()
+}
+
 /// The table as the golden renders it: one `GET <path>  <reply>` line per route,
-/// in table order, then the fleet listener's routes.
+/// in table order, then the fleet listener's routes, then every JSON response
+/// type's fields (`Type.name: type`, from its generated TypeScript twin). A
+/// response shape is a contract (D2, #3035): `scripts/contract-additive-guard.py`
+/// lets a PR add lines here and refuses one that removes or changes a line.
 #[cfg(test)]
 pub(crate) fn render_table() -> String {
     let mut out: String = table().iter().map(|r| format!("GET {}  {}\n", r.path, r.reply.render())).collect();
@@ -149,6 +181,21 @@ pub(crate) fn render_table() -> String {
         "GET {}  json ListenerCard (fleet listener, not the viewer daemon; the caller's own grant rides with the card)\n",
         darkmux_fleet::CARD_PATH
     ));
+    out.push_str("\n# response types: Type.field: type, from the generated TypeScript twins\n");
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../ui/src/types/generated");
+    let mut seen = std::collections::BTreeSet::new();
+    for r in table() {
+        let Reply::Json(ty) = r.reply else { continue };
+        let name = bare(ty);
+        if !seen.insert(name) {
+            continue;
+        }
+        let src = std::fs::read_to_string(dir.join(format!("{name}.ts")))
+            .unwrap_or_else(|e| panic!("{} answers with {ty}, whose generated {name}.ts is unreadable: {e}", r.path));
+        for member in ts_members(&src) {
+            out.push_str(&format!("{name}.{member}\n"));
+        }
+    }
     out
 }
 
@@ -181,6 +228,19 @@ mod tests {
         );
     }
 
+    /// The member reader keeps a field's whole type (nested generics, unions,
+    /// inline objects), drops doc comments, and reads a non-object type as its
+    /// union members.
+    #[test]
+    fn ts_members_reads_fields_and_unions() {
+        let object = "import type { A } from \"./A\";\n/** doc */\nexport type T = { a: Array<A>, \n/** why */\nb?: string | null, c: { x: number, y: number }, d: \"p,q\", };\n";
+        assert_eq!(
+            ts_members(object),
+            ["a: Array<A>", "b?: string | null", "c: { x: number, y: number }", "d: \"p,q\""]
+        );
+        assert_eq!(ts_members("export type U = \"on\" | \"off\" | { k: number };"), ["\"on\"", "\"off\"", "{ k: number }"]);
+    }
+
     /// No two routes share a path, and every path is unique in the router.
     #[test]
     fn route_paths_are_unique() {
@@ -197,7 +257,7 @@ mod tests {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../ui/src/types/generated");
         for r in table() {
             let ty = match r.reply {
-                Reply::Json(t) | Reply::JsonList(t) => t,
+                Reply::Json(t) => t,
                 _ => continue,
             };
             let name = bare(ty);

@@ -3,8 +3,9 @@ import type { ArchiveFlowRecord } from "./ArchiveFlowRecord";
 import type { RecordsMeta } from "./RecordsMeta";
 
 /**
- * `GET /flow-mission/:id` and `GET /flow-dispatch/:id`: the records of one
- * mission or one dispatch, across days and fleet.
+ * `GET /flow/:date`, `GET /flow-mission/:id` and `GET /flow-dispatch/:id`: the
+ * records of one day, one mission or one dispatch (across days and fleet for
+ * the last two).
  *
  * The records are the raw archive lines (an archive line may carry a field this
  * binary does not model), so the field holds JSON values whose documented shape

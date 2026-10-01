@@ -33,20 +33,14 @@ function wrapper() {
   );
 }
 
-/** URL-AWARE on purpose. The two endpoints have DIFFERENT wire shapes, and a
- *  mock that returns one shape for both is green while the decode is broken —
- *  which is exactly what happened here, caught by a live probe at the merge
- *  gate rather than by this file:
+/** Both endpoints answer the `FlowRecordsResponse` envelope (D5, #3035):
  *
- *    GET /flow/<date>        -> a BARE JSON ARRAY   (lib.rs flow_handler)
+ *    GET /flow/<date>        -> { records, count, ... }  (lib.rs flow_handler)
  *    GET /flow-dispatch/<id>  -> { records, count, ... }  (catalog_records_response)
  */
 function mockFetch(records: unknown[]) {
-  return vi.fn(async (url: string) => {
-    const u = String(url);
-    const body = u.startsWith("/flow/")
-      ? records // bare array
-      : { records, count: records.length, truncated: false, generated_at_ms: 0 };
+  return vi.fn(async () => {
+    const body = { records, count: records.length, truncated: false, generated_at_ms: 0 };
     return { ok: true, status: 200, json: async () => body };
   });
 }
@@ -251,7 +245,7 @@ function mockFetchLive(opts: { liveIds: string[]; records: () => unknown[] }) {
       };
     }
     const recs = opts.records();
-    const body = u.startsWith("/flow/") ? recs : { records: recs, count: recs.length, truncated: false, generated_at_ms: 0 };
+    const body = { records: recs, count: recs.length, truncated: false, generated_at_ms: 0 };
     return { ok: true, status: 200, json: async () => body };
   });
 }

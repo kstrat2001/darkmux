@@ -188,7 +188,7 @@ def main():
         # (never a hardcoded date — a rebuild anchored to a different `--now`
         # or spanning a day boundary changes what this lists, and the export
         # follows without a second edit). `/flow/<date>` returns that day's
-        # records as a bare JSON array (`flow_handler`,
+        # records as a `FlowRecordsResponse` envelope (`flow_handler`,
         # `crates/darkmux-serve/src/lib.rs`); concatenating every day and
         # sorting by `ts` reproduces exactly what the daemon would serve
         # across the whole (short, demo-world) history, in the chronological
@@ -202,7 +202,7 @@ def main():
             date = day.get("date") if isinstance(day, dict) else day
             if not date:
                 continue
-            flow_records.extend(get(a.base, f"/flow/{date}"))
+            flow_records.extend(get(a.base, f"/flow/{date}")["records"])
         flow_records.sort(key=lambda r: r.get("ts") or "")
     except urllib.error.URLError as e:
         sys.exit(f"cannot reach {a.base} ({e}). Start the demo world first: ./serve.py")

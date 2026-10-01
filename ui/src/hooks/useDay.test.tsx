@@ -39,11 +39,11 @@ describe("useDay", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
-  it("a daemon playback route fetches /flow/<date> and shapes it", async () => {
+  it("a daemon playback route fetches /flow/<date> (a FlowRecordsResponse envelope) and shapes it", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn((url: string) => {
-        if (String(url) === "/flow/2026-08-07") return Promise.resolve(new Response(JSON.stringify([{ ts: "2026-08-07T01:00:00Z", action: "dispatch.start", session_id: "s1" }]), { status: 200 }));
+        if (String(url) === "/flow/2026-08-07") return Promise.resolve(new Response(JSON.stringify({ records: [{ ts: "2026-08-07T01:00:00Z", action: "dispatch.start", session_id: "s1" }], count: 1, truncated: false, generated_at_ms: 1 }), { status: 200 }));
         return Promise.resolve(new Response("not found", { status: 404 }));
       }),
     );
