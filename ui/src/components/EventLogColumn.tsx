@@ -5,6 +5,7 @@ import { handleNamesExecution } from "../lib/usageRecords";
 import { useThrottledValue } from "../hooks/useThrottledValue";
 import { useArrivalKeys } from "../hooks/useArrivalKeys";
 import { LIVE_WINDOW_MS } from "../lib/flow";
+import { recordMachineKey, recordMachines } from "../lib/machineIdentity";
 import { clkAt, compactThousands, type CompactStyle } from "../lib/format";
 import { RecordView } from "./RecordView";
 import { Shimmer } from "./Placeholder";
@@ -301,6 +302,13 @@ function persistDetailPct(pane: string, pct: number): void {
   }
 }
 
+/** The label a record's machine is printed under, or `null` when the record
+ *  names no machine. */
+function machineLabelOf(labels: ReadonlyMap<string, string>, r: NormRecord): string | null {
+  const key = recordMachineKey(r);
+  return key === null ? null : (labels.get(key) ?? null);
+}
+
 export function EventLogColumn({
   records,
   visible,
@@ -394,6 +402,9 @@ export function EventLogColumn({
   // (`"note"`) was a facet value that had never been seen before and the
   // one-shot reseed had already run.
   const facets = useMemo(() => computeFacets(records), [records]);
+  // Which machine each record belongs to (by uid), the label to print it by,
+  // and every name it has gone by (for search).
+  const machines = useMemo(() => recordMachines(records), [records]);
   // Vocabulary skew, said out loud: records whose action this build does not
   // know (a newer daemon, or an archive the daemon could not upgrade). They
   // still render, but every derivation keyed on the vocabulary ignores them,
@@ -472,7 +483,7 @@ export function EventLogColumn({
     // has not seen before, which is right for live traffic and exactly wrong
     // for a value the operator deliberately deselected last session. Applying
     // first, then letting the ledger mark everything seen, keeps both correct.
-    const facetsHaveArrived = facets.act.length || facets.cat.length || facets.tier.length || facets.src.length;
+    const facetsHaveArrived = facets.act.length || facets.cat.length || facets.tier.length || facets.src.length || facets.mach.length;
     if (!appliedInitialRef.current && facetsHaveArrived) {
       appliedInitialRef.current = true;
       const restored = applyStoredPicks(overridesRef.current, facets);
@@ -582,7 +593,7 @@ export function EventLogColumn({
   const widthDragRef = useRef<{ startX: number; startW: number; proposed: number } | null>(null);
   const [widthReadout, setWidthReadout] = useState<string | null>(null);
 
-  const filtered = useMemo(() => records.filter((r) => matchesFilters(r, filters)), [records, filters]);
+  const filtered = useMemo(() => records.filter((r) => matchesFilters(r, filters, machines)), [records, filters, machines]);
 
   // (#2417 round 2) Each of these four is an OPERATOR GESTURE — the only
   // call sites allowed to persist. They no longer go through a functional
@@ -660,15 +671,27 @@ export function EventLogColumn({
   const shared = useMemo(() => {
     // A record with no session (machine telemetry rides the same list) says
     // nothing about which session this is, so it neither joins nor breaks
-    // the set; same for a record with no machine.
-    const machines = new Set(records.map((r) => r.machine_id).filter(Boolean) as string[]);
+    // the set; same for a record that names no machine. A machine is its
+    // uid, not a name: two machines sharing a display name are two, and one
+    // machine under two spellings is one.
+    const machineKeys = new Set(records.flatMap((r) => recordMachineKey(r) ?? []));
     const sessions = new Set(records.map((r) => r.session_id).filter(Boolean) as string[]);
     // (#2902 step 1b) A compactor call's usage record names the compactor, a
     // sub-execution inside this session, never who ran the session.
     const handles = new Set(records.filter(handleNamesExecution).map((r) => r.handle).filter(Boolean) as string[]);
     const one = (set: Set<string>) => (set.size === 1 ? [...set][0] : null);
-    return { machine: one(machines), session: one(sessions), handle: one(handles) };
-  }, [records]);
+    // One machine, and it has a name to say: the header names it once. One
+    // machine nothing has named says nothing (there is nothing to tell apart);
+    // several machines are named on each row.
+    const machineKey = one(machineKeys);
+    const named = machineKey !== null && machines.aliases.has(machineKey);
+    return {
+      machine: named ? (machines.label.get(machineKey) ?? null) : null,
+      severalMachines: machineKeys.size > 1,
+      session: one(sessions),
+      handle: one(handles),
+    };
+  }, [records, machines]);
 
   // (#2068) The followed record is throttled: at playback speed the newest
   // record changed several times a second and the detail card swapped its
@@ -1273,6 +1296,7 @@ export function EventLogColumn({
             <FiltersBody
               facets={facets}
               filters={filters}
+              machineLabels={machines.label}
               onToggle={toggleFacet}
               onToggleMany={setFacetMany}
               onSetQuery={setQuery}
@@ -1486,7 +1510,7 @@ export function EventLogColumn({
                       <span className="eventlog__ractivity">{activityOf(r)}</span>
                     </>
                   )}
-                  {r.machine_id && !shared.machine ? <span className="eventlog__recmachine"> · {r.machine_id}</span> : null}
+                  {shared.severalMachines && machineLabelOf(machines.label, r) ? <span className="eventlog__recmachine"> · {machineLabelOf(machines.label, r)}</span> : null}
                   {r.session_id && !shared.session ? <span className="eventlog__recsession"> · {r.session_id}</span> : null}
                   {obj.text ? (
                     <span className={`eventlog__recobj${obj.mono ? " eventlog__recobj--mono" : ""}${obj.kind === "think" ? " eventlog__recobj--dim" : ""}`}>
@@ -1566,6 +1590,7 @@ export function EventLogColumn({
       <FiltersDialog
         facets={facets}
         filters={filters}
+        machineLabels={machines.label}
         onToggle={toggleFacet}
         onToggleMany={setFacetMany}
         onSetQuery={setQuery}

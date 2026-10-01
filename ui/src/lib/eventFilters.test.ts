@@ -27,6 +27,8 @@ import { onlyModelFacet } from "../components/FiltersDialog";
 import type { NormRecord } from "./ingest";
 import { norm, type RawRecord } from "../testing/records";
 import { ACTION } from "./ingest";
+import { recordMachineKey, recordMachines } from "./machineIdentity";
+import { FLEET_UID as U, lower } from "../testing/machineFleet";
 
 function rec(overrides: RawRecord): NormRecord {
   return norm({ ts: "2026-08-08T12:00:00.000Z", category: "work", action: "dispatch.reasoning", ...overrides });
@@ -126,7 +128,7 @@ describe("matchesFilters", () => {
   });
 
   it("never excludes on a facet the record simply doesn't carry", () => {
-    const filters = defaultFilterState({ act: ["reasoning"], cat: [], tier: [], src: [] });
+    const filters = defaultFilterState({ act: ["reasoning"], cat: [], tier: [], src: [], mach: [] });
     // `rec()` defaults `category: "work"` — override it too, since the
     // point of this test is a facet the record genuinely lacks (tier, here)
     // being absent from the checkbox model entirely, not category (which
@@ -146,7 +148,7 @@ describe("matchesFilters", () => {
 describe("absorbNewFacetValues — viewer.html's absorbNewFilterValues()/SEEN (#1640 live-tail bug)", () => {
   it("auto-includes a brand-new NON-act facet value the first time it's ever seen", () => {
     const seen = createFacetSeen();
-    let filters = defaultFilterState({ act: [], cat: [], tier: [], src: [] }); // the empty-at-mount snapshot
+    let filters = defaultFilterState({ act: [], cat: [], tier: [], src: [], mach: [] }); // the empty-at-mount snapshot
     const facets = computeFacets([rec({ tier: "darkmux" })]);
     filters = absorbNewFacetValues(filters, facets, seen, createStoredPicks());
     expect(filters.tier.has("darkmux")).toBe(true);
@@ -287,7 +289,7 @@ describe("activeFilterCount", () => {
   // `act` uses two values that ARE in `DEFAULT_ACTIVITIES` so "every value
   // selected" is actually achievable via the plain default (#2416 gave `act`
   // a curated allowlist instead of everything-present).
-  const facets: Facets = { act: ["reasoning", "turn"], cat: ["work"], tier: ["operator"], src: ["cli"] };
+  const facets: Facets = { act: ["reasoning", "turn"], cat: ["work"], tier: ["operator"], src: ["cli"], mach: [] };
 
   it("counts nothing when every value is selected", () => {
     expect(activeFilterCount(defaultFilterState(facets), facets)).toBe(0);
@@ -304,14 +306,14 @@ describe("activeFilterCount", () => {
   // reads "filters · 1" whether one value or seventeen are hidden from a
   // busy facet.
   it("counts every hidden PRESENT value, not one per facet", () => {
-    const wide: Facets = { act: [], cat: Array.from({ length: 20 }, (_, i) => `c${i}`), tier: [], src: [] };
+    const wide: Facets = { act: [], cat: Array.from({ length: 20 }, (_, i) => `c${i}`), tier: [], src: [], mach: [] };
     const st = defaultFilterState(wide);
     st.cat = new Set(Array.from({ length: 3 }, (_, i) => `c${i}`)); // 3 of 20 selected, 17 hidden
     expect(activeFilterCount(st, wide)).toBe(17);
   });
 
   it("sums hidden values across multiple facets, not just one", () => {
-    const both: Facets = { act: [], cat: ["a", "b", "c"], tier: ["x", "y"], src: [] };
+    const both: Facets = { act: [], cat: ["a", "b", "c"], tier: ["x", "y"], src: [], mach: [] };
     const st = defaultFilterState(both);
     st.cat = new Set(["a"]); // 2 hidden
     st.tier = new Set(["x"]); // 1 hidden
@@ -320,7 +322,7 @@ describe("activeFilterCount", () => {
 
   it("does not count a facet with nothing on offer", () => {
     // Otherwise a fresh page opens claiming filters it never applied.
-    const empty: Facets = { act: [], cat: [], tier: [], src: [] };
+    const empty: Facets = { act: [], cat: [], tier: [], src: [], mach: [] };
     expect(activeFilterCount(defaultFilterState(empty), empty)).toBe(0);
   });
 
@@ -342,7 +344,7 @@ describe("filter session persistence — generic mechanics (on `cat`, unaffected
   // AGNOSTIC storage mechanics (round-trip, reconciliation against a
   // narrower window, malformed/throwing storage) on `cat`, which still
   // defaults fully-on exactly like every facet used to.
-  const facets: Facets = { act: ["reasoning"], cat: ["a", "b"], tier: ["operator"], src: ["cli"] };
+  const facets: Facets = { act: ["reasoning"], cat: ["a", "b"], tier: ["operator"], src: ["cli"], mach: [] };
   function mem() {
     const m = new Map<string, string>();
     return {
@@ -463,7 +465,7 @@ describe("#2416 — act defaults to DEFAULT_ACTIVITIES, new values absorb off, p
     ]);
     const overrides = createStoredPicks();
     overrides.act.include.add("note"); // the operator's own stored pick
-    const filters = absorbNewFacetValues(defaultFilterState({ act: [], cat: [], tier: [], src: [] }), facets, seen, overrides);
+    const filters = absorbNewFacetValues(defaultFilterState({ act: [], cat: [], tier: [], src: [], mach: [] }), facets, seen, overrides);
     expect(filters.act.has("heartbeat")).toBe(false);
     expect(filters.act.has("tool call")).toBe(true);
     expect(filters.act.has("note")).toBe(true);
@@ -579,7 +581,7 @@ describe("#2416 — act defaults to DEFAULT_ACTIVITIES, new values absorb off, p
   it("end-to-end: absorb, operator correction, disappear/reappear, then a simulated refresh", () => {
     const s = mem();
     const seen = createFacetSeen();
-    let filters = defaultFilterState({ act: [], cat: [], tier: [], src: [] }); // empty at mount
+    let filters = defaultFilterState({ act: [], cat: [], tier: [], src: [], mach: [] }); // empty at mount
 
     // Dispatch introduces heartbeat (absorbs OFF) and tool call (absorbs ON).
     const busy = computeFacets([rec({ action: "dispatch.turn.heartbeat" }), rec({ action: "dispatch.tool" })]);
@@ -762,26 +764,26 @@ describe("hiddenCauseLabel — names the control responsible for a nonzero hidde
   it("names the activity filter when act alone is narrowed and the query is empty", () => {
     // "host telemetry" is not in DEFAULT_ACTIVITIES, so `defaultFilterState`
     // narrows act to the other three; cat/tier stay fully selected.
-    const facets: Facets = { act: ["reasoning", "tool call", "turn", "host telemetry"], cat: ["work"], tier: ["darkmux"], src: [] };
+    const facets: Facets = { act: ["reasoning", "tool call", "turn", "host telemetry"], cat: ["work"], tier: ["darkmux"], src: [], mach: [] };
     const filters = defaultFilterState(facets);
     expect(filters.act.size).toBe(3);
     expect(hiddenCauseLabel(filters, facets)).toBe("activity filter");
   });
 
   it("names search when only the free-text query is narrowing", () => {
-    const facets: Facets = { act: ["reasoning"], cat: [], tier: [], src: [] };
+    const facets: Facets = { act: ["reasoning"], cat: [], tier: [], src: [], mach: [] };
     const filters = { ...defaultFilterState(facets), q: "foo" };
     expect(hiddenCauseLabel(filters, facets)).toBe("search");
   });
 
   it("returns null (mixed cause) when a facet AND the query are both narrowing", () => {
-    const facets: Facets = { act: ["reasoning", "tool call"], cat: [], tier: [], src: [] };
-    const filters = { act: new Set(["reasoning"]), cat: new Set<string>(), tier: new Set<string>(), src: new Set<string>(), q: "foo" };
+    const facets: Facets = { act: ["reasoning", "tool call"], cat: [], tier: [], src: [], mach: [] };
+    const filters = { act: new Set(["reasoning"]), cat: new Set<string>(), tier: new Set<string>(), src: new Set<string>(), mach: new Set<string>(), q: "foo" };
     expect(hiddenCauseLabel(filters, facets)).toBeNull();
   });
 
   it("returns null when nothing is narrowed (no hidden cause to name)", () => {
-    const facets: Facets = { act: ["reasoning"], cat: [], tier: [], src: [] };
+    const facets: Facets = { act: ["reasoning"], cat: [], tier: [], src: [], mach: [] };
     const filters = defaultFilterState(facets);
     expect(hiddenCauseLabel(filters, facets)).toBeNull();
   });
@@ -923,9 +925,9 @@ describe("PERIODIC_SAMPLE_ACTIVITIES — the fallback shows lifecycle noise, nev
   });
 
   it("isPeriodicOnlyWindow is false for an empty facet set (nothing to backstop) and false once any non-periodic value is offered", () => {
-    expect(isPeriodicOnlyWindow({ act: [], cat: [], tier: [], src: [] })).toBe(false);
-    expect(isPeriodicOnlyWindow({ act: ["host telemetry", "heartbeat"], cat: [], tier: [], src: [] })).toBe(true);
-    expect(isPeriodicOnlyWindow({ act: ["host telemetry", "dispatch start"], cat: [], tier: [], src: [] })).toBe(false);
+    expect(isPeriodicOnlyWindow({ act: [], cat: [], tier: [], src: [], mach: [] })).toBe(false);
+    expect(isPeriodicOnlyWindow({ act: ["host telemetry", "heartbeat"], cat: [], tier: [], src: [], mach: [] })).toBe(true);
+    expect(isPeriodicOnlyWindow({ act: ["host telemetry", "dispatch start"], cat: [], tier: [], src: [], mach: [] })).toBe(false);
   });
 
   // Mutation-proof: PERIODIC_SAMPLE_ACTIVITIES must actually name the value
@@ -977,5 +979,79 @@ describe("activity sections and failures come from typed tables, not spelling", 
     expect(on.has("wibble.error")).toBe(false);
     expect(activitySectionOf("wibble.error")).toBe("OTHER");
     expect(activitySectionOf("mission-ish")).toBe("OTHER");
+  });
+});
+
+// A machine facet keyed by the machine's uid (never by the name a record
+// carries), and a search that finds a machine by any name it has used.
+describe("machine facet and machine search", () => {
+  const T = "2026-10-01T10:00:00.000Z";
+  const mrec = (uid: string | undefined, name: string | undefined, over: RawRecord = {}) =>
+    rec({ ts: T, machine_uid: uid, machine_id: name, ...over });
+  const fleet = [
+    mrec(U.mbp, "MacBook-Pro"),
+    mrec(lower(U.mbp), "MacBook-Pro.local"),
+    mrec(U.studio, "m1-max-32gb-studio"),
+    mrec(U.macA, "Mac"),
+    mrec(U.macB, "Mac"),
+  ];
+
+  it("offers one entry per machine: a uid in two cases is one, two uids with one name are two", () => {
+    expect(computeFacets(fleet).mach).toHaveLength(4);
+  });
+
+  it("every machine starts on", () => {
+    const facets = computeFacets(fleet);
+    expect(defaultFilterState(facets).mach).toEqual(new Set(facets.mach));
+  });
+
+  it("hides the records of an unchecked machine by uid, and keeps a same-named machine's", () => {
+    const facets = computeFacets(fleet);
+    const filters = defaultFilterState(facets);
+    filters.mach.delete(recordMachineKey(fleet[3])!);
+    expect(matchesFilters(fleet[3], filters)).toBe(false);
+    expect(matchesFilters(fleet[4], filters)).toBe(true);
+    expect(matchesFilters(fleet[1], filters)).toBe(true);
+  });
+
+  it("a record that names no machine at all is never excluded by the machine facet", () => {
+    const filters = defaultFilterState(computeFacets(fleet));
+    filters.mach.clear();
+    expect(matchesFilters(mrec(undefined, undefined), filters)).toBe(true);
+  });
+
+  it("an unchecked machine counts toward the active filters", () => {
+    const facets = computeFacets(fleet);
+    const filters = defaultFilterState(facets);
+    filters.mach.delete(recordMachineKey(fleet[2])!);
+    expect(activeFilterCount(filters, facets)).toBe(1);
+    expect(hiddenCauseLabel(filters, facets)).toBe("machine filter");
+  });
+
+  it("the operator's machine pick survives a persist and restore", () => {
+    const store = new Map<string, string>();
+    const s = { getItem: (k: string) => store.get(k) ?? null, setItem: (k: string, v: string) => void store.set(k, v) };
+    const facets = computeFacets(fleet);
+    const filters = defaultFilterState(facets);
+    const off = recordMachineKey(fleet[2])!;
+    filters.mach.delete(off);
+    persistFilterState(filters, facets, s);
+    expect(restoreFilterState(facets, s).mach.has(off)).toBe(false);
+    expect(restoreFilterState(facets, s).mach.size).toBe(facets.mach.length - 1);
+  });
+
+  it("search finds a machine by any name it has used, not only the one in the record", () => {
+    const machines = recordMachines(fleet);
+    const filters = { ...defaultFilterState(computeFacets(fleet)), q: "macbook-pro.local" };
+    // The record says `MacBook-Pro`; its machine was also recorded as `.local`.
+    expect(matchesFilters(fleet[0], filters, machines)).toBe(true);
+    expect(matchesFilters(fleet[2], filters, machines)).toBe(false);
+  });
+
+  it("search does not cross machines that share a name only by coincidence of the query", () => {
+    const machines = recordMachines([mrec(U.macA, "alpha"), mrec(U.macA, "alpha-old"), mrec(U.macB, "beta")]);
+    const filters = { ...defaultFilterState(computeFacets(fleet)), q: "alpha-old" };
+    expect(matchesFilters(mrec(U.macA, "alpha"), filters, machines)).toBe(true);
+    expect(matchesFilters(mrec(U.macB, "beta"), filters, machines)).toBe(false);
   });
 });

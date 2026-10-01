@@ -15,6 +15,7 @@ function facets(overrides: Partial<Facets> = {}): Facets {
     cat: [],
     tier: [],
     src: [],
+    mach: [],
     ...overrides,
   };
 }
@@ -25,6 +26,7 @@ function allOnState(f: Facets): FilterState {
     cat: new Set(f.cat),
     tier: new Set(f.tier),
     src: new Set(f.src),
+    mach: new Set(f.mach),
     q: "",
   };
 }
@@ -37,6 +39,7 @@ function renderBody(f: Facets, filters: FilterState, extra: Partial<Parameters<t
     <FiltersBody
       facets={f}
       filters={filters}
+      machineLabels={new Map()}
       onToggle={onToggle}
       onToggleMany={onToggleMany}
       onSetQuery={onSetQuery}
@@ -85,7 +88,7 @@ describe("FiltersBody — section header toggles (operator finding 3)", () => {
 
   it("a section header with none on reads unchecked, not indeterminate", () => {
     const f = facets({ act: ["reasoning", "tool call"] });
-    const filters: FilterState = { act: new Set(), cat: new Set(), tier: new Set(), src: new Set(), q: "" };
+    const filters: FilterState = { act: new Set(), cat: new Set(), tier: new Set(), src: new Set(), mach: new Set<string>(), q: "" };
     renderBody(f, filters);
     const header = screen.getByLabelText(/model: 0 of 2 on/i) as HTMLInputElement;
     expect(header.checked).toBe(false);
@@ -94,7 +97,7 @@ describe("FiltersBody — section header toggles (operator finding 3)", () => {
 
   it("a section header with SOME values on reads indeterminate", () => {
     const f = facets({ act: ["reasoning", "tool call"] });
-    const filters: FilterState = { act: new Set(["reasoning"]), cat: new Set(), tier: new Set(), src: new Set(), q: "" };
+    const filters: FilterState = { act: new Set(["reasoning"]), cat: new Set(), tier: new Set(), src: new Set(), mach: new Set<string>(), q: "" };
     renderBody(f, filters);
     const header = screen.getByLabelText(/model: 1 of 2 on/i) as HTMLInputElement;
     expect(header.indeterminate).toBe(true);
@@ -102,7 +105,7 @@ describe("FiltersBody — section header toggles (operator finding 3)", () => {
 
   it("clicking a mixed header calls onToggleMany to turn every section value ON", () => {
     const f = facets({ act: ["reasoning", "tool call"] });
-    const filters: FilterState = { act: new Set(["reasoning"]), cat: new Set(), tier: new Set(), src: new Set(), q: "" };
+    const filters: FilterState = { act: new Set(["reasoning"]), cat: new Set(), tier: new Set(), src: new Set(), mach: new Set<string>(), q: "" };
     const { onToggleMany } = renderBody(f, filters);
     const header = screen.getByLabelText(/model: 1 of 2 on/i);
     header.click();

@@ -214,3 +214,51 @@ describe("(#2929) machine keys — what the URL hash carries instead of the hard
     expect(new Set(keys).size).toBe(4);
   });
 });
+
+describe("a machine key resolves by uid or by any alias of the machine, never by a name two machines share", () => {
+  const T = "2026-09-27T01:00:00Z";
+
+  it("a link minted on a viewer that saw the bare name opens the machine on a viewer that saw the .local alias", () => {
+    const viewerB = ctx([rec(UID_A, T, "MacBook-Pro.local")]);
+    expect(decodeMachineKey(viewerB, "MacBook-Pro")).toEqual({ uid: UID_A, key: "MacBook-Pro.local", stale: true });
+  });
+
+  it("a re-cased key opens the machine too, and is rewritten to the current key", () => {
+    const c = ctx([rec(UID_A, T, "MacBook-Pro")]);
+    expect(decodeMachineKey(c, "macbook-pro")).toEqual({ uid: UID_A, key: "MacBook-Pro", stale: true });
+  });
+
+  it("any alias the window holds resolves, not only the newest", () => {
+    const c = ctx([rec(UID_A, T, "laptop"), rec(UID_A, "2026-09-27T02:00:00Z", "MacBook-Pro")]);
+    expect(decodeMachineKey(c, "laptop")).toEqual({ uid: UID_A, key: "MacBook-Pro", stale: true });
+  });
+
+  it("a name two machines share opens neither", () => {
+    const c = ctx([rec(UID_A, T, "Mac"), rec(UID_C, T, "Mac")]);
+    expect(decodeMachineKey(c, "Mac")).toEqual(NOT_FOUND);
+    expect(decodeMachineKey(c, "mac")).toEqual(NOT_FOUND);
+  });
+
+  it("a name only another machine answers to still opens nothing", () => {
+    const c = ctx([rec(UID_A, T, "studio")]);
+    expect(decodeMachineKey(c, "laptop")).toEqual(NOT_FOUND);
+  });
+
+  it("a uid seen in two cases (a record and a beat) is one machine with one key", () => {
+    const beat = { machine_uid: UID_A.toLowerCase(), display_name: "studio", schema_version: "1", beat_ts_ms: 1 } as PresenceBeat;
+    const c = ctx([rec(UID_A, T, "studio")], { liveMachines: new Map([[UID_A.toLowerCase(), beat]]) });
+    expect(encodeMachineKey(c, UID_A)).toBe("studio");
+    expect(decodeMachineKey(c, "studio")).toEqual({ uid: UID_A, key: "studio", stale: false });
+  });
+
+  it("a roster entry declaring a seen machine's uid in the other case adds no second card for it", () => {
+    const c = ctx([rec(UID_A, T, "studio")], { roster: [{ id: "studio-roster", machine_uid: UID_A.toLowerCase() }] });
+    expect(decodeMachineKey(c, "studio-roster")).toEqual({ uid: UID_A, key: "studio", stale: true });
+  });
+
+  it("a roster id that is another spelling of a seen machine's name is not minted as a second roster-only card", () => {
+    const c = ctx([rec(UID_A, T, "Darkbook")], { roster: [{ id: "DARKBOOK" }] });
+    expect(encodeMachineKey(c, UID_A)).toBe("Darkbook");
+    expect(decodeMachineKey(c, "DARKBOOK")).toEqual({ uid: UID_A, key: "Darkbook", stale: true });
+  });
+});

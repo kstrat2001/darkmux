@@ -1,5 +1,5 @@
 import type { PresenceBeat } from "../types/generated/PresenceBeat";
-import { displayNameOf, machineUids, ownMachineName, type RosterName, type SelfIdentity } from "./flow";
+import { canonUid, displayNameOf, findUid, machineMatch, machineUids, nameKey, ownMachineName, type RosterName, type SelfIdentity } from "./machineIdentity";
 import type { NormRecord } from "./ingest";
 
 /**
@@ -69,7 +69,7 @@ const HASH_MIN = 6;
  *  prefix of it. Not cryptographic: it only has to be distinct among the
  *  machines one page knows, and not be the uid. */
 export function machineKeyHash(uid: string): string {
-  const str = uid.toLowerCase();
+  const str = canonUid(uid);
   let h1 = 0xdeadbeef;
   let h2 = 0x41c6ce57;
   for (let i = 0; i < str.length; i++) {
@@ -120,16 +120,17 @@ function buildKeyTable(ctx: MachineKeyContext): KeyTable {
   const { data, liveMachines, specs, roster } = ctx;
   // First-seen order (earliest record; presence-only and specs-only uids
   // after; ties by uid) — only used to make assignment deterministic.
+  const uids = machineUids(data, liveMachines);
   const firstSeen = new Map<string, number>();
   for (const r of data) {
-    const uid = r.machine_uid;
-    if (!uid) continue;
+    const uid = findUid(uids, r.machine_uid);
+    if (uid === null) continue;
     const at = r.tMs ?? Infinity;
     const prev = firstSeen.get(uid);
     if (prev === undefined || at < prev) firstSeen.set(uid, at);
   }
-  for (const uid of machineUids(data, liveMachines)) if (!firstSeen.has(uid)) firstSeen.set(uid, Infinity);
-  if (specs?.machine_uid && !firstSeen.has(specs.machine_uid)) firstSeen.set(specs.machine_uid, Infinity);
+  for (const uid of uids) if (!firstSeen.has(uid)) firstSeen.set(uid, Infinity);
+  if (specs?.machine_uid && findUid(firstSeen.keys(), specs.machine_uid) === null) firstSeen.set(specs.machine_uid, Infinity);
   const seen = [...firstSeen.entries()]
     .sort(([ua, ta], [ub, tb]) => (ta !== tb ? (ta < tb ? -1 : 1) : ua < ub ? -1 : ua > ub ? 1 : 0))
     .map(([uid]) => uid);
@@ -137,17 +138,16 @@ function buildKeyTable(ctx: MachineKeyContext): KeyTable {
   // Roster-only cards: an entry whose declared uid is not one of the seen
   // machines, and whose id is not already a seen machine's own name (the
   // fleet lens folds that one into the seen machine's card).
-  const seenSet = new Set(seen);
   const names = new Map(seen.map((uid) => [uid, ownMachineName(data, liveMachines, specs, roster, uid)] as const));
-  const seenNames = new Set([...names.values()].filter((n): n is string => n !== null));
+  const seenNames = new Set([...names.values()].filter((n): n is string => n !== null).map(nameKey));
   const rosterOnly: string[] = [];
   const declaredUid = new Map<string, string>();
   for (const entry of roster) {
     if (!entry.id) continue;
-    if (entry.machine_uid && seenSet.has(entry.machine_uid)) continue;
-    if (seenNames.has(entry.id) || rosterOnly.includes(entry.id)) continue;
+    if (findUid(seen, entry.machine_uid) !== null) continue;
+    if (seenNames.has(nameKey(entry.id)) || rosterOnly.includes(entry.id)) continue;
     rosterOnly.push(entry.id);
-    if (entry.machine_uid) declaredUid.set(entry.machine_uid.toLowerCase(), entry.id);
+    if (entry.machine_uid) declaredUid.set(canonUid(entry.machine_uid), entry.id);
   }
 
   // Every identity a key can name, and its hash; the hash length is the
@@ -233,9 +233,9 @@ export function decodeMachineKey(ctx: MachineKeyContext, key: string): DecodedMa
   if (key === MACHINE_NOT_FOUND_KEY) return NOT_FOUND;
   // An old link: the hash carried the uid (any case). A roster entry's
   // declared uid names its card even before that machine is ever seen.
-  const lower = key.toLowerCase();
+  const lower = canonUid(key);
   for (const [id, k] of keyOf) {
-    if (id.toLowerCase() === lower) return { uid: id, key: k, stale: true };
+    if (canonUid(id) === lower) return { uid: id, key: k, stale: true };
   }
   const declared = declaredUid.get(lower);
   if (declared !== undefined) return { uid: declared, key: keyOf.get(declared) ?? declared, stale: true };
@@ -247,7 +247,19 @@ export function decodeMachineKey(ctx: MachineKeyContext, key: string): DecodedMa
     const hits = [...keyOf.keys()].filter((id) => machineKeyHash(id).startsWith(hx));
     if (hits.length === 1) return { uid: hits[0], key: keyOf.get(hits[0]) as string, stale: true };
   }
-  return NOT_FOUND;
+  return decodeByAlias(ctx, key, keyOf);
+}
+
+/** A bare-name key minted over another window or viewer names the machine by
+ *  one of its spellings (`MacBook-Pro`, `macbook-pro`, `MacBook-Pro.local`).
+ *  It opens that machine when exactly one machine answers to the name, and
+ *  nothing when several do. */
+function decodeByAlias(ctx: MachineKeyContext, key: string, keyOf: Map<string, string>): DecodedMachineKey {
+  const { data, liveMachines, specs, roster } = ctx;
+  const want = nameKey(key);
+  const hits = [...keyOf.keys()].filter((id) => machineMatch(data, liveMachines, specs, roster, id).names.has(want));
+  if (hits.length !== 1) return NOT_FOUND;
+  return { uid: hits[0], key: keyOf.get(hits[0]) as string, stale: true };
 }
 
 /** The label for a machine a key resolved to: a roster-only card's roster

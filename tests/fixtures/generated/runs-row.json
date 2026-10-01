@@ -3,6 +3,7 @@
   "kind": "mission",
   "status": "running",
   "machine": "macbook-pro",
+  "machine_uid": "00000000-0000-4000-8000-ABCDEF000001",
   "route": "https://example.cognitiveservices.azure.com",
   "role": "pr-reviewer",
   "model": "gpt-oss-120b",

@@ -25,6 +25,7 @@
 
 import { ACTION, bookendOf, isAsOf, type NormRecord } from "./ingest";
 import { segmentSession, type Attempt, type SessionSegments } from "./lifecycle";
+import { canonUid, uidOf } from "./machineIdentity";
 
 /** One attempt of one run. `attempt` indexes `RunGroup.attempts`. */
 export interface RunRef {
@@ -178,14 +179,14 @@ function buildIndex(data: readonly NormRecord[]): RunIndex {
   const bySession = new Map<string, RunGroup[]>();
   const byMission = new Map<string, RunGroup[]>();
   for (const g of groups) {
-    for (const uid of new Set(g.records.map((r) => r.machine_uid || "unknown"))) pushTo(byUid, uid, g);
+    for (const uid of new Set(g.records.map((r) => canonUid(uidOf(r))))) pushTo(byUid, uid, g);
     pushTo(bySession, g.sessionId, g);
     if (g.missionId) pushTo(byMission, g.missionId, g);
   }
   linkSiblings(byMission);
   return {
     groups,
-    groupsOn: (uid) => byUid.get(uid) ?? NO_GROUPS,
+    groupsOn: (uid) => byUid.get(canonUid(uid)) ?? NO_GROUPS,
     groupsOfSession: (sid) => bySession.get(sid) ?? NO_GROUPS,
     groupsOfMission: (mid) => byMission.get(mid) ?? NO_GROUPS,
     groupOf: (r) => byGroupKey.get(keyOf.get(r) ?? "") ?? null,

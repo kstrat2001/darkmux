@@ -480,6 +480,7 @@ export function SessionReplay({
   playhead = null,
   connected = true,
   lastContactMs = null,
+  viewerUid,
 }: {
   sessionId: string;
   /** The mission whose run on this session the page shows, when the route
@@ -505,6 +506,10 @@ export function SessionReplay({
    *  every call that doesn't pass it, which skips the half-open check
    *  entirely — see `runRegions`'s own doc. */
   lastContactMs?: number | null;
+  /** The page's own machine identity (`App.tsx`'s `localUid`): the route line says
+   *  "this machine" only for a run that ran on it. Absent or `null` when not
+   *  known (`runRegions` defaults it). */
+  viewerUid?: string | null;
 }) {
   // (#1972) POLLS while the session is live. Without this the page fetched
   // its records ONCE, which is the defect a live dogfood run exposed: the
@@ -791,7 +796,7 @@ export function SessionReplay({
   // "right now", not about the playhead's moment.
   const effectiveConnected = connected || playhead !== null;
   const effectiveLastContactMs = playhead !== null ? null : lastContactMs;
-  const view = runRegions(data, sessionId, clockOverride, effectiveConnected, effectiveLastContactMs, ticking ? liveOverlay : null, presence, policy);
+  const view = runRegions(data, sessionId, clockOverride, effectiveConnected, effectiveLastContactMs, ticking ? liveOverlay : null, presence, policy, viewerUid);
   // `animate: plausiblyRunning`, not `ticking` — `ticking` is now purely the
   // "should the shared clock subscribe" perf gate (see its own doc above)
   // and is unconditionally `false` in playback (`playhead === null` fails

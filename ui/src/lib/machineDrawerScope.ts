@@ -54,7 +54,7 @@
  * without rendering anything.
  */
 import type { Route } from "./route";
-import { uidOf } from "./flow";
+import { sameUid, uidOf } from "./machineIdentity";
 import type { ProcSamplePoint } from "./hostStats";
 import { ACTION, CATEGORY, SOURCE, byTime, payloadOf, recordsAsOf, recordsSince, type NormRecord } from "./ingest";
 
@@ -134,7 +134,7 @@ export interface DrawerScope {
 export function rollingWindowSamples(records: NormRecord[], uid: string | null, nowMs: number): ProcSamplePoint[] {
   const cutoff = nowMs - DRAWER_ROLLING_WINDOW_MS;
   return recordsSince(recordsAsOf(records, nowMs), cutoff)
-    .filter((r) => isHostSampleRecord(r) && (uid == null || uidOf(r) === uid))
+    .filter((r) => isHostSampleRecord(r) && (uid == null || sameUid(uidOf(r), uid)))
     .sort(byTime)
     .map(toPoint);
 }
@@ -150,7 +150,7 @@ export function findLastKnownSample(records: NormRecord[], uid: string | null, n
   let best: { r: NormRecord; ts: number } | null = null;
   for (const r of records) {
     if (!isHostSampleRecord(r)) continue;
-    if (uid != null && uidOf(r) !== uid) continue;
+    if (uid != null && !sameUid(uidOf(r), uid)) continue;
     const ts = r.tMs;
     // The result states when it was measured, so an untimed sample cannot be it.
     if (ts === null || ts > nowMs) continue;

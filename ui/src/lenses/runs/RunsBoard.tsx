@@ -11,8 +11,8 @@ import { useDay } from "../../hooks/useDay";
 import { RUNS_KINDS, type RunsKind } from "../../lib/route";
 import { useFlowWindow } from "../../hooks/useFlowWindow";
 import { useDecodedMachineKey, useMachineKeyContext } from "../../hooks/useMachineKey";
-import { MACHINE_NOT_FOUND_LABEL, machineLabel } from "../../lib/machineKey";
-import { machineNames } from "../../lib/flow";
+import { MACHINE_NOT_FOUND_LABEL, machineLabel, type MachineKeyContext } from "../../lib/machineKey";
+import { machineMatch } from "../../lib/machineIdentity";
 import { LabRunDetail } from "./LabRunDetail";
 import type { RunsResponse } from "../../types/generated/RunsResponse";
 import type { LabRunsResponse } from "../../types/generated/LabRunsResponse";
@@ -22,6 +22,7 @@ import {
   RUNS_CAP,
   runsFiltered,
   runsForMachine,
+  runMachineLabels,
   runsMultiMachine,
   runsAgo,
   runSubtitle,
@@ -561,7 +562,7 @@ export function RunsBoard({
   const labPendingMove = labRunsQuery.data.ok ? labRunsQuery.data.data.pending_move : undefined;
 
   // (#1809) The machine pin, applied ONCE here so every derivation below
-  // (kind counts, the lab-source notice, `showMachine`, the flat row list)
+  // (kind counts, the lab-source notice, the machine labels, the flat row list)
   // sees the already-scoped set rather than each re-deriving its own filter
   // — see `format.ts::runsForMachine`'s own doc for the alias-matching
   // rationale and the "50 missions + 15 dispatches carry no machine at all"
@@ -570,8 +571,7 @@ export function RunsBoard({
   // machine's fleet card is named from, so the pin and the card agree.
   const pinNotFound = machineKey != null && pinUid == null;
   const pinnedMachineName = machineKey == null ? null : pinUid == null ? MACHINE_NOT_FOUND_LABEL : machineLabel(pinKey.ctx, pinUid);
-  const scopedRuns =
-    machineKey == null ? runs : pinUid == null ? [] : runsForMachine(runs, machineNames(pinRecords, pinKey.ctx.liveMachines, pinUid));
+  const scopedRuns = machineKey == null ? runs : runsOfPin(runs, pinKey.ctx, pinUid);
 
   function selectKind(k: RunsKind) {
     setKind(k);
@@ -592,7 +592,7 @@ export function RunsBoard({
         })
       : null;
 
-  const showMachine = runsMultiMachine(scopedRuns);
+  const machineLabels = runsMultiMachine(scopedRuns) ? runMachineLabels(scopedRuns) : NO_MACHINE_LABELS;
   const bar = (
     <RunsBar
       counts={countsByKind(scopedRuns)}
@@ -626,7 +626,7 @@ export function RunsBoard({
         {shown.length ? (
           <>
             {shown.map((r) => (
-              <RunRow key={r.id} run={r} showMachine={showMachine} onActivate={() => activateRun(r)} />
+              <RunRow key={r.id} run={r} machine={machineLabels.get(r.id) ?? null} onActivate={() => activateRun(r)} />
             ))}
             {more > 0 && (
               <div
@@ -754,6 +754,16 @@ function onActivateKeyDown(onActivate: () => void) {
   };
 }
 
+/** The runs of the pinned machine `pinUid`; none when the pin resolved to no
+ *  machine. */
+function runsOfPin(runs: Run[], ctx: MachineKeyContext, pinUid: string | null): Run[] {
+  if (pinUid == null) return [];
+  return runsForMachine(runs, machineMatch(ctx.data, ctx.liveMachines, ctx.specs, ctx.roster, pinUid));
+}
+
+/** No machine column: one machine on the board needs no label per row. */
+const NO_MACHINE_LABELS: ReadonlyMap<string, string> = new Map();
+
 /** viewer.html: `function runStatusBadge(r)` + `function renderRunRow(r,
  * showMachine)`. The `data-act="labrun"/"gomission"` click destinations
  * (drill-in packet: both real now — lab-run detail opens in-page,
@@ -789,10 +799,10 @@ function onActivateKeyDown(onActivate: () => void) {
  * its TEXT goes through `runStatusLabel`, which reads `abandoned` two
  * different ways depending on `Run.abandoned_reason`. See that function's
  * own doc for why "abandoned" alone was the wrong word for this row. */
-function RunRow({ run, showMachine, onActivate }: { run: Run; showMachine: boolean; onActivate: () => void }) {
+function RunRow({ run, machine, onActivate }: { run: Run; machine: string | null; onActivate: () => void }) {
   const interactive = runDestination(run, missionGraphReachable()).kind !== "none";
   const ago = runsAgo(run);
-  const subtitle = runSubtitle(run, showMachine);
+  const subtitle = runSubtitle(run, machine);
   return (
     <div
       className={`labrunrow${interactive ? "" : " flat"}`}

@@ -56,8 +56,9 @@
  * token sums (a caller-side gate, not a change to this file).
  */
 
-import { statusLabel, displayNameOf } from "../../lib/flow";
-import type { RosterName, SelfIdentity } from "../../lib/flow";
+import { statusLabel } from "../../lib/flow";
+import { displayNameOf } from "../../lib/machineIdentity";
+import type { RosterName, SelfIdentity } from "../../lib/machineIdentity";
 import { clkhm } from "../../lib/format";
 import type { PresenceBeat } from "../../types/generated/PresenceBeat";
 import type { NormRecord } from "../../lib/ingest";

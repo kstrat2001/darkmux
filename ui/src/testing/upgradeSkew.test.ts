@@ -4,7 +4,7 @@ import {
   UPGRADE_SKEW,
   UPGRADE_IN_PROGRESS,
 } from "./fleetScenario";
-import { machineUids, nameOf, machineNames } from "../lib/flow";
+import { machineUids, nameOf, machineNames } from "../lib/machineIdentity";
 
 /**
  * (#2818) THE UPGRADE, AS A TEST.

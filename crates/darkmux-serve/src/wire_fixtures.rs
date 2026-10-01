@@ -154,6 +154,7 @@ mod tests {
             kind: RunKind::Mission,
             status: RunStatus::Running,
             machine: Some("macbook-pro".to_string()),
+            machine_uid: Some("00000000-0000-4000-8000-ABCDEF000001".to_string()),
             route: Some("https://example.cognitiveservices.azure.com".to_string()),
             role: Some("pr-reviewer".to_string()),
             model: Some("gpt-oss-120b".to_string()),
