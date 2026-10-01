@@ -1023,11 +1023,11 @@ function routeChrome(route: Route, targetMachineName: string | null): { crumb: s
   if (route.kind === "runs") {
     // `$("logscope").textContent="runs"` (viewer.html:4676) — HIDDEN, raw.
     // `$("crumb").innerHTML = state.level==="lab-run" ? esc(state.labRunDir||"—")
-    // : ""` (viewer.html:2575, `inRuns` branch) — drill-in packet: `route.run`
+    // : ""` (viewer.html:2575, `inRuns` branch) — drill-in packet: `route.lab`
     // is only ever populated once the operator is genuinely looking at a
     // lab-run-detail pane (see `route.ts`'s widened `run` doc), matching
     // legacy's own gate exactly.
-    return { crumb: route.run ?? "", logscope: "runs" };
+    return { crumb: route.lab ?? "", logscope: "runs" };
   }
   return { crumb: "", logscope: "" };
 }
@@ -1076,7 +1076,7 @@ function renderRoute(
     case "fleet":
       return <FleetLens connected={connected} lastContactMs={routeLastContactMs} />;
     case "runs":
-      return <RunsBoard initialKind={route.runsKind} initialRun={route.run} initialMachineKey={route.machine} />;
+      return <RunsBoard initialKind={route.runsKind} initialLab={route.lab} initialMachineKey={route.machine} />;
     case "machine":
       return <MachineLens machineKey={route.machine} />;
     case "console":

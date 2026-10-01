@@ -175,7 +175,7 @@ describe("Masthead — static-build badge suppression (#1801)", () => {
     // The playback route is the demo's LANDING route: its own date resolves
     // only after the flow file loads, so it must read the meta too or it
     // flashes TODAY while every other tab already shows the day.
-    for (const route of [{ kind: "playback", date: null }, { kind: "runs", runsKind: "all", run: null, machine: null }, { kind: "fleet" }, { kind: "mission", missionId: "m1", stepId: null }] as const) {
+    for (const route of [{ kind: "playback", date: null }, { kind: "runs", runsKind: "all", lab: null, machine: null }, { kind: "fleet" }, { kind: "mission", missionId: "m1", stepId: null }] as const) {
       const { container, unmount } = renderMasthead(route as never);
       const badge = container.querySelector(".masthead__srcbadge");
       expect(badge?.textContent).toBe("2026-08-26");

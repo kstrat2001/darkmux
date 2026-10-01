@@ -71,7 +71,7 @@ export type PanelId = (typeof PANEL_IDS)[number];
 export type Route =
   | { kind: "fleet" }
   /** `machine` — added for #1809 (finishing #1508 step 4): pins the runs
-   * lens to ONE machine, composable with `runsKind`/`run` (independent
+   * lens to ONE machine, composable with `runsKind`/`lab` (independent
    * params on the same hash — a pinned kind filter, or a pinned lab-run
    * drill-in, are both real reachable states). `null` is "every machine",
    * the pre-existing behavior — every hash this port already emits
@@ -92,7 +92,7 @@ export type Route =
    * name, or `<name>~<hash>` / `unnamed-<hash>`), never the hardware uid — a uid in the address
    * bar identifies the physical machine to anyone shown a screenshot or a
    * link. */
-  | { kind: "runs"; runsKind: RunsKind; run: string | null; machine: string | null }
+  | { kind: "runs"; runsKind: RunsKind; lab: string | null; machine: string | null }
   /** `machine` (named `uid` before #2929) — widened in the drill-in packet
    * to carry a SPECIFIC machine: `null` for the nav-tab/deep-link entry
    * (`goMachine` in legacy — always "the local machine"), a machine key for
@@ -396,9 +396,12 @@ export function parseRoute(): Route {
     const runsKind = (RUNS_KINDS as readonly string[]).includes(rawKind)
       ? (rawKind as RunsKind)
       : "all";
-    const run = search.has("run") ? search.get("run") : hash.has("run") ? hash.get("run") : null;
+    // (#1974) `lab=<dir>` opens a lab run, named for the run kind it opens
+    // (CLAUDE.md contract 8). The pre-5.0 `run=` spelling has no alias: it is
+    // an ordinary unknown param, so an old link lands on the runs board.
+    const lab = search.has("lab") ? search.get("lab") : hash.has("lab") ? hash.get("lab") : null;
     const machine = get("machine");
-    return { kind: "runs", runsKind, run: run === null ? null : run.trim(), machine: machine ? machine : null };
+    return { kind: "runs", runsKind, lab: lab === null ? null : lab.trim(), machine: machine ? machine : null };
   }
 
   if (lens === "machine") {

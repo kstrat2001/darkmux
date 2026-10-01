@@ -86,7 +86,7 @@ import {
  * Row-click destinations (drill-in packet — both now real, see `RunRow`'s
  * own doc for the split):
  * - (#2860) a `kind==="lab"` row that carries a `dispatch_id` opens the
- *   shared session view, running or finished, from the list or a `run=<dir>`
+ *   shared session view, running or finished, from the list or a `lab=<dir>`
  *   deep link alike (see `runDestination`, `format.ts`).
  *   A lab row WITHOUT one (a bench run, or a run from before lab rows
  *   carried a session) opens `LabRunDetail`, its own record page: an
@@ -94,8 +94,8 @@ import {
  *   NOT a route change, matching legacy's own mechanism exactly: `render()`
  *   just swaps `$("stage").innerHTML` and syncs the address bar via
  *   `history.replaceState` (`syncLabHash`), it never fires a real navigation
- *   either. `initialRun` (from `route.run`, itself from the `run=` hash
- *   param) seeds `labRunDir` on mount/deep-link, so pasting a `run=` URL
+ *   either. `initialLab` (from `route.lab`, itself from the `lab=` hash
+ *   param) seeds `labRunDir` on mount/deep-link, so pasting a `lab=` URL
  *   lands here directly — same `initialKind` echo-guard pattern below,
  *   widened to cover both.
  * - a tracked (mission/dispatch) row opens the mission-graph lens
@@ -164,13 +164,13 @@ import {
 
 export function RunsBoard({
   initialKind,
-  initialRun,
+  initialLab,
   initialMachineKey,
 }: {
   initialKind: RunsKind;
-  initialRun: string | null;
+  initialLab: string | null;
   /** (#1809) The route's `machine=` pin — `null` means every machine, the
-   * pre-existing behavior. Seeded the same way `initialKind`/`initialRun`
+   * pre-existing behavior. Seeded the same way `initialKind`/`initialLab`
    * are (local state, re-synced on a genuine deep-link change below) rather
    * than read live off the route on every render, for the same reason: the
    * kind chips already own a piece of state outside `Route` (see this
@@ -186,13 +186,13 @@ export function RunsBoard({
   const [rowClickNotice, setRowClickNotice] = useState<string | null>(null);
   const [machineKey, setMachineKey] = useState<string | null>(initialMachineKey);
   // `state.labRunDir` (viewer.html) — which lab run (if any) this board is
-  // showing the detail pane for. Seeded from `initialRun`, independent of
+  // showing the detail pane for. Seeded from `initialLab`, independent of
   // `kind` — a lab row (and so this drill-in) is reachable from BOTH
   // kind=all and kind=lab (every other kind filter excludes lab rows
   // entirely, see `runsFiltered`), matching legacy's own
   // `state.level==="lab-run"` gate, which is independent of
   // `state.runsKind` too (see `route.ts`'s widened `run` doc).
-  const [labRunDir, setLabRunDir] = useState<string | null>(initialRun);
+  const [labRunDir, setLabRunDir] = useState<string | null>(initialLab);
 
   // `drillLabRun(dir)` (viewer.html:4101-4131), reduced to the address-bar
   // half — `LabRunDetail` itself owns the two real fetches (detail +
@@ -201,12 +201,12 @@ export function RunsBoard({
   // sync, never a real navigation — see this file's own module doc.
   // `runsKind: kind` (not hardcoded "lab") preserves whichever kind filter
   // was actually active when the operator clicked in — matching legacy's
-  // own `syncLabHash`, which writes `kind=` from `state.runsKind` and `run=`
+  // own `syncLabHash`, which writes `kind=` from `state.runsKind` and `lab=`
   // from `state.labRunDir` as two independent fields on the same hash.
   function openLabRun(dir: string) {
     setLabRunDir(dir);
     setRowClickNotice(null);
-    writeHash(canonicalHash({ kind: "runs", runsKind: kind, run: dir, machine: machineKey }));
+    writeHash(canonicalHash({ kind: "runs", runsKind: kind, lab: dir, machine: machineKey }));
   }
 
   // The lab-run detail's own "‹ runs" back link (viewer.html:4852/4862,
@@ -216,7 +216,7 @@ export function RunsBoard({
   // here, not a redundant re-fetch).
   function closeLabRun() {
     setLabRunDir(null);
-    writeHash(canonicalHash({ kind: "runs", runsKind: kind, run: null, machine: machineKey }));
+    writeHash(canonicalHash({ kind: "runs", runsKind: kind, lab: null, machine: machineKey }));
   }
 
   // (drill-in packet) A one-shot suppression flag for the deep-link re-sync
@@ -225,7 +225,7 @@ export function RunsBoard({
   // here (`openLabRun`/`closeLabRun`/`selectKind`/`clearMachinePin`) fires
   // from a DOM `onClick`, so React's own event-batching keeps its state
   // setters and `writeHash`'s synthetic `hashchange` in the SAME commit —
-  // the guard's `initialRun === labRunDir` check sees both sides already
+  // the guard's `initialLab === labRunDir` check sees both sides already
   // agreeing and never fires. `onLabRunUnresolvable` instead fires from
   // `LabRunDetail`'s `useEffect` (a passive effect, outside any click's
   // batch scope): `hashchange` forces an EARLIER, separate synchronous
@@ -264,7 +264,7 @@ export function RunsBoard({
         ? "run detail needs a running daemon — this static build lists runs without their per-run pipeline and event feed."
         : `couldn't open run "${dir}" — it may have been removed, or the link is stale. Showing the run list.`,
     );
-    writeHash(canonicalHash({ kind: "runs", runsKind: kind, run: null, machine: machineKey }));
+    writeHash(canonicalHash({ kind: "runs", runsKind: kind, lab: null, machine: machineKey }));
   }
 
   // (#1809) Clears the machine pin — the "back to all machines" half of
@@ -274,7 +274,7 @@ export function RunsBoard({
   function clearMachinePin() {
     setMachineKey(null);
     setShowAll(false);
-    writeHash(canonicalHash({ kind: "runs", runsKind: kind, run: labRunDir, machine: null }));
+    writeHash(canonicalHash({ kind: "runs", runsKind: kind, lab: labRunDir, machine: null }));
   }
 
   // `ACTIONS.labrun`/`ACTIONS.gomission` (viewer.html:2991, folded per-row
@@ -329,7 +329,7 @@ export function RunsBoard({
   }
 
   // A fresh deep-link into a DIFFERENT kind or run while this component is
-  // already mounted (route.runsKind/route.run changes without the runs
+  // already mounted (route.runsKind/route.lab changes without the runs
   // lens itself unmounting) re-syncs local filter state — mirrors
   // `window.goRuns` resetting `state.runsAll=false` on every fresh entry
   // into the lens.
@@ -343,11 +343,11 @@ export function RunsBoard({
   // presence poll, a query refetch — anything that touches
   // `location.href` freshly) recomputes a `Route` whose `runsKind`/`run`
   // now match what the operator already clicked, and without this guard
-  // `initialKind`/`initialRun` would look like a FRESH deep-link, silently
+  // `initialKind`/`initialLab` would look like a FRESH deep-link, silently
   // resetting `showAll`/the row-click notice out from under an operator who
   // touched nothing. The guard is exactly "only a GENUINE
   // change resets" — true both for a real deep-link (arriving on a
-  // different `kind=`/`run=`) and for the FIRST render after mount (`kind`/
+  // different `kind=`/`lab=`) and for the FIRST render after mount (`kind`/
   // `labRunDir` seeded from the initial props, so they're already equal
   // and this effect no-ops on mount too, matching its prior behavior
   // there). Two alternatives that look right and aren't (ruled out during
@@ -367,22 +367,22 @@ export function RunsBoard({
   useEffect(() => {
     // (drill-in packet) See `suppressResyncRef`'s own doc above
     // `onLabRunUnresolvable` — this run of the effect IS that call's own
-    // echo (its `writeHash` is what changed `initialRun`), so treat it as
+    // echo (its `writeHash` is what changed `initialLab`), so treat it as
     // already handled rather than re-deriving the same reset a second,
     // conflicting way.
     if (suppressResyncRef.current) {
       suppressResyncRef.current = false;
       return;
     }
-    const deepLinkUnchanged = initialKind === kind && initialRun === labRunDir && initialMachineKey === machineKey;
+    const deepLinkUnchanged = initialKind === kind && initialLab === labRunDir && initialMachineKey === machineKey;
     if (deepLinkUnchanged) return;
     setKind(initialKind);
     setShowAll(false);
     setRowClickNotice(null);
-    setLabRunDir(initialRun);
+    setLabRunDir(initialLab);
     setMachineKey(initialMachineKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [initialKind, initialRun, initialMachineKey]);
+  }, [initialKind, initialLab, initialMachineKey]);
 
   // These stay unconditional (React's rules-of-hooks — a hook can't sit
   // after the early return below) even though the lab-run-detail branch
@@ -419,7 +419,7 @@ export function RunsBoard({
     refetchInterval: daemonBacked ? PRESENCE_POLL_MS : false,
   });
 
-  // (#2860) A `run=<dir>` deep link (bookmarks, and the retired series view
+  // (#2860) A `lab=<dir>` deep link (bookmarks, and the retired series view
   // used to write these too) follows the SAME rule as a list-row click: a
   // lab run with a representative session opens the shared session view;
   // only a run without one keeps its own record page. `location.replace`,
@@ -486,7 +486,7 @@ export function RunsBoard({
   const pinKey = useMachineKeyContext(pinRecords, daemonBacked ? flowWindow.settled : !day.loading, daemonBacked && machineKey != null);
   const pinDecoded = useDecodedMachineKey(machineKey, pinKey.ctx, pinKey.settled, (k) => {
     setMachineKey(k);
-    writeHash(canonicalHash({ kind: "runs", runsKind: kind, run: labRunDir, machine: k }));
+    writeHash(canonicalHash({ kind: "runs", runsKind: kind, lab: labRunDir, machine: k }));
   });
   const pinUid = pinDecoded?.uid ?? null;
   const pinResolving = machineKey != null && pinUid == null && !pinKey.settled;
@@ -577,7 +577,7 @@ export function RunsBoard({
     setKind(k);
     setShowAll(false);
     setRowClickNotice(null);
-    writeHash(canonicalHash({ kind: "runs", runsKind: k, run: null, machine: machineKey }));
+    writeHash(canonicalHash({ kind: "runs", runsKind: k, lab: null, machine: machineKey }));
   }
 
   // viewer.html: `labSourceNotice()`.

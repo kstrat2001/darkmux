@@ -17,7 +17,7 @@ describe("NavChrome", () => {
 
   it.each<[Route, string]>([
     [{ kind: "fleet" }, "lens-fleet"],
-    [{ kind: "runs", runsKind: "all", run: null, machine: null }, "lens-runs"],
+    [{ kind: "runs", runsKind: "all", lab: null, machine: null }, "lens-runs"],
     [{ kind: "machine", machine: null }, "lens-machine"],
     [{ kind: "console", panelId: "", opts: {} }, "lens-console"],
     // Legacy: `state.level==="subsystem"` (a session drill-in) leaves the
