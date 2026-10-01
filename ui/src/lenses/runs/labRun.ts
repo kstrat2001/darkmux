@@ -2,7 +2,7 @@
  * Pure logic for the lab-run detail view ("run detail" for `kind=lab` rows)
  * — a TypeScript port of `viewer.html`'s `computeLabPipeline`/
  * `labStageMeta`/`labStageRow`/`renderLabPipeline`/`labShortId`/
- * `labFeedTs`/`labFeedRow`/`renderLabFeed`/`labCliHint`/`labBadge`
+ * `labFeedTs`/`labFeedRow`/`renderLabFeed`/`labBadge`
  * (viewer.html:4210-4847). This is a NEW render surface (`RunsBoard`'s row
  * click for `kind==="lab"` previously showed a `NOT_PORTED_NOTICE` — see
  * `LabRunDetail.tsx`'s own doc), so there is no existing parity golden to
@@ -11,8 +11,8 @@
  *
  * Output shape follows the same convention `lenses/machine/memoryLedgerLines.ts`
  * established: flat line arrays, one visible text
- * unit per array element, because legacy's own `.labstage`/`.labfeedrow`/
- * `.labcli` are all `display:flex` — each flex child becomes its own
+ * unit per array element, because legacy's own `.labstage`/`.labfeedrow`
+ * are `display:flex` — each flex child becomes its own
  * `innerText` line, so a literal array element per child reproduces that
  * without depending on a stylesheet this port is free to change.
  */
@@ -180,25 +180,6 @@ export function labFeedStatusSuffix(isFinished: boolean, unreachable: boolean): 
   if (isFinished) return " (playback)";
   if (unreachable) return " — daemon unreachable, retrying";
   return " — live, polling";
-}
-
-/** The "try it yourself" line: a `lab eval` invocation rebuilt from what
- * `scores.json` records (`role`, `mode`, `profile`). The cases
- * dir and `--workdirs` root are not recorded, so they stay explicit
- * placeholders rather than a guess dressed up as fact. The experimental
- * modes run fixed reviewer roles and refuse a named role, so they omit it.
- * (4.0) This used to print the deleted funnel's `--roster-profile` and
- * `--exec-mode`, flags `lab eval` rejects. */
-export function labCliHint(scores: LabScoresSummary | null): string {
-  const mode = scores?.mode ?? "strict";
-  const experimental = mode === "freeform" || mode === "agentic" || mode === "dialectic";
-  const parts = ["darkmux lab eval"];
-  if (!experimental) parts.push(scores?.role || "<role>");
-  parts.push("--cases-dir <cases-dir>");
-  if (scores?.profile) parts.push(`--profile ${scores.profile}`);
-  if (mode === "freeform") parts.push("--mode freeform");
-  if (mode === "agentic" || mode === "dialectic") parts.push(`--mode ${mode} --workdirs <workdirs-root>`);
-  return parts.join(" ");
 }
 
 /** `labBadge()` — viewer.html:4210-4214, text-only. `unreachable` is new

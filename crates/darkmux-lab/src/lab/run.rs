@@ -724,14 +724,14 @@ fn run_profile_name(
 
 #[cfg(test)]
 mod tests {
-    /// (#2947) `lab run` (via `lab_run`) and `lab eval` (via
-    /// `run_review_bench`) refuse an unregistered value in every setting
-    /// the `LabRun` scope consumes, under their OWN label, before writing
-    /// anything: a refusal from the dispatch primitive further down would
-    /// read `dispatch:` and would mean a run directory was already minted.
+    /// (#2947) `lab run` (via `lab_run`) refuses an unregistered value in
+    /// every setting the `LabRun` scope consumes, under its OWN label,
+    /// before writing anything: a refusal from the dispatch primitive
+    /// further down would read `dispatch:` and would mean a run directory
+    /// was already minted.
     #[serial_test::serial]
     #[test]
-    fn lab_run_and_lab_eval_refuse_bad_enum_config_before_minting() {
+    fn lab_run_refuses_bad_enum_config_before_minting() {
         use darkmux_types::config_enum::{Scope, ENUM_SETTINGS};
         let mut exercised = 0;
         for s in ENUM_SETTINGS.iter().filter(|s| s.scopes.contains(&Scope::LabRun)) {
@@ -749,26 +749,9 @@ mod tests {
             })
             .unwrap_err()
             .to_string();
-            let eval_err = crate::lab::review_bench::run_review_bench(crate::lab::review_bench::ReviewBenchOpts {
-                role: "pr-reviewer".into(),
-                cases_dir: state.join("no-cases"),
-                profile_name: None,
-                config_path: None,
-                timeout_seconds: 5,
-                scores_out: None,
-                mode: crate::lab::review_bench::BenchMode::Strict,
-                workdirs: None,
-                prosecutor_profile: None,
-                defender_profile: None,
-                judge_profile: None,
-            })
-            .unwrap_err()
-            .to_string();
             unsafe { std::env::remove_var(var) };
-            for err in [&run_err, &eval_err] {
-                assert!(err.contains("lab run: refusing to start: bad config"), "{}: {err}", s.key);
-                assert!(err.contains("`zz-bad-lab`") && err.contains(var), "{}: {err}", s.key);
-            }
+            assert!(run_err.contains("lab run: refusing to start: bad config"), "{}: {run_err}", s.key);
+            assert!(run_err.contains("`zz-bad-lab`") && run_err.contains(var), "{}: {run_err}", s.key);
             let mut written = Vec::new();
             fn walk(d: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
                 for e in std::fs::read_dir(d).into_iter().flatten().flatten() {

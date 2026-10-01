@@ -382,30 +382,30 @@
       "tracked": true
     },
     {
-      "id": "dispatch-health-research-1784652812-1818c0",
+      "id": "dispatch-analyst-1784652812-1818c0",
       "kind": "dispatch",
       "status": "complete",
-      "role": "health-research",
+      "role": "analyst",
       "started_ts": 1784652812,
       "completed_ts": 1784652813,
       "updated_ts": 1784652813,
       "tracked": true
     },
     {
-      "id": "dispatch-health-research-1784652812-1818f0",
+      "id": "dispatch-analyst-1784652812-1818f0",
       "kind": "dispatch",
       "status": "complete",
-      "role": "health-research",
+      "role": "analyst",
       "started_ts": 1784652812,
       "completed_ts": 1784652813,
       "updated_ts": 1784652813,
       "tracked": true
     },
     {
-      "id": "dispatch-health-research-1784652812-181920",
+      "id": "dispatch-analyst-1784652812-181920",
       "kind": "dispatch",
       "status": "complete",
-      "role": "health-research",
+      "role": "analyst",
       "started_ts": 1784652812,
       "completed_ts": 1784652819,
       "updated_ts": 1784652819,

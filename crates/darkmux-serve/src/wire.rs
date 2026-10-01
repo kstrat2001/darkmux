@@ -467,7 +467,7 @@ pub struct LabReviewSummary {
     pub archived: usize,
 }
 
-/// The identity a `lab eval` scores document records.
+/// The identity a bench's scores document records.
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]

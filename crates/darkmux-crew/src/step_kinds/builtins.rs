@@ -596,21 +596,6 @@ impl StepKind for DispatchInternalStepKind {
         resolve_local_seat(&role_id, profile_name.as_deref(), config_path.as_deref(), &format!("step:{}", step.id))
     }
 
-    /// (#1511) The role this kind dispatches, read from the SAME
-    /// task-then-config source `run` and `seat` above both read, so the
-    /// consent gate cannot disagree with the load. `None` only when neither the Task nor the config names a
-    /// role, which is the same input `seat` reports as
-    /// `LocalModelUnresolved` (no wave load) and `run` fails on.
-    fn dispatch_role(
-        &self,
-        step: &Step,
-        task: &Task,
-        _input: &std::collections::BTreeMap<String, String>,
-        _ctx: &StepRunCtx,
-    ) -> Option<String> {
-        task.role_id.clone().or_else(|| load::<DispatchInternalConfig>(step, ConfigKind::DispatchInternal).ok()?.role_id)
-    }
-
     /// (#2614 review, MUST FIX + "Also fix" wrong-problem-surfaced finding)
     /// The scheduler-hoisted half of the `--resume-from` checkpoint gate —
     /// see `StepKind::resume_precheck`'s own doc for the full "why here,
@@ -864,23 +849,6 @@ impl StepKind for DispatchSingleShotStepKind {
             min_ctx,
             seat: format!("step:{}", step.id),
         })
-    }
-
-    /// (#1511) `None` — this kind dispatches a bare MODEL, never a role.
-    /// `run` below builds its request from `config.model` + `config.user` +
-    /// `config.system`; it never resolves a role manifest and never loads a
-    /// role prompt, and `seat` above reads `config.model`/`config.n_ctx`
-    /// for the same reason. There is no role doctrine for the
-    /// licensed-adjacent gate to disclose, so it has nothing to gate — the
-    /// behavior this kind had before #1511 and still has.
-    fn dispatch_role(
-        &self,
-        _step: &Step,
-        _task: &Task,
-        _input: &BTreeMap<String, String>,
-        _ctx: &StepRunCtx,
-    ) -> Option<String> {
-        None
     }
 
     fn run(&self, step: &Step, task: &Task, input: &BTreeMap<String, String>, ctx: &StepRunCtx) -> Result<StepOutcome> {
@@ -2608,21 +2576,6 @@ impl StepKind for DispatchMapStepKind {
         })
     }
 
-    /// (#1511) `None`, for the same reason `dispatch.single_shot` returns
-    /// `None`: every item of the map is a bare model call built from
-    /// `config.model`/`config.user`, with no role manifest anywhere. This
-    /// is also what keeps an EMPTY `dispatch.map` — which claims
-    /// [`SeatClaim::NoModel`] above and loads nothing — from being refused
-    /// for a role it was never going to dispatch.
-    fn dispatch_role(
-        &self,
-        _step: &Step,
-        _task: &Task,
-        _input: &BTreeMap<String, String>,
-        _ctx: &StepRunCtx,
-    ) -> Option<String> {
-        None
-    }
 }
 
 /// Runs a shell command from `Step.config`. Required: `command`
@@ -2791,22 +2744,6 @@ impl StepKind for ProceduralShellStepKind {
         SeatClaim::NoModel
     }
 
-    /// (#1511) `None` — the documented no-dispatch opt-out, matching this
-    /// kind's [`SeatClaim::NoModel`] above. A shell command speaks to no
-    /// model, so there is no role for the licensed-adjacent consent gate to
-    /// check. This arm is why the gate's `None` case is not a fail-open:
-    /// an ordinary `procedural.*` graph legitimately carries no role, and
-    /// says so here rather than leaving the scheduler to guess.
-    fn dispatch_role(
-        &self,
-        _step: &Step,
-        _task: &Task,
-        _input: &BTreeMap<String, String>,
-        _ctx: &StepRunCtx,
-    ) -> Option<String> {
-        None
-    }
-
     fn id(&self) -> &'static str {
         ConfigKind::ProceduralShell.id()
     }
@@ -2965,19 +2902,6 @@ impl StepKind for ProceduralNoopStepKind {
         SeatClaim::NoModel
     }
 
-    /// (#1511) `None` — the documented no-dispatch opt-out, matching this
-    /// kind's [`SeatClaim::NoModel`] above. See
-    /// `ProceduralShellStepKind::dispatch_role`.
-    fn dispatch_role(
-        &self,
-        _step: &Step,
-        _task: &Task,
-        _input: &BTreeMap<String, String>,
-        _ctx: &StepRunCtx,
-    ) -> Option<String> {
-        None
-    }
-
     fn id(&self) -> &'static str {
         ConfigKind::ProceduralNoop.id()
     }
@@ -3063,24 +2987,6 @@ mod tests {
     /// implementations read the bus, so an empty one is sufficient here.
     fn bare_ctx() -> StepRunCtx {
         StepRunCtx::new(crate::test_run(), None, None, None, std::sync::Arc::new(crate::step_kinds::ArtifactBus::new()))
-    }
-
-    /// The consent gate names the role a `dispatch.internal` step dispatches;
-    /// a task's own role is that role even when the step's config fails to
-    /// load (`run` then refuses the config, but the gate must not be blind to
-    /// who the task staffs).
-    #[test]
-    fn dispatch_role_is_the_tasks_role_even_when_the_config_fails_to_load() {
-        let mut task = empty_task();
-        task.role_id = Some("coder".to_string());
-        let bad = step("s1", "dispatch.internal", json!({"timeout_seconds": "soon"}));
-        let role = DispatchInternalStepKind.dispatch_role(&bad, &task, &BTreeMap::new(), &bare_ctx());
-        assert_eq!(role.as_deref(), Some("coder"));
-
-        let configured = step("s1", "dispatch.internal", json!({"role_id": "reviewer"}));
-        let role = DispatchInternalStepKind.dispatch_role(&configured, &empty_task(), &BTreeMap::new(), &bare_ctx());
-        assert_eq!(role.as_deref(), Some("reviewer"));
-        assert_eq!(DispatchInternalStepKind.dispatch_role(&bad, &empty_task(), &BTreeMap::new(), &bare_ctx()), None);
     }
 
     // ── #2614 review: resume_precheck / message ordering ────────────────

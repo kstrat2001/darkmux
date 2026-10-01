@@ -15,11 +15,11 @@ use clap::{Parser, Subcommand};
 /// `ProfileCmd::Scan`/`MachineCmd::Status`/`LabCmd::Run`/
 /// `LabCmd::Characterize`/`LabCmd::Tune` into
 /// one `#[command(flatten)]`-able struct — mechanical dedup only, the doc
-/// string + `--profiles-file` flag name are unchanged. Two other subcommands
-/// (`LabCmd::Eval`, `LabCmd::Loop`) declare their own doc text for
-/// this same flag (a shorter variant and a `#984`-specific one respectively)
-/// and are deliberately left un-flattened — collapsing them would change
-/// their help text.
+/// string + `--profiles-file` flag name are unchanged. One other subcommand
+/// (`LabCmd::Loop`) declares its own doc text for
+/// this same flag (a `#984`-specific one)
+/// and is deliberately left un-flattened — collapsing it would change
+/// its help text.
 #[derive(clap::Args)]
 pub(crate) struct ProfilesFileArg {
     /// Profiles-registry path (profiles.json). Overrides DARKMUX_PROFILES
@@ -1461,78 +1461,6 @@ pub(crate) enum LabCmd {
     Fixture {
         #[command(subcommand)]
         sub: FixtureCmd,
-    },
-    /// Role eval (#1119, generalized in #1465) — run a role over a labeled
-    /// corpus and score precision / recall / verdict / anchor against the
-    /// ground-truth labels. `<role>` defaults to `pr-reviewer` (today's
-    /// behavior); any role that emits the same `{verdict, findings}` JSON
-    /// contract is a caller (a future coder-eval is free). Run across profiles
-    /// (`--profile` / `--profiles-file`) to compare models reproducibly — the
-    /// rows are the bake-off matrix. (Was `lab review-bench`; generalizing the
-    /// snowflake dissolves the `lab review` vs `mission launch review`
-    /// naming collision — `eval` names what it does.)
-    Eval {
-        /// The role to evaluate against the corpus. Defaults to `pr-reviewer`
-        /// (the original `review-bench` behavior). The scorer is role-agnostic
-        /// — it matches the role's emitted `{verdict, findings}` JSON against
-        /// the ground-truth labels. The experimental conditions of `--mode`
-        /// (`freeform`, `agentic`, `dialectic`) are
-        /// `pr-reviewer`-specific and ignore this positional (they dispatch
-        /// fixed reviewer variant roles / pipelines); a follow-up moves those
-        /// behind per-role config (#1465).
-        #[arg(default_value = "pr-reviewer")]
-        role: String,
-        /// Directory of labeled cases (`<id>.diff` + `<id>.label.json`).
-        #[arg(
-            long = "cases-dir",
-            default_value = "templates/builtin/lab-fixtures/pr-review-bench/cases"
-        )]
-        cases_dir: String,
-        /// Profile (the model axis) — defaults to the registry's default_profile.
-        #[arg(long, short = 'p')]
-        profile: Option<String>,
-        /// Profiles-registry path (profiles.json). Overrides DARKMUX_PROFILES.
-        #[arg(long = "profiles-file")]
-        profiles: Option<String>,
-        /// Per-case dispatch timeout in seconds.
-        #[arg(long, default_value = "600")]
-        timeout: u32,
-        /// (#1198) Where to write the scores.json artifact (default: a
-        /// `review-bench-<ts>/scores.json` under the runs dir).
-        #[arg(long = "scores-out")]
-        scores_out: Option<std::path::PathBuf>,
-        /// The experimental condition. `strict` (the default) dispatches the
-        /// shipped grammar-constrained role. `freeform` dispatches
-        /// `pr-reviewer-freeform` (ordinary prose, `MUST FIX:`/`CONSIDER:`
-        /// marker lines, no JSON grammar lock) to measure whether the JSON
-        /// contract itself suppresses recall. `agentic` dispatches
-        /// `pr-reviewer-agentic` with each case's repository tree (at the
-        /// reviewed commit) mounted as the workdir, the production agentic
-        /// condition (#1197); it requires --workdirs. `dialectic` (#1222)
-        /// runs the adversarial pipeline instead of a single reviewer:
-        /// prosecutor, defender, judge as three chained dispatches; the
-        /// judge's sustained charges are the review, and each case's debate
-        /// envelope lands beside scores.json. The advocates run agentic, so
-        /// it requires --workdirs too.
-        #[arg(long, value_enum, default_value_t)]
-        mode: crate::lab::review_bench::BenchMode,
-        /// Evidence root for `--mode agentic` / `--mode dialectic`: one
-        /// subdirectory per case id holding that case's repo tree
-        /// (`git archive <commit> | tar -x -C <root>/<id>`).
-        #[arg(long)]
-        workdirs: Option<std::path::PathBuf>,
-        /// (#1222) Per-seat profile override (dialectic); falls back to
-        /// --profile. Debug phase: leave unset — one profile, all seats.
-        #[arg(long = "prosecutor-profile")]
-        prosecutor_profile: Option<String>,
-        /// (#1222) Per-seat profile override (dialectic); falls back to --profile.
-        #[arg(long = "defender-profile")]
-        defender_profile: Option<String>,
-        /// (#1222) Per-seat profile override (dialectic); falls back to
-        /// --profile. The later single-variable escalation: point this at a
-        /// denser local or remote-endpoint profile while the advocates stay.
-        #[arg(long = "judge-profile")]
-        judge_profile: Option<String>,
     },
     /// Loop lab (#986) — run ONE dispatch under a chosen harness config and
     /// classify how the loop behaved: productive / struggled / inert-false-pass

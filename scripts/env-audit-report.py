@@ -9,7 +9,7 @@ readers against DARKMUX_*-derived test writers and each reader's
 mutates a `DARKMUX_*` env var IS guarded against every OTHER serial test —
 but not against a test that reads the same (or a derived) value without the
 annotation. A guarded writer racing an unguarded reader is still a race
-(#2632: `dialectic_seats_contract` observed a `TempDir` another, unrelated
+(#2632: a crew loader test observed a `TempDir` another, unrelated
 test had already dropped and deleted; `liveness_dir_and_host_sampler_lock_
 path_are_test_isolated` observed its own two `liveness_dir()` calls resolve
 to two different roots within one test run; seven `darkmux-crew::scheduler`

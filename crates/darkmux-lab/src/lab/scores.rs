@@ -47,16 +47,15 @@ pub const SCORES_SCHEMA_VERSION: &str = "1.1.0";
 /// bench wrote the row.
 ///
 /// Bump the suffix whenever [`is_infra_failure`]'s SEMANTICS change (not for
-/// a refactor that preserves them). `/1` means: both benches ran the rule
-/// below.
+/// a refactor that preserves them). `/1` means: the rule below ran.
 ///
 /// **What an ABSENT value does and does not tell a reader.** `None` means
 /// only "written before #2685" — it does NOT say which of the two divergent
 /// pre-#2685 rules produced the row, because neither bench stamped anything.
-/// A pre-#2685 `review-bench` row was classified by this very rule; a
-/// pre-#2685 `tool-bench` row was classified by exit-code-alone; both carry
-/// `None`. Telling them apart still requires the fallback this field exists
-/// to remove — read `bench`, then know the repo history. A distinct retro
+/// A pre-#2685 `tool-bench` row was classified by exit-code-alone, and a
+/// pre-#2685 row from the since-removed review bench by this very rule; both
+/// carry `None`. Telling them apart still requires the fallback this field
+/// exists to remove: read `bench`, then know the repo history. A distinct retro
 /// value cannot fix that: the rows are already on disk unstamped, and
 /// rewriting them would be inventing provenance. So the honest reading of
 /// `None` is "provenance unknown, and possibly incommensurable with its
@@ -239,7 +238,7 @@ pub struct RunProvenance {
 /// READER's job — per-trial rows never collapse at write time.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScoreRow {
-    /// Bench identifier (`review-bench`, `tool-bench`, …) or the external
+    /// Bench identifier (`tool-bench`, …) or the external
     /// harness a row was ingested from.
     pub bench: String,
     /// The bench's own version — scores are only comparable within it.
@@ -344,14 +343,11 @@ pub fn read_scores(path: &Path) -> Result<ScoresDoc> {
 // writes a `ScoreRow` classifies through the predicate below and stamps
 // `INFRA_CLASSIFIER` onto the rows it emits.
 //
-// It lived in `review_bench.rs` until #2685, while `providers::tool_bench`
-// carried its own `infra_fail = !dispatch_ok` — so the SAME event (a
-// non-zero exit alongside a recovered envelope carrying real tokens, which
-// the runtime's escalation arm produces on purpose) was `InfraFail` in one
-// bench and `CapabilityFail` in the other, on rows a reader is invited to
-// compare. `tool_bench` was aligned UP to this rule rather than this rule
-// dropped back to exit-code-alone: the envelope-aware reading is the #1210
-// fix, and losing it for the bench that has it would lower the gate.
+// `providers::tool_bench` once carried its own `infra_fail = !dispatch_ok`,
+// so a non-zero exit alongside a recovered envelope carrying real tokens
+// (which the runtime's escalation arm produces on purpose) was `InfraFail`
+// there and `CapabilityFail` elsewhere, on rows a reader is invited to
+// compare. The envelope-aware reading is the #1210 fix.
 
 /// Per-dispatch metadata pulled from the `--json` envelope (best-effort —
 /// the score math never depends on it, only the artifact's provenance).
@@ -384,15 +380,6 @@ pub(crate) struct EnvelopeMeta {
 /// That qualifier is exact, not a hedge, and it is narrower than "every
 /// reader of dispatch stdout in this crate". Read [`envelope_reply_text`]
 /// below for which callers isolate and which deliberately still do not.
-///
-/// (#2721) `lab::review_bench` and `lab::dialectic`'s `run_debate` USED to be
-/// the counter-examples named here: each took METRICS through
-/// [`envelope_meta`] (isolated, via this) and its TEXT through
-/// `providers::prompt::extract_reply_text` on the WHOLE stdout, so the two
-/// halves of one trial could come from different places. Both now go through
-/// [`envelope_reply_text`], so text and metrics come from the same line by
-/// construction, and one mutation of the selection below turns a guard red in
-/// EACH bench rather than in neither.
 ///
 /// It was two places until #2719: [`parse_envelope`] below and
 /// `providers::tool_bench::extract_reply` each carried their own copy of the
@@ -428,9 +415,8 @@ pub fn envelope_candidate(stdout: &str) -> &str {
 /// [`envelope_meta`] reads the metrics off. The one way a caller should turn
 /// a dispatch's stdout into text.
 ///
-/// Callers: `providers::tool_bench`, `lab::review_bench`, `lab::dialectic`'s
-/// three seats, and the retired `notebook draft` verb (which is why this is
-/// `pub`). A mutation of [`envelope_candidate`] turns a guard red in each.
+/// Callers: `providers::tool_bench`. A mutation of [`envelope_candidate`]
+/// turns a guard red there.
 ///
 /// # This is for dispatch STDOUT, and only for dispatch stdout
 ///
@@ -607,10 +593,9 @@ pub(crate) fn envelope_meta_with_exit(stdout: &str, exit_code: i32) -> EnvelopeM
 /// contract above is the citable evidence.)
 ///
 /// (#2685) The first argument is the CALLER's own "this trial produced no
-/// usable output" signal, so the one predicate serves both benches without
-/// either bench's score type leaking in here: `review_bench` passes
-/// `CaseScore::degenerate` (the review did not parse) and `tool_bench`
-/// passes "the reply carried no `ANSWER:`/`BLOCKED:` verdict".
+/// usable output" signal, so the predicate stays free of any bench's score
+/// type: `tool_bench` passes "the reply carried no `ANSWER:`/`BLOCKED:`
+/// verdict".
 ///
 /// (#2685 frontier-QA) That eligibility gate applies to the ZERO-TOKEN arm
 /// ONLY, and the two arms are asymmetric on purpose because their evidence
@@ -629,8 +614,7 @@ pub(crate) fn envelope_meta_with_exit(stdout: &str, exit_code: i32) -> EnvelopeM
 ///   field to have read a verdict out of: whatever the caller judged was
 ///   SCRAPED from the same unparseable stdout (`tool_bench`'s
 ///   `extract_reply` falls back to the raw line and its `extract_answer`
-///   accepts a lone nonce anywhere in it; `review_bench`'s freeform parser
-///   marks any non-empty text `parsed`). A scrape off a corpse cannot
+///   accepts a lone nonce anywhere in it). A scrape off a corpse cannot
 ///   overrule the evidence that it IS a corpse, so this arm is NOT gated.
 ///
 ///   (#2685 frontier-QA) The "did not parse" reading is load-bearing for
@@ -691,7 +675,7 @@ mod tests {
 
     fn sample_row() -> ScoreRow {
         ScoreRow {
-            bench: "review-bench".into(),
+            bench: "tool-bench".into(),
             bench_version: "1".into(),
             source: "native".into(),
             family: ScoreFamily::Capability,
@@ -815,8 +799,6 @@ mod tests {
 
 
     // ─── (#2685) the shared infra-vs-capability rule ────────────────
-    // Moved here with the code under test (was `review_bench_tests.rs`,
-    // where it sat next to a rule `tool_bench` did not call).
 
     #[test]
     fn envelope_meta_extracts_model_and_tokens() {
@@ -1035,8 +1017,7 @@ mod tests {
     fn is_infra_failure_requires_degenerate_and_positive_zero_token_evidence() {
         // (#2685) The caller's own "produced no usable output" signal,
         // now a plain bool so the one predicate serves every bench:
-        // `review_bench` passes `CaseScore::degenerate`, `tool_bench`
-        // passes "the reply carried no ANSWER:/BLOCKED: verdict".
+        // `tool_bench` passes "the reply carried no ANSWER:/BLOCKED: verdict".
         let degen = true;
         let ran_fine = false;
         let zero = EnvelopeMeta { model: None, total_tokens: Some(0), infra_exit: false, runtime_error: false };

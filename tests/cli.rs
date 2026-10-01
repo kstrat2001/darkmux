@@ -27,7 +27,7 @@ use tempfile::TempDir;
 // without it the child resolves the developer's
 // actual `~/.darkmux`, and every accessor that has no test-build guard
 // of its own (`fleet_file`,
-// `identity_path_override`, `ack_dir_override`) then reads and WRITES
+// `identity_path_override`) then reads and WRITES
 // the operator's real state. Measured 2026-09-07 against this file's own
 // binary: with `DARKMUX_HOME` unset, `darkmux machine add` created
 // `$HOME/.darkmux/fleet.json`.
@@ -911,17 +911,6 @@ fn lab_loop_rejects_an_out_of_range_compact_threshold_ratio() {
         .stderr(predicate::str::contains("--compact-threshold-ratio 5 is out of range"));
 }
 
-/// A seat profile outside `--mode dialectic` is a usage error: exit 2, the
-/// same as a clap-rejected argument, not the generic failure exit 1.
-#[test]
-fn a_seat_profile_outside_dialectic_mode_exits_2() {
-    darkmux_cmd()
-        .args(["lab", "eval", "--mode", "strict", "--judge-profile", "p"])
-        .assert()
-        .code(2)
-        .stderr(predicate::str::contains("`--judge-profile` applies only to `--mode dialectic`"));
-}
-
 /// `--execution` takes the `exec-...` id `dispatch` prints. A session-shaped
 /// value is a usage error (exit 2) on every verb that has the flag, naming
 /// what the flag wants; it never reaches the flow trail.
@@ -995,7 +984,6 @@ fn retired_flag_spellings_are_refused_at_entry_naming_the_replacement() {
         (&["flow", "note", "--text", "t", "--session-id", "s"], "darkmux flow note --session-id", "--execution"),
         (&["flow", "tail", "--session", "s"], "darkmux flow tail --session", "--execution"),
         (&["memory", "correction", "list", "--session", "s"], "darkmux memory correction list --session", "--execution"),
-        (&["lab", "eval", "--freeform"], "darkmux lab eval --freeform", "--mode freeform"),
         (&["lab", "run", "quick-q", "--runs", "2"], "darkmux lab run --runs", "--repeat"),
         (&["lab", "tune", "quick-q", "--runs", "2"], "darkmux lab tune --runs", "--repeat"),
         (&["mission", "status", "--missions"], "darkmux mission status --missions", "--named"),
@@ -1120,20 +1108,26 @@ fn retired_mission_migrate_verb_is_unknown() {
         .stderr(predicate::str::contains("unrecognized subcommand 'migrate'"));
 }
 
-/// (4.0) `lab eval`'s `--k`, `--roster-profile`, `--exec-mode` and
-/// `--bundler` belonged to the deleted funnel mode (#2310 P4d): each was
-/// accepted and silently discarded. They are removed, so clap refuses them.
-/// `--help` after the flag keeps the pre-removal run of this test from
-/// dispatching anything: with the flag known, clap reaches `--help` and
-/// exits 0.
+/// (#3036) `lab eval` is removed whole. Every spelling it ever took (a bare
+/// verb, its experimental `--mode`, and the `--k`, `--roster-profile`,
+/// `--exec-mode`, `--bundler`, `--funnel` and `--crew` flags retired earlier)
+/// exits 2 through the real binary, naming the 5.0 release and both
+/// replacements, never clap's "unrecognized subcommand".
 #[test]
-fn lab_eval_dead_funnel_flags_are_removed() {
-    for (flag, value) in [("--k", "2"), ("--roster-profile", "p"), ("--exec-mode", "auto"), ("--bundler", "b")] {
+fn lab_eval_is_refused_whole_at_entry_naming_its_replacements() {
+    for args in [
+        vec!["lab", "eval"],
+        vec!["lab", "eval", "pr-reviewer", "--mode", "agentic", "--workdirs", "w"],
+        vec!["lab", "eval", "--k", "2", "--help"],
+        vec!["lab", "eval", "--funnel", "--crew", "review-funnel"],
+    ] {
         darkmux_cmd()
-            .args(["lab", "eval", flag, value, "--help"])
+            .args(&args)
             .assert()
-            .failure()
-            .stderr(predicate::str::contains(format!("unexpected argument '{flag}'")));
+            .code(2)
+            .stderr(predicate::str::contains("`darkmux lab eval` was removed in 5.0"))
+            .stderr(predicate::str::contains("darkmux lab run <workload>"))
+            .stderr(predicate::str::contains("darkmux mission launch review"));
     }
 }
 
@@ -1261,7 +1255,7 @@ fn memory_family_carries_both_kinds() {
 /// (`lab register`/`lab unregister`), and the role-scoped snowflake
 /// (`lab review-bench`) all retired into kind-families (`lab run {list,
 /// inspect,compare}`, `lab workload list`, `lab fixture {list,register,
-/// unregister}`) and the generalized `lab eval`. `lab` survives, so each is an
+/// unregister}`). `lab` survives, so each is an
 /// unknown SUB-verb within the surviving family. No compat alias (pre-2.0
 /// clean removal).
 #[test]
@@ -1286,18 +1280,6 @@ fn retired_lab_flat_subverbs_are_unknown() {
     }
 }
 
-/// (#1465) The `--crew` flag on the review-eval path retired with the crew
-/// family (#1426); it is now `--roster-profile`. clap rejects the old flag as
-/// an unexpected argument (no compat alias).
-#[test]
-fn retired_crew_flag_on_lab_eval_is_unknown() {
-    let mut cmd = darkmux_cmd();
-    cmd.args(["lab", "eval", "--funnel", "--crew", "review-funnel"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("unexpected argument"));
-}
-
 /// (#1465) The replacement `lab` surface EXISTS: `lab --help` lists the new
 /// kind-families, and each family's `--help` keeps its members. The retirement
 /// test above only proves the OLD spellings are gone; this proves the new ones
@@ -1314,7 +1296,7 @@ fn lab_kind_families_carry_their_members() {
     };
 
     let lab = help(&["lab"]);
-    for family in ["run", "workload", "fixture", "eval"] {
+    for family in ["run", "workload", "fixture"] {
         assert!(lab.contains(family), "lab --help lists `{family}`: {lab}");
     }
 
@@ -1339,14 +1321,6 @@ fn lab_kind_families_carry_their_members() {
     for sub in ["list", "register", "unregister"] {
         assert!(fixture.contains(sub), "lab fixture --help keeps `{sub}`: {fixture}");
     }
-
-    // `lab eval` takes a role positional (default pr-reviewer). The retired
-    // `--crew` flag, and the `--roster-profile` it was renamed to (a dead
-    // funnel flag, removed in 4.0), must both be gone.
-    let eval = help(&["lab", "eval"]);
-    assert!(eval.to_lowercase().contains("role"), "lab eval --help names the role positional: {eval}");
-    assert!(!eval.contains("--roster-profile"), "lab eval --help must not define --roster-profile: {eval}");
-    assert!(!eval.contains("--crew <"), "lab eval --help must not define the retired --crew flag: {eval}");
 }
 
 /// (#1426 ship-4) `mission run` retired — the coder pipeline runs through
@@ -2988,22 +2962,22 @@ fn dispatch_finding_refuses_a_key_with_no_stored_record() {
     let store = TempDir::new().unwrap(); // empty store
     darkmux_cmd()
         .env("DARKMUX_FINDINGS_DIR", store.path())
-        .args(["dispatch", "health-research", "--finding", "sess-x/9", "smoke"])
+        .args(["dispatch", "coder", "--finding", "sess-x/9", "smoke"])
         .assert()
         .failure()
         .stderr(
             predicate::str::contains("no finding sess-x/9")
                 .and(predicate::str::contains("darkmux finding sync"))
-                // Refused ahead of the dispatch: the ACK gate never ran, and
-                // nothing reached docker.
-                .and(predicate::str::contains("requires operator acknowledgment").not())
+                // Refused ahead of the dispatch: the seat classification never ran,
+                // and nothing reached docker.
+                .and(predicate::str::contains("claims a LOCAL model seat").not())
                 .and(predicate::str::contains("docker").not()),
         );
 
     // A key of the wrong SHAPE is refused with the form it should have.
     darkmux_cmd()
         .env("DARKMUX_FINDINGS_DIR", store.path())
-        .args(["dispatch", "health-research", "--finding", "not-a-key", "smoke"])
+        .args(["dispatch", "coder", "--finding", "not-a-key", "smoke"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("<execution>/<seq>"));
@@ -3011,34 +2985,36 @@ fn dispatch_finding_refuses_a_key_with_no_stored_record() {
 
 /// (#2295) The same refusal rule for the second record kind: `dispatch --mod
 /// <key>` with a key that addresses no stored mod refuses BEFORE any dispatch
-/// setup. Proven by ABSENCE — the ACK gate this role would otherwise hit, and
-/// any docker work, must both be unreached.
+/// setup. Proven by ABSENCE — the seat classification, which this dispatch would
+/// otherwise reach, and any docker work, must both be unreached.
 #[test]
 fn dispatch_mod_refuses_a_key_with_no_stored_record() {
     let store = TempDir::new().unwrap(); // empty store
     darkmux_cmd()
         .env("DARKMUX_MODS_DIR", store.path())
-        .args(["dispatch", "health-research", "--mod", "mod-1-nope", "smoke"])
+        .args(["dispatch", "coder", "--mod", "mod-1-nope", "smoke"])
         .assert()
         .failure()
         .stderr(
             predicate::str::contains("no mod mod-1-nope")
                 .and(predicate::str::contains("darkmux mod list"))
-                .and(predicate::str::contains("requires operator acknowledgment").not())
+                .and(predicate::str::contains("claims a LOCAL model seat").not())
                 .and(predicate::str::contains("docker").not()),
         );
 
     // A key that could escape the store is refused as a key, never read.
     darkmux_cmd()
         .env("DARKMUX_MODS_DIR", store.path())
-        .args(["dispatch", "health-research", "--mod", "../etc", "smoke"])
+        .args(["dispatch", "coder", "--mod", "../etc", "smoke"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("is not a mod key"));
 }
 
 /// (#2265) A key that DOES address a stored finding is loaded and the dispatch
-/// proceeds — proven at the ACK gate, which bails before any Docker work.
+/// proceeds — proven at the scheduler's seat classification (no profile
+/// registry in the scratch home, so the step's placement cannot resolve),
+/// which runs before any Docker work.
 /// `--finding` is repeatable, and both keys resolve.
 #[test]
 fn dispatch_finding_loads_a_stored_record_and_proceeds() {
@@ -3063,18 +3039,15 @@ fn dispatch_finding_loads_a_stored_record_and_proceeds() {
         )
         .unwrap();
     }
-    let ack_dir = TempDir::new().unwrap();
     darkmux_cmd()
         .env("DARKMUX_FINDINGS_DIR", store.path())
-        .env("DARKMUX_ACK_DIR", ack_dir.path())
         .args([
-            "dispatch", "health-research", "--finding", "sess-x/1", "--finding", "sess-y/2",
-            "smoke",
+            "dispatch", "coder", "--finding", "sess-x/1", "--finding", "sess-y/2", "smoke",
         ])
         .assert()
         .failure()
         .stderr(
-            predicate::str::contains("requires operator acknowledgment")
+            predicate::str::contains("claims a LOCAL model seat but its placement could not be resolved")
                 .and(predicate::str::contains("no finding").not()),
         );
 }
@@ -3086,7 +3059,7 @@ fn dispatch_finding_loads_a_stored_record_and_proceeds() {
 /// start` FLOW RECORD that dispatch actually wrote.
 ///
 /// Both halves matter and neither was covered before. The earlier CLI tests
-/// asserted only that a good key reaches the ACK gate and a bad one is refused
+/// asserted only that a good key reaches the seat classification and a bad one is refused
 /// — nothing about the brief or the record — so the append could be deleted
 /// and they stayed green, and the crew-of-one graph could drop the keys (it
 /// did) with nothing to catch it. Here: `prompt_chars` must exceed the
@@ -3145,7 +3118,7 @@ fn dispatch_finding_reaches_the_flow_record_with_the_brief_and_the_keys() {
     .unwrap();
 
     let message = "fix it";
-    // `dialectic-judge` is TOOL-LESS, so this takes the light single-shot
+    // `pr-reviewer` is TOOL-LESS, so this takes the light single-shot
     // hosted path (a host `curl` to the stub) rather than a
     // `darkmux-runtime` container — no Docker, no image, no model.
     darkmux_cmd()
@@ -3155,7 +3128,7 @@ fn dispatch_finding_reaches_the_flow_record_with_the_brief_and_the_keys() {
         .env("DARKMUX_MODS_DIR", mods.path())
         .env("DARKMUX_REDIS_URL", "")
         .args([
-            "dispatch", "dialectic-judge", "--finding", "sess-pin/4", "--mod", "mod-9-pin",
+            "dispatch", "pr-reviewer", "--finding", "sess-pin/4", "--mod", "mod-9-pin",
             "--skip-preflight", message,
         ])
         .assert()
@@ -3233,7 +3206,7 @@ fn dispatch_finding_reaches_the_flow_record_with_the_brief_and_the_keys() {
 /// (#2295 review, CRITICAL 1) The refs cannot ride the fleet work queue — its
 /// job shape has no field for them and the peer's stores are its own — so a
 /// remote `--machine` dispatch that names one is refused rather than routed
-/// with its blocks silently missing. Refused BEFORE the ack gate, like every
+/// with its blocks silently missing. Refused BEFORE the seat classification, like every
 /// other brief-ref refusal.
 #[test]
 fn dispatch_refuses_a_record_ref_routed_to_another_machine() {
@@ -3256,14 +3229,14 @@ fn dispatch_refuses_a_record_ref_routed_to_another_machine() {
         .env("DARKMUX_FINDINGS_DIR", store.path())
         .env("DARKMUX_MACHINE_ID", "this-one")
         .args([
-            "dispatch", "health-research", "--finding", "sess-r/1", "--profile", "host@some-other-mac",
+            "dispatch", "coder", "--finding", "sess-r/1", "--profile", "host@some-other-mac",
             "smoke",
         ])
         .assert()
         .failure()
         .stderr(
             predicate::str::contains("cannot be routed to another machine")
-                .and(predicate::str::contains("requires operator acknowledgment").not()),
+                .and(predicate::str::contains("claims a LOCAL model seat").not()),
         );
 }
 
@@ -3289,63 +3262,54 @@ fn dispatch_refuses_a_malformed_profile_address() {
         .stderr(predicate::str::contains("profile address `host@stu.dio`").and(predicate::str::contains("contains '.'")));
 }
 
-/// (#1426) The POSITIONAL message reaches the dispatch path. `health-research`
-/// is licensed-adjacent, so its ACK gate bails BEFORE any Docker work — a
-/// CI-safe way to prove the positional message was accepted and routed without
-/// a real model.
+/// (#1426) The POSITIONAL message reaches the dispatch path. With no profile
+/// registry in the scratch home, the step's seat cannot resolve, which is
+/// reported before any Docker work: a CI-safe way to prove the positional message was
+/// accepted and routed without a real model.
 #[test]
-fn dispatch_positional_message_reaches_ack_gate() {
-    let ack_dir = TempDir::new().unwrap(); // empty — no prior ack on file
+fn dispatch_positional_message_reaches_the_seat_classification() {
     darkmux_cmd()
-        .env("DARKMUX_ACK_DIR", ack_dir.path())
-        .args(["dispatch", "health-research", "smoke"])
+        .args(["dispatch", "coder", "smoke"])
         .assert()
         .failure()
         .stderr(
-            predicate::str::contains("requires operator acknowledgment")
-                // The positional was consumed — no "no message given" guard,
-                // no docker.
+            predicate::str::contains("claims a LOCAL model seat but its placement could not be resolved")
+                // The positional was consumed: no "no message given" guard.
                 .and(predicate::str::contains("no message given").not())
-                .and(predicate::str::contains("runtime=internal").not())
-                .and(predicate::str::contains("docker").not()),
+                .and(predicate::str::contains("docker run").not()),
         );
 }
 
 /// (#1426) When the positional MESSAGE is omitted, the message is read from
 /// stdin (pipe composition: `git diff | darkmux dispatch pr-reviewer`). Piping
-/// a message to `health-research` proves the stdin channel drives the message
-/// (no TTY-absent error fires) and the dispatch reaches the ACK gate, which
-/// bails before Docker. CI-safe: `write_stdin` makes stdin a non-TTY pipe, the
+/// a message to `coder` proves the stdin channel drives the message (no
+/// TTY-absent error fires) and the dispatch reaches the seat classification,
+/// which runs before Docker. CI-safe: `write_stdin` makes stdin a non-TTY pipe, the
 /// path the byte-faithful `read_to_string` consumes.
 #[test]
-fn dispatch_stdin_message_reaches_ack_gate() {
-    let ack_dir = TempDir::new().unwrap();
+fn dispatch_stdin_message_reaches_the_seat_classification() {
     darkmux_cmd()
-        .env("DARKMUX_ACK_DIR", ack_dir.path())
-        .args(["dispatch", "health-research"])
+        .args(["dispatch", "coder"])
         .write_stdin("smoke from stdin")
         .assert()
         .failure()
         .stderr(
-            predicate::str::contains("requires operator acknowledgment")
+            predicate::str::contains("claims a LOCAL model seat but its placement could not be resolved")
                 // The TTY-absent guard did NOT fire (stdin was a pipe with
                 // content), and no docker work happened.
                 .and(predicate::str::contains("no message given").not())
-                .and(predicate::str::contains("runtime=internal").not())
-                .and(predicate::str::contains("docker").not()),
+                .and(predicate::str::contains("docker run").not()),
         );
 }
 
 /// (#1426) Empty piped stdin bails LOUDLY with its own error — distinct from
 /// the terminal-guard's "no message given" text — instead of dispatching a
 /// blank brief (an empty `git diff |` is the most common accident). The
-/// dispatch never starts: no ACK-gate text, no docker.
+/// dispatch never starts: no model selection, no docker.
 #[test]
 fn dispatch_empty_stdin_bails_loudly() {
-    let ack_dir = TempDir::new().unwrap();
     darkmux_cmd()
-        .env("DARKMUX_ACK_DIR", ack_dir.path())
-        .args(["dispatch", "health-research"])
+        .args(["dispatch", "coder"])
         .write_stdin("") // empty pipe → loud bail, not a blank dispatch
         .assert()
         .failure()
@@ -3354,7 +3318,7 @@ fn dispatch_empty_stdin_bails_loudly() {
                 // Distinct from the TTY-absent guard's error.
                 .and(predicate::str::contains("no message given").not())
                 // Bailed before any dispatch machinery.
-                .and(predicate::str::contains("requires operator acknowledgment").not())
+                .and(predicate::str::contains("claims a LOCAL model seat").not())
                 .and(predicate::str::contains("docker").not()),
         );
 }
@@ -3362,19 +3326,17 @@ fn dispatch_empty_stdin_bails_loudly() {
 /// (#1426) A whitespace-only pipe (`echo |` produces a lone "\n" — the second
 /// most common accident) gets the same loud empty-stdin bail. The emptiness
 /// check trims for the CHECK only; a message with real content is still
-/// delivered byte-faithfully (covered by dispatch_stdin_message_reaches_ack_gate).
+/// delivered byte-faithfully (covered by dispatch_stdin_message_reaches_the_seat_classification).
 #[test]
 fn dispatch_whitespace_only_stdin_bails_loudly() {
-    let ack_dir = TempDir::new().unwrap();
     darkmux_cmd()
-        .env("DARKMUX_ACK_DIR", ack_dir.path())
-        .args(["dispatch", "health-research"])
+        .args(["dispatch", "coder"])
         .write_stdin("\n")
         .assert()
         .failure()
         .stderr(
             predicate::str::contains("stdin was empty")
-                .and(predicate::str::contains("requires operator acknowledgment").not()),
+                .and(predicate::str::contains("claims a LOCAL model seat").not()),
         );
 }
 
@@ -3402,30 +3364,34 @@ fn dispatch_empty_message_file_bails_loudly() {
         );
 }
 
-/// (#1405 gate remediation, relocated to top-level `dispatch` in #1426) The
-/// licensed-adjacent ACK gate fires on the internal dispatch path BEFORE any
-/// Docker work. This pins the moved-but-unwired regression class structurally:
-/// a non-TTY dispatch of `health-research` with no prior ack must bail at the
-/// gate — no Docker preflight, no container spawn — so the test needs no
-/// Docker and is CI-safe.
+/// (#3036) The persona roles (health, legal, fitness, trip, logistics,
+/// editing, lab-manager) were removed in 5.0, so a dispatch to one of their
+/// ids fails with the ordinary unknown-role error, never a leftover consent
+/// prompt. Run against a runtime image the fake docker reports as current, so
+/// the dispatch gets as far as resolving the role.
 #[test]
-fn dispatch_licensed_adjacent_role_bails_at_ack_gate_before_docker() {
-    let ack_dir = TempDir::new().unwrap(); // empty — no prior ack on file
-    darkmux_cmd()
-        .env("DARKMUX_ACK_DIR", ack_dir.path())
-        .args(["dispatch", "health-research", "smoke"])
-        // assert_cmd pipes stdin (not a TTY), so the gate's non-interactive
-        // arm bails rather than prompting for ACKNOWLEDGE.
-        .assert()
-        .failure()
-        .stderr(
-            predicate::str::contains("requires operator acknowledgment")
-                // Bailed BEFORE the Docker preflight / container spawn: the
-                // "runtime=internal — image:" line prints only after the
-                // gate, and no docker error can have surfaced.
-                .and(predicate::str::contains("runtime=internal").not())
-                .and(predicate::str::contains("docker").not()),
-        );
+fn dispatch_to_a_removed_persona_role_fails_with_the_unknown_role_error() {
+    let tmp = TempDir::new().unwrap();
+    let (fake_bin, _log) = fake_docker_for_runtime_image(
+        tmp.path(),
+        &[("darkmux-runtime:latest", env!("CARGO_PKG_VERSION"))],
+    );
+    for role in [
+        "fitness-coach",
+        "health-research",
+        "legal-research",
+        "trip-researcher",
+        "logistics-coordinator",
+        "voice-editor",
+        "lab-manager",
+    ] {
+        dispatch_role_with_fake_docker(tmp.path(), &fake_bin, role, &["--skip-preflight"])
+            .failure()
+            .stderr(
+                predicate::str::contains(format!("role not found: {role}"))
+                    .and(predicate::str::contains("acknowledg").not()),
+            );
+    }
 }
 
 
@@ -3498,11 +3464,9 @@ fn dispatch_host_side_unset_compactor_disclosure_fires_on_the_local_path() {
     );
     let fake_lms = fake_bin.join("lms");
 
-    let ack_dir = TempDir::new().unwrap();
     let real_path = std::env::var("PATH").unwrap_or_default();
 
     darkmux_cmd()
-        .env("DARKMUX_ACK_DIR", ack_dir.path())
         .env("DARKMUX_PROFILES", &profiles_path)
         .env("DARKMUX_LMS_BIN", &fake_lms)
         .env("FAKE_DOCKER_STATE_DIR", tmp.path())
@@ -3609,20 +3573,26 @@ fn dispatch_with_fake_docker(
     fake_bin: &std::path::Path,
     extra: &[&str],
 ) -> assert_cmd::assert::Assert {
+    dispatch_role_with_fake_docker(tmp, fake_bin, "coder", extra)
+}
+
+fn dispatch_role_with_fake_docker(
+    tmp: &std::path::Path,
+    fake_bin: &std::path::Path,
+    role: &str,
+    extra: &[&str],
+) -> assert_cmd::assert::Assert {
     let profiles_path = tmp.join("profiles.json");
     fs::write(
         &profiles_path,
         r#"{"profiles":{"fast":{"models":[{"id":"model-a","n_ctx":32000}]}},"default_profile":"fast"}"#,
     )
     .unwrap();
-    let ack_dir = tmp.join("ack");
-    fs::create_dir_all(&ack_dir).unwrap();
     let real_path = std::env::var("PATH").unwrap_or_default();
-    let mut args = vec!["dispatch", "coder"];
+    let mut args = vec!["dispatch", role];
     args.extend_from_slice(extra);
     args.push("smoke");
     darkmux_cmd()
-        .env("DARKMUX_ACK_DIR", &ack_dir)
         .env("DARKMUX_PROFILES", &profiles_path)
         .env("DARKMUX_LMS_BIN", fake_bin.join("lms"))
         .env("FAKE_DOCKER_STATE_DIR", tmp)
@@ -4295,11 +4265,11 @@ fn serve_sigterm_reaps_the_fleet_runners_curl_child() {
 
     let job = darkmux_fleet::build_work_job(
         "cli-test-serve-node".to_string(),
-        "dialectic-judge".to_string(),
+        "pr-reviewer".to_string(),
         "hang please".to_string(),
         darkmux_types::session_id::SessionId::adhoc(
             darkmux_types::session_id::RunId::mission("cli-test").unwrap(),
-            "dialectic-judge",
+            "pr-reviewer",
             "cli-test-serve-sigterm-session",
         ),
         None,
@@ -4402,7 +4372,7 @@ fn serve_no_longer_takes_work_off_the_redis_queue() {
     // anything else on the network, would XADD.
     let client = redis::Client::open(redis_url.as_str()).unwrap();
     let mut conn = client.get_connection().unwrap();
-    let record = r#"{"role_id":"dialectic-judge","message":"hang please","session_id":"s-queue","timeout_seconds":60,"published_at_unix_ms":1,"attempt":1}"#;
+    let record = r#"{"role_id":"pr-reviewer","message":"hang please","session_id":"s-queue","timeout_seconds":60,"published_at_unix_ms":1,"attempt":1}"#;
     let _: String = redis::cmd("XADD")
         .arg("darkmux:work")
         .arg("*")
@@ -4430,7 +4400,7 @@ fn serve_no_longer_takes_work_off_the_redis_queue() {
 /// PATH (its `status` reports this machine at its own non-loopback address,
 /// `whois` of that address names a PEER node, `nPEERTEST`), then the
 /// allow-list (`config.json`) trusting that node for profile `hang` and role
-/// `dialectic-judge`. `nofile` pins the daemon's open-file limit (soft AND
+/// `pr-reviewer`. `nofile` pins the daemon's open-file limit (soft AND
 /// hard) before exec. `None` when the machine has no non-loopback address.
 struct FleetDaemon {
     child: DirectChildGuard,
@@ -4459,7 +4429,7 @@ fn spawn_fleet_daemon(profiles_json: &str, nofile: Option<u64>) -> Option<FleetD
     fs::create_dir_all(&flows_dir).unwrap();
     fs::write(
         darkmux_home.join("config.json"),
-        r#"{"fleet":{"accept_work":{"peer-test":{"node_id":"nPEERTEST","profiles":["hang"],"roles":["dialectic-judge"]}}}}"#,
+        r#"{"fleet":{"accept_work":{"peer-test":{"node_id":"nPEERTEST","profiles":["hang"],"roles":["pr-reviewer"]}}}}"#,
     )
     .unwrap();
     let fake_bin = darkmux_home.join("fake-bin");
@@ -4786,7 +4756,7 @@ fn mission_launch_generic_sigterm_mid_dispatch_finalizes_and_reaps_curl() {
 
     let config_dir = home.path().join("mission-configs");
     fs::create_dir_all(&config_dir).unwrap();
-    // (#2131) `dialectic-judge` is deliberately TOOL-LESS
+    // (#2131) `pr-reviewer` is deliberately TOOL-LESS
     // (`tool_palette.allow: []`) — `dispatch_internal.rs` routes a
     // tool-less role's remote dispatch through the light single-shot
     // HOSTED path (a plain host-side `curl`, already `child_registry`-
@@ -4805,7 +4775,7 @@ fn mission_launch_generic_sigterm_mid_dispatch_finalizes_and_reaps_curl() {
                 "steps": [{
                     "id": "s1",
                     "kind": "dispatch.internal",
-                    "config": { "role_id": "dialectic-judge", "message": "hang please" }
+                    "config": { "role_id": "pr-reviewer", "message": "hang please" }
                 }]
             }]
         }]
@@ -4924,7 +4894,7 @@ fn mission_launch_wall_clock_bound_self_terminates_and_renders_degraded() {
                 "steps": [{
                     "id": "s1",
                     "kind": "dispatch.internal",
-                    "config": { "role_id": "dialectic-judge", "message": "hang please" }
+                    "config": { "role_id": "pr-reviewer", "message": "hang please" }
                 }]
             }]
         }]
@@ -5036,7 +5006,7 @@ fn dispatch_sigterm_mid_dispatch_finalizes_and_reaps_curl() {
     let profiles_path = home.path().join("profiles.json");
     fs::write(&profiles_path, hanging_endpoint_profiles_json(stub.port)).unwrap();
 
-    // (#2262, matching #2131's own test) `dialectic-judge` is a built-in,
+    // (#2262, matching #2131's own test) `pr-reviewer` is a built-in,
     // deliberately TOOL-LESS role (`tool_palette.allow: []`) — so
     // `dispatch_internal.rs` routes its remote dispatch through the light
     // single-shot HOSTED path (a plain host-side `curl`, already
@@ -5062,11 +5032,11 @@ fn dispatch_sigterm_mid_dispatch_finalizes_and_reaps_curl() {
         .env("DARKMUX_HOME", home.path())
         .env("DARKMUX_FLOWS_DIR", flows.path())
         .env("DARKMUX_PROFILES", &profiles_path)
-        .args(["dispatch", "dialectic-judge", "hang please", "--timeout", "60"])
+        .args(["dispatch", "pr-reviewer", "hang please", "--timeout", "60"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::from(stderr_file))
         .spawn()
-        .expect("spawning darkmux dispatch dialectic-judge");
+        .expect("spawning darkmux dispatch pr-reviewer");
     let pid = child.id();
 
     assert!(
@@ -5204,7 +5174,7 @@ fn lab_run_sigterm_mid_dispatch_finalizes_lifecycle_and_reaps_curl() {
     fs::write(&profiles_path, hanging_endpoint_profiles_json(stub.port)).unwrap();
 
     // A user-tier workload (the `prompt` provider — no sandbox, no Docker
-    // seed) bound to the same tool-less `dialectic-judge` role the
+    // seed) bound to the same tool-less `pr-reviewer` role the
     // `dispatch` proof above uses, so this run ALSO takes the light
     // single-shot HOSTED `curl` path rather than a container.
     let workloads_dir = home.path().join("workloads");
@@ -5214,7 +5184,7 @@ fn lab_run_sigterm_mid_dispatch_finalizes_lifecycle_and_reaps_curl() {
             "id": "sigterm-lab-hang-test",
             "provider": "prompt",
             "description": "SIGTERM lab-run regression fixture (#2262)",
-            "role": "dialectic-judge",
+            "role": "pr-reviewer",
             "prompt": "hang please"
         }
     }"#;
@@ -5599,7 +5569,7 @@ fn start_route_decision_stub(command: &str) -> u16 {
 /// reaches `finalized` (never left `active`), with its phase `abandoned`
 /// (never left `active` either). Two DIFFERENT paths keep the routing call
 /// (the utility binding over the LMStudio URL, #2914) and the launched
-/// dispatch (`dialectic-judge`, pinned via the step's OWN `profile_name`)
+/// dispatch (`pr-reviewer`, pinned via the step's OWN `profile_name`)
 /// pointed at two DIFFERENT stub servers, so the router call can answer
 /// immediately (routing this test's message to the launch target) while the
 /// LAUNCHED dispatch hangs (giving this test a real mid-dispatch window to
@@ -5644,7 +5614,7 @@ fn radio_sigterm_forwards_to_the_launched_child_which_finalizes() {
     // `Launch` (so it spawns a `mission launch` subprocess, not an
     // in-process ephemeral run) by having a `dispatch.internal` step — the
     // SAME shape `mission_launch_generic_sigterm_mid_dispatch_finalizes_and_reaps_curl`
-    // above proves finalizes correctly on a direct SIGTERM. `dialectic-judge`
+    // above proves finalizes correctly on a direct SIGTERM. `pr-reviewer`
     // is tool-less, so it takes the light single-shot hosted `curl` path
     // (no Docker, no image). Its OWN `profile_name` pins it to the "hang"
     // stub, independent of `default_profile` (which the routing call uses).
@@ -5660,7 +5630,7 @@ fn radio_sigterm_forwards_to_the_launched_child_which_finalizes() {
                 "steps": [{
                     "id": "s1",
                     "kind": "dispatch.internal",
-                    "config": { "role_id": "dialectic-judge", "message": "hang please", "profile_name": "hang-stub" }
+                    "config": { "role_id": "pr-reviewer", "message": "hang please", "profile_name": "hang-stub" }
                 }]
             }]
         }]
@@ -5850,7 +5820,7 @@ fn spawn_on_a_pty(cmd: &mut std::process::Command, typed: &[u8]) -> (std::proces
 /// One `darkmux radio "<text>"` invocation that routes to `mission launch
 /// <config_id>` (the routing seat on the utility binding, answered by the
 /// route stub standing in as LMStudio, #2914), is NEVER signaled, and runs
-/// to natural completion against `dispatch_port` (dialectic-judge's own
+/// to natural completion against `dispatch_port` (pr-reviewer's own
 /// `profile_name` pin, same shape as the SIGTERM test above). Returns
 /// radio's own exit status.
 fn run_radio_launch_to_completion(config_id: &str, dispatch_port: u16) -> (std::process::ExitStatus, TempDir) {
@@ -5897,7 +5867,7 @@ fn run_radio_launch_to_completion(config_id: &str, dispatch_port: u16) -> (std::
                     "steps": [{{
                         "id": "s1",
                         "kind": "dispatch.internal",
-                        "config": {{ "role_id": "dialectic-judge", "message": "hi", "profile_name": "dispatch-stub" }}
+                        "config": {{ "role_id": "pr-reviewer", "message": "hi", "profile_name": "dispatch-stub" }}
                     }}]
                 }}]
             }}]
@@ -6730,24 +6700,6 @@ fn mission_launch_run_on_unknown_value_refused_before_minting() {
         "a refused run_on must never mint a mission — no missions/ entry may exist"
     );
 }
-
-// ─── review-bench --funnel flag plumbing (#1222 Phase B packet 7) ─────────
-//
-// The funnel condition's real dispatch path needs a live LMStudio + a real
-// crew registry, so these tests stay at the clap-plumbing layer: the flag
-// conflicts and `requires` relationships fail loud BEFORE any dispatch is
-// attempted. A live corpus run is maintainer-executed (see the doc comment
-// on `run_funnel_case` in `crates/darkmux-lab/src/lab/review_bench.rs`).
-
-// ─── review-bench --funnel end-to-end, offline (#1222 Phase B coverage) ───
-//
-// A funnel run whose bundler produces ZERO bundles short-circuits to a
-// degenerate envelope BEFORE any probe/judge dispatch — so a full
-// `review-bench --funnel` invocation over a non-TypeScript diff corpus is
-// end-to-end testable with no LMStudio and no crew models loaded. These
-// tests exercise the real preflight (registry load + crew resolution +
-// role-prompt resolution), the per-case funnel branch, the console line,
-// and the scores.json/funnels.json artifact pair.
 
 // ── `darkmux radio` (#1698 Packet A) ─────────────────────────────────────
 //
@@ -13042,7 +12994,7 @@ fn radio_refuses_bad_enum_config_before_routing() {
 // paths that need a dispatch: `lab loop` (every override flag, the A/B
 // arms), `lab run` and its recorded-run sub-verbs, `characterize`, `tune`.
 // No model and no Docker: each workload is a `prompt` workload bound to the
-// tool-less `dialectic-judge` role, staffed by a `RespondingStubServer`
+// tool-less `pr-reviewer` role, staffed by a `RespondingStubServer`
 // endpoint, so the dispatch is a host `curl` to the stub.
 
 /// Marker a recorded lesson carries into the `--ab` treatment arm's prompt.
@@ -13074,7 +13026,7 @@ impl LabStub {
                 "id": id,
                 "provider": "prompt",
                 "description": "lab_cli characterization fixture",
-                "role": "dialectic-judge",
+                "role": "pr-reviewer",
                 "prompt": "say ack"
             });
             if !verify.is_null() {
@@ -13530,7 +13482,7 @@ fn lab_verbs_exit_130_on_sigterm_mid_dispatch() {
         fs::create_dir_all(home.path().join("workloads")).unwrap();
         fs::write(
             home.path().join("workloads").join("sigterm-verb-hang.json"),
-            r#"{"workload":{"id":"sigterm-verb-hang","provider":"prompt","role":"dialectic-judge","prompt":"hang"}}"#,
+            r#"{"workload":{"id":"sigterm-verb-hang","provider":"prompt","role":"pr-reviewer","prompt":"hang"}}"#,
         )
         .unwrap();
         let stderr_path = home.path().join("stderr.log");
@@ -13583,31 +13535,6 @@ fn lab_workload_list_prints_ids_one_per_line() {
     }
 }
 
-/// `lab eval` resolves its `--cases-dir` before any dispatch: an empty dir
-/// and a missing one are each refused by name.
-#[test]
-fn lab_eval_refuses_an_empty_or_missing_cases_dir() {
-    let lab = LabStub::new(&RespondingStubServer::start());
-    let cases = lab.home.path().join("cases");
-    fs::create_dir_all(&cases).unwrap();
-    lab.cmd()
-        .args(["lab", "eval", "--profiles-file", lab.profiles(), "--cases-dir"])
-        .arg(&cases)
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(format!(
-            "no cases (*.label.json + sibling *.diff) found in {}",
-            cases.display()
-        )));
-    let missing = lab.home.path().join("nope");
-    lab.cmd()
-        .args(["lab", "eval", "--mode", "dialectic", "--cases-dir"])
-        .arg(&missing)
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(format!("reading cases dir {}", missing.display())));
-}
-
 /// (#2463) SIGTERM mid-dispatch for a lab verb other than `lab run`: the
 /// verb must have armed the signal handlers, so the blocked `curl` is reaped,
 /// the process exits non-zero, and the run's `lifecycle.json` is finalized
@@ -13626,7 +13553,7 @@ fn assert_lab_verb_sigterm_finalizes_interrupted(verb_args: &[&str], label: &str
         workloads_dir.join("sigterm-lab-verb.json"),
         r#"{"workload": {"id": "sigterm-lab-verb", "provider": "prompt",
             "description": "SIGTERM lab-verb fixture (#2463)",
-            "role": "dialectic-judge", "prompt": "hang please"}}"#,
+            "role": "pr-reviewer", "prompt": "hang please"}}"#,
     )
     .unwrap();
 

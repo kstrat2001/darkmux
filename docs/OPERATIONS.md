@@ -351,4 +351,3 @@ The case for darkmux: **once you accept that static configs leave performance on
 **Aspirational (later):**
 
 - 🚧 Plugin system for community-contributed providers, workloads, role manifests
-- 🚧 Per-role bake-offs for non-SWE roles (trip-researcher, health-research, legal-research, …)

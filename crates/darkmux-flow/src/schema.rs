@@ -1215,12 +1215,10 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.0.0";
 //           `dispatch.start`), so no consumer ever sees an orphaned `started`.
 //           No struct/field change — same `payload` blob every other richer
 //           action already uses. Additive: older readers ignore the unknown
-//           actions. Emitted through TWO sinks depending on caller
-//           (lab-vs-fleet scope boundary): `darkmux mission launch review` writes to
-//           the real flow stream via this crate; `darkmux lab review-bench
-//           --funnel` writes to a per-run-local `funnel-events.jsonl` file
-//           instead, never this stream — so existing AuditFileSink chains are
-//           unaffected either way.
+//           actions. `darkmux mission launch review` writes them to the real
+//           flow stream via this crate (the per-run-local
+//           `funnel-events.jsonl` sink of the removed `lab eval --funnel`
+//           mode is gone), so existing AuditFileSink chains are unaffected.
 //   (code-internal, no FLOW_SCHEMA_VERSION bump) — a `dispatch complete`
 //           record's payload now carries `endpoint` alongside `remote_tokens`
 //           whenever the dispatch involved a remote-endpoint seat (#1230

@@ -21,9 +21,7 @@ use super::bundle::BundleSkipReport;
 use darkmux_crew::remote_budget::RemoteBudgetRecord;
 use darkmux_crew::run_outcome::RunOutcome;
 // (#1877 item 2) The run-record + run-observability substrate lives in
-// `darkmux-crew`; the run emitter aliases keep their review-era names so
-// every external `impl ReviewEmitter for X` (`review_bench.rs`) keeps
-// compiling unchanged.
+// `darkmux-crew`; the run emitter aliases keep their review-era names.
 pub use darkmux_crew::run_obs::{NullEmitter, RunEmitter as ReviewEmitter};
 pub use darkmux_crew::run_record::{
     seat_identifier, staffing_snapshot, MemberRecord, SeatStaffingSnapshot, StaffingSnapshot, StepRecord,

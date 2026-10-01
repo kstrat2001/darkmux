@@ -4408,7 +4408,7 @@ fn run_with_sleeper(
                 // (#1221) The cap-cliff: length-finish WITH partial content
                 // (or malformed tool calls) at exactly the per-call cap.
                 // Pre-fix this was a hard error that killed the WHOLE
-                // dispatch — dialectic shakedown-2 (#1222): a prosecutor
+                // dispatch (#1222 shakedown): a prosecutor
                 // burned the entire raised budget in one runaway turn and
                 // the dispatch died, discarding seven prior productive
                 // turns. A cap hit is recoverable exactly like the empty
@@ -13375,7 +13375,7 @@ mod tests {
 
     /// (#1221) The cap-cliff: length-finish with PARTIAL content at exactly
     /// the per-call cap must NOT kill the dispatch (pre-fix it returned Err,
-    /// discarding every prior productive turn — dialectic shakedown-2's
+    /// discarding every prior productive turn — the #1222 shakedown's
     /// failure mode). It routes through the stall recovery: drop + nudge +
     /// bounded budget, ending in a clean EscalationTriggered outcome when
     /// the mock repeats the shape past the budget.

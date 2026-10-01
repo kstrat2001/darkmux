@@ -141,21 +141,6 @@ const RETIRED: &[RetiredVerb] = &[
                  of a role execution (`darkmux dispatch` prints it), not a session id.",
     },
     RetiredVerb {
-        words: &["lab", "eval"],
-        flag: Some("--freeform"),
-        remedy: "The three condition flags are one choice: use `darkmux lab eval --mode freeform`.",
-    },
-    RetiredVerb {
-        words: &["lab", "eval"],
-        flag: Some("--agentic"),
-        remedy: "The three condition flags are one choice: use `darkmux lab eval --mode agentic`.",
-    },
-    RetiredVerb {
-        words: &["lab", "eval"],
-        flag: Some("--dialectic"),
-        remedy: "The three condition flags are one choice: use `darkmux lab eval --mode dialectic`.",
-    },
-    RetiredVerb {
         words: &["lab", "run"],
         flag: Some("--runs"),
         remedy: "`run` names the umbrella over mission, dispatch and lab runs, not a repeat count: \
@@ -180,6 +165,16 @@ const RETIRED: &[RetiredVerb] = &[
                  `darkmux mission status --named`.",
     },
 ];
+
+/// Spellings removed in 5.0, kept apart from [`RETIRED`] so the refusal names
+/// the release that removed each.
+const RETIRED_5_0: &[RetiredVerb] = &[RetiredVerb {
+    words: &["lab", "eval"],
+    flag: None,
+    remedy: "The role-eval harness and its corpus are gone (#3036). To measure a model on a task, \
+             write a workload and run it with `darkmux lab run <workload>`; to review a diff, \
+             launch the `review` mission with `darkmux mission launch review`.",
+}];
 
 impl RetiredVerb {
     fn matches(&self, args: &[String]) -> bool {
@@ -209,10 +204,12 @@ impl RetiredVerb {
 /// The refusal for a command line (`args` without the program name) that
 /// names a retired spelling, or `None` when it names none.
 pub(crate) fn refusal(args: &[String]) -> Option<String> {
-    RETIRED
-        .iter()
-        .find(|r| r.matches(args))
-        .map(|r| format!("`{}` was removed in 4.0. {}", r.spelling(), r.remedy))
+    [("4.0", RETIRED), ("5.0", RETIRED_5_0)].into_iter().find_map(|(release, table)| {
+        table
+            .iter()
+            .find(|r| r.matches(args))
+            .map(|r| format!("`{}` was removed in {release}. {}", r.spelling(), r.remedy))
+    })
 }
 
 #[cfg(test)]
@@ -250,6 +247,23 @@ mod tests {
         assert!(refusal(&args(&["dispatch", "coder", "--", "--phase-id", "p"])).is_none());
     }
 
+    /// (#3036) `lab eval` is refused whole, with any flags or positional it
+    /// used to take, naming the 5.0 release and both replacements.
+    #[test]
+    fn lab_eval_is_refused_whole_naming_its_replacements() {
+        for a in [
+            args(&["lab", "eval"]),
+            args(&["lab", "eval", "pr-reviewer", "--mode", "agentic", "--workdirs", "w"]),
+            args(&["lab", "eval", "--profile", "p"]),
+        ] {
+            let msg = refusal(&a).unwrap_or_else(|| panic!("{a:?} was not refused"));
+            // drift-guard:allow lab eval — asserts the refusal names the retired verb
+            assert!(msg.contains("`darkmux lab eval` was removed in 5.0"), "{msg}");
+            assert!(msg.contains("darkmux lab run <workload>"), "{msg}");
+            assert!(msg.contains("darkmux mission launch review"), "{msg}");
+        }
+    }
+
     #[test]
     fn the_finding_list_dispatch_flag_names_execution() {
         let msg = refusal(&args(&["finding", "list", "--dispatch", "k"])).unwrap();
@@ -268,9 +282,6 @@ mod tests {
         (&["flow", "tier-decision", "--session-id", "s"], "darkmux flow tier-decision --session-id", "--execution"),  // drift-guard:allow retired flag: asserts the refusal names it
         (&["flow", "tail", "--session", "s"], "darkmux flow tail --session", "--execution"),  // drift-guard:allow retired flag: asserts the refusal names it
         (&["memory", "correction", "list", "--session", "s"], "darkmux memory correction list --session", "--execution"),  // drift-guard:allow retired flag: asserts the refusal names it
-        (&["lab", "eval", "--freeform"], "darkmux lab eval --freeform", "--mode freeform"),  // drift-guard:allow retired flag: asserts the refusal names it
-        (&["lab", "eval", "pr-reviewer", "--agentic"], "darkmux lab eval --agentic", "--mode agentic"),  // drift-guard:allow retired flag: asserts the refusal names it
-        (&["lab", "eval", "--dialectic"], "darkmux lab eval --dialectic", "--mode dialectic"),  // drift-guard:allow retired flag: asserts the refusal names it
         (&["lab", "run", "quick-q", "--runs", "3"], "darkmux lab run --runs", "--repeat"),  // drift-guard:allow retired flag: asserts the refusal names it
         (&["lab", "tune", "quick-q", "--runs=3"], "darkmux lab tune --runs", "--repeat"),  // drift-guard:allow retired flag: asserts the refusal names it
         (&["mission", "status", "--missions"], "darkmux mission status --missions", "--named"),
@@ -297,8 +308,6 @@ mod tests {
             &["flow", "catch", "--text", "t", "--execution", "exec-1-2-3"],
             &["flow", "tail", "--execution", "exec-1-2-3"],
             &["memory", "correction", "list", "--execution", "exec-1-2-3"],
-            &["lab", "eval", "--mode", "freeform"],
-            &["lab", "eval", "--mode", "dialectic"],
             &["lab", "run", "quick-q", "--repeat", "3"],
             &["lab", "run", "quick-q", "-n", "3"],
             &["lab", "tune", "quick-q", "--repeat", "3"],

@@ -144,7 +144,7 @@ pub enum Scope {
     /// `darkmux mission launch` (and ACP panel launches, which call it).
     MissionLaunch,
     /// `darkmux lab run` and the lab verbs built on `lab::run::lab_run`
-    /// (`loop`, `characterize`, `tune`), plus `lab eval`.
+    /// (`loop`, `characterize`, `tune`).
     LabRun,
     /// Fleet work submission: the daemon's work-submission listener and the
     /// sending side, both of which build the identity provider.

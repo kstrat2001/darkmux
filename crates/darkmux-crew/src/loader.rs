@@ -35,46 +35,21 @@ pub(crate) const BUILTIN_ROLES: &[(&str, &str)] = &[
     // Tool-less PR reviewer for CI: reads a diff, emits cite-the-line JSON a
     // workflow posts as inline PR comments. Empty tool palette by design.
     ("pr-reviewer", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/pr-reviewer.json"))),
-    // (#1113) Agentic PR reviewer: repo checked out, read/exec tools, FREEFORM
-    // marker-block output (deliberately no output_schema — a grammar lock
-    // combined with tools makes the model skip tool-calling and fabricate).
-    // The marker parser survives in the lab's review-bench scoring
-    // (darkmux-lab review_bench.rs); the `pr-review render` CLI path that
-    // once turned markers into inline PR comments retired in #1426.
-    ("pr-reviewer-agentic", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/pr-reviewer-agentic.json"))),
-    // Sibling of pr-reviewer with the JSON grammar contract (output_schema)
-    // dropped — free-form prose review, MUST FIX:/CONSIDER: marked. Exists to
-    // measure whether the JSON contract itself suppresses recall vs framing
-    // (#1119 review-bench free-form mode); not wired into the CI workflow.
-    ("pr-reviewer-freeform", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/pr-reviewer-freeform.json"))),
     // (#1196) Tool-call bench harness role: the full runtime belt via an
     // EXPLICIT allow-list (empty palette = whole catalog, silently — the
     // #1197 bench-role rule) and NO output_schema (schema+tools makes the
     // model fabricate instead of calling tools; fabrication under the
     // freeform ANSWER:/BLOCKED: contract is what the bench measures).
     ("tool-bench", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/tool-bench.json"))),
-    // (#1222) Dialectic (adversarial) PR-review seats: prosecution builds the
-    // evidenced case against the change, defense answers each charge, judge
-    // rules on the presented record. Advocates are agentic (read/exec) with
-    // freeform marker contracts (no output_schema — grammar + tools makes the
-    // model fabricate); the judge is deliberately tool-less (rules on the
-    // record) with a reason-then-fenced-JSON contract.
-    ("dialectic-prosecutor", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/dialectic-prosecutor.json"))),
-    ("dialectic-defender", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/dialectic-defender.json"))),
-    ("dialectic-judge", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/dialectic-judge.json"))),
     // (#1222 Phase B packet 4 - #2418) Review seats (probe: k-draw,
     // per-bundle defect-finding; judge: double-confirm ruling on each
     // surviving flag) were removed here — they were the review funnel's
     // own seats, and the funnel itself (`build_review_graph`) was deleted
     // in #2310 P4d. The shipped `review` config stages its work through
-    // `reviewer`/`coder` instead. `dialectic-judge` remains as the
-    // general-purpose tool-less, no-output_schema, bail-with-explanation
-    // role these seats were modeled on.
+    // `reviewer`/`coder` instead.
     ("analyst", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/analyst.json"))),
-    ("voice-editor", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/voice-editor.json"))),
     ("design-reviewer", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/design-reviewer.json"))),
     ("test-designer", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/test-designer.json"))),
-    ("lab-manager", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/lab-manager.json"))),
     // (#1698 Packet A) The radio interpreter's ROUTING seat — bounded
     // classification over the currently advertised command catalog. See
     // `src/radio.rs`'s module doc for the two-seat receiver architecture.
@@ -83,27 +58,14 @@ pub(crate) const BUILTIN_ROLES: &[(&str, &str)] = &[
     // only when radio-router refuses. See `src/radio_answer.rs`'s module
     // doc.
     ("radio-host", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/radio-host.json"))),
-    // Non-SWE engagement roles (#141): trip planning, health, athletics, legal.
-    // Each is bounded — research/organize/structure only; no exec, no execution
-    // of bookings or commitments. Each prompt's opening lines name what the role
-    // is NOT, to keep cross-bounds questions from leaking into licensed-
-    // professional territory.
-    ("trip-researcher", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/trip-researcher.json"))),
-    ("logistics-coordinator", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/logistics-coordinator.json"))),
-    ("health-research", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/health-research.json"))),
-    ("fitness-coach", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/fitness-coach.json"))),
-    ("legal-research", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/legal-research.json"))),
 ];
 
 /// Skills compiled into the binary at build time. Filename = `<id>.json`.
 pub(crate) const BUILTIN_SKILLS: &[(&str, &str)] = &[
     ("coding", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/skills/coding.json"))),
-    ("documenting", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/skills/documenting.json"))),
     ("test-designing", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/skills/test-designing.json"))),
     ("code-reviewing", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/skills/code-reviewing.json"))),
     ("analyzing", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/skills/analyzing.json"))),
-    ("writing", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/skills/writing.json"))),
-    ("voice-editing", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/skills/voice-editing.json"))),
     ("lab-running", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/skills/lab-running.json"))),
     ("design-reviewing", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/skills/design-reviewing.json"))),
 ];
@@ -118,13 +80,7 @@ pub(crate) const BUILTIN_ROLE_PROMPTS: &[(&str, &str)] = &[
     ("crawler", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/crawler.md"))),
     ("reviewer", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/reviewer.md"))),
     ("pr-reviewer", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/pr-reviewer.md"))),
-    ("pr-reviewer-agentic", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/pr-reviewer-agentic.md"))),
-    ("pr-reviewer-freeform", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/pr-reviewer-freeform.md"))),
     ("tool-bench", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/tool-bench.md"))),
-    // (#1222) Dialectic PR-review seat prompts. Order mirrors BUILTIN_ROLES.
-    ("dialectic-prosecutor", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/dialectic-prosecutor.md"))),
-    ("dialectic-defender", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/dialectic-defender.md"))),
-    ("dialectic-judge", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/dialectic-judge.md"))),
     // (#1222 Phase B packet 4 - #2418) The review-probe/review-probe-{high,
     // mid,low}/review-judge/review-verify seat prompts were removed here
     // along with their role manifests above — the review funnel that
@@ -139,15 +95,7 @@ pub(crate) const BUILTIN_ROLE_PROMPTS: &[(&str, &str)] = &[
     ("radio-host", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/radio-host.md"))),
     ("analyst", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/analyst.md"))),
     ("design-reviewer", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/design-reviewer.md"))),
-    ("lab-manager", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/lab-manager.md"))),
     ("test-designer", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/test-designer.md"))),
-    ("voice-editor", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/voice-editor.md"))),
-    // Non-SWE engagement roles (#141). Order mirrors BUILTIN_ROLES.
-    ("trip-researcher", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/trip-researcher.md"))),
-    ("logistics-coordinator", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/logistics-coordinator.md"))),
-    ("health-research", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/health-research.md"))),
-    ("fitness-coach", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/fitness-coach.md"))),
-    ("legal-research", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/legal-research.md"))),
 ];
 
 /// (#425) Autonomous-dispatch preamble — prepended to specialist

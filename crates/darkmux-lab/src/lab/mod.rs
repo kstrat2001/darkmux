@@ -19,9 +19,6 @@ pub mod characterize;
 pub mod compare;
 pub mod cow_clone;
 pub mod dispatch_end;
-// (#1222) Dialectic (adversarial) review orchestration — review-bench's
-// prosecutor → defender → judge mode.
-pub mod dialectic;
 pub mod doctor;
 pub mod fixture;
 pub mod fixture_cli;
@@ -39,7 +36,6 @@ pub mod registry;
 // longer needs) The PR-review pipeline driver — bundles → probe (k draws)
 // → dedup → double-confirm judge → envelope.
 pub mod review;
-pub mod review_bench;
 pub mod run;
 pub mod sandbox_hash;
 // (#1198) scores.json — the bench suite's persisted score artifact (#1197).

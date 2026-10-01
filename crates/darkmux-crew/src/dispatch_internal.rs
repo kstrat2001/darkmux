@@ -626,10 +626,9 @@ pub const CHECKPOINT_FILENAME: &str = "checkpoint.json";
 /// `workspace` — computed WITHOUT creating it, so a `--resume-from`
 /// checkpoint can be validated ahead of the residency and filesystem work:
 /// no model load, no eviction, no directory materialization, no
-/// `dispatch.start` flow record. NOT "before any side effect" — three
+/// `dispatch.start` flow record. NOT "before any side effect" — two
 /// things still run earlier in `dispatch()` and are unaffected by this
-/// hoist: the licensed-adjacent ack gate (an interactive stdin prompt that
-/// can `create_dir_all` + write an ack file), the remote-endpoint fork
+/// hoist: the remote-endpoint fork
 /// (which early-returns through `dispatch_remote`, a real HTTP call and a
 /// real token spend, so on that path this gate is never reached at all —
 /// #2561), and `check_docker_preflight` (a `docker pull` of the runtime
@@ -825,8 +824,8 @@ pub(crate) fn validate_resume_checkpoint_content(
 /// function immediately after `--workdir` validation: a refused resume now
 /// fails with no model load, no eviction, no directory materialization and
 /// no `dispatch.start` flow record. It is NOT the first thing `dispatch()`
-/// does — the licensed-adjacent ack gate, the remote-endpoint early return,
-/// and the Docker preflight all still precede it; `auto_workspace_path`'s
+/// does — the remote-endpoint early return
+/// and the Docker preflight both still precede it; `auto_workspace_path`'s
 /// own doc names each and what it costs. It does
 /// everything the checkpoint gate needs to do EXCEPT the final copy into
 /// the fresh dispatch's `host_out` — that step needs `host_out` to exist,
@@ -3159,7 +3158,7 @@ fn remote_chat_attempt(
     use std::io::Write;
     let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
     // (#1177) pid + a process-local counter — a unique name per call, so
-    // parallel same-process dispatches (e.g. the review-bench) can't race the
+    // parallel same-process dispatches (e.g. a crawl's units) can't race the
     // same secret-bearing file.
     let n = REMOTE_CFG_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let cfg_path =
@@ -3723,9 +3722,6 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
     // (#2947) Bad enum config refuses before anything, same as `dispatch`.
     crate::user_files::preflight_with(darkmux_types::config_enum::Scope::Dispatch, opts.config_path.as_deref())?;
     darkmux_flow::daemon_probe::nudge_if_daemon_unreachable("dispatch");
-    crate::dispatch::require_licensed_adjacent_ack(&opts.role_id)
-        .context("licensed-adjacent role dispatch requires acknowledgment")?;
-
     let roles = load_roles().context("loading crew roles for internal dispatch")?;
     let role = roles
         .iter()
@@ -4866,14 +4862,6 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     //    Non-blocking; the dispatch proceeds either way (#104 S3).
     darkmux_flow::daemon_probe::nudge_if_daemon_unreachable("dispatch");
 
-    // 0.5. Licensed-adjacent ACK gate (#1405: moved here from the retired
-    //      openclaw dispatch branch — this is the only dispatch path now).
-    //      For roles whose prompts operate in domains regulated by
-    //      professional licensure (health, law, fitness), require an
-    //      operator acknowledgment on first dispatch.
-    crate::dispatch::require_licensed_adjacent_ack(&opts.role_id)
-        .context("licensed-adjacent role dispatch requires acknowledgment")?;
-
     // (#1177 / #1187) A resolved model naming a remote OpenAI-compatible
     // endpoint forks two ways, decided by whether the ROLE grants any tools:
     //
@@ -5200,8 +5188,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // which needs `host_out` to exist) — see its own doc. Refusing here
     // means: no model load, no eviction, no directory materialization, no
     // `dispatch.start` flow record. It does NOT mean "before anything at
-    // all" — the licensed-adjacent ack gate, the `dispatch_remote` early
-    // return (#2561), and `check_docker_preflight` all ran above.
+    // all" — the `dispatch_remote` early
+    // return (#2561) and `check_docker_preflight` both ran above.
     //
     // `intended_workspace` mirrors, without creating it, whatever step 4
     // below will actually resolve `workspace` to: the operator's own

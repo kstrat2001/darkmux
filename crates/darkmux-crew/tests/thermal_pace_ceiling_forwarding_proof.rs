@@ -190,8 +190,7 @@ fn captured_docker_argv_with(
     let tmp = tempfile::tempdir().expect("tempdir");
     let home_dir = tmp.path().join("home");
     let flows_dir = tmp.path().join("flows");
-    let ack_dir = tmp.path().join("ack");
-    for d in [&home_dir, &flows_dir, &ack_dir] {
+    for d in [&home_dir, &flows_dir] {
         fs::create_dir_all(d).unwrap();
     }
     let record = tmp.path().join("docker-argv.txt");
@@ -206,7 +205,6 @@ fn captured_docker_argv_with(
     // DARKMUX_HOME: `user_state_root()` resolves against it.
     let _home = EnvVarGuard::set("DARKMUX_HOME", &home_dir);
     let _flows = EnvVarGuard::set("DARKMUX_FLOWS_DIR", &flows_dir);
-    let _ack = EnvVarGuard::set("DARKMUX_ACK_DIR", &ack_dir);
     let _lms = EnvVarGuard::set("DARKMUX_LMS_BIN", &fake_lms);
     let _path = EnvVarGuard::set("PATH", format!("{}:{real_path}", fake_bin_dir.display()));
     let _thermal = EnvVarGuard::set("DARKMUX_THERMAL_MAX_PAUSE_MS", max_pause_ms);

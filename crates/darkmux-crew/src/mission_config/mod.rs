@@ -356,11 +356,8 @@ pub struct MissionConfig {
 /// = blocked; the caller MUST refuse to run any step in the graph rather
 /// than attempting it — never a partial run. All three call sites that can
 /// execute a config's graph call this ONCE, up front, before `validate`/
-/// `interpret` ever runs: `darkmux acp`'s ephemeral panel route, a direct
-/// `darkmux mission launch <id>`, and `darkmux-lab`'s `review_bench`
-/// `--funnel` path (#1685 QA CONSIDER 3 — the config it loads is
-/// user-tier-overridable and its graph is `procedural.shell`-capable, same
-/// as the other two).
+/// `interpret` ever runs: `darkmux acp`'s ephemeral panel route and a direct
+/// `darkmux mission launch <id>`.
 pub fn check_cmd(config: &MissionConfig) -> Option<String> {
     let verb = config.cmd.as_deref()?;
     if darkmux_types::config_access::cmd_allowed(verb) {

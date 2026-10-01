@@ -90,18 +90,6 @@ impl StepKind for CrawlPlanStepKind {
         CRAWL_PLAN_KIND
     }
 
-    /// (#1511) `None` — it builds the crawl plan and dispatches no model,
-    /// matching its [`SeatClaim::NoModel`] above.
-    fn dispatch_role(
-        &self,
-        _step: &Step,
-        _task: &Task,
-        _input: &BTreeMap<String, String>,
-        _ctx: &StepRunCtx,
-    ) -> Option<String> {
-        None
-    }
-
     /// (#2577 audit, mechanism corrected on review) `CwdPolicy::
     /// NoAmbientDependency` (the trait default, stated explicitly here) —
     /// the only ambient-adjacent call reachable through this kind

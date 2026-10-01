@@ -2044,8 +2044,8 @@ fn current_millis() -> u64 {
 // never touch the flow stream, Redis, or any other machine's data. Machine-local by construction;
 // no federation, ever. A "run" is any directory directly containing
 // `funnels.json`, `funnel-events.jsonl`, or `scores.json` (the artifacts
-// `review-bench --funnel` writes per-run-local, #1247 Parts 1-2, plus
-// `scores.json` from any other bench mode). The scan is depth-bounded, and a
+// the lab writes per-run-local, #1247 Parts 1-2; `scores.json` comes from
+// the bench providers). The scan is depth-bounded, and a
 // matched run's own `cases/`/`worktrees/` subtrees (full repo checkouts) are
 // never walked into (`LAB_SCAN_SKIP_DIRS` below) — but a match does NOT stop
 // the scan from continuing into a matched dir's OTHER subdirectories, so a
