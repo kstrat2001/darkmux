@@ -675,6 +675,7 @@ mod tests {
     /// A `RemoteEndpoint` seat never touches the host at all — no
     /// reconcile, exactly as `resolve_local_seat`'s own doc requires for a
     /// hosted model (zero local residency exposure by design).
+    #[serial_test::serial]
     #[test]
     fn dispatch_reconciled_skips_reconcile_for_a_remote_endpoint_seat() {
         let host = Arc::new(Mutex::new(MockHost::new()));
@@ -705,6 +706,7 @@ mod tests {
     /// (#2394 fail-open) An unresolved local seat still dispatches — never
     /// silently blocked — but never touches the host either: there is no
     /// placement to reconcile.
+    #[serial_test::serial]
     #[test]
     fn dispatch_reconciled_falls_through_unprotected_when_the_seat_is_unresolved() {
         let host = Arc::new(Mutex::new(MockHost::new()));
