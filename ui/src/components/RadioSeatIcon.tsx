@@ -1,9 +1,11 @@
-/** The radio seat a peer grants: it answers this machine's radio questions.
+/** The radio seat a peer grants: it accepts radio questions from this
+ * machine. A permission, not a selection: several peers may grant it, and
+ * which one answers is this machine's radio setting.
  * A broadcast glyph in the card's name row, in place of the words
  * "radio-host here", which crowded the hardware line; the tooltip (and the
  * accessible name) says what it means, and the hardware line's own tooltip
  * still spells the whole grant out. */
-export const RADIO_SEAT_TITLE = "radio-host here: this machine answers radio questions you send it";
+export const RADIO_SEAT_TITLE = "accepts radio: this machine will answer radio questions sent from here (radio-host)";
 
 export function RadioSeatIcon() {
   return (

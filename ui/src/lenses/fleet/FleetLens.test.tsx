@@ -1652,7 +1652,7 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
     expect(spec.textContent).toBe("Apple M1 Max · 32 GB · runs diff-review");
     expect(spec.getAttribute("title")).toBe("Apple M1 Max · 32 GB · runs diff-review · radio-host here");
     const radio = studio.querySelector('.name [data-testid="radio-seat"]')!;
-    expect(radio.getAttribute("title")).toBe("radio-host here: this machine answers radio questions you send it");
+    expect(radio.getAttribute("title")).toBe("accepts radio: this machine will answer radio questions sent from here (radio-host)");
     expect(radio.getAttribute("aria-label")).toBe(radio.getAttribute("title"));
     // This machine's own card shows no grant.
     const self = [...document.querySelectorAll(".mach")].find((c) => c !== studio)!;
