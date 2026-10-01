@@ -1,6 +1,6 @@
 import { WorkStatus } from "../../components/WorkStatus";
 import { Shimmer } from "../../components/Placeholder";
-import { useEffect, useRef, useState, type KeyboardEvent } from "react";
+import { Fragment, useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../../lib/queryKeys";
@@ -25,7 +25,8 @@ import {
   runMachineLabels,
   runsMultiMachine,
   runsAgo,
-  runSubtitle,
+  runSubtitleParts,
+  type SubtitlePart,
   runStatusLabel,
   runDestination,
   MISSION_GRAPH_UNREACHABLE_NOTICE,
@@ -799,10 +800,32 @@ const NO_MACHINE_LABELS: ReadonlyMap<string, string> = new Map();
  * its TEXT goes through `runStatusLabel`, which reads `abandoned` two
  * different ways depending on `Run.abandoned_reason`. See that function's
  * own doc for why "abandoned" alone was the wrong word for this row. */
+/** A row's subtitle: its parts, `·`-separated, with a lab run's verify word
+ * colored by outcome (pass green, FAIL red). The dash for "no verify result"
+ * stays dim: it is neither good nor bad news. The text is exactly
+ * `runSubtitle`'s, so the parity goldens are unchanged. */
+function RunSubtitle({ parts }: { parts: SubtitlePart[] }) {
+  return parts.map((p, i) => (
+    <Fragment key={i}>
+      {i > 0 && " · "}
+      {p.verify && p.verify.outcome !== "none" ? (
+        <>
+          {"verify "}
+          <span className="verify-word" data-verify={p.verify.outcome}>
+            {p.verify.word}
+          </span>
+        </>
+      ) : (
+        p.text
+      )}
+    </Fragment>
+  ));
+}
+
 function RunRow({ run, machine, onActivate }: { run: Run; machine: string | null; onActivate: () => void }) {
   const interactive = runDestination(run, missionGraphReachable()).kind !== "none";
   const ago = runsAgo(run);
-  const subtitle = runSubtitle(run, machine);
+  const subtitle = runSubtitleParts(run, machine);
   return (
     <div
       className={`labrunrow${interactive ? "" : " flat"}`}
@@ -829,7 +852,11 @@ function RunRow({ run, machine, onActivate }: { run: Run; machine: string | null
         {ago && <span className="labrundir">{ago}</span>}
         {!run.tracked && <span className="rununtracked">untracked</span>}
       </div>
-      {subtitle && <div className="labrunmeta dim">{subtitle}</div>}
+      {subtitle.length > 0 && (
+        <div className="labrunmeta dim">
+          <RunSubtitle parts={subtitle} />
+        </div>
+      )}
     </div>
   );
 }
