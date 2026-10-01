@@ -139,7 +139,14 @@ enum Unit {
 impl Unit {
     fn label(&self) -> String {
         match self {
-            Unit::IntegrationTarget(t) => format!("test --test {t}"),
+            Unit::IntegrationTarget(t) => {
+                let features = required_features_of(t);
+                if features.is_empty() {
+                    format!("test --test {t}")
+                } else {
+                    format!("test --test {t} --features {}", features.join(","))
+                }
+            }
             Unit::PackageLib(p) => format!("test -p {p} --lib"),
             Unit::PackageBins(p) => format!("test -p {p} --bins"),
             Unit::PackageTest(p, t) => format!("test -p {p} --test {t}"),
@@ -149,7 +156,19 @@ impl Unit {
     fn cargo_args(&self) -> Vec<String> {
         match self {
             Unit::IntegrationTarget(t) => {
-                vec!["test".into(), "--test".into(), t.clone(), "--".into(), "--test-threads=4".into()]
+                let mut args = vec!["test".into(), "--test".into(), t.clone()];
+                // A target that declares `required-features` is not built by a
+                // plain `cargo test --test <name>`: cargo exits 101 with
+                // "requires the features", no binary runs, and this check
+                // (correctly) fails the unit as vacuous. Pass what the
+                // manifest declares, so the unit actually executes.
+                let features = required_features_of(t);
+                if !features.is_empty() {
+                    args.push("--features".into());
+                    args.push(features.join(","));
+                }
+                args.extend(["--".into(), "--test-threads=4".into()]);
+                args
             }
             Unit::PackageLib(p) => vec![
                 "test".into(),
@@ -178,6 +197,56 @@ impl Unit {
             ],
         }
     }
+}
+
+/// The `required-features` a root `[[test]]` target declares, read off the
+/// manifest text. Scraped the way `members` is, and for the same reason: a
+/// hardcoded list of gated targets rots silently, the manifest cannot.
+///
+/// A `[[test]]` block is read whole before its `name` is compared, so the
+/// answer does not depend on which key comes first.
+fn required_features(manifest: &str, target: &str) -> Vec<String> {
+    let mut in_test = false;
+    let (mut name, mut features): (Option<String>, Vec<String>) = (None, Vec::new());
+    // `None` marks the end of the manifest: it closes the last block.
+    for line in manifest.lines().map(Some).chain(std::iter::once(None)) {
+        let trimmed = line.map(str::trim);
+        if trimmed.is_none_or(|l| l.starts_with('[')) {
+            if in_test && name.as_deref() == Some(target) {
+                return features;
+            }
+            in_test = trimmed == Some("[[test]]");
+            (name, features) = (None, Vec::new());
+            continue;
+        }
+        if !in_test {
+            continue;
+        }
+        let Some((key, value)) = trimmed.and_then(|l| l.split_once('=')) else { continue };
+        match key.trim() {
+            "name" => name = Some(value.trim().trim_matches('"').to_string()),
+            "required-features" => {
+                features = value
+                    .split_once('[')
+                    .and_then(|(_, rest)| rest.split_once(']'))
+                    .map(|(inside, _)| inside)
+                    .unwrap_or_default()
+                    .split(',')
+                    .map(|f| f.trim().trim_matches('"').to_string())
+                    .filter(|f| !f.is_empty())
+                    .collect();
+            }
+            _ => {}
+        }
+    }
+    Vec::new()
+}
+
+/// [`required_features`] against this crate's own manifest.
+fn required_features_of(target: &str) -> Vec<String> {
+    let manifest = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
+        .unwrap_or_else(|e| panic!("reading Cargo.toml: {e}"));
+    required_features(&manifest, target)
 }
 
 /// Read the units off disk and out of the workspace manifest, every run.
@@ -299,35 +368,20 @@ fn enumerate_units() -> Vec<Unit> {
     units
 }
 
-/// The one unit that still leaks, with its count measured on this branch
-/// and the reason the fix is not a per-test guard. Tracked as #2732.
+/// Units that still leak, each with its count measured and the reason the fix
+/// is not a per-test guard. EMPTY today: the one entry this list held
+/// (`cargo test -p darkmux --bins`, `mission_launch::launch()`'s `process-start`
+/// liveness marker, #2732) measured NOTHING when this check first ran to
+/// completion again, both on macos-latest CI and locally, so the guard's own
+/// rule applied and the entry was deleted. #2732 is left for its owner to close.
 ///
-/// This is an EXEMPTION list, which is the shape this target exists to
-/// argue against — so it is bounded three ways. The entry names a measured
-/// COUNT, not a spelling. The assertion is `0 < files <= cap`, so growth
-/// fails AND a unit that has been fixed also fails until its entry is
-/// deleted. And the entry has to name a unit this check actually runs, so
-/// it cannot outlive the thing it describes.
-///
-/// `mission_launch::launch()` emits the dependency-free liveness floor's
-/// first marker (`process-start`) before anything else, and about
-/// twenty-four tests in `src/mission_launch.rs` call it. Giving each one
-/// `IsolatedState` requires `#[serial_test::serial]`, because that guard
-/// mutates process-global environment — and those tests are not serial
-/// today. Serializing two dozen of them is a real throughput change to the
-/// suite and wants its own measurement.
-///
-/// Measured with `DARKMUX_HOME` UNSET — the ordinary developer machine —
-/// the test-build default sends it to the per-pid test-isolated root
-/// instead, so the operator's real tree is untouched. The exposure is an
-/// operator who exports `DARKMUX_HOME`, and the artifact is a prunable
-/// heartbeat file rather than a chained record.
-const KNOWN_UNISOLATED_UNITS: &[(&str, usize, &str)] = &[(
-    "test -p darkmux --bins",
-    1,
-    "mission_launch::launch()'s `process-start` liveness marker, from ~24 non-serial \
-     tests; #2732",
-)];
+/// The mechanism stays, because this is an EXEMPTION list, the shape this
+/// target exists to argue against, so it is bounded three ways. An entry names
+/// a measured COUNT, not a spelling. The assertion is `0 < files <= cap`, so
+/// growth fails AND a unit that has been fixed also fails until its entry is
+/// deleted. And an entry has to name a unit this check actually runs, so it
+/// cannot outlive the thing it describes.
+const KNOWN_UNISOLATED_UNITS: &[(&str, usize, &str)] = &[];
 
 /// The free half: the enumeration itself, asserted on every `cargo test`.
 ///
@@ -790,4 +844,84 @@ fn no_test_unit_writes_into_a_sentinel_state_tree() {
         offenders.join("\n"),
     );
     assert!(clean > 0, "no unit was actually measured; this green is vacuous");
+}
+
+const GATED_MANIFEST: &str = r#"
+[features]
+alpha = []
+
+[[test]]
+name = "gated_name_first"
+path = "tests/gated_name_first.rs"
+required-features = ["alpha", "beta"]
+
+[[test]]
+required-features = ["gamma"]  # key order must not matter
+name = "gated_features_first"
+
+[[test]]
+name = "ungated"
+path = "tests/ungated.rs"
+
+[[bin]]
+name = "ungated"
+required-features = ["not-a-test"]
+"#;
+
+#[test]
+fn a_gated_target_is_given_every_feature_it_declares() {
+    assert_eq!(required_features(GATED_MANIFEST, "gated_name_first"), ["alpha", "beta"]);
+}
+
+#[test]
+fn the_features_are_found_whichever_key_comes_first() {
+    assert_eq!(required_features(GATED_MANIFEST, "gated_features_first"), ["gamma"]);
+}
+
+#[test]
+fn an_ungated_target_and_an_unknown_one_get_no_features() {
+    assert!(required_features(GATED_MANIFEST, "ungated").is_empty(), "a [[bin]] of the same name must not leak in");
+    assert!(required_features(GATED_MANIFEST, "no_such_target").is_empty());
+}
+
+/// The conformance test: every `[[test]]` in the REAL manifest that declares
+/// `required-features` must have them on its command line. This is what was
+/// broken: `fleet_profile_address_two_daemons` ran as a plain
+/// `cargo test --test ...`, could not build, and failed the whole check on
+/// every push to main.
+#[test]
+fn every_gated_target_in_the_real_manifest_runs_with_its_features() {
+    let manifest = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
+        .expect("reading Cargo.toml");
+    let mut gated = 0;
+    for name in test_names(&manifest) {
+        let wanted = required_features(&manifest, &name);
+        if wanted.is_empty() {
+            continue;
+        }
+        gated += 1;
+        let args = Unit::IntegrationTarget(name.clone()).cargo_args();
+        let at = args.iter().position(|a| a == "--features").unwrap_or_else(|| {
+            panic!("`{name}` declares required-features {wanted:?} but its command line has no --features: {args:?}")
+        });
+        assert_eq!(args[at + 1], wanted.join(","), "`{name}` is run with the wrong features");
+        assert!(at < args.iter().position(|a| a == "--").unwrap(), "--features must come before the `--` that starts test args");
+    }
+    assert!(gated > 0, "the real manifest has no gated [[test]] target, so this test proves nothing; update it if the last one was removed");
+}
+
+/// Every `[[test]]` name in a manifest, in order.
+fn test_names(manifest: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut in_test = false;
+    for line in manifest.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_test = line == "[[test]]";
+        } else if in_test {
+            if let Some(("name", v)) = line.split_once('=').map(|(k, v)| (k.trim(), v)) {
+                names.push(v.trim().trim_matches('"').to_string());
+            }
+        }
+    }
+    names
 }
