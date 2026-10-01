@@ -1193,11 +1193,25 @@ pub(crate) enum MachineCmd {
 pub(crate) enum ProfileCmd {
     /// List profiles in the registry. (#1426 — the retired top-level
     /// `darkmux profiles` verb; now `darkmux profile list`.)
+    ///
+    /// `--machine <peer>` lists the profiles that roster peer lets THIS
+    /// machine dispatch to: each profile's name, its models, and the
+    /// `<profile>@<peer>` address `dispatch --profile` takes. `--remote` lists
+    /// every peer's, grouped by peer. Both read the peers' machine cards (the
+    /// ones `machine list` shows). A peer whose card cannot be read is
+    /// reported as unreadable with the reason, never as 0 profiles, and the
+    /// verb exits 1. `--machine <this machine>` is the plain local list.
     List {
         #[command(flatten)]
         profiles: ProfilesFileArg,
         #[command(flatten)]
         json: JsonFlag,
+        /// A roster machine: list the profiles it lets this machine use.
+        #[arg(long, value_name = "PEER", conflicts_with_all = ["remote", "profiles"])]
+        machine: Option<String>,
+        /// Every roster peer's profiles this machine may use, by peer.
+        #[arg(long, conflicts_with = "profiles")]
+        remote: bool,
     },
     /// Scan the LMStudio model catalog for downloaded models that aren't yet
     /// covered by any profile. For each uncovered model, suggests a task class

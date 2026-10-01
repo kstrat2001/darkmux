@@ -111,23 +111,28 @@ fn cells(m: &FleetMachine) -> [String; 4] {
                 if models.is_empty() { dash() } else { models },
             ]
         }
-        CardOutcome::Unavailable { why, peer_version, peer_version_source } => [
-            dash(),
-            dash(),
-            peer_version.clone().unwrap_or_else(dash),
-            unavailable_phrase(*why, &peer_words(peer_version.as_deref(), *peer_version_source)),
-        ],
-        CardOutcome::Mismatch { answered_as } => [
-            dash(),
-            dash(),
-            dash(),
-            format!("answered as {}; not this machine's card, not used", answered_as.as_deref().unwrap_or("no name")),
-        ],
-        CardOutcome::Unreachable { reason, detail } => {
-            [dash(), dash(), dash(), unreachable_phrase(*reason, detail.as_deref())]
+        other => {
+            let reason = card_unreadable_reason(other).unwrap_or_default();
+            [dash(), dash(), dash(), reason]
         }
-        CardOutcome::Unknown => [dash(), dash(), dash(), "an answer this darkmux does not know".to_string()],
     }
+}
+
+/// Why no card could be read from a peer, in one clause; `None` for a card
+/// that was read. The one place these phrases are worded: the table's last
+/// column and `profile list --machine` both print it.
+pub(crate) fn card_unreadable_reason(outcome: &CardOutcome) -> Option<String> {
+    Some(match outcome {
+        CardOutcome::Available { .. } => return None,
+        CardOutcome::Unavailable { why, peer_version, peer_version_source } => {
+            unavailable_phrase(*why, &peer_words(peer_version.as_deref(), *peer_version_source))
+        }
+        CardOutcome::Mismatch { answered_as } => {
+            format!("answered as {}; not this machine's card, not used", answered_as.as_deref().unwrap_or("no name"))
+        }
+        CardOutcome::Unreachable { reason, detail } => unreachable_phrase(*reason, detail.as_deref()),
+        CardOutcome::Unknown => "an answer this darkmux does not know".to_string(),
+    })
 }
 
 /// Who is reading a line. The CLI's reader is on the machine that ran the
@@ -508,11 +513,11 @@ pub(crate) fn render_text(view: &FleetView, roster_path: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use darkmux_serve::fleet_view::CardSource;
 
-    fn card_json(version: &str) -> serde_json::Value {
+    pub(crate) fn card_json(version: &str) -> serde_json::Value {
         serde_json::json!({
             "card_schema_version": "1.0",
             "work_job_schema_version": "8.0",
@@ -541,15 +546,15 @@ mod tests {
         })
     }
 
-    fn card(version: &str) -> Box<MachineCard> {
+    pub(crate) fn card(version: &str) -> Box<MachineCard> {
         Box::new(serde_json::from_value(card_json(version)).expect("a card of this build's shape"))
     }
 
-    fn read(card: Box<MachineCard>) -> CardOutcome {
+    pub(crate) fn read(card: Box<MachineCard>) -> CardOutcome {
         CardOutcome::Available { card, source: CardSource::Listener }
     }
 
-    fn machine(id: &str, liveness: Liveness, outcome: CardOutcome) -> FleetMachine {
+    pub(crate) fn machine(id: &str, liveness: Liveness, outcome: CardOutcome) -> FleetMachine {
         FleetMachine {
             entry: Some(darkmux_serve::wire::RosterMachineEntry {
                 id: id.to_string(),
@@ -571,16 +576,16 @@ mod tests {
         }
     }
 
-    fn with_accepts(mut m: FleetMachine, accepts: AcceptsState) -> FleetMachine {
+    pub(crate) fn with_accepts(mut m: FleetMachine, accepts: AcceptsState) -> FleetMachine {
         m.accepts = accepts;
         m
     }
 
-    fn unreachable(id: &str, reason: UnreachableReason, detail: Option<&str>) -> FleetMachine {
+    pub(crate) fn unreachable(id: &str, reason: UnreachableReason, detail: Option<&str>) -> FleetMachine {
         machine(id, Liveness::Unknown, CardOutcome::Unreachable { reason, detail: detail.map(str::to_string) })
     }
 
-    fn view(machines: Vec<FleetMachine>) -> FleetView {
+    pub(crate) fn view(machines: Vec<FleetMachine>) -> FleetView {
         FleetView {
             gathered_by: GatheredBy::Daemon,
             local_machine_id: Some("laptop".into()),
@@ -598,7 +603,7 @@ mod tests {
         render_text(v, "/roster.json")
     }
 
-    fn own_row() -> FleetMachine {
+    pub(crate) fn own_row() -> FleetMachine {
         let mut m = with_accepts(machine("x", Liveness::Live, CardOutcome::Available { card: card("5.0.0"), source: CardSource::Local }), AcceptsState::ThisMachine);
         m.entry = None;
         m.is_this_machine = true;
@@ -817,7 +822,7 @@ mod tests {
 
     /// A card with the given loaded model identifiers and (name, model id)
     /// managed profiles.
-    fn card_with(loaded: &[&str], profiles: &[(String, &str)]) -> Box<MachineCard> {
+    pub(crate) fn card_with(loaded: &[&str], profiles: &[(String, &str)]) -> Box<MachineCard> {
         let mut j = card_json("5.0.0");
         j["specs"]["loaded_models"] = loaded
             .iter()
@@ -837,7 +842,7 @@ mod tests {
         (0..n).map(|i| (format!("profile-{i:02}"), "qwen/other-model")).collect()
     }
 
-    fn granted(profiles: &[&str]) -> AcceptsState {
+    pub(crate) fn granted(profiles: &[&str]) -> AcceptsState {
         AcceptsState::Granted {
             accepts: darkmux_serve::machine_card::CardAccepts {
                 peer_name: "laptop".into(),

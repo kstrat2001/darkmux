@@ -152,6 +152,7 @@ cli_outputs! {
     darkmux_crew::lessons::LessonsExport => ["memory lesson export"],
     CorrectionList => ["memory correction list"],
     ProfileList<'_> => ["profile list"],
+    crate::profile_remote::PeerProfileList => ["profile list --machine <peer>", "profile list --remote"],
     MachineStatusOutput<'_> => ["machine status"],
     darkmux_profiles::model_ledger::ModelLedger => ["machine resources"],
     darkmux_serve::wire::MachineResourcesResponse => ["machine resources <peer>"],
