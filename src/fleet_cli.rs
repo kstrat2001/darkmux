@@ -2042,20 +2042,20 @@ mod trust_tests {
     }
 
     #[test]
-    fn a_newer_peers_unknown_variant_reads_as_a_note_in_text_naming_its_version() {
+    fn a_peer_body_this_build_cannot_read_is_a_note_in_text_naming_its_version() {
         let mut body = peer_resources_body();
-        body["limit_source"] = serde_json::json!("quantum_pool");
+        body["limit_source"] = serde_json::json!(12);
         body["darkmux_version"] = serde_json::json!("9.9.9");
         let out = peer_resources_view("studio", body, false).unwrap();
         assert!(out.contains("resources unreadable"), "{out}");
         assert!(out.contains("schema_version 2.1") && out.contains("darkmux_version 9.9.9"), "{out}");
-        assert!(out.contains("quantum_pool"), "what could not be read is named: {out}");
+        assert!(out.contains("integer `12`"), "what could not be read is named: {out}");
     }
 
     #[test]
     fn a_refusal_under_json_names_the_peer_version_and_claims_no_mismatch_it_did_not_see() {
         let mut body = peer_resources_body();
-        body["limit_source"] = serde_json::json!("quantum_pool");
+        body["limit_source"] = serde_json::json!(12);
         let err = peer_resources_view("studio", body.clone(), true).unwrap_err().to_string();
         assert!(err.contains("schema_version 2.1") && err.contains("the schema matches"), "{err}");
         assert!(!err.contains("differs"), "a version mismatch nobody observed is claimed: {err}");
