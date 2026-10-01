@@ -275,7 +275,10 @@ pub(crate) enum Cmd {
         /// (if the original was read-only) at least as read-only a mount —
         /// darkmux refuses to run (never silently starts fresh) on any
         /// mismatch. The prior dir is left untouched; this dispatch gets
-        /// its own fresh out dir and its own run record.
+        /// its own fresh out dir and its own run record. MESSAGE is optional
+        /// on a resume: the conversation continues from the checkpoint,
+        /// which already holds the original prompt, so a bare resume sends a
+        /// default "continue" message.
         ///
         /// IMPORTANT (operator sovereignty — know this before resuming): a
         /// resume replays the checkpoint's recorded tool calls VERBATIM,

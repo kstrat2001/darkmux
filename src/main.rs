@@ -951,13 +951,21 @@ struct DispatchInvocation {
     resume_from: Option<std::path::PathBuf>,
 }
 
+/// (F6) The message a `--resume-from` dispatch carries when none is given. A
+/// resume continues the checkpointed conversation: the runtime seeds its
+/// history from the checkpoint, which already holds the original prompt, so
+/// this text only fills the host's required prompt file.
+const RESUME_DEFAULT_MESSAGE: &str = "Continue the interrupted dispatch from its checkpoint.";
+
 /// The dispatch message in precedence order. `message` and `message_from_file`
 /// arrive as clap parsed them (mutually exclusive), so `role` is only for the
-/// usage guidance.
+/// usage guidance. A `resuming` dispatch with no message of its own takes
+/// [`RESUME_DEFAULT_MESSAGE`] instead of reading stdin.
 fn resolve_dispatch_message(
     role: &str,
     message: Option<String>,
     message_from_file: Option<std::path::PathBuf>,
+    resuming: bool,
 ) -> Result<String> {
     // (#1426) Resolve the message in precedence order: positional MESSAGE >
     // `--message-from-file` > stdin. clap makes the positional and the file
@@ -985,6 +993,7 @@ fn resolve_dispatch_message(
             }
             m
         }
+        (None, None) if resuming => RESUME_DEFAULT_MESSAGE.to_string(),
         (None, None) => {
             use std::io::{IsTerminal, Read};
             if std::io::stdin().is_terminal() {
@@ -1051,7 +1060,7 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
         .transpose()
         .map_err(|e| anyhow::anyhow!("darkmux dispatch: {e}"))?
         .and_then(|a| a.machine);
-    let message = resolve_dispatch_message(&role, message, message_from_file)?;
+    let message = resolve_dispatch_message(&role, message, message_from_file, resume_from.is_some())?;
     // (#2295) `--finding <key>` and `--mod <key>` (both repeatable): each
     // named record's stored content is appended to the brief VERBATIM, after
     // the operator's own message. A key that addresses no stored record is
@@ -1943,6 +1952,16 @@ mod tests {
         let correction = |execution_id| crew::corrections::Correction { ts: "t".into(), execution_id, text: "x".into() };
         assert_eq!(correction_origin(&correction(Some(id.clone()))), id.as_str());
         assert_eq!(correction_origin(&correction(None)), "no execution recorded");
+    }
+
+    /// (F6) A resume with no message continues the checkpoint instead of
+    /// reading an empty stdin; an explicit message still wins.
+    #[test]
+    fn a_resume_without_a_message_defaults_it_and_an_explicit_message_wins() {
+        let defaulted = resolve_dispatch_message("coder", None, None, true).unwrap();
+        assert_eq!(defaulted, RESUME_DEFAULT_MESSAGE);
+        let given = resolve_dispatch_message("coder", Some("do x".into()), None, true).unwrap();
+        assert_eq!(given, "do x");
     }
 
     /// The id `dispatch` prints is the execution's, not its session's, and
