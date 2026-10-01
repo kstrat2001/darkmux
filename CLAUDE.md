@@ -660,7 +660,7 @@ src/                          CLI command layer (clap)
   run_list.rs                 `run list`: the cross-kind union (mission, dispatch, lab), the CLI twin of `GET /runs`
   run_records.rs              `run inspect|stats|compare`: read a lab run's recorded artifacts; refuses mission and dispatch runs, naming where to look
   retired_verbs.rs            The ONE table of retired verb spellings and flags (`mission dispatch`, `lab run list|inspect|stats|compare`, `finding list --dispatch`, ...): checked before clap so the refusal names the replacement
-  lab_cli.rs                  `lab` family — kind-family shape (#1465): `run <workload>` (the launcher only; recorded runs are read through `darkmux run`) · `workload list` · `fixture {list·register·unregister}` · `eval <role>` · `loop`/`characterize`/`tune`/`doctor`
+  lab_cli.rs                  `lab` family — kind-family shape (#1465): `run <workload>` (the launcher only; recorded runs are read through `darkmux run`) · `workload list` · `fixture {list·register·unregister}` · `loop`/`characterize`/`tune`/`doctor`
   phase_cli.rs                Code-review output rendering (`phase_review_output_at`) for the coder-phase QA gate; the `phase` verb family retired (#1463)
   mod_cli.rs                  `mod` family (create/list/show over the write-once mod store)
   role_cli.rs                 `role` family (list/show from the SQLite index)
