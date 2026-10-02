@@ -83,6 +83,18 @@ darkmux release.
   (`concurrent_width`) are each derived once, shared by the scheduler and a
   fleet receiver's seat book.
 
+- **`run list --usage` keys each row on the machine that executed the call**
+  (#3061). `localhost` means a different machine to whoever made the call, so
+  two machines' LM Studios serving the same model merged into one row (a relayed
+  radio answer from the Studio read as the laptop's). Rows are now (machine,
+  endpoint, model): a MACHINE column, and `--json` groups gain additive
+  `machine` and `endpoint_id` fields (a named endpoint shows its registry id, not
+  its URL; the machine is keyed on its hardware uid, so a rename does not split
+  it). A hosted endpoint used from two machines is two rows, the `all` row still
+  sums both. Calls whose reply reported no usage are counted in CALLS at 0
+  tokens, as the endpoint window budget counts them, and a line under the totals
+  says how many (`unreported` on each split in `--json`). Tokens of sessionless
+  utility calls (radio routing) sit in the table but on no run's TOKENS cell.
 - **Informational stderr lines stay out of an interactive terminal** (5.0).
   `[darkmux-liveness]` markers, the `flow: ... sink enabled` banners, and the
   dispatch progress headers print only when stderr is not a terminal (CI logs,

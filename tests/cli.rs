@@ -7123,6 +7123,50 @@ fn run_list_usage_breakdown_end_to_end() {
     assert!(err.contains("--since") && err.contains("24h") && err.contains("YYYY-MM-DD"), "{err}");
 }
 
+/// (#3061) The verb end to end over two machines' records that name the
+/// same `localhost` endpoint and model: two rows, each with its machine, in
+/// `--json` and in the text MACHINE column; the overall sums both.
+#[test]
+fn run_list_usage_keys_rows_on_the_executing_machine() {
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let lab = TempDir::new().unwrap();
+    let day = darkmux_flow::day_utc_now();
+    let now = darkmux_flow::ts_utc_now();
+    let usage = |machine: &str, uid: &str, total: u64| {
+        serde_json::json!({
+            "ts": now, "action": "telemetry.tokens", "category": "telemetry", "source": "tokens",
+            "session_id": format!("s-{machine}"), "execution_id": format!("exec-{machine}"), "handle": "coder",
+            "machine_id": machine, "machine_uid": uid,
+            "payload": { "call_kind": "turn", "purpose": "work", "requested_model": "phi-4", "endpoint": "http://localhost:1234/v1", "token_source": "provider", "prompt_tokens": total - 1, "completion_tokens": 1, "total_tokens": total }
+        })
+    };
+    let body: String = [usage("laptop", "UID-A", 100), usage("studio", "UID-B", 30)].iter().map(|r| format!("{r}\n")).collect();
+    fs::write(flows.path().join(format!("{day}.jsonl")), body).unwrap();
+    let run = |args: &[&str]| {
+        darkmux_cmd()
+            .args(args)
+            .env("DARKMUX_HOME", home.path())
+            .env("DARKMUX_FLOWS_DIR", flows.path())
+            .env("DARKMUX_LAB_DIR", lab.path())
+            .env_remove("DARKMUX_REDIS_URL")
+            .output()
+            .unwrap()
+    };
+    let out = run(&["run", "list", "--json", "--usage", "--all"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let groups = json["usage"]["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 2, "{groups:#?}");
+    assert_eq!((groups[0]["machine"].as_str(), groups[0]["work"]["total"].as_u64()), (Some("laptop"), Some(100)));
+    assert_eq!((groups[1]["machine"].as_str(), groups[1]["work"]["total"].as_u64()), (Some("studio"), Some(30)));
+    assert_eq!(json["usage"]["overall"]["total"], 130);
+    let out = run(&["run", "list", "--usage", "--all"]);
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(text.contains("MACHINE"), "{text}");
+    assert_eq!(text.matches("http://localhost:1234/v1").count(), 2, "one row per machine: {text}");
+}
+
 // ── crawl --dry-run (#1959) ──
 //
 // Migrated from the retired `darkmux crawl plan` verb (deleted alongside

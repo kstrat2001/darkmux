@@ -21,8 +21,10 @@
 //! names none, and is keyed by its session and mission (#3036: no identity is
 //! invented for it).
 //!
-//! What this module reports is what darkmux INVOKED: the endpoint string
-//! the record carries, the model darkmux requested, the model the reply
+//! What this module reports is what darkmux INVOKED, by the machine that
+//! executed it (the record's own `machine_uid`/`machine_id`; a relayed run's
+//! asker writes no usage, so its tokens count once, on the executor): the endpoint
+//! (its registry id when the record carries one, else the string it carries), the model darkmux requested, the model the reply
 //! named when it differs, and the provider's own counts with their source.
 //! Nothing here labels an endpoint local, cloud or metered, and nothing
 //! here costs anything.
@@ -141,13 +143,27 @@ pub fn sum_usage<'a>(records: impl IntoIterator<Item = &'a serde_json::Value>) -
 }
 
 /// One line of the breakdown: everything darkmux invoked one way. The key
-/// is the endpoint it called, the model it requested, and the model the
+/// is the MACHINE that executed the call (#3061: `localhost` is a different
+/// machine to whoever made the call, so the same URL on two machines is two
+/// lines), the endpoint it called (its registry id when the record carries
+/// one, else the endpoint string), the model it requested, and the model the
 /// reply named when it carried one; each is a fact off the record, absent
 /// when the record did not carry it (a legacy complete, a pre-1.57 turn).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct UsageGroup {
+    /// The executing machine's `machine_id` (its newest name in the window,
+    /// the group being keyed on its hardware uid so a rename does not split
+    /// it). Absent on a record that names no machine.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
+    /// The endpoint string darkmux called. For a named endpoint it is a
+    /// display label (the smallest seen), not part of the key.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// The profile registry's `endpoints` id the call went through, when it
+    /// had one; it, not `endpoint`, identifies a named endpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested_model: Option<String>,
     /// The reply's own `model`, kept only when it DIFFERS from the request:
@@ -179,11 +195,18 @@ pub struct UsageSplit {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cached: Option<u64>,
     pub generated: u64,
+    /// Calls of `calls` whose reply reported no usage: counted as calls,
+    /// adding 0 tokens (the endpoint window ledger reads them the same way;
+    /// the conservative charge belongs to a dispatch's own cap only).
+    pub unreported: u64,
 }
 
 impl UsageSplit {
     fn add(&mut self, a: &UsageAmount) {
         self.calls += 1;
+        if !a.reported {
+            self.unreported += 1;
+        }
         self.total = self.total.saturating_add(a.total);
         self.input = self.input.saturating_add(a.prompt);
         self.generated = self.generated.saturating_add(a.completion);
@@ -194,22 +217,50 @@ impl UsageSplit {
 }
 
 /// The breakdown `run list --usage` prints and `--json` emits: the overall
-/// sum plus one [`UsageGroup`] per (endpoint, requested model, reported
-/// model), largest first.
+/// sum plus one [`UsageGroup`] per (executing machine, endpoint, requested
+/// model, reported model), largest first.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct UsageBreakdown {
     pub overall: UsageSum,
     pub groups: Vec<UsageGroup>,
 }
 
-type GroupKey = (Option<String>, Option<String>, Option<String>);
+/// What makes two usage records one line of the breakdown. The endpoint
+/// string is part of the key only for an UNNAMED endpoint: a named one is
+/// its `endpoint_id` (the label can differ per model or deployment).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct GroupKey {
+    /// The executing machine: its hardware uid (case-folded), else its
+    /// `machine_id`, else none.
+    machine: Option<String>,
+    endpoint: Option<String>,
+    endpoint_id: Option<String>,
+    requested: Option<String>,
+    reported: Option<String>,
+}
+
+/// The text a record carries under `k`, empty read as absent.
+fn text_of(v: &serde_json::Value, k: &str) -> Option<String> {
+    v.get(k).and_then(|x| x.as_str()).filter(|x| !x.is_empty()).map(str::to_string)
+}
+
+/// The machine a record names: the record's own `machine_uid`/`machine_id`,
+/// stamped by the machine that wrote it, which is the one that executed the
+/// call (a relayed run's asker writes no usage). Returns the key part and
+/// the display name.
+fn machine_of(v: &serde_json::Value) -> (Option<String>, Option<String>) {
+    let name = text_of(v, "machine_id");
+    let key = text_of(v, "machine_uid").map(|u| u.to_ascii_uppercase()).or_else(|| name.clone());
+    (key, name)
+}
 
 fn group_key(v: &serde_json::Value) -> GroupKey {
     let p = payload_of(v);
-    let s = |k: &str| p.get(k).and_then(|x| x.as_str()).filter(|x| !x.is_empty()).map(str::to_string);
-    let requested = s("requested_model");
-    let reported = s("reported_model").filter(|r| Some(r) != requested.as_ref());
-    (s("endpoint"), requested, reported)
+    let requested = text_of(p, "requested_model");
+    let reported = text_of(p, "reported_model").filter(|r| Some(r) != requested.as_ref());
+    let endpoint_id = text_of(p, "endpoint_id");
+    let endpoint = if endpoint_id.is_some() { None } else { text_of(p, "endpoint") };
+    GroupKey { machine: machine_of(v).0, endpoint, endpoint_id, requested, reported }
 }
 
 /// A pending legacy candidate: held until the fold knows whether its run
@@ -217,7 +268,22 @@ fn group_key(v: &serde_json::Value) -> GroupKey {
 struct PendingComplete {
     execution: usize,
     group: GroupKey,
+    label: GroupLabel,
     amount: UsageAmount,
+}
+
+/// The display facts of one record that are NOT part of its group's key:
+/// the machine's name, the endpoint string, and when the record was written
+/// (the newest name wins, the smallest endpoint string wins, so the line
+/// reads the same whatever order the records arrive in).
+struct GroupLabel {
+    machine: Option<String>,
+    endpoint: Option<String>,
+    ts: String,
+}
+
+fn group_label(v: &serde_json::Value) -> GroupLabel {
+    GroupLabel { machine: machine_of(v).1, endpoint: text_of(payload_of(v), "endpoint"), ts: text_of(v, "ts").unwrap_or_default() }
 }
 
 /// The fold: feed it every record in a window (any order), then `finish`.
@@ -235,6 +301,8 @@ pub struct UsageFold {
     executions: Vec<ExecutionEntry>,
     execution_index: HashMap<String, usize>,
     groups: HashMap<GroupKey, UsageGroup>,
+    /// The timestamp of the record whose machine name each group shows.
+    machine_ts: HashMap<GroupKey, String>,
     completes: Vec<PendingComplete>,
 }
 
@@ -259,7 +327,7 @@ struct ExecutionEntry {
 
 impl UsageFold {
     pub fn new(since: Option<String>) -> Self {
-        Self { since, executions: Vec::new(), execution_index: HashMap::new(), groups: HashMap::new(), completes: Vec::new() }
+        Self { since, executions: Vec::new(), execution_index: HashMap::new(), groups: HashMap::new(), machine_ts: HashMap::new(), completes: Vec::new() }
     }
 
     fn execution_slot(&mut self, v: &serde_json::Value) -> usize {
@@ -301,21 +369,31 @@ impl UsageFold {
             let sum = &mut self.executions[i].sum;
             sum.add(&amount);
             sum.usage_records += 1;
-            self.group(group_key(v), &amount);
+            self.group(group_key(v), group_label(v), &amount);
         } else if is_dispatch_complete(v) && self.in_window(v) && has_any_token_counts(payload_of(v)) {
             let execution = self.execution_slot(v);
-            self.completes.push(PendingComplete { execution, group: group_key(v), amount: amount_of(payload_of(v)) });
+            self.completes.push(PendingComplete { execution, group: group_key(v), label: group_label(v), amount: amount_of(payload_of(v)) });
         }
     }
 
-    fn group(&mut self, key: GroupKey, amount: &UsageAmount) {
+    fn group(&mut self, key: GroupKey, label: GroupLabel, amount: &UsageAmount) {
         let g = self.groups.entry(key.clone()).or_insert_with(|| UsageGroup {
-            endpoint: key.0,
-            requested_model: key.1,
-            reported_model: key.2,
+            machine: None,
+            endpoint: None,
+            endpoint_id: key.endpoint_id.clone(),
+            requested_model: key.requested.clone(),
+            reported_model: key.reported.clone(),
             work: UsageSplit::default(),
             utility: UsageSplit::default(),
         });
+        if label.endpoint.is_some() && (g.endpoint.is_none() || label.endpoint < g.endpoint) {
+            g.endpoint = label.endpoint;
+        }
+        let newest = self.machine_ts.get(&key).is_none_or(|seen| label.ts >= *seen);
+        if label.machine.is_some() && newest {
+            g.machine = label.machine;
+            self.machine_ts.insert(key, label.ts);
+        }
         match amount.purpose {
             // A purpose this build does not name is not known to be a utility job, and `Work` is
             // "every call that is not a utility job": its tokens are counted, never dropped.
@@ -334,7 +412,7 @@ impl UsageFold {
             }
             entry.sum.add(&c.amount);
             entry.sum.legacy_completes += 1;
-            self.group(c.group, &c.amount);
+            self.group(c.group, c.label, &c.amount);
         }
         let mut overall = UsageSum::default();
         let mut by_session: HashMap<String, Vec<usize>> = HashMap::new();
@@ -353,6 +431,8 @@ impl UsageFold {
         groups.sort_by(|a, b| {
             b.total()
                 .cmp(&a.total())
+                .then_with(|| a.machine.cmp(&b.machine))
+                .then_with(|| a.endpoint_id.cmp(&b.endpoint_id))
                 .then_with(|| a.endpoint.cmp(&b.endpoint))
                 .then_with(|| a.requested_model.cmp(&b.requested_model))
                 .then_with(|| a.reported_model.cmp(&b.reported_model))
@@ -552,6 +632,121 @@ mod tests {
         let idx = fold_all(&[usage, complete, other_mission], None);
         let o = &idx.breakdown.overall;
         assert_eq!((o.total, o.legacy_completes), (13, 1), "the same session under another mission is another run: {o:?}");
+    }
+
+    /// One usage record as the machine that EXECUTED the call wrote it.
+    fn usage_on(machine: &str, uid: &str, endpoint_id: Option<&str>, purpose: &str, model: &str, total: Option<u64>) -> serde_json::Value {
+        let mut p = serde_json::json!({"call_kind":"single_shot","purpose":purpose,"requested_model":model,"endpoint":"http://localhost:1234/v1"});
+        match total {
+            Some(t) => {
+                p["token_source"] = "provider".into();
+                p["prompt_tokens"] = (t - 1).into();
+                p["completion_tokens"] = 1.into();
+                p["total_tokens"] = t.into();
+            }
+            None => p["token_source"] = "absent".into(),
+        }
+        if let Some(id) = endpoint_id {
+            p["endpoint_id"] = id.into();
+        }
+        serde_json::json!({"ts":"2026-10-02T06:00:00Z","action":"telemetry.tokens","category":"telemetry","source":"tokens","session_id":format!("s-{machine}"),"execution_id":format!("exec-{machine}-{model}-{purpose}-{total:?}"),"machine_id":machine,"machine_uid":uid,"payload":p})
+    }
+
+    /// (#3061) `localhost` means a different machine to whoever made the
+    /// call: the same URL and model on two machines are two rows, and the
+    /// overall still sums both.
+    #[test]
+    fn one_localhost_on_two_machines_is_two_groups() {
+        let records = [
+            usage_on("MacBook-Pro", "UID-A", None, "work", "darkmux:phi-4", Some(100)),
+            usage_on("studio", "UID-B", None, "work", "darkmux:phi-4", Some(30)),
+        ];
+        let b = fold_all(&records, None).breakdown;
+        assert_eq!(b.groups.len(), 2, "{:#?}", b.groups);
+        let by: std::collections::BTreeMap<_, _> = b.groups.iter().map(|g| (g.machine.clone().unwrap(), g.total())).collect();
+        assert_eq!(by, [("MacBook-Pro".to_string(), 100), ("studio".to_string(), 30)].into());
+        assert_eq!(b.overall.total, 130);
+    }
+
+    /// A machine renamed mid-window is still one machine: the hardware uid
+    /// is the key, the newest `machine_id` the label.
+    #[test]
+    fn a_renamed_machine_stays_one_group_labeled_by_its_newest_name() {
+        let mut old = usage_on("studio", "UID-B", None, "work", "m", Some(10));
+        old["ts"] = "2026-10-01T06:00:00Z".into();
+        let mut new = usage_on("studio-renamed", "uid-b", None, "work", "m", Some(20));
+        new["ts"] = "2026-10-02T06:00:00Z".into();
+        for order in [[old.clone(), new.clone()], [new, old]] {
+            let g = fold_all(&order, None).breakdown.groups;
+            assert_eq!(g.len(), 1, "{g:#?}");
+            assert_eq!((g[0].machine.as_deref(), g[0].total()), (Some("studio-renamed"), 30));
+        }
+    }
+
+    /// A named endpoint is identified by its registry id: its rows carry the
+    /// id, and one hosted endpoint used from two machines is two rows
+    /// (each machine's spend is enforced locally), summed by the overall.
+    #[test]
+    fn a_hosted_endpoint_used_from_two_machines_is_two_rows_keyed_by_its_id() {
+        let mut other_label = usage_on("MacBook-Pro", "UID-A", Some("azure"), "work", "gpt", Some(50));
+        other_label["payload"]["endpoint"] = "https://x.example/gpt".into();
+        let records = [
+            usage_on("MacBook-Pro", "UID-A", Some("azure"), "work", "gpt", Some(100)),
+            other_label,
+            usage_on("studio", "UID-B", Some("azure"), "work", "gpt", Some(7)),
+        ];
+        let b = fold_all(&records, None).breakdown;
+        assert_eq!(b.groups.len(), 2, "one id on one machine is one row whatever its label: {:#?}", b.groups);
+        assert!(b.groups.iter().all(|g| g.endpoint_id.as_deref() == Some("azure")));
+        assert_eq!(b.groups[0].total(), 150);
+        assert_eq!(b.overall.total, 157);
+    }
+
+    /// A relayed run executes on the peer, which writes the usage; the asker
+    /// writes only bookends with no counts. Tokens count once, on the
+    /// executor.
+    #[test]
+    fn a_relayed_run_counts_once_on_the_executor() {
+        let sid = "radio.solo.relay.MacBook-Pro.radio.solo.adhoc.radio-host.1";
+        let mut exec = usage_on("studio", "UID-B", None, "work", "darkmux:phi-4", Some(60));
+        exec["session_id"] = sid.into();
+        let asker_start = serde_json::json!({"ts":"2026-10-02T06:00:00Z","action":"dispatch.start","session_id":"radio-ask","machine_id":"MacBook-Pro","machine_uid":"UID-A"});
+        let asker_end = serde_json::json!({"ts":"2026-10-02T06:00:05Z","action":"dispatch.complete","session_id":"radio-ask","machine_id":"MacBook-Pro","machine_uid":"UID-A","payload":{}});
+        let idx = fold_all(&[asker_start, exec, asker_end], None);
+        let g = &idx.breakdown.groups;
+        assert_eq!(g.len(), 1, "{g:#?}");
+        assert_eq!((g[0].machine.as_deref(), g[0].work.calls, g[0].total()), (Some("studio"), 1, 60));
+        assert_eq!(idx.breakdown.overall.total, 60);
+    }
+
+    /// A utility call is a utility row of ITS machine, never specialist work.
+    #[test]
+    fn a_utility_call_lands_in_the_utility_split_of_its_machines_row() {
+        let records = [
+            usage_on("MacBook-Pro", "UID-A", None, "utility", "darkmux:qwen3-4b", Some(9)),
+            usage_on("MacBook-Pro", "UID-A", None, "work", "darkmux:coder", Some(90)),
+        ];
+        let g = fold_all(&records, None).breakdown.groups;
+        let util = g.iter().find(|g| g.requested_model.as_deref() == Some("darkmux:qwen3-4b")).unwrap();
+        assert_eq!((util.utility.total, util.work.calls), (9, 0));
+        let work = g.iter().find(|g| g.requested_model.as_deref() == Some("darkmux:coder")).unwrap();
+        assert_eq!((work.work.total, work.utility.calls), (90, 0));
+    }
+
+    /// A call whose reply reported no usage is a counted call that adds 0
+    /// tokens and says so (`unreported`), the same reading the endpoint
+    /// window ledger takes (`known: 0, metered: false`); the conservative
+    /// charge applies only to a dispatch's own cap.
+    #[test]
+    fn a_usage_less_call_counts_as_a_call_of_zero_tokens_and_is_flagged() {
+        let records = [
+            usage_on("MacBook-Pro", "UID-A", None, "work", "m", None),
+            usage_on("MacBook-Pro", "UID-A", None, "work", "m", Some(40)),
+        ];
+        let g = fold_all(&records, None).breakdown.groups;
+        assert_eq!(g.len(), 1);
+        assert_eq!((g[0].work.calls, g[0].work.total, g[0].work.unreported), (2, 40, 1));
+        assert_eq!(usage_contribution(&records[0]).unwrap().spend, None, "the window ledger reads it as unmetered");
     }
 
     fn fold_all(records: &[serde_json::Value], since: Option<&str>) -> UsageIndex {
