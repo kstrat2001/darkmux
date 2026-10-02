@@ -11,7 +11,7 @@ export interface PanelAgeLabel {
   ageSec: number;
 }
 
-/** viewer.html: `function panelAgeLabel(body, fetchedAt)`. `fetchedAt` is
+/** Legacy `function panelAgeLabel(body, fetchedAt)`. `fetchedAt` is
  * WHEN THIS CLIENT fetched (`Date.now()` at the time — react-query's
  * `dataUpdatedAt` is the direct analog of legacy's `st.fetchedAt`); the
  * daemon reports whether IT served a cached body via `age_ms`, so both are

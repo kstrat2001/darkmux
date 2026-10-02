@@ -1,7 +1,7 @@
 /**
- * The REPLAY arm of `renderMeta()` (viewer.html:1308-1341) and the mission
+ * The REPLAY arm of `renderMeta()` and the mission
  * helpers it shares with the crumb — `liveScopedMissions()` /
- * `primaryMission()` / `missionLabel()` (viewer.html:1207-1221).
+ * `primaryMission()` / `missionLabel()`.
  *
  * `lib/metaLine.ts` is the LIVE arm and stays untouched. Legacy branches
  * these two apart explicitly, and the split is not cosmetic:
@@ -28,13 +28,13 @@ import { machineUids } from "./machineIdentity";
 import { clk, clkrange, lday } from "./format";
 import type { NormRecord } from "./ingest";
 
-/** `missions` — `recompute()`, viewer.html:1052. Distinct `mission_id`s in
+/** `missions` — `recompute()`,. Distinct `mission_id`s in
  * record order, which is timestamp order, so "first" means oldest. */
 function missionIds(data: NormRecord[]): string[] {
   return [...new Set(data.filter((r) => r.mission_id).map((r) => r.mission_id as string))];
 }
 
-/** `liveScopedMissions()` — viewer.html:1207-1214, REPLAY arm only.
+/** `liveScopedMissions()`, REPLAY arm only.
  *
  * The live arm filters to missions with a currently-running session, and
  * returns empty when nothing is running — which is why `goldens/fleet.txt`
@@ -48,14 +48,14 @@ function replayMissions(data: NormRecord[]): string[] {
   return missionIds(data);
 }
 
-/** `primaryMission()` — viewer.html:1216. The single mission the crumb
+/** `primaryMission()`. The single mission the crumb
  * focuses on. */
 export function primaryReplayMission(data: NormRecord[]): string | null {
   const ms = replayMissions(data);
   return ms.length ? ms[0] : null;
 }
 
-/** `missionLabel()` — viewer.html:1217-1221. Caps at two named missions plus
+/** `missionLabel()`. Caps at two named missions plus
  * a "+N more" so a busy day's headline cannot sprawl. `—` (an em dash) when
  * the day has no missions at all, which is a real state: a day of unscoped
  * `dispatch` calls has records and no mission ids. */
@@ -65,7 +65,7 @@ export function replayMissionLabel(data: NormRecord[]): string {
   return ms.length > 2 ? `${ms.slice(0, 2).join(", ")} +${ms.length - 2} more` : ms.join(", ");
 }
 
-/** `setBadges()`'s `DATA_SOURCE` — viewer.html:3465, the `play` arm. Rendered
+/** `setBadges()`'s `DATA_SOURCE`, the `play` arm. Rendered
  * INSIDE the meta line (legacy wraps it in `<b>`), distinct from `#srcbadge`'s
  * own text, which is capitalized differently ("Flow · <date>"). Two strings,
  * two places, and they do not match — so neither is derived from the other. */

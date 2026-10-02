@@ -1,5 +1,5 @@
 /**
- * `● ready · N ⬚ · last run …` — viewer.html:1283.
+ * `● ready · N ⬚ · last run …`.
  *
  * This exists because the port had flattened legacy's three elements into one
  * plain string:

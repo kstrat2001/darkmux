@@ -1,9 +1,9 @@
 /**
- * `renderMeta()` (viewer.html:1278-1307), live-mode branch only — `/next` is
+ * `renderMeta()`, live-mode branch only — `/next` is
  * always daemon-served (no playback/static-context path exists in this
  * scaffold; see `ui/README.md`), so the `else` branch (`DATA_SOURCE`,
  * playback date range) is out of scope. Also folds in `idleStatus()`
- * (viewer.html:1258-1276) — the "● ready · N · last run Xh ago" headline —
+ * — the "● ready · N · last run Xh ago" headline —
  * since this port's corpus never has a LIVE subject (`liveSubject()` needs a
  * running session; the recorded corpus has none — see the packet report),
  * so the `head` branch legacy picks is always `idleStatus()`'s here. The
@@ -43,7 +43,7 @@ function machineCount(liveMachines: Map<string, PresenceBeat>, selfUid: string |
   return uids.size;
 }
 
-/** `idleStatus()` — viewer.html:1258-1276. */
+/** `idleStatus()`. */
 function idleHeadline(data: NormRecord[], liveMachines: Map<string, PresenceBeat>, nowMs: number, selfUid: string | null): string {
   const n = machineCount(liveMachines, selfUid);
   if (!n) return "○ waiting for a machine";

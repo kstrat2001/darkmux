@@ -4,7 +4,7 @@ import { ACTION, payloadOf, type NormRecord } from "./ingest";
 
 /**
  * The event-log row's trailing preview (`renderLog()`'s `detail`,
- * viewer.html:2487-2503) — the part that says WHAT a record did, not merely
+ *) — the part that says WHAT a record did, not merely
  * what kind of record it is.
  *
  * The port rendered `time · activity · machine · session` and stopped there,
@@ -28,7 +28,7 @@ function clip(s: string, max: number): string {
 }
 
 /**
- * `prettyArgs()` (viewer.html:2454-2467) — flatten a tool call's JSON
+ * `prettyArgs()` — flatten a tool call's JSON
  * arguments to `k=v k=v`, each value clipped, so a row shows the search
  * pattern / path / command itself.
  *

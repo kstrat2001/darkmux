@@ -16,7 +16,7 @@ import { isPlainObject } from "./guards";
 import { recordMachineKey, type RecordMachines } from "./machineIdentity";
 import { ACTION, CATEGORY, SOURCE, tagText, wireOf, type NormAction, type NormRecord } from "./ingest";
 
-/** `activityOf()` — viewer.html:1014-1042, the FULL mapping (every branch,
+/** `activityOf()`, the FULL mapping (every branch,
  * including session end / machine online-offline / note, which the port's
  * previous row-label-only subset omitted because nothing yet needed the
  * facet checkboxes those branches feed). */
@@ -63,7 +63,7 @@ const ACTIVITY_NAMES: ReadonlyMap<NormAction, string> = new Map<NormAction, stri
   [ACTION.TierDecision, "routing"],
 ]);
 
-/** `ACT_ORDER` — viewer.html:1047. Preferred display order for the activity
+/** `ACT_ORDER`. Preferred display order for the activity
  * facet: model-doing activities first, then dispatch lifecycle, then fleet
  * lifecycle, then telemetry. */
 export const ACT_ORDER: string[] = [
@@ -455,7 +455,7 @@ export function groupActivitiesBySections(values: string[]): ActivitySectionGrou
   return ACTIVITY_SECTION_ORDER.map((title) => ({ title, values: buckets[title] })).filter((g) => g.values.length > 0);
 }
 
-/** `recompute()`'s facet derivation — viewer.html:1054-1058.
+/** `recompute()`'s facet derivation.
  *
  * One DELIBERATE divergence from legacy, named here because the file it
  * diverges from is about to be deleted and would otherwise stop being
@@ -657,7 +657,7 @@ export function cloneFacetSeen(seen: FacetSeen): FacetSeen {
   return { act: new Set(seen.act), cat: new Set(seen.cat), tier: new Set(seen.tier), src: new Set(seen.src), mach: new Set(seen.mach) };
 }
 
-/** `absorbNewFilterValues()` — viewer.html:3451-3457, called after every
+/** `absorbNewFilterValues()`, called after every
  * `recompute()` (boot, `applyLive()`'s per-poll live-tail merge, and the
  * date-rollover reload). Mutates `seen` and returns a `filters` object
  * describing what a BRAND-NEW facet value (one `seen` has never recorded)

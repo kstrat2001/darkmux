@@ -12,7 +12,7 @@ const OTHER_GROUPS: { title: string; key: keyof Facets }[] = [
 ];
 
 /**
- * `renderFilters()` (viewer.html:2862-2866) — the checkbox-per-facet grid
+ * `renderFilters()` — the checkbox-per-facet grid
  * (activity/category/tier/telemetry source) plus the modal's own search
  * field. Wired to the SAME `records`/`FilterState` the event log itself
  * filters by (`EventLogColumn.tsx` owns the state; this renders the
@@ -32,7 +32,7 @@ const OTHER_GROUPS: { title: string; key: keyof Facets }[] = [
  * over its one flat group, so the affordance is uniform across the panel.
  *
  * **Legacy's per-checkbox `data-act="filter" data-k data-arg` attributes
- * (viewer.html:2864) are deliberately NOT carried over.** The repo's rule is
+ * are deliberately NOT carried over.** The repo's rule is
  * to preserve legacy's `data-act` hooks so e2e coverage transfers rather
  * than being re-authored — but those three were legacy's DELEGATED-EVENT
  * plumbing (one body-level listener reading `data-k`/`data-arg` off the
@@ -188,7 +188,7 @@ export function FiltersBody({
   );
 }
 
-/** `onlyModelActivity()` — viewer.html:2869-2873. Narrows the activity facet
+/** `onlyModelActivity()`. Narrows the activity facet
  * to exactly `DEFAULT_ACTIVITIES` (intersected with what's actually present
  * in `facets.act`, matching legacy's `FACTS.filter(a=>keep.has(a))`).
  *

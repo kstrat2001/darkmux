@@ -91,7 +91,7 @@ export function runsReachable(): boolean {
   return injectedMeta("darkmux-runs-src") !== null;
 }
 
-/** `missionGraphReachable()` — viewer.html:2732. The predicate outlived its
+/** `missionGraphReachable()`. The predicate outlived its
  * original reason and keeps a NEW one (#1868 third packet): it used to mean
  * "is there a separate mission-graph document to navigate to", back when
  * `/mission/<id>/graph` served a standalone page with its own vendored

@@ -25,7 +25,7 @@ import { getSource } from "../lib/source";
 import type { LiveTailStatus } from "../hooks/useLiveTail";
 
 /**
- * The masthead (`.top`, viewer.html:802-816) — brand, build-identifier chip,
+ * The masthead (`.top`) — brand, build-identifier chip,
  * the playback-catalog trigger, the live/mode badge, the manual-refetch
  * control, and the topnav links. Mounted once at `App.tsx`'s root, ABOVE
  * `.app-shell__crumbbar` (matching legacy's DOM order: `.top` precedes
@@ -44,7 +44,7 @@ import type { LiveTailStatus } from "../hooks/useLiveTail";
  * excluding the region) was the chosen fix.
  *
  * **Now wired to the about modal (#1640).** Legacy's populated chip is also
- * the trigger for `#imodalbg` (viewer.html:1132, the build/status snapshot
+ * the trigger for `#imodalbg` (the build/status snapshot
  * dialog) — this component's `verbadge` is a real `data-act="about"` button
  * (only when it has content: an empty chip has nothing to show a dialog
  * about, matching legacy's own `if(vb&&verMeta)` gate). (#2107 "one
@@ -77,7 +77,7 @@ import type { LiveTailStatus } from "../hooks/useLiveTail";
  *
  * **On a static build (#1801, `getSource().kind === "static"`), the badge is TEXT, not a
  * `<CatalogPanel>`.** Legacy's own gate is `if(!flowSrc && mode!=="no-daemon"){
- * sb.dataset.act="catalog"; ... }` (viewer.html:3936) — `#srcbadge` becomes
+ * sb.dataset.act="catalog"; ... }` — `#srcbadge` becomes
  * the history-browser trigger ONLY when a real daemon is behind the page;
  * the static demo's badge stays inert. `CatalogPanel`'s toggle fetches
  * `/flow-days` + `/flow-missions`, neither of which the static demo ships a
@@ -152,7 +152,7 @@ export function Masthead({
   const verText = verMeta ? "ⓘ" : "";
   const verTitle = verMeta ? `darkmux ${verMeta}${schemaMeta ? ` · flow schema ${schemaMeta}` : ""} — about` : undefined;
 
-  // `refreshbtn` — viewer.html:809/3439-ish (`refetchLive()`). No single
+  // `refreshbtn` (`refetchLive()`). No single
   // legacy-equivalent "refetch exactly the live window" hook is exposed
   // from `useLiveTail` today (it owns SSE + a 20s reconcile backstop
   // internally, not a manual trigger) — invalidating every active query is

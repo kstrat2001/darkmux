@@ -294,25 +294,14 @@ export function isAiKind(kind: string | undefined): boolean {
   // `-render` kinds are prompt builders, never dispatchers, and `-collect`
   // kinds are the procedural fan-in step AFTER a `dispatch.map` (they read
   // that step's already-completed results, never dispatch themselves) —
-  // both excluded BEFORE the prefix tests below (see mission-graph.html's
-  // own #1530 note; `-collect` added per #2310 P2 review finding I4 — a
-  // `review.probe-collect`/`review.verify-collect` step was getting a
-  // token/turn meter it never earned, having placed zero dispatches of its
-  // own).
+  // both excluded BEFORE the prefix tests below (#1530; `-collect` per
+  // #2310 P2 review finding I4).
   if (kind.endsWith("-render") || kind.endsWith("-collect")) return false;
   // (#2430) `dispatch.summary` folds the unit outcomes already on disk; it
   // dispatches no model, though its id shares the `dispatch.` prefix.
   if (kind === "dispatch.summary") return false;
   if (kind.indexOf("dispatch.") === 0) return true;
   if (kind === "mission.coder" || kind === "mission.verify") return true;
-  // (#2310 P4d; #2404 P4d round 3) The `review.probe`/`review.judge`/
-  // `review.verify` funnel step kinds this special-case matches were
-  // deleted along with the review funnel itself — `review` today runs
-  // through the generic `dispatch.*`/`mission.*` kinds matched above. This
-  // branch stays only to keep rendering HISTORICAL records emitted by a
-  // run from before that deletion; no live config can mint these kinds.
-  if (kind.indexOf("review.probe") === 0 || kind.indexOf("review.judge") === 0 || kind.indexOf("review.verify") === 0)
-    return true;
   return false;
 }
 

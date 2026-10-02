@@ -1,4 +1,4 @@
-/** `ICON.machine` — viewer.html:935. A chip outline.
+/** `ICON.machine`. A chip outline.
  *
  * Shared rather than local to one lens: it appears on the fleet cards AND in
  * the `#meta` headline beside the online-machine count. The meta one was

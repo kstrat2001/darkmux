@@ -35,7 +35,7 @@ pub use darkmux_doctor as doctor;
 // resolving for doctor/serve/lab.
 pub use darkmux_eureka as eureka;
 // #515 — fleet extracted (deps crew/flow/types all crates now). Re-export
-// keeps crate::fleet::* resolving for serve/phase_cli.
+// keeps crate::fleet::* resolving for serve/phase_review.
 pub use darkmux_fleet as fleet;
 // (#2265) `darkmux finding` — the write-once finding store's read verbs plus
 // `sync`, the store's second producer after the live dispatch tailer.
@@ -106,10 +106,10 @@ mod card_status;
 mod role_cli;
 // #515 — serve daemon extracted (final crate; deps doctor/eureka/fleet/crew/
 // flow/profiles all crates). Re-export keeps crate::serve::* resolving for
-// main + phase_cli.
+// main + phase_review.
 pub use darkmux_serve as serve;
 mod skills;
-mod phase_cli;
+mod phase_review;
 // #463 workspace split (PR2) — profiles/ownership/lms extracted to the
 // darkmux-profiles crate. These re-exports keep crate::{profiles,
 // ownership,lms}::* paths resolving. (2.0, #1405: the

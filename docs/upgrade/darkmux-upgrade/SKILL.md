@@ -2,12 +2,12 @@
 name: darkmux-upgrade
 description: Upgrade a darkmux 3.x home (`~/.darkmux`, or `$DARKMUX_HOME`) to 5.0 safely. Use it when the user is moving from 3.x, or when `darkmux doctor` reports retired keys, spellings, or paths, or darkmux refuses to start over a leftover env var or a `profiles.json` shape. Backs the home up first, then applies exactly what `darkmux doctor` names, in order, re-running doctor after each step and stopping to ask on anything that needs the user's judgment. One-time and optional; `darkmux init` does not install it.
 user_invocable: true
-allowed-tools: "Bash(darkmux:*), Bash(cp:*), Bash(cmp:*), Bash(mv:*), Bash(mkdir:*), Bash(ls:*), Bash(find:*), Bash(jq:*), Bash(bash:*), Bash(lms:*), Bash(env:*), Bash(date:*), Read, Edit"
+allowed-tools: "Bash(darkmux:*), Bash(cp:*), Bash(cmp:*), Bash(mv:*), Bash(mkdir:*), Bash(ls:*), Bash(find:*), Bash(grep:*), Bash(jq:*), Bash(bash:*), Bash(lms:*), Bash(env:*), Bash(date:*), Read, Edit"
 ---
 
 # Upgrade a darkmux 3.x home to 5.0
 
-The 5.0 release refuses retired config keys, env vars, and file shapes instead of guessing what they meant. Each refusal names its fix in `darkmux doctor`. This skill is the safe order for applying those fixes to the user's own files. It is a one-time procedure: follow it start to finish, once.
+The 5.0 release refuses retired config keys, env vars, and the `profiles.json` and mission-config shapes it names, instead of guessing what they meant. Each refusal names its fix in `darkmux doctor`. Everything else from before 5.0 (the old `crew/` layout, mission state in an old spelling, the old lab directory, retired verbs, leftover skills and roles) is no longer read or reported, and steps 5 to 7b cover those by hand. This skill is the safe order for applying all of it to the user's own files. It is a one-time procedure: follow it start to finish, once.
 
 You edit the user's own state: their config, profiles, missions, and shell rc. Treat every file as theirs.
 
@@ -35,7 +35,7 @@ $NEW --version    # must report the new major; if not, you have the wrong binary
 $NEW doctor
 ```
 
-`doctor` and `config` are the only commands that run while a retired env var is set; every other command refuses. Doctor's failures are the work list. The steps below are in the order that worked, but doctor is the authority on what applies to this home.
+`doctor` and `config` are the only commands that run while a retired env var is set; every other command refuses. Doctor's failures are the work list for config, profiles, mission configs, workloads and fixtures. Steps 5 to 7b are not reported by doctor: check them yourself. The steps below are in the order that worked, but doctor is the authority on what applies to the files it names.
 
 The row `user file keys: profiles.json` lists every refused key in that file at once, so read the whole row before editing. Still expect to run doctor several times: fixing one file can reveal the next.
 
@@ -144,7 +144,7 @@ jq --arg p "PROFILE" --argjson i 0 --arg id "ENDPOINT-ID" \
 
 ### 4c. Keys with no effect, and renames
 
-Delete or rename each of these when doctor names it:
+Delete or rename each of these. Doctor now names each as an unknown key and prints the closest valid one:
 
 | Key | Fix |
 |---|---|
@@ -184,46 +184,54 @@ After this step, `darkmux doctor` should load `profiles.json`. If a row still fa
 
 ## Step 5: Lab runs
 
-Doctor's row `lab runs location` fails when `<root>/runs` still holds runs; 4.0 reads `<root>/lab`. Run the exact command it prints: `mv -n <root>/runs <root>/lab`, or `rmdir <root>/lab && mv -n <root>/runs <root>/lab` when an empty `lab` already exists. When runs are on both sides, doctor warns and prints a merge command instead; use that.
+darkmux no longer checks for lab runs in the old place. 4.0 reads `<root>/lab`, and a `<root>/runs` that still holds runs is simply not read, so `darkmux run list --kind lab` shows none of them. Move them yourself, never overwriting: `mv -n <root>/runs <root>/lab`, or `rmdir <root>/lab && mv -n <root>/runs <root>/lab` when an empty `lab` already exists. When runs are on both sides, merge entry by entry with `mv -n` and report any name that stayed behind.
 
 ## Step 6: The old `crew/` layout
 
-Doctor's row `beat-33 crew/ layout` fails when state is still under `<root>/crew/`. It prints a script; read it before running it. Every move in it is `mv -n`, so a name that already exists at the destination is left where it is and the script prints a `LEFTOVERS` line. Compare those two copies with the user, and let them pick which to delete.
+darkmux no longer checks for state under `<root>/crew/`, and the loader resolves `<root>/<subdir>/` only, so anything left there is invisible. Look with `ls "$ROOT/crew"`. Read before moving, and use `mv -n` for every move:
 
-**Trap: the script is bash, not zsh.** In zsh the `.[!.]*` glob aborts the whole command when nothing matches. Current doctor prints the script wrapped in `bash <<'DARKMUX_CREW_MERGE'` at column zero, unwrapped, so the block runs as printed from any shell. If the script you were shown is not wrapped, run it with `bash -c` or save it to a file and run `bash file`.
-
-What it does:
-
-- `crew/roles`, `crew/crews`, `crew/skills`, `crew/missions`, `crew/phases` move to the same names at the root, merging entry by entry when the destination exists.
-- Pre-#148 **flat** mission and phase files (`crew/missions/<id>.json`) and `crew/sprints` are **kept, not deleted**: they move to `<root>/archive/pre-148-missions/`. 5.0 reads neither, and `darkmux mission migrate` no longer exists, so the archive is the answer. (An older build moved those files into `missions/`, where the next check then refused them. If doctor's row `mission state files` names flat files under `missions/` or `phases/`, its remedy is the same archive move.)
-- `crew/role-model-pins.json` is never moved. Nothing reads it; doctor says to delete it. Ask before deleting.
+- `crew/roles`, `crew/crews`, `crew/skills`, `crew/missions`, `crew/phases` move to the same names at the root. When the destination exists, merge entry by entry, and compare any name that already exists on both sides with the user instead of choosing.
+- Pre-#148 **flat** mission and phase files (`crew/missions/<id>.json`, `missions/<id>.json`, `phases/<id>.json` directly under the root) and `crew/sprints` are not read by 5.0 and `darkmux mission migrate` no longer exists. **Keep, do not delete:** move them to `<root>/archive/pre-148-missions/`.
+- `crew/role-model-pins.json` is never moved. Nothing reads it. Ask before deleting.
 - The autonomous-dispatch preamble override moves to `<root>/AUTONOMOUS_DISPATCH_PREAMBLE.md`.
 
-Run doctor again. The row should pass, and `crew/` should be gone (`rmdir` succeeds only when it is empty; whatever remains is either the user's own or a `LEFTOVERS` line).
+`rmdir "$ROOT/crew"` succeeds only when it is empty; whatever remains is the user's own.
 
 ## Step 7: Mission state under `missions/<id>/`
 
-Doctor's row `mission state files` names every file and the one-line fix. The renames:
+darkmux no longer refuses a mission file in an old spelling, so each of these goes unnoticed until you look: a `mission.json` that still says `sprint_ids` loads as a mission with no phases. Check for the old spellings and rename them:
 
 | In | Old | New |
 |---|---|---|
 | `mission.json` | key `sprint_ids` | `phase_ids` |
 | `mission.json` | key `closed_ts` | `finalized_ts` |
 | `mission.json` | status value `closed` | `finalized` |
+| `mission.json` | status value `paused` (the no-op `mission pause` verb) | `active` |
 | `tasks/<phase>/*.json` | key `sprint_id` | `phase_id` |
 | the mission directory | `sprints/` | `phases/` |
 
-Rename keys in place, keeping their order, and never overwrite: skip the file and report it if the new key already exists. For each `mission.json`:
+Find them with `grep -l -e sprint_ids -e closed_ts -e '"closed"' -e '"paused"' "$ROOT"/missions/*/mission.json` and `ls -d "$ROOT"/missions/*/sprints`. Rename keys in place, keeping their order, and never overwrite: skip the file and report it if the new key already exists. For each `mission.json`:
 
 ```bash
 jq 'with_entries(if .key == "sprint_ids" and (has("phase_ids") | not) then .key = "phase_ids"
                  elif .key == "closed_ts" and (has("finalized_ts") | not) then .key = "finalized_ts" else . end)
-    | if .status == "closed" then .status = "finalized" else . end' mission.json > mission.json.new
+    | if .status == "closed" then .status = "finalized" elif .status == "paused" then .status = "active" else . end' mission.json > mission.json.new
 ```
 
 Use the same `with_entries` shape with `sprint_id` to `phase_id` for each task file. For the directory: `mv -n sprints phases` when `phases/` does not exist. When both exist, merge with `mv -n` per entry and report any name that stayed behind.
 
-A large home can have hundreds of files, so loop in a script and report the counts (files, renames, directories). Re-run doctor at the end.
+A large home can have hundreds of files, so loop in a script and report the counts (files, renames, directories).
+
+## Step 7b: Leftovers darkmux no longer reports
+
+darkmux used to find and name these. It now ignores them, so check once by hand:
+
+- **Installed skills that darkmux no longer ships.** `darkmux init` used to delete retired `darkmux-*` skill directories; it now leaves them. A leftover can still teach an agent a dead verb. List `~/.claude/skills/darkmux-*` and the other agent skill directories `darkmux init` writes to, compare with `ls skills/` in the source tree (or the release's bundled list), and ask before deleting any. `darkmux doctor` still warns on an installed skill that differs from the bundled copy.
+- **Retired roles in the user tier.** `<root>/roles/mission-compiler.json` (and its `.md`), `scribe.json` and `scribe.md` retired with `mission propose` and `lab notebook`. Nothing dispatches them, though a leftover `.json` still shows in `darkmux role list`. Ask, then delete.
+- **A role manifest with `"role_family": "admin"`.** The value was renamed to `"utility"` long ago and a manifest still using it is now rejected as an unknown family. Set `"role_family": "utility"`.
+- **Retired verbs.** A script that calls one now gets the usual unrecognized-subcommand error instead of a message naming the replacement. The replacements: `mission dispatch`, `mission add-phase`, `mission start`, `mission pause` and `mission resume` are gone (use `mission launch <config>`, `mission abort <id>` and `mission finalize <id>`); `lab run list|inspect|stats|compare` became `darkmux run list --kind lab`, `run inspect`, `run stats` and `run compare`; `lab eval` became `lab run <workload>` and `mission launch review`; `finding list --dispatch` is `--execution`; `--session-id` and `--session` on `dispatch`, `flow` and `memory correction list` are `--name` and `--execution`; `--runs` is `--repeat`; `mission status --missions` is `--named`; `dispatch --phase-id` is gone; `swap`, `status`, `model` and `fleet` folded into `machine` (`machine status`, `machine eject`, `machine list`); `lessons` is `memory lesson`.
+- **Pre-2.6.0 audit files** (the struct-hash format) are not recognized as a chain: `darkmux flow integrity-check` reports them as unverifiable instead of "legacy, rotate it". Rotate them by moving the file aside so a new chain starts.
+- **Pre-4.0 flow archives.** Their free-form session ids (`task-<id>`, `mission-run-<m>-<p>`, `step-<id>`) are not read as sessions, and records in a retired action spelling read as an unknown action: they stay on disk and show in the event log, but attach to no mission, and no host-load track is drawn from a pre-4.0 `telemetry.process` record.
 
 ## Step 8: Mission configs, workloads, fixtures
 
@@ -251,7 +259,7 @@ Doctor lists each file under `user file keys: <file>`. The fixes it names:
 darkmux doctor
 ```
 
-The retired-state failures should be gone. What remains falls into two groups; report both and leave them to the user:
+The retired config-key and `profiles.json` failures should be gone. What remains falls into two groups; report both and leave them to the user:
 
 - **Not an upgrade blocker, the user's call:** temp-directory residue, stale skills (`darkmux init` refreshes them), the roster's loopback address or identity, state-file permissions, legacy audit files, stray hook outboxes, a Redis password.
 - **A 3.x daemon still consuming the retired queue:** the row `retired work queue` fails while one is. The consumer can be another machine, or this machine's own 3.x daemon: check the consumer names in the row, and stopping this machine's 3.x `darkmux serve` is then the fix. Setting `redis.enabled` to false hides the row while the hole is still open, so do not use it to make the row go away.

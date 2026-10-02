@@ -41,7 +41,7 @@ export interface LiveSessionsResult {
   coverage: DegradedFleetSource | null;
 }
 
-/** `pollLiveSessions()` (viewer.html:3664) as a query hook. */
+/** `pollLiveSessions()` as a query hook. */
 /** `enabled` (#1800 P2): a REPLAY must not poll live presence. Passing the
  * result away is not enough — the query still fires, still polls on
  * `refetchInterval`, and still describes NOW. This stops the request. */

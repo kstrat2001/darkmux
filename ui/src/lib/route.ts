@@ -204,7 +204,7 @@ export type Route =
    * to ask `/flow/<date>` for one either. Legacy's own flowSrc branch has the
    * identical gap — `let date=injectedDate||targetDate()` defaults to today,
    * then gets overwritten by `RAW[0].ts` ONLY once the file has actually
-   * loaded (viewer.html:3902) — so the real date is knowable only after a
+   * loaded — so the real date is knowable only after a
    * fetch this synchronous parser can't perform. `null` names that honestly;
    * a consumer that needs a display date derives one from the loaded records
    * via `lib/flow.ts::firstRecordDate`, the same derivation legacy performs,
@@ -214,7 +214,7 @@ export type Route =
 
 /** (Packet 5) Should the App-level live tail (`hooks/useLiveTail.ts` — SSE +
  * reconcile backstop feeding the FLEET-wide rolling window) be running for
- * this route? Mirrors legacy's `wantsPlayback` (viewer.html:3853:
+ * this route? Mirrors legacy's `wantsPlayback` (
  * `injectedMode==="play" || !!flowSrc || !!cq`, where `cq` is a mission/
  * session catalog query) — `playback`/`session`/`mission` are all requests
  * for a SPECIFIC slice, not the rolling live window, so `boot()` never
@@ -230,8 +230,8 @@ export type Route =
 export function isLiveRoute(route: Route): boolean {
   // (#1801) A daemon-less build is NEVER live, on any lens. Legacy's gate is
   // GLOBAL — `wantsPlayback = injectedMode==="play" || !!flowSrc || !!cq`
-  // (viewer.html:3880) — and `startLiveTail(date); startLivePoll();` runs only
-  // under `if(mode==="live")` (viewer.html:3956), so a static build never
+  // — and `startLiveTail(date); startLivePoll();` runs only
+  // under `if(mode==="live")`, so a static build never
   // opens an SSE stream or a presence poll no matter which lens is showing.
   //
   // This gate was keyed on route KIND alone, and `parseRoute` resolves `lens=`
@@ -294,10 +294,10 @@ export function tokRateConnectionEvidence(
  * catalog/replay overlay; hidden on runs and machine" — that is WRONG,
  * verified two ways against the actual legacy source:
  *
- * 1. Reading `renderCrumb()` (viewer.html:2521): `document.body.classList
+ * 1. Reading `renderCrumb()`: `document.body.classList
  *    .toggle("runs-mode", inRuns||inConsole)` — CONSOLE sets `runs-mode`
  *    too, not just runs. `machine-mode` is its own separate toggle
- *    (line 2523). The CSS (viewer.html:106/258) hides `.log`/`.split`/
+ *    (line 2523). The CSS hides `.log`/`.split`/
  *    `.scrub` on BOTH `body.runs-mode` and `body.machine-mode`.
  * 2. A throwaway Playwright probe against the recorded corpus
  *    (`getComputedStyle('.log').display` per lens, via the harness's own
@@ -485,7 +485,7 @@ export function parseRoute(): Route {
   // playback UNCONDITIONALLY — checked here, above even an explicit bare
   // `#<date>` hash, because it mirrors legacy's own precedence exactly:
   // `wantsPlayback = injectedMode==="play" || !!flowSrc || !!cq`
-  // (viewer.html:3880) forces the playback branch regardless of what `date`
+  // forces the playback branch regardless of what `date`
   // holds, and the flowSrc RECORD-LOADING branch itself (3897-3906) reads
   // the committed file unconditionally too — a hash like `#2026-08-01` on a
   // static build has no daemon behind it to serve THAT day, so legacy
@@ -515,8 +515,7 @@ export function parseRoute(): Route {
     // not in the URL the client can read as a route: the server responds to
     // the path with `inject_mode_meta(html, "play", Some(date))`, and the
     // browser's `location` shows `/play/2026-08-07` with no hash and no query.
-    // Legacy reads those metas at boot (`injectedMode`/`injectedDate`,
-    // viewer.html:3836+) — this port read only version/schema, so before the
+    // Legacy reads those metas at boot (`injectedMode`/`injectedDate`) — this port read only version/schema, so before the
     // flip it had no way to know and no reason to: `/play/:date` served
     // LEGACY, and `/next` was live-only by construction.
     //

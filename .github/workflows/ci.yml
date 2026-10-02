@@ -881,9 +881,9 @@ jobs:
           python3 scripts/flow-action-guard.py --self-test
           python3 scripts/flow-action-guard.py
       - name: Flow records are read through the one reader (5.0)
-        # `darkmux_flow::reader` upgrades a retired spelling and keeps an
-        # action it does not know as `FlowAction::Other`, so a record a newer
-        # darkmux wrote still reads. Production code that deserializes a
+        # `darkmux_flow::reader` maps nothing and keeps an action it does not
+        # know (a retired spelling, or one a newer darkmux wrote) as
+        # `FlowAction::Other`, so such a record still reads. Production code that deserializes a
         # `FlowRecord` itself skips that. The guard self-tests before it scans;
         # test code and the reader itself are exempt.
         run: |

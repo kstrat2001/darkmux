@@ -88,8 +88,7 @@
   --accent: #4fd1c5;
   --error: #f56565;
   --border: #232838;
-  /* Semantic status colors, carried over from legacy's palette
-     (viewer.html `:root`). These were USED before they were DEFINED — a
+  /* Semantic status colors, carried over from legacy's palette. These were USED before they were DEFINED — a
      `var(--warn)` with no fallback is invalid at computed-value time, so the
      property silently unsets rather than erroring. `.fleetcov` (the
      coverage-degraded banner, #1729) therefore rendered with inherited body
@@ -217,8 +216,7 @@ body {
   width: 100%;
 }
 
-/* ── Nav chrome (Packet 1.5) — port of legacy's `.crumbbar` (viewer.html:89,
-   816): the lens-tab bar (`.lenstabs`/`.lens`) plus `#crumb`/`#meta` sharing
+/* ── Nav chrome (Packet 1.5) — port of legacy's `.crumbbar` (816): the lens-tab bar (`.lenstabs`/`.lens`) plus `#crumb`/`#meta` sharing
    one row. `#crumb`/`#meta` keep their OWN element/id (unchanged from
    Packets 1-3 — only their PARENT moved), so this is pure layout, not a
    content change; the parity extractor selects by id regardless of DOM
@@ -596,7 +594,7 @@ body {
   min-width: 0;
 }
 
-/* ── Masthead (Chrome packet) — port of legacy's `.top` (viewer.html:802-816).
+/* ── Masthead (Chrome packet) — port of legacy's `.top`.
    Precedes `.app-shell__crumbbar`, matching legacy's DOM order. */
 .masthead {
   display: flex;
@@ -915,9 +913,9 @@ body {
 }
 
 /* ── Content row (Chrome packet) — `#stage` beside the event-log column,
-   the port of legacy's `.wrap` (viewer.html:822-847: `.stage` then `.log`,
+   the port of legacy's `.wrap` (`.stage` then `.log`,
    siblings). Stacks on phone width, matching legacy's own mobile-first
-   `.wrap{display:block}` rule (viewer.html:672-680). */
+   `.wrap{display:block}` rule. */
 .app-shell__content {
   display: flex;
   /* `stretch`, not `flex-start`: the event-log column fills the row's height
@@ -934,9 +932,8 @@ body {
   }
 }
 
-/* ── Event-log column (Chrome packet) — port of legacy's `.log`
-   (viewer.html:321) + `.detail`/`.split`/`.loglist`/`.loghead`/`.logsearch`/
-   `#logbody`/`.rec` (viewer.html:321-372). Only mounted (never just
+/* ── Event-log column (Chrome packet) — port of legacy's `.log` + `.detail`/`.split`/`.loglist`/`.loghead`/`.logsearch`/
+   `#logbody`/`.rec`. Only mounted (never just
    CSS-hidden) when `lib/route.ts`'s `showsEventLog(route)` is true — see
    that function's own doc for the verified visibility rule.
 
@@ -1273,7 +1270,7 @@ body {
   }
 }
 /* `runs`/`console`/`machine` — port of legacy's `body.runs-mode .log,
-   body.machine-mode .log{display:none}` (viewer.html:106/258), applied here
+   body.machine-mode .log{display:none}`, applied here
    as a class on the column itself (this app conditionally SETS the class
    per route in `App.tsx` rather than toggling a body class) instead of
    unmounting it — see `EventLogColumn.tsx`'s own `visible` doc for why
@@ -1753,7 +1750,7 @@ body {
   border-radius: 6px;
   /* 16px, not 12px — iOS Safari zooms the whole page on focus of a text
      input under 16px; same rationale as legacy's own `.searchbox input`
-     rule (viewer.html:341-347). */
+     rule. */
   padding: 6px 26px;
   font: calc(16px * var(--fs-scale)) var(--font-mono);
 }
@@ -2335,7 +2332,7 @@ body {
 .eventlog__recsession {
   color: var(--dim);
 }
-/* Row preview + per-activity glyph (viewer.html:621-635). The glyph is the
+/* Row preview + per-activity glyph. The glyph is the
    only thing on a log row that says "tool call" vs "reasoning" without
    reading; the preview is the only thing that says WHAT the call did. Both
    were absent from the port until the operator noticed — an inline SVG adds
@@ -4767,7 +4764,7 @@ body {
    any more — that region now holds its OWN cards (`.memcard`, below), and a
    bordered/padded wrapper around a stack of bordered/padded cards is a
    double border, not a nested one. */
-/* `.memwrap`, viewer.html:273 — flex-column + gap is how legacy spaces its
+/* `.memwrap` — flex-column + gap is how legacy spaces its
    OWN card stack, and it is verified layout-safe for this exact purpose:
    `tests/parity/goldens/machine.txt` was captured off legacy's real
    `.memwrap`-nested `.memcard`s and shows clean one-line-per-string text
@@ -5652,7 +5649,7 @@ body {
    with the `<a>` it styled (`MachineLens.tsx`). */
 
 /* `.hint` is used by this lens's empty state and was likewise undefined —
-   legacy defines it at viewer.html:455. */
+   legacy defines it at. */
 .hint {
   display: block;
   color: var(--dim);
@@ -6459,7 +6456,7 @@ body {
 
 /* ── Modal dialogs (#1640) — Filters/About ───────────────────────────────
    viewer.html's `.modalbg`/`.modal`/`.mhd`/`.mx`/`.fgroup`/`.mft`/
-   `.rrdetail`/`.kv` block (viewer.html:649-663, 574, 510-513), ported under
+   `.rrdetail`/`.kv` block, ported under
    fresh `.dialog*` BEM names — the port is free to restyle (per the packet
    brief: "visual styling may differ, text content must match"); only the
    element `id`s (`#modalbg`/`#imodalbg`) and `data-act` hooks

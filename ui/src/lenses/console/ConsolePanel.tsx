@@ -213,7 +213,7 @@ export function ConsolePanel({
   );
 }
 
-/** viewer.html: one `.runchip[data-act="setpanel"]` entry of the tab bar. */
+/** Legacy one `.runchip[data-act="setpanel"]` entry of the tab bar. */
 function PanelTab({ id, label, active, onSelect }: { id: PanelId; label: string; active: boolean; onSelect: (id: PanelId) => void }) {
   return (
     <span
@@ -837,7 +837,7 @@ function BooleanToken({
   );
 }
 
-/** viewer.html: `renderConsole()`'s body switch (`.panelout`/`.panelerr`,
+/** Legacy `renderConsole()`'s body switch (`.panelout`/`.panelerr`,
  * loading > error > loaded > not-yet-run precedence). The loaded branch is
  * the ONLY one using a real `<pre>` element — see `styles.css`'s module doc
  * for why the tag choice (not just the class) matters.

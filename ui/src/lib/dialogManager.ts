@@ -15,7 +15,7 @@
  * The keyboard machinery — Tab-trap, Shift+Tab wrap, single-Escape-closes-
  * the-open-dialog, focus-restore-on-close — is installed ONCE at module
  * load, mirroring legacy's own top-level `document.addEventListener` calls
- * (viewer.html:2944-2980).
+ *.
  *
  * **Port note — `openModalEl` is also assigned to `window`.** This is a
  * deliberate, narrow exception to this port's otherwise-firm "no page
@@ -67,7 +67,7 @@ export function isModalOpen(id: ModalId): boolean {
 }
 
 /**
- * `openModalEl()` — viewer.html:2919-2931 (#1640). EXACTLY ONE dialog may be
+ * `openModalEl()` (#1640). EXACTLY ONE dialog may be
  * open. Opening any dialog while another is already open closes the first
  * one WITHOUT restoring focus (legacy's `closeOpenModal({restore:false})`) —
  * "topmost" and "only" become the same thing by construction, and the
@@ -81,7 +81,7 @@ export function openModalEl(id: ModalId): void {
   // `window.openModalEl('bogus')` sets `openId` to an element that does not
   // exist: nothing renders, and the next Escape is silently swallowed
   // closing the dialog that isn't there. Legacy no-ops on a missing element
-  // (`const m=$(id); if(!m)return;` — viewer.html:2928); this is that.
+  // (`const m=$(id); if(!m)return;`); this is that.
   if (!MODAL_IDS.includes(id)) return;
   if (openId !== null) {
     // Swap: close the currently-open one silently, keep `returnFocus` as-is.
@@ -95,7 +95,7 @@ export function openModalEl(id: ModalId): void {
 }
 
 /**
- * `closeOpenModal()` — viewer.html:2967-2977. Closes whichever dialog is
+ * `closeOpenModal()`. Closes whichever dialog is
  * open (there is only ever one, by construction — see `openModalEl`).
  * `{restore:false}` keeps the remembered focus target instead of consuming
  * it, for the "swapping to another dialog" case above. Returns `true` iff a
@@ -116,7 +116,7 @@ export function closeOpenModal(opts?: { restore?: boolean }): boolean {
   return true;
 }
 
-/** `isModalOpen`/focusable-query subset of viewer.html:2936-2958's Tab-trap —
+/** `isModalOpen`/focusable-query subset of the Tab-trap —
  * matches the exact selector + "actually visible or currently focused"
  * filter legacy uses, so a hidden-but-present control (e.g. a `hidden`
  * `<details>` child) is never treated as a tab stop. */
@@ -129,8 +129,7 @@ function focusableIn(scope: Element): HTMLElement[] {
 }
 
 /**
- * `document.addEventListener("keydown", ..., true)` — viewer.html:2944-2958
- * (#1640). Capture-phase so it sees Tab before anything else. Keeps Tab (and
+ * `document.addEventListener("keydown", ..., true)` (#1640). Capture-phase so it sees Tab before anything else. Keeps Tab (and
  * Shift+Tab) cycling within the open dialog's own focusable set; focus that
  * has somehow ended up OUTSIDE the dialog (page just loaded, or it escaped
  * earlier) is pulled back to the FIRST control rather than left to wander.
@@ -159,7 +158,7 @@ function handleTabTrap(e: KeyboardEvent): void {
   }
 }
 
-/** viewer.html:3055-3057's Escape arm — bubble phase, no capture. Closes
+/** The Escape arm — bubble phase, no capture. Closes
  * whichever dialog is open; a no-op when nothing is. (Legacy also closes the
  * catalog panel here — that panel owns its own Escape handler independently
  * in this port, see `CatalogPanel.tsx`, so this stays scoped to dialogs.) */

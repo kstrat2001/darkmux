@@ -8,10 +8,10 @@ import { runIndex, sessionRun, __runIndexBuilds } from "./runRef";
 
 /**
  * (#1801) The static-demo record pipeline: `ingestJsonl` (the flowSrc
- * branch's own line-by-line parse, viewer.html:3899-3901),
+ * branch's own line-by-line parse),
  * `fetchStaticFlowRecords` (the GET + parse, its own silent-empty-on-failure
  * contract), and `firstRecordDate` (the RAW[0].ts date derivation,
- * viewer.html:3902). All three are exercised indirectly by
+ *). All three are exercised indirectly by
  * `useRouteRecords.test.tsx`/`PlaybackLens.test.tsx`'s static-mode cases;
  * these cover the pure-function edges those integration tests don't reach on
  * their own (a malformed line, a CRLF file, a schema-header-first file).

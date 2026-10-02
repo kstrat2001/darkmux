@@ -120,7 +120,7 @@ export function utilityModelId(specs: MachineSpecsResponse | null, isLocalSpecs:
   return specs?.utility_model?.id ?? null;
 }
 
-/** `limitDescription()` — viewer.html:4896's inline ternary, factored out so
+/** `limitDescription()` — an inline ternary, factored out so
  * every k/v surface naming the limit's source (Stage 2/3's machine detail
  * row, `MachineHealthRegion.tsx`) has one source of truth for the wording. */
 export function limitDescription(limitSource: string | null | undefined): string {
@@ -133,19 +133,19 @@ export function limitDescription(limitSource: string | null | undefined): string
   return "no limit readable";
 }
 
-/** `memStampText()` — viewer.html:4879. */
+/** `memStampText()`. */
 export function stampLine(b: MachineResourcesResponse): string {
   const gather = b.gather_ms != null ? String(b.gather_ms) : "—";
   const cache = b.cache_ttl_ms != null ? String(b.cache_ttl_ms) : "—";
   return `gather ${gather} ms (zero model dispatches) · server cache ${cache} ms · polled every ${MACHINE_MEM_POLL_MS / 1000}s`;
 }
 
-/** The attribution footer line — viewer.html:1930. */
+/** The attribution footer line. */
 export function attributionLine(b: MachineResourcesResponse): string {
   return `attribution: ${b.attribution_note || b.attribution || "—"}`;
 }
 
-/** `perScale` — viewer.html:1891. The common scale every PER-MODEL row's bar
+/** `perScale`. The common scale every PER-MODEL row's bar
  * is drawn against: the largest single potential/current figure among all
  * rendered models, so a small model's bar stays legible next to a large one.
  * Re-exported from `machineGauge.ts` for that module's own consumers — see
@@ -155,7 +155,7 @@ export function perModelScale(models: ModelRow[]): number {
   return Math.max(1, maxOf(models.map((mm) => Math.max(Number(mm.potential_bytes) || 0, Number(mm.current_bytes) || 0))) ?? 0);
 }
 
-/** The not-local placeholder sentence — viewer.html:1871. Named export
+/** The not-local placeholder sentence. Named export
  * (rather than an inline literal in the component) so the wording has
  * exactly one source. */
 export function notLocalMessage(machineName: string): string {
@@ -167,16 +167,16 @@ export function notLocalMessage(machineName: string): string {
   return `residency / RAM not reported from here: local-probe only. View the machine page on ${machineName || "that machine"} directly for live figures.`;
 }
 
-/** The daemon-unreachable-with-no-cached-data placeholder — viewer.html:1873. */
+/** The daemon-unreachable-with-no-cached-data placeholder. */
 export const DAEMON_UNREACHABLE_MESSAGE =
   "daemon not reachable — the machine lens reads live probes via /machine/resources (CLI twin: darkmux machine resources).";
 
-/** The first-fetch-in-flight placeholder (viewer.html:1875) retired by
+/** The first-fetch-in-flight placeholder retired by
  * #2862 — `MachineHealthRegion` now draws a `Shimmer` in its place rather
  * than this literal string. Kept out of the export surface on purpose so a
  * new caller doesn't reach for the bare-text pattern this issue removed. */
 
-/** The stale-cached-snapshot banner — viewer.html:1880. Stage 2/3 renders
+/** The stale-cached-snapshot banner. Stage 2/3 renders
  * it as `.mm-stalebanner` above the desaturated hero, not as a `.memwarn`
  * line: legacy showed it inside the ledger card because the ledger WAS the
  * page, whereas the banner now has to caption an entire instrument cluster

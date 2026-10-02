@@ -57,9 +57,9 @@ import { Shimmer } from "../../components/Placeholder";
  * Dismissal (QA must-fix — legacy has THREE ways to close `#catpanel`, this
  * component dropped all of them at first): ported both of legacy's handlers
  * verbatim as one `useEffect`, active only while `open` —
- *   - Escape (`viewer.html:3020-3023`): closes unconditionally.
+ *   - Escape: closes unconditionally.
  *   - click outside the panel AND outside the toggle
- *     (`viewer.html:3002-3008`): both live inside `.catalog-anchor` below, so
+ *: both live inside `.catalog-anchor` below, so
  *     one `!anchorRef.current.contains(e.target)` containment check covers
  *     both exclusions at once — a click on the toggle re-closes via the
  *     toggle's OWN `onClick` (which already flips `open`), never a second,
@@ -117,7 +117,7 @@ export function CatalogPanel({ label }: { label?: ReactNode } = {}) {
     setOpen(false);
   }
 
-  // viewer.html:3002-3008 (click outside) + viewer.html:3020-3023 (Escape).
+  // Click outside, and Escape.
   // Attached only while `open` — a closed panel has nothing to dismiss, and
   // re-attaching fresh on every open avoids a stale-closure `open` check
   // inside the handlers (the effect itself is the gate).
@@ -156,7 +156,7 @@ export function CatalogPanel({ label }: { label?: ReactNode } = {}) {
         // (Chrome packet) `aria-label` is a CONSTANT "browse history"
         // regardless of `label` below — legacy's own `#srcbadge` does
         // exactly this split (visible text "LIVE"/a mission id/a date,
-        // `title`="browse history" — viewer.html:3909) when `<Masthead>` renders this
+        // `title`="browse history") when `<Masthead>` renders this
         // component in the source/date-badge slot: it passes the pill's own
         // content (`label={pillLabel(...)}`) so the VISIBLE text matches the masthead byte-for-byte
         // (`tests/parity/goldens/fleet.txt`'s `=== topbar ===` section), while
@@ -224,7 +224,7 @@ function CatalogContent({
   return (
     <>
       <div className="cathdr">playback catalog</div>
-      {/* `data-act`/`data-arg` on every row below — viewer.html:3122/3130/3142
+      {/* `data-act`/`data-arg` on every row below
           (`data-act="golive"`/`"goday"`/`"gomission"`) — carry no behavior
           here (each row's own `onClick` above does the navigating, not a
           delegated listener reading these attrs off the click target), same

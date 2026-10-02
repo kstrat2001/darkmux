@@ -450,7 +450,7 @@ fn make_coder_result_artifact() -> Arc<dyn Any + Send + Sync> {
 
 fn make_coder_verify_result_artifact() -> Arc<dyn Any + Send + Sync> {
     Arc::new(Mutex::new(
-        None::<std::result::Result<crate::phase_cli::PhaseReviewOutput, String>>,
+        None::<std::result::Result<crate::phase_review::PhaseReviewOutput, String>>,
     ))
 }
 
@@ -973,12 +973,12 @@ impl StepKind for MissionCoderStepKind {
 }
 
 /// Wraps the mechanical-verify half of the old hand-written sequence
-/// (`phase_cli::phase_review_output_at` against the worktree diff). Its
+/// (`phase_review::phase_review_output_at` against the worktree diff). Its
 /// `run()` role is ALWAYS `"code-reviewer"` — that's hardcoded inside
 /// `phase_review_output_at` itself (the coder-phase QA gate), not something
 /// the caller overrides.
 ///
-/// **Tier 3 (#1352), on purpose.** Wraps the whole `phase_cli`
+/// **Tier 3 (#1352), on purpose.** Wraps the whole `phase_review`
 /// mechanical-review pipeline (a multi-step process of its own, not a
 /// single dispatch), with a hardcoded role and coder-phase-specific
 /// CLI/`ArtifactBus`-result plumbing (#1530 Packet 2). No second consumer
@@ -1051,7 +1051,7 @@ impl StepKind for MissionVerifyStepKind {
         // `build-verify` task declares. See that task's own `notes` entry
         // for why this is documented-decorative rather than wired: the
         // reviewer prompt's TEXT also self-identifies as "the darkmux
-        // `code-reviewer` role" (src/phase_cli.rs), so making this
+        // `code-reviewer` role" (src/phase_review.rs), so making this
         // role-configurable is a real feature (a role-agnostic prompt), not
         // a one-field wire.
         _task: &crew::types::Task,
@@ -1059,7 +1059,7 @@ impl StepKind for MissionVerifyStepKind {
         run_ctx: &StepRunCtx,
     ) -> Result<StepOutcome> {
         let result_slot = run_ctx
-            .artifact::<Mutex<Option<std::result::Result<crate::phase_cli::PhaseReviewOutput, String>>>>(
+            .artifact::<Mutex<Option<std::result::Result<crate::phase_review::PhaseReviewOutput, String>>>>(
                 CODER_VERIFY_RESULT_ARTIFACT,
             )
             .expect("register_coder_phase_kinds seeds the coder.verify-result artifact before the graph runs");
@@ -1071,7 +1071,7 @@ impl StepKind for MissionVerifyStepKind {
             style::header("▶ local QA: dispatching `code-reviewer` against the worktree diff…")
         );
 
-        match crate::phase_cli::phase_review_output_at(&ctx.wt_path, Some(&ctx.base), Some(&ctx.phase_id)) {
+        match crate::phase_review::phase_review_output_at(&ctx.wt_path, Some(&ctx.base), Some(&ctx.phase_id)) {
             Ok(review) => {
                 print_review_summary(&review);
                 let verdict = review.verdict.to_string();
@@ -2899,7 +2899,7 @@ fn print_token_line(t: &darkmux_trajectory::TokenSum) {
 }
 
 /// Render the QA verdict + findings with severity coloring.
-fn print_review_summary(review: &crate::phase_cli::PhaseReviewOutput) {
+fn print_review_summary(review: &crate::phase_review::PhaseReviewOutput) {
     let verdict_styled = match review.verdict.as_str() {
         "clean" => style::success("clean"),
         "flags-only" => style::warn("flags-only"),

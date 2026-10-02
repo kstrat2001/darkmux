@@ -59,7 +59,7 @@ export interface ScrubberProps {
    * `humanMissionLabel`): the clock then renders alone rather than
    * falling back to a raw id, which lives only in the Machine info
    * modal's `playback` row now, not here. Legacy's own `visible()+"/"+DATA
-   * .length+" rec"` readout (viewer.html:2619) that used to sit here is
+   * .length+" rec"` readout that used to sit here is
    * gone too — the range input IS the progress indicator; the counts
    * moved to that same modal row alongside the id. */
   label?: string | null;
@@ -89,7 +89,7 @@ export function Scrubber({
   // `span` (floored to 1) feeds `onScrub`'s drag math below, so a drag on a
   // zero-span day never divides by zero. The RENDERED value is a separate
   // question — legacy's own rule is `span > 0 ? Math.round(...) : 100`
-  // (viewer.html:2618, `#1640`): a zero-span day pins the thumb at the END,
+  //: a zero-span day pins the thumb at the END,
   // not the start. Flooring `span` to 1 before that branch (a prior version
   // of this line did) silently took the `span > 0` arm with a floored span
   // instead of the real one, computing 0 instead of following legacy's

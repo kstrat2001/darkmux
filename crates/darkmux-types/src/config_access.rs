@@ -487,7 +487,7 @@ pub fn lms_bin_with_source() -> (String, Source) {
 /// The LMStudio **base** URL (`scheme://host:port`), resolving
 /// `env(DARKMUX_LMSTUDIO_URL) > config.lmstudio_url > http://localhost:1234`.
 /// Callers append their endpoint path: `/v1/chat/completions`
-/// (`phase_cli::lmstudio_chat_url`) and `/v1/models` (the `dispatch_internal`
+/// (`phase_review::lmstudio_chat_url`) and `/v1/models` (the `dispatch_internal`
 /// model probe).
 ///
 /// (#661 Slice 4) `DARKMUX_LMSTUDIO_URL` is the **base** URL — a clean pre-1.0

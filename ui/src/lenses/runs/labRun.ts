@@ -57,14 +57,10 @@ export function computeLabPipeline(events: NormRecord[]): LabPipeline {
 export function labStageMeta(payload: Record<string, unknown> | null | undefined): string {
   if (!payload) return "not started";
   const bits: string[] = [];
-  const drawsTotal = payload.draws_total;
   const itemsIn = payload.items_in;
   const itemsOut = payload.items_out;
   const model = payload.model as string | undefined;
-  if (drawsTotal != null) {
-    const drawsDone = (payload.draws_done as number) || 0;
-    bits.push(`${drawsDone}/${drawsTotal} draws${model ? ` · ${shortModel(model)}` : ""}`);
-  } else if (itemsIn != null || itemsOut != null) {
+  if (itemsIn != null || itemsOut != null) {
     bits.push(`${itemsIn ?? "—"} → ${itemsOut ?? "—"}`);
   } else if (model) {
     bits.push(shortModel(model));

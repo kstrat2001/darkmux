@@ -468,17 +468,17 @@ edit loop detected on src/widget.rs in an earlier dispatch
             tmp.path().join("2026-06-22.jsonl"),
             concat!(
                 // mission `auth`, s1 — a file-keyed cycle (warn)
-                r#"{"ts":"2026-06-22T10:00:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"mission-run-auth-s1","handle":"coder","payload":{"kind":"cycle","severity":"warn","detail":"`edit` called 3×","area":{"files":["src/x.rs"]}}}"#, "\n",
+                r#"{"ts":"2026-06-22T10:00:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"auth.phase.s1","handle":"coder","payload":{"kind":"cycle","severity":"warn","detail":"`edit` called 3×","area":{"files":["src/x.rs"]}}}"#, "\n",
                 // `auth`, s2 — an info-severity firing (must rank below warn)
-                r#"{"ts":"2026-06-22T11:00:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"mission-run-auth-s2","handle":"coder","payload":{"kind":"intra-turn-stall","severity":"info","detail":"runaway turn recovered"}}"#, "\n",
+                r#"{"ts":"2026-06-22T11:00:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"auth.phase.s2","handle":"coder","payload":{"kind":"intra-turn-stall","severity":"info","detail":"runaway turn recovered"}}"#, "\n",
                 // exact duplicate of the cycle — must not repeat
-                r#"{"ts":"2026-06-22T11:30:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"mission-run-auth-s1","handle":"coder","payload":{"kind":"cycle","severity":"warn","detail":"`edit` called 3×","area":{"files":["src/x.rs"]}}}"#, "\n",
+                r#"{"ts":"2026-06-22T11:30:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"auth.phase.s1","handle":"coder","payload":{"kind":"cycle","severity":"warn","detail":"`edit` called 3×","area":{"files":["src/x.rs"]}}}"#, "\n",
                 // SIBLING mission `auth-v2` — exact-set scope must NOT bleed it
-                r#"{"ts":"2026-06-22T11:45:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"mission-run-auth-v2-s1","handle":"coder","payload":{"kind":"cycle","severity":"warn","detail":"belongs to auth-v2"}}"#, "\n",
+                r#"{"ts":"2026-06-22T11:45:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"auth-v2.phase.s1","handle":"coder","payload":{"kind":"cycle","severity":"warn","detail":"belongs to auth-v2"}}"#, "\n",
                 // non-detector telemetry (source=runtime) — skip
-                r#"{"ts":"2026-06-22T12:00:00Z","category":"telemetry","source":"runtime","session_id":"mission-run-auth-s1","handle":"coder","payload":{"kind":"context","detail":"context fill 40%"}}"#, "\n",
+                r#"{"ts":"2026-06-22T12:00:00Z","category":"telemetry","source":"runtime","session_id":"auth.phase.s1","handle":"coder","payload":{"kind":"context","detail":"context fill 40%"}}"#, "\n",
                 // non-telemetry category, even with source=detector — skip
-                r#"{"ts":"2026-06-22T12:05:00Z","category":"work","source":"detector","action":"telemetry.detector","session_id":"mission-run-auth-s1","handle":"coder","payload":{"kind":"cycle","severity":"warn","detail":"wrong category"}}"#, "\n",
+                r#"{"ts":"2026-06-22T12:05:00Z","category":"work","source":"detector","action":"telemetry.detector","session_id":"auth.phase.s1","handle":"coder","payload":{"kind":"cycle","severity":"warn","detail":"wrong category"}}"#, "\n",
             ),
         )
         .unwrap();
@@ -536,8 +536,8 @@ edit loop detected on src/widget.rs in an earlier dispatch
         std::fs::write(
             tmp.path().join("2026-06-22.jsonl"),
             concat!(
-                r#"{"ts":"2026-06-22T10:00:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"mission-run-rep-s1","handle":"coder","payload":{"kind":"cycle","severity":"warn","detail":"`edit` called 3×","area":{"files":["src/x.rs"]}}}"#, "\n",
-                r#"{"ts":"2026-06-22T10:01:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"mission-run-rep-s1","handle":"coder","payload":{"kind":"repetition","severity":"warn","detail":"observation 17: tail_ratio=0.242 over 68000 characters: the degeneracy gate judged this repeating (#2836)"}}"#, "\n",
+                r#"{"ts":"2026-06-22T10:00:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"rep.phase.s1","handle":"coder","payload":{"kind":"cycle","severity":"warn","detail":"`edit` called 3×","area":{"files":["src/x.rs"]}}}"#, "\n",
+                r#"{"ts":"2026-06-22T10:01:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"rep.phase.s1","handle":"coder","payload":{"kind":"repetition","severity":"warn","detail":"observation 17: tail_ratio=0.242 over 68000 characters: the degeneracy gate judged this repeating (#2836)"}}"#, "\n",
             ),
         )
         .unwrap();
@@ -597,9 +597,9 @@ edit loop detected on src/widget.rs in an earlier dispatch
             tmp.path().join("2026-06-22.jsonl"),
             concat!(
                 // older caution on the file in play (normalized match for `./src/target.rs`)
-                r#"{"ts":"2026-06-22T10:00:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"mission-run-m-s1","payload":{"kind":"cycle","severity":"warn","detail":"on the target","area":{"files":["src/target.rs"]}}}"#, "\n",
+                r#"{"ts":"2026-06-22T10:00:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"m.phase.s1","payload":{"kind":"cycle","severity":"warn","detail":"on the target","area":{"files":["src/target.rs"]}}}"#, "\n",
                 // NEWER, same-severity caution on an unrelated file
-                r#"{"ts":"2026-06-22T12:00:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"mission-run-m-s1","payload":{"kind":"cycle","severity":"warn","detail":"on something else","area":{"files":["src/other.rs"]}}}"#, "\n",
+                r#"{"ts":"2026-06-22T12:00:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"m.phase.s1","payload":{"kind":"cycle","severity":"warn","detail":"on something else","area":{"files":["src/other.rs"]}}}"#, "\n",
             ),
         )
         .unwrap();
@@ -646,9 +646,9 @@ edit loop detected on src/widget.rs in an earlier dispatch
             format!(
                 concat!(
                     // stale caution (recorded hash != current content), NEWER
-                    r#"{{"ts":"2026-06-22T12:00:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"mission-run-m-s1","payload":{{"kind":"cycle","severity":"warn","detail":"stale one","area":{{"files":["stale.rs"],"code_hash":"{stale}"}}}}}}"#, "\n",
+                    r#"{{"ts":"2026-06-22T12:00:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"m.phase.s1","payload":{{"kind":"cycle","severity":"warn","detail":"stale one","area":{{"files":["stale.rs"],"code_hash":"{stale}"}}}}}}"#, "\n",
                     // fresh caution (recorded hash == current content), older
-                    r#"{{"ts":"2026-06-22T10:00:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"mission-run-m-s1","payload":{{"kind":"cycle","severity":"warn","detail":"fresh one","area":{{"files":["fresh.rs"],"code_hash":"{fresh}"}}}}}}"#, "\n",
+                    r#"{{"ts":"2026-06-22T10:00:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"m.phase.s1","payload":{{"kind":"cycle","severity":"warn","detail":"fresh one","area":{{"files":["fresh.rs"],"code_hash":"{fresh}"}}}}}}"#, "\n",
                 ),
                 stale = stale_recorded_hash,
                 fresh = fresh_hash,
@@ -752,8 +752,8 @@ edit loop detected on src/widget.rs in an earlier dispatch
     /// for a mission's EXACT dispatch session ids, dedups, and excludes other
     /// sources + sibling missions. The load-bearing case is the sibling-mission
     /// regression QA caught: `auth-v2`'s notes must NOT bleed into `auth` (a
-    /// prefix match would, since `mission-run-auth-v2-s1` starts with
-    /// `mission-run-auth-`). `#[serial]` — mutates the shared DARKMUX_FLOWS_DIR.
+    /// prefix match on `auth` would, since `auth-v2.phase.s1` starts with
+    /// `auth`). `#[serial]` — mutates the shared DARKMUX_FLOWS_DIR.
     #[test]
     #[serial_test::serial]
     fn mission_adjudication_notes_reads_family_and_filters() {
@@ -762,17 +762,17 @@ edit loop detected on src/widget.rs in an earlier dispatch
             tmp.path().join("2026-06-21.jsonl"),
             concat!(
                 // mission `auth`, phase s1 — an adjudication correction
-                r#"{"ts":"2026-06-21T10:00:00Z","action":"operator.note","source":"adjudication","session_id":"mission-run-auth-s1","handle":"Do not rename the field."}"#, "\n",
+                r#"{"ts":"2026-06-21T10:00:00Z","action":"operator.note","source":"adjudication","session_id":"auth.phase.s1","handle":"Do not rename the field."}"#, "\n",
                 // `auth`, a LATER phase — same family, must be carried forward
-                r#"{"ts":"2026-06-21T11:00:00Z","action":"operator.note","source":"adjudication","session_id":"mission-run-auth-s2","handle":"Use cargo test -p foo."}"#, "\n",
+                r#"{"ts":"2026-06-21T11:00:00Z","action":"operator.note","source":"adjudication","session_id":"auth.phase.s2","handle":"Use cargo test -p foo."}"#, "\n",
                 // exact duplicate of the first — must not repeat
-                r#"{"ts":"2026-06-21T11:30:00Z","action":"operator.note","source":"adjudication","session_id":"mission-run-auth-s1","handle":"Do not rename the field."}"#, "\n",
+                r#"{"ts":"2026-06-21T11:30:00Z","action":"operator.note","source":"adjudication","session_id":"auth.phase.s1","handle":"Do not rename the field."}"#, "\n",
                 // SIBLING mission `auth-v2` (id is a hyphen-extension of `auth`)
                 // — a prefix match would bleed this in; the exact-set match must
                 // NOT (the #849 QA regression).
-                r#"{"ts":"2026-06-21T11:45:00Z","action":"operator.note","source":"adjudication","session_id":"mission-run-auth-v2-s1","handle":"Belongs to auth-v2 ONLY."}"#, "\n",
+                r#"{"ts":"2026-06-21T11:45:00Z","action":"operator.note","source":"adjudication","session_id":"auth-v2.phase.s1","handle":"Belongs to auth-v2 ONLY."}"#, "\n",
                 // an ORCHESTRATOR (dashboard) note for `auth` — wrong source, skip
-                r#"{"ts":"2026-06-21T12:00:00Z","action":"operator.note","source":"orchestrator","session_id":"mission-run-auth-s1","handle":"crew shipped it!"}"#, "\n",
+                r#"{"ts":"2026-06-21T12:00:00Z","action":"operator.note","source":"orchestrator","session_id":"auth.phase.s1","handle":"crew shipped it!"}"#, "\n",
             ),
         )
         .unwrap();
@@ -842,10 +842,10 @@ edit loop detected on src/widget.rs in an earlier dispatch
         std::fs::write(
             flows.path().join("2026-06-22.jsonl"),
             concat!(
-                r#"{"ts":"2026-06-22T10:00:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"mission-run-m-debrief-s1","handle":"coder","payload":{"kind":"cycle","severity":"warn","detail":"edit called 3x","area":{"files":["src/index.rs"]}}}"#, "\n",
-                r#"{"ts":"2026-06-22T10:30:00Z","action":"operator.note","source":"adjudication","session_id":"mission-run-m-debrief-s1","handle":"overrode SIGNOFF: verify never ran"}"#, "\n",
+                r#"{"ts":"2026-06-22T10:00:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"m-debrief.phase.s1","handle":"coder","payload":{"kind":"cycle","severity":"warn","detail":"edit called 3x","area":{"files":["src/index.rs"]}}}"#, "\n",
+                r#"{"ts":"2026-06-22T10:30:00Z","action":"operator.note","source":"adjudication","session_id":"m-debrief.phase.s1","handle":"overrode SIGNOFF: verify never ran"}"#, "\n",
                 // SIBLING mission session must NOT bleed in.
-                r#"{"ts":"2026-06-22T10:45:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"mission-run-m-debrief-v2-s1","handle":"coder","payload":{"kind":"cycle","severity":"warn","detail":"belongs to a sibling"}}"#, "\n",
+                r#"{"ts":"2026-06-22T10:45:00Z","category":"telemetry","source":"detector","action":"telemetry.detector","session_id":"m-debrief-v2.phase.s1","handle":"coder","payload":{"kind":"cycle","severity":"warn","detail":"belongs to a sibling"}}"#, "\n",
             ),
         )
         .unwrap();
@@ -1603,7 +1603,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
         // caller-seed path `register_coder_phase_kinds` uses in production)
         // and a `StepRunCtx` around it, exactly the seam `StepRunCtx::new`'s
         // own doc names for out-of-scheduler unit tests.
-        let slot: Arc<Mutex<Option<std::result::Result<crate::phase_cli::PhaseReviewOutput, String>>>> =
+        let slot: Arc<Mutex<Option<std::result::Result<crate::phase_review::PhaseReviewOutput, String>>>> =
             Arc::new(Mutex::new(None));
         let ctx = Arc::new(CoderPhaseContext {
             repo_root: repo.clone(),

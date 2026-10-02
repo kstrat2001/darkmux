@@ -9,7 +9,7 @@ const TABS = [
 
 type TabAct = (typeof TABS)[number]["act"];
 
-/** Legacy: `viewer.html:2504-2508`'s `lf`/`lm`/`ll`/`lmm` `.on`-class
+/** Legacy's `lf`/`lm`/`ll`/`lmm` `.on`-class
  * assignment, folded into a switch over [[Route]]. `fleet` is "on" whenever
  * the operator is NOT inside runs/machine/console (legacy:
  * `(inMission||inRuns||inMachine||inConsole)?"":" on"`) — which includes
@@ -89,7 +89,7 @@ function targetHash(tab: TabAct): string {
 
 /**
  * The lens-tab bar — `/next`'s port of legacy's `.lenstabs`
- * (`viewer.html:816`: `<a id="lens-fleet">fleet` · `<a id="lens-console">console`
+ * (`<a id="lens-fleet">fleet` · `<a id="lens-console">console`
  * · `<a id="lens-runs">runs` · `<a id="lens-machine">machine`, in that exact
  * DOM order). Order is NOT reordered at any width — the phone-width
  * "broadest-scope-first" reflow (`tests/e2e/chrome-order.spec.js`) is about

@@ -1435,13 +1435,12 @@ mod tests {
         assert!(shown.ends_with("m-auth"), "the run, not the phase session: {shown}");
         assert!(!shown.contains("phase"), "{shown}");
 
-        // A pre-4.0 execution record reads with a synthesized id, which is
-        // built from its session: it shows the run instead.
-        // flow-action-guard:allow — a pre-4.0 archive spelling, read leniently
+        // A pre-4.0 record's session is not in the session grammar: it names
+        // no run, so the column is empty and the session never shows.
+        // flow-action-guard:allow — a pre-4.0 archive spelling
         let old = r#"{"ts":"2025-01-01T00:00:00Z","action":"dispatch start","handle":"coder","session_id":"mission-run-auth-s1","mission_id":"auth"}"#;
         let shown = tail_match(old, None, false).unwrap();
-        assert!(shown.ends_with("auth"), "{shown}");
-        assert!(!shown.contains("legacy:") && !shown.contains("mission-run-auth-s1"), "{shown}");
+        assert!(shown.ends_with(" -") && !shown.contains("mission-run-auth-s1"), "{shown}");
 
         let neither = r#"{"ts":"2025-01-01T00:00:00Z","action":"operator.note","handle":"hi"}"#;
         assert!(tail_match(neither, None, false).unwrap().ends_with(" -"));

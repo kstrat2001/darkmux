@@ -1815,15 +1815,6 @@ fn machine_list_builds_this_machines_row_from_a_local_card_and_never_dials_its_a
     assert_eq!(v["cache_ttl_ms"], 0, "the CLI's gather is not cached");
 }
 
-/// `--deep` is retired: the card is the default content.
-#[test]
-fn machine_list_deep_is_refused_naming_the_default() {
-    let out = darkmux_cmd().args(["machine", "list", "--deep"]).output().unwrap();
-    assert!(!out.status.success());
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("`darkmux machine list --deep` was removed") && err.contains("by default"), "{err}");
-}
-
 /// (#2924) `darkmux doctor` actually appends the fleet-roster rows. The
 /// evaluators and the row builder are tested as pure functions; deleting the
 /// one `report.checks.extend(fleet_cli::roster_doctor_checks())` line in
@@ -9439,52 +9430,6 @@ fn board_drift_kinds(home: &std::path::Path, flows: &std::path::Path, id: &str) 
         .iter()
         .map(|d| d["kind"].as_str().unwrap().to_string())
         .collect()
-}
-
-/// A `mission.json` an older binary left at `"status": "paused"` is an
-/// ordinary open mission now: `darkmux run list` and the board both read it
-/// as `Active`, so a recorded `session.end` on its dispatch reads
-/// `abandoned` and the board names it, exactly as for an `active` mission.
-#[test]
-fn a_legacy_paused_mission_reads_as_active_on_run_list_and_the_board() {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let home = TempDir::new().unwrap();
-    let flows = TempDir::new().unwrap();
-    write_mission_with_phases(
-        home.path(),
-        "legacy-paused-e2e",
-        "paused",
-        &[("p1", "running")],
-        now - 25 * 60,
-    );
-    let day = darkmux_flow::day_utc_now();
-    fs::write(
-        flows.path().join(format!("{day}.jsonl")),
-        serde_json::json!({
-            "ts": "2024-01-01T09:00:00Z",
-            "action": "session.end",
-            "session_id": "legacy-paused-e2e-sess",
-            "mission_id": "legacy-paused-e2e",
-            "handle": "coder",
-        })
-        .to_string()
-            + "\n",
-    )
-    .unwrap();
-    assert_eq!(
-        run_list_status(home.path(), flows.path(), "legacy-paused-e2e"),
-        "abandoned",
-        "a legacy paused mission is Active, so its recorded session end reads abandoned"
-    );
-    assert!(
-        board_drift_kinds(home.path(), flows.path(), "legacy-paused-e2e")
-            .iter()
-            .any(|k| k == "running-phase-execution-dead"),
-        "and the board names the dead session as it does for an active mission"
-    );
 }
 
 /// (#2682 round 4) A CLOSED mission still holding a `Running` phase — ten

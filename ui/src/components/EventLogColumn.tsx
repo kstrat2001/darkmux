@@ -35,7 +35,7 @@ import type { DispatchRestPayload } from "../types/generated/DispatchRestPayload
 import { ACTION, payloadOf, recKey, unknownActionCount, type NormRecord } from "../lib/ingest";
 import { onIntentClick } from "../lib/clickIntent";
 
-/** Row cap — `renderLog()`'s `all.slice(-50).reverse()` (viewer.html:2443):
+/** Row cap — `renderLog()`'s `all.slice(-50).reverse()`:
  * newest 50, newest-first. */
 const LOG_CAP = 50;
 
@@ -145,7 +145,7 @@ function onActivateKeyDown(onActivate: () => void) {
 }
 
 /**
- * The event-log column (`.log`, viewer.html:829-849) — the per-record
+ * The event-log column (`.log`) — the per-record
  * stream, its search box + the full checkbox-per-facet filters modal, the
  * follow-latest toggle, the drag-to-resize `.split` handle, and the
  * `#detail` selected-event panel. Mounted by `App.tsx` for every route
@@ -210,8 +210,7 @@ function onActivateKeyDown(onActivate: () => void) {
  *
  * **The filter MODAL (#1640) — no longer a cut.** `#fbtn`/`data-act="filters"`
  * now opens the real checkbox-per-facet modal (`FiltersDialog.tsx`,
- * `#modalbg`) — matching legacy's own trigger exactly (viewer.html:840,
- * `data-act="filters"`) — rather than the narrower "model activity only"
+ * `#modalbg`) — matching legacy's own trigger exactly (* `data-act="filters"`) — rather than the narrower "model activity only"
  * boolean toggle this button stood in for previously (see git history for
  * that interim shape; superseded now that the shared dialog/focus machinery
  * exists to hold the real thing). The former glyph-vs-label mobile-UX note
@@ -903,7 +902,7 @@ export function EventLogColumn({
     // information the newest-first ordering does not already show, and this
     // chip sits beside a live stream where every extra word is noise.
     //
-    // The CAP itself is legacy's (`all.slice(-50)`, viewer.html:2443) — what
+    // The CAP itself is legacy's (`all.slice(-50)`) — what
     // this port adds is SAYING so. Legacy hides 684 records in silence; the
     // label is the honest half and worth keeping.
     //
@@ -1600,10 +1599,9 @@ export function EventLogColumn({
   );
 }
 
-/** `renderDetail()`'s fallback branch (viewer.html:2417-2418,
- * `` `<pre>${pretty(r)}</pre>` ``) — this column doesn't reproduce the
+/** `renderDetail()`'s fallback branch (* `` `<pre>${pretty(r)}</pre>` ``) — this column doesn't reproduce the
  * structured per-action cards legacy builds for reasoning/tool/compaction/
- * tier-decision records (viewer.html:2370-2415); every selected record
+ * tier-decision records; every selected record
  * renders through this ONE pretty-printed-JSON view instead. A real,
  * working detail pane (the operator can inspect any field of any selected
  * event) — just not the bespoke per-action layout, named as a follow-up

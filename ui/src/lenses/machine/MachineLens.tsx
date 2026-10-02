@@ -110,7 +110,7 @@ export function lineClass(line: string): string | undefined {
  *  reported", never blank for a machine that did not report and never another
  *  machine's. This machine is its `/machine/specs` probe (`beatSpec` is
  *  `specOf`'s answer for it); a peer is the card the view just read, else its
- *  presence beat's string (`specOf`, viewer.html:1124-1129). The placeholder is
+ *  presence beat's string (`specOf`). The placeholder is
  *  said only once the answers are in (`settled`) and, for this machine, only
  *  when its probe named no chip, so the header does not draw one that a card
  *  replaces. */
@@ -121,7 +121,7 @@ function machineHeaderSpec(f: { own: boolean; specs: MachineSpecsResponse | null
 }
 
 /**
- * The machine page — `renderMachine()` (viewer.html:1796-1991), now purely
+ * The machine page — `renderMachine()`, now purely
  * the RESIDENCY ROOM its #1286 doctrine names it as (probe-fed RAM/model
  * health that only THIS daemon's own host can honestly report — see the
  * module-level `CLAUDE.md`'s "observer must not join the observed"
@@ -160,7 +160,7 @@ function machineHeaderSpec(f: { own: boolean; specs: MachineSpecsResponse | null
  * the wrong name) PLUS `/flow/<today>` + `/flow/<yesterday>` +
  * `/fleet/machines/live` (machine presence — the source of the header's
  * `label`/`spec` AND a remote machine's own `specs` string — `specOf()`,
- * viewer.html:1124-1129, since a remote
+ *, since a remote
  * machine's hardware line comes from its presence beat, not this daemon's
  * local `/machine/specs` probe). `/fleet/dispatches/live` — fetched by the
  * OLD runs list for its live-vs-ended status labels — is gone along with
@@ -348,8 +348,8 @@ export function MachineLens({
 
   // The resources probe is LOCAL-ONLY data (`/machine/resources` always
   // describes THIS daemon's own host) — legacy's `pollMachineMem` never
-  // even fetches it for a remote machine's page (viewer.html:4906-4907:
-  // `if(state.level!=="machine"||!machineIsLocalNow())... return`). Gating
+  // even fetches it for a remote machine's page
+  // (`if(state.level!=="machine"||!machineIsLocalNow())... return`). Gating
   // the query itself (not just the render) matches that: a remote page
   // never issues the request at all.
   const resourcesQuery = useQuery({
@@ -449,7 +449,7 @@ export function MachineLens({
     <div className="machine-lens">
       <div className="machine-lens__hdr stagehdr">
         {/* `<a data-act="fleet">fleet</a> › machine · ${label}` — the
-            `.stagehdr` back-link (viewer.html:2021), distinct from `#crumb`
+            `.stagehdr` back-link, distinct from `#crumb`
             (which carries no such link for the machine page — see
             `App.tsx`'s `routeChrome` doc). A real `<button>` (not an
             anchor with no href) so it never offers a tooltip/status-bar

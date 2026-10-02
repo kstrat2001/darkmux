@@ -153,7 +153,7 @@ describe("CatalogPanel", () => {
   });
 
   // QA must-fix: legacy has THREE ways to close #catpanel
-  // (viewer.html:3002-3008 click-outside, viewer.html:3020-3023 Escape); the
+  //; the
   // panel originally dropped all of them. These three tests cover each
   // dismissal path independently, including the toggle-reclick case QA
   // named as the zero-coverage path.

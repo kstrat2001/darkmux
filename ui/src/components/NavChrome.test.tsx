@@ -8,7 +8,7 @@ afterEach(() => {
 });
 
 describe("NavChrome", () => {
-  it("renders all four tabs in legacy DOM order (viewer.html:816: fleet, console, runs, machine)", () => {
+  it("renders all four tabs in legacy DOM order", () => {
     render(<NavChrome route={{ kind: "fleet" }} />);
     const tabs = screen.getAllByRole("link");
     expect(tabs.map((t) => t.textContent)).toEqual(["fleet", "console", "runs", "machine"]);

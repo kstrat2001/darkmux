@@ -547,7 +547,7 @@ impl CompactionDispatchArgs {
     /// Lookup chain: role override > profile default > None
     /// (runtime default ⇒ unbounded). Call after `from_profile` from
     /// any dispatcher that knows which role is about to run; sites
-    /// that don't have a role (phase_cli adhoc) can skip the call
+    /// that don't have a role (phase_review adhoc) can skip the call
     /// and the profile-level fallback applies.
     pub fn apply_role_override(&mut self, role: &crate::types::Role) {
         if let Some(role_bail) = role.bail_after_compactions {

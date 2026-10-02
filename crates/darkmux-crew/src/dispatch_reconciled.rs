@@ -54,7 +54,7 @@
 //! on inspection, to be exactly this case — already protected one level
 //! up, not actually gapped — and are deliberately NOT routed through here:
 //!
-//! - `src/phase_cli.rs`'s `phase_review_output_at` is reached ONLY from
+//! - `src/phase_review.rs`'s `phase_review_output_at` is reached ONLY from
 //!   `MissionVerifyStepKind::run()` (`src/coder_phase.rs`) — the standalone
 //!   `phase` CLI verb that used to call it directly was retired in #1463.
 //!   `MissionVerifyStepKind::seat()` already calls `resolve_local_seat`.

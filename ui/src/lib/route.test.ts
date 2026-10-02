@@ -416,7 +416,7 @@ describe("parseRoute — the injected playback date (/play/<date>)", () => {
 /**
  * (#1801) `darkmux-flow-src` — the static demo's committed `.jsonl` — forces
  * a playback route with no server-assigned date, mirroring legacy's own
- * `wantsPlayback = ... || !!flowSrc || ...` (viewer.html:3880), which forces
+ * `wantsPlayback = ... || !!flowSrc || ...`, which forces
  * the playback branch regardless of any date the hash/query names. See
  * `route.ts`'s own doc on the widened `date: string | null` for why `null`
  * is the honest value here rather than a guessed placeholder.
@@ -477,7 +477,7 @@ describe("parseRoute — the static-demo flow-src route (#1801)", () => {
 
 /**
  * (#1801, merge-gate finding) `isLiveRoute()` is the port's analog of legacy's
- * GLOBAL `wantsPlayback` gate (viewer.html:3880). It was keyed on route KIND
+ * GLOBAL `wantsPlayback` gate. It was keyed on route KIND
  * alone, and `parseRoute` resolves `lens=` BEFORE the static-build branch — so
  * `#lens=runs` on the daemon-less demo parsed to `{kind:"runs"}` and opened
  * every live consumer: an SSE stream, a 5s presence poll, and a mode badge

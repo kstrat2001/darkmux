@@ -91,7 +91,7 @@ pub struct ReviewFinding {
 
 /// Parsed result from a QA-REVIEW-SIGNOFF block (internal, not serialized).
 /// Fields are module-private — `parse_signoff` returns the value; callers
-/// within `phase_cli` read the fields directly. External `pub` was excessive.
+/// within `phase_review` read the fields directly. External `pub` was excessive.
 pub(crate) struct SignoffParse {
     block: usize,
     flag: usize,
@@ -756,7 +756,7 @@ mod tests {
             .output()
             .ok();
 
-        crate::phase_cli::phase_review_output_at(repo.path(), None, Some("66")).unwrap();
+        crate::phase_review::phase_review_output_at(repo.path(), None, Some("66")).unwrap();
 
         // Read all jsonl files; expect 2 records (start + verdict).
         let files: Vec<_> = std::fs::read_dir(guard.path())
@@ -801,7 +801,7 @@ mod tests {
             .output()
             .ok();
 
-        crate::phase_cli::phase_review_output_at(repo.path(), None, Some("66")).unwrap();
+        crate::phase_review::phase_review_output_at(repo.path(), None, Some("66")).unwrap();
 
         let records = collect_records(guard.path());
         let verdict = records
@@ -824,7 +824,7 @@ mod tests {
         // path — neither is reliable across CI envs (the temp repo has no
         // `main` branch in CI's git defaults). Testing the helper directly
         // captures the contract without env-coupling.
-        let record = crate::phase_cli::build_review_record(
+        let record = crate::phase_review::build_review_record(
             crate::flow::Level::Error,
             crate::flow::Category::Machinery,
             crate::flow::Tier::Darkmux,
@@ -875,7 +875,7 @@ mod tests {
             std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
         }
 
-        let result = crate::phase_cli::phase_review_output_at(repo.path(), None, Some("66"));
+        let result = crate::phase_review::phase_review_output_at(repo.path(), None, Some("66"));
 
         unsafe {
             match prev {
@@ -976,7 +976,7 @@ mod tests {
             .output()
             .ok();
 
-        crate::phase_cli::phase_review_output_at(repo.path(), None, Some("66")).unwrap();
+        crate::phase_review::phase_review_output_at(repo.path(), None, Some("66")).unwrap();
 
         let records = collect_records(guard.path());
         assert_eq!(records.len(), 2, "expected begin + verdict records only");

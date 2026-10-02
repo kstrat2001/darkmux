@@ -53,7 +53,7 @@ export const RECONCILE_BACKSTOP_MS = 20_000;
 export const LIVE_CONTACT_TIMEOUT_MS = 2 * RECONCILE_BACKSTOP_MS;
 export const MACHINE_MEM_POLL_MS = 5_000;
 export const PANEL_CACHE_MS = 3_000;
-/** `LAB_POLL_STEADY_MS`/`LAB_POLL_BACKFILL_MS` (viewer.html:4020-4021) — the
+/** `LAB_POLL_STEADY_MS`/`LAB_POLL_BACKFILL_MS` — the
  * lab-run detail's event-feed poll cadence (`LabRunDetail.tsx`): steady
  * once caught up, rapid while draining a backlog (a big historical run's
  * playback). Not wired to a `refetchInterval` query — see that component's
@@ -105,7 +105,7 @@ export const queryKeys = {
   /** `GET /flow/<date>` — the full day's records (distinct from `flowTail`'s
    * SSE stream key above). Consumed by `useFlowWindow` (`hooks/
    * useFlowWindow.ts`), which fetches yesterday+today per `loadLiveWindow()`
-   * (viewer.html:3497) — see `lib/flow.ts`'s module doc for the fetch-order
+   * — see `lib/flow.ts`'s module doc for the fetch-order
    * subtlety that makes the two-day merge order load-bearing. */
   flowDate: (date: string) => ["flow", date] as const,
   /** `source.ts, the flow file`'s committed `.jsonl` (#1801) — the

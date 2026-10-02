@@ -90,7 +90,7 @@ describe("EventLogColumn", () => {
     render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
     const rows = document.querySelectorAll('[data-act="rec"]');
     expect(rows.length).toBe(2);
-    // newest first (viewer.html:2443's `slice(-50).reverse()`)
+    // newest first (`slice(-50).reverse()`)
     expect(rows[0].textContent).toContain("s-new");
     expect(rows[1].textContent).toContain("s-old");
   });

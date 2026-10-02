@@ -12,7 +12,7 @@ import { closeOpenModal, isModalOpen, useOpenModalId, type ModalId } from "../li
  * **Rendered through a portal into `document.body`, always mounted,
  * `style.display` toggled — never conditionally unmounted.** This matches
  * legacy's own static body-level markup (the backdrop `<div id="modalbg">`
- * etc. exist in the DOM whether open or closed, viewer.html:861-881) and is
+ * etc. exist in the DOM whether open or closed) and is
  * load-bearing for two things:
  *   1. `tests/e2e/viewer-keyboard.spec.js`'s `openCount()` helper reads
  *      `document.getElementById(id).style.display` — an inline `"flex"`
@@ -43,7 +43,7 @@ import { closeOpenModal, isModalOpen, useOpenModalId, type ModalId } from "../li
  * remembered focus target (the element that opened it is gone too).
  *
  * Focus-on-open mirrors legacy's `openModalEl`:
- * `m.querySelector(".mx").focus()` (viewer.html:2930) — the close button
+ * `m.querySelector(".mx").focus()` — the close button
  * gets focus the instant the dialog becomes the open one.
  */
 export function Dialog({
@@ -92,7 +92,7 @@ export function Dialog({
       id={id}
       style={{ display: open ? "flex" : "none" }}
       onClick={(e) => {
-        // viewer.html:2978-2980 (#1132) — click on the backdrop itself
+        // (#1132) A click on the backdrop itself
         // closes; a click that bubbled up from inside `.dialog` must not.
         if (e.target === e.currentTarget) closeOpenModal();
       }}

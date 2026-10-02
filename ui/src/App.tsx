@@ -76,7 +76,7 @@ import type { FlowRecordsResponse } from "./types/generated/FlowRecordsResponse"
  * `goldens/fleet.txt` and `goldens/machine.txt` carry byte-identical
  * `=== meta ===` sections), so it's computed here rather than per-lens — but
  * it is NOT mode-independent: `renderMeta` branches live-vs-replay
- * (viewer.html:1330-1340), and #1800 wired the replay arm (`lib/replayMeta.ts`)
+ *, and #1800 wired the replay arm (`lib/replayMeta.ts`)
  * off `routeRecords`. Lens-independent, mode-dependent. The underlying
  * `useFlowWindow`/`useLiveMachines`/`machineSpecs` queries are ALSO used
  * inside `MachineLens` — TanStack Query dedupes by queryKey, so this is
@@ -451,7 +451,7 @@ export function App() {
   // `FleetCoverageNotice` below renders the full sentence off the same hook.
   const fleetCoverage = useDegradedFleetSource(isLiveRoute(route));
   // Gated for the SAME reason, and via the same two-sided rule: `/machine/specs`
-  // is live-only (viewer.html:2696 — "playback mode never starts that poll"),
+  // is live-only,
   // and an ungated observer here would keep the shared cache warm for
   // `FleetLens`'s gated one exactly as `useLiveMachines` did. Gating one side
   // and not the other is indistinguishable from gating neither.
@@ -886,7 +886,7 @@ export function App() {
   );
 }
 
-/** `renderCrumb()` (viewer.html:2476-2568) + each lens's own
+/** `renderCrumb()` + each lens's own
  * `$("logscope").textContent=` assignment, folded into one lookup keyed on
  * [[Route]]. `machine`/`fleet`/`session`/`playback` all have a real,
  * source-cited `logscope` mapping (added once `EventLogColumn` gave
@@ -910,8 +910,8 @@ export function App() {
 function routeChrome(route: Route, targetMachineName: string | null): { crumb: string; logscope: string } {
   if (route.kind === "machine") {
     // `$("crumb").innerHTML = state.machine!=null ? escN(state.machine) :
-    // "this machine"` (viewer.html:2537); `$("logscope").textContent =
-    // m!=null?nameOf(m):"machine"` (viewer.html:1799). `targetMachineName`
+    // "this machine"`; `$("logscope").textContent =
+    // m!=null?nameOf(m):"machine"`. `targetMachineName`
     // (computed below in `App()`) resolves the ROUTE's machine — the local
     // one for `uid: null`, or the drilled uid's own name for a fleet-card
     // drill — matching `escN(state.machine)`'s uid-generic lookup, not
@@ -920,7 +920,7 @@ function routeChrome(route: Route, targetMachineName: string | null): { crumb: s
     return { crumb: targetMachineName ?? "this machine", logscope: targetMachineName ?? "machine" };
   }
   if (route.kind === "fleet") {
-    // `$("logscope").textContent="fleet"` (viewer.html:1668) — legacy's
+    // `$("logscope").textContent="fleet"` — legacy's
     // literal string is lowercase; `goldens/fleet.txt` shows it UPPERCASE
     // because `#logscope` sits inside `.loglist h3`, which carries
     // `text-transform:uppercase` (that whole event-log sidebar isn't ported
@@ -954,8 +954,7 @@ function routeChrome(route: Route, targetMachineName: string | null): { crumb: s
   // branches above, just now visibility-aware instead of uniformly assumed
   // visible.
   if (route.kind === "dispatch") {
-    // `$("logscope").textContent=sid` (viewer.html:2042,
-    // `renderSubsystem()`) — a VISIBLE-log route, so uppercased.
+    // `$("logscope").textContent=sid` (// `renderSubsystem()`) — a VISIBLE-log route, so uppercased.
     return { crumb: "", logscope: route.dispatchId };
   }
   if (route.kind === "playback") {
@@ -963,7 +962,7 @@ function routeChrome(route: Route, targetMachineName: string | null): { crumb: s
     // default (verified: no `state.level=` assignment sits on the
     // `targetDate()`/playback boot path — see `showsEventLog`'s doc for the
     // same read), so legacy's `renderFleet()` sets the same `"fleet"`
-    // logscope (viewer.html:1668) it does on a live fleet view — VISIBLE,
+    // logscope it does on a live fleet view — VISIBLE,
     // already uppercase.
     //
     // (#2120, operator finding — "reads like a variable name") Used to take
@@ -987,16 +986,16 @@ function routeChrome(route: Route, targetMachineName: string | null): { crumb: s
     return { crumb: "", logscope: "" };
   }
   if (route.kind === "console") {
-    // `$("logscope").textContent="console"` (viewer.html:4513) — a HIDDEN-
+    // `$("logscope").textContent="console"` — a HIDDEN-
     // log route (`showsEventLog`), so left RAW/lowercase, matching what
     // legacy's own `textContent` fallback would show if inspected the same
     // way (never visually seen either way, but real for DOM fidelity).
     return { crumb: "", logscope: "console" };
   }
   if (route.kind === "runs") {
-    // `$("logscope").textContent="runs"` (viewer.html:4676) — HIDDEN, raw.
+    // `$("logscope").textContent="runs"` — HIDDEN, raw.
     // `$("crumb").innerHTML = state.level==="lab-run" ? esc(state.labRunDir||"—")
-    // : ""` (viewer.html:2575, `inRuns` branch) — drill-in packet: `route.lab`
+    // : ""` — drill-in packet: `route.lab`
     // is only ever populated once the operator is genuinely looking at a
     // lab-run-detail pane (see `route.ts`'s widened `run` doc), matching
     // legacy's own gate exactly.
