@@ -408,6 +408,9 @@ use std::path::Path;
 //           and judged by its value (`LeftoverValue`, #3057).
 //           Nothing is carried over: limits are off until set per endpoint.
 //           Folded into a minor bump like 2.2's removals.
+//           Also ADDED `redis.telemetry_maxlen` (the retention cap of the
+//           hub's machine-telemetry stream; unreleased, so folded into 2.3).
+//           An older binary refuses a config carrying it as an unknown key.
 pub const CONFIG_SCHEMA_VERSION: &str = "2.3";
 
 /// A `config.json` key an older darkmux read (and `init` may have written)
@@ -891,6 +894,14 @@ pub struct DirsConfig {
 /// silently reviving the warning for every operator on the shipped default.
 pub const DEFAULT_REDIS_MAXLEN: usize = 10_000;
 
+/// The shipped default for `redis.telemetry_maxlen`: the retention of the hub's
+/// SECOND stream, `<redis.stream>:telemetry`, which carries only the machine
+/// samples (`machine.telemetry`). Telemetry is most of the hub's records by
+/// volume, so on one shared stream it flushed work records out of their
+/// window (#2101: a relayed run's usage was gone from the hub within two
+/// days). It has its own cap so neither kind can evict the other.
+pub const DEFAULT_REDIS_TELEMETRY_MAXLEN: usize = 10_000;
+
 /// The Redis flow-coordination sink — a **feature block gated by `enabled`**,
 /// not by field-presence. `darkmux init` writes the whole block with
 /// `enabled: false` and every connection knob populated to its sensible
@@ -912,6 +923,10 @@ pub struct RedisConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub db: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub stream: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub maxlen: Option<usize>,
+    /// Retention of the machine-telemetry stream (`<stream>:telemetry`),
+    /// separate from `maxlen` so samples never evict work records. `0` is
+    /// unbounded, as for `maxlen`.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub telemetry_maxlen: Option<usize>,
     #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -2173,6 +2188,7 @@ impl DarkmuxConfig {
                 db: None,
                 stream: Some("darkmux:flow".to_string()),
                 maxlen: Some(DEFAULT_REDIS_MAXLEN),
+                telemetry_maxlen: Some(DEFAULT_REDIS_TELEMETRY_MAXLEN),
                 extras: Default::default(),
             }),
             audit: Some(AuditConfig {

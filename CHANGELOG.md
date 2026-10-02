@@ -62,6 +62,33 @@ darkmux release.
 
 ### Changed (5.0)
 
+- **Machine telemetry has its own hub stream, so work records keep their window** (#2101).
+  `machine.telemetry` was 87% of the hub's records, so the one capped stream held
+  about 41 hours and a relayed run's usage was trimmed away before its sender could
+  be asked (12 of 30 relayed runs on one day). Samples now go to
+  `<redis.stream>:telemetry` under their own cap, `redis.telemetry_maxlen`
+  (env `DARKMUX_REDIS_TELEMETRY_MAXLEN`, default 10000, `0` unbounded; `init`
+  writes it, `config set` validates it, `doctor` and `flow status` show it).
+  `GET /flow/<date>`, a dispatch replay and the live tail read both streams
+  and merge them in hub order (the listings read the work stream only, below); the outage backfill never re-sends a sample (the
+  next one supersedes it). `flow status --json` gains `telemetry_stream`,
+  `telemetry_max_len`, `telemetry_xlen`, `telemetry_oldest_ts` and `telemetry_newest_ts`
+  (`tests/cli-json.golden` regenerated); the schema-skew sample reads both streams.
+  `/runs`, `/flow-missions` and a mission replay read the work stream only (a full
+  read of both doubled the parse cost, 300 ms to 610 ms for 10k entries each); a
+  dispatch replay reads both for its host charts. A live tail on one stream only is closed
+  so the client reconnects.
+  **Trade:** the outage backfill re-sends work records only, so a relayed run's
+  host chart has a hole over the outage window. `redis.telemetry_maxlen` is part of
+  config schema 2.3; an older binary refuses it as an unknown key.
+  **Upgraders:** the old samples stay on the work stream until they age out; no
+  action needed.
+- **Hub outage watermark hardening** (#3062 follow-ups). The watermark's generation
+  never restarts at 1 when its file is lost (it starts at the clock's nanoseconds),
+  its temp file is fsynced before the rename, a torn-tail sidecar's directory is
+  fsynced so its name survives a power cut, and the sink's disable warning names
+  what failed last (`write` or `backfill`) instead of counting both as writes.
+
 - **Fleet compatibility remnants removed** (5.0). `doctor`'s roster identity
   check no longer treats a flow record without a `machine_uid` as a known name
   (a record with no uid names no machine), and the retired Redis-queue

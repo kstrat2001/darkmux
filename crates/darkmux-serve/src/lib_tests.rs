@@ -3049,6 +3049,19 @@
         assert_eq!(ids, vec!["1000-0", "2000-0"]);
     }
 
+    /// (#2101) Work records and machine samples are read from two streams and
+    /// come back as one run in hub order, whichever stream each came from.
+    #[test]
+    fn work_and_telemetry_reads_merge_in_hub_order() {
+        let r = |id: &str, action: &str| serde_json::json!({"hub_id": id, "action": action});
+        let work = vec![r("1000-0", "dispatch.start"), r("3000-0", "dispatch.complete")];
+        let telemetry = vec![r("2000-0", "machine.telemetry"), r("2000-1", "machine.telemetry"), r("4000-0", "machine.telemetry")];
+        let merged = super::merge_by_hub_id(work, telemetry);
+        let ids: Vec<_> = merged.iter().map(|m| m["hub_id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["1000-0", "2000-0", "2000-1", "3000-0", "4000-0"]);
+        assert!(super::merge_by_hub_id(Vec::new(), Vec::new()).is_empty());
+    }
+
     #[test]
     fn a_live_tail_line_carries_its_hub_id() {
         let line = super::stamp_hub_id_line(r#"{"ts":"2026-05-14T09:00:00Z","action":"operator.note"}"#, Some("1000-3"));
@@ -3457,11 +3470,18 @@
         const REDIS_READY_TIMEOUT: Duration = Duration::from_secs(5);
 
         fn redis_server_available() -> bool {
-            Command::new("redis-server")
+            let ok = Command::new("redis-server")
                 .arg("--version")
                 .output()
                 .map(|o| o.status.success())
-                .unwrap_or(false)
+                .unwrap_or(false);
+            // A job that opted in must never silently skip (#1662): a test that
+            // cannot run is a probe that passes without executing.
+            assert!(
+                ok || std::env::var("DARKMUX_E2E_REQUIRED").is_err(),
+                "redis-server is not on PATH, but DARKMUX_E2E_REQUIRED is set"
+            );
+            ok
         }
 
         struct RedisFixture {
@@ -3533,6 +3553,122 @@
         fn today_utc_date() -> String {
             darkmux_flow::day_utc_now()
         }
+
+        const WORK_STREAM: &str = "darkmux:flow";
+        const TELEMETRY_STREAM: &str = "darkmux:flow:telemetry";
+
+        fn xlen(url: &str, stream: &str) -> u64 {
+            let client = redis::Client::open(url).expect("redis client");
+            let mut conn = client.get_connection().expect("conn");
+            redis::cmd("XLEN").arg(stream).query(&mut conn).expect("XLEN")
+        }
+
+        /// A sink writing through the production path (`RedisSink`), the two
+        /// streams capped at 100 entries each.
+        fn capped_sink(url: &str) -> darkmux_flow::RedisSink {
+            darkmux_flow::RedisSink::new(url, WORK_STREAM, Some(100))
+                .unwrap()
+                .with_telemetry(TELEMETRY_STREAM, Some(100))
+        }
+
+        fn flow_record(
+            action: darkmux_flow::FlowAction,
+            handle: &str,
+            execution: Option<&darkmux_types::execution_id::ExecutionId>,
+        ) -> darkmux_flow::FlowRecord {
+            use darkmux_types::session_id::{RunId, SessionId};
+            let session = SessionId::adhoc(RunId::mission("telemetry-split").unwrap(), "coder", "sess-2101");
+            let mut r = darkmux_flow::FlowRecord::for_session(
+                &session,
+                darkmux_flow::Level::Info,
+                darkmux_flow::Category::Work,
+                darkmux_flow::Stage::Dispatch,
+                action,
+                handle,
+            );
+            r.execution_id = execution.cloned();
+            r
+        }
+
+        /// (#2101) THE regression: machine samples are most of the hub's
+        /// records by volume, and on one capped stream they flushed a relayed
+        /// run's usage out of the hub within two days. A flood of samples
+        /// must trim only the telemetry stream, and the day read must still
+        /// hand back the usage record, merged in hub order with the samples.
+        #[test]
+        #[serial]
+        fn a_telemetry_flood_does_not_evict_a_usage_record() {
+            if !redis_server_available() {
+                eprintln!("skipping: redis-server not on PATH");
+                return;
+            }
+            use darkmux_flow::FlowSinkWrite as _;
+            let redis = spawn_redis();
+            let sink = capped_sink(&redis.url);
+            let execution = darkmux_types::execution_id::ExecutionId::mint();
+
+            sink.write(&flow_record(darkmux_flow::FlowAction::TelemetryTokens, "usage-first", Some(&execution))).unwrap();
+            for i in 0..1_000 {
+                sink.write(&flow_record(darkmux_flow::FlowAction::MachineTelemetry, &format!("sample-{i}"), None)).unwrap();
+            }
+
+            assert_eq!(xlen(&redis.url, WORK_STREAM), 1, "the usage record stays on the work stream");
+            let sampled = xlen(&redis.url, TELEMETRY_STREAM);
+            assert!(sampled < 1_000, "the telemetry stream must be the one that is trimmed, holds {sampled}");
+
+            let read = super::read_flow_records_from_redis(&redis.url, None, super::FleetScope::WithSamples).unwrap();
+            let actions: Vec<&str> = read.records.iter().filter_map(|r| r["action"].as_str()).collect();
+            assert_eq!(actions.first(), Some(&"telemetry.tokens"), "the usage record is read, first in hub order");
+            // The run and mission listings read the work stream alone: samples
+            // double the parse cost of every cache refresh and they use none.
+            let listing = super::read_flow_records_from_redis(&redis.url, None, super::FleetScope::Work).unwrap();
+            assert!(
+                listing.records.iter().all(|r| r["action"] != "machine.telemetry"),
+                "a work-scope read must not pull the telemetry stream"
+            );
+            assert_eq!(listing.records.len(), 1);
+            assert_eq!(
+                actions.iter().filter(|a| **a == "machine.telemetry").count() as u64,
+                sampled,
+                "every sample the telemetry stream still holds is read back too"
+            );
+        }
+
+        /// (#2101) The live tail follows BOTH hub streams: the machine samples
+        /// that feed the fleet's live readings arrive beside the work records.
+        #[tokio::test]
+        #[serial]
+        async fn the_live_tail_carries_work_records_and_machine_samples() {
+            if !redis_server_available() {
+                eprintln!("skipping: redis-server not on PATH");
+                return;
+            }
+            use darkmux_flow::FlowSinkWrite as _;
+            let redis = spawn_redis();
+            let today = today_utc_date();
+            let stream = redis_tail_lines(
+                redis.url.clone(),
+                vec![WORK_STREAM.to_string(), TELEMETRY_STREAM.to_string()],
+                today,
+            );
+            tokio::pin!(stream);
+            tokio::time::sleep(Duration::from_millis(150)).await;
+
+            let sink = capped_sink(&redis.url);
+            sink.write(&flow_record(darkmux_flow::FlowAction::OperatorNote, "work-note", None)).unwrap();
+            sink.write(&flow_record(darkmux_flow::FlowAction::MachineTelemetry, "sample", None)).unwrap();
+
+            let mut seen = Vec::new();
+            while seen.len() < 2 {
+                match next_line(&mut stream, Duration::from_millis(3000)).await {
+                    Some(line) => seen.push(line),
+                    None => break,
+                }
+            }
+            assert!(seen.iter().any(|l| l.contains("work-note")), "work record missing from the tail: {seen:?}");
+            assert!(seen.iter().any(|l| l.contains("machine.telemetry")), "machine sample missing from the tail: {seen:?}");
+        }
+
 
         async fn body_as_array(
             response: axum::response::Response,
@@ -3618,7 +3754,7 @@
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
                 let started = std::time::Instant::now();
-                let r = super::read_flow_records_from_redis("redis://127.0.0.1:1", Some("2026-08-15"));
+                let r = super::read_flow_records_from_redis("redis://127.0.0.1:1", Some("2026-08-15"), super::FleetScope::WithSamples);
                 let _ = tx.send((r.is_err(), started.elapsed()));
             });
 
@@ -4057,7 +4193,7 @@
 
             let stream = redis_tail_lines(
                 redis.url.clone(),
-                "darkmux:flow".to_string(),
+                vec!["darkmux:flow".to_string()],
                 today.clone(),
             );
             tokio::pin!(stream);
@@ -4130,7 +4266,7 @@
 
             let stream = redis_tail_lines(
                 redis.url.clone(),
-                "darkmux:flow".to_string(),
+                vec!["darkmux:flow".to_string()],
                 today.clone(),
             );
             tokio::pin!(stream);
@@ -4190,7 +4326,7 @@
             // ≈ 5s before the synthetic record + exit.
             let stream = redis_tail_lines(
                 "redis://127.0.0.1:1".to_string(),
-                "darkmux:flow".to_string(),
+                vec!["darkmux:flow".to_string()],
                 "2026-05-23".to_string(),
             );
             tokio::pin!(stream);
@@ -4305,6 +4441,136 @@
                 got.contains("sse-redis-end-to-end"),
                 "expected XADD'd record to surface as SSE event; got: {got:?}"
             );
+        }
+
+        /// (#2101) The live view the handler serves includes the telemetry
+        /// stream: a machine sample XADDed to `<stream>:telemetry` surfaces as
+        /// an SSE event. Dropping the stream from the handler's list left every
+        /// other test green.
+        #[tokio::test]
+        #[serial]
+        async fn flow_stream_handler_carries_the_telemetry_stream() {
+            if !redis_server_available() {
+                eprintln!("skipping: redis-server not on PATH");
+                return;
+            }
+            let redis = spawn_redis();
+            let today = today_utc_date();
+            unsafe { std::env::set_var("DARKMUX_REDIS_URL", &redis.url); }
+            let tmp = TempDir::new().unwrap();
+            let app = build_router_local(tmp.path().to_path_buf());
+            let response = app
+                .oneshot(Request::builder().uri(format!("/flow/{today}/stream")).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            use futures::StreamExt;
+            let mut body = response.into_body().into_data_stream();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let client = redis::Client::open(redis.url.as_str()).unwrap();
+            let mut conn = client.get_connection().unwrap();
+            let record = format!(r#"{{"ts":"{today}T12:00:00Z","action":"sse-telemetry-sample"}}"#);
+            let _: String = redis::cmd("XADD")
+                .arg(TELEMETRY_STREAM).arg("*").arg("schema").arg("2.0.0").arg("record").arg(&record)
+                .query(&mut conn).unwrap();
+            let read_fut = async {
+                let mut acc = Vec::new();
+                while let Some(Ok(chunk)) = body.next().await {
+                    acc.extend_from_slice(&chunk);
+                    if String::from_utf8_lossy(&acc).contains("sse-telemetry-sample") {
+                        break;
+                    }
+                }
+                String::from_utf8_lossy(&acc).into_owned()
+            };
+            let got = tokio::time::timeout(Duration::from_secs(3), read_fut).await.unwrap_or_default();
+            unsafe { std::env::remove_var("DARKMUX_REDIS_URL"); }
+            assert!(got.contains("sse-telemetry-sample"), "the telemetry stream is not in the live view: {got:?}");
+        }
+
+        /// (#2101) The session replay (`/flow-dispatch/:id`) reads the
+        /// telemetry stream: a peer's host sample on the hub lands in the run's
+        /// record set, which is what its SYSTEM pane draws. Reading the work
+        /// stream alone blanks that pane with no error.
+        #[tokio::test]
+        #[serial]
+        async fn a_dispatch_replay_carries_the_peers_host_samples_from_the_hub() {
+            if !redis_server_available() {
+                eprintln!("skipping: redis-server not on PATH");
+                return;
+            }
+            let redis = spawn_redis();
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+            let ts = |ago: i64| darkmux_flow::ts_utc_at(now - ago);
+            let add = |stream: &str, json: String| {
+                let client = redis::Client::open(redis.url.as_str()).unwrap();
+                let mut conn = client.get_connection().unwrap();
+                let _: String = redis::cmd("XADD").arg(stream).arg("*").arg("schema").arg("2.0.0").arg("record").arg(json).query(&mut conn).unwrap();
+            };
+            let rec = |action: &str, ago: i64| {
+                format!(r#"{{"ts":"{}","action":"{action}","session_id":"sess-peer","machine_uid":"UID-PEER","handle":"h"}}"#, ts(ago))
+            };
+            add(WORK_STREAM, rec("dispatch.start", 60));
+            add(WORK_STREAM, rec("dispatch.complete", 20));
+            add(TELEMETRY_STREAM, format!(r#"{{"ts":"{}","action":"machine.telemetry","machine_uid":"UID-PEER","handle":"sample"}}"#, ts(40)));
+            unsafe { std::env::set_var("DARKMUX_REDIS_URL", &redis.url); }
+            let tmp = TempDir::new().unwrap();
+            let app = build_router_local(tmp.path().to_path_buf());
+            let response = app
+                .oneshot(Request::builder().uri("/flow-dispatch/sess-peer").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            unsafe { std::env::remove_var("DARKMUX_REDIS_URL"); }
+            let arr = body_as_array(response).await;
+            let actions: Vec<&str> = arr.iter().filter_map(|r| r["action"].as_str()).collect();
+            assert!(actions.contains(&"machine.telemetry"), "the peer's host sample is missing from its run's records: {actions:?}");
+            assert!(actions.contains(&"dispatch.start"), "{actions:?}");
+        }
+
+        /// (#2101) The call site of the tail supervisor: a stream whose task
+        /// spends its failure budget (a key of the wrong type errors every
+        /// XREAD) must close the whole tail, though the other stream is
+        /// healthy, so the client reconnects. A detached task would leave the
+        /// SSE open on one stream only.
+        #[tokio::test]
+        #[serial]
+        async fn a_tail_that_loses_one_stream_closes_instead_of_staying_half_alive() {
+            if !redis_server_available() {
+                eprintln!("skipping: redis-server not on PATH");
+                return;
+            }
+            use futures::StreamExt;
+            let redis = spawn_redis();
+            let client = redis::Client::open(redis.url.as_str()).unwrap();
+            let mut conn = client.get_connection().unwrap();
+            let _: () = redis::cmd("SET").arg("not-a-stream").arg("x").query(&mut conn).unwrap();
+            let stream = redis_tail_lines(
+                redis.url.clone(),
+                vec![WORK_STREAM.to_string(), "not-a-stream".to_string()],
+                today_utc_date(),
+            );
+            tokio::pin!(stream);
+            // 10 failures x 500ms of backoff, then the synthetic record, then close.
+            let drained = tokio::time::timeout(Duration::from_secs(20), async { while stream.next().await.is_some() {} }).await;
+            assert!(drained.is_ok(), "the tail stayed open on the healthy stream after the other stream's task ended");
+        }
+
+        /// (#2101) When one stream's tail task ends, the others are stopped
+        /// and the channel closes, so the client reconnects instead of sitting
+        /// on a tail that silently lost a whole stream.
+        #[tokio::test]
+        async fn one_tail_task_ending_closes_the_channel() {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(4);
+            let mut tasks = tokio::task::JoinSet::new();
+            let forever = tx.clone();
+            tasks.spawn(async move {
+                let _held = forever;
+                std::future::pending::<()>().await;
+            });
+            tasks.spawn(async {});
+            drop(tx);
+            tokio::spawn(super::end_tail_when_any_task_ends(tasks));
+            let closed = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await;
+            assert!(matches!(closed, Ok(None)), "the channel must close once any task ends: {closed:?}");
         }
 
         // ─── #1466 gate MUST FIX 4: `mission_graph_json_handler` proxying

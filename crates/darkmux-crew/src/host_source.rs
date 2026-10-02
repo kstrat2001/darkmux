@@ -581,13 +581,18 @@ pub(crate) const NON_PRODUCER_SOURCE_PATHS: &[(&str, &str)] = &[
     ),
     (
         "crates/darkmux-flow/src/lib.rs",
-        "consumer: a test asks `reaches_fleet_stream` about `FlowAction::MachineTelemetry`, \
-         and nothing there builds a record",
+        "consumer: a test asks `hub_stream` which hub stream `FlowAction::MachineTelemetry` \
+         rides, and nothing there builds a record",
     ),
     (
         "crates/darkmux-crew/src/host_source.rs",
         "this file — the registry itself. Its literals ARE the table, plus the scanner's own \
          fixtures; scanning it would classify the table as its own producer",
+    ),
+    (
+        "crates/darkmux-flow/src/hub_link_tests.rs",
+        "tests for the Redis sink's hub link, in a sibling file; its `machine.telemetry` \
+         literal is a fixture record written to a fake hub",
     ),
     (
         "crates/darkmux-doctor/src/checks_hooks.rs",

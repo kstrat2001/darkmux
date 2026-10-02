@@ -132,6 +132,17 @@ impl Bookend {
     }
 }
 
+/// Which of the hub's two streams a record rides (#2101). The work stream
+/// carries what an engagement needs to keep (a run's usage, its steps, its
+/// lifecycle); the telemetry stream carries the machine samples, which are
+/// live state and most of the hub's records by volume, so a cap shared with
+/// the work stream flushed work records out of their window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HubStream {
+    Work,
+    Telemetry,
+}
+
 /// A row's bookend, when the row declares one.
 macro_rules! flow_bookend {
     () => {
@@ -201,6 +212,20 @@ macro_rules! flow_actions {
                 match self {
                     $( FlowAction::$variant => flow_grain!($($grain)?), )*
                     FlowAction::Other(_) => None,
+                }
+            }
+
+            /// The hub stream this action rides, `None` when it stays off the hub.
+            /// Heartbeats are local-only liveness detail (a 2 s cadence, most of
+            /// a long mission's records); `machine.telemetry` is the one
+            /// high-rate sampling action, so it gets its own stream. Every other
+            /// action, a thermal or battery transition included, is a rare edge
+            /// and rides the work stream.
+            pub fn hub_stream(&self) -> Option<HubStream> {
+                match self {
+                    FlowAction::DispatchTurnHeartbeat => None,
+                    FlowAction::MachineTelemetry => Some(HubStream::Telemetry),
+                    _ => Some(HubStream::Work),
                 }
             }
 

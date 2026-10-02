@@ -519,6 +519,28 @@ pub fn redis_maxlen() -> usize {
     pick_parsed("DARKMUX_REDIS_MAXLEN", cfg, Some(crate::config::DEFAULT_REDIS_MAXLEN)).unwrap()
 }
 
+/// The hub's machine-telemetry stream: the work stream's name plus
+/// `:telemetry`, so it follows `redis.stream` (and a test's stream override)
+/// without a second name to keep in step. (#2101)
+pub fn redis_telemetry_stream() -> String {
+    format!("{}{REDIS_TELEMETRY_STREAM_SUFFIX}", redis_stream())
+}
+
+/// What [`redis_telemetry_stream`] appends to the work stream's name.
+pub const REDIS_TELEMETRY_STREAM_SUFFIX: &str = ":telemetry";
+
+/// Retention of [`redis_telemetry_stream`] (`XADD MAXLEN ~ N`); `0` carries
+/// the operator's "unbounded" intent, as for [`redis_maxlen`]. (#2101)
+pub fn redis_telemetry_maxlen() -> usize {
+    let cfg = config().redis.as_ref().and_then(|r| r.telemetry_maxlen);
+    pick_parsed(
+        "DARKMUX_REDIS_TELEMETRY_MAXLEN",
+        cfg,
+        Some(crate::config::DEFAULT_REDIS_TELEMETRY_MAXLEN),
+    )
+    .unwrap()
+}
+
 // The non-secret connection bits for the config-assembled Redis URL (#661
 // Slice 5). CONFIG-ONLY — there is no per-field env var; the env path to
 // configure Redis is the full `DARKMUX_REDIS_URL` (tier-1 of `flow::redis_url`).

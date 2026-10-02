@@ -168,7 +168,11 @@ impl Backfill<'_> {
         let ts = v.get("ts")?.as_str()?;
         let uid = v.get("machine_uid").and_then(|u| u.as_str());
         let ours = uid.is_none() || uid == self.own_uid;
-        let publishable = crate::reader::action_of(&v).as_ref().is_none_or(crate::reaches_fleet_stream);
+        // Work records only: a heartbeat stays local and a telemetry sample is
+        // live state, so the next one supersedes any the hub missed (#2101).
+        let publishable = crate::reader::action_of(&v)
+            .as_ref()
+            .is_none_or(|a| a.hub_stream() == Some(crate::HubStream::Work));
         let wanted = ts >= self.since
             && ours
             && publishable
@@ -187,8 +191,9 @@ impl Backfill<'_> {
 /// backfill lands. Writes are atomic (temp file + rename) and serialized
 /// under an `flock` on a sibling lock file.
 ///
-/// Each `record` bumps `seq`, and a clear keeps the file with `since: null`
-/// and the counter intact, so a generation is never reused: a backfill clears
+/// Each `record` moves `seq` forward (to at least the clock's nanoseconds), and
+/// a clear keeps the file with `since: null` and the counter intact, so a
+/// generation is never reused, even after the file is lost: a backfill clears
 /// only the `seq` it read, and a failure recorded while it ran (or after a
 /// concurrent backfill cleared) keeps the watermark for the next recovery.
 /// Delivery is at-least-once, and readers de-duplicate on record identity.
@@ -202,7 +207,7 @@ pub(crate) struct OutageWatermark {
 struct Stored {
     /// `ts` of the earliest record that failed to publish; `None` once cleared.
     since: Option<String>,
-    /// Bumped by every `record`; never reset by a clear.
+    /// Moved forward by every `record`; never reset by a clear.
     seq: u64,
 }
 
@@ -246,8 +251,15 @@ impl OutageWatermark {
         let mut tmp_name = self.path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
         tmp_name.push(format!(".tmp-{}", std::process::id()));
         let tmp = self.path.with_file_name(tmp_name);
-        std::fs::write(&tmp, serde_json::to_vec(stored)?)
-            .with_context(|| format!("writing {}", tmp.display()))?;
+        // Synced before the rename: a power cut must leave the old file or the
+        // whole new one, never a renamed empty file that reads as "no outage".
+        let write = || -> std::io::Result<()> {
+            use std::io::Write as _;
+            let mut file = std::fs::File::create(&tmp)?;
+            file.write_all(&serde_json::to_vec(stored)?)?;
+            file.sync_all()
+        };
+        write().with_context(|| format!("writing {}", tmp.display()))?;
         std::fs::rename(&tmp, &self.path)
             .with_context(|| format!("replacing {}", self.path.display()))
     }
@@ -257,7 +269,11 @@ impl OutageWatermark {
     pub(crate) fn record(&self, ts: &str) -> Result<()> {
         darkmux_types::flock::with_locked_file(&self.lock_path(), |_| {
             let old = self.load_stored();
-            let seq = old.as_ref().map_or(0, |o| o.seq) + 1;
+            // Past the stored generation, and never below the clock: a file
+            // that is missing or unreadable restarts at the clock's reading,
+            // not at 1, so a backfill holding an old generation cannot match
+            // a newer outage's.
+            let seq = old.as_ref().map_or(0, |o| o.seq + 1).max(now_nanos());
             let since = match old.and_then(|o| o.since) {
                 Some(prev) => prev.min(ts.to_string()),
                 None => ts.to_string(),
@@ -274,6 +290,13 @@ impl OutageWatermark {
             _ => Ok(()),
         })
     }
+}
+
+/// Nanoseconds since the epoch: the floor of a new watermark generation.
+fn now_nanos() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
 }
 
 /// Where the outage watermark lives: `<darkmux root>/state/hub-outage.json`.

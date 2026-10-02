@@ -24,7 +24,7 @@ mod integrity;
 mod schema;
 mod status;
 
-pub use action::{Bookend, Edge, FlowAction, FlowScope, Grain, UnknownAction};
+pub use action::{Bookend, Edge, FlowAction, FlowScope, Grain, HubStream, UnknownAction};
 pub use payload::{OpenPayload, Payload, UnreadPayload};
 pub use bookend::*;
 pub use hub_link::{HubLink, SinkPolicy};
@@ -989,6 +989,10 @@ pub struct RedisSink {
     /// Optional MAXLEN ~ N retention cap. None = unbounded (don't use
     /// in production; the stream grows without bound).
     max_len: Option<usize>,
+    /// The machine-telemetry stream (#2101) and its own cap, kept apart from
+    /// `stream` so samples never evict work records.
+    telemetry_stream: String,
+    telemetry_max_len: Option<usize>,
     /// (#388) Consecutive write-failure counter. Reset to 0 on any
     /// successful write. When it reaches `REDIS_DISABLE_THRESHOLD` the
     /// sink disables itself (for the rest of the process under `OneShot`,
@@ -1376,6 +1380,8 @@ impl RedisSink {
             url,
             stream: stream.to_string(),
             max_len,
+            telemetry_stream: format!("{stream}{}", darkmux_types::config_access::REDIS_TELEMETRY_STREAM_SUFFIX),
+            telemetry_max_len: max_len,
             consecutive_failures: AtomicU32::new(0),
             disabled: AtomicBool::new(false),
             policy: SinkPolicy::OneShot,
@@ -1386,6 +1392,14 @@ impl RedisSink {
             watermark_read: AtomicBool::new(false),
             watermark_seen: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Write `machine.telemetry` to `stream` under `max_len` instead of the
+    /// default (`<stream>:telemetry`, the work stream's cap). (#2101)
+    pub fn with_telemetry(mut self, stream: &str, max_len: Option<usize>) -> Self {
+        self.telemetry_stream = stream.to_string();
+        self.telemetry_max_len = max_len;
+        self
     }
 
     /// Set what this sink does once it has disabled itself (default `OneShot`).
@@ -1440,8 +1454,8 @@ impl RedisSink {
                 SinkPolicy::LongLived => "disabling Redis flow sink until the peer answers again",
             };
             eprintln!(
-                "flow::RedisSink: {} unreachable after {n} consecutive {what} failures \
-                 ({err:#}); {outlook}. LocalFileSink is unaffected.",
+                "flow::RedisSink: {} unreachable after {n} consecutive failures \
+                 (last: {what}: {err:#}); {outlook}. LocalFileSink is unaffected.",
                 self.url
             );
         }
@@ -1497,25 +1511,20 @@ impl RedisSink {
     pub fn url(&self) -> &str { self.url.expose_for_probe() }
     pub fn stream(&self) -> &str { &self.stream }
     pub fn max_len(&self) -> Option<usize> { self.max_len }
-}
-
-/// Whether a record rides the shared fleet stream (#2101). Heartbeats are
-/// local-only liveness detail: the local file sink keeps every one, but at a
-/// 2 s cadence they were most of a long mission's records and flushed other
-/// machines' work out of the capped stream. The fleet stream carries work
-/// records and machine telemetry; presence is a separate TTL key, and any
-/// other timed record (`dispatch.tool`, `dispatch.turn`) keeps a peer's run
-/// live. Used by the live write AND the outage backfill.
-pub(crate) fn reaches_fleet_stream(action: &FlowAction) -> bool {
-    *action != FlowAction::DispatchTurnHeartbeat
+    pub fn telemetry_stream(&self) -> &str { &self.telemetry_stream }
+    pub fn telemetry_max_len(&self) -> Option<usize> { self.telemetry_max_len }
 }
 
 impl FlowSink for RedisSink {
     fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
         let record = record.get();
-        if !reaches_fleet_stream(&record.action) {
+        // (#2101) Heartbeats are local-only liveness detail: the local file
+        // sink keeps every one, but at a 2 s cadence they flushed other
+        // machines' work out of the capped stream. Presence is a separate TTL
+        // key, and any other timed record keeps a peer's run live.
+        let Some(hub_stream) = record.action.hub_stream() else {
             return Ok(());
-        }
+        };
         // (#388) A sink that is not due to try skips silently: no connection
         // attempt (so no 500ms timeout) and no log. Returning Ok keeps this
         // best-effort coordination sink from masking the durable
@@ -1523,7 +1532,7 @@ impl FlowSink for RedisSink {
         if !self.should_attempt() {
             return Ok(());
         }
-        match self.deliver(record) {
+        match self.deliver(record, hub_stream) {
             Ok(()) => self.note_success(),
             // Swallow: log a single one-time warning at the disable
             // threshold (note_failure), but never propagate to the
@@ -1553,7 +1562,7 @@ impl RedisSink {
     /// One delivery attempt, fallible: connect, first re-send what the local
     /// day files hold from an outage (`LongLived` only), then XADD `record`.
     /// The caller wraps it with the #388 accounting.
-    fn deliver(&self, record: &FlowRecord) -> Result<()> {
+    fn deliver(&self, record: &FlowRecord, hub_stream: HubStream) -> Result<()> {
         let mut conn = open_redis_connection_bounded(&self.client, REDIS_CONNECT_TIMEOUT)
             .context("getting Redis connection")?;
         // (#2227) The connect above is bounded; the XADD below was not. An
@@ -1566,8 +1575,8 @@ impl RedisSink {
         if self.policy == SinkPolicy::LongLived {
             self.backfill(&mut conn, &payload, false)?;
         }
-        self.xadd(&payload, false).query::<String>(&mut conn)
-            .with_context(|| format!("XADD to Redis stream `{}`", self.stream))?;
+        self.xadd(hub_stream, &payload, false).query::<String>(&mut conn)
+            .with_context(|| format!("XADD to Redis stream `{}`", self.stream_for(hub_stream).0))?;
         Ok(())
     }
 
@@ -1602,16 +1611,25 @@ impl RedisSink {
         }
     }
 
+    /// The stream `hub_stream` names, and the cap its XADDs carry.
+    fn stream_for(&self, hub_stream: HubStream) -> (&str, Option<usize>) {
+        match hub_stream {
+            HubStream::Work => (&self.stream, self.max_len),
+            HubStream::Telemetry => (&self.telemetry_stream, self.telemetry_max_len),
+        }
+    }
+
     /// The XADD for one record. Two-field encoding: `schema` carries the
     /// version (so downstream consumers across darkmux versions can handle skew
     /// explicitly), `record` carries the JSON-serialized FlowRecord. A
     /// backfilled entry adds `late=1`: it was written while the hub was
     /// unreachable and is being re-sent, so a stream reader can tell it from
     /// a live write. Readers select fields by name and ignore the marker.
-    fn xadd(&self, payload: &str, late: bool) -> redis::Cmd {
+    fn xadd(&self, hub_stream: HubStream, payload: &str, late: bool) -> redis::Cmd {
+        let (stream, max_len) = self.stream_for(hub_stream);
         let mut cmd = redis::cmd("XADD");
-        cmd.arg(&self.stream);
-        if let Some(n) = self.max_len {
+        cmd.arg(stream);
+        if let Some(n) = max_len {
             cmd.arg("MAXLEN").arg("~").arg(n);
         }
         cmd.arg("*"); // auto-generated ID
@@ -1654,7 +1672,7 @@ impl RedisSink {
         for chunk in lines.chunks(BACKFILL_PIPELINE_CHUNK) {
             let mut pipe = redis::pipe();
             for line in chunk {
-                pipe.add_command(self.xadd(line, true)).ignore();
+                pipe.add_command(self.xadd(HubStream::Work, line, true)).ignore();
             }
             pipe.query::<()>(conn)
                 .with_context(|| format!("backfilling {} record(s) to Redis stream `{}`", lines.len(), self.stream))?;
@@ -1680,6 +1698,11 @@ impl RedisSink {
         config.insert(
             "max_len".to_string(),
             self.max_len.map(|n| n.to_string()).unwrap_or_else(|| "unbounded".to_string()),
+        );
+        config.insert("telemetry_stream".to_string(), self.telemetry_stream.clone());
+        config.insert(
+            "telemetry_max_len".to_string(),
+            self.telemetry_max_len.map(|n| n.to_string()).unwrap_or_else(|| "unbounded".to_string()),
         );
         // (#2227) Surface the #388 self-disable. `sink_info` feeds
         // `darkmux flow status --json` and the daemon's endpoint, and until now
@@ -1836,12 +1859,25 @@ impl FlowSink for TeeSink {
 ///
 /// `DARKMUX_REDIS_STREAM` overrides the stream name (default `darkmux:flow`).
 /// `DARKMUX_REDIS_MAXLEN` overrides the retention cap (default 10000;
-/// set to `0` for unbounded — not recommended).
+/// set to `0` for unbounded — not recommended). `machine.telemetry` rides
+/// its own stream, `<stream>:telemetry`, capped by
+/// `DARKMUX_REDIS_TELEMETRY_MAXLEN` (default 10000) (#2101).
 ///
 /// Connection errors at construction degrade gracefully: if Redis is
 /// unreachable when the sink builds, the warning logs to stderr and the
 /// default sink continues without it. Operators see the connection
 /// failure loudly; the audit + casual substrates stay intact.
+/// The Redis sink as `config_access` resolves it (env > config.json > default):
+/// the work stream and cap, the telemetry stream and ITS cap (`0` is
+/// unbounded for both), under the process's sink policy. (#2101)
+fn redis_sink_from_config(url: &str) -> Result<RedisSink> {
+    use darkmux_types::config_access as c;
+    let cap = |n: usize| (n != 0).then_some(n);
+    Ok(RedisSink::new(url, &c::redis_stream(), cap(c::redis_maxlen()))?
+        .with_policy(sink_policy())
+        .with_telemetry(&c::redis_telemetry_stream(), cap(c::redis_telemetry_maxlen())))
+}
+
 fn build_default_sink() -> Arc<dyn FlowSink> {
     let mut sinks: Vec<Arc<dyn FlowSink>> = Vec::new();
 
@@ -1876,15 +1912,11 @@ fn build_default_sink() -> Arc<dyn FlowSink> {
         // default) so a config-only operator's `redis.stream`/`redis.maxlen`
         // aren't silently dropped. The `0 → None` (unbounded) translation stays
         // at this call site per the accessor's contract.
-        let stream = darkmux_types::config_access::redis_stream();
-        let max_len = match darkmux_types::config_access::redis_maxlen() {
-            0 => None,
-            n => Some(n),
-        };
-
-        match RedisSink::new(raw_url.expose_for_probe(), &stream, max_len) {
+        let sink = redis_sink_from_config(raw_url.expose_for_probe());
+        match sink {
             Ok(redis_sink) => {
-                let redis_sink = redis_sink.with_policy(sink_policy());
+                let (stream, max_len) = (redis_sink.stream().to_string(), redis_sink.max_len());
+                let (telemetry_stream, telemetry_max_len) = (redis_sink.telemetry_stream().to_string(), redis_sink.telemetry_max_len());
                 // (#1955) The URL is deliberately NOT printed.
                 //
                 // `RawRedisUrl`'s redaction covers the PASSWORD (#213/#229)
@@ -1902,7 +1934,8 @@ fn build_default_sink() -> Arc<dyn FlowSink> {
                 // stream name and nothing else.
                 darkmux_types::diag_eprintln!(
                     "flow: Redis sink enabled: stream={stream} \
-                     max_len={max_len:?} (composed via TeeSink)"
+                     max_len={max_len:?} telemetry_stream={telemetry_stream} \
+                     telemetry_max_len={telemetry_max_len:?} (composed via TeeSink)"
                 );
                 sinks.push(Arc::new(redis_sink));
             }
@@ -2496,8 +2529,32 @@ mod tests {
             tool.persist(checked).unwrap();
         }
         assert!(tool.is_disabled(), "a tool record is attempted, and 3 failures trip the sink");
-        assert!(!reaches_fleet_stream(&FlowAction::DispatchTurnHeartbeat));
-        assert!(reaches_fleet_stream(&FlowAction::MachineTelemetry));
+        assert_eq!(FlowAction::DispatchTurnHeartbeat.hub_stream(), None);
+        assert_eq!(FlowAction::MachineTelemetry.hub_stream(), Some(HubStream::Telemetry));
+        assert_eq!(FlowAction::DispatchTool.hub_stream(), Some(HubStream::Work));
+    }
+
+    /// (#2101) The configured telemetry stream and cap are the ones the default
+    /// sink applies, not the work stream's: dropping the `with_telemetry` call
+    /// silently gave samples the work cap.
+    #[test]
+    #[serial_test::serial]
+    fn the_configured_telemetry_cap_is_the_one_applied() {
+        let vars = ["DARKMUX_REDIS_STREAM", "DARKMUX_REDIS_MAXLEN", "DARKMUX_REDIS_TELEMETRY_MAXLEN"];
+        unsafe {
+            std::env::set_var("DARKMUX_REDIS_STREAM", "t:flow");
+            std::env::set_var("DARKMUX_REDIS_MAXLEN", "111");
+            std::env::set_var("DARKMUX_REDIS_TELEMETRY_MAXLEN", "222");
+        }
+        let sink = redis_sink_from_config("redis://127.0.0.1:1").unwrap();
+        unsafe { std::env::set_var("DARKMUX_REDIS_TELEMETRY_MAXLEN", "0") };
+        let unbounded = redis_sink_from_config("redis://127.0.0.1:1").unwrap();
+        for v in vars {
+            unsafe { std::env::remove_var(v) };
+        }
+        assert_eq!((sink.stream(), sink.max_len()), ("t:flow", Some(111)));
+        assert_eq!((sink.telemetry_stream(), sink.telemetry_max_len()), ("t:flow:telemetry", Some(222)));
+        assert_eq!(unbounded.telemetry_max_len(), None, "0 is unbounded");
     }
 
     #[test]
@@ -5090,7 +5147,7 @@ mod tests {
         // (1) The fallible inner write must SURFACE the stall as an `Err`.
         // A silent skip here is what let the disable machinery starve.
         let start = std::time::Instant::now();
-        let inner = sink.deliver(&rec);
+        let inner = sink.deliver(&rec, HubStream::Work);
         let inner_elapsed = start.elapsed();
         let inner_err = inner.expect_err(
             "try_write against a handshake-completing, command-silent peer must \
