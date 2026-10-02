@@ -321,6 +321,7 @@ pub fn spawn_reconciler_thread() -> Option<std::thread::JoinHandle<()>> {
             // the last session baseline, never fires a false `session.end`).
             let mut healthy = true;
             loop {
+                crate::tick_default_sink();
                 match read_live(&client) {
                     Ok(beats) => {
                         // (#902) A recovery tick (first success after a

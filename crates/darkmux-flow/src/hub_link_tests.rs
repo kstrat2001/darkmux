@@ -529,6 +529,27 @@ fn a_one_shot_writers_outage_records_are_backfilled_by_the_daemon() {
     );
 }
 
+/// A healthy daemon must pick up an outage a one-shot writer recorded, on its
+/// periodic tick, without waiting for a restart or an outage of its own.
+#[test]
+fn a_healthy_daemons_tick_backfills_a_one_shot_writers_watermark() {
+    let dir = TempDir::new().unwrap();
+    let hub = Hub::start();
+    let daemon = sink(&hub, &dir, SinkPolicy::LongLived);
+    write(&daemon, &dir, &rec("b1", 60));
+    daemon.tick();
+    assert_eq!(handles(&hub.entries()), ["b1"], "a tick with no watermark sends nothing");
+    // A one-shot CLI wrote while the hub was unreachable from where it ran.
+    let missed = rec("cli1", 30);
+    write_file_only(&dir, &missed);
+    hub_link::OutageWatermark::new(watermark_file(&dir)).record(&missed.ts).unwrap();
+    daemon.tick();
+    assert_eq!(handles(&hub.entries()), ["b1", "cli1"], "the tick backfills what the CLI missed");
+    assert!(!watermark_file(&dir).exists(), "a landed backfill clears the watermark");
+    daemon.tick();
+    assert_eq!(hub.entries().len(), 2, "a tick after the clear sends nothing");
+}
+
 /// A backfill the hub refuses must leave the watermark for the next recovery.
 #[test]
 fn a_failed_backfill_keeps_the_persisted_watermark() {

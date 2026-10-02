@@ -109,6 +109,10 @@ pub trait FlowSink: Send + Sync {
     fn hub_link(&self) -> Option<HubLink> {
         None
     }
+
+    /// Periodic housekeeping a long-lived process drives (the presence
+    /// reconciler's tick). A no-op unless the sink has deferred work.
+    fn tick(&self) {}
 }
 
 /// A record that passed the write check: its action is one darkmux writes
@@ -1009,6 +1013,9 @@ pub struct RedisSink {
     watermark: hub_link::OutageWatermark,
     /// Whether the persisted watermark has been read since this sink started.
     watermark_read: AtomicBool,
+    /// The watermark file's (mtime, length) as of the last tick that acted on
+    /// it, so a tick only reads and re-sends when the file changed.
+    watermark_seen: std::sync::Mutex<Option<(std::time::SystemTime, u64)>>,
 }
 
 /// (#388) Consecutive write failures before a `RedisSink` disables
@@ -1377,6 +1384,7 @@ impl RedisSink {
             link: std::sync::Mutex::new(hub_link::LinkState::new()),
             watermark: hub_link::OutageWatermark::new(hub_link::default_watermark_path()),
             watermark_read: AtomicBool::new(false),
+            watermark_seen: std::sync::Mutex::new(None),
         })
     }
 
@@ -1529,6 +1537,10 @@ impl FlowSink for RedisSink {
     fn hub_link(&self) -> Option<HubLink> {
         Some(self.link_state().link())
     }
+
+    fn tick(&self) {
+        self.catch_up_watermark();
+    }
 }
 
 impl RedisSink {
@@ -1546,11 +1558,42 @@ impl RedisSink {
         let payload = serde_json::to_string(record)
             .context("serializing FlowRecord for Redis")?;
         if self.policy == SinkPolicy::LongLived {
-            self.backfill(&mut conn, &payload)?;
+            self.backfill(&mut conn, &payload, false)?;
         }
         self.xadd(&payload, false).query::<String>(&mut conn)
             .with_context(|| format!("XADD to Redis stream `{}`", self.stream))?;
         Ok(())
+    }
+
+    /// Tick work for a healthy long-lived sink: when the watermark file has
+    /// changed since the last tick (a one-shot writer's failed write recorded
+    /// one), re-send from it now rather than at the next restart or outage.
+    /// One `stat` when nothing changed; the file is read, and the hub
+    /// contacted, only when its (mtime, length) differs.
+    fn catch_up_watermark(&self) {
+        if self.policy != SinkPolicy::LongLived || self.is_disabled() {
+            return;
+        }
+        let sig = self.watermark.signature();
+        {
+            let mut seen = self.watermark_seen.lock().unwrap_or_else(|p| p.into_inner());
+            if *seen == sig {
+                return;
+            }
+            *seen = sig;
+        }
+        if sig.is_none() {
+            return;
+        }
+        let result = open_redis_connection_bounded(&self.client, REDIS_CONNECT_TIMEOUT)
+            .context("getting Redis connection")
+            .and_then(|mut conn| {
+                bound_redis_response(&conn);
+                self.backfill(&mut conn, "", true)
+            });
+        if let Err(e) = result {
+            self.note_failure(&e, &schema::ts_utc_now());
+        }
     }
 
     /// The XADD for one record. Two-field encoding: `schema` carries the
@@ -1583,10 +1626,10 @@ impl RedisSink {
     /// cleared once the re-send lands. Delivery is at-least-once: reader-side
     /// de-duplication by record identity absorbs any record the hub already
     /// holds.
-    fn backfill(&self, conn: &mut redis::Connection, payload: &str) -> Result<()> {
+    fn backfill(&self, conn: &mut redis::Connection, payload: &str, check_file: bool) -> Result<()> {
         let own = self.link_state().outage_since().map(str::to_string);
         let first = !self.watermark_read.swap(true, Ordering::AcqRel);
-        let marked = if own.is_some() || first { self.watermark.load() } else { None };
+        let marked = if own.is_some() || first || check_file { self.watermark.load() } else { None };
         let Some(since) = own.into_iter().chain(marked.as_ref().map(|m| m.since.clone())).min() else {
             return Ok(());
         };
@@ -1754,6 +1797,10 @@ impl FlowSink for TeeSink {
             children: self.sinks.iter().map(|s| s.info()).collect(),
             raw_url: None,
         }
+    }
+
+    fn tick(&self) {
+        self.sinks.iter().for_each(|s| s.tick());
     }
 
     fn hub_link(&self) -> Option<HubLink> {
@@ -1950,6 +1997,12 @@ pub fn set_sink_policy(policy: SinkPolicy) -> Result<()> {
             sink_policy().as_str()
         ),
     }
+}
+
+/// Drive the default sink's periodic housekeeping (the daemon's presence
+/// reconciler calls this every few seconds).
+pub fn tick_default_sink() {
+    default_sink().tick();
 }
 
 /// This process's link to the fleet hub's flow stream, read from the default

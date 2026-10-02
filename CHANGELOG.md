@@ -1540,6 +1540,11 @@ darkmux release.
   once, each with `hook.failed`. The guide, config docs, and
   comments said "bounded retries" and implied `hook.failed` for a receiver that
   stays down.
+- **A healthy daemon picks up a one-shot writer's outage on its next tick.** The
+  presence reconciler's tick `stat`s the hub-outage watermark and, when it changed,
+  backfills from it, so those records no longer wait for a daemon restart.
+- **A hook delivery's rejected total is updated before its `.last` status.** A
+  reader that saw the status could see a total that did not yet include it.
 - **The jq transform timeout cannot leak its orphan counter.** The worker thread
   owns the decrement, so a worker finishing in the timeout window no longer
   leaves the rule stuck `Busy`.

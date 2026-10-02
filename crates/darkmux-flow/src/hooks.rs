@@ -3908,9 +3908,13 @@ impl Pending<'_> {
         let rejected_for_status = receiver_rejected.filter(|n| *n > 0);
         let reasons_for_status: Vec<String> =
             if rejected_for_status.is_some() { receiver_rejected_reasons } else { Vec::new() };
+        // The accumulating counter is updated BEFORE the `.last` status is
+        // published: a reader that sees a status naming this delivery's
+        // rejection must also see the total that includes it.
+        let total = rejected_for_status
+            .map(|n| (n, add_receiver_rejected(&rt.rule.outbox_path, &rt.rule.receiver_rejected_path, n)));
         write_last_status_full(rt, true, None, rejected_for_status, reasons_for_status.clone());
-        if let Some(n) = rejected_for_status {
-            let total = add_receiver_rejected(&rt.rule.outbox_path, &rt.rule.receiver_rejected_path, n);
+        if let Some((n, total)) = total {
             // (#2196 fix-round MUST FIX 1) Quoted + re-sanitized; (#2196
             // fix-round 4, MUST FIX G) and on its own INDENTED line(s) rather
             // than inline, because this string reaches a real terminal, the

@@ -215,6 +215,13 @@ impl OutageWatermark {
         self.path.with_file_name(name)
     }
 
+    /// The state file's (mtime, length): a cheap change detector for a
+    /// periodic check. `None` when the file is absent.
+    pub(crate) fn signature(&self) -> Option<(std::time::SystemTime, u64)> {
+        let meta = std::fs::metadata(&self.path).ok()?;
+        Some((meta.modified().ok()?, meta.len()))
+    }
+
     /// The stored watermark; `None` when absent or unreadable.
     pub(crate) fn load(&self) -> Option<Marked> {
         let text = std::fs::read_to_string(&self.path).ok()?;
