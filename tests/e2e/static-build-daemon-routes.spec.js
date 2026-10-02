@@ -76,19 +76,28 @@ test('(U5-1) a static build asks a daemon for nothing on #lens=fleet', async ({ 
 
 test('(U4-1) every lens shows the same committed day in the events column, at rest', async ({ page }) => {
   const counts = {};
-  for (const lens of LENSES) {
+  for (const lens of LENSES.filter((l) => l !== 'machine')) {
     await page.goto(`/index.html#lens=${lens}`);
     await expect(page.locator('.eventlog__rec').first()).toBeVisible();
     counts[lens] = await eventCountText(page);
   }
   // Non-zero everywhere…
-  for (const lens of LENSES) {
+  for (const lens of Object.keys(counts)) {
     expect(counts[lens], `${lens} reported no events for a day the page had loaded`).not.toMatch(/^0 events$/);
   }
   // …and the SAME everywhere: the at-rest scope is the loaded day, and which
   // lens is showing does not change how much of it happened.
   const distinct = new Set(Object.values(counts));
   expect([...distinct], `per-lens counts disagreed: ${JSON.stringify(counts)}`).toHaveLength(1);
+
+  // (5.0 R2) The machine page is the exception by design: it lists ONE
+  // machine's records. This harness ships no machine fixture, so the page
+  // cannot say whose machine it is, and an unknown machine lists nothing
+  // rather than everyone's (the served demo ships one; its machine page is
+  // pinned in `ui/src/App.test.tsx`).
+  await page.goto('/index.html#lens=machine');
+  await expect(page.locator('.machine-lens__hdr')).toBeVisible();
+  expect(await eventCountText(page)).toMatch(/^0 events$/);
 
   // (#2417 round 3, CONSIDER-2) The finder above stays permissive (the
   // hidden-count segment is optional in its own regex), but on THIS busy
