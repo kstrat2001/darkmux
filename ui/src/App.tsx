@@ -1076,7 +1076,7 @@ function renderRoute(
     case "fleet":
       return <FleetLens connected={connected} lastContactMs={routeLastContactMs} />;
     case "runs":
-      return <RunsBoard initialKind={route.runsKind} initialLab={route.lab} initialMachineKey={route.machine} />;
+      return <RunsBoard initialKind={route.runsKind} initialLab={route.lab} initialMachineKey={route.machine} initialFilters={route.filters} />;
     case "machine":
       return <MachineLens machineKey={route.machine} />;
     case "console":

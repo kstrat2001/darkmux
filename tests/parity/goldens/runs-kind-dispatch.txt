@@ -18,11 +18,21 @@ github
 runs
 
 === stage ===
-runs · dispatch · newest 25 of 67
+runs · dispatch
 all 308
 mission 108
 dispatch 67
 lab 133
+Time
+Status
+Machine
+Model
+Role
+Workload
+Verify
+Route
+Tracked
+Showing newest 25 of 67 runs
 COMPLETE
 DISPATCH
 crew-dispatch-radio-router-1786199280181417-5

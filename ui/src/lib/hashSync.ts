@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { dispatchHash, type Route } from "./route";
+import { emptyFilterSel, filterSelPairs } from "./runsFilterQuery";
 import { canonicalOptPairs } from "../lenses/console/panels";
 
 /**
@@ -66,35 +67,8 @@ export function canonicalHash(route: Route): string | null {
   switch (route.kind) {
     case "fleet":
       return "";
-    case "runs": {
-      const p = new URLSearchParams();
-      p.set("lens", "runs");
-      if (route.runsKind && route.runsKind !== "all") p.set("kind", route.runsKind);
-      // (drill-in packet) `run` now HAS a real destination — the lab-run
-      // detail view (`LabRunDetail`) — so it earns a place in the canonical
-      // hash again, matching legacy's own `state.level==="lab-run"` write
-      // (`if(state.level==="lab-run"&&state.labRunDir!=null)p.set("run",...)`
-      // in `syncLabHash`). Written whenever `route.lab` is set, INDEPENDENT
-      // of `runsKind` — legacy's own gate is `state.level==="lab-run"`, not
-      // `state.runsKind==="lab"`: a lab row is visible (and clickable) under
-      // BOTH kind=all and kind=lab (any OTHER kind filter excludes lab rows
-      // entirely — see `runsFiltered`), so the reachable hash forms are
-      // `lab=` alone (kind=all, no `kind=` param at all) and
-      // `kind=lab&lab=`, both real. See this file's module doc for why this
-      // REVERSES the prior QA correction, now that the drill-in exists to
-      // preserve `run` for.
-      if (route.lab) p.set("lab", route.lab);
-      // (#1809) The machine pin, written whenever set — composable with
-      // `kind`/`lab` above, independent params on the same hash (matching
-      // `route.ts`'s own doc: a pinned kind filter and a pinned lab-run
-      // drill-in are both real, simultaneously reachable states).
-      // (#2929) A machine KEY, never a uid: every writer encodes through
-      // `lib/machineKey.ts`. Written verbatim here because this function has
-      // no window to encode with — an old uid link passes through until the
-      // lens resolves it and rewrites it (see `useDecodedMachineKey`).
-      if (route.machine) p.set("machine", route.machine);
-      return p.toString();
-    }
+    case "runs":
+      return runsHash(route);
     case "machine": {
       const p = new URLSearchParams();
       p.set("lens", "machine");
@@ -210,4 +184,38 @@ export function useSyncHash(route: Route): void {
     // `route` is a referentially-stable snapshot from `useHashRoute` (only
     // changes identity when the hash actually moved) — safe as a direct dep.
   }, [route]);
+}
+
+/** The canonical hash of a runs-lens route. */
+function runsHash(route: Extract<Route, { kind: "runs" }>): string {
+  const p = new URLSearchParams();
+  p.set("lens", "runs");
+  if (route.runsKind && route.runsKind !== "all") p.set("kind", route.runsKind);
+  // (drill-in packet) `lab` now HAS a real destination — the lab-run
+  // detail view (`LabRunDetail`) — so it earns a place in the canonical
+  // hash again, matching legacy's own `state.level==="lab-run"` write
+  // (`if(state.level==="lab-run"&&state.labRunDir!=null)p.set("lab",...)`
+  // in `syncLabHash`). Written whenever `route.lab` is set, INDEPENDENT
+  // of `runsKind` — legacy's own gate is `state.level==="lab-run"`, not
+  // `state.runsKind==="lab"`: a lab row is visible (and clickable) under
+  // BOTH kind=all and kind=lab (any OTHER kind filter excludes lab rows
+  // entirely — see `runsFiltered`), so the reachable hash forms are
+  // `lab=` alone (kind=all, no `kind=` param at all) and
+  // `kind=lab&lab=`, both real. See this file's module doc for why this
+  // REVERSES the prior QA correction, now that the drill-in exists to
+  // preserve `lab` for.
+  if (route.lab) p.set("lab", route.lab);
+  // (#1809) The machine pin, written whenever set — composable with
+  // `kind`/`lab` above, independent params on the same hash (matching
+  // `route.ts`'s own doc: a pinned kind filter and a pinned lab-run
+  // drill-in are both real, simultaneously reachable states).
+  // (#2929) A machine KEY, never a uid: every writer encodes through
+  // `lib/machineKey.ts`. Written verbatim here because this function has
+  // no window to encode with — an old uid link passes through until the
+  // lens resolves it and rewrites it (see `useDecodedMachineKey`).
+  // (#2925) Every selected machine key, then the other dimensions' values.
+  const filters = { ...(route.filters ?? emptyFilterSel()) };
+  if (route.machine && filters.machine.length === 0) filters.machine = [route.machine];
+  for (const [name, value] of filterSelPairs(filters)) p.append(name, value);
+  return p.toString();
 }

@@ -1,6 +1,6 @@
 import { WorkStatus } from "../../components/WorkStatus";
 import { Shimmer } from "../../components/Placeholder";
-import { Fragment, useEffect, useRef, useState, type KeyboardEvent } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../../lib/queryKeys";
@@ -9,10 +9,13 @@ import { missionGraphReachable } from "../../lib/source";
 import { getSource, labRunsSrc, runsSrc } from "../../lib/source";
 import { useDay } from "../../hooks/useDay";
 import { RUNS_KINDS, type RunsKind } from "../../lib/route";
+import { emptyFilterSel, filterSelPairs, isFilterSelEmpty, type FilterDim, type FilterSel } from "../../lib/runsFilterQuery";
 import { useFlowWindow } from "../../hooks/useFlowWindow";
-import { useDecodedMachineKey, useMachineKeyContext } from "../../hooks/useMachineKey";
-import { MACHINE_NOT_FOUND_LABEL, machineLabel, type MachineKeyContext } from "../../lib/machineKey";
-import { machineMatch } from "../../lib/machineIdentity";
+import { decodeMachineKey } from "../../lib/machineKey";
+import { useMachineKeyContext } from "../../hooks/useMachineKey";
+import { FilterBar } from "./RunsFilterBar";
+import { applyFilters, buildFacets, kindCounts, type FilterEnv } from "./runFilters";
+import { canonicalMachineKeys, keyOfMachineValue, machineIndex, machineValueLabel, valueOfMachineKey } from "./machineFilter";
 import { LabRunDetail } from "./LabRunDetail";
 import type { RunsResponse } from "../../types/generated/RunsResponse";
 import type { LabRunsResponse } from "../../types/generated/LabRunsResponse";
@@ -21,7 +24,6 @@ import type { Run } from "../../types/generated/Run";
 import {
   RUNS_CAP,
   runsFiltered,
-  runsForMachine,
   runMachineLabels,
   runsMultiMachine,
   runsAgo,
@@ -166,6 +168,7 @@ export function RunsBoard({
   initialKind,
   initialLab,
   initialMachineKey,
+  initialFilters,
 }: {
   initialKind: RunsKind;
   initialLab: string | null;
@@ -180,11 +183,13 @@ export function RunsBoard({
    * (#2929) A machine KEY (`lib/machineKey.ts`), never the hardware uid —
    * or, on an old link, the uid itself, resolved leniently and rewritten. */
   initialMachineKey: string | null;
+  /** (#2925) The route's dimension filters; absent means none. */
+  initialFilters?: FilterSel;
 }) {
   const [kind, setKind] = useState<RunsKind>(initialKind);
   const [showAll, setShowAll] = useState(false);
   const [rowClickNotice, setRowClickNotice] = useState<string | null>(null);
-  const [machineKey, setMachineKey] = useState<string | null>(initialMachineKey);
+  const [sel, setSel] = useState<FilterSel>(() => seedSel(initialFilters, initialMachineKey));
   // `state.labRunDir` (viewer.html) — which lab run (if any) this board is
   // showing the detail pane for. Seeded from `initialLab`, independent of
   // `kind` — a lab row (and so this drill-in) is reachable from BOTH
@@ -193,6 +198,14 @@ export function RunsBoard({
   // `state.level==="lab-run"` gate, which is independent of
   // `state.runsKind` too (see `route.ts`'s widened `run` doc).
   const [labRunDir, setLabRunDir] = useState<string | null>(initialLab);
+
+  // (#2925) A new filter selection: local state, then the address bar. Like the
+  // kind tabs it changes no `Route` (no `hashchange`), so it writes directly.
+  function commitSel(next: FilterSel) {
+    setSel(next);
+    setShowAll(false);
+    writeBoardHash(kind, labRunDir, next);
+  }
 
   // `drillLabRun(dir)` (viewer.html:4101-4131), reduced to the address-bar
   // half — `LabRunDetail` itself owns the two real fetches (detail +
@@ -206,7 +219,7 @@ export function RunsBoard({
   function openLabRun(dir: string) {
     setLabRunDir(dir);
     setRowClickNotice(null);
-    writeHash(canonicalHash({ kind: "runs", runsKind: kind, lab: dir, machine: machineKey }));
+    writeBoardHash(kind, dir, sel);
   }
 
   // The lab-run detail's own "‹ runs" back link (viewer.html:4852/4862,
@@ -216,7 +229,7 @@ export function RunsBoard({
   // here, not a redundant re-fetch).
   function closeLabRun() {
     setLabRunDir(null);
-    writeHash(canonicalHash({ kind: "runs", runsKind: kind, lab: null, machine: machineKey }));
+    writeBoardHash(kind, null, sel);
   }
 
   // (drill-in packet) A one-shot suppression flag for the deep-link re-sync
@@ -264,17 +277,7 @@ export function RunsBoard({
         ? "run detail needs a running daemon — this static build lists runs without their per-run pipeline and event feed."
         : `couldn't open run "${dir}" — it may have been removed, or the link is stale. Showing the run list.`,
     );
-    writeHash(canonicalHash({ kind: "runs", runsKind: kind, lab: null, machine: machineKey }));
-  }
-
-  // (#1809) Clears the machine pin — the "back to all machines" half of
-  // "visible AND clearable" the packet brief requires. Preserves whichever
-  // kind filter/lab-run drill-in was active, matching `selectKind`'s own
-  // "only the ONE thing that changed" discipline below.
-  function clearMachinePin() {
-    setMachineKey(null);
-    setShowAll(false);
-    writeHash(canonicalHash({ kind: "runs", runsKind: kind, lab: labRunDir, machine: null }));
+    writeBoardHash(kind, null, sel);
   }
 
   // `ACTIONS.labrun`/`ACTIONS.gomission` (viewer.html:2991, folded per-row
@@ -374,15 +377,16 @@ export function RunsBoard({
       suppressResyncRef.current = false;
       return;
     }
-    const deepLinkUnchanged = initialKind === kind && initialLab === labRunDir && initialMachineKey === machineKey;
+    const seeded = seedSel(initialFilters, initialMachineKey);
+    const deepLinkUnchanged = initialKind === kind && initialLab === labRunDir && selKey(seeded) === selKey(sel);
     if (deepLinkUnchanged) return;
     setKind(initialKind);
     setShowAll(false);
     setRowClickNotice(null);
     setLabRunDir(initialLab);
-    setMachineKey(initialMachineKey);
+    setSel(seeded);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [initialKind, initialLab, initialMachineKey]);
+  }, [initialKind, initialLab, initialMachineKey, selKey(seedSel(initialFilters, initialMachineKey))]);
 
   // These stay unconditional (React's rules-of-hooks — a hook can't sit
   // after the early return below) even though the lab-run-detail branch
@@ -474,22 +478,52 @@ export function RunsBoard({
   // branch below.
   const day = useDay(null);
   const pinRecords = daemonBacked ? flowWindow.data : (day.ingested ?? []); // identity fields only
-  const staticPinPending = !daemonBacked && machineKey !== null && day.loading;
+  const staticPinPending = !daemonBacked && sel.machine.length > 0 && day.loading;
 
-  // (#2929) The pin's key resolved back to the machine's uid, from the same
-  // inputs its fleet card was named from (presence, this daemon's specs, the
-  // roster — read only while a machine is pinned, and only against a
-  // daemon). An old link carrying the uid itself still resolves, and is
-  // rewritten to the key once those inputs have settled. A key that
-  // resolves to nothing, once they have, pins nothing: no rows, and the chip
-  // says "machine not found" rather than inventing a label no card shows.
-  const pinKey = useMachineKeyContext(pinRecords, daemonBacked ? flowWindow.settled : !day.loading, daemonBacked && machineKey != null);
-  const pinDecoded = useDecodedMachineKey(machineKey, pinKey.ctx, pinKey.settled, (k) => {
-    setMachineKey(k);
-    writeHash(canonicalHash({ kind: "runs", runsKind: kind, lab: labRunDir, machine: k }));
-  });
-  const pinUid = pinDecoded?.uid ?? null;
-  const pinResolving = machineKey != null && pinUid == null && !pinKey.settled;
+  // (#2929, #2925) The machine dimension's hash keys resolved back to machines,
+  // from the same inputs the fleet card was named from (presence, this
+  // daemon's specs, the roster, read against a daemon). It is read whenever
+  // the board is daemon-backed, not only while a machine is selected: the
+  // machine pill must mint the same keys the cards do. An old link carrying
+  // the uid itself still resolves, and is rewritten to the key once those
+  // inputs have settled. A key that resolves to nothing selects no runs, and
+  // its chip says "machine not found" rather than inventing a label no card
+  // shows.
+  const keyCtx = useMachineKeyContext(pinRecords, daemonBacked ? flowWindow.settled : !day.loading, daemonBacked);
+
+  const allRuns = useMemo(() => (runsQuery.data?.ok ? (runsQuery.data.data.runs ?? NO_RUNS) : NO_RUNS), [runsQuery.data]);
+  const index = useMemo(() => machineIndex(allRuns, keyCtx.ctx, sel.machine), [allRuns, keyCtx.ctx, sel.machine]);
+  // Windows are minutes wide at their narrowest, so a once-a-minute clock keeps
+  // the facet counts from recomputing on every poll.
+  const nowBucket = Math.floor(nowMs / 60000) * 60000;
+  const env = useMemo<FilterEnv>(() => ({ now: nowBucket, machineOf: index.keyOf }), [nowBucket, index]);
+  // The selection in VALUE space: machine keys become machine identities.
+  const selValues = useMemo<FilterSel>(
+    () => ({ ...sel, machine: sel.machine.map((k) => valueOfMachineKey(keyCtx.ctx, index, k)) }),
+    [sel, keyCtx.ctx, index],
+  );
+  // A key that resolves to nothing YET waits for the inputs, rather than
+  // flashing "machine not found" at a machine the roster is about to name.
+  const machinesResolving = !keyCtx.settled && sel.machine.some((k) => decodeMachineKey(keyCtx.ctx, k).uid === null);
+  const kindRows = useMemo(() => (kind === "all" ? allRuns : allRuns.filter((r) => r.kind === kind)), [allRuns, kind]);
+  const facets = useMemo(
+    () => buildFacets(kindRows, selValues, env, (dim, v) => (dim === "machine" ? machineValueLabel(keyCtx.ctx, index, v) : v)),
+    [kindRows, selValues, env, keyCtx.ctx, index],
+  );
+  const filtered = useMemo(() => applyFilters(allRuns, selValues, env), [allRuns, selValues, env]);
+
+  // Once the context settles, an old uid link or an outgrown key is rewritten
+  // to the machine's current key (a replaceState, no history entry). After the
+  // commit, not inside it: a lens mounts in the SAME commit as the route change
+  // that brought it, and the app root's `useSyncHash` would otherwise write the
+  // old key straight back over this rewrite.
+  const canonKeys = useMemo(() => (keyCtx.settled ? canonicalMachineKeys(keyCtx.ctx, sel.machine) : null), [keyCtx, sel.machine]);
+  useEffect(() => {
+    if (!canonKeys || canonKeys.join("\n") === sel.machine.join("\n")) return undefined;
+    const id = setTimeout(() => commitSel({ ...sel, machine: canonKeys }), 0);
+    return () => clearTimeout(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canonKeys]);
 
   // The lab-run detail pane is its own top-level render, reached without
   // waiting on the two queries above and independent of `kind` (see
@@ -526,7 +560,7 @@ export function RunsBoard({
   // has no honest guess for, and a bar of shimmered zeros would read the
   // same as #2817's "waiting is not zero" defect one level up (a filter
   // chip showing "0" before the count is known).
-  if (!runsQuery.data || !labRunsQuery.data || staticPinPending || pinResolving) {
+  if (!runsQuery.data || !labRunsQuery.data || staticPinPending || machinesResolving) {
     return (
       <div data-state="pending" role="status" aria-label="Loading runs">
         <div className="stagehdr">runs</div>
@@ -555,36 +589,36 @@ export function RunsBoard({
     );
   }
 
-  const runs: Run[] = runsQuery.data.ok ? runsQuery.data.data.runs : [];
   const labConfigured = labRunsQuery.data.ok ? labRunsQuery.data.data.configured !== false : false;
   const labDir = labRunsQuery.data.ok ? labRunsQuery.data.data.dir : null;
   const labDirExists = labRunsQuery.data.ok ? labRunsQuery.data.data.exists : null;
   const labPendingMove = labRunsQuery.data.ok ? labRunsQuery.data.data.pending_move : undefined;
 
-  // (#1809) The machine pin, applied ONCE here so every derivation below
-  // (kind counts, the lab-source notice, the machine labels, the flat row list)
-  // sees the already-scoped set rather than each re-deriving its own filter
-  // — see `format.ts::runsForMachine`'s own doc for the alias-matching
-  // rationale and the "50 missions + 15 dispatches carry no machine at all"
-  // exclusion it names.
-  // (#2921) The shared machine label, with the same specs and roster the
-  // machine's fleet card is named from, so the pin and the card agree.
-  const pinNotFound = machineKey != null && pinUid == null;
-  const pinnedMachineName = machineKey == null ? null : pinUid == null ? MACHINE_NOT_FOUND_LABEL : machineLabel(pinKey.ctx, pinUid);
-  const scopedRuns = machineKey == null ? runs : runsOfPin(runs, pinKey.ctx, pinUid);
+  // The filter bar speaks in values; the hash carries machine KEYS. A value
+  // that is already selected keeps the key it arrived with, so an unresolved
+  // key survives the other choices being toggled.
+  function changeFilter(dim: FilterDim, values: string[]) {
+    if (dim !== "machine") return commitSel({ ...sel, [dim]: values });
+    const keys = values.map((v) => {
+      const at = selValues.machine.indexOf(v);
+      return at >= 0 ? sel.machine[at] : keyOfMachineValue(keyCtx.ctx, index, v);
+    });
+    commitSel({ ...sel, machine: keys });
+  }
+  const clearFilters = () => commitSel(emptyFilterSel());
 
   function selectKind(k: RunsKind) {
     setKind(k);
     setShowAll(false);
     setRowClickNotice(null);
-    writeHash(canonicalHash({ kind: "runs", runsKind: k, lab: null, machine: machineKey }));
+    writeBoardHash(k, null, sel);
   }
 
   // viewer.html: `labSourceNotice()`.
   const notice =
     kind === "lab"
       ? labSourceNotice({
-          hasLabRuns: scopedRuns.some((r) => r.kind === "lab"),
+          hasLabRuns: allRuns.some((r) => r.kind === "lab"),
           configured: labConfigured,
           dir: labDir,
           dirExists: labDirExists,
@@ -592,30 +626,22 @@ export function RunsBoard({
         })
       : null;
 
-  const machineLabels = runsMultiMachine(scopedRuns) ? runMachineLabels(scopedRuns) : NO_MACHINE_LABELS;
-  const bar = (
-    <RunsBar
-      counts={countsByKind(scopedRuns)}
-      kind={kind}
-      onKind={selectKind}
-      pinnedMachineName={pinnedMachineName}
-      pinNotFound={pinNotFound}
-      onClearMachine={clearMachinePin}
-    />
-  );
+  const machineLabels = runsMultiMachine(filtered) ? runMachineLabels(filtered) : NO_MACHINE_LABELS;
+  const bar = <RunsBar counts={kindCounts(filtered, RUNS_KINDS)} kind={kind} onKind={selectKind} />;
 
-  const rows = runsFiltered(scopedRuns, kind);
+  const rows = runsFiltered(filtered, kind);
   const shown = showAll ? rows : rows.slice(0, RUNS_CAP);
   const more = rows.length - shown.length;
   const scope = kind === "all" ? "" : ` · ${kind}`;
-  const count = showAll || more <= 0 ? `${rows.length} run${rows.length === 1 ? "" : "s"}` : `newest ${shown.length} of ${rows.length}`;
+  const filtering = !isFilterSelEmpty(sel);
 
   return (
     <div data-state="data">
       <div className="stagehdr">
-        runs{scope} · {count}
+        runs{scope}
       </div>
       {bar}
+      <FilterBar facets={facets} rendered={shown.length} shown={rows.length} total={kindRows.length} onChange={changeFilter} onClearAll={clearFilters} />
       {rowClickNotice && (
         <div className="labnotice" role="status">
           {rowClickNotice}
@@ -641,7 +667,11 @@ export function RunsBoard({
             )}
           </>
         ) : (
-          <div className="none">no {kind === "all" ? "" : `${kind} `}runs recorded yet.</div>
+          <div className="none">
+            {filtering
+              ? "no runs match these filters. Remove a filter, or Clear all."
+              : `no ${kind === "all" ? "" : `${kind} `}runs recorded yet.`}
+          </div>
         )}
       </div>
     </div>
@@ -672,42 +702,10 @@ function labSourceNotice(s: {
   return `no lab runs found under the configured lab dir${at}.`;
 }
 
-function countsByKind(runs: Run[]): Record<string, number> {
-  const counts: Record<string, number> = { all: runs.length };
-  RUNS_KINDS.slice(1).forEach((k) => {
-    counts[k] = runs.filter((r) => r.kind === k).length;
-  });
-  return counts;
-}
-
-/** viewer.html: `function renderRunsBar()` — PLUS the machine-pin chip
- * (#1809), which has no legacy namesake (the runs lens gained a machine
- * dimension only in this port). Deliberately reuses the `.runchip` idiom
- * the kind chips already establish rather than inventing a second visual
- * language for "a filter is active, click to change it" — see
- * `RunsBoard.tsx`'s own module doc / #1809 for why this is the pinned
- * state's ONE required property: visible (the chip names the machine) and
- * clearable (clicking it is `clearMachinePin`, the "back to all machines"
- * path). Rendered only when a pin is actually set — an unpinned board's
- * `.runsbar` is byte-identical to before this packet, which is what keeps
- * `goldens/runs.txt`'s existing byte-parity assertion untouched. */
-function RunsBar({
-  counts,
-  kind,
-  onKind,
-  pinnedMachineName,
-  pinNotFound = false,
-  onClearMachine,
-}: {
-  counts: Record<string, number>;
-  kind: RunsKind;
-  onKind: (k: RunsKind) => void;
-  /** `null` = no machine pin — the pre-existing "every machine" board. */
-  pinnedMachineName: string | null;
-  /** (#2929) The pin's key names no machine: the chip says so, same slot. */
-  pinNotFound?: boolean;
-  onClearMachine: () => void;
-}) {
+/** viewer.html: `function renderRunsBar()`: the kind tabs, each with the count
+ * of runs it would show under the dimension filters (#2925). The machine pin's
+ * old chip is gone: a machine is a filter chip now, under the filter bar. */
+function RunsBar({ counts, kind, onKind }: { counts: Record<string, number>; kind: RunsKind; onKind: (k: RunsKind) => void }) {
   return (
     <div className="runsbar">
       {RUNS_KINDS.map((k) => (
@@ -724,19 +722,6 @@ function RunsBar({
           <span className="runchipn"> {counts[k] ?? 0}</span>
         </span>
       ))}
-      {pinnedMachineName != null && (
-        <span
-          className="runchip on"
-          data-act="clearmachine"
-          role="button"
-          tabIndex={0}
-          onClick={onClearMachine}
-          onKeyDown={onActivateKeyDown(onClearMachine)}
-          title="clear the machine filter — show runs from every machine"
-        >
-          {pinNotFound ? MACHINE_NOT_FOUND_LABEL : `machine: ${pinnedMachineName}`} ✕
-        </span>
-      )}
     </div>
   );
 }
@@ -754,11 +739,23 @@ function onActivateKeyDown(onActivate: () => void) {
   };
 }
 
-/** The runs of the pinned machine `pinUid`; none when the pin resolved to no
- *  machine. */
-function runsOfPin(runs: Run[], ctx: MachineKeyContext, pinUid: string | null): Run[] {
-  if (pinUid == null) return [];
-  return runsForMachine(runs, machineMatch(ctx.data, ctx.liveMachines, ctx.specs, ctx.roster, pinUid));
+const NO_RUNS: Run[] = [];
+
+/** The board's filter selection as a route seeds it: the dimension filters,
+ * with a bare `machine=` pin (older links, fleet-card drill-ins) as the one
+ * selected machine. */
+function seedSel(filters: FilterSel | undefined, machineKey: string | null): FilterSel {
+  const sel = { ...emptyFilterSel(), ...filters };
+  if (sel.machine.length === 0 && machineKey) sel.machine = [machineKey];
+  return sel;
+}
+
+/** A comparable form of a selection, for the deep-link echo guard. */
+const selKey = (sel: FilterSel): string => JSON.stringify(filterSelPairs(sel));
+
+/** Write the board's state to the address bar (`replaceState`, no history). */
+function writeBoardHash(kind: RunsKind, lab: string | null, sel: FilterSel) {
+  writeHash(canonicalHash({ kind: "runs", runsKind: kind, lab, machine: sel.machine[0] ?? null, filters: sel }));
 }
 
 /** No machine column: one machine on the board needs no label per row. */
