@@ -34,7 +34,7 @@ export function UtilityGlyph({
 }: {
   strip: UtilityStrip;
   /** (#2958) The source that would name a running job has not answered
-   *  yet: a QUIET strip's words say "no signal", not "idle", which would be
+   *  yet: a QUIET strip's words say "checking…", not "idle", which would be
    *  a default rather than a reading. A job already read still shows. The
    *  box is unchanged. */
   noSignal?: boolean;
@@ -49,7 +49,7 @@ export function UtilityGlyph({
         : strip.resident === false
           ? "not loaded"
           : "residency unknown";
-  const doing = job ? (job.stalled ? `${job.word}, stalled` : job.word) : noSignal ? "no signal" : "idle";
+  const doing = job ? (job.stalled ? `${job.word}, stalled` : job.word) : noSignal ? "checking…" : "idle";
   const label =
     strip.model != null ? `Utility model: ${strip.model}\n${residency} · ${doing}` : `Utility model: unknown\n${doing}`;
   const dot = strip.resident === true ? "filled" : strip.resident === false ? "hollow" : "unknown";

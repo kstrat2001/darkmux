@@ -1885,7 +1885,7 @@ describe("App — presence coverage on the masthead", () => {
   });
 
   // (#2965) A failed `/flow/<day>` read has its own notice, in the same
-  // app-level notice row: the cards and the machine page hold "no signal"
+  // app-level notice row: the cards and the machine page hold "checking…"
   // for it, and this says why. Presence is healthy here, so the only notice
   // on the page is the flow one.
   it("shows the flow-read notice when a flow read fails, and names the failure", async () => {
@@ -1931,8 +1931,8 @@ describe("App — presence coverage on the masthead", () => {
   // (#2965 review) The failure is not sticky. Nothing else refetches a
   // `flowDate` key (the live tail writes `flowTail`), so a failed day has to
   // retry itself: one blip, and the page heals at the next retry instead of
-  // holding "no signal" until a reload.
-  it("clears the notice and the card's 'no signal' once a failed read succeeds on retry", async () => {
+  // holding "checking…" until a reload.
+  it("clears the notice and the card's 'checking…' once a failed read succeeds on retry", async () => {
     vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
     try {
       mockPresence({ machines: [BEAT("a")], meta: { sources: { fleet: { state: "ok" } }, complete: true } });
@@ -1951,7 +1951,7 @@ describe("App — presence coverage on the masthead", () => {
       );
       const { container } = renderApp();
       await waitFor(() => expect(container.querySelector('.fleetcov[data-state="flow-unreadable"]')).toBeTruthy());
-      await waitFor(() => expect(container.querySelector(".mach .stat")?.textContent).toBe("no signal"));
+      await waitFor(() => expect(container.querySelector(".mach .stat")?.textContent).toBe("checking…"));
       await act(async () => {
         vi.advanceTimersByTime(21_000);
       });
@@ -1998,7 +1998,7 @@ describe("App — presence coverage on the masthead", () => {
     const { container } = renderApp();
     await waitFor(() => expect(container.querySelector('.fleetcov[data-state="flow-unreadable"]')).toBeTruthy());
     expect(container.querySelector('.fleetcov[data-state="flow-unreadable"]')!.textContent).toContain("401 Unauthorized");
-    await waitFor(() => expect(container.querySelector(".mach .stat")?.textContent).toBe("no signal"));
+    await waitFor(() => expect(container.querySelector(".mach .stat")?.textContent).toBe("checking…"));
   });
 
   it("shows no flow-read notice when the flow reads succeed — the inverted case", async () => {

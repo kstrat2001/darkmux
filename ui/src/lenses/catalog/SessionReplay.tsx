@@ -98,7 +98,7 @@ export function ScopeLamps({
       ? finished
         ? "finished"
         : noSignal
-          ? "no signal — page disconnected from the daemon"
+          ? "disconnected — page lost the daemon"
           : "no model working"
       : reading.state === "generating"
         ? reading.thinking
@@ -281,7 +281,7 @@ export function modelScopeHero(view: Pick<SessionRunView, "liveTokScope" | "fini
       // seconds tick with the page's clock (the playhead in playback).
       note:
         state === "nosignal"
-          ? "no signal"
+          ? "disconnected"
           : writing
             ? liveStateLabel({ state: "tools", toolName: live.toolName, writing: true, writingSeconds: live.writingSeconds })
             : compacting

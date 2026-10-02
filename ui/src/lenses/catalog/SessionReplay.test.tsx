@@ -1233,7 +1233,7 @@ describe("SessionReplay TOK/S tile — rendered-surface pinning (#2886 pass 5)",
     ];
   }
 
-  it("shows 'no signal' (not blank) for a genuinely disconnected LIVE view, not the run being idle", async () => {
+  it("shows 'disconnected' (not blank) for a genuinely disconnected LIVE view, not the run being idle", async () => {
     vi.useFakeTimers();
     const t0 = 1_800_000_000_000;
     vi.setSystemTime(t0);
@@ -1247,14 +1247,14 @@ describe("SessionReplay TOK/S tile — rendered-surface pinning (#2886 pass 5)",
     // (#2890) The tube shows static (the `nosignal` state) with an empty
     // center, and the words sit under the lamps.
     expect(latestTokenScopeProps()).toMatchObject({ state: "nosignal", centerLabel: null });
-    expect(document.querySelector('[data-testid="run-token-scope"] .modelbox__note')?.textContent).toBe("no signal");
+    expect(document.querySelector('[data-testid="run-token-scope"] .modelbox__note')?.textContent).toBe("disconnected");
   });
 
   // (finding F5, "effectiveConnected = connected") A SCRUBBED playhead must
   // read as connected REGARDLESS of the live `connected` prop — history is
   // not affected by whether the live page happens to be connected right
   // now. Same stale fixture, `connected={false}`, but now WITH a playhead —
-  // the genuine historical stall must show, not a false "no signal".
+  // the genuine historical stall must show, not a false "disconnected".
   it("a scrubbed playhead ignores the live connected=false and shows the REAL historical stall", async () => {
     vi.useFakeTimers();
     const t0 = 1_800_000_000_000;
@@ -1274,7 +1274,7 @@ describe("SessionReplay TOK/S tile — rendered-surface pinning (#2886 pass 5)",
   // live connection right now, not about the history being viewed.
   // `lastContactMs` here sits BEFORE the stalled execution's own deadline
   // (t0-38_000 + 30_000 = t0-8_000), which — if NOT withheld — would
-  // downgrade a genuine historical stall to "no signal".
+  // downgrade a genuine historical stall to "disconnected".
   it("a scrubbed playhead withholds lastContactMs too, so a stale half-open value can't downgrade real history", async () => {
     vi.useFakeTimers();
     const t0 = 1_800_000_000_000;
@@ -1497,9 +1497,9 @@ describe("modelScopeHero (#2890)", () => {
     expect(h).toMatchObject({ state: "tools", toolName: "edit", toolWriting: false, centerUnit: null });
   });
 
-  it("no signal is its own state with the words under the lamps", () => {
+  it("disconnected is its own state with the words under the lamps", () => {
     const h = modelScopeHero({ liveTokScope: { ...live, state: null, noSignal: true }, finishedTokRate: null });
-    expect(h).toMatchObject({ state: "nosignal", centerLabel: null, note: "no signal" });
+    expect(h).toMatchObject({ state: "nosignal", centerLabel: null, note: "disconnected" });
   });
 
   it("finished: the average, 'avg tok/s', and the partial-average qualifier as the note", () => {

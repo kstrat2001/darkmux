@@ -35,7 +35,7 @@ import { UtilityGlyph } from "../../components/UtilityGlyph";
 import { scopeStateOf } from "../../lib/scopeMorph";
 import { liveStateLabel, reasonForLine } from "../../lib/tokenRate";
 import { tokensOffMeter } from "./savings";
-import { buildFleetCardBase, withLiveReadings, busiestExecution, isStrictlyBusier, specDimLabel, specLine, statusReason, cardFace, notStreamedNames, NO_SIGNAL_STAT, type CardSourcesAnswered, type FleetCard } from "./cards";
+import { buildFleetCardBase, withLiveReadings, busiestExecution, isStrictlyBusier, specDimLabel, specLine, statusReason, cardFace, notStreamedNames, DISCONNECTED_STAT, type CardSourcesAnswered, type FleetCard } from "./cards";
 import { useLatch } from "../../hooks/useLatch";
 import { buildActivityTimeline, ACTIVITY_WINDOW_PRESETS, DEFAULT_ACTIVITY_WINDOW_MIN } from "./timeline";
 import { rowFacts, rowSpecs } from "./viewRows";
@@ -787,7 +787,7 @@ export function FleetLens({
   });
   // Each latched: the FIRST answer counts (`useLatch`), so the flow
   // window's new day key at UTC midnight does not blink every card back to
-  // "no signal".
+  // "checking…".
   const flowAnswered = useLatch(flowWindow.settled);
   const presenceAnswered = useLatch(!livePolling || presenceState.status !== "pending");
   const sessionsAnswered = useLatch(!livePolling || sessionsState.status !== "pending");
@@ -798,7 +798,7 @@ export function FleetLens({
   const { orderSelf, orderState } = useCardOrderGate(liveMode, specs, viewAnswered);
   // (#2965) A failed flow read settles the window with no records, which
   // is what a quiet window looks like: the flow source has not answered
-  // while its read is failing, so the claims it backs hold "no signal".
+  // while its read is failing, so the claims it backs hold "checking…".
   // `FlowReadNotice` (app-level) says why. The latch still covers the
   // midnight rollover: a new day's PENDING key is not a failure.
   const flowKnown = flowAnswered && flowWindow.failure === null;
@@ -1067,8 +1067,8 @@ export function FleetLens({
           const face = cardFace(card, showsReading, answered);
           // (#2955 review) The page's execution has no live state: the
           // page lost the daemon (`liveStateWhileConnected`'s downgrade).
-          // Its status line is the plain "no signal" every other card
-          // shows, with the dim dot, not a lit reading; the tube shows
+          // Its status line says "disconnected" (the page lost the daemon, the
+          // machine is running), with the dim dot, not a lit reading; the tube shows
           // static and the card stays active (its machine IS running).
           const readingNoSignal = face.tube === "reading" && selectedExec != null && selectedExec.state === null;
           // `card.liveTokRate !== null` (the scope's mount gate below) only
@@ -1230,7 +1230,7 @@ export function FleetLens({
                       // (`readingNoSignal`), so this arm only narrows the
                       // type for `liveStateLabel`.
                       selectedExec.state === null
-                      ? NO_SIGNAL_STAT
+                      ? DISCONNECTED_STAT
                       : // (#2890, operator) The prompt's estimated size lives
                         // here, not in the tube (whose center is the brain for
                         // all of PROMPT). "processing ~36k", not "processing
@@ -1272,7 +1272,7 @@ export function FleetLens({
                   <span className="dot" />
                   {/* (#2958) "idle" before its sources answer is a default,
                       not a reading: see `cardFace`. */}
-                  {readingNoSignal ? NO_SIGNAL_STAT : face.stat}
+                  {readingNoSignal ? DISCONNECTED_STAT : face.stat}
                 </div>
               )}
               {/* (#2881) The pager: shown only with 2+ running executions —
@@ -1365,6 +1365,7 @@ export function FleetLens({
                 // (#2958) "0 running" before every source has answered is a
                 // default, not a count: the app's "not yet measured" mark,
                 // in the same one-line slot. One or more is a reading.
+                if (face.secondLine !== null) return <div className="runs">{face.secondLine}</div>;
                 if (!face.countShown) return <div className="runs">—</div>;
                 const runsHash = machineRunsHash(encodeMachineKey(machineKeyCtx, card.uid), card.runningSessionIds);
                 const rateText = `${fmtN(Math.round(card.liveTokRate ?? 0))} tok/s`;
@@ -1419,7 +1420,7 @@ export function FleetLens({
                     // (#2890) The same morphing states as the run page's hero,
                     // sized for the card. `state: null` here is the per-
                     // execution disconnection downgrade (a running machine is
-                    // guaranteed by the gate above), the same "no signal" the
+                    // guaranteed by the gate above), the same "disconnected" the
                     // rate line prints, so the tube shows static.
                     state={scopeStateOf({ state: selectedExec.state, noSignal: selectedExec.state === null })}
                     toolName={selectedExec.toolName}

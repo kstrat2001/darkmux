@@ -345,9 +345,9 @@ const STATES = [
     // tell a stalled model from a dropped stream, so the run page says "no
     // signal" under its lamps. Live only (playback has no connection).
     // (#2955 review) The fleet card too: its machine is running, and its
-    // status line is the plain dim-dot "no signal" (`fleetStat`), not a lit
+    // status line is the plain dim-dot "disconnected" (`fleetStat`), not a lit
     // reading. Live only on the card as on the run page.
-    id: "no-signal", date: "2026-08-21", now: "12:00:50", runText: "no signal", rateText: null, fleetStat: "no signal", fleetPlayback: false, blockStream: true,
+    id: "no-signal", date: "2026-08-21", now: "12:00:50", runText: "disconnected", rateText: null, fleetStat: "disconnected", fleetPlayback: false, blockStream: true,
     recs: (b, d) => [...b.prefix(d), b.opener(d), b.beat(d, "12:00:10", 2, 500, 500), tick(d, "12:00:50")],
   },
 ];

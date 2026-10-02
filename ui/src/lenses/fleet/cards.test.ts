@@ -1091,7 +1091,7 @@ describe("card availability when the view's liveness says the stream stopped (5.
     const row = rowFactsFor({ uid: "darkbook", known: true, standing: "online", liveness: "no_beat" });
     const c = buildFleetCard(stale, new Map(), null, new Set(), false, "darkbook", true, T, row);
     expect(c.availability).toBe("not_streamed");
-    expect(cardFace({ absent: false, active: false, runsCount: 0, standing: c.standing, availability: c.availability, note: c.note }, false, { flow: true, presence: true, sessions: true, runs: true })).toMatchObject({ stat: "online · not streaming", noSignal: true });
+    expect(cardFace({ absent: false, active: false, runsCount: 0, standing: c.standing, availability: c.availability, note: c.note }, false, { flow: true, presence: true, sessions: true, runs: true })).toMatchObject({ stat: "online", secondLine: "not streaming", noSignal: true });
   });
 
   it("an unknown liveness falls back to what the window holds", () => {
@@ -1118,13 +1118,15 @@ describe("the status line's word and reason follow the availability (5.0 R3)", (
 
   it("not_streamed with the card read says online, and not streaming", () => {
     const f = face("not_streamed", "online");
-    expect(f.stat).toBe("online · not streaming");
+    expect(f.stat).toBe("online");
+    expect(f.secondLine).toBe("not streaming");
     expect(statusReason({ note: null }, f)).toBe("online · not streaming: its flow stream doesn't reach this hub, so its activity can't be shown here.");
   });
 
   it("not_streamed with the card unread claims no evidence it is up", () => {
     const f = face("not_streamed", "online", "not listening");
     expect(f.stat).toBe("not streaming");
+    expect(f.secondLine).toBeNull();
     expect(statusReason({ note: "not listening" }, f)).toBe("not streaming: nothing from this machine's flow stream reaches this hub, and its card couldn't be read.");
   });
 
@@ -1146,7 +1148,7 @@ describe("cardFace (#2958)", () => {
 
   it("a peer whose records never reach this viewer never reads idle, whatever answered (5.0 R3)", () => {
     const silent = { ...quiet, availability: "not_streamed" as const };
-    expect(cardFace(silent, false, all)).toMatchObject({ stat: "online · not streaming", noSignal: true, tube: "nosignal", countShown: false, utilityQuietKnown: false });
+    expect(cardFace(silent, false, all)).toMatchObject({ stat: "online", secondLine: "not streaming", noSignal: true, tube: "nosignal", countShown: false, utilityQuietKnown: false });
   });
 
   it("a not-streamed peer still shows work a /runs row proves (a positive reading)", () => {
@@ -1154,8 +1156,8 @@ describe("cardFace (#2958)", () => {
     expect(cardFace(silent, false, all)).toMatchObject({ stat: "dispatch in flight", countShown: true });
   });
 
-  it("nothing answered: an idle card says no signal, with no-signal static and no count", () => {
-    expect(cardFace(quiet, false, none)).toMatchObject({ stat: "no signal", noSignal: true, tube: "nosignal", countShown: false, utilityQuietKnown: false, active: false, absent: false });
+  it("nothing answered: an idle card says checking…, with no-signal static and no count", () => {
+    expect(cardFace(quiet, false, none)).toMatchObject({ stat: "checking…", noSignal: true, tube: "nosignal", countShown: false, utilityQuietKnown: false, active: false, absent: false });
   });
 
   it("everything answered: idle is a reading", () => {
@@ -1164,7 +1166,7 @@ describe("cardFace (#2958)", () => {
 
   it("idle waits on EVERY source, one at a time", () => {
     for (const k of ["flow", "presence", "sessions", "runs"] as const) {
-      expect(cardFace(quiet, false, { ...all, [k]: false }).stat, k).toBe("no signal");
+      expect(cardFace(quiet, false, { ...all, [k]: false }).stat, k).toBe("checking…");
     }
   });
 
@@ -1180,8 +1182,8 @@ describe("cardFace (#2958)", () => {
 
   it("offline waits on presence and the flow window, not on /runs; it keeps the tube's box, powered off", () => {
     const gone = { absent: true, active: false, runsCount: 0, standing: "offline" as const, availability: "known" as const, note: null };
-    expect(cardFace(gone, false, { ...all, presence: false })).toMatchObject({ stat: "no signal", absent: false, tube: "nosignal" });
-    expect(cardFace(gone, false, { ...all, flow: false })).toMatchObject({ stat: "no signal", absent: false });
+    expect(cardFace(gone, false, { ...all, presence: false })).toMatchObject({ stat: "checking…", absent: false, tube: "nosignal" });
+    expect(cardFace(gone, false, { ...all, flow: false })).toMatchObject({ stat: "checking…", absent: false });
     expect(cardFace(gone, false, { flow: true, presence: true, sessions: false, runs: false })).toMatchObject({ stat: "offline", absent: true, tube: "off", noSignal: false, countShown: false });
     expect(cardFace(gone, false, all)).toMatchObject({ stat: "offline", absent: true, tube: "off", countShown: true });
   });
@@ -1215,10 +1217,10 @@ describe("buildFleetCard: a machine the fleet view holds", () => {
     expect(card).toMatchObject({ spec: "", note: "listener off", standing: "offline", absent: true, stat: "offline" });
   });
 
-  it("a standing the view could not decide says no signal, never idle", () => {
+  it("a standing the view could not decide says checking…, never idle", () => {
     const row = rowFactsFor({ uid: "studio", known: false, name: "studio", note: "listener unavailable", standing: "unknown" });
     const card = buildFleetCard([], new Map(), null, new Set(), false, "studio", true, T_MAX, row);
-    expect(card).toMatchObject({ absent: false, stat: "no signal" });
+    expect(card).toMatchObject({ absent: false, stat: "checking…" });
   });
 
   it("a machine outside the view keeps the flow-derived standing", () => {
@@ -1227,12 +1229,14 @@ describe("buildFleetCard: a machine the fleet view holds", () => {
   });
 });
 
-describe("cardFace: an undecided standing is no signal, not idle", () => {
+describe("cardFace: an undecided standing is not idle", () => {
   const all = { flow: true, presence: true, sessions: true, runs: true };
-  it("says no signal with the no-signal tube, and offline only when the standing is offline", () => {
-    const base = { absent: false, active: false, runsCount: 0, availability: "known" as const, note: null };
-    expect(cardFace({ ...base, standing: "unknown" }, false, all)).toMatchObject({ stat: "no signal", tube: "nosignal", absent: false });
-    expect(cardFace({ ...base, standing: "online" }, false, all)).toMatchObject({ stat: "idle", tube: "idle" });
+  const none = { flow: false, presence: false, sessions: false, runs: false };
+  it("says checking… until presence answers, then not streaming; offline only when the standing is offline", () => {
+    const base = { absent: false, active: false, runsCount: 0, availability: "known" as const, note: "not listening" as string | null };
+    expect(cardFace({ ...base, standing: "unknown" }, false, none)).toMatchObject({ stat: "checking…", secondLine: null, tube: "nosignal" });
+    expect(cardFace({ ...base, standing: "unknown" }, false, all)).toMatchObject({ stat: "not streaming", secondLine: null, tube: "nosignal", absent: false });
+    expect(cardFace({ ...base, note: null, standing: "online" }, false, all)).toMatchObject({ stat: "idle", tube: "idle" });
     expect(cardFace({ ...base, absent: true, standing: "offline" }, false, all)).toMatchObject({ stat: "offline", tube: "off", absent: true });
   });
 });

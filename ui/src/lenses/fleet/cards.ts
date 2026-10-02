@@ -112,18 +112,21 @@ export function specDimLabel(card: { specUnknown: SpecUnknownReason | null }): s
 /** The status word and tooltip for a machine whose flow stream does not reach
  * this hub (`not_streamed`). One mapping, chosen by what the view knows:
  *  - the card was read: the machine answered, so it IS up and only its
- *    activity feed is missing ("online · not streaming");
+ *    activity feed is missing: the status line says "online" and the count
+ *    line below it "not streaming";
  *  - the card was not read (and presence did not say offline, which wins
  *    before this is asked): nothing is fresh evidence it is up, so the word
  *    claims no "online" ("not streaming"). */
-function notStreamingStatus(cardRead: boolean): { word: string; reason: string } {
+function notStreamingStatus(cardRead: boolean): { word: string; secondLine: string | null; reason: string } {
   return cardRead
     ? {
-        word: "online · not streaming",
+        word: "online",
+        secondLine: "not streaming",
         reason: "online · not streaming: its flow stream doesn't reach this hub, so its activity can't be shown here.",
       }
     : {
         word: "not streaming",
+        secondLine: null,
         reason: "not streaming: nothing from this machine's flow stream reaches this hub, and its card couldn't be read.",
       };
 }
@@ -596,7 +599,7 @@ export function buildFleetCardBase(
   const active = flowActive || labRunning > 0;
   const id = cardIdentity(data, liveMachines, specs, machAbsent, m, roster, row);
   const standing = id.standing;
-  const stat = standing === "offline" ? "offline" : active ? "dispatch in flight" : standing === "unknown" ? NO_SIGNAL_STAT : "idle";
+  const stat = standing === "offline" ? "offline" : active ? "dispatch in flight" : standing === "unknown" ? CHECKING_STAT : "idle";
   // (#2060) `topLevelRuns` collapses a mission's own session together with
   // any of its seat/step dispatches into ONE entry — a mission with one seat
   // running reads "1 running", not "2 running", in both modes.
@@ -684,23 +687,24 @@ export function buildFleetCardBase(
 }
 
 /** (#2958) The word a card shows in place of its status until the first
- *  data it is derived from has arrived: the same "no signal" a running
- *  execution's line says when the page loses the daemon (#2886), so a card
- *  that knows nothing yet reuses the existing word for "no information"
- *  rather than a new indicator. */
-export const NO_SIGNAL_STAT = "no signal";
+ *  data it is derived from has arrived. */
+const CHECKING_STAT = "checking…";
+
+/** (#2886) The word a running execution's line shows when the page itself
+ *  lost the daemon: the machine is running, this page cannot see it. */
+export const DISCONNECTED_STAT = "disconnected";
 
 /** (#2958) Which of a fleet card's sources have answered at least once on
  *  this mount (success or failure; a source this mount never reads counts
  *  as answered). A failed read counts: it has its own notice
  *  (`RunsUnreadableNotice`, `FleetCoverageNotice`), and waiting on it would
- *  hold "no signal" forever. The flow window is the exception (#2965): its
+ *  hold "checking…" forever. The flow window is the exception (#2965): its
  *  failed read yields an empty window, which every negative claim here would
  *  read as "nothing happened", so `flow` is false while a day's read is
  *  failing (and `FlowReadNotice` names it). `/fleet/roster` is not a
  *  source here: it names machines, never says what one is doing. The caller latches each one, so only the
  *  FIRST answer counts: a later pending read (a refetch, or the flow
- *  window's new day key at UTC midnight) never re-enters "no signal". */
+ *  window's new day key at UTC midnight) never re-enters "checking…". */
 export interface CardSourcesAnswered {
   /** The flow window: sessions, activity, `machine.online/offline` edges,
    *  utility jobs. */
@@ -716,9 +720,8 @@ export interface CardSourcesAnswered {
 
 /** (#2958) What a card may say, given what has answered so far. */
 export interface CardFace {
-  /** The status word: "offline", "dispatch in flight", "idle", "no signal",
-   *  or (the stream does not reach this hub) "online · not streaming" /
-   *  "not streaming". */
+  /** The status word: "offline", "dispatch in flight", "idle", "checking…",
+   *  or (the stream does not reach this hub) "online" / "not streaming". */
   stat: string;
   /** Drawn as offline (dimmed card, powered-off tube). */
   absent: boolean;
@@ -729,31 +732,34 @@ export interface CardFace {
   noSignal: boolean;
   /** The word is one of the not-streaming forms. */
   notStreaming: boolean;
+  /** Replaces the running-count line ("N running" / "—"); `null` keeps it. */
+  secondLine: string | null;
   /** The tube: a live execution's reading, the idle tube, the powered-off
    *  screen of an offline machine, or no-signal static. */
   tube: "reading" | "idle" | "off" | "nosignal";
   /** The running count is shown; otherwise "—" holds its line. */
   countShown: boolean;
   /** The utility strip may call a quiet strip "idle"; otherwise its words
-   *  say "no signal". A running utility job always shows. */
+   *  say "checking…". A running utility job always shows. */
   utilityQuietKnown: boolean;
 }
 
 const everySourceAnswered = (a: CardSourcesAnswered): boolean => a.flow && a.presence && a.sessions && a.runs;
 
 /** Whether the stream's absence is what the card should say: nothing proves it
- * offline or working, and presence and flow have both answered. */
-function isNotStreaming(f: { absent: boolean; active: boolean; seen: boolean; answered: boolean }): boolean {
-  return f.answered && !f.seen && !f.absent && !f.active;
+ * offline or working, presence and flow have both answered, and either its
+ * records do not reach this viewer or presence could not say it is up. */
+function isNotStreaming(f: { absent: boolean; active: boolean; seen: boolean; undecided: boolean; answered: boolean }): boolean {
+  return f.answered && (!f.seen || f.undecided) && !f.absent && !f.active;
 }
 
 /** The card's status word, in precedence order: offline, then work a `/runs`
- * row proves, then the not-streaming forms, then idle, else "no signal". */
+ * row proves, then the not-streaming forms, then idle, else "checking…". */
 function statusWord(f: { absent: boolean; active: boolean; notStreaming: boolean; idleKnown: boolean; cardRead: boolean }): string {
   if (f.absent) return "offline";
   if (f.active) return "dispatch in flight";
   if (f.notStreaming) return notStreamingStatus(f.cardRead).word;
-  return f.idleKnown ? "idle" : NO_SIGNAL_STAT;
+  return f.idleKnown ? "idle" : CHECKING_STAT;
 }
 
 /** (#2958) A POSITIVE reading shows as soon as the source that produced it
@@ -772,13 +778,12 @@ function statusWord(f: { absent: boolean; active: boolean; notStreaming: boolean
  *    a `machine.online` edge, contradicts it). It wins over a reading: an
  *    offline card's tube is powered off.
  *  - A machine whose standing is unknown (presence could not say and its card
- *    was not read) never says "idle": it says "no signal".
+ *    was not read) never says "idle": once presence has answered it says
+ *    "not streaming".
  *  - "idle", "no model working", "0 running": wait on every source.
  *  - A quiet utility strip's "idle": waits on the flow window, the only
  *    source of utility jobs.
- *  Until then the card says "no signal", the same word a running
- *  execution's line says when the page loses the daemon (#2886), in the
- *  same boxes. */
+ *  Until then the card says "checking…", in the same boxes. */
 export function cardFace(
   card: { absent: boolean; active: boolean; runsCount: number; standing: Standing; availability: MachineAvailability; note: string | null },
   hasReading: boolean,
@@ -793,9 +798,10 @@ export function cardFace(
   const active = card.active && !absent;
   const idleKnown = all && card.standing === "online";
   // Once presence and flow have answered, a machine whose stream does not
-  // reach this hub says so rather than the generic "no signal".
-  const notStreaming = isNotStreaming({ absent, active: card.active, seen, answered: offlineKnown });
-  const stat = statusWord({ absent, active: card.active, notStreaming, idleKnown, cardRead: card.note === null });
+  // reach this hub says so rather than still "checking…".
+  const notStreaming = isNotStreaming({ absent, active: card.active, seen, undecided: card.standing === "unknown", answered: offlineKnown });
+  const cardRead = card.note === null;
+  const stat = statusWord({ absent, active: card.active, notStreaming, idleKnown, cardRead });
   // Offline wins: a machine said to be gone draws the powered-off screen,
   // even over a reading its last records left behind.
   const tube = absent ? "off" : hasReading ? "reading" : idleKnown ? "idle" : "nosignal";
@@ -805,6 +811,7 @@ export function cardFace(
     active,
     noSignal: !absent && !card.active && !idleKnown,
     notStreaming,
+    secondLine: notStreaming ? notStreamingStatus(cardRead).secondLine : null,
     tube,
     countShown: card.runsCount > 0 || all,
     utilityQuietKnown: answered.flow && seen,

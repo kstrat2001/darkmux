@@ -42,7 +42,7 @@ const STAT = ".mach .stat";
 const PHONE_OVERFLOW = new Set(["toolgen-named", "armed-toolgen"]);
 
 /** (#2955 review) How the status line LOOKS: its words' color and weight,
- *  and its dot's color. "no signal" must look the same on every card. */
+ *  and its dot's color. "disconnected" must look the same on every card. */
 async function statLook(page) {
   return page.locator(STAT).first().evaluate((e) => {
     const cs = getComputedStyle(e);
@@ -199,7 +199,7 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
         const { ctx, page } = await openState(browser, viewport, state, { mode, surface: "fleet" });
         await expect(page.locator(CARD.card).first()).toBeVisible();
         // (#2955 review) A running machine whose page lost the daemon: the
-        // plain "no signal" status line, not a lit reading.
+        // plain "disconnected" status line, not a lit reading.
         if (state.fleetStat) {
           await expect(page.locator(STAT).first(), `${state.id}: the status words`).toHaveText(state.fleetStat);
           await expect(page.locator(CARD.card).first(), `${state.id}: a running card, dim dot`).toHaveClass(/\bactive\b.*\bnosignal\b|\bnosignal\b.*\bactive\b/);
@@ -251,15 +251,15 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
       }
       // (#2915) The strip is one size in EVERY state, idle included.
       expect(sizeGroups(rows, "util"), `the utility strip changed size (${vpName}, ${mode})`).toHaveLength(1);
-      // (#2955 review) "no signal" looks like every other plain status
+      // (#2955 review) "disconnected" looks like every other plain status
       // line ("idle"'s words), with the dim dot, never the reading's lit
       // style. Live only: a replay has no connection to lose.
       if (mode === "live") {
         const ns = rows.find((r) => r.state === "no-signal");
         const idle = rows.find((r) => r.state === "finished");
         expect(ns, "the disconnected state was measured").toBeTruthy();
-        expect({ color: ns.look.color, weight: ns.look.weight }, "no signal: the plain status words").toEqual({ color: idle.look.color, weight: idle.look.weight });
-        expect(ns.look.dot, "no signal: the dim dot").toBe(ns.look.dim);
+        expect({ color: ns.look.color, weight: ns.look.weight }, "disconnected: the plain status words").toEqual({ color: idle.look.color, weight: idle.look.weight });
+        expect(ns.look.dot, "disconnected: the dim dot").toBe(ns.look.dim);
       }
       // (#2955, operator 2026-09-27) The card is also the same size idle and
       // running, on a desktop as on a phone: the reading rides the status
@@ -276,7 +276,7 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
   }
 }
 
-// (#2958) Before its first data a fleet card says "no signal" (its stat word
+// (#2958) Before its first data a fleet card says "checking…" (its stat word
 // and a static tube), in the same boxes: the same size as the same card once
 // loaded idle, and on a phone as running too. Live only: a replay has its
 // records in hand and never waits. The loading page is the "finished" state's
@@ -306,8 +306,8 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
         const cards = page.locator(CARD.card);
         await expect(cards).toHaveCount(offline ? 2 : 1);
         // (#2955) A generating card's status line is its reading.
-        const want = id === "loading" ? ["no signal"] : id === "loaded" ? ["idle"] : [byId.generating.rateText];
-        if (offline) want.push(id === "loading" ? "no signal" : "offline");
+        const want = id === "loading" ? ["checking…"] : id === "loaded" ? ["idle"] : [byId.generating.rateText];
+        if (offline) want.push(id === "loading" ? "checking…" : "offline");
         await expect(page.locator(".mach .stat"), `${id}: the cards' stat words`).toHaveText(want);
         if (id === "loading") {
           await expect(page.locator(".mach .runs").first(), "loading: no count yet").toHaveText("—");
@@ -320,7 +320,7 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
         await page.waitForTimeout(400);
         const m = await measure(page, { card: CARD.card, cardScope: CARD.cardScope, util: CARD.util, stat: ".mach .stat", runs: ".mach .runs" });
         // The stat and count lines hold their words, so only their HEIGHT is
-        // the box: "no signal" and "idle" are different widths of one line.
+        // the box: "checking…" and "idle" are different widths of one line.
         rows.push({ state: id, ...m, stat: m.stat.map((b) => b.h), runs: m.runs.map((b) => b.h) });
         await ctx.close();
       }
@@ -355,8 +355,10 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
       await expect(page.locator(".mach .stat").first()).toHaveText("idle");
       if (peerSpec) {
         await expect(page.locator(".mach .spec").nth(1), `${label}: the peer's subtitle`).toHaveText(peerSpec);
-        await expect(page.locator(".mach .stat").nth(1), `${label}: the peer's status`).toHaveText(peerSpec === "hardware not reported" ? "offline" : "online · not streaming");
+        await expect(page.locator(".mach .stat").nth(1), `${label}: the peer's status`).toHaveText(peerSpec === "hardware not reported" ? "offline" : "online");
         await expect(page.locator(".mach").nth(1).locator(".name .radio-seat"), `${label}: the radio seat icon`).toHaveCount(peerSpec === "hardware not reported" ? 0 : 1);
+        // The count line below the status says why (the read card's variant).
+        if (peerSpec !== "hardware not reported") await expect(page.locator(".mach .runs").nth(1), `${label}: the peer's second line`).toHaveText("not streaming");
         // Shown on a desktop; on a phone it gives the name its room (no tooltip on touch).
         if (peerSpec !== "hardware not reported") await expect(page.locator(".mach").nth(1).locator(".name .radio-seat")).toBeVisible({ visible: viewport.width > 560 });
       }

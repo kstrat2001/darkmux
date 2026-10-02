@@ -6,14 +6,14 @@ import type { UtilityStrip } from "../lib/utilityJobs";
 // (#2958) `noSignal` changes only what a QUIET strip says: a job already
 // read (the live channel can carry one before the flow window answers) is a
 // positive reading and shows.
-describe("UtilityGlyph no signal (#2958)", () => {
+describe("UtilityGlyph checking… (#2958)", () => {
   const quiet: UtilityStrip = { model: "darkmux:util-4b", resident: true, job: null };
   const routing = { ...quiet, job: { job: "radio_routing", visual: "radio", word: "radio routing", stalled: false, sinceMs: 0 } } as unknown as UtilityStrip;
   const label = (c: HTMLElement) => c.querySelector(".mach-util")!.getAttribute("aria-label");
 
-  it("a quiet strip says no signal, not idle, and draws quiet", () => {
+  it("a quiet strip says checking…, not idle, and draws quiet", () => {
     const { container } = render(<UtilityGlyph strip={quiet} noSignal />);
-    expect(label(container)).toBe("Utility model: darkmux:util-4b\nresident · no signal");
+    expect(label(container)).toBe("Utility model: darkmux:util-4b\nresident · checking…");
     expect(container.querySelector(".mach-util")!.getAttribute("data-visual")).toBe("quiet");
   });
 

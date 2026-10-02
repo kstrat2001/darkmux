@@ -31,7 +31,7 @@ export interface UtilitySectionView {
   /** "idle", "radio routing · 3s", "compacting · 12s", "compacting · stalled". */
   liveLine: string;
   /** (#2958) The page's flow window has not answered yet: the live line
-   *  says "no signal" rather than "idle", and every count reads "—". */
+   *  says "checking…" rather than "idle", and every count reads "—". */
   noSignal: boolean;
   jobs: Array<{ word: string; calls: string; tokens: string; known: boolean }>;
 }
@@ -75,7 +75,7 @@ export function utilitySectionView(args: {
         : strip.resident === false
           ? "not loaded"
           : "no utility model registered";
-  const liveLine = liveLineOf(strip.job, noSignal ? "no signal" : unseen ? NOT_REPORTED : null, args.nowMs);
+  const liveLine = liveLineOf(strip.job, noSignal ? "checking…" : unseen ? NOT_REPORTED : null, args.nowMs);
   const mine = recordsAsOf(args.data, args.nowMs).filter((r) => sameUid(uidOf(r), args.uid));
   // (#2915 review, C7) A FIXED set of rows, so the section is one size
   // whatever ran: one per known job, then ONE "other" row folding every job

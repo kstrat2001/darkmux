@@ -47,7 +47,7 @@ export const isUnseen = (a: MachineAvailability | undefined): boolean => a !== u
 
 /** What a page about `uid` can see of it, judged only once the flow window has
  *  answered and the page knows whose machine it is (until then `known`: the
- *  pending forms already say "no signal"). `self`: the page is about the
+ *  pending forms already say "checking…"). `self`: the page is about the
  *  machine serving it. */
 export function windowAvailability(
   data: NormRecord[],
@@ -64,5 +64,5 @@ export function windowAvailability(
  *  page's identity are both settled. */
 export function remoteIdleLine(a: MachineAvailability, answered: boolean): string {
   if (isUnseen(a)) return `${NOT_REPORTED} · no records from this machine reach this viewer`;
-  return answered ? "idle · no samples in the last 10 min" : "no signal";
+  return answered ? "idle · no samples in the last 10 min" : "checking…";
 }

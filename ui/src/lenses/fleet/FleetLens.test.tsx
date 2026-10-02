@@ -1394,7 +1394,7 @@ describe("FleetLens pager (#2881)", () => {
     // (#2955 review) Now the whole status line, a bare "—" said nothing:
     // "— tok/s", as the thinking case reads "— think tok/s". A known state
     // (generating) with no number yet keeps the reading style and the lit
-    // dot; only "no signal" (no state at all) takes the dim, plain line.
+    // dot; only "disconnected" (no state at all) takes the dim, plain line.
     expect(document.querySelector(".mach-scope__rate")!.textContent).toBe("— tok/s");
     expect(document.querySelector(".mach-scope__rate")).toBe(document.querySelector(".mach .stat"));
     expect(document.querySelector(".mach")!.className).not.toContain("nosignal");
@@ -1474,7 +1474,7 @@ describe("FleetLens pager (#2881)", () => {
   // deadline (so a CORRECT per-execution check trusts s2's stall) but
   // BEFORE s1's much-later deadline (so a WRONG machine-wide check — using
   // s1's fresher heartbeat as the deadline for BOTH executions — would
-  // wrongly downgrade s2 to "no signal" instead).
+  // wrongly downgrade s2 to "disconnected" instead).
   it("downgrades a stalled execution using ITS OWN last heartbeat as the half-open deadline, not the machine-wide one", async () => {
     const records: NormRecord[] = normAll([
       // s1: CODER, fresh — generating, last heartbeat at 95s.
@@ -1509,9 +1509,9 @@ describe("FleetLens pager (#2881)", () => {
   // per-execution deadline (30s) OR with no check running at all (passing
   // `undefined`, which trusts every stall unconditionally while connected).
   // This one moves `lastContactMs` BEFORE s2's own deadline, so the CORRECT
-  // behavior downgrades to "no signal" — a result "no check ran" cannot
+  // behavior downgrades to "checking…" — a result "no check ran" cannot
   // produce (it would still read "stalled").
-  it("downgrades to 'no signal' when contact came BEFORE the stalled execution's own deadline", async () => {
+  it("downgrades to 'disconnected' when contact came BEFORE the stalled execution's own deadline", async () => {
     const records: NormRecord[] = normAll([
       { ts: at(-5), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "darkmux/coder" },
       { ts: at(93), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0 + 93_000, generated_chars: 0 } },
@@ -1530,7 +1530,7 @@ describe("FleetLens pager (#2881)", () => {
     fireEvent.click(screen.getByLabelText("next execution"));
     expect(document.querySelector(".mach-scope__pager-role")!.textContent).toBe("reviewer");
     // (#2955 review) The plain no-signal status line, dim dot, not the reading.
-    expect(document.querySelector(".mach .stat")!.textContent).toBe("no signal");
+    expect(document.querySelector(".mach .stat")!.textContent).toBe("disconnected");
     expect(document.querySelector(".mach-scope__rate")).toBeNull();
     expect(document.querySelector(".mach")!.className).toContain("nosignal");
     expect(latestTokenScopeProps()).toMatchObject({ state: "nosignal" });
@@ -1650,7 +1650,8 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
     await waitFor(() => expect(document.querySelector('.savings[data-settled="true"]')).not.toBeNull());
     const studio = [...document.querySelectorAll(".mach")].find((c) => c.querySelector(".mach-name")!.textContent === "studio")!;
     // (5.0 R3) Up, but nothing it writes reaches this viewer: never "idle".
-    await waitFor(() => expect(studio.querySelector(".stat")!.textContent).toBe("online · not streaming"));
+    await waitFor(() => expect(studio.querySelector(".stat")!.textContent).toBe("online"));
+    expect(studio.querySelector(".runs")!.textContent).toBe("not streaming");
     expect(studio.className).not.toContain("absent");
     expect(studio.textContent).not.toContain("offline");
     expect(studio.querySelector(".stat")!.getAttribute("title")).toBe("online · not streaming: its flow stream doesn't reach this hub, so its activity can't be shown here.");
@@ -2065,8 +2066,8 @@ describe("FleetLens — hero grid-switch breakpoint accounts for the eventlog pa
 // while a run was live. A POSITIVE reading shows as soon as its own source
 // has it; a NEGATIVE claim ("idle", "no model working", "0 running",
 // "offline") waits for every source that could contradict it and says
-// "no signal" (stat word, tube, and a dash for the count) until then.
-describe("FleetLens — a card says no signal until its first data arrives (#2958)", () => {
+// "checking…" (stat word, tube, and a dash for the count) until then.
+describe("FleetLens — a card says checking… until its first data arrives (#2958)", () => {
   const BEAT = [{ machine_uid: "u1", display_name: "MacBook-Pro", schema_version: "1.43.0", beat_ts_ms: Date.parse(FROZEN_NOW) }];
   const cardScope = (card: Element) => JSON.parse(card.querySelector('[data-testid="token-scope-probe"]')!.getAttribute("data-props")!) as ScopeProbe;
   const stat = (card: Element) => card.querySelector(".stat")!.textContent;
@@ -2074,7 +2075,7 @@ describe("FleetLens — a card says no signal until its first data arrives (#295
   const SPECS = { machine_id: "MacBook-Pro", machine_uid: "u-self", cpu_brand: "Apple M5 Max", ram_total_bytes: 137438953472 };
   const newClient = () => new QueryClient({ defaultOptions: { queries: { retry: false } } });
 
-  it("a live lab run: 'no signal' while /runs is unanswered, then 'dispatch in flight'", async () => {
+  it("a live lab run: 'checking…' while /runs is unanswered, then 'dispatch in flight'", async () => {
     const runs = gate();
     mockFleetFetch({
       machines: BEAT,
@@ -2089,7 +2090,7 @@ describe("FleetLens — a card says no signal until its first data arrives (#295
     await waitFor(() => expect(document.querySelector('.savings[data-settled="true"]')).not.toBeNull());
     await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
     const card = document.querySelector(".mach")!;
-    expect(stat(card)).toBe("no signal");
+    expect(stat(card)).toBe("checking…");
     expect(card.textContent).not.toContain("idle");
     expect(card.textContent).not.toContain("running");
     expect(card.querySelector(".runs")!.textContent).toBe("—");
@@ -2111,14 +2112,14 @@ describe("FleetLens — a card says no signal until its first data arrives (#295
     expect(cardScope(loaded)).toMatchObject({ state: "idle", centerUnit: "no model working" });
   });
 
-  it("a genuinely idle machine: 'no signal' while loading, then 'idle' once its data says so", async () => {
+  it("a genuinely idle machine: 'checking…' while loading, then 'idle' once its data says so", async () => {
     const runs = gate();
     mockFleetFetch({ machines: BEAT, runs: [], hold: { "/runs": runs.promise } });
     const queryClient = newClient();
     renderFleetLens({}, queryClient);
     await waitForFleetQueriesSettled(queryClient);
     await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
-    expect(stat(document.querySelector(".mach")!)).toBe("no signal");
+    expect(stat(document.querySelector(".mach")!)).toBe("checking…");
     expect(cardScope(document.querySelector(".mach")!)).toMatchObject({ state: "nosignal" });
 
     runs.open();
@@ -2131,7 +2132,7 @@ describe("FleetLens — a card says no signal until its first data arrives (#295
 
   // Each source on its own: this machine's card (drawn from /machine/specs,
   // which is fast) must wait on every source its "idle" is derived from,
-  // so holding any ONE of them holds "no signal".
+  // so holding any ONE of them holds "checking…".
   // The flow paths are named inside the test: `todayUTC()` reads the frozen
   // clock, which `beforeEach` sets after this list is built.
   const flowPaths = () => [`/flow/${todayUTC()}`, `/flow/${prevDateUTC(todayUTC())}`];
@@ -2141,7 +2142,7 @@ describe("FleetLens — a card says no signal until its first data arrives (#295
     ["live sessions", () => ["/fleet/dispatches/live"]],
     ["/runs", () => ["/runs"]],
   ] as const) {
-    it(`this machine's own card says 'no signal' while ${what} alone is unanswered, then 'idle'`, async () => {
+    it(`this machine's own card says 'checking…' while ${what} alone is unanswered, then 'idle'`, async () => {
       const paths: string[] = held();
       const slow = gate();
       mockFleetFetch({ specs: SPECS, runs: [], hold: Object.fromEntries(paths.map((p) => [p, slow.promise])) });
@@ -2159,11 +2160,11 @@ describe("FleetLens — a card says no signal until its first data arrives (#295
       });
       const card = document.querySelector(".mach")!;
       expect(card.textContent).toContain("MacBook-Pro");
-      expect(stat(card)).toBe("no signal");
+      expect(stat(card)).toBe("checking…");
       expect(card.querySelector(".runs")!.textContent).toBe("—");
       expect(cardScope(card)).toMatchObject({ state: "nosignal" });
       // Only the flow window can contradict a quiet utility strip.
-      expect(utilLabel(card)).toMatch(what === "the flow window" ? /no signal$/ : /idle$/);
+      expect(utilLabel(card)).toMatch(what === "the flow window" ? /checking…$/ : /idle$/);
 
       slow.open();
       await waitFor(() => expect(stat(document.querySelector(".mach")!)).toBe("idle"));
@@ -2215,16 +2216,16 @@ describe("FleetLens — a card says no signal until its first data arrives (#295
   });
 
   // (#2958 review M1) An offline card is one size in every state: while
-  // presence is unanswered it says "no signal" in the tube's box, and once
+  // presence is unanswered it says "checking…" in the tube's box, and once
   // presence says it is gone it keeps that box with the screen powered off.
-  it("a rostered-but-silent machine: 'no signal' while presence is unanswered, then 'offline' with a powered-off tube", async () => {
+  it("a rostered-but-silent machine: 'checking…' while presence is unanswered, then 'offline' with a powered-off tube", async () => {
     const presence = gate();
     mockFleetFetch({ view: [unreachableRow("studio", "unknown")], runs: [], hold: { "/fleet/machines/live": presence.promise } });
     renderFleetLens();
     await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
     await waitFor(() => expect(document.querySelector('.savings[data-settled="true"]')).not.toBeNull());
     const card = document.querySelector(".mach")!;
-    expect(stat(card)).toBe("no signal");
+    expect(stat(card)).toBe("checking…");
     expect(card.className).not.toContain("absent");
     expect(cardScope(card)).toMatchObject({ state: "nosignal" });
 
@@ -2243,8 +2244,8 @@ describe("FleetLens — a card says no signal until its first data arrives (#295
 
   // (#2958 review C4) Only the FIRST answer counts. At UTC midnight the
   // flow window rolls to a new day's key, which starts out pending; the
-  // cards must not blink back to "no signal" while it loads.
-  it("does not return to 'no signal' when the flow window rolls to a new day at UTC midnight", async () => {
+  // cards must not blink back to "checking…" while it loads.
+  it("does not return to 'checking…' when the flow window rolls to a new day at UTC midnight", async () => {
     vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
     vi.setSystemTime(new Date("2026-06-15T23:59:58.000Z"));
     const nextDay = gate();
@@ -2266,7 +2267,7 @@ describe("FleetLens — a card says no signal until its first data arrives (#295
   // own roster entry is unknown to the page, so no card may say "offline" or
   // "0 running" for it; once the view answers, the machine's own idle card
   // is the only one.
-  it("this machine's own roster entry says 'no signal', not 'offline', while /fleet/view is unanswered", async () => {
+  it("this machine's own roster entry says 'checking…', not 'offline', while /fleet/view is unanswered", async () => {
     const view = gate();
     mockFleetFetch({
       roster: [{ id: "laptop", address: "100.64.1.1:8765", added_unix_ms: 1000, machine_uid: "u-self" }],
@@ -2286,7 +2287,7 @@ describe("FleetLens — a card says no signal until its first data arrives (#295
     await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
     expect(queryClient.getQueryState(queryKeys.fleetView("/fleet/view"))?.status, "/fleet/view is still unanswered").toBe("pending");
     const card = document.querySelector(".mach")!;
-    expect(stat(card)).toBe("no signal");
+    expect(stat(card)).toBe("checking…");
     expect(card.textContent).not.toContain("offline");
     expect(card.textContent).not.toContain("0 running");
     expect(card.querySelector(".runs")!.textContent).toBe("—");
@@ -2332,20 +2333,20 @@ describe("FleetLens — a card says no signal until its first data arrives (#295
   // (#2965) A failed flow read is not an answer that nothing happened. Both
   // `/flow/<day>` reads fail while presence shows the machine beating: the
   // records that would say it is working are exactly the ones missing, so
-  // "idle · 0 running" is a claim nothing read. The card holds "no signal"
+  // "idle · 0 running" is a claim nothing read. The card holds "checking…"
   // (and the app-level `FlowReadNotice` names the failure).
   for (const [what, failing] of [
     ["both days", () => [`/flow/${todayUTC()}`, `/flow/${prevDateUTC(todayUTC())}`]],
     ["today alone", () => [`/flow/${todayUTC()}`]],
   ] as const) {
-    it(`says 'no signal', not 'idle', when the flow read fails (${what})`, async () => {
+    it(`says 'checking…', not 'idle', when the flow read fails (${what})`, async () => {
       const paths: string[] = failing();
       mockFleetFetch({ machines: BEAT, specs: SPECS, runs: [], fail: Object.fromEntries(paths.map((p) => [p, 500])) });
       const queryClient = newClient();
       renderFleetLens({}, queryClient);
       await waitForFleetQueriesSettled(queryClient);
       // Every source has answered, the failed flow read included: nothing is
-      // still loading, so "no signal" here is the failure's, not a load's.
+      // still loading, so "checking…" here is the failure's, not a load's.
       await waitFor(() => {
         for (const key of [queryKeys.fleetSessionsLive(), queryKeys.runs(), queryKeys.flowDate(todayUTC()), queryKeys.flowDate(prevDateUTC(todayUTC()))]) {
           expect(queryClient.getQueryState(key)?.status, JSON.stringify(key)).toBe("success");
@@ -2354,12 +2355,12 @@ describe("FleetLens — a card says no signal until its first data arrives (#295
       await waitFor(() => expect(document.querySelector('.fleet-lens[data-state="loaded"]')).not.toBeNull());
       await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
       for (const card of Array.from(document.querySelectorAll(".mach"))) {
-        expect(stat(card)).toBe("no signal");
+        expect(stat(card)).toBe("checking…");
         expect(card.textContent).not.toContain("idle");
         expect(card.textContent).not.toContain("offline");
         expect(card.querySelector(".runs")!.textContent).toBe("—");
         expect(cardScope(card)).toMatchObject({ state: "nosignal" });
-        expect(utilLabel(card)).toMatch(/no signal$/);
+        expect(utilLabel(card)).toMatch(/checking…$/);
       }
       // The token panel's zeros are a negative claim off the same read: it
       // keeps its loading silhouette rather than counting up to "0".
@@ -2371,7 +2372,7 @@ describe("FleetLens — a card says no signal until its first data arrives (#295
   // first read fails. The latch that keeps a PENDING new day from blinking
   // the cards back must not also hide a FAILED one; and the failed day is
   // retried, so the card heals on its own once the read succeeds.
-  it("a failed read of the new day at UTC midnight says 'no signal', then heals when the retry succeeds", async () => {
+  it("a failed read of the new day at UTC midnight says 'checking…', then heals when the retry succeeds", async () => {
     vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
     vi.setSystemTime(new Date("2026-06-15T23:59:58.000Z"));
     mockFleetFetch({ machines: BEAT, runs: [], failOnce: ["/flow/2026-06-16"], emptyDays: ["2026-06-16"] });
@@ -2381,7 +2382,7 @@ describe("FleetLens — a card says no signal until its first data arrives (#295
     await act(async () => {
       vi.advanceTimersByTime(5_000);
     });
-    await waitFor(() => expect(stat(document.querySelector(".mach")!)).toBe("no signal"));
+    await waitFor(() => expect(stat(document.querySelector(".mach")!)).toBe("checking…"));
     expect(document.querySelector(".savings")!.getAttribute("data-settled")).toBe("false");
     await act(async () => {
       vi.advanceTimersByTime(21_000);
@@ -2402,7 +2403,7 @@ describe("FleetLens — a card says no signal until its first data arrives (#295
     });
   });
 
-  it("a replay has its records in hand and never shows 'no signal'", async () => {
+  it("a replay has its records in hand and never shows 'checking…'", async () => {
     const records = normAll([
       { ts: "2026-08-26T10:00:00.000Z", machine_uid: "u1", machine_id: "m5", action: "machine.online", source: "presence_reconciler" },
     ]);
@@ -2492,7 +2493,7 @@ describe("savings hero: nothing leaks while loading (#2830)", () => {
   // (#2886 pass 4, do-it — fresh-reviewer finding 7, "add tests for... both
   // dimmed renders") The DOM-level counterparts to `cards.test.ts`'s
   // data-layer coverage of `liveTokCarried`/the half-open no-signal read —
-  // this proves the JSX actually stamps `data-carried`/"no signal" from
+  // this proves the JSX actually stamps `data-carried`/"checking…" from
   // those fields, not just that the underlying derivation is correct.
   describe("the TOK/S rate line's carried and no-signal renders", () => {
     // Hardcoded to FROZEN_NOW's own date rather than `todayUTC()` — this
@@ -2534,7 +2535,7 @@ describe("savings hero: nothing leaks while loading (#2830)", () => {
       expect(rate.getAttribute("data-carried")).toBe("true");
     });
 
-    it("shows literal 'no signal' text, not 'stalled', when the page is disconnected over an otherwise-stale heartbeat", async () => {
+    it("shows literal 'disconnected' text, not 'stalled', when the page is disconnected over an otherwise-stale heartbeat", async () => {
       mockFleetFetch({
         flowToday: [
           { ts: t1a, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
@@ -2544,12 +2545,12 @@ describe("savings hero: nothing leaks while loading (#2830)", () => {
       });
       renderFleetLens({ connected: false });
 
-      // (#2955 review) "no signal" looks the same everywhere: the plain
+      // (#2955 review) "disconnected" looks the same everywhere: the plain
       // status line with the dim dot (`.mach.nosignal`), never the lit
       // reading style, even on a card whose machine is running.
       await waitFor(() => expect(document.querySelector('[data-testid="fleet-token-scope"]')).not.toBeNull());
       const card = document.querySelector(".mach")!;
-      await waitFor(() => expect(card.querySelector(".stat")!.textContent).toBe("no signal"));
+      await waitFor(() => expect(card.querySelector(".stat")!.textContent).toBe("disconnected"));
       expect(card.querySelector(".mach-scope__rate"), "not the reading style").toBeNull();
       expect(card.className, "the dim dot").toContain("nosignal");
       expect(card.className, "the machine is still running").toContain("active");
