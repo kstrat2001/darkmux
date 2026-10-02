@@ -73,7 +73,6 @@ import {
   foldFlowRecords,
   indexGraph,
   missionTotals,
-  normalizeMissionStatus,
   recordInMission,
   seedMetricsFromGraph,
   recordsByStep,
@@ -618,7 +617,7 @@ export function MissionGraphLens({
   // including every sign-off gate, where no step is running. The header's
   // elapsed clock must tick for the MISSION, so the clock follows the mission
   // status as well as the steps.
-  const missionRunning = !!graph && workStatusKind(normalizeMissionStatus(graph.mission_status)) === "running";
+  const missionRunning = !!graph && workStatusKind(graph.mission_status) === "running";
   const now = useNow(anyRunning || missionRunning);
   const policy = useLifecyclePolicy();
   // Each step's run phase as of `now`, from the records attributed to it:
@@ -730,7 +729,7 @@ export function MissionGraphLens({
 
   const useTimeline = timelineActive(viewMode, isMobile);
   const tot = missionTotals(metrics);
-  const status = normalizeMissionStatus(graph.mission_status);
+  const status = graph.mission_status;
   const running = missionRunning;
   const idParts = splitMissionId(graph.mission_id);
   const span = missionSpan(metrics);

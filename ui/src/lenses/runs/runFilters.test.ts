@@ -42,10 +42,10 @@ describe("facet counts", () => {
   });
 
   // (5.0 R3) The status chip and the status filter say the same word.
-  it("a running run on a machine that is not reporting is filed under 'unknown', not 'running'", () => {
+  it("a running run on a machine that is not reporting is filed under 'not reporting', not 'running'", () => {
     const env = envFor(RUNS, (r) => r.id === "c");
-    expect(counts(facetChoices(RUNS, sel({}), "status", env))).toEqual({ complete: 3, unknown: 1 });
-    expect(applyFilters(RUNS, sel({ status: ["unknown"] }), env).map((r) => r.id)).toEqual(["c"]);
+    expect(counts(facetChoices(RUNS, sel({}), "status", env))).toEqual({ complete: 3, "not reporting": 1 });
+    expect(applyFilters(RUNS, sel({ status: ["not reporting"] }), env).map((r) => r.id)).toEqual(["c"]);
     expect(applyFilters(RUNS, sel({ status: ["running"] }), env)).toEqual([]);
   });
 

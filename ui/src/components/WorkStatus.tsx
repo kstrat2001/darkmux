@@ -13,8 +13,8 @@
  *
  *   running  — in progress: accent, and the pulse (`data-live` modulates it
  *              exactly as the run detail's liveness state always did)
- *   done     — a good terminal: complete / finished / finalized / closed
- *   error    — a bad terminal: error / errored / killed
+ *   done     — a good terminal: complete / finalized
+ *   error    — a bad terminal: error
  *   degraded — a MIXED terminal (#2406): real output was produced, some of
  *              it was not — a phase with some tasks complete and some
  *              errored/abandoned. Warn color, same as `stopped` (a caution,
@@ -24,17 +24,20 @@
  *              different facts (a mix that shipped real output vs. an
  *              operator/budget kill) and must stay distinguishable by the
  *              raw status word even though they share a color family.
- *   stopped  — an operator or budget terminal: aborted / abandoned /
- *              interrupted / escalated
- *   idle     — not started, or a word this map does not know: planned /
- *              unparseable / unknown (a run on a machine that is not
- *              reporting, 5.0 R3) / undefined / anything new (loud in the DOM via
- *              `s-<raw>`, quiet on screen)
+ *   stopped  — an operator or budget terminal: abandoned / escalated
+ *   idle     — not started, or not claimable: planned / waiting / unparseable /
+ *              not_reporting (a run on a machine that is not reporting, 5.0 R3)
+ *   unknown  — a word this map does not list (a status newer than this build,
+ *              or none at all): the raw word shows in the chip, dim, and in the
+ *              DOM as `s-<raw>`. Never worded as idle.
  *
  * Styling lives in ONE place: `.wstatus` in `styles.css`. A call site may add
  * a layout class (`className`) but never a second color/animation source.
  */
 import type { LivenessState } from "./LivenessPulse";
+import type { RunBadgeStatus } from "../lib/runStatusWord";
+import type { GraphNodeStatus } from "../types/generated/GraphNodeStatus";
+import type { MissionStatus } from "../types/generated/MissionStatus";
 
 /**
  * THE word a pulsing chip says. (operator, 2026-09-04: a pulsing pill on the
@@ -52,19 +55,19 @@ import type { LivenessState } from "./LivenessPulse";
  * (operator, 2026-09-04: "live is a separate idea from a running job.")
  */
 export const RUNNING_WORD = "running";
-export type WorkStatusKind = "running" | "done" | "error" | "degraded" | "stopped" | "idle";
+export type WorkStatusKind = "running" | "done" | "error" | "degraded" | "stopped" | "idle" | "unknown";
 
-const KIND: Record<string, WorkStatusKind> = {
+/** Every status word a scope hands this chip: a run's (with `not_reporting`),
+ *  a mission's, a phase's or task's. Typed from the generated unions, so a new
+ *  variant is a compile error here until it is given a kind. */
+export type WorkStatusWord = RunBadgeStatus | MissionStatus | GraphNodeStatus;
+
+const KIND: Record<WorkStatusWord, WorkStatusKind> = {
   running: "running",
   active: "running",
-  live: "running",
   complete: "done",
-  finished: "done",
   finalized: "done",
-  closed: "done",
   error: "error",
-  errored: "error",
-  killed: "error",
   // (#2406) Mixed terminal — real output was produced, some of it was not.
   // Its own kind, not folded into `stopped`: see this file's own doc for
   // why the two must stay distinguishable by word even though they share
@@ -75,15 +78,19 @@ const KIND: Record<string, WorkStatusKind> = {
   // (F2) A deliberate hand-off to a higher tier: unfinished by design, so a
   // caution like `stopped`, never the error color.
   escalated: "stopped",
-  interrupted: "stopped",
   planned: "idle",
+  waiting: "idle",
   unparseable: "idle",
-  unknown: "idle",
+  not_reporting: "idle",
+  unknown: "unknown",
 };
 
+const isWorkStatusWord = (raw: string): raw is WorkStatusWord => Object.hasOwn(KIND, raw);
+
+/** The chip's kind. A word the map does not list is `unknown`, never `idle`:
+ *  an unrecognized status must not read as "nothing is happening". */
 export function workStatusKind(raw: string | undefined): WorkStatusKind {
-  if (!raw) return "idle";
-  return KIND[raw.toLowerCase()] ?? "idle";
+  return raw !== undefined && isWorkStatusWord(raw) ? KIND[raw] : "unknown";
 }
 
 export function WorkStatus({
@@ -93,8 +100,8 @@ export function WorkStatus({
   className,
   title,
 }: {
-  /** The raw status word from the data (`active`, `running`, `complete`, …). */
-  status: string | undefined;
+  /** The status word from the data (`active`, `running`, `complete`, …). */
+  status: WorkStatusWord | undefined;
   /** Override the visible text of a NON-running chip (a terminal's scope-specific
    *  word). A running chip always says `RUNNING_WORD`; the override is ignored. */
   label?: string;
@@ -104,7 +111,7 @@ export function WorkStatus({
   title?: string;
 }) {
   const kind = workStatusKind(status);
-  const raw = (status ?? "unknown").toLowerCase();
+  const raw = status ?? "unknown";
   const cls = ["wstatus", `is-${kind}`, `s-${raw}`, className].filter(Boolean).join(" ");
   return (
     <span className={cls} data-live={kind === "running" ? (live ?? "beating") : undefined} title={title}>

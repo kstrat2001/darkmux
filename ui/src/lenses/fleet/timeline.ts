@@ -56,7 +56,7 @@
  * token sums (a caller-side gate, not a change to this file).
  */
 
-import { statusLabel } from "../../lib/flow";
+import { runStatusWord } from "../../lib/runStatusWord";
 import { displayNameOf } from "../../lib/machineIdentity";
 import type { RosterName, SelfIdentity } from "../../lib/machineIdentity";
 import { clkhm } from "../../lib/format";
@@ -161,7 +161,7 @@ function barFor(g: RunGroup, w: BarWindow): TimelineBar | null {
   const role = ((first.start ?? first.opening).handle || "").replace(/^darkmux\//, "");
   const state = toRunState(l);
   const key = g.missionId ? `${g.sessionId}\x1f${g.missionId}` : g.sessionId;
-  return { sid: g.sessionId, key, hash: dispatchHash(g.sessionId, g.missionId), leftPct, widthPct, status: state.status, title: `${role} · ${g.sessionId} · ${statusLabel(state)}` };
+  return { sid: g.sessionId, key, hash: dispatchHash(g.sessionId, g.missionId), leftPct, widthPct, status: state.status, title: `${role} · ${g.sessionId} · ${runStatusWord(state.status, state.abandonReason)}` };
 }
 
 export function buildActivityTimeline(

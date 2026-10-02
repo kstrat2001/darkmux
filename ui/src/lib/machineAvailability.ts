@@ -44,8 +44,9 @@ export const NOT_REPORTED = "not reported";
 
 /** (5.0 R3) The status a run reads when it is recorded as running on a machine
  *  that is not reporting: nothing says it is still running, and nothing says
- *  it stopped. The wire status is untouched; this is what THIS viewer can claim. */
-export const NOT_REPORTING_STATUS = "unknown";
+ *  it stopped. The wire status is untouched; this is what THIS viewer can claim.
+ *  Its own key, distinct from the run status `unparseable`; `runStatusWord` words it. */
+export const NOT_REPORTING_STATUS = "not_reporting";
 export const NOT_REPORTING_TITLE = "The machine this ran on is not reporting, so whether it is still running is unknown.";
 
 /** Whether a surface must hold back its idle / zero / quiet claims. */

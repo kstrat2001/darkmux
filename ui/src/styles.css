@@ -2839,7 +2839,8 @@ body {
    tells it apart from `stopped`. */
 .wstatus.is-degraded { color: var(--warn); border-color: var(--warn); }
 .wstatus.is-stopped { color: var(--warn); border-color: var(--warn); }
-.wstatus.is-idle { color: var(--dim); border-color: var(--border); }
+.wstatus.is-idle,
+.wstatus.is-unknown { color: var(--dim); border-color: var(--border); }
 
 .labbadge {
   flex: 0 0 auto;

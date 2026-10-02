@@ -228,57 +228,11 @@ export function computeTMin(data: readonly NormRecord[]): number {
 }
 
 /** What a lens is allowed to say about a run: one canonical status, plus the
- * payload facts a LABEL may render it with. */
+ * payload fact a LABEL may render it with. */
 export interface RunState {
   status: RunStatus;
-  /** `error` only. The terminal record reported a kill/timeout rather than a
-   * plain failure — a rendering nuance of `error`, not a status of its own. */
-  killed: boolean;
   /** `abandoned` only. Mirrors `Run.abandoned_reason` on the wire. */
   abandonReason?: AbandonReason;
-}
-
-/**
- * (#2813) The word a lens shows for a run. A TOTAL function of the canonical
- * status — a lens may choose WORDS, it may never choose STATES.
- *
- * This used to take four booleans and return `running | killed | errored |
- * complete | canceled`, a vocabulary that overlapped the server's
- * `RunStatus` in only two values and had no total function between them. It
- * was a faithful port of `viewer.html`, written before a typed API existed;
- * the enum arrived afterwards and this never went back. Meanwhile
- * `runStatusLabel` in the runs lens had been doing it correctly all along —
- * status verbatim, `abandoned` split on its reason.
- *
- * The `never` binding below is the part that keeps this true: adding a
- * `RunStatus` variant is a COMPILE ERROR here until it is handled. The
- * generated-types drift guard in CI keeps `RunStatus` current with Rust; this
- * keeps the LABELS current with `RunStatus`. Without it, CI is happy while a
- * lens quietly ignores the enum, which is how the two vocabularies coexisted.
- */
-export function statusLabel(state: RunState): string {
-  switch (state.status) {
-    case "planned":
-      return "planned";
-    case "running":
-      return "running";
-    case "complete":
-      return "complete";
-    case "degraded":
-      return "degraded";
-    case "error":
-      return state.killed ? "killed" : "errored";
-    case "escalated":
-      return "escalated";
-    case "abandoned":
-      return state.abandonReason === "aborted" ? "aborted" : "no ending recorded";
-    case "unparseable":
-      return "unknown";
-    default: {
-      const unhandled: never = state.status;
-      return unhandled;
-    }
-  }
 }
 
 /** `machPresent()` — viewer.html:1321-1327. true=present, false=absent,

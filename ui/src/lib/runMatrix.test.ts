@@ -8,7 +8,7 @@ import {
   type MatrixCell,
 } from "./runMatrix";
 import { runActivity, runStatusLabel, runsFiltered, RUNS_CAP } from "../lenses/runs/format";
-import { statusLabel } from "./flow";
+import { runStatusWord } from "./runStatusWord";
 import type { RunKind } from "../types/generated/RunKind";
 import type { RunStatus } from "../types/generated/RunStatus";
 
@@ -123,19 +123,10 @@ describe.each(CELLS.map((c) => [c.id, c] as const))("cell %s", (_id, cell: Matri
     }
   });
 
-  it("agrees with the fleet-side label for the same state", () => {
-    // The disagreement #2813 named: two vocabularies for one axis meant a
-    // card and a list could describe the same run differently. They are
-    // now two renderings of the same canonical state, so neither may
-    // describe a state the other does not have. Asserting the pair are
-    // both non-empty and both derived from `cell.status` is what pins
-    // that; asserting they are IDENTICAL would be wrong, since the runs
-    // board deliberately expands `abandoned` and the card does not have
-    // to.
-    const card = statusLabel({ status: cell.status, killed: false, abandonReason: cell.abandonReason });
-    expect(card, `${cell.id} has no fleet-side label`).toBeTruthy();
-    expect(card).not.toBe("canceled");
-    expect(card).not.toBe("killed");
+  it("reads the same word on the board as the run page's pill", () => {
+    // 5.0: one map (`runStatusWord`) words a status for the board, its filter,
+    // the run page and the timeline; no surface may pick its own word.
+    expect(runStatusLabel(run), `${cell.id} board word`).toBe(runStatusWord(cell.status, cell.abandonReason));
   });
 
   it("is included by its own kind filter and excluded by the others", () => {

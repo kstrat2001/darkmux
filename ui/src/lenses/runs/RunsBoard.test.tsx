@@ -165,7 +165,7 @@ describe("RunsBoard", () => {
   });
 
   // (5.0 R3) A run recorded as running on a peer that is down has no live
-  // evidence: its badge and its status filter both read "unknown".
+  // evidence: its badge and its status filter both read "not reporting".
   describe("a running run on a machine that is not reporting", () => {
     const peerRow = (liveness: "no_beat" | "live") => ({
       entry: { id: "studio", address: "a:1", added_unix_ms: 1 },
@@ -176,12 +176,12 @@ describe("RunsBoard", () => {
     });
     const RUN = [{ id: "peer-run", kind: "dispatch", status: "running", tracked: true, updated_ts: 400, machine: "studio", machine_uid: "u-studio" }];
 
-    it("reads unknown, not running, and is filed under unknown", async () => {
+    it("reads not reporting, not running, and is filed under not reporting", async () => {
       mockFetch(true, true, {}, RUN, [peerRow("no_beat")]);
       renderBoard();
-      await waitFor(() => expect(screen.getByText("unknown", { selector: ".labbadge" })).toBeInTheDocument());
-      const badge = screen.getByText("unknown", { selector: ".labbadge" });
-      expect(badge).toHaveClass("wstatus", "is-idle", "s-unknown");
+      await waitFor(() => expect(screen.getByText("not reporting", { selector: ".labbadge" })).toBeInTheDocument());
+      const badge = screen.getByText("not reporting", { selector: ".labbadge" });
+      expect(badge).toHaveClass("wstatus", "is-idle", "s-not_reporting");
       expect(badge).not.toHaveAttribute("data-live");
       expect(badge.getAttribute("title")).toMatch(/not reporting/i);
       expect(screen.queryByText("running", { selector: ".labbadge" })).not.toBeInTheDocument();
@@ -196,7 +196,7 @@ describe("RunsBoard", () => {
       await waitFor(() => expect(screen.getByText("running", { selector: ".labbadge" })).toBeInTheDocument());
     });
 
-    it("a run whose session is live is never unknown, even when its machine's row reads down", async () => {
+    it("a run whose session is live is never not reporting, even when its machine's row reads down", async () => {
       mockFetch(true, true, {}, RUN, [peerRow("no_beat")], ["peer-run"]);
       renderBoard();
       await waitFor(() => expect(asked("/fleet/view") && asked("/fleet/dispatches/live")).toBe(true));

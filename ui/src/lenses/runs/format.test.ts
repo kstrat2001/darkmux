@@ -151,11 +151,12 @@ describe("runStatusLabel", () => {
     expect(runStatusLabel(r)).toBe("no ending recorded");
   });
   // (5.0 R3) A running run on a machine that is not reporting has no live
-  // evidence behind it, so it reads unknown. Nothing else changes.
-  it("reads a running run on a machine that is not reporting as 'unknown'", () => {
+  // evidence behind it, so it reads "not reporting", a word of its own that is
+  // not the `unparseable` run status. Nothing else changes.
+  it("reads a running run on a machine that is not reporting as 'not reporting'", () => {
     const r = run({ id: "a", kind: "dispatch", status: "running", tracked: true });
-    expect(runStatusLabel(r, true)).toBe("unknown");
-    expect(runBadgeStatus(r, true)).toBe("unknown");
+    expect(runStatusLabel(r, true)).toBe("not reporting");
+    expect(runBadgeStatus(r, true)).toBe("not_reporting");
     expect(runStatusLabel(r, false)).toBe("running");
   });
   it("leaves a finished run's status alone even when its machine is not reporting", () => {
