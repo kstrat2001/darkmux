@@ -2803,10 +2803,10 @@ mod tests {
 
     #[test]
     fn a_model_key_that_contains_a_host_as_a_substring_survives() {
-        let r = Redaction::from_parts(&[("peerone", "studio.example")], &[], None, None);
+        let r = Redaction::from_parts(&[("peerone", "studio.example"), ("peertwo", "studio")], &[], None, None);
         assert_eq!(
-            filtered(&r, "lmstudio-community/qwen3-4b studio.example"),
-            "lmstudio-community/qwen3-4b (address hidden)"
+            filtered(&r, "lmstudio-community/qwen3-4b studio.example lmstudio:1234 lmstudio.example studio:1234"),
+            "lmstudio-community/qwen3-4b (address hidden) lmstudio:1234 lmstudio.example (address hidden):1234"
         );
     }
 

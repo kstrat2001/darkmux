@@ -115,12 +115,36 @@ pub(crate) fn table() -> Vec<Route> {
     ]
 }
 
-/// A JSON route's handler behind the one redaction layer
-/// ([`crate::redaction::redact_reads`]), unless the handler redacts itself.
-fn with_read_redaction(reply: Reply, redacts_itself: bool, handler: MethodRouter<AppState>) -> MethodRouter<AppState> {
-    match reply {
-        Reply::Json(_) if !redacts_itself => handler.layer(axum::middleware::from_fn(crate::redaction::redact_reads)),
-        _ => handler,
+/// How a route keeps host facts from a remote reader. Every route has one, and
+/// [`Route::redaction`] matches exhaustively on [`Reply`], so a new kind of
+/// reply cannot be added without choosing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RouteRedaction {
+    /// The handler sits behind [`crate::redaction::redact_reads`].
+    Layer,
+    /// The handler redacts for a remote reader itself (the panels' terminal
+    /// output, the event stream's lines).
+    Handler,
+    /// A fixed document or image that names no host.
+    Static,
+}
+
+impl Route {
+    pub(crate) fn redaction(&self) -> RouteRedaction {
+        match self.reply {
+            Reply::Json(_) if self.redacts_itself => RouteRedaction::Handler,
+            Reply::Json(_) => RouteRedaction::Layer,
+            Reply::EventStream => RouteRedaction::Handler,
+            Reply::Html | Reply::Png | Reply::Manifest => RouteRedaction::Static,
+        }
+    }
+}
+
+/// A route's handler, behind the redaction layer when its stance is `Layer`.
+fn with_read_redaction(route: &Route) -> MethodRouter<AppState> {
+    match route.redaction() {
+        RouteRedaction::Layer => route.handler.clone().layer(axum::middleware::from_fn(crate::redaction::redact_reads)),
+        RouteRedaction::Handler | RouteRedaction::Static => route.handler.clone(),
     }
 }
 
@@ -132,7 +156,7 @@ pub(crate) fn router() -> Router<AppState> {
         table().into_iter().partition(|r| r.reply == Reply::EventStream);
     let timed = timed
         .into_iter()
-        .fold(Router::new(), |router, r| router.route(r.path, with_read_redaction(r.reply, r.redacts_itself, r.handler)))
+        .fold(Router::new(), |router, r| router.route(r.path, with_read_redaction(&r)))
         .layer(tower_http::timeout::TimeoutLayer::new(Duration::from_secs(crate::REQUEST_TIMEOUT_SECS)));
     let streaming = streaming.into_iter().fold(Router::new(), |router, r| router.route(r.path, r.handler));
     timed.merge(streaming)

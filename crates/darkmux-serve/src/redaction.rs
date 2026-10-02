@@ -325,18 +325,33 @@ fn ipv6_spans(text: &str, out: &mut Vec<Span>) {
         while i < b.len() && (b[i].is_ascii_hexdigit() || b[i] == b':') {
             i += 1;
         }
-        if (start > 0 && word_byte(b[start - 1])) || b.get(i).is_some_and(|c| word_byte(*c)) {
+        if b.get(i).is_some_and(|c| word_byte(*c)) {
             continue;
         }
-        let run = &text[start..i];
-        let parsed = run.parse::<std::net::Ipv6Addr>().map(|a| (a, i)).or_else(|_| {
-            let t = run.strip_suffix(':').unwrap_or(run);
-            t.parse::<std::net::Ipv6Addr>().map(|a| (a, start + t.len()))
-        });
-        if let Some((_, end)) = parsed.ok().filter(|(a, _)| v6_is_host_fact(*a)) {
-            out.push(Span { start, end, with: ADDRESS_HIDDEN });
+        let glued = start > 0 && word_byte(b[start - 1]);
+        if let Some(span) = v6_in_run(text, start, i, glued) {
+            out.push(span);
         }
     }
+}
+
+/// The host-fact IPv6 literal in the run `start..end`, if any: the whole run,
+/// then each suffix after a `:` (`ip:fd7a::1`, `peer:fd7a:115c::53`, and
+/// `bad:fd7a:...`, where the label's own letters are hex digits). A run glued
+/// to a word on its left is tried only from a `:` on.
+fn v6_in_run(text: &str, start: usize, end: usize, glued: bool) -> Option<Span> {
+    let run = &text[start..end];
+    let from_colons = run.match_indices(':').map(|(i, _)| i + 1);
+    let offsets = (!glued).then_some(0).into_iter().chain(from_colons);
+    for off in offsets {
+        let cand = &run[off..];
+        for t in [cand, cand.strip_suffix(':').unwrap_or(cand)] {
+            if t.parse::<std::net::Ipv6Addr>().is_ok_and(v6_is_host_fact) {
+                return Some(Span { start: start + off, end: start + off + t.len(), with: ADDRESS_HIDDEN });
+            }
+        }
+    }
+    None
 }
 
 /// Every `.ts.net` name, whole.
@@ -566,7 +581,15 @@ impl Redaction {
                     .collect();
                 for (old, new) in renames {
                     if let Some(val) = o.remove(&old) {
-                        o.insert(new, val);
+                        // Two keys can redact to the same text: the later one
+                        // is suffixed so a remote map loses no entry.
+                        let mut key = new.clone();
+                        let mut n = 2;
+                        while o.contains_key(&key) {
+                            key = format!("{new} #{n}");
+                            n += 1;
+                        }
+                        o.insert(key, val);
                     }
                 }
             }
@@ -878,6 +901,10 @@ mod tests {
         assert_eq!(r.line("http://[fd7a:115c:a1e0::53]:1234/v1"), format!("http://[{ADDRESS_HIDDEN}]:1234/v1"));
         assert_eq!(r.line("at fd7a:115c:a1e0:ab12:4843:cd96:625b:1 now"), format!("at {ADDRESS_HIDDEN} now"));
         assert_eq!(r.line("fd7a:115c:a1e0::53: refused"), format!("{ADDRESS_HIDDEN}: refused"));
+        // Glued to a label: the label's own letters can be hex digits (`bad`).
+        assert_eq!(r.line("ip:fd7a::1"), format!("ip:{ADDRESS_HIDDEN}"));
+        assert_eq!(r.line("peer:fd7a:115c::53"), format!("peer:{ADDRESS_HIDDEN}"));
+        assert_eq!(r.line("bad:fd7a:115c:a1e0::53"), format!("bad:{ADDRESS_HIDDEN}"));
         for hidden in ["2001:db8::1", "fe80::1", "fc00::5"] {
             assert_eq!(r.line(hidden), ADDRESS_HIDDEN, "{hidden}");
         }
@@ -904,6 +931,56 @@ mod tests {
         let mut v = serde_json::json!({"peer 100.64.7.7": "x", "ok": {"/Users/someone/k": ["at 10.0.0.1"]}});
         r.json(&mut v);
         assert_eq!(v, serde_json::json!({format!("peer {ADDRESS_HIDDEN}"): "x", "ok": {"~/k": [format!("at {ADDRESS_HIDDEN}")]}}));
+    }
+
+    #[test]
+    fn two_keys_that_redact_alike_both_survive() {
+        let r = rules();
+        let mut v = serde_json::json!({"100.64.7.7": 1, "10.0.0.1": 2, "(address hidden)": 3, "ok": 4});
+        r.json(&mut v);
+        let o = v.as_object().unwrap();
+        assert_eq!(o.len(), 4, "{v}");
+        let mut got: Vec<i64> = o.values().map(|x| x.as_i64().unwrap()).collect();
+        got.sort();
+        assert_eq!(got, [1, 2, 3, 4]);
+        assert!(o.contains_key(ADDRESS_HIDDEN) && o.contains_key(&format!("{ADDRESS_HIDDEN} #2")) && o.contains_key(&format!("{ADDRESS_HIDDEN} #3")), "{v}");
+    }
+
+    /// A bare roster host (`studio`) must not be found inside a longer word,
+    /// and must be where it addresses, even as the whole string after `@`.
+    #[test]
+    fn a_bare_host_is_a_whole_word_and_an_at_sign_is_a_position() {
+        let r = Redaction::from_parts(&[("peerone", "studio"), ("peertwo", "kain-studio")], &[], None, None);
+        assert_eq!(r.line("lmstudio:1234 and lmstudio-community/x"), "lmstudio:1234 and lmstudio-community/x");
+        assert_eq!(r.line("studio:1234"), format!("{ADDRESS_HIDDEN}:1234"));
+        assert_eq!(r.line("me@kain-studio"), format!("me@{ADDRESS_HIDDEN}"));
+    }
+
+    /// Every route in the table states how a remote reader is kept from host
+    /// facts. The self-redacting set is closed: adding to it is a deliberate
+    /// edit here. Static routes are fetched as a remote reader and carry none.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn every_table_route_is_layered_or_declared() {
+        use crate::routes::RouteRedaction::*;
+        let _facts = HostFacts::set();
+        unsafe { std::env::remove_var("DARKMUX_REDIS_URL") };
+        let mut handler: Vec<&str> = Vec::new();
+        let flows = seed_flows();
+        for route in crate::routes::table() {
+            match route.redaction() {
+                Layer => {}
+                Handler => handler.push(route.path),
+                Static => {
+                    let path = route.path.replace(":date", &darkmux_flow::day_utc_now());
+                    let (_, body) = get(crate::build_router(flows.path().to_path_buf()), &path, REMOTE).await;
+                    for secret in SECRETS {
+                        assert!(!body.contains(secret), "static route {} shows `{secret}`", route.path);
+                    }
+                }
+            }
+        }
+        assert_eq!(handler, ["/flow/:date/stream", "/panel/:id"], "a route that redacts for itself must be declared here on purpose");
     }
 
     #[tokio::test]
@@ -933,7 +1010,8 @@ mod tests {
             let text = std::fs::read_to_string(&path).unwrap();
             // A file's test module comes last; only the code above it counts.
             let code = text.split("\n#[cfg(test)]\nmod tests").next().unwrap_or("");
-            if code.contains(".route(") || code.contains(".nest(") {
+            let registers = [".route(", ".nest(", ".route_service(", ".nest_service(", ".fallback("].iter().any(|p| code.contains(p));
+            if registers || (code.contains(".merge(") && code.contains("Router")) {
                 offenders.push(name);
             }
         }
