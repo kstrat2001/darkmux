@@ -904,6 +904,29 @@ fn summarize_audit_reports(reports: &[darkmux_flow::IntegrityReport]) -> Check {
         };
     }
 
+    // A crash mid-append left an incomplete last line; a later append set it
+    // aside in a sidecar. The remaining chain verifies, so this is a caveat
+    // (the cut bytes are not part of the chain), not a break.
+    let torn: Vec<&str> = reports
+        .iter()
+        .flat_map(|r| r.torn_tails.iter().map(String::as_str))
+        .collect();
+    if !torn.is_empty() {
+        return Check {
+            name: "audit integrity".into(),
+            status: Status::Warn,
+            message: format!(
+                "{} torn audit tail(s) set aside after an interrupted write: {}",
+                torn.len(),
+                torn.join(", ")
+            ),
+            hint: Some(
+                "A write was interrupted mid-line; the incomplete bytes were moved to the named sidecar file and the chain continues from the last complete line. Inspect or delete the sidecar once reviewed. The chain check does not detect records removed from the end of a day file."
+                    .into(),
+            ),
+        };
+    }
+
     // (#1769) Every chain either links cleanly or is a legacy-format file
     // this binary does not attempt to content-verify (recomputing a
     // struct-hash would repeat the exact lossy round trip #1768/#1769
@@ -9914,7 +9937,23 @@ mod tests {
             legacy_format: false,
             note: None,
             writer_schema_version: Some("1.19.0".into()),
+            torn_tails: Vec::new(),
         }
+    }
+
+    #[test]
+    fn summarize_audit_reports_torn_tail_is_warn_naming_the_sidecar() {
+        let torn = darkmux_flow::IntegrityReport {
+            torn_tails: vec!["/audit/2026-08-11.jsonl.torn-1790000000000".into()],
+            ..mk_clean_report(3)
+        };
+        let check = summarize_audit_reports(&[torn]);
+        assert_eq!(check.status, Status::Warn, "a set-aside torn tail is a caveat, not a break");
+        assert!(
+            check.message.contains("2026-08-11.jsonl.torn-1790000000000"),
+            "the sidecar must be named: {}",
+            check.message
+        );
     }
 
     /// Unknown actions in the archive warn with their count and names, a

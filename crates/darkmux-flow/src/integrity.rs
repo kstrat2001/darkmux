@@ -131,11 +131,16 @@ pub(crate) fn audit_record_at(record: &FlowRecord, path: &Path) -> Result<()> {
 #[cfg(unix)]
 fn audit_record_at_locked(record: &FlowRecord, path: &Path, file: &mut std::fs::File) -> Result<()> {
     use std::io::{Read, Seek, SeekFrom, Write as _};
-    let mut contents = String::new();
+    let mut raw = Vec::new();
     file.seek(SeekFrom::Start(0))
         .with_context(|| format!("seek to start of {}", path.display()))?;
-    file.read_to_string(&mut contents)
+    file.read_to_end(&mut raw)
         .with_context(|| format!("reading audit log {}", path.display()))?;
+    // A crash mid-append leaves a torn last line; settle it before reading
+    // the chain's tail so a write never glues onto or chains from it.
+    recover_torn_tail(path, file, &mut raw)?;
+    let contents = String::from_utf8(raw)
+        .with_context(|| format!("audit log {} is not valid UTF-8", path.display()))?;
 
     let (prev_hash, write_header) = if contents.is_empty() {
         // Fresh file — the seed hash binds the chain to the schema header
@@ -230,21 +235,130 @@ fn audit_record_at_locked(record: &FlowRecord, path: &Path, file: &mut std::fs::
     let hash_hex = audit_hash_of(&to_write).context("computing audit hash")?;
     let line = format!("{hash_hex} {record_json}");
 
-    // Append (after seeking to end). flock holds; PIPE_BUF guarantee is
-    // belt-and-suspenders for the JSONL line.
+    // Append (after seeking to end). flock holds. The header (fresh file)
+    // and the record line each carry their own `\n` and go out in ONE
+    // `write_all`, so a crash can tear the tail but can never leave a
+    // complete line without its terminator for the next append to glue onto.
     file.seek(SeekFrom::End(0))
         .with_context(|| format!("seek to end of {}", path.display()))?;
+    let mut out = String::new();
     if let Some(header) = write_header {
-        file.write_all(header.as_bytes())
-            .with_context(|| format!("writing schema header to {}", path.display()))?;
-        file.write_all(b"\n")?;
+        out.push_str(&header);
+        out.push('\n');
     }
-    file.write_all(line.as_bytes())
+    out.push_str(&line);
+    out.push('\n');
+    file.write_all(out.as_bytes())
         .with_context(|| format!("appending record to audit log {}", path.display()))?;
-    file.write_all(b"\n")?;
     file.sync_all()
         .with_context(|| format!("syncing audit log {}", path.display()))?;
     Ok(())
+}
+
+/// `true` when `tail` (the bytes after the file's last `\n`) is a whole
+/// line: the schema header when `first_line`, otherwise a `<hash> <json>`
+/// record whose prefix equals the BLAKE3 of its own bytes.
+fn tail_is_whole_line(tail: &[u8], first_line: bool) -> bool {
+    let Ok(text) = std::str::from_utf8(tail) else {
+        return false;
+    };
+    if first_line {
+        return serde_json::from_str::<serde_json::Value>(text)
+            .ok()
+            .and_then(|v| v.get("_type").and_then(|t| t.as_str()).map(|t| t == "schema"))
+            .unwrap_or(false);
+    }
+    match text.split_once(' ') {
+        Some((hash, json)) => {
+            is_blake3_hex(hash)
+                && audit_hash_of_bytes(json.as_bytes()) == hash
+                && serde_json::from_str::<serde_json::Value>(json).is_ok()
+        }
+        None => false,
+    }
+}
+
+/// Path of the sidecar a torn tail of `path` is moved into:
+/// `<day file>.torn-<unix millis>`, with a numeric suffix on collision.
+fn torn_sidecar_path(path: &Path) -> PathBuf {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let base = format!("{}.torn-{millis}", path.display());
+    let mut candidate = PathBuf::from(&base);
+    let mut n = 1u32;
+    while candidate.exists() {
+        candidate = PathBuf::from(format!("{base}-{n}"));
+        n += 1;
+    }
+    candidate
+}
+
+/// Settle the bytes after the file's last newline before extending the
+/// chain, under the caller's lock.
+///
+/// - Empty or whitespace-only tail: nothing to do (whitespace is trimmed).
+/// - A whole line that merely lost its `\n` (hash prefix matches its own
+///   bytes): the newline is written back so the record survives.
+/// - Anything else is a torn write. Its bytes go to a
+///   `<day file>.torn-<ts>` sidecar, the day file is truncated back to the
+///   last newline, and the chain continues from the last complete line.
+///   `integrity_check_file` lists the sidecar in `IntegrityReport::torn_tails`.
+///
+/// A newline-terminated last line is never touched here: a bad one is
+/// foreign content and the callers' existing refusal applies.
+#[cfg(unix)]
+fn recover_torn_tail(path: &Path, file: &mut std::fs::File, raw: &mut Vec<u8>) -> Result<()> {
+    use std::io::{Seek, SeekFrom, Write as _};
+    let tail_start = raw.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+    let tail = &raw[tail_start..];
+    if tail.is_empty() {
+        return Ok(());
+    }
+    if tail_is_whole_line(tail, tail_start == 0) {
+        file.seek(SeekFrom::End(0))
+            .with_context(|| format!("seek to end of {}", path.display()))?;
+        file.write_all(b"\n")
+            .with_context(|| format!("restoring newline in {}", path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("syncing audit log {}", path.display()))?;
+        raw.push(b'\n');
+        return Ok(());
+    }
+    if !tail.iter().all(|b| b.is_ascii_whitespace()) {
+        let sidecar = torn_sidecar_path(path);
+        fs::write(&sidecar, tail)
+            .with_context(|| format!("writing torn-tail sidecar {}", sidecar.display()))?;
+    }
+    file.set_len(tail_start as u64)
+        .with_context(|| format!("truncating torn tail of {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("syncing audit log {}", path.display()))?;
+    raw.truncate(tail_start);
+    Ok(())
+}
+
+/// Sidecars of torn tails set aside next to `path` (see
+/// [`recover_torn_tail`]), sorted by name.
+fn torn_sidecars_of(path: &Path) -> Vec<String> {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return Vec::new();
+    };
+    let prefix = format!("{}.torn-", name.to_string_lossy());
+    let mut found: Vec<String> = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with(&prefix))
+        })
+        .map(|p| p.display().to_string())
+        .collect();
+    found.sort();
+    found
 }
 
 /// Build the schema header line used by LocalFileSink (via `record_at`).
@@ -335,6 +449,12 @@ fn legacy_format_note(hash_format: Option<&str>) -> String {
 /// (`serde_json::Value`, not the typed `FlowRecord`) without weakening
 /// the guarantee.
 pub fn integrity_check_file(path: &Path) -> Result<IntegrityReport> {
+    let mut report = walk_chain(path)?;
+    report.torn_tails = torn_sidecars_of(path);
+    Ok(report)
+}
+
+fn walk_chain(path: &Path) -> Result<IntegrityReport> {
     let contents = fs::read_to_string(path)
         .with_context(|| format!("reading audit log {}", path.display()))?;
     let lines: Vec<&str> = contents.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -349,6 +469,7 @@ pub fn integrity_check_file(path: &Path) -> Result<IntegrityReport> {
             legacy_format: false,
             note: None,
             writer_schema_version: None,
+            torn_tails: Vec::new(),
         });
     }
 
@@ -373,6 +494,7 @@ pub fn integrity_check_file(path: &Path) -> Result<IntegrityReport> {
             legacy_format: true,
             note: Some(legacy_format_note(header_hash_format(header_line).as_deref())),
             writer_schema_version,
+            torn_tails: Vec::new(),
         });
     }
 
@@ -398,6 +520,7 @@ pub fn integrity_check_file(path: &Path) -> Result<IntegrityReport> {
                 legacy_format: false,
                 note: None,
                 writer_schema_version,
+                torn_tails: Vec::new(),
             });
         };
 
@@ -415,6 +538,7 @@ pub fn integrity_check_file(path: &Path) -> Result<IntegrityReport> {
                 legacy_format: false,
                 note: None,
                 writer_schema_version,
+                torn_tails: Vec::new(),
             });
         }
 
@@ -432,6 +556,7 @@ pub fn integrity_check_file(path: &Path) -> Result<IntegrityReport> {
                     legacy_format: false,
                     note: None,
                     writer_schema_version,
+                    torn_tails: Vec::new(),
                 });
             }
         };
@@ -452,6 +577,7 @@ pub fn integrity_check_file(path: &Path) -> Result<IntegrityReport> {
                 legacy_format: false,
                 note: None,
                 writer_schema_version,
+                torn_tails: Vec::new(),
             });
         }
 
@@ -472,6 +598,7 @@ pub fn integrity_check_file(path: &Path) -> Result<IntegrityReport> {
                 legacy_format: false,
                 note: None,
                 writer_schema_version,
+                torn_tails: Vec::new(),
             });
         }
 
@@ -487,6 +614,7 @@ pub fn integrity_check_file(path: &Path) -> Result<IntegrityReport> {
         legacy_format: false,
         note: None,
         writer_schema_version,
+        torn_tails: Vec::new(),
     })
 }
 
@@ -605,6 +733,13 @@ pub struct IntegrityReport {
     /// header is missing or unparseable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub writer_schema_version: Option<String>,
+    /// Sidecar files (`<day file>.torn-<ts>`) holding bytes of an
+    /// incomplete last line that a later append set aside after a crash
+    /// mid-write. Informational: the day file's chain verifies over the
+    /// lines that remain, and the sidecar keeps what was cut so an operator
+    /// can inspect it. Empty (and omitted) when nothing was set aside.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub torn_tails: Vec<String>,
 }
 
 fn is_false(b: &bool) -> bool {

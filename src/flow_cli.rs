@@ -582,6 +582,14 @@ fn print_integrity_check(
                 r.path,
                 style::dim(&format!("({} record(s))", r.records_checked))
             );
+            for sidecar in &r.torn_tails {
+                println!(
+                    "{}",
+                    style::warn(&format!(
+                        "       torn tail set aside after an interrupted write: {sidecar}"
+                    ))
+                );
+            }
             if !r.chain_valid {
                 if let Some(line) = r.break_at_line {
                     println!("{}", style::error(&format!("       chain break at line {line}")));

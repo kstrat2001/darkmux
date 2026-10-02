@@ -5383,6 +5383,119 @@ mod tests {
         }
     }
 
+    // Torn-tail recovery: a crash mid-append must not poison
+    // the chain for every later write. Each tear shape is built by
+    // truncating/extending the raw bytes of a real chain.
+
+    fn torn_chain(n: usize) -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("chain.jsonl");
+        for i in 0..n {
+            let mut rec = minimal_record();
+            rec.handle = format!("rec-{i}");
+            crate::integrity::audit_record_at(&rec, &path).unwrap();
+        }
+        (tmp, path)
+    }
+
+    fn torn_sidecars(path: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let prefix = format!("{}.torn-", path.file_name().unwrap().to_string_lossy());
+        let mut v: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with(&prefix))
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn append_one(path: &std::path::Path, handle: &str) {
+        let mut rec = minimal_record();
+        rec.handle = handle.to_string();
+        crate::integrity::audit_record_at(&rec, path).unwrap();
+    }
+
+    #[test]
+    fn torn_tail_half_record_is_set_aside_and_chain_continues() {
+        let (_t, path) = torn_chain(3);
+        let before = std::fs::read(&path).unwrap();
+        let mut torn = before.clone();
+        let half = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef {\"ts\":\"2025";
+        torn.extend_from_slice(half);
+        std::fs::write(&path, &torn).unwrap();
+
+        append_one(&path, "after");
+
+        let report = integrity_check_file(&path).unwrap();
+        assert!(report.chain_valid, "chain must verify after recovery: {report:?}");
+        assert_eq!(report.records_checked, 4);
+        let sidecars = torn_sidecars(&path);
+        assert_eq!(sidecars.len(), 1);
+        assert_eq!(std::fs::read(&sidecars[0]).unwrap(), half);
+        assert_eq!(report.torn_tails, vec![sidecars[0].display().to_string()]);
+        let after = std::fs::read(&path).unwrap();
+        assert!(after.starts_with(&before), "valid lines must be untouched");
+    }
+
+    #[test]
+    fn torn_tail_cut_inside_hash_prefix_is_set_aside() {
+        let (_t, path) = torn_chain(2);
+        let mut torn = std::fs::read(&path).unwrap();
+        torn.extend_from_slice(b"0123456789abcdef0123");
+        std::fs::write(&path, &torn).unwrap();
+
+        append_one(&path, "after-1");
+        append_one(&path, "after-2");
+
+        let report = integrity_check_file(&path).unwrap();
+        assert!(report.chain_valid, "{report:?}");
+        assert_eq!(report.records_checked, 4);
+        assert_eq!(torn_sidecars(&path).len(), 1);
+    }
+
+    #[test]
+    fn torn_tail_full_record_missing_newline_is_kept_not_glued() {
+        let (_t, path) = torn_chain(3);
+        let mut bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.pop(), Some(b'\n'));
+        std::fs::write(&path, &bytes).unwrap();
+
+        append_one(&path, "after");
+
+        let report = integrity_check_file(&path).unwrap();
+        assert!(report.chain_valid, "a glued tail would break here: {report:?}");
+        assert_eq!(report.records_checked, 4, "the complete record must survive");
+        assert!(torn_sidecars(&path).is_empty(), "nothing was torn, nothing set aside");
+        assert!(report.torn_tails.is_empty());
+    }
+
+    #[test]
+    fn torn_tail_half_header_is_set_aside_and_file_reseeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("chain.jsonl");
+        std::fs::write(&path, b"{\"_type\":\"schema\",\"vers").unwrap();
+
+        append_one(&path, "first");
+
+        let report = integrity_check_file(&path).unwrap();
+        assert!(report.chain_valid, "{report:?}");
+        assert_eq!(report.records_checked, 1);
+        assert_eq!(torn_sidecars(&path).len(), 1);
+    }
+
+    #[test]
+    fn clean_tail_is_untouched_by_an_append() {
+        let (_t, path) = torn_chain(3);
+        let before = std::fs::read(&path).unwrap();
+        append_one(&path, "after");
+        let after = std::fs::read(&path).unwrap();
+        assert!(after.starts_with(&before));
+        assert!(torn_sidecars(&path).is_empty());
+        let report = integrity_check_file(&path).unwrap();
+        assert!(report.chain_valid && report.torn_tails.is_empty());
+    }
+
     // (#1775) The exit-status belt. "Verified" and "could not verify" are
     // DIFFERENT claims, and the automated consumer the docs name — a cron
     // keyed on the exit code — could previously only see the first one.
@@ -5402,6 +5515,7 @@ mod tests {
             legacy_format: legacy,
             note: None,
             writer_schema_version: None,
+            torn_tails: Vec::new(),
         }
     }
 
