@@ -339,6 +339,7 @@ mod tests {
             uid_source: None::<UidSource>,
             liveness: Liveness::Unknown,
             last_beat_ms: None,
+            clock_skew_ms: None,
             received_at_ms: Some(1_000),
             fetch_ms: None,
             card: outcome,

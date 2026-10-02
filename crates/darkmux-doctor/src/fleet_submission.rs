@@ -93,6 +93,10 @@ pub struct FleetSubmissionFacts {
     /// (#2916 stage 2) This machine's resolved `machine_id`: the name a
     /// `profile@machine` address uses for it.
     pub local_machine: Option<String>,
+    /// (#3017) Each machine's clock against the hub's, in milliseconds
+    /// (negative = behind), from its newest presence beat: name and skew.
+    /// Only machines with a beat and a readable hub clock appear.
+    pub clock_skews: Vec<(String, i64)>,
 }
 
 fn check(name: &str, status: Status, message: String, hint: Option<String>) -> Check {
@@ -117,6 +121,7 @@ pub fn fleet_submission_checks(f: &FleetSubmissionFacts) -> Vec<Check> {
         rows.push(trust_row(f));
     }
     rows.extend(f.daemon_hub_link.as_ref().map(hub_link_row));
+    rows.extend(clock_skew_row(f));
     if !f.retired_streams.is_empty() {
         let live: Vec<String> = f
             .queue_consumers
@@ -153,6 +158,31 @@ pub fn fleet_submission_checks(f: &FleetSubmissionFacts) -> Vec<Check> {
         rows.push(check("retired work queue", status, message, Some(hint)));
     }
     rows
+}
+
+/// (#3017) A machine whose clock differs from the hub's by more than
+/// `CLOCK_SKEW_THRESHOLD_MS`, in the same wording `machine list` prints. No
+/// row at all when every clock is within the threshold.
+fn clock_skew_row(f: &FleetSubmissionFacts) -> Option<Check> {
+    let skewed: Vec<String> = f
+        .clock_skews
+        .iter()
+        .filter_map(|(name, ms)| darkmux_flow::presence::clock_skew_words(*ms).map(|w| format!("{name}: {w}")))
+        .collect();
+    if skewed.is_empty() {
+        return None;
+    }
+    Some(check(
+        "clock skew",
+        Status::Warn,
+        skewed.join("; "),
+        Some(
+            "Set the machine's clock to sync automatically (macOS: System Settings > General > Date & Time). \
+             The viewer orders work across machines by the hub's receive order, so runs stay in sequence, \
+             but that machine's own timestamps read off by this much."
+                .to_string(),
+        ),
+    ))
 }
 
 /// The daemon's link to the hub's flow stream. While it is down the daemon
@@ -450,6 +480,7 @@ mod tests {
             daemon_hub_link: None,
             busy: BusyFacts { running: Some(refuse(1)), configured: Some(refuse(1)) },
             local_machine: Some("studio".into()),
+            clock_skews: Vec::new(),
         }
     }
 
@@ -534,6 +565,23 @@ mod tests {
         let rows = fleet_submission_checks(&f);
         assert!(rows.iter().all(|c| c.name != "fleet identity"), "{rows:?}");
         assert_eq!(rows.len(), 3);
+    }
+
+    /// (#3017) Doctor warns on a clock past the threshold, in `machine list`'s
+    /// wording, and says nothing under it.
+    #[test]
+    fn a_clock_skew_warns_only_past_the_threshold() {
+        let rows_for = |skews: Vec<(String, i64)>| {
+            let mut f = facts();
+            f.clock_skews = skews;
+            fleet_submission_checks(&f)
+        };
+        let under = rows_for(vec![("studio".into(), -5_000), ("mini".into(), 0)]);
+        assert!(under.iter().all(|c| c.name != "clock skew"), "{under:?}");
+        let past = rows_for(vec![("studio".into(), -10 * 60 * 1000), ("mini".into(), 1_000)]);
+        let row = row(&past, "clock skew");
+        assert_eq!(row.status, Status::Warn);
+        assert_eq!(row.message, "studio: clock 10m behind the hub");
     }
 
     #[test]

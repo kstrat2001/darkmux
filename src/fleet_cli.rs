@@ -818,6 +818,10 @@ pub(crate) fn fleet_submission_doctor_checks() -> Vec<crate::doctor::Check> {
             }),
         },
         local_machine: darkmux_flow::resolve_machine_id(),
+        clock_skews: {
+            let view = crate::machine_list::local_fleet_view();
+            view.machines.iter().filter_map(|m| Some((crate::machine_list::row_name(&view, m), m.clock_skew_ms?))).collect()
+        },
     };
     crate::doctor::fleet_submission_checks(&facts)
 }

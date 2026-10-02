@@ -37,6 +37,51 @@ pub const DEFAULT_BEAT_INTERVAL_SECS: u64 = 5;
 /// expiry, so the reader never times anything out itself.
 pub const DEFAULT_TTL_SECS: u64 = 15;
 
+/// (#3017) How far a machine's clock may differ from the hub's before the
+/// difference is reported (`darkmux machine list`, `darkmux doctor`): 30
+/// seconds.
+///
+/// A skew is measured as the beat's own timestamp against the hub's clock
+/// when the beat is read, and a beat is up to [`DEFAULT_TTL_SECS`] (15s) old
+/// by then, so a machine with a PERFECT clock still reads up to 15s "behind".
+/// The threshold is twice that, so a healthy machine never reads as skewed and
+/// anything past it is a real difference. It is also far under the minutes a
+/// skew has to reach to reorder a retry or age a live run out of its window.
+pub const CLOCK_SKEW_THRESHOLD_MS: u64 = 2 * DEFAULT_TTL_SECS * 1000;
+
+/// A machine's clock against the hub's, in milliseconds: negative = behind.
+/// `beat_ts_ms` is the machine's own stamp on its newest beat and
+/// `hub_now_ms` the hub's clock at the moment the beat was read.
+pub fn clock_skew_ms(beat_ts_ms: u64, hub_now_ms: u64) -> i64 {
+    beat_ts_ms as i64 - hub_now_ms as i64
+}
+
+/// The sentence for a skew past [`CLOCK_SKEW_THRESHOLD_MS`], the one wording
+/// `machine list` and `doctor` share: `clock 10m behind the hub`. `None` at or
+/// under the threshold, so a healthy fleet prints nothing.
+pub fn clock_skew_words(skew_ms: i64) -> Option<String> {
+    if skew_ms.unsigned_abs() <= CLOCK_SKEW_THRESHOLD_MS {
+        return None;
+    }
+    let secs = skew_ms.unsigned_abs() / 1000;
+    let amount = match secs {
+        s if s < 3600 => format!("{}m", (s + 30) / 60),
+        s => format!("{}h{}m", s / 3600, (s % 3600 + 30) / 60),
+    };
+    let side = if skew_ms < 0 { "behind" } else { "ahead of" };
+    Some(format!("clock {amount} {side} the hub"))
+}
+
+/// The hub's own clock in Unix milliseconds (`TIME`), the reference a beat's
+/// timestamp is measured against.
+pub fn read_hub_time_ms(client: &redis::Client) -> Result<u64> {
+    let mut conn = open_redis_connection_bounded(client, REDIS_CONNECT_TIMEOUT)
+        .context("getting Redis connection for the hub clock")?;
+    bound_redis_response(&conn);
+    let (secs, micros): (u64, u64) = redis::cmd("TIME").query(&mut conn).context("TIME")?;
+    Ok(secs * 1000 + micros / 1000)
+}
+
 /// What a live machine publishes each heartbeat. Kept small (refreshed every
 /// few seconds). The identity key is `machine_uid` (stable hardware id);
 /// `display_name` is the mutable operator label. `specs` is best-effort
@@ -362,6 +407,21 @@ mod tests {
             "read_live took {read_elapsed:?}; expected bounded by \
              REDIS_RESPONSE_TIMEOUT (1s) + connect. Unbounded before #2227."
         );
+    }
+
+    /// (#3017) Past the threshold a skew is said in one wording; at or under it,
+    /// nothing. A healthy clock reads up to a beat TTL behind, and must say nothing.
+    #[test]
+    fn a_skew_is_worded_only_past_the_threshold() {
+        let hub = 1_800_000_000_000u64;
+        let at = |behind_ms: u64| clock_skew_words(clock_skew_ms(hub - behind_ms, hub));
+        assert_eq!(at(0), None);
+        assert_eq!(at(DEFAULT_TTL_SECS * 1000), None, "a perfect clock read from a full-TTL-old beat");
+        assert_eq!(at(CLOCK_SKEW_THRESHOLD_MS), None, "the threshold itself is not past it");
+        assert_eq!(at(CLOCK_SKEW_THRESHOLD_MS + 1000).as_deref(), Some("clock 1m behind the hub"));
+        assert_eq!(at(10 * 60 * 1000).as_deref(), Some("clock 10m behind the hub"));
+        assert_eq!(clock_skew_words(clock_skew_ms(hub + 3 * 60 * 1000, hub)).as_deref(), Some("clock 3m ahead of the hub"));
+        assert_eq!(at(2 * 3600 * 1000 + 5 * 60 * 1000).as_deref(), Some("clock 2h5m behind the hub"));
     }
 
     fn sample_beat() -> PresenceBeat {
