@@ -1978,7 +1978,12 @@ fn any_dispatch_live_in(dir: &std::path::Path, day: &str, now_ms: u64, max_age_m
 /// live however recent that record is.
 fn session_is_live(agg: &SessionAgg, now_ms: u64) -> bool {
     agg.terminal_status.is_none()
-        && crate::run_lifecycle::quiet_clock_live(agg.last_activity_ts.as_deref(), agg.wait_until_ms, now_ms, stale_after_ms())
+        && crate::run_lifecycle::quiet_clock_live(
+            agg.last_activity_ts.as_deref(),
+            agg.wait_until_ms,
+            agg.clock_now_ms.unwrap_or(now_ms),
+            stale_after_ms(),
+        )
 }
 
 /// Representative role/model/route for a lab run's `/runs` row, off its
@@ -2166,6 +2171,15 @@ struct SessionAgg {
     /// terminal. Same raw-ISO-string convention as `start_ts`/`terminal_ts`
     /// — parsed via [`parse_flow_ts`] only where a numeric is needed.
     last_activity_ts: Option<String>,
+    /// (#3017) The clock this session's own machine reads now, in epoch ms:
+    /// its newest presence beat's stamp ([`PeerClocks`]), set only for a
+    /// session from ANOTHER machine that is reporting.
+    /// [`session_is_live`] judges a quiet peer session against it, never
+    /// against this daemon's clock: a peer whose clock runs minutes slow or
+    /// fast would otherwise read abandoned while running, or running long
+    /// after it stopped. `None` for this machine's own sessions (one clock
+    /// already) and for a session with no machine uid, or from a peer with no live beat.
+    clock_now_ms: Option<u64>,
     /// (#2902 step 5) A `budget.wait` was seen: a hosted call held by its
     /// budget before its first bookend is a run.
     has_wait: bool,
@@ -2287,7 +2301,47 @@ fn build_flow_session_index_in(
         std::ops::ControlFlow::Continue(())
     });
     settle_session_index(&mut idx);
+    PeerClocks::read().apply(&mut idx);
     idx
+}
+
+/// (#3017) Each live peer's own clock as of now, in epoch ms, by hardware
+/// uid (case-folded): the timestamp on its newest presence beat. A beat is
+/// refreshed every few seconds and expires with its key, so a peer that has
+/// one is reporting and its beat stamp IS its clock to within the beat
+/// interval. A peer with no live beat is not reporting: it has no entry and
+/// its sessions are judged against this daemon's clock as before, so a
+/// silent peer's runs still age out instead of reading live for good.
+#[derive(Default)]
+struct PeerClocks {
+    now_ms: HashMap<String, u64>,
+}
+
+impl PeerClocks {
+    /// The live peers' clocks, from the shared Redis (empty when it is off or
+    /// unreadable: nothing is corrected then).
+    fn read() -> Self {
+        let Some(url) = darkmux_flow::redis_url() else { return Self::default() };
+        let (beats, _) = crate::read_presence_beats(&url, "runs", darkmux_flow::presence::read_live);
+        Self::from_beats(&beats)
+    }
+
+    fn from_beats(beats: &[darkmux_flow::presence::PresenceBeat]) -> Self {
+        Self { now_ms: beats.iter().map(|b| (b.machine_uid.to_ascii_lowercase(), b.beat_ts_ms)).collect() }
+    }
+
+    /// Give each session of ANOTHER machine that machine's clock. This
+    /// machine's own sessions keep `None`: they already share this daemon's clock.
+    fn apply(&self, idx: &mut HashMap<String, SessionAgg>) {
+        let mine = darkmux_hardware::machine_uid().map(str::to_ascii_lowercase);
+        for agg in idx.values_mut() {
+            let Some(uid) = agg.machine_uid.as_deref().map(str::to_ascii_lowercase) else { continue };
+            if mine.as_deref() == Some(uid.as_str()) {
+                continue;
+            }
+            agg.clock_now_ms = self.now_ms.get(&uid).copied();
+        }
+    }
 }
 
 /// Fold one flow record into its session's [`SessionAgg`]: the one pass
@@ -5080,6 +5134,61 @@ mod tests {
     }
 
     // ── ghost_runs: the staleness gate (#1642, #1633) ───────────────────
+
+    #[test]
+    fn ghost_runs_judge_a_peer_session_by_its_own_clock() {
+        // (#3017) The peer's clock runs 30 minutes SLOW: its live session's
+        // last record reads 30 minutes older than this daemon's `now`, past
+        // the staleness budget, yet the peer's own clock says it just wrote it.
+        let base_ts = "2000-01-01T00:00:00Z";
+        let base_ms = parse_flow_ts(base_ts).unwrap() * 1_000;
+        let daemon_now = base_ms + 30 * 60 * 1_000;
+        let session = |clock_now_ms: Option<u64>| {
+            let mut idx = HashMap::new();
+            idx.insert(
+                "peer-sess".to_string(),
+                SessionAgg { has_start: true, last_activity_ts: Some(base_ts.to_string()), clock_now_ms, ..Default::default() },
+            );
+            ghost_runs(&idx, &HashSet::new(), &HashSet::new(), &HashSet::new(), daemon_now)
+        };
+        assert_eq!(session(None)[0].status, RunStatus::Abandoned, "judged by this daemon's clock it is 30 minutes quiet");
+        assert_eq!(session(Some(base_ms + 1_000))[0].status, RunStatus::Running, "its own clock says it just wrote");
+        // And the other way: the peer's own clock moved on past the budget, so
+        // a session that has been quiet that long on ITS clock has stopped.
+        let quiet = session(Some(base_ms + stale_after_ms() + 1_000));
+        assert_eq!(quiet[0].status, RunStatus::Abandoned);
+    }
+
+    /// (#3017) A peer with a live presence beat gets that beat's stamp as its
+    /// clock; a peer with none (not reporting) and this machine keep this
+    /// daemon's clock.
+    #[test]
+    fn a_reporting_peers_sessions_get_its_beat_clock() {
+        let sess = |uid: &str| SessionAgg { machine_uid: Some(uid.to_string()), ..Default::default() };
+        let mut idx = HashMap::new();
+        idx.insert("slow".to_string(), sess("PEER-UID-0001"));
+        idx.insert("silent".to_string(), sess("GONE-UID-0002"));
+        idx.insert("mine".to_string(), sess(darkmux_hardware::machine_uid().unwrap_or("local")));
+        idx.insert("anon".to_string(), SessionAgg::default());
+        let beat = |uid: &str, ts: u64| darkmux_flow::presence::PresenceBeat {
+            machine_uid: uid.to_string(),
+            display_name: "darkbook".into(),
+            schema_version: "2.0.0".into(),
+            beat_ts_ms: ts,
+            specs: None,
+            darkmux_version: None,
+            fleet_mode: None,
+        };
+        let mut beats = vec![beat("peer-uid-0001", 1_000_000)];
+        if let Some(me) = darkmux_hardware::machine_uid() {
+            beats.push(beat(me, 5_000_000));
+        }
+        PeerClocks::from_beats(&beats).apply(&mut idx);
+        assert_eq!(idx["slow"].clock_now_ms, Some(1_000_000), "uids compare case-insensitively");
+        assert_eq!(idx["silent"].clock_now_ms, None, "no live beat: not reporting, judged by this daemon's clock");
+        assert_eq!(idx["mine"].clock_now_ms, None, "this machine's own sessions keep this machine's clock");
+        assert_eq!(idx["anon"].clock_now_ms, None);
+    }
 
     #[test]
     fn ghost_runs_fresh_session_is_running_stale_session_is_abandoned() {
