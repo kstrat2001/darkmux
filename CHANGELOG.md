@@ -64,7 +64,7 @@ darkmux release.
 
 5.0 is the compatibility break. Code whose only job was to read or report a
 pre-5.0 shape is deleted. The retired config-key and environment-variable
-refusals stay (`RETIRED_SETTINGS`). The renames a 4.x install has to apply by
+refusals stay (`RETIRED_SETTINGS`). The renames a 3.x home has to apply by
 hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`).
 
 - **Retired verbs and flags get clap's own error.** The table that refused
@@ -77,9 +77,10 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   launches a workload called `list`). The replacements are listed in the
   upgrade skill.
 - **A mission state file in an old spelling is no longer refused or reported.**
-  A `mission.json` with `sprint_ids` loads as a mission with no phases, a task
-  file with `sprint_id` loses its phase, a `sprints/` directory is not read,
-  and a status of `closed` or `paused` reads as an unknown status (the
+  A `mission.json` with `sprint_ids` loads as a mission with no phases. A task
+  file with `sprint_id` does not load, because `phase_id` is required, and the
+  load of that phase's whole task list fails with it. A `sprints/` directory
+  is not read, and a status of `closed` or `paused` reads as an unknown status (the
   `paused` alias is gone). `darkmux doctor` no longer has the `mission state
   files` row. A state file from a newer darkmux is still refused.
 - **`darkmux doctor` stops reporting the old layouts.** The rows `beat-33
@@ -87,10 +88,12 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   (mission-compiler, scribe)` are gone, and the skills row no longer warns on
   an installed skill the binary stopped shipping. State under `<root>/crew/`
   stays invisible and is not named.
-- **Lab runs left in `<root>/runs` are not read and not named.** Every lab
+- **Lab runs left in `<root>/runs` are not read and not named.** 3.13 wrote
+  lab runs to `<root>/runs`, so every 3.x upgrader has them there. Every lab
   verb, `darkmux run list --kind lab` and `darkmux serve` used to refuse or
   warn with the `mv` that moves them; now `run list --kind lab` shows none of
-  them. `GET /lab/runs` loses its `pending_move` field and the `serve` banner
+  them, with no warning. Move the directory yourself (step 5 of the upgrade
+  skill has the exact commands). `GET /lab/runs` loses its `pending_move` field and the `serve` banner
   its move line.
 - **`darkmux init` no longer prunes retired skills.** A leftover `darkmux-*`
   skill directory the binary stopped shipping stays installed until you delete
@@ -107,7 +110,7 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   `crawl.summary` steps under those names, and an archived `crawl.unit-outcome`
   output is refused as the wrong producer. A mission config that names a retired
   step kind is still refused, naming the new id.
-- **Pre-4.0 session ids attribute to nothing.** The free-form strings
+- **3.x session ids attribute to nothing.** The free-form strings
   (`task-<id>`, `step-<id>[-<mission>]`, `mission-run-<mission>-<phase>`) in an
   old flow archive are not sessions: `flow tail` shows `-` for their run,
   `/flow-mission` does not name their step, the mission graph does not fold
@@ -118,7 +121,7 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   sandbox it names, a pre-2.0 openclaw reply envelope is no longer unwrapped,
   and an openclaw trajectory line is no longer forced to an unknown event.
 - **The viewer draws no host-load track from a retired record.** A
-  `telemetry.process` record in a pre-4.0 archive no longer feeds the machine
+  `telemetry.process` record in a 3.x archive no longer feeds the machine
   drawer, the mission header's host readout or a run's SYSTEM pane (current
   `machine.telemetry` is unchanged), and a mission step whose kind starts with
   `review.` gets no AI styling from its name.
@@ -126,7 +129,10 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   `remote_budgets` key, a `remote` seat flag on an archived staffing snapshot
   or `step result` record, and a peer card's `seats.hosted` key are no longer
   read as their `dispatch_budgets` / `unmanaged` successors: the budget rows
-  and the unmanaged flag read as empty or false, and a card still carrying
+  and the unmanaged flag read as empty or false (every review envelope already
+  on disk spells `remote_budgets`, so none can read as a partial run on a
+  judge-stage skip any more, and that dead branch of `review_outcome` is
+  deleted), and a card still carrying
   `hosted` shows its peer as unavailable. The 1.0 and 1.1 card fixtures are
   deleted with the alias.
 - **A pre-2.6 audit file is no longer verified.** `darkmux flow integrity-check`

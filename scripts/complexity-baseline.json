@@ -112,7 +112,6 @@
   "src/fleet_cli.rs::cmd_machine_add": 23,
   "src/fleet_cli.rs::fleet_submission_doctor_checks": 18,
   "src/fleet_cli.rs::trust_at": 30,
-  "src/flow_cli.rs::print_integrity_check": 19,
   "src/init.rs::ensure_session_start_hook": 17,
   "src/init.rs::init": 24,
   "src/main.rs::cmd_init": 31,

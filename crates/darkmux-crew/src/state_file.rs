@@ -11,7 +11,7 @@ use anyhow::{bail, Context, Result};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-/// Which state file a document is, and so which retired spellings apply.
+/// Which state file a document is, and so which schema version applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StateKind {
     Mission,

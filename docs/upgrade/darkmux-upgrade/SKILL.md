@@ -35,7 +35,7 @@ $NEW --version    # must report the new major; if not, you have the wrong binary
 $NEW doctor
 ```
 
-`doctor` and `config` are the only commands that run while a retired env var is set; every other command refuses. Doctor's failures are the work list for config, profiles, mission configs, workloads and fixtures. Steps 5 to 7b are not reported by doctor: check them yourself. The steps below are in the order that worked, but doctor is the authority on what applies to the files it names.
+`doctor` and `config` run whatever retired env vars are set. Every other command refuses to start while one of the three refused vars is set (`DARKMUX_CREW_DIR`, `DARKMUX_REMOTE_MAX_TOKENS_PER_STEP`, `DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION`), and only warns, then carries on, for the others (step 2 lists them). Doctor's failures are the work list for config, profiles, mission configs, workloads and fixtures. Steps 5 to 7b are not reported by doctor: check them yourself. The steps below are in the order that worked, but doctor is the authority on what applies to the files it names.
 
 The row `user file keys: profiles.json` lists every refused key in that file at once, so read the whole row before editing. Still expect to run doctor several times: fixing one file can reveal the next.
 
@@ -66,10 +66,15 @@ If 3.x must keep running, upgrade a copy instead of the live home. Copy it (as i
 
 ## Step 2: The shell rc and open shells
 
-A retired env var is refused at start. `DARKMUX_NOTEBOOK_DIR` (retired in 4.0, #2913) is the common one; `DARKMUX_CREW_DIR` and `DARKMUX_RADIO_ROUTER_PROFILE` are refused the same way. `DARKMUX_REMOTE_MAX_TOKENS_PER_STEP` and `DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION` are refused too (ignoring a spend cap would remove it); `DARKMUX_REMOTE_STEP_BUDGET_POLICY` and `DARKMUX_REMOTE_CONCURRENT_CAP` only warn and are ignored. Their limits moved to the endpoint (step 4d); remove all four exports the same way. Doctor's row `retired env vars (4.0)` names each one it finds.
+A retired env var is either refused or ignored with a warning, by whether ignoring it is safe (`RETIRED_SETTINGS` in `darkmux_types::config`, applied at the CLI entry for every command except `doctor` and `config`):
+
+- **Refused: the command does not start.** `DARKMUX_CREW_DIR` (state location: `DARKMUX_HOME` is the one root now), and `DARKMUX_REMOTE_MAX_TOKENS_PER_STEP` and `DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION` (ignoring a spend cap would remove it; the limits moved to the endpoint, step 4d).
+- **Warned and ignored: the command runs, printing `env var ... is ignored: ...`.** `DARKMUX_NOTEBOOK_DIR`, `DARKMUX_RADIO_ROUTER_PROFILE`, `DARKMUX_ACK_DIR`, `DARKMUX_LOG`, `DARKMUX_REMOTE_STEP_BUDGET_POLICY`, `DARKMUX_REMOTE_CONCURRENT_CAP`, `DARKMUX_MACHINE_ROLLUP_ENABLED` and `DARKMUX_MACHINE_ROLLUP_PERIOD_SECONDS`.
+
+Remove every one you find the same way. Doctor's row `retired env vars (4.0)` names each one it finds.
 
 1. Find the `export` line in the user's shell rc (`~/.zshrc`, `~/.bashrc`, or a file it sources) and remove it with the Edit tool. It is the user's file: show the line you removed. If they use the same name for something outside darkmux, say so and let them decide. **If 3.x keeps running on this machine, leave the export in place** (3.x still reads it) and prefix each new-binary command with `env -u DARKMUX_NOTEBOOK_DIR` instead.
-2. **Trap: an already-open shell keeps the old value.** The new binary refuses to start in that shell even after the rc is fixed. Open a new terminal, run `unset DARKMUX_NOTEBOOK_DIR` in the current one, or prefix commands with `env -u DARKMUX_NOTEBOOK_DIR`. Re-sourcing `.zshrc` may print harmless `compdef` noise.
+2. **Trap: an already-open shell keeps the old value.** A refused var (`DARKMUX_CREW_DIR`, the two `DARKMUX_REMOTE_MAX_TOKENS_*` vars) keeps the new binary from starting in that shell even after the rc is fixed, and a warned one keeps printing its warning. Open a new terminal, run `unset <VAR>` in the current one, or prefix commands with `env -u <VAR>`. Re-sourcing `.zshrc` may print harmless `compdef` noise.
 
 ## Step 3: `config.json`
 
@@ -182,9 +187,17 @@ A `dispatch.map` step's `bucket_group` or `bucket_budget` in a mission config is
 
 After this step, `darkmux doctor` should load `profiles.json`. If a row still fails, read it and repeat 4a to 4d for what it now names.
 
-## Step 5: Lab runs
+## Step 5: Lab runs (everyone upgrading from 3.x: do not skip)
 
-darkmux no longer checks for lab runs in the old place. 4.0 reads `<root>/lab`, and a `<root>/runs` that still holds runs is simply not read, so `darkmux run list --kind lab` shows none of them. Move them yourself, never overwriting: `mv -n <root>/runs <root>/lab`, or `rmdir <root>/lab && mv -n <root>/runs <root>/lab` when an empty `lab` already exists. When runs are on both sides, merge entry by entry with `mv -n` and report any name that stayed behind.
+3.13 wrote lab runs to `<root>/runs`. 5.0 reads `<root>/lab` and no longer checks the old place, so runs left in `<root>/runs` are simply not read: `darkmux run list --kind lab` shows none of them, with no warning. Move them yourself, never overwriting:
+
+```bash
+ls "$ROOT/runs" "$ROOT/lab" 2>&1 | head        # what is on each side
+mv -n "$ROOT/runs" "$ROOT/lab"                 # when "$ROOT/lab" does not exist
+rmdir "$ROOT/lab" && mv -n "$ROOT/runs" "$ROOT/lab"   # when an empty "$ROOT/lab" already exists
+```
+
+When runs are on both sides, merge entry by entry (`mv -n "$ROOT/runs"/* "$ROOT/lab"/`, then `rmdir "$ROOT/runs"`, which fails loudly on anything skipped) and report any name that stayed behind. If `DARKMUX_LAB_DIR` or `dirs.lab` is set, the lab directory is that path instead of `<root>/lab`: use it as the destination.
 
 ## Step 6: The old `crew/` layout
 
@@ -199,7 +212,7 @@ darkmux no longer checks for state under `<root>/crew/`, and the loader resolves
 
 ## Step 7: Mission state under `missions/<id>/`
 
-darkmux no longer refuses a mission file in an old spelling, so each of these goes unnoticed until you look: a `mission.json` that still says `sprint_ids` loads as a mission with no phases. Check for the old spellings and rename them:
+darkmux no longer refuses a mission file in an old spelling, so each of these goes unnoticed until you look. A `mission.json` that still says `sprint_ids` loads as a mission with no phases. A task file that still says `sprint_id` does not load at all, because `phase_id` is required: the load of that phase's whole task list fails, so the phase shows no tasks and its steps cannot run. The `jq` rename below is the remedy for both. Check for the old spellings and rename them:
 
 | In | Old | New |
 |---|---|---|
@@ -232,9 +245,9 @@ darkmux used to find and name these. It now ignores them, so check once by hand:
 <!-- flow-action-guard:allow-start — names the retired spellings to say what they now read as -->
 - **Retired verbs.** A script that calls one now gets the usual unrecognized-subcommand error instead of a message naming the replacement. The replacements: `mission dispatch`, `mission add-phase`, `mission start`, `mission pause` and `mission resume` are gone (use `mission launch <config>`, `mission abort <id>` and `mission finalize <id>`); `lab run list|inspect|stats|compare` became `darkmux run list --kind lab`, `run inspect`, `run stats` and `run compare`; `lab eval` became `lab run <workload>` and `mission launch review`; `finding list --dispatch` is `--execution`; `--session-id` and `--session` on `dispatch`, `flow` and `memory correction list` are `--name` and `--execution`; `--runs` is `--repeat`; `mission status --missions` is `--named`; `dispatch --phase-id` is gone; `swap`, `status`, `model` and `fleet` folded into `machine` (`machine status`, `machine eject`, `machine list`); `lessons` is `memory lesson`.
 <!-- flow-action-guard:allow-end — names the retired spellings to say what they now read as -->
-- **Pre-2.6.0 audit files** (the struct-hash format) are no longer verified: `darkmux flow integrity-check` reports one as a break at line 1 (exit 2) and `darkmux doctor` fails the audit row, instead of a "legacy" warning. The `--strict` flag and exit 3 are gone. Archive the file (move it aside) so a fresh chain starts.
+- **Pre-2.6.0 audit files** (the struct-hash format: a header with no `hash_format`) are no longer verified. `darkmux flow integrity-check` reports each as a break at line 1 with 0 records checked (exit 2), `darkmux doctor` fails its `audit integrity` row naming the file, and the audit sink refuses to extend such a file. Nothing is recomputed, so this is not evidence of editing. The old "legacy" warning, `--strict` and exit 3 are gone. Archive the file (`mv -n` it aside) so a fresh chain starts; a torn-tail warning is separate and unchanged.
 <!-- flow-action-guard:allow-start — names the retired spellings to say what they now read as -->
-- **Pre-4.0 flow archives.** Their free-form session ids (`task-<id>`, `mission-run-<m>-<p>`, `step-<id>`) are not read as sessions, and records in a retired action spelling read as an unknown action: they stay on disk and show in the event log, but attach to no mission, and no host-load track is drawn from a pre-4.0 `telemetry.process` record.
+- **Flow archives written by 3.x.** Their free-form session ids (`task-<id>`, `mission-run-<m>-<p>`, `step-<id>`) are not read as sessions, and records in a retired action spelling read as an unknown action: they stay on disk and show in the event log, but attach to no mission, and no host-load track is drawn from a pre-4.0 `telemetry.process` record.
 <!-- flow-action-guard:allow-end — names the retired spellings to say what they now read as -->
 
 ## Step 8: Mission configs, workloads, fixtures

@@ -448,78 +448,14 @@ fn usize_is_zero(n: &usize) -> bool {
 ///   bundle/probe stage, or the `strict` judge-exhaustion policy opting back
 ///   into the pre-#1876 behavior via `judge_gate_outcome`'s Gate 1) — the
 ///   SAME condition that has always meant "produced no signal."
-/// - [`RunOutcome::Partial`] — `env.degenerate` is `None` but at least one
-///   `dispatch_budgets` row for a JUDGE stage (`"judge-pass1"`/`"judge-pass2"`)
-///   carries `skipped_calls > 0`. Only an envelope recorded before 4.0 can
-///   (#2902 step 5: no call is skipped for budget any more); it is kept so
-///   those still read as they did. This is the #1876 fix's own case: the
-///   judge stage's remote token bucket ran out before the whole docket was
-///   judged, but usable rulings exist. Scoped to judge stages ONLY —
-///   probe-stage exhaustion already renders as a "reduced coverage" warning
-///   on a healthy run (never touched `env.degenerate`, nothing to fix), and
-///   verify-stage exhaustion already renders normally with its own
-///   `env.warnings` note (`run_verify_stage` never sets `env.degenerate`
-///   either) — folding those into `Partial` too would double-announce an
-///   already-correct treatment, not fix a bug.
-/// - [`RunOutcome::Complete`] — neither of the above.
+/// - [`RunOutcome::Complete`] — otherwise. (`Partial` is not produced here:
+///   it needed a judge-stage budget skip, which only an envelope recorded
+///   before 4.0 carried, under a key 5.0 no longer reads.)
 pub fn review_outcome(env: &ReviewEnvelope) -> RunOutcome {
     if let Some(reason) = &env.degenerate {
         return RunOutcome::Empty { reason: reason.clone() };
     }
-    let reasons: Vec<String> = env
-        .dispatch_budgets
-        .iter()
-        // (#1876/#1877 QA follow-up) Exact stage names, not a `starts_with`
-        // prefix — a future `judge-*` row that ISN'T one of the two real
-        // stages should never silently flip a run to Partial by accident.
-        .filter(|r| matches!(r.stage.as_str(), "judge-pass1" | "judge-pass2") && r.skipped_calls > 0)
-        .map(|r| judge_budget_shortfall_reason(env, r))
-        .collect();
-    if reasons.is_empty() {
-        RunOutcome::Complete
-    } else {
-        RunOutcome::Partial { reasons }
-    }
-}
-
-/// (#1876/#1877 QA follow-up) `judge-pass1` and `judge-pass2` skips mean
-/// DIFFERENT things and need different wording — conflating them was a
-/// real bug this function's own predecessor had. A pass-1 skip means the
-/// flag NEVER got a ruling at all (`budget_exhausted_outcome` -> `Error` ->
-/// excluded from `usable`, per `judge_gate_outcome`'s own filter) — the
-/// flag is genuinely unjudged. A pass-2 skip means the flag's pass-1
-/// ALREADY ruled it `Confirmed`; only the CONFIRMATION pass was skipped,
-/// which the (since-deleted) funnel's confirmation stage demoted to
-/// `Tier::NeedsCheck` (`demoted_by_pass2 = true`) — that flag WAS judged
-/// and DOES render, just at a lower tier than a from-scratch double-confirm
-/// would have given it. Reporting a pass-2 skip as "N flags went unjudged"
-/// (the pass-1 wording) would be factually wrong on both halves: the flags
-/// were judged, and `env.judged.len()` is the wrong denominator (pass-2's
-/// docket is pass-1's CONFIRMS, not the whole run).
-fn judge_budget_shortfall_reason(env: &ReviewEnvelope, r: &DispatchBudgetRecord) -> String {
-    // (#1876/#1877 QA follow-up) "{used} of {max} tokens used" reads like a
-    // typo when `used` overshoots `max` — which it routinely does, by
-    // design: the ceiling is SOFT (`DispatchBudget`'s own module doc), so a
-    // grant can land a reply that reports usage slightly above what was
-    // admitted. "exceeded its N-token allowance" states the same fact
-    // without inviting a "did you mean 500000 of 500497?" double-take.
-    if r.stage == "judge-pass1" {
-        format!(
-            "{} of {} flags went unjudged on the `judge-pass1` stage — it exceeded its {}-token \
-             allowance ({} used)",
-            r.skipped_calls,
-            env.judged.len(),
-            r.max_tokens,
-            r.used_tokens
-        )
-    } else {
-        format!(
-            "{} confirmed finding(s) were conservatively demoted to needs-check because their \
-             confirmation pass was skipped on the `judge-pass2` stage — it exceeded its {}-token \
-             allowance ({} used)",
-            r.skipped_calls, r.max_tokens, r.used_tokens
-        )
-    }
+    RunOutcome::Complete
 }
 
 /// (#1877 item 2) Review's OWN predicate mapping from its envelope fields
@@ -531,12 +467,9 @@ fn judge_budget_shortfall_reason(env: &ReviewEnvelope, r: &DispatchBudgetRecord)
 /// a thin wrapper around it, because the two answer different questions
 /// with different consumers:
 ///
-/// - [`review_outcome`] answers "did every item in the docket get a
-///   ruling" for the PR-COMMENT banner (`src/pr_review.rs`'s
-///   `synthesize_review`) — narrowly scoped to judge-stage coverage on
-///   purpose (see its own doc: probe/verify-stage warnings already render
-///   normally and folding them in would double-announce an
-///   already-correct treatment).
+/// - [`review_outcome`] answers "did the run produce any signal" for the
+///   PR-COMMENT banner (`src/pr_review.rs`'s `synthesize_review`): empty
+///   when the envelope is degenerate, else complete.
 /// - This function answers "does the MISSION BOARD need to flag this run"
 ///   — the question `review_result_to_mission_envelope` has always
 ///   answered via two signals that predate `RunOutcome` entirely:
@@ -551,7 +484,7 @@ fn judge_budget_shortfall_reason(env: &ReviewEnvelope, r: &DispatchBudgetRecord)
 /// degenerate run (today `Clean`; `review_outcome` would call it `Empty` ->
 /// `Degenerate`) and a probe/verify-only warning with no judge-stage skip
 /// (today `Degraded`; `review_outcome` would call it `Complete` -> `Clean`,
-/// since its `Partial` predicate is judge-stage-scoped by design). This
+/// since it never reads `env.warnings`). This
 /// function exists so that does NOT happen — every existing
 /// `review_result_to_mission_envelope` test still gets the SAME status it
 /// got before #1877, because this function reproduces that same predicate,
@@ -645,7 +578,7 @@ mod tests {
     /// `review_outcome`/`review_mission_outcome` have no production caller
     /// left (the funnel that called them is deleted) — so they are TESTED
     /// rather than left as unexercised code: a recorded envelope with no
-    /// degenerate reason, no warnings and no judge-budget shortfall is a
+    /// degenerate reason and no warnings is a
     /// COMPLETE run under both mappings.
     #[test]
     fn both_outcome_mappings_read_a_clean_recorded_envelope_as_complete() {

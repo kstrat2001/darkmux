@@ -154,8 +154,7 @@ pub fn user_state_root() -> PathBuf {
 }
 
 /// A user-state subdirectory: `<root>/<subdir>/`. The pre-Beat-33
-/// `<root>/crew/<subdir>/` layout is not read; `darkmux doctor` fails on it
-/// and prints the move script.
+/// `<root>/crew/<subdir>/` layout is not read.
 fn user_subdir(subdir: &str) -> PathBuf {
     user_state_root().join(subdir)
 }

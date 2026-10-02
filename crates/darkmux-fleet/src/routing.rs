@@ -73,7 +73,7 @@ use crate::job::{Boundary, SingleShotJob};
 use darkmux_crew::dispatch::{self, DispatchOpts, DispatchResult, RoutingDecision};
 
 /// Route a dispatch local-vs-remote, then run it locally via the raw
-/// `crew::dispatch::dispatch` primitive. `phase_cli`'s QA-gate dispatch is
+/// `crew::dispatch::dispatch` primitive. `phase_review`'s QA-gate dispatch is
 /// the one caller: it is reached only from an already-wave-protected
 /// `StepKind` whose `seat()` resolved residency for the whole wave, so it must
 /// not independently Exclusive-reconcile (see `dispatch_reconciled`'s own
@@ -128,7 +128,7 @@ fn address_label(opts: &DispatchOpts, target: &str) -> String {
 /// (with `--wait`) replies with the result. Otherwise the dispatch falls
 /// through to `local_dispatch`, a caller-injected LOCAL execution primitive
 /// (#1509): the CLI verb passes `dispatch_as_crew_of_one`, radio passes its
-/// single-shot primitive, `phase_cli` the raw one via [`dispatch_routed`].
+/// single-shot primitive, `phase_review` the raw one via [`dispatch_routed`].
 pub fn dispatch_routed_via(
     opts: DispatchOpts,
     local_dispatch: impl FnOnce(DispatchOpts) -> Result<DispatchResult>,
