@@ -1130,8 +1130,7 @@ pub fn max_stall_recoveries_with_source() -> (Option<u32>, Source) {
     pick_parsed_with_source("DARKMUX_RUNTIME_MAX_STALL_RECOVERIES", cfg, None)
 }
 
-/// Every renamed or retired setting (`config::RENAMED_SETTINGS`,
-/// `config::RETIRED_SETTINGS`) whose env var is still set. The ONE refusal of
+/// Every retired or renamed setting (`config::RETIRED_SETTINGS`) whose env var is still set. The ONE refusal of
 /// them is `refuse_retired_env`, called once at CLI entry; `doctor` reads this
 /// list to report them. A leftover `config.json` key is judged by its value
 /// instead: refused as an unknown key, or only warned about at its old default

@@ -22,9 +22,6 @@ impl WorkloadProvider for PromptProvider {
     fn id(&self) -> &'static str {
         "prompt"
     }
-    fn description(&self) -> &'static str {
-        "Trivial provider: dispatch a single prompt, capture reply, optionally check keywords."
-    }
     fn dispatch_role(&self, loaded: &LoadedWorkload) -> Option<String> {
         Some(pick_role(loaded))
     }
@@ -166,8 +163,6 @@ pub(crate) fn finish_run(f: &FinishInputs<'_>, d: &Dispatched) -> Result<RunResu
         escalation: end.escalation().map(str::to_string),
         ok: end.ok(),
         duration_ms: f.duration_ms,
-        payload_text: Some(reply),
-        trajectory_path: None,
         verify,
         error: d.error(),
     })
@@ -452,7 +447,6 @@ mod tests {
     fn make_loaded(spec: WorkloadSpec, base_dir: PathBuf) -> LoadedWorkload {
         LoadedWorkload {
             manifest: WorkloadManifest { schema_version: None, workload: spec },
-            manifest_path: base_dir.join("workload.json"),
             base_dir,
             source: WorkloadSource::OnDisk,
         }
@@ -551,7 +545,6 @@ mod tests {
     fn provider_metadata() {
         let p = PromptProvider;
         assert_eq!(p.id(), "prompt");
-        assert!(p.description().contains("prompt"));
     }
 
     #[test]

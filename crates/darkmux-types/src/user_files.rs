@@ -1013,16 +1013,10 @@ pub fn open_objects<T: JsonSchema>() -> Vec<String> {
         .collect()
 }
 
-/// `config.json`'s retired keys: a renamed setting names its new key, a
-/// removed one says so and what to do.
+/// `config.json`'s retired keys: the line says what replaced the key (a rename names
+/// the new one) or that it was removed, and what to do.
 pub fn config_retired(path: &str) -> Option<String> {
-    crate::config::RENAMED_SETTINGS
-        .iter()
-        .find(|r| r.old_key == path)
-        .map(|r| format!("renamed to `{}` in 4.0 (#2902); {}", r.new_key, r.advice))
-        .or_else(|| {
-            crate::config::RETIRED_SETTINGS.iter().find(|r| r.key == path).map(|r| r.line.to_string())
-        })
+    crate::config::RETIRED_SETTINGS.iter().find(|r| r.key == path).map(|r| r.line.to_string())
 }
 
 /// A retired `config.json` key still holding a value ignoring which changes

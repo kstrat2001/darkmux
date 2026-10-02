@@ -45,9 +45,6 @@ impl WorkloadProvider for ScriptedProvider {
     fn id(&self) -> &'static str {
         SCRIPTED
     }
-    fn description(&self) -> &'static str {
-        "scripted stub for lab_run's harness branches"
-    }
     fn setup(&self, _: &LoadedWorkload, _: &Path, _: &Path) -> Result<()> {
         let s = SCRIPT.lock().unwrap().clone().unwrap_or_default();
         if s.setup_err {
@@ -93,8 +90,6 @@ impl WorkloadProvider for ScriptedProvider {
             escalation: s.escalation.clone(),
             ok: s.ok,
             duration_ms: 2_000,
-            payload_text: None,
-            trajectory_path: None,
             verify: s.verify.map(|passed| VerifyOutcome { passed, details: "scripted".into() }),
             error: if s.ok { None } else { Some("scripted error".into()) },
         })
@@ -643,8 +638,6 @@ fn run_notes_name_an_unexplained_failure() {
         escalation: None,
         ok: false,
         duration_ms: 61_999,
-        payload_text: None,
-        trajectory_path: None,
         verify: Some(VerifyOutcome { passed: false, details: "2 failing".into() }),
         error: None,
     };
@@ -716,8 +709,6 @@ fn an_escalated_run_is_counted_and_labeled_as_an_escalation_not_an_error() {
         escalation: Some("escalation_compaction_reread_loop".into()),
         ok: false,
         duration_ms: 232_000,
-        payload_text: None,
-        trajectory_path: None,
         verify: None,
         error: Some("runtime exit: dispatching to model".into()),
     };

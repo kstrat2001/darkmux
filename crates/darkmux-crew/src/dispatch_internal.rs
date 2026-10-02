@@ -2654,13 +2654,11 @@ impl<'a> DispatchBookendGuard<'a> {
         self.inner.close(DISPATCH_BOOKEND_UNIT, finished);
     }
 
-    /// Kept for a caller that emits its own terminal record through a
-    /// different path and just needs to silence the Drop backstop — no
-    /// production call site needs this anymore (`close()` now disarms
-    /// itself), but the test suite exercises this path directly to prove
-    /// the disarm-suppresses-the-backstop behavior still holds through the
-    /// wrapper.
-    #[allow(dead_code)]
+    /// Silence the Drop backstop without emitting a terminal record. No
+    /// production call site needs it (`close()` disarms itself); the tests
+    /// use it to prove the disarm-suppresses-the-backstop behavior holds
+    /// through the wrapper.
+    #[cfg(test)]
     fn disarm(&mut self) {
         self.inner.disarm();
     }

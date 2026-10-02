@@ -118,6 +118,25 @@ pub enum RunStatus {
     Unparseable,
 }
 
+impl RunStatus {
+    /// The status word, exactly as it serializes on the wire and as the UI shows it
+    /// (the run board's `runStatusLabel` passes it through). The one place the words are
+    /// spelled for a non-serde reader (`darkmux run list`, `mission show`); a test pins it to the
+    /// serde name so the two cannot drift.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RunStatus::Planned => "planned",
+            RunStatus::Running => "running",
+            RunStatus::Complete => "complete",
+            RunStatus::Degraded => "degraded",
+            RunStatus::Error => "error",
+            RunStatus::Escalated => "escalated",
+            RunStatus::Abandoned => "abandoned",
+            RunStatus::Unparseable => "unparseable",
+        }
+    }
+}
+
 /// (#1907) Which of two genuinely different situations produced a
 /// [`RunStatus::Abandoned`] row — see [`Run::abandoned_reason`]'s own doc
 /// for the wire contract and each construction site
@@ -2764,6 +2783,23 @@ mod tests {
     use darkmux_crew::types::{MissionSpec, NodeStatus, PhaseStatus};
     use std::io::Write;
     use tempfile::TempDir;
+
+    /// The status word every non-serde reader prints is the wire word the UI shows.
+    #[test]
+    fn run_status_as_str_is_the_serde_name() {
+        for st in [
+            RunStatus::Planned,
+            RunStatus::Running,
+            RunStatus::Complete,
+            RunStatus::Degraded,
+            RunStatus::Error,
+            RunStatus::Escalated,
+            RunStatus::Abandoned,
+            RunStatus::Unparseable,
+        ] {
+            assert_eq!(serde_json::to_value(st).unwrap(), serde_json::json!(st.as_str()));
+        }
+    }
 
     // ── parse_flow_ts / civil calendar round-trip ───────────────────────
 

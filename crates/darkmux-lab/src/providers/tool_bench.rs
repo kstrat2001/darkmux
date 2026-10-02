@@ -926,10 +926,6 @@ impl WorkloadProvider for ToolBenchProvider {
     fn id(&self) -> &'static str {
         "tool-bench"
     }
-    fn description(&self) -> &'static str {
-        "Tool-call bench: nonce-provenance-scored tasks per axis (selection, arguments, \
-         chaining, recovery, termination) dispatched through the internal runtime."
-    }
     fn dispatch_role(&self, loaded: &LoadedWorkload) -> Option<String> {
         Some(bench_role(loaded))
     }
@@ -1276,8 +1272,6 @@ impl WorkloadProvider for ToolBenchProvider {
             escalation: None,
             ok: true,
             duration_ms,
-            payload_text: Some(summary),
-            trajectory_path: None,
             verify: Some(VerifyOutcome {
                 // The bench "passes" when the MEASUREMENT is valid (no infra
                 // failures) — model quality lives in the rows, not here.
@@ -2328,7 +2322,6 @@ not json — tolerated
             serde_json::from_str(&manifest_json.to_string()).expect("test workload manifest parses");
         LoadedWorkload {
             manifest,
-            manifest_path: PathBuf::new(),
             base_dir: PathBuf::new(),
             source: crate::workloads::types::WorkloadSource::Embedded,
         }

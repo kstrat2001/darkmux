@@ -392,13 +392,7 @@ fn set_at(path: &Path, key: &str, value: &str) -> Result<String> {
              security add-generic-password -U -a \"$USER\" -s {item} -w <value>"
         );
     }
-    // (#2902 step 5) Renamed in 4.0, no alias: name the new key.
-    if let Some(new_key) = darkmux_types::config::RENAMED_SETTINGS.iter().find(|r| r.old_key == key).map(|r| r.new_key) {
-        bail!(
-            "`{key}` was renamed to `{new_key}` in 4.0 (#2902): darkmux config set {new_key} {value}"
-        );
-    }
-    // A retired key names what replaced it, never a near-miss guess.
+    // A retired or renamed key names what replaced it, never a near-miss guess.
     if let Some(line) = darkmux_types::user_files::config_retired(key) {
         bail!("`{key}`: {line}");
     }

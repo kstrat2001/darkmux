@@ -1012,7 +1012,7 @@ pub fn compact(
 ///    now the caller in loop_runner sees the error and the dispatch
 ///    fails — better than silent corruption.
 /// 5. Apply per-slot soft caps (defaults from
-///    `RuntimeCompactionConfig::default_slot_caps()`).
+///    `default_slot_caps_v0_1()`).
 /// 6. Render to markdown via `render_structured_output_as_markdown`.
 /// 7. Splice middle messages with the synthetic system message.
 ///
@@ -1020,7 +1020,6 @@ pub fn compact(
 /// successful parse + render so a failed compaction leaves the
 /// conversation intact for the caller's error-handling path (e.g.,
 /// retry with narrative, surface to operator).
-#[allow(dead_code)]
 pub fn structured_compact(
     client: &LmStudioClient,
     messages: &mut Vec<Message>,
@@ -1625,14 +1624,10 @@ fn extract_compactor_content(message: Message) -> Result<String> {
         .ok_or_else(|| anyhow!("compactor returned no content or reasoning_content"))
 }
 
-/// (#372 T2-B) v0.1 per-slot character caps. Mirrors the table the
-/// main-crate `RuntimeCompactionConfig::default_slot_caps()` ships
-/// for profile-side consumers. Duplicated rather than shared because
-/// the runtime crate doesn't depend on the main crate. T2-C plumbs
+/// (#372 T2-B) v0.1 per-slot character caps. T2-C plumbs
 /// operator-overrides via CLI flag; until then this is the only
 /// source the runtime consults. Single source of truth for the v0.1
 /// commitments per #354.
-#[allow(dead_code)]
 pub fn default_slot_caps_v0_1() -> std::collections::BTreeMap<String, u32> {
     let entries: &[(&str, u32)] = &[
         ("objective", 1024),
@@ -1662,7 +1657,6 @@ pub fn default_slot_caps_v0_1() -> std::collections::BTreeMap<String, u32> {
 ///
 /// Slots without a defined cap are left untouched — operators who
 /// haven't tuned them get the compactor's full output.
-#[allow(dead_code)]
 pub fn apply_slot_caps(
     out: &mut StructuredCompactionOutput,
     caps: &std::collections::BTreeMap<String, u32>,
@@ -1723,7 +1717,6 @@ pub fn apply_slot_caps(
 /// `objective` always renders since it's a required slot. The header
 /// names the count of compacted messages so the agent sees how much
 /// conversation was condensed.
-#[allow(dead_code)]
 pub fn render_structured_output_as_markdown(
     out: &StructuredCompactionOutput,
     compacted_message_count: usize,
@@ -2188,7 +2181,6 @@ fn render_messages_as_excerpt(messages: &[Message]) -> String {
 /// T2-A ships the SHAPE only; T2-B implements `structured_compact()`
 /// which actually parses these from the compactor's JSON-mode response.
 /// Until then no production code path constructs these — only tests.
-#[allow(dead_code)]
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct StructuredCompactionOutput {
     pub objective: String,
@@ -2209,7 +2201,6 @@ pub struct StructuredCompactionOutput {
 /// Nested under `StructuredCompactionOutput.current_truth`. Sub-slots
 /// for the dimensions of "what's the agent's working-memory state
 /// right now." All optional — small workloads only have a subset.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
 pub struct CurrentTruth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2225,7 +2216,6 @@ pub struct CurrentTruth {
 /// which artifact. `generation` matches the runtime's compaction
 /// counter; `source_message_count` is how many messages the
 /// compactor was asked to summarize (the middle slice size).
-#[allow(dead_code)]
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct CompactionMetadata {
     pub schema_version: String,

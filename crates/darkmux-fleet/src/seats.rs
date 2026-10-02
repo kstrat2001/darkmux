@@ -50,9 +50,7 @@ impl WorkSeat {
     fn width(&self) -> usize {
         match self {
             WorkSeat::Local { .. } => 1,
-            WorkSeat::Unmanaged { concurrent_calls, .. } => {
-                concurrent_calls.map_or(1, |n| darkmux_types::config_access::jobs_at_once(n as usize))
-            }
+            WorkSeat::Unmanaged { concurrent_calls, .. } => darkmux_types::endpoint::concurrent_width(*concurrent_calls),
         }
     }
 }

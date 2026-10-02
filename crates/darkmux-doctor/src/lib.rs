@@ -2664,7 +2664,7 @@ fn resolved_config_path() -> std::path::PathBuf {
 }
 
 /// Settings RENAMED or RETIRED with no alias
-/// (`darkmux_types::config::RENAMED_SETTINGS` / `RETIRED_SETTINGS`: the
+/// (`darkmux_types::config::RETIRED_SETTINGS`: the
 /// `remote.*` limits 5.0 moved to each endpoint, `DARKMUX_CREW_DIR`). A
 /// leftover env var is read by nothing; one whose loss would change behavior
 /// is refused by every command but `doctor` and `config` and fails this row,

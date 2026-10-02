@@ -46,8 +46,8 @@ use std::sync::OnceLock;
 /// host-side in `dispatch_internal.rs`) but this crate never constructs
 /// them: neither cap has a per-hit runtime record in THIS pass (#2165 scope
 /// is the four sites named in its own doc — salvage, intra-turn-stall,
-/// checkpoint continuation, inactivity warning). `#[allow(dead_code)]`
-/// documents that gap rather than dropping the variants and silently
+/// checkpoint continuation, inactivity warning). The `allow(dead_code)` on
+/// those two variants documents that gap rather than dropping the variants and silently
 /// narrowing the enum's contract.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -61,9 +61,9 @@ pub enum BoundKind {
     /// GENERATION_CHECKPOINT_INTERVAL`'s doc for the incident this fixes.
     GenerationCheckpointInterval,
     MaxTokensPerCall,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // kept: part of the wire contract, see the enum doc
     MaxTurns,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // kept: part of the wire contract, see the enum doc
     MaxTokens,
     InactivityTimeout,
 }

@@ -361,7 +361,7 @@ use std::path::Path;
 //           same gate as every other user file). The valid keys are derived
 //           from this type's JSON schema, never listed. A retired key is
 //           named with what replaced it: `remote.max_tokens_per_execution`
-//           (renamed, `RENAMED_SETTINGS`) and every other key a past
+//           (renamed) and every other key a past
 //           `DarkmuxConfig` had (`RETIRED_SETTINGS`, built from `git log`). A leftover
 //           of any of the three used to be warned about and ignored; now it
 //           refuses. A value of the wrong type (`"port": "x"`) is refused the
@@ -410,35 +410,11 @@ use std::path::Path;
 //           Folded into a minor bump like 2.2's removals.
 pub const CONFIG_SCHEMA_VERSION: &str = "2.3";
 
-/// (#2902 step 5) A setting RENAMED in 4.0, with no alias. `config set`
-/// refuses the old key naming the new one; a leftover old key in
-/// `config.json` is an unknown key, refused by every preflight and failed by
-/// `darkmux doctor` with this rename as its message (`user_files`); a
-/// leftover old env var is failed by doctor and refused by every command
-/// (`config_access::refuse_retired_env`, once at CLI entry; see
-/// [`retired_env_leftovers`]).
-#[derive(Debug, Clone, Copy)]
-pub struct RenamedSetting {
-    pub old_key: &'static str,
-    pub old_env: &'static str,
-    pub new_key: &'static str,
-    pub new_env: &'static str,
-    /// What to do about a leftover (the old key never silently does nothing).
-    pub advice: &'static str,
-}
-
-/// Every setting renamed and kept (none at present). The one 4.0 entry,
-/// `remote.max_tokens_per_execution` to `remote.max_tokens_per_step`, ended
-/// when 5.0 retired the whole `remote` block (it is a `RETIRED_SETTINGS`
-/// entry now).
-pub const RENAMED_SETTINGS: &[RenamedSetting] = &[];
-
 /// A `config.json` key an older darkmux read (and `init` may have written)
 /// that this one does not. The unknown-key gate (`user_files`) names it with
 /// `line` instead of guessing a near-miss. Built from `git log` of this file
 /// (every field a past `DarkmuxConfig` carried that this one does not);
-/// `every_historical_config_key_is_named_as_retired` pins the set. Settings
-/// renamed in 4.0 that also had an env var are [`RENAMED_SETTINGS`].
+/// `every_historical_config_key_is_named_as_retired` pins the set.
 #[derive(Debug, Clone, Copy)]
 pub struct RetiredSetting {
     /// The dotted key; a block (`review`) covers every key inside it.
@@ -447,7 +423,9 @@ pub struct RetiredSetting {
     pub env: Option<&'static str>,
     /// What a still-set `env` does at CLI entry. `Refuse` when ignoring it
     /// would quietly change behavior; `Warn` when nothing reads it and nothing
-    /// is lost. Meaningless without an `env`.
+    /// is lost. Meaningless without an `env`. One rule on both channels, refuse only when
+    /// ignoring is unsafe: a `Warn` setting's `leftover` is `Any`, a `Refuse` one's is not
+    /// (`a_retired_settings_env_and_config_channels_agree_on_whether_ignoring_it_is_unsafe`).
     pub env_policy: LeftoverPolicy,
     /// How a leftover `config.json` key's VALUE is judged (#3057): at the
     /// default `darkmux init` once wrote (or any value, where ignoring it
@@ -515,7 +493,7 @@ pub fn leftover_is_harmless(key: &str, value: &serde_json::Value) -> bool {
     }
 }
 
-/// Every retired `config.json` key that is not a [`RENAMED_SETTINGS`] entry.
+/// Every retired or renamed `config.json` key (a rename's `line` names the new key).
 pub const RETIRED_SETTINGS: &[RetiredSetting] = &[
     RetiredSetting {
         key: "remote",
@@ -550,7 +528,7 @@ pub const RETIRED_SETTINGS: &[RetiredSetting] = &[
         key: "remote.step_budget_policy",
         env: Some("DARKMUX_REMOTE_STEP_BUDGET_POLICY"),
         env_policy: LeftoverPolicy::Warn,
-        leftover: LeftoverValue::Default(&[OldDefault::Null, OldDefault::Str("warn")]),
+        leftover: LeftoverValue::Any,
         line: "removed in 5.0 (#3035): what reaching a limit does is `endpoints.<id>.limits.policy` (`off`, `warn` \
                or `wait`) in profiles.json, one policy for the endpoint's whole `limits`",
     },
@@ -575,7 +553,7 @@ pub const RETIRED_SETTINGS: &[RetiredSetting] = &[
         key: "runtime.log_level",
         env: Some("DARKMUX_LOG"),
         env_policy: LeftoverPolicy::Warn,
-        leftover: LeftoverValue::Default(&[OldDefault::Str("info")]),
+        leftover: LeftoverValue::Any,
         line: "removed in 5.0 (#3035): it only ever switched on one debug line on the tool-less hosted dispatch \
                path and nothing else read it. Delete it",
     },
@@ -591,7 +569,7 @@ pub const RETIRED_SETTINGS: &[RetiredSetting] = &[
         key: "machine_rollup.enabled",
         env: Some("DARKMUX_MACHINE_ROLLUP_ENABLED"),
         env_policy: LeftoverPolicy::Warn,
-        leftover: LeftoverValue::Default(&[OldDefault::Bool(false)]),
+        leftover: LeftoverValue::Any,
         line: "removed in 5.0 (#3036) with the rest of `machine_rollup`. Delete it",
     },
     RetiredSetting {
@@ -605,7 +583,7 @@ pub const RETIRED_SETTINGS: &[RetiredSetting] = &[
         key: "dirs.notebook",
         env: Some("DARKMUX_NOTEBOOK_DIR"),
         env_policy: LeftoverPolicy::Warn,
-        leftover: LeftoverValue::Refuse,
+        leftover: LeftoverValue::Any,
         line: "removed in 4.0 (#2913): the notebook verbs retired; the bundled `darkmux-lab-notebook` skill writes \
                an entry wherever your own instructions say. Delete it",
     },
@@ -614,7 +592,7 @@ pub const RETIRED_SETTINGS: &[RetiredSetting] = &[
         key: "radio.router_profile",
         env: Some("DARKMUX_RADIO_ROUTER_PROFILE"),
         env_policy: LeftoverPolicy::Warn,
-        leftover: LeftoverValue::Refuse,
+        leftover: LeftoverValue::Any,
         line: "removed in CONFIG 1.28: radio routing runs on the machine's utility model, `internal.utility` in \
                profiles.json. Delete it",
     },
@@ -748,15 +726,8 @@ pub struct RetiredLeftover {
 /// Every renamed or retired setting whose env var is still set. (A leftover
 /// `config.json` key is an unknown key, which `user_files` refuses.)
 pub fn retired_env_leftovers(env: &dyn Fn(&str) -> Option<String>) -> Vec<RetiredLeftover> {
-    // A renamed setting always refuses: ignoring it would quietly drop what
-    // the operator set (a token cap) under its new name.
-    let renamed = RENAMED_SETTINGS.iter().map(|r| {
-        let what = format!("renamed to `{}` (env {}) in 4.0 (#2902); {}", r.new_key, r.new_env, r.advice);
-        (r.old_key, r.old_env, LeftoverPolicy::Refuse, what)
-    });
     let retired = RETIRED_SETTINGS.iter().filter_map(|r| Some((r.key, r.env?, r.env_policy, r.line.to_string())));
-    renamed
-        .chain(retired)
+    retired
         .filter_map(|(key, var, policy, what)| {
             let v = env(var).filter(|v| !v.trim().is_empty())?;
             let found_in = format!("env var {var} ({v})");
@@ -2408,6 +2379,24 @@ impl DarkmuxConfig {
 mod tests {
     use super::*;
     use crate::config_enum::ConfigEnum;
+
+    /// One rule across both channels: refuse only when ignoring a leftover is unsafe. A setting
+    /// whose env var is merely warned about must not refuse its `config.json` twin at any value,
+    /// and one whose env var refuses must not let any value of its key through unjudged.
+    #[test]
+    fn a_retired_settings_env_and_config_channels_agree_on_whether_ignoring_it_is_unsafe() {
+        for r in RETIRED_SETTINGS.iter().filter(|r| r.env.is_some()) {
+            let config_ignores_any_value = r.leftover == LeftoverValue::Any;
+            match r.env_policy {
+                LeftoverPolicy::Warn => {
+                    assert!(config_ignores_any_value, "{}: env warns but a config leftover can still refuse", r.key)
+                }
+                LeftoverPolicy::Refuse => {
+                    assert!(!config_ignores_any_value, "{}: env refuses but any config leftover value passes", r.key)
+                }
+            }
+        }
+    }
 
     /// (#1323) The config seam's self-defending conformance test: a project-local
     /// `.darkmux/config.json` (created for missions/phases/lessons) must NEVER

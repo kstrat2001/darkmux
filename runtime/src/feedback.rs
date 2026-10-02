@@ -277,12 +277,9 @@ impl FeedbackInjector {
             })
     }
 
-    /// True if `DARKMUX_FEEDBACK_INJECTION` is enabled. Public so
-    /// consumers (loop runner today, doctor / observability surfaces
-    /// in future steps) can decide whether to surface
-    /// feedback-injection state. Currently used in tests only; the
+    /// True if `DARKMUX_FEEDBACK_INJECTION` is enabled. Tests only; the
     /// loop runner relies on `drain()` returning empty when disabled.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn enabled(&self) -> bool {
         self.enabled
     }
@@ -489,7 +486,7 @@ impl FeedbackInjector {
     /// Number of pending messages waiting to be drained. Tests use
     /// this to verify queue state; loop runner uses `drain()`'s
     /// returned `Vec::len()` instead (cheaper than two calls).
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn pending_count(&self) -> usize {
         self.pending.len()
     }

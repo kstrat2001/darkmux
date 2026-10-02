@@ -392,7 +392,7 @@ After 5.0 a change to a data shape is additive, so a file written by a newer dar
 
 A rename is not read as its old name. Each surface that can be misspelled has its own table of retired spellings, and each refusal names what replaced the spelling. There are no aliases.
 
-- **Config keys** are `RENAMED_SETTINGS` and `RETIRED_SETTINGS` in `darkmux_types::config`, each with the line naming its replacement; each other user-file kind has a `RetiredLookup` for its own retired keys. `darkmux config set` refuses a retired key and names the new one.
+- **Config keys** are `RETIRED_SETTINGS` in `darkmux_types::config` (a rename is an entry too), each with the line naming its replacement; each other user-file kind has a `RetiredLookup` for its own retired keys. `darkmux config set` refuses a retired key and names the new one.
 - **Environment variables**: `retired_env_leftovers` is one check at CLI entry that refuses every command except `doctor` and `config` (and `--help` and `--version`) while a retired variable is set, and doctor lists each with what replaced it.
 - **Verbs and flags**: `src/retired_verbs.rs` holds the one `RETIRED` table, and `refusal` runs on the raw command line before clap, because a retired spelling can still parse (a retired `lab run <read verb>` reads as the launcher for a workload of that name), so clap's own rejection cannot be the trigger. It exits 2 naming the replacement. `scripts/rs-drift-guard.py` scans Rust string literals for retired verbs, and the docs-drift job scans the docs.
 - **Mission state files** in a retired spelling (a `sprint_ids` key, a `sprints/` directory) are refused by `darkmux_crew::retired_state`, naming the rewrite, and doctor fails each one.

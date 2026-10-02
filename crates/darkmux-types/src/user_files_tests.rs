@@ -2,8 +2,8 @@ use super::*;
 use serde::Deserialize;
 use serde_json::json;
 
+#[allow(dead_code)] // kept: serde-read-only probe type; its fields exist only to shape the generated JSON schema
 #[derive(Deserialize, JsonSchema)]
-#[allow(dead_code)]
 struct Inner {
     port: Option<u16>,
     host: Option<String>,
@@ -12,16 +12,16 @@ struct Inner {
     extras: serde_json::Map<String, Value>,
 }
 
+#[allow(dead_code)] // kept: serde-read-only probe type; its fields exist only to shape the generated JSON schema
 #[derive(Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-#[allow(dead_code)]
 enum Shape {
     Circle { radius: f64 },
     Square { side: f64 },
 }
 
+#[allow(dead_code)] // kept: serde-read-only probe type; its fields exist only to shape the generated JSON schema
 #[derive(Deserialize, JsonSchema)]
-#[allow(dead_code)]
 struct Probe {
     #[serde(default)]
     schema_version: Option<String>,
@@ -145,8 +145,8 @@ fn a_retired_key_under_a_map_is_looked_up_with_the_map_key_as_a_wildcard() {
 /// the schema is generated from the type.
 #[test]
 fn a_new_field_is_valid_without_being_listed_anywhere() {
+    #[allow(dead_code)] // kept: serde-read-only probe type; its fields exist only to shape the generated JSON schema
     #[derive(Deserialize, JsonSchema)]
-    #[allow(dead_code)]
     struct Fresh {
         zanzibar_quokka_ratio: Option<u8>,
         #[serde(default)]
@@ -660,12 +660,13 @@ fn a_set_spend_cap_is_still_refused() {
     }
 }
 
-/// A feature the operator turned on: ignoring it silently drops it.
+/// A feature turned on whose env twin only warns: ignoring the rollup loses a diagnostic
+/// record, nothing unsafe, so the config channel warns too (one rule across both channels).
 #[test]
-fn machine_rollup_turned_on_is_still_refused() {
+fn machine_rollup_turned_on_only_warns_like_its_env_var() {
     let check = config_check(json!({"machine_rollup": {"enabled": true, "period_seconds": 60}}));
-    assert!(check.refusal.is_some());
-    assert!(check.warnings.is_empty());
+    assert!(check.refusal.is_none());
+    assert_eq!(warned(&check), ["machine_rollup"]);
 }
 
 #[test]
@@ -716,15 +717,19 @@ fn each_retired_key_is_judged_by_its_value() {
         ("machine_rollup.enabled", json!(false)),
         ("machine_rollup.period_seconds", json!(60)),
         ("dirs.ack", json!("/any/where")),
+        ("dirs.notebook", json!("/any/where")),
+        ("radio.router_profile", json!("p")),
+        ("remote.step_budget_policy", json!("wait")),
+        ("machine_rollup.enabled", json!(true)),
+        ("runtime.log_level", json!("debug")),
     ];
     for (key, value) in harmless {
         assert!(crate::config::leftover_is_harmless(key, &value), "{key} = {value} must warn");
     }
     let unsafe_values = [
         ("remote.max_tokens_per_step", json!(50000)),
-        ("remote.step_budget_policy", json!("wait")),
-        ("machine_rollup.enabled", json!(true)),
-        ("runtime.log_level", json!("debug")),
+        ("remote.max_tokens_per_execution", json!(7)),
+        ("dirs.crew", json!("/x")),
         ("not.retired", json!(null)),
     ];
     for (key, value) in unsafe_values {

@@ -170,7 +170,7 @@ impl BudgetPolicy {
 ///
 /// **`concurrent_calls` is for an endpoint darkmux does NOT manage.** It is
 /// how many calls to it run at once; absent, they run one at a time and
-/// darkmux says so once per launch (it never guesses a number). On a managed
+/// darkmux says so once per process (it never guesses a number). On a managed
 /// endpoint darkmux's scheduler owns parallelism (residency and the
 /// backend's parallel slots), so declaring it there is refused
 /// ([`ModelEndpoint::validate`]).
@@ -222,6 +222,14 @@ pub struct UsageWindow {
     #[serde(flatten)]
     #[schemars(skip)]
     pub extras: serde_json::Map<String, serde_json::Value>,
+}
+
+/// (#3035) How many calls to an unmanaged endpoint run at once, given its declared
+/// `limits.concurrent_calls`: the number (`0` is unbounded, the darkmux bound
+/// convention), else one (darkmux never guesses a number). The one rule; the
+/// scheduler's batches and a fleet receiver's seat book both ask here.
+pub fn concurrent_width(declared: Option<u32>) -> usize {
+    declared.map_or(1, |n| crate::config_access::jobs_at_once(n as usize))
 }
 
 impl UsageWindow {
@@ -520,6 +528,17 @@ impl ModelEndpoint {
             EndpointSource::Named(id) | EndpointSource::Unresolved(id) => Some(id),
             EndpointSource::Inline => None,
         }
+    }
+
+    /// (#3035) The key this endpoint's calls claim a seat under, wherever a seat is
+    /// counted (the scheduler's batches, a fleet receiver's seat book): its
+    /// `endpoints` id, else (an inline endpoint, which has none) its URL, else a
+    /// placeholder. The one derivation; no consumer spells its own.
+    pub fn seat_key(&self) -> String {
+        self.named_id()
+            .map(str::to_string)
+            .or_else(|| self.url.clone())
+            .unwrap_or_else(|| "(unnamed endpoint)".to_string())
     }
 
     /// THE classification: what darkmux does at this endpoint. An unresolved
@@ -912,6 +931,23 @@ mod tests {
 
     use super::*;
     use crate::ProfileModel;
+
+    /// (#3035) One width rule: absent is one at a time, `0` is unbounded.
+    #[test]
+    fn concurrent_width_is_one_unless_declared_and_zero_is_unbounded() {
+        assert_eq!(concurrent_width(None), 1);
+        assert_eq!(concurrent_width(Some(3)), 3);
+        assert_eq!(concurrent_width(Some(0)), usize::MAX);
+    }
+
+    /// (#3035) One key rule: the id, else the URL, else a placeholder.
+    #[test]
+    fn seat_key_is_the_id_else_the_url() {
+        assert_eq!(ModelEndpoint::reference("azure").seat_key(), "azure");
+        let inline = ModelEndpoint { url: Some("https://x.test/v1".into()), ..Default::default() };
+        assert_eq!(inline.seat_key(), "https://x.test/v1");
+        assert_eq!(ModelEndpoint::default().seat_key(), "(unnamed endpoint)");
+    }
 
     fn pm(json: &str) -> ProfileModel {
         serde_json::from_str(json).unwrap()

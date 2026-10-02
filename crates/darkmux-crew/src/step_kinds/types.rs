@@ -443,41 +443,48 @@ pub struct StepOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EndpointSlot {
     key: String,
+    kind: SlotKind,
     concurrent_calls: Option<u32>,
+}
+
+/// What an [`EndpointSlot`] stands for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlotKind {
+    /// A real endpoint.
+    Endpoint,
+    /// A step whose endpoint could not be resolved (`run` refuses it).
+    Unresolved,
+    /// The unresolved-local-seat fail-open (#1509).
+    UnresolvedLocal,
 }
 
 impl EndpointSlot {
     /// A slot for the endpoint `key` with the declared `concurrent_calls`.
     pub fn new(key: impl Into<String>, concurrent_calls: Option<u32>) -> Self {
-        Self { key: key.into(), concurrent_calls }
+        Self { key: key.into(), kind: SlotKind::Endpoint, concurrent_calls }
     }
 
-    /// The slot `ep` claims: keyed by its `endpoints` id (an inline endpoint,
-    /// which has none, by its URL), carrying its declared `concurrent_calls`.
+    /// The slot `ep` claims: keyed by [`darkmux_types::ModelEndpoint::seat_key`],
+    /// carrying its declared `concurrent_calls`.
     pub fn of(ep: &darkmux_types::ModelEndpoint) -> Self {
-        let key = ep
-            .named_id()
-            .map(str::to_string)
-            .or_else(|| ep.url.clone())
-            .unwrap_or_else(|| "(unnamed endpoint)".to_string());
-        Self::new(key, ep.known_limits().and_then(|l| l.concurrent_calls))
+        Self::new(ep.seat_key(), ep.known_limits().and_then(|l| l.concurrent_calls))
     }
 
     /// The slot of a step whose endpoint could not be resolved: `run` refuses
     /// it with the reason, and until then it waits its turn alone.
     pub fn unresolved() -> Self {
-        Self::new("(unresolved endpoint)", None)
+        Self { key: "(unresolved endpoint)".to_string(), kind: SlotKind::Unresolved, concurrent_calls: None }
     }
 
     /// The slot the unresolved-local-seat fail-open claims (#1509): one at a
     /// time, in a batch of its own. Not an endpoint, so it is never noted.
     pub fn unresolved_local() -> Self {
-        Self::new("(unresolved local seat)", None)
+        Self { key: "(unresolved local seat)".to_string(), kind: SlotKind::UnresolvedLocal, concurrent_calls: None }
     }
 
     /// True for a real endpoint's slot, false for the fail-open slots.
     pub fn is_endpoint(&self) -> bool {
-        !self.key.starts_with('(')
+        self.kind == SlotKind::Endpoint
     }
 
     /// The endpoint's id (or URL), for messages and grouping.
@@ -490,10 +497,10 @@ impl EndpointSlot {
         self.concurrent_calls
     }
 
-    /// How many of this endpoint's calls run at once: the declared number
-    /// (`0` is unbounded, the darkmux bound convention), else one.
+    /// How many of this endpoint's calls run at once
+    /// ([`darkmux_types::endpoint::concurrent_width`]).
     pub fn width(&self) -> usize {
-        self.concurrent_calls.map_or(1, |n| darkmux_types::config_access::jobs_at_once(n as usize))
+        darkmux_types::endpoint::concurrent_width(self.concurrent_calls)
     }
 }
 

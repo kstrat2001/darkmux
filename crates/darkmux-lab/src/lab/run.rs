@@ -761,9 +761,6 @@ mod tests {
             fn id(&self) -> &'static str {
                 "stub-2902-role"
             }
-            fn description(&self) -> &'static str {
-                "stub for #2902's run-role proof"
-            }
             fn setup(&self, _: &LoadedWorkload, _: &std::path::Path, _: &std::path::Path) -> anyhow::Result<()> {
                 Ok(())
             }
@@ -795,7 +792,6 @@ mod tests {
         .unwrap();
         let loaded = LoadedWorkload {
             manifest,
-            manifest_path: std::path::PathBuf::new(),
             base_dir: std::path::PathBuf::new(),
             source: crate::workloads::types::WorkloadSource::Embedded,
         };
@@ -1145,7 +1141,6 @@ mod tests {
                     extras: BTreeMap::new(),
                 },
             },
-            manifest_path: tmp.path().join("workloads/demo.json"),
             base_dir: tmp.path().to_path_buf(),
             source: WorkloadSource::OnDisk,
         };
@@ -1187,7 +1182,6 @@ mod tests {
                     extras: BTreeMap::new(),
                 },
             },
-            manifest_path: tmp.path().join("workloads/demo.json"),
             base_dir: tmp.path().to_path_buf(),
             source: WorkloadSource::OnDisk,
         };
@@ -1262,7 +1256,6 @@ mod tests {
                     extras: BTreeMap::new(),
                 },
             },
-            manifest_path: tmp.path().join("workloads/demo.json"),
             base_dir: tmp.path().to_path_buf(),
             source: WorkloadSource::OnDisk,
         };
@@ -1327,7 +1320,6 @@ mod tests {
                     extras: BTreeMap::new(),
                 },
             },
-            manifest_path: tmp.path().join("workloads/demo.json"),
             base_dir: tmp.path().to_path_buf(),
             source: WorkloadSource::OnDisk,
         };
@@ -1378,7 +1370,6 @@ mod tests {
                     extras: BTreeMap::new(),
                 },
             },
-            manifest_path: tmp.path().join("workloads/demo.json"),
             base_dir: tmp.path().to_path_buf(),
             source: WorkloadSource::OnDisk,
         };
@@ -1444,7 +1435,6 @@ mod tests {
                     extras: BTreeMap::new(),
                 },
             },
-            manifest_path: project.path().join("workloads/demo.json"),
             base_dir: project.path().to_path_buf(),
             source: WorkloadSource::OnDisk,
         };
@@ -1533,7 +1523,6 @@ mod tests {
                     extras: BTreeMap::new(),
                 },
             },
-            manifest_path: project.path().join("workloads/demo.json"),
             base_dir: project.path().to_path_buf(),
             source: WorkloadSource::OnDisk,
         };
@@ -1592,7 +1581,6 @@ mod tests {
                     extras: BTreeMap::new(),
                 },
             },
-            manifest_path: project.path().join("workloads/demo.json"),
             base_dir: project.path().to_path_buf(),
             source: WorkloadSource::OnDisk,
         };
@@ -1846,9 +1834,6 @@ mod tests {
             fn id(&self) -> &'static str {
                 "stub-2511-session-join"
             }
-            fn description(&self) -> &'static str {
-                "stub for #2511's end-to-end wiring proof"
-            }
             fn setup(&self, _: &LoadedWorkload, _: &Path, _: &Path) -> Result<()> {
                 Ok(())
             }
@@ -1871,8 +1856,6 @@ mod tests {
                     escalation: None,
                     ok: true,
                     duration_ms: 1,
-                    payload_text: Some("stub".into()),
-                    trajectory_path: None,
                     verify: Some(VerifyOutcome { passed: true, details: "stub".into() }),
                     error: None,
                 })
@@ -1969,9 +1952,6 @@ mod tests {
             fn id(&self) -> &'static str {
                 "stub-2511-session-join-ordering"
             }
-            fn description(&self) -> &'static str {
-                "stub for #2511's report-before-dispatch ordering proof"
-            }
             fn setup(&self, _: &LoadedWorkload, _: &Path, _: &Path) -> Result<()> {
                 Ok(())
             }
@@ -2001,8 +1981,6 @@ mod tests {
                     escalation: None,
                     ok: true,
                     duration_ms: 1,
-                    payload_text: Some("stub".into()),
-                    trajectory_path: None,
                     verify: Some(VerifyOutcome { passed: true, details: "stub".into() }),
                     error: None,
                 })
@@ -2141,7 +2119,6 @@ mod tests {
                     extras: BTreeMap::new(),
                 },
             },
-            manifest_path: tmp.path().join("w.json"),
             base_dir: tmp.path().to_path_buf(),
             source: WorkloadSource::OnDisk,
         };

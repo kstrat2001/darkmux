@@ -858,14 +858,6 @@ fn derive_profile_name(model_id: &str, task: heuristics::TaskClass) -> String {
     format!("{}-{}", safe_base, task.as_str())
 }
 
-/// True if the model id has a publisher prefix that gets stripped by
-/// `derive_profile_name`. Reserved for future per-model warnings; the
-/// scan currently catches collisions globally instead.
-#[allow(dead_code)]
-fn has_stripped_publisher(model_id: &str) -> bool {
-    model_id.contains('/')
-}
-
 fn cmd_role(sub: RoleCmd) -> Result<i32> {
     match sub {
         RoleCmd::List {
@@ -2223,11 +2215,5 @@ mod tests {
     fn derive_profile_name_strips_garbage_chars() {
         let n = derive_profile_name("publisher/some@weird*name!", heuristics::TaskClass::Mid);
         assert_eq!(n, "someweirdname-mid");
-    }
-
-    #[test]
-    fn has_stripped_publisher_true_for_pubprefixed() {
-        assert!(has_stripped_publisher("nousresearch/hermes"));
-        assert!(!has_stripped_publisher("hermes"));
     }
 }

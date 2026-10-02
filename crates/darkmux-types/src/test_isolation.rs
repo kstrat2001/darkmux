@@ -184,7 +184,7 @@ pub const CLEARED_STATE_VARS: &[&str] = &[
     // Retired or renamed in 4.0 or 5.0: nothing reads them and every command but
     // doctor/config refuses to start while one is set, so an ambient export
     // would fail every spawned darkmux. `every_retired_env_var_is_cleared`
-    // keeps this in step with `config::RETIRED_SETTINGS` / `RENAMED_SETTINGS`.
+    // keeps this in step with `config::RETIRED_SETTINGS`.
     "DARKMUX_CREW_DIR",
     "DARKMUX_NOTEBOOK_DIR",
     "DARKMUX_ACK_DIR",
@@ -926,9 +926,7 @@ mod tests {
     /// setting's env var is set, so the guard must clear every one of them.
     #[test]
     fn every_retired_env_var_is_cleared() {
-        let retired = crate::config::RETIRED_SETTINGS.iter().filter_map(|r| r.env);
-        let renamed = crate::config::RENAMED_SETTINGS.iter().map(|r| r.old_env);
-        for var in retired.chain(renamed) {
+        for var in crate::config::RETIRED_SETTINGS.iter().filter_map(|r| r.env) {
             assert!(CLEARED_STATE_VARS.contains(&var), "{var} is retired but not cleared by the isolation guard");
         }
     }

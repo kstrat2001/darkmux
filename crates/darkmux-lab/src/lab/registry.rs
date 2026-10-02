@@ -93,11 +93,7 @@ fn registry_lock_path(path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// One registered fixture's entry. Fields are public-API surface for
-/// Phase 3 (resolver) + Phase 4 (CLI verbs) — they're populated now
-/// even though no consumer reads them in Phase 2 (#489), hence the
-/// dead-code lint.
-#[allow(dead_code)]
+/// One registered fixture's entry (#489).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct RegisteredFixture {
     /// Absolute path to the fixture directory.
@@ -118,19 +114,13 @@ pub(crate) struct RegisteredFixture {
     pub satisfies: Option<String>,
 }
 
-/// The registry file's top-level shape. Phase 2 (#489) ships the
-/// structure + serialization; Phase 3 wires the resolver; Phase 4
-/// adds the CLI verbs (`dm lab register/list/doctor`). Many fields +
-/// methods are dead-code-lint-suppressed until those phases consume
-/// them.
-#[allow(dead_code)]
+/// The registry file's top-level shape (#489).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct LabRegistry {
     #[serde(default)]
     pub fixtures: BTreeMap<String, RegisteredFixture>,
 }
 
-#[allow(dead_code)]
 impl LabRegistry {
     /// Load the registry from `path`. Returns an empty registry if
     /// the file doesn't exist (first-time-operator-friendly).
