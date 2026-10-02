@@ -139,8 +139,7 @@ abandoned_reason?: AbandonReason,
  * record (`telemetry.tokens`) carrying its `mission_id` or one of its
  * sessions, utility calls included, through `crate::usage_sum` — the
  * same fold `darkmux run list`'s TOKENS column and `--usage` read, and
- * the same rule the viewer's `sumUsage` applies (the legacy fallback
- * for a run with no usage record included). Absent when nothing was
+ * the same rule the viewer's `sumUsage` applies. Absent when nothing was
  * measured: no record matched, or none reported a count. It is never
  * `0` for "unknown". Bounded by the same scan window as everything
  * else on the row.

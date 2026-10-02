@@ -1203,6 +1203,7 @@ UsageReport
   default_window: boolean
   overall: UsageSum
   groups: UsageGroup[]
+  no_run: UsageSplit
 UsageSplit
   calls: uint64
   total: uint64
@@ -1218,7 +1219,6 @@ UsageSum
   utility: uint64
   usage_records: uint64
   reported: uint64
-  legacy_completes: uint64
 UsageWindow
   period?: string | null
   tokens?: uint64 | null

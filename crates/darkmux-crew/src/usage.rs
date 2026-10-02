@@ -228,7 +228,6 @@ pub fn usage_payload(facts: &CallFacts<'_>, counts: &darkmux_trajectory::UsageCo
         reasoning_tokens: count(counts.reasoning),
         cached_tokens: count(counts.cached),
         turn_seq: None,
-        unmanaged: None,
         index: None,
         generation: None,
         parent_role_id: None,
@@ -251,10 +250,18 @@ pub fn usage_payload(facts: &CallFacts<'_>, counts: &darkmux_trajectory::UsageCo
 /// beside the payload writer, so the record and its payload cannot drift
 /// apart.
 pub fn utility_usage_record(job_role_id: &str, model: &str, execution: &ExecutionId, payload: UsagePayload) -> darkmux_flow::FlowRecord {
+    sessionless_usage_record(job_role_id, model, execution, payload)
+}
+
+/// The usage record of a model call that belongs to no run: no session, `handle`
+/// the caller's own name (a utility job's role id, `doctor-probe`). The shape
+/// [`utility_usage_record`] and the `doctor --probe` call share, so neither can
+/// drift from what the breakdown reads.
+pub fn sessionless_usage_record(handle: &str, model: &str, execution: &ExecutionId, payload: UsagePayload) -> darkmux_flow::FlowRecord {
     darkmux_flow::FlowRecord {
         execution_id: Some(execution.clone()),
         source: Some(darkmux_flow::FlowSource::Tokens),
-        ..utility_record(job_role_id, model, darkmux_flow::Payload::TelemetryTokens(payload))
+        ..utility_record(handle, model, darkmux_flow::Payload::TelemetryTokens(payload))
     }
 }
 
@@ -437,8 +444,6 @@ pub fn has_any_token_counts(p: &serde_json::Value) -> bool {
     num(p.get("total_tokens")) > 0
         || num(p.get("prompt_tokens")) > 0
         || num(p.get("completion_tokens")) > 0
-        || num(p.get("unmanaged_tokens")) > 0
-        || num(p.get("remote_tokens")) > 0
 }
 
 pub fn amount_of(p: &serde_json::Value) -> UsageAmount {
@@ -447,14 +452,6 @@ pub fn amount_of(p: &serde_json::Value) -> UsageAmount {
     let mut total = num(p.get("total_tokens"));
     if total == 0 {
         total = prompt + completion;
-    }
-    if total == 0 {
-        // A `dispatch.map` step's own spend on a `dispatch.complete`; an
-        // archived record spells the key `remote_tokens`.
-        total = num(p.get("unmanaged_tokens"));
-        if total == 0 {
-            total = num(p.get("remote_tokens"));
-        }
     }
     let cached = p.get("cached_tokens").filter(|c| is_finite_number(c)).map(|c| num(Some(c)));
     UsageAmount {
@@ -498,6 +495,29 @@ mod tests {
         assert!(usage_payload(&facts(None), &counts).endpoint_id.is_none());
         assert_eq!(usage_payload(&facts(Some("azure")), &darkmux_trajectory::UsageCounts::default()).endpoint_id.as_deref(), Some("azure"), "an absent-usage record still names its endpoint");
     }
+    /// (#3061) One rule for a half-reported call across the wire: what a
+    /// usage record's reader counts for it is what the run total
+    /// (`TokenSum`, via `UsageCounts::floor_tokens`) counts, for every shape
+    /// of reported counts.
+    #[test]
+    fn the_record_reader_and_the_run_total_agree_on_every_shape_of_half_reported_call() {
+        let facts = CallFacts { call_kind: CallKind::SingleShot, role_id: None, requested_model: "m", reported_model: None, endpoint: "h/m", endpoint_id: None };
+        let opt = |on: bool, v: u64| on.then_some(v);
+        for mask in 0..8u8 {
+            let counts = darkmux_trajectory::UsageCounts {
+                prompt: opt(mask & 1 != 0, 900),
+                completion: opt(mask & 2 != 0, 40),
+                total: opt(mask & 4 != 0, 1000),
+                ..Default::default()
+            };
+            let record = serde_json::to_value(usage_payload(&facts, &counts)).unwrap();
+            assert_eq!(amount_of(&record).total, counts.floor_tokens(), "counts {counts:?}");
+            let mut sum = darkmux_trajectory::TokenSum::default();
+            sum.add(&counts);
+            assert_eq!(sum.total, amount_of(&record).total, "counts {counts:?}");
+        }
+    }
+
     /// The sums read a usage record as raw JSON, in the one value domain the
     /// viewer shares (`num`: floor, clamp, hostile values read 0), because a
     /// typed `u64` cannot express that domain. This pins the two halves

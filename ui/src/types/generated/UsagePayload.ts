@@ -60,10 +60,6 @@ reasoning_tokens?: number, cached_tokens?: number,
  */
 turn_seq?: number, 
 /**
- * On a `dispatch.map` per-call record: whether the item ran on an unmanaged endpoint.
- */
-unmanaged?: boolean, 
-/**
  * On a `dispatch.map` per-call record: the item's position. An item that retried emits one
  * record per attempt, all with this index.
  */

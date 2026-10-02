@@ -3205,6 +3205,9 @@ pub struct ProbeReport {
     pub total_tokens: Option<u64>,
 }
 
+/// The `handle` of the usage record a `doctor --probe` leaves.
+const PROBE_HANDLE: &str = "doctor-probe";
+
 /// (#1177 `doctor --probe`) Live credential/routing probe: ONE minimal chat
 /// completion through the EXACT same URL/auth/POST path a real hosted
 /// dispatch uses (`ModelEndpoint::chat_url` + `remote_auth_header` +
@@ -3239,15 +3242,28 @@ pub fn probe_unmanaged_endpoint(
     let t0 = SystemTime::now();
     let resp = remote_chat_completion(&url, auth.as_ref(), &req_body, timeout_seconds)?;
     let wall_ms = t0.elapsed().map(|d| d.as_millis() as u64).unwrap_or(0);
-    Ok(ProbeReport {
-        label,
-        wall_ms,
-        served_model: resp
-            .get("model")
-            .and_then(|m| m.as_str())
-            .map(str::to_string),
-        total_tokens: darkmux_trajectory::UsageCounts::of_reply(&resp).total_tokens(),
-    })
+    let counts = darkmux_trajectory::UsageCounts::of_reply(&resp);
+    let served_model = resp.get("model").and_then(|m| m.as_str()).map(str::to_string);
+    // (#3061) A probe spends real tokens: it leaves the one usage record every
+    // model call leaves, on no run (it has no session and no bookends).
+    let payload = crate::usage::usage_payload(
+        &crate::usage::CallFacts {
+            call_kind: crate::usage::CallKind::SingleShot,
+            role_id: None,
+            requested_model: model_id,
+            reported_model: served_model.as_deref(),
+            endpoint: &label,
+            endpoint_id: ep.named_id(),
+        },
+        &counts,
+    );
+    let _ = darkmux_flow::record(crate::usage::sessionless_usage_record(
+        PROBE_HANDLE,
+        model_id,
+        &darkmux_types::execution_id::ExecutionId::mint(),
+        payload,
+    ));
+    Ok(ProbeReport { label, wall_ms, served_model, total_tokens: counts.total_tokens() })
 }
 
 /// POST the chat-completions request via `curl`, keeping the auth secret OFF
@@ -10440,29 +10456,6 @@ impl TailerState {
     }
 }
 
-/// (#795) Map a `model.completed` trajectory event to the per-turn
-/// `telemetry.tokens` payload — `{turn_seq, prompt_tokens,
-/// completion_tokens, total_tokens}`. Pure (no IO, no global sink) so the
-/// mapping is unit-testable in isolation from `handle_event`'s
-/// flow-record emission, same pattern as `detector_telemetry_payload`.
-///
-/// (#2902 step 1a) An event with no `usage` object (upstream omitted it —
-/// rare) still yields a record, `token_source: "absent"` with no counts, so
-/// per-turn records remain one per call AND still sum to the dispatch's
-/// metrics totals exactly (an absent record adds nothing). Absent token
-/// counts inside a present `usage` object degrade to 0 (defensive; the
-/// runtime always writes both fields). See `turn_usage_counts`.
-///
-/// (#1444 review) `total_tokens` PREFERS the provider's own reported total
-/// and only falls back to `prompt + completion`. It used to compute the sum
-/// unconditionally, discarding the number the provider actually sent — which
-/// understates the headline on every provider that bills a third token class
-/// outside `completion_tokens`. 284 blocks in this machine's recorded corpus
-/// do exactly that (`gemini-3.1-pro-preview`, `gemini-2.5-flash`,
-/// `grok-4.3`; e.g. `prompt=9970 completion=128 total=11598` — 1500 tokens
-/// the sum never sees), and `grok-4.3` does it on 30 of 30 recorded calls.
-/// The fallback stays for the runtime's older `model.completed` events,
-/// which have always written all three keys anyway.
 /// A streamed chunk (`model.partial`) or a writing tick
 /// (`model.tool_call.writing`), as the heartbeat reads it.
 struct Chunk<'a> {

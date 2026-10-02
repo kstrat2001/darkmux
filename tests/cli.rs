@@ -7028,8 +7028,8 @@ fn run_list_binary_agrees_with_the_shared_union_it_calls() {
 /// (#2902 step 2b) The verb end to end: the TOKENS column, `--usage`'s
 /// breakdown (text and `--json`), `--since` as a duration and as a date,
 /// and a bad `--since` refused by name. Two dispatch sessions in today's
-/// day file: one with usage records (its complete is NOT read), one legacy
-/// with tokens only on its complete (read once, the legacy rule).
+/// day file: one with usage records (its complete is NOT read), one pre-5.0
+/// with tokens only on its complete (no usage record: nothing measured).
 #[test]
 fn run_list_usage_breakdown_end_to_end() {
     let home = TempDir::new().unwrap();
@@ -7070,29 +7070,27 @@ fn run_list_usage_breakdown_end_to_end() {
     let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let tokens = |id: &str| json["runs"].as_array().unwrap().iter().find(|r| r["id"] == id).unwrap_or_else(|| panic!("{id} in {json}"))["tokens"].clone();
     assert_eq!(tokens("sess-modern"), 1290, "work + utility; the complete's 99,999 is never read");
-    assert_eq!(tokens("sess-legacy"), 700, "the legacy rule reads the complete once");
+    assert!(tokens("sess-legacy").is_null(), "a complete carries no tokens: nothing measured");
     let usage = &json["usage"];
     assert_eq!(usage["default_window"], true);
-    assert_eq!(usage["overall"]["total"], 1990);
+    assert_eq!(usage["overall"]["total"], 1290);
     assert_eq!(usage["overall"]["cached"], 300);
     assert_eq!(usage["overall"]["utility"], 90);
-    assert_eq!(usage["overall"]["legacy_completes"], 1);
     let groups = usage["groups"].as_array().unwrap();
-    assert_eq!(groups.len(), 3, "{groups:#?}");
+    assert_eq!(groups.len(), 2, "{groups:#?}");
     assert_eq!(groups[0]["work"]["total"], 1200);
     assert_eq!(groups[0]["reported_model"], "qwen-a-served");
-    assert!(groups[1].get("endpoint").is_none(), "the legacy complete carries no endpoint: {}", groups[1]);
-    assert_eq!(groups[2]["utility"]["total"], 90);
+    assert_eq!(groups[1]["utility"]["total"], 90);
 
     // Text: the TOKENS column and the breakdown under the table.
     let out = run(&["run", "list", "--usage", "--all"]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let text = String::from_utf8_lossy(&out.stdout).to_string();
     assert!(text.contains("TOKENS"), "{text}");
-    assert!(text.contains("1.29k") && text.contains(" 700 "), "{text}");
+    assert!(text.contains("1.29k"), "{text}");
     assert!(text.contains("usage since ") && text.contains("the default 14-day window"), "{text}");
     assert!(text.contains("reported model: qwen-a-served"), "{text}");
-    assert!(text.contains("1,990"), "{text}");
+    assert!(text.contains("1,290"), "{text}");
 
     // --since as a duration keeps today's rows; as a far-future date it
     // keeps none and the breakdown is empty.
@@ -7100,7 +7098,7 @@ fn run_list_usage_breakdown_end_to_end() {
     let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(json["total"], 2, "{json}");
     assert_eq!(json["usage"]["default_window"], false);
-    assert_eq!(json["usage"]["overall"]["total"], 1990);
+    assert_eq!(json["usage"]["overall"]["total"], 1290);
     let out = run(&["run", "list", "--json", "--usage", "--since", "2999-01-01"]);
     let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(json["total"], 0, "{json}");

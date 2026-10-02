@@ -377,8 +377,7 @@ pub struct Run {
     /// record (`telemetry.tokens`) carrying its `mission_id` or one of its
     /// sessions, utility calls included, through `crate::usage_sum` — the
     /// same fold `darkmux run list`'s TOKENS column and `--usage` read, and
-    /// the same rule the viewer's `sumUsage` applies (the legacy fallback
-    /// for a run with no usage record included). Absent when nothing was
+    /// the same rule the viewer's `sumUsage` applies. Absent when nothing was
     /// measured: no record matched, or none reported a count. It is never
     /// `0` for "unknown". Bounded by the same scan window as everything
     /// else on the row.
@@ -7246,7 +7245,7 @@ mod tests {
                 // A ghost whose only record reported nothing.
                 serde_json::json!({ "ts": now, "action": "dispatch.start", "session_id": "crew-dispatch-silent", "handle": "reviewer" }),
                 usage_record(&now, "crew-dispatch-silent", None, serde_json::json!({ "call_kind": "turn", "token_source": "absent" })),
-                // A legacy ghost: no usage record at all, tokens on its complete.
+                // A pre-5.0 ghost: no usage record at all, tokens only on its complete.
                 serde_json::json!({ "ts": "2026-07-24T09:10:00Z", "action": "dispatch.start", "session_id": "crew-dispatch-legacy", "handle": "reviewer" }),
                 serde_json::json!({ "ts": "2026-07-24T09:11:00Z", "action": "dispatch.complete", "session_id": "crew-dispatch-legacy", "payload": { "total_tokens": 700 } }),
             ],
@@ -7263,7 +7262,7 @@ mod tests {
         assert_eq!(tokens("dispatch-coder-2"), Some(300), "tracked mission: its step session's records, not its complete");
         assert_eq!(tokens("crew-dispatch-reviewer-orphan"), Some(150), "ghost: work + utility, all tokens");
         assert_eq!(tokens("crew-dispatch-silent"), None, "nothing measured is absent, never 0");
-        assert_eq!(tokens("crew-dispatch-legacy"), Some(700), "the legacy fallback: a run with no usage record reads its complete");
+        assert_eq!(tokens("crew-dispatch-legacy"), None, "a complete carries no tokens: no usage record, nothing measured");
         assert_eq!(tokens("review-on-the-hub"), Some(500), "peer mission: fleet records fold the same way");
         // The wire drops the field entirely when absent.
         let silent = serde_json::to_value(runs.iter().find(|r| r.id == "crew-dispatch-silent").unwrap()).unwrap();
@@ -7318,20 +7317,13 @@ mod tests {
         assert_eq!(row.tokens, Some(333));
     }
 
-    /// (#2902 step 2b, review MUST FIX 1's day-file edge) A run whose usage
-    /// records sit in a day file OLDER than the scan window and whose
-    /// complete sits inside it. The walk never opens the older file, so
-    /// those usage records are unobservable here and the run looks
-    /// legacy: its row reads the complete's total, which is the writer's
-    /// own WHOLE-run figure, not a partial sum. That is the honest
-    /// reading the bounded scan can give; `--since` past the edge widens
-    /// the walk and the usage records then win (the assertion below). It
-    /// cannot be closed without opening files outside the window, which
-    /// is the cost bound `/runs` exists to keep. Pinned so a change here
-    /// is a decision, not a drift.
+    /// A run whose usage records sit in a day file OLDER than the scan window
+    /// and whose complete sits inside it: the walk never opens the older file,
+    /// so the run's tokens are unmeasured (a complete is never read for
+    /// tokens), and `--since` past the edge widens the walk and finds them.
     #[test]
     #[serial_test::serial]
-    fn build_runs_at_the_window_edge_reads_a_straddling_runs_complete_whole() {
+    fn build_runs_at_the_window_edge_never_reads_a_straddling_runs_complete() {
         let _g = CrewGuard::new();
         let flows = TempDir::new().unwrap();
         let old_day = cutoff_date_string(RUNS_FLOW_SCAN_WINDOW_DAYS + 1);
@@ -7350,10 +7342,50 @@ mod tests {
             &[serde_json::json!({ "ts": now, "action": "dispatch.complete", "session_id": "straddle", "handle": "coder", "payload": { "total_tokens": 1000 } })],
         );
         let built = build_runs_with_usage(flows.path(), None, &[], None);
-        assert_eq!((built.usage.overall.total, built.usage.overall.legacy_completes), (1000, 1), "the bounded scan's reading");
+        assert_eq!(built.usage.overall.total, 0, "the bounded scan sees no usage record, and a complete is not tokens");
         let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         let widened = build_runs_with_usage(flows.path(), None, &[], Some(now_secs - (RUNS_FLOW_SCAN_WINDOW_DAYS as u64 + 2) * 86_400));
-        assert_eq!((widened.usage.overall.total, widened.usage.overall.legacy_completes), (900, 0), "widened past the edge, the usage records win");
+        assert_eq!(widened.usage.overall.total, 900, "widened past the edge, the usage records are read");
+    }
+
+    /// (#3061) A resumed dispatch reuses its execution id under a new session:
+    /// each session's row reads its own tokens (the first no longer carries
+    /// the resumed one's, the resumed one is no longer `-`), and the rows plus
+    /// the sessionless calls (radio routing) are the overall.
+    #[test]
+    #[serial_test::serial]
+    fn build_runs_attributes_a_resumed_session_to_itself_and_rows_plus_no_run_equal_the_total() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let now = darkmux_flow::ts_utc_now();
+        let with_exec = |mut r: serde_json::Value| {
+            r["execution_id"] = serde_json::json!("exec-resumed");
+            r
+        };
+        let provider = |total: u64| serde_json::json!({ "call_kind": "turn", "token_source": "provider", "total_tokens": total });
+        let routing = {
+            let mut r = usage_record(&now, "x", None, serde_json::json!({ "call_kind": "single_shot", "purpose": "utility", "token_source": "provider", "total_tokens": 9 }));
+            r.as_object_mut().unwrap().remove("session_id");
+            r["handle"] = serde_json::json!("radio-router");
+            r
+        };
+        write_day_file(
+            flows.path(),
+            &today(),
+            &[
+                serde_json::json!({ "ts": now, "action": "dispatch.start", "session_id": "sess-first", "handle": "coder" }),
+                with_exec(usage_record(&now, "sess-first", None, provider(100))),
+                serde_json::json!({ "ts": now, "action": "dispatch.start", "session_id": "sess-resumed", "handle": "coder" }),
+                with_exec(usage_record(&now, "sess-resumed", None, provider(40))),
+                routing,
+            ],
+        );
+        let built = build_runs_with_usage(flows.path(), None, &[], None);
+        let tokens = |id: &str| built.runs.iter().find(|r| r.id == id).unwrap_or_else(|| panic!("{id} in {:?}", built.runs)).tokens;
+        assert_eq!((tokens("sess-first"), tokens("sess-resumed")), (Some(100), Some(40)));
+        let rows: u64 = built.runs.iter().filter_map(|r| r.tokens).sum();
+        assert_eq!(built.usage.no_run.total, 9);
+        assert_eq!(rows + built.usage.no_run.total, built.usage.overall.total, "rows plus no-run are the overall");
     }
 
     /// (#2902 step 2b) `build_runs_with_usage`'s breakdown is the same fold

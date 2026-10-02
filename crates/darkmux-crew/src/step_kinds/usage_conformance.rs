@@ -80,10 +80,10 @@ const ROSTER: &[CallSite] = &[
         file: "src/dispatch_internal.rs",
         caller: "probe_unmanaged_endpoint",
         transport: "remote_chat_completion(",
-        duty: Duty::Exempt(
-            "`doctor --probe`: a 64-token connectivity check with no session id and no \
-             bookends, so a usage record would belong to no run. Open question for #2902.",
-        ),
+        duty: Duty::Emits {
+            writer_in: ("src/dispatch_internal.rs", "probe_unmanaged_endpoint"),
+            test: "dispatch_internal::tests::usage_conformance_probe_unmanaged_endpoint",
+        },
     },
     CallSite {
         file: "src/dispatch_internal.rs",

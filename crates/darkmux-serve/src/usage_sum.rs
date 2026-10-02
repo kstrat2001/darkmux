@@ -3,31 +3,31 @@
 //! Every model call darkmux makes emits exactly one `telemetry.tokens`
 //! usage record (writer: `darkmux_crew::usage`), and a token total anywhere
 //! is a PLAIN SUM of those records: no execution keying, no complete-vs-telemetry
-//! precedence, no dedup, no local/cloud classification, no estimates. This
-//! module is that sum on the server side, shared by `darkmux run list`
-//! (`src/run_list.rs`, the TOKENS column and `--usage`) and the daemon's
-//! `GET /runs` (each row's `tokens`), the same way `runs::build_runs` is
-//! shared by both. `ui/src/lib/usageRecords.ts::sumUsage` is the viewer's
-//! half; the shared golden fixture `tests/usage-golden/` pins both to one
-//! answer (`shared_golden_matches_the_viewer` below, and the TS side's own
-//! test over the same files).
+//! precedence, no dedup, no local/cloud classification, no estimates, and no
+//! fallback to a `dispatch complete` (a record written before 5.0 without a
+//! usage record carries no tokens here). This module is that sum on the server
+//! side, shared by `darkmux run list` (`src/run_list.rs`, the TOKENS column and
+//! `--usage`) and the daemon's `GET /runs` (each row's `tokens`), the same way
+//! `runs::build_runs` is shared by both. `ui/src/lib/usageRecords.ts::sumUsage`
+//! is the viewer's half; the shared golden fixture `tests/usage-golden/` pins
+//! both to one answer (`shared_golden_matches_the_viewer` below, and the TS
+//! side's own test over the same files).
 //!
-//! THE ONE EXCEPTION is legacy data, isolated in [`UsageFold`]'s finish: an
-//! execution with ZERO usage records (written before flow schema 1.57.0, or
-//! by a fleet peer on an older darkmux) counts its token-bearing
-//! `dispatch complete` once. An execution with any usage record, even a
-//! count-less `token_source: "absent"` one, never reads its complete. The
-//! execution is the record's own `execution_id`; a record from before 4.0
-//! names none, and is keyed by its session and mission (#3036: no identity is
-//! invented for it).
+//! A run's tokens are the records that name its session or mission, each
+//! record counted under ITS OWN session and mission (#3061: a resumed
+//! dispatch reuses its execution id under a new session, so the execution is
+//! not the unit of attribution; the record is). A record naming neither
+//! (radio routing, a `doctor --probe`) belongs to no run: it is in the
+//! overall and in [`UsageBreakdown::no_run`], so the run rows plus `no_run`
+//! equal the overall.
 //!
 //! What this module reports is what darkmux INVOKED, by the machine that
 //! executed it (the record's own `machine_uid`/`machine_id`; a relayed run's
-//! asker writes no usage, so its tokens count once, on the executor): the endpoint
-//! (its registry id when the record carries one, else the string it carries), the model darkmux requested, the model the reply
-//! named when it differs, and the provider's own counts with their source.
-//! Nothing here labels an endpoint local, cloud or metered, and nothing
-//! here costs anything.
+//! asker writes no usage, so its tokens count once, on the executor): the
+//! endpoint (its registry id when the record carries one, else the string it
+//! carries), the model darkmux requested, the model the reply named when it
+//! differs, and the provider's own counts with their source. Nothing here
+//! labels an endpoint local, cloud or metered, and nothing here costs anything.
 
 use std::collections::{HashMap, HashSet};
 
@@ -37,8 +37,8 @@ use darkmux_crew::usage::UsagePurpose;
 /// `UsageSum`, field for field.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct UsageSum {
-    /// Sum of each record's total (the provider's own, else prompt +
-    /// completion, else a legacy complete's `remote_tokens`).
+    /// Sum of each record's total (the provider's own, else the halves it
+    /// reported).
     pub total: u64,
     /// Sum of `prompt_tokens`.
     pub prompt: u64,
@@ -52,11 +52,9 @@ pub struct UsageSum {
     pub utility: u64,
     /// Usage records counted, `absent` ones included.
     pub usage_records: u64,
-    /// Counted entries (usage records or legacy completes) that reported a
-    /// count: `0` means nothing measured, which a cell shows as `-`, never 0.
+    /// Usage records that reported a count: `0` means nothing measured, which
+    /// a cell shows as `-`, never 0.
     pub reported: u64,
-    /// Legacy `dispatch complete` records counted.
-    pub legacy_completes: u64,
 }
 
 impl UsageSum {
@@ -73,9 +71,10 @@ impl UsageSum {
         if a.reported {
             self.reported += 1;
         }
+        self.usage_records += 1;
     }
 
-    /// Fold another sum into this one (the overall over every execution).
+    /// Fold another sum into this one (the overall over every run).
     fn merge(&mut self, o: &UsageSum) {
         self.total = self.total.saturating_add(o.total);
         self.prompt = self.prompt.saturating_add(o.prompt);
@@ -86,7 +85,6 @@ impl UsageSum {
         self.utility = self.utility.saturating_add(o.utility);
         self.usage_records += o.usage_records;
         self.reported += o.reported;
-        self.legacy_completes += o.legacy_completes;
     }
 }
 
@@ -96,42 +94,7 @@ impl UsageSum {
 // `darkmux_crew::budget`, below this crate in the dependency graph) and this
 // fold read a record the same way. Re-exported here unchanged.
 pub use darkmux_crew::usage::{is_usage_record, usage_contribution, usage_purpose, UsageAmount, MAX_COUNT};
-use darkmux_crew::usage::{amount_of, has_any_token_counts, payload_of};
-
-/// The key a record is grouped under: the twin of `executionKey`. The
-/// execution it names; a record from before 4.0 names none and none is
-/// invented for it (#3036), so it is keyed by its session and mission (a bare
-/// session id recurs across unrelated runs in such an archive, #2690/#2709),
-/// or, with no session, by the record itself (its time, handle and machine).
-fn execution_key(v: &serde_json::Value) -> String {
-    let text = |key: &str| v.get(key).and_then(serde_json::Value::as_str).unwrap_or_default();
-    match (text("execution_id"), text("session_id")) {
-        ("", "") => format!("unnamed::{}:{}:{}:{}", text("mission_id"), text("ts"), text("handle"), text("machine_uid")),
-        ("", session) => format!("unnamed:{session}:{}", text("mission_id")),
-        (execution, _) => execution.to_string(),
-    }
-}
-
-/// The records the legacy fallback counts (the twin of
-/// `legacyCompleteCounts`): every token-bearing `dispatch complete` whose
-/// execution holds no usage record.
-pub fn legacy_complete_counts<'a>(records: &[&'a serde_json::Value]) -> Vec<&'a serde_json::Value> {
-    let with_usage: HashSet<String> =
-        records.iter().filter(|r| is_usage_record(r)).map(|r| execution_key(r)).collect();
-    records
-        .iter()
-        .copied()
-        .filter(|r| is_legacy_fallback_complete(r, &with_usage))
-        .collect()
-}
-
-fn is_dispatch_complete(v: &serde_json::Value) -> bool {
-    darkmux_flow::reader::action_of(v) == Some(darkmux_flow::FlowAction::DispatchComplete)
-}
-
-fn is_legacy_fallback_complete(v: &serde_json::Value, with_usage: &HashSet<String>) -> bool {
-    is_dispatch_complete(v) && has_any_token_counts(payload_of(v)) && !with_usage.contains(&execution_key(v))
-}
+use darkmux_crew::usage::{amount_of, payload_of};
 
 /// THE sum over a slice of records: [`UsageFold`] driven to completion.
 pub fn sum_usage<'a>(records: impl IntoIterator<Item = &'a serde_json::Value>) -> UsageSum {
@@ -148,7 +111,7 @@ pub fn sum_usage<'a>(records: impl IntoIterator<Item = &'a serde_json::Value>) -
 /// lines), the endpoint it called (its registry id when the record carries
 /// one, else the endpoint string), the model it requested, and the model the
 /// reply named when it carried one; each is a fact off the record, absent
-/// when the record did not carry it (a legacy complete, a pre-1.57 turn).
+/// when the record did not carry it (a pre-5.0 record).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct UsageGroup {
     /// The executing machine's `machine_id` (its newest name in the window,
@@ -187,7 +150,7 @@ impl UsageGroup {
 /// One purpose's share of a group.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct UsageSplit {
-    /// Records counted (usage records or legacy completes).
+    /// Usage records counted.
     pub calls: u64,
     pub total: u64,
     pub input: u64,
@@ -218,11 +181,15 @@ impl UsageSplit {
 
 /// The breakdown `run list --usage` prints and `--json` emits: the overall
 /// sum plus one [`UsageGroup`] per (executing machine, endpoint, requested
-/// model, reported model), largest first.
+/// model, reported model), largest first, plus the calls that belong to no run.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct UsageBreakdown {
     pub overall: UsageSum,
     pub groups: Vec<UsageGroup>,
+    /// The calls whose record names no session and no mission (radio routing,
+    /// a `doctor --probe`): in `overall`, on no run's TOKENS cell. The run rows
+    /// plus this equal the overall.
+    pub no_run: UsageSplit,
 }
 
 /// What makes two usage records one line of the breakdown. The endpoint
@@ -263,15 +230,6 @@ fn group_key(v: &serde_json::Value) -> GroupKey {
     GroupKey { machine: machine_of(v).0, endpoint, endpoint_id, requested, reported }
 }
 
-/// A pending legacy candidate: held until the fold knows whether its run
-/// key ever saw a usage record.
-struct PendingComplete {
-    execution: usize,
-    group: GroupKey,
-    label: GroupLabel,
-    amount: UsageAmount,
-}
-
 /// The display facts of one record that are NOT part of its group's key:
 /// the machine's name, the endpoint string, and when the record was written
 /// (the newest name wins, the smallest endpoint string wins, so the line
@@ -287,60 +245,46 @@ fn group_label(v: &serde_json::Value) -> GroupLabel {
 }
 
 /// The fold: feed it every record in a window (any order), then `finish`.
-/// Linear in the records, one small allocation per NEW execution or group.
+/// Linear in the records, one small allocation per NEW run key or group.
 /// `since` (an ISO `YYYY-MM-DDTHH:MM:SSZ` bound, inclusive) keeps records
-/// stamped before it out of the SUMS only; the flow schema's timestamps
-/// sort as plain strings, so this is a lexical compare, the same one
-/// `runs.rs` uses everywhere. Every usage record the pass visits still
-/// marks its execution as one that HAS usage records, whatever its stamp:
-/// the legacy rule asks whether the execution ever wrote one, and a bound
-/// that cut a modern execution's turns off must not turn its complete into
-/// a legacy count (review MUST FIX 1).
+/// stamped before it out of the sums; the flow schema's timestamps sort as
+/// plain strings, so this is a lexical compare, the same one `runs.rs` uses
+/// everywhere.
 pub struct UsageFold {
     since: Option<String>,
-    executions: Vec<ExecutionEntry>,
-    execution_index: HashMap<String, usize>,
+    runs: Vec<RunEntry>,
+    run_index: HashMap<(String, String), usize>,
     groups: HashMap<GroupKey, UsageGroup>,
     /// The timestamp of the record whose machine name each group shows.
     machine_ts: HashMap<GroupKey, String>,
-    completes: Vec<PendingComplete>,
+    no_run: UsageSplit,
 }
 
-/// The session and mission an execution's records carry, kept so a caller
-/// can look a run's executions up by either.
-#[derive(Debug, Clone, Default)]
-struct ExecutionParts {
+/// One (session, mission) pair's sum inside the fold: the unit a run row
+/// reads its tokens from. Either id may be empty (a record names what it
+/// names; neither means the record belongs to no run).
+#[derive(Debug, Default)]
+struct RunEntry {
     session_id: String,
     mission_id: String,
-}
-
-/// One execution's state inside the fold.
-#[derive(Debug, Default)]
-struct ExecutionEntry {
-    parts: ExecutionParts,
-    /// True once ANY usage record of this execution was visited, in the window
-    /// or not — the legacy rule's question. `sum.usage_records` counts
-    /// only the ones in the window.
-    has_usage: bool,
     sum: UsageSum,
 }
 
 impl UsageFold {
     pub fn new(since: Option<String>) -> Self {
-        Self { since, executions: Vec::new(), execution_index: HashMap::new(), groups: HashMap::new(), machine_ts: HashMap::new(), completes: Vec::new() }
+        Self { since, runs: Vec::new(), run_index: HashMap::new(), groups: HashMap::new(), machine_ts: HashMap::new(), no_run: UsageSplit::default() }
     }
 
-    fn execution_slot(&mut self, v: &serde_json::Value) -> usize {
-        let key = execution_key(v);
-        if let Some(&i) = self.execution_index.get(&key) {
+    /// The entry of the (session, mission) `v` names, created on first sight.
+    fn run_slot(&mut self, v: &serde_json::Value) -> usize {
+        let s = |k: &str| text_of(v, k).unwrap_or_default();
+        let key = (s("session_id"), s("mission_id"));
+        if let Some(&i) = self.run_index.get(&key) {
             return i;
         }
-        let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
-        let parts = ExecutionParts { session_id: s("session_id"), mission_id: s("mission_id") };
-        self.executions.push(ExecutionEntry { parts, ..Default::default() });
-        let i = self.executions.len() - 1;
-        self.execution_index.insert(key, i);
-        i
+        self.runs.push(RunEntry { session_id: key.0.clone(), mission_id: key.1.clone(), sum: UsageSum::default() });
+        self.run_index.insert(key, self.runs.len() - 1);
+        self.runs.len() - 1
     }
 
     /// True when `v` is stamped inside the window (or carries no stamp:
@@ -356,24 +300,20 @@ impl UsageFold {
         }
     }
 
-    /// Fold one flow record. Anything that is neither a usage record nor a
-    /// `dispatch complete` is ignored at no cost beyond the action read.
+    /// Fold one flow record. Anything that is not a usage record is ignored
+    /// at no cost beyond the action read.
     pub fn add(&mut self, v: &serde_json::Value) {
-        if is_usage_record(v) {
-            let i = self.execution_slot(v);
-            self.executions[i].has_usage = true;
-            if !self.in_window(v) {
-                return;
-            }
-            let amount = amount_of(payload_of(v));
-            let sum = &mut self.executions[i].sum;
-            sum.add(&amount);
-            sum.usage_records += 1;
-            self.group(group_key(v), group_label(v), &amount);
-        } else if is_dispatch_complete(v) && self.in_window(v) && has_any_token_counts(payload_of(v)) {
-            let execution = self.execution_slot(v);
-            self.completes.push(PendingComplete { execution, group: group_key(v), label: group_label(v), amount: amount_of(payload_of(v)) });
+        if !is_usage_record(v) || !self.in_window(v) {
+            return;
         }
+        let amount = amount_of(payload_of(v));
+        let i = self.run_slot(v);
+        let entry = &mut self.runs[i];
+        entry.sum.add(&amount);
+        if entry.session_id.is_empty() && entry.mission_id.is_empty() {
+            self.no_run.add(&amount);
+        }
+        self.group(group_key(v), group_label(v), &amount);
     }
 
     fn group(&mut self, key: GroupKey, label: GroupLabel, amount: &UsageAmount) {
@@ -404,28 +344,18 @@ impl UsageFold {
         }
     }
 
-    /// Apply the legacy rule and produce the index.
-    pub fn finish(mut self) -> UsageIndex {
-        let completes = std::mem::take(&mut self.completes);
-        for c in completes {
-            let entry = &mut self.executions[c.execution];
-            if entry.has_usage {
-                continue;
-            }
-            entry.sum.add(&c.amount);
-            entry.sum.legacy_completes += 1;
-            self.group(c.group, c.label, &c.amount);
-        }
+    /// Produce the index.
+    pub fn finish(self) -> UsageIndex {
         let mut overall = UsageSum::default();
         let mut by_session: HashMap<String, Vec<usize>> = HashMap::new();
         let mut by_mission: HashMap<String, Vec<usize>> = HashMap::new();
-        for (i, entry) in self.executions.iter().enumerate() {
+        for (i, entry) in self.runs.iter().enumerate() {
             overall.merge(&entry.sum);
-            if !entry.parts.session_id.is_empty() {
-                by_session.entry(entry.parts.session_id.clone()).or_default().push(i);
+            if !entry.session_id.is_empty() {
+                by_session.entry(entry.session_id.clone()).or_default().push(i);
             }
-            if !entry.parts.mission_id.is_empty() {
-                by_mission.entry(entry.parts.mission_id.clone()).or_default().push(i);
+            if !entry.mission_id.is_empty() {
+                by_mission.entry(entry.mission_id.clone()).or_default().push(i);
             }
         }
         let mut groups: Vec<UsageGroup> = self.groups.into_values().collect();
@@ -439,8 +369,8 @@ impl UsageFold {
                 .then_with(|| a.requested_model.cmp(&b.requested_model))
                 .then_with(|| a.reported_model.cmp(&b.reported_model))
         });
-        let executions = self.executions.into_iter().map(|e| (e.parts, e.sum)).collect();
-        UsageIndex { executions, by_session, by_mission, breakdown: UsageBreakdown { overall, groups } }
+        let runs = self.runs.into_iter().map(|e| (e.mission_id, e.sum)).collect();
+        UsageIndex { runs, by_session, by_mission, breakdown: UsageBreakdown { overall, groups, no_run: self.no_run } }
     }
 }
 
@@ -448,7 +378,8 @@ impl UsageFold {
 /// plus the breakdown.
 #[derive(Debug, Default)]
 pub struct UsageIndex {
-    executions: Vec<(ExecutionParts, UsageSum)>,
+    /// Each (session, mission) entry's mission id and sum.
+    runs: Vec<(String, UsageSum)>,
     by_session: HashMap<String, Vec<usize>>,
     by_mission: HashMap<String, Vec<usize>>,
     pub breakdown: UsageBreakdown,
@@ -456,9 +387,9 @@ pub struct UsageIndex {
 
 impl UsageIndex {
     /// ALL tokens (utility included) of the run whose records carry
-    /// `mission_id` OR one of `session_ids`, each execution counted once.
-    /// `None` when nothing was measured: no execution matched, or none of
-    /// the matched executions' records reported a count.
+    /// `mission_id` OR one of `session_ids`, each entry counted once.
+    /// `None` when nothing was measured: no entry matched, or none of
+    /// the matched entries' records reported a count.
     ///
     /// With a `mission_id`, a session hit counts only when its records
     /// name that mission or none: the scheduler stamps `session_id` from
@@ -475,22 +406,22 @@ impl UsageIndex {
         let mut seen: HashSet<usize> = HashSet::new();
         let mut total = 0u64;
         let mut reported = 0u64;
-        let mut take = |i: usize, executions: &[(ExecutionParts, UsageSum)]| {
+        let mut take = |i: usize, runs: &[(String, UsageSum)]| {
             if seen.insert(i) {
-                total = total.saturating_add(executions[i].1.total);
-                reported += executions[i].1.reported;
+                total = total.saturating_add(runs[i].1.total);
+                reported += runs[i].1.reported;
             }
         };
         if let Some(mid) = mission_id {
             for &i in self.by_mission.get(mid).into_iter().flatten() {
-                take(i, &self.executions);
+                take(i, &self.runs);
             }
         }
         for sid in session_ids {
             for &i in self.by_session.get(sid).into_iter().flatten() {
-                let owner = self.executions[i].0.mission_id.as_str();
+                let owner = self.runs[i].0.as_str();
                 if owner.is_empty() || mission_id.is_none() || mission_id == Some(owner) {
-                    take(i, &self.executions);
+                    take(i, &self.runs);
                 }
             }
         }
@@ -567,8 +498,7 @@ mod tests {
 
     /// The shared value domain (`domain.jsonl` + `clamp.jsonl`): both sums
     /// floor a finite number to an integer in `[0, 2^53]`, read anything
-    /// else as 0, and judge "reported" (usage record or legacy complete
-    /// alike) by that same reading.
+    /// else as 0, and judge "reported" by that same reading.
     #[test]
     fn shared_domain_goldens_match_the_viewer() {
         for (records_file, expected_file) in [("domain.jsonl", "domain-expected.json"), ("clamp.jsonl", "clamp-expected.json")] {
@@ -577,7 +507,6 @@ mod tests {
             let s = &idx.breakdown.overall;
             assert_eq!(shape(s.total, s.prompt, s.completion, s.cached), expected["overall"], "{records_file}: overall");
             assert_eq!(s.usage_records, expected["usage_records"].as_u64().unwrap(), "{records_file}");
-            assert_eq!(s.legacy_completes, expected["legacy_completes_counted"].as_u64().unwrap(), "{records_file}");
             assert_eq!(s.reported, expected["reported_entries"].as_u64().unwrap(), "{records_file}: reported");
             if let Some(by_model) = expected.get("by_requested_model") {
                 assert_eq!(breakdown_by(&records, "requested_model"), *by_model, "{records_file}");
@@ -609,31 +538,40 @@ mod tests {
         assert_eq!(o.total, 6 * (1u64 << 53), "six clamped maxima, exactly");
     }
 
-    /// The legacy fallback asks whether THIS EXECUTION wrote a usage record,
-    /// not whether anything in its session did: two executions in one session
-    /// (a map's items) are two questions. A sibling's usage record must not
-    /// hide the other's token-bearing `dispatch.complete`.
+    /// (#3061) A resumed dispatch reuses its execution id under a NEW session,
+    /// so the execution is not the unit of attribution: each record counts
+    /// under its OWN session. The resumed pair's two sessions read their own
+    /// tokens, neither the other's.
     #[test]
-    fn a_siblings_usage_record_does_not_hide_an_executions_legacy_complete() {
-        let usage = serde_json::json!({"action":"telemetry.tokens","category":"telemetry","source":"tokens","session_id":"m.task.t","mission_id":"m","execution_id":"exec-a","payload":{"total_tokens":10,"token_source":"provider"}});
-        let complete_a = serde_json::json!({"action":"dispatch.complete","session_id":"m.task.t","mission_id":"m","execution_id":"exec-a","payload":{"total_tokens":10}});
-        let complete_b = serde_json::json!({"action":"dispatch.complete","session_id":"m.task.t","mission_id":"m","execution_id":"exec-b","payload":{"total_tokens":7}});
-        let idx = fold_all(&[usage, complete_a, complete_b], None);
-        let o = &idx.breakdown.overall;
-        assert_eq!((o.total, o.usage_records, o.legacy_completes), (17, 1, 1), "A by its usage record, B by its complete: {o:?}");
-        assert_eq!(idx.tokens_for(Some("m"), ["m.task.t"]), Some(17), "and both are the one run's tokens");
+    fn a_resumed_executions_records_count_under_their_own_sessions() {
+        let usage = |sid: &str, total: u64| serde_json::json!({"action":"telemetry.tokens","category":"telemetry","source":"tokens","session_id":sid,"mission_id":"m","execution_id":"exec-shared","payload":{"token_source":"provider","total_tokens":total}});
+        let idx = fold_all(&[usage("sess-first", 100), usage("sess-resumed", 40), usage("sess-resumed", 2)], None);
+        assert_eq!(idx.tokens_for_session("sess-first"), Some(100), "the first session reads only its own");
+        assert_eq!(idx.tokens_for_session("sess-resumed"), Some(42), "and the resumed one has its own, not `-`");
+        assert_eq!(idx.breakdown.overall.total, 142);
     }
 
-    /// A record naming no execution (written before 4.0) is keyed by its
-    /// session and mission: the fallback reads as it always did.
+    /// The same session under another mission is another run (the scheduler
+    /// stamps one session id from a TASK id, which two missions can share).
     #[test]
-    fn a_pre_4_0_run_still_keys_on_its_session_and_mission() {
-        let usage = serde_json::json!({"action":"telemetry.tokens","category":"telemetry","source":"tokens","session_id":"s","mission_id":"m","payload":{"total_tokens":10,"token_source":"provider"}});
-        let complete = serde_json::json!({"action":"dispatch.complete","session_id":"s","mission_id":"m","payload":{"total_tokens":10}});
-        let other_mission = serde_json::json!({"action":"dispatch.complete","session_id":"s","mission_id":"other","payload":{"total_tokens":3}});
-        let idx = fold_all(&[usage, complete, other_mission], None);
-        let o = &idx.breakdown.overall;
-        assert_eq!((o.total, o.legacy_completes), (13, 1), "the same session under another mission is another run: {o:?}");
+    fn the_same_session_under_another_mission_is_another_run() {
+        let usage = |mission: &str, total: u64| serde_json::json!({"action":"telemetry.tokens","category":"telemetry","source":"tokens","session_id":"s","mission_id":mission,"payload":{"token_source":"provider","total_tokens":total}});
+        let idx = fold_all(&[usage("m", 10), usage("other", 3)], None);
+        assert_eq!(idx.tokens_for(Some("m"), ["s"]), Some(10));
+        assert_eq!(idx.tokens_for(Some("other"), ["s"]), Some(3));
+    }
+
+    /// A call that names no session and no mission (radio routing, a
+    /// `doctor --probe`) is in the overall and in `no_run`, on no run: the
+    /// runs' tokens plus `no_run` are the overall.
+    #[test]
+    fn a_sessionless_call_is_counted_in_no_run_so_rows_plus_it_equal_the_total() {
+        let run = serde_json::json!({"action":"telemetry.tokens","category":"telemetry","source":"tokens","session_id":"s1","payload":{"token_source":"provider","total_tokens":100}});
+        let routing = serde_json::json!({"action":"telemetry.tokens","category":"telemetry","source":"tokens","handle":"radio-router","payload":{"purpose":"utility","call_kind":"single_shot","token_source":"provider","total_tokens":9}});
+        let idx = fold_all(&[run, routing.clone(), routing], None);
+        assert_eq!(idx.breakdown.overall.total, 118);
+        assert_eq!((idx.breakdown.no_run.calls, idx.breakdown.no_run.total), (2, 18));
+        assert_eq!(idx.tokens_for_session("s1").unwrap() + idx.breakdown.no_run.total, idx.breakdown.overall.total);
     }
 
     /// One usage record as the machine that EXECUTED the call wrote it.
@@ -764,8 +702,8 @@ mod tests {
     }
 
     /// The per-field breakdown the TS test computes the same way: every
-    /// usage record's contribution plus the legacy completes, keyed on one
-    /// payload field, `(none)` when absent.
+    /// usage record's contribution, keyed on one payload field, `(none)`
+    /// when absent.
     fn breakdown_by(records: &[serde_json::Value], field: &str) -> serde_json::Value {
         let refs: Vec<&serde_json::Value> = records.iter().collect();
         let mut out: std::collections::BTreeMap<String, u64> = Default::default();
@@ -778,15 +716,11 @@ mod tests {
                 add(r, &a);
             }
         }
-        for r in legacy_complete_counts(&refs) {
-            add(r, &amount_of(payload_of(r)));
-        }
         serde_json::to_value(out).unwrap()
     }
 
     /// The shared golden: this fold and the viewer's `sumUsage` must agree
-    /// on every figure `tests/usage-golden/expected.json` pins, the legacy
-    /// rule included.
+    /// on every figure `tests/usage-golden/expected.json` pins.
     #[test]
     fn shared_golden_matches_the_viewer() {
         let (records, expected) = golden();
@@ -794,7 +728,6 @@ mod tests {
         let s = &idx.breakdown.overall;
         assert_eq!(shape(s.total, s.prompt, s.completion, s.cached), expected["overall"], "overall");
         assert_eq!(s.usage_records, expected["usage_records"].as_u64().unwrap());
-        assert_eq!(s.legacy_completes, expected["legacy_completes_counted"].as_u64().unwrap());
         assert_eq!(s.utility, expected["by_purpose"]["utility"]["total"].as_u64().unwrap());
 
         // The groups, re-summed by purpose, are the golden's by_purpose.
@@ -814,7 +747,7 @@ mod tests {
         assert_eq!(purpose_shape(&work), expected["by_purpose"]["work"], "work");
         assert_eq!(purpose_shape(&util), expected["by_purpose"]["utility"], "utility");
         assert_eq!(shape(work.total, work.input, work.generated, work.cached), expected["excluding_utility"]);
-        assert_eq!(work.calls + util.calls, s.usage_records + s.legacy_completes, "every counted entry lands in one split");
+        assert_eq!(work.calls + util.calls, s.usage_records, "every counted record lands in one split");
 
         // The groups, re-keyed on one field, are the golden's per-field maps.
         let by = |field: &str| {
@@ -839,26 +772,21 @@ mod tests {
         assert_eq!(&sum_usage(records.iter()), s);
     }
 
-    /// The golden's legacy complete (`crew-dispatch-old-1`, 1000 tokens)
-    /// is counted; every complete whose execution holds a usage record is
-    /// not, including the count-less `absent` probe step's.
+    /// A `dispatch complete` carries no tokens here, whatever its payload
+    /// says: the golden's old runs that wrote only a complete (and a run
+    /// whose usage record is count-less) read as unmeasured, never as their
+    /// complete's total.
     #[test]
-    fn legacy_rule_counts_only_completes_of_runs_with_no_usage_record() {
+    fn a_dispatch_complete_is_never_read_for_tokens() {
         let (records, _) = golden();
-        let refs: Vec<&serde_json::Value> = records.iter().collect();
-        let counted: Vec<&str> =
-            legacy_complete_counts(&refs).iter().map(|r| r["session_id"].as_str().unwrap()).collect();
-        assert_eq!(counted, vec!["crew-dispatch-old-1"]);
         let idx = fold_all(&records, None);
-        assert_eq!(idx.tokens_for_session("crew-dispatch-old-1"), Some(1000));
-        // A run with only an `absent` record (task-probe has counted items
-        // too) — build one: usage record with no counts, then a complete.
+        assert_eq!(idx.tokens_for_session("crew-dispatch-old-1"), None, "its 1,000 live only on a complete");
         let only_absent = vec![
             serde_json::json!({"action":"telemetry.tokens","category":"telemetry","source":"tokens","session_id":"s-abs","payload":{"token_source":"absent","call_kind":"turn"}}),
             serde_json::json!({"action":"dispatch.complete","session_id":"s-abs","payload":{"total_tokens":500}}),
         ];
         let idx = fold_all(&only_absent, None);
-        assert_eq!(idx.breakdown.overall.total, 0, "an absent record silences the complete");
+        assert_eq!(idx.breakdown.overall.total, 0);
         assert_eq!(idx.tokens_for_session("s-abs"), None, "nothing measured reads as absent, never 0");
     }
 
@@ -880,35 +808,22 @@ mod tests {
         assert_eq!(idx.tokens_for_session("crew-dispatch-radio-router-1"), Some(35));
         assert_eq!(idx.tokens_for(Some("no-such-mission"), std::iter::empty()), None);
         // Whole-window total is the plain sum of every key.
-        assert_eq!(idx.breakdown.overall.total, 2228);
+        assert_eq!(idx.breakdown.overall.total, 1228);
     }
 
-    /// (review MUST FIX 1) The reviewer's repro: a modern run whose usage
-    /// records fall before `since` and whose complete falls after it. The
-    /// complete must not be counted as legacy; the run's in-window sum is
-    /// simply zero, and it holds no `(none)` group.
+    /// `since` bounds a run's tokens to the window: records stamped before
+    /// it are out of the sums (and out of the groups), those after it in.
     #[test]
-    fn since_never_turns_a_modern_run_into_a_legacy_one() {
+    fn since_keeps_only_the_windows_share_of_a_run() {
         let usage = |ts: &str, total: u64| serde_json::json!({"action":"telemetry.tokens","category":"telemetry","source":"tokens","session_id":"S1","ts":ts,"payload":{"call_kind":"turn","purpose":"work","requested_model":"m","endpoint":"http://h/v1","token_source":"provider","total_tokens":total}});
-        let records = vec![
-            serde_json::json!({"action":"dispatch.start","session_id":"S1","ts":"2026-09-26T08:00:00Z"}),
-            usage("2026-09-26T08:01:00Z", 120),
-            usage("2026-09-26T08:02:00Z", 90),
-            usage("2026-09-26T08:03:00Z", 180),
-            serde_json::json!({"action":"dispatch.complete","session_id":"S1","ts":"2026-09-26T09:30:00Z","payload":{"total_tokens":300}}),
-        ];
+        let records = vec![usage("2026-09-26T08:01:00Z", 120), usage("2026-09-26T08:02:00Z", 90), usage("2026-09-26T09:30:00Z", 180)];
         let whole = fold_all(&records, None);
-        assert_eq!((whole.tokens_for_session("S1"), whole.breakdown.overall.legacy_completes), (Some(390), 0));
+        assert_eq!(whole.tokens_for_session("S1"), Some(390));
         let bounded = fold_all(&records, Some("2026-09-26T09:00:00Z"));
-        assert_eq!(bounded.breakdown.overall.total, 0);
-        assert_eq!(bounded.breakdown.overall.legacy_completes, 0);
-        assert_eq!(bounded.tokens_for_session("S1"), None, "nothing measured in the window");
-        assert!(bounded.breakdown.groups.is_empty(), "no (none) group: {:?}", bounded.breakdown.groups);
-        // A genuinely legacy run in the same window is still counted.
-        let mut with_legacy = records.clone();
-        with_legacy.push(serde_json::json!({"action":"dispatch.complete","session_id":"S2","ts":"2026-09-26T09:40:00Z","payload":{"total_tokens":50}}));
-        let bounded = fold_all(&with_legacy, Some("2026-09-26T09:00:00Z"));
-        assert_eq!((bounded.breakdown.overall.total, bounded.breakdown.overall.legacy_completes), (50, 1));
+        assert_eq!((bounded.breakdown.overall.total, bounded.tokens_for_session("S1")), (180, Some(180)));
+        let none = fold_all(&records, Some("2026-09-26T10:00:00Z"));
+        assert_eq!(none.tokens_for_session("S1"), None, "nothing measured in the window");
+        assert!(none.breakdown.groups.is_empty(), "no (none) group: {:?}", none.breakdown.groups);
     }
 
     /// (review CONSIDER 2) Two missions whose steps share a session id (the
@@ -951,7 +866,8 @@ mod tests {
     }
 
     /// Utility is split out by each record's purpose inside a group, and
-    /// a legacy record without `purpose` follows the legacy rule.
+    /// a record without `purpose` (before flow schema 1.59.0) reads a
+    /// compaction as utility and anything else as work.
     #[test]
     fn utility_is_split_by_purpose_within_a_group() {
         let (records, _) = golden();
@@ -963,7 +879,7 @@ mod tests {
             .find(|g| g.requested_model.as_deref() == Some("util-4b"))
             .expect("util-4b group");
         // 90 (compaction, purpose utility) + 35 (radio, purpose utility) +
-        // 20 (compaction with NO purpose: the legacy rule) = 145; no work.
+        // 20 (compaction with NO purpose: read as utility) = 145; no work.
         assert_eq!((lm.utility.total, lm.utility.calls, lm.work.total), (145, 3, 0));
         let qa = idx.breakdown.groups.iter().find(|g| g.requested_model.as_deref() == Some("qwen-a")).unwrap();
         assert_eq!((qa.work.total, qa.work.cached, qa.utility.total), (360, Some(40), 0));
@@ -982,28 +898,21 @@ mod tests {
         assert_eq!(serde_json::to_value(&none.breakdown.overall).unwrap().get("cached"), None, "absent on the wire");
     }
 
-    /// `since` drops records stamped before the bound, inclusive at it, and
-    /// the legacy rule is judged on what is INSIDE the window. Fixed
-    /// timestamps on both sides: no clock.
+    /// `since` drops records stamped before the bound, inclusive at it.
+    /// Fixed timestamps on both sides: no clock.
     #[test]
     fn since_bounds_the_fold_lexically_and_inclusively() {
         let (records, _) = golden();
-        // Everything from the radio dispatch (10:11) on: radio 35 +
-        // old-1 complete 1000 + old-2 turn 40 + fixer 80 = 1155.
+        // Everything from the radio dispatch (10:11) on: radio 35 + old-2
+        // turn 40 + fixer 80 = 155.
         let idx = fold_all(&records, Some("2026-09-26T10:11:00Z"));
-        assert_eq!(idx.breakdown.overall.total, 1155);
-        assert_eq!(idx.breakdown.overall.legacy_completes, 1);
-        // One second later the radio usage record (10:11:00) is out, and so
-        // is its complete (same second) — the window holds 1120.
+        assert_eq!(idx.breakdown.overall.total, 155);
+        // One second later the radio usage record (10:11:00) is out: 120.
         let idx = fold_all(&records, Some("2026-09-26T10:11:01Z"));
-        assert_eq!(idx.breakdown.overall.total, 1120);
-        // A bound after the old-2 turn but before its complete: the turn is
-        // outside the SUM, but the run still HAS a usage record, so its
-        // complete (10:16) is never read — a modern run must not turn into
-        // a legacy one because the window cut its turns off (review MUST
-        // FIX 1). Only the fixer's 80 remain.
+        assert_eq!(idx.breakdown.overall.total, 120);
+        // A bound after the old-2 turn: only the fixer's 80 remain.
         let idx = fold_all(&records, Some("2026-09-26T10:16:00Z"));
-        assert_eq!((idx.breakdown.overall.total, idx.breakdown.overall.legacy_completes), (80, 0));
+        assert_eq!(idx.breakdown.overall.total, 80);
         assert_eq!(idx.tokens_for_session("crew-dispatch-old-2"), None, "nothing of it is in the window");
         // A record with no ts is kept.
         let idx = fold_all(

@@ -150,6 +150,17 @@ impl UsageCounts {
             _ => None,
         })
     }
+
+    /// What every DISPLAY sum and every run total counts for one call: its
+    /// [`Self::total_tokens`] when known, else whatever halves it reported (a
+    /// floor: the unreported half is spend nobody measured). One rule on both
+    /// sides of the wire: a usage record's reader (`darkmux_crew::usage::amount_of`)
+    /// reads the same figure off the record's fields. A budget's own
+    /// conservative charge for an unknown spend is a different question, and
+    /// is answered by `darkmux_crew::budget::conservative_spend`.
+    pub fn floor_tokens(&self) -> u64 {
+        self.total_tokens().unwrap_or_else(|| self.prompt.unwrap_or(0).saturating_add(self.completion.unwrap_or(0)))
+    }
 }
 
 /// A running sum of [`UsageCounts`], one call at a time.
@@ -157,10 +168,10 @@ impl UsageCounts {
 pub struct TokenSum {
     pub prompt: u64,
     pub completion: u64,
-    /// Each call's [`UsageCounts::total_tokens`], summed: never recomputed
-    /// as prompt + completion over the whole run. A call whose total is
-    /// unknown adds nothing here (its reported halves still add to
-    /// `prompt`/`completion`).
+    /// Each call's [`UsageCounts::floor_tokens`], summed: never recomputed
+    /// as prompt + completion over the whole run. A call that reported only
+    /// one half adds that half (a floor), the figure a usage record's display
+    /// sum shows.
     pub total: u64,
     /// `None` until a call reports the field.
     pub reasoning: Option<u64>,
@@ -171,7 +182,7 @@ impl TokenSum {
     pub fn add(&mut self, c: &UsageCounts) {
         self.prompt = self.prompt.saturating_add(c.prompt.unwrap_or(0));
         self.completion = self.completion.saturating_add(c.completion.unwrap_or(0));
-        self.total = self.total.saturating_add(c.total_tokens().unwrap_or(0));
+        self.total = self.total.saturating_add(c.floor_tokens());
         if let Some(r) = c.reasoning {
             self.reasoning = Some(self.reasoning.unwrap_or(0).saturating_add(r));
         }
@@ -199,6 +210,22 @@ mod tests {
         assert_eq!((sum.cached, sum.reasoning), (Some(0), Some(4)), "a reported zero is a reading, and the first report starts the sum");
         sum.add(&UsageCounts { prompt: Some(1), completion: Some(1), cached: Some(6), ..Default::default() });
         assert_eq!((sum.cached, sum.reasoning), (Some(6), Some(4)), "a later call that omits a field leaves it alone");
+    }
+
+    /// (#3061) One rule for a half-reported call: the run's total counts what
+    /// the call DID report (its prompt half alone is a floor on the spend),
+    /// the same figure a usage record's display sum shows. A sum that dropped
+    /// the half would read a prompt-only call as free.
+    #[test]
+    fn a_call_reporting_one_half_adds_that_half_to_the_total() {
+        let mut sum = TokenSum::default();
+        sum.add(&UsageCounts { prompt: Some(900), ..Default::default() });
+        sum.add(&UsageCounts { completion: Some(40), ..Default::default() });
+        sum.add(&UsageCounts { prompt: Some(10), completion: Some(5), ..Default::default() });
+        assert_eq!((sum.prompt, sum.completion, sum.total), (910, 45, 955));
+        assert_eq!(UsageCounts { prompt: Some(900), ..Default::default() }.floor_tokens(), 900);
+        assert_eq!(UsageCounts::default().floor_tokens(), 0, "nothing reported adds nothing");
+        assert_eq!(UsageCounts { total: Some(7), prompt: Some(900), ..Default::default() }.floor_tokens(), 7, "the provider's total still wins");
     }
 
     #[test]
@@ -289,7 +316,7 @@ mod tests {
         s.add(&UsageCounts { prompt: Some(5), completion: Some(1), ..Default::default() });
         s.add(&UsageCounts::default());
         s.add(&UsageCounts { completion: Some(7), ..Default::default() });
-        assert_eq!((s.prompt, s.completion, s.total), (15, 10, 26), "a call with no known total adds none");
+        assert_eq!((s.prompt, s.completion, s.total), (15, 10, 33), "a call with no known total adds the halves it reported (#3061)");
         assert_eq!(s.reasoning, None, "no call reported reasoning");
         s.add(&UsageCounts { reasoning: Some(0), ..Default::default() });
         assert_eq!(s.reasoning, Some(0), "a reported 0 is a 0");

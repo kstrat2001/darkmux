@@ -814,6 +814,14 @@ fn merged(a: &UsageSplit, b: &UsageSplit) -> UsageSplit {
     }
 }
 
+/// The calls that belong to no run (radio routing, a `doctor --probe`) are in
+/// the totals above but on no run's TOKENS cell; say how much, so the rows
+/// plus this line equal the total.
+fn no_run_note(split: &UsageSplit) -> String {
+    let calls = if split.calls == 1 { "call" } else { "calls" };
+    format!("{} {calls} on no run ({} tokens): in the totals, on no run's TOKENS cell", grouped(split.calls), grouped(split.total))
+}
+
 /// The calls a provider answered without a usage block are counted as calls
 /// and add 0 tokens here, the same reading the endpoint window budget takes
 /// (the conservative charge applies only to a dispatch's own cap). Say so
@@ -836,13 +844,8 @@ fn usage_lines(report: &UsageReport, width: Option<usize>) -> Vec<String> {
     let o = &b.overall;
     let mut lines = Vec::new();
     let window = if report.default_window { "the default 14-day window" } else { "--since" };
-    let legacy = match o.legacy_completes {
-        0 => String::new(),
-        1 => " · 1 legacy complete".to_string(),
-        n => format!(" · {n} legacy completes"),
-    };
     lines.push(style::header(&format!(
-        "usage since {} ({window}) · {} calls{legacy}",
+        "usage since {} ({window}) · {} calls",
         report.since,
         grouped(o.usage_records)
     )));
@@ -919,6 +922,9 @@ fn usage_lines(report: &UsageReport, width: Option<usize>) -> Vec<String> {
     lines.push(format!("{}{}", label("all", "", ""), usage_numbers(&all)));
     if utility.calls > 0 {
         lines.push(format!("{}{}", label("utility", "", ""), usage_numbers(&utility)));
+    }
+    if b.no_run.calls > 0 {
+        lines.push(style::dim(&no_run_note(&b.no_run)));
     }
     if all.unreported > 0 {
         lines.push(style::dim(&unreported_note(all.unreported)));
@@ -1587,10 +1593,10 @@ mod tests {
                     completion: 290,
                     cached: Some(140),
                     utility: 145,
-                    usage_records: 8,
+                    usage_records: 9,
                     reported: 9,
-                    legacy_completes: 1,
                 },
+                no_run: split(2, 110, 95, None, 15),
                 groups: vec![
                     UsageGroup {
                         machine: Some("laptop".into()),
@@ -1642,7 +1648,8 @@ mod tests {
         let lines = usage_lines(&sample_report(), None);
         let text = lines.join("\n");
         assert!(lines[0].starts_with("usage since 2026-09-12T00:00:00Z"), "{text}");
-        assert!(lines[0].contains("8 calls") && lines[0].contains("1 legacy complete"), "{text}");
+        assert!(lines[0].contains("9 calls") && !lines[0].contains("legacy"), "{text}");
+        assert!(text.contains("2 calls on no run (110 tokens)"), "{text}");
         let header = &lines[1];
         for col in ["MACHINE", "ENDPOINT", "MODEL", "CALLS", "INPUT", "CACHED", "GENERATED", "TOTAL"] {
             assert!(header.contains(col), "{col} missing from {header:?}");
