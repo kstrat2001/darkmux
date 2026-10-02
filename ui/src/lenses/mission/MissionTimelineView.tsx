@@ -12,6 +12,7 @@ import { StepMeterEl, StepRow } from "./StepRow";
 import { WorkStatus } from "../../components/WorkStatus";
 import { groupTimeline, type TaskAggMetrics } from "./timeline";
 import type { GraphEdge, GraphNode, MetricsMap } from "./graph";
+import { onIntentClick } from "../../lib/clickIntent";
 
 function TltCount({ open, stepCount }: { open: boolean; stepCount: number }) {
   if (open || stepCount === 0) return <span className="tlt-count" />;
@@ -44,7 +45,7 @@ function TaskCard({
         className="tlt-hd"
         role="button"
         tabIndex={0}
-        onClick={onToggle}
+        onClick={onIntentClick(onToggle)}
         onKeyDown={(e) => {
           if (e.key === "Enter" || e.key === " ") {
             e.preventDefault();

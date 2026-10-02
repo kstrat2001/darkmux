@@ -104,6 +104,32 @@ const TABS = [
 ];
 
 test.describe("nav chrome (Packet 1.5)", () => {
+  test("dragging to select text on a fleet card never drills it; a plain click does (select-not-click)", async ({ page }) => {
+    const meta = loadMeta();
+    installCorpusRoutes(page, meta);
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await page.goto("/index.html");
+    await expect(page.locator("body")).not.toHaveClass(/booting/);
+
+    const card = page.locator(".mach").first();
+    await expect(card).toBeVisible();
+    const before = await page.evaluate(() => location.hash);
+    const box = await card.locator(".name").first().boundingBox();
+    expect(box, "the card name has a bounding box").not.toBeNull();
+    const y = box.y + box.height / 2;
+    await page.mouse.move(box.x + 1, y);
+    await page.mouse.down();
+    await page.mouse.move(box.x + Math.max(box.width - 1, 20), y, { steps: 8 });
+    await page.mouse.up();
+    const selected = await page.evaluate(() => String(window.getSelection()));
+    expect(selected.length, "the drag selected some card text").toBeGreaterThan(0);
+    expect(await page.evaluate(() => location.hash), "a selection drag must not navigate").toBe(before);
+
+    await page.evaluate(() => window.getSelection()?.removeAllRanges());
+    await card.click({ position: { x: 4, y: 4 } });
+    await expect.poll(() => page.evaluate(() => location.hash)).not.toBe(before);
+  });
+
   test("tabs render in the legacy DOM order (viewer.html:816: fleet, console, runs, machine) at 390px, no horizontal overflow", async ({ page }) => {
     const meta = loadMeta();
     installCorpusRoutes(page, meta);

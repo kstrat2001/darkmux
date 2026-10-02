@@ -33,6 +33,7 @@ import { restReasonLabel } from "../lib/tokenRate";
 import { openModalEl } from "../lib/dialogManager";
 import type { DispatchRestPayload } from "../types/generated/DispatchRestPayload";
 import { ACTION, payloadOf, recKey, unknownActionCount, type NormRecord } from "../lib/ingest";
+import { onIntentClick } from "../lib/clickIntent";
 
 /** Row cap — `renderLog()`'s `all.slice(-50).reverse()` (viewer.html:2443):
  * newest 50, newest-first. */
@@ -1333,7 +1334,7 @@ export function EventLogColumn({
                     // mission lens's own parity-extraction hook
                     // (`tests/parity/lib/extract-graph.js` reads it).
                     title: r.handle || undefined,
-                    onClick: () => selectRecord(r),
+                    onClick: onIntentClick(() => selectRecord(r)),
                     onKeyDown: onActivateKeyDown(() => selectRecord(r)),
                   };
               // (#2863) A turn is the header its events sit under: how long
@@ -1492,7 +1493,7 @@ export function EventLogColumn({
                   // justified addition to this shared component, not a
                   // fork of it.
                   title={r.handle || undefined}
-                  onClick={() => selectRecord(r)}
+                  onClick={onIntentClick(() => selectRecord(r))}
                   onKeyDown={onActivateKeyDown(() => selectRecord(r))}
                 >
                   <span className="eventlog__rectime">{clkAt(r.tMs)}</span>{" "}

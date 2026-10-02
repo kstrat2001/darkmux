@@ -38,6 +38,7 @@ import {
   runDestination,
   MISSION_GRAPH_UNREACHABLE_NOTICE,
 } from "./format";
+import { onIntentClick } from "../../lib/clickIntent";
 
 /**
  * The runs board — `#lens=runs` (kind filter over mission/dispatch/lab,
@@ -855,7 +856,7 @@ function RunRow({ run, machine, notReporting, onActivate }: { run: Run; machine:
       // promise a destination 6% of the time there is none.
       {...(interactive ? { "data-nav": "1" } : {})}
       {...(interactive
-        ? { role: "button" as const, tabIndex: 0, onClick: onActivate, onKeyDown: onActivateKeyDown(onActivate) }
+        ? { role: "button" as const, tabIndex: 0, onClick: onIntentClick(onActivate), onKeyDown: onActivateKeyDown(onActivate) }
         : {})}
     >
       <div className="labrunmain">

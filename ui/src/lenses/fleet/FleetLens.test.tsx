@@ -812,6 +812,28 @@ describe("FleetLens", () => {
   // tests below are the LOCAL half. The REMOTE half — what a click on a
   // card this daemon can't confirm as itself actually does — is its own
   // test further down, the inverted case.
+  it("a click that ends a text selection inside a machine card does not navigate (select-not-click)", async () => {
+    const today = todayUTC();
+    mockFleetFetch({
+      flowToday: [
+        { ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
+      ],
+      specs: { machine_id: "MacBook-Pro", cpu_brand: "Apple M5 Max" },
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    const card = document.querySelector(".mach")!;
+    const range = document.createRange();
+    range.selectNodeContents(card.querySelector(".name")!);
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(range);
+    fireEvent.click(card);
+    expect(window.location.hash).toBe("");
+    window.getSelection()!.removeAllRanges();
+    fireEvent.click(card);
+    expect(window.location.hash).toBe("#lens=runs&machine=MacBook-Pro");
+  });
+
   it("clicking the LOCAL machine card navigates to the residency room via a real hash write", async () => {
     const today = todayUTC();
     mockFleetFetch({

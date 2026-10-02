@@ -45,6 +45,7 @@ import {
   type GraphNode,
   type MetricsMap,
 } from "./graph";
+import { endedSelectionOrDrag } from "../../lib/clickIntent";
 
 interface MissionNodeData {
   label: string;
@@ -467,8 +468,8 @@ export function MissionCanvas({
   // nodes are already `selectable:false` in `toRfNodes`, but React Flow
   // still calls `onNodeClick` for a non-selectable node, so this checks
   // `n.kind === "task"` itself rather than relying on that flag.
-  const onNodeClick: NodeMouseHandler = (_event, node) => {
-    if (!onSelectStep) return;
+  const onNodeClick: NodeMouseHandler = (event, node) => {
+    if (!onSelectStep || endedSelectionOrDrag(event)) return;
     const gn = graphNodes.find((n) => n.id === node.id);
     if (!gn || gn.kind !== "task") return;
     const steps = gn.steps || [];

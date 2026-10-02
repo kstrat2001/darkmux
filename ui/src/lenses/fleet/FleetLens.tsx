@@ -1,7 +1,7 @@
 import { judgementAt } from "../../lib/lifecycle";
 import { useLifecyclePolicy } from "../../hooks/useLifecyclePolicy";
 import { encodeMachineKey } from "../../lib/machineKey";
-import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent } from "react";
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent, type MouseEvent } from "react";
 import { fitTubes } from "./tubeFit";
 import { scopeCenter } from "../../lib/scopeCenter";
 import { useQuery } from "@tanstack/react-query";
@@ -44,6 +44,7 @@ import { rowFacts, rowSpecs } from "./viewRows";
 import { runsForMachine } from "../runs/format";
 import { recordsAsOf, type NormRecord } from "../../lib/ingest";
 import { dispatchHash } from "../../lib/route";
+import { onIntentClick } from "../../lib/clickIntent";
 
 /** `ICON.machine` (viewer.html:935) — the generic processor/chip glyph
  * every fleet card renders, since `MACH_ICON` (the per-machine form-factor
@@ -1168,9 +1169,9 @@ export function FleetLens({
             // double-firing; this `aria-label` is the remaining a11y-tree
             // cleanup that nesting still needs.
             aria-label={card.name}
-            onClick={() => {
+            onClick={onIntentClick(() => {
               location.hash = machineDrillHash(encodeMachineKey(machineKeyCtx, card.uid));
-            }}
+            })}
             onKeyDown={(e) => {
               if (e.key === "Enter" || e.key === " ") {
                 e.preventDefault();
@@ -1358,13 +1359,19 @@ export function FleetLens({
                   e.stopPropagation();
                   location.hash = runsHash;
                 };
+                // The selection guard must not swallow the stopPropagation
+                // above, or the outer card would still drill on a selection.
+                const onCountClick = (e: MouseEvent<HTMLDivElement>) => {
+                  e.stopPropagation();
+                  onIntentClick(() => activate(e))(e);
+                };
                 return (
                   <div
                     className="runs runs--live"
                     role="button"
                     tabIndex={0}
                     aria-label={`open the ${card.runsCount} running ${card.runsCount === 1 ? "dispatch" : "dispatches"} on ${card.name}`}
-                    onClick={activate}
+                    onClick={onCountClick}
                     onKeyDown={(e) => {
                       if (e.key === "Enter" || e.key === " ") {
                         e.preventDefault();
