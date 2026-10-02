@@ -59,29 +59,37 @@ pub(crate) struct StatusReading {
 fn outcome_line(outcome: &CardOutcome) -> Option<&'static str> {
     Some(match outcome {
         CardOutcome::Available { .. } => return None,
-        CardOutcome::Unavailable { why, .. } => match why {
-            UnavailableWhy::NoCardRoute => "no card (older peer)",
-            UnavailableWhy::OtherSchemaMajor => "card schema differs",
-            UnavailableWhy::Unparseable => "card unreadable",
-            UnavailableWhy::Unknown => "card unavailable",
-        },
+        CardOutcome::Unavailable { why, .. } => unavailable_line(*why),
         CardOutcome::Mismatch { .. } => "another machine answered",
-        CardOutcome::Unreachable { reason, .. } => match reason {
-            UnreachableReason::BadAddress => "bad address",
-            UnreachableReason::DnsFailed => "address not found",
-            UnreachableReason::IdentityUnavailable => "identity unavailable",
-            UnreachableReason::NotOnOverlay => "not on the overlay network",
-            UnreachableReason::PinNotSaved => "pin not saved",
-            UnreachableReason::PinMismatch => "identity mismatch",
-            UnreachableReason::ListenerOff => "not listening",
-            UnreachableReason::AuthRequired => "auth required",
-            UnreachableReason::RefusedByPeer => "refused by peer",
-            UnreachableReason::ListenerUnavailable => "listener unavailable",
-            UnreachableReason::BadAnswer => "bad answer",
-            UnreachableReason::Unknown => "unreachable",
-        },
+        CardOutcome::Unreachable { reason, .. } => unreachable_line(*reason),
         CardOutcome::Unknown => "card state unknown",
     })
+}
+
+fn unavailable_line(why: UnavailableWhy) -> &'static str {
+    match why {
+        UnavailableWhy::NoCardRoute => "no card (older peer)",
+        UnavailableWhy::OtherSchemaMajor => "card schema differs",
+        UnavailableWhy::Unparseable => "card unreadable",
+        UnavailableWhy::Unknown => "card unavailable",
+    }
+}
+
+fn unreachable_line(reason: UnreachableReason) -> &'static str {
+    match reason {
+        UnreachableReason::BadAddress => "bad address",
+        UnreachableReason::DnsFailed => "address not found",
+        UnreachableReason::IdentityUnavailable => "identity unavailable",
+        UnreachableReason::NotOnOverlay => "not on the overlay network",
+        UnreachableReason::PinNotSaved => "pin not saved",
+        UnreachableReason::PinMismatch => "identity mismatch",
+        UnreachableReason::ListenerOff => "not listening",
+        UnreachableReason::AuthRequired => "auth required",
+        UnreachableReason::RefusedByPeer => "refused by peer",
+        UnreachableReason::ListenerUnavailable => "listener unavailable",
+        UnreachableReason::BadAnswer => "bad answer",
+        UnreachableReason::Unknown => "unreachable",
+    }
 }
 
 /// Whether a loaded model of the card is working right now.
