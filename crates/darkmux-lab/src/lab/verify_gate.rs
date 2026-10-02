@@ -607,22 +607,23 @@ fn run_full_gate(
     report.passed = gate_result.passed;
     report.details = gate_result.details.clone();
     report.work_gate = Some(WorkGate::Evidence(Box::new(WorkGateEvidence {
-        baseline_test_count: Some(baseline_test_count),
-        tests_total: summary.map(|s| s.tests),
-        tests_passed: summary.map(|s| s.pass),
-        tests_added: gate_result.tests_added,
-        tests_failed: summary.map(|s| s.fail),
-        tests_skipped: summary.map(|s| s.skipped),
-        tests_todo: summary.map(|s| s.todo),
-        sandbox_changed,
-        coverage_min_pct,
-        coverage_pct,
-        command_tampered,
+        baseline_test_count: Some(Some(baseline_test_count)),
+        tests_total: Some(summary.map(|s| s.tests)),
+        tests_passed: Some(summary.map(|s| s.pass)),
+        tests_added: Some(gate_result.tests_added),
+        tests_failed: Some(summary.map(|s| s.fail)),
+        tests_skipped: Some(summary.map(|s| s.skipped)),
+        tests_todo: Some(summary.map(|s| s.todo)),
+        sandbox_changed: Some(sandbox_changed),
+        // The input is an f32; its shortest decimal is what the gate has always written.
+        coverage_min_pct: Some(coverage_min_pct.and_then(|v| v.to_string().parse::<f64>().ok())),
+        coverage_pct: Some(coverage_pct),
+        command_tampered: Some(command_tampered),
         // The raw "did the verify command exit 0" signal, preserved
         // distinctly from the gated `passed` above it — #2833's finding
         // was precisely that this signal alone is vacuous for a
         // write-the-tests workload, not that it's wrong to record.
-        command_passed: Some(verify_command_passed),
+        command_passed: Some(Some(verify_command_passed)),
         extras: Default::default(),
     })));
 

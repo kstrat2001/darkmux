@@ -720,6 +720,16 @@ pub fn run_stats(run: &str) -> Result<RunStats> {
     compute_from_dir(&dir, &darkmux_types::config_access::flows_dir())
 }
 
+/// The one word a run's verify result normalizes to, so a caller comparing runs across the
+/// shape change (a bare word, then `{passed, details}`) is not comparing two shapes.
+fn verify_word(m: &crate::lab::manifest::RunManifest) -> Option<String> {
+    match m.verify.as_ref()?.as_ref()? {
+        crate::lab::manifest::ManifestVerify::Legacy(word) => Some(word.clone()),
+        crate::lab::manifest::ManifestVerify::Report(r) => Some(if r.passed { "pass" } else { "fail" }.to_string()),
+        crate::lab::manifest::ManifestVerify::Unrecognized(_) => None,
+    }
+}
+
 /// Derive the metrics for a run directory.
 ///
 /// `flows_dir` is read for host telemetry and dispatch bounds; a missing or
@@ -753,11 +763,7 @@ pub fn compute_from_dir(run_dir: &Path, flows_dir: &Path) -> Result<RunStats> {
     // The manifest records verify as `{passed, details}`; older runs wrote a
     // bare string. Normalized to one word here so a caller comparing runs
     // across that change is not comparing two shapes.
-    let verify = manifest.as_ref().and_then(|m| match m.verify.as_ref()?.as_ref()? {
-        crate::lab::manifest::ManifestVerify::Legacy(word) => Some(word.clone()),
-        crate::lab::manifest::ManifestVerify::Report(r) => Some(if r.passed { "pass" } else { "fail" }.to_string()),
-        crate::lab::manifest::ManifestVerify::Unrecognized(_) => None,
-    });
+    let verify = manifest.as_ref().and_then(verify_word);
     let ok = manifest.as_ref().and_then(|m| m.ok);
 
     // (#2833) A run's verify came from BEFORE the write-the-tests work gate
@@ -769,7 +775,7 @@ pub fn compute_from_dir(run_dir: &Path, flows_dir: &Path) -> Result<RunStats> {
     // had it existed yet. Best-effort: if the fixture path is gone or
     // unreadable, this stays `false` rather than guessing.
     let schema_version = manifest.as_ref().and_then(|m| m.schema_version);
-    let fixture_source_path = manifest.as_ref().and_then(|m| m.fixture.as_ref()?.source_path.clone());
+    let fixture_source_path = manifest.as_ref().and_then(|m| m.fixture.as_ref()?.source_path.clone()?);
     let verify_ungated = verify.is_some()
         && schema_version.unwrap_or(0) < 6
         && fixture_source_path

@@ -285,7 +285,7 @@ pub struct ForFinding {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mission_id: Option<String>,
     /// The finding's `context` (the launcher's provenance).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "darkmux_flow::payload::lenient", skip_serializing_if = "Option::is_none")]
     pub context: Option<darkmux_flow::payload::RecordContext>,
     /// The finding's `emitted` verbatim (the model's own arguments). Copied,
     /// never read: darkmux does not interpret an emission here either.

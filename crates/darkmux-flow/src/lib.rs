@@ -2351,7 +2351,10 @@ mod tests {
     const TS: &str = "2025-01-15T12:34:56Z";
 
     fn unreachable_sink() -> RedisSink {
-        RedisSink::new("redis://127.0.0.1:6390", "darkmux:test", None).unwrap()
+        // A port that was free a moment ago and has no listener now: nothing a developer
+        // runs on a fixed port (a real Redis on 6390) can be dialed, or written to, by a test.
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        RedisSink::new(&format!("redis://127.0.0.1:{port}"), "darkmux:test", None).unwrap()
     }
 
     #[test]

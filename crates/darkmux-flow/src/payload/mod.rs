@@ -39,7 +39,7 @@ mod thermal;
 mod usage;
 
 pub use audit::AuditWriteFailedPayload;
-pub use context::{ContextSite, RecordContext, RuleRef};
+pub use context::{lenient, ContextSite, RecordContext, RuleRef};
 pub use hook::{HookDeliveryPayload, HookDryRunPayload, HookFailedPayload, HookNoticePayload};
 pub use dispatch::{
     BoundRef, BriefRef, BriefRefKind, CheckpointVerdict, DispatchCheckpointPayload, DispatchCompactionPayload,

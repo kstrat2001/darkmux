@@ -226,6 +226,7 @@ impl From<String> for KnobValue {
 #[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct Knob {
     /// The resolved value; `null` for an uncapped knob.
+    #[serde(default, deserialize_with = "super::context::lenient")]
     pub value: Option<KnobValue>,
     /// The tier that resolved it.
     pub source: KnobSource,
@@ -346,7 +347,7 @@ pub struct DispatchStartPayload {
     pub step_id: Option<String>,
     /// The provenance a dispatch caller supplied (the crawl launcher's workspace, source, sha,
     /// rule, unit), a [`RecordContext`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "super::context::lenient", skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub context: Option<RecordContext>,
 }
@@ -542,7 +543,7 @@ pub struct DispatchEndPayload {
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub step_id: Option<String>,
     /// The provenance a dispatch caller supplied, a [`RecordContext`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "super::context::lenient", skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub context: Option<RecordContext>,
 }
@@ -615,7 +616,7 @@ pub struct DispatchTurnPayload {
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub step_id: Option<String>,
     /// The provenance a dispatch caller supplied, a [`RecordContext`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "super::context::lenient", skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub context: Option<RecordContext>,
 }
@@ -672,7 +673,7 @@ pub struct DispatchHeartbeatPayload {
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub step_id: Option<String>,
     /// The provenance a dispatch caller supplied, a [`RecordContext`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "super::context::lenient", skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub context: Option<RecordContext>,
 }
@@ -738,7 +739,7 @@ pub struct DispatchToolPayload {
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub step_id: Option<String>,
     /// The provenance a dispatch caller supplied, a [`RecordContext`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "super::context::lenient", skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub context: Option<RecordContext>,
 }
@@ -779,7 +780,7 @@ pub struct DispatchCompactionPayload {
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub step_id: Option<String>,
     /// The provenance a dispatch caller supplied, a [`RecordContext`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "super::context::lenient", skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub context: Option<RecordContext>,
 }
@@ -837,7 +838,7 @@ pub struct DispatchCheckpointPayload {
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub step_id: Option<String>,
     /// The provenance a dispatch caller supplied, a [`RecordContext`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "super::context::lenient", skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub context: Option<RecordContext>,
 }
@@ -873,7 +874,7 @@ pub struct DispatchReasoningPayload {
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub step_id: Option<String>,
     /// The provenance a dispatch caller supplied, a [`RecordContext`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "super::context::lenient", skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub context: Option<RecordContext>,
 }
@@ -905,7 +906,7 @@ pub struct DispatchFeedbackPayload {
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub step_id: Option<String>,
     /// The provenance a dispatch caller supplied, a [`RecordContext`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "super::context::lenient", skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub context: Option<RecordContext>,
 }
@@ -986,7 +987,7 @@ pub struct DispatchRestPayload {
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub step_id: Option<String>,
     /// The provenance a dispatch caller supplied, a [`RecordContext`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "super::context::lenient", skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub context: Option<RecordContext>,
 }
@@ -1024,7 +1025,7 @@ pub struct DispatchDegeneracyWarningPayload {
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub step_id: Option<String>,
     /// The provenance a dispatch caller supplied, a [`RecordContext`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "super::context::lenient", skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub context: Option<RecordContext>,
 }
@@ -1070,7 +1071,7 @@ pub struct DispatchWorkdirGitUnavailablePayload {
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub step_id: Option<String>,
     /// The provenance a dispatch caller supplied, a [`RecordContext`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "super::context::lenient", skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub context: Option<RecordContext>,
 }

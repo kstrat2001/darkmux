@@ -21,10 +21,21 @@ use std::path::Path;
 /// The file a run's manifest is written to.
 pub const MANIFEST_FILE: &str = "manifest.json";
 
-/// `Some(inner)` for a key that is present, so an explicit `null` reads as
-/// `Some(None)` and an absent key (the field's `default`) as `None`.
-fn present<'de, T: Deserialize<'de>, D: Deserializer<'de>>(d: D) -> Result<Option<Option<T>>, D::Error> {
-    Option::<T>::deserialize(d).map(Some)
+/// A field that reads as `T` or, when it is not one, as absent: leniency per FIELD, so one
+/// wrong-typed key costs that key and never the manifest (contract 7). The bad raw value is
+/// dropped, since a typed field has nowhere to keep it.
+fn lenient<'de, T: serde::de::DeserializeOwned, D: Deserializer<'de>>(d: D) -> Result<Option<T>, D::Error> {
+    Ok(serde_json::from_value(Value::deserialize(d)?).ok())
+}
+
+/// [`lenient`] for a key whose `null` means something: `Some(None)` for an explicit `null`,
+/// `Some(Some(v))` for a value, and `None` (absent) for a key that is missing or wrong-typed.
+fn present<'de, T: serde::de::DeserializeOwned, D: Deserializer<'de>>(d: D) -> Result<Option<Option<T>>, D::Error> {
+    let v = Value::deserialize(d)?;
+    if v.is_null() {
+        return Ok(Some(None));
+    }
+    Ok(serde_json::from_value(v).ok().map(Some))
 }
 
 /// `true` only for a JSON `true`.
@@ -43,48 +54,48 @@ pub struct RunManifest {
     /// The manifest's own revision (4 added `fixture`, 5 `verify`, 6 the work
     /// gate, 7 dropped `metrics.json`, 8 `escalation`). The enrichers only
     /// raise it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
     pub schema_version: Option<u64>,
     /// The run-manifest data version a newer darkmux is refused on.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
     pub manifest_schema_version: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
     pub workload: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
     /// The profile NAME the run was requested under.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
     pub profile_description: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
     /// Whether the dispatch path completed (not whether the workload's own
     /// verify passed: that is `verify`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
     pub ok: Option<bool>,
     /// Absent: the run predates `verify`. `null`: the workload declares no
     /// verify command, so nothing was checked.
     #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
     pub verify: Option<Option<ManifestVerify>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<String>,
     /// The sandbox's content hash after the run; `null` when it could not be hashed.
     #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
     pub final_hash: Option<Option<String>>,
     /// The runtime's `escalation_*` result, written only when the dispatch
     /// stopped on purpose.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
     pub escalation: Option<String>,
     /// Runtime artifacts the run refused to preserve; present only when something was.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
     pub refused_artifacts: Option<Vec<RefusedArtifactRecord>>,
     /// What the run started from, stamped by the lab after the provider finishes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
     pub fixture: Option<ManifestFixture>,
     /// A key this type does not name (an older run's camelCase spelling, a newer
     /// darkmux's field), kept and re-serialized flat.
@@ -113,7 +124,7 @@ pub struct ManifestVerifyReport {
     pub passed: bool,
     #[serde(default, deserialize_with = "text_or_empty")]
     pub details: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
     pub work_gate: Option<WorkGate>,
     #[serde(flatten)]
     pub extras: Map<String, Value>,
@@ -128,36 +139,36 @@ pub enum WorkGate {
     Evidence(Box<WorkGateEvidence>),
 }
 
-/// The gate's measurements. Every key is always written, `null` for one that
-/// could not be read.
+/// The gate's measurements. The gate writes every key, `null` for one it could not read;
+/// each field is `Some(None)` for such a `null` and `None` for a key that is not there.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkGateEvidence {
-    #[serde(default)]
-    pub baseline_test_count: Option<u64>,
-    #[serde(default)]
-    pub tests_total: Option<u64>,
-    #[serde(default)]
-    pub tests_passed: Option<u64>,
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    pub baseline_test_count: Option<Option<u64>>,
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    pub tests_total: Option<Option<u64>>,
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    pub tests_passed: Option<Option<u64>>,
     /// Signed: a shrinking suite is visible.
-    #[serde(default)]
-    pub tests_added: Option<i64>,
-    #[serde(default)]
-    pub tests_failed: Option<u64>,
-    #[serde(default)]
-    pub tests_skipped: Option<u64>,
-    #[serde(default)]
-    pub tests_todo: Option<u64>,
-    #[serde(default)]
-    pub sandbox_changed: Option<bool>,
-    #[serde(default)]
-    pub coverage_min_pct: Option<f32>,
-    #[serde(default)]
-    pub coverage_pct: Option<f64>,
-    #[serde(default)]
-    pub command_tampered: Option<String>,
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    pub tests_added: Option<Option<i64>>,
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    pub tests_failed: Option<Option<u64>>,
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    pub tests_skipped: Option<Option<u64>>,
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    pub tests_todo: Option<Option<u64>>,
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    pub sandbox_changed: Option<Option<bool>>,
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    pub coverage_min_pct: Option<Option<f64>>,
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    pub coverage_pct: Option<Option<f64>>,
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    pub command_tampered: Option<Option<String>>,
     /// Whether the verify command itself exited 0, kept apart from the gated `passed`.
-    #[serde(default)]
-    pub command_passed: Option<bool>,
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    pub command_passed: Option<Option<bool>>,
     #[serde(flatten)]
     pub extras: Map<String, Value>,
 }
@@ -166,10 +177,10 @@ pub struct WorkGateEvidence {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ManifestFixture {
     /// The canonical source directory; `null` for a self-contained workload with none.
-    #[serde(default)]
-    pub source_path: Option<String>,
-    #[serde(default)]
-    pub baseline_hash: Option<String>,
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<Option<String>>,
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    pub baseline_hash: Option<Option<String>>,
     #[serde(flatten)]
     pub extras: Map<String, Value>,
 }
@@ -237,7 +248,7 @@ impl RunManifest {
 
     /// The content hash of the fixture the run started from, when one was recorded.
     pub fn baseline_hash(&self) -> Option<&str> {
-        self.fixture.as_ref()?.baseline_hash.as_deref()
+        self.fixture.as_ref()?.baseline_hash.as_ref()?.as_deref()
     }
 }
 
@@ -287,6 +298,36 @@ mod tests {
         assert_eq!(round_trips(json!({"final_hash": null})).final_hash, Some(None));
     }
 
+    /// (#3035, contract 7) Leniency is per FIELD: a wrong-typed key costs that key, never the
+    /// manifest, and never a verdict a sibling key states plainly.
+    #[test]
+    fn a_wrong_typed_field_costs_that_field_and_nothing_around_it() {
+        let m: RunManifest = serde_json::from_value(json!({"ok": "true", "workload": "w", "provider": "p",
+            "duration_ms": "9", "schema_version": [], "fixture": {"source_path": 3, "baseline_hash": "h"},
+            "escalation": 4})).unwrap();
+        assert_eq!((m.ok, m.duration_ms, m.schema_version, m.escalation.clone()), (None, None, None, None));
+        assert_eq!((m.workload.as_deref(), m.provider.as_deref()), (Some("w"), Some("p")));
+        assert_eq!(m.baseline_hash(), Some("h"));
+        let m: RunManifest = serde_json::from_value(json!({"verify": {"passed": true, "details": "d",
+            "work_gate": {"tests_total": "14", "tests_passed": 14, "command_passed": true}}, "final_hash": 5})).unwrap();
+        assert_eq!(m.verify_passed(), Some(true), "an explicit pass survives a bad nested key");
+        let Some(WorkGate::Evidence(g)) = &m.verify_report().unwrap().work_gate else { panic!("evidence") };
+        assert_eq!((g.tests_total, g.tests_passed), (None, Some(Some(14))));
+        assert_eq!(m.final_hash, None);
+        let m: RunManifest = serde_json::from_value(json!({"verify": {"passed": true, "work_gate": 7}})).unwrap();
+        assert_eq!(m.verify_passed(), Some(true));
+    }
+
+    /// A partial `work_gate` or `fixture` rewrites as the keys it had, and a float keeps the
+    /// digits it was written with.
+    #[test]
+    fn a_partial_gate_and_a_float_rewrite_as_they_were() {
+        round_trips(json!({"verify": {"passed": true, "details": "d", "work_gate": {"tests_total": 3, "command_passed": true}},
+            "fixture": {"baseline_hash": "h"}}));
+        round_trips(json!({"verify": {"passed": true, "details": "d", "work_gate": {"coverage_min_pct": 85.3,
+            "coverage_pct": 91.25}}}));
+    }
+
     /// A verdict that cannot be read is a failure, never a pass (#2833).
     #[test]
     fn a_verify_with_no_passed_key_reads_as_failed() {
@@ -319,10 +360,11 @@ mod tests {
         for entry in fs::read_dir(&root).unwrap().flatten() {
             let Ok(raw) = fs::read_to_string(entry.path().join(MANIFEST_FILE)) else { continue };
             let want: Value = serde_json::from_str(&raw).unwrap();
-            let typed: RunManifest = serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{}: {e}", entry.path().display()));
             n += 1;
-            if serde_json::to_value(&typed).unwrap() != want {
-                bad.push(entry.path().display().to_string());
+            match serde_json::from_str::<RunManifest>(&raw) {
+                Ok(typed) if serde_json::to_value(&typed).unwrap() == want => {}
+                Ok(_) => bad.push(format!("{}: writes back different JSON", entry.path().display())),
+                Err(e) => bad.push(format!("{}: {e}", entry.path().display())),
             }
         }
         println!("manifests {n}, mismatches {}", bad.len());

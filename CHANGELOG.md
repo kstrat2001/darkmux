@@ -72,7 +72,9 @@ darkmux release.
   `manifest.json` is one `RunManifest` type that the three providers, the fixture
   and work-gate enrichers and every reader share. The free-form fields that stay
   `any` (a finding's `emitted`, a mission input's `default`, `Profile.use_when`)
-  are listed in `DESIGN.md` with a reason each.
+  are listed in `DESIGN.md` with a reason each. Each typed field reads leniently on its
+  own: a wrong-typed key is dropped (`None`) and the rest of the payload, manifest or
+  finding still reads.
 - **Additive-only schema changes are enforced, not hoped for** (#3035). These
   authored and persisted shapes carry a `schema_version` (role, skill, crew,
   rule, workload and lab-fixture manifests; `mission.json` and each phase, task

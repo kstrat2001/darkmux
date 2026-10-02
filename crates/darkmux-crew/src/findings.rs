@@ -129,6 +129,7 @@ pub struct FindingRecord {
     /// The dispatch's `record_context` when it had one (a crawl's workspace /
     /// source / sha / rule / unit), else `null`. Host-stamped provenance; the one
     /// key added to it here is `site` ([`stamp_site`]).
+    #[serde(default, deserialize_with = "darkmux_flow::payload::lenient")]
     pub context: Option<darkmux_flow::payload::RecordContext>,
     /// The model's arguments, verbatim. Free-form JSON by contract (#3035): a
     /// model chooses its own keys, and an emission that is not an object is
@@ -1138,6 +1139,26 @@ mod tests {
         r.context = None;
         stamp_site(&mut r, &spans());
         assert!(r.context.is_none(), "an absent context is not turned into one");
+    }
+
+    /// (#3035, contract 7) A `finding.json` whose `context` has a wrong-typed key, or is no
+    /// object at all, still loads: the finding is an event, and one odd provenance key must
+    /// not erase it from the store.
+    #[test]
+    fn a_finding_with_a_wrong_typed_context_still_loads() {
+        let tmp = TempDir::new().unwrap();
+        for (seq, context) in [(1, serde_json::json!({"unit": 7, "source": "app"})), (2, serde_json::json!("odd"))] {
+            let mut raw = serde_json::to_value(rec_at("sess-ctx", seq, "2026-09-03T01:00:00Z")).unwrap();
+            raw["context"] = context;
+            let dir = tmp.path().join("sess-ctx").join(seq.to_string());
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("finding.json"), raw.to_string()).unwrap();
+        }
+        let all = load_all_at(tmp.path()).unwrap();
+        assert_eq!(all.len(), 2, "both findings load");
+        assert_eq!(all[0].context.as_ref().and_then(|c| c.source.as_deref()), Some("app"), "the good key survives");
+        assert!(all[0].context.as_ref().is_some_and(|c| c.unit.is_none()));
+        assert!(all[1].context.is_none());
     }
 
     /// Operator-run evidence, not CI: `DARKMUX_ROUNDTRIP_FINDINGS=~/.darkmux/findings cargo nextest

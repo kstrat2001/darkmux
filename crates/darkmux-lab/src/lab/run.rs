@@ -572,8 +572,8 @@ fn enrich_manifest_with_fixture_info(
             .to_string()
     });
     manifest.fixture = Some(ManifestFixture {
-        source_path,
-        baseline_hash: baseline_hash.map(str::to_string),
+        source_path: Some(source_path),
+        baseline_hash: Some(baseline_hash.map(str::to_string)),
         extras: Default::default(),
     });
     // (#2494) RAISE to 4, never lower. This enricher mints v4 to mean

@@ -765,7 +765,7 @@ pub struct BudgetPayload {
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub step_id: Option<String>,
     /// The provenance a dispatch caller supplied, a [`RecordContext`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "super::context::lenient", skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub context: Option<RecordContext>,
 }
