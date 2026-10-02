@@ -453,25 +453,26 @@ export function stepDispatchSessions(records: NormRecord[], missionId: string): 
     let best = "";
     let bestT: Tally | null = null;
     for (const [sid, t] of Object.entries(seen)) {
-      if (!bestT) {
+      if (!bestT || attemptBeats(t, bestT)) {
         best = sid;
         bestT = t;
-        continue;
       }
-      if (t.ours !== bestT.ours) {
-        if (t.ours) { best = sid; bestT = t; }
-        continue;
-      }
-      const newer = attemptRecency(t, bestT);
-      if (newer !== 0) {
-        if (newer > 0) { best = sid; bestT = t; }
-        continue;
-      }
-      if (t.n > bestT.n) { best = sid; bestT = t; }
     }
     if (best) out[stepId] = best;
   }
   return out;
+}
+
+/** Whether attempt `t` is the better representative of its step than `best`:
+ *  one positively tagged with this mission, else the more recent, else the
+ *  one with more records. */
+function attemptBeats(
+  t: { n: number; lastTs: number; lastHub: number | null; ours: boolean },
+  best: { n: number; lastTs: number; lastHub: number | null; ours: boolean },
+): boolean {
+  if (t.ours !== best.ours) return t.ours;
+  const newer = attemptRecency(t, best);
+  return newer !== 0 ? newer > 0 : t.n > best.n;
 }
 
 /** Positive when attempt `a` is more recent than `b`, negative when older, 0
@@ -483,24 +484,13 @@ function attemptRecency(a: { lastTs: number; lastHub: number | null }, b: { last
 }
 
 /** Whether folding a record left the step's accumulator unchanged. */
+const METRIC_KEYS: readonly (keyof StepMetrics)[] = [
+  "tokRun", "tokFinal", "tokEnded", "tokResult", "turnRun", "turnFinal", "turnsEnded", "toolRun", "toolFinal",
+  "usageSeen", "startTs", "endTs", "endHub", "lastTs", "stepBookended",
+];
+
 function sameMetrics(a: StepMetrics, b: StepMetrics): boolean {
-  return (
-    a.tokRun === b.tokRun &&
-    a.tokFinal === b.tokFinal &&
-    a.tokEnded === b.tokEnded &&
-    a.tokResult === b.tokResult &&
-    a.turnRun === b.turnRun &&
-    a.turnFinal === b.turnFinal &&
-    a.turnsEnded === b.turnsEnded &&
-    a.toolRun === b.toolRun &&
-    a.toolFinal === b.toolFinal &&
-    a.usageSeen === b.usageSeen &&
-    a.startTs === b.startTs &&
-    (a.endHub ?? null) === (b.endHub ?? null) &&
-    a.endTs === b.endTs &&
-    a.stepBookended === b.stepBookended &&
-    a.lastTs === b.lastTs
-  );
+  return METRIC_KEYS.every((k) => a[k] === b[k]);
 }
 
 /** The running and final counts one record carries, each read through its own

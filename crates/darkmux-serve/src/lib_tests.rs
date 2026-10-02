@@ -3051,12 +3051,12 @@
 
     #[test]
     fn a_live_tail_line_carries_its_hub_id() {
-        let line = super::stamp_hub_id_line(r#"{"ts":"2026-05-14T09:00:00Z","action":"operator.note"}"#, "1000-3");
+        let line = super::stamp_hub_id_line(r#"{"ts":"2026-05-14T09:00:00Z","action":"operator.note"}"#, Some("1000-3"));
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v["hub_id"], "1000-3");
         assert_eq!(v["action"], "operator.note");
         // A line that is not a JSON object passes through untouched.
-        assert_eq!(super::stamp_hub_id_line("not json", "1-0"), "not json");
+        assert_eq!(super::stamp_hub_id_line("not json", Some("1-0")), "not json");
     }
 
     fn xentry(ms: u64, ts: &str) -> redis::Value {

@@ -29,6 +29,7 @@ import { liveStateLabel, reasonForLine, toolReadout, type LiveStateReading } fro
 import { leftTrimWidth } from "../../lib/leftTrim";
 import { REPLAY_GRANULARITY_NOTE, useLiveOverlay } from "../../lib/liveChannel";
 import { scopeStateOf, type ScopeState } from "../../lib/scopeMorph";
+import type { RunRelay } from "../../types/generated/RunRelay";
 import { useRelayOrigin } from "../../hooks/useRelayOrigin";
 import { CLEAN_DETECTORS, runRegions } from "../session/sessionRun";
 import type { BriefEntry, SessionRunView } from "../session/sessionRun";
@@ -477,6 +478,11 @@ function BriefEntryContent({ entry }: { entry: BriefEntry }) {
   );
 }
 
+/** (#3017) ", asked on <machine>" for relayed work, else nothing. */
+function askedOnSuffix(relay: RunRelay | null): string {
+  return relay ? `, asked on ${relay.asked_on_machine}` : "";
+}
+
 export function SessionReplay({
   sessionId,
   missionId = null,
@@ -839,7 +845,7 @@ export function SessionReplay({
         {view.header.role}{" "}
         <span className="session-run__meta">
           ({view.header.sid} on {view.header.machineName}
-          {relay ? `, asked on ${relay.asked_on_machine}` : ""})
+          {askedOnSuffix(relay)})
         </span>
       </h2>
 

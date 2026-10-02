@@ -4584,8 +4584,10 @@ fn stamp_hub_id(record: &mut serde_json::Value, id: &str) {
 }
 
 /// [`stamp_hub_id`] for a record still in its wire spelling (the live tail
-/// forwards lines). A line that is not a JSON object passes through as is.
-fn stamp_hub_id_line(line: &str, id: &str) -> String {
+/// forwards lines). A line that is not a JSON object, or an entry with no
+/// id, passes through as is.
+fn stamp_hub_id_line(line: &str, id: Option<&str>) -> String {
+    let Some(id) = id else { return line.to_string() };
     match serde_json::from_str::<serde_json::Value>(line) {
         Ok(mut v) if v.is_object() => {
             stamp_hub_id(&mut v, id);
@@ -5369,10 +5371,7 @@ fn xread_block_once(
                 continue;
             };
             if record_ts_matches_date(record_json, date_filter) {
-                records.push(match redis_value_as_str(&parts[0]) {
-                    Some(id) => stamp_hub_id_line(record_json, id),
-                    None => record_json.to_string(),
-                });
+                records.push(stamp_hub_id_line(record_json, redis_value_as_str(&parts[0])));
             }
         }
     }

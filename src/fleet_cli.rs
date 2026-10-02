@@ -818,12 +818,16 @@ pub(crate) fn fleet_submission_doctor_checks() -> Vec<crate::doctor::Check> {
             }),
         },
         local_machine: darkmux_flow::resolve_machine_id(),
-        clock_skews: {
-            let view = crate::machine_list::local_fleet_view();
-            view.machines.iter().filter_map(|m| Some((crate::machine_list::row_name(&view, m), m.clock_skew_ms?))).collect()
-        },
+        clock_skews: fleet_clock_skews(),
     };
     crate::doctor::fleet_submission_checks(&facts)
+}
+
+/// (#3017) Each fleet machine's clock against the hub's, from the same view
+/// `machine list` prints: only machines with a beat and a readable hub clock.
+fn fleet_clock_skews() -> Vec<(String, i64)> {
+    let view = crate::machine_list::local_fleet_view();
+    view.machines.iter().filter_map(|m| Some((crate::machine_list::row_name(&view, m), m.clock_skew_ms?))).collect()
 }
 
 /// (#2916 review C8) What the local daemon says about its fleet listener
