@@ -181,6 +181,24 @@ pub enum DispatchSessionEvidence {
     StaleNoTerminal,
 }
 
+/// (#3016) Where a relayed run was asked: the other end of a run one machine
+/// submitted and another executed (radio's answering seat on a peer,
+/// `dispatch --profile p@peer`, a fleet work job). Read from the relay
+/// session id (`SessionId::parse`), the only parser of that grammar. The
+/// row's own `machine` is the EXECUTOR; this names the asker.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
+pub struct RunRelay {
+    /// The machine that asked: the receiver's allow-list name for the
+    /// submitter, normally its `machine_id`.
+    pub asked_on_machine: String,
+    /// The asker's own run id (its session's run), so the asking side can
+    /// be found there. The asker's session row itself is folded into this
+    /// one (see [`ghost_runs`]).
+    pub sender_run: String,
+}
+
 /// One row of the `/runs` view-model. Lenient-on-read WIRE shape (every
 /// field but `id`/`kind`/`status`/`tracked` is optional) — this is NEVER
 /// persisted, so there's no schema-version discipline to carry; a future
@@ -358,6 +376,11 @@ pub struct Run {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub verify_passed: Option<bool>,
+    /// (#3016) Set when this row is relayed work: asked on another machine,
+    /// executed on `machine`. Absent for work that ran where it was asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub relay: Option<RunRelay>,
 }
 
 /// Build the full run union — the SAME `Vec<Run>` both `runs_handler`
@@ -882,6 +905,7 @@ fn flow_mission_to_run(
         tokens: None,
         workload: None,
         verify_passed: None,
+        relay: None,
     }
 }
 
@@ -1234,6 +1258,7 @@ fn mission_to_run(
         tokens: None,
         workload: None,
         verify_passed: None,
+        relay: None,
     }
 }
 
@@ -1731,6 +1756,7 @@ fn lab_summary_to_run(
         tokens: None,
         workload: summary.workload.clone(),
         verify_passed: summary.verify_passed,
+        relay: None,
     }
 }
 
@@ -2400,11 +2426,12 @@ fn ghost_runs(
     now_ms: u64,
 ) -> Vec<Run> {
     let mut out = Vec::new();
+    let echoes = relay_echo_sessions(flow_index);
     for (session_id, agg) in flow_index {
         if !agg.has_start && !agg.has_wait {
             continue;
         }
-        if known_session_ids.contains(session_id) {
+        if known_session_ids.contains(session_id) || echoes.contains(session_id) {
             continue;
         }
         if let Some(mid) = &agg.mission_id {
@@ -2476,9 +2503,49 @@ fn ghost_runs(
             tokens: None,
             workload: None,
             verify_passed: None,
+            relay: run_relay(session_id),
         });
     }
     out
+}
+
+/// (#3016) The relay origin a session id names, or `None` for a session that
+/// ran where it was asked. The one place `runs.rs` reads the relay grammar,
+/// through `SessionId::parse`.
+fn run_relay(session_id: &str) -> Option<RunRelay> {
+    use darkmux_types::session_id::{SessionId, SessionKind};
+    // Every relay wire contains this component; skip the parse otherwise.
+    if !session_id.contains(".relay.") {
+        return None;
+    }
+    match SessionId::parse(session_id).ok()?.kind() {
+        SessionKind::Relay { sender, peer } => {
+            Some(RunRelay { asked_on_machine: peer.clone(), sender_run: sender.run_id().as_str().to_string() })
+        }
+        _ => None,
+    }
+}
+
+/// (#3016) The sessions that are only the ASKING side of work another
+/// session executed: the sender's session, named inside every relay
+/// session's id. One relayed run is one row, and the EXECUTOR owns it: it
+/// ran where the tokens were spent, so it counts there and the machine
+/// filter matches it. The sender's bookends around the same work are its
+/// echo and must not become a second row. A sender session is folded only
+/// when its relay session is itself a row here (it opened a dispatch); a
+/// relay this reader sees no start for leaves the sender's row standing,
+/// so the work never vanishes. Matching is by the exact sender wire, so an
+/// unrelated session never folds.
+fn relay_echo_sessions(flow_index: &HashMap<String, SessionAgg>) -> HashSet<String> {
+    use darkmux_types::session_id::{SessionId, SessionKind};
+    flow_index
+        .iter()
+        .filter(|(id, agg)| (agg.has_start || agg.has_wait) && id.contains(".relay."))
+        .filter_map(|(id, _)| match SessionId::parse(id).ok()?.kind() {
+            SessionKind::Relay { sender, .. } => Some(sender.wire()),
+            _ => None,
+        })
+        .collect()
 }
 
 // ─── Bounded day-file scan (#1523 gate scale-cap) ──────────────────────────
@@ -4889,6 +4956,56 @@ mod tests {
         // explicitly anyway so the client's drill rule never needs a
         // dispatch-specific "use `id` itself" carve-out.
         assert_eq!(g.dispatch_id.as_deref(), Some("orphan-sess"));
+    }
+
+    fn live_ghost_agg(machine: &str) -> SessionAgg {
+        SessionAgg {
+            has_start: true,
+            machine: Some(machine.to_string()),
+            role: Some("radio-host".to_string()),
+            start_ts: Some("2026-07-24T10:00:00Z".to_string()),
+            last_activity_ts: Some("2026-07-24T10:00:00Z".to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn sender_session(run: &str) -> darkmux_types::session_id::SessionId {
+        use darkmux_types::session_id::{RunId, SessionId};
+        SessionId::adhoc(RunId::standalone(run).unwrap(), "radio-host", "n1")
+    }
+
+    /// (#3016) A relayed run is ONE row: the executor's. The asker's own
+    /// session for the same work is its echo and folds into it.
+    #[test]
+    fn ghost_runs_fold_a_relay_pair_into_one_executor_row() {
+        let sender = sender_session("radio-1");
+        let relayed = darkmux_types::session_id::SessionId::relay(sender.clone(), "MacBook-Pro").wire();
+        let mut idx = HashMap::new();
+        idx.insert(sender.wire(), live_ghost_agg("MacBook-Pro"));
+        idx.insert(relayed.clone(), live_ghost_agg("darkbook"));
+        let now_ms = parse_flow_ts("2026-07-24T10:00:00Z").unwrap() * 1_000;
+        let ghosts = ghost_runs(&idx, &HashSet::new(), &HashSet::new(), &HashSet::new(), now_ms);
+        assert_eq!(ghosts.len(), 1, "one relayed run is one row: {ghosts:?}");
+        let g = &ghosts[0];
+        assert_eq!(g.id, relayed);
+        assert_eq!(g.machine.as_deref(), Some("darkbook"), "the executor owns the row");
+        assert_eq!(
+            g.relay,
+            Some(RunRelay { asked_on_machine: "MacBook-Pro".into(), sender_run: "radio-1".into() })
+        );
+    }
+
+    /// (#3016) Two sessions that merely look alike stay two rows.
+    #[test]
+    fn ghost_runs_keep_an_unrelated_pair_as_two_rows() {
+        let relayed = darkmux_types::session_id::SessionId::relay(sender_session("radio-1"), "MacBook-Pro").wire();
+        let mut idx = HashMap::new();
+        idx.insert(sender_session("radio-2").wire(), live_ghost_agg("MacBook-Pro"));
+        idx.insert(relayed, live_ghost_agg("darkbook"));
+        let now_ms = parse_flow_ts("2026-07-24T10:00:00Z").unwrap() * 1_000;
+        let ghosts = ghost_runs(&idx, &HashSet::new(), &HashSet::new(), &HashSet::new(), now_ms);
+        assert_eq!(ghosts.len(), 2, "{ghosts:?}");
+        assert_eq!(ghosts.iter().filter(|g| g.relay.is_some()).count(), 1);
     }
 
     /// (#1918) By construction a ghost SHOULD never be ambiguous — one row
