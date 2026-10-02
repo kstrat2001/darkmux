@@ -147,8 +147,10 @@ pub struct MachineSpecsResponse {
     pub loaded_models: Vec<LoadedModel>,
     pub lms_unreachable: bool,
     pub utility_model: Option<UtilityModel>,
-    /// The Redis URL with its password redacted, when Redis is configured.
-    pub redis_url_redacted: Option<String>,
+    /// Whether this machine has a fleet hub (Redis) configured. A fact, never
+    /// the URL: the hub's host is not something a card shows anyone (#3072).
+    #[serde(default)]
+    pub hub_configured: bool,
     #[cfg_attr(test, ts(type = "number"))]
     pub generated_at_ms: u64,
 }

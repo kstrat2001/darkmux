@@ -328,7 +328,7 @@ jobs:
 
       # (#2101) In-process tests that need a real redis-server (the telemetry
       # stream's pins: live-view subscription, listing scope, replay samples,
-      # tail supervision, the flow status probe). They skip silently without
+      # tail supervision, the flow status probe, the remote reader's redaction). They skip silently without
       # redis, and the macOS job has none, so they run HERE with
       # DARKMUX_E2E_REQUIRED=1 (a missing redis fails them), and the step
       # fails unless every named test is reported `ok`: a filter that matches
@@ -345,12 +345,14 @@ jobs:
             flow_stream_handler_carries_the_telemetry_stream \
             a_dispatch_replay_carries_the_peers_host_samples_from_the_hub \
             a_tail_that_loses_one_stream_closes_instead_of_staying_half_alive \
+            the_redis_flow_stream_redacts_for_a_remote_reader_through_the_handler \
             probe_redis_reports_the_telemetry_stream_and_its_schemas 2>&1 | tee redis-pins.log
           for t in a_telemetry_flood_does_not_evict_a_usage_record \
             the_live_tail_carries_work_records_and_machine_samples \
             flow_stream_handler_carries_the_telemetry_stream \
             a_dispatch_replay_carries_the_peers_host_samples_from_the_hub \
             a_tail_that_loses_one_stream_closes_instead_of_staying_half_alive \
+            the_redis_flow_stream_redacts_for_a_remote_reader_through_the_handler \
             probe_redis_reports_the_telemetry_stream_and_its_schemas; do
             grep -Eq "test .*${t} \.\.\. ok" redis-pins.log || { echo "pin did not run: ${t}"; exit 1; }
           done

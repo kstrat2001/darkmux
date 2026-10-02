@@ -109,7 +109,7 @@ const TICKET_RE = /\bSYS[-_]\d+\b/gi;
 const SHA40_RE = /\b[a-f0-9]{40}\b/g;
 
 // Any IPv4-shaped substring, anywhere, in any field — defense-in-depth catch
-// for things like `redis_url_redacted`'s embedded tailnet address. Kept
+// for a tailnet address inside a URL or a free-text field. Kept
 // deliberately permissive (any dotted-quad) rather than scoped to one field
 // name, since a leaked IP could show up in a URL, a log line, anywhere.
 const IPV4_RE = /\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\b/g;
@@ -304,7 +304,7 @@ const SAFE_FIELDS = new Set([
   "mission_id", "mission_status", "missions", "model", "model_key", "name",
   "orchestrator", "origin", "os", "owner", "panel", "parentId", "path",
   "phase_id", "phase_ids", "potential_source", "profile",
-  "recorded_at_iso", "redis_url_redacted", "reasoning_format",
+  "recorded_at_iso", "hub_configured", "reasoning_format",
   "result_class", "role", "role_id", "route", "ruling", "runtime",
   "schema_version", "served_model", "session_id", "size", "source",
   "stage", "state", "status", "step_id", "surface", "target", "task_ids",

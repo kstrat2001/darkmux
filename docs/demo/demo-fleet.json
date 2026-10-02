@@ -70,7 +70,7 @@
             "os": "macos aarch64",
             "ram_free_for_ai_bytes": 98725027315,
             "ram_total_bytes": 274877906944,
-            "redis_url_redacted": "redis://demo-hub.internal:6379",
+            "hub_configured": true,
             "utility_model": {
               "id": "darkmux:qwen3-4b-instruct-2507",
               "loaded": true
@@ -145,7 +145,7 @@
             "os": "macos aarch64",
             "ram_free_for_ai_bytes": 20851693056,
             "ram_total_bytes": 34359738368,
-            "redis_url_redacted": "redis://demo-hub.internal:6379",
+            "hub_configured": true,
             "utility_model": {
               "id": "darkmux:qwen3-4b-instruct-2507",
               "loaded": true
@@ -229,7 +229,7 @@
             "os": "macos aarch64",
             "ram_free_for_ai_bytes": 8981477191,
             "ram_total_bytes": 17179869184,
-            "redis_url_redacted": "redis://demo-hub.internal:6379",
+            "hub_configured": true,
             "utility_model": {
               "id": "darkmux:qwen3-4b-instruct-2507",
               "loaded": true

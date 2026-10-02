@@ -68,7 +68,7 @@ MachineSpecsResponse.cpu_brand: string | null
 MachineSpecsResponse.loaded_models: Array<LoadedModel>
 MachineSpecsResponse.lms_unreachable: boolean
 MachineSpecsResponse.utility_model: UtilityModel | null
-MachineSpecsResponse.redis_url_redacted: string | null
+MachineSpecsResponse.hub_configured: boolean
 MachineSpecsResponse.generated_at_ms: number
 MachineResourcesResponse.cache_ttl_ms: number
 MachineResourcesResponse.load?: MachineLoad

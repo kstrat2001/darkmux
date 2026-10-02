@@ -151,6 +151,23 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
 
 ### Changed (5.0)
 
+- **Read routes never show host facts to a stranger** (5.0, #3072). A caller
+  that is neither this machine nor a token holder no longer sees an address, a
+  tailnet name or a home directory in any JSON read (`/fleet/view`,
+  `/fleet/roster`, `/machine/*`, `/lab/runs`, `/flow/*`, `/runs`, ...) or in the
+  live stream. One module owns the rule, shared with the console panels, and
+  applies it in one pass to every key and value (a non-JSON reply on a JSON
+  route is redacted as text): roster addresses and their hosts, the fleet hub's
+  host, private and tailnet IPv4 literals and any IPv4 literal in a URL or
+  `host:port` position (a version like `0.3.30.1` in prose stays), tailnet,
+  unique-local, global and link-local IPv6 literals (`::1` stays), any `.ts.net`
+  name, and home directories (`/Users/<name>`, `/home/<name>`,
+  `/var/home/<name>`, `/root`) read "(address hidden)" or `~`. A roster host
+  with no dot (`studio`) is hidden only where it addresses (`://studio`,
+  `studio:8765`), so "LM Studio" survives. `specs.redis_url_redacted` is gone
+  from `GET /machine/specs` and the machine card (it put the hub's tailnet
+  address on every machine's card); `specs.hub_configured` says whether a hub
+  is configured, never where. The card keeps schema 1.2 (unreleased).
 - **Machine telemetry has its own hub stream, so work records keep their window** (#2101).
   `machine.telemetry` was 87% of the hub's records, so the one capped stream held
   about 41 hours and a relayed run's usage was trimmed away before its sender could

@@ -52,6 +52,7 @@ mod host_sampler;
 /// The machine card, served by the fleet listener at `GET /fleet/card` and read from each machine's own row of `GET /fleet/view`.
 pub mod machine_card;
 mod panel;
+mod redaction;
 /// (#1466) Best-effort peer-mission-graph fetch — see the module's own doc
 /// for the full attribution → roster → presence → fetch decision chain.
 mod peer_graph;
@@ -2955,7 +2956,7 @@ fn degraded_specs() -> wire::MachineSpecsResponse {
         loaded_models: Vec::new(),
         lms_unreachable: true,
         utility_model: None,
-        redis_url_redacted: None,
+        hub_configured: false,
         generated_at_ms: current_millis(),
     }
 }
@@ -2992,9 +2993,9 @@ pub(crate) fn gather_specs() -> wire::MachineSpecsResponse {
     // name-based path as their fallback rather than reading absence as "not
     // this machine".
     let machine_uid = darkmux_hardware::machine_uid();
-    // env(DARKMUX_REDIS_URL) > config-assembled (#661 Slice 5); `Display` on
-    // `RawRedisUrl` is the redacted form, so this stays password-safe.
-    let redis_url_redacted = darkmux_flow::redis_url().map(|u| u.to_string());
+    // env(DARKMUX_REDIS_URL) > config-assembled (#661 Slice 5). Only WHETHER a
+    // hub is configured goes on the wire, never its URL or host (#3072).
+    let hub_configured = darkmux_flow::redis_url().is_some();
 
     // (#1008) The configured machine utility model (`internal.utility`) + whether
     // it's resident, so the viewer's utility card shows OBSERVED state instead of
@@ -3018,7 +3019,7 @@ pub(crate) fn gather_specs() -> wire::MachineSpecsResponse {
         loaded_models,
         lms_unreachable,
         utility_model,
-        redis_url_redacted,
+        hub_configured,
         generated_at_ms: current_millis(),
     }
 }
@@ -3141,11 +3142,17 @@ fn read_cpu_brand() -> Option<String> {
 async fn flow_stream_handler(
     State(state): State<AppState>,
     Path(date_raw): Path<String>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Sse<futures::stream::BoxStream<'static, Result<Event, std::convert::Infallible>>>, (StatusCode, &'static str)> {
     let Some(date) = is_valid_date(&date_raw) else {
         return Err((StatusCode::BAD_REQUEST, "bad date format"));
     };
     let date_owned = date.to_string();
+    // A reader that is neither this machine nor a token holder gets each event
+    // line with host facts redacted (`redaction.rs`).
+    let redaction: Option<Arc<redaction::Redaction>> =
+        (!caller_is_local_or_holds_token(peer.map(|c| c.0), &headers)).then(|| Arc::new(redaction::Redaction::derive()));
 
     // (#925) Bound concurrent SSE streams so a client can't exhaust
     // connections. fetch_add-then-check; roll back + 503 if over the cap.
@@ -3187,34 +3194,33 @@ async fn flow_stream_handler(
     };
 
     use futures::stream::StreamExt;
-    let event_stream: futures::stream::BoxStream<'static, Result<Event, std::convert::Infallible>> =
-        if redis_reachable {
-            let url = redis_url.expect("redis_reachable implies url");
-            // (#875, #2101) Both hub streams: work records and the machine
-            // samples ride separate streams, and the live view needs both.
-            let stream_names = vec![
-                darkmux_types::config_access::redis_stream(),
-                darkmux_types::config_access::redis_telemetry_stream(),
-            ];
-            Box::pin(
-                // expose_for_probe(): redis_tail_lines + resolve_current_last_id
-                // use the URL only for Client::open and never log it (they
-                // pre-date the RawRedisUrl wrapper and handle the raw string
-                // safely), so the secret stays unlogged. (#661 Slice 5)
-                redis_tail_lines(url.expose_for_probe().to_string(), stream_names, date_owned)
-                    .map(|line| Ok(Event::default().data(line))),
-            )
-        } else {
-            if redis_url.is_some() {
-                eprintln!(
-                    "darkmux serve: GET /flow/{date_owned}/stream Redis probe failed; \
-                     falling back to file tail"
-                );
-            }
-            let path = state.flows_dir.join(format!("{date_owned}.jsonl"));
-            let start_offset = tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
-            Box::pin(build_tail_stream(path, start_offset))
-        };
+    // Both sources yield flow-record lines; the one `redacted_events` below is
+    // where a remote reader's lines are filtered, whichever source they came from.
+    let lines: futures::stream::BoxStream<'static, String> = if redis_reachable {
+        let url = redis_url.expect("redis_reachable implies url");
+        // (#875, #2101) Both hub streams: work records and the machine
+        // samples ride separate streams, and the live view needs both.
+        let stream_names = vec![
+            darkmux_types::config_access::redis_stream(),
+            darkmux_types::config_access::redis_telemetry_stream(),
+        ];
+        // expose_for_probe(): redis_tail_lines + resolve_current_last_id
+        // use the URL only for Client::open and never log it (they
+        // pre-date the RawRedisUrl wrapper and handle the raw string
+        // safely), so the secret stays unlogged. (#661 Slice 5)
+        Box::pin(redis_tail_lines(url.expose_for_probe().to_string(), stream_names, date_owned))
+    } else {
+        if redis_url.is_some() {
+            eprintln!(
+                "darkmux serve: GET /flow/{date_owned}/stream Redis probe failed; \
+                 falling back to file tail"
+            );
+        }
+        let path = state.flows_dir.join(format!("{date_owned}.jsonl"));
+        let start_offset = tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
+        Box::pin(tail_lines(path, start_offset))
+    };
+    let event_stream = redacted_events(lines, redaction.clone());
 
     // (#2928) The live channel rides the same connection as named `live`
     // events, so an older viewer (which listens only for unnamed `message`
@@ -3222,7 +3228,7 @@ async fn flow_stream_handler(
     // Local-daemon only: these are samples from THIS machine's dispatches,
     // whichever path (Redis or file) the flow records above come from.
     let event_stream: futures::stream::BoxStream<'static, Result<Event, std::convert::Infallible>> =
-        Box::pin(futures::stream::select(event_stream, live_hub::live_events()));
+        Box::pin(futures::stream::select(event_stream, live_hub::live_events(redaction)));
 
     // (#925) Carry the SSE slot inside the stream so the open-count decrement
     // happens exactly when the connection ends or the client disconnects.
@@ -4977,17 +4983,18 @@ fn tail_lines(
 
 type TailState = (PathBuf, u64, String, VecDeque<String>);
 
-/// SSE wrapper around `tail_lines`. Maps each line to an `Event` with
-/// the line as `data:` payload. axum's `KeepAlive` layer handles
-/// liveness comments during quiet periods.
-fn build_tail_stream(
-    path: PathBuf,
-    start_offset: u64,
-) -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
+/// The SSE events of a flow-line stream, each line redacted first when the
+/// reader is remote (`Some`). The ONE place the file tail and the Redis tail
+/// meet a reader.
+fn redacted_events(
+    lines: futures::stream::BoxStream<'static, String>,
+    redaction: Option<Arc<redaction::Redaction>>,
+) -> futures::stream::BoxStream<'static, Result<Event, std::convert::Infallible>> {
     use futures::stream::StreamExt;
-    tail_lines(path, start_offset).map(|line| Ok(Event::default().data(line)))
+    lines
+        .map(move |line| Ok(Event::default().data(redaction::Redaction::for_reader(redaction.as_deref(), line))))
+        .boxed()
 }
-
 /// Long-poll Redis `XREAD BLOCK` and yield each matching record as a
 /// JSON line. Tail-from-now semantics — pre-existing entries are NOT
 /// replayed.

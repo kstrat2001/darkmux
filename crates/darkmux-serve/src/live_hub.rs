@@ -235,12 +235,16 @@ pub(crate) fn spawn_ingest(
 /// Every sample published from now on, as SSE `event: live` frames, for one
 /// viewer. Tail-from-now like the flow tail: nothing is replayed.
 pub(crate) fn live_events(
+    redaction: Option<std::sync::Arc<crate::redaction::Redaction>>,
 ) -> futures::stream::BoxStream<'static, Result<Event, std::convert::Infallible>> {
     let rx = hub().subscribe();
-    Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+    Box::pin(futures::stream::unfold((rx, redaction), |(mut rx, redaction)| async move {
         loop {
             match rx.recv().await {
-                Ok(s) => return Some((Ok(Event::default().event("live").data(&*s)), rx)),
+                Ok(s) => {
+                    let data = crate::redaction::Redaction::for_reader(redaction.as_deref(), s.to_string());
+                    return Some((Ok(Event::default().event("live").data(data)), (rx, redaction)));
+                }
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => return None,
             }

@@ -142,6 +142,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::redaction::{redact_stdout, Redaction};
 use crate::wire::PanelResponse;
 use crate::{current_millis, AppState};
 
@@ -1056,240 +1057,6 @@ async fn resolve_selection(
 /// What a caller that is neither this machine nor a token holder is shown
 /// instead of the daemon's diagnostics (see [`redact_for_remote`]).
 const REMOTE_DIAGNOSTICS_NOTE: &str = "diagnostics are shown on this machine only";
-/// Stands in for a roster address in a remote caller's output.
-const ADDRESS_HIDDEN: &str = "(address hidden)";
-
-/// What a non-local caller must not read in a panel's output, derived from
-/// the daemon's own state when the request is served: every roster ADDRESS
-/// (and its host part) that is not itself a public machine name, and the
-/// daemon user's home and `DARKMUX_HOME` directories. Machine ids and names are
-/// public (a 400 for a bad opt lists them): only the address behind one is
-/// private.
-struct Redaction {
-    /// Longest first, so an address is replaced whole before its host part.
-    addresses: Vec<String>,
-    /// Directory prefixes and what each reads as, longest first.
-    dirs: Vec<(String, &'static str)>,
-}
-
-impl Redaction {
-    /// The roster is read from disk and the directories from the environment
-    /// per call; there is no list to maintain. An unreadable roster hides
-    /// nothing it cannot name, and the caller still gets no `stderr_tail`.
-    fn derive() -> Self {
-        let roster = darkmux_fleet::load_roster().ok();
-        let machines: Vec<(&str, &str)> =
-            roster.iter().flat_map(|r| r.machines.values().map(|m| (m.id.as_str(), m.address.as_str()))).collect();
-        let mut public: Vec<String> = Vec::new();
-        for m in roster.iter().flat_map(|r| r.machines.values()) {
-            public.extend(m.current_name.clone());
-        }
-        public.extend(darkmux_flow::resolve_machine_id());
-        let home = std::env::var("HOME").ok();
-        let darkmux_home = std::env::var("DARKMUX_HOME").ok();
-        Self::from_parts(&machines, &public, home, darkmux_home)
-    }
-
-    /// `machines` is `(id, address)`; `public` are further machine names.
-    fn from_parts(
-        machines: &[(&str, &str)],
-        public: &[String],
-        home: Option<String>,
-        darkmux_home: Option<String>,
-    ) -> Self {
-        let is_public = |s: &str| {
-            machines.iter().any(|(id, _)| id.eq_ignore_ascii_case(s)) || public.iter().any(|p| p.eq_ignore_ascii_case(s))
-        };
-        let mut all: Vec<String> = Vec::new();
-        for addr in machines.iter().map(|(_, a)| a.trim()).filter(|a| !a.is_empty()) {
-            if !is_public(addr) {
-                all.push(addr.to_string());
-            }
-            if let Some(host) = address_host(addr).filter(|h| !is_public(h)) {
-                all.push(host.to_string());
-            }
-        }
-        all.sort_by_key(|a| std::cmp::Reverse(a.len()));
-        all.dedup();
-        // A directory as given and as the filesystem resolves it (`/tmp` is
-        // `/private/tmp` on macOS): a verb may print either.
-        let forms = |d: Option<String>| -> Vec<String> {
-            let given = d.map(|d| d.trim_end_matches('/').to_string()).filter(|d| d.len() > 1);
-            let canon = given
-                .as_deref()
-                .and_then(|g| std::fs::canonicalize(g).ok())
-                .map(|c| c.to_string_lossy().trim_end_matches('/').to_string())
-                .filter(|c| c.len() > 1);
-            let mut all: Vec<String> = given.into_iter().chain(canon).collect();
-            all.dedup();
-            all
-        };
-        let homes = forms(home);
-        let mut dirs: Vec<(String, &'static str)> = homes.iter().cloned().map(|h| (h, "~")).collect();
-        // A DARKMUX_HOME inside HOME (at a path boundary: `/Users/kainx/dm` is
-        // not inside `/Users/kain`) is covered by the HOME rewrite.
-        for dh in forms(darkmux_home) {
-            let inside = homes.iter().any(|h| dh == *h || dh.starts_with(&format!("{h}/")));
-            if !inside {
-                dirs.push((dh, "$DARKMUX_HOME"));
-            }
-        }
-        dirs.sort_by_key(|(d, _)| std::cmp::Reverse(d.len()));
-        let mut seen = std::collections::HashSet::new();
-        dirs.retain(|(d, _)| seen.insert(d.clone()));
-        Self { addresses: all, dirs }
-    }
-}
-
-/// The host of a roster address (`name:8765`, `[::1]:8765`, a bare IP or name).
-fn address_host(addr: &str) -> Option<&str> {
-    if let Some(rest) = addr.strip_prefix('[') {
-        return rest.split_once(']').map(|(host, _)| host);
-    }
-    match addr.rsplit_once(':') {
-        Some((host, port)) if !host.contains(':') && port.chars().all(|c| c.is_ascii_digit()) => Some(host),
-        _ => None,
-    }
-}
-
-/// A character that continues a host name or a path component: a match
-/// touching one is part of a longer word (`mac` in `macos`, `studio` in
-/// `lmstudio-community`, `/Users/kain` in `/Users/kainx`), never the needle.
-fn word_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '-' || c == '_'
-}
-
-/// Whether the text beginning with `rest` continues a word: a word character,
-/// or a `.` that is followed by one (`.net` in `host.net`). A `.` that ends the
-/// text or is followed by anything else is punctuation, a boundary.
-fn continues_forward(rest: &str) -> bool {
-    let mut it = rest.chars();
-    match it.next() {
-        Some('.') => it.next().is_some_and(word_char),
-        Some(c) => word_char(c),
-        None => false,
-    }
-}
-
-/// The mirror of [`continues_forward`] for the text ending with `before`.
-fn continues_backward(before: &str) -> bool {
-    let mut it = before.chars().rev();
-    match it.next() {
-        Some('.') => it.next().is_some_and(word_char),
-        Some(c) => word_char(c),
-        None => false,
-    }
-}
-
-/// Replace each ASCII-case-insensitive occurrence of `needle` in `text` that
-/// is a whole token: neither side may continue a word.
-fn replace_token(text: &str, needle: &str, with: &str) -> String {
-    if needle.is_empty() {
-        return text.to_string();
-    }
-    let (hay, pat) = (text.to_ascii_lowercase(), needle.to_ascii_lowercase());
-    let mut out = String::with_capacity(text.len());
-    let mut last = 0;
-    let mut from = 0;
-    while let Some(rel) = hay[from..].find(&pat) {
-        let (start, end) = (from + rel, from + rel + pat.len());
-        if !continues_backward(&text[..start]) && !continues_forward(&text[end..]) {
-            out.push_str(&text[last..start]);
-            out.push_str(with);
-            last = end;
-        }
-        from = end;
-    }
-    out.push_str(&text[last..]);
-    out
-}
-
-/// Redact one run of plain text: roster addresses, then the directories.
-fn redact_text(text: &str, r: &Redaction) -> String {
-    let mut out = text.to_string();
-    for addr in &r.addresses {
-        out = replace_token(&out, addr, ADDRESS_HIDDEN);
-    }
-    for (dir, reads_as) in &r.dirs {
-        out = replace_token(&out, dir, reads_as);
-    }
-    out
-}
-
-/// How many bytes of `rest` (which starts with an ESC or a C1 CSI, U+009B)
-/// the escape at its start covers, and what of it is sent on. Only two forms
-/// survive for a remote caller: SGR (`CSI digits;colons m`, rebuilt from its
-/// parameters) and OSC 8 hyperlinks (rebuilt with no parameters, an ST
-/// terminator and the target only when it names nothing private). Every other
-/// escape is dropped whole; one that is malformed or unterminated loses only
-/// its introducer, so what follows is ordinary text and gets redacted as such
-/// (`\x1b[/Users/kain` must not be eaten as the sequence `\x1b[/U`).
-fn classify_escape(rest: &str, r: &Redaction) -> (usize, String) {
-    let bytes = rest.as_bytes();
-    if rest.starts_with('\u{9b}') {
-        return csi(rest, 2);
-    }
-    match bytes.get(1) {
-        Some(b'[') => csi(rest, 2),
-        Some(b']') => osc(rest, r),
-        // A charset designation (`ESC ( B`) is three bytes.
-        Some(b'(' | b')' | b'*' | b'+') if bytes.get(2).is_some_and(u8::is_ascii_alphanumeric) => (3, String::new()),
-        _ => (1, String::new()),
-    }
-}
-
-/// A CSI whose introducer is `intro` bytes long: kept only as SGR.
-fn csi(rest: &str, intro: usize) -> (usize, String) {
-    let body = &rest.as_bytes()[intro..];
-    let params = body.iter().take_while(|b| b.is_ascii_digit() || **b == b';' || **b == b':').count();
-    match body.get(params) {
-        Some(b'm') => (intro + params + 1, format!("\x1b[{}m", &rest[intro..intro + params])),
-        Some(b) if (0x40..=0x7e).contains(b) => (intro + params + 1, String::new()),
-        _ => (intro, String::new()),
-    }
-}
-
-/// An OSC: kept only as an OSC 8 hyperlink, rebuilt without its parameters.
-fn osc(rest: &str, r: &Redaction) -> (usize, String) {
-    let body = &rest[2..];
-    let bel = body.find('\x07').map(|p| (p, 1));
-    let st = body.find("\x1b\\").map(|p| (p, 2));
-    let Some((end, term_len)) = [bel, st].into_iter().flatten().min_by_key(|(p, _)| *p) else {
-        return (2, String::new());
-    };
-    let consumed = 2 + end + term_len;
-    let Some((_params, target)) = body[..end].strip_prefix("8;").and_then(|l| l.split_once(';')) else {
-        return (consumed, String::new());
-    };
-    let hidden = target.chars().any(char::is_control) || redact_text(target, r) != target;
-    (consumed, format!("\x1b]8;;{}\x1b\\", if hidden { "" } else { target }))
-}
-
-/// A panel's stdout for a remote caller. The text is split into escape
-/// sequences and plain runs FIRST, and each run is redacted on its own, so an
-/// escape boundary is always a token boundary: panel children are forced to
-/// color, and `\x1b[2m/Users/kain` must read as a path, not as a path glued to
-/// the `m` that ends the escape. See [`classify_escape`] for which escapes
-/// survive.
-fn redact_stdout(text: &str, r: &Redaction) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut run_start = 0;
-    let mut i = 0;
-    while i < text.len() {
-        let ch = text[i..].chars().next().unwrap_or(' ');
-        if ch != '\x1b' && ch != '\u{9b}' {
-            i += ch.len_utf8();
-            continue;
-        }
-        out.push_str(&redact_text(&text[run_start..i], r));
-        let (consumed, kept) = classify_escape(&text[i..], r);
-        out.push_str(&kept);
-        i += consumed;
-        run_start = i;
-    }
-    out.push_str(&redact_text(&text[run_start..], r));
-    out
-}
 
 /// The ONE output filter for a caller that is not this machine or a token
 /// holder, applied to every panel's response whatever the panel: `stderr_tail`
@@ -2979,10 +2746,10 @@ mod tests {
             None,
         );
         for want in ["Peer.Example:8765", "Peer.Example", "[fd7a::1]:8765", "fd7a::1", "10.0.0.4"] {
-            assert!(r.addresses.iter().any(|a| a == want), "{want} in {:?}", r.addresses);
+            assert!(r.addresses().contains(&want), "{want} in {:?}", r.addresses());
         }
-        assert!(r.addresses.windows(2).all(|w| w[0].len() >= w[1].len()), "longest first");
-        assert!(r.dirs.is_empty(), "a bare / is not a home to rewrite");
+        assert!(r.addresses().windows(2).all(|w| w[0].len() >= w[1].len()), "longest first");
+        assert!(r.dirs().is_empty(), "a bare / is not a home to rewrite");
     }
 
     fn body_with(text: &str) -> PanelResponse {
@@ -3016,10 +2783,10 @@ mod tests {
     /// tokens go, never a substring of a word.
     #[test]
     fn a_short_address_is_hidden_only_as_a_whole_token() {
-        let r = Redaction::from_parts(&[("peerone", "mac"), ("peertwo", "ana")], &[], None, None);
+        let r = Redaction::from_parts(&[("peerone", "mac.local"), ("peertwo", "ana.local")], &[], None, None);
         assert_eq!(
-            filtered(&r, "mac is up; macos aarch64; analyst; lmstudio-community/mac-x ana, (mac)"),
-            "(address hidden) is up; macos aarch64; analyst; lmstudio-community/mac-x (address hidden), ((address hidden))"
+            filtered(&r, "mac.local is up; macos aarch64; analyst; lmstudio-community/mac.local-x ana.local, (mac.local)"),
+            "(address hidden) is up; macos aarch64; analyst; lmstudio-community/mac.local-x (address hidden), ((address hidden))"
         );
     }
 
@@ -3036,23 +2803,37 @@ mod tests {
 
     #[test]
     fn a_model_key_that_contains_a_host_as_a_substring_survives() {
-        let r = Redaction::from_parts(&[("peerone", "studio")], &[], None, None);
+        let r = Redaction::from_parts(&[("peerone", "studio.example"), ("peertwo", "studio")], &[], None, None);
         assert_eq!(
-            filtered(&r, "lmstudio-community/qwen3-4b studio"),
-            "lmstudio-community/qwen3-4b (address hidden)"
+            filtered(&r, "lmstudio-community/qwen3-4b studio.example lmstudio:1234 lmstudio.example studio:1234"),
+            "lmstudio-community/qwen3-4b (address hidden) lmstudio:1234 lmstudio.example (address hidden):1234"
+        );
+    }
+
+    /// A bare roster host (no dot) is a word in prose ("LM Studio", "the
+    /// Studio is busy"): it is a host fact only where it addresses.
+    #[test]
+    fn a_bare_roster_host_is_hidden_only_where_it_addresses() {
+        let r = Redaction::from_parts(&[("peerone", "studio:8765")], &[], None, None);
+        assert_eq!(filtered(&r, "LM Studio: the Studio is busy"), "LM Studio: the Studio is busy");
+        assert_eq!(
+            filtered(&r, "at studio:8765 and http://studio/x and studio:9000 and me@studio"),
+            "at (address hidden) and http://(address hidden)/x and (address hidden):9000 and me@(address hidden)"
         );
     }
 
     #[test]
     fn the_home_rewrite_respects_path_boundaries_and_covers_darkmux_home() {
-        let r = Redaction::from_parts(&[], &[], Some("/Users/kain".into()), Some("/Volumes/x/dm".into()));
+        let r = Redaction::from_parts(&[], &[], Some("/srv/kain".into()), Some("/Volumes/x/dm".into()));
         assert_eq!(
-            filtered(&r, "/Users/kain/a /Users/kainx/b /Volumes/x/dm/c /Volumes/x/dmz"),
-            "~/a /Users/kainx/b $DARKMUX_HOME/c /Volumes/x/dmz"
+            filtered(&r, "/srv/kain/a /srv/kainx/b /Volumes/x/dm/c /Volumes/x/dmz"),
+            "~/a /srv/kainx/b $DARKMUX_HOME/c /Volumes/x/dmz"
         );
+        // Another account's home reads `~` whoever it is.
+        assert_eq!(filtered(&r, "/Users/kainx/b"), "~/b");
         // A DARKMUX_HOME inside HOME is covered by the HOME rewrite.
-        let r = Redaction::from_parts(&[], &[], Some("/Users/kain".into()), Some("/Users/kain/.darkmux".into()));
-        assert_eq!(filtered(&r, "/Users/kain/.darkmux/x"), "~/.darkmux/x");
+        let r = Redaction::from_parts(&[], &[], Some("/srv/kain".into()), Some("/srv/kain/.darkmux".into()));
+        assert_eq!(filtered(&r, "/srv/kain/.darkmux/x"), "~/.darkmux/x");
     }
 
     fn app_state() -> AppState {
@@ -3163,16 +2944,19 @@ mod tests {
     async fn one_state_serves_a_remote_caller_then_this_machine_unredacted() {
         let dir = tempfile::tempdir().unwrap();
         let roster = dir.path().join("fleet.json");
-        // `echo role list` prints `role list`; "role" is the roster address.
+        // The child prints a line naming the roster's address.
+        let child = dir.path().join("child.sh");
+        std::fs::write(&child, "#!/bin/sh\necho peer at example-host.example:8765 role list\n").unwrap();
+        std::fs::set_permissions(&child, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
         std::fs::write(
             &roster,
-            r#"{"version":"2","machines":{"peerone":{"id":"peerone","address":"role","added_unix_ms":1}}}"#,
+            r#"{"version":"2","machines":{"peerone":{"id":"peerone","address":"example-host.example:8765","added_unix_ms":1}}}"#,
         )
         .unwrap();
         let prev = std::env::var("DARKMUX_FLEET_FILE").ok();
         std::env::set_var("DARKMUX_FLEET_FILE", &roster);
         let mut state = app_state();
-        state.panels.child_exe = Some(std::path::PathBuf::from("/bin/echo"));
+        state.panels.child_exe = Some(child);
         let serve = |peer: &str| {
             let mut headers = axum::http::HeaderMap::new();
             headers.insert(PANEL_HEADER, "1".parse().unwrap());
@@ -3192,15 +2976,15 @@ mod tests {
             Some(v) => std::env::set_var("DARKMUX_FLEET_FILE", v),
             None => std::env::remove_var("DARKMUX_FLEET_FILE"),
         }
-        assert_eq!(remote.ansi_text.trim(), "(address hidden) list");
-        assert_eq!(local.ansi_text.trim(), "role list", "the cache must hold the unfiltered body");
+        assert_eq!(remote.ansi_text.trim(), "peer at (address hidden) role list");
+        assert_eq!(local.ansi_text.trim(), "peer at example-host.example:8765 role list", "the cache must hold the unfiltered body");
     }
 
     // ── real panel output: colored, punctuated, linked ─────────────────
 
     fn real_redaction() -> Redaction {
         Redaction::from_parts(
-            &[("studio", "studio.tailnet.example:8765"), ("mini", "100.64.1.2"), ("macbox", "mac")],
+            &[("studio", "studio.tailnet.example:8765"), ("mini", "100.64.1.2"), ("macbox", "mac.local")],
             &[],
             Some("/Users/kain".into()),
             Some("/Users/kainx/dm".into()),
@@ -3217,7 +3001,7 @@ mod tests {
             ("\x1b[2mstudio.tailnet.example\x1b[0m", "\x1b[2m(address hidden)\x1b[0m"),
             ("\x1b[0mstudio.tailnet.example:8765", "\x1b[0m(address hidden)"),
             ("\x1b[2m100.64.1.2", "\x1b[2m(address hidden)"),
-            ("\x1b[1mmac", "\x1b[1m(address hidden)"),
+            ("\x1b[1mmac.local", "\x1b[1m(address hidden)"),
             ("\x1b[38;5;208m/Users/kain\x1b[39m", "\x1b[38;5;208m~\x1b[39m"),
         ] {
             assert_eq!(filtered(&r, input), want, "{input:?}");
@@ -3232,12 +3016,12 @@ mod tests {
             ("is studio.tailnet.example.", "is (address hidden)."),
             ("at 100.64.1.2.", "at (address hidden)."),
             ("in /Users/kain.", "in ~."),
-            ("(100.64.1.2), mac.\n", "((address hidden)), (address hidden).\n"),
+            ("(100.64.1.2), mac.local.\n", "((address hidden)), (address hidden).\n"),
         ] {
             assert_eq!(filtered(&r, input), want, "{input:?}");
         }
         // A dot followed by a word character still continues the name.
-        assert_eq!(filtered(&r, "100.64.1.2.5 mac.example"), "100.64.1.2.5 mac.example");
+        assert_eq!(filtered(&r, "100.64.1.2.5 mac.local.example"), "100.64.1.2.5 mac.local.example");
     }
 
     #[test]
@@ -3310,7 +3094,7 @@ mod tests {
         let (h, dm) = (home.to_string_lossy().to_string(), home.join("dm").to_string_lossy().to_string());
         let r = Redaction::from_parts(&[], &[], Some(h.clone()), Some(dm.clone()));
         assert_eq!(filtered(&r, &format!("{dm}/x")), "~/dm/x");
-        assert!(r.dirs.iter().all(|(_, label)| *label == "~"), "{:?}", r.dirs);
+        assert!(r.dirs().iter().all(|(_, label)| *label == "~"), "{:?}", r.dirs());
         // A sibling that merely shares the prefix is not inside it.
         std::fs::create_dir_all(format!("{h}x/dm")).ok();
         let r = Redaction::from_parts(&[], &[], Some(h.clone()), Some(format!("{h}x/dm")));

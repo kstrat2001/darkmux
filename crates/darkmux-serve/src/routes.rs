@@ -58,18 +58,22 @@ pub(crate) struct Route {
     pub(crate) path: &'static str,
     pub(crate) reply: Reply,
     handler: MethodRouter<AppState>,
+    /// The handler redacts for a remote caller itself (the console panels,
+    /// whose terminal output needs escape-aware filtering), so the JSON layer
+    /// stays off it.
+    redacts_itself: bool,
 }
 
 /// A JSON route: the type is checked to exist, and named in the golden.
 macro_rules! json {
     ($ty:ty, $path:literal, $handler:expr) => {{
         let _: Option<$ty> = None;
-        Route { path: $path, reply: Reply::Json(stringify!($ty)), handler: get($handler) }
+        Route { path: $path, reply: Reply::Json(stringify!($ty)), handler: get($handler), redacts_itself: false }
     }};
 }
 
 fn plain(path: &'static str, reply: Reply, handler: MethodRouter<AppState>) -> Route {
-    Route { path, reply, handler }
+    Route { path, reply, handler, redacts_itself: false }
 }
 
 /// Every route the viewer daemon serves.
@@ -91,7 +95,7 @@ pub(crate) fn table() -> Vec<Route> {
         json!(MachineResourcesResponse, "/machine/resources", machine_resources_handler),
         json!(MissionsResponse, "/missions", missions_handler),
         json!(RunsResponse, "/runs", runs_handler),
-        json!(PanelResponse, "/panel/:id", panel::panel_handler),
+        Route { redacts_itself: true, ..json!(PanelResponse, "/panel/:id", panel::panel_handler) },
         json!(PhasesResponse, "/phases", phases_handler),
         json!(mission_graph::MissionGraph, "/mission/:id/graph.json", mission_graph_json_handler),
         plain("/manifest.webmanifest", Reply::Manifest, get(web_manifest_handler)),
@@ -111,6 +115,39 @@ pub(crate) fn table() -> Vec<Route> {
     ]
 }
 
+/// How a route keeps host facts from a remote reader. Every route has one, and
+/// [`Route::redaction`] matches exhaustively on [`Reply`], so a new kind of
+/// reply cannot be added without choosing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RouteRedaction {
+    /// The handler sits behind [`crate::redaction::redact_reads`].
+    Layer,
+    /// The handler redacts for a remote reader itself (the panels' terminal
+    /// output, the event stream's lines).
+    Handler,
+    /// A fixed document or image that names no host.
+    Static,
+}
+
+impl Route {
+    pub(crate) fn redaction(&self) -> RouteRedaction {
+        match self.reply {
+            Reply::Json(_) if self.redacts_itself => RouteRedaction::Handler,
+            Reply::Json(_) => RouteRedaction::Layer,
+            Reply::EventStream => RouteRedaction::Handler,
+            Reply::Html | Reply::Png | Reply::Manifest => RouteRedaction::Static,
+        }
+    }
+}
+
+/// A route's handler, behind the redaction layer when its stance is `Layer`.
+fn with_read_redaction(route: &Route) -> MethodRouter<AppState> {
+    match route.redaction() {
+        RouteRedaction::Layer => route.handler.clone().layer(axum::middleware::from_fn(crate::redaction::redact_reads)),
+        RouteRedaction::Handler | RouteRedaction::Static => route.handler.clone(),
+    }
+}
+
 /// The router: every non-streaming route gets a request timeout, bounding a slow
 /// or hung request; the long-lived event stream (#925) is kept apart so that
 /// timeout never applies to it.
@@ -119,7 +156,7 @@ pub(crate) fn router() -> Router<AppState> {
         table().into_iter().partition(|r| r.reply == Reply::EventStream);
     let timed = timed
         .into_iter()
-        .fold(Router::new(), |router, r| router.route(r.path, r.handler))
+        .fold(Router::new(), |router, r| router.route(r.path, with_read_redaction(&r)))
         .layer(tower_http::timeout::TimeoutLayer::new(Duration::from_secs(crate::REQUEST_TIMEOUT_SECS)));
     let streaming = streaming.into_iter().fold(Router::new(), |router, r| router.route(r.path, r.handler));
     timed.merge(streaming)
