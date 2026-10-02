@@ -1229,6 +1229,47 @@ fn recorded_execution(out_dir: &Path) -> Option<ExecutionId> {
     }
 }
 
+/// The image a resume runs on, and the refusal when `requested` (the
+/// `--image` the resume was given) names a different one than the origin
+/// recorded. The origin's `image` is the explicit `--image` its dispatch ran
+/// with (`null` for the default runtime image), so:
+///
+/// - no `--image` on the resume: it runs on the origin's recorded image;
+/// - the same `--image`: passes;
+/// - a different `--image`, or one named when the origin ran the default:
+///   RESUME IMAGE MISMATCH. A checkpoint continues a conversation whose tool
+///   results came from one environment; resuming it in another would let the
+///   model act on state its new toolchain does not have.
+///
+/// An unreadable or unparseable origin record returns `requested` unchanged:
+/// the checkpoint gate ([`validate_resume_checkpoint`]) refuses that case
+/// with RESUME ORIGIN UNKNOWN, and one refusal per cause is enough.
+pub(crate) fn resume_effective_image(
+    resume_from: &Path,
+    requested: Option<&str>,
+) -> Result<Option<String>> {
+    let origin = read_resume_origin(resume_from)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+    let Some(origin) = origin else {
+        return Ok(requested.map(str::to_string));
+    };
+    let recorded = origin.get("image").and_then(|v| v.as_str());
+    match (recorded, requested) {
+        (recorded, None) => Ok(recorded.map(str::to_string)),
+        (Some(r), Some(q)) if r == q => Ok(Some(q.to_string())),
+        (recorded, Some(q)) => {
+            let origin_image = recorded.map_or("the default runtime image".to_string(), |r| format!("`{r}`"));
+            bail_resume!(
+                "darkmux dispatch: RESUME IMAGE MISMATCH — the checkpoint at {} was written in \
+                 {origin_image}, but this dispatch's image is `{q}`; refusing to resume into a \
+                 different environment (drop --image to resume on the original)",
+                resume_from.join(CHECKPOINT_FILENAME).display()
+            )
+        }
+    }
+}
+
 /// (#2774 review F2) Build tier 4's `resume_hint` — the command an
 /// operator reads at 3am and pastes — so that it is a command darkmux will
 /// actually ACCEPT.
@@ -1274,8 +1315,9 @@ pub(crate) fn resume_hint_from_origin(
         );
     };
     let read_only = origin.get("workspace_read_only").and_then(|v| v.as_bool()).unwrap_or(false);
-    let image = origin.get("image").and_then(|v| v.as_str());
 
+    // No `--image`: a resume with none runs on the origin's recorded image
+    // ([`resume_effective_image`]), so naming it here would be noise.
     let mut cmd = format!(
         "darkmux dispatch {} --resume-from {} --workdir {}",
         shell_quote(role_id),
@@ -1284,10 +1326,6 @@ pub(crate) fn resume_hint_from_origin(
     );
     if read_only {
         cmd.push_str(" --workspace-read-only");
-    }
-    if let Some(image) = image {
-        cmd.push_str(" --image ");
-        cmd.push_str(&shell_quote(image));
     }
     format!("{cmd} (once conditions look better — this pause does not clear on its own)")
 }
@@ -5361,8 +5399,15 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // into it (bind-mount + entrypoint override) so the coder runs in the
     // operator's environment and can compile/test in-sandbox. The default path
     // runs a darkmux image directly (binary baked in, no injection).
-    let inject = opts
-        .image
+    //
+    // A resume runs on the image its origin recorded ([`resume_effective_image`]),
+    // and is refused here, before any image work, when `--image` names another.
+    let image_arg: Option<String> = match opts.resume_from.as_deref() {
+        Some(resume_from) => resume_effective_image(resume_from, opts.image.as_deref())
+            .context("darkmux dispatch --resume-from")?,
+        None => opts.image.clone(),
+    };
+    let inject = image_arg
         .as_deref()
         .is_some_and(|img| !is_darkmux_runtime_image(img));
 
@@ -5384,7 +5429,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // image is resolved and version-checked either way: the gate is what
     // keeps a mismatched runtime from running, and a debug flag (or the
     // `skip_preflight` mission step key) must not open it.
-    let explicit_darkmux_image = opts.image.as_deref().filter(|_| !inject);
+    let explicit_darkmux_image = image_arg.as_deref().filter(|_| !inject);
     let darkmux_image = if opts.skip_preflight {
         ensure_darkmux_image_present(explicit_darkmux_image)?
     } else {
@@ -5396,8 +5441,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // by the content id that was checked, not by its tag, so a tag re-pointed
     // between the check and `docker run` cannot swap in an unchecked image.
     // `image` stays the human-readable ref for records and messages.
-    let image = opts
-        .image
+    let image = image_arg
         .clone()
         .unwrap_or_else(|| darkmux_image.reference.clone());
     let run_image = if inject {
@@ -5757,7 +5801,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // workspace path/mount-mode into its own host_out, unconditionally —
     // the host-held record a LATER --resume-from reads back rather than
     // guessing. See `write_resume_origin_meta`'s own doc.
-    write_resume_origin_meta(&host_out, &workspace, opts.workspace_read_only, opts.image.as_deref(), &execution);
+    write_resume_origin_meta(&host_out, &workspace, opts.workspace_read_only, image_arg.as_deref(), &execution);
 
     // (#2114 follow-up / #2162) `--resume-from <dir>` trigger: the checkpoint
     // was already validated — see the `validate_resume_checkpoint` call

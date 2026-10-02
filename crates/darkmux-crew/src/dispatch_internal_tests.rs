@@ -5525,7 +5525,10 @@
         assert_eq!(args.first().map(String::as_str), Some("darkmux"));
         assert_eq!(args.get(1).map(String::as_str), Some("dispatch"));
         assert_eq!(args.get(2).map(String::as_str), Some("coder"));
-        assert_eq!(flag_value(&args, "--image"), Some("rust:latest"), "hint: {hint}");
+        assert!(
+            !args.iter().any(|a| a == "--image"),
+            "a resume with no --image runs on the origin's image, so the hint omits it: {hint}"
+        );
         assert!(!hint.contains("--phase-id"), "the flag was removed (#2954): {hint}");
 
         let resume_from = flag_value(&args, "--resume-from").expect("hint names --resume-from");
@@ -5540,6 +5543,58 @@
             read_only,
         )
         .expect("the hint darkmux prints must be a command darkmux accepts");
+    }
+
+    /// A resume runs on the origin's recorded image: with no `--image` it
+    /// inherits it, the same `--image` passes, and a different one (or one
+    /// named when the origin ran the default image) is refused like the
+    /// workspace gate refuses a different tree.
+    #[test]
+    fn a_resume_keeps_its_origins_image() {
+        let ws = TempDir::new().unwrap();
+        let prior = TempDir::new().unwrap();
+        let minted = darkmux_types::execution_id::ExecutionId::mint();
+        write_resume_origin_meta(prior.path(), ws.path(), false, Some("rust:latest"), &minted);
+
+        assert_eq!(
+            resume_effective_image(prior.path(), None).unwrap().as_deref(),
+            Some("rust:latest"),
+            "no --image: the resume runs on the origin's image"
+        );
+        assert_eq!(
+            resume_effective_image(prior.path(), Some("rust:latest")).unwrap().as_deref(),
+            Some("rust:latest"),
+            "the same --image passes"
+        );
+        let err = resume_effective_image(prior.path(), Some("python:3.12")).unwrap_err();
+        assert!(err.is::<ResumeRefusal>(), "a refusal, not a plain error: {err:#}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("RESUME IMAGE MISMATCH") && msg.contains("rust:latest") && msg.contains("python:3.12"),
+            "{msg}"
+        );
+    }
+
+    /// An origin that ran the default image refuses a resume naming one, and
+    /// a resume naming none stays on the default (`None`).
+    #[test]
+    fn a_resume_of_a_default_image_run_refuses_an_explicit_image() {
+        let ws = TempDir::new().unwrap();
+        let prior = TempDir::new().unwrap();
+        write_resume_origin_meta(prior.path(), ws.path(), false, None, &darkmux_types::execution_id::ExecutionId::mint());
+
+        assert_eq!(resume_effective_image(prior.path(), None).unwrap(), None);
+        let msg = resume_effective_image(prior.path(), Some("rust:latest")).unwrap_err().to_string();
+        assert!(msg.contains("RESUME IMAGE MISMATCH") && msg.contains("default runtime image"), "{msg}");
+    }
+
+    /// With no readable origin the image decision defers to the checkpoint
+    /// gate (RESUME ORIGIN UNKNOWN) rather than refusing twice.
+    #[test]
+    fn a_resume_without_an_origin_record_defers_the_image_decision() {
+        let prior = TempDir::new().unwrap();
+        assert_eq!(resume_effective_image(prior.path(), Some("rust:latest")).unwrap().as_deref(), Some("rust:latest"));
+        assert_eq!(resume_effective_image(prior.path(), None).unwrap(), None);
     }
 
     /// (#2774 round-3 MF2) The F2 regression the round-2 fix did NOT
