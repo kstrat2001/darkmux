@@ -16,6 +16,23 @@ darkmux release.
 
 ### Added
 
+- **A relayed run is one run** (#3016). Work asked on one machine and executed
+  on another (radio's answering seat on a peer, `dispatch --profile p@peer`, a
+  fleet job) is one row on the runs board, owned by the machine that ran it: it
+  counts there and the Machine filter matches it. The asking machine's own
+  session for the same work folds into it. `GET /runs` rows gain an additive
+  `relay: { asked_on_machine, sender_run }`; the row subtitle ends "from
+  <asker>" and the run page header reads "on <executor>, asked on <asker>".
+- **Cross-machine order is the hub's receive order** (#3017). Records read off
+  the hub carry the Redis stream id as an additive `hub_id`; the mission graph
+  orders a step's attempts and folds its span by it, so a peer whose clock runs
+  slow no longer loses its live retry to a failed attempt or stretches a
+  "finished" span across two clocks. A reporting peer's quiet session is judged
+  against that peer's own clock (its presence beat), not this daemon's.
+- **Clock skew is said in `machine list` and `doctor`, nowhere else** (#3017).
+  `clock 10m behind the hub` appears when a machine's presence beat is more
+  than 30 seconds off the hub's clock (twice the beat TTL, so a healthy clock
+  never reads skewed); `FleetMachine` gains an additive `clock_skew_ms`.
 - **Wire contracts are additive-only from 5.0 (D2).** `route-table.golden` now lists
   every JSON response type's fields and their types (read from the generated
   TypeScript twins), and `scripts/contract-additive-guard.py` fails a PR that removes
